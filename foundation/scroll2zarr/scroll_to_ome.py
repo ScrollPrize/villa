@@ -168,15 +168,19 @@ def slice_count(s, maxx):
 def load_tiff(tiffname):
     print(tiffname)
     if str(tiffname).endswith('.tif'):
-        return tifffile.imread(str(tiffname))
+        image =  tifffile.imread(str(tiffname))
     elif str(tiffname).endswith('.jpg'):
-        print("returning jpg")
         image = cv2.imread(str(tiffname), cv2.IMREAD_GRAYSCALE)
-        print(f"shape: {image.shape}, dtype: {image.dtype}")
-        return image
     else:
         print("returning none")
         return None
+    # if uint8, convert to uint16
+    if image.dtype == np.uint8:
+        image = image.astype(np.uint16)*256
+    # if float, convert to uint16
+    if image.dtype == np.float32:
+        image = (image*65535).astype(np.uint16)
+    return image
 
 def get_tiffs(tiffdir):
     # Note this is a generator, not a list
