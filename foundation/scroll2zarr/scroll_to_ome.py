@@ -644,7 +644,9 @@ def get_standard_config(tiffdir, output, volume_type):
         # Get the segment ID from the tiff directory
         segment_id = os.path.basename(os.path.dirname(tiffdir))
         standard_config['segment_id'] = segment_id
-        mask_path = os.path.join(os.path.dirname(tiffdir), f"{standard_config['segment_id']}_mask.png")
+        # find *_mask paths
+        mask_paths = list(tiffdir.glob("*_mask.png"))
+        mask_path = mask_paths[0]
         standard_config['mask_path'] = mask_path
         surface_volume_meate_path = os.path.join(os.path.dirname(tiffdir), "meta.json")
         surface_volume_meta = json.load(open(surface_volume_meate_path))
