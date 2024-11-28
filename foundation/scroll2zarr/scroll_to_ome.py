@@ -248,7 +248,7 @@ def get_tiff_volume_mask(tiff, itiff):
 
 def get_tiff_surface_mask(mask_path):
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-    mask = mask // 255
+    mask = mask > 0
     return mask
 
 def load_transform(transform_path):
