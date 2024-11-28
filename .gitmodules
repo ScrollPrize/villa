@@ -1,0 +1,3 @@
+[submodule "foundation/scroll2zarr/vesuvius_basic_compression"]
+	path = foundation/scroll2zarr/vesuvius_basic_compression
+	url = https://github.com/OliverDaubney/vesuvius_basic_compression.git
