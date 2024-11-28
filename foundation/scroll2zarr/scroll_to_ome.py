@@ -648,7 +648,10 @@ def get_standard_config(tiffdir, output, volume_type):
         mask_path = os.path.join(os.path.dirname(tiffdir), f"{standard_config['segment_id']}_mask.png")
         # if not found, try to find it in the parent directory
         if not os.path.exists(mask_path):
-            mask_path = list(os.path.dirname(tiffdir).glob("*_mask.png"))[0]
+            # Define the search pattern
+            search_pattern = os.path.join(os.path.dirname(tiffdir), "*_mask.png")
+            # Find all matching files
+            mask_path = glob.glob(search_pattern)[0]
             print(f"Mask not found in {os.path.dirname(tiffdir)}, finding alternative: {mask_path}")
         standard_config['mask_path'] = mask_path
         surface_volume_meate_path = os.path.join(os.path.dirname(tiffdir), "meta.json")
