@@ -561,3 +561,8 @@ in `volumes` are not compressed, so this discussion does not apply
 to them).
 
 A script `decompress_tiffs.py` is provided for this purpose.
+
+## Separate utility for segment files: segment_to_ome.py
+This is used for exporting a .tif stack of scroll segment files to .zarr format. The usage is identical to scroll_to_ome.py but it has been tweaked to work with segments without loss of depth resolution:
+python segment_to_ome.py <input_tiff_dir> <output_zarr_ome_dir> --chunk_size 128 --nlevels 1
+
