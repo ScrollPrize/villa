@@ -30,21 +30,36 @@ def save_point_cloud(filename, points):
 def load_mesh_vertices(obj_file, use_tempfile=True):
     # copy mesh to tempfile
     if use_tempfile:
+        # print("using tempfile")
         with tempfile.NamedTemporaryFile(suffix=".obj") as temp_file:
+            # print("created temp file")
             # copy mesh to tempfile
             temp_path = temp_file.name
+            # print(f"copying mesh from {obj_file} to {temp_path}")
             # os copy
             os.system(f"cp {obj_file} {temp_path}")
             # load mesh
             mesh = o3d.io.read_triangle_mesh(temp_path, print_progress=True)
     else:
         mesh = o3d.io.read_triangle_mesh(obj_file, print_progress=True)
-
+    print("loaded mesh")
+    # check if mesh is empty
+    if mesh is None:
+        raise ValueError("Mesh is None")
+    if len(mesh.vertices) == 0:
+        raise ValueError("Mesh is empty")
     # Coordinate transform to pointcloud coordinate system
     vertices = np.asarray(mesh.vertices)
+    # print(f"Shape: {vertices.shape}, dtype: {vertices.dtype}")
     vertices += 500
     vertices = vertices[:,[1, 2, 0]]
-    mesh.vertices = o3d.utility.Vector3dVector(vertices)
+    # print("Did some math on the mesh")
+    # print(f"Shape: {vertices.shape}, dtype: {vertices.dtype}")
+    vertices_o3d = o3d.utility.Vector3dVector(vertices) # CAREFULL: numpy version + open3d version issue. open3d 0.18.0 only works with numpy version < 2.0.0. eg 1.26.4/1.22.4
+    # print(f"converted to o3d type")
+    mesh.vertices = vertices_o3d
+
+    # print("transformed vertices")
 
     triangles = np.asarray(mesh.triangles)
 
@@ -145,7 +160,7 @@ def generate_sample(index, valid_triangles, winding_angles, scene, triangles, pl
     # Save GT PointCloud
     ply_name = os.path.basename(ply_path)[:-4]
     gt_file = os.path.join(output_dir, ply_name, f"{ply_name}.ply")
-    save_point_cloud(gt_file, points)
+    save_point_cloud(gt_file, clostest_points)
 
     # Cluster points by winding angle
     clusters = cluster_points_by_winding_angle(winding_angles_points)
@@ -272,12 +287,13 @@ def set_up_mesh(mesh_file, pointcloud_dir, continue_from=0, save_meshes=False, u
     
     fresh_start = continue_from <= 0
     if fresh_start:
+        print("Setting up mesh")
         # Load the mesh vertices
         triangles, scene = load_mesh_vertices(mesh_file, use_tempfile=use_tempfile)
-
+        # print(f"Loaded {len(triangles)} triangles")
         # Calculate winding angles for each vertex
         winding_angles, splitter = calculate_winding_angle(mesh_file, pointcloud_dir)
-
+        print(f"Calculated winding angles for {len(winding_angles)} vertices")
         # pickle winding angles
         os.makedirs(output_dir, exist_ok=True)
         with open(os.path.join(output_dir, "winding_angles_triangles.pkl"), "wb") as f:

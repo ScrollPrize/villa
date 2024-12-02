@@ -267,7 +267,53 @@ class MeshSplitter:
         """
         self.visited_vertices.clear()
 
+    def angle_to_color_extended(self, angle):
+        """
+        Converts an angle (0-1080 degrees) to an RGB color.
+        - Cycles through Red, Green, Blue every 360 degrees.
+        - Interpolates smoothly within each cycle.
+        """
+        # Normalize angle to [0, 1080)
+        # angle = angle % 1080
+
+        # Determine which turn and segment within the 360 range
+        turn = angle // 360  # 0 = Red, 1 = Green, 2 = Blue
+        within_turn = angle / 360 - turn  # Position within the current turn
+        within_turn = 0
+        turn = turn % 3
+
+        if turn == 0:
+            r = 1.0 - within_turn
+            g = within_turn
+            b = 0
+        elif turn == 1:
+            r = 0
+            g = 1.0 - within_turn
+            b = within_turn
+        else:
+            r = within_turn
+            g = 0
+            b = 1.0 - within_turn
+
+        return r, g, b
+
+    def save_colored_angles(self):
+        # create colored pointcloud from mesh
+        vertices = np.asarray(self.mesh.vertices)
+        colors_angles = self.vertices_np[:, 0]
+        # map to rgb interpolated colors
+        min_angle = np.min(colors_angles)
+        colors_angles = colors_angles - min_angle
+        colors = np.array([self.angle_to_color_extended(angle) for angle in colors_angles])
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(vertices)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+        # save pointcloud
+        pcd_path = os.path.join(os.path.dirname(self.mesh_path), "vertices_colored.ply")
+        o3d.io.write_point_cloud(pcd_path, pcd)
+
     def save_vertices(self):
+        # map to 
         # numpy tp mesh path
         vertices_path = os.path.join(os.path.dirname(self.mesh_path), "vertices_flattened.npy")
         # Save as npz
@@ -304,15 +350,16 @@ class MeshSplitter:
             qualifying_triangles = np.any(np.isin(triangles, window_indices), axis=1)
             qualifying_uvs = qualifying_triangles.repeat(3).reshape(-1)
 
-            selected_triangles = triangles[qualifying_triangles]
-            selected_uvs = triangle_uvs[qualifying_uvs]
 
              # Create a new mesh with the selected vertices and triangles
             cut_mesh = o3d.geometry.TriangleMesh()
             cut_mesh.vertices = o3d.utility.Vector3dVector(vertices)
             cut_mesh.vertex_normals = o3d.utility.Vector3dVector(normals)
+            selected_triangles = triangles[qualifying_triangles]
             cut_mesh.triangles = o3d.utility.Vector3iVector(selected_triangles)
-            cut_mesh.triangle_uvs = o3d.utility.Vector2dVector(selected_uvs)
+            if len(triangle_uvs) > 0:
+                selected_uvs = triangle_uvs[qualifying_uvs]
+                cut_mesh.triangle_uvs = o3d.utility.Vector2dVector(selected_uvs)
             cut_mesh = cut_mesh.remove_unreferenced_vertices()
             print(f"Nr triangles in cut mesh: {len(np.asarray(cut_mesh.triangles))}")
             print(f"Nr uvs in cut mesh: {len(np.asarray(cut_mesh.triangle_uvs))}")
@@ -331,6 +378,7 @@ class MeshSplitter:
     def compute(self, split_width=50000, fresh_start=True, stamp=None):
         if fresh_start:
             self.compute_uv_with_bfs(0)
+            self.save_colored_angles()
             self.scale_uv_x()
             self.save_vertices()
         else:
@@ -353,4 +401,4 @@ if __name__ == '__main__':
     split_width = args.split_width
     
     splitter = MeshSplitter(args.mesh, umbilicus_path)
-    splitter.compute(args.mesh, split_width)
+    splitter.compute(split_width, fresh_start=False)
