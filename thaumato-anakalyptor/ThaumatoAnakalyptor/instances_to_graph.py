@@ -517,7 +517,7 @@ def score_same_block_patches(patch1, patch2, overlapp_threshold, umbilicus_dista
     Calculate the score between two patches from the same block.
     """
     # Calculate winding switch sheet scores
-    distance_raw = umbilicus_distance(patch1, patch2)
+    distance_raw, orthogonal_d, geo_d = umbilicus_distance(patch1, patch2)
     score_raw, k = np.abs(distance_raw), np.sign(distance_raw)
     k = k * overlapp_threshold["winding_direction"] # because of scroll's specific winding direction
 
@@ -525,32 +525,40 @@ def score_same_block_patches(patch1, patch2, overlapp_threshold, umbilicus_dista
     
     score = score_val * overlapp_threshold["winding_switch_sheet_score_factor"]
 
-    # Centroid distance between patches
-    centroid1 = np.mean(patch1["points"], axis=0)
-    centroid2 = np.mean(patch2["points"], axis=0)
-    centroid_distance = np.linalg.norm(centroid1 - centroid2)
-
+    valid = True
     # Check for enough points
-    if centroid_distance > overlapp_threshold["max_winding_switch_sheet_distance"]:
+    if geo_d > overlapp_threshold["max_winding_switch_sheet_distance"]:
+        valid = False
+        score = -0.5
+    if geo_d < overlapp_threshold["min_winding_switch_sheet_distance"]:
+        valid = False
         score = -1.0
-    if centroid_distance < overlapp_threshold["min_winding_switch_sheet_distance"]:
-        score = -1.0
-    if score_val <= 0.0:
-        score = -1.0
-    if score_val >= 1.0:
-        score = -1.0
+    if orthogonal_d > overlapp_threshold["max_winding_switch_sheet_distance"]: # too far away
+        valid = False
+        score = -0.5
     if patch1["points"].shape[0] < overlapp_threshold["min_points_winding_switch"] * overlapp_threshold["sample_ratio_score"]:
-        score = -1.0
+        valid = False
+        score = -0.5
     if patch2["points"].shape[0] < overlapp_threshold["min_points_winding_switch"] * overlapp_threshold["sample_ratio_score"]:
-        score = -1.0
-    if score_raw < overlapp_threshold["min_winding_switch_sheet_distance"]: # whole volume went bad for winding switch
-        score = -1.0
+        valid = False
+        score = -0.5
+    if score_val <= 0.0: # too far away
+        valid = False
+        score = -0.5
     if score_raw > overlapp_threshold["max_winding_switch_sheet_distance"]: # not good patch, but whole volume might still be good for winding switch
+        valid = False
         score = -0.5
     if (patch1["patch_prediction_scores"][0] < overlapp_threshold["min_prediction_threshold"]) or (patch2["patch_prediction_scores"][0] < overlapp_threshold["min_prediction_threshold"]):
+        valid = False
+        score = -0.5
+    if score_val >= 1.0: # too close, whole volume went bad for winding switch
+        valid = False
+        score = -1.0
+    if score_raw < overlapp_threshold["min_winding_switch_sheet_distance"]: # whole volume went bad for winding switch
+        valid = False
         score = -1.0
 
-    return (score, k), patch1["anchor_angles"][0], patch2["anchor_angles"][0]
+    return (score, k, valid), patch1["anchor_angles"][0], patch2["anchor_angles"][0]
 
 def process_same_block(main_block_patches_list, overlapp_threshold, umbilicus_distance):
     def scores_cleaned(direction_scores):
@@ -559,7 +567,7 @@ def process_same_block(main_block_patches_list, overlapp_threshold, umbilicus_di
         
         score_min = min(direction_scores, key=lambda x: x[2]) # return if there were bad scores
         if score_min[2] == -1.0:
-            return [(score_min[0], score_min[1], -1.0, score_min[3], score_min[4], score_min[5])]
+            return []
         
         score = max(direction_scores, key=lambda x: x[2])
         score_val = score[2]
@@ -577,12 +585,13 @@ def process_same_block(main_block_patches_list, overlapp_threshold, umbilicus_di
         for j in range(len(main_block_patches_list)):
             if i == j:
                 continue
-            (score_, k_), anchor_angle1, anchor_angle2 = score_same_block_patches(main_block_patches_list[i], main_block_patches_list[j], overlapp_threshold, umbilicus_distance)
+            (score_, k_, valid_), anchor_angle1, anchor_angle2 = score_same_block_patches(main_block_patches_list[i], main_block_patches_list[j], overlapp_threshold, umbilicus_distance)
             if score_ > 0.0:
-                score_switching_sheets_.append((main_block_patches_list[i]['ids'][0], main_block_patches_list[j]['ids'][0], score_, k_, anchor_angle1, anchor_angle2, np.mean(main_block_patches_list[i]["points"], axis=0), np.mean(main_block_patches_list[j]["points"], axis=0)))
+                score_switching_sheets_.append((main_block_patches_list[i]['ids'][0], main_block_patches_list[j]['ids'][0], score_, k_, anchor_angle1, anchor_angle2, np.mean(main_block_patches_list[i]["points"], axis=0), np.mean(main_block_patches_list[j]["points"], axis=0), valid_))
 
             # Add bad edges
-            score_bad_edges.append((main_block_patches_list[i]['ids'][0], main_block_patches_list[j]['ids'][0], 1.0, 0.0, anchor_angle1, anchor_angle2, np.mean(main_block_patches_list[i]["points"], axis=0), np.mean(main_block_patches_list[j]["points"], axis=0)))
+            if valid_:
+                score_bad_edges.append((main_block_patches_list[i]['ids'][0], main_block_patches_list[j]['ids'][0], 1.0, 0.0, anchor_angle1, anchor_angle2, np.mean(main_block_patches_list[i]["points"], axis=0), np.mean(main_block_patches_list[j]["points"], axis=0)))
 
         # filter and only take the scores closest to the main patch (smallest scores) for each k in +1, -1
         direction1_scores = [score for score in score_switching_sheets_ if score[3] > 0.0]
@@ -640,13 +649,23 @@ def process_block(args):
     file_path, path_instances, overlapp_threshold, umbilicus_data = args
     umbilicus_func = lambda z: umbilicus_xz_at_y(umbilicus_data, z)
     def umbilicus_distance(patch1, patch2):
-        centroid1 = np.mean(patch1["points"], axis=0)
-        centroid2 = np.mean(patch2["points"], axis=0)
-        def d_(patch_centroid):
-            umbilicus_point = umbilicus_func(patch_centroid[1])
-            patch_centroid_vec = patch_centroid - umbilicus_point
-            return np.linalg.norm(patch_centroid_vec)
-        return d_(centroid1) - d_(centroid2)
+        # Geometric mean
+        geo1 = np.exp(np.mean(np.log(patch1["points"]), axis=0))
+        geo2 = np.exp(np.mean(np.log(patch2["points"]), axis=0))
+        assert geo1.shape[0] == 3, "Points must be 3D."
+        def d_(patch_point):
+            umbilicus_point = umbilicus_func(patch_point[1])
+            patch_point_vec = patch_point - umbilicus_point
+            return np.linalg.norm(patch_point_vec), patch_point_vec
+        d1, pv1 = d_(geo1)
+        d2, pv2 = d_(geo2)
+        # Find ortoghonal distance between the two points
+        xv = pv1 * np.abs(d1 - d2) / d1
+        pv12 = pv2 - pv1
+        pv12_x = xv + pv12
+        ortogh_length = np.linalg.norm(pv12_x)
+        geo_d = np.linalg.norm(geo1 - geo2)
+        return d1 - d2, ortogh_length, geo_d
 
     file_name = ".".join(file_path.split(".")[:-1])
     main_block_patches_list = subvolume_surface_patches_folder(file_name, sample_ratio=overlapp_threshold["sample_ratio_score"])
@@ -809,7 +828,16 @@ class ScrollGraph(Graph):
         # Build a same sheet edge between two nodes
         self.add_edge(node1, node2, certainty, sheet_offset_k=0.0, same_block=same_block)
 
-    def build_other_block_edges(self, score_sheets):
+    def build_other_block_edges(self, score_sheets, update_edges=False, nodes_set=None):
+        if update_edges:
+            # Delete all edges
+            for edge in list(self.edges.keys()):
+                for k in list(self.edges[edge].keys()):
+                    if not self.edges[edge][k]['same_block']:
+                        del self.edges[edge][k]
+                if len(self.edges[edge]) == 0:
+                    del self.edges[edge]
+
         # Define a wrapper function for umbilicus_xz_at_y
         umbilicus_func = lambda z: umbilicus_xz_at_y(self.umbilicus_data, z)
         # Build edges between patches from different blocks
@@ -828,9 +856,24 @@ class ScrollGraph(Graph):
                 angle_diff -= 360.0
             if angle_diff < -180.0:
                 angle_diff += 360.0
-            self.add_edge(id1, id2, score, sheet_offset_k=angle_diff, same_block=False)
+            if update_edges:
+                # Only add edges if both nodes are in the set
+                if id1 in nodes_set and id2 in nodes_set:
+                    self.add_edge(id1, id2, score, sheet_offset_k=angle_diff, same_block=False)
+            else:
+                # Add all edges
+                self.add_edge(id1, id2, score, sheet_offset_k=angle_diff, same_block=False)
 
-    def build_same_block_edges(self, score_switching_sheets):
+    def build_same_block_edges(self, score_switching_sheets, update_edges=False, nodes_set=None):
+        if update_edges:
+            # Delete all edges
+            for edge in list(self.edges.keys()):
+                for k in list(self.edges[edge].keys()):
+                    if self.edges[edge][k]['same_block']:
+                        del self.edges[edge][k]
+                if len(self.edges[edge]) == 0:
+                    del self.edges[edge]
+        
         # Define a wrapper function for umbilicus_xz_at_y
         umbilicus_func = lambda z: umbilicus_xz_at_y(self.umbilicus_data, z)
         # Build edges between patches from the same block
@@ -840,7 +883,7 @@ class ScrollGraph(Graph):
         for score_ in score_switching_sheets:
             grand_total += 1
             id1, id2, score, k, anchor_angle1, anchor_angle2, centroid1, centroid2 = score_
-            if score < 0.0:
+            if score <= 0.0:
                 continue
             total_count += 1
             umbilicus_point1 = umbilicus_func(centroid1[1])[[0, 2]]
@@ -855,7 +898,13 @@ class ScrollGraph(Graph):
             if angle_diff < -180.0:
                 angle_diff += 360.0
             angle_diff -= k * 360.0 # Next/Previous winding
-            self.add_edge(id1, id2, score, sheet_offset_k=angle_diff, same_block=True)
+            if update_edges:
+                # Only add edges if both nodes are in the set
+                if id1 in nodes_set and id2 in nodes_set:
+                    self.add_edge(id1, id2, score, sheet_offset_k=angle_diff, same_block=True)
+            else:
+                # Add all edges
+                self.add_edge(id1, id2, score, sheet_offset_k=angle_diff, same_block=True)
 
     def build_bad_edges(self, score_bad_edges):
         for score_ in score_bad_edges:
@@ -1113,7 +1162,7 @@ class ScrollGraph(Graph):
                     print(f"Node {node_id} not found in graph.")
         print(f"Adjusted winding angles for {count_adjusted_nodes_windings} nodes.")
 
-    def build_graph(self, path_instances, start_point, num_processes=4, prune_unconnected=False, start_fresh=True, gt_mesh_file=None, continue_from=0):
+    def build_graph(self, path_instances, start_point, num_processes=4, prune_unconnected=False, start_fresh=True, gt_mesh_file=None, continue_from=0, update_edges=False):
         #from original coordinates to instance coordinates
         start_block, patch_id = (0, 0, 0), 0
         self.start_block, self.patch_id, self.start_point = start_block, patch_id, start_point
@@ -1134,33 +1183,35 @@ class ScrollGraph(Graph):
 
             count_res = 0
             patches_centroids = {}
+            nodes_set = frozenset(self.nodes.keys()) # faster membership test
             # Process results from each worker
             for score_sheets, score_switching_sheets, score_bad_edges, volume_centroids in tqdm(results, desc="Processing results"):
                 count_res += len(score_sheets)
                 # Calculate scores, add patches edges to graph, etc.
-                self.build_other_block_edges(score_sheets)
-                self.build_same_block_edges(score_switching_sheets)
+                self.build_other_block_edges(score_sheets, update_edges=update_edges, nodes_set=nodes_set)
+                self.build_same_block_edges(score_switching_sheets, update_edges=update_edges, nodes_set=nodes_set)
                 # self.build_bad_edges(score_bad_edges)
                 patches_centroids.update(volume_centroids)
             print(f"Number of results: {count_res}")
 
-            # Define a wrapper function for umbilicus_xz_at_y
-            umbilicus_func = lambda z: umbilicus_xz_at_y(self.umbilicus_data, z)
+            if not update_edges:
+                # Define a wrapper function for umbilicus_xz_at_y
+                umbilicus_func = lambda z: umbilicus_xz_at_y(self.umbilicus_data, z)
 
-            # Add patches as nodes to graph
-            edges_keys = list(self.edges.keys())
-            nodes_from_edges = set()
-            for edge in tqdm(edges_keys, desc="Initializing nodes"):
-                nodes_from_edges.add(edge[0])
-                nodes_from_edges.add(edge[1])
-            for node in nodes_from_edges:
-                try:
-                    umbilicus_point = umbilicus_func(patches_centroids[node][1])[[0, 2]]
-                    umbilicus_vector = umbilicus_point - patches_centroids[node][[0, 2]]
-                    angle = angle_between(umbilicus_vector) * 180.0 / np.pi
-                    self.add_node(node, patches_centroids[node], winding_angle=angle)
-                except:
-                    del self.edges[edge]
+                # Add patches as nodes to graph
+                edges_keys = list(self.edges.keys())
+                nodes_from_edges = set()
+                for edge in tqdm(edges_keys, desc="Initializing nodes"):
+                    nodes_from_edges.add(edge[0])
+                    nodes_from_edges.add(edge[1])
+                for node in nodes_from_edges:
+                    try:
+                        umbilicus_point = umbilicus_func(patches_centroids[node][1])[[0, 2]]
+                        umbilicus_vector = umbilicus_point - patches_centroids[node][[0, 2]]
+                        angle = angle_between(umbilicus_vector) * 180.0 / np.pi
+                        self.add_node(node, patches_centroids[node], winding_angle=angle)
+                    except:
+                        del self.edges[edge]
 
             node_id = tuple((*start_block, patch_id))
             print(f"Start node: {node_id}, nr nodes: {len(self.nodes)}, nr edges: {len(self.edges)}")
@@ -1334,7 +1385,7 @@ class ScrollGraph(Graph):
             centroid = self.nodes[node]['centroid']
             winding_angle = self.nodes[node]['winding_angle']
             if (tolerated_nodes is not None) and (node in tolerated_nodes):
-                subgraph.add_node(node, centroid, winding_angle=winding_angle)
+                subgraph.add_node(node, centroid, winding_angle=winding_angle, winding_angle_gt=self.nodes[node]['winding_angle_gt'] if 'winding_angle_gt' in self.nodes[node] else None)
                 continue
             elif (min_z is not None) and (centroid[1] < min_z):
                 continue
@@ -1351,7 +1402,7 @@ class ScrollGraph(Graph):
             elif (umbilicus_max_distance is not None) and np.linalg.norm(umbilicus_func(centroid[1]) - centroid) > umbilicus_max_distance:
                 continue
             else:
-                subgraph.add_node(node, centroid, winding_angle=winding_angle)
+                subgraph.add_node(node, centroid, winding_angle=winding_angle, winding_angle_gt=self.nodes[node]['winding_angle_gt'] if 'winding_angle_gt' in self.nodes[node] else None)
         for edge in self.edges:
             node1, node2 = edge
             if (tolerated_nodes is not None) and (node1 in tolerated_nodes) and (node2 in tolerated_nodes): # dont add useless edges
@@ -1514,7 +1565,7 @@ def load_graph_winding_angle_from_binary(filename, graph):
     print(f"Number of nodes remaining: {len(nodes_graph)} from {num_nodes}. Number of nodes in graph: {len(graph.nodes)}")
     return graph
 
-def compute(overlapp_threshold, start_point, path, recompute=False, stop_event=None, toy_problem=False, update_graph=False, flip_winding_direction=False, gt_mesh_file=None, continue_from=0):
+def compute(overlapp_threshold, start_point, path, recompute=False, stop_event=None, toy_problem=False, update_graph=False, flip_winding_direction=False, gt_mesh_file=None, continue_from=0, update_edges=False):
 
     umbilicus_path = os.path.dirname(path) + "/umbilicus.txt"
     start_block, patch_id = (0, 0, 0), 0
@@ -1530,8 +1581,9 @@ def compute(overlapp_threshold, start_point, path, recompute=False, stop_event=N
     
     # Build graph
     if recompute:
+        load_graph_fresh = continue_from <= -2
         start_fresh = continue_from <= -1
-        if start_fresh:
+        if load_graph_fresh:
             scroll_graph = ScrollGraph(overlapp_threshold, umbilicus_path)
         else:
             scroll_graph = load_graph(recompute_path)
@@ -1541,7 +1593,7 @@ def compute(overlapp_threshold, start_point, path, recompute=False, stop_event=N
                 count_gt_added += 1
         print(f"Number of nodes with GT winding angle: {count_gt_added}")
         num_processes = max(1, cpu_count() - 2)
-        start_block, patch_id = scroll_graph.build_graph(path, num_processes=num_processes, start_point=start_point, prune_unconnected=False, start_fresh=start_fresh, gt_mesh_file=gt_mesh_file, continue_from=continue_from)
+        start_block, patch_id = scroll_graph.build_graph(path, num_processes=num_processes, start_point=start_point, prune_unconnected=False, start_fresh=start_fresh, gt_mesh_file=gt_mesh_file, continue_from=continue_from, update_edges=update_edges)
         print("Saving built graph...")
         scroll_graph.save_graph(recompute_path)
     
@@ -1599,7 +1651,7 @@ def random_walks():
                           "cost_threshold_prediction": 2.5, "min_prediction_threshold": 0.15, "nr_points_min": 200.0, "nr_points_max": 4000.0, "min_patch_points": 300.0, 
                           "winding_angle_range": None, "multiple_instances_per_batch_factor": 1.0,
                           "epsilon": 1e-5, "angle_tolerance": 85, "max_threads": 30,
-                          "min_points_winding_switch": 1000, "min_winding_switch_sheet_distance": 3, "max_winding_switch_sheet_distance": 10, "winding_switch_sheet_score_factor": 1.5, "winding_direction": 1.0,
+                          "min_points_winding_switch": 1000, "min_winding_switch_sheet_distance": 4, "max_winding_switch_sheet_distance": 7, "winding_switch_sheet_score_factor": 1.5, "winding_direction": 1.0,
                           "enable_winding_switch": True, "max_same_block_jump_range": 3,
                           "pyramid_up_nr_average": 10000, "nr_walks_per_node":5000,
                           "enable_winding_switch_postprocessing": False,
@@ -1652,7 +1704,8 @@ def random_walks():
     parser.add_argument('--create_graph', help='Create graph. Directly creates the binary .bin graph file from a previously constructed graph .pkl', action='store_true')
     parser.add_argument('--flip_winding_direction', help='Flip winding direction', action='store_true')
     parser.add_argument('--gt_mesh_file', type=str, help='Ground truth mesh file', default=None)
-    parser.add_argument('--continue_from', type=int, help='Continue from a certain point in the graph', default=0)
+    parser.add_argument('--continue_from', type=int, help='Continue from a certain point in the graph', default=-2)
+    parser.add_argument('--update_edges', help='Update edges', action='store_true')
 
     # Take arguments back over
     args = parser.parse_args()
@@ -1704,10 +1757,10 @@ def random_walks():
         scroll_graph_solved.save_graph(save_path.replace("blocks", "graph_BP_solved") + ".pkl")
     else:
         # Compute
-        compute(overlapp_threshold=overlapp_threshold, start_point=start_point, path=path, recompute=recompute, toy_problem=args.toy_problem, update_graph=args.update_graph, flip_winding_direction=args.flip_winding_direction, gt_mesh_file=args.gt_mesh_file, continue_from=args.continue_from)
+        compute(overlapp_threshold=overlapp_threshold, start_point=start_point, path=path, recompute=recompute, toy_problem=args.toy_problem, update_graph=args.update_graph, flip_winding_direction=args.flip_winding_direction, gt_mesh_file=args.gt_mesh_file, continue_from=args.continue_from, update_edges=args.update_edges)
 
 if __name__ == '__main__':
     multiprocessing.set_start_method('spawn') # need sppawn because of open3d initialization deadlock in the init worker function
     random_walks()
 
-# Example command: python3 -m ThaumatoAnakalyptor.instances_to_graph --path /tomato_files/instances --recompute 1
+# Example command: python3 -m ThaumatoAnakalyptor.instances_to_graph --path /scroll.volpkg/working/scroll3_surface_points/point_cloud_colorized_verso_subvolume_blocks --recompute 1
