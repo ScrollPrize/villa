@@ -587,11 +587,11 @@ def process_same_block(main_block_patches_list, overlapp_threshold, umbilicus_di
                 continue
             (score_, k_, valid_), anchor_angle1, anchor_angle2 = score_same_block_patches(main_block_patches_list[i], main_block_patches_list[j], overlapp_threshold, umbilicus_distance)
             if score_ > 0.0:
-                score_switching_sheets_.append((main_block_patches_list[i]['ids'][0], main_block_patches_list[j]['ids'][0], score_, k_, anchor_angle1, anchor_angle2, np.mean(main_block_patches_list[i]["points"], axis=0), np.mean(main_block_patches_list[j]["points"], axis=0), valid_))
+                score_switching_sheets_.append((main_block_patches_list[i]['ids'][0], main_block_patches_list[j]['ids'][0], score_, k_, anchor_angle1, anchor_angle2, np.exp(np.mean(np.log(main_block_patches_list[i]["points"]), axis=0)), np.exp(np.mean(np.log(main_block_patches_list[j]["points"]), axis=0)), valid_))
 
             # Add bad edges
             if valid_:
-                score_bad_edges.append((main_block_patches_list[i]['ids'][0], main_block_patches_list[j]['ids'][0], 1.0, 0.0, anchor_angle1, anchor_angle2, np.mean(main_block_patches_list[i]["points"], axis=0), np.mean(main_block_patches_list[j]["points"], axis=0)))
+                score_bad_edges.append((main_block_patches_list[i]['ids'][0], main_block_patches_list[j]['ids'][0], 1.0, 0.0, anchor_angle1, anchor_angle2, np.exp(np.mean(np.log(main_block_patches_list[i]["points"]), axis=0)), np.exp(np.mean(np.log(main_block_patches_list[j]["points"]), axis=0))))
 
         # filter and only take the scores closest to the main patch (smallest scores) for each k in +1, -1
         direction1_scores = [score for score in score_switching_sheets_ if score[3] > 0.0]
@@ -672,7 +672,7 @@ def process_block(args):
 
     patches_centroids = {}
     for patch in main_block_patches_list:
-        patches_centroids[tuple(patch["ids"][0])] = np.mean(patch["points"], axis=0)
+        patches_centroids[tuple(patch["ids"][0])] = np.exp(np.mean(np.log(patch["points"]), axis=0))
 
     # Extract block's integer ID
     block_id = [int(i) for i in file_path.split('/')[-1].split('.')[0].split("_")]
