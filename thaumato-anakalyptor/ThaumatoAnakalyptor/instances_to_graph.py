@@ -851,6 +851,9 @@ def worker_build_GT(args):
 
     return nodes_winding_alignment
     
+def init_worker_build_graph(centroid_method_):
+    global centroid_method
+    centroid_method = centroid_method_
 
 class ScrollGraph(Graph):
     def __init__(self, overlapp_threshold, umbilicus_path):
@@ -1207,9 +1210,6 @@ class ScrollGraph(Graph):
                     print(f"Node {node_id} not found in graph.")
         print(f"Adjusted winding angles for {count_adjusted_nodes_windings} nodes.")
 
-    def init_worker_build_graph(centroid_method_):
-        global centroid_method
-        centroid_method = centroid_method_
     
     def build_graph(self, path_instances, start_point, num_processes=4, prune_unconnected=False, start_fresh=True, gt_mesh_file=None, continue_from=0, update_edges=False):
         #from original coordinates to instance coordinates
