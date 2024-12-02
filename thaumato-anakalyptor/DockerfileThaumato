@@ -59,7 +59,7 @@ RUN export TORCH_CUDA_ARCH_LIST="6.0 6.1 6.2 7.0 7.2 7.5 8.0 8.6" \
 && cd /workspace/ThaumatoAnakalyptor/mask3d/third_party/pointnet2 && python setup.py install
 
 RUN pip install pytorch-lightning==1.9.5 \
-&& pip install torchmetrics==0.11.4 colorcet py7zr
+&& pip install torchmetrics==0.11.4 colorcet py7zr numba==0.60.0
 
 RUN apt-get update && apt-get install -y libgl1-mesa-glx
 
