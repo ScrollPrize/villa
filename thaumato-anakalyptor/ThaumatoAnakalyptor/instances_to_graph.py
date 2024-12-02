@@ -333,9 +333,11 @@ class Graph:
         self.edges = {}  # Stores edges with update matrices and certainty factors
         self.nodes = {}  # Stores node beliefs and fixed status
 
-    def add_node(self, node, centroid, winding_angle=None):
+    def add_node(self, node, centroid, winding_angle=None, winding_angle_gt=None):
         node = tuple(int(node[i]) for i in range(4))
         self.nodes[node] = {'centroid': centroid, "winding_angle": winding_angle}
+        if not winding_angle_gt is None:
+            self.nodes[node]['winding_angle_gt'] = winding_angle_gt
 
     def compute_node_edges(self, verbose=True):
         """
