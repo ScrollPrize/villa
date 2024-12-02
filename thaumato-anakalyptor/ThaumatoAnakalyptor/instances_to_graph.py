@@ -1208,6 +1208,9 @@ class ScrollGraph(Graph):
         print(f"Adjusted winding angles for {count_adjusted_nodes_windings} nodes.")
 
     def build_graph(self, path_instances, start_point, num_processes=4, prune_unconnected=False, start_fresh=True, gt_mesh_file=None, continue_from=0, update_edges=False):
+        def init_worker(centroid_method_):
+            global centroid_method
+            centroid_method = centroid_method_
         #from original coordinates to instance coordinates
         start_block, patch_id = (0, 0, 0), 0
         self.start_block, self.patch_id, self.start_point = start_block, patch_id, start_point
@@ -1219,7 +1222,7 @@ class ScrollGraph(Graph):
             print(f"Found {len(blocks_files)} blocks.")
             print("Building graph...")
             # Create a pool of worker processes
-            with Pool(num_processes) as pool:
+            with Pool(num_processes, initializer=init_worker, initargs=(centroid_method,)) as pool:
                 # Map the process_block function to each file
                 zipped_args = list(zip(blocks_files, [path_instances] * len(blocks_files), [self.overlapp_threshold] * len(blocks_files), [self.umbilicus_data] * len(blocks_files)))
                 results = list(tqdm(pool.imap(process_block, zipped_args), total=len(zipped_args)))
