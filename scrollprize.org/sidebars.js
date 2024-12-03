@@ -13,6 +13,14 @@
 
 /** @type {import('@docusaurus/plugin-content-docs').SidebarsConfig} */
 const sidebars = {
+  jobsSidebar: [
+    {
+      type: 'html',
+      value: '<a class="navbar__brand custom-top-header" href="/"><div class="navbar__logo"><img src="/img/social/favicon-64x64.png" alt="Vesuvius Challenge Logo" class="themedImage_ToTc themedImage--dark_i4oU"></div><b class="navbar__title text--truncate">Vesuvius Challenge</b></a>'
+    },
+    { type: 'doc', id: 'landing' },
+    { type: 'doc', id: 'jobs' },
+  ],
   overviewSidebar: [
     {
       type: 'html',

@@ -63,6 +63,55 @@ const config = {
         },
         items: [],
       },
+      footer: {
+        style: 'dark',
+        links: [
+          {
+            title: 'Overview',
+            items: [
+              {
+                label: 'Getting Started',
+                to: '/get_started',
+              },
+              {
+                label: 'Master Plan',
+                to: '/master_plan',
+              }
+            ],
+          },
+          {
+            title: 'Community',
+            items: [
+              {
+                label: 'Discord',
+                href: 'https://discord.gg/V4fJhvtaQn',
+              },
+              {
+                label: 'Substack',
+                href: 'https://scrollprize.substack.com',
+              },
+              {
+                label: 'GitHub',
+                href: 'https://github.com/ScrollPrize/villa',
+              },
+              {
+                label: '𝕏',
+                href: 'https://x.com/scrollprize',
+              },
+            ],
+          },
+          {
+            title: 'More',
+            items: [
+              {
+                label: 'Jobs',
+                to: '/jobs', // Adjust the path if needed
+              },
+            ],
+          },
+        ],
+        copyright: `Copyright © ${new Date().getFullYear()} Vesuvius Challenge.`,
+      },
       metadata: [
         // Primary Meta Tags
         {

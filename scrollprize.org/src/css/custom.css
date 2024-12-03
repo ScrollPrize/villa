@@ -78,7 +78,9 @@ figcaption {
 /* .navbar, */
 .theme-doc-toc-mobile,
 .footer {
-  display: none !important;
+  background-color: var(--ifm-background-color);
+  border-top: 1px solid #2F3237 !important;
+  z-index: 1;
 }
 
 .docs-doc-id-landing main {
