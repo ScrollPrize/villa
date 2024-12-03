@@ -139,11 +139,13 @@ def build_patch(main_sheet_patch, subvolume_size, path, sample_ratio=1.0, align_
     x, y, z, id_ = patch_id
     anchor_normal = get_vector_mean(patch_normals)
     anchor_angle = alpha_angles(np.array([anchor_normal]))[0]
+    centroid = np.mean(patch_points, axis=0)
 
     additional_main_patch = {"ids": [patch_id],
                     "points": patch_points,
                     "normals": patch_normals,
                     "colors": patch_color,
+                    "centroid": centroid,
                     "anchor_points": [patch_points[0]], 
                     "anchor_normals": [anchor_normal],
                     "anchor_angles": [anchor_angle],
@@ -526,8 +528,8 @@ def score_same_block_patches(patch1, patch2, overlapp_threshold, umbilicus_dista
     score = score_val * overlapp_threshold["winding_switch_sheet_score_factor"]
 
     # Centroid distance between patches
-    centroid1 = np.mean(patch1["points"], axis=0)
-    centroid2 = np.mean(patch2["points"], axis=0)
+    centroid1 = patch1["centroid"]
+    centroid2 = patch2["centroid"]
     centroid_distance = np.linalg.norm(centroid1 - centroid2)
 
     # Check for enough points
@@ -579,10 +581,10 @@ def process_same_block(main_block_patches_list, overlapp_threshold, umbilicus_di
                 continue
             (score_, k_), anchor_angle1, anchor_angle2 = score_same_block_patches(main_block_patches_list[i], main_block_patches_list[j], overlapp_threshold, umbilicus_distance)
             if score_ > 0.0:
-                score_switching_sheets_.append((main_block_patches_list[i]['ids'][0], main_block_patches_list[j]['ids'][0], score_, k_, anchor_angle1, anchor_angle2, np.mean(main_block_patches_list[i]["points"], axis=0), np.mean(main_block_patches_list[j]["points"], axis=0)))
+                score_switching_sheets_.append((main_block_patches_list[i]['ids'][0], main_block_patches_list[j]['ids'][0], score_, k_, anchor_angle1, anchor_angle2, main_block_patches_list[i]["centroid"], main_block_patches_list[j]["centroid"]))
 
             # Add bad edges
-            score_bad_edges.append((main_block_patches_list[i]['ids'][0], main_block_patches_list[j]['ids'][0], 1.0, 0.0, anchor_angle1, anchor_angle2, np.mean(main_block_patches_list[i]["points"], axis=0), np.mean(main_block_patches_list[j]["points"], axis=0)))
+            score_bad_edges.append((main_block_patches_list[i]['ids'][0], main_block_patches_list[j]['ids'][0], 1.0, 0.0, anchor_angle1, anchor_angle2, main_block_patches_list[i]["centroid"], main_block_patches_list[j]["centroid"]))
 
         # filter and only take the scores closest to the main patch (smallest scores) for each k in +1, -1
         direction1_scores = [score for score in score_switching_sheets_ if score[3] > 0.0]
@@ -640,8 +642,8 @@ def process_block(args):
     file_path, path_instances, overlapp_threshold, umbilicus_data = args
     umbilicus_func = lambda z: umbilicus_xz_at_y(umbilicus_data, z)
     def umbilicus_distance(patch1, patch2):
-        centroid1 = np.mean(patch1["points"], axis=0)
-        centroid2 = np.mean(patch2["points"], axis=0)
+        centroid1 = patch1["centroid"]
+        centroid2 = patch2["centroid"]
         def d_(patch_centroid):
             umbilicus_point = umbilicus_func(patch_centroid[1])
             patch_centroid_vec = patch_centroid - umbilicus_point
@@ -653,7 +655,7 @@ def process_block(args):
 
     patches_centroids = {}
     for patch in main_block_patches_list:
-        patches_centroids[tuple(patch["ids"][0])] = np.mean(patch["points"], axis=0)
+        patches_centroids[tuple(patch["ids"][0])] = patch["centroid"]
 
     # Extract block's integer ID
     block_id = [int(i) for i in file_path.split('/')[-1].split('.')[0].split("_")]
@@ -684,7 +686,7 @@ def process_block(args):
                 patches_list_ = [main_block_patch, surrounding_block_patch]
                 score_ = score_other_block_patches(patches_list_, 0, 1, overlapp_threshold) # score, anchor_angle1, anchor_angle2
                 if score_[0] > overlapp_threshold["final_score_min"]:
-                    score_sheets_patch.append((main_block_patch['ids'][0], surrounding_block_patch['ids'][0], score_[0], None, score_[1], score_[2], np.mean(main_block_patch["points"], axis=0), np.mean(surrounding_block_patch["points"], axis=0)))
+                    score_sheets_patch.append((main_block_patch['ids'][0], surrounding_block_patch['ids'][0], score_[0], None, score_[1], score_[2], main_block_patch["centroid"], surrounding_block_patch["centroid"]))
 
             # Find the best score for each main block patch
             if len(score_sheets_patch) > 0:
