@@ -208,11 +208,13 @@ def build_patch(main_sheet_patch, subvolume_size, path, sample_ratio=1.0, align_
     x, y, z, id_ = patch_id
     anchor_normal = get_vector_mean(patch_normals)
     anchor_angle = alpha_angles(np.array([anchor_normal]))[0]
+    centroid = centroid_method(patch_points)
 
     additional_main_patch = {"ids": [patch_id],
                     "points": patch_points,
                     "normals": patch_normals,
                     "colors": patch_color,
+                    "centroid": centroid,
                     "anchor_points": [patch_points[0]], 
                     "anchor_normals": [anchor_normal],
                     "anchor_angles": [anchor_angle],
@@ -658,11 +660,11 @@ def process_same_block(main_block_patches_list, overlapp_threshold, umbilicus_di
                 continue
             (score_, k_, valid_), anchor_angle1, anchor_angle2 = score_same_block_patches(main_block_patches_list[i], main_block_patches_list[j], overlapp_threshold, umbilicus_distance)
             if score_ > 0.0:
-                score_switching_sheets_.append((main_block_patches_list[i]['ids'][0], main_block_patches_list[j]['ids'][0], score_, k_, anchor_angle1, anchor_angle2, centroid_method(main_block_patches_list[i]["points"]), centroid_method(main_block_patches_list[j]["points"]), valid_))
+                score_switching_sheets_.append((main_block_patches_list[i]['ids'][0], main_block_patches_list[j]['ids'][0], score_, k_, anchor_angle1, anchor_angle2, main_block_patches_list[i]["centroid"], main_block_patches_list[j]["centroid"], valid_))
 
             # Add bad edges
             if valid_:
-                score_bad_edges.append((main_block_patches_list[i]['ids'][0], main_block_patches_list[j]['ids'][0], 1.0, 0.0, anchor_angle1, anchor_angle2, centroid_method(main_block_patches_list[i]["points"]), centroid_method(main_block_patches_list[j]["points"])))
+                score_bad_edges.append((main_block_patches_list[i]['ids'][0], main_block_patches_list[j]['ids'][0], 1.0, 0.0, anchor_angle1, anchor_angle2, main_block_patches_list[i]["centroid"], main_block_patches_list[j]["centroid"]))
 
         # filter and only take the scores closest to the main patch (smallest scores) for each k in +1, -1
         direction1_scores = [score for score in score_switching_sheets_ if score[3] > 0.0]
@@ -721,8 +723,8 @@ def process_block(args):
     umbilicus_func = lambda z: umbilicus_xz_at_y(umbilicus_data, z)
     def umbilicus_distance(patch1, patch2):
         # Geometric mean
-        geo1 = centroid_method(patch1["points"])
-        geo2 = centroid_method(patch2["points"])
+        geo1 = patch1["centroid"]
+        geo2 = patch2["centroid"]
         assert geo1.shape[0] == 3, "Points must be 3D."
         def d_(patch_point):
             umbilicus_point = umbilicus_func(patch_point[1])
@@ -743,7 +745,7 @@ def process_block(args):
 
     patches_centroids = {}
     for patch in main_block_patches_list:
-        patches_centroids[tuple(patch["ids"][0])] = centroid_method(patch["points"])
+        patches_centroids[tuple(patch["ids"][0])] = patch["centroid"]
 
     # Extract block's integer ID
     block_id = [int(i) for i in file_path.split('/')[-1].split('.')[0].split("_")]
@@ -774,7 +776,7 @@ def process_block(args):
                 patches_list_ = [main_block_patch, surrounding_block_patch]
                 score_ = score_other_block_patches(patches_list_, 0, 1, overlapp_threshold) # score, anchor_angle1, anchor_angle2
                 if score_[0] > overlapp_threshold["final_score_min"]:
-                    score_sheets_patch.append((main_block_patch['ids'][0], surrounding_block_patch['ids'][0], score_[0], None, score_[1], score_[2], centroid_method(main_block_patch["points"]), centroid_method(surrounding_block_patch["points"])))
+                    score_sheets_patch.append((main_block_patch['ids'][0], surrounding_block_patch['ids'][0], score_[0], None, score_[1], score_[2], main_block_patch["centroid"], surrounding_block_patch["centroid"]))
 
             # Find the best score for each main block patch
             if len(score_sheets_patch) > 0:
