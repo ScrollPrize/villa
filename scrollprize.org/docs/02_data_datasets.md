@@ -57,3 +57,15 @@ This dataset contains a subset of Scroll 1, chunked into 256x256x256 cubes.
 For each cube, the original scroll volume data and the instance segmentation data are provided (each in `.nrrd` format).
 - [README](https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumetric-instance-labels/README.txt)
 - [.zip download](https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumetric-instance-labels/instance-labels-harmonized.zip) (1.4 GB)
+
+## `GrandPrizeBannerRegion`
+
+Data related to the Grand Prize (GP) region from `Scroll1`. The dataset includes volumes and meshes associated to manual segmentation of surfaces.
+
+- [README](https://dl.ash2txt.org/datasets/GrandPrizeBannerRegion/README.txt)
+- [gp_meshes.7z](https://dl.ash2txt.org/datasets/GrandPrizeBannerRegion/gp_meshes.7z) (288 MB)
+- [gp_volume.zarr/](https://dl.ash2txt.org/datasets/GrandPrizeBannerRegion/volumes/gp_volume.zarr) (77 GB)
+- [gp_tifstack.7z](https://dl.ash2txt.org/datasets/GrandPrizeBannerRegion/volumes/gp_tifstack.7z) (389.9 GB)
+
+
+
