@@ -261,6 +261,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Scroll pretraining](https://github.com/younader/VesuviusPretraining) by Youssef Nader. Youssef’s original idea for pretraining on the scrolls and finetuning on the fragments, which led him to winning the First Letters Prize.
 
+- [pre-trained DINOv2 models](https://github.com/SergeyPnev/dinov2-vesuvius) by Sergei Pnev. Self-supervised model pre-trained on scrolls 1-5 with predictions.
 #### 📦 Materials
 
 - [Ink Labels](https://discord.com/channels/1079907749569237093/1223849912467460116). Nicola Bodill produced more accurate labels for ink detection based on the prediction of the Grand Prize winner model
