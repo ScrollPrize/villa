@@ -97,6 +97,8 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 def read_image_mask(fragment_id,start_idx=18,end_idx=38,rotation=0):
     images = []
     idxs = range(start_idx, end_idx)
+    orig_h, orig_w = None, None
+    pad0, pad1 = None, None
 
     for i in idxs:
         fragment_path = f"{args.segment_path}/{fragment_id}/layers/{i:02}"
@@ -127,7 +129,7 @@ def read_image_mask(fragment_id,start_idx=18,end_idx=38,rotation=0):
         # White mask
         fragment_mask = np.ones_like(images[:,:,0]) * 255
 
-    return images, fragment_mask
+    return images, fragment_mask, (orig_h, orig_w), (pad0, pad1)
 
 def get_img_splits(fragment_id,s,e,rotation=0):
     images = []
@@ -137,7 +139,7 @@ def get_img_splits(fragment_id,s,e,rotation=0):
     print('reading ',fragment_id)
     # check for superseded fragment
     try:
-        image,fragment_mask = read_image_mask(fragment_id, s,e,rotation)
+        image, fragment_mask, (orig_h, orig_w), (pad0, pad1) = read_image_mask(fragment_id, s, e, rotation)
     except Exception as e:
         print("aborted reading fragment", fragment_id, e)
         return None
@@ -165,7 +167,7 @@ def get_img_splits(fragment_id,s,e,rotation=0):
                               shuffle=False,
                               num_workers=args.workers, pin_memory=(args.gpus==1), drop_last=False,
                               )
-    return test_loader, np.stack(xyxys),(image.shape[0],image.shape[1]),fragment_mask
+    return test_loader, np.stack(xyxys), (image.shape[0], image.shape[1]), fragment_mask, (orig_h, orig_w), (pad0, pad1)
 
 def get_transforms(data, cfg):
     if data == 'valid':
@@ -293,16 +295,17 @@ if __name__ == "__main__":
                         img_split = get_img_splits(fragment_id,start_f,end_f,r)
                         if img_split is None:
                             continue
-                        test_loader,test_xyxz,test_shape,fragment_mask = img_split
-                        mask_pred = predict_fn(test_loader, model, device, test_xyxz,test_shape)
-                        mask_pred = np.clip(np.nan_to_num(mask_pred),a_min=0,a_max=1)
-                        mask_pred /= mask_pred.max()
+                        test_loader, test_xyxz, (padded_h, padded_w), fragment_mask, (orig_h, orig_w), (pad0, pad1) = img_split
+                        mask_pred = predict_fn(test_loader, model, device, test_xyxz, (padded_h, padded_w))
+                        unpadded_pred = mask_pred[:orig_h, :orig_w]
+                        unpadded_pred = np.clip(np.nan_to_num(unpadded_pred), a_min=0, a_max=1)
+                        unpadded_pred /= unpadded_pred.max()
 
                         preds.append(mask_pred)
 
                         if len(args.out_path) > 0:
                             # CV2 image
-                            image_cv = (mask_pred * 255).astype(np.uint8)
+                            image_cv = (unpadded_pred * 255).astype(np.uint8)
                             try:
                                 os.makedirs(args.out_path,exist_ok=True)
                             except:
