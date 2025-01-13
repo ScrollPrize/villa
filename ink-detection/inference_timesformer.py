@@ -106,8 +106,10 @@ def read_image_mask(fragment_id,start_idx=18,end_idx=38,rotation=0):
             image = cv2.imread(f"{fragment_path}.tif", 0)
         else:
             image = cv2.imread(f"{fragment_path}.jpg", 0)
-        pad0 = (256 - image.shape[0] % 256)
-        pad1 = (256 - image.shape[1] % 256)
+        if orig_h is None:
+            orig_h, orig_w = image.shape
+            pad0 = (256 - (orig_h % 256)) if (orig_h % 256) != 0 else 0
+            pad1 = (256 - (orig_w % 256)) if (orig_w % 256) != 0 else 0
         image = np.pad(image, [(0, pad0), (0, pad1)], constant_values=0)
         image=np.clip(image,0,200)
         images.append(image)
