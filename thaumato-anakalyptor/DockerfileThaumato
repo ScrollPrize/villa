@@ -144,7 +144,7 @@ WORKDIR /workspace/ThaumatoAnakalyptor/sheet_generation/build/
 # print out the contents of the current working directory
 RUN ls -la
 
-RUN cmake .. \
+RUN cmake -DPYTHON_EXECUTABLE=$(which python3) .. \
 && cmake --build .
 
 # Build the graph_problem
