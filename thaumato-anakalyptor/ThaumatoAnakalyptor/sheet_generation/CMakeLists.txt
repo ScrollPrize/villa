@@ -9,6 +9,12 @@ set(CMAKE_CXX_STANDARD 17)
 # Add optimization flags for the release build
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 
+find_package(PythonInterp REQUIRED)
+find_package(PythonLibs REQUIRED)
+
+include_directories(${PYTHON_INCLUDE_DIRS})
+link_directories(${PYTHON_LIBRARIES})
+
 # Add pybind11 submodule
 add_subdirectory(pybind11)
 
@@ -32,6 +38,6 @@ pybind11_add_module(sheet_generation solver.cpp)
 pybind11_add_module(pointcloud_processing pointcloud_processing.cpp)
 pybind11_add_module(meshing_utils meshing_utils.cpp)
 # Link YAML-CPP library
-target_link_libraries(sheet_generation PRIVATE yaml-cpp Eigen3::Eigen ${CMAKE_THREAD_LIBS_INIT})
-target_link_libraries(pointcloud_processing PRIVATE ${CMAKE_THREAD_LIBS_INIT} ${LibArchive_LIBRARIES} TBB::tbb hdbscan OpenMP::OpenMP_CXX)
-target_link_libraries(meshing_utils PRIVATE ${CMAKE_THREAD_LIBS_INIT} ${LibArchive_LIBRARIES} TBB::tbb hdbscan OpenMP::OpenMP_CXX)
+target_link_libraries(sheet_generation PRIVATE yaml-cpp Eigen3::Eigen ${CMAKE_THREAD_LIBS_INIT} ${PYTHON_LIBRARIES})
+target_link_libraries(pointcloud_processing PRIVATE ${CMAKE_THREAD_LIBS_INIT} ${LibArchive_LIBRARIES} TBB::tbb hdbscan OpenMP::OpenMP_CXX ${PYTHON_LIBRARIES})
+target_link_libraries(meshing_utils PRIVATE ${CMAKE_THREAD_LIBS_INIT} ${LibArchive_LIBRARIES} TBB::tbb hdbscan OpenMP::OpenMP_CXX ${PYTHON_LIBRARIES})
