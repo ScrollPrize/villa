@@ -557,7 +557,7 @@ def compute(base_path, input_mesh, input_raw_pointcloud, input_instance_pointclo
             # make dirs
             os.makedirs(base_path, exist_ok=True)
             with open(os.path.join(base_path, "development1.pkl"), "wb") as f:
-                pickle.dump(gt_splitter.vertices_np, f)
+                pickle.dump(mesh1_splitter.vertices_np, f)
         else:
             with open(os.path.join(base_path, "development1.pkl"), "rb") as f:
                 mesh1_splitter.vertices_np = pickle.load(f)
