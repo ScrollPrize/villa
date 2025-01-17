@@ -130,6 +130,9 @@ libarchive-dev \
 libtbb-dev  \
 libopencv-dev
 
+RUN pip uninstall opencv-python-headless opencv-python -y
+RUN pip install opencv-python
+
 # build C++ ThaumatoAnakalyptor code with the submodules
 RUN git clone --recurse-submodules https://github.com/schillij95/ThaumatoAnakalyptor /ThaumatoAnakalyptor_temp
 RUN mkdir -p /workspace
@@ -144,7 +147,7 @@ WORKDIR /workspace/ThaumatoAnakalyptor/sheet_generation/build/
 # print out the contents of the current working directory
 RUN ls -la
 
-RUN cmake -DPYTHON_EXECUTABLE=$(which python3) .. \
+RUN cmake .. \
 && cmake --build .
 
 # Build the graph_problem
