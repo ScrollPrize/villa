@@ -108,7 +108,7 @@ This example shows how to do segmentation on Scroll 3 (PHerc0332).
     cd ThaumatoAnakalyptor/sheet_generation
     mkdir build
     cd build
-    cmake ..
+    cmake -DPYTHON_EXECUTABLE=$(which python3) ..
     cmake --build .
     ```
 
