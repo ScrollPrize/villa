@@ -1,4 +1,6 @@
 /build
+/experiments
+/python*
 *.bin
 histogram.png
 histogram/
