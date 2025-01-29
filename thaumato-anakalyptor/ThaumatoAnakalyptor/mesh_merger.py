@@ -62,7 +62,7 @@ def save_mesh(save_mesh_path, mesh):
 
 def calculate_winding_angle(mesh_path, pointcloud_dir):
     umbilicus_path = os.path.join(os.path.dirname(pointcloud_dir), "umbilicus.txt")
-    splitter =  MeshSplitter(mesh_path, umbilicus_path)
+    splitter = MeshSplitter(mesh_path, umbilicus_path, use_tempfile=True)
     # splitter.compute_uv_with_bfs(np.random.randint(0, splitter.vertices_np.shape[0]))
     splitter.compute_uv_with_bfs(0) # for production
     winding_angles = splitter.vertices_np[:, 0]
