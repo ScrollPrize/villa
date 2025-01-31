@@ -4,3 +4,5 @@ wandb/
 scroll*/
 lightning_logs/
 overlapp_threshold.yaml
+python*/
+experiments/
