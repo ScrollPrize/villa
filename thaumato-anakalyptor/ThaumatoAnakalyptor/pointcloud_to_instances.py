@@ -2,14 +2,17 @@
 
 import numpy as np
 import os
+import shutil
 import open3d as o3d
 #import tarfile
 import py7zr
+import tarfile
+import h5py
 import time
 # import colorcet as cc
 # surface points extraction
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import BasePredictionWriter
 
@@ -30,6 +33,73 @@ import argparse
 
 from .surface_fitting_utilities import get_vector_mean, rotation_matrix_to_align_z_with_v, optimize_sheet
 from .grid_to_pointcloud import load_xyz_from_file, umbilicus, umbilicus_xz_at_y, fix_umbilicus_recompute
+
+def get_optimized_rotation_matrix(angles):
+    """
+    Computes the optimized 3D rotation matrix using extrinsic Euler angles.
+
+    Parameters:
+    angles (tuple): Rotation angles (Rx, Ry, Rz) in degrees.
+
+    Returns:
+    numpy.ndarray: The 3x3 rotation matrix.
+    """
+    # Convert angles to radians
+    theta_x, theta_y, theta_z = np.radians(angles)
+
+    # Rotation matrix around X-axis
+    R_x = np.array([
+        [1,  0,               0],
+        [0,  np.cos(theta_x), -np.sin(theta_x)],
+        [0,  np.sin(theta_x), np.cos(theta_x)]
+    ])
+
+    # Rotation matrix around Y-axis
+    R_y = np.array([
+        [np.cos(theta_y),  0, np.sin(theta_y)],
+        [0,               1, 0],
+        [-np.sin(theta_y), 0, np.cos(theta_y)]
+    ])
+
+    # Rotation matrix around Z-axis
+    R_z = np.array([
+        [np.cos(theta_z), -np.sin(theta_z), 0],
+        [np.sin(theta_z), np.cos(theta_z),  0],
+        [0,               0,                1]
+    ])
+
+    # Compute the final extrinsic rotation matrix: R = Rz * Ry * Rx
+    R_final = np.dot(R_z, np.dot(R_y, R_x))
+
+    return R_final
+
+
+def transform_to_new_system(R, points):
+    """
+    Transforms points from the original coordinate system to the new coordinate system.
+
+    Parameters:
+    R (numpy.ndarray): 3x3 rotation matrix.
+    points (numpy.ndarray): Nx3 array of points in the original coordinate system.
+
+    Returns:
+    numpy.ndarray: Transformed points in the new coordinate system.
+    """
+    return np.dot(points, R.T)  # Apply rotation
+
+
+def transform_to_original_system(R, points):
+    """
+    Transforms points from the new coordinate system back to the original coordinate system.
+
+    Parameters:
+    R (numpy.ndarray): 3x3 rotation matrix.
+    points (numpy.ndarray): Nx3 array of points in the new coordinate system.
+
+    Returns:
+    numpy.ndarray: Transformed points back in the original coordinate system.
+    """
+    return np.dot(points, R)  # Apply inverse rotation (R.T is the inverse of a rotation matrix)
 
 def load_ply(filename, main_drive="", alternative_drives=[]):
     """
@@ -70,7 +140,7 @@ def save_surface_ply(surface_points, normals, colors, score, distance, coeff, n,
     metadata = {
         'score': float(score),
         'distance': float(distance),
-        'coeff': [float(item) for item in coeff.tolist()], # Convert numpy array to list for JSON serialization
+        'coeff': [float(item) for item in list(coeff)], # Convert numpy array to list for JSON serialization
         'n': int(n),
     }
     
@@ -83,15 +153,18 @@ def save_surface_ply(surface_points, normals, colors, score, distance, coeff, n,
         json.dump(metadata, metafile)
 
 def save_block_ply_args(args):
+    # print("save_block_ply_args")
     save_block_ply(*args)
 
-def save_block_ply(block_points, block_normals, block_colors, block_scores, block_name, score_threshold=0.5, distance_threshold=10.0, n=4, alpha=1000.0, slope_alpha=0.1, post_process=True, block_distances_precomputed=None, block_coeffs_precomputed=None, check_exist=True):
+def save_block_ply(block_points, block_normals, block_colors, block_scores, block_name, score_threshold=0.5, distance_threshold=10.0, n=4, alpha=1000.0, slope_alpha=0.1, post_process=True, block_distances_precomputed=None, block_coeffs_precomputed=None, check_exist=True, use_7z=True):
     # Check if 7z file exists
+    # print(f"Saving {block_name}")
     if check_exist and os.path.exists(block_name + '.7z'):
         return
 
     # Save to a temporary file first to ensure data integrity
     temp_block_name = block_name + "_temp"
+    # print(f"Saving {temp_block_name}")
 
     # Check if folder exists
     if not os.path.exists(block_name):
@@ -130,30 +203,112 @@ def save_block_ply(block_points, block_normals, block_colors, block_scores, bloc
 
     used_name_block = block_name if os.path.exists(block_name) else temp_block_name
 
-    # Create the 7z archive
-    with py7zr.SevenZipFile(temp_block_name + '.7z', 'w') as archive:
-        archive.writeall(used_name_block, '')
+
+    archive_name_type = temp_block_name + '.7z' if use_7z else temp_block_name + '.tar'
+    block_name_type = block_name + '.7z' if use_7z else block_name + '.tar'
+    if use_7z:
+        # Create the 7z archive
+        with py7zr.SevenZipFile(archive_name_type, 'w') as archive:
+            try:
+                archive.writeall(used_name_block, '')
+            except Exception as e:
+                print(e)
+                print(f"Error writing {used_name_block} to {temp_block_name}.7z")
+    else:
+        # Tar the temp folder without including the 'temp' name inside the tar
+        with tarfile.open(archive_name_type, 'w') as tar:
+            for root, _, files in os.walk(used_name_block):
+                for file in files:
+                    full_file_path = os.path.join(root, file)
+                    arcname = full_file_path[len(used_name_block) + 1:]
+                    tar.add(full_file_path, arcname=arcname)
 
     # Remove the temp folder
-    for root, dirs, files in os.walk(used_name_block, topdown=False):
-        for file in files:
-            os.remove(os.path.join(root, file))
-        for dir in dirs:
-            os.rmdir(os.path.join(root, dir))
-    
     try:
-        os.rmdir(used_name_block)
+        shutil.rmtree(used_name_block)
     except Exception as e:
         print(e)
         print(f"Error removing {used_name_block}")
 
     # Rename the 7z archive to the original filename (without '_temp')
     try:
-        os.rename(temp_block_name + '.7z', block_name + '.7z')
+        os.rename(archive_name_type, block_name_type)
         #print(f"Saved {block_name}.7z")
     except Exception as e:
         print(e)
         print(f"Error renaming {temp_block_name}.7z to {block_name}.7z")
+        
+def save_block_h5_args(args):
+    # print("save_block_h5_args")
+    save_block_h5(*args)
+
+def save_block_h5(block_points, block_normals, block_colors, block_scores, block_name, 
+                  score_threshold=0.5, distance_threshold=10.0, 
+                  n=4, alpha=1000.0, slope_alpha=0.1, post_process=True, 
+                  block_distances_precomputed=None, block_coeffs_precomputed=None, 
+                  check_exist=True):
+    """
+    Saves point cloud data into an HDF5 file using the block_name as the group identifier.
+    """
+    group_name = os.path.basename(block_name)
+    h5_filename = os.path.dirname(block_name) + ".h5"
+    # Check if block already exists in HDF5 file
+    if os.path.exists(h5_filename):
+        # with h5py.File(h5_filename, "r") as h5f:
+        #     if block_name in h5f:
+        #         print(f"Block {block_name} already exists in {h5_filename}. Skipping...")
+        #         return
+        pass
+    else:
+        # Create a new HDF5 file (this will overwrite if it exists)
+        with h5py.File(h5_filename, "w") as h5f:
+            pass #  pass just to have the h5f in the scope and being created
+
+    # Post-process the data if required
+    if post_process:
+        block_points, block_normals, block_colors, block_scores, block_distances, block_coeffs = post_process_surfaces(
+            block_points, block_normals, block_colors, block_scores, 
+            score_threshold=score_threshold, distance_threshold=distance_threshold, 
+            n=n, alpha=alpha, slope_alpha=slope_alpha)
+    else:
+        assert (block_distances_precomputed is not None) and (block_coeffs_precomputed is not None), \
+            "block_distances_precomputed and block_coeffs_precomputed must be provided if post_process=False"
+        block_distances = block_distances_precomputed
+        block_coeffs = block_coeffs_precomputed
+
+    # Skip if too few points
+    if sum(len(block) for block in block_points) < 10:
+        print(f"Skipping block {block_name} due to insufficient points.")
+        return
+
+    # Open HDF5 file in append mode
+    with h5py.File(h5_filename, "a") as h5f:
+        # check if group exists
+        if group_name in h5f:
+            # overwrite
+            del h5f[group_name]
+        # Create a group for the block
+        grp = h5f.create_group(group_name)
+
+        for nr_surface in range(len(block_points)):
+            if len(block_points[nr_surface]) < 10:
+                continue
+            # new group in the block group
+            surface_grp = grp.create_group(f"surface_{nr_surface}")
+            surface_grp.create_dataset("points", data=block_points[nr_surface], compression="gzip")
+            surface_grp.create_dataset("normals", data=block_normals[nr_surface], compression="gzip")
+            surface_grp.create_dataset("colors", data=block_colors[nr_surface], compression="gzip")
+            surface_grp.create_dataset("coeffs", data=np.array(block_coeffs[nr_surface]), compression="gzip")
+            
+            # Store metadata attributes
+            surface_grp.attrs["score_threshold"] = score_threshold
+            surface_grp.attrs["distance_threshold"] = distance_threshold
+            surface_grp.attrs["n"] = n
+            surface_grp.attrs["alpha"] = alpha
+            surface_grp.attrs["slope_alpha"] = slope_alpha
+            surface_grp.attrs["scores"] = block_scores[nr_surface]
+            surface_grp.attrs["distances"] = block_distances[nr_surface]
+            
 
 def post_process_surfaces(surfaces, surfaces_normals, surfaces_colors, scores, score_threshold=0.5, distance_threshold=10.0, n=4, alpha = 1000.0, slope_alpha = 0.1):
     indices = [] # valid surfaces
@@ -213,9 +368,9 @@ def load_single_ply(ply_file, grid_block_size, main_drive="", alternative_drives
 def load_plys(src_folder, main_drive, alternative_drives, start, size, grid_block_size=200, num_processes=3, load_multithreaded=True, executor=None):
     path_template = "cell_yxz_{:03}_{:03}_{:03}.ply"
     ply_files = []
-    for x in range(start[0], start[0]+size[0]):
-        for y in range(start[1], start[1]+size[1]):
-            for z in range(start[2], start[2]+size[2]):
+    for x in range(start[0]-2, start[0]+size[0]+1):
+        for y in range(start[1]-2, start[1]+size[1]+1):
+            for z in range(start[2]-2, start[2]+size[2]+1):
                 ply_files.append(os.path.join(src_folder, path_template.format(x,y,z)))
 
     if executor and load_multithreaded:
@@ -253,6 +408,55 @@ def load_plys(src_folder, main_drive, alternative_drives, start, size, grid_bloc
 
     return points, normals, colors
 
+def load_pc_start(src_folder, main_drive, alternative_drives, start, grid_block_size=200, load_multithreaded=True, executor=None):
+    path_template = "cell_yxz_{:03}_{:03}_{:03}.ply"
+    indices = start_to_cell_indices(start, grid_block_size)
+    points = []
+    normals = []
+    colors = []
+
+    ply_files = []
+    for index in indices:
+        ply_file = os.path.join(src_folder, path_template.format(index[0], index[1], index[2]))
+        ply_files.append(ply_file)
+
+    if executor and load_multithreaded:
+        # Prepare the tasks
+        tasks = [(ply_file, grid_block_size, main_drive, alternative_drives) for ply_file in ply_files]
+        # Schedule the tasks and collect the futures
+        futures = [executor.submit(load_single_ply, *task) for task in tasks]
+        # Wait for the futures to complete and collect the results
+        results = [future.result() for future in futures]
+    elif load_multithreaded:
+        with Pool(processes=3) as pool:
+            results = pool.starmap(load_single_ply, [(ply_file, grid_block_size, main_drive, alternative_drives) for ply_file in ply_files])
+    else:
+        results = [load_single_ply(ply_file, grid_block_size, main_drive, alternative_drives) for ply_file in ply_files]
+
+    # Filter out None results
+    results = [res for res in results if res is not None]
+
+    if len(results) == 0:
+        return None
+    
+    # Unzip the results to get points, normals, and colors lists
+    points, normals, colors = zip(*results)
+
+    points = np.concatenate(points, axis=0)
+    normals = np.concatenate(normals, axis=0)
+    colors = np.concatenate(colors, axis=0)
+
+    # Randomly shuffle the points (for data looking more like the training data during instance prediction with mask3d)
+    indices = np.arange(points.shape[0])
+    np.random.shuffle(indices)
+    points = points[indices]
+    normals = normals[indices]
+    colors = colors[indices]
+
+    points, normals, colors = remove_duplicate_points_normals(points, normals, colors)
+
+    return points, normals, colors
+        
 def extract_subvolume(points, normals, colors, angles, start, size=50):
     """
     Extract a subvolume of size "size" from "points" starting at "start".
@@ -261,44 +465,78 @@ def extract_subvolume(points, normals, colors, angles, start, size=50):
     if isinstance(size, int):
         size = np.array([size, size, size])
 
-    # Ensure start is in shape (a, 3)
-    if start.shape == (3,):
-        start = np.expand_dims(start, axis=0)
+    start_ = np.array(start).copy() + np.array(size).copy() // 2
+    max_d = max(size) / (2.0 ** 0.5)  # maximum distance from the center of the subvolume
+    # remove points that are too far away
+    mask = np.all(np.abs(points.copy() - start_) <= max_d, axis=1)
+    points = points[mask]
+    normals = normals[mask]
+    colors = colors[mask]
+    angles = angles[mask]
 
-    # Ensure size is in shape (a, 3)
-    if size.shape == (3,):
-        size = np.expand_dims(size, axis=0)
-
+    # random rotation
+    random_angles = np.random.randint(0, 360, size=(3))
+    R = get_optimized_rotation_matrix(tuple(random_angles))
+    # translate to system 2
+    points_2 = transform_to_new_system(R, points.copy() - start_) + start_
+    # points_2 = points.copy()
     # Remove entries that have np.any(size[a] == 0)
-    mask = np.all(size > 0, axis=1)
+    mask = size > 0
     start = start[mask]
     size = size[mask]
 
     # Check if entries exist after removing entries
     if start.shape[0] == 0:
-        return np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3))
+        return np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3))
 
     # any dimension of size is 0
     if np.any(size <= 0):
-        return np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3))
+        return np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3))
     
     # Find all points in the subvolume
-    mask = np.zeros(points.shape[0], dtype=bool)
+    mask = np.ones(points_2.shape[0], dtype=bool)
     for i in range(start.shape[0]):
-        mask_i = np.all(np.logical_and(points >= start[i], points < start[i] + size[i]), axis=1)
-        mask = np.logical_or(mask, mask_i)
-
+        mask_i = np.logical_and(points_2[:,i] >= start[i], points_2[:,i] < start[i] + size[i])
+        mask = np.logical_and(mask, mask_i)
 
     # No points in the subvolume
     if np.all(~mask):
-        return np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3))
+        return np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3))
     
-    subvolume_points = points[mask]
+    subvolume_points = points_2[mask]
+    original_subvolume_points = points[mask]
     subvolume_normals = normals[mask]
     subvolume_colors = colors[mask]
     subvolume_angles = angles[mask]
 
-    return subvolume_points, subvolume_normals, subvolume_colors, subvolume_angles
+    return subvolume_points, original_subvolume_points, subvolume_normals, subvolume_colors, subvolume_angles
+
+def get_rotated_original_bounds(start, size):
+    # retrieve the original bounds of the rotated subvolume
+    start_ = np.array(start).copy() + np.array(size).copy() // 2
+    max_d = max(size) / (2.0 ** 0.5)  # maximum distance from the center of the subvolume
+    # create a bounding box around the subvolume
+    min_bound = start_ - max_d
+    max_bound = start_ + max_d
+    return min_bound, max_bound
+
+def position_to_pc_cell(position, grid_block_size=200):
+    return tuple((np.array(position) // grid_block_size).astype(int))
+
+def start_to_cell_indices(start, grid_block_size=200):
+    if isinstance(grid_block_size, int):
+        grid_block_size = np.array([grid_block_size, grid_block_size, grid_block_size])
+    # print(f"Start: {start}")
+    min_bound, max_bound = get_rotated_original_bounds(start, grid_block_size)
+    start_indx = position_to_pc_cell(min_bound, grid_block_size)
+    stop_indx = position_to_pc_cell(max_bound, grid_block_size)
+    indices = []
+    for x in range(start_indx[0], stop_indx[0]+1):
+        for y in range(start_indx[1], stop_indx[1]+1):
+            for z in range(start_indx[2], stop_indx[2]+1):
+                indices.append([x, y, z])
+    # print(f"Indices: {indices}")
+    return indices
 
 def remove_duplicate_points(points):
     """
@@ -380,14 +618,15 @@ def build_start_list(start, stop, size, path, folder, umbilicus_points_path, umb
     return start_list
     
 def to_surfaces_args(args):
+    # print("to_surfaces_args")
     return to_surfaces(*args)
 
 
 class MyPredictionWriter(BasePredictionWriter):
     def __init__(self, path="/media/julian/FastSSD/scroll3_surface_points", folder="point_cloud_colorized", dest="/media/julian/HDD8TB/scroll3_surface_points", main_drive="", alternative_drives=[], fix_umbilicus=True, umbilicus_points_path="", start=[0, 0, 0], stop=[16, 17, 29], size = [3, 3, 3], umbilicus_distance_threshold=1500, score_threshold=0.5, batch_size=4, gpus=1, num_processes=3):
         super().__init__(write_interval="batch")  # or "epoch" for end of an epoch
-        num_threads = multiprocessing.cpu_count()
-        self.pool = multiprocessing.Pool(processes=num_threads)  # Initialize the pool once
+        self.num_threads = multiprocessing.cpu_count()
+        self.pool = multiprocessing.Pool(processes=self.num_threads)  # Initialize the pool once
 
         self.path = path
         self.folder = folder
@@ -404,7 +643,7 @@ class MyPredictionWriter(BasePredictionWriter):
         self.batch_size = batch_size
         self.gpus = gpus
         # Initialize the ThreadPoolExecutor with the desired number of threads
-        self.executor = ThreadPoolExecutor(max_workers=num_processes)
+        self.executor = ThreadPoolExecutor(max_workers=self.num_threads)
 
         self.start_list = build_start_list(start, stop, size, path, folder, umbilicus_points_path, umbilicus_distance_threshold)
 
@@ -413,6 +652,9 @@ class MyPredictionWriter(BasePredictionWriter):
         self.computed_indices = []
         self.progress_file = os.path.join(dest, "progress.json")
         self.config = {"path": path, "folder": folder, "dest": dest, "main_drive": main_drive, "alternative_drives": alternative_drives, "fix_umbilicus": fix_umbilicus, "umbilicus_points_path": umbilicus_points_path, "start": start, "stop": stop, "size": size, "umbilicus_distance_threshold": umbilicus_distance_threshold, "score_threshold": score_threshold, "batch_size": batch_size, "gpus": gpus}
+        self._load_progress()
+
+    def _load_progress(self):
         nr_total_indices = len(self.to_compute_indices)
         if os.path.exists(self.progress_file):
             with open(self.progress_file, 'r') as file:
@@ -433,23 +675,36 @@ class MyPredictionWriter(BasePredictionWriter):
         # Example: Just print the predictions
         print(predictions)
         print("On predict")
-    
+
     def write_on_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, prediction, batch_indices, batch, batch_idx: int, dataloader_idx: int) -> None:
-        if prediction is None:
-            # print("Prediction is None")
-            return
-        # print(f"On batch end, len: {len(prediction)}")
-        if len(prediction) == 0:
-            # print("Prediction is empty")
-            return
-
+        """Handles batch processing including post-processing and file writing."""
         items_pytorch, points_batch, normals_batch, colors_batch, names_batch, indxs = batch
+        
+        if prediction and len(prediction) > 0:
+            self.post_process(prediction, items_pytorch, points_batch, normals_batch, colors_batch, names_batch, use_multiprocessing=True, use_h5 = True)
 
-        # Use a multiprocessing pool to handle post processing in parallel
-        self.post_process(indxs, prediction, items_pytorch, points_batch, normals_batch, colors_batch, names_batch, use_multiprocessing=True)
-        # print(f"On batch end, len: {len(prediction)} ... finished")
+        # Update progress
+        self.computed_indices.extend(list(set(indxs) - set(self.computed_indices)))
+        update_progress_file(self.progress_file, self.computed_indices, self.config)
 
-    def post_process(self, indxs, res, items_pytorch, points_batch, normals_batch, colors_batch, names_batch, use_multiprocessing=False, distance_threshold=10.0, n=4, alpha = 1000.0, slope_alpha = 0.1):
+    def write_on_batch_end_async(self, trainer: pl.Trainer, pl_module: pl.LightningModule, prediction, batch_indices, batch, batch_idx: int, dataloader_idx: int) -> None:
+        """Submits the entire batch processing to the thread pool for async execution."""
+        # check how many blocks are left to compute om the executor
+        print(f"Put batch into Queue: {batch_idx}")
+        self.executor.submit(self._process_batch, prediction, batch, batch_idx)
+
+    def _process_batch(self, prediction, batch, batch_idx: int):
+        """Handles batch processing including post-processing and file writing."""
+        items_pytorch, points_batch, normals_batch, colors_batch, names_batch, indxs = batch
+        
+        if prediction and len(prediction) > 0:
+            self.post_process(prediction, items_pytorch, points_batch, normals_batch, colors_batch, names_batch, use_multiprocessing=False, use_h5 = True)
+
+        # Update progress
+        self.computed_indices.extend(list(set(indxs) - set(self.computed_indices)))
+        update_progress_file(self.progress_file, self.computed_indices, self.config)
+
+    def post_process(self, res, items_pytorch, points_batch, normals_batch, colors_batch, names_batch, use_multiprocessing=False, distance_threshold=10.0, n=4, alpha = 1000.0, slope_alpha = 0.1, use_h5 = True):
         # print GPU memory usage
         if res is None:
             print("batch_inference result is None")
@@ -458,35 +713,51 @@ class MyPredictionWriter(BasePredictionWriter):
             res = list(res.values())
 
         if use_multiprocessing:
+            # print("Using multiprocessing")
             # Save the block
             res = self.pool.map(to_surfaces_args, [(points_batch[i], normals_batch[i], colors_batch[i], res[i]) for i in range(len(points_batch))])
             surfaces, surfaces_normals, surfaces_colors, scores = zip(*res)
         else:
+            # print("Not using multiprocessing")
             # Single threaded version
             surfaces, surfaces_normals, surfaces_colors, scores = to_surfaces(points_batch, normals_batch, colors_batch, res)
         # return surfaces, surfaces_normals, surfaces_colors, names_batch, scores
 
         # save each instance for each subvolume
         # Setting up multiprocessing, process count
-        if use_multiprocessing:
-            # Save the block
-            self.pool.map(save_block_ply_args, [(surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i], self.score_threshold, distance_threshold, n, alpha, slope_alpha) for i in range(len(surfaces))])
+        if use_h5:
+            if False and use_multiprocessing:
+                # Use multiprocessing to save HDF5 blocks
+                self.pool.map(save_block_h5, [
+                    (surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i], 
+                    self.score_threshold, distance_threshold, n, alpha, slope_alpha, False, 
+                    [0] * len(surfaces[i]), [[]] * len(surfaces[i])) for i in range(len(surfaces))
+                ])
+            else:
+                # Single-threaded HDF5 saving
+                for i in range(len(surfaces)):
+                    save_block_h5(
+                        surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i], 
+                        self.score_threshold, distance_threshold, n, alpha, slope_alpha, False, 
+                        [0] * len(surfaces[i]), [[]] * len(surfaces[i])
+                    )
         else:
-            # single threaded version
-            for i in range(len(surfaces)):
-                save_block_ply(surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i], self.score_threshold, distance_threshold, n, alpha, slope_alpha)
-
-        # Update the progress file
-        indxs = list(set(indxs) - set(self.computed_indices))
-        for indx in indxs:
-            self.computed_indices.append(indx)
-        update_progress_file(self.progress_file, self.computed_indices, self.config)
-
+            if use_multiprocessing:
+                # print(f"Using multiprocessing, len surfaces: {len(surfaces)}")
+                # Save the block
+                self.pool.map(save_block_ply_args, [(surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i], self.score_threshold, distance_threshold, n, alpha, slope_alpha, False, [0]*len(surfaces[i]), [[]]*len(surfaces[i])) for i in range(len(surfaces))])
+            else:
+                # single threaded version
+                for i in range(len(surfaces)):
+                    save_block_ply(surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i], self.score_threshold, distance_threshold, n, alpha, slope_alpha, False, [0]*len(surfaces[i]), [[]]*len(surfaces[i]))
 
 class PointCloudDataset(Dataset):
-    def __init__(self, path="/media/julian/FastSSD/scroll3_surface_points", folder="point_cloud_colorized", dest="/media/julian/HDD8TB/scroll3_surface_points", main_drive="", alternative_drives=[], fix_umbilicus=True, umbilicus_points_path="", start=[0, 0, 0], stop=[16, 17, 29], size = [3, 3, 3], umbilicus_distance_threshold=1500, score_threshold=0.5, batch_size=4, gpus=1, num_processes=3, recompute=False):
+    def __init__(self, path="/media/julian/FastSSD/scroll3_surface_points", folder="point_cloud_colorized", dest="/media/julian/HDD8TB/scroll3_surface_points", main_drive="", alternative_drives=[], fix_umbilicus=True, umbilicus_points_path="", start=[0, 0, 0], stop=[16, 17, 29], size = [3, 3, 3], umbilicus_distance_threshold=1500, score_threshold=0.5, batch_size=4, gpus=1, num_processes=3, recompute=False, rotate=False, overlap_denumerator=3):
         self.writer = MyPredictionWriter(path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points_path, start, stop, size, umbilicus_distance_threshold, score_threshold, batch_size, gpus, num_processes)
-
+        self.rotate = rotate
+        self.R = np.eye(3) if not self.rotate else get_optimized_rotation_matrix((45, 45, 45))
+        self.overlap_denumerator = overlap_denumerator
+        self.recompute = recompute
         self.path = path
         self.folder = folder
         self.dest = dest
@@ -516,14 +787,18 @@ class PointCloudDataset(Dataset):
             self.umbilicus_points_old = None
 
         self.start_list = build_start_list(start, stop, size, path, folder, umbilicus_points_path, umbilicus_distance_threshold)
+        # self.start_list = [(17, 17, 18)] # Debug
 
         self.num_tasks = len(self.start_list)
         self.to_compute_indices = range(self.num_tasks)
         self.computed_indices = []
         self.progress_file = os.path.join(dest, "progress.json")
         self.config = {"path": path, "folder": folder, "dest": dest, "main_drive": main_drive, "alternative_drives": alternative_drives, "fix_umbilicus": fix_umbilicus, "umbilicus_points_path": umbilicus_points_path, "start": start, "stop": stop, "size": size, "umbilicus_distance_threshold": umbilicus_distance_threshold, "score_threshold": score_threshold, "batch_size": batch_size, "gpus": gpus}
+        self._load_progress()
+    
+    def _load_progress(self):    
         nr_total_indices = len(self.to_compute_indices)
-        if os.path.exists(self.progress_file) and (not recompute):
+        if os.path.exists(self.progress_file) and (not self.recompute):
             with open(self.progress_file, 'r') as file:
                 progress = json.load(file)
                 if 'config' in progress:
@@ -541,7 +816,7 @@ class PointCloudDataset(Dataset):
     def get_writer(self):
         return self.writer
 
-    def create_batches(self, path, points, normals, colors, start, size, fix_umbilicus, umbilicus_points, umbilicus_points_old, main_drive, alternative_drives, subvolume_size=50):
+    def create_batches(self, idx__, path, src_folder, start, size, fix_umbilicus, umbilicus_points, umbilicus_points_old, main_drive, alternative_drives, subvolume_size=50, load_multithreaded=True, executor=None):
         # Size is int
         if isinstance(subvolume_size, int):
             subvolume_size = np.array([subvolume_size, subvolume_size, subvolume_size])
@@ -549,41 +824,33 @@ class PointCloudDataset(Dataset):
         # Iterate over all subvolumes
         start = np.array(start)
         # Swap axes
-        start = start[[0,2,1]]
-        min_coord = start * subvolume_size
+        axis_swap = [0, 2, 1]
+        axis_inverse_swap = [0, 2, 1]
+        start_index = start[axis_swap]
         # size is size = original size + 1, we want original size * 2 subvolume blocks that overlap
-        ranges = (size - 1) * subvolume_size # -1 because we want to include the last subvolume for tiling operation from later calls starting at the last subvolume but not save one half filled block
         subvolumes_points = []
+        original_subvolumes_points = []
         subvolumes_normals = []
         subvolumes_colors = []
         start_coords = []
         block_names = []
         block_names_created = []
         
-        # Find block coords that contain points
-        min_coords = np.min(points, axis=0)
-        max_coords = np.max(points, axis=0)
-
-        start_ = np.floor(min_coords / (subvolume_size//2)) * (subvolume_size//2)
-        # Swap axes
-        # Max between start and min_coord
-        start = np.maximum(start_, min_coord)
-
-        stop_coord = min_coord + ranges
-
-        stop_max_coords = np.ceil(max_coords / (subvolume_size//2)) * (subvolume_size//2)
         # Min between stop and max_coord
-        stop = np.minimum(stop_max_coords, stop_coord)
         # print(f"Start_: {start_}, min_coord {min_coord}, Stop_max_coords: {stop_max_coords}, Stop: {stop_coord}, Range: {ranges}, Stop: {stop}")
         # time.sleep(15)
         # Make blocks of size '50x50x50'
-        for x in range(int(start[0]), int(stop[0]), subvolume_size[0] // 2):
-            for y in range(int(start[1]), int(stop[1]), subvolume_size[1] // 2):
-                for z in range(int(start[2]), int(stop[2]), subvolume_size[2] // 2):
-                    x_prime = x
-                    y_prime = y
-                    z_prime = z
-                    start_coord = np.array([x_prime,y_prime,z_prime])
+        indx_count = 0
+        for x in range(int((size[0] - 1) * self.overlap_denumerator)):
+            x_coord = start_index[0] * subvolume_size[0] + (x * subvolume_size[0] // self.overlap_denumerator)
+            for y in range(int((size[1] - 1) * self.overlap_denumerator)):
+                y_coord = start_index[1] * subvolume_size[1] + (y * subvolume_size[1] // self.overlap_denumerator)
+                for z in range(int((size[2] - 1) * self.overlap_denumerator)):
+                    indx_count += 1
+                    if indx_count != idx__ + 1:
+                        continue
+                    z_coord = start_index[2] * subvolume_size[2] + (z * subvolume_size[2] // self.overlap_denumerator)
+                    start_coord = np.array([x_coord,y_coord,z_coord])
                     block_name = path + f"_subvolume_blocks/{start_coord[0]:06}_{start_coord[1]:06}_{start_coord[2]:06}" # nice ordering in the folder
                     block_name_tar = block_name + ".7z"
                     block_name_tar_alternatives = []
@@ -591,51 +858,61 @@ class PointCloudDataset(Dataset):
                         block_name_tar_alternatives.append(block_name.replace(main_drive, alternative_drive) + ".7z")
 
                     # Skip if the block tar already exists. Same for alternative path
-                    if (not (fix_umbilicus and fix_umbilicus_recompute(start_coord * 200.0 / 50.0, 200, umbilicus_points, umbilicus_points_old))) and (os.path.exists(block_name_tar) or any([os.path.exists(block_name_tar_alternative) for block_name_tar_alternative in block_name_tar_alternatives])):
+                    if (not (fix_umbilicus and fix_umbilicus_recompute(start_coord * 200.0 / 50.0, 200, umbilicus_points, umbilicus_points_old))) and ((not self.recompute) and (os.path.exists(block_name_tar) or any([os.path.exists(block_name_tar_alternative) for block_name_tar_alternative in block_name_tar_alternatives]))):
                         # print(f"Block {block_name} already exists.")
                         block_names_created.append(block_name)
                         continue
 
+
+                    res_pc = load_pc_start(src_folder, main_drive, alternative_drives, start_coord[axis_inverse_swap] * 200.0 / 50.0, grid_block_size=200, load_multithreaded=load_multithreaded, executor=executor)
+                    if res_pc is None:
+                        # print(f"Block {block_name} does not exist.")
+                        continue
+                    points, normals, colors = res_pc
                     # Extract a subvolume
-                    subvolume_points, subvolume_normals, subvolume_colors, subvolume_angles = extract_subvolume(points, normals, colors, colors, start=start_coord, size=subvolume_size) # Second colors is just a placeholder since we dont yet have any angles which the function expects
+                    subvolume_points, original_subvolume_points, subvolume_normals, subvolume_colors, subvolume_angles = extract_subvolume(points, normals, colors, colors, start=start_coord, size=subvolume_size) # Second colors is just a placeholder since we dont yet have any angles which the function expects
                     if len(subvolume_points) < 10:
                         # print(f"Subvolume {start_coord} has no points.")
                         continue
                     
-
-
                     subvolumes_points.append(subvolume_points)
+                    original_subvolumes_points.append(original_subvolume_points)
                     subvolumes_normals.append(subvolume_normals)
                     subvolumes_colors.append(subvolume_colors)
                     start_coords.append(start_coord)
                     block_names.append(block_name)
 
-        return subvolumes_points, subvolumes_normals, subvolumes_colors, start_coords, block_names
+        assert indx_count == self.overlap_denumerator ** 3, f"Index count is {indx_count} and should be less than {self.overlap_denumerator ** 3}"
+        return subvolumes_points, original_subvolumes_points, subvolumes_normals, subvolumes_colors, start_coords, block_names
 
-    def precompute(self, index, start, size, path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points, umbilicus_points_old, use_multiprocessing, executor=None):
+    def precompute(self, idx__, index, start, size, path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points, umbilicus_points_old, use_multiprocessing, executor=None):
         src_path = os.path.join(path, folder)
         dest_path = os.path.join(dest, folder)
-        size = np.array(size) + 1 # +1 because we want to include the last subvolume for tiling operation from later calls starting at the last subvolume
+        size = np.array(size).copy() + 1 # +1 because we want to include the last subvolume for tiling operation from later calls starting at the last subvolume
         
-        res = load_plys(src_path, main_drive, alternative_drives, start, size, grid_block_size=200, load_multithreaded=use_multiprocessing, executor=executor)
-        points, normals, colors = res
-        points, normals, colors = remove_duplicate_points_normals(points, normals, colors)
-        subvolumes_points, subvolumes_normals, subvolumes_colors, start_coords, block_names = self.create_batches(dest_path, points, normals, colors, start, size, fix_umbilicus, umbilicus_points, umbilicus_points_old, main_drive, alternative_drives)
-        return subvolumes_points, subvolumes_normals, subvolumes_colors, start_coords, block_names
+        # res = load_plys(src_path, main_drive, alternative_drives, start, size, grid_block_size=200, load_multithreaded=use_multiprocessing, executor=executor)
+        # points, normals, colors = res
+        # points, normals, colors = remove_duplicate_points_normals(points, normals, colors)
+        subvolumes_points, original_subvolumes_points, subvolumes_normals, subvolumes_colors, start_coords, block_names = self.create_batches(idx__, dest_path, src_path, start, size, fix_umbilicus, umbilicus_points, umbilicus_points_old, main_drive, alternative_drives, load_multithreaded=use_multiprocessing, executor=executor)
+        return subvolumes_points, original_subvolumes_points, subvolumes_normals, subvolumes_colors, start_coords, block_names
 
     def __len__(self):
-        return len(self.to_compute_indices)
+        length = len(self.to_compute_indices) * (self.overlap_denumerator ** 3)
+        return length
 
     def __getitem__(self, idx):
-        i = self.to_compute_indices[idx] # index of the start_list
+        idx_ = idx // (self.overlap_denumerator ** 3)
+        idx__ = idx % (self.overlap_denumerator ** 3)
+        i = self.to_compute_indices[idx_] # index of the start_list
         x = self.start_list[i]
 
-        res = self.precompute(i, x, self.size, self.path, self.folder, self.dest, self.main_drive, self.alternative_drives, self.fix_umbilicus, self.umbilicus_points, self.umbilicus_points_old, False, None)
-        points_batch, normals_batch, colors_batch, start_coords, names_batch = res
+        res = self.precompute(idx__, i, x, self.size, self.path, self.folder, self.dest, self.main_drive, self.alternative_drives, self.fix_umbilicus, self.umbilicus_points, self.umbilicus_points_old, False, None)
+        points_batch, original_points_batch, normals_batch, colors_batch, start_coords, names_batch = res
 
         # Detect the surfaces in the subvolume
         points_batch_indices = [i for i, points in enumerate(points_batch) if points.shape[0] > 100]
         points_batch = [points_batch[i] for i in points_batch_indices]
+        original_points_batch = [original_points_batch[i] for i in points_batch_indices]
         normals_batch = [normals_batch[i] for i in points_batch_indices]
         colors_batch = [colors_batch[i] for i in points_batch_indices]
         names_batch = [names_batch[i] for i in points_batch_indices]
@@ -646,8 +923,8 @@ class PointCloudDataset(Dataset):
         coords_batch = [coords - min_coord_batch[i] for i, coords in enumerate(coords_batch)]
 
         items_pytorch = [preprocess_points(c) for c in coords_batch]
-
-        return items_pytorch, points_batch, normals_batch, colors_batch, names_batch, i
+        # print(f"Returned {count_returned} of {len(self)}")
+        return items_pytorch, original_points_batch, normals_batch, colors_batch, names_batch, i
 
 # Custom collation function
 def custom_collate_fn(batches):
@@ -673,14 +950,17 @@ def custom_collate_fn(batches):
     # Return a single batch containing all aggregated items
     return items_pytorch_agg, points_batch_agg, normals_batch_agg, colors_batch_agg, names_batch_agg, indxs_agg
 
-def pointcloud_inference(path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points_path, start, stop, size, umbilicus_distance_threshold, score_threshold, batch_size, gpus, recompute):
+def pointcloud_inference(path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points_path, start, stop, size, umbilicus_distance_threshold, score_threshold, batch_size, gpus, recompute, overlap_denumerator):
     init()
     model = get_model()
     # model = torch.nn.DataParallel(model)
     # model.to('cuda')  # Move model to GPU
+    # compile the model for faster inference
+    # model = torch.compile(model) # too low torch version
 
-    dataset = PointCloudDataset(path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points_path, start, stop, size, umbilicus_distance_threshold, score_threshold, batch_size, recompute=recompute)
-    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=custom_collate_fn, shuffle=False, num_workers=12, prefetch_factor=2)  # Adjust num_workers as per your system
+    dataset = PointCloudDataset(path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points_path, start, stop, size, umbilicus_distance_threshold, score_threshold, batch_size, recompute=recompute, overlap_denumerator=overlap_denumerator)
+    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=custom_collate_fn, shuffle=False, num_workers=24, prefetch_factor=5)  # Adjust num_workers as per your system
+    # dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=24, prefetch_factor=3)  # Adjust num_workers as per your system
 
     writer = dataset.get_writer()
     trainer = pl.Trainer(callbacks=[writer], gpus=gpus, strategy="ddp")
@@ -703,9 +983,10 @@ def main():
     # umbilicus_distance_threshold=2200 # scroll 3
     umbilicus_distance_threshold = -1
     score_threshold=0.10
-    batch_size = 1
+    batch_size = 5
     gpus = -1
     pointcloud_size = 1
+    overlap_denumerator = 2
 
     # Create an argument parser
     parser = argparse.ArgumentParser(description="Compute surface patches from pointcloud.")
@@ -722,7 +1003,10 @@ def main():
     parser.add_argument("--batch_size", type=int, help="Batch size for Mask3D", default=batch_size)
     parser.add_argument("--gpus", type=int, help="Number of GPUs to use", default=gpus)
     parser.add_argument("--recompute", action='store_true', help="Flag, recompute all blocks, even if they already exist")
-
+    parser.add_argument("--z_min", type=int, help="Minimum slice index for computation", default=-500)
+    parser.add_argument("--z_max", type=int, help="Maximum slice index for computation", default=50000)
+    parser.add_argument("--overlap_denumerator", type=int, help="Denominator for overlap of subvolumes", default=overlap_denumerator)
+    
     # Parse the arguments
     args, unknown = parser.parse_known_args()
     path = args.path
@@ -738,13 +1022,19 @@ def main():
     batch_size = args.batch_size
     gpus = args.gpus
     recompute = args.recompute
+    z_start = int((args.z_min +500)//200)
+    z_end = int((args.z_max +500)//200)
+    overlap_denumerator = args.overlap_denumerator
 
     # import sys
     # # Remove command-line arguments for later internal calls to Mask3D
     # sys.argv = [sys.argv[0]]
 
     # Compute the surface patches
-    pointcloud_inference(path, folder, dest, main_drive, alternative_ply_drives, fix_umbilicus, umbilicus_points_path, [0, 0, 0], [100, 100, 100], [pointcloud_size, pointcloud_size, pointcloud_size], umbilicus_distance_threshold, score_threshold, batch_size, gpus, recompute)
+    pointcloud_inference(path, folder, dest, main_drive, alternative_ply_drives, fix_umbilicus, umbilicus_points_path, [0, 0, z_start], [100, 100, z_end], [pointcloud_size, pointcloud_size, pointcloud_size], umbilicus_distance_threshold, score_threshold, batch_size, gpus, recompute, overlap_denumerator)
     
 if __name__ == "__main__":
     main()
+
+# iostat -dx 1
+# python3 -m ThaumatoAnakalyptor.pointcloud_to_instances --path /scroll_pcs --dest /scroll_pcs --umbilicus_path /scroll_pcs/umbilicus.txt --main_drive "" --alternative_ply_drives "" "" --batch_size 4 --gpus 1 --z_min 3000 --z_max 4000

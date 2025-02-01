@@ -5,6 +5,7 @@ from PyQt5.QtWidgets import (QMainWindow, QAction, QSplitter, QVBoxLayout,
                              QFileDialog, QLineEdit, QCheckBox, QMessageBox, QStyle, QVBoxLayout, QScrollArea, QHBoxLayout, QGraphicsScene, QGraphicsView)
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QBrush, QKeyEvent, QIcon
+from PyQt5.QtWidgets import QGraphicsEllipseItem, QGraphicsItemGroup
 
 import tifffile
 
@@ -27,6 +28,9 @@ import signal
 import numpy as np
 import open3d as o3d
 import zarr 
+import tarfile
+import py7zr
+import tempfile
 
 from ThaumatoAnakalyptor.sheet_to_mesh import umbilicus_xy_at_z
 
@@ -74,8 +78,10 @@ class ThaumatoAnakalyptor(QMainWindow):
         
         self.isSelectingStartingPoint = False
         self.display_points = False
+        self.display_instances_points = False
         self.points = []
         self.points_pc = None
+        self.points_instances_pc = None
         self.loadConfig()
         self.initUI()
         # set icon
@@ -106,7 +112,7 @@ class ThaumatoAnakalyptor(QMainWindow):
         # Check and load TIFF files
         self.tifImages = self.loadImages(self.Config.get("original_2d_tiffs", ""))
         self.zarr_volume = None
-        self.currentTifIndex = 0
+        self.currentTifIndex = 3100
         self.image_array = None
         self.old_index = -1
 
@@ -186,6 +192,11 @@ class ThaumatoAnakalyptor(QMainWindow):
         self.displayPointsCheckbox = QCheckBox("Display Points")
         self.displayPointsCheckbox.stateChanged.connect(self.toggleDisplayPoints)
         navigationLayout.addWidget(self.displayPointsCheckbox)
+
+        # Checkbox Display Instances Points
+        self.displayInstancesPointsCheckbox = QCheckBox("Display Instances Points")
+        self.displayInstancesPointsCheckbox.stateChanged.connect(self.toggleDisplayInstancesPoints)
+        navigationLayout.addWidget(self.displayInstancesPointsCheckbox)
 
         # Add the navigation layout to the main layout
         layout.addLayout(navigationLayout)
@@ -270,9 +281,8 @@ class ThaumatoAnakalyptor(QMainWindow):
             if self.display_points: 
                 # Draw Pointclouds from .ply files
                 self.draw_pointcloud(index)
-            else:
-                # Clear the points
-                self.points_pc = None
+            if self.display_instances_points:
+                self.draw_instances_pointcloud(index)
             
             self.old_index = index
         else:
@@ -314,7 +324,7 @@ class ThaumatoAnakalyptor(QMainWindow):
             ply_files = [f for f in ply_files if f.split("_")[4] == z_index_cell_string+".ply"]
             self.points_pc = []
             nr_valid_points = 0
-            for ply_file in ply_files:
+            for ply_file in tqdm(ply_files, desc="Loading .ply files"):
                 # load the ply files
                 pcd = o3d.io.read_point_cloud(os.path.join(pointcloud_path, ply_file))
                 points_pcd = np.array(pcd.points)
@@ -323,11 +333,68 @@ class ThaumatoAnakalyptor(QMainWindow):
                 nr_valid_points += len(valid_points)
                 self.points_pc.append(valid_points)
 
-        # Draw the points
-        for pointcloud in self.points_pc:
+        # Optimize Drawing
+        graphics_group = QGraphicsItemGroup()
+        for pointcloud in tqdm(self.points_pc, desc="Drawing Points"):
             for point in pointcloud:
                 y, z, x = point
-                self.tifScene.addEllipse(x-500, y-500, 2, 2, QPen(Qt.blue), QBrush(Qt.blue))
+                ellipse = QGraphicsEllipseItem(x-500, y-500, 2, 2)
+                ellipse.setPen(QPen(Qt.blue))  # Set outline color
+                ellipse.setBrush(QBrush(Qt.blue))  # Set fill color
+                graphics_group.addToGroup(ellipse)
+
+        self.tifScene.addItem(graphics_group)
+
+    def draw_instances_pointcloud(self, index):
+        if index != self.old_index or self.points_instances_pc is None:
+            # Find all .ply files in the directory
+            pointcloud_path = os.path.join(self.Config["surface_points_path"], "point_cloud_colorized_verso_subvolume_blocks")
+            tar_files = [f for f in os.listdir(pointcloud_path) if f.endswith('.tar') or f.endswith('.7z')]
+            print(f"Found {len(tar_files)} tar/7z files")
+            adjusted_tiff_index = 500 + self.currentTifIndex
+            tar_files = [f for f in tar_files if (s_i := (int(f.split("_")[1]) * 4)) >= adjusted_tiff_index and s_i <= adjusted_tiff_index + 200]
+            print(f"Found {len(tar_files)} tar files")
+            self.points_instances_pc = []
+            nr_valid_points = 0
+            with tempfile.TemporaryDirectory() as temp_dir:
+                extracted_ply_files = []
+
+                for tar_file in tqdm(tar_files, desc="Extracting .tar/.7z files"):
+                    tar_path = os.path.join(pointcloud_path, tar_file)
+                    tar_subdir = os.path.join(temp_dir, os.path.splitext(tar_file)[0])  # Unique subdir for each archive
+                    os.makedirs(tar_subdir, exist_ok=True)
+
+                    try:
+                        if tar_path.endswith('.tar'):
+                            with tarfile.open(tar_path, 'r') as archive:
+                                ply_members = [m for m in archive.getmembers() if m.name.endswith('.ply')]
+                                archive.extractall(path=tar_subdir, members=ply_members)
+                                extracted_ply_files.extend([os.path.join(tar_subdir, m.name) for m in ply_members])
+                        elif tar_path.endswith('.7z'):
+                            with py7zr.SevenZipFile(tar_path, 'r') as archive:
+                                archive.extractall(tar_subdir)  # Extract directly into the subdir
+                                extracted_ply_files.extend([os.path.join(tar_subdir, f) for f in os.listdir(tar_subdir) if f.endswith('.ply')])
+                    except Exception as e:
+                        print(f"Failed to extract {tar_path}: {e}")
+                    
+                for ply_file in tqdm(extracted_ply_files, desc="Loading .ply files"):
+                    pcd = o3d.io.read_point_cloud(ply_file)
+                    points_pcd = np.asarray(pcd.points) * 4
+                    valid_points = points_pcd[np.abs(points_pcd[:, 1] - adjusted_tiff_index) <= 1]
+                    nr_valid_points += len(valid_points)
+                    self.points_instances_pc.append(valid_points)
+
+        # Optimize Drawing
+        graphics_group = QGraphicsItemGroup()
+        for pointcloud in tqdm(self.points_instances_pc, desc="Drawing Points"):
+            for point in pointcloud:
+                y, z, x = point
+                ellipse = QGraphicsEllipseItem(x-500, y-500, 2, 2)
+                ellipse.setPen(QPen(Qt.red))  # Set outline color
+                ellipse.setBrush(QBrush(Qt.red))  # Set fill color
+                graphics_group.addToGroup(ellipse)
+
+        self.tifScene.addItem(graphics_group)
 
     def jumpToTifIndex(self):
         index = int(self.indexBox.text())
@@ -335,6 +402,10 @@ class ThaumatoAnakalyptor(QMainWindow):
 
     def toggleDisplayPoints(self):
         self.display_points = self.displayPointsCheckbox.isChecked()
+        self.loadSlice(self.currentTifIndex)
+
+    def toggleDisplayInstancesPoints(self):
+        self.display_instances_points = self.displayInstancesPointsCheckbox.isChecked()
         self.loadSlice(self.currentTifIndex)
 
     def onTifMousePress(self, event):

@@ -8,10 +8,11 @@ import glob
 import os
 import tarfile
 import py7zr
+import h5py
 import tempfile
 import open3d as o3d
 import json
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, Manager
 import time
 import argparse
 import yaml
@@ -21,8 +22,9 @@ import random
 from copy import deepcopy
 import struct
 import multiprocessing
+from scipy.spatial import cKDTree
 
-from .instances_to_sheets import select_points, get_vector_mean, alpha_angles, adjust_angles_zero, adjust_angles_offset, add_overlapp_entries_to_patches_list, assign_points_to_tiles, compute_overlap_for_pair, overlapp_score, fit_sheet, winding_switch_sheet_score_raw_precomputed_surface, find_starting_patch, save_main_sheet, update_main_sheet
+from .instances_to_sheets import select_points, get_vector_mean, alpha_angles, adjust_angles_zero, adjust_angles_offset, add_overlapp_entries_to_patches_list, assign_points_to_tiles, compute_overlap_for_pair, compute_overlap_for_pair_old, overlapp_score, fit_sheet, winding_switch_sheet_score_raw_precomputed_surface, find_starting_patch, save_main_sheet, update_main_sheet
 from .sheet_to_mesh import load_xyz_from_file, scale_points, umbilicus_xz_at_y, shuffling_points_axis
 from .mesh_to_mask3d_labels import set_up_mesh
 from .split_mesh import MeshSplitter
@@ -138,6 +140,102 @@ def angle_between(v1, v2=np.array([1, 0])):
     assert angle is not None, "Angle is None."
     return angle
 
+def build_kd_tree(blocks_files):
+    """
+    Builds a KD-tree from the available block files.
+
+    Args:
+        blocks_files (str): Block files.
+
+    Returns:
+        tuple: (cKDTree object, numpy array of block_ids)
+    """
+    # Extract block IDs
+    block_ids = []
+    for file_path in blocks_files:
+        file_name = ".".join(file_path.split(".")[:-1])
+        raw_id_str = file_name.split('/')[-1]  # e.g., "100_200_300"
+        block_id = [int(i) for i in raw_id_str.split('_')]
+        block_ids.append(block_id)
+
+    block_ids = np.array(block_ids)  # Convert list to numpy array
+
+    if len(block_ids) == 0:
+        raise ValueError("No valid block IDs found in the specified directory.")
+
+    # Build the KD-tree
+    kd_tree = cKDTree(block_ids)
+    return kd_tree, block_ids
+
+def surrounding_volumes_kdtree(volume_id, overlapp_threshold, block_ids, kd_tree, volume_size=50):
+    """
+    Returns all volumes within `max_distance` of `volume_id` using a KD-tree.
+
+    Args:
+        volume_id   (array-like): The 3D integer ID (x,y,z) of the volume of interest.
+        kd_tree     (cKDTree)   : Pre-built KD-tree of all block IDs.
+        block_ids   (ndarray)   : Array of shape (N, 3) with all known block IDs.
+        max_distance (float)    : The maximum Euclidean distance from volume_id.
+
+    Returns:
+        np.ndarray: Subset of block_ids that lie within max_distance of volume_id.
+    """
+    # Query KD-tree for blocks within max_distance
+    idxs = kd_tree.query_ball_point(volume_id, volume_size / 2.0)
+    surrounding_volumes = block_ids[idxs]
+    # filter in sheet z range
+    surrounding_volumes = [volume for volume in surrounding_volumes if volume[1] >= overlapp_threshold["sheet_z_range"][0] and volume[1] <= overlapp_threshold["sheet_z_range"][1]]
+    return surrounding_volumes
+
+def build_surrounding_volumes_dict(kd_tree, block_ids, overlapp_threshold, volume_size=50):
+    """
+    Precomputes and stores surrounding volumes for each volume_id.
+
+    Args:
+        kd_tree (cKDTree): Pre-built KD-tree of all block IDs.
+        block_ids (ndarray): Array of shape (N, 3) with all known block IDs.
+        overlapp_threshold (dict): If provided, filters based on `sheet_z_range`.
+        volume_size (float, optional): Search distance (default: 50).
+
+    Returns:
+        dict: A dictionary {volume_id: surrounding_volumes}.
+    """
+    surrounding_dict = {}
+
+    for volume_id in tqdm(block_ids, desc="Building surrounding volumes dict"):
+        idxs = kd_tree.query_ball_point(volume_id, volume_size / 2.0)
+        surrounding_volumes = block_ids[idxs]
+
+        # filter out volume ids that have more than one dimension difference
+        surrounding_volumes = [volume for volume in surrounding_volumes if np.sum(volume == volume_id) == 1]
+
+        # filter sucht that only connections to larger ids are stored
+        surrounding_volumes = [volume for volume in surrounding_volumes if not (volume[0] < volume_id[0] or volume[1] < volume_id[1] or volume[2] < volume_id[2])]
+
+        # filter out volume_id itself
+        surrounding_volumes = [volume for volume in surrounding_volumes if not np.array_equal(volume, volume_id)]
+
+        # Apply `sheet_z_range` filtering
+        z_min, z_max = overlapp_threshold["sheet_z_range"]
+        surrounding_volumes = [volume for volume in surrounding_volumes if z_min <= volume[1] <= z_max]
+
+        surrounding_dict[tuple(volume_id)] = surrounding_volumes  # Store as tuple key
+
+    return surrounding_dict
+
+def surrounding_volumes_kdtree_dict(volume_id):
+    """
+    Returns surrounding volumes using precomputed dictionary lookups.
+
+    Args:
+        volume_id (tuple or list): The 3D integer ID (x,y,z) of the volume of interest.
+
+    Returns:
+        list: Surrounding volume IDs.
+    """
+    return surrounding_dict.get(tuple(volume_id), [])  # Default to empty list if not found
+    
+
 def surrounding_volumes(volume_id, overlapp_threshold, volume_size=50):
     """
     Returns the surrounding volumes of a volume
@@ -199,56 +297,173 @@ def load_ply(ply_file_path):
 
     return points, normals, colors, score, distance, coeff, n
 
-def build_patch(main_sheet_patch, subvolume_size, path, sample_ratio=1.0, align_and_flip_normals=False):
+def build_patch_from_data(patch_data, main_sheet_patch, subvolume_size, sample_ratio=1.0, path=""):
+    """
+    Build the patch dictionary from already loaded pointcloud data.
+    
+    Parameters
+    ----------
+    patch_data : tuple
+        A tuple containing (patch_points, patch_normals, patch_color, patch_score, patch_distance, patch_coeff, n).
+    main_sheet_patch : tuple
+        A tuple in the form ((x, y, z), main_sheet_surface_nr, offset_angle).
+    subvolume_size : int or sequence of int
+        The size of the subvolume; will be converted to a NumPy array.
+    sample_ratio : float, optional
+        The ratio of points to sample.
+    file_path : str, optional
+        If provided, used to extract the patch id from the file name.
+    
+    Returns
+    -------
+    additional_main_patch : dict
+        The dictionary containing the patch information.
+    offset_angle : float
+        The offset angle (as provided in main_sheet_patch).
+    """
     subvolume_size = np.array(subvolume_size)
     ((x, y, z), main_sheet_surface_nr, offset_angle) = main_sheet_patch
-    file = path + f"/{x:06}_{y:06}_{z:06}/surface_{main_sheet_surface_nr}.ply"
-    res = load_ply(path)
-    patch_points = res[0]
-    patch_normals = res[1]
-    patch_color = res[2]
-    patch_score = res[3]
-    patch_distance = res[4]
-    patch_coeff = res[5]
-    n = res[6]
+    ply_file_path = path + f"/{x:06}_{y:06}_{z:06}/surface_{main_sheet_surface_nr}.ply"
+    (patch_points, patch_normals, patch_color, patch_score, patch_distance, patch_coeff, n) = patch_data
 
     # Sample points from picked patch
     patch_points, patch_normals, patch_color, _ = select_points(
         patch_points, patch_normals, patch_color, patch_color, sample_ratio
     )
 
-    patch_id = tuple([*map(int, file.split("/")[-2].split("_"))]+[int(file.split("/")[-1].split(".")[-2].split("_")[-1])])
+    # Determine the patch id.
+    # If a file_path is provided (as when loading from a ply file), extract it from the path.
+    # Otherwise, default to using the main_sheet_patch information.
+    patch_id = tuple([*map(int, ply_file_path.split("/")[-2].split("_"))]+[int(ply_file_path.split("/")[-1].split(".")[-2].split("_")[-1])])
 
     x, y, z, id_ = patch_id
     anchor_normal = get_vector_mean(patch_normals)
     anchor_angle = alpha_angles(np.array([anchor_normal]))[0]
     centroid = centroid_method(patch_points)
 
-    additional_main_patch = {"ids": [patch_id],
-                    "points": patch_points,
-                    "normals": patch_normals,
-                    "colors": patch_color,
-                    "centroid": centroid,
-                    "anchor_points": [patch_points[0]], 
-                    "anchor_normals": [anchor_normal],
-                    "anchor_angles": [anchor_angle],
-                    "angles": adjust_angles_offset(adjust_angles_zero(alpha_angles(patch_normals), - anchor_angle), offset_angle),
-                    "subvolume": [(x, y, z)],
-                    "subvolume_size": [subvolume_size],
-                    "iteration": 0,
-                    "patch_prediction_scores": [patch_score],
-                    "patch_prediction_distances": [patch_distance],
-                    "patch_prediction_coeff": [patch_coeff],
-                    "n": [n],
-                    }
+    additional_main_patch = {
+        "ids": [patch_id],
+        "points": patch_points,
+        "normals": patch_normals,
+        "colors": patch_color,
+        "centroid": centroid,
+        "anchor_points": [patch_points[0]],
+        "anchor_normals": [anchor_normal],
+        "anchor_angles": [anchor_angle],
+        "angles": adjust_angles_offset(
+                      adjust_angles_zero(alpha_angles(patch_normals), -anchor_angle),
+                      offset_angle
+                  ),
+        "subvolume": [(x, y, z)],
+        "subvolume_size": [subvolume_size],
+        "iteration": 0,
+        "patch_prediction_scores": [patch_score],
+        "patch_prediction_distances": [patch_distance],
+        "patch_prediction_coeff": [patch_coeff],
+        "n": [n],
+    }
     
     return additional_main_patch, offset_angle
 
+# def build_patch(main_sheet_patch, subvolume_size, path, sample_ratio=1.0, align_and_flip_normals=False):
+#     subvolume_size = np.array(subvolume_size)
+#     ((x, y, z), main_sheet_surface_nr, offset_angle) = main_sheet_patch
+#     file = path + f"/{x:06}_{y:06}_{z:06}/surface_{main_sheet_surface_nr}.ply"
+#     res = load_ply(path)
+#     patch_points = res[0]
+#     patch_normals = res[1]
+#     patch_color = res[2]
+#     patch_score = res[3]
+#     patch_distance = res[4]
+#     patch_coeff = res[5]
+#     n = res[6]
+
+#     # Sample points from picked patch
+#     patch_points, patch_normals, patch_color, _ = select_points(
+#         patch_points, patch_normals, patch_color, patch_color, sample_ratio
+#     )
+
+#     patch_id = tuple([*map(int, file.split("/")[-2].split("_"))]+[int(file.split("/")[-1].split(".")[-2].split("_")[-1])])
+
+#     x, y, z, id_ = patch_id
+#     anchor_normal = get_vector_mean(patch_normals)
+#     anchor_angle = alpha_angles(np.array([anchor_normal]))[0]
+#     centroid = centroid_method(patch_points)
+
+#     additional_main_patch = {"ids": [patch_id],
+#                     "points": patch_points,
+#                     "normals": patch_normals,
+#                     "colors": patch_color,
+#                     "centroid": centroid,
+#                     "anchor_points": [patch_points[0]], 
+#                     "anchor_normals": [anchor_normal],
+#                     "anchor_angles": [anchor_angle],
+#                     "angles": adjust_angles_offset(adjust_angles_zero(alpha_angles(patch_normals), - anchor_angle), offset_angle),
+#                     "subvolume": [(x, y, z)],
+#                     "subvolume_size": [subvolume_size],
+#                     "iteration": 0,
+#                     "patch_prediction_scores": [patch_score],
+#                     "patch_prediction_distances": [patch_distance],
+#                     "patch_prediction_coeff": [patch_coeff],
+#                     "n": [n],
+#                     }
+    
+#     return additional_main_patch, offset_angle
+
+def build_patch(main_sheet_patch, subvolume_size, path, sample_ratio=1.0, align_and_flip_normals=False):
+    """
+    Build a patch from a PLY file.
+    
+    Loads the ply file from the given path (constructed using the main_sheet_patch information),
+    calls load_ply to obtain the pointcloud data, and then delegates to build_patch_from_data.
+    
+    Parameters
+    ----------
+    main_sheet_patch : tuple
+        A tuple in the form ((x, y, z), main_sheet_surface_nr, offset_angle).
+    subvolume_size : int or sequence of int
+        The size of the subvolume.
+    path : str
+        The base directory where the patch is stored.
+    sample_ratio : float, optional
+        The ratio of points to sample.
+    align_and_flip_normals : bool, optional
+        (Currently not used; included for compatibility.)
+    
+    Returns
+    -------
+    additional_main_patch : dict
+        The dictionary containing the patch information.
+    offset_angle : float
+        The offset angle.
+    """
+    patch_data = load_ply(path)
+    return build_patch_from_data(patch_data, main_sheet_patch, subvolume_size, sample_ratio, path=path)
+
 def subvolume_surface_patches_folder(file, subvolume_size=50, sample_ratio=1.0):
     """
-    Load surface patches from overlapping subvolumes instances predictions.
+    Load surface patches from overlapping subvolume instance predictions.
+    
+    This function first looks for an HDF5 file (named "<file>.h5") and, if found,
+    iterates through its groups (each group corresponds to one saved patch, as in
+    save_block_h5). If no HDF5 file is found, it falls back to extracting a TAR 
+    or 7z archive (with extension .tar or .7z) that contains .ply files. Each PLY 
+    file is then processed with build_patch.
+    
+    Parameters
+    ----------
+    file : str
+        Base name (or path without extension) of the archive/HDF5 file.
+    subvolume_size : int or sequence of int, optional
+        The size of the subvolume (will be converted to a 3-tuple).
+    sample_ratio : float, optional
+        The ratio of points to sample from each patch.
+        
+    Returns
+    -------
+    patches_list : list of dict
+        A list of dictionaries containing the patch data.
     """
-
     # Standardize subvolume_size to a NumPy array
     subvolume_size = np.atleast_1d(subvolume_size).astype(int)
     if subvolume_size.shape[0] == 1:
@@ -256,10 +471,65 @@ def subvolume_surface_patches_folder(file, subvolume_size=50, sample_ratio=1.0):
 
     patches_list = []
 
+    # Construct possible filenames.
+    h5_filename = f"{os.path.dirname(file)}.h5"
     tar_filename = f"{file}.tar"
     zip_filename = f"{file}.7z"
 
-    if os.path.isfile(tar_filename) or os.path.isfile(zip_filename):
+    if os.path.isfile(h5_filename):
+        group_name = os.path.basename(file)
+        # print(f"Loading patches from {h5_filename} with group name: {group_name}")
+        # Load from HDF5 file.
+        with h5py.File(h5_filename, "r") as h5f:
+            if group_name in h5f:
+                grp = h5f[group_name]
+                for surface in grp:
+                    surface_nr = int(surface.split("_")[-1])
+                    try:
+                        # print(f"Loading patch {surface} from {h5_filename}")
+                        # Extract the datasets saved in each group.
+                        points = grp[surface]["points"][()]       # e.g. an (N,3) array.
+                        normals = grp[surface]["normals"][()]
+                        colors = grp[surface]["colors"][()]
+                        coeffs = grp[surface]["coeffs"][()]
+                        # Retrieve attributes; in particular we need 'n'.
+                        attrs = dict(grp[surface].attrs)
+                        n_val = attrs.get("n", 0)
+                        scores = attrs.get("scores", None)
+                        distances = attrs.get("distances", None)
+
+                        # print(f"min max colors: {np.min(colors, axis=0)} {np.max(colors, axis=0)}")
+                        # print(f"shape colors: {colors.shape}, shape points: {points.shape}, shape normals: {normals.shape}, shape coeffs: {coeffs.shape}")
+                        # time.sleep(10)
+                        assert points.shape[0] == normals.shape[0], f"Inconsistent normals shapes. Points: {points.shape[0]}, Normals: {normals.shape[0]}, Colors: {colors.shape[0]}"
+                        assert points.shape[0] == colors.shape[0], f"2 Inconsistent colors shapes. Points: {points.shape[0]}, Normals: {normals.shape[0]}, Colors: {colors.shape[0]}, Coeffs: {coeffs.shape[0]}"
+
+                        # Package the data as expected by build_patch_from_data.
+                        patch_data = (points, normals, colors, scores, distances, coeffs, n_val)
+
+                        # Attempt to parse main_sheet_patch from the group name.
+                        # Expecting a format like "x_y_z_patchNr"
+                        parts = group_name.split('_')
+                        if len(parts) >= 3:
+                            try:
+                                x = int(parts[0])
+                                y = int(parts[1])
+                                z = int(parts[2])
+                            except Exception as e:
+                                x, y, z = 0, 0, 0
+                        else:
+                            x, y, z = 0, 0, 0
+                        # Use 0.0 as a default offset_angle.
+                        main_sheet_patch = ((x, y, z), surface_nr, float(0.0))
+                        # print(f"Loading patch {main_sheet_patch}")
+                        # time.sleep(10)
+
+                        # Rebuild the patch dictionary using the loaded data.
+                        patch_dict, _ = build_patch_from_data(patch_data, main_sheet_patch, subvolume_size, sample_ratio, path=os.path.dirname(file))
+                        patches_list.append(patch_dict)
+                    except Exception as e:
+                        print(f"Error loading subvolume {group_name} patch {surface_nr} from {h5_filename}: {e}")
+    elif os.path.isfile(tar_filename) or os.path.isfile(zip_filename):
         # Open the archive
         if os.path.isfile(tar_filename):
             archive = tarfile.open(tar_filename, 'r')
@@ -293,7 +563,6 @@ def subvolume_surface_patches_folder(file, subvolume_size=50, sample_ratio=1.0):
                 main_sheet_patch = (ids[:3], ids[3], float(0.0))
                 surface_dict, _ = build_patch(main_sheet_patch, tuple(subvolume_size), ply_file_path, sample_ratio=float(sample_ratio))
                 patches_list.append(surface_dict)
-
     return patches_list
 
 def extract_ids(file_name):
@@ -672,11 +941,11 @@ def process_same_block(main_block_patches_list, overlapp_threshold, umbilicus_di
         # find out if close to angle%90 == 0
         # TODO: actually calculate this from the sheet configuration instead of approximating from the sheet position around the umbilicus
         # angle = (patch_angle(patches_list[i]) + patch_angle(patches_list[j])) / 2.0 # approximation
-        right_angle = angle / 90.0 + 0.5
-        right_angle = right_angle - np.floor(right_angle) - 0.5
         min_points_factor = 1.0
-        if abs(right_angle) < 0.333:
-            min_points_factor = 0.25
+        # right_angle = angle / 90.0 + 0.5
+        # right_angle = right_angle - np.floor(right_angle) - 0.5
+        # if abs(right_angle) < 0.333: # not needed anymore after graph gap fix
+        #     min_points_factor = 0.25
         score_switching_sheets_ = []
         for j in range(len(main_block_patches_list)):
             if i == j:
@@ -705,6 +974,59 @@ def score_other_block_patches(patches_list, i, j, overlapp_threshold, angle):
     # find out if close to angle%90 == 0
     # TODO: actually calculate this from the sheet configuration instead of approximating from the sheet position around the umbilicus
     # angle = (patch_angle(patches_list[i]) + patch_angle(patches_list[j])) / 2.0 # approximation
+    min_points_factor = 1.0
+    # right_angle = angle / 90.0 + 0.5
+    # right_angle = right_angle - np.floor(right_angle) - 0.5
+    # if abs(right_angle) < 0.333: # not needed anymore after graph gap fix
+    #     min_points_factor = 0.25
+    
+    patch1 = patches_list[i]
+    patch2 = patches_list[j]
+    patches_list = [patch1, patch2]
+    # Single threaded
+    results = []
+    results.append(compute_overlap_for_pair((0, patches_list, overlapp_threshold["epsilon"], overlapp_threshold["angle_tolerance"])))
+
+    assert len(results) == 1, "Only one result should be returned."
+    assert len(results[0]) == 1, "Only one pair of patches should be returned."
+
+    # Combining results
+    for result in results:
+        for i, j, overlapp_percentage, overlap, non_overlap, points_overlap, angles_offset in result:
+            patches_list[i]["overlapp_percentage"][j] = overlapp_percentage
+            patches_list[i]["overlap"][j] = overlap
+            patches_list[i]["non_overlap"][j] = non_overlap
+            patches_list[i]["points_overlap"][j] = points_overlap
+            score = overlapp_score(i, j, patches_list, overlapp_threshold=overlapp_threshold, sample_ratio=overlapp_threshold["sample_ratio_score"], min_points_factor=min_points_factor)
+
+            if overlap < min_points_factor * overlapp_threshold["nr_points_min"] * overlapp_threshold["sample_ratio_score"] or overlap <= 0:
+                score = -1.0
+            elif score <= 0.0:
+                score = -1.0
+            elif patches_list[j]["points"].shape[0] < min_points_factor * overlapp_threshold["min_patch_points"] * overlapp_threshold["sample_ratio_score"]:
+                score = -1.0
+            elif patches_list[i]["points"].shape[0] < min_points_factor * overlapp_threshold["min_patch_points"] * overlapp_threshold["sample_ratio_score"]:
+                score = -1.0
+            elif patches_list[i]["patch_prediction_scores"][0] < overlapp_threshold["min_prediction_threshold"] or patches_list[j]["patch_prediction_scores"][0] < overlapp_threshold["min_prediction_threshold"]:
+                score = -1.0
+            elif overlapp_threshold["fit_sheet"]:
+                cost_refined, cost_percentile, cost_sheet_distance, surface = fit_sheet(patches_list, i, j, overlapp_threshold["cost_percentile"], overlapp_threshold["epsilon"], overlapp_threshold["angle_tolerance"])
+                if cost_refined >= overlapp_threshold["cost_threshold"]:
+                    score = -1.0
+                elif cost_percentile >= overlapp_threshold["cost_percentile_threshold"]:
+                    score = -1.0
+                elif cost_sheet_distance >= overlapp_threshold["cost_sheet_distance_threshold"]:
+                    score = -1.0
+
+    return score, patch1["anchor_angles"][0], patch2["anchor_angles"][0]
+
+def score_other_block_patches_old(patches_list, i, j, overlapp_threshold, angle):
+    """
+    Calculate the score between two patches from different blocks.
+    """
+    # find out if close to angle%90 == 0
+    # TODO: actually calculate this from the sheet configuration instead of approximating from the sheet position around the umbilicus
+    # angle = (patch_angle(patches_list[i]) + patch_angle(patches_list[j])) / 2.0 # approximation
     right_angle = angle / 90.0 + 0.5
     right_angle = right_angle - np.floor(right_angle) - 0.5
     min_points_factor = 1.0
@@ -716,7 +1038,7 @@ def score_other_block_patches(patches_list, i, j, overlapp_threshold, angle):
     patches_list = [patch1, patch2]
     # Single threaded
     results = []
-    results.append(compute_overlap_for_pair((0, patches_list, overlapp_threshold["epsilon"], overlapp_threshold["angle_tolerance"])))
+    results.append(compute_overlap_for_pair_old((0, patches_list, overlapp_threshold["epsilon"], overlapp_threshold["angle_tolerance"])))
 
     assert len(results) == 1, "Only one result should be returned."
     assert len(results[0]) == 1, "Only one pair of patches should be returned."
@@ -793,7 +1115,8 @@ def process_block(args):
         # Extract block's integer ID
         block_id = [int(i) for i in file_path.split('/')[-1].split('.')[0].split("_")]
         block_id = np.array(block_id)
-        surrounding_ids = surrounding_volumes(block_id, overlapp_threshold)
+        surrounding_ids = surrounding_volumes_kdtree_dict(block_id)
+        # surrounding_ids = surrounding_volumes(block_id, overlapp_threshold)
         surrounding_blocks_patches_list = []
         surrounding_blocks_patches_list_ = []
         for surrounding_id in surrounding_ids:
@@ -805,15 +1128,15 @@ def process_block(args):
         # Add the overlap base to the patches list that contains the points + normals + scores only before
         patches_list = main_block_patches_list + surrounding_blocks_patches_list_
         add_overlapp_entries_to_patches_list(patches_list)
-        subvolume = {"start": block_id - 25, "end": block_id + 75}
 
-        # Assign points to tiles
-        try:
-            assign_points_to_tiles(patches_list, subvolume, tiling=3)
-        except Exception as e:
-            print(e)
-            print("Error assigning points to tiles.")
-            return [], [], [], {}
+        # # Assign points to tiles
+        # subvolume = {"start": block_id - 25, "end": block_id + 75}
+        # try:
+        #     assign_points_to_tiles(patches_list, subvolume, tiling=3)
+        # except Exception as e:
+        #     print(e)
+        #     print("Error assigning points to tiles.")
+        #     return [], [], [], {}
 
         # calculate scores between each main block patch and surrounding blocks patches
         score_sheets = []
@@ -907,9 +1230,10 @@ def worker_build_GT(args):
 
     return nodes_winding_alignment
     
-def init_worker_build_graph(centroid_method_):
-    global centroid_method
+def init_worker_build_graph(centroid_method_, surrounding_dict_):
+    global centroid_method, surrounding_dict
     centroid_method = centroid_method_
+    surrounding_dict = surrounding_dict_
 
 class ScrollGraph(Graph):
     def __init__(self, overlapp_threshold, umbilicus_path):
@@ -1275,15 +1599,40 @@ class ScrollGraph(Graph):
         if start_fresh:
             blocks_tar_files = glob.glob(path_instances + '/*.tar')
             blocks_7z_files  = glob.glob(path_instances + '/*.7z')
-            blocks_files = blocks_tar_files + blocks_7z_files
+            blocks_h5_filename = os.path.join(path_instances + ".h5")
+            blocks_h5_files = []
+            
+            if os.path.exists(blocks_h5_filename):
+                with h5py.File(blocks_h5_filename, "r") as h5f:
+                    blocks_h5_files = [os.path.join(path_instances, key + ".ply") for key in h5f.keys()]
+                    print(f"Found {len(blocks_h5_files)} blocks in HDF5 file.")
+                    # group_path = "scroll_pcs/point_cloud_colorized_verso_subvolume_blocks"
+
+                    # with h5py.File(blocks_h5_filename.replace(".h5", "_.h5"), "w") as new_h5:
+                    #     for key in h5f[group_path]:  # Iterate over items in group
+                    #         new_h5.copy(h5f[group_path][key], new_h5, name=key)
+                    #         print(f"Copied '{key}' to root level.")
+
+            blocks_files = blocks_tar_files + blocks_7z_files + blocks_h5_files
+            # sort blocks files
+            blocks_files = sorted(blocks_files) # gimmick
+            # debug with first 100
+            # blocks_files = blocks_files[:1000]
             print(f"Found {len(blocks_files)} blocks before filtering.")
             blocks_files = [block_file for block_file in blocks_files if int(block_file.split('/')[-1].split('.')[0].split("_")[1]) >= self.overlapp_threshold["sheet_z_range"][0] and int(block_file.split('/')[-1].split('.')[0].split("_")[1]) <= self.overlapp_threshold["sheet_z_range"][1]]
             print(f"Found {len(blocks_files)} blocks.")
+            kd_tree, block_ids = build_kd_tree(blocks_files)
+            # Create a shared dictionary using Manager
+            manager = Manager()
+            surrounding_dict_shared = manager.dict(build_surrounding_volumes_dict(kd_tree, block_ids, self.overlapp_threshold))
             print("Building graph...")
             # Create a pool of worker processes
-            with Pool(num_processes, initializer=init_worker_build_graph, initargs=(centroid_method,)) as pool:
+            with Pool(num_processes, initializer=init_worker_build_graph, initargs=(centroid_method,surrounding_dict_shared,)) as pool: # num_processes
+                print(f"Number of blocks: {len(blocks_files)}")
                 # Map the process_block function to each file
                 zipped_args = list(zip(blocks_files, [path_instances] * len(blocks_files), [self.overlapp_threshold] * len(blocks_files), [self.umbilicus_data] * len(blocks_files)))
+                # for za in zipped_args:
+                #     process_block(za)
                 results = list(tqdm(pool.imap(process_block, zipped_args), total=len(zipped_args)))
 
             print(f"Number of results: {len(results)}")

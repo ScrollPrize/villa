@@ -18,7 +18,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Enable or disable GPU support
-option(ENABLE_GPU "Enable GPU compilation" ON)
+option(ENABLE_GPU "Enable GPU compilation" OFF)
 
 # Find and enable OpenMP
 find_package(OpenMP REQUIRED)
@@ -43,16 +43,16 @@ target_compile_options(graph_problem PRIVATE
 )
 
 # ------------------------ GPU Version ----------------------------------
+# Find CUDA toolkit (recommended for modern CMake)
+find_package(CUDAToolkit REQUIRED)
+
+# Detect architecture if not explicitly defined
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    # Default to common architectures if automatic detection fails
+    set(CMAKE_CUDA_ARCHITECTURES 60 61 70 75 80)
+endif()
+
 if(ENABLE_GPU)
-    # Find CUDA toolkit (recommended for modern CMake)
-    find_package(CUDAToolkit REQUIRED)
-
-    # Detect architecture if not explicitly defined
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        # Default to common architectures if automatic detection fails
-        set(CMAKE_CUDA_ARCHITECTURES 60 61 70 75 80)
-    endif()
-
     # Add the executable for the GPU version
     add_executable(graph_problem_gpu main_gpu.cpp solve_gpu.cu node_structs.cpp)
 
@@ -76,35 +76,49 @@ if(ENABLE_GPU)
         POSITION_INDEPENDENT_CODE ON  # Required if you plan to link shared libraries
     )
     
-# -------------------- Python Module (Pybind11) ---------------------
-    set(PYTHON_EXECUTABLE $(which python)) # Conda's Python executable
-    find_package(Python COMPONENTS Interpreter Development)
-    include_directories(${Python_INCLUDE_DIRS})
-    link_directories(${Python_LIBRARY_DIRS})
-
-    # Add the Python module
-    add_subdirectory(pybind11)  # Ensure pybind11 is added to the project
-
-    # Add a Python module with pybind11
-    pybind11_add_module(graph_problem_gpu_py main_py.cpp solve_gpu.cu node_structs.cpp)
-
-    # Include directories for Python module
-    target_include_directories(graph_problem_gpu_py PRIVATE ${CMAKE_SOURCE_DIR})
-
-    # Link libraries for the Python module
-    target_link_libraries(graph_problem_gpu_py PRIVATE OpenMP::OpenMP_CXX ${OpenCV_LIBS} CUDA::cudart)
-
-    # Add compile options for the GPU version
-    target_compile_options(graph_problem_gpu_py PRIVATE
-        $<$<CONFIG:Release>:-use_fast_math>  # Enable fast math for faster performance (if precision allows)
-        $<$<CONFIG:Release>:-O3>       # Use -O3 for Release builds
-        $<$<CONFIG:Debug>:-O0>         # No optimization for Debug builds
-    )
-
-    # Set properties for the Python module
-    set_target_properties(graph_problem_gpu_py PROPERTIES
-        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
-        CUDA_SEPARABLE_COMPILATION ON
-        POSITION_INDEPENDENT_CODE ON  # Required for Python modules
-    )
 endif()
+# -------------------- Python Module (Pybind11) ---------------------
+# Automatically detect Python from the system environment
+execute_process(
+    COMMAND which python3
+    OUTPUT_VARIABLE Python_EXECUTABLE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)# Find the Python executable
+find_package(Python REQUIRED COMPONENTS Interpreter)
+# output which python3
+# Print the path found by 'which python'
+# Print the path found by 'which python'
+message(STATUS "Python path found by 'which python': ${PYTHON_WHICH}")
+
+# Also print the Python interpreter found by CMake
+message(STATUS "Python interpreter found by CMake: ${Python_EXECUTABLE}")
+
+find_package(Python COMPONENTS Interpreter Development)
+include_directories(${Python_INCLUDE_DIRS})
+link_directories(${Python_LIBRARY_DIRS})
+
+# Add the Python module
+add_subdirectory(pybind11)  # Ensure pybind11 is added to the project
+
+# Add a Python module with pybind11
+pybind11_add_module(graph_problem_gpu_py main_py.cpp solve_gpu.cu node_structs.cpp)
+
+# Include directories for Python module
+target_include_directories(graph_problem_gpu_py PRIVATE ${CMAKE_SOURCE_DIR})
+
+# Link libraries for the Python module
+target_link_libraries(graph_problem_gpu_py PRIVATE OpenMP::OpenMP_CXX ${OpenCV_LIBS} CUDA::cudart)
+
+# Add compile options for the GPU version
+target_compile_options(graph_problem_gpu_py PRIVATE
+    $<$<CONFIG:Release>:-use_fast_math>  # Enable fast math for faster performance (if precision allows)
+    $<$<CONFIG:Release>:-O3>       # Use -O3 for Release builds
+    $<$<CONFIG:Debug>:-O0>         # No optimization for Debug builds
+)
+
+# Set properties for the Python module
+set_target_properties(graph_problem_gpu_py PROPERTIES
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+    CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE ON  # Required for Python modules
+)

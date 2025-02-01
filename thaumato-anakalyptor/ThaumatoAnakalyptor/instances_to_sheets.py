@@ -577,6 +577,30 @@ def overlap_mask(patch1, patch2, index):
 
 def compute_overlap_for_pair(args):
     i, patches_list, epsilon, angle_tolerance = args
+    patch_i = patches_list[i]
+    points_i = patch_i["points"]
+    result_overlapps = []
+    for j in range(i+1, len(patches_list)):
+        # extract the unique points and the nr of overlapping points
+        patch_j = patches_list[j]
+        points_j = patch_j["points"]
+        points_ij = np.vstack([points_i, points_j])
+        unique_points_size = np.unique(points_ij, axis=0).shape[0]
+        total_points_size = points_ij.shape[0]
+        overlapping_points_size = total_points_size - unique_points_size        
+
+        # Compute the surface overlap between the two patches
+        overlapp_percentage = 1.0 * overlapping_points_size / (unique_points_size + 0.00001)
+        overlap = overlapping_points_size
+        non_overlap = unique_points_size - overlapping_points_size
+        points_overlap = None
+        angles_offset = 0.0
+
+        result_overlapps.append((i, j, overlapp_percentage, overlap, non_overlap, points_overlap, angles_offset))
+    return result_overlapps
+
+def compute_overlap_for_pair_old(args):
+    i, patches_list, epsilon, angle_tolerance = args
     result_overlapps = []
     for j in range(i+1, len(patches_list)):
         # Extract indexes of overlapping tiles
@@ -750,11 +774,14 @@ def overlapp_score(i, j, patches_list, overlapp_threshold={"score_threshold": 0.
     overlapp_percentage = patches_list[i]["overlapp_percentage"][j]
     overlap = patches_list[i]["overlap"][j] / (min_points_factor * sample_ratio) # Adjust for calculation based on total points
 
-    nrp = min(max(overlapp_threshold["nr_points_min"], overlap), overlapp_threshold["nr_points_max"]) / (overlapp_threshold["nr_points_min"])
-    nrp_factor = np.log(np.log(nrp) + 1.0) + 1.0
+    # nrp = min(max(overlapp_threshold["nr_points_min"], overlap), overlapp_threshold["nr_points_max"]) / (overlapp_threshold["nr_points_min"])
+    # nrp_factor = np.log(np.log(nrp) + 1.0) + 1.0
 
-    p = 1.0 - overlapp_percentage
-    score = 1.0 - (min_points_factor**0.5) * p
+    nrp = (min(max(2.0 * overlapp_threshold["nr_points_min"], overlap), 2.0 * overlapp_threshold["nr_points_max"]) - 2.0 * overlapp_threshold["nr_points_min"]) / (2.0 * overlapp_threshold["nr_points_max"] - 2.0 * overlapp_threshold["nr_points_min"])
+    nrp_factor = nrp + 1.0
+
+    non_overlap_percentage = 1.0 - overlapp_percentage
+    score = 1.0 - (min_points_factor**2.0) * non_overlap_percentage
     # score = overlapp_percentage
 
     if score >= overlapp_threshold["score_threshold"]:

@@ -572,9 +572,12 @@ class GridDataset(Dataset):
         while i < len(blocks_to_process):
             corner_coords = blocks_to_process[i]
             # check if block is in z range, else remove
-            if corner_coords[2] < self.min_z or corner_coords[2] > self.max_z:
-                    # remove from processing index i
-                    blocks_to_process = blocks_to_process[:i] + blocks_to_process[i+1:]
+            if self.min_z is not None and corner_coords[2] < self.min_z:
+                # remove from processing index i
+                blocks_to_process = blocks_to_process[:i] + blocks_to_process[i+1:]
+            elif self.max_z is not None and corner_coords[2] > self.max_z:
+                # remove from processing index i
+                blocks_to_process = blocks_to_process[:i] + blocks_to_process[i+1:]
             else:
                 i += 1
         return blocks_to_process

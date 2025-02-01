@@ -131,6 +131,11 @@ class InstanceSegmentation(pl.LightningModule):
         if len(batch[0]) == 0:
             return []
         prediction = self.inference(batch[0])
+        if batch_idx % 15 == 0:
+            # cleanup torch vram
+            torch.cuda.empty_cache()
+            # trigger garbage collection
+            gc.collect()
         return prediction
     
     def inference(self, batch):

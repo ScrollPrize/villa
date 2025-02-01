@@ -6,3 +6,4 @@ lightning_logs/
 overlapp_threshold.yaml
 python*/
 experiments/
+colormap.ply

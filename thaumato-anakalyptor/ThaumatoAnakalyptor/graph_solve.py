@@ -4,7 +4,7 @@ import cv2
 import os
 import argparse
 
-sys.path.append('build')
+sys.path.append('ThaumatoAnakalyptor/graph_problem/build')
 import graph_problem_gpu_py
 
 def compress_video(input_path, output_path, codec='mp4v', scale=0.5):
@@ -113,11 +113,11 @@ def run_f_star(solver, experiment_name="", continue_from=0):
         solver.solve_f_star(num_iterations=20000, spring_constant=2.50, o=0.0, i_round=3)
         solver.solve_f_star(num_iterations=20000, spring_constant=1.75, o=0.0, i_round=4)
         solver.solve_f_star(num_iterations=20000, spring_constant=1.5, o=0.0, i_round=5)
-        solver.solve_f_star(num_iterations=30000, spring_constant=1.0, o=0.0, i_round=6)
-        solver.solve_f_star(num_iterations=15000, spring_constant=0.75, o=0.02, i_round=7)
-        solver.solve_f_star(num_iterations=15000, spring_constant=0.8, o=0.02, i_round=8)
-        solver.solve_f_star(num_iterations=15000, spring_constant=0.9, o=0.02, i_round=9)
-        solver.solve_f_star(num_iterations=15000, spring_constant=1.1, o=0.0, i_round=10)
+        # solver.solve_f_star(num_iterations=30000, spring_constant=1.0, o=0.0, i_round=6)
+        # solver.solve_f_star(num_iterations=15000, spring_constant=0.75, o=0.02, i_round=7)
+        # solver.solve_f_star(num_iterations=15000, spring_constant=0.8, o=0.02, i_round=8)
+        # solver.solve_f_star(num_iterations=15000, spring_constant=0.9, o=0.02, i_round=9)
+        # solver.solve_f_star(num_iterations=15000, spring_constant=1.1, o=0.0, i_round=10)
         solver.save_graph(save_path)
     else:
         solver.load_graph(save_path)
@@ -151,7 +151,7 @@ def run_ring(solver, experiment_name="", i_round=11, fresh_start=0, standard_win
     intermediate_ring_solution_save_path = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_solver_connected_1.bin"
     if fresh_start <= 0:
         # warmup iterations
-        solver.solve_ring(num_iterations=30000, i_round=i_round, other_block_factor = 0.5 * other_block_factor, increase_same_block_weight=False, 
+        solver.solve_ring(num_iterations=40000, i_round=i_round, other_block_factor = 5 * other_block_factor, increase_same_block_weight=False, 
                           std_target=std_target, standard_winding_direction=standard_winding_direction)
         solver.solution_loss()
         solver.save_graph(intermediate_ring_solution_save_path)
@@ -162,12 +162,12 @@ def run_ring(solver, experiment_name="", i_round=11, fresh_start=0, standard_win
     intermediate_ring_solution_save_path2 = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_solver_connected_2.bin"
     if fresh_start <= 1:
         std_target_step = (std_target2 - std_target) / iter_target2 # target std from 0.013 -> 0.1 within 30'000 iterations
-        solver.solve_ring(num_iterations=iter_target2, i_round=i_round, other_block_factor = 0.5 * other_block_factor, increase_same_block_weight=False, 
+        solver.solve_ring(num_iterations=iter_target2, i_round=i_round, other_block_factor = 5 * other_block_factor, increase_same_block_weight=False, 
                           std_target=std_target, std_target_step=std_target_step, standard_winding_direction=standard_winding_direction)
         solver.solution_loss()
         i_round += 1
         # converge with std target 2
-        solver.solve_ring(num_iterations=30000, i_round=i_round, other_block_factor = 0.5 *other_block_factor, increase_same_block_weight=False, 
+        solver.solve_ring(num_iterations=30000, i_round=i_round, other_block_factor = 5 *other_block_factor, increase_same_block_weight=False, 
                           std_target=std_target2, standard_winding_direction=standard_winding_direction)
         solver.solution_loss()
         i_round += 1
@@ -263,7 +263,7 @@ def main(graph_path="graph_scroll5_january_unrolling_full_v2.bin", experiment_na
     # make checkpoint folder in experiment folder
     os.makedirs(f"experiments/{experiment_name}/checkpoints", exist_ok=True)
 
-    fresh_start_star = 0 # continue solve computation from fresh_start
+    # fresh_start_star = 0 # continue solve computation from fresh_start
     i_round = run_f_star(solver, experiment_name, continue_from=fresh_start_star)
     solver.filter_f_star() # filter the graph based on f_star solution
     solver.generate_ply(f"experiments/{experiment_name}/solved_f_star.ply")
@@ -273,7 +273,7 @@ def main(graph_path="graph_scroll5_january_unrolling_full_v2.bin", experiment_na
 
     solver.largest_connected_component()
 
-    fresh_start_ring = 0 # continue solve computation from fresh_start
+    # fresh_start_ring = 0 # continue solve computation from fresh_start
     scale_outer = 1.0 # S5 right side
     scale_inner = 1.0 # S5 left side
     i_round = run_ring(solver, experiment_name, fresh_start=fresh_start_ring, i_round=i_round, standard_winding_direction=standard_winding_direction, scale_left=scale_outer, scale_right=scale_inner)

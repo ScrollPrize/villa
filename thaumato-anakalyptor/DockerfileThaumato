@@ -37,6 +37,18 @@ COPY environment_thaumato.yml /workspace/
 # Update the environment using the yml file
 RUN conda env update --name thaumato -f /workspace/environment_thaumato.yml
 
+RUN /opt/conda/bin/conda init bash && exec bash && conda activate thaumato
+
+# Ensure Conda is properly initialized
+RUN /opt/conda/bin/conda init bash && \
+    echo "source /opt/conda/etc/profile.d/conda.sh" >> ~/.bashrc
+
+# Set default shell to bash (important for conda activation)
+SHELL ["/bin/bash", "--login", "-c"]
+
+# Activate the `thaumato` environment in all future sessions
+RUN echo "conda activate thaumato" >> ~/.bashrc
+
 # Copy mask3d third party for installation
 COPY ./ThaumatoAnakalyptor/mask3d/third_party/ /workspace/ThaumatoAnakalyptor/mask3d/third_party/
 
@@ -58,8 +70,8 @@ RUN export TORCH_CUDA_ARCH_LIST="6.0 6.1 6.2 7.0 7.2 7.5 8.0 8.6" \
 && make \
 && cd /workspace/ThaumatoAnakalyptor/mask3d/third_party/pointnet2 && python setup.py install
 
-RUN pip install pytorch-lightning==1.9.5 \
-&& pip install torchmetrics==0.11.4 colorcet py7zr numba==0.60.0
+RUN pip install pytorch-lightning==1.9.5 --no-deps
+RUN pip install torchmetrics==0.11.4 colorcet py7zr numba==0.60.0
 
 RUN apt-get update && apt-get install -y libgl1-mesa-glx
 
@@ -96,23 +108,8 @@ RUN ls -la
 RUN apt-cache search libsdl
 RUN apt-get install -y libsdl2-dev libgsl-dev
 
-# Install virtualenv
-RUN pip install virtualenv
-
-# Create a virtual environment for the second set of dependencies
-RUN virtualenv youssefGP
-
-# Activate the virtual environment and install packages from the requirements.txt file at a specific commit
-RUN /bin/bash -c "source youssefGP/bin/activate && \
-pip3 install -r https://raw.githubusercontent.com/younader/Vesuvius-Grandprize-Winner/940634f1fe3ffb9a585b733dda6c3dd234540b41/requirements.txt"
-
 # Install gdown to handle Google Drive file downloads
 RUN pip install gdown
-
-# Download the canonical timesformer weights from Google Drive using gdown
-RUN mkdir -p /workspace/Vesuvius-Grandprize-Winner
-RUN rm -f /workspace/Vesuvius-Grandprize-Winner/timesformer_wild15_20230702185753_0_fr_i3depoch=12.ckpt
-RUN gdown --id 13Iu-dR-1sKq_oGJfNa86LcBSv1o4XA37 -O /workspace/Vesuvius-Grandprize-Winner/timesformer_wild15_20230702185753_0_fr_i3depoch=12.ckpt
 
 # Copy scripts and modules
 COPY ./ThaumatoAnakalyptor/mask3d/ /workspace/ThaumatoAnakalyptor/mask3d/
@@ -130,8 +127,9 @@ libarchive-dev \
 libtbb-dev  \
 libopencv-dev
 
-RUN pip uninstall opencv-python-headless opencv-python -y
-RUN pip install opencv-python
+# RUN pip uninstall opencv-python-headless opencv-python -y
+# RUN pip install opencv-python
+RUN pip install h5py
 
 # build C++ ThaumatoAnakalyptor code with the submodules
 RUN git clone --recurse-submodules https://github.com/schillij95/ThaumatoAnakalyptor /ThaumatoAnakalyptor_temp
