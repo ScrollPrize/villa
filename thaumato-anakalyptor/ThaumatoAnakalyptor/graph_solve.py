@@ -151,7 +151,7 @@ def run_ring(solver, experiment_name="", i_round=11, fresh_start=0, standard_win
     intermediate_ring_solution_save_path = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_solver_connected_1.bin"
     if fresh_start <= 0:
         # warmup iterations
-        solver.solve_ring(num_iterations=40000, i_round=i_round, other_block_factor = 5 * other_block_factor, increase_same_block_weight=False, 
+        solver.solve_ring(num_iterations=5 * 40000, i_round=i_round, other_block_factor = 50 * other_block_factor, increase_same_block_weight=False, 
                           std_target=std_target, standard_winding_direction=standard_winding_direction)
         solver.solution_loss()
         solver.save_graph(intermediate_ring_solution_save_path)
@@ -162,12 +162,12 @@ def run_ring(solver, experiment_name="", i_round=11, fresh_start=0, standard_win
     intermediate_ring_solution_save_path2 = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_solver_connected_2.bin"
     if fresh_start <= 1:
         std_target_step = (std_target2 - std_target) / iter_target2 # target std from 0.013 -> 0.1 within 30'000 iterations
-        solver.solve_ring(num_iterations=iter_target2, i_round=i_round, other_block_factor = 5 * other_block_factor, increase_same_block_weight=False, 
+        solver.solve_ring(num_iterations=iter_target2, i_round=i_round, other_block_factor = 15 * other_block_factor, increase_same_block_weight=False, 
                           std_target=std_target, std_target_step=std_target_step, standard_winding_direction=standard_winding_direction)
         solver.solution_loss()
         i_round += 1
         # converge with std target 2
-        solver.solve_ring(num_iterations=30000, i_round=i_round, other_block_factor = 5 *other_block_factor, increase_same_block_weight=False, 
+        solver.solve_ring(num_iterations=100000, i_round=i_round, other_block_factor = 15 *other_block_factor, increase_same_block_weight=False, 
                           std_target=std_target2, standard_winding_direction=standard_winding_direction)
         solver.solution_loss()
         i_round += 1
@@ -176,41 +176,41 @@ def run_ring(solver, experiment_name="", i_round=11, fresh_start=0, standard_win
         solver.load_graph(intermediate_ring_solution_save_path2)
         i_round += 2
 
-    # intermediate_ring_solution_save_path3 = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_solver_connected_3.bin"
-    # if fresh_start <= 2:
-    #     # final parameters + speedup in convergence (makes solution a little less accurate, but convergence towards perfect solution is faster)
-    #     # solver.solution_loss()
-    #     for i in range(10):
-    #         solver.solve_ring(num_iterations=10000, i_round=i_round, other_block_factor=2.5 * other_block_factor, increase_same_block_weight=True, 
-    #                           convergence_speedup=True, std_target=std_target2, wiggle=i<7, standard_winding_direction=standard_winding_direction, 
-    #                           scale_left=scale_left, scale_right=scale_right) # for sure c-thresh is lower than mean 0.002187, max 0.045 # 100k iterations, still a little short, maybe 500k needed
-    #         solver.solution_loss()
-    #         i_round += 1
-    #     solver.save_graph(intermediate_ring_solution_save_path3)
-    # elif fresh_start == 3:
-    #     solver.load_graph(intermediate_ring_solution_save_path3)
-    #     i_round += 10
+    intermediate_ring_solution_save_path3 = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_solver_connected_3.bin"
+    if fresh_start <= 2:
+        # final parameters + speedup in convergence (makes solution a little less accurate, but convergence towards perfect solution is faster)
+        # solver.solution_loss()
+        for i in range(10):
+            solver.solve_ring(num_iterations=10000, i_round=i_round, other_block_factor=150 * other_block_factor, increase_same_block_weight=True, 
+                              convergence_speedup=True, std_target=std_target2, wiggle=i<7, standard_winding_direction=standard_winding_direction, 
+                              scale_left=scale_left, scale_right=scale_right) # for sure c-thresh is lower than mean 0.002187, max 0.045 # 100k iterations, still a little short, maybe 500k needed
+            solver.solution_loss()
+            i_round += 1
+        solver.save_graph(intermediate_ring_solution_save_path3)
+    elif fresh_start == 3:
+        solver.load_graph(intermediate_ring_solution_save_path3)
+        i_round += 10
 
-    # intermediate_ring_solution_save_path4 = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_solver_connected_4.bin"
-    # if fresh_start <= 3:
-    #     # let the sides converge with the final parameters. (makes solution more accurate)
-    #     solver.solve_ring(num_iterations=100000, i_round=i_round, other_block_factor=2.5 * other_block_factor, increase_same_block_weight=True, 
-    #                       convergence_speedup=False, std_target=std_target2, wiggle=False, standard_winding_direction=standard_winding_direction, 
-    #                       scale_left=scale_left, scale_right=scale_right)
-    #     solver.solution_loss()
-    #     i_round += 1
-    #     solver.save_graph(intermediate_ring_solution_save_path4)
-    # elif fresh_start == 4:
-    #     solver.load_graph(intermediate_ring_solution_save_path4)
-    #     i_round += 1
+    intermediate_ring_solution_save_path4 = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_solver_connected_4.bin"
+    if fresh_start <= 3:
+        # let the sides converge with the final parameters. (makes solution more accurate)
+        solver.solve_ring(num_iterations=100000, i_round=i_round, other_block_factor=15 * other_block_factor, increase_same_block_weight=True, 
+                          convergence_speedup=False, std_target=std_target2, wiggle=False, standard_winding_direction=standard_winding_direction, 
+                          scale_left=scale_left, scale_right=scale_right)
+        solver.solution_loss()
+        i_round += 1
+        solver.save_graph(intermediate_ring_solution_save_path4)
+    elif fresh_start == 4:
+        solver.load_graph(intermediate_ring_solution_save_path4)
+        i_round += 1
     
-    # if fresh_start < 4:
-    #     # generate video
-    #     try:
-    #         solver.generate_video("python_sides", f"experiments/{experiment_name}/python_sides.avi", 10)
-    #         compress_video(f"experiments/{experiment_name}/python_sides.avi", f"experiments/{experiment_name}/python_sides.mp4", codec='mp4v', scale=0.5)
-    #     except:
-    #         print(f"Error compressing video experiments/{experiment_name}/python_sides.avi")
+    if fresh_start < 4:
+        # generate video
+        try:
+            solver.generate_video("python_sides", f"experiments/{experiment_name}/python_sides.avi", 10)
+            compress_video(f"experiments/{experiment_name}/python_sides.avi", f"experiments/{experiment_name}/python_sides.mp4", codec='mp4v', scale=0.5)
+        except:
+            print(f"Error compressing video experiments/{experiment_name}/python_sides.avi")
 
     # filter the edges based on the ring solution
     solver.filter_graph_ring()
