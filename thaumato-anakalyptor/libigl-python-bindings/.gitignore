@@ -39,3 +39,5 @@ junit
 .*.swo
 *~
 dist/
+
+*mesh*/
