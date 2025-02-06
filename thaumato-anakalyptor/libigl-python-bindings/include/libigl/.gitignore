@@ -36,6 +36,7 @@
 /tests/data
 /tutorial/data
 /install
+cmake/
 
 # Libigl specific
 LibiglOptions.cmake
