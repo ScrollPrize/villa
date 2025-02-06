@@ -38,12 +38,12 @@ junit
 .*.swp
 .*.swo
 *~
-dist/
+dist
 
-*mesh*/
-meshes/
-split_mesh/
-split_mesh2/
-build/
-window_mesh/
-igl/
+*mesh*
+meshes
+split_mesh
+split_mesh2
+build
+window_mesh
+igl
