@@ -41,3 +41,6 @@ junit
 dist/
 
 *mesh*/
+meshes/
+split_mesh/
+split_mesh2/
