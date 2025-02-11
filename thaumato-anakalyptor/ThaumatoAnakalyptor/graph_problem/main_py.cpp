@@ -432,12 +432,12 @@ class Solver {
         }
         void solve_ring(int num_iterations, int i_round = 1, float other_block_factor = 1.0f, float std_target = 0.013f, float std_target_step = 0.0f, 
                         bool increase_same_block_weight = true, bool convergence_speedup = false, float convergence_thresh = 0.0f, bool wiggle = true, 
-                        bool standard_winding_direction = false, float scale_left=1.0f, float scale_right=1.0f) {
+                        bool standard_winding_direction = false, float scale_left=1.0f, float scale_right=1.0f, bool enable_delete_nodes = true) {
             // use the ring solver to refine the graph edges with before running the winding number solver
             // store only the valid indices to speed up the loop
             std::vector<size_t> valid_indices = get_valid_indices(graph);
             graph = run_solver_ring(graph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, other_block_factor, std_target, std_target_step, increase_same_block_weight, 
-            convergence_speedup, convergence_thresh, wiggle, standard_winding_direction, scale_left, scale_right);
+            convergence_speedup, convergence_thresh, wiggle, standard_winding_direction, scale_left, scale_right, enable_delete_nodes);
         }
         void filter_graph_ring() {
             // Filters the graph edges based on the ring solver solution
@@ -445,11 +445,31 @@ class Solver {
             // get largest connected component
             largest_connected_component();
         }
-        void solve_winding_number(int num_iterations, int i_round = 1, int seed_node = 100, float other_block_factor = 1.0f, int side_fix_nr = 0) {
+        void set_labels(std::vector<float> gt_winding_nrs, std::vector<bool> gt) {
+            // set labels
+            std::vector<size_t> valid_indices = get_valid_indices(graph);
+            for (size_t i = 0; i < valid_indices.size(); ++i) {
+                size_t index = valid_indices[i];
+                graph[index].winding_nr_old = gt_winding_nrs[i];
+                graph[index].winding_nr = graph[index].winding_nr_old;                
+                graph[index].fixed = gt[i];
+            }
+        }
+        std::vector<float> get_labels() {
+            // get labels
+            std::vector<float> labels;
+            std::vector<size_t> valid_indices = get_valid_indices(graph);
+            for (size_t i = 0; i < valid_indices.size(); ++i) {
+                size_t index = valid_indices[i];
+                labels.push_back(graph[index].winding_nr_old);
+            }
+            return labels;
+        }
+        void solve_winding_number(int num_iterations, int i_round = 1, int seed_node = 100, float other_block_factor = 1.0f, int side_fix_nr = 0, bool display = true) {
             // use the winding number solver for the final solution
             // store only the valid indices to speed up the loop
             std::vector<size_t> valid_indices = get_valid_indices(graph);
-            graph = run_solver_winding_number(graph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, other_block_factor, seed_node, side_fix_nr);
+            graph = run_solver_winding_number(graph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, other_block_factor, seed_node, side_fix_nr, display);
         }
         void assign_f_star(std::vector<Node>& graph) {
             // assign winding angles to f star
@@ -692,16 +712,24 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("wiggle") = true,
             py::arg("standard_winding_direction") = false,
             py::arg("scale_left") = 1.0f,
-            py::arg("scale_right") = 1.0f)
+            py::arg("scale_right") = 1.0f,
+            py::arg("enable_delete_nodes") = true)
         .def("filter_graph_ring", &Solver::filter_graph_ring,
             "Method to filter the graph edges after running the ring solver")
+        .def("set_labels", &Solver::set_labels,
+            "Method to set the labels of the graph",
+            py::arg("gt_f_stars"),
+            py::arg("gt"))
+        .def("get_labels", &Solver::get_labels,
+            "Method to get the labels of the graph")
         .def("solve_winding_number", &Solver::solve_winding_number,
             "Method to final solve the graph with the winding number solver",
             py::arg("num_iterations") = 10000,
             py::arg("i_round") = 1,
             py::arg("seed_node") = 100,
             py::arg("other_block_factor") = 1.0f,
-            py::arg("side_fix_nr") = 0)
+            py::arg("side_fix_nr") = 0,
+            py::arg("display") = true)
         .def("save_solution", &Solver::save_solution,
             "Method to save the final solution of the graph",
             py::arg("graph_path"))

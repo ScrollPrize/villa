@@ -1016,7 +1016,7 @@ __global__ void update_nodes_kernel_sides(Node* d_graph, size_t* d_valid_indices
     Node& node = d_graph[i];
 
     if (node.deleted) return;
-
+    
     // Initialize random number generator
     curandState state;
     curand_init(seed * idx, idx, 0, &state);
@@ -1426,7 +1426,19 @@ __global__ void update_sides_kernel(Node* d_graph, size_t* d_valid_indices, int 
                 sum_abs_diff += diff;
 
                 // Update sides_old and reset sides
-                node.sides_old[i] = (4.0f * node.sides[i] + node.sides_old[i]) / 5.0f;
+                if (node.fixed && node.gt) { // If ground truth is available
+                int winding_number = static_cast<int>(std::floor(node.gt_f_star / 360.0)) % node.sides_nr;
+                assert (winding_number >= 0.0f);
+                    if (winding_number == i) {
+                        node.sides_old[i] = 1.0f;
+                    }
+                    else {
+                        node.sides_old[i] = 0.0f;
+                    }
+                }
+                else {
+                    node.sides_old[i] = (4.0f * node.sides[i] + node.sides_old[i]) / 5.0f;
+                }
                 node.sides[i] = 0.0f;
             }
 
@@ -1639,7 +1651,7 @@ __global__ void compute_sum_squares(Node* d_graph, size_t *d_valid_indices, size
 
     if (idx < num_nodes) {
         Node& node = d_graph[idx];
-        if (!node.deleted) {
+        if (!node.deleted && !node.fixed) {
             local_sum_squares[tid] = 0.0f;
             for (int i = 0; i < Node::sides_nr; i++) {
                 float deviation = node.sides[i] - mean;
@@ -1668,14 +1680,14 @@ __global__ void compute_sum_squares(Node* d_graph, size_t *d_valid_indices, size
 }
 
 __global__ void standardize_sides(Node* d_graph, size_t *d_valid_indices, size_t num_valid_nodes, size_t num_nodes, float mean, float std, float std_target, float std_cutoff, float min_f_star, float max_f_star, unsigned long seed, int iteration, bool wiggle, 
-                                    bool standard_winding_direction, float scale_left, float scale_right) {
+                                    bool standard_winding_direction, float scale_left, float scale_right, bool enable_delete_nodes) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_valid_nodes) return;
     idx = d_valid_indices[idx];
     float max_z_score = 0.0f;
     if (idx < num_nodes) {
         Node& node = d_graph[idx];
-        if (node.deleted) return;
+        if (node.deleted || node.fixed) return;
 
         // Initialize random number generator
         curandState state;
@@ -1709,7 +1721,7 @@ __global__ void standardize_sides(Node* d_graph, size_t *d_valid_indices, size_t
             max_z_score = fmaxf(max_z_score, (node.sides[i] - mean) / std_target); // only interested in peak, not in what wrap it is not
         }
         mean_std /= Node::sides_nr;
-        if (max_z_score > 8.0f) { // delete nodes that are not well reachable and make the convergence slow
+        if (enable_delete_nodes && max_z_score > 8.0f && !node.fixed) { // delete nodes that are not well reachable and make the convergence slow
             node.deleted = true;
         }
 
@@ -1750,7 +1762,7 @@ __global__ void standardize_sides(Node* d_graph, size_t *d_valid_indices, size_t
 }
 
 float standardize_graph(Node* d_graph, size_t *d_valid_indices, size_t num_valid_nodes, int num_nodes, float std_target = 0.013f, float std_cutoff = -1.0f, float sides_moving_eps = 0.0025f, unsigned long seed = 0, float min_f_star = 0.0f, float max_f_star = 0.0f, int iteration = 0, 
-                        bool wiggle = true, bool standard_winding_direction = false, float scale_left = 1.0f, float scale_right = 1.0f) {
+                        bool wiggle = true, bool standard_winding_direction = false, float scale_left = 1.0f, float scale_right = 1.0f, bool enable_delete_nodes = true) {
     // CUDA kernel configuration
     int threads_per_block = 256;
     int num_blocks = (num_valid_nodes + threads_per_block - 1) / threads_per_block;
@@ -1792,7 +1804,7 @@ float standardize_graph(Node* d_graph, size_t *d_valid_indices, size_t num_valid
     float std = sqrt(h_sum_squares / total_values);
     // std::cout << "Standard deviation scaling: " << std_target / std << std::endl;
     // Standardize sides
-    standardize_sides<<<num_blocks, threads_per_block>>>(d_graph, d_valid_indices, num_valid_nodes, num_nodes, mean, std, std_target, std_cutoff, min_f_star, max_f_star, seed, iteration, wiggle, standard_winding_direction, scale_left, scale_right);
+    standardize_sides<<<num_blocks, threads_per_block>>>(d_graph, d_valid_indices, num_valid_nodes, num_nodes, mean, std, std_target, std_cutoff, min_f_star, max_f_star, seed, iteration, wiggle, standard_winding_direction, scale_left, scale_right, enable_delete_nodes);
 
     cudaDeviceSynchronize(); // Check for errors during kernel execution
 
@@ -4643,7 +4655,7 @@ std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations
     return graph;
 }
 
-std::vector<Node> run_solver_ring(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float other_block_factor, float std_target, float std_target_step, bool increase_same_block_weight, bool convergence_speedup, float convergence_thresh, bool wiggle, bool standard_winding_direction, float scale_left, float scale_right) {
+std::vector<Node> run_solver_ring(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float other_block_factor, float std_target, float std_target_step, bool increase_same_block_weight, bool convergence_speedup, float convergence_thresh, bool wiggle, bool standard_winding_direction, float scale_left, float scale_right, bool enable_delete_nodes) {
     float sides_moving_eps = 0.0025f;
 
     // Allocate space for min and max f_star values on the GPU
@@ -4699,7 +4711,7 @@ std::vector<Node> run_solver_ring(std::vector<Node>& graph, int num_iterations, 
         cudaDeviceSynchronize(); // Check for errors during kernel execution
 
         float std_cutoff = increase_same_block_weight ? 5.0f : -1.0f;
-        float std_scaling = standardize_graph(d_graph, d_valid_indices, num_valid_nodes, num_nodes, std_target, std_cutoff, sides_moving_eps, dis(gen), min_f_star, max_f_star, iter, wiggle, standard_winding_direction, scale_left, scale_right);
+        float std_scaling = standardize_graph(d_graph, d_valid_indices, num_valid_nodes, num_nodes, std_target, std_cutoff, sides_moving_eps, dis(gen), min_f_star, max_f_star, iter, wiggle, standard_winding_direction, scale_left, scale_right, enable_delete_nodes);
 
         // set the device convergence max and sum variable to 0
         cudaMemset(d_max_convergence, 0, sizeof(float));
@@ -4838,7 +4850,7 @@ void spanning_tree_winding_number(std::vector<Node>& graph) {
     std::cout << "Assigned winding numbers to " << count_assigned << " nodes" << std::endl;
 }
 
-std::vector<Node> run_solver_winding_number(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float other_block_factor, int seed_node, int side_fix_nr) {
+std::vector<Node> run_solver_winding_number(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float other_block_factor, int seed_node, int side_fix_nr, bool display) {
     size_t fix_count = 0;
     size_t fixed_deficit = 0;
     bool adjusting_side = false;
@@ -4869,7 +4881,7 @@ std::vector<Node> run_solver_winding_number(std::vector<Node>& graph, int num_it
 
     size_t fixed_nr_nodes = 0;
     // Run the iterations
-    for (int iter = 1; true; iter++) {
+    for (int iter = 1; side_fix_nr > 0 || iter < num_iterations; iter++) {
         // Launch the kernel to update nodes
         update_nodes_kernel_winding_number_step1<<<blocksPerGrid, threadsPerBlock>>>(d_graph, d_valid_indices, num_valid_nodes, other_block_factor, seed_node);
 
@@ -4906,13 +4918,16 @@ std::vector<Node> run_solver_winding_number(std::vector<Node>& graph, int num_it
             bool fix_nodes = side_fix_nr > 0 && !adjusting_side;
             // bool fix_nodes = side_fix_nr > 0;
             auto [h_all_edges_, h_all_sides_] = copy_graph_from_gpu(graph.data(), d_graph, num_nodes, &d_all_edges, &d_all_sides, false, false);
-            // Generate filename with zero padding
-            std::ostringstream filename_plot_happyness;
-            filename_plot_happyness << "python_happyness/happyness_plot_python_" << i_round << "_" << iter << ".png";
-            plot_nodes_happyness(graph, filename_plot_happyness.str()); // plotting "standard" happyness
-            std::ostringstream filename_plot_nodes_winding_nrs;
-            filename_plot_nodes_winding_nrs << "python_winding_numbers/plot_nodes_winding_nrs_python_" << i_round << "_" << iter << ".png";
-            plot_nodes_winding_numbers(graph, filename_plot_nodes_winding_nrs.str());
+            
+            if (display) {
+                // Generate filename with zero padding
+                std::ostringstream filename_plot_happyness;
+                filename_plot_happyness << "python_happyness/happyness_plot_python_" << i_round << "_" << iter << ".png";
+                plot_nodes_happyness(graph, filename_plot_happyness.str()); // plotting "standard" happyness
+                std::ostringstream filename_plot_nodes_winding_nrs;
+                filename_plot_nodes_winding_nrs << "python_winding_numbers/plot_nodes_winding_nrs_python_" << i_round << "_" << iter << ".png";
+                plot_nodes_winding_numbers(graph, filename_plot_nodes_winding_nrs.str());
+            }
 
             // fix the top side_fix_nr nodes
             if (fix_nodes) {

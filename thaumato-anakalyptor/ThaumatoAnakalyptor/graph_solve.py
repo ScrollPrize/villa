@@ -244,7 +244,6 @@ def run_winding_number(solver, experiment_name="", i_round=15):
 def main(graph_path="graph_scroll5_january_unrolling_full_v2.bin", experiment_name=None, standard_winding_direction=True, fresh_start_star=0, fresh_start_ring=0, z_min=None, z_max=None):
     # z_min = 3000
     # z_max = 4000
-    standard_winding_direction = True
     if experiment_name is None:
         experiment_name = os.path.basename(graph_path)[:-4]
     if z_min is not None and z_max is not None:
