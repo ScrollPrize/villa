@@ -29,15 +29,13 @@ find_package(Threads REQUIRED)  # Find the threading library
 find_package(LibArchive REQUIRED)
 find_package(TBB REQUIRED)
 find_package(OpenMP REQUIRED)
-
-# Include directories for external libraries and headers
-include_directories(${LibArchive_INCLUDE_DIRS})
-
+# Find the HighFive library if it's installed on the system
+find_package(HDF5 REQUIRED COMPONENTS C CXX HL) # HDF5 is a dependency for HighFive
 
 pybind11_add_module(sheet_generation solver.cpp)
 pybind11_add_module(pointcloud_processing pointcloud_processing.cpp)
 pybind11_add_module(meshing_utils meshing_utils.cpp)
 # Link YAML-CPP library
 target_link_libraries(sheet_generation PRIVATE yaml-cpp Eigen3::Eigen ${CMAKE_THREAD_LIBS_INIT} ${PYTHON_LIBRARIES})
-target_link_libraries(pointcloud_processing PRIVATE ${CMAKE_THREAD_LIBS_INIT} ${LibArchive_LIBRARIES} TBB::tbb hdbscan OpenMP::OpenMP_CXX ${PYTHON_LIBRARIES})
+target_link_libraries(pointcloud_processing PRIVATE ${CMAKE_THREAD_LIBS_INIT} ${LibArchive_LIBRARIES} TBB::tbb hdbscan OpenMP::OpenMP_CXX ${PYTHON_LIBRARIES} HDF5::HDF5)
 target_link_libraries(meshing_utils PRIVATE ${CMAKE_THREAD_LIBS_INIT} ${LibArchive_LIBRARIES} TBB::tbb hdbscan OpenMP::OpenMP_CXX ${PYTHON_LIBRARIES})

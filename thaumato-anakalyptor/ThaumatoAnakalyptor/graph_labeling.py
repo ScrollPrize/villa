@@ -7,6 +7,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QEvent
 import pyqtgraph as pg
 from scipy.spatial import cKDTree
+import time
 
 # --------------------------------------------------
 # Import your custom library.
@@ -628,9 +629,9 @@ class PointCloudLabeler(QMainWindow):
                 # Only update if manual label is unlabeled and a calculated label exists.
                 if self.labels[i] == self.UNLABELED and self.calculated_labels[i] != self.UNLABELED:
                     if y_m > 180:
-                        self.labels[i] = self.calculated_labels[i] + 1
+                        self.labels[i] = self.calculated_labels[i]
                     elif y_m < -180:
-                        self.labels[i] = self.calculated_labels[i] - 1
+                        self.labels[i] = self.calculated_labels[i]
                     else:
                         self.labels[i] = self.calculated_labels[i]
         elif view_name == 'xz':
@@ -950,6 +951,11 @@ class PointCloudLabeler(QMainWindow):
             self.xy_scatter.setAcceptedMouseButtons(Qt.NoButton)
             self.xz_scatter.setAcceptedMouseButtons(Qt.NoButton)
             event.accept()
+        elif event.key() == Qt.Key_U:  # <-- new shortcut for update labels draw mode
+            self.calc_draw_button.setChecked(not self.calc_drawing_mode)
+            self.toggle_calc_draw_mode()
+            time.sleep(0.1)
+            event.accept()
         elif event.key() == Qt.Key_Z and (event.modifiers() & Qt.ControlModifier):
             self.undo()
             event.accept()
@@ -961,6 +967,7 @@ class PointCloudLabeler(QMainWindow):
             event.accept()
         else:
             super(PointCloudLabeler, self).keyPressEvent(event)
+
     
     def keyReleaseEvent(self, event):
         if event.key() == Qt.Key_S and self.s_pressed:

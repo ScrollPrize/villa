@@ -30,6 +30,7 @@ Author: Julian Schilliger - ThaumatoAnakalyptor - 2024
 #include <omp.h>
 #include <tuple>
 #include <cmath>
+#include "hdf5.h"
 
 namespace fs = std::filesystem;
 namespace py = pybind11;
@@ -151,18 +152,23 @@ std::string format_filename(int number) {
 
 class PointCloudLoader {
 public:
-    PointCloudLoader(const std::vector<std::tuple<std::vector<int>, int, double>>& node_data, const std::string& base_path, const int start_z, const int end_z, bool verbose)
-        : node_data_(node_data), base_path_(base_path), start_z_(start_z), end_z_(end_z), verbose(verbose) {}
+    PointCloudLoader(const std::vector<std::tuple<std::vector<int>, int, double>>& node_data,
+                     const std::string& base_path,
+                     const int start_z,
+                     const int end_z,
+                     bool verbose)
+        : node_data_(node_data), base_path_(base_path),
+          start_z_(start_z), end_z_(end_z), verbose(verbose) {}
 
     bool file_exists(const std::string& name) {
         return std::filesystem::exists(name);
     }
 
     bool extract_ply_from_archive(const std::string& archive_path,
-                              const std::string& ply_filename,
-                              std::string& out_ply_content)
+                                  const std::string& ply_filename,
+                                  std::string& out_ply_content)
     {
-        // RAII struct to ensure archive is always freed
+        // RAII struct to ensure archive is freed
         struct ArchiveGuard {
             archive* arch;
             ArchiveGuard(archive* a) : arch(a) {}
@@ -173,12 +179,11 @@ public:
             }
         };
 
-        // Create and initialize the archive
         archive* a = archive_read_new();
         if (!a) {
-            return false; 
+            return false;
         }
-        ArchiveGuard guard(a); // Ensures archive_read_free(a) is called at scope exit
+        ArchiveGuard guard(a);
 
         archive_read_support_filter_all(a);
         archive_read_support_format_all(a);
@@ -189,108 +194,252 @@ public:
         }
 
         struct archive_entry* entry;
-        // Iterate through entries
         while (archive_read_next_header(a, &entry) == ARCHIVE_OK) {
             std::string currentFile = archive_entry_pathname(entry);
             if (currentFile == ply_filename) {
                 const void* buff;
                 size_t size;
                 la_int64_t offset;
-
                 std::ostringstream oss;
-                // Read block by block
                 while (archive_read_data_block(a, &buff, &size, &offset) == ARCHIVE_OK) {
                     oss.write(static_cast<const char*>(buff), size);
                 }
                 out_ply_content = oss.str();
-
-                // Return true once we have our .ply content
                 return true;
             }
-            // Skip files that don't match ply_filename
             archive_read_data_skip(a);
         }
-        // If we get here, the file wasn't found in the archive
         return false;
     }
 
     void process_node(size_t start, size_t end) {
         for (size_t index = start; index < end; ++index) {
-            size_t numpy_offset = offset_per_node[index];
             auto& node = node_data_[index];
             const auto& xyz = std::get<0>(node);
             size_t patch_nr = std::get<1>(node);
             double winding_angle = std::get<2>(node);
 
-            // Check if xyz[1] is within the specified range
+            // Skip nodes outside the Z-range
             if (xyz[1] < start_z_ || xyz[1] > end_z_) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 print_progress();
                 continue;
             }
 
-            std::string base_filename = base_path_ + "/" + format_filename(xyz[0]) + "_" + format_filename(xyz[1]) + "_" + format_filename(xyz[2]);
-            std::string archive_path;
+            // Construct a unique base filename using the node's xyz values
+            std::string base_filename = base_path_ + "/" +
+                format_filename(xyz[0]) + "_" +
+                format_filename(xyz[1]) + "_" +
+                format_filename(xyz[2]);
 
-            if (file_exists(base_filename + ".tar")) {
-                archive_path = base_filename + ".tar";
-                // std::cout << "Loading " << archive_path << std::endl;
-            } else if (file_exists(base_filename + ".7z")) {
-                archive_path = base_filename + ".7z";
-                // std::cout << "Loading " << archive_path << std::endl;
-            } else {
-                std::cerr << "No archive found for " << base_filename << std::endl;
-                std::lock_guard<std::mutex> lock(mutex_);
-                print_progress();
-                continue;
-            }
+            // Check if an HDF5 file exists (named as base_path_ + ".h5")
+            std::string h5_path = base_path_ + ".h5";
+            if (file_exists(h5_path)) {
+                // Compute the group name (basename of base_filename)
+                std::string group_name = get_basename(base_filename);
+                std::string surface_group_name = "surface_" + std::to_string(patch_nr);
 
-            std::string ply_file_name = "surface_" + std::to_string(patch_nr) + ".ply";
-            std::string ply_content;
-
-            if (!extract_ply_from_archive(archive_path, ply_file_name, ply_content)) {
-                std::cerr << "Failed to extract PLY file from archive: " << archive_path << std::endl;
-                continue;
-            }
-
-            try {
-                // Use std::istringstream to read PLY content from string
-                std::istringstream plyStream(ply_content);
-
-                // Load PLY content using hapPLY
-                happly::PLYData plyIn(plyStream);
-
-                auto vertices = plyIn.getVertexData();
-
-                std::vector<double> x = std::get<0>(std::get<0>(vertices));
-                std::vector<double> y = std::get<1>(std::get<0>(vertices));
-                std::vector<double> z = std::get<2>(std::get<0>(vertices));
-
-                std::vector<double> nx = std::get<0>(std::get<1>(vertices));
-                std::vector<double> ny = std::get<1>(std::get<1>(vertices));
-                std::vector<double> nz = std::get<2>(std::get<1>(vertices));
-
-                std::vector<unsigned char> r = std::get<0>(std::get<2>(vertices));
-                std::vector<unsigned char> g = std::get<1>(std::get<2>(vertices));
-                std::vector<unsigned char> b = std::get<2>(std::get<2>(vertices));
-
-                std::vector<Point> points;
-                points.reserve(x.size());
-                for (size_t i = 0; i < x.size(); ++i) {
-                    bool delete_range = y[i] < start_z_ || y[i] > end_z_;
-                    points.emplace_back(
-                        static_cast<float>(x[i]), static_cast<float>(y[i]), static_cast<float>(z[i]), static_cast<float>(winding_angle), // coordinates and winding angle
-                        static_cast<float>(nx[i]), static_cast<float>(ny[i]), static_cast<float>(nz[i]),  // normal vector components
-                        static_cast<unsigned char>(r[i]), static_cast<unsigned char>(g[i]), static_cast<unsigned char>(b[i]),  // color components
-                        delete_range  // range marked for deletion
-                    );
+                // Open HDF5 file in read-only mode.
+                hid_t file_id = H5Fopen(h5_path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+                if (file_id < 0) {
+                    std::cerr << "Error opening HDF5 file: " << h5_path << std::endl;
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    print_progress();
+                    continue;
                 }
 
-                std::lock_guard<std::mutex> lock(mutex_);
-                print_progress();
-                cloud_.pts.insert(cloud_.pts.end(), points.begin(), points.end());
-            } catch (const std::exception& e) {
-                std::cerr << "Error processing node: " << e.what() << std::endl;
+                // Open the group (if it exists)
+                hid_t group_id = H5Gopen2(file_id, group_name.c_str(), H5P_DEFAULT);
+                if (group_id < 0) {
+                    std::cerr << "Group " << group_name << " not found in HDF5 file: " << h5_path << std::endl;
+                    H5Fclose(file_id);
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    print_progress();
+                    continue;
+                }
+
+                // Open the subgroup for the surface data.
+                hid_t surface_group_id = H5Gopen2(group_id, surface_group_name.c_str(), H5P_DEFAULT);
+                if (surface_group_id < 0) {
+                    std::cerr << "Surface group " << surface_group_name << " not found in group " << group_name << std::endl;
+                    H5Gclose(group_id);
+                    H5Fclose(file_id);
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    print_progress();
+                    continue;
+                }
+
+                // --- Read the "points" dataset ---
+                hid_t points_dset = H5Dopen2(surface_group_id, "points", H5P_DEFAULT);
+                if (points_dset < 0) {
+                    std::cerr << "Dataset 'points' not found in " << surface_group_name << std::endl;
+                    H5Gclose(surface_group_id);
+                    H5Gclose(group_id);
+                    H5Fclose(file_id);
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    print_progress();
+                    continue;
+                }
+                hid_t points_space = H5Dget_space(points_dset);
+                int ndims = H5Sget_simple_extent_ndims(points_space);
+                if (ndims != 2) {
+                    std::cerr << "Dataset 'points' does not have 2 dimensions" << std::endl;
+                    H5Sclose(points_space);
+                    H5Dclose(points_dset);
+                    H5Gclose(surface_group_id);
+                    H5Gclose(group_id);
+                    H5Fclose(file_id);
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    print_progress();
+                    continue;
+                }
+                hsize_t dims[2];
+                H5Sget_simple_extent_dims(points_space, dims, nullptr);
+                size_t num_points = dims[0]; // Number of vertices
+                // Read points data (assumed to be stored as double, shape: [num_points x 3])
+                std::vector<double> points_data(num_points * 3);
+                H5Dread(points_dset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, points_data.data());
+                H5Sclose(points_space);
+                H5Dclose(points_dset);
+
+                // --- Read the "normals" dataset ---
+                hid_t normals_dset = H5Dopen2(surface_group_id, "normals", H5P_DEFAULT);
+                if (normals_dset < 0) {
+                    std::cerr << "Dataset 'normals' not found in " << surface_group_name << std::endl;
+                    H5Gclose(surface_group_id);
+                    H5Gclose(group_id);
+                    H5Fclose(file_id);
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    print_progress();
+                    continue;
+                }
+                hid_t normals_space = H5Dget_space(normals_dset);
+                int ndims_normals = H5Sget_simple_extent_ndims(normals_space);
+                hsize_t dims_normals[2];
+                H5Sget_simple_extent_dims(normals_space, dims_normals, nullptr);
+                std::vector<double> normals_data(num_points * 3);
+                H5Dread(normals_dset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, normals_data.data());
+                H5Sclose(normals_space);
+                H5Dclose(normals_dset);
+
+                // --- Read the "colors" dataset ---
+                hid_t colors_dset = H5Dopen2(surface_group_id, "colors", H5P_DEFAULT);
+                if (colors_dset < 0) {
+                    std::cerr << "Dataset 'colors' not found in " << surface_group_name << std::endl;
+                    H5Gclose(surface_group_id);
+                    H5Gclose(group_id);
+                    H5Fclose(file_id);
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    print_progress();
+                    continue;
+                }
+                hid_t colors_space = H5Dget_space(colors_dset);
+                int ndims_colors = H5Sget_simple_extent_ndims(colors_space);
+                hsize_t dims_colors[2];
+                H5Sget_simple_extent_dims(colors_space, dims_colors, nullptr);
+                std::vector<unsigned char> colors_data(num_points * 3);
+                H5Dread(colors_dset, H5T_NATIVE_UCHAR, H5S_ALL, H5S_ALL, H5P_DEFAULT, colors_data.data());
+                H5Sclose(colors_space);
+                H5Dclose(colors_dset);
+
+                // Close groups and file
+                H5Gclose(surface_group_id);
+                H5Gclose(group_id);
+                H5Fclose(file_id);
+
+                // Convert the raw data into points
+                std::vector<Point> points;
+                points.reserve(num_points);
+                for (size_t i = 0; i < num_points; ++i) {
+                    double x = points_data[i * 3 + 0];
+                    double y = points_data[i * 3 + 1];
+                    double z = points_data[i * 3 + 2];
+                    bool delete_range = (y < start_z_ || y > end_z_);
+                    points.emplace_back(
+                        static_cast<float>(x),
+                        static_cast<float>(y),
+                        static_cast<float>(z),
+                        static_cast<float>(winding_angle),
+                        static_cast<float>(normals_data[i * 3 + 0]),
+                        static_cast<float>(normals_data[i * 3 + 1]),
+                        static_cast<float>(normals_data[i * 3 + 2]),
+                        colors_data[i * 3 + 0],
+                        colors_data[i * 3 + 1],
+                        colors_data[i * 3 + 2],
+                        delete_range
+                    );
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    print_progress();
+                    cloud_.pts.insert(cloud_.pts.end(), points.begin(), points.end());
+                }
+            }
+            else {
+                // Fallback to reading from TAR/7z archive
+                std::string archive_path;
+                if (file_exists(base_filename + ".tar")) {
+                    archive_path = base_filename + ".tar";
+                }
+                else if (file_exists(base_filename + ".7z")) {
+                    archive_path = base_filename + ".7z";
+                }
+                else {
+                    std::cerr << "No archive found for " << base_filename << std::endl;
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    print_progress();
+                    continue;
+                }
+
+                std::string ply_file_name = "surface_" + std::to_string(patch_nr) + ".ply";
+                std::string ply_content;
+                if (!extract_ply_from_archive(archive_path, ply_file_name, ply_content)) {
+                    std::cerr << "Failed to extract PLY file from archive: " << archive_path << std::endl;
+                    continue;
+                }
+
+                try {
+                    std::istringstream plyStream(ply_content);
+                    happly::PLYData plyIn(plyStream);
+                    auto vertices = plyIn.getVertexData();
+
+                    std::vector<double> x = std::get<0>(std::get<0>(vertices));
+                    std::vector<double> y = std::get<1>(std::get<0>(vertices));
+                    std::vector<double> z = std::get<2>(std::get<0>(vertices));
+
+                    std::vector<double> nx = std::get<0>(std::get<1>(vertices));
+                    std::vector<double> ny = std::get<1>(std::get<1>(vertices));
+                    std::vector<double> nz = std::get<2>(std::get<1>(vertices));
+
+                    std::vector<unsigned char> r = std::get<0>(std::get<2>(vertices));
+                    std::vector<unsigned char> g = std::get<1>(std::get<2>(vertices));
+                    std::vector<unsigned char> b = std::get<2>(std::get<2>(vertices));
+
+                    std::vector<Point> points;
+                    points.reserve(x.size());
+                    for (size_t i = 0; i < x.size(); ++i) {
+                        bool delete_range = y[i] < start_z_ || y[i] > end_z_;
+                        points.emplace_back(
+                            static_cast<float>(x[i]),
+                            static_cast<float>(y[i]),
+                            static_cast<float>(z[i]),
+                            static_cast<float>(winding_angle),
+                            static_cast<float>(nx[i]),
+                            static_cast<float>(ny[i]),
+                            static_cast<float>(nz[i]),
+                            r[i], g[i], b[i],
+                            delete_range
+                        );
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        print_progress();
+                        cloud_.pts.insert(cloud_.pts.end(), points.begin(), points.end());
+                    }
+                }
+                catch (const std::exception& e) {
+                    std::cerr << "Error processing node: " << e.what() << std::endl;
+                }
             }
         }
     }
@@ -300,38 +449,94 @@ public:
             const auto& xyz = std::get<0>(node_data_[index]);
             size_t patch_nr = std::get<1>(node_data_[index]);
 
-            // Check if xyz[1] is within the specified range
             if (xyz[1] < start_z_ || xyz[1] > end_z_) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 print_progress();
                 continue;
             }
 
-            std::string base_filename = base_path_ + "/" + format_filename(xyz[0]) + "_" + format_filename(xyz[1]) + "_" + format_filename(xyz[2]);
-            std::string archive_path;
+            std::string base_filename = base_path_ + "/" +
+                format_filename(xyz[0]) + "_" +
+                format_filename(xyz[1]) + "_" +
+                format_filename(xyz[2]);
 
-            if (file_exists(base_filename + ".tar")) {
-                archive_path = base_filename + ".tar";
-                // std::cout << "Loading " << archive_path << std::endl;
-            } else if (file_exists(base_filename + ".7z")) {
-                archive_path = base_filename + ".7z";
-                // std::cout << "Loading " << archive_path << std::endl;
-            } else {
-                std::cerr << "No archive found for " << base_filename << std::endl;
-                std::lock_guard<std::mutex> lock(mutex_);
-                print_progress();
-                continue;
+            std::string h5_path = base_path_ + ".h5";
+            if (file_exists(h5_path)) {
+                std::string group_name = get_basename(base_filename);
+                std::string surface_group_name = "surface_" + std::to_string(patch_nr);
+
+                hid_t file_id = H5Fopen(h5_path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+                if (file_id < 0) {
+                    std::cerr << "Error opening HDF5 file: " << h5_path << std::endl;
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    print_progress();
+                    continue;
+                }
+                hid_t group_id = H5Gopen2(file_id, group_name.c_str(), H5P_DEFAULT);
+                if (group_id < 0) {
+                    std::cerr << "Group " << group_name << " not found in HDF5 file: " << h5_path << std::endl;
+                    H5Fclose(file_id);
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    print_progress();
+                    continue;
+                }
+                hid_t surface_group_id = H5Gopen2(group_id, surface_group_name.c_str(), H5P_DEFAULT);
+                if (surface_group_id < 0) {
+                    std::cerr << "Surface group " << surface_group_name << " not found in group " << group_name << std::endl;
+                    H5Gclose(group_id);
+                    H5Fclose(file_id);
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    print_progress();
+                    continue;
+                }
+
+                // Open "points" dataset to get the number of vertices.
+                hid_t points_dset = H5Dopen2(surface_group_id, "points", H5P_DEFAULT);
+                if (points_dset < 0) {
+                    std::cerr << "Dataset 'points' not found in " << surface_group_name << std::endl;
+                    H5Gclose(surface_group_id);
+                    H5Gclose(group_id);
+                    H5Fclose(file_id);
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    print_progress();
+                    continue;
+                }
+                hid_t points_space = H5Dget_space(points_dset);
+                int ndims = H5Sget_simple_extent_ndims(points_space);
+                hsize_t dims[2];
+                H5Sget_simple_extent_dims(points_space, dims, nullptr);
+                size_t num_points = dims[0];
+                offset_per_node[index] = num_points;
+                H5Sclose(points_space);
+                H5Dclose(points_dset);
+                H5Gclose(surface_group_id);
+                H5Gclose(group_id);
+                H5Fclose(file_id);
             }
+            else {
+                // Fallback to using the archive.
+                std::string archive_path;
+                if (file_exists(base_filename + ".tar")) {
+                    archive_path = base_filename + ".tar";
+                }
+                else if (file_exists(base_filename + ".7z")) {
+                    archive_path = base_filename + ".7z";
+                }
+                else {
+                    std::cerr << "No archive found for " << base_filename << std::endl;
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    print_progress();
+                    continue;
+                }
 
-            std::string ply_file_name = "surface_" + std::to_string(patch_nr) + ".ply";
-            std::string ply_content;
-
-            if (extract_ply_from_archive(archive_path, ply_file_name, ply_content)) {
-                std::istringstream plyStream(ply_content);
-                happly::PLYData plyData(plyStream);
-
-                if (plyData.hasElement("vertex")) {
-                    offset_per_node[index] = plyData.getElement("vertex").getProperty<double>("x").size();
+                std::string ply_file_name = "surface_" + std::to_string(patch_nr) + ".ply";
+                std::string ply_content;
+                if (extract_ply_from_archive(archive_path, ply_file_name, ply_content)) {
+                    std::istringstream plyStream(ply_content);
+                    happly::PLYData plyData(plyStream);
+                    if (plyData.hasElement("vertex")) {
+                        offset_per_node[index] = plyData.getElement("vertex").getProperty<double>("x").size();
+                    }
                 }
             }
             std::lock_guard<std::mutex> lock(mutex_);
@@ -343,9 +548,8 @@ public:
         size_t num_threads = std::thread::hardware_concurrency();
         std::vector<std::thread> threads;
         size_t total_nodes = node_data_.size();
-        size_t chunk_size = std::ceil(static_cast<double>(total_nodes) / static_cast<double>(num_threads));
+        size_t chunk_size = std::ceil(static_cast<double>(total_nodes) / num_threads);
         
-        // Set up progress tracking
         problem_size = total_nodes;
         progress = 0;
 
@@ -354,19 +558,16 @@ public:
             size_t end = std::min(start + chunk_size, total_nodes);
             threads.emplace_back(&PointCloudLoader::find_vertex_counts, this, start, end);
         }
-
         for (auto& thread : threads) {
             thread.join();
         }
 
-        // Reset progress
         if (verbose) {
             std::cout << std::endl;
         }
         problem_size = -1;
         progress = 0;
 
-        // Calculate offsets and total points
         size_t total_points = 0;
         size_t total_points_temp = 0;
         for (size_t i = 0; i < total_nodes; ++i) {
@@ -379,7 +580,7 @@ public:
 
     void load_all() {
         size_t total_nodes = node_data_.size();
-        offset_per_node = std::make_unique<size_t[]>(total_nodes); // smart pointer
+        offset_per_node = std::make_unique<size_t[]>(total_nodes);
         if (verbose) {
             std::cout << "Loading all nodes..." << std::endl;
         }
@@ -389,11 +590,10 @@ public:
             std::cout << "Total points: " << total_points << std::endl;
         }
 
-        size_t num_threads = std::thread::hardware_concurrency(); // Number of threads
+        size_t num_threads = std::thread::hardware_concurrency();
         std::vector<std::thread> threads;
-        size_t chunk_size = std::ceil(static_cast<double>(total_nodes) / static_cast<double>(num_threads));
+        size_t chunk_size = std::ceil(static_cast<double>(total_nodes) / num_threads);
 
-        // Set up progress tracking
         problem_size = total_nodes;
         progress = 0;
 
@@ -402,14 +602,12 @@ public:
             size_t end = std::min(start + chunk_size, total_nodes);
             threads.emplace_back(&PointCloudLoader::process_node, this, start, end);
         }
-
         for (auto& thread : threads) {
             thread.join();
         }
         if (verbose) {
-            std::cout << std::endl;
-            std::cout << "All nodes have been processed." << std::endl;
-        }   
+            std::cout << std::endl << "All nodes have been processed." << std::endl;
+        }
     }
 
     void free_memory() {
@@ -423,7 +621,6 @@ public:
             cloud_.pts.erase(std::remove_if(cloud_.pts.begin(), cloud_.pts.end(), [](const Point& p) {
                 return p.marked_for_deletion;
             }), cloud_.pts.end());
-            // cloud_.pts.shrink_to_fit(); // Shrink to fit after erasing marked points
         }
         catch (...) {
             std::cerr << "Error deleting marked points" << std::endl;
@@ -432,9 +629,9 @@ public:
 
     void sortPointsWZYX() {
         unsigned int available_threads = std::thread::hardware_concurrency();
-        unsigned int num_threads = std::min(available_threads, 32u); // Use up to 32 threads, or fewer if not available
+        unsigned int num_threads = std::min(available_threads, 32u);
     
-        tbb::task_arena limited_arena(num_threads); // limit to 32 threads, for example
+        tbb::task_arena limited_arena(num_threads);
         limited_arena.execute([&] {
             std::sort(std::execution::par_unseq, cloud_.pts.begin(), cloud_.pts.end(), [](const Point& a, const Point& b) {
                 if (a.w != b.w) return a.w < b.w;
@@ -447,9 +644,9 @@ public:
 
     void sortPointsXYZW() {
         unsigned int available_threads = std::thread::hardware_concurrency();
-        unsigned int num_threads = std::min(available_threads, 32u); // Use up to 32 threads, or fewer if not available
+        unsigned int num_threads = std::min(available_threads, 32u);
     
-        tbb::task_arena limited_arena(num_threads); // limit to 32 threads, for example
+        tbb::task_arena limited_arena(num_threads);
         limited_arena.execute([&] {
             std::sort(std::execution::par_unseq, cloud_.pts.begin(), cloud_.pts.end(), [](const Point& a, const Point& b) {
                 if (a.x != b.x) return a.x < b.x;
@@ -467,11 +664,11 @@ public:
         size_t chunk_size = total_points / num_threads;
 
         std::vector<size_t> chunk_starts = getChunkStarts(num_threads, total_points, chunk_size);
-
         for (size_t i = 0; i < num_threads; ++i) {
-            threads.emplace_back(&PointCloudLoader::processDuplicatesThreaded, this, chunk_starts[i], (i + 1 < num_threads) ? chunk_starts[i + 1] : total_points);
+            threads.emplace_back(&PointCloudLoader::processDuplicatesThreaded, this,
+                                 chunk_starts[i],
+                                 (i + 1 < num_threads) ? chunk_starts[i + 1] : total_points);
         }
-
         for (auto& thread : threads) {
             thread.join();
         }
@@ -532,16 +729,13 @@ public:
     }
 
     PointCloud get_results() {
-        return std::move(cloud_);  // Move the points instead of copying
+        return std::move(cloud_);
     }
-
 
 private:
     const int start_z_;
     const int end_z_;
     std::vector<std::tuple<std::vector<int>, int, double>> node_data_;
-    // Preallocated NumPy arrays
-    // py::array_t<float> points, normals, colors;
     PointCloud cloud_;
     std::unique_ptr<size_t[]> offset_per_node;
     std::string base_path_;
@@ -555,7 +749,6 @@ private:
             return;
         }
         progress++;
-        // print on one line
         std::cout << "Progress: " << progress << "/" << problem_size << "\r";
         std::cout.flush();
     }
@@ -567,8 +760,10 @@ private:
             chunk_starts[i] = start;
             size_t end = std::min(start + chunk_size, total_points);
             if (end < total_points) {
-                // Advance end to the next change in xyz values
-                while (end < total_points && cloud_.pts[end - 1].x == cloud_.pts[end].x && cloud_.pts[end - 1].y == cloud_.pts[end].y && cloud_.pts[end - 1].z == cloud_.pts[end].z) {
+                while (end < total_points &&
+                       cloud_.pts[end - 1].x == cloud_.pts[end].x &&
+                       cloud_.pts[end - 1].y == cloud_.pts[end].y &&
+                       cloud_.pts[end - 1].z == cloud_.pts[end].z) {
                     ++end;
                 }
             }
@@ -583,16 +778,11 @@ private:
 
         while (it != finish) {
             auto next = it + 1;
-
-            // Find the end of the current range of points with the same x, y, z
-            while (next != finish && next->x == it->x && next->y == it->y && next->z == it->z) {
+            while (next != finish &&
+                   next->x == it->x && next->y == it->y && next->z == it->z) {
                 ++next;
             }
-
-            // Process all points in the range with the same x, y, z
             processRange(it, next);
-
-            // Move iterator to the start of the next group of points
             it = next;
         }
     }
@@ -600,61 +790,50 @@ private:
     void processRange(std::vector<Point>::iterator begin, std::vector<Point>::iterator end) {
         if (begin == end) return;
 
-        // check if all points in the range have the same x y z values
         double x = begin->x;
         double y = begin->y;
         double z = begin->z;
         for (auto it = begin + 1; it != end; ++it) {
             if (it->x != x || it->y != y || it->z != z) {
                 std::cout << "Error: Points in range do not have the same x y z values" << std::endl;
-                std::cout << "Range: " << begin->x << " " << begin->y << " " << begin->z << " to " << (end - 1)->x << " " << (end - 1)->y << " " << (end - 1)->z << std::endl;
+                std::cout << "Range: " << begin->x << " " << begin->y << " " << begin->z << " to "
+                          << (end - 1)->x << " " << (end - 1)->y << " " << (end - 1)->z << std::endl;
                 return;
             }
         }
 
         size_t best_w_index_range = 0;
-        double best_w = begin->w;  // Initialize best_w with the first w value in the range
+        double best_w = begin->w;
         double sum_selected_w = 0;
         size_t count = 0;
 
         auto start_it = begin;
         auto end_it = begin;
-
         while (end_it != end) {
             sum_selected_w += end_it->w;
             ++count;
             double mean_iterative_w = sum_selected_w / count;
-
-            // Adjust the start_it to maintain the constraint mean_iterative_w ± 90
-            while (start_it != end_it && !(mean_iterative_w - 90 <= start_it->w && start_it->w <= mean_iterative_w + 90)) {
+            while (start_it != end_it &&
+                   !(mean_iterative_w - 90 <= start_it->w && start_it->w <= mean_iterative_w + 90)) {
                 sum_selected_w -= start_it->w;
                 --count;
                 ++start_it;
-                mean_iterative_w = sum_selected_w / count;  // Recalculate mean after adjusting start
+                mean_iterative_w = sum_selected_w / count;
             }
-
-            // Check and update the best_w if the current range is the largest
             if (end_it - start_it + 1 > best_w_index_range) {
                 best_w_index_range = end_it - start_it + 1;
                 best_w = mean_iterative_w;
             }
-
-            ++end_it;  // Expand the end index to include more points
+            ++end_it;
         }
-
-        // Now mark all points for deletion
         for (auto it = begin; it != end; ++it) {
-            it->marked_for_deletion = true;  // Mark all for deletion
+            it->marked_for_deletion = true;
         }
-
-        // find w value that is closest to the best w value
         for (auto it = begin; it != end; ++it) {
             if (std::abs(it->w - best_w) < std::abs(begin->w - best_w)) {
                 begin = it;
             }
         }
-
-        // Unmark the point that is closest to the best w value
         begin->marked_for_deletion = false;
     }
 
@@ -663,45 +842,38 @@ private:
             if (i >= cloud_.pts.size()) {
                 continue;
             }
-            if (i < 0) {
-                continue;
-            }
             try {
                 std::vector<nf::ResultItem<size_t, double>> ret_matches;
                 nf::SearchParameters params;
                 const double query_pt[3] = { cloud_.pts[i].x, cloud_.pts[i].y, cloud_.pts[i].z };
-
-                // Perform the radius search
                 const double radius = spatial_threshold * spatial_threshold;
                 index->radiusSearch(&query_pt[0], radius, ret_matches, params);
-
                 for (auto& match : ret_matches) {
                     if (match.first >= cloud_.pts.size()) {
                         continue;
                     }
-                    if (match.first < 0) {
-                        continue;
-                    }
-                    if (i != match.first && std::abs(cloud_.pts[i].w - cloud_.pts[match.first].w) > angle_threshold) {
+                    if (i != match.first &&
+                        std::abs(cloud_.pts[i].w - cloud_.pts[match.first].w) > angle_threshold) {
                         std::lock_guard<std::mutex> lock(mutex_);
                         cloud_.pts[i].marked_for_deletion = true;
                         cloud_.pts[match.first].marked_for_deletion = true;
                     }
                 }
-                {
-                    if (i % 1000 == 0) {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        print_progress();
-                    }
+                if (i % 1000 == 0) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    print_progress();
                 }
             }
             catch (...) {
-                // std::cerr << "Error processing point: " << e.what() << std::endl;
+                // Handle errors silently.
             }
         }
     }
 
-    
+    // Helper: returns the basename of a given path.
+    std::string get_basename(const std::string& path) {
+        return std::filesystem::path(path).filename().string();
+    }
 };
 
 std::tuple<py::array_t<float>, py::array_t<float>, py::array_t<float>> to_array(const PointCloud& cloud) {
