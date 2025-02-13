@@ -125,7 +125,8 @@ apt-get install -y \
 libeigen3-dev  \ 
 libarchive-dev \
 libtbb-dev  \
-libopencv-dev
+libopencv-dev \
+libhdf5-dev
 
 # RUN pip uninstall opencv-python-headless opencv-python -y
 # RUN pip install opencv-python
