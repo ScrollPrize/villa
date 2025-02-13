@@ -7,3 +7,4 @@ overlapp_threshold.yaml
 python*/
 experiments/
 colormap.ply
+thaumato_image.*
