@@ -273,6 +273,7 @@ def save_block_h5(h5f, block_points, block_normals, block_colors, block_scores, 
     # check if group exists
     if group_name in h5f:
         # overwrite
+        print(f"Overwriting {group_name}")
         del h5f[group_name]
     # Create a group for the block
     grp = h5f.create_group(group_name)
@@ -282,10 +283,10 @@ def save_block_h5(h5f, block_points, block_normals, block_colors, block_scores, 
             continue
         # new group in the block group
         surface_grp = grp.create_group(f"surface_{nr_surface}")
-        surface_grp.create_dataset("points", data=block_points[nr_surface], compression="gzip", compression_opts=8)
-        surface_grp.create_dataset("normals", data=block_normals[nr_surface], compression="gzip", compression_opts=8)
-        surface_grp.create_dataset("colors", data=block_colors[nr_surface], compression="gzip", compression_opts=8)
-        surface_grp.create_dataset("coeffs", data=np.array(block_coeffs[nr_surface]), compression="gzip", compression_opts=8)
+        surface_grp.create_dataset("points", data=block_points[nr_surface]) #, compression="gzip", compression_opts=8)
+        surface_grp.create_dataset("normals", data=block_normals[nr_surface] #, compression="gzip", compression_opts=8)
+        surface_grp.create_dataset("colors", data=block_colors[nr_surface] #, compression="gzip", compression_opts=8)
+        surface_grp.create_dataset("coeffs", data=np.array(block_coeffs[nr_surface]) #, compression="gzip", compression_opts=8)
         
         # Store metadata attributes
         surface_grp.attrs["score_threshold"] = score_threshold
@@ -296,7 +297,6 @@ def save_block_h5(h5f, block_points, block_normals, block_colors, block_scores, 
         surface_grp.attrs["scores"] = block_scores[nr_surface]
         surface_grp.attrs["distances"] = block_distances[nr_surface]
             
-
 def post_process_surfaces(surfaces, surfaces_normals, surfaces_colors, scores, score_threshold=0.5, distance_threshold=10.0, n=4, alpha = 1000.0, slope_alpha = 0.1):
     indices = [] # valid surfaces
     coeff_list = [] # coefficients of surfaces
