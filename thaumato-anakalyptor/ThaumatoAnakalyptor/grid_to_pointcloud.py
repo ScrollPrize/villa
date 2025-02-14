@@ -653,7 +653,7 @@ class ZarrDataset(GridDataset):
             if previously_computed and (not recompute): # Block was already computed and is valid
                 blocks_processed.add(corner_coords)
             else: # Recompute if wasn't computed or recompute flag is set
-                if corner_coords[0] < 500 or corner_coords[1] < 500 or corner_coords[2] < 500 or corner_coords[0] + grid_block_size + 500 > y_height or corner_coords[1] + grid_block_size + 500 > x_height or corner_coords[2] + grid_block_size + 500 > z_height:
+                if corner_coords[0] < 500 or corner_coords[1] < 500 or corner_coords[2] < 500 or corner_coords[0] - 500 > y_height or corner_coords[1] - 500 > x_height or corner_coords[2] - 500 > z_height:
                     blocks_processed.add(corner_coords)
                     # Outside of the scroll, don't add neighbors
                     continue
