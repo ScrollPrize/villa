@@ -283,10 +283,10 @@ def save_block_h5(h5f, block_points, block_normals, block_colors, block_scores, 
             continue
         # new group in the block group
         surface_grp = grp.create_group(f"surface_{nr_surface}")
-        surface_grp.create_dataset("points", data=block_points[nr_surface], chunks=True) #, compression="gzip", compression_opts=8)
-        surface_grp.create_dataset("normals", data=block_normals[nr_surface], chunks=True) #, compression="gzip", compression_opts=8)
-        surface_grp.create_dataset("colors", data=block_colors[nr_surface], chunks=True) #, compression="gzip", compression_opts=8)
-        surface_grp.create_dataset("coeffs", data=np.array(block_coeffs[nr_surface])) #, compression="gzip", compression_opts=8)
+        surface_grp.create_dataset("points", data=block_points[nr_surface], compression="lzf") #, compression="gzip", compression_opts=8)
+        surface_grp.create_dataset("normals", data=block_normals[nr_surface], compression="lzf") #, compression="gzip", compression_opts=8)
+        surface_grp.create_dataset("colors", data=block_colors[nr_surface], compression="lzf") #, compression="gzip", compression_opts=8)
+        surface_grp.create_dataset("coeffs", data=np.array(block_coeffs[nr_surface]), compression="lzf") #, compression="gzip", compression_opts=8)
         
         # Store metadata attributes
         surface_grp.attrs["score_threshold"] = score_threshold
