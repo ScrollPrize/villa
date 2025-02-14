@@ -80,11 +80,9 @@ def load_grid_zarr(zarr_volume, cords, grid_block_size=500, cell_block_size=500,
 
     # ensure the grid block is of the correct grid block size
     if np.any(grid_block.shape != grid_block_size):
-        print(f"Grid block shape is {grid_block.shape}, but should be {grid_block_size}.")
         grid_block_ = np.zeros((grid_block_size[0], grid_block_size[1], grid_block_size[2]), dtype=grid_block.dtype)
         grid_block_[:grid_block.shape[0], :grid_block.shape[1], :grid_block.shape[2]] = grid_block
         grid_block = grid_block_
-        print("Adjusted gridblock shape")
 
     if uint8 and grid_block.dtype == np.uint16:
         grid_block = np.uint8(grid_block//256)
