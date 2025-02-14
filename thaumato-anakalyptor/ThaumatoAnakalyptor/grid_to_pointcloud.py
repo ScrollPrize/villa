@@ -26,6 +26,8 @@ from scipy.interpolate import interp1d
 from .add_random_colors_to_pointcloud import add_random_colors
 # import torch.multiprocessing as multiprocessing
 import multiprocessing
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import glob
 import argparse
 
@@ -426,51 +428,75 @@ def skip_computation_block(corner_coords, grid_block_size, umbilicus_points, max
 class MyPredictionWriter(BasePredictionWriter):
     def __init__(self, computed_blocks, pointcloud_base, save_template_v, save_template_r, grid_block_size=200):
         super().__init__(write_interval="batch")  # or "epoch" for end of an epoch
-        # num_threads = multiprocessing.cpu_count()
-        # self.pool = multiprocessing.Pool(processes=num_threads)  # Initialize the pool once
         self.computed_blocks = computed_blocks 
         self.pointcloud_base = pointcloud_base
         self.save_template_v = save_template_v
         self.save_template_r = save_template_r
         self.grid_block_size = grid_block_size
+        # Use a thread pool for IO-bound tasks; threads avoid pickling overhead.
+        self.executor = ThreadPoolExecutor(max_workers=8)
+        # A lock to protect shared resources (computed_blocks, file writing)
+        self.lock = threading.Lock()
 
     def write_on_predict(self, predictions: list, batch_indices: list, dataloader_idx: int, batch, batch_idx: int, dataloader_len: int):
-        # Example: Just print the predictions
         print(predictions)
         print("On predict")
     
-    def write_on_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, prediction, batch_indices, batch, batch_idx: int, dataloader_idx: int) -> None:
+    def write_on_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, 
+                            prediction, batch_indices, batch, batch_idx: int, dataloader_idx: int) -> None:
         if prediction is None:
-            # print("Prediction is None")
             return
-        # print(f"On batch end, len: {len(prediction)}")
         if len(prediction) == 0:
-            # print("Prediction is empty")
             return
 
+        # Unpack prediction tuple
         (points_r_tensors, normals_r_tensors), (points_v_tensors, normals_v_tensors), corner_coordss = prediction
-        
+
+        # Schedule each save operation in parallel
+        futures = []
         for i in range(len(points_r_tensors)):
-            points_r = points_r_tensors[i].cpu().numpy()
-            normals_r = normals_r_tensors[i].cpu().numpy()
-            points_v = points_v_tensors[i].cpu().numpy()
-            normals_v = normals_v_tensors[i].cpu().numpy()
-            corner_coords = corner_coordss[i]
-            
-            # Save the surface points and normals as a PLY file
-            file_x, file_y, file_z = corner_coords[0]//self.grid_block_size, corner_coords[1]//self.grid_block_size, corner_coords[2]//self.grid_block_size
-            surface_ply_filename_v = self.save_template_v.format(file_x, file_y, file_z)
-            surface_ply_filename_r = self.save_template_r.format(file_x, file_y, file_z)
+            futures.append(self.executor.submit(
+                self.parallel_save_surface,
+                points_r_tensors[i],
+                normals_r_tensors[i],
+                points_v_tensors[i],
+                normals_v_tensors[i],
+                corner_coordss[i]
+            ))
+        # (Optionally, wait for all tasks to complete)
+        for future in futures:
+            future.result()
 
-            save_surface_ply(points_r, normals_r, surface_ply_filename_r)
-            save_surface_ply(points_v, normals_v, surface_ply_filename_v)
-            self.computed_blocks.add(corner_coords)
+        # Save the computed blocks file (this is typically very fast)
+        computed_blocks_filepath = os.path.join(self.pointcloud_base, "computed_blocks.txt")
+        with open(computed_blocks_filepath, "w") as f:
+            with self.lock:
+                for block in self.computed_blocks:
+                    f.write(str(block) + "\n")
 
-        # Save the computed blocks
-        self.computed_blocks = self.computed_blocks
-        with open(os.path.join(self.pointcloud_base, "computed_blocks.txt"), "w") as f:
-            for block in self.computed_blocks:
-                f.write(str(block) + "\n")
+    def parallel_save_surface(self, points_r_tensor, normals_r_tensor, points_v_tensor, normals_v_tensor, corner_coords):
+        # Convert the tensors to numpy arrays
+        points_r = points_r_tensor.cpu().numpy()
+        normals_r = normals_r_tensor.cpu().numpy()
+        points_v = points_v_tensor.cpu().numpy()
+        normals_v = normals_v_tensor.cpu().numpy()
+
+        # Compute file indices based on the grid block size
+        file_x = corner_coords[0] // self.grid_block_size
+        file_y = corner_coords[1] // self.grid_block_size
+        file_z = corner_coords[2] // self.grid_block_size
+
+        surface_ply_filename_r = self.save_template_r.format(file_x, file_y, file_z)
+        surface_ply_filename_v = self.save_template_v.format(file_x, file_y, file_z)
+
+        # Save the two surfaces (one for each prediction)
+        save_surface_ply(points_r, normals_r, surface_ply_filename_r)
+        save_surface_ply(points_v, normals_v, surface_ply_filename_v)
+
+        # Update computed blocks in a thread-safe manner.
+        # Convert corner_coords to tuple to ensure it is hashable for a set.
+        with self.lock:
+            self.computed_blocks.add(tuple(corner_coords))
 
 class GridDataset(Dataset):
     def __init__(self, pointcloud_base, start_block, path_template, save_template_v, save_template_r, umbilicus_points, umbilicus_points_old, grid_block_size=200, recompute=False, fix_umbilicus=False, maximum_distance=-1, min_z=None, max_z=None):
