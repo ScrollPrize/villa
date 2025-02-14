@@ -203,7 +203,7 @@ def build_surrounding_volumes_dict(kd_tree, block_ids, overlapp_threshold, volum
     surrounding_dict = {}
 
     for volume_id in tqdm(block_ids, desc="Building surrounding volumes dict"):
-        idxs = kd_tree.query_ball_point(volume_id, volume_size / 2.0)
+        idxs = kd_tree.query_ball_point(volume_id, volume_size / 2.0 + 1)
         surrounding_volumes = block_ids[idxs]
 
         # filter out volume ids that have more than one dimension difference
