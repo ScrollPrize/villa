@@ -243,7 +243,7 @@ def save_block_h5_args(args):
     # print("save_block_h5_args")
     save_block_h5(*args)
 
-def save_block_h5(block_points, block_normals, block_colors, block_scores, block_name, 
+def save_block_h5(h5f, block_points, block_normals, block_colors, block_scores, block_name, 
                   score_threshold=0.5, distance_threshold=10.0, 
                   n=4, alpha=1000.0, slope_alpha=0.1, post_process=True, 
                   block_distances_precomputed=None, block_coeffs_precomputed=None, 
@@ -252,18 +252,6 @@ def save_block_h5(block_points, block_normals, block_colors, block_scores, block
     Saves point cloud data into an HDF5 file using the block_name as the group identifier.
     """
     group_name = os.path.basename(block_name)
-    h5_filename = os.path.dirname(block_name) + ".h5"
-    # Check if block already exists in HDF5 file
-    if os.path.exists(h5_filename):
-        # with h5py.File(h5_filename, "r") as h5f:
-        #     if block_name in h5f:
-        #         print(f"Block {block_name} already exists in {h5_filename}. Skipping...")
-        #         return
-        pass
-    else:
-        # Create a new HDF5 file (this will overwrite if it exists)
-        with h5py.File(h5_filename, "w") as h5f:
-            pass #  pass just to have the h5f in the scope and being created
 
     # Post-process the data if required
     if post_process:
@@ -282,33 +270,31 @@ def save_block_h5(block_points, block_normals, block_colors, block_scores, block
         print(f"Skipping block {block_name} due to insufficient points.")
         return
 
-    # Open HDF5 file in append mode
-    with h5py.File(h5_filename, "a") as h5f:
-        # check if group exists
-        if group_name in h5f:
-            # overwrite
-            del h5f[group_name]
-        # Create a group for the block
-        grp = h5f.create_group(group_name)
+    # check if group exists
+    if group_name in h5f:
+        # overwrite
+        del h5f[group_name]
+    # Create a group for the block
+    grp = h5f.create_group(group_name)
 
-        for nr_surface in range(len(block_points)):
-            if len(block_points[nr_surface]) < 10:
-                continue
-            # new group in the block group
-            surface_grp = grp.create_group(f"surface_{nr_surface}")
-            surface_grp.create_dataset("points", data=block_points[nr_surface], compression="gzip", compression_opts=8)
-            surface_grp.create_dataset("normals", data=block_normals[nr_surface], compression="gzip", compression_opts=8)
-            surface_grp.create_dataset("colors", data=block_colors[nr_surface], compression="gzip", compression_opts=8)
-            surface_grp.create_dataset("coeffs", data=np.array(block_coeffs[nr_surface]), compression="gzip", compression_opts=8)
-            
-            # Store metadata attributes
-            surface_grp.attrs["score_threshold"] = score_threshold
-            surface_grp.attrs["distance_threshold"] = distance_threshold
-            surface_grp.attrs["n"] = n
-            surface_grp.attrs["alpha"] = alpha
-            surface_grp.attrs["slope_alpha"] = slope_alpha
-            surface_grp.attrs["scores"] = block_scores[nr_surface]
-            surface_grp.attrs["distances"] = block_distances[nr_surface]
+    for nr_surface in range(len(block_points)):
+        if len(block_points[nr_surface]) < 10:
+            continue
+        # new group in the block group
+        surface_grp = grp.create_group(f"surface_{nr_surface}")
+        surface_grp.create_dataset("points", data=block_points[nr_surface], compression="gzip", compression_opts=8)
+        surface_grp.create_dataset("normals", data=block_normals[nr_surface], compression="gzip", compression_opts=8)
+        surface_grp.create_dataset("colors", data=block_colors[nr_surface], compression="gzip", compression_opts=8)
+        surface_grp.create_dataset("coeffs", data=np.array(block_coeffs[nr_surface]), compression="gzip", compression_opts=8)
+        
+        # Store metadata attributes
+        surface_grp.attrs["score_threshold"] = score_threshold
+        surface_grp.attrs["distance_threshold"] = distance_threshold
+        surface_grp.attrs["n"] = n
+        surface_grp.attrs["alpha"] = alpha
+        surface_grp.attrs["slope_alpha"] = slope_alpha
+        surface_grp.attrs["scores"] = block_scores[nr_surface]
+        surface_grp.attrs["distances"] = block_distances[nr_surface]
             
 
 def post_process_surfaces(surfaces, surfaces_normals, surfaces_colors, scores, score_threshold=0.5, distance_threshold=10.0, n=4, alpha = 1000.0, slope_alpha = 0.1):
@@ -720,7 +706,7 @@ class MyPredictionWriter(BasePredictionWriter):
                         normals_batch,
                         colors_batch,
                         names_batch,
-                        use_multiprocessing=True,  # Change to True if preferred.
+                        use_multiprocessing=False,  # Change to True if preferred.
                         use_h5=True
                     )
                 self.computed_indices.extend(list(set(indxs) - set(self.computed_indices)))
@@ -773,13 +759,27 @@ class MyPredictionWriter(BasePredictionWriter):
                     [0] * len(surfaces[i]), [[]] * len(surfaces[i])) for i in range(len(surfaces))
                 ])
             else:
-                # Single-threaded HDF5 saving
-                for i in range(len(surfaces)):
-                    save_block_h5(
-                        surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i], 
-                        self.score_threshold, distance_threshold, n, alpha, slope_alpha, False, 
-                        [0] * len(surfaces[i]), [[]] * len(surfaces[i])
-                    )
+                h5_filename = os.path.dirname(names_batch[0]) + ".h5"
+                # Check if block already exists in HDF5 file
+                if os.path.exists(h5_filename):
+                    # with h5py.File(h5_filename, "r") as h5f:
+                    #     if block_name in h5f:
+                    #         print(f"Block {block_name} already exists in {h5_filename}. Skipping...")
+                    #         return
+                    pass
+                else:
+                    # Create a new HDF5 file (this will overwrite if it exists)
+                    with h5py.File(h5_filename, "w") as h5f:
+                        pass #  pass just to have the h5f in the scope and being created
+                # Open HDF5 file in append mode
+                with h5py.File(h5_filename, "a") as h5f:
+                    # Single-threaded HDF5 saving
+                    for i in range(len(surfaces)):
+                        save_block_h5(h5f, 
+                            surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i], 
+                            self.score_threshold, distance_threshold, n, alpha, slope_alpha, False, 
+                            [0] * len(surfaces[i]), [[]] * len(surfaces[i])
+                        )
         else:
             if use_multiprocessing:
                 # print(f"Using multiprocessing, len surfaces: {len(surfaces)}")
