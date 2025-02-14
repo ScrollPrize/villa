@@ -15,6 +15,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import BasePredictionWriter
+import torch.distributed as dist
 
 # show cuda devices
 print(torch.cuda.device_count())
@@ -686,6 +687,44 @@ class MyPredictionWriter(BasePredictionWriter):
         # Update progress
         self.computed_indices.extend(list(set(indxs) - set(self.computed_indices)))
         update_progress_file(self.progress_file, self.computed_indices, self.config)
+
+    def write_on_batch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", 
+                            prediction, batch_indices, batch, batch_idx: int, dataloader_idx: int) -> None:
+        """
+        Gathers both the predictions and the batch info from all GPUs.
+        The ordering in the gathered lists is determined by the process rank, so the i-th element in
+        both lists corresponds to the same GPU. Only the master (global rank 0) performs post-processing.
+        """
+        # Determine world size (if not distributed, this will be 1)
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+        # Prepare lists to hold gathered objects from each GPU.
+        # The order is by global rank: index 0 will be rank 0, index 1 will be rank 1, etc.
+        all_predictions = [None] * world_size
+        all_batches = [None] * world_size
+
+        # Gather predictions and batch objects from all processes.
+        dist.all_gather_object(all_predictions, prediction)
+        dist.all_gather_object(all_batches, batch)
+
+        # Only execute file writing on the master process.
+        if trainer.is_global_zero:
+            for pred, bat in zip(all_predictions, all_batches):
+                # Unpack your batch info as defined in your dataset:
+                items_pytorch, points_batch, normals_batch, colors_batch, names_batch, indxs = bat
+                if pred and len(pred) > 0:
+                    self.post_process(
+                        pred,
+                        items_pytorch,
+                        points_batch,
+                        normals_batch,
+                        colors_batch,
+                        names_batch,
+                        use_multiprocessing=False,  # Change to True if preferred.
+                        use_h5=True
+                    )
+                self.computed_indices.extend(list(set(indxs) - set(self.computed_indices)))
+            update_progress_file(self.progress_file, self.computed_indices, self.config)
 
     def write_on_batch_end_async(self, trainer: pl.Trainer, pl_module: pl.LightningModule, prediction, batch_indices, batch, batch_idx: int, dataloader_idx: int) -> None:
         """Submits the entire batch processing to the thread pool for async execution."""
