@@ -434,7 +434,7 @@ class MyPredictionWriter(BasePredictionWriter):
         self.save_template_r = save_template_r
         self.grid_block_size = grid_block_size
         # Use a thread pool for IO-bound tasks; threads avoid pickling overhead.
-        all_threads = threading.active_count()
+        all_threads = multiprocessing.cpu_count()
         print(f"Saving with {all_threads} threads.")
         self.executor = ThreadPoolExecutor(max_workers=all_threads)
         # A lock to protect shared resources (computed_blocks, file writing)
