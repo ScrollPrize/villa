@@ -720,7 +720,7 @@ class MyPredictionWriter(BasePredictionWriter):
                         normals_batch,
                         colors_batch,
                         names_batch,
-                        use_multiprocessing=False,  # Change to True if preferred.
+                        use_multiprocessing=True,  # Change to True if preferred.
                         use_h5=True
                     )
                 self.computed_indices.extend(list(set(indxs) - set(self.computed_indices)))
@@ -921,7 +921,7 @@ class PointCloudDataset(Dataset):
                     start_coords.append(start_coord)
                     block_names.append(block_name)
 
-        assert indx_count == self.overlap_denumerator ** 3, f"Index count is {indx_count} and should be less than {self.overlap_denumerator ** 3}"
+        assert indx_count == self.overlap_denumerator ** 3, f"Index count is {indx_count} and should be exactly {self.overlap_denumerator ** 3}"
         return subvolumes_points, original_subvolumes_points, subvolumes_normals, subvolumes_colors, start_coords, block_names
 
     def precompute(self, idx__, index, start, size, path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points, umbilicus_points_old, use_multiprocessing, executor=None):
@@ -1025,7 +1025,7 @@ def main():
     batch_size = 5
     gpus = -1
     pointcloud_size = 1
-    overlap_denumerator = 2
+    overlap_denumerator = 3
 
     # Create an argument parser
     parser = argparse.ArgumentParser(description="Compute surface patches from pointcloud.")
