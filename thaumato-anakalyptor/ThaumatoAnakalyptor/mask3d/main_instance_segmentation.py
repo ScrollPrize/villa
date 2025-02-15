@@ -37,7 +37,7 @@ def get_parameters(cfg: DictConfig):
 
     if not os.path.exists(cfg.general.save_dir):
         os.makedirs(cfg.general.save_dir)
-    else:
+    elif os.path.exists(f"{cfg.general.save_dir}/last-epoch.ckpt"):
         print("EXPERIMENT ALREADY EXIST")
         cfg["trainer"][
             "resume_from_checkpoint"
