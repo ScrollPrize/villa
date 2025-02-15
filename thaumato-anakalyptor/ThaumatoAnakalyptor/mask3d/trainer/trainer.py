@@ -1580,7 +1580,10 @@ class InstanceSegmentation(pl.LightningModule):
         self.log_dict(ap_results)
 
         if not self.config.general.export:
-            shutil.rmtree(base_path)
+            try:
+                shutil.rmtree(base_path)
+            except:
+                pass
 
         del self.preds
         del self.bbox_preds
