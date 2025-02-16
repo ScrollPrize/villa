@@ -271,6 +271,8 @@ def main(graph_path="graph_scroll5_january_unrolling_full_v2.bin", experiment_na
     # solver.set_z_range(z_min, z_max)
 
     solver.largest_connected_component()
+    save_path = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_f_star_final.bin"
+    solver.save_graph(save_path)
 
     # fresh_start_ring = 0 # continue solve computation from fresh_start
     scale_outer = 1.0 # S5 right side

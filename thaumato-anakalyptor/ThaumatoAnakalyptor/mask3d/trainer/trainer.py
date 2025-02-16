@@ -52,9 +52,11 @@ class RegularCheckpointing(pl.Callback):
     def on_train_epoch_end(
         self, trainer: "pl.Trainer", pl_module: "pl.LightningModule"
     ):
-        general = pl_module.config.general
-        trainer.save_checkpoint(f"{general.save_dir}/last-epoch.ckpt")
-        print("Checkpoint created")
+        # save if global rank is 0 (GPU 0)
+        if trainer.is_global_zero:
+            general = pl_module.config.general
+            trainer.save_checkpoint(f"{general.save_dir}/last-epoch.ckpt")
+            print("Checkpoint created")
 
 
 class InstanceSegmentation(pl.LightningModule):
