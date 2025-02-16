@@ -703,9 +703,25 @@ class MyPredictionWriter(BasePredictionWriter):
                 use_multiprocessing=False,  # Change to True if preferred.
                 use_h5=True
             )
-        self.computed_indices.extend(list(set(indxs) - set(self.computed_indices)))
-        update_progress_file(self.progress_file, self.computed_indices, self.config)
+        
+        # Determine world size (if not distributed, this will be 1)
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
 
+        # Prepare lists to hold gathered objects from each GPU.
+        # The order is by global rank: index 0 will be rank 0, index 1 will be rank 1, etc.
+        all_batches = [None] * world_size
+
+        # Gather predictions and batch objects from all processes.
+        dist.all_gather_object(all_batches, batch)
+
+        # Only execute file writing on the master process.
+        if trainer.is_global_zero:
+            for bat in all_batches:
+                # Unpack your batch info as defined in your dataset:
+                items_pytorch, points_batch, normals_batch, colors_batch, names_batch, indxs = bat
+                self.computed_indices.extend(list(set(indxs) - set(self.computed_indices)))
+            update_progress_file(self.progress_file, self.computed_indices, self.config)
+    
     def post_process(self, res, items_pytorch, points_batch, normals_batch, colors_batch, names_batch, 
                      use_multiprocessing=False, distance_threshold=10.0, n=4, alpha=1000.0, 
                      slope_alpha=0.1, use_h5=True):
@@ -733,7 +749,7 @@ class MyPredictionWriter(BasePredictionWriter):
 
                 gpu_rank = dist.get_rank() if dist.is_initialized() else 0
                 # Create 4 intermediate filenames (one per thread)
-                self.intermediate_filenames = [os.path.join(dir_name, "gpu_threads_h5s" f"{base}_gpu{gpu_rank}_thread{i}{ext}") for i in range(4)]
+                self.intermediate_filenames = [os.path.join(dir_name, "gpu_threads_h5s", f"{base}_gpu{gpu_rank}_thread{i}{ext}") for i in range(4)]
                 # Open each intermediate file in append mode.
                 self.intermediate_handles = [h5py.File(fname, "a") for fname in self.intermediate_filenames]
                 # Create one lock per intermediate file.
