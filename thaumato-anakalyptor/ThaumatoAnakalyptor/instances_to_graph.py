@@ -1130,7 +1130,8 @@ def process_block(args):
                 if len(score_sheets_patch) > 0:
                     # sort and take top 3
                     score_sheets_patch = sorted(score_sheets_patch, key=lambda x: x[2], reverse=True)
-                    score_sheets_patch = score_sheets_patch[:3]
+                    max_ind = min(3, len(score_sheets_patch))
+                    score_sheets_patch = score_sheets_patch[:max_ind]
                     # score_sheets_patch = max(score_sheets_patch, key=lambda x: x[2])
                     score_sheets.append(score_sheets_patch)
         
