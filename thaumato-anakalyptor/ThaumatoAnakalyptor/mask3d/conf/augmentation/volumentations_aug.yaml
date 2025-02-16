@@ -21,33 +21,33 @@ transform:
           - 0.1
         - - -0.1
           - 0.1
-    - __class_fullname__: volumentations.augmentations.transforms.RotateAroundAxis3d
-      always_apply: true
-      axis:
-        - 0
-        - 0
-        - 1
-      p: 0.25
-      rotation_limit:
-        - -3.141592653589793
-        - 3.141592653589793
-    - __class_fullname__: volumentations.augmentations.transforms.RotateAroundAxis3d
-      always_apply: true
-      axis:
-        - 0
-        - 1
-        - 0
-      p: 0.25
-      rotation_limit:
-        - -3.141592653589793
-        - 3.141592653589793
-    - __class_fullname__: volumentations.augmentations.transforms.RotateAroundAxis3d
-      always_apply: true
-      axis:
-        - 1
-        - 0
-        - 0
-      p: 0.25
-      rotation_limit:
-        - -3.141592653589793
-        - 3.141592653589793
+    # - __class_fullname__: volumentations.augmentations.transforms.RotateAroundAxis3d
+    #   always_apply: true
+    #   axis:
+    #     - 0
+    #     - 0
+    #     - 1
+    #   p: 0.25
+    #   rotation_limit:
+    #     - -3.141592653589793
+    #     - 3.141592653589793
+    # - __class_fullname__: volumentations.augmentations.transforms.RotateAroundAxis3d
+    #   always_apply: true
+    #   axis:
+    #     - 0
+    #     - 1
+    #     - 0
+    #   p: 0.25
+    #   rotation_limit:
+    #     - -3.141592653589793
+    #     - 3.141592653589793
+    # - __class_fullname__: volumentations.augmentations.transforms.RotateAroundAxis3d
+    #   always_apply: true
+    #   axis:
+    #     - 1
+    #     - 0
+    #     - 0
+    #   p: 0.25
+    #   rotation_limit:
+    #     - -3.141592653589793
+    #     - 3.141592653589793

@@ -28,3 +28,7 @@ transform:
       r_shift_limit:
         - -20
         - 20
+    - __class_fullname__: albumentations.augmentations.transforms.RandomRotate90
+      always_apply: true
+      p: 0.5
+

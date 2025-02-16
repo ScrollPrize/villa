@@ -82,6 +82,9 @@ class PointCloudLabeler(QMainWindow):
                                                        z_max=self.default_z_max)
             gt_path = os.path.join("experiments", self.default_experiment,
                                    "checkpoints", "checkpoint_graph_solver_connected_2.bin")
+            if not os.path.exists(gt_path):
+                gt_path = os.path.join("experiments", self.default_experiment, "checkpoints", "checkpoint_graph_f_star_final.bin")
+            
             if os.path.exists(gt_path):
                 self.solver.load_graph(gt_path)
             else:
@@ -358,6 +361,9 @@ class PointCloudLabeler(QMainWindow):
                                                        z_min=self.default_z_min,
                                                        z_max=self.default_z_max)
             gt_path = os.path.join("experiments", exp_name, "checkpoints", "checkpoint_graph_solver_connected_2.bin")
+            if not os.path.exists(gt_path):
+                gt_path = os.path.join("experiments", exp_name, "checkpoints", "checkpoint_graph_f_star_final.bin")
+            
             if os.path.exists(gt_path):
                 self.solver.load_graph(gt_path)
             else:
@@ -365,6 +371,7 @@ class PointCloudLabeler(QMainWindow):
             new_points = self.solver.get_positions()
             self.points = np.array(new_points)
             self.labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
+            self.calculated_labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
             self.kdtree_xy = cKDTree(self.points[:, [0,1]])
             self.kdtree_xz = cKDTree(self.points[:, [0,2]])
             self.update_views()
