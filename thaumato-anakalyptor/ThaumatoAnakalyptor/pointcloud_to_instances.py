@@ -750,6 +750,10 @@ class MyPredictionWriter(BasePredictionWriter):
                 gpu_rank = dist.get_rank() if dist.is_initialized() else 0
                 # Create 4 intermediate filenames (one per thread)
                 self.intermediate_filenames = [os.path.join(dir_name, "gpu_threads_h5s", f"{base}_gpu{gpu_rank}_thread{i}{ext}") for i in range(4)]
+                try:
+                    os.makedirs(os.path.dirname(self.intermediate_filenames[0]))
+                except FileExistsError:
+                    pass
                 # Open each intermediate file in append mode.
                 self.intermediate_handles = [h5py.File(fname, "a") for fname in self.intermediate_filenames]
                 # Create one lock per intermediate file.
