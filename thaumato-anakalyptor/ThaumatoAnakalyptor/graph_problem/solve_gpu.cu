@@ -974,15 +974,16 @@ __global__ void update_nodes_kernel_f_star(Node* d_graph, size_t* d_valid_indice
         if (edge.same_block) {
             // update closeness
             node.same_block_closeness += fabsf(k_dif);
-            certainty *= fmaxf(1.0f, 0.25f * node.same_block_closeness_old / 360.0f);
-            certainty *= fmaxf(1.0f, 0.25f * k_dif / 360.0f);
+            // certainty *= fmaxf(1.0f, 0.25f * node.same_block_closeness_old / 360.0f);
+            // certainty *= fmaxf(1.0f, 0.25f * k_dif / 360.0f);
         }
         else {
             float dk = n2n1 - spring_constant * k;
             float fitting_factor = fmaxf(1.0f, 1.0f / (1.0f + 0.01f * fabsf(dk)));
             float same_block_factor2 = fmaxf(1.0f, 1.0f * node.num_same_block_edges);
             float edges_factor = sqrt(1.0f * (node.num_edges - node.num_same_block_edges) * (d_graph[target_node].num_edges - d_graph[target_node].num_same_block_edges));
-            float certainty_factor = 0.05f * fitting_factor * same_block_factor2 * edges_factor;
+            // float certainty_factor = 0.05f * fitting_factor * same_block_factor2 * edges_factor;
+            float certainty_factor = 0.05f * same_block_factor2 * edges_factor;
             certainty *= certainty_factor;
             k *= 0.02f; // wrong other block edges make the adjacent windings be closer together, if k is "the perfect" angle step, then we would have too steep winding lines, since they wrap around that would then lead to places where the lines need to bend abruptly to compensate for the too steepness compared to the distance between the windings
         }

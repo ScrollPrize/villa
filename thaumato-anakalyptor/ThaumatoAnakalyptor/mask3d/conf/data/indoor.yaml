@@ -22,7 +22,7 @@ task: ${general.task}
 # data loader
 pin_memory: false
 num_workers: 4
-batch_size: 5
+batch_size: 16
 test_batch_size: 1
 cache_data: false
 
