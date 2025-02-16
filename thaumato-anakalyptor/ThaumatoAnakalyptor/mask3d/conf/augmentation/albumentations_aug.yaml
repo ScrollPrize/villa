@@ -30,5 +30,5 @@ transform:
         - 20
     - __class_fullname__: albumentations.augmentations.transforms.RandomRotate90
       always_apply: true
-      p: 0.5
+      p: 0.25
 
