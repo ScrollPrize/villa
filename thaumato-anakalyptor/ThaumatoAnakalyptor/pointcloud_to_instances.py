@@ -719,6 +719,9 @@ class MyPredictionWriter(BasePredictionWriter):
             for bat in all_batches:
                 # Unpack your batch info as defined in your dataset:
                 items_pytorch, points_batch, normals_batch, colors_batch, names_batch, indxs = bat
+                indxs = list(indxs)
+                # filter out negative indices
+                indxs = [i for i in indxs if i >= 0]
                 self.computed_indices.extend(list(set(indxs) - set(self.computed_indices)))
             update_progress_file(self.progress_file, self.computed_indices, self.config)
     
@@ -973,6 +976,7 @@ class PointCloudDataset(Dataset):
         idx_ = idx // (self.overlap_denumerator ** 3)
         idx__ = idx % (self.overlap_denumerator ** 3)
         i = self.to_compute_indices[idx_] # index of the start_list
+        progress_i = i if idx__ == (self.overlap_denumerator ** 3) - 1 else -1
         x = self.start_list[i]
 
         res = self.precompute(idx__, i, x, self.size, self.path, self.folder, self.dest, self.main_drive, self.alternative_drives, self.fix_umbilicus, self.umbilicus_points, self.umbilicus_points_old, False, None)
@@ -993,7 +997,7 @@ class PointCloudDataset(Dataset):
 
         items_pytorch = [preprocess_points(c) for c in coords_batch]
         # print(f"Returned {count_returned} of {len(self)}")
-        return items_pytorch, original_points_batch, normals_batch, colors_batch, names_batch, i
+        return items_pytorch, original_points_batch, normals_batch, colors_batch, names_batch, progress_i
 
 # Custom collation function
 def custom_collate_fn(batches):
