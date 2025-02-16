@@ -916,7 +916,7 @@ def score_same_block_patches(patch1, patch2, overlapp_threshold, umbilicus_dista
 
     return (score, k, valid), patch1["anchor_angles"][0], patch2["anchor_angles"][0]
 
-def process_same_block(main_block_patches_list, overlapp_threshold, umbilicus_distance, patch_angle):
+def process_same_block(main_block_patches_list, overlapp_threshold, umbilicus_distance):
     def scores_cleaned(direction_scores):
         if len(direction_scores) == 0:
             return []
@@ -937,15 +937,7 @@ def process_same_block(main_block_patches_list, overlapp_threshold, umbilicus_di
     score_switching_sheets = []
     score_bad_edges = []
     for i in range(len(main_block_patches_list)):
-        angle = patch_angle(main_block_patches_list[i])
-        # find out if close to angle%90 == 0
-        # TODO: actually calculate this from the sheet configuration instead of approximating from the sheet position around the umbilicus
-        # angle = (patch_angle(patches_list[i]) + patch_angle(patches_list[j])) / 2.0 # approximation
         min_points_factor = 1.0
-        # right_angle = angle / 90.0 + 0.5
-        # right_angle = right_angle - np.floor(right_angle) - 0.5
-        # if abs(right_angle) < 0.333: # not needed anymore after graph gap fix
-        #     min_points_factor = 0.25
         score_switching_sheets_ = []
         for j in range(len(main_block_patches_list)):
             if i == j:
@@ -967,7 +959,7 @@ def process_same_block(main_block_patches_list, overlapp_threshold, umbilicus_di
         score_switching_sheets += score1 + score2
     return score_switching_sheets, score_bad_edges
 
-def score_other_block_patches(patches_list, i, j, overlapp_threshold, angle):
+def score_other_block_patches(patches_list, i, j, overlapp_threshold):
     """
     Calculate the score between two patches from different blocks.
     """
@@ -1098,12 +1090,6 @@ def process_block(args):
             ortogh_length = np.linalg.norm(pv12_x)
             geo_d = np.linalg.norm(geo1 - geo2)
             return d1 - d2, ortogh_length, geo_d
-        
-        def patch_angle(patch1):
-            umbilicus_point = umbilicus_func(patch1["centroid"][1])[[0, 2]]
-            umbilicus_vector = umbilicus_point - patch1["centroid"][[0, 2]]
-            angle = angle_between(umbilicus_vector) * 180.0 / np.pi
-            return angle
 
         file_name = ".".join(file_path.split(".")[:-1])
         main_block_patches_list = subvolume_surface_patches_folder(file_name, sample_ratio=overlapp_threshold["sample_ratio_score"])
@@ -1129,24 +1115,14 @@ def process_block(args):
         patches_list = main_block_patches_list + surrounding_blocks_patches_list_
         add_overlapp_entries_to_patches_list(patches_list)
 
-        # # Assign points to tiles
-        # subvolume = {"start": block_id - 25, "end": block_id + 75}
-        # try:
-        #     assign_points_to_tiles(patches_list, subvolume, tiling=3)
-        # except Exception as e:
-        #     print(e)
-        #     print("Error assigning points to tiles.")
-        #     return [], [], [], {}
-
         # calculate scores between each main block patch and surrounding blocks patches
         score_sheets = []
         for i, main_block_patch in enumerate(main_block_patches_list):
-            angle = patch_angle(main_block_patch)
             for surrounding_blocks_patches in surrounding_blocks_patches_list:
                 score_sheets_patch = []
                 for j, surrounding_block_patch in enumerate(surrounding_blocks_patches):
                     patches_list_ = [main_block_patch, surrounding_block_patch]
-                    score_ = score_other_block_patches(patches_list_, 0, 1, overlapp_threshold, angle) # score, anchor_angle1, anchor_angle2
+                    score_ = score_other_block_patches(patches_list_, 0, 1, overlapp_threshold) # score, anchor_angle1, anchor_angle2
                     if score_[0] > overlapp_threshold["final_score_min"]:
                         score_sheets_patch.append((main_block_patch['ids'][0], surrounding_block_patch['ids'][0], score_[0], None, score_[1], score_[2], main_block_patch["centroid"], surrounding_block_patch["centroid"]))
 
@@ -1155,7 +1131,7 @@ def process_block(args):
                     score_sheets_patch = max(score_sheets_patch, key=lambda x: x[2])
                     score_sheets.append(score_sheets_patch)
         
-        score_switching_sheets, score_bad_edges = process_same_block(main_block_patches_list, overlapp_threshold, umbilicus_distance, patch_angle)
+        score_switching_sheets, score_bad_edges = process_same_block(main_block_patches_list, overlapp_threshold, umbilicus_distance)
 
         # Process and return results...
         return score_sheets, score_switching_sheets, score_bad_edges, patches_centroids
