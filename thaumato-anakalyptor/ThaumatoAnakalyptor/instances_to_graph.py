@@ -1128,7 +1128,10 @@ def process_block(args):
 
                 # Find the best score for each main block patch
                 if len(score_sheets_patch) > 0:
-                    score_sheets_patch = max(score_sheets_patch, key=lambda x: x[2])
+                    # sort and take top 3
+                    score_sheets_patch = sorted(score_sheets_patch, key=lambda x: x[2], reverse=True)
+                    score_sheets_patch = score_sheets_patch[:3]
+                    # score_sheets_patch = max(score_sheets_patch, key=lambda x: x[2])
                     score_sheets.append(score_sheets_patch)
         
         score_switching_sheets, score_bad_edges = process_same_block(main_block_patches_list, overlapp_threshold, umbilicus_distance)
