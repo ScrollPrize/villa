@@ -16,6 +16,7 @@ from torch.utils.data import Dataset, DataLoader, IterableDataset
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import BasePredictionWriter
 import torch.distributed as dist
+from tqdm import tqdm
 
 # show cuda devices
 print(torch.cuda.device_count())
@@ -608,12 +609,28 @@ def to_surfaces_args(args):
     # print("to_surfaces_args")
     return to_surfaces(*args)
 
+import os
+import json
+import h5py
+import numpy as np
+import multiprocessing
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import torch.distributed as dist
 
 class MyPredictionWriter(BasePredictionWriter):
-    def __init__(self, path="/media/julian/FastSSD/scroll3_surface_points", folder="point_cloud_colorized", dest="/media/julian/HDD8TB/scroll3_surface_points", main_drive="", alternative_drives=[], fix_umbilicus=True, umbilicus_points_path="", start=[0, 0, 0], stop=[16, 17, 29], size = [3, 3, 3], umbilicus_distance_threshold=1500, score_threshold=0.5, batch_size=4, gpus=1, num_processes=3):
+    def __init__(self, 
+                 path="/media/julian/FastSSD/scroll3_surface_points", 
+                 folder="point_cloud_colorized", 
+                 dest="/media/julian/HDD8TB/scroll3_surface_points", 
+                 main_drive="", alternative_drives=[], 
+                 fix_umbilicus=True, umbilicus_points_path="", 
+                 start=[0, 0, 0], stop=[16, 17, 29], size=[3, 3, 3], 
+                 umbilicus_distance_threshold=1500, score_threshold=0.5, 
+                 batch_size=4, gpus=1, num_processes=4):  # num_processes=4 for 4 writer threads
         super().__init__(write_interval="batch")  # or "epoch" for end of an epoch
         self.num_threads = multiprocessing.cpu_count()
-        self.pool = multiprocessing.Pool(processes=self.num_threads)  # Initialize the pool once
+        self.pool = multiprocessing.Pool(processes=self.num_threads)  # Initialize once
 
         self.path = path
         self.folder = folder
@@ -629,18 +646,28 @@ class MyPredictionWriter(BasePredictionWriter):
         self.score_threshold = score_threshold
         self.batch_size = batch_size
         self.gpus = gpus
-        # Initialize the ThreadPoolExecutor with the desired number of threads
-        self.executor = ThreadPoolExecutor(max_workers=self.num_threads)
+
+        # Create a fixed thread pool of 4 threads.
+        self.executor = ThreadPoolExecutor(max_workers=4)
 
         self.start_list = build_start_list(start, stop, size, path, folder, umbilicus_points_path, umbilicus_distance_threshold)
-
         self.num_tasks = len(self.start_list)
         self.to_compute_indices = range(self.num_tasks)
         self.computed_indices = []
         self.progress_file = os.path.join(dest, "progress.json")
-        self.config = {"path": path, "folder": folder, "dest": dest, "main_drive": main_drive, "alternative_drives": alternative_drives, "fix_umbilicus": fix_umbilicus, "umbilicus_points_path": umbilicus_points_path, "start": start, "stop": stop, "size": size, "umbilicus_distance_threshold": umbilicus_distance_threshold, "score_threshold": score_threshold, "batch_size": batch_size, "gpus": gpus}
+        self.config = {"path": path, "folder": folder, "dest": dest, "main_drive": main_drive, 
+                       "alternative_drives": alternative_drives, "fix_umbilicus": fix_umbilicus, 
+                       "umbilicus_points_path": umbilicus_points_path, "start": start, "stop": stop, 
+                       "size": size, "umbilicus_distance_threshold": umbilicus_distance_threshold, 
+                       "score_threshold": score_threshold, "batch_size": batch_size, "gpus": gpus}
         self._load_progress()
 
+        # For HDF5 saving: these will be lazily initialized on the first call.
+        self.final_filename = None           # Final HDF5 filename (always os.path.dirname(names_batch[0]) + ".h5")
+        self.intermediate_filenames = None   # List of 4 intermediate filenames (one per thread)
+        self.intermediate_handles = None     # Open HDF5 file handles for each thread
+        self.interm_locks = None             # One lock per intermediate file
+       
     def _load_progress(self):
         nr_total_indices = len(self.to_compute_indices)
         if os.path.exists(self.progress_file):
@@ -658,137 +685,120 @@ class MyPredictionWriter(BasePredictionWriter):
                         else:
                             print("No progress file found.")
 
-    def write_on_predict(self, predictions: list, batch_indices: list, dataloader_idx: int, batch, batch_idx: int, dataloader_len: int):
-        # Example: Just print the predictions
-        print(predictions)
-        print("On predict")
-
-    def write_on_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, prediction, batch_indices, batch, batch_idx: int, dataloader_idx: int) -> None:
-        """Handles batch processing including post-processing and file writing."""
+    def write_on_batch_end(self, trainer:"pl.Trainer", pl_module:"pl.LightningModule", 
+                             prediction, batch_indices, batch, batch_idx:int, dataloader_idx:int) -> None:
+        """
+        In this multi-GPU setting each GPU writes its own batch.
+        """
+        # Unpack your batch info as defined in your dataset:
         items_pytorch, points_batch, normals_batch, colors_batch, names_batch, indxs = batch
-        
         if prediction and len(prediction) > 0:
-            self.post_process(prediction, items_pytorch, points_batch, normals_batch, colors_batch, names_batch, use_multiprocessing=True, use_h5 = True)
-
-        # Update progress
+            self.post_process(
+                prediction,
+                items_pytorch,
+                points_batch,
+                normals_batch,
+                colors_batch,
+                names_batch,
+                use_multiprocessing=False,  # Change to True if preferred.
+                use_h5=True
+            )
         self.computed_indices.extend(list(set(indxs) - set(self.computed_indices)))
         update_progress_file(self.progress_file, self.computed_indices, self.config)
 
-    def write_on_batch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", 
-                            prediction, batch_indices, batch, batch_idx: int, dataloader_idx: int) -> None:
-        """
-        Gathers both the predictions and the batch info from all GPUs.
-        The ordering in the gathered lists is determined by the process rank, so the i-th element in
-        both lists corresponds to the same GPU. Only the master (global rank 0) performs post-processing.
-        """
-        # Determine world size (if not distributed, this will be 1)
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-
-        # Prepare lists to hold gathered objects from each GPU.
-        # The order is by global rank: index 0 will be rank 0, index 1 will be rank 1, etc.
-        all_predictions = [None] * world_size
-        all_batches = [None] * world_size
-
-        # Gather predictions and batch objects from all processes.
-        dist.all_gather_object(all_predictions, prediction)
-        dist.all_gather_object(all_batches, batch)
-
-        # Only execute file writing on the master process.
-        if trainer.is_global_zero:
-            for pred, bat in zip(all_predictions, all_batches):
-                # Unpack your batch info as defined in your dataset:
-                items_pytorch, points_batch, normals_batch, colors_batch, names_batch, indxs = bat
-                if pred and len(pred) > 0:
-                    self.post_process(
-                        pred,
-                        items_pytorch,
-                        points_batch,
-                        normals_batch,
-                        colors_batch,
-                        names_batch,
-                        use_multiprocessing=False,  # Change to True if preferred.
-                        use_h5=True
-                    )
-                self.computed_indices.extend(list(set(indxs) - set(self.computed_indices)))
-            update_progress_file(self.progress_file, self.computed_indices, self.config)
-
-    def write_on_batch_end_async(self, trainer: pl.Trainer, pl_module: pl.LightningModule, prediction, batch_indices, batch, batch_idx: int, dataloader_idx: int) -> None:
-        """Submits the entire batch processing to the thread pool for async execution."""
-        # check how many blocks are left to compute om the executor
-        print(f"Put batch into Queue: {batch_idx}")
-        self.executor.submit(self._process_batch, prediction, batch, batch_idx)
-
-    def _process_batch(self, prediction, batch, batch_idx: int):
-        """Handles batch processing including post-processing and file writing."""
-        items_pytorch, points_batch, normals_batch, colors_batch, names_batch, indxs = batch
-        
-        if prediction and len(prediction) > 0:
-            self.post_process(prediction, items_pytorch, points_batch, normals_batch, colors_batch, names_batch, use_multiprocessing=False, use_h5 = True)
-
-        # Update progress
-        self.computed_indices.extend(list(set(indxs) - set(self.computed_indices)))
-        update_progress_file(self.progress_file, self.computed_indices, self.config)
-
-    def post_process(self, res, items_pytorch, points_batch, normals_batch, colors_batch, names_batch, use_multiprocessing=False, distance_threshold=10.0, n=4, alpha = 1000.0, slope_alpha = 0.1, use_h5 = True):
-        # print GPU memory usage
+    def post_process(self, res, items_pytorch, points_batch, normals_batch, colors_batch, names_batch, 
+                     use_multiprocessing=False, distance_threshold=10.0, n=4, alpha=1000.0, 
+                     slope_alpha=0.1, use_h5=True):
         if res is None:
             print("batch_inference result is None")
-            res = [{"pred_classes": []}]*len(items_pytorch)
+            res = [{"pred_classes": []}] * len(items_pytorch)
         else:
             res = list(res.values())
 
         if use_multiprocessing:
-            # print("Using multiprocessing")
-            # Save the block
-            res = self.pool.map(to_surfaces_args, [(points_batch[i], normals_batch[i], colors_batch[i], res[i]) for i in range(len(points_batch))])
+            res = self.pool.map(to_surfaces_args, [(points_batch[i], normals_batch[i], colors_batch[i], res[i])
+                                                    for i in range(len(points_batch))])
             surfaces, surfaces_normals, surfaces_colors, scores = zip(*res)
         else:
-            # print("Not using multiprocessing")
-            # Single threaded version
             surfaces, surfaces_normals, surfaces_colors, scores = to_surfaces(points_batch, normals_batch, colors_batch, res)
-        # return surfaces, surfaces_normals, surfaces_colors, names_batch, scores
 
-        # save each instance for each subvolume
-        # Setting up multiprocessing, process count
         if use_h5:
-            if False and use_multiprocessing:
-                # Use multiprocessing to save HDF5 blocks
-                self.pool.map(save_block_h5, [
-                    (surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i], 
-                    self.score_threshold, distance_threshold, n, alpha, slope_alpha, False, 
-                    [0] * len(surfaces[i]), [[]] * len(surfaces[i])) for i in range(len(surfaces))
-                ])
-            else:
-                h5_filename = os.path.dirname(names_batch[0]) + ".h5"
-                # Check if block already exists in HDF5 file
-                if os.path.exists(h5_filename):
-                    # with h5py.File(h5_filename, "r") as h5f:
-                    #     if block_name in h5f:
-                    #         print(f"Block {block_name} already exists in {h5_filename}. Skipping...")
-                    #         return
-                    pass
-                else:
-                    # Create a new HDF5 file (this will overwrite if it exists)
-                    with h5py.File(h5_filename, "w") as h5f:
-                        pass #  pass just to have the h5f in the scope and being created
-                # Open HDF5 file in append mode
-                with h5py.File(h5_filename, "a") as h5f:
-                    # Single-threaded HDF5 saving
-                    for i in range(len(surfaces)):
-                        save_block_h5(h5f, 
-                            surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i], 
-                            self.score_threshold, distance_threshold, n, alpha, slope_alpha, False, 
-                            [0] * len(surfaces[i]), [[]] * len(surfaces[i])
-                        )
+            # Determine the final HDF5 filename (this is always the same for a given dataset).
+            final_h5_filename = os.path.dirname(names_batch[0]) + ".h5"
+            if self.final_filename is None:
+                self.final_filename = final_h5_filename
+                dir_name = os.path.dirname(final_h5_filename)
+                basename = os.path.basename(final_h5_filename)
+                base, ext = os.path.splitext(basename)
+
+                gpu_rank = dist.get_rank() if dist.is_initialized() else 0
+                # Create 4 intermediate filenames (one per thread)
+                self.intermediate_filenames = [os.path.join(dir_name, "gpu_threads_h5s" f"{base}_gpu{gpu_rank}_thread{i}{ext}") for i in range(4)]
+                # Open each intermediate file in append mode.
+                self.intermediate_handles = [h5py.File(fname, "a") for fname in self.intermediate_filenames]
+                # Create one lock per intermediate file.
+                self.interm_locks = [threading.Lock() for _ in range(4)]
+            
+            # Group the blocks (each block corresponds to one surface from the batch) by thread.
+            # Round-robin assignment: block i is assigned to thread index = i % 4.
+            tasks_by_thread = {i: [] for i in range(4)}
+            for i in range(len(surfaces)):
+                thread_idx = i % 4
+                tasks_by_thread[thread_idx].append((surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i]))
+            
+            # For each thread that has tasks, submit a single task that writes all its assigned blocks.
+            for thread_idx, tasks in tasks_by_thread.items():
+                if tasks:
+                    self.executor.submit(self.async_save_batch, thread_idx, tasks, distance_threshold, n, alpha, slope_alpha)
         else:
             if use_multiprocessing:
-                # print(f"Using multiprocessing, len surfaces: {len(surfaces)}")
-                # Save the block
-                self.pool.map(save_block_ply_args, [(surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i], self.score_threshold, distance_threshold, n, alpha, slope_alpha, False, [0]*len(surfaces[i]), [[]]*len(surfaces[i])) for i in range(len(surfaces))])
+                self.pool.map(save_block_ply_args, [(surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i],
+                                                     self.score_threshold, distance_threshold, n, alpha, slope_alpha, False,
+                                                     [0] * len(surfaces[i]), [[]] * len(surfaces[i]))
+                                                    for i in range(len(surfaces))])
             else:
-                # single threaded version
                 for i in range(len(surfaces)):
-                    save_block_ply(surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i], self.score_threshold, distance_threshold, n, alpha, slope_alpha, False, [0]*len(surfaces[i]), [[]]*len(surfaces[i]))
+                    save_block_ply(surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i],
+                                   self.score_threshold, distance_threshold, n, alpha, slope_alpha, False,
+                                   [0] * len(surfaces[i]), [[]] * len(surfaces[i]))
+    
+    def async_save_batch(self, thread_idx, tasks, distance_threshold, n, alpha, slope_alpha):
+        """
+        This method runs in one of the fixed threads.
+        It writes all blocks in 'tasks' to the intermediate HDF5 file corresponding to thread_idx.
+        Each task in tasks is a tuple: (surf, norm, col, scr, nname).
+        """
+        with self.interm_locks[thread_idx]:
+            for (surf, norm, col, scr, nname) in tasks:
+                save_block_h5(self.intermediate_handles[thread_idx],
+                              surf, norm, col, scr, nname,
+                              self.score_threshold, distance_threshold, n, alpha, slope_alpha,
+                              False, [0] * len(surf), [[]] * len(surf))
+    
+    def finalize(self):
+        """
+        At the end of the epoch, wait for all threads to finish.
+        Then (only on global rank 0) merge the 4 intermediate HDF5 files into the final file.
+        """
+        # Wait for all asynchronous tasks to complete.
+        self.executor.shutdown(wait=True)
+        # Close all intermediate HDF5 file handles.
+        if self.intermediate_handles is not None:
+            for h5f in self.intermediate_handles:
+                h5f.close()
+        # Only merge on global rank 0.
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            # find all intermediate files in h5_dir
+            h5_dir = os.path.dirname(self.intermediate_filenames[0])
+            self.intermediate_filenames = [os.path.join(h5_dir, f) for f in os.listdir(h5_dir) if f.endswith(".h5")]
+            with h5py.File(self.final_filename, "w") as h5f_final:
+                for fname in tqdm(self.intermediate_filenames, desc="Merging intermediate files"):
+                    if os.path.exists(fname):
+                        with h5py.File(fname, "r") as h5f_in:
+                            for group in tqdm(h5f_in, desc=f"Merging {os.path.basename(fname)}"):
+                                h5f_in.copy(h5f_in[group], h5f_final, name=group)
+            print(f"Final merged HDF5 file: {self.final_filename}")
 
 class PointCloudDataset(Dataset):
     def __init__(self, path="/media/julian/FastSSD/scroll3_surface_points", folder="point_cloud_colorized", dest="/media/julian/HDD8TB/scroll3_surface_points", main_drive="", alternative_drives=[], fix_umbilicus=True, umbilicus_points_path="", start=[0, 0, 0], stop=[16, 17, 29], size = [3, 3, 3], umbilicus_distance_threshold=1500, score_threshold=0.5, batch_size=4, gpus=1, num_processes=3, recompute=False, rotate=False, overlap_denumerator=3):
@@ -1008,6 +1018,8 @@ def pointcloud_inference(path, folder, dest, main_drive, alternative_drives, fix
     # Run prediction
     trainer.predict(model, dataloaders=dataloader, return_predictions=False)
     print("Prediction done")
+    writer.finalize()
+    print("Finalize done")
 
 def main():
     side = "_verso" # actually recto

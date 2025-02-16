@@ -2,7 +2,8 @@ import sys, os, ast, numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QSlider, QLabel, QSpinBox, QDoubleSpinBox, QCheckBox,
-    QAction, QMessageBox, QInputDialog, QGraphicsEllipseItem, QFileDialog
+    QAction, QMessageBox, QInputDialog, QGraphicsEllipseItem, QFileDialog,
+    QProgressDialog
 )
 from PyQt5.QtCore import Qt, QEvent
 import pyqtgraph as pg
@@ -15,6 +16,51 @@ import time
 sys.path.append('ThaumatoAnakalyptor/graph_problem/build')
 import graph_problem_gpu_py
 
+def point_to_polyline_distance(point, polyline):
+    """
+    Compute the minimum distance from a point (x,y) to a polyline.
+    polyline is a 2D numpy array of shape (n,2) representing connected points.
+    """
+    min_dist = np.inf
+    for i in range(len(polyline)-1):
+        p1 = polyline[i]
+        p2 = polyline[i+1]
+        v = p2 - p1
+        w = point - p1
+        if np.all(v == 0):
+            dist = np.linalg.norm(w)
+        else:
+            t = np.dot(w, v) / np.dot(v, v)
+            if t < 0:
+                dist = np.linalg.norm(point - p1)
+            elif t > 1:
+                dist = np.linalg.norm(point - p2)
+            else:
+                proj = p1 + t * v
+                dist = np.linalg.norm(point - proj)
+        if dist < min_dist:
+            min_dist = dist
+    return min_dist
+
+def vectorized_point_to_polyline_distance(point, polyline):
+    """
+    Compute the minimum distance from a point (2,) to a polyline.
+    The polyline is assumed to be an array of shape (n,2), and the distance is computed
+    over all segments (from polyline[i] to polyline[i+1]). Uses vectorized operations.
+    """
+    p1 = polyline[:-1]  # shape (n-1, 2)
+    p2 = polyline[1:]
+    v = p2 - p1         # segment vectors
+    w = point - p1      # vectors from p1 to point; broadcasting (n-1,2)
+    dot_wv = np.einsum('ij,ij->i', w, v)
+    dot_vv = np.einsum('ij,ij->i', v, v)
+    # Avoid division by zero:
+    t = np.divide(dot_wv, dot_vv, out=np.zeros_like(dot_wv), where=dot_vv!=0)
+    t = np.clip(t, 0, 1)
+    proj = p1 + (t[:, None] * v)
+    dists = np.linalg.norm(point - proj, axis=1)
+    return np.min(dists)
+
 # --------------------------------------------------
 # Graph Labeler GUI with updated pipette, solver, and calculated label tools.
 # --------------------------------------------------
@@ -23,7 +69,7 @@ class PointCloudLabeler(QMainWindow):
         super().__init__(parent)
         self.setWindowTitle("Graph Labeler")
         
-        # --- Default settings for data (used when loading via the Data menu) ---
+        # --- Default settings for data ---
         self.graph_path = "/media/julian/2/Scroll5/scroll5_complete_surface_points_zarrtest/1352_3600_5005/graph.bin"
         self.default_z_min = 3000
         self.default_z_max = 4000
@@ -45,29 +91,33 @@ class PointCloudLabeler(QMainWindow):
             self.solver = None
         
         # --- Global Variables ---
-        self.scaleFactor = 100  # for converting float values to slider integers
+        self.scaleFactor = 100  # for converting slider values
         self.s_pressed = False
         self.original_drawing_mode = True
-        self.pipette_mode = False  # when True, the next left-click (in either view) will pick a label
-        self.calc_drawing_mode = False  # when True, drawing strokes will transfer calculated labels
+        self.pipette_mode = False
+        self.calc_drawing_mode = False
         
-        self.UNLABELED = -9999  # special value for unlabeled points
+        self.UNLABELED = -9999
         
         self.undo_stack = []
         self.redo_stack = []
         self._stroke_backup = None
         
+        # Lists/dictionaries for spline display and storage.
+        self.spline_items = []
+        self.spline_segments = {}  # keys: effective winding number, values: list of 2D arrays
+        
         # --- Create Menus ---
         self._create_menu()
         
         # --- Data and Labels ---
-        self.points = np.array(point_data)  # shape: (N,3)
+        self.points = np.array(point_data)
         self.labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
         self.calculated_labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
         
         # --- Display Parameters ---
         self.point_size = 3
-        self.max_display = 200000  # increased 4×
+        self.max_display = 200000
         
         # Coordinate naming.
         self.f_star_min, self.f_star_max = float(np.min(self.points[:,0])), float(np.max(self.points[:,0]))
@@ -78,12 +128,11 @@ class PointCloudLabeler(QMainWindow):
         self.kdtree_xy = cKDTree(self.points[:, [0,1]])
         self.kdtree_xz = cKDTree(self.points[:, [0,2]])
         
-        # --- Pre-created Brushes for manual labels ---
+        # --- Pre-created Brushes ---
         self.brush_black = pg.mkBrush(0, 0, 0)
         self.brush_red   = pg.mkBrush(255, 0, 0)
         self.brush_green = pg.mkBrush(0, 255, 0)
         self.brush_blue  = pg.mkBrush(0, 0, 255)
-        # --- Brushes for calculated labels (faded) ---
         self.calc_brush_black = pg.mkBrush(0, 0, 0, 100)
         self.calc_brush_red   = pg.mkBrush(255, 0, 0, 100)
         self.calc_brush_green = pg.mkBrush(0, 255, 0, 100)
@@ -110,11 +159,11 @@ class PointCloudLabeler(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
         
-        # Horizontal layout for two view columns.
+        # Two view columns.
         views_columns_layout = QHBoxLayout()
         main_layout.addLayout(views_columns_layout)
         
-        # Left Column: XY view and its slice controls.
+        # Left Column: XY view.
         left_column = QVBoxLayout()
         views_columns_layout.addLayout(left_column)
         self.xy_plot = pg.PlotWidget()
@@ -125,7 +174,7 @@ class PointCloudLabeler(QMainWindow):
         self.xy_plot.setMouseEnabled(x=True, y=True)
         left_column.addWidget(self.xy_plot)
         self.xy_plot.addItem(self.cursor_circle)
-        # XY slice controls (Z slice):
+        # XY slice controls.
         xy_controls = QHBoxLayout()
         self.z_center_widget, self.z_center_slider, self.z_center_spinbox = self.create_sync_slider_spinbox(
             "Z slice center:", self.z_min, self.z_max, (self.z_min+self.z_max)/2)
@@ -134,12 +183,11 @@ class PointCloudLabeler(QMainWindow):
         xy_controls.addWidget(self.z_center_widget)
         xy_controls.addWidget(self.z_thickness_widget)
         left_column.addLayout(xy_controls)
-        # --- Button to apply calculated labels in current XY slice ---
         self.apply_calc_xy_button = QPushButton("Apply Updated Labels to XY")
         self.apply_calc_xy_button.clicked.connect(self.apply_calculated_labels_xy)
         left_column.addWidget(self.apply_calc_xy_button)
         
-        # Right Column: XZ view and its slice controls (f_init slice).
+        # Right Column: XZ view.
         right_column = QVBoxLayout()
         views_columns_layout.addLayout(right_column)
         self.xz_plot = pg.PlotWidget()
@@ -157,12 +205,11 @@ class PointCloudLabeler(QMainWindow):
         xz_controls.addWidget(self.finit_center_widget)
         xz_controls.addWidget(self.finit_thickness_widget)
         right_column.addLayout(xz_controls)
-        # --- Button to apply calculated labels in current XZ slice ---
         self.apply_calc_xz_button = QPushButton("Apply Updated Labels to XZ")
         self.apply_calc_xz_button.clicked.connect(self.apply_calculated_labels_xz)
         right_column.addWidget(self.apply_calc_xz_button)
         
-        # Common Controls row.
+        # Common Controls.
         common_controls_layout = QHBoxLayout()
         main_layout.addLayout(common_controls_layout)
         self.radius_widget, self.radius_slider, self.radius_spinbox = self.create_sync_slider_spinbox(
@@ -198,7 +245,6 @@ class PointCloudLabeler(QMainWindow):
         label_save_layout.addWidget(QLabel("Label:"))
         label_save_layout.addWidget(self.label_spinbox)
         common_controls_layout.addLayout(label_save_layout)
-        # --- Buttons for updated label tools ---
         self.update_labels_button = QPushButton("Update Labels")
         self.update_labels_button.clicked.connect(self.update_labels)
         common_controls_layout.addWidget(self.update_labels_button)
@@ -215,13 +261,38 @@ class PointCloudLabeler(QMainWindow):
         self.save_graph_button = QPushButton("Save Labeled Graph")
         self.save_graph_button.clicked.connect(self.save_graph)
         common_controls_layout.addWidget(self.save_graph_button)
+        # Spline controls.
+        self.update_spline_button = QPushButton("Update Spline")
+        self.update_spline_button.clicked.connect(self.update_winding_splines)
+        common_controls_layout.addWidget(self.update_spline_button)
+        spline_min_layout = QHBoxLayout()
+        self.spline_min_points_spinbox = QSpinBox()
+        self.spline_min_points_spinbox.setRange(10, 10000)
+        self.spline_min_points_spinbox.setValue(100)
+        spline_min_label = QLabel("Min points for spline:")
+        spline_min_layout.addWidget(spline_min_label)
+        spline_min_layout.addWidget(self.spline_min_points_spinbox)
+        common_controls_layout.addLayout(spline_min_layout)
+        # New: Line distance threshold control.
+        line_dist_layout = QHBoxLayout()
+        self.line_distance_threshold_spinbox = QSpinBox()
+        self.line_distance_threshold_spinbox.setRange(1, 100)
+        self.line_distance_threshold_spinbox.setValue(4)
+        line_dist_label = QLabel("Line dist thresh:")
+        line_dist_layout.addWidget(line_dist_label)
+        line_dist_layout.addWidget(self.line_distance_threshold_spinbox)
+        common_controls_layout.addLayout(line_dist_layout)
+        self.spline_min_points_spinbox.valueChanged.connect(self.update_views)
+        # New: Assign Line Labels button.
+        self.assign_line_labels_button = QPushButton("Assign Line Labels")
+        self.assign_line_labels_button.clicked.connect(self.assign_line_labels)
+        common_controls_layout.addWidget(self.assign_line_labels_button)
         
         # Create scatter items.
         self.xy_scatter = pg.ScatterPlotItem(size=self.point_size, pen=None)
         self.xz_scatter = pg.ScatterPlotItem(size=self.point_size, pen=None)
         self.xy_plot.addItem(self.xy_scatter)
         self.xz_plot.addItem(self.xz_scatter)
-        # New scatter items for calculated labels (overlay)
         self.xy_calc_scatter = pg.ScatterPlotItem(size=self.point_size, pen=None)
         self.xz_calc_scatter = pg.ScatterPlotItem(size=self.point_size, pen=None)
         self.xy_plot.addItem(self.xy_calc_scatter)
@@ -239,7 +310,7 @@ class PointCloudLabeler(QMainWindow):
         self.update_views()
     
     # --------------------------
-    # Event filter for updating the cursor circle.
+    # Event filter for cursor circle.
     # --------------------------
     def eventFilter(self, source, event):
         if event.type() == QEvent.MouseMove and source is self.xy_plot.scene():
@@ -293,11 +364,10 @@ class PointCloudLabeler(QMainWindow):
                 QMessageBox.warning(self, "Load Data", f"Graph file not found at {gt_path}")
             new_points = self.solver.get_positions()
             self.points = np.array(new_points)
-            self.labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)  # discard old labels
+            self.labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
             self.kdtree_xy = cKDTree(self.points[:, [0,1]])
             self.kdtree_xz = cKDTree(self.points[:, [0,2]])
             self.update_views()
-            print(f"Loaded graph from {self.graph_path} for experiment {exp_name}")
         else:
             QMessageBox.warning(self, "Load Data", f"File {self.graph_path} does not exist.")
     
@@ -306,7 +376,6 @@ class PointCloudLabeler(QMainWindow):
         if fname:
             with open(fname, "w") as f:
                 f.write(str(self.labels.tolist()))
-            print(f"Labels saved to {fname}")
     
     def load_labels_from_path(self):
         fname, _ = QFileDialog.getOpenFileName(self, "Load Labels", os.path.join("experiments", self.default_experiment), "Text Files (*.txt);;All Files (*)")
@@ -321,7 +390,6 @@ class PointCloudLabeler(QMainWindow):
             if len(new_labels) == len(self.labels):
                 self.labels = new_labels
                 self.update_views()
-                print(f"Labels loaded from {fname}")
             else:
                 QMessageBox.warning(self, "Load Labels", "Loaded labels length does not match current data.")
     
@@ -331,35 +399,30 @@ class PointCloudLabeler(QMainWindow):
             "1. Views:\n"
             "   - Left (XY) view: horizontal axis = f_star; vertical axis = f_init (angular).\n"
             "     Grey dashed lines at f_init = -180 and 180 show the primary range.\n"
-            "     Grey dashed lines (from the right column) indicate the current f init slice (center and thickness).\n"
-            "     The shear indicator (orange dashed line) shows the shear angle (in degrees) used in the XZ view.\n"
+            "     Guides indicate the current f init slice and shear angle.\n"
             "   - Right (XZ) view: horizontal axis = f_star; vertical axis = Z.\n\n"
             "2. Slice Controls:\n"
-            "   - Left column: Adjust Z slice (center and thickness) to filter points for the XY view.\n"
-            "   - Right column: Adjust f init center and thickness to filter points for the XZ view.\n\n"
-            "3. Common Controls:\n"
-            "   - Drawing radius – a circle around the cursor shows the affected area.\n"
-            "   - Shear: in the XZ view, f_star' = f_star + tan(shear°)*(f_init - f init center).\n"
-            "   - Max Display Points for performance.\n"
-            "   - Toggle Drawing Mode; press and hold 'S' to temporarily disable drawing mode.\n"
-            "   - Toggle 'Show guides' to show/hide overlay indicator lines.\n"
-            "   - Pipette: click the Pipette button (or press 'P') and then click in either view to pick a label.\n"
-            "   - Update Labels: generates labels via the solver.\n"
-            "   - Save Labeled Graph: Saves the labeled graph as solved graph for further meshing.\n\n"
-            "4. Drawing (in the XY view):\n"
-            "   - Manual drawing applies the label from the Label spinbox.\n"
-            "   - If drawing in the virtual regions (f_init > 180 or < -180), the label is adjusted (+1 or -1).\n\n"
-            "5. Updated Label Tools:\n"
-            "   - Updated Labels Overlay: Points that are unlabeled but have a solver-computed label are shown in faded colors.\n"
-            "   - Updated Labels Draw Mode: Toggle this mode (via the 'Updated Labels Draw Mode' button) to allow drawing strokes that transfer\n"
-            "     the updated label (if available) onto points.\n"
-            "   - Clear Updated Labels: Clears all calculated labels.\n"
-            "   - Apply Updated Labels to XY/XZ: Under each view, these buttons copy all calculated labels (in the current slice)\n"
-            "     over to the manual labels for points that are still unlabeled.\n\n"
-            "6. Undo/Redo:\n"
-            "   - Press Ctrl+Z to undo; Ctrl+Y to redo.\n\n"
-            "7. Saving:\n"
-            "   - Use the Data menu to save or load labels.\n"
+            "   - Adjust Z slice (XY view) and f init slice (XZ view) using the sliders/spinboxes.\n\n"
+            "3. Drawing:\n"
+            "   - Manual drawing applies the label from the Label spinbox.\n\n"
+            "4. Updated Label Tools:\n"
+            "   - Update Labels: runs the solver to compute calculated labels.\n"
+            "   - Clear Updated Labels: clears calculated labels.\n"
+            "   - Apply Updated Labels to XY/XZ: copies calculated labels to manual labels in the current slice.\n\n"
+            "5. Spline Tool:\n"
+            "   - Update Spline: for each winding number with enough points (min points adjustable), local regression is performed\n"
+            "     at grid steps (step size 5) using points within ±5. Contiguous segments with changes <20 are drawn.\n"
+            "   - If splines for winding numbers i and i+1 (with i < i+1) overlap improperly (i.e. s_i(f_init) is not less than s_{i+1}(f_init)),\n"
+            "     grid points failing that ordering are removed (i.e. no line is drawn there).\n\n"
+            "6. Assign Line Labels:\n"
+            "   - A new parameter, 'Line dist thresh' (default 4), is used. When you press 'Assign Line Labels', for each point in the current XY slice\n"
+            "     that has a valid effective winding number and a calculated label, the code computes the minimum distance from the point to its own spline\n"
+            "     and to the splines of winding numbers ±1. The point’s manual label is updated only if its distance to its own spline is less than\n"
+            "     the threshold and is strictly lower than the distances to both neighbors. The number of points assigned is printed.\n\n"
+            "7. Undo/Redo:\n"
+            "   - Ctrl+Z to undo; Ctrl+Y to redo.\n\n"
+            "8. Saving:\n"
+            "   - Use the Data menu to save/load labels and to save the labeled graph.\n"
         )
         QMessageBox.information(self, "Tool Usage", help_text)
     
@@ -401,10 +464,12 @@ class PointCloudLabeler(QMainWindow):
             self.xz_scatter.setAcceptedMouseButtons(Qt.NoButton)
     
     # --------------------------
-    # Helper: return the displayed label for point index i using given y.
+    # Helper: return the displayed label for a point using given y.
     # --------------------------
     def displayed_label(self, i, y):
         lab = self.labels[i]
+        if abs(lab - self.UNLABELED) < 2:
+            lab = self.calculated_labels[i]
         if y < -180:
             return lab + 1
         elif y > 180:
@@ -587,7 +652,7 @@ class PointCloudLabeler(QMainWindow):
             else:
                 effective_y = y_m
                 update_label = current_label
-            if update_label == self.UNLABELED+1 or update_label == self.UNLABELED-1:
+            if update_label in [self.UNLABELED+1, self.UNLABELED-1]:
                 update_label = self.UNLABELED
             indices = self.get_nearby_indices_xy(x_m, y_m, r)
             z_center = self.z_center_spinbox.value()
@@ -626,14 +691,8 @@ class PointCloudLabeler(QMainWindow):
             z_max_val = z_center + z_thickness/2
             indices = [i for i in indices if self.points[i,2] >= z_min_val and self.points[i,2] <= z_max_val]
             for i in indices:
-                # Only update if manual label is unlabeled and a calculated label exists.
                 if self.labels[i] == self.UNLABELED and self.calculated_labels[i] != self.UNLABELED:
-                    if y_m > 180:
-                        self.labels[i] = self.calculated_labels[i]
-                    elif y_m < -180:
-                        self.labels[i] = self.calculated_labels[i]
-                    else:
-                        self.labels[i] = self.calculated_labels[i]
+                    self.labels[i] = self.calculated_labels[i]
         elif view_name == 'xz':
             indices = self.kdtree_xz.query_ball_point([x_m, y_m], r=r)
             finit_center = self.finit_center_spinbox.value()
@@ -650,7 +709,6 @@ class PointCloudLabeler(QMainWindow):
     # Update the views.
     # --------------------------
     def update_views(self):
-        # --- XY View: Filter by Z slice (manual labels) ---
         z_center = self.z_center_spinbox.value()
         z_thickness = self.z_thickness_slider.value()/self.scaleFactor
         z_min_val = z_center - z_thickness/2
@@ -679,7 +737,6 @@ class PointCloudLabeler(QMainWindow):
         self.xy_scatter.setData(x=pts_combined[:,0], y=pts_combined[:,1],
                                 size=self.point_size, pen=None, brush=brushes_xy)
         
-        # --- XZ View: Filter by f_init slice (manual labels) ---
         finit_center = self.finit_center_spinbox.value()
         finit_thickness = self.finit_thickness_slider.value()/self.scaleFactor
         finit_min_val = finit_center - finit_thickness/2
@@ -700,12 +757,9 @@ class PointCloudLabeler(QMainWindow):
         self.xz_scatter.setData(x=pts_xz_display[:,0], y=pts_xz_display[:,2],
                                 size=self.point_size, pen=None, brush=brushes_xz)
         
-        # --- Overlay: Calculated Labels in XY view ---
-        # Only display calculated label if manual label is UNLABELED and a calculated label exists.
         mask_calc = (np.abs(labels_combined - self.UNLABELED) <= 1) & (np.abs(calc_labels_combined - self.UNLABELED) > 1)
         pts_combined_calc = pts_combined[mask_calc]
         labels_combined_calc = calc_labels_combined[mask_calc]
-        # Create brushes for calculated labels (faded) based on mod.
         brushes_calc = np.empty(labels_combined_calc.shape[0], dtype=object)
         for i, lab in enumerate(labels_combined_calc):
             mod = lab % 3
@@ -719,7 +773,6 @@ class PointCloudLabeler(QMainWindow):
                                      y=pts_combined_calc[:,1] if pts_combined_calc.size else [],
                                      size=self.point_size, pen=None, brush=brushes_calc)
         
-        # --- Overlay: Calculated Labels in XZ view ---
         mask_xz = (self.points[:,1] >= finit_min_val) & (self.points[:,1] <= finit_max_val)
         pts_xz_full = self.points[mask_xz]
         manual_labels_xz = self.labels[mask_xz]
@@ -746,6 +799,254 @@ class PointCloudLabeler(QMainWindow):
         self.update_guides()
     
     # --------------------------
+    # Update winding splines in the XY view.
+    # --------------------------
+    def update_winding_splines(self):
+        for item in self.spline_items:
+            self.xy_plot.removeItem(item)
+        self.spline_items = []
+        self.spline_segments = {}
+        
+        z_center = self.z_center_spinbox.value()
+        z_thickness = self.z_thickness_slider.value() / self.scaleFactor
+        z_min_val = z_center - z_thickness / 2
+        z_max_val = z_center + z_thickness / 2
+        mask = (self.points[:, 2] >= z_min_val) & (self.points[:, 2] <= z_max_val)
+        pts = self.points[mask]
+        labels_xy = self.labels[mask]
+        calc_labels_xy = self.calculated_labels[mask]
+        
+        # Adjust f_init using -180/180 wrap-around and compute effective label.
+        f_init_adjusted = np.empty_like(pts[:, 1])
+        effective_labels = np.empty_like(labels_xy)
+        for i in range(len(pts)):
+            if pts[i, 1] < -180:
+                f_init_adjusted[i] = pts[i, 1] + 360
+            elif pts[i, 1] > 180:
+                f_init_adjusted[i] = pts[i, 1] - 360
+            else:
+                f_init_adjusted[i] = pts[i, 1]
+            base_label = labels_xy[i] if labels_xy[i] != self.UNLABELED else calc_labels_xy[i]
+            if base_label in [self.UNLABELED, self.UNLABELED + 1, self.UNLABELED - 1]:
+                effective_labels[i] = self.UNLABELED
+            else:
+                if pts[i, 1] < -180:
+                    effective_labels[i] = base_label - 1
+                elif pts[i, 1] > 180:
+                    effective_labels[i] = base_label + 1
+                else:
+                    effective_labels[i] = base_label
+        
+        valid = effective_labels != self.UNLABELED
+        if not np.any(valid):
+            return
+        f_init_valid = f_init_adjusted[valid]
+        f_star_valid = pts[valid, 0]
+        eff_labels_valid = effective_labels[valid]
+        
+        threshold = self.spline_min_points_spinbox.value()
+        step = 5
+        unique_labels = np.unique(eff_labels_valid)
+        # First, compute segments per effective winding.
+        temp_segments = {}
+        for ul in unique_labels:
+            indices = np.where(eff_labels_valid == ul)[0]
+            if len(indices) < threshold:
+                continue
+            x_label = f_init_valid[indices]
+            y_label = f_star_valid[indices]
+            grid_min = np.floor(x_label.min())
+            grid_max = np.ceil(x_label.max())
+            grid = np.arange(grid_min, grid_max + 1, step)
+            fitted_values = np.empty_like(grid, dtype=float)
+            valid_mask = np.zeros_like(grid, dtype=bool)
+            for i, g in enumerate(grid):
+                window = np.where(np.abs(x_label - g) <= step)[0]
+                if window.size > 0:
+                    if window.size >= 2:
+                        coeffs = np.polyfit(x_label[window], y_label[window], 1)
+                        fitted = np.polyval(coeffs, g)
+                    else:
+                        fitted = y_label[window[0]]
+                    if -5000 <= fitted <= 5000:
+                        fitted_values[i] = fitted
+                        valid_mask[i] = True
+                    else:
+                        valid_mask[i] = False
+                else:
+                    valid_mask[i] = False
+            valid_indices = np.where(valid_mask)[0]
+            if valid_indices.size == 0:
+                continue
+            segments = []
+            current_segment = [valid_indices[0]]
+            for idx in valid_indices[1:]:
+                if idx == current_segment[-1] + 1:
+                    if abs(fitted_values[idx] - fitted_values[current_segment[-1]]) < 20:
+                        current_segment.append(idx)
+                    else:
+                        if len(current_segment) >= 2:
+                            segments.append(current_segment)
+                        current_segment = [idx]
+                else:
+                    if len(current_segment) >= 2:
+                        segments.append(current_segment)
+                    current_segment = [idx]
+            if len(current_segment) >= 2:
+                segments.append(current_segment)
+            if not segments:
+                continue
+            temp_segments[ul] = (grid, fitted_values, segments)
+        
+        # Enforce ordering between splines.
+        sorted_ul = sorted(temp_segments.keys())
+        final_segments = {}
+        for i, ul in enumerate(sorted_ul):
+            grid, fitted_values, segments = temp_segments[ul]
+            new_segments = []
+            if i < len(sorted_ul) - 1:
+                neighbor_ul = sorted_ul[i+1]
+                n_grid, n_fitted, n_segments = temp_segments[neighbor_ul]
+                neighbor_points = []
+                for seg in n_segments:
+                    neighbor_points.append(np.column_stack((n_fitted[seg], n_grid[seg])))
+                if neighbor_points:
+                    neighbor_poly = np.vstack(neighbor_points)
+                    neighbor_poly = neighbor_poly[np.argsort(neighbor_poly[:,1])]
+                else:
+                    neighbor_poly = None
+            else:
+                neighbor_poly = None
+            for seg in segments:
+                seg_grid = grid[seg]
+                seg_current = fitted_values[seg]
+                valid_idx = []
+                for j in range(len(seg_grid)):
+                    valid_pt = True
+                    if neighbor_poly is not None:
+                        if seg_grid[j] >= neighbor_poly[:,1].min() and seg_grid[j] <= neighbor_poly[:,1].max():
+                            neighbor_val = np.interp(seg_grid[j], neighbor_poly[:,1], neighbor_poly[:,0])
+                            if seg_current[j] >= neighbor_val:
+                                valid_pt = False
+                    if valid_pt:
+                        valid_idx.append(j)
+                if valid_idx:
+                    valid_idx = np.array(valid_idx)
+                    grouped = []
+                    current = [valid_idx[0]]
+                    for k in valid_idx[1:]:
+                        if k == current[-1] + 1:
+                            current.append(k)
+                        else:
+                            if len(current) >= 2:
+                                grouped.append(current)
+                            current = [k]
+                    if len(current) >= 2:
+                        grouped.append(current)
+                    for group in grouped:
+                        # Fix: convert seg (a list) to a numpy array before indexing.
+                        new_seg = np.array(seg)[np.array(group)]
+                        new_segments.append(new_seg)
+            if new_segments:
+                final_segments[ul] = (grid, fitted_values, new_segments)
+        
+        # Store final_segments into self.spline_segments and draw.
+        for ul, (grid, fitted_values, segments) in final_segments.items():
+            self.spline_segments[ul] = []
+            mod = int(ul) % 3
+            if mod == 0:
+                color = (255, 0, 0)
+            elif mod == 1:
+                color = (0, 255, 0)
+            else:
+                color = (0, 0, 255)
+            pen = pg.mkPen(color=color, width=2)
+            for seg in segments:
+                seg_grid = grid[seg]
+                seg_fitted = fitted_values[seg]
+                if len(seg_grid) >= 2:
+                    spline_item = pg.PlotDataItem(x=seg_fitted, y=seg_grid, pen=pen)
+                    self.xy_plot.addItem(spline_item)
+                    self.spline_items.append(spline_item)
+                    polyline = np.column_stack((seg_fitted, seg_grid))
+                    self.spline_segments.setdefault(ul, []).append(polyline)
+    
+    # --------------------------
+    # Assign Line Labels.
+    # --------------------------
+    def assign_line_labels(self):
+        thresh = self.line_distance_threshold_spinbox.value()  # now a parameter (default 4)
+        z_center = self.z_center_spinbox.value()
+        z_thickness = self.z_thickness_slider.value() / self.scaleFactor
+        z_min_val = z_center - z_thickness/2
+        z_max_val = z_center + z_thickness/2
+        mask = (self.points[:,2] >= z_min_val) & (self.points[:,2] <= z_max_val)
+        pts = self.points[mask]
+        current_labels = self.labels[mask]
+        calc_labels = self.calculated_labels[mask]
+        
+        # Adjust f_init for wrap-around.
+        f_init_adjusted = pts[:,1].copy()
+        for i in range(len(pts)):
+            if pts[i,1] < -180:
+                f_init_adjusted[i] = pts[i,1] + 360
+            elif pts[i,1] > 180:
+                f_init_adjusted[i] = pts[i,1] - 360
+            else:
+                f_init_adjusted[i] = pts[i,1]
+        
+        # Compute effective winding numbers.
+        effective_labels = np.empty_like(current_labels)
+        for i in range(len(pts)):
+            base_label = current_labels[i] if current_labels[i] != self.UNLABELED else calc_labels[i]
+            if abs(base_label - self.UNLABELED) < 2:
+                effective_labels[i] = self.UNLABELED
+            else:
+                if pts[i,1] < -180:
+                    effective_labels[i] = base_label - 1
+                elif pts[i,1] > 180:
+                    effective_labels[i] = base_label + 1
+                else:
+                    effective_labels[i] = base_label
+        
+        valid_idx = np.where(effective_labels != self.UNLABELED)[0]
+        total_points = len(valid_idx)
+        progress = QProgressDialog("Assigning line labels...", "Cancel", 0, total_points, self)
+        progress.setWindowTitle("Progress")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+        
+        assign_count = 0
+        count = 0
+        for idx in valid_idx:
+            ul = effective_labels[idx]
+            if ul not in self.spline_segments:
+                count += 1
+                progress.setValue(count)
+                if progress.wasCanceled():
+                    break
+                continue
+            pt = np.array([pts[idx,0], f_init_adjusted[idx]])
+            d_self = np.min([vectorized_point_to_polyline_distance(pt, seg) for seg in self.spline_segments[ul]])
+            d_minus = np.inf
+            if (ul - 1) in self.spline_segments:
+                d_minus = np.min([vectorized_point_to_polyline_distance(pt, seg) for seg in self.spline_segments[ul-1]])
+            d_plus = np.inf
+            if (ul + 1) in self.spline_segments:
+                d_plus = np.min([vectorized_point_to_polyline_distance(pt, seg) for seg in self.spline_segments[ul+1]])
+            if d_self < thresh and d_self < d_minus and d_self < d_plus and calc_labels[idx] != self.UNLABELED:
+                global_idx = np.where(mask)[0][idx]
+                self.labels[global_idx] = calc_labels[idx]
+                assign_count += 1
+            count += 1
+            progress.setValue(count)
+            if progress.wasCanceled():
+                break
+        progress.close()
+        self.update_views()
+        print(f"Assigned line labels to {assign_count} points (threshold: {thresh}).")
+    
+    # --------------------------
     # Pipette: pick label at XY click.
     # --------------------------
     def pick_label_at(self, ev, plot_widget):
@@ -761,18 +1062,15 @@ class PointCloudLabeler(QMainWindow):
         indices = [i for i in indices if self.points[i,2] >= z_min_val and self.points[i,2] <= z_max_val]
         indices = np.array(indices)
         if indices.size == 0:
-            print("Pipette: no points found")
             return
         disp_labels = np.array([self.displayed_label(i, y) for i in indices])
         disp_labels = disp_labels[(disp_labels != self.UNLABELED) &
                                   (disp_labels != self.UNLABELED+1) &
                                   (disp_labels != self.UNLABELED-1)]
         if disp_labels.size == 0:
-            print("Pipette: no labeled points found")
             return
         vals, counts = np.unique(disp_labels, return_counts=True)
         mode_label = int(vals[np.argmax(counts)])
-        print(f"Pipette (XY): picked label {mode_label} from {disp_labels.size} points")
         self.label_spinbox.setValue(mode_label)
     
     # --------------------------
@@ -791,18 +1089,15 @@ class PointCloudLabeler(QMainWindow):
         indices = [i for i in indices if self.points[i,1] >= finit_min_val and self.points[i,1] <= finit_max_val]
         indices = np.array(indices)
         if indices.size == 0:
-            print("Pipette (XZ): no points found")
             return
         disp_labels = self.labels[indices]
         disp_labels = disp_labels[(disp_labels != self.UNLABELED) &
                                   (disp_labels != self.UNLABELED+1) &
                                   (disp_labels != self.UNLABELED-1)]
         if disp_labels.size == 0:
-            print("Pipette (XZ): no labeled points found")
             return
         vals, counts = np.unique(disp_labels, return_counts=True)
         mode_label = int(vals[np.argmax(counts)])
-        print(f"Pipette (XZ): picked label {mode_label} from {disp_labels.size} points")
         self.label_spinbox.setValue(mode_label)
     
     # --------------------------
@@ -810,7 +1105,6 @@ class PointCloudLabeler(QMainWindow):
     # --------------------------
     def activate_pipette(self):
         self.pipette_mode = True
-        print("Pipette mode activated. Click in the XY or XZ view to pick a label.")
     
     # --------------------------
     # Update Ground Truth.
@@ -819,7 +1113,6 @@ class PointCloudLabeler(QMainWindow):
         ground_truth = self.labels.tolist()
         with open("ground_truth.txt", "w") as f:
             f.write(str(ground_truth))
-        print("Ground truth updated. Saved to ground_truth.txt")
     
     # --------------------------
     # Update Labels.
@@ -827,17 +1120,14 @@ class PointCloudLabeler(QMainWindow):
     def update_labels(self):
         if self.solver is not None:
             gt = np.abs((self.labels - self.UNLABELED) > 2)
-            any_gt = np.any(gt)
-            if not any_gt:
-                print("No ground truth labels found.")
+            if not np.any(gt):
                 return
-            self.solver.set_labels(self.labels, gt)  # if applicable
-            print(f"Running winding number solver")
-            self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1, other_block_factor=15.0, side_fix_nr=-1, display=False)
+            self.solver.set_labels(self.labels, gt)
+            self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1,
+                                             other_block_factor=15.0, side_fix_nr=-1, display=False)
             calculated_labels = self.solver.get_labels()
             self.calculated_labels = np.array(calculated_labels)
             self.update_views()
-            print("Labels updated from solver.")
     
     # --------------------------
     # Save Labeled Graph.
@@ -845,10 +1135,9 @@ class PointCloudLabeler(QMainWindow):
     def save_graph(self):
         if self.solver is not None:
             gt = np.abs((self.labels - self.UNLABELED) > 2)
-            self.solver.set_labels(self.labels, gt)  # if applicable
+            self.solver.set_labels(self.labels, gt)
             graph_solved_path = self.graph_path.replace("graph.bin", "output_graph.bin")
             self.solver.save_solution(graph_solved_path)
-            print("Saved Labeled Graph.")
     
     # --------------------------
     # Undo/Redo functionality.
@@ -873,7 +1162,6 @@ class PointCloudLabeler(QMainWindow):
     def save_labels(self):
         labeled_data = np.hstack([self.points, self.labels.reshape(-1,1)])
         np.save("labeled_pointcloud.npy", labeled_data)
-        print("Labels saved to labeled_pointcloud.npy")
     
     # --------------------------
     # Toggle Calculated Draw Mode.
@@ -893,17 +1181,13 @@ class PointCloudLabeler(QMainWindow):
         if np.any(mask):
             self.labels[mask] = self.calculated_labels[mask]
             self.update_views()
-            print(f"Applied calculated labels to {np.sum(mask)} points.")
-        else:
-            print("No applicable calculated labels found.")
-
+    
     # --------------------------
     # Clear Calculated Labels.
     # --------------------------
     def clear_calculated_labels(self):
         self.calculated_labels[:] = self.UNLABELED
         self.update_views()
-        print("Calculated labels cleared.")
     
     # --------------------------
     # Apply Calculated Labels from XY slice to manual labels.
@@ -914,14 +1198,10 @@ class PointCloudLabeler(QMainWindow):
         z_min_val = z_center - z_thickness/2
         z_max_val = z_center + z_thickness/2
         mask = (self.points[:,2] >= z_min_val) & (self.points[:,2] <= z_max_val)
-        # Only apply where manual label is UNLABELED and a calculated label exists.
         indices = np.where(mask & (self.labels == self.UNLABELED) & (self.calculated_labels != self.UNLABELED))[0]
         if indices.size:
             self.labels[indices] = self.calculated_labels[indices]
             self.update_views()
-            print(f"Applied calculated labels to {indices.size} points in XY slice.")
-        else:
-            print("No applicable calculated labels found in current XY slice.")
     
     # --------------------------
     # Apply Calculated Labels from XZ slice to manual labels.
@@ -936,9 +1216,6 @@ class PointCloudLabeler(QMainWindow):
         if indices.size:
             self.labels[indices] = self.calculated_labels[indices]
             self.update_views()
-            print(f"Applied calculated labels to {indices.size} points in XZ slice.")
-        else:
-            print("No applicable calculated labels found in current XZ slice.")
     
     # --------------------------
     # Key events.
@@ -951,7 +1228,7 @@ class PointCloudLabeler(QMainWindow):
             self.xy_scatter.setAcceptedMouseButtons(Qt.NoButton)
             self.xz_scatter.setAcceptedMouseButtons(Qt.NoButton)
             event.accept()
-        elif event.key() == Qt.Key_U:  # <-- new shortcut for update labels draw mode
+        elif event.key() == Qt.Key_U:
             self.calc_draw_button.setChecked(not self.calc_drawing_mode)
             self.toggle_calc_draw_mode()
             time.sleep(0.1)
@@ -967,7 +1244,6 @@ class PointCloudLabeler(QMainWindow):
             event.accept()
         else:
             super(PointCloudLabeler, self).keyPressEvent(event)
-
     
     def keyReleaseEvent(self, event):
         if event.key() == Qt.Key_S and self.s_pressed:
@@ -988,7 +1264,7 @@ class PointCloudLabeler(QMainWindow):
 # --------------------------------------------------
 def main():
     app = QApplication(sys.argv)
-    gui = PointCloudLabeler()  # no initial point_data; load via Data menu
+    gui = PointCloudLabeler()
     gui.show()
     sys.exit(app.exec_())
 
