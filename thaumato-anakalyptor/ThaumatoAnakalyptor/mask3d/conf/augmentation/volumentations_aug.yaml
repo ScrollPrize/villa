@@ -23,7 +23,7 @@ transform:
           - 0.1
     - __class_fullname__: volumentations.augmentations.transforms.Flip3d
       always_apply: false
-      p: 0.5
+      p: 0.10
       axis:
         - 0  # Flips along the x-axis
         - 1  # Flips along the y-axis
