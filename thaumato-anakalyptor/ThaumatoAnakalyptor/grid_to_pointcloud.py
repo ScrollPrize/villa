@@ -497,8 +497,8 @@ class GridDataset(Dataset):
         recto_path = os.path.dirname(save_template_r) # full path
         print(f"Search paths in {verso_path}, {recto_path}")
         # list all files in the directories
-        verso_files = glob.glob(os.path.join(verso_path, '/*.ply'))
-        recto_files = glob.glob(os.path.join(recto_path, '/*.ply'))
+        verso_files = glob.glob(os.path.join(verso_path, '*.ply'))
+        recto_files = glob.glob(os.path.join(recto_path, '*.ply'))
         computed_blocks = set()
         for file in verso_files:
             x, y, z = file[:-4].split('/')[-1].split('_')[-3:]
