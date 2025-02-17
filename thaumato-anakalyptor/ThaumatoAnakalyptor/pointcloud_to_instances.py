@@ -778,28 +778,31 @@ class MyPredictionWriter(BasePredictionWriter):
             
             # Group the blocks (each block corresponds to one surface from the batch) by thread.
             # Round-robin assignment: block i is assigned to thread index = i % 4.
+            random_offset = np.random.randint(4)
             tasks_by_thread = {i: [] for i in range(4)}
             for i in range(len(surfaces)):
-                thread_idx = i % 4
+                thread_idx = (i + random_offset) % 4
                 tasks_by_thread[thread_idx].append((surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i]))
             
             # For each thread that has tasks, submit a single task that writes all its assigned blocks.
             for thread_idx, tasks in tasks_by_thread.items():
                 if tasks:
-                    self.executor.submit(self.async_save_batch, thread_idx, tasks, distance_threshold, n, alpha, slope_alpha)
+                    self.executor.submit(self.async_save_batch_h5, thread_idx, tasks, distance_threshold, n, alpha, slope_alpha)
         else:
-            if use_multiprocessing:
-                self.pool.map(save_block_ply_args, [(surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i],
-                                                     self.score_threshold, distance_threshold, n, alpha, slope_alpha, False,
-                                                     [0] * len(surfaces[i]), [[]] * len(surfaces[i]), True, use_7z)
-                                                    for i in range(len(surfaces))])
-            else:
-                for i in range(len(surfaces)):
-                    save_block_ply(surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i],
-                                   self.score_threshold, distance_threshold, n, alpha, slope_alpha, False,
-                                   [0] * len(surfaces[i]), [[]] * len(surfaces[i]), True, use_7z)
+            # Group the blocks (each block corresponds to one surface from the batch) by thread.
+            # Round-robin assignment: block i is assigned to thread index = i % 4.
+            random_offset = np.random.randint(4)
+            tasks_by_thread = {i: [] for i in range(4)}
+            for i in range(len(surfaces)):
+                thread_idx = (i + random_offset) % 4
+                tasks_by_thread[thread_idx].append((surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i]))
+            
+            # For each thread that has tasks, submit a single task that writes all its assigned blocks.
+            for thread_idx, tasks in tasks_by_thread.items():
+                if tasks:
+                    self.executor.submit(self.async_save_batch_tar, thread_idx, tasks, distance_threshold, n, alpha, slope_alpha, use_7z)
     
-    def async_save_batch(self, thread_idx, tasks, distance_threshold, n, alpha, slope_alpha):
+    def async_save_batch_h5(self, thread_idx, tasks, distance_threshold, n, alpha, slope_alpha):
         """
         This method runs in one of the fixed threads.
         It writes all blocks in 'tasks' to the intermediate HDF5 file corresponding to thread_idx.
@@ -811,6 +814,18 @@ class MyPredictionWriter(BasePredictionWriter):
                               surf, norm, col, scr, nname,
                               self.score_threshold, distance_threshold, n, alpha, slope_alpha,
                               False, [0] * len(surf), [[]] * len(surf))
+
+    def async_save_batch_tar(self, thread_idx, tasks, distance_threshold, n, alpha, slope_alpha, use_7z):
+        """
+        This method runs in one of the fixed threads.
+        It writes all blocks in 'tasks' to the intermediate HDF5 file corresponding to thread_idx.
+        Each task in tasks is a tuple: (surf, norm, col, scr, nname).
+        """
+        with self.interm_locks[thread_idx]:
+            for (surf, norm, col, scr, nname) in tasks:
+                save_block_ply(surf, norm, col, scr, nname,
+                              self.score_threshold, distance_threshold, n, alpha, slope_alpha, False,
+                                   [0] * len(surf), [[]] * len(surf), True, use_7z)
     
     def finalize(self):
         """
