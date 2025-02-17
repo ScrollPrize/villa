@@ -493,8 +493,11 @@ class GridDataset(Dataset):
         print("Updating computed blocks...")
         old_computed_blocks = self.load_computed_blocks(pointcloud_base)
         # directory of verso and recto
-        verso_files = glob.glob(save_template_v.replace("{0}", "*").replace("{1}", "*").replace("{2}", "*"))
-        recto_files = glob.glob(save_template_r.replace("{0}", "*").replace("{1}", "*").replace("{2}", "*"))
+        verso_path = save_template_v.replace("{0}", "*").replace("{1}", "*").replace("{2}", "*")
+        recto_path = save_template_r.replace("{0}", "*").replace("{1}", "*").replace("{2}", "*")
+        print(f"Search paths in {pointcloud_base}: {verso_path}, {recto_path}")
+        verso_files = glob.glob(verso_path)
+        recto_files = glob.glob(recto_path)
         computed_blocks = set()
         for file in verso_files:
             x, y, z = file.split('/')[-1].split('_')[:3]
