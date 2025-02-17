@@ -17,6 +17,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import BasePredictionWriter
 import torch.distributed as dist
 from tqdm import tqdm
+import atexit
 
 # show cuda devices
 print(torch.cuda.device_count())
@@ -759,6 +760,9 @@ class MyPredictionWriter(BasePredictionWriter):
                     pass
                 # Open each intermediate file in append mode.
                 self.intermediate_handles = [h5py.File(fname, "a") for fname in self.intermediate_filenames]
+                for intermediate_handle in self.intermediate_handles:
+                    atexit.register(intermediate_handle.close)
+                
                 # Create one lock per intermediate file.
                 self.interm_locks = [threading.Lock() for _ in range(4)]
             
