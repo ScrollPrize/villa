@@ -720,16 +720,13 @@ class MyPredictionWriter(BasePredictionWriter):
 
         # Prepare lists to hold gathered objects from each GPU.
         # The order is by global rank: index 0 will be rank 0, index 1 will be rank 1, etc.
-        all_batches = [None] * world_size
-
+        all_indices = [None] * world_size
         # Gather predictions and batch objects from all processes.
-        dist.all_gather_object(all_batches, batch)
-
+        dist.all_gather_object(all_indices, indxs)
+        
         # Only execute file writing on the master process.
         if trainer.is_global_zero:
-            for bat in all_batches:
-                # Unpack your batch info as defined in your dataset:
-                items_pytorch, points_batch, normals_batch, colors_batch, names_batch, indxs = bat
+            for indxs in all_indices:
                 indxs = list(indxs)
                 # filter out negative indices
                 indxs = [i for i in indxs if i >= 0]
