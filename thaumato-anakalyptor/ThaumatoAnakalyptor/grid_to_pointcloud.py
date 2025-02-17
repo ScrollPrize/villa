@@ -493,20 +493,17 @@ class GridDataset(Dataset):
         print("Updating computed blocks...")
         old_computed_blocks = self.load_computed_blocks(pointcloud_base)
         # directory of verso and recto
-        verso_path = os.path.dirname(save_template_v)
-        recto_path = os.path.dirname(save_template_r)
-        print(f"Search paths in {pointcloud_base}: {verso_path}, {recto_path}")
-        verso_files = glob.glob(verso_path)
-        recto_files = glob.glob(recto_path)
+        verso_path = os.path.dirname(save_template_v) # full path
+        recto_path = os.path.dirname(save_template_r) # full path
+        print(f"Search paths in {verso_path}, {recto_path}")
+        # list all files in the directories
+        verso_files = glob.glob(os.path.join(verso_path, '/*.ply'))
+        recto_files = glob.glob(os.path.join(recto_path, '/*.ply'))
         computed_blocks = set()
         for file in verso_files:
-            if not file.endswith('.ply'):
-                continue
             x, y, z = file[:-4].split('/')[-1].split('_')[-3:]
             computed_blocks.add((int(x)*self.grid_block_size, int(y)*self.grid_block_size, int(z)*self.grid_block_size))
         for file in recto_files:
-            if not file.endswith('.ply'):
-                continue
             x, y, z = file[:-4].split('/')[-1].split('_')[-3:]
             computed_blocks.add((int(x)*self.grid_block_size, int(y)*self.grid_block_size, int(z)*self.grid_block_size))
         print(f"Found {len(computed_blocks)} computed blocks. Where before there were {len(old_computed_blocks)}")
