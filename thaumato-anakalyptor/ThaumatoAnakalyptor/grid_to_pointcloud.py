@@ -495,7 +495,6 @@ class GridDataset(Dataset):
         # directory of verso and recto
         verso_path = os.path.dirname(save_template_v) # full path
         recto_path = os.path.dirname(save_template_r) # full path
-        print(f"Search paths in {verso_path}, {recto_path}")
         # list all files in the directories
         verso_files = glob.glob(os.path.join(verso_path, '*.ply'))
         recto_files = glob.glob(os.path.join(recto_path, '*.ply'))
