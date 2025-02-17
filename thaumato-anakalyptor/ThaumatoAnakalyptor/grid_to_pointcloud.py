@@ -473,7 +473,7 @@ class MyPredictionWriter(BasePredictionWriter):
                 f.write(str(block) + "\n")
 
 class GridDataset(Dataset):
-    def __init__(self, pointcloud_base, start_block, path_template, save_template_v, save_template_r, umbilicus_points, umbilicus_points_old, grid_block_size=200, recompute=False, fix_umbilicus=False, maximum_distance=-1, min_z=None, max_z=None):
+    def __init__(self, pointcloud_base, start_block, path_template, save_template_v, save_template_r, umbilicus_points, umbilicus_points_old, grid_block_size=200, recompute=False, fix_umbilicus=False, maximum_distance=-1, min_z=None, max_z=None, update_computed_blocks=False):
         self.min_z = min_z
         self.max_z = max_z
         if not hasattr(self, 'zarr_volume'):
@@ -481,11 +481,32 @@ class GridDataset(Dataset):
         self.grid_block_size = grid_block_size
         self.path_template = path_template
         self.umbilicus_points = umbilicus_points
+        if update_computed_blocks:
+            self.update_computed_blocks(pointcloud_base, save_template_v, save_template_r)
         self.blocks_to_process, blocks_processed = self.init_blocks_to_process(pointcloud_base, start_block, umbilicus_points, umbilicus_points_old, path_template, grid_block_size, recompute, fix_umbilicus, maximum_distance)
         self.blocks_to_process = self.filter_blocks_to_process(self.blocks_to_process)
         print(f"Found {len(self.blocks_to_process)} blocks to process. And {len(blocks_processed)} blocks already processed.")
 
         self.writer = MyPredictionWriter(blocks_processed, pointcloud_base, save_template_v, save_template_r, grid_block_size=grid_block_size)
+
+    def update_computed_blocks(self, pointcloud_base, save_template_v, save_template_r):
+        print("Updating computed blocks...")
+        old_computed_blocks = self.load_computed_blocks(pointcloud_base)
+        # directory of verso and recto
+        verso_files = glob.glob(os.path.join(pointcloud_base, save_template_v.replace("{0}", "*").replace("{1}", "*").replace("{2}", "*")))
+        recto_files = glob.glob(os.path.join(pointcloud_base, save_template_r.replace("{0}", "*").replace("{1}", "*").replace("{2}", "*")))
+        computed_blocks = set()
+        for file in verso_files:
+            x, y, z = file.split('/')[-1].split('_')[:3]
+            computed_blocks.add((int(x), int(y), int(z)))
+        for file in recto_files:
+            x, y, z = file.split('/')[-1].split('_')[:3]
+            computed_blocks.add((int(x), int(y), int(z)))
+        print(f"Found {len(computed_blocks)} computed blocks. Where before there were {len(old_computed_blocks)}")
+        # save the computed blocks
+        with open(os.path.join(pointcloud_base, "computed_blocks.txt"), "w") as f:
+            for block in computed_blocks:
+                f.write(str(block) + "\n")
         
     def init_blocks_to_process(self, pointcloud_base, start_block, umbilicus_points, umbilicus_points_old, path_template, grid_block_size, recompute, fix_umbilicus, maximum_distance):
         # Load the set of computed blocks
@@ -624,10 +645,10 @@ class GridDataset(Dataset):
         return block_tensor, reference_vector_tensor, corner_coords, self.grid_block_size, padding
     
 class ZarrDataset(GridDataset):
-    def __init__(self, pointcloud_base, start_block, path_template, save_template_v, save_template_r, umbilicus_points, umbilicus_points_old, grid_block_size=200, recompute=False, fix_umbilicus=False, maximum_distance=-1, min_z=None, max_z=None):
+    def __init__(self, pointcloud_base, start_block, path_template, save_template_v, save_template_r, umbilicus_points, umbilicus_points_old, grid_block_size=200, recompute=False, fix_umbilicus=False, maximum_distance=-1, min_z=None, max_z=None, update_computed_blocks=False):
         self.zarr_volume = zarr.open(path_template, mode='r')
         self.zarr_volume = self.zarr_volume[0]
-        super().__init__(pointcloud_base, start_block, path_template, save_template_v, save_template_r, umbilicus_points, umbilicus_points_old, grid_block_size=grid_block_size, recompute=recompute, fix_umbilicus=fix_umbilicus, maximum_distance=maximum_distance, min_z=min_z, max_z=max_z)
+        super().__init__(pointcloud_base, start_block, path_template, save_template_v, save_template_r, umbilicus_points, umbilicus_points_old, grid_block_size=grid_block_size, recompute=recompute, fix_umbilicus=fix_umbilicus, maximum_distance=maximum_distance, min_z=min_z, max_z=max_z, update_computed_blocks=update_computed_blocks)
 
     def blocks_to_compute(self, start_coord, computed_blocks, umbilicus_points, umbilicus_points_old, path_template, grid_block_size, recompute, fix_umbilicus, maximum_distance):
         print("Using zarr dataset")
@@ -655,7 +676,6 @@ class ZarrDataset(GridDataset):
                 blocks_processed.add(corner_coords)
             else: # Recompute if wasn't computed or recompute flag is set
                 if corner_coords[0] < 500 or corner_coords[1] < 500 or corner_coords[2] < 500 or corner_coords[0] - 500 > y_height or corner_coords[1] - 500 > x_height or corner_coords[2] - 500 > z_height:
-                    blocks_processed.add(corner_coords)
                     # Outside of the scroll, don't add neighbors
                     continue
                 # this next check comes after the empty check, else under certain umbilicus distances, there might be an infinite loop
@@ -742,11 +762,11 @@ class PointCloudModel(pl.LightningModule):
 
         return (points_r_tensors, normals_r_tensors), (points_v_tensors, normals_v_tensors), corner_coordss
     
-def grid_inference(pointcloud_base, start_block, path_template, save_template_v, save_template_r, umbilicus_points, umbilicus_points_old, grid_block_size=200, recompute=False, fix_umbilicus=False, maximum_distance=-1, batch_size=1, min_z=None, max_z=None):
+def grid_inference(pointcloud_base, start_block, path_template, save_template_v, save_template_r, umbilicus_points, umbilicus_points_old, grid_block_size=200, recompute=False, fix_umbilicus=False, maximum_distance=-1, batch_size=1, min_z=None, max_z=None, update_computed_blocks=False):
     if path_template.endswith(".zarr"):
-        dataset = ZarrDataset(pointcloud_base, start_block, path_template, save_template_v, save_template_r, umbilicus_points, umbilicus_points_old, grid_block_size=grid_block_size, recompute=recompute, fix_umbilicus=fix_umbilicus, maximum_distance=maximum_distance, min_z=min_z, max_z=max_z)
+        dataset = ZarrDataset(pointcloud_base, start_block, path_template, save_template_v, save_template_r, umbilicus_points, umbilicus_points_old, grid_block_size=grid_block_size, recompute=recompute, fix_umbilicus=fix_umbilicus, maximum_distance=maximum_distance, min_z=min_z, max_z=max_z, update_computed_blocks=update_computed_blocks)
     else:
-        dataset = GridDataset(pointcloud_base, start_block, path_template, save_template_v, save_template_r, umbilicus_points, umbilicus_points_old, grid_block_size=grid_block_size, recompute=recompute, fix_umbilicus=fix_umbilicus, maximum_distance=maximum_distance, min_z=min_z, max_z=max_z)
+        dataset = GridDataset(pointcloud_base, start_block, path_template, save_template_v, save_template_r, umbilicus_points, umbilicus_points_old, grid_block_size=grid_block_size, recompute=recompute, fix_umbilicus=fix_umbilicus, maximum_distance=maximum_distance, min_z=min_z, max_z=max_z, update_computed_blocks=update_computed_blocks)
     num_threads = multiprocessing.cpu_count() // int(1.5 * int(CFG['GPUs']))
     num_treads_for_gpus = 5
     num_workers = min(num_threads, num_treads_for_gpus)
@@ -764,7 +784,7 @@ def grid_inference(pointcloud_base, start_block, path_template, save_template_v,
     
     return
 
-def compute(disk_load_save, base_path, volume_subpath, pointcloud_subpath, maximum_distance, recompute, fix_umbilicus, start_block, num_threads, gpus, skip_surface_blocks, min_z, max_z):
+def compute(disk_load_save, base_path, volume_subpath, pointcloud_subpath, maximum_distance, recompute, fix_umbilicus, start_block, num_threads, gpus, skip_surface_blocks, min_z, max_z, update_computed_blocks):
     # Initialize CUDA context
     # _ = torch.tensor([0.0]).cuda()
     # try:
@@ -828,7 +848,7 @@ def compute(disk_load_save, base_path, volume_subpath, pointcloud_subpath, maxim
     # (2600, 2200, 5000)
     if not skip_surface_blocks:
         # compute_surface_for_block_multiprocessing(start_block, pointcloud_base, path_template, save_template_v, save_template_r, umbilicus_points, grid_block_size=200, recompute=recompute, fix_umbilicus=fix_umbilicus, umbilicus_points_old=umbilicus_points_old, maximum_distance=maximum_distance)
-        grid_inference(pointcloud_base, start_block, path_template, save_template_v, save_template_r, umbilicus_raw_points, umbilicus_raw_points_old, grid_block_size=200, recompute=recompute, fix_umbilicus=fix_umbilicus, maximum_distance=maximum_distance, batch_size=1*int(CFG['GPUs']), min_z=min_z, max_z=max_z)
+        grid_inference(pointcloud_base, start_block, path_template, save_template_v, save_template_r, umbilicus_raw_points, umbilicus_raw_points_old, grid_block_size=200, recompute=recompute, fix_umbilicus=fix_umbilicus, maximum_distance=maximum_distance, batch_size=1*int(CFG['GPUs']), min_z=min_z, max_z=max_z, update_computed_blocks=update_computed_blocks)
     else:
         print("Skipping surface block computation.")
 
@@ -867,6 +887,7 @@ def main():
     parser.add_argument("--gpus", type=int, help="Number of GPUs to use", default=CFG['GPUs'])
     parser.add_argument("--skip_surface_blocks", action='store_true', help="Flag, skip the surface block computation")
     parser.add_argument('--sheet_z_range', type=int, nargs=2,help='Z range of segmentation', default=[None, None])
+    parser.add_argument('--update_computed_blocks', action='store_true', help='Update the computed blocks file')
 
     # only parse known args for PL multi GPU DDP setup to work
     args, unknown = parser.parse_known_args()
@@ -887,7 +908,7 @@ def main():
     skip_surface_blocks = args.skip_surface_blocks
     
     # Compute the surface points
-    compute(disk_load_save, base_path, volume_subpath, pointcloud_subpath, maximum_distance, recompute, fix_umbilicus, start_block, args.num_threads, args.gpus, skip_surface_blocks, args.sheet_z_range[0], args.sheet_z_range[1])
+    compute(disk_load_save, base_path, volume_subpath, pointcloud_subpath, maximum_distance, recompute, fix_umbilicus, start_block, args.num_threads, args.gpus, skip_surface_blocks, args.sheet_z_range[0], args.sheet_z_range[1], args.update_computed_blocks)
 
 if __name__ == "__main__":
     main()
