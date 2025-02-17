@@ -504,7 +504,7 @@ class GridDataset(Dataset):
             computed_blocks.add((int(x)*self.grid_block_size, int(y)*self.grid_block_size, int(z)*self.grid_block_size))
         for file in recto_files:
             x, y, z = file[:-4].split('/')[-1].split('_')[-3:]
-            computed_blocks.add((int(x)*self.grid_block_size, int(y)*self.grid_block_size, int(z)*self.grid_block_size)))
+            computed_blocks.add((int(x)*self.grid_block_size, int(y)*self.grid_block_size, int(z)*self.grid_block_size))
         print(f"Found {len(computed_blocks)} computed blocks. Where before there were {len(old_computed_blocks)}")
         # save the computed blocks
         with open(os.path.join(pointcloud_base, "computed_blocks.txt"), "w") as f:
