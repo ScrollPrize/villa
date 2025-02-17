@@ -164,6 +164,9 @@ def save_block_ply(block_points, block_normals, block_colors, block_scores, bloc
     # print(f"Saving {block_name}")
     if check_exist and os.path.exists(block_name + '.7z'):
         return
+    # Check if tar exists
+    if check_exist and os.path.exists(block_name + '.tar'):
+        return
 
     # Save to a temporary file first to ensure data integrity
     temp_block_name = block_name + "_temp"
@@ -203,6 +206,9 @@ def save_block_ply(block_points, block_normals, block_colors, block_scores, bloc
     # Delete the temporary 7z file if it exists
     if os.path.exists(temp_block_name + '.7z'):
         os.remove(temp_block_name + '.7z')
+    # Delete the temporary tar file if it exists
+    if os.path.exists(temp_block_name + '.tar'):
+        os.remove(temp_block_name + '.tar')
 
     used_name_block = block_name if os.path.exists(block_name) else temp_block_name
 
@@ -628,7 +634,8 @@ class MyPredictionWriter(BasePredictionWriter):
                  fix_umbilicus=True, umbilicus_points_path="", 
                  start=[0, 0, 0], stop=[16, 17, 29], size=[3, 3, 3], 
                  umbilicus_distance_threshold=1500, score_threshold=0.5, 
-                 batch_size=4, gpus=1, num_processes=4):  # num_processes=4 for 4 writer threads
+                 batch_size=4, gpus=1, num_processes=4,
+                 use_h5=False, use_7z=False):  # num_processes=4 for 4 writer threads
         super().__init__(write_interval="batch")  # or "epoch" for end of an epoch
         self.num_threads = multiprocessing.cpu_count()
         self.pool = multiprocessing.Pool(processes=self.num_threads)  # Initialize once
@@ -647,6 +654,8 @@ class MyPredictionWriter(BasePredictionWriter):
         self.score_threshold = score_threshold
         self.batch_size = batch_size
         self.gpus = gpus
+        self.use_h5 = use_h5
+        self.use_7z = use_7z
 
         # Create a fixed thread pool of 4 threads.
         self.executor = ThreadPoolExecutor(max_workers=4)
@@ -702,7 +711,8 @@ class MyPredictionWriter(BasePredictionWriter):
                 colors_batch,
                 names_batch,
                 use_multiprocessing=False,  # Change to True if preferred.
-                use_h5=True
+                use_h5=self.use_h5,
+                use_7z=self.use_7z
             )
         
         # Determine world size (if not distributed, this will be 1)
@@ -728,7 +738,7 @@ class MyPredictionWriter(BasePredictionWriter):
     
     def post_process(self, res, items_pytorch, points_batch, normals_batch, colors_batch, names_batch, 
                      use_multiprocessing=False, distance_threshold=10.0, n=4, alpha=1000.0, 
-                     slope_alpha=0.1, use_h5=True):
+                     slope_alpha=0.1, use_h5=True, use_7z=False):
         if res is None:
             print("batch_inference result is None")
             res = [{"pred_classes": []}] * len(items_pytorch)
@@ -781,13 +791,13 @@ class MyPredictionWriter(BasePredictionWriter):
             if use_multiprocessing:
                 self.pool.map(save_block_ply_args, [(surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i],
                                                      self.score_threshold, distance_threshold, n, alpha, slope_alpha, False,
-                                                     [0] * len(surfaces[i]), [[]] * len(surfaces[i]))
+                                                     [0] * len(surfaces[i]), [[]] * len(surfaces[i]), True, use_7z)
                                                     for i in range(len(surfaces))])
             else:
                 for i in range(len(surfaces)):
                     save_block_ply(surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i],
                                    self.score_threshold, distance_threshold, n, alpha, slope_alpha, False,
-                                   [0] * len(surfaces[i]), [[]] * len(surfaces[i]))
+                                   [0] * len(surfaces[i]), [[]] * len(surfaces[i]), True, use_7z)
     
     def async_save_batch(self, thread_idx, tasks, distance_threshold, n, alpha, slope_alpha):
         """
@@ -828,8 +838,10 @@ class MyPredictionWriter(BasePredictionWriter):
             print(f"Final merged HDF5 file: {self.final_filename}")
 
 class PointCloudDataset(Dataset):
-    def __init__(self, path="/media/julian/FastSSD/scroll3_surface_points", folder="point_cloud_colorized", dest="/media/julian/HDD8TB/scroll3_surface_points", main_drive="", alternative_drives=[], fix_umbilicus=True, umbilicus_points_path="", start=[0, 0, 0], stop=[16, 17, 29], size = [3, 3, 3], umbilicus_distance_threshold=1500, score_threshold=0.5, batch_size=4, gpus=1, num_processes=3, recompute=False, rotate=False, overlap_denumerator=3):
-        self.writer = MyPredictionWriter(path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points_path, start, stop, size, umbilicus_distance_threshold, score_threshold, batch_size, gpus, num_processes)
+    def __init__(self, path="/media/julian/FastSSD/scroll3_surface_points", folder="point_cloud_colorized", dest="/media/julian/HDD8TB/scroll3_surface_points", main_drive="", alternative_drives=[], fix_umbilicus=True, umbilicus_points_path="", 
+                 start=[0, 0, 0], stop=[16, 17, 29], size = [3, 3, 3], umbilicus_distance_threshold=1500, score_threshold=0.5, batch_size=4, gpus=1, num_processes=3, recompute=False, rotate=False, overlap_denumerator=3,
+                 use_h5=False, use_7z=False):
+        self.writer = MyPredictionWriter(path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points_path, start, stop, size, umbilicus_distance_threshold, score_threshold, batch_size, gpus, num_processes, use_h5=use_h5, use_7z=use_7z)
         self.rotate = rotate
         self.R = np.eye(3) if not self.rotate else get_optimized_rotation_matrix((45, 45, 45))
         self.overlap_denumerator = overlap_denumerator
@@ -1027,7 +1039,7 @@ def custom_collate_fn(batches):
     # Return a single batch containing all aggregated items
     return items_pytorch_agg, points_batch_agg, normals_batch_agg, colors_batch_agg, names_batch_agg, indxs_agg
 
-def pointcloud_inference(path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points_path, start, stop, size, umbilicus_distance_threshold, score_threshold, batch_size, gpus, recompute, overlap_denumerator):
+def pointcloud_inference(path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points_path, start, stop, size, umbilicus_distance_threshold, score_threshold, batch_size, gpus, recompute, overlap_denumerator, use_h5, use_7z):
     init()
     model = get_model()
     # model = torch.nn.DataParallel(model)
@@ -1035,7 +1047,7 @@ def pointcloud_inference(path, folder, dest, main_drive, alternative_drives, fix
     # compile the model for faster inference
     # model = torch.compile(model) # too low torch version
 
-    dataset = PointCloudDataset(path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points_path, start, stop, size, umbilicus_distance_threshold, score_threshold, batch_size, recompute=recompute, overlap_denumerator=overlap_denumerator)
+    dataset = PointCloudDataset(path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points_path, start, stop, size, umbilicus_distance_threshold, score_threshold, batch_size, recompute=recompute, overlap_denumerator=overlap_denumerator, use_h5=use_h5, use_7z=use_7z)
     dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=custom_collate_fn, shuffle=False, num_workers=24, prefetch_factor=5)  # Adjust num_workers as per your system
     # dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=24, prefetch_factor=3)  # Adjust num_workers as per your system
 
@@ -1046,8 +1058,9 @@ def pointcloud_inference(path, folder, dest, main_drive, alternative_drives, fix
     # Run prediction
     trainer.predict(model, dataloaders=dataloader, return_predictions=False)
     print("Prediction done")
-    writer.finalize()
-    print("Finalize done")
+    if use_h5:
+        writer.finalize()
+        print("Finalize done")
 
 def main():
     side = "_verso" # actually recto
@@ -1085,7 +1098,9 @@ def main():
     parser.add_argument("--z_min", type=int, help="Minimum slice index for computation", default=-500)
     parser.add_argument("--z_max", type=int, help="Maximum slice index for computation", default=50000)
     parser.add_argument("--overlap_denumerator", type=int, help="Denominator for overlap of subvolumes", default=overlap_denumerator)
-    
+    parser.add_argument("--use_h5", action='store_true', help="Flag, use HDF5 as storage (Tar default).")
+    parser.add_argument("--use_7z", action='store_true', help="Flag, use 7z as storage (Tar default).")
+
     # Parse the arguments
     args, unknown = parser.parse_known_args()
     path = args.path
@@ -1104,13 +1119,17 @@ def main():
     z_start = int((args.z_min +500)//200)
     z_end = int((args.z_max +500)//200)
     overlap_denumerator = args.overlap_denumerator
+    use_h5 = args.use_h5
+    use_7z = args.use_7z
 
     # import sys
     # # Remove command-line arguments for later internal calls to Mask3D
     # sys.argv = [sys.argv[0]]
 
     # Compute the surface patches
-    pointcloud_inference(path, folder, dest, main_drive, alternative_ply_drives, fix_umbilicus, umbilicus_points_path, [0, 0, z_start], [100, 100, z_end], [pointcloud_size, pointcloud_size, pointcloud_size], umbilicus_distance_threshold, score_threshold, batch_size, gpus, recompute, overlap_denumerator)
+    pointcloud_inference(path, folder, dest, main_drive, alternative_ply_drives, fix_umbilicus, umbilicus_points_path, [0, 0, z_start], [100, 100, z_end], 
+                         [pointcloud_size, pointcloud_size, pointcloud_size], umbilicus_distance_threshold, score_threshold, batch_size, gpus, recompute, overlap_denumerator,
+                        use_h5, use_7z)
     
 if __name__ == "__main__":
     main()
