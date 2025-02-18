@@ -1130,10 +1130,10 @@ def process_block(args):
                 if len(score_sheets_patch) > 0:
                     # sort and take top 3
                     score_sheets_patch = sorted(score_sheets_patch, key=lambda x: x[2], reverse=True)
-                    max_ind = min(3, len(score_sheets_patch))
+                    max_ind = min(2, len(score_sheets_patch))
                     score_sheets_patch = score_sheets_patch[:max_ind]
                     # score_sheets_patch = max(score_sheets_patch, key=lambda x: x[2])
-                    score_sheets.append(score_sheets_patch)
+                    score_sheets.extend(score_sheets_patch)
         
         score_switching_sheets, score_bad_edges = process_same_block(main_block_patches_list, overlapp_threshold, umbilicus_distance)
 
