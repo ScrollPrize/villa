@@ -507,9 +507,13 @@ class GridDataset(Dataset):
             computed_blocks.add((int(x)*self.grid_block_size, int(y)*self.grid_block_size, int(z)*self.grid_block_size))
         print(f"Found {len(computed_blocks)} computed blocks. Where before there were {len(old_computed_blocks)}")
         # save the computed blocks
-        with open(os.path.join(pointcloud_base, "computed_blocks.txt"), "w") as f:
-            for block in computed_blocks:
-                f.write(str(block) + "\n")
+        if computed_blocks != old_computed_blocks:
+            print("Saving updated computed blocks...")
+            with open(os.path.join(pointcloud_base, "computed_blocks.txt"), "w") as f:
+                for block in computed_blocks:
+                    f.write(str(block) + "\n")
+        else:
+            print("No change in computed blocks.")
         
     def init_blocks_to_process(self, pointcloud_base, start_block, umbilicus_points, umbilicus_points_old, path_template, grid_block_size, recompute, fix_umbilicus, maximum_distance):
         # Load the set of computed blocks
