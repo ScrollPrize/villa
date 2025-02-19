@@ -796,9 +796,7 @@ class MyPredictionWriter(BasePredictionWriter):
             
             # For each thread that has tasks, submit a single task that writes all its assigned blocks.
             for thread_idx, tasks in tasks_by_thread.items():
-                print("submitting items 1")
                 if tasks:
-                    print("submitting items 2")
                     self.executor.submit(self.async_save_batch_tar, thread_idx, tasks, distance_threshold, n, alpha, slope_alpha, use_7z)
     
     def async_save_batch_h5(self, thread_idx, tasks, distance_threshold, n, alpha, slope_alpha):
@@ -820,13 +818,10 @@ class MyPredictionWriter(BasePredictionWriter):
         It writes all blocks in 'tasks' to the intermediate HDF5 file corresponding to thread_idx.
         Each task in tasks is a tuple: (surf, norm, col, scr, nname).
         """
-        print("async_save_batch_tar")
-        with self.interm_locks[thread_idx]:
-            print("saving tar")
-            for (surf, norm, col, scr, nname) in tasks:
-                save_block_ply(surf, norm, col, scr, nname,
-                              self.score_threshold, distance_threshold, n, alpha, slope_alpha, False,
-                                   [0] * len(surf), [[]] * len(surf), True, use_7z)
+        for (surf, norm, col, scr, nname) in tasks:
+            save_block_ply(surf, norm, col, scr, nname,
+                            self.score_threshold, distance_threshold, n, alpha, slope_alpha, False,
+                                [0] * len(surf), [[]] * len(surf), True, use_7z)
     
     def finalize(self):
         """
