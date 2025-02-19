@@ -819,6 +819,7 @@ class MyPredictionWriter(BasePredictionWriter):
         Each task in tasks is a tuple: (surf, norm, col, scr, nname).
         """
         with self.interm_locks[thread_idx]:
+            print("saving tar")
             for (surf, norm, col, scr, nname) in tasks:
                 save_block_ply(surf, norm, col, scr, nname,
                               self.score_threshold, distance_threshold, n, alpha, slope_alpha, False,
