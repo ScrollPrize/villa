@@ -684,7 +684,18 @@ class MyPredictionWriter(BasePredictionWriter):
             with open(self.progress_file, 'r') as file:
                 progress = json.load(file)
                 if 'config' in progress:
-                    if progress['config'] != self.config:
+                    progress_config = progress['config']
+                    # delete batch size
+                    if 'batch_size' in progress_config:
+                        del progress_config['batch_size']
+                    if 'batch_size' in self.config:
+                        del self.config['batch_size']
+                    # delete gpus
+                    if 'gpus' in progress_config:
+                        del progress_config['gpus']
+                    if 'gpus' in self.config:
+                        del self.config['gpus']
+                    if progress_config != self.config:
                         print("Progress file found but with different config. Overwriting.")
                     else:
                         print("Progress file found with same config. Resuming computation.")
@@ -901,7 +912,18 @@ class PointCloudDataset(Dataset):
             with open(self.progress_file, 'r') as file:
                 progress = json.load(file)
                 if 'config' in progress:
-                    if progress['config'] != self.config:
+                    progress_config = progress['config']
+                    # delete batch size
+                    if 'batch_size' in progress_config:
+                        del progress_config['batch_size']
+                    if 'batch_size' in self.config:
+                        del self.config['batch_size']
+                    # delete gpus
+                    if 'gpus' in progress_config:
+                        del progress_config['gpus']
+                    if 'gpus' in self.config:
+                        del self.config['gpus']
+                    if progress_config != self.config:
                         print("Progress file found but with different config. Overwriting.")
                     else:
                         print("Progress file found with same config. Resuming computation.")
