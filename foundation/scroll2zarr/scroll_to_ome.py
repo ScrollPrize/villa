@@ -800,7 +800,11 @@ def main():
         volume_type = "surface_volume" if os.path.basename(tiffdir) == "layers" else "scroll_volume"
         standard_config = get_standard_config(tiffdir, args.output, volume_type)
     else:
-        standard_config = {'zarr_dir': args.output}
+        if Path(args.output).suffix != ".zarr":
+            standard_config_ = get_standard_config(tiffdir, args.output, volume_type)
+            standard_config = {'zarr_dir': standard_config_['zarr_dir']}
+        else:
+            standard_config = {'zarr_dir': args.output}
     # N bits to use for the output data
     standard_config['n_bits'] = n_bits
     # Standardize flag

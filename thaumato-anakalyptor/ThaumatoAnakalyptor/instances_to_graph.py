@@ -1128,9 +1128,10 @@ def process_block(args):
 
                 # Find the best score for each main block patch
                 if len(score_sheets_patch) > 0:
-                    # sort and take top 3
+                    # sort and take top_n
+                    top_n = 1
                     score_sheets_patch = sorted(score_sheets_patch, key=lambda x: x[2], reverse=True)
-                    max_ind = min(2, len(score_sheets_patch))
+                    max_ind = min(top_n, len(score_sheets_patch))
                     score_sheets_patch = score_sheets_patch[:max_ind]
                     # score_sheets_patch = max(score_sheets_patch, key=lambda x: x[2])
                     score_sheets.extend(score_sheets_patch)
