@@ -212,7 +212,6 @@ def save_block_ply(block_points, block_normals, block_colors, block_scores, bloc
 
     used_name_block = block_name if os.path.exists(block_name) else temp_block_name
 
-
     archive_name_type = temp_block_name + '.7z' if use_7z else temp_block_name + '.tar'
     block_name_type = block_name + '.7z' if use_7z else block_name + '.tar'
     if use_7z:
@@ -625,6 +624,9 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import torch.distributed as dist
 
+##########################################
+#  Modified Prediction Writer Class      #
+##########################################
 class MyPredictionWriter(BasePredictionWriter):
     def __init__(self, 
                  path="/media/julian/FastSSD/scroll3_surface_points", 
@@ -635,7 +637,8 @@ class MyPredictionWriter(BasePredictionWriter):
                  start=[0, 0, 0], stop=[16, 17, 29], size=[3, 3, 3], 
                  umbilicus_distance_threshold=1500, score_threshold=0.5, 
                  batch_size=4, gpus=1, num_processes=4,
-                 use_h5=False, use_7z=False):  # num_processes=4 for 4 writer threads
+                 use_h5=False, use_7z=False,
+                 overlap_denumerator=3):  # added overlap_denumerator parameter
         super().__init__(write_interval="batch")  # or "epoch" for end of an epoch
         self.num_threads = multiprocessing.cpu_count()
         self.pool = multiprocessing.Pool(processes=self.num_threads)  # Initialize once
@@ -656,6 +659,7 @@ class MyPredictionWriter(BasePredictionWriter):
         self.gpus = gpus
         self.use_h5 = use_h5
         self.use_7z = use_7z
+        self.overlap_denumerator = overlap_denumerator
 
         # Create a fixed thread pool of 8 threads.
         self.executor = ThreadPoolExecutor(max_workers=8)
@@ -663,15 +667,17 @@ class MyPredictionWriter(BasePredictionWriter):
         self.task_semaphore = threading.Semaphore(100)
 
         self.start_list = build_start_list(start, stop, size, path, folder, umbilicus_points_path, umbilicus_distance_threshold)
-        self.num_tasks = len(self.start_list)
-        self.to_compute_indices = range(self.num_tasks)
+        # Now total number of tasks equals number of start_list entries * (overlap_denumerator^3)
+        self.num_tasks = len(self.start_list) * (self.overlap_denumerator ** 3)
+        self.to_compute_indices = list(range(self.num_tasks))
         self.computed_indices = []
         self.progress_file = os.path.join(dest, "progress.json")
         self.config = {"path": path, "folder": folder, "dest": dest, "main_drive": main_drive, 
                        "alternative_drives": alternative_drives, "fix_umbilicus": fix_umbilicus, 
                        "umbilicus_points_path": umbilicus_points_path, "start": start, "stop": stop, 
                        "size": size, "umbilicus_distance_threshold": umbilicus_distance_threshold, 
-                       "score_threshold": score_threshold, "batch_size": batch_size, "gpus": gpus}
+                       "score_threshold": score_threshold, "batch_size": batch_size, "gpus": gpus,
+                       "overlap_denumerator": overlap_denumerator}
         self._load_progress()
 
         # For HDF5 saving: these will be lazily initialized on the first call.
@@ -874,6 +880,9 @@ class MyPredictionWriter(BasePredictionWriter):
                                 h5f_in.copy(h5f_in[group], h5f_final, name=group)
             print(f"Final merged HDF5 file: {self.final_filename}")
 
+##########################################
+#      Modified Dataset Class            #
+##########################################
 class PointCloudDataset(Dataset):
     def __init__(self, path="/media/julian/FastSSD/scroll3_surface_points", folder="point_cloud_colorized", dest="/media/julian/HDD8TB/scroll3_surface_points", main_drive="", alternative_drives=[], fix_umbilicus=True, umbilicus_points_path="", 
                  start=[0, 0, 0], stop=[16, 17, 29], size = [3, 3, 3], umbilicus_distance_threshold=1500, score_threshold=0.5, batch_size=4, gpus=1, num_processes=3, recompute=False, rotate=False, overlap_denumerator=3,
@@ -911,92 +920,81 @@ class PointCloudDataset(Dataset):
             self.umbilicus_points_old = None
 
         self.start_list = build_start_list(start, stop, size, path, folder, umbilicus_points_path, umbilicus_distance_threshold)
-        # self.start_list = [(17, 17, 18)] # Debug
-
-        self.num_tasks = len(self.start_list)
-        self.to_compute_indices = range(self.num_tasks)
-        self.computed_indices = []
-        self.progress_file = os.path.join(dest, "progress.json")
-        self.config = {"path": path, "folder": folder, "dest": dest, "main_drive": main_drive, "alternative_drives": alternative_drives, "fix_umbilicus": fix_umbilicus, "umbilicus_points_path": umbilicus_points_path, "start": start, "stop": stop, "size": size, "umbilicus_distance_threshold": umbilicus_distance_threshold, "score_threshold": score_threshold, "batch_size": batch_size, "gpus": gpus}
-        self._load_progress(update_saved_index_coords)
-
-        self.writer = MyPredictionWriter(path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points_path, start, stop, size, umbilicus_distance_threshold, score_threshold, batch_size, gpus, num_processes, use_h5=use_h5, use_7z=use_7z)
-    
-    def _load_progress(self, update_saved_index_coords):    
-        nr_total_indices = len(self.to_compute_indices)
-        dest_path = os.path.join(self.dest, self.folder)
-        if os.path.exists(self.progress_file) and (not self.recompute):
-            with open(self.progress_file, 'r') as file:
+        # Total number of dataset items = number of start_list entries * (overlap_denumerator^3)
+        total_items = len(self.start_list) * (self.overlap_denumerator ** 3)
+        # Instead of grouping overlapping subvolumes into one index, we now treat each subvolume as a separate dataset item.
+        if os.path.exists(os.path.join(dest, "progress.json")) and (not self.recompute):
+            with open(os.path.join(dest, "progress.json"), 'r') as file:
                 progress = json.load(file)
                 if 'config' in progress:
                     progress_config = progress['config']
-                    # delete batch size
+                    # remove batch_size and gpus for comparison.
                     if 'batch_size' in progress_config:
                         del progress_config['batch_size']
-                    if 'batch_size' in self.config:
+                    if 'batch_size' in self.__dict__.get('config', {}):
                         del self.config['batch_size']
-                    # delete gpus
                     if 'gpus' in progress_config:
                         del progress_config['gpus']
-                    if 'gpus' in self.config:
+                    if 'gpus' in self.__dict__.get('config', {}):
                         del self.config['gpus']
-                    if progress_config != self.config:
+                    if progress_config != progress['config']:
                         print("Progress file found but with different config. Overwriting.")
                     else:
                         print("Progress file found with same config. Resuming computation.")
                         if 'indices' in progress:
-                            new_computed_indices = None
-                            if update_saved_index_coords:
-                                print("Trying to update saved index coordinates.")
-                                new_computed_indices = []
-                                for i in tqdm(self.to_compute_indices, desc="Checking saved computations"):
-                                    good_i = 0
-                                    bad_i = 0
-                                    for idx in range(i * (self.overlap_denumerator ** 3), (i + 1) * (self.overlap_denumerator ** 3)):
-                                        if not self.is_saved_index_coords(idx, self.size, dest_path, self.main_drive, self.alternative_drives):
-                                            bad_i += 1
-                                        else:
-                                            good_i += 1
-                                    if bad_i== 0 or 1.0 * good_i / bad_i > 0.5:
-                                        new_computed_indices.append(i)
-                            self.computed_indices = progress['indices']
-                            if new_computed_indices and set(new_computed_indices) != set(self.computed_indices):
-                                print("Some saved computations are different. Overwriting progress file.")
-                                self.computed_indices = list(set(new_computed_indices))
-                                update_progress_file(self.progress_file, self.computed_indices, self.config)
-                            self.to_compute_indices = list(set(self.to_compute_indices) - set(self.computed_indices))
-                            print(f"Resuming computation. {len(self.to_compute_indices)} blocks of {nr_total_indices} left to compute.")
+                            saved = progress['indices']
+                            print(f"Found {len(saved)} computed items out of {total_items}.")
+                            self.computed_indices = saved
                         else:
-                            print("No progress file found.")
+                            self.computed_indices = []
+                else:
+                    self.computed_indices = []
+        else:
+            self.computed_indices = []
+        # The remaining indices are those dataset items (each subvolume) not yet computed.
+        self.remaining_indices = sorted(list(set(range(total_items)) - set(self.computed_indices)))
+        print(f"Resuming: {len(self.remaining_indices)} items left out of {total_items}.")
 
+        # Update config to include overlap_denumerator
+        self.config = {"path": path, "folder": folder, "dest": dest, "main_drive": main_drive, 
+                       "alternative_drives": alternative_drives, "fix_umbilicus": fix_umbilicus, "umbilicus_points_path": umbilicus_points_path, 
+                       "start": start, "stop": stop, "size": size, "umbilicus_distance_threshold": umbilicus_distance_threshold, 
+                       "score_threshold": score_threshold, "batch_size": batch_size, "gpus": gpus,
+                       "overlap_denumerator": overlap_denumerator}
+    
+        # Pass overlap_denumerator to the writer as well.
+        self.writer = MyPredictionWriter(path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points_path, start, stop, size, umbilicus_distance_threshold, score_threshold, batch_size, gpus, num_processes, use_h5=use_h5, use_7z=use_7z, overlap_denumerator=overlap_denumerator)
+    
+    # Modified _load_progress is now handled in the __init__ above.
+    
     def get_writer(self):
         return self.writer
     
     def is_saved_index_coords(self, idx, size, path, main_drive, alternative_drives, subvolume_size=50):
-        size = np.array(size).copy() + 1 # for the -1 in the range
-        # Size is int
+        """
+        Check if the subvolume corresponding to dataset index `idx` has been saved.
+        """
+        size = np.array(size).copy() + 1  # for the -1 in the range
         if isinstance(subvolume_size, int):
             subvolume_size = np.array([subvolume_size, subvolume_size, subvolume_size])
-        idx_ = idx // (self.overlap_denumerator ** 3)
-        idx__ = idx % (self.overlap_denumerator ** 3)
-        i = self.to_compute_indices[idx_] # index of the start_list
-        x = self.start_list[i]
-        start = np.array(x)
+        block_idx = idx // (self.overlap_denumerator ** 3)
+        sub_idx = idx % (self.overlap_denumerator ** 3)
+        x = self.start_list[block_idx]  # start coordinate for this block
         # Swap axes
         axis_swap = [0, 2, 1]
-        start_index = start[axis_swap]
+        start_index = np.array(x)[axis_swap]
         # Make blocks of size '50x50x50'
         indx_count = 0
-        for x in range(int((size[0] - 1) * self.overlap_denumerator)):
-            x_coord = start_index[0] * subvolume_size[0] + (x * subvolume_size[0] // self.overlap_denumerator)
+        for xx in range(int((size[0] - 1) * self.overlap_denumerator)):
+            x_coord = start_index[0] * subvolume_size[0] + (xx * subvolume_size[0] // self.overlap_denumerator)
             for y in range(int((size[1] - 1) * self.overlap_denumerator)):
                 y_coord = start_index[1] * subvolume_size[1] + (y * subvolume_size[1] // self.overlap_denumerator)
                 for z in range(int((size[2] - 1) * self.overlap_denumerator)):
                     indx_count += 1
-                    if indx_count != idx__ + 1:
+                    if indx_count != sub_idx + 1:
                         continue
                     z_coord = start_index[2] * subvolume_size[2] + (z * subvolume_size[2] // self.overlap_denumerator)
-                    start_coord = np.array([x_coord,y_coord,z_coord])
+                    start_coord = np.array([x_coord, y_coord, z_coord])
                     block_name = path + f"_subvolume_blocks/{start_coord[0]:06}_{start_coord[1]:06}_{start_coord[2]:06}" # nice ordering in the folder
                     block_name_tar = block_name + ".tar"
                     block_name_tar_alternatives = []
@@ -1007,7 +1005,7 @@ class PointCloudDataset(Dataset):
                     for alternative_drive in alternative_drives:
                         block_name_zip_alternatives.append(block_name.replace(main_drive, alternative_drive) + ".7z")
                     # Computation exists
-                    if os.path.exists(block_name_tar) or any([os.path.exists(block_name_tar_alternative) for block_name_tar_alternative in block_name_tar_alternatives]) or os.path.exists(block_name_zip) or any([os.path.exists(block_name_zip_alternative) for block_name_zip_alternative in block_name_zip_alternatives]):
+                    if os.path.exists(block_name_tar) or any([os.path.exists(name) for name in block_name_tar_alternatives]) or os.path.exists(block_name_zip) or any([os.path.exists(name) for name in block_name_zip_alternatives]):
                         return True
         # No computation exists
         return False
@@ -1031,13 +1029,10 @@ class PointCloudDataset(Dataset):
         start_coords = []
         block_names = []
         
-        # Min between stop and max_coord
-        # print(f"Start_: {start_}, min_coord {min_coord}, Stop_max_coords: {stop_max_coords}, Stop: {stop_coord}, Range: {ranges}, Stop: {stop}")
-        # time.sleep(15)
         # Make blocks of size '50x50x50'
         indx_count = 0
-        for x in range(int((size[0] - 1) * self.overlap_denumerator)):
-            x_coord = start_index[0] * subvolume_size[0] + (x * subvolume_size[0] // self.overlap_denumerator)
+        for xx in range(int((size[0] - 1) * self.overlap_denumerator)):
+            x_coord = start_index[0] * subvolume_size[0] + (xx * subvolume_size[0] // self.overlap_denumerator)
             for y in range(int((size[1] - 1) * self.overlap_denumerator)):
                 y_coord = start_index[1] * subvolume_size[1] + (y * subvolume_size[1] // self.overlap_denumerator)
                 for z in range(int((size[2] - 1) * self.overlap_denumerator)):
@@ -1045,7 +1040,7 @@ class PointCloudDataset(Dataset):
                     if indx_count != idx__ + 1:
                         continue
                     z_coord = start_index[2] * subvolume_size[2] + (z * subvolume_size[2] // self.overlap_denumerator)
-                    start_coord = np.array([x_coord,y_coord,z_coord])
+                    start_coord = np.array([x_coord, y_coord, z_coord])
                     block_name = path + f"_subvolume_blocks/{start_coord[0]:06}_{start_coord[1]:06}_{start_coord[2]:06}" # nice ordering in the folder
                     block_name_tar = block_name + ".tar"
                     block_name_tar_alternatives = []
@@ -1056,21 +1051,12 @@ class PointCloudDataset(Dataset):
                     for alternative_drive in alternative_drives:
                         block_name_zip_alternatives.append(block_name.replace(main_drive, alternative_drive) + ".7z")
                     
-                    # Skip if the block tar already exists. Same for alternative path
-                    # if (not (fix_umbilicus and fix_umbilicus_recompute(start_coord * 200.0 / 50.0, 200, umbilicus_points, umbilicus_points_old))) and ((not self.recompute) and (os.path.exists(block_name_tar) or any([os.path.exists(block_name_tar_alternative) for block_name_tar_alternative in block_name_tar_alternatives]) or os.path.exists(block_name_zip) or any([os.path.exists(block_name_zip_alternative) for block_name_zip_alternative in block_name_zip_alternatives]))):
-                    #     # print(f"Block {block_name} already exists.")
-                    #     block_names_created.append(block_name)
-                    #     continue
-
                     res_pc = load_pc_start(src_folder, main_drive, alternative_drives, start_coord[axis_inverse_swap] * 200.0 / 50.0, grid_block_size=200, load_multithreaded=load_multithreaded, executor=executor)
                     if res_pc is None:
-                        # print(f"Block {block_name} does not exist.")
                         continue
                     points, normals, colors = res_pc
-                    # Extract a subvolume
-                    subvolume_points, original_subvolume_points, subvolume_normals, subvolume_colors, subvolume_angles = extract_subvolume(points, normals, colors, colors, start=start_coord, size=subvolume_size) # Second colors is just a placeholder since we dont yet have any angles which the function expects
+                    subvolume_points, original_subvolume_points, subvolume_normals, subvolume_colors, subvolume_angles = extract_subvolume(points, normals, colors, colors, start=start_coord, size=subvolume_size) 
                     if len(subvolume_points) < 10:
-                        # print(f"Subvolume {start_coord} has no points.")
                         continue
                     
                     subvolumes_points.append(subvolume_points)
@@ -1086,35 +1072,32 @@ class PointCloudDataset(Dataset):
     def precompute(self, idx__, index, start, size, path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points, umbilicus_points_old, use_multiprocessing, executor=None):
         src_path = os.path.join(path, folder)
         dest_path = os.path.join(dest, folder)
-        size = np.array(size).copy() + 1 # +1 because we want to include the last subvolume for tiling operation from later calls starting at the last subvolume
+        size = np.array(size).copy() + 1 # +1 because we want to include the last subvolume for tiling operation
         
-        # res = load_plys(src_path, main_drive, alternative_drives, start, size, grid_block_size=200, load_multithreaded=use_multiprocessing, executor=executor)
-        # points, normals, colors = res
-        # points, normals, colors = remove_duplicate_points_normals(points, normals, colors)
         subvolumes_points, original_subvolumes_points, subvolumes_normals, subvolumes_colors, start_coords, block_names = self.create_batches(idx__, dest_path, src_path, start, size, fix_umbilicus, umbilicus_points, umbilicus_points_old, main_drive, alternative_drives, load_multithreaded=use_multiprocessing, executor=executor)
         return subvolumes_points, original_subvolumes_points, subvolumes_normals, subvolumes_colors, start_coords, block_names
 
     def __len__(self):
-        length = len(self.to_compute_indices) * (self.overlap_denumerator ** 3)
-        return length
+        # Return the number of remaining subvolume items (each subvolume is now one dataset item)
+        return len(self.remaining_indices)
 
     def __getitem__(self, idx):
-        idx_ = idx // (self.overlap_denumerator ** 3)
-        idx__ = idx % (self.overlap_denumerator ** 3)
-        i = self.to_compute_indices[idx_] # index of the start_list
-        progress_i = i if idx__ == (self.overlap_denumerator ** 3) - 1 else -1
-        x = self.start_list[i]
+        # Get the actual dataset index (in the full range) from the remaining indices.
+        actual_idx = self.remaining_indices[idx]
+        block_idx = actual_idx // (self.overlap_denumerator ** 3)
+        sub_idx = actual_idx % (self.overlap_denumerator ** 3)
+        x = self.start_list[block_idx]
 
-        res = self.precompute(idx__, i, x, self.size, self.path, self.folder, self.dest, self.main_drive, self.alternative_drives, self.fix_umbilicus, self.umbilicus_points, self.umbilicus_points_old, False, None)
+        res = self.precompute(sub_idx, block_idx, x, self.size, self.path, self.folder, self.dest, self.main_drive, self.alternative_drives, self.fix_umbilicus, self.umbilicus_points, self.umbilicus_points_old, False, None)
         points_batch, original_points_batch, normals_batch, colors_batch, start_coords, names_batch = res
 
-        # Detect the surfaces in the subvolume
-        points_batch_indices = [i for i, points in enumerate(points_batch) if points.shape[0] > 100]
-        points_batch = [points_batch[i] for i in points_batch_indices]
-        original_points_batch = [original_points_batch[i] for i in points_batch_indices]
-        normals_batch = [normals_batch[i] for i in points_batch_indices]
-        colors_batch = [colors_batch[i] for i in points_batch_indices]
-        names_batch = [names_batch[i] for i in points_batch_indices]
+        # Filter out subvolumes with too few points
+        valid_indices = [i for i, points in enumerate(points_batch) if points.shape[0] > 100]
+        points_batch = [points_batch[i] for i in valid_indices]
+        original_points_batch = [original_points_batch[i] for i in valid_indices]
+        normals_batch = [normals_batch[i] for i in valid_indices]
+        colors_batch = [colors_batch[i] for i in valid_indices]
+        names_batch = [names_batch[i] for i in valid_indices]
         # Deep copy the points
         coords_batch = [np.copy(points) for points in points_batch]
         # Translate the points so that the volume starts at (0,0,0)
@@ -1122,8 +1105,8 @@ class PointCloudDataset(Dataset):
         coords_batch = [coords - min_coord_batch[i] for i, coords in enumerate(coords_batch)]
 
         items_pytorch = [preprocess_points(c) for c in coords_batch]
-        # print(f"Returned {count_returned} of {len(self)}")
-        return items_pytorch, original_points_batch, normals_batch, colors_batch, names_batch, progress_i
+        # Return the batch along with the dataset index (actual_idx) so that progress can be updated for each item.
+        return items_pytorch, original_points_batch, normals_batch, colors_batch, names_batch, actual_idx
 
 # Custom collation function
 def custom_collate_fn(batches):
@@ -1158,10 +1141,9 @@ def pointcloud_inference(path, folder, dest, main_drive, alternative_drives, fix
     # model = torch.compile(model) # too low torch version
 
     dataset = PointCloudDataset(path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points_path, start, stop, size, 
-                                umbilicus_distance_threshold, score_threshold, batch_size, recompute=recompute, overlap_denumerator=overlap_denumerator, use_h5=use_h5, use_7z=use_7z,
+                                umbilicus_distance_threshold, score_threshold, batch_size, gpus, recompute=recompute, overlap_denumerator=overlap_denumerator, use_h5=use_h5, use_7z=use_7z,
                                 update_saved_index_coords=update_saved_index_coords)
     dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=custom_collate_fn, shuffle=False, num_workers=24, prefetch_factor=5)  # Adjust num_workers as per your system
-    # dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=24, prefetch_factor=3)  # Adjust num_workers as per your system
 
     writer = dataset.get_writer()
     trainer = pl.Trainer(callbacks=[writer], gpus=gpus, strategy="ddp")
@@ -1235,10 +1217,6 @@ def main():
     use_h5 = args.use_h5
     use_7z = args.use_7z
     update_saved_index_coords = args.update_progress
-
-    # import sys
-    # # Remove command-line arguments for later internal calls to Mask3D
-    # sys.argv = [sys.argv[0]]
 
     # Compute the surface patches
     pointcloud_inference(path, folder, dest, main_drive, alternative_ply_drives, fix_umbilicus, umbilicus_points_path, [0, 0, z_start], [100, 100, z_end], 
