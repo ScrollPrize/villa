@@ -985,12 +985,15 @@ class PointCloudDataset(Dataset):
         start_index = start[axis_swap]
         # Make blocks of size '50x50x50'
         indx_count = 0
-        print(f"Start_: {start}, Size: {size}, Idx: {idx_}, Idx__: {idx__}")
+        print(f"Start_: {start}, Size: {size}, Idx: {idx_}, Idx__: {idx__}, subvolume_size: {subvolume_size}")
         for x in range(int((size[0] - 1) * self.overlap_denumerator)):
+            print("here x")
             x_coord = start_index[0] * subvolume_size[0] + (x * subvolume_size[0] // self.overlap_denumerator)
             for y in range(int((size[1] - 1) * self.overlap_denumerator)):
+                print("here y")
                 y_coord = start_index[1] * subvolume_size[1] + (y * subvolume_size[1] // self.overlap_denumerator)
                 for z in range(int((size[2] - 1) * self.overlap_denumerator)):
+                    print("here z")
                     indx_count += 1
                     if indx_count != idx__ + 1:
                         continue
