@@ -949,7 +949,7 @@ class PointCloudDataset(Dataset):
                             if update_saved_index_coords:
                                 print("Trying to update saved index coordinates.")
                                 new_computed_indices = []
-                                for i in self.to_compute_indices:
+                                for i in tqdm(self.to_compute_indices, desc="Checking saved computations"):
                                     good_i = True
                                     for idx in range(i * (self.overlap_denumerator ** 3), (i + 1) * (self.overlap_denumerator ** 3)):
                                         if not self.is_saved_index_coords(idx, self.size, dest_path, self.main_drive, self.alternative_drives):
