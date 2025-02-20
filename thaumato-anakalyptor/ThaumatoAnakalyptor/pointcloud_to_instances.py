@@ -944,7 +944,7 @@ class PointCloudDataset(Dataset):
                     else:
                         print("Progress file found with same config. Resuming computation.")
                         if 'indices' in progress:
-                            self.computed_indices = progress['indices']
+                            new_computed_indices = None
                             if update_saved_index_coords:
                                 new_computed_indices = []
                                 for i in range(self.num_tasks):
@@ -955,10 +955,11 @@ class PointCloudDataset(Dataset):
                                             break
                                     if good_i:
                                         new_computed_indices.append(i)
-                                if set(new_computed_indices) != set(self.computed_indices):
-                                    print("Some saved computations are different. Overwriting progress file.")
-                                    self.computed_indices = list(set(new_computed_indices))
-                                    update_progress_file(self.progress_file, self.computed_indices, self.config)
+                            self.computed_indices = progress['indices']
+                            if new_computed_indices and set(new_computed_indices) != set(self.computed_indices):
+                                print("Some saved computations are different. Overwriting progress file.")
+                                self.computed_indices = list(set(new_computed_indices))
+                                update_progress_file(self.progress_file, self.computed_indices, self.config)
                             self.to_compute_indices = list(set(self.to_compute_indices) - set(self.computed_indices))
                             print(f"Resuming computation. {len(self.to_compute_indices)} blocks of {nr_total_indices} left to compute.")
                         else:
