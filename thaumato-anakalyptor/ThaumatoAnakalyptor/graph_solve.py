@@ -93,7 +93,7 @@ def update_sides(solver):
     print(f"down_index {down_index} up_index {up_index}")
     return down_index, up_index
 
-def run_f_star(solver, experiment_name="", continue_from=0):
+def run_f_star(solver, experiment_name="", continue_from=0, visualize=False):
     print(f"Running f_star solver")
     save_path = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_f_star_0.bin"
     if continue_from == 0:
@@ -107,17 +107,17 @@ def run_f_star(solver, experiment_name="", continue_from=0):
     
     save_path = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_f_star_1.bin"
     if continue_from <= 1:
-        solver.solve_f_star(num_iterations=10000, spring_constant=4.5, o=0.000, i_round=0)
-        solver.solve_f_star(num_iterations=10000, spring_constant=4.0, o=0.00, i_round=1)
-        solver.solve_f_star(num_iterations=20000, spring_constant=3.25, o=0.0, i_round=2)
-        solver.solve_f_star(num_iterations=20000, spring_constant=2.50, o=0.0, i_round=3)
-        solver.solve_f_star(num_iterations=20000, spring_constant=1.75, o=0.0, i_round=4)
-        solver.solve_f_star(num_iterations=20000, spring_constant=1.5, o=0.0, i_round=5)
-        # solver.solve_f_star(num_iterations=30000, spring_constant=1.0, o=0.0, i_round=6)
-        # solver.solve_f_star(num_iterations=15000, spring_constant=0.75, o=0.02, i_round=7)
-        # solver.solve_f_star(num_iterations=15000, spring_constant=0.8, o=0.02, i_round=8)
-        # solver.solve_f_star(num_iterations=15000, spring_constant=0.9, o=0.02, i_round=9)
-        # solver.solve_f_star(num_iterations=15000, spring_constant=1.1, o=0.0, i_round=10)
+        solver.solve_f_star(num_iterations=10000, spring_constant=4.5, o=0.000, i_round=0, visualize=visualize)
+        solver.solve_f_star(num_iterations=10000, spring_constant=4.0, o=0.00, i_round=1, visualize=visualize)
+        solver.solve_f_star(num_iterations=20000, spring_constant=3.25, o=0.0, i_round=2, visualize=visualize)
+        solver.solve_f_star(num_iterations=20000, spring_constant=2.50, o=0.0, i_round=3, visualize=visualize)
+        solver.solve_f_star(num_iterations=20000, spring_constant=1.75, o=0.0, i_round=4, visualize=visualize)
+        solver.solve_f_star(num_iterations=20000, spring_constant=1.5, o=0.0, i_round=5, visualize=visualize)
+        # solver.solve_f_star(num_iterations=30000, spring_constant=1.0, o=0.0, i_round=6, visualize=visualize)
+        # solver.solve_f_star(num_iterations=15000, spring_constant=0.75, o=0.02, i_round=7, visualize=visualize)
+        # solver.solve_f_star(num_iterations=15000, spring_constant=0.8, o=0.02, i_round=8, visualize=visualize)
+        # solver.solve_f_star(num_iterations=15000, spring_constant=0.9, o=0.02, i_round=9, visualize=visualize)
+        # solver.solve_f_star(num_iterations=15000, spring_constant=1.1, o=0.0, i_round=10, visualize=visualize)
         solver.save_graph(save_path)
     else:
         solver.load_graph(save_path)
@@ -241,7 +241,7 @@ def run_winding_number(solver, experiment_name="", i_round=15):
     except:
         print(f"Error compressing video experiments/{experiment_name}/python_winding_numbers.avi")
 
-def main(graph_path="graph_scroll5_january_unrolling_full_v2.bin", experiment_name=None, standard_winding_direction=True, fresh_start_star=0, fresh_start_ring=0, z_min=None, z_max=None):
+def main(graph_path="graph_scroll5_january_unrolling_full_v2.bin", experiment_name=None, standard_winding_direction=True, fresh_start_star=0, fresh_start_ring=0, z_min=None, z_max=None, visualize=False):
     # z_min = 3000
     # z_max = 4000
     if experiment_name is None:
@@ -263,7 +263,7 @@ def main(graph_path="graph_scroll5_january_unrolling_full_v2.bin", experiment_na
     os.makedirs(f"experiments/{experiment_name}/checkpoints", exist_ok=True)
 
     # fresh_start_star = 0 # continue solve computation from fresh_start
-    i_round = run_f_star(solver, experiment_name, continue_from=fresh_start_star)
+    i_round = run_f_star(solver, experiment_name, continue_from=fresh_start_star, visualize=visualize)
     solver.filter_f_star() # filter the graph based on f_star solution
     solver.generate_ply(f"experiments/{experiment_name}/solved_f_star.ply")
 
@@ -302,9 +302,10 @@ if __name__ == "__main__":
     parser.add_argument("--inversed_winding_direction", action="store_true", help="Use inverse winding direction. For example Scroll 1.")
     parser.add_argument("--fresh_start_star", type=int, default=0, help="Fresh start for f_star solver")
     parser.add_argument("--fresh_start_ring", type=int, default=0, help="Fresh start for ring solver")
+    parser.add_argument("--visualize", action="store_true", help="Visualize Solver")
 
     args = parser.parse_args()
     print(f"Solver arguments: {args}")
 
     # Run the solver
-    main(args.graph_path, experiment_name=args.experiment_name, standard_winding_direction=not args.inversed_winding_direction, fresh_start_star=args.fresh_start_star, fresh_start_ring=args.fresh_start_ring, z_min=args.z_min, z_max=args.z_max)
+    main(args.graph_path, experiment_name=args.experiment_name, standard_winding_direction=not args.inversed_winding_direction, fresh_start_star=args.fresh_start_star, fresh_start_ring=args.fresh_start_ring, z_min=args.z_min, z_max=args.z_max, visualize=args.visualize)
