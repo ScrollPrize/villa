@@ -751,9 +751,9 @@ class MyPredictionWriter(BasePredictionWriter):
                 indxs = list(indxs)
                 # Filter out negative indices.
                 # indxs = [i for i in indxs if i >= 0]
-                self.computed_indices = list(set(self.computed_indices) + set(indxs))
+                self.computed_indices = list(set(self.computed_indices + indxs))
             update_progress_file(self.progress_file, self.computed_indices, self.config)
-            
+
         if prediction and len(prediction) > 0:
             self.post_process(
                 prediction,
