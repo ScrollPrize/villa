@@ -637,8 +637,10 @@ class MyPredictionWriter(BasePredictionWriter):
                  batch_size=4, gpus=1, num_processes=4,
                  use_h5=False, use_7z=False):  # num_processes=4 for 4 writer threads
         super().__init__(write_interval="batch")  # or "epoch" for end of an epoch
+
+        # Create a multiprocessing pool (used for tar saving and optionally for processing surfaces).
         self.num_threads = multiprocessing.cpu_count()
-        self.pool = multiprocessing.Pool(processes=self.num_threads)  # Initialize once
+        self.pool = multiprocessing.Pool(processes=self.num_threads)
 
         self.path = path
         self.folder = folder
@@ -657,14 +659,14 @@ class MyPredictionWriter(BasePredictionWriter):
         self.use_h5 = use_h5
         self.use_7z = use_7z
 
-        # Create a fixed thread pool of 8 threads.
+        # Create a fixed thread pool for HDF5 saving tasks.
         self.executor = ThreadPoolExecutor(max_workers=8)
-        # Initialize a semaphore to limit pending tasks to 100.
+        # Semaphore to limit to 100 active save tasks at a time.
         self.task_semaphore = threading.Semaphore(100)
 
         self.start_list = build_start_list(start, stop, size, path, folder, umbilicus_points_path, umbilicus_distance_threshold)
         self.num_tasks = len(self.start_list)
-        self.to_compute_indices = range(self.num_tasks)
+        self.to_compute_indices = list(range(self.num_tasks))
         self.computed_indices = []
         self.progress_file = os.path.join(dest, "progress.json")
         self.config = {"path": path, "folder": folder, "dest": dest, "main_drive": main_drive, 
@@ -675,7 +677,7 @@ class MyPredictionWriter(BasePredictionWriter):
         self._load_progress()
 
         # For HDF5 saving: these will be lazily initialized on the first call.
-        self.final_filename = None           # Final HDF5 filename (always os.path.dirname(names_batch[0]) + ".h5")
+        self.final_filename = None           # Final HDF5 filename
         self.intermediate_filenames = None   # List of 4 intermediate filenames (one per thread)
         self.intermediate_handles = None     # Open HDF5 file handles for each thread
         self.interm_locks = None             # One lock per intermediate file
@@ -708,9 +710,8 @@ class MyPredictionWriter(BasePredictionWriter):
                             print("No progress file found.")
 
     def submit_task(self, fn, *args, **kwargs):
-        # Block if there are already 100 pending tasks.
+        # Use the thread pool executor (for HDF5 tasks) with semaphore gating.
         self.task_semaphore.acquire()
-        # Submit the wrapped function.
         future = self.executor.submit(self._wrapped_fn, fn, *args, **kwargs)
         return future
        
@@ -718,9 +719,14 @@ class MyPredictionWriter(BasePredictionWriter):
         try:
             return fn(*args, **kwargs)
         finally:
-            # Ensure that the semaphore is released even if the task fails.
             self.task_semaphore.release()
-
+    
+    def submit_multiprocessing_task(self, fn, *args, **kwargs):
+        # This method uses the multiprocessing pool for tar saving.
+        self.task_semaphore.acquire()
+        # When the task is done, the callback will release the semaphore.
+        self.pool.apply_async(fn, args=args, kwds=kwargs, callback=lambda _: self.task_semaphore.release())
+       
     def write_on_batch_end(self, trainer:"pl.Trainer", pl_module:"pl.LightningModule", 
                              prediction, batch_indices, batch, batch_idx:int, dataloader_idx:int) -> None:
         """
@@ -745,7 +751,6 @@ class MyPredictionWriter(BasePredictionWriter):
         world_size = dist.get_world_size() if dist.is_initialized() else 1
 
         # Prepare lists to hold gathered objects from each GPU.
-        # The order is by global rank: index 0 will be rank 0, index 1 will be rank 1, etc.
         all_indices = [None] * world_size
         # Gather predictions and batch objects from all processes.
         dist.all_gather_object(all_indices, indxs)
@@ -776,7 +781,7 @@ class MyPredictionWriter(BasePredictionWriter):
             surfaces, surfaces_normals, surfaces_colors, scores = to_surfaces(points_batch, normals_batch, colors_batch, res)
 
         if use_h5:
-            # Determine the final HDF5 filename (this is always the same for a given dataset).
+            # HDF5 branch uses the thread pool executor.
             final_h5_filename = os.path.dirname(names_batch[0]) + ".h5"
             if self.final_filename is None:
                 self.final_filename = final_h5_filename
@@ -800,30 +805,27 @@ class MyPredictionWriter(BasePredictionWriter):
                 self.interm_locks = [threading.Lock() for _ in range(4)]
             
             # Group the blocks (each block corresponds to one surface from the batch) by thread.
-            # Round-robin assignment: block i is assigned to thread index = i % 4.
             random_offset = np.random.randint(4)
             tasks_by_thread = {i: [] for i in range(4)}
             for i in range(len(surfaces)):
                 thread_idx = (i + random_offset) % 4
                 tasks_by_thread[thread_idx].append((surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i]))
             
-            # For each thread that has tasks, submit a single task that writes all its assigned blocks.
+            # Submit each task to the thread pool.
             for thread_idx, tasks in tasks_by_thread.items():
                 if tasks:
                     self.submit_task(self.async_save_batch_h5, thread_idx, tasks, distance_threshold, n, alpha, slope_alpha)
         else:
-            # Group the blocks (each block corresponds to one surface from the batch) by thread.
-            # Round-robin assignment: block i is assigned to thread index = i % 4.
+            # Tar saving branch now uses the multiprocessing pool for true multithreaded saving.
             random_offset = np.random.randint(4)
             tasks_by_thread = {i: [] for i in range(4)}
             for i in range(len(surfaces)):
                 thread_idx = (i + random_offset) % 4
                 tasks_by_thread[thread_idx].append((surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i]))
             
-            # For each thread that has tasks, submit a single task that writes all its assigned blocks.
             for thread_idx, tasks in tasks_by_thread.items():
                 if tasks:
-                    self.submit_task(self.async_save_batch_tar, tasks, distance_threshold, n, alpha, slope_alpha, use_7z)
+                    self.submit_multiprocessing_task(self.async_save_batch_tar, tasks, distance_threshold, n, alpha, slope_alpha, use_7z)
     
     def async_save_batch_h5(self, thread_idx, tasks, distance_threshold, n, alpha, slope_alpha):
         """
@@ -837,11 +839,11 @@ class MyPredictionWriter(BasePredictionWriter):
                               surf, norm, col, scr, nname,
                               self.score_threshold, distance_threshold, n, alpha, slope_alpha,
                               False, [0] * len(surf), [[]] * len(surf))
-
+    
     def async_save_batch_tar(self, tasks, distance_threshold, n, alpha, slope_alpha, use_7z):
         """
-        This method runs in one of the fixed threads.
-        It writes all blocks in 'tasks' to the intermediate tar file.
+        This method runs in a separate process from the multiprocessing pool.
+        It writes all blocks in 'tasks' to a tar file.
         Each task in tasks is a tuple: (surf, norm, col, scr, nname).
         """
         for (surf, norm, col, scr, nname) in tasks:
@@ -851,11 +853,14 @@ class MyPredictionWriter(BasePredictionWriter):
     
     def finalize(self):
         """
-        At the end of the epoch, wait for all threads to finish.
+        At the end of the epoch, wait for all asynchronous tasks to finish.
         Then (only on global rank 0) merge the 4 intermediate HDF5 files into the final file.
         """
-        # Wait for all asynchronous tasks to complete.
+        # Wait for all HDF5 save tasks.
         self.executor.shutdown(wait=True)
+        # Close the multiprocessing pool and wait for tar tasks to complete.
+        self.pool.close()
+        self.pool.join()
         # Close all intermediate HDF5 file handles.
         if self.intermediate_handles is not None:
             for h5f in self.intermediate_handles:
@@ -863,7 +868,6 @@ class MyPredictionWriter(BasePredictionWriter):
         # Only merge on global rank 0.
         rank = dist.get_rank() if dist.is_initialized() else 0
         if rank == 0:
-            # Find all intermediate files in the h5 directory.
             h5_dir = os.path.dirname(self.intermediate_filenames[0])
             self.intermediate_filenames = [os.path.join(h5_dir, f) for f in os.listdir(h5_dir) if f.endswith(".h5")]
             with h5py.File(self.final_filename, "w") as h5f_final:
