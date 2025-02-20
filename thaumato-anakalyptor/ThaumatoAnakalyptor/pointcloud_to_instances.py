@@ -971,6 +971,7 @@ class PointCloudDataset(Dataset):
         return self.writer
     
     def is_saved_index_coords(self, idx, size, path, main_drive, alternative_drives, subvolume_size=50):
+        time.sleep(1)
         # Size is int
         if isinstance(subvolume_size, int):
             subvolume_size = np.array([subvolume_size, subvolume_size, subvolume_size])
