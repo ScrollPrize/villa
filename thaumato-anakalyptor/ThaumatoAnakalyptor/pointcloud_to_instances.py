@@ -735,18 +735,6 @@ class MyPredictionWriter(BasePredictionWriter):
         """
         # Unpack your batch info as defined in your dataset:
         items_pytorch, points_batch, normals_batch, colors_batch, names_batch, indxs = batch
-        if prediction and len(prediction) > 0:
-            self.post_process(
-                prediction,
-                items_pytorch,
-                points_batch,
-                normals_batch,
-                colors_batch,
-                names_batch,
-                use_multiprocessing=False,  # Change to True if preferred.
-                use_h5=self.use_h5,
-                use_7z=self.use_7z
-            )
         
         # Determine world size (if not distributed, this will be 1)
         world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -765,6 +753,19 @@ class MyPredictionWriter(BasePredictionWriter):
                 # indxs = [i for i in indxs if i >= 0]
                 self.computed_indices = list(set(self.computed_indices) + set(indxs))
             update_progress_file(self.progress_file, self.computed_indices, self.config)
+            
+        if prediction and len(prediction) > 0:
+            self.post_process(
+                prediction,
+                items_pytorch,
+                points_batch,
+                normals_batch,
+                colors_batch,
+                names_batch,
+                use_multiprocessing=False,  # Change to True if preferred.
+                use_h5=self.use_h5,
+                use_7z=self.use_7z
+            )
     
     def post_process(self, res, items_pytorch, points_batch, normals_batch, colors_batch, names_batch, 
                      use_multiprocessing=False, distance_threshold=10.0, n=4, alpha=1000.0, 
