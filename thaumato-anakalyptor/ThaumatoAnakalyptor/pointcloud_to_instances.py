@@ -993,6 +993,7 @@ class PointCloudDataset(Dataset):
                     indx_count += 1
                     if indx_count != idx__ + 1:
                         continue
+                    print("here 1")
                     z_coord = start_index[2] * subvolume_size[2] + (z * subvolume_size[2] // self.overlap_denumerator)
                     start_coord = np.array([x_coord,y_coord,z_coord])
                     block_name = path + f"_subvolume_blocks/{start_coord[0]:06}_{start_coord[1]:06}_{start_coord[2]:06}" # nice ordering in the folder
@@ -1004,7 +1005,7 @@ class PointCloudDataset(Dataset):
                     block_name_zip_alternatives = []
                     for alternative_drive in alternative_drives:
                         block_name_zip_alternatives.append(block_name.replace(main_drive, alternative_drive) + ".7z")
-                    
+                    print("here 2")
                     # Computation exists
                     if os.path.exists(block_name_tar) or any([os.path.exists(block_name_tar_alternative) for block_name_tar_alternative in block_name_tar_alternatives]) or os.path.exists(block_name_zip) or any([os.path.exists(block_name_zip_alternative) for block_name_zip_alternative in block_name_zip_alternatives]):
                         print(f"Block {block_name_tar} already exists.")
