@@ -878,18 +878,6 @@ class PointCloudDataset(Dataset):
     def __init__(self, path="/media/julian/FastSSD/scroll3_surface_points", folder="point_cloud_colorized", dest="/media/julian/HDD8TB/scroll3_surface_points", main_drive="", alternative_drives=[], fix_umbilicus=True, umbilicus_points_path="", 
                  start=[0, 0, 0], stop=[16, 17, 29], size = [3, 3, 3], umbilicus_distance_threshold=1500, score_threshold=0.5, batch_size=4, gpus=1, num_processes=3, recompute=False, rotate=False, overlap_denumerator=3,
                  use_h5=False, use_7z=False, update_saved_index_coords=False):
-
-        self.start_list = build_start_list(start, stop, size, path, folder, umbilicus_points_path, umbilicus_distance_threshold)
-        # self.start_list = [(17, 17, 18)] # Debug
-
-        self.num_tasks = len(self.start_list)
-        self.to_compute_indices = range(self.num_tasks)
-        self.computed_indices = []
-        self.progress_file = os.path.join(dest, "progress.json")
-        self.config = {"path": path, "folder": folder, "dest": dest, "main_drive": main_drive, "alternative_drives": alternative_drives, "fix_umbilicus": fix_umbilicus, "umbilicus_points_path": umbilicus_points_path, "start": start, "stop": stop, "size": size, "umbilicus_distance_threshold": umbilicus_distance_threshold, "score_threshold": score_threshold, "batch_size": batch_size, "gpus": gpus}
-        self._load_progress(update_saved_index_coords)
-
-        self.writer = MyPredictionWriter(path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points_path, start, stop, size, umbilicus_distance_threshold, score_threshold, batch_size, gpus, num_processes, use_h5=use_h5, use_7z=use_7z)
         self.rotate = rotate
         self.R = np.eye(3) if not self.rotate else get_optimized_rotation_matrix((45, 45, 45))
         self.overlap_denumerator = overlap_denumerator
@@ -921,6 +909,18 @@ class PointCloudDataset(Dataset):
             self.umbilicus_points_old = umbilicus(umbilicus_raw_points_old)
         else:
             self.umbilicus_points_old = None
+
+        self.start_list = build_start_list(start, stop, size, path, folder, umbilicus_points_path, umbilicus_distance_threshold)
+        # self.start_list = [(17, 17, 18)] # Debug
+
+        self.num_tasks = len(self.start_list)
+        self.to_compute_indices = range(self.num_tasks)
+        self.computed_indices = []
+        self.progress_file = os.path.join(dest, "progress.json")
+        self.config = {"path": path, "folder": folder, "dest": dest, "main_drive": main_drive, "alternative_drives": alternative_drives, "fix_umbilicus": fix_umbilicus, "umbilicus_points_path": umbilicus_points_path, "start": start, "stop": stop, "size": size, "umbilicus_distance_threshold": umbilicus_distance_threshold, "score_threshold": score_threshold, "batch_size": batch_size, "gpus": gpus}
+        self._load_progress(update_saved_index_coords)
+
+        self.writer = MyPredictionWriter(path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points_path, start, stop, size, umbilicus_distance_threshold, score_threshold, batch_size, gpus, num_processes, use_h5=use_h5, use_7z=use_7z)
     
     def _load_progress(self, update_saved_index_coords):    
         nr_total_indices = len(self.to_compute_indices)
