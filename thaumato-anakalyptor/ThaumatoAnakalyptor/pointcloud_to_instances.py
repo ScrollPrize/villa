@@ -976,6 +976,9 @@ class PointCloudDataset(Dataset):
         # Compute remaining indices (those items not yet computed)
         self.remaining_indices = sorted(list(set(range(total_items)) - set(self.computed_indices)))
         print(f"Resuming: {len(self.remaining_indices)} items left out of {total_items}.")
+
+        # Pass overlap_denumerator to the writer as well.
+        self.writer = MyPredictionWriter(path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points_path, start, stop, size, umbilicus_distance_threshold, score_threshold, batch_size, gpus, num_processes, use_h5=use_h5, use_7z=use_7z, overlap_denumerator=overlap_denumerator)
     
     def get_writer(self):
         return self.writer
