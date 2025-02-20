@@ -956,6 +956,7 @@ class PointCloudDataset(Dataset):
                                 if has_differences:
                                     print("Some saved computations are missing. Overwriting progress file.")
                                     self.computed_indices = new_computed_indices
+                                    update_progress_file(self.progress_file, self.computed_indices, self.config)
                             self.to_compute_indices = list(set(self.to_compute_indices) - set(self.computed_indices))
                             print(f"Resuming computation. {len(self.to_compute_indices)} blocks of {nr_total_indices} left to compute.")
                         else:
