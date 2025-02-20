@@ -183,7 +183,8 @@ def save_block_ply(block_points, block_normals, block_colors, block_scores, bloc
             block_coeffs = block_coeffs_precomputed
 
         if sum([len(block) for block in block_points]) < 10:
-            return
+            # Save empty tar just to indicate that it was computed
+            block_points = []
         
         # Create folder if it doesn't exist
         os.makedirs(os.path.dirname(temp_block_name), exist_ok=True)
@@ -221,7 +222,7 @@ def save_block_ply(block_points, block_normals, block_colors, block_scores, bloc
                 archive.writeall(used_name_block, '')
             except Exception as e:
                 print(e)
-                print(f"Error writing {used_name_block} to {temp_block_name}.7z")
+                print(f"Error writing {used_name_block} to {temp_block_name}.7z. e: {e}")
     else:
         # Tar the temp folder without including the 'temp' name inside the tar
         with tarfile.open(archive_name_type, 'w') as tar:
