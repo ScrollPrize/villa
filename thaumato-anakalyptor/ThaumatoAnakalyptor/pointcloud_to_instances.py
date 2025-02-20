@@ -986,19 +986,14 @@ class PointCloudDataset(Dataset):
         start_index = start[axis_swap]
         # Make blocks of size '50x50x50'
         indx_count = 0
-        print(f"Start_: {start}, Size: {size}, Idx: {idx_}, Idx__: {idx__}, subvolume_size: {subvolume_size}")
         for x in range(int((size[0] - 1) * self.overlap_denumerator)):
-            print("here x")
             x_coord = start_index[0] * subvolume_size[0] + (x * subvolume_size[0] // self.overlap_denumerator)
             for y in range(int((size[1] - 1) * self.overlap_denumerator)):
-                print("here y")
                 y_coord = start_index[1] * subvolume_size[1] + (y * subvolume_size[1] // self.overlap_denumerator)
                 for z in range(int((size[2] - 1) * self.overlap_denumerator)):
-                    print("here z")
                     indx_count += 1
                     if indx_count != idx__ + 1:
                         continue
-                    print("here 1")
                     z_coord = start_index[2] * subvolume_size[2] + (z * subvolume_size[2] // self.overlap_denumerator)
                     start_coord = np.array([x_coord,y_coord,z_coord])
                     block_name = path + f"_subvolume_blocks/{start_coord[0]:06}_{start_coord[1]:06}_{start_coord[2]:06}" # nice ordering in the folder
@@ -1010,12 +1005,9 @@ class PointCloudDataset(Dataset):
                     block_name_zip_alternatives = []
                     for alternative_drive in alternative_drives:
                         block_name_zip_alternatives.append(block_name.replace(main_drive, alternative_drive) + ".7z")
-                    print("here 2")
                     # Computation exists
                     if os.path.exists(block_name_tar) or any([os.path.exists(block_name_tar_alternative) for block_name_tar_alternative in block_name_tar_alternatives]) or os.path.exists(block_name_zip) or any([os.path.exists(block_name_zip_alternative) for block_name_zip_alternative in block_name_zip_alternatives]):
-                        print(f"Block {block_name_tar} already exists.")
                         return True
-                    print(f"Block {block_name_tar} does not exist.")
         # No computation exists
         return False
 
