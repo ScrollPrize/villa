@@ -880,9 +880,12 @@ class MyPredictionWriter(BasePredictionWriter):
                                 h5f_in.copy(h5f_in[group], h5f_final, name=group)
             print(f"Final merged HDF5 file: {self.final_filename}")
 
+##########################################
+#      Modified Dataset Class            #
+##########################################
 class PointCloudDataset(Dataset):
     def __init__(self, path="/media/julian/FastSSD/scroll3_surface_points", folder="point_cloud_colorized", dest="/media/julian/HDD8TB/scroll3_surface_points", main_drive="", alternative_drives=[], fix_umbilicus=True, umbilicus_points_path="", 
-                 start=[0, 0, 0], stop=[16, 17, 29], size=[3, 3, 3], umbilicus_distance_threshold=1500, score_threshold=0.5, batch_size=4, gpus=1, num_processes=3, recompute=False, rotate=False, overlap_denumerator=3,
+                 start=[0, 0, 0], stop=[16, 17, 29], size = [3, 3, 3], umbilicus_distance_threshold=1500, score_threshold=0.5, batch_size=4, gpus=1, num_processes=3, recompute=False, rotate=False, overlap_denumerator=3,
                  use_h5=False, use_7z=False, update_saved_index_coords=False):
         # Set rotation (if any)
         self.rotate = rotate
@@ -921,6 +924,13 @@ class PointCloudDataset(Dataset):
         # Total number of dataset items equals number of start positions * (overlap_denumerator^3)
         total_items = len(self.start_list) * (self.overlap_denumerator ** 3)
 
+        # Update configuration (including the overlap parameter)
+        self.config = {"path": path, "folder": folder, "dest": dest, "main_drive": main_drive, 
+                       "alternative_drives": alternative_drives, "fix_umbilicus": fix_umbilicus, "umbilicus_points_path": umbilicus_points_path, 
+                       "start": start, "stop": stop, "size": size, "umbilicus_distance_threshold": umbilicus_distance_threshold, 
+                       "score_threshold": score_threshold, "batch_size": batch_size, "gpus": gpus,
+                       "overlap_denumerator": overlap_denumerator}
+
         progress_path = os.path.join(dest, "progress.json")
         # Load saved progress if available and if not forcing a recompute
         if os.path.exists(progress_path) and (not self.recompute):
@@ -934,7 +944,7 @@ class PointCloudDataset(Dataset):
                     if 'gpus' in progress_config:
                         del progress_config['gpus']
                     # Compare with the current config (which we set later)
-                    if progress_config != progress['config']:
+                    if progress_config != self.config:
                         print("Progress file found but with different config. Overwriting.")
                         self.computed_indices = []
                     else:
@@ -966,32 +976,24 @@ class PointCloudDataset(Dataset):
         # Compute remaining indices (those items not yet computed)
         self.remaining_indices = sorted(list(set(range(total_items)) - set(self.computed_indices)))
         print(f"Resuming: {len(self.remaining_indices)} items left out of {total_items}.")
-
-        # Update configuration (including the overlap parameter)
-        self.config = {"path": path, "folder": folder, "dest": dest, "main_drive": main_drive, 
-                       "alternative_drives": alternative_drives, "fix_umbilicus": fix_umbilicus, "umbilicus_points_path": umbilicus_points_path, 
-                       "start": start, "stop": stop, "size": size, "umbilicus_distance_threshold": umbilicus_distance_threshold, 
-                       "score_threshold": score_threshold, "batch_size": batch_size, "gpus": gpus,
-                       "overlap_denumerator": overlap_denumerator}
     
-        # Pass overlap_denumerator and other config info to the prediction writer
-        self.writer = MyPredictionWriter(path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points_path, start, stop, size, umbilicus_distance_threshold, score_threshold, batch_size, gpus, num_processes, use_h5=use_h5, use_7z=use_7z, overlap_denumerator=overlap_denumerator)
-
+    def get_writer(self):
+        return self.writer
+    
     def is_saved_index_coords(self, idx, size, path, main_drive, alternative_drives, subvolume_size=50):
         """
-        Check if the subvolume corresponding to dataset item `idx` has already been computed.
+        Check if the subvolume corresponding to dataset index `idx` has been saved.
         """
-        # Increase size by one to account for tiling range
-        size = np.array(size).copy() + 1  
+        size = np.array(size).copy() + 1  # for the -1 in the range
         if isinstance(subvolume_size, int):
             subvolume_size = np.array([subvolume_size, subvolume_size, subvolume_size])
-        # Map the global index to block and subvolume indices
         block_idx = idx // (self.overlap_denumerator ** 3)
         sub_idx = idx % (self.overlap_denumerator ** 3)
-        x = self.start_list[block_idx]  # starting coordinate for this block
-        # Swap axes for proper ordering
+        x = self.start_list[block_idx]  # start coordinate for this block
+        # Swap axes
         axis_swap = [0, 2, 1]
         start_index = np.array(x)[axis_swap]
+        # Make blocks of size '50x50x50'
         indx_count = 0
         for xx in range(int((size[0] - 1) * self.overlap_denumerator)):
             x_coord = start_index[0] * subvolume_size[0] + (xx * subvolume_size[0] // self.overlap_denumerator)
@@ -1003,31 +1005,41 @@ class PointCloudDataset(Dataset):
                         continue
                     z_coord = start_index[2] * subvolume_size[2] + (z * subvolume_size[2] // self.overlap_denumerator)
                     start_coord = np.array([x_coord, y_coord, z_coord])
-                    # Build file names for the saved subvolume (tar and 7z alternatives)
-                    block_name = path + f"_subvolume_blocks/{start_coord[0]:06}_{start_coord[1]:06}_{start_coord[2]:06}"
+                    block_name = path + f"_subvolume_blocks/{start_coord[0]:06}_{start_coord[1]:06}_{start_coord[2]:06}" # nice ordering in the folder
                     block_name_tar = block_name + ".tar"
-                    block_name_tar_alternatives = [block_name.replace(main_drive, alt) + ".tar" for alt in alternative_drives]
+                    block_name_tar_alternatives = []
+                    for alternative_drive in alternative_drives:
+                        block_name_tar_alternatives.append(block_name.replace(main_drive, alternative_drive) + ".tar")
                     block_name_zip = block_name + ".7z"
-                    block_name_zip_alternatives = [block_name.replace(main_drive, alt) + ".7z" for alt in alternative_drives]
-                    # If any of the files exist, we assume this subvolume is computed.
-                    if os.path.exists(block_name_tar) or any(os.path.exists(x) for x in block_name_tar_alternatives) or os.path.exists(block_name_zip) or any(os.path.exists(x) for x in block_name_zip_alternatives):
+                    block_name_zip_alternatives = []
+                    for alternative_drive in alternative_drives:
+                        block_name_zip_alternatives.append(block_name.replace(main_drive, alternative_drive) + ".7z")
+                    # Computation exists
+                    if os.path.exists(block_name_tar) or any([os.path.exists(name) for name in block_name_tar_alternatives]) or os.path.exists(block_name_zip) or any([os.path.exists(name) for name in block_name_zip_alternatives]):
                         return True
+        # No computation exists
         return False
 
     def create_batches(self, idx__, path, src_folder, start, size, fix_umbilicus, umbilicus_points, umbilicus_points_old, main_drive, alternative_drives, subvolume_size=50, load_multithreaded=True, executor=None):
-        # [Implementation remains unchanged from previous version]
+        # Size is int
         if isinstance(subvolume_size, int):
             subvolume_size = np.array([subvolume_size, subvolume_size, subvolume_size])
+
+        # Iterate over all subvolumes
         start = np.array(start)
+        # Swap axes
         axis_swap = [0, 2, 1]
         axis_inverse_swap = [0, 2, 1]
         start_index = start[axis_swap]
+        # size is size = original size + 1, we want original size * 2 subvolume blocks that overlap
         subvolumes_points = []
         original_subvolumes_points = []
         subvolumes_normals = []
         subvolumes_colors = []
         start_coords = []
         block_names = []
+        
+        # Make blocks of size '50x50x50'
         indx_count = 0
         for xx in range(int((size[0] - 1) * self.overlap_denumerator)):
             x_coord = start_index[0] * subvolume_size[0] + (xx * subvolume_size[0] // self.overlap_denumerator)
@@ -1039,55 +1051,71 @@ class PointCloudDataset(Dataset):
                         continue
                     z_coord = start_index[2] * subvolume_size[2] + (z * subvolume_size[2] // self.overlap_denumerator)
                     start_coord = np.array([x_coord, y_coord, z_coord])
-                    block_name = path + f"_subvolume_blocks/{start_coord[0]:06}_{start_coord[1]:06}_{start_coord[2]:06}"
+                    block_name = path + f"_subvolume_blocks/{start_coord[0]:06}_{start_coord[1]:06}_{start_coord[2]:06}" # nice ordering in the folder
+                    block_name_tar = block_name + ".tar"
+                    block_name_tar_alternatives = []
+                    for alternative_drive in alternative_drives:
+                        block_name_tar_alternatives.append(block_name.replace(main_drive, alternative_drive) + ".tar")
+                    block_name_zip = block_name + ".7z"
+                    block_name_zip_alternatives = []
+                    for alternative_drive in alternative_drives:
+                        block_name_zip_alternatives.append(block_name.replace(main_drive, alternative_drive) + ".7z")
+                    
                     res_pc = load_pc_start(src_folder, main_drive, alternative_drives, start_coord[axis_inverse_swap] * 200.0 / 50.0, grid_block_size=200, load_multithreaded=load_multithreaded, executor=executor)
                     if res_pc is None:
                         continue
                     points, normals, colors = res_pc
-                    subvolume_points, original_subvolume_points, subvolume_normals, subvolume_colors, _ = extract_subvolume(points, normals, colors, colors, start=start_coord, size=subvolume_size)
+                    subvolume_points, original_subvolume_points, subvolume_normals, subvolume_colors, subvolume_angles = extract_subvolume(points, normals, colors, colors, start=start_coord, size=subvolume_size) 
                     if len(subvolume_points) < 10:
                         continue
+                    
                     subvolumes_points.append(subvolume_points)
                     original_subvolumes_points.append(original_subvolume_points)
                     subvolumes_normals.append(subvolume_normals)
                     subvolumes_colors.append(subvolume_colors)
                     start_coords.append(start_coord)
                     block_names.append(block_name)
+
         assert indx_count == self.overlap_denumerator ** 3, f"Index count is {indx_count} and should be exactly {self.overlap_denumerator ** 3}"
         return subvolumes_points, original_subvolumes_points, subvolumes_normals, subvolumes_colors, start_coords, block_names
 
     def precompute(self, idx__, index, start, size, path, folder, dest, main_drive, alternative_drives, fix_umbilicus, umbilicus_points, umbilicus_points_old, use_multiprocessing, executor=None):
         src_path = os.path.join(path, folder)
         dest_path = os.path.join(dest, folder)
-        size = np.array(size).copy() + 1
-        subvolumes_points, original_subvolumes_points, subvolumes_normals, subvolumes_colors, start_coords, block_names = self.create_batches(idx__, dest_path, src_path, start, size, fix_umbilicus, umbilicus_points, umbilicus_points_old, main_drive, alternative_drives, load_multithreaded=use_multiprocessed, executor=executor)
+        size = np.array(size).copy() + 1 # +1 because we want to include the last subvolume for tiling operation
+        
+        subvolumes_points, original_subvolumes_points, subvolumes_normals, subvolumes_colors, start_coords, block_names = self.create_batches(idx__, dest_path, src_path, start, size, fix_umbilicus, umbilicus_points, umbilicus_points_old, main_drive, alternative_drives, load_multithreaded=use_multiprocessing, executor=executor)
         return subvolumes_points, original_subvolumes_points, subvolumes_normals, subvolumes_colors, start_coords, block_names
-    
-    def get_writer(self):
-        return self.writer
 
     def __len__(self):
-        # Return the number of remaining dataset items (each subvolume is one item)
+        # Return the number of remaining subvolume items (each subvolume is now one dataset item)
         return len(self.remaining_indices)
 
     def __getitem__(self, idx):
+        # Get the actual dataset index (in the full range) from the remaining indices.
         actual_idx = self.remaining_indices[idx]
         block_idx = actual_idx // (self.overlap_denumerator ** 3)
         sub_idx = actual_idx % (self.overlap_denumerator ** 3)
         x = self.start_list[block_idx]
+
         res = self.precompute(sub_idx, block_idx, x, self.size, self.path, self.folder, self.dest, self.main_drive, self.alternative_drives, self.fix_umbilicus, self.umbilicus_points, self.umbilicus_points_old, False, None)
         points_batch, original_points_batch, normals_batch, colors_batch, start_coords, names_batch = res
 
+        # Filter out subvolumes with too few points
         valid_indices = [i for i, points in enumerate(points_batch) if points.shape[0] > 100]
         points_batch = [points_batch[i] for i in valid_indices]
         original_points_batch = [original_points_batch[i] for i in valid_indices]
         normals_batch = [normals_batch[i] for i in valid_indices]
         colors_batch = [colors_batch[i] for i in valid_indices]
         names_batch = [names_batch[i] for i in valid_indices]
+        # Deep copy the points
         coords_batch = [np.copy(points) for points in points_batch]
+        # Translate the points so that the volume starts at (0,0,0)
         min_coord_batch = [np.min(coords, axis=0) for coords in coords_batch]
         coords_batch = [coords - min_coord_batch[i] for i, coords in enumerate(coords_batch)]
+
         items_pytorch = [preprocess_points(c) for c in coords_batch]
+        # Return the batch along with the dataset index (actual_idx) so that progress can be updated for each item.
         return items_pytorch, original_points_batch, normals_batch, colors_batch, names_batch, actual_idx
 
 # Custom collation function
