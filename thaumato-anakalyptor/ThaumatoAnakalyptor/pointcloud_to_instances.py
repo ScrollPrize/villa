@@ -762,8 +762,8 @@ class MyPredictionWriter(BasePredictionWriter):
             for indxs in all_indices:
                 indxs = list(indxs)
                 # Filter out negative indices.
-                indxs = [i for i in indxs if i >= 0]
-                self.computed_indices.extend(list(set(indxs) - set(self.computed_indices)))
+                # indxs = [i for i in indxs if i >= 0]
+                self.computed_indices = list(set(self.computed_indices) + set(indxs))
             update_progress_file(self.progress_file, self.computed_indices, self.config)
     
     def post_process(self, res, items_pytorch, points_batch, normals_batch, colors_batch, names_batch, 
@@ -819,18 +819,22 @@ class MyPredictionWriter(BasePredictionWriter):
                 if tasks:
                     self.submit_task(self.async_save_batch_h5, thread_idx, tasks, distance_threshold, n, alpha, slope_alpha)
         else:
-            # Group the blocks (each block corresponds to one surface from the batch) by thread.
-            # Round-robin assignment: block i is assigned to thread index = i % 4.
-            random_offset = np.random.randint(4)
-            tasks_by_thread = {i: [] for i in range(4)}
+            # single threaded version
             for i in range(len(surfaces)):
-                thread_idx = (i + random_offset) % 4
-                tasks_by_thread[thread_idx].append((surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i]))
+                save_block_ply(surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i], self.score_threshold, distance_threshold, n, alpha, slope_alpha, False, [0] * len(surfaces[i]), [[]] * len(surfaces[i]), True, use_7z)
             
-            # For each thread that has tasks, submit a single task that writes all its assigned blocks.
-            for thread_idx, tasks in tasks_by_thread.items():
-                if tasks:
-                    self.submit_task(self.async_save_batch_tar, tasks, distance_threshold, n, alpha, slope_alpha, use_7z)
+            # # Group the blocks (each block corresponds to one surface from the batch) by thread.
+            # # Round-robin assignment: block i is assigned to thread index = i % 4.
+            # random_offset = np.random.randint(4)
+            # tasks_by_thread = {i: [] for i in range(4)}
+            # for i in range(len(surfaces)):
+            #     thread_idx = (i + random_offset) % 4
+            #     tasks_by_thread[thread_idx].append((surfaces[i], surfaces_normals[i], surfaces_colors[i], scores[i], names_batch[i]))
+            
+            # # For each thread that has tasks, submit a single task that writes all its assigned blocks.
+            # for thread_idx, tasks in tasks_by_thread.items():
+            #     if tasks:
+            #         self.submit_task(self.async_save_batch_tar, tasks, distance_threshold, n, alpha, slope_alpha, use_7z)
     
     def async_save_batch_h5(self, thread_idx, tasks, distance_threshold, n, alpha, slope_alpha):
         """
