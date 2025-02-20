@@ -1005,6 +1005,7 @@ class PointCloudDataset(Dataset):
                     # Computation exists
                     if os.path.exists(block_name_tar) or any([os.path.exists(block_name_tar_alternative) for block_name_tar_alternative in block_name_tar_alternatives]) or os.path.exists(block_name_zip) or any([os.path.exists(block_name_zip_alternative) for block_name_zip_alternative in block_name_zip_alternatives]):
                         return True
+                    print(f"Block {block_name_tar} does not exist.")
         # No computation exists
         return False
 
