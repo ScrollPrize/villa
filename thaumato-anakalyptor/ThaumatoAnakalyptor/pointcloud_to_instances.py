@@ -941,8 +941,12 @@ class PointCloudDataset(Dataset):
                     # Remove keys that we don’t use for config comparison
                     if 'batch_size' in progress_config:
                         del progress_config['batch_size']
+                    if 'batch_size' in self.config:
+                        del self.config['batch_size']
                     if 'gpus' in progress_config:
                         del progress_config['gpus']
+                    if 'gpus' in self.config:
+                        del self.config['gpus']
                     # Compare with the current config (which we set later)
                     if progress_config != self.config:
                         print("Progress file found but with different config. Overwriting.")
