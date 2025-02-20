@@ -1062,6 +1062,9 @@ class PointCloudDataset(Dataset):
         size = np.array(size).copy() + 1
         subvolumes_points, original_subvolumes_points, subvolumes_normals, subvolumes_colors, start_coords, block_names = self.create_batches(idx__, dest_path, src_path, start, size, fix_umbilicus, umbilicus_points, umbilicus_points_old, main_drive, alternative_drives, load_multithreaded=use_multiprocessed, executor=executor)
         return subvolumes_points, original_subvolumes_points, subvolumes_normals, subvolumes_colors, start_coords, block_names
+    
+    def get_writer(self):
+        return self.writer
 
     def __len__(self):
         # Return the number of remaining dataset items (each subvolume is one item)
