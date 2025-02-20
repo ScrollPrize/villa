@@ -566,7 +566,7 @@ def filter_umilicus_distance(start_list, size, path, folder, umbilicus_points_pa
 
     # loop over all start points
     start_list_filtered = []
-    for start in start_list:
+    for start in tqdm(start_list, desc="Filtering start list"):
         #check if start block is existing
         empty_block = True
         for i in range(size[0]):
@@ -961,7 +961,7 @@ class PointCloudDataset(Dataset):
                                             bad_i += 1
                                         else:
                                             good_i += 1
-                                    if 1.0 * good_i / bad_i > 0.5:
+                                    if bad_i== 0 or 1.0 * good_i / bad_i > 0.5:
                                         new_computed_indices.append(i)
                             self.computed_indices = progress['indices']
                             if new_computed_indices and set(new_computed_indices) != set(self.computed_indices):
