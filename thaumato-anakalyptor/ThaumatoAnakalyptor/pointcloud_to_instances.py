@@ -946,20 +946,18 @@ class PointCloudDataset(Dataset):
                         if 'indices' in progress:
                             self.computed_indices = progress['indices']
                             if update_saved_index_coords:
-                                has_differences = False
                                 new_computed_indices = []
-                                for i in self.computed_indices:
+                                for i in range(self.num_tasks):
                                     good_i = True
                                     for idx in range(i * (self.overlap_denumerator ** 3), (i + 1) * (self.overlap_denumerator ** 3)):
                                         if not self.is_saved_index_coords(idx, self.size, dest_path, self.main_drive, self.alternative_drives):
-                                            has_differences = True
                                             good_i = False
                                             break
                                     if good_i:
                                         new_computed_indices.append(i)
-                                if has_differences:
-                                    print("Some saved computations are missing. Overwriting progress file.")
-                                    self.computed_indices = new_computed_indices
+                                if set(new_computed_indices) != set(self.computed_indices):
+                                    print("Some saved computations are different. Overwriting progress file.")
+                                    self.computed_indices = list(set(new_computed_indices))
                                     update_progress_file(self.progress_file, self.computed_indices, self.config)
                             self.to_compute_indices = list(set(self.to_compute_indices) - set(self.computed_indices))
                             print(f"Resuming computation. {len(self.to_compute_indices)} blocks of {nr_total_indices} left to compute.")
