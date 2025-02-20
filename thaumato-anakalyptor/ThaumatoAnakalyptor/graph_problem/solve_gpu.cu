@@ -4554,7 +4554,7 @@ int fix_winding_nodes(std::vector<Node>& graph, int nr_nodes, int seed_node_old)
     }
 }
 
-std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float o, float spring_constant) {
+std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float o, float spring_constant, bool visualize) {
     if (i_round < 0) {
         o = o * 0.25f;
     }
@@ -4617,7 +4617,9 @@ std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations
             // Generate filename with zero padding
             std::ostringstream filename_plot;
             filename_plot << "python_angles/winding_angles_python_" << i_round << "_" << iter << ".png";
-            plot_nodes(graph, filename_plot.str());
+            if (visualize) {
+                plot_nodes(graph, filename_plot.str());
+            }
 
             // median_f_star
             auto [median1, median2] = min_max_percentile_f_star(graph, 0.5f);
