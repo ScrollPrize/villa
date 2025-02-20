@@ -949,7 +949,7 @@ class PointCloudDataset(Dataset):
                             if update_saved_index_coords:
                                 print("Trying to update saved index coordinates.")
                                 new_computed_indices = []
-                                for i in range(self.num_tasks):
+                                for i in self.to_compute_indices:
                                     good_i = True
                                     for idx in range(i * (self.overlap_denumerator ** 3), (i + 1) * (self.overlap_denumerator ** 3)):
                                         if not self.is_saved_index_coords(idx, self.size, dest_path, self.main_drive, self.alternative_drives):
@@ -1006,6 +1006,7 @@ class PointCloudDataset(Dataset):
                     
                     # Computation exists
                     if os.path.exists(block_name_tar) or any([os.path.exists(block_name_tar_alternative) for block_name_tar_alternative in block_name_tar_alternatives]) or os.path.exists(block_name_zip) or any([os.path.exists(block_name_zip_alternative) for block_name_zip_alternative in block_name_zip_alternatives]):
+                        print(f"Block {block_name_tar} already exists.")
                         return True
                     print(f"Block {block_name_tar} does not exist.")
         # No computation exists
