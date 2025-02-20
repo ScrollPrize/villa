@@ -1595,6 +1595,8 @@ class ScrollGraph(Graph):
                     #         print(f"Copied '{key}' to root level.")
 
             blocks_files = blocks_tar_files + blocks_7z_files + blocks_h5_files
+            # filter out blocks that contain '_temp' in their name
+            blocks_files = [block_file for block_file in blocks_files if '_temp' not in block_file]
             # sort blocks files
             blocks_files = sorted(blocks_files) # gimmick
             # debug with first 100
