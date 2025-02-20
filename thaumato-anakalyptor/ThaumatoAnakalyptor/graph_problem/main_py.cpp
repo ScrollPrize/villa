@@ -418,11 +418,11 @@ class Solver {
             // solve the graph
             graph = run_solver(graph, o, spring_constant, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, seed_node, other_block_factor, down_index, up_index, side_fix_nr, std_target, std_target_step, increase_same_block_weight);
         }
-        void solve_f_star(int num_iterations, float spring_constant, int i_round = 1, float o_ = 0.0f) {
+        void solve_f_star(int num_iterations, float spring_constant, int i_round = 1, float o_ = 0.0f, bool visualize = false) {
             // use the f_star solver for the intermediate solution
             // store only the valid indices to speed up the loop
             std::vector<size_t> valid_indices = get_valid_indices(graph);
-            graph = run_solver_f_star(graph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, o_, spring_constant);
+            graph = run_solver_f_star(graph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, o_, spring_constant, visualize);
         }
         void filter_f_star() {
             // Filters the graph edges based on the f star solution
@@ -696,7 +696,8 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("num_iterations") = 10000,
             py::arg("spring_constant") = 1.2f,
             py::arg("i_round") = -1,
-            py::arg("o") = 0.0f)
+            py::arg("o") = 0.0f,
+            py::arg("visualize") = false)
         .def("filter_f_star", &Solver::filter_f_star,
             "Method to filter the graph edges after running the f star solver")
         .def("solve_ring", &Solver::solve_ring,
