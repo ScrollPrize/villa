@@ -618,11 +618,13 @@ class Graph:
         self.edges = {}  # Stores edges with update matrices and certainty factors
         self.nodes = {}  # Stores node beliefs and fixed status
 
-    def add_node(self, node, centroid, winding_angle=None, winding_angle_gt=None):
+    def add_node(self, node, centroid, winding_angle=None, winding_angle_gt=None, sample_point=None):
         node = tuple(int(node[i]) for i in range(4))
         self.nodes[node] = {'centroid': centroid, "winding_angle": winding_angle}
         if not winding_angle_gt is None:
             self.nodes[node]['winding_angle_gt'] = winding_angle_gt
+        if not sample_point is None:
+            self.nodes[node]['sample_point'] = sample_point
 
     def compute_node_edges(self, verbose=True):
         """
@@ -1095,8 +1097,11 @@ def process_block(args):
         main_block_patches_list = subvolume_surface_patches_folder(file_name, sample_ratio=overlapp_threshold["sample_ratio_score"])
 
         patches_centroids = {}
+        patches_points = {}
         for patch in main_block_patches_list:
             patches_centroids[tuple(patch["ids"][0])] = patch["centroid"]
+            random_point = patch["points"][np.random.choice(patch["points"].shape[0], 1, replace=False)]
+            patches_points[tuple(patch["ids"][0])] = random_point
 
         # Extract block's integer ID
         block_id = [int(i) for i in file_path.split('/')[-1].split('.')[0].split("_")]
@@ -1139,10 +1144,10 @@ def process_block(args):
         score_switching_sheets, score_bad_edges = process_same_block(main_block_patches_list, overlapp_threshold, umbilicus_distance)
 
         # Process and return results...
-        return score_sheets, score_switching_sheets, score_bad_edges, patches_centroids
+        return score_sheets, score_switching_sheets, score_bad_edges, patches_centroids, patches_points
     except Exception as e:
         print(f"function process_block (instances_to_graph.py) Error: {e}")
-        return [], [], [], {}
+        return [], [], [], {}, {}
 
 def init_worker_build_GT(mesh_file, pointcloud_dir):
     """
@@ -1622,15 +1627,17 @@ class ScrollGraph(Graph):
 
             count_res = 0
             patches_centroids = {}
+            patches_points = {}
             nodes_set = frozenset(self.nodes.keys()) # faster membership test
             # Process results from each worker
-            for score_sheets, score_switching_sheets, score_bad_edges, volume_centroids in tqdm(results, desc="Processing results"):
+            for score_sheets, score_switching_sheets, score_bad_edges, volume_centroids, volume_points in tqdm(results, desc="Processing results"):
                 count_res += len(score_sheets)
                 # Calculate scores, add patches edges to graph, etc.
                 self.build_other_block_edges(score_sheets, update_edges=update_edges, nodes_set=nodes_set)
                 self.build_same_block_edges(score_switching_sheets, update_edges=update_edges, nodes_set=nodes_set)
                 # self.build_bad_edges(score_bad_edges)
                 patches_centroids.update(volume_centroids)
+                patches_points.update(volume_points)
             print(f"Number of results: {count_res}")
 
             if not update_edges:
@@ -1648,7 +1655,8 @@ class ScrollGraph(Graph):
                         umbilicus_point = umbilicus_func(patches_centroids[node][1])[[0, 2]]
                         umbilicus_vector = umbilicus_point - patches_centroids[node][[0, 2]]
                         angle = angle_between(umbilicus_vector) * 180.0 / np.pi
-                        self.add_node(node, patches_centroids[node], winding_angle=angle)
+                        node_point = patches_points[node]
+                        self.add_node(node, patches_centroids[node], winding_angle=angle, sample_point=node_point)
                     except:
                         try:
                             del self.edges[edge]
@@ -1678,7 +1686,7 @@ class ScrollGraph(Graph):
         graph = ScrollGraph(self.overlapp_threshold, self.umbilicus_path)
         # add all nodes
         for node in self.nodes:
-            graph.add_node(node, self.nodes[node]['centroid'], winding_angle=self.nodes[node]['winding_angle'])
+            graph.add_node(node, self.nodes[node]['centroid'], winding_angle=self.nodes[node]['winding_angle'], sample_point=self.nodes[node]['sample_point'] if 'sample_point' in self.nodes[node] else None)
         return graph
     
     def set_overlapp_threshold(self, overlapp_threshold):
@@ -1827,7 +1835,7 @@ class ScrollGraph(Graph):
             centroid = self.nodes[node]['centroid']
             winding_angle = self.nodes[node]['winding_angle']
             if (tolerated_nodes is not None) and (node in tolerated_nodes):
-                subgraph.add_node(node, centroid, winding_angle=winding_angle, winding_angle_gt=self.nodes[node]['winding_angle_gt'] if 'winding_angle_gt' in self.nodes[node] else None)
+                subgraph.add_node(node, centroid, winding_angle=winding_angle, winding_angle_gt=self.nodes[node]['winding_angle_gt'] if 'winding_angle_gt' in self.nodes[node] else None, sample_point=self.nodes[node]['sample_point'] if 'sample_point' in self.nodes[node] else None)
                 continue
             elif (min_z is not None) and (centroid[1] < min_z):
                 continue
@@ -1844,7 +1852,7 @@ class ScrollGraph(Graph):
             elif (umbilicus_max_distance is not None) and np.linalg.norm(umbilicus_func(centroid[1]) - centroid) > umbilicus_max_distance:
                 continue
             else:
-                subgraph.add_node(node, centroid, winding_angle=winding_angle, winding_angle_gt=self.nodes[node]['winding_angle_gt'] if 'winding_angle_gt' in self.nodes[node] else None)
+                subgraph.add_node(node, centroid, winding_angle=winding_angle, winding_angle_gt=self.nodes[node]['winding_angle_gt'] if 'winding_angle_gt' in self.nodes[node] else None, sample_point=self.nodes[node]['sample_point'] if 'sample_point' in self.nodes[node] else None)
         for edge in self.edges:
             node1, node2 = edge
             if (tolerated_nodes is not None) and (node1 in tolerated_nodes) and (node2 in tolerated_nodes): # dont add useless edges
@@ -1864,7 +1872,7 @@ class ScrollGraph(Graph):
         subgraph = ScrollGraph(self.overlapp_threshold, self.umbilicus_path)
         # Add nodes
         for node in nodes_set:
-            subgraph.add_node(node, self.nodes[node]['centroid'], winding_angle=self.nodes[node]['winding_angle'])
+            subgraph.add_node(node, self.nodes[node]['centroid'], winding_angle=self.nodes[node]['winding_angle'], sample_point=self.nodes[node]['sample_point'] if 'sample_point' in self.nodes[node] else None)
         # add ks
         subgraph.update_winding_angles(nodes, ks, update_winding_angles=False)
         
