@@ -657,8 +657,10 @@ class MyPredictionWriter(BasePredictionWriter):
         self.use_h5 = use_h5
         self.use_7z = use_7z
 
-        # Create a fixed thread pool of 4 threads.
-        self.executor = ThreadPoolExecutor(max_workers=4)
+        # Create a fixed thread pool of 8 threads.
+        self.executor = ThreadPoolExecutor(max_workers=8)
+        # Initialize a semaphore to limit pending tasks to 100.
+        self.task_semaphore = threading.Semaphore(100)
 
         self.start_list = build_start_list(start, stop, size, path, folder, umbilicus_points_path, umbilicus_distance_threshold)
         self.num_tasks = len(self.start_list)
@@ -685,12 +687,11 @@ class MyPredictionWriter(BasePredictionWriter):
                 progress = json.load(file)
                 if 'config' in progress:
                     progress_config = progress['config']
-                    # delete batch size
+                    # Remove batch_size and gpus for comparison.
                     if 'batch_size' in progress_config:
                         del progress_config['batch_size']
                     if 'batch_size' in self.config:
                         del self.config['batch_size']
-                    # delete gpus
                     if 'gpus' in progress_config:
                         del progress_config['gpus']
                     if 'gpus' in self.config:
@@ -705,6 +706,20 @@ class MyPredictionWriter(BasePredictionWriter):
                             print(f"Resuming computation. {len(self.to_compute_indices)} blocks of {nr_total_indices} left to compute.")
                         else:
                             print("No progress file found.")
+
+    def submit_task(self, fn, *args, **kwargs):
+        # Block if there are already 100 pending tasks.
+        self.task_semaphore.acquire()
+        # Submit the wrapped function.
+        future = self.executor.submit(self._wrapped_fn, fn, *args, **kwargs)
+        return future
+       
+    def _wrapped_fn(self, fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            # Ensure that the semaphore is released even if the task fails.
+            self.task_semaphore.release()
 
     def write_on_batch_end(self, trainer:"pl.Trainer", pl_module:"pl.LightningModule", 
                              prediction, batch_indices, batch, batch_idx:int, dataloader_idx:int) -> None:
@@ -739,7 +754,7 @@ class MyPredictionWriter(BasePredictionWriter):
         if trainer.is_global_zero:
             for indxs in all_indices:
                 indxs = list(indxs)
-                # filter out negative indices
+                # Filter out negative indices.
                 indxs = [i for i in indxs if i >= 0]
                 self.computed_indices.extend(list(set(indxs) - set(self.computed_indices)))
             update_progress_file(self.progress_file, self.computed_indices, self.config)
@@ -795,7 +810,7 @@ class MyPredictionWriter(BasePredictionWriter):
             # For each thread that has tasks, submit a single task that writes all its assigned blocks.
             for thread_idx, tasks in tasks_by_thread.items():
                 if tasks:
-                    self.executor.submit(self.async_save_batch_h5, thread_idx, tasks, distance_threshold, n, alpha, slope_alpha)
+                    self.submit_task(self.async_save_batch_h5, thread_idx, tasks, distance_threshold, n, alpha, slope_alpha)
         else:
             # Group the blocks (each block corresponds to one surface from the batch) by thread.
             # Round-robin assignment: block i is assigned to thread index = i % 4.
@@ -808,7 +823,7 @@ class MyPredictionWriter(BasePredictionWriter):
             # For each thread that has tasks, submit a single task that writes all its assigned blocks.
             for thread_idx, tasks in tasks_by_thread.items():
                 if tasks:
-                    self.executor.submit(self.async_save_batch_tar, tasks, distance_threshold, n, alpha, slope_alpha, use_7z)
+                    self.submit_task(self.async_save_batch_tar, tasks, distance_threshold, n, alpha, slope_alpha, use_7z)
     
     def async_save_batch_h5(self, thread_idx, tasks, distance_threshold, n, alpha, slope_alpha):
         """
@@ -831,8 +846,8 @@ class MyPredictionWriter(BasePredictionWriter):
         """
         for (surf, norm, col, scr, nname) in tasks:
             save_block_ply(surf, norm, col, scr, nname,
-                            self.score_threshold, distance_threshold, n, alpha, slope_alpha, False,
-                                [0] * len(surf), [[]] * len(surf), True, use_7z)
+                           self.score_threshold, distance_threshold, n, alpha, slope_alpha, False,
+                           [0] * len(surf), [[]] * len(surf), True, use_7z)
     
     def finalize(self):
         """
@@ -848,7 +863,7 @@ class MyPredictionWriter(BasePredictionWriter):
         # Only merge on global rank 0.
         rank = dist.get_rank() if dist.is_initialized() else 0
         if rank == 0:
-            # find all intermediate files in h5_dir
+            # Find all intermediate files in the h5 directory.
             h5_dir = os.path.dirname(self.intermediate_filenames[0])
             self.intermediate_filenames = [os.path.join(h5_dir, f) for f in os.listdir(h5_dir) if f.endswith(".h5")]
             with h5py.File(self.final_filename, "w") as h5f_final:
