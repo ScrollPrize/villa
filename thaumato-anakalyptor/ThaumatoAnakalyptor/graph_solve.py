@@ -95,12 +95,13 @@ def update_sides(solver):
 
 def run_f_star(solver, experiment_name="", continue_from=0, visualize=False):
     print(f"Running f_star solver")
+    print(f"Visualize {visualize}")
     save_path = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_f_star_0.bin"
     if continue_from == 0:
         # remove and remake dirs python_angles to save the solver visualization
         os.system("rm -rf python_angles")
         os.system("mkdir python_angles")
-        solver.solve_f_star(num_iterations=100000, spring_constant=5.0, o=0.0, i_round=-1)
+        solver.solve_f_star(num_iterations=100000, spring_constant=5.0, o=0.0, i_round=-1, visualize=visualize)
         solver.save_graph(save_path)
     elif continue_from == 1:
         solver.load_graph(save_path)
@@ -113,11 +114,11 @@ def run_f_star(solver, experiment_name="", continue_from=0, visualize=False):
         solver.solve_f_star(num_iterations=20000, spring_constant=2.50, o=0.0, i_round=3, visualize=visualize)
         solver.solve_f_star(num_iterations=20000, spring_constant=1.75, o=0.0, i_round=4, visualize=visualize)
         solver.solve_f_star(num_iterations=20000, spring_constant=1.5, o=0.0, i_round=5, visualize=visualize)
-        # solver.solve_f_star(num_iterations=30000, spring_constant=1.0, o=0.0, i_round=6, visualize=visualize)
-        # solver.solve_f_star(num_iterations=15000, spring_constant=0.75, o=0.02, i_round=7, visualize=visualize)
-        # solver.solve_f_star(num_iterations=15000, spring_constant=0.8, o=0.02, i_round=8, visualize=visualize)
-        # solver.solve_f_star(num_iterations=15000, spring_constant=0.9, o=0.02, i_round=9, visualize=visualize)
-        # solver.solve_f_star(num_iterations=15000, spring_constant=1.1, o=0.0, i_round=10, visualize=visualize)
+        solver.solve_f_star(num_iterations=30000, spring_constant=1.0, o=0.0, i_round=6, visualize=visualize)
+        solver.solve_f_star(num_iterations=15000, spring_constant=0.75, o=0.02, i_round=7, visualize=visualize)
+        solver.solve_f_star(num_iterations=15000, spring_constant=0.8, o=0.02, i_round=8, visualize=visualize)
+        solver.solve_f_star(num_iterations=15000, spring_constant=0.9, o=0.02, i_round=9, visualize=visualize)
+        solver.solve_f_star(num_iterations=15000, spring_constant=1.1, o=0.0, i_round=10, visualize=visualize)
         solver.save_graph(save_path)
     else:
         solver.load_graph(save_path)

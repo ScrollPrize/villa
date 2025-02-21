@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import (
     QAction, QMessageBox, QInputDialog, QGraphicsEllipseItem, QFileDialog,
     QProgressDialog, QDialog, QFormLayout, QDialogButtonBox, QLineEdit
 )
-from PyQt5.QtCore import Qt, QEvent
+from PyQt5.QtCore import Qt, QEvent, QPointF
 import pyqtgraph as pg
 from scipy.spatial import cKDTree
 import time
@@ -143,7 +143,11 @@ class PointCloudLabeler(QMainWindow):
         self.line_z_center = pg.InfiniteLine(angle=0, pen=pg.mkPen('grey', width=1, style=Qt.DashLine))
         self.line_z_upper  = pg.InfiniteLine(angle=0, pen=pg.mkPen('grey', width=1, style=Qt.DashLine))
         self.line_z_lower  = pg.InfiniteLine(angle=0, pen=pg.mkPen('grey', width=1, style=Qt.DashLine))
-        self.shear_indicator = pg.InfiniteLine(angle=0, pen=pg.mkPen('orange', width=1, style=Qt.DashLine))
+        # Orange indicator (for XZ shear) originally belonged to XZ view;
+        # now we switch it to the XY view.
+        self.xz_shear_indicator = pg.InfiniteLine(angle=0, pen=pg.mkPen('orange', width=1, style=Qt.DashLine))
+        # Purple indicator (for XY horizontal shear) is now switched to the XZ view.
+        self.xy_horizontal_indicator = pg.InfiniteLine(angle=0, pen=pg.mkPen('purple', width=1, style=Qt.DashLine))
         
         # Cursor circle.
         self.cursor_circle = QGraphicsEllipseItem(0, 0, 0, 0)
@@ -178,6 +182,19 @@ class PointCloudLabeler(QMainWindow):
         xy_controls.addWidget(self.z_center_widget)
         xy_controls.addWidget(self.z_thickness_widget)
         left_column.addLayout(xy_controls)
+        # Add two new shear controls for the XY view:
+        # Vertical shear (rotating around the f_star axis)
+        xy_vertical_shear_layout = QHBoxLayout()
+        self.xy_vertical_shear_widget, self.xy_vertical_shear_slider, self.xy_vertical_shear_spinbox = self.create_sync_slider_spinbox(
+            "XY Vertical Shear (°):", -90.0, 90.0, 0.0, decimals=1)
+        xy_vertical_shear_layout.addWidget(self.xy_vertical_shear_widget)
+        left_column.addLayout(xy_vertical_shear_layout)
+        # Horizontal shear (rotating around the f_init axis)
+        xy_horizontal_shear_layout = QHBoxLayout()
+        self.xy_horizontal_shear_widget, self.xy_horizontal_shear_slider, self.xy_horizontal_shear_spinbox = self.create_sync_slider_spinbox(
+            "XY Horizontal Shear (°):", -90.0, 90.0, 0.0, decimals=1)
+        xy_horizontal_shear_layout.addWidget(self.xy_horizontal_shear_widget)
+        left_column.addLayout(xy_horizontal_shear_layout)
         self.apply_calc_xy_button = QPushButton("Apply Updated Labels to XY")
         self.apply_calc_xy_button.clicked.connect(self.apply_calculated_labels_xy)
         left_column.addWidget(self.apply_calc_xy_button)
@@ -200,6 +217,12 @@ class PointCloudLabeler(QMainWindow):
         xz_controls.addWidget(self.finit_center_widget)
         xz_controls.addWidget(self.finit_thickness_widget)
         right_column.addLayout(xz_controls)
+        # XZ shear control (unchanged functionality)
+        xz_shear_layout = QHBoxLayout()
+        self.xz_shear_widget, self.xz_shear_slider, self.xz_shear_spinbox = self.create_sync_slider_spinbox(
+            "XZ Shear (°):", -90.0, 90.0, 0.0, decimals=1)
+        xz_shear_layout.addWidget(self.xz_shear_widget)
+        right_column.addLayout(xz_shear_layout)
         self.apply_calc_xz_button = QPushButton("Apply Updated Labels to XZ")
         self.apply_calc_xz_button.clicked.connect(self.apply_calculated_labels_xz)
         right_column.addWidget(self.apply_calc_xz_button)
@@ -266,10 +289,6 @@ class PointCloudLabeler(QMainWindow):
         self.radius_widget, self.radius_slider, self.radius_spinbox = self.create_sync_slider_spinbox(
             "Drawing radius:", 1.0, 20.0, 5, decimals=0)
         common_controls_layout.addWidget(self.radius_widget)
-        
-        self.shear_widget, self.shear_slider, self.shear_spinbox = self.create_sync_slider_spinbox(
-            "Shear (°):", -90.0, 90.0, 0.0, decimals=1)
-        common_controls_layout.addWidget(self.shear_widget)
         
         max_disp_layout = QHBoxLayout()
         max_disp_label = QLabel("Max Display Points:")
@@ -381,16 +400,11 @@ class PointCloudLabeler(QMainWindow):
         help_menu.addAction(usage_action)
     
     def load_data(self):
-        # Create a custom dialog with two entries: bin folder and experiment name.
         dialog = QDialog(self)
         dialog.setWindowTitle("Load Data")
         layout = QVBoxLayout(dialog)
-
         form_layout = QFormLayout()
-        
-        # Create the bin folder entry with a browse button.
         bin_path_lineedit = QLineEdit()
-        # Use the directory portion of the current graph_path as default.
         bin_path_lineedit.setText(os.path.dirname(self.graph_path))
         browse_button = QPushButton("Browse...")
         browse_button.setToolTip("Click to choose the bin folder")
@@ -398,38 +412,26 @@ class PointCloudLabeler(QMainWindow):
         h_layout.addWidget(bin_path_lineedit)
         h_layout.addWidget(browse_button)
         form_layout.addRow("Bin Folder:", h_layout)
-        
-        # Create the experiment name entry.
         exp_lineedit = QLineEdit()
         exp_lineedit.setText(self.default_experiment)
         form_layout.addRow("Experiment name:", exp_lineedit)
-        
         layout.addLayout(form_layout)
-        
-        # OK and Cancel buttons.
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         layout.addWidget(button_box)
-        
-        # Connect the browse button to open a directory chooser.
         browse_button.clicked.connect(lambda: self.browse_for_directory(bin_path_lineedit))
-        
-        # Connect dialog buttons.
         button_box.accepted.connect(dialog.accept)
         button_box.rejected.connect(dialog.reject)
-        
-        # Execute the dialog.
         if dialog.exec_() == QDialog.Accepted:
             selected_dir = bin_path_lineedit.text().strip()
             exp_name = exp_lineedit.text().strip()
+            self.default_experiment = exp_name
             if not selected_dir or not exp_name:
                 return
-            # Assume graph.bin is inside the selected directory.
             bin_file_path = os.path.join(selected_dir, "graph.bin")
             if not os.path.exists(bin_file_path):
                 QMessageBox.warning(self, "Load Data", f"File {bin_file_path} does not exist.")
                 return
             self.graph_path = bin_file_path
-            # Load the solver using the bin file and experiment name.
             self.solver = graph_problem_gpu_py.Solver(self.graph_path,
                                                     z_min=self.default_z_min,
                                                     z_max=self.default_z_max)
@@ -448,7 +450,7 @@ class PointCloudLabeler(QMainWindow):
             self.kdtree_xz = cKDTree(self.points[:, [0, 2]])
             self.update_slider_ranges()
             self.update_views()
-
+    
     def browse_for_directory(self, lineedit):
         directory = QFileDialog.getExistingDirectory(self, "Select Bin Folder", lineedit.text() or os.getcwd())
         if directory:
@@ -486,30 +488,23 @@ class PointCloudLabeler(QMainWindow):
             "   • XZ View (right): f_star (horizontal) vs. Z (vertical).\n\n"
             "2. Slice Controls:\n"
             "   • Adjust Z slice (XY) and f init slice (XZ) using the sliders.\n\n"
-            "3. Drawing:\n"
+            "3. Shear Controls:\n"
+            "   • XZ Shear: Applies shear to the XZ view (x_new = f_star + shear*(finit - center)).\n"
+            "     (Orange indicator now appears in the XY view.)\n"
+            "   • XY Vertical Shear: In the XY view, shifts f_init based on (z - z_center).\n"
+            "   • XY Horizontal Shear: In the XY view, shifts f_star based on (z - z_center).\n"
+            "     (Purple indicator now appears in the XZ view.)\n\n"
+            "4. Drawing:\n"
             "   • Use the mouse to manually label points. The active label is set in the 'Label' spinbox.\n\n"
-            "4. Updated Label Tools:\n"
-            "   • Update Labels: Compute calculated labels using the solver.\n"
-            "   • Clear Updated Labels: Reset calculated labels.\n"
-            "   • Apply Updated Labels to XY/XZ: Copy calculated labels for the current slice.\n\n"
-            "5. Spline Tools (Top Row Controls):\n"
-            "   • Update Labels\n"
-            "   • Min points for spline\n"
-            "   • Update Spline\n"
-            "   • Clear Splines\n"
-            "   • Disregard label 0: When checked, points with an effective winding number of 0 are ignored.\n"
-            "   • Assign Line Labels: Assign manual labels based on spline distances.\n"
-            "   • Line dist thresh\n"
-            "   • Spline winding range (min and max)\n\n"
-            "6. Common Controls (Bottom Row):\n"
-            "   • Drawing radius, Shear, Max Display Points, Drawing Mode, Pipette, Label selection,\n"
-            "     Updated Labels Draw Mode, Apply/Clear Updated Labels, Save Labeled Graph.\n\n"
-            "7. Key Shortcuts:\n"
-            "   • P: Activate pipette mode (to pick a label from a point).\n"
-            "   • U: Toggle Updated Labels Draw Mode.\n"
-            "   • Ctrl+Z: Undo last action.\n"
-            "   • Ctrl+Y: Redo last undone action.\n\n"
-            "8. Saving:\n"
+            "5. Updated Label Tools:\n"
+            "   • Update Labels, Clear Updated Labels, Apply Updated Labels to XY/XZ.\n\n"
+            "6. Spline Tools (Top Row):\n"
+            "   • Update Labels, Min points for spline, Update/Clear Spline, etc.\n\n"
+            "7. Common Controls (Bottom Row):\n"
+            "   • Drawing radius, Max Display Points, Drawing Mode, Pipette, Label selection, etc.\n\n"
+            "8. Key Shortcuts:\n"
+            "   • P: Pipette, U: Toggle Updated Labels Draw Mode, Ctrl+Z: Undo, Ctrl+Y: Redo.\n\n"
+            "9. Saving:\n"
             "   • Use the Data menu to load data or save/load labels, and to save the final labeled graph.\n"
         )
         QMessageBox.information(self, "Usage Instructions", help_text)
@@ -539,7 +534,6 @@ class PointCloudLabeler(QMainWindow):
         return container, slider, spinbox
     
     def update_slider_ranges(self):
-        # Update Z center slider/spinbox based on new Z range.
         self.z_min = float(np.min(self.points[:, 2]))
         self.z_max = float(np.max(self.points[:, 2]))
         self.z_center_slider.setMinimum(int(self.z_min * self.scaleFactor))
@@ -549,8 +543,6 @@ class PointCloudLabeler(QMainWindow):
         center_val = (self.z_min + self.z_max) / 2
         self.z_center_slider.setValue(int(center_val * self.scaleFactor))
         self.z_center_spinbox.setValue(center_val)
-
-        # Update Z thickness slider/spinbox (range from 0.01 to the full Z range).
         z_range = self.z_max - self.z_min
         self.z_thickness_slider.setMinimum(int(0.01 * self.scaleFactor))
         self.z_thickness_slider.setMaximum(int(z_range * self.scaleFactor))
@@ -593,6 +585,7 @@ class PointCloudLabeler(QMainWindow):
         return self.kdtree_xy.query_ball_point([x, effective_y], r=r)
     
     def update_guides(self):
+        # For the XY view:
         if self.show_guides_checkbox.isChecked():
             try:
                 self.xy_plot.addItem(self.line_finit_neg)
@@ -612,10 +605,13 @@ class PointCloudLabeler(QMainWindow):
                 self.xy_plot.addItem(self.line_finit_lower)
             except Exception:
                 pass
-            angle = self.shear_spinbox.value()
-            self.shear_indicator.setAngle(angle)
+            # Add the orange indicator (original XZ shear) to the XY view.
+            self.xz_shear_indicator.setAngle(self.xz_shear_spinbox.value())
+            center_f_star = (self.f_star_min + self.f_star_max) / 2
+            center_f_init = (self.f_init_min + self.f_init_max) / 2
+            self.xz_shear_indicator.setPos(QPointF(center_f_star, center_f_init))
             try:
-                self.xy_plot.addItem(self.shear_indicator)
+                self.xy_plot.addItem(self.xz_shear_indicator)
             except Exception:
                 pass
         else:
@@ -625,10 +621,11 @@ class PointCloudLabeler(QMainWindow):
                 self.xy_plot.removeItem(self.line_finit_center)
                 self.xy_plot.removeItem(self.line_finit_upper)
                 self.xy_plot.removeItem(self.line_finit_lower)
-                self.xy_plot.removeItem(self.shear_indicator)
+                self.xy_plot.removeItem(self.xz_shear_indicator)
             except Exception:
                 pass
         
+        # For the XZ view:
         if self.show_guides_checkbox.isChecked():
             z_center = self.z_center_spinbox.value()
             z_thickness = self.z_thickness_slider.value() / self.scaleFactor
@@ -641,11 +638,21 @@ class PointCloudLabeler(QMainWindow):
                 self.xz_plot.addItem(self.line_z_lower)
             except Exception:
                 pass
+            # Add the purple indicator (new XY horizontal shear) to the XZ view.
+            self.xy_horizontal_indicator.setAngle(self.xy_horizontal_shear_spinbox.value())
+            center_f_star = (self.f_star_min + self.f_star_max) / 2
+            center_z = (self.z_min + self.z_max) / 2
+            self.xy_horizontal_indicator.setPos(QPointF(center_f_star, center_z))
+            try:
+                self.xz_plot.addItem(self.xy_horizontal_indicator)
+            except Exception:
+                pass
         else:
             try:
                 self.xz_plot.removeItem(self.line_z_center)
                 self.xz_plot.removeItem(self.line_z_upper)
                 self.xz_plot.removeItem(self.line_z_lower)
+                self.xz_plot.removeItem(self.xy_horizontal_indicator)
             except Exception:
                 pass
     
@@ -814,7 +821,16 @@ class PointCloudLabeler(QMainWindow):
         pts_combined, labels_combined, calc_labels_combined = self.downsample_points(
             pts_combined, labels_combined, calc_labels_combined, self.max_display)
         brushes_xy = self.get_brushes_from_labels(labels_combined)
-        self.xy_scatter.setData(x=pts_combined[:, 0], y=pts_combined[:, 1],
+        # Apply two shear transformations for the XY view:
+        # Vertical shear (shifts f_init)
+        shear_vertical = self.xy_vertical_shear_spinbox.value()
+        vertical_factor = np.tan(np.radians(shear_vertical))
+        # Horizontal shear (shifts f_star)
+        shear_horizontal = self.xy_horizontal_shear_spinbox.value()
+        horizontal_factor = np.tan(np.radians(shear_horizontal))
+        new_f_init = pts_combined[:, 1] + vertical_factor * (pts_combined[:, 2] - z_center)
+        new_f_star = pts_combined[:, 0] + horizontal_factor * (pts_combined[:, 2] - z_center)
+        self.xy_scatter.setData(x=new_f_star, y=new_f_init,
                                 size=self.point_size, pen=None, brush=brushes_xy)
         
         finit_center = self.finit_center_spinbox.value()
@@ -824,8 +840,8 @@ class PointCloudLabeler(QMainWindow):
         mask_xz = (self.points[:, 1] >= finit_min_val) & (self.points[:, 1] <= finit_max_val)
         pts_xz = self.points[mask_xz]
         labels_xz = self.labels[mask_xz]
-        shear_angle_deg = self.shear_spinbox.value()
-        shear_factor = np.tan(np.radians(shear_angle_deg))
+        shear_angle_deg_xz = self.xz_shear_spinbox.value()
+        shear_factor = np.tan(np.radians(shear_angle_deg_xz))
         if pts_xz.size:
             x_new = pts_xz[:, 0] + shear_factor * (pts_xz[:, 1] - finit_center)
         else:
@@ -883,7 +899,6 @@ class PointCloudLabeler(QMainWindow):
             self.xy_plot.removeItem(item)
         self.spline_items = []
         self.spline_segments = {}
-        
         z_center = self.z_center_spinbox.value()
         z_thickness = self.z_thickness_slider.value() / self.scaleFactor
         z_min_val = z_center - z_thickness / 2
@@ -892,8 +907,6 @@ class PointCloudLabeler(QMainWindow):
         pts = self.points[mask]
         labels_xy = self.labels[mask]
         calc_labels_xy = self.calculated_labels[mask]
-        
-        # Compute adjusted f_init and effective winding numbers.
         f_init_adjusted = np.empty_like(pts[:, 1])
         effective_labels = np.empty_like(labels_xy)
         for i in range(len(pts)):
@@ -904,7 +917,6 @@ class PointCloudLabeler(QMainWindow):
             else:
                 f_init_adjusted[i] = pts[i, 1]
             base_label = labels_xy[i] if labels_xy[i] != self.UNLABELED else calc_labels_xy[i]
-            # For effective label, if base_label is 0, we assign 0.
             effective_labels[i] = base_label if base_label != self.UNLABELED else self.UNLABELED
             if base_label != self.UNLABELED:
                 if pts[i, 1] < -180:
@@ -913,8 +925,6 @@ class PointCloudLabeler(QMainWindow):
                     effective_labels[i] = base_label + 1
                 else:
                     effective_labels[i] = base_label
-        
-        # Optionally disregard label 0.
         valid = effective_labels != self.UNLABELED
         if self.disregard_label0_checkbox.isChecked():
             valid = valid & (effective_labels != 0)
@@ -923,13 +933,11 @@ class PointCloudLabeler(QMainWindow):
         f_init_valid = f_init_adjusted[valid]
         f_star_valid = pts[valid, 0]
         eff_labels_valid = effective_labels[valid]
-        
         threshold = self.spline_min_points_spinbox.value()
         step = 5
         unique_labels = np.unique(eff_labels_valid)
         temp_segments = {}
         for ul in unique_labels:
-            # For label 0, if not disregarded, require at least 2 points.
             if ul == 0:
                 if len(np.where(eff_labels_valid == 0)[0]) < 2:
                     continue
@@ -981,7 +989,6 @@ class PointCloudLabeler(QMainWindow):
             if not segments:
                 continue
             temp_segments[ul] = (grid, fitted_values, segments)
-        
         sorted_ul = sorted(temp_segments.keys())
         final_segments = {}
         for i, ul in enumerate(sorted_ul):
@@ -1031,7 +1038,6 @@ class PointCloudLabeler(QMainWindow):
                         new_segments.append(new_seg)
             if new_segments:
                 final_segments[ul] = (grid, fitted_values, new_segments)
-        
         for ul, (grid, fitted_values, segments) in final_segments.items():
             self.spline_segments[ul] = []
             mod = int(ul) % 3
@@ -1068,7 +1074,6 @@ class PointCloudLabeler(QMainWindow):
         effective_labels = np.where(np.abs(base_label - self.UNLABELED) < 2, self.UNLABELED,
                                     np.where(f_init < -180, base_label - 1,
                                              np.where(f_init > 180, base_label + 1, base_label)))
-        # Optionally disregard label 0.
         if self.disregard_label0_checkbox.isChecked():
             effective_labels[effective_labels == 0] = self.UNLABELED
         assign_min = self.assign_min_spinbox.value()
