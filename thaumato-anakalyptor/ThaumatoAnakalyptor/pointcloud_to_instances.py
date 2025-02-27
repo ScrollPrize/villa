@@ -1195,7 +1195,7 @@ def main():
     batch_size = 5
     gpus = -1
     pointcloud_size = 1
-    overlap_denumerator = 3
+    overlap_denumerator = 2
 
     # Create an argument parser
     parser = argparse.ArgumentParser(description="Compute surface patches from pointcloud.")
