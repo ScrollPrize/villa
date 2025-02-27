@@ -744,15 +744,6 @@ class MyPredictionWriter(BasePredictionWriter):
         all_indices = [None] * world_size
         # Gather predictions and batch objects from all processes.
         dist.all_gather_object(all_indices, indxs)
-        
-        # Only execute file writing on the master process.
-        if trainer.is_global_zero:
-            for indxs in all_indices:
-                indxs = list(indxs)
-                # Filter out negative indices.
-                # indxs = [i for i in indxs if i >= 0]
-                self.computed_indices = list(set(self.computed_indices + indxs))
-            update_progress_file(self.progress_file, self.computed_indices, self.config)
 
         if prediction and len(prediction) > 0:
             self.post_process(
@@ -766,6 +757,15 @@ class MyPredictionWriter(BasePredictionWriter):
                 use_h5=self.use_h5,
                 use_7z=self.use_7z
             )
+        
+        # Only execute file writing on the master process.
+        if trainer.is_global_zero:
+            for indxs in all_indices:
+                indxs = list(indxs)
+                # Filter out negative indices.
+                # indxs = [i for i in indxs if i >= 0]
+                self.computed_indices = list(set(self.computed_indices + indxs))
+            update_progress_file(self.progress_file, self.computed_indices, self.config)
     
     def post_process(self, res, items_pytorch, points_batch, normals_batch, colors_batch, names_batch, 
                      use_multiprocessing=False, distance_threshold=10.0, n=4, alpha=1000.0, 
