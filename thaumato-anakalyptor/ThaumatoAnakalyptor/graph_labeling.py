@@ -1183,11 +1183,12 @@ class PointCloudLabeler(QMainWindow):
     def update_labels(self):
         if self.solver is not None:
             gt = np.abs((self.labels - self.UNLABELED) > 2)
-            if not np.any(gt):
-                return
+            # if not np.any(gt):
+            #     return
             self.solver.set_labels(self.labels, gt)
             self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1,
                                              other_block_factor=15.0, side_fix_nr=-1, display=False)
+            # self.solver.solve_union()
             calculated_labels = self.solver.get_labels()
             self.calculated_labels = np.array(calculated_labels)
             self.update_views()

@@ -275,6 +275,9 @@ def main(graph_path="graph_scroll5_january_unrolling_full_v2.bin", experiment_na
     save_path = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_f_star_final.bin"
     solver.save_graph(save_path)
 
+    # solver.solve_union()
+    # exit()
+
     # fresh_start_ring = 0 # continue solve computation from fresh_start
     scale_outer = 1.0 # S5 right side
     scale_inner = 1.0 # S5 left side

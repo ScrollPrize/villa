@@ -22,6 +22,7 @@ Julian Schilliger 2024 ThaumatoAnakalyptor
 #include <random>
 #include <queue>
 #include <numeric>
+#include "mst_union.h"
 
 namespace fs = std::filesystem;
 namespace py = pybind11;
@@ -430,6 +431,10 @@ class Solver {
             // get largest connected component
             largest_connected_component();
         }
+        void solve_union() {
+            // use the union solver for the final solution
+            solveGraphUnion(graph);
+        }
         void solve_ring(int num_iterations, int i_round = 1, float other_block_factor = 1.0f, float std_target = 0.013f, float std_target_step = 0.0f, 
                         bool increase_same_block_weight = true, bool convergence_speedup = false, float convergence_thresh = 0.0f, bool wiggle = true, 
                         bool standard_winding_direction = false, float scale_left=1.0f, float scale_right=1.0f, bool enable_delete_nodes = true) {
@@ -700,6 +705,8 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("visualize") = false)
         .def("filter_f_star", &Solver::filter_f_star,
             "Method to filter the graph edges after running the f star solver")
+        .def("solve_union", &Solver::solve_union,
+            "Method to solve the graph with the union solver")
         .def("solve_ring", &Solver::solve_ring,
             "Method to refine the graph edges with the ring solver",
             py::arg("num_iterations") = 10000,
