@@ -81,8 +81,7 @@ class PointCloudLabeler(QMainWindow):
                                    "checkpoints", "checkpoint_graph_solver_connected_2.bin")
             if not os.path.exists(gt_path):
                 gt_path = os.path.join("experiments", self.default_experiment,
-                                       "checkpoints", "checkpoint_graph_f_star_0.bin")
-                                    #    "checkpoints", "checkpoint_graph_f_star_final.bin")
+                                       "checkpoints", "checkpoint_graph_f_star_final.bin")
             if os.path.exists(gt_path):
                 self.solver.load_graph(gt_path)
             else:
