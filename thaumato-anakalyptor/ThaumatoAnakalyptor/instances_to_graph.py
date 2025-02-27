@@ -207,7 +207,7 @@ def build_surrounding_volumes_dict(kd_tree, block_ids, overlapp_threshold, volum
         surrounding_volumes = block_ids[idxs]
 
         # filter out volume ids that have more than one dimension difference
-        surrounding_volumes = [volume for volume in surrounding_volumes if np.sum(volume == volume_id) == 1]
+        surrounding_volumes = [volume for volume in surrounding_volumes if np.sum(volume == volume_id) == 2]
 
         # filter sucht that only connections to larger ids are stored
         surrounding_volumes = [volume for volume in surrounding_volumes if not (volume[0] < volume_id[0] or volume[1] < volume_id[1] or volume[2] < volume_id[2])]
