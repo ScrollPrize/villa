@@ -1,4 +1,5 @@
 import sys, os, ast, numpy as np
+import json
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QSlider, QLabel, QSpinBox, QDoubleSpinBox, QCheckBox,
@@ -72,6 +73,9 @@ class PointCloudLabeler(QMainWindow):
         self.default_z_min = 3000
         self.default_z_max = 4000
         self.default_experiment = "denominator3-rotated"
+
+        # Load config (if available) to override defaults.
+        self.load_config()
         
         # Initialize solver if no external point data is provided.
         if point_data is None:
@@ -287,7 +291,7 @@ class PointCloudLabeler(QMainWindow):
         # --------------------------------------------------------------------
         common_controls_layout = QHBoxLayout()
         self.radius_widget, self.radius_slider, self.radius_spinbox = self.create_sync_slider_spinbox(
-            "Drawing radius:", 1.0, 20.0, 5, decimals=0)
+            "Drawing radius:", 0.1, 20.0, 2.5, decimals=1)
         common_controls_layout.addWidget(self.radius_widget)
         
         max_disp_layout = QHBoxLayout()
@@ -361,6 +365,38 @@ class PointCloudLabeler(QMainWindow):
         
         self.update_guides()
         self.update_views()
+
+    def load_config(self):
+        config_file = "config_labeling_gui.json"
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, "r") as f:
+                    config = json.load(f)
+                # Override defaults if available in the config.
+                self.graph_path = config.get("graph_path", self.graph_path)
+                self.default_experiment = config.get("default_experiment", self.default_experiment)
+                print("Loaded config:", config)
+            except Exception as e:
+                print("Error loading config file:", e)
+        else:
+            print("Config file not found. Using default settings.")
+
+    def save_config(self):
+        config = {
+            "graph_path": self.graph_path,
+            "default_experiment": self.default_experiment
+        }
+        try:
+            with open("config_labeling_gui.json", "w") as f:
+                json.dump(config, f, indent=4)
+            print("Config saved.")
+        except Exception as e:
+            print("Error saving config:", e)
+
+    def closeEvent(self, event):
+        # Save the config when the GUI closes.
+        self.save_config()
+        event.accept()
     
     # --------------------------------------------------
     # Event filter for cursor circle.
@@ -582,16 +618,15 @@ class PointCloudLabeler(QMainWindow):
             effective_y = y + 360
         else:
             effective_y = y
-        return self.kdtree_xy.query_ball_point([x, effective_y], r=r)
+        return np.asarray(self.kdtree_xy.query_ball_point([x, effective_y], r=r))
     
     def update_guides(self):
         # For the XY view:
         if self.show_guides_checkbox.isChecked():
-            try:
+            if self.line_finit_neg.scene() is None:
                 self.xy_plot.addItem(self.line_finit_neg)
+            if self.line_finit_pos.scene() is None:
                 self.xy_plot.addItem(self.line_finit_pos)
-            except Exception:
-                pass
             finit_center = self.finit_center_spinbox.value()
             finit_thickness = self.finit_thickness_slider.value() / self.scaleFactor
             upper = finit_center + finit_thickness / 2
@@ -599,31 +634,25 @@ class PointCloudLabeler(QMainWindow):
             self.line_finit_center.setPos(finit_center)
             self.line_finit_upper.setPos(upper)
             self.line_finit_lower.setPos(lower)
-            try:
+            if self.line_finit_center.scene() is None:
                 self.xy_plot.addItem(self.line_finit_center)
+            if self.line_finit_upper.scene() is None:
                 self.xy_plot.addItem(self.line_finit_upper)
+            if self.line_finit_lower.scene() is None:
                 self.xy_plot.addItem(self.line_finit_lower)
-            except Exception:
-                pass
-            # Add the orange indicator (original XZ shear) to the XY view.
+            # Add the orange indicator only if not added already.
             self.xz_shear_indicator.setAngle(self.xz_shear_spinbox.value())
             center_f_star = (self.f_star_min + self.f_star_max) / 2
             center_f_init = (self.f_init_min + self.f_init_max) / 2
             self.xz_shear_indicator.setPos(QPointF(center_f_star, center_f_init))
-            try:
+            if self.xz_shear_indicator.scene() is None:
                 self.xy_plot.addItem(self.xz_shear_indicator)
-            except Exception:
-                pass
         else:
-            try:
-                self.xy_plot.removeItem(self.line_finit_neg)
-                self.xy_plot.removeItem(self.line_finit_pos)
-                self.xy_plot.removeItem(self.line_finit_center)
-                self.xy_plot.removeItem(self.line_finit_upper)
-                self.xy_plot.removeItem(self.line_finit_lower)
-                self.xy_plot.removeItem(self.xz_shear_indicator)
-            except Exception:
-                pass
+            # Remove guide items if guides are turned off.
+            for item in [self.line_finit_neg, self.line_finit_pos, self.line_finit_center,
+                        self.line_finit_upper, self.line_finit_lower, self.xz_shear_indicator]:
+                if item.scene() is not None:
+                    self.xy_plot.removeItem(item)
         
         # For the XZ view:
         if self.show_guides_checkbox.isChecked():
@@ -632,29 +661,19 @@ class PointCloudLabeler(QMainWindow):
             self.line_z_center.setPos(z_center)
             self.line_z_upper.setPos(z_center + z_thickness / 2)
             self.line_z_lower.setPos(z_center - z_thickness / 2)
-            try:
-                self.xz_plot.addItem(self.line_z_center)
-                self.xz_plot.addItem(self.line_z_upper)
-                self.xz_plot.addItem(self.line_z_lower)
-            except Exception:
-                pass
-            # Add the purple indicator (new XY horizontal shear) to the XZ view.
+            for item in [self.line_z_center, self.line_z_upper, self.line_z_lower]:
+                if item.scene() is None:
+                    self.xz_plot.addItem(item)
             self.xy_horizontal_indicator.setAngle(self.xy_horizontal_shear_spinbox.value())
             center_f_star = (self.f_star_min + self.f_star_max) / 2
             center_z = (self.z_min + self.z_max) / 2
             self.xy_horizontal_indicator.setPos(QPointF(center_f_star, center_z))
-            try:
+            if self.xy_horizontal_indicator.scene() is None:
                 self.xz_plot.addItem(self.xy_horizontal_indicator)
-            except Exception:
-                pass
         else:
-            try:
-                self.xz_plot.removeItem(self.line_z_center)
-                self.xz_plot.removeItem(self.line_z_upper)
-                self.xz_plot.removeItem(self.line_z_lower)
-                self.xz_plot.removeItem(self.xy_horizontal_indicator)
-            except Exception:
-                pass
+            for item in [self.line_z_center, self.line_z_upper, self.line_z_lower, self.xy_horizontal_indicator]:
+                if item.scene() is not None:
+                    self.xz_plot.removeItem(item)
     
     def downsample_points(self, pts, labels, calc_labels=None, max_display=1):
         n = pts.shape[0]
@@ -732,107 +751,269 @@ class PointCloudLabeler(QMainWindow):
         ev.accept()
     
     def _paint_points(self, ev, plot_widget, view_name):
+        start_time = time.time()
+        current_time = time.time()
+        # Get the current mouse position in view coordinates
         mouse_point = plot_widget.plotItem.vb.mapSceneToView(ev.scenePos())
         x_m = mouse_point.x()
         y_m = mouse_point.y()
         current_label = self.label_spinbox.value()
         r = self.radius_spinbox.value()
-        if view_name == 'xy':
-            if y_m > 180:
-                update_label = current_label + 1
-            elif y_m < -180:
-                update_label = current_label - 1
+
+        # If we have a previous mouse position less than 0.5 seconds old,
+        # create 10 intermediate steps along the line.
+        if hasattr(self, 'last_mouse_time') and (current_time - self.last_mouse_time < 0.5):
+            last_x, last_y = self.last_mouse_point
+            distance = np.sqrt((x_m - last_x) ** 2 + (y_m - last_y) ** 2)
+            if distance > 40:
+                xs = [x_m]
+                ys = [y_m]
             else:
-                update_label = current_label
-            if update_label in [self.UNLABELED + 1, self.UNLABELED - 1]:
-                update_label = self.UNLABELED
-            indices = self.get_nearby_indices_xy(x_m, y_m, r)
-            z_center = self.z_center_spinbox.value()
-            z_thickness = self.z_thickness_slider.value() / self.scaleFactor
-            z_min_val = z_center - z_thickness / 2
-            z_max_val = z_center + z_thickness / 2
-            indices = [i for i in indices if self.points[i, 2] >= z_min_val and self.points[i, 2] <= z_max_val]
-        elif view_name == 'xz':
-            indices = self.kdtree_xz.query_ball_point([x_m, y_m], r=r)
-            finit_center = self.finit_center_spinbox.value()
-            finit_thickness = self.finit_thickness_slider.value() / self.scaleFactor
-            finit_min_val = finit_center - finit_thickness / 2
-            finit_max_val = finit_center + finit_thickness / 2
-            indices = [i for i in indices if self.points[i, 1] >= finit_min_val and self.points[i, 1] <= finit_max_val]
-            update_label = current_label
+                steps = 10
+                xs = np.linspace(last_x, x_m, steps)
+                ys = np.linspace(last_y, y_m, steps)
         else:
-            indices = []
-        indices = np.array(indices)
-        if indices.size:
-            self.labels[indices] = update_label
+            xs = [x_m]
+            ys = [y_m]
+
+        # For each step along the interpolated path, update labels near that point.
+        for x, y in zip(xs, ys):
+            if view_name == 'xy':
+                # Adjust the label based on the y coordinate.
+                if y > 180:
+                    update_label = current_label + 1
+                elif y < -180:
+                    update_label = current_label - 1
+                else:
+                    update_label = current_label
+                # Ensure that the update_label does not accidentally flip to an invalid state.
+                if update_label in [self.UNLABELED + 1, self.UNLABELED - 1]:
+                    update_label = self.UNLABELED
+
+                # Get nearby indices in the xy plane.
+                indices = np.array(self.get_nearby_indices_xy(x, y, r))
+                z_center = self.z_center_spinbox.value()
+                z_thickness = self.z_thickness_slider.value() / self.scaleFactor
+                z_min_val = z_center - z_thickness / 2
+                z_max_val = z_center + z_thickness / 2
+                mask = (self.points[indices, 2] >= z_min_val) & (self.points[indices, 2] <= z_max_val)
+                indices = indices[mask]
+
+            elif view_name == 'xz':
+                # For the xz view, use the KDTree to find nearby points.
+                indices = np.asarray(self.kdtree_xz.query_ball_point([x, y], r=r))
+                finit_center = self.finit_center_spinbox.value()
+                finit_thickness = self.finit_thickness_slider.value() / self.scaleFactor
+                finit_min_val = finit_center - finit_thickness / 2
+                finit_max_val = finit_center + finit_thickness / 2
+                mask = (self.points[indices, 1] >= finit_min_val) & (self.points[indices, 1] <= finit_max_val)
+                indices = indices[mask]
+                update_label = current_label
+            else:
+                indices = np.array([])
+
+            # Update the labels for the points that were found.
+            if indices.size:
+                self.labels[indices] = update_label
+
+        # Save the current mouse position and time for the next event.
+        self.last_mouse_point = (x_m, y_m)
+        self.last_mouse_time = current_time
+
+        end_time = time.time()  # finished updating labels
         self.update_views()
-    
+        end_time2 = time.time()  # finished updating views
+        # print(f"Time to update labels: {end_time - start_time:.4f} s, "
+        #     f"Time to update views: {end_time2 - end_time:.4f} s")
+
     def _paint_points_calculated(self, ev, plot_widget, view_name):
+        start_time = time.time()
+        current_time = time.time()
+        # Get the current mouse position in view coordinates.
         mouse_point = plot_widget.plotItem.vb.mapSceneToView(ev.scenePos())
         x_m = mouse_point.x()
         y_m = mouse_point.y()
         r = self.radius_spinbox.value()
-        if view_name == 'xy':
-            indices = self.get_nearby_indices_xy(x_m, y_m, r)
-            z_center = self.z_center_spinbox.value()
-            z_thickness = self.z_thickness_slider.value() / self.scaleFactor
-            z_min_val = z_center - z_thickness / 2
-            z_max_val = z_center + z_thickness / 2
-            indices = [i for i in indices if self.points[i, 2] >= z_min_val and self.points[i, 2] <= z_max_val]
-            for i in indices:
-                if self.labels[i] == self.UNLABELED and self.calculated_labels[i] != self.UNLABELED:
-                    self.labels[i] = self.calculated_labels[i]
-        elif view_name == 'xz':
-            indices = self.kdtree_xz.query_ball_point([x_m, y_m], r=r)
-            finit_center = self.finit_center_spinbox.value()
-            finit_thickness = self.finit_thickness_slider.value() / self.scaleFactor
-            finit_min_val = finit_center - finit_thickness / 2
-            finit_max_val = finit_center + finit_thickness / 2
-            indices = [i for i in indices if self.points[i, 1] >= finit_min_val and self.points[i, 1] <= finit_max_val]
-            for i in indices:
-                if self.labels[i] == self.UNLABELED and self.calculated_labels[i] != self.UNLABELED:
-                    self.labels[i] = self.calculated_labels[i]
+
+        # If a previous mouse event occurred within 0.5 sec, interpolate 10 steps.
+        if hasattr(self, 'last_mouse_time') and (current_time - self.last_mouse_time < 0.5):
+            last_x, last_y = self.last_mouse_point
+            distance = np.sqrt((x_m - last_x) ** 2 + (y_m - last_y) ** 2)
+            if distance > 40:
+                xs = [x_m]
+                ys = [y_m]
+            else:
+                steps = 10
+                xs = np.linspace(last_x, x_m, steps)
+                ys = np.linspace(last_y, y_m, steps)
+        else:
+            xs = [x_m]
+            ys = [y_m]
+
+        # For each intermediate position, update the calculated labels.
+        for x, y in zip(xs, ys):
+            if view_name == 'xy':
+                indices = np.array(self.get_nearby_indices_xy(x, y, r))
+                z_center = self.z_center_spinbox.value()
+                z_thickness = self.z_thickness_slider.value() / self.scaleFactor
+                z_min_val = z_center - z_thickness / 2
+                z_max_val = z_center + z_thickness / 2
+                mask = (self.points[indices, 2] >= z_min_val) & (self.points[indices, 2] <= z_max_val)
+                indices = indices[mask]
+                for i in indices:
+                    if self.labels[i] == self.UNLABELED and self.calculated_labels[i] != self.UNLABELED:
+                        self.labels[i] = self.calculated_labels[i]
+            elif view_name == 'xz':
+                indices = np.asarray(self.kdtree_xz.query_ball_point([x, y], r=r))
+                finit_center = self.finit_center_spinbox.value()
+                finit_thickness = self.finit_thickness_slider.value() / self.scaleFactor
+                finit_min_val = finit_center - finit_thickness / 2
+                finit_max_val = finit_center + finit_thickness / 2
+                mask = (self.points[indices, 1] >= finit_min_val) & (self.points[indices, 1] <= finit_max_val)
+                indices = indices[mask]
+                for i in indices:
+                    if self.labels[i] == self.UNLABELED and self.calculated_labels[i] != self.UNLABELED:
+                        self.labels[i] = self.calculated_labels[i]
+
+        # Save the current mouse position and time for the next event.
+        self.last_mouse_point = (x_m, y_m)
+        self.last_mouse_time = current_time
+
+        end_time = time.time()  # Finished updating labels.
         self.update_views()
-    
+        end_time2 = time.time()  # Finished updating views.
+        # print(f"Time to update calc labels: {end_time - start_time:.4f} s, Time to update views: {end_time2 - end_time:.4f} s")
+
     def update_views(self):
+        t0 = time.time()
+        # ----- Compute z-slice values -----
         z_center = self.z_center_spinbox.value()
         z_thickness = self.z_thickness_slider.value() / self.scaleFactor
         z_min_val = z_center - z_thickness / 2
         z_max_val = z_center + z_thickness / 2
+        t1 = time.time()
+        # print("Step 1 (z-slice):", t1 - t0, "s")
+        
+        # ----- Process XY view visible points -----
         mask_xy = (self.points[:, 2] >= z_min_val) & (self.points[:, 2] <= z_max_val)
         pts_xy = self.points[mask_xy]
         labels_xy = self.labels[mask_xy]
         calc_labels_xy = self.calculated_labels[mask_xy]
+        t2 = time.time()
+        # print("Step 2 (XY: mask & extract pts/labels):", t2 - t1, "s")
+        
+        # ----- Adjust wrapping: top -----
         mask_top = pts_xy[:, 1] < -90
         pts_top = pts_xy[mask_top].copy()
         if pts_top.size:
             pts_top[:, 1] += 360
         labels_top = labels_xy[mask_top] - 1
         calc_labels_top = calc_labels_xy[mask_top] - 1
+        t3 = time.time()
+        # print("Step 3 (XY: top wrap adjustment):", t3 - t2, "s")
+        
+        # ----- Adjust wrapping: bottom -----
         mask_bottom = pts_xy[:, 1] > 90
         pts_bottom = pts_xy[mask_bottom].copy()
         if pts_bottom.size:
             pts_bottom[:, 1] -= 360
         labels_bottom = labels_xy[mask_bottom] + 1
         calc_labels_bottom = calc_labels_xy[mask_bottom] + 1
+        t4 = time.time()
+        # print("Step 4 (XY: bottom wrap adjustment):", t4 - t3, "s")
+        
+        # ----- Combine and downsample XY arrays -----
         pts_combined = np.concatenate([pts_xy, pts_top, pts_bottom], axis=0)
         labels_combined = np.concatenate([labels_xy, labels_top, labels_bottom], axis=0)
         calc_labels_combined = np.concatenate([calc_labels_xy, calc_labels_top, calc_labels_bottom], axis=0)
         pts_combined, labels_combined, calc_labels_combined = self.downsample_points(
             pts_combined, labels_combined, calc_labels_combined, self.max_display)
-        brushes_xy = self.get_brushes_from_labels(labels_combined)
-        # Apply two shear transformations for the XY view:
-        # Vertical shear (shifts f_init)
+        t5 = time.time()
+        # print("Step 5 (XY: combine & downsample):", t5 - t4, "s")
+        
+        # ----- Compute new brushes for XY view -----
+        new_brushes_xy = self.get_brushes_from_labels(labels_combined)
+        t6 = time.time()
+        # print("XY Step 6 (brushes):", t6 - t5, "s")
+        
+        # ----- Build geometry for XY view (shear transforms) -----
         shear_vertical = self.xy_vertical_shear_spinbox.value()
         vertical_factor = np.tan(np.radians(shear_vertical))
-        # Horizontal shear (shifts f_star)
         shear_horizontal = self.xy_horizontal_shear_spinbox.value()
         horizontal_factor = np.tan(np.radians(shear_horizontal))
         new_f_init = pts_combined[:, 1] + vertical_factor * (pts_combined[:, 2] - z_center)
         new_f_star = pts_combined[:, 0] + horizontal_factor * (pts_combined[:, 2] - z_center)
-        self.xy_scatter.setData(x=new_f_star, y=new_f_init,
-                                size=self.point_size, pen=None, brush=brushes_xy)
+        new_xy_geometry = {'x': new_f_star, 'y': new_f_init}
+        t6b = time.time()
+        # print("XY Step 6b (shear geometry):", t6b - t6, "s")
         
+        # ----- Caching for XY view geometry & brushes -----
+        xy_key = (z_center,
+                self.z_thickness_slider.value(),
+                self.xy_vertical_shear_spinbox.value(),
+                self.xy_horizontal_shear_spinbox.value(),
+                pts_combined.shape[0])
+        if not hasattr(self, "_cached_xy_key") or self._cached_xy_key != xy_key:
+            # Geometry changed; perform full update.
+            self.xy_scatter.setData(x=new_xy_geometry['x'], y=new_xy_geometry['y'],
+                                    size=self.point_size, pen=None, brush=new_brushes_xy)
+            self._cached_xy_geometry = new_xy_geometry
+            self._cached_xy_brushes = new_brushes_xy.copy()
+            self._cached_xy_key = xy_key
+            # print("XY: Full setData update")
+        else:
+            t6c = time.time()
+            # Geometry unchanged; update brushes only if necessary.
+            changed_mask = np.array([new_brushes_xy[i] != self._cached_xy_brushes[i]
+                                    for i in range(len(new_brushes_xy))])
+            # print(f"XY: Brushes size: {new_brushes_xy.size}, changed mask size: {changed_mask.size}, nr changed: {np.sum(changed_mask)}")
+            t6d = time.time()
+            # print("XY: changed mask time:", t6d - t6c, "s")
+            if np.any(changed_mask):
+                self.xy_scatter.setBrush(new_brushes_xy)
+                self._cached_xy_brushes[changed_mask] = new_brushes_xy[changed_mask]
+                # print("XY: Partial brush update")
+            t6e = time.time()
+            # print("XY: Brush update time:", t6e - t6d, "s")
+        t7 = time.time()
+        # print("XY Caching update:", t7 - t6b, "s")
+        
+        # ----- Caching for XY calc labels -----
+        mask_calc = (np.abs(labels_combined - self.UNLABELED) <= 1) & \
+                    (np.abs(calc_labels_combined - self.UNLABELED) > 1)
+        pts_combined_calc = pts_combined[mask_calc]
+        calc_labels_combined_calc = calc_labels_combined[mask_calc]
+        new_brushes_calc_xy = np.empty(calc_labels_combined_calc.shape[0], dtype=object)
+        for i, lab in enumerate(calc_labels_combined_calc):
+            mod = lab % 3
+            if mod == 0:
+                new_brushes_calc_xy[i] = self.calc_brush_red
+            elif mod == 1:
+                new_brushes_calc_xy[i] = self.calc_brush_green
+            elif mod == 2:
+                new_brushes_calc_xy[i] = self.calc_brush_blue
+        calc_xy_key = (z_center, self.z_thickness_slider.value(), pts_combined_calc.shape[0])
+        if not hasattr(self, "_cached_calc_xy_key") or self._cached_calc_xy_key != calc_xy_key:
+            self.xy_calc_scatter.setData(x=pts_combined_calc[:, 0] if pts_combined_calc.size else [],
+                                        y=pts_combined_calc[:, 1] if pts_combined_calc.size else [],
+                                        size=self.point_size, pen=None, brush=new_brushes_calc_xy)
+            self._cached_calc_xy_geometry = {'x': pts_combined_calc[:, 0] if pts_combined_calc.size else [],
+                                            'y': pts_combined_calc[:, 1] if pts_combined_calc.size else []}
+            self._cached_calc_xy_brushes = new_brushes_calc_xy.copy()
+            self._cached_calc_xy_key = calc_xy_key
+            # print("XY Calc: Full setData update")
+        else:
+            changed_mask_calc = np.array([new_brushes_calc_xy[i] != self._cached_calc_xy_brushes[i]
+                                        for i in range(len(new_brushes_calc_xy))])
+            # print(f"XY Calc: Brushes size: {new_brushes_calc_xy.size}, changed mask size: {changed_mask_calc.size}, nr changed: {np.sum(changed_mask)}")
+            if np.any(changed_mask_calc):
+                self.xy_calc_scatter.setBrush(new_brushes_calc_xy)
+                self._cached_calc_xy_brushes[changed_mask_calc] = new_brushes_calc_xy[changed_mask_calc]
+                # print("XY Calc: Partial brush update")
+        t7b = time.time()
+        # print("XY Calc Caching update:", t7b - t7, "s")
+        
+        # ----- Process XZ view -----
         finit_center = self.finit_center_spinbox.value()
         finit_thickness = self.finit_thickness_slider.value() / self.scaleFactor
         finit_min_val = finit_center - finit_thickness / 2
@@ -841,58 +1022,94 @@ class PointCloudLabeler(QMainWindow):
         pts_xz = self.points[mask_xz]
         labels_xz = self.labels[mask_xz]
         shear_angle_deg_xz = self.xz_shear_spinbox.value()
-        shear_factor = np.tan(np.radians(shear_angle_deg_xz))
+        xz_shear_factor = np.tan(np.radians(shear_angle_deg_xz))
         if pts_xz.size:
-            x_new = pts_xz[:, 0] + shear_factor * (pts_xz[:, 1] - finit_center)
+            new_x_xz = pts_xz[:, 0] + xz_shear_factor * (pts_xz[:, 1] - finit_center)
         else:
-            x_new = pts_xz[:, 0]
+            new_x_xz = pts_xz[:, 0]
         pts_xz_display = pts_xz.copy()
-        pts_xz_display[:, 0] = x_new
+        pts_xz_display[:, 0] = new_x_xz
         pts_xz_display, labels_xz = self.downsample_points(pts_xz_display, labels=labels_xz, max_display=self.max_display)
-        brushes_xz = self.get_brushes_from_labels(labels_xz)
-        self.xz_scatter.setData(x=pts_xz_display[:, 0], y=pts_xz_display[:, 2],
-                                size=self.point_size, pen=None, brush=brushes_xz)
+        new_xz_geometry = {'x': pts_xz_display[:, 0], 'y': pts_xz_display[:, 2]}
+        new_brushes_xz = self.get_brushes_from_labels(labels_xz)
+        t8 = time.time()
+        # print("XZ Step 8 (processing & downsampling):", t8 - t7b, "s")
         
-        mask_calc = (np.abs(labels_combined - self.UNLABELED) <= 1) & (np.abs(calc_labels_combined - self.UNLABELED) > 1)
-        pts_combined_calc = pts_combined[mask_calc]
-        labels_combined_calc = calc_labels_combined[mask_calc]
-        brushes_calc = np.empty(labels_combined_calc.shape[0], dtype=object)
-        for i, lab in enumerate(labels_combined_calc):
-            mod = lab % 3
-            if mod == 0:
-                brushes_calc[i] = self.calc_brush_red
-            elif mod == 1:
-                brushes_calc[i] = self.calc_brush_green
-            elif mod == 2:
-                brushes_calc[i] = self.calc_brush_blue
-        self.xy_calc_scatter.setData(x=pts_combined_calc[:, 0] if pts_combined_calc.size else [],
-                                     y=pts_combined_calc[:, 1] if pts_combined_calc.size else [],
-                                     size=self.point_size, pen=None, brush=brushes_calc)
+        # ----- Caching for XZ view geometry & brushes -----
+        xz_key = (finit_center,
+                self.finit_thickness_slider.value(),
+                self.xz_shear_spinbox.value(),
+                pts_xz_display.shape[0])
+        if not hasattr(self, "_cached_xz_key") or self._cached_xz_key != xz_key:
+            self.xz_scatter.setData(x=new_xz_geometry['x'], y=new_xz_geometry['y'],
+                                    size=self.point_size, pen=None, brush=new_brushes_xz)
+            self._cached_xz_geometry = new_xz_geometry
+            self._cached_xz_brushes = new_brushes_xz.copy()
+            self._cached_xz_key = xz_key
+            # print("XZ: Full setData update")
+        else:
+            t8b = time.time()
+            changed_mask_xz = np.array([new_brushes_xz[i] != self._cached_xz_brushes[i]
+                                        for i in range(len(new_brushes_xz))])
+            # print(f"XZ: Brushes size: {new_brushes_xz.size}, changed mask size: {changed_mask_xz.size}")
+            t8c = time.time()
+            # print("XZ: changed mask time:", t8c - t8b, "s")
+            if np.any(changed_mask_xz):
+                self.xz_scatter.setBrush(new_brushes_xz)
+                self._cached_xz_brushes[changed_mask_xz] = new_brushes_xz[changed_mask_xz]
+                # print("XZ: Partial brush update")
+            t8d = time.time()
+            # print("XZ: Brush update time:", t8d - t8c, "s")
+        t9 = time.time()
+        # print("XZ Caching update:", t9 - t8, "s")
         
-        mask_xz = (self.points[:, 1] >= finit_min_val) & (self.points[:, 1] <= finit_max_val)
-        pts_xz_full = self.points[mask_xz]
-        manual_labels_xz = self.labels[mask_xz]
-        calc_labels_xz = self.calculated_labels[mask_xz]
-        valid_calc_mask_xz = (manual_labels_xz == self.UNLABELED) & (calc_labels_xz != self.UNLABELED)
+        # ----- Caching for XZ calc labels -----
+        mask_xz_calc = (self.points[:, 1] >= finit_min_val) & (self.points[:, 1] <= finit_max_val)
+        pts_xz_full = self.points[mask_xz_calc]
+        manual_labels_xz = self.labels[mask_xz_calc]
+        calc_labels_xz_full = self.calculated_labels[mask_xz_calc]
+        valid_calc_mask_xz = (manual_labels_xz == self.UNLABELED) & (calc_labels_xz_full != self.UNLABELED)
         pts_calc_xz = pts_xz_full[valid_calc_mask_xz]
-        labels_calc_xz = calc_labels_xz[valid_calc_mask_xz]
+        labels_calc_xz = calc_labels_xz_full[valid_calc_mask_xz]
         pts_calc_xz_display = pts_calc_xz.copy()
         if pts_calc_xz.size:
-            pts_calc_xz_display[:, 0] = pts_calc_xz_display[:, 0] + shear_factor * (pts_calc_xz_display[:, 1] - finit_center)
-        brushes_calc_xz = np.empty(labels_calc_xz.shape[0], dtype=object)
+            pts_calc_xz_display[:, 0] = pts_calc_xz_display[:, 0] + xz_shear_factor * (pts_calc_xz_display[:, 1] - finit_center)
+        new_brushes_calc_xz = np.empty(labels_calc_xz.shape[0], dtype=object)
         for i, lab in enumerate(labels_calc_xz):
             mod = lab % 3
             if mod == 0:
-                brushes_calc_xz[i] = self.calc_brush_red
+                new_brushes_calc_xz[i] = self.calc_brush_red
             elif mod == 1:
-                brushes_calc_xz[i] = self.calc_brush_green
+                new_brushes_calc_xz[i] = self.calc_brush_green
             elif mod == 2:
-                brushes_calc_xz[i] = self.calc_brush_blue
-        self.xz_calc_scatter.setData(x=pts_calc_xz_display[:, 0] if pts_calc_xz_display.size else [],
-                                     y=pts_calc_xz_display[:, 2] if pts_calc_xz_display.size else [],
-                                     size=self.point_size, pen=None, brush=brushes_calc_xz)
+                new_brushes_calc_xz[i] = self.calc_brush_blue
+        calc_xz_key = (finit_center, self.finit_thickness_slider.value(), pts_calc_xz_display.shape[0])
+        if not hasattr(self, "_cached_calc_xz_key") or self._cached_calc_xz_key != calc_xz_key:
+            self.xz_calc_scatter.setData(x=pts_calc_xz_display[:, 0] if pts_calc_xz_display.size else [],
+                                        y=pts_calc_xz_display[:, 2] if pts_calc_xz_display.size else [],
+                                        size=self.point_size, pen=None, brush=new_brushes_calc_xz)
+            self._cached_calc_xz_geometry = {'x': pts_calc_xz_display[:, 0] if pts_calc_xz_display.size else [],
+                                            'y': pts_calc_xz_display[:, 2] if pts_calc_xz_display.size else []}
+            self._cached_calc_xz_brushes = new_brushes_calc_xz.copy()
+            self._cached_calc_xz_key = calc_xz_key
+            # print("XZ Calc: Full setData update")
+        else:
+            changed_mask_calc_xz = np.array([new_brushes_calc_xz[i] != self._cached_calc_xz_brushes[i]
+                                            for i in range(len(new_brushes_calc_xz))])
+            # print(f"XZ Calc: Brushes size: {new_brushes_calc_xz.size}, changed mask size: {changed_mask_calc_xz.size}")
+            if np.any(changed_mask_calc_xz):
+                self.xz_calc_scatter.setBrush(new_brushes_calc_xz)
+                self._cached_calc_xz_brushes[changed_mask_calc_xz] = new_brushes_calc_xz[changed_mask_calc_xz]
+                # print("XZ Calc: Partial brush update")
+        t10 = time.time()
+        # print("XZ Calc Caching update:", t10 - t9, "s")
         
+        # ----- Update guides -----
         self.update_guides()
+        t11 = time.time()
+        # print("Step 16 (update_guides):", t11 - t10, "s")
+        
+        # print(f"Total update_views time: {t11 - t0:.4f} s")
     
     def update_winding_splines(self):
         for item in self.spline_items:
@@ -1183,8 +1400,8 @@ class PointCloudLabeler(QMainWindow):
     def update_labels(self):
         if self.solver is not None:
             gt = np.abs((self.labels - self.UNLABELED) > 2)
-            # if not np.any(gt):
-            #     return
+            if not np.any(gt):
+                return
             self.solver.set_labels(self.labels, gt)
             self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1,
                                              other_block_factor=15.0, side_fix_nr=-1, display=False)
@@ -1306,6 +1523,7 @@ class PointCloudLabeler(QMainWindow):
 # Main: Create GUI.
 # --------------------------------------------------
 def main():
+    pg.setConfigOptions(useOpenGL=True)
     app = QApplication(sys.argv)
     gui = PointCloudLabeler()
     gui.show()

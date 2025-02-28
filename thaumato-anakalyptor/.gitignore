@@ -1,4 +1,5 @@
 config.json
+config_labeling_gui.json
 saved/
 wandb/
 scroll*/
