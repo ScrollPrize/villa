@@ -256,6 +256,9 @@ def main(graph_path="graph_scroll5_january_unrolling_full_v2.bin", experiment_na
     else:
         solver = graph_problem_gpu_py.Solver(graph_path)
 
+    if not standard_winding_direction:
+        solver.invert_graph()
+
     # make experiment folder if it does not exist
     os.makedirs("experiments", exist_ok=True)
     # make experiment folder if it does not exist
@@ -281,7 +284,7 @@ def main(graph_path="graph_scroll5_january_unrolling_full_v2.bin", experiment_na
     # fresh_start_ring = 0 # continue solve computation from fresh_start
     scale_outer = 1.0 # S5 right side
     scale_inner = 1.0 # S5 left side
-    i_round = run_ring(solver, experiment_name, fresh_start=fresh_start_ring, i_round=i_round, standard_winding_direction=standard_winding_direction, scale_left=scale_outer, scale_right=scale_inner)
+    i_round = run_ring(solver, experiment_name, fresh_start=fresh_start_ring, i_round=i_round, standard_winding_direction=True, scale_left=scale_outer, scale_right=scale_inner)
     solver.solution_loss()
 
     if fresh_start_ring <= 4:

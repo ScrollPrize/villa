@@ -1147,7 +1147,7 @@ public:
             umbilicus_points_vector.push_back(umbilicus_point);
         }
 
-        auto result = this->processPointset(processed_points, processed_normals, umbilicus_points_vector, angleStep, z_spacing, max_eucledian_distance, min_z, max_z, min_wind, max_wind);
+        auto result = this->processPointsetV2(processed_points, processed_normals, umbilicus_points_vector, angleStep, z_spacing, max_eucledian_distance, min_z, max_z, min_wind, max_wind);
 
         return std::move(result);
     }
@@ -1241,6 +1241,175 @@ public:
         // }
 
         return std::move(results);
+    }
+
+    std::vector<std::tuple<
+    std::vector<std::vector<float>>,             // For each z bin: ordered ts (radii) values
+    std::vector<std::vector<std::vector<float>>>,  // For each z bin: ordered normals
+    std::vector<std::vector<float>>,               // Precomputed ordered umbilicus points (one per z bin)
+    std::vector<float>                             // Angle vector for this angle step
+    >> processPointsetV2(
+        const std::vector<std::vector<float>>& sorted_points,  // Pre-sorted by winding angle (4th entry)
+        const std::vector<std::vector<float>>& sorted_normals,
+        const std::vector<std::vector<float>>& umbilicus_points,
+        float angleStep,      // e.g. 6 degrees per step
+        int z_spacing,        // spacing used to compute z bins
+        float max_distance,   // max allowed z deviation for candidate acceptance
+        float min_z, float max_z, 
+        float min_wind, float max_wind)
+    {
+        // Step 1: Precompute z bins and their corresponding umbilicus points.
+        std::vector<float> zPositions = calculateZPositions(sorted_points, z_spacing, min_z, max_z);
+        std::vector<std::vector<float>> ordered_umbilicus_points(zPositions.size());
+        for (size_t i = 0; i < zPositions.size(); ++i) {
+            ordered_umbilicus_points[i] = umbilicus_xz_at_y(umbilicus_points, zPositions[i]);
+        }
+
+        // Step 2: Determine overall angle range from sorted points.
+        if (sorted_points.empty())
+            return {};  // no points to process
+
+        float minAngle = sorted_points.front()[3];
+        float maxAngle = sorted_points.back()[3];
+        int numSteps = static_cast<int>(std::floor((maxAngle - minAngle) / angleStep)) + 1;
+        std::vector<std::tuple<
+            std::vector<std::vector<float>>,             // ordered ts (radii) per z bin
+            std::vector<std::vector<std::vector<float>>>,  // ordered normals per z bin
+            std::vector<std::vector<float>>,               // ordered umbilicus points (common to all bins)
+            std::vector<float>                             // angle vector for this angle step
+        >> results;
+        results.reserve(numSteps);
+
+        size_t nPoints = sorted_points.size();
+        size_t currentStart = 0, currentEnd = 0;
+
+        // Step 3: Loop over angle steps from minAngle to maxAngle.
+        for (int step = 0; step < numSteps; ++step) {
+            float targetAngle = minAngle + step * angleStep;
+            // Use a ±10° window.
+            float windowLow = targetAngle - 10.0f;
+            float windowHigh = targetAngle + 10.0f;
+
+            // Advance currentStart until point angle >= windowLow.
+            while (currentStart < nPoints && sorted_points[currentStart][3] < windowLow) {
+                ++currentStart;
+            }
+            // Ensure currentEnd is not behind currentStart.
+            currentEnd = std::max(currentStart, currentEnd);
+            // Advance currentEnd until point angle > windowHigh.
+            while (currentEnd < nPoints && sorted_points[currentEnd][3] <= windowHigh) {
+                ++currentEnd;
+            }
+            // Now, candidate indices lie in [currentStart, currentEnd).
+
+            // Create candidate bins (one vector per z bin).
+            // Each candidate is a pair: (angular metric, index into sorted_points).
+            std::vector<std::vector<std::pair<float, size_t>>> bin_candidates(zPositions.size());
+
+            for (size_t i = currentStart; i < currentEnd; ++i) {
+                float pointAngle = sorted_points[i][3];
+                // Compute angular difference (accounting for wrap-around if needed).
+                float diff = std::fabs(pointAngle - targetAngle);
+                if (diff > 180.0f)
+                    diff = 360.0f - diff;
+                float metric = diff; // Use angular difference as the metric.
+                
+                // Get the point's vertical coordinate (assumed at index 1).
+                float point_z = sorted_points[i][1];
+                if (point_z < zPositions.front() || point_z > zPositions.back())
+                    continue;
+                
+                // Compute the candidate's z bin index (rounding based on z_spacing).
+                int bin_index = static_cast<int>(std::round((point_z - zPositions.front()) / static_cast<float>(z_spacing)));
+                if (bin_index < 0 || bin_index >= static_cast<int>(zPositions.size()))
+                    continue;
+                
+                // Accept candidate only if its z difference from the bin center is within max_distance.
+                float zDiff = std::fabs(point_z - zPositions[bin_index]);
+                if (zDiff > max_distance) {
+                    std::cout << "Something is wrong with the sorted points!!!!" << std::endl;
+                    continue;
+                }
+                
+                bin_candidates[bin_index].push_back({metric, i});
+            }
+
+            // For each z bin, process candidates:
+            // 1. Sort candidates by angular metric.
+            // 2. Retain the closest 50 candidates.
+            // 3. Compute their centroid (in x and z); update the centroid's z to the bin center.
+            // 4. Compute each candidate's distance to the centroid and sort.
+            // 5. Retain the closest 10 candidates.
+            std::vector<std::vector<float>> ordered_ts(zPositions.size());               // To store computed radii per bin.
+            std::vector<std::vector<std::vector<float>>> ordered_normals(zPositions.size()); // To store corresponding normals.
+            for (size_t bin = 0; bin < zPositions.size(); ++bin) {
+                auto& candidates = bin_candidates[bin];
+                if (candidates.empty())
+                    continue;
+
+                // Sort by angular difference.
+                std::sort(candidates.begin(), candidates.end(),
+                        [](const std::pair<float, size_t>& a, const std::pair<float, size_t>& b) {
+                            return a.first < b.first;
+                        });
+                // Keep up to 50 closest candidates.
+                if (candidates.size() > 50)
+                    candidates.resize(50);
+
+                // Compute centroid (average x and z) of these candidates.
+                float sumX = 0.0f, sumZ = 0.0f;
+                for (const auto& cand : candidates) {
+                    size_t idx = cand.second;
+                    sumX += sorted_points[idx][0];
+                    sumZ += sorted_points[idx][2];  // Assume index 2 holds the z-coordinate for radius.
+                }
+                int count = candidates.size();
+                float centroidX = sumX / count;
+                float centroidZ = sumZ / count;
+                // Update centroid's z to the bin's center.
+                float updatedCentroidZ = zPositions[bin];
+
+                // Compute distances from each candidate to the centroid.
+                std::vector<std::pair<float, size_t>> dist_candidates;
+                for (const auto& cand : candidates) {
+                    size_t idx = cand.second;
+                    float dx = sorted_points[idx][0] - centroidX;
+                    float dz = sorted_points[idx][2] - updatedCentroidZ;
+                    float distance = std::sqrt(dx * dx + dz * dz);
+                    dist_candidates.push_back({distance, idx});
+                }
+                // Sort candidates by distance to the centroid.
+                std::sort(dist_candidates.begin(), dist_candidates.end(),
+                        [](const std::pair<float, size_t>& a, const std::pair<float, size_t>& b) {
+                            return a.first < b.first;
+                        });
+                // Retain the closest 10 candidates.
+                if (dist_candidates.size() > 10)
+                    dist_candidates.resize(10);
+
+                // For each selected candidate, compute the "ts" value (radius)
+                // using the corresponding umbilicus point and store the normal.
+                for (const auto& dc : dist_candidates) {
+                    size_t idx = dc.second;
+                    std::vector<float> umb = umbilicus_xz_at_y(umbilicus_points, sorted_points[idx][1]);
+                    float dx = sorted_points[idx][0] - umb[0];
+                    float dz = sorted_points[idx][2] - umb[2];
+                    float radius = -std::sqrt(dx * dx + dz * dz);
+                    ordered_ts[bin].push_back(radius);
+                    ordered_normals[bin].push_back(sorted_normals[idx]);
+                }
+            }
+
+            // Compute the 3D angle vector for the target angle.
+            float rad = targetAngle * M_PI / 180.0f;
+            std::vector<float> angle_vector = { std::cos(rad), 0.0f, -std::sin(rad) };
+
+            // Store the result for this angle step.
+            results.push_back(std::make_tuple(ordered_ts, ordered_normals, ordered_umbilicus_points, angle_vector));
+            std::cout << "Processed angle step at target angle " << targetAngle << " degrees" << std::endl;
+        }
+
+        return results;
     }
 
 private:
