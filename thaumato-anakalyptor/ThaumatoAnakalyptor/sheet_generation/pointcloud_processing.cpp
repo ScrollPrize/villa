@@ -1278,7 +1278,7 @@ public:
             minWind = min_wind;
             maxWind = max_wind;
         }
-        
+
         int numSteps = static_cast<int>(std::floor((maxWind - minWind) / angleStep)) + 1;
         std::vector<std::tuple<
             std::vector<std::vector<float>>,             // ordered ts (radii) per z bin
@@ -1414,8 +1414,11 @@ public:
 
             // Store the result for this angle step.
             results.push_back(std::make_tuple(ordered_ts, ordered_normals, ordered_umbilicus_points, angle_vector));
-            // Update same line, flush
-            std::cout << "\rProcessed angle step at target angle " << targetAngle << " degrees. Of " << numSteps << " steps." << std::flush;
+            // Print every 1% progress
+            if (verbose && step % (numSteps / 100) == 0) {
+                // Update same line, flush
+                std::cout << "\rProcessed angle step at target angle " << targetAngle << " degrees. Of " << numSteps << " steps." << std::flush;
+            }
         }
         std::cout << std::endl;
 
