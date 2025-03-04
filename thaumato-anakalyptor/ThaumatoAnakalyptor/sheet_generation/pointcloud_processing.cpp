@@ -545,12 +545,12 @@ public:
                 try {
                     std::istringstream plyStream(ply_content);
                     happly::PLYData plyIn(plyStream);
-                    // if (plyIn.hasElement("vertex")) {
-                    //     offset_per_node[index] = plyIn.getElement("vertex").getProperty<double>("x").size();
-                    // }
-                    // Faster way
-                    auto vertices = plyIn.getVertexData();
-                    offset_per_node[index] = std::get<0>(std::get<0>(vertices)).size();
+                    if (plyIn.hasElement("vertex")) {
+                        offset_per_node[index] = plyIn.getElement("vertex").getProperty<double>("x").size();
+                    }
+                    // // Faster way
+                    // auto vertices = plyIn.getVertexData();
+                    // offset_per_node[index] = std::get<0>(std::get<0>(vertices)).size();
                     {
                         std::lock_guard<std::mutex> lock(mutex_);
                         print_progress();
