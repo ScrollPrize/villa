@@ -514,6 +514,10 @@ public:
                 H5Gclose(surface_group_id);
                 H5Gclose(group_id);
                 H5Fclose(file_id);
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    print_progress();
+                }
             }
             else {
                 // Fallback to using the archive.
@@ -533,25 +537,29 @@ public:
 
                 std::string ply_file_name = "surface_" + std::to_string(patch_nr) + ".ply";
                 std::string ply_content;
-                if (extract_ply_from_archive(archive_path, ply_file_name, ply_content)) {
-                    try {
-                        std::istringstream plyStream(ply_content);
-                        happly::PLYData plyIn(plyStream);
-                        // if (plyIn.hasElement("vertex")) {
-                        //     offset_per_node[index] = plyIn.getElement("vertex").getProperty<double>("x").size();
-                        // }
-                        // Faster way
-                        auto vertices = plyIn.getVertexData();
-                        offset_per_node[index] = std::get<0>(std::get<0>(vertices)).size();
-                        
-                    }
-                    catch (const std::exception& e) {
-                        std::cerr << "Error counting points in node: " << e.what() << std::endl;
+                if (!extract_ply_from_archive(archive_path, ply_file_name, ply_content)) {
+                    std::cerr << "Failed to extract PLY file from archive: " << archive_path << std::endl;
+                    continue;
+                }
+                
+                try {
+                    std::istringstream plyStream(ply_content);
+                    happly::PLYData plyIn(plyStream);
+                    // if (plyIn.hasElement("vertex")) {
+                    //     offset_per_node[index] = plyIn.getElement("vertex").getProperty<double>("x").size();
+                    // }
+                    // Faster way
+                    auto vertices = plyIn.getVertexData();
+                    offset_per_node[index] = std::get<0>(std::get<0>(vertices)).size();
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        print_progress();
                     }
                 }
+                catch (const std::exception& e) {
+                    std::cerr << "Error counting points in node: " << e.what() << std::endl;
+                }
             }
-            std::lock_guard<std::mutex> lock(mutex_);
-            print_progress();
         }
     }
 
@@ -589,9 +597,10 @@ public:
         return total_points;
     }
 
-    void load_total_points(size_t total_nodes) {
+    void load_total_points() {
         size_t num_threads = std::thread::hardware_concurrency();
         std::vector<std::thread> threads;
+        size_t total_nodes = node_data_.size();
         size_t chunk_size = std::ceil(static_cast<double>(total_nodes) / num_threads);
 
         problem_size = total_nodes;
@@ -619,7 +628,7 @@ public:
             std::cout << "Total points: " << total_points << std::endl;
         }
 
-        load_total_points(total_nodes);
+        load_total_points();
         if (verbose) {
             std::cout << std::endl << "All nodes have been processed." << std::endl;
         }
