@@ -1174,7 +1174,8 @@ public:
             umbilicus_points_vector.push_back(umbilicus_point);
         }
 
-        auto result = this->processPointsetV2(processed_points, processed_normals, umbilicus_points_vector, angleStep, z_spacing, max_eucledian_distance, min_z, max_z, min_wind, max_wind);
+        auto result = this->processPointset(processed_points, processed_normals, umbilicus_points_vector, angleStep, z_spacing, max_eucledian_distance, min_z, max_z, min_wind, max_wind);
+        // auto result = this->processPointsetV2(processed_points, processed_normals, umbilicus_points_vector, angleStep, z_spacing, max_eucledian_distance, min_z, max_z, min_wind, max_wind);
 
         return std::move(result);
     }
