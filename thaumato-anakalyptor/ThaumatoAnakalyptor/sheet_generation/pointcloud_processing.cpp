@@ -749,8 +749,11 @@ private:
             return;
         }
         progress++;
-        std::cout << "Progress: " << progress << "/" << problem_size << "\r";
-        std::cout.flush();
+        // Print every 1% progress
+        if (problem_size <= 0 || progress % (problem_size / 100) == 0) {
+            std::cout << "Progress: " << progress << "/" << problem_size << "\r";
+            std::cout.flush();
+        }
     }
 
     std::vector<size_t> getChunkStarts(size_t num_threads, size_t total_points, size_t chunk_size) {
@@ -1214,7 +1217,7 @@ public:
             std::cout << "Processed angle " << angleStep_ * 360.0 / angleSteps << std::endl;
             ;
         }
-        
+
         // needs to be done in python since this function gets called repeatedly and the results need to be combined before cutting away
         // // Cut away start and end of results that are empty
         // int first_non_empty = 0;
