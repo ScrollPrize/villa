@@ -1417,7 +1417,7 @@ public:
             // Print every 1% progress
             if (verbose && step % (numSteps / 100) == 0) {
                 // Update same line, flush
-                std::cout << "\rProcessed angle step at target angle " << targetAngle << " degrees. Of " << numSteps << " steps." << std::flush;
+                std::cout << "\rProcessed angle step at target angle " << std::fixed << std::setprecision(2) << targetAngle << " degrees. Of min/max angles: " << minWind << " / " << maxWind << " degrees. Progress: " << (step * 100) / numSteps << "%" << std::flush;
             }
         }
         std::cout << std::endl;
