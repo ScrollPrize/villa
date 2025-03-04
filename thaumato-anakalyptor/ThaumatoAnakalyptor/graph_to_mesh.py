@@ -1602,7 +1602,7 @@ class WalkToSheet():
         # Return the paths to the split meshes
         return split_mesh_paths, stamp
     
-    def load_pointcloud_to_raw_ordered_pointset(self, debug=False, continue_from=0, z_range=None, angle_step=1, z_spacing=10):
+    def load_pointcloud_to_raw_ordered_pointset(self, debug=False, continue_from=0, z_range=None, angle_step=1, z_spacing=10, max_z_step_size=250):
         # retrieve min max approximate winding angles
         approx_min_angle, approx_max_angle, approx_min_z, approx_max_z = self.find_minmax_winding_angle_z_range()
         print(f"Approximate min and max winding angles: {approx_min_angle}, {approx_max_angle} with z range: {approx_min_z}, {approx_max_z}")
@@ -1618,6 +1618,8 @@ class WalkToSheet():
 
         # loop over build + ordered pointset creation for each z range step (with overlap in loaded pointclouds)
         z_step = 50 * z_spacing
+        # maximum z step size
+        z_step = min(z_step, max_z_step_size)
         results = None
         for step_index, z_start in enumerate(tqdm(range(approx_min_z, approx_max_z, z_step), desc="Z range steps")):
             result_pkl_path = os.path.join(self.save_path, f"ordered_pointset_{step_index}.pkl")
@@ -1733,9 +1735,9 @@ class WalkToSheet():
         
         return results
 
-    def unroll(self, fragment=False, debug=False, continue_from=0, z_range=None, angle_step=1, z_spacing=10, learning_rate=0.2, iterations=11, unfix_factor=2.5, downsample=False):
+    def unroll(self, fragment=False, debug=False, continue_from=0, z_range=None, angle_step=1, z_spacing=10, learning_rate=0.2, iterations=11, unfix_factor=2.5, downsample=False, max_z_step_size=max_z_step_size):
         # Load the graph
-        result = self.load_pointcloud_to_raw_ordered_pointset(debug=debug, continue_from=continue_from, z_range=z_range, angle_step=angle_step, z_spacing=z_spacing)
+        result = self.load_pointcloud_to_raw_ordered_pointset(debug=debug, continue_from=continue_from, z_range=z_range, angle_step=angle_step, z_spacing=z_spacing, max_z_step_size=max_z_step_size)
 
         # get nodes
         ordered_pointsets_s = self.rolled_ordered_pointset(result, angle_step=angle_step, continue_from=continue_from, fragment=fragment, learning_rate=learning_rate, iterations=iterations, unfix_factor=unfix_factor)
@@ -1794,6 +1796,7 @@ if __name__ == '__main__':
     parser.add_argument('--iterations', type=int, default=11, help='Number of iterations for the optimization')
     parser.add_argument('--unfix_factor', type=float, default=2.5, help='Unfix factor for the optimization. Higher = less unfixed points')
     parser.add_argument('--downsample', action='store_true', help='Downsample the mesh')
+    parser.add_argument('--max_z_step_size', type=int, default=250, help='Maximum z step size for the unrolling (VRAM is approx size = GB)')
 
     args = parser.parse_args()
 
@@ -1819,7 +1822,7 @@ if __name__ == '__main__':
     
     walk = WalkToSheet(graph, args.path, start_point, scale_factor, split_width=args.split_width)
     # walk.save_graph_pointcloud(reference_path)
-    walk.unroll(fragment=args.fragment, debug=args.debug, continue_from=args.continue_from, z_range=z_range, angle_step=args.angle_step, z_spacing=args.z_spacing, learning_rate=args.learning_rate, iterations=args.iterations, unfix_factor=args.unfix_factor, downsample=args.downsample)
+    walk.unroll(fragment=args.fragment, debug=args.debug, continue_from=args.continue_from, z_range=z_range, angle_step=args.angle_step, z_spacing=args.z_spacing, learning_rate=args.learning_rate, iterations=args.iterations, unfix_factor=args.unfix_factor, downsample=args.downsample, max_z_step_size=args.max_z_step_size)
 
 # Example command: python3 -m ThaumatoAnakalyptor.graph_to_mesh --path /scroll.volpkg/working/scroll3_surface_points/point_cloud_colorized_verso_subvolume_blocks --graph /scroll.volpkg/working/scroll3_surface_points/1352_3600_5002/point_cloud_colorized_verso_subvolume_graph_BP_solved.pkl --start_point 1352 3600 5002 --debug
 # python3 -m ThaumatoAnakalyptor.graph_to_mesh --path /scroll2v2_surface_points/point_cloud_colorized_verso_subvolume_blocks --graph /scroll2v2_surface_points/1352_3600_5002/point_cloud_colorized_verso_subvolume_graph_BP_solved.pkl --start_point 1352 3600 5002
