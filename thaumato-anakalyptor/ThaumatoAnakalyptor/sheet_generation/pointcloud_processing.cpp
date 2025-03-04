@@ -1211,10 +1211,10 @@ public:
         // Process points for each angle step
         for (int angleStep_ = 0; angleStep_ < angleSteps / 4; angleStep_++) {
             processAngle(origin_points, original_normals, umbilicus_points, ordered_umbilicus_points, radii, angleStep_, angleSteps, minWind, totalAngles, zPositions, max_eucledian_distance, results);
-            std::cout << "Processed angle " << angleStep_ * 360.0 / angleSteps << std::flush;
+            std::cout << "Processed angle " << angleStep_ * 360.0 / angleSteps << std::endl;
+            ;
         }
-        std::cout << std::endl;
-
+        
         // needs to be done in python since this function gets called repeatedly and the results need to be combined before cutting away
         // // Cut away start and end of results that are empty
         // int first_non_empty = 0;
@@ -1407,7 +1407,7 @@ public:
             // Store the result for this angle step.
             results.push_back(std::make_tuple(ordered_ts, ordered_normals, ordered_umbilicus_points, angle_vector));
             // Update same line, flush
-            std::cout << "Processed angle step at target angle " << targetAngle << " degrees. Of " << numSteps << " steps." << std::flush;
+            std::cout << "\rProcessed angle step at target angle " << targetAngle << " degrees. Of " << numSteps << " steps." << std::flush;
         }
         std::cout << std::endl;
 
