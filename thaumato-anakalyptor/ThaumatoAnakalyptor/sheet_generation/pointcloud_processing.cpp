@@ -589,18 +589,7 @@ public:
         return total_points;
     }
 
-    void load_all() {
-        size_t total_nodes = node_data_.size();
-        offset_per_node = std::make_unique<size_t[]>(total_nodes);
-        if (verbose) {
-            std::cout << "Loading all nodes..." << std::endl;
-        }
-        size_t total_points = find_total_points();
-        cloud_.pts.reserve(total_points);
-        if (verbose) {
-            std::cout << "Total points: " << total_points << std::endl;
-        }
-
+    void load_total_points(size_t total_nodes) {
         size_t num_threads = std::thread::hardware_concurrency();
         std::vector<std::thread> threads;
         size_t chunk_size = std::ceil(static_cast<double>(total_nodes) / num_threads);
@@ -616,6 +605,21 @@ public:
         for (auto& thread : threads) {
             thread.join();
         }
+    }
+
+    void load_all() {
+        size_t total_nodes = node_data_.size();
+        offset_per_node = std::make_unique<size_t[]>(total_nodes);
+        if (verbose) {
+            std::cout << "Loading all nodes..." << std::endl;
+        }
+        size_t total_points = find_total_points();
+        cloud_.pts.reserve(total_points);
+        if (verbose) {
+            std::cout << "Total points: " << total_points << std::endl;
+        }
+
+        load_total_points(total_nodes);
         if (verbose) {
             std::cout << std::endl << "All nodes have been processed." << std::endl;
         }
