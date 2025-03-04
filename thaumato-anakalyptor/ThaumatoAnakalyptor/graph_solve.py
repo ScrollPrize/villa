@@ -152,7 +152,7 @@ def run_ring(solver, experiment_name="", i_round=11, fresh_start=0, standard_win
     intermediate_ring_solution_save_path = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_solver_connected_1.bin"
     if fresh_start <= 0:
         # warmup iterations
-        solver.solve_ring(num_iterations=5 * 40000, i_round=i_round, other_block_factor = 50 * other_block_factor, increase_same_block_weight=False, 
+        solver.solve_ring(num_iterations=5 * 40000, i_round=i_round, other_block_factor = 1 * other_block_factor, increase_same_block_weight=False, 
                           std_target=std_target, standard_winding_direction=standard_winding_direction)
         solver.solution_loss()
         solver.save_graph(intermediate_ring_solution_save_path)

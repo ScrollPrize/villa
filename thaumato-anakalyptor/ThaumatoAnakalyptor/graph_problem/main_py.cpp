@@ -486,10 +486,23 @@ class Solver {
             }
         }
         void save_solution(std::string graph_path) {
+            // build deleted vector
+            std::vector<bool> deleted;
+            for (size_t i = 0; i < graph.size(); ++i) {
+                deleted.push_back(graph[i].deleted);
+                // set deleted to fixed
+                graph[i].deleted = graph[i].deleted || graph[i].fixed;
+            }
+
             // Extract the final winding angle assignment from the winding number solver and save it
             assign_f_star(graph);
             // save the graph f star solution
             save_graph_to_binary(graph_path, graph);
+
+            // restore deleted vector
+            for (size_t i = 0; i < graph.size(); ++i) {
+                graph[i].deleted = deleted[i];
+            }
         }
         void load_graph(std::string graph_path) {
             graph = loadGraph(graph_path);
