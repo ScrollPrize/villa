@@ -491,7 +491,7 @@ class Solver {
             for (size_t i = 0; i < graph.size(); ++i) {
                 deleted.push_back(graph[i].deleted);
                 // set deleted to fixed
-                graph[i].deleted = graph[i].deleted || graph[i].fixed;
+                graph[i].deleted = graph[i].deleted || !graph[i].fixed;
             }
 
             // Extract the final winding angle assignment from the winding number solver and save it
