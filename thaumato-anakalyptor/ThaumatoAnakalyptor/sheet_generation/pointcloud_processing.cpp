@@ -1272,9 +1272,14 @@ public:
         if (sorted_points.empty())
             return {};  // no points to process
 
-        float minAngle = sorted_points.front()[3];
-        float maxAngle = sorted_points.back()[3];
-        int numSteps = static_cast<int>(std::floor((maxAngle - minAngle) / angleStep)) + 1;
+        auto [minWind, maxWind] = findMinMaxWindingAngles(sorted_points);
+
+        if (min_wind != max_wind) {
+            minWind = min_wind;
+            maxWind = max_wind;
+        }
+        
+        int numSteps = static_cast<int>(std::floor((maxWind - minWind) / angleStep)) + 1;
         std::vector<std::tuple<
             std::vector<std::vector<float>>,             // ordered ts (radii) per z bin
             std::vector<std::vector<std::vector<float>>>,  // ordered normals per z bin
@@ -1286,9 +1291,9 @@ public:
         size_t nPoints = sorted_points.size();
         size_t currentStart = 0, currentEnd = 0;
 
-        // Step 3: Loop over angle steps from minAngle to maxAngle.
+        // Step 3: Loop over angle steps from minWind to maxAngle.
         for (int step = 0; step < numSteps; ++step) {
-            float targetAngle = minAngle + step * angleStep;
+            float targetAngle = minWind + step * angleStep;
             // Use a ±10° window.
             float windowLow = targetAngle - 10.0f;
             float windowHigh = targetAngle + 10.0f;
