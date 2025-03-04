@@ -213,6 +213,8 @@ public:
     }
 
     void process_node(size_t start, size_t end) {
+        std::string h5_path = base_path_ + ".h5";
+        bool h5_exists = file_exists(h5_path);
         for (size_t index = start; index < end; ++index) {
             auto& node = node_data_[index];
             const auto& xyz = std::get<0>(node);
@@ -233,8 +235,7 @@ public:
                 format_filename(xyz[2]);
 
             // Check if an HDF5 file exists (named as base_path_ + ".h5")
-            std::string h5_path = base_path_ + ".h5";
-            if (file_exists(h5_path)) {
+            if (h5_exists) {
                 // Compute the group name (basename of base_filename)
                 std::string group_name = get_basename(base_filename);
                 std::string surface_group_name = "surface_" + std::to_string(patch_nr);
@@ -445,6 +446,8 @@ public:
     }
 
     void find_vertex_counts(size_t start, size_t end) {
+        std::string h5_path = base_path_ + ".h5";
+        bool h5_exists = file_exists(h5_path);
         for (size_t index = start; index < end; ++index) {
             const auto& xyz = std::get<0>(node_data_[index]);
             size_t patch_nr = std::get<1>(node_data_[index]);
@@ -460,8 +463,7 @@ public:
                 format_filename(xyz[1]) + "_" +
                 format_filename(xyz[2]);
 
-            std::string h5_path = base_path_ + ".h5";
-            if (file_exists(h5_path)) {
+            if (h5_exists) {
                 std::string group_name = get_basename(base_filename);
                 std::string surface_group_name = "surface_" + std::to_string(patch_nr);
 
@@ -532,10 +534,19 @@ public:
                 std::string ply_file_name = "surface_" + std::to_string(patch_nr) + ".ply";
                 std::string ply_content;
                 if (extract_ply_from_archive(archive_path, ply_file_name, ply_content)) {
-                    std::istringstream plyStream(ply_content);
-                    happly::PLYData plyData(plyStream);
-                    if (plyData.hasElement("vertex")) {
-                        offset_per_node[index] = plyData.getElement("vertex").getProperty<double>("x").size();
+                    try {
+                        std::istringstream plyStream(ply_content);
+                        happly::PLYData plyIn(plyStream);
+                        // if (plyIn.hasElement("vertex")) {
+                        //     offset_per_node[index] = plyIn.getElement("vertex").getProperty<double>("x").size();
+                        // }
+                        // Faster way
+                        auto vertices = plyIn.getVertexData();
+                        offset_per_node[index] = std::get<0>(std::get<0>(vertices)).size();
+                        
+                    }
+                    catch (const std::exception& e) {
+                        std::cerr << "Error counting points in node: " << e.what() << std::endl;
                     }
                 }
             }
