@@ -1622,7 +1622,7 @@ class WalkToSheet():
         for step_index, z_start in enumerate(tqdm(range(approx_min_z, approx_max_z, z_step), desc="Z range steps")):
             result_pkl_path = os.path.join(self.save_path, f"ordered_pointset_{step_index}.pkl")
             z_end = z_start + z_step
-            z_range = (z_start - 60, z_end + 60)
+            z_range = (z_start - 20, z_end + 20)
             print(f"z_range: {z_range}")
 
             # Set to false to load precomputed partial results during development
