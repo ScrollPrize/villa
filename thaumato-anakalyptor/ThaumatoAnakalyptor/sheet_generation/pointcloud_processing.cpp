@@ -1406,8 +1406,10 @@ public:
 
             // Store the result for this angle step.
             results.push_back(std::make_tuple(ordered_ts, ordered_normals, ordered_umbilicus_points, angle_vector));
-            std::cout << "Processed angle step at target angle " << targetAngle << " degrees" << std::endl;
+            // Update same line, flush
+            std::cout << "Processed angle step at target angle " << targetAngle << " degrees. Of " << numSteps << " steps." << std::flush;
         }
+        std::cout << std::endl;
 
         return results;
     }
