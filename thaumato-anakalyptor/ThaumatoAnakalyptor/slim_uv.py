@@ -234,9 +234,8 @@ class Flatboi:
         # Simplify
         self.mesh = self.mesh.simplify_vertex_clustering(1.0)
         print(f"Simplify round 1. remaining vertices: {len(np.asarray(self.mesh.vertices))} and triangles: {len(np.asarray(self.mesh.triangles))}")
-        target_triangles = np.asarray(self.mesh.triangles).shape[0] / 2
+        target_triangles = np.asarray(self.mesh.triangles).shape[0] // 2
         # Mesh to cuda
-        self.mesh = self.mesh.to('cuda')
         self.mesh = self.mesh.simplify_quadric_decimation(target_triangles)
         print(f"Simplify round 2")
 
