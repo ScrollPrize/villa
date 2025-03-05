@@ -230,6 +230,14 @@ class Flatboi:
 
         # select largest connected component
         self.mesh = self.filter_largest_connected_component(self.mesh)
+
+        # Simplify
+        self.mesh = self.mesh.simplify_vertex_clustering(1.0)
+        print(f"Simplify round 1")
+        target_triangles = np.asarray(self.mesh.triangles).shape[0] / 2
+        self.mesh = self.mesh.simplify_quadric_decimation(target_triangles)
+        print(f"Simplify round 2")
+
         # Remove degenerate and duplicated triangles/vertices and non-manifold edges
         self.mesh = self.mesh.remove_degenerate_triangles()
         self.mesh = self.mesh.remove_duplicated_triangles()
