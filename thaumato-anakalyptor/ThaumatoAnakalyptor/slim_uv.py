@@ -253,8 +253,8 @@ class Flatboi:
             self.mesh = self.mesh.remove_unreferenced_vertices()
 
             # Simplify
-            downsampled_mesh = self.mesh.simplify_vertex_clustering(2.0)
-            print(f"Simplify Open3D round 1. Remaining vertices: {len(np.asarray(downsampled_mesh.vertices))} and triangles: {len(np.asarray(downsampled_mesh.triangles))}")
+            # downsampled_mesh = self.mesh.simplify_vertex_clustering(2.0)
+            # print(f"Simplify Open3D round 1. Remaining vertices: {len(np.asarray(downsampled_mesh.vertices))} and triangles: {len(np.asarray(downsampled_mesh.triangles))}")
             if target_num_triangles < len(np.asarray(downsampled_mesh.triangles)):
                 # Simplify Open3D
                 downsampled_mesh = downsampled_mesh.simplify_quadric_decimation(target_num_triangles)
