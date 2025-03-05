@@ -46,7 +46,7 @@ class Flatboi:
         self.read_mesh(obj_path)
         self.filter_mesh()
         
-    def filter_largest_connected_component(mesh):
+    def filter_largest_connected_component(self, mesh):
         # Compute connected components for triangles.
         triangle_clusters, cluster_n_triangles, _ = mesh.cluster_connected_triangles()
         print(f"Number of connected components: {len(cluster_n_triangles)}")
