@@ -88,7 +88,7 @@ class Flatboi:
             mesh_filtered = mesh_filtered.remove_non_manifold_edges()
             mesh_filtered = mesh_filtered.remove_unreferenced_vertices()
 
-            if len(mesh_filtered.vertices) == len(old_mesh_vertices_count) and len(old_mesh_triangles_count) == len(mesh.triangles):
+            if len(mesh_filtered.vertices) == old_mesh_vertices_count and len(mesh_filtered.triangles) == old_mesh_triangles_count:
                 print("No change in number of vertices. Exiting.")
                 break
             mesh = mesh_filtered
