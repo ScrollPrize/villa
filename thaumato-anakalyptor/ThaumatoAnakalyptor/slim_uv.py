@@ -61,6 +61,7 @@ class Flatboi:
             
             # Filter triangles to keep only those in the largest connected component
             triangles_to_keep = np.where(triangle_clusters == largest_cluster_idx)[0]
+            triangles_to_remove = np.where(triangle_clusters != largest_cluster_idx)[0]
 
             vertices_to_keep = np.unique(np.asarray(mesh.triangles)[triangles_to_keep])
 
@@ -70,7 +71,7 @@ class Flatboi:
             # mesh_filtered = mesh.select_by_index(list(vertices_to_keep), cleanup=False)
             # Copy mesh to avoid modifying the original
             mesh_filtered = mesh
-            mesh_filtered.remove_triangles_by_index(list(triangles_to_keep))
+            mesh_filtered.remove_triangles_by_index(list(triangles_to_remove))
             mesh_filtered.remove_unreferenced_vertices()
             
             # Filter UVs by mapping them to the selected triangles
@@ -98,56 +99,6 @@ class Flatboi:
             iteration += 1
         
         return mesh_filtered
-    
-    # def filter_largest_connected_component(self, mesh):
-    #     # Compute connected components for triangles.
-    #     triangle_clusters, cluster_n_triangles, _ = mesh.cluster_connected_triangles()
-    #     print(f"Number of connected components: {len(cluster_n_triangles)}")
-    #     if len(cluster_n_triangles) == 1:
-    #         print("Only one connected component found; no filtering needed.")
-    #         return mesh
-        
-    #     # Identify the largest cluster by number of triangles.
-    #     largest_cluster_idx = np.argmax(cluster_n_triangles)
-        
-    #     # Find indices of triangles belonging to the largest component.
-    #     triangles_to_keep = np.where(triangle_clusters == largest_cluster_idx)[0]
-    #     print(f"Keeping {len(triangles_to_keep)} triangles from the largest connected component out of {len(mesh.triangles)} total triangles.")
-        
-    #     # Extract the corresponding triangles as a numpy array.
-    #     triangles_np = np.asarray(mesh.triangles)
-    #     new_triangles = triangles_np[triangles_to_keep]
-        
-    #     # Find all unique vertices referenced by these triangles.
-    #     unique_vertices = np.unique(new_triangles)
-        
-    #     # Create a mapping from old vertex indices to new ones.
-    #     mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(unique_vertices)}
-        
-    #     # Remap the triangle indices.
-    #     new_triangles_mapped = np.array([[mapping[idx] for idx in tri] for tri in new_triangles])
-        
-    #     # Get the new vertex array.
-    #     vertices_np = np.asarray(mesh.vertices)
-    #     new_vertices = vertices_np[unique_vertices]
-        
-    #     # Build the filtered mesh.
-    #     mesh_filtered = o3d.geometry.TriangleMesh()
-    #     mesh_filtered.vertices = o3d.utility.Vector3dVector(new_vertices)
-    #     mesh_filtered.triangles = o3d.utility.Vector3iVector(new_triangles_mapped)
-        
-    #     # If UVs exist, filter them similarly.
-    #     if mesh.has_triangle_uvs():
-    #         triangle_uvs_np = np.asarray(mesh.triangle_uvs).reshape(-1, 3, 2)
-    #         # Only keep UVs corresponding to the selected triangles.
-    #         new_triangle_uvs = triangle_uvs_np[triangles_to_keep].reshape(-1, 2)
-    #         mesh_filtered.triangle_uvs = o3d.utility.Vector2dVector(new_triangle_uvs)
-        
-    #     # Optionally, clean up any unreferenced vertices.
-    #     mesh_filtered.remove_unreferenced_vertices()
-        
-    #     print(f"Filtered mesh: {len(mesh_filtered.vertices)} vertices, {len(mesh_filtered.triangles)} triangles.")
-    #     return mesh_filtered
     
     def downsample_mesh_with_texture(self, target_area_per_triangle=0.05):
         """
