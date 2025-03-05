@@ -47,38 +47,47 @@ class Flatboi:
         self.filter_mesh()
         
     def filter_largest_connected_component(self, mesh):
-        # Compute connected components
-        triangle_clusters, cluster_n_triangles, _ = mesh.cluster_connected_triangles()
+        iteration = 0
+        while True:
+            # Compute connected components
+            triangle_clusters, cluster_n_triangles, _ = mesh.cluster_connected_triangles()
 
-        print(f"Number of connected components: {len(cluster_n_triangles)}")
-        
-        # Find the largest connected component based on the number of triangles
-        largest_cluster_idx = np.argmax(cluster_n_triangles)
-        
-        # Filter triangles to keep only those in the largest connected component
-        triangles_to_keep = np.where(triangle_clusters == largest_cluster_idx)[0]
-
-        vertices_to_keep = np.unique(np.asarray(mesh.triangles)[triangles_to_keep])
-
-        print(f"Keeping {len(vertices_to_keep)} vertices and {len(triangles_to_keep)} triangles from the largest connected component. Of total {len(mesh.vertices)} vertices and {len(mesh.triangles)} triangles.")
-
-        # Select triangles and vertices for the largest connected component
-        mesh_filtered = mesh.select_by_index(list(vertices_to_keep), cleanup=False)
-        
-        # Filter UVs by mapping them to the selected triangles
-        original_uvs = np.asarray(mesh.triangle_uvs).reshape(-1, 3, 2)
-        if original_uvs.size > 0:
-            filtered_uvs = original_uvs[triangles_to_keep].reshape(-1, 2)
+            print(f"Number of connected components: {len(cluster_n_triangles)}")
             
-            # Set the filtered UVs to the new mesh
-            mesh_filtered.triangle_uvs = o3d.utility.Vector2dVector(filtered_uvs)
+            # Find the largest connected component based on the number of triangles
+            largest_cluster_idx = np.argmax(cluster_n_triangles)
+            
+            # Filter triangles to keep only those in the largest connected component
+            triangles_to_keep = np.where(triangle_clusters == largest_cluster_idx)[0]
 
-        # Remove degenerate and duplicated triangles/vertices and non-manifold edges
-        mesh_filtered = mesh_filtered.remove_degenerate_triangles()
-        mesh_filtered = mesh_filtered.remove_duplicated_triangles()
-        mesh_filtered = mesh_filtered.remove_duplicated_vertices()
-        mesh_filtered = mesh_filtered.remove_non_manifold_edges()
-        mesh_filtered = mesh_filtered.remove_unreferenced_vertices()
+            vertices_to_keep = np.unique(np.asarray(mesh.triangles)[triangles_to_keep])
+
+            print(f"Keeping {len(vertices_to_keep)} vertices and {len(triangles_to_keep)} triangles from the largest connected component. Of total {len(mesh.vertices)} vertices and {len(mesh.triangles)} triangles.")
+
+            # Select triangles and vertices for the largest connected component
+            mesh_filtered = mesh.select_by_index(list(vertices_to_keep), cleanup=False)
+            
+            # Filter UVs by mapping them to the selected triangles
+            original_uvs = np.asarray(mesh.triangle_uvs).reshape(-1, 3, 2)
+            if original_uvs.size > 0:
+                filtered_uvs = original_uvs[triangles_to_keep].reshape(-1, 2)
+                
+                # Set the filtered UVs to the new mesh
+                mesh_filtered.triangle_uvs = o3d.utility.Vector2dVector(filtered_uvs)
+
+            # Remove degenerate and duplicated triangles/vertices and non-manifold edges
+            mesh_filtered = mesh_filtered.remove_degenerate_triangles()
+            mesh_filtered = mesh_filtered.remove_duplicated_triangles()
+            mesh_filtered = mesh_filtered.remove_duplicated_vertices()
+            mesh_filtered = mesh_filtered.remove_non_manifold_edges()
+            mesh_filtered = mesh_filtered.remove_unreferenced_vertices()
+
+            if len(mesh_filtered.vertices) == len(mesh.vertices) and len(mesh_filtered.triangles) == len(mesh.triangles):
+                print("No change in number of vertices. Exiting.")
+                break
+            mesh = mesh_filtered
+            print(f"Iteration {iteration} completed.")
+            iteration += 1
         
         return mesh_filtered
     
