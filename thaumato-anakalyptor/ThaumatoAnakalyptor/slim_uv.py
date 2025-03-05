@@ -171,15 +171,32 @@ class Flatboi:
         assert np.all(I >= 0), "Some vertices do not have UVs."
         
         # Save the downsampled mesh
-        # Create a new Open3D mesh from the downsampled vertices and faces
-        downsampled_mesh = o3d.geometry.TriangleMesh()
-        downsampled_mesh.vertices = o3d.utility.Vector3dVector(U)
-        # Handle normals
-        if hasattr(self, 'vertex_normals') and len(self.vertex_normals) > 0:
-            downsampled_mesh.vertex_normals = o3d.utility.Vector3dVector(self.vertex_normals[I])
+        if success:
+            # Create a new Open3D mesh from the downsampled vertices and faces
+            downsampled_mesh = o3d.geometry.TriangleMesh()
+            downsampled_mesh.vertices = o3d.utility.Vector3dVector(U)
+            # Handle normals
+            if hasattr(self, 'vertex_normals') and len(self.vertex_normals) > 0:
+                downsampled_mesh.vertex_normals = o3d.utility.Vector3dVector(self.vertex_normals[I])
+            else:
+                downsampled_mesh.compute_vertex_normals()
+            downsampled_mesh.triangles = o3d.utility.Vector3iVector(G)
         else:
-            downsampled_mesh.compute_vertex_normals()
-        downsampled_mesh.triangles = o3d.utility.Vector3iVector(G)
+            print("Downsampling with IGL failed, fallback to Open3D.")
+            # Remove degenerate and duplicated triangles/vertices and non-manifold edges
+            self.mesh = self.mesh.remove_degenerate_triangles()
+            self.mesh = self.mesh.remove_duplicated_triangles()
+            self.mesh = self.mesh.remove_duplicated_vertices()
+            self.mesh = self.mesh.remove_non_manifold_edges()
+            self.mesh = self.mesh.remove_unreferenced_vertices()
+
+            # Simplify
+            downsampled_mesh = self.mesh.simplify_vertex_clustering(2.0)
+            print(f"Simplify Open3D round 1. Remaining vertices: {len(np.asarray(downsampled_mesh.vertices))} and triangles: {len(np.asarray(downsampled_mesh.triangles))}")
+            # Simplify Open3D
+            downsampled_mesh = downsampled_mesh.simplify_quadric_decimation(target_num_triangles)
+            print(f"Simplify Open3D round 2. Remaining vertices: {len(np.asarray(downsampled_mesh.vertices))} and triangles: {len(np.asarray(downsampled_mesh.triangles))}")
+
         downsampled_mesh = downsampled_mesh.compute_vertex_normals()
 
         # Set UVs as triangle attributes
@@ -230,21 +247,6 @@ class Flatboi:
 
         # select largest connected component
         self.mesh = self.filter_largest_connected_component(self.mesh)
-
-        # Simplify
-        self.mesh = self.mesh.simplify_vertex_clustering(1.0)
-        print(f"Simplify round 1. remaining vertices: {len(np.asarray(self.mesh.vertices))} and triangles: {len(np.asarray(self.mesh.triangles))}")
-        target_triangles = np.asarray(self.mesh.triangles).shape[0] // 2
-        # Mesh to cuda
-        self.mesh = self.mesh.simplify_quadric_decimation(target_triangles)
-        print(f"Simplify round 2")
-
-        # Remove degenerate and duplicated triangles/vertices and non-manifold edges
-        self.mesh = self.mesh.remove_degenerate_triangles()
-        self.mesh = self.mesh.remove_duplicated_triangles()
-        self.mesh = self.mesh.remove_duplicated_vertices()
-        self.mesh = self.mesh.remove_non_manifold_edges()
-        self.mesh = self.mesh.remove_unreferenced_vertices()
 
         self.vertices = np.asarray(self.mesh.vertices, dtype=np.float64)
         if stretch:
