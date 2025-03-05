@@ -28,7 +28,7 @@ import time
 import warnings
 
 class MyPredictionWriter(BasePredictionWriter):
-    def __init__(self, save_path, image_size, r, max_queue_size=10, max_workers=1, display=True, use_mmemmap=False):
+    def __init__(self, save_path, image_size, r, max_queue_size=10, max_workers=1, display=True, use_memmap=False):
         super().__init__(write_interval="batch")  # or "epoch" for end of an epoch
         self.save_path = save_path
         self.image_size = image_size
@@ -36,14 +36,14 @@ class MyPredictionWriter(BasePredictionWriter):
         self.image = None
         self.r = r
         self.surface_volume_np = None
-        self.use_mmemmap = use_mmemmap
+        self.use_memmap = use_memmap
         self.max_queue_size = max(max_queue_size, max_workers)
         self.executor = ThreadPoolExecutor(max_workers=max_workers)  # Adjust number of workers as needed
         self.semaphore = Semaphore(self.max_queue_size)
         self.futures = []
         self.num_workers = cpu_count()
         self.trainer_rank = None
-        # Only used if not using mmemmap
+        # Only used if not using memmap
         self.shm = None
 
     def write_on_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, prediction, batch_indices, batch, batch_idx: int, dataloader_idx: int) -> None:
@@ -51,16 +51,16 @@ class MyPredictionWriter(BasePredictionWriter):
             self.trainer_rank = trainer.global_rank if trainer.world_size > 1 else 0
 
         if self.surface_volume_np is None:
-            if self.use_mmemmap:
+            if self.use_memmap:
                 if trainer.global_rank == 0:
                     # Create memmap on disk (only rank 0 creates it)
-                    self.surface_volume_np = self.create_mmemmap_array(
-                        (2*self.r+1, self.image_size[0], self.image_size[1]), np.uint16, filename="surface_volume_mmemmap.dat")
+                    self.surface_volume_np = self.create_memmap_array(
+                        (2*self.r+1, self.image_size[0], self.image_size[1]), np.uint16, filename="surface_volume_memmap.dat")
                     torch.distributed.barrier()  # Wait for other processes
                 else:
                     torch.distributed.barrier()  # Wait until rank 0 creates the memmap
-                    self.surface_volume_np = self.attach_mmemmap_array(
-                        (2*self.r+1, self.image_size[0], self.image_size[1]), np.uint16, filename="surface_volume_mmemmap.dat")
+                    self.surface_volume_np = self.attach_memmap_array(
+                        (2*self.r+1, self.image_size[0], self.image_size[1]), np.uint16, filename="surface_volume_memmap.dat")
             else:
                 if trainer.global_rank == 0:
                     # Create a shared array and gather the shared memory name
@@ -142,14 +142,14 @@ class MyPredictionWriter(BasePredictionWriter):
             except FileNotFoundError:
                 time.sleep(0.2)
 
-    def create_mmemmap_array(self, shape, dtype, filename="surface_volume_mmemmap.dat"):
+    def create_memmap_array(self, shape, dtype, filename="surface_volume_memmap.dat"):
         filepath = os.path.join(self.save_path, filename)
         # Create (or overwrite) the memmap file on disk
         memmap_array = np.memmap(filepath, dtype=dtype, mode='w+', shape=shape)
         memmap_array[:] = 0  # Initialize with zeros
         return memmap_array
 
-    def attach_mmemmap_array(self, shape, dtype, filename="surface_volume_mmemmap.dat"):
+    def attach_memmap_array(self, shape, dtype, filename="surface_volume_memmap.dat"):
         filepath = os.path.join(self.save_path, filename)
         while not os.path.exists(filepath):
             time.sleep(0.2)
@@ -189,7 +189,7 @@ class MyPredictionWriter(BasePredictionWriter):
         print("Waiting for all writes to complete")
         self.wait_for_all_writes_to_complete()
         if self.trainer_rank != 0:  # Only rank 0 should write to disk
-            if not self.use_mmemmap:
+            if not self.use_memmap:
                 self.shm.close()
                 self.shm = None
             return
@@ -211,8 +211,8 @@ class MyPredictionWriter(BasePredictionWriter):
             print("Invalid flag. Choose between 'tif', 'jpg', 'memmap', 'npz', 'zarr'")
             return
         
-        # Close the shared memory if not using mmemmap
-        if not self.use_mmemmap:
+        # Close the shared memory if not using memmap
+        if not self.use_memmap:
             try:
                 self.shm.close()
                 # No warnings verbose
@@ -309,7 +309,7 @@ class MyPredictionWriter(BasePredictionWriter):
         
 class MeshDataset(Dataset):
     """Dataset class for rendering a mesh."""
-    def __init__(self, path, scroll, scroll_format="grid cells", output_path=None, grid_size=500, r=32, max_side_triangle=10, max_workers=1, display=False, use_mmemmap=False):
+    def __init__(self, path, scroll, scroll_format="grid cells", output_path=None, grid_size=500, r=32, max_side_triangle=10, max_workers=1, display=False, use_memmap=False):
         """Initialize the dataset."""
         self.grid_size = grid_size
         self.path = path
@@ -326,7 +326,7 @@ class MeshDataset(Dataset):
         self.load_mesh(path)
         output_path = os.path.dirname(path) if output_path is None else output_path
         write_path = os.path.join(output_path, "layers")
-        self.writer = MyPredictionWriter(write_path, self.image_size, r, max_workers=max_workers, display=display, use_mmemmap=use_mmemmap)
+        self.writer = MyPredictionWriter(write_path, self.image_size, r, max_workers=max_workers, display=display, use_memmap=use_memmap)
 
         self.grids_to_process = self.init_grids_to_process()
 
@@ -909,7 +909,7 @@ def custom_collate_fn(batch):
     except:
         return None, None, None, None, None, None
     
-def ppm_and_texture(obj_path, scroll, output_path=None, grid_size=500, gpus=1, batch_size=1, r=32, format='jpg', max_side_triangle: int = 10, display=False, nr_workers=None, prefetch_factor=2, use_mmemmap=False):
+def ppm_and_texture(obj_path, scroll, output_path=None, grid_size=500, gpus=1, batch_size=1, r=32, format='jpg', max_side_triangle: int = 10, display=False, nr_workers=None, prefetch_factor=2, use_memmap=False):
     # Number of workers
     num_threads = multiprocessing.cpu_count() // int(1.5 * int(gpus))
     num_treads_for_gpus = 12
@@ -933,7 +933,7 @@ def ppm_and_texture(obj_path, scroll, output_path=None, grid_size=500, gpus=1, b
         scroll = os.path.join(scroll, "cell_yxz_{:03}_{:03}_{:03}.tif")
 
     # Initialize the dataset and dataloader
-    dataset = MeshDataset(obj_path, scroll, scroll_format=scroll_format, output_path=output_path, grid_size=grid_size, r=r, max_side_triangle=max_side_triangle, max_workers=max_workers, display=display, use_mmemmap=use_mmemmap)
+    dataset = MeshDataset(obj_path, scroll, scroll_format=scroll_format, output_path=output_path, grid_size=grid_size, r=r, max_side_triangle=max_side_triangle, max_workers=max_workers, display=display, use_memmap=use_memmap)
     dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=custom_collate_fn, shuffle=False, num_workers=num_workers, prefetch_factor=prefetch_factor)
     model = PPMAndTextureModel(r=r, max_side_triangle=max_side_triangle)
     
@@ -960,11 +960,11 @@ if __name__ == '__main__':
     parser.add_argument('--display', action='store_true')
     parser.add_argument('--nr_workers', type=int, default=None)
     parser.add_argument('--prefetch_factor', type=int, default=2)
-    parser.add_argument('--mmemmap', action='store_true', help="Use memory mapped numpy arrays for multi-GPU support")
+    parser.add_argument('--memmap', action='store_true', help="Use memory mapped numpy arrays for multi-GPU support")
     args = parser.parse_known_args()[0]
 
     print(f"Rendering args: {args}")
     if args.display:
         print("[INFO]: Displaying the rendering image slows down the rendering process by about 20%.")
     
-    ppm_and_texture(args.obj, gpus=args.gpus, scroll=args.scroll, output_path=args.output_path, r=args.r, format=args.format, max_side_triangle=args.max_side_triangle, display=args.display, nr_workers=args.nr_workers, prefetch_factor=args.prefetch_factor, use_mmemmap=args.mmemmap)
+    ppm_and_texture(args.obj, gpus=args.gpus, scroll=args.scroll, output_path=args.output_path, r=args.r, format=args.format, max_side_triangle=args.max_side_triangle, display=args.display, nr_workers=args.nr_workers, prefetch_factor=args.prefetch_factor, use_memmap=args.memmap)
