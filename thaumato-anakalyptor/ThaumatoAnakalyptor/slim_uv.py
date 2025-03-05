@@ -67,7 +67,7 @@ class Flatboi:
             # # Select triangles and vertices for the largest connected component
             # mesh_filtered = mesh.select_by_index(list(vertices_to_keep), cleanup=False)
             # Copy mesh to avoid modifying the original
-            mesh_filtered = mesh.copy()
+            mesh_filtered = mesh.clone()
             mesh_filtered.remove_triangles_by_index(list(triangles_to_keep))
             mesh_filtered.remove_unreferenced_vertices()
             
