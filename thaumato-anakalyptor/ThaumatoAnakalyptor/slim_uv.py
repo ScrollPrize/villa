@@ -230,6 +230,11 @@ class Flatboi:
 
         # select largest connected component
         self.mesh = self.filter_largest_connected_component(self.mesh)
+        # Remove degenerate and duplicated triangles/vertices and non-manifold edges
+        self.mesh.remove_degenerate_triangles()
+        self.mesh.remove_duplicated_triangles()
+        self.mesh.remove_duplicated_vertices()
+        self.mesh.remove_non_manifold_edges()
 
         self.vertices = np.asarray(self.mesh.vertices, dtype=np.float64)
         if stretch:
