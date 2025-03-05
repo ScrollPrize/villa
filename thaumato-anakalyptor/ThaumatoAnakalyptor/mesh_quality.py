@@ -402,12 +402,24 @@ def show_winding_angle_relationship(base_path, umbilicus_path, mesh_path1, mesh_
     image_path1 = mesh_path1.replace(".obj", ".png")
     image_path2 = mesh_path2.replace(".obj", ".png")
     # get uvs image sizes
-    with Image.open(image_path1) as img:
-        # Get dimensions
-        img1_size = img.size[:2]
-    with Image.open(image_path2) as img:
-        # Get dimensions
-        img2_size = img.size[:2]
+    try:
+        with Image.open(image_path1) as img:
+            # Get dimensions
+            img1_size = img.size[:2]
+    except:
+        image_path1 = image_path1.replace(".png", "_0.png")
+        with Image.open(image_path1) as img:
+            # Get dimensions
+            img1_size = img.size[:2]
+    try:
+        with Image.open(image_path2) as img:
+            # Get dimensions
+            img2_size = img.size[:2]
+    except:
+        image_path2 = image_path2.replace(".png", "_0.png")
+        with Image.open(image_path2) as img:
+            # Get dimensions
+            img2_size = img.size[:2]
 
     # load the meshes
     mesh1, vertices1, triangles1, scene1 = load_mesh_vertices(mesh_path1)
