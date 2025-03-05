@@ -144,6 +144,8 @@ class MyPredictionWriter(BasePredictionWriter):
 
     def create_memmap_array(self, shape, dtype, filename="surface_volume_memmap.dat"):
         filepath = os.path.join(self.save_path, filename)
+        # Ensure the directory exists
+        os.makedirs(self.save_path, exist_ok=True)
         # Create (or overwrite) the memmap file on disk
         memmap_array = np.memmap(filepath, dtype=dtype, mode='w+', shape=shape)
         memmap_array[:] = 0  # Initialize with zeros
