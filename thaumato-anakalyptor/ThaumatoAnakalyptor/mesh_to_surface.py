@@ -959,8 +959,8 @@ def ppm_and_texture(obj_path, scroll, output_path=None, grid_size=500, gpus=1, b
         for seg_start in range(0, total_layers, r_steps):
             seg_end = min(seg_start + r_steps, total_layers)
             writer.current_step_offset = seg_start
-            # Reinitialize shared memory for the current segment
-            writer.surface_volume_np, writer.shm = writer.create_shared_array((seg_end - seg_start, dataset.image_size[0], dataset.image_size[1]), np.uint16, name=f"surface_volume_{seg_start}")
+            # reset the surface volume
+            writer.surface_volume_np = None
             # Set the current r range in the model for filtering predictions
             model.current_r_range = (seg_start, seg_end)
             print(f"Rendering segment: layers {seg_start} to {seg_end-1}")
