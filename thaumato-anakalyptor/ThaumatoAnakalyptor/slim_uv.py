@@ -181,6 +181,43 @@ class Flatboi:
             else:
                 downsampled_mesh.compute_vertex_normals()
             downsampled_mesh.triangles = o3d.utility.Vector3iVector(G)
+
+            # Set UVs as triangle attributes
+            if self.original_uvs is not None and self.original_uvs.size > 0:
+                uvs = self.original_uvs.reshape((-1, 3, 2))
+                assert np.all(uvs >= 0), "Some triangles do not have UVs."
+                # get uvs for each vertex. each vertex whenever it is inside a triangle, has the same uv
+                vertex_uvs = np.zeros((self.vertices.shape[0], 2), dtype=np.float64) - 1.0
+                for t in range(self.triangles.shape[0]):
+                    for v in range(self.triangles.shape[1]):
+                        # if np.all(vertex_uvs[self.triangles[t,v]] >= 0):
+                        #     assert np.allclose(vertex_uvs[self.triangles[t,v]], uvs[t,v]), "UVs do not match."
+                        vertex_uvs[self.triangles[t,v]] = uvs[t,v].copy()
+
+                assert np.all(vertex_uvs >= 0), "Some vertices do not have UVs."
+
+                # Map to decimated_vertex_uvs
+                downsampled_vertex_uvs = np.zeros((U.shape[0], 2), dtype=np.float64) - 1.0
+                for i in range(U.shape[0]):
+                    if I[i] >= 0:
+                        downsampled_vertex_uvs[i] = vertex_uvs[I[i]].copy()
+                    else:
+                        print(f"Vertex {i} does not have a corresponding UV.")
+
+                assert np.all(downsampled_vertex_uvs >= 0), "Some vertices do not have UVs."
+
+                # Map to downsampled_uvs
+                downsampled_uvs = np.zeros((G.shape[0], 3, 2), dtype=np.float64)
+                for t in range(G.shape[0]):
+                    for v in range(G.shape[1]):
+                        downsampled_uvs[t,v] = downsampled_vertex_uvs[G[t,v]].copy()
+                # Reshape
+                downsampled_uvs = downsampled_uvs.reshape((-1, 2))
+
+                # Set the UVs
+                downsampled_mesh.triangle_uvs = o3d.utility.Vector2dVector(downsampled_uvs)
+            else:
+                print("Original mesh has no UVs; skipping UV mapping.")
         else:
             print("Downsampling with IGL failed, fallback to Open3D.")
             # Remove degenerate and duplicated triangles/vertices and non-manifold edges
@@ -201,43 +238,7 @@ class Flatboi:
                 print("Further Open3D simplification not needed.")
 
         downsampled_mesh = downsampled_mesh.compute_vertex_normals()
-
-        # Set UVs as triangle attributes
-        if self.original_uvs is not None and self.original_uvs.size > 0:
-            uvs = self.original_uvs.reshape((-1, 3, 2))
-            assert np.all(uvs >= 0), "Some triangles do not have UVs."
-            # get uvs for each vertex. each vertex whenever it is inside a triangle, has the same uv
-            vertex_uvs = np.zeros((self.vertices.shape[0], 2), dtype=np.float64) - 1.0
-            for t in range(self.triangles.shape[0]):
-                for v in range(self.triangles.shape[1]):
-                    # if np.all(vertex_uvs[self.triangles[t,v]] >= 0):
-                    #     assert np.allclose(vertex_uvs[self.triangles[t,v]], uvs[t,v]), "UVs do not match."
-                    vertex_uvs[self.triangles[t,v]] = uvs[t,v].copy()
-
-            assert np.all(vertex_uvs >= 0), "Some vertices do not have UVs."
-
-            # Map to decimated_vertex_uvs
-            downsampled_vertex_uvs = np.zeros((U.shape[0], 2), dtype=np.float64) - 1.0
-            for i in range(U.shape[0]):
-                if I[i] >= 0:
-                    downsampled_vertex_uvs[i] = vertex_uvs[I[i]].copy()
-                else:
-                    print(f"Vertex {i} does not have a corresponding UV.")
-
-            assert np.all(downsampled_vertex_uvs >= 0), "Some vertices do not have UVs."
-
-            # Map to downsampled_uvs
-            downsampled_uvs = np.zeros((G.shape[0], 3, 2), dtype=np.float64)
-            for t in range(G.shape[0]):
-                for v in range(G.shape[1]):
-                    downsampled_uvs[t,v] = downsampled_vertex_uvs[G[t,v]].copy()
-            # Reshape
-            downsampled_uvs = downsampled_uvs.reshape((-1, 2))
-
-            # Set the UVs
-            downsampled_mesh.triangle_uvs = o3d.utility.Vector2dVector(downsampled_uvs)
-        else:
-            print("Original mesh has no UVs; skipping UV mapping.")
+        downsampled_mesh = self.filter_largest_connected_component(downsampled_mesh)
                 
         # Save the mesh with UVs to an OBJ file
         obj_path = self.input_obj.replace(".obj", "_downsampled.obj")
