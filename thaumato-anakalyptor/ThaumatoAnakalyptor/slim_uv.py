@@ -48,6 +48,8 @@ class Flatboi:
         
     def filter_largest_connected_component(self, mesh):
         iteration = 0
+        old_mesh_vertices_count = len(mesh.vertices)
+        old_mesh_triangles_count = len(mesh.triangles)
         while True:
             # Compute connected components
             triangle_clusters, cluster_n_triangles, _ = mesh.cluster_connected_triangles()
@@ -62,12 +64,12 @@ class Flatboi:
 
             vertices_to_keep = np.unique(np.asarray(mesh.triangles)[triangles_to_keep])
 
-            print(f"Keeping {len(vertices_to_keep)} vertices and {len(triangles_to_keep)} triangles from the largest connected component. Of total {len(mesh.vertices)} vertices and {len(mesh.triangles)} triangles.")
+            print(f"Keeping {len(vertices_to_keep)} vertices and {len(triangles_to_keep)} triangles from the largest connected component. Of total {old_mesh_vertices_count} vertices and {old_mesh_triangles_count} triangles.")
 
             # # Select triangles and vertices for the largest connected component
             # mesh_filtered = mesh.select_by_index(list(vertices_to_keep), cleanup=False)
             # Copy mesh to avoid modifying the original
-            mesh_filtered = mesh.clone()
+            mesh_filtered = mesh
             mesh_filtered.remove_triangles_by_index(list(triangles_to_keep))
             mesh_filtered.remove_unreferenced_vertices()
             
@@ -86,10 +88,12 @@ class Flatboi:
             mesh_filtered = mesh_filtered.remove_non_manifold_edges()
             mesh_filtered = mesh_filtered.remove_unreferenced_vertices()
 
-            if len(mesh_filtered.vertices) == len(mesh.vertices) and len(mesh_filtered.triangles) == len(mesh.triangles):
+            if len(mesh_filtered.vertices) == len(old_mesh_vertices_count) and len(old_mesh_triangles_count) == len(mesh.triangles):
                 print("No change in number of vertices. Exiting.")
                 break
             mesh = mesh_filtered
+            old_mesh_triangles_count = len(mesh.triangles)
+            old_mesh_vertices_count = len(mesh.vertices)
             print(f"Iteration {iteration} completed.")
             iteration += 1
         
