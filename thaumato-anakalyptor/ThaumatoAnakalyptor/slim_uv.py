@@ -50,6 +50,9 @@ class Flatboi:
         # Compute connected components for triangles.
         triangle_clusters, cluster_n_triangles, _ = mesh.cluster_connected_triangles()
         print(f"Number of connected components: {len(cluster_n_triangles)}")
+        if len(cluster_n_triangles) == 1:
+            print("Only one connected component found; no filtering needed.")
+            return mesh
         
         # Identify the largest cluster by number of triangles.
         largest_cluster_idx = np.argmax(cluster_n_triangles)
@@ -256,6 +259,11 @@ class Flatboi:
                 print("Further Open3D simplification not needed.")
 
         downsampled_mesh = downsampled_mesh.compute_vertex_normals()
+        # save before filtering
+        obj_path = self.input_obj.replace(".obj", "_downsampled_unfiltered.obj")
+        o3d.io.write_triangle_mesh(obj_path, downsampled_mesh)
+        print("Downsampled mesh saved without filtering.")
+
         downsampled_mesh = self.filter_largest_connected_component(downsampled_mesh)
                 
         # Save the mesh with UVs to an OBJ file
