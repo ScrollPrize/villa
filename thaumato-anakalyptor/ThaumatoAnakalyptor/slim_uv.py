@@ -193,9 +193,12 @@ class Flatboi:
             # Simplify
             downsampled_mesh = self.mesh.simplify_vertex_clustering(2.0)
             print(f"Simplify Open3D round 1. Remaining vertices: {len(np.asarray(downsampled_mesh.vertices))} and triangles: {len(np.asarray(downsampled_mesh.triangles))}")
-            # Simplify Open3D
-            downsampled_mesh = downsampled_mesh.simplify_quadric_decimation(target_num_triangles)
-            print(f"Simplify Open3D round 2. Remaining vertices: {len(np.asarray(downsampled_mesh.vertices))} and triangles: {len(np.asarray(downsampled_mesh.triangles))}")
+            if target_num_triangles < len(np.asarray(downsampled_mesh.triangles)):
+                # Simplify Open3D
+                downsampled_mesh = downsampled_mesh.simplify_quadric_decimation(target_num_triangles)
+                print(f"Simplify Open3D round 2. Remaining vertices: {len(np.asarray(downsampled_mesh.vertices))} and triangles: {len(np.asarray(downsampled_mesh.triangles))}")
+            else:
+                print("Further Open3D simplification not needed.")
 
         downsampled_mesh = downsampled_mesh.compute_vertex_normals()
 
