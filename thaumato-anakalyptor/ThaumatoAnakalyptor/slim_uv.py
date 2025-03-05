@@ -72,6 +72,13 @@ class Flatboi:
             
             # Set the filtered UVs to the new mesh
             mesh_filtered.triangle_uvs = o3d.utility.Vector2dVector(filtered_uvs)
+
+        # Remove degenerate and duplicated triangles/vertices and non-manifold edges
+        mesh_filtered = mesh_filtered.remove_degenerate_triangles()
+        mesh_filtered = mesh_filtered.remove_duplicated_triangles()
+        mesh_filtered = mesh_filtered.remove_duplicated_vertices()
+        mesh_filtered = mesh_filtered.remove_non_manifold_edges()
+        mesh_filtered = mesh_filtered.remove_unreferenced_vertices()
         
         return mesh_filtered
     
