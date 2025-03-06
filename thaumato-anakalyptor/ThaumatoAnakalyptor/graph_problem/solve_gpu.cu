@@ -1355,6 +1355,87 @@ __global__ void update_nodes_kernel_winding_number_step2(Node* d_graph, size_t* 
     node.happiness = fmaxf(0.000f, fminf(0.9999f, node.happiness));
 }
 
+// Kernel to update nodes on the GPU
+__global__ void update_nodes_kernel_random_step1(Node* d_graph, size_t* d_valid_indices, int num_valid_nodes) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_valid_nodes) return;
+
+    size_t i = d_valid_indices[idx];
+    Node& node = d_graph[i];
+    if (node.deleted) return;
+
+    Edge* edges = node.edges;
+    
+    // recalculate edges wnr based on the target wnr
+    for (int j = 0; j < node.num_edges; ++j) {
+        Node& target_node = d_graph[edges[j].target_node];
+        int target_wnr = target_node.winding_nr_old;
+
+        float target_angle = 360 * target_wnr + target_node.f_init;
+        float recalculated_node_wnr = (target_angle - edges[j].k - node.f_init) / 360.0f;
+        int node_wnr = static_cast<int>(std::round(recalculated_node_wnr));
+        edges[j].wnr_from_target = node_wnr;
+        if (edges[j].wnr_from_target != node_wnr) {
+            printf("Error: recalculated wnr is not an integer\n");
+        }
+    }
+}
+
+// Kernel to update nodes on the GPU
+__global__ void update_nodes_kernel_random_step2(Node* d_graph, size_t* d_valid_indices, int num_valid_nodes, unsigned long seed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_valid_nodes) return;
+
+    size_t i = d_valid_indices[idx];
+    Node& node = d_graph[i];
+    if (node.deleted) return;
+
+    // Initialize random number generator
+    curandState state;
+    curand_init(seed * idx, idx, 0, &state);
+
+    Edge* edges = node.edges;
+
+    int available_edges = 0;
+    for (int j = 0; j < node.num_edges; ++j) {
+        if (d_graph[edges[j].target_node].deleted) continue;
+        if (fabsf(edges[j].wnr_from_target) > 900) continue;
+        available_edges++;
+    }
+
+    // pick random edge
+    int random_edge = curand(&state) % available_edges;
+    int second_random_edge = curand(&state) % available_edges;
+    int edge_counter = 0;
+    int winding_nr1 = -1000;
+    bool negative_k = false;
+    int winding_nr2 = -1000;
+    for (int j = 0; j < node.num_edges; ++j) {
+        if (d_graph[edges[j].target_node].deleted) continue;
+        if (fabsf(edges[j].wnr_from_target) > 900) continue;
+        if (edge_counter == random_edge) {
+            negative_k = edges[j].k < 0.0f;
+            winding_nr1 = edges[j].wnr_from_target;
+        }
+        if (edge_counter == second_random_edge) {
+            winding_nr2 = edges[j].wnr_from_target;
+        }
+        edge_counter++;
+    }
+    int p_001 = curand(&state) % 100;
+    if (false && negative_k && p_001 < 1) {
+        winding_nr1 = winding_nr2;
+    }
+    // winding numbers update
+    node.winding_nr = winding_nr1;
+     
+    // sides update
+    if (node.fixed) {
+        // set wnr
+        node.winding_nr = node.winding_nr_old; // reset to old value
+    }
+}
+
 // Kernel to update f_tilde with f_star on the GPU
 __global__ void update_f_tilde_kernel(Node* d_graph, size_t* d_valid_indices, int num_valid_nodes) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4953,6 +5034,117 @@ std::vector<Node> run_solver_winding_number(std::vector<Node>& graph, int num_it
                 // Re-copy the updated graph to GPU
                 num_nodes = graph.size();
                 update_fixed_field(d_graph, graph.data(), num_nodes);
+            }
+
+            // free old host memory
+            if (h_all_edges_ != nullptr) {
+                delete[] h_all_edges_;
+            }
+            if (h_all_sides_ != nullptr) {
+                delete[] h_all_sides_;
+            }
+
+            // Print
+            std::cout << "\rIteration: " << iter << std::flush;  // Updates the same line
+        }
+    }
+    std::cout << std::endl;
+
+    // Graph to host
+    auto [h_all_edges_, h_all_sides_] = copy_graph_from_gpu(graph.data(), d_graph, num_nodes, &d_all_edges, &d_all_sides);
+    // free old h_all_edges
+    if (*h_all_edges != nullptr) {
+        delete[] *h_all_edges;
+    }
+    *h_all_edges = h_all_edges_;
+    // free old h_all_sides
+    if (*h_all_sides != nullptr) {
+        delete[] *h_all_sides;
+    }
+    *h_all_sides = h_all_sides_;
+    // Free GPU memory
+    free_edges_from_gpu(d_all_edges);
+    free_sides_from_gpu(d_all_sides);
+    cudaFree(d_graph);
+
+    return graph;
+}
+
+std::vector<Node> run_solver_random(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, bool display) {
+    // Allocate space for min and max f_star values on the GPU
+    size_t num_nodes = graph.size();
+    size_t num_valid_nodes = valid_indices.size();
+    // Allocate memory on the GPU
+    size_t* d_valid_indices;
+    cudaMalloc(&d_valid_indices, num_valid_nodes * sizeof(size_t));
+    // Copy graph and valid indices to the GPU
+    cudaMemcpy(d_valid_indices, valid_indices.data(), num_valid_nodes * sizeof(size_t), cudaMemcpyHostToDevice);
+
+    Node* d_graph;
+    cudaMalloc(&d_graph, num_nodes * sizeof(Node));
+    cudaMemcpy(d_graph, graph.data(), num_nodes * sizeof(Node), cudaMemcpyHostToDevice);
+
+    // Allocate and copy edges to GPU
+    Edge* d_all_edges = nullptr;
+    float* d_all_sides = nullptr;
+    copy_graph_to_gpu(graph.data(), d_graph, num_nodes, &d_all_edges, &d_all_sides);
+
+    std::cout << "Copied data to GPU" << std::endl;
+    
+    // CUDA kernel configuration
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (num_valid_nodes + threadsPerBlock - 1) / threadsPerBlock;
+
+    // random seed generation unsigned long
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, 1000000);
+
+    // Run the iterations
+    for (int iter = 1; iter < num_iterations; iter++) {
+        // Launch the kernel to update nodes
+        update_nodes_kernel_random_step1<<<blocksPerGrid, threadsPerBlock>>>(d_graph, d_valid_indices, num_valid_nodes);
+
+        cudaError_t err = cudaGetLastError(); // Check for errors during kernel launch
+        if (err != cudaSuccess) {
+            std::cerr << "CUDA Kernel error: " << cudaGetErrorString(err) << std::endl;
+        }
+        cudaDeviceSynchronize(); // Check for errors during kernel execution
+
+        // Launch the kernel to update nodes
+        update_nodes_kernel_random_step2<<<blocksPerGrid, threadsPerBlock>>>(d_graph, d_valid_indices, num_valid_nodes, dis(gen));
+
+        err = cudaGetLastError(); // Check for errors during kernel launch
+        if (err != cudaSuccess) {
+            std::cerr << "CUDA Kernel error: " << cudaGetErrorString(err) << std::endl;
+        }
+        cudaDeviceSynchronize(); // Check for errors during kernel execution
+
+        // Launch the kernel to update f_tilde with f_star
+        update_winding_number_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_graph, d_valid_indices, num_valid_nodes);
+
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            std::cerr << "CUDA Synchronization error: " << cudaGetErrorString(err) << std::endl;
+        }
+
+        // Synchronize to ensure all threads are finished
+        cudaDeviceSynchronize();
+
+        // Adjusting side logic
+        int step_size = 120;
+        if (iter % step_size == 0) {
+            // Copy results back to the host
+            auto [h_all_edges_, h_all_sides_] = copy_graph_from_gpu(graph.data(), d_graph, num_nodes, &d_all_edges, &d_all_sides, false, false);
+            
+            if (display) {
+                // Generate filename with zero padding
+                // std::ostringstream filename_plot_happyness;
+                // filename_plot_happyness << "python_happyness/happyness_plot_python_" << i_round << "_" << iter << ".png";
+                // plot_nodes_happyness(graph, filename_plot_happyness.str()); // plotting "standard" happyness
+                std::ostringstream filename_plot_nodes_winding_nrs;
+                filename_plot_nodes_winding_nrs << "python_winding_numbers/plot_nodes_winding_nrs_python_" << i_round << "_" << iter << ".png";
+                plot_nodes_winding_numbers(graph, filename_plot_nodes_winding_nrs.str());
             }
 
             // free old host memory

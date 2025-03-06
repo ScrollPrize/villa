@@ -476,6 +476,12 @@ class Solver {
             std::vector<size_t> valid_indices = get_valid_indices(graph);
             graph = run_solver_winding_number(graph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, other_block_factor, seed_node, side_fix_nr, display);
         }
+        void solve_random(int num_iterations, int i_round = 1, bool display = true) {
+            // use the random solver for the final solution
+            // store only the valid indices to speed up the loop
+            std::vector<size_t> valid_indices = get_valid_indices(graph);
+            graph = run_solver_random(graph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, display);
+        }
         void assign_f_star(std::vector<Node>& graph) {
             // assign winding angles to f star
             for (size_t i = 0; i < graph.size(); ++i) {
@@ -750,6 +756,11 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("seed_node") = 100,
             py::arg("other_block_factor") = 1.0f,
             py::arg("side_fix_nr") = 0,
+            py::arg("display") = true)
+        .def("solve_random", &Solver::solve_random,
+            "Method to final solve the graph with the random solver",
+            py::arg("num_iterations") = 10000,
+            py::arg("i_round") = 1,
             py::arg("display") = true)
         .def("save_solution", &Solver::save_solution,
             "Method to save the final solution of the graph",

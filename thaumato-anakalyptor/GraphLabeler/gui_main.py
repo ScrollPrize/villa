@@ -14,51 +14,14 @@ import time
 # --------------------------------------------------
 # Importing the custom graph problem library.
 # --------------------------------------------------
-sys.path.append('ThaumatoAnakalyptor/graph_problem/build')
+sys.path.append('../ThaumatoAnakalyptor/graph_problem/build')
 import graph_problem_gpu_py
 
-def point_to_polyline_distance(point, polyline):
-    """
-    Compute the minimum distance from a point (x,y) to a polyline.
-    The polyline is a 2D numpy array representing connected points.
-    """
-    min_dist = np.inf
-    for i in range(len(polyline) - 1):
-        p1 = polyline[i]
-        p2 = polyline[i + 1]
-        v = p2 - p1
-        w = point - p1
-        if np.all(v == 0):
-            dist = np.linalg.norm(w)
-        else:
-            t = np.dot(w, v) / np.dot(v, v)
-            if t < 0:
-                dist = np.linalg.norm(point - p1)
-            elif t > 1:
-                dist = np.linalg.norm(point - p2)
-            else:
-                proj = p1 + t * v
-                dist = np.linalg.norm(point - proj)
-        if dist < min_dist:
-            min_dist = dist
-    return min_dist
-
-def vectorized_point_to_polyline_distance(point, polyline):
-    """
-    Compute the minimum distance from a point (2,) to a polyline.
-    Uses vectorized operations.
-    """
-    p1 = polyline[:-1]
-    p2 = polyline[1:]
-    v = p2 - p1
-    w = point - p1
-    dot_wv = np.einsum('ij,ij->i', w, v)
-    dot_vv = np.einsum('ij,ij->i', v, v)
-    t = np.divide(dot_wv, dot_vv, out=np.zeros_like(dot_wv), where=dot_vv != 0)
-    t = np.clip(t, 0, 1)
-    proj = p1 + (t[:, None] * v)
-    dists = np.linalg.norm(point - proj, axis=1)
-    return np.min(dists)
+from config import load_config, save_config
+from solver_interface import SolverInterface
+from utils import vectorized_point_to_polyline_distance
+from widgets import create_sync_slider_spinbox
+from ome_zarr_view import OmeZarrViewWindow
 
 # --------------------------------------------------
 # Main: Create GUI.
@@ -68,23 +31,21 @@ class PointCloudLabeler(QMainWindow):
         super().__init__(parent)
         self.setWindowTitle("Graph Labeler")
         
-        # Default data settings
-        self.graph_path = "/media/julian/2/Scroll5/scroll5_complete_surface_points_zarrtest/1352_3600_5005/graph.bin"
-        self.default_z_min = 3000
-        self.default_z_max = 4000
-        self.default_experiment = "denominator3-rotated"
+        # Load configuration (or fall back to defaults)
+        self.config = load_config("config_labeling_gui.json")
+        self.graph_path = self.config.get("graph_path", "/media/julian/2/Scroll5/scroll5_complete_surface_points_zarrtest/1352_3600_5005/graph.bin")
+        self.default_experiment = self.config.get("default_experiment", "denominator3-rotated")
+        self.ome_zarr_path = self.config.get("ome_zarr_path", None)
+        self.umbilicus_path = self.config.get("umbilicus_path", None)
 
-        # Load config (if available) to override defaults.
-        self.load_config()
-        
-        # Initialize solver if no external point data is provided.
+
+        # Initialize solver using SolverInterface if no external point data is provided.
         if point_data is None:
-            self.solver = graph_problem_gpu_py.Solver(
-                self.graph_path, z_min=self.default_z_min, z_max=self.default_z_max)
-            gt_path = os.path.join("experiments", self.default_experiment,
+            self.solver = SolverInterface(self.graph_path)
+            gt_path = os.path.join("../experiments", self.default_experiment,
                                    "checkpoints", "checkpoint_graph_solver_connected_2.bin")
             if not os.path.exists(gt_path):
-                gt_path = os.path.join("experiments", self.default_experiment,
+                gt_path = os.path.join("../experiments", self.default_experiment,
                                        "checkpoints", "checkpoint_graph_f_star_final.bin")
             if os.path.exists(gt_path):
                 self.solver.load_graph(gt_path)
@@ -105,7 +66,7 @@ class PointCloudLabeler(QMainWindow):
         self.redo_stack = []
         self._stroke_backup = None
         
-        # Spline storage (keys: effective winding number, values: list of polylines)
+        # Spline storage.
         self.spline_items = []
         self.spline_segments = {}
         
@@ -179,24 +140,24 @@ class PointCloudLabeler(QMainWindow):
         left_column.addWidget(self.xy_plot)
         self.xy_plot.addItem(self.cursor_circle)
         xy_controls = QHBoxLayout()
-        self.z_center_widget, self.z_center_slider, self.z_center_spinbox = self.create_sync_slider_spinbox(
-            "Z slice center:", self.z_min, self.z_max, (self.z_min + self.z_max) / 2)
-        self.z_thickness_widget, self.z_thickness_slider, self.z_thickness_spinbox = self.create_sync_slider_spinbox(
-            "Z slice thickness:", 0.01, self.z_max - self.z_min, (self.z_max - self.z_min) * 0.1)
+        self.z_center_widget, self.z_center_slider, self.z_center_spinbox = create_sync_slider_spinbox(
+            "Z slice center:", self.z_min, self.z_max, (self.z_min + self.z_max) / 2, self.scaleFactor, self.z_slice_center_changed)
+        self.z_thickness_widget, self.z_thickness_slider, self.z_thickness_spinbox = create_sync_slider_spinbox(
+            "Z slice thickness:", 0.01, self.z_max - self.z_min, (self.z_max - self.z_min) * 0.1, self.scaleFactor, self.update_views)
         xy_controls.addWidget(self.z_center_widget)
         xy_controls.addWidget(self.z_thickness_widget)
         left_column.addLayout(xy_controls)
         # Add two new shear controls for the XY view:
         # Vertical shear (rotating around the f_star axis)
         xy_vertical_shear_layout = QHBoxLayout()
-        self.xy_vertical_shear_widget, self.xy_vertical_shear_slider, self.xy_vertical_shear_spinbox = self.create_sync_slider_spinbox(
-            "XY Vertical Shear (°):", -90.0, 90.0, 0.0, decimals=1)
+        self.xy_vertical_shear_widget, self.xy_vertical_shear_slider, self.xy_vertical_shear_spinbox = create_sync_slider_spinbox(
+            "XY Vertical Shear (°):", -90.0, 90.0, 0.0, self.scaleFactor, self.update_views, decimals=1)
         xy_vertical_shear_layout.addWidget(self.xy_vertical_shear_widget)
         left_column.addLayout(xy_vertical_shear_layout)
         # Horizontal shear (rotating around the f_init axis)
         xy_horizontal_shear_layout = QHBoxLayout()
-        self.xy_horizontal_shear_widget, self.xy_horizontal_shear_slider, self.xy_horizontal_shear_spinbox = self.create_sync_slider_spinbox(
-            "XY Horizontal Shear (°):", -90.0, 90.0, 0.0, decimals=1)
+        self.xy_horizontal_shear_widget, self.xy_horizontal_shear_slider, self.xy_horizontal_shear_spinbox = create_sync_slider_spinbox(
+            "XY Horizontal Shear (°):", -90.0, 90.0, 0.0, self.scaleFactor, self.update_views, decimals=1)
         xy_horizontal_shear_layout.addWidget(self.xy_horizontal_shear_widget)
         left_column.addLayout(xy_horizontal_shear_layout)
         self.apply_calc_xy_button = QPushButton("Apply Updated Labels to XY")
@@ -213,18 +174,18 @@ class PointCloudLabeler(QMainWindow):
         self.xz_plot.setMouseEnabled(x=True, y=True)
         right_column.addWidget(self.xz_plot)
         xz_controls = QHBoxLayout()
-        self.finit_center_widget, self.finit_center_slider, self.finit_center_spinbox = self.create_sync_slider_spinbox(
+        self.finit_center_widget, self.finit_center_slider, self.finit_center_spinbox = create_sync_slider_spinbox(
             "f init center:", float(np.min(self.points[:, 1])), float(np.max(self.points[:, 1])),
-            (np.min(self.points[:, 1]) + np.max(self.points[:, 1])) / 2)
-        self.finit_thickness_widget, self.finit_thickness_slider, self.finit_thickness_spinbox = self.create_sync_slider_spinbox(
-            "f init thickness:", 0.01, float(np.max(self.points[:, 1]) - np.min(self.points[:, 1])), 5.0)
+            (np.min(self.points[:, 1]) + np.max(self.points[:, 1])) / 2, self.scaleFactor, self.f_init_center_changed)
+        self.finit_thickness_widget, self.finit_thickness_slider, self.finit_thickness_spinbox = create_sync_slider_spinbox(
+            "f init thickness:", 0.01, float(np.max(self.points[:, 1]) - np.min(self.points[:, 1])), 5.0, self.scaleFactor, self.update_views)
         xz_controls.addWidget(self.finit_center_widget)
         xz_controls.addWidget(self.finit_thickness_widget)
         right_column.addLayout(xz_controls)
         # XZ shear control (unchanged functionality)
         xz_shear_layout = QHBoxLayout()
-        self.xz_shear_widget, self.xz_shear_slider, self.xz_shear_spinbox = self.create_sync_slider_spinbox(
-            "XZ Shear (°):", -90.0, 90.0, 0.0, decimals=1)
+        self.xz_shear_widget, self.xz_shear_slider, self.xz_shear_spinbox = create_sync_slider_spinbox(
+            "XZ Shear (°):", -90.0, 90.0, 0.0, self.scaleFactor, self.update_views, decimals=1)
         xz_shear_layout.addWidget(self.xz_shear_widget)
         right_column.addLayout(xz_shear_layout)
         self.apply_calc_xz_button = QPushButton("Apply Updated Labels to XZ")
@@ -296,8 +257,8 @@ class PointCloudLabeler(QMainWindow):
         # Bottom Controls Row: Common Drawing and File Controls.
         # --------------------------------------------------------------------
         common_controls_layout = QHBoxLayout()
-        self.radius_widget, self.radius_slider, self.radius_spinbox = self.create_sync_slider_spinbox(
-            "Drawing radius:", 0.1, 20.0, 2.5, decimals=1)
+        self.radius_widget, self.radius_slider, self.radius_spinbox = create_sync_slider_spinbox(
+            "Drawing radius:", 0.1, 20.0, 2.5, self.scaleFactor, self.update_views, decimals=1)
         common_controls_layout.addWidget(self.radius_widget)
         
         max_disp_layout = QHBoxLayout()
@@ -372,36 +333,25 @@ class PointCloudLabeler(QMainWindow):
         self.update_guides()
         self.update_views()
 
-    def load_config(self):
-        config_file = "config_labeling_gui.json"
-        if os.path.exists(config_file):
-            try:
-                with open(config_file, "r") as f:
-                    config = json.load(f)
-                # Override defaults if available in the config.
-                self.graph_path = config.get("graph_path", self.graph_path)
-                self.default_experiment = config.get("default_experiment", self.default_experiment)
-                print("Loaded config:", config)
-            except Exception as e:
-                print("Error loading config file:", e)
-        else:
-            print("Config file not found. Using default settings.")
+    def z_slice_center_changed(self):
+        if hasattr(self, 'ome_zarr_window'):
+            self.ome_zarr_window.update_z_slice_center(self.z_center_spinbox.value())
+        self.update_views()
 
-    def save_config(self):
-        config = {
-            "graph_path": self.graph_path,
-            "default_experiment": self.default_experiment
-        }
-        try:
-            with open("config_labeling_gui.json", "w") as f:
-                json.dump(config, f, indent=4)
-            print("Config saved.")
-        except Exception as e:
-            print("Error saving config:", e)
+    def f_init_center_changed(self):
+        if hasattr(self, 'ome_zarr_window'):
+            self.ome_zarr_window.update_finit_center(self.finit_center_spinbox.value())
+        self.update_views()
 
+    # Instead, call save_config on close.
     def closeEvent(self, event):
-        # Save the config when the GUI closes.
-        self.save_config()
+        self.config["graph_path"] = self.graph_path
+        self.config["default_experiment"] = self.default_experiment
+        if self.ome_zarr_path:
+            self.config["ome_zarr_path"] = self.ome_zarr_path  # Save the OME-Zarr path
+        if self.umbilicus_path:
+            self.config["umbilicus_path"] = self.umbilicus_path
+        save_config(self.config, "config_labeling_gui.json")
         event.accept()
     
     # --------------------------------------------------
@@ -436,10 +386,49 @@ class PointCloudLabeler(QMainWindow):
         load_labels_action.triggered.connect(self.load_labels_from_path)
         data_menu.addAction(load_labels_action)
         
+        # NEW: Action to set the OME-Zarr (scroll) path.
+        set_ome_zarr_action = QAction("Set OME-Zarr Path", self)
+        set_ome_zarr_action.triggered.connect(self.set_ome_zarr_path)
+        data_menu.addAction(set_ome_zarr_action)
+
+        set_umbilicus_action = QAction("Set Umbilicus Path", self)
+        set_umbilicus_action.triggered.connect(self.set_umbilicus_path)
+        data_menu.addAction(set_umbilicus_action)
+        
+        # Existing "View" menu for OME-Zarr window…
+        view_menu = menu_bar.addMenu("View")
+        ome_zarr_action = QAction("Open OME-Zarr View", self)
+        ome_zarr_action.triggered.connect(self.open_ome_zarr_view_window)
+        view_menu.addAction(ome_zarr_action)
+        
         help_menu = menu_bar.addMenu("Help")
         usage_action = QAction("Usage", self)
         usage_action.triggered.connect(self.show_help)
         help_menu.addAction(usage_action)
+
+    def set_ome_zarr_path(self):
+        directory = QFileDialog.getExistingDirectory(self, "Select OME-Zarr Directory", self.ome_zarr_path or os.getcwd())
+        if directory:
+            self.ome_zarr_path = directory
+            self.config["ome_zarr_path"] = directory
+            save_config(self.config, "config_labeling_gui.json")
+
+    def set_umbilicus_path(self):
+        fname, _ = QFileDialog.getOpenFileName(self, "Select Umbilicus .txt File", self.umbilicus_path or os.getcwd(), "Text Files (*.txt);;All Files (*)")
+        if fname:
+            self.umbilicus_path = fname
+            self.config["umbilicus_path"] = fname
+            save_config(self.config, "config_labeling_gui.json")
+
+    def open_ome_zarr_view_window(self):
+        self.ome_zarr_window = OmeZarrViewWindow(
+            graph_labels=self.labels,
+            solver_interface=self.solver,
+            experiment_path=self.default_experiment,
+            ome_zarr_path=self.ome_zarr_path,
+            umbilicus_path=self.umbilicus_path
+        )
+        self.ome_zarr_window.show()
     
     def load_data(self):
         dialog = QDialog(self)
@@ -474,12 +463,10 @@ class PointCloudLabeler(QMainWindow):
                 QMessageBox.warning(self, "Load Data", f"File {bin_file_path} does not exist.")
                 return
             self.graph_path = bin_file_path
-            self.solver = graph_problem_gpu_py.Solver(self.graph_path,
-                                                    z_min=self.default_z_min,
-                                                    z_max=self.default_z_max)
-            gt_path = os.path.join("experiments", exp_name, "checkpoints", "checkpoint_graph_solver_connected_2.bin")
+            self.solver = graph_problem_gpu_py.Solver(self.graph_path)
+            gt_path = os.path.join("../experiments", exp_name, "checkpoints", "checkpoint_graph_solver_connected_2.bin")
             if not os.path.exists(gt_path):
-                gt_path = os.path.join("experiments", exp_name, "checkpoints", "checkpoint_graph_f_star_final.bin")
+                gt_path = os.path.join("../experiments", exp_name, "checkpoints", "checkpoint_graph_f_star_final.bin")
             if os.path.exists(gt_path):
                 self.solver.load_graph(gt_path)
             else:
@@ -505,7 +492,7 @@ class PointCloudLabeler(QMainWindow):
                 f.write(str(self.labels.tolist()))
     
     def load_labels_from_path(self):
-        fname, _ = QFileDialog.getOpenFileName(self, "Load Labels", os.path.join("experiments", self.default_experiment),
+        fname, _ = QFileDialog.getOpenFileName(self, "Load Labels", os.path.join("../experiments", self.default_experiment),
                                                  "Text Files (*.txt);;All Files (*)")
         if fname:
             with open(fname, "r") as f:
@@ -550,30 +537,6 @@ class PointCloudLabeler(QMainWindow):
             "   • Use the Data menu to load data or save/load labels, and to save the final labeled graph.\n"
         )
         QMessageBox.information(self, "Usage Instructions", help_text)
-    
-    def create_sync_slider_spinbox(self, label_text, min_val, max_val, default_val, decimals=2):
-        container = QWidget()
-        layout = QHBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        label = QLabel(label_text)
-        slider = QSlider(Qt.Horizontal)
-        slider.setMinimum(int(min_val * self.scaleFactor))
-        slider.setMaximum(int(max_val * self.scaleFactor))
-        slider.setValue(int(default_val * self.scaleFactor))
-        spinbox = QDoubleSpinBox()
-        spinbox.setDecimals(decimals)
-        spinbox.setMinimum(min_val)
-        spinbox.setMaximum(max_val)
-        spinbox.setValue(default_val)
-        spinbox.setSingleStep(1.0)
-        slider.valueChanged.connect(lambda val: (spinbox.blockSignals(True), spinbox.setValue(val / self.scaleFactor),
-                                                  spinbox.blockSignals(False), self.update_views()))
-        spinbox.valueChanged.connect(lambda val: (slider.blockSignals(True), slider.setValue(int(val * self.scaleFactor)),
-                                                   slider.blockSignals(False), self.update_views()))
-        layout.addWidget(label)
-        layout.addWidget(slider)
-        layout.addWidget(spinbox)
-        return container, slider, spinbox
     
     def update_slider_ranges(self):
         self.z_min = float(np.min(self.points[:, 2]))
@@ -1403,6 +1366,7 @@ class PointCloudLabeler(QMainWindow):
         with open("ground_truth.txt", "w") as f:
             f.write(str(ground_truth))
     
+    # Example of using the solver interface when updating labels:
     def update_labels(self):
         if self.solver is not None:
             gt = np.abs((self.labels - self.UNLABELED) > 2)
@@ -1412,15 +1376,14 @@ class PointCloudLabeler(QMainWindow):
             selected_solver = self.solver_combo.currentText() if hasattr(self, "solver_combo") else "Winding Number"
             if selected_solver == "Winding Number":
                 self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1,
-                                                other_block_factor=15.0, side_fix_nr=-1, display=False)
+                                                 other_block_factor=15.0, side_fix_nr=-1, display=False)
             elif selected_solver == "Union":
                 self.solver.solve_union()
             elif selected_solver == "Random":
-                # Replace with the actual alternative solver function if available
                 self.solver.solve_random(num_iterations=5000, i_round=-3, display=True)
             else:
                 self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1,
-                                                other_block_factor=15.0, side_fix_nr=-1, display=False)
+                                                 other_block_factor=15.0, side_fix_nr=-1, display=False)
             calculated_labels = self.solver.get_labels()
             self.calculated_labels = np.array(calculated_labels)
             self.update_views()
@@ -1533,16 +1496,3 @@ class PointCloudLabeler(QMainWindow):
             event.accept()
         else:
             super(PointCloudLabeler, self).keyReleaseEvent(event)
-
-# --------------------------------------------------
-# Main: Create GUI.
-# --------------------------------------------------
-def main():
-    pg.setConfigOptions(useOpenGL=True)
-    app = QApplication(sys.argv)
-    gui = PointCloudLabeler()
-    gui.show()
-    sys.exit(app.exec_())
-
-if __name__ == "__main__":
-    main()

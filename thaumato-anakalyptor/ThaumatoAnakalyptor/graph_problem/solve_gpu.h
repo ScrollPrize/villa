@@ -14,6 +14,7 @@ std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations
 std::vector<Node> run_solver_ring(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float other_block_factor, float std_target, 
                                     float std_target_step, bool increase_same_block_weight, bool convergence_speedup, float convergence_thresh, bool wiggle, bool standard_winding_direction, float scale_left, float scale_right, bool enable_delete_nodes);
 std::vector<Node> run_solver_winding_number(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float other_block_factor, int seed_node, int side_fix_nr, bool display);
+std::vector<Node> run_solver_random(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, bool display);
 
 void filter_graph_sides(std::vector<Node>& graph);
 void filter_graph_f_star(std::vector<Node>& graph, float f_star_threshold);
