@@ -196,6 +196,8 @@ def main():
                         help="Number of threads (processes) to use. If >1, partial HDF5 files are created and merged.")
     parser.add_argument("--compression_level", type=int, default=4,
                         help="Compression level (0-9, only for gzip, where 0 is no compression and 9 is max compression).")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print more detailed information during processing.")
     args = parser.parse_args()
 
     print(f"Converting instance archives in {args.input_dir} to HDF5 file: {args.output_h5}")
@@ -227,7 +229,8 @@ def main():
                 extr_time, grp_time = process_instance_archive(archive, h5_file, args.group_prefix, args.compression, args.compression_level)
                 total_extraction_time += extr_time
                 total_group_time += grp_time
-                tqdm.write(f"Processed {os.path.basename(archive)}: extr={extr_time:.2f}s, grp={grp_time:.2f}s")
+                if args.verbose:
+                    tqdm.write(f"Processed {os.path.basename(archive)}: extr={extr_time:.2f}s, grp={grp_time:.2f}s")
         print(f"Conversion complete. HDF5 file saved as: {args.output_h5}")
         print(f"Total extraction time: {total_extraction_time:.2f} sec")
         print(f"Total group creation time: {total_group_time:.2f} sec")
