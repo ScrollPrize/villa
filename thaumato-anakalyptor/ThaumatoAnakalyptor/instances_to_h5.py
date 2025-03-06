@@ -226,7 +226,7 @@ def main():
         chunk_size = ceil(len(archives) / n_threads)
         archive_chunks = [archives[i:i+chunk_size] for i in range(0, len(archives), chunk_size)]
         partial_files = []
-        partials_dir = setup_h5_partials_folder()
+        partials_dir = setup_h5_partials_folder(args.output_h5)
         futures = []
         total_extraction_time = 0.0
         total_group_time = 0.0
