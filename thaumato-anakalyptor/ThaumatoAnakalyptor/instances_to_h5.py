@@ -22,6 +22,7 @@ import numpy as np
 import open3d as o3d
 import py7zr
 import tarfile
+from tqdm import tqdm
 
 
 def load_ply_file(filepath):
@@ -148,7 +149,7 @@ def main():
     
     # Open the HDF5 file for writing.
     with h5py.File(args.output_h5, "w") as h5_file:
-        for archive in archives:
+        for archive in tqdm(archives, desc="Processing archives"):
             print(f"Processing archive: {archive}")
             try:
                 process_instance_archive(archive, h5_file, group_prefix=args.group_prefix, compression=args.compression)
