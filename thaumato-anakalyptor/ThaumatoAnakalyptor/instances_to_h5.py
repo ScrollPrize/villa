@@ -175,9 +175,12 @@ def main():
                         help="Number of threads (processes) to use. If >1, partial HDF5 files are created and merged.")
     args = parser.parse_args()
 
+    print(f"Converting instance archives in {args.input_dir} to HDF5 file: {args.output_h5}")
+
     # Find all archive files.
-    archives = [os.path.join(args.input_dir, f) for f in os.listdir(args.input_dir)
+    archives = [os.path.join(args.input_dir, f) for f in tqdm(os.listdir(args.input_dir))
                 if f.lower().endswith(('.7z', '.tar'))]
+    print(f"Found {len(archives)} archives.")
     archives.sort()
     if not archives:
         print("[ERROR] No archives found in the specified input directory.")
