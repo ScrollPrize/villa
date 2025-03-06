@@ -63,7 +63,7 @@ def extract_archive(archive_path, extract_dir):
         raise ValueError(f"Unsupported archive format for {archive_path}")
 
 
-def process_instance_archive(archive_path, h5_file, group_prefix="", compression="lzf"):
+def process_instance_archive(archive_path, h5_file, group_prefix="", compression="lzf", compression_level=4):
     """
     Extracts an instance archive, reads its PLY and metadata files, and writes them into the HDF5 file.
     
@@ -125,9 +125,9 @@ def process_instance_archive(archive_path, h5_file, group_prefix="", compression
                     print(f"[WARNING] Reading metadata file {metadata_file}: {e}")
 
             surface_grp = grp.create_group(base)
-            surface_grp.create_dataset("points", data=points, compression=compression)
-            surface_grp.create_dataset("normals", data=normals, compression=compression)
-            surface_grp.create_dataset("colors", data=colors, compression=compression)
+            surface_grp.create_dataset("points", data=points, compression=compression, compression_opts=compression_level if compression == 'gzip' else None)
+            surface_grp.create_dataset("normals", data=normals, compression=compression, compression_opts=compression_level if compression == 'gzip' else None)
+            surface_grp.create_dataset("colors", data=colors, compression=compression, compression_opts=compression_level if compression == 'gzip' else None)
             
             for key, value in metadata.items():
                 try:
@@ -142,7 +142,7 @@ def process_instance_archive(archive_path, h5_file, group_prefix="", compression
         shutil.rmtree(temp_dir)
 
 
-def process_archives_chunk(archives, partial_h5_filename, group_prefix, compression):
+def process_archives_chunk(archives, partial_h5_filename, group_prefix, compression, compression_level=4):
     """
     Processes a list of archives and writes the results into a partial HDF5 file.
     
@@ -152,7 +152,7 @@ def process_archives_chunk(archives, partial_h5_filename, group_prefix, compress
     total_group_time = 0.0
     with h5py.File(partial_h5_filename, "w") as h5_file:
         for archive in tqdm(archives, desc=f"Thread processing {os.path.basename(partial_h5_filename)}", leave=False):
-            extr_time, grp_time = process_instance_archive(archive, h5_file, group_prefix, compression)
+            extr_time, grp_time = process_instance_archive(archive, h5_file, group_prefix, compression, compression_level=compression_level)
             total_extraction_time += extr_time
             total_group_time += grp_time
     return total_extraction_time, total_group_time
@@ -184,6 +184,8 @@ def main():
                         help="Optional prefix for group names in the HDF5 file.")
     parser.add_argument("--threads", type=int, default=1,
                         help="Number of threads (processes) to use. If >1, partial HDF5 files are created and merged.")
+    parser.add_argument("--compression_level", type=int, default=4,
+                        help="Compression level (0-9, only for gzip, where 0 is no compression and 9 is max compression).")
     args = parser.parse_args()
 
     print(f"Converting instance archives in {args.input_dir} to HDF5 file: {args.output_h5}")
@@ -212,7 +214,7 @@ def main():
         total_group_time = 0.0
         with h5py.File(args.output_h5, "w") as h5_file:
             for archive in tqdm(archives, desc="Processing archives"):
-                extr_time, grp_time = process_instance_archive(archive, h5_file, args.group_prefix, args.compression)
+                extr_time, grp_time = process_instance_archive(archive, h5_file, args.group_prefix, args.compression, args.compression_level)
                 total_extraction_time += extr_time
                 total_group_time += grp_time
                 tqdm.write(f"Processed {os.path.basename(archive)}: extr={extr_time:.2f}s, grp={grp_time:.2f}s")
@@ -237,7 +239,7 @@ def main():
                 print(f"Thread {i} will write to: {partial_filename}")
                 partial_files.append(partial_filename)
                 futures.append(executor.submit(process_archives_chunk, chunk, partial_filename,
-                                               args.group_prefix, args.compression))
+                                               args.group_prefix, args.compression, args.compression_level))
             for future in as_completed(futures):
                 extr_time, grp_time = future.result()
                 total_extraction_time += extr_time
