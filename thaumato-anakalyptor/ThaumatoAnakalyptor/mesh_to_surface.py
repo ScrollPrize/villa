@@ -840,14 +840,6 @@ class PPMAndTextureModel(pl.LightningModule):
             # Step 6: Return the 3D Surface Volume coordinates and the values
             values = values.reshape(-1)
             grid_points = grid_points.reshape(-1, 3) # grid_points: S' x 3
-            
-            # If segmented rendering is enabled, filter points by current segment and re-index layer coordinate
-            if hasattr(self, 'current_r_range'):
-                seg_start, seg_end = self.current_r_range
-                mask_seg = (grid_points[:, 2] >= seg_start) & (grid_points[:, 2] < seg_end)
-                values = values[mask_seg]
-                grid_points = grid_points[mask_seg]
-                grid_points[:, 2] = grid_points[:, 2] - seg_start
 
             # Empty the cache to free up memory
             torch.cuda.empty_cache()
@@ -961,8 +953,6 @@ def ppm_and_texture(obj_path, scroll, output_path=None, grid_size=500, gpus=1, b
             writer.current_step_offset = seg_start
             # reset the surface volume
             writer.surface_volume_np = None
-            # Set the current r range in the model for filtering predictions
-            model.current_r_range = (seg_start, seg_end)
             print(f"Rendering segment: layers {seg_start} to {seg_end-1}")
             trainer.predict(model, dataloaders=dataloader, return_predictions=False)
             writer.write_to_disk(format)
