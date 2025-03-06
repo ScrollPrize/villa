@@ -189,7 +189,7 @@ class MyPredictionWriter(BasePredictionWriter):
         # Make folder if it does not exist
         os.makedirs(self.save_path, exist_ok=True)
 
-        if flag == 'tif':
+        if flag == 'tif' or flag == 'tiff':
             self.write_tif()
         elif flag == 'jpg':
             self.write_jpg()
