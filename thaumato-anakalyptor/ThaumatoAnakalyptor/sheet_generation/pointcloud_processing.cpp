@@ -220,26 +220,26 @@ public:
             const auto& xyz = std::get<0>(node);
             size_t patch_nr = std::get<1>(node);
             double winding_angle = std::get<2>(node);
-
+    
             // Skip nodes outside the Z-range
             if (xyz[1] < start_z_ || xyz[1] > end_z_) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 print_progress();
                 continue;
             }
-
+    
             // Construct a unique base filename using the node's xyz values
             std::string base_filename = base_path_ + "/" +
                 format_filename(xyz[0]) + "_" +
                 format_filename(xyz[1]) + "_" +
                 format_filename(xyz[2]);
-
+    
             // Check if an HDF5 file exists (named as base_path_ + ".h5")
             if (h5_exists) {
                 // Compute the group name (basename of base_filename)
                 std::string group_name = get_basename(base_filename);
                 std::string surface_group_name = "surface_" + std::to_string(patch_nr);
-
+    
                 // Open HDF5 file in read-only mode.
                 hid_t file_id = H5Fopen(h5_path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
                 if (file_id < 0) {
@@ -248,7 +248,7 @@ public:
                     print_progress();
                     continue;
                 }
-
+    
                 // Open the group (if it exists)
                 hid_t group_id = H5Gopen2(file_id, group_name.c_str(), H5P_DEFAULT);
                 if (group_id < 0) {
@@ -258,7 +258,7 @@ public:
                     print_progress();
                     continue;
                 }
-
+    
                 // Open the subgroup for the surface data.
                 hid_t surface_group_id = H5Gopen2(group_id, surface_group_name.c_str(), H5P_DEFAULT);
                 if (surface_group_id < 0) {
@@ -269,7 +269,7 @@ public:
                     print_progress();
                     continue;
                 }
-
+    
                 // --- Read the "points" dataset ---
                 hid_t points_dset = H5Dopen2(surface_group_id, "points", H5P_DEFAULT);
                 if (points_dset < 0) {
@@ -302,28 +302,37 @@ public:
                 H5Dread(points_dset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, points_data.data());
                 H5Sclose(points_space);
                 H5Dclose(points_dset);
-
+    
                 // --- Read the "normals" dataset ---
+                std::vector<double> normals_data;
                 hid_t normals_dset = H5Dopen2(surface_group_id, "normals", H5P_DEFAULT);
                 if (normals_dset < 0) {
-                    std::cerr << "Dataset 'normals' not found in " << surface_group_name << std::endl;
-                    H5Gclose(surface_group_id);
-                    H5Gclose(group_id);
-                    H5Fclose(file_id);
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    print_progress();
-                    continue;
+                    // Normals dataset is missing: use dummy normals (1, 0, 0) for every point.
+                    normals_data.resize(num_points * 3);
+                    for (size_t i = 0; i < num_points; ++i) {
+                        normals_data[i * 3 + 0] = 1.0;
+                        normals_data[i * 3 + 1] = 0.0;
+                        normals_data[i * 3 + 2] = 0.0;
+                    }
+                } else {
+                    hid_t normals_space = H5Dget_space(normals_dset);
+                    int ndims_normals = H5Sget_simple_extent_ndims(normals_space);
+                    hsize_t dims_normals[2];
+                    H5Sget_simple_extent_dims(normals_space, dims_normals, nullptr);
+                    if (dims_normals[1] == 3) {
+                        normals_data.resize(num_points * 3);
+                        H5Dread(normals_dset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, normals_data.data());
+                    }
+                    else {
+                        // something is wrong here
+                        std::cerr << "Unexpected number of dimensions for normals dataset" << std::endl;
+                    }
+                    H5Sclose(normals_space);
+                    H5Dclose(normals_dset);
                 }
-                hid_t normals_space = H5Dget_space(normals_dset);
-                int ndims_normals = H5Sget_simple_extent_ndims(normals_space);
-                hsize_t dims_normals[2];
-                H5Sget_simple_extent_dims(normals_space, dims_normals, nullptr);
-                std::vector<double> normals_data(num_points * 3);
-                H5Dread(normals_dset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, normals_data.data());
-                H5Sclose(normals_space);
-                H5Dclose(normals_dset);
-
+    
                 // --- Read the "colors" dataset ---
+                std::vector<unsigned char> colors_data;
                 hid_t colors_dset = H5Dopen2(surface_group_id, "colors", H5P_DEFAULT);
                 if (colors_dset < 0) {
                     std::cerr << "Dataset 'colors' not found in " << surface_group_name << std::endl;
@@ -338,16 +347,30 @@ public:
                 int ndims_colors = H5Sget_simple_extent_ndims(colors_space);
                 hsize_t dims_colors[2];
                 H5Sget_simple_extent_dims(colors_space, dims_colors, nullptr);
-                std::vector<unsigned char> colors_data(num_points * 3);
-                H5Dread(colors_dset, H5T_NATIVE_UCHAR, H5S_ALL, H5S_ALL, H5P_DEFAULT, colors_data.data());
+                if (dims_colors[1] == 3) {
+                    colors_data.resize(num_points * 3);
+                    H5Dread(colors_dset, H5T_NATIVE_UCHAR, H5S_ALL, H5S_ALL, H5P_DEFAULT, colors_data.data());
+                }
+                else if (dims_colors[1] == 1) {
+                    // If only one color value per point, duplicate it to form an RGB triplet.
+                    std::vector<unsigned char> temp_colors(num_points);
+                    H5Dread(colors_dset, H5T_NATIVE_UCHAR, H5S_ALL, H5S_ALL, H5P_DEFAULT, temp_colors.data());
+                    colors_data.resize(num_points * 3);
+                    for (size_t i = 0; i < num_points; ++i) {
+                        unsigned char value = temp_colors[i];
+                        colors_data[i * 3 + 0] = value;
+                        colors_data[i * 3 + 1] = value;
+                        colors_data[i * 3 + 2] = value;
+                    }
+                }
                 H5Sclose(colors_space);
                 H5Dclose(colors_dset);
-
+    
                 // Close groups and file
                 H5Gclose(surface_group_id);
                 H5Gclose(group_id);
                 H5Fclose(file_id);
-
+    
                 // Convert the raw data into points
                 std::vector<Point> points;
                 points.reserve(num_points);
@@ -391,31 +414,31 @@ public:
                     print_progress();
                     continue;
                 }
-
+    
                 std::string ply_file_name = "surface_" + std::to_string(patch_nr) + ".ply";
                 std::string ply_content;
                 if (!extract_ply_from_archive(archive_path, ply_file_name, ply_content)) {
                     std::cerr << "Failed to extract PLY file from archive: " << archive_path << std::endl;
                     continue;
                 }
-
+    
                 try {
                     std::istringstream plyStream(ply_content);
                     happly::PLYData plyIn(plyStream);
                     auto vertices = plyIn.getVertexData();
-
+    
                     std::vector<double> x = std::get<0>(std::get<0>(vertices));
                     std::vector<double> y = std::get<1>(std::get<0>(vertices));
                     std::vector<double> z = std::get<2>(std::get<0>(vertices));
-
+    
                     std::vector<double> nx = std::get<0>(std::get<1>(vertices));
                     std::vector<double> ny = std::get<1>(std::get<1>(vertices));
                     std::vector<double> nz = std::get<2>(std::get<1>(vertices));
-
+    
                     std::vector<unsigned char> r = std::get<0>(std::get<2>(vertices));
                     std::vector<unsigned char> g = std::get<1>(std::get<2>(vertices));
                     std::vector<unsigned char> b = std::get<2>(std::get<2>(vertices));
-
+    
                     std::vector<Point> points;
                     points.reserve(x.size());
                     for (size_t i = 0; i < x.size(); ++i) {
@@ -443,7 +466,7 @@ public:
                 }
             }
         }
-    }
+    }    
 
     void find_vertex_counts(size_t start, size_t end) {
         std::string h5_path = base_path_ + ".h5";

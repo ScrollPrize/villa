@@ -68,11 +68,11 @@ def process_instance_archive(archive_path, h5_file, group_prefix="", compression
     Extracts an instance archive, reads its PLY and metadata files, and writes them into the HDF5 file.
     
     Each archive becomes an HDF5 group (named after the archive filename). Inside that group, each
-    surface is stored in a subgroup (named after the PLY file, without extension) with datasets:
+    surface is stored in a subgroup (named after the PLY file, without extension) with dataset:
       - "points"
-      - "normals"
-      - "colors"
-    and with any metadata stored as attributes.
+      - "colors" (only the second entry per point is stored)
+    
+    Any metadata is stored as attributes.
     
     Returns:
         extraction_duration (float): Time taken for archive extraction (seconds).
@@ -116,6 +116,13 @@ def process_instance_archive(archive_path, h5_file, group_prefix="", compression
                 print(f"[ERROR] Reading {ply_file}: {e}")
                 continue
 
+            # Use only the second entry of the colors data
+            if colors.ndim == 2 and colors.shape[1] >= 2:
+                colors = colors[:, 1]
+            else:
+                print(f"[WARNING] Colors data in {ply_file} does not have at least 2 columns.")
+                continue
+
             metadata = {}
             if os.path.exists(metadata_file):
                 try:
@@ -125,9 +132,11 @@ def process_instance_archive(archive_path, h5_file, group_prefix="", compression
                     print(f"[WARNING] Reading metadata file {metadata_file}: {e}")
 
             surface_grp = grp.create_group(base)
-            surface_grp.create_dataset("points", data=points, compression=compression, compression_opts=compression_level if compression == 'gzip' else None)
-            surface_grp.create_dataset("normals", data=normals, compression=compression, compression_opts=compression_level if compression == 'gzip' else None)
-            surface_grp.create_dataset("colors", data=colors, compression=compression, compression_opts=compression_level if compression == 'gzip' else None)
+            surface_grp.create_dataset("points", data=points, compression=compression,
+                                         compression_opts=compression_level if compression == 'gzip' else None)
+            # Normals are no longer saved.
+            surface_grp.create_dataset("colors", data=colors, compression=compression,
+                                         compression_opts=compression_level if compression == 'gzip' else None)
             
             for key, value in metadata.items():
                 try:
