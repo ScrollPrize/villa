@@ -177,18 +177,17 @@ class OmeZarrViewWindow(QMainWindow):
         self.loader_worker.start()
     
     def on_slice_loaded(self, image_slice):
+        self.xy_view.setImage(image_slice)
         print("OME-Zarr XY view updated with new slice.")
         # Draw the umbilicus dot on the XY view.
         try:
             umbilicus_data = load_xyz_from_file(self.umbilicus_path) - 500
             # Interpolate the umbilicus XY (from umbilicus data, which is (y, z, x)) for the current z_index.
             pos = umbilicus_xy_at_z(umbilicus_data, self.current_z_index)
-            # cv2 draw circle: center, radius, color, thickness
-            image_slice = cv2.circle(image_slice, (int(pos[0]), int(pos[1])), 15, (255, 0, 0), -1)
-            
+            # pos is in (x, y) order.
+            self.umbilicus_dot.setData([pos[1]], [pos[0]])
         except Exception as e:
             print("Error updating umbilicus dot:", e)
-        self.xy_view.setImage(image_slice)
     
     # --- XZ view update ---
     def update_finit_center(self, finit_center_value):

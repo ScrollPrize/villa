@@ -26,6 +26,17 @@ import open3d as o3d
 import py7zr
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+def setup_h5_partials_folder(h5_path):
+    """Creates a fresh h5_partials folder, deleting it first if it exists."""
+    partials_dir = os.path.join(os.path.dirname(h5_path), "h5_partials")
+    if os.path.exists(partials_dir):
+        response = input(f"The folder '{partials_dir}' already exists. Delete and recreate? (y/n): ")
+        if response.lower() != 'y':
+            print("Exiting without modifying h5_partials.")
+            exit(1)
+        shutil.rmtree(partials_dir)
+    os.makedirs(partials_dir)
+    return partials_dir
 
 def load_ply_file(filepath):
     """
@@ -215,13 +226,15 @@ def main():
         chunk_size = ceil(len(archives) / n_threads)
         archive_chunks = [archives[i:i+chunk_size] for i in range(0, len(archives), chunk_size)]
         partial_files = []
+        partials_dir = setup_h5_partials_folder()
         futures = []
         total_extraction_time = 0.0
         total_group_time = 0.0
 
         with ProcessPoolExecutor(max_workers=n_threads) as executor:
             for i, chunk in enumerate(archive_chunks):
-                partial_filename = f"{args.output_h5}.part{i}"
+                partial_filename = os.path.join(partials_dir, os.path.basename(f"{args.output_h5}.part{i}"))
+                print(f"Thread {i} will write to: {partial_filename}")
                 partial_files.append(partial_filename)
                 futures.append(executor.submit(process_archives_chunk, chunk, partial_filename,
                                                args.group_prefix, args.compression))
