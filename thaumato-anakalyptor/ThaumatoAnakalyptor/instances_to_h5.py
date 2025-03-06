@@ -162,10 +162,11 @@ def merge_h5_files(partial_files, final_filename):
     """
     Merges multiple partial HDF5 files into one final HDF5 file.
     """
+    print(f"Merging {len(partial_files)} partial HDF5 files into {final_filename}")
     with h5py.File(final_filename, "w") as h5_final:
-        for pf in partial_files:
+        for pf in tqdm(partial_files, desc="Merging partial HDF5 files"):
             with h5py.File(pf, "r") as h5_part:
-                for group in h5_part:
+                for group in tqdm(h5_part, desc=f"Merging {os.path.basename(pf)}"):
                     # Copy each group from the partial file into the final file.
                     h5_part.copy(group, h5_final, name=group)
 
