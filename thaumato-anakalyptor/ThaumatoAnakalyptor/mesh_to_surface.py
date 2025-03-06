@@ -48,10 +48,10 @@ class MyPredictionWriter(BasePredictionWriter):
     
     def write_on_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, prediction, batch_indices, batch, batch_idx: int, dataloader_idx: int) -> None:
         if self.trainer_rank is None: # Only set the rank once
-            self.trainer_rank = trainer.global_rank if trainer.world_size > 1 else 0
+            self.trainer_rank = trainer.local_rank if trainer.world_size > 1 else 0
 
         if self.surface_volume_np is None:
-            if trainer.global_rank == 0:
+            if trainer.local_rank == 0:
                 if self.r_steps is not None:
                     seg_layers = min(self.r_steps, (2*self.r+1 - self.current_step_offset))
                     self.surface_volume_np, self.shm = self.create_shared_array((seg_layers, self.image_size[0], self.image_size[1]), np.uint16, name=f"surface_volume_{self.current_step_offset}")
