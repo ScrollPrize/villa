@@ -34,6 +34,8 @@ class MyPredictionWriter(BasePredictionWriter):
         self.image_size = image_size
         self.display = display
         self.image = None
+        # This composite will be updated after each segment.
+        self.composite = np.zeros(self.image_size, dtype=np.uint16)
         self.r = r
         self.r_steps = r_steps  # new argument: number of layers to process at a time
         self.surface_volume_np = None
@@ -218,6 +220,12 @@ class MyPredictionWriter(BasePredictionWriter):
         # Reset surface_volume_np to allow reinitialization for the next segment
         self.surface_volume_np = None
 
+    def compute_composite(self):
+        # Compute composite (max) image from the current segment (surface_volume_np)
+        for i in range(self.surface_volume_np.shape[0]):
+            self.composite = np.maximum(self.composite, self.surface_volume_np[i])
+        return self.composite
+
     def write_tif(self):
         def save_tif(i, filename):
             image = self.surface_volume_np[i]
@@ -239,9 +247,7 @@ class MyPredictionWriter(BasePredictionWriter):
                 future.result()
 
         # Create Composite max image from all tifs in the current segment
-        composite_image = np.zeros((self.surface_volume_np.shape[1], self.surface_volume_np.shape[2]), dtype=np.float32)
-        for i in range(self.surface_volume_np.shape[0]):
-            composite_image = np.maximum(composite_image, self.surface_volume_np[i])
+        composite_image = self.compute_composite()
 
         composite_image = composite_image.astype(np.uint16)
         composite_image = composite_image.T
@@ -272,9 +278,7 @@ class MyPredictionWriter(BasePredictionWriter):
                 future.result()
 
         # Create Composite max image from all jpgs in the current segment
-        composite_image = np.zeros((self.surface_volume_np.shape[1], self.surface_volume_np.shape[2]), dtype=np.float32)
-        for i in range(self.surface_volume_np.shape[0]):
-            composite_image = np.maximum(composite_image, self.surface_volume_np[i])
+        composite_image = self.compute_composite()
 
         composite_image = composite_image.astype(np.uint16)
         composite_image = (composite_image / 256).astype(np.uint8)
@@ -746,7 +750,7 @@ class PPMAndTextureModel(pl.LightningModule):
         return grid_points
 
     def forward(self, x):
-        # grid_coords: T x 3, grid_cell: B x W x H x W, vertices: T x 3 x 3, normals: T x 3 x 3, uv_coords_triangles: T x 3 x 2, grid_index: T
+        # grid_coords: T x 3, grid_cell: B x W x W x W, vertices: T x 3 x 3, normals: T x 3 x 3, uv_coords_triangles: T x 3 x 2, grid_index: T
         grid_coords, grid_cells, vertices, normals, uv_coords_triangles, grid_index = x
         
         # Handle the case where the grid cells are empty
@@ -840,7 +844,7 @@ class PPMAndTextureModel(pl.LightningModule):
             # Step 6: Return the 3D Surface Volume coordinates and the values
             values = values.reshape(-1)
             grid_points = grid_points.reshape(-1, 3) # grid_points: S' x 3
-
+            
             # Empty the cache to free up memory
             torch.cuda.empty_cache()
 
