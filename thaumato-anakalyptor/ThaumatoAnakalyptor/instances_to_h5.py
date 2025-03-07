@@ -231,11 +231,22 @@ def main():
         return
 
     if os.path.exists(args.output_h5):
-        print(f"[WARNING] Output HDF5 file {args.output_h5} already exists.")
-        response = input("Do you want to overwrite it? (y/n): ")
-        if response.lower() != 'y':
-            print("Exiting without overwriting the existing file.")
-            return
+        while True:
+            print(f"[WARNING] Output HDF5 file {args.output_h5} already exists.")
+            response = input("Do you want to overwrite(y) or remove(r) it? (y/r/n): ")
+            if response.lower() == 'r':
+                print(f"Removing existing file {args.output_h5}.")
+                os.remove(args.output_h5)
+                break
+            elif response.lower() == 'y':
+                print(f"Overwriting existing file {args.output_h5}.")
+                break
+            elif response.lower() == 'n':
+                print("Exiting without overwriting the existing file.")
+                return
+            else:
+                print("Invalid response. Please enter 'y', 'r', or 'n'.")
+                
 
     if args.threads <= 1:
         # Process sequentially.
