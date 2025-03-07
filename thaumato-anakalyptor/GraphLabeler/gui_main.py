@@ -18,7 +18,6 @@ sys.path.append('../ThaumatoAnakalyptor/graph_problem/build')
 import graph_problem_gpu_py
 
 from config import load_config, save_config
-from solver_interface import SolverInterface
 from utils import vectorized_point_to_polyline_distance
 from widgets import create_sync_slider_spinbox
 from ome_zarr_view import OmeZarrViewWindow
@@ -36,12 +35,14 @@ class PointCloudLabeler(QMainWindow):
         self.graph_path = self.config.get("graph_path", "/media/julian/2/Scroll5/scroll5_complete_surface_points_zarrtest/1352_3600_5005/graph.bin")
         self.default_experiment = self.config.get("default_experiment", "denominator3-rotated")
         self.ome_zarr_path = self.config.get("ome_zarr_path", None)
+        self.graph_pkl_path = self.config.get("graph_pkl_path", None)
+        self.h5_path = self.config.get("h5_path", None)
         self.umbilicus_path = self.config.get("umbilicus_path", None)
 
 
         # Initialize solver using SolverInterface if no external point data is provided.
         if point_data is None:
-            self.solver = SolverInterface(self.graph_path)
+            self.solver = graph_problem_gpu_py.Solver(self.graph_path)
             gt_path = os.path.join("../experiments", self.default_experiment,
                                    "checkpoints", "checkpoint_graph_solver_connected_2.bin")
             if not os.path.exists(gt_path):
@@ -334,12 +335,12 @@ class PointCloudLabeler(QMainWindow):
         self.update_views()
 
     def z_slice_center_changed(self):
-        if hasattr(self, 'ome_zarr_window'):
+        if hasattr(self, 'ome_zarr_window') and self.ome_zarr_window is not None:
             self.ome_zarr_window.update_z_slice_center(self.z_center_spinbox.value())
         self.update_views()
 
     def f_init_center_changed(self):
-        if hasattr(self, 'ome_zarr_window'):
+        if hasattr(self, 'ome_zarr_window') and self.ome_zarr_window is not None:
             self.ome_zarr_window.update_finit_center(self.finit_center_spinbox.value())
         self.update_views()
 
@@ -349,6 +350,10 @@ class PointCloudLabeler(QMainWindow):
         self.config["default_experiment"] = self.default_experiment
         if self.ome_zarr_path:
             self.config["ome_zarr_path"] = self.ome_zarr_path  # Save the OME-Zarr path
+        if self.graph_pkl_path:
+            self.config["graph_pkl_path"] = self.graph_pkl_path
+        if self.h5_path:
+            self.config["h5_path"] = self.h5_path
         if self.umbilicus_path:
             self.config["umbilicus_path"] = self.umbilicus_path
         save_config(self.config, "config_labeling_gui.json")
@@ -386,10 +391,17 @@ class PointCloudLabeler(QMainWindow):
         load_labels_action.triggered.connect(self.load_labels_from_path)
         data_menu.addAction(load_labels_action)
         
-        # NEW: Action to set the OME-Zarr (scroll) path.
         set_ome_zarr_action = QAction("Set OME-Zarr Path", self)
         set_ome_zarr_action.triggered.connect(self.set_ome_zarr_path)
         data_menu.addAction(set_ome_zarr_action)
+
+        set_graph_pkl_action = QAction("Set Graph.pkl Path", self)
+        set_graph_pkl_action.triggered.connect(self.set_graph_pkl_path)
+        data_menu.addAction(set_graph_pkl_action)
+
+        set_h5_action = QAction("Set H5 Path", self)
+        set_h5_action.triggered.connect(self.set_h5_path)
+        data_menu.addAction(set_h5_action)
 
         set_umbilicus_action = QAction("Set Umbilicus Path", self)
         set_umbilicus_action.triggered.connect(self.set_umbilicus_path)
@@ -413,6 +425,20 @@ class PointCloudLabeler(QMainWindow):
             self.config["ome_zarr_path"] = directory
             save_config(self.config, "config_labeling_gui.json")
 
+    def set_graph_pkl_path(self):
+        fname, _ = QFileDialog.getOpenFileName(self, "Select Graph .pkl File", self.graph_pkl_path or os.getcwd(), "Pickle Files (*.pkl);;All Files (*)")
+        if fname:
+            self.graph_pkl_path = fname
+            self.config["graph_pkl_path"] = fname
+            save_config(self.config, "config_labeling_gui.json")
+
+    def set_h5_path(self):
+        fname, _ = QFileDialog.getOpenFileName(self, "Select H5 File", self.h5_path or os.getcwd(), "HDF5 Files (*.h5);;All Files (*)")
+        if fname:
+            self.h5_path = fname
+            self.config["h5_path"] = fname
+            save_config(self.config, "config_labeling_gui.json")
+
     def set_umbilicus_path(self):
         fname, _ = QFileDialog.getOpenFileName(self, "Select Umbilicus .txt File", self.umbilicus_path or os.getcwd(), "Text Files (*.txt);;All Files (*)")
         if fname:
@@ -423,12 +449,33 @@ class PointCloudLabeler(QMainWindow):
     def open_ome_zarr_view_window(self):
         self.ome_zarr_window = OmeZarrViewWindow(
             graph_labels=self.labels,
-            solver_interface=self.solver,
+            solver=self.solver,
             experiment_path=self.default_experiment,
             ome_zarr_path=self.ome_zarr_path,
+            graph_pkl_path=self.graph_pkl_path,
+            h5_path=self.h5_path,
             umbilicus_path=self.umbilicus_path
         )
         self.ome_zarr_window.show()
+
+    def open_ome_zarr_view_window(self):
+        self.ome_zarr_window = OmeZarrViewWindow(
+            graph_labels=self.labels,
+            solver=self.solver,
+            experiment_path=self.default_experiment,
+            ome_zarr_path=self.ome_zarr_path,
+            graph_pkl_path=self.graph_pkl_path,
+            h5_path=self.h5_path,
+            umbilicus_path=self.umbilicus_path
+        )
+        # Connect the destroyed signal so that when the window is closed,
+        # we automatically set our pointer to None.
+        self.ome_zarr_window.destroyed.connect(self.on_ome_zarr_view_destroyed)
+        self.ome_zarr_window.show()
+
+    def on_ome_zarr_view_destroyed(self):
+        print("OME-Zarr view window has been destroyed; setting pointer to None.")
+        self.ome_zarr_window = None
     
     def load_data(self):
         dialog = QDialog(self)
@@ -1479,6 +1526,14 @@ class PointCloudLabeler(QMainWindow):
             event.accept()
         elif event.key() == Qt.Key_P:
             self.activate_pipette()
+            event.accept()
+        # up arrow
+        elif event.key() == Qt.Key_Up:
+            self.label_spinbox.setValue(self.label_spinbox.value() + 1)
+            event.accept()
+        # down arrow
+        elif event.key() == Qt.Key_Down:
+            self.label_spinbox.setValue(self.label_spinbox.value() - 1)
             event.accept()
         else:
             super(PointCloudLabeler, self).keyPressEvent(event)

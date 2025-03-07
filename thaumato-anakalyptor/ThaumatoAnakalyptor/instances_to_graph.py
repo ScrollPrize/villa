@@ -489,8 +489,21 @@ def subvolume_surface_patches_folder(file, subvolume_size=50, sample_ratio=1.0):
                         # print(f"Loading patch {surface} from {h5_filename}")
                         # Extract the datasets saved in each group.
                         points = grp[surface]["points"][()]       # e.g. an (N,3) array.
-                        normals = grp[surface]["normals"][()]
+                        # check if normals are in the file
+                        if "normals" in grp[surface]:
+                            normals = grp[surface]["normals"][()]
+                        else:
+                            # dummy normals 1, 0, 0
+                            normals = np.zeros(points.shape, dtype=np.float32)
+                            normals[:, 0] = 1.0
                         colors = grp[surface]["colors"][()]
+                        # check shape of colors
+                        if colors.shape[1] == 4:
+                            colors = colors[:, :3]
+                        elif colors.shape[1] == 1:
+                            colors = np.repeat(colors, 3, axis=1)
+                        elif colors.shape[1] != 3:
+                            raise ValueError(f"Invalid colors shape: {colors.shape}")
                         coeffs = grp[surface]["coeffs"][()]
                         # Retrieve attributes; in particular we need 'n'.
                         attrs = dict(grp[surface].attrs)
