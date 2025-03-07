@@ -26,6 +26,9 @@ import open3d as o3d
 import py7zr
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+import threading
+import queue
+
 def setup_h5_partials_folder(h5_path):
     """Creates a fresh h5_partials folder, deleting it first if it exists."""
     partials_dir = os.path.join(os.path.dirname(h5_path), "h5_partials")
@@ -48,7 +51,6 @@ def load_ply_file(filepath):
     colors = np.asarray(pcd.colors)
     return points, normals, colors
 
-
 def extract_archive(archive_path, extract_dir):
     """
     Extracts a 7z or tar archive into the given directory.
@@ -57,18 +59,17 @@ def extract_archive(archive_path, extract_dir):
         with py7zr.SevenZipFile(archive_path, 'r') as archive:
             archive.extractall(path=extract_dir)
     elif archive_path.lower().endswith('.tar'):
-        with tarfile.open(archive_path, 'r') as tar:
+        with tarfile.open(archive_path, "r") as tar:
             tar.extractall(path=extract_dir)
     else:
         raise ValueError(f"Unsupported archive format for {archive_path}")
-
 
 def process_instance_archive(archive_path, h5_file, group_prefix="", compression="lzf", compression_level=4):
     """
     Extracts an instance archive, reads its PLY and metadata files, and writes them into the HDF5 file.
     
     Each archive becomes an HDF5 group (named after the archive filename). Inside that group, each
-    surface is stored in a subgroup (named after the PLY file, without extension) with dataset:
+    surface is stored in a subgroup (named after the PLY file, without extension) with datasets:
       - "points"
       - "colors" (only the second entry per point is stored)
     
@@ -150,35 +151,53 @@ def process_instance_archive(archive_path, h5_file, group_prefix="", compression
     finally:
         shutil.rmtree(temp_dir)
 
-
 def process_archives_chunk(archives, partial_h5_filename, group_prefix, compression, compression_level=4):
     """
     Processes a list of archives and writes the results into a partial HDF5 file.
     
-    Returns a tuple (total_extraction_time, total_group_time).
+    Returns a tuple (total_extraction_time, total_group_time, archives_processed).
     """
     total_extraction_time = 0.0
     total_group_time = 0.0
     with h5py.File(partial_h5_filename, "w") as h5_file:
-        for archive in tqdm(archives, desc=f"Thread processing {os.path.basename(partial_h5_filename)}", leave=False):
+        for archive in archives:
             extr_time, grp_time = process_instance_archive(archive, h5_file, group_prefix, compression, compression_level=compression_level)
             total_extraction_time += extr_time
             total_group_time += grp_time
-    return total_extraction_time, total_group_time
+    return total_extraction_time, total_group_time, len(archives)
 
-
-def merge_h5_files(partial_files, final_filename):
+def merge_worker(merge_queue, final_filename, merge_pbar):
     """
-    Merges multiple partial HDF5 files into one final HDF5 file.
+    Continuously monitors the merge_queue for completed partial files.
+    For each partial file, counts its groups, updates the merge progress bar total,
+    merges the groups into the final HDF5 file (opened in append mode), and deletes the partial file.
+    A None value in the queue signals that no more partial files are coming.
     """
-    print(f"Merging {len(partial_files)} partial HDF5 files into {final_filename}")
-    with h5py.File(final_filename, "w") as h5_final:
-        for pf in tqdm(partial_files, desc="Merging partial HDF5 files"):
+    while True:
+        pf = merge_queue.get()
+        if pf is None:
+            merge_queue.task_done()
+            break
+        try:
+            # Count the number of groups in the partial file.
             with h5py.File(pf, "r") as h5_part:
-                for group in tqdm(h5_part, desc=f"Merging {os.path.basename(pf)}"):
-                    # Copy each group from the partial file into the final file.
-                    h5_part.copy(group, h5_final, name=group)
-
+                groups = list(h5_part.keys())
+            num_groups = len(groups)
+            # Increase the total of the merge progress bar.
+            merge_pbar.total += num_groups
+            merge_pbar.refresh()
+            # Open the final file in append mode and copy groups.
+            with h5py.File(final_filename, "a") as h5_final:
+                with h5py.File(pf, "r") as h5_part:
+                    for group in groups:
+                        h5_part.copy(group, h5_final, name=group)
+                        merge_pbar.update(1)
+            # Delete the partial file after merging.
+            os.remove(pf)
+        except Exception as e:
+            print(f"[ERROR] Merging partial file {pf}: {e}")
+        finally:
+            merge_queue.task_done()
 
 def main():
     parser = argparse.ArgumentParser(
@@ -193,7 +212,7 @@ def main():
     parser.add_argument("--group_prefix", type=str, default="",
                         help="Optional prefix for group names in the HDF5 file.")
     parser.add_argument("--threads", type=int, default=1,
-                        help="Number of threads (processes) to use. If >1, partial HDF5 files are created and merged.")
+                        help="Number of threads (processes) to use. If >1, partial HDF5 files are created and merged on the fly.")
     parser.add_argument("--compression_level", type=int, default=4,
                         help="Compression level (0-9, only for gzip, where 0 is no compression and 9 is max compression).")
     parser.add_argument("--verbose", action="store_true",
@@ -203,15 +222,13 @@ def main():
     print(f"Converting instance archives in {args.input_dir} to HDF5 file: {args.output_h5}")
 
     # Find all archive files.
-    archives = [os.path.join(args.input_dir, f) for f in tqdm(os.listdir(args.input_dir))
+    archives = [os.path.join(args.input_dir, f) for f in os.listdir(args.input_dir)
                 if f.lower().endswith(('.7z', '.tar'))]
     print(f"Found {len(archives)} archives.")
     archives.sort()
     if not archives:
         print("[ERROR] No archives found in the specified input directory.")
         return
-
-    print(f"Found {len(archives)} archives. Converting to HDF5...")
 
     if os.path.exists(args.output_h5):
         print(f"[WARNING] Output HDF5 file {args.output_h5} already exists.")
@@ -235,47 +252,53 @@ def main():
         print(f"Total extraction time: {total_extraction_time:.2f} sec")
         print(f"Total group creation time: {total_group_time:.2f} sec")
     else:
-        # Process in parallel using partial HDF5 files.
+        # Process in parallel with many small chunks and on-the-fly merging.
         n_threads = args.threads
-        # Split archives evenly among threads.
-        chunk_size = ceil(len(archives) / n_threads)
+        chunk_size = ceil(len(archives) / (n_threads * 2))  # use more, smaller chunks
         archive_chunks = [archives[i:i+chunk_size] for i in range(0, len(archives), chunk_size)]
-        partial_files = []
         partials_dir = setup_h5_partials_folder(args.output_h5)
-        futures = []
+
+        # Prepare a queue and start the merge worker thread.
+        merge_queue = queue.Queue()
+        merge_pbar = tqdm(desc="Merging partial HDF5 files", total=0)
+        merge_thread = threading.Thread(target=merge_worker, args=(merge_queue, args.output_h5, merge_pbar))
+        merge_thread.start()
+
         total_extraction_time = 0.0
         total_group_time = 0.0
         start_time = time.perf_counter()
 
+        future_to_pf = {}
         with ProcessPoolExecutor(max_workers=n_threads) as executor:
             for i, chunk in enumerate(archive_chunks):
-                partial_filename = os.path.join(partials_dir, os.path.basename(f"{args.output_h5}.part{i}"))
-                print(f"Thread {i} will write to: {partial_filename}")
-                partial_files.append(partial_filename)
-                futures.append(executor.submit(process_archives_chunk, chunk, partial_filename,
-                                               args.group_prefix, args.compression, args.compression_level))
-            for future in as_completed(futures):
-                extr_time, grp_time = future.result()
+                partial_filename = os.path.join(partials_dir, f"{os.path.basename(args.output_h5)}.part{i}")
+                print(f"Chunk {i} will write to: {partial_filename}")
+                future = executor.submit(process_archives_chunk, chunk, partial_filename,
+                                           args.group_prefix, args.compression, args.compression_level)
+                future_to_pf[future] = partial_filename
+
+            pbar = tqdm(total=len(archives), desc="Processing archives")
+            for future in as_completed(future_to_pf):
+                extr_time, grp_time, count = future.result()
                 total_extraction_time += extr_time
                 total_group_time += grp_time
+                pbar.update(count)
+                # As soon as a chunk finishes, push its partial file for merging.
+                merge_queue.put(future_to_pf[future])
+            pbar.close()
 
-        partial_end_time = time.perf_counter()
+        # Wait until all partial files have been processed by the merge worker.
+        merge_queue.join()
+        # Signal the merge worker to exit.
+        merge_queue.put(None)
+        merge_thread.join()
+        merge_pbar.close()
 
-        # Merge partial HDF5 files.
-        merge_h5_files(partial_files, args.output_h5)
-        # Remove partial files.
-        for pf in partial_files:
-            os.remove(pf)
-
-        merge_end_time = time.perf_counter()
-
+        total_time = time.perf_counter() - start_time
         print(f"Conversion complete. Final HDF5 file saved as: {args.output_h5}")
         print(f"Total extraction time: {total_extraction_time:.2f} sec")
         print(f"Total group creation time: {total_group_time:.2f} sec")
-        print(f"Total processing time: {merge_end_time - start_time:.2f} sec")
-        print(f"Partial processing time: {partial_end_time - start_time:.2f} sec")
-        print(f"Merge time: {merge_end_time - partial_end_time:.2f} sec")
-
+        print(f"Total processing time: {total_time:.2f} sec")
 
 if __name__ == "__main__":
     main()

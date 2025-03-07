@@ -470,6 +470,14 @@ class Solver {
             }
             return labels;
         }
+        std::vector<bool> get_deleted_list() {
+            // get labels
+            std::vector<bool> deleted;
+            for (size_t i = 0; i < graph.size(); ++i) {
+                deleted.push_back(graph[i].deleted);
+            }
+            return deleted;
+        }
         void solve_winding_number(int num_iterations, int i_round = 1, int seed_node = 100, float other_block_factor = 1.0f, int side_fix_nr = 0, bool display = true) {
             // use the winding number solver for the final solution
             // store only the valid indices to speed up the loop
@@ -749,6 +757,8 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("gt"))
         .def("get_labels", &Solver::get_labels,
             "Method to get the labels of the graph")
+        .def("get_deleted_list", &Solver::get_deleted_list,
+            "Method to get the deleted list of the graph")
         .def("solve_winding_number", &Solver::solve_winding_number,
             "Method to final solve the graph with the winding number solver",
             py::arg("num_iterations") = 10000,
