@@ -266,7 +266,8 @@ def main():
         # Process in parallel with many small chunks and on-the-fly merging.
         n_threads = args.threads
         chunk_size = ceil(len(archives) / (n_threads * 2))  # use more, smaller chunks
-        chunk_size = min(chunk_size, 100)  # limit chunk size to avoid too many small files
+        chunk_size = min(chunk_size, 100)  # limit chunk size to avoid too large files
+        chunk_size = max(chunk_size, 5)  # ensure at least 5 archives per chunk
         archive_chunks = [archives[i:i+chunk_size] for i in range(0, len(archives), chunk_size)]
         print(f"Using {n_threads} threads to process {len(archives)} archives in {len(archive_chunks)} chunks.")
         partials_dir = setup_h5_partials_folder(args.output_h5)
