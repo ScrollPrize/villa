@@ -245,6 +245,7 @@ def main():
         futures = []
         total_extraction_time = 0.0
         total_group_time = 0.0
+        start_time = time.perf_counter()
 
         with ProcessPoolExecutor(max_workers=n_threads) as executor:
             for i, chunk in enumerate(archive_chunks):
@@ -258,14 +259,22 @@ def main():
                 total_extraction_time += extr_time
                 total_group_time += grp_time
 
+        partial_end_time = time.perf_counter()
+
         # Merge partial HDF5 files.
         merge_h5_files(partial_files, args.output_h5)
         # Remove partial files.
         for pf in partial_files:
             os.remove(pf)
+
+        merge_end_time = time.perf_counter()
+
         print(f"Conversion complete. Final HDF5 file saved as: {args.output_h5}")
         print(f"Total extraction time: {total_extraction_time:.2f} sec")
         print(f"Total group creation time: {total_group_time:.2f} sec")
+        print(f"Total processing time: {merge_end_time - start_time:.2f} sec")
+        print(f"Partial processing time: {partial_end_time - start_time:.2f} sec")
+        print(f"Merge time: {merge_end_time - partial_end_time:.2f} sec")
 
 
 if __name__ == "__main__":

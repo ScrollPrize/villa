@@ -6,6 +6,48 @@ from tqdm import tqdm
 from scipy.interpolate import interp1d
 import cv2
 
+class Graph:
+    def __init__(self):
+        self.edges = {}  # Stores edges with update matrices and certainty factors
+        self.nodes = {}  # Stores node beliefs and fixed status
+
+class ScrollGraph(Graph):
+    def __init__(self, overlapp_threshold, umbilicus_path):
+        super().__init__()
+
+    def extract_undeleted_nodes(self, deleted_nodes):
+        """
+        Extract undeleted nodes from the graph.
+        """
+        return [key for i, key in enumerate(list(self.nodes.keys())) if not deleted_nodes[i]]
+
+    def get_points_XY(self, z_index, undeleted_nodes_indices, block_size=200):
+        """
+        Get the points for the XY view at the given z_index.
+        """
+        
+        all_node_keys = list(self.nodes.keys())
+        node_keys = [all_node_keys[i] for i in undeleted_nodes_indices]
+
+        # check if the node is touching the z_index
+        close_nodes = []
+        for node_key in node_keys:
+            if abs(self.nodes[node_key]['centroid'][1] * 4.0 - 500 - z_index) < block_size:
+                close_nodes.append(node_key)
+
+        # load all point of close blocks
+        points = None
+
+        # filter points in z slice
+
+        # assign winding angles
+
+        # unique points + their consolidated winding angles
+
+        return points
+
+        
+
 # --- Helper Functions ---
 
 def load_xyz_from_file(filename='umbilicus.txt'):
@@ -99,7 +141,8 @@ class OmeZarrXZLoaderWorker(QThread):
             z_idx = np.arange(z_dim)[:, None]
             xz_image = dset[z_idx, ys_int, xs_int]  # shape: (z_dim, num_samples)
             # Flip vertically so that z layer 0 appears at the bottom.
-            xz_image = np.flipud(xz_image)
+            # xz_image = np.flipud(xz_image)
+            xz_image = xz_image.T  # shape: (num_samples, z_dim)
         except Exception as e:
             print(f"Error loading XZ slice with finit center {self.finit_center_value}: {e}")
             xz_image = np.zeros((512,512), dtype=np.uint8)
