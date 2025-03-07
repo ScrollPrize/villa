@@ -257,6 +257,7 @@ def main():
         chunk_size = ceil(len(archives) / (n_threads * 2))  # use more, smaller chunks
         chunk_size = min(chunk_size, 100)  # limit chunk size to avoid too many small files
         archive_chunks = [archives[i:i+chunk_size] for i in range(0, len(archives), chunk_size)]
+        print(f"Using {n_threads} threads to process {len(archives)} archives in {len(archive_chunks)} chunks.")
         partials_dir = setup_h5_partials_folder(args.output_h5)
 
         # Prepare a queue and start the merge worker thread.
@@ -273,7 +274,6 @@ def main():
         with ProcessPoolExecutor(max_workers=n_threads) as executor:
             for i, chunk in enumerate(archive_chunks):
                 partial_filename = os.path.join(partials_dir, f"{os.path.basename(args.output_h5)}.part{i}")
-                print(f"Chunk {i} will write to: {partial_filename}")
                 future = executor.submit(process_archives_chunk, chunk, partial_filename,
                                            args.group_prefix, args.compression, args.compression_level)
                 future_to_pf[future] = partial_filename
