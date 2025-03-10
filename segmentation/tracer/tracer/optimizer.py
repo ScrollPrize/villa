@@ -63,6 +63,9 @@ class SurfaceOptimizer:
         self.volume = volume
         self.step_size = step_size
         
+        # Add debug attribute to the optimizer to fix 'no attribute debug' errors
+        self.debug = OPTIMIZER_DEBUG_ENABLED or GENERAL_DEBUG_ENABLED
+        
         # Initialize interpolator - ensure we use autodiff-compatible version
         from tracer.core.interpolation import TrilinearInterpolator
         debug_print("OPTIMIZER_DEBUG: Using autodiff-compatible interpolator for gradient tracking")
