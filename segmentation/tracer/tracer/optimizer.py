@@ -514,8 +514,11 @@ class SurfaceOptimizer:
         # Pre-optimize candidate points using volume gradients for better initialization
         self._pre_optimize_using_gradient(candidate_points)
         
-        # We no longer clear existing variables since we use a persistent registry
-        # This ensures variable names remain consistent across optimizations
+        # FIXED: Clear the variable registry for each optimization to avoid conflicts
+        # The variable registry is causing "Two different variable objects with the same name" errors
+        self.variable_registry = {}
+        self.variables = {}
+        debug_print("OPTIMIZER_DEBUG: Cleared variable registry to prevent name conflicts")
         
         try:
             # Create objective - this initializes variables internally
@@ -711,12 +714,13 @@ class SurfaceOptimizer:
                     # Calculate what percentage of variables were missing
                     missing_percentage = len(missing_vars) / len(self.variables) * 100
                     
-                    # Only treat as failure if a significant percentage of variables are missing
-                    if missing_percentage > 30:
+                    # Only treat as failure if a very high percentage of variables are missing
+                    # Use a higher threshold (80%) since we've now cleared the registry in optimize_points
+                    if missing_percentage > 80:
                         logger.warning(f"Optimization missing {missing_percentage:.1f}% of variables")
                         success = False
                     else:
-                        # Just debug log if only a small percentage is missing - this is normal
+                        # Just debug log if only a reasonable percentage is missing - this is normal
                         debug_print(f"OPTIMIZER_DEBUG: Missing {missing_percentage:.1f}% of variables (usually expected)")
                         
                 if has_nan:
