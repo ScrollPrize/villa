@@ -331,7 +331,7 @@ class InstanceSegmentation(pl.LightningModule):
             [item for item in [v for k, v in logs.items() if "loss_dice" in k]]
         )
 
-        self.log_dict(logs, sync_dist=True)
+        self.log_dict(logs)
         return sum(losses.values())
 
     def validation_step(self, batch, batch_idx):
