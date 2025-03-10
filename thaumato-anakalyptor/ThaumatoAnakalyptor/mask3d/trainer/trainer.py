@@ -369,7 +369,7 @@ class InstanceSegmentation(pl.LightningModule):
             outputs
         )
         results = {"train_loss_mean": train_loss}
-        self.log_dict(results, sync_dist=True)
+        self.log_dict(results)
 
     def validation_epoch_end(self, outputs):
         self.test_epoch_end(outputs)
@@ -1579,7 +1579,7 @@ class InstanceSegmentation(pl.LightningModule):
             ap_results[f"{log_prefix}_mean_ap_50"] = 0.0
             ap_results[f"{log_prefix}_mean_ap_25"] = 0.0
 
-        self.log_dict(ap_results, sync_dist=True)
+        self.log_dict(ap_results)
 
         if not self.config.general.export:
             try:
@@ -1620,7 +1620,11 @@ class InstanceSegmentation(pl.LightningModule):
             [item for item in [v for k, v in dd.items() if "loss_dice" in k]]
         )
 
-        self.log_dict(dd, sync_dist=True)
+        # check if val loss is in the dictionary
+        if "val_loss" not in dd:
+            dd["val_loss"] = dd["val_mean_loss_ce"] + dd["val_mean_loss_mask"] + dd["val_mean_loss_dice"]
+
+        self.log_dict(dd)
 
     def configure_optimizers(self):
         optimizer = hydra.utils.instantiate(
