@@ -162,7 +162,11 @@ class FringeExpander:
         # Step 1: Collect candidates from current fringe
         candidates = self._collect_candidates_from_fringe()
         if not candidates:
-            logger.info(f"No candidates found from fringe in generation {self.generation}")
+            if self.debug:
+                fringe_debug(f"No candidates found from fringe in generation {self.generation}")
+            else:
+                logger.info(f"Generation {self.generation}: No candidates found, attempting recovery")
+                
             # Try fringe recovery if no candidates were found
             if self._attempt_fringe_recovery():
                 logger.info(f"Fringe recovery successful, found {len(self.grid.fringe)} new fringe points")
@@ -193,7 +197,13 @@ class FringeExpander:
             # Increment gradually instead of resetting to max
             old_min = self.current_reference_min
             self.current_reference_min = min(self.current_reference_min + 1, self.max_reference_count)
-            logger.info(f"Reference threshold increased from {old_min} to {self.current_reference_min}")
+            # This is important for debugging but not necessary as info for every reference update
+            if self.debug:
+                fringe_debug(f"Reference threshold increased from {old_min} to {self.current_reference_min}")
+            else:
+                # Log less frequently at info level - only when we reach significant thresholds
+                if self.current_reference_min in [4, 6, 8] or self.current_reference_min == self.max_reference_count:
+                    logger.info(f"Reference threshold increased to {self.current_reference_min}")
         
         return generation_valid_points
     
@@ -558,12 +568,11 @@ class FringeExpander:
             if loss < self.physical_fail_threshold:
                 if self.debug:
                     fringe_debug(f"Point ({y},{x}) optimized successfully with loss: {loss} (below threshold {self.physical_fail_threshold})")
-                else:
-                    logger.info(f"Point ({y},{x}) optimized successfully with loss: {loss} (below threshold {self.physical_fail_threshold})")
             else:
                 if self.debug:
                     fringe_debug(f"Point ({y},{x}) optimization resulted in high loss: {loss} (above threshold {self.physical_fail_threshold})")
                 else:
+                    # Only log high losses at info level, as they're more important to track even without full debugging
                     logger.info(f"Point ({y},{x}) optimization resulted in high loss: {loss} (above threshold {self.physical_fail_threshold})")
             
             return loss
@@ -702,7 +711,10 @@ class FringeExpander:
             self.current_reference_min = max(self.absolute_min_references, self.current_reference_min - 2)
             self.recoveries += 1
             
-            logger.info(f"Attempting fringe recovery with reference threshold reduced from {old_min} to {self.current_reference_min}")
+            if self.debug:
+                fringe_debug(f"Attempting fringe recovery with reference threshold reduced from {old_min} to {self.current_reference_min}")
+            else:
+                logger.info(f"Recovery: Reducing reference threshold to {self.current_reference_min}")
             
             # Try to recover from rest points first using the new threshold
             recovered_from_rest = False
@@ -731,12 +743,18 @@ class FringeExpander:
                 recovery_count = max(5, min(20, len(sorted_fringe)))
                 new_fringe = [point for _, point in sorted_fringe[:recovery_count]]
                 
-                logger.info(f"Recovery Strategy 1: Recovered {len(new_fringe)} points from rest_points using reduced threshold {self.current_reference_min}")
+                if self.debug:
+                    fringe_debug(f"Recovery Strategy 1: Recovered {len(new_fringe)} points from rest_points using reduced threshold {self.current_reference_min}")
+                else:
+                    logger.info(f"Recovery: Found {len(new_fringe)} points with threshold {self.current_reference_min}")
                 self.grid.fringe = new_fringe
                 return True
         
         # 2. If reducing threshold didn't work or we're already at minimum, try using absolute minimum
-        logger.info(f"Moving to recovery strategy 2: Using absolute minimum reference count {self.absolute_min_references}")
+        if self.debug:
+            fringe_debug(f"Moving to recovery strategy 2: Using absolute minimum reference count {self.absolute_min_references}")
+        else:
+            logger.info(f"Recovery: Trying with absolute minimum of {self.absolute_min_references} references")
         
         # Even if we already tried with current_reference_min = 2, we'll try again with absolute_min_references
         # This time searching all rest points again
@@ -760,16 +778,25 @@ class FringeExpander:
             recovery_count = max(5, min(20, len(sorted_fringe)))
             new_fringe = [point for _, point in sorted_fringe[:recovery_count]]
             
-            logger.info(f"Recovery Strategy 2: Recovered {len(new_fringe)} points from rest_points using absolute minimum {self.absolute_min_references}")
+            if self.debug:
+                fringe_debug(f"Recovery Strategy 2: Recovered {len(new_fringe)} points from rest_points using absolute minimum {self.absolute_min_references}")
+            else:
+                logger.info(f"Recovery: Found {len(new_fringe)} points with absolute minimum {self.absolute_min_references}")
+            
             self.grid.fringe = new_fringe
             # Also lower the preference threshold to match what we found
             min_ref_count_found = sorted_fringe[-1][0] if sorted_fringe else self.absolute_min_references
             self.current_reference_min = max(self.absolute_min_references, min_ref_count_found)
-            logger.info(f"Reset preference threshold to {self.current_reference_min} based on recovered points")
+            
+            if self.debug:
+                fringe_debug(f"Reset preference threshold to {self.current_reference_min} based on recovered points")
             return True
             
         # 3. If no rest points pass even the absolute minimum, try all valid points
-        logger.info(f"Moving to recovery strategy 3: Collecting from all valid points")
+        if self.debug:
+            fringe_debug(f"Moving to recovery strategy 3: Collecting from all valid points")
+        else:
+            logger.info(f"Recovery: Trying to gather points from all valid surface points")
         
         # Collect all valid points in the used area
         bounds = self.grid.get_used_rect()
@@ -794,11 +821,15 @@ class FringeExpander:
         recovery_count = max(10, min(30, len(sorted_valid_points)))
         self.grid.fringe = [point for _, point in sorted_valid_points[:recovery_count]]
         
-        logger.info(f"Recovery Strategy 3: Recovered {len(self.grid.fringe)} points from all valid points")
+        if self.debug:
+            fringe_debug(f"Recovery Strategy 3: Recovered {len(self.grid.fringe)} points from all valid points")
+        else:
+            logger.info(f"Recovery: Found {len(self.grid.fringe)} points from all valid surface points")
         
         # Also reset the preference threshold to match the current situation
         self.current_reference_min = self.absolute_min_references
-        logger.info(f"Reset preference threshold to absolute minimum {self.absolute_min_references}")
+        if self.debug:
+            fringe_debug(f"Reset preference threshold to absolute minimum {self.absolute_min_references}")
         
         # If we found any points, recovery was successful
         return len(self.grid.fringe) > 0
@@ -834,9 +865,13 @@ class FringeExpander:
                 
             # Log progress periodically
             if gen % 5 == 0 or gen == num_generations - 1:
-                logger.info(f"Generation {gen}: {self.total_valid_points} valid points, "
-                           f"fringe size {len(self.grid.fringe)}, "
-                           f"recoveries: {self.recoveries}")
+                if self.debug:
+                    fringe_debug(f"Generation {gen}: {self.total_valid_points} valid points, "
+                               f"fringe size {len(self.grid.fringe)}, "
+                               f"recoveries: {self.recoveries}")
+                else:
+                    # More concise version for info level
+                    logger.info(f"Generation {gen}: {self.total_valid_points} valid points, {len(self.grid.fringe)} in fringe")
             
             # Check if we've reached the minimum point count
             if min_points > 0 and self.total_valid_points >= min_points:
