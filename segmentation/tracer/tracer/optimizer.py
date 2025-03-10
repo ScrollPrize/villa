@@ -717,11 +717,14 @@ class SurfaceOptimizer:
                     # Only treat as failure if a very high percentage of variables are missing
                     # Use a higher threshold (80%) since we've now cleared the registry in optimize_points
                     if missing_percentage > 80:
-                        logger.warning(f"Optimization missing {missing_percentage:.1f}% of variables")
+                        # Important: Don't use warning level for this anymore, as it's a common situation
+                        # with the Theseus optimizer where variables aren't returned
+                        if self.debug:
+                            logger.debug(f"Theseus optimizer didn't return {missing_percentage:.1f}% of variables")
                         success = False
                     else:
                         # Just debug log if only a reasonable percentage is missing - this is normal
-                        debug_print(f"OPTIMIZER_DEBUG: Missing {missing_percentage:.1f}% of variables (usually expected)")
+                        debug_print(f"OPTIMIZER_DEBUG: Theseus optimizer didn't return {missing_percentage:.1f}% of variables (usually expected)")
                         
                 if has_nan:
                     logger.warning("Optimization produced NaN values, falling back to gradient initialization")
