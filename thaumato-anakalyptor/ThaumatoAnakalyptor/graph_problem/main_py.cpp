@@ -470,6 +470,34 @@ class Solver {
             }
             return labels;
         }
+        void set_f_star(size_t seed_node) {
+            // set f star
+            std::vector<size_t> valid_indices = get_valid_indices(graph);
+            size_t seed_node_index = valid_indices[seed_node];
+            std::cout << "Setting f star for seed node: " << seed_node_index << std::endl;
+            float f_star_seed_winding = graph[seed_node_index].f_star - graph[seed_node_index].f_init;
+            int winding_nr_seed = graph[seed_node_index].winding_nr;
+            for (size_t i = 0; i < valid_indices.size(); ++i) {
+                size_t index = valid_indices[i];
+                if (graph[index].fixed) {
+                    // get updated f star value
+                    int wnr_offset = graph[index].winding_nr - winding_nr_seed;
+                    float f_star_index = f_star_seed_winding + graph[index].f_init + wnr_offset * 360.0f;
+                    graph[index].f_star = f_star_index;
+                    graph[index].f_tilde = f_star_index;
+                }
+            }
+        }
+        std::vector<bool> get_gt() {
+            // get labels
+            std::vector<bool> gt;
+            std::vector<size_t> valid_indices = get_valid_indices(graph);
+            for (size_t i = 0; i < valid_indices.size(); ++i) {
+                size_t index = valid_indices[i];
+                gt.push_back(graph[index].fixed);
+            }
+            return gt;
+        }
         std::vector<size_t> get_undeleted_indices() {
             // get labels
             std::vector<size_t> undeleted;
@@ -761,6 +789,11 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("gt"))
         .def("get_labels", &Solver::get_labels,
             "Method to get the labels of the graph")
+        .def("set_f_star", &Solver::set_f_star,
+            "Method to set the f star values of the graph",
+            py::arg("seed_node"))
+        .def("get_gt", &Solver::get_gt,
+            "Method to get the ground truth of the graph")
         .def("get_undeleted_indices", &Solver::get_undeleted_indices,
             "Method to get the undeleted node indices of the graph")
         .def("solve_winding_number", &Solver::solve_winding_number,

@@ -113,7 +113,7 @@ def centroid_method_geometric_mean(X):
     """
     Compute the centroid of a set of points using the geometric mean.
     """
-    return np.exp(np.mean(np.log(C), axis=0))
+    return np.exp(np.mean(np.log(X), axis=0))
 
 def unit_vector(vector):
     """ Returns the unit vector of the vector.  """

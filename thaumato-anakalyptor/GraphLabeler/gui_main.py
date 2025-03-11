@@ -10,6 +10,7 @@ from PyQt5.QtCore import Qt, QEvent, QPointF
 import pyqtgraph as pg
 from scipy.spatial import cKDTree
 import time
+from tqdm import tqdm
 
 # --------------------------------------------------
 # Importing the custom graph problem library.
@@ -20,7 +21,6 @@ import graph_problem_gpu_py
 from config import load_config, save_config
 from utils import vectorized_point_to_polyline_distance
 from widgets import create_sync_slider_spinbox
-from ome_zarr_view import OmeZarrViewWindow
 
 # --------------------------------------------------
 # Main: Create GUI.
@@ -55,7 +55,9 @@ class PointCloudLabeler(QMainWindow):
             point_data = self.solver.get_positions()
         else:
             self.solver = None
-        
+        self.seed_node = None # master node, this is the fixed node, to which all other nodes are fixed in f_star to
+        self.recompute = True
+
         # Global variables and state.
         self.scaleFactor = 100
         self.s_pressed = False
@@ -203,7 +205,7 @@ class PointCloudLabeler(QMainWindow):
 
         # --- Solver selection dropdown ---
         self.solver_combo = QComboBox()
-        self.solver_combo.addItems(["Winding Number", "Union", "Random"])
+        self.solver_combo.addItems(["Winding Number", "F*", "Union", "Random"])
         top_controls_layout.addWidget(QLabel("Select Solver:"))
         top_controls_layout.addWidget(self.solver_combo)
         
@@ -259,7 +261,7 @@ class PointCloudLabeler(QMainWindow):
         # --------------------------------------------------------------------
         common_controls_layout = QHBoxLayout()
         self.radius_widget, self.radius_slider, self.radius_spinbox = create_sync_slider_spinbox(
-            "Drawing radius:", 0.1, 20.0, 2.5, self.scaleFactor, self.update_views, decimals=1)
+            "Drawing radius:", 0.1, 20.0, 3.5, self.scaleFactor, self.update_views, decimals=1)
         common_controls_layout.addWidget(self.radius_widget)
         
         max_disp_layout = QHBoxLayout()
@@ -447,18 +449,15 @@ class PointCloudLabeler(QMainWindow):
             save_config(self.config, "config_labeling_gui.json")
 
     def open_ome_zarr_view_window(self):
-        self.ome_zarr_window = OmeZarrViewWindow(
-            graph_labels=self.labels,
-            solver=self.solver,
-            experiment_path=self.default_experiment,
-            ome_zarr_path=self.ome_zarr_path,
-            graph_pkl_path=self.graph_pkl_path,
-            h5_path=self.h5_path,
-            umbilicus_path=self.umbilicus_path
-        )
-        self.ome_zarr_window.show()
-
-    def open_ome_zarr_view_window(self):
+        try:
+            del sys.modules['ome_zarr_view']
+        except KeyError:
+            print("Module 'ome_zarr_view' not found in sys.modules; continuing.")
+        try:
+            del OmeZarrViewWindow
+        except NameError:
+            print("Name 'OmeZarrViewWindow' not found; continuing")
+        from ome_zarr_view import OmeZarrViewWindow
         self.ome_zarr_window = OmeZarrViewWindow(
             graph_labels=self.labels,
             solver=self.solver,
@@ -518,14 +517,21 @@ class PointCloudLabeler(QMainWindow):
                 self.solver.load_graph(gt_path)
             else:
                 QMessageBox.warning(self, "Load Data", f"Graph file not found at {gt_path}")
-            new_points = self.solver.get_positions()
-            self.points = np.array(new_points)
+
+            self.update_positions(update_labels=True)
+
+    def update_positions(self, update_labels=False):
+        self.recompute = True
+        new_points = np.array(self.solver.get_positions())
+        print(f"Points shape previous vs new: {self.points.shape} vs {new_points.shape}")
+        self.points = np.array(new_points)
+        if update_labels:
             self.labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
             self.calculated_labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
-            self.kdtree_xy = cKDTree(self.points[:, [0, 1]])
-            self.kdtree_xz = cKDTree(self.points[:, [0, 2]])
-            self.update_slider_ranges()
-            self.update_views()
+        self.kdtree_xy = cKDTree(self.points[:, [0, 1]])
+        self.kdtree_xz = cKDTree(self.points[:, [0, 2]])
+        self.update_slider_ranges()
+        self.update_views()
     
     def browse_for_directory(self, lineedit):
         directory = QFileDialog.getExistingDirectory(self, "Select Bin Folder", lineedit.text() or os.getcwd())
@@ -634,7 +640,7 @@ class PointCloudLabeler(QMainWindow):
             effective_y = y + 360
         else:
             effective_y = y
-        return np.asarray(self.kdtree_xy.query_ball_point([x, effective_y], r=r))
+        return np.asarray(self.kdtree_xy.query_ball_point([x, effective_y], r=r), dtype=np.int32)
     
     def update_guides(self):
         # For the XY view:
@@ -969,7 +975,7 @@ class PointCloudLabeler(QMainWindow):
                 self.xy_vertical_shear_spinbox.value(),
                 self.xy_horizontal_shear_spinbox.value(),
                 pts_combined.shape[0])
-        if not hasattr(self, "_cached_xy_key") or self._cached_xy_key != xy_key:
+        if self.recompute or not hasattr(self, "_cached_xy_key") or self._cached_xy_key != xy_key:
             # Geometry changed; perform full update.
             self.xy_scatter.setData(x=new_xy_geometry['x'], y=new_xy_geometry['y'],
                                     size=self.point_size, pen=None, brush=new_brushes_xy)
@@ -1009,7 +1015,7 @@ class PointCloudLabeler(QMainWindow):
             elif mod == 2:
                 new_brushes_calc_xy[i] = self.calc_brush_blue
         calc_xy_key = (z_center, self.z_thickness_slider.value(), pts_combined_calc.shape[0])
-        if not hasattr(self, "_cached_calc_xy_key") or self._cached_calc_xy_key != calc_xy_key:
+        if self.recompute or not hasattr(self, "_cached_calc_xy_key") or self._cached_calc_xy_key != calc_xy_key:
             self.xy_calc_scatter.setData(x=pts_combined_calc[:, 0] if pts_combined_calc.size else [],
                                         y=pts_combined_calc[:, 1] if pts_combined_calc.size else [],
                                         size=self.point_size, pen=None, brush=new_brushes_calc_xy)
@@ -1056,7 +1062,7 @@ class PointCloudLabeler(QMainWindow):
                 self.finit_thickness_slider.value(),
                 self.xz_shear_spinbox.value(),
                 pts_xz_display.shape[0])
-        if not hasattr(self, "_cached_xz_key") or self._cached_xz_key != xz_key:
+        if self.recompute or not hasattr(self, "_cached_xz_key") or self._cached_xz_key != xz_key:
             self.xz_scatter.setData(x=new_xz_geometry['x'], y=new_xz_geometry['y'],
                                     size=self.point_size, pen=None, brush=new_brushes_xz)
             self._cached_xz_geometry = new_xz_geometry
@@ -1100,7 +1106,7 @@ class PointCloudLabeler(QMainWindow):
             elif mod == 2:
                 new_brushes_calc_xz[i] = self.calc_brush_blue
         calc_xz_key = (finit_center, self.finit_thickness_slider.value(), pts_calc_xz_display.shape[0])
-        if not hasattr(self, "_cached_calc_xz_key") or self._cached_calc_xz_key != calc_xz_key:
+        if self.recompute or not hasattr(self, "_cached_calc_xz_key") or self._cached_calc_xz_key != calc_xz_key:
             self.xz_calc_scatter.setData(x=pts_calc_xz_display[:, 0] if pts_calc_xz_display.size else [],
                                         y=pts_calc_xz_display[:, 2] if pts_calc_xz_display.size else [],
                                         size=self.point_size, pen=None, brush=new_brushes_calc_xz)
@@ -1123,9 +1129,13 @@ class PointCloudLabeler(QMainWindow):
         # ----- Update guides -----
         self.update_guides()
         t11 = time.time()
+
+        if hasattr(self, 'ome_zarr_window') and self.ome_zarr_window is not None:
+            self.ome_zarr_window.update_overlay_labels(self.labels, self.calculated_labels)
         # print("Step 16 (update_guides):", t11 - t10, "s")
         
         # print(f"Total update_views time: {t11 - t0:.4f} s")
+        self.recompute = False
     
     def update_winding_splines(self):
         for item in self.spline_items:
@@ -1424,6 +1434,19 @@ class PointCloudLabeler(QMainWindow):
             if selected_solver == "Winding Number":
                 self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1,
                                                  other_block_factor=15.0, side_fix_nr=-1, display=False)
+            elif selected_solver == "F*":
+                if self.seed_node is None:
+                    # try to set a seed node. first labeled point found.
+                    for i, label in tqdm(enumerate(self.labels), desc="Finding seed node"):
+                        if abs(label - self.UNLABELED) > 2:
+                            self.seed_node = i
+                            break
+                if self.seed_node is not None:
+                    self.solver.set_f_star(self.seed_node)
+                self.solver.solve_f_star(50000, 1.0, visualize=True)
+                # Update positions
+                self.update_positions()
+                return
             elif selected_solver == "Union":
                 self.solver.solve_union()
             elif selected_solver == "Random":
