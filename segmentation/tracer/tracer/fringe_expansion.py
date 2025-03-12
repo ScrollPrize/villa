@@ -71,10 +71,9 @@ class FringeExpander:
         reference_radius: int = 1,
         max_reference_count: int = 8,
         initial_reference_min: int = 3,
-        distance_threshold: float = 1.5,
-        intensity_threshold: float = 0.5,
+        distance_threshold: float = 1.5,  # Match C++ dist_th = 1.5
         max_optimization_tries: int = 5,
-        physical_fail_threshold: float = 5.0,  # FIXED: More realistic threshold based on tests
+        physical_fail_threshold: float = 0.1,  # Match C++ phys_fail_th = 0.1
         num_workers: int = 4
     ):
         """
@@ -97,21 +96,20 @@ class FringeExpander:
         
         # Reference counting parameters
         self.reference_radius = reference_radius
-        self.max_reference_count = max_reference_count
+        self.max_reference_count = 6  # Match C++ default (ref_max = 6)
         
-        # FIXED: Current reference minimum is a preference metric, not a hard cutoff
-        # We always allow points with at least 2 references, but prefer points with higher counts
-        # as the surface grows and more candidates are available
-        self.absolute_min_references = 2  # Hard minimum for any point to be considered
-        self.current_reference_min = self.absolute_min_references  # Start with minimum as preference
+        # C++ implementation starts with high reference requirement that gradually decreases
+        # This is different from our previous approach where we started low
+        self.absolute_min_references = 2   # Hard minimum for any point to be considered
+        self.current_reference_min = 6     # Start high like C++ implementation
         
         logger.info(f"Using absolute minimum reference count of {self.absolute_min_references} and " +
-                  f"initial preferred reference count of {self.current_reference_min}")
+                  f"initial preferred reference count of {self.current_reference_min} (matching C++ behavior)")
         
         # Quality thresholds
-        self.distance_threshold = distance_threshold
-        self.intensity_threshold = intensity_threshold
-        self.physical_fail_threshold = physical_fail_threshold
+        self.distance_threshold = distance_threshold  # Max allowed distance from object (C++ dist_th)
+        self.physical_fail_threshold = physical_fail_threshold  # Max loss value (C++ phys_fail_th)
+        self.intensity_threshold = getattr(optimizer, 'intensity_threshold', 170.0)  # Default intensity threshold
         
         # Optimization parameters
         self.max_optimization_tries = max_optimization_tries
@@ -124,6 +122,9 @@ class FringeExpander:
         self.total_rejected_points = 0
         self.recoveries = 0
         self.generation = 0
+        
+        # Get step_size from optimizer or grid (needed for exact C++ random range calculation)
+        self.step_size = getattr(optimizer, 'step_size', 10.0)
         
         # For fringe management
         self.rest_points = []  # Points that didn't meet reference count but might be used later
@@ -192,18 +193,20 @@ class FringeExpander:
             fringe_debug(f"Generation {self.generation}: Added {generation_valid_points} valid points to fringe")
             fringe_debug(f"Current fringe size: {len(self.grid.fringe)}")
         
-        # FIXED: Increment reference minimum gradually instead of jumping to max
+        # Implement C++ reference count behavior - start high and decrease over time
         if generation_valid_points > 0:
-            # Increment gradually instead of resetting to max
-            old_min = self.current_reference_min
-            self.current_reference_min = min(self.current_reference_min + 1, self.max_reference_count)
-            # This is important for debugging but not necessary as info for every reference update
-            if self.debug:
-                fringe_debug(f"Reference threshold increased from {old_min} to {self.current_reference_min}")
-            else:
-                # Log less frequently at info level - only when we reach significant thresholds
-                if self.current_reference_min in [4, 6, 8] or self.current_reference_min == self.max_reference_count:
-                    logger.info(f"Reference threshold increased to {self.current_reference_min}")
+            # C++ gradually decreases the threshold after successful generations
+            # Unlike our previous approach of increasing it
+            if self.generation > 5 and self.generation % 3 == 0:
+                old_min = self.current_reference_min
+                # Gradually decrease the threshold down to the minimum (similar to C++)
+                self.current_reference_min = max(self.absolute_min_references, self.current_reference_min - 1)
+                
+                if self.debug:
+                    fringe_debug(f"Reference threshold decreased from {old_min} to {self.current_reference_min}")
+                else:
+                    # Log reference threshold changes
+                    logger.info(f"Reference threshold decreased to {self.current_reference_min} after {self.generation} generations")
         
         return generation_valid_points
     
@@ -276,11 +279,20 @@ class FringeExpander:
         """
         successful_candidates = []
         
+        # Enhanced logging - track rejection reasons for debugging
+        rejection_reasons = {
+            "insufficient_refs": 0,
+            "optimization_failed": 0,
+            "distance_check_failed": 0,
+            "path_check_failed": 0,
+            "exception": 0
+        }
+        
         # Use ThreadPoolExecutor for parallel evaluation
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
             # Submit evaluation tasks for all candidates
             future_to_candidate = {
-                executor.submit(self._evaluate_candidate, y, x): (y, x) 
+                executor.submit(self._evaluate_candidate_with_reason, y, x): (y, x) 
                 for y, x in candidates
             }
             
@@ -288,21 +300,39 @@ class FringeExpander:
             for future in future_to_candidate:
                 y, x = future_to_candidate[future]
                 try:
-                    # Get result (True if successful, False if failed)
-                    result = future.result()
-                    if result:
+                    # Get result (Success flag and rejection reason if failed)
+                    success, reason = future.result()
+                    if success:
                         # Point was successful, add to successful candidates
                         successful_candidates.append((y, x))
                     else:
-                        # Point failed, might be added to rest_points in _evaluate_candidate
+                        # Point failed, track rejection reason for debugging
+                        if reason in rejection_reasons:
+                            rejection_reasons[reason] += 1
+                        # Might be added to rest_points in _evaluate_candidate
                         self.total_rejected_points += 1
                 except Exception as e:
                     logger.error(f"Error evaluating candidate ({y},{x}): {e}")
                     # Clear processing state
                     self.grid.update_state(y, x, 0, clear=STATE_PROCESSING)
                     self.total_rejected_points += 1
+                    rejection_reasons["exception"] += 1
+        
+        # Log rejection statistics
+        total_candidates = len(candidates)
+        success_count = len(successful_candidates)
+        logger.info(f"Candidate evaluation: {success_count}/{total_candidates} successful "
+                   f"({success_count/total_candidates*100:.1f}% success rate)")
+        logger.info(f"Rejection reasons: {rejection_reasons}")
         
         return successful_candidates
+        
+    def _evaluate_candidate_with_reason(self, y: int, x: int) -> Tuple[bool, str]:
+        """Wrapper for _evaluate_candidate that returns success and rejection reason"""
+        # Call the actual evaluation function and capture pass/fail
+        success = self._evaluate_candidate(y, x)
+        reason = self.grid.get_point_rejection_reason(y, x) if not success else None
+        return success, reason
     
     def _evaluate_candidate(self, y: int, x: int) -> bool:
         """
@@ -357,35 +387,41 @@ class FringeExpander:
             # current_reference_min is the preference metric that increases over time
             
             # Check if we have enough reference points for minimum threshold
+            # C++ checks this on line 1209: if(ref_count < 2 || ref_count+0.35*rec_ref_sum < curr_ref_min)
             if ref_count < self.absolute_min_references:
                 # Not enough references for absolute minimum, add to rest points
                 if self.debug:
                     fringe_debug(f"Point ({y},{x}) has insufficient references ({ref_count} direct, {rec_ref_sum:.2f} recursive), absolute min={self.absolute_min_references}")
                 self.grid.update_state(y, x, 0, clear=STATE_PROCESSING)
+                self.grid.set_point_rejection_reason(y, x, "insufficient_refs")
                 self.rest_points.append((y, x))
                 return False
                 
+            # Use the exact same formula as C++ for evaluating reference count adequacy
+            # In C++, the formula is: ref_count + 0.35 * rec_ref_sum < curr_ref_min
+            combined_ref_count = ref_count + 0.35 * rec_ref_sum
+            
             # If we have enough references for absolute minimum, check preference threshold
-            if ref_count + 0.35 * rec_ref_sum < self.current_reference_min:
-                # Not at preferred reference count, but still above absolute minimum
-                # Add to rest points for potential future use, but with a note that it met minimum
-                if self.debug:
-                    fringe_debug(f"Point ({y},{x}) has {ref_count} references (below preferred {self.current_reference_min}), but above minimum {self.absolute_min_references}")
+            if combined_ref_count < self.current_reference_min:
+                # C++ implementation is more aggressive - checks if curr_points.size() < 10
+                # In our case, that means checking if the fringe is small
+                # C++ adds these points to "rest_ref_pts" but still continues optimizing them
+                # See lines 1212-1228 in SurfaceHelpers.cpp
                 
-                # Determine whether to continue based on fringe size
-                # If we have plenty of better candidates, add to rest_points
-                # If fringe is becoming small, accept this point anyway
-                if len(self.grid.fringe) > 10 and len(self.rest_points) < 50:
-                    # We have enough good candidates, so add this to rest_points for later
+                # For us, be more permissive: If fringe is small (<20) or we have few rest points,
+                # continue processing this candidate anyway (like C++ does)
+                if len(self.grid.fringe) < 20 or len(self.rest_points) < 20:
+                    # Continue with optimization (fall through) - C++ is more permissive here
+                    if self.debug:
+                        fringe_debug(f"Point ({y},{x}) has {ref_count} refs (combined {combined_ref_count:.2f}) below preferred {self.current_reference_min}, but continuing due to small fringe")
+                else:
+                    # We have enough good candidates, mark this for later
+                    if self.debug:
+                        fringe_debug(f"Point ({y},{x}) has {ref_count} refs (combined {combined_ref_count:.2f}) below preferred {self.current_reference_min}, adding to rest points")
+                    # Add to rest points - but C++ would still try optimizing it
                     self.grid.update_state(y, x, 0, clear=STATE_PROCESSING)
-                    # Add to rest points with a higher priority flag (it met minimum threshold)
                     self.rest_points.append((y, x))
                     return False
-                else:
-                    # Fringe is small, accept this point even though it's below preference threshold
-                    if self.debug:
-                        fringe_debug(f"Accepting point ({y},{x}) despite being below preferred threshold because fringe is small")
-                    # Continue with optimization (fall through)
         
             # 2. Initial optimization
             # This follows lines 1216-1247 of the C++ implementation
@@ -396,8 +432,9 @@ class FringeExpander:
                 avg_position += self.grid.get_point(ref_y, ref_x)
             avg_position /= len(ref_points)
             
-            # Add small random offset to avoid exact duplication
-            random_offset = np.random.uniform(-0.1, 0.1, 3)
+            # Add small random offset exactly like C++ does on line 1217:
+            # cv::Vec3d init = locs(best_l)+cv::Vec3d((rand()%1000)/10000.0-0.05,(rand()%1000)/10000.0-0.05,(rand()%1000)/10000.0-0.05);
+            random_offset = np.random.uniform(-0.05, 0.05, 3)  # MATCH C++ EXACTLY: Offset range [-0.05, 0.05]
             
             # Initialize position based on best reference plus small random offset
             if best_ref is not None:
@@ -422,16 +459,26 @@ class FringeExpander:
                 fringe_debug(f"Point ({y},{x}) first optimization loss: {loss}")
             
             # If loss is too high, try multiple random initializations
+            # This matches C++ implementation which tries multiple initializations
+            # in SurfaceHelpers.cpp lines 1230-1247 
             if loss > self.physical_fail_threshold:
                 if self.debug:
                     fringe_debug(f"Point ({y},{x}) loss {loss} > threshold {self.physical_fail_threshold}, trying random initializations")
                 best_loss = loss
                 best_position = self.grid.get_point(y, x).copy()
                 
-                # Try up to 5 random initializations
-                for i in range(min(5, self.max_optimization_tries)):
-                    # Reset to new random position near the average
-                    random_offset = np.random.uniform(-1.0, 1.0, 3)
+                # C++ tries exactly 100 optimization attempts (SurfaceHelpers.cpp line 1234-1236)
+                # for (int n=0;n<100;n++) {
+                #     int range = step*10;
+                #     locs(p) = avg + cv::Vec3d((rand()%(range*2))-range,(rand()%(range*2))-range,(rand()%(range*2))-range);
+                # }
+                
+                # Calculate exact range like C++ does: step*10 (SurfaceHelpers.cpp line 1235)
+                range_value = self.step_size * 10  # MATCH C++ EXACTLY: range = step*10
+                
+                for i in range(100):  # MATCH C++ EXACTLY: 100 attempts
+                    # Reset to new random position using exact C++ range [-step*10, step*10]
+                    random_offset = np.random.uniform(-range_value, range_value, 3)
                     new_init = avg_position + random_offset
                     self.grid.set_point(y, x, new_init)
                     
@@ -457,6 +504,43 @@ class FringeExpander:
                         fringe_debug(f"Point ({y},{x}) restoring best position with loss {best_loss}")
                     self.grid.set_point(y, x, best_position)
                     loss = best_loss
+                
+                # Add local optimization fallback as in C++ SurfaceHelpers.cpp lines 1297-1308
+                # C++ tries local optimization with increasing radius if random initialization fails
+                if best_loss > self.physical_fail_threshold:
+                    if self.debug:
+                        fringe_debug(f"Point ({y},{x}) still above threshold after random attempts, trying local optimization")
+                    
+                    # Try local optimization with increasing radius
+                    for radius in range(1, 5):  # Similar to C++ max_local_opt_r=4
+                        # Try local optimization with this radius
+                        neighbors = self._get_neighbors_within_radius(y, x, radius)
+                        if not neighbors:
+                            continue
+                        
+                        # Create position based on average of neighbors
+                        local_avg = np.zeros(3, dtype=np.float32)
+                        for ny, nx in neighbors:
+                            local_avg += self.grid.get_point(ny, nx)
+                        local_avg /= len(neighbors)
+                        
+                        # Set position and optimize
+                        self.grid.set_point(y, x, local_avg)
+                        local_loss = self._optimize_candidate(y, x)
+                        
+                        if self.debug:
+                            fringe_debug(f"Point ({y},{x}) local radius {radius} loss: {local_loss}")
+                        
+                        # Keep if better
+                        if local_loss < best_loss:
+                            best_loss = local_loss
+                            best_position = self.grid.get_point(y, x).copy()
+                            self.grid.set_point(y, x, best_position)
+                            loss = best_loss
+                        
+                        # Early stop if good enough
+                        if best_loss < self.physical_fail_threshold:
+                            break
             
             # 3. Final quality test
             # This follows lines 1252-1286 of the C++ implementation
@@ -472,18 +556,59 @@ class FringeExpander:
             if self.debug:
                 fringe_debug(f"Point ({y},{x}) path checks passed: {path_checks_passed}")
             
-            # Final quality decision
-            quality_passed = distance_value < self.distance_threshold and loss < self.physical_fail_threshold and path_checks_passed
+            # Final quality decision - EXACTLY match C++ implementation
+            # C++ uses dist_th = 1.5 (matching our self.distance_threshold)
+            # C++ uses phys_fail_th = 0.1 (matching our self.physical_fail_threshold)
+            # These values are defined in SurfaceHelpers.cpp lines 989 and 1102
+            
+            # CORRECTION: In C++, high intensity is good, not bad!
+            # The distance_value is actually an intensity value in our implementation (0-255 range)
+            # So we want to PASS points with HIGH intensity, not fail them
+            # In SurfaceHelpers.cpp line 1263:
+            # if(dtrans_value.at<float>(0,0) >= dist_th) continue;
+            # The comparison is REVERSED - it fails points with intensity BELOW threshold
+            
+            # FIXED: Change the condition to properly check distance transform values
+            # IMPORTANT: In the distance transform, LOW values (near 0.0) are GOOD!
+            # They mean the point is close to the object boundary
+            distance_passed = distance_value <= self.distance_threshold  # Use C++ dist_th=1.5
+            loss_passed = loss < self.physical_fail_threshold  # phys_fail_th = 0.1 in C++
+            
+            # Always log detailed quality check results for debugging
+            print(f"QUALITY CHECKS ({y},{x}): distance={distance_value:.6f} (should be ≤{self.distance_threshold}), loss={loss:.6f} (thresh={self.physical_fail_threshold}), paths={path_checks_passed}")
+            
+            # Final quality checks with correct distance transform logic (low is good)
+            quality_passed = distance_passed and loss_passed and path_checks_passed
+            
+            # Log each check result
+            print(f"  distance_passed: {distance_passed}, loss_passed: {loss_passed}, path_checks_passed: {path_checks_passed}")
+            
             if quality_passed:
-                # Success! Keep point as valid
-                if self.debug:
-                    fringe_debug(f"Point ({y},{x}) PASSED quality checks: distance={distance_value}, loss={loss}")
+                # Success! Keep point as valid with both LOC_VALID and COORD_VALID
+                print(f"PASSED ALL ({y},{x}): Point passed all quality checks")
+                # Explicitly set both flags to match C++ behavior
+                self.grid.update_state(y, x, STATE_LOC_VALID | STATE_COORD_VALID)
                 return True
             else:
-                # Mark as failed but keep coordinates for future reference
-                if self.debug:
-                    fringe_debug(f"Point ({y},{x}) FAILED quality checks: distance={distance_value}, loss={loss}, paths={path_checks_passed}")
+                # Failed quality checks, but still keep as COORD_VALID for future reference
+                # This mirrors C++ behavior which maintains points even when they fail validation
+                print(f"FAILED CHECK ({y},{x}): Failed quality checks")
+                
+                # Critical difference: Set STATE_COORD_VALID but clear STATE_LOC_VALID
+                # This allows the point to be part of the surface but not used for reference counting
                 self.grid.update_state(y, x, STATE_COORD_VALID, clear=STATE_LOC_VALID | STATE_PROCESSING)
+                # Add to rest_points for potential future use like C++ does
+                self.rest_points.append((y, x))
+                # Track rejection reason for diagnostics
+                if not distance_passed:
+                    self.grid.set_point_rejection_reason(y, x, "distance_check_failed")
+                    print(f"  REASON: distance value {distance_value:.6f} > threshold {self.distance_threshold} (too far from object)")
+                elif not loss_passed:
+                    self.grid.set_point_rejection_reason(y, x, "optimization_failed")
+                    print(f"  REASON: loss value {loss:.6f} > threshold {self.physical_fail_threshold}")
+                elif not path_checks_passed:
+                    self.grid.set_point_rejection_reason(y, x, "path_check_failed")
+                    print(f"  REASON: path checks failed")
                 return False
                 
         except Exception as e:
@@ -537,49 +662,6 @@ class FringeExpander:
         
         return ref_count, ref_points, best_ref
     
-    def _optimize_candidate(self, y: int, x: int) -> float:
-        """
-        Optimize a candidate point using the optimizer.
-        
-        Args:
-            y: Y coordinate of the candidate
-            x: X coordinate of the candidate
-            
-        Returns:
-            Final loss value after optimization
-        """
-        try:
-            # FIXED: Clear the optimizer's variable registry before each optimization
-            # to avoid naming conflicts when optimizing the same point multiple times
-            # This is critical to prevent "Two different variable objects with the same name" errors
-            self.optimizer.variable_registry = {}
-            
-            # Use the optimizer to optimize this point
-            # This sets up all necessary cost functions and constraints
-            self.optimizer.optimize_points([(y, x)])
-            
-            # Get the final loss from the optimizer
-            loss = self.optimizer.get_last_loss()
-            
-            if self.debug:
-                fringe_debug(f"Optimized candidate ({y},{x}) with loss: {loss}")
-            
-            # FIXED: Add additional logging to track typical loss values
-            if loss < self.physical_fail_threshold:
-                if self.debug:
-                    fringe_debug(f"Point ({y},{x}) optimized successfully with loss: {loss} (below threshold {self.physical_fail_threshold})")
-            else:
-                if self.debug:
-                    fringe_debug(f"Point ({y},{x}) optimization resulted in high loss: {loss} (above threshold {self.physical_fail_threshold})")
-                else:
-                    # Only log high losses at info level, as they're more important to track even without full debugging
-                    logger.info(f"Point ({y},{x}) optimization resulted in high loss: {loss} (above threshold {self.physical_fail_threshold})")
-            
-            return loss
-        except Exception as e:
-            logger.error(f"Error optimizing candidate ({y},{x}): {e}")
-            # Return a high loss value to indicate failure
-            return float('inf')
     
     def _evaluate_distance(self, point: np.ndarray) -> float:
         """
@@ -598,8 +680,9 @@ class FringeExpander:
                 logger.error(f"Cannot evaluate distance: Invalid coordinates in point: {point}")
                 return float('inf')
             
-            # Get value at the point using the optimizer's sampling function
-            value = self.optimizer.sample_volume_at_point_3d(point)
+            # Get distance value at the point using the optimizer's distance transform sampler
+            # IMPORTANT: This should return the distance transform value, not raw intensity
+            value = self.optimizer.sample_distance_at_point_3d(point)
             
             # For debugging
             if self.debug:
@@ -674,14 +757,17 @@ class FringeExpander:
                 # Interpolate point
                 point = start * (1 - t) + end * t
                 
-                # Check distance value
-                distance = self._evaluate_distance(point)
+                # Check intensity value (distance_value is actually intensity in our case)
+                intensity = self._evaluate_distance(point)
                 
-                # Fail if any point exceeds threshold
-                if distance >= self.distance_threshold:
+                # FIXED: Check against distance threshold (low values are good)
+                # This matches the C++ logic: distance values should be LESS THAN dist_th
+                if intensity > self.distance_threshold:
+                    print(f"PATH CHECK FAILED: Point along path with distance {intensity} > {self.distance_threshold} threshold")
                     return False
             
-            # All samples passed
+            # All samples passed - all points along path had low distance values
+            print(f"PATH CHECK PASSED: All points along path have distance < {self.distance_threshold}")
             return True
         except Exception as e:
             logger.error(f"Error evaluating path from {start} to {end}: {e}")
@@ -703,18 +789,28 @@ class FringeExpander:
         
         # FIXED: Use the class-level absolute_min_references rather than hardcoding
         
-        # Try different recovery strategies in order of preference:
-        # 1. Reduce preferred threshold if it's above the absolute minimum
+        # Try different recovery strategies based on C++ implementation
+        # In SurfaceHelpers.cpp lines 1336-1347, the recovery mechanism reduces reference threshold
+        # and is more aggressive
+        self.recoveries += 1
+        
+        # 1. For C++ style recovery, be more aggressive with threshold reduction
+        # Especially in later recoveries
+        old_min = self.current_reference_min
         if self.current_reference_min > self.absolute_min_references:
-            old_min = self.current_reference_min
-            # More aggressive reduction - reduce by 2 instead of 1 to recover faster
-            self.current_reference_min = max(self.absolute_min_references, self.current_reference_min - 2)
-            self.recoveries += 1
-            
-            if self.debug:
-                fringe_debug(f"Attempting fringe recovery with reference threshold reduced from {old_min} to {self.current_reference_min}")
+            # C++ style: more aggressive reduction after multiple recovery attempts
+            if self.recoveries > 2:
+                # After multiple recoveries, make larger reductions
+                reduction = min(3, self.current_reference_min - self.absolute_min_references)
+                self.current_reference_min = max(self.absolute_min_references, self.current_reference_min - reduction)
             else:
-                logger.info(f"Recovery: Reducing reference threshold to {self.current_reference_min}")
+                # First few recoveries, reduce by 1
+                self.current_reference_min -= 1
+                
+            if self.debug:
+                fringe_debug(f"C++ style recovery #{self.recoveries}: Reducing reference threshold from {old_min} to {self.current_reference_min}")
+            else:
+                logger.info(f"Recovery #{self.recoveries}: Reducing reference threshold to {self.current_reference_min} (C++ style)")
             
             # Try to recover from rest points first using the new threshold
             recovered_from_rest = False
@@ -738,15 +834,15 @@ class FringeExpander:
                 
                 sorted_fringe.sort(reverse=True)  # Sort by reference count (higher first)
                 
-                # Take a subset of points with highest reference counts to restart growth
-                # but ensure we take at least 5 points if available
-                recovery_count = max(5, min(20, len(sorted_fringe)))
+                # C++ style: In recovery mode, take more points to increase chances of success
+                # Take a subset of points with highest reference counts, but ensure we take more than standard
+                recovery_count = max(20, min(40, len(sorted_fringe)))  # C++ takes more points in recovery
                 new_fringe = [point for _, point in sorted_fringe[:recovery_count]]
                 
                 if self.debug:
-                    fringe_debug(f"Recovery Strategy 1: Recovered {len(new_fringe)} points from rest_points using reduced threshold {self.current_reference_min}")
+                    fringe_debug(f"C++ style recovery: Recovered {len(new_fringe)} points from rest_points using reduced threshold {self.current_reference_min}")
                 else:
-                    logger.info(f"Recovery: Found {len(new_fringe)} points with threshold {self.current_reference_min}")
+                    logger.info(f"Recovery: Found {len(new_fringe)} points with threshold {self.current_reference_min} (C++ style recovery)")
                 self.grid.fringe = new_fringe
                 return True
         
@@ -774,19 +870,20 @@ class FringeExpander:
             
             sorted_fringe.sort(reverse=True)  # Sort by reference count (higher first)
             
-            # Take a subset of points with highest reference counts, but ensure we take at least 5
-            recovery_count = max(5, min(20, len(sorted_fringe)))
+            # C++ implementation takes more points during recovery
+            # Use more aggressive recovery by taking a larger subset
+            recovery_count = max(30, min(50, len(sorted_fringe)))  # More aggressive count
             new_fringe = [point for _, point in sorted_fringe[:recovery_count]]
             
             if self.debug:
-                fringe_debug(f"Recovery Strategy 2: Recovered {len(new_fringe)} points from rest_points using absolute minimum {self.absolute_min_references}")
+                fringe_debug(f"C++ style recovery: Recovered {len(new_fringe)} points from rest_points using absolute minimum {self.absolute_min_references}")
             else:
-                logger.info(f"Recovery: Found {len(new_fringe)} points with absolute minimum {self.absolute_min_references}")
+                logger.info(f"Recovery: Found {len(new_fringe)} points with absolute minimum {self.absolute_min_references} (C++ style)")
             
             self.grid.fringe = new_fringe
-            # Also lower the preference threshold to match what we found
-            min_ref_count_found = sorted_fringe[-1][0] if sorted_fringe else self.absolute_min_references
-            self.current_reference_min = max(self.absolute_min_references, min_ref_count_found)
+            # C++ implementation sets reference threshold to absolute minimum during recovery
+            # This is more aggressive than our original approach
+            self.current_reference_min = self.absolute_min_references  # Force to absolute minimum like C++
             
             if self.debug:
                 fringe_debug(f"Reset preference threshold to {self.current_reference_min} based on recovered points")
@@ -817,17 +914,20 @@ class FringeExpander:
         
         sorted_valid_points.sort(reverse=True)  # Sort by neighbor count
         
-        # Add points with the best connectivity, taking at least 10 if available
-        recovery_count = max(10, min(30, len(sorted_valid_points)))
+        # C++ implementation is very aggressive in final recovery stage
+        # Take many more points (this is our last chance at recovery)
+        recovery_count = max(50, min(100, len(sorted_valid_points)))  # Much more aggressive
         self.grid.fringe = [point for _, point in sorted_valid_points[:recovery_count]]
         
         if self.debug:
-            fringe_debug(f"Recovery Strategy 3: Recovered {len(self.grid.fringe)} points from all valid points")
+            fringe_debug(f"Final C++ style recovery: Recovered {len(self.grid.fringe)} points from all valid points")
         else:
-            logger.info(f"Recovery: Found {len(self.grid.fringe)} points from all valid surface points")
+            logger.info(f"Recovery: Found {len(self.grid.fringe)} points from all valid surface points (C++ aggressive recovery)")
         
-        # Also reset the preference threshold to match the current situation
+        # C++ style: Reset reference threshold to absolute minimum and keep it there for a while
         self.current_reference_min = self.absolute_min_references
+        # Also reset the recovery counter to give this a fresh start
+        self.recoveries = 0  # Reset counter to avoid increasing thresholds too quickly after recovery
         if self.debug:
             fringe_debug(f"Reset preference threshold to absolute minimum {self.absolute_min_references}")
         
@@ -885,3 +985,141 @@ class FringeExpander:
         
         # Return total points added
         return self.total_valid_points - starting_points
+        
+    def _count_reference_points(self, y: int, x: int) -> Tuple[int, List[Tuple[int, int]], Optional[Tuple[int, int]]]:
+        """
+        Count reference points for a candidate and find the best reference.
+        This matches the C++ implementation in SurfaceHelpers.cpp lines 1172-1214.
+        
+        Args:
+            y: Y coordinate of the candidate
+            x: X coordinate of the candidate
+            
+        Returns:
+            (ref_count, ref_points, best_ref):
+            - ref_count: Number of reference points
+            - ref_points: List of (y, x) coordinates of reference points
+            - best_ref: Coordinates of the best reference point (or None)
+        """
+        # Get reference points (valid neighbors within reference_radius)
+        ref_points = []
+        
+        # Count reference points (LOC_VALID neighbors within reference_radius)
+        for dy in range(-self.reference_radius, self.reference_radius+1):
+            for dx in range(-self.reference_radius, self.reference_radius+1):
+                # Skip the center point
+                if dy == 0 and dx == 0:
+                    continue
+                
+                # Check neighbor
+                ny, nx = y + dy, x + dx
+                if not self.grid.is_in_bounds(ny, nx):
+                    continue
+                    
+                # Only count LOC_VALID points as references
+                if self.grid.get_state(ny, nx) & STATE_LOC_VALID:
+                    ref_points.append((ny, nx))
+        
+        # Find the best reference point (with most connected neighbors)
+        best_ref = None
+        best_ref_count = -1
+        
+        for ref_y, ref_x in ref_points:
+            # Count valid neighbors for this reference
+            ref_neighbor_count = self.grid.get_neighbor_count(ref_y, ref_x, 1, STATE_LOC_VALID)
+            
+            # Update best if this one has more neighbors
+            if ref_neighbor_count > best_ref_count:
+                best_ref_count = ref_neighbor_count
+                best_ref = (ref_y, ref_x)
+        
+        return len(ref_points), ref_points, best_ref
+        
+    def _optimize_candidate(self, y: int, x: int) -> float:
+        """
+        Optimize a candidate point and normalize the loss like C++.
+        
+        Args:
+            y: Y coordinate of candidate point
+            x: X coordinate of candidate point
+            
+        Returns:
+            Normalized loss value (lower is better)
+        """
+        try:
+            # Convert y and x to proper integer values to avoid any variable name issues
+            y_val = int(y)
+            x_val = int(x)
+            
+            # Get the raw loss from the optimizer using the new optimize_point method
+            # The optimizer.optimize_point method will now return a high but not infinite value on failure
+            print(f"FRINGE_OPTIMIZE: Calling optimizer.optimize_point with y={y_val}, x={x_val}")
+            raw_loss = self.optimizer.optimize_point(y_val, x_val)
+            
+            # Check for extreme or invalid loss values
+            if np.isnan(raw_loss) or np.isinf(raw_loss):
+                logger.warning(f"Invalid loss value {raw_loss} for point ({y},{x}), using fallback value")
+                raw_loss = 10.0  # Use a reasonable high value, not infinite
+            elif raw_loss > 100.0:
+                logger.warning(f"Extremely high loss value {raw_loss} for point ({y},{x}), capping")
+                raw_loss = 10.0  # Cap extremely high values
+            
+            # Estimate number of constraints based on reference points
+            ref_count, _, _ = self._count_reference_points(y, x)
+            num_constraints = max(1, ref_count * 2)  # ~2 constraints per reference
+            
+            # Apply normalization like C++ does in SurfaceHelpers.cpp:
+            # Line 334: return sqrt(best/tgts.size());
+            # Line 406: return sqrt(best/tgts.size());
+            # Line 819: return sqrt(summary.final_cost/summary.num_residual_blocks);
+            normalized_loss = np.sqrt(raw_loss / num_constraints)
+            
+            if self.debug:
+                fringe_debug(f"Point ({y},{x}) loss normalized: sqrt({raw_loss:.6f} / {num_constraints}) = {normalized_loss:.6f}")
+                if normalized_loss < self.physical_fail_threshold:
+                    fringe_debug(f"Point ({y},{x}) normalized loss {normalized_loss:.6f} is below threshold {self.physical_fail_threshold}")
+                else:
+                    fringe_debug(f"Point ({y},{x}) normalized loss {normalized_loss:.6f} exceeds threshold {self.physical_fail_threshold}")
+                
+            return normalized_loss
+        except Exception as e:
+            logger.error(f"Error optimizing point ({y},{x}): {e}")
+            # Return a capped high value rather than infinity
+            return 5.0  # High enough to exceed threshold but not infinite
+    
+    def _get_neighbors_within_radius(self, y: int, x: int, radius: int) -> List[Tuple[int, int]]:
+        """
+        Get neighbors within a given radius for local optimization.
+        This matches the C++ local optimization approach in SurfaceHelpers.cpp.
+        
+        Args:
+            y: Y coordinate of the center point
+            x: X coordinate of the center point
+            radius: Radius to search for neighbors
+            
+        Returns:
+            List of (y, x) coordinates of valid neighbors within radius
+        """
+        neighbors = []
+        
+        # Search in a square around the point
+        for dy in range(-radius, radius+1):
+            for dx in range(-radius, radius+1):
+                # Skip the center point
+                if dy == 0 and dx == 0:
+                    continue
+                
+                # Check if within radius (use L2 norm)
+                if np.sqrt(dy*dy + dx*dx) > radius:
+                    continue
+                
+                # Check if neighbor is valid
+                ny, nx = y + dy, x + dx
+                if not self.grid.is_in_bounds(ny, nx):
+                    continue
+                
+                # Only use LOC_VALID points as references
+                if self.grid.get_state(ny, nx) & STATE_LOC_VALID:
+                    neighbors.append((ny, nx))
+        
+        return neighbors

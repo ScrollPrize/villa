@@ -6,9 +6,10 @@ setup(
     packages=find_packages(),
     install_requires=[
         "torch>=1.9.0",
-        "theseus>=0.1.0",
+        "theseus-ai>=0.1.0",  # Ensure version with CholmodSparseSolver support
         "matplotlib",
         "numpy",
+        "pillow",
     ],
     author="Volume Cartographer Team",
     author_email="info@volumecartographer.com",

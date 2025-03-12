@@ -413,11 +413,16 @@ def space_tracing_quad_phys(
     generations: int = 100,
     step_size: float = 10.0,
     cache_root: str = "",
-    intensity_threshold: float = 0.5,  # Threshold for considering a point valid
+    intensity_threshold: float = 170,  # Raw intensity threshold (matches C++ TH=170)
     batch_size: int = 20,  # Number of points to optimize at once
     max_points: int = 5000,  # Maximum number of points in the surface
     min_growth_rate: float = 0.05,  # Minimum growth rate before stopping (fraction of batch size)
-    max_failed_generations: int = 5  # Maximum number of consecutive failed generations before stopping
+    max_failed_generations: int = 5,  # Maximum number of consecutive failed generations before stopping
+    use_fringe_expander: bool = True,  # Whether to use the new FringeExpander for growth
+    distance_threshold: float = 1.5,  # Maximum distance value for accepting points (matches C++ dist_th)
+    physical_fail_threshold: float = 0.1,  # Threshold for physical constraint failure (matches C++ phys_fail_th)
+    max_reference_count: int = 6,  # Maximum reference count for quality assessment (matches C++ ref_max)
+    initial_reference_min: int = 2  # Initial minimum reference count required (matches C++ curr_ref_min)
 ) -> QuadSurface:
     """
     Grow a surface from a seed point through optimization.
@@ -440,6 +445,11 @@ def space_tracing_quad_phys(
         max_points: Maximum number of points in the surface
         min_growth_rate: Minimum growth rate before stopping (fraction of batch size)
         max_failed_generations: Maximum number of consecutive failed generations
+        use_fringe_expander: Whether to use the new FringeExpander (True) or legacy GrowthPriority (False)
+        distance_threshold: Maximum distance value for accepting points
+        physical_fail_threshold: Threshold for physical constraint failure
+        max_reference_count: Maximum reference count for quality assessment
+        initial_reference_min: Initial minimum reference count required
     
     Returns:
         A QuadSurface object with the optimized surface points
@@ -464,229 +474,119 @@ def space_tracing_quad_phys(
     grid_size = 2 * generations + 10  # Ensure enough space for growth
     grid = PointGrid(grid_size, grid_size)
     
-    # Create optimizer
-    optimizer = SurfaceOptimizer(grid, dataset, cache, step_size)
-    
     # Initialize grid with volume information
     from tracer.core.interpolation import TrilinearInterpolator
     interp = TrilinearInterpolator(dataset)
     grid.initialize_at_origin(origin, step_size, use_gradients=True, 
                              volume_loader=interp.evaluate_with_gradient)
     
-    # Create growth priority handler
-    priority = GrowthPriority(grid, optimizer)
+    # Create optimizer
+    optimizer = SurfaceOptimizer(grid, dataset, cache, step_size)
+    optimizer.interpolator = interp  # Ensure interpolator is accessible
     
     # Initial stats
     start_time = time.time()
     total_valid_points = 4  # Start with 4 seed points
-    failed_points = 0
-    consecutive_failed_generations = 0
     
-    # Growth loop
-    for gen in range(generations):
-        # Get candidate points for this generation
-        candidates = grid.get_candidate_points()
-        if not candidates:
-            logger.info(f"No more candidates found at generation {gen}, stopping")
-            break
+    # Choose growth strategy based on parameter
+    if use_fringe_expander:
+        # Use the new FringeExpander implementation with C++ compatible settings
+        from tracer.fringe_expansion import FringeExpander
         
-        logger.info(f"Generation {gen}: Found {len(candidates)} candidate points")
+        logger.info("Using FringeExpander with C++ compatible settings for surface growth")
         
-        # Add candidates to priority queue
-        priority.add_candidates(candidates)
+        fringe_expander = FringeExpander(
+            grid=grid,
+            optimizer=optimizer,
+            reference_radius=1,
+            max_reference_count=6,  # Match C++ ref_max = 6 in SurfaceHelpers.cpp:1109
+            initial_reference_min=6,  # Start high like C++ (curr_ref_min = ref_max) in SurfaceHelpers.cpp:1110
+            distance_threshold=1.5,  # Match C++ dist_th = 1.5 in SurfaceHelpers.cpp:989
+            max_optimization_tries=20,  # Much higher than default for more persistent optimization
+            physical_fail_threshold=physical_fail_threshold,  # 0.1 from caller (matching C++)
+            num_workers=min(32, batch_size)  # Use more workers for faster parallel processing
+        )
         
-        # Track how many points we add in this generation
-        generation_valid_points = 0
-        
-        # Process candidates in batches by priority until all are processed
-        while not priority.is_empty():
-            # Get next batch of highest-priority candidates
-            batch = priority.get_next_batch(batch_size)
-            logger.info(f"  Got batch of {len(batch)} candidates")
-            if not batch:
-                break
+        # Growth loop using FringeExpander
+        try:
+            logger.info(f"Starting growth for up to {generations} generations with max {max_points} points")
             
-            try:
-                # Debug batch points before optimization
-                print(f"DEBUG: Batch points before optimization:")
-                for y, x in batch:
-                    point = grid.get_point(y, x)
-                    value = optimizer.sample_volume_at_point(y, x)
-                    print(f"DEBUG:   Point ({y}, {x}) at {point}, value: {value}")
+            # Keep track of consecutive failed generations
+            consecutive_failed_generations = 0
+            last_valid_count = total_valid_points
+            
+            for gen in range(generations):
+                # Expand one generation
+                logger.info(f"Starting generation {gen}")
                 
-                # Process with proper batch handling
-                # Use a single optimization call to avoid potential issues with shared variables
-                print(f"GROW_DEBUG: Processing batch with {len(batch)} points: {batch}")
-                logger.info(f"  Processing batch with {len(batch)} points using batch_size={batch_size}")
-                
-                # Track optimization success
-                optimization_succeeded = False
-                
-                try:
-                    # Split batch into smaller sub-batches if needed for memory efficiency
-                    # but maintain sub-batches of at least batch_size or remaining points
-                    sub_batch_size = min(batch_size, len(batch))
-                    if sub_batch_size < 1:
-                        sub_batch_size = 1  # Ensure at least one point per sub-batch
-                    
-                    # Track successful points in this batch
-                    successful_points = set()
-                        
-                    for i in range(0, len(batch), sub_batch_size):
-                        sub_batch = batch[i:i+sub_batch_size]
-                        print(f"GROW_DEBUG: Processing sub-batch {i//sub_batch_size+1} with {len(sub_batch)} points")
-                        logger.info(f"  Processing sub-batch {i//sub_batch_size+1} with {len(sub_batch)} points")
-                        
-                        try:
-                            optimizer.optimize_points(sub_batch)
-                            print(f"GROW_DEBUG: Sub-batch optimization completed successfully")
-                            logger.info(f"  Sub-batch optimization completed successfully")
-                            optimization_succeeded = True
-                            # Mark all points in this sub-batch as successful
-                            successful_points.update(sub_batch)
-                        except Exception as e:
-                            print(f"GROW_DEBUG: Sub-batch optimization failed: {e}")
-                            logger.warning(f"  Failed to optimize sub-batch: {e}")
+                # Add detailed debugging about current state before expansion
+                logger.info(f"Before generation {gen}: fringe size={len(grid.fringe)}, "
+                            f"reference_min={fringe_expander.current_reference_min}, "
+                            f"valid points={fringe_expander.total_valid_points}, "
+                            f"rejected points={fringe_expander.total_rejected_points}")
                             
-                            # If sub-batch optimization fails, try each point individually
-                            print("GROW_DEBUG: Falling back to single-point optimization")
-                            logger.info("  Falling back to single-point optimization")
-                            
-                            for y, x in sub_batch:
-                                try:
-                                    print(f"GROW_DEBUG: Optimizing single point ({y},{x})")
-                                    logger.info(f"  Optimizing single point ({y},{x})")
-                                    optimizer.optimize_points([(y, x)])
-                                    print(f"GROW_DEBUG: Single point optimization for ({y},{x}) completed")
-                                    logger.info(f"  Single point optimization for ({y},{x}) completed")
-                                    optimization_succeeded = True
-                                    successful_points.add((y, x))
-                                except Exception as e:
-                                    print(f"GROW_DEBUG: Single point optimization for ({y},{x}) failed: {e}")
-                                    logger.warning(f"  Failed to optimize point ({y},{x}): {e}")
+                new_points = fringe_expander.expand_one_generation()
                 
-                except Exception as e:
-                    print(f"GROW_DEBUG: Batch processing failed: {e}")
-                    logger.error(f"Error processing batch: {e}")
+                # Update total valid points
+                total_valid_points = fringe_expander.total_valid_points + 4  # Add the 4 seed points
                 
-                # Mark failed points (those not in successful_points)
-                failed_in_batch = 0
-                for y, x in batch:
-                    if (y, x) not in successful_points:
-                        grid.set_state(y, x, STATE_NONE)
-                        failed_in_batch += 1
+                # More detailed logging after expansion
+                logger.info(f"Generation {gen} result: +{new_points} points, "
+                            f"new fringe size={len(grid.fringe)}, "
+                            f"total valid={total_valid_points}, "
+                            f"rejected total={fringe_expander.total_rejected_points}")
                 
-                # If all optimization attempts failed, skip this batch
-                if not optimization_succeeded:
-                    print("GROW_DEBUG: Complete optimization failure for this batch")
-                    logger.warning("  Complete optimization failure - no points could be optimized")
-                    failed_points += failed_in_batch
-                    continue
+                # Check for early termination conditions
+                if new_points == 0:
+                    logger.info(f"No new points added in generation {gen}, stopping")
+                    break
                 
-                # If some points failed but others succeeded, update failed_points counter
-                if failed_in_batch > 0:
-                    failed_points += failed_in_batch
-                    logger.info(f"  {failed_in_batch} points in the batch failed optimization")
-                
-                # Debug batch points after optimization
-                print(f"DEBUG: Batch points after optimization:")
-                for y, x in batch:
-                    point = grid.get_point(y, x)
-                    value = optimizer.sample_volume_at_point(y, x)
-                    print(f"DEBUG:   Point ({y}, {x}) at {point}, value: {value}")
-                
-                # Process optimized points and update fringe
-                new_valid_points = 0
-                for y, x in batch:
-                    # Sample volume at optimized point for quality check
-                    value = optimizer.sample_volume_at_point(y, x)
-                    point = grid.get_point(y, x)
+                # Calculate growth rate
+                if gen > 0:  # Skip first generation
+                    growth_rate = new_points / (batch_size + 0.001)  # Avoid division by zero
+                    logger.info(f"Generation {gen} growth rate: {growth_rate:.2f}")
                     
-                    # Perform additional validation checks
-                    valid_point = True
-                    
-                    # Check if any coordinate is negative
-                    if np.any(point < 0):
-                        logger.info(f"  Point ({y}, {x}) has negative coordinates: {point}")
-                        valid_point = False
-                    
-                    # Check if intensity is above threshold
-                    if value < intensity_threshold:
-                        logger.info(f"  Point ({y}, {x}) has low intensity: {value:.3f}")
-                        valid_point = False
-                    
-                    # Calculate distance from seed point
-                    dist_from_seed = np.linalg.norm(point - origin)
-                    print(f"DEBUG: Point ({y}, {x}) dist from seed: {dist_from_seed}")
-                    
-                    # Only keep valid points
-                    if valid_point:
-                        # Mark as valid (this will allow us to expand from this point)
-                        grid.update_state(y, x, STATE_LOC_VALID | STATE_COORD_VALID)
-                        grid.fringe.append((y, x))
-                        new_valid_points += 1
-                        generation_valid_points += 1
-                        logger.info(f"  Point ({y}, {x}) added with value {value:.3f}, dist: {dist_from_seed:.3f}")
+                    # Update consecutive failed generations count
+                    if growth_rate < min_growth_rate:
+                        consecutive_failed_generations += 1
+                        logger.warning(f"Low growth rate generation ({growth_rate:.2f} < {min_growth_rate}). "
+                                    f"Consecutive failed generations: {consecutive_failed_generations}")
                     else:
-                        # Mark as invalid
-                        grid.set_state(y, x, STATE_NONE)
-                        failed_points += 1
-                        logger.info(f"  Point ({y}, {x}) failed with value {value:.3f}, dist: {dist_from_seed:.3f}")
+                        consecutive_failed_generations = 0
+                    
+                    # Stop if too many consecutive failed generations
+                    if consecutive_failed_generations >= max_failed_generations:
+                        logger.warning(f"Stopping after {consecutive_failed_generations} consecutive failed generations")
+                        break
                 
-                total_valid_points += new_valid_points
-                logger.debug(f"Batch added {new_valid_points} valid points")
+                # Periodic logging
+                if gen % 5 == 0 or gen == generations - 1:
+                    valid_count = np.sum((grid.state & grid.state.dtype.type(STATE_LOC_VALID)) != 0)
+                    elapsed = time.time() - start_time
+                    logger.info(f"Generation {gen}: {valid_count} valid points, " 
+                                f"fringe size {len(grid.fringe)}, "
+                                f"speed: {valid_count/elapsed:.1f} points/sec")
+                    
+                    # Check if we're stuck (no valid points in fringe)
+                    if len(grid.fringe) == 0:
+                        logger.info("No valid points in fringe, stopping")
+                        break
                 
                 # Stop if we've reached the maximum number of points
                 if total_valid_points >= max_points:
                     logger.info(f"Reached maximum point count ({max_points}), stopping")
                     break
-            
-            except Exception as e:
-                logger.error(f"Error processing batch: {e}")
-                # Mark these candidates as failed but continue with next batch
-                for y, x in batch:
-                    grid.set_state(y, x, STATE_NONE)
-                    failed_points += len(batch)
-                
-        # Check growth rate for this generation
-        growth_rate = generation_valid_points / (len(candidates) + 0.001)  # Avoid division by zero
-        logger.info(f"Generation {gen} growth rate: {growth_rate:.2f}")
         
-        # Update consecutive failed generations count
-        if growth_rate < min_growth_rate:
-            consecutive_failed_generations += 1
-            logger.warning(f"Low growth rate generation ({growth_rate:.2f} < {min_growth_rate}). "
-                           f"Consecutive failed generations: {consecutive_failed_generations}")
-        else:
-            consecutive_failed_generations = 0
-        
-        # Stop if too many consecutive failed generations
-        if consecutive_failed_generations >= max_failed_generations:
-            logger.warning(f"Stopping after {consecutive_failed_generations} consecutive failed generations")
-            break
-        
-        # Periodic logging
-        if gen % 5 == 0 or gen == generations - 1:
-            valid_count = np.sum((grid.state & grid.state.dtype.type(STATE_LOC_VALID)) != 0)
-            elapsed = time.time() - start_time
-            logger.info(f"Generation {gen}: {valid_count} valid points, " 
-                        f"fringe size {len(grid.fringe)}, "
-                        f"speed: {valid_count/elapsed:.1f} points/sec")
-            
-            # Check if we're stuck (no valid points in fringe)
-            if len(grid.fringe) == 0:
-                logger.info("No valid points in fringe, stopping")
-                break
-        
-        # Stop if we've reached the maximum number of points
-        if total_valid_points >= max_points:
-            break
+        except Exception as e:
+            logger.error(f"Error during fringe expansion: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     # Compute final statistics
     elapsed = time.time() - start_time
     valid_count = np.sum((grid.state & grid.state.dtype.type(STATE_LOC_VALID)) != 0)
     logger.info(f"Growth completed in {elapsed:.1f} seconds")
-    logger.info(f"Final surface: {valid_count} valid points, {failed_points} failed points")
+    logger.info(f"Final surface: {valid_count} valid points")
     logger.info(f"Speed: {valid_count/elapsed:.1f} points/sec")
     
     # Convert to QuadSurface
@@ -695,22 +595,33 @@ def space_tracing_quad_phys(
     # Add additional metadata
     surface.meta["origin"] = origin.tolist()
     surface.meta["step_size"] = step_size
-    surface.meta["generations"] = gen
+    surface.meta["generations"] = gen if 'gen' in locals() else 0
     surface.meta["processing_time_sec"] = elapsed
     surface.meta["valid_points"] = int(valid_count)
-    surface.meta["failed_points"] = failed_points
+    
+    if use_fringe_expander:
+        # Add FringeExpander-specific metadata
+        surface.meta["fringe_expander"] = True
+        surface.meta["rejected_points"] = fringe_expander.total_rejected_points
+        surface.meta["recoveries"] = fringe_expander.recoveries
+        surface.meta["reference_min"] = fringe_expander.current_reference_min
+    else:
+        # Add GrowthPriority-specific metadata
+        surface.meta["fringe_expander"] = False
+        surface.meta["failed_points"] = failed_points if 'failed_points' in locals() else 0
+    
     surface.meta["intensity_threshold"] = intensity_threshold
     
     # Calculate surface area (rough estimate)
     area_vx2 = valid_count * (step_size ** 2)
     surface.meta["area_vx2"] = float(area_vx2)
     
-    # If we stopped due to failed generations, note that
-    if consecutive_failed_generations >= max_failed_generations:
+    # Add stop reason
+    if 'consecutive_failed_generations' in locals() and consecutive_failed_generations >= max_failed_generations:
         surface.meta["stop_reason"] = "consecutive_failed_generations"
     elif total_valid_points >= max_points:
         surface.meta["stop_reason"] = "max_points_reached"
-    elif gen >= generations - 1:
+    elif 'gen' in locals() and gen >= generations - 1:
         surface.meta["stop_reason"] = "max_generations_reached"
     else:
         surface.meta["stop_reason"] = "no_more_candidates"
@@ -728,7 +639,13 @@ def grow_surface_from_seed(
     cache_size: int = 1024 * 1024 * 1024,  # 1 GB default cache size
     intensity_threshold: float = 0.5,
     check_overlapping: bool = False,
-    name_prefix: str = "auto_grown_"
+    name_prefix: str = "auto_grown_",
+    use_fringe_expander: bool = True,  # Whether to use the new FringeExpander
+    distance_threshold: float = 1.5,    # Maximum distance value for accepting points
+    physical_fail_threshold: float = 0.1,  # Threshold for physical constraint failure
+    max_reference_count: int = 8,      # Maximum reference count for quality assessment
+    initial_reference_min: int = 3,    # Initial minimum reference count required
+    batch_size: int = 20               # Number of points to optimize at once
 ) -> QuadSurface:
     """
     Grow a surface from a seed point and save it to disk.
@@ -747,6 +664,12 @@ def grow_surface_from_seed(
         intensity_threshold: Threshold for considering a point valid
         check_overlapping: Whether to check for overlapping segments
         name_prefix: Prefix for generated surface names
+        use_fringe_expander: Whether to use the new FringeExpander (True) or legacy GrowthPriority (False)
+        distance_threshold: Maximum distance value for accepting points
+        physical_fail_threshold: Threshold for physical constraint failure
+        max_reference_count: Maximum reference count for quality assessment
+        initial_reference_min: Initial minimum reference count required
+        batch_size: Number of points to optimize at once
         
     Returns:
         The grown QuadSurface
@@ -777,7 +700,13 @@ def grow_surface_from_seed(
         origin=seed_point,
         generations=generations,
         step_size=step_size,
-        intensity_threshold=intensity_threshold
+        intensity_threshold=intensity_threshold,
+        batch_size=batch_size,
+        use_fringe_expander=use_fringe_expander,
+        distance_threshold=distance_threshold,
+        physical_fail_threshold=physical_fail_threshold,
+        max_reference_count=max_reference_count,
+        initial_reference_min=initial_reference_min
     )
     
     # Create unique ID (timestamp-based like in C++ version)
@@ -791,6 +720,7 @@ def grow_surface_from_seed(
     surface.meta["vc_gsfs_mode"] = "explicit_seed"
     surface.meta["vc_gsfs_version"] = "python-theseus"
     surface.meta["format"] = "tifxyz"  # For compatibility with C++ code
+    surface.meta["use_fringe_expander"] = use_fringe_expander
     
     # Save surface
     output_path = Path(output_path)

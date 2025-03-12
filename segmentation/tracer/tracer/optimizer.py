@@ -23,6 +23,55 @@ from cost_functions.base.space_loss_acc import SpaceLossAcc
 from cost_functions.base.dist_loss import DistLoss
 from cost_functions.base.straight_loss_2 import StraightLoss2
 
+
+class SqrtNormObjective(th.Objective):
+    """
+    An objective that applies square root normalization to the final error.
+    
+    This matches the C++ implementation which uses sqrt(sum/count) normalization
+    as seen in SurfaceHelpers.cpp:
+    - Line 334: return sqrt(best/tgts.size());
+    - Line 406: return sqrt(best/tgts.size());
+    - Line 819: return sqrt(summary.final_cost/summary.num_residual_blocks);
+    """
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._residual_count = 0
+        # Add debug flag
+        self.debug_enabled = os.environ.get('OPTIMIZER_DEBUG', '0').lower() in ('1', 'true', 'yes', 'on')
+        
+    def add(self, cost_function):
+        """Add a cost function and track residual count."""
+        super().add(cost_function)
+        # Each cost function contributes its dimension to the residual count
+        added_dim = cost_function.dim()
+        self._residual_count += added_dim
+        
+        if self.debug_enabled:
+            print(f"OPTIMIZER_DEBUG: Added cost function {cost_function.name} with dimension {added_dim}, "
+                  f"total residuals now {self._residual_count}")
+    
+    def error_metric(self):
+        """Calculate the error with sqrt normalization."""
+        if self._residual_count == 0:
+            return 0.0
+        
+        # Get the standard sum-of-squares error
+        standard_error = super().error_metric()
+        
+        # Apply sqrt(error/count) normalization to match C++ implementation
+        if torch.is_tensor(standard_error):
+            normalized_error = torch.sqrt(standard_error / self._residual_count)
+        else:
+            normalized_error = np.sqrt(standard_error / self._residual_count)
+        
+        if self.debug_enabled:
+            print(f"OPTIMIZER_DEBUG: Normalizing error from {standard_error} to {normalized_error} "
+                  f"with {self._residual_count} residuals")
+        
+        return normalized_error
+
 # Check if debugging is enabled via environment variables
 OPTIMIZER_DEBUG_ENABLED = os.environ.get('OPTIMIZER_DEBUG', '0').lower() in ('1', 'true', 'yes', 'on')
 GENERAL_DEBUG_ENABLED = os.environ.get('DEBUG', '0').lower() in ('1', 'true', 'yes', 'on')
@@ -66,10 +115,30 @@ class SurfaceOptimizer:
         # Add debug attribute to the optimizer to fix 'no attribute debug' errors
         self.debug = OPTIMIZER_DEBUG_ENABLED or GENERAL_DEBUG_ENABLED
         
-        # Initialize interpolator - ensure we use autodiff-compatible version
+        # Create a unique ID that's used for all variable names
+        # This ensures we avoid name conflicts between different optimizer instances
+        import time
+        import random
+        self.current_optimization_id = f"{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+        print(f"OPTIMIZER_DEBUG: Created optimizer with session ID {self.current_optimization_id}")
+        
+        # Initialize interpolator for raw volume data
         from tracer.core.interpolation import TrilinearInterpolator
         debug_print("OPTIMIZER_DEBUG: Using autodiff-compatible interpolator for gradient tracking")
         self.interpolator = TrilinearInterpolator(volume)
+        
+        # Initialize distance transform interpolator (for path checking and evaluations)
+        from tracer.core.distance_transform.interpolator import DistanceTransformInterpolator
+        self.dist_interpolator = DistanceTransformInterpolator(
+            volume=volume,
+            threshold=170.0,  # Match C++ TH=170
+            chunk_size=64,    # Match C++ CHUNK_SIZE=64
+            border=16,        # Match C++ BORDER=16
+            cache_size=100    # Cache size (adjust as needed)
+        )
+        
+        # Set distance threshold for evaluation (match C++ dist_th=1.5)
+        self.dist_threshold = 1.5
         
         # Dict to store optimization variables
         self.variables: Dict[Tuple[int, int], 'th.Vector'] = {}
@@ -79,14 +148,18 @@ class SurfaceOptimizer:
         self.variable_registry = {}
         
         # Optimization parameters
-        self.max_iterations = 30  # Increase iterations for better convergence
-        self.step_size_opt = 0.05  # Reduce step size for more stable optimization
+        self.max_iterations = 50  # Default iterations for convergence
+        self.step_size_opt = 0.1  # Step size for optimization
         self.cost_weights = {
-            "space_loss": 1.0,  # Weight for image intensity alignment
-            "dist_loss": 1.0,   # Increase weight for distance to maintain proper spacing
-            "straight_loss": 0.8,  # Increase smoothness weight
-            "anchor_loss": 10.0  # Strong weight to keep points where they should be
+            "space_loss": 1.0,  # FIXED: C++ uses weight 1.0 for space_loss from gen_space_loss
+            "dist_loss": 1.0,   # Match C++ space_trace_dist_w (1.0)
+            "straight_loss": 0.7,  # Match C++ StraightLoss weight (0.7)
+            "anchor_loss": 0.0  # Zero out anchor loss (not used in C++ version)
         }
+        
+        # Enable detailed debug mode for this execution
+        self.detailed_debug = True
+        print(f"DEBUG OPTIMIZER INIT: Created SurfaceOptimizer with cost weights: {self.cost_weights}")
         
         # Boundary checking for volume extents
         self.volume_shape = None
@@ -156,17 +229,96 @@ class SurfaceOptimizer:
             y_val = torch.tensor([[float(point[1])]], dtype=torch.float32)
             x_val = torch.tensor([[float(point[2])]], dtype=torch.float32)
             
-            # Call evaluate_with_gradient with proper tensor inputs
-            value, gradient = self.interpolator.evaluate_with_gradient(z, y_val, x_val)
-            
-            # Convert the tensors to numpy arrays and extract the values
-            # FIXED: Ensure proper detachment before converting to numpy
-            value_np = float(value.detach().item())  # Detach before item() to avoid gradient issues
-            # Extract the first (and only) gradient in the batch
-            # Gradient has shape [batch, N, 3] so we need to get the first batch item
-            gradient_np = gradient[0, 0].detach().cpu().numpy()  # Explicitly detach gradient
-            
-            return value_np, gradient_np.astype(np.float32)  # Ensure consistent float32 dtype
+            try:
+                # Call evaluate_with_gradient with proper tensor inputs
+                value, gradient = self.interpolator.evaluate_with_gradient(z, y_val, x_val)
+                
+                # Convert the tensors to numpy arrays and extract the values
+                # FIXED: Ensure proper detachment before converting to numpy
+                value_np = float(value.detach().item())  # Detach before item() to avoid gradient issues
+                
+                # Safely extract gradient - handle different gradient tensor shapes
+                try:
+                    # Default case: Gradient has shape [batch, N, 3]
+                    if isinstance(gradient, torch.Tensor) and len(gradient.shape) >= 3 and gradient.shape[-1] == 3:
+                        # Extract the first (and only) gradient in the batch
+                        gradient_np = gradient[0, 0].detach().cpu().numpy()
+                    # Alternative case: Gradient has shape [batch, 3]
+                    elif isinstance(gradient, torch.Tensor) and len(gradient.shape) == 2 and gradient.shape[-1] == 3:
+                        gradient_np = gradient[0].detach().cpu().numpy()
+                    # Handle case where gradient is a scalar or has no shape
+                    elif not isinstance(gradient, torch.Tensor) or not hasattr(gradient, 'shape'):
+                        print(f"Warning: Gradient is not a tensor or has no shape attribute: type={type(gradient)}")
+                        gradient_np = np.zeros(3, dtype=np.float32)
+                    # Fallback: Reshape or create a default gradient
+                    else:
+                        print(f"Warning: Unexpected gradient shape {gradient.shape}, creating default gradient")
+                        gradient_np = np.zeros(3, dtype=np.float32)
+                except (IndexError, AttributeError, TypeError) as e:
+                    print(f"Warning: Could not process gradient properly: {e}")
+                    gradient_np = np.zeros(3, dtype=np.float32)
+                
+                # Extra safety check to ensure gradient is always a numpy array with shape (3,)
+                if not isinstance(gradient_np, np.ndarray):
+                    print(f"Warning: gradient_np is not an ndarray, creating zeros array")
+                    gradient_np = np.zeros(3, dtype=np.float32)
+                elif gradient_np.shape != (3,):
+                    print(f"Warning: Correcting gradient shape from {gradient_np.shape} to (3,)")
+                    # Try to reshape if possible, otherwise create zeros
+                    try:
+                        if gradient_np.size >= 3:
+                            gradient_np = gradient_np.flatten()[:3]
+                        else:
+                            gradient_np = np.zeros(3, dtype=np.float32)
+                    except:
+                        gradient_np = np.zeros(3, dtype=np.float32)
+                
+                # Final safety check to ensure dtype is float32
+                gradient_np = gradient_np.astype(np.float32)
+                
+            except Exception as e:
+                print(f"Error in evaluate_with_gradient: {e}")
+                # Fall back to separate evaluation and numerical gradient
+                try:
+                    # Evaluate value directly
+                    value = self.interpolator.evaluate(z, y_val, x_val)
+                    value_np = float(value.detach().item())
+                    
+                    # Create a default zero gradient
+                    gradient_np = np.zeros(3, dtype=np.float32)
+                    
+                    # Attempt to compute numerical gradient if possible
+                    epsilon = 0.1
+                    try:
+                        # Z direction
+                        z_plus = torch.tensor([[float(point[0] + epsilon)]], dtype=torch.float32)
+                        z_minus = torch.tensor([[float(point[0] - epsilon)]], dtype=torch.float32)
+                        val_z_plus = self.interpolator.evaluate(z_plus, y_val, x_val).item()
+                        val_z_minus = self.interpolator.evaluate(z_minus, y_val, x_val).item()
+                        gradient_np[0] = (val_z_plus - val_z_minus) / (2 * epsilon)
+                        
+                        # Y direction
+                        y_plus = torch.tensor([[float(point[1] + epsilon)]], dtype=torch.float32)
+                        y_minus = torch.tensor([[float(point[1] - epsilon)]], dtype=torch.float32)
+                        val_y_plus = self.interpolator.evaluate(z, y_plus, x_val).item()
+                        val_y_minus = self.interpolator.evaluate(z, y_minus, x_val).item()
+                        gradient_np[1] = (val_y_plus - val_y_minus) / (2 * epsilon)
+                        
+                        # X direction
+                        x_plus = torch.tensor([[float(point[2] + epsilon)]], dtype=torch.float32)
+                        x_minus = torch.tensor([[float(point[2] - epsilon)]], dtype=torch.float32)
+                        val_x_plus = self.interpolator.evaluate(z, y_val, x_plus).item()
+                        val_x_minus = self.interpolator.evaluate(z, y_val, x_minus).item()
+                        gradient_np[2] = (val_x_plus - val_x_minus) / (2 * epsilon)
+                    except Exception as e2:
+                        print(f"Failed to compute numerical gradient: {e2}")
+                        # Keep zero gradient
+                except Exception as e2:
+                    print(f"Failed to fall back to basic evaluation: {e2}")
+                    value_np = 0.0
+                    gradient_np = np.zeros(3, dtype=np.float32)
+                
+            return value_np, gradient_np  # Ensure consistent float32 dtype
         except Exception as e:
             print(f"Error sampling with gradient at {point}: {e}")
             return 0.0, np.zeros(3, dtype=np.float32)
@@ -183,50 +335,95 @@ class SurfaceOptimizer:
         # Use the persistent variable registry from the class
         # to ensure variables are shared across multiple optimization calls
         
-        # Helper function to get or create point variables - similar to the one in create_objective
+        # Helper function to get or create point variables - simplified for reliability
         def get_point_variable(y, x):
-            var_name = f"p_{y}_{x}"
-            if var_name not in self.variable_registry:
-                # Get the point position
-                point = self.grid.get_point(y, x).copy()
+            # Ensure y and x are converted to base Python types for string formatting
+            y_val = int(y)
+            x_val = int(x)
+            
+            # SIMPLIFIED APPROACH: Always use this naming format with unique session ID
+            # This guarantees no name conflicts between different optimization runs
+            unique_suffix = self.current_optimization_id
+            
+            # Create a simple and consistent naming scheme that is guaranteed to be unique
+            simple_name = f"p{y_val}_{x_val}_{unique_suffix}"
+            
+            print(f"DEBUG_VAR_INIT: Creating variable for point ({y_val},{x_val}) with name '{simple_name}'")
+            
+            # Check if variable already exists in registry for this exact session
+            if simple_name in self.variable_registry:
+                print(f"DEBUG_VAR_INIT: Variable '{simple_name}' found in this session's registry")
+                return self.variable_registry[simple_name]
                 
-                if not self.grid.is_valid(y, x):
-                    # For new points, initialize from neighbors
-                    valid_neighbors = []
-                    for dy, dx in self.grid.neighbors:
-                        ny, nx = y + dy, x + dx
-                        if self.grid.is_valid(ny, nx):
-                            valid_neighbors.append(self.grid.get_point(ny, nx))
+            # Variable doesn't exist, need to create it
+            # Get the point position
+            point = self.grid.get_point(y_val, x_val).copy()
+            
+            if not self.grid.is_valid(y_val, x_val):
+                # For new points, initialize from neighbors
+                valid_neighbors = []
+                for dy, dx in self.grid.neighbors:
+                    ny, nx = y_val + dy, x_val + dx
+                    if self.grid.is_valid(ny, nx):
+                        valid_neighbors.append(self.grid.get_point(ny, nx))
+                
+                if valid_neighbors:
+                    # Average of valid neighbors
+                    point = np.mean(valid_neighbors, axis=0)
+            
+            # Ensure correct shape
+            flat_point = point.flatten()[:3]  # Take first 3 elements in ZYX order
+            
+            # Log shape information
+            debug_print(f"OPTIMIZER_DEBUG: Creating variable {simple_name} from point {flat_point} (ZYX order)")
+            
+            # CRITICAL FIX: Convert from our ZYX ordering to Theseus XYZ ordering
+            # Since Theseus Point3 expects XYZ order, we need to swap coordinates
+            theseus_point = np.zeros(3, dtype=np.float32)
+            theseus_point[0] = flat_point[2]  # x = z
+            theseus_point[1] = flat_point[1]  # y = y
+            theseus_point[2] = flat_point[0]  # z = x
+            
+            debug_print(f"OPTIMIZER_DEBUG: Converted to Theseus format {theseus_point} (XYZ order)")
+            
+            # Convert to tensor properly, ensuring correct shape (batch_size, 3)
+            # IMPORTANT: Set requires_grad=True to enable gradient tracking
+            # Use tensor() with requires_grad=True, as this is more reliable than requires_grad_()
+            point_tensor = torch.tensor(theseus_point.reshape(1, 3), dtype=torch.float32, requires_grad=True)
+            
+            # Double-check that requires_grad is actually True
+            if not point_tensor.requires_grad:
+                print(f"WARNING: point_tensor.requires_grad is False even though we set it to True")
+                # Try an alternative approach to ensure gradient tracking
+                point_tensor = torch.tensor(theseus_point.reshape(1, 3), dtype=torch.float32).requires_grad_(True)
+            
+            print_debug(f"DEBUG: Tensor shape after creation: {point_tensor.shape}, requires_grad={point_tensor.requires_grad}")
+            
+            try:
+                # Create a new variable with the simple, unique name
+                var = th.Point3(tensor=point_tensor, name=simple_name)
+                print(f"DEBUG_VAR_INIT: Successfully created variable with name '{simple_name}'")
+                
+                # Register with unique name
+                self.variable_registry[simple_name] = var
+                self.variables[(y_val, x_val)] = var
+                return var
+                
+            except Exception as e:
+                print(f"ERROR: Failed to create variable with name '{simple_name}': {e}")
+                try:
+                    # Try with a truly basic fallback name that's still unique to this session
+                    fallback_name = f"var_{len(self.variable_registry)}_{unique_suffix}"
+                    print(f"DEBUG_VAR_INIT: Trying fallback name '{fallback_name}'")
+                    var = th.Point3(tensor=point_tensor, name=fallback_name)
                     
-                    if valid_neighbors:
-                        # Average of valid neighbors
-                        point = np.mean(valid_neighbors, axis=0)
-                
-                # Ensure correct shape
-                flat_point = point.flatten()[:3]  # Take first 3 elements
-                
-                # Log shape information
-                print_debug(f"DEBUG: Creating variable {var_name} from point {flat_point}")
-                
-                # Convert to tensor properly, ensuring correct shape (batch_size, 3)
-                # IMPORTANT: Set requires_grad=True to enable gradient tracking
-                # Use tensor() with requires_grad=True, as this is more reliable than requires_grad_()
-                point_tensor = torch.tensor(flat_point.reshape(1, 3), dtype=torch.float32, requires_grad=True)
-                
-                # Double-check that requires_grad is actually True
-                if not point_tensor.requires_grad:
-                    print(f"WARNING: point_tensor.requires_grad is False even though we set it to True")
-                    # Try an alternative approach to ensure gradient tracking
-                    point_tensor = torch.tensor(flat_point.reshape(1, 3), dtype=torch.float32).requires_grad_(True)
-                
-                print_debug(f"DEBUG: Tensor shape after creation: {point_tensor.shape}, requires_grad={point_tensor.requires_grad}")
-                
-                # Create a new variable if it doesn't exist
-                var = th.Point3(tensor=point_tensor, name=var_name)
-                # Register it
-                self.variable_registry[var_name] = var
-                self.variables[(y, x)] = var
-            return self.variable_registry[var_name]
+                    # Register with fallback name
+                    self.variable_registry[fallback_name] = var 
+                    self.variables[(y_val, x_val)] = var
+                    return var
+                except Exception as final_e:
+                    print(f"FATAL ERROR: Could not create variable under any name: {final_e}")
+                    raise
         
         # Determine which variables we need
         need_vars = set()
@@ -260,81 +457,148 @@ class SurfaceOptimizer:
         import theseus as th
         from cost_functions.base.anchor_loss import AnchorLoss
         
-        # First, let's create a fresh objective
-        objective = th.Objective()
+        # Convert all candidate points to ensure they're proper integer tuples
+        safe_candidates = []
+        for y, x in candidate_points:
+            y_val = int(y)
+            x_val = int(x)
+            safe_candidates = safe_candidates + [(y_val, x_val)]
+        candidate_points = safe_candidates  # Use the safe candidates instead
         
-        # Use the persistent variable registry from the class
-        # to ensure variables are shared across multiple optimization calls
+        # Create a custom objective that uses sqrt normalization to match C++
+        if hasattr(self, 'detailed_debug') and self.detailed_debug:
+            print(f"DEBUG CREATE OBJECTIVE: Creating SqrtNormObjective for {len(candidate_points)} candidate points: {candidate_points}")
+        objective = SqrtNormObjective()
+        
+        # FUNDAMENTAL FIX: Create a completely fresh variable registry and variable dict for each objective
+        # This is needed to avoid name conflicts - since we're creating one objective per call here
+        # Each candidate point goes in its own objective with no shared variables
+        self.variable_registry = {}
+        self.variables = {}
         variable_registry = self.variable_registry
         
         # Helper function to get or create point variables
         def get_point_variable(y, x):
-            var_name = f"p_{y}_{x}"
-            if var_name not in variable_registry:
-                # Get the point position
-                point = self.grid.get_point(y, x).copy()
-                print_debug(f"DEBUG: Initial point ({y},{x}): {point}")
+            # Ensure y and x are converted to base Python types for string formatting
+            y_val = int(y)
+            x_val = int(x)
+            
+            # CRITICAL FIX: Generate a completely unique name for EVERY variable instance
+            # Include the timestamp ID plus a random number to guarantee uniqueness
+            import random
+            random_suffix = random.randint(10000, 99999)
+            
+            # Create a variable name that is guaranteed to be unique
+            # This is essential to avoid any possible name conflicts
+            var_name = f"p{y_val}_{x_val}_{self.current_optimization_id}_{random_suffix}"
+            
+            print(f"DEBUG_VAR_CREATE: Creating new variable for point ({y_val},{x_val})")
+            print(f"DEBUG_VAR_CREATE: Unique variable name: '{var_name}'")
+            
+            # CRITICAL FIX: DO NOT check if variable exists - always create a new one
+            # This ensures each cost function gets its own unique variable instance
                 
-                # Reshape to ensure we have a flat 1D array of 3 elements
-                flat_point = point.flatten()[:3]  # Take first 3 elements in case of weird shapes
+            # Variable doesn't exist, need to create it
+            # Get the point position
+            point = self.grid.get_point(y_val, x_val).copy()
+            print_debug(f"DEBUG: Initial point ({y_val},{x_val}): {point}")
+            
+            # Reshape to ensure we have a flat 1D array of 3 elements
+            flat_point = point.flatten()[:3]  # Take first 3 elements in case of weird shapes
+            
+            # Ensure points are not negative and within volume bounds
+            if self.volume_shape is not None:
+                print_debug(f"DEBUG: Volume shape: {self.volume_shape}")
+                # Enforce minimum coordinate of 0.1 (slightly above 0)
+                original = flat_point.copy()
+                flat_point[0] = max(0.1, flat_point[0])
+                flat_point[1] = max(0.1, flat_point[1])
+                flat_point[2] = max(0.1, flat_point[2])
                 
-                # Ensure points are not negative and within volume bounds
-                if self.volume_shape is not None:
-                    print_debug(f"DEBUG: Volume shape: {self.volume_shape}")
-                    # Enforce minimum coordinate of 0.1 (slightly above 0)
-                    original = flat_point.copy()
-                    flat_point[0] = max(0.1, flat_point[0])
-                    flat_point[1] = max(0.1, flat_point[1])
-                    flat_point[2] = max(0.1, flat_point[2])
-                    
-                    # Ensure points are within volume bounds with margin
-                    if flat_point[0] >= self.volume_shape[0] - 1:
-                        flat_point[0] = self.volume_shape[0] - 1.1
-                    if flat_point[1] >= self.volume_shape[1] - 1:
-                        flat_point[1] = self.volume_shape[1] - 1.1
-                    if flat_point[2] >= self.volume_shape[2] - 1:
-                        flat_point[2] = self.volume_shape[2] - 1.1
-                    
-                    if not np.array_equal(original, flat_point):
-                        print_debug(f"DEBUG: Point adjusted from {original} to {flat_point}")
+                # Ensure points are within volume bounds with margin
+                if flat_point[0] >= self.volume_shape[0] - 1:
+                    flat_point[0] = self.volume_shape[0] - 1.1
+                if flat_point[1] >= self.volume_shape[1] - 1:
+                    flat_point[1] = self.volume_shape[1] - 1.1
+                if flat_point[2] >= self.volume_shape[2] - 1:
+                    flat_point[2] = self.volume_shape[2] - 1.1
                 
-                # Convert to tensor properly, ensuring correct shape (batch_size, 3)
-                # Make sure we're creating a new tensor with shape [1, 3]
-                # IMPORTANT: Set requires_grad=True to enable gradient tracking
-                point_tensor = torch.tensor(flat_point.reshape(1, 3), dtype=torch.float32, requires_grad=True)
+                if not np.array_equal(original, flat_point):
+                    print_debug(f"DEBUG: Point adjusted from {original} to {flat_point}")
+            
+            # CRITICAL FIX: Convert from our ZYX ordering to Theseus XYZ ordering
+            # For Point3 in Theseus, we need XYZ order
+            theseus_point = np.zeros(3, dtype=np.float32)
+            theseus_point[0] = flat_point[2]  # x = z
+            theseus_point[1] = flat_point[1]  # y = y
+            theseus_point[2] = flat_point[0]  # z = x
+            
+            debug_print(f"OPTIMIZER_DEBUG: Converted point {flat_point} (ZYX) to {theseus_point} (XYZ)")
+            
+            # Convert to tensor properly, ensuring correct shape (batch_size, 3)
+            # Make sure we're creating a new tensor with shape [1, 3]
+            # IMPORTANT: Set requires_grad=True to enable gradient tracking
+            point_tensor = torch.tensor(theseus_point.reshape(1, 3), dtype=torch.float32, requires_grad=True)
+            
+            # Double-check that requires_grad is actually True
+            if not point_tensor.requires_grad:
+                print(f"WARNING: point_tensor.requires_grad is False even though we set it to True")
+                # Try an alternative approach to ensure gradient tracking
+                point_tensor = torch.tensor(flat_point.reshape(1, 3), dtype=torch.float32).requires_grad_(True)
                 
-                # Double-check that requires_grad is actually True
+                # If still not working, try another approach
                 if not point_tensor.requires_grad:
-                    print(f"WARNING: point_tensor.requires_grad is False even though we set it to True")
-                    # Try an alternative approach to ensure gradient tracking
-                    point_tensor = torch.tensor(flat_point.reshape(1, 3), dtype=torch.float32).requires_grad_(True)
-                    
-                    # If still not working, try another approach
-                    if not point_tensor.requires_grad:
-                        print(f"WARNING: Second attempt failed, trying with clone()")
-                        raw_tensor = torch.tensor(flat_point.reshape(1, 3), dtype=torch.float32)
-                        point_tensor = raw_tensor.clone().detach().requires_grad_(True)
-                
-                print_debug(f"DEBUG: Created tensor with shape {point_tensor.shape}, requires_grad={point_tensor.requires_grad}")
-                
-                # Ensure point tensor has the correct shape [batch_size, 3]
-                if len(point_tensor.shape) > 2:
-                    # Reshape tensor if it has extra dimensions
-                    batch_size = point_tensor.shape[0]
-                    point_tensor = point_tensor.reshape(batch_size, 3)
-                
-                # Create a new variable if it doesn't exist
+                    print(f"WARNING: Second attempt failed, trying with clone()")
+                    raw_tensor = torch.tensor(flat_point.reshape(1, 3), dtype=torch.float32)
+                    point_tensor = raw_tensor.clone().detach().requires_grad_(True)
+            
+            print_debug(f"DEBUG: Created tensor with shape {point_tensor.shape}, requires_grad={point_tensor.requires_grad}")
+            
+            # Ensure point tensor has the correct shape [batch_size, 3]
+            if len(point_tensor.shape) > 2:
+                # Reshape tensor if it has extra dimensions
+                batch_size = point_tensor.shape[0]
+                point_tensor = point_tensor.reshape(batch_size, 3)
+            
+            # Create a single variable with a guaranteed unique name
+            try:
+                # Create the variable with our unique name
                 var = th.Point3(tensor=point_tensor, name=var_name)
-                # Register it
+                
+                # Register the variable in our registries
                 variable_registry[var_name] = var
-                self.variables[(y, x)] = var
-            return variable_registry[var_name]
+                self.variables[(y_val, x_val)] = var
+                print(f"DEBUG_VAR_CREATE: Variable created and registered with name '{var_name}'")
+                return var
+                
+            except Exception as e:
+                print(f"ERROR: Failed to create variable with name '{var_name}': {e}")
+                try:
+                    # If there's an error, try with an even simpler fallback name
+                    import random
+                    fallback_name = f"var_{len(variable_registry)}_{random.randint(10000, 99999)}"
+                    print(f"DEBUG_VAR_CREATE: Trying fallback name '{fallback_name}'")
+                    var = th.Point3(tensor=point_tensor, name=fallback_name)
+                    
+                    # Register the variable
+                    variable_registry[fallback_name] = var 
+                    self.variables[(y_val, x_val)] = var
+                    return var
+                except Exception as final_e:
+                    print(f"FATAL ERROR: Could not create variable: {final_e}")
+                    raise
         
         # Create shared cost weights
         space_weight = th.ScaleCostWeight(self.cost_weights["space_loss"])
         dist_weight = th.ScaleCostWeight(self.cost_weights["dist_loss"])
         straight_weight = th.ScaleCostWeight(self.cost_weights["straight_loss"])
         anchor_weight = th.ScaleCostWeight(self.cost_weights["anchor_loss"])
+        
+        if hasattr(self, 'detailed_debug') and self.detailed_debug:
+            print(f"DEBUG COST WEIGHTS: space={self.cost_weights['space_loss']}, "
+                  f"dist={self.cost_weights['dist_loss']}, "
+                  f"straight={self.cost_weights['straight_loss']}, "
+                  f"anchor={self.cost_weights['anchor_loss']}")
         
         # Create a set of all variables we need
         all_vars = set()
@@ -355,45 +619,86 @@ class SurfaceOptimizer:
         for y, x in candidate_points:
             var = get_point_variable(y, x)
             if self.cost_weights["space_loss"] > 0:
-                # Add space loss for this point
-                cf = SpaceLossAcc(
-                    point=var, 
-                    interpolator=self.interpolator,
-                    cost_weight=space_weight,
-                    maximize=True,
-                    name=f"space_loss_{y}_{x}"
-                )
-                objective.add(cf)
+                # CRITICAL FIX: Check the variable to ensure it's a proper Theseus variable
+                if not hasattr(var, 'tensor'):
+                    print(f"ERROR: Variable has no tensor attribute! Type: {type(var)}")
+                    if isinstance(var, str):
+                        print(f"ERROR: Variable is a string '{var}' not a Theseus variable!")
+                        raise ValueError(f"Cannot create cost function with string variable: {var}")
+                    else:
+                        print(f"ERROR: Unknown variable type: {type(var)}")
+                        raise ValueError(f"Cannot create cost function with invalid variable type: {type(var)}")
+                
+                # Generate a unique name for the cost function
+                import random
+                unique_cf_name = f"space_loss_{y}_{x}_{random.randint(10000, 99999)}"
+                
+                try:
+                    # Add space loss for this point
+                    cf = SpaceLossAcc(
+                        point=var, 
+                        interpolator=self.interpolator,
+                        cost_weight=space_weight,
+                        maximize=True,
+                        name=unique_cf_name
+                    )
+                    objective.add(cf)
+                    print(f"DEBUG: Successfully added SpaceLossAcc with unique name: {unique_cf_name}")
+                except Exception as e:
+                    print(f"ERROR: Failed to create SpaceLossAcc: {e}")
+                    print(f"ERROR: Variable type: {type(var)}")
+                    if hasattr(var, 'tensor'):
+                        print(f"ERROR: Tensor shape: {var.tensor.shape}")
+                    raise
                 
                 # Add AnchorLoss to enhance stability
                 if self.cost_weights["anchor_loss"] > 0:
-                    # Create an anchor point variable for this point
-                    # Use the same initial position as the point itself
-                    anchor_var_name = f"anchor_{y}_{x}"
-                    if anchor_var_name not in variable_registry:
-                        # Create a copy of the point tensor for the anchor
-                        # Ensure the tensor has the shape [batch_size, 3]
-                        # IMPORTANT: We need to ensure the anchor tensor also has requires_grad=True
-                        anchor_tensor = var.tensor.clone().detach().requires_grad_(True)
-                        print_debug(f"DEBUG: Creating anchor variable {anchor_var_name} from tensor with shape {anchor_tensor.shape}, requires_grad={anchor_tensor.requires_grad}")
-                        
-                        # Ensure anchor tensor has shape [batch_size, 3]
-                        if len(anchor_tensor.shape) > 2:
-                            # Log original shape
-                            print_debug(f"DEBUG: Anchor tensor has too many dimensions: {anchor_tensor.shape}")
-                            
-                            # Reshape tensor if it has extra dimensions
-                            batch_size = anchor_tensor.shape[0]
-                            anchor_tensor = anchor_tensor.reshape(batch_size, 3)
-                            print_debug(f"DEBUG: Reshaped anchor tensor to {anchor_tensor.shape}")
-                            
-                        anchor_var = th.Point3(tensor=anchor_tensor, name=anchor_var_name)
-                        variable_registry[anchor_var_name] = anchor_var
-                    else:
-                        anchor_var = variable_registry[anchor_var_name]
+                    # CRITICAL FIX: Make sure var is a valid Theseus variable
+                    if not hasattr(var, 'tensor'):
+                        print(f"ERROR: Variable has no tensor attribute! Type: {type(var)}")
+                        continue  # Skip anchor loss if the variable isn't valid
                     
-                    # Add more tensor shape validation before creating AnchorLoss
-                    print_debug(f"DEBUG: Adding AnchorLoss for point ({y},{x})")
+                    # Create an anchor point variable for this point with unique name
+                    # Generate a random suffix to guarantee uniqueness
+                    import random
+                    y_val = int(y)
+                    x_val = int(x)
+                    random_suffix = random.randint(10000, 99999)
+                    unique_anchor_name = f"anchor{y_val}_{x_val}_{self.current_optimization_id}_{random_suffix}"
+                    
+                    # Create a copy of the point tensor for the anchor
+                    # Ensure the tensor has the shape [batch_size, 3]
+                    # IMPORTANT: We need to ensure the anchor tensor also has requires_grad=True
+                    anchor_tensor = var.tensor.clone().detach().requires_grad_(True)
+                    print(f"DEBUG: Creating anchor variable '{unique_anchor_name}' from tensor with shape {anchor_tensor.shape}, requires_grad={anchor_tensor.requires_grad}")
+                    
+                    # Ensure anchor tensor has shape [batch_size, 3]
+                    if len(anchor_tensor.shape) > 2:
+                        # Log original shape
+                        print(f"DEBUG: Anchor tensor has too many dimensions: {anchor_tensor.shape}")
+                        
+                        # Reshape tensor if it has extra dimensions
+                        batch_size = anchor_tensor.shape[0]
+                        anchor_tensor = anchor_tensor.reshape(batch_size, 3)
+                        print(f"DEBUG: Reshaped anchor tensor to {anchor_tensor.shape}")
+                            
+                        # Create a Theseus variable from the anchor tensor
+                        print(f"DEBUG: Creating anchor variable with unique name: '{unique_anchor_name}'")
+                        anchor_var = th.Point3(tensor=anchor_tensor, name=unique_anchor_name)
+                        
+                        # Store in registry with the unique name
+                        variable_registry[unique_anchor_name] = anchor_var
+                    # Create the anchor variable if not done above 
+                    if not 'anchor_var' in locals():
+                        # Create a Theseus variable from the anchor tensor
+                        print(f"DEBUG: Creating anchor variable with unique name: '{unique_anchor_name}'")
+                        anchor_var = th.Point3(tensor=anchor_tensor, name=unique_anchor_name)
+                        
+                        # Store in registry with the unique name
+                        variable_registry[unique_anchor_name] = anchor_var
+                    
+                    # Add more debug for creating AnchorLoss
+                    print(f"DEBUG: Adding AnchorLoss for point ({y},{x})")
                     print_debug(f"DEBUG: Point tensor shape before AnchorLoss: {var.tensor.shape}")
                     print_debug(f"DEBUG: Anchor tensor shape before AnchorLoss: {anchor_var.tensor.shape}")
                     
@@ -412,22 +717,40 @@ class SurfaceOptimizer:
                         else:
                             raise ValueError(f"Cannot reshape anchor tensor with shape {anchor_var.tensor.shape} to [batch_size, 3]")
                     
-                    # Create and add the anchor loss
+                    # Create a unique name for the AnchorLoss cost function
+                    import random
+                    anchor_cf_name = f"anchor_loss_{y}_{x}_{random.randint(10000, 99999)}"
+                    
+                    # Create and add the anchor loss with detailed error checking
                     try:
+                        # Make sure both variables have the .tensor attribute
+                        if not hasattr(var, 'tensor'):
+                            print(f"ERROR: Point variable has no tensor attribute!")
+                            continue
+                            
+                        if not hasattr(anchor_var, 'tensor'):
+                            print(f"ERROR: Anchor variable has no tensor attribute!")
+                            continue
+
+                        # Create the anchor loss with our unique name
                         anchor_cf = AnchorLoss(
                             point=var,
                             anchor_point=anchor_var,
                             interpolator=self.interpolator,
                             cost_weight=anchor_weight,
-                            name=f"anchor_loss_{y}_{x}"
+                            name=anchor_cf_name
                         )
                         objective.add(anchor_cf)
-                        print_debug(f"DEBUG: Successfully added AnchorLoss for point ({y},{x})")
+                        print(f"DEBUG: Successfully added AnchorLoss with name '{anchor_cf_name}' for point ({y},{x})")
                     except Exception as e:
                         print(f"ERROR: Failed adding AnchorLoss for point ({y},{x}): {e}")
-                        print(f"ERROR: Point tensor shape: {var.tensor.shape}, Anchor tensor shape: {anchor_var.tensor.shape}")
-                        # Re-raise the exception to properly handle the error
-                        raise
+                        print(f"ERROR: Point type: {type(var)}, Anchor type: {type(anchor_var)}")
+                        if hasattr(var, 'tensor'):
+                            print(f"ERROR: Point tensor shape: {var.tensor.shape}")
+                        if hasattr(anchor_var, 'tensor'):
+                            print(f"ERROR: Anchor tensor shape: {anchor_var.tensor.shape}")
+                        # Continue without re-raising to allow other cost functions to be added
+                        continue
         
         # Step 2: Add distance constraints between points - this helps maintain proper spacing
         if self.cost_weights["dist_loss"] > 0:
@@ -505,9 +828,17 @@ class SurfaceOptimizer:
             max_iterations: Maximum number of iterations (default: self.max_iterations)
         """
         # Store candidate_points in a class variable so it's available in exception handlers
-        self.current_candidates = candidate_points
+        self.current_candidates = [tuple(map(int, point)) for point in candidate_points]
         
-        debug_print(f"OPTIMIZER_DEBUG: Starting optimize_points with {len(candidate_points)} candidate points: {candidate_points}")
+        # Convert all candidate points to ensure they're proper integer tuples
+        # This helps avoid subtle type issues with formatting in variable names
+        safe_candidates = []
+        for y, x in candidate_points:
+            y_val = int(y)
+            x_val = int(x)
+            safe_candidates.append((y_val, x_val))
+        
+        debug_print(f"OPTIMIZER_DEBUG: Starting optimize_points with {len(safe_candidates)} candidate points: {safe_candidates}")
         import logging
         logger = logging.getLogger(__name__)
         
@@ -515,18 +846,33 @@ class SurfaceOptimizer:
             max_iterations = self.max_iterations
         
         # Pre-optimize candidate points using volume gradients for better initialization
-        self._pre_optimize_using_gradient(candidate_points)
+        self._pre_optimize_using_gradient(safe_candidates)
         
-        # FIXED: Clear the variable registry for each optimization to avoid conflicts
-        # The variable registry is causing "Two different variable objects with the same name" errors
+        # CRITICAL FIX: Always completely clear the variable registry for each optimization run
+        # This is essential to avoid "Two different variable objects with the same name" errors
         self.variable_registry = {}
         self.variables = {}
+        
+        # Generate a fresh unique session ID for EVERY optimization run
+        # This ensures all variables created in this specific run have globally unique names
+        import time
+        import random
+        self.current_optimization_id = f"{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+        print(f"OPTIMIZER_DEBUG: Generated new session ID {self.current_optimization_id} for optimization run")
+        
         debug_print("OPTIMIZER_DEBUG: Cleared variable registry to prevent name conflicts")
+        
+        # Perform a pre-check on variable naming to catch issues early
+        for y, x in safe_candidates:
+            var_name = f"p_{y}_{x}"
+            safe_name = str(var_name)
+            print(f"OPTIMIZER_DEBUG: Will create variable '{safe_name}' for point ({y},{x})")
         
         try:
             # Create objective - this initializes variables internally
-            debug_print(f"OPTIMIZER_DEBUG: Creating objective for candidates: {candidate_points}")
-            objective = self.create_objective(candidate_points)
+            debug_print(f"OPTIMIZER_DEBUG: Creating objective for candidates: {safe_candidates}")
+            # Use the safe_candidates with proper integer types instead of the original candidates
+            objective = self.create_objective(safe_candidates)
             debug_print(f"OPTIMIZER_DEBUG: Objective created with {len(objective.optim_vars)} optimization variables")
             
             # Create optimizer with CholmodSparseSolver instead of default DenseCholesky
@@ -534,10 +880,11 @@ class SurfaceOptimizer:
             optimizer = th.LevenbergMarquardt(
                 objective=objective,
                 linear_solver_cls=th.CholmodSparseSolver,  # Use Cholmod sparse solver
-                max_iterations=max_iterations,
-                step_size=self.step_size_opt,
-                damping=100.0,  # Very high damping for tests to ensure numeric stability
-                verbose=False
+                max_iterations=200,  # Match C++ inner optimization iterations (line 1082 in SurfaceHelpers.cpp)
+                step_size=1.0,  # Standard step size
+                damping=1.0,  # Reduced damping to match C++ implementation approach
+                function_tolerance=1e-3,  # Match C++ options.function_tolerance (line 1083)
+                verbose=True  # Enable verbose output to see optimization progress
             )
             
             # Create Theseus layer - as recommended in examples
@@ -565,6 +912,9 @@ class SurfaceOptimizer:
             
             # Run optimization with error handling
             success = True
+            # Initialize final_values and info to avoid reference before assignment errors
+            final_values = {}
+            info = None
             try:
                 # Print all input tensor shapes for debugging
                 debug_print(f"OPTIMIZER_DEBUG: Running optimization for {len(candidate_points)} candidates")
@@ -665,14 +1015,61 @@ class SurfaceOptimizer:
                             if not tensor.requires_grad:
                                 raise ValueError(f"Point variable {name} still doesn't have requires_grad=True after fixing!")
 
+                    # DEBUGGING: Print each cost function type in the objective
+                    if hasattr(self, 'detailed_debug') and self.detailed_debug:
+                        print("DEBUG OPTIMIZER FUNCTIONS:")
+                        for i, cf in enumerate(objective.cost_functions):
+                            print(f"  Cost function {i}: {cf.__class__.__name__} - {cf.name}")
+                            if hasattr(cf, "optim_vars"):
+                                # DEBUG: Check each optim_var and print its type to find the str issue
+                                print(f"    Optimization variables count: {len(cf.optim_vars)}")
+                                for j, var in enumerate(cf.optim_vars):
+                                    print(f"      Var {j} type: {type(var)}")
+                                    if isinstance(var, str):
+                                        print(f"      WARNING: Found string variable instead of tensor: '{var}'")
+                                    elif hasattr(var, 'name'):
+                                        print(f"      Var name: {var.name}")
+                                    else:
+                                        print(f"      Variable has no name attribute")
+                            print(f"    Cost weight: {cf.weight.__class__.__name__}")
+
                     # Now run the optimization - NO torch.no_grad() context manager
-                    debug_print("OPTIMIZER_DEBUG: Running forward pass with gradient tracking enabled")
-                    final_values, info = layer.forward(
-                        inputs,
-                        optimizer_kwargs={"track_best_solution": True}
-                    )
-                    debug_print("OPTIMIZER_DEBUG: Forward pass completed successfully")
-                    debug_print("OPTIMIZER_DEBUG: Optimization completed successfully")
+                    print("OPTIMIZER RUN: Running TheseusLayer.forward() with gradient tracking enabled")
+                    try:
+                        final_values, info = layer.forward(
+                            inputs,
+                            optimizer_kwargs={"track_best_solution": True}
+                        )
+                        print("OPTIMIZER SUCCESS: Forward pass completed successfully")
+                        
+                        # Print optimization results summary
+                        status = info.status[0] if hasattr(info, 'status') and len(info.status) > 0 else "Unknown"
+                        print(f"OPTIMIZER STATUS: {status}")
+                        
+                        if hasattr(objective, 'error_metric') and objective.error_metric() is not None:
+                            err_val = objective.error_metric()
+                            print(f"OPTIMIZER ERROR: Final error metric = {err_val}")
+                        
+                        debug_print("OPTIMIZER_DEBUG: Optimization completed successfully")
+                        
+                        # Print detailed information about the final values
+                        debug_print(f"OPTIMIZER_DEBUG: Final values contain {len(final_values)} variables")
+                        for name, tensor in final_values.items():
+                            debug_print(f"OPTIMIZER_DEBUG: Final value '{name}' has shape {tensor.shape}")
+                            
+                        # Verify the optimization actually moved points
+                        for name, tensor in final_values.items():
+                            if name in inputs and torch.allclose(inputs[name], tensor):
+                                debug_print(f"OPTIMIZER_DEBUG: WARNING - Variable {name} didn't move during optimization!")
+                    except Exception as e:
+                        logger.error(f"Optimization forward pass failed: {e}")
+                        # Create fallback values if forward fails entirely
+                        debug_print(f"OPTIMIZER_DEBUG: Creating fallback values due to forward pass failure")
+                        final_values = {}
+                        for name, tensor in inputs.items():
+                            final_values[name] = tensor  # Use original inputs as fallback
+                        info = None
+                        success = False
                 except RuntimeError as e:
                     # Handle potential dimension mismatch errors from Theseus
                     error_str = str(e)
@@ -776,6 +1173,31 @@ class SurfaceOptimizer:
                     # FIXED: Ensure proper detachment of tensors
                     optimized_point = final_values[var.name].detach().cpu().numpy()
                     
+                    # IMPORTANT: Add logging to show original values - use direct print for reliability
+                    original_point = self.grid.get_point(y, x).copy()
+                    print(f"DIRECT DEBUG: Point ({y},{x}) original position: {original_point}")
+                    print(f"DIRECT DEBUG: Point ({y},{x}) optimized position from Theseus (XYZ format): {optimized_point[0]}")
+                    print(f"DIRECT DEBUG: Variable tensor shape: {final_values[var.name].shape}")
+                    
+                    # Print a sample of what's in final_values to understand structure
+                    if (y,x) == next(iter(candidate_points)):  # Only for first point
+                        print(f"DIRECT DEBUG: Sample of final_values keys: {list(final_values.keys())[:5]}")
+                        print(f"DIRECT DEBUG: Original input shape for {var.name}: {inputs[var.name].shape if var.name in inputs else 'Not in inputs'}")
+                    
+                    # CRITICAL FIX: Convert from Theseus XYZ ordering to our ZYX ordering
+                    # Theseus uses th.Point3 with XYZ order, but our grid uses ZYX order
+                    # So we need to swap coordinates from tensor[0]=x, tensor[1]=y, tensor[2]=z to our z,y,x
+                    optimized_point_zyx = optimized_point.copy()
+                    # Swap coordinates: X from Theseus becomes Z for us (index 0)
+                    # Swap coordinates: Z from Theseus becomes X for us (index 2)
+                    optimized_point_zyx[0, 0] = optimized_point[0, 2]  # z = theseus.z
+                    optimized_point_zyx[0, 1] = optimized_point[0, 1]  # y = theseus.y
+                    optimized_point_zyx[0, 2] = optimized_point[0, 0]  # x = theseus.x
+                    
+                    # Use the properly ordered point
+                    optimized_point = optimized_point_zyx
+                    print(f"DIRECT DEBUG: Point ({y},{x}) converted position (ZYX format): {optimized_point[0]}")
+                    
                     # Apply post-optimization bounds checking
                     if self.volume_shape is not None:
                         # Ensure points are positive and in bounds
@@ -783,9 +1205,29 @@ class SurfaceOptimizer:
                         optimized_point[0, 1] = max(0.1, min(self.volume_shape[1] - 1.1, optimized_point[0, 1]))
                         optimized_point[0, 2] = max(0.1, min(self.volume_shape[2] - 1.1, optimized_point[0, 2]))
                     
-                    # Add debug info about the optimized point
-                    debug_print(f"OPTIMIZER_DEBUG: Updated point ({y},{x}) to position {optimized_point[0]}")
+                    # Calculate position delta for debugging
+                    delta = optimized_point[0] - original_point
+                    delta_norm = np.linalg.norm(delta)
                     
+                    # Compare input and output tensors for this variable
+                    if var.name in inputs:
+                        input_tensor = inputs[var.name]
+                        output_tensor = final_values[var.name]
+                        tensor_diff = output_tensor - input_tensor
+                        tensor_diff_norm = torch.norm(tensor_diff).item()
+                        print(f"DIRECT DEBUG: Variable {var.name} tensor changed by {tensor_diff_norm:.6f}")
+                        print(f"DIRECT DEBUG: Input tensor: {input_tensor.detach().cpu().numpy()[0]}")
+                        print(f"DIRECT DEBUG: Output tensor: {output_tensor.detach().cpu().numpy()[0]}")
+                    
+                    # Add debug info about the optimized point - use direct print
+                    print(f"DIRECT DEBUG: Updated point ({y},{x}) to position {optimized_point[0]}")
+                    print(f"DIRECT DEBUG: Point ({y},{x}) position delta: {delta}, magnitude: {delta_norm:.6f}")
+                    
+                    # IMPORTANT: Verify whether the position actually changed after coordinate conversion
+                    if delta_norm < 1e-5:
+                        print(f"DIRECT DEBUG: WARNING - Point ({y},{x}) didn't move after optimization!")
+                    
+                    # Apply the update
                     self.grid.set_point(y, x, optimized_point)
                     
                     # Mark as valid if optimization succeeded
@@ -811,6 +1253,71 @@ class SurfaceOptimizer:
             self.grid.generation_max_cost.append(-1.0)
             self.grid.generation_avg_cost.append(-1.0)
             
+    def optimize_point(self, y: int, x: int) -> float:
+        """
+        Optimize a single point and return its loss value.
+        
+        This is a convenience wrapper around optimize_points for single point optimization.
+        
+        Args:
+            y: Y coordinate of the point to optimize
+            x: X coordinate of the point to optimize
+            
+        Returns:
+            The final loss value after optimization
+        """
+        try:
+            import logging
+            logger = logging.getLogger(__name__)
+            
+            # We need a unique session ID for this optimization
+            import time
+            import random
+            
+            # Set the session ID on the optimizer instance for this run
+            # This ensures all variables created will use this same ID
+            self.current_optimization_id = f"{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+            
+            # ESSENTIAL: Clear the variable registry before optimization to avoid conflicts
+            # This ensures a clean slate for each optimization run
+            self.variable_registry = {}
+            self.variables = {}
+            
+            print(f"OPTIMIZE_POINT: Starting optimization for point ({y},{x}) with ID {self.current_optimization_id}")
+            
+            # Create a consistent variable naming format using the new ID
+            expected_var_name = f"p{y}_{x}_{self.current_optimization_id}"
+            print(f"OPTIMIZE_POINT: Will create variable with name '{expected_var_name}'")
+            
+            try:
+                # Note: We've already set the current_optimization_id above, no need to do it again
+                
+                # Call optimize_points with the single point to optimize
+                # The integer conversion is done inside optimize_points
+                self.optimize_points([(y, x)])
+                print(f"OPTIMIZE_POINT: Successfully completed optimization for point ({y},{x})")
+                
+            except Exception as e:
+                logger.error(f"Failed to optimize point ({y},{x}): {e}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                return 100.0  # Return high loss value on failure
+            finally:
+                # Always clean up the ID after optimization, even if there was an error
+                if hasattr(self, 'current_optimization_id'):
+                    delattr(self, 'current_optimization_id')
+            
+            # Get the loss from the optimization
+            loss = self.get_last_loss()
+            print(f"OPTIMIZE_POINT: Loss for point ({y},{x}): {loss}")
+            return loss
+            
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Optimization failed with error: {e}")
+            return 100.0  # High but not infinite
+    
     def get_last_loss(self) -> float:
         """
         Get the last optimization loss value.
@@ -831,13 +1338,13 @@ class SurfaceOptimizer:
     
     def sample_volume_at_point_3d(self, point: np.ndarray) -> float:
         """
-        Sample the volume at a 3D point.
+        Sample the raw volume at a 3D point.
         
         Args:
             point: 3D point coordinates in ZYX order
             
         Returns:
-            The interpolated value at the point (0.0 if out of bounds)
+            The interpolated intensity value at the point (0.0 if out of bounds)
         """
         try:
             # Check for valid point coordinates
@@ -862,11 +1369,44 @@ class SurfaceOptimizer:
             # FIXED: Ensure tensor is detached before calling item()
             result = float(value.detach().item())  # Detach before calling item() to avoid gradient issues
             
-            print_debug(f"DEBUG: Sampled value {result} at point {point}")
+            print_debug(f"DEBUG: Sampled raw volume value {result} at point {point}")
             return result
         except Exception as e:
             print(f"ERROR: Error sampling at 3D point {point}: {e}")
             return 0.0
+            
+    def sample_distance_at_point_3d(self, point: np.ndarray) -> float:
+        """
+        Sample the distance transform at a 3D point.
+        
+        Args:
+            point: 3D point coordinates in ZYX order
+            
+        Returns:
+            The distance value at the point (0.0 for object voxels, >0 for background)
+        """
+        try:
+            # Check for valid point coordinates
+            if np.any(np.isnan(point)) or np.any(np.isinf(point)):
+                print(f"WARNING: Invalid coordinates in point for distance sampling: {point}")
+                return float('inf')
+                
+            # Check if point is within volume bounds
+            if self.volume_shape is not None:
+                for i, coord in enumerate(point):
+                    if coord < 0 or coord >= self.volume_shape[i] - 1:
+                        print(f"WARNING: Point {point} is out of volume bounds {self.volume_shape}")
+                        return float('inf')
+            
+            # Sample from distance transform interpolator
+            z, y, x = point
+            dist_value = self.dist_interpolator.sample(z, y, x)
+            
+            print_debug(f"DEBUG: Sampled distance value {dist_value} at point {point}")
+            return dist_value
+        except Exception as e:
+            print(f"ERROR: Error sampling distance at 3D point {point}: {e}")
+            return float('inf')
     
     def _pre_optimize_using_gradient(self, candidate_points: List[Tuple[int, int]]):
         """
@@ -909,17 +1449,36 @@ class SurfaceOptimizer:
                 outward_vector = outward_vector / np.linalg.norm(outward_vector)
             
             # Sample volume with gradient for intensity guidance
-            value, gradient = self.sample_volume_with_gradient(y, x)
-            
-            # Combine gradient direction and outward direction
-            # Start with more outward bias for points near center
-            if outward_dist < self.step_size * 4:
-                # For points very near center, use mostly outward direction
-                # with just a small influence from gradient
-                combined_vector = outward_vector * 0.8 + gradient * 0.2
-            else:
-                # For points already away from center, balance gradient and outward
-                combined_vector = outward_vector * 0.4 + gradient * 0.6
+            try:
+                value, gradient = self.sample_volume_with_gradient(y, x)
+                
+                # Ensure gradient is a proper numpy array
+                if not isinstance(gradient, np.ndarray):
+                    print(f"Error using gradient for initialization: gradient is {type(gradient)}, not ndarray")
+                    gradient = np.zeros(3, dtype=np.float32)  # Default to zero gradient
+                
+                # Handle case where gradient doesn't have a shape attribute (scalar float)
+                # This can happen with certain volume types or when interpolation returns a float
+                try:
+                    grad_shape = gradient.shape
+                except AttributeError:
+                    print(f"Warning: gradient is a scalar value without shape attribute. Creating zero gradient.")
+                    gradient = np.zeros(3, dtype=np.float32)
+                
+                # Combine gradient direction and outward direction
+                # Start with more outward bias for points near center
+                if outward_dist < self.step_size * 4:
+                    # For points very near center, use mostly outward direction
+                    # with just a small influence from gradient
+                    combined_vector = outward_vector * 0.8 + gradient * 0.2
+                else:
+                    # For points already away from center, balance gradient and outward
+                    combined_vector = outward_vector * 0.4 + gradient * 0.6
+                    
+            except Exception as e:
+                print(f"Error using gradient for initialization: {e}")
+                # Fall back to using only outward direction
+                combined_vector = outward_vector
                 
             # Normalize the combined vector
             combined_norm = np.linalg.norm(combined_vector)

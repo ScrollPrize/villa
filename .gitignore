@@ -3,3 +3,5 @@
 *.pyc
 *.tif
 node_modules/.yarn-integrity
+/segmentation/tracer/tests/volumes/s5_059_region_7300_3030_4555.zarr
+/segmentation/tracer/tests/volumes

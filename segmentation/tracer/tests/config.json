@@ -1,0 +1,11 @@
+{
+    "cache_size": 4294967296,
+    "mode": "explicit_seed",
+    "step_size": 10.0,
+    "min_area_cm": 0.05,
+    "tgt_overlap_count": 20,
+    "search_effort": 10,
+    "generations": 150,
+    "thread_limit": 16,
+    "cache_root": "/tmp/vc_cache"
+}

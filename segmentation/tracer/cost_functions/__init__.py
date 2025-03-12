@@ -1,15 +1,69 @@
 """Cost functions for volume cartographer tracer."""
 
-from .anchor_loss import AnchorLoss
-from .dist_loss import DistLoss
-from .dist_loss_2d import DistLoss2D
-from .lin_chk_dist_loss import LinChkDistLoss
-from .space_line_loss_acc import SpaceLineLossAcc
-from .space_loss_acc import SpaceLossAcc
-from .straight_loss import StraightLoss
-from .straight_loss_2 import StraightLoss2
-from .straight_loss_2d import StraightLoss2D
-from .surface_loss_d import SurfaceLossD
-from .trilinear_interpolator import TrilinearInterpolator
-from .z_coord_loss import ZCoordLoss
-from .z_location_loss import ZLocationLoss
+# Import all cost functions from base implementations
+from .base import (
+    AnchorLoss,
+    DistLoss,
+    DistLoss2D,
+    LinChkDistLoss,
+    SpaceLineLossAcc,
+    SpaceLossAcc,
+    StraightLoss,
+    StraightLoss2,
+    StraightLoss2D,
+    SurfaceLossD,
+    ZCoordLoss,
+    ZLocationLoss,
+)
+
+# Import all cost functions from autodiff implementations
+from .autodiff import (
+    AnchorLossAutoDiff,
+    DistLossAutoDiff,
+    DistLoss2DAutoDiff,
+    LinChkDistLossAutoDiff,
+    SpaceLineLossAccAutoDiff,
+    SpaceLossAccAutoDiff,
+    StraightLossAutoDiff,
+    StraightLoss2AutoDiff,
+    ZCoordLossAutoDiff,
+    ZLocationLossAutoDiff,
+)
+
+# Import interpolators from core
+from tracer.core.interpolation import (
+    TrilinearInterpolator,
+    TrilinearInterpolatorAutoDiff
+)
+
+__all__ = [
+    # Base implementations
+    "AnchorLoss",
+    "DistLoss",
+    "DistLoss2D",
+    "LinChkDistLoss",
+    "SpaceLineLossAcc",
+    "SpaceLossAcc",
+    "StraightLoss",
+    "StraightLoss2",
+    "StraightLoss2D",
+    "SurfaceLossD",
+    "ZCoordLoss",
+    "ZLocationLoss",
+    
+    # AutoDiff implementations
+    "AnchorLossAutoDiff",
+    "DistLossAutoDiff",
+    "DistLoss2DAutoDiff",
+    "LinChkDistLossAutoDiff",
+    "SpaceLineLossAccAutoDiff",
+    "SpaceLossAccAutoDiff",
+    "StraightLossAutoDiff",
+    "StraightLoss2AutoDiff",
+    "ZCoordLossAutoDiff",
+    "ZLocationLossAutoDiff",
+    
+    # Utilities
+    "TrilinearInterpolator",
+    "TrilinearInterpolatorAutoDiff",
+]
