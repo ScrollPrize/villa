@@ -24,54 +24,34 @@ find_package(TBB REQUIRED)
 find_package(OpenMP REQUIRED)
 
 # ---------------------------
-# Fetch and build HDF5 (version 1.12.2) with thread safety enabled
-# and disable the unsupported C++ API.
+# Use ExternalProject_Add to build HDF5.
 # ---------------------------
-include(FetchContent)
-
-# Allow unsupported options.
-set(ALLOW_UNSUPPORTED ON CACHE BOOL "Allow unsupported options")
-
-# Force building shared libraries and disable static libs.
-set(BUILD_SHARED_LIBS ON CACHE BOOL "Build shared libraries" FORCE)
-set(HDF5_BUILD_STATIC_LIBS OFF CACHE BOOL "Disable HDF5 static libraries" FORCE)
-
-FetchContent_Declare(
-  hdf5
-  URL https://support.hdfgroup.org/ftp/HDF5/releases/hdf5-1.12/hdf5-1.12.2/src/hdf5-1.12.2.tar.gz
-)
-# Set options for a thread-safe build.
-set(HDF5_ENABLE_THREADSAFE ON CACHE BOOL "Enable HDF5 thread safety")
-set(HDF5_USE_FILE_LOCKING FALSE CACHE BOOL "Disable HDF5 file locking")
-set(HDF5_BUILD_HL OFF CACHE BOOL "Disable HDF5 HL API")
-set(HDF5_BUILD_CPP_LIB OFF CACHE BOOL "Disable HDF5 C++ API")
-set(HDF5_BUILD_TOOLS OFF CACHE BOOL "Disable HDF5 tools")
-set(HDF5_BUILD_EXAMPLES OFF CACHE BOOL "Disable HDF5 examples")
-set(HDF5_BUILD_TESTING OFF CACHE BOOL "Disable HDF5 testing")
-# Specify an install prefix for HDF5.
-set(HDF5_INSTALL_PREFIX ${CMAKE_BINARY_DIR}/hdf5_install CACHE PATH "HDF5 install prefix")
-
-FetchContent_MakeAvailable(hdf5)
-
-# Pre-create the install directories so that the imported target’s properties point to existing paths.
-file(MAKE_DIRECTORY "${HDF5_INSTALL_PREFIX}/include")
-file(MAKE_DIRECTORY "${HDF5_INSTALL_PREFIX}/lib")
-
-# ---------------------------
-# Add a custom target to install HDF5.
-# ---------------------------
-add_custom_target(hdf5_install
-  COMMAND ${CMAKE_COMMAND} --install ${hdf5_BINARY_DIR} --prefix ${HDF5_INSTALL_PREFIX}
-  COMMENT "Installing HDF5 to ${HDF5_INSTALL_PREFIX}"
+include(ExternalProject)
+ExternalProject_Add(hdf5_project
+    URL https://support.hdfgroup.org/ftp/HDF5/releases/hdf5-1.12/hdf5-1.12.2/src/hdf5-1.12.2.tar.gz
+    PREFIX ${CMAKE_BINARY_DIR}/hdf5
+    # Install HDF5 into a local directory.
+    CMAKE_ARGS 
+       -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/hdf5_install
+       -DBUILD_SHARED_LIBS=ON
+       -DHDF5_ENABLE_THREADSAFE=ON
+       -DHDF5_USE_FILE_LOCKING=FALSE
+       -DHDF5_BUILD_HL=OFF
+       -DHDF5_BUILD_CPP_LIB=OFF
+       -DHDF5_BUILD_STATIC_LIBS=OFF
+       -DHDF5_BUILD_TOOLS=OFF
+       -DHDF5_BUILD_EXAMPLES=OFF
+       -DHDF5_BUILD_TESTING=OFF
+       -DALLOW_UNSUPPORTED=ON
+    UPDATE_DISCONNECTED 1
 )
 
-# Create an imported target for HDF5 if one isn’t provided.
-if (NOT TARGET HDF5::HDF5)
-  add_library(HDF5::HDF5 UNKNOWN IMPORTED)
-  set_target_properties(HDF5::HDF5 PROPERTIES
-    IMPORTED_LOCATION "${HDF5_INSTALL_PREFIX}/lib/libhdf5.so"
-    INTERFACE_INCLUDE_DIRECTORIES "${HDF5_INSTALL_PREFIX}/include")
-endif()
+# Create an imported target for HDF5 using the installed files.
+add_library(HDF5::HDF5 UNKNOWN IMPORTED)
+set_target_properties(HDF5::HDF5 PROPERTIES
+    IMPORTED_LOCATION "${CMAKE_BINARY_DIR}/hdf5_install/lib/libhdf5.so"
+    INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_BINARY_DIR}/hdf5_install/include"
+)
 
 # ---------------------------
 # Create pybind11 modules.
@@ -100,9 +80,9 @@ target_link_libraries(meshing_utils PRIVATE
     OpenMP::OpenMP_CXX 
     ${PYTHON_LIBRARIES})
 
-# Define compile definitions so that our code and HDF5 headers know we use thread safety.
+# Define compile definitions so that our code and HDF5 headers know thread safety is enabled.
 target_compile_definitions(pointcloud_processing PRIVATE H5_HAVE_THREADSAFE HDF5_USE_FILE_LOCKING=FALSE)
 
-# Ensure that targets that depend on HDF5 wait for the install.
-add_dependencies(pointcloud_processing hdf5_install)
-add_dependencies(meshing_utils hdf5_install)
+# Ensure that targets depending on HDF5 wait until it is built and installed.
+add_dependencies(pointcloud_processing hdf5_project)
+add_dependencies(meshing_utils hdf5_project)
