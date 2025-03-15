@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.5)
 project(sheet_generation)
 
-# Set build type, C++ standard, and optimization flags.
+# Set the build type if it's not already set.
+# set(CMAKE_BUILD_TYPE Debug)
 set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
@@ -24,13 +25,12 @@ find_package(TBB REQUIRED)
 find_package(OpenMP REQUIRED)
 
 # ---------------------------
-# Use ExternalProject_Add to build HDF5.
+# Build HDF5 (version 1.12.2) via ExternalProject_Add.
 # ---------------------------
 include(ExternalProject)
 ExternalProject_Add(hdf5_project
     URL https://support.hdfgroup.org/ftp/HDF5/releases/hdf5-1.12/hdf5-1.12.2/src/hdf5-1.12.2.tar.gz
     PREFIX ${CMAKE_BINARY_DIR}/hdf5
-    # Install HDF5 into a local directory.
     CMAKE_ARGS 
        -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/hdf5_install
        -DBUILD_SHARED_LIBS=ON
@@ -54,14 +54,26 @@ set_target_properties(HDF5::HDF5 PROPERTIES
 )
 
 # ---------------------------
+# Place the pybind11 modules in the top-level build directory.
+# ---------------------------
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+
+# ---------------------------
 # Create pybind11 modules.
 # ---------------------------
 pybind11_add_module(sheet_generation solver.cpp)
 pybind11_add_module(pointcloud_processing pointcloud_processing.cpp)
 pybind11_add_module(meshing_utils meshing_utils.cpp)
 
+# ---------------------------
 # Link libraries for each module.
-target_link_libraries(sheet_generation PRIVATE yaml-cpp Eigen3::Eigen ${CMAKE_THREAD_LIBS_INIT} ${PYTHON_LIBRARIES})
+# ---------------------------
+target_link_libraries(sheet_generation PRIVATE 
+    yaml-cpp 
+    Eigen3::Eigen 
+    ${CMAKE_THREAD_LIBS_INIT} 
+    ${PYTHON_LIBRARIES}
+)
 
 target_link_libraries(pointcloud_processing PRIVATE 
     ${CMAKE_THREAD_LIBS_INIT} 
@@ -70,7 +82,8 @@ target_link_libraries(pointcloud_processing PRIVATE
     hdbscan 
     OpenMP::OpenMP_CXX 
     ${PYTHON_LIBRARIES} 
-    HDF5::HDF5)
+    HDF5::HDF5
+)
 
 target_link_libraries(meshing_utils PRIVATE 
     ${CMAKE_THREAD_LIBS_INIT} 
@@ -78,11 +91,12 @@ target_link_libraries(meshing_utils PRIVATE
     TBB::tbb 
     hdbscan 
     OpenMP::OpenMP_CXX 
-    ${PYTHON_LIBRARIES})
+    ${PYTHON_LIBRARIES}
+)
 
-# Define compile definitions so that our code and HDF5 headers know thread safety is enabled.
+# Define compile definitions for thread safety.
 target_compile_definitions(pointcloud_processing PRIVATE H5_HAVE_THREADSAFE HDF5_USE_FILE_LOCKING=FALSE)
 
-# Ensure that targets depending on HDF5 wait until it is built and installed.
+# Ensure targets that depend on HDF5 wait for its build/install.
 add_dependencies(pointcloud_processing hdf5_project)
 add_dependencies(meshing_utils hdf5_project)
