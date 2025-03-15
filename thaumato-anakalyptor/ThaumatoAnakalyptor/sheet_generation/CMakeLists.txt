@@ -26,14 +26,18 @@ find_package(OpenMP REQUIRED)
 
 # ---------------------------
 # Fetch and build HDF5 (version 1.12.2) with thread safety enabled
-# and disable the unsupported C++ API.
+# and disable the C++ API.
 # ---------------------------
 include(FetchContent)
+
+# Override the unsupported combination by allowing unsupported options.
+set(ALLOW_UNSUPPORTED ON CACHE BOOL "Allow unsupported options")
+
 FetchContent_Declare(
   hdf5
   URL https://support.hdfgroup.org/ftp/HDF5/releases/hdf5-1.12/hdf5-1.12.2/src/hdf5-1.12.2.tar.gz
 )
-# Set options for a thread-safe build
+# Set options for a thread-safe build and disable the C++ API
 set(HDF5_ENABLE_THREADSAFE ON CACHE BOOL "Enable HDF5 thread safety")
 set(HDF5_USE_FILE_LOCKING FALSE CACHE BOOL "Disable HDF5 file locking")
 set(HDF5_BUILD_HL OFF CACHE BOOL "Disable HDF5 HL API")
@@ -41,12 +45,12 @@ set(HDF5_BUILD_CPP_LIB OFF CACHE BOOL "Disable HDF5 C++ API")
 set(HDF5_BUILD_TOOLS OFF CACHE BOOL "Disable HDF5 tools")
 set(HDF5_BUILD_EXAMPLES OFF CACHE BOOL "Disable HDF5 examples")
 set(HDF5_BUILD_TESTING OFF CACHE BOOL "Disable HDF5 testing")
-# Specify an install prefix for HDF5 so we know where the built library is installed.
+# Specify an install prefix for HDF5
 set(HDF5_INSTALL_PREFIX ${CMAKE_BINARY_DIR}/hdf5_install CACHE PATH "HDF5 install prefix")
 
 FetchContent_MakeAvailable(hdf5)
 
-# Create an imported target for HDF5 if one is not provided by the fetched project.
+# Create an imported target for HDF5 if one is not provided.
 if (NOT TARGET HDF5::HDF5)
   add_library(HDF5::HDF5 UNKNOWN IMPORTED)
   set_target_properties(HDF5::HDF5 PROPERTIES
