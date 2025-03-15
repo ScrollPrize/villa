@@ -1922,6 +1922,7 @@ public:
             learning_rate(learning_rate),
             iterations(iterations),
             error_val_d(error_val_d),
+            unfix_factor(unfix_factor),
             verbose(verbose) {}
 
     void print_progress() {
