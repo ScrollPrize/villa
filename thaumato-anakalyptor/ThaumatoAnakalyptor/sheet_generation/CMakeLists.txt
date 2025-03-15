@@ -32,8 +32,9 @@ include(FetchContent)
 # Allow unsupported options.
 set(ALLOW_UNSUPPORTED ON CACHE BOOL "Allow unsupported options")
 
-# Force shared libraries (we need a .so, not a static lib).
+# Force building shared libraries and disable static libs.
 set(BUILD_SHARED_LIBS ON CACHE BOOL "Build shared libraries" FORCE)
+set(HDF5_BUILD_STATIC_LIBS OFF CACHE BOOL "Disable HDF5 static libraries" FORCE)
 
 FetchContent_Declare(
   hdf5
@@ -52,7 +53,7 @@ set(HDF5_INSTALL_PREFIX ${CMAKE_BINARY_DIR}/hdf5_install CACHE PATH "HDF5 instal
 
 FetchContent_MakeAvailable(hdf5)
 
-# Pre-create the install directories so that the imported target points to existing paths.
+# Pre-create the install directories so that the imported target’s properties point to existing paths.
 file(MAKE_DIRECTORY "${HDF5_INSTALL_PREFIX}/include")
 file(MAKE_DIRECTORY "${HDF5_INSTALL_PREFIX}/lib")
 
@@ -102,6 +103,6 @@ target_link_libraries(meshing_utils PRIVATE
 # Define compile definitions so that our code and HDF5 headers know we use thread safety.
 target_compile_definitions(pointcloud_processing PRIVATE H5_HAVE_THREADSAFE HDF5_USE_FILE_LOCKING=FALSE)
 
-# Ensure targets that depend on HDF5 wait for the install.
+# Ensure that targets that depend on HDF5 wait for the install.
 add_dependencies(pointcloud_processing hdf5_install)
 add_dependencies(meshing_utils hdf5_install)
