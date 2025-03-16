@@ -195,7 +195,8 @@ class MyPredictionWriter(BasePredictionWriter):
             # in Yellow
             print("\033[93mRank 0 will write to disk.\033[0m")
             return
-        print("Writing Segment to disk")
+        # green
+        print("\033[92mWriting Segment to disk.\033[0m")
         # Make folder if it does not exist
         os.makedirs(self.save_path, exist_ok=True)
 
