@@ -268,12 +268,15 @@ class MyPredictionWriter(BasePredictionWriter):
 
     def write_jpg(self, quality=60):  # Adjust the default quality value as needed
         def save_jpg(i, filename):
-            image = self.surface_volume_np[i]
-            # Normalize to 0-1, then scale to 0-255
-            image = (image / 256).astype(np.uint8)
-            image = image.T
-            image = image[::-1, :]
-            cv2.imwrite(filename, image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            try:
+                image = self.surface_volume_np[i]
+                # Normalize to 0-1, then scale to 0-255
+                image = (image / 256).astype(np.uint8)
+                image = image.T
+                image = image[::-1, :]
+                cv2.imwrite(filename, image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            except Exception as e:
+                print(e)
 
         with ThreadPoolExecutor(self.num_workers) as executor:
             futures = []
