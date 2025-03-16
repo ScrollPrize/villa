@@ -49,8 +49,8 @@ class MyPredictionWriter(BasePredictionWriter):
         self.current_step_offset = 0
     
     def write_on_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, prediction, batch_indices, batch, batch_idx: int, dataloader_idx: int) -> None:
-        # if self.trainer_rank is None: # Only set the rank once
-            # self.trainer_rank = trainer.global_rank if trainer.world_size > 1 else 0
+        if self.trainer_rank is None: # Only set the rank once
+            self.trainer_rank = trainer.global_rank if trainer.world_size > 1 else 0
 
         if self.surface_volume_np is None:
             if trainer.global_rank == 0:
@@ -59,12 +59,12 @@ class MyPredictionWriter(BasePredictionWriter):
                     self.surface_volume_np, self.shm, success = self.create_shared_array((seg_layers, self.image_size[0], self.image_size[1]), np.uint16, name=f"surface_volume_{self.current_step_offset}")
                 else:
                     self.surface_volume_np, self.shm, success = self.create_shared_array((2*self.r+1, self.image_size[0], self.image_size[1]), np.uint16, name="surface_volume")
-                self.trainer_rank = 0 if success else None
+                # self.trainer_rank = 0 if success else None
                 # Gather the shared memory name
                 torch.distributed.barrier()
             else:
-                if self.trainer_rank is None:
-                    self.trainer_rank = 1
+                # if self.trainer_rank is None:
+                #     self.trainer_rank = 1
                 torch.distributed.barrier()
                 if self.r_steps is not None:
                     seg_layers = min(self.r_steps, (2*self.r+1 - self.current_step_offset))
@@ -191,10 +191,10 @@ class MyPredictionWriter(BasePredictionWriter):
         self.wait_for_all_writes_to_complete()
         if self.trainer_rank != 0: # Only rank 0 should write to disk
             print("\033[93mRank 0 will write to disk.\033[0m")
+            torch.distributed.barrier()
             self.shm.close()
             self.shm = None
             # in Yellow
-            torch.distributed.barrier()
             return
         # green
         print("\033[92mWriting Segment to disk.\033[0m")
