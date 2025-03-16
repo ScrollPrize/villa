@@ -647,7 +647,6 @@ def main():
     parser.add_argument("--max_distance", type=float, help="Maximum distance for a point to be considered part of the mesh", default=float("inf"))
     parser.add_argument("--distance_threshold", type=float, help="Distance threshold for overlapping vertices", default=30)
     parser.add_argument("--output_dir", type=str, help="Output directory for the mesh quality statistics", default="./")
-    parser.add_argument("--reuse_winding_calculation", action="store_true", help="Start from scratch and compute the winding angles", default=False)
 
     args = parser.parse_args()
     print(f"args: {args}")
