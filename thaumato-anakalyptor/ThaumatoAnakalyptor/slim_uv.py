@@ -72,7 +72,6 @@ class Flatboi:
             # Copy mesh to avoid modifying the original
             mesh_filtered = mesh
             mesh_filtered.remove_triangles_by_index(list(triangles_to_remove))
-            mesh_filtered.remove_unreferenced_vertices()
             
             # Filter UVs by mapping them to the selected triangles
             original_uvs = np.asarray(mesh.triangle_uvs).reshape(-1, 3, 2)
@@ -81,13 +80,6 @@ class Flatboi:
                 
                 # Set the filtered UVs to the new mesh
                 mesh_filtered.triangle_uvs = o3d.utility.Vector2dVector(filtered_uvs)
-
-            # Remove degenerate and duplicated triangles/vertices and non-manifold edges
-            mesh_filtered = mesh_filtered.remove_degenerate_triangles()
-            mesh_filtered = mesh_filtered.remove_duplicated_triangles()
-            mesh_filtered = mesh_filtered.remove_duplicated_vertices()
-            mesh_filtered = mesh_filtered.remove_non_manifold_edges()
-            mesh_filtered = mesh_filtered.remove_unreferenced_vertices()
 
             if len(mesh_filtered.vertices) == old_mesh_vertices_count and len(mesh_filtered.triangles) == old_mesh_triangles_count:
                 print("No change in number of vertices. Exiting.")
@@ -100,72 +92,6 @@ class Flatboi:
         
         return mesh_filtered
     
-    def downsample_mesh_with_texture(self, target_area_per_triangle=0.05):
-        """
-        This function gives comparable results to the downsample_mesh function, but needs the pymeshlab library.
-        target_area_per_triangle: Desired area (sqmm) per triangle
-        """
-        import pymeshlab
-        # Load the initial mesh with open3d for the uvs, vertices and triangles
-        self.read_mesh(self.input_obj, stretch=False) # no stretch
-
-        uvs = self.original_uvs.reshape((-1, 3, 2))
-        assert np.all(uvs >= 0), "Some triangles do not have UVs."
-        # get uvs for each vertex. each vertex whenever it is inside a triangle, has the same uv
-        vertex_uvs = np.zeros((self.vertices.shape[0], 2), dtype=np.float64) - 1.0
-        for t in range(self.triangles.shape[0]):
-            for v in range(self.triangles.shape[1]):
-                # if np.all(vertex_uvs[self.triangles[t,v]] >= 0):
-                #     assert np.allclose(vertex_uvs[self.triangles[t,v]], uvs[t,v]), "UVs do not match."
-                vertex_uvs[self.triangles[t,v]] = uvs[t,v].copy()
-
-        assert np.all(vertex_uvs >= 0), "Some vertices do not have UVs."
-
-        print(f"Num uvs: {uvs.shape[0]}, num triangles: {self.triangles.shape[0]}, num uvs: {self.original_uvs.shape[0]}")
-        
-        # Compute the area of each triangle and the total surface area
-        triangle_areas = igl.doublearea(self.vertices, self.triangles) / 2.0
-        total_area = np.sum(triangle_areas)
-        # to um. 1 unit = um
-        total_area = total_area * self.um * self.um / (1000.0 * 1000.0)
-        print("Total surface area (sqmm):", total_area)
-        print("Average area (sqmm) per triangle:", total_area / self.triangles.shape[0])
-
-        # Determine the target number of triangles
-        target_num_triangles = int(total_area / target_area_per_triangle)
-
-        if target_num_triangles >= self.triangles.shape[0]:
-            print("No need to downsample")
-            return self.input_obj
-
-        # Decimate the mesh
-        print(f"Target number of triangles: {target_num_triangles}")
-
-        # Instantiate a pymeshlab.Mesh with vertices, faces, and UVs
-        mesh_with_uvs = pymeshlab.Mesh(
-            vertex_matrix=self.vertices,
-            face_matrix=self.triangles,
-            v_tex_coords_matrix=vertex_uvs  # Set the UVs in per-wedge format
-        )
-        # Initialize MeshSet and add the mesh with UVs
-        ms = pymeshlab.MeshSet()
-        ms.add_mesh(mesh_with_uvs)
-        ms.apply_filter('compute_texcoord_transfer_vertex_to_wedge')
-
-        # Apply Quadric Edge Collapse Decimation with texture preservation
-        ms.apply_filter(
-            'meshing_decimation_quadric_edge_collapse_with_texture',
-            targetfacenum=target_num_triangles
-        )
-
-        # Save the mesh with UVs to an OBJ file
-        obj_path = self.input_obj.replace(".obj", "_downsampled.obj")
-        # Save the simplified mesh with preserved UVs
-        ms.save_current_mesh(obj_path)
-
-        print(f"Downsampled mesh saved with UVs to {obj_path}")
-        return obj_path
-
     def downsample_mesh(self, target_area_per_triangle=0.05):
         # Load the initial mesh with open3d for the uvs, vertices and triangles
         self.read_mesh(self.input_obj, stretch=False) # no stretch
@@ -287,6 +213,7 @@ class Flatboi:
         self.vertex_normals = np.asarray(self.mesh.vertex_normals, dtype=np.float64)
         self.triangles = np.asarray(self.mesh.triangles, dtype=np.int64)
         self.original_uvs = np.asarray(self.mesh.triangle_uvs, dtype=np.float64)
+        print(f"UVs shape is: {self.original_uvs.shape}")
 
     def filter_mesh(self, area_cutoff=0.0000001):
         # Filtering out any triangles with 0 area

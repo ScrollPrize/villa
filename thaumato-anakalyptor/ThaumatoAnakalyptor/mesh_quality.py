@@ -462,6 +462,16 @@ def show_winding_angle_relationship(base_path, umbilicus_path, mesh_path1, mesh_
     mesh2, vertices2, triangles2, scene2 = load_mesh_vertices(mesh_path2)
     uvs2 = np.asarray(mesh2.triangle_uvs).reshape(-1, 3, 2)
 
+    # Color the meshes based on the XY coordinates to Red/Green to maybe spot winding switches
+    colors1 = coloring_xy_redgreen(vertices1)
+    colors2 = coloring_xy_redgreen(vertices2)
+    image1_path = os.path.join(base_path, "xy_colors1.png")
+    image2_path = os.path.join(base_path, "xy_colors2.png")
+    print("Generating xy color images")
+    generate_colored_mask_png(range(len(uvs1)), colors1[triangles1[:, 0]], uvs1, img1_size, image1_path)
+    generate_colored_mask_png(range(len(uvs2)), colors2[triangles2[:, 0]], uvs2, img2_size, image2_path)
+    print("Done generating xy color images")
+
     generate_colored_mask_png(range(len(uvs1)), np.ones((len(uvs1), 3), dtype=np.uint8), uvs1, img1_size, os.path.join(base_path, "mask_test.png"))
     # generate a winding angle assignment to flattening image
     image1_path = os.path.join(base_path, "winding_angles1.png")
@@ -510,16 +520,6 @@ def show_winding_angle_relationship(base_path, umbilicus_path, mesh_path1, mesh_
     print("Generating winding angle images")
     generate_colored_mask_png(range(len(uvs2)), colors2[triangles2[:, 0]], uvs2, img2_size, image2_path)
     print("Done generating winding angle images")
-
-    # Color the meshes based on the XY coordinates to Red/Green to maybe spot winding switches
-    colors1 = coloring_xy_redgreen(vertices1)
-    colors2 = coloring_xy_redgreen(vertices2)
-    image1_path = os.path.join(base_path, "xy_colors1.png")
-    image2_path = os.path.join(base_path, "xy_colors2.png")
-    print("Generating xy color images")
-    generate_colored_mask_png(range(len(uvs1)), colors1[triangles1[:, 0]], uvs1, img1_size, image1_path)
-    generate_colored_mask_png(range(len(uvs2)), colors2[triangles2[:, 0]], uvs2, img2_size, image2_path)
-    print("Done generating xy color images")
 
     # Creates a image of the flattened meshes where the winding angles are shown as colored triangles
     # also creates an image where the distance to the proper winding is show. green/red and intensity for direction and distance, grey if over threshold
