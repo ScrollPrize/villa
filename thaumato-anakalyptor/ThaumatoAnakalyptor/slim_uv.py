@@ -184,6 +184,11 @@ class Flatboi:
                 downsampled_mesh = self.mesh.simplify_vertex_clustering(2.0)
             else:
                 downsampled_mesh = self.mesh
+
+            # Add initial UV coordinates
+            _, _, arap_ic_uvs = self.arap_ic(np.asarray(downsampled_mesh.vertices), np.asarray(downsampled_mesh.triangles))
+            downsampled_mesh.triangle_uvs = o3d.utility.Vector2dVector(arap_ic_uvs.reshape((-1, 2)))
+            
             # print(f"Simplify Open3D round 1. Remaining vertices: {len(np.asarray(downsampled_mesh.vertices))} and triangles: {len(np.asarray(downsampled_mesh.triangles))}")
             if target_num_triangles < len(np.asarray(downsampled_mesh.triangles)):
                 # Simplify Open3D
@@ -235,24 +240,34 @@ class Flatboi:
         print(f"Filtered out {len_before - len(self.triangles)} triangles with 0 area of total {len_before} triangles.")
         # assert len(self.triangles) == len(self.original_uvs), f"Number of triangles and uvs do not match. {len(self.triangles)} != {len(self.original_uvs)}"
 
-    def generate_boundary(self):
-        res = igl.boundary_loop(self.triangles)
+    def generate_boundary(self, triangles=None):
+        if triangles is None:
+            triangles = self.triangles
+        res = igl.boundary_loop(triangles)
         print("Generated Boundary")
         return res
     
-    def harmonic_ic(self):
-        bnd = self.generate_boundary()
-        bnd_uv = igl.map_vertices_to_circle(self.vertices, bnd)
+    def harmonic_ic(self, vertices=None, triangles=None):
+        if vertices is None:
+            vertices = self.vertices
+        if triangles is None:
+            triangles = self.triangles
+        bnd = self.generate_boundary(triangles)
+        bnd_uv = igl.map_vertices_to_circle(vertices, bnd)
         # harmonic map to unit circle, this will be the initial condition
-        uv = igl.harmonic(self.vertices, self.triangles, bnd, bnd_uv, 1)
+        uv = igl.harmonic(vertices, triangles, bnd, bnd_uv, 1)
         return bnd, bnd_uv, uv
     
-    def arap_solver_ic(self, uv):
+    def arap_solver_ic(self, uv, vertices=None, triangles=None):
+        if vertices is None:
+            vertices = self.vertices
+        if triangles is None:
+            triangles = self.triangles
         # jiggle the uv and vertices a little bit randomly to counteract numerical issues
         uv += np.random.rand(*uv.shape) * 0.0001
-        vertices_jiggled = self.vertices.copy() + np.random.rand(*self.vertices.shape) * 0.0001
+        vertices_jiggled = vertices.copy() + np.random.rand(*vertices.shape) * 0.0001
 
-        arap = igl.ARAP(vertices_jiggled, self.triangles, 2, np.zeros(0))
+        arap = igl.ARAP(vertices_jiggled, triangles, 2, np.zeros(0))
         print("ARAP")
         success = False
         for i in tqdm(range(11), desc="ARAP"):
@@ -268,14 +283,18 @@ class Flatboi:
             uv = uva
         if not success:
             print("Fallback to harmonic arap")
-            _, _, uv = self.arap_ic()
+            _, _, uv = self.harmonic_ic(vertices, triangles)
         return uv
     
-    def arap_ic(self):
-        bnd = self.generate_boundary()
-        bnd_uv = igl.map_vertices_to_circle(self.vertices, bnd)
-        uv = igl.harmonic(self.vertices, self.triangles, bnd, bnd_uv, 1)
-        arap = igl.ARAP(self.vertices, self.triangles, 2, np.zeros(0))
+    def arap_ic(self, vertices=None, triangles=None):
+        if vertices is None:
+            vertices = self.vertices
+        if triangles is None:
+            triangles = self.triangles
+        bnd = self.generate_boundary(triangles)
+        bnd_uv = igl.map_vertices_to_circle(vertices, bnd)
+        uv = igl.harmonic(vertices, triangles, bnd, bnd_uv, 1)
+        arap = igl.ARAP(vertices, triangles, 2, np.zeros(0))
         print("ARAP")
         for i in tqdm(range(10), desc="ARAP"):
             uv = arap.solve(np.zeros((0, 0)), uv)
@@ -288,7 +307,7 @@ class Flatboi:
             bc[i] = uva[bnd[i]]
 
         return bnd, bc, uva
-    
+
     def original_ic(self):
         input_directory = os.path.dirname(self.input_obj)
         base_file_name, _ = os.path.splitext(os.path.basename(self.input_obj))
