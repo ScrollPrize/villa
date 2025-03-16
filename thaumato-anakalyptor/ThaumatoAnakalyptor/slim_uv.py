@@ -542,6 +542,18 @@ class Flatboi:
         energies.extend(list(energies_))
         print_errors(slim_uvs)
 
+        print("Exponential Symmetric Dirichlet Distortion Energy")
+        slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=igl.SLIM_ENERGY_TYPE_EXP_SYMMETRIC_DIRICHLET, soft_penalty=0)
+        slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs, iterations=10)
+        energies.extend(list(energies_))
+        print_errors(slim_uvs)
+
+        print("Symmetric Dirichlet Distortion Energy")
+        slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=igl.SLIM_ENERGY_TYPE_SYMMETRIC_DIRICHLET, soft_penalty=0)
+        slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs, iterations=30)
+        energies.extend(list(energies_))
+        print_errors(slim_uvs)
+
         # rescale slim uvs
         slim_uvs = slim_uvs * self.stretch_factor
 
