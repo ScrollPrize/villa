@@ -403,6 +403,12 @@ class MeshDataset(Dataset):
             with Image.open(image_path) as img:
                 # Get dimensions
                 y_size, x_size = img.size
+                if y_size < 10 or x_size < 10:
+                    print("Texture image too small. Exit.")
+                    exit(1)
+        else:
+            print("No texture image found. Exit.")
+            exit(1)
         print(f"Y-size: {y_size}, X-size: {x_size}", end="\n")
 
         print(f"Loading mesh from {path}", end="\n")
