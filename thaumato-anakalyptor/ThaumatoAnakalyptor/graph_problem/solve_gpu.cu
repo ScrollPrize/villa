@@ -1011,7 +1011,7 @@ __global__ void update_nodes_kernel_f_star(Node* d_graph, size_t* d_valid_indice
         // Add momentum: update the momentum field and then update f_star.
         const float momentum_coef = 0.999f; // momentum coefficient (can be tuned)
         float step = sum_w_f_tilde_k / sum_w;
-        step *= 0.0005f;
+        step *= 0.0025f;
         node.f_star_momentum = momentum_coef * node.f_star_momentum + step;
         node.f_star += node.f_star_momentum;
         // node.f_star = (sum_w_f_tilde_k + o * node_f_tilde) / (sum_w + o);
