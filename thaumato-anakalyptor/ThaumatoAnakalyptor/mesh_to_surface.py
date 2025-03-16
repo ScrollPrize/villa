@@ -71,7 +71,7 @@ class MyPredictionWriter(BasePredictionWriter):
                     self.surface_volume_np, self.shm = self.attach_shared_array((seg_layers, self.image_size[0], self.image_size[1]), np.uint16, name=f"surface_volume_{self.current_step_offset}")
                 else:
                     self.surface_volume_np, self.shm = self.attach_shared_array((2*self.r+1, self.image_size[0], self.image_size[1]), np.uint16, name="surface_volume")
-        print(f"This is rank {trainer.global_rank} and trainer rank {self.trainer_rank}, self.trainer_rank is {self.trainer_rank}")
+        # print(f"This is rank {trainer.global_rank} and trainer rank {self.trainer_rank}")
         self.semaphore.acquire()  # Wait for a slot to become available if necessary
         future = self.executor.submit(self.process_and_write_data, prediction)
         future.add_done_callback(lambda _future: self.semaphore.release())
