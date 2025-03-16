@@ -190,10 +190,11 @@ class MyPredictionWriter(BasePredictionWriter):
         print("Waiting for all writes to complete")
         self.wait_for_all_writes_to_complete()
         if self.trainer_rank != 0: # Only rank 0 should write to disk
+            print("\033[93mRank 0 will write to disk.\033[0m")
             self.shm.close()
             self.shm = None
             # in Yellow
-            print("\033[93mRank 0 will write to disk.\033[0m")
+            torch.distributed.barrier()
             return
         # green
         print("\033[92mWriting Segment to disk.\033[0m")
@@ -228,6 +229,7 @@ class MyPredictionWriter(BasePredictionWriter):
         print("Segment written to disk")
         # Reset surface_volume_np to allow reinitialization for the next segment
         self.surface_volume_np = None
+        torch.distributed.barrier()
 
     def compute_composite(self):
         # Compute composite (max) image from the current segment (surface_volume_np)
