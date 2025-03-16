@@ -53,12 +53,12 @@ class MyPredictionWriter(BasePredictionWriter):
             self.trainer_rank = trainer.local_rank if trainer.world_size > 1 else 0
 
         if self.surface_volume_np is None:
-            if trainer.local_rank == 0:
+            if trainer.global_rank == 0:
                 if self.r_steps is not None:
                     seg_layers = min(self.r_steps, (2*self.r+1 - self.current_step_offset))
-                    self.surface_volume_np, self.shm = self.create_shared_array((seg_layers, self.image_size[0], self.image_size[1]), np.uint16, name=f"surface_volume_{self.current_step_offset}")
+                    self.surface_volume_np, self.shm, success = self.create_shared_array((seg_layers, self.image_size[0], self.image_size[1]), np.uint16, name=f"surface_volume_{self.current_step_offset}")
                 else:
-                    self.surface_volume_np, self.shm = self.create_shared_array((2*self.r+1, self.image_size[0], self.image_size[1]), np.uint16, name="surface_volume")
+                    self.surface_volume_np, self.shm, success = self.create_shared_array((2*self.r+1, self.image_size[0], self.image_size[1]), np.uint16, name="surface_volume")
                 # Gather the shared memory name
                 torch.distributed.barrier()
             else:
@@ -113,6 +113,7 @@ class MyPredictionWriter(BasePredictionWriter):
 
     def create_shared_array(self, shape, dtype, name="shared_array"):
         array_size = np.prod(shape) * np.dtype(dtype).itemsize
+        success = True
         try:
             # Create a shared array
             shm = shared_memory.SharedMemory(create=True, size=array_size, name=name)
@@ -120,10 +121,11 @@ class MyPredictionWriter(BasePredictionWriter):
             print(f"Shared memory with name {name} already exists.")
             # Clean up the shared memory if it already exists
             shm = shared_memory.SharedMemory(create=False, size=array_size, name=name)
+            success = False
 
         arr = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
         arr.fill(0)  # Initialize the array with zeros
-        return arr, shm
+        return arr, shm, success
     
     def attach_shared_array(self, shape, dtype, name="shared_array"):
         while True:
