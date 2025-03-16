@@ -71,8 +71,21 @@ def compute_mean_windings_from_partial(inverse_indices, winding, unlabeled):
     
     # Calculate the mean winding angle by dividing the sum by the count.
     mean_winding = sum_winding / count_winding
+    mask_0 = mean_winding == 0
         
-    return mean_winding
+    # Compute the first occurrence for each unique group.
+    # np.unique returns the sorted unique group labels and the corresponding first indices.
+    groups, first_indices = np.unique(inverse_indices, return_index=True)
+    first_winding = winding[first_indices]
+
+    # Adjust the computed mean:
+    # Use the base from the first occurrence (i.e. floor(first_winding/360)*360)
+    # and add the remainder of the computed mean (i.e. mean_winding % 360).
+    adjusted_mean_winding = np.floor(mean_winding / 360) * 360 + (first_winding % 360)
+    # Set the entries without any labels to exactly 0 for later displaying them as white (0 is white indicator)
+    adjusted_mean_winding[mask_0] = 0.0
+    
+    return adjusted_mean_winding
 
 def compute_mean_windings_precomputed(inverse_indices, winding, winding_computed, unlabeled):
     mean_winding = compute_mean_windings_from_partial(inverse_indices, winding, unlabeled)

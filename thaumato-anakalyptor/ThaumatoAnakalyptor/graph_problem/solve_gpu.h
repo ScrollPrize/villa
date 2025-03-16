@@ -3,7 +3,7 @@
 #define SOLVE_GPU_H
 
 #include <vector>
-#include "node_structs.h"  // Assuming Node and Edge are declared here
+#include "node_structs.h"
 #include <string>
 
 // Declaration of the GPU solver function

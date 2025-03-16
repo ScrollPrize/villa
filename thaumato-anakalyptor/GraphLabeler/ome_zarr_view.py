@@ -1,7 +1,9 @@
 import numpy as np
-from PyQt5.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFileDialog, QMessageBox, QDialog, QFormLayout, QDialogButtonBox, QLineEdit, QComboBox, QPushButton, QLabel, QProgressDialog, QSpinBox, QDoubleSpinBox, QCheckBox
+from PyQt5.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFileDialog, QMessageBox, QDialog, QFormLayout, QDialogButtonBox, QLineEdit, QComboBox, QPushButton, QLabel, QProgressDialog, QSpinBox, QDoubleSpinBox, QCheckBox, QApplication
 from PyQt5.QtCore import QTimer, QThread, pyqtSignal, QObject, pyqtSlot, Qt, QEvent, QPointF
+from PyQt5.QtGui import QImage, QPainter
 import pyqtgraph as pg
+import pyqtgraph.exporters
 import cv2
 import h5py
 import zarr
@@ -46,24 +48,97 @@ def brush_for_winding(w, r, g, b):
     else:  # mod == 0
         return r   # red
     
+# def vectorized_brush_for_winding(w_array, brush_red, brush_green, brush_blue):
+#     """
+#     Vectorized version of brush_for_winding.
+#     Given an array of winding values, compute the integer rounded value,
+#     then assign brushes based on mod 3:
+#     mod == 1 -> brush_green
+#     mod == 2 -> brush_blue
+#     mod == 0 -> brush_red
+#     """
+#     # Round w/360 to the nearest integer.
+#     w_int = np.rint(w_array / 360.0).astype(np.int64)
+#     mod = w_int % 3
+#     # Create an empty array of objects (brushes).
+#     result = np.empty(mod.shape, dtype=object)
+#     result[mod == 1] = brush_green
+#     result[mod == 2] = brush_blue
+#     result[mod == 0] = brush_red
+#     return result
+
 def vectorized_brush_for_winding(w_array, brush_red, brush_green, brush_blue):
     """
-    Vectorized version of brush_for_winding.
-    Given an array of winding values, compute the integer rounded value,
-    then assign brushes based on mod 3:
-    mod == 1 -> brush_green
-    mod == 2 -> brush_blue
-    mod == 0 -> brush_red
+    Computes a QBrush for each winding value in w_array by interpolating
+    along a manually defined gradient that cycles from red -> green -> blue -> red.
+    The gradient is divided into 12 equal intervals (each corresponding to 30°).
+    
+    Parameters:
+      w_array: numpy array of winding values in degrees.
+      brush_red, brush_green, brush_blue: ignored in this implementation.
+    
+    Returns:
+      A list of QBrush objects with the same shape as w_array.
     """
-    # Round w/360 to the nearest integer.
-    w_int = np.rint(w_array / 360.0).astype(np.int64)
-    mod = w_int % 3
+    # Define a palette of 12 colors for angles 0, 30, 60, ..., 330 degrees.
+    brushes = []
+    steps = 36
+    d_angle = 360.0 / steps
+    for i in range(steps):
+        angle = i * d_angle  # in degrees
+        if angle < 120:
+            # Transition: Red (255, 0, 0) to Green (0, 255, 0)
+            f = angle / 120.0  # f increases from 0 to 1
+            r = 255 * (1 - f)
+            g = 255 * f
+            b = 0
+        elif angle < 240:
+            # Transition: Green (0, 255, 0) to Blue (0, 0, 255)
+            f = (angle - 120) / 120.0
+            r = 0
+            g = 255 * (1 - f)
+            b = 255 * f
+        else:
+            # Transition: Blue (0, 0, 255) to Red (255, 0, 0)
+            f = (angle - 240) / 120.0
+            r = 255 * f
+            g = 0
+            b = 255 * (1 - f)
+        brushes.append(pg.mkBrush(r, g, b))
+    
+    # Map winding values (in degrees) to a normalized index in [0, 12).
+    w_int = np.rint(w_array / (3 * d_angle)).astype(np.int64)
+    mod = w_int % steps
     # Create an empty array of objects (brushes).
     result = np.empty(mod.shape, dtype=object)
-    result[mod == 1] = brush_green
-    result[mod == 2] = brush_blue
-    result[mod == 0] = brush_red
+    for i in range(steps):
+        result[mod == i] = brushes[i]
+    
     return result
+
+def save_high_res_widget(widget, save_path, fixed_width=5000):
+    # Get the widget's current size.
+    original_size = widget.size()
+    orig_width = original_size.width()
+    orig_height = original_size.height()
+    
+    # Compute scale factor based on the desired fixed width.
+    scale_factor = fixed_width / orig_width
+    new_width = fixed_width
+    new_height = int(orig_height * scale_factor)
+    
+    # Create a QImage with the fixed width and proportional height.
+    image = QImage(new_width, new_height, QImage.Format_ARGB32)
+    image.fill(Qt.white)  # Fill background with white (or any color you prefer)
+    
+    # Render the widget into the QImage using QPainter.
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.scale(scale_factor, scale_factor)
+    widget.render(painter)
+    painter.end()
+    
+    image.save(save_path)
 
 ########################################
 # Worker Classes
@@ -248,6 +323,8 @@ class OmeZarrViewWindow(QMainWindow):
         self.setWindowTitle("OME-Zarr Views")
         self.setAttribute(Qt.WA_DeleteOnClose)
 
+        os.makedirs("GraphLabelerViews", exist_ok=True)
+
         self.UNLABELED = -9999
         self.graph_labels = graph_labels
         self.solver = solver
@@ -393,8 +470,11 @@ class OmeZarrViewWindow(QMainWindow):
     
     def on_slice_loaded(self, image_slice):
         self.xy_view.setImage(image_slice)
-        print("OME-Zarr XY view updated with new slice.")
-
+        # exporting data of image view object
+        current_timestamp = time.strftime("%Y%m%d-%H%M%S")
+        # Ensure the widget is fully rendered
+        self.xy_view.export(os.path.join("GraphLabelerViews", f"xy_view_{current_timestamp}.png"))
+    
     def get_brushes(self):
         # Create boolean masks based on valid winding conditions.
         brush_mask = np.abs(self.last_overlay_windings // 360 - self.UNLABELED) > 2
@@ -447,6 +527,11 @@ class OmeZarrViewWindow(QMainWindow):
                 size=2
             )
             self.xy_view.addItem(self.overlay_scatter)
+        # exporting data of image view object
+        current_timestamp = time.strftime("%Y%m%d-%H%M%S")
+        self.xy_view.export(os.path.join("GraphLabelerViews", f"points_xy_view_{current_timestamp}.png"))
+        save_high_res_widget(self.xy_view, os.path.join("GraphLabelerViews", f"pixmap_points_xy_view_{current_timestamp}.png"))
+        print("OME-Zarr XY view updated with new slice.")
     
     # --- XZ Overlay Helpers ---
     def get_brushes_xz(self):
@@ -503,14 +588,18 @@ class OmeZarrViewWindow(QMainWindow):
                 size=2
             )
             self.xz_view.addItem(self.overlay_scatter_xz)
+        # exporting data of image view object
+        current_timestamp = time.strftime("%Y%m%d-%H%M%S")
+        # Ensure the widget is fully rendered
+        self.xz_view.export(os.path.join("GraphLabelerViews", f"points_xz_view_{current_timestamp}.png"))
+        save_high_res_widget(self.xz_view, os.path.join("GraphLabelerViews", f"pixmap_points_xz_view_{current_timestamp}.png"))
     
     # --- Color Update Trigger ---
     def update_overlay_labels(self, labels, computed_labels):
         self.labels = labels
         self.computed_labels = computed_labels
-        if not self.debounce_timer_labels.isActive():
-            self._trigger_overlay_labels_update()
-            self.debounce_timer_labels.start(2000)
+        self.debounce_timer_labels.stop()
+        self.debounce_timer_labels.start(5000)
 
     def _trigger_overlay_labels_update(self):
         windings = self.labels * 360.0 + self.f_init
@@ -559,6 +648,9 @@ class OmeZarrViewWindow(QMainWindow):
     
     def on_xz_slice_loaded(self, xz_image):
         self.xz_view.setImage(xz_image)
+        # exporting data of image view object
+        current_timestamp = time.strftime("%Y%m%d-%H%M%S")
+        self.xz_view.export(os.path.join("GraphLabelerViews", f"xz_view_{current_timestamp}.png"))
         print("OME-Zarr XZ view updated with new slice.")
     
     def closeEvent(self, event):

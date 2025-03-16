@@ -386,6 +386,41 @@ def distance_color(distance, distance_threshold):
         color = np.array([0.5, 0.5, 0.5]) # grey
     return color
 
+def coloring_xy_redgreen(vertices):
+    """
+    Assigns a color to each vertex based on its x and y coordinates.
+    
+    The x coordinate is normalized and mapped to the red channel,
+    the y coordinate is normalized and mapped to the green channel,
+    and the blue channel is set to 0.
+    
+    Args:
+        vertices (np.ndarray): An array of shape (N, 3) representing the mesh vertices.
+        
+    Returns:
+        np.ndarray: An array of shape (N, 3) containing RGB colors in [0, 1] for each vertex.
+    """
+    import numpy as np
+    
+    # Extract x and y coordinates
+    x = vertices[:, 0]
+    y = vertices[:, 1]
+    
+    # Normalize x and y to the [0, 1] range.
+    # Avoid division by zero if the range is zero.
+    x_min, x_max = x.min(), x.max()
+    y_min, y_max = y.min(), y.max()
+    x_range = x_max - x_min if x_max != x_min else 1.0
+    y_range = y_max - y_min if y_max != y_min else 1.0
+    
+    norm_x = (x - x_min) / x_range
+    norm_y = (y - y_min) / y_range
+    
+    # Construct colors: red from normalized x, green from normalized y, blue is 0
+    colors = np.stack([norm_x, norm_y, np.zeros_like(norm_x)], axis=-1)
+    
+    return colors
+
 def triangle_mask_area(triangles, vertices, mask):
     # calculates the area of the mask in the mesh
     selected_triangles = triangles[mask]
@@ -475,6 +510,16 @@ def show_winding_angle_relationship(base_path, umbilicus_path, mesh_path1, mesh_
     print("Generating winding angle images")
     generate_colored_mask_png(range(len(uvs2)), colors2[triangles2[:, 0]], uvs2, img2_size, image2_path)
     print("Done generating winding angle images")
+
+    # Color the meshes based on the XY coordinates to Red/Green to maybe spot winding switches
+    colors1 = coloring_xy_redgreen(vertices1)
+    colors2 = coloring_xy_redgreen(vertices2)
+    image1_path = os.path.join(base_path, "xy_colors1.png")
+    image2_path = os.path.join(base_path, "xy_colors2.png")
+    print("Generating xy color images")
+    generate_colored_mask_png(range(len(uvs1)), colors1[triangles1[:, 0]], uvs1, img1_size, image1_path)
+    generate_colored_mask_png(range(len(uvs2)), colors2[triangles2[:, 0]], uvs2, img2_size, image2_path)
+    print("Done generating xy color images")
 
     # Creates a image of the flattened meshes where the winding angles are shown as colored triangles
     # also creates an image where the distance to the proper winding is show. green/red and intensity for direction and distance, grey if over threshold

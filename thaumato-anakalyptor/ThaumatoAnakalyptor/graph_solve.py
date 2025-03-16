@@ -93,32 +93,67 @@ def update_sides(solver):
     print(f"down_index {down_index} up_index {up_index}")
     return down_index, up_index
 
-def run_f_star(solver, experiment_name="", continue_from=0, visualize=False):
-    print(f"Running f_star solver")
+def run_f_star_lr(solver, experiment_name="", continue_from=0, visualize=False):
     print(f"Visualize {visualize}")
+    # solver.solve_f_star(num_iterations=20000, spring_constant=10.0, o=0.0, i_round=-1, visualize=visualize)
+    
+    print(f"Running f_star solver lr")
     save_path = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_f_star_0.bin"
     if continue_from == 0:
         # remove and remake dirs python_angles to save the solver visualization
         os.system("rm -rf python_angles")
         os.system("mkdir python_angles")
-        solver.solve_f_star(num_iterations=100000, spring_constant=5.0, o=0.0, i_round=-1, visualize=visualize)
+        for _ in range(4):
+            solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=3.0, other_block_factor=0.5, lr=0.25, error_cutoff=-1.0, display=visualize)
+            solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=2.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=visualize)
+            solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=1.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=visualize)
         solver.save_graph(save_path)
     elif continue_from == 1:
         solver.load_graph(save_path)
+
+    save_path = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_f_star_1.bin"
+    if continue_from <= 1:
+        solver.solve_f_star_with_labels(num_iterations=200000, spring_constant=1.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=visualize)
+        solver.save_graph(save_path)
+    else:
+        solver.load_graph(save_path)
+
+    # generate video
+    if continue_from < 2:
+        try:
+            solver.generate_video("python_angles", f"experiments/{experiment_name}/python_angles_setup.avi", 10)
+            compress_video(f"experiments/{experiment_name}/python_angles_setup.avi", f"experiments/{experiment_name}/python_angles_setup.mp4", codec='mp4v', scale=0.5)
+        except:
+            print(f"Error compressing video experiments/{experiment_name}/python_angles_setup.avi")
+
+    return 11
+
+def run_f_star(solver, experiment_name="", continue_from=0, visualize=False):
+    print(f"Running f_star solver")
+    print(f"Visualize {visualize}")
+    save_path = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_f_star_0.bin"
+    # if continue_from == 0:
+    #     # remove and remake dirs python_angles to save the solver visualization
+    #     os.system("rm -rf python_angles")
+    #     os.system("mkdir python_angles")
+    #     solver.solve_f_star(num_iterations=100000, spring_constant=5.0, o=0.0, i_round=-1, visualize=visualize)
+    #     solver.save_graph(save_path)
+    # elif continue_from == 1:
+    #     solver.load_graph(save_path)
     
     save_path = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_f_star_1.bin"
     if continue_from <= 1:
-        solver.solve_f_star(num_iterations=10000, spring_constant=4.5, o=0.000, i_round=0, visualize=visualize)
-        solver.solve_f_star(num_iterations=10000, spring_constant=4.0, o=0.00, i_round=1, visualize=visualize)
-        solver.solve_f_star(num_iterations=20000, spring_constant=3.25, o=0.0, i_round=2, visualize=visualize)
-        solver.solve_f_star(num_iterations=20000, spring_constant=2.50, o=0.0, i_round=3, visualize=visualize)
-        solver.solve_f_star(num_iterations=20000, spring_constant=1.75, o=0.0, i_round=4, visualize=visualize)
-        solver.solve_f_star(num_iterations=20000, spring_constant=1.5, o=0.0, i_round=5, visualize=visualize)
-        solver.solve_f_star(num_iterations=30000, spring_constant=1.0, o=0.0, i_round=6, visualize=visualize)
-        solver.solve_f_star(num_iterations=15000, spring_constant=0.75, o=0.02, i_round=7, visualize=visualize)
-        solver.solve_f_star(num_iterations=15000, spring_constant=0.8, o=0.02, i_round=8, visualize=visualize)
-        solver.solve_f_star(num_iterations=15000, spring_constant=0.9, o=0.02, i_round=9, visualize=visualize)
-        solver.solve_f_star(num_iterations=15000, spring_constant=1.1, o=0.0, i_round=10, visualize=visualize)
+        # solver.solve_f_star(num_iterations=10000, spring_constant=4.5, o=0.000, i_round=0, visualize=visualize)
+        # solver.solve_f_star(num_iterations=10000, spring_constant=4.0, o=0.00, i_round=1, visualize=visualize)
+        # solver.solve_f_star(num_iterations=20000, spring_constant=3.25, o=0.0, i_round=2, visualize=visualize)
+        # solver.solve_f_star(num_iterations=20000, spring_constant=2.50, o=0.0, i_round=3, visualize=visualize)
+        # solver.solve_f_star(num_iterations=20000, spring_constant=1.75, o=0.0, i_round=4, visualize=visualize)
+        # solver.solve_f_star(num_iterations=20000, spring_constant=1.5, o=0.0, i_round=5, visualize=visualize)
+        solver.solve_f_star(num_iterations=50000, spring_constant=1.0, o=0.0, i_round=6, visualize=visualize)
+        # solver.solve_f_star(num_iterations=15000, spring_constant=0.75, o=0.02, i_round=7, visualize=visualize)
+        # solver.solve_f_star(num_iterations=15000, spring_constant=0.8, o=0.02, i_round=8, visualize=visualize)
+        # solver.solve_f_star(num_iterations=15000, spring_constant=0.9, o=0.02, i_round=9, visualize=visualize)
+        # solver.solve_f_star(num_iterations=15000, spring_constant=1.1, o=0.0, i_round=10, visualize=visualize)
         solver.save_graph(save_path)
     else:
         solver.load_graph(save_path)
@@ -268,6 +303,7 @@ def main(graph_path="graph_scroll5_january_unrolling_full_v2.bin", experiment_na
 
     # fresh_start_star = 0 # continue solve computation from fresh_start
     i_round = run_f_star(solver, experiment_name, continue_from=fresh_start_star, visualize=visualize)
+    # i_round = run_f_star_lr(solver, experiment_name, continue_from=fresh_start_star, visualize=visualize)
     solver.filter_f_star() # filter the graph based on f_star solution
     solver.generate_ply(f"experiments/{experiment_name}/solved_f_star.ply")
 

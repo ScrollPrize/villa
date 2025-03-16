@@ -37,6 +37,7 @@ struct Node {
     float f_init;                // Initial value of f for this node
     float f_tilde;               // Current value of f_tilde for this node (used in BP updates)
     float f_star;                // The computed final value of f for this node
+    float f_star_momentum = 0.0f;       // Momentum accumulator (initialize to 0)
     float happiness = 0.0f;      // Happiness value for this node
     float happiness_old = 0.0f;  // Old happiness value for this node
     bool gt;                     // Indicates if this node has ground truth available

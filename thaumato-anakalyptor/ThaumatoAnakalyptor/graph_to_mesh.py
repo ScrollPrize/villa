@@ -1781,7 +1781,7 @@ if __name__ == '__main__':
     start_point = [3164, 3476, 3472]
     import argparse
     parser = argparse.ArgumentParser(description='Unroll a graph to a sheet')
-    parser.add_argument('--path', type=str, help='Path to the instances', required=True)
+    parser.add_argument('--path', type=str, help='Path to the instances. If type is H5, please input the path without the ".h5" suffix.', required=True)
     parser.add_argument('--graph', type=str, help='Path to the graph file from --Path', required=True)
     parser.add_argument('--fragment', action='store_true', help='Meshing Fragment, each layer as separate mesh')
     parser.add_argument('--debug', action='store_true', help='Debug mode')

@@ -963,42 +963,58 @@ __global__ void update_nodes_kernel_f_star(Node* d_graph, size_t* d_valid_indice
         float k_dif = edge.k - n2n1 / spring_constant;
 
         float certainty = edge.certainty;
-        certainty = 0.01f;
+        // certainty = 0.01f;
         float k = edge.k;
 
         if (certainty < 0.001f) {
             continue;
         }
 
+        float step_edge = 1.0f;
         // Node winding angle update calculation
         if (edge.same_block) {
             // update closeness
             node.same_block_closeness += fabsf(k_dif);
-            certainty *= fmaxf(1.0f, 0.25f * node.same_block_closeness_old / 360.0f);
-            certainty *= fmaxf(1.0f, 0.25f * k_dif / 360.0f);
+            // certainty *= fmaxf(1.0f, 0.25f * node.same_block_closeness_old / 360.0f);
+            // certainty *= fmaxf(1.0f, 0.25f * k_dif / 360.0f);
         }
         else {
+            step_edge *= 0.2f;
             float dk = n2n1 - spring_constant * k;
             float fitting_factor = fmaxf(1.0f, 1.0f / (1.0f + 0.01f * fabsf(dk)));
             float same_block_factor2 = fmaxf(1.0f, 1.0f * node.num_same_block_edges);
             float edges_factor = sqrt(1.0f * (node.num_edges - node.num_same_block_edges) * (d_graph[target_node].num_edges - d_graph[target_node].num_same_block_edges));
             float certainty_factor = 0.05f * fitting_factor * same_block_factor2 * edges_factor;
             // float certainty_factor = 0.05f * same_block_factor2 * edges_factor;
-            certainty *= certainty_factor;
-            k *= 0.02f; // wrong other block edges make the adjacent windings be closer together, if k is "the perfect" angle step, then we would have too steep winding lines, since they wrap around that would then lead to places where the lines need to bend abruptly to compensate for the too steepness compared to the distance between the windings
+            // certainty *= certainty_factor;
+            // k *= 0.02f; // wrong other block edges make the adjacent windings be closer together, if k is "the perfect" angle step, then we would have too steep winding lines, since they wrap around that would then lead to places where the lines need to bend abruptly to compensate for the too steepness compared to the distance between the windings
         }
         // calculate f star update
         float predicted_winding_angle = d_graph[target_node].f_tilde - spring_constant * k;
-        sum_w_f_tilde_k += certainty * predicted_winding_angle;
-        sum_w += certainty;
+        float error_k = node_f_tilde - predicted_winding_angle;
+        if (!edge.same_block && std::abs(error_k) > 0.250f) {
+            step_edge *= 10.2f;
+        }
+        float k_diff = predicted_winding_angle - node.f_star;
+        float sigma = 360.0f;
+        float step_loss = expf(-(k_diff * k_diff) / (2.0f * sigma * sigma));
+        sum_w_f_tilde_k += step_edge * certainty * step_loss * (predicted_winding_angle - node.f_star);
+        sum_w += step_edge * certainty * step_loss;
 
         // Calculate node happiness: mean difference between k and target f_tilde - node f_tilde target + target node happiness weighted multiplied by the certainty
         num_active_edges++;
+
     }
 
     if (sum_w > 0)
     {
-        node.f_star = (sum_w_f_tilde_k + o * node_f_tilde) / (sum_w + o);
+        // Add momentum: update the momentum field and then update f_star.
+        const float momentum_coef = 0.999f; // momentum coefficient (can be tuned)
+        float step = sum_w_f_tilde_k / sum_w;
+        step *= 0.0025f;
+        node.f_star_momentum = momentum_coef * node.f_star_momentum + step;
+        node.f_star += node.f_star_momentum;
+        // node.f_star = (sum_w_f_tilde_k + o * node_f_tilde) / (sum_w + o);
     }
     // Clip f_star to the range [ - 2 * 360 * estimated_windings, 2 * 360 * estimated_windings]
     float winding_max =  4 * 360 * estimated_windings;
@@ -1471,12 +1487,21 @@ __global__ void update_f_star_kernel(Node* d_graph, size_t* d_valid_indices, int
     Node& node = d_graph[i];
     if (node.deleted) return;
 
-    if (median_f_star != 0.0f) {
-        node.f_star -= median_f_star;
-    }
-
     // Update f_tilde with the computed f_star
-    node.f_tilde = node.f_star;
+    if (node.fixed) {
+        if (median_f_star != 0.0f) {
+            node.f_tilde -= median_f_star;
+        }
+        node.f_star = node.f_tilde;
+    }
+    else {
+        if (median_f_star != 0.0f) {
+            node.f_star -= median_f_star;
+        }
+        // Update f_tilde with the computed f_star
+        node.f_tilde = node.f_star;
+    }
+    // node.f_tilde = node.f_star;
 
     // Update the closeness between nodes
     node.same_block_closeness /= fmaxf(1.0, 1.0f * node.num_same_block_edges);
@@ -4636,6 +4661,7 @@ int fix_winding_nodes(std::vector<Node>& graph, int nr_nodes, int seed_node_old)
 }
 
 std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float o, float spring_constant, bool visualize) {
+    std::vector<Node> graph_copy = graph;
     if (i_round < 0) {
         o = o * 0.25f;
     }
@@ -4694,16 +4720,16 @@ std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations
         int step_size = 120;
         if (iter % step_size == 0) {
             // Copy results back to the host
-            auto [h_all_edges_, h_all_sides_] = copy_graph_from_gpu(graph.data(), d_graph, num_nodes, &d_all_edges, &d_all_sides, false, false);
+            auto [h_all_edges_, h_all_sides_] = copy_graph_from_gpu(graph_copy.data(), d_graph, num_nodes, &d_all_edges, &d_all_sides, false, false);
             // Generate filename with zero padding
             std::ostringstream filename_plot;
             filename_plot << "python_angles/winding_angles_python_" << i_round << "_" << iter << ".png";
             if (visualize) {
-                plot_nodes(graph, filename_plot.str());
+                plot_nodes(graph_copy, filename_plot.str());
             }
 
             // median_f_star
-            auto [median1, median2] = min_max_percentile_f_star(graph, 0.5f);
+            auto [median1, median2] = min_max_percentile_f_star(graph_copy, 0.5f);
             median_f_star = median1;
             
             // free old host memory
@@ -4720,17 +4746,14 @@ std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations
     std::cout << std::endl;
 
     // Graph to host
-    auto [h_all_edges_, h_all_sides_] = copy_graph_from_gpu(graph.data(), d_graph, num_nodes, &d_all_edges, &d_all_sides);
-    // free old h_all_edges
-    if (*h_all_edges != nullptr) {
-        delete[] *h_all_edges;
+    auto [h_all_edges_, h_all_sides_] = copy_graph_from_gpu(graph_copy.data(), d_graph, num_nodes, &d_all_edges, &d_all_sides, false, false);
+    // take over f star to original graph
+    for (size_t i = 0; i < num_nodes; ++i) {
+        graph[i].f_star = graph_copy[i].f_star;
+        graph[i].f_tilde = graph_copy[i].f_tilde;
+        // graph[i].f_star_momentum = graph_copy[i].f_star_momentum;
     }
-    *h_all_edges = h_all_edges_;
-    // free old h_all_sides
-    if (*h_all_sides != nullptr) {
-        delete[] *h_all_sides;
-    }
-    *h_all_sides = h_all_sides_;
+    
     // Free GPU memory
     free_edges_from_gpu(d_all_edges);
     free_sides_from_gpu(d_all_sides);
@@ -4935,6 +4958,7 @@ void spanning_tree_winding_number(std::vector<Node>& graph) {
 }
 
 std::vector<Node> run_solver_winding_number(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float other_block_factor, int seed_node, int side_fix_nr, bool display) {
+    std::vector<Node> graph_copy = graph;
     size_t fix_count = 0;
     size_t fixed_deficit = 0;
     bool adjusting_side = false;
@@ -5001,16 +5025,16 @@ std::vector<Node> run_solver_winding_number(std::vector<Node>& graph, int num_it
             // Copy results back to the host
             bool fix_nodes = side_fix_nr > 0 && !adjusting_side;
             // bool fix_nodes = side_fix_nr > 0;
-            auto [h_all_edges_, h_all_sides_] = copy_graph_from_gpu(graph.data(), d_graph, num_nodes, &d_all_edges, &d_all_sides, false, false);
+            auto [h_all_edges_, h_all_sides_] = copy_graph_from_gpu(graph_copy.data(), d_graph, num_nodes, &d_all_edges, &d_all_sides, false, false);
             
             if (display) {
                 // Generate filename with zero padding
                 std::ostringstream filename_plot_happyness;
                 filename_plot_happyness << "python_happyness/happyness_plot_python_" << i_round << "_" << iter << ".png";
-                plot_nodes_happyness(graph, filename_plot_happyness.str()); // plotting "standard" happyness
+                plot_nodes_happyness(graph_copy, filename_plot_happyness.str()); // plotting "standard" happyness
                 std::ostringstream filename_plot_nodes_winding_nrs;
                 filename_plot_nodes_winding_nrs << "python_winding_numbers/plot_nodes_winding_nrs_python_" << i_round << "_" << iter << ".png";
-                plot_nodes_winding_numbers(graph, filename_plot_nodes_winding_nrs.str());
+                plot_nodes_winding_numbers(graph_copy, filename_plot_nodes_winding_nrs.str());
             }
 
             // fix the top side_fix_nr nodes
@@ -5022,7 +5046,7 @@ std::vector<Node> run_solver_winding_number(std::vector<Node>& graph, int num_it
                 else {
                     fix_count = fix_count + 500;
                 }
-                fixed_deficit = fix_top_nodes(graph, fix_count-fixed_deficit, iter/step_size);
+                fixed_deficit = fix_top_nodes(graph_copy, fix_count-fixed_deficit, iter/step_size);
                 if (fixed_deficit == fixed_nr_nodes) {
                     std::cout << "All nodes are fixed" << std::endl;
                     break;
@@ -5032,8 +5056,8 @@ std::vector<Node> run_solver_winding_number(std::vector<Node>& graph, int num_it
 
             if (fix_nodes) {
                 // Re-copy the updated graph to GPU
-                num_nodes = graph.size();
-                update_fixed_field(d_graph, graph.data(), num_nodes);
+                num_nodes = graph_copy.size();
+                update_fixed_field(d_graph, graph_copy.data(), num_nodes);
             }
 
             // free old host memory
@@ -5051,17 +5075,18 @@ std::vector<Node> run_solver_winding_number(std::vector<Node>& graph, int num_it
     std::cout << std::endl;
 
     // Graph to host
-    auto [h_all_edges_, h_all_sides_] = copy_graph_from_gpu(graph.data(), d_graph, num_nodes, &d_all_edges, &d_all_sides);
-    // free old h_all_edges
-    if (*h_all_edges != nullptr) {
-        delete[] *h_all_edges;
+    auto [h_all_edges_, h_all_sides_] = copy_graph_from_gpu(graph_copy.data(), d_graph, num_nodes, &d_all_edges, &d_all_sides);
+
+    // take over f star to original graph
+    for (size_t i = 0; i < num_nodes; ++i) {
+        graph[i].f_star = graph_copy[i].f_star;
+        graph[i].f_tilde = graph_copy[i].f_tilde;
+        graph[i].winding_nr = graph_copy[i].winding_nr;
+        graph[i].winding_nr_old = graph_copy[i].winding_nr_old;
+        graph[i].fixed = graph_copy[i].fixed;
+        graph[i].side = graph_copy[i].side;
+        // graph[i].f_star_momentum = graph_copy[i].f_star_momentum;
     }
-    *h_all_edges = h_all_edges_;
-    // free old h_all_sides
-    if (*h_all_sides != nullptr) {
-        delete[] *h_all_sides;
-    }
-    *h_all_sides = h_all_sides_;
     // Free GPU memory
     free_edges_from_gpu(d_all_edges);
     free_sides_from_gpu(d_all_sides);

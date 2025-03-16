@@ -205,9 +205,21 @@ class PointCloudLabeler(QMainWindow):
 
         # --- Solver selection dropdown ---
         self.solver_combo = QComboBox()
-        self.solver_combo.addItems(["Winding Number", "F*", "Union", "Random"])
+        self.solver_combo.addItems(["F*", "F*2", "F*3", "F*4", "Winding Number", "Union", "Random", "Set Labels"])
         top_controls_layout.addWidget(QLabel("Select Solver:"))
         top_controls_layout.addWidget(self.solver_combo)
+
+        self.use_z_range_checkbox = QCheckBox("Solve in Z range")
+        self.use_z_range_checkbox.setChecked(False)
+        top_controls_layout.addWidget(self.use_z_range_checkbox)
+
+        solve_iterations_layout = QHBoxLayout()
+        self.solve_iterations_spinbox = QSpinBox()
+        self.solve_iterations_spinbox.setRange(10, 1000000)
+        self.solve_iterations_spinbox.setValue(15000)
+        solve_iterations_layout.addWidget(QLabel("Solver Iterations:"))
+        solve_iterations_layout.addWidget(self.solve_iterations_spinbox)
+        top_controls_layout.addLayout(solve_iterations_layout)
         
         spline_min_layout = QHBoxLayout()
         self.spline_min_points_spinbox = QSpinBox()
@@ -290,11 +302,16 @@ class PointCloudLabeler(QMainWindow):
         
         label_save_layout = QHBoxLayout()
         self.label_spinbox = QSpinBox()
-        self.label_spinbox.setRange(-1000, 1000)
+        self.label_spinbox.setRange(-10000, 1000)
         self.label_spinbox.setValue(1)
         label_save_layout.addWidget(QLabel("Label:"))
         label_save_layout.addWidget(self.label_spinbox)
         common_controls_layout.addLayout(label_save_layout)
+
+        self.erase_button = QPushButton("Erase Label")
+        # set label to unlabeled if erase button is checked
+        self.erase_button.clicked.connect(lambda: self.label_spinbox.setValue(self.UNLABELED))
+        common_controls_layout.addWidget(self.erase_button)
         
         self.calc_draw_button = QPushButton("Updated Labels Draw Mode: Off")
         self.calc_draw_button.setCheckable(True)
@@ -520,7 +537,7 @@ class PointCloudLabeler(QMainWindow):
 
             self.update_positions(update_labels=True)
 
-    def update_positions(self, update_labels=False):
+    def update_positions(self, update_labels=False, update_slide_ranges=True):
         self.recompute = True
         new_points = np.array(self.solver.get_positions())
         print(f"Points shape previous vs new: {self.points.shape} vs {new_points.shape}")
@@ -530,7 +547,8 @@ class PointCloudLabeler(QMainWindow):
             self.calculated_labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
         self.kdtree_xy = cKDTree(self.points[:, [0, 1]])
         self.kdtree_xz = cKDTree(self.points[:, [0, 2]])
-        self.update_slider_ranges()
+        if update_slide_ranges:
+            self.update_slider_ranges()
         self.update_views()
     
     def browse_for_directory(self, lineedit):
@@ -1427,30 +1445,83 @@ class PointCloudLabeler(QMainWindow):
     def update_labels(self):
         if self.solver is not None:
             gt = np.abs((self.labels - self.UNLABELED) > 2)
-            if not np.any(gt):
-                return
+            # if not np.any(gt):
+            #     return
             self.solver.set_labels(self.labels, gt)
-            selected_solver = self.solver_combo.currentText() if hasattr(self, "solver_combo") else "Winding Number"
+            selected_solver = self.solver_combo.currentText() if hasattr(self, "solver_combo") else "F*"
             if selected_solver == "Winding Number":
                 self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1,
                                                  other_block_factor=15.0, side_fix_nr=-1, display=False)
-            elif selected_solver == "F*":
+            elif "F*" in selected_solver:
+                if self.use_z_range_checkbox.isChecked():
+                    print("Using z-range")
+                    undeleted = self.solver.get_undeleted_indices()
+                    z_center = self.z_center_spinbox.value()
+                    z_thickness = self.z_thickness_slider.value() / self.scaleFactor
+                    z_min_val = 4 * (z_center - z_thickness / 2) - 500.0
+                    z_max_val = 4 * (z_center + z_thickness / 2) - 500.0
+                    deleted_mask_previous = self.solver.set_z_range(z_min_val, z_max_val)
+                    self.seed_node = None
+                else:
+                    deleted_mask_previous = np.zeros_like(self.labels, dtype=bool)
                 if self.seed_node is None:
+                    assert len(deleted_mask_previous) == len(self.labels), "Deleted mask shape mismatch"
                     # try to set a seed node. first labeled point found.
                     for i, label in tqdm(enumerate(self.labels), desc="Finding seed node"):
+                        if i == 0: # do not use "no-seed" index as seed node
+                            continue
                         if abs(label - self.UNLABELED) > 2:
-                            self.seed_node = i
+                            if deleted_mask_previous[i]:
+                                continue
+                            offset = np.logical_not(deleted_mask_previous[:i]).sum()
+                            self.seed_node = offset
                             break
                 if self.seed_node is not None:
+                    self.solver.set_labeled_edges(self.seed_node)
                     self.solver.set_f_star(self.seed_node)
-                self.solver.solve_f_star(50000, 1.0, visualize=True)
+                    # self.solver.fix_good_edges()
+                if selected_solver == "F*":
+                    self.solver.solve_f_star_with_labels(num_iterations=15000, seed_node=self.seed_node if self.seed_node else 0, spring_constant=1.1, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
+                    self.solver.solve_f_star_with_labels(num_iterations=15000, seed_node=self.seed_node if self.seed_node else 0, spring_constant=1.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
+                    # self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=3.0, other_block_factor=0.75, lr=7.0, error_cutoff=-1.0, display=True)
+                    # self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=2.0, other_block_factor=0.2, lr=4.0, error_cutoff=-1.0, display=True)
+                    # self.solver.solve_f_star_with_labels(num_iterations=30000, spring_constant=1.0, other_block_factor=0.2, lr=4.0, error_cutoff=-1.0, display=True)
+
+                    # self.solver.solve_f_star_with_labels(num_iterations=75000, seed_node=self.seed_node if self.seed_node else 0, other_block_factor=0.2, lr=4.0, error_cutoff=-1.0, display=True)
+                    # self.solver.solve_f_star_with_labels(num_iterations=75000, seed_node=self.seed_node if self.seed_node else 0, other_block_factor=0.3, lr=7.0, error_cutoff=-1.0, display=True)
+                    # self.solver.solve_f_star_with_labels(num_iterations=35000, seed_node=self.seed_node, other_block_factor=0.25, lr=3.0, error_cutoff=0.0, display=True)
+                    # self.solver.solve_f_star_with_labels(num_iterations=15000, other_block_factor=0.750, lr=3.0, error_cutoff=0.0, display=True)
+                    # self.solver.solve_f_star_with_labels(num_iterations=7500, other_block_factor=0.50, lr=5.0, error_cutoff=1080.0, display=True)
+                    # self.solver.solve_f_star_with_labels(num_iterations=7500, other_block_factor=0.50, lr=5.0, error_cutoff=720.0, display=True)
+                    # self.solver.solve_f_star_with_labels(num_iterations=7500, other_block_factor=0.50, lr=5.0, error_cutoff=360.0, display=True)
+                    # self.solver.solve_f_star_with_labels(num_iterations=7500, other_block_factor=0.50, lr=5.0, error_cutoff=180.0, display=True)
+                    # self.solver.solve_f_star_with_labels(num_iterations=7500, other_block_factor=0.50, lr=5.0, error_cutoff=90.0, display=True)
+                elif selected_solver == "F*2":
+                    # self.solver.solve_f_star_with_labels(num_iterations=20000, spring_constant=1.0, other_block_factor=0.03, lr=0.10, error_cutoff=-1.0, display=True)
+                    self.solver.solve_f_star_with_labels(num_iterations=int(self.solve_iterations_spinbox.value()), seed_node=self.seed_node if self.seed_node else 0, spring_constant=1.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
+                    # self.solver.solve_f_star_with_labels(num_iterations=35000, seed_node=self.seed_node if self.seed_node else 0, other_block_factor=1.0, lr=1.0, error_cutoff=0.0, display=True)
+                elif selected_solver == "F*3":
+                    self.solver.solve_f_star_with_labels(num_iterations=15000, seed_node=self.seed_node if self.seed_node else 0, spring_constant=4.0, other_block_factor=0.5, lr=0.25, error_cutoff=-1.0, display=True)
+                    self.solver.solve_f_star_with_labels(num_iterations=15000, seed_node=self.seed_node if self.seed_node else 0, spring_constant=2.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
+                    self.solver.solve_f_star_with_labels(num_iterations=30000, seed_node=self.seed_node if self.seed_node else 0, spring_constant=1.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
+                    # self.solver.solve_f_star_with_labels(num_iterations=30000, seed_node=self.seed_node if self.seed_node else 0, spring_constant=0.5, other_block_factor=0.02, lr=0.080, error_cutoff=-1.0, display=True)
+                elif selected_solver == "F*4":
+                    self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, o=0.0, i_round=6, visualize=True)
+
+                if self.use_z_range_checkbox.isChecked():
+                    print("Resetting z-range")
+                    self.solver.set_undeleted_indices(undeleted)
+                    self.seed_node = None
+
                 # Update positions
-                self.update_positions()
+                self.update_positions(update_slide_ranges=False)
                 return
             elif selected_solver == "Union":
                 self.solver.solve_union()
             elif selected_solver == "Random":
                 self.solver.solve_random(num_iterations=5000, i_round=-3, display=True)
+            elif selected_solver == "Set Labels":
+                print("Setting Labels and no solving.")
             else:
                 self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1,
                                                  other_block_factor=15.0, side_fix_nr=-1, display=False)
