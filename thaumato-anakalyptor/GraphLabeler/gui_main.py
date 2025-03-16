@@ -1533,6 +1533,13 @@ class PointCloudLabeler(QMainWindow):
         if self.solver is not None:
             gt = np.abs((self.labels - self.UNLABELED) > 2)
             self.solver.set_labels(self.labels, gt)
+            # delete unasigned points
+            label_indices = np.array(self.solver.get_undeleted_indices())
+            mask_labeled = np.abs(self.labels - self.UNLABELED) > 2
+            labeled_indices = list(label_indices[mask_labeled])
+            self.solver.set_undeleted_indices(labeled_indices)
+            print(f"Deleted Unlabeled Points: {len(label_indices) - len(labeled_indices)} of {len(label_indices)}. Saving graph...")
+            # Save graph as output_graph.bin for meshing
             graph_solved_path = self.graph_path.replace("graph.bin", "output_graph.bin")
             self.solver.save_solution(graph_solved_path)
     
