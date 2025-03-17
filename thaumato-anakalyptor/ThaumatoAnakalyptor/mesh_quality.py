@@ -93,14 +93,13 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
         # tri_uv[:, 1] = np.clip(tri_uv[:, 1], 0, image_size[1]-1)
 
         uv = (tri_uv * image_size).astype(np.int32)
-                
-        # Create a blank canvas (mask) the same size as the binary_mask.
-        triangle_mask = np.zeros(binary_mask.shape, dtype=np.uint8)
-        cv2.fillPoly(triangle_mask, [uv], 1)  # Fill triangle area with 1
+
+        triangle_mask_entries = binary_mask[uv[:, 1], uv[:, 0]]
+        print(f"Triangle {i}: {triangle_mask_entries}")
         
         # Use the triangle mask to index into the binary mask.
         # If any pixel in the binary mask (within the triangle) is 255, count the triangle as white.
-        if np.any(binary_mask[triangle_mask == 1] == 255):
+        if np.any(triangle_mask_entries == 255):
             white_triangles.append(triangles[i])
         else:
             black_triangles.append(triangles[i])
@@ -391,8 +390,9 @@ def calculate_vertices_error(vertices1, winding_angles1, winding_angles2, triang
     print(f"The standard deviation of the overlapping Input Mesh vertice distance to the Ground Truth Mesh is {std_distance}")
 
 def generate_colored_mask_png(triangle_ids, colors, uvs, image_size, path):
-    uvs = (uvs * image_size).astype(np.int32)
-    mask = np.zeros((*image_size[::-1], 3), dtype=np.uint8)
+    # downscale by 10x
+    uvs = (uvs * image_size // 10).astype(np.int32)
+    mask = np.zeros((*image_size[::-1] // 10, 3), dtype=np.uint8)
     colors = (colors * 255).astype(np.uint8)
     # color = np.array([255,255,255], dtype=np.uint8)
     for i, triangle_id in tqdm(enumerate(triangle_ids), desc="Generating colored mask"):
@@ -404,8 +404,6 @@ def generate_colored_mask_png(triangle_ids, colors, uvs, image_size, path):
         # except:
         #     pass
     mask = mask[::-1, :, :]
-    # downscale by 10x
-    mask = cv2.resize(mask, (image_size[0] // 10, image_size[1] // 10), interpolation=cv2.INTER_NEAREST)
     cv2.imwrite(path, mask)
 
 def winding_angle_color(winding_angle):
