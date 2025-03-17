@@ -62,8 +62,8 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
         white_threshold (int): Threshold value to consider a pixel white (default 128).
 
     Returns:
-        white_triangles (list): List of triangle indices (or indices into your triangles array) that are white.
-        black_triangles (list): List of triangle indices that are completely black.
+        white_triangles (np.ndarray): Array of triangle indices that fall on white regions.
+        black_triangles (np.ndarray): Array of triangle indices that fall on black regions.
     """
     # Find *_mask.png
     mask_path = glob.glob(os.path.join(os.path.dirname(mask_path), "*_mask.png"))
