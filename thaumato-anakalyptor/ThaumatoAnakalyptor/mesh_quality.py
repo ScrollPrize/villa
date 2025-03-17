@@ -605,7 +605,7 @@ def show_winding_angle_relationship(base_path, umbilicus_path, mesh_path1, mesh_
     image2_path = os.path.join(base_path, "winding_angles_masked_related2.png")
     print("Generating masked related winding angle images")
     generate_colored_mask_png(np.arange(len(uvs1[triangles_related_mask]))[mask_same_winding2], colors2[vertices_ids2][mask_same_winding2], uvs1[triangles_related_mask], img1_size, image1_path)
-    generate_colored_mask_png(np.arange(len(uvs2))[mask_same_winding1], colors1[vertices_ids1][mask_same_winding1], uvs2, img2_size, image2_path)
+    generate_colored_mask_png(np.arange(len(uvs2_mask))[mask_same_winding1], colors1[vertices_ids1][mask_same_winding1], uvs2_mask, img2_size, image2_path)
     print("Done generating masked related winding angle images")
     # find color of distances
     colors1 = np.array([distance_color(distance, distance_threshold) for distance in distances_v1_to_mesh2])
