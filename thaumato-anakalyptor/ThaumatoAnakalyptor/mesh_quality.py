@@ -378,6 +378,7 @@ def calculate_vertices_error(vertices1, winding_angles1, winding_angles2, triang
     print(f"The standard deviation of the overlapping Input Mesh vertice distance to the Ground Truth Mesh is {std_distance}")
 
 def generate_colored_mask_png(triangle_ids, colors, uvs, image_size, path):
+    image_size = np.array(image_size)
     # downscale by 10x
     uvs = (uvs * image_size // 10).astype(np.int32)
     mask = np.zeros((*(image_size[::-1] // 10), 3), dtype=np.uint8)
