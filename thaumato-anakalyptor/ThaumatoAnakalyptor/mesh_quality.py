@@ -84,9 +84,7 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
     
     uvs_scaled = (uvs * image_size).astype(np.int32)
     # clip
-    print(f"min max uvs: {np.min(uvs_scaled, axis=0)}, {np.max(uvs_scaled, axis=0)}")
     uvs_scaled = np.clip(uvs_scaled, 0, image_size - 1)
-    print(f"min max uvs: {np.min(uvs_scaled, axis=0)}, {np.max(uvs_scaled, axis=0)}")
     masked = binary_mask[uvs_scaled[..., 0], uvs_scaled[..., 1]]
     white_triangles_mask = np.any(masked, axis=1)
 
@@ -584,7 +582,7 @@ def show_winding_angle_relationship(base_path, umbilicus_path, mesh_path1, mesh_
     mask_same_winding2 = np.abs(winding_angles2[vertices_ids2] - winding_angles1[triangles1[triangles_related_mask][:, 0]]) < 90
     area_good = triangle_mask_area(triangles1[triangles_related_mask], vertices1, mask_same_winding2)
     # area_total = mesh1.get_surface_area()
-    area_total = triangle_mask_area(triangles1, vertices1, np.ones(len(triangles1), dtype=np.bool))
+    area_total = triangle_mask_area(triangles1, vertices1, np.ones(len(triangles1), dtype=bool))
     print(f"Area of good mesh2 surface in mesh1: {area_good} / {area_total} = {area_good / area_total}") # GP as GT, FASP related to this
     # for each triangle pick first vertice and relate to vertice of other mesh
     triangles_id1, distances_v2_to_mesh1 = find_closest_triangles_signed_distance(mesh2_triangle_points, scene1, mesh1_splitter)
@@ -594,7 +592,7 @@ def show_winding_angle_relationship(base_path, umbilicus_path, mesh_path1, mesh_
     mask_same_winding1 = np.abs(winding_angles1[vertices_ids1] - winding_angles2[triangles2_mask[:, 0]]) < 90
     area_good = triangle_mask_area(triangles2_mask, vertices2, mask_same_winding1)
     # area_total = mesh2.get_surface_area()
-    area_total = triangle_mask_area(triangles2_mask, vertices2, np.ones(len(triangles2_mask), dtype=np.bool))
+    area_total = triangle_mask_area(triangles2_mask, vertices2, np.ones(len(triangles2_mask), dtype=bool))
     print(f"Area of good mesh1 surface in mesh2: {area_good} / {area_total} = {area_good / area_total}")
     
     image1_path = os.path.join(base_path, "winding_angles_related1.png")
