@@ -88,7 +88,7 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
         # Convert UV coordinates for the triangle vertices to image pixel coordinates.
         # (Assumes uvs are normalized [0,1] so we multiply by image size)
         # Note: cv2.fillPoly expects points in (x, y) order.
-        tri_uv = uvs[tri].astype(np.int32)
+        tri_uv = uvs[tri]
         
         # Ensure the triangle coordinates are within image bounds
         # tri_uv[:, 0] = np.clip(tri_uv[:, 0], 0, image_size[0]-1)
