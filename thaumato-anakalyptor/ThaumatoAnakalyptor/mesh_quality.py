@@ -576,11 +576,12 @@ def show_winding_angle_relationship(base_path, umbilicus_path, mesh_path1, mesh_
     triangles_id2, distances_v1_to_mesh2 = find_closest_triangles_signed_distance(mesh1_triangle_points, scene2, mesh1_splitter)
     triangles_id2 = np.array(triangles_id2)
     # filter out non white distances and triangles
-    distances_v1_to_mesh2 = distances_v1_to_mesh2[white_triangles_mask[triangles_id2]]
-    triangles_id2 = triangles_id2[white_triangles_mask[triangles_id2]]
+    triangles_related_mask = white_triangles_mask[triangles_id2]
+    distances_v1_to_mesh2 = distances_v1_to_mesh2[triangles_related_mask]
+    triangles_id2 = triangles_id2[triangles_related_mask]
     # find vertice in triangles by id
     vertices_ids2 = triangles2[triangles_id2][:, 0]
-    mask_same_winding2 = np.abs(winding_angles2[vertices_ids2] - winding_angles1[triangles1[:, 0]]) < 90
+    mask_same_winding2 = np.abs(winding_angles2[vertices_ids2] - winding_angles1[triangles1[triangles_related_mask][:, 0]]) < 90
     area_good = triangle_mask_area(triangles1, vertices1, mask_same_winding2)
     # area_total = mesh1.get_surface_area()
     area_total = triangle_mask_area(triangles1, vertices1, np.ones(len(triangles1), dtype=np.bool))
