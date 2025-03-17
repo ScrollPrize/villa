@@ -84,7 +84,7 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
     print(f"Binary mask shape: {binary_mask.shape}")
     
     uvs_scaled = (uvs * image_size).astype(np.int32)
-    masked = binary_mask[uvs_scaled[..., 1], uvs_scaled[..., 0]]
+    masked = binary_mask[uvs_scaled[..., 0], uvs_scaled[..., 1]]
     white_triangles_mask = np.any(masked, axis=1)
     black_triangles_mask = np.logical_not(white_triangles_mask)
     white_triangles = triangles[white_triangles_mask]
@@ -92,7 +92,7 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
 
     print(f"Split triangles into {len(white_triangles)} white and {len(black_triangles)} black triangles.")
     
-    return np.array(white_triangles), np.array(black_triangles)
+    return white_triangles, black_triangles
 
 def calculate_winding_angle(default_splitter):
     # splitter.compute_uv_with_bfs(np.random.randint(0, splitter.vertices_np.shape[0]))
