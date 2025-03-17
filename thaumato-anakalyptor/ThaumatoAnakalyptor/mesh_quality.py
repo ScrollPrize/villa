@@ -62,9 +62,10 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
         white_threshold (int): Threshold value to consider a pixel white (default 128).
 
     Returns:
-        white_triangles (np.ndarray): Array of triangle indices that fall on white regions.
-        black_triangles (np.ndarray): Array of triangle indices that fall on black regions.
+        np.ndarray: Filtered UV coordinates.
+        np.ndarray: Filtered triangle indices.
     """
+
     # Find *_mask.png
     mask_path = glob.glob(os.path.join(os.path.dirname(mask_path), "*_mask.png"))
     if len(mask_path) == 0:
@@ -89,11 +90,11 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
     white_triangles_mask = np.any(masked, axis=1)
     black_triangles_mask = np.logical_not(white_triangles_mask)
     white_triangles = triangles[white_triangles_mask]
-    black_triangles = triangles[black_triangles_mask]
+    uvs = uvs[white_triangles_mask]
 
-    print(f"Split triangles into {len(white_triangles)} white and {len(black_triangles)} black triangles.")
+    print(f"Split triangles into {len(white_triangles)} white and {np.sum(black_triangles_mask)} black triangles.")
     
-    return white_triangles, black_triangles
+    return uvs, white_triangles
 
 def calculate_winding_angle(default_splitter):
     # splitter.compute_uv_with_bfs(np.random.randint(0, splitter.vertices_np.shape[0]))
@@ -379,7 +380,7 @@ def calculate_vertices_error(vertices1, winding_angles1, winding_angles2, triang
 def generate_colored_mask_png(triangle_ids, colors, uvs, image_size, path):
     # downscale by 10x
     uvs = (uvs * image_size // 10).astype(np.int32)
-    mask = np.zeros((*image_size[::-1] // 10, 3), dtype=np.uint8)
+    mask = np.zeros((*(image_size[::-1] // 10), 3), dtype=np.uint8)
     colors = (colors * 255).astype(np.uint8)
     # color = np.array([255,255,255], dtype=np.uint8)
     for i, triangle_id in tqdm(enumerate(triangle_ids), desc="Generating colored mask"):
@@ -503,7 +504,7 @@ def show_winding_angle_relationship(base_path, umbilicus_path, mesh_path1, mesh_
     mesh2, vertices2, triangles2, scene2 = load_mesh_vertices(mesh_path2)
     uvs2 = np.asarray(mesh2.triangle_uvs).reshape(-1, 3, 2)
 
-    triangles2, _ = filter_triangles_by_mask(image_path2, uvs2, triangles2)
+    uvs2, triangles2 = filter_triangles_by_mask(image_path2, uvs2, triangles2)
 
     # Color the meshes based on the XY coordinates to Red/Green to maybe spot winding switches
     colors1 = coloring_xy_redgreen(vertices1)
