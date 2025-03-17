@@ -76,6 +76,8 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
     mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
     if mask_img is None:
         raise ValueError(f"Could not load mask image from: {mask_path}")
+    
+    image_size = mask_img.shape[:2]
         
     # Threshold the image to obtain a binary mask (0 or 255)
     _, binary_mask = cv2.threshold(mask_img, white_threshold, 255, cv2.THRESH_BINARY)
@@ -90,11 +92,13 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
         # tri_uv[:, 0] = np.clip(tri_uv[:, 0], 0, image_size[0]-1)
         # tri_uv[:, 1] = np.clip(tri_uv[:, 1], 0, image_size[1]-1)
 
-        print(f"Triangle {i}: {tri_uv}")
+        uv = (tri_uv * image_size).astype(np.int32)
+
+        print(f"Triangle {i}: {uv}")
         
         # Create a blank canvas (mask) the same size as the binary_mask.
         triangle_mask = np.zeros(binary_mask.shape, dtype=np.uint8)
-        cv2.fillPoly(triangle_mask, [tri_uv], 1)  # Fill triangle area with 1
+        cv2.fillPoly(triangle_mask, [uv], 1)  # Fill triangle area with 1
         
         # Use the triangle mask to index into the binary mask.
         # If any pixel in the binary mask (within the triangle) is 255, count the triangle as white.
