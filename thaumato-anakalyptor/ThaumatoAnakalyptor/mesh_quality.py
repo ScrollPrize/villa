@@ -77,7 +77,7 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
     if mask_img is None:
         return triangles, np.array([])
     
-    image_size = mask_img.shape[:2]
+    image_size = np.array(mask_img.shape[:2])
         
     # Threshold the image to obtain a binary mask (0 or 255)
     _, binary_mask = cv2.threshold(mask_img, white_threshold, 255, cv2.THRESH_BINARY)
