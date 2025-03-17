@@ -1506,7 +1506,8 @@ class PointCloudLabeler(QMainWindow):
                     self.solver.solve_f_star_with_labels(num_iterations=30000, seed_node=self.seed_node if self.seed_node else 0, spring_constant=1.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
                     # self.solver.solve_f_star_with_labels(num_iterations=30000, seed_node=self.seed_node if self.seed_node else 0, spring_constant=0.5, other_block_factor=0.02, lr=0.080, error_cutoff=-1.0, display=True)
                 elif selected_solver == "F*4":
-                    self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, o=0.0, i_round=6, visualize=True)
+                    self.solver.solve_f_star(num_iterations=int(3 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=36000000.0, i_round=6, visualize=True)
+                    self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=360.0, i_round=6, visualize=True)
 
                 if self.use_z_range_checkbox.isChecked():
                     print("Resetting z-range")

@@ -938,7 +938,7 @@ __global__ void update_nodes_kernel(Node* d_graph, size_t* d_valid_indices, floa
 }
 
 // Kernel to update nodes on the GPU
-__global__ void update_nodes_kernel_f_star(Node* d_graph, size_t* d_valid_indices, float o, float spring_constant, int num_valid_nodes, int estimated_windings, int i_round) {
+__global__ void update_nodes_kernel_f_star(Node* d_graph, size_t* d_valid_indices, float o, float spring_constant, float step_sigma, int num_valid_nodes, int estimated_windings, int i_round) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_valid_nodes) return;
 
@@ -996,8 +996,9 @@ __global__ void update_nodes_kernel_f_star(Node* d_graph, size_t* d_valid_indice
             step_edge *= 10.2f;
         }
         float k_diff = predicted_winding_angle - node.f_star;
-        float sigma = 360.0f;
-        float step_loss = expf(-(k_diff * k_diff) / (2.0f * sigma * sigma));
+        float step_loss = expf(-(k_diff * k_diff) / (2.0f * step_sigma * step_sigma));
+        // step_loss = 1.0f; // only for testing, to make scroll windings straight in the end use the bell curve
+        // sum_w_f_tilde_k += step_edge * certainty * step_loss * (predicted_winding_angle - node.f_star + 0.5f * d_graph[target_node].f_star_momentum) / 1.5f;
         sum_w_f_tilde_k += step_edge * certainty * step_loss * (predicted_winding_angle - node.f_star);
         sum_w += step_edge * certainty * step_loss;
 
@@ -4660,7 +4661,7 @@ int fix_winding_nodes(std::vector<Node>& graph, int nr_nodes, int seed_node_old)
     }
 }
 
-std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float o, float spring_constant, bool visualize) {
+std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float o, float spring_constant, float step_sigma, bool visualize) {
     std::vector<Node> graph_copy = graph;
     if (i_round < 0) {
         o = o * 0.25f;
@@ -4696,7 +4697,7 @@ std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations
     // Run the iterations
     for (int iter = 1; iter < num_iterations; iter++) {
         // Launch the kernel to update nodes
-        update_nodes_kernel_f_star<<<blocksPerGrid, threadsPerBlock>>>(d_graph, d_valid_indices, o_current, spring_constant, num_valid_nodes, 200, i_round);
+        update_nodes_kernel_f_star<<<blocksPerGrid, threadsPerBlock>>>(d_graph, d_valid_indices, o_current, spring_constant, step_sigma, num_valid_nodes, 200, i_round);
 
         cudaError_t err = cudaGetLastError(); // Check for errors during kernel launch
         if (err != cudaSuccess) {

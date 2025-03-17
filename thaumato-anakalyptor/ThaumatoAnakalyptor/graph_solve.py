@@ -132,14 +132,15 @@ def run_f_star(solver, experiment_name="", continue_from=0, visualize=False):
     print(f"Running f_star solver")
     print(f"Visualize {visualize}")
     save_path = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_f_star_0.bin"
-    # if continue_from == 0:
-    #     # remove and remake dirs python_angles to save the solver visualization
-    #     os.system("rm -rf python_angles")
-    #     os.system("mkdir python_angles")
-    #     solver.solve_f_star(num_iterations=100000, spring_constant=5.0, o=0.0, i_round=-1, visualize=visualize)
-    #     solver.save_graph(save_path)
-    # elif continue_from == 1:
-    #     solver.load_graph(save_path)
+    if continue_from == 0:
+        # remove and remake dirs python_angles to save the solver visualization
+        os.system("rm -rf python_angles")
+        os.system("mkdir python_angles")
+        # solver.solve_f_star(num_iterations=100000, spring_constant=5.0, o=0.0, i_round=-1, visualize=visualize)
+        solver.solve_f_star(num_iterations=75000, spring_constant=1.0, o=0.0, step_sigma=36000000.0, i_round=0, visualize=visualize)
+        solver.save_graph(save_path)
+    elif continue_from == 1:
+        solver.load_graph(save_path)
     
     save_path = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_f_star_1.bin"
     if continue_from <= 1:
@@ -149,7 +150,7 @@ def run_f_star(solver, experiment_name="", continue_from=0, visualize=False):
         # solver.solve_f_star(num_iterations=20000, spring_constant=2.50, o=0.0, i_round=3, visualize=visualize)
         # solver.solve_f_star(num_iterations=20000, spring_constant=1.75, o=0.0, i_round=4, visualize=visualize)
         # solver.solve_f_star(num_iterations=20000, spring_constant=1.5, o=0.0, i_round=5, visualize=visualize)
-        solver.solve_f_star(num_iterations=50000, spring_constant=1.0, o=0.0, i_round=6, visualize=visualize)
+        solver.solve_f_star(num_iterations=15000, spring_constant=1.0, step_sigma=360.0, o=0.0, i_round=1, visualize=visualize)
         # solver.solve_f_star(num_iterations=15000, spring_constant=0.75, o=0.02, i_round=7, visualize=visualize)
         # solver.solve_f_star(num_iterations=15000, spring_constant=0.8, o=0.02, i_round=8, visualize=visualize)
         # solver.solve_f_star(num_iterations=15000, spring_constant=0.9, o=0.02, i_round=9, visualize=visualize)
@@ -166,7 +167,7 @@ def run_f_star(solver, experiment_name="", continue_from=0, visualize=False):
         except:
             print(f"Error compressing video experiments/{experiment_name}/python_angles_setup.avi")
 
-    return 11
+    return 2
 
 def run_ring(solver, experiment_name="", i_round=11, fresh_start=0, standard_winding_direction=False, scale_left=1.0, scale_right=1.0):
     print(f"Running ring solver with fresh_start {fresh_start}")
@@ -314,25 +315,26 @@ def main(graph_path="graph_scroll5_january_unrolling_full_v2.bin", experiment_na
     save_path = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_f_star_final.bin"
     solver.save_graph(save_path)
 
-    # solver.solve_union()
-    # exit()
+    if False: # not needed anymore with the manual Graph Labeling GUI
+        # solver.solve_union()
+        # exit()
 
-    # fresh_start_ring = 0 # continue solve computation from fresh_start
-    scale_outer = 1.0 # S5 right side
-    scale_inner = 1.0 # S5 left side
-    i_round = run_ring(solver, experiment_name, fresh_start=fresh_start_ring, i_round=i_round, standard_winding_direction=True, scale_left=scale_outer, scale_right=scale_inner)
-    solver.solution_loss()
+        # fresh_start_ring = 0 # continue solve computation from fresh_start
+        scale_outer = 1.0 # S5 right side
+        scale_inner = 1.0 # S5 left side
+        i_round = run_ring(solver, experiment_name, fresh_start=fresh_start_ring, i_round=i_round, standard_winding_direction=True, scale_left=scale_outer, scale_right=scale_inner)
+        solver.solution_loss()
 
-    if fresh_start_ring <= 4:
-        run_winding_number(solver, experiment_name, i_round=i_round)
-        solver.save_graph(f"experiments/{experiment_name}/checkpoints/checkpoint_graph_final.bin")
+        if fresh_start_ring <= 4:
+            run_winding_number(solver, experiment_name, i_round=i_round)
+            solver.save_graph(f"experiments/{experiment_name}/checkpoints/checkpoint_graph_final.bin")
 
-        #load graph
-        solver.load_graph(f"experiments/{experiment_name}/checkpoints/checkpoint_graph_final.bin")
-        solver.generate_ply(f"experiments/{experiment_name}/output_graph.ply")
+            #load graph
+            solver.load_graph(f"experiments/{experiment_name}/checkpoints/checkpoint_graph_final.bin")
+            solver.generate_ply(f"experiments/{experiment_name}/output_graph.ply")
 
-        solution_path = f"experiments/{experiment_name}/output_graph.bin"
-        solver.save_solution(solution_path)
+            solution_path = f"experiments/{experiment_name}/output_graph.bin"
+            solver.save_solution(solution_path)
 
 
 if __name__ == "__main__":
