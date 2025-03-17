@@ -84,12 +84,7 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
     black_triangles = []
     
     # Loop over triangles
-    for i, tri in enumerate(triangles):
-        # Convert UV coordinates for the triangle vertices to image pixel coordinates.
-        # (Assumes uvs are normalized [0,1] so we multiply by image size)
-        # Note: cv2.fillPoly expects points in (x, y) order.
-        tri_uv = uvs[tri]
-        
+    for i, tri_uv in tqdm(enumerate(uvs), desc="Filtering triangles by mask"):        
         # Ensure the triangle coordinates are within image bounds
         # tri_uv[:, 0] = np.clip(tri_uv[:, 0], 0, image_size[0]-1)
         # tri_uv[:, 1] = np.clip(tri_uv[:, 1], 0, image_size[1]-1)
@@ -101,9 +96,9 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
         # Use the triangle mask to index into the binary mask.
         # If any pixel in the binary mask (within the triangle) is 255, count the triangle as white.
         if np.any(binary_mask[triangle_mask == 1] == 255):
-            white_triangles.append(tri)
+            white_triangles.append(triangles[i])
         else:
-            black_triangles.append(tri)
+            black_triangles.append(triangles[i])
 
     print(f"Split triangles into {len(white_triangles)} white and {len(black_triangles)} black triangles.")
     
