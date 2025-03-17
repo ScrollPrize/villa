@@ -76,7 +76,7 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
     mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
     if mask_img is None:
         return triangles, np.array([])
-    mask_img = mask_img[::-1, :]
+    mask_img = mask_img[:, ::-1]
     
     image_size = np.array(mask_img.shape[:2])
         
