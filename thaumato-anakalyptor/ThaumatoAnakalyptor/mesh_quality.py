@@ -66,7 +66,12 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
         black_triangles (list): List of triangle indices that are completely black.
     """
     # Find *_mask.png
-    mask_path = glob.glob(os.path.join(os.path.dirname(mask_path), "*_mask.png"))[0]
+    mask_path = glob.glob(os.path.join(os.path.dirname(mask_path), "*_mask.png"))
+    if len(mask_path) == 0:
+        return triangles, np.array([])
+    mask_path = mask_path[0]
+    print(f"Using mask image: {mask_path}")
+    
     # Load mask image in grayscale
     mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
     if mask_img is None:
@@ -96,9 +101,9 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
         # Use the triangle mask to index into the binary mask.
         # If any pixel in the binary mask (within the triangle) is 255, count the triangle as white.
         if np.any(binary_mask[triangle_mask == 1] == 255):
-            white_triangles.append(i)
+            white_triangles.append(tri)
         else:
-            black_triangles.append(i)
+            black_triangles.append(tri)
 
     print(f"Split triangles into {len(white_triangles)} white and {len(black_triangles)} black triangles.")
     
