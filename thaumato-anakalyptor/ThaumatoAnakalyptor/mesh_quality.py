@@ -93,9 +93,7 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
         # tri_uv[:, 1] = np.clip(tri_uv[:, 1], 0, image_size[1]-1)
 
         uv = (tri_uv * image_size).astype(np.int32)
-
-        print(f"Triangle {i}: {uv}")
-        
+                
         # Create a blank canvas (mask) the same size as the binary_mask.
         triangle_mask = np.zeros(binary_mask.shape, dtype=np.uint8)
         cv2.fillPoly(triangle_mask, [uv], 1)  # Fill triangle area with 1
