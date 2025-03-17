@@ -62,8 +62,7 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
         white_threshold (int): Threshold value to consider a pixel white (default 128).
 
     Returns:
-        np.ndarray: Filtered UV coordinates.
-        np.ndarray: Filtered triangle indices.
+        np.ndarray: Boolean mask indicating whether each triangle is white.
     """
 
     # Find *_mask.png
@@ -89,13 +88,10 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
     uvs_scaled = np.clip(uvs_scaled, 0, image_size - 1)
     masked = binary_mask[uvs_scaled[..., 0], uvs_scaled[..., 1]]
     white_triangles_mask = np.any(masked, axis=1)
-    black_triangles_mask = np.logical_not(white_triangles_mask)
-    white_triangles = triangles[white_triangles_mask]
-    uvs = uvs[white_triangles_mask]
 
-    print(f"Split triangles into {len(white_triangles)} white and {np.sum(black_triangles_mask)} black triangles.")
+    print(f"Split triangles into {np.sum(white_triangles_mask)} white and {len(white_triangles_mask) - np.sum(white_triangles_mask)} black triangles.")
     
-    return uvs, white_triangles
+    return white_triangles_mask
 
 def calculate_winding_angle(default_splitter):
     # splitter.compute_uv_with_bfs(np.random.randint(0, splitter.vertices_np.shape[0]))
@@ -506,7 +502,9 @@ def show_winding_angle_relationship(base_path, umbilicus_path, mesh_path1, mesh_
     mesh2, vertices2, triangles2, scene2 = load_mesh_vertices(mesh_path2)
     uvs2 = np.asarray(mesh2.triangle_uvs).reshape(-1, 3, 2)
 
-    uvs2, triangles2 = filter_triangles_by_mask(image_path2, uvs2, triangles2)
+    white_triangles_mask = filter_triangles_by_mask(image_path2, uvs2, triangles2)
+    uvs2_mask = uvs2[white_triangles_mask]
+    triangles2_mask = triangles2[white_triangles_mask]
 
     # Color the meshes based on the XY coordinates to Red/Green to maybe spot winding switches
     colors1 = coloring_xy_redgreen(vertices1)
@@ -514,11 +512,11 @@ def show_winding_angle_relationship(base_path, umbilicus_path, mesh_path1, mesh_
     image1_path = os.path.join(base_path, "xy_colors1.png")
     image2_path = os.path.join(base_path, "xy_colors2.png")
     print("Generating xy color images")
-    generate_colored_mask_png(range(len(uvs1)), colors1[triangles1[:, 0]], uvs1, img1_size, image1_path)
-    generate_colored_mask_png(range(len(uvs2)), colors2[triangles2[:, 0]], uvs2, img2_size, image2_path)
+    generate_colored_mask_png(np.arange(len(uvs1)), colors1[triangles1[:, 0]], uvs1, img1_size, image1_path)
+    generate_colored_mask_png(np.arange(len(uvs2_mask)), colors2[triangles2_mask[:, 0]], uvs2_mask, img2_size, image2_path)
     print("Done generating xy color images")
 
-    generate_colored_mask_png(range(len(uvs1)), np.ones((len(uvs1), 3), dtype=np.uint8), uvs1, img1_size, os.path.join(base_path, "mask_test.png"))
+    generate_colored_mask_png(np.arange(len(uvs1)), np.ones((len(uvs1), 3), dtype=np.uint8), uvs1, img1_size, os.path.join(base_path, "mask_test.png"))
     # generate a winding angle assignment to flattening image
     image1_path = os.path.join(base_path, "winding_angles1.png")
     image2_path = os.path.join(base_path, "winding_angles2.png")
@@ -539,7 +537,7 @@ def show_winding_angle_relationship(base_path, umbilicus_path, mesh_path1, mesh_
     # find color of winding angles
     colors1 = np.array([winding_angle_color(winding_angle) for winding_angle in winding_angles1])
     print("Generating winding angle images")
-    generate_colored_mask_png(range(len(uvs1)), colors1[triangles1[:, 0]], uvs1, img1_size, image1_path)
+    generate_colored_mask_png(np.arange(len(uvs1)), colors1[triangles1[:, 0]], uvs1, img1_size, image1_path)
     print("Done generating winding angle images")
 
     mesh2_splitter = MeshSplitter(mesh_path2, umbilicus_path, use_tempfile=True)
@@ -564,43 +562,48 @@ def show_winding_angle_relationship(base_path, umbilicus_path, mesh_path1, mesh_
     # find color of winding angles
     colors2 = np.array([winding_angle_color(winding_angle) for winding_angle in winding_angles2])
     print("Generating winding angle images")
-    generate_colored_mask_png(range(len(uvs2)), colors2[triangles2[:, 0]], uvs2, img2_size, image2_path)
+    generate_colored_mask_png(np.arange(len(uvs2_mask)), colors2[triangles2_mask[:, 0]], uvs2_mask, img2_size, image2_path)
     print("Done generating winding angle images")
 
     # Creates a image of the flattened meshes where the winding angles are shown as colored triangles
     # also creates an image where the distance to the proper winding is show. green/red and intensity for direction and distance, grey if over threshold
     # for each triangle pick first vertice and relate to vertice of other mesh
     mesh1_triangle_points = vertices1[triangles1[:, 0]]
-    mesh2_triangle_points = vertices2[triangles2[:, 0]]
+    mesh2_triangle_points = vertices2[triangles2_mask[:, 0]]
     triangles_id2, distances_v1_to_mesh2 = find_closest_triangles_signed_distance(mesh1_triangle_points, scene2, mesh1_splitter)
     triangles_id2 = np.array(triangles_id2)
+    # filter out non white distances and triangles
+    distances_v1_to_mesh2 = distances_v1_to_mesh2[white_triangles_mask[triangles_id2]]
+    triangles_id2 = triangles_id2[white_triangles_mask[triangles_id2]]
     # find vertice in triangles by id
     vertices_ids2 = triangles2[triangles_id2][:, 0]
     mask_same_winding2 = np.abs(winding_angles2[vertices_ids2] - winding_angles1[triangles1[:, 0]]) < 90
     area_good = triangle_mask_area(triangles1, vertices1, mask_same_winding2)
-    area_total = mesh1.get_surface_area()
+    # area_total = mesh1.get_surface_area()
+    area_total = triangle_mask_area(triangles1, vertices1, np.ones(len(triangles1), dtype=np.bool))
     print(f"Area of good mesh2 surface in mesh1: {area_good} / {area_total} = {area_good / area_total}") # GP as GT, FASP related to this
     # for each triangle pick first vertice and relate to vertice of other mesh
     triangles_id1, distances_v2_to_mesh1 = find_closest_triangles_signed_distance(mesh2_triangle_points, scene1, mesh1_splitter)
     triangles_id1 = np.array(triangles_id1)
     # find vertice in triangles by id
     vertices_ids1 = triangles1[triangles_id1][:, 0]
-    mask_same_winding1 = np.abs(winding_angles1[vertices_ids1] - winding_angles2[triangles2[:, 0]]) < 90
-    area_good = triangle_mask_area(triangles2, vertices2, mask_same_winding1)
-    area_total = mesh2.get_surface_area()
+    mask_same_winding1 = np.abs(winding_angles1[vertices_ids1] - winding_angles2[triangles2_mask[:, 0]]) < 90
+    area_good = triangle_mask_area(triangles2_mask, vertices2, mask_same_winding1)
+    # area_total = mesh2.get_surface_area()
+    area_total = triangle_mask_area(triangles2_mask, vertices2, np.ones(len(triangles2_mask), dtype=np.bool))
     print(f"Area of good mesh1 surface in mesh2: {area_good} / {area_total} = {area_good / area_total}")
     
     image1_path = os.path.join(base_path, "winding_angles_related1.png")
     image2_path = os.path.join(base_path, "winding_angles_related2.png")
     print("Generating related winding angle images")
-    generate_colored_mask_png(range(len(uvs1)), colors2[vertices_ids2], uvs1, img1_size, image1_path)
-    generate_colored_mask_png(range(len(uvs2)), colors1[vertices_ids1], uvs2, img2_size, image2_path)
+    generate_colored_mask_png(np.arange(len(uvs1)), colors2[vertices_ids2], uvs1, img1_size, image1_path)
+    generate_colored_mask_png(np.arange(len(uvs2_mask)), colors1[vertices_ids1], uvs2_mask, img2_size, image2_path)
     print("Done generating related winding angle images")
     image1_path = os.path.join(base_path, "winding_angles_masked_related1.png")
     image2_path = os.path.join(base_path, "winding_angles_masked_related2.png")
     print("Generating masked related winding angle images")
-    generate_colored_mask_png(np.array(range(len(uvs1)))[mask_same_winding2], colors2[vertices_ids2][mask_same_winding2], uvs1, img1_size, image1_path)
-    generate_colored_mask_png(np.array(range(len(uvs2)))[mask_same_winding1], colors1[vertices_ids1][mask_same_winding1], uvs2, img2_size, image2_path)
+    generate_colored_mask_png(np.arange(len(uvs1))[mask_same_winding2], colors2[vertices_ids2][mask_same_winding2], uvs1, img1_size, image1_path)
+    generate_colored_mask_png(np.arange(len(uvs2))[mask_same_winding1], colors1[vertices_ids1][mask_same_winding1], uvs2, img2_size, image2_path)
     print("Done generating masked related winding angle images")
     # find color of distances
     colors1 = np.array([distance_color(distance, distance_threshold) for distance in distances_v1_to_mesh2])
@@ -608,8 +611,8 @@ def show_winding_angle_relationship(base_path, umbilicus_path, mesh_path1, mesh_
     image1_path = os.path.join(base_path, "distance1.png")
     image2_path = os.path.join(base_path, "distance2.png")
     print("Generating distance images")
-    generate_colored_mask_png(range(len(uvs1)), colors1, uvs1, img1_size, image1_path)
-    generate_colored_mask_png(range(len(uvs2)), colors2, uvs2, img2_size, image2_path)
+    generate_colored_mask_png(np.arange(len(uvs1)), colors1, uvs1, img1_size, image1_path)
+    generate_colored_mask_png(np.arange(len(uvs2_mask)), colors2, uvs2_mask, img2_size, image2_path)
     print("Done generating distance images")
 
 def compute(base_path, input_mesh, input_raw_pointcloud, input_instance_pointcloud, mesh_path2, umbilicus_path, max_distance, distance_threshold, fresh_start=True):
