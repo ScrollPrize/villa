@@ -83,26 +83,11 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
     _, binary_mask = cv2.threshold(mask_img, white_threshold, 255, cv2.THRESH_BINARY)
     print(f"Binary mask shape: {binary_mask.shape}")
     
-    white_triangles = []
-    black_triangles = []
-    
-    # Loop over triangles
-    for i, tri_uv in tqdm(enumerate(uvs), desc="Filtering triangles by mask"):        
-        # Ensure the triangle coordinates are within image bounds
-        # tri_uv[:, 0] = np.clip(tri_uv[:, 0], 0, image_size[0]-1)
-        # tri_uv[:, 1] = np.clip(tri_uv[:, 1], 0, image_size[1]-1)
-
-        uv = (tri_uv * image_size).astype(np.int32)
-
-        triangle_mask_entries = binary_mask[uv[:, 1], uv[:, 0]]
-        print(f"Triangle {i}: {triangle_mask_entries}")
-        
-        # Use the triangle mask to index into the binary mask.
-        # If any pixel in the binary mask (within the triangle) is 255, count the triangle as white.
-        if np.any(triangle_mask_entries == 255):
-            white_triangles.append(triangles[i])
-        else:
-            black_triangles.append(triangles[i])
+    uvs_scaled = (uvs * image_size).astype(np.int32)[:,::-1]
+    white_triangles_mask = np.any(binary_mask[uvs_scaled], axis=1)
+    black_triangles_mask = np.logical_not(white_triangles_mask)
+    white_triangles = triangles[white_triangles_mask]
+    black_triangles = triangles[black_triangles_mask]
 
     print(f"Split triangles into {len(white_triangles)} white and {len(black_triangles)} black triangles.")
     
