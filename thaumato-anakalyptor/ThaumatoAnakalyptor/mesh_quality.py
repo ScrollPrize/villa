@@ -83,8 +83,8 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
     _, binary_mask = cv2.threshold(mask_img, white_threshold, 255, cv2.THRESH_BINARY)
     print(f"Binary mask shape: {binary_mask.shape}")
     
-    uvs_scaled = (uvs * image_size).astype(np.int32)[:,:,::-1]
-    masked = binary_mask[uvs_scaled]
+    uvs_scaled = (uvs * image_size).astype(np.int32)
+    masked = binary_mask[uvs_scaled[..., 1], uvs_scaled[..., 0]]
     white_triangles_mask = np.any(masked, axis=1)
     black_triangles_mask = np.logical_not(white_triangles_mask)
     white_triangles = triangles[white_triangles_mask]
