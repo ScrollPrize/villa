@@ -582,7 +582,7 @@ def show_winding_angle_relationship(base_path, umbilicus_path, mesh_path1, mesh_
     # find vertice in triangles by id
     vertices_ids2 = triangles2[triangles_id2][:, 0]
     mask_same_winding2 = np.abs(winding_angles2[vertices_ids2] - winding_angles1[triangles1[triangles_related_mask][:, 0]]) < 90
-    area_good = triangle_mask_area(triangles1, vertices1, mask_same_winding2)
+    area_good = triangle_mask_area(triangles1[triangles_related_mask], vertices1, mask_same_winding2)
     # area_total = mesh1.get_surface_area()
     area_total = triangle_mask_area(triangles1, vertices1, np.ones(len(triangles1), dtype=np.bool))
     print(f"Area of good mesh2 surface in mesh1: {area_good} / {area_total} = {area_good / area_total}") # GP as GT, FASP related to this
@@ -606,7 +606,7 @@ def show_winding_angle_relationship(base_path, umbilicus_path, mesh_path1, mesh_
     image1_path = os.path.join(base_path, "winding_angles_masked_related1.png")
     image2_path = os.path.join(base_path, "winding_angles_masked_related2.png")
     print("Generating masked related winding angle images")
-    generate_colored_mask_png(np.arange(len(uvs1))[mask_same_winding2], colors2[vertices_ids2][mask_same_winding2], uvs1, img1_size, image1_path)
+    generate_colored_mask_png(np.arange(len(uvs1[triangles_related_mask]))[mask_same_winding2], colors2[vertices_ids2][mask_same_winding2], uvs1[triangles_related_mask], img1_size, image1_path)
     generate_colored_mask_png(np.arange(len(uvs2))[mask_same_winding1], colors1[vertices_ids1][mask_same_winding1], uvs2, img2_size, image2_path)
     print("Done generating masked related winding angle images")
     # find color of distances
