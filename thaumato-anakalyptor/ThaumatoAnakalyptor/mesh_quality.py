@@ -473,6 +473,8 @@ def triangle_mask_area(triangles, vertices, mask):
     return area
 
 def show_winding_angle_relationship(base_path, umbilicus_path, mesh_path1, mesh_path2, max_distance, distance_threshold=100):
+    # make dirs
+    os.makedirs(base_path, exist_ok=True)
     # load the image sizes
     image_path1 = mesh_path1.replace(".obj", ".png")
     image_path2 = mesh_path2.replace(".obj", ".png")
