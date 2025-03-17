@@ -79,6 +79,7 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
         
     # Threshold the image to obtain a binary mask (0 or 255)
     _, binary_mask = cv2.threshold(mask_img, white_threshold, 255, cv2.THRESH_BINARY)
+    print(f"Binary mask shape: {binary_mask.shape}")
     
     white_triangles = []
     black_triangles = []
@@ -88,6 +89,8 @@ def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
         # Ensure the triangle coordinates are within image bounds
         # tri_uv[:, 0] = np.clip(tri_uv[:, 0], 0, image_size[0]-1)
         # tri_uv[:, 1] = np.clip(tri_uv[:, 1], 0, image_size[1]-1)
+
+        print(f"Triangle {i}: {tri_uv}")
         
         # Create a blank canvas (mask) the same size as the binary_mask.
         triangle_mask = np.zeros(binary_mask.shape, dtype=np.uint8)
