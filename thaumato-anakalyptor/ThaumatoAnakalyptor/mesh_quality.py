@@ -1,13 +1,10 @@
 ### Julian Schilliger - ThaumatoAnakalyptor - Vesuvius Challenge 2024
 
 import open3d as o3d
-import igl
 import numpy as np
 import cv2
 from PIL import Image
 Image.MAX_IMAGE_PIXELS = None
-from scipy.spatial import KDTree
-from scipy.cluster.hierarchy import fcluster, linkage
 import argparse
 import os
 from .split_mesh import MeshSplitter
@@ -15,7 +12,7 @@ from .sheet_to_mesh import scale_points, shuffling_points_axis
 import tempfile
 from tqdm import tqdm
 import pickle
-from copy import deepcopy
+import glob
 
 def setup_closest_triangles(mesh):
     mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
@@ -52,6 +49,60 @@ def load_mesh_vertices(obj_file, use_tempfile=True):
 
     scene = setup_closest_triangles(mesh)
     return mesh, vertices, triangles, scene
+
+def filter_triangles_by_mask(mask_path, uvs, triangles, white_threshold=128):
+    """
+    Filters triangles based on whether they fall on a white or black region of a mask image.
+    If any pixel within a triangle's area is white, the triangle is counted as white.
+
+    Args:
+        mask_path (str): File path to the black & white mask image.
+        uvs (np.ndarray): Array of UV coordinates (shape: [num_uv, 2]). Assumed to be normalized [0, 1].
+        triangles (np.ndarray): Array of triangle indices (shape: [num_triangles, 3]).
+        white_threshold (int): Threshold value to consider a pixel white (default 128).
+
+    Returns:
+        white_triangles (list): List of triangle indices (or indices into your triangles array) that are white.
+        black_triangles (list): List of triangle indices that are completely black.
+    """
+    # Find *_mask.png
+    mask_path = glob.glob(os.path.join(os.path.dirname(mask_path), "*_mask.png"))[0]
+    # Load mask image in grayscale
+    mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if mask_img is None:
+        raise ValueError(f"Could not load mask image from: {mask_path}")
+        
+    # Threshold the image to obtain a binary mask (0 or 255)
+    _, binary_mask = cv2.threshold(mask_img, white_threshold, 255, cv2.THRESH_BINARY)
+    
+    white_triangles = []
+    black_triangles = []
+    
+    # Loop over triangles
+    for i, tri in enumerate(triangles):
+        # Convert UV coordinates for the triangle vertices to image pixel coordinates.
+        # (Assumes uvs are normalized [0,1] so we multiply by image size)
+        # Note: cv2.fillPoly expects points in (x, y) order.
+        tri_uv = uvs[tri].astype(np.int32)
+        
+        # Ensure the triangle coordinates are within image bounds
+        # tri_uv[:, 0] = np.clip(tri_uv[:, 0], 0, image_size[0]-1)
+        # tri_uv[:, 1] = np.clip(tri_uv[:, 1], 0, image_size[1]-1)
+        
+        # Create a blank canvas (mask) the same size as the binary_mask.
+        triangle_mask = np.zeros(binary_mask.shape, dtype=np.uint8)
+        cv2.fillPoly(triangle_mask, [tri_uv], 1)  # Fill triangle area with 1
+        
+        # Use the triangle mask to index into the binary mask.
+        # If any pixel in the binary mask (within the triangle) is 255, count the triangle as white.
+        if np.any(binary_mask[triangle_mask == 1] == 255):
+            white_triangles.append(i)
+        else:
+            black_triangles.append(i)
+
+    print(f"Split triangles into {len(white_triangles)} white and {len(black_triangles)} black triangles.")
+    
+    return np.array(white_triangles), np.array(black_triangles)
 
 def calculate_winding_angle(default_splitter):
     # splitter.compute_uv_with_bfs(np.random.randint(0, splitter.vertices_np.shape[0]))
@@ -461,6 +512,8 @@ def show_winding_angle_relationship(base_path, umbilicus_path, mesh_path1, mesh_
     uvs1 = np.asarray(mesh1.triangle_uvs).reshape(-1, 3, 2)
     mesh2, vertices2, triangles2, scene2 = load_mesh_vertices(mesh_path2)
     uvs2 = np.asarray(mesh2.triangle_uvs).reshape(-1, 3, 2)
+
+    triangles2, _ = filter_triangles_by_mask(image_path2, uvs2, triangles2)
 
     # Color the meshes based on the XY coordinates to Red/Green to maybe spot winding switches
     colors1 = coloring_xy_redgreen(vertices1)
