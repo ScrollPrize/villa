@@ -23,16 +23,13 @@ Julian Schilliger 2025 ThaumatoAnakalyptor
 #include <thread>
 
 // Kernel to update nodes on the GPU with momentum
-inline __global__ void update_nodes_kernel_f_star_step(Node* d_graph, size_t* d_valid_indices, size_t seed_node, float seed_tilde, float spring_constant, float other_block_factor, float lr, float error_cutoff, int num_valid_nodes, int estimated_windings, float* d_global_sum_compressed, float* d_global_sum_decompressed) {
+inline __global__ void update_nodes_kernel_f_star_step(Node* d_graph, size_t* d_valid_indices, float spring_constant, float other_block_factor, float lr, float error_cutoff, int num_valid_nodes, int estimated_windings, float* d_global_sum_compressed, float* d_global_sum_decompressed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_valid_nodes) return;
 
     size_t i = d_valid_indices[idx];
     Node& node = d_graph[i];
     if (node.deleted) return;
-    if (i == seed_node && seed_node != 0) {
-        return;
-    }
 
     float same_block_factor = 1.0f;
     if (other_block_factor > 1.0f) {
@@ -45,23 +42,18 @@ inline __global__ void update_nodes_kernel_f_star_step(Node* d_graph, size_t* d_
     float step = 0.0f;
     float count_compressed = 0;
     float count_decompressed = 0;
+    float total_certainty = 0.0f;
 
     Edge* edges = node.edges;
     // Loop over all edges to compute the update step
     for (int j = 0; j < node.num_edges; ++j) {
         const Edge& edge = edges[j];
         size_t target_node = edge.target_node;
-        float target_tilde = seed_tilde;
         float step_edge = lr;
-        if (target_node != seed_node || seed_node == 0) {
-            target_tilde = d_graph[target_node].f_tilde;
-            if (d_graph[target_node].deleted) continue;
-            if (node.fixed && d_graph[target_node].fixed && !edge.fixed) {
-                continue;
-            }
-            // if (node.fixed && !d_graph[target_node].fixed) {
-            //     step_edge *= 0.10f;
-            // }
+        float target_tilde = d_graph[target_node].f_tilde;
+        if (d_graph[target_node].deleted) continue;
+        if (node.fixed && d_graph[target_node].fixed && !edge.fixed) {
+            continue;
         }
 
         float k = spring_constant * edge.k;
@@ -73,9 +65,13 @@ inline __global__ void update_nodes_kernel_f_star_step(Node* d_graph, size_t* d_
         // if (fabsf(predicted_winding_angle - node_f_tilde) < 0.1f) {
         //     continue;
         // }
-
+        float certainty = 1.0f;
         // Adjust step_edge based on edge properties
-        if (edge.fixed) {
+        if ((!node.fixed || !d_graph[target_node].fixed) && edge.fixed) {
+            // certainty = 100.0f;
+            step_edge *= 100.0f;
+        }
+        else if (edge.fixed) {
             step_edge *= 2.0f;
         }
         else if (edge.same_block) {
@@ -114,11 +110,17 @@ inline __global__ void update_nodes_kernel_f_star_step(Node* d_graph, size_t* d_
                 }
             }
         }
-        step += step_edge;
+
+        total_certainty += certainty;
+        step += certainty * step_edge;
     }
 
     // Add momentum: update the momentum field and then update f_star.
     const float momentum_coef = 0.999f; // momentum coefficient (can be tuned)
+    if (total_certainty == 0.0f) {
+        total_certainty = 1.0f;
+    }
+    // step = step / total_certainty;
     node.f_star_momentum = momentum_coef * node.f_star_momentum + step;
     node.f_star += node.f_star_momentum;
 
@@ -541,7 +543,7 @@ inline void plot_nodes(const std::vector<Node>& graph, const std::string& filena
     cv::waitKey(1);
 }
 
-std::vector<Node> run_solver_f_star_with_labels(std::vector<Node>& graph, int num_iterations, size_t seed_node, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, float spring_constant, float other_block_factor, float lr, float error_cutoff, bool visualize) {
+std::vector<Node> run_solver_f_star_with_labels(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, float spring_constant, float other_block_factor, float lr, float error_cutoff, bool visualize) {
     std::vector<Node> graph_copy = graph;
     std::cout << "Visualize: " << visualize << std::endl;
     // Allocate space for min and max f_star values on the GPU
@@ -568,7 +570,6 @@ std::vector<Node> run_solver_f_star_with_labels(std::vector<Node>& graph, int nu
     // CUDA kernel configuration
     int threadsPerBlock = 256;
     int blocksPerGrid = (num_valid_nodes + threadsPerBlock - 1) / threadsPerBlock;
-    float seed_tilde = graph[seed_node].f_tilde;
 
     // Run the iterations
     for (int iter = 1; iter < num_iterations; iter++) {        
@@ -580,7 +581,7 @@ std::vector<Node> run_solver_f_star_with_labels(std::vector<Node>& graph, int nu
         cudaMemset(d_global_sum_decompressed, 0, sizeof(float));
 
         // Launch the kernel to update nodes
-        update_nodes_kernel_f_star_step<<<blocksPerGrid, threadsPerBlock>>>(d_graph, d_valid_indices, seed_node, seed_tilde, spring_constant, other_block_factor, lr, error_cutoff, num_valid_nodes, 200, d_global_sum_compressed, d_global_sum_decompressed);
+        update_nodes_kernel_f_star_step<<<blocksPerGrid, threadsPerBlock>>>(d_graph, d_valid_indices, spring_constant, other_block_factor, lr, error_cutoff, num_valid_nodes, 200, d_global_sum_compressed, d_global_sum_decompressed);
         float h_global_sum_compressed = 0;
         float h_global_sum_decompressed = 0;
         cudaMemcpy(&h_global_sum_compressed, d_global_sum_compressed, sizeof(float), cudaMemcpyDeviceToHost);

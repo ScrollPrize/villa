@@ -78,6 +78,9 @@ class PointCloudLabeler(QMainWindow):
         
         # Data and labels.
         self.points = np.array(point_data)
+        self.group = np.zeros(len(self.points), dtype=np.int32)
+        self.active_group = 0
+        self.last_group_update = 0
         self.labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
         self.calculated_labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
         
@@ -94,13 +97,16 @@ class PointCloudLabeler(QMainWindow):
         
         # Pre-created brushes.
         self.brush_black = pg.mkBrush(0, 0, 0)
-        self.brush_red   = pg.mkBrush(255, 0, 0)
-        self.brush_green = pg.mkBrush(0, 255, 0)
-        self.brush_blue  = pg.mkBrush(0, 0, 255)
-        self.calc_brush_black = pg.mkBrush(0, 0, 0, 100)
-        self.calc_brush_red   = pg.mkBrush(255, 0, 0, 100)
-        self.calc_brush_green = pg.mkBrush(0, 255, 0, 100)
-        self.calc_brush_blue  = pg.mkBrush(0, 0, 255, 100)
+        self.brush_red_active   = pg.mkBrush(255, 0, 0)
+        self.brush_green_active = pg.mkBrush(0, 255, 0)
+        self.brush_brown_active  = pg.mkBrush(218,165,32)        
+        self.brush_red_inactive   = pg.mkBrush(205, 0, 200, 180)
+        self.brush_green_inactive = pg.mkBrush(0, 205, 200, 180)
+        self.brush_brown_inactive  = pg.mkBrush(168,125,152, 180)
+        self.calc_brush_black = pg.mkBrush(0, 0, 0, 80)
+        self.calc_brush_red   = pg.mkBrush(255, 0, 0, 80)
+        self.calc_brush_green = pg.mkBrush(0, 255, 0, 80)
+        self.calc_brown_blue  = pg.mkBrush(218,165,32, 80)
         
         # Guide lines and indicators.
         self.line_finit_neg = pg.InfiniteLine(pos=-180, angle=0, pen=pg.mkPen('grey', width=1, style=Qt.DashLine))
@@ -205,7 +211,7 @@ class PointCloudLabeler(QMainWindow):
 
         # --- Solver selection dropdown ---
         self.solver_combo = QComboBox()
-        self.solver_combo.addItems(["F*", "F*2", "F*3", "F*4", "Winding Number", "Union", "Random", "Set Labels"])
+        self.solver_combo.addItems(["F*", "F*2", "F*4", "Winding Number", "Union", "Random", "Set Labels"])
         top_controls_layout.addWidget(QLabel("Select Solver:"))
         top_controls_layout.addWidget(self.solver_combo)
 
@@ -265,6 +271,10 @@ class PointCloudLabeler(QMainWindow):
         effective_range_layout.addWidget(QLabel("max:"))
         effective_range_layout.addWidget(self.assign_max_spinbox)
         top_controls_layout.addLayout(effective_range_layout)
+
+        self.deleted_range_button = QPushButton("<-- Delete Range")
+        self.deleted_range_button.clicked.connect(self.delete_range)
+        top_controls_layout.addWidget(self.deleted_range_button)
         
         main_layout.addLayout(top_controls_layout)
         
@@ -331,6 +341,38 @@ class PointCloudLabeler(QMainWindow):
         common_controls_layout.addWidget(self.save_graph_button)
         
         main_layout.addLayout(common_controls_layout)
+
+
+        # --------------------------------------------------
+        # Cellar Layout
+        # --------------------------------------------------
+        cellar_controls_layout = QHBoxLayout()
+
+        # Show Max Group (just display, no control)
+        self.max_group_label = QLabel("Max Group: 0")
+        cellar_controls_layout.addWidget(self.max_group_label)
+
+        group_save_layout = QHBoxLayout()
+        self.group_spinbox = QSpinBox()
+        self.group_spinbox.setRange(0, 1)
+        self.group_spinbox.setValue(0)
+        self.group_spinbox.valueChanged.connect(self.update_group)
+        group_save_layout.addWidget(QLabel("Group:"))
+        group_save_layout.addWidget(self.group_spinbox)
+        self.group_offset_spinbox = QSpinBox()
+        self.group_offset_spinbox.setRange(-1000, 1000)
+        self.group_offset_spinbox.setValue(0)
+        group_save_layout.addWidget(QLabel("Group Offset:"))
+        group_save_layout.addWidget(self.group_offset_spinbox)
+        self.merge_group_button = QPushButton("Apply Group Offset")
+        self.merge_group_button.clicked.connect(self.offset_group)
+        group_save_layout.addWidget(self.merge_group_button)
+        self.merge_group_button = QPushButton("Merge Group")
+        self.merge_group_button.clicked.connect(self.merge_group)
+        group_save_layout.addWidget(self.merge_group_button)
+        cellar_controls_layout.addLayout(group_save_layout)
+
+        main_layout.addLayout(cellar_controls_layout)
         
         # Create scatter items for displaying points.
         self.xy_scatter = pg.ScatterPlotItem(size=self.point_size, pen=None)
@@ -557,24 +599,36 @@ class PointCloudLabeler(QMainWindow):
             lineedit.setText(directory)
     
     def save_labels_to_path(self):
-        fname, _ = QFileDialog.getSaveFileName(self, "Save Labels", "", "Text Files (*.txt);;All Files (*)")
+        fname, _ = QFileDialog.getSaveFileName(self, "Save Labels", os.path.join("../experiments", self.default_experiment), "Text Files (*.txt);;All Files (*)")
         if fname:
             with open(fname, "w") as f:
-                f.write(str(self.labels.tolist()))
+                # write labels + group to file
+                data = json.dumps({"labels": self.labels.tolist(), "group": self.group.tolist()})
+                f.write(data)
     
     def load_labels_from_path(self):
         fname, _ = QFileDialog.getOpenFileName(self, "Load Labels", os.path.join("../experiments", self.default_experiment),
                                                  "Text Files (*.txt);;All Files (*)")
         if fname:
             with open(fname, "r") as f:
-                data = f.read()
+                data = json.load(f)
             try:
-                new_labels = np.array(ast.literal_eval(data), dtype=np.int32)
+                new_labels = np.array(data["labels"], dtype=np.int32)
+                new_groups = np.array(data["group"], dtype=np.int32)
             except Exception as e:
-                QMessageBox.warning(self, "Load Labels", f"Error reading file: {e}")
-                return
+                # Fallback to old label save format
+                print("Falling back to old label format.")
+                with open(fname, "r") as f:
+                    data = f.read()
+                try:
+                    new_labels = np.array(ast.literal_eval(data), dtype=np.int32)
+                    new_groups = np.zeros(len(new_labels), dtype=np.int32)
+                except Exception as e:
+                    QMessageBox.warning(self, "Load Labels", f"Error reading file: {e}")
+                    return
             if len(new_labels) == len(self.labels):
                 self.labels = new_labels
+                self.group = new_groups
                 self.update_views()
             else:
                 QMessageBox.warning(self, "Load Labels", "Loaded labels length does not match current data.")
@@ -714,36 +768,107 @@ class PointCloudLabeler(QMainWindow):
             for item in [self.line_z_center, self.line_z_upper, self.line_z_lower, self.xy_horizontal_indicator]:
                 if item.scene() is not None:
                     self.xz_plot.removeItem(item)
+
+    def update_group(self, val):
+        self.active_group = val
+        self.update_views()
+
+    def update_groups_data(self):
+        # Do only once every n_seconds
+        n_seconds = 5
+        if time.time() - self.last_group_update < n_seconds:
+            return
+        self.last_group_update = time.time()
+
+        self.max_group = np.max(self.group)
+        self.max_group_label.setText(f"Max Group: {self.max_group}")
+        self.group_spinbox.setMaximum(self.max_group + 1)
+
+    def offset_group(self):
+        offset = int(self.group_offset_spinbox.value())
+        if self.active_group == 0:
+            return
+        # Track undo/redo
+        self.undo_stack.append((self.labels.copy(), self.group.copy()))
+        self.redo_stack = []
+
+        self.labels[self.group == self.active_group] += offset
+        # Set the offset group back to 0.
+        self.group_offset_spinbox.setValue(0)
+        self.update_views()
+
+    def merge_group(self):
+        if self.active_group == 0:
+            return
+        
+        # Open Ask Dialog
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Question)
+        msg.setText("Merge Group")
+        msg.setInformativeText(f"Merge the active group ({self.active_group}) with the GT (0) group?")
+        msg.setWindowTitle("Merge Group")
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setDefaultButton(QMessageBox.Yes)
+        ret = msg.exec_()
+        if ret == QMessageBox.No:
+            print("Merge Group cancelled.")
+            return
+        print(f"Merging group {self.active_group} with GT group.")
+        
+        # Track undo/redo
+        self.undo_stack.append((self.labels.copy(), self.group.copy()))
+        self.redo_stack = []
+        
+        self.group[self.group == self.active_group] = 0
+        mask_higher_groups = self.group > self.active_group
+        self.group[mask_higher_groups] -= 1
+        self.active_group = 0
+
+        self.update_views()
     
-    def downsample_points(self, pts, labels, calc_labels=None, max_display=1):
+    def downsample_points(self, pts, labels, groups, calc_labels=None, max_display=1):
         n = pts.shape[0]
         if n > max_display:
             indices = np.linspace(0, n - 1, max_display, dtype=int)
             if calc_labels is not None:
-                return pts[indices], labels[indices], calc_labels[indices]
+                return pts[indices], labels[indices], groups[indices], calc_labels[indices]
             else:
-                return pts[indices], labels[indices]
+                return pts[indices], labels[indices], groups[indices]
         else:
             if calc_labels is not None:
-                return pts, labels, calc_labels
+                return pts, labels, groups, calc_labels
             else:
-                return pts, labels
+                return pts, labels, groups
     
-    def get_brushes_from_labels(self, labels_array):
+    def get_brushes_from_labels(self, labels_array, group_array):
         brushes = np.empty(labels_array.shape[0], dtype=object)
         mask_unlabeled = (labels_array == self.UNLABELED) | (labels_array == self.UNLABELED + 1) | (labels_array == self.UNLABELED - 1)
         brushes[mask_unlabeled] = self.brush_black
         mask_valid = ~mask_unlabeled
         valid_labels = labels_array[mask_valid]
+        valid_groups = group_array[mask_valid]
+        mask_active_group = valid_groups == self.active_group
+        count_active_group = 0
+        count_inactive_group = 0
         mod = valid_labels % 3
         valid_indices = np.where(mask_valid)[0]
         for i, idx in enumerate(valid_indices):
-            if mod[i] == 0:
-                brushes[idx] = self.brush_red
-            elif mod[i] == 1:
-                brushes[idx] = self.brush_green
-            elif mod[i] == 2:
-                brushes[idx] = self.brush_blue
+            if mask_active_group[i]:
+                count_active_group += 1
+                if mod[i] == 0:
+                    brushes[idx] = self.brush_red_active
+                elif mod[i] == 1:
+                    brushes[idx] = self.brush_green_active
+                elif mod[i] == 2:
+                    brushes[idx] = self.brush_brown_active
+            else:
+                count_inactive_group += 1
+                if mod[i] == 0:
+                    brushes[idx] = self.brush_red_inactive
+                elif mod[i] == 1:
+                    brushes[idx] = self.brush_green_inactive
+                elif mod[i] == 2:
+                    brushes[idx] = self.brush_brown_inactive
         return brushes
     
     def _enable_pencil(self, plot_widget, scatter_item, view_name='xy'):
@@ -765,7 +890,7 @@ class PointCloudLabeler(QMainWindow):
         if (ev.button() == Qt.LeftButton and self.drawing_mode_checkbox.isChecked() and not self.s_pressed):
             ev.accept()
             if self._stroke_backup is None:
-                self._stroke_backup = self.labels.copy()
+                self._stroke_backup = (self.labels.copy(), self.group.copy())
             if self.calc_drawing_mode:
                 self._paint_points_calculated(ev, plot_widget, view_name)
             else:
@@ -855,6 +980,7 @@ class PointCloudLabeler(QMainWindow):
             # Update the labels for the points that were found.
             if indices.size:
                 self.labels[indices] = update_label
+                self.group[indices] = self.active_group
 
         # Save the current mouse position and time for the next event.
         self.last_mouse_point = (x_m, y_m)
@@ -914,6 +1040,7 @@ class PointCloudLabeler(QMainWindow):
                 for i in indices:
                     if self.labels[i] == self.UNLABELED and self.calculated_labels[i] != self.UNLABELED:
                         self.labels[i] = self.calculated_labels[i]
+                        self.group[i] = self.active_group
 
         # Save the current mouse position and time for the next event.
         self.last_mouse_point = (x_m, y_m)
@@ -938,6 +1065,7 @@ class PointCloudLabeler(QMainWindow):
         mask_xy = (self.points[:, 2] >= z_min_val) & (self.points[:, 2] <= z_max_val)
         pts_xy = self.points[mask_xy]
         labels_xy = self.labels[mask_xy]
+        group_xy = self.group[mask_xy]
         calc_labels_xy = self.calculated_labels[mask_xy]
         t2 = time.time()
         # print("Step 2 (XY: mask & extract pts/labels):", t2 - t1, "s")
@@ -948,6 +1076,7 @@ class PointCloudLabeler(QMainWindow):
         if pts_top.size:
             pts_top[:, 1] += 360
         labels_top = labels_xy[mask_top] - 1
+        group_top = group_xy[mask_top]
         calc_labels_top = calc_labels_xy[mask_top] - 1
         t3 = time.time()
         # print("Step 3 (XY: top wrap adjustment):", t3 - t2, "s")
@@ -958,6 +1087,7 @@ class PointCloudLabeler(QMainWindow):
         if pts_bottom.size:
             pts_bottom[:, 1] -= 360
         labels_bottom = labels_xy[mask_bottom] + 1
+        group_bottom = group_xy[mask_bottom]
         calc_labels_bottom = calc_labels_xy[mask_bottom] + 1
         t4 = time.time()
         # print("Step 4 (XY: bottom wrap adjustment):", t4 - t3, "s")
@@ -965,14 +1095,15 @@ class PointCloudLabeler(QMainWindow):
         # ----- Combine and downsample XY arrays -----
         pts_combined = np.concatenate([pts_xy, pts_top, pts_bottom], axis=0)
         labels_combined = np.concatenate([labels_xy, labels_top, labels_bottom], axis=0)
+        group_combined = np.concatenate([group_xy, group_top, group_bottom], axis=0)
         calc_labels_combined = np.concatenate([calc_labels_xy, calc_labels_top, calc_labels_bottom], axis=0)
-        pts_combined, labels_combined, calc_labels_combined = self.downsample_points(
-            pts_combined, labels_combined, calc_labels_combined, self.max_display)
+        pts_combined, labels_combined, group_combined, calc_labels_combined = self.downsample_points(
+            pts_combined, labels_combined, group_combined, calc_labels_combined, self.max_display)
         t5 = time.time()
         # print("Step 5 (XY: combine & downsample):", t5 - t4, "s")
         
         # ----- Compute new brushes for XY view -----
-        new_brushes_xy = self.get_brushes_from_labels(labels_combined)
+        new_brushes_xy = self.get_brushes_from_labels(labels_combined, group_combined)
         t6 = time.time()
         # print("XY Step 6 (brushes):", t6 - t5, "s")
         
@@ -1031,7 +1162,7 @@ class PointCloudLabeler(QMainWindow):
             elif mod == 1:
                 new_brushes_calc_xy[i] = self.calc_brush_green
             elif mod == 2:
-                new_brushes_calc_xy[i] = self.calc_brush_blue
+                new_brushes_calc_xy[i] = self.calc_brown_blue
         calc_xy_key = (z_center, self.z_thickness_slider.value(), pts_combined_calc.shape[0])
         if self.recompute or not hasattr(self, "_cached_calc_xy_key") or self._cached_calc_xy_key != calc_xy_key:
             self.xy_calc_scatter.setData(x=pts_combined_calc[:, 0] if pts_combined_calc.size else [],
@@ -1061,6 +1192,7 @@ class PointCloudLabeler(QMainWindow):
         mask_xz = (self.points[:, 1] >= finit_min_val) & (self.points[:, 1] <= finit_max_val)
         pts_xz = self.points[mask_xz]
         labels_xz = self.labels[mask_xz]
+        group_xz = self.group[mask_xz]
         shear_angle_deg_xz = self.xz_shear_spinbox.value()
         xz_shear_factor = np.tan(np.radians(shear_angle_deg_xz))
         if pts_xz.size:
@@ -1069,9 +1201,9 @@ class PointCloudLabeler(QMainWindow):
             new_x_xz = pts_xz[:, 0]
         pts_xz_display = pts_xz.copy()
         pts_xz_display[:, 0] = new_x_xz
-        pts_xz_display, labels_xz = self.downsample_points(pts_xz_display, labels=labels_xz, max_display=self.max_display)
+        pts_xz_display, labels_xz, group_xz = self.downsample_points(pts_xz_display, labels=labels_xz, groups=group_xz, max_display=self.max_display)
         new_xz_geometry = {'x': pts_xz_display[:, 0], 'y': pts_xz_display[:, 2]}
-        new_brushes_xz = self.get_brushes_from_labels(labels_xz)
+        new_brushes_xz = self.get_brushes_from_labels(labels_xz, group_xz)
         t8 = time.time()
         # print("XZ Step 8 (processing & downsampling):", t8 - t7b, "s")
         
@@ -1122,7 +1254,7 @@ class PointCloudLabeler(QMainWindow):
             elif mod == 1:
                 new_brushes_calc_xz[i] = self.calc_brush_green
             elif mod == 2:
-                new_brushes_calc_xz[i] = self.calc_brush_blue
+                new_brushes_calc_xz[i] = self.calc_brown_blue
         calc_xz_key = (finit_center, self.finit_thickness_slider.value(), pts_calc_xz_display.shape[0])
         if self.recompute or not hasattr(self, "_cached_calc_xz_key") or self._cached_calc_xz_key != calc_xz_key:
             self.xz_calc_scatter.setData(x=pts_calc_xz_display[:, 0] if pts_calc_xz_display.size else [],
@@ -1146,6 +1278,7 @@ class PointCloudLabeler(QMainWindow):
         
         # ----- Update guides -----
         self.update_guides()
+        self.update_groups_data()
         t11 = time.time()
 
         if hasattr(self, 'ome_zarr_window') and self.ome_zarr_window is not None:
@@ -1165,6 +1298,7 @@ class PointCloudLabeler(QMainWindow):
         z_min_val = z_center - z_thickness / 2
         z_max_val = z_center + z_thickness / 2
         mask = (self.points[:, 2] >= z_min_val) & (self.points[:, 2] <= z_max_val)
+        mask = np.logical_and(mask, self.group == 0) # only consider group 0 points
         pts = self.points[mask]
         labels_xy = self.labels[mask]
         calc_labels_xy = self.calculated_labels[mask]
@@ -1320,12 +1454,17 @@ class PointCloudLabeler(QMainWindow):
                     self.spline_segments.setdefault(ul, []).append(polyline)
     
     def assign_line_labels(self):
+        # Track undo/redo
+        self.undo_stack.append((self.labels.copy(), self.group.copy()))
+        self.redo_stack = []
+        
         thresh = self.line_distance_threshold_spinbox.value()
         z_center = self.z_center_spinbox.value()
         z_thickness = self.z_thickness_slider.value() / self.scaleFactor
         z_min_val = z_center - z_thickness / 2
         z_max_val = z_center + z_thickness / 2
         mask = (self.points[:, 2] >= z_min_val) & (self.points[:, 2] <= z_max_val)
+        mask = np.logical_and(mask, self.group == 0) # only consider group 0 points
         pts = self.points[mask]
         current_labels = self.labels[mask]
         calc_labels = self.calculated_labels[mask]
@@ -1376,6 +1515,7 @@ class PointCloudLabeler(QMainWindow):
             if d_self < thresh and d_self < d_minus and d_self < d_plus and calc_labels[idx] != self.UNLABELED:
                 global_idx = global_indices[idx]
                 self.labels[global_idx] = calc_labels[idx]
+                self.group = 0 # Use GT group when assigning line labels
                 assign_count += 1
             if j % update_interval == 0:
                 progress.setValue(j)
@@ -1384,6 +1524,26 @@ class PointCloudLabeler(QMainWindow):
         progress.close()
         self.update_views()
         print(f"Assigned line labels to {assign_count} points (threshold: {thresh}).")
+
+    def delete_range(self):
+        # delete points within the specified range
+        z_center = self.z_center_spinbox.value()
+        z_thickness = self.z_thickness_slider.value() / self.scaleFactor
+        z_min_val = z_center - z_thickness / 2
+        z_max_val = z_center + z_thickness / 2
+        mask = (self.points[:, 2] >= z_min_val) & (self.points[:, 2] <= z_max_val)
+        range_min = self.assign_min_spinbox.value()
+        range_max = self.assign_max_spinbox.value()
+        mask = np.logical_and(mask, np.logical_and(self.labels >= range_min, self.labels <= range_max))
+        mask = np.logical_and(mask, self.group == self.active_group) # Only delete points in the active group
+
+        # Track undo/redo
+        self.undo_stack.append((self.labels.copy(), self.group.copy()))
+        self.redo_stack = []
+
+        self.labels[mask] = self.UNLABELED
+        self.group[mask] = 0
+        self.update_views()
     
     def pick_label_at(self, ev, plot_widget):
         dataPos = plot_widget.plotItem.vb.mapSceneToView(ev.scenePos())
@@ -1436,18 +1596,21 @@ class PointCloudLabeler(QMainWindow):
     def activate_pipette(self):
         self.pipette_mode = True
     
-    def update_ground_truth(self):
-        ground_truth = self.labels.tolist()
-        with open("ground_truth.txt", "w") as f:
-            f.write(str(ground_truth))
-    
     # Example of using the solver interface when updating labels:
     def update_labels(self):
         if self.solver is not None:
             gt = np.abs((self.labels - self.UNLABELED) > 2)
-            # if not np.any(gt):
-            #     return
-            self.solver.set_labels(self.labels, gt)
+            gt_0 = np.logical_and(gt, self.group == 0) # only consider group 0 points
+
+            self.solver.set_labels(self.labels, gt_0)
+            groups = np.unique(self.group)
+            for group in groups:
+                if group == 0:
+                    continue
+                gt_g = np.logical_and(gt, self.group == group)
+                print(f"Sum of gt_g: {np.sum(gt_g)} in group {group}")
+                self.solver.fix_good_edges(self.labels, gt_g)
+
             selected_solver = self.solver_combo.currentText() if hasattr(self, "solver_combo") else "F*"
             if selected_solver == "Winding Number":
                 self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1,
@@ -1479,32 +1642,15 @@ class PointCloudLabeler(QMainWindow):
                 if self.seed_node is not None:
                     self.solver.set_labeled_edges(self.seed_node)
                     self.solver.set_f_star(self.seed_node)
-                    # self.solver.fix_good_edges()
                 if selected_solver == "F*":
-                    self.solver.solve_f_star_with_labels(num_iterations=15000, seed_node=self.seed_node if self.seed_node else 0, spring_constant=1.1, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
-                    self.solver.solve_f_star_with_labels(num_iterations=15000, seed_node=self.seed_node if self.seed_node else 0, spring_constant=1.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
-                    # self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=3.0, other_block_factor=0.75, lr=7.0, error_cutoff=-1.0, display=True)
-                    # self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=2.0, other_block_factor=0.2, lr=4.0, error_cutoff=-1.0, display=True)
-                    # self.solver.solve_f_star_with_labels(num_iterations=30000, spring_constant=1.0, other_block_factor=0.2, lr=4.0, error_cutoff=-1.0, display=True)
-
-                    # self.solver.solve_f_star_with_labels(num_iterations=75000, seed_node=self.seed_node if self.seed_node else 0, other_block_factor=0.2, lr=4.0, error_cutoff=-1.0, display=True)
-                    # self.solver.solve_f_star_with_labels(num_iterations=75000, seed_node=self.seed_node if self.seed_node else 0, other_block_factor=0.3, lr=7.0, error_cutoff=-1.0, display=True)
-                    # self.solver.solve_f_star_with_labels(num_iterations=35000, seed_node=self.seed_node, other_block_factor=0.25, lr=3.0, error_cutoff=0.0, display=True)
-                    # self.solver.solve_f_star_with_labels(num_iterations=15000, other_block_factor=0.750, lr=3.0, error_cutoff=0.0, display=True)
-                    # self.solver.solve_f_star_with_labels(num_iterations=7500, other_block_factor=0.50, lr=5.0, error_cutoff=1080.0, display=True)
-                    # self.solver.solve_f_star_with_labels(num_iterations=7500, other_block_factor=0.50, lr=5.0, error_cutoff=720.0, display=True)
-                    # self.solver.solve_f_star_with_labels(num_iterations=7500, other_block_factor=0.50, lr=5.0, error_cutoff=360.0, display=True)
-                    # self.solver.solve_f_star_with_labels(num_iterations=7500, other_block_factor=0.50, lr=5.0, error_cutoff=180.0, display=True)
-                    # self.solver.solve_f_star_with_labels(num_iterations=7500, other_block_factor=0.50, lr=5.0, error_cutoff=90.0, display=True)
+                    self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=1.1, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
+                    self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=1.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
                 elif selected_solver == "F*2":
-                    # self.solver.solve_f_star_with_labels(num_iterations=20000, spring_constant=1.0, other_block_factor=0.03, lr=0.10, error_cutoff=-1.0, display=True)
-                    self.solver.solve_f_star_with_labels(num_iterations=int(self.solve_iterations_spinbox.value()), seed_node=self.seed_node if self.seed_node else 0, spring_constant=1.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
-                    # self.solver.solve_f_star_with_labels(num_iterations=35000, seed_node=self.seed_node if self.seed_node else 0, other_block_factor=1.0, lr=1.0, error_cutoff=0.0, display=True)
+                    self.solver.solve_f_star_with_labels(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
                 elif selected_solver == "F*3":
-                    self.solver.solve_f_star_with_labels(num_iterations=15000, seed_node=self.seed_node if self.seed_node else 0, spring_constant=4.0, other_block_factor=0.5, lr=0.25, error_cutoff=-1.0, display=True)
-                    self.solver.solve_f_star_with_labels(num_iterations=15000, seed_node=self.seed_node if self.seed_node else 0, spring_constant=2.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
-                    self.solver.solve_f_star_with_labels(num_iterations=30000, seed_node=self.seed_node if self.seed_node else 0, spring_constant=1.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
-                    # self.solver.solve_f_star_with_labels(num_iterations=30000, seed_node=self.seed_node if self.seed_node else 0, spring_constant=0.5, other_block_factor=0.02, lr=0.080, error_cutoff=-1.0, display=True)
+                    self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=4.0, other_block_factor=0.5, lr=0.25, error_cutoff=-1.0, display=True)
+                    self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=2.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
+                    self.solver.solve_f_star_with_labels(num_iterations=30000, spring_constant=1.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
                 elif selected_solver == "F*4":
                     self.solver.solve_f_star(num_iterations=int(3 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=36000000.0, i_round=6, visualize=True)
                     self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=360.0, i_round=6, visualize=True)
@@ -1546,21 +1692,25 @@ class PointCloudLabeler(QMainWindow):
     
     def undo(self):
         if self.undo_stack:
-            prev_state = self.undo_stack.pop()
-            self.redo_stack.append(self.labels.copy())
+            prev_state, prev_group = self.undo_stack.pop()
+            self.redo_stack.append((self.labels.copy(), self.group.copy()))
             self.labels = prev_state.copy()
+            self.group = prev_group.copy()
             self.update_views()
     
     def redo(self):
         if self.redo_stack:
-            next_state = self.redo_stack.pop()
-            self.undo_stack.append(self.labels.copy())
+            next_state, next_group = self.redo_stack.pop()
+            self.undo_stack.append((self.labels.copy(), self.group.copy()))
             self.labels = next_state.copy()
+            self.group = next_group.copy()
             self.update_views()
-    
-    def save_labels(self):
-        labeled_data = np.hstack([self.points, self.labels.reshape(-1, 1)])
-        np.save("labeled_pointcloud.npy", labeled_data)
+
+    def update_undo_redo(self):
+        # Clear out undo stack if it is larger than 50
+        max_len = 50
+        if len(self.undo_stack) > max_len:
+            self.undo_stack = self.undo_stack[-max_len:]
     
     def toggle_calc_draw_mode(self):
         self.calc_drawing_mode = self.calc_draw_button.isChecked()
@@ -1572,6 +1722,10 @@ class PointCloudLabeler(QMainWindow):
     def apply_all_calculated_labels(self):
         mask = (self.labels == self.UNLABELED) & (self.calculated_labels != self.UNLABELED)
         if np.any(mask):
+            # Track undo/redo
+            self.undo_stack.append((self.labels.copy(), self.group.copy()))
+            self.redo_stack = []
+
             self.labels[mask] = self.calculated_labels[mask]
             self.update_views()
     
@@ -1587,6 +1741,10 @@ class PointCloudLabeler(QMainWindow):
         mask = (self.points[:, 2] >= z_min_val) & (self.points[:, 2] <= z_max_val)
         indices = np.where(mask & (self.labels == self.UNLABELED) & (self.calculated_labels != self.UNLABELED))[0]
         if indices.size:
+            # Track undo/redo
+            self.undo_stack.append((self.labels.copy(), self.group.copy()))
+            self.redo_stack = []
+
             self.labels[indices] = self.calculated_labels[indices]
             self.update_views()
     
@@ -1598,6 +1756,10 @@ class PointCloudLabeler(QMainWindow):
         mask = (self.points[:, 1] >= finit_min_val) & (self.points[:, 1] <= finit_max_val)
         indices = np.where(mask & (self.labels == self.UNLABELED) & (self.calculated_labels != self.UNLABELED))[0]
         if indices.size:
+            # Track undo/redo
+            self.undo_stack.append((self.labels.copy(), self.group.copy()))
+            self.redo_stack = []
+
             self.labels[indices] = self.calculated_labels[indices]
             self.update_views()
     

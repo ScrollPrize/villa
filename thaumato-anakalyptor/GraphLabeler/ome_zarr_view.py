@@ -450,7 +450,7 @@ class OmeZarrViewWindow(QMainWindow):
             print("Error updating umbilicus dot:", e)
 
         self.computed_labels = np.array(self.solver.get_labels())
-        self.labels[:] = self.UNLABELED
+        # self.labels[:] = self.UNLABELED
         mask_labels = np.array(self.solver.get_gt())
         self.labels[mask_labels] = self.computed_labels[mask_labels]
 
