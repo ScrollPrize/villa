@@ -174,11 +174,65 @@ class ScrollGraph(Graph):
         else:
             points_all = np.empty((0, 4), dtype=np.float32)
         return points_all, np.array(point_nodes_indices)
+    
+    def load_nodes_graph(self, close_nodes, winding_angles_nodes, winding_angles_nodes_computed):
+        """
+        Backup that loads a reduced pointcloud from the .pkl file itself
+        """
+        nodes_points = []
+        # Build a dictionary mapping each unique group name to a list of (surface_nr, index) tuples.
+        groups_dict = {}
+        for idx, close_node in enumerate(close_nodes):
+            start_coord = close_node[:3]
+            group_name = f"{start_coord[0]:06}_{start_coord[1]:06}_{start_coord[2]:06}"
+            surface_nr = close_node[3]
+            groups_dict.setdefault(group_name, []).append((surface_nr, idx))
+        
+        # Calculate the total number of surfaces to process.
+        total_surfaces = sum(len(entries) for entries in groups_dict.values())
+
+        point_nodes_indices = []
+        
+        # Use a tqdm progress bar for the surfaces.
+        with tqdm(total=total_surfaces, desc="Loading nodes") as pbar:
+            # Iterate over unique group names.
+            for group_name, entries in groups_dict.items():
+                # Process each requested surface within this group.
+                for surface_nr, idx in entries:
+                    node_key = close_nodes[idx]
+                    try:
+                        points = self.nodes[node_key]['sample_points']
+                        if points.shape[1] != 3:
+                            raise ValueError(f"Invalid points shape: {points.shape}")
+                        
+                        # Append the corresponding winding angle as a new column.
+                        winding_angle = winding_angles_nodes[idx]
+                        winding_angle_computed = winding_angles_nodes_computed[idx]
+                        winding_col = np.full((points.shape[0], 1), winding_angle, dtype=np.float32)
+                        winding_col_computed = np.full((points.shape[0], 1), winding_angle_computed, dtype=np.float32)
+                        points = np.concatenate([points, winding_col, winding_col_computed], axis=1)
+                        nodes_points.append(points)
+                        point_nodes_indices.extend([idx] * points.shape[0])
+                    except Exception as e:
+                        print(f"Error loading node {node_key} from the graph: {e}")
+                    pbar.update(1)
+
+        if nodes_points:
+            points_all = np.concatenate(nodes_points, axis=0)
+        else:
+            points_all = np.empty((0, 4), dtype=np.float32)
+        return points_all, np.array(point_nodes_indices)
+    
+
 
     def get_points_XY(self, z_index, h5_filename, labels, computed_labels, f_init, undeleted_nodes_indices, unlabeled, block_size=200):
         """
         Get the points for the XY view at the given z_index.
         """
+        use_h5 = h5_filename.endswith(".h5")
+        if not use_h5:
+            # If using subsampled points from graph, use more nodes for fuller pointcloud display
+            block_size *= 4
         
         all_node_keys = list(self.nodes.keys())
         node_keys = [all_node_keys[i] for i in undeleted_nodes_indices]
@@ -197,8 +251,14 @@ class ScrollGraph(Graph):
         # sort close nodes by key
         print(f"first few close nodes: {close_nodes[:min(5, len(close_nodes))]}")
 
-        # load all point of close blocks
-        points, point_nodes_indices = self.load_nodes(h5_filename, close_nodes, close_angles, close_angles_computed)
+        # Load points from these nodes.
+        plane_point_filter_distance = 3
+        if not use_h5:
+            # Use backup graph node points
+            points, point_nodes_indices = self.load_nodes_graph(close_nodes, close_angles, close_angles_computed)
+            plane_point_filter_distance = 20
+        else:
+            points, point_nodes_indices = self.load_nodes(h5_filename, close_nodes, close_angles, close_angles_computed)
 
         print(f"Loaded {points.shape} points for XY view at z_index {z_index}")
 
@@ -208,7 +268,8 @@ class ScrollGraph(Graph):
         points = points[:, [1, 0, 2, 3, 4]]
 
         # filter points in z slice
-        mask = np.abs(points[:, 0] - z_index) < 3
+        print(f"Filtering points for XY view with distance {plane_point_filter_distance}")
+        mask = np.abs(points[:, 0] - z_index) < plane_point_filter_distance
         points = points[mask]
         point_nodes_indices = point_nodes_indices[mask]
 
@@ -267,12 +328,18 @@ class ScrollGraph(Graph):
                 - centroid_close_mask: Boolean mask indicating which nodes passed the centroid filtering.
         """
 
+
         # Convert target angle to radians and compute its normal and tangent vectors.
         f_target_rad = np.deg2rad(f_target)
         normal = np.array([-np.sin(f_target_rad), np.cos(f_target_rad)])
         tangent = np.array([-np.cos(f_target_rad), -np.sin(f_target_rad)])
 
         print(f"Angle: {f_target} degrees, normal: {normal}, tangent: {tangent}")
+        
+        use_h5 = h5_filename.endswith(".h5")
+        if not use_h5:
+            # If using subsampled points from graph, use more nodes for fuller pointcloud display
+            block_size *= 4
         
         # Get node keys corresponding to undeleted nodes.
         all_node_keys = list(self.nodes.keys())
@@ -307,8 +374,14 @@ class ScrollGraph(Graph):
         
         print(f"Found {len(close_nodes)} close nodes based on umbilicus plane filtering out of {len(node_keys)} undeleted nodes.")
         
+        plane_point_filter_distance = 3
         # Load points from these nodes.
-        points, point_nodes_indices = self.load_nodes(h5_filename, close_nodes, close_angles, close_angles_computed)
+        if not use_h5:
+            # Use backup graph node points
+            points, point_nodes_indices = self.load_nodes_graph(close_nodes, close_angles, close_angles_computed)
+            plane_point_filter_distance = 20
+        else:
+            points, point_nodes_indices = self.load_nodes(h5_filename, close_nodes, close_angles, close_angles_computed)
         print(f"Loaded {points.shape} points for XZ view on umbilicus plane with f_target {f_target}")
         
         # Scale point coordinates.
@@ -328,7 +401,8 @@ class ScrollGraph(Graph):
         # 4. Compute the distance from the umbilicus plane (by projecting diff onto the normal vector).
         distance = np.abs(np.sum(diff * normal, axis=1))
         # 5. Create the mask for points within a distance of 3.
-        points_distance_mask = distance < 3
+        print(f"Filtering points for XZ view with distance {plane_point_filter_distance}")
+        points_distance_mask = distance < plane_point_filter_distance
         
         # Filter points and associated node indices.
         points = points[points_distance_mask]
@@ -360,4 +434,3 @@ class ScrollGraph(Graph):
         print(f"Computed mean winding for {points.shape} unique 3D points for XZ view on umbilicus plane with f_target {f_target}")
         
         return points, point_nodes_indices, windings, windings_computed, inverse_indices, winding, winding_computed, centroid_close_mask
-

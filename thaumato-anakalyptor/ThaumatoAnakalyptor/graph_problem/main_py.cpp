@@ -168,6 +168,26 @@ std::vector<size_t> get_valid_indices(const std::vector<Node>& graph) {
     return valid_indices;
 }
 
+std::tuple<std::vector<size_t>, std::vector<bool>> get_valid_indices_inverse(const std::vector<Node>& graph) {
+    std::vector<size_t> valid_indices_inverse;
+    std::vector<bool> valid_indices_bool;
+    size_t num_valid_nodes = 0;
+    for (size_t i = 0; i < graph.size(); ++i) {
+        // node is not deleted
+        if (!graph[i].deleted) {
+            valid_indices_inverse.push_back(num_valid_nodes);
+            valid_indices_bool.push_back(true);
+            num_valid_nodes++;
+        }
+        else {
+            valid_indices_inverse.push_back(0);
+            valid_indices_bool.push_back(false);
+        }
+    }
+    std::cout << "Number of valid nodes: " << num_valid_nodes << std::endl;
+    return std::make_tuple(valid_indices_inverse, valid_indices_bool);
+}
+
 void save_graph_to_binary(const std::string& file_name, const std::vector<Node>& graph) {
     std::ofstream outfile(file_name, std::ios::binary);
 
@@ -459,11 +479,11 @@ class Solver {
             std::vector<size_t> valid_indices = get_valid_indices(graph);
             graph = run_solver_f_star(graph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, o_, spring_constant, step_sigma, visualize);
         }
-        void solve_f_star_with_labels(int num_iterations, size_t seed_node, float spring_constant, float other_block_factor = 1.0f, float lr = 10.0f, float error_cutoff = -1.0f, bool display = false) {
+        void solve_f_star_with_labels(int num_iterations, float spring_constant, float other_block_factor = 1.0f, float lr = 10.0f, float error_cutoff = -1.0f, bool display = false) {
             // use the f_star solver for the intermediate solution
             // store only the valid indices to speed up the loop
             std::vector<size_t> valid_indices = get_valid_indices(graph);
-            graph = run_solver_f_star_with_labels(graph, num_iterations, seed_node, valid_indices, &h_all_edges, &h_all_sides, spring_constant, other_block_factor, lr, error_cutoff, display);
+            graph = run_solver_f_star_with_labels(graph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, spring_constant, other_block_factor, lr, error_cutoff, display);
         }
         void filter_f_star() {
             // Filters the graph edges based on the f star solution
@@ -565,23 +585,37 @@ class Solver {
             }
             std::cout << "Number of fixed nodes: " << count_fixed << std::endl;
         }
-        void fix_good_edges() {
+        void fix_good_edges(std::vector<float> gt_winding_nrs, std::vector<bool> gt) {
             // fix good edges
             std::vector<size_t> valid_indices = get_valid_indices(graph);
+            auto [valid_indices_inverse, valid_indices_bool] = get_valid_indices_inverse(graph);
+            size_t count_considered = 0;
+            size_t count_considered_connections = 0;
+            size_t count_fixed = 0;
+
             for (size_t i = 0; i < valid_indices.size(); ++i) {
                 size_t index = valid_indices[i];
-                if (graph[index].fixed) {
-                    float f_node = graph[index].winding_nr * 360.0f + graph[index].f_init;
+                if (!graph[index].deleted && gt[i]) {
+                    count_considered++;
+                    float f_node = gt_winding_nrs[i] * 360.0f + graph[index].f_init;
                     for (int j = 0; j < graph[index].num_edges; ++j) {
                         Edge& edge = graph[index].edges[j];
-                        if (graph[edge.target_node].fixed) {
-                            float f_target = graph[edge.target_node].winding_nr * 360.0f + graph[edge.target_node].f_init;
-                            edge.k = f_target - f_node;
-                            edge.fixed = true;
+                        if (!valid_indices_bool[edge.target_node]) {
+                            continue;
+                        }
+                        count_considered_connections++;
+                        size_t valid_index_target = valid_indices_inverse[edge.target_node];
+                        if (!graph[edge.target_node].deleted && gt[valid_index_target]) {
+                            float f_target = gt_winding_nrs[valid_index_target] * 360.0f + graph[edge.target_node].f_init;
+                            if (std::abs(edge.k - (f_target - f_node)) < 0.001f) {
+                                edge.fixed = true;
+                                count_fixed++;
+                            }
                         }
                     }
                 }
             }
+            std::cout << "Number of fixed edges: " << count_fixed << " out of " << count_considered << " considered nodes and " << count_considered_connections << " considered connections." << std::endl;
         }
         std::vector<bool> get_gt() {
             // get labels
@@ -878,7 +912,6 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
         .def("solve_f_star_with_labels", &Solver::solve_f_star_with_labels,
             "Method to intermediately solve the graph with a mean winding angle approach and labels",
             py::arg("num_iterations") = 5000,
-            py::arg("seed_node") = 0,
             py::arg("spring_constant") = 1.0f,
             py::arg("other_block_factor") = 1.0f,
             py::arg("lr") = 10.0f,
@@ -918,7 +951,9 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             "Method to set the edges of the graph based on the labels",
             py::arg("seed_node"))
         .def("fix_good_edges", &Solver::fix_good_edges,
-            "Method to fix the good edges of the graph")
+            "Method to fix the good edges of the graph",
+            py::arg("gt_f_stars"),
+            py::arg("gt"))
         .def("get_gt", &Solver::get_gt,
             "Method to get the ground truth of the graph")
         .def("get_undeleted_indices", &Solver::get_undeleted_indices,
