@@ -653,6 +653,7 @@ class GridDataset(Dataset):
     
 class ZarrDataset(GridDataset):
     def __init__(self, pointcloud_base, start_block, path_template, save_template_v, save_template_r, umbilicus_points, umbilicus_points_old, grid_block_size=200, recompute=False, fix_umbilicus=False, maximum_distance=-1, min_z=None, max_z=None, update_computed_blocks=False):
+        print(f"Opening zarr dataset at {path_template}")
         self.zarr_volume = zarr.open(path_template, mode='r')
         self.zarr_volume = self.zarr_volume[0]
         super().__init__(pointcloud_base, start_block, path_template, save_template_v, save_template_r, umbilicus_points, umbilicus_points_old, grid_block_size=grid_block_size, recompute=recompute, fix_umbilicus=fix_umbilicus, maximum_distance=maximum_distance, min_z=min_z, max_z=max_z, update_computed_blocks=update_computed_blocks)
