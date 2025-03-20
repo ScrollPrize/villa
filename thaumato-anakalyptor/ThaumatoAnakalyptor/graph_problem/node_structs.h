@@ -13,6 +13,7 @@ struct Edge {
     float k;
     bool same_block;
     bool fixed;
+    bool temporary = false;
     bool gt_edge;
     bool good_edge;
     bool wnr_added = false;      // Target winding number incorporated to the node
