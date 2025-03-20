@@ -1716,6 +1716,8 @@ class PointCloudLabeler(QMainWindow):
                     for i, label in tqdm(enumerate(self.labels), desc="Finding seed node"):
                         if i == 0: # do not use "no-seed" index as seed node
                             continue
+                        if self.group[i] != 0:
+                            continue
                         if abs(label - self.UNLABELED) > 2:
                             if deleted_mask_previous[i]:
                                 continue
