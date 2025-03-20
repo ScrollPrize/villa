@@ -10,6 +10,7 @@ import tempfile
 import open3d as o3d
 import shutil
 import numpy as np
+import argparse
 
 def extract_and_process_files(archive_dir, output_dir):
     """Extracts .7z and .tar files from archive_dir, processes .ply files, and saves merged point clouds to output_dir."""
@@ -65,4 +66,13 @@ def extract_and_process_files(archive_dir, output_dir):
 if __name__ == "__main__":
     archive_directory = "point_cloud_colorized_verso_subvolume_blocks"  # Change this to your input directory
     output_directory = "debug_instances"  # Change this to your output directory
+
+    parser = argparse.ArgumentParser(description='Extract .7z and .tar files from archive_dir, process .ply files, and save merged point clouds to output_dir.')
+    parser.add_argument('--archive_directory', type=str, help='Directory containing .7z and .tar files.', default=archive_directory)
+    parser.add_argument('--output_directory', type=str, help='Output directory for merged point clouds.', default=output_directory)
+    args = parser.parse_args()
+
+    archive_directory = args.archive_directory
+    output_directory = args.output_directory
+
     extract_and_process_files(archive_directory, output_directory)
