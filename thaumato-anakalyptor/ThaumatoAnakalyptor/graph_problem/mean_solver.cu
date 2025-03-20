@@ -69,7 +69,7 @@ inline __global__ void update_nodes_kernel_f_star_step(Node* d_graph, size_t* d_
         // Adjust step_edge based on edge properties
         if ((!node.fixed || !d_graph[target_node].fixed) && edge.fixed) {
             // certainty = 100.0f;
-            step_edge *= 100.0f;
+            step_edge *= 10.0f;
         }
         else if (edge.fixed) {
             step_edge *= 2.0f;
