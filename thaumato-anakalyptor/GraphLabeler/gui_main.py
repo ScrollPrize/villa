@@ -205,7 +205,9 @@ class PointCloudLabeler(QMainWindow):
         # --------------------------------------------------------------------
         # Top Controls Row: Spline and Label Update Controls.
         # --------------------------------------------------------------------
+
         top_controls_layout = QHBoxLayout()
+
         self.update_labels_button = QPushButton("Update Labels")
         self.update_labels_button.clicked.connect(self.update_labels)
         top_controls_layout.addWidget(self.update_labels_button)
@@ -262,10 +264,10 @@ class PointCloudLabeler(QMainWindow):
         
         effective_range_layout = QHBoxLayout()
         self.assign_min_spinbox = QSpinBox()
-        self.assign_min_spinbox.setRange(-1000, 1000)
+        self.assign_min_spinbox.setRange(-10000, 10000)
         self.assign_min_spinbox.setValue(-1000)
         self.assign_max_spinbox = QSpinBox()
-        self.assign_max_spinbox.setRange(-1000, 1000)
+        self.assign_max_spinbox.setRange(-10000, 10000)
         self.assign_max_spinbox.setValue(1000)
         effective_range_layout.addWidget(QLabel("Spline winding range min:"))
         effective_range_layout.addWidget(self.assign_min_spinbox)
@@ -276,6 +278,10 @@ class PointCloudLabeler(QMainWindow):
         self.deleted_range_button = QPushButton("<-- Delete Range")
         self.deleted_range_button.clicked.connect(self.delete_range)
         top_controls_layout.addWidget(self.deleted_range_button)
+
+        self.split_groups_button = QPushButton("<-- Split Range into Groups")
+        self.split_groups_button.clicked.connect(self.split_groups_range)
+        top_controls_layout.addWidget(self.split_groups_button)
         
         main_layout.addLayout(top_controls_layout)
         
@@ -349,6 +355,11 @@ class PointCloudLabeler(QMainWindow):
         # --------------------------------------------------
         cellar_controls_layout = QHBoxLayout()
 
+
+        self.slab_compute_button = QPushButton("Compute Slabs")
+        self.slab_compute_button.clicked.connect(self.run_slab_computation)
+        cellar_controls_layout.addWidget(self.slab_compute_button)
+
         # Show Max Group (just display, no control)
         self.max_group_label = QLabel("Max Group: 0")
         cellar_controls_layout.addWidget(self.max_group_label)
@@ -365,9 +376,9 @@ class PointCloudLabeler(QMainWindow):
         self.group_offset_spinbox.setValue(0)
         group_save_layout.addWidget(QLabel("Group Offset:"))
         group_save_layout.addWidget(self.group_offset_spinbox)
-        self.merge_group_button = QPushButton("Apply Group Offset")
-        self.merge_group_button.clicked.connect(self.offset_group)
-        group_save_layout.addWidget(self.merge_group_button)
+        self.offset_group_button = QPushButton("Apply Group Offset")
+        self.offset_group_button.clicked.connect(self.offset_group)
+        group_save_layout.addWidget(self.offset_group_button)
         self.merge_group_button = QPushButton("Merge Group")
         self.merge_group_button.clicked.connect(self.merge_group)
         group_save_layout.addWidget(self.merge_group_button)
@@ -588,6 +599,7 @@ class PointCloudLabeler(QMainWindow):
         if update_labels:
             self.labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
             self.calculated_labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
+            self.group = np.zeros(len(self.points), dtype=np.int32)
         self.kdtree_xy = cKDTree(self.points[:, [0, 1]])
         self.kdtree_xz = cKDTree(self.points[:, [0, 2]])
         if update_slide_ranges:
@@ -601,6 +613,9 @@ class PointCloudLabeler(QMainWindow):
     
     def save_labels_to_path(self):
         fname, _ = QFileDialog.getSaveFileName(self, "Save Labels", os.path.join("../experiments", self.default_experiment), "Text Files (*.txt);;All Files (*)")
+        self._save_labels_to_path(fname)
+
+    def _save_labels_to_path(self, fname):
         if fname:
             with open(fname, "w") as f:
                 # write labels + group to file
@@ -793,7 +808,10 @@ class PointCloudLabeler(QMainWindow):
         self.undo_stack.append((self.labels.copy(), self.group.copy()))
         self.redo_stack = []
 
-        self.labels[self.group == self.active_group] += offset
+        mask_group = self.group == self.active_group
+        mask_labeled = np.abs(self.labels - self.UNLABELED) > 2
+        mask_group_labeled = np.logical_and(mask_group, mask_labeled)
+        self.labels[mask_group_labeled] += offset # offset only the labeled points
         # Set the offset group back to 0.
         self.group_offset_spinbox.setValue(0)
         self.update_views()
@@ -1526,7 +1544,7 @@ class PointCloudLabeler(QMainWindow):
             if d_self < thresh and d_self < d_minus and d_self < d_plus and calc_labels[idx] != self.UNLABELED:
                 global_idx = global_indices[idx]
                 self.labels[global_idx] = calc_labels[idx]
-                self.group = 0 # Use GT group when assigning line labels
+                self.group[global_idx] = 0 # Use GT group when assigning line labels
                 assign_count += 1
             if j % update_interval == 0:
                 progress.setValue(j)
@@ -1537,12 +1555,23 @@ class PointCloudLabeler(QMainWindow):
         print(f"Assigned line labels to {assign_count} points (threshold: {thresh}).")
 
     def delete_range(self):
+        self._split_range(make_group=False)
+
+    def split_groups_range(self):
+        self._split_range(make_group=True)
+
+    def _split_range(self, make_group):
         # delete points within the specified range
         z_center = self.z_center_spinbox.value()
         z_thickness = self.z_thickness_slider.value() / self.scaleFactor
         z_min_val = z_center - z_thickness / 2
         z_max_val = z_center + z_thickness / 2
         mask = (self.points[:, 2] >= z_min_val) & (self.points[:, 2] <= z_max_val)
+        f_init_center = self.finit_center_spinbox.value()
+        f_init_thickness = self.finit_thickness_slider.value() / self.scaleFactor
+        f_init_min_val = f_init_center - f_init_thickness / 2
+        f_init_max_val = f_init_center + f_init_thickness / 2
+        mask = np.logical_and(mask, np.logical_and(self.points[:, 1] >= f_init_min_val, self.points[:, 1] <= f_init_max_val))
         range_min = self.assign_min_spinbox.value()
         range_max = self.assign_max_spinbox.value()
         mask = np.logical_and(mask, np.logical_and(self.labels >= range_min, self.labels <= range_max))
@@ -1552,8 +1581,15 @@ class PointCloudLabeler(QMainWindow):
         self.undo_stack.append((self.labels.copy(), self.group.copy()))
         self.redo_stack = []
 
-        self.labels[mask] = self.UNLABELED
-        self.group[mask] = 0
+        if not make_group:
+            self.labels[mask] = self.UNLABELED
+            self.group[mask] = 0
+        else:
+            new_group = self.group.max() + 1
+            self.group[mask] = new_group
+            # Activate the new group
+            self.group_spinbox.setValue(new_group)
+
         self.update_views()
     
     def pick_label_at(self, ev, plot_widget):
@@ -1674,6 +1710,111 @@ class PointCloudLabeler(QMainWindow):
 
     def activate_group_pipette(self):
         self.group_pipette_mode = True
+
+    def run_slab_computation(self):
+        """
+        Computes labels over slabs in z. It starts at the current slab (using the current z_center
+        and thickness) and saves the result. If the current thickness is less than 200, it resets the
+        thickness to 200 and recomputes. Then it moves upward (and then downward) in 100-unit steps
+        for the z_center, computing and saving labels at each step. At the end, a popup displays the total
+        computation time.
+
+        For each slab, the procedure is as follows:
+        1. Set the line thickness assignment to 3.
+        2. For two iterations:
+            a. Set the solver mode to "F*3" and call update_labels().
+            b. Clear splines and calculated labels.
+            c. Update winding splines.
+            d. Switch the solver mode to "Winding Number" and call update_labels() to compute the winding number.
+            e. Restore the previous solver mode.
+            f. Call assign_line_labels().
+            g. Clear splines and calculated labels.
+        3. Ensure the z-range checkbox is enabled during the computation.
+        4. Update views and save the labels for each slab.
+        """
+        start_time = time.time()
+        initial_z_center = self.z_center_spinbox.value()
+        initial_thickness = self.z_thickness_spinbox.value() / self.scaleFactor
+        desired_thickness = 200.0
+        step = 100.0
+
+        def compute_current_slab():
+            # Set the line thickness assignment to 3.
+            self.line_distance_threshold_spinbox.setValue(3)
+            # Ensure z-range is enabled.
+            original_z_range = self.use_z_range_checkbox.isChecked()
+            self.use_z_range_checkbox.setChecked(True)
+            original_disregard_label0 = self.disregard_label0_checkbox.isChecked()
+            self.disregard_label0_checkbox.setChecked(False)
+            for _ in range(2):
+                # --- Run F*3 update via update_labels ---
+                if hasattr(self, "solver_combo"):
+                    prev_solver = self.solver_combo.currentText()
+                    self.solver_combo.setCurrentText("F*3")
+                self.update_labels()
+                # Clear splines and calculated labels.
+                self.clear_splines()
+                self.clear_calculated_labels()
+                # Update winding splines.
+                self.update_winding_splines()
+                # --- Run winding number update via update_labels ---
+                if hasattr(self, "solver_combo"):
+                    self.solver_combo.setCurrentText("Winding Number")
+                self.update_labels()
+                # Restore the previous solver mode.
+                if hasattr(self, "solver_combo"):
+                    self.solver_combo.setCurrentText(prev_solver)
+                # Assign line labels.
+                self.assign_line_labels()
+                # Clear splines and calculated labels again.
+                self.clear_splines()
+                self.clear_calculated_labels()
+            # Restore the original z-range checkbox state.
+            self.use_z_range_checkbox.setChecked(original_z_range)
+            self.disregard_label0_checkbox.setChecked(original_disregard_label0)
+            # Update views.
+            self.update_views()
+
+        # Compute for the initial slab.
+        compute_current_slab()
+        base_path = os.path.join("../experiments", self.default_experiment)
+        slab_filename = os.path.join(base_path, "slab_initial.txt")
+        self._save_labels_to_path(slab_filename)
+
+        # If the current slab thickness is less than 200, set thickness to 200 and recompute.
+        if initial_thickness < desired_thickness:
+            self.z_thickness_spinbox.setValue(desired_thickness)
+            self.z_thickness_slider.setValue(int(desired_thickness * self.scaleFactor))
+            self.update_views()
+            compute_current_slab()
+            slab_filename = os.path.join(base_path, "slab_thickness200.txt")
+            self._save_labels_to_path(slab_filename)
+
+        # Iterate upward from the original z_center.
+        current_z_center = initial_z_center
+        while current_z_center + desired_thickness / 2 < self.z_max:
+            current_z_center += step
+            self.z_center_spinbox.setValue(current_z_center)
+            self.z_center_slider.setValue(int(current_z_center * self.scaleFactor))
+            self.update_views()
+            compute_current_slab()
+            slab_filename = os.path.join(base_path, f"slab_up_{int(current_z_center)}.txt")
+            self._save_labels_to_path(slab_filename)
+
+        # Iterate downward from the original z_center.
+        current_z_center = initial_z_center
+        while current_z_center - desired_thickness / 2 > self.z_min:
+            current_z_center -= step
+            self.z_center_spinbox.setValue(current_z_center)
+            self.z_center_slider.setValue(int(current_z_center * self.scaleFactor))
+            self.update_views()
+            compute_current_slab()
+            slab_filename = os.path.join(base_path, f"slab_down_{int(current_z_center)}.txt")
+            self._save_labels_to_path(slab_filename)
+
+        total_time = time.time() - start_time
+        QMessageBox.information(self, "Slab Computation",
+                                f"Slab computation completed in {total_time:.2f} seconds.")
     
     # Example of using the solver interface when updating labels:
     def update_labels(self):

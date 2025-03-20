@@ -69,7 +69,7 @@ void add_labeled_temporary_edge(std::vector<Node>& graph, size_t source_node, si
     edge.target_node = target_node;
     edge.k = k;
     edge.same_block = false;
-    edge.certainty = 0.010f;
+    edge.certainty = 0.050f;
     // add edge to the node
     Edge* new_edges = new Edge[graph[source_node].num_edges + 1];
     for (int j = 0; j < graph[source_node].num_edges; ++j) {
