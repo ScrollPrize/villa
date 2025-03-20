@@ -19,7 +19,7 @@ sys.path.append('../ThaumatoAnakalyptor/graph_problem/build')
 import graph_problem_gpu_py
 
 from config import load_config, save_config
-from utils import vectorized_point_to_polyline_distance
+from utils import vectorized_point_to_polyline_distance, build_temporary_group_edges
 from widgets import create_sync_slider_spinbox
 
 # --------------------------------------------------
@@ -63,6 +63,7 @@ class PointCloudLabeler(QMainWindow):
         self.s_pressed = False
         self.original_drawing_mode = True
         self.pipette_mode = False
+        self.group_pipette_mode = False
         self.calc_drawing_mode = False
         self.UNLABELED = -9999
         self.undo_stack = []
@@ -211,7 +212,7 @@ class PointCloudLabeler(QMainWindow):
 
         # --- Solver selection dropdown ---
         self.solver_combo = QComboBox()
-        self.solver_combo.addItems(["F*", "F*2", "F*4", "Winding Number", "Union", "Random", "Set Labels"])
+        self.solver_combo.addItems(["F*", "F*2", "F*3", "F*4", "Winding Number", "Union", "Random", "Set Labels"])
         top_controls_layout.addWidget(QLabel("Select Solver:"))
         top_controls_layout.addWidget(self.solver_combo)
 
@@ -657,7 +658,7 @@ class PointCloudLabeler(QMainWindow):
             "7. Common Controls (Bottom Row):\n"
             "   • Drawing radius, Max Display Points, Drawing Mode, Pipette, Label selection, etc.\n\n"
             "8. Key Shortcuts:\n"
-            "   • P: Pipette, U: Toggle Updated Labels Draw Mode, Ctrl+Z: Undo, Ctrl+Y: Redo.\n\n"
+            "   • P: Pipette to pick label, G:  Pipette to pick group, U: Toggle Updated Labels Draw Mode, Ctrl+Z: Undo, Ctrl+Y: Redo.\n\n"
             "9. Saving:\n"
             "   • Use the Data menu to load data or save/load labels, and to save the final labeled graph.\n"
         )
@@ -882,10 +883,20 @@ class PointCloudLabeler(QMainWindow):
             self.pick_label_at(ev, plot_widget)
             self.pipette_mode = False
             return
+        if view_name == 'xy' and self.group_pipette_mode:
+            ev.accept()
+            self.pick_group_at(ev, plot_widget)
+            self.group_pipette_mode = False
+            return
         if view_name == 'xz' and self.pipette_mode:
             ev.accept()
             self.pick_label_at_xz(ev, plot_widget)
             self.pipette_mode = False
+            return
+        if view_name == 'xz' and self.group_pipette_mode:
+            ev.accept()
+            self.pick_group_at_xz(ev, plot_widget)
+            self.group_pipette_mode = False
             return
         if (ev.button() == Qt.LeftButton and self.drawing_mode_checkbox.isChecked() and not self.s_pressed):
             ev.accept()
@@ -1568,6 +1579,40 @@ class PointCloudLabeler(QMainWindow):
         vals, counts = np.unique(disp_labels, return_counts=True)
         mode_label = int(vals[np.argmax(counts)])
         self.label_spinbox.setValue(mode_label)
+
+    def pick_group_at(self, ev, plot_widget):
+        dataPos = plot_widget.plotItem.vb.mapSceneToView(ev.scenePos())
+        x = dataPos.x()
+        y = dataPos.y()
+        r = self.radius_spinbox.value()
+        indices = self.get_nearby_indices_xy(x, y, r)
+        z_center = self.z_center_spinbox.value()
+        z_thickness = self.z_thickness_slider.value() / self.scaleFactor
+        z_min_val = z_center - z_thickness / 2
+        z_max_val = z_center + z_thickness / 2
+        indices = [i for i in indices if self.points[i, 2] >= z_min_val and self.points[i, 2] <= z_max_val]
+        indices = np.array(indices)
+        if indices.size == 0:
+            return
+        disp_labels = np.array([self.displayed_label(i, y) for i in indices])
+        disp_group = np.array([self.group[i] for i in indices])
+
+        disp_group = disp_group[(disp_labels != self.UNLABELED) &
+                                  (disp_labels != self.UNLABELED + 1) &
+                                  (disp_labels != self.UNLABELED - 1)]
+        disp_labels = disp_labels[(disp_labels != self.UNLABELED) &
+                                  (disp_labels != self.UNLABELED + 1) &
+                                  (disp_labels != self.UNLABELED - 1)]
+        
+        if disp_group.size == 0:
+            return
+        vals, counts = np.unique(disp_group, return_counts=True)
+        mode_group = int(vals[np.argmax(counts)])
+        vals, counts = np.unique(disp_labels, return_counts=True)
+        mode_label = int(vals[np.argmax(counts)])
+
+        self.group_spinbox.setValue(mode_group)
+        self.label_spinbox.setValue(mode_label)
     
     def pick_label_at_xz(self, ev, plot_widget):
         dataPos = plot_widget.plotItem.vb.mapSceneToView(ev.scenePos())
@@ -1592,9 +1637,43 @@ class PointCloudLabeler(QMainWindow):
         vals, counts = np.unique(disp_labels, return_counts=True)
         mode_label = int(vals[np.argmax(counts)])
         self.label_spinbox.setValue(mode_label)
+
+    def pick_group_at_xz(self, ev, plot_widget):
+        dataPos = plot_widget.plotItem.vb.mapSceneToView(ev.scenePos())
+        x = dataPos.x()
+        z = dataPos.y()
+        r = self.radius_spinbox.value()
+        indices = self.kdtree_xz.query_ball_point([x, z], r=r)
+        finit_center = self.finit_center_spinbox.value()
+        finit_thickness = self.finit_thickness_slider.value() / self.scaleFactor
+        finit_min_val = finit_center - finit_thickness / 2
+        finit_max_val = finit_center + finit_thickness / 2 
+        indices = [i for i in indices if self.points[i, 1] >= finit_min_val and self.points[i, 1] <= finit_max_val]
+        indices = np.array(indices)
+        if indices.size == 0:
+            return
+        disp_labels = self.labels[indices]
+        disp_group = self.group[indices]
+        disp_group = disp_group[(disp_labels != self.UNLABELED) &
+                                  (disp_labels != self.UNLABELED + 1) &
+                                  (disp_labels != self.UNLABELED - 1)]
+        disp_labels = disp_labels[(disp_labels != self.UNLABELED) &
+                                    (disp_labels != self.UNLABELED + 1) &
+                                    (disp_labels != self.UNLABELED - 1)]
+        if disp_group.size == 0:
+            return
+        vals, counts = np.unique(disp_group, return_counts=True)
+        mode_group = int(vals[np.argmax(counts)])
+        vals, counts = np.unique(disp_labels, return_counts=True)
+        mode_label = int(vals[np.argmax(counts)])
+        self.group_spinbox.setValue(mode_group)
+        self.label_spinbox.setValue(mode_label)
     
     def activate_pipette(self):
         self.pipette_mode = True
+
+    def activate_group_pipette(self):
+        self.group_pipette_mode = True
     
     # Example of using the solver interface when updating labels:
     def update_labels(self):
@@ -1602,14 +1681,18 @@ class PointCloudLabeler(QMainWindow):
             gt = np.abs((self.labels - self.UNLABELED) > 2)
             gt_0 = np.logical_and(gt, self.group == 0) # only consider group 0 points
 
+            self.solver.remove_temporary_edges()
             self.solver.set_labels(self.labels, gt_0)
             groups = np.unique(self.group)
+            group_metadata= []
             for group in groups:
                 if group == 0:
                     continue
                 gt_g = np.logical_and(gt, self.group == group)
                 print(f"Sum of gt_g: {np.sum(gt_g)} in group {group}")
                 self.solver.fix_good_edges(self.labels, gt_g)
+                source, target, winding_number_difference = build_temporary_group_edges(self.solver, self.labels, gt_g)
+                group_metadata.append((source, target, winding_number_difference))
 
             selected_solver = self.solver_combo.currentText() if hasattr(self, "solver_combo") else "F*"
             if selected_solver == "Winding Number":
@@ -1652,8 +1735,8 @@ class PointCloudLabeler(QMainWindow):
                     self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=2.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
                     self.solver.solve_f_star_with_labels(num_iterations=30000, spring_constant=1.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
                 elif selected_solver == "F*4":
-                    self.solver.solve_f_star(num_iterations=int(3 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=36000000.0, i_round=6, visualize=True)
-                    self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=360.0, i_round=6, visualize=True)
+                    self.solver.solve_f_star(num_iterations=int(2 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=36000000.0, i_round=6, visualize=True)
+                    self.solver.solve_f_star(num_iterations=int(2 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=360.0, i_round=6, visualize=True)
 
                 if self.use_z_range_checkbox.isChecked():
                     print("Resetting z-range")
@@ -1662,6 +1745,13 @@ class PointCloudLabeler(QMainWindow):
 
                 # Update positions
                 self.update_positions(update_slide_ranges=False)
+
+                # # compare position to group metadata, DEBUG
+                # for source, target, winding_number_difference in group_metadata:
+                #     for i, (s, t, wnr) in enumerate(zip(source, target, winding_number_difference)):
+                #         wnr_d = (self.points[t, 0] * 20 - self.points[s, 0] * 20) - wnr * 360
+                #         print(f"Group {self.group[t]}: {wnr_d:.2f}° difference between {s} and {t}")
+
                 return
             elif selected_solver == "Union":
                 self.solver.solve_union()
@@ -1790,6 +1880,9 @@ class PointCloudLabeler(QMainWindow):
             event.accept()
         elif event.key() == Qt.Key_P:
             self.activate_pipette()
+            event.accept()
+        elif event.key() == Qt.Key_G:
+            self.activate_group_pipette()
             event.accept()
         # up arrow
         elif event.key() == Qt.Key_Up:

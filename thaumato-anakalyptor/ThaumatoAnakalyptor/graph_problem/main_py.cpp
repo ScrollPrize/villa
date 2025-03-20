@@ -61,6 +61,26 @@ void add_labeled_edge(std::vector<Node>& graph, size_t source_node, size_t targe
     }
 }
 
+void add_labeled_temporary_edge(std::vector<Node>& graph, size_t source_node, size_t target_node, float k) {
+    // create new edge
+    Edge edge;
+    edge.fixed = true;
+    edge.temporary = true;
+    edge.target_node = target_node;
+    edge.k = k;
+    edge.same_block = false;
+    edge.certainty = 0.10f;
+    // add edge to the node
+    Edge* new_edges = new Edge[graph[source_node].num_edges + 1];
+    for (int j = 0; j < graph[source_node].num_edges; ++j) {
+        new_edges[j] = graph[source_node].edges[j];
+    }
+    new_edges[graph[source_node].num_edges] = edge;
+    delete[] graph[source_node].edges;
+    graph[source_node].edges = new_edges;
+    graph[source_node].num_edges++;
+}
+
 void invert_winding_direction_graph(std::vector<Node>& graph) {
     for (size_t i = 0; i < graph.size(); ++i) {
         for (int j = 0; j < graph[i].num_edges; ++j) {
@@ -585,6 +605,38 @@ class Solver {
             }
             std::cout << "Number of fixed nodes: " << count_fixed << std::endl;
         }
+        void add_temporary_fixed_edges(std::vector<size_t> source, std::vector<size_t> target, std::vector<int> winding_number_difference) {
+            std::vector<size_t> valid_indices = get_valid_indices(graph);
+            
+            // assert same length of all vectors
+            if (source.size() != target.size() || source.size() != winding_number_difference.size()) {
+                std::cout << "Error: source, target and winding number difference vectors must have the same length." << std::endl;
+                return;
+            }
+            // add temporary fixed edges
+            for (size_t i = 0; i < source.size(); ++i) {
+                size_t source_node = valid_indices[source[i]];
+                size_t target_node = valid_indices[target[i]];
+
+                float f_node = graph[source_node].f_init;
+                float f_target = winding_number_difference[i] * 360.0f + graph[target_node].f_init;
+                float k = f_target - f_node;
+                add_labeled_temporary_edge(graph, source_node, target_node, k);
+                add_labeled_temporary_edge(graph, target_node, source_node, -k);
+            }
+        }
+        void remove_temporary_edges() {
+            // remove temporary edges
+            for (size_t i = 0; i < graph.size(); ++i) {
+                for (int j = 0; j < graph[i].num_edges; ++j) {
+                    if (graph[i].edges[j].temporary) {
+                        graph[i].edges[j] = graph[i].edges[graph[i].num_edges - 1];
+                        graph[i].num_edges--;
+                        j--;
+                    }
+                }
+            }
+        }
         void fix_good_edges(std::vector<float> gt_winding_nrs, std::vector<bool> gt) {
             // fix good edges
             std::vector<size_t> valid_indices = get_valid_indices(graph);
@@ -950,6 +1002,13 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
         .def("set_labeled_edges", &Solver::set_labeled_edges,
             "Method to set the edges of the graph based on the labels",
             py::arg("seed_node"))
+        .def("add_temporary_fixed_edges", &Solver::add_temporary_fixed_edges,
+            "Method to add temporary fixed edges to the graph",
+            py::arg("source"),
+            py::arg("target"),
+            py::arg("winding_number_difference"))
+        .def("remove_temporary_edges", &Solver::remove_temporary_edges,
+            "Method to remove temporary edges from the graph")
         .def("fix_good_edges", &Solver::fix_good_edges,
             "Method to fix the good edges of the graph",
             py::arg("gt_f_stars"),
