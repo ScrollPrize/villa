@@ -1129,6 +1129,7 @@ class WalkToSheet():
         # If reverse flag is set, reverse the input arrays.
         # The reversed array is obtained by slicing with [::-1]
         if reverse:
+            print("Reversing the input arrays.")
             result_ts = result_ts[::-1]
             result_normals = result_normals[::-1]
             angle_vector = angle_vector[::-1]
