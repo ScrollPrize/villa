@@ -1319,6 +1319,12 @@ public:
         if (sorted_points.empty())
             return {};  // no points to process
 
+        std::cout << "Processing pointset" << std::endl;
+        // Preprocess angle step
+        int angleSteps = getAngleSteps(angleStep);
+
+        std::cout << "Angle steps: " << angleSteps << std::endl;
+
         auto [minWind, maxWind] = findMinMaxWindingAngles(sorted_points);
 
         if (min_wind != max_wind) {
@@ -1326,14 +1332,19 @@ public:
             maxWind = max_wind;
         }
 
-        int numSteps = static_cast<int>(std::floor((maxWind - minWind) / angleStep)) + 1;
+        // Find size of results based on the min and max angles
+        int totalAngles = getAngleIndex(0.0f, maxWind, minWind) + 1;
+
+        std::cout << "Total angles: " << totalAngles << std::endl;
+
+        // int numSteps = static_cast<int>(std::floor((maxWind - minWind) / angleStep)) + 1;
+        int numSteps = totalAngles * angleSteps;
         std::vector<std::tuple<
             std::vector<std::vector<float>>,             // ordered ts (radii) per z bin
             std::vector<std::vector<std::vector<float>>>,  // ordered normals per z bin
             std::vector<std::vector<float>>,               // ordered umbilicus points (common to all bins)
             std::vector<float>                             // angle vector for this angle step
-        >> results;
-        results.reserve(numSteps);
+        >> results(numSteps)
 
         size_t nPoints = sorted_points.size();
         size_t currentStart = 0, currentEnd = 0;
