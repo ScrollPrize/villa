@@ -37,7 +37,8 @@ if __name__ == "__main__":
             # copy input mesh to the output folder
             print(f"Copying {input_obj} to {args.output_folder}")
             obj_path_ = finalize_mesh_main(args.output_folder, input_obj, 1.0, args.cut_size, False)
-            obj_paths.extend(obj_path_)
+            if obj_path_ is not None:
+                obj_paths.extend(obj_path_)
     # sort the obj_paths
     obj_paths.sort()
     obj_paths = obj_paths[::-1]
