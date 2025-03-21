@@ -1111,7 +1111,7 @@ class WalkToSheet():
             num_threads = multiprocessing.cpu_count()
         if num_threads == 1:
             results = []
-            for arg in tqdm(args, desc="Interpolating ordered pointset"):
+            for arg in tqdm(args, desc="Interpolating ordered pointset (Single thread)"):
                 results.append(compute_means_adjacent(*arg))
         else:
             with multiprocessing.Pool(num_threads) as pool:
