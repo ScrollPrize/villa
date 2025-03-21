@@ -1344,7 +1344,7 @@ public:
             std::vector<std::vector<std::vector<float>>>,  // ordered normals per z bin
             std::vector<std::vector<float>>,               // ordered umbilicus points (common to all bins)
             std::vector<float>                             // angle vector for this angle step
-        >> results(numSteps)
+        >> results(numSteps);
 
         size_t nPoints = sorted_points.size();
         size_t currentStart = 0, currentEnd = 0;
