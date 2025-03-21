@@ -1743,19 +1743,12 @@ class WalkToSheet():
                 fresh_start = continue_from <= 2
                 if fresh_start or not os.path.exists(result_pkl_path):
                     result = pointcloud_processing.create_ordered_pointset(points, normals, self.graph.umbilicus_data, angleStep=float(angle_step), z_spacing=int(z_spacing), max_eucledian_distance=10, min_z=z_start, max_z=z_end, min_wind=approx_min_angle, max_wind=approx_max_angle) # named parameters for mesh detail level: float angleStep, int z_spacing, float max_eucledian_distance, bool verbose
-                    # # save result as pkl
-                    # with open(result_pkl_path, 'wb') as f:
-                    #     pickle.dump(result, f)
+                    # save result as pkl
+                    with open(result_pkl_path, 'wb') as f:
+                        pickle.dump(result, f)
                 else:
                     with open(result_pkl_path, 'rb') as f:
                         result = pickle.load(f)
-
-                # debug section v1 vs v2 ordered pointset generation function, to delete after
-                with open(result_pkl_path, 'rb') as f:
-                    result_v1 = pickle.load(f)
-                print(f"Length of V1 results: {len(result_v1)} and V2 results: {len(result)}")
-                print(f"0-th entry dtype and length of V1: {type(result_v1[0])}, {len(result_v1[0])} and V2: {type(result[0])}, {len(result[0])}")
-                print(f"0-th entry 0-th element of V1: {type(result_v1[0][0])}, {len(result_v1[0][0])} and V2: {type(result[0][0])}, {len(result[0][0])}")
 
                 if results is None:
                     results = result
@@ -1772,23 +1765,12 @@ class WalkToSheet():
                 size_in_gbs = size_in_bytes / 1024 / 1024 / 1024
                 print(f"Size of results: {size_in_gbs} GBs")
 
-            # # Save the results
-            # with open(results_pkl_path, 'wb') as f:
-            #     pickle.dump(results, f)
+            # Save the results
+            with open(results_pkl_path, 'wb') as f:
+                pickle.dump(results, f)
         else:
             with open(results_pkl_path, 'rb') as f:
                 results = pickle.load(f)
-
-        # Debug section v1 vs v2 ordered pointset generation function, to delete after
-        with open(results_pkl_path, 'rb') as f:
-            results_v1 = pickle.load(f)
-
-        print(f"Length of V1 results: {len(results_v1)} and V2 results: {len(results)}")
-        print(f"0-th entry dtype and length of V1: {type(results_v1[0])}, {len(results_v1[0])} and V2: {type(results[0])}, {len(results[0])}")
-        print(f"0-th entry 0-th element of V1: {type(results_v1[0][0])}, {len(results_v1[0][0])} and V2: {type(results[0][0])}, {len(results[0][0])}")
-        print(f"0-th entry 0-th element 0-th element of V1: {type(results_v1[0][0][0])}, {len(results_v1[0][0][0])} and V2: {type(results[0][0][0])}, {len(results[0][0][0])}")
-
-        exit()
         
         return results
 
