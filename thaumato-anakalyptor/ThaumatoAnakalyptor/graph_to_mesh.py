@@ -1737,7 +1737,7 @@ class WalkToSheet():
         
         return results
 
-    def unroll(self, fragment=False, debug=False, continue_from=0, z_range=None, angle_step=1, z_spacing=10, learning_rate=0.2, iterations=11, unfix_factor=2.5, downsample=False, max_z_step_size=250, num_threads=num_threads):
+    def unroll(self, fragment=False, debug=False, continue_from=0, z_range=None, angle_step=1, z_spacing=10, learning_rate=0.2, iterations=11, unfix_factor=2.5, downsample=False, max_z_step_size=250, num_threads=None):
         # Load the graph
         result = self.load_pointcloud_to_raw_ordered_pointset(debug=debug, continue_from=continue_from, z_range=z_range, angle_step=angle_step, z_spacing=z_spacing, max_z_step_size=max_z_step_size)
 
