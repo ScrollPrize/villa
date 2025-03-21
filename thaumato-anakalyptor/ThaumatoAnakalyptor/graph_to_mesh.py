@@ -1433,7 +1433,9 @@ class WalkToSheet():
                 if valid_clip:
                     interpolated_ts = [interpolated_ts[i][valid_bottom_index:valid_top_index] for i in range(len(interpolated_ts))]
                     interpolated_normals = [interpolated_normals[i][valid_bottom_index:valid_top_index] for i in range(len(interpolated_normals))]
-                    ordered_umbilicus_points_ = [ordered_umbilicus_points[i][valid_bottom_index:valid_top_index] for i in range(len(ordered_umbilicus_points))]                    
+                    ordered_umbilicus_points_ = [ordered_umbilicus_points[i][valid_bottom_index:valid_top_index] for i in range(len(ordered_umbilicus_points))]
+                else:
+                    ordered_umbilicus_points_ = ordered_umbilicus_points                  
 
                 # go from interpolated t values to ordered pointset (3D points)
                 interpolated_points = self.ordered_pointset_to_3D(interpolated_ts, ordered_umbilicus_points_, angle_vector)
