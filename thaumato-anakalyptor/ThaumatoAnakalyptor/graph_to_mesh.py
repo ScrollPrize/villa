@@ -384,7 +384,7 @@ class WalkToSheet():
                     index_dif = i - first_found
                 indices.append(i)
             else:
-                assert index_dif is None, f"Index difference is not consistent!"
+                assert index_dif is None, f"Index difference is not consistent! {index_dif} at {i} with {angle_vector[i]} and {vector} vs {angle_vector[first_found]}"
             if index_dif is None:
                 i += 1
             else:
