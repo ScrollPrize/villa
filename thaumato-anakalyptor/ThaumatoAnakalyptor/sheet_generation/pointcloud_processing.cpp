@@ -1332,6 +1332,11 @@ public:
             maxWind = max_wind;
         }
 
+        // put down to complete 360 deg winding
+        float k_ = minWind / 360.0;
+        int k = std::floor(k_);
+        minWind = k * 360.0;
+
         // Find size of results based on the min and max angles
         int totalAngles = getAngleIndex(0.0f, maxWind, minWind) + 1;
 
