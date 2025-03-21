@@ -1623,7 +1623,8 @@ class WalkToSheet():
         # maximum z step size
         z_step = min(z_step, max_z_step_size)
         results = None
-        if continue_from <= 2 or True:
+        results_pkl_path = os.path.join(self.save_path, "results.pkl")
+        if continue_from <= 2 or not os.path.exists(results_pkl_path):
             for step_index, z_start in enumerate(tqdm(range(approx_min_z, approx_max_z, z_step), desc="Z range steps")):
                 result_pkl_path = os.path.join(self.save_path, f"ordered_pointset_{step_index}.pkl")
                 z_end = z_start + z_step
@@ -1737,11 +1738,9 @@ class WalkToSheet():
                 print(f"Size of results: {size_in_gbs} GBs")
 
             # Save the results
-            results_pkl_path = os.path.join(self.save_path, "results.pkl")
             with open(results_pkl_path, 'wb') as f:
                 pickle.dump(results, f)
         else:
-            results_pkl_path = os.path.join(self.save_path, "results.pkl")
             with open(results_pkl_path, 'rb') as f:
                 results = pickle.load(f)
         
