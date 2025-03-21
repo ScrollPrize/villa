@@ -1329,7 +1329,7 @@ class WalkToSheet():
         test_pointset_ply_path = os.path.join(test_folder, f"ordered_pointset_test_cpp.ply")
         self.pointcloud_from_ordered_pointset(pointset, os.path.join(self.save_path, test_pointset_ply_path))
            
-    def rolled_ordered_pointset(self, result, continue_from=0, fragment=False, angle_step=0.5, learning_rate=0.2, iterations=11, unfix_factor=2.5, num_threads=None):
+    def rolled_ordered_pointset(self, result, continue_from=0, fragment=False, angle_step=0.5, learning_rate=0.2, iterations=11, unfix_factor=2.5, num_threads=None, valid_clip=True):
         print("length of result: ", len(result))
         ordered_pointset, ordered_normals, ordered_umbilicus_points, angle_vector = zip(*result)
         print("length of ordered_pointset: ", len(ordered_pointset))
@@ -1357,7 +1357,10 @@ class WalkToSheet():
         if fresh_start3:
             valid_p = 0.4
             if not fragment:
-                valid_ts_s, valid_normals_s, angle_vector_s = self.clip_valid_windings(result_ts, result_normals, angle_vector, angle_step, valid_p_winding=valid_p, valid_p_z=valid_p, reverse=not winding_direction)
+                if valid_clip:
+                    valid_ts_s, valid_normals_s, angle_vector_s = self.clip_valid_windings(result_ts, result_normals, angle_vector, angle_step, valid_p_winding=valid_p, valid_p_z=valid_p, reverse=not winding_direction)
+                else:
+                    valid_ts_s, valid_normals_s, angle_vector_s = [result_ts], [result_normals], [angle_vector]
             else:
                 valid_p = 0.1
                 start_indices, end_indices = self.clip_valid_angles_fragment(result_ts, result_normals, angle_vector, angle_step, valid_p_winding=valid_p, valid_p_z=valid_p)
@@ -1765,12 +1768,12 @@ class WalkToSheet():
         
         return results
 
-    def unroll(self, fragment=False, debug=False, continue_from=0, z_range=None, angle_step=1, z_spacing=10, learning_rate=0.2, iterations=11, unfix_factor=2.5, downsample=False, max_z_step_size=250, num_threads=None):
+    def unroll(self, fragment=False, debug=False, continue_from=0, z_range=None, angle_step=1, z_spacing=10, learning_rate=0.2, iterations=11, unfix_factor=2.5, downsample=False, max_z_step_size=250, num_threads=None, valid_clip=True):
         # Load the graph
         result = self.load_pointcloud_to_raw_ordered_pointset(debug=debug, continue_from=continue_from, z_range=z_range, angle_step=angle_step, z_spacing=z_spacing, max_z_step_size=max_z_step_size)
 
         # get nodes
-        ordered_pointsets_s = self.rolled_ordered_pointset(result, angle_step=angle_step, continue_from=continue_from, fragment=fragment, learning_rate=learning_rate, iterations=iterations, unfix_factor=unfix_factor, num_threads=num_threads)
+        ordered_pointsets_s = self.rolled_ordered_pointset(result, angle_step=angle_step, continue_from=continue_from, fragment=fragment, learning_rate=learning_rate, iterations=iterations, unfix_factor=unfix_factor, num_threads=num_threads, valid_clip=valid_clip)
 
         pointset_ply_path = os.path.join(self.save_path, "ordered_pointset.ply")
         self.pointcloud_from_ordered_pointset(ordered_pointsets_s[0], pointset_ply_path)
@@ -1828,6 +1831,7 @@ if __name__ == '__main__':
     parser.add_argument('--downsample', action='store_true', help='Downsample the mesh')
     parser.add_argument('--max_z_step_size', type=int, default=250, help='Maximum z step size for the unrolling (RAM is approx size = GB)')
     parser.add_argument('--num_threads', type=int, default=None, help='Number of threads to use for the interpolation')
+    parser.add_argument('--disable_valid_clip', action='store_true', help='Disable the valid winding clip')
 
     args = parser.parse_args()
 
@@ -1853,7 +1857,7 @@ if __name__ == '__main__':
     
     walk = WalkToSheet(graph, args.path, start_point, scale_factor, split_width=args.split_width)
     # walk.save_graph_pointcloud(reference_path)
-    walk.unroll(fragment=args.fragment, debug=args.debug, continue_from=args.continue_from, z_range=z_range, angle_step=args.angle_step, z_spacing=args.z_spacing, learning_rate=args.learning_rate, iterations=args.iterations, unfix_factor=args.unfix_factor, downsample=args.downsample, max_z_step_size=args.max_z_step_size, num_threads=args.num_threads)
+    walk.unroll(fragment=args.fragment, debug=args.debug, continue_from=args.continue_from, z_range=z_range, angle_step=args.angle_step, z_spacing=args.z_spacing, learning_rate=args.learning_rate, iterations=args.iterations, unfix_factor=args.unfix_factor, downsample=args.downsample, max_z_step_size=args.max_z_step_size, num_threads=args.num_threads, valid_clip=not args.disable_valid_clip)
 
 # Example command: python3 -m ThaumatoAnakalyptor.graph_to_mesh --path /scroll.volpkg/working/scroll3_surface_points/point_cloud_colorized_verso_subvolume_blocks --graph /scroll.volpkg/working/scroll3_surface_points/1352_3600_5002/point_cloud_colorized_verso_subvolume_graph_BP_solved.pkl --start_point 1352 3600 5002 --debug
 # python3 -m ThaumatoAnakalyptor.graph_to_mesh --path /scroll2v2_surface_points/point_cloud_colorized_verso_subvolume_blocks --graph /scroll2v2_surface_points/1352_3600_5002/point_cloud_colorized_verso_subvolume_graph_BP_solved.pkl --start_point 1352 3600 5002
