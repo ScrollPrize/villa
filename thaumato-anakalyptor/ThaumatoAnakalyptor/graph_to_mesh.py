@@ -377,7 +377,7 @@ class WalkToSheet():
         first_found = None
         index_dif = None
         while i < len(angle_vector):
-            if np.allclose(angle_vector[i], vector):
+            if np.allclose(angle_vector[i], vector, atol=1e-2):
                 if first_found is None:
                     first_found = i
                 elif index_dif is None:
