@@ -1358,7 +1358,7 @@ class WalkToSheet():
             valid_p = 0.4
             if not fragment:
                 if valid_clip:
-                    valid_ts_s, valid_normals_s, angle_vector_s = self.clip_valid_windings(result_ts, result_normals, angle_vector, angle_step, valid_p_winding=valid_p, valid_p_z=valid_p, reverse=not winding_direction)
+                    valid_ts_s, valid_normals_s, angle_vector_s = self.clip_valid_windings(result_ts, result_normals, angle_vector, angle_step, valid_p_winding=valid_p, valid_p_z=valid_p, reverse=winding_direction)
                 else:
                     valid_ts_s, valid_normals_s, angle_vector_s = [result_ts], [result_normals], [angle_vector]
             else:
