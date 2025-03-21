@@ -1743,9 +1743,9 @@ class WalkToSheet():
                 fresh_start = continue_from <= 2
                 if fresh_start or not os.path.exists(result_pkl_path):
                     result = pointcloud_processing.create_ordered_pointset(points, normals, self.graph.umbilicus_data, angleStep=float(angle_step), z_spacing=int(z_spacing), max_eucledian_distance=10, min_z=z_start, max_z=z_end, min_wind=approx_min_angle, max_wind=approx_max_angle) # named parameters for mesh detail level: float angleStep, int z_spacing, float max_eucledian_distance, bool verbose
-                    # save result as pkl
-                    with open(result_pkl_path, 'wb') as f:
-                        pickle.dump(result, f)
+                    # # save result as pkl
+                    # with open(result_pkl_path, 'wb') as f:
+                    #     pickle.dump(result, f)
                 else:
                     with open(result_pkl_path, 'rb') as f:
                         result = pickle.load(f)
