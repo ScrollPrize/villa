@@ -1358,6 +1358,7 @@ public:
         // Step 3: Loop over angle steps from minWind to maxAngle.
         for (int step = 0; step < numSteps; ++step) {
             float targetAngle = minWind + step * angleStep;
+            float vectorAngle = minWind + (step % angleSteps) * angleStep;
             // Use a ±10° window.
             float windowLow = targetAngle - 10.0f;
             float windowHigh = targetAngle + 10.0f;
@@ -1473,7 +1474,7 @@ public:
             }
 
             // Compute the 3D angle vector for the target angle.
-            float rad = targetAngle * M_PI / 180.0f;
+            float rad = vectorAngle * M_PI / 180.0f;
             std::vector<float> angle_vector = { std::cos(rad), 0.0f, -std::sin(rad) };
 
             // Store the result for this angle step.
