@@ -1471,7 +1471,9 @@ public:
             std::vector<float> angle_vector = { std::cos(rad), 0.0f, -std::sin(rad) };
 
             // Store the result for this angle step.
-            results.push_back(std::make_tuple(ordered_ts, ordered_normals, ordered_umbilicus_points, angle_vector));
+            // results.push_back(std::make_tuple(ordered_ts, ordered_normals, ordered_umbilicus_points, angle_vector));
+            results[step] = {ordered_ts, ordered_normals, ordered_umbilicus_points, angle_vector};
+
             // Print every 1% progress
             if (verbose && step % (numSteps / 100) == 0) {
                 // Update same line, flush
