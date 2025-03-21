@@ -1124,60 +1124,73 @@ class WalkToSheet():
 
         return result_ts, result_normals
     
-    def clip_valid_windings(self, result_ts, result_normals, angle_vector, angle_step, valid_p_winding=0.1, valid_p_z=0.1):
-        # Clip away invalid windings at the beginning and end of the ordered pointset
+    def clip_valid_windings(self, result_ts, result_normals, angle_vector, angle_step,
+                            valid_p_winding=0.1, valid_p_z=0.1, reverse=False):
+        # If reverse flag is set, reverse the input arrays.
+        # The reversed array is obtained by slicing with [::-1]
+        if reverse:
+            result_ts = result_ts[::-1]
+            result_normals = result_normals[::-1]
+            angle_vector = angle_vector[::-1]
+
         steps_per_winding = 360 / angle_step
-        nr_windings = int(np.ceil(len(result_ts)/steps_per_winding))
+        nr_windings = int(np.ceil(len(result_ts) / steps_per_winding))
 
         valid_start_indx = 0
+        # Find the first valid winding
         for i in range(nr_windings):
             start_index = int(i * steps_per_winding)
-            end_index = int(min((i+1) * steps_per_winding, len(result_ts)))
-            winding_ts = [result_ts[j] for j in range(start_index, end_index)]
-            winding_normals = [result_normals[j] for j in range(start_index, end_index)]
-            # check if winding is valid
+            end_index = int(min((i + 1) * steps_per_winding, len(result_ts)))
+            winding_ts = result_ts[start_index:end_index]
+            winding_normals = result_normals[start_index:end_index]
+            # Check if the winding is valid
             valid_winding = self.check_valid_winding(winding_ts, winding_normals, valid_p_winding, valid_p_z)
             if not valid_winding:
-                valid_start_indx = i+1
+                valid_start_indx = i + 1
             else:
                 break
         print(f"Found valid start index: {valid_start_indx}")
-        
+
         valid_end_indx = nr_windings
-        for i in range(nr_windings-2, valid_start_indx, -1): # skip last winding
+        # Find the last valid winding (skipping the very last winding if too short)
+        for i in range(nr_windings - 2, valid_start_indx, -1):
             start_index = int(i * steps_per_winding)
-            end_index = int(min((i+1) * steps_per_winding, len(result_ts)))
-            # skip last winding if it is too short
+            end_index = int(min((i + 1) * steps_per_winding, len(result_ts)))
             if end_index - start_index < steps_per_winding / 2:
                 continue
-            winding_ts = [result_ts[j] for j in range(start_index, end_index)]
-            winding_normals = [result_normals[j] for j in range(start_index, end_index)]
-            # check if winding is valid
+            winding_ts = result_ts[start_index:end_index]
+            winding_normals = result_normals[start_index:end_index]
             valid_winding = self.check_valid_winding(winding_ts, winding_normals, valid_p_winding, valid_p_z)
             if not valid_winding:
                 valid_end_indx = i
             else:
                 break
+        print(f"Clipped windings from {valid_start_indx} to {valid_end_indx}. Total windings: {nr_windings}.")
 
-        print(f"Clipped windings from {valid_start_indx} to {valid_end_indx}. Total length: {nr_windings}.")
-        # Translate indices from winding to pointset indices
-        valid_start_indx = int(valid_start_indx * steps_per_winding)
-        valid_end_indx = min(int(valid_end_indx * steps_per_winding), len(result_ts))
+        # Convert winding indices back to pointset indices
+        valid_start_index = int(valid_start_indx * steps_per_winding)
+        valid_end_index = min(int(valid_end_indx * steps_per_winding), len(result_ts))
 
-        # Clip the valid windings
-        if valid_start_indx < valid_end_indx:
-            valid_ts = result_ts[valid_start_indx:valid_end_indx]
-            valid_normals = result_normals[valid_start_indx:valid_end_indx]
-            angle_vector = angle_vector[valid_start_indx:valid_end_indx]
-            # reset same vector indices
+        # Clip the arrays based on the valid range
+        if valid_start_index < valid_end_index:
+            valid_ts = result_ts[valid_start_index:valid_end_index]
+            valid_normals = result_normals[valid_start_index:valid_end_index]
+            valid_angle_vector = angle_vector[valid_start_index:valid_end_index]
+            # Reset angle vector indices global variable
             global angle_vector_indices_dp
             angle_vector_indices_dp = {}
         else:
             valid_ts = []
             valid_normals = []
-            angle_vector = []
+            valid_angle_vector = []
 
-        return [valid_ts], [valid_normals], [angle_vector]
+        # If reverse flag was set, reverse the valid segments back to the original order.
+        if reverse:
+            valid_ts = valid_ts[::-1]
+            valid_normals = valid_normals[::-1]
+            valid_angle_vector = valid_angle_vector[::-1]
+
+        return [valid_ts], [valid_normals], [valid_angle_vector]
     
     def clip_valid_angles_fragment(self, result_ts, result_normals, angle_vector, angle_step, valid_p_winding=0.01, valid_p_z=0.01):
         # Clip away invalid windings at the beginning and end of the ordered pointset
@@ -1343,7 +1356,7 @@ class WalkToSheet():
         if fresh_start3:
             valid_p = 0.4
             if not fragment:
-                valid_ts_s, valid_normals_s, angle_vector_s = self.clip_valid_windings(result_ts, result_normals, angle_vector, angle_step, valid_p_winding=valid_p, valid_p_z=valid_p)
+                valid_ts_s, valid_normals_s, angle_vector_s = self.clip_valid_windings(result_ts, result_normals, angle_vector, angle_step, valid_p_winding=valid_p, valid_p_z=valid_p, reverse=not winding_direction)
             else:
                 valid_p = 0.1
                 start_indices, end_indices = self.clip_valid_angles_fragment(result_ts, result_normals, angle_vector, angle_step, valid_p_winding=valid_p, valid_p_z=valid_p)
