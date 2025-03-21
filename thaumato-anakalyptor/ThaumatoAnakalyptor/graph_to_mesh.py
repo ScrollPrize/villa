@@ -1750,6 +1750,13 @@ class WalkToSheet():
                     with open(result_pkl_path, 'rb') as f:
                         result = pickle.load(f)
 
+                # debug section v1 vs v2 ordered pointset generation function, to delete after
+                with open(result_pkl_path, 'rb') as f:
+                    result_v1 = pickle.load(f)
+                print(f"Length of V1 results: {len(result_v1)} and V2 results: {len(result)}")
+                print(f"0-th entry dtype and length of V1: {result_v1[0].dtype}, {len(result_v1[0])} and V2: {result[0].dtype}, {len(result[0])}")
+                print(f"0-th entry 0-th element of V1: {result_v1[0][0].dtype}, {len(result_v1[0][0])} and V2: {result[0][0].dtype}, {len(result[0][0])}")
+
                 if results is None:
                     results = result
                 else:
