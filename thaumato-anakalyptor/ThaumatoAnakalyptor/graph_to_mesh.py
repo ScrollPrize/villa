@@ -1623,117 +1623,127 @@ class WalkToSheet():
         # maximum z step size
         z_step = min(z_step, max_z_step_size)
         results = None
-        for step_index, z_start in enumerate(tqdm(range(approx_min_z, approx_max_z, z_step), desc="Z range steps")):
-            result_pkl_path = os.path.join(self.save_path, f"ordered_pointset_{step_index}.pkl")
-            z_end = z_start + z_step
-            z_range = (z_start - 20, z_end + 20)
-            print(f"z_range: {z_range}")
+        if continue_from <= 2 or True:
+            for step_index, z_start in enumerate(tqdm(range(approx_min_z, approx_max_z, z_step), desc="Z range steps")):
+                result_pkl_path = os.path.join(self.save_path, f"ordered_pointset_{step_index}.pkl")
+                z_end = z_start + z_step
+                z_range = (z_start - 20, z_end + 20)
+                print(f"z_range: {z_range}")
 
-            # Set to false to load precomputed partial results during development
-            start_fresh = continue_from <= 1
-            path_points = os.path.join(self.save_path, f"points_{step_index}.npz")
-            if start_fresh or not os.path.exists(path_points):
                 # Set to false to load precomputed partial results during development
-                start_fresh_build_points = continue_from <= 0 or not os.path.exists(path_points)
-                if start_fresh_build_points:
-                    # get points
-                    points, normals, colors = self.build_points(z_range=z_range)
+                start_fresh = continue_from <= 1
+                path_points = os.path.join(self.save_path, f"points_{step_index}.npz")
+                if start_fresh or not os.path.exists(path_points):
+                    # Set to false to load precomputed partial results during development
+                    start_fresh_build_points = continue_from <= 0 or not os.path.exists(path_points)
+                    if start_fresh_build_points:
+                        # get points
+                        points, normals, colors = self.build_points(z_range=z_range)
 
-                    # Make directory if it doesn't exist
-                    os.makedirs(self.save_path, exist_ok=True)
+                        # Make directory if it doesn't exist
+                        os.makedirs(self.save_path, exist_ok=True)
+                        # Save as npz
+                        with open(path_points, 'wb') as f:
+                            np.savez(f, points=points, normals=normals, colors=colors)
+                    else:
+                        # Open the npz file
+                        with open(path_points, 'rb') as f:
+                            npzfile = np.load(f)
+                            points = npzfile['points']
+                            normals = npzfile['normals']
+                            colors = npzfile['colors']
+
                     # Save as npz
-                    with open(path_points, 'wb') as f:
-                        np.savez(f, points=points, normals=normals, colors=colors)
+                    with open(os.path.join(self.save_path, f"points_selected_{step_index}.npz"), 'wb') as f:
+                        np.savez(f, points=points, normals=normals)
                 else:
-                    # Open the npz file
-                    with open(path_points, 'rb') as f:
-                        npzfile = np.load(f)
-                        points = npzfile['points']
-                        normals = npzfile['normals']
-                        colors = npzfile['colors']
+                    load_points = continue_from <= 2 or debug or not os.path.exists(result_pkl_path)
+                    if load_points:
+                        # Open the npz file
+                        with open(os.path.join(self.save_path, f"points_selected_{step_index}.npz"), 'rb') as f:
+                            npzfile = np.load(f)
+                            points = npzfile['points']
+                            normals = npzfile['normals']
+                        print(f"Shape of points_originals_selected: {points.shape}")
+                    else:
+                        points = None
+                        normals = None
 
-                # Save as npz
-                with open(os.path.join(self.save_path, f"points_selected_{step_index}.npz"), 'wb') as f:
-                    np.savez(f, points=points, normals=normals)
-            else:
-                load_points = continue_from <= 2 or debug or not os.path.exists(result_pkl_path)
-                if load_points:
-                    # Open the npz file
-                    with open(os.path.join(self.save_path, f"points_selected_{step_index}.npz"), 'rb') as f:
-                        npzfile = np.load(f)
-                        points = npzfile['points']
-                        normals = npzfile['normals']
-                    print(f"Shape of points_originals_selected: {points.shape}")
-                else:
-                    points = None
-                    normals = None
+                # some debugging visualization of seperate pointcloud windings
+                if debug:
+                    # get winding angles
+                    winding_angles = points[:, 3]
 
-            # some debugging visualization of seperate pointcloud windings
-            if debug:
-                # get winding angles
-                winding_angles = points[:, 3]
+                    min_wind = np.min(winding_angles)
+                    max_wind = np.max(winding_angles)
+                    print(f"Min and max winding angles: {min_wind}, {max_wind}")
 
-                min_wind = np.min(winding_angles)
-                max_wind = np.max(winding_angles)
-                print(f"Min and max winding angles: {min_wind}, {max_wind}")
-
-                # remove test folder
-                test_folder = os.path.join(self.save_path, "test_winding_angles")
-                if os.path.exists(test_folder):
-                    shutil.rmtree(test_folder)
-                os.makedirs(test_folder)
-                # test
-                for test_angle in range(int(min_wind), int(max_wind), 360):
-                    if (test_angle // 360 % 20) > 2:
-                        continue
-                    start_index, end_index = self.points_at_winding_angle(points, test_angle+180, max_angle_diff=180)
-                    points_test = points[start_index:end_index]
-                    colors_test = points_test[:,3]
-                    points_test = points_test[:,:3]
-                    normals_test = normals[start_index:end_index]
-                    print(f"extracted {len(points_test)} points at {test_angle} degrees")
-                    # save as ply
-                    ordered_pointsets_test = [(points_test, normals_test)]
-                    test_pointset_ply_path = os.path.join(test_folder, f"ordered_pointset_test_{test_angle}_{step_index}.ply")
-                    try:
-                        self.pointcloud_from_ordered_pointset(ordered_pointsets_test, test_pointset_ply_path, color=colors_test)
-                    except:
-                        print("Error saving test pointset")
-
-                # if debug:
-                #     # save complete pointcloud
-                #     complete_pointset_ply_path = os.path.join(test_folder, "complete_pointset.ply")
-                #     try:
-                #         self.pointcloud_from_ordered_pointset([(points, normals)], complete_pointset_ply_path, color=points[:,3])
-                #     except:
-                #         print("Error saving complete pointset")
-
-            print("Using Cpp rolled_ordered_pointset")
-            # Set to false to load precomputed partial results during development
-            fresh_start = continue_from <= 2
-            if fresh_start or not os.path.exists(result_pkl_path):
-                result = pointcloud_processing.create_ordered_pointset(points, normals, self.graph.umbilicus_data, angleStep=float(angle_step), z_spacing=int(z_spacing), max_eucledian_distance=10, min_z=z_start, max_z=z_end, min_wind=approx_min_angle, max_wind=approx_max_angle) # named parameters for mesh detail level: float angleStep, int z_spacing, float max_eucledian_distance, bool verbose
-                # save result as pkl
-                with open(result_pkl_path, 'wb') as f:
-                    pickle.dump(result, f)
-            else:
-                with open(result_pkl_path, 'rb') as f:
-                    result = pickle.load(f)
-
-            if results is None:
-                results = result
-            else:
-                # results shape: total num angle steps, "ordered_pointset, ordered_normals, ordered_umbilicus_points, angle_vector", z steps, "individual shape"
-                for i in range(len(result)): # angle steps
-                    for j in range(len(result[i])): # type of data
-                        if j == 3: # angle vector
+                    # remove test folder
+                    test_folder = os.path.join(self.save_path, "test_winding_angles")
+                    if os.path.exists(test_folder):
+                        shutil.rmtree(test_folder)
+                    os.makedirs(test_folder)
+                    # test
+                    for test_angle in range(int(min_wind), int(max_wind), 360):
+                        if (test_angle // 360 % 20) > 2:
                             continue
-                        results[i][j].extend(result[i][j]) # extend the z steps
-            
-            # Get the size of the object in bytes
-            size_in_bytes = sys.getsizeof(results)
-            size_in_gbs = size_in_bytes / 1024 / 1024 / 1024
-            print(f"Size of results: {size_in_gbs} GBs")
+                        start_index, end_index = self.points_at_winding_angle(points, test_angle+180, max_angle_diff=180)
+                        points_test = points[start_index:end_index]
+                        colors_test = points_test[:,3]
+                        points_test = points_test[:,:3]
+                        normals_test = normals[start_index:end_index]
+                        print(f"extracted {len(points_test)} points at {test_angle} degrees")
+                        # save as ply
+                        ordered_pointsets_test = [(points_test, normals_test)]
+                        test_pointset_ply_path = os.path.join(test_folder, f"ordered_pointset_test_{test_angle}_{step_index}.ply")
+                        try:
+                            self.pointcloud_from_ordered_pointset(ordered_pointsets_test, test_pointset_ply_path, color=colors_test)
+                        except:
+                            print("Error saving test pointset")
+
+                    # if debug:
+                    #     # save complete pointcloud
+                    #     complete_pointset_ply_path = os.path.join(test_folder, "complete_pointset.ply")
+                    #     try:
+                    #         self.pointcloud_from_ordered_pointset([(points, normals)], complete_pointset_ply_path, color=points[:,3])
+                    #     except:
+                    #         print("Error saving complete pointset")
+
+                print("Using Cpp rolled_ordered_pointset")
+                # Set to false to load precomputed partial results during development
+                fresh_start = continue_from <= 2
+                if fresh_start or not os.path.exists(result_pkl_path):
+                    result = pointcloud_processing.create_ordered_pointset(points, normals, self.graph.umbilicus_data, angleStep=float(angle_step), z_spacing=int(z_spacing), max_eucledian_distance=10, min_z=z_start, max_z=z_end, min_wind=approx_min_angle, max_wind=approx_max_angle) # named parameters for mesh detail level: float angleStep, int z_spacing, float max_eucledian_distance, bool verbose
+                    # save result as pkl
+                    with open(result_pkl_path, 'wb') as f:
+                        pickle.dump(result, f)
+                else:
+                    with open(result_pkl_path, 'rb') as f:
+                        result = pickle.load(f)
+
+                if results is None:
+                    results = result
+                else:
+                    # results shape: total num angle steps, "ordered_pointset, ordered_normals, ordered_umbilicus_points, angle_vector", z steps, "individual shape"
+                    for i in range(len(result)): # angle steps
+                        for j in range(len(result[i])): # type of data
+                            if j == 3: # angle vector
+                                continue
+                            results[i][j].extend(result[i][j]) # extend the z steps
+                
+                # Get the size of the object in bytes
+                size_in_bytes = sys.getsizeof(results)
+                size_in_gbs = size_in_bytes / 1024 / 1024 / 1024
+                print(f"Size of results: {size_in_gbs} GBs")
+
+            # Save the results
+            results_pkl_path = os.path.join(self.save_path, "results.pkl")
+            with open(results_pkl_path, 'wb') as f:
+                pickle.dump(results, f)
+        else:
+            results_pkl_path = os.path.join(self.save_path, "results.pkl")
+            with open(results_pkl_path, 'rb') as f:
+                results = pickle.load(f)
         
         return results
 
