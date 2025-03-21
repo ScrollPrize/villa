@@ -1084,7 +1084,7 @@ class WalkToSheet():
 
         return result_ts, result_normals
     
-    def interpolate_ordered_pointset_multithreaded(self, ordered_pointset, ordered_normals, angle_vector, winding_direction):
+    def interpolate_ordered_pointset_multithreaded(self, ordered_pointset, ordered_normals, angle_vector, winding_direction, num_threads=None):
         computed_vectors_set = set()
         result_ts = []
         result_normals = []
