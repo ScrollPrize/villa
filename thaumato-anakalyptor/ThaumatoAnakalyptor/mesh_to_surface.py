@@ -197,7 +197,7 @@ class MyPredictionWriter(BasePredictionWriter):
             # in Yellow
             return
         # green
-        print("\033[92mWriting Segment to disk.\033[0m")
+        print(f"\033[92mWriting Segment to disk. Min/Max Values: {np.min(self.surface_volume_np)}, {np.max(self.surface_volume_np)}\033[0m")
         # Make folder if it does not exist
         os.makedirs(self.save_path, exist_ok=True)
 
