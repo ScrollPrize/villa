@@ -1136,50 +1136,41 @@ class WalkToSheet():
 
         steps_per_winding = 360 / angle_step
         nr_windings = int(np.ceil(len(result_ts) / steps_per_winding))
-        
-        best_start_index = 0
-        best_end_index = 0
-        
-        valid_start_indx = 0
-        valid_end_indx = 0
-        while valid_end_index < nr_windings - 2:
-            # Find the first valid winding
-            for i in range(nr_windings):
-                start_index = int(i * steps_per_winding)
-                end_index = int(min((i + 1) * steps_per_winding, len(result_ts)))
-                winding_ts = result_ts[start_index:end_index]
-                winding_normals = result_normals[start_index:end_index]
-                # Check if the winding is valid
-                valid_winding = self.check_valid_winding(winding_ts, winding_normals, valid_p_winding, valid_p_z)
-                if not valid_winding:
-                    valid_start_indx = i + 1
-                else:
-                    break
-            print(f"Found valid start index: {valid_start_indx}")
 
-            valid_end_indx = nr_windings
-            # Find the last valid winding (skipping the very last winding if too short)
-            for i in range(nr_windings - 2, valid_start_indx, -1):
-                start_index = int(i * steps_per_winding)
-                end_index = int(min((i + 1) * steps_per_winding, len(result_ts)))
-                if end_index - start_index < steps_per_winding / 2:
-                    continue
-                winding_ts = result_ts[start_index:end_index]
-                winding_normals = result_normals[start_index:end_index]
-                valid_winding = self.check_valid_winding(winding_ts, winding_normals, valid_p_winding, valid_p_z)
-                if not valid_winding:
-                    valid_end_indx = i
-                else:
-                    break
-                
-            if best_end_index - best_start_index < valid_end_indx - valid_start_indx:
-                best_start_index = valid_start_indx
-                best_end_index = valid_end_indx
-        print(f"Clipped windings from {best_start_index} to {best_end_index}. Total windings: {nr_windings}.")
+        valid_start_indx = 0
+        # Find the first valid winding
+        for i in range(nr_windings):
+            start_index = int(i * steps_per_winding)
+            end_index = int(min((i + 1) * steps_per_winding, len(result_ts)))
+            winding_ts = result_ts[start_index:end_index]
+            winding_normals = result_normals[start_index:end_index]
+            # Check if the winding is valid
+            valid_winding = self.check_valid_winding(winding_ts, winding_normals, valid_p_winding, valid_p_z)
+            if not valid_winding:
+                valid_start_indx = i + 1
+            else:
+                break
+        print(f"Found valid start index: {valid_start_indx}")
+
+        valid_end_indx = nr_windings
+        # Find the last valid winding (skipping the very last winding if too short)
+        for i in range(nr_windings - 2, valid_start_indx, -1):
+            start_index = int(i * steps_per_winding)
+            end_index = int(min((i + 1) * steps_per_winding, len(result_ts)))
+            if end_index - start_index < steps_per_winding / 2:
+                continue
+            winding_ts = result_ts[start_index:end_index]
+            winding_normals = result_normals[start_index:end_index]
+            valid_winding = self.check_valid_winding(winding_ts, winding_normals, valid_p_winding, valid_p_z)
+            if not valid_winding:
+                valid_end_indx = i
+            else:
+                break
+        print(f"Clipped windings from {valid_start_indx} to {valid_end_indx}. Total windings: {nr_windings}.")
 
         # Convert winding indices back to pointset indices
-        valid_start_index = int(best_start_index * steps_per_winding)
-        valid_end_index = min(int(best_end_index * steps_per_winding), len(result_ts))
+        valid_start_index = int(valid_start_indx * steps_per_winding)
+        valid_end_index = min(int(valid_end_indx * steps_per_winding), len(result_ts))
 
         # Clip the arrays based on the valid range
         if valid_start_index < valid_end_index:
@@ -1435,7 +1426,7 @@ class WalkToSheet():
                     interpolated_normals = [interpolated_normals[i][valid_bottom_index:valid_top_index] for i in range(len(interpolated_normals))]
                     ordered_umbilicus_points_ = [ordered_umbilicus_points[i][valid_bottom_index:valid_top_index] for i in range(len(ordered_umbilicus_points))]
                 else:
-                    ordered_umbilicus_points_ = ordered_umbilicus_points                  
+                    ordered_umbilicus_points_ = ordered_umbilicus_points                    
 
                 # go from interpolated t values to ordered pointset (3D points)
                 interpolated_points = self.ordered_pointset_to_3D(interpolated_ts, ordered_umbilicus_points_, angle_vector)
