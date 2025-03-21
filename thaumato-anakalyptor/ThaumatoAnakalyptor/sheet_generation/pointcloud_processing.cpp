@@ -1322,6 +1322,7 @@ public:
         std::cout << "Processing pointset" << std::endl;
         // Preprocess angle step
         int angleSteps = getAngleSteps(angleStep);
+        angleStep = 360.0f / angleSteps;
 
         std::cout << "Angle steps: " << angleSteps << std::endl;
 
