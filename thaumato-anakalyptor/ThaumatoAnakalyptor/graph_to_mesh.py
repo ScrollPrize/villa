@@ -1799,7 +1799,7 @@ if __name__ == '__main__':
     parser.add_argument('--unfix_factor', type=float, default=2.5, help='Unfix factor for the optimization. Higher = less unfixed points')
     parser.add_argument('--downsample', action='store_true', help='Downsample the mesh')
     parser.add_argument('--max_z_step_size', type=int, default=250, help='Maximum z step size for the unrolling (RAM is approx size = GB)')
-    parser.add_argument('--num_threads', type=int, default=None, help='Number of threads to use for the unrolling')
+    parser.add_argument('--num_threads', type=int, default=None, help='Number of threads to use for the interpolation')
 
     args = parser.parse_args()
 
