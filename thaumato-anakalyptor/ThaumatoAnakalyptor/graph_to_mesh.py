@@ -1383,9 +1383,12 @@ class WalkToSheet():
                                                             learning_rate=learning_rate, iterations=iterations, error_val_d=0.0001, unfix_factor=unfix_factor,
                                                             verbose=True)
                 
-                valid_ts_s = [interpolated_ts[start_indices[i]-start_index_0:end_indices[i]-start_index_0] for i in range(len(start_indices))]
-                valid_normals_s = [interpolated_normals[start_indices[i]-start_index_0:end_indices[i]-start_index_0] for i in range(len(start_indices))]
-                angle_vector_s = [angle_vector[start_indices[i]:end_indices[i]] for i in range(len(start_indices))]
+                if valid_clip:
+                    valid_ts_s = [interpolated_ts[start_indices[i]-start_index_0:end_indices[i]-start_index_0] for i in range(len(start_indices))]
+                    valid_normals_s = [interpolated_normals[start_indices[i]-start_index_0:end_indices[i]-start_index_0] for i in range(len(start_indices))]
+                    angle_vector_s = [angle_vector[start_indices[i]:end_indices[i]] for i in range(len(start_indices))]
+                else:
+                    valid_ts_s, valid_normals_s, angle_vector_s = [interpolated_ts], [interpolated_normals], [angle_vector]
 
             for valid_i_s in range(len(valid_ts_s)):
                 valid_ts = valid_ts_s[valid_i_s]
@@ -1418,9 +1421,10 @@ class WalkToSheet():
                     print(f"length of interpolated_ts: {len(interpolated_ts)}, length of interpolated_normals: {len(interpolated_normals)}, length of angle_vector: {len(angle_vector)}")
 
                 # Clip away invalid z values
-                interpolated_ts = [interpolated_ts[i][valid_bottom_index:valid_top_index] for i in range(len(interpolated_ts))]
-                interpolated_normals = [interpolated_normals[i][valid_bottom_index:valid_top_index] for i in range(len(interpolated_normals))]
-                ordered_umbilicus_points_ = [ordered_umbilicus_points[i][valid_bottom_index:valid_top_index] for i in range(len(ordered_umbilicus_points))]
+                if valid_clip:
+                    interpolated_ts = [interpolated_ts[i][valid_bottom_index:valid_top_index] for i in range(len(interpolated_ts))]
+                    interpolated_normals = [interpolated_normals[i][valid_bottom_index:valid_top_index] for i in range(len(interpolated_normals))]
+                    ordered_umbilicus_points_ = [ordered_umbilicus_points[i][valid_bottom_index:valid_top_index] for i in range(len(ordered_umbilicus_points))]                    
 
                 # go from interpolated t values to ordered pointset (3D points)
                 interpolated_points = self.ordered_pointset_to_3D(interpolated_ts, ordered_umbilicus_points_, angle_vector)
