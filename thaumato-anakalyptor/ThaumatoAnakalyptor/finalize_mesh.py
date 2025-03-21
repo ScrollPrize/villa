@@ -207,7 +207,7 @@ def main(output_folder, input_mesh, scale_factor, cut_size, delauny):
     mesh, texture_size = load_obj(obj_path, delauny)
     if np.any(texture_size < 10):
         print("Texture size is too small, please check the texture image")
-        return
+        return None
     mesh_filename = os.path.basename(input_mesh)
 
     # Scale mesh
