@@ -23,6 +23,7 @@ if __name__ == "__main__":
     parser.add_argument('--prefetch_factor', type=int, default=2)
     parser.add_argument('--start', type=int, default=0)
     parser.add_argument('--end', type=int, default=None)
+    parser.add_argument('--reverse', action='store_true')
 
     args = parser.parse_known_args()[0]
     print(f"Known args: {args}")
@@ -41,7 +42,8 @@ if __name__ == "__main__":
                 obj_paths.extend(obj_path_)
     # sort the obj_paths
     obj_paths.sort()
-    obj_paths = obj_paths[::-1]
+    if args.reverse:
+        obj_paths = obj_paths[::-1]
     if args.end is not None:
         obj_paths = obj_paths[args.start:args.end]
     else:
