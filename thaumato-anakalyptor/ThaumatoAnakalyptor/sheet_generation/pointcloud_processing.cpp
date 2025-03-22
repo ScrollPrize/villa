@@ -1473,8 +1473,11 @@ public:
                 }
             }
 
+            // for some reason, needs offset
+            vectorAngle -= 90.0f;
             // Compute the 3D angle vector for the target angle.
             float rad = vectorAngle * M_PI / 180.0f;
+            
             std::vector<float> angle_vector = { std::cos(rad), 0.0f, -std::sin(rad) };
 
             // Store the result for this angle step.
