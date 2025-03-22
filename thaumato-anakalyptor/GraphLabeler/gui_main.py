@@ -78,7 +78,9 @@ class PointCloudLabeler(QMainWindow):
         self._create_menu()
         
         # Data and labels.
+        self.show_original_points = False
         self.points = np.array(point_data)
+        self.original_points = np.array(point_data)
         self.group = np.zeros(len(self.points), dtype=np.int32)
         self.active_group = 0
         self.last_group_update = 0
@@ -597,6 +599,7 @@ class PointCloudLabeler(QMainWindow):
         print(f"Points shape previous vs new: {self.points.shape} vs {new_points.shape}")
         self.points = np.array(new_points)
         if update_labels:
+            self.original_points = np.array(self.points)
             self.labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
             self.calculated_labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
             self.group = np.zeros(len(self.points), dtype=np.int32)
@@ -673,7 +676,7 @@ class PointCloudLabeler(QMainWindow):
             "7. Common Controls (Bottom Row):\n"
             "   • Drawing radius, Max Display Points, Drawing Mode, Pipette, Label selection, etc.\n\n"
             "8. Key Shortcuts:\n"
-            "   • P: Pipette to pick label, G:  Pipette to pick group, U: Toggle Updated Labels Draw Mode, Ctrl+Z: Undo, Ctrl+Y: Redo.\n\n"
+            "   • P: Pipette to pick label, G:  Pipette to pick group, U: Toggle Updated Labels Draw Mode, Ctrl+Z: Undo, Ctrl+Y: Redo, Space or O: toggle between initial and current points position.\n\n"
             "9. Saving:\n"
             "   • Use the Data menu to load data or save/load labels, and to save the final labeled graph.\n"
         )
@@ -1092,7 +1095,10 @@ class PointCloudLabeler(QMainWindow):
         
         # ----- Process XY view visible points -----
         mask_xy = (self.points[:, 2] >= z_min_val) & (self.points[:, 2] <= z_max_val)
-        pts_xy = self.points[mask_xy]
+        if self.show_original_points:
+            pts_xy = self.original_points[mask_xy]
+        else:
+            pts_xy = self.points[mask_xy]
         labels_xy = self.labels[mask_xy]
         group_xy = self.group[mask_xy]
         calc_labels_xy = self.calculated_labels[mask_xy]
@@ -1219,7 +1225,10 @@ class PointCloudLabeler(QMainWindow):
         finit_min_val = finit_center - finit_thickness / 2
         finit_max_val = finit_center + finit_thickness / 2
         mask_xz = (self.points[:, 1] >= finit_min_val) & (self.points[:, 1] <= finit_max_val)
-        pts_xz = self.points[mask_xz]
+        if self.show_original_points:
+            pts_xz = self.original_points[mask_xz]
+        else:
+            pts_xz = self.points[mask_xz]
         labels_xz = self.labels[mask_xz]
         group_xz = self.group[mask_xz]
         shear_angle_deg_xz = self.xz_shear_spinbox.value()
@@ -1944,6 +1953,11 @@ class PointCloudLabeler(QMainWindow):
         max_len = 50
         if len(self.undo_stack) > max_len:
             self.undo_stack = self.undo_stack[-max_len:]
+
+    def toggle_original_points(self):
+        self.show_original_points = not self.show_original_points
+        self.recompute = True
+        self.update_views()
     
     def toggle_calc_draw_mode(self):
         self.calc_drawing_mode = self.calc_draw_button.isChecked()
@@ -2026,6 +2040,10 @@ class PointCloudLabeler(QMainWindow):
             event.accept()
         elif event.key() == Qt.Key_G:
             self.activate_group_pipette()
+            event.accept()
+        # space or O
+        elif event.key() == Qt.Key_Space or event.key() == Qt.Key_O:
+            self.toggle_original_points()
             event.accept()
         # up arrow
         elif event.key() == Qt.Key_Up:
