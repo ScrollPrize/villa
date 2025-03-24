@@ -684,6 +684,9 @@ class InstanceSegmentation(pl.LightningModule):
                 f"val_{k}": v.detach().cpu().item() for k, v in losses.items()
             }
         else:
+            return {
+                f"val_{k}": v.detach().cpu().item() for k, v in losses.items()
+            }
             return 0.0
 
     def test_step(self, batch, batch_idx):
