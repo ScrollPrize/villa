@@ -5,4 +5,4 @@
   save_dir: ${general.save_dir}
   entity: "schillij-scrollprize"
   resume: "allow"
-  id: ${general.experiment_name}
+  # id: ${general.experiment_name}
