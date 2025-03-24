@@ -28,5 +28,5 @@ general.eval_inner_core=50.0 \
 general.topk_per_image=${CURR_TOPK} \
 general.use_dbscan=true \
 general.dbscan_eps=${CURR_DBSCAN} \
-data.test_mode=evaluation \
+data.test_mode=validation \
 general.export=true
