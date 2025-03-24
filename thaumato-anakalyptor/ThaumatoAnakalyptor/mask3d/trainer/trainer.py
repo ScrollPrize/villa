@@ -573,7 +573,6 @@ class InstanceSegmentation(pl.LightningModule):
         )
 
     def eval_step(self, batch, batch_idx):
-        print("eval step")
         data, target, file_names = batch
         inverse_maps = data.inverse_maps
         target_full = data.target_full
@@ -1624,8 +1623,6 @@ class InstanceSegmentation(pl.LightningModule):
         # check if val loss is in the dictionary
         if "val_loss" not in dd:
             dd["val_loss"] = dd["val_mean_loss_ce"] + dd["val_mean_loss_mask"] + dd["val_mean_loss_dice"]
-
-        print(dd)
 
         self.log_dict(dd)
 
