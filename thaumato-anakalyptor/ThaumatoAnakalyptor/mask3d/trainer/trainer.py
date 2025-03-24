@@ -573,6 +573,7 @@ class InstanceSegmentation(pl.LightningModule):
         )
 
     def eval_step(self, batch, batch_idx):
+        print("eval step")
         data, target, file_names = batch
         inverse_maps = data.inverse_maps
         target_full = data.target_full
