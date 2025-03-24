@@ -621,7 +621,7 @@ class InstanceSegmentation(pl.LightningModule):
             else:
                 raise run_err
 
-        if True or self.config.data.test_mode != "test":
+        if self.config.data.test_mode != "test":
             if self.config.trainer.deterministic:
                 torch.use_deterministic_algorithms(False)
 
@@ -684,9 +684,6 @@ class InstanceSegmentation(pl.LightningModule):
                 f"val_{k}": v.detach().cpu().item() for k, v in losses.items()
             }
         else:
-            return {
-                f"val_{k}": v.detach().cpu().item() for k, v in losses.items()
-            }
             return 0.0
 
     def test_step(self, batch, batch_idx):
@@ -1603,8 +1600,8 @@ class InstanceSegmentation(pl.LightningModule):
         self.bbox_gt = dict()
 
     def test_epoch_end(self, outputs):
-        # if self.config.general.export:
-        #     return
+        if self.config.general.export:
+            return
 
         self.eval_instance_epoch_end()
 
