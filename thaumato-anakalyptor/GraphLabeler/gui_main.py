@@ -161,7 +161,19 @@ class PointCloudLabeler(QMainWindow):
         xy_controls.addWidget(self.z_center_widget)
         xy_controls.addWidget(self.z_thickness_widget)
         left_column.addLayout(xy_controls)
-        # Add two new shear controls for the XY view:
+        self.line_fstar_min = pg.InfiniteLine(pos=self.f_star_min, angle=90, 
+                                        pen=pg.mkPen('blue', width=1, style=Qt.DashLine))
+        self.line_fstar_max = pg.InfiniteLine(pos=self.f_star_max, angle=90, 
+                                                pen=pg.mkPen('blue', width=1, style=Qt.DashLine))
+
+        # Create slider/spinbox controls for f* min and max; using the f* data range as both min and max of the slider.
+        self.fstar_min_widget, self.fstar_min_slider, self.fstar_min_spinbox = create_sync_slider_spinbox(
+            "f* Min:", self.f_star_min, self.f_star_max, self.f_star_min, self.scaleFactor, self.update_fstar_indicators, decimals=1)
+        self.fstar_max_widget, self.fstar_max_slider, self.fstar_max_spinbox = create_sync_slider_spinbox(
+            "f* Max:", self.f_star_min, self.f_star_max, self.f_star_max, self.scaleFactor, self.update_fstar_indicators, decimals=1)
+
+        left_column.addWidget(self.fstar_min_widget)
+        left_column.addWidget(self.fstar_max_widget)
         # Vertical shear (rotating around the f_star axis)
         xy_vertical_shear_layout = QHBoxLayout()
         self.xy_vertical_shear_widget, self.xy_vertical_shear_slider, self.xy_vertical_shear_spinbox = create_sync_slider_spinbox(
@@ -431,6 +443,11 @@ class PointCloudLabeler(QMainWindow):
         if hasattr(self, 'ome_zarr_window') and self.ome_zarr_window is not None:
             self.ome_zarr_window.update_z_slice_center(self.z_center_spinbox.value())
         self.update_views()
+
+    def update_fstar_indicators(self):
+        # Update the positions of the f* indicator lines
+        self.line_fstar_min.setPos(self.fstar_min_spinbox.value())
+        self.line_fstar_max.setPos(self.fstar_max_spinbox.value())
 
     def f_init_center_changed(self):
         if hasattr(self, 'ome_zarr_window') and self.ome_zarr_window is not None:
@@ -782,6 +799,17 @@ class PointCloudLabeler(QMainWindow):
             # Remove guide items if guides are turned off.
             for item in [self.line_finit_neg, self.line_finit_pos, self.line_finit_center,
                         self.line_finit_upper, self.line_finit_lower, self.xz_shear_indicator]:
+                if item.scene() is not None:
+                    self.xy_plot.removeItem(item)
+
+        # For the min max XY fff* guides:
+        if self.show_guides_checkbox.isChecked():
+            if self.line_fstar_min.scene() is None:
+                self.xy_plot.addItem(self.line_fstar_min)
+            if self.line_fstar_max.scene() is None:
+                self.xy_plot.addItem(self.line_fstar_max)
+        else:
+            for item in [self.line_fstar_min, self.line_fstar_max]:
                 if item.scene() is not None:
                     self.xy_plot.removeItem(item)
         
