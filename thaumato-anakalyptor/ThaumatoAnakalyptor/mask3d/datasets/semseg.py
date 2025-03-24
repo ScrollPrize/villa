@@ -331,6 +331,8 @@ class SemanticSegmentationDataset(Dataset):
                                     }
                                 )
                             else:
+                                print(f"block_id: {block_id}, cond_inner: {cond_inner.sum()} < 10000")
+                                continue
                                 assert False, f"block_id: {block_id}, cond_inner: {cond_inner.sum()}"
 
             if self.on_crops:
