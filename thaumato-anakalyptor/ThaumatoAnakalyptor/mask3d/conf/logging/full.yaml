@@ -3,6 +3,6 @@
   project: ${general.project_name}
   name: ${general.experiment_name}
   save_dir: ${general.save_dir}
-  entity: "schillij"
+  entity: "schillij-scrollprize"
   resume: "allow"
   id: ${general.experiment_name}
