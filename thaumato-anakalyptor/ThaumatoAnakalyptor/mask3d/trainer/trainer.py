@@ -621,7 +621,7 @@ class InstanceSegmentation(pl.LightningModule):
             else:
                 raise run_err
 
-        if self.config.data.test_mode != "test":
+        if True or self.config.data.test_mode != "test":
             if self.config.trainer.deterministic:
                 torch.use_deterministic_algorithms(False)
 
