@@ -1108,7 +1108,8 @@ class InstanceSegmentation(pl.LightningModule):
                             file_name,
                             self.decoder_id,
                         )
-                    except:
+                    except Exception as e:
+                        print(f"Error during exporting in eval instance step: {e}")
                         pass
                 else:
                     self.export(
