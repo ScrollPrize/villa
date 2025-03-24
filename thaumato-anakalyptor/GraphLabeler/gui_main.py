@@ -66,6 +66,7 @@ class PointCloudLabeler(QMainWindow):
         self.group_pipette_mode = False
         self.calc_drawing_mode = False
         self.UNLABELED = -9999
+        self.teflon_label = 9999
         self.undo_stack = []
         self.redo_stack = []
         self._stroke_backup = None
@@ -110,6 +111,7 @@ class PointCloudLabeler(QMainWindow):
         self.calc_brush_red   = pg.mkBrush(255, 0, 0, 80)
         self.calc_brush_green = pg.mkBrush(0, 255, 0, 80)
         self.calc_brown_blue  = pg.mkBrush(218,165,32, 80)
+        self.transparent_brush = pg.mkBrush(0, 0, 0, 0)
         
         # Guide lines and indicators.
         self.line_finit_neg = pg.InfiniteLine(pos=-180, angle=0, pen=pg.mkPen('grey', width=1, style=Qt.DashLine))
@@ -361,6 +363,22 @@ class PointCloudLabeler(QMainWindow):
         self.slab_compute_button = QPushButton("Compute Slabs")
         self.slab_compute_button.clicked.connect(self.run_slab_computation)
         cellar_controls_layout.addWidget(self.slab_compute_button)
+
+        self.reset_points_button = QPushButton("Reset Points")
+        self.reset_points_button.clicked.connect(self.reset_points)
+        cellar_controls_layout.addWidget(self.reset_points_button)
+
+        self.teflon_spinbox = QSpinBox()
+        self.teflon_spinbox.setRange(-10000, 10000)
+        self.teflon_spinbox.setValue(self.teflon_label)
+        self.teflon_spinbox.valueChanged.connect(self.update_teflon)
+        cellar_controls_layout.addWidget(QLabel("Teflon Label:"))
+        cellar_controls_layout.addWidget(self.teflon_spinbox)
+
+        self.hide_teflon_checkbox = QCheckBox("Hide Teflon")
+        self.hide_teflon_checkbox.setChecked(False)
+        cellar_controls_layout.addWidget(self.hide_teflon_checkbox)
+        self.hide_teflon_checkbox.toggled.connect(self.update_views)
 
         # Show Max Group (just display, no control)
         self.max_group_label = QLabel("Max Group: 0")
@@ -788,6 +806,10 @@ class PointCloudLabeler(QMainWindow):
                 if item.scene() is not None:
                     self.xz_plot.removeItem(item)
 
+    def update_teflon(self, val):
+        self.teflon_label = val
+        self.update_views()
+
     def update_group(self, val):
         self.active_group = val
         self.update_views()
@@ -875,7 +897,9 @@ class PointCloudLabeler(QMainWindow):
         mod = valid_labels % 3
         valid_indices = np.where(mask_valid)[0]
         for i, idx in enumerate(valid_indices):
-            if mask_active_group[i]:
+            if valid_groups[i] == 0 and valid_labels[i] == self.teflon_label and self.hide_teflon_checkbox.isChecked():
+                brushes[idx] = self.transparent_brush
+            elif mask_active_group[i]:
                 count_active_group += 1
                 if mod[i] == 0:
                     brushes[idx] = self.brush_red_active
@@ -994,6 +1018,8 @@ class PointCloudLabeler(QMainWindow):
                 z_min_val = z_center - z_thickness / 2
                 z_max_val = z_center + z_thickness / 2
                 mask = (self.points[indices, 2] >= z_min_val) & (self.points[indices, 2] <= z_max_val)
+                if self.hide_teflon_checkbox.isChecked():
+                    mask = mask & np.logical_or(self.labels[indices] != self.teflon_label, self.group[indices] != 0)
                 indices = indices[mask]
 
             elif view_name == 'xz':
@@ -1004,6 +1030,8 @@ class PointCloudLabeler(QMainWindow):
                 finit_min_val = finit_center - finit_thickness / 2
                 finit_max_val = finit_center + finit_thickness / 2
                 mask = (self.points[indices, 1] >= finit_min_val) & (self.points[indices, 1] <= finit_max_val)
+                if self.hide_teflon_checkbox.isChecked():
+                    mask = mask & np.logical_or(self.labels[indices] != self.teflon_label, self.group[indices] != 0)
                 indices = indices[mask]
                 update_label = current_label
             else:
@@ -1083,7 +1111,7 @@ class PointCloudLabeler(QMainWindow):
         end_time2 = time.time()  # Finished updating views.
         # print(f"Time to update calc labels: {end_time - start_time:.4f} s, Time to update views: {end_time2 - end_time:.4f} s")
 
-    def update_views(self):
+    def update_views(self, val=None):
         t0 = time.time()
         # ----- Compute z-slice values -----
         z_center = self.z_center_spinbox.value()
@@ -1720,6 +1748,11 @@ class PointCloudLabeler(QMainWindow):
     def activate_group_pipette(self):
         self.group_pipette_mode = True
 
+    def reset_points(self):
+        self.points = self.original_points.copy()
+        self.recompute = True
+        self.update_views()
+
     def run_slab_computation(self):
         """
         Computes labels over slabs in z. It starts at the current slab (using the current z_center
@@ -1956,6 +1989,7 @@ class PointCloudLabeler(QMainWindow):
 
     def toggle_original_points(self):
         self.show_original_points = not self.show_original_points
+        print(f"Toggling original points: {self.show_original_points}")
         self.recompute = True
         self.update_views()
     

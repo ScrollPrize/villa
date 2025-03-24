@@ -108,3 +108,6 @@ void saveGraph(const std::vector<Node>& nodes, const std::string& filename);
 std::vector<Node> loadGraph(const std::string& filename);
 
 std::pair<std::vector<Node>, float> load_graph_from_binary(const std::string &file_name, bool clip_z, float z_min, float z_max, float same_winding_factor, bool fix_same_block_edges);
+
+std::vector<Node> createSubgraph(const std::vector<Node>& graph, const std::vector<bool>& mask);
+void updateGraphWithSubgraph(std::vector<Node>& graph, const std::vector<bool>& mask, const std::vector<Node>& subgraph);

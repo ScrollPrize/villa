@@ -496,15 +496,36 @@ class Solver {
         void solve_f_star(int num_iterations, float spring_constant, int i_round = 1, float o_ = 0.0f, float step_sigma=360.0f, bool visualize = false) {
             // use the f_star solver for the intermediate solution
             // store only the valid indices to speed up the loop
-            std::vector<size_t> valid_indices = get_valid_indices(graph);
-            graph = run_solver_f_star(graph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, o_, spring_constant, step_sigma, visualize);
+            auto [undeleted_mask, count_undeleted] = get_undeleted_mask();
+            std::vector<Node> subgraph = graph;
+            bool create_subgraph = 1.0f * count_undeleted / graph.size() < 0.5f;
+            if (create_subgraph) {
+                std::cout << "Creating subgraph" << std::endl;
+                subgraph = createSubgraph(graph, undeleted_mask);
+            }
+            std::vector<size_t> valid_indices = get_valid_indices(subgraph);
+            run_solver_f_star(subgraph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, o_, spring_constant, step_sigma, visualize);
+            if (create_subgraph) {
+                updateGraphWithSubgraph(graph, undeleted_mask, subgraph);
+            }
         }
         void solve_f_star_with_labels(int num_iterations, float spring_constant, float other_block_factor = 1.0f, float lr = 10.0f, float error_cutoff = -1.0f, bool display = false) {
             // use the f_star solver for the intermediate solution
             // store only the valid indices to speed up the loop
-            std::vector<size_t> valid_indices = get_valid_indices(graph);
-            graph = run_solver_f_star_with_labels(graph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, spring_constant, other_block_factor, lr, error_cutoff, display);
+            auto [undeleted_mask, count_undeleted] = get_undeleted_mask();
+            std::vector<Node>& subgraph = graph;
+            bool create_subgraph = 1.0f * count_undeleted / graph.size() < 0.5f;
+            if (create_subgraph) {
+                std::cout << "Creating subgraph" << std::endl;
+                subgraph = createSubgraph(graph, undeleted_mask);
+            }
+            std::vector<size_t> valid_indices = get_valid_indices(subgraph);
+            run_solver_f_star_with_labels(subgraph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, spring_constant, other_block_factor, lr, error_cutoff, display);
+            if (create_subgraph) {
+                updateGraphWithSubgraph(graph, undeleted_mask, subgraph);
+            }
         }
+        
         void filter_f_star() {
             // Filters the graph edges based on the f star solution
             filter_graph_f_star(graph, 8 * 360.0f);
@@ -678,6 +699,18 @@ class Solver {
                 gt.push_back(graph[index].fixed);
             }
             return gt;
+        }
+        std::tuple<std::vector<bool>, size_t> get_undeleted_mask() {
+            // get labels
+            std::vector<bool> undeleted_mask(graph.size(), false);
+            size_t undeleted = 0;
+            for (size_t i = 0; i < graph.size(); ++i) {
+                undeleted_mask[i] = !graph[i].deleted;
+                if (!graph[i].deleted) {
+                    undeleted++;
+                }
+            }
+            return std::make_tuple(undeleted_mask, undeleted);
         }
         std::vector<size_t> get_undeleted_indices() {
             // get labels

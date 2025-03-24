@@ -311,3 +311,92 @@ std::pair<std::vector<Node>, float> load_graph_from_binary(const std::string &fi
     // Return the graph and the max certainty value
     return std::make_pair(graph, max_certainty);
 }
+
+std::vector<Node> createSubgraph(const std::vector<Node>& graph, const std::vector<bool>& mask) {
+    // Build a mapping from original node indices to subgraph indices.
+    std::vector<size_t> mapping(graph.size(), -1);
+    int subIndex = 0;
+    for (size_t i = 0; i < graph.size(); ++i) {
+        if (mask[i]) {
+            mapping[i] = subIndex++;
+        }
+    }
+
+    std::vector<Node> subgraph;
+    subgraph.reserve(subIndex);
+
+    // Process each node in the original graph.
+    for (size_t i = 0; i < graph.size(); ++i) {
+        if (mask[i]) {
+            const Node& origNode = graph[i];
+            
+            // Create a new node. Here we start with a shallow copy of scalar values.
+            Node newNode = origNode;
+            
+            // --- Deep-copy the sides arrays ---
+            // Allocate new arrays for sides and sides_old.
+            newNode.sides = new float[Node::sides_nr];
+            newNode.sides_old = new float[Node::sides_nr];
+            for (int j = 0; j < Node::sides_nr; ++j) {
+                newNode.sides[j] = origNode.sides[j];
+                newNode.sides_old[j] = origNode.sides_old[j];
+            }
+
+            // --- Filter and adjust the edges ---
+            // Only keep edges whose target node is also selected.
+            std::vector<Edge> filteredEdges;
+            for (int e = 0; e < origNode.num_edges; ++e) {
+                const Edge& edge = origNode.edges[e];
+                if (mask[edge.target_node]) {
+                    Edge newEdge = edge;
+                    // Adjust the target node index to the subgraph's index.
+                    newEdge.target_node = mapping[edge.target_node];
+                    filteredEdges.push_back(newEdge);
+                }
+            }
+            // Replace the edge list with the filtered, adjusted edges.
+            // First free the old dynamic array if necessary.
+            newNode.num_edges = filteredEdges.size();
+            newNode.edges = new Edge[newNode.num_edges];
+            for (int e = 0; e < newNode.num_edges; ++e) {
+                newNode.edges[e] = filteredEdges[e];
+            }
+            // (Optionally, you might also update num_same_block_edges based on newNode.edges.)
+
+            // Add the new node to the subgraph.
+            subgraph.push_back(newNode);
+        }
+    }
+
+    return subgraph;
+}
+
+
+void updateGraphWithSubgraph(std::vector<Node>& graph, const std::vector<bool>& mask, 
+                               const std::vector<Node>& subgraph) {
+    // We assume that the subgraph nodes are in the same order as the original nodes that were selected.
+    int subIndex = 0;
+    for (size_t i = 0; i < graph.size(); ++i) {
+        if (mask[i]) {
+            // Update the original node's computed values from the subgraph.
+            graph[i].f_tilde = subgraph[subIndex].f_tilde;
+            graph[i].f_star  = subgraph[subIndex].f_star;
+            
+            // Update winding number values.
+            graph[i].winding_nr       = subgraph[subIndex].winding_nr;
+            graph[i].winding_nr_old   = subgraph[subIndex].winding_nr_old;
+            graph[i].wnr_side         = subgraph[subIndex].wnr_side;
+            graph[i].wnr_side_old     = subgraph[subIndex].wnr_side_old;
+            graph[i].total_wnr_side   = subgraph[subIndex].total_wnr_side;
+            
+            // Update side values.
+            graph[i].side         = subgraph[subIndex].side;
+            graph[i].side_number  = subgraph[subIndex].side_number;
+            for (int j = 0; j < Node::sides_nr; ++j) {
+                graph[i].sides[j] = subgraph[subIndex].sides[j];
+                graph[i].sides_old[j] = subgraph[subIndex].sides_old[j];
+            }
+            ++subIndex;
+        }
+    }
+}

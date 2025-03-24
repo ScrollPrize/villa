@@ -197,7 +197,8 @@ class STPLS3DPreprocessing(BasePreprocessing):
                     filebase["filepath_crop"].append(str(processed_filepath))
                 else:
                     print("block was smaller than 1000 points")
-                    assert False, f"block was smaller than 1000 points: {len(block)}, file: {filepath}"
+                    continue
+                    # assert False, f"block was smaller than 1000 points: {len(block)}, file: {filepath}"
 
         filebase["color_mean"] = [
             float((points[:, 3] / 255).mean()),

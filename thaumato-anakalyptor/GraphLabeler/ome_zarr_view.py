@@ -285,7 +285,7 @@ class PersistentScrollGraphWorker(QObject):
                 (overlay_points, overlay_windings, overlay_windings_computed, winding, winding_computed)
             )
         except Exception as e:
-            print("Error in PersistentScrollGraphWorker:", e)
+            print("Error in PersistentScrollGraphWorker compute overlay:", e)
             self.overlay_points_computed.emit(
                 (np.empty((0, 3)), np.empty((0, 1)), np.empty((0, 1)), np.empty((0, 1)), np.empty((0, 1)))
             )
@@ -463,6 +463,7 @@ class OmeZarrViewWindow(QMainWindow):
 
     def on_overlay_points_updated(self, labels, computed_labels):
         try:
+            # print(f"Shapes of labels and computed labels: {labels.shape}, {computed_labels.shape}, undeleted: {self.undeleted_nodes_indices.shape}")
             self.overlay_request.emit(int(self.current_z_index), self.h5_path, labels, computed_labels,
                                       self.f_init, self.undeleted_nodes_indices, 50)
         except Exception as e:
