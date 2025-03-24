@@ -727,7 +727,7 @@ class InstanceSegmentation(pl.LightningModule):
             )
 
         labels_per_query = labels[topk_indices]
-        topk_indices = topk_indices // num_classes
+        topk_indices = torch.div(topk_indices, num_classes, rounding_mode='floor')
         mask_pred = mask_pred[:, topk_indices]
 
         result_pred_mask = (mask_pred > 0).float()
