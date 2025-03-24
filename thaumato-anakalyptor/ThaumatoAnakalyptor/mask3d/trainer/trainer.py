@@ -1600,8 +1600,8 @@ class InstanceSegmentation(pl.LightningModule):
         self.bbox_gt = dict()
 
     def test_epoch_end(self, outputs):
-        if self.config.general.export:
-            return
+        # if self.config.general.export:
+        #     return
 
         self.eval_instance_epoch_end()
 
