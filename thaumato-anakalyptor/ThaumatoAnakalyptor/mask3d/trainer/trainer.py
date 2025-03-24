@@ -1093,7 +1093,7 @@ class InstanceSegmentation(pl.LightningModule):
                     )
 
             if self.config.general.export:
-                if self.validation_dataset.dataset_name == "stpls3d" or self.validation_dataset.dataset_name == "thaumatoanakalyptor":
+                if False and self.validation_dataset.dataset_name == "stpls3d": # deactivated, thaumato-frankenstein uses the other branch
                     try:
                         print(f"Exporting {file_names[bid]}")
                         scan_id, _, sample, crop_id = file_names[bid].split("_")
