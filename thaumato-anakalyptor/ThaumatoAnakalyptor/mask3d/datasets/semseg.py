@@ -331,7 +331,7 @@ class SemanticSegmentationDataset(Dataset):
                                     }
                                 )
                             else:
-                                assert False
+                                assert False, f"block_id: {block_id}, cond_inner: {cond_inner.sum()}"
 
             if self.on_crops:
                 self._data = new_data
