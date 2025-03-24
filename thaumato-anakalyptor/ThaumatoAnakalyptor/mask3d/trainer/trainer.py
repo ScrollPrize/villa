@@ -1093,7 +1093,7 @@ class InstanceSegmentation(pl.LightningModule):
                     )
 
             if self.config.general.export:
-                if self.validation_dataset.dataset_name == "stpls3d":
+                if self.validation_dataset.dataset_name == "stpls3d" or self.validation_dataset.dataset_name == "thaumatoanakalyptor":
                     try:
                         scan_id, _, sample, crop_id = file_names[bid].split("_")
                         crop_id = int(crop_id.replace(".txt", ""))
