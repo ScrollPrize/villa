@@ -11,8 +11,8 @@ python main_instance_segmentation.py \
 general.experiment_name="validation" \
 general.project_name="stpls3d" \
 data/datasets=stpls3d \
-general.num_targets=3 \
-data.num_labels=3 \
+general.num_targets=2 \
+data.num_labels=2 \
 data.voxel_size=0.333 \
 data.num_workers=10 \
 data.cache_data=true \
@@ -29,8 +29,8 @@ python main_instance_segmentation.py \
 general.experiment_name="validation_query_${CURR_QUERY}_topk_${CURR_TOPK}_dbscan_${CURR_DBSCAN}_size_${CURR_SIZE}" \
 general.project_name="stpls3d_eval" \
 data/datasets=stpls3d \
-general.num_targets=3 \
-data.num_labels=3 \
+general.num_targets=2 \
+data.num_labels=2 \
 data.voxel_size=0.333 \
 data.num_workers=10 \
 data.cache_data=true \
