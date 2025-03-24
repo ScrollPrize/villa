@@ -29,4 +29,5 @@ general.topk_per_image=${CURR_TOPK} \
 general.use_dbscan=true \
 general.dbscan_eps=${CURR_DBSCAN} \
 data.test_mode=test \
-general.export=false
+general.export=true \
+general.gpus=1
