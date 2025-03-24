@@ -1624,6 +1624,8 @@ class InstanceSegmentation(pl.LightningModule):
         if "val_loss" not in dd:
             dd["val_loss"] = dd["val_mean_loss_ce"] + dd["val_mean_loss_mask"] + dd["val_mean_loss_dice"]
 
+        print(dd)
+
         self.log_dict(dd)
 
     def configure_optimizers(self):
