@@ -1426,7 +1426,12 @@ public:
                     continue;
                 }
                 
-                bin_candidates[bin_index].push_back({metric, i});
+                for (int z_index = 0; z_index < zPositions.size(); ++z_index) {
+                    float zDiff = std::fabs(point_z - zPositions[z_index]);
+                    if (zDiff < max_distance) {
+                        bin_candidates[z_index].push_back({metric, i});
+                    }
+                }
             }
 
             // For each z bin, process candidates:
