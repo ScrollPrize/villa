@@ -1378,9 +1378,9 @@ public:
                 ++currentEnd;
             }
             // Now, candidate indices lie in [currentStart, currentEnd).
-                        
+
             // Fix window to 100 * size of zPositions
-            int windowPoints = 100 * zPositions.size();
+            int windowPoints = 500 * zPositions.size();
             float ratio = static_cast<float>(windowPoints) / static_cast<float>(currentEnd - currentStart);
             size_t windowStart = std::max(static_cast<size_t>(middle - static_cast<int>((middle - currentStart)) * ratio), currentStart);
             size_t windowEnd = std::min(static_cast<size_t>(middle + static_cast<int>((currentEnd - middle)) * ratio), currentEnd);
