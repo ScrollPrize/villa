@@ -1378,23 +1378,12 @@ public:
             // Create candidate bins (one vector per z bin).
             // Each candidate is a pair: (angular metric, index into sorted_points).
             std::vector<std::vector<std::pair<float, size_t>>> bin_candidates(zPositions.size());
+            std::vector<std::vector<float>> bin_umbilicus_points(zPositions.size());
+            for (size_t i = 0; i < zPositions.size(); ++i) {
+                bin_umbilicus_points[i] = umbilicus_xz_at_y(umbilicus_points, zPositions[i]);
+            }
 
             for (size_t i = currentStart; i < currentEnd; ++i) {
-                float pointAngle = sorted_points[i][3];
-                // Compute angular difference (accounting for wrap-around if needed).
-                float diff = std::fabs(pointAngle - targetAngle);
-                if (diff > 180.0f) {
-                    diff = 360.0f - diff;
-                    std::cout << "Something is wrong with the sorted points winding angle!!!!" << std::endl;
-                }
-                // Calculate distance from target angle. sind dif * radius point
-                std::vector<float> umb = umbilicus_xz_at_y(umbilicus_points, sorted_points[i][1]);
-                float dx = sorted_points[i][0] - umb[0];
-                float dz = sorted_points[i][2] - umb[2];
-                float r = std::sqrt(dx * dx + dz * dz);
-                float h = r * std::sin(diff * M_PI / 180.0f);
-                float metric = std::abs(h); // Use absolute distance to the target angle as the metric.
-                
                 // Get the point's vertical coordinate (assumed at index 1).
                 float point_z = sorted_points[i][1];
                 if (point_z < zPositions.front() || point_z > zPositions.back())
@@ -1404,6 +1393,21 @@ public:
                 int bin_index = static_cast<int>(std::round((point_z - zPositions.front()) / static_cast<float>(z_spacing)));
                 if (bin_index < 0 || bin_index >= static_cast<int>(zPositions.size()))
                     continue;
+                
+                float pointAngle = sorted_points[i][3];
+                // Compute angular difference (accounting for wrap-around if needed).
+                float diff = std::fabs(pointAngle - targetAngle);
+                if (diff > 180.0f) {
+                    diff = 360.0f - diff;
+                    std::cout << "Something is wrong with the sorted points winding angle!!!!" << std::endl;
+                }
+                // Calculate distance from target angle. sind dif * radius point
+                std::vector<float> umb_approximation = bin_umbilicus_points[bin_index];
+                float dx = sorted_points[i][0] - umb_approximation[0];
+                float dz = sorted_points[i][2] - umb_approximation[2];
+                float r = std::sqrt(dx * dx + dz * dz);
+                float h = r * std::sin(diff * M_PI / 180.0f);
+                float metric = std::abs(h); // Use absolute distance to the target angle as the metric.
                 
                 // Accept candidate only if its z difference from the bin center is within max_distance.
                 float zDiff = std::fabs(point_z - zPositions[bin_index]);
