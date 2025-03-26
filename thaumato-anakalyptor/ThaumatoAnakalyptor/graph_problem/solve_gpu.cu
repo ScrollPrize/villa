@@ -1004,7 +1004,6 @@ __global__ void update_nodes_kernel_f_star(Node* d_graph, size_t* d_valid_indice
 
         // Calculate node happiness: mean difference between k and target f_tilde - node f_tilde target + target node happiness weighted multiplied by the certainty
         num_active_edges++;
-
     }
 
     if (sum_w > 0)
@@ -1014,6 +1013,7 @@ __global__ void update_nodes_kernel_f_star(Node* d_graph, size_t* d_valid_indice
         float step = sum_w_f_tilde_k / sum_w;
         step *= 0.0025f;
         node.f_star_momentum = momentum_coef * node.f_star_momentum + step;
+        node.f_star_momentum = fminf(1.0f, node.f_star_momentum);
         node.f_star += node.f_star_momentum;
         // node.f_star = (sum_w_f_tilde_k + o * node_f_tilde) / (sum_w + o);
     }

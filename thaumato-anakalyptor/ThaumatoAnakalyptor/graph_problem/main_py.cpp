@@ -857,6 +857,25 @@ class Solver {
             }
             return deleted_mask_previous;
         }
+        std::vector<bool> set_f_star_range(float f_star_min, float f_star_max, bool undelete_inside = false) {
+            std::cout << "Setting f star range: " << f_star_min << " - " << f_star_max << std::endl;
+            std::vector<bool> deleted_mask_previous;
+            // set f star range
+            for (size_t i = 0; i < graph.size(); ++i) {
+                float f_star = graph[i].f_star;
+                bool append = !graph[i].deleted;
+                if (f_star < f_star_min || f_star > f_star_max) {
+                    graph[i].deleted = true;
+                }
+                else if (undelete_inside) {
+                    graph[i].deleted = false;
+                }
+                if (append) {
+                    deleted_mask_previous.push_back(graph[i].deleted);
+                }
+            }
+            return deleted_mask_previous;
+        }
         std::vector<std::vector<float>> get_positions() {
             // get positions
             std::vector<std::vector<float>> positions;
@@ -867,6 +886,14 @@ class Solver {
                 positions.push_back(position);
             }
             return positions;
+        }
+        void set_positions(std::vector<float> f_stars) {
+            std::vector<size_t> valid_indices = get_valid_indices(graph);
+            for (size_t i = 0; i < valid_indices.size(); ++i) {
+                size_t index = valid_indices[i];
+                graph[index].f_star = f_stars[i];
+                graph[index].f_tilde = f_stars[i];
+            }
         }
         void largest_connected_component() {
             find_largest_connected_component(graph);
@@ -1081,7 +1108,15 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("z_min"),
             py::arg("z_max"),
             py::arg("undelete_inside") = false)
+        .def("set_f_star_range", &Solver::set_f_star_range,
+            "Method to set the f star range of the graph",
+            py::arg("f_star_min"),
+            py::arg("f_star_max"),
+            py::arg("undelete_inside") = false)
         .def("get_positions", &Solver::get_positions)
+        .def("set_positions", &Solver::set_positions,
+            "Method to set the f star values of the graph",
+            py::arg("f_stars"))
         .def("load_graph", &Solver::load_graph,
             "Method to load the graph from a binary file",
             py::arg("graph_path"))

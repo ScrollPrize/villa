@@ -168,12 +168,17 @@ class PointCloudLabeler(QMainWindow):
 
         # Create slider/spinbox controls for f* min and max; using the f* data range as both min and max of the slider.
         self.fstar_min_widget, self.fstar_min_slider, self.fstar_min_spinbox = create_sync_slider_spinbox(
-            "f* Min:", self.f_star_min, self.f_star_max, self.f_star_min, self.scaleFactor, self.update_fstar_indicators, decimals=1)
+            "F* Min:", self.f_star_min, self.f_star_max, self.f_star_min, self.scaleFactor, self.update_fstar_indicators, decimals=1)
         self.fstar_max_widget, self.fstar_max_slider, self.fstar_max_spinbox = create_sync_slider_spinbox(
-            "f* Max:", self.f_star_min, self.f_star_max, self.f_star_max, self.scaleFactor, self.update_fstar_indicators, decimals=1)
+            "F* Max:", self.f_star_min, self.f_star_max, self.f_star_max, self.scaleFactor, self.update_fstar_indicators, decimals=1)
 
         left_column.addWidget(self.fstar_min_widget)
         left_column.addWidget(self.fstar_max_widget)
+        # Use f* range checkbox
+        self.use_fstar_range_checkbox = QCheckBox("Use F* range")
+        self.use_fstar_range_checkbox.setChecked(False)
+        left_column.addWidget(self.use_fstar_range_checkbox)
+        self.use_fstar_range_checkbox.toggled.connect(self.update_fstar_indicators)
         # Vertical shear (rotating around the f_star axis)
         xy_vertical_shear_layout = QHBoxLayout()
         self.xy_vertical_shear_widget, self.xy_vertical_shear_slider, self.xy_vertical_shear_spinbox = create_sync_slider_spinbox(
@@ -448,6 +453,7 @@ class PointCloudLabeler(QMainWindow):
         # Update the positions of the f* indicator lines
         self.line_fstar_min.setPos(self.fstar_min_spinbox.value())
         self.line_fstar_max.setPos(self.fstar_max_spinbox.value())
+        self.update_views()
 
     def f_init_center_changed(self):
         if hasattr(self, 'ome_zarr_window') and self.ome_zarr_window is not None:
@@ -803,7 +809,7 @@ class PointCloudLabeler(QMainWindow):
                     self.xy_plot.removeItem(item)
 
         # For the min max XY fff* guides:
-        if self.show_guides_checkbox.isChecked():
+        if self.use_fstar_range_checkbox.isChecked():
             if self.line_fstar_min.scene() is None:
                 self.xy_plot.addItem(self.line_fstar_min)
             if self.line_fstar_max.scene() is None:
@@ -1778,7 +1784,11 @@ class PointCloudLabeler(QMainWindow):
 
     def reset_points(self):
         self.points = self.original_points.copy()
+        self.solver.set_positions(list(20*self.points[:,0]))
         self.recompute = True
+        self.kdtree_xy = cKDTree(self.points[:, [0, 1]])
+        self.kdtree_xz = cKDTree(self.points[:, [0, 2]])
+        self.update_slider_ranges()
         self.update_views()
 
     def run_slab_computation(self):
@@ -1910,9 +1920,9 @@ class PointCloudLabeler(QMainWindow):
                 self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1,
                                                  other_block_factor=15.0, side_fix_nr=-1, display=False)
             elif "F*" in selected_solver:
+                undeleted = self.solver.get_undeleted_indices()
                 if self.use_z_range_checkbox.isChecked():
                     print("Using z-range")
-                    undeleted = self.solver.get_undeleted_indices()
                     z_center = self.z_center_spinbox.value()
                     z_thickness = self.z_thickness_slider.value() / self.scaleFactor
                     z_min_val = 4 * (z_center - z_thickness / 2) - 500.0
@@ -1921,6 +1931,10 @@ class PointCloudLabeler(QMainWindow):
                     self.seed_node = None
                 else:
                     deleted_mask_previous = np.zeros_like(self.labels, dtype=bool)
+                if self.use_fstar_range_checkbox.isChecked():
+                    print("Using f*-range")
+                    self.solver.set_f_star_range(f_star_min=float(20*self.fstar_min_spinbox.value()), f_star_max=float(20*self.fstar_max_spinbox.value()))
+                    self.seed_node = None
                 if self.seed_node is None:
                     assert len(deleted_mask_previous) == len(self.labels), "Deleted mask shape mismatch"
                     # try to set a seed node. first labeled point found.
@@ -1951,7 +1965,7 @@ class PointCloudLabeler(QMainWindow):
                     self.solver.solve_f_star(num_iterations=int(2 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=36000000.0, i_round=6, visualize=True)
                     self.solver.solve_f_star(num_iterations=int(2 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=360.0, i_round=6, visualize=True)
 
-                if self.use_z_range_checkbox.isChecked():
+                if self.use_z_range_checkbox.isChecked() or self.use_fstar_range_checkbox.isChecked():
                     print("Resetting z-range")
                     self.solver.set_undeleted_indices(undeleted)
                     self.seed_node = None

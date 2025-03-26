@@ -1383,9 +1383,17 @@ public:
                 float pointAngle = sorted_points[i][3];
                 // Compute angular difference (accounting for wrap-around if needed).
                 float diff = std::fabs(pointAngle - targetAngle);
-                if (diff > 180.0f)
+                if (diff > 180.0f) {
                     diff = 360.0f - diff;
-                float metric = diff; // Use angular difference as the metric.
+                    std::cout::cout << "Something is wrong with the sorted points winding angle!!!!" << std::endl;
+                }
+                // Calculate distance from target angle. sind dif * radius point
+                std::vector<float> umb = umbilicus_xz_at_y(umbilicus_points, sorted_points[i][1]);
+                float dx = sorted_points[i][0] - umb[0];
+                float dz = sorted_points[i][2] - umb[2];
+                float r = std::sqrt(dx * dx + dz * dz);
+                float h = r * std::sin(diff * M_PI / 180.0f);
+                float metric = std::abs(h); // Use absolute distance to the target angle as the metric.
                 
                 // Get the point's vertical coordinate (assumed at index 1).
                 float point_z = sorted_points[i][1];
@@ -1425,44 +1433,48 @@ public:
                         [](const std::pair<float, size_t>& a, const std::pair<float, size_t>& b) {
                             return a.first < b.first;
                         });
-                // Keep up to 50 closest candidates.
-                if (candidates.size() > 50)
-                    candidates.resize(50);
+                // Keep up to 10 closest candidates.
+                if (candidates.size() > 10)
+                    candidates.resize(10);
 
-                // Compute centroid (average x and z) of these candidates.
-                float sumX = 0.0f, sumZ = 0.0f;
-                for (const auto& cand : candidates) {
-                    size_t idx = cand.second;
-                    sumX += sorted_points[idx][0];
-                    sumZ += sorted_points[idx][2];  // Assume index 2 holds the z-coordinate for radius.
-                }
-                int count = candidates.size();
-                float centroidX = sumX / count;
-                float centroidZ = sumZ / count;
-                // Update centroid's z to the bin's center.
-                float updatedCentroidZ = zPositions[bin];
+                // // Keep up to 50 closest candidates.
+                // if (candidates.size() > 50)
+                //     candidates.resize(50);
 
-                // Compute distances from each candidate to the centroid.
-                std::vector<std::pair<float, size_t>> dist_candidates;
-                for (const auto& cand : candidates) {
-                    size_t idx = cand.second;
-                    float dx = sorted_points[idx][0] - centroidX;
-                    float dz = sorted_points[idx][2] - updatedCentroidZ;
-                    float distance = std::sqrt(dx * dx + dz * dz);
-                    dist_candidates.push_back({distance, idx});
-                }
-                // Sort candidates by distance to the centroid.
-                std::sort(dist_candidates.begin(), dist_candidates.end(),
-                        [](const std::pair<float, size_t>& a, const std::pair<float, size_t>& b) {
-                            return a.first < b.first;
-                        });
-                // Retain the closest 10 candidates.
-                if (dist_candidates.size() > 10)
-                    dist_candidates.resize(10);
+                // // Compute centroid (average x and z) of these candidates.
+                // float sumX = 0.0f, sumZ = 0.0f;
+                // for (const auto& cand : candidates) {
+                //     size_t idx = cand.second;
+                //     sumX += sorted_points[idx][0];
+                //     sumZ += sorted_points[idx][2];  // Assume index 2 holds the z-coordinate for radius.
+                // }
+                // int count = candidates.size();
+                // float centroidX = sumX / count;
+                // float centroidZ = sumZ / count;
+                // // Update centroid's z to the bin's center.
+                // float updatedCentroidZ = zPositions[bin];
+
+                // // Compute distances from each candidate to the centroid.
+                // std::vector<std::pair<float, size_t>> dist_candidates;
+                // for (const auto& cand : candidates) {
+                //     size_t idx = cand.second;
+                //     float dx = sorted_points[idx][0] - centroidX;
+                //     float dz = sorted_points[idx][2] - updatedCentroidZ;
+                //     float distance = std::sqrt(dx * dx + dz * dz);
+                //     dist_candidates.push_back({distance, idx});
+                // }
+                // // Sort candidates by distance to the centroid.
+                // std::sort(dist_candidates.begin(), dist_candidates.end(),
+                //         [](const std::pair<float, size_t>& a, const std::pair<float, size_t>& b) {
+                //             return a.first < b.first;
+                //         });
+                // // Retain the closest 10 candidates.
+                // if (dist_candidates.size() > 10)
+                //     dist_candidates.resize(10);
 
                 // For each selected candidate, compute the "ts" value (radius)
                 // using the corresponding umbilicus point and store the normal.
-                for (const auto& dc : dist_candidates) {
+                for (const auto& dc : candidates) {
                     size_t idx = dc.second;
                     std::vector<float> umb = umbilicus_xz_at_y(umbilicus_points, sorted_points[idx][1]);
                     float dx = sorted_points[idx][0] - umb[0];
