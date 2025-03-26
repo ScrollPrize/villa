@@ -1385,7 +1385,7 @@ public:
                 float diff = std::fabs(pointAngle - targetAngle);
                 if (diff > 180.0f) {
                     diff = 360.0f - diff;
-                    std::cout::cout << "Something is wrong with the sorted points winding angle!!!!" << std::endl;
+                    std::cout << "Something is wrong with the sorted points winding angle!!!!" << std::endl;
                 }
                 // Calculate distance from target angle. sind dif * radius point
                 std::vector<float> umb = umbilicus_xz_at_y(umbilicus_points, sorted_points[i][1]);
