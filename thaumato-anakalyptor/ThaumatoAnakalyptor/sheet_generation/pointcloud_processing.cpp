@@ -1383,8 +1383,8 @@ public:
             // Fix window to 100 * size of zPositions
             int windowPoints = 100 * zPositions.size();
             float ratio = static_cast<float>(windowPoints) / static_cast<float>(currentEnd - currentStart);
-            size_t windowStart = static_cast<size_t>(middle - static_cast<int>((middle - currentStart)) * ratio);
-            size_t windowEnd = static_cast<size_t>(middle + static_cast<int>((currentEnd - middle)) * ratio);
+            size_t windowStart = std::max(static_cast<size_t>(middle - static_cast<int>((middle - currentStart)) * ratio), currentStart);
+            size_t windowEnd = std::min(static_cast<size_t>(middle + static_cast<int>((currentEnd - middle)) * ratio), currentEnd);
             std::cout << "Window is " << windowStart << " to " << windowEnd << std::endl;
 
             // Create candidate bins (one vector per z bin).
