@@ -1378,7 +1378,7 @@ public:
                 ++currentEnd;
             }
             // Now, candidate indices lie in [currentStart, currentEnd).
-            std::cout << "Window is " << windowLow << " to " << windowHigh << " with target angle " << targetAngle << " and middle " << middle << std::endl;
+            std::cout << "Window is " << currentStart << " to " << currentEnd << " with target angle " << targetAngle << " and middle " << middle << std::endl;
             
             // Fix window to 100 * size of zPositions
             int windowPoints = 100 * zPositions.size();
