@@ -1353,7 +1353,7 @@ public:
         >> results(numSteps);
 
         size_t nPoints = sorted_points.size();
-        size_t currentStart = 0, currentEnd = 0;
+        size_t currentStart = 0, currentEnd = 0, middle = 0;
 
         // Step 3: Loop over angle steps from minWind to maxAngle.
         for (int step = 0; step < numSteps; ++step) {
@@ -1367,13 +1367,25 @@ public:
             while (currentStart < nPoints && sorted_points[currentStart][3] < windowLow) {
                 ++currentStart;
             }
+            middle = std::max(currentStart, middle);
+            while (middle < nPoints && sorted_points[middle][3] < targetAngle) {
+                ++middle;
+            }
             // Ensure currentEnd is not behind currentStart.
-            currentEnd = std::max(currentStart, currentEnd);
+            currentEnd = std::max(middle, currentEnd);
             // Advance currentEnd until point angle > windowHigh.
             while (currentEnd < nPoints && sorted_points[currentEnd][3] <= windowHigh) {
                 ++currentEnd;
             }
             // Now, candidate indices lie in [currentStart, currentEnd).
+            std::cout << "Window is " << windowLow << " to " << windowHigh << " with target angle " << targetAngle << " and middle " << middle << std::endl;
+            
+            // Fix window to 100 * size of zPositions
+            int windowPoints = 100 * zPositions.size();
+            float ratio = static_cast<float>(windowPoints) / static_cast<float>(currentEnd - currentStart);
+            size_t windowStart = middle - static_cast<int>((middle - currentStart) * ratio);
+            size_t windowEnd = middle + static_cast<int>((currentEnd - middle) * ratio);
+            std::cout << "Window is " << windowStart << " to " << windowEnd << std::endl;
 
             // Create candidate bins (one vector per z bin).
             // Each candidate is a pair: (angular metric, index into sorted_points).
@@ -1383,7 +1395,7 @@ public:
                 bin_umbilicus_points[i] = umbilicus_xz_at_y(umbilicus_points, zPositions[i]);
             }
 
-            for (size_t i = currentStart; i < currentEnd; ++i) {
+            for (size_t i = windowStart; i < windowEnd; ++i) {
                 // Get the point's vertical coordinate (assumed at index 1).
                 float point_z = sorted_points[i][1];
                 if (point_z < zPositions.front() || point_z > zPositions.back())
