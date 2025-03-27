@@ -493,7 +493,7 @@ class Solver {
             // solve the graph
             graph = run_solver(graph, o, spring_constant, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, seed_node, other_block_factor, down_index, up_index, side_fix_nr, std_target, std_target_step, increase_same_block_weight);
         }
-        void solve_f_star(int num_iterations, float spring_constant, int i_round = 1, float o_ = 0.0f, float step_sigma=360.0f, bool visualize = false) {
+        void solve_f_star(int num_iterations, float spring_constant, int i_round = 1, float o_ = 0.0f, float step_sigma=360.0f, int teflon_winding_nr=9999, bool visualize = false) {
             // use the f_star solver for the intermediate solution
             // store only the valid indices to speed up the loop
             auto [undeleted_mask, count_undeleted] = get_undeleted_mask();
@@ -504,7 +504,7 @@ class Solver {
                 subgraph = createSubgraph(graph, undeleted_mask);
             }
             std::vector<size_t> valid_indices = get_valid_indices(subgraph);
-            run_solver_f_star(subgraph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, o_, spring_constant, step_sigma, visualize);
+            run_solver_f_star(subgraph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, o_, spring_constant, step_sigma, teflon_winding_nr, visualize);
             if (create_subgraph) {
                 updateGraphWithSubgraph(graph, undeleted_mask, subgraph);
             }
@@ -711,6 +711,27 @@ class Solver {
                 }
             }
             return std::make_tuple(undeleted_mask, undeleted);
+        }
+        std::vector<bool> get_deleted_mask(std::vector<size_t> valid_indices) {
+            // get labels
+            std::vector<bool> deleted_mask(valid_indices.size());
+            for (size_t i = 0; i < valid_indices.size(); ++i) {
+                size_t index = valid_indices[i];
+                deleted_mask[i] = graph[index].deleted;
+            }
+            return deleted_mask;
+        }
+        void delete_nodes(std::vector<bool> deletes) {
+            // delete nodes
+            std::vector<size_t> valid_indices = get_valid_indices(graph);
+            for (size_t i = 0; i < valid_indices.size(); ++i) {
+                size_t index = valid_indices[i];
+                if (deletes[i]) {
+                    graph[index].deleted = true;
+                }
+            }
+            // get largest connected component
+            largest_connected_component();
         }
         std::vector<size_t> get_undeleted_indices() {
             // get labels
@@ -1020,6 +1041,7 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("i_round") = -1,
             py::arg("o") = 0.0f,
             py::arg("step_sigma") = 360.0f,
+            py::arg("teflon_winding_nr") = 9999,
             py::arg("visualize") = false)
         .def("solve_f_star_with_labels", &Solver::solve_f_star_with_labels,
             "Method to intermediately solve the graph with a mean winding angle approach and labels",
@@ -1075,6 +1097,12 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("gt"))
         .def("get_gt", &Solver::get_gt,
             "Method to get the ground truth of the graph")
+        .def("get_deleted_mask", &Solver::get_deleted_mask,
+            "Method to get the deleted mask of the graph",
+            py::arg("valid_indices"))
+        .def("delete_nodes", &Solver::delete_nodes,
+            "Method to delete nodes of the graph",
+            py::arg("deletes"))
         .def("get_undeleted_indices", &Solver::get_undeleted_indices,
             "Method to get the undeleted node indices of the graph")
         .def("set_undeleted_indices", &Solver::set_undeleted_indices,

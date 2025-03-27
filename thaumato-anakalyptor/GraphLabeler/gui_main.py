@@ -235,7 +235,7 @@ class PointCloudLabeler(QMainWindow):
 
         # --- Solver selection dropdown ---
         self.solver_combo = QComboBox()
-        self.solver_combo.addItems(["F*", "F*2", "F*3", "F*4", "Winding Number", "Union", "Random", "Set Labels"])
+        self.solver_combo.addItems(["F*", "F*2", "F*3", "F*4", "F*5", "Winding Number", "Union", "Random", "Set Labels"])
         top_controls_layout.addWidget(QLabel("Select Solver:"))
         top_controls_layout.addWidget(self.solver_combo)
 
@@ -931,7 +931,7 @@ class PointCloudLabeler(QMainWindow):
         mod = valid_labels % 3
         valid_indices = np.where(mask_valid)[0]
         for i, idx in enumerate(valid_indices):
-            if valid_groups[i] == 0 and valid_labels[i] == self.teflon_label and self.hide_teflon_checkbox.isChecked():
+            if valid_groups[i] == 0 and (abs(valid_labels[i] - self.teflon_label) < 2) and self.hide_teflon_checkbox.isChecked():
                 brushes[idx] = self.transparent_brush
             elif mask_active_group[i]:
                 count_active_group += 1
@@ -1900,10 +1900,14 @@ class PointCloudLabeler(QMainWindow):
     def update_labels(self):
         if self.solver is not None:
             gt = np.abs((self.labels - self.UNLABELED) > 2)
-            gt_0 = np.logical_and(gt, self.group == 0) # only consider group 0 points
+            if self.hide_teflon_checkbox.isChecked():
+                gt_0 = np.logical_and(gt, np.abs(self.labels - self.teflon_label) > 2)
+            else:
+                gt_0 = gt
+            gt_0 = np.logical_and(gt_0, self.group == 0) # only consider group 0 points
 
             self.solver.remove_temporary_edges()
-            self.solver.set_labels(self.labels, gt_0)
+            self.solver.set_labels(list(self.labels), list(gt_0))
             groups = np.unique(self.group)
             group_metadata= []
             for group in groups:
@@ -1911,30 +1915,32 @@ class PointCloudLabeler(QMainWindow):
                     continue
                 gt_g = np.logical_and(gt, self.group == group)
                 print(f"Sum of gt_g: {np.sum(gt_g)} in group {group}")
-                self.solver.fix_good_edges(self.labels, gt_g)
-                source, target, winding_number_difference = build_temporary_group_edges(self.solver, self.labels, gt_g)
+                self.solver.fix_good_edges(list(self.labels), list(gt_g))
+                source, target, winding_number_difference = build_temporary_group_edges(self.solver, list(self.labels), list(gt_g))
                 group_metadata.append((source, target, winding_number_difference))
 
+            undeleted = self.solver.get_undeleted_indices()
+            if self.hide_teflon_checkbox.isChecked():
+                print("Hiding teflon during solver update")
+                self.solver.delete_nodes(list(np.abs(self.labels - self.teflon_label) < 2))
+            if self.use_z_range_checkbox.isChecked():
+                print("Using z-range")
+                z_center = self.z_center_spinbox.value()
+                z_thickness = self.z_thickness_slider.value() / self.scaleFactor
+                z_min_val = 4 * (z_center - z_thickness / 2) - 500.0
+                z_max_val = 4 * (z_center + z_thickness / 2) - 500.0
+                self.solver.set_z_range(z_min_val, z_max_val)
+                self.seed_node = None
+            if self.use_fstar_range_checkbox.isChecked():
+                print("Using f*-range")
+                self.solver.set_f_star_range(f_star_min=float(20*self.fstar_min_spinbox.value()), f_star_max=float(20*self.fstar_max_spinbox.value()))
+                self.seed_node = None
             selected_solver = self.solver_combo.currentText() if hasattr(self, "solver_combo") else "F*"
+            deleted_mask_previous = self.solver.get_deleted_mask(undeleted)
             if selected_solver == "Winding Number":
                 self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1,
                                                  other_block_factor=15.0, side_fix_nr=-1, display=False)
             elif "F*" in selected_solver:
-                undeleted = self.solver.get_undeleted_indices()
-                if self.use_z_range_checkbox.isChecked():
-                    print("Using z-range")
-                    z_center = self.z_center_spinbox.value()
-                    z_thickness = self.z_thickness_slider.value() / self.scaleFactor
-                    z_min_val = 4 * (z_center - z_thickness / 2) - 500.0
-                    z_max_val = 4 * (z_center + z_thickness / 2) - 500.0
-                    deleted_mask_previous = self.solver.set_z_range(z_min_val, z_max_val)
-                    self.seed_node = None
-                else:
-                    deleted_mask_previous = np.zeros_like(self.labels, dtype=bool)
-                if self.use_fstar_range_checkbox.isChecked():
-                    print("Using f*-range")
-                    self.solver.set_f_star_range(f_star_min=float(20*self.fstar_min_spinbox.value()), f_star_max=float(20*self.fstar_max_spinbox.value()))
-                    self.seed_node = None
                 if self.seed_node is None:
                     assert len(deleted_mask_previous) == len(self.labels), "Deleted mask shape mismatch"
                     # try to set a seed node. first labeled point found.
@@ -1943,11 +1949,14 @@ class PointCloudLabeler(QMainWindow):
                             continue
                         if self.group[i] != 0:
                             continue
+                        if abs(self.labels[i] - self.teflon_label) < 2:
+                            continue
                         if abs(label - self.UNLABELED) > 2:
                             if deleted_mask_previous[i]:
                                 continue
                             offset = np.logical_not(deleted_mask_previous[:i]).sum()
                             self.seed_node = offset
+                            print(f"Found seed node at index {i} (offset {offset})")
                             break
                 if self.seed_node is not None:
                     self.solver.set_labeled_edges(self.seed_node)
@@ -1962,8 +1971,10 @@ class PointCloudLabeler(QMainWindow):
                     self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=2.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
                     self.solver.solve_f_star_with_labels(num_iterations=30000, spring_constant=1.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
                 elif selected_solver == "F*4":
-                    self.solver.solve_f_star(num_iterations=int(2 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=36000000.0, i_round=6, visualize=True)
-                    self.solver.solve_f_star(num_iterations=int(2 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=360.0, i_round=6, visualize=True)
+                    self.solver.solve_f_star(num_iterations=int(2 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True)
+                    self.solver.solve_f_star(num_iterations=int(2 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=360.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True)
+                elif selected_solver == "F*5":
+                    self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True)
 
                 if self.use_z_range_checkbox.isChecked() or self.use_fstar_range_checkbox.isChecked():
                     print("Resetting z-range")
@@ -1989,8 +2000,14 @@ class PointCloudLabeler(QMainWindow):
             else:
                 self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1,
                                                  other_block_factor=15.0, side_fix_nr=-1, display=False)
+            
+            self.solver.set_undeleted_indices(undeleted)
+            if self.use_z_range_checkbox.isChecked() or self.use_fstar_range_checkbox.isChecked():
+                print("Resetting z-range")
+                self.seed_node = None
             calculated_labels = self.solver.get_labels()
             self.calculated_labels = np.array(calculated_labels)
+
             self.update_views()
     
     def save_graph(self):

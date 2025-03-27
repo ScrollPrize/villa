@@ -1480,7 +1480,7 @@ __global__ void update_f_tilde_kernel(Node* d_graph, size_t* d_valid_indices, in
 }
 
 // Kernel to update f_star solver fields on the GPU
-__global__ void update_f_star_kernel(Node* d_graph, size_t* d_valid_indices, int num_valid_nodes, float median_f_star) {
+__global__ void update_f_star_kernel(Node* d_graph, size_t* d_valid_indices, int num_valid_nodes, float median_f_star, int teflon_winding_nr) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_valid_nodes) return;
 
@@ -1490,7 +1490,7 @@ __global__ void update_f_star_kernel(Node* d_graph, size_t* d_valid_indices, int
 
     // Update f_tilde with the computed f_star
     if (node.fixed) {
-        if (median_f_star != 0.0f) {
+        if ((median_f_star != 0.0f) && (fabsf(node.winding_nr - teflon_winding_nr) > 1)) {
             node.f_tilde -= median_f_star;
         }
         node.f_star = node.f_tilde;
@@ -4661,7 +4661,7 @@ int fix_winding_nodes(std::vector<Node>& graph, int nr_nodes, int seed_node_old)
     }
 }
 
-std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float o, float spring_constant, float step_sigma, bool visualize) {
+std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float o, float spring_constant, float step_sigma, int teflon_winding_nr, bool visualize) {
     std::vector<Node> graph_copy = graph;
     if (i_round < 0) {
         o = o * 0.25f;
@@ -4706,7 +4706,7 @@ std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations
         cudaDeviceSynchronize(); // Check for errors during kernel execution
 
         // Launch the kernel to update f_tilde with f_star
-        update_f_star_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_graph, d_valid_indices, num_valid_nodes, median_f_star);
+        update_f_star_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_graph, d_valid_indices, num_valid_nodes, median_f_star, teflon_winding_nr);
         median_f_star = 0.0f;
 
         err = cudaGetLastError();
