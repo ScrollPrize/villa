@@ -306,7 +306,7 @@ class WalkToSheet():
             z_max = max(z_max, z)
         return min_winding_angle, max_winding_angle, z_min, z_max
 
-    def build_points(self, z_range=None):
+    def build_points(self, z_range=None, single_threaded_pc_load=False):
         # Building the pointcloud 4D (position) + 3D (Normal) + 3D (Color, randomness) representation of the graph
         points = []
         normals = []
@@ -324,7 +324,7 @@ class WalkToSheet():
             sheet_infos.append(patch_sheet_patch_info)
         time_start = time.time()
         # print(sheet_infos)
-        points, normals, colors = pointcloud_processing.load_pointclouds(sheet_infos, self.path, z_range[0], z_range[1], True)
+        points, normals, colors = pointcloud_processing.load_pointclouds(nodes=sheet_infos, path=self.path, start_z=z_range[0], end_z=z_range[1], single_threaded=single_threaded_pc_load, verbose=True)
         print(f"Time to load pointclouds: {time.time() - time_start}")
         print(f"Shape of patch_points: {np.array(points).shape}")
 
@@ -1632,7 +1632,7 @@ class WalkToSheet():
         # Return the paths to the split meshes
         return split_mesh_paths, stamp
     
-    def load_pointcloud_to_raw_ordered_pointset(self, debug=False, continue_from=0, z_range=None, angle_step=1, z_spacing=10, max_z_step_size=250):
+    def load_pointcloud_to_raw_ordered_pointset(self, debug=False, continue_from=0, z_range=None, angle_step=1, z_spacing=10, max_z_step_size=250, single_threaded_pc_load=False):
         # retrieve min max approximate winding angles
         approx_min_angle, approx_max_angle, approx_min_z, approx_max_z = self.find_minmax_winding_angle_z_range()
         print(f"Approximate min and max winding angles: {approx_min_angle}, {approx_max_angle} with z range: {approx_min_z}, {approx_max_z}")
@@ -1667,7 +1667,7 @@ class WalkToSheet():
                     start_fresh_build_points = continue_from <= 0 or not os.path.exists(path_points)
                     if start_fresh_build_points:
                         # get points
-                        points, normals, colors = self.build_points(z_range=z_range)
+                        points, normals, colors = self.build_points(z_range=z_range, single_threaded_pc_load=single_threaded_pc_load)
 
                         # Make directory if it doesn't exist
                         os.makedirs(self.save_path, exist_ok=True)
@@ -1774,9 +1774,9 @@ class WalkToSheet():
         
         return results
 
-    def unroll(self, fragment=False, debug=False, continue_from=0, z_range=None, angle_step=1, z_spacing=10, learning_rate=0.2, iterations=11, unfix_factor=2.5, downsample=False, max_z_step_size=250, num_threads=None, valid_clip=True):
+    def unroll(self, fragment=False, debug=False, continue_from=0, z_range=None, angle_step=1, z_spacing=10, learning_rate=0.2, iterations=11, unfix_factor=2.5, downsample=False, max_z_step_size=250, num_threads=None, valid_clip=True, single_threaded_pc_load=False):
         # Load the graph
-        result = self.load_pointcloud_to_raw_ordered_pointset(debug=debug, continue_from=continue_from, z_range=z_range, angle_step=angle_step, z_spacing=z_spacing, max_z_step_size=max_z_step_size)
+        result = self.load_pointcloud_to_raw_ordered_pointset(debug=debug, continue_from=continue_from, z_range=z_range, angle_step=angle_step, z_spacing=z_spacing, max_z_step_size=max_z_step_size, single_threaded_pc_load=single_threaded_pc_load)
 
         # get nodes
         ordered_pointsets_s = self.rolled_ordered_pointset(result, angle_step=angle_step, continue_from=continue_from, fragment=fragment, learning_rate=learning_rate, iterations=iterations, unfix_factor=unfix_factor, num_threads=num_threads, valid_clip=valid_clip)
@@ -1837,6 +1837,7 @@ if __name__ == '__main__':
     parser.add_argument('--downsample', action='store_true', help='Downsample the mesh')
     parser.add_argument('--max_z_step_size', type=int, default=250, help='Maximum z step size for the unrolling (RAM is approx size = GB)')
     parser.add_argument('--num_threads', type=int, default=None, help='Number of threads to use for the interpolation')
+    parser.add_argument('--single_threaded_pc_load', type=int, default=None, help='Used to load the pointclouds single threaded for .h5 file format (h5 in standard mode does not support multi-threaded loading)')
     parser.add_argument('--disable_valid_clip', action='store_true', help='Disable the valid winding clip')
 
     args = parser.parse_args()
@@ -1863,7 +1864,7 @@ if __name__ == '__main__':
     
     walk = WalkToSheet(graph, args.path, start_point, scale_factor, split_width=args.split_width)
     # walk.save_graph_pointcloud(reference_path)
-    walk.unroll(fragment=args.fragment, debug=args.debug, continue_from=args.continue_from, z_range=z_range, angle_step=args.angle_step, z_spacing=args.z_spacing, learning_rate=args.learning_rate, iterations=args.iterations, unfix_factor=args.unfix_factor, downsample=args.downsample, max_z_step_size=args.max_z_step_size, num_threads=args.num_threads, valid_clip=not args.disable_valid_clip)
+    walk.unroll(fragment=args.fragment, debug=args.debug, continue_from=args.continue_from, z_range=z_range, angle_step=args.angle_step, z_spacing=args.z_spacing, learning_rate=args.learning_rate, iterations=args.iterations, unfix_factor=args.unfix_factor, downsample=args.downsample, max_z_step_size=args.max_z_step_size, num_threads=args.num_threads, valid_clip=not args.disable_valid_clip, single_threaded_pc_load=args.single_threaded_pc_load)
 
 # Example command: python3 -m ThaumatoAnakalyptor.graph_to_mesh --path /scroll.volpkg/working/scroll3_surface_points/point_cloud_colorized_verso_subvolume_blocks --graph /scroll.volpkg/working/scroll3_surface_points/1352_3600_5002/point_cloud_colorized_verso_subvolume_graph_BP_solved.pkl --start_point 1352 3600 5002 --debug
 # python3 -m ThaumatoAnakalyptor.graph_to_mesh --path /scroll2v2_surface_points/point_cloud_colorized_verso_subvolume_blocks --graph /scroll2v2_surface_points/1352_3600_5002/point_cloud_colorized_verso_subvolume_graph_BP_solved.pkl --start_point 1352 3600 5002
