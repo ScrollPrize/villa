@@ -586,8 +586,8 @@ public:
         }
     }
 
-    size_t find_total_points() {
-        size_t num_threads = std::thread::hardware_concurrency();
+    size_t find_total_points(bool single_threaded = false) {
+        size_t num_threads = single_threaded ? 1 : std::thread::hardware_concurrency();
         std::vector<std::thread> threads;
         size_t total_nodes = node_data_.size();
         size_t chunk_size = std::ceil(static_cast<double>(total_nodes) / num_threads);
@@ -620,8 +620,8 @@ public:
         return total_points;
     }
 
-    void load_total_points() {
-        size_t num_threads = std::thread::hardware_concurrency();
+    void load_total_points(bool single_threaded = false) {
+        size_t num_threads = single_threaded ? 1 : std::thread::hardware_concurrency();
         std::vector<std::thread> threads;
         size_t total_nodes = node_data_.size();
         size_t chunk_size = std::ceil(static_cast<double>(total_nodes) / num_threads);
@@ -639,19 +639,19 @@ public:
         }
     }
 
-    void load_all() {
+    void load_all(bool single_threaded = false) {
         size_t total_nodes = node_data_.size();
         offset_per_node = std::make_unique<size_t[]>(total_nodes);
         if (verbose) {
             std::cout << "Loading all nodes..." << std::endl;
         }
-        size_t total_points = find_total_points();
+        size_t total_points = find_total_points(single_threaded);
         cloud_.pts.reserve(total_points);
         if (verbose) {
             std::cout << "Total points: " << total_points << std::endl;
         }
 
-        load_total_points();
+        load_total_points(single_threaded);
         if (verbose) {
             std::cout << std::endl << "All nodes have been processed." << std::endl;
         }
@@ -977,9 +977,9 @@ py::array_t<bool> vector_to_array(std::vector<bool> selected_originals) {
     return points_mask;
 }
 
-std::tuple<py::array_t<float>, py::array_t<float>, py::array_t<float>> load_pointclouds(const std::vector<std::tuple<std::vector<int>, int, double>>& nodes, const std::string& path, const int start_z, const int end_z, bool verbose = true) {
+std::tuple<py::array_t<float>, py::array_t<float>, py::array_t<float>> load_pointclouds(const std::vector<std::tuple<std::vector<int>, int, double>>& nodes, const std::string& path, const int start_z, const int end_z, bool single_threaded = false, bool verbose = true) {
     PointCloudLoader processor(nodes, path, start_z, end_z, verbose);
-    processor.load_all();
+    processor.load_all(single_threaded);
     processor.sortPointsXYZW();
     if (verbose) {
         std::cout << "Sorted points by XYZW" << std::endl;
@@ -2479,8 +2479,15 @@ std::vector<std::vector<float>> optimize_ordered_pointset(
 PYBIND11_MODULE(pointcloud_processing, m) {
     m.doc() = "pybind11 module for parallel point cloud processing";
 
-    m.def("load_pointclouds", &load_pointclouds, "Function to load point clouds and return points, normals, and colors.");
-
+    m.def("load_pointclouds", &load_pointclouds, 
+        "Function to load point clouds and return points, normals, and colors.",
+        py::arg("nodes"),
+        py::arg("path"),
+        py::arg("start_z"),
+        py::arg("end_z"),
+        py::arg("single_threaded") = false,
+        py::arg("verbose") = true);
+    
     m.def("upsample_pointclouds", &upsample_pointclouds, "Function to load point clouds and return points, normals, and colors.");
 
     m.def("create_ordered_pointset", &create_ordered_pointset, 
