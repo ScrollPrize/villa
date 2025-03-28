@@ -1,0 +1,6 @@
+pyqtgraph
+scipy
+numpy
+h5py
+zarr
+tqdm
