@@ -149,6 +149,8 @@ RUN ls -la
 RUN cmake .. \
 && cmake --build .
 
+ENV PATH=/usr/bin:$PATH
+
 # Build the graph_problem
 WORKDIR /workspace/ThaumatoAnakalyptor/graph_problem/
 
@@ -170,6 +172,7 @@ WORKDIR /
 # Add user for GUI
 # RUN adduser --quiet --disabled-password qtuser && usermod -a -G audio qtuser
 RUN usermod -a -G audio root
+
 
 # Set working directory
 WORKDIR /workspace/
