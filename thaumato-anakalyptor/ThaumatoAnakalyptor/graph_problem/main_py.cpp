@@ -513,7 +513,7 @@ class Solver {
             // use the f_star solver for the intermediate solution
             // store only the valid indices to speed up the loop
             auto [undeleted_mask, count_undeleted] = get_undeleted_mask();
-            std::vector<Node>& subgraph = graph;
+            std::vector<Node> subgraph = graph;
             bool create_subgraph = 1.0f * count_undeleted / graph.size() < 0.5f;
             if (create_subgraph) {
                 std::cout << "Creating subgraph" << std::endl;
@@ -712,7 +712,7 @@ class Solver {
             }
             return std::make_tuple(undeleted_mask, undeleted);
         }
-        std::vector<bool> get_deleted_mask(std::vector<size_t> valid_indices) {
+        std::vector<bool> get_deleted_mask(const std::vector<size_t>& valid_indices) {
             // get labels
             std::vector<bool> deleted_mask(valid_indices.size());
             for (size_t i = 0; i < valid_indices.size(); ++i) {
