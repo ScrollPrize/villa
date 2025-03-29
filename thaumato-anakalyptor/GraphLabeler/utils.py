@@ -1,4 +1,5 @@
 import numpy as np
+import open3d as o3d
 
 def vectorized_point_to_polyline_distance(point, polyline):
     """
@@ -52,3 +53,48 @@ def build_temporary_group_edges(solver, labels, group_mask):
     solver.add_temporary_fixed_edges(source=source, target=target, winding_number_difference=winding_number_difference)
 
     return source, target, winding_number_difference
+
+def filter_point_normals(points: np.ndarray, filter_normal: np.ndarray, angle_threshold: float,
+                         radius: float = 10.0, max_nn: int = 30):
+    """
+    Given an array of 3D points, estimate normals using Open3D, and filter out points
+    whose normals deviate from a given filter_normal by more than angle_threshold (in degrees).
+
+    Parameters:
+    - points (np.ndarray): Input array of shape (N, 3) representing 3D points.
+    - filter_normal (np.ndarray): A 3-element array representing the target normal. Should be non-zero.
+    - angle_threshold (float): The maximum allowed angular difference in degrees.
+    - radius (float): Radius for neighborhood search when estimating normals (default: 0.1).
+    - max_nn (int): Maximum number of nearest neighbors to consider (default: 30).
+
+    Returns:
+    - filtered_points (np.ndarray): Subset of input points that pass the normal filter.
+    - filtered_normals (np.ndarray): Corresponding normals of the filtered points.
+    """
+    # Create a point cloud from the input points.
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    
+    # Estimate normals using a KDTree search with the specified parameters.
+    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=max_nn))
+    
+    # Convert the estimated normals to a NumPy array.
+    normals = np.asarray(pcd.normals)
+    
+    # Normalize the filter_normal to ensure accurate angle calculations.
+    filter_normal = filter_normal / np.linalg.norm(filter_normal)
+    
+    # Compute the dot product between each normal and the filter_normal,
+    # taking the absolute value so that flipped normals are considered equivalent.
+    dots = np.clip(np.abs(np.dot(normals, filter_normal)), 0.0, 1.0)
+    angles = np.arccos(dots)  # Angles in radians
+    angles_deg = np.degrees(angles)  # Convert to degrees
+    
+    # Create a mask for normals within the specified angular threshold.
+    mask = angles_deg <= angle_threshold
+    
+    # Filter the original points and their corresponding normals.
+    filtered_points = points[mask]
+    print(f"Filtered points shape: {filtered_points.shape} vs original points shape: {points.shape}")
+    
+    return ~mask

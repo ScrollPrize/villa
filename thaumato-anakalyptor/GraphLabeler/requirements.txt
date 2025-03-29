@@ -4,3 +4,4 @@ numpy
 h5py
 zarr
 tqdm
+open3d

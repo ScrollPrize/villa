@@ -1,7 +1,7 @@
 import sys, os, ast, numpy as np
 import json
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QSplitter, QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QSlider, QLabel, QSpinBox, QDoubleSpinBox, QCheckBox,
     QAction, QMessageBox, QInputDialog, QGraphicsEllipseItem, QFileDialog,
     QProgressDialog, QDialog, QFormLayout, QDialogButtonBox, QLineEdit, QComboBox
@@ -11,6 +11,7 @@ import pyqtgraph as pg
 from scipy.spatial import cKDTree
 import time
 from tqdm import tqdm
+from collections import defaultdict
 
 # --------------------------------------------------
 # Importing the custom graph problem library.
@@ -19,7 +20,7 @@ sys.path.append('../ThaumatoAnakalyptor/graph_problem/build')
 import graph_problem_gpu_py
 
 from config import load_config, save_config
-from utils import vectorized_point_to_polyline_distance, build_temporary_group_edges
+from utils import vectorized_point_to_polyline_distance, build_temporary_group_edges, filter_point_normals
 from widgets import create_sync_slider_spinbox
 
 # --------------------------------------------------
@@ -89,8 +90,8 @@ class PointCloudLabeler(QMainWindow):
         self.calculated_labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
         
         # Display parameters.
-        self.point_size = 3
-        self.max_display = 200000
+        self.point_size = 1.5
+        self.max_display = 400
         self.f_star_min, self.f_star_max = float(np.min(self.points[:, 0])), float(np.max(self.points[:, 0]))
         self.f_init_min, self.f_init_max = -180.0, 180.0
         self.z_min, self.z_max = float(np.min(self.points[:, 2])), float(np.max(self.points[:, 2]))
@@ -137,14 +138,13 @@ class PointCloudLabeler(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-        
+
         # Upper view area.
-        views_columns_layout = QHBoxLayout()
-        main_layout.addLayout(views_columns_layout)
+        splitter = QSplitter(Qt.Horizontal)
         
         # Left (XY) view.
-        left_column = QVBoxLayout()
-        views_columns_layout.addLayout(left_column)
+        left_widget = QWidget()
+        left_column = QVBoxLayout(left_widget)
         self.xy_plot = pg.PlotWidget()
         self.xy_plot.setBackground('w')
         self.xy_plot.setLabel('bottom', 'f_star')
@@ -196,8 +196,8 @@ class PointCloudLabeler(QMainWindow):
         left_column.addWidget(self.apply_calc_xy_button)
         
         # Right (XZ) view.
-        right_column = QVBoxLayout()
-        views_columns_layout.addLayout(right_column)
+        right_widget = QWidget()
+        right_column = QVBoxLayout(right_widget)
         self.xz_plot = pg.PlotWidget()
         self.xz_plot.setBackground('w')
         self.xz_plot.setLabel('bottom', 'f_star')
@@ -222,6 +222,13 @@ class PointCloudLabeler(QMainWindow):
         self.apply_calc_xz_button = QPushButton("Apply Updated Labels to XZ")
         self.apply_calc_xz_button.clicked.connect(self.apply_calculated_labels_xz)
         right_column.addWidget(self.apply_calc_xz_button)
+
+        # Add both widgets to the splitter.
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+
+        # Add the splitter to the main layout.
+        main_layout.addWidget(splitter)
         
         # --------------------------------------------------------------------
         # Top Controls Row: Spline and Label Update Controls.
@@ -317,12 +324,16 @@ class PointCloudLabeler(QMainWindow):
         max_disp_layout = QHBoxLayout()
         max_disp_label = QLabel("Max Display Points:")
         self.max_display_spinbox = QSpinBox()
-        self.max_display_spinbox.setRange(1000, 1000000)
+        self.max_display_spinbox.setRange(1, 10000000)
         self.max_display_spinbox.setValue(self.max_display)
         max_disp_layout.addWidget(max_disp_label)
         max_disp_layout.addWidget(self.max_display_spinbox)
         common_controls_layout.addLayout(max_disp_layout)
         self.max_display_spinbox.valueChanged.connect(self.update_max_display)
+
+        self.local_downsample_checkbox = QCheckBox("Local Downsample")
+        self.local_downsample_checkbox.setChecked(True)
+        common_controls_layout.addWidget(self.local_downsample_checkbox)
         
         self.drawing_mode_checkbox = QCheckBox("Drawing Mode")
         self.drawing_mode_checkbox.setChecked(True)
@@ -397,6 +408,26 @@ class PointCloudLabeler(QMainWindow):
         cellar_controls_layout.addWidget(self.hide_teflon_checkbox)
         self.hide_teflon_checkbox.toggled.connect(self.update_views)
 
+        self.filter_teflon_button = QPushButton("Filter Teflon")
+        self.filter_teflon_button.clicked.connect(self.filter_teflon)
+        cellar_controls_layout.addWidget(self.filter_teflon_button)
+
+        self.filter_angle_spinbox = QSpinBox()
+        self.filter_angle_spinbox.setRange(0, 90)
+        self.filter_angle_spinbox.setValue(80)
+        cellar_controls_layout.addWidget(QLabel("Filter Angle:"))
+        cellar_controls_layout.addWidget(self.filter_angle_spinbox)
+
+        self.filter_distance_spinbox = QSpinBox()
+        self.filter_distance_spinbox.setRange(0, 100)
+        self.filter_distance_spinbox.setValue(5)
+        cellar_controls_layout.addWidget(QLabel("Normal Estimation Distance:"))
+        cellar_controls_layout.addWidget(self.filter_distance_spinbox)
+
+        self.reset_teflon_button = QPushButton("Reset Teflon")
+        self.reset_teflon_button.clicked.connect(self.reset_teflon)
+        cellar_controls_layout.addWidget(self.reset_teflon_button)
+
         # Show Max Group (just display, no control)
         self.max_group_label = QLabel("Max Group: 0")
         cellar_controls_layout.addWidget(self.max_group_label)
@@ -441,6 +472,7 @@ class PointCloudLabeler(QMainWindow):
         
         self.xy_plot.scene().installEventFilter(self)
         
+        self.update_slider_ranges()
         self.update_guides()
         self.update_views()
 
@@ -657,6 +689,8 @@ class PointCloudLabeler(QMainWindow):
     
     def save_labels_to_path(self):
         fname, _ = QFileDialog.getSaveFileName(self, "Save Labels", os.path.join("../experiments", self.default_experiment), "Text Files (*.txt);;All Files (*)")
+        if not fname.endswith(".txt"):
+            fname += ".txt"
         self._save_labels_to_path(fname)
 
     def _save_labels_to_path(self, fname):
@@ -739,6 +773,7 @@ class PointCloudLabeler(QMainWindow):
         self.z_thickness_spinbox.setMinimum(0.01)
         self.z_thickness_spinbox.setMaximum(z_range)
         thickness_val = z_range * 0.1
+        thickness_val = min(thickness_val, 100.0)
         self.z_thickness_slider.setValue(int(thickness_val * self.scaleFactor))
         self.z_thickness_spinbox.setValue(thickness_val)
     
@@ -844,6 +879,34 @@ class PointCloudLabeler(QMainWindow):
         self.teflon_label = val
         self.update_views()
 
+    def filter_teflon(self):
+        # filter pointcloud with normal
+        angle_thresh = self.filter_angle_spinbox.value()
+        distance_thresh = self.filter_distance_spinbox.value()
+        filter_mask = filter_point_normals(self.points * np.array([1.0, 0.2, 0.1]), np.array([1.0, 0.0, 0.0]), angle_thresh, radius=distance_thresh) # squeeze y and z to make the single lines/sheets more connected
+        unlabeled_mask = np.abs(self.labels - self.UNLABELED) < 2
+        mask = np.logical_and(filter_mask, unlabeled_mask)
+        # Track undo/redo
+        self.undo_stack.append((self.labels.copy(), self.group.copy()))
+        self.redo_stack = []
+
+        # assign to group 0 and label teflon
+        self.group[mask] = 0
+        self.labels[mask] = self.teflon_label
+        self.update_views()
+        self.update_groups_data()
+
+    def reset_teflon(self):
+        # reset teflon to unlabeled, group 0
+        # Track undo/redo
+        self.undo_stack.append((self.labels.copy(), self.group.copy()))
+        self.redo_stack = []
+
+        mask = self.labels == self.teflon_label
+        self.labels[mask] = self.UNLABELED
+        self.group[mask] = 0
+        self.update_views()
+
     def update_group(self, val):
         self.active_group = val
         self.update_views()
@@ -904,7 +967,13 @@ class PointCloudLabeler(QMainWindow):
 
         self.update_views()
     
-    def downsample_points(self, pts, labels, groups, calc_labels=None, max_display=1):
+    def downsample_points(self, pts, labels, groups, calc_labels=None, max_display=1, axis=None):
+        if self.local_downsample_checkbox.isChecked():
+            return self.subsample_points_local(pts, labels, groups, calc_labels=calc_labels, max_display=max_display, axis=axis)
+        else:  
+            return self.global_subsample_points(pts, labels, groups, calc_labels=calc_labels, max_display=max_display)
+
+    def global_subsample_points(self, pts, labels, groups, calc_labels=None, max_display=1):
         n = pts.shape[0]
         if n > max_display:
             indices = np.linspace(0, n - 1, max_display, dtype=int)
@@ -917,6 +986,61 @@ class PointCloudLabeler(QMainWindow):
                 return pts, labels, groups, calc_labels
             else:
                 return pts, labels, groups
+            
+    def subsample_points_local(self, points, labels, groups, calc_labels=None, max_display=1, grid_size=50, axis=None):
+        """
+        Subsample points in 2D such that each grid cell (of size grid_size)
+        contains at most max_per_cell points.
+
+        Parameters:
+            points (np.ndarray): An (N, 2) array of 2D points.
+            grid_size (float): The size of each grid cell.
+            max_per_cell (int): Maximum number of points to keep per cell.
+
+        Returns:
+            np.ndarray: The subsampled points.
+        """
+        max_per_cell = max_display
+        # Compute the lower bound of the grid and cell indices for each point.
+        min_xy = points.min(axis=0)
+        cell_indices = ((points - min_xy) // grid_size).astype(int)
+        if axis is not None:
+            if axis == 'xy':
+                cell_indices = cell_indices[:, :2]
+            elif axis == 'xz':
+                cell_indices = cell_indices[:, [0, 2]]
+            else:
+                raise ValueError("Invalid axis. Use 'xy' or 'xz'.")
+        
+        # Use np.ravel_multi_index to compute a unique cell ID for each point.
+        max_indices = cell_indices.max(axis=0) + 1
+        cell_ids = np.ravel_multi_index(cell_indices.T, dims=tuple(max_indices))
+        
+        # Sort all points by their cell_id.
+        order = np.argsort(cell_ids)
+        sorted_cell_ids = cell_ids[order]
+        
+        # Get the start index and counts for each unique cell.
+        unique_cells, first_index, counts = np.unique(sorted_cell_ids, return_index=True, return_counts=True)
+        
+        # For each unique cell, randomly select up to max_per_cell indices.
+        selected_indices = []
+        for idx, count in zip(first_index, counts):
+            # indices of points in the current cell
+            cell_group = order[idx:idx+count]
+            if count > max_display:
+                indices = np.linspace(0, count-1, max_display, dtype=int)
+            else:
+                indices = np.arange(count)
+            # Keep only up to max_per_cell points
+            selected_indices.append(cell_group[indices])
+        
+        # Concatenate selected indices and return the subsampled points.
+        keep_indices = np.concatenate(selected_indices)
+        if calc_labels is not None:
+            return points[keep_indices], labels[keep_indices], groups[keep_indices], calc_labels[keep_indices]
+        else:
+            return points[keep_indices], labels[keep_indices], groups[keep_indices]
     
     def get_brushes_from_labels(self, labels_array, group_array):
         brushes = np.empty(labels_array.shape[0], dtype=object)
@@ -1195,7 +1319,7 @@ class PointCloudLabeler(QMainWindow):
         group_combined = np.concatenate([group_xy, group_top, group_bottom], axis=0)
         calc_labels_combined = np.concatenate([calc_labels_xy, calc_labels_top, calc_labels_bottom], axis=0)
         pts_combined, labels_combined, group_combined, calc_labels_combined = self.downsample_points(
-            pts_combined, labels_combined, group_combined, calc_labels_combined, self.max_display)
+            pts_combined, labels_combined, group_combined, calc_labels_combined, self.max_display, axis='xy')
         t5 = time.time()
         # print("Step 5 (XY: combine & downsample):", t5 - t4, "s")
         
@@ -1301,7 +1425,7 @@ class PointCloudLabeler(QMainWindow):
             new_x_xz = pts_xz[:, 0]
         pts_xz_display = pts_xz.copy()
         pts_xz_display[:, 0] = new_x_xz
-        pts_xz_display, labels_xz, group_xz = self.downsample_points(pts_xz_display, labels=labels_xz, groups=group_xz, max_display=self.max_display)
+        pts_xz_display, labels_xz, group_xz = self.downsample_points(pts_xz_display, labels=labels_xz, groups=group_xz, max_display=self.max_display, axis='xz')
         new_xz_geometry = {'x': pts_xz_display[:, 0], 'y': pts_xz_display[:, 2]}
         new_brushes_xz = self.get_brushes_from_labels(labels_xz, group_xz)
         t8 = time.time()
@@ -1898,6 +2022,7 @@ class PointCloudLabeler(QMainWindow):
     
     # Example of using the solver interface when updating labels:
     def update_labels(self):
+        undeleted = self.solver.get_undeleted_indices()
         if self.solver is not None:
             gt = np.abs((self.labels - self.UNLABELED) > 2)
             if self.hide_teflon_checkbox.isChecked():
@@ -1919,7 +2044,6 @@ class PointCloudLabeler(QMainWindow):
                 source, target, winding_number_difference = build_temporary_group_edges(self.solver, list(self.labels), list(gt_g))
                 group_metadata.append((source, target, winding_number_difference))
 
-            undeleted = self.solver.get_undeleted_indices()
             if self.hide_teflon_checkbox.isChecked():
                 print("Hiding teflon during solver update")
                 self.solver.delete_nodes(list(np.abs(self.labels - self.teflon_label) < 2))
@@ -1943,23 +2067,44 @@ class PointCloudLabeler(QMainWindow):
             elif "F*" in selected_solver:
                 if self.seed_node is None:
                     assert len(deleted_mask_previous) == len(self.labels), "Deleted mask shape mismatch"
-                    # try to set a seed node. first labeled point found.
-                    for i, label in tqdm(enumerate(self.labels), desc="Finding seed node"):
-                        if i == 0: # do not use "no-seed" index as seed node
-                            continue
-                        if self.group[i] != 0:
-                            continue
-                        if abs(self.labels[i] - self.teflon_label) < 2:
-                            continue
-                        if abs(label - self.UNLABELED) > 2:
-                            if deleted_mask_previous[i]:
-                                continue
-                            offset = np.logical_not(deleted_mask_previous[:i]).sum()
-                            self.seed_node = offset
-                            print(f"Found seed node at index {i} (offset {offset})")
-                            break
+                    mask_valid = np.abs(self.labels - self.UNLABELED) > 2
+                    mask_group_0 = self.group == 0
+                    mask_non_teflon = np.abs(self.labels - self.teflon_label) > 2
+                    mask_non_deleted = np.logical_not(deleted_mask_previous)
+                    mask_not_first_index = np.arange(len(self.labels)) != 0
+                    
+                    mask = np.logical_and(mask_valid, mask_group_0)
+                    mask = np.logical_and(mask, mask_non_teflon)
+                    mask = np.logical_and(mask, mask_non_deleted)
+                    mask = np.logical_and(mask, mask_not_first_index)
+                    first_valid = np.where(mask)[0]
+                    if first_valid.size == 0:
+                        print("No seed node found.")
+                        self.seed_node = None
+                    else:
+                        offset = np.logical_not(deleted_mask_previous[:first_valid[0]]).sum()
+                        self.seed_node = offset
+                        assert mask[first_valid[0]], f"Seed node {self.seed_node} at {first_valid[0]} is not valid"
+                        first_valid = first_valid[0]
+                    print(f"Seed node found at index {self.seed_node} at {first_valid}.")
+                    # # try to set a seed node. first labeled point found.
+                    # for i, label in tqdm(enumerate(self.labels), desc="Finding seed node"):
+                    #     if i == 0: # do not use "no-seed" index as seed node
+                    #         continue
+                    #     if self.group[i] != 0:
+                    #         continue
+                    #     if abs(self.labels[i] - self.teflon_label) < 2:
+                    #         continue
+                    #     if abs(label - self.UNLABELED) > 2:
+                    #         if deleted_mask_previous[i]:
+                    #             continue
+                    #         offset = np.logical_not(deleted_mask_previous[:i]).sum()
+                    #         self.seed_node = offset
+                    #         print(f"Found seed node at index {i} (offset {offset})")
+                    #         break
                 if self.seed_node is not None:
-                    self.solver.set_labeled_edges(self.seed_node)
+                    pass
+                    # self.solver.set_labeled_edges(self.seed_node)
                     self.solver.set_f_star(self.seed_node)
                 if selected_solver == "F*":
                     self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=1.1, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
@@ -1977,10 +2122,10 @@ class PointCloudLabeler(QMainWindow):
                     self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True)
 
                 if self.use_z_range_checkbox.isChecked() or self.use_fstar_range_checkbox.isChecked():
-                    print("Resetting z-range")
+                    print(f"Resetting z-range, length: {len(undeleted)}")
                     self.solver.set_undeleted_indices(undeleted)
                     self.seed_node = None
-
+                    # print("Reset the z undeleted indices")
                 # Update positions
                 self.update_positions(update_slide_ranges=False)
 
