@@ -1,0 +1,10 @@
+{
+    "graph_path": "/scroll4_v5/graph.bin",
+    "default_experiment": "scroll4-full-v5",
+    "default_z_min": 3000,
+    "default_z_max": 4000,
+    "ome_zarr_path": "/scroll.volpkg/volumes/53keV_7.91um.zarr",
+    "umbilicus_path": "/scroll.volpkg/volumes/20231117161658_umbilicus.txt",
+    "graph_pkl_path": "/scroll4_v5/point_cloud_colorized_verso_subvolume_scroll_graph_angular.pkl",
+    "h5_path": "/scroll4_v5/point_cloud_colorized_verso_subvolume_blocks_nonormalsonecolor_compressedgziplevel7.h5"
+}

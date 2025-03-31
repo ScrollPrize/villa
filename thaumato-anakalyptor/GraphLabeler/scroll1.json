@@ -1,0 +1,10 @@
+{
+    "graph_path": "/home/julian/villa/thaumato-anakalyptor/experiments/s1-merged-v3/graph.bin",
+    "default_experiment": "s1-merged-v3",
+    "default_z_min": 3000,
+    "default_z_max": 4000,
+    "ome_zarr_path": "/media/julian/3/PHerc1667.volpkg/volumes/53keV_7.91um.zarr",
+    "umbilicus_path": "/media/julian/3/PHerc1667.volpkg/volumes/20231117161658_umbilicus.txt",
+    "graph_pkl_path": "/media/julian/1/scroll4_v5/point_cloud_colorized_verso_subvolume_scroll_graph_angular.pkl",
+    "h5_path": "/media/julian/1/scroll4_v5/point_cloud_colorized_verso_subvolume_blocks_nonormalsonecolor_compressedgziplevel7.h5"
+}

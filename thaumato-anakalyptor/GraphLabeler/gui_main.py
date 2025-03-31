@@ -80,6 +80,7 @@ class PointCloudLabeler(QMainWindow):
         self._create_menu()
         
         # Data and labels.
+        self.hide_labels = False
         self.show_original_points = False
         self.points = np.array(point_data)
         self.original_points = np.array(point_data)
@@ -90,7 +91,7 @@ class PointCloudLabeler(QMainWindow):
         self.calculated_labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
         
         # Display parameters.
-        self.point_size = 1.5
+        self.point_size = 2
         self.max_display = 400
         self.f_star_min, self.f_star_max = float(np.min(self.points[:, 0])), float(np.max(self.points[:, 0]))
         self.f_init_min, self.f_init_max = -180.0, 180.0
@@ -99,6 +100,10 @@ class PointCloudLabeler(QMainWindow):
         # Create KD-trees.
         self.kdtree_xy = cKDTree(self.points[:, [0, 1]])
         self.kdtree_xz = cKDTree(self.points[:, [0, 2]])
+        self.original_kdtree_xy = self.kdtree_xy
+        self.original_kdtree_xz = self.kdtree_xz
+        self.computed_kdtree_xy = self.kdtree_xy
+        self.computed_kdtree_xz = self.kdtree_xz
         
         # Pre-created brushes.
         self.brush_black = pg.mkBrush(0, 0, 0)
@@ -242,7 +247,7 @@ class PointCloudLabeler(QMainWindow):
 
         # --- Solver selection dropdown ---
         self.solver_combo = QComboBox()
-        self.solver_combo.addItems(["F*", "F*2", "F*3", "F*4", "F*5", "Winding Number", "Union", "Random", "Set Labels"])
+        self.solver_combo.addItems(["F*", "F*2", "F*3", "F*4", "F*5", "F*6", "Winding Number", "Union", "Random", "Set Labels"])
         top_controls_layout.addWidget(QLabel("Select Solver:"))
         top_controls_layout.addWidget(self.solver_combo)
 
@@ -257,6 +262,16 @@ class PointCloudLabeler(QMainWindow):
         solve_iterations_layout.addWidget(QLabel("Solver Iterations:"))
         solve_iterations_layout.addWidget(self.solve_iterations_spinbox)
         top_controls_layout.addLayout(solve_iterations_layout)
+
+        solve_other_block_factor_layout = QHBoxLayout()
+        self.solve_other_block_factor_spinbox = QDoubleSpinBox()
+        self.solve_other_block_factor_spinbox.setRange(0, 100)
+        self.solve_other_block_factor_spinbox.setDecimals(2)
+        self.solve_other_block_factor_spinbox.setSingleStep(1.0)
+        self.solve_other_block_factor_spinbox.setValue(0.10)
+        solve_other_block_factor_layout.addWidget(QLabel("Same Sheet Factor:"))
+        solve_other_block_factor_layout.addWidget(self.solve_other_block_factor_spinbox)
+        top_controls_layout.addLayout(solve_other_block_factor_layout)
         
         spline_min_layout = QHBoxLayout()
         self.spline_min_points_spinbox = QSpinBox()
@@ -528,6 +543,14 @@ class PointCloudLabeler(QMainWindow):
     # --------------------------------------------------
     def _create_menu(self):
         menu_bar = self.menuBar()
+        project_menu = menu_bar.addMenu("Project")
+        load_action = QAction("Load Project", self)
+        load_action.triggered.connect(self.load_project)
+        project_menu.addAction(load_action)
+        save_project_action = QAction("Save Project", self)
+        save_project_action.triggered.connect(self.save_project_to_path)
+        project_menu.addAction(save_project_action)
+
         data_menu = menu_bar.addMenu("Data")
         load_action = QAction("Load Data", self)
         load_action.triggered.connect(self.load_data)
@@ -621,7 +644,50 @@ class PointCloudLabeler(QMainWindow):
     def on_ome_zarr_view_destroyed(self):
         print("OME-Zarr view window has been destroyed; setting pointer to None.")
         self.ome_zarr_window = None
-    
+
+    def load_project(self):
+        # Choose path to load config from
+        fname, _ = QFileDialog.getOpenFileName(self, "Load Data", "", "Jason Files (*.json);;All Files (*)")
+        if fname:
+            load_config(fname)
+            self.graph_path = self.config.get("graph_path", self.graph_path)
+            self.default_experiment = self.config.get("default_experiment", self.default_experiment)
+            self.ome_zarr_path = self.config.get("ome_zarr_path", self.ome_zarr_path)
+            self.graph_pkl_path = self.config.get("graph_pkl_path", self.graph_pkl_path)
+            self.h5_path = self.config.get("h5_path", self.h5_path)
+            self.umbilicus_path = self.config.get("umbilicus_path", self.umbilicus_path)
+            if self.graph_path:
+                self.solver = graph_problem_gpu_py.Solver(self.graph_path)
+                gt_path = os.path.join("../experiments", self.default_experiment, "checkpoints", "checkpoint_graph_solver_connected_2.bin")
+                if not os.path.exists(gt_path):
+                    gt_path = os.path.join("../experiments", self.default_experiment, "checkpoints", "checkpoint_graph_f_star_final.bin")
+                if os.path.exists(gt_path):
+                    self.solver.load_graph(gt_path)
+                else:
+                    QMessageBox.warning(self, "Load Data", f"Graph file not found at {gt_path}")
+                self.update_positions(update_labels=True)
+                self.update_slider_ranges()
+                self.update_views()
+            else:
+                QMessageBox.warning(self, "Load Project", "Graph path not found in config.")
+                return
+
+    def save_project_to_path(self):
+        # save config to path
+        fname, _ = QFileDialog.getSaveFileName(self, "Save Project", "", "Jason Files (*.json);;All Files (*)")
+        if fname:
+            self.config["graph_path"] = self.graph_path
+            self.config["default_experiment"] = self.default_experiment
+            if self.ome_zarr_path:
+                self.config["ome_zarr_path"] = self.ome_zarr_path
+            if self.graph_pkl_path:
+                self.config["graph_pkl_path"] = self.graph_pkl_path
+            if self.h5_path:
+                self.config["h5_path"] = self.h5_path
+            if self.umbilicus_path:
+                self.config["umbilicus_path"] = self.umbilicus_path
+            save_config(self.config, fname)
+
     def load_data(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("Load Data")
@@ -1044,6 +1110,9 @@ class PointCloudLabeler(QMainWindow):
     
     def get_brushes_from_labels(self, labels_array, group_array):
         brushes = np.empty(labels_array.shape[0], dtype=object)
+        if self.hide_labels:
+            brushes[:] = self.brush_black
+            return brushes
         mask_unlabeled = (labels_array == self.UNLABELED) | (labels_array == self.UNLABELED + 1) | (labels_array == self.UNLABELED - 1)
         brushes[mask_unlabeled] = self.brush_black
         mask_valid = ~mask_unlabeled
@@ -1936,6 +2005,12 @@ class PointCloudLabeler(QMainWindow):
         3. Ensure the z-range checkbox is enabled during the computation.
         4. Update views and save the labels for each slab.
         """
+        # Pop-Up "Are you sure?" dialog
+        reply = QMessageBox.question(self, "Slab Computation",
+                                    "This will take a while. Are you sure you want to continue?",
+                                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.No:
+            return
         start_time = time.time()
         initial_z_center = self.z_center_spinbox.value()
         initial_thickness = self.z_thickness_spinbox.value() / self.scaleFactor
@@ -2023,6 +2098,7 @@ class PointCloudLabeler(QMainWindow):
     # Example of using the solver interface when updating labels:
     def update_labels(self):
         undeleted = self.solver.get_undeleted_indices()
+        other_block_factor=float(self.solve_other_block_factor_spinbox.value())
         if self.solver is not None:
             gt = np.abs((self.labels - self.UNLABELED) > 2)
             if self.hide_teflon_checkbox.isChecked():
@@ -2107,10 +2183,10 @@ class PointCloudLabeler(QMainWindow):
                     # self.solver.set_labeled_edges(self.seed_node)
                     self.solver.set_f_star(self.seed_node)
                 if selected_solver == "F*":
-                    self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=1.1, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
-                    self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=1.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
+                    self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=1.1, other_block_factor=other_block_factor, lr=0.05, error_cutoff=-1.0, display=True)
+                    self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=1.0, other_block_factor=other_block_factor, lr=0.05, error_cutoff=-1.0, display=True)
                 elif selected_solver == "F*2":
-                    self.solver.solve_f_star_with_labels(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
+                    self.solver.solve_f_star_with_labels(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, other_block_factor=other_block_factor, lr=0.05, error_cutoff=-1.0, display=True)
                 elif selected_solver == "F*3":
                     self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=4.0, other_block_factor=0.5, lr=0.25, error_cutoff=-1.0, display=True)
                     self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=2.0, other_block_factor=0.1, lr=0.05, error_cutoff=-1.0, display=True)
@@ -2120,6 +2196,8 @@ class PointCloudLabeler(QMainWindow):
                     self.solver.solve_f_star(num_iterations=int(2 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=360.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True)
                 elif selected_solver == "F*5":
                     self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True)
+                elif selected_solver == "F*6":
+                    self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, o=0.0, step_sigma=360.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True)
 
                 if self.use_z_range_checkbox.isChecked() or self.use_fstar_range_checkbox.isChecked():
                     print(f"Resetting z-range, length: {len(undeleted)}")
@@ -2195,6 +2273,14 @@ class PointCloudLabeler(QMainWindow):
         self.show_original_points = not self.show_original_points
         print(f"Toggling original points: {self.show_original_points}")
         self.recompute = True
+        if self.show_original_points:
+            self.computed_kdtree_xy = self.kdtree_xy
+            self.computed_kdtree_xz = self.kdtree_xz
+            self.kdtree_xy = self.original_kdtree_xy
+            self.kdtree_xz = self.original_kdtree_xz
+        else:
+            self.kdtree_xy = self.computed_kdtree_xy
+            self.kdtree_xz = self.computed_kdtree_xz
         self.update_views()
     
     def toggle_calc_draw_mode(self):
@@ -2290,6 +2376,10 @@ class PointCloudLabeler(QMainWindow):
         # down arrow
         elif event.key() == Qt.Key_Down:
             self.label_spinbox.setValue(self.label_spinbox.value() - 1)
+            event.accept()
+        elif event.key() == Qt.Key_C:
+            self.hide_labels = not self.hide_labels
+            self.update_views()
             event.accept()
         else:
             super(PointCloudLabeler, self).keyPressEvent(event)

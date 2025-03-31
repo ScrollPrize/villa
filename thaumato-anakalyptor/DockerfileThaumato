@@ -151,7 +151,7 @@ RUN cmake .. \
 
 ENV PATH=/usr/bin:$PATH
 
-RUN pip3 install pyqtgraph scipy numpy h5py zarr tqdm open3d
+RUN pip3 install pyqtgraph scipy numpy h5py zarr tqdm open3d opencv-python
 
 # Build the graph_problem
 WORKDIR /workspace/ThaumatoAnakalyptor/graph_problem/
