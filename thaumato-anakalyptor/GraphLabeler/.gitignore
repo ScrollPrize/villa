@@ -2,3 +2,4 @@ __pycache__/
 __pycache__/*
 GraphLabelerViews/
 config_labeling_gui*
+*.json
