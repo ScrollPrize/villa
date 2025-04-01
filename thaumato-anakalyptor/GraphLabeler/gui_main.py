@@ -247,7 +247,7 @@ class PointCloudLabeler(QMainWindow):
 
         # --- Solver selection dropdown ---
         self.solver_combo = QComboBox()
-        self.solver_combo.addItems(["F*", "F*2", "F*3", "F*4", "F*5", "F*6", "Winding Number", "Union", "Random", "Set Labels"])
+        self.solver_combo.addItems(["F*", "F*2", "F*3", "F*4", "F*5", "F*6", "F*7", "Winding Number", "Union", "Random", "Set Labels"])
         top_controls_layout.addWidget(QLabel("Select Solver:"))
         top_controls_layout.addWidget(self.solver_combo)
 
@@ -296,6 +296,10 @@ class PointCloudLabeler(QMainWindow):
         self.assign_line_labels_button = QPushButton("Assign Line Labels")
         self.assign_line_labels_button.clicked.connect(self.assign_line_labels)
         top_controls_layout.addWidget(self.assign_line_labels_button)
+
+        self.assign_line_labels_all_button = QPushButton("Assign Line Labels All")
+        self.assign_line_labels_all_button.clicked.connect(self.assign_line_labels_all)
+        top_controls_layout.addWidget(self.assign_line_labels_all_button)
         
         line_dist_layout = QHBoxLayout()
         self.line_distance_threshold_spinbox = QSpinBox()
@@ -561,7 +565,10 @@ class PointCloudLabeler(QMainWindow):
         load_labels_action = QAction("Load Labels", self)
         load_labels_action.triggered.connect(self.load_labels_from_path)
         data_menu.addAction(load_labels_action)
-        
+        reset_labels_action = QAction("Reset Labels", self)
+        reset_labels_action.triggered.connect(self.reset_labels)
+        data_menu.addAction(reset_labels_action)
+
         set_ome_zarr_action = QAction("Set OME-Zarr Path", self)
         set_ome_zarr_action.triggered.connect(self.set_ome_zarr_path)
         data_menu.addAction(set_ome_zarr_action)
@@ -792,6 +799,11 @@ class PointCloudLabeler(QMainWindow):
                 self.update_views()
             else:
                 QMessageBox.warning(self, "Load Labels", "Loaded labels length does not match current data.")
+
+    def reset_labels(self):
+        self.labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
+        self.group = np.zeros(len(self.points), dtype=np.int32)
+        self.update_views()
     
     def show_help(self):
         help_text = (
@@ -1818,6 +1830,56 @@ class PointCloudLabeler(QMainWindow):
         self.update_views()
         print(f"Assigned line labels to {assign_count} points (threshold: {thresh}).")
 
+    def assign_line_labels_all(self):
+        # Track undo/redo
+        self.undo_stack.append((self.labels.copy(), self.group.copy()))
+        self.redo_stack = []
+        
+        thresh = self.line_distance_threshold_spinbox.value()
+        z_center = self.z_center_spinbox.value()
+        z_thickness = self.z_thickness_slider.value() / self.scaleFactor
+        z_min_val = z_center - z_thickness / 2
+        z_max_val = z_center + z_thickness / 2
+        mask = (self.points[:, 2] >= z_min_val) & (self.points[:, 2] <= z_max_val)
+        pts = self.points[mask]
+        global_indices = np.where(mask)[0]
+        total_points = len(pts)
+        progress = QProgressDialog("Assigning line labels...", "Cancel", 0, total_points, self)
+        progress.setWindowTitle("Progress")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+        assign_count = 0
+        update_interval = max(total_points // 100, 1)
+        assign_min = self.assign_min_spinbox.value()
+        assign_max = self.assign_max_spinbox.value()
+        for j, idx in enumerate(range(total_points)):
+            if j % update_interval == 0:
+                progress.setValue(j)
+            if progress.wasCanceled():
+                break
+            global_idx = global_indices[idx]
+            if abs(self.labels[global_idx]-self.UNLABELED) < 2:
+                continue
+            pt = np.array([pts[idx, 0], pts[idx, 1]])
+            for ul in self.spline_segments:
+                if ul < assign_min or ul > assign_max:
+                    continue
+                d_self = np.min([vectorized_point_to_polyline_distance(pt, seg) for seg in self.spline_segments[ul]])
+                d_minus = np.inf
+                if (ul - 1) in self.spline_segments:
+                    d_minus = np.min([vectorized_point_to_polyline_distance(pt, seg) for seg in self.spline_segments[ul - 1]])
+                d_plus = np.inf
+                if (ul + 1) in self.spline_segments:
+                    d_plus = np.min([vectorized_point_to_polyline_distance(pt, seg) for seg in self.spline_segments[ul + 1]])
+                if d_self < thresh and d_self < d_minus and d_self < d_plus:
+                    self.labels[global_idx] = ul
+                    self.group[global_idx] = 0 # Use GT group when assigning line labels
+                    assign_count += 1
+                    break
+        progress.close()
+        self.update_views()
+        print(f"Assigned line labels to {assign_count} points (threshold: {thresh}).")
+
     def delete_range(self):
         self._split_range(make_group=False)
 
@@ -2198,6 +2260,9 @@ class PointCloudLabeler(QMainWindow):
                     self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True)
                 elif selected_solver == "F*6":
                     self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, o=0.0, step_sigma=360.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True)
+                elif selected_solver == "F*7":
+                    self.solver.solve_f_star(num_iterations=int(3 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=False)
+                    self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=360.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=False)
 
                 if self.use_z_range_checkbox.isChecked() or self.use_fstar_range_checkbox.isChecked():
                     print(f"Resetting z-range, length: {len(undeleted)}")
