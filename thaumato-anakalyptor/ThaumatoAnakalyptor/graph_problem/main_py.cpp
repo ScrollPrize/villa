@@ -493,7 +493,7 @@ class Solver {
             // solve the graph
             graph = run_solver(graph, o, spring_constant, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, seed_node, other_block_factor, down_index, up_index, side_fix_nr, std_target, std_target_step, increase_same_block_weight);
         }
-        void solve_f_star(int num_iterations, float spring_constant, int i_round = 1, float o_ = 0.0f, float step_sigma=360.0f, int teflon_winding_nr=9999, bool visualize = false) {
+        void solve_f_star(int num_iterations, float spring_constant, int i_round = 1, float o_ = 0.0f, float step_sigma=360.0f, int teflon_winding_nr=9999, bool visualize = false, bool adjust_median = true) {
             // use the f_star solver for the intermediate solution
             // store only the valid indices to speed up the loop
             auto [undeleted_mask, count_undeleted] = get_undeleted_mask();
@@ -504,7 +504,7 @@ class Solver {
                 subgraph = createSubgraph(graph, undeleted_mask);
             }
             std::vector<size_t> valid_indices = get_valid_indices(subgraph);
-            run_solver_f_star(subgraph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, o_, spring_constant, step_sigma, teflon_winding_nr, visualize);
+            run_solver_f_star(subgraph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, o_, spring_constant, step_sigma, teflon_winding_nr, visualize, adjust_median);
             if (create_subgraph) {
                 updateGraphWithSubgraph(graph, undeleted_mask, subgraph);
             }
@@ -551,7 +551,7 @@ class Solver {
             // get largest connected component
             largest_connected_component();
         }
-        void set_labels(std::vector<float> gt_winding_nrs, std::vector<bool> gt) {
+        void set_labels(std::vector<float> gt_winding_nrs, std::vector<bool> gt, bool set_f_star = false) {
             // set labels
             std::vector<size_t> valid_indices = get_valid_indices(graph);
             size_t count_fixed = 0;
@@ -560,6 +560,11 @@ class Solver {
                 graph[index].winding_nr_old = gt_winding_nrs[i];
                 graph[index].winding_nr = graph[index].winding_nr_old;                
                 graph[index].fixed = gt[i];
+                if (set_f_star) {
+                    float f_star_index = graph[index].f_init + graph[index].winding_nr * 360.0f;
+                    graph[index].f_star = f_star_index;
+                    graph[index].f_tilde = f_star_index;
+                }
                 if (gt[i]) {
                     count_fixed++;
                 }
@@ -1042,7 +1047,8 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("o") = 0.0f,
             py::arg("step_sigma") = 360.0f,
             py::arg("teflon_winding_nr") = 9999,
-            py::arg("visualize") = false)
+            py::arg("visualize") = false,
+            py::arg("adjust_median") = true)
         .def("solve_f_star_with_labels", &Solver::solve_f_star_with_labels,
             "Method to intermediately solve the graph with a mean winding angle approach and labels",
             py::arg("num_iterations") = 5000,
@@ -1075,7 +1081,8 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
         .def("set_labels", &Solver::set_labels,
             "Method to set the labels of the graph",
             py::arg("gt_f_stars"),
-            py::arg("gt"))
+            py::arg("gt"),
+            py::arg("set_f_star") = false)
         .def("get_labels", &Solver::get_labels,
             "Method to get the labels of the graph")
         .def("set_f_star", &Solver::set_f_star,

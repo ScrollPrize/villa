@@ -247,7 +247,7 @@ class PointCloudLabeler(QMainWindow):
 
         # --- Solver selection dropdown ---
         self.solver_combo = QComboBox()
-        self.solver_combo.addItems(["F*", "F*2", "F*3", "F*4", "F*5", "F*6", "F*7", "Winding Number", "Union", "Random", "Set Labels"])
+        self.solver_combo.addItems(["F*", "F*2", "F*3", "F*4", "F*5", "F*6", "F*7", "F*Slab", "Winding Number", "Union", "Random", "Set Labels"])
         top_controls_layout.addWidget(QLabel("Select Solver:"))
         top_controls_layout.addWidget(self.solver_combo)
 
@@ -410,6 +410,27 @@ class PointCloudLabeler(QMainWindow):
         self.slab_compute_button = QPushButton("Compute Slabs")
         self.slab_compute_button.clicked.connect(self.run_slab_computation)
         cellar_controls_layout.addWidget(self.slab_compute_button)
+
+        slabs_range_layout = QHBoxLayout()
+        self.slabs_min_spinbox = QSpinBox()
+        self.slabs_min_spinbox.setRange(-100000, 100000)
+        self.slabs_min_spinbox.setValue(-100000)
+        self.slabs_max_spinbox = QSpinBox()
+        self.slabs_max_spinbox.setRange(-100000, 100000)
+        self.slabs_max_spinbox.setValue(100000)
+        slabs_range_layout.addWidget(QLabel("Slabs Z range min:"))
+        slabs_range_layout.addWidget(self.slabs_min_spinbox)
+        slabs_range_layout.addWidget(QLabel("max:"))
+        slabs_range_layout.addWidget(self.slabs_max_spinbox)
+        cellar_controls_layout.addLayout(slabs_range_layout)
+        # slab thickness
+        slab_thickness_layout = QHBoxLayout()
+        self.slab_thickness_spinbox = QSpinBox()
+        self.slab_thickness_spinbox.setRange(1, 1000)
+        self.slab_thickness_spinbox.setValue(100)
+        slab_thickness_layout.addWidget(QLabel("Slab thickness:"))
+        slab_thickness_layout.addWidget(self.slab_thickness_spinbox)
+        cellar_controls_layout.addLayout(slab_thickness_layout)
 
         self.reset_points_button = QPushButton("Reset Points")
         self.reset_points_button.clicked.connect(self.reset_points)
@@ -963,7 +984,9 @@ class PointCloudLabeler(QMainWindow):
         distance_thresh = self.filter_distance_spinbox.value()
         filter_mask = filter_point_normals(self.points * np.array([1.0, 0.2, 0.1]), np.array([1.0, 0.0, 0.0]), angle_thresh, radius=distance_thresh) # squeeze y and z to make the single lines/sheets more connected
         unlabeled_mask = np.abs(self.labels - self.UNLABELED) < 2
+        mask_edge = np.logical_and(self.points[:, 1] > -165, self.points[:, 1] < 165) # hacky way to not filter out nodes that are close to the wrap-around (not points in cartesian -> wrongly assigning 90 deg angle, therefore need to not filter out)
         mask = np.logical_and(filter_mask, unlabeled_mask)
+        mask = np.logical_and(mask, mask_edge)
         # Track undo/redo
         self.undo_stack.append((self.labels.copy(), self.group.copy()))
         self.redo_stack = []
@@ -1834,51 +1857,110 @@ class PointCloudLabeler(QMainWindow):
         # Track undo/redo
         self.undo_stack.append((self.labels.copy(), self.group.copy()))
         self.redo_stack = []
-        
+
+        # Get current parameters.
         thresh = self.line_distance_threshold_spinbox.value()
         z_center = self.z_center_spinbox.value()
         z_thickness = self.z_thickness_slider.value() / self.scaleFactor
         z_min_val = z_center - z_thickness / 2
         z_max_val = z_center + z_thickness / 2
+        assign_min = self.assign_min_spinbox.value()
+        assign_max = self.assign_max_spinbox.value()
+
+        # Get the points in the current z-slab.
         mask = (self.points[:, 2] >= z_min_val) & (self.points[:, 2] <= z_max_val)
+        mask = np.logical_and(mask, self.group == 0) # only consider group 0 points
         pts = self.points[mask]
         global_indices = np.where(mask)[0]
-        total_points = len(pts)
-        progress = QProgressDialog("Assigning line labels...", "Cancel", 0, total_points, self)
+        if pts.shape[0] == 0:
+            return
+
+        # Only work on candidate points that are not already “labeled” (UNLABELED).
+        cand_mask = np.abs(self.labels[mask] - self.UNLABELED) < 2
+        if not np.any(cand_mask):
+            return
+        cand_globals = global_indices[cand_mask]
+        # For distance computations we only need the x,y coordinates.
+        candidate_pts = pts[cand_mask, :2]  # shape (m, 2)
+        m = candidate_pts.shape[0]
+
+        # Get sorted list of winding labels (ul) available in spline_segments in the allowed range.
+        labels_to_check = sorted([ul for ul in self.spline_segments if assign_min <= ul <= assign_max])
+        L = len(labels_to_check)
+        if L == 0:
+            return
+
+        # --- Helper: Compute distance from many points to a set of line segments.
+        # Each polyline is broken into segments (p0 -> p1) and we compute the minimum distance.
+        def point_to_segments_distance(points, segments):
+            # points: (m,2); segments: (n,2,2)
+            p0 = segments[:, 0, :]  # shape (n,2)
+            p1 = segments[:, 1, :]  # shape (n,2)
+            v = p1 - p0             # shape (n,2)
+            # Compute vector from p0 to every point: shape (m, n, 2)
+            diff = points[:, np.newaxis, :] - p0[np.newaxis, :, :]
+            # Compute projection factor t along each segment.
+            dot_val = np.sum(diff * v, axis=2)  # shape (m, n)
+            norm_v2 = np.sum(v * v, axis=1)       # shape (n,)
+            t = dot_val / (norm_v2[np.newaxis, :] + 1e-8)
+            t = np.clip(t, 0, 1)
+            proj = p0[np.newaxis, :, :] + t[..., np.newaxis] * v[np.newaxis, :, :]
+            dist = np.linalg.norm(points[:, np.newaxis, :] - proj, axis=2)  # shape (m, n)
+            return np.min(dist, axis=1)  # shape (m,)
+
+        progress = QProgressDialog("Assigning all line labels...", "Cancel", 0, L, self)
         progress.setWindowTitle("Progress")
         progress.setWindowModality(Qt.WindowModal)
         progress.show()
-        assign_count = 0
-        update_interval = max(total_points // 100, 1)
-        assign_min = self.assign_min_spinbox.value()
-        assign_max = self.assign_max_spinbox.value()
-        for j, idx in enumerate(range(total_points)):
-            if j % update_interval == 0:
-                progress.setValue(j)
+        update_interval = max(L // 100, 1)
+        
+        # For each label in labels_to_check, compute the minimum distance from every candidate point.
+        # We assume each spline_segments[ul] is a list of polyline arrays.
+        D = np.empty((L, m))
+        for i, ul in enumerate(labels_to_check):
+            if i % update_interval == 0:
+                progress.setValue(i)
             if progress.wasCanceled():
-                break
-            global_idx = global_indices[idx]
-            if abs(self.labels[global_idx]-self.UNLABELED) < 2:
-                continue
-            pt = np.array([pts[idx, 0], pts[idx, 1]])
-            for ul in self.spline_segments:
-                if ul < assign_min or ul > assign_max:
+                return
+            d_vals = np.full(m, np.inf)
+            for polyline in self.spline_segments[ul]:
+                # Skip segments that are too short.
+                if polyline.shape[0] < 2:
                     continue
-                d_self = np.min([vectorized_point_to_polyline_distance(pt, seg) for seg in self.spline_segments[ul]])
-                d_minus = np.inf
-                if (ul - 1) in self.spline_segments:
-                    d_minus = np.min([vectorized_point_to_polyline_distance(pt, seg) for seg in self.spline_segments[ul - 1]])
-                d_plus = np.inf
-                if (ul + 1) in self.spline_segments:
-                    d_plus = np.min([vectorized_point_to_polyline_distance(pt, seg) for seg in self.spline_segments[ul + 1]])
-                if d_self < thresh and d_self < d_minus and d_self < d_plus:
-                    self.labels[global_idx] = ul
-                    self.group[global_idx] = 0 # Use GT group when assigning line labels
-                    assign_count += 1
-                    break
+                # Build an array of segments from the polyline.
+                segs = np.stack([polyline[:-1], polyline[1:]], axis=1)  # shape (n_seg, 2, 2)
+                d_seg = point_to_segments_distance(candidate_pts, segs)
+                d_vals = np.minimum(d_vals, d_seg)
+            D[i, :] = d_vals
+
+        # Now determine for each candidate point whether the distance for a given label is below threshold
+        # and lower than the distances for its immediate neighbors.
+        cond = (D < thresh)
+        for k in range(L):
+            if k > 0:
+                cond[k, :] &= (D[k, :] < D[k - 1, :])
+            if k < L - 1:
+                cond[k, :] &= (D[k, :] < D[k + 1, :])
+
+        # For each candidate point, choose the first (lowest-index in sorted order) label that satisfies the condition.
+        assigned_idx = np.full(m, -1, dtype=int)
+        for k in range(L):
+            to_assign = (assigned_idx == -1) & cond[k, :]
+            assigned_idx[to_assign] = k
+
+        # Update the labels (and groups) for candidate points where an assignment was found.
+        assigned = assigned_idx != -1
+        for idx, k in zip(cand_globals[assigned], assigned_idx[assigned]):
+            # Get the label to assign.
+            self.labels[idx] = labels_to_check[k]
+            self.group[idx] = 0  # GT group
+            assert self.points[idx, 2] >= z_min_val and self.points[idx, 2] <= z_max_val, f"Point {idx} out of range: {self.points[idx, 2]} not in [{z_min_val}, {z_max_val}]"
+
+        assign_count = np.sum(assigned)
         progress.close()
+        self.recompute = True
         self.update_views()
-        print(f"Assigned line labels to {assign_count} points (threshold: {thresh}).")
+        print(f"Assigned all line labels to {assign_count} of {m} points (threshold: {thresh}).")
 
     def delete_range(self):
         self._split_range(make_group=False)
@@ -2076,40 +2158,45 @@ class PointCloudLabeler(QMainWindow):
         start_time = time.time()
         initial_z_center = self.z_center_spinbox.value()
         initial_thickness = self.z_thickness_spinbox.value() / self.scaleFactor
-        desired_thickness = 200.0
-        step = 100.0
+        desired_thickness = float(self.slab_thickness_spinbox.value())
+        step = desired_thickness / 2
 
-        def compute_current_slab():
+        def compute_current_slab(update_splines=False, extra_z_range=None):
             # Set the line thickness assignment to 3.
-            self.line_distance_threshold_spinbox.setValue(3)
+            # self.line_distance_threshold_spinbox.setValue(3)
             # Ensure z-range is enabled.
             original_z_range = self.use_z_range_checkbox.isChecked()
             self.use_z_range_checkbox.setChecked(True)
             original_disregard_label0 = self.disregard_label0_checkbox.isChecked()
             self.disregard_label0_checkbox.setChecked(False)
-            for _ in range(2):
-                # --- Run F*3 update via update_labels ---
+            for _ in range(1):
+                # --- Run F*5 update via update_labels ---
                 if hasattr(self, "solver_combo"):
                     prev_solver = self.solver_combo.currentText()
-                    self.solver_combo.setCurrentText("F*3")
-                self.update_labels()
-                # Clear splines and calculated labels.
-                self.clear_splines()
-                self.clear_calculated_labels()
-                # Update winding splines.
-                self.update_winding_splines()
-                # --- Run winding number update via update_labels ---
-                if hasattr(self, "solver_combo"):
-                    self.solver_combo.setCurrentText("Winding Number")
-                self.update_labels()
+                    self.solver_combo.setCurrentText("F*Slab")
+                self.update_labels(extra_z_range=extra_z_range)
+                # # --- Run F*2 update via update_labels ---
+                # if hasattr(self, "solver_combo"):
+                #     prev_solver = self.solver_combo.currentText()
+                #     self.solver_combo.setCurrentText("F*2")
+                # self.update_labels()
+                # # --- Run winding number update via update_labels ---
+                # if hasattr(self, "solver_combo"):
+                #     self.solver_combo.setCurrentText("Winding Number")
+                # self.update_labels()
                 # Restore the previous solver mode.
                 if hasattr(self, "solver_combo"):
                     self.solver_combo.setCurrentText(prev_solver)
+                if update_splines:
+                    # Clear splines and calculated labels.
+                    self.clear_splines()
+                    self.clear_calculated_labels()
+                    # Update winding splines.
+                    self.update_winding_splines()
+                    self.update_views()
                 # Assign line labels.
-                self.assign_line_labels()
-                # Clear splines and calculated labels again.
-                self.clear_splines()
-                self.clear_calculated_labels()
+                # self.assign_line_labels()
+                self.assign_line_labels_all()
             # Restore the original z-range checkbox state.
             self.use_z_range_checkbox.setChecked(original_z_range)
             self.disregard_label0_checkbox.setChecked(original_disregard_label0)
@@ -2117,40 +2204,48 @@ class PointCloudLabeler(QMainWindow):
             self.update_views()
 
         # Compute for the initial slab.
-        compute_current_slab()
+        compute_current_slab(update_splines=True)
         base_path = os.path.join("../experiments", self.default_experiment)
-        slab_filename = os.path.join(base_path, "slab_initial.txt")
+        slab_filename = os.path.join(base_path, "slabs", "slab_initial.txt")
+        #make dir
+        os.makedirs(os.path.dirname(slab_filename), exist_ok=True)
         self._save_labels_to_path(slab_filename)
 
         # If the current slab thickness is less than 200, set thickness to 200 and recompute.
-        if initial_thickness < desired_thickness:
-            self.z_thickness_spinbox.setValue(desired_thickness)
-            self.z_thickness_slider.setValue(int(desired_thickness * self.scaleFactor))
+        self.z_thickness_spinbox.setValue(desired_thickness)
+        self.z_thickness_slider.setValue(int(desired_thickness * self.scaleFactor))
+        if initial_thickness < desired_thickness/self.scaleFactor:
             self.update_views()
             compute_current_slab()
-            slab_filename = os.path.join(base_path, "slab_thickness200.txt")
+            slab_filename = os.path.join(base_path, "slabs", "slab_thickness_initial.txt")
             self._save_labels_to_path(slab_filename)
 
+        # adjust for initial computation steps
+        done_steps = max(0, np.floor(initial_thickness * self.scaleFactor / (2 * step)) - 1)
         # Iterate upward from the original z_center.
-        current_z_center = initial_z_center
-        while current_z_center + desired_thickness / 2 < self.z_max:
+        current_z_center = initial_z_center + done_steps * step
+        z_max = min(self.z_max, float(self.slabs_max_spinbox.value()))
+        z_min = max(self.z_min, float(self.slabs_min_spinbox.value()))
+        while current_z_center + desired_thickness / 2 < z_max:
+            extra_z_range = (current_z_center - desired_thickness / 2, current_z_center + desired_thickness / 2)
             current_z_center += step
             self.z_center_spinbox.setValue(current_z_center)
             self.z_center_slider.setValue(int(current_z_center * self.scaleFactor))
             self.update_views()
-            compute_current_slab()
-            slab_filename = os.path.join(base_path, f"slab_up_{int(current_z_center)}.txt")
+            compute_current_slab(extra_z_range=extra_z_range)
+            slab_filename = os.path.join(base_path, "slabs", f"slab_up_{int(current_z_center)}.txt")
             self._save_labels_to_path(slab_filename)
 
         # Iterate downward from the original z_center.
-        current_z_center = initial_z_center
-        while current_z_center - desired_thickness / 2 > self.z_min:
+        current_z_center = initial_z_center - done_steps * step
+        while current_z_center - desired_thickness / 2 > z_min:
+            extra_z_range = (current_z_center - desired_thickness / 2, current_z_center + desired_thickness / 2)
             current_z_center -= step
             self.z_center_spinbox.setValue(current_z_center)
             self.z_center_slider.setValue(int(current_z_center * self.scaleFactor))
             self.update_views()
-            compute_current_slab()
-            slab_filename = os.path.join(base_path, f"slab_down_{int(current_z_center)}.txt")
+            compute_current_slab(extra_z_range=extra_z_range)
+            slab_filename = os.path.join(base_path, "slabs", f"slab_down_{int(current_z_center)}.txt")
             self._save_labels_to_path(slab_filename)
 
         total_time = time.time() - start_time
@@ -2158,7 +2253,7 @@ class PointCloudLabeler(QMainWindow):
                                 f"Slab computation completed in {total_time:.2f} seconds.")
     
     # Example of using the solver interface when updating labels:
-    def update_labels(self):
+    def update_labels(self, extra_z_range=None):
         undeleted = self.solver.get_undeleted_indices()
         other_block_factor=float(self.solve_other_block_factor_spinbox.value())
         if self.solver is not None:
@@ -2215,6 +2310,9 @@ class PointCloudLabeler(QMainWindow):
                     mask = np.logical_and(mask, mask_non_teflon)
                     mask = np.logical_and(mask, mask_non_deleted)
                     mask = np.logical_and(mask, mask_not_first_index)
+                    if extra_z_range is not None:
+                        mask_z_range = np.logical_and(self.points[:, 2] >= extra_z_range[0], self.points[:, 2] <= extra_z_range[1])
+                        mask = np.logical_and(mask, mask_z_range)
                     first_valid = np.where(mask)[0]
                     if first_valid.size == 0:
                         print("No seed node found.")
@@ -2225,23 +2323,7 @@ class PointCloudLabeler(QMainWindow):
                         assert mask[first_valid[0]], f"Seed node {self.seed_node} at {first_valid[0]} is not valid"
                         first_valid = first_valid[0]
                     print(f"Seed node found at index {self.seed_node} at {first_valid}.")
-                    # # try to set a seed node. first labeled point found.
-                    # for i, label in tqdm(enumerate(self.labels), desc="Finding seed node"):
-                    #     if i == 0: # do not use "no-seed" index as seed node
-                    #         continue
-                    #     if self.group[i] != 0:
-                    #         continue
-                    #     if abs(self.labels[i] - self.teflon_label) < 2:
-                    #         continue
-                    #     if abs(label - self.UNLABELED) > 2:
-                    #         if deleted_mask_previous[i]:
-                    #             continue
-                    #         offset = np.logical_not(deleted_mask_previous[:i]).sum()
-                    #         self.seed_node = offset
-                    #         print(f"Found seed node at index {i} (offset {offset})")
-                    #         break
                 if self.seed_node is not None:
-                    pass
                     # self.solver.set_labeled_edges(self.seed_node)
                     self.solver.set_f_star(self.seed_node)
                 if selected_solver == "F*":
@@ -2263,6 +2345,12 @@ class PointCloudLabeler(QMainWindow):
                 elif selected_solver == "F*7":
                     self.solver.solve_f_star(num_iterations=int(3 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=False)
                     self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=360.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=False)
+                elif selected_solver == "F*Slab":
+                    self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()//2), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True, adjust_median=False)
+                    self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()//2), spring_constant=1.0, o=0.0, step_sigma=360.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True, adjust_median=False)
+                    self.solver.solve_f_star_with_labels(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, other_block_factor=0.5, lr=0.25, error_cutoff=-1.0, display=True)
+                    # self.solver.solve_f_star_with_labels(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, other_block_factor=other_block_factor, lr=0.05, error_cutoff=-1.0, display=True)
+                    # self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1, other_block_factor=15.0, side_fix_nr=-1, display=False)
 
                 if self.use_z_range_checkbox.isChecked() or self.use_fstar_range_checkbox.isChecked():
                     print(f"Resetting z-range, length: {len(undeleted)}")

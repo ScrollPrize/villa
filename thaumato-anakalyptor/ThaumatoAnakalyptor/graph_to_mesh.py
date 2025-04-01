@@ -305,6 +305,33 @@ class WalkToSheet():
             z_min = min(z_min, z)
             z_max = max(z_max, z)
         return min_winding_angle, max_winding_angle, z_min, z_max
+    
+    def build_points_graph(self, sheet_infos, z_range=None):
+        # Building the pointcloud 4D (position) + 3D (Normal) + 3D (Color, randomness) representation of the graph
+        points = []
+
+        for (block, patch_id, winding_angle) in tqdm(sheet_infos, desc="Building points"):
+            node_key = tuple([block[0], block[1], block[2], patch_id])
+            if node_key not in self.graph.nodes:
+                continue
+            # Get the node data
+            node_data = self.graph.nodes[node_key]
+            # Get the sample points from the node
+            sample_points = node_data['sample_points']
+            winding_angle_vector = np.full((len(sample_points), winding_angle))
+            points_ = np.concatenate((sample_points, winding_angle_vector), axis=1)
+            points.append(points_)
+
+        points = np.concatenate(points, axis=0)
+        # filter z range
+        if z_range is not None:
+            points = points[(points[:, 1] >= z_range[0]) & (points[:, 1] <= z_range[1])]
+
+        
+        # points to nested list of list
+        points = points.tolist()
+
+        return pointcloud_processing.process_pointclouds(points=points, nodes=sheet_infos, path=self.path, start_z=z_range[0], end_z=z_range[1], single_threaded=False, verbose=True)
 
     def build_points(self, z_range=None, single_threaded_pc_load=False):
         # Building the pointcloud 4D (position) + 3D (Normal) + 3D (Color, randomness) representation of the graph
@@ -324,7 +351,11 @@ class WalkToSheet():
             sheet_infos.append(patch_sheet_patch_info)
         time_start = time.time()
         # print(sheet_infos)
-        points, normals, colors = pointcloud_processing.load_pointclouds(nodes=sheet_infos, path=self.path, start_z=z_range[0], end_z=z_range[1], single_threaded=single_threaded_pc_load, verbose=True)
+        if self.path.endswith(".pkl"):
+            # use sample_points from nodes in python graph pkl
+            points, normals, colors = self.build_points_graph(sheet_infos)
+        else:
+            points, normals, colors = pointcloud_processing.load_pointclouds(nodes=sheet_infos, path=self.path, start_z=z_range[0], end_z=z_range[1], single_threaded=single_threaded_pc_load, verbose=True)
         print(f"Time to load pointclouds: {time.time() - time_start}")
         print(f"Shape of patch_points: {np.array(points).shape}")
 
@@ -1820,7 +1851,7 @@ if __name__ == '__main__':
     start_point = [3164, 3476, 3472]
     import argparse
     parser = argparse.ArgumentParser(description='Unroll a graph to a sheet')
-    parser.add_argument('--path', type=str, help='Path to the instances. If type is H5, please input the path without the ".h5" suffix.', required=True)
+    parser.add_argument('--path', type=str, help='Path to the instances. If type is H5, please input the path without the ".h5" suffix. When using python graph.pkl put suffix ".pkl".', required=True)
     parser.add_argument('--graph', type=str, help='Path to the graph file from --Path', required=True)
     parser.add_argument('--fragment', action='store_true', help='Meshing Fragment, each layer as separate mesh')
     parser.add_argument('--debug', action='store_true', help='Debug mode')

@@ -4661,7 +4661,7 @@ int fix_winding_nodes(std::vector<Node>& graph, int nr_nodes, int seed_node_old)
     }
 }
 
-std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float o, float spring_constant, float step_sigma, int teflon_winding_nr, bool visualize) {
+std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float o, float spring_constant, float step_sigma, int teflon_winding_nr, bool visualize, bool adjust_median) {
     std::vector<Node> graph_copy = graph;
     if (i_round < 0) {
         o = o * 0.25f;
@@ -4729,9 +4729,11 @@ std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations
                 plot_nodes(graph_copy, filename_plot.str());
             }
 
-            // median_f_star
-            auto [median1, median2] = min_max_percentile_f_star(graph_copy, 0.5f);
-            median_f_star = median1;
+            if (adjust_median) {
+                // median_f_star
+                auto [median1, median2] = min_max_percentile_f_star(graph_copy, 0.5f);
+                median_f_star = median1;
+            }
             
             // free old host memory
             if (h_all_edges_ != nullptr) {
