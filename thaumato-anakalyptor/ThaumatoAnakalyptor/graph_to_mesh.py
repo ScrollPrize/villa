@@ -318,7 +318,7 @@ class WalkToSheet():
             node_data = self.graph.nodes[node_key]
             # Get the sample points from the node
             sample_points = node_data['sample_points']
-            winding_angle_vector = np.full((len(sample_points), winding_angle))
+            winding_angle_vector = np.full(len(sample_points), winding_angle)
             points_ = np.concatenate((sample_points, winding_angle_vector), axis=1)
             points.append(points_)
 
