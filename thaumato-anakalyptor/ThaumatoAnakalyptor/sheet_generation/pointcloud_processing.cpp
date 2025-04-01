@@ -657,6 +657,22 @@ public:
         }
     }
 
+    void set_points(std::vector<std::vector<float>> points) {
+        cloud_.pts.clear();
+        cloud_.pts.reserve(points.size());
+        for (const auto& point : points) {
+            if (point.size() == 4) {
+                cloud_.addPoint(Point(point[0], point[1], point[2], point[3], 0, 0, 1, 0, 0, 0, false));
+            }
+            else if (point.size() == 7) {
+                cloud_.addPoint(Point(point[0], point[1], point[2], point[3], point[4], point[5], point[6], 0, 0, 0, false));
+            }
+            else if (point.size() == 10) {
+                cloud_.addPoint(Point(point[0], point[1], point[2], point[3], point[4], point[5], point[6], static_cast<unsigned char>(point[7]), static_cast<unsigned char>(point[8]), static_cast<unsigned char>(point[9]), false));
+            }
+        }
+    }
+
     void free_memory() {
         cloud_.pts.clear();
         cloud_.pts.shrink_to_fit();
@@ -980,6 +996,33 @@ py::array_t<bool> vector_to_array(std::vector<bool> selected_originals) {
 std::tuple<py::array_t<float>, py::array_t<float>, py::array_t<float>> load_pointclouds(const std::vector<std::tuple<std::vector<int>, int, double>>& nodes, const std::string& path, const int start_z, const int end_z, bool single_threaded = false, bool verbose = true) {
     PointCloudLoader processor(nodes, path, start_z, end_z, verbose);
     processor.load_all(single_threaded);
+    processor.sortPointsXYZW();
+    if (verbose) {
+        std::cout << "Sorted points by XYZW" << std::endl;
+    }
+    processor.processDuplicates();
+    if (verbose) {
+        std::cout << "Processed duplicates" << std::endl;
+    }
+    processor.deleteMarkedPoints();
+    if (verbose) {
+        std::cout << "Deleted marked points" << std::endl;
+    }
+    processor.filterPointsUsingKDTree(2.0, 90.0);
+    if (verbose) {
+        std::cout << "Filtered points using KDTree" << std::endl;
+    }
+    processor.sortPointsWZYX();
+    if (verbose) {
+        std::cout << "Sorted points by WZYX" << std::endl;
+    }
+    PointCloud processed_points = std::move(processor.get_results());
+    return to_array(std::move(processed_points));
+}
+
+std::tuple<py::array_t<float>, py::array_t<float>, py::array_t<float>> process_pointclouds(std::vector<std::vector<float>> points, const std::vector<std::tuple<std::vector<int>, int, double>>& nodes, const std::string& path, const int start_z, const int end_z, bool single_threaded = false, bool verbose = true) {
+    PointCloudLoader processor(nodes, path, start_z, end_z, verbose);
+    processor.set_points(points);
     processor.sortPointsXYZW();
     if (verbose) {
         std::cout << "Sorted points by XYZW" << std::endl;
@@ -2481,6 +2524,16 @@ PYBIND11_MODULE(pointcloud_processing, m) {
 
     m.def("load_pointclouds", &load_pointclouds, 
         "Function to load point clouds and return points, normals, and colors.",
+        py::arg("nodes"),
+        py::arg("path"),
+        py::arg("start_z"),
+        py::arg("end_z"),
+        py::arg("single_threaded") = false,
+        py::arg("verbose") = true);
+
+    m.def("process_pointclouds", &process_pointclouds, 
+        "Function to process point clouds and return points, normals, and colors.",
+        py::arg("points"),
         py::arg("nodes"),
         py::arg("path"),
         py::arg("start_z"),

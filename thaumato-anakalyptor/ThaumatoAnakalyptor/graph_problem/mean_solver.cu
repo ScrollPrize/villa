@@ -126,7 +126,7 @@ inline __global__ void update_nodes_kernel_f_star_step(Node* d_graph, size_t* d_
     node.f_star += node.f_star_momentum;
 
     // Clip f_star to the allowed range [ - 4 * 360 * estimated_windings, 4 * 360 * estimated_windings ]
-    float winding_max = 4 * 360 * estimated_windings;
+    float winding_max = 2.0f * 360 * estimated_windings;
     node.f_star = fmaxf(-winding_max, fminf(winding_max, node.f_star));
 
     // Update global compression/decompression sums
@@ -139,7 +139,7 @@ inline __global__ void update_nodes_kernel_f_star_step(Node* d_graph, size_t* d_
 }
 
 // Kernel to update f_star solver fields on the GPU
-inline __global__ void update_f_star_kernel_step(Node* d_graph, size_t* d_valid_indices, int num_valid_nodes, float scale_compression) {
+inline __global__ void update_f_star_labels_kernel_step(Node* d_graph, size_t* d_valid_indices, int num_valid_nodes) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_valid_nodes) return;
     
@@ -152,7 +152,7 @@ inline __global__ void update_f_star_kernel_step(Node* d_graph, size_t* d_valid_
     }
     else {
         // Update f_tilde with the computed f_star
-        node.f_tilde = node.f_star * scale_compression;
+        node.f_tilde = node.f_star;
     }
     // Update f_tilde with the computed f_star
     // node.f_tilde = node.f_star * scale_compression;
@@ -567,7 +567,7 @@ std::vector<Node> run_solver_f_star_with_labels(std::vector<Node>& graph, int nu
 
     std::cout << "Copied data to GPU" << std::endl;
     
-    std::cout << "Solving on GPU... learning ratre: " << lr << " error cutoff: " << error_cutoff << std::endl;
+    std::cout << "Solving on GPU... learning rate: " << lr << " error cutoff: " << error_cutoff << std::endl;
     // CUDA kernel configuration
     int threadsPerBlock = 256;
     int blocksPerGrid = (num_valid_nodes + threadsPerBlock - 1) / threadsPerBlock;
@@ -598,7 +598,7 @@ std::vector<Node> run_solver_f_star_with_labels(std::vector<Node>& graph, int nu
         cudaDeviceSynchronize(); // Check for errors during kernel execution
         
         // Launch the kernel to update f_tilde with f_star
-        update_f_star_kernel_step<<<blocksPerGrid, threadsPerBlock>>>(d_graph, d_valid_indices, num_valid_nodes, scale_compression);
+        update_f_star_labels_kernel_step<<<blocksPerGrid, threadsPerBlock>>>(d_graph, d_valid_indices, num_valid_nodes);
         
         err = cudaGetLastError();
         if (err != cudaSuccess) {
