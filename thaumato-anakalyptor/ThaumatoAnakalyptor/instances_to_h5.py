@@ -207,13 +207,13 @@ def main():
                         help="Directory containing instance archives (7z or tar files).")
     parser.add_argument("--output_h5", type=str, required=True,
                         help="Path for the output HDF5 file.")
-    parser.add_argument("--compression", type=str, default="lzf",
+    parser.add_argument("--compression", type=str, default="gzip",
                         help="Compression algorithm to use for HDF5 datasets (e.g., 'lzf', 'gzip').")
     parser.add_argument("--group_prefix", type=str, default="",
                         help="Optional prefix for group names in the HDF5 file.")
     parser.add_argument("--threads", type=int, default=1,
                         help="Number of threads (processes) to use. If >1, partial HDF5 files are created and merged on the fly.")
-    parser.add_argument("--compression_level", type=int, default=4,
+    parser.add_argument("--compression_level", type=int, default=7,
                         help="Compression level (0-9, only for gzip, where 0 is no compression and 9 is max compression).")
     parser.add_argument("--verbose", action="store_true",
                         help="Print more detailed information during processing.")
