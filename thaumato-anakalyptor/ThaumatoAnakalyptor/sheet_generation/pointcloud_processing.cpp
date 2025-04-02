@@ -1466,7 +1466,7 @@ public:
                 // float h = r * std::sin(diff * M_PI / 180.0f);
                 // float metric = std::abs(h); // Use absolute distance to the target angle as the metric.
                 
-                float distance = distanceToProjectionUsingHessian(sorted_points[i], angle_vector);
+                float distance = std::abs(distanceToProjectionUsingHessian(sorted_points[i], angle_vector));
                 
                 // Accept candidate only if its z difference from the bin center is within max_distance.
                 float zDiff = std::fabs(point_z - zPositions[bin_index]);

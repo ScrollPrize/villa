@@ -1691,7 +1691,7 @@ class WalkToSheet():
     def load_pointcloud_to_raw_ordered_pointset(self, debug=False, continue_from=0, z_range=None, angle_step=1, z_spacing=10, max_z_step_size=250, single_threaded_pc_load=False):
         # retrieve min max approximate winding angles
         approx_min_angle, approx_max_angle, approx_min_z, approx_max_z = self.find_minmax_winding_angle_z_range()
-        print(f"Approximate min and max winding angles: {approx_min_angle}, {approx_max_angle} with z range: {approx_min_z}, {approx_max_z}")
+        print(f"Approximate min and max winding angles: {approx_min_angle}, {approx_max_angle} with z range: {approx_min_z}, {approx_max_z}. This represents {(approx_max_angle - approx_min_angle) / 360} windings.")
         # adjust to desired z range
         if z_range is not None:
             approx_min_z = max(approx_min_z, z_range[0])
@@ -1700,7 +1700,7 @@ class WalkToSheet():
         approx_max_angle += 360.0
         approx_min_z -= 50
         approx_max_z += 50
-        print(f"Approximate min and max winding angles: {approx_min_angle}, {approx_max_angle} with z range: {approx_min_z}, {approx_max_z}")
+        print(f"[After alignment]: Approximate min and max winding angles: {approx_min_angle}, {approx_max_angle} with z range: {approx_min_z}, {approx_max_z}. This represents {(approx_max_angle - approx_min_angle) / 360} windings.")
 
         # loop over build + ordered pointset creation for each z range step (with overlap in loaded pointclouds)
         z_step = 50 * z_spacing

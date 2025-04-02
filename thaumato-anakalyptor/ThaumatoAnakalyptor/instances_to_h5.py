@@ -64,7 +64,7 @@ def extract_archive(archive_path, extract_dir):
     else:
         raise ValueError(f"Unsupported archive format for {archive_path}")
 
-def process_instance_archive(archive_path, h5_file, group_prefix="", compression="lzf", compression_level=4):
+def process_instance_archive(archive_path, h5_file, group_prefix="", compression="lzf", compression_level=4, verbose=False):
     """
     Extracts an instance archive, reads its PLY and metadata files, and writes them into the HDF5 file.
     
@@ -95,7 +95,8 @@ def process_instance_archive(archive_path, h5_file, group_prefix="", compression
                     ply_files.append(os.path.join(root, file))
                     
         if not ply_files:
-            print(f"[WARNING] No .ply files found in archive {archive_path}.")
+            if verbose:
+                print(f"[WARNING] No .ply files found in archive {archive_path}.")
             return extraction_duration, group_creation_duration
 
         t1 = time.perf_counter()
@@ -151,7 +152,7 @@ def process_instance_archive(archive_path, h5_file, group_prefix="", compression
     finally:
         shutil.rmtree(temp_dir)
 
-def process_archives_chunk(archives, partial_h5_filename, group_prefix, compression, compression_level=4):
+def process_archives_chunk(archives, partial_h5_filename, group_prefix, compression, compression_level=4, verbose=False):
     """
     Processes a list of archives and writes the results into a partial HDF5 file.
     
@@ -161,7 +162,7 @@ def process_archives_chunk(archives, partial_h5_filename, group_prefix, compress
     total_group_time = 0.0
     with h5py.File(partial_h5_filename, "w") as h5_file:
         for archive in archives:
-            extr_time, grp_time = process_instance_archive(archive, h5_file, group_prefix, compression, compression_level=compression_level)
+            extr_time, grp_time = process_instance_archive(archive, h5_file, group_prefix, compression, compression_level=compression_level, verbose=verbose)
             total_extraction_time += extr_time
             total_group_time += grp_time
     return total_extraction_time, total_group_time, len(archives)
@@ -254,7 +255,7 @@ def main():
         total_group_time = 0.0
         with h5py.File(args.output_h5, "w") as h5_file:
             for archive in tqdm(archives, desc="Processing archives"):
-                extr_time, grp_time = process_instance_archive(archive, h5_file, args.group_prefix, args.compression, args.compression_level)
+                extr_time, grp_time = process_instance_archive(archive, h5_file, args.group_prefix, args.compression, args.compression_level, verbose=args.verbose)
                 total_extraction_time += extr_time
                 total_group_time += grp_time
                 if args.verbose:
@@ -287,7 +288,7 @@ def main():
             for i, chunk in enumerate(archive_chunks):
                 partial_filename = os.path.join(partials_dir, f"{os.path.basename(args.output_h5)}.part{i}")
                 future = executor.submit(process_archives_chunk, chunk, partial_filename,
-                                           args.group_prefix, args.compression, args.compression_level)
+                                           args.group_prefix, args.compression, args.compression_level, args.verbose)
                 future_to_pf[future] = partial_filename
 
             pbar = tqdm(total=len(archives), desc="Processing archives")
