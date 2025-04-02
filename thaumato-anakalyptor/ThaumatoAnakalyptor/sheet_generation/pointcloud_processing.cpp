@@ -1402,6 +1402,10 @@ public:
         for (int step = 0; step < numSteps; ++step) {
             float targetAngle = minWind + step * angleStep;
             float vectorAngle = minWind + (step % angleSteps) * angleStep;
+            // Compute the 3D angle vector for the target angle.
+            float rad_vectorAngle = (vectorAngle - 90.0f) * M_PI / 180.0f; // for some reason, needs offset
+            std::vector<float> angle_vector = { std::cos(rad_vectorAngle), 0.0f, -std::sin(rad_vectorAngle) };
+            
             // Use a ±10° window.
             float windowLow = targetAngle - 10.0f;
             float windowHigh = targetAngle + 10.0f;
@@ -1431,10 +1435,10 @@ public:
             // Create candidate bins (one vector per z bin).
             // Each candidate is a pair: (angular metric, index into sorted_points).
             std::vector<std::vector<std::pair<float, size_t>>> bin_candidates(zPositions.size());
-            std::vector<std::vector<float>> bin_umbilicus_points(zPositions.size());
-            for (size_t i = 0; i < zPositions.size(); ++i) {
-                bin_umbilicus_points[i] = umbilicus_xz_at_y(umbilicus_points, zPositions[i]);
-            }
+            // std::vector<std::vector<float>> bin_umbilicus_points(zPositions.size());
+            // for (size_t i = 0; i < zPositions.size(); ++i) {
+            //     bin_umbilicus_points[i] = umbilicus_xz_at_y(umbilicus_points, zPositions[i]);
+            // }
 
             for (size_t i = windowStart; i < windowEnd; ++i) {
                 // Get the point's vertical coordinate (assumed at index 1).
@@ -1455,15 +1459,18 @@ public:
                     std::cout << "Something is wrong with the sorted points winding angle!!!!" << std::endl;
                 }
                 // Calculate distance from target angle. sind dif * radius point
-                std::vector<float> umb_approximation = bin_umbilicus_points[bin_index];
-                float dx = sorted_points[i][0] - umb_approximation[0];
-                float dz = sorted_points[i][2] - umb_approximation[2];
-                float r = std::sqrt(dx * dx + dz * dz);
-                float h = r * std::sin(diff * M_PI / 180.0f);
-                float metric = std::abs(h); // Use absolute distance to the target angle as the metric.
+                // std::vector<float> umb_approximation = bin_umbilicus_points[bin_index];
+                // float dx = sorted_points[i][0] - umb_approximation[0];
+                // float dz = sorted_points[i][2] - umb_approximation[2];
+                // float r = std::sqrt(dx * dx + dz * dz);
+                // float h = r * std::sin(diff * M_PI / 180.0f);
+                // float metric = std::abs(h); // Use absolute distance to the target angle as the metric.
+                
+                float distance = distanceToProjectionUsingHessian(sorted_points[i], angle_vector);
                 
                 // Accept candidate only if its z difference from the bin center is within max_distance.
                 float zDiff = std::fabs(point_z - zPositions[bin_index]);
+                // float metric = std::sqrt(h * h + zDiff * zDiff); // Use euclidean distance to the target angle as the metric.
                 if (zDiff > max_distance) {
                     std::cout << "Something is wrong with the sorted points!!!!" << std::endl;
                     continue;
@@ -1472,7 +1479,7 @@ public:
                 for (int z_index = 0; z_index < zPositions.size(); ++z_index) {
                     float zDiff = std::fabs(point_z - zPositions[z_index]);
                     if (zDiff < max_distance) {
-                        bin_candidates[z_index].push_back({metric, i});
+                        bin_candidates[z_index].push_back({distance, i});
                     }
                 }
             }
@@ -1546,13 +1553,6 @@ public:
                     ordered_normals[bin].push_back(sorted_normals[idx]);
                 }
             }
-
-            // for some reason, needs offset
-            vectorAngle -= 90.0f;
-            // Compute the 3D angle vector for the target angle.
-            float rad = vectorAngle * M_PI / 180.0f;
-            
-            std::vector<float> angle_vector = { std::cos(rad), 0.0f, -std::sin(rad) };
 
             // Store the result for this angle step.
             // results.push_back(std::make_tuple(ordered_ts, ordered_normals, ordered_umbilicus_points, angle_vector));
