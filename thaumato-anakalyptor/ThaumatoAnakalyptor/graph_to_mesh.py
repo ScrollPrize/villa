@@ -318,7 +318,7 @@ class WalkToSheet():
             node_data = self.graph.nodes[node_key]
             # Get the sample points from the node
             sample_points = node_data['sample_points']
-            winding_angle_vector = np.full(len(sample_points), winding_angle)
+            winding_angle_vector = np.full((len(sample_points), 1), winding_angle)
             points_ = np.concatenate((sample_points, winding_angle_vector), axis=1)
             points.append(points_)
 
@@ -353,7 +353,7 @@ class WalkToSheet():
         # print(sheet_infos)
         if self.path.endswith(".pkl"):
             # use sample_points from nodes in python graph pkl
-            points, normals, colors = self.build_points_graph(sheet_infos)
+            points, normals, colors = self.build_points_graph(sheet_infos, z_range=z_range)
         else:
             points, normals, colors = pointcloud_processing.load_pointclouds(nodes=sheet_infos, path=self.path, start_z=z_range[0], end_z=z_range[1], single_threaded=single_threaded_pc_load, verbose=True)
         print(f"Time to load pointclouds: {time.time() - time_start}")
@@ -434,9 +434,31 @@ class WalkToSheet():
         return res    
     
     def find_inner_outermost_winding_direction(self, t_means, angle_vector):
+        star_valid_outermost = None
+        end_valid_innermost = None
+        for i in range(len(t_means)):
+            for u in range(len(t_means[i])):
+                if t_means[i][u] is not None:
+                        star_valid_outermost = i
+                        break
+            if star_valid_outermost is not None:
+                break
+        for i in range(len(t_means)-1, -1, -1):
+            for u in range(len(t_means[i])):
+                if t_means[i][u] is not None:
+                        end_valid_innermost = i
+                        break
+            if end_valid_innermost is not None:
+                break
+
+        if star_valid_outermost is None or end_valid_innermost is None:
+            print("[ERROR (find_inner_outermost_winding_direction)]: No t values found.")
+        if star_valid_outermost == end_valid_innermost:
+            print("[ERROR (find_inner_outermost_winding_direction)]: Only one entry t values found.")
+
         # Split t_means into outermost and innermost half
-        t_means_outermost_half = t_means[:len(t_means)//2]
-        t_means_innermost_half = t_means[len(t_means)//2:]
+        t_means_outermost_half = t_means[star_valid_outermost: (star_valid_outermost + end_valid_innermost) // 2]
+        t_means_innermost_half = t_means[(star_valid_outermost + end_valid_innermost) // 2: end_valid_innermost]
 
         # Compute mean ts value of furthest out t values
         mean_outermost_half = 0.0
@@ -446,6 +468,9 @@ class WalkToSheet():
                 if t_means_outermost_half[i][u] is not None:
                     mean_outermost_half += t_means_outermost_half[i][u]
                     count_outermost += 1
+        if count_outermost == 0:
+            print("[ERROR (find_inner_outermost_winding_direction)]: No t values found.")
+            count_outermost += 1
         mean_outermost_half /= count_outermost
 
         # Compute mean ts value of innermost t values
@@ -492,7 +517,7 @@ class WalkToSheet():
         
         # get mean values
         if count == 0:
-            print("[ERROR (find_inner_outermost_winding_direction)]: No t values found.")
+            print("[ERROR (find_inner_outermost_winding_direction)]: No t values found at all.")
             count += 1
             mean_outermost_ts = 1
         mean_innermost_ts /= count
