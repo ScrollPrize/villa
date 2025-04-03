@@ -4668,6 +4668,7 @@ std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations
     }
     float o_current = o;
     std::cout << "Visualize: " << visualize << std::endl;
+    std::cout << "Adjust median: " << adjust_median << std::endl;
     // Allocate space for min and max f_star values on the GPU
     size_t num_nodes = graph.size();
     size_t num_valid_nodes = valid_indices.size();
