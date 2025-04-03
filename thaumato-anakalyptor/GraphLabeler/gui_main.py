@@ -242,7 +242,7 @@ class PointCloudLabeler(QMainWindow):
         top_controls_layout = QHBoxLayout()
 
         self.update_labels_button = QPushButton("Update Labels")
-        self.update_labels_button.clicked.connect(self.update_labels)
+        self.update_labels_button.clicked.connect(lambda: self.update_labels())
         top_controls_layout.addWidget(self.update_labels_button)
 
         # --- Solver selection dropdown ---
@@ -2311,6 +2311,7 @@ class PointCloudLabeler(QMainWindow):
                     mask = np.logical_and(mask, mask_non_deleted)
                     mask = np.logical_and(mask, mask_not_first_index)
                     if extra_z_range is not None:
+                        print(f"Using extra z-range: {extra_z_range}")
                         mask_z_range = np.logical_and(self.points[:, 2] >= extra_z_range[0], self.points[:, 2] <= extra_z_range[1])
                         mask = np.logical_and(mask, mask_z_range)
                     first_valid = np.where(mask)[0]

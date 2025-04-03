@@ -305,7 +305,7 @@ def main(graph_path="graph_scroll5_january_unrolling_full_v2.bin", experiment_na
     # fresh_start_star = 0 # continue solve computation from fresh_start
     i_round = run_f_star(solver, experiment_name, continue_from=fresh_start_star, visualize=visualize)
     # i_round = run_f_star_lr(solver, experiment_name, continue_from=fresh_start_star, visualize=visualize)
-    solver.filter_f_star() # filter the graph based on f_star solution
+    # solver.filter_f_star() # filter the graph based on f_star solution
     solver.generate_ply(f"experiments/{experiment_name}/solved_f_star.ply")
 
     # #  f* was on complete scroll, take subset for sides now to debug

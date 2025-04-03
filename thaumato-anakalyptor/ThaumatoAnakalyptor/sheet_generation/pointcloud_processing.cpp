@@ -1404,7 +1404,7 @@ public:
             float vectorAngle = minWind + (step % angleSteps) * angleStep;
             // Compute the 3D angle vector for the target angle.
             float rad_vectorAngle = (vectorAngle - 90.0f) * M_PI / 180.0f; // for some reason, needs offset
-            std::vector<float> angle_vector = { std::cos(rad_vectorAngle), 0.0f, -std::sin(rad_vectorAngle) };
+            std::vector<float> angle_vector = { std::cos(static_cast<float>(rad_vectorAngle)), 0.0f, -std::sin(static_cast<float>(rad_vectorAngle)) };
             
             // Use a ±10° window.
             float windowLow = targetAngle - 10.0f;
@@ -1435,10 +1435,10 @@ public:
             // Create candidate bins (one vector per z bin).
             // Each candidate is a pair: (angular metric, index into sorted_points).
             std::vector<std::vector<std::pair<float, size_t>>> bin_candidates(zPositions.size());
-            // std::vector<std::vector<float>> bin_umbilicus_points(zPositions.size());
-            // for (size_t i = 0; i < zPositions.size(); ++i) {
-            //     bin_umbilicus_points[i] = umbilicus_xz_at_y(umbilicus_points, zPositions[i]);
-            // }
+            std::vector<std::vector<float>> bin_umbilicus_points(zPositions.size());
+            for (size_t i = 0; i < zPositions.size(); ++i) {
+                bin_umbilicus_points[i] = umbilicus_xz_at_y(umbilicus_points, zPositions[i]);
+            }
 
             for (size_t i = windowStart; i < windowEnd; ++i) {
                 // Get the point's vertical coordinate (assumed at index 1).
@@ -1459,14 +1459,12 @@ public:
                     std::cout << "Something is wrong with the sorted points winding angle!!!!" << std::endl;
                 }
                 // Calculate distance from target angle. sind dif * radius point
-                // std::vector<float> umb_approximation = bin_umbilicus_points[bin_index];
                 // float dx = sorted_points[i][0] - umb_approximation[0];
                 // float dz = sorted_points[i][2] - umb_approximation[2];
                 // float r = std::sqrt(dx * dx + dz * dz);
                 // float h = r * std::sin(diff * M_PI / 180.0f);
                 // float metric = std::abs(h); // Use absolute distance to the target angle as the metric.
                 
-                float distance = std::abs(distanceToProjectionUsingHessian(sorted_points[i], angle_vector));
                 
                 // Accept candidate only if its z difference from the bin center is within max_distance.
                 float zDiff = std::fabs(point_z - zPositions[bin_index]);
@@ -1479,6 +1477,8 @@ public:
                 for (int z_index = 0; z_index < zPositions.size(); ++z_index) {
                     float zDiff = std::fabs(point_z - zPositions[z_index]);
                     if (zDiff < max_distance) {
+                        std::vector<float> umb_approximation = bin_umbilicus_points[z_index];
+                        float distance = distancePointToLine(sorted_points[i], umb_approximation, angle_vector);
                         bin_candidates[z_index].push_back({distance, i});
                     }
                 }
@@ -1979,6 +1979,45 @@ private:
 
         return distance;
     }
+
+    float distancePointToLine(const std::vector<float>& point, 
+                const std::vector<float>& linePoint, 
+                const std::vector<float>& lineDirection) {
+        // Check that the vectors have at least 3 dimensions.
+        if (point.size() < 3 || linePoint.size() < 3 || lineDirection.size() < 3) {
+        throw std::invalid_argument("All input vectors must have at least 3 dimensions.");
+        }
+
+        float dot = 0.0f;         // Dot product of (point - linePoint) and lineDirection
+        float normDiffSq = 0.0f;    // Squared norm of (point - linePoint)
+        float normDirSq = 0.0f;     // Squared norm of lineDirection
+
+        // Only consider the first 3 dimensions.
+        for (size_t i = 0; i < 3; ++i) {
+        float diff = point[i] - linePoint[i];
+        normDiffSq += diff * diff;
+        normDirSq += lineDirection[i] * lineDirection[i];
+        dot += diff * lineDirection[i];
+        }
+
+        if (normDirSq == 0.0f) {
+        throw std::invalid_argument("The line direction vector must be non-zero in the first 3 dimensions.");
+        }
+
+        // Calculate squared projection length of (point - linePoint) on the direction vector.
+        float projSq = (dot * dot) / normDirSq;
+
+        // Compute the squared distance from the point to the line.
+        float distSq = normDiffSq - projSq;
+
+        // Protect against small negative numbers due to floating point inaccuracies.
+        if (distSq < 0) {
+        distSq = 0;
+        }
+
+        // Return the absolute distance.
+        return std::sqrt(distSq);
+        }
 
 };
 

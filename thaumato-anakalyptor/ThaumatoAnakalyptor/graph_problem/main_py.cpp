@@ -498,16 +498,10 @@ class Solver {
             // store only the valid indices to speed up the loop
             auto [undeleted_mask, count_undeleted] = get_undeleted_mask();
             std::vector<Node> subgraph = graph;
-            bool create_subgraph = 1.0f * count_undeleted / graph.size() < 0.5f;
-            if (create_subgraph) {
-                std::cout << "Creating subgraph" << std::endl;
-                subgraph = createSubgraph(graph, undeleted_mask);
-            }
+            subgraph = createSubgraph(graph, undeleted_mask);
             std::vector<size_t> valid_indices = get_valid_indices(subgraph);
             run_solver_f_star(subgraph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, o_, spring_constant, step_sigma, teflon_winding_nr, visualize, adjust_median);
-            if (create_subgraph) {
-                updateGraphWithSubgraph(graph, undeleted_mask, subgraph);
-            }
+            updateGraphWithSubgraph(graph, undeleted_mask, subgraph);
         }
         void solve_f_star_with_labels(int num_iterations, float spring_constant, float other_block_factor = 1.0f, float lr = 10.0f, float error_cutoff = -1.0f, bool display = false) {
             // use the f_star solver for the intermediate solution
@@ -515,15 +509,10 @@ class Solver {
             auto [undeleted_mask, count_undeleted] = get_undeleted_mask();
             std::vector<Node> subgraph = graph;
             bool create_subgraph = 1.0f * count_undeleted / graph.size() < 0.5f;
-            if (create_subgraph) {
-                std::cout << "Creating subgraph" << std::endl;
-                subgraph = createSubgraph(graph, undeleted_mask);
-            }
+            subgraph = createSubgraph(graph, undeleted_mask);
             std::vector<size_t> valid_indices = get_valid_indices(subgraph);
             run_solver_f_star_with_labels(subgraph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, spring_constant, other_block_factor, lr, error_cutoff, display);
-            if (create_subgraph) {
-                updateGraphWithSubgraph(graph, undeleted_mask, subgraph);
-            }
+            updateGraphWithSubgraph(graph, undeleted_mask, subgraph);
         }
         
         void filter_f_star() {
