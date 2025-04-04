@@ -36,6 +36,11 @@ namespace fs = std::filesystem;
 namespace py = pybind11;
 namespace nf = nanoflann;
 
+bool pathExists(hid_t id, const std::string& path)
+{
+  return H5Lexists( id, path.c_str(), H5P_DEFAULT ) > 0;
+}
+
 struct Point {
     float x, y, z, w;   // Coordinates and winding angle
     float nx, ny, nz;   // Normal vector components
@@ -305,16 +310,9 @@ public:
     
                 // --- Read the "normals" dataset ---
                 std::vector<double> normals_data;
-                hid_t normals_dset = H5Dopen2(surface_group_id, "normals", H5P_DEFAULT);
-                if (normals_dset < 0) {
-                    // Normals dataset is missing: use dummy normals (1, 0, 0) for every point.
-                    normals_data.resize(num_points * 3);
-                    for (size_t i = 0; i < num_points; ++i) {
-                        normals_data[i * 3 + 0] = 1.0;
-                        normals_data[i * 3 + 1] = 0.0;
-                        normals_data[i * 3 + 2] = 0.0;
-                    }
-                } else {
+                bool exist_normal = pathExists(surface_group_id, "normals");
+                if (exist_normal) {
+                    hid_t normals_dset = H5Dopen2(surface_group_id, "normals", H5P_DEFAULT);
                     hid_t normals_space = H5Dget_space(normals_dset);
                     int ndims_normals = H5Sget_simple_extent_ndims(normals_space);
                     hsize_t dims_normals[2];
@@ -329,6 +327,15 @@ public:
                     }
                     H5Sclose(normals_space);
                     H5Dclose(normals_dset);
+                }
+                else  {
+                    // Normals dataset is missing: use dummy normals (1, 0, 0) for every point.
+                    normals_data.resize(num_points * 3);
+                    for (size_t i = 0; i < num_points; ++i) {
+                        normals_data[i * 3 + 0] = 1.0;
+                        normals_data[i * 3 + 1] = 0.0;
+                        normals_data[i * 3 + 2] = 0.0;
+                    }
                 }
     
                 // --- Read the "colors" dataset ---
@@ -361,6 +368,15 @@ public:
                         colors_data[i * 3 + 0] = value;
                         colors_data[i * 3 + 1] = value;
                         colors_data[i * 3 + 2] = value;
+                    }
+                }
+                else {
+                    // std::cout << "Unexpected number of dimensions for colors dataset: " << dims_colors[1] << std::endl;
+                    colors_data.resize(num_points * 3);
+                    for (size_t i = 0; i < num_points; ++i) {
+                        colors_data[i * 3 + 0] = 0.0;
+                        colors_data[i * 3 + 1] = 0.0;
+                        colors_data[i * 3 + 2] = 0.0;
                     }
                 }
                 H5Sclose(colors_space);
@@ -629,13 +645,20 @@ public:
         problem_size = total_nodes;
         progress = 0;
 
-        for (size_t i = 0; i < num_threads; ++i) {
-            size_t start = i * chunk_size;
-            size_t end = std::min(start + chunk_size, total_nodes);
-            threads.emplace_back(&PointCloudLoader::process_node, this, start, end);
+        std::cout << "Loading all nodes with " << num_threads << " threads..." << std::endl;
+        if (num_threads <= 1) {
+            std::cout << "Loading all nodes in a single thread..." << std::endl;
+            process_node(0, total_nodes);
         }
-        for (auto& thread : threads) {
-            thread.join();
+        else {
+            for (size_t i = 0; i < num_threads; ++i) {
+                size_t start = i * chunk_size;
+                size_t end = std::min(start + chunk_size, total_nodes);
+                threads.emplace_back(&PointCloudLoader::process_node, this, start, end);
+            }
+            for (auto& thread : threads) {
+                thread.join();
+            }
         }
     }
 
@@ -994,6 +1017,7 @@ py::array_t<bool> vector_to_array(std::vector<bool> selected_originals) {
 }
 
 std::tuple<py::array_t<float>, py::array_t<float>, py::array_t<float>> load_pointclouds(const std::vector<std::tuple<std::vector<int>, int, double>>& nodes, const std::string& path, const int start_z, const int end_z, bool single_threaded = false, bool verbose = true) {
+    std::cout << "Loading single threaded: " << single_threaded << std::endl;
     PointCloudLoader processor(nodes, path, start_z, end_z, verbose);
     processor.load_all(single_threaded);
     processor.sortPointsXYZW();
