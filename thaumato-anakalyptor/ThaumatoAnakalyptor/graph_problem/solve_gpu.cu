@@ -1013,14 +1013,15 @@ __global__ void update_nodes_kernel_f_star(Node* d_graph, size_t* d_valid_indice
         float step = sum_w_f_tilde_k / sum_w;
         step *= 0.0025f;
         node.f_star_momentum = momentum_coef * node.f_star_momentum + step;
-        node.f_star_momentum = fminf(1.0f, node.f_star_momentum);
+        node.f_star_momentum = fmaxf(-1.0f, fminf(1.0f, node.f_star_momentum));
         node.f_star += node.f_star_momentum;
         // node.f_star = (sum_w_f_tilde_k + o * node_f_tilde) / (sum_w + o);
     }
     // Clip f_star to the range [ - 2 * 360 * estimated_windings, 2 * 360 * estimated_windings]
     float winding_max =  4 * 360 * estimated_windings;
     if (fabsf(node.f_star) >= winding_max) {
-        node.deleted = true;
+        // node.deleted = true;
+        node.f_star_momentum = 0.0f;
     }
     node.f_star = fmaxf(- winding_max, fminf(winding_max, node.f_star));
 }
@@ -1480,7 +1481,7 @@ __global__ void update_f_tilde_kernel(Node* d_graph, size_t* d_valid_indices, in
 }
 
 // Kernel to update f_star solver fields on the GPU
-__global__ void update_f_star_kernel(Node* d_graph, size_t* d_valid_indices, int num_valid_nodes, float median_f_star, int teflon_winding_nr) {
+__global__ void update_f_star_kernel(Node* d_graph, size_t* d_valid_indices, int num_valid_nodes, float median_f_star, int teflon_winding_nr, bool blow_away) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_valid_nodes) return;
 
@@ -1490,7 +1491,10 @@ __global__ void update_f_star_kernel(Node* d_graph, size_t* d_valid_indices, int
 
     // Update f_tilde with the computed f_star
     if (node.fixed) {
-        if ((median_f_star != 0.0f) && (fabsf(node.winding_nr - teflon_winding_nr) > 1)) {
+        // if ((median_f_star != 0.0f) && (fabsf(node.winding_nr - teflon_winding_nr) > 1)) {
+        //     node.f_tilde -= median_f_star;
+        // }
+        if (median_f_star != 0.0f) {
             node.f_tilde -= median_f_star;
         }
         node.f_star = node.f_tilde;
@@ -1501,6 +1505,10 @@ __global__ void update_f_star_kernel(Node* d_graph, size_t* d_valid_indices, int
         }
         // Update f_tilde with the computed f_star
         node.f_tilde = node.f_star;
+        if (blow_away) {
+            //  blow the node a bit away
+            node.f_star += 0.5f;
+        }
     }
     // node.f_tilde = node.f_star;
 
@@ -4661,7 +4669,7 @@ int fix_winding_nodes(std::vector<Node>& graph, int nr_nodes, int seed_node_old)
     }
 }
 
-std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float o, float spring_constant, float step_sigma, int teflon_winding_nr, bool visualize, bool adjust_median) {
+std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float o, float spring_constant, float step_sigma, int teflon_winding_nr, bool visualize, bool adjust_median, bool blow_away) {
     std::vector<Node> graph_copy = graph;
     if (i_round < 0) {
         o = o * 0.25f;
@@ -4707,7 +4715,7 @@ std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations
         cudaDeviceSynchronize(); // Check for errors during kernel execution
 
         // Launch the kernel to update f_tilde with f_star
-        update_f_star_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_graph, d_valid_indices, num_valid_nodes, median_f_star, teflon_winding_nr);
+        update_f_star_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_graph, d_valid_indices, num_valid_nodes, median_f_star, teflon_winding_nr, blow_away);
         median_f_star = 0.0f;
 
         err = cudaGetLastError();
