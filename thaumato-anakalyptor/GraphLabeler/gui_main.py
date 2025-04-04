@@ -2224,7 +2224,7 @@ class PointCloudLabeler(QMainWindow):
         self.z_thickness_slider.setValue(int(desired_thickness * self.scaleFactor))
         if initial_thickness < desired_thickness/self.scaleFactor:
             self.update_views()
-            compute_current_slab()
+            compute_current_slab(seed_node=seed_node)
             slab_filename = os.path.join(base_path, "slabs", "slab_thickness_initial.txt")
             self._save_labels_to_path(slab_filename)
 

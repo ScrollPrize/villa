@@ -1936,7 +1936,7 @@ if __name__ == '__main__':
     parser.add_argument('--downsample', action='store_true', help='Downsample the mesh')
     parser.add_argument('--max_z_step_size', type=int, default=250, help='Maximum z step size for the unrolling (RAM is approx size = GB)')
     parser.add_argument('--num_threads', type=int, default=None, help='Number of threads to use for the interpolation')
-    parser.add_argument('--single_threaded_pc_load', type=int, default=None, help='Used to load the pointclouds single threaded for .h5 file format (h5 in standard mode does not support multi-threaded loading)')
+    parser.add_argument('--single_threaded_pc_load', action='store_true', help='Used to load the pointclouds single threaded for .h5 file format (h5 in standard mode does not support multi-threaded loading)')
     parser.add_argument('--disable_valid_clip', action='store_true', help='Disable the valid winding clip')
 
     args = parser.parse_args()

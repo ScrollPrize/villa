@@ -122,7 +122,7 @@ inline __global__ void update_nodes_kernel_f_star_step(Node* d_graph, size_t* d_
     }
     // step = step / total_certainty;
     node.f_star_momentum = momentum_coef * node.f_star_momentum + step;
-    node.f_star_momentum = fmaxf(-1.0f, fminf(1.0f, node.f_star_momentum));
+    node.f_star_momentum = fmaxf(-3.0f, fminf(3.0f, node.f_star_momentum));
     node.f_star += node.f_star_momentum;
 
     // Clip f_star to the allowed range [ - 4 * 360 * estimated_windings, 4 * 360 * estimated_windings ]
