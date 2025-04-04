@@ -130,6 +130,49 @@ def compute_means_adjacent(adjacent_ts, adjacent_normals, winding_direction):
             res_ = [np.mean(t) if len(t) > 0 else None for t in ts]
             res.append(res_)
         return res
+    
+    def calculate_medians_pick_first_in_range(ts_lists, delta=2.0):
+        """
+        For each row in ts_lists, and for each sub-list of t-values in that row:
+        (1) Find the median by sorting a COPY of the sub-list.
+            - If even length, picks the 'lower' of the two middle elements.
+        (2) Filter the ORIGINAL sub-list to keep only t's within [median-delta, median+delta].
+        (3) Return the first value of that filtered set in original order, or None if empty.
+
+        :param ts_lists: A 2D list (list of rows, each row is a list of sub-lists of t-values).
+        :param delta: How far from the median we allow t-values to be and still pass the filter.
+        :return: A 2D list with the same shape as ts_lists, each element is a single t or None.
+        """
+        res = []
+        for row in ts_lists:  # Each 'row' is a list of sub-lists [ [t1, t2, ...], [t1, t2, ...] ]
+            row_res = []
+            for t_candidates in row:
+                if not t_candidates:  # If empty sub-list
+                    row_res.append(None)
+                    continue
+
+                # 1) Sort a copy to find median
+                sorted_copy = sorted(t_candidates)
+                n = len(sorted_copy)
+                mid = n // 2
+                if n % 2 == 0:
+                    median_val = sorted_copy[mid - 1]  # 'lower' median
+                else:
+                    median_val = sorted_copy[mid]
+
+                # 2) Filter original list based on [median - delta, median + delta]
+                lo = median_val - delta
+                hi = median_val + delta
+                filtered = [t for t in t_candidates if lo <= t <= hi]
+
+                # 3) Take the first from the filtered list, in original order
+                chosen_t = filtered[0] if filtered else None
+                row_res.append(chosen_t)
+
+            res.append(row_res)
+
+        return res
+
     # Copy to preserve original lists
     original_ts = deepcopy(adjacent_ts)
 
@@ -159,7 +202,7 @@ def compute_means_adjacent(adjacent_ts, adjacent_normals, winding_direction):
         print(f"T means: Fixed {count_fixed}/{count_original} original out of total {count_total} t values spaces.")
 
     # Calculate initial means of each list, handle empty lists by setting means to None
-    t_means = calculate_means(adjacent_ts)
+    t_means = calculate_medians_pick_first_in_range(adjacent_ts)
     # debug
     normals_means = []
     for i, ts in enumerate(adjacent_ts):
@@ -185,11 +228,11 @@ def compute_means_adjacent(adjacent_ts, adjacent_normals, winding_direction):
                         adjacent_ts[u][i] = fixed_adjacent_ts[u][i]
 
         # Recalculate means after filtering
-        return calculate_means(adjacent_ts)
+        return calculate_medians_pick_first_in_range(adjacent_ts)
 
     def optimization_step(t_means, fixed, fixed_adjacent_ts):
         # Iteratively refine means until they are in the correct order
-        max_iterations = 100  # Limit iterations to prevent infinite loop
+        max_iterations = 20  # Limit iterations to prevent infinite loop
         for _ in range(max_iterations):
             previous_means = t_means[:]
             t_means = refine_means(t_means, fixed, fixed_adjacent_ts)

@@ -426,7 +426,7 @@ class PointCloudLabeler(QMainWindow):
         # slab thickness
         slab_thickness_layout = QHBoxLayout()
         self.slab_thickness_spinbox = QSpinBox()
-        self.slab_thickness_spinbox.setRange(1, 1000)
+        self.slab_thickness_spinbox.setRange(1, 100000)
         self.slab_thickness_spinbox.setValue(100)
         slab_thickness_layout.addWidget(QLabel("Slab thickness:"))
         slab_thickness_layout.addWidget(self.slab_thickness_spinbox)
@@ -793,6 +793,7 @@ class PointCloudLabeler(QMainWindow):
                 # write labels + group to file
                 data = json.dumps({"labels": self.labels.tolist(), "group": self.group.tolist()})
                 f.write(data)
+            print(f"Labels saved to {fname}")
     
     def load_labels_from_path(self):
         fname, _ = QFileDialog.getOpenFileName(self, "Load Labels", os.path.join("../experiments", self.default_experiment),
@@ -2161,7 +2162,7 @@ class PointCloudLabeler(QMainWindow):
         desired_thickness = float(self.slab_thickness_spinbox.value())
         step = desired_thickness / 2
 
-        def compute_current_slab(update_splines=False, extra_z_range=None):
+        def compute_current_slab(update_splines=False, extra_z_range=None, seed_node=None):
             # Set the line thickness assignment to 3.
             # self.line_distance_threshold_spinbox.setValue(3)
             # Ensure z-range is enabled.
@@ -2170,11 +2171,15 @@ class PointCloudLabeler(QMainWindow):
             original_disregard_label0 = self.disregard_label0_checkbox.isChecked()
             self.disregard_label0_checkbox.setChecked(False)
             for _ in range(1):
+                if seed_node is not None:
+                    self.solver.set_f_star(seed_node)
                 # --- Run F*5 update via update_labels ---
                 if hasattr(self, "solver_combo"):
                     prev_solver = self.solver_combo.currentText()
                     self.solver_combo.setCurrentText("F*Slab")
                 self.update_labels(extra_z_range=extra_z_range)
+                # Use same seed node for a continuous graph 
+
                 # # --- Run F*2 update via update_labels ---
                 # if hasattr(self, "solver_combo"):
                 #     prev_solver = self.solver_combo.currentText()
@@ -2211,6 +2216,9 @@ class PointCloudLabeler(QMainWindow):
         os.makedirs(os.path.dirname(slab_filename), exist_ok=True)
         self._save_labels_to_path(slab_filename)
 
+        # get seed node
+        seed_node = self.find_seed_node(extra_z_range=(initial_z_center - initial_thickness / 2, initial_z_center + initial_thickness / 2))
+
         # If the current slab thickness is less than 200, set thickness to 200 and recompute.
         self.z_thickness_spinbox.setValue(desired_thickness)
         self.z_thickness_slider.setValue(int(desired_thickness * self.scaleFactor))
@@ -2232,7 +2240,7 @@ class PointCloudLabeler(QMainWindow):
             self.z_center_spinbox.setValue(current_z_center)
             self.z_center_slider.setValue(int(current_z_center * self.scaleFactor))
             self.update_views()
-            compute_current_slab(extra_z_range=extra_z_range)
+            compute_current_slab(extra_z_range=extra_z_range, seed_node=seed_node)
             slab_filename = os.path.join(base_path, "slabs", f"slab_up_{int(current_z_center)}.txt")
             self._save_labels_to_path(slab_filename)
 
@@ -2244,18 +2252,15 @@ class PointCloudLabeler(QMainWindow):
             self.z_center_spinbox.setValue(current_z_center)
             self.z_center_slider.setValue(int(current_z_center * self.scaleFactor))
             self.update_views()
-            compute_current_slab(extra_z_range=extra_z_range)
+            compute_current_slab(extra_z_range=extra_z_range, seed_node=seed_node)
             slab_filename = os.path.join(base_path, "slabs", f"slab_down_{int(current_z_center)}.txt")
             self._save_labels_to_path(slab_filename)
 
         total_time = time.time() - start_time
         QMessageBox.information(self, "Slab Computation",
                                 f"Slab computation completed in {total_time:.2f} seconds.")
-    
-    # Example of using the solver interface when updating labels:
-    def update_labels(self, extra_z_range=None):
-        undeleted = self.solver.get_undeleted_indices()
-        other_block_factor=float(self.solve_other_block_factor_spinbox.value())
+        
+    def set_labels(self):
         if self.solver is not None:
             gt = np.abs((self.labels - self.UNLABELED) > 2)
             if self.hide_teflon_checkbox.isChecked():
@@ -2263,9 +2268,48 @@ class PointCloudLabeler(QMainWindow):
             else:
                 gt_0 = gt
             gt_0 = np.logical_and(gt_0, self.group == 0) # only consider group 0 points
-
-            self.solver.remove_temporary_edges()
             self.solver.set_labels(list(self.labels), list(gt_0))
+        return gt
+    
+    def find_seed_node(self, deleted_mask_previous=None, extra_z_range=None):
+        if deleted_mask_previous is None:
+            undeleted = self.solver.get_undeleted_indices()
+            deleted_mask_previous = self.solver.get_deleted_mask(undeleted)
+        assert len(deleted_mask_previous) == len(self.labels), "Deleted mask shape mismatch"
+        mask_valid = np.abs(self.labels - self.UNLABELED) > 2
+        mask_group_0 = self.group == 0
+        mask_non_teflon = np.abs(self.labels - self.teflon_label) > 2
+        mask_non_deleted = np.logical_not(deleted_mask_previous)
+        mask_not_first_index = np.arange(len(self.labels)) != 0
+        
+        mask = np.logical_and(mask_valid, mask_group_0)
+        mask = np.logical_and(mask, mask_non_teflon)
+        mask = np.logical_and(mask, mask_non_deleted)
+        mask = np.logical_and(mask, mask_not_first_index)
+        if extra_z_range is not None:
+            print(f"Using extra z-range: {extra_z_range}")
+            mask_z_range = np.logical_and(self.points[:, 2] >= extra_z_range[0], self.points[:, 2] <= extra_z_range[1])
+            mask = np.logical_and(mask, mask_z_range)
+        first_valid = np.where(mask)[0]
+        if first_valid.size == 0:
+            print("No seed node found.")
+            seed_node = None
+        else:
+            offset = np.logical_not(deleted_mask_previous[:first_valid[0]]).sum()
+            seed_node = offset
+            assert mask[first_valid[0]], f"Seed node {seed_node} at {first_valid[0]} is not valid"
+            first_valid = first_valid[0]
+        print(f"Seed node found at index {seed_node} at {first_valid}. With label {self.labels[first_valid]}")
+        return seed_node
+    
+    # Example of using the solver interface when updating labels:
+    def update_labels(self, extra_z_range=None):
+        undeleted = self.solver.get_undeleted_indices()
+        other_block_factor=float(self.solve_other_block_factor_spinbox.value())
+        if self.solver is not None:
+            self.solver.remove_temporary_edges()
+            gt = self.set_labels()
+
             groups = np.unique(self.group)
             group_metadata= []
             for group in groups:
@@ -2299,31 +2343,7 @@ class PointCloudLabeler(QMainWindow):
                                                  other_block_factor=15.0, side_fix_nr=-1, display=False)
             elif "F*" in selected_solver:
                 if self.seed_node is None:
-                    assert len(deleted_mask_previous) == len(self.labels), "Deleted mask shape mismatch"
-                    mask_valid = np.abs(self.labels - self.UNLABELED) > 2
-                    mask_group_0 = self.group == 0
-                    mask_non_teflon = np.abs(self.labels - self.teflon_label) > 2
-                    mask_non_deleted = np.logical_not(deleted_mask_previous)
-                    mask_not_first_index = np.arange(len(self.labels)) != 0
-                    
-                    mask = np.logical_and(mask_valid, mask_group_0)
-                    mask = np.logical_and(mask, mask_non_teflon)
-                    mask = np.logical_and(mask, mask_non_deleted)
-                    mask = np.logical_and(mask, mask_not_first_index)
-                    if extra_z_range is not None:
-                        print(f"Using extra z-range: {extra_z_range}")
-                        mask_z_range = np.logical_and(self.points[:, 2] >= extra_z_range[0], self.points[:, 2] <= extra_z_range[1])
-                        mask = np.logical_and(mask, mask_z_range)
-                    first_valid = np.where(mask)[0]
-                    if first_valid.size == 0:
-                        print("No seed node found.")
-                        self.seed_node = None
-                    else:
-                        offset = np.logical_not(deleted_mask_previous[:first_valid[0]]).sum()
-                        self.seed_node = offset
-                        assert mask[first_valid[0]], f"Seed node {self.seed_node} at {first_valid[0]} is not valid"
-                        first_valid = first_valid[0]
-                    print(f"Seed node found at index {self.seed_node} at {first_valid}.")
+                    self.seed_node = self.find_seed_node(deleted_mask_previous=deleted_mask_previous, extra_z_range=extra_z_range)
                 if self.seed_node is not None:
                     # self.solver.set_labeled_edges(self.seed_node)
                     self.solver.set_f_star(self.seed_node)
@@ -2347,9 +2367,9 @@ class PointCloudLabeler(QMainWindow):
                     self.solver.solve_f_star(num_iterations=int(3 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=False)
                     self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=360.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=False)
                 elif selected_solver == "F*Slab":
-                    self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()//2), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True, adjust_median=False)
+                    self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True, adjust_median=False, blow_away=True)
                     self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()//2), spring_constant=1.0, o=0.0, step_sigma=360.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True, adjust_median=False)
-                    self.solver.solve_f_star_with_labels(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, other_block_factor=0.5, lr=0.25, error_cutoff=-1.0, display=True)
+                    self.solver.solve_f_star_with_labels(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, other_block_factor=other_block_factor, lr=0.25, error_cutoff=-1.0, display=True)
                     # self.solver.solve_f_star_with_labels(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, other_block_factor=other_block_factor, lr=0.05, error_cutoff=-1.0, display=True)
                     # self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1, other_block_factor=15.0, side_fix_nr=-1, display=False)
 
