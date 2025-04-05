@@ -73,63 +73,6 @@ def angle_between(v1, v2=np.array([1, 0])):
     v2_u = unit_vector(v2)
     return np.arccos(np.clip(np.dot(v1_u, v2_u), -1.0, 1.0))
 
-def mad_outlier_mask(distances, factor=3.0):
-    """
-    Returns a boolean mask of outliers using the Median Absolute Deviation (MAD).
-    
-    :param distances: 1D numpy array of distances (e.g., per-vertex displacement magnitudes).
-    :param factor:    How aggressively to label outliers. 
-                     Larger = fewer outliers, smaller = more outliers.
-    :return:          mask_outlier, a boolean array where True indicates an outlier.
-    """
-    median_dist = np.median(distances)
-    abs_dev = np.abs(distances - median_dist)
-    mad = np.median(abs_dev)
-    
-    # Handle edge case if MAD is zero (all distances are identical or nearly so)
-    if mad < 1e-12:
-        return np.full(distances.shape, False)  # No outliers if everything is the same
-    
-    # Mark outliers (large jumps)
-    mask_outlier = abs_dev > factor * mad
-    return mask_outlier
-
-def smooth_mesh_outliers(mesh, factor=3.0, iterations=10):
-    """
-    Smooth the entire mesh using Taubin smoothing, then keep only the 'large' vertex displacements 
-    based on a MAD-based outlier detection. 'Small' moves are reverted to the original.
-    
-    :param mesh:        open3d.geometry.TriangleMesh
-    :param factor:      How aggressively to label outliers (large jumps).
-    :param iterations:  Number of Taubin smoothing iterations.
-    :return:            A new TriangleMesh with small displacements reverted.
-    """
-    # Store original positions
-    original_vertices = np.asarray(mesh.vertices).copy()
-
-    # Smooth the mesh (Taubin)
-    mesh_smooth = mesh.filter_smooth_taubin(number_of_iterations=iterations)
-    mesh_smooth.compute_vertex_normals()
-
-    # Compute per-vertex displacements
-    new_vertices = np.asarray(mesh_smooth.vertices)
-    distances = np.linalg.norm(new_vertices - original_vertices, axis=1)
-
-    # Identify large jumps via MAD
-    mask_outlier = mad_outlier_mask(distances, factor=factor)
-
-    print(f"Smoothing {np.sum(mask_outlier) / len(mask_outlier) * 100:.2f}% of vertices as outliers.")
-    
-    # Revert SMALL jumps (inliers) to original
-    # (so only large jumps are kept from the smoothing)
-    new_vertices[~mask_outlier] = original_vertices[~mask_outlier]
-
-    # Update the mesh
-    mesh_smooth.vertices = o3d.utility.Vector3dVector(new_vertices)
-    mesh_smooth.compute_vertex_normals()
-
-    return mesh_smooth
-
 def smooth_mesh_spikes(
     mesh: o3d.geometry.TriangleMesh,
     mad_factor: float = 3.0,
