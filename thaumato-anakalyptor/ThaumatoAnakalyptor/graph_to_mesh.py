@@ -1986,7 +1986,7 @@ class WalkToSheet():
             if continue_from <= 5:
                 mesh, uv_image = self.mesh_from_ordered_pointset(ordered_pointsets)
                 for _ in range(4):
-                    mesh = smooth_mesh_spikes(mesh, mad_factor=2.5)
+                    mesh = smooth_mesh_spikes(mesh, mad_factor=3.5)
                 self.save_mesh(mesh, uv_image, mesh_path)
 
             split_mesh_paths, stamp = self.split(mesh_path, split_width=self.split_width, fresh_start=(continue_from <= 6), stamp=stamp)
