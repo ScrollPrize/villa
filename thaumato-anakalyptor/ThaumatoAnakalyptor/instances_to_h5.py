@@ -136,9 +136,9 @@ def process_instance_archive(archive_path, h5_file, group_prefix="", compression
             surface_grp = grp.create_group(base)
             surface_grp.create_dataset("points", data=points, compression=compression,
                                          compression_opts=compression_level if compression == 'gzip' else None)
-            # Normals are no longer saved.
-            surface_grp.create_dataset("colors", data=colors, compression=compression,
-                                         compression_opts=compression_level if compression == 'gzip' else None)
+            # # Normals are no longer saved.
+            # surface_grp.create_dataset("colors", data=colors, compression=compression,
+            #                              compression_opts=compression_level if compression == 'gzip' else None)
             
             for key, value in metadata.items():
                 try:

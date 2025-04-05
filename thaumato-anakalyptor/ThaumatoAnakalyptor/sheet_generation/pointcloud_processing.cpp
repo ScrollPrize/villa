@@ -340,38 +340,51 @@ public:
     
                 // --- Read the "colors" dataset ---
                 std::vector<unsigned char> colors_data;
-                hid_t colors_dset = H5Dopen2(surface_group_id, "colors", H5P_DEFAULT);
-                if (colors_dset < 0) {
-                    std::cerr << "Dataset 'colors' not found in " << surface_group_name << std::endl;
-                    H5Gclose(surface_group_id);
-                    H5Gclose(group_id);
-                    H5Fclose(file_id);
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    print_progress();
-                    continue;
-                }
-                hid_t colors_space = H5Dget_space(colors_dset);
-                int ndims_colors = H5Sget_simple_extent_ndims(colors_space);
-                hsize_t dims_colors[2];
-                H5Sget_simple_extent_dims(colors_space, dims_colors, nullptr);
-                if (dims_colors[1] == 3) {
-                    colors_data.resize(num_points * 3);
-                    H5Dread(colors_dset, H5T_NATIVE_UCHAR, H5S_ALL, H5S_ALL, H5P_DEFAULT, colors_data.data());
-                }
-                else if (dims_colors[1] == 1) {
-                    // If only one color value per point, duplicate it to form an RGB triplet.
-                    std::vector<unsigned char> temp_colors(num_points);
-                    H5Dread(colors_dset, H5T_NATIVE_UCHAR, H5S_ALL, H5S_ALL, H5P_DEFAULT, temp_colors.data());
-                    colors_data.resize(num_points * 3);
-                    for (size_t i = 0; i < num_points; ++i) {
-                        unsigned char value = temp_colors[i];
-                        colors_data[i * 3 + 0] = value;
-                        colors_data[i * 3 + 1] = value;
-                        colors_data[i * 3 + 2] = value;
+                bool exist_colors = pathExists(surface_group_id, "colors");
+                if (exist_colors) {
+                    hid_t colors_dset = H5Dopen2(surface_group_id, "colors", H5P_DEFAULT);
+                    if (colors_dset < 0) {
+                        std::cerr << "Dataset 'colors' not found in " << surface_group_name << std::endl;
+                        H5Gclose(surface_group_id);
+                        H5Gclose(group_id);
+                        H5Fclose(file_id);
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        print_progress();
+                        continue;
                     }
+                    hid_t colors_space = H5Dget_space(colors_dset);
+                    int ndims_colors = H5Sget_simple_extent_ndims(colors_space);
+                    hsize_t dims_colors[2];
+                    H5Sget_simple_extent_dims(colors_space, dims_colors, nullptr);
+                    if (dims_colors[1] == 3) {
+                        colors_data.resize(num_points * 3);
+                        H5Dread(colors_dset, H5T_NATIVE_UCHAR, H5S_ALL, H5S_ALL, H5P_DEFAULT, colors_data.data());
+                    }
+                    else if (dims_colors[1] == 1) {
+                        // If only one color value per point, duplicate it to form an RGB triplet.
+                        std::vector<unsigned char> temp_colors(num_points);
+                        H5Dread(colors_dset, H5T_NATIVE_UCHAR, H5S_ALL, H5S_ALL, H5P_DEFAULT, temp_colors.data());
+                        colors_data.resize(num_points * 3);
+                        for (size_t i = 0; i < num_points; ++i) {
+                            unsigned char value = temp_colors[i];
+                            colors_data[i * 3 + 0] = value;
+                            colors_data[i * 3 + 1] = value;
+                            colors_data[i * 3 + 2] = value;
+                        }
+                    }
+                    else {
+                        // std::cout << "Unexpected number of dimensions for colors dataset: " << dims_colors[1] << std::endl;
+                        colors_data.resize(num_points * 3);
+                        for (size_t i = 0; i < num_points; ++i) {
+                            colors_data[i * 3 + 0] = 0.0;
+                            colors_data[i * 3 + 1] = 0.0;
+                            colors_data[i * 3 + 2] = 0.0;
+                        }
+                    }
+                    H5Sclose(colors_space);
+                    H5Dclose(colors_dset);
                 }
                 else {
-                    // std::cout << "Unexpected number of dimensions for colors dataset: " << dims_colors[1] << std::endl;
                     colors_data.resize(num_points * 3);
                     for (size_t i = 0; i < num_points; ++i) {
                         colors_data[i * 3 + 0] = 0.0;
@@ -379,8 +392,6 @@ public:
                         colors_data[i * 3 + 2] = 0.0;
                     }
                 }
-                H5Sclose(colors_space);
-                H5Dclose(colors_dset);
     
                 // Close groups and file
                 H5Gclose(surface_group_id);
