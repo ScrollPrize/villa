@@ -2036,7 +2036,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_threads', type=int, default=None, help='Number of threads to use for the interpolation')
     parser.add_argument('--single_threaded_pc_load', action='store_true', help='Used to load the pointclouds single threaded for .h5 file format (h5 in standard mode does not support multi-threaded loading)')
     parser.add_argument('--disable_valid_clip', action='store_true', help='Disable the valid winding clip')
-    parser.add_argument('--smoothing_factor', type=float, default=3.5, help='Smoothing factor for the mesh')
+    parser.add_argument('--smoothing_factor', type=float, default=2.5, help='Smoothing factor for the mesh')
 
     args = parser.parse_args()
 
