@@ -2443,14 +2443,14 @@ class PointCloudLabeler(QMainWindow):
     
     def save_graph(self):
         if self.solver is not None:
-            gt = np.abs((self.labels - self.UNLABELED) > 2)
-            self.solver.set_labels(self.labels, gt)
+            gt_0 = np.abs(self.labels - self.UNLABELED) > 2 # remove unlabeled
+            gt_1 = np.logical_and(gt_0, np.abs(self.labels - self.teflon_label) > 2) # remove teflon
+            self.solver.set_labels(self.labels, gt_1)
             # delete unasigned points
             label_indices = np.array(self.solver.get_undeleted_indices())
-            mask_labeled = np.abs(self.labels - self.UNLABELED) > 2
-            labeled_indices = list(label_indices[mask_labeled])
+            labeled_indices = list(label_indices[gt_1])
             self.solver.set_undeleted_indices(labeled_indices)
-            print(f"Deleted Unlabeled Points: {len(label_indices) - len(labeled_indices)} of {len(label_indices)}. Saving graph...")
+            print(f"Deleted Unlabeled Points: {len(label_indices) - len(labeled_indices)} of {len(label_indices)}. Total {gt_1.shape[0] - np.sum(gt_1)} deleted points with {np.sum(gt_0)} unlabeled points and {np.sum(np.abs(self.labels - self.teflon_label) > 2)} teflon points. Saving graph...")
             # Save graph as output_graph.bin for meshing
             graph_solved_path = self.graph_path.replace("graph.bin", "output_graph.bin")
             self.solver.save_solution(graph_solved_path)
