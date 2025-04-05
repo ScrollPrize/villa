@@ -1,0 +1,84 @@
+experiment_name: "nnunetv2_baseline"
+base_trainer: "nnUNetTrainer"
+dataset_id: "Dataset003_sk-fibers_hzvt-augmented-2"
+configuration: "3d_fullres"
+fold: 0
+num_gpus: 4
+plans: "nnUNetResEncUNetLPlans"
+
+configurations:
+  - name: "baseline"
+    params:
+      initial_lr: 1e-2
+      weight_decay: 3e-5
+      num_epochs: 1000
+  
+  - name: "lr_2e_2"
+    params:
+      initial_lr: 2e-2
+      weight_decay: 3e-5
+      num_epochs: 1000
+  
+  - name: "lr_7e_3"
+    params:
+      initial_lr: 7e-3
+      weight_decay: 3e-5
+      num_epochs: 1000
+  
+  - name: "lr_3e_2_150epochs"
+    params:
+      initial_lr: 3e-2
+      weight_decay: 3e-5
+      num_epochs: 150
+
+  - name: "lr_2e_2_150epochs"
+    params:
+      initial_lr: 2e-2
+      weight_decay: 3e-5
+      num_epochs: 150
+
+  - name: "lr_3e_3"
+    params:
+      initial_lr: 3e-3
+      weight_decay: 3e-5
+      num_epochs: 1000
+
+  - name: "lr_1e_3"
+    params:
+      initial_lr: 1e-3
+      weight_decay: 3e-5
+      num_epochs: 1000
+  
+  - name: "lr_1e_2_150epochs"
+    params:
+      initial_lr: 1e-2
+      weight_decay: 3e-5
+      num_epochs: 150
+
+evaluation:
+  evaluation_script: /path/to/custom_evaluation_script.py
+  evaluation_script_dir: /path/to/custom_evaluation_script.py
+  labels_folder: /path/to/labels
+  metrics:
+  - hyperparameters:
+      ignore_index: 0
+      num_classes: 4
+    type: dice_multiclass
+  - hyperparameters:
+      bins: 30
+      distance_metric: wasserstein
+      epsilon: 1e-8
+    type: skeleton_distance_length
+  - hyperparameters: {}
+    type: critical_components_multiclass
+  - hyperparameters:
+      connectivity: 26
+      ignore_index: 0
+      num_classes: 4
+    type: connected_components
+  output_folder: /path/to/evaluation
+  predictions_base_folder: /path/to/predictions
+experiment_name: lr_tuning_experiment_SkeletonSuperVoxel
+fold: 0
+num_gpus: 1
+plans: nnUNetResEncUNetLPlans
