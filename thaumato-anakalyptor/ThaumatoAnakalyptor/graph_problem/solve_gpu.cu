@@ -1122,6 +1122,9 @@ __global__ void update_nodes_kernel_winding_number_step1(Node* d_graph, size_t* 
     // recalculate edges wnr based on the target wnr
     for (int j = 0; j < node.num_edges; ++j) {
         Node& target_node = d_graph[edges[j].target_node];
+        if (target_node.deleted) {
+            continue;
+        }
         int target_wnr = target_node.winding_nr_old;
 
         float target_angle = 360 * target_wnr + target_node.f_init;

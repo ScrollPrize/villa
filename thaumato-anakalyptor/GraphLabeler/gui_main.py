@@ -411,6 +411,10 @@ class PointCloudLabeler(QMainWindow):
         self.slab_compute_button.clicked.connect(self.run_slab_computation)
         cellar_controls_layout.addWidget(self.slab_compute_button)
 
+        self.skip_initial_checkbox = QCheckBox("Skip Initial")
+        self.skip_initial_checkbox.setChecked(False)
+        cellar_controls_layout.addWidget(self.skip_initial_checkbox)
+
         slabs_range_layout = QHBoxLayout()
         self.slabs_min_spinbox = QSpinBox()
         self.slabs_min_spinbox.setRange(-100000, 100000)
@@ -2170,7 +2174,7 @@ class PointCloudLabeler(QMainWindow):
             self.use_z_range_checkbox.setChecked(True)
             original_disregard_label0 = self.disregard_label0_checkbox.isChecked()
             self.disregard_label0_checkbox.setChecked(False)
-            for _ in range(1):
+            for _ in range(2):
                 if seed_node is not None:
                     self.solver.set_f_star(seed_node)
                 # --- Run F*5 update via update_labels ---
@@ -2200,16 +2204,39 @@ class PointCloudLabeler(QMainWindow):
                     self.update_winding_splines()
                     self.update_views()
                 # Assign line labels.
-                # self.assign_line_labels()
-                self.assign_line_labels_all()
+                self.assign_line_labels()
+                # self.assign_line_labels_all()
             # Restore the original z-range checkbox state.
             self.use_z_range_checkbox.setChecked(original_z_range)
             self.disregard_label0_checkbox.setChecked(original_disregard_label0)
             # Update views.
+            self.recompute = True
             self.update_views()
 
         # Compute for the initial slab.
-        compute_current_slab(update_splines=True)
+        if not self.skip_initial_checkbox.isChecked():
+            compute_current_slab(update_splines=True)
+        else:
+            print("Skipping initial slab computation.")
+            # --- Run F*5 update via update_labels ---
+            if hasattr(self, "solver_combo"):
+                prev_solver = self.solver_combo.currentText()
+                self.solver_combo.setCurrentText("Set Labels")
+                self.update_labels()
+                self.solver.set_f_star(self.find_seed_node()) # make labeled nodes straight
+                # Update positions
+                self.update_positions(update_slide_ranges=False)
+                # Restore the previous solver mode.
+                self.solver_combo.setCurrentText(prev_solver)
+                # Clear splines and calculated labels.
+                self.clear_splines()
+                self.clear_calculated_labels()
+                # Update winding splines.
+                self.update_winding_splines()
+                # Update views.
+                self.recompute = True
+                self.update_views()
+        
         base_path = os.path.join("../experiments", self.default_experiment)
         slab_filename = os.path.join(base_path, "slabs", "slab_initial.txt")
         #make dir
@@ -2223,6 +2250,7 @@ class PointCloudLabeler(QMainWindow):
         self.z_thickness_spinbox.setValue(desired_thickness)
         self.z_thickness_slider.setValue(int(desired_thickness * self.scaleFactor))
         if initial_thickness < desired_thickness/self.scaleFactor:
+            self.recompute = True
             self.update_views()
             compute_current_slab(seed_node=seed_node)
             slab_filename = os.path.join(base_path, "slabs", "slab_thickness_initial.txt")
@@ -2239,6 +2267,7 @@ class PointCloudLabeler(QMainWindow):
             current_z_center += step
             self.z_center_spinbox.setValue(current_z_center)
             self.z_center_slider.setValue(int(current_z_center * self.scaleFactor))
+            self.recompute = True
             self.update_views()
             compute_current_slab(extra_z_range=extra_z_range, seed_node=seed_node)
             slab_filename = os.path.join(base_path, "slabs", f"slab_up_{int(current_z_center)}.txt")
@@ -2251,6 +2280,7 @@ class PointCloudLabeler(QMainWindow):
             current_z_center -= step
             self.z_center_spinbox.setValue(current_z_center)
             self.z_center_slider.setValue(int(current_z_center * self.scaleFactor))
+            self.recompute = True
             self.update_views()
             compute_current_slab(extra_z_range=extra_z_range, seed_node=seed_node)
             slab_filename = os.path.join(base_path, "slabs", f"slab_down_{int(current_z_center)}.txt")
@@ -2368,15 +2398,19 @@ class PointCloudLabeler(QMainWindow):
                     self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=360.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=False)
                 elif selected_solver == "F*Slab":
                     self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True, adjust_median=False, blow_away=True)
+                    self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()//2), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True, adjust_median=False, blow_away=False)
                     self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()//2), spring_constant=1.0, o=0.0, step_sigma=360.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True, adjust_median=False)
                     self.solver.solve_f_star_with_labels(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, other_block_factor=other_block_factor, lr=0.25, error_cutoff=-1.0, display=True)
                     # self.solver.solve_f_star_with_labels(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, other_block_factor=other_block_factor, lr=0.05, error_cutoff=-1.0, display=True)
-                    # self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1, other_block_factor=15.0, side_fix_nr=-1, display=False)
+                    self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1, other_block_factor=15.0, side_fix_nr=-1, display=False)
 
                 if self.use_z_range_checkbox.isChecked() or self.use_fstar_range_checkbox.isChecked():
                     print(f"Resetting z-range, length: {len(undeleted)}")
                     self.solver.set_undeleted_indices(undeleted)
                     self.seed_node = None
+                if selected_solver == "F*Slab":
+                    calculated_labels = self.solver.get_labels()
+                    self.calculated_labels = np.array(calculated_labels)
                     # print("Reset the z undeleted indices")
                 # Update positions
                 self.update_positions(update_slide_ranges=False)
