@@ -73,6 +73,159 @@ def angle_between(v1, v2=np.array([1, 0])):
     v2_u = unit_vector(v2)
     return np.arccos(np.clip(np.dot(v1_u, v2_u), -1.0, 1.0))
 
+def mad_outlier_mask(distances, factor=3.0):
+    """
+    Returns a boolean mask of outliers using the Median Absolute Deviation (MAD).
+    
+    :param distances: 1D numpy array of distances (e.g., per-vertex displacement magnitudes).
+    :param factor:    How aggressively to label outliers. 
+                     Larger = fewer outliers, smaller = more outliers.
+    :return:          mask_outlier, a boolean array where True indicates an outlier.
+    """
+    median_dist = np.median(distances)
+    abs_dev = np.abs(distances - median_dist)
+    mad = np.median(abs_dev)
+    
+    # Handle edge case if MAD is zero (all distances are identical or nearly so)
+    if mad < 1e-12:
+        return np.full(distances.shape, False)  # No outliers if everything is the same
+    
+    # Mark outliers (large jumps)
+    mask_outlier = abs_dev > factor * mad
+    return mask_outlier
+
+def smooth_mesh_outliers(mesh, factor=3.0, iterations=10):
+    """
+    Smooth the entire mesh using Taubin smoothing, then keep only the 'large' vertex displacements 
+    based on a MAD-based outlier detection. 'Small' moves are reverted to the original.
+    
+    :param mesh:        open3d.geometry.TriangleMesh
+    :param factor:      How aggressively to label outliers (large jumps).
+    :param iterations:  Number of Taubin smoothing iterations.
+    :return:            A new TriangleMesh with small displacements reverted.
+    """
+    # Store original positions
+    original_vertices = np.asarray(mesh.vertices).copy()
+
+    # Smooth the mesh (Taubin)
+    mesh_smooth = mesh.filter_smooth_taubin(number_of_iterations=iterations)
+    mesh_smooth.compute_vertex_normals()
+
+    # Compute per-vertex displacements
+    new_vertices = np.asarray(mesh_smooth.vertices)
+    distances = np.linalg.norm(new_vertices - original_vertices, axis=1)
+
+    # Identify large jumps via MAD
+    mask_outlier = mad_outlier_mask(distances, factor=factor)
+
+    print(f"Smoothing {np.sum(mask_outlier) / len(mask_outlier) * 100:.2f}% of vertices as outliers.")
+    
+    # Revert SMALL jumps (inliers) to original
+    # (so only large jumps are kept from the smoothing)
+    new_vertices[~mask_outlier] = original_vertices[~mask_outlier]
+
+    # Update the mesh
+    mesh_smooth.vertices = o3d.utility.Vector3dVector(new_vertices)
+    mesh_smooth.compute_vertex_normals()
+
+    return mesh_smooth
+
+def smooth_mesh_spikes(
+    mesh: o3d.geometry.TriangleMesh,
+    mad_factor: float = 3.0,
+    smoothing_iterations: int = 10,
+    smoothing_method: str = "taubin"
+) -> o3d.geometry.TriangleMesh:
+    """
+    Smooth only the 'spiky' vertices in a mesh, determined via a vectorized 
+    face-normal vs. vertex-normal angle measure, with MAD-based outlier detection.
+    
+    Steps:
+      1) Compute vertex normals & face normals.
+      2) For each face, measure angles between face normal and each of its vertices' normals.
+      3) Aggregate those angles to get a per-vertex 'spikiness' score.
+      4) Detect outlier spikiness via median + mad_factor*MAD.
+      5) Perform a smoothing pass on the entire mesh.
+      6) Revert all non-spiky vertices to their original positions.
+      
+    :param mesh:                 The input TriangleMesh.
+    :param mad_factor:           How aggressively to consider spikiness as an outlier 
+                                 (e.g., 3.0 means spikiness > median + 3*MAD is 'spiky').
+    :param smoothing_iterations: Number of smoothing iterations (e.g., 10).
+    :param smoothing_method:     "taubin", "laplacian", or "simple" (Open3D filter_smooth_*).
+    :return:                     A new TriangleMesh with only outlier spiky vertices smoothed.
+    """
+    # 1) Ensure we have normals computed
+    mesh.compute_vertex_normals()
+    mesh.compute_triangle_normals()
+
+    # Extract arrays for faster NumPy processing
+    vertex_normals = np.asarray(mesh.vertex_normals)   # (V, 3)
+    face_normals   = np.asarray(mesh.triangle_normals) # (F, 3)
+    faces          = np.asarray(mesh.triangles)        # (F, 3)
+    triangle_uvs  = np.asarray(mesh.triangle_uvs)          # (F, 3, 2)
+
+    # 2) Vectorized spikiness computation (face-normal vs. vertex-normal angle)
+    face_vertex_normals = vertex_normals[faces]                # (F, 3, 3)
+    dot_vals = np.sum(face_normals[:, None, :] * face_vertex_normals, axis=2)  # (F, 3)
+    np.clip(dot_vals, -1.0, 1.0, out=dot_vals)  # clip to valid range for arccos
+    angles = np.arccos(dot_vals)                # (F, 3)
+
+    # Accumulate angle sums & counts for each vertex
+    spikiness_sum = np.zeros(len(vertex_normals), dtype=np.float64)
+    counts        = np.zeros(len(vertex_normals), dtype=np.int32)
+
+    # Add angles for each of the 3 vertices of each face
+    np.add.at(spikiness_sum, faces[:, 0], angles[:, 0])
+    np.add.at(spikiness_sum, faces[:, 1], angles[:, 1])
+    np.add.at(spikiness_sum, faces[:, 2], angles[:, 2])
+    np.add.at(counts,        faces[:, 0], 1)
+    np.add.at(counts,        faces[:, 1], 1)
+    np.add.at(counts,        faces[:, 2], 1)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        spikiness = np.where(counts > 0, spikiness_sum / counts, 0.0)
+
+    # 3) MAD-based outlier detection on spikiness
+    #    spiky means spikiness > median + mad_factor*MAD
+    med_spike = np.median(spikiness)
+    abs_dev   = np.abs(spikiness - med_spike)
+    mad       = np.median(abs_dev)
+    if mad < 1e-12:
+        # If everything is basically the same, no spiky outliers
+        is_spiky = np.full_like(spikiness, False, dtype=bool)
+    else:
+        threshold_spike = med_spike + mad_factor * mad
+        is_spiky = spikiness > threshold_spike
+
+    print(f"Smoothing {np.sum(is_spiky) / len(is_spiky) * 100:.2f}% of vertices as outliers.")
+
+    # 4) Smooth entire mesh
+    mesh_smooth = o3d.geometry.TriangleMesh(mesh)  # copy to avoid mutating original
+    if smoothing_method.lower() == "taubin":
+        mesh_smooth = mesh_smooth.filter_smooth_taubin(number_of_iterations=smoothing_iterations)
+    elif smoothing_method.lower() == "laplacian":
+        mesh_smooth = mesh_smooth.filter_smooth_laplacian(number_of_iterations=smoothing_iterations)
+    elif smoothing_method.lower() == "simple":
+        mesh_smooth = mesh_smooth.filter_smooth_simple(number_of_iterations=smoothing_iterations)
+    else:
+        raise ValueError(
+            f"Unknown smoothing_method '{smoothing_method}'. Must be 'taubin', 'laplacian', or 'simple'."
+        )
+    mesh_smooth.compute_vertex_normals()
+
+    # 5) Revert all NON-spiky vertices to original
+    original_vertices = np.asarray(mesh.vertices)
+    new_vertices      = np.asarray(mesh_smooth.vertices)
+    new_vertices[~is_spiky] = original_vertices[~is_spiky]
+
+    # Update geometry & return
+    mesh_smooth.vertices = o3d.utility.Vector3dVector(new_vertices)
+    mesh_smooth.compute_vertex_normals()
+    mesh_smooth.triangle_uvs = o3d.utility.Vector2dVector(triangle_uvs)
+    
+    return mesh_smooth
+
 def flatten_args(args):
     save_path, mesh_path, downsample = args
     print(f"Flattening {mesh_path}")
@@ -1889,6 +2042,8 @@ class WalkToSheet():
             ordered_pointsets = ordered_pointsets_s[i]
             if continue_from <= 5:
                 mesh, uv_image = self.mesh_from_ordered_pointset(ordered_pointsets)
+                for _ in range(4):
+                    mesh = smooth_mesh_spikes(mesh, mad_factor=2.5)
                 self.save_mesh(mesh, uv_image, mesh_path)
 
             split_mesh_paths, stamp = self.split(mesh_path, split_width=self.split_width, fresh_start=(continue_from <= 6), stamp=stamp)
