@@ -1837,14 +1837,17 @@ class WalkToSheet():
             approx_max_z = min(approx_max_z, z_range[1])
         approx_min_angle -= 360.0
         approx_max_angle += 360.0
-        approx_min_z -= 50
-        approx_max_z += 50
-        print(f"[After alignment]: Approximate min and max winding angles: {approx_min_angle}, {approx_max_angle} with z range: {approx_min_z}, {approx_max_z}. This represents {(approx_max_angle - approx_min_angle) / 360} windings.")
 
         # loop over build + ordered pointset creation for each z range step (with overlap in loaded pointclouds)
         z_step = 50 * z_spacing
         # maximum z step size
-        z_step = min(z_step, max_z_step_size)
+        if max_z_step_size > z_step:
+            z_step = max_z_step_size
+        else:
+            z_step = min(z_step, max_z_step_size)
+        approx_min_z -= z_step
+        approx_max_z += z_step
+        print(f"[After alignment]: Approximate min and max winding angles: {approx_min_angle}, {approx_max_angle} with z range: {approx_min_z}, {approx_max_z}. This represents {(approx_max_angle - approx_min_angle) / 360} windings.")
         results = None
         results_pkl_path = os.path.join(self.save_path, "results.pkl")
         if continue_from <= 2 or not os.path.exists(results_pkl_path):
