@@ -1969,7 +1969,7 @@ class WalkToSheet():
         
         return results
 
-    def unroll(self, fragment=False, debug=False, continue_from=0, z_range=None, angle_step=1, z_spacing=10, learning_rate=0.2, iterations=11, unfix_factor=2.5, downsample=False, max_z_step_size=250, num_threads=None, valid_clip=True, single_threaded_pc_load=False):
+    def unroll(self, fragment=False, debug=False, continue_from=0, z_range=None, angle_step=1, z_spacing=10, learning_rate=0.2, iterations=11, unfix_factor=2.5, downsample=False, max_z_step_size=250, num_threads=None, valid_clip=True, single_threaded_pc_load=False, smoothing_factor=3.5):
         # Load the graph
         result = self.load_pointcloud_to_raw_ordered_pointset(debug=debug, continue_from=continue_from, z_range=z_range, angle_step=angle_step, z_spacing=z_spacing, max_z_step_size=max_z_step_size, single_threaded_pc_load=single_threaded_pc_load)
 
@@ -1986,7 +1986,7 @@ class WalkToSheet():
             if continue_from <= 5:
                 mesh, uv_image = self.mesh_from_ordered_pointset(ordered_pointsets)
                 for _ in range(4):
-                    mesh = smooth_mesh_spikes(mesh, mad_factor=3.5)
+                    mesh = smooth_mesh_spikes(mesh, mad_factor=smoothing_factor)
                 self.save_mesh(mesh, uv_image, mesh_path)
 
             split_mesh_paths, stamp = self.split(mesh_path, split_width=self.split_width, fresh_start=(continue_from <= 6), stamp=stamp)
@@ -2036,6 +2036,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_threads', type=int, default=None, help='Number of threads to use for the interpolation')
     parser.add_argument('--single_threaded_pc_load', action='store_true', help='Used to load the pointclouds single threaded for .h5 file format (h5 in standard mode does not support multi-threaded loading)')
     parser.add_argument('--disable_valid_clip', action='store_true', help='Disable the valid winding clip')
+    parser.add_argument('--smoothing_factor', type=float, default=3.5, help='Smoothing factor for the mesh')
 
     args = parser.parse_args()
 
@@ -2061,8 +2062,7 @@ if __name__ == '__main__':
     
     walk = WalkToSheet(graph, args.path, start_point, scale_factor, split_width=args.split_width)
     # walk.save_graph_pointcloud(reference_path)
-    walk.unroll(fragment=args.fragment, debug=args.debug, continue_from=args.continue_from, z_range=z_range, angle_step=args.angle_step, z_spacing=args.z_spacing, learning_rate=args.learning_rate, iterations=args.iterations, unfix_factor=args.unfix_factor, downsample=args.downsample, max_z_step_size=args.max_z_step_size, num_threads=args.num_threads, valid_clip=not args.disable_valid_clip, single_threaded_pc_load=args.single_threaded_pc_load)
-
+    walk.unroll(fragment=args.fragment, debug=args.debug, continue_from=args.continue_from, z_range=z_range, angle_step=args.angle_step, z_spacing=args.z_spacing, learning_rate=args.learning_rate, iterations=args.iterations, unfix_factor=args.unfix_factor, downsample=args.downsample, max_z_step_size=args.max_z_step_size, num_threads=args.num_threads, valid_clip=not args.disable_valid_clip, single_threaded_pc_load=args.single_threaded_pc_load, smoothing_factor=args.smoothing_factor)
 # Example command: python3 -m ThaumatoAnakalyptor.graph_to_mesh --path /scroll.volpkg/working/scroll3_surface_points/point_cloud_colorized_verso_subvolume_blocks --graph /scroll.volpkg/working/scroll3_surface_points/1352_3600_5002/point_cloud_colorized_verso_subvolume_graph_BP_solved.pkl --start_point 1352 3600 5002 --debug
 # python3 -m ThaumatoAnakalyptor.graph_to_mesh --path /scroll2v2_surface_points/point_cloud_colorized_verso_subvolume_blocks --graph /scroll2v2_surface_points/1352_3600_5002/point_cloud_colorized_verso_subvolume_graph_BP_solved.pkl --start_point 1352 3600 5002
 # python3 -m ThaumatoAnakalyptor.graph_to_mesh --path /scroll_pcs/point_cloud_colorized_verso_subvolume_blocks --graph /scroll_pcs/1352_3600_5007/point_cloud_colorized_verso_subvolume_graph_BP_solved.pkl --start_point 1352 3600 5007 --downsample --angle_step 1.0 --z_spacing 5 --start_point 1352 3600 5007
