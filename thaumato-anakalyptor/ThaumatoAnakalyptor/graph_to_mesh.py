@@ -908,7 +908,7 @@ class WalkToSheet():
         # create a dictionary with the indices of the points in the ordered pointset as keys and a list of the indices of the neighbouring points as values
         neighbours_dict = {}
         angle_set = set()
-        for i in range(len(ordered_pointset)):
+        for i in tqdm(range(len(ordered_pointset)), desc="Building neighbours dictionary"):
             if tuple(angle_vector[i]) in angle_set:
                 continue
             angle_set.add(tuple(angle_vector[i]))
