@@ -36,7 +36,7 @@ hide_table_of_contents: true
   />
 </head>
 
-In our tradition of progress prizes, we’re awarding four $3,000 prizes for qualifying submissions by Dec 31st. This time, we do not award prizes specific to segmentation or ink detection. Anything that increases the probability of reading the scrolls this year qualifies.
+In our tradition of progress prizes, we’re awarding four \$3,000 prizes for qualifying submissions by Dec 31st. This time, we do not award prizes specific to segmentation or ink detection. Anything that increases the probability of reading the scrolls this year qualifies.
 
 <div>There are some conditions:</div>
 

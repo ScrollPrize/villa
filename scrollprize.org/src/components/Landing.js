@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
-import Marquee from "react-fast-marquee";
-import useBrokenLinks from '@docusaurus/useBrokenLinks';
+import useBrokenLinks from "@docusaurus/useBrokenLinks";
+import BeforeAfter from "./BeforeAfter";
 
 const inlineImage = (src) => (
   <div
@@ -41,14 +41,15 @@ const stories = ({ unrollVideo, mlVideo, xrayVideo }) => [
           While digging a well, an Italian farmworker encounters a marble
           pavement. Excavations unearth beautiful statues and frescoes – and
           hundreds of scrolls. Carbonized and ashen, they are extremely fragile.
-          But the temptation to open them is great; if read, they would significantly
-          increase the corpus of literature we have from antiquity.
+          But the temptation to open them is great; if read, they would
+          significantly increase the corpus of literature we have from
+          antiquity.
         </div>
         <div className="max-w-3xl mb-8">
           Early attempts to open the scrolls unfortunately destroy many of them.
-          A few are painstakingly unrolled by a monk over several
-          decades, and they are found to contain philosophical texts written in
-          Greek. More than six hundred remain unopened and unreadable.
+          A few are painstakingly unrolled by a monk over several decades, and
+          they are found to contain philosophical texts written in Greek. More
+          than six hundred remain unopened and unreadable.
         </div>
         {inlineImage("/img/landing/scroll.webp")}
         {inlineImage("/img/landing/herc-materials.webp")}
@@ -79,9 +80,9 @@ const stories = ({ unrollVideo, mlVideo, xrayVideo }) => [
         </div>
         <div className="max-w-3xl mb-8">
           Virtual unwrapping has since emerged as a growing field with multiple
-          successes. Their work went on to show the elusive carbon ink of
-          the Herculaneum scrolls can also be detected using X-ray tomography,
-          laying the foundation for Vesuvius Challenge.
+          successes. Their work went on to show the elusive carbon ink of the
+          Herculaneum scrolls can also be detected using X-ray tomography,
+          laying the foundation for the Vesuvius Challenge.
         </div>
         <video
           // autoPlay
@@ -111,15 +112,16 @@ const stories = ({ unrollVideo, mlVideo, xrayVideo }) => [
     description: (
       <>
         <div className="max-w-3xl mb-8">
-          Vesuvius Challenge was launched in March 2023 to bring the world
-          together to read the Herculaneum scrolls. Along with smaller
-          progress prizes, a Grand Prize was issued for the first team to
-          recover 4 passages of 140 characters from a Herculaneum scroll.
+          The Vesuvius Challenge was launched in March 2023 to bring the world
+          together to read the Herculaneum scrolls. Along with smaller progress
+          prizes, a Grand Prize was issued for the first team to recover 4
+          passages of 140 characters from a Herculaneum scroll.
         </div>
         <div className="max-w-3xl mb-8">
-          Following a year of remarkable progress, <a href="grandprize">the prize was claimed</a>. After 275
-          years, the ancient puzzle of the Herculaneum Papyri has been cracked open.
-          But the quest to uncover the secrets of the scrolls is just beginning.
+          Following a year of remarkable progress,{" "}
+          <a href="grandprize">the prize was claimed</a>. After 275 years, the
+          ancient puzzle of the Herculaneum Papyri has been cracked open. But
+          the quest to uncover the secrets of the scrolls is just beginning.
         </div>
         <div className="flex overflow-hidden rounded-lg md:mb-8 mb-4 h-96 relative bg-black">
           <img
@@ -338,7 +340,8 @@ const prizes = [
   {
     title: "First Letters / First Title Prizes",
     prizeMoney: "4 x $60,000",
-    description: "Find first letters in Scrolls 2, 3, and 4, or the title of Scroll 1",
+    description:
+      "Find first letters in Scrolls 2, 3, and 4, or the title of Scroll 1",
     requirement: "",
     href: "2024_prizes#3-first-letters-prizes-scrolls-2-4",
     // tba: true,
@@ -349,7 +352,7 @@ const prizes = [
     description: "Open ended prizes from $1,000-20,000",
     requirement: "",
     href: "2024_prizes#monthly-progress-prizes",
-  }
+  },
 ];
 
 const creators = [
@@ -425,6 +428,15 @@ const sponsors = [
     image: ["/img/landing/collison1.webp", "/img/landing/collison2.webp"],
   },
   {
+    name: "Julia DeWahl & Dan Romero",
+    amount: 100000,
+    href: "https://twitter.com/natfriedman/status/1637959778558439425",
+    image: [
+      "/img/landing/Julia DeWahl.webp",
+      "/img/landing/Dan Romero.webp",
+    ],
+  },
+  {
     name: "Eugene Jhong",
     amount: 100000,
     href: "https://twitter.com/ejhong",
@@ -459,15 +471,6 @@ const sponsors = [
     amount: 50000,
     href: "https://ex.rs/",
     image: "/img/landing/Arthur Breitman.webp",
-  },
-  {
-    name: "Julia DeWahl & Dan Romero",
-    amount: 50000,
-    href: "https://twitter.com/natfriedman/status/1637959778558439425",
-    image: [
-      "/img/landing/Julia DeWahl.webp",
-      "/img/landing/Dan Romero.webp",
-    ],
   },
   {
     name: "Anonymous",
@@ -669,14 +672,19 @@ const team = {
       href: "https://www2.cs.uky.edu/dri/stephen-parsons/",
     },
     {
+      name: "Sean Johnson",
+      title: "Technical Community Manager",
+      href: "https://github.com/bruniss",
+    },
+    {
       name: "Julian Schilliger",
       title: "Software Engineer",
       href: "https://www.linkedin.com/in/julian-schilliger-963b21294/",
     },
     {
       name: "Giorgio Angelotti",
-      title: "Machine Learning Consultant",
-      href: "https://www.linkedin.com/in/giorgio-angelotti/",
+      title: "ML Consultant & Research Scientist, PhD",
+      href: "https://thegiorgio.org/",
     },
     {
       name: "Youssef Nader",
@@ -684,59 +692,54 @@ const team = {
       href: "https://youssefnader.com/",
     },
     {
-      name: "Ben Kyles",
-      title: "Segmentation Team Lead",
-      href: "https://twitter.com/ben_kyles",
+      name: "Elian Rafael Dal Prá",
+      title: "ML Intern & Annotation Specialist",
+      href: "https://twitter.com/elianrafaeldp",
     },
     {
-      name: "Adrionna Fey",
-      title: "Segmentation Team Member",
-      href: "https://twitter.com/Meadowsnax1",
+      name: "Johannes Rudolph",
+      title: "Platform Engineer",
+      href: "https://blog.virtual-void.net/",
     },
     {
       name: "David Josey",
-      title: "Segmentation Team Member",
+      title: "ML Annotation Team Lead",
       href: "https://www.linkedin.com/in/davidsjosey/",
     },
     {
+      name: "Adrionna Fey",
+      title: "Annotation Specialist",
+      href: "https://twitter.com/Meadowsnax1",
+    },
+    {
+      name: "Eric Thvedt",
+      title: "Annotation Specialist",
+      href: "https://www.linkedin.com/in/eric-thvedt/",
+    },
+    {
+      name: "Kendra Brown",
+      title: "Annotation Specialist",
+      href: "https://darthkendraresearch.wordpress.com/",
+    },
+    {
       name: "Konrad Rosenberg",
-      title: "Segmentation Team Member",
+      title: "Annotation Specialist",
       href: "https://twitter.com/germanicgems",
     },
     {
-      name: "JP Posma",
-      title: "Technical Advisor, former Project Lead",
-      href: "https://janpaulposma.nl/",
+      name: "Sarah Morejohn",
+      title: "Annotation Specialist",
+      href: "https://www.linkedin.com/in/sarah-morejohn-1140b049/",
     },
     {
-      name: "Daniel Havíř",
-      title: "Machine Learning Advisor",
-      href: "https://danielhavir.com/",
+      name: "Sergei Pnev",
+      title: "Annotation Specialist",
+      href: "www.linkedin.com/in/sergey-pnev",
     },
     {
-      name: "Ian Janicki",
-      title: "Design Advisor",
-      href: "https://ianjanicki.com/",
-    },
-    {
-      name: "Chris Frangione",
-      title: "Prize Advisor",
-      href: "https://www.linkedin.com/in/chrisfrangione/",
-    },
-    {
-      name: "Garrett Ryan",
-      title: "Classics Advisor",
-      href: "https://toldinstone.com/",
-    },
-    {
-      name: "Dejan Gotić",
-      title: "3d Animator",
-      href: "https://www.instagram.com/dejangotic_constructology/",
-    },
-    {
-      name: "Jonny Hyman",
-      title: "2d Animator",
-      href: "https://jonnyhyman.com/",
+      name: "Techjays",
+      title: "Annotation Services",
+      href: "https://www.techjays.com/",
     },
   ],
   educe: [
@@ -776,35 +779,87 @@ const team = {
       href: "https://hum.byu.edu/directory/roger-macfarlane",
     },
   ],
+  alumni: [
+    {
+      name: "JP Posma",
+      title: "Project Lead",
+      href: "https://janpaulposma.nl/",
+    },
+    {
+      name: "Ben Kyles",
+      title: "Segmentation Team Lead",
+      href: "https://twitter.com/ben_kyles",
+    },
+    {
+      name: "Raymond Gasper",
+      title: "Annotation Specialist",
+      href: "https://www.linkedin.com/in/raymond-james-gasper/",
+    },
+    {
+      name: "Daniel Havíř",
+      title: "Machine Learning",
+      href: "https://danielhavir.com/",
+    },
+    {
+      name: "Ian Janicki",
+      title: "Design",
+      href: "https://ianjanicki.com/",
+    },
+    {
+      name: "Chris Frangione",
+      title: "Prizes",
+      href: "https://www.linkedin.com/in/chrisfrangione/",
+    },
+    {
+      name: "Garrett Ryan",
+      title: "Classics",
+      href: "https://toldinstone.com/",
+    },
+    {
+      name: "Dejan Gotić",
+      title: "3D Animator",
+      href: "https://www.instagram.com/dejangotic_constructology/",
+    },
+    {
+      name: "Jonny Hyman",
+      title: "2D Animator",
+      href: "https://jonnyhyman.com/",
+    },
+  ],
   papyrology: [
     {
       name: "Federica Nicolardi (Coordinator)",
-      title: "Assistant Professor of Papyrology, University of Naples Federico II",
+      title:
+        "Assistant Professor of Papyrology, University of Naples Federico II",
       href: "https://www.docenti.unina.it/federica.nicolardi",
     },
     {
       name: "Marzia D'Angelo",
-      title: "Postdoctoral Fellow in Papyrology, University of Naples Federico II",
+      title:
+        "Postdoctoral Fellow in Papyrology, University of Naples Federico II",
       href: "https://unina.academia.edu/MDAngelo",
     },
     {
       name: "Kilian Fleischer",
-      title: "Research Director and Papyrologist, University of Tübingen and CNR",
+      title:
+        "Research Director and Papyrologist, University of Tübingen and CNR",
       href: "https://www.klassphil.uni-wuerzburg.de/team/pd-dr-kilian-fleischer/",
     },
     {
       name: "Alessia Lavorante",
-      title: "Postdoctoral Fellow in Papyrology, University of Naples Federico II",
+      title:
+        "Postdoctoral Fellow in Papyrology, University of Naples Federico II",
       href: "https://unina.academia.edu/AlessiaLavorante",
     },
     {
       name: "Michael McOsker",
       title: "Researcher, University College London",
-      href: "https://www.ucl.ac.uk/classics/michael-mcosker",
+      href: "https://profiles.ucl.ac.uk/97051-michael-mcosker",
     },
     {
       name: "Claudio Vergara",
-      title: "Postdoctoral Fellow in Papyrology, University of Naples Federico II",
+      title:
+        "Postdoctoral Fellow in Papyrology, University of Naples Federico II",
       href: "https://unina.academia.edu/ClaudioVergara",
     },
     {
@@ -839,7 +894,8 @@ const team = {
     },
     {
       name: "Federica Nicolardi",
-      title: "Assistant Professor of Papyrology, University of Naples Federico II",
+      title:
+        "Assistant Professor of Papyrology, University of Naples Federico II",
       href: "https://www.docenti.unina.it/federica.nicolardi",
     },
     {
@@ -931,7 +987,10 @@ const Story = ({ story, index }) => (
   >
     <div className="container mx-auto z-30 relative">
       <div className="py-10 max-w-4xl">
-        <h1 className="text-3xl md:text-6xl font-black mb-2 leading-none tracking-tighter" id={story.anchor}>
+        <h1
+          className="text-3xl md:text-6xl font-black mb-2 leading-none tracking-tighter"
+          id={story.anchor}
+        >
           <span
             style={{
               background:
@@ -973,7 +1032,7 @@ const Winners = ({ winners, large }) => (
   <div className={`flex ml-3 ${large ? "h-10" : "h-8"}`}>
     {winners.map((winner, i) => (
       <React.Fragment key={i}>
-        <div className="-ml-3" style={{ zIndex: (100-i)}}>
+        <div className="-ml-3" style={{ zIndex: 100 - i }}>
           <img
             src={winner.image}
             className={`${large ? "h-10" : "h-8"} rounded-full border-2 ${
@@ -1163,7 +1222,7 @@ const Sponsor = ({ sponsor }) => {
                 className={`${image} ${
                   i === 1 ? "-ml-3" : ""
                 } rounded-full saturate-0 border-2 border-solid border-[#272222]`}
-                style={{ zIndex: (100-i) }}
+                style={{ zIndex: 100 - i }}
               />
             ))}
           </div>
@@ -1238,50 +1297,6 @@ const autoPlay = (ref) =>
       // Video couldn't play, low power play button showing.
     });
 
-// const RevealOnScroll = ({ children, delay }) => {
-//   const [isVisible, setIsVisible] = useState(false);
-//   const domRef = useRef();
-
-//   useEffect(() => {
-//     const observer = new IntersectionObserver(
-//       (entries) => {
-//         entries.forEach((entry) => setIsVisible(entry.isIntersecting));
-//       },
-//       {
-//         threshold: 0.1, // Adjust this value based on your needs
-//       }
-//     );
-
-//     const currentElement = domRef.current;
-//     if (currentElement) {
-//       observer.observe(currentElement);
-//     }
-
-//     return () => {
-//       if (currentElement) {
-//         observer.unobserve(currentElement);
-//       }
-//     };
-//   }, []);
-
-//   const delayClass = delay ? `delay-${delay}` : "";
-//   console.log(delayClass);
-//   return (
-//     <div
-//       ref={domRef}
-//       className={`transition ease-in duration-500 ${delayClass} ${
-//         isVisible
-//           ? "opacity-100 translate-y-0"
-//           : "opacity-0 transform translate-y-3"
-//       }`}
-//     >
-//       {children}
-//     </div>
-//   );
-// };
-
-// export default RevealOnScroll;
-
 const AnimatedArrow = ({ text, button }) => (
   <div className={`flex ${button ? "" : "opacity-60"} text-sm`}>
     <div className="hidden sm:block uppercase font-bold tracking-wider mr-1 group-hover:mr-3 transition-all ease-in-out duration-300">
@@ -1300,6 +1315,182 @@ const AnimatedArrow = ({ text, button }) => (
   </div>
 );
 
+// export default BeforeAfter;
+
+const LargeAnimatedArrow = ({ text, button }) => (
+  <div className={`flex ${button ? "" : "opacity-60"} text-l`}>
+    <div className="hidden sm:block uppercase font-bold tracking-wider mr-1 group-hover:mr-3 transition-all ease-in-out duration-300">
+      {text}
+    </div>
+    <div className="block sm:hidden uppercase font-bold tracking-wider mr-1">
+      {text}
+    </div>
+    <img
+      src={
+        button
+          ? "/img/landing/arrow-right.svg"
+          : "/img/landing/arrow-right-white.svg"
+      }
+    />
+  </div>
+);
+
+const ChallengeBox = ({
+  title,
+  children,
+  linkText,
+  href,
+  imageSrc,
+  imagePosition = "right",
+}) => {
+  // When imagePosition is "top"
+  if (imagePosition === "top") {
+    return (
+      <div className="w-full flex flex-col bg-[#131114bf] p-5 rounded-xl justify-between border border-[#FFFFFF20]">
+        {/* Responsive image container:
+            On mobile, height is natural; on md+ screens, fixed height */}
+        <div className="mb-4 md:h-48">
+          {imageSrc &&
+            // If imageSrc is a string, render an <img>; otherwise assume it’s a component
+            (typeof imageSrc === "string" ? (
+              <img
+                src={imageSrc}
+                alt="Scroll representation"
+                className="rounded-lg w-full h-full object-cover"
+              />
+            ) : (
+              <div className="w-full">{imageSrc}</div>
+            ))}
+        </div>
+        {/* Title */}
+        <div className="h-12 flex items-center">
+          <h2 className="text-white text-2xl font-bold">{title}</h2>
+        </div>
+        {/* Divider */}
+        <div className="h-px bg-[#FFFFFF20] mb-4" />
+        {/* Content */}
+        <div className="flex-grow">{children}</div>
+        {/* Link */}
+        <a href={href} className="mt-4 block group">
+          <div className="group-hover:-translate-y-2 transition-transform ease-in-out duration-300">
+            <LargeAnimatedArrow text={linkText} />
+          </div>
+        </a>
+      </div>
+    );
+  }
+
+  // When imagePosition is "bottom"
+  if (imagePosition === "bottom") {
+    return (
+      <div className="w-full flex flex-col bg-[#131114bf] p-5 mb-5 rounded-xl justify-between border border-[#FFFFFF20]">
+        <b className="text-white text-2xl mb-3">{title}</b>
+        <div className="h-px bg-[#FFFFFF20] mb-4" />
+        {children}
+        <a href={href} className="mt-auto group">
+          <div className="group-hover:-translate-y-2 transition-transform ease-in-out duration-300">
+            <LargeAnimatedArrow text={linkText} />
+          </div>
+        </a>
+        {imageSrc && (
+          <div className="mt-4 w-full">
+            {typeof imageSrc === "string" ? (
+              <img
+                src={imageSrc}
+                alt="Scroll representation"
+                className="rounded-lg w-full h-auto"
+              />
+            ) : (
+              <div className="w-full">{imageSrc}</div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // When imagePosition is "left"
+  if (imagePosition === "left") {
+    return (
+      <div className="w-full flex flex-col bg-[#131114bf] p-5 mb-5 rounded-xl justify-between border border-[#FFFFFF20]">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="w-full">
+            {imageSrc &&
+              (typeof imageSrc === "string" ? (
+                <img
+                  src={imageSrc}
+                  alt="Scroll representation"
+                  className="rounded-lg w-full h-auto"
+                />
+              ) : (
+                <div className="w-full">{imageSrc}</div>
+              ))}
+          </div>
+          <div className="flex flex-col">
+            <b className="text-white text-2xl mb-3">{title}</b>
+            <div className="h-px bg-[#FFFFFF20] mb-4" />
+            {children}
+            <a href={href} className="mt-auto group">
+              <div className="group-hover:-translate-y-2 transition-transform ease-in-out duration-300">
+                <LargeAnimatedArrow text={linkText} />
+              </div>
+            </a>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Default layout: imagePosition "right"
+  // On mobile: single-column grid with the image on top;
+  // On md+ screens: two columns with text on the left and image on the right.
+  return (
+    <div className="w-full flex flex-col bg-[#131114bf] p-5 mb-5 rounded-xl justify-between border border-[#FFFFFF20]">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {/* Text and Link Container */}
+        <div className="order-2 md:order-1 flex flex-col">
+          <b className="text-white text-2xl mb-3">{title}</b>
+          <div className="h-px bg-[#FFFFFF20] mb-4" />
+          {children}
+          <a href={href} className="mt-auto group">
+            <div className="group-hover:-translate-y-2 transition-transform ease-in-out duration-300">
+              <LargeAnimatedArrow text={linkText} />
+            </div>
+          </a>
+        </div>
+        {/* Image Container */}
+        <div className="order-1 md:order-2">
+          {imageSrc && (
+            <div className="w-full">
+              {typeof imageSrc === "string" ? (
+                <img
+                  src={imageSrc}
+                  alt="Scroll representation"
+                  className="rounded-lg w-full h-auto"
+                />
+              ) : (
+                <div className="w-full">{imageSrc}</div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const App = () => {
+  const tabData = [{ label: "Tab 1" }, { label: "Tab 2" }, { label: "Tab 3" }];
+
+  return (
+    <div className="App">
+      <h1 className="geeks">GeeksforGeeks</h1>
+      <h1>React Tabs Example</h1>
+      <Tabs tabs={tabData} />
+    </div>
+  );
+};
+
 export function Landing() {
   useBrokenLinks().collectAnchor("sponsors");
   useBrokenLinks().collectAnchor("educelab-funders");
@@ -1315,10 +1506,10 @@ export function Landing() {
       return;
     }
     const storyDivs = Array.from(
-      document.querySelectorAll("[id^='story-section']")
+      document.querySelectorAll("[id^='story-section']"),
     );
     const imageDivs = Array.from(
-      document.querySelectorAll("[id^='story-image']")
+      document.querySelectorAll("[id^='story-image']"),
     );
     const onScroll = () => {
       const storyBounds = storyDivs.map((div) => getBounds(div));
@@ -1326,11 +1517,11 @@ export function Landing() {
         getBackgroundOpacity({
           y: bounds.y - window.innerHeight / 2,
           height: bounds.height,
-        })
+        }),
       );
       imageDivs.forEach(
         (story, index) =>
-          (story.style.opacity = backgroundOpacities[index] * 0.4)
+          (story.style.opacity = backgroundOpacities[index] * 0.4),
       );
     };
     window.addEventListener("scroll", onScroll);
@@ -1372,9 +1563,8 @@ export function Landing() {
                       textFillColor: "transparent",
                     }}
                   >
-                    <span className="whitespace-nowrap">
-                      Win Prizes.&nbsp;
-                    </span>&nbsp;
+                    <span className="whitespace-nowrap">Win Prizes.&nbsp;</span>
+                    &nbsp;
                     <span className="whitespace-nowrap">
                       Make History.&nbsp;
                     </span>
@@ -1382,78 +1572,410 @@ export function Landing() {
                 </h1>
                 <p className="max-w-lg md:text-xl text-lg font-medium mb-8 !leading-[110%] tracking-tight">
                   <span className="opacity-80 md:opacity-60">
-                    Vesuvius Challenge is a machine learning, computer
-                    vision, and geometry competition that is{" "}
+                    Vesuvius Challenge is a machine learning, computer vision,
+                    and geometry competition that is{" "}
                   </span>
                   <span className="opacity-100">
-                    <a href="grandprize">reading</a> the Herculaneum scrolls & has awarded
-                    over $1,000,000 in prizes.
+                    <a href="grandprize">reading</a>&nbsp;
                   </span>
-                  <br /> <br />
                   <span className="opacity-80 md:opacity-60">
-                    We're still going. The challenge is now to go from reading a few passages to entire scrolls.&nbsp;
+                    the Herculaneum scrolls & has awarded $1,500,000 in prizes.
+                  </span>
+                  <br />
+                  <br />
+                  <span className="opacity-80 md:opacity-60">
+                    Our challenge is now to go from reading a few passages to
+                    entire scrolls.&nbsp;
                   </span>
                   <span className="opacity-100">
-                    <a href="jobs">We're hiring!</a>
+                    <a href="/get_started">Join the community</a>&nbsp;
+                  </span>
+                  <span className="opacity-80 md:opacity-60">
+                    to win prizes and make history.
+                  </span>
+                  <span className="opacity-80 md:opacity-60">&nbsp;Also:</span>
+                  <span className="opacity-100">
+                    <a href="jobs">&nbsp;we're hiring!</a>
                   </span>
                 </p>
               </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 auto-rows-fr gap-4 items-stretch max-w-7xl">
-                <a
-                  className="cursor-pointer group hover:no-underline"
-                  href="/get_started"
-                >
-                  <div
-                    className="relative rounded-2xl border-solid text-white border border-[#FFFFFF20] bg-[#131114bf] group-hover:-translate-y-2 transition-transform ease-in-out duration-300 flex flex-col overflow-hidden"
-                    style={{
-                      boxShadow:
-                        "0px 2.767px 2.214px 0px rgba(0, 0, 0, 0.09), 0px 6.65px 5.32px 0px rgba(0, 0, 0, 0.13), 0px 12.522px 10.017px 0px rgba(0, 0, 0, 0.16), 0px 22.336px 17.869px 0px rgba(0, 0, 0, 0.19), 0px 41.778px 33.422px 0px rgba(0, 0, 0, 0.23), 0px 100px 80px 0px rgba(0, 0, 0, 0.32)",
-                    }}
-                  >
-                    <div className="flex flex-col py-4 md:py-5 px-5 md:px-7 ">
-                      <h3 className="text-xl md:text-3xl text-white mt-0 mb-1 tracking-tighter !leading-[90%] flex-grow">
-                        Get Started
-                      </h3>
-                      <AnimatedArrow text="$1M+ already awarded" />
-                    </div>
-                    <img
-                      className=""
-                      src="/img/landing/grand-prize-preview.webp"
-                    />
-                    <Marquee
-                      autoFill
-                      className="py-1 md:py-2 text-xs md:text-sm font-bold text-[#E34E29] bg-[#68140160]"
+
+              <div className="grid items-start max-w-8xl">
+                <div className="">
+                  {/*<h2 className="text-right pt-2 mr-12">*/}
+                  {/*  What's Happening*/}
+                  {/*</h2>*/}
+                </div>
+                {/* MOBILE LAYOUT – visible on screens below md */}
+                <div className="grid grid-cols-2 gap-4 max-w-9xl pb-3 md:hidden">
+                  {/* Card 1: Get Started */}
+                  <div className="w-full">
+                    <a
+                      className="cursor-pointer group hover:no-underline"
+                      href="/get_started"
                     >
-                      WIN PRIZES&nbsp;&nbsp;&nbsp;•&nbsp;&nbsp;&nbsp;READ THE SCROLLS
-                      &nbsp;&nbsp;&nbsp;•&nbsp;&nbsp;&nbsp;
-                    </Marquee>
+                      <div
+                        className="h-auto relative rounded-2xl border border-[#FFFFFF20] bg-[#131114bf] group-hover:-translate-y-2 transition-transform ease-in-out duration-300 flex flex-col overflow-hidden"
+                        style={{
+                          boxShadow:
+                            "0px 2.767px 2.214px 0px rgba(0,0,0,0.09), 0px 6.65px 5.32px 0px rgba(0,0,0,0.13), 0px 12.522px 10.017px 0px rgba(0,0,0,0.16), 0px 22.336px 17.869px 0px rgba(0,0,0,0.19), 0px 41.778px 33.422px 0px rgba(0,0,0,0.23), 0px 100px 80px 0px rgba(0,0,0,0.32)",
+                        }}
+                      >
+                        <div className="flex flex-col py-3 px-4 h-32">
+                          <h3 className="text-base sm:text-lg text-white mt-0 mb-1 tracking-tighter leading-[90%] flex-grow pb-2">
+                            Get Started
+                          </h3>
+                          <p className="text-sm">
+                            $1.5 million in prizes already awarded!
+                          </p>
+                          <div className="pt-2"></div>
+                        </div>
+                      </div>
+                    </a>
                   </div>
-                </a>
-                <a
-                  className="cursor-pointer group hover:no-underline"
-                  href="/master_plan"
-                >
-                  <div
-                    className="relative rounded-2xl border-solid text-white border border-[#FFFFFF20] bg-[#131114bf] group-hover:-translate-y-2 transition-transform ease-in-out duration-300 flex flex-col overflow-hidden"
-                    style={{
-                      height: "100%",
-                      boxShadow:
-                        "0px 2.767px 2.214px 0px rgba(0, 0, 0, 0.09), 0px 6.65px 5.32px 0px rgba(0, 0, 0, 0.13), 0px 12.522px 10.017px 0px rgba(0, 0, 0, 0.16), 0px 22.336px 17.869px 0px rgba(0, 0, 0, 0.19), 0px 41.778px 33.422px 0px rgba(0, 0, 0, 0.23), 0px 100px 80px 0px rgba(0, 0, 0, 0.32)",
-                    }}
+
+                  {/* Card 2 */}
+                  <div className="w-full">
+                    <a
+                      className="cursor-pointer group hover:no-underline"
+                      href="/prizes"
+                    >
+                      <div
+                        className="h-auto relative rounded-2xl border border-[#FFFFFF20] bg-[#131114bf] group-hover:-translate-y-2 transition-transform ease-in-out duration-300 flex flex-col overflow-hidden"
+                        style={{
+                          boxShadow:
+                            "0px 2.767px 2.214px 0px rgba(0,0,0,0.09), 0px 6.65px 5.32px 0px rgba(0,0,0,0.13), 0px 12.522px 10.017px 0px rgba(0,0,0,0.16), 0px 22.336px 17.869px 0px rgba(0,0,0,0.19), 0px 41.778px 33.422px 0px rgba(0,0,0,0.23), 0px 100px 80px 0px rgba(0,0,0,0.32)",
+                        }}
+                      >
+                        <div className="flex flex-col py-3 px-4">
+                          <h3 className="text-base sm:text-lg text-white mt-0 mb-1 tracking-tighter leading-[90%] flex-grow">
+                            New Year, New Prizes!
+                          </h3>
+                          <p className="text-xs">2/14/2025</p>
+                          {/* Remove the animated arrow; add a spacer if desired */}
+                          <div className="pt-2"></div>
+                        </div>
+                        <img className="w-full h-auto" src="" alt="" />
+                      </div>
+                    </a>
+                  </div>
+
+                  {/* Card 3 */}
+                  <div className="w-full">
+                    <a
+                      className="cursor-pointer group hover:no-underline"
+                      href="https://scrollprize.substack.com/p/exciting-news-from-scroll-5"
+                    >
+                      <div
+                        className="h-auto relative rounded-2xl border border-[#FFFFFF20] bg-[#131114bf] group-hover:-translate-y-2 transition-transform ease-in-out duration-300 flex flex-col overflow-hidden"
+                        style={{
+                          boxShadow:
+                            "0px 2.767px 2.214px 0px rgba(0,0,0,0.09), 0px 6.65px 5.32px 0px rgba(0,0,0,0.13), 0px 12.522px 10.017px 0px rgba(0,0,0,0.16), 0px 22.336px 17.869px 0px rgba(0,0,0,0.19), 0px 41.778px 33.422px 0px rgba(0,0,0,0.23), 0px 100px 80px 0px rgba(0,0,0,0.32)",
+                        }}
+                      >
+                        <div className="flex flex-col py-3 px-4">
+                          <h3 className="text-base sm:text-lg text-white mt-0 mb-1 tracking-tighter leading-[90%] flex-grow">
+                            Exciting News from Scroll 5!
+                          </h3>
+                          <p className="text-xs">01/23/2025</p>
+                          <div className="pt-2"></div>
+                        </div>
+                        <img className="w-full h-auto" src="" alt="" />
+                      </div>
+                    </a>
+                  </div>
+
+                  {/* Card 4 */}
+                  <div className="w-full">
+                    <a
+                      className="cursor-pointer group hover:no-underline"
+                      href="https://scrollprize.substack.com/p/awarding-the-amazing-autosegmentation"
+                    >
+                      <div
+                        className="relative rounded-2xl border border-[#FFFFFF20] bg-[#131114bf] group-hover:-translate-y-2 transition-transform ease-in-out duration-300 flex flex-col overflow-hidden"
+                        style={{
+                          boxShadow:
+                            "0px 2.767px 2.214px 0px rgba(0,0,0,0.09), 0px 6.65px 5.32px 0px rgba(0,0,0,0.13), 0px 12.522px 10.017px 0px rgba(0,0,0,0.16), 0px 22.336px 17.869px 0px rgba(0,0,0,0.19), 0px 41.778px 33.422px 0px rgba(0,0,0,0.23), 0px 100px 80px 0px rgba(0,0,0,0.32)",
+                        }}
+                      >
+                        <div className="h-auto flex flex-col py-3 px-4 z-10">
+                          <h3 className="text-base sm:text-lg text-white mt-0 mb-1 tracking-tighter leading-[90%] flex-grow">
+                            $60,000 Awarded for FASP Submissions!
+                          </h3>
+                          <p className="text-xs">01/22/2025</p>
+                          <div className="pt-2"></div>
+                        </div>
+                        <img
+                          className="absolute top-[50px] right-0 max-w-[190px] w-full h-auto object-contain"
+                          src="/img/landing/fragment.webp"
+                          alt=""
+                        />
+                      </div>
+                    </a>
+                  </div>
+                </div>
+
+                {/* DESKTOP LAYOUT – visible on md and above */}
+                <div className="hidden md:grid grid-cols-2 xl:grid-cols-4 gap-4 max-w-9xl pb-3">
+                  {/* Left Card (Get Started) */}
+                  <a
+                    className="cursor-pointer group hover:no-underline"
+                    href="/get_started"
                   >
-                    <div className="flex flex-col py-4 md:py-5 px-5 md:px-7 z-10">
-                      <h3 className="text-xl md:text-3xl text-white mt-0 mb-1 tracking-tighter !leading-[90%] flex-grow">
-                        Read the Master Plan
-                      </h3>
-                      <AnimatedArrow text="Read the post" />
+                    <div
+                      className="h-auto md:h-28 relative rounded-2xl border border-[#FFFFFF20] bg-[#131114bf] group-hover:-translate-y-2 transition-transform ease-in-out duration-300 flex flex-col overflow-hidden"
+                      style={{
+                        boxShadow:
+                          "0px 2.767px 2.214px 0px rgba(0,0,0,0.09), 0px 6.65px 5.32px 0px rgba(0,0,0,0.13), 0px 12.522px 10.017px 0px rgba(0,0,0,0.16), 0px 22.336px 17.869px 0px rgba(0,0,0,0.19), 0px 41.778px 33.422px 0px rgba(0,0,0,0.23), 0px 100px 80px 0px rgba(0,0,0,0.32)",
+                      }}
+                    >
+                      <div className="flex flex-col py-4 md:py-2.5 px-5 md:px-5">
+                        <h3 className="text-xl md:text-xl text-white mt-0 mb-1 tracking-tighter leading-[90%] flex-grow pb-3">
+                          Get Started
+                        </h3>
+                        <AnimatedArrow text="$1.5M+ already awarded" />
+                      </div>
                     </div>
-                    <img
-                      className="absolute top-[50px] right-0 max-w-[190px]"
-                      src="/img/landing/fragment.webp"
-                    />
+                  </a>
+
+                  {/* Right Cards (Grid) */}
+                  {/* First Right Card */}
+                  <a
+                    className="cursor-pointer group hover:no-underline"
+                    href="/prizes"
+                  >
+                    <div
+                      className="h-auto md:h-28 relative rounded-2xl border border-[#FFFFFF20] bg-[#131114bf] group-hover:-translate-y-2 transition-transform ease-in-out duration-300 flex flex-col overflow-hidden"
+                      style={{
+                        boxShadow:
+                          "0px 2.767px 2.214px 0px rgba(0,0,0,0.09), 0px 6.65px 5.32px 0px rgba(0,0,0,0.13), 0px 12.522px 10.017px 0px rgba(0,0,0,0.16), 0px 22.336px 17.869px 0px rgba(0,0,0,0.19), 0px 41.778px 33.422px 0px rgba(0,0,0,0.23), 0px 100px 80px 0px rgba(0,0,0,0.32)",
+                      }}
+                    >
+                      <div className="flex flex-col py-4 md:py-2.5 px-5 md:px-5">
+                        <h3 className="text-lg md:text-xl text-white mt-0 mb-1 tracking-tighter leading-[90%] flex-grow">
+                        New Year, New Prizes!
+                        </h3>
+                        <p className="text-sm">2/14/2025</p>
+                      </div>
+                      <img className="w-full h-auto" src="" alt="" />
+                    </div>
+                  </a>
+
+                  {/* Second Right Card */}
+                  <a
+                    className="cursor-pointer group hover:no-underline"
+                    href="https://scrollprize.substack.com/p/exciting-news-from-scroll-5 "
+                  >
+                    <div
+                      className="h-auto md:h-28 relative rounded-2xl border border-[#FFFFFF20] bg-[#131114bf] group-hover:-translate-y-2 transition-transform ease-in-out duration-300 flex flex-col overflow-hidden"
+                      style={{
+                        boxShadow:
+                          "0px 2.767px 2.214px 0px rgba(0,0,0,0.09), 0px 6.65px 5.32px 0px rgba(0,0,0,0.13), 0px 12.522px 10.017px 0px rgba(0,0,0,0.16), 0px 22.336px 17.869px 0px rgba(0,0,0,0.19), 0px 41.778px 33.422px 0px rgba(0,0,0,0.23), 0px 100px 80px 0px rgba(0,0,0,0.32)",
+                      }}
+                    >
+                      <div className="flex flex-col py-4 md:py-2.5 px-5 md:px-5">
+                        <h3 className="text-lg md:text-xl text-white mt-0 mb-1 tracking-tighter leading-[90%] flex-grow">
+                          Exciting News from Scroll 5!
+                        </h3>
+                        <p className="text-sm">2/05/2025</p>
+                      </div>
+                      <img className="w-full h-auto" src="" alt="" />
+                    </div>
+                  </a>
+
+                  {/* Third Right Card */}
+                  <a
+                    className="cursor-pointer group hover:no-underline"
+                    href="https://scrollprize.substack.com/p/awarding-the-amazing-autosegmentation"
+                  >
+                    <div
+                      className="relative rounded-2xl border border-[#FFFFFF20] bg-[#131114bf] group-hover:-translate-y-2 transition-transform ease-in-out duration-300 flex flex-col overflow-hidden"
+                      style={{
+                        boxShadow:
+                          "0px 2.767px 2.214px 0px rgba(0,0,0,0.09), 0px 6.65px 5.32px 0px rgba(0,0,0,0.13), 0px 12.522px 10.017px 0px rgba(0,0,0,0.16), 0px 22.336px 17.869px 0px rgba(0,0,0,0.19), 0px 41.778px 33.422px 0px rgba(0,0,0,0.23), 0px 100px 80px 0px rgba(0,0,0,0.32)",
+                      }}
+                    >
+                      <div className="h-auto md:h-28 flex flex-col py-4 md:py-2.5 px-5 md:px-5 z-10 ">
+                        <h3 className="text-lg md:text-xl text-white mt-0 mb-1 tracking-tighter leading-[90%] flex-grow">
+                          $60,000 Awarded for FASP Submissions!
+                        </h3>
+                        <p className="text-sm">01/23/2025</p>
+                      </div>
+                      <img
+                        className="absolute top-[50px] right-0 max-w-[190px] w-full h-auto object-contain"
+                        src="/img/landing/fragment.webp"
+                        alt=""
+                      />
+                    </div>
+                  </a>
+                </div>
+
+                <div className="flex-wrap z-10 pt-1">
+                  <div className="grid grid-cols-1">
+                    <ChallengeBox
+                      title="Open Problem: Representation"
+                      linkText="Scan the Surface"
+                      href="/unwrapping"
+                      imageSrc={
+                        <BeforeAfter
+                          beforeImage="/img/data/rep_raw_10037.png"
+                          afterImage="/img/data/rep_norms_10037.png"
+                        />
+                      }
+                      imagePosition="right"
+                    >
+                      <p className="">
+                        Carbonized and crushed under pyroclastic flow and
+                        debris, the scrolls are in rough shape. Tracing the 3D
+                        sheets through these damaged scrolls is nearly
+                        impossible in the raw scan data. More structured
+                        representations, like those obtained with semantic
+                        segmentation, simplify downstream tasks significantly.
+                      </p>
+                      <p className=" pt-16">
+                        Related skills: image annotation, computer vision,
+                        machine learning, medical imaging
+                      </p>
+                    </ChallengeBox>
+
+                    <ChallengeBox
+                      title="Open Problem: Meshing and Reconstruction"
+                      linkText="Chart the Path"
+                      href="/segmentation"
+                      imageSrc={
+                        <BeforeAfter
+                          beforeImage="/img/data/raw_pred.png"
+                          afterImage="/img/data/patches.png"
+                        />
+                      }
+                      imagePosition="right"
+                    >
+                      <p className="pb-5">
+                        A better image representation alone does not an unrolled
+                        scroll make. We need methods to better map the surfaces,
+                        stitch them where necessary, and extract them into
+                        readable sheets of papyrus.
+
+                        For a primer on current autosegmentation methods and their progress, read the <a href="/unwrapping"> Virtual Unwrapping document.</a>
+                      </p>
+                      <p className=" pt-16">
+                        Related skills: geometry processing, computer vision,
+                        machine learning, optimization
+                      </p>
+                    </ChallengeBox>
+
+                    <ChallengeBox
+                      title="Open Problem: Ink Detection"
+                      linkText="Find a Letter"
+                      href="/tutorial5"
+                      imageSrc={
+                        <BeforeAfter
+                          beforeImage="/img/ink/51002_crop/32.jpg"
+                          afterImage="/img/ink/51002_crop/prediction.jpg"
+                        />
+                      }
+                      imagePosition="right"
+                    >
+                      <div></div>
+                      <p className="">
+                        We've so far recovered text from just two of our five
+                        scrolls. Is the ink fundamentally different in others?
+                        Is the papyrus surface? We're not yet sure. We are
+                        certain though that if it ever existed, it can be
+                        detected.
+                      </p>
+                      <p className="pt-16">
+                        Related skills: image annotation, computer vision,
+                        machine learning, pattern recognition
+                      </p>
+                    </ChallengeBox>
                   </div>
-                </a>
+                </div>
               </div>
+              <div
+                className="mt-2 pt-2 pb-0 relative rounded-2xl border-solid text-white border border-[#FFFFFF20] bg-[#131114bf]"
+                style={{
+                  // Remove any fixed height to let the container size naturally.
+                  boxShadow:
+                    "0px 2.767px 2.214px 0px rgba(0, 0, 0, 0.09), 0px 6.65px 5.32px 0px rgba(0, 0, 0, 0.13), 0px 12.522px 10.017px 0px rgba(0, 0, 0, 0.16), 0px 22.336px 17.869px 0px rgba(0, 0, 0, 0.19), 0px 41.778px 33.422px 0px rgba(0, 0, 0, 0.23), 0px 100px 80px 0px rgba(0, 0, 0, 0.32)",
+                }}
+              >
+                <h3 className="text-2xl text-white pt-2 pb-3 text-center">
+                  What We're Building Towards
+                </h3>
+
+                {/* Mobile Version: 2x2 Grid (visible on screens below md) */}
+                <div className="grid grid-cols-2 gap-4 px-6 pb-3 md:hidden">
+                  <div className="relative pr-3">
+                    <div className="absolute right-0 top-0 bottom-0 w-px bg-orange-600" />
+                    <b className="block mb-2">
+                      Accurate Surface Representation
+                    </b>
+                    <p className="text-sm">
+                      We lack the accuracy to make the meshing step as simple as
+                      it could be.
+                    </p>
+                  </div>
+                  <div className="relative">
+                    <b className="block mb-2">Generalizable Ink Detection</b>
+                    <p className="text-sm">
+                      Ink has been found in two scrolls, but remains elusive in
+                      our other scrolls.
+                    </p>
+                  </div>
+                  <div className="relative">
+                    <div className="absolute right-0 top-0 bottom-0 w-px bg-orange-600" />
+                    <b className="block mb-2">High Quality Annotations</b>
+                    <p className="text-sm">
+                      We need an abundance of high-quality annotations.
+                    </p>
+                  </div>
+                  <div className="relative">
+                    <b className="block mb-2">Robust Meshing</b>
+                    <p className="text-sm">
+                      Methods that function where Surface Representation is
+                      unreliable are needed.
+                    </p>
+                  </div>
+                </div>
+
+                {/* Desktop Version: 4‑Column Grid (visible on md and up) */}
+                <div className="hidden md:grid grid-cols-4 gap-5 px-6 pb-3">
+                  <div className="relative px-3">
+                    <div className="absolute right-0 top-0 bottom-0 w-px bg-orange-600" />
+                    <b className="block mb-2">
+                      Accurate Surface Representations
+                    </b>
+                    <p className="text-sm">
+                      We lack the accuracy to make the meshing step as simple as
+                      it could be.
+                    </p>
+                  </div>
+                  <div className="relative px-3">
+                    <div className="absolute right-0 top-0 bottom-0 w-px bg-orange-600" />
+                    <b className="block mb-2">Generalizable Ink Detection</b>
+                    <p className="text-sm">
+                      Ink has been found in two scrolls, but remains elusive in
+                      our other scrolls.
+                    </p>
+                  </div>
+                  <div className="relative px-3">
+                    <div className="absolute right-0 top-0 bottom-0 w-px bg-orange-600" />
+                    <b className="block mb-2">High Quality Annotations</b>
+                    <p className="text-sm">
+                      We need an abundance of high-quality annotations.
+                    </p>
+                  </div>
+                  <div className="px-3">
+                    <b className="block mb-2">Robust Meshing</b>
+                    <p className="text-sm">
+                      Methods that function where Surface Representation is
+                      unreliable are needed.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
               <div className="pt-8 mb-4">
                 <p className="max-w-lg md:text-xl text-lg font-medium mb-8 !leading-[110%] tracking-tight">
                   <span id="our-story" className=" opacity-80 md:opacity-60">
@@ -1513,9 +2035,10 @@ export function Landing() {
                 </h1>
                 <p className="max-w-xl md:text-xl text-lg font-medium !mb-8 md:w-full w-4/5  !leading-[110%] tracking-tight opacity-60">
                   Due to the overwhelming success from the past year, the
-                  Vesuvius Challenge moves onto its next stage of reading 90%
-                  of all four scrolls. Read more about the prizes below, and on how
-                  they contribute towards the <a href="master_plan">The Master Plan</a>.
+                  Vesuvius Challenge moves onto its next stage of reading 90% of
+                  all four scrolls. Read more about the prizes below, and on how
+                  they contribute towards the{" "}
+                  <a href="master_plan">The Master Plan</a>.
                 </p>
                 <div className="flex flex-col gap-3 max-w-7xl">
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-w-6xl">
@@ -1532,9 +2055,10 @@ export function Landing() {
                   Awarded Prizes
                 </h1>
                 <p className="max-w-xl md:text-xl text-lg font-medium !mb-8 md:w-full w-4/5  !leading-[110%] tracking-tight opacity-60">
-                  Incredible teams of engineers are helping us unlock these secrets,
-                  providing unprecedented access to scrolls that have not been
-                  read in two millennia. Learn more about their accomplishments.
+                  Incredible teams of engineers are helping us unlock these
+                  secrets, providing unprecedented access to scrolls that have
+                  not been read in two millennia. Learn more about their
+                  accomplishments.
                 </p>
               </div>
               <div className="flex flex-col gap-3 max-w-7xl">
@@ -1569,12 +2093,14 @@ export function Landing() {
                 </div>
               </div>
               <div className="mb-6 md:mb-10 max-w-6xl">
-                <h1 className="mb-16 text-4xl md:text-7xl font-black leading-none tracking-tighter " name="sponsors" id="sponsors">
+                <h1
+                  className="mb-16 text-4xl md:text-7xl font-black leading-none tracking-tighter "
+                  name="sponsors"
+                  id="sponsors"
+                >
                   Sponsors
                 </h1>
-                <h2 className="text-3xl md:text-5xl text-[#E8A42F]">
-                  Caesars
-                </h2>
+                <h2 className="text-3xl md:text-5xl text-[#E8A42F]">Caesars</h2>
                 <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-4 auto-rows-fr  gap-2 pb-8">
                   {sponsors
                     .filter((s) => s.amount >= 200000)
@@ -1631,6 +2157,14 @@ export function Landing() {
                       EduceLab Team
                     </h3>
                     {team.educe.map((t, i) => (
+                      <Link link={t} key={i} />
+                    ))}
+                  </div>
+                  <div className="flex-1 flex-col lg:gap-0 gap-2 mt-8 min-w-[100%] md:min-w-[50%] pr-4 lg:pr-12">
+                    <h3 className="text-3xl font-black tracking-tighter">
+                      Advisors & Alumni
+                    </h3>
+                    {team.alumni.map((t, i) => (
                       <Link link={t} key={i} />
                     ))}
                   </div>

@@ -42,7 +42,7 @@ import Admonition from '@theme/Admonition';
 
 ### 1. Join the community
 
-Join our [Discord server](https://discord.gg/V4fJhvtaQn), subscribe to our [mailing list](https://scrollprize.substack.com), follow [@scrollprize](https://x.com/scrollprize) on X, and complete our [community survey](https://forms.gle/mtA3B4uQusVFTEDu9).
+Join our [Discord server](https://discord.com/invite/uTfNwwecCQ), subscribe to our [mailing list](https://scrollprize.substack.com), follow [@scrollprize](https://x.com/scrollprize) on X, and complete our [community survey](https://forms.gle/mtA3B4uQusVFTEDu9).
 
 ### 2. See a scroll
 
@@ -52,22 +52,22 @@ Get a feel for [the data](data) by looking inside a scroll that has not been ope
 
 ### 3. Dive in
 
-Our goal is to read 90% of each of four scrolls:
+Our goal is to read the entire library, starting with a complete scroll:
 
 <Admonition type="tip" icon="📜" title="Grand Prize">
-* Prizes: $200,000 [Grand Prize](2024_prizes#2024-grand-prize)
+* Prizes: \$200,000 [Read Entire Scroll Prize](prizes#read-entire-scroll-prize-200000)
 * Starting point: [The Data](data), [The Tutorials](tutorial)
 </Admonition>
 
 There are currently two primary subproblems where we need your help:
 
 <Admonition type="info" icon="⚙️" title="Segmentation">
-* Prizes: $100,000 [First Automated Segmentation Prize](2024_prizes#first-automated-segmentation-prize)
-* Starting point: [Segmentation tutorial](tutorial3), [Segmentation - a different approach](tutorial4)
+* Prizes: [Progress Prizes](prizes#progress-prizes)
+* Starting point: [Virtual Unwrapping](unwrapping), [Segmentation tutorial](segmentation), [Segmentation - a different approach](tutorial4)
 </Admonition>
 
 <Admonition type="info" icon="🖋️" title="Ink Detection">
-* Prizes: 4 x $60,000 [First Letters and First Title Prizes](2024_prizes#3-first-letters-prizes--first-title-prize)
+* Prizes: 4 x \$60,000 [First Letters and First Title Prizes](prizes#first-letters-and-title-prizes)
 * Starting point: [Ink detection tutorial](tutorial5)
 </Admonition>
 
@@ -78,13 +78,13 @@ Find more information about our datasets ([data page](data)) and what to do with
 There are many great tools and resources that you can use and contribute to:
 
 <Admonition type="danger" icon="🌎" title="Open Source">
-* Prizes: $350,000 [Monthly Progress Prizes](2024_prizes#monthly-progress-prizes)
-* Starting point: [Awesome Scroll Tools](community_projects) and [Progress Prizes Wish List](2024_prizes#monthly-progress-prizes)
+* Prizes: [Progress Prizes](prizes#progress-prizes)
+* Starting point: [Awesome Scroll Tools](community_projects) and [Progress Prizes Wish List](prizes#wish-list)
 </Admonition>
 
 For prototyping new ideas, we particularly recommend the [Python](https://github.com/ScrollPrize/villa/tree/main/vesuvius) and [C](https://github.com/ScrollPrize/villa/tree/main/vesuvius-c) libraries for easily working with scroll data.
 
-Reach out to our [Discord community](https://discord.gg/V4fJhvtaQn) and [team](mailto:team@scrollprize.org) with your questions!
+Reach out to our [Discord community](https://discord.com/invite/uTfNwwecCQ) and [team](mailto:team@scrollprize.org) with your questions!
 
 <!-- cloud image https://github.com/ScrollPrize/cloud-image -->
 <!-- cloud credits (link to form to apply for them) -->

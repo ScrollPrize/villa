@@ -92,7 +92,7 @@ docker pull ghcr.io/spacegaier/volume-cartographer:edge
     Install [Homebrew](https://brew.sh/). Run `brew install --no-quarantine educelab/casks/volume-cartographer`.
 
     * The GUI app will be installed to `/Applications/VC.app`.
-    * The command line tools are installed to `$(brew --prefix)/bin` and should be available in the terminal immediately (e.g. `vc_packager`) — if not, make sure you have `eval $(/opt/homebrew/bin/brew shellenv)` in your shell profile and restart your terminal.
+    * The command line tools are installed to `\$(brew --prefix)/bin` and should be available in the terminal immediately (e.g. `vc_packager`) — if not, make sure you have `eval \$(/opt/homebrew/bin/brew shellenv)` in your shell profile and restart your terminal.
   </TabItem>
   <TabItem value="mac_docker" label="macOS (using Docker)">
     <div>If you prefer Docker, here are the steps:</div>
@@ -214,7 +214,7 @@ rclone copy :http:/full-scrolls/Scroll1/PHercParis4.volpkg/volumes/2023020518073
 If you wish to begin with a smaller portion of Scroll 1, rather than the entire scroll, you can download 1cm of scan data from the center using:
 
 ```bash
-for i in `seq 6000 7250`; do wget http://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumes/20230205180739/0$i.tif; done
+for i in `seq 6000 7250`; do wget http://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumes/20230205180739/0\$i.tif; done
 ```
 
 Be sure to have the config.json file at the root of the `.volpkg` directory, and the meta.json file in the `volumes` directory so that VC can work with it.
@@ -356,24 +356,24 @@ export SEGMENT=20240227040603 #change to the segment number you've created
 export SCROLL="Scroll1/PHercParis4.volpkg" #change to whatever scroll you are currently working in
 
 
-# Navigate to the segment folder, create a directory named after $SEGMENT
-cd ${SCROLL}
-mkdir -p "${SEGMENT}"
-cd "${SEGMENT}"
+# Navigate to the segment folder, create a directory named after \$SEGMENT
+cd \${SCROLL}
+mkdir -p "\${SEGMENT}"
+cd "\${SEGMENT}"
 
 # Copy necessary files from the scroll folder to the current directory
-cp "/full_scrolls/${SCROLL}/paths/${SEGMENT}/pointset.vcps" .
-cp "/full_scrolls/${SCROLL}/paths/${SEGMENT}/meta.json" .
-cp "/full_scrolls/${SCROLL}/paths/${SEGMENT}/pointset.vcano" .
+cp "/full_scrolls/\${SCROLL}/paths/\${SEGMENT}/pointset.vcps" .
+cp "/full_scrolls/\${SCROLL}/paths/\${SEGMENT}/meta.json" .
+cp "/full_scrolls/\${SCROLL}/paths/\${SEGMENT}/pointset.vcano" .
 
 # Convert and render pointset, then generate layers and calculate area
-nice vc_convert_pointset -i pointset.vcps -o "${SEGMENT}_points.obj"
-nice vc_render -v "/full_scrolls/${SCROLL}/" -s "${SEGMENT}" -o "${SEGMENT}.obj" --output-ppm "${SEGMENT}.ppm" --intermediate-mesh "${SEGMENT}_intermediate_mesh.obj" --save-graph 0 --orient-normals
+nice vc_convert_pointset -i pointset.vcps -o "\${SEGMENT}_points.obj"
+nice vc_render -v "/full_scrolls/\${SCROLL}/" -s "\${SEGMENT}" -o "\${SEGMENT}.obj" --output-ppm "\${SEGMENT}.ppm" --intermediate-mesh "\${SEGMENT}_intermediate_mesh.obj" --save-graph 0 --orient-normals
 
 mkdir -p layers
-nice vc_layers_from_ppm -v "/full_scrolls/${SCROLL}" -p "${SEGMENT}.ppm" --output-dir layers/ -r 32 -f tif --cache-memory-limit 50G
+nice vc_layers_from_ppm -v "/full_scrolls/\${SCROLL}" -p "\${SEGMENT}.ppm" --output-dir layers/ -r 32 -f tif --cache-memory-limit 50G
 
-vc_area "/full_scrolls/${SCROLL}" ${SEGMENT} | grep cm | awk '{print $2}' | tee area_cm2.txt
+vc_area "/full_scrolls/\${SCROLL}" \${SEGMENT} | grep cm | awk '{print \$2}' | tee area_cm2.txt
 
 # Set author name
 echo '<YourNameHere>' > author.txt

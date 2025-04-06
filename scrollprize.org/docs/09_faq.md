@@ -53,7 +53,7 @@ After their discovery in the 1750s, some were opened physically, mostly destroyi
 A few hundred scrolls were excavated that were never opened, and remain rolled up with their contents sealed away.
 Our community is building methods to read these scrolls using micro-CT and an algorithmic pipeline using machine learning and computer vision.
 
-We've awarded over $1,000,000 in prizes and broken through, revealing complete passages of Greek philosophy from the inside of a closed Herculaneum scroll for the first time.
+We've awarded over \$1,000,000 in prizes and broken through, revealing complete passages of Greek philosophy from the inside of a closed Herculaneum scroll for the first time.
 Now we are continuing - we want to go from reading 5% of one scroll to reading multiple complete scrolls.
 Join us to win prizes and be a part of history!
 
@@ -66,6 +66,8 @@ The [2024 prize](2024_prizes) deadlines closed on **December 31, 2024**, and we 
 We have a [background page](background) for that!
 
 ### Where can I read the texts Vesuvius Challenge has uncovered?
+
+Check out [these images](https://drive.google.com/drive/folders/1nnWR3ZMcUxJhp4SJYkV8-REwHsQT0fQb?usp=sharing) of some text we've so far revealed!
 
 Here are the scholarly publications so far resulting from Vesuvius Challenge:
 
@@ -151,7 +153,7 @@ Here are some other excellent books we recommend:
 
 ### What if I would like to contribute, but don’t have time to compete for the Grand Prize?
 
-* Join our [Discord](https://discord.gg/V4fJhvtaQn) to learn about current efforts and how you can pitch in.
+* Join our [Discord](https://discord.com/invite/uTfNwwecCQ) to learn about current efforts and how you can pitch in.
 * You can make smaller open source contributions, which would benefit the whole community. Everyone in the community will be grateful for your work, and you might even be able to win a prize - see those [already awarded](winners)!
 
 ### Can I share my progress on social media?

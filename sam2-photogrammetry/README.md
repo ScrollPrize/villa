@@ -7,9 +7,9 @@ Before proceeding, please install SAM 2.1 as indicated in the original repositor
 In particular, we recommend first installing CUDA, then creating a conda environment with python=3.12 (`conda create -n sam2-photo python=3.12`), then pip installing pytorch using the pip install instructions found [here](https://pytorch.org/) (`conda activate sam2-photo`, `pip3 install torch torchvision torchaudio`), and finally installing SAM with `pip install -e .[notebooks]`.
 
 ### Checkpoint Details
-A checkpoint (`checkpoints/photo_t_2000.torch`) was obtained by fine-tuning the prompt encoder and the mask decoder of SAM 2.1 on a dataset of scroll/mask image pairs. The fine-tuning was carried out using the `train.py` script located in the main folder of this repository.
+A checkpoint (`checkpoints/photo2_ruler_t_1000.torch`) was obtained by fine-tuning the prompt encoder and the mask decoder of SAM 2.1 on a dataset of scroll/mask image pairs. The fine-tuning was carried out using the `train.py` script located in the main folder of this repository.
 
-Please first execute the script `checkpoints/download_ckpts.sh`, then download [this file](https://dl.ash2txt.org/ml-models/photogrammetry-segmentation/SAM2/photo_t_2000.torch) and put it in the `checkpoints` folder. 
+Please first execute the script `checkpoints/download_ckpts.sh`, then download [this file](https://dl.ash2txt.org/ml-models/photogrammetry-segmentation/SAM2/photo2_ruler_t_1000.torch) and put it in the `checkpoints` folder. 
 
 ## Running Segmentation
 To segment the scroll (and optionally the ruler) on new photos, use the `segment.py` script and point it to the folder containing the photos from the photogrammetry session. The folder should be organized as follows:
@@ -20,9 +20,14 @@ To segment the scroll (and optionally the ruler) on new photos, use the `segment
 
 - `<folder_path>` contains different scrolls captured in different orientations.
 - Each `<scroll_name>` subfolder includes various orientations.
-- A `JPEG_Enhanced` subfolder must be present within each orientation folder, containing `.jpg` images for processing.
+- A `JPGEnhanced` subfolder must be present within each orientation folder, containing `.jpg` images for processing.
 
 Ensure the dataset is structured accordingly.
+
+### Command to convert RAW to JPG
+```
+python raw2jpg.py <folder_path>
+```
 
 ### Command for Segmentation
 Run the following command to perform segmentation:
@@ -30,8 +35,25 @@ Run the following command to perform segmentation:
 ```
 python segment.py --root_dir <folder_path>
 ```
+### Command for Fixing predictions
+Run the following command to perform segmentation:
 
+```
+python cc-fix.py <folder_path>
+```
+### Command for creating applying Mask
+Run the following command to perform segmentation:
 
+```
+python mask-applier.py --root_dir <folder_path>
+```
+
+### Afterwards
+After these steps, one should run PGSRecon or OpenMVG + OpenMVS
+after the meshes have been reconstructed and scaled the volume is computable with
+```
+python volume.py <folder_path> <output_csv>
+```
 # SAM 2: Segment Anything in Images and Videos
 
 **[AI at Meta, FAIR](https://ai.meta.com/research/)**

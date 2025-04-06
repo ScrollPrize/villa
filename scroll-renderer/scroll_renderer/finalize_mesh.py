@@ -22,10 +22,15 @@ def copy_obj(path: str, output_folder: str):
     print(f"Copied {path} to {output_obj_path}")
 
     # Copy the texture image
-    # png 
-    path_png = path[:-4] + "_0.png"
-    output_png_path = os.path.join(output_folder, obj_filename[:-4] + "_0.png")
-    shutil.copy(path_png, output_png_path)
+    # png
+    try: 
+        path_png = path[:-4] + "_0.png"
+        output_png_path = os.path.join(output_folder, obj_filename[:-4] + "_0.png")
+        shutil.copy(path_png, output_png_path)
+    except:
+        path_png = path[:-4] + ".png"
+        output_png_path = os.path.join(output_folder, obj_filename[:-4] + "_0.png")
+        shutil.copy(path_png, output_png_path)
     print(f"Copied {path_png} to {output_png_path}")
 
     return output_obj_path, output_png_path

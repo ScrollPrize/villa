@@ -22,7 +22,7 @@ setup(
         'dask-image',
         'zarr',
         'einops',
-        'torch',
+        'torch==2.5.0',
         'pytorch-lightning',
         'open3d',
         'libigl',

@@ -1,3 +1,5 @@
 **/.venv/
 /**/.idea/*
-.vscode/
+*.pyc
+*.tif
+node_modules/.yarn-integrity

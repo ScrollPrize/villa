@@ -1,6 +1,6 @@
 ---
-title: "Tutorial 5: Ink Detection"
-sidebar_label: "5. Ink Detection"
+title: "Tutorial: Ink Detection"
+sidebar_label: "Ink Detection"
 hide_table_of_contents: true
 ---
 

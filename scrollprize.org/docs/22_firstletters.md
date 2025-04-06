@@ -8,18 +8,18 @@ hide_title: true
 <head>
   <html data-theme="dark" />
 
-  <meta name="description" content="Vesuvius Challenge $700,000 Grand Prize “now definitely achievable”" />
+  <meta name="description" content="Vesuvius Challenge \$700,000 Grand Prize “now definitely achievable”" />
 
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://scrollprize.org/firstletters" />
   <meta property="og:title" content="First word discovered in unopened Herculaneum scroll by 21yo computer science student" />
-  <meta property="og:description" content="Vesuvius Challenge $700,000 Grand Prize “now definitely achievable”" />
+  <meta property="og:description" content="Vesuvius Challenge \$700,000 Grand Prize “now definitely achievable”" />
   <meta property="og:image" content="https://scrollprize.org/img/firstletters/purple_card-new.webp" />
 
   <meta property="twitter:card" content="summary_large_image" />
   <meta property="twitter:url" content="https://scrollprize.org/firstletters" />
   <meta property="twitter:title" content="First word discovered in unopened Herculaneum scroll by 21yo computer science student" />
-  <meta property="twitter:description" content="Vesuvius Challenge $700,000 Grand Prize “now definitely achievable”" />
+  <meta property="twitter:description" content="Vesuvius Challenge \$700,000 Grand Prize “now definitely achievable”" />
   <meta property="twitter:image" content="https://scrollprize.org/img/firstletters/purple_card-new.webp" />
 </head>
 
@@ -34,7 +34,7 @@ hide_title: true
   textFillColor: "transparent",
 }}>unopened Herculaneum scroll</span> by 21yo computer science student</h1>
 
-<div className="md:text-3xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none tracking-tight">Vesuvius Challenge $700,000 Grand Prize “now definitely achievable”</div>
+<div className="md:text-3xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none tracking-tight">Vesuvius Challenge \$700,000 Grand Prize “now definitely achievable”</div>
 
 <div className="opacity-60 mb-8 italic">October 12th, 2023</div>
 
@@ -45,7 +45,7 @@ hide_title: true
   WebkitTextFillColor: "transparent",
   backgroundClip: "text",
   textFillColor: "transparent",
-}}>Vesuvius Challenge $700,000 Grand Prize “now definitely achievable”</div> -->
+}}>Vesuvius Challenge \$700,000 Grand Prize “now definitely achievable”</div> -->
 
 
 <figure className="">
@@ -58,7 +58,7 @@ hide_title: true
 
 The Herculaneum papyri, ancient scrolls housed in the library of a private villa near Pompeii, were buried and carbonized by the eruption of Vesuvius in 79 AD. For almost 2,000 years, this lone surviving library from antiquity was buried underground under 20 meters of volcanic mud. In the 1700s, they were excavated, and while they were in some ways preserved by the eruption, they were so fragile that they would turn to dust if mishandled. How do you read a scroll you can’t open? For hundreds of years, this question went unanswered.
 
-That is until Luke Farritor, a contestant of the <a href="/">Vesuvius Challenge</a>, became the first person in two millennia to see an entire word from within an unopened scroll this August. For that, we are thrilled to award Luke a $40,000 First Letters Prize, which required contestants to find at least 10 letters in a 4 cm<sup>2</sup> area in a scroll.
+That is until Luke Farritor, a contestant of the <a href="/">Vesuvius Challenge</a>, became the first person in two millennia to see an entire word from within an unopened scroll this August. For that, we are thrilled to award Luke a \$40,000 First Letters Prize, which required contestants to find at least 10 letters in a 4 cm<sup>2</sup> area in a scroll.
 
 <div className="flex flex-wrap items-end max-w-[100%] mb-4">
   <figure className="w-[50%]">
@@ -71,7 +71,7 @@ That is until Luke Farritor, a contestant of the <a href="/">Vesuvius Challenge<
   </figure>
 </div>
 
-Shortly after that, another contestant, Youssef Nader, *independently* discovered the same word in the same area, with even clearer results — winning the second place prize of $10,000.
+Shortly after that, another contestant, Youssef Nader, *independently* discovered the same word in the same area, with even clearer results — winning the second place prize of \$10,000.
 
 <div className="flex flex-wrap items-end max-w-[100%] mb-4">
   <figure className="w-[50%]">
@@ -84,7 +84,7 @@ Shortly after that, another contestant, Youssef Nader, *independently* discovere
   </figure>
 </div>
 
-These breakthroughs were both inspired by contestant Casey Handmer, who was the first person to find substantial, convincing evidence of ink within the unopened scrolls, as explained in his <a href="https://caseyhandmer.wordpress.com/2023/08/05/reading-ancient-scrolls/">blog post</a> and <a href="https://photos.google.com/share/AF1QipPC8Z9P1MxxS6UdoCJWDGofjxSHfBYGgDp47gSOoJW1gtKBGeIeXzAc6AbOVyhsLQ/photo/AF1QipNlEs7d9PS5whLeu2EIdGcxBfgpUb4tvaIi1w5i?key=cHJ2ZDFmVVBfVG8tbV80WUkwREVIVTN1aUYxQXhR">this video</a>. His insights led directly to Luke’s discovery, as well as an improved understanding of the ink signal. We’re awarding him a $10,000 First Ink Prize. Congratulations to Casey, Luke, and Youssef!
+These breakthroughs were both inspired by contestant Casey Handmer, who was the first person to find substantial, convincing evidence of ink within the unopened scrolls, as explained in his <a href="https://caseyhandmer.wordpress.com/2023/08/05/reading-ancient-scrolls/">blog post</a> and <a href="https://photos.google.com/share/AF1QipPC8Z9P1MxxS6UdoCJWDGofjxSHfBYGgDp47gSOoJW1gtKBGeIeXzAc6AbOVyhsLQ/photo/AF1QipNlEs7d9PS5whLeu2EIdGcxBfgpUb4tvaIi1w5i?key=cHJ2ZDFmVVBfVG8tbV80WUkwREVIVTN1aUYxQXhR">this video</a>. His insights led directly to Luke’s discovery, as well as an improved understanding of the ink signal. We’re awarding him a \$10,000 First Ink Prize. Congratulations to Casey, Luke, and Youssef!
 
 So how did we get here, and how do these models work? Let’s start with a little history.
 
@@ -104,7 +104,7 @@ His team also scanned and photographed detached scroll fragments bearing visible
   <figcaption className="mt-0">Training a machine learning model on the ground truth data from the detached fragments. From Stephen Parsons’ <a href="https://uknowledge.uky.edu/cs_etds/138/">PhD dissertation</a>.</figcaption>
 </figure>
 
-Professor Seales’ graduate student, Stephen Parsons, worked on detecting ink from the CT-scans using machine learning models and <a href="tutorial4">found success with the detached fragments</a>. That success caught the eye of tech entrepreneurs Nat Friedman and Daniel Gross, who started Vesuvius Challenge to accelerate this progress. They launched an open competition March of 2023, and — alongside a $700,000 Grand Prize — awarded several smaller prizes for the development of open source tools and techniques.
+Professor Seales’ graduate student, Stephen Parsons, worked on detecting ink from the CT-scans using machine learning models and <a href="tutorial4">found success with the detached fragments</a>. That success caught the eye of tech entrepreneurs Nat Friedman and Daniel Gross, who started Vesuvius Challenge to accelerate this progress. They launched an open competition March of 2023, and — alongside a \$700,000 Grand Prize — awarded several smaller prizes for the development of open source tools and techniques.
 
 Early in the summer, a small team of annotators (the “segmentation team”) joined our effort. They began <a href="tutorial3">mapping the 3D structure of the scroll</a> using tools initially built by EduceLab and improved by our community. By July we had segmented and “virtually flattened” hundreds of cm2 of papyrus.
 
@@ -241,11 +241,11 @@ The segmentation team and contestants continue to make progress, and a few days 
 
 In this image you can clearly see four and a half columns of text, separated by margins. Many more letters are now visible, though not all are immediately legible. Our papyrological team is working hard to further investigate this result, and we’ll have updates on this soon.
 
-These advancements demonstrate that the <a href="grand_prize">$700,000 Grand Prize</a> is within reach. Our optimism is at an all time high.
+These advancements demonstrate that the <a href="grand_prize">\$700,000 Grand Prize</a> is within reach. Our optimism is at an all time high.
 
 Now is the best time to get involved! Join our vibrant <a href="https://discord.gg/V4fJhvtaQn">Discord community</a>, sign up to receive <a href="https://scrollprize.substack.com/">newsletters via Substack</a>, or follow <a href="https://twitter.com/scrollprize">@scrollprize</a> on X. To get started, download some <a href="data">data</a>, walk through some of our <a href="tutorial">tutorials</a>, and catch up on the progress made by contestants by looking at the <a href="winners">prize winners</a> and <a href="community_projects">community tools</a>.
 
-Will you be the one unlocking the knowledge in hundreds of scrolls — doubling the amount of texts from antiquity — and potentially thousands more that are yet to be excavated, becoming the last hero of the Roman Empire and winning $700,000 while you’re at it?
+Will you be the one unlocking the knowledge in hundreds of scrolls — doubling the amount of texts from antiquity — and potentially thousands more that are yet to be excavated, becoming the last hero of the Roman Empire and winning \$700,000 while you’re at it?
 
 The race is on.
 

@@ -18,8 +18,14 @@ const sidebars = {
       type: 'html',
       value: '<a class="navbar__brand custom-top-header" href="/"><div class="navbar__logo"><img src="/img/social/favicon-64x64.png" alt="Vesuvius Challenge Logo" class="themedImage_ToTc themedImage--dark_i4oU"></div><b class="navbar__title text--truncate">Vesuvius Challenge</b></a>'
     },
-    { type: 'doc', id: 'landing' },
     { type: 'doc', id: 'jobs' },
+  ],
+  villaModelSidebar: [
+    {
+      type: 'html',
+      value: '<a class="navbar__brand custom-top-header" href="/"><div class="navbar__logo"><img src="/img/social/favicon-64x64.png" alt="Vesuvius Challenge Logo" class="themedImage_ToTc themedImage--dark_i4oU"></div><b class="navbar__title text--truncate">Vesuvius Challenge</b></a>'
+    },
+    { type: 'doc', id: 'villa_model' },
   ],
   overviewSidebar: [
     {
@@ -32,15 +38,16 @@ const sidebars = {
       link: { type: 'doc', id: 'landing' },
       items: [
         { type: 'doc', id: 'get_started' },
+        { type: 'doc', id: 'prizes' },
+        { type: 'doc', id: 'unwrapping' },
         { type: 'doc', id: 'master_plan' },
       ]
     },
     {
       type: 'category',
       label: 'Competition',
-      link: { type: 'doc', id: '28_2024_prizes' },
+      link: { type: 'doc', id: 'winners' },
       items: [
-        { type: 'doc', id: '28_2024_prizes' },
         { type: 'doc', id: 'winners' },
         { type: 'doc', id: 'community_projects' },
       ],
@@ -67,8 +74,7 @@ const sidebars = {
       items: [
         { type: 'doc', id: 'tutorial1' },
         { type: 'doc', id: 'tutorial2' },
-        { type: 'doc', id: 'tutorial3' },
-        { type: 'doc', id: 'tutorial4' },
+        { type: 'doc', id: 'segmentation' },
         { type: 'doc', id: 'tutorial5' },
       ],
     },
@@ -92,7 +98,8 @@ const sidebars = {
       type: 'link',
       label: 'Donate',
       href: 'https://donate.stripe.com/aEUg101vt9eN8gM144',
-    }
+    },
+    { type: 'doc', id: 'jobs' },
   ],
   archiveSidebar: [
     {

@@ -1,0 +1,51 @@
+Metadata-Version: 2.2
+Name: nnunetv2
+Version: 2.5.1
+Summary: nnU-Net is a framework for out-of-the box image segmentation.
+Author: Helmholtz Imaging Applied Computer Vision Lab
+Author-email: Fabian Isensee <f.isensee@dkfz-heidelberg.de>
+Project-URL: homepage, https://github.com/MIC-DKFZ/nnUNet
+Project-URL: repository, https://github.com/MIC-DKFZ/nnUNet
+Keywords: deep learning,image segmentation,semantic segmentation,medical image analysis,medical image segmentation,nnU-Net,nnunet
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Science/Research
+Classifier: Intended Audience :: Healthcare Industry
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: Topic :: Scientific/Engineering :: Image Recognition
+Classifier: Topic :: Scientific/Engineering :: Medical Science Apps.
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.1.2
+Requires-Dist: acvl-utils<0.3,>=0.2
+Requires-Dist: dynamic-network-architectures<0.4,>=0.3.1
+Requires-Dist: tqdm
+Requires-Dist: dicom2nifti
+Requires-Dist: scipy
+Requires-Dist: batchgenerators>=0.25
+Requires-Dist: numpy>=1.24
+Requires-Dist: scikit-learn
+Requires-Dist: scikit-image>=0.19.3
+Requires-Dist: SimpleITK>=2.2.1
+Requires-Dist: pandas
+Requires-Dist: graphviz
+Requires-Dist: tifffile
+Requires-Dist: requests
+Requires-Dist: nibabel
+Requires-Dist: matplotlib
+Requires-Dist: seaborn
+Requires-Dist: imagecodecs
+Requires-Dist: yacs
+Requires-Dist: batchgeneratorsv2>=0.2
+Requires-Dist: einops
+Requires-Dist: monai
+Requires-Dist: mamba_ssm
+Requires-Dist: edt
+Requires-Dist: timm
+Requires-Dist: opencv-python-headless
+Provides-Extra: dev
+Requires-Dist: black; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
+Requires-Dist: pre-commit; extra == "dev"

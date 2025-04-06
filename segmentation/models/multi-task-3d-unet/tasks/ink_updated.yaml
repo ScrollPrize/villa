@@ -1,0 +1,89 @@
+tr_setup:
+  model_name: webk_ink_test2
+  vram_max: 22000
+  autoconfigure: true
+  tr_val_split: 0.9
+  dilate_label: false
+  load_weights_only: false
+  ckpt_out_base: ./checkpoints
+  tensorboard_log_dir: ./logs
+tr_config:
+  optimizer: AdamW
+  patch_size:
+  - 10
+  - 128
+  - 128
+  batch_size: 12
+  max_steps_per_epoch: 500
+  max_val_steps_per_epoch: 25
+  max_epoch: 500
+model_config:
+  use_timm_encoder: false
+  timm_encoder_class: null
+
+dataset_config:
+  min_bbox_percent: 0.2
+  min_labeled_ratio: 0.2
+  use_cache: true
+  cache_file: ./patch_cache
+  wk_url: http://dl.ash2txt.org:8080/
+  wk_token:
+  targets:
+    ink:
+      in_channels: 1
+      out_channels: 1
+      activation: none
+      weight: 1
+      loss_fn: BCEWithLogitsLoss
+
+      volumes:
+      - data_volume: "/home/sean/Desktop/s1_segments/0926.zarr/layers.zarr"
+        label_volume: "/home/sean/Desktop/s1_segments/0926.zarr/inklabels.zarr"
+        format: zarr_local
+
+      - data_volume: "/home/sean/Desktop/s1_segments/1321.zarr/layers.zarr"
+        label_volume: "/home/sean/Desktop/s1_segments/1321.zarr/inklabels.zarr"
+        format: zarr_local
+
+      - data_volume: "/home/sean/Desktop/s1_segments/1619.zarr/layers.zarr"
+        label_volume: "/home/sean/Desktop/s1_segments/1619.zarr/inklabels.zarr"
+        format: zarr_local
+
+      - data_volume: "/home/sean/Desktop/s1_segments/3336.zarr/layers.zarr"
+        label_volume: "/home/sean/Desktop/s1_segments/3336.zarr/inklabels.zarr"
+        format: zarr_local
+
+      - data_volume: "/home/sean/Desktop/s1_segments/4423.zarr/layers.zarr"
+        label_volume: "/home/sean/Desktop/s1_segments/4423.zarr/inklabels.zarr"
+        format: zarr_local
+
+      - data_volume: "/home/sean/Desktop/s1_segments/5753.zarr/layers.zarr"
+        label_volume: "/home/sean/Desktop/s1_segments/5753.zarr/inklabels.zarr"
+        format: zarr_local
+
+      - data_volume: "/home/sean/Desktop/s1_segments/51002.zarr/layers.zarr"
+        label_volume: "/home/sean/Desktop/s1_segments/51002.zarr/inklabels.zarr"
+        format: zarr_local
+
+inference_config:
+  checkpoint_path: ./checkpoints/ckpt.pth
+  num_dataloader_workers: 12
+  input_path: ./data/0901/layers.zarr
+  input_format: zarr
+  output_path: ./outputs/0901
+  output_format: zarr
+  output_type: np.uint8
+  output_targets:
+  - ink
+  load_all: true
+  overlap: 0.1
+  patch_size:
+  - 128
+  - 128
+  - 128
+  batch_size: 4
+  targets:
+  - ink:
+      channels: 1
+      activation: none
+      weight: 1

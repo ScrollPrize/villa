@@ -49,7 +49,7 @@ Some highlighted contributions are added to this repository as submodules.
 
 We keep this repository updated as much as we can, but research moves _fast_! 🏃💨
 
-For state-of-the-art updates join our [Discord server](https://discord.com/invite/V4fJhvtaQn) 💬⏰
+For state-of-the-art updates join our [Discord server](https://discord.com/invite/uTfNwwecCQ) 💬⏰
 
 ## 📊 Data access/visualization
 
@@ -67,7 +67,9 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [vesuvius-phalanx](https://github.com/mvrcii/phalanx): Python library / CLI for accessing Vesuvius data. Allows flexible access to volume and fragment scroll data. By Marcel Roth
 
-- [llfio-chunkloader](https://github.com/climbmax123/LLFIOCunkloadingTestingAndBenching): A Methode to access Data in chunks of (x,y,z) that is by lot faster and compute efficient than Zarr. (Written in C++ but it is possible to integrate in Python). 
+- [llfio-chunkloader](https://github.com/climbmax123/LLFIOCunkloadingTestingAndBenching): A Methode to access Data in chunks of (x,y,z) that is by lot faster and compute efficient than Zarr. (Written in C++ but it is possible to integrate in Python).
+
+- [preprocessed-data](https://github.com/usc-caisplusplus/scroll-data-preprocessing): Data preprocessing code and a fully processed version of the dataset in .zarr format to allow for faster training of ink detection models. 
 
 ## Segmentation
 
@@ -185,6 +187,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [Instance segmentation experiments](https://discord.com/channels/1079907749569237093/1235042673899995176/1235042673899995176) by James Darby, Ryan Reszetnik, Liamo Pennimpede, Lucas Nelson
 
 - [Probabilistic view on the offset for surface volume creation](https://discord.com/channels/1079907749569237093/1177617480366170162) by Giorgio Angelotti
+
+- [Creating segments from intersecting horizontal and vertical fibers](https://gist.github.com/jrudolph/3e0ebbd6e731f794733c236a86ff39fb) by Johannes Rudolph
 
 ### 📊 Visualization
 

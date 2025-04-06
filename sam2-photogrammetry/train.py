@@ -7,10 +7,24 @@
 import numpy as np
 import torch
 import cv2
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 import wandb
 import os
+
+# Define augmentation pipeline
+augmentation = A.Compose([
+    A.HorizontalFlip(p=0.2),  # Randomly flip images horizontally
+    A.VerticalFlip(p=0.2),  # Randomly flip images vertically
+    A.RandomRotate90(p=0.2),  # Rotate 90 degrees randomly
+    A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=15, p=0.1),  # Shift, Scale, Rotate
+    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.2),  # Change brightness/contrast
+    A.GaussianBlur(blur_limit=(3, 7), p=0.2),  # Apply Gaussian Blur
+    A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=0.1),  # Elastic distortions
+    A.Resize(1024, 1024),  # Resize to fixed 1024x1024
+])
 
 # Path to the main dataset folder
 data_dir = r"photo_data/"
@@ -48,28 +62,30 @@ for scroll_folder in os.listdir(data_dir):
                                     "annotation": os.path.join(mask_path, mask_filename)
                                 })
 
-# Function to read a random batch from the dataset
-def read_batch(data):
-    # Select a random sample
-    ent = data[np.random.randint(len(data))]
-    Img = cv2.imread(ent["image"])[..., ::-1]  # Read image and convert BGR to RGB
-    ann_map = cv2.imread(ent["annotation"], cv2.IMREAD_GRAYSCALE)  # Read binary mask in grayscale
+# Function to read and augment a random batch from the dataset
+def read_batch(data, training=True):
+    ent = data[np.random.randint(len(data))]  # Randomly select an entry
+    Img = cv2.imread(ent["image"])[..., ::-1]  # Read image in RGB
+    ann_map = cv2.imread(ent["annotation"], cv2.IMREAD_GRAYSCALE)  # Read mask
 
-    # Resize image and annotation to max 1024x1024 while maintaining aspect ratio
-    r = np.min([1024 / Img.shape[1], 1024 / Img.shape[0]])
-    Img = cv2.resize(Img, (int(Img.shape[1] * r), int(Img.shape[0] * r)))
-    ann_map = cv2.resize(ann_map, (int(ann_map.shape[1] * r), int(ann_map.shape[0] * r)), interpolation=cv2.INTER_NEAREST)
+    # Apply augmentation
+    if training:
+        augmented = augmentation(image=Img, mask=ann_map)
+        Img = augmented["image"]
+        ann_map = augmented["mask"]
 
     # Get binary masks and points
-    inds = np.unique(ann_map)[1:]  # Find unique labels (skip background, assumed to be 0)
+    inds = np.unique(ann_map)[1:]  # Find unique labels (skip background)
     points = []
     masks = []
     for ind in inds:
         mask = (ann_map == ind).astype(np.uint8)
         masks.append(mask)
         coords = np.argwhere(mask > 0)
-        yx = np.array(coords[np.random.randint(len(coords))])
-        points.append([[yx[1], yx[0]]])
+        if len(coords) > 0:
+            yx = np.array(coords[np.random.randint(len(coords))])
+            points.append([[yx[1], yx[0]]])
+
     return Img, np.array(masks), np.array(points), np.ones([len(masks), 1])
 
 
@@ -156,7 +172,7 @@ for itr in range(100000):
             scaler.step(optimizer)
             scaler.update() # Mix precision
 
-            if itr%1000==0: torch.save(predictor.model.state_dict(), f"photo_{model_type}_{itr}.torch") # save model
+            if itr%1000==0: torch.save(predictor.model.state_dict(), f"photo2_{model_type}_{itr}.torch") # save model
 
             # Display results
 

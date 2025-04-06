@@ -1,0 +1,25 @@
+labels_folder: "/home/giorgio/Documents/nnUNet_raw/Dataset081_zebra-on-steroids/labels-check"
+predictions_folder: "/home/giorgio/Documents/nnUNet_raw/Dataset081_zebra-on-steroids/preds-check"
+output_csv: "metrics.csv"
+output_folder: "/home/giorgio/Projects/villa-cases/segmentation/evaluation/output"
+wandb_project: "vesuvius-challenge-evaluation"
+run_name: "recto-"
+metrics:
+  - type: "dice_multiclass"
+    hyperparameters:
+      num_classes: 4
+      ignore_index: 0
+  - type: "critical_components_multiclass"
+    hyperparameters: {}
+  - type: "connected_components"
+    hyperparameters:
+      connectivity: 26
+      num_classes: 4
+      ignore_index: 0
+  - type: "mean_ap"
+    hyperparameters:
+      ignore_index: 0
+  - type: "centerline_dice"
+    hyperparameters:
+      tolerance_radius: 3.0
+
