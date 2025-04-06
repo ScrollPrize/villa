@@ -44,4 +44,4 @@ As you will learn in the [tutorials](/tutorial), one of the big challenges of re
   </video>
 </figure>
 
-For this important subproblem, we are offering a $100,000 [Ink Detection Progress Prize](https://www.kaggle.com/competitions/vesuvius-challenge-ink-detection/). This progress prize is hosted on Kaggle, and the final submission deadline is June 14th, 2023.
+For this important subproblem, we are offering a \$100,000 [Ink Detection Progress Prize](https://www.kaggle.com/competitions/vesuvius-challenge-ink-detection/). This progress prize is hosted on Kaggle, and the final submission deadline is June 14th, 2023.

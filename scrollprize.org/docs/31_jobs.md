@@ -36,12 +36,19 @@ hide_table_of_contents: true
   />
 </head>
 
+import TOCInline from '@theme/TOCInline';
 
 # Jobs
 
 We are laser focused on our mission of reading the Herculaneum scrolls and are always interested in talking.
 If you can help us achieve this goal, please reach out to jobs@scrollprize.org.
 In addition, we are hiring for the specific roles listed below.
+
+***
+
+<TOCInline
+  toc={toc}
+/>
 
 ***
 
@@ -113,7 +120,7 @@ Send your resume, cover letter, and examples of relevant projects to jobs@scroll
 
 ## Computer Vision and Geometry Applied Researcher
 
-The Vesuvius Challenge applied researchers advance the frontier of the most promising research directions from our community, to keep making continuous progress on the most promising research avenues in virtual unrolling and related problems.
+The Vesuvius Challenge applied researchers advance the frontier of the most promising research directions from our community, to keep making continuous progress on the most promising research avenues in virtual unwrapping and related problems.
 
 #### Overview
 If the Vesuvius Challenge community performs a breadth-first search of research ideas to help us read the scrolls, this role performs depth-first search. We (and you!) are laser focused on solving the remaining hurdles to extract these hidden texts from their scroll confines.
@@ -177,10 +184,10 @@ This is a full-time position (30+ hours/week). Pay rate up to 40USD per hour.
 - C/C++, Python
 
 #### Impact
-Not only will you unroll ancient scrolls and be the first human to lay eyes on the resulting text in two millennia, your efforts will directly contribute to automation of unrolling, which is a key ingredient to help catalyze further excavation of Herculaneum and unearth the only remaining library from antiquity before it is too late! 
+Not only will you unwrap ancient scrolls and be the first human to lay eyes on the resulting text in two millennia, your efforts will directly contribute to automation of unwrapping, which is a key ingredient to help catalyze further excavation of Herculaneum and unearth the only remaining library from antiquity before it is too late! 
 
 #### To Apply
-Send your resume, cover letter, and examples of relevant projects to ben@scrollprize.org. Include "Annotation Specialist" in the subject line.
+Send your resume, cover letter, and examples of relevant projects to jobs@scrollprize.org. Include "Annotation Specialist" in the subject line.
 
 ***
 

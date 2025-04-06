@@ -36,7 +36,7 @@ hide_table_of_contents: true
   />
 </head>
 
-Be sure to check [Discord](https://discord.gg/V4fJhvtaQn), [Substack](https://scrollprize.substack.com/), and [X](https://x.com/scrollprize) for livestream announcements!
+Be sure to check [Discord](https://discord.com/invite/uTfNwwecCQ), [Substack](https://scrollprize.substack.com/), and [X](https://x.com/scrollprize) for livestream announcements!
 
 ### July 31, 2024 - Office Hours
 

@@ -3,6 +3,7 @@
 import argparse
 import numpy as np
 import torch
+import gc
 from PIL import Image
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -146,8 +147,8 @@ def process_video_dir(video_dir: Path, mask_generator, predictor, recompute=Fals
     # The frame index where we add the initial annotation
     ann_frame_idx = 0
 
-    # Add each mask except the last (assuming last is the bright background)
-    for ann_obj_id in range(max(len(masks) - 1, 1)):
+    # Add each mask except the last
+    for ann_obj_id in range(len(masks)):
         _, _, _, = predictor.add_new_mask(
             inference_state=inference_state,
             frame_idx=ann_frame_idx,
@@ -186,6 +187,7 @@ def process_video_dir(video_dir: Path, mask_generator, predictor, recompute=Fals
 
         save_segmented_mask(mask, mask_path)
 
+        predictor.reset_state(inference_state)
 
 def main():
     # Parse command line arguments
@@ -213,7 +215,7 @@ def main():
     parser.add_argument(
         "--photo_t_checkpoint",
         type=str,
-        default="./checkpoints/photo_t_2000.torch",
+        default="./checkpoints/photo2_ruler_t_1000.torch",
         help="Relative or absolute path to the photo_t checkpoint for partial model weights."
     )
     # New argument: if set, force recomputation
@@ -266,8 +268,8 @@ def main():
     mask_generator = SAM2AutomaticMaskGenerator(
         sam2,
         points_per_side=64,
-        points_per_batch=6,
-        min_mask_region_area=256,
+        points_per_batch=16,
+        min_mask_region_area=2048,
         use_m2m=True
     )
 
@@ -299,6 +301,8 @@ def main():
             predictor=predictor,
             recompute=args.recompute
         )
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

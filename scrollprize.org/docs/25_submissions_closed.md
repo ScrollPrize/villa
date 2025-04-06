@@ -50,7 +50,7 @@ We have accelerated progress on this amazing research problem, and we will read 
 
 Vesuvius Challenge is not over.
 Along with Grand Prize results, we will soon announce the next stages.
-For now, please stay engaged in our [community on Discord](https://discord.gg/V4fJhvtaQn), where discussion and exploration are ongoing.
+For now, please stay engaged in our [community on Discord](https://discord.com/invite/uTfNwwecCQ), where discussion and exploration are ongoing.
 The [datasets](data) will also remain available on our data server.
 
 Happy New Year to all, and let's make 2024 as incredible as 2023!

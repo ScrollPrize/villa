@@ -45,7 +45,7 @@ The core principle of ThaumatoAnakalyptor involves extracting 3D points on papyr
 
 - **Segmentation and Mesh Formation:** The PointCloud volume is split into subvolumes, and a 3D instance segmentation algorithm clusters the surface points to instances of sheet patches. A Random Walk procedure is employed to stitch patches together into a sheet of points containing the 3D position and their respective winding number. Using Poisson surface reconstruction, the sheet points are then transformed into a mesh.
 
-- **Texturing:** The mesh is unrolled to generate UV coordinates. Sub-meshes are created for easier texturing. Volume Cartographer's render pipeline textures the sheet's surface.
+- **Texturing:** The mesh is unwrapped to generate UV coordinates. Sub-meshes are created for easier texturing. Volume Cartographer's render pipeline textures the sheet's surface.
 
 
 ## Running the Code

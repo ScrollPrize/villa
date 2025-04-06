@@ -42,7 +42,7 @@ slug: "2024_gp_submissions"
 
 <div>If you have a qualifying result, submit it for consideration by sending an email to <a href="mailto:grandprize@scrollprize.org">grandprize@scrollprize.org</a> and provide the following:</div>
 
-* **Images.** Submissions must be in the form of images of the virtually unrolled papyrus, showing visible and legible text.
+* **Images.** Submissions must be in the form of images of the virtually unwrapped papyrus, showing visible and legible text.
     * Submit a single static image for each scroll. If necessary, the image can be tiled to reasonable dimensions. Images must be generated programmatically, as direct outputs of CT data inputs, and should not contain manual annotations of characters or text.
     * Specify which scroll each image came from.
     * Specify where in the scroll they were found: include information about the position of the text vertically as well as radially within the scroll. One easy way to do this is to provide images showing the 3D position of the text surface inside the scroll.

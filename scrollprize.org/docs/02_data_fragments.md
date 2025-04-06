@@ -69,7 +69,7 @@ Originally held back for automated scoring in the [Kaggle](https://kaggle.com/co
 <p>Volume [20230222173037](https://dl.ash2txt.org/fragments/Frag4/PHercParis1Fr39.volpkg/volumes/20230222173037/): 3.24µm, 88keV, 9209 x 24MB .tif files. Total size: 216 GB</p>
 
 **Fragment 5 (PHerc. 1667 Cr 1 Fr 3)**
-From the same original scroll as Scroll 4 (PHerc. 1667), which was partially unrolled in 1987 using the Oslo method. Find this fragment on [Chartes.it](https://www.chartes.it/index.php?r=document/view&id=1691).
+From the same original scroll as Scroll 4 (PHerc. 1667), which was partially opened in 1987 using the Oslo method. Find this fragment on [Chartes.it](https://www.chartes.it/index.php?r=document/view&id=1691).
 <div className="flex flex-wrap mb-4">
   <div className="w-[45%] mb-2 mr-2 max-w-[300px]"><img src="/img/data/fr5-2.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">Fragment 5 (PHerc. 1667 Cr 1 Fr 3)</figcaption></div>
 </div>

@@ -18,6 +18,7 @@ def main():
     parser.add_argument('--display', action='store_true')
     parser.add_argument('--remote', action='store_true')
     parser.add_argument('--nr_workers', type=int, default=None)
+    parser.add_argument('--max_side_triangle', type=int, default=None)
     parser.add_argument('--start', type=int, default=0)
     parser.add_argument('--end', type=int, default=None)
 
@@ -46,7 +47,7 @@ def main():
         print(f"Texturing {obj_path}")
         # Call mesh_to_surface as a separate process
         command = [
-            "python", "-m", "scroll-renderer.mesh_to_surface",
+            "mesh_to_surface",
             obj_path, args.scroll,
             "--gpus", str(args.gpus),
             "--r", str(args.r),
@@ -58,6 +59,9 @@ def main():
             command.append("--remote")
         if args.nr_workers is not None:
             command.extend(["--nr_workers", str(args.nr_workers)])
+        if args.max_side_triangle is not None:
+            command.extend(["--max_side_triangle", str(args.max_side_triangle)])
+     
         # Running the command
         process_rendering = subprocess.Popen(command)
         process_rendering.wait()

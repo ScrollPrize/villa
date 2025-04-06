@@ -1,0 +1,283 @@
+---
+title: "Virtual Unwrapping"
+hide_table_of_contents: true
+math: true
+---
+import BeforeAfter from '@site/src/components/BeforeAfter';
+import Head from '@docusaurus/Head';
+
+<Head>
+  <html data-theme="dark" />
+  <meta name="description" content="A $1,000,000+ machine learning and computer vision competition" />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://scrollprize.org" />
+  <meta property="og:title" content="Vesuvius Challenge" />
+  <meta property="og:description" content="A $1,000,000+ machine learning and computer vision competition" />
+  <meta property="og:image" content="https://scrollprize.org/img/social/opengraph.jpg" />
+  <meta property="twitter:card" content="summary_large_image" />
+  <meta property="twitter:url" content="https://scrollprize.org" />
+  <meta property="twitter:title" content="Vesuvius Challenge" />
+  <meta property="twitter:description" content="A $1,000,000+ machine learning and computer vision competition" />
+  <meta property="twitter:image" content="https://scrollprize.org/img/social/opengraph.jpg" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.13.11/dist/katex.min.css" />
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.13.11/dist/katex.min.js" async></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.13.11/dist/contrib/auto-render.min.js" async defer></script>
+</Head>
+
+# Virtual Unwrapping
+
+The image data of the Herculaneum scrolls (PHerc 172) look like this:
+<iframe 
+    src="https://neuroglancer-demo.appspot.com/#!%7B%22dimensions%22:%7B%22z%22:%5B1%2C%22%22%5D%2C%22y%22:%5B1%2C%22%22%5D%2C%22x%22:%5B1%2C%22%22%5D%7D%2C%22position%22:%5B6604%2C3584.962158203125%2C3800.589599609375%5D%2C%22crossSectionOrientation%22:%5B0.5%2C0.5%2C-0.5%2C-0.5%5D%2C%22crossSectionScale%22:9.97573495387749%2C%22projectionOrientation%22:%5B-0.15356537699699402%2C0.12269044667482376%2C0.013992083258926868%2C0.9803922176361084%5D%2C%22projectionScale%22:13614.041135923644%2C%22layers%22:%5B%7B%22type%22:%22image%22%2C%22source%22:%7B%22url%22:%22zarr2://https://dl.ash2txt.org/other/dev/scrolls/5/volumes/53keV_7.91um.zarr/%22%2C%22subsources%22:%7B%22default%22:true%2C%22bounds%22:true%7D%2C%22enableDefaultSubsources%22:false%7D%2C%22tab%22:%22source%22%2C%22name%22:%2253keV_7.91um.zarr%22%7D%5D%2C%22selectedLayer%22:%7B%22layer%22:%2253keV_7.91um.zarr%22%7D%2C%22layout%22:%224panel%22%7D"
+    width="100%" height="600">
+</iframe>
+
+It's a mess! The scrolls, that survived a volcanic eruption and were buried under lava and mud for centuries, are carbonized, damaged, frayed and, most importantly, still wrapped!
+
+To read a scroll, we first need to unwrap it... **virtually**!
+
+If, within the chaotic 3D image you are observing, you can isolate a contiguous region of the papyrus sheet, you can approximate it with a 2-manifold—specifically, an orientable genus-0 developable surface. This allows you to construct a bidimensional isometric parametrization[^1] on the manifold, thereby defining a local basis.
+
+The 2-manifold is typically represented as a non-watertight triangular mesh. When rendered in the coordinate frame established by its local basis, the surface appears flat, provided that the parametrization is derived from an isometric mapping from 3D to 2D. In this case, local distances, shapes, and angles are preserved, ensuring geometric fidelity in the transformation.
+
+<div className="mb-4">
+  <img src="/img/virtual-unwrapping/s5-segment.png" className="w-[60%]"/>
+  <figcaption className="mt-[-6px]">A triangular mesh in 3D space.</figcaption>
+</div>
+
+<BeforeAfter
+  beforeImage="https://dl.ash2txt.org/full-scrolls/Scroll5/PHerc172.volpkg/paths/20241108120732/composite.jpg"
+  afterImage="https://dl.ash2txt.org/full-scrolls/Scroll5/PHerc172.volpkg/paths/20241108120732/20241108120732_prediction_rotated_0_layer_17.png"
+/>
+
+By rendering the mesh in 2D and observing the now-flattened papyrus sheet, faint letters begin to emerge — appearing as brighter regions in the figure. These weak ink traces are captured by machine learning, that can enhance their visibility and improve text recovery.
+
+## The Open Question
+
+Virtual unwrapping is essential to read the scrolls, but far from trivial.
+
+The open question that has been puzzling our community for more than one year, and Dr. Seales’ research for over twenty-five years, is the following:
+
+> **Can we find an automated way to isolate the 2-manifold that represents the rolled scroll in the 3D images?**
+
+We were awarding \$100k to anyone that could solve this problem by the end of 2024. The prize was left unclaimed.
+
+However, both the community and the team worked on three approaches that are currently the state-of-the-art in virtual unwrapping attempts:
+- Spiral Fitting
+- Surface Tracer
+- Thaumato Anakalyptor
+
+On a **very high level**, all three methods apply two major steps:
+1. Extract from the raw data a more manageable **intermediate representation** (via ML or classic filters).
+2. Process this representation into a surface mesh (via either top-down or bottom-up strategies).
+
+<div className="mb-4">
+  <img src="/img/virtual-unwrapping/ir.png" className="w-[70%]"/>
+  <figcaption className="mt-[-6px]">Example of intermediate representations.</figcaption>
+</div>
+
+**Top-down approaches** solve a global optimization problem: they try to fit a complete surface representing the scroll to the intermediate representation at once.
+
+**Bottom-up approaches** solve a local optimization problem, building small patches that are then stitched together coherently.
+
+All approaches rely also on the information about the scroll umbilicus. Unfortunately, no method currently manages to fit the intended surface to the data!
+
+Let us delve into the details of how the current state-of-the-art methods work.
+
+## Top-down methods
+
+### Spiral Fitting
+
+**(Overview)**  
+This method leverages the idea that the scroll, in its original form, was a 2D spiral extruded in a 3D shape with approximate cylindrical symmetry. Once flattened, the papyrus sheet is nearly rectangular, with locally perpendicular fibers. The approach attempts to find the transformation that deformed this canonical spiral into the observed data.
+
+<div className="mb-4">
+  <img src="/img/virtual-unwrapping/spiral.jpg" className="w-[70%]"/>
+  <figcaption className="mt-[-6px]">An archimedean spiral in red, before (left) and after (right) being fit to the scroll surface predictions (in green).</figcaption>
+</div>
+
+#### Intermediate Representations
+
+The method extracts useful intermediate representations from the raw 3D images using machine learning–based semantic segmentation, more specifically nnUNet[^2], to isolate characteristic features that can be used in the fitting step.
+
+
+Specifically, the extracted intermediate representations are:
+- **Surface sheets predictions**: $\mathcal{S}$
+- **Vertical papyrus fibers predictions**: $\mathcal{F}_v$
+- **Horizontal papyrus fibers predictions**: $\mathcal{F}_h$
+
+These representations are not free from mistakes (e.g., fake mergers or false positives), but they still make the geometry easier to handle than raw data alone.
+
+<div className="mb-4">
+  <img src="/img/virtual-unwrapping/fibers.png" className="w-[70%]"/>
+  <figcaption className="mt-[-6px]">Vertical fibers (red) and horizontal fibers (blue) highlighted in a papyrus fragment.</figcaption>
+</div>
+
+#### Geometry Processing
+
+Given surface predictions $\mathcal{S}$, vertical papyrus fibers $\mathcal{F}_v$, horizontal papyrus fibers $\mathcal{F}_h$, and a canonical non-deformed spiral $\mathcal{S}_0$, the goal is to find a **3D diffeomorphism**, i.e. a differentiable and invertible transformation from $\mathcal{S}_0$ to $\mathcal{S}$.
+
+We can represent this transformation as an **integrable, parametrized flow field** $\mathbf{u}(\mathbf{x})$ in the full 3D volume. The canonical spiral $\mathcal{S}_0$ is displaced by the flow vectors $\mathbf{u}$. To find the best flow field, we minimize a global objective that aligns the deformed canonical surface to the intermediate representation while enforcing fiber directions.
+For example, by an abuse of notation:
+
+$$
+\min_{\mathbf{u}(\mathbf{x})} \Bigg[
+  \int_{\Omega} d\Omega \underbrace{\big\| (\mathcal{S}_0(\mathbf{x}) + \mathbf{u}(\mathbf{x})) - \mathcal{S}(\mathbf{x}) \big\|^2}_{\text{data fidelity}}
+  + \underbrace{\lambda R(\mathbf{u}, \mathcal{F}_v, \mathcal{F}_h)}_{\text{fiber base regularization}}
+\Bigg]
+$$
+
+where $\mathcal{S}_0(\mathbf{x}) + \mathbf{u}(\mathbf{x})$ represents the canonical spiral displaced by the flow field, $\Omega$ is the domain in the 3D volume, and $R(\mathbf{u}, \mathcal{F}_v, \mathcal{F}_h)$ enforces that vertical/horizontal fibers in $\mathcal{S}$ match up properly when flattened.
+
+#### First Automated Segmentation Prize Submission
+Spiral fitting was submitted by Prof Paul Henderson for the First Automated Segmentation Prize of 2024.
+Although it did not meet the needed quality criteria to win, it was the most elegant solution according to the Vesuvius Challenge Team.
+
+<div className="mb-4">
+  <a href="/img/virtual-unwrapping/fasp-spiral-fitting.jpg" target="_blank" rel="noopener noreferrer">
+    <img src="/img/virtual-unwrapping/fasp-spiral-fitting.jpg" className="w-[70%] cursor-pointer" />
+  </a>
+  <figcaption className="mt-[-6px]">FASP - Spiral Fitting submission (almost zero human input)</figcaption>
+</div>
+
+For more information, visit [this repository](https://github.com/pmh47/spiral-fitting).
+
+## Bottom-up methods
+
+### Surface Tracer
+
+**(Overview)**  
+Surface Tracer recognizes that, physically, the papyrus sheet is relatively continuous and should not bend abruptly from one point to the next. Instead of a global approach, it grows a surface mesh **locally** by “tracing” the sheet.
+
+#### Intermediate Representation
+As with Spiral Fitting, a semantic segmentation of the surface sheet is obtained using nnUNet[^2]. The predictions may contain fake mergers, holes, and other errors, but they focus on identifying likely surface voxels.
+
+<div className="mb-4">
+  <img src="/img/virtual-unwrapping/surface-predictions.jpg" className="w-[70%]"/>
+  <figcaption className="mt-[-6px]">Slice showing Machine Learning prediction of the surface.</figcaption>
+</div>
+
+
+#### Geometry Processing
+Starting from one or multiple small patches on the intermediate representation, the method **iteratively expands** these patches. In each step, a new point on the fringe is chosen to minimize a local objective. A typical local objective might be:
+
+$$
+\min_{\mathbf{x}_{new}} \Big[
+    \underbrace{\lambda_{\text{data}} \, d(\mathbf{x}_{new}, \mathcal{S})}_{\text{data fidelity}}
+    +\underbrace{ \lambda_{\text{dist}} \, \|\mathbf{x}_{new} - \mathbf{x}_{\text{fringe}}\|
+    + \lambda_{\text{bend}} \, B(\mathbf{x}_{new}, M_{\text{current}})}_{\text{physical inspired term}}
+\Big]
+$$
+
+
+where:
+- $d(\mathbf{x}_{new}, \mathcal{S})$ measures how well the new point sits on the surface predictions,
+- $\|\mathbf{x}_{new} - \mathbf{x}_{\text{fringe}}\|$ prevents large jumps,
+- $B(\mathbf{x}_{new}, M_{\text{current}})$ measures how adding the new point affects the mesh local curvature (flatness).
+
+Every *n* iterations, the mesh is smoothed to better approximate a developable surface. Because growing a single mesh is slow, multiple patches are grown in parallel and then merged via a consensus algorithm.
+
+<figure>
+  <iframe src="/vid/big_patch.mp4" width="600" height="400" allow="autoplay; encrypted-media" allowFullScreen></iframe>
+  <figcaption>The surface tracer in action.</figcaption>
+</figure>
+
+Finally, human annotators should manually further refine the results to reduce mistakes in the obtained mesh.
+
+#### First Automated Segmentation Prize Submission
+The surface tracer was submitted by Dr Hendrik Schilling and Sean Johnson for the First Automated Segmentation Prize of 2024.
+Although it did not meet the needed quality criteria to win, it was very close to the target!
+
+<div className="mb-4">
+  <a href="/img/virtual-unwrapping/fasp-surface-tracer.jpg" target="_blank" rel="noopener noreferrer">
+    <img src="/img/virtual-unwrapping/fasp-surface-tracer.jpg" className="w-[70%] cursor-pointer" />
+  </a>
+  <figcaption className="mt-[-6px]">FASP - Surface tracer submission (4 hours of human input)</figcaption>
+</div>
+
+More information [here](https://github.com/hendrikschilling/FASP).
+
+### Thaumato Anakalyptor
+
+**(Overview)**  
+Thaumato Anakalyptor focuses on extracting a dense point cloud of the scroll surface by thresholding gradient-like features, then clustering those points locally to form continuous patches, which are finally stitched into a global surface.
+
+#### Intermediate Representation
+The raw data is first blurred with a box filter. Then a surface-like point cloud is extracted by thresholding on both first and second derivatives via Sobel filters. This approach loosely resembles a 3D Canny-edge filter [^3], though it lacks some refined steps like Gaussian averaging, non-maximum suppression and hysteresis thresholding.
+
+A limitation is that compressed regions may yield lower point-cloud density, cross-fiber edges can be falsely extracted, and scan artifacts (e.g. beam hardening effect) can be mistakenly detected as false surfaces. Nevertheless, based on visual inspection, the point clouds appear to decently represent the intended sheet surfaces.
+
+<div className="mb-4">
+  <img src="/img/virtual-unwrapping/thaumato-ir.png" className="w-[70%]"/>
+  <figcaption className="mt-[-6px]">Slice showing surface point clouds (blue) in Scroll 5 (PHerc 172).</figcaption>
+</div>
+
+#### Geometry Processing
+The resulting point cloud is divided into overlapping chunks. Within each chunk, machine learning instance segmentation (i.e., Mask3D[^4]) clusters the points into patches belonging to different wraps of the scroll. The cluster instances are then mapped to a graph where possibly adjacent instances are nodes $n \in N$ linked by edges $e \in E$ with weights $w(e) \in \mathbb{R}$. The instances are then stitched together by solving a global connectivity graph problem that assigns consistent “winding angles” around the scroll umbilicus to each patch, forming a single coherent mesh, and correcting segmentation errors.
+
+Mathematically, Thaumato Anakalyptor seeks to find a winding angle assignment function $ f: N \rightarrow \mathbb{R} $, where $N$ are the nodes in the graph and $f(n)$ is a winding angle.
+
+Ideally, a solution could be:
+
+$$
+f^* = \arg\max_{f \in F} \sum_{e \in E} w(e) \cdot c(e)
+$$
+
+where
+
+$$
+c((n_0, n_1)) = 
+\begin{cases} 
+1, & \text{if } f(n_1) - f(n_0) = k((n_0, n_1)) \\
+0, & \text{otherwise}
+\end{cases}
+$$
+
+with $k$ being the observed winding angle difference.
+The optimization looks for the assignment with the least number of wrongly estimated edge winding angle differences.
+
+<figure>
+  <iframe src="/vid/graph_solver.mp4" width="600" height="400" allow="autoplay; encrypted-media" allowFullScreen></iframe>
+  <figcaption>Example run of the graph solver on Scroll 1 (PHerc Paris 4). Each sheet is visible as a separate line in the image. Colored lines are sheets belonging to the Grand Prize Banner. Every point in a line is a single clustered patch.</figcaption>
+</figure>
+
+#### 2023 Ink Detection Grand Prize - Additional Material
+An early version of Thaumato Anakalyptor, developed by Julian Schilliger, was included as additional material in the submission that won the 2023 Ink Detection Grand Prize.
+
+This is a recent (as of Juanuary 2025) virtual unwrapping attempt with Thaumato Anakalyptor on Scroll 5 (PHerc 172).
+
+<div className="mb-4">
+  <a href="/img/virtual-unwrapping/thaumato-s5jan.jpg" target="_blank" rel="noopener noreferrer">
+    <img src="/img/virtual-unwrapping/thaumato-s5jan.jpg" className="w-[70%] cursor-pointer" />
+  </a>
+  <figcaption className="mt-[-6px]">Virtual unwrapping attempt with Thaumato Anakalyptor on Scroll 5 (almost zero human input).</figcaption>
+</div>
+
+
+Another high-level review of the Thaumato Anakalyptor segmentation can be found [here](tutorial4), and a technical report and roadmap can be found [here](https://github.com/ScrollPrize/villa/blob/main/thaumato-anakalyptor/documentation/ThaumatoAnakalyptor___Technical_Report_and_Roadmap.pdf).
+
+---
+
+## **Conclusion**
+
+All three methods—**Spiral Fitting**, **Surface Tracer**, and **Thaumato Anakalyptor**—share *at a very high level* a similar pipeline of extracting an **intermediate representation** and then building a **surface mesh** via **geometry processing**. However, each takes a different path to deal with errors and ambiguities in the data:
+- **Spiral Fitting** uses a **global** approach to align a canonical shape to the segmented surface and fiber directions.
+- **Surface Tracer** **locally** expands a mesh from patches, carefully balancing data fidelity and smoothness.
+- **Thaumato Anakalyptor** focuses on a **point-cloud** extraction and **local** segmentation strategy, which it then stitches into a global mesh.
+
+Despite these advances, the problem is still unsolved. No method so far manages to perfectly fit the wanted surface to the data.
+The most common error is **sheet switching**, i.e. when the fitted surface jumps a winding, resulting in a distorted, non realistic shape.
+We need your help to virtually unwrap the Herculaneum scrolls.
+
+---
+## References
+
+[^1]: Rabinovich et al. (2017). _Scalable Locally Injective Mappings_. ACM Transactions on Graphics (TOG), 36(4), 1.
+
+[^2]: Isensee et al. (2024). _nnU-Net Revisited: A Call for Rigorous Validation in 3D Medical Image Segmentation_, International Conference on Medical Image Computing and Computer-Assisted Intervention (pp. 488-498). Cham: Springer Nature Switzerland.
+
+[^3]: Canny, J. (1986), _A Computational Approach To Edge Detection_, IEEE Transactions on Pattern Analysis and Machine Intelligence, 8(6):679–698.
+
+[^4]: Schult et al. (2023). _Mask3D: Mask Transformer for 3D Semantic Instance Segmentation_. Paper presented at the International Conference on Robotics and Automation (ICRA).
+
+

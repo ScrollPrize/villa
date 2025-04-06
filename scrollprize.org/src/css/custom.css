@@ -5,6 +5,10 @@
  */
 
 /* https://dev.to/sajclarke_62/using-tailwindcss-v3-in-docusaurus-in-5-steps-5c26 */
+/* Load KaTeX styles first to avoid overriding other styles */
+@import "katex/dist/katex.min.css";
+
+/* Tailwind should come after KaTeX to avoid getting overridden */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;

@@ -1,0 +1,5 @@
+-e .
+uv
+ipykernel
+nbconvert
+tqdm
