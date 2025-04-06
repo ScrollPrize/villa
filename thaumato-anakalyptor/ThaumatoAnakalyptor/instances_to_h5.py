@@ -114,6 +114,7 @@ def process_instance_archive(archive_path, h5_file, group_prefix="", compression
             
             try:
                 points, normals, colors = load_ply_file(ply_file)
+                points = points.astype(np.float32)
             except Exception as e:
                 print(f"[ERROR] Reading {ply_file}: {e}")
                 continue
