@@ -277,6 +277,7 @@ public:
     
                 // --- Read the "points" dataset ---
                 hid_t points_dset = H5Dopen2(surface_group_id, "points", H5P_DEFAULT);
+                hid_t dtype_points = H5Dget_type(points_dset);
                 if (points_dset < 0) {
                     std::cerr << "Dataset 'points' not found in " << surface_group_name << std::endl;
                     H5Gclose(surface_group_id);
@@ -304,7 +305,19 @@ public:
                 size_t num_points = dims[0]; // Number of vertices
                 // Read points data (assumed to be stored as double, shape: [num_points x 3])
                 std::vector<double> points_data(num_points * 3);
-                H5Dread(points_dset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, points_data.data());
+                if (H5Tequal(dtype_points, H5T_NATIVE_DOUBLE) > 0) {
+                    H5Dread(points_dset, dtype_points, H5S_ALL, H5S_ALL, H5P_DEFAULT, points_data.data());
+                }
+                else {
+                    std::vector<float> points_data_(num_points * dims[1]);
+                    H5Dread(points_dset, dtype_points, H5S_ALL, H5S_ALL, H5P_DEFAULT, points_data_.data());
+                    // cast to float
+                    for (size_t i = 0; i < num_points; ++i) {
+                        for (size_t j = 0; j < dims[1]; ++j) {
+                            points_data[i * dims[1] + j] = static_cast<double>(points_data_[i * dims[1] + j]);
+                        }
+                    }
+                }
                 H5Sclose(points_space);
                 H5Dclose(points_dset);
     
@@ -313,13 +326,26 @@ public:
                 bool exist_normal = pathExists(surface_group_id, "normals");
                 if (exist_normal) {
                     hid_t normals_dset = H5Dopen2(surface_group_id, "normals", H5P_DEFAULT);
+                    hid_t dtype_normals = H5Dget_type(normals_dset);
                     hid_t normals_space = H5Dget_space(normals_dset);
                     int ndims_normals = H5Sget_simple_extent_ndims(normals_space);
                     hsize_t dims_normals[2];
                     H5Sget_simple_extent_dims(normals_space, dims_normals, nullptr);
                     if (dims_normals[1] == 3) {
                         normals_data.resize(num_points * 3);
-                        H5Dread(normals_dset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, normals_data.data());
+                        if (H5Tequal(dtype_normals, H5T_NATIVE_DOUBLE) > 0) {
+                            H5Dread(normals_dset, dtype_normals, H5S_ALL, H5S_ALL, H5P_DEFAULT, normals_data.data());
+                        }
+                        else {
+                            std::vector<float> normals_data_(num_points * dims_normals[1]);
+                            H5Dread(points_dset, dtype_normals, H5S_ALL, H5S_ALL, H5P_DEFAULT, normals_data_.data());
+                            // cast to float
+                            for (size_t i = 0; i < num_points; ++i) {
+                                for (size_t j = 0; j < dims_normals[1]; ++j) {
+                                    normals_data[i * dims_normals[1] + j] = static_cast<double>(normals_data_[i * dims_normals[1] + j]);
+                                }
+                            }
+                        }
                     }
                     else {
                         // something is wrong here
@@ -340,9 +366,15 @@ public:
     
                 // --- Read the "colors" dataset ---
                 std::vector<unsigned char> colors_data;
+                colors_data.resize(num_points * 3);
                 bool exist_colors = pathExists(surface_group_id, "colors");
                 if (exist_colors) {
                     hid_t colors_dset = H5Dopen2(surface_group_id, "colors", H5P_DEFAULT);
+                    hid_t dtype = H5Dget_type(colors_dset);
+                    if (dtype < 0) {
+                        std::cerr << "Failed to get the datatype." << std::endl;
+                        // Handle error...
+                    }
                     if (colors_dset < 0) {
                         std::cerr << "Dataset 'colors' not found in " << surface_group_name << std::endl;
                         H5Gclose(surface_group_id);
@@ -356,36 +388,43 @@ public:
                     int ndims_colors = H5Sget_simple_extent_ndims(colors_space);
                     hsize_t dims_colors[2];
                     H5Sget_simple_extent_dims(colors_space, dims_colors, nullptr);
-                    if (dims_colors[1] == 3) {
-                        colors_data.resize(num_points * 3);
-                        H5Dread(colors_dset, H5T_NATIVE_UCHAR, H5S_ALL, H5S_ALL, H5P_DEFAULT, colors_data.data());
-                    }
-                    else if (dims_colors[1] == 1) {
-                        // If only one color value per point, duplicate it to form an RGB triplet.
-                        std::vector<unsigned char> temp_colors(num_points);
-                        H5Dread(colors_dset, H5T_NATIVE_UCHAR, H5S_ALL, H5S_ALL, H5P_DEFAULT, temp_colors.data());
-                        colors_data.resize(num_points * 3);
+                    std::vector<float> temp_colors(num_points * dims_colors[1]);
+                    // Check if the dataset is double or float.
+                    if (H5Tequal(dtype, H5T_NATIVE_DOUBLE) > 0) {
+                        std::vector<double> temp_colors_(num_points * dims_colors[1]);
+                        H5Dread(colors_dset, dtype, H5S_ALL, H5S_ALL, H5P_DEFAULT, temp_colors_.data());
+                        // cast to float
                         for (size_t i = 0; i < num_points; ++i) {
-                            unsigned char value = temp_colors[i];
-                            colors_data[i * 3 + 0] = value;
-                            colors_data[i * 3 + 1] = value;
-                            colors_data[i * 3 + 2] = value;
+                            for (size_t j = 0; j < dims_colors[1]; ++j) {
+                                temp_colors[i * dims_colors[1] + j] = static_cast<float>(temp_colors_[i * dims_colors[1] + j]);
+                            }
                         }
                     }
                     else {
-                        // std::cout << "Unexpected number of dimensions for colors dataset: " << dims_colors[1] << std::endl;
-                        colors_data.resize(num_points * 3);
+                        // Read the colors as float
+                        H5Dread(colors_dset, dtype, H5S_ALL, H5S_ALL, H5P_DEFAULT, temp_colors.data());
+                    }
+
+                    if (dims_colors[1] >= 3) {
                         for (size_t i = 0; i < num_points; ++i) {
-                            colors_data[i * 3 + 0] = 0.0;
-                            colors_data[i * 3 + 1] = 0.0;
-                            colors_data[i * 3 + 2] = 0.0;
+                            colors_data[i * 3 + 0] = static_cast<unsigned char>(temp_colors[i * dims_colors[1] + 0] * 255);
+                            colors_data[i * 3 + 1] = static_cast<unsigned char>(temp_colors[i * dims_colors[1] + 1] * 255);
+                            colors_data[i * 3 + 2] = static_cast<unsigned char>(temp_colors[i * dims_colors[1] + 2] * 255);
+                        }
+                    }
+                    else {
+                        // If only one color value per point, duplicate it to form an RGB triplet.
+                        for (size_t i = 0; i < num_points; ++i) {
+                            unsigned char value = static_cast<unsigned char>(temp_colors[i*dims_colors[1]] * 255);
+                            colors_data[i * 3 + 0] = value;
+                            colors_data[i * 3 + 1] = value;
+                            colors_data[i * 3 + 2] = value;
                         }
                     }
                     H5Sclose(colors_space);
                     H5Dclose(colors_dset);
                 }
                 else {
-                    colors_data.resize(num_points * 3);
                     for (size_t i = 0; i < num_points; ++i) {
                         colors_data[i * 3 + 0] = 0.0;
                         colors_data[i * 3 + 1] = 0.0;

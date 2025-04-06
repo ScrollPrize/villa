@@ -115,6 +115,7 @@ def process_instance_archive(archive_path, h5_file, group_prefix="", compression
             try:
                 points, normals, colors = load_ply_file(ply_file)
                 points = points.astype(np.float32)
+                colors = colors.astype(np.float32)
             except Exception as e:
                 print(f"[ERROR] Reading {ply_file}: {e}")
                 continue
@@ -122,6 +123,10 @@ def process_instance_archive(archive_path, h5_file, group_prefix="", compression
             # Use only the second entry of the colors data
             if colors.ndim == 2 and colors.shape[1] >= 2:
                 colors = colors[:, 1]
+                # extend to n, 1
+                colors = np.expand_dims(colors, axis=1)
+                assert len(colors.shape) == 2, f"Colors data in {ply_file} should be 2D after slicing, but got {colors.shape}."
+                assert colors.shape[1] == 1, f"Colors data in {ply_file} should have 1 column after slicing, but got {colors.shape[1]}."
             else:
                 print(f"[WARNING] Colors data in {ply_file} does not have at least 2 columns.")
                 continue
@@ -138,8 +143,8 @@ def process_instance_archive(archive_path, h5_file, group_prefix="", compression
             surface_grp.create_dataset("points", data=points, compression=compression,
                                          compression_opts=compression_level if compression == 'gzip' else None)
             # # Normals are no longer saved.
-            # surface_grp.create_dataset("colors", data=colors, compression=compression,
-            #                              compression_opts=compression_level if compression == 'gzip' else None)
+            surface_grp.create_dataset("colors", data=colors, compression=compression,
+                                         compression_opts=compression_level if compression == 'gzip' else None)
             
             for key, value in metadata.items():
                 try:
