@@ -154,7 +154,7 @@ def process_instance_archive(archive_path, h5_file, group_prefix="", compression
         group_creation_duration = time.perf_counter() - t1
 
     except:
-        print(f"[ERROR] Processing archive {archive_path}: {e}")
+        print(f"[ERROR] Processing archive {archive_path}")
     finally:
         shutil.rmtree(temp_dir)
     return extraction_duration, group_creation_duration
