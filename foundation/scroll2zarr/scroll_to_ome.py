@@ -801,6 +801,7 @@ def main():
         standard_config = get_standard_config(tiffdir, args.output, volume_type)
     else:
         if Path(args.output).suffix != ".zarr":
+            volume_type = "surface_volume" if os.path.basename(tiffdir) == "layers" else "scroll_volume"
             standard_config_ = get_standard_config(tiffdir, args.output, volume_type)
             standard_config = {'zarr_dir': standard_config_['zarr_dir']}
         else:
