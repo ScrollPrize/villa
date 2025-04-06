@@ -153,10 +153,11 @@ def process_instance_archive(archive_path, h5_file, group_prefix="", compression
                     print(f"[WARNING] Setting attribute {key} for {base}: {e}")
         group_creation_duration = time.perf_counter() - t1
 
-        return extraction_duration, group_creation_duration
-
+    except:
+        print(f"[ERROR] Processing archive {archive_path}: {e}")
     finally:
         shutil.rmtree(temp_dir)
+    return extraction_duration, group_creation_duration
 
 def process_archives_chunk(archives, partial_h5_filename, group_prefix, compression, compression_level=4, verbose=False):
     """
