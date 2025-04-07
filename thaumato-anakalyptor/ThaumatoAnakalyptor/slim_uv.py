@@ -531,6 +531,7 @@ class Flatboi:
                 best_slim_uvs = slim_uvs
 
         slim_uvs = best_slim_uvs
+        print_errors(slim_uvs)
         # rescale slim uvs
         slim_uvs = slim_uvs * self.stretch_factor
 
