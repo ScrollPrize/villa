@@ -483,94 +483,38 @@ class Flatboi:
 
         slim_uvs = self.orient_uvs(uv) # Enables the UVs to be oriented correctly for the slim optimization
 
+
         energies = []
+        slim_energy_types = []
+        slim_iterations = []
 
         if self.downsample:
-            # More initializations if the mesh was downsampled
-            print("Log ARAP Energy")
-            slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=igl.SLIM_ENERGY_TYPE_LOG_ARAP, soft_penalty=0)
-            slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs)
+            slim_energy_types += [igl.SLIM_ENERGY_TYPE_LOG_ARAP, igl.SLIM_ENERGY_TYPE_ARAP]
+            slim_iterations += [None, None]
+        
+        slim_energy_types += [igl.SLIM_ENERGY_TYPE_SYMMETRIC_DIRICHLET, 
+                              igl.SLIM_ENERGY_TYPE_LOG_ARAP,
+                              igl.SLIM_ENERGY_TYPE_SYMMETRIC_DIRICHLET,
+                              igl.SLIM_ENERGY_TYPE_CONFORMAL,
+                              igl.SLIM_ENERGY_TYPE_LOG_ARAP,
+                              igl.SLIM_ENERGY_TYPE_ARAP,
+                              igl.SLIM_ENERGY_TYPE_SYMMETRIC_DIRICHLET,
+                              igl.SLIM_ENERGY_TYPE_EXP_SYMMETRIC_DIRICHLET,
+                              igl.SLIM_ENERGY_TYPE_ARAP,
+                              igl.SLIM_ENERGY_TYPE_SYMMETRIC_DIRICHLET,
+                              igl.SLIM_ENERGY_TYPE_EXP_SYMMETRIC_DIRICHLET,
+                              igl.SLIM_ENERGY_TYPE_SYMMETRIC_DIRICHLET
+                            ]
+        slim_iterations += [30, None, None, 30 if self.downsample else None, None, None, 30, 10, None, 30, 10, 30]
+
+        for i in range(len(slim_energy_types)):
+            energy_type = slim_energy_types[i]
+            iterations = slim_iterations[i]
+            print(f"SLIM Energy Type: {energy_type}, Iterations: {iterations}")
+            slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=energy_type, soft_penalty=0)
+            slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs, iterations=iterations)
             energies.extend(list(energies_))
             print_errors(slim_uvs)
-
-            print("ARAP Energy")
-            slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=igl.SLIM_ENERGY_TYPE_ARAP, soft_penalty=0)
-            slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs)
-            energies.extend(list(energies_))
-            print_errors(slim_uvs)
-
-        # initializing SLIM with Symmetric Dirichlet Distortion Energy (isometric)
-        print("Symmetric Dirichlet Distortion Energy")
-        slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=igl.SLIM_ENERGY_TYPE_SYMMETRIC_DIRICHLET, soft_penalty=0)
-        slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs, iterations=30) # 30 iterations
-        energies.extend(list(energies_))
-        print_errors(slim_uvs)
-
-        print("Log ARAP Energy")
-        slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=igl.SLIM_ENERGY_TYPE_LOG_ARAP, soft_penalty=0)
-        slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs)
-        energies.extend(list(energies_))
-        print_errors(slim_uvs)
-
-        print("Symmetric Dirichlet Distortion Energy")
-        slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=igl.SLIM_ENERGY_TYPE_SYMMETRIC_DIRICHLET, soft_penalty=0)
-        slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs)
-        energies.extend(list(energies_))
-        print_errors(slim_uvs)
-
-        print("Conformal Energy")
-        slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=igl.SLIM_ENERGY_TYPE_CONFORMAL, soft_penalty=0)
-        slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs, iterations=30 if self.downsample else None)
-        energies.extend(list(energies_))
-        print_errors(slim_uvs)
-
-        print("Log ARAP Energy")
-        slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=igl.SLIM_ENERGY_TYPE_LOG_ARAP, soft_penalty=0)
-        slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs)
-        energies.extend(list(energies_))
-        print_errors(slim_uvs)
-
-        print("ARAP Energy")
-        slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=igl.SLIM_ENERGY_TYPE_ARAP, soft_penalty=0)
-        slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs)
-        energies.extend(list(energies_))
-        print_errors(slim_uvs)
-
-        print("Symmetric Dirichlet Distortion Energy")
-        slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=igl.SLIM_ENERGY_TYPE_SYMMETRIC_DIRICHLET, soft_penalty=0)
-        slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs, iterations=30)
-        energies.extend(list(energies_))
-        print_errors(slim_uvs)
-
-        print("Exponential Symmetric Dirichlet Distortion Energy")
-        slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=igl.SLIM_ENERGY_TYPE_EXP_SYMMETRIC_DIRICHLET, soft_penalty=0)
-        slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs, iterations=10)
-        energies.extend(list(energies_))
-        print_errors(slim_uvs)
-
-        print("ARAP Energy")
-        slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=igl.SLIM_ENERGY_TYPE_ARAP, soft_penalty=0)
-        slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs)
-        energies.extend(list(energies_))
-        print_errors(slim_uvs)
-
-        print("Symmetric Dirichlet Distortion Energy")
-        slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=igl.SLIM_ENERGY_TYPE_SYMMETRIC_DIRICHLET, soft_penalty=0)
-        slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs, iterations=30)
-        energies.extend(list(energies_))
-        print_errors(slim_uvs)
-
-        print("Exponential Symmetric Dirichlet Distortion Energy")
-        slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=igl.SLIM_ENERGY_TYPE_EXP_SYMMETRIC_DIRICHLET, soft_penalty=0)
-        slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs, iterations=10)
-        energies.extend(list(energies_))
-        print_errors(slim_uvs)
-
-        print("Symmetric Dirichlet Distortion Energy")
-        slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=igl.SLIM_ENERGY_TYPE_SYMMETRIC_DIRICHLET, soft_penalty=0)
-        slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs, iterations=30)
-        energies.extend(list(energies_))
-        print_errors(slim_uvs)
 
         # rescale slim uvs
         slim_uvs = slim_uvs * self.stretch_factor
