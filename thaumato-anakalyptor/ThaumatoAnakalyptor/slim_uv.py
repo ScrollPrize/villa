@@ -519,7 +519,7 @@ class Flatboi:
         for i in range(len(slim_energy_types)):
             energy_type = slim_energy_types[i]
             iterations = slim_iterations[i]
-            print(f"{energy_type} Energy, Iterations: {iterations if iterations is not None else self.max_iter}")
+            print(f"{energy_types_names[energy_type]} Energy, Iterations: {iterations if iterations is not None else self.max_iter}")
             slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=energy_type, soft_penalty=0)
             slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs, iterations=iterations)
             energies.extend(list(energies_))
