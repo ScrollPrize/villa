@@ -483,10 +483,16 @@ class Flatboi:
 
         slim_uvs = self.orient_uvs(uv) # Enables the UVs to be oriented correctly for the slim optimization
 
-
         energies = []
         slim_energy_types = []
         slim_iterations = []
+        energy_types_names = {
+            igl.SLIM_ENERGY_TYPE_SYMMETRIC_DIRICHLET: "Symmetric Dirichlet Distortion",
+            igl.SLIM_ENERGY_TYPE_ARAP: "ARAP",
+            igl.SLIM_ENERGY_TYPE_LOG_ARAP: "Log ARAP",
+            igl.SLIM_ENERGY_TYPE_CONFORMAL: "Conformal",
+            igl.SLIM_ENERGY_TYPE_EXP_SYMMETRIC_DIRICHLET: "Exponential Symmetric Dirichlet Distortion"
+        }
 
         if self.downsample:
             slim_energy_types += [igl.SLIM_ENERGY_TYPE_LOG_ARAP, igl.SLIM_ENERGY_TYPE_ARAP]
@@ -510,7 +516,7 @@ class Flatboi:
         for i in range(len(slim_energy_types)):
             energy_type = slim_energy_types[i]
             iterations = slim_iterations[i]
-            print(f"SLIM Energy Type: {energy_type}, Iterations: {iterations}")
+            print(f"{energy_type} Energy, Iterations: {iterations if iterations is not None else self.max_iter}")
             slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=energy_type, soft_penalty=0)
             slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs, iterations=iterations)
             energies.extend(list(energies_))
