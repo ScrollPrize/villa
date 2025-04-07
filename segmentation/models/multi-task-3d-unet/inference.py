@@ -17,20 +17,6 @@ from typing import Dict, Tuple, List
 from collections import defaultdict
 import torch.distributed as dist
 
-def remap_state_dict(state_dict):
-    new_state_dict = {}
-    for key, value in state_dict.items():
-        new_key = key
-        # Example mapping: if the nnUNet checkpoint uses "encoder." and your model expects "shared_encoder."
-        if key.startswith("encoder."):
-            new_key = "shared_encoder." + key[len("encoder."):]
-        # If the checkpoint uses "decoder." and your model expects a ModuleDict under "task_decoders" (say, for key "sheet")
-        elif key.startswith("decoder."):
-            new_key = "task_decoders.sheet." + key[len("decoder."):]
-        # You might also need to check for differences in naming for stem or other submodules.
-        new_state_dict[new_key] = value
-    return new_state_dict
-
 
 class ZarrInferenceHandler:
     def __init__(self, config_file: str, write_layers: bool, postprocess_only: bool = False,

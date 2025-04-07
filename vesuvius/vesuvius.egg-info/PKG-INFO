@@ -1,3 +1,44 @@
+Metadata-Version: 2.4
+Name: vesuvius
+Version: 0.1.10
+Home-page: https://github.com/ScrollPrize/villa
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Science/Research
+Classifier: Topic :: Software Development :: Libraries
+Classifier: Topic :: Scientific/Engineering
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: numpy
+Requires-Dist: requests
+Requires-Dist: aiohttp
+Requires-Dist: fsspec
+Requires-Dist: tensorstore
+Requires-Dist: huggingface_hub
+Requires-Dist: dask
+Requires-Dist: zarr
+Requires-Dist: tqdm
+Requires-Dist: lxml
+Requires-Dist: nest_asyncio
+Requires-Dist: pynrrd
+Requires-Dist: pyyaml
+Requires-Dist: Pillow
+Requires-Dist: Torch
+Requires-Dist: nnUNetv2
+Requires-Dist: scipy
+Requires-Dist: batchgenerators
+Requires-Dist: batchgeneratorsv2
+Requires-Dist: dynamic_network_architectures
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: requires-dist
+Dynamic: requires-python
+
 # vesuvius
 From [Vesuvius Challenge](https://scrollprize.org), a Python library for accessing CT scans of ancient scrolls.
 

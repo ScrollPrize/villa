@@ -3,3 +3,14 @@
 *.pyc
 *.tif
 node_modules/.yarn-integrity
+/vesuvius/outputs
+/vesuvius/sandbox
+/vesuvius/sandbox
+/vesuvius/utils/tests/s5_test.zarr
+/vesuvius/vesuvius.egg-info
+/vesuvius/vesuvius.egg-info
+/segmentation/models/arch/nnunet/nnunetv2.egg-info
+/segmentation/models/batchgeneratorsv2/batchgeneratorsv2.egg-info
+/segmentation/models/arch/nnunet/nnunetv2.egg-info
+/vesuvius/vesuvius.egg-info
+/vesuvius/vesuvius.egg-info

@@ -1,8 +1,8 @@
 import os
 import re
 import yaml
-from typing import Dict, List, Optional
-from .utils import get_installation_path
+from typing import Dict, List
+from vesuvius.utils import get_installation_path
 
 
 def update_local_list(base_dir: str, base_dir_cubes: str) -> None:

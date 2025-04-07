@@ -1,1 +1,2 @@
-include src/vesuvius/configs/*.yaml
+include setup/configs/*.yaml
+include vesuvius/setup/configs/*.yaml

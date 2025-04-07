@@ -24,8 +24,8 @@ with open("README.md", "r", encoding="utf-8") as fh:
 setup(
     name='vesuvius',
     version='0.1.10',
-    package_dir = {"": "src"},
-    packages=find_packages(where="src"),
+    py_modules=['vesuvius'],
+    packages=find_packages(),
     url='https://github.com/ScrollPrize/villa',
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -35,24 +35,38 @@ setup(
         'aiohttp',
         'fsspec',
         'tensorstore',
+        'huggingface_hub',
+        'dask',
         'zarr',
         'tqdm',
         'lxml',
         'nest_asyncio',
         'pynrrd',
         'pyyaml',
-        'Pillow'
+        'Pillow',
+        'Torch',
+        'nnUNetv2',
+        'scipy',
+        'batchgenerators',
+        'batchgeneratorsv2',
+        'dynamic_network_architectures'
     ],
     python_requires='>=3.8',
     include_package_data=True,
     package_data={
-        '': ['src/vesuvius/configs/*.yaml'],
+        'vesuvius': ['setup/configs/*.yaml'],
+        'setup': ['configs/*.yaml'],
     },
     entry_points={
         'console_scripts': [
-            'vesuvius.accept_terms=vesuvius.setup.accept_terms:main',
+            'vesuvius.accept_terms=setup.accept_terms:main',
+            'vesuvius.predict=models.run.inference:main',
+            'vesuvius.blend_logits=models.run.blending:main',
+            'vesuvius.finalize_outputs=models.run.finalize_outputs:main',
+            'vesuvius.inference_pipeline=models.run.vesuvius_pipeline:run_pipeline',
         ],
     },
+    # No scripts needed as we're using entry_points
     classifiers=[
         'Programming Language :: Python :: 3',
         'Programming Language :: Python :: 3.8',
