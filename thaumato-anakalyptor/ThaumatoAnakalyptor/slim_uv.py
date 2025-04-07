@@ -185,10 +185,6 @@ class Flatboi:
             else:
                 downsampled_mesh = self.mesh
 
-            # Add initial UV coordinates
-            _, _, arap_ic_uvs = self.arap_ic(np.asarray(downsampled_mesh.vertices), np.asarray(downsampled_mesh.triangles))
-            downsampled_mesh.triangle_uvs = o3d.utility.Vector2dVector(arap_ic_uvs.reshape((-1, 2)))
-            
             # print(f"Simplify Open3D round 1. Remaining vertices: {len(np.asarray(downsampled_mesh.vertices))} and triangles: {len(np.asarray(downsampled_mesh.triangles))}")
             if target_num_triangles < len(np.asarray(downsampled_mesh.triangles)):
                 # Simplify Open3D
@@ -196,6 +192,16 @@ class Flatboi:
                 print(f"Simplify Open3D round 2. Remaining vertices: {len(np.asarray(downsampled_mesh.vertices))} and triangles: {len(np.asarray(downsampled_mesh.triangles))}")
             else:
                 print("Further Open3D simplification not needed.")
+
+            # Add initial UV coordinates
+            _, _, arap_ic_uvs = self.arap_ic(np.asarray(downsampled_mesh.vertices), np.asarray(downsampled_mesh.triangles))
+            print(f"Shape of arap_ic_uvs: {arap_ic_uvs.shape}")
+            triangle_uvs = np.zeros((self.triangles.shape[0], 3, 2), dtype=np.float64)
+            downsampled_triangles = np.asarray(downsampled_mesh.triangles)
+            for t in range(downsampled_triangles.shape[0]):
+                for v in range(downsampled_triangles.shape[1]):
+                    triangle_uvs[t,v] = arap_ic_uvs[downsampled_triangles[t,v]].copy()
+            downsampled_mesh.triangle_uvs = o3d.utility.Vector2dVector(triangle_uvs.reshape((-1, 2)))
 
         downsampled_mesh = downsampled_mesh.compute_vertex_normals()
         downsampled_mesh = self.filter_largest_connected_component(downsampled_mesh)
@@ -345,8 +351,18 @@ class Flatboi:
             for v in range(self.triangles.shape[1]):
                 uv[self.triangles[t,v]] = uvs[t,v]
 
+        # if self.downsample:
+        #     uv = self.arap_solver_ic(uv)
         if self.downsample:
-            uv = self.arap_solver_ic(uv)
+            while True:
+                uv_ = self.arap_solver_ic(uv)
+                uv_size = np.max(uv_, axis=0) - np.min(uv_, axis=0)
+                assert uv_size.shape[0] == 2, f"uv_size shape is {uv_size.shape}"
+                if np.all(uv_size > 1):
+                    uv = uv_ # found a 'valid' solution
+                    break
+                else:
+                    print("Invalid solution, trying again...")
 
         return np.zeros((0, 1), dtype=np.int32), np.zeros((0,2), dtype=np.float64), uv
     
