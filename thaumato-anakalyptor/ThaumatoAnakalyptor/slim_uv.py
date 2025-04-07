@@ -785,7 +785,7 @@ def main():
 
     print(f"Adding UV coordinates to mesh {path}")
 
-    flatboi = Flatboi(path, args.iter, um=args.um, downsample=args.downsample, output=args.output)
+    flatboi = Flatboi(path, args.iter, um=args.um, downsample=args.downsample, output_obj=args.output)
     harmonic_uvs, harmonic_energies = flatboi.slim(initial_condition=args.ic)
     
 	# Align the UV map
