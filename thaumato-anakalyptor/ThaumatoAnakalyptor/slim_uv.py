@@ -36,6 +36,8 @@ class Flatboi:
         self.input_obj = obj_path
         if output_obj is not None:
             self.output_obj = output_obj
+            if not self.output_obj.endswith(".obj"):
+                self.output_obj = os.path.join(self.output_obj, os.path.basename(obj_path)).replace(".obj", "_flatboi.obj")
         else:
             self.output_obj = obj_path.replace(".obj", "_flatboi.obj")
         self.max_iter = max_iter
@@ -207,7 +209,7 @@ class Flatboi:
         downsampled_mesh = self.filter_largest_connected_component(downsampled_mesh)
                 
         # Save the mesh with UVs to an OBJ file
-        obj_path = self.input_obj.replace(".obj", "_downsampled.obj")
+        obj_path = self.output_obj.replace(".obj", "_downsampled.obj")
         o3d.io.write_triangle_mesh(obj_path, downsampled_mesh)
         print("Downsampled mesh saved with UVs.")
         return obj_path
@@ -752,6 +754,7 @@ def main():
     # Create an argument parser
     parser = argparse.ArgumentParser(description='Add UV coordinates using the flatboi script for SLIM to a ThaumatoAnakalyptor papyrus surface mesh (.obj). output mesh has additional "_flatboi.obj" in name.')
     parser.add_argument('--path', type=str, help='Path of .obj Mesh', default=path)
+    parser.add_argument('--output', type=str, help='Output path/mesh for the UV mapped mesh.', default=None)
     parser.add_argument('--iter', type=int, help='Max number of iterations.')
     parser.add_argument('--ic', type=str, help='Initial condition for SLIM. Options: original, arap, harmonic', default='arap')
     parser.add_argument('--axis', type=str, help='Volume axis for alignment. Options: x, y, z', default='z')
@@ -782,7 +785,7 @@ def main():
 
     print(f"Adding UV coordinates to mesh {path}")
 
-    flatboi = Flatboi(path, args.iter, um=args.um, downsample=args.downsample)
+    flatboi = Flatboi(path, args.iter, um=args.um, downsample=args.downsample, output=args.output)
     harmonic_uvs, harmonic_energies = flatboi.slim(initial_condition=args.ic)
     
 	# Align the UV map
