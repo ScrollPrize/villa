@@ -457,6 +457,7 @@ class Flatboi:
         def print_errors(slim_uvs):
             l2, linf, area_error = self.stretch_metrics(slim_uvs)
             print(f"Stretch metrics L2: {l2:.5f}, Linf: {linf:.5f}, Area Error: {area_error:.5f}", end="\n")
+            return l2, linf, area_error
 
         if initial_condition == 'original':
             print("Using Cylindrical Unrolling UV Condition")
@@ -512,6 +513,8 @@ class Flatboi:
                               igl.SLIM_ENERGY_TYPE_SYMMETRIC_DIRICHLET
                             ]
         slim_iterations += [30, None, None, 30 if self.downsample else None, None, None, 30, 10, None, 30, 10, 30]
+        best_slim_uvs = slim_uvs
+        best_combined_error = float("inf")
 
         for i in range(len(slim_energy_types)):
             energy_type = slim_energy_types[i]
@@ -520,8 +523,14 @@ class Flatboi:
             slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=energy_type, soft_penalty=0)
             slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs, iterations=iterations)
             energies.extend(list(energies_))
-            print_errors(slim_uvs)
+            l2, linf, area_error = print_errors(slim_uvs)
+            combined_error = l2 * linf * area_error
+            if combined_error < best_combined_error:
+                print("Found better solution")
+                best_combined_error = combined_error
+                best_slim_uvs = slim_uvs
 
+        slim_uvs = best_slim_uvs
         # rescale slim uvs
         slim_uvs = slim_uvs * self.stretch_factor
 
