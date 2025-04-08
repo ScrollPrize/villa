@@ -2017,7 +2017,7 @@ class WalkToSheet():
                 print(f"Finished mesh piece {i+1} of {len(ordered_pointsets_s)}.")
 
 if __name__ == '__main__':
-    start_point = [3164, 3476, 3472]
+    start_point = [1352, 3600, 5002]
     import argparse
     parser = argparse.ArgumentParser(description='Unroll a graph to a sheet')
     parser.add_argument('--path', type=str, help='Path to the instances. If type is H5, please input the path without the ".h5" suffix. When using python graph.pkl put suffix ".pkl".', required=True)

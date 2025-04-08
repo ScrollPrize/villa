@@ -2150,7 +2150,7 @@ def random_walks():
     parser.add_argument('--winding_direction', type=int,help='Winding direction of sheet in scroll scan. Examples: SCroll 1: "-1", Scroll 3: "1"', default=overlapp_threshold["winding_direction"])
     parser.add_argument('--sheet_z_range', type=int, nargs=2,help='Z range of segmentation', default=[overlapp_threshold["sheet_z_range"][0], overlapp_threshold["sheet_z_range"][1]])
     parser.add_argument('--sheet_k_range', type=int, nargs=2,help='Angle range (as k 1k = 360 deg, k is int) of the sheet winding for segmentation', default=[overlapp_threshold["sheet_k_range"][0], overlapp_threshold["sheet_k_range"][1]])
-    parser.add_argument('--starting_point', type=int, nargs=3,help='Starting point for a new segmentation', default=start_point)
+    parser.add_argument('--start_point', type=int, nargs=3,help='Start point for a new segmentation', default=start_point)
     parser.add_argument('--continue_segmentation', type=int,help='Continue previous segmentation (point_cloud_colorized_subvolume_main_sheet.ta). 1 to continue, 0 to restart.', default=int(continue_segmentation))
     parser.add_argument('--enable_winding_switch', type=int,help='Enable switching of winding if two sheets lay on top of each eather. 1 enable, 0 disable.', default=int(overlapp_threshold["enable_winding_switch"]))
     parser.add_argument('--enable_winding_switch_postprocessing', type=int,help='Enable postprocessing switching of winding if two sheets lay on top of each eather. 1 enable, 0 disable.', default=int(overlapp_threshold["enable_winding_switch_postprocessing"]))
@@ -2189,7 +2189,7 @@ def random_walks():
     overlapp_threshold["winding_direction"] = args.winding_direction
     overlapp_threshold["sheet_z_range"] = [(z_range_ + 500) /(200.0 / 50.0) for z_range_ in args.sheet_z_range]
     overlapp_threshold["sheet_k_range"] = args.sheet_k_range
-    start_point = args.starting_point
+    start_point = args.start_point
     continue_segmentation = bool(args.continue_segmentation)
     overlapp_threshold["enable_winding_switch"] = bool(args.enable_winding_switch)
     overlapp_threshold["enable_winding_switch_postprocessing"] = bool(args.enable_winding_switch_postprocessing)

@@ -91,24 +91,47 @@ This example shows how to do segmentation on Scroll 3 (PHerc0332).
     ```bash
     xhost +local:docker
     xhost +local:root
-
     ```
+
     ```bash
     docker run --gpus all --shm-size=150g -it --rm \
     -v $(pwd)/:/workspace \
     -v <path_to_scroll>:/scroll.volpkg \
-    -v <optional_alternative_path_to_scroll>:/scroll_alternative.volpkg \
+    -v <path_to_scroll_thaumato_folder>:/scroll_pcs \
     -v /tmp/.X11-unix:/tmp/.X11-unix \
     -e DISPLAY=$DISPLAY \
     thaumato_image
     ```
 
-    *Note*: If you run ThaumatoAnakalyptor without the docker, or you update the repository without rebuilding the docker image you need to compile the C++ code by hand.
+- **Compile the Custom ThaumatoAnakalyptor C++ Code:**
+    Make the scripts executable:
+    ```bash
+    chmod +x compile_cpp.sh GraphLabeler.sh
+    ```
+
+    *Note*: If you run ThaumatoAnakalyptor for the first time or any time you update the repository, you need to compile the C++ code.
+    
+    ***Easy:*** 
+    ```bash
+    ./compile_cpp.sh
+    ```
+
+    ***Advanced:***
+    
+    Make sure to have the thaumato environment activated:
     ```bash
     cd ThaumatoAnakalyptor/sheet_generation
     mkdir build
     cd build
-    cmake -DPYTHON_EXECUTABLE=$(which python3) ..
+    cmake ..
+    cmake --build .
+    ```
+    Make sure to have all environments deactivated  (also 'base'):
+    ```bash
+    cd ThaumatoAnakalyptor/graph_problem
+    mkdir build
+    cd build
+    cmake ..
     cmake --build .
     ```
 
@@ -128,69 +151,77 @@ This example shows how to do segmentation on Scroll 3 (PHerc0332).
 
 #### Command Line Segmentation
 
-- **Umblicius Generation**
-    It is highly recommended to use the GUI ("Volume Preprocessing"/"Generate Grid Cells") for this step. If you would like to do it by hand, great care is required.
+- **Umblicius Generation:**
+    **It is highly recommended to use the GUI ("Volume Preprocessing"/"Generate Grid Cells") for this step.** If you would like to do it by hand, great care is required.
 
     *Note*:
-        To generate an ```umbilicus.txt``` for a scroll, make sure to transform the umbilicus coordinates from scroll coordinates ```x, y, z``` - where ```x,y``` is the tif 2D coordinates and ```z``` the tif layer number - into umbilicus coordinates ```uc``` with this formula: ```uc = y + 500, z + 500, x + 500```.
+        To generate an ```umbilicus.txt``` for a scroll by hand, make sure to transform the umbilicus coordinates from scroll coordinates ```x, y, z``` - where ```x,y``` is the tif 2D coordinates and ```z``` the tif layer number - into umbilicus coordinates ```uc``` with this formula: ```uc = y + 500, z + 500, x + 500```.
 
 - **Precomputation Steps:**
     These are the instructions to use ThaumatoAnakalyptor from the command line.
     The precomputation step is expected to take a few days.
 
-    The Grid Cells used for segmentation have to be in 8um resolution. ```generate_half_sized_grid.py``` is used for 4um resolution scans to generate Grid Cells in 8um resolution. If you have access to multiple GPU's, adjust the ```--num_threads``` and ```--gpus``` flags to speed up the process.
+    The Ome-Zarr or Grid Cells volumes used for segmentation have to be in 8um resolution. ```generate_half_sized_grid.py``` is used for 4um resolution scans to generate Grid Cells in 8um resolution. If you have access to multiple GPU's, adjust the ```--num_threads``` and ```--gpus``` flags to speed up the process.
+    If you use for example a ~4um volume, you can downsample it to approximately 8um with:
     ```bash
     python3 -m ThaumatoAnakalyptor.generate_half_sized_grid --input_directory <scroll-path>/PHerc0332.volpkg/volumes/20231027191953 --output_directory <scroll-path>/PHerc0332.volpkg/volumes/2dtifs_8um
     ```
+
+    Then you can start the precomputation, which extracts first a pointcloud surface representation from the raw scan.
     ```bash
-    python3 -m ThaumatoAnakalyptor.grid_to_pointcloud --base_path "" --volume_subpath "<scroll-path>/PHerc0332.volpkg/volumes/2dtifs_8um_grids" --disk_load_save "" "" --pointcloud_subpath "<scroll-path>/scroll3_surface_points/point_cloud" --num_threads 4 --gpus 1
+    python3 -m ThaumatoAnakalyptor.grid_to_pointcloud --base_path "" --volume_subpath "<scroll-path>/PHerc0332.volpkg/volumes/2dtifs_8um_grids" --disk_load_save "" "" --pointcloud_subpath "/scroll_pcs/point_cloud" --num_threads 4 --gpus 1
     ```
+
+    The pointclouds are combined to small patches on the surface:
     ```bash
-    python3 -m ThaumatoAnakalyptor.pointcloud_to_instances --path "<scroll-path>/scroll3_surface_points" --dest "<scroll-path>/scroll3_surface_points" --umbilicus_path "<scroll-path>/PHerc0332.volpkg/volumes/umbilicus.txt" --main_drive "" --alternative_ply_drives "" --max_umbilicus_dist -1 --gpus 1
+    python3 -m ThaumatoAnakalyptor.pointcloud_to_instances --path "/scroll_pcs" --dest "/scroll_pcs" --umbilicus_path "<scroll-path>/PHerc0332.volpkg/volumes/umbilicus.txt" --main_drive "" --alternative_ply_drives "" --max_umbilicus_dist -1 --gpus 1
+    ```
+
+    And the patches are connected into a graph that when solved contain the information about where the connected, complete surface lies in the scan: 
+    The first time the script ```instances_to_graph.py```  is run on a new scroll. This will generate the overlapping graph of the scroll. For subsequent runs, flag ```--recompute``` can be set to 0 to speed up the process. Flag ```--continue_from``` can be set to the step you would like to continue from.
+    ```bash
+    python3 -m ThaumatoAnakalyptor.instances_to_graph --path "/scroll_pcs/point_cloud_colorized_verso_subvolume_blocks"
+    ```
+
+    In a next step you can we pre-solve the graph. To segment Scroll 3 between the z height of 5000 and 7000 (in the 8um volume), set the flags ```--z_min``` and ```--z_max```.
+
+    ```bash
+    python3 -m ThaumatoAnakalyptor.graph_solve "/scroll_pcs/1352_3600_5002/graph.bin" --experiment_name "scroll-5-partial" --z_min 5000 --z_max 7000
     ```
 
 - **Segmentation Steps:**
-    The first time the script ```instances_to_graph.py```  is run on a new scroll, flag ```--recompute``` should be set to 1, the flag ```--continue_from``` should be set to -1. This will generate the overlapping graph of the scroll. For subsequent runs, flag ```--recompute``` should be set to 0 to speed up the process. Flag ```--continue_from``` can be set to the step you would like to continue from.
-    ```bash
-    python3 -m ThaumatoAnakalyptor.instances_to_graph --path "<scroll-path>/scroll3_surface_points/point_cloud_colorized_verso_subvolume_blocks" --recompute 1 --continue_from -1
-    ```
-
-    In a next step you can use a graph solver of your liking. So far, the C++ solver is integrated completely. To segment Scroll 3 between the z height of 5000 and 7000, set the flags ```--z_min``` and ```--z_max```.
+    Then you can start the 'Graph Labeler' (GL) GUI to finish the solved graph.
+    *Note*: The first time you run the GL, make sure that you compiled the custom ThaumatoAnakalyptor C++ libraries.
 
     ```bash
-    ./ThaumatoAnakalyptor/graph_problem/build/graph_problem --input_graph "<scroll-path>/scroll3_surface_points/1352_3600_5002/graph.bin" --output_graph "<scroll-path>/scroll3_surface_points/1352_3600_5002/output_graph.bin" --auto --auto_num_iterations 2000 --video --z_min 5000 --z_max 7000 --num_iterations 2000 --estimated_windings 60 --steps 3 --spring_constant 1.2
+    ./GraphLabeler.sh
     ```
 
-    *Note*:
-        ```./ThaumatoAnakalyptor/graph_problem/build/graph_problem_gpu``` runs the solver on GPU. If you cannot compile it for GPU, you can adjust the CMakeLists.txt to exclude the GPU compilation.
+    Label the graph with the help of the GL tool. See this tutorial for further information: TODO
 
     Finally, translate the solution back from a .bin to a .pkl:
     ```bash
-    python3 -m ThaumatoAnakalyptor.instances_to_graph --path "<scroll-path>/scroll3_surface_points/point_cloud_colorized_verso_subvolume_blocks" --create_graph
+    python3 -m ThaumatoAnakalyptor.instances_to_graph --path "/scroll_pcs/point_cloud_colorized_verso_subvolume_blocks" --create_graph
     ```
 
 - **Meshing Steps:** 
     When you are happy with the segmentation, the next step is to generate the mesh. This can be done with the following commands:
     ```bash
-    python3 -m ThaumatoAnakalyptor.graph_to_mesh --path  <scroll-path>/scroll3_surface_points/point_cloud_colorized_verso_subvolume_blocks --graph 1352_3600_5002/point_cloud_colorized_verso_subvolume_graph_BP_solved.pkl 1352 3600 5002 --z_range 5000 7000 --angle_step 2.0 --unfix_factor 5.0 --continue_from 0 --scale_factor 2.0
+    python3 -m ThaumatoAnakalyptor.graph_to_mesh --path  /scroll_pcs/point_cloud_colorized_verso_subvolume_blocks --graph 1352_3600_5002/point_cloud_colorized_verso_subvolume_graph_BP_solved.pkl --z_range 5000 7000 --angle_step 2.0 --unfix_factor 3.0 --continue_from 0 --scale_factor 2.0
     ```
     The ```scale_factor``` depends on the resolution of the scroll scan. For 8um resolution, the ```scale_factor``` is 1.0. For 4um resolution, the ```scale_factor``` is 2.0.
-    You should now have created a folder ```<scroll-path>/scroll3_surface_points/1352_3600_5002/point_cloud_colorized_verso_subvolume_blocks/windowed_mesh_<time-tag>```.
+    You should now have created a folder ```/scroll_pcs/1352_3600_5002/point_cloud_colorized_verso_subvolume_blocks/windowed_mesh_<time-tag>```.
 
 - **Texturing Steps:**
     Rendering is GPU accelerated. First run the following commands:
     ```bash
     export MAX_TILE_SIZE=200000000000
-    ```
-    ```bash
     export OPENCV_IO_MAX_IMAGE_PIXELS=4294967295
-    ```
-    ```bash
     export CV_IO_MAX_IMAGE_PIXELS=4294967295
     ```
     To display the rendering process, use the flag ```--display```.
     ```bash
-    python3 -m ThaumatoAnakalyptor.large_mesh_to_surface --input_mesh <scroll-path>/scroll3_surface_points/1352_3600_5002/point_cloud_colorized_verso_subvolume_blocks/windowed_mesh_<time-tag> --scroll <scroll-path>/PHerc0332.volpkg/volume_grids/20231027191953 --nr_workers 16 --gpus 1 --display 
+    python3 -m ThaumatoAnakalyptor.large_mesh_to_surface --input_mesh /scroll_pcs/1352_3600_5002/point_cloud_colorized_verso_subvolume_blocks/windowed_mesh_<time-tag> --scroll <scroll-path>/PHerc0332.volpkg/volume_grids/20231027191953 --nr_workers 16 --gpus 1 --display 
     ```
     *Note*: The rendering also works with ome-zarr ```.zarr``` files. At the moment an empty ```--scroll``` directory will not result in an error.
 
@@ -210,8 +241,8 @@ Make sure to download the provided training data ```3d_instance_segmentation_tra
 - Recto and verso namings are switched.
 
 ## TODO
-- Find and implement better sheet stitching algorithm
 - Remove unused/old files
+- Refactor the codebase
 
 ## Contribution and Support
 - As this software is in active development, users are encouraged to report any encountered issues. I'm happy to help and answer questions.
