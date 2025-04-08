@@ -33,8 +33,8 @@ class PointCloudLabeler(QMainWindow):
         
         # Load configuration (or fall back to defaults)
         self.config = load_config("config_labeling_gui.json")
-        self.graph_path = self.config.get("graph_path", "/media/julian/2/Scroll5/scroll5_complete_surface_points_zarrtest/1352_3600_5005/graph.bin")
-        self.default_experiment = self.config.get("default_experiment", "denominator3-rotated")
+        self.graph_path = self.config.get("graph_path", "")
+        self.default_experiment = self.config.get("default_experiment", "")
         self.ome_zarr_path = self.config.get("ome_zarr_path", None)
         self.graph_pkl_path = self.config.get("graph_pkl_path", None)
         self.h5_path = self.config.get("h5_path", None)
@@ -42,7 +42,7 @@ class PointCloudLabeler(QMainWindow):
 
 
         # Initialize solver using SolverInterface if no external point data is provided.
-        if point_data is None:
+        if point_data is None and self.default_experiment != "" and self.graph_path != "":
             self.solver = graph_problem_gpu_py.Solver(self.graph_path)
             gt_path = os.path.join("../experiments", self.default_experiment,
                                    "checkpoints", "checkpoint_graph_solver_connected_2.bin")
@@ -56,6 +56,7 @@ class PointCloudLabeler(QMainWindow):
             point_data = self.solver.get_positions()
         else:
             self.solver = None
+            point_data = np.zeros((0, 3), dtype=np.float32)
         self.seed_node = None # master node, this is the fixed node, to which all other nodes are fixed in f_star to
         self.recompute = True
 
@@ -93,9 +94,13 @@ class PointCloudLabeler(QMainWindow):
         # Display parameters.
         self.point_size = 2
         self.max_display = 400
-        self.f_star_min, self.f_star_max = float(np.min(self.points[:, 0])), float(np.max(self.points[:, 0]))
+        if self.points.shape[0] > 0:
+            self.f_star_min, self.f_star_max = float(np.min(self.points[:, 0])), float(np.max(self.points[:, 0]))
+            self.z_min, self.z_max = float(np.min(self.points[:, 2])), float(np.max(self.points[:, 2]))
+        else:
+            self.f_star_min, self.f_star_max = -1.0, 1.0
+            self.z_min, self.z_max = -1.0, 1.0
         self.f_init_min, self.f_init_max = -180.0, 180.0
-        self.z_min, self.z_max = float(np.min(self.points[:, 2])), float(np.max(self.points[:, 2]))
         
         # Create KD-trees.
         self.kdtree_xy = cKDTree(self.points[:, [0, 1]])
@@ -211,10 +216,10 @@ class PointCloudLabeler(QMainWindow):
         right_column.addWidget(self.xz_plot)
         xz_controls = QHBoxLayout()
         self.finit_center_widget, self.finit_center_slider, self.finit_center_spinbox = create_sync_slider_spinbox(
-            "f init center:", float(np.min(self.points[:, 1])), float(np.max(self.points[:, 1])),
-            (np.min(self.points[:, 1]) + np.max(self.points[:, 1])) / 2, self.scaleFactor, self.f_init_center_changed)
+            "f init center:", -180.0, 180.0,
+            0.0, self.scaleFactor, self.f_init_center_changed)
         self.finit_thickness_widget, self.finit_thickness_slider, self.finit_thickness_spinbox = create_sync_slider_spinbox(
-            "f init thickness:", 0.01, float(np.max(self.points[:, 1]) - np.min(self.points[:, 1])), 5.0, self.scaleFactor, self.update_views)
+            "f init thickness:", 0.01, 360.0, 5.0, self.scaleFactor, self.update_views)
         xz_controls.addWidget(self.finit_center_widget)
         xz_controls.addWidget(self.finit_thickness_widget)
         right_column.addLayout(xz_controls)
@@ -726,7 +731,7 @@ class PointCloudLabeler(QMainWindow):
         layout = QVBoxLayout(dialog)
         form_layout = QFormLayout()
         bin_path_lineedit = QLineEdit()
-        bin_path_lineedit.setText(os.path.dirname(self.graph_path))
+        bin_path_lineedit.setText(self.graph_path)
         browse_button = QPushButton("Browse...")
         browse_button.setToolTip("Click to choose the bin folder")
         h_layout = QHBoxLayout()
@@ -739,7 +744,7 @@ class PointCloudLabeler(QMainWindow):
         layout.addLayout(form_layout)
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         layout.addWidget(button_box)
-        browse_button.clicked.connect(lambda: self.browse_for_directory(bin_path_lineedit))
+        browse_button.clicked.connect(lambda: self.browse_for_bin(bin_path_lineedit, exp_lineedit))
         button_box.accepted.connect(dialog.accept)
         button_box.rejected.connect(dialog.reject)
         if dialog.exec_() == QDialog.Accepted:
@@ -748,7 +753,7 @@ class PointCloudLabeler(QMainWindow):
             self.default_experiment = exp_name
             if not selected_dir or not exp_name:
                 return
-            bin_file_path = os.path.join(selected_dir, "graph.bin")
+            bin_file_path = selected_dir # os.path.join(selected_dir, "graph.bin")
             if not os.path.exists(bin_file_path):
                 QMessageBox.warning(self, "Load Data", f"File {bin_file_path} does not exist.")
                 return
@@ -780,10 +785,14 @@ class PointCloudLabeler(QMainWindow):
             self.update_slider_ranges()
         self.update_views()
     
-    def browse_for_directory(self, lineedit):
-        directory = QFileDialog.getExistingDirectory(self, "Select Bin Folder", lineedit.text() or os.getcwd())
-        if directory:
-            lineedit.setText(directory)
+    def browse_for_bin(self, lineedit, exp_lineedit):
+        graph_path, _ = QFileDialog.getOpenFileName(self, "Select Graph Bin", lineedit.text() or os.getcwd(), "Graph Files (*.bin);;All Files (*)")
+        if graph_path:
+            lineedit.setText(graph_path)
+            # if exp_lineedit empty, set it to the directory name
+            if not exp_lineedit.text():
+                exp_name = os.path.basename(os.path.dirname(graph_path))
+                exp_lineedit.setText(exp_name)
     
     def save_labels_to_path(self):
         fname, _ = QFileDialog.getSaveFileName(self, "Save Labels", os.path.join("../experiments", self.default_experiment), "Text Files (*.txt);;All Files (*)")
@@ -862,8 +871,12 @@ class PointCloudLabeler(QMainWindow):
         QMessageBox.information(self, "Usage Instructions", help_text)
     
     def update_slider_ranges(self):
-        self.z_min = float(np.min(self.points[:, 2]))
-        self.z_max = float(np.max(self.points[:, 2]))
+        if self.points is not None and len(self.points) > 0:
+            self.z_min = float(np.min(self.points[:, 2]))
+            self.z_max = float(np.max(self.points[:, 2]))
+        else:
+            self.z_min = 0.0
+            self.z_max = 1.0
         self.z_center_slider.setMinimum(int(self.z_min * self.scaleFactor))
         self.z_center_slider.setMaximum(int(self.z_max * self.scaleFactor))
         self.z_center_spinbox.setMinimum(self.z_min)
@@ -1108,6 +1121,11 @@ class PointCloudLabeler(QMainWindow):
         """
         max_per_cell = max_display
         # Compute the lower bound of the grid and cell indices for each point.
+        if len(points) == 0:
+            if calc_labels is not None:
+                return points, labels, groups, calc_labels
+            else:
+                return points, labels, groups
         min_xy = points.min(axis=0)
         cell_indices = ((points - min_xy) // grid_size).astype(int)
         if axis is not None:
