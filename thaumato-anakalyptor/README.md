@@ -104,6 +104,7 @@ This example shows how to do segmentation on Scroll 3 (PHerc0332).
     ```
 
 - **Compile the Custom ThaumatoAnakalyptor C++ Code:**
+
     Make the scripts executable:
     ```bash
     chmod +x compile_cpp.sh GraphLabeler.sh
@@ -111,28 +112,8 @@ This example shows how to do segmentation on Scroll 3 (PHerc0332).
 
     *Note*: If you run ThaumatoAnakalyptor for the first time or any time you update the repository, you need to compile the C++ code.
     
-    ***Easy:*** 
     ```bash
     ./compile_cpp.sh
-    ```
-
-    ***Advanced:***
-    
-    Make sure to have the thaumato environment activated:
-    ```bash
-    cd ThaumatoAnakalyptor/sheet_generation
-    mkdir build
-    cd build
-    cmake ..
-    cmake --build .
-    ```
-    Make sure to have all environments deactivated  (also 'base'):
-    ```bash
-    cd ThaumatoAnakalyptor/graph_problem
-    mkdir build
-    cd build
-    cmake ..
-    cmake --build .
     ```
 
 - **GUI**
