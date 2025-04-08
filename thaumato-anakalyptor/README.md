@@ -65,7 +65,7 @@ This example shows how to do segmentation on Scroll 3 (PHerc0332).
 - **Setup:**
     Download the git repository:
     ```bash
-    git clone --recurse-submodules https://github.com/schillij95/ThaumatoAnakalyptor
+    git clone --recurse-submodules https://github.com/ScrollPrize/villa
     ```
     Download the checkpoint ```last-epoch.ckpt``` for the instance segmentation model and place it into ```ThaumatoAnakalyptor/mask3d/saved/train/last-epoch.ckpt```. 
     Download checkpoint ```timesformer_wild15_20230702185753_0_fr_i3depoch=12.ckpt``` for the ink detection model and place it into ```Vesuvius-Grandprize-Winner/timesformer_wild15_20230702185753_0_fr_i3depoch=12.ckpt```.
