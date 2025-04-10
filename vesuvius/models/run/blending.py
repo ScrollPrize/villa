@@ -4,6 +4,10 @@ import asyncio
 import os
 import re
 import json
+import threading
+import concurrent.futures
+import multiprocessing
+import queue
 from tqdm.auto import tqdm
 from scipy.ndimage import gaussian_filter  # For map generation alternative
 import torch
@@ -29,10 +33,201 @@ def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=tor
     gaussian_map /= gaussian_map.max()
     gaussian_map = gaussian_map.reshape(1, pZ, pY, pX)
     gaussian_map = torch.clamp(gaussian_map, min=0)
-    
+
     print(
         f"Generated Gaussian map with shape {gaussian_map.shape}, min: {gaussian_map.min().item():.4f}, max: {gaussian_map.max().item():.4f}")
     return gaussian_map
+
+
+# --- Spatial Patch Sorting and Grouping ---
+def group_patches_for_parallel_processing(coords, patch_size, num_workers, volume_shape):
+    """
+    Groups patches into processing batches that guarantee no spatial overlap.
+    
+    Args:
+        coords: Array of patch coordinates, shape (N, 3) with (z, y, x) coordinates
+        patch_size: Tuple of (pZ, pY, pX) specifying patch dimensions
+        num_workers: Number of parallel workers to use
+        volume_shape: Tuple of (Z, Y, X) original volume dimensions
+        
+    Returns:
+        List of lists, where each sublist contains patch indices that can be processed in parallel
+    """
+    pZ, pY, pX = patch_size
+    Z, Y, X = volume_shape
+    
+    # For large volumes, divide space into non-overlapping regions
+    # We'll create a spatial grid where each cell is at least 'patch_size' apart
+    # This ensures patches in the same cell never overlap
+    
+    # Calculate number of cells needed in each dimension
+    grid_z = max(1, num_workers)  # At least 1 cell per dimension
+    grid_y = max(1, num_workers)
+    grid_x = max(1, num_workers)
+    
+    # Calculate cell size in each dimension
+    cell_z = max(pZ, Z // grid_z)
+    cell_y = max(pY, Y // grid_y)
+    cell_x = max(pX, X // grid_x)
+    
+    # Group patches by their spatial grid cell
+    grid_cells = {}  # Maps (grid_z, grid_y, grid_x) to list of patch indices
+    
+    for i, (z, y, x) in enumerate(coords):
+        # Calculate which grid cell this patch belongs to
+        gz = min(z // cell_z, grid_z - 1)
+        gy = min(y // cell_y, grid_y - 1)
+        gx = min(x // cell_x, grid_x - 1)
+        
+        # Define a grid cell ID
+        cell_id = (gz, gy, gx)
+        
+        if cell_id not in grid_cells:
+            grid_cells[cell_id] = []
+        
+        grid_cells[cell_id].append(i)
+    
+    # Group cells into non-overlapping sets
+    # We can process all cells with the same (gz % 2, gy % 2, gx % 2) in parallel
+    parallel_groups = {}
+    
+    for (gz, gy, gx), indices in grid_cells.items():
+        group_id = (gz % 2, gy % 2, gx % 2)
+        if group_id not in parallel_groups:
+            parallel_groups[group_id] = []
+        
+        parallel_groups[group_id].extend(indices)
+    
+    # Sort parallel_groups by size (descending) to balance workload
+    sorted_groups = sorted(parallel_groups.values(), key=len, reverse=True)
+    
+    return sorted_groups
+
+
+# --- Parallel Patch Processing ---
+async def process_patch_batch(
+    patch_indices, 
+    coords, 
+    patch_size,
+    logits_store, 
+    final_store, 
+    weights_store, 
+    gaussian_map, 
+    gaussian_map_spatial,
+    verbose=False
+):
+    """
+    Process a batch of non-overlapping patches in parallel.
+    
+    All provided patch_indices must be guaranteed to not overlap spatially.
+    """
+    pZ, pY, pX = patch_size
+    futures = []
+    
+    for patch_idx in patch_indices:
+        z, y, x = coords[patch_idx].tolist()  # Convert tensor values to Python integers
+
+        # Define slices for this patch
+        output_slice = (
+            slice(None),  # All classes
+            slice(z, z + pZ),
+            slice(y, y + pY),
+            slice(x, x + pX)
+        )
+        weight_slice = (
+            slice(z, z + pZ),
+            slice(y, y + pY),
+            slice(x, x + pX)
+        )
+
+        # Read logit patch
+        read_future = logits_store[patch_idx].read()
+        futures.append((patch_idx, read_future, output_slice, weight_slice))
+    
+    # Process results as they complete
+    tasks = []
+    
+    for patch_idx, read_future, output_slice, weight_slice in futures:
+        # Read the current values from the output stores
+        logit_patch_np = await read_future
+        current_logits_future = final_store[output_slice].read()
+        current_weights_future = weights_store[weight_slice].read()
+        
+        # Wait for both reads to complete
+        current_logits_np, current_weights_np = await asyncio.gather(
+            current_logits_future, current_weights_future
+        )
+        
+        # Convert to tensors and process
+        logit_patch = torch.from_numpy(logit_patch_np)
+        current_logits = torch.from_numpy(current_logits_np)
+        current_weights = torch.from_numpy(current_weights_np)
+        
+        # Apply Gaussian weight map
+        weighted_patch = logit_patch * gaussian_map  # Broadcasting
+        
+        # Add to existing values
+        updated_logits = current_logits + weighted_patch
+        updated_weights = current_weights + gaussian_map_spatial
+        
+        # Convert back to numpy for TensorStore write
+        updated_logits_np = updated_logits.numpy()
+        updated_weights_np = updated_weights.numpy()
+        
+        # Write back - gather these for concurrent writes
+        write_logit_future = final_store[output_slice].write(updated_logits_np)
+        write_weight_future = weights_store[weight_slice].write(updated_weights_np)
+        
+        # Add the write tasks to our list
+        tasks.append(asyncio.gather(write_logit_future, write_weight_future))
+    
+    # Wait for all writes to complete
+    await asyncio.gather(*tasks)
+    return len(futures)  # Return number of patches processed
+
+
+# --- Parallel Chunk Normalization ---
+async def normalize_chunk_parallel(
+    chunk_slice, 
+    final_store, 
+    weights_store, 
+    epsilon=1e-8
+):
+    """Process a single chunk for normalization."""
+    # Read the chunk data
+    weight_chunk_slice = chunk_slice[1:]  # Remove class dimension for weights
+    
+    logit_chunk_future = final_store[chunk_slice].read()
+    weight_chunk_future = weights_store[weight_chunk_slice].read()
+    
+    # Wait for both reads to complete
+    logit_chunk_np, weight_chunk_np = await asyncio.gather(logit_chunk_future, weight_chunk_future)
+    
+    # Convert to PyTorch tensors
+    logit_chunk = torch.from_numpy(logit_chunk_np)
+    weight_chunk = torch.from_numpy(weight_chunk_np)
+    
+    # Ensure weights are broadcastable to logits shape (C, cZ, cY, cX)
+    # Add class dimension to weights: (cZ, cY, cX) -> (1, cZ, cY, cX)
+    weight_chunk_b = weight_chunk.unsqueeze(0)
+    
+    # Create a mask where weights are significant
+    mask = weight_chunk_b > epsilon
+    
+    # Initialize with zeros
+    final_chunk = torch.zeros_like(logit_chunk)
+    
+    # Only normalize where weights are significant
+    final_chunk[mask] = logit_chunk[mask] / (weight_chunk_b[mask] + epsilon)
+    
+    # Convert back to numpy for TensorStore write
+    final_chunk_np = final_chunk.numpy()
+    
+    # Write the normalized chunk back
+    await final_store[chunk_slice].write(final_chunk_np)
+    
+    # Return the chunk size for progress tracking
+    return torch.prod(torch.tensor(final_chunk.shape)).item()
 
 
 # --- Main Merging Function ---
@@ -44,6 +239,7 @@ async def merge_inference_outputs(
         chunk_size: tuple = (128, 128, 128),  # Spatial chunk size (Z, Y, X) for output
         cache_pool_gb: float = 10.0,
         delete_weights: bool = True,  # Delete weight accumulator after merge
+        num_workers: int = None,      # Number of parallel workers (defaults to CPU count)
         verbose: bool = True):
     """
     Merges partial inference results with Gaussian blending.
@@ -57,8 +253,15 @@ async def merge_inference_outputs(
         chunk_size: Spatial chunk size (Z, Y, X) for output Zarr stores.
         cache_pool_gb: TensorStore cache pool size in GiB.
         delete_weights: Whether to delete the weight accumulator Zarr after completion.
+        num_workers: Number of parallel workers. If None, uses CPU count.
         verbose: Print progress messages.
     """
+    # Set default number of workers if not provided
+    if num_workers is None:
+        num_workers = max(1, multiprocessing.cpu_count() - 1)  # Leave one CPU for system tasks
+    
+    print(f"Using {num_workers} parallel workers for processing")
+    
     if weight_accumulator_path is None:
         base, _ = os.path.splitext(output_path)
         weight_accumulator_path = f"{base}_weights.zarr"
@@ -87,7 +290,7 @@ async def merge_inference_outputs(
             raise FileNotFoundError(f"Part {part_id} is missing logits or coordinates Zarr.")
 
     # --- 2. Read Metadata (from first available part) ---
-    first_part_id = part_ids[0]  # Use the first available part_id 
+    first_part_id = part_ids[0]  # Use the first available part_id
     print(f"Reading metadata from part {first_part_id}...")
     part0_logits_path = part_files[first_part_id]['logits']
     try:
@@ -169,7 +372,7 @@ async def merge_inference_outputs(
     # Extract spatial dimensions for weights store
     gaussian_map_spatial = gaussian_map[0]  # Shape (pZ, pY, pX) for weights store
 
-    # --- 5. Process Each Part (Accumulation) ---
+    # --- 5. Process Each Part (Accumulation) using Parallel Processing ---
     print("\n--- Accumulating Weighted Patches ---")
     pZ, pY, pX = patch_size
     total_patches_processed = 0
@@ -195,73 +398,50 @@ async def merge_inference_outputs(
         coords = torch.from_numpy(coords_np)
         num_patches_in_part = coords.shape[0]
         if verbose: print(f"  Found {num_patches_in_part} patches in part {part_id}.")
-
-        # Process patches serially for simplicity, could be parallelized with care
-        for patch_idx in tqdm(range(num_patches_in_part), desc=f"  Patches Part {part_id}", leave=False,
-                              disable=not verbose):
-            z, y, x = coords[patch_idx].tolist()  # Convert tensor values to Python integers
-
-            # Define slices (handle boundary conditions implicitly via slicing)
-            output_slice = (
-                slice(None),  # All classes
-                slice(z, z + pZ),
-                slice(y, y + pY),
-                slice(x, x + pX)
-            )
-            weight_slice = (
-                slice(z, z + pZ),
-                slice(y, y + pY),
-                slice(x, x + pX)
-            )
-
-            # Read logit patch and immediately convert to tensor
-            logit_patch_np = await logits_store[patch_idx].read()  # Reads (C, pZ, pY, pX)
-            logit_patch = torch.from_numpy(logit_patch_np)
-            
-            # Apply Gaussian weight map
-            weighted_patch = logit_patch * gaussian_map  # Broadcasting (1, pZ, pY, pX)
-
-            # Atomically add to stores
-            # We can't use accumulate parameter directly with TensorStore
-            # So we read the current values, add, and write back
-            current_logits_np = await final_store[output_slice].read()
-            current_weights_np = await weights_store[weight_slice].read()
-            
-            # Convert to tensors
-            current_logits = torch.from_numpy(current_logits_np)
-            current_weights = torch.from_numpy(current_weights_np)
-
-            # Add to existing values
-            updated_logits = current_logits + weighted_patch
-            updated_weights = current_weights + gaussian_map_spatial
-
-            # Convert back to numpy for TensorStore write
-            updated_logits_np = updated_logits.numpy()
-            updated_weights_np = updated_weights.numpy()
-
-            # Write back
-            write_logit_future = final_store[output_slice].write(updated_logits_np)
-            write_weight_future = weights_store[weight_slice].write(updated_weights_np)
-
-            # Await writes for this patch before next (simplest flow control)
-            await asyncio.gather(write_logit_future, write_weight_future)
-            total_patches_processed += 1
+        
+        # Group patches into non-overlapping batches for parallel processing
+        patch_groups = group_patches_for_parallel_processing(
+            coords, 
+            patch_size, 
+            num_workers, 
+            original_volume_shape
+        )
+        
+        # Process each group in sequence, but patches within a group in parallel
+        with tqdm(total=num_patches_in_part, desc=f"  Patches Part {part_id}", leave=False,
+                  disable=not verbose) as patch_pbar:
+                
+            for group_idx, patch_indices in enumerate(patch_groups):
+                # Process this non-overlapping batch in parallel
+                patches_processed = await process_patch_batch(
+                    patch_indices,
+                    coords,
+                    patch_size,
+                    logits_store,
+                    final_store,
+                    weights_store,
+                    gaussian_map,
+                    gaussian_map_spatial,
+                    verbose
+                )
+                
+                total_patches_processed += patches_processed
+                patch_pbar.update(patches_processed)
+                
+                # Progress is already shown by the tqdm progress bar
 
     print(f"\nAccumulation complete. Processed {total_patches_processed} patches total.")
 
-    # --- 6. Normalize ---
+    # --- 6. Normalize in Parallel ---
     print("\n--- Normalizing Output ---")
-    # Iterate chunk by chunk over the *output* store dimensions
-
     # Get output shape and chunks for iteration
-    num_processed_voxels = 0
     total_voxels = np.prod(output_shape)
+    processed_voxels = 0
 
-    # Create a list of chunk indices to iterate over
-    # Based on output shape and chunk size
+    # Create a list of chunk indices to iterate over based on output shape and chunk size
     def get_chunk_indices(shape, chunks):
         # For each dimension, calculate how many chunks we need
-        chunk_counts = [int(np.ceil(s / c)) for s, c in zip(shape, output_chunks)]
+        chunk_counts = [int(np.ceil(s / c)) for s, c in zip(shape, chunks)]
 
         # Generate all combinations of chunk indices
         from itertools import product
@@ -269,85 +449,57 @@ async def merge_inference_outputs(
         return chunk_indices
 
     chunk_indices = get_chunk_indices(output_shape, output_chunks)
-
-    # Wrap the chunk iteration with tqdm
-    chunk_iterator = tqdm(chunk_indices,
-                          desc="Normalizing Chunks",
-                          total=len(chunk_indices),
-                          unit="chunk")
-
-    normalize_futures = []
-    max_concurrent_normalize = 32  # Limit concurrent reads/writes
-
-    for read_chunk_indices in chunk_iterator:
-        # Calculate slices for this chunk using the chunk indices
-        # Generate a tuple of slices based on chunk indices and chunk size
-        chunk_slice = tuple(
-            slice(idx * chunk, min((idx + 1) * chunk, shape_dim))
-            for idx, chunk, shape_dim in zip(read_chunk_indices, output_chunks, output_shape)
-        )
-
-        # Read summed logits and weights for this chunk
-        logit_chunk_future = final_store[chunk_slice].read()
-        # Adjust slice for weights store (remove class dimension)
-        weight_chunk_slice = chunk_slice[1:]
-        weight_chunk_future = weights_store[weight_chunk_slice].read()
-
-        # Process concurrently
-        logit_chunk_np, weight_chunk_np = await asyncio.gather(logit_chunk_future, weight_chunk_future)
+    
+    # Set up progress tracking
+    chunk_pbar = tqdm(total=len(chunk_indices), desc="Normalizing Chunks", unit="chunk")
+    
+    # Use semaphore to limit concurrent operations
+    semaphore = asyncio.Semaphore(num_workers * 2)  # Allow more normalization tasks than workers
+    
+    async def process_chunk_with_semaphore(chunk_index):
+        """Process a chunk with semaphore to limit concurrency."""
+        nonlocal processed_voxels
         
-        # Convert to PyTorch tensors
-        logit_chunk = torch.from_numpy(logit_chunk_np)
-        weight_chunk = torch.from_numpy(weight_chunk_np)
-
-        # Ensure weights are broadcastable to logits shape (C, cZ, cY, cX)
-        # Add class dimension to weights: (cZ, cY, cX) -> (1, cZ, cY, cX)
-        weight_chunk_b = weight_chunk.unsqueeze(0)
-
-        # Normalize, handling division by zero
-        # Add a small epsilon to weights to avoid division by zero errors
-        epsilon = 1e-8
-        # Create a mask where weights are significant
-        mask = weight_chunk_b > epsilon
-        
-        # Initialize with zeros 
-        final_chunk = torch.zeros_like(logit_chunk)
-        
-        # Only normalize where weights are significant
-        final_chunk[mask] = logit_chunk[mask] / (weight_chunk_b[mask] + epsilon)
-        
-        # Convert back to numpy for TensorStore write 
-        final_chunk_np = final_chunk.numpy()
-
-        # Write the normalized chunk back (overwrite)
-        # Use fire-and-forget writes and manage concurrency
-        write_future = final_store[chunk_slice].write(final_chunk_np)
-        normalize_futures.append(write_future)
-
-        # --- Concurrency Management ---
-        if len(normalize_futures) >= max_concurrent_normalize:
-            # Wait for the oldest futures to complete
-            num_to_wait = len(normalize_futures) - max_concurrent_normalize // 2
-            # print(f"Waiting for {num_to_wait} normalization futures...")
-            await asyncio.gather(*normalize_futures[:num_to_wait])
-            normalize_futures = normalize_futures[num_to_wait:]
-            # print("Done waiting.")
-
-        # Update progress tracking (approximate)
-        num_processed_voxels += torch.prod(torch.tensor(final_chunk.shape)).item()
-
-    # Wait for any remaining normalization writes
-    if normalize_futures:
-        print("Waiting for final normalization writes...")
-        await asyncio.gather(*normalize_futures)
-
+        async with semaphore:
+            # Calculate slice for this chunk
+            chunk_slice = tuple(
+                slice(idx * chunk, min((idx + 1) * chunk, shape_dim))
+                for idx, chunk, shape_dim in zip(chunk_index, output_chunks, output_shape)
+            )
+            
+            # Process the chunk
+            chunk_voxels = await normalize_chunk_parallel(
+                chunk_slice, 
+                final_store, 
+                weights_store
+            )
+            
+            # Update progress
+            processed_voxels += chunk_voxels
+            chunk_pbar.update(1)
+            
+            # Update progress percentage occasionally
+            if chunk_pbar.n % 10 == 0:
+                percent_complete = min(100, processed_voxels * 100 / total_voxels)
+                chunk_pbar.set_postfix({"percent": f"{percent_complete:.1f}%"})
+                
+            return chunk_voxels
+    
+    # Create tasks for all chunks
+    normalization_tasks = [
+        process_chunk_with_semaphore(chunk_index) 
+        for chunk_index in chunk_indices
+    ]
+    
+    # Run all tasks
+    results = await asyncio.gather(*normalization_tasks)
+    
+    # Clean up
+    chunk_pbar.close()
+    
     print("\nNormalization complete.")
 
     # --- 7. Cleanup ---
-    # Stores are implicitly closed when context ends? Explicitly closing is safer if needed.
-    # final_store = None # Release reference
-    # weights_store = None
-
     if delete_weights:
         print(f"Deleting weight accumulator: {weight_accumulator_path}")
         try:
@@ -368,6 +520,7 @@ def main():
     """Entry point for the vesuvius.blend command line tool."""
     import argparse
     import sys
+    import multiprocessing
 
     parser = argparse.ArgumentParser(description='Merge partial nnUNet inference outputs with Gaussian blending.')
     parser.add_argument('parent_dir', type=str,
@@ -382,6 +535,8 @@ def main():
                         help='Spatial chunk size (Z,Y,X) for output Zarr. Comma-separated. If not specified, patch_size will be used.')
     parser.add_argument('--cache_gb', type=float, default=4.0,
                         help='TensorStore cache pool size in GiB. Default: 4.0')
+    parser.add_argument('--num_workers', type=int, default=None,
+                        help=f'Number of parallel workers to use. Default: CPU count - 1 ({max(1, multiprocessing.cpu_count() - 1)})')
     parser.add_argument('--keep_weights', action='store_true',
                         help='Do not delete the weight accumulator Zarr after merging.')
     parser.add_argument('--quiet', action='store_true',
@@ -407,6 +562,7 @@ def main():
             chunk_size=chunks,
             cache_pool_gb=args.cache_gb,
             delete_weights=not args.keep_weights,
+            num_workers=args.num_workers,
             verbose=not args.quiet
         ))
         return 0
@@ -417,6 +573,8 @@ def main():
         traceback.print_exc()
         return 1
 
+
 if __name__ == '__main__':
     import sys
+
     sys.exit(main())
