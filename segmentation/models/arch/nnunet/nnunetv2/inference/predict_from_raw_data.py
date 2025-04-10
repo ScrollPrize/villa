@@ -39,6 +39,7 @@ class nnUNetPredictor(object):
                  tile_step_size: float = 0.5,
                  use_gaussian: bool = True,
                  use_mirroring: bool = True,
+                 tta_type: str = 'mirroring',  # 'mirroring' or 'rotation'
                  perform_everything_on_device: bool = True,
                  device: torch.device = torch.device('cuda'),
                  verbose: bool = False,
@@ -54,6 +55,13 @@ class nnUNetPredictor(object):
         self.tile_step_size = tile_step_size
         self.use_gaussian = use_gaussian
         self.use_mirroring = use_mirroring
+        
+        # Validate tta_type
+        if tta_type not in ['mirroring', 'rotation']:
+            print(f"Warning: Invalid tta_type '{tta_type}'. Defaulting to 'mirroring'.")
+            tta_type = 'mirroring'
+        self.tta_type = tta_type
+        
         if device.type == 'cuda':
             torch.backends.cudnn.benchmark = True
         else:
@@ -535,21 +543,53 @@ class nnUNetPredictor(object):
         return slicers
 
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
-        mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
+        if not self.use_mirroring:
+            # If TTA is disabled entirely, just run the network once
+            return self.network(x)
+        
+        # Whether mirroring or rotation, we always start with original prediction
         prediction = self.network(x)
+        
+        if self.tta_type == 'mirroring':
+            mirror_axes = self.allowed_mirroring_axes
+            if mirror_axes is not None:
+                # check for invalid numbers in mirror_axes
+                # x should be 5d for 3d images and 4d for 2d. so the max value of mirror_axes cannot exceed len(x.shape) - 3
+                assert max(mirror_axes) <= x.ndim - 3, 'mirror_axes does not match the dimension of the input!'
 
-        if mirror_axes is not None:
-            # check for invalid numbers in mirror_axes
-            # x should be 5d for 3d images and 4d for 2d. so the max value of mirror_axes cannot exceed len(x.shape) - 3
-            assert max(mirror_axes) <= x.ndim - 3, 'mirror_axes does not match the dimension of the input!'
-
-            mirror_axes = [m + 2 for m in mirror_axes]
-            axes_combinations = [
-                c for i in range(len(mirror_axes)) for c in itertools.combinations(mirror_axes, i + 1)
-            ]
-            for axes in axes_combinations:
-                prediction += torch.flip(self.network(torch.flip(x, axes)), axes)
-            prediction /= (len(axes_combinations) + 1)
+                mirror_axes = [m + 2 for m in mirror_axes]
+                axes_combinations = [
+                    c for i in range(len(mirror_axes)) for c in itertools.combinations(mirror_axes, i + 1)
+                ]
+                for axes in axes_combinations:
+                    prediction += torch.flip(self.network(torch.flip(x, axes)), axes)
+                prediction /= (len(axes_combinations) + 1)
+        
+        elif self.tta_type == 'rotation':
+            if x.ndim < 5:  # Make sure input is 3D (5D tensor with batch and channels)
+                if self.verbose:
+                    print(f"Warning: Rotation TTA requires 3D inputs, but got shape {x.shape}. Skipping rotations.")
+                return prediction
+                
+            # Apply rotations in the XY plane (last two dimensions)
+            # 90 degrees
+            rotated = torch.rot90(x, k=1, dims=(-2, -1))
+            rotated_pred = self.network(rotated)
+            prediction += torch.rot90(rotated_pred, k=-1, dims=(-2, -1))  # Rotate back
+            
+            # 180 degrees
+            rotated = torch.rot90(x, k=2, dims=(-2, -1))
+            rotated_pred = self.network(rotated)
+            prediction += torch.rot90(rotated_pred, k=-2, dims=(-2, -1))  # Rotate back
+            
+            # 270 degrees
+            rotated = torch.rot90(x, k=3, dims=(-2, -1))
+            rotated_pred = self.network(rotated)
+            prediction += torch.rot90(rotated_pred, k=-3, dims=(-2, -1))  # Rotate back
+            
+            # Average the predictions
+            prediction /= 4.0  # Original + 3 rotations
+            
         return prediction
 
     def _internal_predict_sliding_window_return_logits(self,
@@ -769,6 +809,9 @@ def predict_entry_point_modelfolder():
     parser.add_argument('--disable_tta', action='store_true', required=False, default=False,
                         help='Set this flag to disable test time data augmentation in the form of mirroring. Faster, '
                              'but less accurate inference. Not recommended.')
+    parser.add_argument('--tta_type', type=str, choices=['mirroring', 'rotation'], default='mirroring', required=False,
+                        help='Type of test-time augmentation to use. Options: mirroring (default), rotation. '
+                             'Rotation is specifically helpful for circular or radially symmetric structures.')
     parser.add_argument('--verbose', action='store_true', help="Set this if you like being talked to. You will have "
                                                                "to be a good listener/reader.")
     parser.add_argument('--save_probabilities', action='store_true',
@@ -825,6 +868,7 @@ def predict_entry_point_modelfolder():
     predictor = nnUNetPredictor(tile_step_size=args.step_size,
                                 use_gaussian=True,
                                 use_mirroring=not args.disable_tta,
+                                tta_type=args.tta_type,
                                 perform_everything_on_device=True,
                                 device=device,
                                 verbose=args.verbose,
@@ -870,6 +914,9 @@ def predict_entry_point():
     parser.add_argument('--disable_tta', action='store_true', required=False, default=False,
                         help='Set this flag to disable test time data augmentation in the form of mirroring. Faster, '
                              'but less accurate inference. Not recommended.')
+    parser.add_argument('--tta_type', type=str, choices=['mirroring', 'rotation'], default='mirroring', required=False,
+                        help='Type of test-time augmentation to use. Options: mirroring (default), rotation. '
+                             'Rotation is specifically helpful for circular or radially symmetric structures.')
     parser.add_argument('--verbose', action='store_true', help="Set this if you like being talked to. You will have "
                                                                "to be a good listener/reader.")
     parser.add_argument('--save_probabilities', action='store_true',
@@ -939,6 +986,7 @@ def predict_entry_point():
     predictor = nnUNetPredictor(tile_step_size=args.step_size,
                                 use_gaussian=True,
                                 use_mirroring=not args.disable_tta,
+                                tta_type=args.tta_type,
                                 perform_everything_on_device=True,
                                 device=device,
                                 verbose=args.verbose,
