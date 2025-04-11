@@ -15,6 +15,8 @@
 #    `python3 chop_and_stack.py input.jpg simple_output.jpg extended_output.jpg 4 --percent 20`
 
 from PIL import Image, ImageDraw, ImageEnhance
+# None image size
+Image.MAX_IMAGE_PIXELS = None
 import sys
 import argparse
 
