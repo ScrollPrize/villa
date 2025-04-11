@@ -12,7 +12,7 @@ else
 fi
 
 # Build the sheet_generation project.
-cd ThaumatoAnakalyptor/sheet_generation || exit 1
+cd /workspace/ThaumatoAnakalyptor/sheet_generation || exit 1
 mkdir -p build
 cd build || exit 1
 cmake ..
