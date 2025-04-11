@@ -13,7 +13,7 @@ xhost +local:root
 sudo docker run --gpus all --shm-size=150g -it --rm \
     -v /home/ubuntu/Desktop/scrolls:/scrolls \
     -v /home/ubuntu/villa/thaumato-anakalyptor/:/workspace \
-    -v /home/ubuntu/Desktop/experiments:/workspace/experminets \
+    -v /home/ubuntu/Desktop/experiments:/workspace/experiments \
     -v /tmp/.X11-unix:/tmp/.X11-unix \
     -e DISPLAY=$DISPLAY \
     thaumato_image \
