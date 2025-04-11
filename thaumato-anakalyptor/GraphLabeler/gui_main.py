@@ -23,6 +23,9 @@ from config import load_config, save_config
 from utils import vectorized_point_to_polyline_distance, build_temporary_group_edges, filter_point_normals
 from widgets import create_sync_slider_spinbox
 
+# print current working directory
+print("Current working directory:", os.getcwd())
+
 # --------------------------------------------------
 # Main: Create GUI.
 # --------------------------------------------------
