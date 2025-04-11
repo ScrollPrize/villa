@@ -19,7 +19,7 @@ cmake ..
 cmake --build . --parallel 32
 
 # Build the graph_problem project.
-cd ../../graph_problem || exit 1
+cd /workspace/ThaumatoAnakalyptor/graph_problem || exit 1
 mkdir -p build
 cd build || exit 1
 
