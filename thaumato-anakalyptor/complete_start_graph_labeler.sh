@@ -1,12 +1,15 @@
 #!/bin/bash
 # Filename: run_thaumato.sh
 
-# Enable X11 access for the docker user and root
+# Change directory to the repository and update it
+cd /home/ubuntu/villa || { echo "Directory /home/ubuntu/villa not found!"; exit 1; }
+git pull
+
+# Enable X11 access for Docker containers and root
 xhost +local:docker
 xhost +local:root
 
-# Run the Docker container with GPU support and mounts,
-# then execute the commands to change script permissions and run them.
+# Run the Docker container with GPU access, large shared memory, multiple volume mounts, and GUI support.
 docker run --gpus all --shm-size=150g -it --rm \
     -v /home/ubuntu/Desktop/scrolls:/scrolls \
     -v /home/ubuntu/villa/thaumato-anakalyptor/:/workspace \
