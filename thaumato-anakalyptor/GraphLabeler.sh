@@ -11,6 +11,8 @@ else
     echo "Conda environment 'thaumato' is already active."
 fi
 
+source "./compile_cpp.sh"
+
 # Deactivate conda completely (ensure no conda environment, not even 'base', remains active).
 while [[ -n "$CONDA_DEFAULT_ENV" ]]; do
     conda deactivate
