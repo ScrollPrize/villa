@@ -20,7 +20,7 @@ done
 echo "Conda completely deactivated."
 
 # Change directory to the GraphLabeler project.
-cd GraphLabeler || { echo "Failed to change directory to GraphLabeler. Exiting."; exit 1; }
+cd /workspace/GraphLabeler || { echo "Failed to change directory to GraphLabeler. Exiting."; exit 1; }
 
 # Execute the main Python script.
 python3 main.py
