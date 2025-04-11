@@ -47,10 +47,10 @@ class PointCloudLabeler(QMainWindow):
         # Initialize solver using SolverInterface if no external point data is provided.
         if point_data is None and self.default_experiment != "" and self.graph_path != "":
             self.solver = graph_problem_gpu_py.Solver(self.graph_path)
-            gt_path = os.path.join("../experiments", self.default_experiment,
+            gt_path = os.path.join(os.getcwd(), "../experiments", self.default_experiment,
                                    "checkpoints", "checkpoint_graph_solver_connected_2.bin")
             if not os.path.exists(gt_path):
-                gt_path = os.path.join("../experiments", self.default_experiment,
+                gt_path = os.path.join(os.getcwd(), "../experiments", self.default_experiment,
                                        "checkpoints", "checkpoint_graph_f_star_final.bin")
             if os.path.exists(gt_path):
                 self.solver.load_graph(gt_path)
@@ -698,9 +698,9 @@ class PointCloudLabeler(QMainWindow):
             self.umbilicus_path = self.config.get("umbilicus_path", self.umbilicus_path)
             if self.graph_path:
                 self.solver = graph_problem_gpu_py.Solver(self.graph_path)
-                gt_path = os.path.join("../experiments", self.default_experiment, "checkpoints", "checkpoint_graph_solver_connected_2.bin")
+                gt_path = os.path.join(os.getcwd(), "../experiments", self.default_experiment, "checkpoints", "checkpoint_graph_solver_connected_2.bin")
                 if not os.path.exists(gt_path):
-                    gt_path = os.path.join("../experiments", self.default_experiment, "checkpoints", "checkpoint_graph_f_star_final.bin")
+                    gt_path = os.path.join(os.getcwd(), "../experiments", self.default_experiment, "checkpoints", "checkpoint_graph_f_star_final.bin")
                 if os.path.exists(gt_path):
                     self.solver.load_graph(gt_path)
                 else:
@@ -762,9 +762,9 @@ class PointCloudLabeler(QMainWindow):
                 return
             self.graph_path = bin_file_path
             self.solver = graph_problem_gpu_py.Solver(self.graph_path)
-            gt_path = os.path.join("../experiments", exp_name, "checkpoints", "checkpoint_graph_solver_connected_2.bin")
+            gt_path = os.path.join(os.getcwd(), "../experiments", exp_name, "checkpoints", "checkpoint_graph_solver_connected_2.bin")
             if not os.path.exists(gt_path):
-                gt_path = os.path.join("../experiments", exp_name, "checkpoints", "checkpoint_graph_f_star_final.bin")
+                gt_path = os.path.join(os.getcwd(), "../experiments", exp_name, "checkpoints", "checkpoint_graph_f_star_final.bin")
             if os.path.exists(gt_path):
                 self.solver.load_graph(gt_path)
             else:
@@ -798,7 +798,7 @@ class PointCloudLabeler(QMainWindow):
                 exp_lineedit.setText(exp_name)
     
     def save_labels_to_path(self):
-        fname, _ = QFileDialog.getSaveFileName(self, "Save Labels", os.path.join("../experiments", self.default_experiment), "Text Files (*.txt);;All Files (*)")
+        fname, _ = QFileDialog.getSaveFileName(self, "Save Labels", os.path.join(os.getcwd(), "../experiments", self.default_experiment), "Text Files (*.txt);;All Files (*)")
         if not fname.endswith(".txt"):
             fname += ".txt"
         self._save_labels_to_path(fname)
@@ -812,7 +812,7 @@ class PointCloudLabeler(QMainWindow):
             print(f"Labels saved to {fname}")
     
     def load_labels_from_path(self):
-        fname, _ = QFileDialog.getOpenFileName(self, "Load Labels", os.path.join("../experiments", self.default_experiment),
+        fname, _ = QFileDialog.getOpenFileName(self, "Load Labels", os.path.join(os.getcwd(), "../experiments", self.default_experiment),
                                                  "Text Files (*.txt);;All Files (*)")
         if fname:
             with open(fname, "r") as f:
@@ -2258,7 +2258,7 @@ class PointCloudLabeler(QMainWindow):
                 self.recompute = True
                 self.update_views()
         
-        base_path = os.path.join("../experiments", self.default_experiment)
+        base_path = os.path.join(os.getcwd(), "../experiments", self.default_experiment)
         slab_filename = os.path.join(base_path, "slabs", "slab_initial.txt")
         #make dir
         os.makedirs(os.path.dirname(slab_filename), exist_ok=True)
