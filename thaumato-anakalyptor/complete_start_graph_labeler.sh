@@ -10,7 +10,7 @@ xhost +local:docker
 xhost +local:root
 
 # Run the Docker container with GPU access, large shared memory, multiple volume mounts, and GUI support.
-docker run --gpus all --shm-size=150g -it --rm \
+sudo docker run --gpus all --shm-size=150g -it --rm \
     -v /home/ubuntu/Desktop/scrolls:/scrolls \
     -v /home/ubuntu/villa/thaumato-anakalyptor/:/workspace \
     -v /home/ubuntu/Desktop/experiments:/workspace/experminets \
