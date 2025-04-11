@@ -17,4 +17,4 @@ sudo docker run --gpus all --shm-size=150g -it --rm \
     -v /tmp/.X11-unix:/tmp/.X11-unix \
     -e DISPLAY=$DISPLAY \
     thaumato_image \
-    bash -c "chmod +x compile_cpp.sh GraphLabeler.sh
+    bash -c "chmod +x compile_cpp.sh GraphLabeler.sh"
