@@ -31,3 +31,5 @@ echo "Conda completely deactivated."
 
 cmake ..
 cmake --build . --parallel 32
+
+cd /workspace || exit 1
