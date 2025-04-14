@@ -73,6 +73,7 @@ void saveGraph(const std::vector<Node>& nodes, const std::string& filename) {
 
 // Function to load the graph from a binary file
 std::vector<Node> loadGraph(const std::string& filename, int version) {
+    std::cout << "Loading graph version " << version << " from file: " << filename << std::endl;
     std::ifstream inFile(filename, std::ios::binary);
     if (!inFile) {
         throw std::runtime_error("Could not open file for reading");

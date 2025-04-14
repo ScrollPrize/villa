@@ -57,6 +57,10 @@ class PointCloudLabeler(QMainWindow):
         else:
             self.solver = None
             point_data = np.zeros((0, 3), dtype=np.float32)
+        point_data = np.array(point_data, dtype=np.float32)
+        if len(point_data.shape) != 2:
+            print(f"Error: point_data should be a 2D array, but got shape {point_data.shape}")
+            point_data = np.zeros((0, 3), dtype=np.float32)
         self.seed_node = None # master node, this is the fixed node, to which all other nodes are fixed in f_star to
         self.recompute = True
 
