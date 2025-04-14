@@ -603,13 +603,15 @@ class PointCloudLabeler(QMainWindow):
     # --------------------------------------------------
     def _create_menu(self):
         menu_bar = self.menuBar()
-        project_menu = menu_bar.addMenu("Project")
-        load_action = QAction("Load Project", self)
-        load_action.triggered.connect(self.load_project)
-        project_menu.addAction(load_action)
-        save_project_action = QAction("Save Project", self)
-        save_project_action.triggered.connect(self.save_project_to_path)
-        project_menu.addAction(save_project_action)
+
+        ### Deactivating until complete implementation ###
+        # project_menu = menu_bar.addMenu("Project")
+        # load_action = QAction("Load Project", self)
+        # load_action.triggered.connect(self.load_project)
+        # project_menu.addAction(load_action)
+        # save_project_action = QAction("Save Project", self)
+        # save_project_action.triggered.connect(self.save_project_to_path)
+        # project_menu.addAction(save_project_action)
 
         data_menu = menu_bar.addMenu("Data")
         load_action = QAction("Load Data", self)
