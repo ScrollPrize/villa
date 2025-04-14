@@ -26,6 +26,18 @@ from scroll_graph_util import compute_mean_windings_precomputed, load_xyz_from_f
 def load_graph_pkl(graph_pkl_path):
     with open(graph_pkl_path, 'rb') as f:
         graph = pickle.load(f)
+    # Remove edges and from nodes all fields except sample_points and centroid
+    try:
+        del graph.edges
+    except:
+        print("No edges to delete.")
+    for node in graph.nodes:
+        try:
+            for field in list(graph.nodes[node].keys()):
+                if field not in ['sample_points', 'centroid']:
+                    del graph.nodes[node][field]
+        except:
+            print(f"Error deleting fields for node {node}.")
     return graph   
 
 ########################################
