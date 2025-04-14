@@ -1240,12 +1240,13 @@ class PointCloudLabeler(QMainWindow):
             else:
                 return points, labels, groups
         min_xy = points.min(axis=0)
+        grid_size = np.array([grid_size, grid_size, 7*grid_size])
         cell_indices = ((points - min_xy) // grid_size).astype(int)
         if axis is not None:
             if axis == 'xy':
                 cell_indices = cell_indices[:, :2]
             elif axis == 'xz':
-                cell_indices = cell_indices[:, [1, 2]]
+                cell_indices = cell_indices[:, [0, 2]]
             else:
                 raise ValueError("Invalid axis. Use 'xy' or 'xz'.")
         
