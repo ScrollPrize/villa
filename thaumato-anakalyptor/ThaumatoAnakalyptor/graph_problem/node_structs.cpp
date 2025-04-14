@@ -142,6 +142,7 @@ std::vector<Node> loadGraph(const std::string& filename, int version) {
     }
 
     inFile.close();
+    std::cout << "Loaded " << num_nodes << " nodes from file." << std::endl;
     return nodes;
 }
 
