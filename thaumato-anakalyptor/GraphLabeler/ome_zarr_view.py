@@ -32,8 +32,8 @@ def load_graph_pkl(graph_pkl_path):
         del graph.edges
     except:
         print("No edges to delete.")
-    for node in graph.nodes:
-        for field in tqdm(list(graph.nodes[node].keys()), desc="Deleting node fields"):
+    for node in tqdm(graph.nodes, desc="Deleting node fields"):
+        for field in list(graph.nodes[node].keys()):
             try:
                 if field not in ['sample_points', 'centroid']:
                     del graph.nodes[node][field]
