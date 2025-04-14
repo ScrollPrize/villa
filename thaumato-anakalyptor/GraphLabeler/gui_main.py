@@ -1245,7 +1245,7 @@ class PointCloudLabeler(QMainWindow):
             if axis == 'xy':
                 cell_indices = cell_indices[:, :2]
             elif axis == 'xz':
-                cell_indices = cell_indices[:, [0, 2]]
+                cell_indices = cell_indices[:, [1, 2]]
             else:
                 raise ValueError("Invalid axis. Use 'xy' or 'xz'.")
         
