@@ -111,6 +111,11 @@ std::vector<Node> loadGraph(const std::string& filename, int version) {
                 inFile.read(reinterpret_cast<char*>(&node.sides[j]), sizeof(node.sides[j]));
                 inFile.read(reinterpret_cast<char*>(&node.sides_old[j]), sizeof(node.sides_old[j]));
             }
+            else {
+                float dummy;
+                inFile.read(reinterpret_cast<char*>(&dummy), sizeof(dummy));
+                inFile.read(reinterpret_cast<char*>(&dummy), sizeof(dummy));
+            }
         }
 
         inFile.read(reinterpret_cast<char*>(&node.num_same_block_edges), sizeof(node.num_same_block_edges));
