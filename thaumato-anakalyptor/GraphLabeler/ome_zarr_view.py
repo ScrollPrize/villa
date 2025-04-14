@@ -12,6 +12,7 @@ import time
 import os
 import ast
 import sys
+from tqdm import tqdm
 # remove the lib first
 try:
     del sys.modules['scroll_graph_util']
@@ -32,12 +33,12 @@ def load_graph_pkl(graph_pkl_path):
     except:
         print("No edges to delete.")
     for node in graph.nodes:
-        try:
-            for field in list(graph.nodes[node].keys()):
+        for field in tqdm(list(graph.nodes[node].keys()), desc="Deleting node fields"):
+            try:
                 if field not in ['sample_points', 'centroid']:
                     del graph.nodes[node][field]
-        except:
-            print(f"Error deleting fields for node {node}.")
+            except:
+                print(f"Error deleting fields for node {node}.")
     return graph   
 
 ########################################
