@@ -232,7 +232,7 @@ class ScrollGraph(Graph):
         use_h5 = h5_filename.endswith(".h5")
         if not use_h5:
             # If using subsampled points from graph, use more nodes for fuller pointcloud display
-            block_size *= 4
+            block_size *= 2
         
         all_node_keys = list(self.nodes.keys())
         node_keys = [all_node_keys[i] for i in undeleted_nodes_indices]
@@ -256,7 +256,7 @@ class ScrollGraph(Graph):
         if not use_h5:
             # Use backup graph node points
             points, point_nodes_indices = self.load_nodes_graph(close_nodes, close_angles, close_angles_computed)
-            plane_point_filter_distance = 20
+            plane_point_filter_distance = 10
         else:
             points, point_nodes_indices = self.load_nodes(h5_filename, close_nodes, close_angles, close_angles_computed)
 
