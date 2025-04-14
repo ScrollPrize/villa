@@ -791,10 +791,10 @@ class Solver {
         }
         void load_graph(std::string graph_path) {
             try {
-                graph = loadGraph(graph_path, 1);
+                graph = loadGraph(graph_path, 1); // old graph version as default for now, switch over to 1 when new graphs arrive
             }
             catch (...) {
-                std::cerr << "Error loading graph, trying to load old graph version." << std::endl;
+                std::cout << "Error loading graph, trying to load old graph version." << std::endl;
                 graph = loadGraph(graph_path, 0);
             }
         }
