@@ -59,7 +59,7 @@ struct Node {
     float same_block_closeness_old = 0.0f;
 
     float side = 0.0f;           // Side value for the node wrt to nodes around itself
-    static constexpr int sides_nr = 18; // Number of sides for the node
+    static constexpr int sides_nr = 3; // Number of sides for the node
     float* sides = new float[sides_nr]; // Sides values for the node
     float* sides_old = new float[sides_nr]; // Sides values for the node
     int side_number = 0;         // Side of node

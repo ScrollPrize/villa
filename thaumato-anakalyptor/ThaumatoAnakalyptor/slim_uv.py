@@ -137,7 +137,13 @@ class Flatboi:
 
             # Set UVs as triangle attributes
             if self.original_uvs is not None and self.original_uvs.size > 0:
-                uvs = self.original_uvs.reshape((-1, 3, 2))
+                uvs = self.original_uvs.reshape((-1, 2))
+                min_uvs = np.min(uvs, axis=0)
+                max_uvs = np.max(uvs, axis=0)
+                print(f"UVs min: {min_uvs}, max: {max_uvs}")
+                # to 0
+                uvs = uvs - min_uvs
+                uvs = uvs.reshape((-1, 3, 2))
                 assert np.all(uvs >= 0), "Some triangles do not have UVs."
                 # get uvs for each vertex. each vertex whenever it is inside a triangle, has the same uv
                 vertex_uvs = np.zeros((self.vertices.shape[0], 2), dtype=np.float64) - 1.0
@@ -308,7 +314,7 @@ class Flatboi:
             uv = arap.solve(np.zeros((0, 0)), uv)
         uva = arap.solve(np.zeros((0, 0)), uv)
 
-        uva = self.arap_solver_ic(uva)
+        uva = self.arap_solver_ic(uva, vertices, triangles)
 
         bc = np.zeros((bnd.shape[0],2), dtype=np.float64)
         for i in tqdm(range(bnd.shape[0])):
@@ -353,20 +359,57 @@ class Flatboi:
             for v in range(self.triangles.shape[1]):
                 uv[self.triangles[t,v]] = uvs[t,v]
 
+        # Fix vertices that form a band around the scroll close to the middle of the z height of the scroll
+        bnd_mask_top_third = np.abs(uv[:, 1] - 0.75) < 0.01
+        bnd_mask_middle = np.abs(uv[:, 1] - 0.5) < 0.01
+        bnd_mask_bottom_third = np.abs(uv[:, 1] - 0.25) < 0.01
+        bnd_mask = bnd_mask_top_third | bnd_mask_middle | bnd_mask_bottom_third
+        bnd = np.where(bnd_mask)[0]
+        print(f"Size of boundary: {len(bnd)}")
+
+        bnd = np.array(bnd, dtype=np.int32)
+        bnd_uv = np.zeros((bnd.shape[0], 2), dtype=np.float64)
+        for i in range(bnd.shape[0]):
+            bnd_uv[i] = uv[bnd[i]]
+
         # if self.downsample:
         #     uv = self.arap_solver_ic(uv)
         if self.downsample:
             while True:
-                uv_ = self.arap_solver_ic(uv)
-                uv_size = np.max(uv_, axis=0) - np.min(uv_, axis=0)
-                assert uv_size.shape[0] == 2, f"uv_size shape is {uv_size.shape}"
-                if np.all(uv_size > 1):
-                    uv = uv_ # found a 'valid' solution
-                    break
-                else:
-                    print("Invalid solution, trying again...")
+                try:
+                    uv_ = self.arap_solver_ic(uv, self.vertices, self.triangles)
+                    uv_size = np.max(uv_, axis=0) - np.min(uv_, axis=0)
+                    assert uv_size.shape[0] == 2, f"uv_size shape is {uv_size.shape}"
+                    if np.all(uv_size > 1):
+                        uv = uv_ # found a 'valid' solution
+                        break
+                    else:
+                        print("Invalid solution, trying again...")
+                except Exception as e:
+                    print(f"Error: {e}")
 
         return np.zeros((0, 1), dtype=np.int32), np.zeros((0,2), dtype=np.float64), uv
+    
+    def add_boundary_colors(self, bnd):
+        """
+        Adds color to the mesh where boundary vertices define red triangles.
+        """
+        vertices = np.asarray(self.mesh.vertices)
+        triangles = np.asarray(self.mesh.triangles)
+        
+        # Convert bnd to a set for fast lookup
+        boundary_vertices = set(bnd)
+        
+        # Assign colors (default white, boundary triangles red)
+        colors = np.ones((len(vertices), 3))  # White by default
+        red_color = np.array([1.0, 0.0, 0.0])
+        
+        for tri in triangles:
+            if any(v in boundary_vertices for v in tri):
+                colors[tri] = red_color  # Set triangle vertices to red
+        
+        # Set colors to the mesh
+        self.mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
     
     def orient_uvs(self, vertices):
         # Assert that no NaNs or Infs are present
@@ -405,14 +448,17 @@ class Flatboi:
             iterations = self.max_iter
         energies = np.zeros(iterations+1, dtype=np.float64)
         energies[0] = slim.energy()
+        print(f"Initial Energy: {energies[0]:.5f}")
 
-        threshold = 1e-5
+        threshold = 1e-5 / (len(old_uvs) / 50000)
         converged = False
         iteration = 0
         while iteration < iterations:
             print(iteration)
             temp_energy = slim.energy()
+            print("starting solve")
             slim.solve(1)
+            print("solve 1 step")
             new_energy = slim.energy()
             energies[iteration+1] = new_energy
             iteration += 1
@@ -448,7 +494,6 @@ class Flatboi:
             print("Not Converged")
             slim_uvs = old_uvs
 
-        slim_uvs = self.orient_uvs(slim_uvs)
         slim_uvs = slim_uvs.astype(np.float64)
 
         return slim_uvs, energies
@@ -482,7 +527,9 @@ class Flatboi:
         bnd = bnd.astype(np.int64)
         bnd_uv = bnd_uv.astype(np.float64)
 
+        self.add_boundary_colors(bnd)
         slim_uvs = self.orient_uvs(uv) # Enables the UVs to be oriented correctly for the slim optimization
+        self.save_img(slim_uvs*self.stretch_factor)
 
         energies = []
         slim_energy_types = []
@@ -520,7 +567,9 @@ class Flatboi:
             energy_type = slim_energy_types[i]
             iterations = slim_iterations[i]
             print(f"{energy_types_names[energy_type]} Energy, Iterations: {iterations if iterations is not None else self.max_iter}")
-            slim = igl.SLIM(self.vertices, self.triangles, v_init=slim_uvs, b=bnd, bc=bnd_uv, energy_type=energy_type, soft_penalty=0)
+            print(f"Shapes of vertices: {self.vertices.shape}, triangles: {self.triangles.shape}, bnd: {bnd.shape}, bnd_uv: {bnd_uv.shape}, slim_uvs: {slim_uvs.shape}")
+            print(f"Types of vertices: {self.vertices.dtype}, triangles: {self.triangles.dtype}, bnd: {bnd.dtype}, bnd_uv: {bnd_uv.dtype}, slim_uvs: {slim_uvs.dtype}")
+            slim = igl.SLIM(self.vertices, self.triangles, slim_uvs, bnd, bnd_uv, energy_type=energy_type, soft_penalty=0.0)
             slim_uvs, energies_ = self.slim_optimization(slim, slim_uvs, iterations=iterations)
             energies.extend(list(energies_))
             l2, linf, area_error = print_errors(slim_uvs)
@@ -533,6 +582,7 @@ class Flatboi:
         slim_uvs = best_slim_uvs
         print_errors(slim_uvs)
         # rescale slim uvs
+        slim_uvs = self.orient_uvs(slim_uvs)
         slim_uvs = slim_uvs * self.stretch_factor
 
         return slim_uvs, np.array(energies)
@@ -555,15 +605,22 @@ class Flatboi:
         image_size = (int(round(max_y)) + 1, int(round(max_x)) + 1)
         print(f"Image size: {image_size}")
 
-        mask = np.zeros((image_size[0], image_size[1]), dtype=np.uint8)
+        # mask = np.zeros((image_size[0], image_size[1]), dtype=np.uint8)
+        mask = np.zeros((image_size[0], image_size[1], 3), dtype=np.uint8)  # RGB image
+        colors = np.asarray(self.mesh.vertex_colors) * 255  # Scale to [0, 255]
+        colors = [colors[triangle].mean(axis=0).astype(np.uint8)[::-1] for triangle in self.triangles]
         triangles = [[shifted_coords[t_i] for t_i in t] for t in self.triangles]
-        for triangle in triangles:
+        for i, triangle in enumerate(tqdm(triangles, desc="Drawing Triangles")):
             triangle = np.array(triangle).astype(np.int32)
+            color = [int(colors[i][j]) for j in range(len(colors[i]))]
             try:
-                cv2.fillPoly(mask, [triangle], 255)
-            except:
+                cv2.fillPoly(mask, [triangle], color)
+            except Exception as e:
+                print(e)
                 pass
         mask = mask[::-1, :]
+        # make directory if it does not exist
+        os.makedirs(output_directory, exist_ok=True)
         cv2.imwrite(image_path, mask)
 
     def save_mtl(self):
