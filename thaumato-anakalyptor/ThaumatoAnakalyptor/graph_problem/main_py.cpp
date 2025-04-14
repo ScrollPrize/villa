@@ -790,7 +790,13 @@ class Solver {
             }
         }
         void load_graph(std::string graph_path) {
-            graph = loadGraph(graph_path);
+            try {
+                graph = loadGraph(graph_path, 1);
+            }
+            catch (...) {
+                std::cerr << "Error loading graph, trying old version " << e.what() << std::endl;
+                graph = loadGraph(graph_path, 0);
+            }
         }
         void save_graph(std::string graph_path) {
             saveGraph(graph, graph_path);

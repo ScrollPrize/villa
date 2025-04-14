@@ -105,7 +105,7 @@ bool operator==(const std::vector<Node>& graph1, const std::vector<Node>& graph2
 
 // Function declarations for saving and loading the graph
 void saveGraph(const std::vector<Node>& nodes, const std::string& filename);
-std::vector<Node> loadGraph(const std::string& filename);
+std::vector<Node> loadGraph(const std::string& filename, int version = 0);
 
 std::pair<std::vector<Node>, float> load_graph_from_binary(const std::string &file_name, bool clip_z, float z_min, float z_max, float same_winding_factor, bool fix_same_block_edges);
 
