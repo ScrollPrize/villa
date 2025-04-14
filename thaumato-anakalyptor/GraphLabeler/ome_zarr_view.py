@@ -337,7 +337,11 @@ class OmeZarrViewWindow(QMainWindow):
         self.graph_pkl_path = graph_pkl_path
         self.h5_path = h5_path
         self.umbilicus_path = umbilicus_path
-        self.umbilicus_data = load_xyz_from_file(self.umbilicus_path) - 500
+        if os.path.exists(self.umbilicus_path):
+            self.umbilicus_data = load_xyz_from_file(self.umbilicus_path) - 500
+        else:
+            self.umbilicus_data = np.array([[y_dim / 2, 0, x_dim / 2]])
+            print(f"Umbilicus path {self.umbilicus_path} not found; using estimated umbilicus data.")
         self.winding, overlay_point_nodes_indices = None, None
         self.f_init = np.array(self.solver.get_positions())[:, 1]
         self.undeleted_nodes_indices = np.array(self.solver.get_undeleted_indices())
