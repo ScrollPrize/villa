@@ -184,7 +184,12 @@ class OmeZarrXZLoaderWorker(QThread):
             z_dim, y_dim, x_dim = dset.shape  # shape: (Z, Y, X)
 
             # Load umbilicus data and subtract 500.
-            umbilicus_data = load_xyz_from_file(self.umbilicus_path) - 500
+            if self.umbilicus_path is not None and os.path.exists(self.umbilicus_path):
+                print(f"Loading umbilicus data from {self.umbilicus_path}")
+                umbilicus_data = load_xyz_from_file(self.umbilicus_path) - 500
+            else:
+                umbilicus_data = np.array([[y_dim / 2, 0, x_dim / 2]])
+                print(f"Umbilicus path {self.umbilicus_path} not found; using estimated umbilicus data.")
             centers = []
             for z_val in range(z_dim):
                 pos = umbilicus_xy_at_z(umbilicus_data, z_val)
@@ -218,11 +223,11 @@ class PersistentScrollGraphWorker(QObject):
     overlay_labels_computed = pyqtSignal(object)
     overlay_labels_computed_xz = pyqtSignal(object)
 
-    def __init__(self, graph_pkl_path, umbilicus_path, unlabeled, parent=None):
+    def __init__(self, graph_pkl_path, umbilicus_data, unlabeled, parent=None):
         super().__init__(parent)
         # Load the scroll graph (from pickle) once.
         self.scroll_graph = load_graph_pkl(graph_pkl_path)
-        self.umbilicus_data = load_xyz_from_file(umbilicus_path) - 500
+        self.umbilicus_data = umbilicus_data
         self.UNLABELED = unlabeled
         self.overlay_point_nodes_indices = None
         self.overlay_point_nodes_indices_xz = None        
@@ -337,7 +342,8 @@ class OmeZarrViewWindow(QMainWindow):
         self.graph_pkl_path = graph_pkl_path
         self.h5_path = h5_path
         self.umbilicus_path = umbilicus_path
-        if self.umbilicus_path and os.path.exists(self.umbilicus_path):
+        if self.umbilicus_path is not None and os.path.exists(self.umbilicus_path):
+            print(f"Loading umbilicus data from {self.umbilicus_path}")
             self.umbilicus_data = load_xyz_from_file(self.umbilicus_path) - 500
         else:
             self.umbilicus_data = np.array([[y_dim / 2, 0, x_dim / 2]])
@@ -403,7 +409,7 @@ class OmeZarrViewWindow(QMainWindow):
 
         # Setup persistent overlay worker.
         self.overlay_thread = QThread()
-        self.persistent_overlay_worker = PersistentScrollGraphWorker(self.graph_pkl_path, self.umbilicus_path, self.UNLABELED)
+        self.persistent_overlay_worker = PersistentScrollGraphWorker(self.graph_pkl_path, self.umbilicus_data, self.UNLABELED)
         self.persistent_overlay_worker.moveToThread(self.overlay_thread)
         self.overlay_thread.start()
         self.persistent_overlay_worker.overlay_points_computed.connect(self.on_overlay_points_computed)
