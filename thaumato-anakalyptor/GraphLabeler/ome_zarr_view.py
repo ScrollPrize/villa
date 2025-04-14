@@ -337,7 +337,7 @@ class OmeZarrViewWindow(QMainWindow):
         self.graph_pkl_path = graph_pkl_path
         self.h5_path = h5_path
         self.umbilicus_path = umbilicus_path
-        if os.path.exists(self.umbilicus_path):
+        if self.umbilicus_path and os.path.exists(self.umbilicus_path):
             self.umbilicus_data = load_xyz_from_file(self.umbilicus_path) - 500
         else:
             self.umbilicus_data = np.array([[y_dim / 2, 0, x_dim / 2]])
