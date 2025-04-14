@@ -175,6 +175,14 @@ class PointCloudLabeler(QMainWindow):
         xy_controls.addWidget(self.z_center_widget)
         xy_controls.addWidget(self.z_thickness_widget)
         left_column.addLayout(xy_controls)
+        xy_selections = QHBoxLayout()
+        self.z_selection_widget, self.z_selection_slider, self.z_selection_spinbox = create_sync_slider_spinbox(
+            "Z selection center:", self.z_min, self.z_max, (self.z_min + self.z_max) / 2, self.scaleFactor, self.update_views)
+        self.z_selection_thickness_widget, self.z_selection_thickness_slider, self.z_selection_thickness_spinbox = create_sync_slider_spinbox(
+            "Z selection thickness:", 0.0, self.z_max - self.z_min, 0.0, self.scaleFactor, self.update_views)
+        xy_selections.addWidget(self.z_selection_widget)
+        xy_selections.addWidget(self.z_selection_thickness_widget)
+        left_column.addLayout(xy_selections)
         self.line_fstar_min = pg.InfiniteLine(pos=self.f_star_min, angle=90, 
                                         pen=pg.mkPen('blue', width=1, style=Qt.DashLine))
         self.line_fstar_max = pg.InfiniteLine(pos=self.f_star_max, angle=90, 
@@ -227,6 +235,15 @@ class PointCloudLabeler(QMainWindow):
         xz_controls.addWidget(self.finit_center_widget)
         xz_controls.addWidget(self.finit_thickness_widget)
         right_column.addLayout(xz_controls)
+        xz_selections = QHBoxLayout()
+        self.finit_selection_widget, self.finit_selection_slider, self.finit_selection_spinbox = create_sync_slider_spinbox(
+            "f selection center:", -180.0, 180.0,
+            0.0, self.scaleFactor, self.update_views)
+        self.f_selection_thickness_widget, self.f_selection_thickness_slider, self.f_selection_thickness_spinbox = create_sync_slider_spinbox(
+            "f selection thickness:", 0.0, 2 * 360.0, 0.0, self.scaleFactor, self.update_views)
+        xz_selections.addWidget(self.finit_selection_widget)
+        xz_selections.addWidget(self.f_selection_thickness_widget)
+        right_column.addLayout(xz_selections)
         # XZ shear control (unchanged functionality)
         xz_shear_layout = QHBoxLayout()
         self.xz_shear_widget, self.xz_shear_slider, self.xz_shear_spinbox = create_sync_slider_spinbox(
@@ -500,6 +517,11 @@ class PointCloudLabeler(QMainWindow):
         self.offset_group_button = QPushButton("Apply Group Offset")
         self.offset_group_button.clicked.connect(self.offset_group)
         group_save_layout.addWidget(self.offset_group_button)
+        self.merge_group_spinbox = QSpinBox()
+        self.merge_group_spinbox.setRange(-1000, 1000)
+        self.merge_group_spinbox.setValue(0)
+        group_save_layout.addWidget(QLabel("Merge Group Index:"))
+        group_save_layout.addWidget(self.merge_group_spinbox)
         self.merge_group_button = QPushButton("Merge Group")
         self.merge_group_button.clicked.connect(self.merge_group)
         group_save_layout.addWidget(self.merge_group_button)
@@ -931,8 +953,11 @@ class PointCloudLabeler(QMainWindow):
         return np.asarray(self.kdtree_xy.query_ball_point([x, effective_y], r=r), dtype=np.int32)
     
     def update_guides(self):
-        # For the XY view:
+        # ---------------------------
+        # For the XY view (Main guides):
+        # ---------------------------
         if self.show_guides_checkbox.isChecked():
+            # Add existing finit guidelines.
             if self.line_finit_neg.scene() is None:
                 self.xy_plot.addItem(self.line_finit_neg)
             if self.line_finit_pos.scene() is None:
@@ -950,21 +975,58 @@ class PointCloudLabeler(QMainWindow):
                 self.xy_plot.addItem(self.line_finit_upper)
             if self.line_finit_lower.scene() is None:
                 self.xy_plot.addItem(self.line_finit_lower)
-            # Add the orange indicator only if not added already.
+            # Orange indicator (for XZ shear) shown in XY view.
             self.xz_shear_indicator.setAngle(self.xz_shear_spinbox.value())
             center_f_star = (self.f_star_min + self.f_star_max) / 2
             center_f_init = (self.f_init_min + self.f_init_max) / 2
             self.xz_shear_indicator.setPos(QPointF(center_f_star, center_f_init))
             if self.xz_shear_indicator.scene() is None:
                 self.xy_plot.addItem(self.xz_shear_indicator)
+
+            # ---------------------------
+            # Additional f-selection guides for XY view:
+            # (These are vertical purple lines marking the selection center and the boundaries.)
+            f_sel_thickness = self.f_selection_thickness_slider.value() / self.scaleFactor
+            if f_sel_thickness:
+                # The f selection center is taken from the finit_selection_spinbox.
+                f_sel_center = self.finit_selection_spinbox.value()
+                left_sel = f_sel_center - f_sel_thickness / 2
+                right_sel = f_sel_center + f_sel_thickness / 2
+                if not hasattr(self, 'f_selection_left_line'):
+                    self.f_selection_left_line = pg.InfiniteLine(angle=0, pen=pg.mkPen('purple', width=1, style=Qt.DashLine))
+                if not hasattr(self, 'f_selection_right_line'):
+                    self.f_selection_right_line = pg.InfiniteLine(angle=0, pen=pg.mkPen('purple', width=1, style=Qt.DashLine))
+                if not hasattr(self, 'f_selection_center_line'):
+                    self.f_selection_center_line = pg.InfiniteLine(angle=0, pen=pg.mkPen('purple', width=1, style=Qt.DashLine))
+                self.f_selection_left_line.setPos(left_sel)
+                self.f_selection_right_line.setPos(right_sel)
+                self.f_selection_center_line.setPos(f_sel_center)
+                if self.f_selection_left_line.scene() is None:
+                    self.xy_plot.addItem(self.f_selection_left_line)
+                if self.f_selection_right_line.scene() is None:
+                    self.xy_plot.addItem(self.f_selection_right_line)
+                if self.f_selection_center_line.scene() is None:
+                    self.xy_plot.addItem(self.f_selection_center_line)
+            else:
+                # Remove f selection guides if thickness is zero.
+                for attr in ['f_selection_left_line', 'f_selection_right_line', 'f_selection_center_line']:
+                    if hasattr(self, attr):
+                        line_item = getattr(self, attr)
+                        if line_item.scene() is not None:
+                            self.xy_plot.removeItem(line_item)
         else:
-            # Remove guide items if guides are turned off.
+            # Remove all XY guide items when guides are turned off.
             for item in [self.line_finit_neg, self.line_finit_pos, self.line_finit_center,
-                        self.line_finit_upper, self.line_finit_lower, self.xz_shear_indicator]:
-                if item.scene() is not None:
+                        self.line_finit_upper, self.line_finit_lower, self.xz_shear_indicator,
+                        getattr(self, 'f_selection_left_line', None),
+                        getattr(self, 'f_selection_right_line', None),
+                        getattr(self, 'f_selection_center_line', None)]:
+                if item is not None and item.scene() is not None:
                     self.xy_plot.removeItem(item)
 
-        # For the min max XY fff* guides:
+        # ---------------------------
+        # f* Range Guides for XY view:
+        # ---------------------------
         if self.use_fstar_range_checkbox.isChecked():
             if self.line_fstar_min.scene() is None:
                 self.xy_plot.addItem(self.line_fstar_min)
@@ -974,8 +1036,10 @@ class PointCloudLabeler(QMainWindow):
             for item in [self.line_fstar_min, self.line_fstar_max]:
                 if item.scene() is not None:
                     self.xy_plot.removeItem(item)
-        
-        # For the XZ view:
+
+        # ---------------------------
+        # For the XZ view (Main guides):
+        # ---------------------------
         if self.show_guides_checkbox.isChecked():
             z_center = self.z_center_spinbox.value()
             z_thickness = self.z_thickness_slider.value() / self.scaleFactor
@@ -991,9 +1055,43 @@ class PointCloudLabeler(QMainWindow):
             self.xy_horizontal_indicator.setPos(QPointF(center_f_star, center_z))
             if self.xy_horizontal_indicator.scene() is None:
                 self.xz_plot.addItem(self.xy_horizontal_indicator)
+
+            # ---------------------------
+            # Additional z-selection guides for XZ view:
+            # (These are horizontal purple lines marking the selection center and the boundaries.)
+            z_sel_thickness = self.z_selection_thickness_slider.value() / self.scaleFactor
+            if z_sel_thickness:
+                z_sel_center = self.z_selection_spinbox.value()
+                top_sel = z_sel_center + z_sel_thickness / 2
+                bottom_sel = z_sel_center - z_sel_thickness / 2
+                if not hasattr(self, 'z_selection_top_line'):
+                    self.z_selection_top_line = pg.InfiniteLine(angle=0, pen=pg.mkPen('purple', width=1, style=Qt.DashLine))
+                if not hasattr(self, 'z_selection_bottom_line'):
+                    self.z_selection_bottom_line = pg.InfiniteLine(angle=0, pen=pg.mkPen('purple', width=1, style=Qt.DashLine))
+                if not hasattr(self, 'z_selection_center_line'):
+                    self.z_selection_center_line = pg.InfiniteLine(angle=0, pen=pg.mkPen('purple', width=1, style=Qt.DashLine))
+                self.z_selection_top_line.setPos(top_sel)
+                self.z_selection_bottom_line.setPos(bottom_sel)
+                self.z_selection_center_line.setPos(z_sel_center)
+                if self.z_selection_top_line.scene() is None:
+                    self.xz_plot.addItem(self.z_selection_top_line)
+                if self.z_selection_bottom_line.scene() is None:
+                    self.xz_plot.addItem(self.z_selection_bottom_line)
+                if self.z_selection_center_line.scene() is None:
+                    self.xz_plot.addItem(self.z_selection_center_line)
+            else:
+                for attr in ['z_selection_top_line', 'z_selection_bottom_line', 'z_selection_center_line']:
+                    if hasattr(self, attr):
+                        line_item = getattr(self, attr)
+                        if line_item.scene() is not None:
+                            self.xz_plot.removeItem(line_item)
         else:
-            for item in [self.line_z_center, self.line_z_upper, self.line_z_lower, self.xy_horizontal_indicator]:
-                if item.scene() is not None:
+            for item in [self.line_z_center, self.line_z_upper, self.line_z_lower,
+                        self.xy_horizontal_indicator,
+                        getattr(self, 'z_selection_top_line', None),
+                        getattr(self, 'z_selection_bottom_line', None),
+                        getattr(self, 'z_selection_center_line', None)]:
+                if item is not None and item.scene() is not None:
                     self.xz_plot.removeItem(item)
 
     def update_teflon(self, val):
@@ -1065,11 +1163,15 @@ class PointCloudLabeler(QMainWindow):
         if self.active_group == 0:
             return
         
+        merge_group = int(self.merge_group_spinbox.value())
+        if merge_group == self.active_group:
+            return
+        
         # Open Ask Dialog
         msg = QMessageBox()
         msg.setIcon(QMessageBox.Question)
         msg.setText("Merge Group")
-        msg.setInformativeText(f"Merge the active group ({self.active_group}) with the GT (0) group?")
+        msg.setInformativeText(f"Merge the active group ({self.active_group}) with the {merge_group} group?")
         msg.setWindowTitle("Merge Group")
         msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
         msg.setDefaultButton(QMessageBox.Yes)
@@ -1077,16 +1179,21 @@ class PointCloudLabeler(QMainWindow):
         if ret == QMessageBox.No:
             print("Merge Group cancelled.")
             return
-        print(f"Merging group {self.active_group} with GT group.")
+        print(f"Merging group {self.active_group} with {merge_group} group.")
         
         # Track undo/redo
         self.undo_stack.append((self.labels.copy(), self.group.copy()))
         self.redo_stack = []
         
-        self.group[self.group == self.active_group] = 0
+        self.group[self.group == self.active_group] = merge_group
         mask_higher_groups = self.group > self.active_group
         self.group[mask_higher_groups] -= 1
-        self.active_group = 0
+        if merge_group > self.active_group:
+            self.active_group = merge_group - 1
+        else:
+            self.active_group = merge_group
+        self.merge_group_spinbox.setValue(0)
+        self.group_spinbox.setValue(self.active_group)
 
         self.update_views()
     
@@ -1997,13 +2104,13 @@ class PointCloudLabeler(QMainWindow):
 
     def _split_range(self, make_group):
         # delete points within the specified range
-        z_center = self.z_center_spinbox.value()
-        z_thickness = self.z_thickness_slider.value() / self.scaleFactor
+        z_center = self.z_selection_spinbox.value()
+        z_thickness = self.z_selection_thickness_slider.value() / self.scaleFactor
         z_min_val = z_center - z_thickness / 2
         z_max_val = z_center + z_thickness / 2
         mask = (self.points[:, 2] >= z_min_val) & (self.points[:, 2] <= z_max_val)
-        f_init_center = self.finit_center_spinbox.value()
-        f_init_thickness = self.finit_thickness_slider.value() / self.scaleFactor
+        f_init_center = self.finit_selection_spinbox.value()
+        f_init_thickness = self.f_selection_thickness_slider.value() / self.scaleFactor
         f_init_min_val = f_init_center - f_init_thickness / 2
         f_init_max_val = f_init_center + f_init_thickness / 2
         mask = np.logical_and(mask, np.logical_and(self.points[:, 1] >= f_init_min_val, self.points[:, 1] <= f_init_max_val))
@@ -2025,6 +2132,7 @@ class PointCloudLabeler(QMainWindow):
             # Activate the new group
             self.group_spinbox.setValue(new_group)
 
+        self.recompute = True
         self.update_views()
     
     def pick_label_at(self, ev, plot_widget):
