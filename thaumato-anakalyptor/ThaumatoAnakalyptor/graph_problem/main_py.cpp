@@ -794,7 +794,7 @@ class Solver {
                 graph = loadGraph(graph_path, 1);
             }
             catch (...) {
-                std::cerr << "Error loading graph, trying old version " << e.what() << std::endl;
+                std::cerr << "Error loading graph, trying to load old graph version." << std::endl;
                 graph = loadGraph(graph_path, 0);
             }
         }
