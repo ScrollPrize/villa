@@ -46,6 +46,7 @@ void saveGraph(const std::vector<Node>& nodes, const std::string& filename) {
         outFile.write(reinterpret_cast<const char*>(&node.total_wnr_side), sizeof(node.total_wnr_side));
         outFile.write(reinterpret_cast<const char*>(&node.winding_nr), sizeof(node.winding_nr));
         outFile.write(reinterpret_cast<const char*>(&node.winding_nr_old), sizeof(node.winding_nr_old));
+        outFile.write(reinterpret_cast<const char*>(Node::sides_nr), sizeof(Node::sides_nr));
         for (int j = 0; j < Node::sides_nr; ++j) {
             outFile.write(reinterpret_cast<const char*>(&node.sides[j]), sizeof(node.sides[j]));
             outFile.write(reinterpret_cast<const char*>(&node.sides_old[j]), sizeof(node.sides_old[j]));
@@ -71,7 +72,7 @@ void saveGraph(const std::vector<Node>& nodes, const std::string& filename) {
 }
 
 // Function to load the graph from a binary file
-std::vector<Node> loadGraph(const std::string& filename) {
+std::vector<Node> loadGraph(const std::string& filename, int version) {
     std::ifstream inFile(filename, std::ios::binary);
     if (!inFile) {
         throw std::runtime_error("Could not open file for reading");
@@ -101,9 +102,15 @@ std::vector<Node> loadGraph(const std::string& filename) {
         inFile.read(reinterpret_cast<char*>(&node.total_wnr_side), sizeof(node.total_wnr_side));
         inFile.read(reinterpret_cast<char*>(&node.winding_nr), sizeof(node.winding_nr));
         inFile.read(reinterpret_cast<char*>(&node.winding_nr_old), sizeof(node.winding_nr_old));
-        for (int j = 0; j < Node::sides_nr; ++j) {
-            inFile.read(reinterpret_cast<char*>(&node.sides[j]), sizeof(node.sides[j]));
-            inFile.read(reinterpret_cast<char*>(&node.sides_old[j]), sizeof(node.sides_old[j]));
+        int sides_nr = 18;
+        if (version > 0) {
+            inFile.read(reinterpret_cast<char*>(&sides_nr), sizeof(sides_nr));
+        }
+        for (int j = 0; j < sides_nr; ++j) {
+            if (j < Node::sides_nr) {
+                inFile.read(reinterpret_cast<char*>(&node.sides[j]), sizeof(node.sides[j]));
+                inFile.read(reinterpret_cast<char*>(&node.sides_old[j]), sizeof(node.sides_old[j]));
+            }
         }
 
         inFile.read(reinterpret_cast<char*>(&node.num_same_block_edges), sizeof(node.num_same_block_edges));
