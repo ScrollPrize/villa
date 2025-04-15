@@ -480,6 +480,16 @@ class Solver {
             // calculate_histogram_edges(graph, "histogram_edges_start.png");
             largest_connected_component();
         }
+        ~Solver() {
+            if (h_all_edges) {
+                delete[] h_all_edges;
+                h_all_edges = nullptr;
+            }
+            if (h_all_sides) {
+                delete[] h_all_sides;
+                h_all_sides = nullptr;
+            }
+        }
         void invert_graph() {
             invert_winding_direction_graph(graph);
         }
@@ -752,8 +762,13 @@ class Solver {
         void solve_winding_number(int num_iterations, int i_round = 1, int seed_node = 100, float other_block_factor = 1.0f, int side_fix_nr = 0, bool display = true) {
             // use the winding number solver for the final solution
             // store only the valid indices to speed up the loop
-            std::vector<size_t> valid_indices = get_valid_indices(graph);
-            graph = run_solver_winding_number(graph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, other_block_factor, seed_node, side_fix_nr, display);
+            auto [undeleted_mask, count_undeleted] = get_undeleted_mask();
+            std::vector<Node> subgraph = graph;
+            bool create_subgraph = 1.0f * count_undeleted / graph.size() < 0.5f;
+            subgraph = createSubgraph(graph, undeleted_mask);
+            std::vector<size_t> valid_indices = get_valid_indices(subgraph);
+            run_solver_winding_number(subgraph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, other_block_factor, seed_node, side_fix_nr, display);
+            updateGraphWithSubgraph(graph, undeleted_mask, subgraph);
         }
         void solve_random(int num_iterations, int i_round = 1, bool display = true) {
             // use the random solver for the final solution

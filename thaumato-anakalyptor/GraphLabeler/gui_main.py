@@ -63,6 +63,7 @@ class PointCloudLabeler(QMainWindow):
             point_data = np.zeros((0, 3), dtype=np.float32)
         self.seed_node = None # master node, this is the fixed node, to which all other nodes are fixed in f_star to
         self.recompute = True
+        self.stop_slab_computation = False  # Initialize the stop flag.
 
         # Global variables and state.
         self.scaleFactor = 100
@@ -462,6 +463,10 @@ class PointCloudLabeler(QMainWindow):
         self.slab_compute_button = QPushButton("Compute Slabs")
         self.slab_compute_button.clicked.connect(self.run_slab_computation)
         cellar_controls_layout.addWidget(self.slab_compute_button)
+
+        self.stop_slab_button = QPushButton("Stop Slab Computation")
+        self.stop_slab_button.clicked.connect(self.set_stop_slab_flag)
+        cellar_controls_layout.addWidget(self.stop_slab_button)
 
         self.skip_initial_checkbox = QCheckBox("Skip Initial")
         self.skip_initial_checkbox.setChecked(False)
@@ -2459,6 +2464,8 @@ class PointCloudLabeler(QMainWindow):
                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.No:
             return
+        # Reset the stop flag at the beginning of a new computation
+        self.stop_slab_computation = False
         start_time = time.time()
         initial_z_center = self.z_center_spinbox.value()
         initial_thickness = self.z_thickness_spinbox.value() / self.scaleFactor
@@ -2466,45 +2473,51 @@ class PointCloudLabeler(QMainWindow):
         step = desired_thickness / 2
 
         def compute_current_slab(update_splines=False, extra_z_range=None, seed_node=None):
-            # Set the line thickness assignment to 3.
-            # self.line_distance_threshold_spinbox.setValue(3)
-            # Ensure z-range is enabled.
-            original_z_range = self.use_z_range_checkbox.isChecked()
-            self.use_z_range_checkbox.setChecked(True)
-            original_disregard_label0 = self.disregard_label0_checkbox.isChecked()
-            self.disregard_label0_checkbox.setChecked(False)
-            for _ in range(2):
-                if seed_node is not None:
-                    self.solver.set_f_star(seed_node)
-                # --- Run F*5 update via update_labels ---
-                if hasattr(self, "solver_combo"):
-                    prev_solver = self.solver_combo.currentText()
-                    self.solver_combo.setCurrentText("F*Slab")
-                self.update_labels(extra_z_range=extra_z_range)
-                # Use same seed node for a continuous graph 
+            # Check if the computation should be stopped
+            if not self.stop_slab_computation:
+                # Set the line thickness assignment to 3.
+                # self.line_distance_threshold_spinbox.setValue(3)
+                # Ensure z-range is enabled.
+                original_z_range = self.use_z_range_checkbox.isChecked()
+                self.use_z_range_checkbox.setChecked(True)
+                original_disregard_label0 = self.disregard_label0_checkbox.isChecked()
+                self.disregard_label0_checkbox.setChecked(False)
+                for _ in range(2):
+                    if seed_node is not None:
+                        self.solver.set_f_star(seed_node)
+                    # --- Run F*5 update via update_labels ---
+                    if hasattr(self, "solver_combo"):
+                        prev_solver = self.solver_combo.currentText()
+                        self.solver_combo.setCurrentText("F*Slab")
+                    self.update_labels(extra_z_range=extra_z_range)
+                    # Use same seed node for a continuous graph 
 
-                # # --- Run F*2 update via update_labels ---
-                # if hasattr(self, "solver_combo"):
-                #     prev_solver = self.solver_combo.currentText()
-                #     self.solver_combo.setCurrentText("F*2")
-                # self.update_labels()
-                # # --- Run winding number update via update_labels ---
-                # if hasattr(self, "solver_combo"):
-                #     self.solver_combo.setCurrentText("Winding Number")
-                # self.update_labels()
-                # Restore the previous solver mode.
-                if hasattr(self, "solver_combo"):
-                    self.solver_combo.setCurrentText(prev_solver)
-                if update_splines:
-                    # Clear splines and calculated labels.
-                    self.clear_splines()
-                    self.clear_calculated_labels()
-                    # Update winding splines.
-                    self.update_winding_splines()
-                    self.update_views()
-                # Assign line labels.
-                self.assign_line_labels()
-                # self.assign_line_labels_all()
+                    # Check if the computation should be stopped
+                    if self.stop_slab_computation:
+                        break
+
+                    # # --- Run F*2 update via update_labels ---
+                    # if hasattr(self, "solver_combo"):
+                    #     prev_solver = self.solver_combo.currentText()
+                    #     self.solver_combo.setCurrentText("F*2")
+                    # self.update_labels()
+                    # # --- Run winding number update via update_labels ---
+                    # if hasattr(self, "solver_combo"):
+                    #     self.solver_combo.setCurrentText("Winding Number")
+                    # self.update_labels()
+                    # Restore the previous solver mode.
+                    if hasattr(self, "solver_combo"):
+                        self.solver_combo.setCurrentText(prev_solver)
+                    if update_splines:
+                        # Clear splines and calculated labels.
+                        self.clear_splines()
+                        self.clear_calculated_labels()
+                        # Update winding splines.
+                        self.update_winding_splines()
+                        self.update_views()
+                    # Assign line labels.
+                    self.assign_line_labels()
+                    # self.assign_line_labels_all()
             # Restore the original z-range checkbox state.
             self.use_z_range_checkbox.setChecked(original_z_range)
             self.disregard_label0_checkbox.setChecked(original_disregard_label0)
@@ -2562,6 +2575,9 @@ class PointCloudLabeler(QMainWindow):
         z_max = min(self.z_max, float(self.slabs_max_spinbox.value()))
         z_min = max(self.z_min, float(self.slabs_min_spinbox.value()))
         while current_z_center + desired_thickness / 2 < z_max:
+            if self.stop_slab_computation:
+                print("Slab computation stopped during upward iteration.")
+                break
             extra_z_range = (current_z_center - desired_thickness / 2, current_z_center + desired_thickness / 2)
             current_z_center += step
             self.z_center_spinbox.setValue(current_z_center)
@@ -2572,9 +2588,16 @@ class PointCloudLabeler(QMainWindow):
             slab_filename = os.path.join(base_path, "slabs", f"slab_up_{int(current_z_center)}.txt")
             self._save_labels_to_path(slab_filename)
 
+        if self.stop_slab_computation:
+            QMessageBox.information(self, "Slab Computation", "Slab computation was stopped by the user.")
+            return
+
         # Iterate downward from the original z_center.
         current_z_center = initial_z_center - done_steps * step
         while current_z_center - desired_thickness / 2 > z_min:
+            if self.stop_slab_computation:
+                print("Slab computation stopped during downward iteration.")
+                break
             extra_z_range = (current_z_center - desired_thickness / 2, current_z_center + desired_thickness / 2)
             current_z_center -= step
             self.z_center_spinbox.setValue(current_z_center)
@@ -2585,9 +2608,17 @@ class PointCloudLabeler(QMainWindow):
             slab_filename = os.path.join(base_path, "slabs", f"slab_down_{int(current_z_center)}.txt")
             self._save_labels_to_path(slab_filename)
 
+        if self.stop_slab_computation:
+            QMessageBox.information(self, "Slab Computation", "Slab computation was stopped by the user.")
+            return
+
         total_time = time.time() - start_time
         QMessageBox.information(self, "Slab Computation",
                                 f"Slab computation completed in {total_time:.2f} seconds.")
+        
+    def set_stop_slab_flag(self):
+        self.stop_slab_computation = True
+        print("Stop slab computation flag set.")
         
     def set_labels(self):
         if self.solver is not None:

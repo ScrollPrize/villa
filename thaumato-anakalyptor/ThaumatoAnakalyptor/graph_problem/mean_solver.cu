@@ -568,6 +568,11 @@ std::vector<Node> run_solver_f_star_with_labels(std::vector<Node>& graph, int nu
     float* d_all_sides = nullptr;
     copy_graph_to_gpu(graph.data(), d_graph, num_nodes, &d_all_edges, &d_all_sides);
 
+    float* d_global_sum_compressed;
+    float* d_global_sum_decompressed;
+    cudaMalloc(&d_global_sum_compressed, sizeof(float));
+    cudaMalloc(&d_global_sum_decompressed, sizeof(float));
+
     std::cout << "Copied data to GPU" << std::endl;
     
     std::cout << "Solving on GPU... learning rate: " << lr << " error cutoff: " << error_cutoff << std::endl;
@@ -577,10 +582,6 @@ std::vector<Node> run_solver_f_star_with_labels(std::vector<Node>& graph, int nu
 
     // Run the iterations
     for (int iter = 1; iter < num_iterations; iter++) {        
-        float* d_global_sum_compressed;
-        float* d_global_sum_decompressed;
-        cudaMalloc(&d_global_sum_compressed, sizeof(float));
-        cudaMalloc(&d_global_sum_decompressed, sizeof(float));
         cudaMemset(d_global_sum_compressed, 0, sizeof(float));
         cudaMemset(d_global_sum_decompressed, 0, sizeof(float));
 
@@ -633,6 +634,11 @@ std::vector<Node> run_solver_f_star_with_labels(std::vector<Node>& graph, int nu
     }
     std::cout << std::endl;
 
+    // Free GPU memory that is not needed anymore
+    cudaFree(d_global_sum_compressed);
+    cudaFree(d_global_sum_decompressed);
+    cudaFree(d_valid_indices);
+
     auto [h_all_edges_, h_all_sides_] = copy_graph_from_gpu(graph_copy.data(), d_graph, num_nodes, &d_all_edges, &d_all_sides, false, false);
     // take over f star to original graph
     for (size_t i = 0; i < num_nodes; ++i) {
@@ -645,6 +651,13 @@ std::vector<Node> run_solver_f_star_with_labels(std::vector<Node>& graph, int nu
     free_edges_from_gpu(d_all_edges);
     free_sides_from_gpu(d_all_sides);
     cudaFree(d_graph);
+    // Free RAM memory
+    if (h_all_edges_ != nullptr) {
+        delete[] h_all_edges_;
+    }
+    if (h_all_sides_ != nullptr) {
+        delete[] h_all_sides_;
+    }
 
     return graph;
 }
