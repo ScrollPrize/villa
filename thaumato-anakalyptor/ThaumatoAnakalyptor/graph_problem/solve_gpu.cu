@@ -4772,7 +4772,16 @@ std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations
     // Free GPU memory
     free_edges_from_gpu(d_all_edges);
     free_sides_from_gpu(d_all_sides);
+    cudaFree(d_valid_indices);
     cudaFree(d_graph);
+
+    // free old host memory
+    if (h_all_edges_ != nullptr) {
+        delete[] h_all_edges_;
+    }
+    if (h_all_sides_ != nullptr) {
+        delete[] h_all_sides_;
+    }
 
     return graph;
 }
@@ -5105,7 +5114,16 @@ std::vector<Node> run_solver_winding_number(std::vector<Node>& graph, int num_it
     // Free GPU memory
     free_edges_from_gpu(d_all_edges);
     free_sides_from_gpu(d_all_sides);
+    cudaFree(d_valid_indices);
     cudaFree(d_graph);
+
+    // Free RAM memory
+    if (h_all_edges_ != nullptr) {
+        delete[] h_all_edges_;
+    }
+    if (h_all_sides_ != nullptr) {
+        delete[] h_all_sides_;
+    }
 
     return graph;
 }
