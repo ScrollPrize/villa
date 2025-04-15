@@ -4,7 +4,7 @@ from PyQt5.QtWidgets import (
     QSplitter, QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QSlider, QLabel, QSpinBox, QDoubleSpinBox, QCheckBox,
     QAction, QMessageBox, QInputDialog, QGraphicsEllipseItem, QFileDialog,
-    QProgressDialog, QDialog, QFormLayout, QDialogButtonBox, QLineEdit, QComboBox
+    QProgressDialog, QDialog, QFormLayout, QDialogButtonBox, QLineEdit, QComboBox, QTextBrowser
 )
 from PyQt5.QtCore import Qt, QEvent, QPointF
 import pyqtgraph as pg
@@ -72,7 +72,7 @@ class PointCloudLabeler(QMainWindow):
         self.group_pipette_mode = False
         self.calc_drawing_mode = False
         self.UNLABELED = -9999
-        self.teflon_label = 9999
+        self.teflon_label = 200
         self.undo_stack = []
         self.redo_stack = []
         self._stroke_backup = None
@@ -86,6 +86,7 @@ class PointCloudLabeler(QMainWindow):
         
         # Data and labels.
         self.hide_labels = False
+        self.hide_estimated_colors = False
         self.show_original_points = False
         self.points = np.array(point_data)
         self.original_points = np.array(point_data)
@@ -127,6 +128,31 @@ class PointCloudLabeler(QMainWindow):
         self.calc_brush_green = pg.mkBrush(0, 255, 0, 80)
         self.calc_brown_blue  = pg.mkBrush(218,165,32, 80)
         self.transparent_brush = pg.mkBrush(0, 0, 0, 0)
+
+        cornflower_blue = (100, 149, 237)  # Cornflower Blue
+        medium_orchid   = (186, 85, 211)   # Medium Orchid (a purple shade)
+        turquoise       = (64, 224, 208)   # Turquoise
+
+        # Generate brushes for values 0.0, 0.1, 0.2, ... 2.9 (i.e. 30 steps)
+        self.unlabeled_brushes = []
+        for i in range(30):  # i = 0..29
+            val = i * 0.1  # our discrete value in [0,3)
+            seg = int(val)   # segment 0, 1, or 2
+            frac = val - seg
+            if seg == 0:
+                start_color, end_color = cornflower_blue, medium_orchid
+            elif seg == 1:
+                start_color, end_color = medium_orchid, turquoise
+            elif seg == 2:
+                # For cyclic interpolation, wrap from turquoise back to cornflower_blue.
+                start_color, end_color = turquoise, cornflower_blue
+            # Interpolate per channel.
+            interp_color = tuple(
+                int((1 - frac) * s + frac * e) for s, e in zip(start_color, end_color)
+            )
+            brush = pg.mkBrush(*interp_color)
+            self.unlabeled_brushes.append(brush)
+        self.unlabeled_brushes = np.array(self.unlabeled_brushes)
         
         # Guide lines and indicators.
         self.line_finit_neg = pg.InfiniteLine(pos=-180, angle=0, pen=pg.mkPen('grey', width=1, style=Qt.DashLine))
@@ -869,35 +895,152 @@ class PointCloudLabeler(QMainWindow):
         self.update_views()
     
     def show_help(self):
-        help_text = (
-            "Graph Labeler Usage Instructions\n"
-            "================================\n\n"
-            "1. Views:\n"
-            "   • XY View (left): f_star (horizontal) vs. f_init (vertical).\n"
-            "   • XZ View (right): f_star (horizontal) vs. Z (vertical).\n\n"
-            "2. Slice Controls:\n"
-            "   • Adjust Z slice (XY) and f init slice (XZ) using the sliders.\n\n"
-            "3. Shear Controls:\n"
-            "   • XZ Shear: Applies shear to the XZ view (x_new = f_star + shear*(finit - center)).\n"
-            "     (Orange indicator now appears in the XY view.)\n"
-            "   • XY Vertical Shear: In the XY view, shifts f_init based on (z - z_center).\n"
-            "   • XY Horizontal Shear: In the XY view, shifts f_star based on (z - z_center).\n"
-            "     (Purple indicator now appears in the XZ view.)\n\n"
-            "4. Drawing:\n"
-            "   • Use the mouse to manually label points. The active label is set in the 'Label' spinbox.\n\n"
-            "5. Updated Label Tools:\n"
-            "   • Update Labels, Clear Updated Labels, Apply Updated Labels to XY/XZ.\n\n"
-            "6. Spline Tools (Top Row):\n"
-            "   • Update Labels, Min points for spline, Update/Clear Spline, etc.\n\n"
-            "7. Common Controls (Bottom Row):\n"
-            "   • Drawing radius, Max Display Points, Drawing Mode, Pipette, Label selection, etc.\n\n"
-            "8. Key Shortcuts:\n"
-            "   • P: Pipette to pick label, G:  Pipette to pick group, U: Toggle Updated Labels Draw Mode, Ctrl+Z: Undo, Ctrl+Y: Redo, Space or O: toggle between initial and current points position.\n\n"
-            "9. Saving:\n"
-            "   • Use the Data menu to load data or save/load labels, and to save the final labeled graph.\n"
-        )
-        QMessageBox.information(self, "Usage Instructions", help_text)
-    
+        help_html = """
+        <html>
+        <head>
+        <style>
+            body {
+            font-family: "Segoe UI", Arial, sans-serif;
+            font-size: 11pt;
+            }
+            h2 {
+            font-size: 14pt;
+            margin: 0 0 0.4em 0;
+            }
+            h3 {
+            font-size: 12pt;
+            margin: 1em 0 0.4em 0;
+            }
+            ul {
+            margin-top: 0;
+            margin-bottom: 1em;
+            padding-left: 1.2em;
+            }
+            li {
+            margin-bottom: 0.5em;
+            }
+            .shortcut {
+            font-weight: bold;
+            color: #2222AA;
+            }
+            .section-title {
+            font-weight: bold;
+            color: #AA2222;
+            }
+        </style>
+        </head>
+        <body>
+
+        <h2>Graph Labeler Usage Instructions</h2>
+
+        <h3 class="section-title">1. Views</h3>
+        <ul>
+            <li><strong>XY View (left):</strong> f_star (horizontal) vs. f_init (vertical).</li>
+            <li><strong>XZ View (right):</strong> f_star (horizontal) vs. Z (vertical).</li>
+        </ul>
+
+        <h3 class="section-title">2. Slice Controls</h3>
+        <ul>
+            <li>Use the Z-slice sliders (left view) and f_init-slice sliders (right view) to focus on a “slab.”</li>
+            <li>The 'Thickness' sliders define how tall each slab is (in Z or in f_init).</li>
+            <li>The 'Z selection' and 'f selection' controls further isolate areas if needed.</li>
+        </ul>
+
+        <h3 class="section-title">3. Shear Controls</h3>
+        <ul>
+            <li><strong>XZ Shear (right):</strong> Shears the XZ view horizontally.</li>
+            <li><strong>XY Vertical Shear (left):</strong> Shifts f_init in the XY view based on Z.</li>
+            <li><strong>XY Horizontal Shear (left):</strong> Shifts f_star in the XY view based on Z.</li>
+            <li>Helps visually separate or untangle overlapping sheets.</li>
+        </ul>
+
+        <h3 class="section-title">4. Drawing & Labeling</h3>
+        <ul>
+            <li>Left-click and drag on the view to label points (with the label in the bottom spinbox).</li>
+            <li>The “Drawing radius” controls the brush size for labeling.</li>
+            <li>“Erase Label” sets the label spinbox to the “unlabeled” code, so you can drag to remove labels.</li>
+            <li>The “Group” spinbox (and offset/merge tools) let you manage multi-layer labeling.</li>
+        </ul>
+
+        <h3 class="section-title">5. Updated Label Tools</h3>
+        <ul>
+            <li>After running a solver (“Update Labels”), some points get an “updated” (calculated) label.</li>
+            <li><span class="shortcut">U</span> toggles “Update Labels Draw Mode”: paint only those updated labels onto unlabeled points.</li>
+            <li>“Apply All Updated Labels” replaces every unlabeled point with its calculated label.</li>
+            <li>“Apply Updated Labels to XY/XZ” applies only to the visible slab in that view.</li>
+            <li>“Clear Updated Labels” removes them entirely.</li>
+        </ul>
+
+        <h3 class="section-title">6. Spline Tools (Top Row)</h3>
+        <ul>
+            <li>“Update Spline” fits polynomial lines to labeled winding sheets (for big structures like spiral/winding shapes).</li>
+            <li>“Assign Line Labels” snaps nearby unlabeled points to those fitted lines if they’re close.</li>
+            <li>“Clear Splines” removes any drawn splines.</li>
+        </ul>
+
+        <h3 class="section-title">7. Common Controls (Bottom Row)</h3>
+        <ul>
+            <li><strong>Drawing radius</strong> = brush size for labeling.</li>
+            <li><strong>Max Display Points</strong> limits the visible points (speeds up display).</li>
+            <li><strong>Drawing Mode</strong> toggles whether left-click labeling is active.</li>
+            <li><strong>Pipette</strong> (or press <span class="shortcut">P</span>) picks up a label under the cursor.</li>
+            <li><strong>Save Labeled Graph</strong> writes a new graph file with unlabeled points removed.</li>
+        </ul>
+
+        <h3 class="section-title">8. Additional Tools & Info</h3>
+        <ul>
+            <li><strong>Filter Teflon / Reset Teflon</strong>: specialized for Teflon-labeled regions.</li>
+            <li><strong>Compute Slabs</strong>: advanced auto-label in multiple Z-slab steps.</li>
+            <li><strong>Reset Points</strong> reverts all data to the original positions.</li>
+        </ul>
+
+        <h3 class="section-title">9. Key Shortcuts</h3>
+        <ul>
+            <li><span class="shortcut">S (hold)</span>: Temporarily disable drawing (release to restore).</li>
+            <li><span class="shortcut">P</span>: Pipette a label.</li>
+            <li><span class="shortcut">G</span>: Pipette a group & label.</li>
+            <li><span class="shortcut">U</span>: Toggle updated-labels paint mode.</li>
+            <li><span class="shortcut">Ctrl+Z</span>: Undo.</li>
+            <li><span class="shortcut">Ctrl+Y</span>: Redo.</li>
+            <li><span class="shortcut">Space or O</span>: Toggle original vs. computed point positions (view-only).</li>
+            <li><span class="shortcut">Up/Down Arrow</span>: Increase/decrease the label spinbox.</li>
+            <li><span class="shortcut">C</span>: Hide/show <em>all</em> labeled points.</li>
+            <li><span class="shortcut">L</span>: Hide/show the estimated color shading for unlabeled points.</li>
+        </ul>
+
+        <h3 class="section-title">10. Resetting Points</h3>
+        <ul>
+            <li><strong>Reset Points</strong> (bottom row) truly reverts the dataset to the original 3D coords.</li>
+            <li><strong>Space or O</strong> only toggles the <em>view</em> between original vs. computed—does not permanently move them.</li>
+        </ul>
+
+        <h3 class="section-title">11. Saving & Loading</h3>
+        <ul>
+            <li>Use the “Data” menu to load data (the .bin file), or load/save .txt label files.</li>
+            <li>“Reset Labels” discards all labeling, making every point unlabeled again.</li>
+            <li>“Save Labeled Graph” exports the final labeled graph, removing any unlabeled nodes.</li>
+        </ul>
+
+        </body>
+        </html>
+        """
+
+        # Create a custom QDialog so we can show a scrollable text browser
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Usage Instructions")
+        
+        layout = QVBoxLayout(dialog)
+        text_browser = QTextBrowser(dialog)
+        text_browser.setHtml(help_html)
+        text_browser.setOpenExternalLinks(False)
+        text_browser.setReadOnly(True)
+
+        layout.addWidget(text_browser)
+        # Set an initial size for the dialog; the user can still resize
+        dialog.resize(700, 500)
+        
+        dialog.exec_()
+
     def update_slider_ranges(self):
         if self.points is not None and len(self.points) > 0:
             self.z_min = float(np.min(self.points[:, 2]))
@@ -1199,27 +1342,22 @@ class PointCloudLabeler(QMainWindow):
 
         self.update_views()
     
-    def downsample_points(self, pts, labels, groups, calc_labels=None, max_display=1, axis=None):
+    def downsample_points(self, pts, max_display=1, axis=None):
         if self.local_downsample_checkbox.isChecked():
-            return self.subsample_points_local(pts, labels, groups, calc_labels=calc_labels, max_display=max_display, axis=axis)
+            indices = self.subsample_points_local(pts, max_display=max_display, axis=axis)
         else:  
-            return self.global_subsample_points(pts, labels, groups, calc_labels=calc_labels, max_display=max_display)
+            indices = self.global_subsample_points(pts, max_display=max_display)
+        return indices
 
-    def global_subsample_points(self, pts, labels, groups, calc_labels=None, max_display=1):
+    def global_subsample_points(self, pts, max_display=1):
         n = pts.shape[0]
         if n > max_display:
             indices = np.linspace(0, n - 1, max_display, dtype=int)
-            if calc_labels is not None:
-                return pts[indices], labels[indices], groups[indices], calc_labels[indices]
-            else:
-                return pts[indices], labels[indices], groups[indices]
+            return indices
         else:
-            if calc_labels is not None:
-                return pts, labels, groups, calc_labels
-            else:
-                return pts, labels, groups
+            return np.arange(n)
             
-    def subsample_points_local(self, points, labels, groups, calc_labels=None, max_display=1, grid_size=50, axis=None):
+    def subsample_points_local(self, points, max_display=1, grid_size=50, axis=None):
         """
         Subsample points in 2D such that each grid cell (of size grid_size)
         contains at most max_per_cell points.
@@ -1235,10 +1373,7 @@ class PointCloudLabeler(QMainWindow):
         max_per_cell = max_display
         # Compute the lower bound of the grid and cell indices for each point.
         if len(points) == 0:
-            if calc_labels is not None:
-                return points, labels, groups, calc_labels
-            else:
-                return points, labels, groups
+            return np.array([], dtype=int)
         min_xy = points.min(axis=0)
         grid_size = np.array([grid_size, grid_size, 7*grid_size])
         cell_indices = ((points - min_xy) // grid_size).astype(int)
@@ -1275,45 +1410,65 @@ class PointCloudLabeler(QMainWindow):
         
         # Concatenate selected indices and return the subsampled points.
         keep_indices = np.concatenate(selected_indices)
-        if calc_labels is not None:
-            return points[keep_indices], labels[keep_indices], groups[keep_indices], calc_labels[keep_indices]
-        else:
-            return points[keep_indices], labels[keep_indices], groups[keep_indices]
+        return keep_indices
     
-    def get_brushes_from_labels(self, labels_array, group_array):
+    def get_brushes_from_labels(self, labels_array, group_array, points_array):
         brushes = np.empty(labels_array.shape[0], dtype=object)
         if self.hide_labels:
             brushes[:] = self.brush_black
             return brushes
-        mask_unlabeled = (labels_array == self.UNLABELED) | (labels_array == self.UNLABELED + 1) | (labels_array == self.UNLABELED - 1)
-        brushes[mask_unlabeled] = self.brush_black
+
+        # Identify the unlabeled points.
+        mask_unlabeled = (
+            (labels_array == self.UNLABELED)
+        | (labels_array == self.UNLABELED + 1)
+        | (labels_array == self.UNLABELED - 1)
+        )
+
+        if self.hide_estimated_colors:
+            brushes[mask_unlabeled] = self.brush_black
+        else:
+            # For each unlabeled point, compute its color using its original x coordinate.
+            x_vals = points_array[mask_unlabeled, 0]
+            y_vals = points_array[mask_unlabeled, 1]
+            # Compute the color value using the mapping: ((x * 20) - y) / 360, wrapped mod 3.
+            color_vals = (((x_vals * 20) - y_vals) / 360) % 3
+            # Round to one decimal place.
+            rounded_vals = np.round(color_vals, 1)
+            # Wrap around any values equal or exceeding 3.0.
+            rounded_vals[rounded_vals >= 3.0] = 0.0
+            # Each 0.1 increment corresponds to an index.
+            indices = np.array(np.round(rounded_vals * 10), dtype=int)
+            # Sanity-check: force any out-of-bound indices to 0.
+            indices = np.where((indices < 0) | (indices >= len(self.unlabeled_brushes)), 0, indices)
+            # Assign the precomputed brushes using vectorized indexing.
+            brushes[mask_unlabeled] = self.unlabeled_brushes[indices]
+
+        # For "labeled" points, continue with your existing logic.
         mask_valid = ~mask_unlabeled
-        valid_labels = labels_array[mask_valid]
-        valid_groups = group_array[mask_valid]
-        mask_active_group = valid_groups == self.active_group
-        count_active_group = 0
-        count_inactive_group = 0
-        mod = valid_labels % 3
         valid_indices = np.where(mask_valid)[0]
-        for i, idx in enumerate(valid_indices):
-            if valid_groups[i] == 0 and (abs(valid_labels[i] - self.teflon_label) < 2) and self.hide_teflon_checkbox.isChecked():
-                brushes[idx] = self.transparent_brush
-            elif mask_active_group[i]:
-                count_active_group += 1
-                if mod[i] == 0:
-                    brushes[idx] = self.brush_red_active
-                elif mod[i] == 1:
-                    brushes[idx] = self.brush_green_active
-                elif mod[i] == 2:
-                    brushes[idx] = self.brush_brown_active
-            else:
-                count_inactive_group += 1
-                if mod[i] == 0:
-                    brushes[idx] = self.brush_red_inactive
-                elif mod[i] == 1:
-                    brushes[idx] = self.brush_green_inactive
-                elif mod[i] == 2:
-                    brushes[idx] = self.brush_brown_inactive
+        if valid_indices.size:
+            valid_labels = labels_array[mask_valid]
+            valid_groups = group_array[mask_valid]
+            mask_active_group = valid_groups == self.active_group
+            mod = valid_labels % 3
+            for j, idx in enumerate(valid_indices):
+                if valid_groups[j] == 0 and (abs(valid_labels[j] - self.teflon_label) < 2) and self.hide_teflon_checkbox.isChecked():
+                    brushes[idx] = self.transparent_brush
+                elif mask_active_group[j]:
+                    if mod[j] == 0:
+                        brushes[idx] = self.brush_red_active
+                    elif mod[j] == 1:
+                        brushes[idx] = self.brush_green_active
+                    elif mod[j] == 2:
+                        brushes[idx] = self.brush_brown_active
+                else:
+                    if mod[j] == 0:
+                        brushes[idx] = self.brush_red_inactive
+                    elif mod[j] == 1:
+                        brushes[idx] = self.brush_green_inactive
+                    elif mod[j] == 2:
+                        brushes[idx] = self.brush_brown_inactive
         return brushes
     
     def _enable_pencil(self, plot_widget, scatter_item, view_name='xy'):
@@ -1526,6 +1681,7 @@ class PointCloudLabeler(QMainWindow):
             pts_xy = self.original_points[mask_xy]
         else:
             pts_xy = self.points[mask_xy]
+        original_pts_xy = self.original_points[mask_xy]
         labels_xy = self.labels[mask_xy]
         group_xy = self.group[mask_xy]
         calc_labels_xy = self.calculated_labels[mask_xy]
@@ -1537,6 +1693,9 @@ class PointCloudLabeler(QMainWindow):
         pts_top = pts_xy[mask_top].copy()
         if pts_top.size:
             pts_top[:, 1] += 360
+        original_pts_top = original_pts_xy[mask_top].copy()
+        if original_pts_top.size:
+            original_pts_top[:, 1] += 360
         labels_top = labels_xy[mask_top] - 1
         group_top = group_xy[mask_top]
         calc_labels_top = calc_labels_xy[mask_top] - 1
@@ -1548,6 +1707,9 @@ class PointCloudLabeler(QMainWindow):
         pts_bottom = pts_xy[mask_bottom].copy()
         if pts_bottom.size:
             pts_bottom[:, 1] -= 360
+        original_pts_bottom = original_pts_xy[mask_bottom].copy()
+        if original_pts_bottom.size:
+            original_pts_bottom[:, 1] -= 360
         labels_bottom = labels_xy[mask_bottom] + 1
         group_bottom = group_xy[mask_bottom]
         calc_labels_bottom = calc_labels_xy[mask_bottom] + 1
@@ -1556,16 +1718,18 @@ class PointCloudLabeler(QMainWindow):
         
         # ----- Combine and downsample XY arrays -----
         pts_combined = np.concatenate([pts_xy, pts_top, pts_bottom], axis=0)
+        original_pts_combined = np.concatenate([original_pts_xy, original_pts_top, original_pts_bottom], axis=0)
         labels_combined = np.concatenate([labels_xy, labels_top, labels_bottom], axis=0)
         group_combined = np.concatenate([group_xy, group_top, group_bottom], axis=0)
         calc_labels_combined = np.concatenate([calc_labels_xy, calc_labels_top, calc_labels_bottom], axis=0)
-        pts_combined, labels_combined, group_combined, calc_labels_combined = self.downsample_points(
-            pts_combined, labels_combined, group_combined, calc_labels_combined, self.max_display, axis='xy')
+        keep_indices_xy = self.downsample_points(pts_combined, self.max_display, axis='xy')
+        # Downsample all data
+        pts_combined, original_pts_combined, labels_combined, group_combined, calc_labels_combined = pts_combined[keep_indices_xy], original_pts_combined[keep_indices_xy], labels_combined[keep_indices_xy], group_combined[keep_indices_xy], calc_labels_combined[keep_indices_xy]
         t5 = time.time()
         # print("Step 5 (XY: combine & downsample):", t5 - t4, "s")
         
         # ----- Compute new brushes for XY view -----
-        new_brushes_xy = self.get_brushes_from_labels(labels_combined, group_combined)
+        new_brushes_xy = self.get_brushes_from_labels(labels_combined, group_combined, original_pts_combined)
         t6 = time.time()
         # print("XY Step 6 (brushes):", t6 - t5, "s")
         
@@ -1656,6 +1820,7 @@ class PointCloudLabeler(QMainWindow):
             pts_xz = self.original_points[mask_xz]
         else:
             pts_xz = self.points[mask_xz]
+        original_pts_xz = self.original_points[mask_xz]
         labels_xz = self.labels[mask_xz]
         group_xz = self.group[mask_xz]
         shear_angle_deg_xz = self.xz_shear_spinbox.value()
@@ -1666,9 +1831,10 @@ class PointCloudLabeler(QMainWindow):
             new_x_xz = pts_xz[:, 0]
         pts_xz_display = pts_xz.copy()
         pts_xz_display[:, 0] = new_x_xz
-        pts_xz_display, labels_xz, group_xz = self.downsample_points(pts_xz_display, labels=labels_xz, groups=group_xz, max_display=self.max_display, axis='xz')
+        keep_indices_xz = self.downsample_points(pts_xz_display, max_display=self.max_display, axis='xz')
+        pts_xz_display, original_pts_xz, labels_xz, group_xz = pts_xz_display[keep_indices_xz], original_pts_xz[keep_indices_xz], labels_xz[keep_indices_xz], group_xz[keep_indices_xz] # Downsample all data
         new_xz_geometry = {'x': pts_xz_display[:, 0], 'y': pts_xz_display[:, 2]}
-        new_brushes_xz = self.get_brushes_from_labels(labels_xz, group_xz)
+        new_brushes_xz = self.get_brushes_from_labels(labels_xz, group_xz, original_pts_xz)
         t8 = time.time()
         # print("XZ Step 8 (processing & downsampling):", t8 - t7b, "s")
         
@@ -2720,6 +2886,10 @@ class PointCloudLabeler(QMainWindow):
             event.accept()
         elif event.key() == Qt.Key_C:
             self.hide_labels = not self.hide_labels
+            self.update_views()
+            event.accept()
+        elif event.key() == Qt.Key_L:
+            self.hide_estimated_colors = not self.hide_estimated_colors
             self.update_views()
             event.accept()
         else:
