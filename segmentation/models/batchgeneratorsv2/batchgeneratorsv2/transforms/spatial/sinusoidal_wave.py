@@ -222,7 +222,7 @@ class SineWaveDeformation(BasicTransform):
 
     def __init__(self, min_peaks=1, max_peaks=5, min_magnitude=0.0, max_magnitude=1.0,
                  random_state=None, boundary_mode='constant', constant_value=0.0, 
-                 single_axis=True, fixed_axis=None):
+                 single_axis=True, fixed_axis=None, p_apply=1.0):
         """
         Initialize the sine wave deformation transform.
 
@@ -238,6 +238,7 @@ class SineWaveDeformation(BasicTransform):
             single_axis (bool): If True, use the same random axis for all waves. If False, use independent axes.
             fixed_axis (int, optional): If provided, always use this specific axis instead of a random one.
                 Only used when single_axis=True. Axis is 0-indexed (0=X, 1=Y, 2=Z).
+            p_apply (float): Probability of applying the transformation. Default: 1.0 (always apply)
         """
         super().__init__()
         self.min_peaks = min_peaks
@@ -249,6 +250,7 @@ class SineWaveDeformation(BasicTransform):
         self.constant_value = constant_value
         self.single_axis = single_axis
         self.fixed_axis = fixed_axis
+        self.p_apply = p_apply
 
         if self.random_state is not None:
             torch.manual_seed(self.random_state)
@@ -436,6 +438,10 @@ class SineWaveDeformation(BasicTransform):
         Returns:
             torch.Tensor: Deformed image with exactly the same shape as input
         """
+        # Check if we should apply the transform based on probability
+        if torch.rand(1, device=img.device).item() > self.p_apply:
+            return img
+            
         # Store original shape
         original_shape = img.shape
         
@@ -489,6 +495,10 @@ class SineWaveDeformation(BasicTransform):
         Returns:
             torch.Tensor: Deformed segmentation with exactly the same shape as input
         """
+        # Check if we should apply the transform based on probability
+        if torch.rand(1, device=segmentation.device).item() > self.p_apply:
+            return segmentation
+            
         # Store original shape
         original_shape = segmentation.shape
         
@@ -547,6 +557,10 @@ class SineWaveDeformation(BasicTransform):
         Returns:
             torch.Tensor: Deformed distance map with exactly the same shape as input
         """
+        # Check if we should apply the transform based on probability
+        if torch.rand(1, device=dist_map.device).item() > self.p_apply:
+            return dist_map
+            
         # Store original shape
         original_shape = dist_map.shape
         

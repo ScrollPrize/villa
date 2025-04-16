@@ -7,6 +7,7 @@ from torch import autocast, nn
 from PIL import Image, ImageDraw, ImageFont
 
 from nnunetv2.training.nnUNetTrainer.variants.data_augmentation.nnUNetTrainerNoMirroring import nnUNetTrainerNoMirroring
+from nnunetv2.utilities.helpers import empty_cache, dummy_context
 
 from batchgeneratorsv2.transforms.spatial.sinusoidal_wave import SineWaveDeformation
 from batchgeneratorsv2.transforms.spatial.rotation import ArbitraryRotationTransform
@@ -32,7 +33,9 @@ from batchgeneratorsv2.transforms.nnunet.remove_connected_components import \
     RemoveRandomConnectedComponentFromOneHotEncodingTransform
 from batchgeneratorsv2.transforms.intensity.illumination import InhomogeneousSliceIlluminationTransform
 from batchgeneratorsv2.transforms.noise.extranoisetransforms import BlankRectangleTransform
-from nnunetv2.utilities.helpers import empty_cache, dummy_context
+
+from batchgenerators.transforms.utility_transforms import OneOfTransform
+
 
 class nnUNetTrainer_SpatialNoMir(nnUNetTrainerNoMirroring):
     @staticmethod
@@ -150,25 +153,24 @@ class nnUNetTrainer_SpatialNoMir(nnUNetTrainerNoMirroring):
                 p_per_channel=0.5  # Probability per channel
             ), apply_probability=0.25
         ))
-        transforms.append(RandomTransform(
-            ArbitraryRotationTransform(
-            rotation_angle_range=(-np.pi / 8, np.pi / 8),  # +/- 15 degrees
-            p_per_axis=0.5  # 50% chance of rotation per axis
-            ), apply_probability=0.75
-        ))
-        transforms.append(RandomTransform(
-            SineWaveDeformation(
-                    min_peaks=1,
-                    max_peaks=2,
-                    min_magnitude=0.0,
-                    max_magnitude=0.50,
-                    boundary_mode='constant',  # 'constant', 'nearest', 'reflect', or 'mirror'
-                    constant_value=0.5,  # Fill value when boundary_mode is 'constant'
-                    single_axis=True,  # Use same random axis for all waves
-                    fixed_axis=None # random axis to apply
-                ), apply_probability=0.15
-        ))
 
+        transforms.append(OneOfTransform([
+            ArbitraryRotationTransform(
+                rotation_angle_range=(-np.pi / 8, np.pi / 8),  # +/- 15 degrees
+                p_per_axis=0.5  # 50% chance of rotation per axis
+            ),
+            SineWaveDeformation(
+                min_peaks=1,
+                max_peaks=2,
+                min_magnitude=0.0,
+                max_magnitude=0.30,
+                boundary_mode='constant',  # 'constant', 'nearest', 'reflect', or 'mirror'
+                constant_value=0.5,  # Fill value when boundary_mode is 'constant'
+                single_axis=True,  # Use same random axis for all waves
+                fixed_axis=None,  # random axis to apply
+                p_apply=0.15
+            )
+        ]))
 
         if mirror_axes is not None and len(mirror_axes) > 0:
             transforms.append(
