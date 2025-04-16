@@ -154,7 +154,21 @@ class nnUNetTrainer_SpatialNoMir(nnUNetTrainerNoMirroring):
             ), apply_probability=0.25
         ))
 
+        # this looks really stupid but its because OneOfTransform does not take a probability argument per transform
+        # so we just add it 4x so its 85% rot and 15% sinewave
         transforms.append(OneOfTransform([
+            ArbitraryRotationTransform(
+                rotation_angle_range=(-np.pi / 8, np.pi / 8),  # +/- 15 degrees
+                p_per_axis=0.5  # 50% chance of rotation per axis
+            ),
+            ArbitraryRotationTransform(
+                rotation_angle_range=(-np.pi / 8, np.pi / 8),  # +/- 15 degrees
+                p_per_axis=0.5  # 50% chance of rotation per axis
+            ),
+            ArbitraryRotationTransform(
+                rotation_angle_range=(-np.pi / 8, np.pi / 8),  # +/- 15 degrees
+                p_per_axis=0.5  # 50% chance of rotation per axis
+            ),
             ArbitraryRotationTransform(
                 rotation_angle_range=(-np.pi / 8, np.pi / 8),  # +/- 15 degrees
                 p_per_axis=0.5  # 50% chance of rotation per axis
@@ -168,7 +182,7 @@ class nnUNetTrainer_SpatialNoMir(nnUNetTrainerNoMirroring):
                 constant_value=0.5,  # Fill value when boundary_mode is 'constant'
                 single_axis=True,  # Use same random axis for all waves
                 fixed_axis=None,  # random axis to apply
-                p_apply=0.15
+                p_apply=1.0
             )
         ]))
 
