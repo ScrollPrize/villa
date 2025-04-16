@@ -14,3 +14,4 @@ node_modules/.yarn-integrity
 /segmentation/models/arch/nnunet/nnunetv2.egg-info
 /vesuvius/vesuvius.egg-info
 /vesuvius/vesuvius.egg-info
+/segmentation/models/batchgeneratorsv2/batchgeneratorsv2.egg-info

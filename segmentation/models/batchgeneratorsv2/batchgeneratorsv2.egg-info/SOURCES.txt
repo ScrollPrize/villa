@@ -34,6 +34,8 @@ batchgeneratorsv2/transforms/noise/gaussian_blur.py
 batchgeneratorsv2/transforms/spatial/__init__.py
 batchgeneratorsv2/transforms/spatial/low_resolution.py
 batchgeneratorsv2/transforms/spatial/mirroring.py
+batchgeneratorsv2/transforms/spatial/rotation.py
+batchgeneratorsv2/transforms/spatial/sinusoidal_wave.py
 batchgeneratorsv2/transforms/spatial/spatial.py
 batchgeneratorsv2/transforms/spatial/transpose.py
 batchgeneratorsv2/transforms/utils/__init__.py

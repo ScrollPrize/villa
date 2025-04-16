@@ -1,7 +1,0 @@
-{"time":"2025-04-07T13:26:30.742133065-05:00","level":"INFO","msg":"stream: starting","core version":"0.19.9","symlink path":"/home/sean/Documents/villa/segmentation/models/arch/nnunet/wandb/run-20250407_132630-qb6gap8n/logs/debug-core.log"}
-{"time":"2025-04-07T13:26:30.942394749-05:00","level":"INFO","msg":"created new stream","id":"qb6gap8n"}
-{"time":"2025-04-07T13:26:30.942730731-05:00","level":"INFO","msg":"stream: started","id":"qb6gap8n"}
-{"time":"2025-04-07T13:26:30.942741498-05:00","level":"INFO","msg":"sender: started","stream_id":"qb6gap8n"}
-{"time":"2025-04-07T13:26:30.942789998-05:00","level":"INFO","msg":"writer: Do: started","stream_id":"qb6gap8n"}
-{"time":"2025-04-07T13:26:30.942867461-05:00","level":"INFO","msg":"handler: started","stream_id":"qb6gap8n"}
-{"time":"2025-04-07T13:26:31.15940348-05:00","level":"INFO","msg":"Starting system monitor"}

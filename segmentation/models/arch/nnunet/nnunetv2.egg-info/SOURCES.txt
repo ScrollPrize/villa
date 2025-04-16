@@ -174,6 +174,7 @@ nnunetv2/training/nnUNetTrainer/variants/data_augmentation/nnUNetTrainerDAOrd0.p
 nnunetv2/training/nnUNetTrainer/variants/data_augmentation/nnUNetTrainerExtraDA.py
 nnunetv2/training/nnUNetTrainer/variants/data_augmentation/nnUNetTrainerNoDA.py
 nnunetv2/training/nnUNetTrainer/variants/data_augmentation/nnUNetTrainerNoMirroring.py
+nnunetv2/training/nnUNetTrainer/variants/data_augmentation/nnUNetTrainer_SpatialNoMir.py
 nnunetv2/training/nnUNetTrainer/variants/loss/__init__.py
 nnunetv2/training/nnUNetTrainer/variants/loss/nnUNetTrainerCELoss.py
 nnunetv2/training/nnUNetTrainer/variants/loss/nnUNetTrainerDiceLoss.py

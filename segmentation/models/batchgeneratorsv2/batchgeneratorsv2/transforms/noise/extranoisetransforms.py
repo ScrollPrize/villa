@@ -7,13 +7,28 @@ class ColorFunctionExtractor:
     def __init__(self, rectangle_value):
         self.rectangle_value = rectangle_value
 
-    def __call__(self, x):
-        if np.isscalar(self.rectangle_value):
-            return self.rectangle_value
+    def __call__(self, x, device=None):
+        if isinstance(self.rectangle_value, (int, float)):
+            return torch.tensor(self.rectangle_value, device=device)
         elif callable(self.rectangle_value):
-            return self.rectangle_value(x)
+            # Handle the np.mean case specifically
+            if self.rectangle_value == np.mean:
+                return torch.mean(x.float())
+            
+            # For other callables, call but handle possible numpy return
+            try:
+                value = self.rectangle_value(x)
+                return value if isinstance(value, torch.Tensor) else torch.tensor(value, device=device)
+            except TypeError:
+                # If it's calling numpy mean, convert tensor to numpy first
+                if hasattr(x, 'cpu'):
+                    x_np = x.detach().cpu().numpy()
+                    value = self.rectangle_value(x_np)
+                    return torch.tensor(value, device=device)
+                raise
         elif isinstance(self.rectangle_value, (tuple, list)):
-            return np.random.uniform(*self.rectangle_value)
+            # Use torch.rand instead of np.random.uniform
+            return torch.rand(1, device=device) * (self.rectangle_value[1] - self.rectangle_value[0]) + self.rectangle_value[0]
         else:
             raise RuntimeError("unrecognized format for rectangle_value")
 
@@ -55,7 +70,7 @@ class BlankRectangleTransform(BasicTransform):
     def get_parameters(self, **data_dict) -> dict:
         return {}
 
-    def _get_rectangle_size(self, img_shape: Tuple[int, ...]) -> List[int]:
+    def _get_rectangle_size(self, img_shape: Tuple[int, ...], device=None) -> List[int]:
         img_dim = len(img_shape)
         
         if isinstance(self.rectangle_size, int):
@@ -66,38 +81,73 @@ class BlankRectangleTransform(BasicTransform):
         
         elif isinstance(self.rectangle_size, (tuple, list)) and all([isinstance(i, (tuple, list)) for i in self.rectangle_size]):
             if self.force_square:
-                return [np.random.randint(self.rectangle_size[0][0], self.rectangle_size[0][1] + 1)] * img_dim
+                # Use torch.randint instead of np.random.randint
+                size = torch.randint(
+                    self.rectangle_size[0][0],
+                    self.rectangle_size[0][1] + 1,
+                    (1,),
+                    device=device
+                ).item()
+                return [size] * img_dim
             else:
-                return [np.random.randint(self.rectangle_size[d][0], self.rectangle_size[d][1] + 1) 
-                        for d in range(img_dim)]
+                # Generate all random sizes at once using torch
+                sizes = [
+                    torch.randint(
+                        self.rectangle_size[d][0],
+                        self.rectangle_size[d][1] + 1,
+                        (1,),
+                        device=device
+                    ).item()
+                    for d in range(img_dim)
+                ]
+                return sizes
         else:
             raise RuntimeError("unrecognized format for rectangle_size")
 
     def _apply_to_image(self, img: torch.Tensor, **kwargs) -> torch.Tensor:
         result = img.clone()
         img_shape = img.shape[1:]  # DHW
+        device = img.device
         
-        if np.random.uniform() < self.p_per_sample:
+        # Use torch.rand instead of np.random.uniform
+        if torch.rand(1, device=device).item() < self.p_per_sample:
             for c in range(img.shape[0]):
-                if np.random.uniform() < self.p_per_channel:
-                    # Number of rectangles
-                    n_rect = (self.num_rectangles if isinstance(self.num_rectangles, int) 
-                            else np.random.randint(self.num_rectangles[0], self.num_rectangles[1] + 1))
+                if torch.rand(1, device=device).item() < self.p_per_channel:
+                    # Number of rectangles - use torch.randint for integer random values
+                    if isinstance(self.num_rectangles, int):
+                        n_rect = self.num_rectangles
+                    else:
+                        n_rect = torch.randint(
+                            self.num_rectangles[0], 
+                            self.num_rectangles[1] + 1, 
+                            (1,), 
+                            device=device
+                        ).item()
                     
                     for _ in range(n_rect):
-                        rectangle_size = self._get_rectangle_size(img_shape)
+                        # Get rectangle size using PyTorch random generators
+                        rectangle_size = self._get_rectangle_size(img_shape, device)
                         
-                        # Get random starting positions
-                        lb = [np.random.randint(0, max(img_shape[i] - rectangle_size[i], 1)) 
-                            for i in range(len(img_shape))]
+                        # Get random starting positions using torch.randint
+                        lb = []
+                        for i in range(len(img_shape)):
+                            max_pos = max(img_shape[i] - rectangle_size[i], 1)
+                            lb.append(torch.randint(0, max_pos, (1,), device=device).item())
+                        
                         ub = [i + j for i, j in zip(lb, rectangle_size)]
                         
                         # Create slice for the rectangle
                         my_slice = tuple([c, *[slice(i, j) for i, j in zip(lb, ub)]])
                         
-                        # Get intensity value and convert to torch tensor before assignment
-                        intensity = self.color_fn(result[my_slice].cpu().numpy())
-                        intensity = torch.tensor(intensity, device=result.device, dtype=result.dtype)
+                        # Get intensity value directly as a tensor
+                        # No need for cpu().numpy() conversion or back to tensor
+                        intensity = self.color_fn(result[my_slice], device=device)
+                        if not isinstance(intensity, torch.Tensor):
+                            intensity = torch.tensor(intensity, device=device, dtype=result.dtype)
+                        else:
+                            intensity = intensity.to(dtype=result.dtype)
+                            
+                        # Apply the rectangle
                         result[my_slice] = intensity
         
         return result
