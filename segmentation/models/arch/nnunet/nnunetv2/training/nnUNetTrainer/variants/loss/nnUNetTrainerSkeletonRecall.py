@@ -9,7 +9,6 @@ from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import MemoryEfficientSoftDiceLoss, get_tp_fp_fn_tn
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.utilities.helpers import empty_cache, dummy_context
-from nnunetv2.training.nnUNetTrainer.variants.data_augmentation.nnUNetTrainerNoMirroring import nnUNetTrainerSkeletonRecallNoMirroring
 
 from nnunetv2.training.dataloading.data_loader_2d_skel import nnUNetDataLoader2DSkel
 from nnunetv2.training.dataloading.data_loader_3d_skel import nnUNetDataLoader3DSkel

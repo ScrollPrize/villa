@@ -24,7 +24,6 @@ from batchgeneratorsv2.transforms.utils.random import RandomTransform
 from batchgeneratorsv2.transforms.utils.remove_label import RemoveLabelTansform
 from batchgeneratorsv2.transforms.utils.seg_to_regions import ConvertSegmentationToRegionsTransform
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
-from nnunetv2.training.nnUNetTrainer.variants.loss.nnUNetTrainerSkeletonRecall import nnUNetTrainerSkeletonRecall
 
 
 class nnUNetTrainerNoMirroring(nnUNetTrainer):
