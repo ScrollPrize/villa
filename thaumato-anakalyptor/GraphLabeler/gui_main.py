@@ -4,14 +4,15 @@ from PyQt5.QtWidgets import (
     QSplitter, QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QSlider, QLabel, QSpinBox, QDoubleSpinBox, QCheckBox,
     QAction, QMessageBox, QInputDialog, QGraphicsEllipseItem, QFileDialog,
-    QProgressDialog, QDialog, QFormLayout, QDialogButtonBox, QLineEdit, QComboBox, QTextBrowser
+    QProgressDialog, QDialog, QFormLayout, QDialogButtonBox, QLineEdit, QComboBox, QTextBrowser, QGraphicsPathItem
 )
 from PyQt5.QtCore import Qt, QEvent, QPointF
+from PyQt5.QtGui  import QPainterPath, QPen, QColor
 import pyqtgraph as pg
 from scipy.spatial import cKDTree
 import time
 from tqdm import tqdm
-from collections import defaultdict
+from collections import Counter
 
 # --------------------------------------------------
 # Importing the custom graph problem library.
@@ -174,6 +175,9 @@ class PointCloudLabeler(QMainWindow):
         self.cursor_circle = QGraphicsEllipseItem(0, 0, 0, 0)
         self.cursor_circle.setPen(pg.mkPen('cyan', width=1, style=Qt.DashLine))
         self.cursor_circle.setVisible(False)
+        self.cursor_circle_xz = QGraphicsEllipseItem(0, 0, 0, 0)
+        self.cursor_circle_xz.setPen(pg.mkPen('cyan', width=1, style=Qt.DashLine))
+        self.cursor_circle_xz.setVisible(False)
         
         # Layout setup.
         central_widget = QWidget()
@@ -253,6 +257,7 @@ class PointCloudLabeler(QMainWindow):
         self.xz_plot.setLabel('left', 'Z')
         self.xz_plot.setMouseEnabled(x=True, y=True)
         right_column.addWidget(self.xz_plot)
+        self.xz_plot.addItem(self.cursor_circle_xz)
         xz_controls = QHBoxLayout()
         self.finit_center_widget, self.finit_center_slider, self.finit_center_spinbox = create_sync_slider_spinbox(
             "f init center:", -180.0, 180.0,
@@ -564,7 +569,29 @@ class PointCloudLabeler(QMainWindow):
         self.xy_scatter = pg.ScatterPlotItem(size=self.point_size, pen=None)
         self.xz_scatter = pg.ScatterPlotItem(size=self.point_size, pen=None)
         self.xy_plot.addItem(self.xy_scatter)
+        self._overlay = QGraphicsPathItem()
+        # semi‑transparent blue (alpha=150), with round caps
+        pen = QPen(QColor(50, 150, 255, 150))
+        pen.setWidthF(self.radius_spinbox.value() * 2)  # diameter = 2*radius
+        pen.setCapStyle(Qt.RoundCap)
+        self._overlay.setPen(pen)
+        self._overlay.setZValue(1000)  # draw on top of everything
+        self.xy_plot.addItem(self._overlay)
+
+        # keep the overlay line in sync if the user changes the brush radius
+        self.radius_spinbox.valueChanged.connect(self._update_overlay_pen)
+
+        self.xy_plot.addItem(self._overlay)
         self.xz_plot.addItem(self.xz_scatter)
+        self._overlay_xz = QGraphicsPathItem()
+        pen_xz = QPen(QColor(50,150,255,150))
+        pen_xz.setWidthF(self.radius_spinbox.value()*2)
+        pen_xz.setCapStyle(Qt.RoundCap)
+        self._overlay_xz.setPen(pen_xz)
+        self._overlay_xz.setZValue(1000)
+        self.xz_plot.addItem(self._overlay_xz)
+        self.radius_spinbox.valueChanged.connect(self._update_overlay_xz)
+
         self.xy_calc_scatter = pg.ScatterPlotItem(size=self.point_size, pen=None)
         self.xz_calc_scatter = pg.ScatterPlotItem(size=self.point_size, pen=None)
         self.xy_plot.addItem(self.xy_calc_scatter)
@@ -577,6 +604,7 @@ class PointCloudLabeler(QMainWindow):
         self._enable_pencil(self.xz_plot, self.xz_scatter, view_name='xz')
         
         self.xy_plot.scene().installEventFilter(self)
+        self.xz_plot.scene().installEventFilter(self)
         
         self.update_slider_ranges()
         self.update_guides()
@@ -617,17 +645,29 @@ class PointCloudLabeler(QMainWindow):
     # Event filter for cursor circle.
     # --------------------------------------------------
     def eventFilter(self, source, event):
-        if event.type() == QEvent.MouseMove and source is self.xy_plot.scene():
-            if self.drawing_mode_checkbox.isChecked():
-                pos = event.scenePos()
-                dataPos = self.xy_plot.plotItem.vb.mapSceneToView(pos)
-                r = self.radius_spinbox.value()
-                self.cursor_circle.setRect(dataPos.x() - r, dataPos.y() - r, 2 * r, 2 * r)
-                self.cursor_circle.setVisible(True)
+        if event.type() == QEvent.MouseMove and self.drawing_mode_checkbox.isChecked():
+            # XY
+            if source is self.xy_plot.scene():
+                plot, circle = self.xy_plot, self.cursor_circle
+            # XZ
+            elif source is self.xz_plot.scene():
+                plot, circle = self.xz_plot, self.cursor_circle_xz
             else:
-                self.cursor_circle.setVisible(False)
+                return super().eventFilter(source, event)
+
+            pos = event.scenePos()
+            dataPos = plot.plotItem.vb.mapSceneToView(pos)
+            r = self.radius_spinbox.value()
+            circle.setRect(dataPos.x() - r, dataPos.y() - r, 2*r, 2*r)
+            circle.setVisible(True)
             return False
-        return super(PointCloudLabeler, self).eventFilter(source, event)
+
+        # if they moved off either view, hide both
+        if event.type() in (QEvent.Leave, QEvent.HoverLeave):
+            self.cursor_circle.setVisible(False)
+            self.cursor_circle_xz.setVisible(False)
+
+        return super().eventFilter(source, event)
     
     # --------------------------------------------------
     # Setup menu.
@@ -1346,6 +1386,17 @@ class PointCloudLabeler(QMainWindow):
         self.group_spinbox.setValue(self.active_group)
 
         self.update_views()
+
+    def _update_overlay_pen(self, radius):
+        """When the radius slider changes, update the overlay pen thickness."""
+        pen = self._overlay.pen()
+        pen.setWidthF(radius * 2)
+        self._overlay.setPen(pen)
+
+    def _update_overlay_xz(self, radius):
+        pen = self._overlay_xz.pen()
+        pen.setWidthF(radius * 2)
+        self._overlay_xz.setPen(pen)
     
     def downsample_points(self, pts, max_display=1, axis=None):
         if self.local_downsample_checkbox.isChecked():
@@ -1480,8 +1531,30 @@ class PointCloudLabeler(QMainWindow):
         scatter_item.mousePressEvent = lambda ev: self._on_mouse_press(ev, plot_widget, view_name)
         scatter_item.mouseMoveEvent = lambda ev: self._on_mouse_drag(ev, plot_widget, view_name)
         scatter_item.mouseReleaseEvent = lambda ev: self._on_mouse_release(ev, plot_widget, view_name)
+
+    def _current_label_qcolor(self):
+        """Return a semi‐transparent QColor matching the current spin‑box label,
+        but draw UNLABELED in the “unlabeled” color (black here)."""
+        lab = self.label_spinbox.value()
+        alpha = 150
+
+        if lab == self.UNLABELED:
+            # draw erase strokes in your unlabeled color
+            return QColor(0, 0, 0, alpha)
+
+        # otherwise pick by (label % 3)
+        mod = lab % 3
+        if mod == 0:
+            base = self.brush_red_active.color()
+        elif mod == 1:
+            base = self.brush_green_active.color()
+        else:
+            base = self.brush_brown_active.color()
+
+        return QColor(base.red(), base.green(), base.blue(), alpha)
     
     def _on_mouse_press(self, ev, plot_widget, view_name):
+        # pipette / group‑pipette remain unchanged:
         if view_name == 'xy' and self.pipette_mode:
             ev.accept()
             self.pick_label_at(ev, plot_widget)
@@ -1502,34 +1575,175 @@ class PointCloudLabeler(QMainWindow):
             self.pick_group_at_xz(ev, plot_widget)
             self.group_pipette_mode = False
             return
-        if (ev.button() == Qt.LeftButton and self.drawing_mode_checkbox.isChecked() and not self.s_pressed):
+
+        # ---- start a brush stroke in XY ----
+        if plot_widget is self.xy_plot \
+        and ev.button() == Qt.LeftButton \
+        and self.drawing_mode_checkbox.isChecked() \
+        and not self.s_pressed:
+            ev.accept()
+            # backup for undo
+            if self._stroke_backup is None:
+                self._stroke_backup = (self.labels.copy(), self.group.copy())
+            pt = self.xy_plot.plotItem.vb.mapSceneToView(ev.scenePos())
+            self._current_path_xy = QPainterPath(QPointF(pt.x(), pt.y()))
+            pen = self._overlay.pen()
+            pen.setColor(self._current_label_qcolor())
+            self._overlay.setPen(pen)
+            self._overlay.setPath(self._current_path_xy)
+            self._overlay.setVisible(True)
+            return
+
+        # ---- start a brush stroke in XZ ----
+        if plot_widget is self.xz_plot \
+        and ev.button() == Qt.LeftButton \
+        and self.drawing_mode_checkbox.isChecked() \
+        and not self.s_pressed:
             ev.accept()
             if self._stroke_backup is None:
                 self._stroke_backup = (self.labels.copy(), self.group.copy())
-            if self.calc_drawing_mode:
-                self._paint_points_calculated(ev, plot_widget, view_name)
-            else:
-                self._paint_points(ev, plot_widget, view_name)
-        else:
-            ev.ignore()
+            pt = self.xz_plot.plotItem.vb.mapSceneToView(ev.scenePos())
+            self._current_path_xz = QPainterPath(QPointF(pt.x(), pt.y()))
+            pen = self._overlay_xz.pen()
+            pen.setColor(self._current_label_qcolor())
+            self._overlay_xz.setPen(pen)
+            self._overlay_xz.setPath(self._current_path_xz)
+            self._overlay_xz.setVisible(True)
+            return
+
+        ev.ignore()
     
     def _on_mouse_drag(self, ev, plot_widget, view_name):
-        if (ev.buttons() & Qt.LeftButton and self.drawing_mode_checkbox.isChecked() and not self.s_pressed):
+        # ---- extend XY stroke ----
+        if plot_widget is self.xy_plot \
+        and (ev.buttons() & Qt.LeftButton) \
+        and self.drawing_mode_checkbox.isChecked() \
+        and not self.s_pressed:
             ev.accept()
-            if self.calc_drawing_mode:
-                self._paint_points_calculated(ev, plot_widget, view_name)
-            else:
-                self._paint_points(ev, plot_widget, view_name)
-        else:
-            ev.ignore()
+            pt = self.xy_plot.plotItem.vb.mapSceneToView(ev.scenePos())
+            self._current_path_xy.lineTo(QPointF(pt.x(), pt.y()))
+            self._overlay.setPath(self._current_path_xy)
+            return
+
+        # ---- extend XZ stroke ----
+        if plot_widget is self.xz_plot \
+        and (ev.buttons() & Qt.LeftButton) \
+        and self.drawing_mode_checkbox.isChecked() \
+        and not self.s_pressed:
+            ev.accept()
+            pt = self.xz_plot.plotItem.vb.mapSceneToView(ev.scenePos())
+            self._current_path_xz.lineTo(QPointF(pt.x(), pt.y()))
+            self._overlay_xz.setPath(self._current_path_xz)
+            return
+
+        ev.ignore()
     
     def _on_mouse_release(self, ev, plot_widget, view_name):
-        if ev.button() == Qt.LeftButton and self._stroke_backup is not None:
+        # ---- finish XY stroke ----
+        if plot_widget is self.xy_plot \
+        and ev.button() == Qt.LeftButton \
+        and self._stroke_backup is not None:
+            ev.accept()
+            pts = [(self._current_path_xy.elementAt(i).x,
+                    self._current_path_xy.elementAt(i).y)
+                for i in range(self._current_path_xy.elementCount())]
+            self._apply_brush_path_to_labels(pts)
             self.undo_stack.append(self._stroke_backup)
-            self.redo_stack = []
+            self.redo_stack.clear()
             self._stroke_backup = None
-        ev.accept()
+            self._overlay.setPath(QPainterPath())
+            self._overlay.setVisible(False)
+            return
+
+        # ---- finish XZ stroke ----
+        if plot_widget is self.xz_plot \
+        and ev.button() == Qt.LeftButton \
+        and self._stroke_backup is not None:
+            ev.accept()
+            pts = [(self._current_path_xz.elementAt(i).x,
+                    self._current_path_xz.elementAt(i).y)
+                for i in range(self._current_path_xz.elementCount())]
+            self._apply_brush_path_to_labels_xz(pts)
+            self.undo_stack.append(self._stroke_backup)
+            self.redo_stack.clear()
+            self._stroke_backup = None
+            self._overlay_xz.setPath(QPainterPath())
+            self._overlay_xz.setVisible(False)
+            return
+
+        ev.accept()  # eat all other releases so the view doesn’t pan
     
+    def _apply_brush_path_to_labels(self, data_path):
+        """
+        Apply the brush stroke (given as a list of data‐space (x,y) points)
+        to update self.labels and self.group, preserving wrap‑around logic.
+        """
+        r    = self.radius_spinbox.value()
+        zc   = self.z_center_spinbox.value()
+        half = self.z_thickness_slider.value() / self.scaleFactor / 2
+        grp  = self.active_group
+        base = self.label_spinbox.value()
+
+        # 1) Collect for each point index the list of wrap offsets (+1, 0, -1)
+        hit_offsets = {}   # idx -> list of offsets
+        for x, y in data_path:
+            off = 1 if y > 180 else (-1 if y < -180 else 0)
+            for i in self.get_nearby_indices_xy(x, y, r):
+                # only if inside current Z slab
+                if (zc - half) <= self.points[i, 2] <= (zc + half):
+                    hit_offsets.setdefault(i, []).append(off)
+
+        if not hit_offsets:
+            return
+
+        # 2) For each point, pick the most common offset and apply
+        for i, offs in hit_offsets.items():
+            most_common_off = Counter(offs).most_common(1)[0][0]
+            new_lab = base + most_common_off
+            # prevent accidental UNLABELED±1
+            if new_lab in (self.UNLABELED + 1, self.UNLABELED - 1):
+                new_lab = self.UNLABELED
+
+            self.labels[i] = new_lab
+            self.group[i]  = grp
+
+        # 3) Repaint
+        self.update_views()
+
+    def _apply_brush_path_to_labels_xz(self, data_path):
+        """
+        Apply the brush stroke (given as a list of data‐space (f_star, Z) points)
+        to update self.labels and self.group, respecting the current f_init slab.
+        """
+        # brush radius in data coords
+        r    = self.radius_spinbox.value()
+        # center and half‐thickness of the f_init slab
+        fc   = self.finit_center_spinbox.value()
+        half = self.finit_thickness_slider.value() / self.scaleFactor / 2
+        grp  = self.active_group
+        base = self.label_spinbox.value()
+
+        # collect all hit indices
+        hit = set()
+        for xf, z in data_path:
+            # query in (f_star, Z) space
+            idxs = self.kdtree_xz.query_ball_point([xf, z], r=r)
+            for i in idxs:
+                # only if the original Y = f_init is in the current slab
+                if (fc - half) <= self.points[i, 1] <= (fc + half):
+                    hit.add(i)
+
+        if not hit:
+            return
+
+        # assign label and group
+        for i in hit:
+            self.labels[i] = base
+            self.group[i]  = grp
+
+        # repaint both views
+        self.update_views()
+
     def _paint_points(self, ev, plot_widget, view_name):
         start_time = time.time()
         current_time = time.time()
