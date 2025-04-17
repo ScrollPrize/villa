@@ -305,7 +305,7 @@ class PointCloudLabeler(QMainWindow):
 
         # --- Solver selection dropdown ---
         self.solver_combo = QComboBox()
-        self.solver_combo.addItems(["F*", "F*2", "F*3", "F*4", "F*5", "F*6", "F*7", "F*Slab", "Winding Number", "Union", "Random", "Set Labels"])
+        self.solver_combo.addItems(["F*", "Linear", "F*3", "F*4", "Ripple", "Smooth", "Ripple Smooth Combined", "F*Slab", "Winding Number", "Union", "Random", "Set Labels"])
         top_controls_layout.addWidget(QLabel("Select Solver:"))
         top_controls_layout.addWidget(self.solver_combo)
 
@@ -395,7 +395,7 @@ class PointCloudLabeler(QMainWindow):
         # --------------------------------------------------------------------
         common_controls_layout = QHBoxLayout()
         self.radius_widget, self.radius_slider, self.radius_spinbox = create_sync_slider_spinbox(
-            "Drawing radius:", 0.1, 20.0, 3.5, self.scaleFactor, self.update_views, decimals=1)
+            "Drawing radius:", 0.1, 20.0, 3.5, 1.0, self.update_views, decimals=1)
         common_controls_layout.addWidget(self.radius_widget)
         
         max_disp_layout = QHBoxLayout()
@@ -580,6 +580,7 @@ class PointCloudLabeler(QMainWindow):
 
         # keep the overlay line in sync if the user changes the brush radius
         self.radius_spinbox.valueChanged.connect(self._update_overlay_pen)
+        self.radius_slider.valueChanged.connect(self._update_overlay_pen)
 
         self.xy_plot.addItem(self._overlay)
         self.xz_plot.addItem(self.xz_scatter)
@@ -591,6 +592,7 @@ class PointCloudLabeler(QMainWindow):
         self._overlay_xz.setZValue(1000)
         self.xz_plot.addItem(self._overlay_xz)
         self.radius_spinbox.valueChanged.connect(self._update_overlay_xz)
+        self.radius_slider.valueChanged.connect(self._update_overlay_xz)
 
         self.xy_calc_scatter = pg.ScatterPlotItem(size=self.point_size, pen=None)
         self.xz_calc_scatter = pg.ScatterPlotItem(size=self.point_size, pen=None)
@@ -2915,7 +2917,7 @@ class PointCloudLabeler(QMainWindow):
             if selected_solver == "Winding Number":
                 self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1,
                                                  other_block_factor=15.0, side_fix_nr=-1, display=False)
-            elif "F*" in selected_solver:
+            elif "F*" in selected_solver or selected_solver in ["Linear", "Ripple", "Smooth", "Ripple Smooth Combined"]:
                 if self.seed_node is None:
                     self.seed_node = self.find_seed_node(deleted_mask_previous=deleted_mask_previous, extra_z_range=extra_z_range)
                 if self.seed_node is not None:
@@ -2924,7 +2926,7 @@ class PointCloudLabeler(QMainWindow):
                 if selected_solver == "F*":
                     self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=1.1, other_block_factor=other_block_factor, lr=0.05, error_cutoff=-1.0, display=True)
                     self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=1.0, other_block_factor=other_block_factor, lr=0.05, error_cutoff=-1.0, display=True)
-                elif selected_solver == "F*2":
+                elif selected_solver == "Linear":
                     self.solver.solve_f_star_with_labels(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, other_block_factor=other_block_factor, lr=0.05, error_cutoff=-1.0, display=True)
                 elif selected_solver == "F*3":
                     self.solver.solve_f_star_with_labels(num_iterations=15000, spring_constant=4.0, other_block_factor=0.5, lr=0.25, error_cutoff=-1.0, display=True)
@@ -2933,11 +2935,11 @@ class PointCloudLabeler(QMainWindow):
                 elif selected_solver == "F*4":
                     self.solver.solve_f_star(num_iterations=int(2 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True)
                     self.solver.solve_f_star(num_iterations=int(2 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=360.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True)
-                elif selected_solver == "F*5":
+                elif selected_solver == "Ripple":
                     self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True)
-                elif selected_solver == "F*6":
+                elif selected_solver == "Smooth":
                     self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, o=0.0, step_sigma=360.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True)
-                elif selected_solver == "F*7":
+                elif selected_solver == "Ripple Smooth Combined":
                     self.solver.solve_f_star(num_iterations=int(3 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=False)
                     self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=360.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=False)
                 elif selected_solver == "F*Slab":
