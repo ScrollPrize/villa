@@ -932,6 +932,21 @@ class Solver {
                 graph[index].f_tilde = f_stars[i];
             }
         }
+        std::tuple<std::vector<float>, std::vector<size_t>> get_gt_f_star() {
+            // get gt f star
+            std::vector<float> gt_f_star;
+            std::vector<size_t> valid_indices = get_valid_indices(graph);
+            std::vector<size_t> gt_indices;
+            for (size_t i = 0; i < valid_indices.size(); ++i) {
+                size_t index = valid_indices[i];
+                if (graph[index].gt) {
+                    gt_f_star.push_back(graph[index].gt_f_star);
+                    gt_indices.push_back(i);
+                }
+            }
+            return std::make_tuple(gt_f_star, gt_indices);
+        }
+
         void largest_connected_component() {
             find_largest_connected_component(graph);
             nr_nodes = get_valid_indices(graph).size();
@@ -1164,6 +1179,8 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
         .def("set_positions", &Solver::set_positions,
             "Method to set the f star values of the graph",
             py::arg("f_stars"))
+        .def("get_gt_f_star", &Solver::get_gt_f_star,
+            "Method to get the ground truth f star values of the graph")
         .def("load_graph", &Solver::load_graph,
             "Method to load the graph from a binary file",
             py::arg("graph_path"))
