@@ -305,7 +305,7 @@ def find_valid_relations(points2, scene1, triangles1, winding_angles2, max_dista
 
     return closest_indices1, winding_angles_points2, clostest_points2, points_indices2, percentage_valid
 
-def align_winding_angles(vertices1, winding_angles1, mesh2_stuff, umbilicus_path, max_distance, gt_splitter, debug=False):
+def align_winding_angles(vertices1, winding_angles1, mesh2_stuff, umbilicus_path, max_distance, gt_splitter, debug=False, verbose=True):
     # load the meshes
     mesh2, vertices2, triangles2, scene2 = mesh2_stuff
 
@@ -319,7 +319,7 @@ def align_winding_angles(vertices1, winding_angles1, mesh2_stuff, umbilicus_path
 
     # Make statistic about the winding differences in the closest vertices
     winding_angle_difference = {}
-    for i in tqdm(range(len(closest_indices2)), desc="Winding angle difference"):
+    for i in tqdm(range(len(closest_indices2)), desc="Winding angle difference", disable=not verbose):
         vertex2 = vertices2[closest_indices2[i]]
         angle2 = winding_angles2[closest_indices2[i]]
         vertex1 = clostest_vertices1[i]
