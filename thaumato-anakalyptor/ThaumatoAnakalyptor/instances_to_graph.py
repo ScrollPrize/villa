@@ -1531,7 +1531,7 @@ class ScrollGraph(Graph):
         self.compute_node_edges()
         return (factor_0, factor_not_0, factor_bad)
     
-    def add_ground_truth_from_mesh(self, path_instances, mesh_file, continue_from=0):
+    def add_ground_truth_from_mesh(self, path_instances, mesh_file, continue_from=0, max_threads=-1):
         umbilicus_path = os.path.join(os.path.dirname(path_instances), "umbilicus.txt")
         # Load GT data
 
@@ -1545,8 +1545,11 @@ class ScrollGraph(Graph):
             # os copy
             os.system(f"cp {mesh_file} {temp_path}")
             
+            processes = min(48, multiprocessing.cpu_count()//2)
+            if max_threads > 0:
+                    processes = min(max_threads, processes)
             # with multiprocessing.Pool(processes=multiprocessing.cpu_count()//2, initializer=init_worker_build_GT, initargs=(mesh_file, path_instances)) as pool:
-            with multiprocessing.Pool(processes=min(48, multiprocessing.cpu_count()//2), initializer=init_worker_build_GT, initargs=(temp_path, path_instances)) as pool:
+            with multiprocessing.Pool(processes=processes), initializer=init_worker_build_GT, initargs=(temp_path, path_instances)) as pool:
                 # PC instance path from node name
                 blocks_tar_files = glob.glob(path_instances + '/*.tar')
                 ## multithread
@@ -1595,7 +1598,7 @@ class ScrollGraph(Graph):
         print(f"Adjusted winding angles for {count_adjusted_nodes_windings} nodes.")
 
     
-    def build_graph(self, path_instances, start_point, num_processes=4, prune_unconnected=False, start_fresh=True, gt_mesh_file=None, continue_from=0, update_edges=False):
+    def build_graph(self, path_instances, start_point, num_processes=4, prune_unconnected=False, start_fresh=True, gt_mesh_file=None, continue_from=0, update_edges=False, max_threads=-1):
         #from original coordinates to instance coordinates
         start_block, patch_id = (0, 0, 0), 0
         self.start_block, self.patch_id, self.start_point = start_block, patch_id, start_point
@@ -1692,7 +1695,7 @@ class ScrollGraph(Graph):
 
         # Add GT data to nodes
         if gt_mesh_file is not None:
-            self.add_ground_truth_from_mesh(path_instances, gt_mesh_file, continue_from=continue_from) # TODO
+            self.add_ground_truth_from_mesh(path_instances, gt_mesh_file, continue_from=continue_from, max_threads=max_threads) # TODO
 
         return start_block, patch_id
     
@@ -2063,7 +2066,7 @@ def compute(overlapp_threshold, start_point, path, recompute=False, stop_event=N
                 count_gt_added += 1
         print(f"Number of nodes with GT winding angle: {count_gt_added}")
         num_processes = max(1, cpu_count() - 2)
-        start_block, patch_id = scroll_graph.build_graph(path, num_processes=num_processes, start_point=start_point, prune_unconnected=False, start_fresh=start_fresh, gt_mesh_file=gt_mesh_file, continue_from=continue_from, update_edges=update_edges)
+        start_block, patch_id = scroll_graph.build_graph(path, num_processes=num_processes, start_point=start_point, prune_unconnected=False, start_fresh=start_fresh, gt_mesh_file=gt_mesh_file, continue_from=continue_from, update_edges=update_edges, max_threads=overlapp_threshold["max_threads"])
         print("Saving built graph...")
         scroll_graph.save_graph(recompute_path)
     
