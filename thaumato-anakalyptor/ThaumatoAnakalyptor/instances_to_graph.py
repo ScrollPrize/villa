@@ -1206,27 +1206,31 @@ def worker_build_GT(args):
                 # Still 0 percent -> no patch in this subvolume is valid
                 if percentage_valid == 0.0:
                     break
-                
-    if os.path.isfile(filename):
-        # Handle .tar files
-        if filename.endswith(".tar"):
-            with tarfile.open(filename, 'r') as archive, tempfile.TemporaryDirectory() as temp_dir:
-                # Extract all .ply files at once
-                archive.extractall(path=temp_dir, members=archive.getmembers())
-                ply_files = [os.path.join(temp_dir, m.name) for m in archive.getmembers() if m.name.endswith(".ply")]
-                process_ply_files(ply_files)
-                        
-        # Handle .7z files
-        elif filename.endswith(".7z"):
-            with py7zr.SevenZipFile(filename, 'r') as archive, tempfile.TemporaryDirectory() as temp_dir:
-                archive.extractall(path=temp_dir)
-                # List all extracted .ply files
-                ply_files = [
-                    os.path.join(root, file)
-                    for root, _, files in os.walk(temp_dir)
-                    for file in files if file.endswith(".ply")
-                ]
-                process_ply_files(ply_files)
+
+    try:   
+        if os.path.isfile(filename):
+            # Handle .tar files
+            if filename.endswith(".tar"):
+                with tarfile.open(filename, 'r') as archive, tempfile.TemporaryDirectory() as temp_dir:
+                    # Extract all .ply files at once
+                    archive.extractall(path=temp_dir, members=archive.getmembers())
+                    ply_files = [os.path.join(temp_dir, m.name) for m in archive.getmembers() if m.name.endswith(".ply")]
+                    process_ply_files(ply_files)
+                            
+            # Handle .7z files
+            elif filename.endswith(".7z"):
+                with py7zr.SevenZipFile(filename, 'r') as archive, tempfile.TemporaryDirectory() as temp_dir:
+                    archive.extractall(path=temp_dir)
+                    # List all extracted .ply files
+                    ply_files = [
+                        os.path.join(root, file)
+                        for root, _, files in os.walk(temp_dir)
+                        for file in files if file.endswith(".ply")
+                    ]
+                    process_ply_files(ply_files)
+    except Exception as e:
+        print(f"Error processing {filename}: {e}")
+        return []
 
     return nodes_winding_alignment
     
