@@ -1549,7 +1549,7 @@ class ScrollGraph(Graph):
             if max_threads > 0:
                     processes = min(max_threads, processes)
             # with multiprocessing.Pool(processes=multiprocessing.cpu_count()//2, initializer=init_worker_build_GT, initargs=(mesh_file, path_instances)) as pool:
-            with multiprocessing.Pool(processes=processes), initializer=init_worker_build_GT, initargs=(temp_path, path_instances)) as pool:
+            with multiprocessing.Pool(processes=processes, initializer=init_worker_build_GT, initargs=(temp_path, path_instances)) as pool:
                 # PC instance path from node name
                 blocks_tar_files = glob.glob(path_instances + '/*.tar')
                 ## multithread
