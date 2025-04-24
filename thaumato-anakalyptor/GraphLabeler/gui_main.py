@@ -78,6 +78,7 @@ class PointCloudLabeler(QMainWindow):
         self.undo_stack = []
         self.redo_stack = []
         self._stroke_backup = None
+        self.gt_labels = None
         
         # Spline storage.
         self.spline_items = []
@@ -305,7 +306,7 @@ class PointCloudLabeler(QMainWindow):
 
         # --- Solver selection dropdown ---
         self.solver_combo = QComboBox()
-        self.solver_combo.addItems(["F*", "Linear", "F*3", "F*4", "Ripple", "Smooth", "Ripple Smooth Combined", "F*Slab", "Winding Number", "Union", "Random", "Set Labels"])
+        self.solver_combo.addItems(["F*", "Linear", "F*3", "F*4", "Ripple", "Smooth", "Ripple Smooth Combined", "F*Slab", "Winding Number", "Union", "Random", "Create Good Edges", "Set Labels"])
         top_controls_layout.addWidget(QLabel("Select Solver:"))
         top_controls_layout.addWidget(self.solver_combo)
 
@@ -397,6 +398,16 @@ class PointCloudLabeler(QMainWindow):
         self.radius_widget, self.radius_slider, self.radius_spinbox = create_sync_slider_spinbox(
             "Drawing radius:", 0.1, 20.0, 3.5, 1.0, self.update_views, decimals=1)
         common_controls_layout.addWidget(self.radius_widget)
+
+        solve_other_block_r_layout = QHBoxLayout()
+        self.solve_other_block_r_spinbox = QDoubleSpinBox()
+        self.solve_other_block_r_spinbox.setRange(0, 100)
+        self.solve_other_block_r_spinbox.setDecimals(2)
+        self.solve_other_block_r_spinbox.setSingleStep(1.0)
+        self.solve_other_block_r_spinbox.setValue(10)
+        solve_other_block_r_layout.addWidget(QLabel("Good Edges R:"))
+        solve_other_block_r_layout.addWidget(self.solve_other_block_r_spinbox)
+        common_controls_layout.addLayout(solve_other_block_r_layout)
         
         max_disp_layout = QHBoxLayout()
         max_disp_label = QLabel("Max Display Points:")
@@ -421,6 +432,16 @@ class PointCloudLabeler(QMainWindow):
         self.show_guides_checkbox.setChecked(True)
         common_controls_layout.addWidget(self.show_guides_checkbox)
         self.show_guides_checkbox.toggled.connect(self.update_guides)
+
+        # Button to toggle GT label display
+        self.show_gt_labels_button = QPushButton("Show GT Labels")
+        self.show_gt_labels_button.setCheckable(True)
+        self.show_gt_labels_button.clicked.connect(self.toggle_gt_labels)
+        common_controls_layout.addWidget(self.show_gt_labels_button)
+
+        self.gt_to_group_button = QPushButton("GT to Group")
+        self.gt_to_group_button.clicked.connect(self.gt_labels_to_group)
+        common_controls_layout.addWidget(self.gt_to_group_button)
         
         self.pipette_button = QPushButton("Pipette")
         self.pipette_button.clicked.connect(self.activate_pipette)
@@ -1320,6 +1341,39 @@ class PointCloudLabeler(QMainWindow):
         self.group[mask] = 0
         self.update_views()
 
+    def toggle_gt_labels(self):
+        if self.show_gt_labels_button.isChecked():
+            gt_f_stars, indices = self.solver.get_gt_f_star()
+            gt_f_stars = np.array(gt_f_stars)
+            indices = np.array(indices)
+            print(f"Dtype of gt_f_stars: {gt_f_stars.dtype}")
+            print(f"Length of gt_f_stars: {len(gt_f_stars)}")
+            print(f"Dtype of indices: {indices.dtype}")
+            print(f"Length of indices: {len(indices)}")
+            indices = indices.astype(np.int32)
+
+            self.gt_labels = np.zeros(len(self.points), dtype=np.int32) + self.UNLABELED * 360.0
+            self.gt_labels[indices] = np.array(gt_f_stars)
+            self.update_views()
+        else:
+            self.gt_labels = None
+            self.update_views()
+
+    def gt_labels_to_group(self):
+        gt_f_stars, indices = self.solver.get_gt_f_star()
+        indices = np.array(indices, dtype=np.int32)
+        gt_wrap_nrs = np.array(gt_f_stars) / 360.0
+        gt_wrap_nrs = np.round(gt_wrap_nrs).astype(np.int32)
+        if len(gt_wrap_nrs) == 0:
+            print("No GT labels found.")
+            return
+        # Track undo/redo
+        self.undo_stack.append((self.labels.copy(), self.group.copy()))
+        self.redo_stack = []
+        new_group_nr = np.max(self.group) + 1
+        self.group[indices] = new_group_nr
+        self.labels[indices] = gt_wrap_nrs
+
     def update_group(self, val):
         self.active_group = val
         self.update_views()
@@ -1527,6 +1581,24 @@ class PointCloudLabeler(QMainWindow):
                         brushes[idx] = self.brush_green_inactive
                     elif mod[j] == 2:
                         brushes[idx] = self.brush_brown_inactive
+        return brushes
+    
+    def update_brushes_gt(self, brushes, gt_f_stars):
+        for i, label in enumerate(gt_f_stars):
+            if abs(label/360.0 - self.UNLABELED) > 2:
+                # New brush, use color gradient r g b for each 360 deg one step
+                # 0 -> red, 360 -> green, 720 -> blue
+                label_mod = label % 1080
+                if label_mod < 360:
+                    rest = label_mod / 360
+                    color = (255 * (1 - rest), 255 * rest, 0)
+                elif label_mod < 720:
+                    rest = (label_mod - 360) / 360
+                    color = (0, 255 * (1 - rest), 255 * rest)
+                else:
+                    rest = (label_mod - 720) / 360
+                    color = (255 * rest, 0, 255 * (1 - rest))
+                brushes[i] = pg.mkBrush(color[0], color[1], color[2], 150)
         return brushes
     
     def _enable_pencil(self, plot_widget, scatter_item, view_name='xy'):
@@ -1946,11 +2018,19 @@ class PointCloudLabeler(QMainWindow):
         keep_indices_xy = self.downsample_points(pts_combined, self.max_display, axis='xy')
         # Downsample all data
         pts_combined, original_pts_combined, labels_combined, group_combined, calc_labels_combined = pts_combined[keep_indices_xy], original_pts_combined[keep_indices_xy], labels_combined[keep_indices_xy], group_combined[keep_indices_xy], calc_labels_combined[keep_indices_xy]
+        if self.gt_labels is not None:
+            gt_labels_xy = self.gt_labels[mask_xy]
+            gt_labels_top = gt_labels_xy[mask_top] - 1
+            gt_labels_bottom = gt_labels_xy[mask_bottom] + 1
+            gt_labels_combined = np.concatenate([gt_labels_xy, gt_labels_top, gt_labels_bottom], axis=0)
+            gt_labels_combined = gt_labels_combined[keep_indices_xy]
         t5 = time.time()
         # print("Step 5 (XY: combine & downsample):", t5 - t4, "s")
         
         # ----- Compute new brushes for XY view -----
         new_brushes_xy = self.get_brushes_from_labels(labels_combined, group_combined, original_pts_combined)
+        if self.gt_labels is not None:
+            new_brushes_xy = self.update_brushes_gt(new_brushes_xy, gt_labels_combined)
         t6 = time.time()
         # print("XY Step 6 (brushes):", t6 - t5, "s")
         
@@ -2054,8 +2134,13 @@ class PointCloudLabeler(QMainWindow):
         pts_xz_display[:, 0] = new_x_xz
         keep_indices_xz = self.downsample_points(pts_xz_display, max_display=self.max_display, axis='xz')
         pts_xz_display, original_pts_xz, labels_xz, group_xz = pts_xz_display[keep_indices_xz], original_pts_xz[keep_indices_xz], labels_xz[keep_indices_xz], group_xz[keep_indices_xz] # Downsample all data
+        if self.gt_labels is not None:
+            gt_labels_xz = self.gt_labels[mask_xz]
+            gt_labels_xz = gt_labels_xz[keep_indices_xz]
         new_xz_geometry = {'x': pts_xz_display[:, 0], 'y': pts_xz_display[:, 2]}
         new_brushes_xz = self.get_brushes_from_labels(labels_xz, group_xz, original_pts_xz)
+        if self.gt_labels is not None:
+            new_brushes_xz = self.update_brushes_gt(new_brushes_xz, gt_labels_xz)
         t8 = time.time()
         # print("XZ Step 8 (processing & downsampling):", t8 - t7b, "s")
         
@@ -2917,7 +3002,7 @@ class PointCloudLabeler(QMainWindow):
             if selected_solver == "Winding Number":
                 self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1,
                                                  other_block_factor=15.0, side_fix_nr=-1, display=False)
-            elif "F*" in selected_solver or selected_solver in ["Linear", "Ripple", "Smooth", "Ripple Smooth Combined"]:
+            elif "F*" in selected_solver or selected_solver in ["Linear", "Ripple", "Smooth", "Ripple Smooth Combined", "Create Good Edges"]:
                 if self.seed_node is None:
                     self.seed_node = self.find_seed_node(deleted_mask_previous=deleted_mask_previous, extra_z_range=extra_z_range)
                 if self.seed_node is not None:
@@ -2940,8 +3025,8 @@ class PointCloudLabeler(QMainWindow):
                 elif selected_solver == "Smooth":
                     self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, o=0.0, step_sigma=360.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True)
                 elif selected_solver == "Ripple Smooth Combined":
-                    self.solver.solve_f_star(num_iterations=int(3 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=False)
-                    self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=360.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=False)
+                    self.solver.solve_f_star(num_iterations=int(3 * self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True)
+                    self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value() / 4), spring_constant=1.0, o=0.0, step_sigma=360.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True)
                 elif selected_solver == "F*Slab":
                     self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True, adjust_median=False, blow_away=True)
                     self.solver.solve_f_star(num_iterations=int(self.solve_iterations_spinbox.value()//2), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True, adjust_median=False, blow_away=False)
@@ -2949,6 +3034,8 @@ class PointCloudLabeler(QMainWindow):
                     self.solver.solve_f_star_with_labels(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, other_block_factor=other_block_factor, lr=0.25, error_cutoff=-1.0, display=True)
                     # self.solver.solve_f_star_with_labels(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, other_block_factor=other_block_factor, lr=0.05, error_cutoff=-1.0, display=True)
                     self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1, other_block_factor=15.0, side_fix_nr=-1, display=False)
+                elif selected_solver == "Create Good Edges":
+                    self.solver.label_good_neighbors(r=self.solve_other_block_r_spinbox.value(), delta_neg=180.0, delta_top=10.0, delta_perfect=5.0, min_neighbors=5)
 
                 if self.use_z_range_checkbox.isChecked() or self.use_fstar_range_checkbox.isChecked():
                     print(f"Resetting z-range, length: {len(undeleted)}")

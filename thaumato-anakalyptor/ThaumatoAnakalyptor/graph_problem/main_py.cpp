@@ -24,6 +24,7 @@ Julian Schilliger 2024 ThaumatoAnakalyptor
 #include <queue>
 #include <numeric>
 #include "mst_union.h"
+#include "neighbor_score.h"
 
 namespace fs = std::filesystem;
 namespace py = pybind11;
@@ -932,6 +933,21 @@ class Solver {
                 graph[index].f_tilde = f_stars[i];
             }
         }
+        std::tuple<std::vector<float>, std::vector<size_t>> get_gt_f_star() {
+            // get gt f star
+            std::vector<float> gt_f_star;
+            std::vector<size_t> valid_indices = get_valid_indices(graph);
+            std::vector<size_t> gt_indices;
+            for (size_t i = 0; i < valid_indices.size(); ++i) {
+                size_t index = valid_indices[i];
+                if (graph[index].gt) {
+                    gt_f_star.push_back(graph[index].gt_f_star);
+                    gt_indices.push_back(i);
+                }
+            }
+            return std::make_tuple(gt_f_star, gt_indices);
+        }
+
         void largest_connected_component() {
             find_largest_connected_component(graph);
             nr_nodes = get_valid_indices(graph).size();
@@ -1019,7 +1035,20 @@ class Solver {
             auto [mean_local, min_local, q1_local, median_local, q3_local, max_local] = computeLocalizedError(graph_copy, valid_gt_indices, 100, 187); // 187 patches breath = radius of 30cm local area covered. 
             std::cout << "After assigning winding angles with Prim MST. Mean Error to GT: " << mean << ", Min: " << min << ", Q1: " << q1 << ", Median: " << median << ", Q3: " << q3 << ", Max: " << max << " | Localized Error: " << mean_local << ", Min: " << min_local << ", Q1: " << q1_local << ", Median: " << median_local << ", Q3: " << q3_local << ", Max: " << max_local << std::endl;
         }
-};
+
+        // Identify nodes with strong local f_star coherence, add edges, and return neighbors within delta_top
+        // Identify nodes with strong local f_star coherence, add edges, and return neighbors within delta_top
+        std::map<size_t, std::vector<size_t>> label_good_neighbors(
+            float r,
+            float delta_neg,
+            float delta_top,
+            float delta_perfect,
+            float sample_fraction = 0.01f,
+            size_t min_neighbors = 30)
+        {
+            return find_good_neighbors_and_add_edges(graph, r, delta_neg, delta_top, delta_perfect, sample_fraction, min_neighbors);
+        }
+    };
 
 PYBIND11_MODULE(graph_problem_gpu_py, m) {
     m.doc() = "pybind11 module for python solver class";
@@ -1164,6 +1193,8 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
         .def("set_positions", &Solver::set_positions,
             "Method to set the f star values of the graph",
             py::arg("f_stars"))
+        .def("get_gt_f_star", &Solver::get_gt_f_star,
+            "Method to get the ground truth f star values of the graph")
         .def("load_graph", &Solver::load_graph,
             "Method to load the graph from a binary file",
             py::arg("graph_path"))
@@ -1176,7 +1207,10 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
         .def("generate_ply", &Solver::generate_ply)
         .def("solution_loss", &Solver::solution_loss,
             "Method to calculate the solution loss",
-            py::arg("use_sides") = true);
+            py::arg("use_sides") = true)
+        .def("label_good_neighbors", &Solver::label_good_neighbors,
+            "Identify nodes with strong local f_star coherence, add edges, and return neighbors within delta_top",
+            py::arg("r"), py::arg("delta_neg"), py::arg("delta_top"), py::arg("delta_perfect"), py::arg("sample_fraction") = 0.01f, py::arg("min_neighbors") = 30);
 }
 
 // Example command to run the program: ./build/graph_problem --input_graph graph.bin --output_graph output_graph.bin --auto --auto_num_iterations 2000 --video --z_min 5000 --z_max 7000 --num_iterations 5000 --estimated_windings 160 --steps 3 --spring_constant 1.2
