@@ -1,4 +1,5 @@
 import sys, os, ast, numpy as np
+import math
 import json
 from PyQt5.QtWidgets import (
     QSplitter, QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -131,6 +132,26 @@ class PointCloudLabeler(QMainWindow):
         self.calc_brush_green = pg.mkBrush(0, 255, 0, 80)
         self.calc_brown_blue  = pg.mkBrush(218,165,32, 80)
         self.transparent_brush = pg.mkBrush(0, 0, 0, 0)
+        # Additional brushes for 4/5 color modes
+        self.brush_blue_active = pg.mkBrush(0, 0, 255)
+        self.brush_blue_inactive = pg.mkBrush(0, 0, 205, 180)
+        self.brush_yellow_active = pg.mkBrush(255, 255, 0)
+        self.brush_yellow_inactive = pg.mkBrush(205, 205, 0, 180)
+        # Lists for dynamic color selection
+        self.active_brushes = [
+            self.brush_red_active,
+            self.brush_green_active,
+            self.brush_brown_active,
+            self.brush_blue_active,
+            self.brush_yellow_active]
+        self.inactive_brushes = [
+            self.brush_red_inactive,
+            self.brush_green_inactive,
+            self.brush_brown_inactive,
+            self.brush_blue_inactive,
+            self.brush_yellow_inactive]
+        # Load number of colors from config (default 3)
+        self.num_colors = self.config.get("num_colors", 3)
 
         cornflower_blue = (100, 149, 237)  # Cornflower Blue
         medium_orchid   = (186, 85, 211)   # Medium Orchid (a purple shade)
@@ -476,6 +497,20 @@ class PointCloudLabeler(QMainWindow):
         self.save_graph_button = QPushButton("Save Labeled Graph")
         self.save_graph_button.clicked.connect(self.save_graph)
         common_controls_layout.addWidget(self.save_graph_button)
+        # Color mode buttons
+        self.colors4_button = QPushButton("4 Colors")
+        self.colors4_button.setCheckable(True)
+        self.colors5_button = QPushButton("5 Colors")
+        self.colors5_button.setCheckable(True)
+        common_controls_layout.addWidget(self.colors4_button)
+        common_controls_layout.addWidget(self.colors5_button)
+        self.colors4_button.clicked.connect(lambda checked: self._on_colors_toggled(4, checked))
+        self.colors5_button.clicked.connect(lambda checked: self._on_colors_toggled(5, checked))
+        # Restore color mode from config
+        if self.num_colors == 4:
+            self.colors4_button.setChecked(True)
+        elif self.num_colors == 5:
+            self.colors5_button.setChecked(True)
         
         main_layout.addLayout(common_controls_layout)
 
@@ -630,6 +665,18 @@ class PointCloudLabeler(QMainWindow):
         self.xz_plot.scene().installEventFilter(self)
         
         self.update_slider_ranges()
+
+        # Restore Z slice settings from config
+        if "z_slice_center" in self.config:
+            self.z_center_spinbox.setValue(self.config["z_slice_center"])
+        if "z_slice_thickness" in self.config:
+            self.z_thickness_spinbox.setValue(self.config["z_slice_thickness"])
+        # Restore f_init slice settings from config
+        if "f_init_center" in self.config:
+            self.finit_center_spinbox.setValue(self.config["f_init_center"])
+        if "f_init_thickness" in self.config:
+            self.finit_thickness_spinbox.setValue(self.config["f_init_thickness"])
+
         self.update_guides()
         self.update_views()
 
@@ -661,6 +708,12 @@ class PointCloudLabeler(QMainWindow):
             self.config["h5_path"] = self.h5_path
         if self.umbilicus_path:
             self.config["umbilicus_path"] = self.umbilicus_path
+        # Save slice and color settings
+        self.config["z_slice_center"] = self.z_center_spinbox.value()
+        self.config["z_slice_thickness"] = self.z_thickness_spinbox.value()
+        self.config["f_init_center"] = self.finit_center_spinbox.value()
+        self.config["f_init_thickness"] = self.finit_thickness_spinbox.value()
+        self.config["num_colors"] = self.num_colors
         save_config(self.config, "config_labeling_gui.json")
         event.accept()
     
@@ -845,6 +898,12 @@ class PointCloudLabeler(QMainWindow):
                 self.config["h5_path"] = self.h5_path
             if self.umbilicus_path:
                 self.config["umbilicus_path"] = self.umbilicus_path
+            # Save slice and color settings
+            self.config["z_slice_center"] = self.z_center_spinbox.value()
+            self.config["z_slice_thickness"] = self.z_thickness_spinbox.value()
+            self.config["f_init_center"] = self.finit_center_spinbox.value()
+            self.config["f_init_thickness"] = self.finit_thickness_spinbox.value()
+            self.config["num_colors"] = self.num_colors
             save_config(self.config, fname)
 
     def load_data(self):
@@ -1164,6 +1223,26 @@ class PointCloudLabeler(QMainWindow):
         else:
             effective_y = y
         return np.asarray(self.kdtree_xy.query_ball_point([x, effective_y], r=r), dtype=np.int32)
+    
+    def _interpolate_path(self, path, r):
+        """
+        Densify a list of (x,y) points so no segment exceeds half the radius r.
+        """
+        if not path:
+            return []
+        step = r * 0.5
+        interp = []
+        for (x0, y0), (x1, y1) in zip(path, path[1:]):
+            interp.append((x0, y0))
+            dx = x1 - x0; dy = y1 - y0
+            dist = math.hypot(dx, dy)
+            if dist > step:
+                n = int(dist / step)
+                for k in range(1, n + 1):
+                    t = k / (n + 1)
+                    interp.append((x0 + t * dx, y0 + t * dy))
+        interp.append(path[-1])
+        return interp
     
     def update_guides(self):
         # ---------------------------
@@ -1563,24 +1642,17 @@ class PointCloudLabeler(QMainWindow):
             valid_labels = labels_array[mask_valid]
             valid_groups = group_array[mask_valid]
             mask_active_group = valid_groups == self.active_group
-            mod = valid_labels % 3
+            # Cycle labels over current number of colors
+            mod = valid_labels % self.num_colors
             for j, idx in enumerate(valid_indices):
+                # Teflon hiding logic
                 if valid_groups[j] == 0 and (abs(valid_labels[j] - self.teflon_label) < 2) and self.hide_teflon_checkbox.isChecked():
                     brushes[idx] = self.transparent_brush
-                elif mask_active_group[j]:
-                    if mod[j] == 0:
-                        brushes[idx] = self.brush_red_active
-                    elif mod[j] == 1:
-                        brushes[idx] = self.brush_green_active
-                    elif mod[j] == 2:
-                        brushes[idx] = self.brush_brown_active
                 else:
-                    if mod[j] == 0:
-                        brushes[idx] = self.brush_red_inactive
-                    elif mod[j] == 1:
-                        brushes[idx] = self.brush_green_inactive
-                    elif mod[j] == 2:
-                        brushes[idx] = self.brush_brown_inactive
+                    if mask_active_group[j]:
+                        brushes[idx] = self.active_brushes[mod[j]]
+                    else:
+                        brushes[idx] = self.inactive_brushes[mod[j]]
         return brushes
     
     def update_brushes_gt(self, brushes, gt_f_stars):
@@ -1600,6 +1672,25 @@ class PointCloudLabeler(QMainWindow):
                     color = (255 * rest, 0, 255 * (1 - rest))
                 brushes[i] = pg.mkBrush(color[0], color[1], color[2], 150)
         return brushes
+    
+    def _on_colors_toggled(self, num, checked):
+        """
+        Handler for 4/5 color toggle buttons. Sets num_colors and updates views.
+        """
+        if checked:
+            self.num_colors = num
+            # Ensure mutual exclusivity
+            if num == 4:
+                self.colors5_button.setChecked(False)
+            elif num == 5:
+                self.colors4_button.setChecked(False)
+        else:
+            # Revert to default 3 colors
+            self.num_colors = 3
+        # Save to config
+        self.config["num_colors"] = self.num_colors
+        # save_config(self.config, "config_labeling_gui.json")
+        self.update_views()
     
     def _enable_pencil(self, plot_widget, scatter_item, view_name='xy'):
         scatter_item.mousePressEvent = lambda ev: self._on_mouse_press(ev, plot_widget, view_name)
@@ -1753,6 +1844,8 @@ class PointCloudLabeler(QMainWindow):
         to update self.labels and self.group, preserving wrap‑around logic.
         """
         r    = self.radius_spinbox.value()
+        # densify stroke points so gaps are smaller than brush radius/2
+        data_path = self._interpolate_path(data_path, r)
         zc   = self.z_center_spinbox.value()
         half = self.z_thickness_slider.value() / self.scaleFactor / 2
         grp  = self.active_group
@@ -1789,33 +1882,50 @@ class PointCloudLabeler(QMainWindow):
         Apply the brush stroke (given as a list of data‐space (f_star, Z) points)
         to update self.labels and self.group, respecting the current f_init slab.
         """
-        # brush radius in data coords
-        r    = self.radius_spinbox.value()
-        # center and half‐thickness of the f_init slab
-        fc   = self.finit_center_spinbox.value()
+        """
+        Apply the brush stroke in the XZ view to update labels and group, using display-space
+        coordinates that include the current XZ shear transform.
+        """
+        # brush radius in display-space units
+        r = self.radius_spinbox.value()
+        # densify stroke points so gaps are smaller than brush radius/2
+        data_path = self._interpolate_path(data_path, r)
+        # f_init slab center and half-thickness
+        fc = self.finit_center_spinbox.value()
         half = self.finit_thickness_slider.value() / self.scaleFactor / 2
-        grp  = self.active_group
+        grp = self.active_group
         base = self.label_spinbox.value()
 
-        # collect all hit indices
+        # shear factor for XZ view
+        shear_factor = np.tan(np.radians(self.xz_shear_spinbox.value()))
+        # select indices within the f_init slab
+        slab_mask = (self.points[:, 1] >= (fc - half)) & (self.points[:, 1] <= (fc + half))
+        slab_indices = np.nonzero(slab_mask)[0]
+        if slab_indices.size == 0:
+            return
+        # compute display-space coordinates for slab points
+        pts = self.points[slab_indices]
+        x_disp = pts[:, 0] + shear_factor * (pts[:, 1] - fc)
+        z_disp = pts[:, 2]
+        coords = np.vstack([x_disp, z_disp]).T
+        # build a temporary KD-tree on display coords
+        tree = cKDTree(coords)
+
         hit = set()
         for xf, z in data_path:
-            # query in (f_star, Z) space
-            idxs = self.kdtree_xz.query_ball_point([xf, z], r=r)
-            for i in idxs:
-                # only if the original Y = f_init is in the current slab
-                if (fc - half) <= self.points[i, 1] <= (fc + half):
-                    hit.add(i)
+            # find slab points near the stroke path in display space
+            rel_idxs = tree.query_ball_point([xf, z], r=r)
+            for j in rel_idxs:
+                hit.add(slab_indices[j])
 
         if not hit:
             return
 
-        # assign label and group
+        # assign label and group to all hit points
         for i in hit:
             self.labels[i] = base
-            self.group[i]  = grp
+            self.group[i] = grp
 
-        # repaint both views
         self.update_views()
 
     def _paint_points(self, ev, plot_widget, view_name):
@@ -1959,6 +2069,8 @@ class PointCloudLabeler(QMainWindow):
         # print(f"Time to update calc labels: {end_time - start_time:.4f} s, Time to update views: {end_time2 - end_time:.4f} s")
 
     def update_views(self, val=None):
+        if not hasattr(self, 'xy_scatter'):
+            return
         t0 = time.time()
         # ----- Compute z-slice values -----
         z_center = self.z_center_spinbox.value()
