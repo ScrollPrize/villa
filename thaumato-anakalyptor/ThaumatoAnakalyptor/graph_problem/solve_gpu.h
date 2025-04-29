@@ -18,9 +18,24 @@ std::vector<Node> run_solver_random(std::vector<Node>& graph, int num_iterations
 
 void filter_graph_sides(std::vector<Node>& graph);
 void filter_graph_f_star(std::vector<Node>& graph, float f_star_threshold);
+// Tugging solver: f_star with neighbor-based tugging adjustments and full solver parameters
+std::vector<Node> run_solver_tugging(
+    std::vector<Node>& graph,
+    int num_iterations,
+    std::vector<size_t>& valid_indices,
+    Edge** h_all_edges,
+    float** h_all_sides,
+    int i_round,
+    float o,
+    float spring_constant,
+    float step_sigma,
+    float distribute,
+    float diff_step
+);
 
 float min_f_star(const std::vector<Node>& graph, bool use_gt = false);
 float max_f_star(const std::vector<Node>& graph, bool use_gt = false);
+std::pair<float, float> min_max_percentile_f_star(const std::vector<Node>& graph, float percentile, bool use_gt = false);
 
 void calculate_histogram(const std::vector<Node>& graph, const std::string& filename = std::string(), int num_buckets = 1000);
 void calculate_happyness_histogram(const std::vector<Node>& graph, const std::string& filename = std::string(), int num_buckets = 1000);

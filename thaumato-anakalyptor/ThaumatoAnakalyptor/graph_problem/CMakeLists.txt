@@ -54,7 +54,7 @@ endif()
 
 if(ENABLE_GPU)
     # Add the executable for the GPU version
-    add_executable(graph_problem_gpu main_gpu.cpp solve_gpu.cu node_structs.cpp)
+    add_executable(graph_problem_gpu main_gpu.cpp solve_gpu.cu solve_tugging.cu node_structs.cpp)
 
     # Include the directory where argparse.hpp and other headers are located for the GPU version
     target_include_directories(graph_problem_gpu PRIVATE ${CMAKE_SOURCE_DIR})
@@ -101,7 +101,7 @@ link_directories(${Python_LIBRARY_DIRS})
 add_subdirectory(pybind11)  # Ensure pybind11 is added to the project
 
 # Add a Python module with pybind11
-pybind11_add_module(graph_problem_gpu_py main_py.cpp solve_gpu.cu mean_solver.cu mst_union.cpp node_structs.cpp neighbor_score.cpp)
+pybind11_add_module(graph_problem_gpu_py main_py.cpp solve_gpu.cu solve_tugging.cu mean_solver.cu mst_union.cpp node_structs.cpp neighbor_score.cpp)
 
 # Include directories for Python module
 target_include_directories(graph_problem_gpu_py PRIVATE ${CMAKE_SOURCE_DIR})

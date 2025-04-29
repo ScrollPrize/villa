@@ -7,6 +7,7 @@ Julian Schilliger 2024 ThaumatoAnakalyptor
 #include <pybind11/stl.h>
 
 #include "solve_gpu.h"
+#include "solve_tugging.h"
 #include "mean_solver.h"
 #include <opencv2/opencv.hpp>
 #include <iostream>
@@ -777,6 +778,36 @@ class Solver {
             std::vector<size_t> valid_indices = get_valid_indices(graph);
             graph = run_solver_random(graph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, display);
         }
+        // tugging-based f_star refinement solver
+        void solve_tugging(
+            int num_iterations,
+            int i_round = 1,
+            float o = 0.0f,
+            float spring_constant = 1.2f,
+            float step_sigma = 360.0f,
+            float distribute = 0.5f,
+            float diff_step = 0.1f,
+            bool visualize = false)
+        {
+            auto [undeleted_mask, count_undeleted] = get_undeleted_mask();
+            std::vector<Node> subgraph = createSubgraph(graph, undeleted_mask);
+            std::vector<size_t> valid_indices = get_valid_indices(subgraph);
+            run_solver_tugging(
+                subgraph,
+                num_iterations,
+                valid_indices,
+                &h_all_edges,
+                &h_all_sides,
+                i_round,
+                o,
+                spring_constant,
+                step_sigma,
+                distribute,
+                diff_step,
+                visualize
+            );
+            updateGraphWithSubgraph(graph, undeleted_mask, subgraph);
+        }
         void assign_f_star(std::vector<Node>& graph) {
             // assign winding angles to f star
             for (size_t i = 0; i < graph.size(); ++i) {
@@ -1169,6 +1200,16 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("num_iterations") = 10000,
             py::arg("i_round") = 1,
             py::arg("display") = true)
+        .def("solve_tugging", &Solver::solve_tugging,
+            "Refine f_star with neighbor tugging and full solver parameters",
+            py::arg("num_iterations") = 10000,
+            py::arg("i_round") = 1,
+            py::arg("o") = 0.0f,
+            py::arg("spring_constant") = 1.2f,
+            py::arg("step_sigma") = 360.0f,
+            py::arg("distribute") = 0.5f,
+            py::arg("diff_step") = 0.1f,
+            py::arg("visualize") = false)
         .def("save_solution", &Solver::save_solution,
             "Method to save the final solution of the graph",
             py::arg("graph_path"))
