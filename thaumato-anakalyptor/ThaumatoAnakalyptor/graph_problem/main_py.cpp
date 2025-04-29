@@ -836,8 +836,9 @@ class Solver {
                 graph[i].deleted = deleted[i];
             }
         }
-        void load_graph(std::string graph_path) {
-            graph = loadGraph(graph_path, 0); // old graph version as default for now, switch over to 1 when new graphs arrive
+        void load_graph(std::string graph_path, int version = 0) {
+            std::cout << "Loading graph from: " << graph_path << " version: " << version << std::endl;
+            graph = loadGraph(graph_path, version); // old graph version as default for now, switch over to 1 when new graphs arrive
             // try {
             //     graph = loadGraph(graph_path, 1);
             // }
@@ -1238,7 +1239,8 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             "Method to get the ground truth f star values of the graph")
         .def("load_graph", &Solver::load_graph,
             "Method to load the graph from a binary file",
-            py::arg("graph_path"))
+            py::arg("graph_path"),
+            py::arg("version") = 0)
         .def("save_graph", &Solver::save_graph)
         .def("largest_connected_component", &Solver::largest_connected_component)
         .def("unfix", &Solver::unfix)
