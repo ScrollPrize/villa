@@ -156,6 +156,13 @@ def run_f_star(solver, experiment_name="", continue_from=0, visualize=False):
         # solver.solve_f_star(num_iterations=15000, spring_constant=0.9, o=0.02, i_round=9, visualize=visualize)
         # solver.solve_f_star(num_iterations=15000, spring_constant=1.1, o=0.0, i_round=10, visualize=visualize)
         solver.save_graph(save_path)
+    elif continue_from == 2:
+        solver.load_graph(save_path)
+
+    save_path = f"experiments/{experiment_name}/checkpoints/checkpoint_graph_tugging.bin"
+    if continue_from <= 2:
+        solver.solve_tugging(num_iterations=50000, spring_constant=1.0, step_sigma=520.0, o=0.0, i_round=2, visualize=visualize, distribute=0.3, diff_step=0.0000040)
+        solver.save_graph(save_path)
     else:
         solver.load_graph(save_path)
 

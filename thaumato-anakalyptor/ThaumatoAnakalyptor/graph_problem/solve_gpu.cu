@@ -2398,7 +2398,7 @@ float max_happyness(const std::vector<Node>& graph) {
     return max_h;
 }
 
-std::pair<float, float> min_max_percentile_f_star(const std::vector<Node>& graph, float percentile, bool use_gt = false) {
+std::pair<float, float> min_max_percentile_f_star(const std::vector<Node>& graph, float percentile, bool use_gt) {
     std::vector<float> f_star_values;
     for (const auto& node : graph) {
         if (node.deleted) {

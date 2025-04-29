@@ -327,7 +327,7 @@ class PointCloudLabeler(QMainWindow):
 
         # --- Solver selection dropdown ---
         self.solver_combo = QComboBox()
-        self.solver_combo.addItems(["F*", "Linear", "F*3", "F*4", "Ripple", "Smooth", "Ripple Smooth Combined", "F*Slab", "Winding Number", "Union", "Random", "Create Good Edges", "Set Labels"])
+        self.solver_combo.addItems(["F*", "Linear", "F*3", "F*4", "Ripple", "Smooth", "Ripple Smooth Combined", "Tugging", "F*Slab", "Winding Number", "Union", "Random", "Create Good Edges", "Set Labels"])
         top_controls_layout.addWidget(QLabel("Select Solver:"))
         top_controls_layout.addWidget(self.solver_combo)
 
@@ -3114,7 +3114,7 @@ class PointCloudLabeler(QMainWindow):
             if selected_solver == "Winding Number":
                 self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1,
                                                  other_block_factor=15.0, side_fix_nr=-1, display=False)
-            elif "F*" in selected_solver or selected_solver in ["Linear", "Ripple", "Smooth", "Ripple Smooth Combined", "Create Good Edges"]:
+            elif "F*" in selected_solver or selected_solver in ["Linear", "Ripple", "Smooth", "Ripple Smooth Combined", "Tugging", "Create Good Edges"]:
                 if self.seed_node is None:
                     self.seed_node = self.find_seed_node(deleted_mask_previous=deleted_mask_previous, extra_z_range=extra_z_range)
                 if self.seed_node is not None:
@@ -3148,6 +3148,8 @@ class PointCloudLabeler(QMainWindow):
                     self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1, other_block_factor=15.0, side_fix_nr=-1, display=False)
                 elif selected_solver == "Create Good Edges":
                     self.solver.label_good_neighbors(r=self.solve_other_block_r_spinbox.value(), delta_neg=180.0, delta_top=10.0, delta_perfect=5.0, min_neighbors=5)
+                elif selected_solver == "Tugging":
+                    self.solver.solve_tugging(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, step_sigma=520.0, o=0.0, i_round=2, visualize=True, distribute=0.3, diff_step=0.0000040)
 
                 if self.use_z_range_checkbox.isChecked() or self.use_fstar_range_checkbox.isChecked():
                     print(f"Resetting z-range, length: {len(undeleted)}")
