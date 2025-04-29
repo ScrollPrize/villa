@@ -47,12 +47,14 @@ class PointCloudLabeler(QMainWindow):
         if point_data is None and self.default_experiment != "" and self.graph_path != "":
             self.solver = graph_problem_gpu_py.Solver(self.graph_path)
             gt_path = os.path.join("../experiments", self.default_experiment,
-                                   "checkpoints", "checkpoint_graph_solver_connected_2.bin")
+                                   "checkpoints", "checkpoint_graph_tugging.bin")
+            version_graph = 1
             if not os.path.exists(gt_path):
                 gt_path = os.path.join("../experiments", self.default_experiment,
                                        "checkpoints", "checkpoint_graph_f_star_final.bin")
+                version_graph = 0
             if os.path.exists(gt_path):
-                self.solver.load_graph(gt_path)
+                self.solver.load_graph(gt_path, version_graph)
             else:
                 print("Default graph file not found; continuing without loading.")
             point_data = self.solver.get_positions()
@@ -870,11 +872,13 @@ class PointCloudLabeler(QMainWindow):
             self.umbilicus_path = self.config.get("umbilicus_path", self.umbilicus_path)
             if self.graph_path:
                 self.solver = graph_problem_gpu_py.Solver(self.graph_path)
-                gt_path = os.path.join("../experiments", self.default_experiment, "checkpoints", "checkpoint_graph_solver_connected_2.bin")
+                gt_path = os.path.join("../experiments", self.default_experiment, "checkpoints", "checkpoint_graph_tugging.bin")
+                version = 1
                 if not os.path.exists(gt_path):
                     gt_path = os.path.join("../experiments", self.default_experiment, "checkpoints", "checkpoint_graph_f_star_final.bin")
+                    version = 0
                 if os.path.exists(gt_path):
-                    self.solver.load_graph(gt_path)
+                    self.solver.load_graph(gt_path, version)
                 else:
                     QMessageBox.warning(self, "Load Data", f"Graph file not found at {gt_path}")
                 self.update_positions(update_labels=True)
@@ -3149,7 +3153,7 @@ class PointCloudLabeler(QMainWindow):
                 elif selected_solver == "Create Good Edges":
                     self.solver.label_good_neighbors(r=self.solve_other_block_r_spinbox.value(), delta_neg=180.0, delta_top=10.0, delta_perfect=5.0, min_neighbors=5)
                 elif selected_solver == "Tugging":
-                    self.solver.solve_tugging(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, step_sigma=520.0, o=0.0, i_round=2, visualize=True, distribute=0.3, diff_step=0.0000040)
+                    self.solver.solve_tugging(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, step_sigma=520.0, o=0.0, i_round=2, visualize=True, distribute=0.3, diff_step=0.00000550)
 
                 if self.use_z_range_checkbox.isChecked() or self.use_fstar_range_checkbox.isChecked():
                     print(f"Resetting z-range, length: {len(undeleted)}")
