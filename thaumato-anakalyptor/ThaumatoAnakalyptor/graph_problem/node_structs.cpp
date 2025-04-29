@@ -46,7 +46,7 @@ void saveGraph(const std::vector<Node>& nodes, const std::string& filename) {
         outFile.write(reinterpret_cast<const char*>(&node.total_wnr_side), sizeof(node.total_wnr_side));
         outFile.write(reinterpret_cast<const char*>(&node.winding_nr), sizeof(node.winding_nr));
         outFile.write(reinterpret_cast<const char*>(&node.winding_nr_old), sizeof(node.winding_nr_old));
-        outFile.write(reinterpret_cast<const char*>(Node::sides_nr), sizeof(Node::sides_nr));
+        outFile.write(reinterpret_cast<const char*>(&node.sides_nr), sizeof(node.sides_nr));
         for (int j = 0; j < Node::sides_nr; ++j) {
             outFile.write(reinterpret_cast<const char*>(&node.sides[j]), sizeof(node.sides[j]));
             outFile.write(reinterpret_cast<const char*>(&node.sides_old[j]), sizeof(node.sides_old[j]));
