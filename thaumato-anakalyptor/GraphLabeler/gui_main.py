@@ -1711,15 +1711,11 @@ class PointCloudLabeler(QMainWindow):
             # draw erase strokes in your unlabeled color
             return QColor(0, 0, 0, alpha)
 
-        # otherwise pick by (label % 3)
-        mod = lab % 3
-        if mod == 0:
-            base = self.brush_red_active.color()
-        elif mod == 1:
-            base = self.brush_green_active.color()
-        else:
-            base = self.brush_brown_active.color()
-
+        # otherwise pick brush based on current number of colors (label % num_colors)
+        idx = lab % self.num_colors
+        # select the corresponding active brush from the configured list
+        brush = self.active_brushes[idx]
+        base = brush.color()
         return QColor(base.red(), base.green(), base.blue(), alpha)
     
     def _on_mouse_press(self, ev, plot_widget, view_name):
