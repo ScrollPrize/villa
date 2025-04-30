@@ -973,7 +973,11 @@ class Solver {
             for (size_t i = 0; i < valid_indices.size(); ++i) {
                 size_t index = valid_indices[i];
                 if (graph[index].gt) {
-                    gt_f_star.push_back(graph[index].gt_f_star);
+                    float gt_f_star_ = graph[index].gt_f_star;
+                    if (graph[index].f_init < -90.0f && graph[index].f_init > -140.0f) {
+                        gt_f_star_ -= 360.0f; // gt f star mesh -> graph winding angle bugfix
+                    }
+                    gt_f_star.push_back(gt_f_star_);
                     gt_indices.push_back(i);
                 }
             }
