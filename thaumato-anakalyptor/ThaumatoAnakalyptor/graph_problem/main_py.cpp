@@ -977,6 +977,7 @@ class Solver {
                     if (graph[index].f_init < -90.0f && graph[index].f_init > -140.0f) {
                         gt_f_star_ -= 360.0f; // gt f star mesh -> graph winding angle bugfix
                     }
+                    gt_f_star_ += 90.0f; // gt f star mesh -> graph winding angle alignment
                     gt_f_star.push_back(gt_f_star_);
                     gt_indices.push_back(i);
                 }
