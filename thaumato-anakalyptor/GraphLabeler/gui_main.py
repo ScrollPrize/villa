@@ -1294,8 +1294,8 @@ class PointCloudLabeler(QMainWindow):
             if f_sel_thickness:
                 # The f selection center is taken from the finit_selection_spinbox.
                 f_sel_center = self.finit_selection_spinbox.value()
-                left_sel = f_sel_center - f_sel_thickness / 2
-                right_sel = f_sel_center + f_sel_thickness / 2
+                left_sel = f_sel_center - f_sel_thickness
+                right_sel = f_sel_center + f_sel_thickness
                 if not hasattr(self, 'f_selection_left_line'):
                     self.f_selection_left_line = pg.InfiniteLine(angle=0, pen=pg.mkPen('purple', width=1, style=Qt.DashLine))
                 if not hasattr(self, 'f_selection_right_line'):
