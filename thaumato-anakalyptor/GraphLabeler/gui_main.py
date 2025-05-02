@@ -670,6 +670,8 @@ class PointCloudLabeler(QMainWindow):
         
         self.xy_plot.scene().installEventFilter(self)
         self.xz_plot.scene().installEventFilter(self)
+        self.xy_plot.viewport().installEventFilter(self)
+        self.xz_plot.viewport().installEventFilter(self)
         
         self.update_slider_ranges()
 
@@ -728,6 +730,15 @@ class PointCloudLabeler(QMainWindow):
     # Event filter for cursor circle.
     # --------------------------------------------------
     def eventFilter(self, source, event):
+        # 1) catch the mouse back/forward button presses
+        if event.type() == QEvent.MouseButtonPress:
+            if event.button() == Qt.XButton1:    # “Back” button
+                self.label_spinbox.setValue(self.label_spinbox.value() - 1)
+                return True
+            elif event.button() == Qt.XButton2:  # “Forward” button
+                self.label_spinbox.setValue(self.label_spinbox.value() + 1)
+                return True
+                
         if event.type() == QEvent.MouseMove and self.drawing_mode_checkbox.isChecked():
             # XY
             if source is self.xy_plot.scene():
