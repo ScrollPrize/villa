@@ -404,6 +404,10 @@ class PointCloudLabeler(QMainWindow):
         effective_range_layout.addWidget(self.assign_max_spinbox)
         top_controls_layout.addLayout(effective_range_layout)
 
+        self.outside_checkbox = QCheckBox("Outside")
+        self.outside_checkbox.setChecked(False)
+        top_controls_layout.addWidget(self.outside_checkbox)
+
         self.deleted_range_button = QPushButton("<-- Delete Range")
         self.deleted_range_button.clicked.connect(self.delete_range)
         top_controls_layout.addWidget(self.deleted_range_button)
@@ -2218,7 +2222,7 @@ class PointCloudLabeler(QMainWindow):
         else:
             changed_mask_calc = np.array([new_brushes_calc_xy[i] != self._cached_calc_xy_brushes[i]
                                         for i in range(len(new_brushes_calc_xy))])
-            # print(f"XY Calc: Brushes size: {new_brushes_calc_xy.size}, changed mask size: {changed_mask_calc.size}, nr changed: {np.sum(changed_mask)}")
+            # print(f"XY Calc: Brushes size: {new_brushes_calc_xy.size}, changed mask size: {changed_mask_calc.size}, nr changed: {np.sum(changed_mask_calc)}")
             if np.any(changed_mask_calc):
                 self.xy_calc_scatter.setBrush(new_brushes_calc_xy)
                 self._cached_calc_xy_brushes[changed_mask_calc] = new_brushes_calc_xy[changed_mask_calc]
@@ -2704,6 +2708,9 @@ class PointCloudLabeler(QMainWindow):
         f_init_min_val = f_init_center - f_init_thickness / 2
         f_init_max_val = f_init_center + f_init_thickness / 2
         mask = np.logical_and(mask, np.logical_and(self.points[:, 1] >= f_init_min_val, self.points[:, 1] <= f_init_max_val))
+        if self.outside_checkbox.isChecked():
+            # Delete points outside the range
+            mask = np.logical_not(mask)
         range_min = self.assign_min_spinbox.value()
         range_max = self.assign_max_spinbox.value()
         mask = np.logical_and(mask, np.logical_and(self.labels >= range_min, self.labels <= range_max))
