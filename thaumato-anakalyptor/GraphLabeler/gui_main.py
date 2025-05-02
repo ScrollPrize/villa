@@ -964,6 +964,9 @@ class PointCloudLabeler(QMainWindow):
             self.labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
             self.calculated_labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
             self.group = np.zeros(len(self.points), dtype=np.int32)
+
+        if self.show_original_points:
+            self.toggle_original_points()
         self.kdtree_xy = cKDTree(self.points[:, [0, 1]])
         self.kdtree_xz = cKDTree(self.points[:, [0, 2]])
         if update_slide_ranges:
