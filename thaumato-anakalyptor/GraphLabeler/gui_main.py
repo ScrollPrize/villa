@@ -944,7 +944,7 @@ class PointCloudLabeler(QMainWindow):
                 return
             self.graph_path = bin_file_path
             self.solver = graph_problem_gpu_py.Solver(self.graph_path)
-            gt_path = os.path.join("../experiments", exp_name, "checkpoints", "checkpoint_graph_solver_connected_2.bin")
+            gt_path = os.path.join("../experiments", exp_name, "checkpoints", "checkpoint_graph_tugging.bin")
             if not os.path.exists(gt_path):
                 gt_path = os.path.join("../experiments", exp_name, "checkpoints", "checkpoint_graph_f_star_final.bin")
             if os.path.exists(gt_path):
