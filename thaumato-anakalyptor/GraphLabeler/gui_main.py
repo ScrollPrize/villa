@@ -104,7 +104,7 @@ class PointCloudLabeler(QMainWindow):
         
         # Display parameters.
         self.point_size = 2
-        self.max_display = 400
+        self.max_display = 1400
         if self.points.shape[0] > 0:
             self.f_star_min, self.f_star_max = float(np.min(self.points[:, 0])), float(np.max(self.points[:, 0]))
             self.z_min, self.z_max = float(np.min(self.points[:, 2])), float(np.max(self.points[:, 2]))
