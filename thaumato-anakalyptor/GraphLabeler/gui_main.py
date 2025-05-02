@@ -296,7 +296,7 @@ class PointCloudLabeler(QMainWindow):
             "f selection center:", -180.0, 180.0,
             0.0, self.scaleFactor, self.update_views)
         self.f_selection_thickness_widget, self.f_selection_thickness_slider, self.f_selection_thickness_spinbox = create_sync_slider_spinbox(
-            "f selection thickness:", 0.0, 2 * 360.0, 0.0, self.scaleFactor, self.update_views)
+            "f selection thickness:", 0.0, 360.0, 0.0, self.scaleFactor, self.update_views)
         xz_selections.addWidget(self.finit_selection_widget)
         xz_selections.addWidget(self.f_selection_thickness_widget)
         right_column.addLayout(xz_selections)
@@ -390,7 +390,9 @@ class PointCloudLabeler(QMainWindow):
         line_dist_layout.addWidget(QLabel("Line dist thresh:"))
         line_dist_layout.addWidget(self.line_distance_threshold_spinbox)
         top_controls_layout.addLayout(line_dist_layout)
+        main_layout.addLayout(top_controls_layout)
         
+        range_controls_layout = QHBoxLayout()
         effective_range_layout = QHBoxLayout()
         self.assign_min_spinbox = QSpinBox()
         self.assign_min_spinbox.setRange(-10000, 10000)
@@ -402,21 +404,20 @@ class PointCloudLabeler(QMainWindow):
         effective_range_layout.addWidget(self.assign_min_spinbox)
         effective_range_layout.addWidget(QLabel("max:"))
         effective_range_layout.addWidget(self.assign_max_spinbox)
-        top_controls_layout.addLayout(effective_range_layout)
+        range_controls_layout.addLayout(effective_range_layout)
 
         self.outside_checkbox = QCheckBox("Outside")
         self.outside_checkbox.setChecked(False)
-        top_controls_layout.addWidget(self.outside_checkbox)
+        range_controls_layout.addWidget(self.outside_checkbox)
 
         self.deleted_range_button = QPushButton("<-- Delete Range")
         self.deleted_range_button.clicked.connect(self.delete_range)
-        top_controls_layout.addWidget(self.deleted_range_button)
+        range_controls_layout.addWidget(self.deleted_range_button)
 
         self.split_groups_button = QPushButton("<-- Split Range into Groups")
         self.split_groups_button.clicked.connect(self.split_groups_range)
-        top_controls_layout.addWidget(self.split_groups_button)
-        
-        main_layout.addLayout(top_controls_layout)
+        range_controls_layout.addWidget(self.split_groups_button)
+        main_layout.addLayout(range_controls_layout)
         
         # --------------------------------------------------------------------
         # Bottom Controls Row: Common Drawing and File Controls.
@@ -2705,8 +2706,8 @@ class PointCloudLabeler(QMainWindow):
         mask = (self.points[:, 2] >= z_min_val) & (self.points[:, 2] <= z_max_val)
         f_init_center = self.finit_selection_spinbox.value()
         f_init_thickness = self.f_selection_thickness_slider.value() / self.scaleFactor
-        f_init_min_val = f_init_center - f_init_thickness / 2
-        f_init_max_val = f_init_center + f_init_thickness / 2
+        f_init_min_val = f_init_center - f_init_thickness
+        f_init_max_val = f_init_center + f_init_thickness
         mask = np.logical_and(mask, np.logical_and(self.points[:, 1] >= f_init_min_val, self.points[:, 1] <= f_init_max_val))
         if self.outside_checkbox.isChecked():
             # Delete points outside the range
