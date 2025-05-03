@@ -999,6 +999,7 @@ class PointCloudLabeler(QMainWindow):
         if update_slide_ranges:
             self.update_slider_ranges()
         self.update_views()
+        print(f"Done updating positions.")
     
     def browse_for_bin(self, lineedit, exp_lineedit):
         graph_path, _ = QFileDialog.getOpenFileName(self, "Select Graph Bin", lineedit.text() or os.getcwd(), "Graph Files (*.bin);;All Files (*)")
