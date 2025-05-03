@@ -5,7 +5,8 @@ from PyQt5.QtWidgets import (
     QSplitter, QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QSlider, QLabel, QSpinBox, QDoubleSpinBox, QCheckBox,
     QAction, QMessageBox, QInputDialog, QGraphicsEllipseItem, QFileDialog,
-    QProgressDialog, QDialog, QFormLayout, QDialogButtonBox, QLineEdit, QComboBox, QTextBrowser, QGraphicsPathItem
+    QProgressDialog, QDialog, QFormLayout, QDialogButtonBox, QLineEdit, QComboBox,
+    QTextBrowser, QGraphicsPathItem, QLayout
 )
 from PyQt5.QtCore import Qt, QEvent, QPointF
 from PyQt5.QtGui  import QPainterPath, QPen, QColor
@@ -206,7 +207,9 @@ class PointCloudLabeler(QMainWindow):
         # Layout setup.
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
+        # Set up the main vertical layout without enforcing its children as the window's minimum size
         main_layout = QVBoxLayout(central_widget)
+        main_layout.setSizeConstraint(QLayout.SetNoConstraint)
 
         # Upper view area.
         splitter = QSplitter(Qt.Horizontal)
@@ -688,6 +691,14 @@ class PointCloudLabeler(QMainWindow):
 
         self.update_guides()
         self.update_views()
+
+        # Enforce a minimum width on interactive widgets (excluding spinboxes) so they remain clickable
+        MIN_WIDTH = 20
+        for cls in (QPushButton, QLabel, QSlider, QCheckBox, QComboBox):
+            for w in self.findChildren(cls):
+                w.setMinimumWidth(MIN_WIDTH)
+        # Add a QSizeGrip in the status bar so users can resize via the bottom-right corner
+        self.statusBar().setSizeGripEnabled(True) # Enable default double grip
 
     def z_slice_center_changed(self):
         if hasattr(self, 'ome_zarr_window') and self.ome_zarr_window is not None:
