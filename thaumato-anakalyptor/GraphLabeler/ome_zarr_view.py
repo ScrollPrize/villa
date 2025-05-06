@@ -25,21 +25,56 @@ from scroll_graph_util import compute_mean_windings_precomputed, load_xyz_from_f
 ########################################
 
 def load_graph_pkl(graph_pkl_path):
+    """
+    Load or build a slimmed ScrollGraph, retaining only 'sample_points' and 'centroid' per node.
+    If a '<base>_small.pkl' exists alongside the original, load from that.
+    Otherwise, unpickle the full graph once, trim and downcast nodes, save a small pickle, and return it.
+    """
+    import scroll_graph_util
+    base, ext = os.path.splitext(graph_pkl_path)
+    small_pkl = base + '_small' + ext
+    # Load pre-slimmed if available
+    if os.path.exists(small_pkl):
+        print(f"[SlimLoad] Loading slimmed graph from {small_pkl}", file=sys.stderr)
+        nodes = pickle.load(open(small_pkl, 'rb'))
+        graph = scroll_graph_util.ScrollGraph(0, None)
+        graph.nodes = nodes
+        print(f"[SlimLoad] Loaded slim graph with {len(nodes)} nodes", file=sys.stderr)
+        return graph
+    # Else build slim graph
+    print(f"[SlimLoad] Building slimmed graph from {graph_pkl_path}", file=sys.stderr)
+    class SlimScrollGraph(scroll_graph_util.ScrollGraph):
+        def __setstate__(self, state):
+            nodes = state.get('nodes', {}) or {}
+            total = len(nodes)
+            print(f"[SlimLoad] Trimming {total} nodes...", file=sys.stderr)
+            slim_nodes = {}
+            for key, data in tqdm(nodes.items(), desc="[SlimLoad] Trimming nodes", total=total, file=sys.stderr):
+                sp = data.get('sample_points')
+                sp16 = np.asarray(sp, dtype=np.float16) if sp is not None else None
+                cent = data.get('centroid')
+                cent16 = np.asarray(cent, dtype=np.float16) if cent is not None else None
+                slim_nodes[key] = {'sample_points': sp16, 'centroid': cent16}
+            self.nodes = slim_nodes
+            print(f"[SlimLoad] Slim graph ready with {len(slim_nodes)} nodes", file=sys.stderr)
+    class SlimUnpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            if module == 'scroll_graph_util' and name in ('ScrollGraph', 'Graph'):
+                return SlimScrollGraph
+            return super().find_class(module, name)
     with open(graph_pkl_path, 'rb') as f:
-        graph = pickle.load(f)
-    # Remove edges and from nodes all fields except sample_points and centroid
+        print(f"[SlimLoad] Unpickling full graph...", file=sys.stderr)
+        unp = SlimUnpickler(f)
+        slim_graph = unp.load()
+        print(f"[SlimLoad] Full graph unpickled and trimmed.", file=sys.stderr)
+    # Save slim nodes dict
     try:
-        del graph.edges
-    except:
-        print("No edges to delete.")
-    for node in tqdm(graph.nodes, desc="Deleting node fields"):
-        for field in list(graph.nodes[node].keys()):
-            try:
-                if field not in ['sample_points', 'centroid']:
-                    del graph.nodes[node][field]
-            except:
-                print(f"Error deleting fields for node {node}.")
-    return graph   
+        with open(small_pkl, 'wb') as fout:
+            pickle.dump(slim_graph.nodes, fout, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"[SlimLoad] Saved slim graph nodes to {small_pkl}", file=sys.stderr)
+    except Exception as e:
+        print(f"[SlimLoad] Warning: could not save slim pickle: {e}", file=sys.stderr)
+    return slim_graph
 
 ########################################
 # Helper Functions
@@ -161,48 +196,82 @@ def save_high_res_widget(widget, save_path, fixed_width=5000):
 class OmeZarrLoaderWorker(QThread):
     slice_loaded = pyqtSignal(np.ndarray)
 
-    def __init__(self, ome_zarr_path, z_index):
+    def __init__(self, ome_zarr_path, z_index, resolution):
         super().__init__()
         self.ome_zarr_path = ome_zarr_path
         self.z_index = z_index
+        self.resolution = resolution
 
     def run(self):
         try:
             store = zarr.open(self.ome_zarr_path, mode='r')
-            image_slice = store['0'][self.z_index]
+            # Load at selected resolution level
+            dset = store[str(self.resolution)]
+            # Calculate the correct z-index for this pyramid level
+            try:
+                res = int(self.resolution)
+            except Exception:
+                res = 0
+            if res > 0:
+                # assume each level downscales by 2**res
+                z_idx = int(self.z_index / (2 ** res))
+            else:
+                z_idx = int(self.z_index)
+            # Clamp to valid range
+            z_dim = dset.shape[0]
+            if z_idx < 0:
+                z_idx = 0
+            elif z_idx >= z_dim:
+                z_idx = z_dim - 1
+            # Extract the slice
+            image_slice = dset[z_idx]
         except Exception as e:
-            print(f"Error loading z slice at index {self.z_index}: {e}")
+            print(f"Error loading z slice at index {getattr(self, 'z_index', None)}: {e}")
             image_slice = np.zeros((512,512,3), dtype=np.uint8)
+        # Emit the loaded (or placeholder) slice
         self.slice_loaded.emit(image_slice)
 
 # --- XZ Loader Worker using Umbilicus Data ---
 class OmeZarrXZLoaderWorker(QThread):
     xz_slice_loaded = pyqtSignal(np.ndarray)
 
-    def __init__(self, ome_zarr_path, finit_center_value, umbilicus_path):
+    def __init__(self, ome_zarr_path, resolution, finit_center_value, umbilicus_path):
         """
         :param ome_zarr_path: Path to the OME-Zarr store.
+        :param resolution: Pyramid level in the Zarr store (integer string key).
         :param finit_center_value: Rotation angle (in degrees) for the XZ view.
         :param umbilicus_path: Path to the umbilicus .txt file.
         """
         super().__init__()
         self.ome_zarr_path = ome_zarr_path
+        self.resolution = resolution
         self.finit_center_value = finit_center_value
         self.umbilicus_path = umbilicus_path
 
     def run(self):
         try:
             store = zarr.open(self.ome_zarr_path, mode='r')
-            dset = store['0']
+            # Load at selected resolution level
+            dset = store[str(self.resolution)]
             z_dim, y_dim, x_dim = dset.shape  # shape: (Z, Y, X)
 
-            # Load umbilicus data and subtract 500.
+            # Determine downscaling factor for this level
+            try:
+                level = int(self.resolution)
+            except Exception:
+                level = 0
+            factor = 2 ** level if level > 0 else 1
+
+            # Load umbilicus data and map into this resolution's coordinate space
             if self.umbilicus_path is not None and os.path.exists(self.umbilicus_path):
                 print(f"Loading umbilicus data from {self.umbilicus_path}")
-                umbilicus_data = load_xyz_from_file(self.umbilicus_path) - 500
+                raw_data = load_xyz_from_file(self.umbilicus_path) - 500
+                umbilicus_data = raw_data / factor
             else:
+                # estimated center in (y,z,x) order
                 umbilicus_data = np.array([[y_dim / 2, 0, x_dim / 2]])
                 print(f"Umbilicus path {self.umbilicus_path} not found; using estimated umbilicus data.")
+            # Build per-slice centers via interpolation
             centers = []
             for z_val in range(z_dim):
                 pos = umbilicus_xy_at_z(umbilicus_data, z_val)
@@ -347,20 +416,16 @@ class OmeZarrViewWindow(QMainWindow):
         self.graph_labels = graph_labels
         self.solver = solver
         self.experiment_path = experiment_path
+        # defer Zarr pyramid loading until resolution is selected
         self.ome_zarr_path = ome_zarr_path
-        store = zarr.open(self.ome_zarr_path, mode='r')
-        dset = store['0']
-        z_dim, y_dim, x_dim = dset.shape  # shape: (Z, Y, X)
-        self.L = max(x_dim, y_dim) / 2.0
+        # metadata (dims, L) will be loaded upon resolution change
+        self.z_dim = self.y_dim = self.x_dim = None
+        self.L = None
         self.graph_pkl_path = graph_pkl_path
         self.h5_path = h5_path
         self.umbilicus_path = umbilicus_path
-        if self.umbilicus_path is not None and os.path.exists(self.umbilicus_path):
-            print(f"Loading umbilicus data from {self.umbilicus_path}")
-            self.umbilicus_data = load_xyz_from_file(self.umbilicus_path) - 500
-        else:
-            self.umbilicus_data = np.array([[y_dim / 2, 0, x_dim / 2]])
-            print(f"Umbilicus path {self.umbilicus_path} not found; using estimated umbilicus data.")
+        # umbilicus_data will be computed when resolution metadata is available
+        self.umbilicus_data = None
         self.winding, overlay_point_nodes_indices = None, None
         self.f_init = np.array(self.solver.get_positions())[:, 1]
         self.undeleted_nodes_indices = np.array(self.solver.get_undeleted_indices())
@@ -398,6 +463,25 @@ class OmeZarrViewWindow(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
+        # --- Settings bar: resolution dropdown ---
+        settings_layout = QHBoxLayout()
+        main_layout.addLayout(settings_layout)
+        settings_layout.addWidget(QLabel("Resolution:"))
+        self.resolution_combobox = QComboBox()
+        # populate integer-named pyramid levels from Zarr store
+        try:
+            store = zarr.open(self.ome_zarr_path, mode='r')
+            levels = sorted(int(k) for k in store.array_keys() if k.isdigit())
+        except Exception:
+            levels = []
+        self.available_resolutions = levels
+        for lvl in levels:
+            self.resolution_combobox.addItem(str(lvl), lvl)
+        if levels:
+            self.current_resolution = levels[0]
+            self.resolution_combobox.setCurrentIndex(0)
+        self.resolution_combobox.currentIndexChanged.connect(self.on_resolution_changed)
+        settings_layout.addWidget(self.resolution_combobox)
         
         views_layout = QHBoxLayout()
         main_layout.addLayout(views_layout)
@@ -461,7 +545,8 @@ class OmeZarrViewWindow(QMainWindow):
         self.current_z_index = z_index  # Store for later use.
         self.loader_worker_running = True
         print(f"Loading OME-Zarr XY slice at index {z_index} (from z slice center {self.pending_z_center})")
-        self.loader_worker = OmeZarrLoaderWorker(self.ome_zarr_path, z_index)
+        # Launch loader worker at selected resolution
+        self.loader_worker = OmeZarrLoaderWorker(self.ome_zarr_path, z_index, self.current_resolution)
         self.loader_worker.slice_loaded.connect(self.on_slice_loaded)
         self.loader_worker.start()
 
@@ -664,11 +749,43 @@ class OmeZarrViewWindow(QMainWindow):
         if self.pending_finit_center is None:
             return
         print(f"Loading OME-Zarr XZ slice with f init center {self.pending_finit_center}, type of {type(self.pending_finit_center)}")
-        self.xz_loader_worker = OmeZarrXZLoaderWorker(self.ome_zarr_path, self.pending_finit_center, self.umbilicus_path)
+        # Launch XZ loader worker at selected resolution
+        self.xz_loader_worker = OmeZarrXZLoaderWorker(self.ome_zarr_path, self.current_resolution,
+                                                    self.pending_finit_center, self.umbilicus_path)
         self.xz_loader_worker.xz_slice_loaded.connect(self.on_xz_slice_loaded)
         self.xz_loader_worker.start()
         # When updating the XZ view, request the XZ overlay.
         self.on_overlay_points_updated_xz(self.labels, self.computed_labels)
+        
+    def on_resolution_changed(self, index):
+        """
+        Handler for resolution dropdown changes: load metadata and update views.
+        """
+        level = self.resolution_combobox.itemData(index)
+        self.current_resolution = level
+        # Load Zarr metadata for this resolution
+        try:
+            store = zarr.open(self.ome_zarr_path, mode='r')
+            dset = store[str(level)]
+            self.z_dim, self.y_dim, self.x_dim = dset.shape
+            self.L = max(self.x_dim, self.y_dim) / 2.0
+        except Exception as e:
+            QMessageBox.warning(self, "Resolution Error",
+                                f"Could not load resolution {level}: {e}")
+            return
+        # Compute umbilicus_data
+        if self.umbilicus_path and os.path.exists(self.umbilicus_path):
+            self.umbilicus_data = load_xyz_from_file(self.umbilicus_path) - 500
+        else:
+            self.umbilicus_data = np.array([[self.y_dim / 2, 0, self.x_dim / 2]])
+        # Update overlay worker if exists
+        if hasattr(self, 'persistent_overlay_worker'):
+            self.persistent_overlay_worker.umbilicus_data = self.umbilicus_data
+        # Refresh current slices
+        if hasattr(self, 'pending_z_center') and self.pending_z_center is not None:
+            self._trigger_z_slice_update()
+        if hasattr(self, 'pending_finit_center') and self.pending_finit_center is not None:
+            self._trigger_xz_slice_update()
     
     def on_xz_slice_loaded(self, xz_image):
         self.xz_view.setImage(xz_image)
