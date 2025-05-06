@@ -183,36 +183,25 @@ def load_tiff(tiffname):
     return image
 
 def get_tiffs(tiffdir):
-    # Note this is a generator, not a list
     tiffs = list(tiffdir.glob("*.tif"))
-    if len(tiffs) == 0:
+    if not tiffs:
         tiffs = list(tiffdir.glob("*.jpg"))
-    rec = re.compile(r'([0-9]+)\.\w+$')
-    # rec = re.compile(r'[0-9]+$')
+    # .*  eats up everything until the _last_ digits before .ext
+    rec = re.compile(r'^.*?([0-9]+)\.\w+$')
     inttiffs = {}
     for tiff in tiffs:
-        tname = tiff.name
-        match = rec.match(tname)
-        if match is None:
+        m = rec.match(tiff.name)
+        if not m:
             continue
-        # Look for last match (closest to end of file name)
-        # ds = match[-1]
-        ds = match.group(1)
-        itiff = int(ds)
-        if itiff in inttiffs:
-            err = "File %s: tiff id %d already used"%(tname,itiff)
-            print(err)
-            return err
-        inttiffs[itiff] = tiff
-    if len(inttiffs) == 0:
-        err = "No tiffs found"
-        print(err)
-        return err
-    
-    itiffs = list(inttiffs.keys())
-    itiffs.sort()
-    
-    return inttiffs, itiffs
+        idx = int(m.group(1))
+        if idx in inttiffs:
+            return f"File {tiff.name}: tiff id {idx} already used"
+        inttiffs[idx] = tiff
+
+    if not inttiffs:
+        return "No tiffs found"
+    sorted_idxs = sorted(inttiffs)
+    return inttiffs, sorted_idxs
 
 def get_tiff_volume_mask(tiff, itiff):
     # Find a region in the tiff that contains a fair mix of 0's and 1's and is close to the center of the image
