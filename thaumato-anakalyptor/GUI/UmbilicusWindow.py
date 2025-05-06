@@ -115,7 +115,8 @@ class UmbilicusWindow(QMainWindow):
         else:
             tifs = [f for f in os.listdir(self.imagePath) if f.endswith('.tif')]
             for tif in tifs:
-                self.images[int(tif[:-4])] = tif
+                tif_name = tif.split("_")[-1]
+                self.images[int(tif_name[:-4])] = tif
 
     def showHelp(self):
         helpText = "ThaumatoAnakalyptor Help\n\n" \
