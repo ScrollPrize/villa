@@ -4,7 +4,12 @@ Generate an HDF5 file containing node centroids and sample points
 from a graph pickle file.
 
 Usage:
-    python generate_graph_h5.py input_graph.pkl output_nodes.h5 [--compression gzip|lzf]
+    python generate_graph_h5.py input_graph.pkl output_nodes.h5 [--compression none|gzip|lzf]
+
+Compression:
+    none  - no compression (fastest write)
+    gzip  - gzip compression (slower, higher ratio)
+    lzf   - lzf compression (fast, moderate ratio, default)
 """
 import argparse
 import os
@@ -36,8 +41,9 @@ class SlimScrollGraph(scroll_graph_util.ScrollGraph):
         for key, data in tqdm(nodes_data.items(), total=total, desc="Trimming nodes"):
             sp = data.get('sample_points')
             cent = data.get('centroid')
-            sp_arr = np.asarray(sp, dtype=float) if sp is not None else None
-            cent_arr = np.asarray(cent, dtype=float) if cent is not None else None
+            # Downcast points and centroids to float16 immediately
+            sp_arr = np.asarray(sp, dtype=np.float16) if sp is not None else None
+            cent_arr = np.asarray(cent, dtype=np.float16) if cent is not None else None
             slim_nodes[key] = {'sample_points': sp_arr, 'centroid': cent_arr}
         self.nodes = slim_nodes
 
@@ -93,8 +99,8 @@ def main():
     parser.add_argument('input_pkl', help='Path to graph pickle (.pkl)')
     parser.add_argument('output_h5', help='Output HDF5 file path (.h5)')
     parser.add_argument(
-        '--compression', choices=['gzip', 'lzf'], default=None,
-        help='Compression type for sample_points datasets'
+        '--compression', choices=['none', 'gzip', 'lzf'], default='lzf',
+        help='Compression for sample_points: none, gzip (slower), or lzf (faster)'
     )
     args = parser.parse_args()
     # Prevent overwriting
@@ -107,7 +113,9 @@ def main():
     except Exception as e:
         print(f"Failed to load nodes from '{args.input_pkl}': {e}", file=sys.stderr)
         sys.exit(1)
-    # Write HDF5
+    # Determine compression setting
+    comp = None if args.compression == 'none' else args.compression
+    # Write HDF5 with progress
     total_nodes = len(nodes)
     with h5py.File(args.output_h5, 'w') as h5f:
         for key, data in tqdm(nodes.items(), total=total_nodes, desc="Writing nodes"):
@@ -121,13 +129,15 @@ def main():
                 grp.create_dataset('centroid', data=data['centroid'])
             elif data.get('position') is not None:
                 grp.create_dataset('centroid', data=data['position'])
-            # Write sample points (as float16) if available
-            if data.get('sample_points') is not None:
-                # Downcast sample points to float16 to save space
-                sp = np.asarray(data['sample_points'], dtype=np.float16)
+            # Write sample points (already float16 or cast) if available
+            sp = data.get('sample_points')
+            if sp is not None:
+                sp_arr = np.asarray(sp)
+                if sp_arr.dtype != np.float16:
+                    sp_arr = sp_arr.astype(np.float16)
                 grp.create_dataset(
-                    'sample_points', data=sp,
-                    compression=args.compression
+                    'sample_points', data=sp_arr,
+                    compression=comp
                 )
     print(f"HDF5 file '{args.output_h5}' written with {len(nodes)} nodes.")
 
