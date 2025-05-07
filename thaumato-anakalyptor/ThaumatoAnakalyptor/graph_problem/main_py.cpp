@@ -727,14 +727,11 @@ class Solver {
             }
             return deleted_mask;
         }
-        void delete_nodes(std::vector<bool> deletes) {
+        void delete_nodes(std::vector<size_t> delete_indices) {
             // delete nodes
-            std::vector<size_t> valid_indices = get_valid_indices(graph);
-            for (size_t i = 0; i < valid_indices.size(); ++i) {
-                size_t index = valid_indices[i];
-                if (deletes[i]) {
-                    graph[index].deleted = true;
-                }
+            for (size_t i = 0; i < delete_indices.size(); ++i) {
+                size_t index = delete_indices[i];
+                graph[index].deleted = true;
             }
             // get largest connected component
             largest_connected_component();
@@ -1187,7 +1184,7 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("valid_indices"))
         .def("delete_nodes", &Solver::delete_nodes,
             "Method to delete nodes of the graph",
-            py::arg("deletes"))
+            py::arg("delete_indices"))
         .def("get_undeleted_indices", &Solver::get_undeleted_indices,
             "Method to get the undeleted node indices of the graph")
         .def("set_undeleted_indices", &Solver::set_undeleted_indices,
