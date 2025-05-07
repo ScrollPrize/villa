@@ -3129,7 +3129,7 @@ class PointCloudLabeler(QMainWindow):
                 group_metadata.append((source, target, winding_number_difference))
 
             if self.hide_teflon_checkbox.isChecked():
-                print("Hiding teflon during solver update"))
+                print("Hiding teflon during solver update")
                 self.solver.delete_nodes(list(np.array(undeleted)[np.abs(self.labels - self.teflon_label) < 2]))
             if self.use_z_range_checkbox.isChecked():
                 print("Using z-range")
