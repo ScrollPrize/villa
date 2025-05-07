@@ -3185,7 +3185,7 @@ class PointCloudLabeler(QMainWindow):
                 elif selected_solver == "Tugging":
                     self.solver.solve_tugging(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, step_sigma=520.0, o=0.0, i_round=2, visualize=True, distribute=0.3, diff_step=0.00000550)
 
-                if self.use_z_range_checkbox.isChecked() or self.use_fstar_range_checkbox.isChecked():
+                if self.use_z_range_checkbox.isChecked() or self.use_fstar_range_checkbox.isChecked() or self.hide_teflon_checkbox.isChecked():
                     print(f"Resetting z-range, length: {len(undeleted)}")
                     self.solver.set_undeleted_indices(undeleted)
                     self.seed_node = None
