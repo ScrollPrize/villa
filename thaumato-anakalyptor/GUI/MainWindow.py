@@ -526,9 +526,8 @@ class ThaumatoAnakalyptor(QMainWindow):
                                 "If you already have an umbilicus generated, load it with 'Load'. Place the umbilicus points in the center of the scroll. Save your work with 'Save' before closing. Make sure to have the appropriate paths set in the Config.")
 
     def openUmbilicusWindow(self):
-        if self.Config.get("downsampled_2d_tiffs", None) and os.path.exists(self.Config["downsampled_2d_tiffs"]):
+        if (self.Config.get("downsampled_2d_tiffs", None) and os.path.exists(self.Config["downsampled_2d_tiffs"])) or (self.Config.get("downsampled_3d_grids", None) and os.path.exists(self.Config["downsampled_3d_grids"])):
             volume_path = self.Config["downsampled_2d_tiffs"] if self.Config.get("downsampled_3d_grids", None) is None else self.Config["downsampled_3d_grids"]
-            print(f"Opening umbilicus window with volume path: {volume_path}")
             self.umbilicusWindow = UmbilicusWindow(volume_path, abs(self.Config["downsample_factor"]))
             self.umbilicusWindow.resize(self.width(), self.height())  # Adjust width and height as needed
             self.umbilicusWindow.show()
