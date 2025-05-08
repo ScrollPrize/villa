@@ -155,12 +155,12 @@ class UmbilicusWindow(QMainWindow):
             # print(f"Loaded image {imagePath} at index {index} with shape {image_array.shape} and dtype {image_array.dtype}")
 
             image_array = np.array(image_array)
+            print(f"DType: {image_array.dtype}, Min max: {image_array.min()} {image_array.max()}")
             if image_array.dtype == np.uint16:
                 image_array = (image_array / 256).astype(np.uint8)
             if image_array.dtype == np.float16:
                 print("float16")
                 image_array = (image_array / 256).astype(np.uint8)
-            print(f"DType: {image_array.dtype}, Min max: {image_array.min()} {image_array.max()}")
 
             # Assuming the image is grayscale, prepare it for display
             image_height, image_width = image_array.shape
