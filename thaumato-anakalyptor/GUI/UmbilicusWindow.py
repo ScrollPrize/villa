@@ -111,10 +111,6 @@ class UmbilicusWindow(QMainWindow):
             # ome-zarr volume
             self.zarr_volume = zarr.open(self.imagePath)
             self.zarr_volume = self.zarr_volume[0]
-            print(f"Shape of zarr volume: {self.zarr_volume.shape}, dtype: {self.zarr_volume.dtype}")
-            small_cutout = self.zarr_volume.shape[0] // 2
-            smal_array = self.zarr_volume[small_cutout]
-            print(f"Some value in the middle: {smal_array}")
             for i in range(len(self.zarr_volume)):
                 self.images[i] = f"zarr z-slice {i}"
         else:
@@ -160,14 +156,12 @@ class UmbilicusWindow(QMainWindow):
 
             # print(f"Loaded image {imagePath} at index {index} with shape {image_array.shape} and dtype {image_array.dtype}")
 
-            print(f"Shape: {image_array.shape}, DType: {image_array.dtype}, Values: {image_array}")
             image_array = np.array(image_array)
-            print(f"DType: {image_array.dtype}, Min max: {image_array.min()} {image_array.max()}")
             if image_array.dtype == np.uint16:
                 image_array = (image_array / 256).astype(np.uint8)
             if image_array.dtype == np.float16:
-                print("float16")
-                image_array = (image_array / 256).astype(np.uint8)
+                print("float16, experimental")
+                image_array = (image_array * 256).astype(np.uint8)
 
             # Assuming the image is grayscale, prepare it for display
             image_height, image_width = image_array.shape
