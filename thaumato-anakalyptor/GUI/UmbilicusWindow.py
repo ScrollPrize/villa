@@ -144,6 +144,7 @@ class UmbilicusWindow(QMainWindow):
                     # Use tifffile to read the TIFF image
                     with tifffile.TiffFile(imagePath) as tif:
                         image_array = tif.asarray()
+                # Convert to numpy array if not already
                 self.image = image_array
                 self.index_old = index
             else:
@@ -151,6 +152,7 @@ class UmbilicusWindow(QMainWindow):
 
             # print(f"Loaded image {imagePath} at index {index} with shape {image_array.shape} and dtype {image_array.dtype}")
 
+            image_array = np.array(image_array)
             if image_array.dtype == np.uint16:
                 image_array = (image_array / 256).astype(np.uint8)
 
@@ -187,6 +189,8 @@ class UmbilicusWindow(QMainWindow):
                 sceneX -= size_image / 2
                 sceneY -= size_image / 2
                 self.scene.addEllipse(sceneX, sceneY, size_image, size_image, QPen(Qt.red), QBrush(Qt.red))
+        else:
+            print(f"Image at index {index} not found in images dictionary.")
 
     def jumpToIndex(self):
         index = int(self.indexBox.text())
