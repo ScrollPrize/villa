@@ -160,6 +160,7 @@ class UmbilicusWindow(QMainWindow):
 
             # print(f"Loaded image {imagePath} at index {index} with shape {image_array.shape} and dtype {image_array.dtype}")
 
+            print(f"Shape: {image_array.shape}, DType: {image_array.dtype}, Values: {image_array}")
             image_array = np.array(image_array)
             print(f"DType: {image_array.dtype}, Min max: {image_array.min()} {image_array.max()}")
             if image_array.dtype == np.uint16:
