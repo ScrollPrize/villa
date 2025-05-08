@@ -3420,9 +3420,14 @@ class PointCloudLabeler(QMainWindow):
     def toggle_streak_mode(self, checked):
         """
         Toggle streak drawing mode: when on, brush strokes will toggle the boolean streak
-        flag on points instead of assigning numeric labels.
+        flag on points instead of assigning numeric labels.  When enabled, set spinbox to 1.
         """
         self.streak_mode = checked
+        # In streak mode, use label 1 to set streak=True; label 0 clears streak
+        if checked:
+            self.label_spinbox.setValue(1)
+        # Update views immediately when toggling streak mode
+        self.update_views()
 
     def apply_all_calculated_labels(self):
         mask = (self.labels == self.UNLABELED) & (self.calculated_labels != self.UNLABELED)
