@@ -102,6 +102,10 @@ class PointCloudLabeler(QMainWindow):
         self.last_group_update = 0
         self.labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
         self.calculated_labels = np.full(len(self.points), self.UNLABELED, dtype=np.int32)
+        # Streak flags: each point can be part of a streak (True) or not (False)
+        self.streaks = np.zeros(len(self.points), dtype=bool)
+        # Streak painting mode off by default
+        self.streak_mode = False
         
         # Display parameters.
         self.point_size = 2
@@ -420,6 +424,11 @@ class PointCloudLabeler(QMainWindow):
         self.split_groups_button = QPushButton("<-- Split Range into Groups")
         self.split_groups_button.clicked.connect(self.split_groups_range)
         range_controls_layout.addWidget(self.split_groups_button)
+        # Streak Mode toggle: enables painting boolean streaks on points
+        self.streak_mode_checkbox = QCheckBox("Streak Mode")
+        self.streak_mode_checkbox.setChecked(False)
+        range_controls_layout.addWidget(self.streak_mode_checkbox)
+        self.streak_mode_checkbox.toggled.connect(self.toggle_streak_mode)
         main_layout.addLayout(range_controls_layout)
         
         # --------------------------------------------------------------------
@@ -1019,8 +1028,13 @@ class PointCloudLabeler(QMainWindow):
     def _save_labels_to_path(self, fname):
         if fname:
             with open(fname, "w") as f:
-                # write labels + group to file
-                data = json.dumps({"labels": self.labels.tolist(), "group": self.group.tolist()})
+                # write labels, group, and streak flags to file
+                payload = {
+                    "labels": self.labels.tolist(),
+                    "group": self.group.tolist(),
+                    "streaks": self.streaks.tolist()
+                }
+                data = json.dumps(payload)
                 f.write(data)
             print(f"Labels saved to {fname}")
     
@@ -1033,20 +1047,29 @@ class PointCloudLabeler(QMainWindow):
             try:
                 new_labels = np.array(data["labels"], dtype=np.int32)
                 new_groups = np.array(data["group"], dtype=np.int32)
+                # Load streaks if present, else default to False and warn
+                if "streaks" in data:
+                    new_streaks = np.array(data["streaks"], dtype=bool)
+                else:
+                    QMessageBox.warning(self, "Load Labels",
+                                        "Old labels file: no streak data found; all streaks set to False.")
+                    new_streaks = np.zeros(len(new_labels), dtype=bool)
             except Exception as e:
-                # Fallback to old label save format
+                # Fallback to old label save format (no groups or streaks)
                 print("Falling back to old label format.")
                 with open(fname, "r") as f:
                     data = f.read()
                 try:
                     new_labels = np.array(ast.literal_eval(data), dtype=np.int32)
                     new_groups = np.zeros(len(new_labels), dtype=np.int32)
+                    new_streaks = np.zeros(len(new_labels), dtype=bool)
                 except Exception as e:
                     QMessageBox.warning(self, "Load Labels", f"Error reading file: {e}")
                     return
             if len(new_labels) == len(self.labels):
                 self.labels = new_labels
                 self.group = new_groups
+                self.streaks = new_streaks
                 self.update_views()
             else:
                 QMessageBox.warning(self, "Load Labels", "Loaded labels length does not match current data.")
@@ -1835,7 +1858,7 @@ class PointCloudLabeler(QMainWindow):
         ev.ignore()
     
     def _on_mouse_release(self, ev, plot_widget, view_name):
-        # ---- finish XY stroke ----
+        # ---- finish XY stroke (label or streak) ----
         if plot_widget is self.xy_plot \
         and ev.button() == Qt.LeftButton \
         and self._stroke_backup is not None:
@@ -1843,15 +1866,20 @@ class PointCloudLabeler(QMainWindow):
             pts = [(self._current_path_xy.elementAt(i).x,
                     self._current_path_xy.elementAt(i).y)
                 for i in range(self._current_path_xy.elementCount())]
-            self._apply_brush_path_to_labels(pts)
-            self.undo_stack.append(self._stroke_backup)
-            self.redo_stack.clear()
+            if self.streak_mode:
+                self._apply_brush_path_to_streaks(pts)
+            else:
+                self._apply_brush_path_to_labels(pts)
+            # no undo for streak mode currently
+            if not self.streak_mode:
+                self.undo_stack.append(self._stroke_backup)
+                self.redo_stack.clear()
             self._stroke_backup = None
             self._overlay.setPath(QPainterPath())
             self._overlay.setVisible(False)
             return
 
-        # ---- finish XZ stroke ----
+        # ---- finish XZ stroke (label or streak) ----
         if plot_widget is self.xz_plot \
         and ev.button() == Qt.LeftButton \
         and self._stroke_backup is not None:
@@ -1859,9 +1887,13 @@ class PointCloudLabeler(QMainWindow):
             pts = [(self._current_path_xz.elementAt(i).x,
                     self._current_path_xz.elementAt(i).y)
                 for i in range(self._current_path_xz.elementCount())]
-            self._apply_brush_path_to_labels_xz(pts)
-            self.undo_stack.append(self._stroke_backup)
-            self.redo_stack.clear()
+            if self.streak_mode:
+                self._apply_brush_path_to_streaks_xz(pts)
+            else:
+                self._apply_brush_path_to_labels_xz(pts)
+            if not self.streak_mode:
+                self.undo_stack.append(self._stroke_backup)
+                self.redo_stack.clear()
             self._stroke_backup = None
             self._overlay_xz.setPath(QPainterPath())
             self._overlay_xz.setVisible(False)
@@ -1958,6 +1990,108 @@ class PointCloudLabeler(QMainWindow):
             self.group[i] = grp
 
         self.update_views()
+    
+    def _apply_brush_path_to_streaks(self, data_path):
+        """
+        Apply brush stroke in XY view to set boolean streak flags based on current spinbox (0/1).
+        """
+        r = self.radius_spinbox.value()
+        data_path = self._interpolate_path(data_path, r)
+        zc = self.z_center_spinbox.value()
+        half = self.z_thickness_slider.value() / self.scaleFactor / 2
+        hit = set()
+        for x, y in data_path:
+            for i in self.get_nearby_indices_xy(x, y, r):
+                if (zc - half) <= self.points[i, 2] <= (zc + half):
+                    hit.add(i)
+        base = self.label_spinbox.value()
+        for i in hit:
+            self.streaks[i] = (base == 1)
+        self.update_views()
+
+    def _apply_brush_path_to_streaks_xz(self, data_path):
+        """
+        Apply brush stroke in XZ view to set boolean streak flags based on current spinbox (0/1).
+        """
+        r = self.radius_spinbox.value()
+        data_path = self._interpolate_path(data_path, r)
+        fc = self.finit_center_spinbox.value()
+        half = self.finit_thickness_slider.value() / self.scaleFactor / 2
+        shear = np.tan(np.radians(self.xz_shear_spinbox.value()))
+        slab_mask = (self.points[:, 1] >= (fc - half)) & (self.points[:, 1] <= (fc + half))
+        slab_idx = np.nonzero(slab_mask)[0]
+        if slab_idx.size == 0:
+            return
+        pts = self.points[slab_idx]
+        coords = np.vstack([pts[:, 0] + shear * (pts[:, 1] - fc), pts[:, 2]]).T
+        tree = cKDTree(coords)
+        hit = set()
+        for xf, z in data_path:
+            rel = tree.query_ball_point([xf, z], r)
+            for j in rel:
+                hit.add(slab_idx[j])
+        base = self.label_spinbox.value()
+        for i in hit:
+            self.streaks[i] = (base == 1)
+        self.update_views()
+
+    def _update_views_streak(self):
+        """
+        Repaint views showing only streak flags (black for False, label-1 color for True).
+        """
+        # XY view
+        z_center = self.z_center_spinbox.value()
+        z_thick = self.z_thickness_slider.value() / self.scaleFactor
+        z_min = z_center - z_thick / 2
+        z_max = z_center + z_thick / 2
+        mask_xy = (self.points[:, 2] >= z_min) & (self.points[:, 2] <= z_max)
+        pts_xy = self.original_points[mask_xy] if self.show_original_points else self.points[mask_xy]
+        streaks_xy = self.streaks[mask_xy]
+        # wrap top/bottom
+        mask_top = pts_xy[:, 1] < -90
+        pts_top = pts_xy[mask_top].copy(); pts_top[:, 1] += 360
+        s_top = streaks_xy[mask_top]
+        mask_bot = pts_xy[:, 1] > 90
+        pts_bot = pts_xy[mask_bot].copy(); pts_bot[:, 1] -= 360
+        s_bot = streaks_xy[mask_bot]
+        pts_all = np.concatenate([pts_xy, pts_top, pts_bot], axis=0)
+        streaks_all = np.concatenate([streaks_xy, s_top, s_bot], axis=0)
+        # shear transforms
+        vert = np.tan(np.radians(self.xy_vertical_shear_spinbox.value()))
+        horz = np.tan(np.radians(self.xy_horizontal_shear_spinbox.value()))
+        f_inits = pts_all[:, 1] + vert * (pts_all[:, 2] - z_center)
+        f_stars = pts_all[:, 0] + horz * (pts_all[:, 2] - z_center)
+        # downsample
+        keep = self.downsample_points(pts_all, self.max_display, axis='xy')
+        xs = f_stars[keep]; ys = f_inits[keep]
+        sts = streaks_all[keep]
+        # brushes
+        brushes = [self.brush_black if not s else self.active_brushes[1] for s in sts]
+        self.xy_scatter.setData(x=xs, y=ys, size=self.point_size, pen=None, brush=brushes)
+        # hide calculated labels and overlays
+        self.xy_calc_scatter.setData([], [], size=self.point_size, pen=None, brush=[])
+        self._overlay.setVisible(False)
+        # XZ view
+        f_center = self.finit_center_spinbox.value()
+        f_thick = self.finit_thickness_slider.value() / self.scaleFactor
+        f_min = f_center - f_thick / 2
+        f_max = f_center + f_thick / 2
+        mask_xz = (self.points[:, 1] >= f_min) & (self.points[:, 1] <= f_max)
+        pts_xz = self.original_points[mask_xz] if self.show_original_points else self.points[mask_xz]
+        streaks_xz = self.streaks[mask_xz]
+        shear = np.tan(np.radians(self.xz_shear_spinbox.value()))
+        disp = pts_xz.copy(); disp[:, 0] = pts_xz[:, 0] + shear * (pts_xz[:, 1] - f_center)
+        keep_xz = self.downsample_points(disp, self.max_display, axis='xz')
+        xs_xz = disp[:, 0][keep_xz]; ys_xz = disp[:, 2][keep_xz]
+        sts_xz = streaks_xz[keep_xz]
+        brushes_xz = [self.brush_black if not s else self.active_brushes[1] for s in sts_xz]
+        self.xz_scatter.setData(x=xs_xz, y=ys_xz, size=self.point_size, pen=None, brush=brushes_xz)
+        self.xz_calc_scatter.setData([], [], size=self.point_size, pen=None, brush=[])
+        self._overlay_xz.setVisible(False)
+        # update guides/groups
+        self.update_guides()
+        self.update_groups_data()
+        self.recompute = False
 
     def _paint_points(self, ev, plot_widget, view_name):
         start_time = time.time()
@@ -2101,6 +2235,10 @@ class PointCloudLabeler(QMainWindow):
 
     def update_views(self, val=None):
         if not hasattr(self, 'xy_scatter'):
+            return
+        # In streak mode, only display boolean streaks
+        if self.streak_mode:
+            self._update_views_streak()
             return
         t0 = time.time()
         # ----- Compute z-slice values -----
@@ -3279,6 +3417,13 @@ class PointCloudLabeler(QMainWindow):
         else:
             self.calc_draw_button.setText("Update Labels Draw Mode: Off")
     
+    def toggle_streak_mode(self, checked):
+        """
+        Toggle streak drawing mode: when on, brush strokes will toggle the boolean streak
+        flag on points instead of assigning numeric labels.
+        """
+        self.streak_mode = checked
+
     def apply_all_calculated_labels(self):
         mask = (self.labels == self.UNLABELED) & (self.calculated_labels != self.UNLABELED)
         if np.any(mask):
