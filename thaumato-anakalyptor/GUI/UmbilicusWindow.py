@@ -111,7 +111,10 @@ class UmbilicusWindow(QMainWindow):
             # ome-zarr volume
             self.zarr_volume = zarr.open(self.imagePath)
             self.zarr_volume = self.zarr_volume[0]
-            print(f"Shape of zarr volume: {self.zarr_volume.shape}, min: {np.min(self.zarr_volume)}, max: {np.max(self.zarr_volume)}")
+            print(f"Shape of zarr volume: {self.zarr_volume.shape}, dtype: {np.array(self.zarr_volume).dtype}")
+            small_cutout = self.zarr_volume.shape[0] // 2
+            smal_array = self.zarr_volume[small_cutout]
+            print(f"Some value in the middle: {smal_array}")
             for i in range(len(self.zarr_volume)):
                 self.images[i] = f"zarr z-slice {i}"
         else:
