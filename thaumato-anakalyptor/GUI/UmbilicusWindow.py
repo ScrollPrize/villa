@@ -276,8 +276,7 @@ class UmbilicusWindow(QMainWindow):
     def savePoints(self):
         umbilicus_name = "umbilicus.txt"
         try:
-            umbilicus_folder = os.path.dirname(self.imagePath) if self.imagePath.endswith('.zarr') else self.imagePath
-            umbilicus_path = os.path.join(umbilicus_folder, umbilicus_name)
+            umbilicus_path = os.path.join(self.imagePath, umbilicus_name)
             print(umbilicus_path)
             point_keys = list(self.points.keys())
             # sort list
@@ -287,7 +286,8 @@ class UmbilicusWindow(QMainWindow):
                     x, y = self.points[index]
                     file.write(f"{y + 500}, {index + 500}, {x + 500}\n")
 
-            umbilicus_path = os.path.join(self.imagePath + "_grids", umbilicus_name)
+            umbilicus_folder = os.path.dirname(self.imagePath) if self.imagePath.endswith('.zarr') else self.imagePath + "_grids"
+            umbilicus_path = os.path.join(umbilicus_folder, umbilicus_name)
             print(umbilicus_path)
             with open(umbilicus_path, "w") as file:
                 for index in point_keys:
