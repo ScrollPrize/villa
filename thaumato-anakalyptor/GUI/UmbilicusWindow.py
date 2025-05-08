@@ -148,6 +148,7 @@ class UmbilicusWindow(QMainWindow):
                 self.image = image_array
                 self.index_old = index
             else:
+                print("Image already loaded, skipping load.")
                 image_array = self.image
 
             # print(f"Loaded image {imagePath} at index {index} with shape {image_array.shape} and dtype {image_array.dtype}")
