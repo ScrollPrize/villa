@@ -439,8 +439,12 @@ class MeshDataset(Dataset):
 
         self.vertices = np.asarray(self.mesh.vertices)
         self.normals = np.asarray(self.mesh.vertex_normals)
+        if len(self.normals) == 0:
+            print("No normals found. Computing normals.")
+            self.mesh = self.mesh.compute_vertex_normals()
+            self.normals = np.asarray(self.mesh.vertex_normals)
         self.triangles = np.asarray(self.mesh.triangles)
-        print("Number of triangles:", len(self.triangles))
+        
         uv = np.asarray(self.mesh.triangle_uvs).reshape(-1, 3, 2)
         # scale numpy UV coordinates to the image size
         self.uv = uv * np.array([y_size, x_size])
