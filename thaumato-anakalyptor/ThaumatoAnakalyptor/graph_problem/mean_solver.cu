@@ -48,6 +48,8 @@ inline __global__ void update_nodes_kernel_f_star_step(Node* d_graph, size_t* d_
     // Loop over all edges to compute the update step
     for (int j = 0; j < node.num_edges; ++j) {
         const Edge& edge = edges[j];
+        // Skip temporary edges
+        if (edge.temporary) continue;
         size_t target_node = edge.target_node;
         float step_edge = lr;
         float target_tilde = d_graph[target_node].f_tilde;

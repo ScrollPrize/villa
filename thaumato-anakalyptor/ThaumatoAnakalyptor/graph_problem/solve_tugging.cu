@@ -37,6 +37,8 @@ __global__ void update_nodes_kernel_tugging_f_star(Node* d_graph, size_t* d_vali
     // loop over all edges and update the nodes
     for (int j = 0; j < node.num_edges; ++j) {
         const Edge& edge = edges[j];
+        // Skip temporary edges
+        if (edge.temporary) continue;
         size_t target_node = edge.target_node;
         if (d_graph[target_node].deleted) continue;
         float n2n1 = d_graph[target_node].f_tilde - node_f_tilde;
@@ -130,6 +132,8 @@ __global__ void update_nodes_kernel_tugging(Node* d_graph, size_t* d_valid_indic
     float f_loc = node.f_star;
     int active_neighbors = 0;
     for (int j = 0; j < node.num_edges; ++j) {
+        // Skip temporary edges
+        if (node.edges[j].temporary) continue;
         Node& nei = d_graph[node.edges[j].target_node];
         if (nei.deleted) continue;
         if (!node.edges[j].same_block) continue;
@@ -152,6 +156,8 @@ __global__ void apply_tugging_kernel(Node* d_graph, size_t* d_valid_indices,
     // Distribute to neighbors
     float steps = node.happiness;
     for (int j = 0; j < node.num_edges; ++j) {
+        // Skip temporary edges
+        if (node.edges[j].temporary) continue;
         Node& nei = d_graph[node.edges[j].target_node];
         if (nei.deleted) continue;
         if (!node.edges[j].same_block) continue;

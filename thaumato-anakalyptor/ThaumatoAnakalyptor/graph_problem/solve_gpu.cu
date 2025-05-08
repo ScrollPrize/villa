@@ -125,6 +125,8 @@ __global__ void update_nodes_kernel(Node* d_graph, size_t* d_valid_indices, floa
 
     // recalculate edges wnr based on the target wnr
     for (int j = 0; j < node.num_edges; ++j) {
+        // Skip temporary edges
+        if (edges[j].temporary) continue;
         Node& target_node = d_graph[edges[j].target_node];
         int target_wnr = target_node.winding_nr_old;
 
@@ -166,6 +168,8 @@ __global__ void update_nodes_kernel(Node* d_graph, size_t* d_valid_indices, floa
     // loop over all edges and update the nodes
     for (int j = 0; j < node.num_edges; ++j) {
         const Edge& edge = edges[j];
+        // Skip temporary edges
+        if (edge.temporary) continue;
         size_t target_node = edge.target_node;
         if (d_graph[target_node].deleted) continue;
         float n2n1 = d_graph[target_node].f_tilde - node_f_tilde;
@@ -956,6 +960,8 @@ __global__ void update_nodes_kernel_f_star(Node* d_graph, size_t* d_valid_indice
     // loop over all edges and update the nodes
     for (int j = 0; j < node.num_edges; ++j) {
         const Edge& edge = edges[j];
+        // Skip temporary edges
+        if (edge.temporary) continue;
         size_t target_node = edge.target_node;
         if (d_graph[target_node].deleted) continue;
         float n2n1 = d_graph[target_node].f_tilde - node_f_tilde;
@@ -1048,6 +1054,8 @@ __global__ void update_nodes_kernel_sides(Node* d_graph, size_t* d_valid_indices
     // loop over all edges and update the nodes
     for (int j = 0; j < node.num_edges; ++j) {
         const Edge& edge = edges[j];
+        // Skip temporary edges
+        if (edge.temporary) continue;
         size_t target_node = edge.target_node;
         if (d_graph[target_node].deleted) continue;
 
@@ -1121,6 +1129,8 @@ __global__ void update_nodes_kernel_winding_number_step1(Node* d_graph, size_t* 
 
     // recalculate edges wnr based on the target wnr
     for (int j = 0; j < node.num_edges; ++j) {
+        // Skip temporary edges
+        if (edges[j].temporary) continue;
         Node& target_node = d_graph[edges[j].target_node];
         if (target_node.deleted) {
             continue;
@@ -1190,6 +1200,8 @@ __global__ void update_nodes_kernel_winding_number_step2(Node* d_graph, size_t* 
     // loop over all edges and update the nodes
     for (int j = 0; j < node.num_edges; ++j) {
         const Edge& edge = edges[j];
+        // Skip temporary edges
+        if (edge.temporary) continue;
         size_t target_node = edge.target_node;
         if (d_graph[target_node].deleted) continue;
         if (edge.certainty < 0.001f) {
@@ -1205,6 +1217,8 @@ __global__ void update_nodes_kernel_winding_number_step2(Node* d_graph, size_t* 
             float certainty_sum = 0.0f;
             int num_same_block = 0;
             for (int l = 0; l < node.num_edges; ++l) {
+                // Skip temporary edges
+                if (edges[l].temporary) continue;
                 if (d_graph[edges[l].target_node].deleted) continue;
                 float certainty = fmaxf(0.001f, edges[l].certainty);
                 certainty_sum += certainty;
@@ -1389,6 +1403,8 @@ __global__ void update_nodes_kernel_random_step1(Node* d_graph, size_t* d_valid_
     
     // recalculate edges wnr based on the target wnr
     for (int j = 0; j < node.num_edges; ++j) {
+        // Skip temporary edges
+        if (edges[j].temporary) continue;
         Node& target_node = d_graph[edges[j].target_node];
         int target_wnr = target_node.winding_nr_old;
 
@@ -1419,6 +1435,8 @@ __global__ void update_nodes_kernel_random_step2(Node* d_graph, size_t* d_valid_
 
     int available_edges = 0;
     for (int j = 0; j < node.num_edges; ++j) {
+        // Skip temporary edges
+        if (edges[j].temporary) continue;
         if (d_graph[edges[j].target_node].deleted) continue;
         if (fabsf(edges[j].wnr_from_target) > 900) continue;
         available_edges++;
@@ -1432,6 +1450,8 @@ __global__ void update_nodes_kernel_random_step2(Node* d_graph, size_t* d_valid_
     bool negative_k = false;
     int winding_nr2 = -1000;
     for (int j = 0; j < node.num_edges; ++j) {
+        // Skip temporary edges
+        if (edges[j].temporary) continue;
         if (d_graph[edges[j].target_node].deleted) continue;
         if (fabsf(edges[j].wnr_from_target) > 900) continue;
         if (edge_counter == random_edge) {
