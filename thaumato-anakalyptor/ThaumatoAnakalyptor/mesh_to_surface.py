@@ -443,6 +443,11 @@ class MeshDataset(Dataset):
         uv = np.asarray(self.mesh.triangle_uvs).reshape(-1, 3, 2)
         # scale numpy UV coordinates to the image size
         self.uv = uv * np.array([y_size, x_size])
+        if len(self.uv) == len(self.vertices):
+            print("UV coordinates match vertices ([Khartes format])")
+            # put uv from current format into num triangles, 3, uv standard format
+            self.uv = self.uv[self.triangles]
+        assert len(self.uv) == len(self.triangles), f"UV coordinates {len(self.uv)} do not match triangles {len(self.triangles)}"
         self.image_size = (y_size, x_size)
 
         # Generate the mask image for foreground/background separation

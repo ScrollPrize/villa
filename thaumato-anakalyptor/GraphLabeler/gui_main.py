@@ -1760,6 +1760,14 @@ class PointCloudLabeler(QMainWindow):
         but draw UNLABELED in the “unlabeled” color (black here)."""
         lab = self.label_spinbox.value()
         alpha = 150
+        # In streak mode, use black for label 0 (clear) and color for label 1
+        if getattr(self, 'streak_mode', False):
+            if lab == 1:
+                # color matching active brush for label 1
+                base = self.active_brushes[1].color()
+                return QColor(base.red(), base.green(), base.blue(), alpha)
+            else:
+                return QColor(0, 0, 0, alpha)
 
         if lab == self.UNLABELED:
             # draw erase strokes in your unlabeled color
