@@ -111,6 +111,7 @@ class UmbilicusWindow(QMainWindow):
             # ome-zarr volume
             self.zarr_volume = zarr.open(self.imagePath)
             self.zarr_volume = self.zarr_volume[0]
+            print(f"Shape of zarr volume: {self.zarr_volume.shape}, min: {self.zarr_volume.min()}, max: {self.zarr_volume.max()}")
             for i in range(len(self.zarr_volume)):
                 self.images[i] = f"zarr z-slice {i}"
         else:
@@ -141,6 +142,7 @@ class UmbilicusWindow(QMainWindow):
                 if self.zarr_volume is not None:
                     print(f"Loading zarr volume image at index {index}")
                     image_array = self.zarr_volume[index]
+
                 else:
                     imagePath = os.path.join(self.imagePath, self.images[index])
                     # Use tifffile to read the TIFF image
