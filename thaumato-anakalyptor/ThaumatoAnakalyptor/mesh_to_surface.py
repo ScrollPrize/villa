@@ -326,7 +326,7 @@ class MyPredictionWriter(BasePredictionWriter):
         
 class MeshDataset(Dataset):
     """Dataset class for rendering a mesh."""
-    def __init__(self, path, scroll, scroll_format="grid cells", output_path=None, grid_size=500, r=32, max_side_triangle=10, max_workers=1, display=False, r_steps=None):
+    def __init__(self, path, scroll, scroll_format="grid cells", output_path=None, grid_size=500, r=32, max_side_triangle=10, max_workers=1, display=False, r_steps=None, volume_offset=None):
         """Initialize the dataset."""
         self.grid_size = grid_size
         self.path = path
@@ -340,7 +340,7 @@ class MeshDataset(Dataset):
             # self.grid_size = chunk_size[0]
         self.r = r+1
         self.max_side_triangle = max_side_triangle
-        self.load_mesh(path)
+        self.load_mesh(path, volume_offset)
         output_path = os.path.dirname(path) if output_path is None else output_path
         write_path = os.path.join(output_path, "layers")
         self.writer = MyPredictionWriter(write_path, self.image_size, r, r_steps=r_steps, max_workers=max_workers, display=display)
@@ -378,8 +378,10 @@ class MeshDataset(Dataset):
         mask = mask[::-1, :]
         cv2.imwrite(os.path.join(os.path.dirname(self.path), os.path.basename(self.path).split(".")[0] + "_mask.png"), mask)
         
-    def load_mesh(self, path):
+    def load_mesh(self, path, volume_offset=None):
         """Load the mesh from the given path and extract the vertices, normals, triangles, and UV coordinates."""
+        volume_offset = np.zeros(3) if volume_offset is None else np.array(volume_offset)
+
         # Get the working path and base name
         working_path = os.path.dirname(path)
         base_name = os.path.splitext(os.path.basename(path))[0]
@@ -437,7 +439,7 @@ class MeshDataset(Dataset):
         self.mesh = mesh
         print(f"Loaded mesh from {path}", end="\n")
 
-        self.vertices = np.asarray(self.mesh.vertices)
+        self.vertices = np.asarray(self.mesh.vertices) + volume_offset
         self.normals = np.asarray(self.mesh.vertex_normals)
         if len(self.normals) == 0:
             print("No normals found. Computing normals.")
@@ -949,7 +951,7 @@ def custom_collate_fn(batch):
     except:
         return None, None, None, None, None, None
     
-def ppm_and_texture(obj_path, scroll, output_path=None, grid_size=500, gpus=1, batch_size=1, r=32, format='jpg', max_side_triangle: int = 10, display=False, nr_workers=None, prefetch_factor=2, r_steps=None):
+def ppm_and_texture(obj_path, scroll, output_path=None, grid_size=500, gpus=1, batch_size=1, r=32, format='jpg', max_side_triangle: int = 10, display=False, nr_workers=None, prefetch_factor=2, r_steps=None, volume_offset=None):
     # Number of workers
     num_threads = multiprocessing.cpu_count() // int(1.5 * int(gpus))
     num_treads_for_gpus = 12
@@ -973,7 +975,7 @@ def ppm_and_texture(obj_path, scroll, output_path=None, grid_size=500, gpus=1, b
         scroll = os.path.join(scroll, "cell_yxz_{:03}_{:03}_{:03}.tif")
 
     # Initialize the dataset and dataloader
-    dataset = MeshDataset(obj_path, scroll, scroll_format=scroll_format, output_path=output_path, grid_size=grid_size, r=r, max_side_triangle=max_side_triangle, max_workers=max_workers, display=display, r_steps=r_steps)
+    dataset = MeshDataset(obj_path, scroll, scroll_format=scroll_format, output_path=output_path, grid_size=grid_size, r=r, max_side_triangle=max_side_triangle, max_workers=max_workers, display=display, r_steps=r_steps, volume_offset=volume_offset)
     dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=custom_collate_fn, shuffle=False, num_workers=num_workers, prefetch_factor=prefetch_factor)
     model = PPMAndTextureModel(r=r, max_side_triangle=max_side_triangle)
     
@@ -1013,10 +1015,12 @@ if __name__ == '__main__':
     parser.add_argument('--nr_workers', type=int, default=None)
     parser.add_argument('--prefetch_factor', type=int, default=2)
     parser.add_argument('--r_steps', type=int, default=None, help="Number of layers to render at a time (segment size).")
+    # 3 integers for volume offset
+    parser.add_argument('--volume_offset', type=int, nargs=3, default=[0, 0, 0], help="Offset for the volume in x, y, z direction.")
     args = parser.parse_known_args()[0]
 
     print(f"Rendering args: {args}")
     if args.display:
         print("[INFO]: Displaying the rendering image slows down the rendering process by about 20%.")
 
-    ppm_and_texture(args.obj, gpus=args.gpus, scroll=args.scroll, output_path=args.output_path, r=args.r, format=args.format, max_side_triangle=args.max_side_triangle, display=args.display, nr_workers=args.nr_workers, prefetch_factor=args.prefetch_factor, r_steps=args.r_steps)
+    ppm_and_texture(args.obj, gpus=args.gpus, scroll=args.scroll, output_path=args.output_path, r=args.r, format=args.format, max_side_triangle=args.max_side_triangle, display=args.display, nr_workers=args.nr_workers, prefetch_factor=args.prefetch_factor, r_steps=args.r_steps, volume_offset=args.volume_offset) 
