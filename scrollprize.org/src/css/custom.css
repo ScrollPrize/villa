@@ -97,7 +97,7 @@ figcaption {
   }
 
   .navbar--fixed-top {
-    display: none;
+    /* display: none; */
   }
 
   .docs-doc-id-landing .container {
