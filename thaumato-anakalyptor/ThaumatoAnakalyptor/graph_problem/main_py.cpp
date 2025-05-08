@@ -769,6 +769,45 @@ class Solver {
             }
             return errors;
         }
+        void deactivate_same_block_edges(std::vector<bool> deactivate_indices) {
+            std::vector<size_t> valid_indices = get_valid_indices(graph);
+            // reset the deactivate indices
+            for (size_t i = 0; i < valid_indices.size(); ++i) {
+                size_t index = valid_indices[i];
+                if (graph[index].deleted) {
+                    continue;
+                }
+                for (int j = 0; j < graph[index].num_edges; ++j) {
+                    Edge& edge = graph[index].edges[j];
+                    edge.temporary = false;
+                }
+            }
+            // deactivate same block edges
+            for (size_t i = 0; i < deactivate_indices.size(); ++i) {
+                size_t index = valid_indices[i];
+                if (graph[index].deleted) {
+                    continue;
+                }
+                if (!deactivate_indices[i]) {
+                    continue;
+                }
+                // loop trough edges, get non-deleted edges
+                for (int j = 0; j < graph[index].num_edges; ++j) {
+                    Edge& edge = graph[index].edges[j];
+                    if (edge.same_block) {
+                        edge.temporary = true;
+                        size_t target_node = edge.target_node;
+                        // deactivate edge in target node
+                        for (int k = 0; k < graph[target_node].num_edges; ++k) {
+                            if (graph[target_node].edges[k].target_node == index) {
+                                graph[target_node].edges[k].temporary = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         std::vector<size_t> get_undeleted_indices() {
             // get labels
             std::vector<size_t> undeleted;
@@ -1220,6 +1259,9 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("delete_indices"))
         .def("node_errors", &Solver::node_errors,
             "Method to calculate the error of nodes of the graph")
+        .def("deactivate_same_block_edges", &Solver::deactivate_same_block_edges,
+            "Method to deactivate the same block edges of the graph",
+            py::arg("deactivate_indices"))
         .def("get_undeleted_indices", &Solver::get_undeleted_indices,
             "Method to get the undeleted node indices of the graph")
         .def("set_undeleted_indices", &Solver::set_undeleted_indices,
