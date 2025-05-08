@@ -736,6 +736,39 @@ class Solver {
             // get largest connected component
             largest_connected_component();
         }
+        std::vector<float> node_errors() {
+            std::vector<size_t> valid_indices = get_valid_indices(graph);
+            std::vector<float> errors(valid_indices.size());
+            for (size_t i = 0; i < valid_indices.size(); ++i) {
+                size_t index = valid_indices[i];
+                if (graph[index].deleted) {
+                    continue;
+                }
+                // loop trough edges, get non-deleted edges, find mean error
+                float error = 0.0f;
+                size_t count = 0;
+                for (int j = 0; j < graph[index].num_edges; ++j) {
+                    const Edge& edge = graph[index].edges[j];
+                    if (graph[edge.target_node].deleted) {
+                        continue;
+                    }
+                    // skip non same block edges
+                    if (!edge.same_block) {
+                        continue;
+                    }
+                    float diff = graph[edge.target_node].f_star - graph[index].f_star;
+                    error += std::abs(diff - edge.k);
+                    count++;
+                }
+                if (count == 0) {
+                    errors[i] = 0.0f;
+                }
+                else {
+                    errors[i] = error / count;
+                }
+            }
+            return errors;
+        }
         std::vector<size_t> get_undeleted_indices() {
             // get labels
             std::vector<size_t> undeleted;
@@ -1185,6 +1218,8 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
         .def("delete_nodes", &Solver::delete_nodes,
             "Method to delete nodes of the graph",
             py::arg("delete_indices"))
+        .def("node_errors", &Solver::node_errors,
+            "Method to calculate the error of nodes of the graph")
         .def("get_undeleted_indices", &Solver::get_undeleted_indices,
             "Method to get the undeleted node indices of the graph")
         .def("set_undeleted_indices", &Solver::set_undeleted_indices,
