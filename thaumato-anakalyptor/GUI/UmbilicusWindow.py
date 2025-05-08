@@ -139,6 +139,7 @@ class UmbilicusWindow(QMainWindow):
         if index in self.images:
             if self.index_old != index:
                 if self.zarr_volume is not None:
+                    print(f"Loading zarr volume image at index {index}")
                     image_array = self.zarr_volume[index]
                 else:
                     imagePath = os.path.join(self.imagePath, self.images[index])
