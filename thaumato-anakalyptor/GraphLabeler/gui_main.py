@@ -3260,6 +3260,12 @@ class PointCloudLabeler(QMainWindow):
         undeleted = self.solver.get_undeleted_indices()
         other_block_factor=float(self.solve_other_block_factor_spinbox.value())
         if self.solver is not None:
+            # Deactivate edges within same streak blocks before updating labels
+            try:
+                self.solver.deactivate_same_block_edges(list(self.streaks))
+            except Exception:
+                # Solver may not support streak deactivation; ignore if unavailable
+                pass
             self.solver.remove_temporary_edges()
             gt = self.set_labels()
 
