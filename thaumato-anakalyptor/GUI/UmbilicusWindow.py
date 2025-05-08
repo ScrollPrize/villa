@@ -107,6 +107,7 @@ class UmbilicusWindow(QMainWindow):
     def construct_images(self):
         self.images = {}
         if self.imagePath.endswith('.zarr'):
+            print("Loading zarr volume")
             # ome-zarr volume
             self.zarr_volume = zarr.open(self.imagePath)
             self.zarr_volume = self.zarr_volume[0]
