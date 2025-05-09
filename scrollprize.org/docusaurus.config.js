@@ -116,6 +116,10 @@ const config = {
                   label: "Jobs",
                   to: "/jobs",
                 },
+                {
+                  label: "🔍 Search",
+                  to: "/search",
+                },
               ],
             },
           ],
@@ -176,6 +180,12 @@ const config = {
           defaultMode: "dark",
           disableSwitch: true,
           respectPrefersColorScheme: false,
+        },
+        algolia: {
+          appId: "2MRGB42TC7",
+          apiKey: "282aecede2dcd2fa6af0028c9a01b748",
+          indexName: "scrollprize",
+          searchPagePath: "search",
         },
       }),
 
