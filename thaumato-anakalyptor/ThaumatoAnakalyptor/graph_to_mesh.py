@@ -459,8 +459,14 @@ class WalkToSheet():
             sample_points = node_data['sample_points']
             winding_angle_vector = np.full((len(sample_points), 1), winding_angle)
             points_ = np.concatenate((sample_points, winding_angle_vector), axis=1)
+            if len(points_) == 0:
+                print(f"Node {node_key} has no sample points.")
+                continue
             points.append(points_)
 
+        if len(points) == 0:
+            print(f"No points found for nodes {sheet_infos}.")
+            return None
         points = np.concatenate(points, axis=0)
         # filter z range
         if z_range is not None:
