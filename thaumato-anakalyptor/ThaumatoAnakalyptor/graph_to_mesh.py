@@ -1903,6 +1903,10 @@ class WalkToSheet():
                         points = None
                         normals = None
 
+                if points is None or len(points) == 0:
+                    print(f"No points found in z range {z_range}.")
+                    continue
+
                 # some debugging visualization of seperate pointcloud windings
                 if debug:
                     # get winding angles
