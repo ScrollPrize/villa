@@ -495,12 +495,13 @@ class WalkToSheet():
             patch_sheet_patch_info = (block, int(patch_id), winding_angle)
             sheet_infos.append(patch_sheet_patch_info)
         time_start = time.time()
-        # print(sheet_infos)
-        if self.path.endswith(".pkl"):
-            # use sample_points from nodes in python graph pkl
-            points, normals, colors = self.build_points_graph(sheet_infos, z_range=z_range)
-        else:
-            points, normals, colors = pointcloud_processing.load_pointclouds(nodes=sheet_infos, path=self.path, start_z=z_range[0], end_z=z_range[1], single_threaded=single_threaded_pc_load, verbose=True)
+        if len(sheet_infos) > 0:
+            # print(sheet_infos)
+            if self.path.endswith(".pkl"):
+                # use sample_points from nodes in python graph pkl
+                points, normals, colors = self.build_points_graph(sheet_infos, z_range=z_range)
+            else:
+                points, normals, colors = pointcloud_processing.load_pointclouds(nodes=sheet_infos, path=self.path, start_z=z_range[0], end_z=z_range[1], single_threaded=single_threaded_pc_load, verbose=True)
         print(f"Time to load pointclouds: {time.time() - time_start}")
         print(f"Shape of patch_points: {np.array(points).shape}")
 
