@@ -116,6 +116,10 @@ const config = {
                   label: "Jobs",
                   to: "/jobs",
                 },
+                {
+                  label: "🔍 Search",
+                  to: "/search",
+                },
               ],
             },
           ],
