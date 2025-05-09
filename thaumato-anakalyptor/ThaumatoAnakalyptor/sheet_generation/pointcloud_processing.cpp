@@ -838,7 +838,7 @@ public:
         progress = 0;
         problem_size = cloud_.pts.size() / 1000;
 
-        std::cout << "Processing " << cloud_.pts.size() <<< " points using KD-tree..." << std::endl;
+        std::cout << "Processing " << cloud_.pts.size() << " points using KD-tree..." << std::endl;
         for (size_t i = 0; i < num_threads; ++i) {
             try {
                 size_t start = i * part_length;
