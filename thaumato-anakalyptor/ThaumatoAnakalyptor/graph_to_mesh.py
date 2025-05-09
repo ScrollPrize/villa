@@ -466,7 +466,7 @@ class WalkToSheet():
 
         if len(points) == 0:
             print(f"No points found for nodes {sheet_infos}.")
-            return None
+            return [], [], []
         points = np.concatenate(points, axis=0)
         # filter z range
         if z_range is not None:
