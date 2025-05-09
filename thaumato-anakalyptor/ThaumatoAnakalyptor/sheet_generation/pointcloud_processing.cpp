@@ -885,8 +885,9 @@ private:
             return;
         }
         progress++;
-        // Print every 1% progress
-        if (problem_size <= 0 || progress % (problem_size / 100) == 0) {
+        // Print progress at regular intervals (avoid division by zero)
+        size_t step = problem_size / 100;
+        if (step == 0 || (progress % step == 0)) {
             std::cout << "Progress: " << progress << "/" << problem_size << "\r";
             std::cout.flush();
         }
@@ -984,7 +985,7 @@ private:
             try {
                 std::vector<nf::ResultItem<size_t, double>> ret_matches;
                 nf::SearchParameters params;
-                const double query_pt[3] = { static_cast<double>(cloud_.pts[i].x), static_cast<double>(cloud_.pts[i].y), static_cast<double>(cloud_.pts[i].z) };
+                const double query_pt[3] = { cloud_.pts[i].x, cloud_.pts[i].y, cloud_.pts[i].z };
                 const double radius = spatial_threshold * spatial_threshold;
                 index->radiusSearch(&query_pt[0], radius, ret_matches, params);
                 for (auto& match : ret_matches) {
