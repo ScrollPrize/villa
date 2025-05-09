@@ -341,7 +341,7 @@ class PointCloudLabeler(QMainWindow):
         top_controls_layout.addWidget(self.solver_combo)
 
         self.use_z_range_checkbox = QCheckBox("Solve in Z range")
-        self.use_z_range_checkbox.setChecked(False)
+        self.use_z_range_checkbox.setChecked(True)
         top_controls_layout.addWidget(self.use_z_range_checkbox)
 
         solve_iterations_layout = QHBoxLayout()
