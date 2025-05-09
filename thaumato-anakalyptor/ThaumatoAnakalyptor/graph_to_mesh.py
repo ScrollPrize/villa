@@ -1903,7 +1903,7 @@ class WalkToSheet():
                         points = None
                         normals = None
 
-                if points is None or len(points) == 0:
+                if points is not None and len(points) == 0:
                     print(f"No points found in z range {z_range}.")
                     continue
 
