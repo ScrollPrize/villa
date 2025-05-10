@@ -337,6 +337,7 @@ class PointCloudLabeler(QMainWindow):
         # --- Solver selection dropdown ---
         self.solver_combo = QComboBox()
         self.solver_combo.addItems(["F*", "Linear", "F*3", "F*4", "Ripple", "Smooth", "Ripple Smooth Combined", "Tugging", "F*Slab", "Winding Number", "Union", "Random", "Create Good Edges", "Set Labels"])
+        self.solver_combo.setCurrentIndex(6) # Default to "Ripple Smooth Combined"
         top_controls_layout.addWidget(QLabel("Select Solver:"))
         top_controls_layout.addWidget(self.solver_combo)
 
