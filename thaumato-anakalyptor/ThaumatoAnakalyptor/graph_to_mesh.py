@@ -1784,7 +1784,6 @@ class WalkToSheet():
         # Number of rows and columns in the pointset grid
         num_rows = len(ordered_pointsets)
         num_cols = len(ordered_pointsets[0][0]) if num_rows > 0 else 0
-        ordered_pointsets = np.array(ordered_pointsets)
 
         print(f"Number of rows: {num_rows}, number of columns: {num_cols}")
 
