@@ -1839,7 +1839,7 @@ class WalkToSheet():
 
     def split(self, mesh_path, split_width=50000, fresh_start=True, stamp=None):
         # Split Scroll mesh into smaller parts of width split_width
-        umbilicus_path = os.path.join(os.path.dirname(self.path), "umbilicus.txt")
+        umbilicus_path = os.path.join(os.path.dirname(self.save_path), "umbilicus.txt")
         splitter = MeshSplitter(mesh_path, umbilicus_path, self.scale_factor)
         split_mesh_paths, stamp = splitter.compute(split_width=split_width, fresh_start=fresh_start, stamp=stamp)
         # Return the paths to the split meshes
