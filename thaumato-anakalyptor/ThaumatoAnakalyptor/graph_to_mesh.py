@@ -2028,7 +2028,7 @@ class WalkToSheet():
             split_mesh_paths, stamp = self.split(mesh_path, split_width=self.split_width, fresh_start=(continue_from <= 6), stamp=stamp)
 
             # Flatten mesh
-            args = [(self.save_path, split_mesh_path, downsample) for split_mesh_path in split_mesh_paths]
+            args = [(os.path.dirname(self.save_path), split_mesh_path, downsample) for split_mesh_path in split_mesh_paths]
             # num_threads = min(max(1, multiprocessing.cpu_count() // 2), 5)
             # with multiprocessing.Pool(num_threads) as pool:
             #     tqdm(pool.imap(flatten_args, args), total=len(args), desc="Flattening meshes")
