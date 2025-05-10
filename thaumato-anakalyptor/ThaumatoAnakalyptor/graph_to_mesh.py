@@ -1538,9 +1538,9 @@ class WalkToSheet():
         test_pointset_ply_path = os.path.join(test_folder, f"ordered_pointset_test_cpp.ply")
         self.pointcloud_from_ordered_pointset(pointset, os.path.join(self.save_path, test_pointset_ply_path))
            
-    def rolled_ordered_pointset(self, result, angles, continue_from=0, fragment=False, angle_step=0.5, learning_rate=0.2, iterations=11, unfix_factor=2.5, num_threads=None, valid_clip=True):
+    def rolled_ordered_pointset(self, result, continue_from=0, fragment=False, angle_step=0.5, learning_rate=0.2, iterations=11, unfix_factor=2.5, num_threads=None, valid_clip=True):
         print("length of result: ", len(result))
-        ordered_pointset, ordered_normals, ordered_umbilicus_points, angle_vector = zip(*result)
+        ordered_pointset, ordered_normals, ordered_umbilicus_points, angles, angle_vector = zip(*result)
         print("length of ordered_pointset: ", len(ordered_pointset))
 
         # determine winding direction
@@ -2010,7 +2010,7 @@ class WalkToSheet():
         result, angles = self.load_pointcloud_to_raw_ordered_pointset(debug=debug, continue_from=continue_from, z_range=z_range, angle_step=angle_step, z_spacing=z_spacing, max_z_step_size=max_z_step_size, single_threaded_pc_load=single_threaded_pc_load)
 
         # get nodes
-        ordered_pointsets_s = self.rolled_ordered_pointset(result, angles, angle_step=angle_step, continue_from=continue_from, fragment=fragment, learning_rate=learning_rate, iterations=iterations, unfix_factor=unfix_factor, num_threads=num_threads, valid_clip=valid_clip)
+        ordered_pointsets_s = self.rolled_ordered_pointset(result, angle_step=angle_step, continue_from=continue_from, fragment=fragment, learning_rate=learning_rate, iterations=iterations, unfix_factor=unfix_factor, num_threads=num_threads, valid_clip=valid_clip)
 
         pointset_ply_path = os.path.join(self.save_path, "ordered_pointset.ply")
         self.pointcloud_from_ordered_pointset(ordered_pointsets_s[0], pointset_ply_path)
