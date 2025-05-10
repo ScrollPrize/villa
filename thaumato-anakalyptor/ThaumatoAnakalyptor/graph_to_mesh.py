@@ -1329,7 +1329,7 @@ class WalkToSheet():
 
         return result_ts, result_normals
     
-    def clip_valid_windings(self, result_ts, result_normals, angle_vector, angle_step,
+    def clip_valid_windings(self, result_ts, result_normals, angles, angle_vector, angle_step,
                             valid_p_winding=0.1, valid_p_z=0.1, reverse=False):
         # If reverse flag is set, reverse the input arrays.
         # The reversed array is obtained by slicing with [::-1]
@@ -1337,6 +1337,7 @@ class WalkToSheet():
             print("Reversing the input arrays.")
             result_ts = result_ts[::-1]
             result_normals = result_normals[::-1]
+            angles = angles[::-1]
             angle_vector = angle_vector[::-1]
 
         steps_per_winding = 360 / angle_step
@@ -1381,6 +1382,7 @@ class WalkToSheet():
         if valid_start_index < valid_end_index:
             valid_ts = result_ts[valid_start_index:valid_end_index]
             valid_normals = result_normals[valid_start_index:valid_end_index]
+            valid_angles = angles[valid_start_index:valid_end_index]
             valid_angle_vector = angle_vector[valid_start_index:valid_end_index]
             # Reset angle vector indices global variable
             global angle_vector_indices_dp
@@ -1388,15 +1390,17 @@ class WalkToSheet():
         else:
             valid_ts = []
             valid_normals = []
+            valid_angles = []
             valid_angle_vector = []
 
         # If reverse flag was set, reverse the valid segments back to the original order.
         if reverse:
             valid_ts = valid_ts[::-1]
             valid_normals = valid_normals[::-1]
+            valid_angles = valid_angles[::-1]
             valid_angle_vector = valid_angle_vector[::-1]
 
-        return [valid_ts], [valid_normals], [valid_angle_vector]
+        return [valid_ts], [valid_normals], [valid_angles], [valid_angle_vector]
     
     def clip_valid_angles_fragment(self, result_ts, result_normals, angle_vector, angle_step, valid_p_winding=0.01, valid_p_z=0.01):
         # Clip away invalid windings at the beginning and end of the ordered pointset
@@ -1534,7 +1538,7 @@ class WalkToSheet():
         test_pointset_ply_path = os.path.join(test_folder, f"ordered_pointset_test_cpp.ply")
         self.pointcloud_from_ordered_pointset(pointset, os.path.join(self.save_path, test_pointset_ply_path))
            
-    def rolled_ordered_pointset(self, result, continue_from=0, fragment=False, angle_step=0.5, learning_rate=0.2, iterations=11, unfix_factor=2.5, num_threads=None, valid_clip=True):
+    def rolled_ordered_pointset(self, result, angles, continue_from=0, fragment=False, angle_step=0.5, learning_rate=0.2, iterations=11, unfix_factor=2.5, num_threads=None, valid_clip=True):
         print("length of result: ", len(result))
         ordered_pointset, ordered_normals, ordered_umbilicus_points, angle_vector = zip(*result)
         print("length of ordered_pointset: ", len(ordered_pointset))
@@ -1563,9 +1567,9 @@ class WalkToSheet():
             valid_p = 0.4
             if not fragment:
                 if valid_clip:
-                    valid_ts_s, valid_normals_s, angle_vector_s = self.clip_valid_windings(result_ts, result_normals, angle_vector, angle_step, valid_p_winding=valid_p, valid_p_z=valid_p, reverse=winding_direction)
+                    valid_ts_s, valid_normals_s, valid_angles_s, angle_vector_s = self.clip_valid_windings(result_ts, result_normals, angles, angle_vector, angle_step, valid_p_winding=valid_p, valid_p_z=valid_p, reverse=winding_direction)
                 else:
-                    valid_ts_s, valid_normals_s, angle_vector_s = [result_ts], [result_normals], [angle_vector]
+                    valid_ts_s, valid_normals_s, valid_angles_s, angle_vector_s = [result_ts], [result_normals], [angles], [angle_vector]
             else:
                 valid_p = 0.1
                 start_indices, end_indices = self.clip_valid_angles_fragment(result_ts, result_normals, angle_vector, angle_step, valid_p_winding=valid_p, valid_p_z=valid_p)
@@ -1591,13 +1595,15 @@ class WalkToSheet():
                 if valid_clip:
                     valid_ts_s = [interpolated_ts[start_indices[i]-start_index_0:end_indices[i]-start_index_0] for i in range(len(start_indices))]
                     valid_normals_s = [interpolated_normals[start_indices[i]-start_index_0:end_indices[i]-start_index_0] for i in range(len(start_indices))]
+                    valid_angles_s = [angles[start_indices[i]-start_index_0:end_indices[i]-start_index_0] for i in range(len(start_indices))]
                     angle_vector_s = [angle_vector[start_indices[i]:end_indices[i]] for i in range(len(start_indices))]
                 else:
-                    valid_ts_s, valid_normals_s, angle_vector_s = [interpolated_ts], [interpolated_normals], [angle_vector]
+                    valid_ts_s, valid_normals_s, valid_angles_s, angle_vector_s = [interpolated_ts], [interpolated_normals], [angles], [angle_vector]
 
             for valid_i_s in range(len(valid_ts_s)):
                 valid_ts = valid_ts_s[valid_i_s]
                 valid_normals = valid_normals_s[valid_i_s]
+                valid_angles = valid_angles_s[valid_i_s]
                 angle_vector = angle_vector_s[valid_i_s]
 
                 # clear angular precomputation
@@ -1651,7 +1657,7 @@ class WalkToSheet():
                 # Creating ordered pointset output format
                 ordered_pointsets_final = []
                 for i in range(len(interpolated_points)):
-                    ordered_pointsets_final.append((np.array(interpolated_points[i]), np.array(interpolated_normals[i]), np.array(interpolated_has_points[i])))
+                    ordered_pointsets_final.append((np.array(interpolated_points[i]), np.array(interpolated_normals[i]), np.array(interpolated_has_points[i]), np.array(valid_angles[i])))
 
                 # Debug output
                 self.ordered_pointset_to_pointcloud_save(interpolated_ts, interpolated_normals, ordered_umbilicus_points, angle_vector)
@@ -1757,7 +1763,7 @@ class WalkToSheet():
 
         # First, convert all pointsets into a single list of vertices
         vertices, normals = [], []
-        for point, normal, _ in ordered_pointsets:
+        for point, normal, _, angle in ordered_pointsets:
             if point is not None:
                 vertices.append(point)
                 normals.append(normal)
@@ -2004,7 +2010,7 @@ class WalkToSheet():
         result, angles = self.load_pointcloud_to_raw_ordered_pointset(debug=debug, continue_from=continue_from, z_range=z_range, angle_step=angle_step, z_spacing=z_spacing, max_z_step_size=max_z_step_size, single_threaded_pc_load=single_threaded_pc_load)
 
         # get nodes
-        ordered_pointsets_s = self.rolled_ordered_pointset(result, angle_step=angle_step, continue_from=continue_from, fragment=fragment, learning_rate=learning_rate, iterations=iterations, unfix_factor=unfix_factor, num_threads=num_threads, valid_clip=valid_clip)
+        ordered_pointsets_s = self.rolled_ordered_pointset(result, angles, angle_step=angle_step, continue_from=continue_from, fragment=fragment, learning_rate=learning_rate, iterations=iterations, unfix_factor=unfix_factor, num_threads=num_threads, valid_clip=valid_clip)
 
         pointset_ply_path = os.path.join(self.save_path, "ordered_pointset.ply")
         self.pointcloud_from_ordered_pointset(ordered_pointsets_s[0], pointset_ply_path)
