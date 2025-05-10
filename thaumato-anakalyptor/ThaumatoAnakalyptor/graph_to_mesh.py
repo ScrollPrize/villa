@@ -426,7 +426,7 @@ class WalkToSheet():
         self.split_width = split_width
         self.graph = graph
         self.path = path
-        self.save_path = os.path.dirname(path) + f"/{start_point[0]}_{start_point[1]}_{start_point[2]}/" if not path.endswith(".pkl") else os.path.dirname(path) + "/"
+        self.save_path = os.path.dirname(path) + f"/{start_point[0]}_{start_point[1]}_{start_point[2]}" if not path.endswith(".pkl") else os.path.dirname(path)
         self.lock = threading.Lock()
 
     def find_minmax_winding_angle_z_range(self):
