@@ -725,10 +725,12 @@ class WalkToSheet():
 
         computed_vectors_set = set()
         interpolated_ts = []
+        interpolated_has_points = []
         interpolated_normals = []
         fixed_points = []
         for i in range(len(t_means)):
             interpolated_ts.append([None]*len(t_means[i]))
+            interpolated_has_points.append([False]*len(t_means[i]))
             interpolated_normals.append([None]*len(t_means[i]))
             fixed_points.append([False]*len(t_means[i]))
         
@@ -748,6 +750,7 @@ class WalkToSheet():
                         interpolated_ts[j][z] = t_means[j][z]
                         interpolated_normals[j][z] = normals_means[j][z]
                         fixed_points[j][z] = True
+                        interpolated_has_points[j][z] = True
                         continue
                     adjacent_vector_ts = [same_vector_ts[a][z] for a in range(len(same_vector_ts))]
                     prev_mean, prev_ind, next_mean, next_ind = adjacent_means(e, adjacent_vector_ts)
@@ -909,7 +912,7 @@ class WalkToSheet():
             if not anything_changed:
                 break
 
-        return interpolated_ts, interpolated_normals, fixed_points
+        return interpolated_ts, interpolated_normals, fixed_points, interpolated_has_points
     
     def deduct_ordered_pointset_neighbours(self, ordered_pointset, angle_vector, winding_direction):
         # create a dictionary with the indices of the points in the ordered pointset as keys and a list of the indices of the neighbouring points as values
@@ -1575,7 +1578,7 @@ class WalkToSheet():
                 angle_vector_ = angle_vector[start_index_0:end_index_last]
 
                 # interpolate initial full pointset. After this step there exists an "ordered pointset" prototype without any None values
-                interpolated_ts, interpolated_normals, fixed_points = self.initial_full_pointset(valid_ts, valid_normals, angle_vector_, mean_innermost_ts, mean_outermost_ts, winding_direction)
+                interpolated_ts, interpolated_normals, fixed_points, interpolated_has_points = self.initial_full_pointset(valid_ts, valid_normals, angle_vector_, mean_innermost_ts, mean_outermost_ts, winding_direction)
 
                 # Calculate for each point in the ordered pointset its neighbouring indices (3d in a 2d list). on same sheet, top bottom, front back, adjacent sheets neighbours: left right
                 neighbours_dict = self.deduct_ordered_pointset_neighbours(interpolated_ts, angle_vector_, winding_direction)
@@ -1605,7 +1608,7 @@ class WalkToSheet():
 
                 if not fragment:
                     # interpolate initial full pointset. After this step there exists an "ordered pointset" prototype without any None values
-                    interpolated_ts, interpolated_normals, fixed_points = self.initial_full_pointset(valid_ts, valid_normals, angle_vector, mean_innermost_ts, mean_outermost_ts, winding_direction)
+                    interpolated_ts, interpolated_normals, fixed_points, interpolated_has_points = self.initial_full_pointset(valid_ts, valid_normals, angle_vector, mean_innermost_ts, mean_outermost_ts, winding_direction)
 
                     # Calculate for each point in the ordered pointset its neighbouring indices (3d in a 2d list). on same sheet, top bottom, front back, adjacent sheets neighbours: left right
                     neighbours_dict = self.deduct_ordered_pointset_neighbours(interpolated_ts, angle_vector, winding_direction)
@@ -1626,6 +1629,7 @@ class WalkToSheet():
                 if valid_clip:
                     interpolated_ts = [interpolated_ts[i][valid_bottom_index:valid_top_index] for i in range(len(interpolated_ts))]
                     interpolated_normals = [interpolated_normals[i][valid_bottom_index:valid_top_index] for i in range(len(interpolated_normals))]
+                    interpolated_has_points = [interpolated_has_points[i][valid_bottom_index:valid_top_index] for i in range(len(interpolated_has_points))]
                     ordered_umbilicus_points_ = [ordered_umbilicus_points[i][valid_bottom_index:valid_top_index] for i in range(len(ordered_umbilicus_points))]
                 else:
                     ordered_umbilicus_points_ = ordered_umbilicus_points                    
@@ -1637,6 +1641,7 @@ class WalkToSheet():
                 # subsample everything
                 interpolated_ts = [interpolated_ts[i] for i in interpolated_subsample_indices]
                 interpolated_points = [interpolated_points[i] for i in interpolated_subsample_indices]
+                interpolated_has_points = [interpolated_has_points[i] for i in interpolated_subsample_indices]
                 interpolated_normals = [interpolated_normals[i] for i in interpolated_subsample_indices]
                 ordered_umbilicus_points_ = [ordered_umbilicus_points_[i] for i in interpolated_subsample_indices]
                 angle_vector = [angle_vector[i] for i in interpolated_subsample_indices]
@@ -1646,7 +1651,7 @@ class WalkToSheet():
                 # Creating ordered pointset output format
                 ordered_pointsets_final = []
                 for i in range(len(interpolated_points)):
-                    ordered_pointsets_final.append((np.array(interpolated_points[i]), np.array(interpolated_normals[i])))
+                    ordered_pointsets_final.append((np.array(interpolated_points[i]), np.array(interpolated_normals[i]), np.array(interpolated_has_points[i])))
 
                 # Debug output
                 self.ordered_pointset_to_pointcloud_save(interpolated_ts, interpolated_normals, ordered_umbilicus_points, angle_vector)
@@ -1752,7 +1757,7 @@ class WalkToSheet():
 
         # First, convert all pointsets into a single list of vertices
         vertices, normals = [], []
-        for point, normal in ordered_pointsets:
+        for point, normal, _ in ordered_pointsets:
             if point is not None:
                 vertices.append(point)
                 normals.append(normal)
@@ -1965,7 +1970,7 @@ class WalkToSheet():
                     # results shape: total num angle steps, "ordered_pointset, ordered_normals, ordered_umbilicus_points, angle_vector", z steps, "individual shape"
                     for i in range(len(result)): # angle steps
                         for j in range(len(result[i])): # type of data
-                            if j == 3: # angle vector
+                            if j >= 3: # angle vector (same for same angle), angle (same for each slab)
                                 continue
                             results[i][j].extend(result[i][j]) # extend the z steps
                 
@@ -1977,15 +1982,26 @@ class WalkToSheet():
             # Save the results
             with open(results_pkl_path, 'wb') as f:
                 pickle.dump(results, f)
+            # Save angles
+            angles = []
+            for i in range(len(results)):
+                angles.append(results[i][4])
+            angles_pkl_path = os.path.join(self.save_path, "angles.pkl")
+            with open(angles_pkl_path, 'wb') as f:  
+                pickle.dump(angles, f)
         else:
             with open(results_pkl_path, 'rb') as f:
                 results = pickle.load(f)
-        
-        return results
+            # Load angles
+            angles_pkl_path = os.path.join(self.save_path, "angles.pkl")
+            with open(angles_pkl_path, 'rb') as f:  
+                angles = pickle.load(f)
+
+        return results, angles
 
     def unroll(self, fragment=False, debug=False, continue_from=0, z_range=None, angle_step=1, z_spacing=10, learning_rate=0.2, iterations=11, unfix_factor=2.5, downsample=False, max_z_step_size=250, num_threads=None, valid_clip=True, single_threaded_pc_load=False, smoothing_factor=3.5):
         # Load the graph
-        result = self.load_pointcloud_to_raw_ordered_pointset(debug=debug, continue_from=continue_from, z_range=z_range, angle_step=angle_step, z_spacing=z_spacing, max_z_step_size=max_z_step_size, single_threaded_pc_load=single_threaded_pc_load)
+        result, angles = self.load_pointcloud_to_raw_ordered_pointset(debug=debug, continue_from=continue_from, z_range=z_range, angle_step=angle_step, z_spacing=z_spacing, max_z_step_size=max_z_step_size, single_threaded_pc_load=single_threaded_pc_load)
 
         # get nodes
         ordered_pointsets_s = self.rolled_ordered_pointset(result, angle_step=angle_step, continue_from=continue_from, fragment=fragment, learning_rate=learning_rate, iterations=iterations, unfix_factor=unfix_factor, num_threads=num_threads, valid_clip=valid_clip)

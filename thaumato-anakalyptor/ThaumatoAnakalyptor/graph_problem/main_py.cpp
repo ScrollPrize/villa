@@ -794,7 +794,7 @@ class Solver {
                 // loop trough edges, get non-deleted edges
                 for (int j = 0; j < graph[index].num_edges; ++j) {
                     Edge& edge = graph[index].edges[j];
-                    if (edge.same_block) {
+                    if (edge.same_block || true) {
                         edge.temporary = true;
                         size_t target_node = edge.target_node;
                         // deactivate edge in target node

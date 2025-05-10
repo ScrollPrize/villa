@@ -1252,7 +1252,7 @@ class EfficientPointsetProcessor {
 public:
     EfficientPointsetProcessor(bool verbose) : verbose(verbose) {}
 
-    std::vector<std::tuple<std::vector<std::vector<float>>, std::vector<std::vector<std::vector<float>>>, std::vector<std::vector<float>>, std::vector<float>>> create_ordered_pointset_processor(
+    std::vector<std::tuple<std::vector<std::vector<float>>, std::vector<std::vector<std::vector<float>>>, std::vector<std::vector<float>>, std::vector<float>, float>> create_ordered_pointset_processor(
         py::array_t<float> original_points,
         py::array_t<float> original_normals,
         py::array_t<float> umbilicus_points,
@@ -1415,7 +1415,8 @@ public:
     std::vector<std::vector<float>>,             // For each z bin: ordered ts (radii) values
     std::vector<std::vector<std::vector<float>>>,  // For each z bin: ordered normals
     std::vector<std::vector<float>>,               // Precomputed ordered umbilicus points (one per z bin)
-    std::vector<float>                             // Angle vector for this angle step
+    std::vector<float>,                             // Angle vector for this angle step
+    float                                      // Winding angle
     >> processPointsetV2(
         const std::vector<std::vector<float>>& sorted_points,  // Pre-sorted by winding angle (4th entry)
         const std::vector<std::vector<float>>& sorted_normals,
@@ -1467,7 +1468,8 @@ public:
             std::vector<std::vector<float>>,             // ordered ts (radii) per z bin
             std::vector<std::vector<std::vector<float>>>,  // ordered normals per z bin
             std::vector<std::vector<float>>,               // ordered umbilicus points (common to all bins)
-            std::vector<float>                             // angle vector for this angle step
+            std::vector<float>,                             // angle vector for this angle step
+            float                                       // winding angle
         >> results(numSteps);
 
         size_t nPoints = sorted_points.size();
@@ -1631,7 +1633,7 @@ public:
 
             // Store the result for this angle step.
             // results.push_back(std::make_tuple(ordered_ts, ordered_normals, ordered_umbilicus_points, angle_vector));
-            results[step] = {ordered_ts, ordered_normals, ordered_umbilicus_points, angle_vector};
+            results[step] = {ordered_ts, ordered_normals, ordered_umbilicus_points, angle_vector, targetAngle};
 
             // Print every 1% progress
             if (verbose && step % (numSteps / 100) == 0) {
@@ -2097,7 +2099,7 @@ private:
 };
 
 
-std::vector<std::tuple<std::vector<std::vector<float>>, std::vector<std::vector<std::vector<float>>>, std::vector<std::vector<float>>, std::vector<float>>> create_ordered_pointset(
+std::vector<std::tuple<std::vector<std::vector<float>>, std::vector<std::vector<std::vector<float>>>, std::vector<std::vector<float>>, std::vector<float>, float>> create_ordered_pointset(
     py::array_t<float> original_points,
     py::array_t<float> original_normals,
     py::array_t<float> umbilicus_points,

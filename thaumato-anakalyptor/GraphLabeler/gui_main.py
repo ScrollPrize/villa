@@ -3262,7 +3262,7 @@ class PointCloudLabeler(QMainWindow):
         if self.solver is not None:
             # Deactivate edges within same streak blocks before updating labels
             try:
-                self.solver.deactivate_same_block_edges(list(self.streaks))
+                self.solver.deactivate_same_block_edges([bool(s) for s in self.streaks])
             except Exception:
                 # Solver may not support streak deactivation; ignore if unavailable
                 pass
