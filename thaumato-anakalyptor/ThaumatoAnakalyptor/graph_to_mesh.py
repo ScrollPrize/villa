@@ -1540,7 +1540,7 @@ class WalkToSheet():
            
     def rolled_ordered_pointset(self, result, continue_from=0, fragment=False, angle_step=0.5, learning_rate=0.2, iterations=11, unfix_factor=2.5, num_threads=None, valid_clip=True):
         print("length of result: ", len(result))
-        ordered_pointset, ordered_normals, ordered_umbilicus_points, angles, angle_vector = zip(*result)
+        ordered_pointset, ordered_normals, ordered_umbilicus_points, angle_vector, angles = zip(*result)
         print("length of ordered_pointset: ", len(ordered_pointset))
 
         # determine winding direction
