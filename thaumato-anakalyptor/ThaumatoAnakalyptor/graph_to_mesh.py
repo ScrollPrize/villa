@@ -1763,11 +1763,13 @@ class WalkToSheet():
         tringles_uv = []
 
         # First, convert all pointsets into a single list of vertices
-        vertices, normals = [], []
-        for point, normal, _, angle in ordered_pointsets:
+        vertices, normals, has_points, angles = [], [], [], []
+        for point, normal, has_point, angle in ordered_pointsets:
             if point is not None:
                 vertices.append(point)
                 normals.append(normal)
+                has_points.append(has_point)
+                angles.append(angle)
         # Convert to Open3D compatible format
         vertices = np.concatenate(vertices, axis=0)
         normals = np.concatenate(normals, axis=0)
@@ -1814,6 +1816,10 @@ class WalkToSheet():
         # Create a grayscale image with a specified size
         n, m = int(np.ceil(num_rows)), int(np.ceil(num_cols))  # replace with your dimensions
         uv_image = Image.new('L', (n, m), color=255)  # 255 for white background, 0 for black
+
+        # Save has points and angles to pkl
+        with open(os.path.join(self.save_path, "mesh_metadata.pkl"), 'wb') as f:
+            pickle.dump((has_points, angles), f)
 
         return mesh, uv_image
     
