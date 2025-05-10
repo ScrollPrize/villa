@@ -794,15 +794,20 @@ class Solver {
                 // loop trough edges, get non-deleted edges
                 for (int j = 0; j < graph[index].num_edges; ++j) {
                     Edge& edge = graph[index].edges[j];
-                    if (edge.same_block || true) {
+                    if (edge.same_block) {
                         edge.temporary = true;
                         size_t target_node = edge.target_node;
                         // deactivate edge in target node
+                        bool found = false;
                         for (int k = 0; k < graph[target_node].num_edges; ++k) {
-                            if (graph[target_node].edges[k].target_node == index) {
+                            if (graph[target_node].edges[k].target_node == index && graph[target_node].edges[k].same_block) {
                                 graph[target_node].edges[k].temporary = true;
+                                found = true;
                                 break;
                             }
+                        }
+                        if (!found) {
+                            std::cout << "Error: edge not found in target node: " << target_node << std::endl;
                         }
                     }
                 }
