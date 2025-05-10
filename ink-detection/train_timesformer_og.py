@@ -125,12 +125,27 @@ cfg_init(CFG)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+import zarr
+class ZarrArrayWrapper:
+  def __init__(self, array):
+    self.array = array
+  def __getitem__(self, slice):
+    #print("getting from zarr array wrapper", self.shape, "slice:", slice)
+    return self.array[(slice[2], slice[0], slice[1])].transpose(1,2,0)
+  @property
+  def shape(self):
+    return self.array.shape[1:] + self.array.shape[0:1]
+
 def read_image_mask(fragment_id,start_idx=17,end_idx=43, CFG=CFG):
     fragment_id_ = fragment_id.split("_")[0]
-    images = []
-    idxs = range(start_idx, end_idx)
+    if os.path.exists(f"train_scrolls/{fragment_id}/{fragment_id}.zarr"):
+      mra = zarr.load(f"train_scrolls/{fragment_id}/{fragment_id}.zarr")
+      images = ZarrArrayWrapper(mra[0])
+    else:
+      images = []
+      idxs = range(start_idx, end_idx)
 
-    for i in idxs:
+      for i in idxs:
         if os.path.exists(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{i:02}.tif"):
             image = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{i:02}.tif", 0)
         else:
@@ -140,8 +155,8 @@ def read_image_mask(fragment_id,start_idx=17,end_idx=43, CFG=CFG):
         image = np.pad(image, [(0, pad0), (0, pad1)], constant_values=0)        
         image=np.clip(image,0,200)
         images.append(image)
-    images = np.stack(images, axis=2)
-    if any(id_ in fragment_id_ for id_ in ['20230701020044','verso','20230901184804','20230901234823','20230531193658','20231007101615','20231005123333','20231011144857','20230522215721', '20230919113918', '20230625171244','20231022170900','20231012173610','20231016151000']):
+      images = np.stack(images, axis=2)
+      if any(id_ in fragment_id_ for id_ in ['20230701020044','verso','20230901184804','20230901234823','20230531193658','20231007101615','20231005123333','20231011144857','20230522215721', '20230919113918', '20230625171244','20231022170900','20231012173610','20231016151000']):
         images=images[:,:,::-1]
     # Get the list of files that match the pattern
     inklabel_files = glob.glob(f"train_scrolls/{fragment_id}/*inklabels.*")
