@@ -1710,7 +1710,8 @@ class WalkToSheet():
         
     def pointcloud_from_ordered_pointset(self, ordered_pointset, filename, color=None):
         points, normals = [], []
-        for point, normal in tqdm(ordered_pointset, desc="Building pointcloud"):
+        for i in tqdm(range(len(ordered_pointset)), desc="Building pointcloud"):
+            point, normal = ordered_pointset[i][0:2]
             if point is not None:
                 points.append(point)
                 normals.append(normal)
