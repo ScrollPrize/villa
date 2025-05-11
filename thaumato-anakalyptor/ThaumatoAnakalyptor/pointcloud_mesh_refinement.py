@@ -107,7 +107,7 @@ def flatten_pointcloud(base_path, k_neighbors=8, winding_width=4, angle_threshol
     os.makedirs(graph_dir, exist_ok=True)
 
     # process windings in segments
-    for start in range(0, len(winding_files), winding_width):
+    for start in range(0, len(winding_files)):
         end = min(start + winding_width, len(winding_files))
         print(f"Processing windings {start} to {end}")
         # load and concatenate pointcloud segments (points include x,y,z,angle)
