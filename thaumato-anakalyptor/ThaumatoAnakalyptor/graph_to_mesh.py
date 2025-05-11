@@ -1768,11 +1768,13 @@ class WalkToSheet():
             if point is not None:
                 vertices.append(point)
                 normals.append(normal)
-                has_points.append(has_point)
-                angles.append(angle)
+                has_points.append([has_point]*len(point))
+                angles.append([angle]*len(point))
         # Convert to Open3D compatible format
         vertices = np.concatenate(vertices, axis=0)
         normals = np.concatenate(normals, axis=0)
+        has_points = np.concatenate(has_points, axis=0)
+        angles = np.concatenate(angles, axis=0)
         # Invert normals
         normals = -normals
 
