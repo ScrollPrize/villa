@@ -43,6 +43,7 @@ def save_winding_pointcloud(winding_path, winding_nr, points):
 
 def generate_winding_pointclouds(mesh_path):
     vertices, (has_points, angles) = load_mesh(mesh_path)
+    print(f"Shape of vertices: {vertices.shape} and of angles: {angles.shape}")
     points_mesh = np.concatenate((vertices, angles), axis=1)
     points_mesh = points_mesh[np.logical_not(has_points)]
 
