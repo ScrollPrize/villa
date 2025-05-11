@@ -57,7 +57,11 @@ def generate_winding_pointclouds(mesh_path):
     for slab_path in tqdm(slabs, desc="Preprocessing slabs"):
         points = load_pointcloud_slab(slab_path).astype(np.float16)
         print(f"Shape of points: {points.shape} and of points_mesh: {points_mesh.shape}")
-        points = np.concatenate((points, points_mesh), axis=0)
+        if points.shape[0] == 0:
+            print("Slab has no points ...")
+            points = points_mesh
+        else:
+            points = np.concatenate((points, points_mesh), axis=0)
         min_angle = np.min(points[:, 3])
         max_angle = np.max(points[:, 3])
         min_winding = int(np.floor(min_angle / 360.0))
