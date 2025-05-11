@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 pointcloud_mesh_refinement.py
-Script to refine a pointcloud using mesh alignment and volumetric downsampling.
+Script to generate a refined mesh using the raw pointcloud and an initial mesh.
 """
 import argparse
 import numpy as np
@@ -41,6 +41,15 @@ def save_winding_pointcloud(winding_path, winding_nr, points):
     points = np.unique(points, axis=0)
     np.savez_compressed(file_path, points=points)
 
+def load_winding_pointcloud(winding_path, winding_nr):
+    # Load the winding pointcloud
+    file_path = os.path.join(winding_path, f"winding_{int(winding_nr)}.npz")
+    if os.path.exists(file_path):
+        points = np.load(file_path)['points']
+        return points
+    else:
+        raise ValueError(f"Winding pointcloud {file_path} not found.")
+
 def generate_winding_pointclouds(mesh_path):
     vertices, (has_points, angles) = load_mesh(mesh_path)
     angles = np.reshape(angles, (-1, 1))
@@ -70,7 +79,76 @@ def generate_winding_pointclouds(mesh_path):
             winding_angle = winding_nr * 360.0
             winding_points = points[np.logical_and(points[:, 3] >= winding_angle, points[:, 3] < winding_angle + 360.0)]
             if len(winding_points) > 0:
-                save_winding_pointcloud(os.path.join(base_path, "winding"), winding_nr, winding_points)
+                save_winding_pointcloud(os.path.join(base_path, "windings"), winding_nr, winding_points)
+
+def flatten_pointcloud(base_path, k_neighbors=8, winding_width=4, angle_threshold=30, angle_weight=0.2):
+    """
+    Flatten pointcloud by concatenating winding segments and building neighbor graphs.
+
+    Optionally, include the 4th dimension (angle) in neighbor search by providing `angle_weight`,
+    or filter out neighbors whose absolute angle difference exceeds `angle_threshold`.
+
+    Args:
+        base_path (str): Path to base directory containing 'windings'.
+        k_neighbors (int): Number of nearest neighbors per point (excluding self).
+        winding_width (int): Number of windings concatenated per graph segment.
+        angle_threshold (float, optional): Max allowed difference in 4th-dimension (angle) to keep a neighbor.
+        angle_weight (float, optional): Scale factor for 4th-dimension when computing distances in KD-tree.
+    """
+    from scipy.spatial import cKDTree
+
+    winding_path = os.path.join(base_path, "windings")
+    # find and order all winding pointclouds
+    winding_files = sorted(glob.glob(os.path.join(winding_path, "winding_*.npz")))
+    print(f"Found {len(winding_files)} winding pointclouds.")
+
+    # directory to save graphs
+    graph_dir = os.path.join(base_path, "graphs")
+    os.makedirs(graph_dir, exist_ok=True)
+
+    # process windings in segments
+    for start in range(0, len(winding_files), winding_width):
+        end = min(start + winding_width, len(winding_files))
+        print(f"Processing windings {start} to {end}")
+        # load and concatenate pointcloud segments (points include x,y,z,angle)
+        pcs = [np.load(wf)['points'] for wf in winding_files[start:end]]
+        points = np.concatenate(pcs, axis=0)
+        coords = points[:, :3]
+        # prepare KDTree input: optionally include 4th-dimension (angle) by weighting
+        if angle_weight is not None:
+            angs = points[:, 3].reshape(-1, 1) * angle_weight
+            tree_input = np.hstack((coords, angs))
+        else:
+            tree_input = coords
+        # build KDTree and query k+1 neighbors (self included)
+        tree = cKDTree(tree_input)
+        distances, indices = tree.query(tree_input, k=k_neighbors + 1)
+        # drop self
+        neighbor_ids = indices[:, 1:]
+        neighbor_dists = distances[:, 1:]
+        # apply 4th-dimension constraint if specified: drop neighbors with large angle diff
+        if angle_threshold is not None:
+            angs = points[:, 3]
+            # broadcast to (n_points, k_neighbors)
+            ref = angs.reshape(-1, 1)
+            nbrs = angs[neighbor_ids]
+            diff = np.abs(ref - nbrs)
+            mask = diff > angle_threshold
+            neighbor_ids[mask] = -1
+            neighbor_dists[mask] = np.inf
+        # build Python lists for each node, dropping invalid neighbors
+        neighbor_lists = []
+        distance_lists = []
+        for nbr_row, dist_row in zip(neighbor_ids, neighbor_dists):
+            valid = [(int(n), float(d)) for n, d in zip(nbr_row, dist_row) if n >= 0 and not np.isinf(d)]
+            neighbor_lists.append([n for n, _ in valid])
+            distance_lists.append([d for _, d in valid])
+        # save lists as pickle
+        out_file = os.path.join(graph_dir, f"graph_{start}_{end}.pkl")
+        with open(out_file, 'wb') as f:
+            pickle.dump({'neighbor_ids': neighbor_lists, 'neighbor_dists': distance_lists}, f)
+        print(f"Graph saved to {out_file}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Refine pointcloud using mesh and downsampling")
@@ -78,6 +156,7 @@ def main():
     args = parser.parse_args()
 
     generate_winding_pointclouds(args.mesh)
+    flatten_pointcloud(os.path.dirname(args.mesh))
 
 
 if __name__ == "__main__":
