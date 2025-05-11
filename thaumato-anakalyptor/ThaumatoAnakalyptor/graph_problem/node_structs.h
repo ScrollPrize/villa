@@ -108,6 +108,7 @@ void saveGraph(const std::vector<Node>& nodes, const std::string& filename);
 std::vector<Node> loadGraph(const std::string& filename, int version = 0);
 
 std::pair<std::vector<Node>, float> load_graph_from_binary(const std::string &file_name, bool clip_z, float z_min, float z_max, float same_winding_factor, bool fix_same_block_edges);
+std::pair<std::vector<Node>, float> load_flattening_graph_from_lists(const std::vector<std::vector<int>> connections, const std::vector<std::vector<float>> distances, const std::vector<float> winding_angle, const std::vector<float> z);
 
 std::vector<Node> createSubgraph(const std::vector<Node>& graph, const std::vector<bool>& mask);
 void updateGraphWithSubgraph(std::vector<Node>& graph, const std::vector<bool>& mask, const std::vector<Node>& subgraph);

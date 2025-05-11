@@ -7,9 +7,13 @@ import argparse
 import numpy as np
 import open3d as o3d
 import os
+import sys
 import pickle
 import glob
 from tqdm import tqdm
+
+sys.path.append('ThaumatoAnakalyptor/graph_problem/build')
+import graph_problem_gpu_py
 
 def load_mesh(mesh_file):
     mesh = o3d.io.read_triangle_mesh(mesh_file)
@@ -148,6 +152,9 @@ def flatten_pointcloud(base_path, k_neighbors=8, winding_width=4, angle_threshol
         with open(out_file, 'wb') as f:
             pickle.dump({'neighbor_ids': neighbor_lists, 'neighbor_dists': distance_lists}, f)
         print(f"Graph saved to {out_file}")
+
+        # load graph into cpp
+        solver = graph_problem_gpu_py.Solver(neighbor_lists, distance_lists)
 
 
 def main():

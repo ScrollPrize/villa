@@ -326,6 +326,33 @@ std::pair<std::vector<Node>, float> load_graph_from_binary(const std::string &fi
     return std::make_pair(graph, max_certainty);
 }
 
+std::pair<std::vector<Node>, float> load_flattening_graph_from_lists(const std::vector<std::vector<int>> connections, const std::vector<std::vector<float>> distances, const std::vector<float> winding_angle, const std::vector<float> z) {
+    std::vector<Node> graph;
+    int num_nodes = connections.size();
+    graph.resize(num_nodes);
+
+    for (int i = 0; i < num_nodes; ++i) {
+        graph[i].z = z[i];
+        graph[i].f_init = z[i];
+        graph[i].f_tilde = winding_angle[i];
+        graph[i].f_star = winding_angle[i];
+        graph[i].side = winding_angle[i];
+        graph[i].deleted = false;
+        // create edges
+        graph[i].num_edges = connections[i].size();
+        graph[i].edges = new Edge[graph[i].num_edges];
+        for (int j = 0; j < graph[i].num_edges; ++j) {
+            graph[i].edges[j].target_node = connections[i][j];
+            graph[i].edges[j].k = distances[i][j];
+            graph[i].edges[j].certainty = 1.0f;
+            graph[i].edges[j].same_block = false;
+        }
+    }
+
+    return std::make_pair(graph, 1.0f);
+}
+    
+
 std::vector<Node> createSubgraph(const std::vector<Node>& graph, const std::vector<bool>& mask) {
     // Build a mapping from original node indices to subgraph indices.
     std::vector<size_t> mapping(graph.size(), -1);
