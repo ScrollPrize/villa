@@ -51,6 +51,7 @@ def generate_winding_pointclouds(mesh_path):
     print("Preparing the winding pointclouds...")
     for slab_path in tqdm(slabs, desc="Preprocessing slabs"):
         points = load_pointcloud_slab(slab_path).astype(np.float16)
+        print(f"Shape of points: {points.shape} and of points_mesh: {points_mesh.shape}")
         points = np.concatenate((points, points_mesh), axis=0)
         min_angle = np.min(points[:, 3])
         max_angle = np.max(points[:, 3])
@@ -66,7 +67,7 @@ def main():
     parser = argparse.ArgumentParser(description="Refine pointcloud using mesh and downsampling")
     parser.add_argument("--mesh", required=True, help="Path to mesh file (.ply or .obj)")
     args = parser.parse_args()
-    
+
     generate_winding_pointclouds(args.mesh)
 
 
