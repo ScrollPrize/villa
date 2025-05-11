@@ -31,7 +31,7 @@ def load_pointcloud_slab(slab_path):
 
 def save_winding_pointcloud(winding_path, winding_nr, points):
     # make folder if it does not exist
-    os.makedirs(os.path.dirname(winding_path), exist_ok=True)
+    os.makedirs(winding_path, exist_ok=True)
     # Save the winding pointcloud
     file_path = os.path.join(winding_path, f"winding_{int(winding_nr)}.npz")
     points_prev = np.zeros((0, 4), dtype=np.float16)
