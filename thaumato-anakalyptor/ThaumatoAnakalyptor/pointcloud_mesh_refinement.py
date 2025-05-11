@@ -52,7 +52,7 @@ def generate_winding_pointclouds(mesh_path):
     base_path = os.path.dirname(mesh_path)
     glob_selected_points_paths = os.path.join(base_path, "points_selected_*.npz")
     print(f"Searching for selected points in {glob_selected_points_paths}")
-    slabs = glob.glob(glob_selected_points_paths)
+    slabs = glob.glob(glob_selected_points_paths).sorted()
     print("Preparing the winding pointclouds...")
     for slab_path in tqdm(slabs, desc="Preprocessing slabs"):
         points = load_pointcloud_slab(slab_path).astype(np.float16)
