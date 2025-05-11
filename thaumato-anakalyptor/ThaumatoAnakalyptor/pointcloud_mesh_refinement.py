@@ -36,7 +36,7 @@ def save_winding_pointcloud(winding_path, winding_nr, points):
     file_path = os.path.join(winding_path, f"winding_{int(winding_nr)}.npz")
     points_prev = np.zeros((0, 4), dtype=np.float16)
     if os.path.exists(file_path):
-        points_prev = np.load(file_path)
+        points_prev = np.load(file_path)['points']
     points = np.concatenate((points_prev, points), axis=0)
     points = np.unique(points, axis=0)
     np.savez_compressed(file_path, points=points)
