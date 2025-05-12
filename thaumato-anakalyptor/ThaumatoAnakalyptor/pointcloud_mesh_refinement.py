@@ -118,6 +118,7 @@ def flatten_pointcloud(base_path, k_neighbors=8, winding_width=4, angle_threshol
         pcs = [np.load(wf)['points'] for wf in winding_files[start:end]]
         points = np.concatenate(pcs, axis=0)
         coords = points[:, :3]
+        winding_angles = points[:, 3]
         # prepare KDTree input: optionally include 4th-dimension (angle) by weighting
         if angle_weight is not None:
             angs = points[:, 3].reshape(-1, 1) * angle_weight
@@ -141,12 +142,27 @@ def flatten_pointcloud(base_path, k_neighbors=8, winding_width=4, angle_threshol
             neighbor_ids[mask] = -1
             neighbor_dists[mask] = np.inf
         # build Python lists for each node, dropping invalid neighbors
-        neighbor_lists = []
-        distance_lists = []
-        for nbr_row, dist_row in zip(neighbor_ids, neighbor_dists):
-            valid = [(int(n), float(d)) for n, d in zip(nbr_row, dist_row) if n >= 0 and not np.isinf(d)]
-            neighbor_lists.append([n for n, _ in valid])
-            distance_lists.append([d for _, d in valid])
+        neighbor_lists = [[]* len(coords)]
+        distance_lists = [[]* len(coords)]
+        # iterate over each point and its neighbors
+        for i in range(len(coords)):
+            # get valid neighbors
+            valid_neighbors = neighbor_ids[i][neighbor_ids[i] != -1]
+            valid_distances = neighbor_dists[i][neighbor_ids[i] != -1]
+            # Add undirected edges
+            neighbor_lists[i].extend(valid_neighbors)
+            distance_lists[i].extend(valid_distances)
+            # Add reverse edges
+            for j in range(len(valid_neighbors)):
+                neighbor_lists[valid_neighbors[j]].append(i)
+                distance_lists[valid_neighbors[j]].append(valid_distances[j])
+
+        # unique neighbor lists
+        for i in range(len(coords)):
+            _, unique_indices = np.unique(neighbor_lists[i], return_index=True)
+            neighbor_lists[i] = [neighbor_lists[i][idx] for idx in unique_indices]
+            distance_lists[i] = [distance_lists[i][idx] for idx in unique_indices]
+
         # save lists as pickle
         out_file = os.path.join(graph_dir, f"graph_{start}_{end}.pkl")
         with open(out_file, 'wb') as f:
@@ -154,7 +170,10 @@ def flatten_pointcloud(base_path, k_neighbors=8, winding_width=4, angle_threshol
         print(f"Graph saved to {out_file}")
 
         # load graph into cpp
-        solver = graph_problem_gpu_py.Solver(neighbor_lists, distance_lists)
+        solver = graph_problem_gpu_py.Solver(neighbor_lists, distance_lists, winding_angles, coords[:,2])
+        # solve the graph problem
+        solver.solve_flattening()
+        
 
 
 def main():
