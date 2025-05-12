@@ -155,6 +155,7 @@ def flatten_pointcloud(base_path, k_neighbors=8, winding_width=4, angle_threshol
             # Add undirected edges
             neighbor_lists[i].extend(valid_neighbors)
             distance_lists[i].extend(valid_distances)
+            print(f"Length of coords: {len(coords)}, max of valid_neighbors: {max(valid_neighbors)}")
             # Add reverse edges
             for j in range(len(valid_indices)):
                 source = valid_neighbors[j]
