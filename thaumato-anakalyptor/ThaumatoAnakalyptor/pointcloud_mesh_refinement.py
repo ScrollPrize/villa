@@ -16,6 +16,7 @@ sys.path.append('ThaumatoAnakalyptor/graph_problem/build')
 # import graph_problem_gpu_py
 
 def load_mesh(mesh_file):
+    print (f"Loading mesh from {mesh_file}")
     mesh = o3d.io.read_triangle_mesh(mesh_file)
     vertices = np.asarray(mesh.vertices)
     metadata_file = os.path.join(os.path.dirname(mesh_file), "mesh_metadata.pkl")
@@ -147,13 +148,14 @@ def flatten_pointcloud(base_path, k_neighbors=8, winding_width=4, angle_threshol
         # iterate over each point and its neighbors
         for i in range(len(coords)):
             # get valid neighbors
-            valid_neighbors = neighbor_ids[i][neighbor_ids[i] != -1]
-            valid_distances = neighbor_dists[i][neighbor_ids[i] != -1]
+            valid_indices = np.where(neighbor_ids[i] != -1)[0]
+            valid_neighbors = neighbor_ids[i][valid_indices]
+            valid_distances = neighbor_dists[i][valid_indices]
             # Add undirected edges
             neighbor_lists[i].extend(valid_neighbors)
             distance_lists[i].extend(valid_distances)
             # Add reverse edges
-            for j in range(len(valid_neighbors)):
+            for j in range(len(valid_indices)):
                 neighbor_lists[valid_neighbors[j]].append(i)
                 distance_lists[valid_neighbors[j]].append(valid_distances[j])
 
