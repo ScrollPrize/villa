@@ -171,9 +171,10 @@ def flatten_pointcloud(base_path, k_neighbors=8, winding_width=4, angle_threshol
 
         # load graph into cpp
         solver = graph_problem_gpu_py.Solver(neighbor_lists, distance_lists, winding_angles, coords[:,2])
+        print("Set up the graph")
         # solve the graph problem
         solver.solve_flattening()
-        
+
 
 
 def main():
