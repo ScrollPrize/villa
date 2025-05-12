@@ -146,7 +146,7 @@ def flatten_pointcloud(base_path, k_neighbors=8, winding_width=4, angle_threshol
         # build Python lists for each node, dropping invalid neighbors
         neighbor_lists = [[]* len(coords)]
         distance_lists = [[]* len(coords)]
-        print(f"Length of coords: {len(coords)}, Length of neighbor_ids: {len(neighbor_ids)}, Length of neighbor_dists: {len(neighbor_dists)}")
+        print(f"Length of coords: {len(coords)}, Length of neighbor_ids: {len(neighbor_lists)}, Length of neighbor_dists: {len(distance_lists)}")
         # iterate over each point and its neighbors
         for i in range(len(coords)):
             # get valid neighbors
