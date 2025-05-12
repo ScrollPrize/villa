@@ -13,7 +13,7 @@ import glob
 from tqdm import tqdm
 
 sys.path.append('ThaumatoAnakalyptor/graph_problem/build')
-import graph_problem_gpu_py
+# import graph_problem_gpu_py
 
 def load_mesh(mesh_file):
     mesh = o3d.io.read_triangle_mesh(mesh_file)
