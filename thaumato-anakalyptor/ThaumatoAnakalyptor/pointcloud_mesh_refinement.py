@@ -129,6 +129,7 @@ def flatten_pointcloud(base_path, k_neighbors=8, winding_width=4, angle_threshol
         # build KDTree and query k+1 neighbors (self included)
         tree = cKDTree(tree_input)
         distances, indices = tree.query(tree_input, k=k_neighbors + 1)
+        print(f"Shape of distances: {distances.shape} and indices: {indices.shape}")
         # drop self
         neighbor_ids = indices[:, 1:]
         neighbor_dists = distances[:, 1:]
