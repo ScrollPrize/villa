@@ -160,8 +160,13 @@ def flatten_pointcloud(base_path, k_neighbors=8, winding_width=4, angle_threshol
             for j in range(len(valid_indices)):
                 source = valid_neighbors[j]
                 target = i
-                neighbor_lists[source].append(target)
-                distance_lists[source].append(valid_distances[j])
+                try:
+                    neighbor_lists[source].append(target)
+                    distance_lists[source].append(valid_distances[j])
+                except Exception as e:
+                    print(f"Error adding reverse edge: {e}")
+                    print(f"Source: {source}, Target: {target}, Length of neighbor_lists: {len(neighbor_lists)}, Length of distance_lists: {len(distance_lists)}")
+                    raise ValueError("Invalid index in neighbor lists.")
 
         # unique neighbor lists
         for i in range(len(coords)):
