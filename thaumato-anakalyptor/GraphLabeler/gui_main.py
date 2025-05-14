@@ -78,7 +78,8 @@ class PointCloudLabeler(QMainWindow):
         self.group_pipette_mode = False
         self.calc_drawing_mode = False
         self.UNLABELED = -9999
-        self.teflon_label = 200
+        # Load teflon label number from config (persistent) or use default 200
+        self.teflon_label = self.config.get("teflon_label", 200)
         self.undo_stack = []
         self.redo_stack = []
         self._stroke_backup = None
@@ -744,6 +745,8 @@ class PointCloudLabeler(QMainWindow):
         self.config["f_init_center"] = self.finit_center_spinbox.value()
         self.config["f_init_thickness"] = self.finit_thickness_spinbox.value()
         self.config["num_colors"] = self.num_colors
+        # Persist teflon label number
+        self.config["teflon_label"] = self.teflon_label
         save_config(self.config, "config_labeling_gui.json")
         event.accept()
     
@@ -945,6 +948,8 @@ class PointCloudLabeler(QMainWindow):
             self.config["f_init_center"] = self.finit_center_spinbox.value()
             self.config["f_init_thickness"] = self.finit_thickness_spinbox.value()
             self.config["num_colors"] = self.num_colors
+            # Persist teflon label number
+            self.config["teflon_label"] = self.teflon_label
             save_config(self.config, fname)
 
     def load_data(self):
