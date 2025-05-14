@@ -533,12 +533,14 @@ class Solver {
             run_solver_f_star_with_labels(subgraph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, spring_constant, other_block_factor, lr, error_cutoff, display);
             updateGraphWithSubgraph(graph, undeleted_mask, subgraph);
         }
-        
         void filter_f_star() {
             // Filters the graph edges based on the f star solution
             filter_graph_f_star(graph, 8 * 360.0f);
             // get largest connected component
             largest_connected_component();
+        }
+        void solve_flattening(int num_iterations, float z_tug_min, float z_tug_max, float angle_tug_min, float angle_tug_max, float tug_step) {
+            // TODO: implement this function
         }
         void solve_union() {
             // use the union solver for the final solution
@@ -1227,6 +1229,14 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("display") = false)
         .def("filter_f_star", &Solver::filter_f_star,
             "Method to filter the graph edges after running the f star solver")
+        .def("solve_flattening", &Solver::solve_flattening,
+            "Method to solve the mesh graph with the flattening solver",
+            py::arg("num_iterations") = 10000,
+            py::arg("z_tug_min") = 0.0f,
+            py::arg("z_tug_max") = 0.0f,
+            py::arg("angle_tug_min") = 0.0f,
+            py::arg("angle_tug_max") = 0.0f,
+            py::arg("tug_step") = 0.0f)
         .def("solve_union", &Solver::solve_union,
             "Method to solve the graph with the union solver")
         .def("solve_ring", &Solver::solve_ring,
