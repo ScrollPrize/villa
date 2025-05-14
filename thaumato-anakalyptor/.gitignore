@@ -9,3 +9,5 @@ python*/
 experiments/
 colormap.ply
 thaumato_image.*
+*.npy
+*.ply
