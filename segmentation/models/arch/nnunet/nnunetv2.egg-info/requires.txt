@@ -21,10 +21,9 @@ yacs
 batchgeneratorsv2>=0.2
 einops
 monai
-mamba_ssm
 edt
-timm
 opencv-python-headless
+wandb
 
 [dev]
 black

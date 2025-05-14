@@ -1,4 +1,4 @@
-Metadata-Version: 2.2
+Metadata-Version: 2.4
 Name: batchgeneratorsv2
 Version: 0.2.1
 Summary: Batchgenerators but better
@@ -222,6 +222,7 @@ Requires-Dist: torch>=2.0.0
 Requires-Dist: numpy
 Requires-Dist: fft-conv-pytorch
 Requires-Dist: batchgenerators>=0.25
+Dynamic: license-file
 
 # batchgeneratorsv2
 This repository is work in progress. If builds upon the [batchgenerators](https://github.com/MIC-DKFZ/batchgenerators) 

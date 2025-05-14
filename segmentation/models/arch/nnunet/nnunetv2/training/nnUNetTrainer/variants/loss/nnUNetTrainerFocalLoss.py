@@ -5,6 +5,7 @@ from nnunetv2.training.loss.focal_loss import FocalLoss
 from nnunetv2.training.loss.compound_losses import DC_and_Focal_loss
 from nnunetv2.training.loss.dice import SoftDiceLoss, MemoryEfficientSoftDiceLoss
 import numpy as np
+from typing import Optional
 
 class nnUNetTrainerFocalLoss(nnUNetTrainer):
     def _build_loss(self):
@@ -33,9 +34,10 @@ class nnUNetTrainerFocalLoss_300epochs(nnUNetTrainerFocalLoss):
         dataset_json: dict,
         unpack_dataset: bool = True,
         device: torch.device = torch.device("cuda"),
-    ):
+        yaml_config_path: Optional[str] = None
+     ):
         """used for debugging plans etc"""
-        super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
+        super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device, yaml_config_path)
         self.num_epochs = 300
 
 
@@ -68,7 +70,8 @@ class nnUNetTrainerDiceFocalLoss_300epochs(nnUNetTrainerDiceFocalLoss):
         dataset_json: dict,
         unpack_dataset: bool = True,
         device: torch.device = torch.device("cuda"),
+        yaml_config_path: Optional[str] = None
     ):
         """used for debugging plans etc"""
-        super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
+        super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device, yaml_config_path)
         self.num_epochs = 300

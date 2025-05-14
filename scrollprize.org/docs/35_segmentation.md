@@ -86,7 +86,7 @@ Move into the directory you have cloned the repo into, and then install the imag
 
 ```bash
 cd volume-cartographer-dev-next
-sudo docker build -f ubuntu-22.04-jammy.Dockerfile -t vc3d3 .
+sudo docker build -f ubuntu-24.04-noble.Dockerfile -t vc3d .
 ```
 
 **Launch VC3D**
@@ -491,7 +491,7 @@ It can be highly beneficial to manually seed volumes. The random seeding is just
   - If necessary, repeat the process until you have a seed on each wrap. 
   - Run vc_grow_seg_from_seed in expansion mode as detailed earlier in the tutorial
 
-The primary motivation for doing this is that if you run expansion mode on randomly created seeds, a significant portion of your compute time is spend expanding seeds into regions you might not care about, or expanding seeds along the case. While its generally true that if you leave expansion mode running long enough, it will fill the volume, this may take a while. It is also not possible for a seed to expand if the surface itself is not connected well to other surfaces -- it is not uncommon to miss large parts of wraps if you do not verify and manually seed.
+The primary motivation for doing this is that if you run expansion mode on randomly created seeds, a significant portion of your compute time is spent expanding seeds into regions you might not care about, or expanding seeds along the case. While it's generally true that if you leave expansion mode running long enough, it will fill the volume, this may take a while. It is also not possible for a seed to expand if the surface itself is not sufficiently connected to other surfaces -- it is not uncommon to miss large parts of wraps if you do not verify and manually seed.
 
 
 ```bash

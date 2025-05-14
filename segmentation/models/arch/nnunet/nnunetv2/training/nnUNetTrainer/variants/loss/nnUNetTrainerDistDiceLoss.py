@@ -6,7 +6,7 @@ import sys
 import warnings
 from copy import deepcopy
 from datetime import datetime
-from typing import Tuple, Union, List
+from typing import Tuple, Union, List, Optional
 
 import numpy as np
 import torch
@@ -62,8 +62,8 @@ from batchgeneratorsv2.transforms.intensity.illumination import InhomogeneousSli
 
 class nnUNetTrainerDistDiceLoss(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device('cuda')):
-        super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
+                 device: torch.device = torch.device('cuda'), yaml_config_path: Optional[str] = None):
+        super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device, yaml_config_path)
         self.dataset_class = DistanceTransformDataset  # Use the custom dataset class
 
 
@@ -410,13 +410,18 @@ class nnUNetTrainerDistDiceLoss(nnUNetTrainer):
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
             self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
         else:
             l.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
+
+        if self.local_rank == 0:
+            self.wandb.log({"training_loss_per_it": l.detach().cpu().numpy()})
+            self.wandb.log({"grad_norm": grad_norm})
+
         return {'loss': l.detach().cpu().numpy()}
 
     def validation_step(self, batch: dict) -> dict:

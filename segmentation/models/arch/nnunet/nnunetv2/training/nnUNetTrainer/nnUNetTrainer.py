@@ -1,13 +1,16 @@
 import inspect
 import multiprocessing
 import os
+import yaml
+from importlib.resources import files
 import shutil
 import sys
 import warnings
 from copy import deepcopy
 from datetime import datetime
 from time import time, sleep
-from typing import Tuple, Union, List
+from typing import Tuple, Union, List, Optional
+from nnunetv2.training.nnUNetTrainer.variants.WandbWrapper import WandbWrapper
 
 import numpy as np
 import torch
@@ -98,7 +101,8 @@ class nnUNetTrainer(object):
                  configuration: str,
                  fold: int, dataset_json: dict,
                  unpack_dataset: bool = True,
-                 device: torch.device = torch.device('cuda')):
+                 device: torch.device = torch.device('cuda'),
+                 yaml_config_path: Optional[str] = None):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
 
         # apex predator of grug is complexity
@@ -170,16 +174,6 @@ class nnUNetTrainer(object):
                  self.configuration_manager.previous_stage_name, 'predicted_next_stage', self.configuration_name) \
                 if self.is_cascaded else None
 
-        ### Some hyperparameters for you to fiddle with
-        self.initial_lr = 1e-2
-        self.weight_decay = 3e-5
-        self.oversample_foreground_percent = 0.33
-        self.num_iterations_per_epoch = 250
-        self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 1000
-        self.current_epoch = 0
-        self.enable_deep_supervision = True
-
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
         # labels can either be a list of int (regular training) or a list of tuples of int (region-based training)
@@ -188,7 +182,7 @@ class nnUNetTrainer(object):
         self.num_input_channels = None  # -> self.initialize()
         self.network = None  # -> self.build_network_architecture()
         self.optimizer = self.lr_scheduler = None  # -> self.initialize
-        self.grad_scaler = GradScaler() if self.device.type == 'cuda' else None
+        self.grad_scaler = torch.amp.GradScaler('cuda') if self.device.type == 'cuda' else None
         self.loss = None  # -> self.initialize
 
         ### Simple logging. Don't take that away from me!
@@ -215,11 +209,33 @@ class nnUNetTrainer(object):
         self.save_every = 50
         self.disable_checkpointing = False
 
+        # Hyperparameters initialization
+        if yaml_config_path is None:
+            yaml_path = files('nnunetv2.training.nnUNetTrainer.configs').joinpath('default.yaml')
+            with yaml_path.open('r') as file:
+                yaml_config = yaml.safe_load(file)
+        else:
+            yaml_config = yaml.safe_load(open(yaml_config_path))
+        yaml_config['architecture'] = configuration
+        yaml_config['fold'] = fold
+        self.num_epochs = yaml_config['num_epochs']
+        self.initial_lr = yaml_config['initial_lr']
+        self.weight_decay = yaml_config['weight_decay']
+        self.num_iterations_per_epoch = yaml_config['num_iterations_per_epoch']
+        self.num_val_iterations_per_epoch = yaml_config['num_val_iterations_per_epoch']
+        self.oversample_foreground_percent = yaml_config['oversample_foreground_percent']
+        self.enable_deep_supervision = yaml_config['enable_deep_supervision']
+        self.current_epoch = 0  ## Dynamic variable not stored in yaml config
+
         ## DDP batch size and oversampling can differ between workers and needs adaptation
         # we need to change the batch size in DDP because we don't use any of those distributed samplers
         self._set_batch_size_and_oversample()
 
         self.was_initialized = False
+
+        # WandbWrapper initialization
+        self.wandb = WandbWrapper(use_wandb=yaml_config['wandb_enabled'], config=yaml_config)
+        self.wandb.init(local_rank=self.local_rank, config=yaml_config)
 
         self.print_to_log_file("\n#######################################################################\n"
                                "Please cite the following paper when using nnU-Net:\n"
@@ -1019,6 +1035,8 @@ class nnUNetTrainer(object):
 
         empty_cache(self.device)
         self.print_to_log_file("Training done.")
+        if self.local_rank == 0:
+            self.wandb.finish()
 
     def on_train_epoch_start(self):
         self.network.train()
@@ -1053,13 +1071,18 @@ class nnUNetTrainer(object):
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
             self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
         else:
             l.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
+
+        if self.local_rank == 0:
+            self.wandb.log({"training_loss_per_it": l.detach().cpu().numpy()})
+            self.wandb.log({"grad_norm": grad_norm})
+
         return {'loss': l.detach().cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
@@ -1143,66 +1166,127 @@ class nnUNetTrainer(object):
             fn_hard = fn_hard[1:]
 
         return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
-
+    
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)
-        tp = np.sum(outputs_collated['tp_hard'], 0)
-        fp = np.sum(outputs_collated['fp_hard'], 0)
-        fn = np.sum(outputs_collated['fn_hard'], 0)
+
+        tp = np.sum(outputs_collated['tp_hard'], axis=0)
+        fp = np.sum(outputs_collated['fp_hard'], axis=0)
+        fn = np.sum(outputs_collated['fn_hard'], axis=0)
+        local_loss = np.mean(outputs_collated['loss'])
 
         if self.is_ddp:
             world_size = dist.get_world_size()
 
-            tps = [None for _ in range(world_size)]
-            dist.all_gather_object(tps, tp)
-            tp = np.vstack([i[None] for i in tps]).sum(0)
+            losses_all = [None] * world_size
+            dist.all_gather_object(losses_all, local_loss)
+            aggregated_loss = np.mean(losses_all)
 
-            fps = [None for _ in range(world_size)]
-            dist.all_gather_object(fps, fp)
-            fp = np.vstack([i[None] for i in fps]).sum(0)
+            tp_list, fp_list, fn_list = [None]*world_size, [None]*world_size, [None]*world_size
+            dist.all_gather_object(tp_list, tp)
+            dist.all_gather_object(fp_list, fp)
+            dist.all_gather_object(fn_list, fn)
 
-            fns = [None for _ in range(world_size)]
-            dist.all_gather_object(fns, fn)
-            fn = np.vstack([i[None] for i in fns]).sum(0)
-
-            losses_val = [None for _ in range(world_size)]
-            dist.all_gather_object(losses_val, outputs_collated['loss'])
-            loss_here = np.vstack(losses_val).mean()
+            global_tp = np.sum(np.vstack(tp_list), axis=0)
+            global_fp = np.sum(np.vstack(fp_list), axis=0)
+            global_fn = np.sum(np.vstack(fn_list), axis=0)
         else:
-            loss_here = np.mean(outputs_collated['loss'])
+            aggregated_loss = local_loss
+            global_tp, global_fp, global_fn = tp, fp, fn
 
-        global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
-        mean_fg_dice = np.nanmean(global_dc_per_class)
+        global_dice_per_class = [
+            2 * t / (2 * t + f + n) if (2 * t + f + n) > 0 else 0
+            for t, f, n in zip(global_tp, global_fp, global_fn)
+        ]
+
+        mean_fg_dice = np.nanmean(global_dice_per_class)
+
+        # Improved WandB logging with clear per-class dice labels
+        # When using DDP, all processes should log validation metrics (not just rank 0)
+        # This ensures all ranks have the same logger state
+        
+        # WandB logging only happens on rank 0
+        if self.local_rank == 0:
+            dice_per_class_dict = {
+                f"dice/{label_name}": np.round(global_dice_per_class[label_idx - 1], 4)
+                for label_name, label_idx in self.dataset_json['labels'].items()
+                if label_idx != 0
+            }
+
+            log_dict = {
+                "epoch": self.current_epoch,
+                "val/loss": aggregated_loss,
+                "val/mean_fg_dice": mean_fg_dice,
+                **dice_per_class_dict
+            }
+
+            self.wandb.log(log_dict)
+        
+        # ALL ranks must log validation metrics to keep logger state consistent across processes
+        self.logger.log('val_losses', aggregated_loss, self.current_epoch)
         self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
-        self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
-        self.logger.log('val_losses', loss_here, self.current_epoch)
+        self.logger.log('dice_per_class_or_region', global_dice_per_class, self.current_epoch)
 
     def on_epoch_start(self):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
 
+
     def on_epoch_end(self):
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
 
-        self.print_to_log_file('train_loss', np.round(self.logger.my_fantastic_logging['train_losses'][-1], decimals=4))
-        self.print_to_log_file('val_loss', np.round(self.logger.my_fantastic_logging['val_losses'][-1], decimals=4))
-        self.print_to_log_file('Pseudo dice', [np.round(i, decimals=4) for i in
-                                               self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]])
-        self.print_to_log_file(
-            f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s")
+        # Fetch values for logging clearly
+        train_loss = np.round(self.logger.my_fantastic_logging['train_losses'][-1], 4)
+        val_loss = np.round(self.logger.my_fantastic_logging['val_losses'][-1], 4)
+        dice_scores = self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]
+        dice_val_avg = np.round(np.mean(dice_scores), 4)
 
-        # handling periodic checkpointing
-        current_epoch = self.current_epoch
-        if (current_epoch + 1) % self.save_every == 0 and current_epoch != (self.num_epochs - 1):
-            self.save_checkpoint(join(self.output_folder, 'checkpoint_latest.pth'))
+        epoch_time = np.round(
+            self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] -
+            self.logger.my_fantastic_logging['epoch_start_timestamps'][-1],
+            2
+        )
 
-        # handle 'best' checkpointing. ema_fg_dice is computed by the logger and can be accessed like this
-        if self._best_ema is None or self.logger.my_fantastic_logging['ema_fg_dice'][-1] > self._best_ema:
-            self._best_ema = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
-            self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(self._best_ema, decimals=4)}")
-            self.save_checkpoint(join(self.output_folder, 'checkpoint_best.pth'))
+        # Improved WandB logging (clean, structured)
+        if self.local_rank == 0:
+            log_dict = {
+                "epoch": self.current_epoch,
+                "train/loss": train_loss,
+                "val/loss": val_loss,
+                "val/avg_dice": dice_val_avg,
+                "epoch_time": epoch_time,
+                "learning_rate": self.optimizer.param_groups[0]['lr'],
+            }
+
+            # log per-class dice explicitly
+            for label_name, label_idx in self.dataset_json['labels'].items():
+                if label_idx == 0:
+                    continue
+                dice_idx = label_idx - 1
+                if 0 <= dice_idx < len(dice_scores):
+                    log_dict[f"dice/{label_name}"] = np.round(dice_scores[dice_idx], 4)
+
+            # EMA dice logging
+            current_ema_dice = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
+            log_dict["val/ema_dice"] = current_ema_dice
+
+            if self._best_ema is None or current_ema_dice > self._best_ema:
+                self._best_ema = current_ema_dice
+                log_dict["val/best_ema_dice"] = current_ema_dice
+                self.save_checkpoint(join(self.output_folder, 'checkpoint_best.pth'))
+
+            self.wandb.log(log_dict)
+
+        self.print_to_log_file('train_loss', train_loss)
+        self.print_to_log_file('val_loss', val_loss)
+        self.print_to_log_file('Pseudo dice', [np.round(d, 4) for d in dice_scores])
+        self.print_to_log_file(f"Epoch time: {epoch_time} s")
 
         if self.local_rank == 0:
             self.logger.plot_progress_png(self.output_folder)
+
+        current_epoch = self.current_epoch
+        if (current_epoch + 1) % self.save_every == 0 and current_epoch != (self.num_epochs - 1):
+            self.save_checkpoint(join(self.output_folder, 'checkpoint_latest.pth'))
 
         self.current_epoch += 1
 

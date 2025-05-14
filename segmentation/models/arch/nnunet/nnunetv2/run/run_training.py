@@ -1,4 +1,3 @@
-import multiprocessing
 import os
 import socket
 from typing import Union, Optional
@@ -17,11 +16,7 @@ from torch.backends import cudnn
 
 
 def find_free_network_port() -> int:
-    """Finds a free port on localhost.
-
-    It is useful in single-node training when we don't want to connect to a real main node but have to set the
-    `MASTER_PORT` environment variable.
-    """
+    """Finds a free port on localhost."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(("", 0))
     port = s.getsockname()[1]
@@ -35,59 +30,58 @@ def get_trainer_from_args(dataset_name_or_id: Union[int, str],
                           trainer_name: str = 'nnUNetTrainer',
                           plans_identifier: str = 'nnUNetPlans',
                           use_compressed: bool = False,
-                          device: torch.device = torch.device('cuda')):
-    # load nnunet class and do sanity checks
-    nnunet_trainer = recursive_find_python_class(join(nnunetv2.__path__[0], "training", "nnUNetTrainer"),
-                                                trainer_name, 'nnunetv2.training.nnUNetTrainer')
-    if nnunet_trainer is None:
-        raise RuntimeError(f'Could not find requested nnunet trainer {trainer_name} in '
+                          device: torch.device = torch.device('cuda'),
+                          yaml_config_path: Optional[str] = None):
+    # load nnUNet class and do sanity checks
+    nnunet_trainer_class = recursive_find_python_class(join(nnunetv2.__path__[0], "training", "nnUNetTrainer"),
+                                                       trainer_name, 'nnunetv2.training.nnUNetTrainer')
+    if nnunet_trainer_class is None:
+        raise RuntimeError(f'Could not find requested nnUNet trainer {trainer_name} in '
                            f'nnunetv2.training.nnUNetTrainer ('
-                           f'{join(nnunetv2.__path__[0], "training", "nnUNetTrainer")}). If it is located somewhere '
-                           f'else, please move it there.')
-    assert issubclass(nnunet_trainer, nnUNetTrainer), 'The requested nnunet trainer class must inherit from ' \
-                                                    'nnUNetTrainer'
+                           f'{join(nnunetv2.__path__[0], "training", "nnUNetTrainer")}).')
+    assert issubclass(nnunet_trainer_class, nnUNetTrainer), 'The requested nnUNet trainer class must inherit from nnUNetTrainer'
 
-    # handle dataset input. If it's an ID we need to convert to int from string
-    if dataset_name_or_id.startswith('Dataset'):
-        pass
-    else:
+    # handle dataset input
+    if isinstance(dataset_name_or_id, str) and not dataset_name_or_id.startswith('Dataset'):
         try:
             dataset_name_or_id = int(dataset_name_or_id)
-        except ValueError:
+        except ValueError as e:
             raise ValueError(f'dataset_name_or_id must either be an integer or a valid dataset name with the pattern '
-                             f'DatasetXXX_YYY where XXX are the three(!) task ID digits. Your '
-                             f'input: {dataset_name_or_id}')
+                             f'DatasetXXX_YYY. Your input: {dataset_name_or_id}') from e
 
-    # initialize nnunet trainer
     preprocessed_dataset_folder_base = join(nnUNet_preprocessed, maybe_convert_to_dataset_name(dataset_name_or_id))
     plans_file = join(preprocessed_dataset_folder_base, plans_identifier + '.json')
     plans = load_json(plans_file)
     dataset_json = load_json(join(preprocessed_dataset_folder_base, 'dataset.json'))
-    nnunet_trainer = nnunet_trainer(plans=plans, configuration=configuration, fold=fold,
-                                    dataset_json=dataset_json, unpack_dataset=not use_compressed, device=device)
-    return nnunet_trainer
+    trainer = nnunet_trainer_class(
+        plans=plans,
+        configuration=configuration,
+        fold=fold,
+        dataset_json=dataset_json,
+        unpack_dataset=not use_compressed,
+        device=device,
+        yaml_config_path=yaml_config_path  # pass YAML config path
+    )
+    return trainer
 
 
 def maybe_load_checkpoint(nnunet_trainer: nnUNetTrainer, continue_training: bool, validation_only: bool,
                           pretrained_weights_file: str = None):
     if continue_training and pretrained_weights_file is not None:
-        raise RuntimeError('Cannot both continue a training AND load pretrained weights. Pretrained weights can only '
-                           'be used at the beginning of the training.')
+        raise RuntimeError('Cannot both continue a training AND load pretrained weights.')
     if continue_training:
         expected_checkpoint_file = join(nnunet_trainer.output_folder, 'checkpoint_final.pth')
         if not isfile(expected_checkpoint_file):
             expected_checkpoint_file = join(nnunet_trainer.output_folder, 'checkpoint_latest.pth')
-        # special case where --c is used to run a previously aborted validation
         if not isfile(expected_checkpoint_file):
             expected_checkpoint_file = join(nnunet_trainer.output_folder, 'checkpoint_best.pth')
         if not isfile(expected_checkpoint_file):
-            print(f"WARNING: Cannot continue training because there seems to be no checkpoint available to "
-                               f"continue from. Starting a new training...")
+            print("WARNING: Cannot continue training because there is no checkpoint available. Starting new training...")
             expected_checkpoint_file = None
     elif validation_only:
         expected_checkpoint_file = join(nnunet_trainer.output_folder, 'checkpoint_final.pth')
         if not isfile(expected_checkpoint_file):
-            raise RuntimeError(f"Cannot run validation because the training is not finished yet!")
+            raise RuntimeError("Cannot run validation because the training is not finished yet!")
     else:
         if pretrained_weights_file is not None:
             if not nnunet_trainer.was_initialized:
@@ -100,7 +94,6 @@ def maybe_load_checkpoint(nnunet_trainer: nnUNetTrainer, continue_training: bool
 
 
 def setup_ddp(rank, world_size):
-    # initialize the process group
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
 
@@ -108,18 +101,20 @@ def cleanup_ddp():
     dist.destroy_process_group()
 
 
-def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, use_compressed, disable_checkpointing, c, val,
-            pretrained_weights, npz, val_with_best, world_size):
+def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, use_compressed, disable_checkpointing,
+            c, val, pretrained_weights, npz, val_with_best, world_size, yaml_config):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
-
-    nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, tr, p,
-                                           use_compressed)
-
+    nnunet_trainer = get_trainer_from_args(
+        dataset_name_or_id, configuration, fold,
+        tr, p, use_compressed,
+        device=torch.device('cuda'),
+        yaml_config_path=yaml_config  # Pass YAML config to DDP routine
+    )
     if disable_checkpointing:
         nnunet_trainer.disable_checkpointing = disable_checkpointing
 
-    assert not (c and val), f'Cannot set --c and --val flag at the same time. Dummy.'
+    assert not (c and val), 'Cannot set --c and --val flag at the same time.'
 
     maybe_load_checkpoint(nnunet_trainer, c, val, pretrained_weights)
 
@@ -148,33 +143,30 @@ def run_training(dataset_name_or_id: Union[str, int],
                  only_run_validation: bool = False,
                  disable_checkpointing: bool = False,
                  val_with_best: bool = False,
-                 device: torch.device = torch.device('cuda')):
+                 device: torch.device = torch.device('cuda'),
+                 yaml_config: Optional[str] = None):  # NEW parameter
     if plans_identifier == 'nnUNetPlans':
         print("\n############################\n"
-              "INFO: You are using the old nnU-Net default plans. We have updated our recommendations. "
-              "Please consider using those instead! "
-              "Read more here: https://github.com/MIC-DKFZ/nnUNet/blob/master/documentation/resenc_presets.md"
-              "\n############################\n")
+              "INFO: You are using the old nnU-Net default plans. Please consider using the updated recommendations.\n"
+              "############################\n")
     if isinstance(fold, str):
         if fold != 'all':
             try:
                 fold = int(fold)
             except ValueError as e:
-                print(f'Unable to convert given value for fold to int: {fold}. fold must bei either "all" or an integer!')
+                print(f'Unable to convert given value for fold to int: {fold}.')
                 raise e
 
     if val_with_best:
         assert not disable_checkpointing, '--val_best is not compatible with --disable_checkpointing'
 
     if num_gpus > 1:
-        assert device.type == 'cuda', f"DDP training (triggered by num_gpus > 1) is only implemented for cuda devices. Your device: {device}"
-
+        assert device.type == 'cuda', f"DDP training is only implemented for cuda devices. Your device: {device}"
         os.environ['MASTER_ADDR'] = 'localhost'
         if 'MASTER_PORT' not in os.environ.keys():
             port = str(find_free_network_port())
             print(f"using port {port}")
-            os.environ['MASTER_PORT'] = port  # str(port)
-
+            os.environ['MASTER_PORT'] = port
         mp.spawn(run_ddp,
                  args=(
                      dataset_name_or_id,
@@ -189,17 +181,23 @@ def run_training(dataset_name_or_id: Union[str, int],
                      pretrained_weights,
                      export_validation_probabilities,
                      val_with_best,
-                     num_gpus),
+                     num_gpus,
+                     yaml_config  # Pass yaml_config
+                 ),
                  nprocs=num_gpus,
                  join=True)
     else:
-        nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, trainer_class_name,
-                                               plans_identifier, use_compressed_data, device=device)
+        nnunet_trainer = get_trainer_from_args(
+            dataset_name_or_id, configuration, fold,
+            trainer_class_name, plans_identifier,
+            use_compressed_data, device=device,
+            yaml_config_path=yaml_config  # Pass yaml_config here
+        )
 
         if disable_checkpointing:
             nnunet_trainer.disable_checkpointing = disable_checkpointing
 
-        assert not (continue_training and only_run_validation), f'Cannot set --c and --val flag at the same time. Dummy.'
+        assert not (continue_training and only_run_validation), 'Cannot set --c and --val flag at the same time.'
 
         maybe_load_checkpoint(nnunet_trainer, continue_training, only_run_validation, pretrained_weights)
 
@@ -223,63 +221,67 @@ def run_training_entry():
     parser.add_argument('configuration', type=str,
                         help="Configuration that should be trained")
     parser.add_argument('fold', type=str,
-                        help='Fold of the 5-fold cross-validation. Should be an int between 0 and 4.')
+                        help='Fold of the 5-fold cross-validation. Should be "all" or an int between 0 and 4.')
     parser.add_argument('-tr', type=str, required=False, default='nnUNetTrainer',
-                        help='[OPTIONAL] Use this flag to specify a custom trainer. Default: nnUNetTrainer')
+                        help='[OPTIONAL] Specify a custom trainer. Default: nnUNetTrainer')
     parser.add_argument('-p', type=str, required=False, default='nnUNetPlans',
-                        help='[OPTIONAL] Use this flag to specify a custom plans identifier. Default: nnUNetPlans')
+                        help='[OPTIONAL] Specify a custom plans identifier. Default: nnUNetPlans')
     parser.add_argument('-pretrained_weights', type=str, required=False, default=None,
-                        help='[OPTIONAL] path to nnU-Net checkpoint file to be used as pretrained model. Will only '
-                             'be used when actually training. Beta. Use with caution.')
+                        help='[OPTIONAL] Path to a checkpoint file for pretrained weights.')
     parser.add_argument('-num_gpus', type=int, default=1, required=False,
-                        help='Specify the number of GPUs to use for training')
+                        help='Number of GPUs to use for training')
     parser.add_argument("--use_compressed", default=False, action="store_true", required=False,
-                        help="[OPTIONAL] If you set this flag the training cases will not be decompressed. Reading compressed "
-                             "data is much more CPU and (potentially) RAM intensive and should only be used if you "
-                             "know what you are doing")
+                        help="If set, training cases will not be decompressed.")
     parser.add_argument('--npz', action='store_true', required=False,
-                        help='[OPTIONAL] Save softmax predictions from final validation as npz files (in addition to predicted '
-                             'segmentations). Needed for finding the best ensemble.')
+                        help='[OPTIONAL] Save softmax predictions as npz files.')
     parser.add_argument('--c', action='store_true', required=False,
-                        help='[OPTIONAL] Continue training from latest checkpoint')
+                        help='[OPTIONAL] Continue training from latest checkpoint.')
     parser.add_argument('--val', action='store_true', required=False,
-                        help='[OPTIONAL] Set this flag to only run the validation. Requires training to have finished.')
+                        help='[OPTIONAL] Only run the validation. Requires training to be finished.')
     parser.add_argument('--val_best', action='store_true', required=False,
-                        help='[OPTIONAL] If set, the validation will be performed with the checkpoint_best instead '
-                             'of checkpoint_final. NOT COMPATIBLE with --disable_checkpointing! '
-                             'WARNING: This will use the same \'validation\' folder as the regular validation '
-                             'with no way of distinguishing the two!')
+                        help='[OPTIONAL] Use checkpoint_best for validation instead of checkpoint_final.')
     parser.add_argument('--disable_checkpointing', action='store_true', required=False,
-                        help='[OPTIONAL] Set this flag to disable checkpointing. Ideal for testing things out and '
-                             'you dont want to flood your hard drive with checkpoints.')
+                        help='[OPTIONAL] Disable checkpointing.')
     parser.add_argument('-device', type=str, default='cuda', required=False,
-                    help="Use this to set the device the training should run with. Available options are 'cuda' "
-                         "(GPU), 'cpu' (CPU) and 'mps' (Apple M1/M2). Do NOT use this to set which GPU ID! "
-                         "Use CUDA_VISIBLE_DEVICES=X nnUNetv2_train [...] instead!")
+                        help="Device type: 'cuda', 'cpu', or 'mps'.")
+    # NEW: YAML configuration file argument
+    parser.add_argument('--yaml_config', type=str, default=None, required=False,
+                        help="Path to YAML config file to use in the trainer. If not provided, the default is used.")
     args = parser.parse_args()
 
-    assert args.device in ['cpu', 'cuda', 'mps'], f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}.'
+    assert args.device in ['cpu', 'cuda', 'mps'], f'-device must be either cpu, mps or cuda. Got: {args.device}.'
     if args.device == 'cpu':
-        # let's allow torch to use hella threads
         import multiprocessing
         torch.set_num_threads(multiprocessing.cpu_count())
         device = torch.device('cpu')
     elif args.device == 'cuda':
-        # multithreading in torch doesn't help nnU-Net if run on GPU
         torch.set_num_threads(1)
         torch.set_num_interop_threads(1)
         device = torch.device('cuda')
     else:
         device = torch.device('mps')
 
-    run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
-                 args.num_gpus, args.use_compressed, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
-                 device=device)
+    run_training(
+        dataset_name_or_id=args.dataset_name_or_id,
+        configuration=args.configuration,
+        fold=args.fold,
+        trainer_class_name=args.tr,
+        plans_identifier=args.p,
+        pretrained_weights=args.pretrained_weights,
+        num_gpus=args.num_gpus,
+        use_compressed_data=args.use_compressed,
+        export_validation_probabilities=args.npz,
+        continue_training=args.c,
+        only_run_validation=args.val,
+        disable_checkpointing=args.disable_checkpointing,
+        val_with_best=args.val_best,
+        device=device,
+        yaml_config=args.yaml_config
+    )
 
 
 if __name__ == '__main__':
     os.environ['OMP_NUM_THREADS'] = '1'
     os.environ['MKL_NUM_THREADS'] = '1'
     os.environ['OPENBLAS_NUM_THREADS'] = '1'
-    # multiprocessing.set_start_method("spawn")
     run_training_entry()

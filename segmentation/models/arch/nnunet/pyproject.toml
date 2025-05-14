@@ -54,7 +54,8 @@ dependencies = [
     "einops",
     "monai",
     "edt",
-    "opencv-python-headless"
+    "opencv-python-headless",
+    "wandb"
 ]
 
 [project.urls]

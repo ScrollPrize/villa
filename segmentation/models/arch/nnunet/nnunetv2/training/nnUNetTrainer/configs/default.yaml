@@ -1,0 +1,11 @@
+project_name: Project Name
+dataset: dataset_name
+wandb_enabled: 1
+
+num_epochs: 1000
+initial_lr: 0.01
+weight_decay: 0.00003
+num_iterations_per_epoch: 250
+num_val_iterations_per_epoch: 50
+oversample_foreground_percent: 0.33
+enable_deep_supervision: 'True'

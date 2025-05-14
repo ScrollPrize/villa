@@ -179,6 +179,12 @@ This depends on the jurisdiction you live in, but generally yes, you do have to 
 
 We very much encourage researchers and students to work on this! Be sure to reach out to us [on Discord or by email](/get_started#1-join-the-community).
 
+### I have some ideas but need help. Who can I ask?
+
+Definitely ask the [Discord](https://discord.com/invite/uTfNwwecCQ) community!
+
+You are also welcome to reach out to our [team](mailto:team@scrollprize.org) directly; though as contest organizers we can only provide limited information regarding specific ideas or submissions and will largely point you towards public resources such as this FAQ or the public Discord channels.
+
 ### I have made some progress, who do I inform about this?
 
 Please email us at team@scrollprize.org. We will keep it confidential. We appreciate you keeping us in the loop!

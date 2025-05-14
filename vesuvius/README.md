@@ -13,7 +13,7 @@ img = scroll[1000,:,:]
 plt.imshow(img)
 ```
 
-<img src="img/slice.png" alt="drawing" width="200"/>
+<img src="examples/img/slice.png" alt="drawing" width="200"/>
 
 Data is streamed in the background, only serving the requested regions.
 

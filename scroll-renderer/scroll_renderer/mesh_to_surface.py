@@ -443,10 +443,12 @@ class MeshDataset(Dataset):
         logger.info(f"Y-size: {y_size}, X-size: {x_size}")
 
         logger.info(f"Loading mesh from {path}")
-        with tempfile.NamedTemporaryFile(suffix=".obj") as temp_file:
-            temp_path = temp_file.name
-            shutil.copy(path, temp_path)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_path = os.path.join(tmpdir, os.path.basename(path))
+            shutil.copyfile(path, temp_path)
             mesh = o3d.io.read_triangle_mesh(temp_path)
+
         logger.info(f"Loaded mesh from {path}")
 
         # Convert to numpy arrays.

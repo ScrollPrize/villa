@@ -36,7 +36,7 @@ hide_table_of_contents: true
   />
 </head>
 
-**To download:** Fill out the [registration form](https://forms.gle/HV1J6dJbmCB2z5QL8) and then visit the [data server](https://dl.ash2txt.org) ([LICENSE](https://dl.ash2txt.org/LICENSE.txt)).
+**To download:** Fill out the [registration form](https://forms.gle/HV1J6dJbmCB2z5QL8) and then visit the [data server](https://dl.ash2txt.org).
 
 To learn more about the data, see the linked pages below.
 Also be sure to check out:

@@ -161,6 +161,8 @@ nnunetv2/training/lr_scheduler/samedlr.py
 nnunetv2/training/nnUNetTrainer/__init__.py
 nnunetv2/training/nnUNetTrainer/nnUNetTrainer.py
 nnunetv2/training/nnUNetTrainer/nnUNetTrainerBaseline.py
+nnunetv2/training/nnUNetTrainer/nnUNetTrainerWorkshop.py
+nnunetv2/training/nnUNetTrainer/variants/WandbWrapper.py
 nnunetv2/training/nnUNetTrainer/variants/__init__.py
 nnunetv2/training/nnUNetTrainer/variants/benchmarking/__init__.py
 nnunetv2/training/nnUNetTrainer/variants/benchmarking/nnUNetTrainerBenchmark_5epochs.py
