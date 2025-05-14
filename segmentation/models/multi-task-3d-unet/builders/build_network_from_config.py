@@ -1,7 +1,7 @@
 import torch.nn as nn
-from builders.utils import get_pool_and_conv_props, get_n_blocks_per_stage
-from builders.encoder import Encoder
-from builders.decoder import Decoder
+from .utils import get_pool_and_conv_props, get_n_blocks_per_stage
+from .encoder import Encoder
+from .decoder import Decoder
 
 def get_activation_module(activation_str: str):
     act_str = activation_str.lower()
@@ -34,11 +34,6 @@ class NetworkFromConfig(nn.Module):
             model_config = mgr.inference_config
 
         self.save_config = True
-
-        # Determine if we are loading an nnUNet checkpoint.
-        self.load_from_nnunet = mgr.inference_config.get("load_from_nnunet", False)
-        # Optionally, a flag to drop the background channel (if you only want the foreground)
-        self.drop_background = mgr.inference_config.get("drop_background", False)
 
         # --------------------------------------------------------------------
         # Common nontrainable parameters (ops, activation, etc.)
@@ -122,82 +117,45 @@ class NetworkFromConfig(nn.Module):
 
         # --------------------------------------------------------------------
         # Build network.
-        # If loading an nnUNet checkpoint, import and instantiate the original ResidualEncoderUNet.
-        # Otherwise, use your original multi-target mode.
         # --------------------------------------------------------------------
-        if self.load_from_nnunet:
-            print("Building model in nnUNet mode using ResidualEncoderUNet.")
-            # In nnUNet mode, assume a single target.
-            self.target_name = list(mgr.targets.keys())[0] if mgr.targets else "default_target"
-            self.out_channels = 2  # Force 2 channels (background + foreground)
-            # Overwrite targets so that final_config can reference them.
-            self.targets = {self.target_name: {"out_channels": self.out_channels}}
-            # Import the ResidualEncoderUNet and valid blocks.
-            from dynamic_network_architectures.architectures.unet import ResidualEncoderUNet
-            from dynamic_network_architectures.building_blocks.residual import BasicBlockD, BottleneckD
-            self.model = ResidualEncoderUNet(
-                input_channels=self.in_channels,
-                n_stages=model_config.get("n_stages", 7),
-                features_per_stage=model_config.get("features_per_stage",
-                                  mgr.inference_config.get("features_per_stage", [32, 64, 128, 256, 320, 320, 320])),
-                conv_op=self.conv_op,
-                kernel_sizes=model_config.get("kernel_sizes", [[3,3,3]] * model_config.get("n_stages", 7)),
-                strides=model_config.get("strides", self.strides),
-                n_blocks_per_stage=model_config.get("n_blocks_per_stage", [1, 3, 4, 6, 6, 6, 6]),
-                num_classes=self.out_channels,
-                n_conv_per_stage_decoder=model_config.get("n_conv_per_stage_decoder", [1]*(model_config.get("n_stages",7)-1)),
-                conv_bias=self.conv_bias,
-                norm_op=self.norm_op,
-                norm_op_kwargs=self.norm_op_kwargs,
-                dropout_op=self.dropout_op,
-                dropout_op_kwargs=self.dropout_op_kwargs,
-                nonlin=self.nonlin,
-                nonlin_kwargs=self.nonlin_kwargs,
-                deep_supervision=True,
-                block=model_config.get("block", BasicBlockD),
-                bottleneck_channels=model_config.get("bottleneck_channels", None),
-                stem_channels=model_config.get("stem_channels", self.features_per_stage[0])
+        self.shared_encoder = Encoder(
+            input_channels=self.in_channels,
+            basic_block=self.basic_encoder_block,
+            n_stages=self.num_stages,
+            features_per_stage=self.features_per_stage,
+            n_blocks_per_stage=self.n_blocks_per_stage,
+            bottleneck_block=self.bottleneck_block,
+            conv_op=self.conv_op,
+            kernel_sizes=self.kernel_sizes,
+            conv_bias=self.conv_bias,
+            norm_op=self.norm_op,
+            norm_op_kwargs=self.norm_op_kwargs,
+            dropout_op=self.dropout_op,
+            dropout_op_kwargs=self.dropout_op_kwargs,
+            nonlin=self.nonlin,
+            nonlin_kwargs=self.nonlin_kwargs,
+            strides=self.strides,
+            return_skips=True,
+            do_stem=model_config.get("do_stem", True),
+            stem_channels=model_config.get("stem_channels", self.stem_n_channels),
+            bottleneck_channels=model_config.get("bottleneck_channels", None),
+            stochastic_depth_p=model_config.get("stochastic_depth_p", 0.0),
+            squeeze_excitation=model_config.get("squeeze_excitation", False),
+            squeeze_excitation_reduction_ratio=model_config.get("squeeze_excitation_reduction_ratio", 1.0/16.0)
+        )
+        self.task_decoders = nn.ModuleDict()
+        self.task_activations = nn.ModuleDict()
+        for target_name, target_info in self.targets.items():
+            out_channels = target_info["out_channels"]
+            activation_str = target_info.get("activation", "none")
+            self.task_decoders[target_name] = Decoder(
+                encoder=self.shared_encoder,
+                basic_block=model_config.get("basic_decoder_block", "ConvBlock"),
+                num_classes=out_channels,
+                n_conv_per_stage=model_config.get("n_conv_per_stage_decoder", [1] * (self.num_stages - 1)),
+                deep_supervision=False
             )
-        else:
-            # Original multi-target mode.
-            self.shared_encoder = Encoder(
-                input_channels=self.in_channels,
-                basic_block=self.basic_encoder_block,
-                n_stages=self.num_stages,
-                features_per_stage=self.features_per_stage,
-                n_blocks_per_stage=self.n_blocks_per_stage,
-                bottleneck_block=self.bottleneck_block,
-                conv_op=self.conv_op,
-                kernel_sizes=self.kernel_sizes,
-                conv_bias=self.conv_bias,
-                norm_op=self.norm_op,
-                norm_op_kwargs=self.norm_op_kwargs,
-                dropout_op=self.dropout_op,
-                dropout_op_kwargs=self.dropout_op_kwargs,
-                nonlin=self.nonlin,
-                nonlin_kwargs=self.nonlin_kwargs,
-                strides=self.strides,
-                return_skips=True,
-                do_stem=model_config.get("do_stem", True),
-                stem_channels=model_config.get("stem_channels", self.stem_n_channels),
-                bottleneck_channels=model_config.get("bottleneck_channels", None),
-                stochastic_depth_p=model_config.get("stochastic_depth_p", 0.0),
-                squeeze_excitation=model_config.get("squeeze_excitation", False),
-                squeeze_excitation_reduction_ratio=model_config.get("squeeze_excitation_reduction_ratio", 1.0/16.0)
-            )
-            self.task_decoders = nn.ModuleDict()
-            self.task_activations = nn.ModuleDict()
-            for target_name, target_info in self.targets.items():
-                out_channels = target_info["out_channels"]
-                activation_str = target_info.get("activation", "none")
-                self.task_decoders[target_name] = Decoder(
-                    encoder=self.shared_encoder,
-                    basic_block=model_config.get("basic_decoder_block", "ConvBlock"),
-                    num_classes=out_channels,
-                    n_conv_per_stage=model_config.get("n_conv_per_stage_decoder", [1] * (self.num_stages - 1)),
-                    deep_supervision=False
-                )
-                self.task_activations[target_name] = get_activation_module(activation_str)
+            self.task_activations[target_name] = get_activation_module(activation_str)
 
         # --------------------------------------------------------------------
         # Build final configuration snapshot.
@@ -249,39 +207,12 @@ class NetworkFromConfig(nn.Module):
             print(f"  {k}: {v}")
 
     def forward(self, x):
-        if self.load_from_nnunet:
-            # Use the imported ResidualEncoderUNet model.
-            out = self.model(x)
-            if self.drop_background:
-                # Drop background channel (assume channel 0 is background).
-                out = out[:, 1:]
-            return {self.target_name: out}
-        else:
-            skips = self.shared_encoder(x)
-            results = {}
-            for task_name, decoder in self.task_decoders.items():
-                logits = decoder(skips)
-                activation_fn = self.task_activations[task_name]
-                if activation_fn is not None and not self.training:
-                    logits = activation_fn(logits)
-                results[task_name] = logits
-            return results
-
-    def load_state_dict(self, state_dict, strict=True):
-        if self.load_from_nnunet:
-            new_state_dict = {}
-            for key, value in state_dict.items():
-                new_key = key
-                # Remove known prefixes
-                if new_key.startswith("module."):
-                    new_key = new_key[len("module."):]
-                if new_key.startswith("model."):
-                    new_key = new_key[len("model."):]
-
-                # Remap the module index from 1 to 2.
-                # (Adjust this replacement if your situation is more complex.)
-                new_key = new_key.replace("all_modules.1", "all_modules.2")
-                new_state_dict[new_key] = value
-            return self.model.load_state_dict(new_state_dict, strict=strict)
-        else:
-            return super().load_state_dict(state_dict, strict=strict)
+        skips = self.shared_encoder(x)
+        results = {}
+        for task_name, decoder in self.task_decoders.items():
+            logits = decoder(skips)
+            activation_fn = self.task_activations[task_name]
+            if activation_fn is not None and not self.training:
+                logits = activation_fn(logits)
+            results[task_name] = logits
+        return results

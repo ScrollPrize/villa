@@ -1,7 +1,7 @@
 ---
 id: prizes
-title: "New Year, New Prizes"
-sidebar_label: "2025 Prizes"
+title: "Open Prizes"
+sidebar_label: "Open Prizes"
 hide_table_of_contents: true
 ---
 
@@ -38,16 +38,30 @@ hide_table_of_contents: true
   />
 </head>
 
-This year, we're changing up the prizes a bit from previous phases. We’re issuing more frequent, targeted awards that address specific technical challenges.
+import TOCInline from '@theme/TOCInline';
 
-We’re also going to offer targeted “asks” for prizes, as we become aware of what roadblocks lie in the way. We still encourage open ended solutions to problems, but will often provide more specific requirements for some progress prizes. 
+Vesuvius Challenge is ongoing and **YOU** can win the below prizes and help us make history!
 
-_**Let’s get started with the prizes!**_
+***
+
+<TOCInline
+  toc={toc}
+/>
+
+***
 
 ## Read Entire Scroll Prize ($200,000)
-[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSed2vRgW3HECXW3E6-llYPOST550yr4L0T5AIQp45GAYRcnGQ/viewform?usp=dialog)
 
 We’re awarding $200,000 to the first team to unwrap an entire scroll and produce readable letters within.
+
+We've made great strides by uncovering hidden text from inside a sealed Herculaneum scroll (now multiple!), but we're still reading 5% or less of full scrolls.
+Segmenting and reading an entire scroll, probably using more automated methods, is the next major milestone for our technical endeavor.
+Reach this bar, and $200,000 is yours!
+
+<div className="mb-4">
+  <img src="/img/landing/scroll.webp" className="w-[50%]"/>
+  <figcaption className="mt-[-6px]">An Entire Scroll.</figcaption>
+</div>
 
 <details class="submission-details">
 <summary>Submission criteria and requirements</summary>
@@ -81,156 +95,112 @@ We may reward partial work - if your unrolling works but the ink detection isn't
 
 </details>
 
+[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSed2vRgW3HECXW3E6-llYPOST550yr4L0T5AIQp45GAYRcnGQ/viewform?usp=dialog)
+
+***
+
 ## First Letters and Title Prizes
-[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSdw43FX_uPQwBTIV8pC2y0xkwZmu6GhrwxV4n3WEbqC8Xof9Q/viewform?usp=dialog)
 
-**First Letters: $60,000 to the first team that uncovers 10 letters within a single 4cm^2 area of any of the following scrolls:**
-* Scroll 2
-* Scroll 3
-* Scroll 4
+One of the frontiers of Vesuvius Challenge is finding techniques that work across multiple scrolls.
+While we've discovered text in some of our scrolls, others have not yet produced legible findings.
+Finding the first letters inside one of these scrolls is a major step forward.
 
-**First Title: $60,000 to the first team to unveil a title of any of our scrolls.**
+Additionally, finding the title of any scroll is a huge and exciting discovery that helps scholars contextualize the rest of the work!
+
+**First Letters: $60,000 to the first team that uncovers 10 letters within a single 4cm^2 area of any of Scrolls 2-4.**
+
+**First Title: $60,000 to the first team to discover the title in any of Scrolls 1-4.**
 
 <div className="mb-4">
   <img src="/img/data/title_example.webp" className="w-[50%]"/>
   <figcaption className="mt-[-6px]">Visible Title in a Scroll Fragment.</figcaption>
 </div>
 
+<details>
+<summary>Submission criteria and requirements</summary>
+
+* **Image.** Submissions must be an image of the virtually unwrapped segment, showing visible and legible text.
+  * Submit a single static image showing the text region. Images must be generated programmatically, as direct outputs of CT data inputs, and should not contain manual annotations of characters or text. This includes annotations that were then used as training data and memorized by a machine learning ink model. Ink model outputs of this region should not overlap with any training data used.
+  * For the First Title Prize, please illustrate the ink predictions in spatial context of the title search, similar to what is [shown here](https://scrollprize.substack.com/p/30k-first-title-prize). You **do not** have to read the title yourself, but just have to produce an image of it that our team of papyrologists are able to read.
+  * Specify which scroll the image comes from. For multiple scrolls, please make multiple submissions.
+  * Include a scale bar showing the size of 1 cm on the submission image.
+  * Specify the 3D position of the text within the scroll. The easiest way to do this is to provide the segmentation file (or the segmentation ID, if using a public segmentation).
+* **Methodology.** A detailed technical description of how your solution works. We need to be able to reproduce your work, so please make this as easy as possible:
+  * For fully automated software, consider a Docker image that we can easily run to reproduce your work, and please include system requirements.
+  * For software with a human in the loop, please provide written instructions and a video explaining how to use your tool. We’ll work with you to learn how to use it, but we’d like to have a strong starting point.
+  * Please include an easily accessible link from which we can download it.
+* **Hallucination mitigation.** If there is any risk of your model hallucinating results, please let us know how you mitigated that risk. Tell us why you are confident that the results you are getting are real.
+  * We strongly discourage submissions that use window sizes larger than 0.5x0.5 mm to generate images from machine learning models. This corresponds to 64x64 pixels for 8 µm scans. If your submission uses larger window sizes, we may reject it and ask you to modify and resubmit.
+  * In addition to hallucination mitigation, do not include overlap between training and prediction regions. This leads to the memorization of annotated labels.
+* **Other information.** Feel free to include any other things we should know.
+
+Your submission will be reviewed by the review teams to verify technical validity and papyrological plausibility and legibility.
+Just as with the Grand Prize, please **do not** make your discovery public until winning the prize. We will work with you to announce your findings.
+</details>
+
+[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSdw43FX_uPQwBTIV8pC2y0xkwZmu6GhrwxV4n3WEbqC8Xof9Q/viewform?usp=dialog)
+
+***
+
 ## Progress Prizes
-As the challenges of autosegmentation and generalized ink detection become clearer, so do our expections for progress prize submissions.
 
-Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, February 28, 2025! When ready, please submit using [this form](https://docs.google.com/forms/d/e/1FAIpQLSdPKXHtDgZs0kihxTMlwCvFMiJcR0b6ls55Kol9-KFZQCU_zQ/viewform?usp=header).
+In addition to milestone-based prizes, we offer monthly prizes for open source contributions that help read the scrolls.
+These prizes are more open-ended, and we have a wishlist to provide some ideas.
+If you are new to the project, this is a great place to start.
+Progress prizes will be awarded at a range of levels based on the contribution:
 
-**Core Requirements**
+* Gold Aureus: \$20,000 (estimated 4-8 per year) – for major contributions
+* Denarius: \$10,000 (estimated 10-15 per year)
+* Sestertius: \$2,500 (estimated 25 per year)
+* Papyrus: \$1,000 (estimated 50 per year)
+
+We favor submissions that:
+* Are **released or open-sourced early**. Tools released earlier have a higher chance of being used for reading the scrolls than those released the last day of the month.
+* Actually **get used**. We’ll look for signals from the community: questions, comments, bug reports, feature requests. Our Annotation Team will publicly provide comments on tools they use.
+* Are **well documented**. It helps a lot if relevant documentation, walkthroughs, images, tutorials or similar are included with the work so that others can use it!
+
+We maintain a [public wishlist](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22help%20wanted%22) of ideas that would make excellent progress prize submissions.
+Some are additionally labeled as [good first issues](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) for newcomers!
+
+Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, April 30th, 2025!
+
+<details>
+<summary>Submission criteria and requirements</summary>
+
+**Core Requirements:**
 1. Problem Identification and Solution
-   * Address a specific challenge using competition scroll data
+   * Address a specific challenge using Vesuvius Challenge scroll data
    * Provide clear implementation path and a demonstration of its use
    * Demonstrate significant advantages over existing solutions
 2. Documentation
    * Include comprehensive documentation
    * Provide usage examples
 3. Technical Integration
-   * Accept standard competition formats (multipage TIFs, on-disk numpy arrays)
+   * Accept standard community formats (multipage TIFs, on-disk numpy arrays)
    * Maintain consistent output formats
    * Designed for modular integration
-
-
-### Wish list
-
-**High-Quality Surface or Fiber Predictions**
-  * Input Format: image/label pairs of surface or fiber labels
-  * Output Format: zarr
-  * Result: High-accuracy predictions of written surfaces or fibers. Good fiber predictions would consist of long connected components without branching
-
-**High-Quality 3d Ink Dataset**
-  * File Format: Zarr or .tif slices
-  * Result: Image/label pairs of high quality 3d ink labels that are “ready-to-run” , no additional cropping or preprocessing required.
-
-**Label Generation Methods**
-  * Input Format: zarr or other on-disk npy array
-  * Output Format: zarr
-  * Result: Image/label pairs of surface or fiber labels that are higher quality than simple voxelization of existing obj meshes
-
-**Inpainting**
-  * Input Format: .obj mesh
-  * Output Format: Triangulated .obj mesh (or quad mesh) with surface normals (sanity constraints: self intersections, watertight, etc)
-  * Implementation: Within the Vesuvius python library (ie: vesuvius.meshing.inpaint)
-  * Result: Given a mesh obj with holes, the holes are inpainted in a way that respects the underlying surface, or interpolates accurately enough that the resultant mesh does this without using the scroll data.
-
-**Sheet Switch Detection**
-  * Input Format: .obj mesh or surface volume
-  * Output Format: zarr array containing labeled switches and an overlay of the flattened segment highlighting the sheet switches
-  * Result: A robust solution to programatically detecting sheet switches within generated segments or surface volumes
-
-**Representation to Graph Tool**
-* Input Format: zarr or other disk array
-* Output Format: Graph with nodes and edges
-* Node Attributes:
-  * ID / name should be zyx position
-  * Input format  [fibers, sheet patches, point clouds, objs, etc]
-  * Additional information to relate the node to the input
-  * Initial winding angle in degrees
-  * This is w.r.t umbilicus
-  * Assigned winding angle (can be initialized as None) in degrees
-  * Ground Truth winding angles, derived from manual segmentations example: [scroll 1 gp banner, scroll 4 banner]
-  * Certainty / Probability score of node accuracy
-
-* Edge Attributes:
-  * Connection between nodes (i, j)
-  * Angle difference between node i and j, represented as (K) in degrees
-  * Certainty / Probability score of edge accuracy of (K)
-
-* Result: A tool or function that accepts a patch or chunk based representation, and returns a graph based representation
-
-<details class="example_graph">
-<summary>An example on VC3D Patch Seeds:</summary>
-* Patches are nodes
-* Patch position in 3D space is ID
-* Patch accuracy from sheet tracer is certainty of Node
-* Patch position around the umbilicus is initial winding angle [-180, 180] degree
-* Overlapping patches form Edges
-* Amount of overlap is certainty of Edge
-* Difference in Edge Nodes is K range [-180, 180] for overlapping nodes, probably mostly in range [+- few degrees around 0]
-* Solver adds the assigned winding angle around the umbilicus that indicates which wrap and angle the patch is at
 </details>
 
-**Improvements to existing graph solvers or implementation of different graph solver**
-  * Input: graph structured as described above
-  * Output: graph with the winding angle assigned
-  * Can include manual annotation or refinements, optimizing for minimal human input
+[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSfc5oTc-XyWA7XJFrUL2Xvi-L3ApDMvQfAqWwgBkrfxChNLZA/viewform?usp=dialog)
 
-**Graph meshing**
-  * Result: Given a graph with attributes pointing to the underlying data, a triangulated obj mesh with UVs is returned 
+***
 
-**Whole Scroll flattening**
-  * Input format: obj
-  * Output format: flattened obj with UV coordinates
-  * Result: Given a triangulated .obj mesh with surface normals, the mesh is flattened such that the distortion present on the boundaries of current flattening methods tested on large segmentations is no longer present. 
+## Referral Prize
 
-**Improvements to VC3D**
-  * Add a refresh button to the segment list, so users don’t have to relaunch VC3D to refresh the segments
-  * Allow running vc_grow_seg_from_segs with a target of a previous trace instead of a seed patch
-  * Integrate a surface normal cost function into the solver
-  * Add functionality to manipulate patch and trace locations, similar to how a segment is manipulated in khartes or the original implementation of VC
-  * Allow scroll regions to be masked rather than individual patches, forcing the solver to ignore these regions
-  * Allow users to “push” or “pull” the segment forward/back from the 2d flattened view
+Refer a successful hire - earn a $5,000 prize.
 
-**Integrations into Vesuvius Python Library**
+<details>
+<summary>Submission criteria and requirements</summary>
 
-Integrate the 2024 FASP submissions into the Vesuvius Python Library to enable more people to experiment and iterate upon them quickly
-
-**VC3D Tracing / Seeding –**
-
-_[vc_grow_seg_from_seed.cpp](https://github.com/hendrikschilling/volume-cartographer/blob/dev-next/apps/src/vc_grow_seg_from_seed.cpp)_ - > vesuvius.tracer.seed
-  * Input format: zarr array containing volumetric predictions, json or other config method for parameters
-  * Output format: obj meshes or tifxyz quad meshes of patches, with required metadata for next steps
-  * Mode: Seed
-
-_[vc_grow_seg_from_seed.cpp](https://github.com/hendrikschilling/volume-cartographer/blob/dev-next/apps/src/vc_grow_seg_from_seed.cpp)_ - > vesuvius.tracer.expand
-  * Input format: folder containing patches from seeds, json or other config method for parameters
-  * Output format: obj meshes or tifxyz quad meshes of patches, with required metadata for next steps, including overlap markers
-  * Mode: Expand
-
-_[vc_grow_seg_from_segments.cpp](https://github.com/hendrikschilling/volume-cartographer/blob/dev-next/apps/src/vc_grow_seg_from_segments.cpp)_  - > vesuvius.tracer.trace
-  * Input format: folder containing patches from seeds, source/target seed, json or other config method for parameters
-  * Output format: obj mesh and/or tifxyz quadmesh
-
-<details class="implementation_details">
-<summary>Implementation Details</summary>
-
-Both call functions in core/src [surface.cpp](https://github.com/hendrikschilling/volume-cartographer/blob/dev-next/core/src/Surface.cpp) and surfacehelpers.cpp. The cost functions are located [here](https://github.com/hendrikschilling/volume-cartographer/blob/dev-next/core/include/vc/core/util/CostFunctions.hpp)
-
-This does not have to use ceres, or any particular solver. We’re looking at functionality not strict requirements on how the solution is attained, but the performance should be equal in terms of output quality. We are willing to sacrifice some speed in this implementation if necessary, but not substantially. 
-
-For python, a good starting point might be theseus (https://github.com/facebookresearch/theseus) which offers many of the same solvers used in the tracer.
+1. **The Offer:** Earn $5,000 for referring a candidate we hire for our research team!
+2. **Referrer Eligibility:** You must be legally eligible to receive the prize payment.
+3. **Hire Eligibility:** Candidates must be new contacts and legally authorized to receive payment from Vesuvius Challenge.
+4. **How to Refer:** Email jobs@scrollprize.org with subject: "Referral: [Candidate Name]." Include: your name & Discord username (if applicable), your contact information, candidate's name & contact information (confirming their permission), and why they're a good fit.
+5. **Terms:** Hires and prizes are determined at the sole discretion of Curious Cases, Inc. Referral must be submitted per the above instructions. Referral must be received before the candidate applies directly. Your referral must be the first one received for that candidate. The candidate must acknowledge your referral during hiring. The candidate must be hired for a full-time research team role.
 </details>
 
-**Spiral Fitting –**
-  
-We’re looking to utilize the spiral fitting created by Paul for his submission [here](https://github.com/pmh47/spiral-fitting). We want it again similar to the sheet tracer in utilization, ie: calling vesuvius.fit
-  * Input format: one or many zarr arrays containing the outputs of the representation step.
-  * output format: .obj mesh
+***
 
-We’d like to explore some methods of using this on patches generated by the tracer or patches generated by any other methods – potentially utilizing this as a generalized “stitcher”
+## Terms and Conditions
 
-
+Prizes are awarded at the sole discretion of Curious Cases, Inc. and are subject to review by our Technical Team, Annotation Team, and Papyrological Team. We may issue more or fewer awards based on the spirit of the prize and the received submissions. You agree to make your method open source if you win a prize. It does not have to be open source at the time of submission, but you have to make it open source under a permissive license to accept the prize. Submissions for milestone prizes will close once the winner is announced and their methods are open sourced. Curious Cases, Inc. reserves the right to modify prize terms at any time in order to more accurately reflect the spirit of the prize as designed. Prize winner must provide payment information to Curious Cases, Inc. within 30 days of prize announcement to receive prize.

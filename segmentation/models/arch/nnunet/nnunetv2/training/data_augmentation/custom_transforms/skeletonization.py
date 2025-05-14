@@ -51,23 +51,18 @@ class MedialSurfaceTransform(BasicTransform):
         
         # Skeletonize
         if not np.sum(bin_seg[0]) == 0:
-            skel = skeletonize(bin_seg[0], surface=True)
-
-            # initializing different axes
-            skel_x = np.zeros_like(skel)
-            skel_y = np.zeros_like(skel)
-            skel_z = np.zeros_like(skel)
-
-            for z in range(skel.shape[0]):
-                skel_z[z] = skeletonize(bin_seg[0][z], surface=False)
-            for y in range(skel.shape[1]):
-                skel_y[:,y,:] = skeletonize(bin_seg[0][:,y,:], surface=False)
-            for x in range(skel.shape[2]):
-                skel_x[:,:,x] = skeletonize(bin_seg[0][:,:,x], surface=False)
-
-            np.logical_or(skel, skel_z, out=skel)
-            np.logical_or(skel, skel_y, out=skel)
-            np.logical_or(skel, skel_x, out=skel)
+            # skel = skeletonize(bin_seg[0], surface=True)
+            skel = np.zeros_like(bin_seg[0])
+            Z, Y, X = skel.shape
+            
+            for z in range(Z):
+                skel[z] |= skeletonize(bin_seg[0][z], surface=False)
+                
+            for y in range(Y):
+                skel[:, y, :] |= skeletonize(bin_seg[0][:, y, :], surface=False)
+                
+            for x in range(X):
+                skel[:, :, x] |= skeletonize(bin_seg[0][:, :, x], surface=False)
             
             skel = (skel > 0).astype(np.int16)
             if self.do_tube:

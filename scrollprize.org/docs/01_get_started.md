@@ -54,9 +54,9 @@ Get a feel for [the data](data) by looking inside a scroll that has not been ope
 
 Our goal is to read the entire library, starting with a complete scroll:
 
-<Admonition type="tip" icon="📜" title="Grand Prize">
+<Admonition type="tip" icon="📜" title="Read an Entire Scroll">
 * Prizes: \$200,000 [Read Entire Scroll Prize](prizes#read-entire-scroll-prize-200000)
-* Starting point: [The Data](data), [The Tutorials](tutorial)
+* Starting point: [Data](data), [Tutorials](tutorial)
 </Admonition>
 
 There are currently two primary subproblems where we need your help:
@@ -67,7 +67,7 @@ There are currently two primary subproblems where we need your help:
 </Admonition>
 
 <Admonition type="info" icon="🖋️" title="Ink Detection">
-* Prizes: 4 x \$60,000 [First Letters and First Title Prizes](prizes#first-letters-and-title-prizes)
+* Prizes: 7 x \$60,000 [First Letters and First Title Prizes](prizes#first-letters-and-title-prizes)
 * Starting point: [Ink detection tutorial](tutorial5)
 </Admonition>
 
@@ -79,10 +79,10 @@ There are many great tools and resources that you can use and contribute to:
 
 <Admonition type="danger" icon="🌎" title="Open Source">
 * Prizes: [Progress Prizes](prizes#progress-prizes)
-* Starting point: [Awesome Scroll Tools](community_projects) and [Progress Prizes Wish List](prizes#wish-list)
+* Starting point: [Awesome Scroll Tools](community_projects) and [Progress Prizes Wish List](prizes#progress-prizes)
 </Admonition>
 
-For prototyping new ideas, we particularly recommend the [Python](https://github.com/ScrollPrize/villa/tree/main/vesuvius) and [C](https://github.com/ScrollPrize/villa/tree/main/vesuvius-c) libraries for easily working with scroll data.
+For prototyping new ideas, we recommend the `vesuvius` [Python](https://github.com/ScrollPrize/villa/tree/main/vesuvius) and [C](https://github.com/ScrollPrize/villa/tree/main/vesuvius-c) libraries for working with scroll data.
 
 Reach out to our [Discord community](https://discord.com/invite/uTfNwwecCQ) and [team](mailto:team@scrollprize.org) with your questions!
 

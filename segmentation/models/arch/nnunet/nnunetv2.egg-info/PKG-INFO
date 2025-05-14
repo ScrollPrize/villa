@@ -1,4 +1,4 @@
-Metadata-Version: 2.2
+Metadata-Version: 2.4
 Name: nnunetv2
 Version: 2.5.1
 Summary: nnU-Net is a framework for out-of-the box image segmentation.
@@ -41,10 +41,9 @@ Requires-Dist: yacs
 Requires-Dist: batchgeneratorsv2>=0.2
 Requires-Dist: einops
 Requires-Dist: monai
-Requires-Dist: mamba_ssm
 Requires-Dist: edt
-Requires-Dist: timm
 Requires-Dist: opencv-python-headless
+Requires-Dist: wandb
 Provides-Extra: dev
 Requires-Dist: black; extra == "dev"
 Requires-Dist: ruff; extra == "dev"

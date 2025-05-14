@@ -147,6 +147,16 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [vesuvius-render](https://github.com/jrudolph/vesuvius-gui?tab=readme-ov-file#vesuvius-render) by Johannes Rudolph:
     - Fast self-contained CPU-based rendering of segments from obj files downloading data on-the-fly.
 
+- [segmata](https://github.com/sgoutteb/segmata) by Stephane Gouttebroze:
+    - Improve the segmentation process by sharpening the layers rendering, this is based on optimizing the layer 32, a further objective is to link this optimization on a inference loop (optimizing on the detected ink instead of only layers)
+
+- [Synthetic instance labels and volume generation](https://lcparker/synthetic-pages) by lcparker
+    - Generate artificial 3D volumes with corresponding instance labels for use in pretraining instance segmentation networks
+ 
+- [Mask3D for instance segmentation on scroll volumes](https://lcparker/Mask3D) by lcparker
+    - SOTA instance segmentation network, configured to work with scroll volumes
+
+
 ### 📦 Materials
 
 #### 🌟 Highlighted
@@ -206,6 +216,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Volume Viewer](https://github.com/tomhsiao1260/vc-whiteboard/tree/demo-3) Used by the segmentation team primarily to see which segments they have worked on already. Hosted [here](http://37.19.207.113:5174/). By Yao Hsiao
     - [Vesuvius Challenge Whiteboard](https://github.com/tomhsiao1260/vc-whiteboard/tree/dev) by Yao Hsiao and Dalufishe
+ 
+- [Neuroglancer Mini](https://github.com/tomhsiao1260/neuroglancer-mini) A trimmed-down version of the Neuroglancer source code. By Yao Hsiao
 
 - [Scroll Viewer](https://github.com/lukeboi/scroll-viewer) by Luke Farritor. A lightweight, extensible tool for viewing volumetric data, which runs in the browser, and is very fast.
 

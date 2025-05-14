@@ -81,7 +81,7 @@ def process_scroll(padded_scroll: str, mesh_file: str, output_dir: str, config=N
         "scroll_height_mm": height,
         "scroll_radius_mm": radius,
         "label_line_1": f"PHerc{padded_scroll}",
-        "label_line_2": "v2",
+        "label_line_2": "v3",
     }
     # If a YAML config was provided and contains "scroll_case", update the defaults.
     if config is not None and "scroll_case" in config:
@@ -109,12 +109,11 @@ def process_scroll(padded_scroll: str, mesh_file: str, output_dir: str, config=N
     # Return padded_scroll, height, and diameter
     # Height includes the entire height of the lining interior to make sure scroll is captured,
     # so is scroll_height + 2 * lining_offset.
-    # Diameter is the external diameter of the case cylinder to make sure the case is not
-    # outside the captured FOV for reconstruction.
+    # Diameter is the external diameter of the lining.
     return (
         padded_scroll,
         scroll_case.lining_interior_height,
-        scroll_case.cylinder_outer_diameter,
+        scroll_case.lining_outer_diameter,
     )
 
 

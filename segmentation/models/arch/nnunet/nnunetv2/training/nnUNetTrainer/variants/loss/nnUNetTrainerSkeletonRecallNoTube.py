@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from torch import autocast
-from typing import Tuple, Union, List
+from typing import Tuple, Union, List, Optional
 import warnings
 
 from nnunetv2.training.loss.compound_losses import DC_SkelREC_and_CE_loss
@@ -48,8 +48,8 @@ from nnunetv2.training.data_augmentation.custom_transforms.skeletonization impor
 
 class nnUNetTrainerSkeletonRecallNoTube(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device('cuda')):
-        super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
+                 device: torch.device = torch.device('cuda'), yaml_config_path: Optional[str] = None):
+        super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device, yaml_config_path)
         self.weight_srec = 1 # This is the default value, you can change it if you want
         if self.label_manager.has_regions:
             raise NotImplementedError("trainer not implemented for regions")
