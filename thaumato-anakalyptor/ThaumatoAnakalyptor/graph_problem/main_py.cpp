@@ -14,6 +14,7 @@ Julian Schilliger 2024 ThaumatoAnakalyptor
 #include <fstream>
 #include <vector>
 #include <tuple>
+#include <utility> // for std::pair
 #include <stack>
 #include <cmath>
 #include <omp.h>
@@ -26,6 +27,7 @@ Julian Schilliger 2024 ThaumatoAnakalyptor
 #include <numeric>
 #include "mst_union.h"
 #include "neighbor_score.h"
+#include "flattening_solver.h"
 
 namespace fs = std::filesystem;
 namespace py = pybind11;
@@ -482,9 +484,9 @@ class Solver {
             // calculate_histogram_edges(graph, "histogram_edges_start.png");
             largest_connected_component();
         }
-        Solver(std::vector<std::vector<int>> connections, std::vector<std::vector<float>> distances, std::vector<float> winding_angles, std::vector<float> z, float o=2.0, int z_min=-2147483648, int z_max=2147483647) : o(o) {
+        Solver(std::vector<std::vector<int>> connections, std::vector<std::vector<float>> distances, std::vector<float> winding_angles, std::vector<float> current_angles, std::vector<float> z, std::vector<float> current_z, float o=2.0, int z_min=-2147483648, int z_max=2147483647) : o(o) {
             // Load graph from binary file
-            auto [graph_, max_certainty] = load_flattening_graph_from_lists(connections, distances, winding_angles, z);
+            auto [graph_, max_certainty] = load_flattening_graph_from_lists(connections, distances, winding_angles, current_angles, z, current_z);
             graph = graph_;
             // calculate_histogram_edges(graph, "histogram_edges_start.png");
             largest_connected_component();
@@ -539,8 +541,34 @@ class Solver {
             // get largest connected component
             largest_connected_component();
         }
-        void solve_flattening(int num_iterations, float z_tug_min, float z_tug_max, float angle_tug_min, float angle_tug_max, float tug_step) {
-            // TODO: implement this function
+        void solve_flattening(
+            int num_iterations,
+            float z_tug_min,
+            float z_tug_max,
+            float angle_tug_min,
+            float angle_tug_max,
+            float tug_step,
+            float init_z_tug = 0.0f,
+            std::vector<std::pair<float, float>> zero_ranges = {},
+            bool visualize = false
+        ) {
+            // Solve flattening on the full graph
+            std::vector<size_t> valid_indices = get_valid_indices(graph);
+            graph = run_solver_flattening(
+                graph,
+                num_iterations,
+                valid_indices,
+                &h_all_edges,
+                &h_all_sides,
+                z_tug_min,
+                z_tug_max,
+                angle_tug_min,
+                angle_tug_max,
+                tug_step,
+                init_z_tug,
+                zero_ranges,
+                visualize
+            );
         }
         void solve_union() {
             // use the union solver for the final solution
@@ -1048,6 +1076,17 @@ class Solver {
                 graph[index].f_tilde = f_stars[i];
             }
         }
+        std::vector<std::vector<float>> get_uvs() {
+            // get uvs
+            std::vector<std::vector<float>> uvs;
+            std::vector<size_t> valid_indices = get_valid_indices(graph);
+            for (size_t i = 0; i < valid_indices.size(); ++i) {
+                size_t index = valid_indices[i];
+                std::vector<float> uv = {graph[index].f_star, graph[index].f_init};
+                uvs.push_back(uv);
+            }
+            return uvs;
+        }
         std::tuple<std::vector<float>, std::vector<size_t>> get_gt_f_star() {
             // get gt f star
             std::vector<float> gt_f_star;
@@ -1071,6 +1110,14 @@ class Solver {
         void largest_connected_component() {
             find_largest_connected_component(graph);
             nr_nodes = get_valid_indices(graph).size();
+        }
+        void fix_nodes(std::vector<size_t> fixed_indices) {
+            // fix nodes
+            std::vector<size_t> valid_indices = get_valid_indices(graph);
+            for (size_t i = 0; i < fixed_indices.size(); ++i) {
+                size_t index = valid_indices[fixed_indices[i]];
+                graph[index].fixed = true;
+            }
         }
         void unfix() {
             // unfix all nodes
@@ -1182,12 +1229,14 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("o") = 2.0f,
             py::arg("z_min") = -2147483648,
             py::arg("z_max") = 2147483647)
-        .def(py::init<std::vector<std::vector<int>>, std::vector<std::vector<float>>, std::vector<float>, std::vector<float>, float, int, int>(),
+        .def(py::init<std::vector<std::vector<int>>, std::vector<std::vector<float>>, std::vector<float>, std::vector<float>, std::vector<float>, std::vector<float>, float, int, int>(),
             "Class method to solve the graph with manual input",
             py::arg("connections"),
             py::arg("distances"),
             py::arg("winding_angles"),
+            py::arg("current_angles"),
             py::arg("z"),
+            py::arg("current_z"),
             py::arg("o") = 2.0f,
             py::arg("z_min") = -2147483648,
             py::arg("z_max") = 2147483647)
@@ -1236,7 +1285,10 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("z_tug_max") = 0.0f,
             py::arg("angle_tug_min") = 0.0f,
             py::arg("angle_tug_max") = 0.0f,
-            py::arg("tug_step") = 0.0f)
+            py::arg("tug_step") = 0.0f,
+            py::arg("init_z_tug") = 0.0f,
+            py::arg("zero_ranges") = std::vector<std::pair<float, float>>(),
+            py::arg("visualize") = false)
         .def("solve_union", &Solver::solve_union,
             "Method to solve the graph with the union solver")
         .def("solve_ring", &Solver::solve_ring,
@@ -1345,6 +1397,7 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
         .def("set_positions", &Solver::set_positions,
             "Method to set the f star values of the graph",
             py::arg("f_stars"))
+        .def("get_uvs", &Solver::get_uvs)
         .def("get_gt_f_star", &Solver::get_gt_f_star,
             "Method to get the ground truth f star values of the graph")
         .def("load_graph", &Solver::load_graph,
@@ -1353,6 +1406,9 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("version") = 0)
         .def("save_graph", &Solver::save_graph)
         .def("largest_connected_component", &Solver::largest_connected_component)
+        .def("fix_nodes", &Solver::fix_nodes,
+            "Method to fix nodes of the graph",
+            py::arg("fixed_indices"))
         .def("unfix", &Solver::unfix)
         .def("update_edges", &Solver::update_edges)
         .def("get_nr_nodes", &Solver::get_nr_nodes)
