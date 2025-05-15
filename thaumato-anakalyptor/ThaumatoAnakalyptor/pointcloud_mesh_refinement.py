@@ -6,6 +6,7 @@ Script to generate a refined mesh using the raw pointcloud and an initial mesh.
 import argparse
 import numpy as np
 import open3d as o3d
+from scipy.spatial import cKDTree
 import os
 import sys
 import pickle
@@ -14,6 +15,17 @@ from tqdm import tqdm
 
 sys.path.append('ThaumatoAnakalyptor/graph_problem/build')
 import graph_problem_gpu_py
+
+### UTILS ###
+
+def shuffling_points_axis(points, axis_indices=[2, 0, 1, 3]):
+    """
+    Rotate points by reshuffling axis
+    """
+    # Reshuffle axis in points
+    points = points[:, axis_indices]
+    # Return points
+    return points
 
 def load_mesh(mesh_file):
     print (f"Loading mesh from {mesh_file}")
@@ -70,6 +82,7 @@ def generate_winding_pointclouds(mesh_path):
     print("Preparing the winding pointclouds...")
     for slab_path in tqdm(slabs, desc="Preprocessing slabs"):
         points = load_pointcloud_slab(slab_path).astype(np.float16)
+        points = shuffling_points_axis(points) # From TA to original coordinates
         print(f"Shape of points: {points.shape} and of points_mesh: {points_mesh.shape}")
         if points.shape[0] == 0:
             print("Slab has no points ...")
@@ -86,7 +99,7 @@ def generate_winding_pointclouds(mesh_path):
             if len(winding_points) > 0:
                 save_winding_pointcloud(os.path.join(base_path, "windings"), winding_nr, winding_points)
 
-def flatten_pointcloud(base_path, k_neighbors=8, winding_width=4, angle_threshold=30, angle_weight=0.2):
+def flatten_pointcloud(base_path, k_neighbors=8, angle_threshold=30, angle_weight=0.2):
     """
     Flatten pointcloud by concatenating winding segments and building neighbor graphs.
 
@@ -100,23 +113,46 @@ def flatten_pointcloud(base_path, k_neighbors=8, winding_width=4, angle_threshol
         angle_threshold (float, optional): Max allowed difference in 4th-dimension (angle) to keep a neighbor.
         angle_weight (float, optional): Scale factor for 4th-dimension when computing distances in KD-tree.
     """
-    from scipy.spatial import cKDTree
-
+    winding_width=3
     winding_path = os.path.join(base_path, "windings")
     # find and order all winding pointclouds
-    winding_files = sorted(glob.glob(os.path.join(winding_path, "winding_*.npz")))
+    winding_files = glob.glob(os.path.join(winding_path, "winding_*.npz"))
     print(f"Found {len(winding_files)} winding pointclouds.")
+    # Bring the files in order of their winding number
+    winding_files_indices = sorted([int(os.path.basename(wf).split("_")[1].split(".")[0]) for wf in winding_files])
+    winding_files = [os.path.join(winding_path, f"winding_{i}.npz") for i in winding_files_indices]
 
     # directory to save graphs
     graph_dir = os.path.join(base_path, "graphs")
     os.makedirs(graph_dir, exist_ok=True)
+    # initialize storage for previous flattened coordinates per winding
+    prev_uvs_u = {}
+    prev_uvs_v = {}
+    prev_points = {}
 
     # process windings in segments
+    winding_us = None
+    winding_vs = None
     for start in range(0, len(winding_files)):
+        if start < 10: # for debug, leave it for now
+            continue
         end = min(start + winding_width, len(winding_files))
-        print(f"Processing windings {start} to {end}")
+        print(f"Processing windings {start} to {end}: {winding_files[start:end]}")
         # load and concatenate pointcloud segments (points include x,y,z,angle)
-        pcs = [np.load(wf)['points'] for wf in winding_files[start:end]]
+        # pcs = [np.load(wf)['points'] if  for wf in winding_files[start:end]]
+        pcs = []
+        for wnr in winding_files_indices[start:end]:
+            # load previous points if available
+            if wnr in prev_points:
+                print(f"Loading previous points for winding {wnr}")
+                points_ = prev_points[wnr]
+            else:
+                print(f"Loading winding pointcloud {wnr} from {winding_path}")
+                points_ = load_winding_pointcloud(winding_path, wnr)
+            pcs.append(points_)
+        min_angles = [np.min(pc[:, 3]) for pc in pcs]
+        max_angles = [np.max(pc[:, 3]) for pc in pcs]
+        winding_indices = [len(pc) for pc in pcs]
         points = np.concatenate(pcs, axis=0)
         coords = points[:, :3]
         winding_angles = points[:, 3]
@@ -128,7 +164,11 @@ def flatten_pointcloud(base_path, k_neighbors=8, winding_width=4, angle_threshol
             tree_input = coords
         # build KDTree and query k+1 neighbors (self included)
         tree = cKDTree(tree_input)
-        distances, indices = tree.query(tree_input, k=k_neighbors + 1)
+        temp_distances, indices = tree.query(tree_input, k=k_neighbors + 1) # "wrong" distance computation. Use 3D euclidean distance instad on first 3 dimensions only
+        distances = np.linalg.norm(coords[indices] - coords[:, np.newaxis], axis=-1) # Coords euclidean distance
+        assert distances.shape == temp_distances.shape, "Distance shape mismatch"
+        del temp_distances
+
         print(f"Shape of distances: {distances.shape} and indices: {indices.shape}")
         # drop self
         neighbor_ids = indices[:, 1:]
@@ -168,27 +208,123 @@ def flatten_pointcloud(base_path, k_neighbors=8, winding_width=4, angle_threshol
             _, unique_indices = np.unique(neighbor_lists[i], return_index=True)
             neighbor_lists[i] = [neighbor_lists[i][idx] for idx in unique_indices]
             distance_lists[i] = [distance_lists[i][idx] for idx in unique_indices]
+            # Filter out  indices with distances > 10000
+            neighbor_lists[i] = [neighbor_lists[i][j] for j, d in enumerate(distance_lists[i]) if d < 10000]
+            distance_lists[i] = [d for d in distance_lists[i] if d < 10000]
 
-        # save lists as pickle
-        out_file = os.path.join(graph_dir, f"graph_{start}_{end}.pkl")
-        with open(out_file, 'wb') as f:
-            pickle.dump({'neighbor_ids': neighbor_lists, 'neighbor_dists': distance_lists}, f)
-        print(f"Graph saved to {out_file}")
+        # Check that each edge is undirected
+        # for i in range(len(coords)):
+        #     for j in range(len(neighbor_lists[i])):
+        #         neighbor = neighbor_lists[i][j]
+        #         if i not in neighbor_lists[neighbor]:
+        #             print(f"Edge {i} -> {neighbor} is not undirected")
+        #             break
+        
+        print(f"Min/Max distances: {np.min(np.concatenate(distance_lists))}, {np.max(np.concatenate(distance_lists))}")
 
         # load graph into cpp
-        solver = graph_problem_gpu_py.Solver(neighbor_lists, distance_lists, winding_angles, coords[:,2])
+        coords_z_index = 2
+        # orchestrate initial guess for current flattened coordinates (u: angle, v: z)
+        current_angles = np.zeros_like(winding_angles)
+        current_z = np.zeros_like(coords[:, coords_z_index])
+        # assign previous results for wraps if available, otherwise use initial values
+        # assign previous results for wraps if available and matching size, otherwise use defaults
+        start_idx = 0
+        # track ranges of previous and new wraps within this window segment
+        prev_ranges = []
+        new_ranges = []
+        for idx_in_segment, count in enumerate(winding_indices):
+            wrap_nr = winding_files_indices[start + idx_in_segment]
+            # default slices
+            default_u = winding_angles[start_idx:start_idx+count]
+            default_v = coords[start_idx:start_idx+count, coords_z_index]
+            prev_u = prev_uvs_u.get(wrap_nr, None)
+            # use previous if exists and matches count
+            if prev_u is not None and prev_u.shape[0] == count:
+                current_angles[start_idx:start_idx+count] = prev_u
+                current_z[start_idx:start_idx+count] = prev_uvs_v[wrap_nr]
+                prev_ranges.append((start_idx, start_idx+count))
+            else:
+                if prev_u is not None and prev_u.shape[0] != count:
+                    print(f"Warning: wrap {wrap_nr} prev_uv length {prev_u.shape[0]} != expected {count}, using defaults.")
+                current_angles[start_idx:start_idx+count] = default_u
+                current_z[start_idx:start_idx+count] = default_v
+                new_ranges.append((start_idx, start_idx+count))
+            start_idx += count
+        # align newly added wraps to previously computed wraps in u (angle) and v (z)
+        if prev_ranges and new_ranges:
+            # align u: offset new wraps' min to prev wraps' max
+            prev_vals = np.concatenate([current_angles[s:e] for s, e in prev_ranges])
+            new_vals = np.concatenate([current_angles[s:e] for s, e in new_ranges])
+            u_offset = np.max(prev_vals) - np.min(new_vals)
+            for s, e in new_ranges:
+                current_angles[s:e] += u_offset
+            # align v (z): match mean of new wraps to mean of prev wraps
+            prev_z_vals = np.concatenate([current_z[s:e] for s, e in prev_ranges])
+            new_z_vals = np.concatenate([current_z[s:e] for s, e in new_ranges])
+            z_offset = np.mean(prev_z_vals) - np.mean(new_z_vals)
+            for s, e in new_ranges:
+                current_z[s:e] += z_offset
+        solver = graph_problem_gpu_py.Solver(neighbor_lists, distance_lists, winding_angles, current_angles, coords[:, coords_z_index], current_z)
         print("Set up the graph")
+        # fix nodes of the start winding if it has been previously computed
+        start_wrap_nr = winding_files_indices[start]
+        # only fix if prev_uvs length matches this wrap's point count
+        first_count = winding_indices[0]
+        prev_u0 = prev_uvs_u.get(start_wrap_nr)
+        if prev_u0 is not None and prev_u0.shape[0] == first_count:
+            to_fix = list(range(first_count))
+            solver.fix_nodes(to_fix)
+            print(f"Fixed {len(to_fix)} nodes of the first winding {start_wrap_nr} with previous results.")
+        else:
+            print(f"Warning: wrap {start_wrap_nr} expected {first_count}, not fixing nodes.")
         # solve the graph problem
-        solver.solve_flattening()
+        min_angle = np.min(winding_angles)
+        max_angle = np.max(winding_angles)
+        z_min = np.min(coords[:, coords_z_index])
+        z_max = np.max(coords[:, coords_z_index])
+        print(F"Min/Max angles: {min_angle}, {max_angle}, Min/Max z: {z_min}, {z_max}")
 
+        zero_ranges = [(min_angle, min_angle+90), (max_angle-90, max_angle)]
+        a_step = (max_angle - min_angle)/winding_width
+        zero_ranges_initial = [(min_angle + index * a_step, min_angle + (index+1)*a_step) for index in range(winding_width)]
+        solver.solve_flattening(num_iterations=20000, visualize=True, angle_tug_min=min_angle+180, angle_tug_max=max_angle-180, z_tug_min=z_min+100, z_tug_max=z_max-100, tug_step=0.25, zero_ranges=zero_ranges_initial)
+        solver.solve_flattening(num_iterations=100000, visualize=True, zero_ranges=zero_ranges)
+        undeleted_indices = np.array(solver.get_undeleted_indices())
+        
+        uvs = np.array(solver.get_uvs())
+        winding_us = []
+        winding_vs = []
+        w_i = 0
+        w_i_total = 0
+        for i in range(len(winding_indices)):
+            undeleted_indices_winding = undeleted_indices[np.logical_and(undeleted_indices >= w_i_total, undeleted_indices < w_i_total + winding_indices[i])]
+            winding_u = uvs[w_i:w_i + len(undeleted_indices_winding), 0]
+            winding_v = uvs[w_i:w_i + len(undeleted_indices_winding), 1]
+            points_winding = points[undeleted_indices_winding]
+
+            # store for next segment initialization
+            wrap_nr = winding_files_indices[start + i]
+            prev_uvs_u[wrap_nr] = winding_u
+            prev_uvs_v[wrap_nr] = winding_v
+            prev_points[wrap_nr] = points_winding
+            winding_us.append(winding_u)
+            winding_vs.append(winding_v)
+            w_i += len(undeleted_indices_winding)
+            w_i_total += winding_indices[i]
+
+        print(f"Keys in prev_uvs_u: {prev_uvs_u.keys()}")
+        print(f"Keys in prev_uvs_v: {prev_uvs_v.keys()}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Refine pointcloud using mesh and downsampling")
     parser.add_argument("--mesh", required=True, help="Path to mesh file (.ply or .obj)")
+    parser.add_argument("--skip_precomputation", action="store_true", help="Skip precomputation of winding pointclouds")
     args = parser.parse_args()
 
-    generate_winding_pointclouds(args.mesh)
+    if not args.skip_precomputation:
+        generate_winding_pointclouds(args.mesh)
     flatten_pointcloud(os.path.dirname(args.mesh))
 
 
