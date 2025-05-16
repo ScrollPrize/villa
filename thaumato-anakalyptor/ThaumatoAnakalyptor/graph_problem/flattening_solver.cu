@@ -78,7 +78,7 @@ __global__ void compute_zero_means_kernel(
     for (int j = 0; j < num_ranges; ++j) {
         float min_a = ranges[j].x;
         float max_a = ranges[j].y;
-        if (w >= min_a && w < max_a) {
+        if (w > min_a && w < max_a) {
             atomicAdd(&sums[j], f);
             atomicAdd(&counts[j], 1);
             break;
@@ -133,26 +133,37 @@ __global__ void flattening_update_kernel(
         if (dist == 0.0f) {
             if (acc_z == 0.0f && acc_s == 0.0f) {
                 // Random small offset to avoid stagnation
-                float seed = float(i) * 12.9898f + float(idx) * 78.233f + edge.target_node * 3.5453f;
+                float seed = float(i) * 12.9898f + float(idx) * 78.233f + edge.target_node * 3.5453f + 400.1f * nb.f_init * node.f_star;
                 float rnd1 = sinf(seed) * 43758.5453123f;
-                float rnd2 = sinf(seed + 1.0f) * 43758.5453123f;
+                float rnd2 = sinf(seed + 1.0f) * 5.5453123f;
                 rnd1 = rnd1 - floorf(rnd1);
                 rnd2 = rnd2 - floorf(rnd2);
-                acc_z = rnd1;
-                acc_s = rnd2;
-                sum_w += 1.0f;
+                dz = rnd1;
+                ds = rnd2;
+                dist = sqrtf(dz*dz + ds*ds);
             }
-            continue;
         }
-        float ux = dz / dist;
-        float us = ds / dist;
         // Determine direction: if the current distance is greater than desired, move closer (+), else move apart (-)
         float sign = (dist > edge.k) ? 1.0f : -1.0f;
-        acc_z += dz * sign;
-        acc_s += ds * sign;
+        dist = fmaxf(dist, 1e-3f);  // Avoid division by zero
+        // acc_z += dz * sign;
+        // acc_s += ds * sign;
+        // sum_w += 1.0f;
+        
+        float error = fabsf(dist - edge.k);
+        error = fminf(error, 0.5 * dist);  // Clamp error to avoid overflow
+        error = fmaxf(error, 1.0f);  // Avoid slow final convergence
+        // dist *= 0.10f;
+        float ux = dz / dist;
+        float us = ds / dist;
+        acc_z += error * ux * sign;
+        acc_s +=  error * us * sign;
         sum_w += 1.0f;
     }
-    if (sum_w == 0.0f) sum_w = 1.0f;
+    if (sum_w == 0.0f) {
+        sum_w = 1.0f;
+    }
+        
     float step_z = acc_z / sum_w;
     float step_s = acc_s / sum_w;
     // Additional z tug (only if a non-zero interval is specified)
@@ -171,17 +182,29 @@ __global__ void flattening_update_kernel(
         for (int j = 0; j < num_zero_ranges; ++j) {
             float min_a = zero_ranges[j].x;
             float max_a = zero_ranges[j].y;
-            if (w_old >= min_a && w_old < max_a) {
+            if (w_old > min_a && w_old < max_a) {
                 float mean = zero_means[j];
-                if (mean > 0) step_z -= tug_step;
-                else if (mean < 0) step_z += tug_step;
+                if (tug_step > 0) {
+                    step_z -= mean;
+                }
+                else {
+                    if (mean > 0) step_z -= fabsf(tug_step);
+                    else if (mean < 0) step_z += fabsf(tug_step);
+                }
                 break;
             }
         }
     }
     // Store updates in temporaries: use node.z for new f_init, node.f_tilde for new f_star
-    node.z       = node.f_init + step_z;
-    node.f_tilde = node.f_star   + step_s;
+    float lr = 1.5f;
+    node.z       = node.f_init + lr * step_z;
+    node.f_tilde = node.f_star + lr * step_s;
+
+    // Clamp to min/max
+    if (node.z < -1e9f) node.z = -1e9f;
+    if (node.z > 1e9f) node.z = 1e9f;
+    if (node.f_tilde < -1e9f) node.f_tilde = -1e9f;
+    if (node.f_tilde > 1e9f) node.f_tilde = 1e9f;
 }
 
 std::vector<Node> run_solver_flattening(
