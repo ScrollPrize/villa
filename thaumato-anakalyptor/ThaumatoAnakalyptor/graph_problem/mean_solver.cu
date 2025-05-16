@@ -440,6 +440,7 @@ inline void plot_nodes(const std::vector<Node>& graph, const std::string& filena
         max_f_init = std::max(max_f_init, node.f_init);
         min_gt = std::min(min_gt, - node.gt_f_star);
     }
+    max_f_init = std::max(max_f_init, min_f_init + 0.1f);
     // round to nearest 360
     min_gt = roundf(min_gt / 360.0f - 1.0f) * 360.0f;
 
