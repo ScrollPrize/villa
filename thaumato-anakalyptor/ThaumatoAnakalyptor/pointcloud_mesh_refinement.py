@@ -101,64 +101,75 @@ def clean_winding_dicts(winding_range, flattened_winding_path, winding_files_ind
 
 def subsample_min_dist(points, r):
     """
-    points: list of (x, y) tuples
-    r: minimum allowed distance
-    returns: list of indices of points (from the original list) such that
-             no two kept points are closer than r
+    Greedy “pack” subsampling: once a point is kept, all its neighbors
+    within r get excluded from future consideration.
+    
+    Args:
+        points: (N,2) array-like of 2D coords
+        r:      minimum allowed distance
+
+    Returns:
+        accepted: list of original indices s.t. no two are closer than r
     """
-    # Pair each point with its original index
-    idx_pts = list(enumerate(points))  
-    random.shuffle(idx_pts)             # random order
-    grid = {}                           # map (i,j) -> list of accepted (idx, (x,y))
-    kept_indices = []
+    pts = np.asarray(points, dtype=float)
+    tree = cKDTree(pts)
+    
+    # start with a random order of all indices
+    order = np.arange(len(pts))
+    np.random.shuffle(order)
+    
+    accepted = []
+    removed = np.zeros(len(pts), dtype=bool)
+    
+    for idx in order:
+        if removed[idx]:
+            continue
+        # accept this one…
+        accepted.append(int(idx))
+        # …and mark all neighbors within r so we never pick them
+        neighbors = tree.query_ball_point(pts[idx], r)
+        removed[neighbors] = True
+    
+    return accepted
 
-    for idx, (x, y) in idx_pts:
-        i, j = int(x // r), int(y // r)
-        ok = True
-
-        # Check accepted points in neighboring 3×3 grid cells
-        for di in (-1, 0, +1):
-            for dj in (-1, 0, +1):
-                cell = (i + di, j + dj)
-                for other_idx, (xx, yy) in grid.get(cell, ()):
-                    if (xx - x)**2 + (yy - y)**2 < r*r:
-                        ok = False
-                        break
-                if not ok:
-                    break
-            if not ok:
-                break
-
-        if ok:
-            kept_indices.append(idx)
-            grid.setdefault((i, j), []).append((idx, (x, y)))
-
-    return kept_indices
 
 def filter_by_density(points, selected_indices, r, n):
     """
-    points: list of (x, y) tuples, the original dataset
-    selected_indices: list of int, indices into `points` (e.g. output of subsample_min_dist_indices)
-    r: float, the radius within which to count neighbors (inclusive)
-    n: int, the minimum number of neighbors required (strictly greater than n)
-    
-    Returns: list of indices (subset of selected_indices) meeting the density criterion.
+    Keep only those indices whose point has strictly more than n neighbors
+    within distance r (counting itself).
+
+    Args:
+        points:            (N,2) array-like of 2D coords
+        selected_indices:  list of indices to test
+        r:                 radius for neighbor counting
+        n:                 threshold (strictly greater)
+
+    Returns:
+        filtered: subset of selected_indices meeting the density criterion
     """
-    r2 = r * r
-    filtered = []
+    pts = np.asarray(points, dtype=float)
+    tree = cKDTree(pts)
     
-    for idx in selected_indices:
-        x0, y0 = points[idx]
-        count = 0
-        # count neighbors (including the point itself; adjust if you want to exclude it)
-        for x1, y1 in points:
-            if (x1 - x0)**2 + (y1 - y0)**2 <= r2:
-                count += 1
-        # keep only if strictly more than n
-        if count > n:
-            filtered.append(idx)
+    # query_ball_point can take an array of query-points at once
+    neighbor_lists = tree.query_ball_point(pts[selected_indices], r)
     
+    # keep only those with > n neighbors
+    filtered = [
+        idx for idx, nbrs in zip(selected_indices, neighbor_lists)
+        if len(nbrs) > n
+    ]
     return filtered
+
+def display_3d_pointcloud(points):
+    # interactive 3d visualization of the downsampled points with matplotlib
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+    ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=1)
+    ax.set_title("Points 3D")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    plt.show()
 
 ### Logic Functions ###
     
@@ -177,7 +188,10 @@ def generate_winding_pointclouds(mesh_path):
     print("Preparing the winding pointclouds...")
     for slab_path in tqdm(slabs, desc="Preprocessing slabs"):
         points = load_pointcloud_slab(slab_path).astype(np.float16)
-        points = shuffling_points_axis(points) * 4.0 # From TA to original coordinates
+        # From TA to original coordinates
+        points = shuffling_points_axis(points)
+        points[:, :3] = points[:, :3] * 4.0 - 500
+
         print(f"Shape of points: {points.shape} and of points_mesh: {points_mesh.shape}")
         if points.shape[0] == 0:
             print("Slab has no points ...")
@@ -218,9 +232,6 @@ def flatten_pointcloud(base_path, k_neighbors=8, angle_threshold=30, angle_weigh
     winding_files_indices = sorted([int(os.path.basename(wf).split("_")[1].split(".")[0]) for wf in winding_files])
     winding_files = [os.path.join(winding_path, f"winding_{i}.npz") for i in winding_files_indices]
 
-    # directory to save graphs
-    graph_dir = os.path.join(base_path, "graphs")
-    os.makedirs(graph_dir, exist_ok=True)
     # initialize storage for previous flattened coordinates per winding
     prev_uvs_u = {}
     prev_uvs_v = {}
@@ -230,7 +241,7 @@ def flatten_pointcloud(base_path, k_neighbors=8, angle_threshold=30, angle_weigh
     winding_us = None
     winding_vs = None
     for start in range(0, len(winding_files)):
-        if start < 77: # for debug, leave it for now
+        if start < 10: # for debug, leave it for now
             continue
         end = min(start + winding_width, len(winding_files))
         print(f"Processing windings {start} to {end}: {winding_files[start:end]}")
@@ -245,6 +256,7 @@ def flatten_pointcloud(base_path, k_neighbors=8, angle_threshold=30, angle_weigh
             else:
                 print(f"Loading winding pointcloud {wnr} from {winding_path}")
                 points_ = load_winding_pointcloud(winding_path, wnr)
+                # display_3d_pointcloud(points_[:, :3]) # Debug visualization
             pcs.append(points_)
         min_angles = [np.min(pc[:, 3]) for pc in pcs]
         max_angles = [np.max(pc[:, 3]) for pc in pcs]
@@ -385,7 +397,7 @@ def flatten_pointcloud(base_path, k_neighbors=8, angle_threshold=30, angle_weigh
         a_step = (max_angle - min_angle)/winding_width
         zero_ranges_initial = [(min_angle + index * a_step, min_angle + (index+1)*a_step) for index in range(winding_width)]
         zero_ranges_fine = [(min_angle + (index + 0.4) * a_step, min_angle + (index+0.6)*a_step) for index in range(winding_width)]
-        solver.solve_flattening(num_iterations=20000, visualize=True, angle_tug_min=min_angle+90, angle_tug_max=max_angle-90, z_tug_min=z_min+100, z_tug_max=z_max-100, tug_step=0.2, zero_ranges=zero_ranges_initial)
+        solver.solve_flattening(num_iterations=20000, visualize=True, angle_tug_min=min_angle+90, angle_tug_max=max_angle-90, z_tug_min=z_min+100, z_tug_max=z_max-100, tug_step=0.5, zero_ranges=zero_ranges_initial)
         solver.solve_flattening(num_iterations=150000, visualize=True, zero_ranges=zero_ranges_initial, tug_step=-0.0005)
         undeleted_indices = np.array(solver.get_undeleted_indices())
         
@@ -432,6 +444,7 @@ def mesh_flattened(flattened_winding_path):
     subsample_radius = 10.0
     for i in range(len(winding_files)):
         points, uvs = load_flattened_winding(flattened_winding_path, winding_files_indices[i])
+        display_3d_pointcloud(points)
         # subsample
         print(f"Subsampling {winding_files[i]} with {points.shape[0]} points")
         print(f"Min max uvs: {np.min(uvs[:, 0])}, {np.max(uvs[:, 0])}, {np.min(uvs[:, 1])}, {np.max(uvs[:, 1])}")
@@ -454,15 +467,7 @@ def mesh_flattened(flattened_winding_path):
         axs[1, 1].set_title("Subsampled Points")
         plt.show()
 
-        # interactive 3d visualization of the downsampled points with matplotlib
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection='3d')
-        ax.scatter(points_subsampled[:, 0], points_subsampled[:, 1], points_subsampled[:, 2], s=1)
-        ax.set_title("Subsampled Points 3D")
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        ax.set_zlabel("Z")
-        plt.show()
+        display_3d_pointcloud(points_subsampled)
 
 
 def main():
@@ -473,7 +478,7 @@ def main():
 
     if not args.skip_precomputation:
         generate_winding_pointclouds(args.mesh)
-        flattened_winding_path = flatten_pointcloud(os.path.dirname(args.mesh))
+    flattened_winding_path = flatten_pointcloud(os.path.dirname(args.mesh))
     flattened_winding_path = os.path.join(os.path.dirname(args.mesh), "windings_flattened")
     mesh_flattened(flattened_winding_path)
 
