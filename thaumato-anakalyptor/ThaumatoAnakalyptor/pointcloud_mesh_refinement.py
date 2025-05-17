@@ -475,7 +475,153 @@ def generate_winding_pointclouds(mesh_path):
             if len(winding_points) > 0:
                 save_winding_pointcloud(os.path.join(base_path, "windings"), winding_nr, winding_points)
 
-def flatten_pointcloud(base_path, k_neighbors=8, angle_threshold=30, angle_weight=0.2):
+def build_neighbor_graph(coords,
+                         angles=None,
+                         k_neighbors=6,
+                         angle_threshold=40,
+                         angle_weight=None,
+                         z_weight=100.0,
+                         max_distance=10000,
+                         angle_bin_size=12.0,
+                         angle_bin_k=2,
+                         z_bin_size=20.0,
+                         z_bin_k=0):
+    """
+    Build undirected neighbor lists and distances using KD-tree on spatial (and optionally angular) data.
+
+    Args:
+        coords (array-like, Nx3): Spatial coordinates.
+        angles (array-like, N), optional: Angular values for each point.
+        k_neighbors (int): Number of nearest neighbors to query (per KD-tree).
+        angle_threshold (float), optional: Maximum allowed angle difference to keep an edge.
+        angle_weight (float), optional: Scaling factor for angles when building first KD-tree.
+        z_weight (float): Scaling factor for Z dimension in second KD-tree.
+        max_distance (float): Maximum spatial distance to keep an edge.
+        angle_bin_size (float): Angular bin size (degrees) for cross-bin connections.
+        angle_bin_k (int): Number of neighbors to connect in each adjacent angular bin.
+        z_bin_size (float): Z bin size for cross-bin connections.
+        z_bin_k (int): Number of neighbors to connect in each adjacent z bin.
+
+    Returns:
+        neighbor_lists (List[List[int]]): Neighbor indices for each point.
+        distance_lists (List[List[float]]): Corresponding distances.
+    """
+    pts = np.asarray(coords, dtype=float)
+    # prepare angle values for thresholding
+    angle_vals = np.asarray(angles, dtype=float) if angles is not None else None
+    # First KD-tree: spatial + optional angular
+    if angle_weight is not None and angles is not None:
+        angs = np.asarray(angles, dtype=float).reshape(-1, 1) * angle_weight
+        tree_input = np.hstack((pts, angs))
+    else:
+        tree_input = pts
+    tree1 = cKDTree(tree_input)
+    _, idx1 = tree1.query(tree_input, k=k_neighbors + 1)
+    # Combine neighbor indices (single KD-tree)
+    combined = idx1
+    # Compute true distances based on spatial coords
+    dists = np.linalg.norm(pts[combined] - pts[:, np.newaxis], axis=-1)
+    # Drop self (first column)
+    neigh_ids = combined[:, 1:]
+    neigh_dists = dists[:, 1:]
+    # Apply angle threshold if given
+    if angle_threshold is not None and angles is not None:
+        angs0 = np.asarray(angles, dtype=float)
+        ref = angs0.reshape(-1, 1)
+        nbrs = angs0[neigh_ids]
+        diff = np.abs(ref - nbrs)
+        mask = diff > angle_threshold
+        neigh_ids[mask] = -1
+        neigh_dists[mask] = np.inf
+    n = pts.shape[0]
+    neighbor_lists = [[] for _ in range(n)]
+    distance_lists = [[] for _ in range(n)]
+    # Build undirected edges
+    for i in range(n):
+        valid = neigh_ids[i] != -1
+        nb = neigh_ids[i][valid]
+        db = neigh_dists[i][valid]
+        neighbor_lists[i].extend(nb.tolist())
+        distance_lists[i].extend(db.tolist())
+        for j, d in zip(nb, db):
+            neighbor_lists[j].append(i)
+            distance_lists[j].append(d)
+    # Additional cross-bin connectivity: angle bins and z bins
+    # Angle-based cross connectivity: connect nearest neighbors in adjacent angle bins
+    if angles is not None and angle_bin_size > 0 and angle_bin_k > 0:
+        bin_idx = np.floor(angle_vals / angle_bin_size).astype(int)
+        bins = {}
+        for idx, b in enumerate(bin_idx):
+            bins.setdefault(b, []).append(idx)
+        # build KD-tree per angle bin
+        bin_trees = {b: cKDTree(pts[ids]) for b, ids in bins.items() if len(ids) >= 1}
+        for i, b in enumerate(bin_idx):
+            # connect across two adjacent angular bins on each side
+            for b2 in (b - 2, b - 1, b + 1, b + 2):
+                if b2 in bin_trees:
+                    ids = bins[b2]
+                    tree_b = bin_trees[b2]
+                    k = min(angle_bin_k, len(ids))
+                    dists_b, idxs_b = tree_b.query(pts[i], k=k)
+                    if k == 1:
+                        dists_b = [dists_b]
+                        idxs_b = [idxs_b]
+                    for local_j in range(len(idxs_b)):
+                        lj = idxs_b[local_j]
+                        j = ids[lj]
+                        # angle threshold filter
+                        if angle_threshold is not None and angle_vals is not None:
+                            if abs(angle_vals[i] - angle_vals[j]) > angle_threshold:
+                                continue
+                        d = np.linalg.norm(pts[i] - pts[j])
+                        neighbor_lists[i].append(j)
+                        distance_lists[i].append(d)
+                        neighbor_lists[j].append(i)
+                        distance_lists[j].append(d)
+    # Z-based cross connectivity: connect nearest neighbors in adjacent z bins
+    if z_bin_size > 0 and z_bin_k > 0:
+        z_vals = pts[:, 2]
+        z_idx = np.floor(z_vals / z_bin_size).astype(int)
+        zbins = {}
+        for idx, zb in enumerate(z_idx):
+            zbins.setdefault(zb, []).append(idx)
+        z_trees = {zb: cKDTree(pts[ids]) for zb, ids in zbins.items() if len(ids) >= 1}
+        for i, zb in enumerate(z_idx):
+            for zb2 in (zb - 1, zb + 1):
+                if zb2 in z_trees:
+                    ids = zbins[zb2]
+                    tree_z = z_trees[zb2]
+                    k = min(z_bin_k, len(ids))
+                    d_z, idxs_z = tree_z.query(pts[i], k=k)
+                    if k == 1:
+                        d_z = [d_z]
+                        idxs_z = [idxs_z]
+                    for local_j in range(len(idxs_z)):
+                        lj = idxs_z[local_j]
+                        j = ids[lj]
+                        # angle threshold filter
+                        if angle_threshold is not None and angle_vals is not None:
+                            if abs(angle_vals[i] - angle_vals[j]) > angle_threshold:
+                                continue
+                        d = np.linalg.norm(pts[i] - pts[j])
+                        neighbor_lists[i].append(j)
+                        distance_lists[i].append(d)
+                        neighbor_lists[j].append(i)
+                        distance_lists[j].append(d)
+    # Ensure uniqueness, preserve all edges
+    for i in range(n):
+        ids = neighbor_lists[i]
+        ds = distance_lists[i]
+        # unique preserving order
+        _, uniq_idx = np.unique(ids, return_index=True)
+        ids = [ids[k] for k in sorted(uniq_idx)]
+        ds = [ds[k] for k in sorted(uniq_idx)]
+        # assign back without removing any edges
+        neighbor_lists[i] = ids
+        distance_lists[i] = ds
+    return neighbor_lists, distance_lists
+
+def flatten_pointcloud(base_path, k_neighbors=6, angle_threshold=40, angle_weight=0.2, downsample_ratio=0.5, display=False):
     """
     Flatten pointcloud by concatenating winding segments and building neighbor graphs.
 
@@ -488,6 +634,7 @@ def flatten_pointcloud(base_path, k_neighbors=8, angle_threshold=30, angle_weigh
         winding_width (int): Number of windings concatenated per graph segment.
         angle_threshold (float, optional): Max allowed difference in 4th-dimension (angle) to keep a neighbor.
         angle_weight (float, optional): Scale factor for 4th-dimension when computing distances in KD-tree.
+        downsample_ratio (float, optional): Fraction of points to randomly keep when loading windings (default 0.5).
     """
     winding_width=3
     winding_path = os.path.join(base_path, "windings")
@@ -508,7 +655,7 @@ def flatten_pointcloud(base_path, k_neighbors=8, angle_threshold=30, angle_weigh
     winding_us = None
     winding_vs = None
     for start in range(0, len(winding_files)):
-        if start < 30: # for debug, leave it for now
+        if start < 27: # for debug, leave it for now
             continue
         end = min(start + winding_width, len(winding_files))
         print(f"Processing windings {start} to {end}: {winding_files[start:end]}")
@@ -523,7 +670,12 @@ def flatten_pointcloud(base_path, k_neighbors=8, angle_threshold=30, angle_weigh
             else:
                 print(f"Loading winding pointcloud {wnr} from {winding_path}")
                 points_ = load_winding_pointcloud(winding_path, wnr)
-                # display_3d_pointcloud(points_[:, :3]) # Debug visualization
+                # random downsampling of newly loaded points
+                if downsample_ratio < 1.0:
+                    mask = np.random.rand(points_.shape[0]) < downsample_ratio
+                    points_ = points_[mask]
+                if display:
+                    display_3d_pointcloud(points_[:, :3]) # Debug visualization
             pcs.append(np.array(points_))
         try:
             min_angles = [np.min(pc[:, 3]) for pc in pcs]
@@ -536,61 +688,14 @@ def flatten_pointcloud(base_path, k_neighbors=8, angle_threshold=30, angle_weigh
         points = np.concatenate(pcs, axis=0)
         coords = points[:, :3]
         winding_angles = points[:, 3]
-        # prepare KDTree input: optionally include 4th-dimension (angle) by weighting
-        if angle_weight is not None:
-            angs = points[:, 3].reshape(-1, 1) * angle_weight
-            tree_input = np.hstack((coords, angs))
-        else:
-            tree_input = coords
-        # build KDTree and query k+1 neighbors (self included)
-        tree = cKDTree(tree_input)
-        temp_distances, indices = tree.query(tree_input, k=k_neighbors + 1) # "wrong" distance computation. Use 3D euclidean distance instad on first 3 dimensions only
-        distances = np.linalg.norm(coords[indices] - coords[:, np.newaxis], axis=-1) # Coords euclidean distance
-        assert distances.shape == temp_distances.shape, "Distance shape mismatch"
-        del temp_distances
-
-        print(f"Shape of distances: {distances.shape} and indices: {indices.shape}")
-        # drop self
-        neighbor_ids = indices[:, 1:]
-        neighbor_dists = distances[:, 1:]
-        # apply 4th-dimension constraint if specified: drop neighbors with large angle diff
-        if angle_threshold is not None:
-            angs = points[:, 3]
-            # broadcast to (n_points, k_neighbors)
-            ref = angs.reshape(-1, 1)
-            nbrs = angs[neighbor_ids]
-            diff = np.abs(ref - nbrs)
-            mask = diff > angle_threshold
-            neighbor_ids[mask] = -1
-            neighbor_dists[mask] = np.inf
-        # build Python lists for each node, dropping invalid neighbors
-        neighbor_lists = [[] for _ in range(len(coords))]
-        distance_lists = [[] for _ in range(len(coords))]
-        print(f"Length of coords: {len(coords)}, Length of neighbor_ids: {len(neighbor_lists)}, Length of neighbor_dists: {len(distance_lists)}")
-        # iterate over each point and its neighbors
-        for i in range(len(coords)):
-            # get valid neighbors
-            valid_indices = np.where(neighbor_ids[i] != -1)[0]
-            valid_neighbors = neighbor_ids[i][valid_indices]
-            valid_distances = neighbor_dists[i][valid_indices]
-            # Add undirected edges
-            neighbor_lists[i].extend(valid_neighbors)
-            distance_lists[i].extend(valid_distances)
-            # Add reverse edges
-            for j in range(len(valid_indices)):
-                source = valid_neighbors[j]
-                target = i
-                neighbor_lists[source].append(target)
-                distance_lists[source].append(valid_distances[j])
-
-        # unique neighbor lists
-        for i in range(len(coords)):
-            _, unique_indices = np.unique(neighbor_lists[i], return_index=True)
-            neighbor_lists[i] = [neighbor_lists[i][idx] for idx in unique_indices]
-            distance_lists[i] = [distance_lists[i][idx] for idx in unique_indices]
-            # Filter out  indices with distances > 10000
-            neighbor_lists[i] = [neighbor_lists[i][j] for j, d in enumerate(distance_lists[i]) if d < 10000]
-            distance_lists[i] = [d for d in distance_lists[i] if d < 10000]
+        # build neighbor graph using KD-tree
+        neighbor_lists, distance_lists = build_neighbor_graph(
+            coords,
+            angles=winding_angles,
+            k_neighbors=k_neighbors,
+            angle_threshold=angle_threshold,
+            angle_weight=angle_weight
+        )
 
         # Check that each edge is undirected
         # for i in range(len(coords)):
@@ -891,13 +996,14 @@ def main():
     parser = argparse.ArgumentParser(description="Refine pointcloud using mesh and downsampling")
     parser.add_argument("--mesh", required=True, help="Path to mesh file (.ply or .obj)")
     parser.add_argument("--skip_precomputation", action="store_true", help="Skip precomputation of winding pointclouds")
+    parser.add_argument("--display", action="store_true", help="Display pointclouds and meshes")
     args = parser.parse_args()
 
     flattened_winding_path = os.path.join(os.path.dirname(args.mesh), "windings_flattened")
     if not args.skip_precomputation:
         generate_winding_pointclouds(args.mesh)
-        flattened_winding_path = flatten_pointcloud(os.path.dirname(args.mesh))
-    grid_uv_flattened(flattened_winding_path, subsample_radius=30.0, display=False)
+    flattened_winding_path = flatten_pointcloud(os.path.dirname(args.mesh), display=args.display)
+    grid_uv_flattened(flattened_winding_path, subsample_radius=30.0, display=args.display)
     filtered_path = os.path.join(os.path.dirname(args.mesh), "windings_filtered")
     mesh_uv_wraps(filtered_path, output_dir=os.path.join(os.path.dirname(filtered_path), "uv_meshes"))
     mesh_uv_global(filtered_path, output_path=os.path.join(os.path.dirname(filtered_path), "mesh_refined.obj"))
