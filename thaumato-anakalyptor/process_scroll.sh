@@ -37,7 +37,7 @@ retry_until_success python3 -m ThaumatoAnakalyptor.pointcloud_to_instances \
     --umbilicus_path "/workspace/experiments/umbilicus.txt" \
     --main_drive "" \
     --alternative_ply_drives "" "" \
-    --batch_size 8 \
+    --batch_size 5 \
     --gpus 4
 
 # 2c) instances_to_graph
