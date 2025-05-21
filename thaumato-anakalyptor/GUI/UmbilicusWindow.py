@@ -32,9 +32,16 @@ class UmbilicusWindow(QMainWindow):
         self.imagePath = imagePath
         self.scale_factor = scale_factor
         self.currentIndex = 0
-        self.incrementing=True
-        self.zarr_volume = None
+        self.incrementing = True
+        # Zarr multiscale support
+        self.is_zarr = False
+        self.zarr_group = None
+        self.pyramid_levels = {}
+        # current pyramid level (0 = full resolution)
+        self.pyr_level = 0
+        # cache last loaded slice and level
         self.index_old = -1
+        self.last_pyr_level = None
         self.construct_images()
         self.points = {}  # Dictionary to store points as {index: (x, y)}
         self.initUI()
@@ -74,6 +81,11 @@ class UmbilicusWindow(QMainWindow):
         self.stepSizeBox = QLineEdit("100")  # Set default value
         self.stepSizeBox.setFixedWidth(100)  # Adjust width as appropriate
         self.stepSizeBox.returnPressed.connect(lambda: self.view.setFocus())  # Unfocus on Enter
+        # Pyramid level selection for zarr multiscale (0 = full res, 1 = half, ...)
+        pyrLabel = QLabel("Level:")
+        self.pyrLevelBox = QLineEdit(str(self.pyr_level))
+        self.pyrLevelBox.setFixedWidth(50)
+        self.pyrLevelBox.returnPressed.connect(self.changePyramidLevel)
 
         indexLabel = QLabel("Index:")
         self.indexBox = QLineEdit()
@@ -89,6 +101,9 @@ class UmbilicusWindow(QMainWindow):
         stepSizeLayout.addWidget(self.fileNameLabel)
         stepSizeLayout.addWidget(stepSizeLabel)
         stepSizeLayout.addWidget(self.stepSizeBox)
+        # add pyramid level controls
+        stepSizeLayout.addWidget(pyrLabel)
+        stepSizeLayout.addWidget(self.pyrLevelBox)
         stepSizeLayout.addWidget(indexLabel)
         stepSizeLayout.addWidget(self.indexBox)
         stepSizeLayout.addWidget(loadButton)
@@ -107,11 +122,23 @@ class UmbilicusWindow(QMainWindow):
     def construct_images(self):
         self.images = {}
         if self.imagePath.endswith('.zarr'):
+            # ome-zarr multiscale volume
             print("Loading zarr volume")
-            # ome-zarr volume
-            self.zarr_volume = zarr.open(self.imagePath)
-            self.zarr_volume = self.zarr_volume[0]
-            for i in range(len(self.zarr_volume)):
+            self.is_zarr = True
+            # open zarr group or array
+            zarr_obj = zarr.open(self.imagePath)
+            if hasattr(zarr_obj, 'keys'):
+                # multiscale group with levels '0', '1', ...
+                level_keys = sorted([int(k) for k in zarr_obj.keys()])
+                for level in level_keys:
+                    self.pyramid_levels[level] = zarr_obj[str(level)]
+            else:
+                # single-scale array
+                self.pyramid_levels[0] = zarr_obj
+            # use level 0 for z dimension count
+            arr0 = self.pyramid_levels[0]
+            z_count = arr0.shape[0]
+            for i in range(z_count):
                 self.images[i] = f"zarr z-slice {i}"
         else:
             tifs = [f for f in os.listdir(self.imagePath) if f.endswith('.tif')]
@@ -130,74 +157,96 @@ class UmbilicusWindow(QMainWindow):
                    "- Click on the TIFF to place a point.\n" \
                    "- Use Ctrl + Click to automatically switch to the next TIFF.\n"
         QMessageBox.information(self, "Help", helpText)
+    
+    def changePyramidLevel(self):
+        """
+        Change the pyramid level for zarr multiscale and reload current image.
+        """
+        try:
+            level = int(self.pyrLevelBox.text())
+        except ValueError:
+            QMessageBox.warning(self, "Warning", "Invalid pyramid level.")
+            self.pyrLevelBox.setText(str(self.pyr_level))
+            return
+        if level not in self.pyramid_levels:
+            QMessageBox.warning(self, "Warning", f"Pyramid level {level} not available.")
+            self.pyrLevelBox.setText(str(self.pyr_level))
+            return
+        # set new level and reload
+        self.pyr_level = level
+        self.loadImage(self.currentIndex)
 
-    def loadImage(self, index):
-        # Adjust index for scale factor
-        index_original = index
-        index *= self.scale_factor
+    def loadImage(self, index_original):
+        """
+        Load and display the image slice at given downsampled index and pyramid level.
+        """
+        # compute actual slice index
+        index_z = index_original * self.scale_factor
 
-        if index in self.images:
-            if self.index_old != index:
-                if self.zarr_volume is not None:
-                    print(f"Loading zarr volume image at index {index}")
-                    image_array = self.zarr_volume[index]
+        # only proceed if index valid
+        if index_z not in self.images:
+            print(f"Image at index {index_z} not found in images dictionary.")
+            return
 
-                else:
-                    imagePath = os.path.join(self.imagePath, self.images[index])
-                    # Use tifffile to read the TIFF image
-                    with tifffile.TiffFile(imagePath) as tif:
-                        image_array = tif.asarray()
-                # Convert to numpy array if not already
-                self.image = image_array
-                self.index_old = index
+        # determine if reload needed (new slice or new pyramid level)
+        reload_needed = (self.index_old != index_z) or (self.is_zarr and self.last_pyr_level != self.pyr_level)
+        if reload_needed:
+            # load image array from source
+            if self.is_zarr:
+                print(f"Loading zarr volume image at level {self.pyr_level}, index {index_z}")
+                arr = self.pyramid_levels.get(self.pyr_level, self.pyramid_levels.get(0))
+                scale_xy = 2 ** self.pyr_level
+                z_scaled = index_z // scale_xy
+                image_array = arr[z_scaled]
             else:
-                print("Image already loaded, skipping load.")
-                image_array = self.image
-
-            # print(f"Loaded image {imagePath} at index {index} with shape {image_array.shape} and dtype {image_array.dtype}")
-
-            image_array = np.array(image_array)
-            if image_array.dtype == np.uint16:
-                image_array = (image_array / 256).astype(np.uint8)
-            if image_array.dtype == np.float16:
-                print("float16, experimental")
-                image_array = (image_array * 256).astype(np.uint8)
-
-            # Assuming the image is grayscale, prepare it for display
-            image_height, image_width = image_array.shape
-
-            self.image_width = image_width
-            self.image_height = image_height
-
-            qimage = QImage(image_array.data, image_width, image_height, image_width, QImage.Format_Grayscale8)
-            pixmap = QPixmap.fromImage(qimage)
-
-            # Clear the previous items in the scene
-            self.scene.clear()
-
-            # Add new pixmap item to the scene
-            self.scene.addPixmap(pixmap)
-            # self.view.fitInView(self.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
-
-            # Set the index box text
-            self.indexBox.setText(str(index_original))
-            self.fileNameLabel.setText("File: " + self.images[index])
-
-            # Draw a red point if it exists for this image
-            if index_original in self.points:
-                x, y = self.points[index_original]
-                # Convert to scene coordinates
-                sceneX = x / self.image_width * self.image_width
-                sceneY = y / self.image_height * self.image_height
-                # Size of point unchanged in display no matter the zoom
-                size_display = 10
-                # Size of point in image coordinates
-                size_image = size_display / self.view.transform().m11()
-                sceneX -= size_image / 2
-                sceneY -= size_image / 2
-                self.scene.addEllipse(sceneX, sceneY, size_image, size_image, QPen(Qt.red), QBrush(Qt.red))
+                path = os.path.join(self.imagePath, self.images[index_z])
+                with tifffile.TiffFile(path) as tif:
+                    image_array = tif.asarray()
+            # cache loaded data
+            self.image = image_array
+            self.index_old = index_z
+            self.last_pyr_level = self.pyr_level
         else:
-            print(f"Image at index {index} not found in images dictionary.")
+            image_array = self.image
+
+        # convert to numpy array
+        image_array = np.array(image_array)
+        if image_array.dtype == np.uint16:
+            image_array = (image_array / 256).astype(np.uint8)
+        if image_array.dtype == np.float16:
+            print("float16, experimental")
+            image_array = (image_array * 256).astype(np.uint8)
+
+        # upscale XY if using lower resolution pyramid
+        if self.is_zarr and self.pyr_level > 0:
+            scale_xy = 2 ** self.pyr_level
+            image_array = np.repeat(np.repeat(image_array, scale_xy, axis=0), scale_xy, axis=1)
+
+        # prepare for display
+        image_height, image_width = image_array.shape
+        self.image_width = image_width
+        self.image_height = image_height
+        qimage = QImage(image_array.data, image_width, image_height, image_width, QImage.Format_Grayscale8)
+        pixmap = QPixmap.fromImage(qimage)
+
+        # update scene
+        self.scene.clear()
+        self.scene.addPixmap(pixmap)
+
+        # update UI elements
+        self.indexBox.setText(str(index_original))
+        self.fileNameLabel.setText("File: " + self.images[index_z])
+
+        # draw umbilicus point if exists
+        if index_original in self.points:
+            x, y = self.points[index_original]
+            sceneX = x / self.image_width * self.image_width
+            sceneY = y / self.image_height * self.image_height
+            size_display = 10
+            size_image = size_display / self.view.transform().m11()
+            sceneX -= size_image / 2
+            sceneY -= size_image / 2
+            self.scene.addEllipse(sceneX, sceneY, size_image, size_image, QPen(Qt.red), QBrush(Qt.red))
 
     def jumpToIndex(self):
         index = int(self.indexBox.text())
