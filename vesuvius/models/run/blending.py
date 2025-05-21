@@ -12,8 +12,89 @@ from functools import partial
 import numcodecs
 from concurrent.futures import ProcessPoolExecutor
 import math
+import bisect
 from data.utils import open_zarr
 
+
+# --- Vectorized Patch Accumulation Function ---
+def accumulate_patch(dest_logits, dest_weights, logit_patch, weight_patch, iz0, iy0, ix0):
+    """
+    PyTorch version using index_add_ for GPU acceleration
+    
+    Parameters same as accumulate_patch, but tensors should be PyTorch tensors
+    """
+    C = dest_logits.shape[0]
+    
+    # 1. Build 1-D indices once
+    dz, dy, dx = weight_patch.shape
+    z, y, x = torch.meshgrid(
+        torch.arange(dz, device=dest_logits.device) + iz0,
+        torch.arange(dy, device=dest_logits.device) + iy0, 
+        torch.arange(dx, device=dest_logits.device) + ix0,
+        indexing='ij'
+    )
+    indices = (z * dest_weights.shape[1] * dest_weights.shape[2] + 
+               y * dest_weights.shape[2] + x).reshape(-1)
+    
+    w_flat = weight_patch.reshape(-1)
+    
+    # 2. Scatter-add weights
+    dest_weights.reshape(-1).index_add_(0, indices, w_flat)
+    
+    # 3. Scatter-add logits - loop over channels
+    lp = logit_patch.reshape(C, -1)
+    for c in range(C):
+        dest_logits[c].reshape(-1).index_add_(0, indices, lp[c] * w_flat)
+
+
+def find_intersecting_patches(coords_np, chunk_info, patch_size):
+    """
+    find patches that intersect with the current chunk using binary search.
+    
+    Args:
+        coords_np: Array of patch coordinates (N, 3) where each row is (z, y, x)
+        chunk_info: Dictionary with chunk boundaries {'z_start', 'z_end', 'y_start', 'y_end', 'x_start', 'x_end'}
+        patch_size: Size of patches (pZ, pY, pX)
+        
+    Returns:
+        List of indices of patches that intersect with the chunk
+    """
+    z_start, z_end = chunk_info['z_start'], chunk_info['z_end']
+    y_start, y_end = chunk_info['y_start'], chunk_info['y_end']
+    x_start, x_end = chunk_info['x_start'], chunk_info['x_end']
+    
+    pZ, pY, pX = patch_size
+    
+    # Create a sorted array of (z_min, original_index) pairs
+    patches_by_z = [(coords_np[i, 0], i) for i in range(coords_np.shape[0])]
+    patches_by_z.sort()  # Sort by z_min
+    
+    # Use binary search to find the first patch that might intersect (z_min < z_end)
+    # bisect.bisect_left returns the insertion point for z_end in the sorted array
+    start_idx = 0
+    if patches_by_z:  # Check if array is not empty
+        # Find patches whose z_min is less than z_end (might intersect)
+        start_idx = bisect.bisect_left(patches_by_z, (z_end, 0), key=lambda x: x[0])
+    
+    # Filter patches that actually intersect on all three axes
+    intersecting_indices = []
+    # Only check patches from beginning up to start_idx
+    for i in range(start_idx):
+        z_min, original_idx = patches_by_z[i]
+        z, y, x = coords_np[original_idx]
+        
+        # Calculate z_max, y_max, x_max for this patch
+        z_max = z + pZ
+        y_max = y + pY
+        x_max = x + pX
+        
+        # Check if the patch intersects with the chunk on all axes
+        if (z_max > z_start and z < z_end and
+            y_max > y_start and y < y_end and
+            x_max > x_start and x < x_end):
+            intersecting_indices.append(original_idx)
+    
+    return intersecting_indices
 
 # --- Gaussian Map Generation ---
 def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=torch.float32) -> torch.Tensor:
@@ -44,7 +125,7 @@ def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=tor
 
 # --- Chunk Processing Worker Function ---
 def process_chunk(chunk_info, parent_dir, output_path, weights_path, gaussian_map, 
-                patch_size, part_files):
+                patch_size, part_files, device=None, fused_normalize=False, epsilon=1e-8):
     """
     Process a single chunk of the volume, handling all patches that intersect with this chunk.
     
@@ -56,6 +137,9 @@ def process_chunk(chunk_info, parent_dir, output_path, weights_path, gaussian_ma
         gaussian_map: Pre-computed Gaussian map
         patch_size: Size of patches (pZ, pY, pX)
         part_files: Dictionary of part files
+        device: PyTorch device to use (default: cuda if available, else cpu)
+        fused_normalize: Whether to normalize in-place (default: False)
+        epsilon: Small value to avoid division by zero (default: 1e-8)
     """
     # Extract chunk boundaries
     z_start, z_end = chunk_info['z_start'], chunk_info['z_end']
@@ -64,9 +148,13 @@ def process_chunk(chunk_info, parent_dir, output_path, weights_path, gaussian_ma
     
     pZ, pY, pX = patch_size
     
-    # Convert gaussian map to numpy for efficient processing
-    gaussian_map_np = gaussian_map.numpy()
-    gaussian_map_spatial_np = gaussian_map_np[0]  # Shape (pZ, pY, pX)
+    # Setup PyTorch device
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        device = torch.device(device)
+    # Convert gaussian map to torch tensor on the correct device
+    gaussian_map_spatial = gaussian_map[0].to(device)  # Shape (pZ, pY, pX)
     
     # Open zarr stores directly
     output_store = open_zarr(output_path, mode='r+', storage_options={'anon': False} if output_path.startswith('s3://') else None)
@@ -78,9 +166,9 @@ def process_chunk(chunk_info, parent_dir, output_path, weights_path, gaussian_ma
     chunk_shape = (num_classes, z_end - z_start, y_end - y_start, x_end - x_start)
     weights_shape = (z_end - z_start, y_end - y_start, x_end - x_start)
     
-    # Initialize accumulators
-    chunk_logits = np.zeros(chunk_shape, dtype=np.float32)
-    chunk_weights = np.zeros(weights_shape, dtype=np.float32)
+    # Initialize accumulators with PyTorch
+    chunk_logits = torch.zeros(chunk_shape, dtype=torch.float32, device=device)
+    chunk_weights = torch.zeros(weights_shape, dtype=torch.float32, device=device)
     
     # Track which patches intersect with this chunk
     patches_processed = 0
@@ -96,17 +184,13 @@ def process_chunk(chunk_info, parent_dir, output_path, weights_path, gaussian_ma
         
         # Read all coordinates for this part
         coords_np = coords_store[:]
-        num_patches_in_part = coords_np.shape[0]
         
-        # Process patches that intersect with this chunk
-        for patch_idx in range(num_patches_in_part):
+        # Efficiently find patches that intersect with this chunk
+        intersecting_indices = find_intersecting_patches(coords_np, chunk_info, patch_size)
+        
+        # Process only the intersecting patches
+        for patch_idx in intersecting_indices:
             z, y, x = coords_np[patch_idx].tolist()
-            
-            # Check if this patch intersects with our chunk
-            if (z + pZ <= z_start or z >= z_end or
-                y + pY <= y_start or y >= y_end or
-                x + pX <= x_start or x >= x_end):
-                continue  # Skip patches that don't intersect with this chunk
                 
             # Calculate intersection between patch and chunk
             iz_start = max(z, z_start) - z_start
@@ -136,28 +220,30 @@ def process_chunk(chunk_info, parent_dir, output_path, weights_path, gaussian_ma
             logit_patch = logits_store[patch_idx][patch_slice]
             
             # Get corresponding weights
-            weight_patch = gaussian_map_spatial_np[
+            weight_patch = gaussian_map_spatial[
                 slice(pz_start, pz_end),
                 slice(py_start, py_end),
                 slice(px_start, px_end)
             ]
+            # Convert numpy arrays to torch tensors
+            logit_patch_torch = torch.tensor(logit_patch, device=device)
             
-            # Apply weights to logits (broadcasting along class dimension)
-            weighted_patch = logit_patch * weight_patch[np.newaxis, :, :, :]
-            
-            # Accumulate into local arrays
-            chunk_logits[
+            # Get views of destination arrays
+            dest_logits = chunk_logits[
                 :,  # All classes
                 iz_start:iz_end,
                 iy_start:iy_end,
                 ix_start:ix_end
-            ] += weighted_patch
+            ]
             
-            chunk_weights[
+            dest_weights = chunk_weights[
                 iz_start:iz_end,
                 iy_start:iy_end,
                 ix_start:ix_end
-            ] += weight_patch
+            ]
+            
+            # Use vectorized accumulation
+            accumulate_patch(dest_logits, dest_weights, logit_patch_torch, weight_patch, 0, 0, 0)
             
             patches_processed += 1
     
@@ -176,9 +262,23 @@ def process_chunk(chunk_info, parent_dir, output_path, weights_path, gaussian_ma
             slice(x_start, x_end)
         )
         
-        # Write accumulated chunk data
-        output_store[output_slice] = chunk_logits
-        weights_store[weight_slice] = chunk_weights
+        # If doing fused normalization, normalize before writing
+        if fused_normalize:
+            # Create mask where weights > 0
+            weight_mask = chunk_weights > 0
+            # Normalize in-place where weights > 0
+            for c in range(num_classes):
+                chunk_logits[c][weight_mask] /= (chunk_weights[weight_mask] + epsilon)
+            # Zero out where weights = 0
+            for c in range(num_classes):
+                chunk_logits[c][~weight_mask] = 0
+            # Convert to numpy and write
+            output_store[output_slice] = chunk_logits.cpu().numpy()
+            # No need to write weights if we've already normalized
+        else:
+            # Convert to numpy and write
+            output_store[output_slice] = chunk_logits.cpu().numpy()
+            weights_store[weight_slice] = chunk_weights.cpu().numpy()
     
     return {
         'chunk': chunk_info,
@@ -292,6 +392,9 @@ def merge_inference_outputs(
         num_workers: int = None,  # Number of worker processes to use
         compression_level: int = 1,  # Compression level (0-9, 0=none)
         delete_weights: bool = True,  # Delete weight accumulator after merge
+        device: str = None,  # PyTorch device to use (cuda if available, else cpu)
+        fused_normalize: bool = True,  # Normalize during accumulation to avoid second pass
+        epsilon: float = 1e-8,  # Small value to avoid division by zero
         verbose: bool = True):
     """
     Merges partial inference results with Gaussian blending using parallel processing.
@@ -309,6 +412,9 @@ def merge_inference_outputs(
                      If None, defaults to CPU_COUNT - 1.
         compression_level: Zarr compression level (0-9, 0=none)
         delete_weights: Whether to delete the weight accumulator Zarr after completion.
+        device: PyTorch device to use (default: 'cuda' if available, else 'cpu').
+        fused_normalize: Whether to normalize during accumulation (default: True).
+        epsilon: Small value to avoid division by zero (default: 1e-8).
         verbose: Print progress messages.
     """
     # Disable Blosc threading to avoid deadlocks when used with multiprocessing
@@ -513,7 +619,10 @@ def merge_inference_outputs(
         weights_path=weight_accumulator_path,
         gaussian_map=gaussian_map,
         patch_size=patch_size,
-        part_files=part_files
+        part_files=part_files,
+        device=device,
+        fused_normalize=fused_normalize,
+        epsilon=epsilon
     )
     
     # Process chunks in parallel
@@ -621,6 +730,12 @@ def main():
                         help='Compression level (0-9, 0=none). Default: 1')
     parser.add_argument('--keep_weights', action='store_true',
                         help='Do not delete the weight accumulator Zarr after merging.')
+    parser.add_argument('--device', type=str, default=None,
+                        help='PyTorch device to use (e.g. "cuda:0", "cpu"). Default: cuda if available, else cpu.')
+    parser.add_argument('--no_fused_normalize', action='store_true',
+                        help='Disable fused normalization during accumulation (use separate pass).')
+    parser.add_argument('--epsilon', type=float, default=1e-8,
+                        help='Small value to avoid division by zero. Default: 1e-8')
     parser.add_argument('--quiet', action='store_true',
                         help='Disable verbose progress messages (tqdm bars still show).')
 
@@ -645,6 +760,9 @@ def main():
             num_workers=args.num_workers,
             compression_level=args.compression_level,
             delete_weights=not args.keep_weights,
+            device=args.device,
+            fused_normalize=not args.no_fused_normalize,
+            epsilon=args.epsilon,
             verbose=not args.quiet
         )
         return 0
