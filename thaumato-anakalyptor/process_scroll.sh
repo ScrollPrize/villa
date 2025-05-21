@@ -12,20 +12,20 @@ fi
 ZARR_NAME=$(basename "$ZARR_DIR" .zarr)
 echo ">>> Found Zarr: $ZARR_NAME (dir: $ZARR_DIR)"
 
-# helper to retry until success
+# helper to retry until success, preserving empty-string args
 retry_until_success() {
-  local cmd="$*"
-  until eval "$cmd"; do
-    echo "+++ Command failed, retrying in 5s: $cmd"
+  local cmd_display="$*"
+  until "$@"; do
+    echo "+++ Command failed, retrying in 5s: $cmd_display"
     sleep 5
   done
 }
 
 # 2a) grid_to_pointcloud
 retry_until_success python3 -m ThaumatoAnakalyptor.grid_to_pointcloud \
-    --base_path '' \
+    --base_path "" \
     --volume_subpath "/scrolls/${ZARR_NAME}.zarr" \
-    --disk_load_save '' '' \
+    --disk_load_save "" "" \
     --pointcloud_subpath "/workspace/experiments/point_cloud" \
     --num_threads 20 \
     --gpus 4
@@ -35,8 +35,8 @@ retry_until_success python3 -m ThaumatoAnakalyptor.pointcloud_to_instances \
     --path "/workspace/experiments" \
     --dest "/workspace/experiments" \
     --umbilicus_path "/workspace/experiments/umbilicus.txt" \
-    --main_drive '' \
-    --alternative_ply_drives '' '' \
+    --main_drive "" \
+    --alternative_ply_drives "" "" \
     --batch_size 8 \
     --gpus 4
 
