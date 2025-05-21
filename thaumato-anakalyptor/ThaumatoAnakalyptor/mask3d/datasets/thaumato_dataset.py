@@ -130,9 +130,9 @@ class SemanticSegmentationInference():
     ):
         args = locals()
         del args['self']  # remove 'self' from the dictionary
-        print("Arguments with which the class was instantiated:")
-        for key, value in args.items():
-            print(f"{key}: {value}")
+        # print("Arguments with which the class was instantiated:")
+        # for key, value in args.items():
+        #     print(f"{key}: {value}")
             
         assert task in [
             "instance_segmentation",

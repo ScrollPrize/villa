@@ -65,7 +65,7 @@ def get_parameters(cfg: DictConfig):
         ] = f"ThaumatoAnakalyptor/mask3d/{cfg.general.save_dir}/last-epoch.ckpt"
 
     for log in cfg.logging:
-        print(log)
+        # print(log)
         loggers.append(hydra.utils.instantiate(log))
         loggers[-1].log_hyperparams(
             flatten_dict(OmegaConf.to_container(cfg, resolve=True))
@@ -87,7 +87,7 @@ def init(num_gpus=1):
     # clear al sys args
     temp_argv = sys.argv
     sys.argv = [sys.argv[0]]  # Keep only the script name, remove all other arguments
-    print("Sys ARGV:", sys.argv)
+    # print("Sys ARGV:", sys.argv)
     res = init_()
     sys.argv = temp_argv
     return res
@@ -245,19 +245,19 @@ def inference(points_3d, index=0, num_gpus=1):
     with torch.no_grad():
         predictions = models[index%num_gpus].inference(batch)
 
-    print(predictions.keys())
-    print(predictions[0].keys())
-    print(predictions[0]["pred_masks"].shape)
-    print(predictions[0]["pred_scores"].shape)
-    print(predictions[0]["pred_scores"])
-    print(predictions[0]["pred_classes"].shape)
-    print(predictions[0]["pred_classes"])
+    # print(predictions.keys())
+    # print(predictions[0].keys())
+    # print(predictions[0]["pred_masks"].shape)
+    # print(predictions[0]["pred_scores"].shape)
+    # print(predictions[0]["pred_scores"])
+    # print(predictions[0]["pred_classes"].shape)
+    # print(predictions[0]["pred_classes"])
 
     prediction = predictions[0]
 
-    result = np.any(predictions[0]["pred_masks"], axis=1).astype(int)
-    print(sum(result))
-    print(np.sum(predictions[0]["pred_masks"]))
+    # result = np.any(predictions[0]["pred_masks"], axis=1).astype(int)
+    # print(sum(result))
+    # print(np.sum(predictions[0]["pred_masks"]))
 
     return prediction
 
