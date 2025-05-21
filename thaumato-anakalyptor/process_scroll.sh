@@ -23,9 +23,9 @@ retry_until_success() {
 
 # 2a) grid_to_pointcloud
 retry_until_success python3 -m ThaumatoAnakalyptor.grid_to_pointcloud \
-    --base_path "" \
+    --base_path '' \
     --volume_subpath "/scrolls/${ZARR_NAME}.zarr" \
-    --disk_load_save "" "" \
+    --disk_load_save '' '' \
     --pointcloud_subpath "/workspace/experiments/point_cloud" \
     --num_threads 20 \
     --gpus 4
@@ -35,8 +35,8 @@ retry_until_success python3 -m ThaumatoAnakalyptor.pointcloud_to_instances \
     --path "/workspace/experiments" \
     --dest "/workspace/experiments" \
     --umbilicus_path "/workspace/experiments/umbilicus.txt" \
-    --main_drive "" \
-    --alternative_ply_drives "" "" \
+    --main_drive '' \
+    --alternative_ply_drives '' '' \
     --batch_size 8 \
     --gpus 4
 
