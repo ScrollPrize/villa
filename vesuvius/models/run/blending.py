@@ -15,6 +15,7 @@ import math
 from data.utils import open_zarr
 
 
+
 # --- Gaussian Map Generation ---
 def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=torch.float32) -> torch.Tensor:
     """
@@ -44,7 +45,7 @@ def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=tor
 
 # --- Chunk Processing Worker Function ---
 def process_chunk(chunk_info, parent_dir, output_path, weights_path, gaussian_map, 
-                patch_size, part_files):
+                patch_size, part_files, patch_bucket=None):
     """
     Process a single chunk of the volume, handling all patches that intersect with this chunk.
     
@@ -82,32 +83,34 @@ def process_chunk(chunk_info, parent_dir, output_path, weights_path, gaussian_ma
     chunk_logits = np.zeros(chunk_shape, dtype=np.float32)
     chunk_weights = np.zeros(weights_shape, dtype=np.float32)
     
-    # Track which patches intersect with this chunk
+    # Track number of patches processed
     patches_processed = 0
     
-    # Process each part file sequentially
-    for part_id in part_files:
-        logits_path = part_files[part_id]['logits']
-        coords_path = part_files[part_id]['coordinates']
+    # Require pre-bucketed patches - throw error if not provided
+    if patch_bucket is None:
+        raise ValueError("patch_bucket must be provided - pre-bucketing is required")
         
-        # Open zarr stores directly
-        coords_store = open_zarr(coords_path, mode='r', storage_options={'anon': False} if coords_path.startswith('s3://') else None)
-        logits_store = open_zarr(logits_path, mode='r', storage_options={'anon': False} if logits_path.startswith('s3://') else None)
-        
-        # Read all coordinates for this part
-        coords_np = coords_store[:]
-        num_patches_in_part = coords_np.shape[0]
-        
-        # Process patches that intersect with this chunk
-        for patch_idx in range(num_patches_in_part):
-            z, y, x = coords_np[patch_idx].tolist()
+    # Chunk key to identify which bucket to use
+    chunk_z = z_start // (z_end - z_start) if z_end > z_start else 0
+    chunk_y = y_start // (y_end - y_start) if y_end > y_start else 0
+    chunk_x = x_start // (x_end - x_start) if x_end > x_start else 0
+    chunk_key = (chunk_z, chunk_y, chunk_x)
+    
+    # Get pre-bucketed patches for this chunk (if any)
+    bucket_patches = patch_bucket.get(chunk_key, [])
+    
+    # Process only the patches that we've pre-bucketed for this chunk
+    for part_id, patch_idx in bucket_patches:
+            logits_path = part_files[part_id]['logits']
+            coords_path = part_files[part_id]['coordinates']
             
-            # Check if this patch intersects with our chunk
-            if (z + pZ <= z_start or z >= z_end or
-                y + pY <= y_start or y >= y_end or
-                x + pX <= x_start or x >= x_end):
-                continue  # Skip patches that don't intersect with this chunk
-                
+            # Open zarr stores as needed
+            coords_store = open_zarr(coords_path, mode='r', storage_options={'anon': False} if coords_path.startswith('s3://') else None)
+            logits_store = open_zarr(logits_path, mode='r', storage_options={'anon': False} if logits_path.startswith('s3://') else None)
+            
+            # Get patch coordinates
+            z, y, x = coords_store[patch_idx].tolist()
+            
             # Calculate intersection between patch and chunk
             iz_start = max(z, z_start) - z_start
             iz_end = min(z + pZ, z_end) - z_start
@@ -142,22 +145,13 @@ def process_chunk(chunk_info, parent_dir, output_path, weights_path, gaussian_ma
                 slice(px_start, px_end)
             ]
             
-            # Apply weights to logits (broadcasting along class dimension)
-            weighted_patch = logit_patch * weight_patch[np.newaxis, :, :, :]
+            # Get views into the destination arrays
+            dest_logits = chunk_logits[:, iz_start:iz_end, iy_start:iy_end, ix_start:ix_end]
+            dest_weights = chunk_weights[iz_start:iz_end, iy_start:iy_end, ix_start:ix_end]
             
-            # Accumulate into local arrays
-            chunk_logits[
-                :,  # All classes
-                iz_start:iz_end,
-                iy_start:iy_end,
-                ix_start:ix_end
-            ] += weighted_patch
-            
-            chunk_weights[
-                iz_start:iz_end,
-                iy_start:iy_end,
-                ix_start:ix_end
-            ] += weight_patch
+            # Use efficient vectorized operations for accumulation (much faster than scatter-add)
+            dest_logits += logit_patch * weight_patch[np.newaxis, :, :, :]
+            dest_weights += weight_patch
             
             patches_processed += 1
     
@@ -521,8 +515,41 @@ def merge_inference_outputs(
     
     print(f"Divided volume into {len(chunks)} chunks for parallel processing")
     
-    # --- 6. Process Chunks in Parallel ---
+    # --- 6. Pre-bucket Patches for Efficient Processing ---
     if not normalize_only:
+        print("\n--- Pre-bucketing Patches ---")
+        # Create a dictionary mapping chunk keys to lists of (part_id, patch_idx) tuples
+        from collections import defaultdict
+        patch_bucket = defaultdict(list)
+        
+        # Get chunk dimensions to determine buckets
+        z_chunk, y_chunk, x_chunk = output_chunks[1:]  # Skip the class dimension
+        
+        # Process each part
+        for part_id in part_ids:
+            coords_path = part_files[part_id]['coordinates']
+            coords_store = open_zarr(coords_path, mode='r', storage_options={'anon': False} if coords_path.startswith('s3://') else None)
+            coords_np = coords_store[:]
+            
+            # Process each patch in this part
+            if verbose:
+                print(f"  Bucketing patches for part {part_id} ({len(coords_np)} patches)")
+            
+            for patch_idx, (z, y, x) in enumerate(coords_np):
+                # Calculate which chunk this patch belongs to
+                chunk_z = z // z_chunk
+                chunk_y = y // y_chunk
+                chunk_x = x // x_chunk
+                
+                # Add this patch to the appropriate bucket
+                chunk_key = (chunk_z, chunk_y, chunk_x)
+                patch_bucket[chunk_key].append((part_id, patch_idx))
+        
+        # Print statistics
+        total_patches = sum(len(patches) for patches in patch_bucket.values())
+        print(f"  Pre-bucketed {total_patches} patches into {len(patch_bucket)} chunks")
+        
+        # --- 7. Process Chunks in Parallel ---
         print("\n--- Accumulating Weighted Patches ---")
         
         # Create a partial function with fixed arguments
@@ -533,7 +560,8 @@ def merge_inference_outputs(
             weights_path=weight_accumulator_path,
             gaussian_map=gaussian_map,
             patch_size=patch_size,
-            part_files=part_files
+            part_files=part_files,
+            patch_bucket=patch_bucket  # Pass the pre-bucketed patches
         )
         
         # Process chunks in parallel
