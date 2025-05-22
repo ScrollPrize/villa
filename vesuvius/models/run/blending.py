@@ -563,7 +563,6 @@ def merge_inference_outputs(
         print("\n--- Skipping Accumulation Phase (--normalize_only flag set) ---")
         # Validate that the required files exist
         print(f"Validating output zarr exists: {output_path}")
-        import fsspec
         if output_path.startswith('s3://'):
             fs = fsspec.filesystem('s3', anon=False)
             if not fs.exists(output_path):
