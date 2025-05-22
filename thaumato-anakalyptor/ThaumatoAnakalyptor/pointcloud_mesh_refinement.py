@@ -446,6 +446,9 @@ def generate_winding_pointclouds(mesh_path):
     print(f"Shape of vertices: {vertices.shape} and of angles: {angles.shape}")
     points_mesh = np.concatenate((vertices, angles), axis=1)
     points_mesh = points_mesh[np.logical_not(has_points)]
+    # Append source flag: 1 for mesh points
+    mesh_flags = np.ones((points_mesh.shape[0], 1), dtype=points_mesh.dtype)
+    points_mesh = np.concatenate((points_mesh, mesh_flags), axis=1)
     print(f"Shape of no has points points_mesh: {points_mesh.shape}")
 
     base_path = os.path.dirname(mesh_path)
@@ -458,6 +461,9 @@ def generate_winding_pointclouds(mesh_path):
         # From TA to original coordinates
         points = shuffling_points_axis(points)
         points[:, :3] = points[:, :3] * 4.0 - 500
+        # Append source flag: 0 for slab points
+        slab_flags = np.zeros((points.shape[0], 1), dtype=points.dtype)
+        points = np.concatenate((points, slab_flags), axis=1)
 
         print(f"Shape of points: {points.shape} and of points_mesh: {points_mesh.shape}")
         if points.shape[0] == 0:
@@ -485,7 +491,12 @@ def build_neighbor_graph(coords,
                          angle_bin_size=12.0,
                          angle_bin_k=2,
                          z_bin_size=20.0,
-                         z_bin_k=0):
+                         z_bin_k=0,
+                         is_mesh=None,
+                         # random extra connections for mesh points
+                         random_angle_thresh=10.0,
+                         random_z_thresh=100.0,
+                         random_k=4):  # number of random extra edges per mesh point
     """
     Build undirected neighbor lists and distances using KD-tree on spatial (and optionally angular) data.
 
@@ -509,6 +520,14 @@ def build_neighbor_graph(coords,
     pts = np.asarray(coords, dtype=float)
     # prepare angle values for thresholding
     angle_vals = np.asarray(angles, dtype=float) if angles is not None else None
+    # Prepare is_mesh flags
+    n = pts.shape[0]
+    if is_mesh is None:
+        is_mesh = np.zeros(n, dtype=bool)
+    else:
+        is_mesh = np.asarray(is_mesh, dtype=bool)
+        if is_mesh.shape[0] != n:
+            raise ValueError(f"is_mesh must have length {n}, got {is_mesh.shape[0]}")
     # First KD-tree: spatial + optional angular
     if angle_weight is not None and angles is not None:
         angs = np.asarray(angles, dtype=float).reshape(-1, 1) * angle_weight
@@ -608,6 +627,28 @@ def build_neighbor_graph(coords,
                         distance_lists[i].append(d)
                         neighbor_lists[j].append(i)
                         distance_lists[j].append(d)
+    # Random additional connectivity around mesh points
+    if angle_vals is not None:
+        # for each mesh point, connect to random neighbors within angle/z window
+        mesh_indices = np.nonzero(is_mesh)[0]
+        for i in mesh_indices:
+            # select by angle and z proximity
+            dz = np.abs(pts[:, 2] - pts[i, 2])
+            da = np.abs(angle_vals - angle_vals[i])
+            mask = (dz <= random_z_thresh) & (da <= random_angle_thresh)
+            mask[i] = False
+            eligible = np.nonzero(mask)[0]
+            if eligible.size > 0:
+                if eligible.size > random_k:
+                    chosen = np.random.choice(eligible, size=random_k, replace=False)
+                else:
+                    chosen = eligible
+                for j in chosen:
+                    d = np.linalg.norm(pts[i] - pts[j])
+                    neighbor_lists[i].append(int(j))
+                    distance_lists[i].append(float(d))
+                    neighbor_lists[j].append(int(i))
+                    distance_lists[j].append(float(d))
     # Ensure uniqueness, preserve all edges
     for i in range(n):
         ids = neighbor_lists[i]
@@ -616,9 +657,21 @@ def build_neighbor_graph(coords,
         _, uniq_idx = np.unique(ids, return_index=True)
         ids = [ids[k] for k in sorted(uniq_idx)]
         ds = [ds[k] for k in sorted(uniq_idx)]
-        # assign back without removing any edges
         neighbor_lists[i] = ids
         distance_lists[i] = ds
+    # Filter out any edges with Euclidean distance > 100.0
+    max_spatial_dist = 100.0
+    for i in range(n):
+        ids = neighbor_lists[i]
+        ds = distance_lists[i]
+        filtered_ids = []
+        filtered_ds = []
+        for j, d in zip(ids, ds):
+            if d <= max_spatial_dist:
+                filtered_ids.append(j)
+                filtered_ds.append(d)
+        neighbor_lists[i] = filtered_ids
+        distance_lists[i] = filtered_ds
     return neighbor_lists, distance_lists
 
 def flatten_pointcloud(base_path, k_neighbors=6, angle_threshold=40, angle_weight=0.2, downsample_ratio=0.5, display=False):
@@ -689,12 +742,18 @@ def flatten_pointcloud(base_path, k_neighbors=6, angle_threshold=40, angle_weigh
         coords = points[:, :3]
         winding_angles = points[:, 3]
         # build neighbor graph using KD-tree
+        # Extract mesh flags for points (5th dimension)
+        if points.shape[1] >= 5:
+            is_mesh_flags = points[:, 4].astype(bool)
+        else:
+            is_mesh_flags = np.zeros(points.shape[0], dtype=bool)
         neighbor_lists, distance_lists = build_neighbor_graph(
             coords,
             angles=winding_angles,
             k_neighbors=k_neighbors,
             angle_threshold=angle_threshold,
-            angle_weight=angle_weight
+            angle_weight=angle_weight,
+            is_mesh=is_mesh_flags
         )
 
         # Check that each edge is undirected
@@ -750,19 +809,31 @@ def flatten_pointcloud(base_path, k_neighbors=6, angle_threshold=40, angle_weigh
             z_offset = np.mean(prev_z_vals) - np.mean(new_z_vals)
             for s, e in new_ranges:
                 current_z[s:e] += z_offset
-        solver = graph_problem_gpu_py.Solver(neighbor_lists, distance_lists, winding_angles, current_angles, coords[:, coords_z_index], current_z)
+        # initialize solver
+        solver = graph_problem_gpu_py.Solver(
+            neighbor_lists,
+            distance_lists,
+            winding_angles,
+            current_angles,
+            coords[:, coords_z_index],
+            current_z
+        )
         print("Set up the graph")
-        # fix nodes of the start winding if it has been previously computed
+        # always fix mesh points to anchor their original positions
+        mesh_idx = np.nonzero(is_mesh_flags)[0].tolist()
+        if mesh_idx:
+            solver.fix_nodes(mesh_idx)
+            print(f"Fixed {len(mesh_idx)} mesh-point nodes to original positions.")
+        # fix nodes of the first winding if it has been previously computed
         start_wrap_nr = winding_files_indices[start]
-        # only fix if prev_uvs length matches this wrap's point count
         first_count = winding_indices[0]
         prev_u0 = prev_uvs_u.get(start_wrap_nr)
         if prev_u0 is not None and prev_u0.shape[0] == first_count:
-            to_fix = list(range(first_count))
-            solver.fix_nodes(to_fix)
-            print(f"Fixed {len(to_fix)} nodes of the first winding {start_wrap_nr} with previous results.")
+            wrap0_idx = list(range(first_count))
+            solver.fix_nodes(wrap0_idx)
+            print(f"Fixed {len(wrap0_idx)} nodes of winding {start_wrap_nr} using previous results.")
         else:
-            print(f"Warning: wrap {start_wrap_nr} expected {first_count}, not fixing nodes.")
+            print(f"Warning: wrap {start_wrap_nr} expected {first_count} points; not fixing its nodes.")
         # solve the graph problem
         min_angle = np.min(winding_angles)
         max_angle = np.max(winding_angles)
