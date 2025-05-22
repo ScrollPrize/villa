@@ -198,8 +198,8 @@ def normalize_chunk(chunk_info, output_path, weights_path, epsilon=1e-8):
         epsilon: Small value to avoid division by zero
     """
     # Debug: Print paths to verify they are correct
-    print(f"Normalizing chunk with output_path: '{output_path}'")
-    print(f"Normalizing chunk with weights_path: '{weights_path}'")
+    # print(f"Normalizing chunk with output_path: '{output_path}'")
+    # print(f"Normalizing chunk with weights_path: '{weights_path}'")
     
     # Safety check for empty paths
     if not output_path:
