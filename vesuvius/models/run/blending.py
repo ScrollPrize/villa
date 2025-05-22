@@ -197,14 +197,32 @@ def normalize_chunk(chunk_info, output_path, weights_path, epsilon=1e-8):
         weights_path: Path to weights zarr
         epsilon: Small value to avoid division by zero
     """
+    # Debug: Print paths to verify they are correct
+    print(f"Normalizing chunk with output_path: '{output_path}'")
+    print(f"Normalizing chunk with weights_path: '{weights_path}'")
+    
+    # Safety check for empty paths
+    if not output_path:
+        raise ValueError(f"Empty output_path provided to normalize_chunk")
+    if not weights_path:
+        raise ValueError(f"Empty weights_path provided to normalize_chunk")
+        
     # Extract chunk boundaries
     z_start, z_end = chunk_info['z_start'], chunk_info['z_end']
     y_start, y_end = chunk_info['y_start'], chunk_info['y_end']
     x_start, x_end = chunk_info['x_start'], chunk_info['x_end']
     
     # Open zarr stores directly
-    output_store = open_zarr(output_path, mode='r+', storage_options={'anon': False} if output_path.startswith('s3://') else None)
-    weights_store = open_zarr(weights_path, mode='r', storage_options={'anon': False} if weights_path.startswith('s3://') else None)
+    try:
+        output_store = open_zarr(output_path, mode='r+', storage_options={'anon': False} if output_path.startswith('s3://') else None)
+    except Exception as e:
+        print(f"Error opening output zarr at '{output_path}': {e}")
+        raise
+    try:
+        weights_store = open_zarr(weights_path, mode='r', storage_options={'anon': False} if weights_path.startswith('s3://') else None)
+    except Exception as e:
+        print(f"Error opening weights zarr at '{weights_path}': {e}")
+        raise
     
     # Define slices for reading data (exact patch size)
     output_slice = (
@@ -292,7 +310,8 @@ def merge_inference_outputs(
         num_workers: int = None,  # Number of worker processes to use
         compression_level: int = 1,  # Compression level (0-9, 0=none)
         delete_weights: bool = True,  # Delete weight accumulator after merge
-        verbose: bool = True):
+        verbose: bool = True,
+        normalize_only: bool = False):  # Skip accumulation phase, only normalize
     """
     Merges partial inference results with Gaussian blending using parallel processing.
     Uses fsspec.get_mapper for consistent zarr access across file systems and protocols.
@@ -503,51 +522,83 @@ def merge_inference_outputs(
     print(f"Divided volume into {len(chunks)} chunks for parallel processing")
     
     # --- 6. Process Chunks in Parallel ---
-    print("\n--- Accumulating Weighted Patches ---")
-    
-    # Create a partial function with fixed arguments
-    process_chunk_partial = partial(
-        process_chunk,
-        parent_dir=parent_dir,
-        output_path=output_path,
-        weights_path=weight_accumulator_path,
-        gaussian_map=gaussian_map,
-        patch_size=patch_size,
-        part_files=part_files
-    )
-    
-    # Process chunks in parallel
-    total_patches_processed = 0
-    
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        # Submit all tasks
-        future_to_chunk = {executor.submit(process_chunk_partial, chunk): chunk for chunk in chunks}
+    if not normalize_only:
+        print("\n--- Accumulating Weighted Patches ---")
         
-        # Use as_completed for better progress tracking and early error detection
-        from concurrent.futures import as_completed
-        for future in tqdm(
-            as_completed(future_to_chunk),
-            total=len(chunks),
-            desc="Processing Chunks",
-            disable=not verbose
-        ):
-            try:
-                result = future.result()
-                total_patches_processed += result['patches_processed']
-            except Exception as e:
-                print(f"Error processing chunk: {e}")
-                raise e
-    
-    print(f"\nAccumulation complete. Processed {total_patches_processed} patches total.")
+        # Create a partial function with fixed arguments
+        process_chunk_partial = partial(
+            process_chunk,
+            parent_dir=parent_dir,
+            output_path=output_path,
+            weights_path=weight_accumulator_path,
+            gaussian_map=gaussian_map,
+            patch_size=patch_size,
+            part_files=part_files
+        )
+        
+        # Process chunks in parallel
+        total_patches_processed = 0
+        
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all tasks
+            future_to_chunk = {executor.submit(process_chunk_partial, chunk): chunk for chunk in chunks}
+            
+            # Use as_completed for better progress tracking and early error detection
+            from concurrent.futures import as_completed
+            for future in tqdm(
+                as_completed(future_to_chunk),
+                total=len(chunks),
+                desc="Processing Chunks",
+                disable=not verbose
+            ):
+                try:
+                    result = future.result()
+                    total_patches_processed += result['patches_processed']
+                except Exception as e:
+                    print(f"Error processing chunk: {e}")
+                    raise e
+        
+        print(f"\nAccumulation complete. Processed {total_patches_processed} patches total.")
+    else:
+        print("\n--- Skipping Accumulation Phase (--normalize_only flag set) ---")
+        # Validate that the required files exist
+        print(f"Validating output zarr exists: {output_path}")
+        import fsspec
+        if output_path.startswith('s3://'):
+            fs = fsspec.filesystem('s3', anon=False)
+            if not fs.exists(output_path):
+                raise FileNotFoundError(f"Output zarr not found: {output_path}. Cannot run normalize_only mode without existing output.")
+        else:
+            if not os.path.exists(output_path):
+                raise FileNotFoundError(f"Output zarr not found: {output_path}. Cannot run normalize_only mode without existing output.")
+                
+        print(f"Validating weights zarr exists: {weight_accumulator_path}")
+        if weight_accumulator_path.startswith('s3://'):
+            fs = fsspec.filesystem('s3', anon=False)
+            if not fs.exists(weight_accumulator_path):
+                raise FileNotFoundError(f"Weight zarr not found: {weight_accumulator_path}. Cannot run normalize_only mode without existing weights.")
+        else:
+            if not os.path.exists(weight_accumulator_path):
+                raise FileNotFoundError(f"Weight zarr not found: {weight_accumulator_path}. Cannot run normalize_only mode without existing weights.")
     
     # --- 7. Normalize in Parallel ---
+    # Print the actual paths that will be used for normalization
+    print(f"Starting normalization with output_path: '{output_path}'")
+    print(f"Starting normalization with weights_path: '{weight_accumulator_path}'")
     print("\n--- Normalizing Output ---")
     
     # Create a partial function with fixed arguments
+    # Use explicit strings to avoid any possible reference issues
+    output_path_str = str(output_path)
+    weights_path_str = str(weight_accumulator_path)
+    
+    print(f"Creating partial function with output_path: '{output_path_str}'")
+    print(f"Creating partial function with weights_path: '{weights_path_str}'")
+    
     normalize_chunk_partial = partial(
         normalize_chunk,
-        output_path=output_path,
-        weights_path=weight_accumulator_path
+        output_path=output_path_str,
+        weights_path=weights_path_str
     )
     
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -621,6 +672,8 @@ def main():
                         help='Compression level (0-9, 0=none). Default: 1')
     parser.add_argument('--keep_weights', action='store_true',
                         help='Do not delete the weight accumulator Zarr after merging.')
+    parser.add_argument('--normalize_only', action='store_true',
+                        help='Skip accumulation phase and only run normalization. Useful for restarting failed jobs.')
     parser.add_argument('--quiet', action='store_true',
                         help='Disable verbose progress messages (tqdm bars still show).')
 
@@ -645,7 +698,8 @@ def main():
             num_workers=args.num_workers,
             compression_level=args.compression_level,
             delete_weights=not args.keep_weights,
-            verbose=not args.quiet
+            verbose=not args.quiet,
+            normalize_only=args.normalize_only
         )
         return 0
     except Exception as e:
