@@ -39,6 +39,7 @@ case "$start" in
   graph)      start_idx=3;;
   compile)    start_idx=4;;
   solve)      start_idx=5;;
+  solve_inverse)      start_idx=6;;
   *) echo "Invalid start step: $start"; usage;;
 esac
 
