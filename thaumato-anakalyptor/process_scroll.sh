@@ -122,4 +122,20 @@ if (( start_idx <= 5 )); then
     --experiment_name "${ZARR_NAME}"
 fi
 
+# step 6: graph_solve
+if (( start_idx <= 6 )); then
+  # Source the conda initialization script to define conda commands.
+  source "$(conda info --base)/etc/profile.d/conda.sh"
+  # Deactivate conda completely (ensure no conda environment, not even base, remains active)
+  while [[ -n "${CONDA_DEFAULT_ENV:-}" ]]; do
+    conda deactivate
+  done
+  echo "Conda completely deactivated."
+  
+  python3 -m ThaumatoAnakalyptor.graph_solve \
+    "/workspace/experiments/1352_3600_5002/graph.bin" \
+    --experiment_name "${ZARR_NAME}_inverse" \
+    --inversed_winding_direction
+fi
+
 echo ">>> All requested steps completed for ${ZARR_NAME}."
