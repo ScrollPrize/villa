@@ -108,6 +108,8 @@ fi
 
 # step 5: graph_solve
 if (( start_idx <= 5 )); then
+  # Source the conda initialization script to define conda commands.
+  source "$(conda info --base)/etc/profile.d/conda.sh"
   # Deactivate conda completely (ensure no conda environment, not even base, remains active)
   while [[ -n "$CONDA_DEFAULT_ENV" ]]; do
     conda deactivate
