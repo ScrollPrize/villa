@@ -51,17 +51,6 @@ fi
 ZARR_NAME=$(basename "$ZARR_DIR" .zarr)
 echo ">>> Processing Zarr: $ZARR_NAME"
 
-# retry helper (preserves empty-string args & logs them verbatim)
-retry_until_success(){
-  local args=( "$@" )
-  local cmd_display
-  printf -v cmd_display '%q ' "${args[@]}"
-  until "${args[@]}"; do
-    echo "+++ FAILED: $cmd_display — retrying in 5s…"
-    sleep 5
-  done
-}
-
 # step 1: grid_to_pointcloud
 if (( start_idx <= 1 )); then
   grid_cmd=(
@@ -108,15 +97,15 @@ fi
 
 # step 5: graph_solve
 if (( start_idx <= 5 )); then
-    # Deactivate conda completely (ensure no conda environment, not even 'base', remains active).
-    while [[ -n "$CONDA_DEFAULT_ENV" ]]; do
-        conda deactivate
-    done
-    echo "Conda completely deactivated."
-    python3 -m ThaumatoAnakalyptor.graph_solve \
-      "/workspace/experiments/1352_3600_5002/graph.bin" \
-      --experiment_name "'"${ZARR_NAME}"'"
-  '
+  # Deactivate conda completely (ensure no conda environment, not even base, remains active)
+  while [[ -n "$CONDA_DEFAULT_ENV" ]]; do
+    conda deactivate
+  done
+  echo "Conda completely deactivated."
+  
+  python3 -m ThaumatoAnakalyptor.graph_solve \
+    "/workspace/experiments/1352_3600_5002/graph.bin" \
+    --experiment_name "${ZARR_NAME}"
 fi
 
 echo ">>> All requested steps completed for ${ZARR_NAME}."
