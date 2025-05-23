@@ -8,13 +8,14 @@ usage(){
 Usage: $0 [--start <step>]
 
 Options:
-  -s,--start <step>   One of: grid, instances, graph, solve
+  -s,--start <step>   One of: grid, instances, graph, compile, solve
                       (default: grid)
 
 Steps:
   grid        run grid_to_pointcloud
   instances   run pointcloud_to_instances
   graph       run instances_to_graph
+  compile     compile bash script
   solve       run graph_solve
 EOF
   exit 1
@@ -36,7 +37,8 @@ case "$start" in
   grid)       start_idx=1;;
   instances)  start_idx=2;;
   graph)      start_idx=3;;
-  solve)      start_idx=4;;
+  compile)    start_idx=4;;
+  solve)      start_idx=5;;
   *) echo "Invalid start step: $start"; usage;;
 esac
 
@@ -96,8 +98,16 @@ if (( start_idx <= 3 )); then
     --path "/workspace/experiments/point_cloud_colorized_verso_subvolume_blocks"
 fi
 
-# step 4: graph_solve
+# step 4: compile bash script
 if (( start_idx <= 4 )); then
+  retry_until_success bash -c '
+    echo "Compiling C++ code..."
+    ./compile_cpp.sh
+  '
+fi
+
+# step 5: graph_solve
+if (( start_idx <= 5 )); then
   retry_until_success bash -c '
     conda deactivate 2>/dev/null || true
     conda deactivate 2>/dev/null || true
