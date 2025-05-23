@@ -150,7 +150,7 @@ def group_patches_by_zarr_chunks(part_files, part_ids, patch_size):
     return zarr_chunk_groups
 
 
-def batch_read_logits_chunks(zarr_chunk_groups, part_files, memory_budget, num_classes, patch_size):
+def batch_read_logits_chunks(zarr_chunk_groups, part_files, memory_budget, num_classes, patch_size, num_workers):
     """
     Efficiently read logits in batches based on memory budget.
     
@@ -160,6 +160,7 @@ def batch_read_logits_chunks(zarr_chunk_groups, part_files, memory_budget, num_c
         memory_budget: Memory allocation information
         num_classes: Number of classes in logits
         patch_size: Tuple (pZ, pY, pX)
+        num_workers: Number of worker processes (for memory budget division)
         
     Yields:
         Batches of (chunk_keys, logits_batch, coords_batch)
@@ -168,7 +169,10 @@ def batch_read_logits_chunks(zarr_chunk_groups, part_files, memory_budget, num_c
     
     # Calculate memory per zarr chunk (float16 logits)
     bytes_per_chunk = num_classes * pZ * pY * pX * 2  # float16 = 2 bytes
-    max_chunks_per_batch = max(1, memory_budget['chunk_buffer_bytes'] // bytes_per_chunk)
+    
+    # Divide memory budget by number of workers to avoid over-allocation
+    worker_memory_budget = memory_budget['chunk_buffer_bytes'] // num_workers
+    max_chunks_per_batch = max(1, worker_memory_budget // bytes_per_chunk)
     
     chunk_keys = list(zarr_chunk_groups.keys())
     
@@ -299,7 +303,7 @@ def spatially_grouped_accumulate(chunk_logits, chunk_weights, batch_logits, batc
 
 # --- Optimized Single-Pass Chunk Processing ---
 def process_chunk(chunk_info, part_files, part_ids, output_path, gaussian_map_np, 
-                 patch_size, memory_budget, epsilon=1e-8):
+                 patch_size, memory_budget, num_workers, epsilon=1e-8):
     """
     Optimized single-pass chunk processing with vectorized operations and batch reading.
     Combines accumulation and normalization in one pass to eliminate redundant I/O.
@@ -312,6 +316,7 @@ def process_chunk(chunk_info, part_files, part_ids, output_path, gaussian_map_np
         gaussian_map_np: Pre-computed Gaussian map as numpy array (pZ, pY, pX)
         patch_size: Size of patches (pZ, pY, pX)
         memory_budget: Memory allocation information
+        num_workers: Number of worker processes (for memory budget division)
         epsilon: Small value to avoid division by zero
     """
     # Extract chunk boundaries
@@ -352,7 +357,7 @@ def process_chunk(chunk_info, part_files, part_ids, output_path, gaussian_map_np
     
     # Process relevant groups in memory-efficient batches
     for batch_keys, batch_logits, batch_coords in batch_read_logits_chunks(
-        relevant_groups, part_files, memory_budget, num_classes, patch_size):
+        relevant_groups, part_files, memory_budget, num_classes, patch_size, num_workers):
         
         # Vectorized intersection calculation for entire batch
         intersection_info = vectorized_intersection_calc(batch_coords, patch_size, chunk_info)
@@ -619,7 +624,8 @@ def merge_inference_outputs(
         output_path=output_path,
         gaussian_map_np=gaussian_map_np,
         patch_size=patch_size,
-        memory_budget=memory_budget
+        memory_budget=memory_budget,
+        num_workers=num_workers
     )
     
     # Process chunks in parallel with single-pass optimization
