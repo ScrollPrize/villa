@@ -59,6 +59,8 @@ retry_until_success(){
   printf -v cmd_display '%q ' "${args[@]}"
   until "${args[@]}"; do
     echo "+++ FAILED: $cmd_display — retrying in 5s…"
+    echo "+++ Killing all python3 processes before retry…"
+    pkill -9 python3 || true
     sleep 5
   done
 }
