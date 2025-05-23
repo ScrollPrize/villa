@@ -749,11 +749,49 @@ def build_neighbor_graph(coords,
     # print(f"Distance filtering: {total_edges_before} -> {total_edges_after} edges (removed {total_edges_before - total_edges_after})")
     return neighbor_lists, distance_lists
 
+def create_flattening_downsample_indices(points, is_mesh_flags, downsample_ratio):
+    """
+    Create downsampled indices for flattening solver that keeps all mesh points 
+    and a fraction of slab points.
+    
+    Args:
+        points: array of points
+        is_mesh_flags: boolean array indicating mesh points
+        downsample_ratio: fraction of slab points to keep
+        
+    Returns:
+        indices: array of indices for downsampled points
+    """
+    mesh_indices = np.where(is_mesh_flags)[0]
+    slab_indices = np.where(~is_mesh_flags)[0]
+    
+    # Keep all mesh points
+    kept_mesh = mesh_indices
+    
+    # Downsample slab points
+    if len(slab_indices) > 0 and downsample_ratio < 1.0:
+        n_slab_keep = int(len(slab_indices) * downsample_ratio)
+        if n_slab_keep > 0:
+            kept_slab = np.random.choice(slab_indices, n_slab_keep, replace=False)
+        else:
+            kept_slab = np.array([], dtype=int)
+    else:
+        kept_slab = slab_indices
+    
+    # Combine and sort
+    all_kept = np.concatenate([kept_mesh, kept_slab])
+    all_kept = np.sort(all_kept)
+    
+    print(f"Downsampling for solver: kept {len(kept_mesh)} mesh + {len(kept_slab)} slab = {len(all_kept)} total points")
+    
+    return all_kept
+
 def flatten_pointcloud(base_path,
                        k_neighbors=6,
                        angle_threshold=40,
                        angle_weight=0.2,
                        downsample_ratio=0.1,
+                       flattening_downsample_ratio=0.3,
                        display=False,
                        display_downsample=0.1,
                        color_by_angle=False):
@@ -769,7 +807,8 @@ def flatten_pointcloud(base_path,
         winding_width (int): Number of windings concatenated per graph segment.
         angle_threshold (float, optional): Max allowed difference in 4th-dimension (angle) to keep a neighbor.
         angle_weight (float, optional): Scale factor for 4th-dimension when computing distances in KD-tree.
-        downsample_ratio (float, optional): Fraction of points to randomly keep when loading windings (default 0.5).
+        downsample_ratio (float, optional): Fraction of points to randomly keep when loading windings (default 0.1).
+        flattening_downsample_ratio (float, optional): Fraction of points to use in first step of flattening solver (default 0.3).
     """
     winding_width=3
     winding_path = os.path.join(base_path, "windings")
@@ -895,15 +934,13 @@ def flatten_pointcloud(base_path,
         
         print(f"Min/Max distances: {np.min(np.concatenate(distance_lists))}, {np.max(np.concatenate(distance_lists))}")
 
-        # load graph into cpp
+        # Initialize UV coordinates using previous results or defaults
         coords_z_index = 2
-        # orchestrate initial guess for current flattened coordinates (u: angle, v: z)
         current_angles = np.zeros_like(winding_angles)
         current_z = np.zeros_like(coords[:, coords_z_index])
-        # assign previous results for wraps if available, otherwise use initial values
-        # assign previous results for wraps if available and matching size, otherwise use defaults
+        
+        # Assign previous results for wraps if available, otherwise use initial values
         start_idx = 0
-        # track ranges of previous and new wraps within this window segment
         prev_ranges = []
         new_ranges = []
         for idx_in_segment, count in enumerate(winding_indices):
@@ -911,7 +948,7 @@ def flatten_pointcloud(base_path,
             # default slices
             default_u = winding_angles[start_idx:start_idx+count]
             default_v = coords[start_idx:start_idx+count, coords_z_index]
-            prev_u = prev_uvs_u.get(wrap_nr, None)
+            prev_u = prev_uvs_u.get(wrap_nr)
             # use previous if exists and matches count
             if prev_u is not None and prev_u.shape[0] == count:
                 current_angles[start_idx:start_idx+count] = prev_u
@@ -924,7 +961,8 @@ def flatten_pointcloud(base_path,
                 current_z[start_idx:start_idx+count] = default_v
                 new_ranges.append((start_idx, start_idx+count))
             start_idx += count
-        # align newly added wraps to previously computed wraps in u (angle) and v (z)
+        
+        # Align newly added wraps to previously computed wraps in u (angle) and v (z)
         if prev_ranges and new_ranges:
             # align u: offset new wraps' min to prev wraps' max
             prev_vals = np.concatenate([current_angles[s:e] for s, e in prev_ranges])
@@ -938,52 +976,194 @@ def flatten_pointcloud(base_path,
             z_offset = np.mean(prev_z_vals) - np.mean(new_z_vals)
             for s, e in new_ranges:
                 current_z[s:e] += z_offset
-        # initialize solver
+
+        # STEP 1: Create downsampled data for initial solve
+        print("=== STEP 1: Creating downsampled data for initial solve ===")
+        downsample_indices = create_flattening_downsample_indices(points, is_mesh_flags, flattening_downsample_ratio)
+        
+        # Create downsampled arrays
+        coords_ds = coords[downsample_indices]
+        winding_angles_ds = winding_angles[downsample_indices]
+        is_mesh_flags_ds = is_mesh_flags[downsample_indices]
+        current_angles_ds = current_angles[downsample_indices]
+        current_z_ds = current_z[downsample_indices]
+        
+        # Build neighbor graph for downsampled points
+        neighbor_lists_ds, distance_lists_ds = build_neighbor_graph(
+            coords_ds,
+            angles=winding_angles_ds,
+            k_neighbors=k_neighbors,
+            angle_threshold=angle_threshold,
+            angle_weight=angle_weight,
+            is_mesh=is_mesh_flags_ds
+        )
+        
+        print(f"Downsampled Min/Max distances: {np.min(np.concatenate(distance_lists_ds))}, {np.max(np.concatenate(distance_lists_ds))}")
+        
+        # Initialize downsampled solver
+        solver_ds = graph_problem_gpu_py.Solver(
+            neighbor_lists_ds,
+            distance_lists_ds,
+            winding_angles_ds,
+            current_angles_ds,
+            coords_ds[:, coords_z_index],
+            current_z_ds
+        )
+        print("Set up downsampled graph")
+        
+        # Fix mesh points and first winding in downsampled solver
+        mesh_idx_ds = np.nonzero(is_mesh_flags_ds)[0].tolist()
+        # if mesh_idx_ds:
+        #     solver_ds.fix_nodes(mesh_idx_ds)
+        #     print(f"Fixed {len(mesh_idx_ds)} mesh-point nodes in downsampled solver.")
+        
+        # Fix nodes of the first winding if it has been previously computed (in downsampled space)
+        start_wrap_nr = winding_files_indices[start]
+        first_count = winding_indices[0]
+        prev_u0 = prev_uvs_u.get(start_wrap_nr)
+        
+        # Find which downsampled indices correspond to the first winding
+        first_winding_mask = np.zeros(len(downsample_indices), dtype=bool)
+        first_winding_mask[downsample_indices < first_count] = True
+        first_winding_ds_indices = np.where(first_winding_mask)[0]
+        
+        if prev_u0 is not None and len(first_winding_ds_indices) > 0:
+            # Convert to relative indices for the downsampled solver
+            ds_valid_indices = np.array(solver_ds.get_undeleted_indices())
+            first_winding_relative = []
+            for abs_idx in first_winding_ds_indices:
+                where_found = np.where(ds_valid_indices == abs_idx)[0]
+                if len(where_found) > 0:
+                    first_winding_relative.append(where_found[0])
+            
+            if len(first_winding_relative) > 0:
+                solver_ds.fix_nodes(first_winding_relative)
+                print(f"Fixed {len(first_winding_relative)} downsampled nodes of winding {start_wrap_nr} using previous results.")
+            else:
+                print(f"Warning: No valid first winding nodes found in downsampled solver")
+        
+        # Solve downsampled graph problem
+        min_angle = np.min(winding_angles_ds)
+        max_angle = np.max(winding_angles_ds)
+        z_min = np.min(coords_ds[:, 2])
+        z_max = np.max(coords_ds[:, 2])
+        print(f"Downsampled Min/Max angles: {min_angle}, {max_angle}, Min/Max z: {z_min}, {z_max}")
+        
+        zero_ranges = [(min_angle, min_angle+270), (max_angle-270, max_angle)]
+        a_step = (max_angle - min_angle)/winding_width
+        zero_ranges_initial = [(min_angle + index * a_step, min_angle + (index+1)*a_step) for index in range(winding_width)]
+        
+        print("Solving downsampled graph (first pass)...")
+        solver_ds.solve_flattening(num_iterations=10000, visualize=True, 
+                                   angle_tug_min=min_angle+90, angle_tug_max=max_angle-90, 
+                                   z_tug_min=z_min+100, z_tug_max=z_max-100, 
+                                   tug_step=0.5, zero_ranges=zero_ranges_initial)
+        
+        uvs_ds_initial = np.array(solver_ds.get_uvs())
+        undeleted_ds_indices = np.array(solver_ds.get_undeleted_indices())
+        print(f"After downsampled solve: u min={uvs_ds_initial[:,0].min()}, u max={uvs_ds_initial[:,0].max()}, v min={uvs_ds_initial[:,1].min()}, v max={uvs_ds_initial[:,1].max()}")
+        print(f"Downsampled solver: {len(undeleted_ds_indices)} undeleted out of {len(downsample_indices)} total downsampled points")
+        
+        # STEP 2: Use downsampled results to initialize full solver
+        print("=== STEP 2: Setting up full solver with downsampled results ===")
+        
+        # Interpolate downsampled results to all points
+        current_angles_full = np.copy(current_angles)
+        current_z_full = np.copy(current_z)
+        
+        # Update positions of undeleted downsampled points with solved values
+        # Map the undeleted indices back to the original full point cloud indices
+        valid_downsample_indices = downsample_indices[undeleted_ds_indices]
+        current_angles_full[valid_downsample_indices] = uvs_ds_initial[:, 0]
+        current_z_full[valid_downsample_indices] = uvs_ds_initial[:, 1]
+        print(f"Updated {len(valid_downsample_indices)} points with downsampled solve results")
+        
+        # Initialize full solver with interpolated values
         solver = graph_problem_gpu_py.Solver(
             neighbor_lists,
             distance_lists,
             winding_angles,
-            current_angles,
+            current_angles_full,
             coords[:, coords_z_index],
-            current_z
+            current_z_full
         )
-        print("Set up the graph")
-        # always fix mesh points to anchor their original positions
-        mesh_idx = np.nonzero(is_mesh_flags)[0].tolist()
-        # if mesh_idx:
-        #     solver.fix_nodes(mesh_idx)
-        #     print(f"Fixed {len(mesh_idx)} mesh-point nodes to original positions.")
-        # fix nodes of the first winding if it has been previously computed
+        print("Set up full graph with downsampled initialization")
+        
+        # Get the valid indices from the full solver to map absolute indices to relative ones
+        full_valid_indices = np.array(solver.get_undeleted_indices())
+        
+        # Convert absolute valid_downsample_indices to relative indices within the full solver's valid nodes
+        relative_indices = []
+        for abs_idx in valid_downsample_indices:
+            # Find where this absolute index appears in the full solver's valid indices
+            where_found = np.where(full_valid_indices == abs_idx)[0]
+            if len(where_found) > 0:
+                relative_indices.append(where_found[0])
+        
+        print(f"Mapped {len(valid_downsample_indices)} absolute indices to {len(relative_indices)} relative indices")
+        
+        # Fix the undeleted downsampled points in the full solver (using relative indices)
+        if len(relative_indices) > 0:
+            solver.fix_nodes(relative_indices)
+            print(f"Fixed {len(relative_indices)} undeleted downsampled points in full solver")
+        else:
+            print("Warning: No valid downsampled points found to fix in full solver")
+        
+        # Solve full graph with fewer iterations
+        min_angle_full = np.min(winding_angles)
+        max_angle_full = np.max(winding_angles)
+        z_min_full = np.min(coords[:, coords_z_index])
+        z_max_full = np.max(coords[:, coords_z_index])
+        
+        print("Solving full graph (refinement pass)...")
+        solver.solve_flattening(num_iterations=5000, visualize=True, 
+                               angle_tug_min=min_angle_full+90, angle_tug_max=max_angle_full-90, 
+                               z_tug_min=z_min_full+100, z_tug_max=z_max_full-100, 
+                               tug_step=0.5, zero_ranges=zero_ranges_initial)
+        
+        uvs_full_initial = np.array(solver.get_uvs())
+        print(f"After full refinement solve: u min={uvs_full_initial[:,0].min()}, u max={uvs_full_initial[:,0].max()}, v min={uvs_full_initial[:,1].min()}, v max={uvs_full_initial[:,1].max()}")
+        
+        # STEP 3: Second round with refined parameters
+        print("=== STEP 3: Second solve round ===")
+        
+        # Unfix all nodes for second round (if method exists)
+        try:
+            solver.unfix()
+            print("Unfixed all nodes for second round")
+        except AttributeError:
+            print("Warning: unfix method not available, proceeding without unfixing")
+        
+        # Re-fix first winding if previously computed
         start_wrap_nr = winding_files_indices[start]
         first_count = winding_indices[0]
         prev_u0 = prev_uvs_u.get(start_wrap_nr)
+        
         if prev_u0 is not None and prev_u0.shape[0] == first_count:
             wrap0_idx = list(range(first_count))
-            solver.fix_nodes(wrap0_idx)
-            print(f"Fixed {len(wrap0_idx)} nodes of winding {start_wrap_nr} using previous results.")
-        else:
-            print(f"Warning: wrap {start_wrap_nr} expected {first_count} points; not fixing its nodes.")
-        # solve the graph problem
-        min_angle = np.min(winding_angles)
-        max_angle = np.max(winding_angles)
-        z_min = np.min(coords[:, coords_z_index])
-        z_max = np.max(coords[:, coords_z_index])
-        print(F"Min/Max angles: {min_angle}, {max_angle}, Min/Max z: {z_min}, {z_max}")
-
-        zero_ranges = [(min_angle, min_angle+270), (max_angle-270, max_angle)]
-        a_step = (max_angle - min_angle)/winding_width
-        zero_ranges_initial = [(min_angle + index * a_step, min_angle + (index+1)*a_step) for index in range(winding_width)]
-        zero_ranges_fine = [(min_angle + (index + 0.4) * a_step, min_angle + (index+0.6)*a_step) for index in range(winding_width)]
-        solver.solve_flattening(num_iterations=20000, visualize=True, angle_tug_min=min_angle+90, angle_tug_max=max_angle-90, z_tug_min=z_min+100, z_tug_max=z_max-100, tug_step=0.5, zero_ranges=zero_ranges_initial)
-        # Print min/max of UVs after first solve
-        uvs_initial = np.array(solver.get_uvs())
-        print(f"After first solve_flattening: u min={uvs_initial[:,0].min()}, u max={uvs_initial[:,0].max()}, v min={uvs_initial[:,1].min()}, v max={uvs_initial[:,1].max()}")
-        solver.solve_flattening(num_iterations=150000, visualize=True, zero_ranges=zero_ranges, tug_step=0.0005)
-        undeleted_indices = np.array(solver.get_undeleted_indices())
+            # Convert to relative indices for the full solver
+            final_valid_indices = np.array(solver.get_undeleted_indices())
+            wrap0_relative = []
+            for abs_idx in wrap0_idx:
+                where_found = np.where(final_valid_indices == abs_idx)[0]
+                if len(where_found) > 0:
+                    wrap0_relative.append(where_found[0])
+            
+            if len(wrap0_relative) > 0:
+                solver.fix_nodes(wrap0_relative)
+                print(f"Re-fixed {len(wrap0_relative)} nodes of winding {start_wrap_nr} for second round.")
+            else:
+                print(f"Warning: No valid first winding nodes found for second round")
         
+        # Second solve with fine parameters
+        zero_ranges_fine = [(min_angle_full, min_angle_full+270), (max_angle_full-270, max_angle_full)]
+        solver.solve_flattening(num_iterations=75000, visualize=True, zero_ranges=zero_ranges_fine, tug_step=0.0005)
+        
+        undeleted_indices = np.array(solver.get_undeleted_indices())
         uvs = np.array(solver.get_uvs())
-        # Print min/max of UVs after second solve
         print(f"After second solve_flattening: u min={uvs[:,0].min()}, u max={uvs[:,0].max()}, v min={uvs[:,1].min()}, v max={uvs[:,1].max()}")
+        
+        # Process results
         winding_us = []
         winding_vs = []
         w_i = 0
@@ -1322,6 +1502,7 @@ def main():
     parser = argparse.ArgumentParser(description="Refine pointcloud using mesh and downsampling")
     parser.add_argument("--mesh", required=True, help="Path to mesh file (.ply or .obj)")
     parser.add_argument("--downsample_ratio", type=float, default=1.0, help="Downsample ratio for pointclouds")
+    parser.add_argument("--flattening_downsample_ratio", type=float, default=0.3, help="Downsample ratio for flattening solver first pass")
     parser.add_argument("--skip_precomputation", action="store_true", help="Skip precomputation of winding pointclouds")
     parser.add_argument("--display", action="store_true", help="Display pointclouds and meshes")
     parser.add_argument("--display_downsample", type=float, default=0.1,
@@ -1342,6 +1523,7 @@ def main():
         os.path.dirname(args.mesh),
         display=args.display,
         downsample_ratio=args.downsample_ratio,
+        flattening_downsample_ratio=args.flattening_downsample_ratio,
         display_downsample=args.display_downsample,
         color_by_angle=args.color_by_angle
     )
