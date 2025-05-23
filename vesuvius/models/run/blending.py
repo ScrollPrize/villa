@@ -170,8 +170,6 @@ def batch_read_logits_chunks(zarr_chunk_groups, part_files, memory_budget, num_c
     bytes_per_chunk = num_classes * pZ * pY * pX * 2  # float16 = 2 bytes
     max_chunks_per_batch = max(1, memory_budget['chunk_buffer_bytes'] // bytes_per_chunk)
     
-    print(f"Batch reading with max {max_chunks_per_batch} zarr chunks per batch")
-    
     chunk_keys = list(zarr_chunk_groups.keys())
     
     # Process in batches
@@ -636,7 +634,7 @@ def merge_inference_outputs(
         for future in tqdm(
             as_completed(future_to_chunk),
             total=len(chunks),
-            desc="Processing Chunks (Single-Pass)",
+            desc="Processing Chunks: ",
             disable=not verbose
         ):
             try:
@@ -710,9 +708,6 @@ def main():
     if not args.quiet:
         print("=== Optimized Blending with Single-Pass Processing ===")
         print(f"RAM Budget: {args.ram_budget_gb}GB")
-        print(f"Vectorized operations: Enabled")
-        print(f"Batch reading: Enabled")
-        print(f"Single-pass processing: Enabled")
         print("=" * 55)
 
     try:
