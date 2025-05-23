@@ -64,8 +64,7 @@ setup(
         'console_scripts': [
             'vesuvius.accept_terms=setup.accept_terms:main',
             'vesuvius.predict=models.run.inference:main',
-            'vesuvius.blend_logits=models.run.blending:main',
-            'vesuvius.finalize_outputs=models.run.finalize_outputs:main',
+            'vesuvius.merge_partitions=models.run.vesuvius_pipeline:run_merge_only',
             'vesuvius.inference_pipeline=models.run.vesuvius_pipeline:run_pipeline',
         ],
     },

@@ -16,6 +16,58 @@ from utils.models.load_nnunet_model import load_model_for_inference
 from data.vc_dataset import VCDataset
 from data.utils import open_zarr
 
+
+def generate_hann_map(
+        patch_size: tuple,
+        verbose: bool = False
+) -> np.ndarray:
+    """
+    Generates a 3-D Hann (raised-cosine) importance map of shape
+    (1, pZ, pY, pX).  With 50 % patch overlap the window forms an exact
+    partition of unity, so a single global normalisation constant
+    suffices during accumulation.
+
+    Parameters
+    ----------
+    patch_size : (int, int, int)
+        The (Z, Y, X) size of the patch to be windowed.
+    verbose : bool, optional
+        If True, print basic stats.
+
+    Returns
+    -------
+    np.ndarray
+        Importance map with dtype float32, values ∈ [0, 1].
+        Shape: (1, pZ, pY, pX) — ready for broadcasting.
+    """
+    pZ, pY, pX = patch_size
+
+    # --- 1-D Hann helper ---------------------------------------------------
+    def hann_1d(L: int) -> np.ndarray:
+        if L == 1:                               # degenerate edge case
+            return np.ones(1, dtype=np.float32)
+        n = np.arange(L, dtype=np.float32)
+        return 0.5 * (1.0 - np.cos(2.0 * np.pi * n / (L - 1)))
+
+    wz = hann_1d(pZ)[:, None, None]             # (Z,1,1)
+    wy = hann_1d(pY)[None, :, None]             # (1,Y,1)
+    wx = hann_1d(pX)[None, None, :]             # (1,1,X)
+
+    # --- separable outer-product ------------------------------------------
+    hann_map = (wz * wy * wx).astype(np.float32)   # (Z,Y,X)
+
+    # --- normalise so max = 1 ------------------------------------------------
+    hann_map /= hann_map.max()  # already 1, but safes against all-zero
+
+    hann_map = hann_map.reshape(1, pZ, pY, pX)     # (1,Z,Y,X)
+
+    if verbose:
+        print(f"Hann map: shape {hann_map.shape}, "
+              f"min {hann_map.min():.4f}, max {hann_map.max():.4f}")
+
+    return hann_map
+
+
 class Inferer():
     def __init__(self,
                  model_path: str = None,
@@ -117,6 +169,8 @@ class Inferer():
         self.num_classes = None
         self.num_total_patches = None
         self.current_patch_write_index = 0
+        self.hann_map = None
+        self.accumulator = None
 
 
     def _load_model(self):
@@ -189,6 +243,13 @@ class Inferer():
 
         return model
 
+    def _create_hann_map(self):
+        """Generate Hann weighting map for blending"""
+        self.hann_map = generate_hann_map(
+            self.patch_size, 
+            verbose=self.verbose
+        )[0]  # Remove batch dimension
+
     def _create_dataset_and_loader(self):
         # Use step_size instead of overlap (step_size is [0-1] representing stride as fraction of patch size)
         # step_size of 0.5 means 50% overlap
@@ -241,6 +302,19 @@ class Inferer():
                                              # so we don't run them through the model 
         )
         return self.dataset, self.dataloader
+
+    def _create_accumulator(self):
+        """Create accumulator for direct accumulation instead of patch storage"""
+        from models.run.partitioned_accumulator import PartitionedAccumulator
+        
+        # Create accumulator for this partition only
+        self.accumulator = PartitionedAccumulator(
+            dataset=self.dataset,
+            num_classes=self.num_classes,
+            hann_map=self.hann_map,
+            output_path=os.path.join(self.output_dir, f"accumulator_part_{self.part_id}"),
+            patch_size=self.patch_size
+        )
         
     def _get_zarr_compressor(self):
         if self.compressor_name.lower() == 'zstd':
@@ -254,302 +328,146 @@ class Inferer():
         else:
             return zarr.Blosc(cname='zstd', clevel=1, shuffle=zarr.Blosc.SHUFFLE)
 
-    def _create_output_stores(self):
-        if self.num_classes is None or self.patch_size is None or self.num_total_patches is None:
-            raise RuntimeError("Cannot create output stores: model/patch info missing.")
-        if not self.patch_start_coords_list:
-            raise RuntimeError("Cannot create output stores: patch coordinates not available.")
-
-        compressor = self._get_zarr_compressor()
-        output_shape = (self.num_total_patches, self.num_classes, *self.patch_size)
-        output_chunks = (1, self.num_classes, *self.patch_size)  # Chunk by individual patch
-        main_store_path = os.path.join(self.output_dir, f"logits_part_{self.part_id}.zarr")
-        
-        print(f"Creating output store at: {main_store_path}")
-        
-        # Create the zarr array using our helper function
-        self.output_store = open_zarr(
-            path=main_store_path, 
-            mode='w',  
-            storage_options={'anon': False} if main_store_path.startswith('s3://') else None,
-            verbose=self.verbose,
-            shape=output_shape,
-            chunks=output_chunks,
-            dtype=np.float16,  
-            compressor=compressor,
-            write_empty_chunks=False  # we skip empty chunks here so we don't write all zero patches to the array but keep
-                                      # the proper indices for later re-zarring 
-        )
-        
-        # Verify the zarr array was created
-        print(f"Created zarr array at {main_store_path} with shape {self.output_store.shape}")
-        
-        # Create coordinates zarr array
-        self.coords_store_path = os.path.join(self.output_dir, f"coordinates_part_{self.part_id}.zarr")
-        coord_shape = (self.num_total_patches, len(self.patch_size))
-        coord_chunks = (min(self.num_total_patches, 4096), len(self.patch_size))
-        
-        print(f"Creating coordinates store at: {self.coords_store_path}")
-        
-        # Create the coordinates zarr array with our helper function
-        coords_store = open_zarr(
-            path=self.coords_store_path,
-            mode='w',
-            storage_options={'anon': False} if self.coords_store_path.startswith('s3://') else None,
-            verbose=self.verbose,
-            shape=coord_shape,
-            chunks=coord_chunks,
-            dtype=np.int32,
-            compressor=compressor,
-            write_empty_chunks=False  
-        )
-        
-        # Verify the coordinates array was created
-        print(f"Created coordinates zarr array at {self.coords_store_path} with shape {coords_store.shape}")
-        
-        try:
-            original_volume_shape = None
-            if hasattr(self.dataset, 'input_shape'):
-                if len(self.dataset.input_shape) == 4:  # has channel dimension
-                    original_volume_shape = list(self.dataset.input_shape[1:])
-                else:  # no channel dimension
-                    original_volume_shape = list(self.dataset.input_shape)
-                if self.verbose:
-                    print(f"Derived original volume shape from dataset.input_shape: {original_volume_shape}")
-            
-            # store some metadata we might later want 
-            self.output_store.attrs['patch_size'] = list(self.patch_size)
-            self.output_store.attrs['overlap'] = self.overlap
-            self.output_store.attrs['part_id'] = self.part_id
-            self.output_store.attrs['num_parts'] = self.num_parts
-            
-            if original_volume_shape:
-                self.output_store.attrs['original_volume_shape'] = original_volume_shape
-            
-            coords_store.attrs['part_id'] = self.part_id
-            coords_store.attrs['num_parts'] = self.num_parts
-            
-        except Exception as e:
-            print(f"Warning: Failed to write custom attributes: {e}")
-
-        coords_np = np.array(self.patch_start_coords_list, dtype=np.int32)
-        coords_store[:] = coords_np
-        
-        if self.verbose: 
-            print(f"Created output stores: {main_store_path} and {self.coords_store_path}")
-        
-        return self.output_store
 
     def _process_batches(self):
-        # Disable Blosc threading to avoid deadlocks when used with multiprocessing
-        numcodecs.blosc.use_threads = False
-        
         self.current_patch_write_index = 0
-        max_workers = min(16, os.cpu_count() or 4)
         
-        # Use the output_store that was already created in _create_output_stores()
-        # No need to reopen it since we already have it
-        zarr_path = os.path.join(self.output_dir, f"logits_part_{self.part_id}.zarr")
-        
-        # Debug information
-        # print(f"Using output path: {zarr_path}")
-        # print(f"Output directory type: {type(self.output_dir)}, value: '{self.output_dir}'")
-        
-        # Validate zarr_path is not empty
-        if not zarr_path:
-            error_msg = f"Error: Empty zarr_path generated from output_dir='{self.output_dir}'"
-            print(error_msg)
-            raise ValueError(error_msg)
-        
-        # Verify we have a valid output store from _create_output_stores()
-        if self.output_store is None:
-            error_msg = f"Error: output_store is None. Make sure _create_output_stores() was called successfully."
-            print(error_msg)
-            raise RuntimeError(error_msg)
-            
-        if self.verbose:
-            print(f"Using existing output store: {zarr_path}")
-            print(f"Output store shape: {self.output_store.shape}")
-        
-        # Keep a reference to the output store that will be shared by all threads
-        output_store = self.output_store
-        
-        # Define write function that uses the shared output store
-        def write_patch(write_index, patch_data):
-            # print(f"Writing patch {write_index} to {zarr_path}")
-            try:
-                # Use the already opened shared output store
-                try:
-                    if not zarr_path or zarr_path.strip() == '':
-                        raise ValueError(f"Empty zarr path provided for index {write_index}")
-                        
-                    # Write directly to the shared output store
-                    output_store[write_index] = patch_data
-                   # print(f"Successfully wrote patch {write_index}")
-                except Exception as e:
-                    print(f"Error in write_patch with index {write_index}: {str(e)} (zarr_path={zarr_path})")
-                    import traceback
-                    traceback.print_exc()
-                    raise e
-                return write_index
-            except Exception as e:
-                print(f"Error writing patch at index {write_index}: {str(e)}")
-                return None
-            
         with tqdm(total=self.num_total_patches, desc=f"Inferring Part {self.part_id}") as pbar:
-            # Use ThreadPoolExecutor for I/O-bound tasks
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = []
+            for batch_data in self.dataloader:
+                if isinstance(batch_data, (list, tuple)):
+                    input_batch = batch_data[0].to(self.device)
+                    is_empty_flags = [False] * input_batch.shape[0]
+                elif isinstance(batch_data, dict):
+                    input_batch = batch_data['data'].to(self.device)
+                    is_empty_flags = batch_data.get('is_empty', [False] * input_batch.shape[0])
+                else:
+                    input_batch = batch_data.to(self.device)
+                    is_empty_flags = [False] * input_batch.shape[0]
                 
-                for batch_data in self.dataloader:
-                    if isinstance(batch_data, (list, tuple)):
-                        input_batch = batch_data[0].to(self.device)
-                        is_empty_flags = [False] * input_batch.shape[0]
-                    elif isinstance(batch_data, dict):
-                        input_batch = batch_data['data'].to(self.device)
-                        is_empty_flags = batch_data.get('is_empty', [False] * input_batch.shape[0])
-                    else:
-                        input_batch = batch_data.to(self.device)
-                        is_empty_flags = [False] * input_batch.shape[0]
-                    
-                    # Skip invalid batches
-                    if input_batch is None or input_batch.shape[0] == 0:
-                        if self.verbose:
-                            print("Skipping batch with no valid data")
-                        continue
-                    
-                    batch_size = input_batch.shape[0]
-                    output_shape = (batch_size, self.num_classes, *self.patch_size)
-                    output_batch = torch.zeros(output_shape, device=self.device, dtype=input_batch.dtype)
-                    
-                    # Find non-empty patches that need model inference
-                    non_empty_indices = [i for i, is_empty in enumerate(is_empty_flags) if not is_empty]
-                    
-                    # Only perform inference if there are non-empty patches
-                    if non_empty_indices:
-                        non_empty_input = input_batch[non_empty_indices]
-                        
-                        # Perform inference with or without TTA
-                        with torch.no_grad(), torch.amp.autocast('cuda'):
-                            if self.do_tta:
-                                # --- TTA ---
-                                outputs_batch_tta = []  # Store list of outputs for each TTA for the batch
-
-                                if self.tta_type == 'mirroring':
-                                    # Apply model to original and mirrored versions (but only for non-empty patches)
-                                    m0 = self.model(non_empty_input)
-                                    m1 = self.model(torch.flip(non_empty_input, dims=[-1]))
-                                    m2 = self.model(torch.flip(non_empty_input, dims=[-2]))
-                                    m3 = self.model(torch.flip(non_empty_input, dims=[-3]))
-                                    m4 = self.model(torch.flip(non_empty_input, dims=[-1, -2]))
-                                    m5 = self.model(torch.flip(non_empty_input, dims=[-1, -3]))
-                                    m6 = self.model(torch.flip(non_empty_input, dims=[-2, -3]))
-                                    m7 = self.model(torch.flip(non_empty_input, dims=[-1, -2, -3]))
-
-                                    # Reverse the flips on the outputs before averaging
-                                    outputs_batch_tta = [
-                                        m0,
-                                        torch.flip(m1, dims=[-1]),
-                                        torch.flip(m2, dims=[-2]),
-                                        torch.flip(m3, dims=[-3]),
-                                        torch.flip(m4, dims=[-1, -2]),
-                                        torch.flip(m5, dims=[-1, -3]),
-                                        torch.flip(m6, dims=[-2, -3]),
-                                        torch.flip(m7, dims=[-1, -2, -3])
-                                    ]
-
-                                elif self.tta_type == 'rotation':
-                                    # Original orientation (identity)
-                                    r0 = self.model(non_empty_input)
-                                    
-                                    # X axis facing "up" - rotate around Y axis (Z and X exchange)
-                                    # This swaps Z and X dimensions
-                                    x_up = torch.transpose(non_empty_input, -3, -1)
-                                    r_x_up = self.model(x_up)
-                                    
-                                    # Z axis facing "up" - rotate around X axis (Y and Z exchange) 
-                                    # This swaps Y and Z dimensions
-                                    z_up = torch.transpose(non_empty_input, -3, -2)
-                                    r_z_up = self.model(z_up)
-                                    
-                                    # Rotate outputs back to original orientation before averaging
-                                    outputs_batch_tta = [
-                                        r0,  # Original
-                                        torch.transpose(r_x_up, -3, -1),  # X-up back to original
-                                        torch.transpose(r_z_up, -3, -2)   # Z-up back to original
-                                    ]
-
-                                # --- Merge TTA results for the batch ---
-                                stacked_outputs = torch.stack(outputs_batch_tta, dim=0)
-                                non_empty_output = torch.mean(stacked_outputs, dim=0)
-
-                            else:
-                                # --- No TTA ---
-                                non_empty_output = self.model(non_empty_input) 
-                        
-                        # Place non-empty patch outputs in the correct positions in output_batch
-                        for idx, original_idx in enumerate(non_empty_indices):
-                            output_batch[original_idx] = non_empty_output[idx]
-                    
-                    else:
-                        if self.verbose:
-                            print("Batch contains only empty patches, skipping model inference")
-                    
-                    output_np = output_batch.cpu().numpy().astype(np.float16)
-                    current_batch_size = output_np.shape[0]
-                    
-                    patch_indices = batch_data.get('index', list(range(current_batch_size)))
-                    
-                    # Submit each patch for writing
-                    for i in range(current_batch_size):
-                        patch_data = output_np[i]  # Shape: (C, Z, Y, X)
-                        write_index = patch_indices[i] if i < len(patch_indices) else i
-                        future = executor.submit(write_patch, write_index, patch_data)
-                        futures.append(future)
-                        
-                    # Process completed futures
-                    completed = [f for f in futures if f.done()]
-                    for future in completed:
-                        try:
-                            result = future.result() 
-                            if result is not None:  # Only update if write was successful
-                                pbar.update(1)
-                                self.current_patch_write_index += 1
-                        except Exception as e:
-                            print(f"Error processing future result: {e}")
-                    
-                    # Keep only pending futures
-                    futures = [f for f in futures if not f.done()]
+                # Skip invalid batches
+                if input_batch is None or input_batch.shape[0] == 0:
+                    if self.verbose:
+                        print("Skipping batch with no valid data")
+                    continue
                 
-                # Process any remaining futures
-                for future in futures:
-                    try:
-                        result = future.result()
-                        if result is not None:  # Only update if write was successful
-                            pbar.update(1)
-                            self.current_patch_write_index += 1
-                    except Exception as e:
-                        print(f"Error processing future result: {e}")
+                batch_size = input_batch.shape[0]
+                output_shape = (batch_size, self.num_classes, *self.patch_size)
+                output_batch = torch.zeros(output_shape, device=self.device, dtype=input_batch.dtype)
+                
+                # Find non-empty patches that need model inference
+                non_empty_indices = [i for i, is_empty in enumerate(is_empty_flags) if not is_empty]
+                
+                # Only perform inference if there are non-empty patches
+                if non_empty_indices:
+                    non_empty_input = input_batch[non_empty_indices]
+                    
+                    # Perform inference with or without TTA
+                    with torch.no_grad(), torch.amp.autocast('cuda'):
+                        if self.do_tta:
+                            # --- TTA ---
+                            outputs_batch_tta = []  # Store list of outputs for each TTA for the batch
+
+                            if self.tta_type == 'mirroring':
+                                # Apply model to original and mirrored versions (but only for non-empty patches)
+                                m0 = self.model(non_empty_input)
+                                m1 = self.model(torch.flip(non_empty_input, dims=[-1]))
+                                m2 = self.model(torch.flip(non_empty_input, dims=[-2]))
+                                m3 = self.model(torch.flip(non_empty_input, dims=[-3]))
+                                m4 = self.model(torch.flip(non_empty_input, dims=[-1, -2]))
+                                m5 = self.model(torch.flip(non_empty_input, dims=[-1, -3]))
+                                m6 = self.model(torch.flip(non_empty_input, dims=[-2, -3]))
+                                m7 = self.model(torch.flip(non_empty_input, dims=[-1, -2, -3]))
+
+                                # Reverse the flips on the outputs before averaging
+                                outputs_batch_tta = [
+                                    m0,
+                                    torch.flip(m1, dims=[-1]),
+                                    torch.flip(m2, dims=[-2]),
+                                    torch.flip(m3, dims=[-3]),
+                                    torch.flip(m4, dims=[-1, -2]),
+                                    torch.flip(m5, dims=[-1, -3]),
+                                    torch.flip(m6, dims=[-2, -3]),
+                                    torch.flip(m7, dims=[-1, -2, -3])
+                                ]
+
+                            elif self.tta_type == 'rotation':
+                                # Original orientation (identity)
+                                r0 = self.model(non_empty_input)
+                                
+                                # X axis facing "up" - rotate around Y axis (Z and X exchange)
+                                # This swaps Z and X dimensions
+                                x_up = torch.transpose(non_empty_input, -3, -1)
+                                r_x_up = self.model(x_up)
+                                
+                                # Z axis facing "up" - rotate around X axis (Y and Z exchange) 
+                                # This swaps Y and Z dimensions
+                                z_up = torch.transpose(non_empty_input, -3, -2)
+                                r_z_up = self.model(z_up)
+                                
+                                # Rotate outputs back to original orientation before averaging
+                                outputs_batch_tta = [
+                                    r0,  # Original
+                                    torch.transpose(r_x_up, -3, -1),  # X-up back to original
+                                    torch.transpose(r_z_up, -3, -2)   # Z-up back to original
+                                ]
+
+                            # --- Merge TTA results for the batch ---
+                            stacked_outputs = torch.stack(outputs_batch_tta, dim=0)
+                            non_empty_output = torch.mean(stacked_outputs, dim=0)
+
+                        else:
+                            # --- No TTA ---
+                            non_empty_output = self.model(non_empty_input) 
+                    
+                    # Place non-empty patch outputs in the correct positions in output_batch
+                    for idx, original_idx in enumerate(non_empty_indices):
+                        output_batch[original_idx] = non_empty_output[idx]
+                
+                else:
+                    if self.verbose:
+                        print("Batch contains only empty patches, skipping model inference")
+                
+                output_np = output_batch.cpu().numpy().astype(np.float32)
+                current_batch_size = output_np.shape[0]
+                
+                patch_indices = batch_data.get('index', list(range(current_batch_size)))
+                
+                # Accumulate each patch directly
+                for i in range(current_batch_size):
+                    patch_data = output_np[i]  # Shape: (C, Z, Y, X)
+                    patch_index = patch_indices[i] if i < len(patch_indices) else i
+                    
+                    # Get global coordinates for this patch
+                    global_coords = self.patch_start_coords_list[patch_index]
+                    
+                    # Accumulate directly
+                    self.accumulator.accumulate_patch(patch_data, global_coords)
+                    
+                    pbar.update(1)
+                    self.current_patch_write_index += 1
         
         if self.verbose:
-            print(f"Finished writing {self.current_patch_write_index} patches.")
+            print(f"Finished processing {self.current_patch_write_index} patches with direct accumulation.")
         
         # Verify completion and report
         if self.current_patch_write_index != self.num_total_patches:
-            print(f"Warning: Expected {self.num_total_patches} patches, but wrote {self.current_patch_write_index}.")
+            print(f"Warning: Expected {self.num_total_patches} patches, but processed {self.current_patch_write_index}.")
 
     def _run_inference(self):
         if self.verbose: print("Loading model...")
         self.model = self._load_model()
 
+        if self.verbose: print("Creating Hann map...")
+        self._create_hann_map()
+
         if self.verbose: print("Creating dataset and dataloader...")
         self._create_dataset_and_loader()
 
         if self.num_total_patches > 0:
-            if self.verbose: print("Creating output stores...")
-            self._create_output_stores()
+            if self.verbose: print("Creating accumulator...")
+            self._create_accumulator()
 
-            if self.verbose: print("Starting inference and writing logits...")
+            if self.verbose: print("Starting inference with direct accumulation...")
             self._process_batches()
         else:
             print(f"Skipping processing for part {self.part_id} as no patches were found.")
@@ -559,8 +477,8 @@ class Inferer():
     def infer(self):
         try:
             self._run_inference()
-            main_output_path = os.path.join(self.output_dir, f"logits_part_{self.part_id}.zarr")
-            return main_output_path, self.coords_store_path
+            accumulator_path = os.path.join(self.output_dir, f"accumulator_part_{self.part_id}")
+            return accumulator_path
         except Exception as e:
             print(f"An error occurred during inference: {e}")
             import traceback
@@ -667,49 +585,48 @@ def main():
 
     try:
         print("\n--- Starting Inference ---")
-        logits_path, coords_path = inferer.infer()
+        accumulator_path = inferer.infer()
 
-        if logits_path and coords_path:
-            # Check if paths exist, using fsspec for S3 paths
-            logits_exists = False
-            coords_exists = False
+        if accumulator_path:
+            # Check if accumulator exists
+            accumulator_exists = False
             
             try:
-                if logits_path.startswith('s3://'):
+                logits_path = os.path.join(accumulator_path, 'logits')
+                if accumulator_path.startswith('s3://'):
                     fs = fsspec.filesystem('s3', anon=False)
                     # Check if .zarray file exists within the zarr directory
-                    logits_exists = fs.exists(os.path.join(logits_path, '.zarray'))
+                    accumulator_exists = fs.exists(os.path.join(logits_path, '.zarray'))
                 else:
-                    logits_exists = os.path.exists(logits_path)
-                    
-                if coords_path.startswith('s3://'):
-                    fs = fsspec.filesystem('s3', anon=False)
-                    coords_exists = fs.exists(os.path.join(coords_path, '.zarray'))
-                else:
-                    coords_exists = os.path.exists(coords_path)
+                    accumulator_exists = os.path.exists(logits_path)
             except Exception as e:
-                print(f"Error checking if output paths exist: {e}")
-                # Continue anyway and try to open the stores
-                logits_exists = True
-                coords_exists = True
+                print(f"Error checking if accumulator exists: {e}")
+                # Continue anyway
+                accumulator_exists = True
             
-            if logits_exists and coords_exists:
+            if accumulator_exists:
                 print(f"\n--- Inference Finished ---")
-                print(f"Output logits saved to: {logits_path}")
+                print(f"Accumulator saved to: {accumulator_path}")
 
-                print("\n--- Inspecting Output Store ---")
+                print("\n--- Inspecting Accumulator ---")
                 try:
-                    # Open the zarr store using our helper function
-                    output_store = open_zarr(
+                    # Open the logits zarr store using our helper function
+                    logits_store = open_zarr(
                         path=logits_path,
                         mode='r',
                         storage_options={'anon': False} if logits_path.startswith('s3://') else None
                     )
-                    print(f"Output shape: {output_store.shape}")
-                    print(f"Output dtype: {output_store.dtype}")
-                    print(f"Output chunks: {output_store.chunks}")
+                    print(f"Logits shape: {logits_store.shape}")
+                    print(f"Logits dtype: {logits_store.dtype}")
+                    print(f"Logits chunks: {logits_store.chunks}")
+                    
+                    # Print normalization factor from metadata
+                    if hasattr(logits_store, 'attrs') and 'normalization_factor' in logits_store.attrs:
+                        norm_factor = logits_store.attrs['normalization_factor']
+                        print(f"Normalization factor: {norm_factor:.6f}")
+                    
                 except Exception as inspect_e:
-                    print(f"Could not inspect output Zarr: {inspect_e}")
+                    print(f"Could not inspect accumulator: {inspect_e}")
                 
                 # Print empty patches report if skip_empty_patches was enabled
                 if inferer.skip_empty_patches and hasattr(inferer.dataset, 'get_empty_patches_report'):

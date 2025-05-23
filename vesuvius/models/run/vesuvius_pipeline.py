@@ -35,7 +35,7 @@ def parse_arguments():
     parser.add_argument('--output', type=str, required=True,
                       help='Path for the final output zarr')
     parser.add_argument('--workdir', type=str, 
-                      help='Working directory for intermediate files. Defaults to output_path + "_work"')
+                      help='Working directory for accumulator parts and intermediate files. Defaults to output_path + "_work"')
     
     # Model arguments
     parser.add_argument('--model', type=str, required=True,
@@ -77,7 +77,7 @@ def parse_arguments():
     parser.add_argument('--skip-predict', dest='skip_predict', action='store_true',
                       help='Skip the prediction step (use existing prediction outputs)')
     parser.add_argument('--skip-blend', dest='skip_blend', action='store_true',
-                      help='Skip the blending step (use existing blended outputs)')
+                      help='Skip the boundary merging step (use existing merged outputs)')
     parser.add_argument('--skip-finalize', dest='skip_finalize', action='store_true',
                       help='Skip the finalization step (only generate blended logits)')
     
@@ -225,91 +225,84 @@ def run_predict(args, part_id, gpu_id, z_min=None, z_max=None):
     return True
 
 
-def run_blend(args):
-    """Run the blending step to merge all parts."""
-    cmd = ['vesuvius.blend_logits', args.parts_dir, args.blended_path]
+def run_boundary_merge(args):
+    """Run the boundary merging step for partitioned accumulation."""
+    from models.run.boundary_merger import BoundaryMerger
+    import glob
     
-    
-    if args.quiet:
-        cmd.append('--quiet')
-    
-    # Run the command
-    print(f"Blending parts: {' '.join(cmd)}")
-    
-    # Run with live stdout/stderr streaming for progress bars
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE if args.quiet else None,
-        stderr=subprocess.PIPE if args.quiet else None,
-        universal_newlines=True,
-        bufsize=1  # Line buffered
-    )
-    
-    # Wait for the process to complete
-    returncode = process.wait()
-    
-    if returncode != 0:
-        if args.quiet:
-            stderr = process.stderr.read() if process.stderr else "No error output available"
-            print("Error blending parts:")
-            print(stderr)
-        return False
-    
-    return True
-
-
-def run_finalize(args):
-    # DEBUG: Print threshold flag value before command construction
-    print(f"DEBUG - threshold flag value: {args.threshold}")
-    print(f"DEBUG - threshold flag type: {type(args.threshold)}")
-    print(f"DEBUG - All available args: {vars(args)}")
-    
-    cmd = ['vesuvius.finalize_outputs', args.blended_path, args.output]
-    
-    # Add mode and threshold arguments
-    cmd.extend(['--mode', args.mode])
-    if args.threshold:
-        print(f"DEBUG - Adding --threshold flag to command")
-        cmd.append('--threshold')
+    # Find accumulator directories
+    if args.parts_dir.startswith('s3://'):
+        # For S3, we need to list accumulator directories
+        import fsspec
+        fs = fsspec.filesystem('s3', anon=False)
+        accumulator_paths = []
+        for item in fs.ls(args.parts_dir, detail=False):
+            if 'accumulator_part_' in item:
+                accumulator_paths.append(item)
     else:
-        print(f"DEBUG - NOT adding --threshold flag")
+        # For local paths, use glob
+        accumulator_pattern = os.path.join(args.parts_dir, "accumulator_part_*")
+        accumulator_paths = sorted(glob.glob(accumulator_pattern))
     
-    # Delete intermediates if not keeping them
-    if not args.keep_intermediates:
-        cmd.append('--delete-intermediates')
-    
-    # Add num_workers argument - use all available CPU cores
-    import multiprocessing as mp
-    num_workers = mp.cpu_count()
-    cmd.extend(['--num-workers', str(num_workers)])
-    print(f"Using {num_workers} worker processes for finalization")
-    
-    if args.quiet:
-        cmd.append('--quiet')
-    
-    # Run the command
-    print(f"Finalizing output: {' '.join(cmd)}")
-    
-    # Run with live stdout/stderr streaming for progress bars
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE if args.quiet else None,
-        stderr=subprocess.PIPE if args.quiet else None,
-        universal_newlines=True,
-        bufsize=1  # Line buffered
-    )
-    
-    # Wait for the process to complete
-    returncode = process.wait()
-    
-    if returncode != 0:
-        if args.quiet:
-            stderr = process.stderr.read() if process.stderr else "No error output available"
-            print("Error finalizing output:")
-            print(stderr)
+    if not accumulator_paths:
+        print("No accumulator parts found for merging.")
         return False
     
+    print(f"Found {len(accumulator_paths)} accumulator parts to merge")
+    
+    # Get volume shape from first accumulator
+    first_acc_path = accumulator_paths[0]
+    logits_path = os.path.join(first_acc_path, 'logits')
+    
+    if first_acc_path.startswith('s3://'):
+        import fsspec
+        from data.utils import open_zarr
+        logits_store = open_zarr(logits_path, mode='r', storage_options={'anon': False})
+    else:
+        from data.utils import open_zarr
+        logits_store = open_zarr(logits_path, mode='r')
+    
+    num_classes = logits_store.shape[0]
+    
+    # Get volume shape from metadata of first accumulator
+    y_size = logits_store.shape[2]
+    x_size = logits_store.shape[3]
+    
+    # Get total Z size from partition bounds metadata
+    total_z = 0
+    for acc_path in accumulator_paths:
+        acc_logits_path = os.path.join(acc_path, 'logits')
+        if acc_path.startswith('s3://'):
+            acc_store = open_zarr(acc_logits_path, mode='r', storage_options={'anon': False})
+        else:
+            acc_store = open_zarr(acc_logits_path, mode='r')
+        
+        # Get core region size from metadata
+        if hasattr(acc_store, 'attrs') and 'core_z_end' in acc_store.attrs:
+            core_z_start = acc_store.attrs['core_z_start']
+            core_z_end = acc_store.attrs['core_z_end']
+            total_z = max(total_z, core_z_end)
+    
+    volume_shape = (total_z, y_size, x_size)
+    
+    # Get patch size from args (required parameter)
+    patch_size = tuple(map(int, args.patch_size.split(',')))
+    
+    # Create boundary merger and merge
+    merger = BoundaryMerger(volume_shape, num_classes)
+    
+    print("Merging partition boundaries...")
+    merged_output = merger.merge_partitions(
+        accumulator_paths, 
+        args.output,  # Write directly to final output path
+        patch_size,
+        mode=args.mode,
+        threshold=args.threshold,
+        verbose=not args.quiet
+    )
+    
     return True
+
 
 
 def cleanup(args):
@@ -367,6 +360,122 @@ def setup_multipart(args, num_parts):
     # We're not returning Z-ranges anymore since vesuvius.predict
     # will handle partitioning internally
     return num_parts
+
+
+def run_merge_only():
+    """Run only the boundary merging phase (for distributed processing)."""
+    parser = argparse.ArgumentParser(description="Merge partitioned accumulators into final output")
+    
+    # Input/output arguments
+    parser.add_argument('--accumulator-dir', type=str, required=True,
+                      help='Directory containing accumulator_part_* subdirectories')
+    parser.add_argument('--output', type=str, required=True,
+                      help='Path for the final output zarr')
+    
+    # Processing parameters
+    parser.add_argument('--mode', type=str, choices=['binary', 'multiclass', 'raw'], default='binary',
+                      help='Processing mode. "binary" for 2-class, "multiclass" for >2 classes, "raw" for logits. Default: binary')
+    parser.add_argument('--threshold', action='store_true',
+                      help='Apply thresholding to get binary/class masks instead of probability maps')
+    parser.add_argument('--patch-size', type=str, required=True,
+                      help='Patch size (z,y,x) separated by commas (e.g., "64,64,64")')
+    
+    # Verbosity
+    parser.add_argument('--quiet', action='store_true',
+                      help='Reduce verbosity')
+    
+    args = parser.parse_args()
+    
+    # Parse patch size
+    try:
+        patch_size = tuple(map(int, args.patch_size.split(',')))
+        if len(patch_size) != 3:
+            raise ValueError("Patch size must have 3 dimensions")
+    except Exception as e:
+        print(f"Error parsing patch_size: {e}")
+        print("Expected format: comma-separated integers, e.g. '64,64,64'")
+        return 1
+    
+    # Find accumulator directories
+    if not args.quiet:
+        print(f"Looking for accumulator parts in: {args.accumulator_dir}")
+    
+    import glob
+    if args.accumulator_dir.startswith('s3://'):
+        # Handle S3 paths
+        import fsspec
+        fs = fsspec.filesystem('s3', anon=False)
+        accumulator_paths = []
+        for item in fs.ls(args.accumulator_dir, detail=False):
+            if 'accumulator_part_' in item:
+                accumulator_paths.append(item)
+    else:
+        # Handle local paths
+        accumulator_pattern = os.path.join(args.accumulator_dir, "accumulator_part_*")
+        accumulator_paths = sorted(glob.glob(accumulator_pattern))
+    
+    if not accumulator_paths:
+        print(f"No accumulator parts found in {args.accumulator_dir}")
+        return 1
+    
+    if not args.quiet:
+        print(f"Found {len(accumulator_paths)} accumulator parts")
+    
+    # Get volume shape and classes from first accumulator
+    first_acc_path = accumulator_paths[0]
+    logits_path = os.path.join(first_acc_path, 'logits')
+    
+    if first_acc_path.startswith('s3://'):
+        logits_store = open_zarr(logits_path, mode='r', storage_options={'anon': False})
+    else:
+        logits_store = open_zarr(logits_path, mode='r')
+    
+    num_classes = logits_store.shape[0]
+    y_size = logits_store.shape[2]
+    x_size = logits_store.shape[3]
+    
+    # Calculate total Z size from partition bounds metadata
+    total_z = 0
+    for acc_path in accumulator_paths:
+        acc_logits_path = os.path.join(acc_path, 'logits')
+        if acc_path.startswith('s3://'):
+            acc_store = open_zarr(acc_logits_path, mode='r', storage_options={'anon': False})
+        else:
+            acc_store = open_zarr(acc_logits_path, mode='r')
+        
+        # Get core region size from metadata
+        if hasattr(acc_store, 'attrs') and 'core_z_end' in acc_store.attrs:
+            core_z_end = acc_store.attrs['core_z_end']
+            total_z = max(total_z, core_z_end)
+    
+    volume_shape = (total_z, y_size, x_size)
+    
+    # Create boundary merger and merge
+    merger = BoundaryMerger(volume_shape, num_classes)
+    
+    if not args.quiet:
+        print("Merging partition boundaries...")
+    
+    try:
+        final_output = merger.merge_partitions(
+            accumulator_paths,
+            args.output,
+            patch_size,
+            mode=args.mode,
+            threshold=args.threshold,
+            verbose=not args.quiet
+        )
+        
+        if not args.quiet:
+            print(f"Merging complete! Final output saved to: {final_output}")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"Error during merging: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
 
 
 def run_pipeline():
@@ -428,9 +537,9 @@ def run_pipeline():
                 print("Prediction failed. Aborting pipeline.")
                 return 1
     
-    # Blending step
+    # Boundary merging step
     if not args.skip_blend:
-        print("\n--- Step 2: Blending ---")
+        print("\n--- Step 2: Boundary Merging ---")
         
         # Check if parts directory exists and has contents (handle S3 paths)
         if args.parts_dir.startswith('s3://'):
@@ -446,31 +555,13 @@ def run_pipeline():
             print("No prediction parts found. Please run the prediction step first.")
             return 1
         
-        success = run_blend(args)
+        success = run_boundary_merge(args)
         if not success:
-            print("Blending failed. Aborting pipeline.")
-            return 1
-    
-    # Finalization step
-    if not args.skip_finalize:
-        print("\n--- Step 3: Finalization ---")
-        
-        # Check if blended path exists (handle S3 paths)
-        if args.blended_path.startswith('s3://'):
-            import fsspec
-            fs = fsspec.filesystem('s3', anon=False)
-            blended_exists = fs.exists(args.blended_path)
-        else:
-            blended_exists = os.path.exists(args.blended_path)
-            
-        if not blended_exists:
-            print("No blended data found. Please run the blending step first.")
+            print("Boundary merging failed. Aborting pipeline.")
             return 1
         
-        success = run_finalize(args)
-        if not success:
-            print("Finalization failed.")
-            return 1
+        print("\n--- Processing Complete ---")
+        print(f"Final output written directly to: {args.output}")
     
     # Final cleanup
     cleanup(args)

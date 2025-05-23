@@ -275,17 +275,34 @@ class VCDataset(Dataset):
             if self.num_parts > 1:
                 max_z = image_size[0]
                 z_per_part = max_z / self.num_parts
-                z_start = int(z_per_part * self.part_id)
-                z_end = int(z_per_part * (self.part_id + 1)) if self.part_id < self.num_parts - 1 else max_z
+                
+                # Calculate core boundaries (non-overlapping regions)
+                core_z_start = int(z_per_part * self.part_id)
+                core_z_end = int(z_per_part * (self.part_id + 1)) if self.part_id < self.num_parts - 1 else max_z
+                
+                # Calculate overlap size (50% of patch Z dimension for Gaussian blending)
+                overlap_size = pZ // 2
+                
+                # Expand boundaries to include overlaps with neighboring partitions
+                z_start = max(0, core_z_start - overlap_size) if self.part_id > 0 else core_z_start
+                z_end = min(max_z, core_z_end + overlap_size) if self.part_id < self.num_parts - 1 else core_z_end
 
                 if self.verbose:
-                    print(f"\nApplying Z-axis partitioning:")
+                    print(f"\nApplying Z-axis partitioning with 50% overlap:")
                     print(f"  Num Parts: {self.num_parts}, Part ID: {self.part_id}")
-                    print(f"  Z Range for this part: [{z_start}, {z_end})")
+                    print(f"  Core Z Range (non-overlapping): [{core_z_start}, {core_z_end})")
+                    print(f"  Expanded Z Range (with overlap): [{z_start}, {z_end})")
+                    print(f"  Overlap size: {overlap_size} voxels")
 
-                # Filter positions based on the patch *starting* coordinate
-                # A patch belongs to the partition its starting Z coordinate falls into.
-                # This is simpler than checking overlap and ensures non-overlapping assignment.
+                # Store partition bounds for accumulator coordinate mapping
+                self.core_z_start = core_z_start
+                self.core_z_end = core_z_end
+                self.expanded_z_start = z_start
+                self.expanded_z_end = z_end
+                self.overlap_size = overlap_size
+
+                # Filter positions based on the patch *starting* coordinate in expanded range
+                # Patches in overlap regions will be processed by multiple partitions
                 original_count = len(self.all_positions)
                 self.all_positions = [pos for pos in self.all_positions if z_start <= pos[0] < z_end]
                 filtered_count = len(self.all_positions)
@@ -296,6 +313,13 @@ class VCDataset(Dataset):
                          print(f"  Part {self.part_id} Z-range of positions: [{self.all_positions[0][0]} - {self.all_positions[-1][0]}]")
                     else:
                          print(f"  Warning: No patch starting positions found in the Z-range [{z_start}, {z_end}) for part {self.part_id}.")
+            else:
+                # Single partition - store bounds for consistency
+                self.core_z_start = 0
+                self.core_z_end = image_size[0]
+                self.expanded_z_start = 0
+                self.expanded_z_end = image_size[0]
+                self.overlap_size = 0
 
 
     def set_distributed(self, rank: int, world_size: int):
@@ -336,6 +360,39 @@ class VCDataset(Dataset):
 
         self.all_positions = assigned_positions
 
+    def get_partition_bounds(self):
+        """Return the Z-bounds for this partition (core and expanded regions)"""
+        if hasattr(self, 'core_z_start'):
+            return {
+                'core_z_start': self.core_z_start,
+                'core_z_end': self.core_z_end,
+                'expanded_z_start': self.expanded_z_start,
+                'expanded_z_end': self.expanded_z_end,
+                'overlap_size': self.overlap_size
+            }
+        else:
+            # Single partition or no partitioning
+            max_z = self.input_shape[0] if len(self.input_shape) == 3 else self.input_shape[1]
+            return {
+                'core_z_start': 0,
+                'core_z_end': max_z,
+                'expanded_z_start': 0,
+                'expanded_z_end': max_z,
+                'overlap_size': 0
+            }
+
+    def global_to_local_coords(self, global_coords):
+        """Convert global volume coordinates to partition-local coordinates"""
+        bounds = self.get_partition_bounds()
+        z_global, y_global, x_global = global_coords
+        z_local = z_global - bounds['expanded_z_start']
+        return (z_local, y_global, x_global)
+
+    def is_in_core_region(self, global_coords):
+        """Check if coordinates are in this partition's core (non-overlapping) region"""
+        bounds = self.get_partition_bounds()
+        z_global, y_global, x_global = global_coords
+        return bounds['core_z_start'] <= z_global < bounds['core_z_end']
 
     def __len__(self):
         return len(self.all_positions)
