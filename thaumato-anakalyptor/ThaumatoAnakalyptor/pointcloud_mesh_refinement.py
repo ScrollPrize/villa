@@ -44,8 +44,8 @@ def load_mesh(mesh_file):
 def load_pointcloud_slab(slab_path):
     # Open the npz file
     with open(slab_path, 'rb') as f:
-        npzfile = np.load(f)
-        points = npzfile['points']
+        numpyfile = np.load(f)
+        points = numpyfile['points']
     return points
 
 def save_winding_pointcloud(winding_path, winding_nr, points):
@@ -53,9 +53,21 @@ def save_winding_pointcloud(winding_path, winding_nr, points):
     os.makedirs(winding_path, exist_ok=True)
     # Save the winding pointcloud
     file_path = os.path.join(winding_path, f"winding_{int(winding_nr)}.npz")
-    points_prev = np.zeros((0, 4), dtype=np.float16)
+    # Load existing points if any, else create empty array matching new data shape
+    points = np.asarray(points)
     if os.path.exists(file_path):
-        points_prev = np.load(file_path)['points']
+        data = np.load(file_path)
+        points_prev = data.get('points')
+        # Ensure dimensions match
+        if points_prev.ndim != 2 or points_prev.shape[1] != points.shape[1]:
+            raise ValueError(
+                f"Dimension mismatch in save_winding_pointcloud: existing points have shape {points_prev.shape}, "
+                f"new points have shape {points.shape}."
+            )
+    else:
+        # initialize empty array with same number of columns
+        points_prev = np.zeros((0, points.shape[1]), dtype=points.dtype)
+    # concatenate and dedupe
     points = np.concatenate((points_prev, points), axis=0)
     points = np.unique(points, axis=0)
     np.savez_compressed(file_path, points=points)
@@ -110,7 +122,7 @@ def clean_winding_dicts(winding_range, flattened_winding_path, winding_files_ind
 
 def subsample_min_dist(points, r):
     """
-    Greedy “pack” subsampling: once a point is kept, all its neighbors
+    Greedy "pack" subsampling: once a point is kept, all its neighbors
     within r get excluded from future consideration.
     
     Args:
@@ -171,7 +183,7 @@ def filter_by_density(points, selected_indices, r, n):
 
 def filter_by_density_mad(points, selected_indices, r, k=3.0):
     """
-    MAD‐based outlier removal on neighbor counts in UV‐space.
+    MAD-based outlier removal on neighbor counts in UV-space.
 
     For each index in `selected_indices`, count how many points lie
     within radius `r`.  Compute the median (m) and MAD of those counts,
@@ -179,7 +191,7 @@ def filter_by_density_mad(points, selected_indices, r, k=3.0):
     > T.
 
     Args:
-        points:           (N,2) array‐like of 2D coords
+        points:           (N,2) array-like of 2D coords
         selected_indices: list of int, indices to test
         r:                float, radius for neighbor counting
         k:                float, MAD multiplier (default=5.0)
@@ -191,7 +203,7 @@ def filter_by_density_mad(points, selected_indices, r, k=3.0):
     pts = np.asarray(points, dtype=float)
     tree = cKDTree(pts)
 
-    # batch query neighbor‐lists
+    # batch query neighbor-lists
     neighbor_lists = tree.query_ball_point(pts[selected_indices], r)
     counts = np.array([len(nbrs) for nbrs in neighbor_lists], dtype=float)
 
@@ -218,18 +230,18 @@ def refine_by_medoid(points, uvs, selected_indices, r_uv):
     """
     For each index in selected_indices:
       1) Find all points whose UV coords lie within r_uv of its UV.
-      2) In that UV‐neighborhood, compute the median of the 3D coords.
+      2) In that UV-neighborhood, compute the median of the 3D coords.
       3) Pick the neighbor whose 3D coordinate is closest to that median.
 
     Args:
-        points:           array‐like of shape (N, ≥3), original 3D coords in [:,:3]
-        uvs:              array‐like of shape (N, 2), original UV coords
+        points:           array-like of shape (N, ≥3), original 3D coords in [:,:3]
+        uvs:              array-like of shape (N, 2), original UV coords
         selected_indices: list of int, indices into points/uvs to refine
         r_uv:             float, search radius in UV space
 
     Returns:
         refined_indices: list of int, same length as selected_indices,
-                         each replaced by its local 3D “medoid” index
+                         each replaced by its local 3D "medoid" index
     """
     pts3 = np.asarray(points, dtype=float)[:, :3]
     uvs2 = np.asarray(uvs,    dtype=float)
@@ -237,10 +249,10 @@ def refine_by_medoid(points, uvs, selected_indices, r_uv):
 
     refined = []
     for idx in selected_indices:
-        # 1) UV‐space neighbors
+        # 1) UV-space neighbors
         nbrs = tree_uv.query_ball_point(uvs2[idx], r_uv)
         if not nbrs:
-            # no UV‐neighbors? keep the original
+            # no UV-neighbors? keep the original
             refined.append(idx)
             continue
 
@@ -269,11 +281,11 @@ def filter_by_edge_error(points, uvs, refined_indices, r_uv, thr):
       5) Return only i with mean_err_i ≤ thr.
 
     Args:
-        points:           array‐like (N, ≥3) of original 3D coords
-        uvs:              array‐like (N, 2)   of original UV coords
+        points:           array-like (N, ≥3) of original 3D coords
+        uvs:              array-like (N, 2)   of original UV coords
         refined_indices:  list[int], indices to evaluate
         r_uv:             float, search radius in UV space
-        thr:              float, maximum allowed mean edge‐error
+        thr:              float, maximum allowed mean edge-error
 
     Returns:
         kept_indices: list[int], subset of refined_indices with mean_error ≤ thr
@@ -285,7 +297,7 @@ def filter_by_edge_error(points, uvs, refined_indices, r_uv, thr):
 
     error_list = []
     for i in refined_indices:
-        # 1) UV‐space neighbors
+        # 1) UV-space neighbors
         nbrs = tree_uv.query_ball_point(uvs2[i], r_uv)
         if not nbrs:
             mean_err = 0.0
@@ -371,11 +383,34 @@ def filter_by_edge_error_mad(points, uvs, refined_indices, r_uv, k=3.0):
 
     return kept_indices, error_list
 
-def display_3d_pointcloud(points):
-    # interactive 3d visualization of the downsampled points with matplotlib
+def display_3d_pointcloud(points, color_by_angle=False, downsample_ratio=0.1):
+    """
+    Interactive 3D visualization of points.
+    If points has a 4th column, it is interpreted as angle in degrees.
+    color_by_angle: if True and angle data present, color points by angle (HSV colormap).
+    downsample_ratio: fraction [0..1] of points to randomly keep for display.
+    """
+    pts = np.asarray(points)
+    # extract angles if present
+    angles = None
+    if pts.ndim == 2 and pts.shape[1] > 3:
+        angles = pts[:, 3]
+    coords = pts[:, :3]
+    # random downsampling for interactive display
+    if 0.0 < downsample_ratio < 1.0:
+        mask = np.random.rand(len(coords)) < downsample_ratio
+        coords = coords[mask]
+        if angles is not None:
+            angles = angles[mask]
     fig = plt.figure()
     ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=1)
+    if color_by_angle and angles is not None:
+        sc = ax.scatter(coords[:, 0], coords[:, 1], coords[:, 2], c=angles,
+                        cmap='hsv', s=1)
+        cbar = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label('Angle (deg)')
+    else:
+        ax.scatter(coords[:, 0], coords[:, 1], coords[:, 2], s=1)
     ax.set_title("Points 3D")
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
@@ -440,7 +475,10 @@ def clean_mesh(mesh,
 
 ### Logic Functions ###
     
-def generate_winding_pointclouds(mesh_path):
+def generate_winding_pointclouds(mesh_path,
+                               display=False,
+                               display_downsample=0.5,
+                               color_by_angle=False):
     vertices, (has_points, angles) = load_mesh(mesh_path)
     angles = np.reshape(angles, (-1, 1))
     print(f"Shape of vertices: {vertices.shape} and of angles: {angles.shape}")
@@ -461,6 +499,8 @@ def generate_winding_pointclouds(mesh_path):
         # From TA to original coordinates
         points = shuffling_points_axis(points)
         points[:, :3] = points[:, :3] * 4.0 - 500
+        # To original winding angle
+        points[:, 3] = points[:, 3] + 90
         # Append source flag: 0 for slab points
         slab_flags = np.zeros((points.shape[0], 1), dtype=points.dtype)
         points = np.concatenate((points, slab_flags), axis=1)
@@ -480,6 +520,11 @@ def generate_winding_pointclouds(mesh_path):
             winding_points = points[np.logical_and(points[:, 3] >= winding_angle, points[:, 3] < winding_angle + 360.0)]
             if len(winding_points) > 0:
                 save_winding_pointcloud(os.path.join(base_path, "windings"), winding_nr, winding_points)
+                if display:
+                    print(f"Displaying winding {winding_nr} (loaded {winding_points.shape[0]} points)")
+                    display_3d_pointcloud(winding_points,
+                                         color_by_angle=color_by_angle,
+                                         downsample_ratio=display_downsample)
 
 def build_neighbor_graph(coords,
                          angles=None,
@@ -528,7 +573,7 @@ def build_neighbor_graph(coords,
         is_mesh = np.asarray(is_mesh, dtype=bool)
         if is_mesh.shape[0] != n:
             raise ValueError(f"is_mesh must have length {n}, got {is_mesh.shape[0]}")
-    # First KD-tree: spatial + optional angular
+    # First KD-tree: spatial + optional angular (query from all points)
     if angle_weight is not None and angles is not None:
         angs = np.asarray(angles, dtype=float).reshape(-1, 1) * angle_weight
         tree_input = np.hstack((pts, angs))
@@ -536,6 +581,7 @@ def build_neighbor_graph(coords,
         tree_input = pts
     tree1 = cKDTree(tree_input)
     _, idx1 = tree1.query(tree_input, k=k_neighbors + 1)
+    
     # Combine neighbor indices (single KD-tree)
     combined = idx1
     # Compute true distances based on spatial coords
@@ -555,7 +601,7 @@ def build_neighbor_graph(coords,
     n = pts.shape[0]
     neighbor_lists = [[] for _ in range(n)]
     distance_lists = [[] for _ in range(n)]
-    # Build undirected edges
+    # Build undirected edges (from all points)
     for i in range(n):
         valid = neigh_ids[i] != -1
         nb = neigh_ids[i][valid]
@@ -565,16 +611,25 @@ def build_neighbor_graph(coords,
         for j, d in zip(nb, db):
             neighbor_lists[j].append(i)
             distance_lists[j].append(d)
-    # Additional cross-bin connectivity: angle bins and z bins
+    # Additional cross-bin connectivity: angle bins and z bins (REACTIVATED)
     # Angle-based cross connectivity: connect nearest neighbors in adjacent angle bins
     if angles is not None and angle_bin_size > 0 and angle_bin_k > 0:
+        print(f"Building angle-based cross-bin connectivity (bin_size={angle_bin_size}, k={angle_bin_k})...")
         bin_idx = np.floor(angle_vals / angle_bin_size).astype(int)
         bins = {}
         for idx, b in enumerate(bin_idx):
             bins.setdefault(b, []).append(idx)
+        print(f"Created {len(bins)} angle bins")
+        
         # build KD-tree per angle bin
         bin_trees = {b: cKDTree(pts[ids]) for b, ids in bins.items() if len(ids) >= 1}
-        for i, b in enumerate(bin_idx):
+        connections_added = 0
+        
+        mesh_indices = np.nonzero(is_mesh)[0]
+        print(f"Processing {len(mesh_indices)} mesh points for angle-based connectivity...")
+        
+        for i in mesh_indices:
+            b = bin_idx[i]
             # connect across two adjacent angular bins on each side
             for b2 in (b - 2, b - 1, b + 1, b + 2):
                 if b2 in bin_trees:
@@ -597,15 +652,27 @@ def build_neighbor_graph(coords,
                         distance_lists[i].append(d)
                         neighbor_lists[j].append(i)
                         distance_lists[j].append(d)
+                        connections_added += 1
+        print(f"Added {connections_added} angle-based cross-bin connections")
+        
     # Z-based cross connectivity: connect nearest neighbors in adjacent z bins
     if z_bin_size > 0 and z_bin_k > 0:
+        print(f"Building Z-based cross-bin connectivity (bin_size={z_bin_size}, k={z_bin_k})...")
         z_vals = pts[:, 2]
         z_idx = np.floor(z_vals / z_bin_size).astype(int)
         zbins = {}
         for idx, zb in enumerate(z_idx):
             zbins.setdefault(zb, []).append(idx)
+        print(f"Created {len(zbins)} Z bins")
+        
         z_trees = {zb: cKDTree(pts[ids]) for zb, ids in zbins.items() if len(ids) >= 1}
-        for i, zb in enumerate(z_idx):
+        z_connections_added = 0
+        
+        mesh_indices = np.nonzero(is_mesh)[0]
+        print(f"Processing {len(mesh_indices)} mesh points for Z-based connectivity...")
+        
+        for i in mesh_indices:
+            zb = z_idx[i]
             for zb2 in (zb - 1, zb + 1):
                 if zb2 in z_trees:
                     ids = zbins[zb2]
@@ -627,28 +694,30 @@ def build_neighbor_graph(coords,
                         distance_lists[i].append(d)
                         neighbor_lists[j].append(i)
                         distance_lists[j].append(d)
-    # Random additional connectivity around mesh points
-    if angle_vals is not None:
-        # for each mesh point, connect to random neighbors within angle/z window
-        mesh_indices = np.nonzero(is_mesh)[0]
-        for i in mesh_indices:
-            # select by angle and z proximity
-            dz = np.abs(pts[:, 2] - pts[i, 2])
-            da = np.abs(angle_vals - angle_vals[i])
-            mask = (dz <= random_z_thresh) & (da <= random_angle_thresh)
-            mask[i] = False
-            eligible = np.nonzero(mask)[0]
-            if eligible.size > 0:
-                if eligible.size > random_k:
-                    chosen = np.random.choice(eligible, size=random_k, replace=False)
-                else:
-                    chosen = eligible
-                for j in chosen:
-                    d = np.linalg.norm(pts[i] - pts[j])
-                    neighbor_lists[i].append(int(j))
-                    distance_lists[i].append(float(d))
-                    neighbor_lists[j].append(int(i))
-                    distance_lists[j].append(float(d))
+                        z_connections_added += 1
+        print(f"Added {z_connections_added} Z-based cross-bin connections")
+    # Random additional connectivity around mesh points - DEACTIVATED
+    # if angle_vals is not None:
+    #     # for each mesh point, connect to random neighbors within angle/z window
+    #     mesh_indices = np.nonzero(is_mesh)[0]
+    #     for i in mesh_indices:
+    #         # select by angle and z proximity
+    #         dz = np.abs(pts[:, 2] - pts[i, 2])
+    #         da = np.abs(angle_vals - angle_vals[i])
+    #         mask = (dz <= random_z_thresh) & (da <= random_angle_thresh)
+    #         mask[i] = False
+    #         eligible = np.nonzero(mask)[0]
+    #         if eligible.size > 0:
+    #             if eligible.size > random_k:
+    #                 chosen = np.random.choice(eligible, size=random_k, replace=False)
+    #             else:
+    #                 chosen = eligible
+    #             for j in chosen:
+    #                 d = np.linalg.norm(pts[i] - pts[j])
+    #                 neighbor_lists[i].append(int(j))
+    #                 distance_lists[i].append(float(d))
+    #                 neighbor_lists[j].append(int(i))
+    #                 distance_lists[j].append(float(d))
     # Ensure uniqueness, preserve all edges
     for i in range(n):
         ids = neighbor_lists[i]
@@ -659,22 +728,35 @@ def build_neighbor_graph(coords,
         ds = [ds[k] for k in sorted(uniq_idx)]
         neighbor_lists[i] = ids
         distance_lists[i] = ds
-    # Filter out any edges with Euclidean distance > 100.0
-    max_spatial_dist = 100.0
-    for i in range(n):
-        ids = neighbor_lists[i]
-        ds = distance_lists[i]
-        filtered_ids = []
-        filtered_ds = []
-        for j, d in zip(ids, ds):
-            if d <= max_spatial_dist:
-                filtered_ids.append(j)
-                filtered_ds.append(d)
-        neighbor_lists[i] = filtered_ids
-        distance_lists[i] = filtered_ds
+    # Distance filtering removed as requested
+    # max_spatial_dist = 100.0
+    # print(f"Filtering edges by distance (max={max_spatial_dist})...")
+    # total_edges_before = sum(len(neighbors) for neighbors in neighbor_lists)
+    # 
+    # for i in range(n):
+    #     ids = neighbor_lists[i]
+    #     ds = distance_lists[i]
+    #     filtered_ids = []
+    #     filtered_ds = []
+    #     for j, d in zip(ids, ds):
+    #         if d <= max_spatial_dist:
+    #             filtered_ids.append(j)
+    #             filtered_ds.append(d)
+    #     neighbor_lists[i] = filtered_ids
+    #     distance_lists[i] = filtered_ds
+    # 
+    # total_edges_after = sum(len(neighbors) for neighbors in neighbor_lists)
+    # print(f"Distance filtering: {total_edges_before} -> {total_edges_after} edges (removed {total_edges_before - total_edges_after})")
     return neighbor_lists, distance_lists
 
-def flatten_pointcloud(base_path, k_neighbors=6, angle_threshold=40, angle_weight=0.2, downsample_ratio=0.5, display=False):
+def flatten_pointcloud(base_path,
+                       k_neighbors=6,
+                       angle_threshold=40,
+                       angle_weight=0.2,
+                       downsample_ratio=0.1,
+                       display=False,
+                       display_downsample=0.1,
+                       color_by_angle=False):
     """
     Flatten pointcloud by concatenating winding segments and building neighbor graphs.
 
@@ -699,6 +781,33 @@ def flatten_pointcloud(base_path, k_neighbors=6, angle_threshold=40, angle_weigh
     winding_files_indices = sorted([int(os.path.basename(wf).split("_")[1].split(".")[0]) for wf in winding_files])
     winding_files = [os.path.join(winding_path, f"winding_{i}.npz") for i in winding_files_indices]
 
+    # Detect first and last windings with mesh vertices
+    print("Scanning windings to find those with mesh vertices...")
+    windings_with_mesh = []
+    for i, winding_idx in enumerate(winding_files_indices):
+        try:
+            points = load_winding_pointcloud(winding_path, winding_idx)
+            if points.shape[1] >= 5:  # Check if mesh flags exist (5th dimension)
+                is_mesh_flags = points[:, 4].astype(bool)
+                if np.any(is_mesh_flags):  # If any mesh vertices exist
+                    windings_with_mesh.append(winding_idx)
+                    print(f"  Winding {winding_idx}: {np.sum(is_mesh_flags)} mesh vertices found")
+        except Exception as e:
+            print(f"  Warning: Could not load winding {winding_idx}: {e}")
+            continue
+    
+    if len(windings_with_mesh) == 0:
+        print("No windings with mesh vertices found. Exiting.")
+        return flattened_winding_path
+    
+    first_mesh_winding = windings_with_mesh[0]
+    last_mesh_winding = windings_with_mesh[-1]
+    print(f"Will process windings {first_mesh_winding} to {last_mesh_winding} (contains mesh vertices)")
+    
+    # Find the start and end indices in the winding_files_indices array
+    first_mesh_idx = winding_files_indices.index(first_mesh_winding)
+    last_mesh_idx = winding_files_indices.index(last_mesh_winding)
+
     # initialize storage for previous flattened coordinates per winding
     prev_uvs_u = {}
     prev_uvs_v = {}
@@ -708,8 +817,17 @@ def flatten_pointcloud(base_path, k_neighbors=6, angle_threshold=40, angle_weigh
     winding_us = None
     winding_vs = None
     for start in range(0, len(winding_files)):
-        if start < 27: # for debug, leave it for now
+        # if start < 27: # for debug, leave it for now
+        #     continue
+        
+        # Skip if before first mesh winding or after last mesh winding
+        if start < first_mesh_idx:
+            print(f"Skipping winding {start} (before first mesh winding)")
             continue
+        if start > last_mesh_idx:
+            print(f"Finished processing: reached winding {start} (past last mesh winding)")
+            break
+            
         end = min(start + winding_width, len(winding_files))
         print(f"Processing windings {start} to {end}: {winding_files[start:end]}")
         # load and concatenate pointcloud segments (points include x,y,z,angle)
@@ -723,12 +841,23 @@ def flatten_pointcloud(base_path, k_neighbors=6, angle_threshold=40, angle_weigh
             else:
                 print(f"Loading winding pointcloud {wnr} from {winding_path}")
                 points_ = load_winding_pointcloud(winding_path, wnr)
+                # trim z-range: remove 50 units from top and bottom
+                z_vals = points_[:, 2]
+                z_min, z_max = z_vals.min(), z_vals.max()
+                z_low, z_high = z_min + 50.0, z_max - 50.0
+                mask_z = (z_vals >= z_low) & (z_vals <= z_high)
+                before_n = points_.shape[0]
+                points_ = points_[mask_z]
+                after_n = points_.shape[0]
+                print(f"Trimmed wrap {wnr}: z [{z_min:.2f},{z_max:.2f}] -> keeping [{z_low:.2f},{z_high:.2f}], {after_n}/{before_n} points")
                 # random downsampling of newly loaded points
                 if downsample_ratio < 1.0:
                     mask = np.random.rand(points_.shape[0]) < downsample_ratio
                     points_ = points_[mask]
                 if display:
-                    display_3d_pointcloud(points_[:, :3]) # Debug visualization
+                    # Display 3D pointcloud, optionally colored by angle
+                    display_3d_pointcloud(points_, color_by_angle=color_by_angle,
+                                        downsample_ratio=display_downsample)
             pcs.append(np.array(points_))
         try:
             min_angles = [np.min(pc[:, 3]) for pc in pcs]
@@ -821,9 +950,9 @@ def flatten_pointcloud(base_path, k_neighbors=6, angle_threshold=40, angle_weigh
         print("Set up the graph")
         # always fix mesh points to anchor their original positions
         mesh_idx = np.nonzero(is_mesh_flags)[0].tolist()
-        if mesh_idx:
-            solver.fix_nodes(mesh_idx)
-            print(f"Fixed {len(mesh_idx)} mesh-point nodes to original positions.")
+        # if mesh_idx:
+        #     solver.fix_nodes(mesh_idx)
+        #     print(f"Fixed {len(mesh_idx)} mesh-point nodes to original positions.")
         # fix nodes of the first winding if it has been previously computed
         start_wrap_nr = winding_files_indices[start]
         first_count = winding_indices[0]
@@ -846,10 +975,15 @@ def flatten_pointcloud(base_path, k_neighbors=6, angle_threshold=40, angle_weigh
         zero_ranges_initial = [(min_angle + index * a_step, min_angle + (index+1)*a_step) for index in range(winding_width)]
         zero_ranges_fine = [(min_angle + (index + 0.4) * a_step, min_angle + (index+0.6)*a_step) for index in range(winding_width)]
         solver.solve_flattening(num_iterations=20000, visualize=True, angle_tug_min=min_angle+90, angle_tug_max=max_angle-90, z_tug_min=z_min+100, z_tug_max=z_max-100, tug_step=0.5, zero_ranges=zero_ranges_initial)
+        # Print min/max of UVs after first solve
+        uvs_initial = np.array(solver.get_uvs())
+        print(f"After first solve_flattening: u min={uvs_initial[:,0].min()}, u max={uvs_initial[:,0].max()}, v min={uvs_initial[:,1].min()}, v max={uvs_initial[:,1].max()}")
         solver.solve_flattening(num_iterations=150000, visualize=True, zero_ranges=zero_ranges, tug_step=0.0005)
         undeleted_indices = np.array(solver.get_undeleted_indices())
         
         uvs = np.array(solver.get_uvs())
+        # Print min/max of UVs after second solve
+        print(f"After second solve_flattening: u min={uvs[:,0].min()}, u max={uvs[:,0].max()}, v min={uvs[:,1].min()}, v max={uvs[:,1].max()}")
         winding_us = []
         winding_vs = []
         w_i = 0
@@ -880,22 +1014,46 @@ def flatten_pointcloud(base_path, k_neighbors=6, angle_threshold=40, angle_weigh
     clean_winding_dicts((0, 0), flattened_winding_path, winding_files_indices, prev_uvs_u, prev_uvs_v, prev_points)
     return flattened_winding_path
 
-def grid_uv_flattened(flattened_winding_path, subsample_radius=3.0, display=False):
+def grid_uv_flattened(flattened_winding_path,
+                       subsample_radius=3.0,
+                       display=False,
+                       display_downsample=0.1,
+                       color_by_angle=False):
     winding_filtered_path = os.path.join(os.path.dirname(flattened_winding_path), "windings_filtered")
     # find and order all winding pointclouds
     winding_files = glob.glob(os.path.join(flattened_winding_path, "flattened_winding_*.npz"))
-    print(f"Found {len(winding_files)} flattened winding pointclouds.")
+    print(f"Found {len(winding_files)} flattened winding pointclouds for grid sampling the uv space.")
     # Bring the files in order of their winding number
     winding_files_indices = sorted([int(os.path.basename(wf).split("_")[2].split(".")[0]) for wf in winding_files])
-    winding_files_indices = winding_files_indices[5:]
     winding_files = [os.path.join(flattened_winding_path, f"flattened_winding_{i}.npz") for i in winding_files_indices]
+    print(f"Will process {len(winding_files)} flattened winding pointclouds for grid sampling the uv space.")
     # Load each wrap, subsample
     for i in range(len(winding_files)):
         points, uvs = load_flattened_winding(flattened_winding_path, winding_files_indices[i])
+        
+        # Filter out mesh points (keep only slab points)
+        if points.shape[1] >= 5:  # Check if mesh flags exist (5th dimension)
+            is_mesh_flags = points[:, 4].astype(bool)
+            slab_mask = ~is_mesh_flags  # Keep non-mesh points (slab points)
+            points_before = points.shape[0]
+            points = points[slab_mask]
+            uvs = uvs[slab_mask]
+            points_after = points.shape[0]
+            print(f"Filtered out mesh points from {winding_files[i]}: {points_before} -> {points_after} points")
+        else:
+            print(f"Warning: No mesh flags found in {winding_files[i]}, keeping all points")
+        
+        # Skip processing if no points (check immediately after filtering)
+        if points.shape[0] == 0 or uvs.shape[0] == 0:
+            print(f"Skipping {winding_files[i]} - no points to process after filtering")
+            save_flattened_winding(winding_filtered_path, winding_files_indices[i], points, uvs)
+            continue
+            
         save_pointcloud_winding(winding_filtered_path, winding_files_indices[i], points)
         # display_3d_pointcloud(points)
         # subsample
         print(f"Subsampling {winding_files[i]} with {points.shape[0]} points")
+        
         print(f"Min max uvs: {np.min(uvs[:, 0])}, {np.max(uvs[:, 0])}, {np.min(uvs[:, 1])}, {np.max(uvs[:, 1])}")
         kept_indices = subsample_min_dist(uvs, subsample_radius)
         print(f"Subsampled {winding_files[i]} to {len(kept_indices)} points")
@@ -906,7 +1064,7 @@ def grid_uv_flattened(flattened_winding_path, subsample_radius=3.0, display=Fals
         uvs_subsampled = uvs[kept_indices]
         print(f"Subsampled {winding_files[i]} to {points_subsampled.shape[0]} points")
         if display:
-            # display  with matplotlib. 2 2d views. left ioriginal uv, right subsampled uv. then another window for 3d subsampled and original
+            # display  with matplotlib: 2D UV and point plots
             fig, axs = plt.subplots(2, 2, figsize=(10, 10))
             axs[0, 0].scatter(uvs[:, 0], uvs[:, 1], s=1)
             axs[0, 0].set_title("Original UVs")
@@ -917,21 +1075,27 @@ def grid_uv_flattened(flattened_winding_path, subsample_radius=3.0, display=Fals
             axs[1, 1].scatter(points_subsampled[:, 0], points_subsampled[:, 1], s=1)
             axs[1, 1].set_title("Subsampled Points")
             plt.show()
-
-            display_3d_pointcloud(points_subsampled)
+            # 3D display, optional coloring by angle
+            display_3d_pointcloud(points_subsampled,
+                                  color_by_angle=color_by_angle,
+                                  downsample_ratio=display_downsample)
 
         kept_indices = refine_by_medoid(points, uvs, kept_indices, subsample_radius)
         points_subsampled = points[kept_indices]
         uvs_subsampled = uvs[kept_indices]
         if display:
-            display_3d_pointcloud(points_subsampled)
+            display_3d_pointcloud(points_subsampled,
+                                  color_by_angle=color_by_angle,
+                                  downsample_ratio=display_downsample)
 
         # kept_indices, errors = filter_by_edge_error(points[:,:3], uvs, kept_indices, 10 * subsample_radius, int(1.5*subsample_radius))
         kept_indices, errors = filter_by_edge_error_mad(points[:,:3], uvs, kept_indices, 10 * subsample_radius, k=5.0) # automatic threshold finding
         points_subsampled = points[kept_indices]
         uvs_subsampled = uvs[kept_indices]
         if display:
-            display_3d_pointcloud(points_subsampled)
+            display_3d_pointcloud(points_subsampled,
+                                  color_by_angle=color_by_angle,
+                                  downsample_ratio=display_downsample)
 
         save_flattened_winding(winding_filtered_path, winding_files_indices[i], points_subsampled, uvs_subsampled)
 
@@ -943,7 +1107,7 @@ def mesh_uv_wraps(filtered_winding_path, output_dir):
       3) Build an Open3D TriangleMesh:
            - vertices = 3D points
            - triangles = simplices
-           - triangle_uvs = flattened per‐triangle UV coords
+           - triangle_uvs = flattened per-triangle UV coords
       4) Save as OBJ with UVs in `output_dir/wrap_<nr>.obj`
 
     Args:
@@ -955,10 +1119,9 @@ def mesh_uv_wraps(filtered_winding_path, output_dir):
 
     # grab all filtered wraps
     winding_flattened_files = glob.glob(os.path.join(filtered_winding_path, "flattened_winding_*.npz"))
-    print(f"Found {len(winding_flattened_files)} flattened winding pointclouds.")
+    print(f"Found {len(winding_flattened_files)} flattened winding pointclouds to mesh uv wraps.")
     # Bring the files in order of their winding number
     winding_flattened_files_indices = sorted([int(os.path.basename(wf).split("_")[2].split(".")[0]) for wf in winding_flattened_files])
-    winding_flattened_files_indices = winding_flattened_files_indices[5:]
     winding_flattened_files = [os.path.join(filtered_winding_path, f"flattened_winding_{i}.npz") for i in winding_flattened_files_indices]
     for fp in winding_flattened_files:
         nr = int(os.path.basename(fp).split("_")[-1].split(".")[0])
@@ -967,9 +1130,19 @@ def mesh_uv_wraps(filtered_winding_path, output_dir):
         winding_angles = data["points"][:, 3].astype(np.float64)
         uvs2 = data["uvs"].astype(np.float64)
 
+        # Skip if no points to mesh
+        if len(pts3) == 0 or len(uvs2) == 0:
+            print(f"Skipping wrap {nr} - no points to mesh")
+            continue
+            
+        # Check if we have enough points for Delaunay triangulation
+        if len(uvs2) < 3:
+            print(f"Skipping wrap {nr} - insufficient points for triangulation: {len(uvs2)}")
+            continue
+
         # 2D Delaunay in UV space
         tri = Delaunay(uvs2)
-        faces = tri.simplices  # M×3 array of vertex‐indices
+        faces = tri.simplices  # M×3 array of vertex-indices
 
         # filter out faces with min max winding angle diff > 10 deg
         winding_angles_faces = winding_angles[faces]
@@ -985,7 +1158,7 @@ def mesh_uv_wraps(filtered_winding_path, output_dir):
         mesh.triangles = o3d.utility.Vector3iVector(faces)
 
         # Open3D expects triangle_uvs to be length 3*M
-        # so we flatten face‐by‐face
+        # so we flatten face-by-face
         tri_uvs = uvs2[faces].reshape(-1, 2)
         mesh.triangle_uvs = o3d.utility.Vector2dVector(tri_uvs)
 
@@ -1003,48 +1176,130 @@ def mesh_uv_wraps(filtered_winding_path, output_dir):
 
 def mesh_uv_global(filtered_winding_path, output_path):
     """
-    Build one seamless UV‐mesh across all wraps:
-      1) load every wrap_i’s (points, uvs)
+    Build one seamless UV-mesh across all wraps:
+      1) load every wrap_i's (points, uvs)
       2) concatenate into big all_pts, all_uvs, all_wrap_ids
       3) Delaunay on all_uvs → faces
       4) keep only faces whose max(wrap_ids) - min(wrap_ids) ≤ 1
-      5) angle‐span / edge‐area cull via clean_mesh
-      6) write single OBJ with per‐triangle UVs
+      5) angle-span / edge-area cull via clean_mesh
+      6) write single OBJ with per-triangle UVs
     """
     # 1) load and concatenate
     files = sorted(glob.glob(os.path.join(filtered_winding_path, "flattened_winding_*.npz")))
+    print(f"mesh_uv_global: Found {len(files)} files to process")
     wrap_ids = []
     pts_list, uvs_list = [], []
     for fp in files:
-        nr = int(os.path.basename(fp).split("_")[-1].split(".")[0])
-        data = np.load(fp)
-        P = data["points"]   # (Ni, ≥4)
-        U = data["uvs"]      # (Ni, 2)
-        pts_list.append(P[:, :3])
-        uvs_list.append(U)
-        wrap_ids.append(np.full((len(P),), nr, dtype=int))
+        try:
+            nr = int(os.path.basename(fp).split("_")[-1].split(".")[0])
+            print(f"  Loading wrap {nr} from {os.path.basename(fp)}")
+            data = np.load(fp)
+            P = data["points"]   # (Ni, ≥4)
+            U = data["uvs"]      # (Ni, 2)
+            print(f"    Loaded {len(P)} points, {len(U)} UVs")
+            
+            # Skip empty files
+            if len(P) == 0 or len(U) == 0:
+                print(f"    Skipping wrap {nr} - empty file")
+                continue
+                
+            pts_list.append(P[:, :3])
+            uvs_list.append(U)
+            wrap_ids.append(np.full((len(P),), nr, dtype=int))
+            print(f"    Added wrap {nr} to mesh: {len(P)} points")
+        except Exception as e:
+            print(f"  Error loading file {fp}: {e}")
+            continue
+            
+    print(f"After loading: {len(pts_list)} valid wraps")
+    
+    # Check if we have any data to process
+    if not pts_list or not uvs_list:
+        print("No valid winding data found for global mesh generation")
+        return
+        
+    print("Concatenating arrays...")
     all_pts = np.vstack(pts_list)
     all_uvs = np.vstack(uvs_list)
     all_wr = np.concatenate(wrap_ids)
+    print(f"Global arrays: {all_pts.shape} points, {all_uvs.shape} UVs")
+
+    # Validate UV coordinates before Delaunay
+    print("Validating UV coordinates...")
+    print(f"UV min: [{np.min(all_uvs[:, 0]):.2f}, {np.min(all_uvs[:, 1]):.2f}]")
+    print(f"UV max: [{np.max(all_uvs[:, 0]):.2f}, {np.max(all_uvs[:, 1]):.2f}]")
+    
+    # Check for invalid values
+    has_nan = np.any(np.isnan(all_uvs))
+    has_inf = np.any(np.isinf(all_uvs))
+    if has_nan or has_inf:
+        print(f"ERROR: Invalid UV values detected - NaN: {has_nan}, Inf: {has_inf}")
+        return
+    
+    # Check for duplicate points (can cause Delaunay issues)
+    unique_uvs, unique_indices = np.unique(all_uvs, axis=0, return_index=True)
+    if len(unique_uvs) < len(all_uvs):
+        print(f"Warning: Found {len(all_uvs) - len(unique_uvs)} duplicate UV points, using unique points only")
+        all_uvs = unique_uvs
+        all_pts = all_pts[unique_indices]
+        all_wr = all_wr[unique_indices]
+        print(f"After deduplication: {all_pts.shape} points, {all_uvs.shape} UVs")
+    
+    # Final check for minimum points
+    if len(all_uvs) < 3:
+        print(f"After validation: insufficient points for triangulation: {len(all_uvs)}")
+        return
+    
+    print("UV validation passed, proceeding with Delaunay...")
+    
+    # Additional geometric checks
+    print("Checking UV coordinate distribution...")
+    uv_range_u = np.max(all_uvs[:, 0]) - np.min(all_uvs[:, 0])
+    uv_range_v = np.max(all_uvs[:, 1]) - np.min(all_uvs[:, 1])
+    print(f"UV ranges: U={uv_range_u:.2f}, V={uv_range_v:.2f}")
+    
+    # Check if points are collinear (could cause Delaunay issues)
+    if uv_range_u < 1e-6 or uv_range_v < 1e-6:
+        print(f"ERROR: UV points appear to be collinear (very small range)")
+        return
+    
+    # Try a small subset first to test Delaunay
+    if len(all_uvs) > 100:
+        print("Testing Delaunay with small subset...")
+        test_indices = np.random.choice(len(all_uvs), size=100, replace=False)
+        test_uvs = all_uvs[test_indices]
+        try:
+            test_tri = Delaunay(test_uvs)
+            print(f"Test triangulation successful: {len(test_tri.simplices)} triangles")
+        except Exception as e:
+            print(f"ERROR: Test Delaunay failed: {e}")
+            return
+    
+    print("Attempting full Delaunay triangulation...")
+    try:
+        # 2) Delaunay on the full UV set
+        tri = Delaunay(all_uvs)
+        print(f"Delaunay successful: {len(tri.simplices)} triangles")
+    except Exception as e:
+        print(f"ERROR: Delaunay triangulation failed: {e}")
+        return
 
     # 2) Delaunay on the full UV set
-    tri = Delaunay(all_uvs)
-    faces = tri.simplices.astype(int)  # (M,3)
 
-    # 3) only allow “neighboring‐wrap” triangles
-    w0 = all_wr[faces[:,0]]
-    w1 = all_wr[faces[:,1]]
-    w2 = all_wr[faces[:,2]]
+    # 3) only allow "neighboring-wrap" triangles
+    w0 = all_wr[tri.simplices[:,0]]
+    w1 = all_wr[tri.simplices[:,1]]
+    w2 = all_wr[tri.simplices[:,2]]
     maxdiff = np.maximum.reduce([w0-w1, w1-w2, w2-w0, w1-w0, w2-w1, w0-w2])
     keep = np.abs(maxdiff) <= 1
-    faces = faces[keep]
+    faces = tri.simplices[keep]
 
     # 4) build Open3D mesh
     mesh = o3d.geometry.TriangleMesh()
     mesh.vertices  = o3d.utility.Vector3dVector(all_pts.astype(np.float64))
     mesh.triangles = o3d.utility.Vector3iVector(faces)
 
-    # assign per‐triangle UVs
+    # assign per-triangle UVs
     tri_uvs = all_uvs[faces].reshape(-1, 2)
     mesh.triangle_uvs = o3d.utility.Vector2dVector(tri_uvs)
 
@@ -1061,20 +1316,42 @@ def mesh_uv_global(filtered_winding_path, output_path):
     # 6) write one global OBJ
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     o3d.io.write_triangle_mesh(output_path, mesh)
-    print(f"Saved global UV‐mesh → {output_path}")
+    print(f"Saved global UV-mesh → {output_path}")
 
 def main():
     parser = argparse.ArgumentParser(description="Refine pointcloud using mesh and downsampling")
     parser.add_argument("--mesh", required=True, help="Path to mesh file (.ply or .obj)")
+    parser.add_argument("--downsample_ratio", type=float, default=1.0, help="Downsample ratio for pointclouds")
     parser.add_argument("--skip_precomputation", action="store_true", help="Skip precomputation of winding pointclouds")
     parser.add_argument("--display", action="store_true", help="Display pointclouds and meshes")
+    parser.add_argument("--display_downsample", type=float, default=0.1,
+                        help="Random downsample ratio for 3D display (0..1)")
+    parser.add_argument("--color_by_angle", action="store_true",
+                        help="Color 3D display by angular value")
     args = parser.parse_args()
 
     flattened_winding_path = os.path.join(os.path.dirname(args.mesh), "windings_flattened")
     if not args.skip_precomputation:
-        generate_winding_pointclouds(args.mesh)
-    flattened_winding_path = flatten_pointcloud(os.path.dirname(args.mesh), display=args.display)
-    grid_uv_flattened(flattened_winding_path, subsample_radius=30.0, display=args.display)
+        generate_winding_pointclouds(
+            args.mesh,
+            display=args.display,
+            display_downsample=args.display_downsample,
+            color_by_angle=args.color_by_angle
+        )
+    flattened_winding_path = flatten_pointcloud(
+        os.path.dirname(args.mesh),
+        display=args.display,
+        downsample_ratio=args.downsample_ratio,
+        display_downsample=args.display_downsample,
+        color_by_angle=args.color_by_angle
+    )
+    grid_uv_flattened(
+        flattened_winding_path,
+        subsample_radius=30.0,
+        display=args.display,
+        display_downsample=args.display_downsample,
+        color_by_angle=args.color_by_angle
+    )
     filtered_path = os.path.join(os.path.dirname(args.mesh), "windings_filtered")
     mesh_uv_wraps(filtered_path, output_dir=os.path.join(os.path.dirname(filtered_path), "uv_meshes"))
     mesh_uv_global(filtered_path, output_path=os.path.join(os.path.dirname(filtered_path), "mesh_refined.obj"))
