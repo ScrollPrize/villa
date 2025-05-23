@@ -87,6 +87,7 @@ if (( start_idx <= 2 )); then
     --alternative_ply_drives "" ""
     --batch_size 5
     --gpus 4
+    --update_progress
   )
   retry_until_success "${inst_cmd[@]}"
 fi
