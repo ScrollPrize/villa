@@ -51,6 +51,17 @@ fi
 ZARR_NAME=$(basename "$ZARR_DIR" .zarr)
 echo ">>> Processing Zarr: $ZARR_NAME"
 
+# retry helper (preserves empty-string args & logs them verbatim)
+retry_until_success(){
+  local args=( "$@" )
+  local cmd_display
+  printf -v cmd_display '%q ' "${args[@]}"
+  until "${args[@]}"; do
+    echo "+++ FAILED: $cmd_display — retrying in 5s…"
+    sleep 5
+  done
+}
+
 # step 1: grid_to_pointcloud
 if (( start_idx <= 1 )); then
   grid_cmd=(
