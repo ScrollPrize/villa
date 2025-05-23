@@ -8,6 +8,8 @@ import threading
 import fsspec
 import numcodecs
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from queue import Queue
+from threading import Thread
 # fork causes issues on windows and w/ tensorstore , force to spawn
 multiprocessing.set_start_method('spawn', force=True)
 from tqdm.auto import tqdm
@@ -171,6 +173,8 @@ class Inferer():
         self.current_patch_write_index = 0
         self.hann_map = None
         self.accumulator = None
+        self.write_queue = None
+        self.accumulation_worker = None
 
 
     def _load_model(self):
@@ -199,6 +203,16 @@ class Inferer():
         # model loader returns a dict, network is the actual model
         model = model_info['network']
         model.eval()
+        
+        # Apply torch.compile for optimization if available (PyTorch 2.0+)
+        if hasattr(torch, 'compile'):
+            if self.verbose:
+                print("Applying torch.compile optimization...")
+            try:
+                model = torch.compile(model)
+            except Exception as e:
+                if self.verbose:
+                    print(f"Warning: torch.compile failed: {e}. Proceeding without compilation.")
         
         # patch size and number of classes from model_info
         self.model_patch_size = tuple(model_info.get('patch_size', (192, 192, 192)))
@@ -329,8 +343,38 @@ class Inferer():
             return zarr.Blosc(cname='zstd', clevel=1, shuffle=zarr.Blosc.SHUFFLE)
 
 
+    def _start_accumulation_worker(self):
+        """Start the background worker thread for async accumulation."""
+        self.write_queue = Queue(maxsize=100)  # Limit queue size to control memory
+        
+        def accumulation_worker():
+            while True:
+                item = self.write_queue.get()
+                if item is None:  # Sentinel value to stop
+                    break
+                patch_data, global_coords = item
+                self.accumulator.accumulate_patch(patch_data, global_coords)
+                self.write_queue.task_done()
+        
+        self.accumulation_worker = Thread(target=accumulation_worker)
+        self.accumulation_worker.daemon = True
+        self.accumulation_worker.start()
+    
+    def _stop_accumulation_worker(self):
+        """Stop the accumulation worker and wait for pending writes."""
+        if self.write_queue is not None:
+            # Wait for all pending writes
+            self.write_queue.join()
+            # Send sentinel to stop worker
+            self.write_queue.put(None)
+            if self.accumulation_worker is not None:
+                self.accumulation_worker.join()
+    
     def _process_batches(self):
         self.current_patch_write_index = 0
+        
+        # Start the accumulation worker
+        self._start_accumulation_worker()
         
         with tqdm(total=self.num_total_patches, desc=f"Inferring Part {self.part_id}") as pbar:
             for batch_data in self.dataloader:
@@ -364,51 +408,53 @@ class Inferer():
                     # Perform inference with or without TTA
                     with torch.no_grad(), torch.amp.autocast('cuda'):
                         if self.do_tta:
-                            # --- TTA ---
-                            outputs_batch_tta = []  # Store list of outputs for each TTA for the batch
-
+                            # --- TTA with batched inference ---
                             if self.tta_type == 'mirroring':
-                                # Apply model to original and mirrored versions (but only for non-empty patches)
-                                m0 = self.model(non_empty_input)
-                                m1 = self.model(torch.flip(non_empty_input, dims=[-1]))
-                                m2 = self.model(torch.flip(non_empty_input, dims=[-2]))
-                                m3 = self.model(torch.flip(non_empty_input, dims=[-3]))
-                                m4 = self.model(torch.flip(non_empty_input, dims=[-1, -2]))
-                                m5 = self.model(torch.flip(non_empty_input, dims=[-1, -3]))
-                                m6 = self.model(torch.flip(non_empty_input, dims=[-2, -3]))
-                                m7 = self.model(torch.flip(non_empty_input, dims=[-1, -2, -3]))
-
-                                # Reverse the flips on the outputs before averaging
+                                # Batch all mirrored variants together
+                                batch_variants = torch.cat([
+                                    non_empty_input,
+                                    torch.flip(non_empty_input, dims=[-1]),
+                                    torch.flip(non_empty_input, dims=[-2]),
+                                    torch.flip(non_empty_input, dims=[-3]),
+                                    torch.flip(non_empty_input, dims=[-1, -2]),
+                                    torch.flip(non_empty_input, dims=[-1, -3]),
+                                    torch.flip(non_empty_input, dims=[-2, -3]),
+                                    torch.flip(non_empty_input, dims=[-1, -2, -3])
+                                ], dim=0)
+                                
+                                # Single model call for all variants
+                                all_outputs = self.model(batch_variants)
+                                
+                                # Split outputs and reverse flips
+                                batch_size = non_empty_input.shape[0]
                                 outputs_batch_tta = [
-                                    m0,
-                                    torch.flip(m1, dims=[-1]),
-                                    torch.flip(m2, dims=[-2]),
-                                    torch.flip(m3, dims=[-3]),
-                                    torch.flip(m4, dims=[-1, -2]),
-                                    torch.flip(m5, dims=[-1, -3]),
-                                    torch.flip(m6, dims=[-2, -3]),
-                                    torch.flip(m7, dims=[-1, -2, -3])
+                                    all_outputs[0*batch_size:1*batch_size],
+                                    torch.flip(all_outputs[1*batch_size:2*batch_size], dims=[-1]),
+                                    torch.flip(all_outputs[2*batch_size:3*batch_size], dims=[-2]),
+                                    torch.flip(all_outputs[3*batch_size:4*batch_size], dims=[-3]),
+                                    torch.flip(all_outputs[4*batch_size:5*batch_size], dims=[-1, -2]),
+                                    torch.flip(all_outputs[5*batch_size:6*batch_size], dims=[-1, -3]),
+                                    torch.flip(all_outputs[6*batch_size:7*batch_size], dims=[-2, -3]),
+                                    torch.flip(all_outputs[7*batch_size:8*batch_size], dims=[-1, -2, -3])
                                 ]
 
                             elif self.tta_type == 'rotation':
-                                # Original orientation (identity)
-                                r0 = self.model(non_empty_input)
+                                # Batch all rotation variants together
+                                batch_variants = torch.cat([
+                                    non_empty_input,
+                                    torch.transpose(non_empty_input, -3, -1),  # X-up
+                                    torch.transpose(non_empty_input, -3, -2)   # Z-up
+                                ], dim=0)
                                 
-                                # X axis facing "up" - rotate around Y axis (Z and X exchange)
-                                # This swaps Z and X dimensions
-                                x_up = torch.transpose(non_empty_input, -3, -1)
-                                r_x_up = self.model(x_up)
+                                # Single model call for all variants
+                                all_outputs = self.model(batch_variants)
                                 
-                                # Z axis facing "up" - rotate around X axis (Y and Z exchange) 
-                                # This swaps Y and Z dimensions
-                                z_up = torch.transpose(non_empty_input, -3, -2)
-                                r_z_up = self.model(z_up)
-                                
-                                # Rotate outputs back to original orientation before averaging
+                                # Split and transform outputs back
+                                batch_size = non_empty_input.shape[0]
                                 outputs_batch_tta = [
-                                    r0,  # Original
-                                    torch.transpose(r_x_up, -3, -1),  # X-up back to original
-                                    torch.transpose(r_z_up, -3, -2)   # Z-up back to original
+                                    all_outputs[0*batch_size:1*batch_size],  # Original
+                                    torch.transpose(all_outputs[1*batch_size:2*batch_size], -3, -1),  # X-up back
+                                    torch.transpose(all_outputs[2*batch_size:3*batch_size], -3, -2)   # Z-up back
                                 ]
 
                             # --- Merge TTA results for the batch ---
@@ -432,7 +478,7 @@ class Inferer():
                 
                 patch_indices = batch_data.get('index', list(range(current_batch_size)))
                 
-                # Accumulate each patch directly
+                # Queue patches for async accumulation
                 for i in range(current_batch_size):
                     patch_data = output_np[i]  # Shape: (C, Z, Y, X)
                     patch_index = patch_indices[i] if i < len(patch_indices) else i
@@ -440,14 +486,17 @@ class Inferer():
                     # Get global coordinates for this patch
                     global_coords = self.patch_start_coords_list[patch_index]
                     
-                    # Accumulate directly
-                    self.accumulator.accumulate_patch(patch_data, global_coords)
+                    # Queue for async accumulation
+                    self.write_queue.put((patch_data.copy(), global_coords))
                     
                     pbar.update(1)
                     self.current_patch_write_index += 1
         
+        # Stop the accumulation worker and wait for all writes to complete
+        self._stop_accumulation_worker()
+        
         if self.verbose:
-            print(f"Finished processing {self.current_patch_write_index} patches with direct accumulation.")
+            print(f"Finished processing {self.current_patch_write_index} patches with async accumulation.")
         
         # Verify completion and report
         if self.current_patch_write_index != self.num_total_patches:
@@ -518,7 +567,7 @@ def main():
     parser.add_argument('--zarr-compressor', type=str, default='zstd',
                       choices=['zstd', 'lz4', 'zlib', 'none'],
                       help='Zarr compression algorithm')
-    parser.add_argument('--zarr-compression-level', type=int, default=3,
+    parser.add_argument('--zarr-compression-level', type=int, default=1,
                       help='Compression level (1-9, higher = better compression but slower)')
     
     # Add arguments for the updated Volume class
