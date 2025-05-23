@@ -76,7 +76,7 @@ class PartitionedAccumulator:
         # Setup internal accumulation workers
         self.internal_queue = Queue(maxsize=200)
         self.internal_workers = []
-        self._start_internal_workers(num_workers=4)
+        self._start_internal_workers(num_workers=16)
         
     def _start_internal_workers(self, num_workers):
         """Start internal workers for parallel zarr writes."""
