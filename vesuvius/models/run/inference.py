@@ -508,6 +508,10 @@ class Inferer():
         # Stop the accumulation worker and wait for all writes to complete
         self._stop_accumulation_worker()
         
+        # Also flush the accumulator's internal queue
+        if hasattr(self.accumulator, 'close'):
+            self.accumulator.close()
+        
         if self.verbose:
             print(f"Finished processing {self.current_patch_write_index} patches with async accumulation.")
         

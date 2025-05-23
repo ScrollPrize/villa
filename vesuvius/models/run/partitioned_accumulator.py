@@ -2,6 +2,8 @@ import numpy as np
 import zarr
 import os
 import threading
+from queue import Queue
+from threading import Thread
 from data.utils import open_zarr
 
 
@@ -71,9 +73,48 @@ class PartitionedAccumulator:
         self.logits_store.attrs['overlap_size'] = self.overlap_size
         self.logits_store.attrs['weighting_scheme'] = 'hann_window'
         
+        # Setup internal accumulation workers
+        self.internal_queue = Queue(maxsize=200)
+        self.internal_workers = []
+        self._start_internal_workers(num_workers=4)
+        
+    def _start_internal_workers(self, num_workers):
+        """Start internal workers for parallel zarr writes."""
+        self.write_locks = {}  # Locks for each chunk
+        
+        def worker():
+            while True:
+                item = self.internal_queue.get()
+                if item is None:
+                    self.internal_queue.task_done()
+                    break
+                weighted_logits, z_local, y_global, x_global = item
+                pZ, pY, pX = weighted_logits.shape[1:]
+                
+                # Identify affected chunks and lock them
+                chunk_z_start = (z_local // self.patch_size[0]) * self.patch_size[0]
+                chunk_y_start = (y_global // self.patch_size[1]) * self.patch_size[1]
+                chunk_x_start = (x_global // self.patch_size[2]) * self.patch_size[2]
+                
+                # Simple approach: serialize writes to same chunk
+                chunk_key = (chunk_z_start, chunk_y_start, chunk_x_start)
+                if chunk_key not in self.write_locks:
+                    self.write_locks[chunk_key] = threading.Lock()
+                
+                with self.write_locks[chunk_key]:
+                    self.logits_store[:, z_local:z_local+pZ, y_global:y_global+pY, x_global:x_global+pX] += weighted_logits
+                
+                self.internal_queue.task_done()
+        
+        for i in range(num_workers):
+            t = Thread(target=worker)
+            t.daemon = True
+            t.start()
+            self.internal_workers.append(t)
+    
     def accumulate_patch(self, patch_logits, global_coords):
         """
-        Accumulate a single patch with Hann weighting.
+        Queue a patch for accumulation.
         
         Args:
             patch_logits: Patch output from model (C, Z, Y, X)
@@ -95,9 +136,23 @@ class PartitionedAccumulator:
         if x_global < 0 or x_global + pX > self.accumulator_shape[3]:
             return  # Patch outside X bounds
         
-        # Apply Hann weighting and accumulate logits
+        # Apply Hann weighting
         weighted_logits = patch_logits * self.hann_map[np.newaxis, :, :, :]
-        self.logits_store[:, z_local:z_local+pZ, y_global:y_global+pY, x_global:x_global+pX] += weighted_logits
+        
+        # Queue for accumulation
+        self.internal_queue.put((weighted_logits, z_local, y_global, x_global))
+    
+    def flush(self):
+        """Wait for all queued writes to complete."""
+        self.internal_queue.join()
+        
+    def close(self):
+        """Shutdown workers and ensure all writes are complete."""
+        self.flush()
+        for _ in self.internal_workers:
+            self.internal_queue.put(None)
+        for worker in self.internal_workers:
+            worker.join()
         
     def get_core_region_data(self):
         """
