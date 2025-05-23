@@ -108,13 +108,7 @@ fi
 
 # step 5: graph_solve
 if (( start_idx <= 5 )); then
-  retry_until_success bash -c '
-    conda deactivate 2>/dev/null || true
-    conda deactivate 2>/dev/null || true
-    exec python3 -m ThaumatoAnakalyptor.graph_solve \
-      "/workspace/experiments/1352_3600_5002/graph.bin" \
-      --experiment_name "'"${ZARR_NAME}"'"
-  '
+  retry_until_success bash -c 'conda deactivate 2>/dev/null || true && conda deactivate 2>/dev/null || true && python3 -m ThaumatoAnakalyptor.graph_solve "/workspace/experiments/1352_3600_5002/graph.bin" --experiment_name "'"${ZARR_NAME}"'"'
 fi
 
 echo ">>> All requested steps completed for ${ZARR_NAME}."
