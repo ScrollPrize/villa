@@ -63,6 +63,8 @@ retry_until_success(){
     pkill -9 python3 || true
     sleep 5
   done
+  echo "+++ SUCCESS: $cmd_display — cleaning up any remaining python3 processes…"
+  pkill -9 python3 || true
 }
 
 # step 1: grid_to_pointcloud
