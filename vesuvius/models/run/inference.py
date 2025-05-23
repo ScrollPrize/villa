@@ -174,7 +174,7 @@ class Inferer():
         self.hann_map = None
         self.accumulator = None
         self.write_queue = None
-        self.accumulation_worker = None
+        self.accumulation_workers = []
 
 
     def _load_model(self):
@@ -343,32 +343,43 @@ class Inferer():
             return zarr.Blosc(cname='zstd', clevel=1, shuffle=zarr.Blosc.SHUFFLE)
 
 
-    def _start_accumulation_worker(self):
-        """Start the background worker thread for async accumulation."""
+    def _start_accumulation_worker(self, num_workers=1):
+        """Start background worker threads for async accumulation."""
         self.write_queue = Queue(maxsize=100)  # Limit queue size to control memory
+        self.accumulation_workers = []
         
-        def accumulation_worker():
+        def accumulation_worker(worker_id):
             while True:
                 item = self.write_queue.get()
                 if item is None:  # Sentinel value to stop
+                    self.write_queue.task_done()
                     break
                 patch_data, global_coords = item
+                
+                # For thread safety with multiple workers:
+                # Each worker could handle specific regions if num_workers > 1
+                # For now, with num_workers=1, all patches go through one worker
                 self.accumulator.accumulate_patch(patch_data, global_coords)
                 self.write_queue.task_done()
         
-        self.accumulation_worker = Thread(target=accumulation_worker)
-        self.accumulation_worker.daemon = True
-        self.accumulation_worker.start()
+        # Start worker threads
+        for worker_id in range(num_workers):
+            worker = Thread(target=accumulation_worker, args=(worker_id,))
+            worker.daemon = True
+            worker.start()
+            self.accumulation_workers.append(worker)
     
     def _stop_accumulation_worker(self):
-        """Stop the accumulation worker and wait for pending writes."""
+        """Stop all accumulation workers and wait for pending writes."""
         if self.write_queue is not None:
             # Wait for all pending writes
             self.write_queue.join()
-            # Send sentinel to stop worker
-            self.write_queue.put(None)
-            if self.accumulation_worker is not None:
-                self.accumulation_worker.join()
+            # Send sentinel to stop each worker
+            for _ in self.accumulation_workers:
+                self.write_queue.put(None)
+            # Wait for all workers to finish
+            for worker in self.accumulation_workers:
+                worker.join()
     
     def _process_batches(self):
         self.current_patch_write_index = 0
@@ -489,6 +500,8 @@ class Inferer():
                     # Queue for async accumulation
                     self.write_queue.put((patch_data.copy(), global_coords))
                     
+                    # Update progress bar with queue size
+                    pbar.set_postfix({'queue': self.write_queue.qsize()})
                     pbar.update(1)
                     self.current_patch_write_index += 1
         
