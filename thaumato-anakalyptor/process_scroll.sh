@@ -8,14 +8,13 @@ usage(){
 Usage: $0 [--start <step>]
 
 Options:
-  -s,--start <step>   One of: grid, instances, graph, conda, solve
+  -s,--start <step>   One of: grid, instances, graph, solve
                       (default: grid)
 
 Steps:
   grid        run grid_to_pointcloud
   instances   run pointcloud_to_instances
   graph       run instances_to_graph
-  conda       run the two conda deactivate calls
   solve       run graph_solve
 EOF
   exit 1
@@ -37,8 +36,7 @@ case "$start" in
   grid)       start_idx=1;;
   instances)  start_idx=2;;
   graph)      start_idx=3;;
-  conda)      start_idx=4;;
-  solve)      start_idx=5;;
+  solve)      start_idx=4;;
   *) echo "Invalid start step: $start"; usage;;
 esac
 
@@ -98,20 +96,15 @@ if (( start_idx <= 3 )); then
     --path "/workspace/experiments/point_cloud_colorized_verso_subvolume_blocks"
 fi
 
-# step 4: conda deactivate twice
+# step 4: graph_solve
 if (( start_idx <= 4 )); then
-  conda deactivate || echo "(first conda deactivate failed, continuing)"
-  conda deactivate || echo "(second conda deactivate failed, continuing)"
-fi
-
-# step 5: graph_solve
-if (( start_idx <= 5 )); then
-  solve_cmd=(
-    python3 -m ThaumatoAnakalyptor.graph_solve
-    "/workspace/experiments/1352_3600_5002/graph.bin"
-    --experiment_name "${ZARR_NAME}"
-  )
-  retry_until_success "${solve_cmd[@]}"
+  retry_until_success bash -c '
+    conda deactivate 2>/dev/null || true
+    conda deactivate 2>/dev/null || true
+    exec python3 -m ThaumatoAnakalyptor.graph_solve \
+      "/workspace/experiments/1352_3600_5002/graph.bin" \
+      --experiment_name "'"${ZARR_NAME}"'"
+  '
 fi
 
 echo ">>> All requested steps completed for ${ZARR_NAME}."
