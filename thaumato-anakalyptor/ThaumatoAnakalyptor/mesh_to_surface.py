@@ -690,10 +690,13 @@ class MeshDataset(Dataset):
         grid_end = [min(grid_end[i], self.zarr.shape[i]) for i in range(3)]
         # copy data into grid size block
         grid_cell = np.zeros((self.grid_size, self.grid_size, self.grid_size), dtype=np.uint16)
-        zarr_grid = self.zarr[grid_start[0]:grid_end[0], grid_start[1]:grid_end[1], grid_start[2]:grid_end[2]]
-        if zarr_grid.dtype == np.uint8:
-            zarr_grid = zarr_grid.astype(np.uint16) * 256
-        grid_cell[:zarr_grid.shape[0], :zarr_grid.shape[1], :zarr_grid.shape[2]] = zarr_grid
+        try:
+            zarr_grid = self.zarr[grid_start[0]:grid_end[0], grid_start[1]:grid_end[1], grid_start[2]:grid_end[2]]
+            if zarr_grid.dtype == np.uint8:
+                zarr_grid = zarr_grid.astype(np.uint16) * 256
+            grid_cell[:zarr_grid.shape[0], :zarr_grid.shape[1], :zarr_grid.shape[2]] = zarr_grid
+        except Exception as e:
+            print(f"Error loading grid {grid_index}: {e}")
 
         if uint8:
             grid_cell = np.uint8(grid_cell//256)

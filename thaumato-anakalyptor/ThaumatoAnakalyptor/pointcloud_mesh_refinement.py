@@ -858,6 +858,8 @@ def flatten_pointcloud(base_path,
     for start in range(0, len(winding_files)):
         # if start < 27: # for debug, leave it for now
         #     continue
+        if start > first_mesh_idx + 2: # for debug, leave it for now
+            continue
         
         # Skip if before first mesh winding or after last mesh winding
         if start < first_mesh_idx:
@@ -1042,26 +1044,32 @@ def flatten_pointcloud(base_path,
             else:
                 print(f"Warning: No valid first winding nodes found in downsampled solver")
         
-        # Solve downsampled graph problem
+        # Solve downsampled graph problem exactly like the original
         min_angle = np.min(winding_angles_ds)
         max_angle = np.max(winding_angles_ds)
-        z_min = np.min(coords_ds[:, 2])
-        z_max = np.max(coords_ds[:, 2])
+        z_min = np.min(coords_ds[:, coords_z_index])
+        z_max = np.max(coords_ds[:, coords_z_index])
         print(f"Downsampled Min/Max angles: {min_angle}, {max_angle}, Min/Max z: {z_min}, {z_max}")
         
         zero_ranges = [(min_angle, min_angle+270), (max_angle-270, max_angle)]
         a_step = (max_angle - min_angle)/winding_width
         zero_ranges_initial = [(min_angle + index * a_step, min_angle + (index+1)*a_step) for index in range(winding_width)]
         
-        print("Solving downsampled graph (first pass)...")
-        solver_ds.solve_flattening(num_iterations=10000, visualize=True, 
+        print("Solving downsampled graph (first pass - original style)...")
+        solver_ds.solve_flattening(num_iterations=20000, visualize=True, 
                                    angle_tug_min=min_angle+90, angle_tug_max=max_angle-90, 
                                    z_tug_min=z_min+100, z_tug_max=z_max-100, 
                                    tug_step=0.5, zero_ranges=zero_ranges_initial)
         
         uvs_ds_initial = np.array(solver_ds.get_uvs())
+        print(f"After first downsampled solve: u min={uvs_ds_initial[:,0].min()}, u max={uvs_ds_initial[:,0].max()}, v min={uvs_ds_initial[:,1].min()}, v max={uvs_ds_initial[:,1].max()}")
+        
+        print("Solving downsampled graph (second pass - original style)...")
+        solver_ds.solve_flattening(num_iterations=150000, visualize=True, zero_ranges=zero_ranges, tug_step=0.0005)
+        
+        uvs_ds_final = np.array(solver_ds.get_uvs())
         undeleted_ds_indices = np.array(solver_ds.get_undeleted_indices())
-        print(f"After downsampled solve: u min={uvs_ds_initial[:,0].min()}, u max={uvs_ds_initial[:,0].max()}, v min={uvs_ds_initial[:,1].min()}, v max={uvs_ds_initial[:,1].max()}")
+        print(f"After second downsampled solve: u min={uvs_ds_final[:,0].min()}, u max={uvs_ds_final[:,0].max()}, v min={uvs_ds_final[:,1].min()}, v max={uvs_ds_final[:,1].max()}")
         print(f"Downsampled solver: {len(undeleted_ds_indices)} undeleted out of {len(downsample_indices)} total downsampled points")
         
         # STEP 2: Use downsampled results to initialize full solver
@@ -1074,9 +1082,36 @@ def flatten_pointcloud(base_path,
         # Update positions of undeleted downsampled points with solved values
         # Map the undeleted indices back to the original full point cloud indices
         valid_downsample_indices = downsample_indices[undeleted_ds_indices]
-        current_angles_full[valid_downsample_indices] = uvs_ds_initial[:, 0]
-        current_z_full[valid_downsample_indices] = uvs_ds_initial[:, 1]
+        current_angles_full[valid_downsample_indices] = uvs_ds_final[:, 0]
+        current_z_full[valid_downsample_indices] = uvs_ds_final[:, 1]
         print(f"Updated {len(valid_downsample_indices)} points with downsampled solve results")
+        
+        if display:
+            # DEBUG: Visualize the fixed points UV coordinates from downsampled solve
+            print("=== DEBUG: Visualizing fixed points from downsampled solve ===")
+            import matplotlib.pyplot as plt
+            
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # Plot 1: All downsampled solution points
+            ax1.scatter(uvs_ds_final[:, 0], uvs_ds_final[:, 1], s=1, alpha=0.6, c='blue')
+            ax1.set_title(f'Downsampled Solution Points\n({len(uvs_ds_final)} points)')
+            ax1.set_xlabel('U (angle)')
+            ax1.set_ylabel('V (z)')
+            ax1.grid(True, alpha=0.3)
+            
+            # Plot 2: Fixed points in full coordinate space
+            fixed_u = current_angles_full[valid_downsample_indices]
+            fixed_v = current_z_full[valid_downsample_indices]
+            ax2.scatter(fixed_u, fixed_v, s=1, alpha=0.6, c='red')
+            ax2.set_title(f'Fixed Points in Full Space\n({len(fixed_u)} points)')
+            ax2.set_xlabel('U (angle)')
+            ax2.set_ylabel('V (z)')
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.show()
+            print(f"Fixed points UV range: U=[{fixed_u.min():.2f}, {fixed_u.max():.2f}], V=[{fixed_v.min():.2f}, {fixed_v.max():.2f}]")
         
         # Initialize full solver with interpolated values
         solver = graph_problem_gpu_py.Solver(
@@ -1093,75 +1128,61 @@ def flatten_pointcloud(base_path,
         full_valid_indices = np.array(solver.get_undeleted_indices())
         
         # Convert absolute valid_downsample_indices to relative indices within the full solver's valid nodes
-        relative_indices = []
+        relative_downsample_indices = []
+        missing_count = 0
         for abs_idx in valid_downsample_indices:
             # Find where this absolute index appears in the full solver's valid indices
             where_found = np.where(full_valid_indices == abs_idx)[0]
             if len(where_found) > 0:
-                relative_indices.append(where_found[0])
+                relative_downsample_indices.append(where_found[0])
+            else:
+                missing_count += 1
         
-        print(f"Mapped {len(valid_downsample_indices)} absolute indices to {len(relative_indices)} relative indices")
+        print(f"Mapped {len(valid_downsample_indices)} absolute indices to {len(relative_downsample_indices)} relative downsample indices")
+        if missing_count > 0:
+            print(f"WARNING: {missing_count} downsampled points not found in full solver valid indices!")
         
-        # Fix the undeleted downsampled points in the full solver (using relative indices)
-        if len(relative_indices) > 0:
-            solver.fix_nodes(relative_indices)
-            print(f"Fixed {len(relative_indices)} undeleted downsampled points in full solver")
+        # Also fix the first winding nodes in the full solver
+        first_winding_relative_full = []
+        first_winding_missing = 0
+        if prev_u0 is not None and prev_u0.shape[0] == first_count:
+            wrap0_idx = list(range(first_count))
+            print(f"DEBUG: first_count = {first_count}, wrap0_idx (first 10): {wrap0_idx[:10]}")
+            # Convert to relative indices for the full solver
+            for abs_idx in wrap0_idx:
+                where_found = np.where(full_valid_indices == abs_idx)[0]
+                if len(where_found) > 0:
+                    first_winding_relative_full.append(where_found[0])
+                else:
+                    first_winding_missing += 1
+        
+        if first_winding_missing > 0:
+            print(f"WARNING: {first_winding_missing} first winding points not found in full solver valid indices!")
+        
+        # Combine downsampled and first winding indices for fixing
+        all_fixed_indices = list(set(relative_downsample_indices + first_winding_relative_full))
+        
+        # Fix both the downsampled points and first winding points in the full solver
+        if len(all_fixed_indices) > 0:
+            solver.fix_nodes(all_fixed_indices)
+            print(f"Fixed {len(relative_downsample_indices)} downsampled points + {len(first_winding_relative_full)} first winding points = {len(all_fixed_indices)} total fixed points in full solver")
         else:
-            print("Warning: No valid downsampled points found to fix in full solver")
+            print("Warning: No valid points found to fix in full solver")
         
-        # Solve full graph with fewer iterations
+        # Solve full graph with just the second solve call (0.0005 tug step only)
         min_angle_full = np.min(winding_angles)
         max_angle_full = np.max(winding_angles)
         z_min_full = np.min(coords[:, coords_z_index])
         z_max_full = np.max(coords[:, coords_z_index])
         
-        print("Solving full graph (refinement pass)...")
-        solver.solve_flattening(num_iterations=5000, visualize=True, 
-                               angle_tug_min=min_angle_full+90, angle_tug_max=max_angle_full-90, 
-                               z_tug_min=z_min_full+100, z_tug_max=z_max_full-100, 
-                               tug_step=0.5, zero_ranges=zero_ranges_initial)
+        zero_ranges_full = [(min_angle_full, min_angle_full+270), (max_angle_full-270, max_angle_full)]
         
-        uvs_full_initial = np.array(solver.get_uvs())
-        print(f"After full refinement solve: u min={uvs_full_initial[:,0].min()}, u max={uvs_full_initial[:,0].max()}, v min={uvs_full_initial[:,1].min()}, v max={uvs_full_initial[:,1].max()}")
-        
-        # STEP 3: Second round with refined parameters
-        print("=== STEP 3: Second solve round ===")
-        
-        # Unfix all nodes for second round (if method exists)
-        try:
-            solver.unfix()
-            print("Unfixed all nodes for second round")
-        except AttributeError:
-            print("Warning: unfix method not available, proceeding without unfixing")
-        
-        # Re-fix first winding if previously computed
-        start_wrap_nr = winding_files_indices[start]
-        first_count = winding_indices[0]
-        prev_u0 = prev_uvs_u.get(start_wrap_nr)
-        
-        if prev_u0 is not None and prev_u0.shape[0] == first_count:
-            wrap0_idx = list(range(first_count))
-            # Convert to relative indices for the full solver
-            final_valid_indices = np.array(solver.get_undeleted_indices())
-            wrap0_relative = []
-            for abs_idx in wrap0_idx:
-                where_found = np.where(final_valid_indices == abs_idx)[0]
-                if len(where_found) > 0:
-                    wrap0_relative.append(where_found[0])
-            
-            if len(wrap0_relative) > 0:
-                solver.fix_nodes(wrap0_relative)
-                print(f"Re-fixed {len(wrap0_relative)} nodes of winding {start_wrap_nr} for second round.")
-            else:
-                print(f"Warning: No valid first winding nodes found for second round")
-        
-        # Second solve with fine parameters
-        zero_ranges_fine = [(min_angle_full, min_angle_full+270), (max_angle_full-270, max_angle_full)]
-        solver.solve_flattening(num_iterations=75000, visualize=True, zero_ranges=zero_ranges_fine, tug_step=0.0005)
+        print("Solving full graph (refinement with fixed anchors - 0.0005 tug only)...")
+        solver.solve_flattening(num_iterations=10000, visualize=True)
         
         undeleted_indices = np.array(solver.get_undeleted_indices())
         uvs = np.array(solver.get_uvs())
-        print(f"After second solve_flattening: u min={uvs[:,0].min()}, u max={uvs[:,0].max()}, v min={uvs[:,1].min()}, v max={uvs[:,1].max()}")
+        print(f"After full refinement solve: u min={uvs[:,0].min()}, u max={uvs[:,0].max()}, v min={uvs[:,1].min()}, v max={uvs[:,1].max()}")
         
         # Process results
         winding_us = []
@@ -1193,6 +1214,146 @@ def flatten_pointcloud(base_path,
     # save the last segments
     clean_winding_dicts((0, 0), flattened_winding_path, winding_files_indices, prev_uvs_u, prev_uvs_v, prev_points)
     return flattened_winding_path
+
+def normalize_uvs(mesh, verbose=True):
+    """
+    Normalize UV coordinates to 0-1 range, returning the natural image size.
+    
+    Args:
+        mesh: Open3D TriangleMesh object with triangle_uvs
+        verbose: bool, whether to print progress info
+    
+    Returns:
+        tuple: (mesh with normalized UVs, natural_image_size as (width, height))
+    """
+    if not hasattr(mesh, 'triangle_uvs') or len(mesh.triangle_uvs) == 0:
+        if verbose:
+            print("Warning: Mesh has no UV coordinates, skipping UV normalization")
+        return mesh, (2048, 2048)  # Default fallback size
+    
+    # Get UV coordinates
+    uvs = np.asarray(mesh.triangle_uvs)
+    
+    if verbose:
+        print(f"Normalizing {len(uvs)} UV coordinates to 0-1 range")
+        print(f"Original UV range: U=[{uvs[:,0].min():.2f}, {uvs[:,0].max():.2f}], V=[{uvs[:,1].min():.2f}, {uvs[:,1].max():.2f}]")
+    
+    # First: move min to (0,0)
+    uv_min = uvs.min(axis=0)
+    uvs_shifted = uvs - uv_min
+    
+    # At this point, the max values represent the natural image size
+    natural_max = uvs_shifted.max(axis=0)
+    natural_image_size = (int(natural_max[0]), int(natural_max[1]))
+    
+    if verbose:
+        print(f"After shifting min to (0,0): U=[0.00, {natural_max[0]:.2f}], V=[0.00, {natural_max[1]:.2f}]")
+        print(f"Natural image size: {natural_image_size}")
+    
+    # Then: normalize to 0-1 range
+    uv_range = natural_max.copy()
+    uv_range[uv_range == 0] = 1.0  # Avoid division by zero
+    
+    normalized_uvs = uvs_shifted / uv_range
+    
+    if verbose:
+        print(f"Normalized UV range: U=[{normalized_uvs[:,0].min():.2f}, {normalized_uvs[:,0].max():.2f}], V=[{normalized_uvs[:,1].min():.2f}, {normalized_uvs[:,1].max():.2f}]")
+    
+    # Update mesh with normalized UVs
+    mesh.triangle_uvs = o3d.utility.Vector2dVector(normalized_uvs)
+    
+    return mesh, natural_image_size
+
+def create_mask(mesh, natural_image_size, output_path=None, verbose=True):
+    """
+    Create a mask from mesh UV coordinates (0-1 range) using natural image size.
+    
+    Args:
+        mesh: Open3D TriangleMesh object with triangle_uvs in 0-1 range
+        natural_image_size: tuple, (width, height) natural size from normalization
+        output_path: str or None, output file path for the mesh (mask will be saved alongside if provided)
+        verbose: bool, whether to print progress info
+    
+    Returns:
+        tuple: (mask_array, mask_path) where mask_path is None if no file was saved
+    """
+    import cv2
+    
+    if not hasattr(mesh, 'triangle_uvs') or len(mesh.triangle_uvs) == 0:
+        if verbose:
+            print("Warning: Mesh has no UV coordinates, skipping mask creation")
+        return None, None
+    
+    # Get UV coordinates (should be in 0-1 range)
+    uvs = np.asarray(mesh.triangle_uvs)
+    
+    if verbose:
+        print(f"Creating mask from {len(uvs)} UV coordinates using natural size {natural_image_size}")
+    
+    # Create mask PNG with natural image size
+    mask = np.zeros(natural_image_size[::-1], dtype=np.uint8)  # height, width
+    
+    # Convert 0-1 UVs to pixel coordinates using natural image size
+    uv_pixels = uvs * np.array([natural_image_size[0] - 1, natural_image_size[1] - 1])
+    uv_pixels = uv_pixels.astype(np.int32)
+    
+    # Group UV coordinates into triangles (every 3 consecutive UVs form a triangle)
+    for i in range(0, len(uv_pixels), 3):
+        if i + 2 < len(uv_pixels):
+            triangle = uv_pixels[i:i+3]
+            # Flip V coordinate for image coordinate system
+            triangle[:, 1] = natural_image_size[1] - 1 - triangle[:, 1]
+            try:
+                cv2.fillPoly(mask, [triangle], 255)
+            except:
+                pass  # Skip invalid triangles
+    
+    # Save mask PNG only if output_path is provided
+    mask_path = None
+    if output_path is not None:
+        mask_path = os.path.join(os.path.dirname(output_path), 
+                                os.path.basename(output_path).split(".")[0] + "_mask.png")
+        cv2.imwrite(mask_path, mask)
+        
+        if verbose:
+            print(f"Created mask PNG: {mask_path} (size: {natural_image_size})")
+    elif verbose:
+        print(f"Created mask array (size: {natural_image_size}) - no file saved")
+    
+    return mask, mask_path
+
+def save_mesh_with_uvs(mesh, output_path, natural_image_size, create_mask_png=True, verbose=True):
+    """
+    Save a mesh with UV coordinates (should already be normalized to 0-1 range).
+    
+    Args:
+        mesh: Open3D TriangleMesh object with triangle_uvs already normalized to 0-1
+        output_path: str, output file path (should end in .obj)
+        natural_image_size: tuple, (width, height) natural size from normalization
+        create_mask_png: bool, whether to create a mask PNG alongside the mesh
+        verbose: bool, whether to print progress info
+    
+    Returns:
+        bool: True if save was successful, False otherwise
+    """
+    if verbose:
+        print(f"Saving mesh with {len(mesh.vertices)} vertices, {len(mesh.triangles)} faces to {output_path}")
+    
+    # Create mask if requested
+    if create_mask_png:
+        mask_array, mask_path = create_mask(mesh, natural_image_size, output_path, verbose)
+    
+    # Create output directory if needed
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
+    # Save mesh
+    success = o3d.io.write_triangle_mesh(output_path, mesh)
+    if success and verbose:
+        print(f"Successfully saved mesh to {output_path}")
+    elif not success:
+        print(f"ERROR: Failed to save mesh to {output_path}")
+    
+    return success
 
 def grid_uv_flattened(flattened_winding_path,
                        subsample_radius=3.0,
@@ -1346,11 +1507,17 @@ def mesh_uv_wraps(filtered_winding_path, output_dir):
         mesh.compute_vertex_normals()
         mesh.compute_triangle_normals()
 
-        mesh = clean_mesh(mesh, longest_edge_pct=100, area_pct=100, edge_length_thresh=1000)
+        # mesh = clean_mesh(mesh, longest_edge_pct=100, area_pct=100, edge_length_thresh=1000)
+
+        # Normalize UVs after cleaning and get natural image size
+        mesh, natural_image_size = normalize_uvs(mesh, verbose=True)
+
+        # Apply advanced mask-based filtering
+        mesh = filter_mesh_by_mask(mesh, natural_image_size, verbose=True, show_debug=False)
 
         # write OBJ with UV coordinates
         out_path = os.path.join(output_dir, f"wrap_{nr}.obj")
-        o3d.io.write_triangle_mesh(out_path, mesh)
+        save_mesh_with_uvs(mesh, out_path, natural_image_size)
         print(f"Saved wrap {nr} mesh → {out_path}")
 
 
@@ -1488,15 +1655,272 @@ def mesh_uv_global(filtered_winding_path, output_path):
     mesh.compute_triangle_normals()
 
     # 5) final cleanup (you can reuse your clean_mesh here)
-    mesh = clean_mesh(mesh,
-                      longest_edge_pct=95,
-                      area_pct=95,
-                      edge_length_thresh=1000)
+    # mesh = clean_mesh(mesh,
+    #                   longest_edge_pct=95,
+    #                   area_pct=95,
+    #                   edge_length_thresh=1000)
 
-    # 6) write one global OBJ
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    o3d.io.write_triangle_mesh(output_path, mesh)
-    print(f"Saved global UV-mesh → {output_path}")
+    # Normalize UVs after cleaning and get natural image size
+    mesh, natural_image_size = normalize_uvs(mesh, verbose=True)
+
+    # Apply advanced mask-based filtering
+    mesh = filter_mesh_by_mask(mesh, natural_image_size, verbose=True, show_debug=False)
+
+    # 6) save using the new function
+    save_mesh_with_uvs(mesh, output_path, natural_image_size)
+
+def filter_mesh_by_mask(mesh, natural_image_size, verbose=True, show_debug=False, fill_area=50000):
+    """
+    Filter mesh triangles using advanced mask-based filtering.
+    
+    Steps:
+    1. Generate triangulated mask from current mesh
+    2. Generate vertex-only mask (white pixels at UV vertex positions)
+    3. Dilate vertex mask by 75 pixels
+    4. Fill black islands smaller than fill_area pixels
+    5. Filter out triangles that have any black pixels in their UV area
+    
+    Args:
+        mesh: Open3D TriangleMesh object with normalized triangle_uvs (0-1 range)
+        natural_image_size: tuple, (width, height) natural size from normalization
+        verbose: bool, whether to print progress info
+        show_debug: bool, whether to show debug mask images
+    
+    Returns:
+        mesh: filtered mesh with problematic triangles removed
+    """
+    import cv2
+    
+    def resize_for_display(image, max_width=800, max_height=600):
+        """Resize image to fit within max dimensions while maintaining aspect ratio"""
+        h, w = image.shape[:2]
+        if w <= max_width and h <= max_height:
+            return image
+        
+        # Calculate scaling factor
+        scale_w = max_width / w
+        scale_h = max_height / h
+        scale = min(scale_w, scale_h)
+        
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        
+        return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    
+    if not hasattr(mesh, 'triangle_uvs') or len(mesh.triangle_uvs) == 0:
+        if verbose:
+            print("Warning: Mesh has no UV coordinates, skipping mask filtering")
+        return mesh
+    
+    uvs = np.asarray(mesh.triangle_uvs)
+    faces = np.asarray(mesh.triangles)
+    
+    if verbose:
+        print(f"Starting mask-based filtering with {len(faces)} triangles")
+    
+    # Step 1: Generate first mask (triangulated)
+    first_mask, _ = create_mask(mesh, natural_image_size, output_path=None, verbose=False)
+    
+    # Step 2: Generate vertex-only mask
+    vertex_mask = np.zeros(natural_image_size[::-1], dtype=np.uint8)  # height, width
+    
+    # Convert 0-1 UVs to pixel coordinates
+    uv_pixels = uvs * np.array([natural_image_size[0] - 1, natural_image_size[1] - 1])
+    uv_pixels = uv_pixels.astype(np.int32)
+    
+    # Color white pixels at each vertex UV position
+    for i in range(len(uv_pixels)):
+        x, y = uv_pixels[i]
+        # Flip Y coordinate for image coordinate system
+        y_flipped = natural_image_size[1] - 1 - y
+        # Ensure coordinates are within bounds
+        if 0 <= x < natural_image_size[0] and 0 <= y_flipped < natural_image_size[1]:
+            vertex_mask[y_flipped, x] = 255
+    
+    if show_debug:
+        cv2.imshow('Step 1: Triangulated Mask', resize_for_display(first_mask))
+        cv2.imshow('Step 2: Vertex-only Mask', resize_for_display(vertex_mask))
+    
+    # Step 3: Dilate by 75 pixels
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (151, 151))  # 75 pixel radius = 151x151 kernel
+    dilated_mask = cv2.dilate(vertex_mask, kernel, iterations=1)
+    
+    if show_debug:
+        cv2.imshow('Step 3: Dilated Mask (75px)', resize_for_display(dilated_mask))
+    
+    # Step 4: Fill black islands smaller than fill_area pixels
+    inverted_mask = 255 - dilated_mask
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(inverted_mask, connectivity=8)
+    
+    final_mask = dilated_mask.copy()
+    filled_count = 0
+    
+    for label in range(1, num_labels):  # Skip background (label 0)
+        area = stats[label, cv2.CC_STAT_AREA]
+        if area < fill_area:  # Fill small black islands
+            final_mask[labels == label] = 255
+            filled_count += 1
+    
+    if show_debug:
+        cv2.imshow(f'Step 4: Filled Small Islands (<{fill_area}px)', resize_for_display(final_mask))
+    
+    # Step 5: Filter triangles based on final mask
+    # Use vectorized approach for much better performance
+    if verbose:
+        print("Filtering triangles using vectorized approach...")
+    
+    # Reshape UV pixels to (n_triangles, 3, 2) for easier processing
+    triangle_uvs = uv_pixels.reshape(-1, 3, 2)
+    n_triangles = len(triangle_uvs)
+    
+    # Flip Y coordinates for image coordinate system
+    triangle_coords = triangle_uvs.copy()
+    triangle_coords[:, :, 1] = natural_image_size[1] - 1 - triangle_coords[:, :, 1]
+    
+    # Quick vertex-based filtering: check if all vertices are in valid regions
+    vertices_flat = triangle_coords.reshape(-1, 2)  # (n_triangles * 3, 2)
+    
+    # Check bounds for all vertices at once
+    valid_bounds = ((vertices_flat[:, 0] >= 0) & (vertices_flat[:, 0] < natural_image_size[0]) & 
+                    (vertices_flat[:, 1] >= 0) & (vertices_flat[:, 1] < natural_image_size[1]))
+    
+    # Sample final mask at valid vertex positions
+    vertex_values = np.zeros(len(vertices_flat), dtype=bool)
+    valid_vertices = vertices_flat[valid_bounds].astype(int)
+    if len(valid_vertices) > 0:
+        vertex_values[valid_bounds] = final_mask[valid_vertices[:, 1], valid_vertices[:, 0]] > 0
+    
+    # Reshape back to per-triangle format
+    vertex_results = vertex_values.reshape(n_triangles, 3)
+    
+    # Quick elimination: if any vertex is in a black region, triangle is likely invalid
+    all_vertices_white = np.all(vertex_results, axis=1)
+    any_vertex_black = np.any(~vertex_results, axis=1)
+    
+    # For triangles where all vertices are white, do additional interior sampling
+    uncertain_triangles = all_vertices_white  # These need more detailed checking
+    
+    if np.any(uncertain_triangles):
+        if verbose:
+            print(f"Doing detailed checking for {np.sum(uncertain_triangles)} uncertain triangles...")
+        
+        # Sample points inside uncertain triangles using barycentric coordinates
+        uncertain_indices = np.where(uncertain_triangles)[0]
+        uncertain_triangle_coords = triangle_coords[uncertain_indices]
+        
+        # Generate multiple sample points per triangle for robust checking
+        n_samples = 5
+        sample_results = []
+        
+        for _ in range(n_samples):
+            # Generate random barycentric coordinates
+            r1 = np.random.rand(len(uncertain_triangle_coords))
+            r2 = np.random.rand(len(uncertain_triangle_coords))
+            
+            # Convert to valid barycentric coordinates (u, v, w) where u+v+w=1
+            u = 1 - np.sqrt(r1)
+            v = np.sqrt(r1) * (1 - r2)
+            w = np.sqrt(r1) * r2
+            
+            # Sample points: P = u*V0 + v*V1 + w*V2
+            sample_points = (u[:, None] * uncertain_triangle_coords[:, 0] + 
+                           v[:, None] * uncertain_triangle_coords[:, 1] + 
+                           w[:, None] * uncertain_triangle_coords[:, 2])
+            
+            # Check bounds and sample mask
+            valid_samples = ((sample_points[:, 0] >= 0) & (sample_points[:, 0] < natural_image_size[0]) & 
+                           (sample_points[:, 1] >= 0) & (sample_points[:, 1] < natural_image_size[1]))
+            
+            sample_values = np.zeros(len(sample_points), dtype=bool)
+            if np.any(valid_samples):
+                valid_coords = sample_points[valid_samples].astype(int)
+                sample_values[valid_samples] = final_mask[valid_coords[:, 1], valid_coords[:, 0]] > 0
+            
+            sample_results.append(sample_values)
+        
+        # A triangle is valid if ALL samples are in white regions
+        all_samples = np.stack(sample_results, axis=1)  # (n_uncertain, n_samples)
+        interior_valid = np.all(all_samples, axis=1)
+        
+        # Update the results for uncertain triangles
+        triangle_validity = np.zeros(n_triangles, dtype=bool)
+        triangle_validity[uncertain_indices] = interior_valid
+        # Triangles with any black vertex are automatically invalid
+        triangle_validity[any_vertex_black] = False
+    else:
+        # No uncertain triangles, just use vertex-based results
+        triangle_validity = all_vertices_white & ~any_vertex_black
+    
+    valid_triangles = np.where(triangle_validity)[0].tolist()
+    
+    if verbose:
+        print(f"Triangle filtering: {len(faces)} -> {len(valid_triangles)} triangles")
+    
+    if show_debug:
+        # Show triangle filtering result
+        filtered_mesh_mask = np.zeros(natural_image_size[::-1], dtype=np.uint8)
+        for tri_idx in valid_triangles:
+            triangle_start = tri_idx * 3
+            triangle_uvs = uv_pixels[triangle_start:triangle_start + 3]
+            triangle_coords = triangle_uvs.copy()
+            triangle_coords[:, 1] = natural_image_size[1] - 1 - triangle_coords[:, 1]
+            try:
+                cv2.fillPoly(filtered_mesh_mask, [triangle_coords], 255)
+            except:
+                pass
+        
+        cv2.imshow(f'Step 5: Filtered Mesh ({len(valid_triangles)} triangles)', resize_for_display(filtered_mesh_mask))
+        
+        # Comparison: original vs final (show absolute difference)
+        difference_mask = cv2.absdiff(first_mask, filtered_mesh_mask)
+        cv2.imshow('Difference (Original - Filtered)', resize_for_display(difference_mask))
+        
+        print("Debug windows will close automatically in 30 seconds...")
+        cv2.waitKey(30000)  # Wait 30 seconds (30000 milliseconds)
+        cv2.destroyAllWindows()
+    
+    # Update mesh with valid triangles only
+    if len(valid_triangles) > 0:
+        valid_faces = faces[valid_triangles]
+        
+        # Check for out-of-bounds vertex indices
+        max_vertex_idx = len(mesh.vertices) - 1
+        face_max = np.max(valid_faces) if len(valid_faces) > 0 else -1
+        if face_max > max_vertex_idx:
+            if verbose:
+                print(f"ERROR: Face indices go up to {face_max} but only {len(mesh.vertices)} vertices available")
+            return mesh
+        
+        # Rebuild UV coordinates for valid triangles
+        valid_triangle_uvs = uvs.reshape(-1,3,2)[valid_triangles]
+        
+        try:
+            # Create new mesh with filtered triangles
+            filtered_mesh = o3d.geometry.TriangleMesh()
+            filtered_mesh.vertices = mesh.vertices
+            filtered_mesh.triangles = o3d.utility.Vector3iVector(valid_faces)
+            
+            # Reshape UV coordinates to (-1, 2) format that Open3D expects
+            uv_array = valid_triangle_uvs.reshape(-1, 2)
+            filtered_mesh.triangle_uvs = o3d.utility.Vector2dVector(uv_array)
+            
+            # Copy other attributes if they exist
+            if hasattr(mesh, 'vertex_normals') and len(mesh.vertex_normals) > 0:
+                filtered_mesh.vertex_normals = mesh.vertex_normals
+            if hasattr(mesh, 'triangle_normals') and len(mesh.triangle_normals) > 0:
+                valid_triangle_normals = np.asarray(mesh.triangle_normals)[valid_triangles]
+                filtered_mesh.triangle_normals = o3d.utility.Vector3dVector(valid_triangle_normals)
+            
+            return filtered_mesh
+            
+        except Exception as e:
+            if verbose:
+                print(f"ERROR during mesh reconstruction: {e}")
+            return mesh
+    else:
+        if verbose:
+            print("Warning: All triangles were filtered out!")
+        return mesh
 
 def main():
     parser = argparse.ArgumentParser(description="Refine pointcloud using mesh and downsampling")
@@ -1519,21 +1943,21 @@ def main():
             display_downsample=args.display_downsample,
             color_by_angle=args.color_by_angle
         )
-    flattened_winding_path = flatten_pointcloud(
-        os.path.dirname(args.mesh),
-        display=args.display,
-        downsample_ratio=args.downsample_ratio,
-        flattening_downsample_ratio=args.flattening_downsample_ratio,
-        display_downsample=args.display_downsample,
-        color_by_angle=args.color_by_angle
-    )
-    grid_uv_flattened(
-        flattened_winding_path,
-        subsample_radius=30.0,
-        display=args.display,
-        display_downsample=args.display_downsample,
-        color_by_angle=args.color_by_angle
-    )
+        flattened_winding_path = flatten_pointcloud(
+            os.path.dirname(args.mesh),
+            display=args.display,
+            downsample_ratio=args.downsample_ratio,
+            flattening_downsample_ratio=args.flattening_downsample_ratio,
+            display_downsample=args.display_downsample,
+            color_by_angle=args.color_by_angle
+        )
+        grid_uv_flattened(
+            flattened_winding_path,
+            subsample_radius=30.0,
+            display=args.display,
+            display_downsample=args.display_downsample,
+            color_by_angle=args.color_by_angle
+        )
     filtered_path = os.path.join(os.path.dirname(args.mesh), "windings_filtered")
     mesh_uv_wraps(filtered_path, output_dir=os.path.join(os.path.dirname(filtered_path), "uv_meshes"))
     mesh_uv_global(filtered_path, output_path=os.path.join(os.path.dirname(filtered_path), "mesh_refined.obj"))
