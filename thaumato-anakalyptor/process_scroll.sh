@@ -8,7 +8,7 @@ usage(){
 Usage: $0 [--start <step>]
 
 Options:
-  -s,--start <step>   One of: grid, instances, graph, compile, solve
+  -s,--start <step>   One of: grid, instances, graph, compile, solve, solve_inverse, h5
                       (default: grid)
 
 Steps:
