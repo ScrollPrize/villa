@@ -42,7 +42,7 @@ case "$start" in
   compile)    start_idx=4;;
   solve)      start_idx=5;;
   solve_inverse)      start_idx=6;;
-  h55)      start_idx=7;;
+  h5)      start_idx=7;;
   *) echo "Invalid start step: $start"; usage;;
 esac
 
