@@ -149,6 +149,7 @@ fi
 if (( start_idx <= 7 )); then
   # Source the conda initialization script to define conda commands.
   source "$(conda info --base)/etc/profile.d/conda.sh"
+  echo conda info --envs
   conda activate thaumato
   
   # python3 -m ThaumatoAnakalyptor.instances_to_h5 --input_dir /workspace/experiments/point_cloud_colorized_verso_subvolume_blocks --output_h5 /workspace/experiments/point_cloud_colorized_verso_subvolume_blocks_compact.h5 --threads 12
