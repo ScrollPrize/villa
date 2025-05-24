@@ -17,6 +17,8 @@ Steps:
   graph       run instances_to_graph
   compile     compile bash script
   solve       run graph_solve
+  solve_inverse run graph_solve with inversed_winding_direction
+  h5        run h5 instance generation
 EOF
   exit 1
 }
@@ -40,6 +42,7 @@ case "$start" in
   compile)    start_idx=4;;
   solve)      start_idx=5;;
   solve_inverse)      start_idx=6;;
+  h55)      start_idx=7;;
   *) echo "Invalid start step: $start"; usage;;
 esac
 
@@ -141,6 +144,18 @@ if (( start_idx <= 6 )); then
     "/workspace/experiments/1352_3600_5002/graph.bin" \
     --experiment_name "${ZARR_NAME}_inverse" \
     --inversed_winding_direction
+fi
+
+if (( start_idx <= 7 )); then
+  conda activate thaumato
+  
+  # python3 -m ThaumatoAnakalyptor.instances_to_h5 --input_dir /workspace/experiments/point_cloud_colorized_verso_subvolume_blocks --output_h5 /workspace/experiments/point_cloud_colorized_verso_subvolume_blocks_compact.h5 --threads 12
+  retry_until_success \
+    python3 -m ThaumatoAnakalyptor.instances_to_h5 \
+    --input_dir "/workspace/experiments/point_cloud_colorized_verso_subvolume_blocks" \
+    --output_h5 "/workspace/experiments/point_cloud_colorized_verso_subvolume_blocks_compact.h5" \
+    --threads 12
+
 fi
 
 echo ">>> All requested steps completed for ${ZARR_NAME}."
