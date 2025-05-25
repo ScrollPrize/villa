@@ -787,7 +787,7 @@ def create_flattening_downsample_indices(points, is_mesh_flags, downsample_ratio
     return all_kept
 
 def flatten_pointcloud(base_path,
-                       k_neighbors=6,
+                       k_neighbors=10,
                        angle_threshold=40,
                        angle_weight=0.2,
                        downsample_ratio=0.1,
@@ -1009,7 +1009,10 @@ def flatten_pointcloud(base_path,
             winding_angles_ds,
             current_angles_ds,
             coords_ds[:, coords_z_index],
-            current_z_ds
+            current_z_ds,
+            coords_ds[:, 0],  # x coordinates
+            coords_ds[:, 1],  # y coordinates  
+            coords_ds[:, 2]   # z coordinates
         )
         print("Set up downsampled graph")
         
@@ -1059,7 +1062,7 @@ def flatten_pointcloud(base_path,
         solver_ds.solve_flattening(num_iterations=20000, visualize=True, 
                                    angle_tug_min=min_angle+90, angle_tug_max=max_angle-90, 
                                    z_tug_min=z_min+100, z_tug_max=z_max-100, 
-                                   tug_step=0.5, zero_ranges=zero_ranges_initial)
+                                   tug_step=0.25, zero_ranges=zero_ranges_initial)
         
         uvs_ds_initial = np.array(solver_ds.get_uvs())
         print(f"After first downsampled solve: u min={uvs_ds_initial[:,0].min()}, u max={uvs_ds_initial[:,0].max()}, v min={uvs_ds_initial[:,1].min()}, v max={uvs_ds_initial[:,1].max()}")
@@ -1120,7 +1123,10 @@ def flatten_pointcloud(base_path,
             winding_angles,
             current_angles_full,
             coords[:, coords_z_index],
-            current_z_full
+            current_z_full,
+            coords[:, 0],  # x coordinates
+            coords[:, 1],  # y coordinates
+            coords[:, 2]   # z coordinates
         )
         print("Set up full graph with downsampled initialization")
         
@@ -1943,21 +1949,21 @@ def main():
             display_downsample=args.display_downsample,
             color_by_angle=args.color_by_angle
         )
-        flattened_winding_path = flatten_pointcloud(
-            os.path.dirname(args.mesh),
-            display=args.display,
-            downsample_ratio=args.downsample_ratio,
-            flattening_downsample_ratio=args.flattening_downsample_ratio,
-            display_downsample=args.display_downsample,
-            color_by_angle=args.color_by_angle
-        )
-        grid_uv_flattened(
-            flattened_winding_path,
-            subsample_radius=30.0,
-            display=args.display,
-            display_downsample=args.display_downsample,
-            color_by_angle=args.color_by_angle
-        )
+    flattened_winding_path = flatten_pointcloud(
+        os.path.dirname(args.mesh),
+        display=args.display,
+        downsample_ratio=args.downsample_ratio,
+        flattening_downsample_ratio=args.flattening_downsample_ratio,
+        display_downsample=args.display_downsample,
+        color_by_angle=args.color_by_angle
+    )
+    grid_uv_flattened(
+        flattened_winding_path,
+        subsample_radius=30.0,
+        display=args.display,
+        display_downsample=args.display_downsample,
+        color_by_angle=args.color_by_angle
+    )
     filtered_path = os.path.join(os.path.dirname(args.mesh), "windings_filtered")
     mesh_uv_wraps(filtered_path, output_dir=os.path.join(os.path.dirname(filtered_path), "uv_meshes"))
     mesh_uv_global(filtered_path, output_path=os.path.join(os.path.dirname(filtered_path), "mesh_refined.obj"))

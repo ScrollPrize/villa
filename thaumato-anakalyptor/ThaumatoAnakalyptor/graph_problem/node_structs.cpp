@@ -46,6 +46,9 @@ void saveGraph(const std::vector<Node>& nodes, const std::string& filename) {
         outFile.write(reinterpret_cast<const char*>(&node.total_wnr_side), sizeof(node.total_wnr_side));
         outFile.write(reinterpret_cast<const char*>(&node.winding_nr), sizeof(node.winding_nr));
         outFile.write(reinterpret_cast<const char*>(&node.winding_nr_old), sizeof(node.winding_nr_old));
+        outFile.write(reinterpret_cast<const char*>(&node.coord_x), sizeof(node.coord_x));
+        outFile.write(reinterpret_cast<const char*>(&node.coord_y), sizeof(node.coord_y));
+        outFile.write(reinterpret_cast<const char*>(&node.coord_z), sizeof(node.coord_z));
         outFile.write(reinterpret_cast<const char*>(&node.sides_nr), sizeof(node.sides_nr));
         for (int j = 0; j < Node::sides_nr; ++j) {
             outFile.write(reinterpret_cast<const char*>(&node.sides[j]), sizeof(node.sides[j]));
@@ -103,6 +106,9 @@ std::vector<Node> loadGraph(const std::string& filename, int version) {
         inFile.read(reinterpret_cast<char*>(&node.total_wnr_side), sizeof(node.total_wnr_side));
         inFile.read(reinterpret_cast<char*>(&node.winding_nr), sizeof(node.winding_nr));
         inFile.read(reinterpret_cast<char*>(&node.winding_nr_old), sizeof(node.winding_nr_old));
+        inFile.read(reinterpret_cast<char*>(&node.coord_x), sizeof(node.coord_x));
+        inFile.read(reinterpret_cast<char*>(&node.coord_y), sizeof(node.coord_y));
+        inFile.read(reinterpret_cast<char*>(&node.coord_z), sizeof(node.coord_z));
         int sides_nr = 18;
         if (version > 0) {
             inFile.read(reinterpret_cast<char*>(&sides_nr), sizeof(sides_nr));
@@ -326,7 +332,7 @@ std::pair<std::vector<Node>, float> load_graph_from_binary(const std::string &fi
     return std::make_pair(graph, max_certainty);
 }
 
-std::pair<std::vector<Node>, float> load_flattening_graph_from_lists(const std::vector<std::vector<int>> connections, const std::vector<std::vector<float>> distances, const std::vector<float> winding_angle, const std::vector<float> current_angle, const std::vector<float> z, const std::vector<float> current_z) {
+std::pair<std::vector<Node>, float> load_flattening_graph_from_lists(const std::vector<std::vector<int>> connections, const std::vector<std::vector<float>> distances, const std::vector<float> winding_angle, const std::vector<float> current_angle, const std::vector<float> z, const std::vector<float> current_z, const std::vector<float> coords_x, const std::vector<float> coords_y, const std::vector<float> coords_z) {
     std::vector<Node> graph;
     int num_nodes = connections.size();
     graph.resize(num_nodes);
@@ -339,6 +345,10 @@ std::pair<std::vector<Node>, float> load_flattening_graph_from_lists(const std::
         // Static values to save initial z and winding angle
         graph[i].wnr_side = z[i];
         graph[i].wnr_side_old = winding_angle[i];
+        // Store 3D coordinates for angle calculations
+        graph[i].coord_x = coords_x[i];
+        graph[i].coord_y = coords_y[i];
+        graph[i].coord_z = coords_z[i];
         graph[i].deleted = false;
         // create edges
         graph[i].num_edges = connections[i].size();
@@ -384,6 +394,12 @@ std::vector<Node> createSubgraph(const std::vector<Node>& graph, const std::vect
                 newNode.sides[j] = origNode.sides[j];
                 newNode.sides_old[j] = origNode.sides_old[j];
             }
+
+            // Copy 3D coordinates (these are scalar values, so already copied by shallow copy)
+            // But let's be explicit for clarity
+            newNode.coord_x = origNode.coord_x;
+            newNode.coord_y = origNode.coord_y;
+            newNode.coord_z = origNode.coord_z;
 
             // --- Filter and adjust the edges ---
             // Only keep edges whose target node is also selected.

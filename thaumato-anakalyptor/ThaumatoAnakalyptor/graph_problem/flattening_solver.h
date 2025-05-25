@@ -10,6 +10,8 @@
  * Flattening solver: adjusts both f_init (z) and f_star (winding) coordinates
  * so that the Euclidean distance between nodes matches edge.k.
  * Applies additional tugs based on initial z (wnr_side) and initial winding (wnr_side_old).
+ * NEW: Also includes angle-based updates that preserve 3D angles between neighbor triplets
+ * by adjusting 2D positions to match the angles formed by neighbor1-node-neighbor2 in 3D space.
  * @param graph           Input graph (vector of Node), will be modified in place and returned.
  * @param num_iterations  Number of iterations to run.
  * @param valid_indices   Indices of nodes that are not deleted (to update).

@@ -58,6 +58,11 @@ struct Node {
     float same_block_closeness = 0.0f;
     float same_block_closeness_old = 0.0f;
 
+    // 3D coordinates for angle preservation in flattening
+    float coord_x = 0.0f;        // Original X coordinate
+    float coord_y = 0.0f;        // Original Y coordinate
+    float coord_z = 0.0f;        // Original Z coordinate
+
     float side = 0.0f;           // Side value for the node wrt to nodes around itself
     static constexpr int sides_nr = 3; // Number of sides for the node
     float* sides = new float[sides_nr]; // Sides values for the node
@@ -80,6 +85,9 @@ struct Node {
               std::abs(f_tilde - other.f_tilde) < 1e-6 &&
               std::abs(f_star - other.f_star) < 1e-6 &&
               std::abs(happiness - other.happiness) < 1e-6 &&
+              std::abs(coord_x - other.coord_x) < 1e-6 &&
+              std::abs(coord_y - other.coord_y) < 1e-6 &&
+              std::abs(coord_z - other.coord_z) < 1e-6 &&
               gt == other.gt &&
               std::abs(gt_f_star - other.gt_f_star) < 1e-6 &&
               deleted == other.deleted &&
@@ -108,7 +116,7 @@ void saveGraph(const std::vector<Node>& nodes, const std::string& filename);
 std::vector<Node> loadGraph(const std::string& filename, int version = 0);
 
 std::pair<std::vector<Node>, float> load_graph_from_binary(const std::string &file_name, bool clip_z, float z_min, float z_max, float same_winding_factor, bool fix_same_block_edges);
-std::pair<std::vector<Node>, float> load_flattening_graph_from_lists(const std::vector<std::vector<int>> connections, const std::vector<std::vector<float>> distances, const std::vector<float> winding_angle, const std::vector<float> current_angles, const std::vector<float> z, const std::vector<float> current_z);
+std::pair<std::vector<Node>, float> load_flattening_graph_from_lists(const std::vector<std::vector<int>> connections, const std::vector<std::vector<float>> distances, const std::vector<float> winding_angle, const std::vector<float> current_angles, const std::vector<float> z, const std::vector<float> current_z, const std::vector<float> coords_x, const std::vector<float> coords_y, const std::vector<float> coords_z);
 
 std::vector<Node> createSubgraph(const std::vector<Node>& graph, const std::vector<bool>& mask);
 void updateGraphWithSubgraph(std::vector<Node>& graph, const std::vector<bool>& mask, const std::vector<Node>& subgraph);

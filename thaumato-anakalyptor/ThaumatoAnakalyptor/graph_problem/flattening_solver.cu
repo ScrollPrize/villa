@@ -120,6 +120,8 @@ __global__ void flattening_update_kernel(
     if (node.deleted) return;
     if (node.fixed) return;
     float acc_z = 0.0f, acc_s = 0.0f, sum_w = 0.0f;
+    float angle_acc_z = 0.0f, angle_acc_s = 0.0f, angle_sum_w = 0.0f;
+    
     // Spring forces in 2D
     for (int e = 0; e < node.num_edges; ++e) {
         const Edge& edge = node.edges[e];
@@ -146,26 +148,114 @@ __global__ void flattening_update_kernel(
         // Determine direction: if the current distance is greater than desired, move closer (+), else move apart (-)
         float sign = (dist > edge.k) ? 1.0f : -1.0f;
         dist = fmaxf(dist, 1e-3f);  // Avoid division by zero
-        // acc_z += dz * sign;
-        // acc_s += ds * sign;
-        // sum_w += 1.0f;
         
         float error = fabsf(dist - edge.k);
         error = fminf(error, 0.5 * dist);  // Clamp error to avoid overflow
         error = fmaxf(error, 1.0f);  // Avoid slow final convergence
-        // dist *= 0.10f;
         float ux = dz / dist;
         float us = ds / dist;
         acc_z += error * ux * sign;
         acc_s +=  error * us * sign;
         sum_w += 1.0f;
     }
+    
+    // Angle-based forces: sample two random neighbors and try to preserve angles
+    if (node.num_edges >= 2) {
+        // Use deterministic "random" selection based on node index and iteration
+        unsigned int seed = i * 2654435761u + blockIdx.x * 16807u;
+        
+        // Select two different neighbors
+        int n1_idx = seed % node.num_edges;
+        int n2_idx = (seed / node.num_edges + 1) % node.num_edges;
+        if (n1_idx == n2_idx && node.num_edges > 1) {
+            n2_idx = (n2_idx + 1) % node.num_edges;
+        }
+        
+        const Edge& edge1 = node.edges[n1_idx];
+        const Edge& edge2 = node.edges[n2_idx];
+        
+        if (!edge1.temporary && !edge2.temporary && 
+            !d_graph[edge1.target_node].deleted && !d_graph[edge2.target_node].deleted) {
+            
+            const Node& nb1 = d_graph[edge1.target_node];  // This will be the angle vertex
+            const Node& nb2 = d_graph[edge2.target_node];
+            
+            // Calculate 3D angle at nb1: (node - nb1) and (nb2 - nb1)
+            float dx1_3d = node.coord_x - nb1.coord_x;
+            float dy1_3d = node.coord_y - nb1.coord_y;
+            float dz1_3d = node.coord_z - nb1.coord_z;
+            
+            float dx2_3d = nb2.coord_x - nb1.coord_x;
+            float dy2_3d = nb2.coord_y - nb1.coord_y;
+            float dz2_3d = nb2.coord_z - nb1.coord_z;
+            
+            // Normalize 3D vectors
+            float len1_3d = sqrtf(dx1_3d*dx1_3d + dy1_3d*dy1_3d + dz1_3d*dz1_3d);
+            float len2_3d = sqrtf(dx2_3d*dx2_3d + dy2_3d*dy2_3d + dz2_3d*dz2_3d);
+            
+            if (len1_3d > 1e-6f && len2_3d > 1e-6f) {
+                dx1_3d /= len1_3d; dy1_3d /= len1_3d; dz1_3d /= len1_3d;
+                dx2_3d /= len2_3d; dy2_3d /= len2_3d; dz2_3d /= len2_3d;
+                
+                // 3D angle cosine
+                float cos_3d = dx1_3d*dx2_3d + dy1_3d*dy2_3d + dz1_3d*dz2_3d;
+                cos_3d = fmaxf(-1.0f, fminf(1.0f, cos_3d));  // Clamp to [-1, 1]
+                float angle_3d = acosf(fabsf(cos_3d));  // Always positive angle
+                
+                // Calculate 2D angle at nb1: (node - nb1) and (nb2 - nb1) in UV space
+                float du1_2d = node.f_star - nb1.f_star;
+                float dv1_2d = node.f_init - nb1.f_init;
+                float du2_2d = nb2.f_star - nb1.f_star;
+                float dv2_2d = nb2.f_init - nb1.f_init;
+                
+                float len1_2d = sqrtf(du1_2d*du1_2d + dv1_2d*dv1_2d);
+                float len2_2d = sqrtf(du2_2d*du2_2d + dv2_2d*dv2_2d);
+                
+                if (len1_2d > 1e-6f && len2_2d > 1e-6f) {
+                    du1_2d /= len1_2d; dv1_2d /= len1_2d;
+                    du2_2d /= len2_2d; dv2_2d /= len2_2d;
+                    
+                    // 2D angle cosine
+                    float cos_2d = du1_2d*du2_2d + dv1_2d*dv2_2d;
+                    cos_2d = fmaxf(-1.0f, fminf(1.0f, cos_2d));
+                    float angle_2d = acosf(fabsf(cos_2d));  // Always positive angle
+                    
+                    // Angle difference (how much 2D angle deviates from 3D)
+                    float angle_error = angle_3d - angle_2d;
+                    
+                    // Calculate gradient to move node in direction that reduces angle error
+                    // We want to move the node to change angle_2d towards angle_3d
+                    
+                    // For small angle changes, the gradient direction is approximately
+                    // perpendicular to the current vector from nb1 to node
+                    float perp_u = -dv1_2d;  // Perpendicular to normalized vector (du1_2d, dv1_2d)
+                    float perp_v = du1_2d;
+                    
+                    // Determine the sign: if angle_2d < angle_3d, we need to increase angle_2d
+                    float sign = (angle_error > 0.0f) ? 1.0f : -1.0f;
+                    
+                    // Scale by angle error and add to accumulator
+                    float angle_weight = 0.1f;  // Weight for angle preservation vs distance preservation
+                    float error_magnitude = fabsf(angle_error);
+                    
+                    angle_acc_s += angle_weight * error_magnitude * sign * perp_u;
+                    angle_acc_z += angle_weight * error_magnitude * sign * perp_v;
+                    angle_sum_w += angle_weight;
+                }
+            }
+        }
+    }
+    
     if (sum_w == 0.0f) {
         sum_w = 1.0f;
     }
+    if (angle_sum_w == 0.0f) {
+        angle_sum_w = 1.0f;
+    }
         
-    float step_z = acc_z / sum_w;
-    float step_s = acc_s / sum_w;
+    float step_z = acc_z / sum_w + angle_acc_z / angle_sum_w;
+    float step_s = acc_s / sum_w + angle_acc_s / angle_sum_w;
+    
     // Additional z tug (only if a non-zero interval is specified)
     if (z_max > z_min) {
         if (node.wnr_side > z_max)      step_z += tug_step;
