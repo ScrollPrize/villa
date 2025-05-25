@@ -1547,6 +1547,10 @@ class WalkToSheet():
         t_means = self.calculate_means(ordered_pointset)
         mean_innermost_ts, mean_outermost_ts, winding_direction = self.find_inner_outermost_winding_direction(t_means, angle_vector)
 
+        # save winding direction to winding_direction.txt
+        with open(os.path.join(self.save_path, "winding_direction.txt"), "w") as f:
+            f.write(f"Winding direction: {winding_direction}")
+
         # Set to false to load precomputed partial results during development
         fresh_start2 = continue_from <= 3
         if fresh_start2:

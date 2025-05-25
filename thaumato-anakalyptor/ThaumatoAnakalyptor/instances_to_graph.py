@@ -647,12 +647,18 @@ class Graph:
             print("Computing node edges...")
         for node in tqdm(self.nodes, desc="Adding nodes") if verbose else self.nodes:
             self.nodes[node]['edges'] = []
+        invalid_edges = []
         for edge in tqdm(self.edges, desc="Computing node edges") if verbose else self.edges:
             for k in self.edges[edge]:
                 if edge[0] not in self.nodes or edge[1] not in self.nodes: # skip edges with bad certainty that are going to extremely weakly connected nodes
+                    invalid_edges.append(edge)
                     continue
                 self.nodes[edge[0]]['edges'].append(edge)
                 self.nodes[edge[1]]['edges'].append(edge)
+        # Remove invalid edges
+        for edge in invalid_edges:
+            if edge in self.edges:
+                del self.edges[edge]
 
     def remove_nodes_edges(self, nodes):
         """

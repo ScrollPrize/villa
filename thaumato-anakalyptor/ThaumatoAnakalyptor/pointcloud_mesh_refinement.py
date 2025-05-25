@@ -20,6 +20,54 @@ import graph_problem_gpu_py
 
 ### UTILS ###
 
+def load_winding_direction(winding_direction_path):
+    """
+    Load winding direction from a text file.
+    
+    The file should contain a line like "Winding direction: True" or "Winding direction: False"
+    as saved by the graph_to_mesh.py WalkToSheet class.
+    
+    Args:
+        winding_direction_path (str): Path to the winding direction text file
+        
+    Returns:
+        bool: True if winding direction is normal, False if reversed
+        
+    Raises:
+        FileNotFoundError: If the winding direction file doesn't exist
+        ValueError: If the file format is invalid or cannot be parsed
+    """
+    if not os.path.exists(winding_direction_path):
+        raise FileNotFoundError(f"Winding direction file not found: {winding_direction_path}")
+    
+    try:
+        with open(winding_direction_path, "r") as f:
+            content = f.read().strip()
+        
+        # Expected format: "Winding direction: True" or "Winding direction: False"
+        if "Winding direction:" not in content:
+            raise ValueError(f"Invalid file format. Expected 'Winding direction: <bool>', got: {content}")
+        
+        # Extract the boolean value part
+        direction_str = content.split("Winding direction:")[-1].strip()
+        
+        # Parse boolean value
+        if direction_str.lower() == "true":
+            winding_direction = True
+        elif direction_str.lower() == "false":
+            winding_direction = False
+        else:
+            raise ValueError(f"Invalid boolean value. Expected 'True' or 'False', got: {direction_str}")
+        
+        print(f"Loaded winding direction: {winding_direction}")
+        return winding_direction
+        
+    except Exception as e:
+        if isinstance(e, (FileNotFoundError, ValueError)):
+            raise
+        else:
+            raise ValueError(f"Error reading winding direction file {winding_direction_path}: {str(e)}")
+
 def shuffling_points_axis(points, axis_indices=[2, 0, 1, 3]):
     """
     Rotate points by reshuffling axis
@@ -1318,7 +1366,7 @@ def create_mask(mesh, natural_image_size, output_path=None, verbose=True):
     mask_path = None
     if output_path is not None:
         mask_path = os.path.join(os.path.dirname(output_path), 
-                                os.path.basename(output_path).split(".")[0] + "_mask.png")
+                                os.path.basename(output_path).split(".")[0] + ".png")
         cv2.imwrite(mask_path, mask)
         
         if verbose:
@@ -1446,21 +1494,21 @@ def grid_uv_flattened(flattened_winding_path,
 
         save_flattened_winding(winding_filtered_path, winding_files_indices[i], points_subsampled, uvs_subsampled)
 
-def mesh_uv_wraps(filtered_winding_path, output_dir):
+def mesh_uv_wraps(filtered_winding_path, output_dir, winding_direction=False):
     """
     For each filtered winding .npz in `filtered_winding_path`:
       1) Load points (Nx3+) and uvs (Nx2)
-      2) Run Delaunay on the UVs → simplices (M×3)
-      3) Build an Open3D TriangleMesh:
-           - vertices = 3D points
-           - triangles = simplices
-           - triangle_uvs = flattened per-triangle UV coords
-      4) Save as OBJ with UVs in `output_dir/wrap_<nr>.obj`
+      2) Always flip UV U-coordinates first (left becomes right)
+      3) Run Delaunay on the flipped UVs → simplices (M×3)
+      4) If winding_direction is False, flip UVs back and reverse triangle winding
+      5) Build an Open3D TriangleMesh with proper normal alignment
+      6) Save as OBJ with UVs in `output_dir/wrap_<nr>.obj`
 
     Args:
         filtered_winding_path: str, folder containing
             `flattened_winding_<nr>.npz` with arrays `points, uvs`
         output_dir: str, where to write `wrap_<nr>.obj`
+        winding_direction: bool, if True keep flipped UVs, if False flip back
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1487,33 +1535,52 @@ def mesh_uv_wraps(filtered_winding_path, output_dir):
             print(f"Skipping wrap {nr} - insufficient points for triangulation: {len(uvs2)}")
             continue
 
-        # 2D Delaunay in UV space
-        tri = Delaunay(uvs2)
+        # ALWAYS flip U coordinates first (left becomes right)
+        print(f"Always flipping U coordinates for wrap {nr} before Delaunay")
+        u_max = np.max(uvs2[:, 0])
+        uvs2_flipped = uvs2.copy()
+        uvs2_flipped[:, 0] = u_max - uvs2[:, 0]
+
+        # 2D Delaunay in UV space using flipped coordinates
+        tri = Delaunay(uvs2_flipped)
         faces = tri.simplices  # M×3 array of vertex-indices
 
-        # filter out faces with min max winding angle diff > 10 deg
-        winding_angles_faces = winding_angles[faces]
+        # Now decide what to do based on winding_direction
+        final_uvs = uvs2_flipped.copy()
+        final_faces = faces.copy()
+        
+        if not winding_direction:
+            # Flip UVs back to original orientation
+            print(f"Flipping UVs back for wrap {nr} (winding_direction=False)")
+            final_uvs = uvs2.copy()  # Use original UVs
+            
+            # Reverse triangle winding order to maintain consistent orientation
+            print(f"Reversing triangle winding order for wrap {nr}")
+            final_faces = faces[:, [0, 2, 1]]  # Swap vertices 1 and 2 to reverse winding
+
+        # filter out faces with min max winding angle diff > 50 deg
+        winding_angles_faces = winding_angles[final_faces]
         min_angles = np.min(winding_angles_faces, axis=1)
         max_angles = np.max(winding_angles_faces, axis=1)
         winding_angle_diffs = max_angles - min_angles
         faces_mask = np.abs(winding_angle_diffs) < 50
-        faces = faces[faces_mask]
+        final_faces = final_faces[faces_mask]
 
         # build Open3D mesh
         mesh = o3d.geometry.TriangleMesh()
         mesh.vertices = o3d.utility.Vector3dVector(pts3)
-        mesh.triangles = o3d.utility.Vector3iVector(faces)
+        mesh.triangles = o3d.utility.Vector3iVector(final_faces)
 
         # Open3D expects triangle_uvs to be length 3*M
-        # so we flatten face-by-face
-        tri_uvs = uvs2[faces].reshape(-1, 2)
+        # so we flatten face-by-face using final UVs
+        tri_uvs = final_uvs[final_faces].reshape(-1, 2)
         mesh.triangle_uvs = o3d.utility.Vector2dVector(tri_uvs)
 
-        # Compute normals
-        mesh.compute_vertex_normals()
+        # Compute triangle normals first to ensure consistent orientation
         mesh.compute_triangle_normals()
-
-        # mesh = clean_mesh(mesh, longest_edge_pct=100, area_pct=100, edge_length_thresh=1000)
+        
+        # Then compute vertex normals (these will be aligned with triangle normals)
+        mesh.compute_vertex_normals()
 
         # Normalize UVs after cleaning and get natural image size
         mesh, natural_image_size = normalize_uvs(mesh, verbose=True)
@@ -1526,16 +1593,22 @@ def mesh_uv_wraps(filtered_winding_path, output_dir):
         save_mesh_with_uvs(mesh, out_path, natural_image_size)
         print(f"Saved wrap {nr} mesh → {out_path}")
 
-
-def mesh_uv_global(filtered_winding_path, output_path):
+def mesh_uv_global(filtered_winding_path, output_path, winding_direction=False):
     """
     Build one seamless UV-mesh across all wraps:
       1) load every wrap_i's (points, uvs)
       2) concatenate into big all_pts, all_uvs, all_wrap_ids
-      3) Delaunay on all_uvs → faces
-      4) keep only faces whose max(wrap_ids) - min(wrap_ids) ≤ 1
-      5) angle-span / edge-area cull via clean_mesh
-      6) write single OBJ with per-triangle UVs
+      3) Always flip UV U-coordinates first (left becomes right)
+      4) Delaunay on flipped all_uvs → faces
+      5) If winding_direction is False, flip UVs back and reverse triangle winding
+      6) keep only faces whose max(wrap_ids) - min(wrap_ids) ≤ 1
+      7) angle-span / edge-area cull via clean_mesh
+      8) write single OBJ with per-triangle UVs
+      
+    Args:
+        filtered_winding_path: str, folder containing filtered winding files
+        output_path: str, path to save the global mesh
+        winding_direction: bool, if True keep flipped UVs, if False flip back
     """
     # 1) load and concatenate
     files = sorted(glob.glob(os.path.join(filtered_winding_path, "flattened_winding_*.npz")))
@@ -1577,39 +1650,46 @@ def mesh_uv_global(filtered_winding_path, output_path):
     all_wr = np.concatenate(wrap_ids)
     print(f"Global arrays: {all_pts.shape} points, {all_uvs.shape} UVs")
 
+    # ALWAYS flip U coordinates first (left becomes right)
+    print("Always flipping U coordinates for global mesh before Delaunay")
+    u_max = np.max(all_uvs[:, 0])
+    all_uvs_flipped = all_uvs.copy()
+    all_uvs_flipped[:, 0] = u_max - all_uvs[:, 0]
+
     # Validate UV coordinates before Delaunay
-    print("Validating UV coordinates...")
-    print(f"UV min: [{np.min(all_uvs[:, 0]):.2f}, {np.min(all_uvs[:, 1]):.2f}]")
-    print(f"UV max: [{np.max(all_uvs[:, 0]):.2f}, {np.max(all_uvs[:, 1]):.2f}]")
+    print("Validating flipped UV coordinates...")
+    print(f"Flipped UV min: [{np.min(all_uvs_flipped[:, 0]):.2f}, {np.min(all_uvs_flipped[:, 1]):.2f}]")
+    print(f"Flipped UV max: [{np.max(all_uvs_flipped[:, 0]):.2f}, {np.max(all_uvs_flipped[:, 1]):.2f}]")
     
     # Check for invalid values
-    has_nan = np.any(np.isnan(all_uvs))
-    has_inf = np.any(np.isinf(all_uvs))
+    has_nan = np.any(np.isnan(all_uvs_flipped))
+    has_inf = np.any(np.isinf(all_uvs_flipped))
     if has_nan or has_inf:
         print(f"ERROR: Invalid UV values detected - NaN: {has_nan}, Inf: {has_inf}")
         return
     
     # Check for duplicate points (can cause Delaunay issues)
-    unique_uvs, unique_indices = np.unique(all_uvs, axis=0, return_index=True)
-    if len(unique_uvs) < len(all_uvs):
-        print(f"Warning: Found {len(all_uvs) - len(unique_uvs)} duplicate UV points, using unique points only")
-        all_uvs = unique_uvs
+    unique_uvs, unique_indices = np.unique(all_uvs_flipped, axis=0, return_index=True)
+    if len(unique_uvs) < len(all_uvs_flipped):
+        print(f"Warning: Found {len(all_uvs_flipped) - len(unique_uvs)} duplicate UV points, using unique points only")
+        all_uvs_flipped = unique_uvs
+        all_uvs = all_uvs[unique_indices]  # Keep original UVs aligned
         all_pts = all_pts[unique_indices]
         all_wr = all_wr[unique_indices]
-        print(f"After deduplication: {all_pts.shape} points, {all_uvs.shape} UVs")
+        print(f"After deduplication: {all_pts.shape} points, {all_uvs_flipped.shape} UVs")
     
     # Final check for minimum points
-    if len(all_uvs) < 3:
-        print(f"After validation: insufficient points for triangulation: {len(all_uvs)}")
+    if len(all_uvs_flipped) < 3:
+        print(f"After validation: insufficient points for triangulation: {len(all_uvs_flipped)}")
         return
     
     print("UV validation passed, proceeding with Delaunay...")
     
     # Additional geometric checks
-    print("Checking UV coordinate distribution...")
-    uv_range_u = np.max(all_uvs[:, 0]) - np.min(all_uvs[:, 0])
-    uv_range_v = np.max(all_uvs[:, 1]) - np.min(all_uvs[:, 1])
-    print(f"UV ranges: U={uv_range_u:.2f}, V={uv_range_v:.2f}")
+    print("Checking flipped UV coordinate distribution...")
+    uv_range_u = np.max(all_uvs_flipped[:, 0]) - np.min(all_uvs_flipped[:, 0])
+    uv_range_v = np.max(all_uvs_flipped[:, 1]) - np.min(all_uvs_flipped[:, 1])
+    print(f"Flipped UV ranges: U={uv_range_u:.2f}, V={uv_range_v:.2f}")
     
     # Check if points are collinear (could cause Delaunay issues)
     if uv_range_u < 1e-6 or uv_range_v < 1e-6:
@@ -1617,10 +1697,10 @@ def mesh_uv_global(filtered_winding_path, output_path):
         return
     
     # Try a small subset first to test Delaunay
-    if len(all_uvs) > 100:
+    if len(all_uvs_flipped) > 100:
         print("Testing Delaunay with small subset...")
-        test_indices = np.random.choice(len(all_uvs), size=100, replace=False)
-        test_uvs = all_uvs[test_indices]
+        test_indices = np.random.choice(len(all_uvs_flipped), size=100, replace=False)
+        test_uvs = all_uvs_flipped[test_indices]
         try:
             test_tri = Delaunay(test_uvs)
             print(f"Test triangulation successful: {len(test_tri.simplices)} triangles")
@@ -1628,37 +1708,52 @@ def mesh_uv_global(filtered_winding_path, output_path):
             print(f"ERROR: Test Delaunay failed: {e}")
             return
     
-    print("Attempting full Delaunay triangulation...")
+    print("Attempting full Delaunay triangulation on flipped UVs...")
     try:
-        # 2) Delaunay on the full UV set
-        tri = Delaunay(all_uvs)
+        # Delaunay on the flipped UV set
+        tri = Delaunay(all_uvs_flipped)
         print(f"Delaunay successful: {len(tri.simplices)} triangles")
     except Exception as e:
         print(f"ERROR: Delaunay triangulation failed: {e}")
         return
 
-    # 2) Delaunay on the full UV set
+    faces = tri.simplices
+    
+    # Now decide what to do based on winding_direction
+    final_uvs = all_uvs_flipped.copy()
+    final_faces = faces.copy()
+    
+    if not winding_direction:
+        # Flip UVs back to original orientation
+        print("Flipping UVs back for global mesh (winding_direction=False)")
+        final_uvs = all_uvs.copy()  # Use original UVs
+        
+        # Reverse triangle winding order to maintain consistent orientation
+        print("Reversing triangle winding order for global mesh")
+        final_faces = faces[:, [0, 2, 1]]  # Swap vertices 1 and 2 to reverse winding
 
-    # 3) only allow "neighboring-wrap" triangles
-    w0 = all_wr[tri.simplices[:,0]]
-    w1 = all_wr[tri.simplices[:,1]]
-    w2 = all_wr[tri.simplices[:,2]]
+    # only allow "neighboring-wrap" triangles
+    w0 = all_wr[final_faces[:,0]]
+    w1 = all_wr[final_faces[:,1]]
+    w2 = all_wr[final_faces[:,2]]
     maxdiff = np.maximum.reduce([w0-w1, w1-w2, w2-w0, w1-w0, w2-w1, w0-w2])
     keep = np.abs(maxdiff) <= 1
-    faces = tri.simplices[keep]
+    final_faces = final_faces[keep]
 
-    # 4) build Open3D mesh
+    # build Open3D mesh
     mesh = o3d.geometry.TriangleMesh()
     mesh.vertices  = o3d.utility.Vector3dVector(all_pts.astype(np.float64))
-    mesh.triangles = o3d.utility.Vector3iVector(faces)
+    mesh.triangles = o3d.utility.Vector3iVector(final_faces)
 
-    # assign per-triangle UVs
-    tri_uvs = all_uvs[faces].reshape(-1, 2)
+    # assign per-triangle UVs using final UVs
+    tri_uvs = final_uvs[final_faces].reshape(-1, 2)
     mesh.triangle_uvs = o3d.utility.Vector2dVector(tri_uvs)
 
-    # Compute normals
-    mesh.compute_vertex_normals()
+    # Compute triangle normals first to ensure consistent orientation
     mesh.compute_triangle_normals()
+    
+    # Then compute vertex normals (these will be aligned with triangle normals)
+    mesh.compute_vertex_normals()
 
     # 5) final cleanup (you can reuse your clean_mesh here)
     # mesh = clean_mesh(mesh,
@@ -1941,32 +2036,42 @@ def main():
                         help="Color 3D display by angular value")
     args = parser.parse_args()
 
-    flattened_winding_path = os.path.join(os.path.dirname(args.mesh), "windings_flattened")
-    if not args.skip_precomputation:
-        generate_winding_pointclouds(
-            args.mesh,
+    # Load winding direction
+    winding_direction_path = os.path.join(os.path.dirname(args.mesh), "winding_direction.txt")
+    try:
+        winding_direction = load_winding_direction(winding_direction_path)
+        print(f"Using winding direction: {winding_direction}")
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Warning: Could not load winding direction: {e}")
+        print("Defaulting to winding_direction=False (no UV flipping)")
+        winding_direction = False
+
+        flattened_winding_path = os.path.join(os.path.dirname(args.mesh), "windings_flattened")
+        if not args.skip_precomputation:
+            generate_winding_pointclouds(
+                args.mesh,
+                display=args.display,
+                display_downsample=args.display_downsample,
+                color_by_angle=args.color_by_angle
+            )
+        flattened_winding_path = flatten_pointcloud(
+            os.path.dirname(args.mesh),
+            display=args.display,
+            downsample_ratio=args.downsample_ratio,
+            flattening_downsample_ratio=args.flattening_downsample_ratio,
+            display_downsample=args.display_downsample,
+            color_by_angle=args.color_by_angle
+        )
+        grid_uv_flattened(
+            flattened_winding_path,
+            subsample_radius=30.0,
             display=args.display,
             display_downsample=args.display_downsample,
             color_by_angle=args.color_by_angle
         )
-    flattened_winding_path = flatten_pointcloud(
-        os.path.dirname(args.mesh),
-        display=args.display,
-        downsample_ratio=args.downsample_ratio,
-        flattening_downsample_ratio=args.flattening_downsample_ratio,
-        display_downsample=args.display_downsample,
-        color_by_angle=args.color_by_angle
-    )
-    grid_uv_flattened(
-        flattened_winding_path,
-        subsample_radius=30.0,
-        display=args.display,
-        display_downsample=args.display_downsample,
-        color_by_angle=args.color_by_angle
-    )
     filtered_path = os.path.join(os.path.dirname(args.mesh), "windings_filtered")
-    mesh_uv_wraps(filtered_path, output_dir=os.path.join(os.path.dirname(filtered_path), "uv_meshes"))
-    mesh_uv_global(filtered_path, output_path=os.path.join(os.path.dirname(filtered_path), "mesh_refined.obj"))
+    mesh_uv_wraps(filtered_path, output_dir=os.path.join(os.path.dirname(filtered_path), "uv_meshes"), winding_direction=winding_direction)
+    mesh_uv_global(filtered_path, output_path=os.path.join(os.path.dirname(filtered_path), "mesh_refined.obj"), winding_direction=winding_direction)
 
 if __name__ == "__main__":
     main()
