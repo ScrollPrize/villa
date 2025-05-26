@@ -13,6 +13,7 @@ from datetime import datetime
 import tempfile
 from heapq import heappush, heappop
 from PIL import Image
+import json
 # This disables the decompression bomb protection in Pillow
 Image.MAX_IMAGE_PIXELS = None
 
@@ -378,13 +379,25 @@ class MeshSplitter:
         min_v = np.min(vertices[:, 2])
         max_v = np.max(vertices[:, 2])
         mesh_paths = []
+        
+        # Save split information for stitching
+        split_info = {
+            'original_mesh_path': self.mesh_path,
+            'min_u': min_u,
+            'max_u': max_u,
+            'min_v': min_v,
+            'max_v': max_v,
+            'split_width': split_width,
+            'stamp': stamp,
+            'windows': []
+        }
+        
         window_start = min_u
         while window_start < max_u:
             window_end = window_start + split_width
             window_indices = np.where((self.vertices_np[:, 0] >= window_start) & (self.vertices_np[:, 0] < window_end))
             qualifying_triangles = np.any(np.isin(triangles, window_indices), axis=1)
             qualifying_uvs = qualifying_triangles.repeat(3).reshape(-1)
-
 
              # Create a new mesh with the selected vertices and triangles
             cut_mesh = o3d.geometry.TriangleMesh()
@@ -410,7 +423,24 @@ class MeshSplitter:
             uv_image = Image.new('L', (int(np.ceil(max_u-min_u)), int(np.ceil(max_v-min_v))), color=255)  # 255 for white background, 0 for black
             uv_image.save(path_window[:-4] + "_cylindrical.png")
             print(f"Saved windowed mesh to {path_window}")
+            
+            # Save window information for stitching
+            window_info = {
+                'window_start': window_start,
+                'window_end': window_end,
+                'mesh_path': path_window,
+                'vertex_indices': window_indices[0].tolist(),  # Original vertex indices in this window
+                'qualifying_triangles': qualifying_triangles.tolist()  # Triangle mask for this window
+            }
+            split_info['windows'].append(window_info)
+            
             window_start = window_end
+        
+        # Save split information to JSON file
+        split_info_path = os.path.join(os.path.dirname(self.mesh_path), window_mesh_name, "split_info.json")
+        with open(split_info_path, 'w') as f:
+            json.dump(split_info, f, indent=2)
+        print(f"Saved split information to {split_info_path}")
         
         return mesh_paths, stamp
         
