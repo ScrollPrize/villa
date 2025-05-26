@@ -75,11 +75,11 @@ run_docker_command() {
 # Function to run command in Docker with retry and restart capability
 run_in_docker_with_retry() {
   local cmd="$1"
-  local max_retries=3
   local retry_count=0
   
-  while (( retry_count < max_retries )); do
-    echo ">>> Attempt $((retry_count + 1)) of $max_retries"
+  while true; do
+    retry_count=$((retry_count + 1))
+    echo ">>> Attempt $retry_count"
     echo ">>> Running: $cmd"
     
     # Kill any existing containers
@@ -91,33 +91,26 @@ run_in_docker_with_retry() {
     
     # Run the command using the same Docker config as start_docker.sh
     if run_docker_command "$cmd"; then
-      echo ">>> SUCCESS: Command completed successfully"
+      echo ">>> SUCCESS: Command completed successfully after $retry_count attempt(s)"
       return 0
     else
-      echo ">>> FAILED: Command failed (attempt $((retry_count + 1)))"
-      retry_count=$((retry_count + 1))
+      echo ">>> FAILED: Command failed (attempt $retry_count)"
+      echo ">>> Cleaning up and restarting Docker in 5 seconds..."
       
-      if (( retry_count < max_retries )); then
-        echo ">>> Cleaning up and restarting Docker in 5 seconds..."
-        
-        # Kill all Docker containers
-        sudo docker kill $(sudo docker ps -q) 2>/dev/null || true
-        sudo docker rm $(sudo docker ps -aq) 2>/dev/null || true
-        
-        # Restart Docker service
-        sudo systemctl restart docker
-        sleep 10
-        
-        # Re-setup Docker environment
-        setup_docker
-        
-        echo ">>> Docker restarted, retrying command..."
-      fi
+      # Kill all Docker containers
+      sudo docker kill $(sudo docker ps -q) 2>/dev/null || true
+      sudo docker rm $(sudo docker ps -aq) 2>/dev/null || true
+      
+      # Restart Docker service
+      sudo systemctl restart docker
+      sleep 10
+      
+      # Re-setup Docker environment
+      setup_docker
+      
+      echo ">>> Docker restarted, retrying command..."
     fi
   done
-  
-  echo ">>> ERROR: Command failed after $max_retries attempts"
-  exit 1
 }
 
 # Find the .zarr directory from host
