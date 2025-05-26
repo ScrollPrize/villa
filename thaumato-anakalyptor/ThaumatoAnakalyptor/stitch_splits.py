@@ -185,13 +185,13 @@ class MeshStitcher:
         """
         if output_path is None:
             mesh_dir = os.path.dirname(self.original_mesh_path)
-            mesh_name = os.path.splitext(os.path.basename(self.original_mesh_path))[0]
+            mesh_basename = os.path.splitext(os.path.basename(self.original_mesh_path))[0]
             if image_filename:
-                # Include the image filename in the output name
-                image_base = os.path.splitext(image_filename)[0]
-                output_path = os.path.join(mesh_dir, f"{mesh_name}_{image_base}_stitched.jpg")
+                # Extract just the filename part, ignoring any subdirectory structure
+                image_base = os.path.splitext(os.path.basename(image_filename))[0]
+                output_path = os.path.join(mesh_dir, f"{mesh_basename}_{image_base}_stitched.jpg")
             else:
-                output_path = os.path.join(mesh_dir, f"{mesh_name}_stitched.jpg")
+                output_path = os.path.join(mesh_dir, f"{mesh_basename}_stitched.jpg")
         
         # Determine output image size based on UV bounds
         min_u = self.split_info['min_u']
@@ -461,7 +461,7 @@ class FinalizeMeshStitcher:
 
     def stitch_renders(self, output_path=None, image_filename=None):
         """
-        Stitch the cut renders back into the original texture image using triangle-level precision.
+        Stitch the cut renders back into the original texture image using simple image translation.
         
         Args:
             output_path: Path to save the stitched image. If None, saves next to original mesh.
@@ -470,13 +470,13 @@ class FinalizeMeshStitcher:
         """
         if output_path is None:
             mesh_dir = os.path.dirname(self.original_mesh_path)
-            mesh_name = os.path.splitext(os.path.basename(self.original_mesh_path))[0]
+            mesh_basename = os.path.splitext(os.path.basename(self.original_mesh_path))[0]
             if image_filename:
                 # Include the image filename in the output name
-                image_base = os.path.splitext(image_filename)[0]
-                output_path = os.path.join(mesh_dir, f"{mesh_name}_{image_base}_stitched.jpg")
+                image_base = os.path.splitext(os.path.basename(image_filename))[0]
+                output_path = os.path.join(mesh_dir, f"{mesh_basename}_{image_base}_stitched.jpg")
             else:
-                output_path = os.path.join(mesh_dir, f"{mesh_name}_stitched.jpg")
+                output_path = os.path.join(mesh_dir, f"{mesh_basename}_stitched.jpg")
         
         # Get original texture size
         original_texture_size = self.cut_info['original_texture_size']
@@ -484,25 +484,9 @@ class FinalizeMeshStitcher:
         height = int(original_texture_size[1])
         
         print(f"Creating output image of size {width}x{height}")
-        print(f"Original texture size from cut_info: {original_texture_size}")
-        if image_filename:
-            print(f"Looking for '{image_filename}' in each cut folder")
         
         # Initialize output image (RGB)
         output_image = np.zeros((height, width, 3), dtype=np.uint8)
-        coverage_mask = np.zeros((height, width), dtype=bool)
-        
-        # Debug counters
-        cuts_processed = 0
-        cuts_found = 0
-        triangles_processed = 0
-        pixels_updated = 0
-        
-        # Track which triangles from the original mesh have actually been written to the output so far
-        processed_triangles_global = set()
-        total_original_triangles = len(self.triangles)
-        
-        print(f"Original mesh has {total_original_triangles} triangles")
         
         # Process each cut
         for cut_info in tqdm(self.cut_info['cuts'], desc="Stitching cuts", disable=False, leave=True, position=0):
@@ -515,7 +499,6 @@ class FinalizeMeshStitcher:
                     print(f"Warning: No render found for cut {cut_info['cut_index']}")
                 continue
             
-            cuts_found += 1
             print(f"Processing cut {cut_info['cut_index']} with render {render_path}")
             
             # Load render image
@@ -523,294 +506,103 @@ class FinalizeMeshStitcher:
             if render_image.mode != 'RGB':
                 render_image = render_image.convert('RGB')
             render_array = np.array(render_image)
-            print(f"  Render image size: {render_array.shape}")
             
-            # Check if we have triangle information (new format)
+            # Check if we have triangle information to calculate translation
             if 'triangle_info' in cut_info and cut_info['triangle_info']:
-                # Use triangle-level precision
                 triangle_info = cut_info['triangle_info']
                 original_uvs = triangle_info['original_uvs']
-                original_triangle_indices = triangle_info['original_triangle_indices']
                 
-                print(f"  Using triangle-level precision with {len(original_triangle_indices)} triangles")
-                print(f"  Original triangle indices range: {min(original_triangle_indices) if original_triangle_indices else 'N/A'} to {max(original_triangle_indices) if original_triangle_indices else 'N/A'}")
-                print(f"  UV coordinates count: {len(original_uvs)} (should be {len(original_triangle_indices) * 3})")
-                
-                # Check if triangle indices and UV coordinates are properly aligned
-                expected_uv_count = len(original_triangle_indices) * 3
-                if len(original_uvs) != expected_uv_count:
-                    print(f"  WARNING: UV count mismatch! Expected {expected_uv_count}, got {len(original_uvs)}")
-                
-                # CRITICAL FIX: We need to use triangle indices as lookups, not sequential array indices
-                # The UV coordinates are stored sequentially, but they correspond to non-sequential triangle indices
-                # We need to create a mapping from triangle index to UV coordinates
-                
-                print(f"  Creating triangle index to UV mapping...")
-                triangle_to_uv_map = {}
-                for uv_idx, triangle_idx in enumerate(original_triangle_indices):
-                    triangle_to_uv_map[triangle_idx] = uv_idx
-                
-                print(f"  Created mapping for {len(triangle_to_uv_map)} triangles")
-                
-                # Get window bounds for this cut
-                window_start = cut_info['window_start']
-                window_end = cut_info['window_end']
-                
-                print(f"  Processing cut {cut_info['cut_index']} with window [{window_start}, {window_end}]")
-                
-                # Process triangles in batches for better performance
-                batch_size = 1000
-                num_triangles = len(original_triangle_indices)
-                
-                # Debug counters for UV coordinate issues
-                triangles_with_negative_uv = 0
-                triangles_outside_texture = 0
-                triangles_with_zero_area = 0
-                triangles_processed_successfully = 0
-                triangles_failed_processing = 0
-                
-                # Reshape original_uvs from n*3,2 to n,3,2 format for easier triangle indexing
+                # Reshape UVs and flip V coordinate
                 original_uvs_reshaped = np.array(original_uvs).reshape(-1, 3, 2)
-                # Flip V coordinate (Y axis) to convert from bottom-left origin (OBJ) to
-                # top-left origin (image).  This avoids the vertical mirroring artefact
-                # where top and bottom portions of the texture overlap.
                 original_uvs_flipped = original_uvs_reshaped.copy()
                 original_uvs_flipped[:, :, 1] = height - 1 - original_uvs_flipped[:, :, 1]
-
-                print(f"  Reshaped UVs to: {original_uvs_reshaped.shape} (after flipping V)")
                 
-                # Compute V range for this cut based on the stored original UVs.
-                # This is more accurate than relying on the global texture height
-                # because each cut may not span the full V extent.
-                cut_v_values = np.array(original_uvs_flipped).reshape(-1,2)[:,1]
-                cut_min_v = float(np.min(cut_v_values))
-                cut_max_v = float(np.max(cut_v_values))
-                v_denominator = max(cut_max_v - cut_min_v, 1e-6)  # avoid divide-by-zero
-                print(f"  Cut V range: [{cut_min_v:.2f}, {cut_max_v:.2f}]")
+                # Get all UV coordinates as flat array
+                all_uvs = original_uvs_flipped.reshape(-1, 2)
                 
-                for batch_start in tqdm(range(0, num_triangles, batch_size), desc=f"Processing triangle batches in cut {cut_info['cut_index']}"):
-                    batch_end = min(batch_start + batch_size, num_triangles)
+                # Calculate translation by comparing normalized cut coordinates to original coordinates
+                # Cut mesh UVs are normalized [0,1], so we need to find the offset
+                cut_min_u = np.min(all_uvs[:, 0])
+                cut_min_v = np.min(all_uvs[:, 1])
+                cut_max_u = np.max(all_uvs[:, 0])
+                cut_max_v = np.max(all_uvs[:, 1])
+                
+                # The translation is simply the minimum coordinates (where [0,0] in cut space maps to)
+                translation_x = int(round(cut_min_u))
+                translation_y = int(round(cut_min_v))
+                
+                # Calculate the size of the cut region
+                cut_width = int(round(cut_max_u - cut_min_u))
+                cut_height = int(round(cut_max_v - cut_min_v))
+                
+                # Resize render to match the cut region size
+                if render_array.shape[0] != cut_height or render_array.shape[1] != cut_width:
+                    render_resized = cv2.resize(render_array, (cut_width, cut_height))
+                else:
+                    render_resized = render_array
+                
+                # Calculate target region in output image
+                target_x_start = max(0, translation_x)
+                target_y_start = max(0, translation_y)
+                target_x_end = min(width, translation_x + cut_width)
+                target_y_end = min(height, translation_y + cut_height)
+                
+                # Calculate source region in resized render
+                source_x_start = max(0, -translation_x)
+                source_y_start = max(0, -translation_y)
+                source_x_end = source_x_start + (target_x_end - target_x_start)
+                source_y_end = source_y_start + (target_y_end - target_y_start)
+                
+                # Ensure we have valid regions
+                if (target_x_end > target_x_start and target_y_end > target_y_start and
+                    source_x_end > source_x_start and source_y_end > source_y_start):
                     
-                    # Process this batch of triangles
-                    for i in range(batch_start, batch_end):
-                        if i >= len(original_triangle_indices):
-                            continue
+                    # Extract the relevant portion of the render
+                    render_portion = render_resized[source_y_start:source_y_end, source_x_start:source_x_end]
+                    
+                    if render_portion.size > 0:
+                        # Apply max-pooling with the output image
+                        current_region = output_image[target_y_start:target_y_end, target_x_start:target_x_end]
+                        max_region = np.maximum(current_region, render_portion)
+                        output_image[target_y_start:target_y_end, target_x_start:target_x_end] = max_region
                         
-                        # Get the actual triangle index and corresponding UV index
-                        triangle_idx = original_triangle_indices[i]
-
-                        uv_idx = triangle_to_uv_map[triangle_idx]
-                        triangles_processed += 1
-                        
-                        # Safety check
-                        if uv_idx >= original_uvs_flipped.shape[0]:
-                            continue
-
-                        triangle_uvs = original_uvs_flipped[uv_idx]
-                        
-                        # Debug: Check triangle index mapping for first few triangles
-                        if i < 3:
-                            print(f"    Processing triangle {triangle_idx} (UV index {uv_idx})")
-                            print(f"      UV coords: {triangle_uvs.flatten()}")
-                        
-                        # Get triangle bounds in original texture space
-                        tri_min_u, tri_max_u, tri_min_v, tri_max_v = self.get_triangle_texture_bounds(triangle_uvs)
-                        
-                        # NO SKIPPING - Process ALL triangles and take max value for each pixel
-                        
-                        # Debug: Check for problematic UV coordinates
-                        if tri_min_u < 0 or tri_min_v < 0:
-                            triangles_with_negative_uv += 1
-                        
-                        if tri_max_u > width or tri_max_v > height:
-                            triangles_outside_texture += 1
-                        
-                        if (tri_max_u - tri_min_u) < 0.1 or (tri_max_v - tri_min_v) < 0.1:
-                            triangles_with_zero_area += 1
-                        
-                        # Debug: Show bounds for first few triangles
-                        if i < 3:
-                            print(f"      Triangle bounds: u=[{tri_min_u:.1f}, {tri_max_u:.1f}], v=[{tri_min_v:.1f}, {tri_max_v:.1f}]")
-                        
-                        # Calculate mapping from render image to output image for this triangle
-                        # Map U coordinates (assuming render spans the full cut width)
-                        render_u_start = (tri_min_u - window_start) / (window_end - window_start) * render_array.shape[1]
-                        render_u_end = (tri_max_u - window_start) / (window_end - window_start) * render_array.shape[1]
-                        
-                        # Map V coordinates (use per-cut V range)
-                        render_v_start = (tri_min_v - cut_min_v) / v_denominator * render_array.shape[0]
-                        render_v_end = (tri_max_v - cut_min_v) / v_denominator * render_array.shape[0]
-                        
-                        # Clamp to render image bounds
-                        render_u_start = max(0, min(render_array.shape[1] - 1, int(render_u_start)))
-                        render_u_end = max(0, min(render_array.shape[1] - 1, int(render_u_end)))
-                        render_v_start = max(0, min(render_array.shape[0] - 1, int(render_v_start)))
-                        render_v_end = max(0, min(render_array.shape[0] - 1, int(render_v_end)))
-                        
-                        # Map to output image coordinates
-                        output_u_start = max(0, min(width - 1, int(tri_min_u)))
-                        output_u_end = max(0, min(width - 1, int(tri_max_u)))
-                        output_v_start = max(0, min(height - 1, int(tri_min_v)))
-                        output_v_end = max(0, min(height - 1, int(tri_max_v)))
-                        
-                        # Debug first few triangles' mapping
-                        if i < 3:
-                            print(f"      Render region: u=[{render_u_start}, {render_u_end}], v=[{render_v_start}, {render_v_end}]")
-                            print(f"      Output region: u=[{output_u_start}, {output_u_end}], v=[{output_v_start}, {output_v_end}]")
-                        
-                        # Ensure we have valid regions (minimal check)
-                        if output_u_end > output_u_start and output_v_end > output_v_start:
-                            if render_u_end > render_u_start and render_v_end > render_v_start:
-                                # Extract and resize regions
-                                try:
-                                    render_region = render_array[render_v_start:render_v_end+1, render_u_start:render_u_end+1]
-                                    if render_region.size > 0:
-                                        output_height = output_v_end - output_v_start + 1
-                                        output_width = output_u_end - output_u_start + 1
-                                        
-                                        if output_height > 0 and output_width > 0:
-                                            # Resize render region to match output region
-                                            if render_region.shape[:2] != (output_height, output_width):
-                                                render_region_resized = cv2.resize(render_region, (output_width, output_height))
-                                            else:
-                                                render_region_resized = render_region
-                                            
-                                            if len(render_region_resized.shape) == 2:
-                                                render_region_resized = np.stack([render_region_resized] * 3, axis=-1)
-                                            
-                                            # Take maximum value for each pixel across all triangles
-                                            # Thread-safe max operation with explicit memory barriers
-                                            current_region = output_image[output_v_start:output_v_end+1, output_u_start:output_u_end+1].copy()
-                                            max_region = np.maximum(current_region, render_region_resized)
-                                            # Ensure atomic write operation
-                                            output_image[output_v_start:output_v_end+1, output_u_start:output_u_end+1] = max_region.copy()
-                                            coverage_mask[output_v_start:output_v_end+1, output_u_start:output_u_end+1] = True
-                                            pixels_updated += output_height * output_width
-                                            
-                                            triangles_processed_successfully += 1
-                                            
-                                            # Track this triangle as processed (for statistics only)
-                                            processed_triangles_global.add(triangle_idx)
-                                            
-                                            if i < 3:
-                                                print(f"      Max-pooled {output_height * output_width} pixels")
-                                except Exception as e:
-                                    triangles_failed_processing += 1
-                                    if i < 10:  # Only print first few errors
-                                        print(f"      Error processing triangle {triangle_idx}: {e}")
-                                    continue
-                            else:
-                                triangles_failed_processing += 1
-                                if i < 10:
-                                    print(f"      Failed: invalid render region {render_u_start}-{render_u_end}, {render_v_start}-{render_v_end}")
-                        else:
-                            triangles_failed_processing += 1
-                            if i < 10:
-                                print(f"      Failed: invalid output region {output_u_start}-{output_u_end}, {output_v_start}-{output_v_end}")
-                
-                print(f"  Cut {cut_info['cut_index']} summary: {triangles_processed} triangles processed")
-                print(f"    Successfully processed: {triangles_processed_successfully}")
-                print(f"    Failed processing: {triangles_failed_processing}")
-                print(f"    Triangles with negative UV: {triangles_with_negative_uv}")
-                print(f"    Triangles outside texture bounds: {triangles_outside_texture}")
-                print(f"    Triangles with near-zero area: {triangles_with_zero_area}")
-                cuts_processed += 1
-                
-                # Force memory synchronization after each cut to prevent race conditions
-                output_image.flush() if hasattr(output_image, 'flush') else None
-                coverage_mask.flush() if hasattr(coverage_mask, 'flush') else None
-                # Explicit memory barrier
-                import gc
-                gc.collect()
+                        pixels_updated = (target_y_end - target_y_start) * (target_x_end - target_x_start)
+                        print(f"  Updated {pixels_updated} pixels")
+                    else:
+                        print(f"  Warning: Empty render portion")
+                else:
+                    print(f"  Warning: Invalid regions, skipping cut")
             else:
                 # Fallback to simple rectangular region mapping (old format)
                 print(f"Warning: No triangle info found for cut {cut_info['cut_index']}, using rectangular mapping")
                 window_start = int(cut_info['window_start'])
                 window_end = int(cut_info['window_end'])
                 
-                print(f"  Window bounds: [{window_start}, {window_end}]")
-                
                 # Clamp to output image bounds
                 window_start = max(0, min(width - 1, window_start))
                 window_end = max(0, min(width, window_end))
                 
-                if window_end <= window_start:
-                    continue
-                
-                # Calculate the region dimensions
-                region_width = window_end - window_start
-                region_height = height
-                
-                print(f"  Mapping to region: {region_width}x{region_height}")
-                
-                # Resize render to fit the region
-                if render_array.shape[0] != region_height or render_array.shape[1] != region_width:
-                    render_resized = cv2.resize(render_array, (region_width, region_height))
-                else:
-                    render_resized = render_array
-                
-                # Ensure render is RGB
-                if len(render_resized.shape) == 2:
-                    render_resized = np.stack([render_resized] * 3, axis=-1)
-                
-                # Copy to output image
-                try:
-                    # Thread-safe max operation for rectangular regions
+                if window_end > window_start:
+                    region_width = window_end - window_start
+                    region_height = height
+                    
+                    # Resize render to fit the region
+                    if render_array.shape[0] != region_height or render_array.shape[1] != region_width:
+                        render_resized = cv2.resize(render_array, (region_width, region_height))
+                    else:
+                        render_resized = render_array
+                    
+                    # Apply max-pooling
                     current_region = output_image[:, window_start:window_end].copy()
                     max_region = np.maximum(current_region, render_resized)
                     output_image[:, window_start:window_end] = max_region.copy()
-                    coverage_mask[:, window_start:window_end] = True
-                    pixels_updated += region_width * region_height
                     
                     print(f"  Max-pooled {region_width * region_height} pixels")
-                except Exception as e:
-                    print(f"Warning: Error processing cut {cut_info['cut_index']}: {e}")
-                    continue
-                    
-                cuts_processed += 1
-        
-        # Print debug summary
-        print(f"\nDebug Summary:")
-        print(f"  Total cuts in cut_info: {len(self.cut_info['cuts'])}")
-        print(f"  Cuts with renders found: {cuts_found}")
-        print(f"  Cuts successfully processed: {cuts_processed}")
-        print(f"  Triangles processed: {triangles_processed}")
-        print(f"  Total pixels updated: {pixels_updated}")
-        print(f"  Coverage percentage: {pixels_updated / (width * height) * 100:.2f}%")
-        
-        # Triangle coverage analysis
-        triangles_covered = len(processed_triangles_global)
-        triangles_missing = total_original_triangles - triangles_covered
-        coverage_percent = (triangles_covered / total_original_triangles) * 100
-        
-        print(f"\nTriangle Coverage Analysis:")
-        print(f"  Original mesh triangles: {total_original_triangles}")
-        print(f"  Triangles in cut metadata: {triangles_covered}")
-        print(f"  Missing triangles: {triangles_missing}")
-        print(f"  Triangle coverage: {coverage_percent:.2f}%")
-        
-        if triangles_missing > 0:
-            print(f"  WARNING: {triangles_missing} triangles from the original mesh are not included in any cut!")
-            print(f"  This explains the missing colored areas in the stitched image.")
-            
-            # Show some examples of missing triangle indices
-            all_triangle_indices = set(range(total_original_triangles))
-            missing_indices = all_triangle_indices - processed_triangles_global
-            missing_sample = sorted(list(missing_indices))[:10]
-            print(f"  Sample missing triangle indices: {missing_sample}")
-        else:
-            print(f"  All triangles are covered in the cut metadata.")
         
         # Save output image
         output_pil = Image.fromarray(output_image)
         output_pil.save(output_path, quality=60, optimize=True)
         print(f"Stitched image saved to: {output_path}")
-        
-        # Also save coverage mask for debugging
-        coverage_path = output_path.replace('.jpg', '_coverage.png')
-        coverage_pil = Image.fromarray((coverage_mask * 255).astype(np.uint8))
-        coverage_pil.save(coverage_path)
-        print(f"Coverage mask saved to: {coverage_path}")
         
         return output_path
 
