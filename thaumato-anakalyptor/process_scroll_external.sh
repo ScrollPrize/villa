@@ -57,6 +57,21 @@ setup_docker() {
   xhost +local:root
 }
 
+# Function to run command in Docker using the same config as start_docker.sh
+run_docker_command() {
+  local cmd="$1"
+  
+  # Use the same Docker configuration as start_docker.sh but run non-interactively
+  sudo docker run --gpus all --shm-size=150g --rm \
+    -v "$HOME/Desktop/scrolls:/scrolls" \
+    -v "$HOME/villa/thaumato-anakalyptor/:/workspace" \
+    -v "$HOME/Desktop/experiments:/workspace/experiments" \
+    -v /tmp/.X11-unix:/tmp/.X11-unix \
+    -e DISPLAY="$DISPLAY" \
+    thaumato_image \
+    bash -c "cd /workspace && chmod +x compile_cpp.sh graph_labeler.sh && source /opt/conda/etc/profile.d/conda.sh && conda activate thaumato && $cmd"
+}
+
 # Function to run command in Docker with retry and restart capability
 run_in_docker_with_retry() {
   local cmd="$1"
@@ -74,15 +89,8 @@ run_in_docker_with_retry() {
     # Wait a moment for cleanup
     sleep 2
     
-    # Run the command in Docker with proper setup
-    if sudo docker run --gpus all --shm-size=150g --rm \
-        -v "$HOME/Desktop/scrolls:/scrolls" \
-        -v "$HOME/villa/thaumato-anakalyptor/:/workspace" \
-        -v "$HOME/Desktop/experiments:/workspace/experiments" \
-        -v /tmp/.X11-unix:/tmp/.X11-unix \
-        -e DISPLAY="$DISPLAY" \
-        thaumato_image \
-        bash -c "cd /workspace && chmod +x compile_cpp.sh graph_labeler.sh && $cmd"; then
+    # Run the command using the same Docker config as start_docker.sh
+    if run_docker_command "$cmd"; then
       echo ">>> SUCCESS: Command completed successfully"
       return 0
     else
@@ -156,14 +164,14 @@ fi
 # step 5: graph_solve
 if (( start_idx <= 5 )); then
   echo ">>> Step 5: Running graph_solve"
-  solve_cmd="source \"\$(conda info --base)/etc/profile.d/conda.sh\" && while [[ -n \"\${CONDA_DEFAULT_ENV:-}\" ]]; do conda deactivate; done && echo \"Conda completely deactivated.\" && python3 -m ThaumatoAnakalyptor.graph_solve \"/workspace/experiments/1352_3600_5002/graph.bin\" --experiment_name \"${ZARR_NAME}\""
+  solve_cmd="while [[ -n \"\${CONDA_DEFAULT_ENV:-}\" ]]; do conda deactivate; done && echo \"Conda completely deactivated.\" && python3 -m ThaumatoAnakalyptor.graph_solve \"/workspace/experiments/1352_3600_5002/graph.bin\" --experiment_name \"${ZARR_NAME}\""
   run_in_docker_with_retry "$solve_cmd"
 fi
 
 # step 6: graph_solve with inverse
 if (( start_idx <= 6 )); then
   echo ">>> Step 6: Running graph_solve with inverse winding direction"
-  solve_inverse_cmd="source \"\$(conda info --base)/etc/profile.d/conda.sh\" && while [[ -n \"\${CONDA_DEFAULT_ENV:-}\" ]]; do conda deactivate; done && echo \"Conda completely deactivated.\" && python3 -m ThaumatoAnakalyptor.graph_solve \"/workspace/experiments/1352_3600_5002/graph.bin\" --experiment_name \"${ZARR_NAME}_inverse\" --inversed_winding_direction"
+  solve_inverse_cmd="while [[ -n \"\${CONDA_DEFAULT_ENV:-}\" ]]; do conda deactivate; done && echo \"Conda completely deactivated.\" && python3 -m ThaumatoAnakalyptor.graph_solve \"/workspace/experiments/1352_3600_5002/graph.bin\" --experiment_name \"${ZARR_NAME}_inverse\" --inversed_winding_direction"
   run_in_docker_with_retry "$solve_inverse_cmd"
 fi
 
