@@ -5,6 +5,8 @@ import numpy as np
 import argparse
 import os
 from PIL import Image
+import json
+from datetime import datetime
 # max image size None
 Image.MAX_IMAGE_PIXELS = None
 
@@ -126,9 +128,33 @@ def cut_mesh_size(mesh, texture_size, min_x, cut_size):
     uvs_mask_ = (uv_scaled[:, 0] >= min_x) & (uv_scaled[:, 0] <= max_x)
     triangles_mask = uvs_mask_.reshape(-1, 3)
     print(f"Sum of triangles mask: {np.sum(triangles_mask)}, with shape {triangles_mask.shape}")
+    
     # Select vertices and triangles within the x range
+    # A triangle is included if ANY of its vertices are in the range
     triangles_mask = np.any(triangles_mask, axis=1)
+    
+    # Debug: Show filtering statistics
+    total_triangles_in_mesh = len(triangles_mask)
+    included_triangles = np.sum(triangles_mask)
+    excluded_triangles = total_triangles_in_mesh - included_triangles
+    
+    print(f"Filtering for range [{min_x}, {max_x}]:")
+    print(f"  Total triangles: {total_triangles_in_mesh}")
+    print(f"  Included triangles: {included_triangles}")
+    print(f"  Excluded triangles: {excluded_triangles}")
+    print(f"  Inclusion rate: {included_triangles/total_triangles_in_mesh*100:.2f}%")
+    
+    # Check UV coordinate ranges
+    u_coords = uv_scaled[:, 0]
+    print(f"  UV U coordinate range: [{np.min(u_coords):.1f}, {np.max(u_coords):.1f}]")
+    print(f"  Triangles with U < min_x ({min_x}): {np.sum(u_coords < min_x)}")
+    print(f"  Triangles with U > max_x ({max_x}): {np.sum(u_coords > max_x)}")
+    
     uvs_mask = triangles_mask.repeat(3).reshape(-1)
+
+    # Store original triangle indices BEFORE mesh cleanup
+    original_triangle_indices_before_cleanup = np.where(triangles_mask)[0]
+    original_uvs_before_cleanup = uv_scaled[uvs_mask]
 
     selected_uvs = uv_scaled[uvs_mask]
     selected_triangles = triangles[triangles_mask]
@@ -139,7 +165,22 @@ def cut_mesh_size(mesh, texture_size, min_x, cut_size):
     cut_mesh.vertex_normals = o3d.utility.Vector3dVector(normals)
     cut_mesh.triangles = o3d.utility.Vector3iVector(selected_triangles)
     cut_mesh.triangle_uvs = o3d.utility.Vector2dVector(selected_uvs)
+    
+    # CRITICAL: Save mapping before cleanup
+    triangles_before_cleanup = np.asarray(cut_mesh.triangles)
+    uvs_before_cleanup = np.asarray(cut_mesh.triangle_uvs)
+    
+    # Now clean up the mesh
     cut_mesh = cut_mesh.remove_unreferenced_vertices()
+    
+    # Get the cleaned mesh data
+    triangles_after_cleanup = np.asarray(cut_mesh.triangles)
+    uvs_after_cleanup = np.asarray(cut_mesh.triangle_uvs)
+    
+    # Create mapping from cleaned mesh triangles back to original mesh triangles
+    # The triangle order should be preserved, but vertex indices change
+    final_triangle_indices = original_triangle_indices_before_cleanup.tolist()
+    final_uvs = original_uvs_before_cleanup.tolist()  # These are already in texture coordinates
 
     # white tif of size 1x1
     tif = np.ones((int(np.ceil(1)), int(np.ceil(1)), 3), dtype=np.uint8)
@@ -151,7 +192,17 @@ def cut_mesh_size(mesh, texture_size, min_x, cut_size):
     cut_mesh_texture_size = np.array([np.max(selected_uvs[:,0]) - np.min(selected_uvs[:,0]), np.max(selected_uvs[:,1]) - np.min(selected_uvs[:,1])])
 
     print(f"Cut mesh from {min_x} to {max_x} with texture size {cut_mesh_texture_size[0]} to {cut_mesh_texture_size[1]} along the x-axis with {len(np.asarray(cut_mesh.vertices))} vertices and {len(np.asarray(cut_mesh.triangles))} triangles")
-    return cut_mesh, cut_mesh_texture_size
+    
+    # Return triangle mapping information with correct post-cleanup data
+    triangle_info = {
+        'original_triangle_indices': final_triangle_indices,
+        'original_uvs': final_uvs,
+        'triangles_mask': triangles_mask.tolist(),
+        'cut_triangle_count': len(triangles_after_cleanup),
+        'original_triangle_count': len(original_triangle_indices_before_cleanup)
+    }
+    
+    return cut_mesh, cut_mesh_texture_size, triangle_info
 
 def cut_meshes(mesh, texture_size, cut_size):
     # Calculate min and max x from the mesh
@@ -162,26 +213,83 @@ def cut_meshes(mesh, texture_size, cut_size):
     current_min_x = min_x
 
     total_vertices = len(np.asarray(mesh.vertices))
+    total_triangles = len(np.asarray(mesh.triangles))
     print(f"Total vertices in mesh: {total_vertices}")
+    print(f"Total triangles in mesh: {total_triangles}")
     total_cut_vertices = 0
+    
+    # Track which triangles are included across all cuts
+    all_included_triangles = set()
+    
+    # Create tracking information for stitching
+    cut_info = {
+        'original_texture_size': texture_size.tolist(),
+        'min_x': float(min_x),
+        'max_x': float(max_x),
+        'min_y': 0.0,
+        'max_y': float(texture_size[1]),
+        'cut_size': cut_size,
+        'timestamp': datetime.now().strftime("%Y%m%d%H%M%S"),
+        'cuts': []
+    }
 
+    cut_index = 0
     while current_min_x < max_x:
+        print(f"\nProcessing cut {cut_index} from {current_min_x} to {min(current_min_x + cut_size, max_x)}")
+        
         # Cut the mesh
-        cut_mesh, cut_mesh_texture_size = cut_mesh_size(mesh, texture_size, current_min_x, cut_size)
+        cut_mesh, cut_mesh_texture_size, triangle_info = cut_mesh_size(mesh, texture_size, current_min_x, cut_size)
         if not cut_mesh.is_empty():
+            # Track triangles included in this cut
+            cut_triangles = set(triangle_info['original_triangle_indices'])
+            all_included_triangles.update(cut_triangles)
+            print(f"Cut {cut_index} includes {len(cut_triangles)} triangles")
+            
             # Normalize UV coordinates of the cut mesh
             if cut_mesh.has_triangle_uvs():
                 uvs = np.asarray(cut_mesh.triangle_uvs)
                 uvs = normalize_uv_coordinates(uvs)
                 cut_mesh.triangle_uvs = o3d.utility.Vector2dVector(uvs)
+            
+            # Save cut information for stitching
+            cut_window_info = {
+                'cut_index': cut_index,
+                'window_start': float(current_min_x),
+                'window_end': float(min(current_min_x + cut_size, max_x)),
+                'cut_texture_size': cut_mesh_texture_size.tolist(),
+                'vertex_count': len(np.asarray(cut_mesh.vertices)),
+                'triangle_count': len(np.asarray(cut_mesh.triangles)),
+                'triangle_info': triangle_info
+            }
+            cut_info['cuts'].append(cut_window_info)
+            
             cut_meshes.append([cut_mesh, cut_mesh_texture_size])
+            cut_index += 1
 
         current_min_x += cut_size
         total_cut_vertices += len(np.asarray(cut_mesh.vertices))
     
+    # Analyze triangle coverage
+    missing_triangles = total_triangles - len(all_included_triangles)
+    coverage_percent = (len(all_included_triangles) / total_triangles) * 100
+    
+    print(f"\nTriangle Coverage Analysis:")
+    print(f"Total triangles in original mesh: {total_triangles}")
+    print(f"Triangles included in cuts: {len(all_included_triangles)}")
+    print(f"Missing triangles: {missing_triangles}")
+    print(f"Coverage: {coverage_percent:.2f}%")
+    
+    if missing_triangles > 0:
+        print(f"WARNING: {missing_triangles} triangles are not included in any cut!")
+        # Find which triangles are missing
+        all_triangle_indices = set(range(total_triangles))
+        missing_indices = all_triangle_indices - all_included_triangles
+        missing_sample = sorted(list(missing_indices))[:10]
+        print(f"Sample missing triangle indices: {missing_sample}")
+    
     print(f"Cut mesh into {len(cut_meshes)} pieces with {total_cut_vertices} vertices out of {total_vertices} vertices in the original mesh")
 
-    return cut_meshes
+    return cut_meshes, cut_info
 
 def save_cut(i, output_filename, cut_mesh, cut_mesh_texture_size):
     if not os.path.exists(os.path.dirname(output_filename)):
@@ -207,7 +315,7 @@ def main(output_folder, input_mesh, scale_factor, cut_size, delauny):
     mesh, texture_size = load_obj(obj_path, delauny)
     if np.any(texture_size < 10):
         print("Texture size is too small, please check the texture image")
-        return None
+        return None, None
     mesh_filename = os.path.basename(input_mesh)
 
     # Scale mesh
@@ -217,7 +325,7 @@ def main(output_folder, input_mesh, scale_factor, cut_size, delauny):
     # save_cut(0, obj_path.replace(".obj", "_scaled.obj"), mesh, texture_size)
 
     # Cut mesh into pieces and normalize UVs
-    cut_mesh_list = cut_meshes(mesh, texture_size, cut_size)
+    cut_mesh_list, cut_info = cut_meshes(mesh, texture_size, cut_size)
 
     obj_paths = []
     # Save each cut piece and adjust the texture if necessary
@@ -225,8 +333,30 @@ def main(output_folder, input_mesh, scale_factor, cut_size, delauny):
         mesh_name = os.path.basename(input_mesh).split(".")[0]
         working_folder = f"working_{mesh_name}" + (f"_{i}" if i > 0 else "")
         output_filename = os.path.join(output_folder, working_folder, f"{mesh_filename.split('.')[0] + (f'_{i}' if i > 0 else '')}.obj")
+        
+        # Update cut_info with the actual output path
+        if i < len(cut_info['cuts']):
+            cut_info['cuts'][i]['mesh_path'] = output_filename
+        
         save_cut(i, output_filename, cut_mesh, cut_mesh_texture_size)
         obj_paths.append(output_filename)
+        
+        # Save additional mapping data as NPZ for robustness
+        npz_path = output_filename.replace('.obj', '_mapping.npz')
+        triangle_info = cut_info['cuts'][i]['triangle_info']
+        np.savez(npz_path,
+                 original_triangle_indices=np.array(triangle_info['original_triangle_indices']),
+                 original_uvs=np.array(triangle_info['original_uvs']),
+                 triangles_mask=np.array(triangle_info['triangles_mask']),
+                 window_start=cut_info['cuts'][i]['window_start'],
+                 window_end=cut_info['cuts'][i]['window_end'])
+        print(f"Saved mapping data to {npz_path}")
+
+    # Save cut information to JSON file
+    cut_info_path = os.path.join(output_folder, "cut_info.json")
+    with open(cut_info_path, 'w') as f:
+        json.dump(cut_info, f, indent=2)
+    print(f"Saved cut information to {cut_info_path}")
 
     return obj_paths
 
@@ -239,6 +369,6 @@ if __name__ == "__main__":
     parser.add_argument("--output_folder", type=str, help="Folder to save the cut meshes", default=None)
 
     args = parser.parse_args()
-    main(args.output_folder, args.input_mesh, args.scale_factor, args.cut_size, args.delauny)
+    obj_paths, cut_info = main(args.output_folder, args.input_mesh, args.scale_factor, args.cut_size, args.delauny)
 
 # python3 finalize_mesh.py --input_mesh /media/julian/SSD4TB/scroll3_surface_points/<start_point_location>/point_cloud_colorized_verso_subvolume_blocks_uv.obj
