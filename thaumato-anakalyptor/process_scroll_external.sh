@@ -74,7 +74,7 @@ run_in_docker_with_retry() {
     # Wait a moment for cleanup
     sleep 2
     
-    # Run the command in Docker
+    # Run the command in Docker with proper setup
     if sudo docker run --gpus all --shm-size=150g --rm \
         -v "$HOME/Desktop/scrolls:/scrolls" \
         -v "$HOME/villa/thaumato-anakalyptor/:/workspace" \
@@ -82,7 +82,7 @@ run_in_docker_with_retry() {
         -v /tmp/.X11-unix:/tmp/.X11-unix \
         -e DISPLAY="$DISPLAY" \
         thaumato_image \
-        bash -c "cd /workspace && $cmd"; then
+        bash -c "cd /workspace && chmod +x compile_cpp.sh graph_labeler.sh && $cmd"; then
       echo ">>> SUCCESS: Command completed successfully"
       return 0
     else
@@ -149,7 +149,7 @@ fi
 # step 4: compile bash script
 if (( start_idx <= 4 )); then
   echo ">>> Step 4: Compiling C++ code"
-  compile_cmd="chmod +x compile_cpp.sh && ./compile_cpp.sh"
+  compile_cmd="echo 'Compiling C++ code...' && ./compile_cpp.sh"
   run_in_docker_with_retry "$compile_cmd"
 fi
 
