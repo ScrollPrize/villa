@@ -106,9 +106,11 @@ std::vector<Node> loadGraph(const std::string& filename, int version) {
         inFile.read(reinterpret_cast<char*>(&node.total_wnr_side), sizeof(node.total_wnr_side));
         inFile.read(reinterpret_cast<char*>(&node.winding_nr), sizeof(node.winding_nr));
         inFile.read(reinterpret_cast<char*>(&node.winding_nr_old), sizeof(node.winding_nr_old));
-        inFile.read(reinterpret_cast<char*>(&node.coord_x), sizeof(node.coord_x));
-        inFile.read(reinterpret_cast<char*>(&node.coord_y), sizeof(node.coord_y));
-        inFile.read(reinterpret_cast<char*>(&node.coord_z), sizeof(node.coord_z));
+        if (version > 1) {
+            inFile.read(reinterpret_cast<char*>(&node.coord_x), sizeof(node.coord_x));
+            inFile.read(reinterpret_cast<char*>(&node.coord_y), sizeof(node.coord_y));
+            inFile.read(reinterpret_cast<char*>(&node.coord_z), sizeof(node.coord_z));
+        }
         int sides_nr = 18;
         if (version > 0) {
             inFile.read(reinterpret_cast<char*>(&sides_nr), sizeof(sides_nr));

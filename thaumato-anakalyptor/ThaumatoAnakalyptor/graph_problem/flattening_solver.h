@@ -22,6 +22,10 @@
  * @param angle_tug_min   Lower threshold on initial winding angle for additional tug.
  * @param angle_tug_max   Upper threshold on initial winding angle for additional tug.
  * @param tug_step        Magnitude of additional tug step.
+ * @param init_z_tug      Initial z tug magnitude.
+ * @param zero_ranges     Ranges of z values that should be set to zero.
+ * @param visualize       Whether to visualize the process.
+ * @param enable_spring_push_multiplier Whether to enable spring push multiplier.
  * @return Modified graph with updated f_init and f_star.
  */
 std::vector<Node> run_solver_flattening(
@@ -37,7 +41,8 @@ std::vector<Node> run_solver_flattening(
     float tug_step,
     float init_z_tug,
     const std::vector<std::pair<float, float>>& zero_ranges,
-    bool visualize = false
+    bool visualize = false,
+    bool enable_spring_push_multiplier = false
 );
 
 #endif // FLATTENING_SOLVER_H
