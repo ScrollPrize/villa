@@ -38,6 +38,7 @@ class PointCloudLabeler(QMainWindow):
         self.config = load_config("config_labeling_gui.json")
         self.graph_path = self.config.get("graph_path", "")
         self.default_experiment = self.config.get("default_experiment", "")
+        self.graph_version = self.config.get("graph_version", 1)
         self.ome_zarr_path = self.config.get("ome_zarr_path", None)
         self.graph_pkl_path = self.config.get("graph_pkl_path", None)
         self.h5_path = self.config.get("h5_path", None)
@@ -49,11 +50,11 @@ class PointCloudLabeler(QMainWindow):
             self.solver = graph_problem_gpu_py.Solver(self.graph_path)
             gt_path = os.path.join("../experiments", self.default_experiment,
                                    "checkpoints", "checkpoint_graph_tugging.bin")
-            version_graph = 1
+            version_graph = self.graph_version
             if not os.path.exists(gt_path):
                 gt_path = os.path.join("../experiments", self.default_experiment,
                                        "checkpoints", "checkpoint_graph_f_star_final.bin")
-                version_graph = 0
+                # Keep the configured version even for the fallback file
             if os.path.exists(gt_path):
                 self.solver.load_graph(gt_path, version_graph)
             else:
@@ -756,10 +757,10 @@ class PointCloudLabeler(QMainWindow):
     def eventFilter(self, source, event):
         # 1) catch the mouse back/forward button presses
         if event.type() == QEvent.MouseButtonPress:
-            if event.button() == Qt.XButton1:    # “Back” button
+            if event.button() == Qt.XButton1:    # "Back" button
                 self.label_spinbox.setValue(self.label_spinbox.value() - 1)
                 return True
-            elif event.button() == Qt.XButton2:  # “Forward” button
+            elif event.button() == Qt.XButton2:  # "Forward" button
                 self.label_spinbox.setValue(self.label_spinbox.value() + 1)
                 return True
                 
@@ -906,6 +907,7 @@ class PointCloudLabeler(QMainWindow):
             load_config(fname)
             self.graph_path = self.config.get("graph_path", self.graph_path)
             self.default_experiment = self.config.get("default_experiment", self.default_experiment)
+            self.graph_version = self.config.get("graph_version", self.graph_version)
             self.ome_zarr_path = self.config.get("ome_zarr_path", self.ome_zarr_path)
             self.graph_pkl_path = self.config.get("graph_pkl_path", self.graph_pkl_path)
             self.h5_path = self.config.get("h5_path", self.h5_path)
@@ -913,10 +915,10 @@ class PointCloudLabeler(QMainWindow):
             if self.graph_path:
                 self.solver = graph_problem_gpu_py.Solver(self.graph_path)
                 gt_path = os.path.join("../experiments", self.default_experiment, "checkpoints", "checkpoint_graph_tugging.bin")
-                version = 1
+                version = self.graph_version
                 if not os.path.exists(gt_path):
                     gt_path = os.path.join("../experiments", self.default_experiment, "checkpoints", "checkpoint_graph_f_star_final.bin")
-                    version = 0
+                    # Keep the configured version even for the fallback file
                 if os.path.exists(gt_path):
                     self.solver.load_graph(gt_path, version)
                 else:
@@ -934,6 +936,7 @@ class PointCloudLabeler(QMainWindow):
         if fname:
             self.config["graph_path"] = self.graph_path
             self.config["default_experiment"] = self.default_experiment
+            self.config["graph_version"] = self.graph_version
             if self.ome_zarr_path:
                 self.config["ome_zarr_path"] = self.ome_zarr_path
             if self.graph_pkl_path:
@@ -968,6 +971,14 @@ class PointCloudLabeler(QMainWindow):
         exp_lineedit = QLineEdit()
         exp_lineedit.setText(self.default_experiment)
         form_layout.addRow("Experiment name:", exp_lineedit)
+        
+        # Add graph version selector
+        version_spinbox = QSpinBox()
+        version_spinbox.setRange(0, 10)
+        version_spinbox.setValue(self.graph_version)
+        version_spinbox.setToolTip("Graph version to load (default: 1)")
+        form_layout.addRow("Graph Version:", version_spinbox)
+        
         layout.addLayout(form_layout)
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         layout.addWidget(button_box)
@@ -977,7 +988,9 @@ class PointCloudLabeler(QMainWindow):
         if dialog.exec_() == QDialog.Accepted:
             selected_dir = bin_path_lineedit.text().strip()
             exp_name = exp_lineedit.text().strip()
+            selected_version = version_spinbox.value()
             self.default_experiment = exp_name
+            self.graph_version = selected_version
             if not selected_dir or not exp_name:
                 return
             bin_file_path = selected_dir # os.path.join(selected_dir, "graph.bin")
@@ -990,7 +1003,7 @@ class PointCloudLabeler(QMainWindow):
             if not os.path.exists(gt_path):
                 gt_path = os.path.join("../experiments", exp_name, "checkpoints", "checkpoint_graph_f_star_final.bin")
             if os.path.exists(gt_path):
-                self.solver.load_graph(gt_path)
+                self.solver.load_graph(gt_path, selected_version)
             else:
                 QMessageBox.warning(self, "Load Data", f"Graph file not found at {gt_path}")
 
@@ -1132,7 +1145,7 @@ class PointCloudLabeler(QMainWindow):
 
         <h3 class="section-title">2. Slice Controls</h3>
         <ul>
-            <li>Use the Z-slice sliders (left view) and f_init-slice sliders (right view) to focus on a “slab.”</li>
+            <li>Use the Z-slice sliders (left view) and f_init-slice sliders (right view) to focus on a "slab."</li>
             <li>The 'Thickness' sliders define how tall each slab is (in Z or in f_init).</li>
             <li>The 'Z selection' and 'f selection' controls further isolate areas if needed.</li>
         </ul>
@@ -1148,25 +1161,25 @@ class PointCloudLabeler(QMainWindow):
         <h3 class="section-title">4. Drawing & Labeling</h3>
         <ul>
             <li>Left-click and drag on the view to label points (with the label in the bottom spinbox).</li>
-            <li>The “Drawing radius” controls the brush size for labeling.</li>
-            <li>“Erase Label” sets the label spinbox to the “unlabeled” code, so you can drag to remove labels.</li>
-            <li>The “Group” spinbox (and offset/merge tools) let you manage multi-layer labeling.</li>
+            <li>"Drawing radius" controls the brush size for labeling.</li>
+            <li>"Erase Label" sets the label spinbox to the "unlabeled" code, so you can drag to remove labels.</li>
+            <li>The "Group" spinbox (and offset/merge tools) let you manage multi-layer labeling.</li>
         </ul>
 
         <h3 class="section-title">5. Updated Label Tools</h3>
         <ul>
-            <li>After running a solver (“Update Labels”), some points get an “updated” (calculated) label.</li>
-            <li><span class="shortcut">U</span> toggles “Update Labels Draw Mode”: paint only those updated labels onto unlabeled points.</li>
-            <li>“Apply All Updated Labels” replaces every unlabeled point with its calculated label.</li>
-            <li>“Apply Updated Labels to XY/XZ” applies only to the visible slab in that view.</li>
-            <li>“Clear Updated Labels” removes them entirely.</li>
+            <li>After running a solver ("Update Labels"), some points get an "updated" (calculated) label.</li>
+            <li><span class="shortcut">U</span> toggles "Update Labels Draw Mode": paint only those updated labels onto unlabeled points.</li>
+            <li>"Apply All Updated Labels" replaces every unlabeled point with its calculated label.</li>
+            <li>"Apply Updated Labels to XY/XZ" applies only to the visible slab in that view.</li>
+            <li>"Clear Updated Labels" removes them entirely.</li>
         </ul>
 
         <h3 class="section-title">6. Spline Tools (Top Row)</h3>
         <ul>
-            <li>“Update Spline” fits polynomial lines to labeled winding sheets (for big structures like spiral/winding shapes).</li>
-            <li>“Assign Line Labels” snaps nearby unlabeled points to those fitted lines if they’re close.</li>
-            <li>“Clear Splines” removes any drawn splines.</li>
+            <li>"Update Spline" fits polynomial lines to labeled winding sheets (for big structures like spiral/winding shapes).</li>
+            <li>"Assign Line Labels" snaps nearby unlabeled points to those fitted lines if they're close.</li>
+            <li>"Clear Splines" removes any drawn splines.</li>
         </ul>
 
         <h3 class="section-title">7. Common Controls (Bottom Row)</h3>
@@ -1207,9 +1220,9 @@ class PointCloudLabeler(QMainWindow):
 
         <h3 class="section-title">11. Saving & Loading</h3>
         <ul>
-            <li>Use the “Data” menu to load data (the .bin file), or load/save .txt label files.</li>
-            <li>“Reset Labels” discards all labeling, making every point unlabeled again.</li>
-            <li>“Save Labeled Graph” exports the final labeled graph, removing any unlabeled nodes.</li>
+            <li>Use the "Data" menu to load data (the .bin file), or load/save .txt label files.</li>
+            <li>"Reset Labels" discards all labeling, making every point unlabeled again.</li>
+            <li>"Save Labeled Graph" exports the final labeled graph, removing any unlabeled nodes.</li>
         </ul>
 
         </body>
@@ -1763,7 +1776,7 @@ class PointCloudLabeler(QMainWindow):
 
     def _current_label_qcolor(self):
         """Return a semi‐transparent QColor matching the current spin‑box label,
-        but draw UNLABELED in the “unlabeled” color (black here)."""
+        but draw UNLABELED in the "unlabeled" color (black here)."""
         lab = self.label_spinbox.value()
         alpha = 150
         # In streak mode, use black for label 0 (clear) and color for label 1
@@ -1913,7 +1926,7 @@ class PointCloudLabeler(QMainWindow):
             self._overlay_xz.setVisible(False)
             return
 
-        ev.accept()  # eat all other releases so the view doesn’t pan
+        ev.accept()  # eat all other releases so the view doesn't pan
     
     def _apply_brush_path_to_labels(self, data_path):
         """
@@ -2779,7 +2792,7 @@ class PointCloudLabeler(QMainWindow):
         if pts.shape[0] == 0:
             return
 
-        # Only work on candidate points that are not already “labeled” (UNLABELED).
+        # Only work on candidate points that are not already "labeled" (UNLABELED).
         cand_mask = np.abs(self.labels[mask] - self.UNLABELED) < 2
         if not np.any(cand_mask):
             return

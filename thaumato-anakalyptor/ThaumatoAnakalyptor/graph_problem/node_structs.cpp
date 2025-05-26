@@ -23,6 +23,11 @@ void saveGraph(const std::vector<Node>& nodes, const std::string& filename) {
         throw std::runtime_error("Could not open file for writing");
     }
 
+    // Write version 3 as the first entry
+    int version = 3;
+    outFile.write(reinterpret_cast<const char*>(&version), sizeof(version));
+    std::cout << "Saving graph as version " << version << std::endl;
+
     size_t num_nodes = nodes.size();
     outFile.write(reinterpret_cast<const char*>(&num_nodes), sizeof(num_nodes));
 
@@ -83,6 +88,14 @@ std::vector<Node> loadGraph(const std::string& filename, int version) {
     }
 
     size_t num_nodes;
+    
+    // If version 3 is requested, read and skip the version number first
+    if (version == 3) {
+        int file_version;
+        inFile.read(reinterpret_cast<char*>(&file_version), sizeof(file_version));
+        std::cout << "Version 3 file detected, file version: " << file_version << std::endl;
+    }
+    
     inFile.read(reinterpret_cast<char*>(&num_nodes), sizeof(num_nodes));
     std::vector<Node> nodes(num_nodes);
 
