@@ -1107,6 +1107,11 @@ def flatten_pointcloud(base_path,
         zero_ranges_initial = [(min_angle + index * a_step, min_angle + (index+1)*a_step) for index in range(winding_width)]
         
         print("Solving downsampled graph (first pass - original style)...")
+        # Print unfixed node count before solving
+        ds_total_nodes = len(np.array(solver_ds.get_undeleted_indices()))
+        ds_fixed_nodes = len(first_winding_relative) if 'first_winding_relative' in locals() and first_winding_relative else 0
+        ds_unfixed_nodes = ds_total_nodes - ds_fixed_nodes
+        print(f"Downsampled solver: {ds_unfixed_nodes} unfixed nodes out of {ds_total_nodes} total nodes ({ds_fixed_nodes} fixed)")
         solver_ds.solve_flattening(num_iterations=20000, visualize=True, 
                                    angle_tug_min=min_angle+90, angle_tug_max=max_angle-90, 
                                    z_tug_min=z_min+100, z_tug_max=z_max-100, 
@@ -1116,7 +1121,12 @@ def flatten_pointcloud(base_path,
         print(f"After first downsampled solve: u min={uvs_ds_initial[:,0].min()}, u max={uvs_ds_initial[:,0].max()}, v min={uvs_ds_initial[:,1].min()}, v max={uvs_ds_initial[:,1].max()}")
         
         print("Solving downsampled graph (second pass - original style)...")
-        solver_ds.solve_flattening(num_iterations=75000, visualize=True, zero_ranges=zero_ranges, tug_step=0.0005)
+        # Print unfixed node count before solving
+        ds_total_nodes_2 = len(np.array(solver_ds.get_undeleted_indices()))
+        ds_fixed_nodes_2 = len(first_winding_relative) if 'first_winding_relative' in locals() and first_winding_relative else 0
+        ds_unfixed_nodes_2 = ds_total_nodes_2 - ds_fixed_nodes_2
+        print(f"Downsampled solver (2nd pass): {ds_unfixed_nodes_2} unfixed nodes out of {ds_total_nodes_2} total nodes ({ds_fixed_nodes_2} fixed)")
+        solver_ds.solve_flattening(num_iterations=75000, visualize=True, zero_ranges=zero_ranges, tug_step=0.0005, enable_spring_push_multiplier=True)
         
         uvs_ds_final = np.array(solver_ds.get_uvs())
         undeleted_ds_indices = np.array(solver_ds.get_undeleted_indices())
@@ -1216,6 +1226,36 @@ def flatten_pointcloud(base_path,
         # Combine downsampled and first winding indices for fixing
         all_fixed_indices = list(set(relative_downsample_indices + first_winding_relative_full))
         
+        # Check how many nodes are fixed
+        fixed_count = len(all_fixed_indices)
+        total_valid = len(full_valid_indices)
+        print(f"Proposed to fix {fixed_count}/{total_valid} nodes ({100*fixed_count/total_valid:.1f}%)")
+        
+        # If too many nodes are fixed, reduce the number to allow more movement
+        if fixed_count > total_valid * 0.8:  # If more than 80% would be fixed
+            print(f"WARNING: Too many nodes would be fixed ({fixed_count}/{total_valid}). Reducing fixed nodes to allow movement.")
+            
+            # Keep only a subset of the most important fixed nodes
+            # Priority: 1) First winding nodes (if available), 2) Subset of downsampled nodes
+            important_fixed = []
+            
+            # Always keep first winding nodes if available
+            if len(first_winding_relative_full) > 0:
+                important_fixed.extend(first_winding_relative_full)
+                print(f"Keeping {len(first_winding_relative_full)} first winding nodes as fixed")
+            
+            # Add a subset of downsampled nodes (every Nth node to spread them out)
+            remaining_budget = max(int(total_valid * 0.3), 10) - len(important_fixed)  # Target 30% fixed max
+            if remaining_budget > 0 and len(relative_downsample_indices) > 0:
+                step = max(1, len(relative_downsample_indices) // remaining_budget)
+                subset_downsample = relative_downsample_indices[::step][:remaining_budget]
+                important_fixed.extend(subset_downsample)
+                print(f"Keeping {len(subset_downsample)} downsampled nodes as fixed (every {step}th node)")
+            
+            all_fixed_indices = important_fixed
+            fixed_count = len(all_fixed_indices)
+            print(f"Reduced fixed nodes to {fixed_count}/{total_valid} ({100*fixed_count/total_valid:.1f}%)")
+        
         # Fix both the downsampled points and first winding points in the full solver
         if len(all_fixed_indices) > 0:
             solver.fix_nodes(all_fixed_indices)
@@ -1229,10 +1269,79 @@ def flatten_pointcloud(base_path,
         z_min_full = np.min(coords[:, coords_z_index])
         z_max_full = np.max(coords[:, coords_z_index])
         
+        # Add debugging before the final solve call
+        print("=== DEBUG: Analyzing solver state before final solve ===")
+        
+        # Check how many nodes are fixed
+        fixed_count = len(all_fixed_indices)
+        total_valid = len(full_valid_indices)
+        print(f"Fixed nodes: {fixed_count}/{total_valid} ({100*fixed_count/total_valid:.1f}%)")
+        
+        # Check initial UV positions
+        initial_uvs = np.array(solver.get_uvs())
+        print(f"Initial UV range: U=[{initial_uvs[:,0].min():.2f}, {initial_uvs[:,0].max():.2f}], V=[{initial_uvs[:,1].min():.2f}, {initial_uvs[:,1].max():.2f}]")
+        
+        # DEBUG: Check edge distances and forces
+        print("=== DEBUG: Checking edge distances ===")
+        sample_edges = 0
+        total_error = 0.0
+        for i in range(min(100, len(neighbor_lists))):  # Sample first 100 nodes
+            for j, neighbor_idx in enumerate(neighbor_lists[i]):
+                if j >= 5:  # Limit to first 5 neighbors per node
+                    break
+                if neighbor_idx < len(initial_uvs):
+                    # Calculate current distance in UV space
+                    uv_dist = np.linalg.norm(initial_uvs[i] - initial_uvs[neighbor_idx])
+                    # Get expected distance
+                    expected_dist = distance_lists[i][j]
+                    error = abs(uv_dist - expected_dist)
+                    total_error += error
+                    sample_edges += 1
+        
+        if sample_edges > 0:
+            avg_error = total_error / sample_edges
+            print(f"Average edge error (sampled {sample_edges} edges): {avg_error:.4f}")
+            if avg_error < 1e-3:
+                print("WARNING: Very small edge errors - nodes may already be well-positioned")
+        else:
+            print("WARNING: No valid edges found for error calculation")
+        
+        # Check if we have any non-fixed nodes
+        if fixed_count >= total_valid * 0.95:
+            print(f"WARNING: {fixed_count}/{total_valid} nodes are fixed - very few nodes can move!")
+        
+        # DEBUG OPTION: Uncomment the next 3 lines to test solver without any fixed nodes
+        # print("DEBUG: Testing solver with NO fixed nodes")
+        # solver.unfix()  # Remove all fixed constraints
+        # all_fixed_indices = []
+        
         zero_ranges_full = [(min_angle_full, min_angle_full+270), (max_angle_full-270, max_angle_full)]
         
-        print("Solving full graph (refinement with fixed anchors - 0.0005 tug only)...")
-        solver.solve_flattening(num_iterations=10000, visualize=True)
+        print("Solving full graph (refinement with fixed anchors - with proper tug parameters)...")
+        # Print unfixed node count before solving
+        full_total_nodes = len(np.array(solver.get_undeleted_indices()))
+        full_fixed_nodes = len(all_fixed_indices)
+        full_unfixed_nodes = full_total_nodes - full_fixed_nodes
+        print(f"Full solver: {full_unfixed_nodes} unfixed nodes out of {full_total_nodes} total nodes ({full_fixed_nodes} fixed)")
+        # FIX: Add the missing tug parameters that were used in the downsampled solve
+        solver.solve_flattening(
+            num_iterations=10000, 
+            visualize=True,
+            z_tug_min=z_min_full+100,
+            z_tug_max=z_max_full-100,
+            angle_tug_min=min_angle_full+90,
+            angle_tug_max=max_angle_full-90,
+            tug_step=0.0005,  # Use the same small tug step as the second downsampled solve
+            zero_ranges=zero_ranges_full
+        )
+        
+        # Check if positions actually changed
+        final_uvs = np.array(solver.get_uvs())
+        uv_change = np.linalg.norm(final_uvs - initial_uvs, axis=1)
+        moved_nodes = np.sum(uv_change > 1e-6)
+        print(f"Nodes that moved significantly: {moved_nodes}/{len(final_uvs)} (change > 1e-6)")
+        print(f"Max UV change: {np.max(uv_change):.6f}")
+        print(f"Mean UV change: {np.mean(uv_change):.6f}")
         
         undeleted_indices = np.array(solver.get_undeleted_indices())
         uvs = np.array(solver.get_uvs())
@@ -2075,14 +2184,14 @@ def main():
             display_downsample=args.display_downsample,
             color_by_angle=args.color_by_angle
         )
-        flattened_winding_path = flatten_pointcloud(
-            os.path.dirname(args.mesh),
-            display=args.display,
-            downsample_ratio=args.downsample_ratio,
-            flattening_downsample_ratio=args.flattening_downsample_ratio,
-            display_downsample=args.display_downsample,
-            color_by_angle=args.color_by_angle
-        )
+    flattened_winding_path = flatten_pointcloud(
+        os.path.dirname(args.mesh),
+        display=args.display,
+        downsample_ratio=args.downsample_ratio,
+        flattening_downsample_ratio=args.flattening_downsample_ratio,
+        display_downsample=args.display_downsample,
+        color_by_angle=args.color_by_angle
+    )
     grid_uv_flattened(
         flattened_winding_path,
         subsample_radius=30.0,

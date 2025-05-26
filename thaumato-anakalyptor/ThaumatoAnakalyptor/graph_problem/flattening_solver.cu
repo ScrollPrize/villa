@@ -99,6 +99,40 @@ __global__ void compute_means_kernel(
     means[idx] = sums[idx] / denom;
 }
 
+// Kernel: count total edges and active edges
+__global__ void count_edges_kernel(
+    Node* d_graph,
+    size_t* d_valid,
+    int num_valid,
+    int* d_total_edges,
+    int* d_active_edges
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_valid) return;
+    
+    size_t i = d_valid[idx];
+    const Node& node = d_graph[i];
+    
+    // Count all edges from this node
+    for (int e = 0; e < node.num_edges; ++e) {
+        const Edge& edge = node.edges[e];
+        const Node& target_node = d_graph[edge.target_node];
+        
+        // Count total edges (avoid double counting by only counting edges where i < target)
+        if (i < edge.target_node) {
+            atomicAdd(d_total_edges, 1);
+        }
+        
+        // Count active edges: both nodes not deleted, not fixed, edge not temporary
+        if (i < edge.target_node && // avoid double counting
+            !node.deleted && !target_node.deleted && // both nodes not deleted
+            !node.fixed && !target_node.fixed &&     // both nodes not fixed
+            !edge.temporary) {                        // edge not temporary
+            atomicAdd(d_active_edges, 1);
+        }
+    }
+}
+
 // Kernel: updates f_init (z) and f_star coordinates to match edge lengths
 __global__ void flattening_update_kernel(
     Node* d_graph,
@@ -111,7 +145,8 @@ __global__ void flattening_update_kernel(
     float tug_step,
     const float2* zero_ranges,
     int num_zero_ranges,
-    const float* zero_means
+    const float* zero_means,
+    bool enable_spring_push_multiplier
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_valid) return;
@@ -148,14 +183,27 @@ __global__ void flattening_update_kernel(
         // Determine direction: if the current distance is greater than desired, move closer (+), else move apart (-)
         float sign = (dist > edge.k) ? 1.0f : -1.0f;
         dist = fmaxf(dist, 1e-3f);  // Avoid division by zero
+
+        // acc_z += dz * sign;
+        // acc_s += ds * sign;
+        // sum_w += 1.0f;
         
         float error = fabsf(dist - edge.k);
         error = fminf(error, 0.5 * dist);  // Clamp error to avoid overflow
         error = fmaxf(error, 1.0f);  // Avoid slow final convergence
+        
+        // Add linear scaling when distance is less than 0.5 of desired distance
+        float force_multiplier = 1.0f;
+        if (enable_spring_push_multiplier && dist < 0.5f * edge.k) {
+            // Linear scaling: 1x at 0.5*edge.k -> 5x at 0.0
+            float ratio = dist / (0.5f * edge.k);  // ratio goes from 1.0 at 0.5*edge.k to 0.0 at dist=0
+            force_multiplier = 1.0f + 4.0f * (1.0f - ratio);  // 1 + 4*(1-ratio) = 5 at ratio=0, 1 at ratio=1
+        }
+        
         float ux = dz / dist;
         float us = ds / dist;
-        acc_z += error * ux * sign;
-        acc_s +=  error * us * sign;
+        acc_z += error * ux * sign * force_multiplier;
+        acc_s += error * us * sign * force_multiplier;
         sum_w += 1.0f;
     }
     
@@ -256,35 +304,35 @@ __global__ void flattening_update_kernel(
     float step_z = acc_z / sum_w + angle_acc_z / angle_sum_w;
     float step_s = acc_s / sum_w + angle_acc_s / angle_sum_w;
     
-    // Additional z tug (only if a non-zero interval is specified)
-    if (z_max > z_min) {
-        if (node.wnr_side > z_max)      step_z += tug_step;
-        else if (node.wnr_side < z_min) step_z -= tug_step;
-    }
-    // Additional angle tug (only if a non-zero interval is specified)
-    if (a_max > a_min) {
-        if (node.wnr_side_old > a_max)      step_s += tug_step;
-        else if (node.wnr_side_old < a_min) step_s -= tug_step;
-    }
-    // Additional zero-range-based tug to drive mean to zero
-    if (num_zero_ranges > 0) {
-        float w_old = node.wnr_side_old;
-        for (int j = 0; j < num_zero_ranges; ++j) {
-            float min_a = zero_ranges[j].x;
-            float max_a = zero_ranges[j].y;
-            if (w_old > min_a && w_old < max_a) {
-                float mean = zero_means[j];
-                if (tug_step > 0) {
-                    step_z -= mean;
-                }
-                else {
-                    if (mean > 0) step_z -= fabsf(tug_step);
-                    else if (mean < 0) step_z += fabsf(tug_step);
-                }
-                break;
-            }
-        }
-    }
+    // // Additional z tug (only if a non-zero interval is specified)
+    // if (z_max > z_min) {
+    //     if (node.wnr_side > z_max)      step_z += tug_step;
+    //     else if (node.wnr_side < z_min) step_z -= tug_step;
+    // }
+    // // Additional angle tug (only if a non-zero interval is specified)
+    // if (a_max > a_min) {
+    //     if (node.wnr_side_old > a_max)      step_s += tug_step;
+    //     else if (node.wnr_side_old < a_min) step_s -= tug_step;
+    // }
+    // // Additional zero-range-based tug to drive mean to zero
+    // if (num_zero_ranges > 0) {
+    //     float w_old = node.wnr_side_old;
+    //     for (int j = 0; j < num_zero_ranges; ++j) {
+    //         float min_a = zero_ranges[j].x;
+    //         float max_a = zero_ranges[j].y;
+    //         if (w_old > min_a && w_old < max_a) {
+    //             float mean = zero_means[j];
+    //             if (tug_step > 0) {
+    //                 step_z -= mean;
+    //             }
+    //             else {
+    //                 if (mean > 0) step_z -= fabsf(tug_step);
+    //                 else if (mean < 0) step_z += fabsf(tug_step);
+    //             }
+    //             break;
+    //         }
+    //     }
+    // }
     // Store updates in temporaries: use node.z for new f_init, node.f_tilde for new f_star
     float lr = 1.5f;
     node.z       = node.f_init + lr * step_z;
@@ -310,7 +358,8 @@ std::vector<Node> run_solver_flattening(
     float tug_step,
     float init_z_tug,
     const std::vector<std::pair<float, float>>& zero_ranges,
-    bool visualize
+    bool visualize,
+    bool enable_spring_push_multiplier
 ) {
     std::vector<Node> graph_copy = graph;
     size_t N = graph_copy.size();
@@ -351,9 +400,34 @@ std::vector<Node> run_solver_flattening(
         cudaMalloc(&d_counts, num_ranges * sizeof(int));
         cudaMalloc(&d_means, num_ranges * sizeof(float));
     }
-    // Launch loop
+    // Allocate device memory for edge counting
+    int* d_total_edges;
+    int* d_active_edges;
+    cudaMalloc(&d_total_edges, sizeof(int));
+    cudaMalloc(&d_active_edges, sizeof(int));
+    
+    // Initialize counters to zero
+    cudaMemset(d_total_edges, 0, sizeof(int));
+    cudaMemset(d_active_edges, 0, sizeof(int));
+    
+    // Launch parameters
     int TPB = 256;
     int blocks = (M + TPB - 1) / TPB;
+    
+    // Count edges before starting solver
+    count_edges_kernel<<<blocks, TPB>>>(d_graph, d_valid, (int)M, d_total_edges, d_active_edges);
+    cudaDeviceSynchronize();
+    
+    // Copy results back to host and print
+    int h_total_edges = 0;
+    int h_active_edges = 0;
+    cudaMemcpy(&h_total_edges, d_total_edges, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_active_edges, d_active_edges, sizeof(int), cudaMemcpyDeviceToHost);
+    
+    std::cout << "Edge count: " << h_total_edges << " total edges, " << h_active_edges 
+              << " active edges (both nodes unfixed, undeleted, edge not temporary)" << std::endl;
+    
+    // Launch loop
     const int step_size = 1000;
     for (int it = 1; it <= num_iterations; ++it) {
         // Reset and compute zero_ranges means if any
@@ -374,7 +448,8 @@ std::vector<Node> run_solver_flattening(
             z_tug_min, z_tug_max,
             angle_tug_min, angle_tug_max,
             tug_step,
-            d_ranges, num_ranges, d_means
+            d_ranges, num_ranges, d_means,
+            enable_spring_push_multiplier
         );
         cudaDeviceSynchronize();
         // Apply: commit temporaries to f_init and f_star
@@ -409,6 +484,9 @@ std::vector<Node> run_solver_flattening(
         cudaFree(d_counts);
         cudaFree(d_means);
     }
+    // Cleanup edge counting device memory
+    cudaFree(d_total_edges);
+    cudaFree(d_active_edges);
     // Cleanup initial-z device memory
     if (d_init_z) cudaFree(d_init_z);
     // Cleanup edges and graph memory

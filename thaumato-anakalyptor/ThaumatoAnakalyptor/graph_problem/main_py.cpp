@@ -550,7 +550,8 @@ class Solver {
             float tug_step,
             float init_z_tug = 0.0f,
             std::vector<std::pair<float, float>> zero_ranges = {},
-            bool visualize = false
+            bool visualize = false,
+            bool enable_spring_push_multiplier = false
         ) {
             // Solve flattening on the full graph
             std::vector<size_t> valid_indices = get_valid_indices(graph);
@@ -567,7 +568,8 @@ class Solver {
                 tug_step,
                 init_z_tug,
                 zero_ranges,
-                visualize
+                visualize,
+                enable_spring_push_multiplier
             );
         }
         void solve_union() {
@@ -1215,7 +1217,7 @@ class Solver {
         {
             return find_good_neighbors_and_add_edges(graph, r, delta_neg, delta_top, delta_perfect, sample_fraction, min_neighbors);
         }
-};
+    };
 
 PYBIND11_MODULE(graph_problem_gpu_py, m) {
     m.doc() = "pybind11 module for python solver class";
@@ -1291,7 +1293,8 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("tug_step") = 0.0f,
             py::arg("init_z_tug") = 0.0f,
             py::arg("zero_ranges") = std::vector<std::pair<float, float>>(),
-            py::arg("visualize") = false)
+            py::arg("visualize") = false,
+            py::arg("enable_spring_push_multiplier") = false)
         .def("solve_union", &Solver::solve_union,
             "Method to solve the graph with the union solver")
         .def("solve_ring", &Solver::solve_ring,
