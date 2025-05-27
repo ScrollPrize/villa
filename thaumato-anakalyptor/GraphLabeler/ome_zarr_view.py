@@ -24,57 +24,104 @@ from scroll_graph_util import compute_mean_windings_precomputed, load_xyz_from_f
 # Utility Functions
 ########################################
 
-def load_graph_pkl(graph_pkl_path):
+def load_graph_pkl(graph_pkl_path, use_h5=False):
     """
     Load or build a slimmed ScrollGraph, retaining only 'sample_points' and 'centroid' per node.
-    If a '<base>_small.pkl' exists alongside the original, load from that.
+    If use_h5=True, creates/loads an even smaller '_tiny.pkl' with only keys and centroids.
+    If a '<base>_small.pkl' or '<base>_tiny.pkl' exists alongside the original, load from that.
     Otherwise, unpickle the full graph once, trim and downcast nodes, save a small pickle, and return it.
     """
     import scroll_graph_util
     base, ext = os.path.splitext(graph_pkl_path)
-    small_pkl = base + '_small' + ext
-    # Load pre-slimmed if available
-    if os.path.exists(small_pkl):
-        print(f"[SlimLoad] Loading slimmed graph from {small_pkl}", file=sys.stderr)
-        nodes = pickle.load(open(small_pkl, 'rb'))
-        graph = scroll_graph_util.ScrollGraph(0, None)
-        graph.nodes = nodes
-        print(f"[SlimLoad] Loaded slim graph with {len(nodes)} nodes", file=sys.stderr)
-        return graph
-    # Else build slim graph
-    print(f"[SlimLoad] Building slimmed graph from {graph_pkl_path}", file=sys.stderr)
-    class SlimScrollGraph(scroll_graph_util.ScrollGraph):
-        def __setstate__(self, state):
-            nodes = state.get('nodes', {}) or {}
-            total = len(nodes)
-            print(f"[SlimLoad] Trimming {total} nodes...", file=sys.stderr)
-            slim_nodes = {}
-            for key, data in tqdm(nodes.items(), desc="[SlimLoad] Trimming nodes", total=total, file=sys.stderr):
-                sp = data.get('sample_points')
-                sp16 = np.asarray(sp, dtype=np.float16) if sp is not None else None
-                cent = data.get('centroid')
-                cent16 = np.asarray(cent, dtype=np.float16) if cent is not None else None
-                slim_nodes[key] = {'sample_points': sp16, 'centroid': cent16}
-            self.nodes = slim_nodes
-            print(f"[SlimLoad] Slim graph ready with {len(slim_nodes)} nodes", file=sys.stderr)
-    class SlimUnpickler(pickle.Unpickler):
-        def find_class(self, module, name):
-            if module == 'scroll_graph_util' and name in ('ScrollGraph', 'Graph'):
-                return SlimScrollGraph
-            return super().find_class(module, name)
-    with open(graph_pkl_path, 'rb') as f:
-        print(f"[SlimLoad] Unpickling full graph...", file=sys.stderr)
-        unp = SlimUnpickler(f)
-        slim_graph = unp.load()
-        print(f"[SlimLoad] Full graph unpickled and trimmed.", file=sys.stderr)
-    # Save slim nodes dict
-    try:
-        with open(small_pkl, 'wb') as fout:
-            pickle.dump(slim_graph.nodes, fout, protocol=pickle.HIGHEST_PROTOCOL)
-        print(f"[SlimLoad] Saved slim graph nodes to {small_pkl}", file=sys.stderr)
-    except Exception as e:
-        print(f"[SlimLoad] Warning: could not save slim pickle: {e}", file=sys.stderr)
-    return slim_graph
+    
+    if use_h5:
+        # For H5 usage, we only need node keys and centroids
+        tiny_pkl = base + '_tiny' + ext
+        # Load pre-tiny if available
+        if os.path.exists(tiny_pkl):
+            print(f"[TinyLoad] Loading tiny graph from {tiny_pkl}", file=sys.stderr)
+            nodes = pickle.load(open(tiny_pkl, 'rb'))
+            graph = scroll_graph_util.ScrollGraph(0, None)
+            graph.nodes = nodes
+            print(f"[TinyLoad] Loaded tiny graph with {len(nodes)} nodes", file=sys.stderr)
+            return graph
+        # Else build tiny graph
+        print(f"[TinyLoad] Building tiny graph from {graph_pkl_path}", file=sys.stderr)
+        class TinyScrollGraph(scroll_graph_util.ScrollGraph):
+            def __setstate__(self, state):
+                nodes = state.get('nodes', {}) or {}
+                total = len(nodes)
+                print(f"[TinyLoad] Trimming {total} nodes to keys+centroids only...", file=sys.stderr)
+                tiny_nodes = {}
+                for key, data in tqdm(nodes.items(), desc="[TinyLoad] Trimming nodes", total=total, file=sys.stderr):
+                    cent = data.get('centroid')
+                    cent16 = np.asarray(cent, dtype=np.float16) if cent is not None else None
+                    tiny_nodes[key] = {'centroid': cent16}
+                self.nodes = tiny_nodes
+                print(f"[TinyLoad] Tiny graph ready with {len(tiny_nodes)} nodes", file=sys.stderr)
+        class TinyUnpickler(pickle.Unpickler):
+            def find_class(self, module, name):
+                if module == 'scroll_graph_util' and name in ('ScrollGraph', 'Graph'):
+                    return TinyScrollGraph
+                return super().find_class(module, name)
+        with open(graph_pkl_path, 'rb') as f:
+            print(f"[TinyLoad] Unpickling full graph...", file=sys.stderr)
+            unp = TinyUnpickler(f)
+            tiny_graph = unp.load()
+            print(f"[TinyLoad] Full graph unpickled and trimmed to tiny.", file=sys.stderr)
+        # Save tiny nodes dict
+        try:
+            with open(tiny_pkl, 'wb') as fout:
+                pickle.dump(tiny_graph.nodes, fout, protocol=pickle.HIGHEST_PROTOCOL)
+            print(f"[TinyLoad] Saved tiny graph nodes to {tiny_pkl}", file=sys.stderr)
+        except Exception as e:
+            print(f"[TinyLoad] Warning: could not save tiny pickle: {e}", file=sys.stderr)
+        return tiny_graph
+    else:
+        # Original small pkl logic for non-H5 usage
+        small_pkl = base + '_small' + ext
+        # Load pre-slimmed if available
+        if os.path.exists(small_pkl):
+            print(f"[SlimLoad] Loading slimmed graph from {small_pkl}", file=sys.stderr)
+            nodes = pickle.load(open(small_pkl, 'rb'))
+            graph = scroll_graph_util.ScrollGraph(0, None)
+            graph.nodes = nodes
+            print(f"[SlimLoad] Loaded slim graph with {len(nodes)} nodes", file=sys.stderr)
+            return graph
+        # Else build slim graph
+        print(f"[SlimLoad] Building slimmed graph from {graph_pkl_path}", file=sys.stderr)
+        class SlimScrollGraph(scroll_graph_util.ScrollGraph):
+            def __setstate__(self, state):
+                nodes = state.get('nodes', {}) or {}
+                total = len(nodes)
+                print(f"[SlimLoad] Trimming {total} nodes...", file=sys.stderr)
+                slim_nodes = {}
+                for key, data in tqdm(nodes.items(), desc="[SlimLoad] Trimming nodes", total=total, file=sys.stderr):
+                    sp = data.get('sample_points')
+                    sp16 = np.asarray(sp, dtype=np.float16) if sp is not None else None
+                    cent = data.get('centroid')
+                    cent16 = np.asarray(cent, dtype=np.float16) if cent is not None else None
+                    slim_nodes[key] = {'sample_points': sp16, 'centroid': cent16}
+                self.nodes = slim_nodes
+                print(f"[SlimLoad] Slim graph ready with {len(slim_nodes)} nodes", file=sys.stderr)
+        class SlimUnpickler(pickle.Unpickler):
+            def find_class(self, module, name):
+                if module == 'scroll_graph_util' and name in ('ScrollGraph', 'Graph'):
+                    return SlimScrollGraph
+                return super().find_class(module, name)
+        with open(graph_pkl_path, 'rb') as f:
+            print(f"[SlimLoad] Unpickling full graph...", file=sys.stderr)
+            unp = SlimUnpickler(f)
+            slim_graph = unp.load()
+            print(f"[SlimLoad] Full graph unpickled and trimmed.", file=sys.stderr)
+        # Save slim nodes dict
+        try:
+            with open(small_pkl, 'wb') as fout:
+                pickle.dump(slim_graph.nodes, fout, protocol=pickle.HIGHEST_PROTOCOL)
+            print(f"[SlimLoad] Saved slim graph nodes to {small_pkl}", file=sys.stderr)
+        except Exception as e:
+            print(f"[SlimLoad] Warning: could not save slim pickle: {e}", file=sys.stderr)
+        return slim_graph
 
 ########################################
 # Helper Functions
@@ -305,10 +352,12 @@ class PersistentScrollGraphWorker(QObject):
     overlay_labels_computed = pyqtSignal(object)
     overlay_labels_computed_xz = pyqtSignal(object)
 
-    def __init__(self, graph_pkl_path, umbilicus_data, unlabeled, parent=None):
+    def __init__(self, graph_pkl_path, umbilicus_data, unlabeled, h5_path=None, parent=None):
         super().__init__(parent)
+        # Determine if we should use the tiny version based on h5_path
+        use_h5 = h5_path is not None and h5_path.endswith(".h5")
         # Load the scroll graph (from pickle) once.
-        self.scroll_graph = load_graph_pkl(graph_pkl_path)
+        self.scroll_graph = load_graph_pkl(graph_pkl_path, use_h5=use_h5)
         self.umbilicus_data = umbilicus_data
         self.UNLABELED = unlabeled
         self.overlay_point_nodes_indices = None
@@ -506,7 +555,7 @@ class OmeZarrViewWindow(QMainWindow):
 
         # Setup persistent overlay worker.
         self.overlay_thread = QThread()
-        self.persistent_overlay_worker = PersistentScrollGraphWorker(self.graph_pkl_path, self.umbilicus_data, self.UNLABELED)
+        self.persistent_overlay_worker = PersistentScrollGraphWorker(self.graph_pkl_path, self.umbilicus_data, self.UNLABELED, self.h5_path)
         self.persistent_overlay_worker.moveToThread(self.overlay_thread)
         self.overlay_thread.start()
         self.persistent_overlay_worker.overlay_points_computed.connect(self.on_overlay_points_computed)

@@ -301,8 +301,8 @@ __global__ void flattening_update_kernel(
         angle_sum_w = 1.0f;
     }
         
-    float step_z = acc_z / sum_w + angle_acc_z / angle_sum_w;
-    float step_s = acc_s / sum_w + angle_acc_s / angle_sum_w;
+    float step_z = acc_z / sum_w;
+    float step_s = acc_s / sum_w;
     
     // // Additional z tug (only if a non-zero interval is specified)
     // if (z_max > z_min) {
