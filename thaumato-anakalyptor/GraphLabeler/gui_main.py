@@ -38,7 +38,7 @@ class PointCloudLabeler(QMainWindow):
         self.config = load_config("config_labeling_gui.json")
         self.graph_path = self.config.get("graph_path", "")
         self.default_experiment = self.config.get("default_experiment", "")
-        self.graph_version = self.config.get("graph_version", 1)
+        self.graph_version = self.config.get("graph_version", 3)
         self.ome_zarr_path = self.config.get("ome_zarr_path", None)
         self.graph_pkl_path = self.config.get("graph_pkl_path", None)
         self.h5_path = self.config.get("h5_path", None)
@@ -976,7 +976,7 @@ class PointCloudLabeler(QMainWindow):
         version_spinbox = QSpinBox()
         version_spinbox.setRange(0, 10)
         version_spinbox.setValue(self.graph_version)
-        version_spinbox.setToolTip("Graph version to load (default: 1)")
+        version_spinbox.setToolTip("Graph version to load (default: 3)")
         form_layout.addRow("Graph Version:", version_spinbox)
         
         layout.addLayout(form_layout)
