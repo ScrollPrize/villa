@@ -357,7 +357,8 @@ std::vector<Node> run_solver_flattening(
     float tug_step,
     float init_z_tug,
     const std::vector<std::pair<float, float>>& zero_ranges,
-    bool visualize
+    bool visualize,
+    bool enable_spring_push_multiplier
 ) {
     std::vector<Node> graph_copy = graph;
     size_t N = graph_copy.size();
