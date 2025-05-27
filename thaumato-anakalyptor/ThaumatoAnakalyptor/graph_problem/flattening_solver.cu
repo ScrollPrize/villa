@@ -145,8 +145,7 @@ __global__ void flattening_update_kernel(
     float tug_step,
     const float2* zero_ranges,
     int num_zero_ranges,
-    const float* zero_means,
-    bool enable_spring_push_multiplier
+    const float* zero_means
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_valid) return;
@@ -194,7 +193,7 @@ __global__ void flattening_update_kernel(
         
         // Add linear scaling when distance is less than 0.5 of desired distance
         float force_multiplier = 1.0f;
-        if (enable_spring_push_multiplier && dist < 0.5f * edge.k) {
+        if (dist < 0.5f * edge.k) {
             // Linear scaling: 1x at 0.5*edge.k -> 5x at 0.0
             float ratio = dist / (0.5f * edge.k);  // ratio goes from 1.0 at 0.5*edge.k to 0.0 at dist=0
             force_multiplier = 1.0f + 4.0f * (1.0f - ratio);  // 1 + 4*(1-ratio) = 5 at ratio=0, 1 at ratio=1
@@ -301,8 +300,8 @@ __global__ void flattening_update_kernel(
         angle_sum_w = 1.0f;
     }
         
-    float step_z = acc_z / sum_w;
-    float step_s = acc_s / sum_w;
+    float step_z = acc_z / sum_w + angle_acc_z / angle_sum_w;
+    float step_s = acc_s / sum_w + angle_acc_s / angle_sum_w;
     
     // // Additional z tug (only if a non-zero interval is specified)
     // if (z_max > z_min) {
@@ -358,8 +357,7 @@ std::vector<Node> run_solver_flattening(
     float tug_step,
     float init_z_tug,
     const std::vector<std::pair<float, float>>& zero_ranges,
-    bool visualize,
-    bool enable_spring_push_multiplier
+    bool visualize
 ) {
     std::vector<Node> graph_copy = graph;
     size_t N = graph_copy.size();
@@ -448,8 +446,7 @@ std::vector<Node> run_solver_flattening(
             z_tug_min, z_tug_max,
             angle_tug_min, angle_tug_max,
             tug_step,
-            d_ranges, num_ranges, d_means,
-            enable_spring_push_multiplier
+            d_ranges, num_ranges, d_means
         );
         cudaDeviceSynchronize();
         // Apply: commit temporaries to f_init and f_star
@@ -484,9 +481,6 @@ std::vector<Node> run_solver_flattening(
         cudaFree(d_counts);
         cudaFree(d_means);
     }
-    // Cleanup edge counting device memory
-    cudaFree(d_total_edges);
-    cudaFree(d_active_edges);
     // Cleanup initial-z device memory
     if (d_init_z) cudaFree(d_init_z);
     // Cleanup edges and graph memory
