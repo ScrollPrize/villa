@@ -1115,7 +1115,7 @@ def flatten_pointcloud(base_path,
         solver_ds.solve_flattening(num_iterations=20000, visualize=True, 
                                    angle_tug_min=min_angle+90, angle_tug_max=max_angle-90, 
                                    z_tug_min=z_min+100, z_tug_max=z_max-100, 
-                                   tug_step=0.25, zero_ranges=zero_ranges_initial)
+                                   tug_step=0.5, zero_ranges=zero_ranges_initial)
         
         uvs_ds_initial = np.array(solver_ds.get_uvs())
         print(f"After first downsampled solve: u min={uvs_ds_initial[:,0].min()}, u max={uvs_ds_initial[:,0].max()}, v min={uvs_ds_initial[:,1].min()}, v max={uvs_ds_initial[:,1].max()}")
