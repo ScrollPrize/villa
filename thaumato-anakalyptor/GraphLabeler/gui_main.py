@@ -44,7 +44,6 @@ class PointCloudLabeler(QMainWindow):
         self.h5_path = self.config.get("h5_path", None)
         self.umbilicus_path = self.config.get("umbilicus_path", None)
 
-
         # Initialize solver using SolverInterface if no external point data is provided.
         if point_data is None and self.default_experiment != "" and self.graph_path != "":
             self.solver = graph_problem_gpu_py.Solver(self.graph_path)
