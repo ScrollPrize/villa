@@ -797,7 +797,7 @@ def build_neighbor_graph(coords,
     # print(f"Distance filtering: {total_edges_before} -> {total_edges_after} edges (removed {total_edges_before - total_edges_after})")
     return neighbor_lists, distance_lists
 
-def create_flattening_downsample_indices(points, is_mesh_flags, downsample_ratio):
+def create_flattening_downsample_indices(points, is_mesh_flags, downsample_ratio, downsample_ratio_mesh):
     """
     Create downsampled indices for flattening solver that keeps all mesh points 
     and a fraction of slab points.
@@ -825,9 +825,19 @@ def create_flattening_downsample_indices(points, is_mesh_flags, downsample_ratio
             kept_slab = np.array([], dtype=int)
     else:
         kept_slab = slab_indices
+
+    # Downsample slab points
+    if len(mesh_indices) > 0 and downsample_ratio_mesh < 1.0:
+        n_slab_keep = int(len(mesh_indices) * downsample_ratio_mesh)
+        if n_slab_keep > 0:
+            kept_slab_mesh = np.random.choice(mesh_indices, n_slab_keep, replace=False)
+        else:
+            kept_slab_mesh = np.array([], dtype=int)
+    else:
+        kept_slab_mesh = mesh_indices
     
     # Combine and sort
-    all_kept = np.concatenate([kept_mesh, kept_slab])
+    all_kept = np.concatenate([kept_slab_mesh, kept_slab])
     all_kept = np.sort(all_kept)
     
     print(f"Downsampling for solver: kept {len(kept_mesh)} mesh + {len(kept_slab)} slab = {len(all_kept)} total points")
@@ -839,10 +849,12 @@ def flatten_pointcloud(base_path,
                        angle_threshold=40,
                        angle_weight=0.2,
                        downsample_ratio=0.1,
-                       flattening_downsample_ratio=0.3,
+                       flattening_downsample_ratio=0.075,
+                       flattening_downsample_ratio_mesh=0.75,
                        display=False,
                        display_downsample=0.1,
-                       color_by_angle=False):
+                       color_by_angle=False,
+                       from_winding=None):
     """
     Flatten pointcloud by concatenating winding segments and building neighbor graphs.
 
@@ -903,12 +915,37 @@ def flatten_pointcloud(base_path,
     # process windings in segments
     winding_us = None
     winding_vs = None
+    print(f"hi {from_winding}")
     for start in range(0, len(winding_files)):
         # if start < 27: # for debug, leave it for now
         #     continue
         # if start > first_mesh_idx + 2: # for debug, leave it for now
         #     continue
-        
+        # Skip if before first mesh winding or after last mesh winding
+        if start < first_mesh_idx:
+            print(f"Skipping winding {start} (before first mesh winding)")
+            continue
+        if start > last_mesh_idx:
+            print(f"Finished processing: reached winding {start} (past last mesh winding)")
+            break
+        print(f"start {start} {winding_files_indices[start]}")
+        if from_winding is not None and winding_files_indices[start] < from_winding:
+            continue
+        if from_winding is not None and winding_files_indices[start] - winding_width - 1 > from_winding:
+            continue
+        # try to load the previous flattened pointcloud
+        try:
+            points, uvs = load_flattened_winding(flattened_winding_path, winding_files_indices[start])
+            prev_points[winding_files_indices[start]] = points
+            prev_uvs_u[winding_files_indices[start]] = uvs[:, 0]
+            prev_uvs_v[winding_files_indices[start]] = uvs[:, 1]
+            print(f"Loaded previous flattened pointcloud for winding {winding_files_indices[start]}")
+        except Exception as e:
+            print(f"Warning: Could not load previous flattened pointcloud for winding {winding_files_indices[start]}: {e}")
+    print("hi2")
+    for start in range(0, len(winding_files)):
+        if from_winding is not None and winding_files_indices[start] < from_winding:
+                continue
         # Skip if before first mesh winding or after last mesh winding
         if start < first_mesh_idx:
             print(f"Skipping winding {start} (before first mesh winding)")
@@ -941,7 +978,7 @@ def flatten_pointcloud(base_path,
                 print(f"Trimmed wrap {wnr}: z [{z_min:.2f},{z_max:.2f}] -> keeping [{z_low:.2f},{z_high:.2f}], {after_n}/{before_n} points")
                 # random downsampling of newly loaded points
                 if downsample_ratio < 1.0:
-                    mask = np.random.rand(points_.shape[0]) < downsample_ratio
+                    mask = np.logical_or(np.random.rand(points_.shape[0]) < downsample_ratio, points_[:, 4].astype(bool))
                     points_ = points_[mask]
                 if display:
                     # Display 3D pointcloud, optionally colored by angle
@@ -1029,7 +1066,7 @@ def flatten_pointcloud(base_path,
 
         # STEP 1: Create downsampled data for initial solve
         print("=== STEP 1: Creating downsampled data for initial solve ===")
-        downsample_indices = create_flattening_downsample_indices(points, is_mesh_flags, flattening_downsample_ratio)
+        downsample_indices = create_flattening_downsample_indices(points, is_mesh_flags, flattening_downsample_ratio, flattening_downsample_ratio_mesh)
         
         # Create downsampled arrays
         coords_ds = coords[downsample_indices]
@@ -1112,7 +1149,7 @@ def flatten_pointcloud(base_path,
         ds_fixed_nodes = len(first_winding_relative) if 'first_winding_relative' in locals() and first_winding_relative else 0
         ds_unfixed_nodes = ds_total_nodes - ds_fixed_nodes
         print(f"Downsampled solver: {ds_unfixed_nodes} unfixed nodes out of {ds_total_nodes} total nodes ({ds_fixed_nodes} fixed)")
-        solver_ds.solve_flattening(num_iterations=20000, visualize=True, 
+        solver_ds.solve_flattening(num_iterations=25000, visualize=True, 
                                    angle_tug_min=min_angle+90, angle_tug_max=max_angle-90, 
                                    z_tug_min=z_min+100, z_tug_max=z_max-100, 
                                    tug_step=0.5, zero_ranges=zero_ranges_initial)
@@ -1213,15 +1250,16 @@ def flatten_pointcloud(base_path,
             wrap0_idx = list(range(first_count))
             print(f"DEBUG: first_count = {first_count}, wrap0_idx (first 10): {wrap0_idx[:10]}")
             # Convert to relative indices for the full solver
-            for abs_idx in wrap0_idx:
-                where_found = np.where(full_valid_indices == abs_idx)[0]
-                if len(where_found) > 0:
-                    first_winding_relative_full.append(where_found[0])
-                else:
-                    first_winding_missing += 1
-        
-        if first_winding_missing > 0:
-            print(f"WARNING: {first_winding_missing} first winding points not found in full solver valid indices!")
+            first_winding_relative_full = list(range(first_count))
+            
+            # for abs_idx in wrap0_idx:
+            #     where_found = np.where(full_valid_indices == abs_idx)[0]
+            #     if len(where_found) > 0:
+            #         first_winding_relative_full.append(where_found[0])
+            #     else:
+            #         first_winding_missing += 1
+        # if first_winding_missing > 0:
+        #     print(f"WARNING: {first_winding_missing} first winding points not found in full solver valid indices!")
         
         # Combine downsampled and first winding indices for fixing
         all_fixed_indices = list(set(relative_downsample_indices + first_winding_relative_full))
@@ -1231,30 +1269,30 @@ def flatten_pointcloud(base_path,
         total_valid = len(full_valid_indices)
         print(f"Proposed to fix {fixed_count}/{total_valid} nodes ({100*fixed_count/total_valid:.1f}%)")
         
-        # If too many nodes are fixed, reduce the number to allow more movement
-        if fixed_count > total_valid * 0.8:  # If more than 80% would be fixed
-            print(f"WARNING: Too many nodes would be fixed ({fixed_count}/{total_valid}). Reducing fixed nodes to allow movement.")
+        # # If too many nodes are fixed, reduce the number to allow more movement
+        # if fixed_count > total_valid * 0.8:  # If more than 80% would be fixed
+        #     print(f"WARNING: Too many nodes would be fixed ({fixed_count}/{total_valid}). Reducing fixed nodes to allow movement.")
             
-            # Keep only a subset of the most important fixed nodes
-            # Priority: 1) First winding nodes (if available), 2) Subset of downsampled nodes
-            important_fixed = []
+        #     # Keep only a subset of the most important fixed nodes
+        #     # Priority: 1) First winding nodes (if available), 2) Subset of downsampled nodes
+        #     important_fixed = []
             
-            # Always keep first winding nodes if available
-            if len(first_winding_relative_full) > 0:
-                important_fixed.extend(first_winding_relative_full)
-                print(f"Keeping {len(first_winding_relative_full)} first winding nodes as fixed")
+        #     # Always keep first winding nodes if available
+        #     if len(first_winding_relative_full) > 0:
+        #         important_fixed.extend(first_winding_relative_full)
+        #         print(f"Keeping {len(first_winding_relative_full)} first winding nodes as fixed")
             
-            # Add a subset of downsampled nodes (every Nth node to spread them out)
-            remaining_budget = max(int(total_valid * 0.3), 10) - len(important_fixed)  # Target 30% fixed max
-            if remaining_budget > 0 and len(relative_downsample_indices) > 0:
-                step = max(1, len(relative_downsample_indices) // remaining_budget)
-                subset_downsample = relative_downsample_indices[::step][:remaining_budget]
-                important_fixed.extend(subset_downsample)
-                print(f"Keeping {len(subset_downsample)} downsampled nodes as fixed (every {step}th node)")
+        #     # Add a subset of downsampled nodes (every Nth node to spread them out)
+        #     remaining_budget = max(int(total_valid * 0.3), 10) - len(important_fixed)  # Target 30% fixed max
+        #     if remaining_budget > 0 and len(relative_downsample_indices) > 0:
+        #         step = max(1, len(relative_downsample_indices) // remaining_budget)
+        #         subset_downsample = relative_downsample_indices[::step][:remaining_budget]
+        #         important_fixed.extend(subset_downsample)
+        #         print(f"Keeping {len(subset_downsample)} downsampled nodes as fixed (every {step}th node)")
             
-            all_fixed_indices = important_fixed
-            fixed_count = len(all_fixed_indices)
-            print(f"Reduced fixed nodes to {fixed_count}/{total_valid} ({100*fixed_count/total_valid:.1f}%)")
+        #     all_fixed_indices = important_fixed
+        #     fixed_count = len(all_fixed_indices)
+        #     print(f"Reduced fixed nodes to {fixed_count}/{total_valid} ({100*fixed_count/total_valid:.1f}%)")
         
         # Fix both the downsampled points and first winding points in the full solver
         if len(all_fixed_indices) > 0:
@@ -2157,13 +2195,16 @@ def main():
     parser = argparse.ArgumentParser(description="Refine pointcloud using mesh and downsampling")
     parser.add_argument("--mesh", required=True, help="Path to mesh file (.ply or .obj)")
     parser.add_argument("--downsample_ratio", type=float, default=1.0, help="Downsample ratio for pointclouds")
-    parser.add_argument("--flattening_downsample_ratio", type=float, default=0.3, help="Downsample ratio for flattening solver first pass")
+    parser.add_argument("--flattening_downsample_ratio", type=float, default=0.075, help="Downsample ratio for flattening solver first pass")
+    parser.add_argument("--flattening_downsample_ratio_mesh", type=float, default=0.75, help="Downsample ratio for flattening solver first pass")
     parser.add_argument("--skip_precomputation", action="store_true", help="Skip precomputation of winding pointclouds")
     parser.add_argument("--display", action="store_true", help="Display pointclouds and meshes")
     parser.add_argument("--display_downsample", type=float, default=0.1,
                         help="Random downsample ratio for 3D display (0..1)")
     parser.add_argument("--color_by_angle", action="store_true",
                         help="Color 3D display by angular value")
+    parser.add_argument("--from_winding", type=int, default=None,
+                        help="Start from this winding index")
     args = parser.parse_args()
 
     # Load winding direction
@@ -2189,8 +2230,10 @@ def main():
         display=args.display,
         downsample_ratio=args.downsample_ratio,
         flattening_downsample_ratio=args.flattening_downsample_ratio,
+        flattening_downsample_ratio_mesh=args.flattening_downsample_ratio_mesh,
         display_downsample=args.display_downsample,
-        color_by_angle=args.color_by_angle
+        color_by_angle=args.color_by_angle,
+        from_winding=args.from_winding
     )
     grid_uv_flattened(
         flattened_winding_path,

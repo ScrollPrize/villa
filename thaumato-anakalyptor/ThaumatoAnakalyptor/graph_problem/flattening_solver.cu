@@ -145,7 +145,8 @@ __global__ void flattening_update_kernel(
     float tug_step,
     const float2* zero_ranges,
     int num_zero_ranges,
-    const float* zero_means
+    const float* zero_means,
+    bool enable_spring_push_multiplier
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_valid) return;
@@ -191,12 +192,20 @@ __global__ void flattening_update_kernel(
         error = fminf(error, 0.5 * dist);  // Clamp error to avoid overflow
         error = fmaxf(error, 1.0f);  // Avoid slow final convergence
         
-        // Add linear scaling when distance is less than 0.5 of desired distance
+        // Add linear scaling when distance is less than 0.5 of desired distance (only if enabled)
         float force_multiplier = 1.0f;
-        if (dist < 0.5f * edge.k) {
+        float activation_ratio = 0.75f;
+        float activation_ratio_push_in = 1.25f;
+        if (enable_spring_push_multiplier && dist < activation_ratio * edge.k) {
             // Linear scaling: 1x at 0.5*edge.k -> 5x at 0.0
-            float ratio = dist / (0.5f * edge.k);  // ratio goes from 1.0 at 0.5*edge.k to 0.0 at dist=0
-            force_multiplier = 1.0f + 4.0f * (1.0f - ratio);  // 1 + 4*(1-ratio) = 5 at ratio=0, 1 at ratio=1
+            float ratio = dist / (activation_ratio * edge.k);  // ratio goes from 1.0 at 0.5*edge.k to 0.0 at dist=0
+            force_multiplier = 1.0f + 10.0f * (1.0f - ratio);  // 1 + 4*(1-ratio) = 5 at ratio=0, 1 at ratio=1
+        }
+
+        if (enable_spring_push_multiplier && dist > activation_ratio_push_in * edge.k) {
+            // Linear scaling: 1x at 0.5*edge.k -> 5x at 0.0
+            float ratio = dist / (activation_ratio_push_in * edge.k);  // ratio goes from 1.0 at activation_ratio_push_in*edge.k to 5.0 at dist=
+            force_multiplier = 1.0f / ratio;
         }
         
         float ux = dz / dist;
@@ -303,35 +312,35 @@ __global__ void flattening_update_kernel(
     float step_z = acc_z / sum_w + angle_acc_z / angle_sum_w;
     float step_s = acc_s / sum_w + angle_acc_s / angle_sum_w;
     
-    // // Additional z tug (only if a non-zero interval is specified)
-    // if (z_max > z_min) {
-    //     if (node.wnr_side > z_max)      step_z += tug_step;
-    //     else if (node.wnr_side < z_min) step_z -= tug_step;
-    // }
-    // // Additional angle tug (only if a non-zero interval is specified)
-    // if (a_max > a_min) {
-    //     if (node.wnr_side_old > a_max)      step_s += tug_step;
-    //     else if (node.wnr_side_old < a_min) step_s -= tug_step;
-    // }
-    // // Additional zero-range-based tug to drive mean to zero
-    // if (num_zero_ranges > 0) {
-    //     float w_old = node.wnr_side_old;
-    //     for (int j = 0; j < num_zero_ranges; ++j) {
-    //         float min_a = zero_ranges[j].x;
-    //         float max_a = zero_ranges[j].y;
-    //         if (w_old > min_a && w_old < max_a) {
-    //             float mean = zero_means[j];
-    //             if (tug_step > 0) {
-    //                 step_z -= mean;
-    //             }
-    //             else {
-    //                 if (mean > 0) step_z -= fabsf(tug_step);
-    //                 else if (mean < 0) step_z += fabsf(tug_step);
-    //             }
-    //             break;
-    //         }
-    //     }
-    // }
+    // Additional z tug (only if a non-zero interval is specified)
+    if (z_max > z_min) {
+        if (node.wnr_side > z_max)      step_z += tug_step;
+        else if (node.wnr_side < z_min) step_z -= tug_step;
+    }
+    // Additional angle tug (only if a non-zero interval is specified)
+    if (a_max > a_min) {
+        if (node.wnr_side_old > a_max)      step_s += tug_step;
+        else if (node.wnr_side_old < a_min) step_s -= tug_step;
+    }
+    // Additional zero-range-based tug to drive mean to zero
+    if (num_zero_ranges > 0) {
+        float w_old = node.wnr_side_old;
+        for (int j = 0; j < num_zero_ranges; ++j) {
+            float min_a = zero_ranges[j].x;
+            float max_a = zero_ranges[j].y;
+            if (w_old > min_a && w_old < max_a) {
+                float mean = zero_means[j];
+                if (tug_step > 0) {
+                    step_z -= mean;
+                }
+                else {
+                    if (mean > 0) step_z -= fabsf(tug_step);
+                    else if (mean < 0) step_z += fabsf(tug_step);
+                }
+                break;
+            }
+        }
+    }
     // Store updates in temporaries: use node.z for new f_init, node.f_tilde for new f_star
     float lr = 1.5f;
     node.z       = node.f_init + lr * step_z;
@@ -447,7 +456,8 @@ std::vector<Node> run_solver_flattening(
             z_tug_min, z_tug_max,
             angle_tug_min, angle_tug_max,
             tug_step,
-            d_ranges, num_ranges, d_means
+            d_ranges, num_ranges, d_means,
+            enable_spring_push_multiplier
         );
         cudaDeviceSynchronize();
         // Apply: commit temporaries to f_init and f_star
