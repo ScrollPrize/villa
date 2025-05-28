@@ -195,18 +195,18 @@ __global__ void flattening_update_kernel(
         // Add linear scaling when distance is less than 0.5 of desired distance (only if enabled)
         float force_multiplier = 1.0f;
         float activation_ratio = 0.75f;
-        float activation_ratio_push_in = 1.25f;
+        float activation_ratio_push_in = 2.0f;
         if (enable_spring_push_multiplier && dist < activation_ratio * edge.k) {
             // Linear scaling: 1x at 0.5*edge.k -> 5x at 0.0
             float ratio = dist / (activation_ratio * edge.k);  // ratio goes from 1.0 at 0.5*edge.k to 0.0 at dist=0
             force_multiplier = 1.0f + 10.0f * (1.0f - ratio);  // 1 + 4*(1-ratio) = 5 at ratio=0, 1 at ratio=1
         }
 
-        if (enable_spring_push_multiplier && dist > activation_ratio_push_in * edge.k) {
-            // Linear scaling: 1x at 0.5*edge.k -> 5x at 0.0
-            float ratio = dist / (activation_ratio_push_in * edge.k);  // ratio goes from 1.0 at activation_ratio_push_in*edge.k to 5.0 at dist=
-            force_multiplier = 1.0f / ratio;
-        }
+        // if (enable_spring_push_multiplier && dist > activation_ratio_push_in * edge.k) {
+        //     // Linear scaling: 1x at 0.5*edge.k -> 5x at 0.0
+        //     float ratio = dist / (activation_ratio_push_in * edge.k);  // ratio goes from 1.0 at activation_ratio_push_in*edge.k to 5.0 at dist=
+        //     force_multiplier = fminf(2.0f, 1.0f + 0.1f*ratio);
+        // }
         
         float ux = dz / dist;
         float us = ds / dist;

@@ -187,11 +187,10 @@ class MeshStitcher:
             mesh_dir = os.path.dirname(self.original_mesh_path)
             mesh_basename = os.path.splitext(os.path.basename(self.original_mesh_path))[0]
             if image_filename:
-                # Extract just the filename part, ignoring any subdirectory structure
                 image_base = os.path.splitext(os.path.basename(image_filename))[0]
-                output_path = os.path.join(mesh_dir, f"{mesh_basename}_{image_base}_stitched.jpg")
+                output_path = os.path.join(mesh_dir, f"{mesh_basename}_{image_base}_stitched.avif")
             else:
-                output_path = os.path.join(mesh_dir, f"{mesh_basename}_stitched.jpg")
+                output_path = os.path.join(mesh_dir, f"{mesh_basename}_stitched.avif")
         
         # Determine output image size based on UV bounds
         min_u = self.split_info['min_u']
@@ -329,11 +328,52 @@ class MeshStitcher:
         
         # Save output image
         output_pil = Image.fromarray(output_image)
-        output_pil.save(output_path, quality=60, optimize=True)
-        print(f"Stitched image saved to: {output_path}")
         
+        try:
+            print("Attempting to save as AVIF...")
+            # AVIF quality is 0-100 (lower is better quality, larger file)
+            # For libaom-av1, crf can be 0-63 (lower is better quality)
+            # Pillow uses a quality parameter that it maps internally.
+            # A common mapping for AVIF is that quality 0-100 maps to CRF values,
+            # where higher quality means lower CRF. Let's try quality=60 (mid-range).
+            output_pil.save(output_path, quality=60, save_all=True) # Pillow >= 9.1.0 for AVIF quality
+            print(f"Stitched AVIF image saved to: {output_path}")
+        except Exception as e_avif:
+            print(f"Failed to save as AVIF: {e_avif}")
+            print("Ensure AVIF support (e.g., libheif/libavif) is installed for Pillow.")
+            # Fallback to BigTIFF with JPEG compression
+            try:
+                # Change extension back to .tif for fallback
+                output_path_tif = output_path.replace('.avif', '.tif')
+                print(f"Attempting to save as BigTIFF with JPEG compression (fallback to {output_path_tif})...")
+                output_pil.save(output_path_tif, compression='tiff_jpeg', quality=60, save_all=True, rows_per_strip=16, bigtiff=True)
+                print(f"Stitched BigTIFF image saved to: {output_path_tif}")
+                output_path = output_path_tif # Update output_path to reflect the actual saved file
+            except Exception as e_bigtiff_jpeg:
+                print(f"Failed to save as BigTIFF with JPEG compression: {e_bigtiff_jpeg}")
+                try:
+                    # Change extension back to .tif for fallback
+                    output_path_tif = output_path.replace('.avif', '.tif')
+                    print(f"Attempting to save as BigTIFF with LZW compression (lossless, fallback to {output_path_tif})...")
+                    output_pil.save(output_path_tif, compression='tiff_lzw', save_all=True, bigtiff=True)
+                    print(f"Stitched BigTIFF image saved to: {output_path_tif} (LZW lossless)")
+                    output_path = output_path_tif # Update output_path
+                except Exception as e_bigtiff_lzw:
+                    print(f"Failed to save as BigTIFF with LZW: {e_bigtiff_lzw}")
+                    print("Falling back to standard TIFF with LZW...")
+                    try:
+                        # Change extension back to .tif for fallback
+                        output_path_tif = output_path.replace('.avif', '.tif')
+                        output_pil.save(output_path_tif, compression='tiff_lzw', save_all=True)
+                        print(f"Stitched standard TIFF image saved to: {output_path_tif} (LZW lossless)")
+                        output_path = output_path_tif # Update output_path
+                    except Exception as e_tiff_lzw:
+                        print(f"CRITICAL: Failed to save image in any supported format: {e_tiff_lzw}")
+                        print(f"Please check image dimensions and available disk space.")
+
         # Also save coverage mask for debugging
-        coverage_path = output_path.replace('.jpg', '_coverage.png')
+        coverage_base = os.path.splitext(output_path)[0]
+        coverage_path = f"{coverage_base}_coverage.png"
         coverage_pil = Image.fromarray((coverage_mask * 255).astype(np.uint8))
         coverage_pil.save(coverage_path)
         print(f"Coverage mask saved to: {coverage_path}")
@@ -472,11 +512,10 @@ class FinalizeMeshStitcher:
             mesh_dir = os.path.dirname(self.original_mesh_path)
             mesh_basename = os.path.splitext(os.path.basename(self.original_mesh_path))[0]
             if image_filename:
-                # Include the image filename in the output name
                 image_base = os.path.splitext(os.path.basename(image_filename))[0]
-                output_path = os.path.join(mesh_dir, f"{mesh_basename}_{image_base}_stitched.jpg")
+                output_path = os.path.join(mesh_dir, f"{mesh_basename}_{image_base}_stitched.avif")
             else:
-                output_path = os.path.join(mesh_dir, f"{mesh_basename}_stitched.jpg")
+                output_path = os.path.join(mesh_dir, f"{mesh_basename}_stitched.avif")
         
         # Get original texture size
         original_texture_size = self.cut_info['original_texture_size']
@@ -601,8 +640,55 @@ class FinalizeMeshStitcher:
         
         # Save output image
         output_pil = Image.fromarray(output_image)
-        output_pil.save(output_path, quality=60, optimize=True)
-        print(f"Stitched image saved to: {output_path}")
+        
+        try:
+            print("Attempting to save as AVIF...")
+            # AVIF quality is 0-100 (lower is better quality, larger file)
+            # For libaom-av1, crf can be 0-63 (lower is better quality)
+            # Pillow uses a quality parameter that it maps internally.
+            # A common mapping for AVIF is that quality 0-100 maps to CRF values,
+            # where higher quality means lower CRF. Let's try quality=60 (mid-range).
+            output_pil.save(output_path, quality=60, save_all=True) # Pillow >= 9.1.0 for AVIF quality
+            print(f"Stitched AVIF image saved to: {output_path}")
+        except Exception as e_avif:
+            print(f"Failed to save as AVIF: {e_avif}")
+            print("Ensure AVIF support (e.g., libheif/libavif) is installed for Pillow.")
+            # Fallback to BigTIFF with JPEG compression
+            try:
+                # Change extension back to .tif for fallback
+                output_path_tif = output_path.replace('.avif', '.tif')
+                print(f"Attempting to save as BigTIFF with JPEG compression (fallback to {output_path_tif})...")
+                output_pil.save(output_path_tif, compression='tiff_jpeg', quality=60, save_all=True, rows_per_strip=16, bigtiff=True)
+                print(f"Stitched BigTIFF image saved to: {output_path_tif}")
+                output_path = output_path_tif # Update output_path to reflect the actual saved file
+            except Exception as e_bigtiff_jpeg:
+                print(f"Failed to save as BigTIFF with JPEG compression: {e_bigtiff_jpeg}")
+                try:
+                    # Change extension back to .tif for fallback
+                    output_path_tif = output_path.replace('.avif', '.tif')
+                    print(f"Attempting to save as BigTIFF with LZW compression (lossless, fallback to {output_path_tif})...")
+                    output_pil.save(output_path_tif, compression='tiff_lzw', save_all=True, bigtiff=True)
+                    print(f"Stitched BigTIFF image saved to: {output_path_tif} (LZW lossless)")
+                    output_path = output_path_tif # Update output_path
+                except Exception as e_bigtiff_lzw:
+                    print(f"Failed to save as BigTIFF with LZW: {e_bigtiff_lzw}")
+                    print("Falling back to standard TIFF with LZW...")
+                    try:
+                        # Change extension back to .tif for fallback
+                        output_path_tif = output_path.replace('.avif', '.tif')
+                        output_pil.save(output_path_tif, compression='tiff_lzw', save_all=True)
+                        print(f"Stitched standard TIFF image saved to: {output_path_tif} (LZW lossless)")
+                        output_path = output_path_tif # Update output_path
+                    except Exception as e_tiff_lzw:
+                        print(f"CRITICAL: Failed to save image in any supported format: {e_tiff_lzw}")
+                        print(f"Please check image dimensions and available disk space.")
+
+        # Also save coverage mask for debugging (no change needed for PNG)
+        coverage_base = os.path.splitext(output_path)[0]
+        coverage_path = f"{coverage_base}_coverage.png"
+        coverage_pil = Image.fromarray((coverage_mask * 255).astype(np.uint8))
+        coverage_pil.save(coverage_path)
+        print(f"Coverage mask saved to: {coverage_path}")
         
         return output_path
 

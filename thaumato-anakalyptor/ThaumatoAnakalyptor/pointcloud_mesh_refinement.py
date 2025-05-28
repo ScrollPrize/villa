@@ -506,8 +506,9 @@ def clean_mesh(mesh,
 
     edge_thr = np.percentile(longest_edge, longest_edge_pct)
     area_thr = np.percentile(areas, area_pct)
-
-    bad = np.where((longest_edge > edge_thr) | (areas > area_thr) | (longest_edge > edge_length_thresh))[0].tolist()
+    print(f"Edge threshold: {edge_thr}, area threshold: {area_thr}, edge length threshold: {edge_length_thresh}")
+    bad = np.where((longest_edge > edge_thr) | (areas > area_thr) | (longest_edge > edge_length_thresh))[0]
+    bad = list(bad)
     mesh.remove_triangles_by_index(bad)
 
     # 3) final cleanup
@@ -516,9 +517,9 @@ def clean_mesh(mesh,
     mesh.compute_triangle_normals()
 
     # 4) warn if still self-intersecting
-    if hasattr(mesh, "is_self_intersecting") and mesh.is_self_intersecting():
+    if False and hasattr(mesh, "is_self_intersecting") and mesh.is_self_intersecting():
         print("Warning: mesh still reports self-intersections after cleanup.")
-
+    print(f"Mesh has {len(mesh.vertices)} vertices and {len(mesh.triangles)} triangles")
     return mesh
 
 ### Logic Functions ###
@@ -915,7 +916,6 @@ def flatten_pointcloud(base_path,
     # process windings in segments
     winding_us = None
     winding_vs = None
-    print(f"hi {from_winding}")
     for start in range(0, len(winding_files)):
         # if start < 27: # for debug, leave it for now
         #     continue
@@ -942,7 +942,6 @@ def flatten_pointcloud(base_path,
             print(f"Loaded previous flattened pointcloud for winding {winding_files_indices[start]}")
         except Exception as e:
             print(f"Warning: Could not load previous flattened pointcloud for winding {winding_files_indices[start]}: {e}")
-    print("hi2")
     for start in range(0, len(winding_files)):
         if from_winding is not None and winding_files_indices[start] < from_winding:
                 continue
@@ -1353,8 +1352,6 @@ def flatten_pointcloud(base_path,
         # solver.unfix()  # Remove all fixed constraints
         # all_fixed_indices = []
         
-        zero_ranges_full = [(min_angle_full, min_angle_full+270), (max_angle_full-270, max_angle_full)]
-        
         print("Solving full graph (refinement with fixed anchors - with proper tug parameters)...")
         # Print unfixed node count before solving
         full_total_nodes = len(np.array(solver.get_undeleted_indices()))
@@ -1364,13 +1361,7 @@ def flatten_pointcloud(base_path,
         # FIX: Add the missing tug parameters that were used in the downsampled solve
         solver.solve_flattening(
             num_iterations=10000, 
-            visualize=True,
-            z_tug_min=z_min_full+100,
-            z_tug_max=z_max_full-100,
-            angle_tug_min=min_angle_full+90,
-            angle_tug_max=max_angle_full-90,
-            tug_step=0.0005,  # Use the same small tug step as the second downsampled solve
-            zero_ranges=zero_ranges_full
+            visualize=True
         )
         
         # Check if positions actually changed
@@ -1499,7 +1490,7 @@ def create_mask(mesh, natural_image_size, output_path=None, verbose=True):
     uv_pixels = uv_pixels.astype(np.int32)
     
     # Group UV coordinates into triangles (every 3 consecutive UVs form a triangle)
-    for i in range(0, len(uv_pixels), 3):
+    for i in tqdm(range(0, len(uv_pixels), 3)):
         if i + 2 < len(uv_pixels):
             triangle = uv_pixels[i:i+3]
             # Flip V coordinate for image coordinate system
@@ -1924,10 +1915,10 @@ def mesh_uv_global(filtered_winding_path, output_path, winding_direction=False):
     mesh.compute_vertex_normals()
 
     # 5) final cleanup (you can reuse your clean_mesh here)
-    # mesh = clean_mesh(mesh,
-    #                   longest_edge_pct=95,
-    #                   area_pct=95,
-    #                   edge_length_thresh=1000)
+    mesh = clean_mesh(mesh,
+                      longest_edge_pct=100,
+                      area_pct=100,
+                      edge_length_thresh=1500)
 
     # Normalize UVs after cleaning and get natural image size
     mesh, natural_image_size = normalize_uvs(mesh, verbose=True)
@@ -1998,7 +1989,7 @@ def filter_mesh_by_mask(mesh, natural_image_size, verbose=True, show_debug=False
     uv_pixels = uv_pixels.astype(np.int32)
     
     # Color white pixels at each vertex UV position
-    for i in range(len(uv_pixels)):
+    for i in tqdm(range(len(uv_pixels)), desc="Coloring vertex mask"):
         x, y = uv_pixels[i]
         # Flip Y coordinate for image coordinate system
         y_flipped = natural_image_size[1] - 1 - y
@@ -2010,25 +2001,40 @@ def filter_mesh_by_mask(mesh, natural_image_size, verbose=True, show_debug=False
         cv2.imshow('Step 1: Triangulated Mask', resize_for_display(first_mask))
         cv2.imshow('Step 2: Vertex-only Mask', resize_for_display(vertex_mask))
     
-    # Step 3: Dilate by 75 pixels
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (151, 151))  # 75 pixel radius = 151x151 kernel
-    dilated_mask = cv2.dilate(vertex_mask, kernel, iterations=1)
+    # Step 3: Dilate by 75 pixels - OPTIMIZED VERSION
+    # Use separable operations for much faster dilation
+    radius = 75
+    # Create 1D kernels for horizontal and vertical dilation
+    kernel_h = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*radius + 1, 1))
+    kernel_v = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (1, 2*radius + 1))
     
+    # Apply separable dilation (much faster than single large kernel)
+    dilated_mask = cv2.dilate(vertex_mask, kernel_h, iterations=1)
+    dilated_mask = cv2.dilate(dilated_mask, kernel_v, iterations=1)
+    print("Dilated mask (optimized)")
     if show_debug:
         cv2.imshow('Step 3: Dilated Mask (75px)', resize_for_display(dilated_mask))
     
-    # Step 4: Fill black islands smaller than fill_area pixels
+    # Step 4: Fill black islands smaller than fill_area pixels - OPTIMIZED VERSION
     inverted_mask = 255 - dilated_mask
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(inverted_mask, connectivity=8)
-    
-    final_mask = dilated_mask.copy()
-    filled_count = 0
-    
-    for label in range(1, num_labels):  # Skip background (label 0)
-        area = stats[label, cv2.CC_STAT_AREA]
-        if area < fill_area:  # Fill small black islands
-            final_mask[labels == label] = 255
-            filled_count += 1
+    print(f"Number of labels: {num_labels}")
+
+    # Vectorized approach: find all small islands at once
+    small_island_labels = np.where(stats[1:, cv2.CC_STAT_AREA] < fill_area)[0] + 1  # +1 because we skip background (label 0)
+    print(f"Found {len(small_island_labels)} small islands to fill")
+
+    # Create a mask for all small islands at once
+    if len(small_island_labels) > 0:
+        # Use np.isin for efficient multi-label selection
+        small_islands_mask = np.isin(labels, small_island_labels)
+        final_mask = dilated_mask.copy()
+        final_mask[small_islands_mask] = 255
+        filled_count = len(small_island_labels)
+        print(f"Filled {filled_count} small islands in vectorized operation")
+    else:
+        final_mask = dilated_mask.copy()
+        filled_count = 0
     
     if show_debug:
         cv2.imshow(f'Step 4: Filled Small Islands (<{fill_area}px)', resize_for_display(final_mask))
@@ -2195,9 +2201,11 @@ def main():
     parser = argparse.ArgumentParser(description="Refine pointcloud using mesh and downsampling")
     parser.add_argument("--mesh", required=True, help="Path to mesh file (.ply or .obj)")
     parser.add_argument("--downsample_ratio", type=float, default=1.0, help="Downsample ratio for pointclouds")
-    parser.add_argument("--flattening_downsample_ratio", type=float, default=0.075, help="Downsample ratio for flattening solver first pass")
+    parser.add_argument("--flattening_downsample_ratio", type=float, default=0.175, help="Downsample ratio for flattening solver first pass")
     parser.add_argument("--flattening_downsample_ratio_mesh", type=float, default=0.75, help="Downsample ratio for flattening solver first pass")
     parser.add_argument("--skip_precomputation", action="store_true", help="Skip precomputation of winding pointclouds")
+    parser.add_argument("--skip_flattening", action="store_true", help="Skip flattening of winding pointclouds")    
+    parser.add_argument("--skip_grid", action="store_true", help="Skip grid UV of flattened winding pointclouds")
     parser.add_argument("--display", action="store_true", help="Display pointclouds and meshes")
     parser.add_argument("--display_downsample", type=float, default=0.1,
                         help="Random downsample ratio for 3D display (0..1)")
@@ -2218,30 +2226,32 @@ def main():
         winding_direction = False
 
     flattened_winding_path = os.path.join(os.path.dirname(args.mesh), "windings_flattened")
-    if not args.skip_precomputation:
+    if not args.skip_precomputation and not args.skip_flattening:
         generate_winding_pointclouds(
             args.mesh,
             display=args.display,
             display_downsample=args.display_downsample,
             color_by_angle=args.color_by_angle
         )
-    flattened_winding_path = flatten_pointcloud(
-        os.path.dirname(args.mesh),
-        display=args.display,
-        downsample_ratio=args.downsample_ratio,
-        flattening_downsample_ratio=args.flattening_downsample_ratio,
-        flattening_downsample_ratio_mesh=args.flattening_downsample_ratio_mesh,
-        display_downsample=args.display_downsample,
-        color_by_angle=args.color_by_angle,
-        from_winding=args.from_winding
-    )
-    grid_uv_flattened(
-        flattened_winding_path,
-        subsample_radius=30.0,
-        display=args.display,
-        display_downsample=args.display_downsample,
-        color_by_angle=args.color_by_angle
-    )
+    if not args.skip_flattening:
+        flattened_winding_path = flatten_pointcloud(
+            os.path.dirname(args.mesh),
+            display=args.display,
+            downsample_ratio=args.downsample_ratio,
+            flattening_downsample_ratio=args.flattening_downsample_ratio,
+            flattening_downsample_ratio_mesh=args.flattening_downsample_ratio_mesh,
+            display_downsample=args.display_downsample,
+            color_by_angle=args.color_by_angle,
+            from_winding=args.from_winding
+        )
+    if not args.skip_grid:
+        grid_uv_flattened(
+            flattened_winding_path,
+            subsample_radius=30.0,
+            display=args.display,
+            display_downsample=args.display_downsample,
+            color_by_angle=args.color_by_angle
+        )
     filtered_path = os.path.join(os.path.dirname(args.mesh), "windings_filtered")
     mesh_uv_wraps(filtered_path, output_dir=os.path.join(os.path.dirname(filtered_path), "uv_meshes"), winding_direction=winding_direction)
     mesh_uv_global(filtered_path, output_path=os.path.join(os.path.dirname(filtered_path), "mesh_refined.obj"), winding_direction=winding_direction)
