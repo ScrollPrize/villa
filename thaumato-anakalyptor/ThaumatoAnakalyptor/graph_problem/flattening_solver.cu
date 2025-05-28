@@ -74,12 +74,13 @@ __global__ void compute_zero_means_kernel(
     size_t i = d_valid[idx];
     const Node& node = d_graph[i];
     float f = node.f_init;
+    float z = node.wnr_side;
     float w = node.wnr_side_old;
     for (int j = 0; j < num_ranges; ++j) {
         float min_a = ranges[j].x;
         float max_a = ranges[j].y;
         if (w > min_a && w < max_a) {
-            atomicAdd(&sums[j], f);
+            atomicAdd(&sums[j], f-z);
             atomicAdd(&counts[j], 1);
             break;
         }
@@ -291,7 +292,7 @@ __global__ void flattening_update_kernel(
                     float sign = (angle_error > 0.0f) ? 1.0f : -1.0f;
                     
                     // Scale by angle error and add to accumulator
-                    float angle_weight = 0.1f;  // Weight for angle preservation vs distance preservation
+                    float angle_weight = 1.5f;  // Weight for angle preservation vs distance preservation
                     float error_magnitude = fabsf(angle_error);
                     
                     angle_acc_s += angle_weight * error_magnitude * sign * perp_u;

@@ -373,7 +373,7 @@ class MeshStitcher:
                             print(f"CRITICAL: Failed to save image in any supported format: {e_tiff_lzw}")
                             print(f"Please check image dimensions and available disk space.")
 
-        # Also save coverage mask for debugging
+        # Also save coverage mask for debugging (always PNG)
         coverage_base = os.path.splitext(output_path)[0]
         coverage_path = f"{coverage_base}_coverage.png"
         coverage_pil = Image.fromarray((coverage_mask * 255).astype(np.uint8))
@@ -529,6 +529,7 @@ class FinalizeMeshStitcher:
         
         # Initialize output image (RGB)
         output_image = np.zeros((height, width, 3), dtype=np.uint8)
+        coverage_mask = np.zeros((height, width), dtype=bool)
         
         # Process each cut
         for cut_info in tqdm(self.cut_info['cuts'], desc="Stitching cuts", disable=False, leave=True, position=0):
@@ -687,7 +688,7 @@ class FinalizeMeshStitcher:
                             print(f"CRITICAL: Failed to save image in any supported format: {e_tiff_lzw}")
                             print(f"Please check image dimensions and available disk space.")
 
-        # Also save coverage mask for debugging (no change needed for PNG)
+        # Also save coverage mask for debugging (always PNG)
         coverage_base = os.path.splitext(output_path)[0]
         coverage_path = f"{coverage_base}_coverage.png"
         coverage_pil = Image.fromarray((coverage_mask * 255).astype(np.uint8))
