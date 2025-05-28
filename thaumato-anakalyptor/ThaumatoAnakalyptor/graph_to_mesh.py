@@ -1890,7 +1890,7 @@ class WalkToSheet():
                 # Set to false to load precomputed partial results during development
                 start_fresh = continue_from <= 1
                 path_points = os.path.join(self.save_path, f"points_{step_index}.npz")
-                if start_fresh or not os.path.exists(path_points):
+                if start_fresh or not os.path.exists(path_points) or not os.path.exists(result_pkl_path):
                     # Set to false to load precomputed partial results during development
                     start_fresh_build_points = continue_from <= 0 or not os.path.exists(path_points)
                     if start_fresh_build_points:
