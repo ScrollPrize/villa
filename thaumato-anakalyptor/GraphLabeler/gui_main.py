@@ -84,6 +84,7 @@ class PointCloudLabeler(QMainWindow):
         self.redo_stack = []
         self._stroke_backup = None
         self.gt_labels = None
+        self.calculating = False
         
         # Spline storage.
         self.spline_items = []
@@ -3275,6 +3276,10 @@ class PointCloudLabeler(QMainWindow):
     
     # Example of using the solver interface when updating labels:
     def update_labels(self, extra_z_range=None):
+        if self.calculating:
+            print("Already calculating, skipping update_labels")
+            return
+        self.calculating = True
         undeleted = self.solver.get_undeleted_indices()
         other_block_factor=float(self.solve_other_block_factor_spinbox.value())
         if self.solver is not None:
@@ -3372,6 +3377,7 @@ class PointCloudLabeler(QMainWindow):
                 #         wnr_d = (self.points[t, 0] * 20 - self.points[s, 0] * 20) - wnr * 360
                 #         print(f"Group {self.group[t]}: {wnr_d:.2f}° difference between {s} and {t}")
 
+                self.calculating = False
                 return
             elif selected_solver == "Union":
                 self.solver.solve_union()
@@ -3391,6 +3397,7 @@ class PointCloudLabeler(QMainWindow):
             self.calculated_labels = np.array(calculated_labels)
 
             self.update_views()
+            self.calculating = False
     
     def save_graph(self):
         if self.solver is not None:
