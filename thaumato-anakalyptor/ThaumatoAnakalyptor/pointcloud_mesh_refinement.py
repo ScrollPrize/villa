@@ -14,6 +14,7 @@ import sys
 import pickle
 import glob
 from tqdm import tqdm
+from collections import deque
 
 sys.path.append('ThaumatoAnakalyptor/graph_problem/build')
 import graph_problem_gpu_py
@@ -1125,7 +1126,7 @@ def flatten_pointcloud(base_path,
                 if len(where_found) > 0:
                     first_winding_relative.append(where_found[0])
             
-            if len(first_winding_relative) > 0:
+            if (start > first_mesh_idx) and len(first_winding_relative) > 0:
                 solver_ds.fix_nodes(first_winding_relative)
                 print(f"Fixed {len(first_winding_relative)} downsampled nodes of winding {start_wrap_nr} using previous results.")
             else:
@@ -1245,11 +1246,12 @@ def flatten_pointcloud(base_path,
         # Also fix the first winding nodes in the full solver
         first_winding_relative_full = []
         first_winding_missing = 0
-        if prev_u0 is not None and prev_u0.shape[0] == first_count:
-            wrap0_idx = list(range(first_count))
-            print(f"DEBUG: first_count = {first_count}, wrap0_idx (first 10): {wrap0_idx[:10]}")
-            # Convert to relative indices for the full solver
-            first_winding_relative_full = list(range(first_count))
+        if start > first_mesh_idx:
+            if prev_u0 is not None and prev_u0.shape[0] == first_count:
+                wrap0_idx = list(range(first_count))
+                print(f"DEBUG: first_count = {first_count}, wrap0_idx (first 10): {wrap0_idx[:10]}")
+                # Convert to relative indices for the full solver
+                first_winding_relative_full = list(range(first_count))
             
             # for abs_idx in wrap0_idx:
             #     where_found = np.where(full_valid_indices == abs_idx)[0]
@@ -1566,18 +1568,35 @@ def save_mesh_with_uvs(mesh, output_path, natural_image_size, create_mask_png=Tr
 
 def grid_uv_flattened(flattened_winding_path,
                        subsample_radius=3.0,
+                       r_grid=100.0,
+                       grid_size=50.0,
                        display=False,
                        display_downsample=0.1,
                        color_by_angle=False):
+    """
+    Enhanced grid-based UV flattening with iterative optimization.
+    
+    Args:
+        flattened_winding_path: Path to flattened winding files
+        subsample_radius: Initial subsampling radius
+        r_grid: Radius for grid optimization (default 100.0)
+        grid_size: Size of grid cells for optimization (default 50.0)
+        display: Whether to display results
+        display_downsample: Downsample ratio for display
+        color_by_angle: Whether to color by angle in display
+    """
     winding_filtered_path = os.path.join(os.path.dirname(flattened_winding_path), "windings_filtered")
+    
     # find and order all winding pointclouds
     winding_files = glob.glob(os.path.join(flattened_winding_path, "flattened_winding_*.npz"))
     print(f"Found {len(winding_files)} flattened winding pointclouds for grid sampling the uv space.")
+    
     # Bring the files in order of their winding number
     winding_files_indices = sorted([int(os.path.basename(wf).split("_")[2].split(".")[0]) for wf in winding_files])
     winding_files = [os.path.join(flattened_winding_path, f"flattened_winding_{i}.npz") for i in winding_files_indices]
     print(f"Will process {len(winding_files)} flattened winding pointclouds for grid sampling the uv space.")
-    # Load each wrap, subsample
+    
+    # Load each wrap, subsample with enhanced grid optimization
     for i in range(len(winding_files)):
         points, uvs = load_flattened_winding(flattened_winding_path, winding_files_indices[i])
         
@@ -1600,19 +1619,20 @@ def grid_uv_flattened(flattened_winding_path,
             continue
             
         save_pointcloud_winding(winding_filtered_path, winding_files_indices[i], points)
-        # display_3d_pointcloud(points)
-        # subsample
-        print(f"Subsampling {winding_files[i]} with {points.shape[0]} points")
         
+        # Initial subsampling
+        print(f"Subsampling {winding_files[i]} with {points.shape[0]} points")
         print(f"Min max uvs: {np.min(uvs[:, 0])}, {np.max(uvs[:, 0])}, {np.min(uvs[:, 1])}, {np.max(uvs[:, 1])}")
+        
         kept_indices = subsample_min_dist(uvs, subsample_radius)
         print(f"Subsampled {winding_files[i]} to {len(kept_indices)} points")
-        # filter by density
+        
+        # Filter by density
         kept_indices = filter_by_density(uvs, kept_indices, 3 * subsample_radius, int((subsample_radius**0.5)*2))
-        # kept_indices = filter_by_density_mad(uvs, kept_indices, 2 * subsample_radius, k=3.0) # automatic threshold finding
         points_subsampled = points[kept_indices]
         uvs_subsampled = uvs[kept_indices]
         print(f"Subsampled {winding_files[i]} to {points_subsampled.shape[0]} points")
+        
         if display:
             # display  with matplotlib: 2D UV and point plots
             fig, axs = plt.subplots(2, 2, figsize=(10, 10))
@@ -1630,24 +1650,285 @@ def grid_uv_flattened(flattened_winding_path,
                                   color_by_angle=color_by_angle,
                                   downsample_ratio=display_downsample)
 
+        # Refine by medoid
         kept_indices = refine_by_medoid(points, uvs, kept_indices, subsample_radius)
-        points_subsampled = points[kept_indices]
-        uvs_subsampled = uvs[kept_indices]
+        points_refined = points[kept_indices]
+        uvs_refined = uvs[kept_indices]
+        
         if display:
-            display_3d_pointcloud(points_subsampled,
+            display_3d_pointcloud(points_refined,
                                   color_by_angle=color_by_angle,
                                   downsample_ratio=display_downsample)
 
+        # Apply enhanced grid-based optimization AFTER refine_by_medoid
+        print(f"Starting grid-based optimization with r_grid={r_grid}, grid_size={grid_size}")
+        optimized_indices = optimize_grid_points(points, uvs, kept_indices, r_grid, grid_size)
+        
+        points_optimized = points[optimized_indices]
+        uvs_optimized = uvs[optimized_indices]
+        print(f"After grid optimization: {points_optimized.shape[0]} points")
+        
+        if display:
+            # Display comparison: original, refined, optimized
+            fig, axs = plt.subplots(2, 3, figsize=(15, 10))
+            
+            # UV plots
+            axs[0, 0].scatter(uvs[:, 0], uvs[:, 1], s=1, alpha=0.5)
+            axs[0, 0].set_title("Original UVs")
+            axs[0, 1].scatter(uvs_refined[:, 0], uvs_refined[:, 1], s=1)
+            axs[0, 1].set_title("Refined UVs")
+            axs[0, 2].scatter(uvs_optimized[:, 0], uvs_optimized[:, 1], s=1)
+            axs[0, 2].set_title("Grid Optimized UVs")
+            
+            # 3D plots
+            axs[1, 0].scatter(points[:, 0], points[:, 1], s=1, alpha=0.5)
+            axs[1, 0].set_title("Original Points")
+            axs[1, 1].scatter(points_refined[:, 0], points_refined[:, 1], s=1)
+            axs[1, 1].set_title("Refined Points")
+            axs[1, 2].scatter(points_optimized[:, 0], points_optimized[:, 1], s=1)
+            axs[1, 2].set_title("Grid Optimized Points")
+            
+            plt.tight_layout()
+            plt.show()
+            
+            # 3D display of optimized points
+            display_3d_pointcloud(points_optimized,
+                                  color_by_angle=color_by_angle,
+                                  downsample_ratio=display_downsample)
+
+        # Final edge error filtering
         # kept_indices, errors = filter_by_edge_error(points[:,:3], uvs, kept_indices, 10 * subsample_radius, int(1.5*subsample_radius))
-        kept_indices, errors = filter_by_edge_error_mad(points[:,:3], uvs, kept_indices, 10 * subsample_radius, k=5.0) # automatic threshold finding
-        points_subsampled = points[kept_indices]
-        uvs_subsampled = uvs[kept_indices]
+        optimized_indices, errors = filter_by_edge_error_mad(points[:,:3], uvs, optimized_indices, 10 * subsample_radius, k=5.0) # automatic threshold finding
+        points_final = points[optimized_indices]
+        uvs_final = uvs[optimized_indices]
+        
         if display:
-            display_3d_pointcloud(points_subsampled,
+            display_3d_pointcloud(points_final,
                                   color_by_angle=color_by_angle,
                                   downsample_ratio=display_downsample)
 
-        save_flattened_winding(winding_filtered_path, winding_files_indices[i], points_subsampled, uvs_subsampled)
+        save_flattened_winding(winding_filtered_path, winding_files_indices[i], points_final, uvs_final)
+        print(f"Final result for {winding_files[i]}: {points_final.shape[0]} points")
+
+def optimize_grid_points(points, uvs, initial_indices, r_grid, grid_size):
+    """
+    Optimize point selection using grid-based approach with FIFO queue.
+    
+    Args:
+        points: All points (N, >=3)
+        uvs: All UV coordinates (N, 2)
+        initial_indices: Initial selected point indices
+        r_grid: Radius for grid optimization
+        grid_size: Size of grid cells
+        
+    Returns:
+        optimized_indices: List of optimized point indices
+    """
+    print(f"Starting grid optimization with {len(initial_indices)} initial points")
+    
+    # Create grid structure
+    uv_min = np.min(uvs, axis=0)
+    uv_max = np.max(uvs, axis=0)
+    
+    # Calculate grid dimensions
+    grid_dims = np.ceil((uv_max - uv_min) / grid_size).astype(int)
+    print(f"Grid dimensions: {grid_dims[0]} x {grid_dims[1]} cells")
+    
+    # Initialize grid data structures
+    grid_points = {}  # grid_coord -> list of point indices in that grid
+    grid_selected = {}  # grid_coord -> selected point index (or None)
+    grid_optimized = {}  # grid_coord -> bool (whether this grid is optimized)
+    
+    # Populate grid with all points
+    for idx in range(len(points)):
+        grid_coord = tuple(((uvs[idx] - uv_min) / grid_size).astype(int))
+        # Clamp to valid grid bounds
+        grid_coord = tuple(np.clip(grid_coord, [0, 0], grid_dims - 1))
+        
+        if grid_coord not in grid_points:
+            grid_points[grid_coord] = []
+            grid_selected[grid_coord] = None
+            grid_optimized[grid_coord] = False
+        grid_points[grid_coord].append(idx)
+    
+    print(f"Created grid with {len(grid_points)} occupied cells")
+    
+    # Initialize with selection from initial_indices
+    selected_grids = set()
+    for idx in initial_indices:
+        grid_coord = tuple(((uvs[idx] - uv_min) / grid_size).astype(int))
+        grid_coord = tuple(np.clip(grid_coord, [0, 0], grid_dims - 1))
+        
+        if grid_coord in grid_points and grid_selected[grid_coord] is None:
+            grid_selected[grid_coord] = idx
+            selected_grids.add(grid_coord)
+    
+    print(f"Initialized {len(selected_grids)} grid cells with points")
+    
+    # Create FIFO queue with all non-optimized grids that have selected points
+    queue = deque()
+    queue_set = set()  # To ensure each grid appears only once in queue
+    
+    for grid_coord in selected_grids:
+        if not grid_optimized[grid_coord]:
+            queue.append(grid_coord)
+            queue_set.add(grid_coord)
+    
+    print(f"Starting optimization queue with {len(queue)} grid cells")
+    
+    # Optimization loop
+    iteration = 0
+    while queue and iteration < 5000000:  # Safety limit
+        iteration += 1
+        if iteration % 100 == 0:
+            print(f"\rOptimization iteration {iteration}, queue size: {len(queue)}", end='', flush=True)
+        
+        current_grid = queue.popleft()
+        queue_set.remove(current_grid)
+        
+        if grid_optimized[current_grid] or grid_selected[current_grid] is None:
+            continue
+            
+        # Find neighboring grids within r_grid radius
+        neighbor_grids = get_neighbor_grids(current_grid, grid_dims, r_grid, grid_size)
+        
+        # Collect all selected points from neighboring grids
+        neighbor_points = []
+        for neighbor_grid in neighbor_grids:
+            if neighbor_grid in grid_selected and grid_selected[neighbor_grid] is not None:
+                neighbor_points.append(grid_selected[neighbor_grid])
+        
+        if len(neighbor_points) < 2:  # Need at least 2 points for error calculation
+            grid_optimized[current_grid] = True
+            continue
+        
+        # Find best point in current grid based on mean error
+        current_grid_points = grid_points[current_grid]
+        if len(current_grid_points) <= 1:
+            grid_optimized[current_grid] = True
+            continue
+            
+        best_point = None
+        best_error = float('inf')
+        
+        for candidate_idx in current_grid_points:
+            # Calculate mean error between candidate and neighbor points
+            total_error = 0.0
+            error_count = 0
+            
+            for neighbor_idx in neighbor_points:
+                if neighbor_idx != candidate_idx:
+                    # UV distance
+                    uv_dist = np.linalg.norm(uvs[candidate_idx] - uvs[neighbor_idx])
+                    # 3D distance
+                    xyz_dist = np.linalg.norm(points[candidate_idx, :3] - points[neighbor_idx, :3])
+                    # Error
+                    error = abs(uv_dist - xyz_dist)
+                    total_error += error
+                    error_count += 1
+            
+            if error_count > 0:
+                mean_error = total_error / error_count
+                if mean_error < best_error:
+                    best_error = mean_error
+                    best_point = candidate_idx
+        
+        # Update selection if we found a better point
+        if best_point is not None:
+            grid_selected[current_grid] = best_point
+        
+        # Mark as optimized
+        grid_optimized[current_grid] = True
+        
+        # Add surrounding grids to queue if they're not optimized and have points
+        surrounding_grids = get_surrounding_grids(current_grid, grid_dims)
+        for surr_grid in surrounding_grids:
+            if (surr_grid in grid_selected and 
+                grid_selected[surr_grid] is not None and 
+                not grid_optimized[surr_grid] and 
+                surr_grid not in queue_set):
+                queue.append(surr_grid)
+                queue_set.add(surr_grid)
+    
+    print(f"\nGrid optimization completed after {iteration} iterations")
+    
+    # Collect final optimized indices
+    optimized_indices = []
+    optimized_count = 0
+    for grid_coord, selected_idx in grid_selected.items():
+        if selected_idx is not None:
+            optimized_indices.append(selected_idx)
+            if grid_optimized[grid_coord]:
+                optimized_count += 1
+    
+    print(f"Final result: {len(optimized_indices)} selected points, {optimized_count} optimized grids")
+    
+    return optimized_indices
+
+
+def get_neighbor_grids(center_grid, grid_dims, r_grid, grid_size):
+    """
+    Get all grid coordinates within r_grid radius of center_grid.
+    
+    Args:
+        center_grid: (x, y) grid coordinate
+        grid_dims: (width, height) grid dimensions
+        r_grid: radius in UV space
+        grid_size: size of each grid cell
+        
+    Returns:
+        List of grid coordinates within radius
+    """
+    neighbors = []
+    
+    # Convert radius to grid units
+    grid_radius = int(np.ceil(r_grid / grid_size))
+    
+    center_x, center_y = center_grid
+    
+    for dx in range(-grid_radius, grid_radius + 1):
+        for dy in range(-grid_radius, grid_radius + 1):
+            x = center_x + dx
+            y = center_y + dy
+            
+            # Check bounds
+            if 0 <= x < grid_dims[0] and 0 <= y < grid_dims[1]:
+                # Check if within radius
+                distance = np.sqrt(dx*dx + dy*dy) * grid_size
+                if distance <= r_grid:
+                    neighbors.append((x, y))
+    
+    return neighbors
+
+
+def get_surrounding_grids(center_grid, grid_dims):
+    """
+    Get immediately surrounding grid cells (8-connected neighborhood).
+    
+    Args:
+        center_grid: (x, y) grid coordinate
+        grid_dims: (width, height) grid dimensions
+        
+    Returns:
+        List of surrounding grid coordinates
+    """
+    neighbors = []
+    center_x, center_y = center_grid
+    
+    for dx in [-1, 0, 1]:
+        for dy in [-1, 0, 1]:
+            if dx == 0 and dy == 0:
+                continue  # Skip center
+                
+            x = center_x + dx
+            y = center_y + dy
+            
+            # Check bounds
+            if 0 <= x < grid_dims[0] and 0 <= y < grid_dims[1]:
+                neighbors.append((x, y))
+    
+    return neighbors
+
 
 def mesh_uv_wraps(filtered_winding_path, output_dir, winding_direction=False):
     """
@@ -2203,6 +2484,8 @@ def main():
     parser.add_argument("--downsample_ratio", type=float, default=1.0, help="Downsample ratio for pointclouds")
     parser.add_argument("--flattening_downsample_ratio", type=float, default=0.175, help="Downsample ratio for flattening solver first pass")
     parser.add_argument("--flattening_downsample_ratio_mesh", type=float, default=0.75, help="Downsample ratio for flattening solver first pass")
+    parser.add_argument("--r_grid", type=float, default=30.0, help="Radius for grid optimization in UV space")
+    parser.add_argument("--grid_size", type=float, default=5.0, help="Size of grid cells for optimization")
     parser.add_argument("--skip_precomputation", action="store_true", help="Skip precomputation of winding pointclouds")
     parser.add_argument("--skip_flattening", action="store_true", help="Skip flattening of winding pointclouds")    
     parser.add_argument("--skip_grid", action="store_true", help="Skip grid UV of flattened winding pointclouds")
@@ -2226,14 +2509,14 @@ def main():
         winding_direction = False
 
     flattened_winding_path = os.path.join(os.path.dirname(args.mesh), "windings_flattened")
-    if not args.skip_precomputation and not args.skip_flattening:
+    if not args.skip_precomputation and not args.skip_flattening and not args.skip_grid:
         generate_winding_pointclouds(
             args.mesh,
             display=args.display,
             display_downsample=args.display_downsample,
             color_by_angle=args.color_by_angle
         )
-    if not args.skip_flattening:
+    if not args.skip_flattening and not args.skip_grid:
         flattened_winding_path = flatten_pointcloud(
             os.path.dirname(args.mesh),
             display=args.display,
@@ -2248,6 +2531,8 @@ def main():
         grid_uv_flattened(
             flattened_winding_path,
             subsample_radius=30.0,
+            r_grid=args.r_grid,
+            grid_size=args.grid_size,
             display=args.display,
             display_downsample=args.display_downsample,
             color_by_angle=args.color_by_angle
