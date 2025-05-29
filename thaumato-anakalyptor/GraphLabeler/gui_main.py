@@ -1995,9 +1995,9 @@ class PointCloudLabeler(QMainWindow):
             return
         # compute display-space coordinates for slab points
         if self.show_original_points:
-            pts = self.original_points[mask_xz]
+            pts = self.original_points[slab_indices]
         else:
-            pts = self.points[mask_xz]
+            pts = self.points[slab_indices]
         x_disp = pts[:, 0] + shear_factor * (pts[:, 1] - fc)
         z_disp = pts[:, 2]
         coords = np.vstack([x_disp, z_disp]).T
@@ -2053,9 +2053,9 @@ class PointCloudLabeler(QMainWindow):
         if slab_idx.size == 0:
             return
         if self.show_original_points:
-            pts = self.original_points[mask_xz]
+            pts = self.original_points[slab_idx]
         else:
-            pts = self.points[mask_xz]
+            pts = self.points[slab_idx]
         coords = np.vstack([pts[:, 0] + shear * (pts[:, 1] - fc), pts[:, 2]]).T
         tree = cKDTree(coords)
         hit = set()
