@@ -1743,6 +1743,7 @@ def grid_uv_flattened(flattened_winding_path,
         # Apply enhanced grid-based optimization AFTER refine_by_medoid
         print(f"Starting grid-based optimization with r_grid={r_grid}, grid_size={grid_size}")
         optimized_indices = optimize_grid_points(points, uvs, kept_indices, r_grid, grid_size)
+        # optimized_indices = kept_indices
         
         points_optimized = points[optimized_indices]
         uvs_optimized = uvs[optimized_indices]
@@ -1792,159 +1793,158 @@ def grid_uv_flattened(flattened_winding_path,
 
 def optimize_grid_points(points, uvs, initial_indices, r_grid, grid_size):
     """
-    Optimize point selection using grid-based approach with FIFO queue.
+    Optimize point selection using radius-based approach with cached candidates.
     
     Args:
         points: All points (N, >=3)
         uvs: All UV coordinates (N, 2)
         initial_indices: Initial selected point indices
-        r_grid: Radius for grid optimization
-        grid_size: Size of grid cells
+        r_grid: Radius for finding neighbors for error calculation
+        grid_size: Radius for finding candidate replacements (UV drift constraint)
         
     Returns:
         optimized_indices: List of optimized point indices
     """
-    print(f"Starting grid optimization with {len(initial_indices)} initial points")
+    print(f"Starting radius-based optimization with {len(initial_indices)} initial points")
+    print(f"Neighbor radius: {r_grid}, candidate radius: {grid_size}")
     
-    # Create grid structure
-    uv_min = np.min(uvs, axis=0)
-    uv_max = np.max(uvs, axis=0)
+    # Convert to numpy arrays for efficient processing
+    points = np.array(points)
+    uvs = np.array(uvs)
     
-    # Calculate grid dimensions
-    grid_dims = np.ceil((uv_max - uv_min) / grid_size).astype(int)
-    print(f"Grid dimensions: {grid_dims[0]} x {grid_dims[1]} cells")
+    # Build KD-tree for efficient radius searches in UV space
+    from scipy.spatial import cKDTree
+    from collections import deque
+    uv_tree = cKDTree(uvs)
     
-    # Initialize grid data structures
-    grid_points = {}  # grid_coord -> list of point indices in that grid
-    grid_selected = {}  # grid_coord -> selected point index (or None)
-    grid_optimized = {}  # grid_coord -> bool (whether this grid is optimized)
+    # Initialize selected indices and tracking
+    selected_indices = np.array(initial_indices)
+    optimized_flags = np.zeros(len(selected_indices), dtype=bool)
     
-    # Populate grid with all points
-    for idx in range(len(points)):
-        grid_coord = tuple(((uvs[idx] - uv_min) / grid_size).astype(int))
-        # Clamp to valid grid bounds
-        grid_coord = tuple(np.clip(grid_coord, [0, 0], grid_dims - 1))
-        
-        if grid_coord not in grid_points:
-            grid_points[grid_coord] = []
-            grid_selected[grid_coord] = None
-            grid_optimized[grid_coord] = False
-        grid_points[grid_coord].append(idx)
+    # Pre-compute and cache candidate points for each initial position
+    print("Pre-computing and caching candidates for each initial position...")
+    candidate_cache = {}
     
-    print(f"Created grid with {len(grid_points)} occupied cells")
+    # FAST: Batch query for all candidates at once
+    initial_uvs = uvs[initial_indices]
+    candidate_lists = uv_tree.query_ball_point(initial_uvs, grid_size)
     
-    # Initialize with selection from initial_indices
-    selected_grids = set()
-    for idx in initial_indices:
-        grid_coord = tuple(((uvs[idx] - uv_min) / grid_size).astype(int))
-        grid_coord = tuple(np.clip(grid_coord, [0, 0], grid_dims - 1))
-        
-        if grid_coord in grid_points and grid_selected[grid_coord] is None:
-            grid_selected[grid_coord] = idx
-            selected_grids.add(grid_coord)
+    for pos, candidates in enumerate(candidate_lists):
+        if len(candidates) > 1:  # More than just the point itself
+            candidate_cache[pos] = np.array(candidates)
     
-    print(f"Initialized {len(selected_grids)} grid cells with points")
+    print(f"Cached candidates for {len(candidate_cache)} positions")
     
-    # Create FIFO queue with all non-optimized grids that have selected points
-    queue = deque()
-    queue_set = set()  # To ensure each grid appears only once in queue
+    # Cache neighbor relationships once at start based on initial positions
+    print("Caching neighbor relationships based on initial positions...")
+    neighbor_cache = {}
+    initial_tree = cKDTree(initial_uvs)
     
-    for grid_coord in selected_grids:
-        if not grid_optimized[grid_coord]:
-            queue.append(grid_coord)
-            queue_set.add(grid_coord)
+    # Find neighbors for each initial position
+    neighbor_lists = initial_tree.query_ball_point(initial_uvs, r_grid)
+    for pos, neighbors in enumerate(neighbor_lists):
+        # Remove self and keep positions with enough neighbors
+        neighbors = [n for n in neighbors if n != pos]
+        if len(neighbors) >= 2:
+            neighbor_cache[pos] = np.array(neighbors)
     
-    print(f"Starting optimization queue with {len(queue)} grid cells")
+    print(f"Cached neighbors for {len(neighbor_cache)} positions")
     
-    # Optimization loop
+    # Use deque for efficient queue operations
+    queue = deque(range(len(selected_indices)))
+    queue_set = set(queue)  # Track membership efficiently
+    
+    # Early exit tracking
+    low_progress_threshold = 50
+    low_progress_limit = 1000
+    low_progress_count = 0
+    
+    # Statistics tracking
     iteration = 0
-    while queue and iteration < 5000000:  # Safety limit
+    points_updated = 0
+    
+    while queue and iteration < 1000000:  # Safety limit
         iteration += 1
+        
         if iteration % 100 == 0:
-            print(f"\rOptimization iteration {iteration}, queue size: {len(queue)}", end='', flush=True)
+            print(f"\rOptimization iteration {iteration:>7}, queue size: {len(queue):>5}    ", end='', flush=True)
         
-        current_grid = queue.popleft()
-        queue_set.remove(current_grid)
+        # Check for early exit due to low queue size
+        if len(queue) < low_progress_threshold:
+            low_progress_count += 1
+        else:
+            low_progress_count = 0
+            
+        if low_progress_count >= low_progress_limit:
+            print(f"\nEarly exit: {low_progress_count} consecutive iterations with queue size < {low_progress_threshold}")
+            break
         
-        if grid_optimized[current_grid] or grid_selected[current_grid] is None:
+        # Get next position from queue (O(1) operation)
+        current_pos = queue.popleft()
+        queue_set.remove(current_pos)
+        
+        # Skip if already optimized or no cached candidates/neighbors
+        if (optimized_flags[current_pos] or 
+            current_pos not in candidate_cache or
+            current_pos not in neighbor_cache):
             continue
-            
-        # Find neighboring grids within r_grid radius
-        neighbor_grids = get_neighbor_grids(current_grid, grid_dims, r_grid, grid_size)
         
-        # Collect all selected points from neighboring grids
-        neighbor_points = []
-        for neighbor_grid in neighbor_grids:
-            if neighbor_grid in grid_selected and grid_selected[neighbor_grid] is not None:
-                neighbor_points.append(grid_selected[neighbor_grid])
+        current_point_idx = selected_indices[current_pos]
         
-        if len(neighbor_points) < 2:  # Need at least 2 points for error calculation
-            grid_optimized[current_grid] = True
-            continue
+        # Get cached candidates and neighbors for this position
+        candidate_indices = candidate_cache[current_pos]
+        neighbor_positions = neighbor_cache[current_pos]
         
-        # Find best point in current grid based on mean error
-        current_grid_points = grid_points[current_grid]
-        if len(current_grid_points) <= 1:
-            grid_optimized[current_grid] = True
-            continue
-            
-        best_point = None
-        best_error = float('inf')
+        # Vectorized error calculation: candidates vs current points at neighbor positions
+        neighbor_indices = selected_indices[neighbor_positions]  # Current points at neighbor positions
         
-        for candidate_idx in current_grid_points:
-            # Calculate mean error between candidate and neighbor points
-            total_error = 0.0
-            error_count = 0
-            
-            for neighbor_idx in neighbor_points:
-                if neighbor_idx != candidate_idx:
-                    # UV distance
-                    uv_dist = np.linalg.norm(uvs[candidate_idx] - uvs[neighbor_idx])
-                    # 3D distance
-                    xyz_dist = np.linalg.norm(points[candidate_idx, :3] - points[neighbor_idx, :3])
-                    # Error
-                    error = abs(uv_dist - xyz_dist)
-                    total_error += error
-                    error_count += 1
-            
-            if error_count > 0:
-                mean_error = total_error / error_count
-                if mean_error < best_error:
-                    best_error = mean_error
-                    best_point = candidate_idx
+        # Pre-compute UV and 3D coordinates for vectorization
+        candidate_uvs = uvs[candidate_indices]  # (n_candidates, 2)
+        candidate_points = points[candidate_indices, :3]  # (n_candidates, 3)
+        neighbor_uvs = uvs[neighbor_indices]  # (n_neighbors, 2)
+        neighbor_points = points[neighbor_indices, :3]  # (n_neighbors, 3)
         
-        # Update selection if we found a better point
-        if best_point is not None:
-            grid_selected[current_grid] = best_point
+        # Vectorized distance calculations
+        uv_dists = np.linalg.norm(
+            candidate_uvs[:, np.newaxis, :] - neighbor_uvs[np.newaxis, :, :], 
+            axis=2
+        )
+        
+        xyz_dists = np.linalg.norm(
+            candidate_points[:, np.newaxis, :] - neighbor_points[np.newaxis, :, :],
+            axis=2
+        )
+        
+        # Calculate errors and mean for each candidate
+        errors = np.abs(uv_dists - xyz_dists)  # (n_candidates, n_neighbors)
+        mean_errors = np.mean(errors, axis=1)  # (n_candidates,)
+        
+        # Find best candidate
+        best_idx = np.argmin(mean_errors)
+        best_candidate = candidate_indices[best_idx]
+        current_error = mean_errors[candidate_indices == current_point_idx]
+        
+        # Update if improvement found
+        if best_candidate != current_point_idx and len(current_error) > 0:
+            if mean_errors[best_idx] < current_error[0]:
+                selected_indices[current_pos] = best_candidate
+                points_updated += 1
+                
+                # Re-queue affected neighbors (avoid duplicates)
+                for neighbor_pos in neighbor_positions:
+                    if neighbor_pos not in queue_set:
+                        queue.append(neighbor_pos)
+                        queue_set.add(neighbor_pos)
+                        optimized_flags[neighbor_pos] = False
         
         # Mark as optimized
-        grid_optimized[current_grid] = True
-        
-        # Add surrounding grids to queue if they're not optimized and have points
-        surrounding_grids = get_surrounding_grids(current_grid, grid_dims)
-        for surr_grid in surrounding_grids:
-            if (surr_grid in grid_selected and 
-                grid_selected[surr_grid] is not None and 
-                not grid_optimized[surr_grid] and 
-                surr_grid not in queue_set):
-                queue.append(surr_grid)
-                queue_set.add(surr_grid)
+        optimized_flags[current_pos] = True
     
-    print(f"\nGrid optimization completed after {iteration} iterations")
+    print(f"\nRadius-based optimization completed after {iteration} iterations")
+    print(f"Points updated during optimization: {points_updated} points were replaced")
+    print(f"Final result: {len(selected_indices)} optimized points")
     
-    # Collect final optimized indices
-    optimized_indices = []
-    optimized_count = 0
-    for grid_coord, selected_idx in grid_selected.items():
-        if selected_idx is not None:
-            optimized_indices.append(selected_idx)
-            if grid_optimized[grid_coord]:
-                optimized_count += 1
-    
-    print(f"Final result: {len(optimized_indices)} selected points, {optimized_count} optimized grids")
-    
-    return optimized_indices
-
+    return selected_indices.tolist()
 
 def get_neighbor_grids(center_grid, grid_dims, r_grid, grid_size):
     """
@@ -2564,8 +2564,8 @@ def main():
     parser.add_argument("--downsample_ratio", type=float, default=1.0, help="Downsample ratio for pointclouds")
     parser.add_argument("--flattening_downsample_ratio", type=float, default=0.175, help="Downsample ratio for flattening solver first pass")
     parser.add_argument("--flattening_downsample_ratio_mesh", type=float, default=0.75, help="Downsample ratio for flattening solver first pass")
-    parser.add_argument("--r_grid", type=float, default=30.0, help="Radius for grid optimization in UV space")
-    parser.add_argument("--grid_size", type=float, default=5.0, help="Size of grid cells for optimization")
+    parser.add_argument("--r_grid", type=float, default=45.0, help="Radius for grid optimization in UV space")
+    parser.add_argument("--grid_size", type=float, default=15.0, help="Size of grid cells for optimization")
     parser.add_argument("--skip_precomputation", action="store_true", help="Skip precomputation of winding pointclouds")
     parser.add_argument("--skip_flattening", action="store_true", help="Skip flattening of winding pointclouds")    
     parser.add_argument("--skip_grid", action="store_true", help="Skip grid UV of flattened winding pointclouds")
@@ -2618,7 +2618,7 @@ def main():
             color_by_angle=args.color_by_angle
         )
     filtered_path = os.path.join(os.path.dirname(args.mesh), "windings_filtered")
-    mesh_uv_wraps(filtered_path, output_dir=os.path.join(os.path.dirname(filtered_path), "uv_meshes"), winding_direction=winding_direction)
+    # mesh_uv_wraps(filtered_path, output_dir=os.path.join(os.path.dirname(filtered_path), "uv_meshes"), winding_direction=winding_direction)
     mesh_uv_global(filtered_path, output_path=os.path.join(os.path.dirname(filtered_path), "mesh_refined.obj"), winding_direction=winding_direction)
 
 if __name__ == "__main__":
