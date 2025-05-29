@@ -6,16 +6,16 @@ import torch.nn.functional as F
 
 def rotate_by_quaternion(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """
-    q: (...,4) unit quaternion with components [w,x,y,z]
+    q: (...,4) unit quaternion with components [w,z,y,x]
     v: (...,3)      vector field to rotate
     returns v_rot(...,3)
     """
     # unpack
     w = q[..., 0].unsqueeze(-1)     # (...,1)
-    xyz = q[..., 1:]                # (...,3)
+    zyx = q[..., 1:]                # (...,3)
     # cross products
-    uv  = torch.cross(    xyz, v, dim=-1)        # (...,3)
-    uuv = torch.cross(xyz, uv, dim=-1)           # (...,3)
+    uv  = torch.cross(    zyx, v, dim=-1)        # (...,3)
+    uuv = torch.cross(zyx, uv, dim=-1)           # (...,3)
     return v + 2*(w*uv + uuv)
 
 def gradient(field: torch.Tensor) -> torch.Tensor:
@@ -57,7 +57,7 @@ def gradient(field: torch.Tensor) -> torch.Tensor:
     dz = dz.squeeze(0)
 
     # stack into (3,3,D,H,W): first dim = channel, second = derivative axis
-    grad = torch.stack((dx, dy, dz), dim=1)
+    grad = torch.stack((dz, dy, dx), dim=1)
     return grad
 
 
