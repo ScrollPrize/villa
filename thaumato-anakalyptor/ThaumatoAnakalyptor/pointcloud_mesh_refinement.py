@@ -2328,39 +2328,35 @@ def filter_mesh_by_mask(mesh, natural_image_size, verbose=True, show_debug=False
 
     print(f"Applied dilation with radius {small_radius} on downscaled image")
 
+    # Step 4: Fill small islands on downscaled image (much faster)
+    # Scale fill_area down by the square of the downscale factor (area scales as factor^2)
+    small_fill_area = max(1, fill_area // (downscale_factor * downscale_factor))
+
+    inverted_small = 255 - dilated_small
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(inverted_small, connectivity=8)
+    print(f"Found {num_labels} labels on downscaled image")
+
+    # Find small islands on the downscaled image
+    small_island_labels = np.where(stats[1:, cv2.CC_STAT_AREA] < small_fill_area)[0] + 1
+    print(f"Found {len(small_island_labels)} small islands to fill on downscaled image (area < {small_fill_area})")
+
+    # Fill small islands on the downscaled image
+    if len(small_island_labels) > 0:
+        small_islands_mask = np.isin(labels, small_island_labels)
+        dilated_small[small_islands_mask] = 255
+        print(f"Filled {len(small_island_labels)} small islands on downscaled image")
+
     # Upsample back to original size using nearest neighbor
     dilated_mask = cv2.resize(dilated_small, (natural_image_size[0], natural_image_size[1]), interpolation=cv2.INTER_NEAREST)
 
     # Ensure final mask is properly thresholded
     dilated_mask[dilated_mask > 0] = 255
+    final_mask = dilated_mask.copy()
 
-    print("Upscaled dilated mask back to original size")
-    
+    print("Upscaled dilated and filled mask back to original size")
+     
     if show_debug:
         cv2.imshow('Step 3: Dilated Mask (75px)', resize_for_display(dilated_mask))
-    
-    # Step 4: Fill black islands smaller than fill_area pixels - OPTIMIZED VERSION
-    inverted_mask = 255 - dilated_mask
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(inverted_mask, connectivity=8)
-    print(f"Number of labels: {num_labels}")
-
-    # Vectorized approach: find all small islands at once
-    small_island_labels = np.where(stats[1:, cv2.CC_STAT_AREA] < fill_area)[0] + 1  # +1 because we skip background (label 0)
-    print(f"Found {len(small_island_labels)} small islands to fill")
-
-    # Create a mask for all small islands at once
-    if len(small_island_labels) > 0:
-        # Use np.isin for efficient multi-label selection
-        small_islands_mask = np.isin(labels, small_island_labels)
-        final_mask = dilated_mask.copy()
-        final_mask[small_islands_mask] = 255
-        filled_count = len(small_island_labels)
-        print(f"Filled {filled_count} small islands in vectorized operation")
-    else:
-        final_mask = dilated_mask.copy()
-        filled_count = 0
-    
-    if show_debug:
         cv2.imshow(f'Step 4: Filled Small Islands (<{fill_area}px)', resize_for_display(final_mask))
     
     # Step 5: Filter triangles based on final mask
