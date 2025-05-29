@@ -1742,8 +1742,8 @@ def grid_uv_flattened(flattened_winding_path,
 
         # Apply enhanced grid-based optimization AFTER refine_by_medoid
         print(f"Starting grid-based optimization with r_grid={r_grid}, grid_size={grid_size}")
-        optimized_indices = optimize_grid_points(points, uvs, kept_indices, r_grid, grid_size)
-        # optimized_indices = kept_indices
+        # optimized_indices = optimize_grid_points(points, uvs, kept_indices, r_grid, grid_size)
+        optimized_indices = kept_indices
         
         points_optimized = points[optimized_indices]
         uvs_optimized = uvs[optimized_indices]
