@@ -408,6 +408,8 @@ class StructureTensorInferer(Inferer, nn.Module):
                 processed_count += batch_size
                 self.current_patch_write_index = processed_count
 
+        torch.cuda.empty_cache()
+        
         if self.verbose:
             print(f"Written {self.current_patch_write_index}/{total} patches.")
     
