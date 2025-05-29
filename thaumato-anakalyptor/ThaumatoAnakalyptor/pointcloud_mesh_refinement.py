@@ -15,6 +15,7 @@ import pickle
 import glob
 from tqdm import tqdm
 from collections import deque
+import cv2
 
 sys.path.append('ThaumatoAnakalyptor/graph_problem/build')
 import graph_problem_gpu_py
@@ -1742,8 +1743,8 @@ def grid_uv_flattened(flattened_winding_path,
 
         # Apply enhanced grid-based optimization AFTER refine_by_medoid
         print(f"Starting grid-based optimization with r_grid={r_grid}, grid_size={grid_size}")
-        # optimized_indices = optimize_grid_points(points, uvs, kept_indices, r_grid, grid_size)
-        optimized_indices = kept_indices
+        optimized_indices = optimize_grid_points(points, uvs, kept_indices, r_grid, grid_size)
+        # optimized_indices = kept_indices
         
         points_optimized = points[optimized_indices]
         uvs_optimized = uvs[optimized_indices]
@@ -1805,145 +1806,85 @@ def optimize_grid_points(points, uvs, initial_indices, r_grid, grid_size):
     Returns:
         optimized_indices: List of optimized point indices
     """
-    print(f"Starting radius-based optimization with {len(initial_indices)} initial points")
-    print(f"Neighbor radius: {r_grid}, candidate radius: {grid_size}")
-    
-    # Convert to numpy arrays for efficient processing
-    points = np.array(points)
-    uvs = np.array(uvs)
-    
-    # Build KD-tree for efficient radius searches in UV space
-    from scipy.spatial import cKDTree
-    from collections import deque
+    points = points[:,:3] # extract the 3d information only
+    initial_indices = np.array(initial_indices).astype(int)
+    selected_indices = initial_indices.copy()
+
+    # kdtree in uv space
     uv_tree = cKDTree(uvs)
-    
-    # Initialize selected indices and tracking
-    selected_indices = np.array(initial_indices)
-    optimized_flags = np.zeros(len(selected_indices), dtype=bool)
-    
-    # Pre-compute and cache candidate points for each initial position
-    print("Pre-computing and caching candidates for each initial position...")
-    candidate_cache = {}
-    
-    # FAST: Batch query for all candidates at once
-    initial_uvs = uvs[initial_indices]
-    candidate_lists = uv_tree.query_ball_point(initial_uvs, grid_size)
-    
-    for pos, candidates in enumerate(candidate_lists):
-        if len(candidates) > 1:  # More than just the point itself
-            candidate_cache[pos] = np.array(candidates)
-    
-    print(f"Cached candidates for {len(candidate_cache)} positions")
-    
-    # Cache neighbor relationships once at start based on initial positions
-    print("Caching neighbor relationships based on initial positions...")
-    neighbor_cache = {}
-    initial_tree = cKDTree(initial_uvs)
-    
-    # Find neighbors for each initial position
-    neighbor_lists = initial_tree.query_ball_point(initial_uvs, r_grid)
-    for pos, neighbors in enumerate(neighbor_lists):
-        # Remove self and keep positions with enough neighbors
-        neighbors = [n for n in neighbors if n != pos]
-        if len(neighbors) >= 2:
-            neighbor_cache[pos] = np.array(neighbors)
-    
-    print(f"Cached neighbors for {len(neighbor_cache)} positions")
-    
-    # Use deque for efficient queue operations
-    queue = deque(range(len(selected_indices)))
-    queue_set = set(queue)  # Track membership efficiently
-    
-    # Early exit tracking
-    low_progress_threshold = 50
-    low_progress_limit = 1000
-    low_progress_count = 0
-    
-    # Statistics tracking
-    iteration = 0
-    points_updated = 0
-    
-    while queue and iteration < 1000000:  # Safety limit
-        iteration += 1
-        
-        if iteration % 100 == 0:
-            print(f"\rOptimization iteration {iteration:>7}, queue size: {len(queue):>5}    ", end='', flush=True)
-        
-        # Check for early exit due to low queue size
-        if len(queue) < low_progress_threshold:
-            low_progress_count += 1
+    uv_tree_neighbours = cKDTree(uvs[initial_indices])
+
+    # Build candidate list for each index
+    candidates = []
+    for i in range(len(initial_indices)):
+        uv_i = uvs[initial_indices[i]]
+        cs = np.array(uv_tree.query_ball_point(uv_i, grid_size))
+        candidates.append(cs)
+
+    # Build neighbour for each index
+    neighbours = []
+    for i in range(len(selected_indices)):
+        # extract neighbours
+        neighbours.append(np.array(uv_tree_neighbours.query_ball_point(uvs[selected_indices[i]], r_grid)))
+
+    queue = [ind for ind in range(len(selected_indices))]
+    computed_indices = np.zeros(len(selected_indices), dtype=bool)
+    iterations = 0
+    under_n_iterations = 0
+    n = 1000
+    max_iter = 1000000 # break after max 1 million iterations
+    while len(queue) > 0:
+        iterations += 1
+        if len(queue) < n:
+            under_n_iterations += 1
         else:
-            low_progress_count = 0
-            
-        if low_progress_count >= low_progress_limit:
-            print(f"\nEarly exit: {low_progress_count} consecutive iterations with queue size < {low_progress_threshold}")
+            under_n_iterations = 0
+        if under_n_iterations > 10000:
+            print(f"\nBreaking out of loop after {iterations} iterations")
             break
-        
-        # Get next position from queue (O(1) operation)
-        current_pos = queue.popleft()
-        queue_set.remove(current_pos)
-        
-        # Skip if already optimized or no cached candidates/neighbors
-        if (optimized_flags[current_pos] or 
-            current_pos not in candidate_cache or
-            current_pos not in neighbor_cache):
+        if iterations > max_iter:
+            print(f"\nBreaking out of loop after {iterations} max iterations")
+            break
+        current_index = queue.pop(0)
+        if computed_indices[current_index]:
             continue
+
+        # Flush the same line
+        print(f"\r{' ' * 60}\rQueue length: {len(queue)}, iterations: {iterations}", end="", flush=True)
+        current_neighbours = neighbours[current_index]
+        # map to indices in selected_indices
+        neighbours_uvs = uvs[selected_indices[current_neighbours]]
+        neighbours_points = points[selected_indices[current_neighbours]]
+
+        current_candidates = candidates[current_index]
+        candidates_uvs = uvs[current_candidates]
+        candidates_points = points[current_candidates]
         
-        current_point_idx = selected_indices[current_pos]
+        # calculate error for each candidate vs neighbours (abs of uv dist vs 3d dist)
+        candidate_errors = []
+        for j in range(len(current_candidates)):
+            candidate_uv = candidates_uvs[j]
+            candidate_point = candidates_points[j]
+            d_uvs = np.linalg.norm(neighbours_uvs - candidate_uv, axis=1)
+            d_3d = np.linalg.norm(neighbours_points - candidate_point, axis=1)
+            candidate_error = np.mean(np.abs(d_uvs - d_3d))
+            candidate_errors.append(candidate_error)
         
-        # Get cached candidates and neighbors for this position
-        candidate_indices = candidate_cache[current_pos]
-        neighbor_positions = neighbor_cache[current_pos]
-        
-        # Vectorized error calculation: candidates vs current points at neighbor positions
-        neighbor_indices = selected_indices[neighbor_positions]  # Current points at neighbor positions
-        
-        # Pre-compute UV and 3D coordinates for vectorization
-        candidate_uvs = uvs[candidate_indices]  # (n_candidates, 2)
-        candidate_points = points[candidate_indices, :3]  # (n_candidates, 3)
-        neighbor_uvs = uvs[neighbor_indices]  # (n_neighbors, 2)
-        neighbor_points = points[neighbor_indices, :3]  # (n_neighbors, 3)
-        
-        # Vectorized distance calculations
-        uv_dists = np.linalg.norm(
-            candidate_uvs[:, np.newaxis, :] - neighbor_uvs[np.newaxis, :, :], 
-            axis=2
-        )
-        
-        xyz_dists = np.linalg.norm(
-            candidate_points[:, np.newaxis, :] - neighbor_points[np.newaxis, :, :],
-            axis=2
-        )
-        
-        # Calculate errors and mean for each candidate
-        errors = np.abs(uv_dists - xyz_dists)  # (n_candidates, n_neighbors)
-        mean_errors = np.mean(errors, axis=1)  # (n_candidates,)
-        
-        # Find best candidate
-        best_idx = np.argmin(mean_errors)
-        best_candidate = candidate_indices[best_idx]
-        current_error = mean_errors[candidate_indices == current_point_idx]
-        
-        # Update if improvement found
-        if best_candidate != current_point_idx and len(current_error) > 0:
-            if mean_errors[best_idx] < current_error[0]:
-                selected_indices[current_pos] = best_candidate
-                points_updated += 1
-                
-                # Re-queue affected neighbors (avoid duplicates)
-                for neighbor_pos in neighbor_positions:
-                    if neighbor_pos not in queue_set:
-                        queue.append(neighbor_pos)
-                        queue_set.add(neighbor_pos)
-                        optimized_flags[neighbor_pos] = False
-        
-        # Mark as optimized
-        optimized_flags[current_pos] = True
-    
-    print(f"\nRadius-based optimization completed after {iteration} iterations")
-    print(f"Points updated during optimization: {points_updated} points were replaced")
-    print(f"Final result: {len(selected_indices)} optimized points")
-    
+        # find the candidate with the smallest error
+        best_candidate = current_candidates[np.argmin(candidate_errors)]
+        # Check if is another candidate than the current one saved in selected_indices
+        if best_candidate != selected_indices[current_index]:
+            selected_indices[current_index] = best_candidate
+            # Add al neighbours to queue
+            for o in range(len(current_neighbours)):
+                if computed_indices[current_neighbours[o]]:
+                    queue.append(current_neighbours[o])
+                    computed_indices[current_neighbours[o]] = False
+
+        computed_indices[current_index] = True
+
+    selected_indices = np.unique(selected_indices)
+    print(f"\nFinal selected indices: {len(selected_indices)} vs {len(initial_indices)}")
     return selected_indices.tolist()
 
 def get_neighbor_grids(center_grid, grid_dims, r_grid, grid_size):
@@ -2362,17 +2303,39 @@ def filter_mesh_by_mask(mesh, natural_image_size, verbose=True, show_debug=False
         cv2.imshow('Step 1: Triangulated Mask', resize_for_display(first_mask))
         cv2.imshow('Step 2: Vertex-only Mask', resize_for_display(vertex_mask))
     
-    # Step 3: Dilate by 75 pixels - OPTIMIZED VERSION
-    # Use separable operations for much faster dilation
-    radius = 75
-    # Create 1D kernels for horizontal and vertical dilation
-    kernel_h = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*radius + 1, 1))
-    kernel_v = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (1, 2*radius + 1))
+    # Step 3: Optimized dilation using downscaling
+    radius = 200
+    downscale_factor = 10
+
+    # Calculate downscaled dimensions
+    small_height = natural_image_size[1] // downscale_factor
+    small_width = natural_image_size[0] // downscale_factor
+    small_radius = max(1, radius // downscale_factor)  # Scale radius down, minimum 1
+
+    print(f"Downscaling from {natural_image_size} to ({small_width}, {small_height}) for faster dilation")
+
+    # Downscale using mean (INTER_AREA)
+    small_mask = cv2.resize(vertex_mask, (small_width, small_height), interpolation=cv2.INTER_AREA)
+
+    # Threshold: any pixel > 0 becomes 255
+    small_mask[small_mask > 0] = 255
+
+    # Create circular kernel for the smaller image
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*small_radius + 1, 2*small_radius + 1))
+
+    # Apply dilation on the smaller image
+    dilated_small = cv2.dilate(small_mask, kernel, iterations=1)
+
+    print(f"Applied dilation with radius {small_radius} on downscaled image")
+
+    # Upsample back to original size using nearest neighbor
+    dilated_mask = cv2.resize(dilated_small, (natural_image_size[0], natural_image_size[1]), interpolation=cv2.INTER_NEAREST)
+
+    # Ensure final mask is properly thresholded
+    dilated_mask[dilated_mask > 0] = 255
+
+    print("Upscaled dilated mask back to original size")
     
-    # Apply separable dilation (much faster than single large kernel)
-    dilated_mask = cv2.dilate(vertex_mask, kernel_h, iterations=1)
-    dilated_mask = cv2.dilate(dilated_mask, kernel_v, iterations=1)
-    print("Dilated mask (optimized)")
     if show_debug:
         cv2.imshow('Step 3: Dilated Mask (75px)', resize_for_display(dilated_mask))
     
