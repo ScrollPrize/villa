@@ -2052,7 +2052,10 @@ class PointCloudLabeler(QMainWindow):
         slab_idx = np.nonzero(slab_mask)[0]
         if slab_idx.size == 0:
             return
-        pts = self.points[slab_idx]
+        if self.show_original_points:
+            pts = self.original_points[mask_xz]
+        else:
+            pts = self.points[mask_xz]
         coords = np.vstack([pts[:, 0] + shear * (pts[:, 1] - fc), pts[:, 2]]).T
         tree = cKDTree(coords)
         hit = set()
