@@ -164,10 +164,11 @@ def clean_winding_dicts(winding_range, flattened_winding_path, winding_files_ind
         if wrap_nr not in winding_files_indices[start:end]:
             # save to npy
             save_flattened_winding(flattened_winding_path, wrap_nr, prev_points[wrap_nr], np.array([prev_uvs_u[wrap_nr], prev_uvs_v[wrap_nr]]).T)
-            # delete
-            del prev_uvs_u[wrap_nr]
-            del prev_uvs_v[wrap_nr]
-            del prev_points[wrap_nr]
+            if wrap_nr not in winding_files_indices[start+1:end]:
+                # delete
+                del prev_uvs_u[wrap_nr]
+                del prev_uvs_v[wrap_nr]
+                del prev_points[wrap_nr]
 
 def subsample_min_dist(points, r):
     """
@@ -543,8 +544,16 @@ def generate_winding_pointclouds(mesh_path,
     glob_selected_points_paths = os.path.join(base_path, "points_selected_*.npz")
     print(f"Searching for selected points in {glob_selected_points_paths}")
     slabs = sorted(glob.glob(glob_selected_points_paths))
-    print("Preparing the winding pointclouds...")
-    for slab_path in tqdm(slabs, desc="Preprocessing slabs"):
+    
+    # Create intermediate directory for per-slab windings
+    intermediate_path = os.path.join(base_path, "intermediate_windings")
+    os.makedirs(intermediate_path, exist_ok=True)
+    
+    print("Processing slabs and splitting into windings...")
+    all_windings_found = set()
+    
+    # Step 1: Process each slab and split into per-winding files
+    for slab_idx, slab_path in enumerate(tqdm(slabs, desc="Processing slabs to per-winding files")):
         points = load_pointcloud_slab(slab_path).astype(np.float16)
         # From TA to original coordinates
         points = shuffling_points_axis(points)
@@ -555,26 +564,92 @@ def generate_winding_pointclouds(mesh_path,
         slab_flags = np.zeros((points.shape[0], 1), dtype=points.dtype)
         points = np.concatenate((points, slab_flags), axis=1)
 
-        print(f"Shape of points: {points.shape} and of points_mesh: {points_mesh.shape}")
+        # Concatenate with mesh points
         if points.shape[0] == 0:
-            print("Slab has no points ...")
-            points = points_mesh
+            print(f"Slab {slab_idx} has no points, using only mesh points...")
+            combined_points = points_mesh
         else:
-            points = np.concatenate((points, points_mesh), axis=0)
-        min_angle = np.min(points[:, 3])
-        max_angle = np.max(points[:, 3])
+            combined_points = np.concatenate((points, points_mesh), axis=0)
+        
+        print(f"Slab {slab_idx}: {combined_points.shape[0]} total points")
+        
+        # Find winding range for this slab
+        min_angle = np.min(combined_points[:, 3])
+        max_angle = np.max(combined_points[:, 3])
         min_winding = int(np.floor(min_angle / 360.0))
         max_winding = int(np.ceil(max_angle / 360.0))
+        
+        # Split points by winding and save separate files
         for winding_nr in range(min_winding, max_winding + 1):
             winding_angle = winding_nr * 360.0
-            winding_points = points[np.logical_and(points[:, 3] >= winding_angle, points[:, 3] < winding_angle + 360.0)]
+            winding_mask = np.logical_and(combined_points[:, 3] >= winding_angle, 
+                                        combined_points[:, 3] < winding_angle + 360.0)
+            winding_points = combined_points[winding_mask]
+            
             if len(winding_points) > 0:
-                save_winding_pointcloud(os.path.join(base_path, "windings"), winding_nr, winding_points)
-                if display:
-                    print(f"Displaying winding {winding_nr} (loaded {winding_points.shape[0]} points)")
-                    display_3d_pointcloud(winding_points,
-                                         color_by_angle=color_by_angle,
-                                         downsample_ratio=display_downsample)
+                # Save as winding_{nr}_slab_{idx}.npz
+                intermediate_file = os.path.join(intermediate_path, f"winding_{winding_nr}_slab_{slab_idx:04d}.npz")
+                np.savez_compressed(intermediate_file, points=winding_points)
+                all_windings_found.add(winding_nr)
+                print(f"  Winding {winding_nr}: {len(winding_points)} points -> {os.path.basename(intermediate_file)}")
+    
+    print(f"Found {len(all_windings_found)} unique windings across all slabs: {sorted(all_windings_found)}")
+    
+    # Step 2: Generate final winding files by loading all slab files for each winding
+    windings_path = os.path.join(base_path, "windings")
+    os.makedirs(windings_path, exist_ok=True)
+    
+    print("Generating final winding pointclouds...")
+    for winding_nr in tqdm(sorted(all_windings_found), desc="Generating final winding files"):
+        # Find all intermediate files for this winding
+        pattern = os.path.join(intermediate_path, f"winding_{winding_nr}_slab_*.npz")
+        winding_slab_files = sorted(glob.glob(pattern))
+        
+        print(f"Winding {winding_nr}: found {len(winding_slab_files)} slab files")
+        
+        if winding_slab_files:
+            # Load and concatenate all points for this winding
+            winding_points_list = []
+            for slab_file in winding_slab_files:
+                data = np.load(slab_file)
+                points = data['points']
+                winding_points_list.append(points)
+                print(f"  Loaded {len(points)} points from {os.path.basename(slab_file)}")
+            
+            # Concatenate all points for this winding
+            combined_winding_points = np.concatenate(winding_points_list, axis=0)
+            print(f"  Total before deduplication: {len(combined_winding_points)} points")
+            
+            # Remove duplicates
+            combined_winding_points = np.unique(combined_winding_points, axis=0)
+            print(f"  Total after deduplication: {len(combined_winding_points)} points")
+            
+            # Save final winding file
+            final_winding_file = os.path.join(windings_path, f"winding_{winding_nr}.npz")
+            np.savez_compressed(final_winding_file, points=combined_winding_points)
+            print(f"Saved final winding {winding_nr}: {len(combined_winding_points)} unique points")
+            
+            if display:
+                print(f"Displaying winding {winding_nr} (loaded {combined_winding_points.shape[0]} points)")
+                display_3d_pointcloud(combined_winding_points,
+                                     color_by_angle=color_by_angle,
+                                     downsample_ratio=display_downsample)
+    
+    # Step 3: Clean up intermediate files
+    print("Cleaning up intermediate files...")
+    intermediate_files = glob.glob(os.path.join(intermediate_path, "winding_*_slab_*.npz"))
+    for file_path in intermediate_files:
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+    
+    try:
+        os.rmdir(intermediate_path)
+    except OSError:
+        pass
+    
+    print(f"Successfully generated {len(all_windings_found)} winding pointclouds from {len(slabs)} slabs")
 
 def build_neighbor_graph(coords,
                          angles=None,
@@ -980,7 +1055,7 @@ def flatten_pointcloud(base_path,
                 if downsample_ratio < 1.0:
                     mask = np.logical_or(np.random.rand(points_.shape[0]) < downsample_ratio, points_[:, 4].astype(bool))
                     points_ = points_[mask]
-                if display:
+            if display:
                     # Display 3D pointcloud, optionally colored by angle
                     display_3d_pointcloud(points_, color_by_angle=color_by_angle,
                                         downsample_ratio=display_downsample)
@@ -1227,21 +1302,26 @@ def flatten_pointcloud(base_path,
         
         # Get the valid indices from the full solver to map absolute indices to relative ones
         full_valid_indices = np.array(solver.get_undeleted_indices())
+
+        full_downsampled_indices_mask = np.zeros(len(coords), dtype=bool)
+        full_downsampled_indices_mask[valid_downsample_indices] = True
+        full_valid_indices_mask = full_downsampled_indices_mask[full_valid_indices]
+        relative_downsample_indices = np.where(full_valid_indices_mask)[0].tolist()
         
-        # Convert absolute valid_downsample_indices to relative indices within the full solver's valid nodes
-        relative_downsample_indices = []
-        missing_count = 0
-        for abs_idx in valid_downsample_indices:
-            # Find where this absolute index appears in the full solver's valid indices
-            where_found = np.where(full_valid_indices == abs_idx)[0]
-            if len(where_found) > 0:
-                relative_downsample_indices.append(where_found[0])
-            else:
-                missing_count += 1
+        # # Convert absolute valid_downsample_indices to relative indices within the full solver's valid nodes
+        # relative_downsample_indices = []
+        # missing_count = 0
+        # for abs_idx in tqdm(valid_downsample_indices, desc="Mapping downsampled indices to full solver"):
+        #     # Find where this absolute index appears in the full solver's valid indices
+        #     where_found = np.where(full_valid_indices == abs_idx)[0]
+        #     if len(where_found) > 0:
+        #         relative_downsample_indices.append(where_found[0])
+        #     else:
+        #         missing_count += 1
         
-        print(f"Mapped {len(valid_downsample_indices)} absolute indices to {len(relative_downsample_indices)} relative downsample indices")
-        if missing_count > 0:
-            print(f"WARNING: {missing_count} downsampled points not found in full solver valid indices!")
+        # print(f"Mapped {len(valid_downsample_indices)} absolute indices to {len(relative_downsample_indices)} relative downsample indices")
+        # if missing_count > 0:
+        #     print(f"WARNING: {missing_count} downsampled points not found in full solver valid indices!")
         
         # Also fix the first winding nodes in the full solver
         first_winding_relative_full = []
@@ -1403,7 +1483,7 @@ def flatten_pointcloud(base_path,
         print(f"Keys in prev_uvs_v: {prev_uvs_v.keys()}")
 
         # save and free up memory of already computed windings
-        clean_winding_dicts((start, end), flattened_winding_path, winding_files_indices, prev_uvs_u, prev_uvs_v, prev_points)
+        clean_winding_dicts((start+1, end), flattened_winding_path, winding_files_indices, prev_uvs_u, prev_uvs_v, prev_points)
 
     # save the last segments
     clean_winding_dicts((0, 0), flattened_winding_path, winding_files_indices, prev_uvs_u, prev_uvs_v, prev_points)
@@ -1647,9 +1727,9 @@ def grid_uv_flattened(flattened_winding_path,
             plt.show()
             # 3D display, optional coloring by angle
             display_3d_pointcloud(points_subsampled,
-                                  color_by_angle=color_by_angle,
-                                  downsample_ratio=display_downsample)
-
+                                     color_by_angle=color_by_angle,
+                                     downsample_ratio=display_downsample)
+    
         # Refine by medoid
         kept_indices = refine_by_medoid(points, uvs, kept_indices, subsample_radius)
         points_refined = points[kept_indices]
