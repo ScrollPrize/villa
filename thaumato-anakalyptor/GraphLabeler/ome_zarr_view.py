@@ -673,6 +673,9 @@ class OmeZarrViewWindow(QMainWindow):
         self.last_overlay_windings = overlay_windings
         self.last_overlay_windings_computed = overlay_windings_computed
         brushes = self.get_brushes()
+        # Scale to proper ome zarr index
+        scale = 2**(self.current_resolution)
+        overlay_points /= scale
         # Assume overlay_points columns: [z, x, y, ...] for XY view.
         x_coords = overlay_points[:, 1]
         y_coords = overlay_points[:, 2]
@@ -733,7 +736,10 @@ class OmeZarrViewWindow(QMainWindow):
         self.last_overlay_windings_xz = overlay_windings
         self.last_overlay_windings_computed_xz = overlay_windings_computed
         brushes = self.get_brushes_xz()
-        
+
+        # Scale to proper ome zarr index
+        scale = 2**(self.current_resolution)
+        overlay_points /= scale
         # Assume overlay_points for the XZ view: first column is the sample (x) coordinate and second column is z.
         x_coords = overlay_points[:, 0]
         z_coords = self.L - overlay_points[:, 1]
