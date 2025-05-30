@@ -8,7 +8,7 @@ usage(){
 Usage: $0 [--start <step>]
 
 Options:
-  -s,--start <step>   One of: copy_graph, create_graph, compile, mesh, refine, surface, stitch
+  -s,--start <step>   One of: copy_graph, create_graph, compile, mesh, refine, surface, stitch, upload
                       (default: copy_graph)
 
 Steps:
@@ -19,6 +19,7 @@ Steps:
   refine      run pointcloud_mesh_refinement
   surface     run large_mesh_to_surface
   stitch      run stitch_splits finalize_mesh
+  upload      rclone upload working folder to S3
 EOF
   exit 1
 }
@@ -43,6 +44,7 @@ case "$start" in
   refine)     start_idx=5;;
   surface)    start_idx=6;;
   stitch)     start_idx=7;;
+  upload)     start_idx=8;;
   *) echo "Invalid start step: $start"; usage;;
 esac
 
@@ -123,6 +125,23 @@ fi
 ZARR_NAME=$(basename "$ZARR_DIR" .zarr)
 echo ">>> Processing Zarr: $ZARR_NAME"
 
+# Extract scroll name from ZARR_NAME (find the PHerc part)
+SCROLL_NAME=""
+IFS='_' read -ra PARTS <<< "$ZARR_NAME"
+for part in "${PARTS[@]}"; do
+  if [[ $part == PHerc* ]]; then
+    SCROLL_NAME="$part"
+    break
+  fi
+done
+
+if [[ -z "$SCROLL_NAME" ]]; then
+  echo "ERROR: Could not extract scroll name (PHerc*) from $ZARR_NAME" >&2
+  exit 1
+fi
+
+echo ">>> Extracted scroll name: $SCROLL_NAME"
+
 # Initial Docker setup
 setup_docker
 
@@ -173,6 +192,13 @@ if (( start_idx <= 7 )); then
   echo ">>> Step 7: Running stitch_splits finalize_mesh"
   stitch_cmd="python3 -m ThaumatoAnakalyptor.stitch_splits /workspace/experiments/1352_3600_5002/working/mesh_refined.obj --type finalize_mesh --image_filename composite.jpg"
   run_in_docker_with_retry "$stitch_cmd"
+fi
+
+# step 8: upload working folder
+if (( start_idx <= 8 )); then
+  echo ">>> Step 8: Uploading working folder to S3"
+  upload_cmd="rclone copy /workspace/experiments/1352_3600_5002/working s3:philodemos/julian/ESRF_may_v1_segmentations/${SCROLL_NAME}/working --transfers=128"
+  run_in_docker_with_retry "$upload_cmd"
 fi
 
 echo ">>> All requested steps completed for ${ZARR_NAME}."
