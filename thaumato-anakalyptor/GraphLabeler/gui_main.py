@@ -1,6 +1,8 @@
 import sys, os, ast, numpy as np
 import math
 import json
+import time
+from datetime import datetime
 from PyQt5.QtWidgets import (
     QSplitter, QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QSlider, QLabel, QSpinBox, QDoubleSpinBox, QCheckBox,
@@ -8,13 +10,13 @@ from PyQt5.QtWidgets import (
     QProgressDialog, QDialog, QFormLayout, QDialogButtonBox, QLineEdit, QComboBox,
     QTextBrowser, QGraphicsPathItem, QLayout
 )
-from PyQt5.QtCore import Qt, QEvent, QPointF
+from PyQt5.QtCore import Qt, QEvent, QPointF, QTimer
 from PyQt5.QtGui  import QPainterPath, QPen, QColor
 import pyqtgraph as pg
 from scipy.spatial import cKDTree
-import time
 from tqdm import tqdm
 from collections import Counter
+import re
 
 # --------------------------------------------------
 # Importing the custom graph problem library.
@@ -85,6 +87,17 @@ class PointCloudLabeler(QMainWindow):
         self._stroke_backup = None
         self.gt_labels = None
         self.calculating = False
+        
+        # Autosave functionality
+        self.last_saved_labels = None
+        self.last_saved_group = None
+        self.last_saved_streaks = None
+        self.last_manual_save_path = None
+        self.last_load_path = None
+        self.autosave_timer = QTimer()
+        self.autosave_timer.timeout.connect(self.perform_autosave)
+        self.autosave_timer.start(10 * 60 * 1000)  # 10 minutes in milliseconds
+        self.autosave_timer.start(10* 1000)  # 10 seconds in milliseconds
         
         # Spline storage.
         self.spline_items = []
@@ -1042,8 +1055,13 @@ class PointCloudLabeler(QMainWindow):
         fname, _ = QFileDialog.getSaveFileName(self, "Save Labels", os.path.join("../experiments", self.default_experiment), "Text Files (*.txt);;All Files (*)")
         if not fname.endswith(".txt"):
             fname += ".txt"
-        self._save_labels_to_path(fname)
-
+        if fname:
+            self._save_labels_to_path(fname)
+            # Track this as the last manual save path for autosave reference
+            self.last_manual_save_path = fname
+            # Update the last saved state
+            self._update_last_saved_state()
+    
     def _save_labels_to_path(self, fname):
         if fname:
             with open(fname, "w") as f:
@@ -1089,6 +1107,10 @@ class PointCloudLabeler(QMainWindow):
                 self.labels = new_labels
                 self.group = new_groups
                 self.streaks = new_streaks
+                # Track this load path for autosave reference
+                self.last_load_path = fname
+                # Update the last saved state to reflect what was just loaded
+                self._update_last_saved_state()
                 self.update_views()
             else:
                 QMessageBox.warning(self, "Load Labels", "Loaded labels length does not match current data.")
@@ -3585,3 +3607,156 @@ class PointCloudLabeler(QMainWindow):
             event.accept()
         else:
             super(PointCloudLabeler, self).keyReleaseEvent(event)
+
+    def perform_autosave(self):
+        """Perform autosave if conditions are met."""
+        # Only autosave if we have a reference path (either from manual save or load)
+        reference_path = self.last_manual_save_path or self.last_load_path
+        if not reference_path:
+            return
+            
+        # Check if labels have changed since last save
+        if self._labels_have_changed():
+            try:
+                autosave_path = self.get_autosave_path(reference_path)
+                if autosave_path:
+                    # Ensure autosave directory exists
+                    autosave_dir = os.path.dirname(autosave_path)
+                    os.makedirs(autosave_dir, exist_ok=True)
+                    self._save_labels_to_path(autosave_path)
+                    # Update last saved state
+                    self._update_last_saved_state()
+                    print(f"Autosaved to {autosave_path}")
+                    
+                    # Clean up old autosave files, keeping only the 30 most recent
+                    self._cleanup_old_autosaves(autosave_dir)
+            except Exception as e:
+                print(f"Autosave failed: {e}")
+
+    def _cleanup_old_autosaves(self, autosave_dir, max_files=30):
+        """Remove old autosave files, keeping only the most recent ones."""
+        try:
+            # Safety check: only clean up if we're actually in an autosave directory
+            if not os.path.basename(autosave_dir) == "autosave":
+                print(f"Safety check failed: {autosave_dir} is not an autosave directory")
+                return
+                
+            # Additional safety check: ensure the directory exists and is readable
+            if not os.path.exists(autosave_dir) or not os.path.isdir(autosave_dir):
+                print(f"Autosave directory does not exist or is not a directory: {autosave_dir}")
+                return
+            
+            # Find all autosave files in the directory
+            autosave_files = []
+            for filename in os.listdir(autosave_dir):
+                # Additional safety: ensure file is actually an autosave file
+                if filename.startswith("autosave_") and filename.endswith(".txt"):
+                    file_path = os.path.join(autosave_dir, filename)
+                    
+                    # Safety check: ensure it's a file and not a directory
+                    if not os.path.isfile(file_path):
+                        continue
+                    
+                    # Extract timestamp from filename to sort by age
+                    match = re.match(r'autosave_(\d{8}_\d{6})_.*\.txt$', filename)
+                    if match:
+                        timestamp_str = match.group(1)
+                        try:
+                            # Parse timestamp
+                            timestamp = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+                            autosave_files.append((timestamp, file_path, filename))
+                        except ValueError:
+                            # If timestamp parsing fails, use file modification time
+                            mtime = os.path.getmtime(file_path)
+                            timestamp = datetime.fromtimestamp(mtime)
+                            autosave_files.append((timestamp, file_path, filename))
+            
+            # Sort by timestamp (oldest first)
+            autosave_files.sort(key=lambda x: x[0])
+            
+            # Remove old files if we have more than max_files
+            if len(autosave_files) > max_files:
+                files_to_remove = autosave_files[:-max_files]  # Keep the last max_files
+                removed_count = 0
+                for timestamp, file_path, filename in files_to_remove:
+                    try:
+                        # Final safety check: ensure the file is still in the autosave directory
+                        if os.path.dirname(file_path) == autosave_dir and filename.startswith("autosave_"):
+                            os.remove(file_path)
+                            print(f"Removed old autosave: {filename}")
+                            removed_count += 1
+                        else:
+                            print(f"Safety check failed for file: {filename}")
+                    except OSError as e:
+                        print(f"Failed to remove old autosave {filename}: {e}")
+                
+                if removed_count > 0:
+                    print(f"Cleaned up {removed_count} old autosave files, keeping {max_files} most recent")
+                
+        except Exception as e:
+            print(f"Failed to cleanup old autosaves: {e}")
+    
+    def _labels_have_changed(self):
+        """Check if current labels differ from last saved state."""
+        if self.last_saved_labels is None:
+            # No previous save state, consider it changed if we have labels
+            return True
+            
+        # Compare current state with last saved state
+        labels_changed = not np.array_equal(self.labels, self.last_saved_labels)
+        group_changed = not np.array_equal(self.group, self.last_saved_group)
+        streaks_changed = not np.array_equal(self.streaks, self.last_saved_streaks)
+        
+        return labels_changed or group_changed or streaks_changed
+    
+    def _update_last_saved_state(self):
+        """Update the last saved state to current state."""
+        self.last_saved_labels = self.labels.copy()
+        self.last_saved_group = self.group.copy()
+        self.last_saved_streaks = self.streaks.copy()
+
+    def get_autosave_path(self, reference_path):
+        """Generate autosave path based on reference path."""
+        if not reference_path:
+            return None
+            
+        # Get directory and filename
+        reference_dir = os.path.dirname(reference_path)
+        reference_filename = os.path.basename(reference_path)
+        
+        # Check if the reference file is already an autosave file
+        if "autosave_" in reference_filename and "autosave" in reference_dir:
+            # If it's already an autosave file, use the same autosave directory
+            autosave_dir = reference_dir
+            # Extract the original filename (remove the autosave prefix and timestamp)
+            if reference_filename.startswith("autosave_"):
+                # Format is: autosave_YYYYMMDD_HHMMSS_original_filename.ext
+                # Split and take everything after the timestamp parts
+                parts = reference_filename.split("_", 3)  # Split into max 4 parts
+                if len(parts) >= 4:
+                    original_filename = parts[3]  # Everything after autosave_YYYYMMDD_HHMMSS_
+                else:
+                    # Fallback: try to find the original filename after any timestamp pattern
+                    # Look for pattern autosave_########_######_filename
+                    import re
+                    match = re.match(r'autosave_\d{8}_\d{6}_(.+)', reference_filename)
+                    if match:
+                        original_filename = match.group(1)
+                    else:
+                        original_filename = reference_filename
+            else:
+                original_filename = reference_filename
+        else:
+            # Create autosave directory
+            autosave_dir = os.path.join(reference_dir, "autosave")
+            original_filename = reference_filename
+            
+        # Generate timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Create autosave filename
+        name_without_ext = os.path.splitext(original_filename)[0]
+        ext = os.path.splitext(original_filename)[1]
+        autosave_filename = f"autosave_{timestamp}_{name_without_ext}{ext}"
+        
+        return os.path.join(autosave_dir, autosave_filename)
