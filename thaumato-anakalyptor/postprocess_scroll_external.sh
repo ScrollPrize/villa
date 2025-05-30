@@ -8,7 +8,7 @@ usage(){
 Usage: $0 [--start <step>]
 
 Options:
-  -s,--start <step>   One of: copy_graph, create_graph, compile, mesh, refine, surface
+  -s,--start <step>   One of: copy_graph, create_graph, compile, mesh, refine, surface, stitch
                       (default: copy_graph)
 
 Steps:
@@ -18,6 +18,7 @@ Steps:
   mesh        run graph_to_mesh
   refine      run pointcloud_mesh_refinement
   surface     run large_mesh_to_surface
+  stitch      run stitch_splits finalize_mesh
 EOF
   exit 1
 }
@@ -41,6 +42,7 @@ case "$start" in
   mesh)       start_idx=4;;
   refine)     start_idx=5;;
   surface)    start_idx=6;;
+  stitch)     start_idx=7;;
   *) echo "Invalid start step: $start"; usage;;
 esac
 
@@ -164,6 +166,13 @@ if (( start_idx <= 6 )); then
   echo ">>> Step 6: Running large_mesh_to_surface"
   surface_cmd="python3 -m ThaumatoAnakalyptor.large_mesh_to_surface --input_mesh /workspace/experiments/1352_3600_5002/mesh_refined.obj --scroll /scrolls/${ZARR_NAME}.zarr --cut_size 20000 --r 16"
   run_in_docker_with_retry "$surface_cmd"
+fi
+
+# step 7: stitch splits
+if (( start_idx <= 7 )); then
+  echo ">>> Step 7: Running stitch_splits finalize_mesh"
+  stitch_cmd="python3 -m ThaumatoAnakalyptor.stitch_splits /workspace/experiments/1352_3600_5002/working/mesh_refined.obj --type finalize_mesh --image_filename composite.jpg"
+  run_in_docker_with_retry "$stitch_cmd"
 fi
 
 echo ">>> All requested steps completed for ${ZARR_NAME}."
