@@ -97,7 +97,6 @@ class PointCloudLabeler(QMainWindow):
         self.autosave_timer = QTimer()
         self.autosave_timer.timeout.connect(self.perform_autosave)
         self.autosave_timer.start(10 * 60 * 1000)  # 10 minutes in milliseconds
-        self.autosave_timer.start(10* 1000)  # 10 seconds in milliseconds
         
         # Spline storage.
         self.spline_items = []
