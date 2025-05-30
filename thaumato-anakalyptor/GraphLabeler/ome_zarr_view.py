@@ -468,7 +468,8 @@ class OmeZarrViewWindow(QMainWindow):
         # defer Zarr pyramid loading until resolution is selected
         self.ome_zarr_path = ome_zarr_path
         # metadata (dims, L) will be loaded upon resolution change
-        self.on_resolution_changed(0)
+        self.z_dim = self.y_dim = self.x_dim = None
+        self.L = None
         self.graph_pkl_path = graph_pkl_path
         self.h5_path = h5_path
         self.umbilicus_path = umbilicus_path
@@ -533,6 +534,8 @@ class OmeZarrViewWindow(QMainWindow):
             self.resolution_combobox.setCurrentIndex(0)
         self.resolution_combobox.currentIndexChanged.connect(self.on_resolution_changed)
         settings_layout.addWidget(self.resolution_combobox)
+        # Load initial resolution
+        self.on_resolution_changed(0)
         
         views_layout = QHBoxLayout()
         main_layout.addLayout(views_layout)
