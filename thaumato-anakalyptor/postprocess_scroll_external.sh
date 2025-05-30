@@ -197,8 +197,27 @@ fi
 # step 8: upload working folder
 if (( start_idx <= 8 )); then
   echo ">>> Step 8: Uploading working folder to S3"
-  upload_cmd="rclone copy /workspace/experiments/1352_3600_5002/working s3:philodemos/julian/ESRF_may_v1_segmentations/${SCROLL_NAME}/working --transfers=128"
-  run_in_docker_with_retry "$upload_cmd"
+  echo ">>> Running rclone on host system (not in Docker)"
+  
+  # Use host path for the working folder
+  HOST_WORKING_PATH="$HOME/Desktop/experiments/1352_3600_5002/working"
+  
+  if [[ ! -d "$HOST_WORKING_PATH" ]]; then
+    echo "ERROR: Working folder not found at $HOST_WORKING_PATH" >&2
+    exit 1
+  fi
+  
+  echo ">>> Uploading from: $HOST_WORKING_PATH"
+  echo ">>> Uploading to: s3:philodemos/julian/ESRF_may_v1_segmentations/${SCROLL_NAME}/working"
+  
+  rclone copy "$HOST_WORKING_PATH" "s3:philodemos/julian/ESRF_may_v1_segmentations/${SCROLL_NAME}/working" --transfers=128
+  
+  if [[ $? -eq 0 ]]; then
+    echo ">>> SUCCESS: rclone upload completed"
+  else
+    echo ">>> ERROR: rclone upload failed" >&2
+    exit 1
+  fi
 fi
 
 echo ">>> All requested steps completed for ${ZARR_NAME}."
