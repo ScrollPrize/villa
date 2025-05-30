@@ -8,23 +8,21 @@ usage(){
 Usage: $0 [--start <step>]
 
 Options:
-  -s,--start <step>   One of: grid, instances, graph, compile, solve, solve_inverse, h5
-                      (default: grid)
+  -s,--start <step>   One of: copy_graph, create_graph, mesh, refine, surface
+                      (default: copy_graph)
 
 Steps:
-  grid        run grid_to_pointcloud
-  instances   run pointcloud_to_instances
-  graph       run instances_to_graph
-  compile     compile bash script
-  solve       run graph_solve
-  solve_inverse run graph_solve with inversed_winding_direction
-  h5        run h5 instance generation
+  copy_graph  copy output_graph.bin back to 1352_3600_5002
+  create_graph run instances_to_graph with --create_graph
+  mesh        run graph_to_mesh
+  refine      run pointcloud_mesh_refinement
+  surface     run large_mesh_to_surface
 EOF
   exit 1
 }
 
 # parse args
-start="grid"
+start="copy_graph"
 while [[ $# -gt 0 ]]; do
   case $1 in
     -s|--start)
@@ -36,13 +34,11 @@ done
 
 # map step name to index
 case "$start" in
-  grid)       start_idx=1;;
-  instances)  start_idx=2;;
-  graph)      start_idx=3;;
-  compile)    start_idx=4;;
-  solve)      start_idx=5;;
-  solve_inverse)      start_idx=6;;
-  h5)      start_idx=7;;
+  copy_graph) start_idx=1;;
+  create_graph) start_idx=2;;
+  mesh)       start_idx=3;;
+  refine)     start_idx=4;;
+  surface)    start_idx=5;;
   *) echo "Invalid start step: $start"; usage;;
 esac
 
@@ -126,60 +122,39 @@ echo ">>> Processing Zarr: $ZARR_NAME"
 # Initial Docker setup
 setup_docker
 
-# step 1: grid_to_pointcloud
+# step 1: copy output_graph.bin back to 1352_3600_5002
 if (( start_idx <= 1 )); then
-  echo ">>> Step 1: Running grid_to_pointcloud"
-  grid_cmd="python3 -m ThaumatoAnakalyptor.grid_to_pointcloud --base_path \"\" --volume_subpath \"/scrolls/${ZARR_NAME}.zarr\" --disk_load_save \"\" \"\" --pointcloud_subpath \"/workspace/experiments/point_cloud\" --num_threads 20 --gpus 4"
-  run_in_docker_with_retry "$grid_cmd"
+  echo ">>> Step 1: Copying output_graph.bin back to 1352_3600_5002"
+  copy_graph_cmd="if [[ -f \"/workspace/experiments/${ZARR_NAME}/output_graph.bin\" ]]; then echo \"Found output_graph.bin in ${ZARR_NAME}\"; cp \"/workspace/experiments/${ZARR_NAME}/output_graph.bin\" \"/workspace/experiments/1352_3600_5002/output_graph.bin\"; elif [[ -f \"/workspace/experiments/${ZARR_NAME}_inverse/output_graph.bin\" ]]; then echo \"Found output_graph.bin in ${ZARR_NAME}_inverse\"; cp \"/workspace/experiments/${ZARR_NAME}_inverse/output_graph.bin\" \"/workspace/experiments/1352_3600_5002/output_graph.bin\"; else echo \"ERROR: output_graph.bin not found in either experiment folder\"; exit 1; fi"
+  run_in_docker_with_retry "$copy_graph_cmd"
 fi
 
-# step 2: pointcloud_to_instances
+# step 2: create graph
 if (( start_idx <= 2 )); then
-  echo ">>> Step 2: Running pointcloud_to_instances"
-  inst_cmd="python3 -m ThaumatoAnakalyptor.pointcloud_to_instances --path \"/workspace/experiments\" --dest \"/workspace/experiments\" --umbilicus_path \"/workspace/experiments/umbilicus.txt\" --main_drive \"\" --alternative_ply_drives \"\" \"\" --batch_size 5 --gpus 4 --update_progress"
-  run_in_docker_with_retry "$inst_cmd"
+  echo ">>> Step 2: Running instances_to_graph with --create_graph"
+  create_graph_cmd="python3 -m ThaumatoAnakalyptor.instances_to_graph --path \"/workspace/experiments/point_cloud_colorized_verso_subvolume_blocks\" --create_graph"
+  run_in_docker_with_retry "$create_graph_cmd"
 fi
 
-# step 3: instances_to_graph
+# step 3: graph to mesh
 if (( start_idx <= 3 )); then
-  echo ">>> Step 3: Running instances_to_graph"
-  graph_cmd="python3 -m ThaumatoAnakalyptor.instances_to_graph --path \"/workspace/experiments/point_cloud_colorized_verso_subvolume_blocks\""
-  run_in_docker_with_retry "$graph_cmd"
+  echo ">>> Step 3: Running graph_to_mesh"
+  mesh_cmd="python3 -m ThaumatoAnakalyptor.graph_to_mesh --path /workspace/experiments/point_cloud_colorized_verso_subvolume_blocks --graph /workspace/experiments/1352_3600_5002/point_cloud_colorized_verso_subvolume_graph_BP_solved.pkl --start_point 1352 3600 5002 --angle_step 2.0 --z_spacing 5 --unfix_factor 3.0 --max_z_step_size 500 --downsample --split_width 40000"
+  run_in_docker_with_retry "$mesh_cmd"
 fi
 
-# step 4: compile bash script
+# step 4: mesh refinement
 if (( start_idx <= 4 )); then
-  echo ">>> Step 4: Compiling C++ code"
-  compile_cmd="echo 'Compiling C++ code...' && ./compile_cpp.sh"
-  run_in_docker_with_retry "$compile_cmd"
+  echo ">>> Step 4: Running pointcloud_mesh_refinement"
+  refine_cmd="python3 -m ThaumatoAnakalyptor.pointcloud_mesh_refinement --mesh /workspace/experiments/1352_3600_5002/mesh_0.obj --downsample_ratio 0.075"
+  run_in_docker_with_retry "$refine_cmd"
 fi
 
-# step 5: graph_solve
+# step 5: large mesh to surface
 if (( start_idx <= 5 )); then
-  echo ">>> Step 5: Running graph_solve"
-  solve_cmd="while [[ -n \"\${CONDA_DEFAULT_ENV:-}\" ]]; do conda deactivate; done && echo \"Conda completely deactivated.\" && python3 -m ThaumatoAnakalyptor.graph_solve \"/workspace/experiments/1352_3600_5002/graph.bin\" --experiment_name \"${ZARR_NAME}\""
-  run_in_docker_with_retry "$solve_cmd"
-fi
-
-# step 6: graph_solve with inverse
-if (( start_idx <= 6 )); then
-  echo ">>> Step 6: Running graph_solve with inverse winding direction"
-  solve_inverse_cmd="while [[ -n \"\${CONDA_DEFAULT_ENV:-}\" ]]; do conda deactivate; done && echo \"Conda completely deactivated.\" && python3 -m ThaumatoAnakalyptor.graph_solve \"/workspace/experiments/1352_3600_5002/graph.bin\" --experiment_name \"${ZARR_NAME}_inverse\" --inversed_winding_direction"
-  run_in_docker_with_retry "$solve_inverse_cmd"
-fi
-
-# Copy graph.bin from 1352_3600_5002 to the experiments folders
-if (( start_idx <= 6 )); then
-  echo ">>> Step 6: Copying graph.bin from 1352_3600_5002 to the experiments folders"
-  cp "/workspace/experiments/1352_3600_5002/graph.bin" "/workspace/experiments/${ZARR_NAME}/graph.bin"
-  cp "/workspace/experiments/1352_3600_5002/graph.bin" "/workspace/experiments/${ZARR_NAME}_inverse/graph.bin"
-fi
-
-# step 7: h5 generation
-if (( start_idx <= 7 )); then
-  echo ">>> Step 7: Running h5 instance generation"
-  h5_cmd="python3 -m ThaumatoAnakalyptor.instances_to_h5 --input_dir \"/workspace/experiments/point_cloud_colorized_verso_subvolume_blocks\" --output_h5 \"/workspace/experiments/point_cloud_colorized_verso_subvolume_blocks_compact.h5\" --threads 12"
-  run_in_docker_with_retry "$h5_cmd"
+  echo ">>> Step 5: Running large_mesh_to_surface"
+  surface_cmd="python3 -m ThaumatoAnakalyptor.large_mesh_to_surface --input_mesh /workspace/experiments/1352_3600_5002/mesh_refined.obj --scroll /scrolls/${ZARR_NAME}.zarr --cut_size 20000 --r 16"
+  run_in_docker_with_retry "$surface_cmd"
 fi
 
 echo ">>> All requested steps completed for ${ZARR_NAME}."
