@@ -155,7 +155,7 @@ fi
 # step 5: mesh refinement
 if (( start_idx <= 5 )); then
   echo ">>> Step 5: Running pointcloud_mesh_refinement"
-  refine_cmd="python3 -m ThaumatoAnakalyptor.pointcloud_mesh_refinement --mesh /workspace/experiments/1352_3600_5002/mesh_0.obj --downsample_ratio 0.075"
+  refine_cmd="while [[ -n \"\${CONDA_DEFAULT_ENV:-}\" ]]; do conda deactivate; done && echo \"Conda completely deactivated.\" && python3 -m ThaumatoAnakalyptor.pointcloud_mesh_refinement --mesh /workspace/experiments/1352_3600_5002/mesh_0.obj --downsample_ratio 0.075"
   run_in_docker_with_retry "$refine_cmd"
 fi
 
