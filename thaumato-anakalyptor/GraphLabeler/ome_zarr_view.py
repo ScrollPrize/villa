@@ -473,8 +473,11 @@ class OmeZarrViewWindow(QMainWindow):
         self.graph_pkl_path = graph_pkl_path
         self.h5_path = h5_path
         self.umbilicus_path = umbilicus_path
-        # umbilicus_data will be computed when resolution metadata is available
-        self.umbilicus_data = None
+        # Compute umbilicus_data
+        if self.umbilicus_path and os.path.exists(self.umbilicus_path):
+            self.umbilicus_data = load_xyz_from_file(self.umbilicus_path) - 500
+        else:
+            self.umbilicus_data = np.array([[self.y_dim / 2, 0, self.x_dim / 2]])
         self.winding, overlay_point_nodes_indices = None, None
         self.f_init = np.array(self.solver.get_positions())[:, 1]
         self.undeleted_nodes_indices = np.array(self.solver.get_undeleted_indices())
@@ -822,11 +825,6 @@ class OmeZarrViewWindow(QMainWindow):
             QMessageBox.warning(self, "Resolution Error",
                                 f"Could not load resolution {level}: {e}")
             return
-        # Compute umbilicus_data
-        if self.umbilicus_path and os.path.exists(self.umbilicus_path):
-            self.umbilicus_data = load_xyz_from_file(self.umbilicus_path) - 500
-        else:
-            self.umbilicus_data = np.array([[self.y_dim / 2, 0, self.x_dim / 2]])
         # Update overlay worker if exists
         if hasattr(self, 'persistent_overlay_worker'):
             self.persistent_overlay_worker.umbilicus_data = self.umbilicus_data
