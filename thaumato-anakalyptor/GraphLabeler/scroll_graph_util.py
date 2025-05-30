@@ -299,9 +299,9 @@ class ScrollGraph(Graph):
         are kept. Then, after loading the points for these nodes, each point is filtered based on 
         its (x,y) distance to the corresponding umbilicus center (with a tighter tolerance of 3 units).
         
-        Finally, the point’s position is updated so that columns 0 and 1 contain the XZ umbilicus 
+        Finally, the point's position is updated so that columns 0 and 1 contain the XZ umbilicus 
         plane view coordinate. Here the new x coordinate is computed as the projection of the 
-        (x,y) difference (point’s (x,y) minus the umbilicus center) onto the tangent direction 
+        (x,y) difference (point's (x,y) minus the umbilicus center) onto the tangent direction 
         (cos(f_target), sin(f_target)) and the z coordinate is retained.
 
         Parameters:
@@ -353,19 +353,24 @@ class ScrollGraph(Graph):
         )
         
         # Filter nodes based on centroid distance from the umbilicus plane.
-        centroid_close_mask = []
-        for node_key in tqdm(node_keys, desc="Filtering nodes by centroid"):
-            centroid = self.nodes[node_key]['centroid']  # [y, z, x]
-            # Scale the centroid to scroll coordinates.
-            scaled_centroid = np.array(centroid) * 4.0 - 500
-            centroid_xy = scaled_centroid[[2,0]]
-            z_val = scaled_centroid[1]
-            # Get the umbilicus center for this z slice.
-            center = umbilicus_xy_at_z(umbilicus_data, z_val)
-            # Compute the absolute distance from the centroid (projected to XY) to the plane.
-            distance = np.abs(np.dot(centroid_xy - center, normal))
-            centroid_close_mask.append(distance < block_size)
-        centroid_close_mask = np.array(centroid_close_mask)
+        # Get all centroids at once
+        centroids = np.array([self.nodes[node_key]['centroid'] for node_key in node_keys])  # shape: (N, 3) [y, z, x]
+        
+        # Scale all centroids to scroll coordinates
+        scaled_centroids = centroids * 4.0 - 500
+        
+        # Extract centroid_xy and z_val arrays
+        centroid_xy = scaled_centroids[:, [2, 0]]  # shape: (N, 2) [x, y]
+        z_vals = scaled_centroids[:, 1]  # shape: (N,)
+        
+        # Get umbilicus centers for all z slices (vectorized)
+        centers = umbilicus_xy_at_z_vector(umbilicus_data, z_vals)  # shape: (N, 2)
+        
+        # Compute all distances at once
+        distances = np.abs((centroid_xy - centers) @ normal)  # shape: (N,)
+        
+        # Apply the mask
+        centroid_close_mask = distances < block_size
         
         # Select only the nodes that are close enough.
         close_nodes = [node_keys[i] for i in range(len(node_keys)) if centroid_close_mask[i]]
@@ -396,7 +401,7 @@ class ScrollGraph(Graph):
         z_vals = points[:, 0]
         # 2. Use the vectorized interpolation to get the umbilicus center for each z value.
         centers = umbilicus_xy_at_z_vector(umbilicus_data, z_vals)  # shape: (N, 2), columns: [x, y]
-        # 3. Compute the difference between each point’s (x,y) and its corresponding center.
+        # 3. Compute the difference between each point's (x,y) and its corresponding center.
         diff = points[:, 1:3] - centers
         # 4. Compute the distance from the umbilicus plane (by projecting diff onto the normal vector).
         distance = np.abs(np.sum(diff * normal, axis=1))
