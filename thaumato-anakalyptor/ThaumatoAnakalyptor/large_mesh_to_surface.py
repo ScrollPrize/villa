@@ -24,6 +24,7 @@ if __name__ == "__main__":
     parser.add_argument('--start', type=int, default=0)
     parser.add_argument('--end', type=int, default=None)
     parser.add_argument('--reverse', action='store_true')
+    parser.add_argument('--skip_completed', action='store_true', help='Skip meshes that have already been processed (contain composite.jpg)')
 
     args = parser.parse_known_args()[0]
     print(f"Known args: {args}")
@@ -49,6 +50,8 @@ if __name__ == "__main__":
     else:
         start = min(args.start, len(obj_paths))
         obj_paths = obj_paths[start:]
+    if args.skip_completed:
+        obj_paths = [obj_path for obj_path in obj_paths if not os.path.exists(os.path.join(os.path.dirname(obj_path), 'composite.jpg'))]
     for obj_path in tqdm(obj_paths, desc='Texturing meshes'):
         print(f"Texturing {obj_path}")
         # ppm_and_texture(obj_path, gpus=args.gpus, grid_cell_path=args.grid_cell, output_path=None, r=args.r, format=args.format, display=args.display, nr_workers=args.nr_workers, prefetch_factor=args.prefetch_factor)
