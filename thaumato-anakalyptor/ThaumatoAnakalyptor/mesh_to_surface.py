@@ -26,6 +26,7 @@ import zarr
 from multiprocessing import cpu_count, shared_memory
 import time
 import warnings
+import glob
 
 class MyPredictionWriter(BasePredictionWriter):
     def __init__(self, save_path, image_size, r, r_steps=None, max_queue_size=10, max_workers=1, display=True):
@@ -118,14 +119,48 @@ class MyPredictionWriter(BasePredictionWriter):
     def create_shared_array(self, shape, dtype, name="shared_array"):
         array_size = np.prod(shape) * np.dtype(dtype).itemsize
         success = True
+        
+        # First try to create a new shared array
         try:
-            # Create a shared array
             shm = shared_memory.SharedMemory(create=True, size=array_size, name=name)
         except FileExistsError:
-            print(f"Shared memory with name {name} already exists.")
-            # Clean up the shared memory if it already exists
-            shm = shared_memory.SharedMemory(create=False, size=array_size, name=name)
-            success = False
+            print(f"Shared memory with name {name} already exists. Attempting to clean up...")
+            
+            # Try to attach to existing shared memory to check if it can be safely removed
+            try:
+                existing_shm = shared_memory.SharedMemory(name=name)
+                existing_size = existing_shm.size
+                
+                # Check if the existing shared memory has the expected size
+                if existing_size == array_size:
+                    print(f"Existing shared memory has correct size ({existing_size} bytes). Reusing it.")
+                    # Try to unlink it first, then create a new one
+                    try:
+                        existing_shm.close()
+                        existing_shm.unlink()
+                        print("Successfully cleaned up existing shared memory. Creating new one...")
+                        shm = shared_memory.SharedMemory(create=True, size=array_size, name=name)
+                    except (FileNotFoundError, PermissionError) as cleanup_error:
+                        print(f"Could not clean up existing shared memory: {cleanup_error}. Reusing existing one.")
+                        # If cleanup fails, reuse the existing one
+                        shm = shared_memory.SharedMemory(name=name)
+                        success = False
+                else:
+                    print(f"Existing shared memory has wrong size ({existing_size} vs expected {array_size}). Attempting cleanup...")
+                    try:
+                        existing_shm.close()
+                        existing_shm.unlink()
+                        print("Successfully cleaned up wrongly-sized shared memory. Creating new one...")
+                        shm = shared_memory.SharedMemory(create=True, size=array_size, name=name)
+                    except (FileNotFoundError, PermissionError) as cleanup_error:
+                        print(f"Could not clean up existing shared memory: {cleanup_error}")
+                        existing_shm.close()
+                        raise RuntimeError(f"Cannot create shared memory '{name}': existing segment has wrong size and cannot be cleaned up")
+                        
+            except FileNotFoundError:
+                # This shouldn't happen, but handle it just in case
+                print("Shared memory disappeared during cleanup attempt. Creating new one...")
+                shm = shared_memory.SharedMemory(create=True, size=array_size, name=name)
 
         arr = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
         arr.fill(0)  # Initialize the array with zeros
@@ -324,6 +359,47 @@ class MyPredictionWriter(BasePredictionWriter):
         z = zarr.open(zarr_path, mode='w', shape=self.surface_volume_np.shape, dtype='uint16', chunks=chunk_size, compressor=compressor)
         z[:] = self.surface_volume_np
         
+    @staticmethod
+    def cleanup_shared_memory(name_pattern="surface_volume"):
+        """
+        Utility method to manually clean up leftover shared memory segments.
+        This can be called if shared memory cleanup fails during normal operation.
+        
+        Args:
+            name_pattern: Pattern to match shared memory names (default: "surface_volume")
+        """
+        try:
+            # On Linux, shared memory segments are typically stored in /dev/shm/
+            shm_dir = "/dev/shm/"
+            if os.path.exists(shm_dir):
+                pattern = os.path.join(shm_dir, f"*{name_pattern}*")
+                shm_files = glob.glob(pattern)
+                
+                for shm_file in shm_files:
+                    try:
+                        # Extract the name from the full path
+                        shm_name = os.path.basename(shm_file)
+                        if shm_name.startswith("psm_"):  # Python shared memory prefix
+                            actual_name = shm_name[4:]  # Remove "psm_" prefix
+                            
+                            # Try to attach and unlink
+                            try:
+                                shm = shared_memory.SharedMemory(name=actual_name)
+                                shm.close()
+                                shm.unlink()
+                                print(f"Cleaned up shared memory: {actual_name}")
+                            except FileNotFoundError:
+                                print(f"Shared memory {actual_name} already cleaned up")
+                            except Exception as e:
+                                print(f"Could not clean up shared memory {actual_name}: {e}")
+                    except Exception as e:
+                        print(f"Error processing {shm_file}: {e}")
+            else:
+                print("Shared memory directory /dev/shm/ not found (this is normal on non-Linux systems)")
+                
+        except Exception as e:
+            print(f"Error during shared memory cleanup: {e}")
+
 class MeshDataset(Dataset):
     """Dataset class for rendering a mesh."""
     def __init__(self, path, scroll, scroll_format="grid cells", output_path=None, grid_size=500, r=32, max_side_triangle=10, max_workers=1, display=False, r_steps=None, volume_offset=None):
