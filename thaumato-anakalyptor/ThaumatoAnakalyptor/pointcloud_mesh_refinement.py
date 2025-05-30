@@ -557,6 +557,8 @@ def generate_winding_pointclouds(mesh_path,
     for slab_idx, slab_path in enumerate(tqdm(slabs, desc="Processing slabs to per-winding files")):
         points = load_pointcloud_slab(slab_path).astype(np.float16)
         # From TA to original coordinates
+        if len(points.shape) != 2:
+            continue
         points = shuffling_points_axis(points)
         points[:, :3] = points[:, :3] * 4.0 - 500
         # To original winding angle
