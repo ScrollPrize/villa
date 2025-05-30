@@ -8,12 +8,13 @@ usage(){
 Usage: $0 [--start <step>]
 
 Options:
-  -s,--start <step>   One of: copy_graph, create_graph, mesh, refine, surface
+  -s,--start <step>   One of: copy_graph, create_graph, compile, mesh, refine, surface
                       (default: copy_graph)
 
 Steps:
   copy_graph  copy output_graph.bin back to 1352_3600_5002
   create_graph run instances_to_graph with --create_graph
+  compile     compile bash script
   mesh        run graph_to_mesh
   refine      run pointcloud_mesh_refinement
   surface     run large_mesh_to_surface
@@ -36,9 +37,10 @@ done
 case "$start" in
   copy_graph) start_idx=1;;
   create_graph) start_idx=2;;
-  mesh)       start_idx=3;;
-  refine)     start_idx=4;;
-  surface)    start_idx=5;;
+  compile)    start_idx=3;;
+  mesh)       start_idx=4;;
+  refine)     start_idx=5;;
+  surface)    start_idx=6;;
   *) echo "Invalid start step: $start"; usage;;
 esac
 
@@ -136,23 +138,30 @@ if (( start_idx <= 2 )); then
   run_in_docker_with_retry "$create_graph_cmd"
 fi
 
-# step 3: graph to mesh
+# step 3: compile bash script
 if (( start_idx <= 3 )); then
-  echo ">>> Step 3: Running graph_to_mesh"
+  echo ">>> Step 3: Compiling C++ code"
+  compile_cmd="echo 'Compiling C++ code...' && ./compile_cpp.sh"
+  run_in_docker_with_retry "$compile_cmd"
+fi
+
+# step 4: graph to mesh
+if (( start_idx <= 4 )); then
+  echo ">>> Step 4: Running graph_to_mesh"
   mesh_cmd="python3 -m ThaumatoAnakalyptor.graph_to_mesh --path /workspace/experiments/point_cloud_colorized_verso_subvolume_blocks --graph /workspace/experiments/1352_3600_5002/point_cloud_colorized_verso_subvolume_graph_BP_solved.pkl --start_point 1352 3600 5002 --angle_step 2.0 --z_spacing 5 --unfix_factor 3.0 --max_z_step_size 500 --downsample --split_width 40000"
   run_in_docker_with_retry "$mesh_cmd"
 fi
 
-# step 4: mesh refinement
-if (( start_idx <= 4 )); then
-  echo ">>> Step 4: Running pointcloud_mesh_refinement"
+# step 5: mesh refinement
+if (( start_idx <= 5 )); then
+  echo ">>> Step 5: Running pointcloud_mesh_refinement"
   refine_cmd="python3 -m ThaumatoAnakalyptor.pointcloud_mesh_refinement --mesh /workspace/experiments/1352_3600_5002/mesh_0.obj --downsample_ratio 0.075"
   run_in_docker_with_retry "$refine_cmd"
 fi
 
-# step 5: large mesh to surface
-if (( start_idx <= 5 )); then
-  echo ">>> Step 5: Running large_mesh_to_surface"
+# step 6: large mesh to surface
+if (( start_idx <= 6 )); then
+  echo ">>> Step 6: Running large_mesh_to_surface"
   surface_cmd="python3 -m ThaumatoAnakalyptor.large_mesh_to_surface --input_mesh /workspace/experiments/1352_3600_5002/mesh_refined.obj --scroll /scrolls/${ZARR_NAME}.zarr --cut_size 20000 --r 16"
   run_in_docker_with_retry "$surface_cmd"
 fi
