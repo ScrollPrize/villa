@@ -51,13 +51,12 @@ class PointCloudLabeler(QMainWindow):
             self.solver = graph_problem_gpu_py.Solver(self.graph_path)
             gt_path = os.path.join("../experiments", self.default_experiment,
                                    "checkpoints", "checkpoint_graph_tugging.bin")
-            version_graph = self.graph_version
             if not os.path.exists(gt_path):
                 gt_path = os.path.join("../experiments", self.default_experiment,
                                        "checkpoints", "checkpoint_graph_f_star_final.bin")
                 # Keep the configured version even for the fallback file
             if os.path.exists(gt_path):
-                self.solver.load_graph(gt_path, version_graph)
+                self.solver.load_graph(gt_path, self.graph_version)
             else:
                 print("Default graph file not found; continuing without loading.")
             point_data = self.solver.get_positions()
@@ -760,6 +759,7 @@ class PointCloudLabeler(QMainWindow):
         self.config["num_colors"] = self.num_colors
         # Persist teflon label number
         self.config["teflon_label"] = self.teflon_label
+        self.config["graph_version"] = self.graph_version
         save_config(self.config, "config_labeling_gui.json")
         event.accept()
     
@@ -1003,6 +1003,7 @@ class PointCloudLabeler(QMainWindow):
             selected_version = version_spinbox.value()
             self.default_experiment = exp_name
             self.graph_version = selected_version
+            self.config["graph_version"] = self.graph_version
             if not selected_dir or not exp_name:
                 return
             bin_file_path = selected_dir # os.path.join(selected_dir, "graph.bin")
