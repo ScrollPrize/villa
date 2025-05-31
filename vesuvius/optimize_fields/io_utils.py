@@ -21,7 +21,7 @@ def create_output_store(
     compressor: Optional[Blosc] = None
 ) -> Tuple[Group, Array, Array]:
     """
-    Create a Zarr group at `output_path` with two datasets 'u' and 'v'.
+    Create a Zarr group at `output_path` with three datasets 'u', 'v' and 'n'.
 
     Args:
       output_path: path for the zarr (will get '.zarr' appended if needed)
@@ -30,7 +30,7 @@ def create_output_store(
       compressor:   a Blosc compressor or None
 
     Returns:
-      (root_group, ds_u, ds_v)
+      (root_group, ds_u, ds_v, ds_n)
     """
     if not output_path.endswith('.zarr'):
         output_path = output_path + '.zarr'
@@ -56,5 +56,12 @@ def create_output_store(
         compressor=compressor,
         write_empty_chunks=False
     )
-
-    return root, ds_u, ds_v
+    ds_n = root.create_dataset(
+        'n',
+        shape=volume_shape,
+        chunks=chunk_size,
+        dtype=np.float32,
+        compressor=compressor,
+        write_empty_chunks=False
+    )
+    return root, ds_u, ds_v, ds_n

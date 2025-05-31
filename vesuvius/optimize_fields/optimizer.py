@@ -29,35 +29,52 @@ class PatchOptimizer:
         self.lr, self.iters = lr, iters
 
     @torch.compile(fullgraph=True, dynamic=True)
-    def _step(self, q_raw, u0, v0, U, V, n):
+    def _step(self, q_raw, U, V, N):
         # 1) normalize quaternion
         norm = q_raw.norm(dim=0, keepdim=True).clamp_min(1e-8)
         q = q_raw / norm       # shape (4,D,H,W)
 
+
+        u0 = torch.zeros_like(U)  # → (3, D, H, W)
+        v0 = torch.zeros_like(U)
+        n0 = torch.zeros_like(U)
+
+        # u0 = e₁ everywhere:
+        u0[0, ...] = 1.0   
+        # v0 = e₂ everywhere:
+        v0[1, ...] = 1.0   
+        # n0 = e₃ everywhere:
+        n0[2, ...] = 1.0   
+        
         # 2) rotate initial frame
         u = rotate_by_quaternion(q.permute(1,2,3,0),    # → (D,H,W,4)
                                  u0.permute(1,2,3,0) )  # → (D,H,W,3)
         v = rotate_by_quaternion(q.permute(1,2,3,0),
                                  v0.permute(1,2,3,0))
+        n = rotate_by_quaternion(q.permute(1,2,3,0),
+                                 n0.permute(1,2,3,0))
+        
         # put back to (3,D,H,W)
         u = u.permute(3,0,1,2)
         v = v.permute(3,0,1,2)
+        n = n.permute(3,0,1,2)
 
         # 3) data fidelity
-        data = - (u*U).sum() - (v*V).sum()
+        data = - (u*U).sum() - (v*V).sum() - (n*N).sum()
 
-        data *= 10**(-3) # TODO: insert another weight here
+        data *= 10**(-3) # TODO: insert another weight here or find a good normalization strategy
         # 4) smoothness on rotated fields
         grad_u = gradient(u)
         grad_v = gradient(v)
-        smooth = self.mu1 * (grad_u.pow(2).sum() + grad_v.pow(2).sum())
+        grad_n = gradient(n)
+        smooth = self.mu1 * (grad_u.pow(2).sum() + grad_v.pow(2).sum() + grad_n.pow(2).sum())
 
         # 5) divergence penalty
-        div_pen = self.mu4 * (divergence(u).pow(2).sum() + divergence(v).pow(2).sum())
+        div_pen = self.mu4 * (divergence(u).pow(2).sum() + divergence(v).pow(2).sum() + divergence(n).pow(2).sum())
 
         return data + smooth + div_pen
 
-    def __call__(self, u0, v0, U, V, n) -> torch.Tensor:
+    def __call__(self, U, V, N) -> torch.Tensor:
         # initialize raw quaternion to identity at every voxel
         # q_raw[0]=1, q_raw[1:]=0 → identity rotation
         q_raw = torch.zeros((4,)+U.shape[1:], device=self.device, dtype=U.dtype)
@@ -71,7 +88,7 @@ class PatchOptimizer:
 
         for _ in pbar:
             optimizer.zero_grad()
-            loss = self._step(q_raw, u0, v0, U, V, n)
+            loss = self._step(q_raw, U, V, N)
             loss.backward()
             #torch.nn.utils.clip_grad_norm_([q_raw], 1.0) # TODO: put an intelligent value
             optimizer.step()
