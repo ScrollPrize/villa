@@ -10,6 +10,7 @@ from tqdm import tqdm
 import argparse
 from pathlib import Path
 import cv2
+import re
 
 # Disable implicit parallelism that could cause concurrency issues
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -24,16 +25,22 @@ np.seterr(all='raise')  # Make numpy raise exceptions on errors instead of warni
 Image.MAX_IMAGE_PIXELS = None
 
 class MeshStitcher:
-    def __init__(self, original_mesh_path, renders_folder):
+    def __init__(self, original_mesh_path, renders_folder, prediction_folder=None, rotation=None, layer=None):
         """
         Initialize the mesh stitcher.
         
         Args:
             original_mesh_path: Path to the original mesh file
             renders_folder: Path to folder containing split renders
+            prediction_folder: Path to folder containing prediction images with specific naming pattern
+            rotation: Optional rotation filter for prediction images (e.g., 0, 90, 180, 270). If None, matches any rotation.
+            layer: Optional layer filter for prediction images (e.g., 0, 1, 2). If None, matches any layer.
         """
         self.original_mesh_path = original_mesh_path
         self.renders_folder = renders_folder
+        self.prediction_folder = prediction_folder
+        self.rotation = rotation
+        self.layer = layer
         
         # Find the working folder with split meshes
         mesh_dir = os.path.dirname(original_mesh_path)
@@ -69,7 +76,7 @@ class MeshStitcher:
         print(f"Loaded mesh with {len(self.vertices_flattened)} vertices and {len(self.triangles)} triangles")
         print(f"Split info contains {len(self.split_info['windows'])} windows")
 
-    def find_render_for_window(self, window_info, image_filename=None):
+    def find_render_for_window(self, window_info, image_filename=None, window_index=None):
         """
         Find the render file corresponding to a window.
         
@@ -77,6 +84,7 @@ class MeshStitcher:
             window_info: Window information from split_info
             image_filename: Specific filename to look for (e.g., 'composite.jpg', 'prediction.png')
                           If None, will search for files matching the window mesh name
+            window_index: Index of the window in the split_info (used for prediction image mapping)
             
         Returns:
             Path to the render file or None if not found
@@ -85,6 +93,41 @@ class MeshStitcher:
         mesh_path = window_info['mesh_path']
         mesh_basename = os.path.basename(mesh_path)
         window_name = mesh_basename.replace('.obj', '')
+        
+        # Try prediction folder first if configured
+        if self.prediction_folder:
+            # Extract fragment_id from window_name (this is the segment name)
+            fragment_id = window_name
+            
+            # Build pattern based on optional parameters
+            if self.rotation is not None and self.layer is not None:
+                # Both rotation and layer specified
+                pattern = f"{fragment_id}_prediction_rotated_{self.rotation}_layer_{self.layer}.png"
+                prediction_path = os.path.join(self.prediction_folder, pattern)
+                if os.path.exists(prediction_path):
+                    print(f"Found prediction image: {prediction_path}")
+                    return prediction_path
+            elif self.rotation is not None:
+                # Only rotation specified, any layer
+                pattern = f"{fragment_id}_prediction_rotated_{self.rotation}_layer_*.png"
+                matches = glob.glob(os.path.join(self.prediction_folder, pattern))
+                if matches:
+                    print(f"Found prediction image: {matches[0]}")
+                    return matches[0]
+            elif self.layer is not None:
+                # Only layer specified, any rotation
+                pattern = f"{fragment_id}_prediction_rotated_*_layer_{self.layer}.png"
+                matches = glob.glob(os.path.join(self.prediction_folder, pattern))
+                if matches:
+                    print(f"Found prediction image: {matches[0]}")
+                    return matches[0]
+            else:
+                # Neither specified, match any rotation and layer
+                pattern = f"{fragment_id}_prediction_rotated_*_layer_*.png"
+                matches = glob.glob(os.path.join(self.prediction_folder, pattern))
+                if matches:
+                    print(f"Found prediction image: {matches[0]}")
+                    return matches[0]
         
         # If specific image filename is provided, look for it in the window folder or renders folder
         if image_filename:
@@ -212,9 +255,9 @@ class MeshStitcher:
         coverage_mask = np.zeros((height, width), dtype=bool)
         
         # Process each window
-        for window_info in tqdm(self.split_info['windows'], desc="Stitching windows"):
+        for window_index, window_info in enumerate(tqdm(self.split_info['windows'], desc="Stitching windows")):
             # Find corresponding render
-            render_path = self.find_render_for_window(window_info, image_filename)
+            render_path = self.find_render_for_window(window_info, image_filename, window_index)
             if render_path is None:
                 if image_filename:
                     print(f"Warning: No '{image_filename}' found for window {window_info['window_start']}-{window_info['window_end']}")
@@ -704,12 +747,30 @@ def main():
     parser.add_argument('--type', type=str, choices=['auto', 'split_mesh', 'finalize_mesh'], 
                        default='auto', help='Type of stitching to perform')
     parser.add_argument('--image_filename', type=str, help='Specific image filename to look for in each cut/window folder (e.g., composite.jpg, prediction.png)', default=None)
+    parser.add_argument('--prediction_folder', type=str, help='Path to folder containing prediction images with naming pattern {window_name}_prediction_rotated_{r}_layer_{i}.png', default=None)
+    parser.add_argument('--rotation', type=int, help='Optional rotation filter for prediction images (e.g., 0, 90, 180, 270). If not specified, matches any rotation.', default=None)
+    parser.add_argument('--layer', type=int, help='Optional layer filter for prediction images (e.g., 0, 1, 2). If not specified, matches any layer.', default=None)
     
     args = parser.parse_args()
     
     print(f"Stitching renders from {args.original_mesh}")
     if args.image_filename:
         print(f"Looking for specific image file: {args.image_filename}")
+    
+    # Validate prediction parameters
+    if args.prediction_folder:
+        if not os.path.exists(args.prediction_folder):
+            print(f"Error: Prediction folder does not exist: {args.prediction_folder}")
+            return
+        
+        print(f"Using prediction images from: {args.prediction_folder}")
+        print(f"Looking for pattern: {{window_name}}_prediction_rotated_{{r}}_layer_{{i}}.png")
+        if args.rotation is not None:
+            print(f"Filtering by rotation: {args.rotation}")
+        if args.layer is not None:
+            print(f"Filtering by layer: {args.layer}")
+        if args.rotation is None and args.layer is None:
+            print("No rotation/layer filters - will match any values")
     
     # Determine which type of stitching to use
     mesh_dir = os.path.dirname(args.original_mesh)
@@ -738,7 +799,7 @@ def main():
     # Create appropriate stitcher and process
     try:
         if stitch_type == 'split_mesh':
-            stitcher = MeshStitcher(args.original_mesh, mesh_dir)
+            stitcher = MeshStitcher(args.original_mesh, mesh_dir, args.prediction_folder, args.rotation, args.layer)
         else:  # finalize_mesh
             stitcher = FinalizeMeshStitcher(args.original_mesh)
         
@@ -754,6 +815,8 @@ def main():
         print("4. Named the rendered images to match the mesh files")
         if args.image_filename:
             print(f"5. Ensured '{args.image_filename}' exists in each cut/window folder")
+        if args.prediction_folder:
+            print(f"5. Ensured prediction images exist with pattern: {{window_name}}_prediction_rotated_{{r}}_layer_{{i}}.png")
 
 if __name__ == '__main__':
     main()
