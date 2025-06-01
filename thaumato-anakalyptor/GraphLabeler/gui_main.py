@@ -3767,6 +3767,18 @@ class PointCloudLabeler(QMainWindow):
         """Handle label updates from OME-Zarr view."""
         print(f"Received label updates for {len(node_updates)} nodes from OME-Zarr view ({view_type})")
         
+        # Debug: Check coordinate spaces
+        print(f"Debug: len(self.points)={len(self.points)}, len(self.labels)={len(self.labels)}")
+        if hasattr(self, 'solver'):
+            undeleted = self.solver.get_undeleted_indices()
+            print(f"Debug: len(undeleted)={len(undeleted)}")
+        
+        # Debug: Check node_updates indices range
+        if node_updates:
+            min_idx = min(node_updates.keys())
+            max_idx = max(node_updates.keys())
+            print(f"Debug: node_updates indices range: {min_idx} to {max_idx}")
+        
         # Track undo/redo
         self.undo_stack.append((self.labels.copy(), self.group.copy()))
         self.redo_stack = []
