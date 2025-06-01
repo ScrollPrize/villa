@@ -426,14 +426,20 @@ class MeshStitcher:
         return output_path
 
 class FinalizeMeshStitcher:
-    def __init__(self, original_mesh_path):
+    def __init__(self, original_mesh_path, prediction_folder=None, rotation=None, layer=None):
         """
         Initialize the finalize mesh stitcher for meshes cut by finalize_mesh.py.
         
         Args:
             original_mesh_path: Path to the original mesh file (already in working folder)
+            prediction_folder: Path to folder containing prediction images with specific naming pattern
+            rotation: Optional rotation filter for prediction images (e.g., 0, 90, 180, 270). If None, matches any rotation.
+            layer: Optional layer filter for prediction images (e.g., 0, 1, 2). If None, matches any layer.
         """
         self.original_mesh_path = original_mesh_path
+        self.prediction_folder = prediction_folder
+        self.rotation = rotation
+        self.layer = layer
         # The mesh is already in the working folder, so use its directory directly
         self.working_folder = os.path.dirname(original_mesh_path)
         
@@ -470,6 +476,41 @@ class FinalizeMeshStitcher:
         mesh_path = cut_info['mesh_path']
         mesh_basename = os.path.basename(mesh_path)
         cut_name = mesh_basename.replace('.obj', '')
+        
+        # Try prediction folder first if configured
+        if self.prediction_folder:
+            # Extract fragment_id from cut_name (this is the segment name)
+            fragment_id = cut_name
+            
+            # Build pattern based on optional parameters
+            if self.rotation is not None and self.layer is not None:
+                # Both rotation and layer specified
+                pattern = f"{fragment_id}_prediction_rotated_{self.rotation}_layer_{self.layer}.png"
+                prediction_path = os.path.join(self.prediction_folder, pattern)
+                if os.path.exists(prediction_path):
+                    print(f"Found prediction image: {prediction_path}")
+                    return prediction_path
+            elif self.rotation is not None:
+                # Only rotation specified, any layer
+                pattern = f"{fragment_id}_prediction_rotated_{self.rotation}_layer_*.png"
+                matches = glob.glob(os.path.join(self.prediction_folder, pattern))
+                if matches:
+                    print(f"Found prediction image: {matches[0]}")
+                    return matches[0]
+            elif self.layer is not None:
+                # Only layer specified, any rotation
+                pattern = f"{fragment_id}_prediction_rotated_*_layer_{self.layer}.png"
+                matches = glob.glob(os.path.join(self.prediction_folder, pattern))
+                if matches:
+                    print(f"Found prediction image: {matches[0]}")
+                    return matches[0]
+            else:
+                # Neither specified, match any rotation and layer
+                pattern = f"{fragment_id}_prediction_rotated_*_layer_*.png"
+                matches = glob.glob(os.path.join(self.prediction_folder, pattern))
+                if matches:
+                    print(f"Found prediction image: {matches[0]}")
+                    return matches[0]
         
         # If specific image filename is provided, look for it in the cut folder
         if image_filename:
@@ -803,7 +844,7 @@ def main():
         if stitch_type == 'split_mesh':
             stitcher = MeshStitcher(args.original_mesh, mesh_dir, args.prediction_folder, args.rotation, args.layer)
         else:  # finalize_mesh
-            stitcher = FinalizeMeshStitcher(args.original_mesh)
+            stitcher = FinalizeMeshStitcher(args.original_mesh, args.prediction_folder, args.rotation, args.layer)
         
         output_path = stitcher.stitch_renders(args.output, args.image_filename)
         print(f"Stitching complete! Output saved to: {output_path}")
