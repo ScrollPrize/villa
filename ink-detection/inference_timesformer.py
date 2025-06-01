@@ -9,7 +9,7 @@ class InferenceArgumentParser(Tap):
     model_path:str= 'outputs/vesuvius/pretraining_all/vesuvius-models/valid_20230827161847_0_fr_i3depoch=7.ckpt'
     out_path:str=""
     stride: int = 32
-    start_idx:int=15
+    start_idx:int=17
     workers: int = 4
     batch_size: int = 64
     size:int=64
@@ -263,7 +263,13 @@ import gc
 
 if __name__ == "__main__":
     # Loading the model
-    model = RegressionPLModel.load_from_checkpoint(args.model_path, strict=False)
+    try:
+        model = RegressionPLModel.load_from_checkpoint(args.model_path, strict=False)
+    except:
+        model = RegressionPLModel(pred_shape=(1,1))
+        w=torch.load(args.model_path,weights_only=False)
+        model.load_state_dict(w['state_dict'])
+    
     if args.model_compile:
         model=torch.compile(model)
     if args.gpus > 1:
@@ -287,7 +293,7 @@ if __name__ == "__main__":
             preds=[]
             try:
                 for r in [0]:
-                    for i in [17]:
+                    for i in [args.start_idx]:
                         start_f=i
                         end_f=start_f+CFG.in_chans
                         img_split = get_img_splits(fragment_id,start_f,end_f,r)

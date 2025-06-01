@@ -1,0 +1,25 @@
+tr_setup:
+  model_name: MultiTask_Fiber_Segmentation
+
+tr_config:
+  patch_size: [192, 192, 192]
+  max_steps_per_epoch: 5000
+  batch_size: 2
+
+dataset_config:
+  binarize_labels: true
+  target_value:
+    hz: 1  # Binary task
+    vt: 1  # Binary task
+  min_labeled_ratio: 0
+  min_bbox_percent: 0
+  skip_patch_validation: true
+  targets:
+    hz:
+      activation: "none"
+      weight: 1
+      loss_fn: "CEDiceLoss"
+    vt:
+      activation: "none"
+      weight: 1
+      loss_fn: "CEDiceLoss"

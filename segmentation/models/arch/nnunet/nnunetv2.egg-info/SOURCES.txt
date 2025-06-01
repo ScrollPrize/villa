@@ -156,6 +156,8 @@ nnunetv2/training/loss/hausdorff.py
 nnunetv2/training/loss/robust_ce_loss.py
 nnunetv2/training/loss/ti_loss.py
 nnunetv2/training/lr_scheduler/__init__.py
+nnunetv2/training/lr_scheduler/exponential_warmup.py
+nnunetv2/training/lr_scheduler/linear_warmup.py
 nnunetv2/training/lr_scheduler/polylr.py
 nnunetv2/training/lr_scheduler/samedlr.py
 nnunetv2/training/nnUNetTrainer/__init__.py

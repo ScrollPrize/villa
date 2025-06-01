@@ -3,6 +3,8 @@ title: "Winners"
 hide_table_of_contents: true
 ---
 
+import PrizeCard from '@site/src/components/PrizeCard';
+
 <head>
   <html data-theme="dark" />
 
@@ -36,11 +38,59 @@ hide_table_of_contents: true
   />
 </head>
 
-Vesuvius Challenge has awarded **\$1,499,500** in prizes!
+Vesuvius Challenge has awarded **\$1,570,000** in prizes!
 
 This page lists all the prizes awarded so far:
 
-### $60,000 First Automated Segmentation
+### \$60,000 First Title Prize (May, 2025)
+
+**Goal:** Discover the end title of a sealed Herculaneum scroll.<br/>
+**Announcement:** <a href="https://scrollprize.substack.com/p/60000-first-title-prize-awarded">Blog post</a>
+
+<div className="flex flex-row flex-wrap">
+  <PrizeCard
+    href="https://github.com/mvrcii/vesuvius_first_title_prize"
+    prizeAmount="$60,000"
+    title="Winner"
+    description="Marcel Roth and Micha Nowak"
+    mediaSrc="/img/firsttitle/scroll5-title-boxes.webp"
+    wide
+  />
+</div>
+
+### \$10,500 Open Source (February, 2025)
+
+**Goal:** Get us closer to reading entire scrolls.<br/>
+**Announcement:** <a href="https://scrollprize.substack.com/p/february-progress-prizes-and-updates">Blog post</a>
+
+<div className="flex flex-row flex-wrap">
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://github.com/jrudolph/vesuvius-gui">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$2,500</div><span className="font-bold">vesuvius-gui developments</span>: Johannes Rudolph / @jrudolph</div>
+    <img src="/img/progress/202502/gui.webp"/>
+  </a>
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://dl.ash2txt.org/community-uploads/waldkauz/fasp/v4/layers_hr/">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$2,500</div><span className="font-bold">Improved FASP segmentation</span>: Hendrik Schilling / @waldkauz</div>
+    <img src="/img/progress/202502/seg.webp"/>
+  </a>
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://discord.com/channels/1079907749569237093/1286341523570688121/1343521735105843242">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$2,500</div><span className="font-bold">VC3D improvements</span>: Hendrik Schilling / @waldkauz</div>
+    <img src="/img/progress/202502/patches.webp"/>
+  </a>
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://discord.com/channels/1079907749569237093/1079907750265499772/1345262156060561469">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$1,000</div><span className="font-bold">Masked scroll Zarrs</span>: Forrest McDonald / @verditelabs</div>
+    <img src="/img/progress/202502/wanax.webp"/>
+  </a>
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://github.com/WillStevens/scrollreading/blob/main/report5.pdf">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$1,000</div><span className="font-bold">Particle-based flattening</span>: William Stevens / @Will Stevens</div>
+    <img src="/img/progress/202502/particles.webp"/>
+  </a>
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://discord.com/channels/1079907749569237093/1315006782191570975/1325148105858879488">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$1,000</div><span className="font-bold">Ink detection refinements</span>: Hendrik Schilling / @waldkauz</div>
+    <img src="/img/progress/202502/ink_samples_dist.webp"/>
+  </a>
+</div>
+
+### \$60,000 First Automated Segmentation
 
 **Goal:** Reproduce the 2023 Grand Prize segmentation result, but faster.<br/>
 **Announcement:** <a href="https://scrollprize.substack.com/p/awarding-the-amazing-autosegmentation">Blog post</a>

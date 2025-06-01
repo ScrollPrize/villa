@@ -192,6 +192,7 @@ const config = {
         },
       };
     },
+    './plugins/fetch-substack-posts',
     [
       "@docusaurus/plugin-client-redirects",
       {

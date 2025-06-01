@@ -14,7 +14,7 @@ from data.volume import Volume
 # Import utility functions directly from vesuvius package
 from utils import list_files, is_aws_ec2_instance
 # Import get_max_value from data.utils to avoid import errors
-from data.utils import get_max_value
+from data.utils import get_max_value, open_zarr
 
 
 class VCDataset(Dataset):
@@ -35,8 +35,6 @@ class VCDataset(Dataset):
             energy: Optional[int] = None,
             resolution: Optional[float] = None,
             segment_id: Optional[int] = None,
-            cache: bool = True,
-            cache_pool: int = 1e10, # Default cache pool size for Volume
             normalization_scheme: str = 'instance_zscore', # Default to instance z-score
             global_mean: Optional[float] = None,
             global_std: Optional[float] = None,
@@ -67,8 +65,6 @@ class VCDataset(Dataset):
             energy: Energy value for Volume.
             resolution: Resolution value for Volume.
             segment_id: Segment ID for Volume (if input_path isn't a specific scroll/segment).
-            cache: Enable Volume's TensorStore caching.
-            cache_pool: Cache size for Volume's TensorStore.
             normalization_scheme: Normalization method for Volume ('none', 'instance_zscore',
                                   'global_zscore', 'instance_minmax').
             global_mean: Global mean for 'global_zscore' scheme.
@@ -133,9 +129,9 @@ class VCDataset(Dataset):
                  use_path = input_path
                  if self.verbose: print(f"Interpreting input_path '{input_path}' as a path for Volume type 'zarr'.")
                  # Automatically set domain to local for file paths unless overridden
-                 if domain is None and not use_path.startswith(('http://', 'https://')):
+                 if domain is None and not use_path.startswith(('http://', 'https://', 's3://')):
                      domain = "local"
-                     if self.verbose: print("Auto-setting domain to 'local' for non-HTTP path.")
+                     if self.verbose: print("Auto-setting domain to 'local' for non-HTTP/S3 path.")
 
         elif isinstance(input_path, int): # Handle integer scroll_id passed as input_path
              type_value = f"scroll{input_path}"
@@ -156,7 +152,6 @@ class VCDataset(Dataset):
                 print(f"  Energy: {energy}")
                 print(f"  Resolution: {resolution}")
                 print(f"  Domain: {domain}")
-                print(f"  Cache: {cache}, Pool (bytes): {cache_pool}")
                 print(f"  Normalization: {normalization_scheme}")
                 if normalization_scheme == 'global_zscore':
                      print(f"    Global Mean: {global_mean}, Global Std: {global_std}")
@@ -166,8 +161,8 @@ class VCDataset(Dataset):
                 print(f"  Targets: {targets}")
                 print("---------------------------\n")
 
-            # Validate Zarr path if provided
-            if type_value == "zarr" and use_path is not None and not use_path.startswith(('http://', 'https://')):
+            # Validate Zarr path if provided - skip validation for remote paths
+            if type_value == "zarr" and use_path is not None and not use_path.startswith(('http://', 'https://', 's3://')):
                 p = Path(use_path)
                 if not p.is_absolute():
                      abs_p = p.resolve()
@@ -177,13 +172,13 @@ class VCDataset(Dataset):
                 if not os.path.exists(use_path):
                     raise FileNotFoundError(f"Zarr path does not exist: {use_path}")
                 if not os.path.isdir(use_path):
-                     # Allow if it's a zip file potentially containing zarr? Tensorstore might handle this.
-                     # Let Volume handle errors, but warn if basic checks fail.
                      if not use_path.endswith('.zip'): # Basic check
                          print(f"  Warning: Zarr path '{use_path}' exists but is not a directory.")
                 # Check for key Zarr files (optional, Volume handles errors)
                 # if not os.path.exists(os.path.join(use_path, '.zarray')) and not os.path.exists(os.path.join(use_path, '.zgroup')):
                 #     print(f"  Warning: Path {use_path} might not be a Zarr store (missing .zarray/.zgroup).")
+            elif type_value == "zarr" and use_path is not None and use_path.startswith('s3://'):
+                if self.verbose: print(f"  Using S3 path: {use_path}")
 
             self.volume = Volume(
                 type=type_value,
@@ -191,8 +186,6 @@ class VCDataset(Dataset):
                 energy=energy,
                 resolution=resolution,
                 segment_id=segment_id,
-                cache=cache,
-                cache_pool=cache_pool,
                 # normalize=False, # Removed, use scheme
                 normalization_scheme=normalization_scheme,
                 global_mean=global_mean,
@@ -381,8 +374,9 @@ class VCDataset(Dataset):
                 
                 # Fast check for empty patch - skip if all zeros or all values are the same
                 # This avoids processing empty patches which won't contain any information
+                # Check if tensor is empty (all zeros or same value) - but don't skip entirely
+                is_empty = False
                 if self.skip_empty_patches and extracted_tensor.numel() > 0:
-                    # Check if tensor is empty (all zeros or same value)
                     # We use a fast min/max comparison rather than var() which is more expensive
                     min_val = extracted_tensor.min().item()
                     max_val = extracted_tensor.max().item()
@@ -390,8 +384,8 @@ class VCDataset(Dataset):
                         # All values are the same - this is likely empty space
                         self.empty_patches_skipped += 1
                         if self.verbose and self.empty_patches_skipped % 100 == 0:
-                            print(f"Skipped {self.empty_patches_skipped} empty patches so far")
-                        return None
+                            print(f"Detected {self.empty_patches_skipped} empty patches so far")
+                        is_empty = True
                 
                 # We need to add channel dim and pad
                 fetched_z, fetched_y, fetched_x = extracted_tensor.shape
@@ -421,7 +415,8 @@ class VCDataset(Dataset):
                 # Take exactly what the model expects
                 extracted_tensor = self.volume[:self.num_input_channels, z_slice, y_slice, x_slice]
                 
-                # Fast check for empty patch - skip if all zeros or all values are the same
+                # Check for empty patch - flag if all values are the same
+                is_empty = False
                 if self.skip_empty_patches and extracted_tensor.numel() > 0:
                     # Check if tensor is empty (all same value) across all channels
                     is_empty = True
@@ -442,8 +437,7 @@ class VCDataset(Dataset):
                         # All checked channels have constant values - likely empty space
                         self.empty_patches_skipped += 1
                         if self.verbose and self.empty_patches_skipped % 100 == 0:
-                            print(f"Skipped {self.empty_patches_skipped} empty patches so far")
-                        return None
+                            print(f"Detected {self.empty_patches_skipped} empty patches so far")
                 
                 # Get dimensions for padding
                 fetched_c, fetched_z, fetched_y, fetched_x = extracted_tensor.shape
@@ -475,35 +469,24 @@ class VCDataset(Dataset):
         return {
             "data": patch_tensor, # Key required by nnUNet inference
             "pos": position_tuple, # Pass position for potential stitching later
-            "index": idx # Pass original index
+            "index": idx, # Pass original index
+            "is_empty": is_empty # Flag to indicate if patch is empty (to skip model inference)
         }
     
     @staticmethod
     def collate_fn(batch):
         """
-        Custom collate function that filters out None values (empty patches)
-        and collates the remaining items properly.
+        Custom collate function that processes empty patches without filtering them.
         """
-        # Filter out None values
-        batch = [item for item in batch if item is not None]
-        
-        # If all items were None, return a special empty batch marker
-        if len(batch) == 0:
-            return {
-                "empty_batch": True,
-                "data": None,  # No data to process
-                "pos": [],
-                "index": []
-            }
-            
-        # Extract items by key
+        # Extract items by key (including the is_empty flag)
         data = torch.stack([item["data"] for item in batch])
         pos = [item["pos"] for item in batch]
         indices = [item["index"] for item in batch]
+        is_empty = [item.get("is_empty", False) for item in batch]
         
         return {
-            "empty_batch": False,
             "data": data,
             "pos": pos,
-            "index": indices
+            "index": indices,
+            "is_empty": is_empty
         }

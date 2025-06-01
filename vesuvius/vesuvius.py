@@ -12,7 +12,7 @@ import yaml
 from setup.accept_terms import get_installation_path
 
 # Import specific classes for direct access
-from data.volume import Volume, Cube
+from data.volume import Volume
 from data.vc_dataset import VCDataset
 
 # Define important utility functions directly in the module to avoid import issues
@@ -54,5 +54,5 @@ def is_aws_ec2_instance():
     return False
 
 # Define what to expose
-__all__ = ['data', 'models', 'utils', 'setup', 'Volume', 'Cube', 'VCDataset', 
+__all__ = ['data', 'models', 'utils', 'setup', 'Volume', 'VCDataset', 
            'list_files', 'list_cubes', 'is_aws_ec2_instance']
