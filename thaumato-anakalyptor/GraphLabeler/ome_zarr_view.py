@@ -1448,28 +1448,43 @@ class OmeZarrViewWindow(QMainWindow):
         print(f"XZ labels: {len(self.point_labels_xz)} points labeled")
         
         # Get the mappings for space conversions
-        # close_mask maps undeleted space (2,366,332) to close space (filtered)
+        # close_mask maps undeleted space to close space (filtered)
         close_mask_xy = self.persistent_overlay_worker.close_mask
         close_mask_xz = self.persistent_overlay_worker.close_mask_xz
         
-        if close_mask_xy is None or close_mask_xz is None:
-            QMessageBox.warning(self, "Error", "No close masks available - try updating the view first")
-            return
-            
-        # Get indices of close nodes in undeleted space
-        close_indices_xy = np.where(close_mask_xy)[0]  # Maps close space → undeleted space
-        close_indices_xz = np.where(close_mask_xz)[0]  # Maps close space → undeleted space
+        # Check which views are available
+        xy_available = (close_mask_xy is not None and 
+                       hasattr(self.persistent_overlay_worker, 'overlay_point_nodes_indices') and 
+                       self.persistent_overlay_worker.overlay_point_nodes_indices is not None and
+                       len(self.point_labels_xy) > 0)
+                       
+        xz_available = (close_mask_xz is not None and 
+                       hasattr(self.persistent_overlay_worker, 'overlay_point_nodes_indices_xz') and 
+                       self.persistent_overlay_worker.overlay_point_nodes_indices_xz is not None and
+                       len(self.point_labels_xz) > 0)
         
-        print(f"DEBUG: close_indices_xy length: {len(close_indices_xy)} (from {len(close_mask_xy)} undeleted nodes)")
-        print(f"DEBUG: close_indices_xz length: {len(close_indices_xz)} (from {len(close_mask_xz)} undeleted nodes)")
+        if not xy_available and not xz_available:
+            QMessageBox.warning(self, "Error", 
+                               "No views with labeled points available.\n"
+                               "Please:\n"
+                               "1. Open and interact with at least one view (XY or XZ)\n"
+                               "2. Label some points in that view\n"
+                               "3. Try again")
+            return
+        
+        print(f"DEBUG: XY view available: {xy_available}, XZ view available: {xz_available}")
         
         # Process XY and XZ views separately
         xy_node_labels = {}
         xz_node_labels = {}
         
-        # Process XY labels
-        if hasattr(self.persistent_overlay_worker, 'overlay_point_nodes_indices') and self.persistent_overlay_worker.overlay_point_nodes_indices is not None:
-            print(f"\nDEBUG XY: overlay_point_nodes_indices length: {len(self.persistent_overlay_worker.overlay_point_nodes_indices)}")
+        # Process XY labels if available
+        if xy_available:
+            # Get indices of close nodes in undeleted space
+            close_indices_xy = np.where(close_mask_xy)[0]  # Maps close space → undeleted space
+            print(f"DEBUG XY: close_indices_xy length: {len(close_indices_xy)} (from {len(close_mask_xy)} undeleted nodes)")
+            
+            print(f"DEBUG XY: overlay_point_nodes_indices length: {len(self.persistent_overlay_worker.overlay_point_nodes_indices)}")
             
             # Check if we have inverse_indices for XY
             if hasattr(self.persistent_overlay_worker, 'inverse_indices') and self.persistent_overlay_worker.inverse_indices is not None:
@@ -1555,11 +1570,15 @@ class OmeZarrViewWindow(QMainWindow):
                 print(f"DEBUG XY: ... and {len(xy_labels_by_close_node) - 10} more nodes")
             print(f"DEBUG XY: Total nodes with accepted labels: {len(xy_node_labels)}")
         else:
-            print("WARNING: No overlay_point_nodes_indices for XY view")
+            print("DEBUG: Skipping XY processing - view not available or no labels")
                         
-        # Process XZ labels (similar to XY)
-        if hasattr(self.persistent_overlay_worker, 'overlay_point_nodes_indices_xz') and self.persistent_overlay_worker.overlay_point_nodes_indices_xz is not None:
-            print(f"\nDEBUG XZ: overlay_point_nodes_indices_xz length: {len(self.persistent_overlay_worker.overlay_point_nodes_indices_xz)}")
+        # Process XZ labels if available (similar to XY)
+        if xz_available:
+            # Get indices of close nodes in undeleted space
+            close_indices_xz = np.where(close_mask_xz)[0]  # Maps close space → undeleted space
+            print(f"DEBUG XZ: close_indices_xz length: {len(close_indices_xz)} (from {len(close_mask_xz)} undeleted nodes)")
+            
+            print(f"DEBUG XZ: overlay_point_nodes_indices_xz length: {len(self.persistent_overlay_worker.overlay_point_nodes_indices_xz)}")
             
             # Check if we have inverse_indices for XZ
             if hasattr(self.persistent_overlay_worker, 'inverse_indices_xz') and self.persistent_overlay_worker.inverse_indices_xz is not None:
@@ -1620,6 +1639,10 @@ class OmeZarrViewWindow(QMainWindow):
                             undeleted_idx = close_indices_xz[close_node_idx]  # close space → undeleted space
                             full_space_idx = self.undeleted_nodes_indices[undeleted_idx]  # undeleted space → full space
                             xz_node_labels[full_space_idx] = (label, percentage, count)
+            
+            print(f"DEBUG XZ: Total nodes with accepted labels: {len(xz_node_labels)}")
+        else:
+            print("DEBUG: Skipping XZ processing - view not available or no labels")
         
         # Combine results with disambiguation
         node_updates_xy = {}  # Track XY-specific updates (in full space)
@@ -1673,11 +1696,25 @@ class OmeZarrViewWindow(QMainWindow):
             xy_count = len(node_updates_xy)
             xz_count = len(node_updates_xz)
             
-            msg = f"Updated {total_updates} nodes:\n"
-            msg += f"- {xy_count} from XY view\n"
-            msg += f"- {xz_count} from XZ view"
+            available_views = []
+            if xy_available:
+                available_views.append(f"{xy_count} from XY view")
+            if xz_available:
+                available_views.append(f"{xz_count} from XZ view")
+            
+            msg = f"Updated {total_updates} nodes:\n- " + "\n- ".join(available_views)
             
             QMessageBox.information(self, "Labels Applied", msg)
         else:
-            QMessageBox.information(self, "No Updates", 
-                                    "No nodes met the criteria (≥3 points and ≥50% agreement)\nCheck console for debug information")
+            available_info = []
+            if xy_available:
+                available_info.append("XY view available")
+            if xz_available:
+                available_info.append("XZ view available")
+            
+            msg = "No nodes met the criteria (≥3 points and ≥50% agreement)\n"
+            if available_info:
+                msg += f"Views: {', '.join(available_info)}\n"
+            msg += "Check console for debug information"
+            
+            QMessageBox.information(self, "No Updates", msg)
