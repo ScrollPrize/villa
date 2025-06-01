@@ -3819,7 +3819,7 @@ class PointCloudLabeler(QMainWindow):
         print(f"Updated {updated_count} nodes total, affecting {total_affected_nodes} nodes with radius expansion")
         
         # Update the display
-        self.update_scatter_colors()
+        self.update_views()
         
         # Reset selection if we modified selected nodes
         if hasattr(self, 'selected_node_idx') and self.selected_node_idx is not None:
