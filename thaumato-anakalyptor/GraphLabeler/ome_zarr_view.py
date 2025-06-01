@@ -461,7 +461,7 @@ class OmeZarrViewWindow(QMainWindow):
     overlay_request_xz = pyqtSignal(float, str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int)
     label_request = pyqtSignal(np.ndarray, np.ndarray)
     # Signal to update labels in gui_main
-    labels_updated_signal = pyqtSignal(dict)
+    labels_updated_signal = pyqtSignal(dict, str)  # (node_updates, view_type)
 
     def __init__(self, graph_labels, solver, experiment_path, ome_zarr_path,
                  graph_pkl_path, h5_path, umbilicus_path, parent=None):
@@ -1595,7 +1595,8 @@ class OmeZarrViewWindow(QMainWindow):
                         xz_node_labels[node_idx] = (label, percentage, count)
         
         # Combine results with disambiguation
-        node_updates = {}
+        node_updates_xy = {}  # Track XY-specific updates
+        node_updates_xz = {}  # Track XZ-specific updates
         all_nodes = set(xy_node_labels.keys()) | set(xz_node_labels.keys())
         
         for node_idx in all_nodes:
@@ -1608,42 +1609,46 @@ class OmeZarrViewWindow(QMainWindow):
                 xz_label, xz_pct, xz_count = xz_data
                 
                 if xy_label == xz_label:
-                    # Same label in both views
-                    node_updates[node_idx] = xy_label
+                    # Same label in both views - assign to XY view by default
+                    node_updates_xy[node_idx] = xy_label
                 else:
                     # Different labels - choose the one with higher percentage
                     if xy_pct > xz_pct:
-                        node_updates[node_idx] = xy_label
+                        node_updates_xy[node_idx] = xy_label
                         print(f"Node {node_idx}: XY label {xy_label} ({xy_pct:.1%}) wins over XZ label {xz_label} ({xz_pct:.1%})")
                     elif xz_pct > xy_pct:
-                        node_updates[node_idx] = xz_label
+                        node_updates_xz[node_idx] = xz_label
                         print(f"Node {node_idx}: XZ label {xz_label} ({xz_pct:.1%}) wins over XY label {xy_label} ({xy_pct:.1%})")
                     else:
                         # Same percentage - use the one with more points
                         if xy_count >= xz_count:
-                            node_updates[node_idx] = xy_label
+                            node_updates_xy[node_idx] = xy_label
                         else:
-                            node_updates[node_idx] = xz_label
+                            node_updates_xz[node_idx] = xz_label
             elif xy_data:
                 # Only XY has valid label
-                node_updates[node_idx] = xy_data[0]
+                node_updates_xy[node_idx] = xy_data[0]
             elif xz_data:
                 # Only XZ has valid label
-                node_updates[node_idx] = xz_data[0]
+                node_updates_xz[node_idx] = xz_data[0]
                 
-        if node_updates:
-            # Emit signal to update gui_main
-            self.labels_updated_signal.emit(node_updates)
+        total_updates = len(node_updates_xy) + len(node_updates_xz)
+        if total_updates > 0:
+            # Emit separate signals for XY and XZ updates
+            if node_updates_xy:
+                self.labels_updated_signal.emit(node_updates_xy, "XY")
+                print(f"Emitted {len(node_updates_xy)} XY view updates")
+            if node_updates_xz:
+                self.labels_updated_signal.emit(node_updates_xz, "XZ")
+                print(f"Emitted {len(node_updates_xz)} XZ view updates")
             
             # Create detailed message
-            xy_only = sum(1 for n in node_updates if n in xy_node_labels and n not in xz_node_labels)
-            xz_only = sum(1 for n in node_updates if n in xz_node_labels and n not in xy_node_labels)
-            both = sum(1 for n in node_updates if n in xy_node_labels and n in xz_node_labels)
+            xy_count = len(node_updates_xy)
+            xz_count = len(node_updates_xz)
             
-            msg = f"Updated {len(node_updates)} nodes:\n"
-            msg += f"- {xy_only} from XY view only\n"
-            msg += f"- {xz_only} from XZ view only\n"
-            msg += f"- {both} from both views"
+            msg = f"Updated {total_updates} nodes:\n"
+            msg += f"- {xy_count} from XY view\n"
+            msg += f"- {xz_count} from XZ view"
             
             QMessageBox.information(self, "Labels Applied", msg)
         else:
