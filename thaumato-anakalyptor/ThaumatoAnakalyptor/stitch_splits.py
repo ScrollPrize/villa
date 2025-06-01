@@ -485,6 +485,7 @@ class FinalizeMeshStitcher:
         
         for ext in possible_extensions:
             pattern = os.path.join(cut_folder, f"{cut_name}.{ext[2:]}")
+            print(f"Pattern: {pattern}")
             matches = glob.glob(pattern)
             if matches:
                 return matches[0]
