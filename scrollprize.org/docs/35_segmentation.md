@@ -74,19 +74,11 @@ Ensure your installation is complete by entering. If you get the 'hello world' o
 sudo docker run hello-world
 ```
 
-**Clone the VC3D Repository**
+**Pull the container image**
 
+While it is possible to build this from source, we recommend just pulling the container image from our [volume-cartographer repository](https://github.com/ScrollPrize/volume-cartographer) by entering the following command:
 ```bash
-git clone https://github.com/hendrikschilling/volume-cartographer.git
-```
-
-**Install the image**
-
-Move into the directory you have cloned the repo into, and then install the image. The -f flag denotes the version you wish to use (from the available dockerfiles) and the -t flag is the name you wish to give the image.
-
-```bash
-cd volume-cartographer-dev-next
-sudo docker build -f ubuntu-24.04-noble.Dockerfile -t vc3d .
+sudo docker pull ghcr.io/scrollprize/volume-cartographer:edge
 ```
 
 **Launch VC3D**
@@ -95,7 +87,13 @@ To launch the docker image, simply type
 
 ```bash
 xhost +local:docker
-sudo docker run -it -v /path/to/scroll/data:/path/to/scroll/data vc3d
+sudo docker run -it --rm \
+  -v "/path/to/data/:/path/to/data/" \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -e DISPLAY=$DISPLAY \
+  -e QT_QPA_PLATFORM=xcb \
+  -e QT_X11_NO_MITSHM=1 \
+ghcr.io/scrollprize/volume-cartographer:edge
 ```
 The -v flag is used to mount a folder to the docker image, allowing you to use files that exist on your local filesystem. It will be mounted under the path following the ':'. You can place as many folders here as you would like.
 
@@ -105,9 +103,9 @@ If you map the docker path exactly the same as it exists on your local system, y
 
 You'll now have a terminal open in the running Docker container. To open the GUI type 
 ```bash
-bin/VC3D
+OMP_NUM_THREADS=8 OMP_WAIT_POLICY=PASSIVE OMP_NESTED=FALSE nice ionice VC3D
 ```
-
+Note that while the OMP environment variables and `nice ionice` are not necessary, for now these will make VC3D more responsive when working with very large amounts of patches.
 ___
 
 ### Preparing Data

@@ -16,6 +16,8 @@
 from typing import Tuple, Union, List
 import numpy as np
 from nnunetv2.imageio.base_reader_writer import BaseReaderWriter
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = None
 from skimage import io
 
 

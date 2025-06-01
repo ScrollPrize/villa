@@ -1,0 +1,32 @@
+# Minimal configuration for 2-class segmentation with labels 1 and 2
+# Uses defaults for all optional parameters
+
+tr_setup:
+  model_name: TwoClass_Segmentation  # required field
+
+tr_config:
+  patch_size: [128, 128, 128]  # 3D patch size for patch extraction [z, y, x]
+
+dataset_config:
+  binarize_labels: true
+  target_value:
+    fibers:
+      mapping:
+        0: 0  # background
+        1: 1  # horizontal fiber 
+        2: 2  # vertical fiber 
+  min_labeled_ratio: 0.1
+  min_bbox_percent: 0.5
+  targets:
+    fibers:
+      out_channels: 3
+      activation: "softmax"
+      weight: 1
+      loss_fn: "CrossEntropyLoss"
+
+inference_config:
+  targets:
+    - fibers:
+        channels: 3  # 3 channels for background (0), class 1, and class 2
+        activation: "softmax"
+        weight: 1

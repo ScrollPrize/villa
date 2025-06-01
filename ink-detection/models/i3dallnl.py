@@ -8,7 +8,7 @@ import numpy as np
 import os
 import sys
 from collections import OrderedDict
-from non_local_helper import NLBlockND
+from .non_local_helper import NLBlockND
 
 class MaxPool3dSamePadding(nn.MaxPool3d):
     

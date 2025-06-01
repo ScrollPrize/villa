@@ -1,0 +1,17 @@
+tr_setup:
+  model_name: SingleTask_Binary_Segmentation
+
+tr_config:
+  patch_size: [64, 64, 64]
+
+dataset_config:
+  binarize_labels: false
+  min_labeled_ratio: 0 
+  min_bbox_percent: 0 
+  skip_patch_validation: true
+  targets:
+    eigenvalues:
+      activation: "none"
+      weight: 1
+      out_channels: 3
+

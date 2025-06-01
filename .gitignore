@@ -19,3 +19,12 @@ node_modules/.yarn-integrity
 # WandB (allow general wandb but ignore this one)
 !**/wandb/**
 /segmentation/models/arch/nnunet/wandb/
+*.pth
+/segmentation/napari_trainer/checkpoints
+segmentation/napari_trainer/cline_rules.md
+segmentation/napari_trainer/test_1638_debug.png
+/vesuvius/vesuvius.egg-info
+/vesuvius/vesuvius.egg-info
+vesuvius/vesuvius.egg-info/PKG-INFO
+/vesuvius/vesuvius.egg-info
+/vesuvius/checkpoints

@@ -54,16 +54,24 @@ def compute_steps_for_sliding_window(image_size, patch_size, step_size_factor):
     Args:
         image_size: size of this dimension
         patch_size: patch size for this dimension
-        step_size_factor: step size as a fraction (0 < step_size_factor <= 1)
+        step_size_factor: step size as a fraction (0 <= step_size_factor <= 1)
+                         0 means no overlap (full stride)
 
     Returns:
         List of step positions for this dimension
     """
     assert image_size >= patch_size, "image size must be larger than patch_size"
-    assert 0 < step_size_factor <= 1, 'step_size must be larger than 0 and smaller or equal to 1'
+    assert 0 <= step_size_factor <= 1, 'step_size must be between 0 and 1 (inclusive)'
 
-    # Calculate step size in voxels - this is key
-    target_step_size = int(patch_size * step_size_factor)
+    # Handle special case: step_size_factor = 0 means no overlap (full stride)
+    if step_size_factor == 0:
+        target_step_size = patch_size
+    else:
+        # Calculate step size in voxels - this is key
+        target_step_size = int(patch_size * step_size_factor)
+    
+    # Ensure target_step_size is at least 1
+    target_step_size = max(1, target_step_size)
 
     # Calculate number of steps
     num_steps = int(np.ceil((image_size - patch_size) / target_step_size)) + 1
@@ -93,17 +101,25 @@ def compute_steps_for_sliding_window_tuple(image_size_tuple, patch_size_tuple, s
     Args:
         image_size_tuple: Tuple with sizes for each dimension (e.g., (Z, Y, X))
         patch_size_tuple: Tuple with patch sizes for each dimension
-        step_size_factor: Step size as a fraction (0 < step_size_factor <= 1)
+        step_size_factor: Step size as a fraction (0 <= step_size_factor <= 1)
+                         0 means no overlap (full stride)
 
     Returns:
         List of lists of step positions, one list per dimension
     """
     assert all(i >= j for i, j in zip(image_size_tuple, patch_size_tuple)), \
         "image size must be as large or larger than patch_size"
-    assert 0 < step_size_factor <= 1, 'step_size must be larger than 0 and smaller or equal to 1'
+    assert 0 <= step_size_factor <= 1, 'step_size must be between 0 and 1 (inclusive)'
 
-    # Target step sizes in voxels for all dimensions
-    target_step_sizes_in_voxels = [int(i * step_size_factor) for i in patch_size_tuple]
+    # Handle special case: step_size_factor = 0 means no overlap (full stride)
+    if step_size_factor == 0:
+        target_step_sizes_in_voxels = list(patch_size_tuple)
+    else:
+        # Target step sizes in voxels for all dimensions
+        target_step_sizes_in_voxels = [int(i * step_size_factor) for i in patch_size_tuple]
+    
+    # Ensure all target step sizes are at least 1
+    target_step_sizes_in_voxels = [max(1, step_size) for step_size in target_step_sizes_in_voxels]
 
     # Calculate number of steps for each dimension
     num_steps = [int(np.ceil((i - k) / j)) + 1 for i, j, k in
@@ -177,4 +193,29 @@ def find_free_network_port() -> int:
     port = s.getsockname()[1]
     s.close()
     return port
+
+def softmax_helper_dim0(x: torch.Tensor) -> torch.Tensor:
+    return torch.softmax(x, 0)
+
+
+def softmax_helper_dim1(x: torch.Tensor) -> torch.Tensor:
+    return torch.softmax(x, 1)
+
+
+def empty_cache(device: torch.device):
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    elif device.type == 'mps':
+        from torch import mps
+        mps.empty_cache()
+    else:
+        pass
+
+
+class dummy_context(object):
+    def __enter__(self):
+        pass
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
 
