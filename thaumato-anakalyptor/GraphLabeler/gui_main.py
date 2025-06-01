@@ -3763,23 +3763,78 @@ class PointCloudLabeler(QMainWindow):
         
         return os.path.join(autosave_dir, autosave_filename)
 
-    def on_ome_zarr_labels_updated(self, node_updates):
+    def on_ome_zarr_labels_updated(self, node_updates, view_type):
         """Handle label updates from OME-Zarr view."""
-        print(f"Received label updates for {len(node_updates)} nodes from OME-Zarr view")
+        print(f"Received label updates for {len(node_updates)} nodes from OME-Zarr view ({view_type})")
         
         # Track undo/redo
         self.undo_stack.append((self.labels.copy(), self.group.copy()))
         self.redo_stack = []
         
-        # Apply the label updates
+        # Get the drawing radius
+        radius = self.radius_spinbox.value()
+        
+        # Apply the label updates with radius expansion using view-specific logic
         updated_count = 0
+        total_affected_nodes = 0
+        
         for node_idx, new_label in node_updates.items():
-            if 0 <= node_idx < len(self.labels):
-                self.labels[node_idx] = new_label
-                updated_count += 1
-                print(f"Updated node {node_idx} to label {new_label}")
-            else:
+            if not (0 <= node_idx < len(self.labels)):
                 print(f"Warning: node index {node_idx} out of range")
+                continue
+                
+            # Get the position of the updated node
+            node_pos = self.points[node_idx]
+            
+            # Use view-specific logic based on which view the updates came from
+            if view_type == "XY":
+                # Use XY view logic similar to _apply_brush_path_to_labels
+                affected_indices = self._get_nearby_indices_xy_with_radius(node_pos, radius)
+            elif view_type == "XZ":
+                # Use XZ view logic similar to _apply_brush_path_to_labels_xz
+                affected_indices = self._get_nearby_indices_xz_with_radius(node_pos, radius)
+            else:
+                print(f"Warning: unknown view type {view_type}, using XY logic as fallback")
+                affected_indices = self._get_nearby_indices_xy_with_radius(node_pos, radius)
+            
+            # Apply the label to all affected nodes
+            if affected_indices:
+                # Handle wrap-around logic based on view type
+                for idx in affected_indices:
+                    if view_type == "XY":
+                        # Handle f_init wrap-around for XY view
+                        point_f_init = self.points[idx, 1]
+                        node_f_init = node_pos[1]
+                        
+                        # Calculate the effective label considering wrap-around
+                        effective_label = new_label
+                        if point_f_init > 180 and node_f_init < -90:
+                            # Point is in upper wrap, adjust label
+                            effective_label = new_label + 1
+                        elif point_f_init < -180 and node_f_init > 90:
+                            # Point is in lower wrap, adjust label
+                            effective_label = new_label - 1
+                        
+                        # Prevent accidental UNLABELED±1
+                        if effective_label in (self.UNLABELED + 1, self.UNLABELED - 1):
+                            effective_label = self.UNLABELED
+                    else:
+                        # For XZ view, no wrap-around adjustment needed
+                        effective_label = new_label
+                    
+                    self.labels[idx] = effective_label
+                    self.group[idx] = self.active_group
+                
+                total_affected_nodes += len(affected_indices)
+                updated_count += 1
+                print(f"Updated node {node_idx} to label {new_label} ({view_type} view), affecting {len(affected_indices)} nearby nodes within radius {radius}")
+            else:
+                # Just update the single node if no nearby nodes found
+                self.labels[node_idx] = new_label
+                self.group[node_idx] = self.active_group
+                updated_count += 1
+                total_affected_nodes += 1
+                print(f"Updated node {node_idx} to label {new_label} ({view_type} view) - no nearby nodes within radius")
         
         # Update the views to reflect the changes
         self.update_views()
@@ -3788,4 +3843,55 @@ class PointCloudLabeler(QMainWindow):
         if hasattr(self, 'ome_zarr_window') and self.ome_zarr_window is not None:
             self.ome_zarr_window.update_overlay_labels(self.labels, self.calculated_labels)
         
-        print(f"Applied {updated_count} label updates from OME-Zarr view")
+        print(f"Applied {updated_count} label updates from OME-Zarr view ({view_type}), affecting {total_affected_nodes} total nodes with radius {radius}")
+
+    def _get_nearby_indices_xy_with_radius(self, node_pos, radius):
+        """Get nearby node indices using the same XY logic as mouse drawing."""
+        # Use the exact same function that mouse drawing uses
+        x, y = node_pos[0], node_pos[1]  # f_star, f_init
+        indices = self.get_nearby_indices_xy(x, y, radius)
+        
+        # Apply the same Z filtering as mouse drawing
+        z_center = self.z_center_spinbox.value()
+        z_thickness = self.z_thickness_slider.value() / self.scaleFactor
+        z_min_val = z_center - z_thickness / 2
+        z_max_val = z_center + z_thickness / 2
+        
+        # Filter indices to only those in the Z slab
+        filtered_indices = [i for i in indices if z_min_val <= self.points[i, 2] <= z_max_val]
+        return filtered_indices
+
+    def _get_nearby_indices_xz_with_radius(self, node_pos, radius):
+        """Get nearby node indices using the same XZ logic as mouse drawing."""
+        # Use the exact same logic as _apply_brush_path_to_labels_xz
+        finit_center = self.finit_center_spinbox.value()
+        finit_thickness = self.finit_thickness_slider.value() / self.scaleFactor
+        finit_min_val = finit_center - finit_thickness / 2
+        finit_max_val = finit_center + finit_thickness / 2
+        
+        # Same slab filtering as mouse drawing
+        slab_mask = (self.points[:, 1] >= finit_min_val) & (self.points[:, 1] <= finit_max_val)
+        slab_indices = np.nonzero(slab_mask)[0]
+        if slab_indices.size == 0:
+            return []
+        
+        # Same shear and coordinate logic as mouse drawing
+        shear_factor = np.tan(np.radians(self.xz_shear_spinbox.value()))
+        if self.show_original_points:
+            pts = self.original_points[slab_indices]
+        else:
+            pts = self.points[slab_indices]
+        
+        x_disp = pts[:, 0] + shear_factor * (pts[:, 1] - finit_center)
+        z_disp = pts[:, 2]
+        coords = np.vstack([x_disp, z_disp]).T
+        
+        # Same temporary KD-tree logic as mouse drawing
+        from scipy.spatial import cKDTree
+        tree = cKDTree(coords)
+        
+        node_x_disp = node_pos[0] + shear_factor * (node_pos[1] - finit_center)
+        node_z_disp = node_pos[2]
+        
+        rel_idxs = tree.query_ball_point([node_x_disp, node_z_disp], r=radius)
+        return [slab_indices[j] for j in rel_idxs]
