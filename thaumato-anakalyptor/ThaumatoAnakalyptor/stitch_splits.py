@@ -241,12 +241,20 @@ class MeshStitcher:
         if output_path is None:
             mesh_dir = os.path.dirname(self.original_mesh_path)
             mesh_basename = os.path.splitext(os.path.basename(self.original_mesh_path))[0]
+            
+            # Use prediction folder basename if available
+            if self.prediction_folder:
+                prediction_basename = os.path.basename(self.prediction_folder)
+                base_name = f"{mesh_basename}_{prediction_basename}"
+            else:
+                base_name = mesh_basename
+            
             # Default to JPG extension first
             if image_filename:
                 image_base = os.path.splitext(os.path.basename(image_filename))[0]
-                output_path = os.path.join(mesh_dir, f"{mesh_basename}_{image_base}_stitched.jpg")
+                output_path = os.path.join(mesh_dir, f"{base_name}_{image_base}_stitched.jpg")
             else:
-                output_path = os.path.join(mesh_dir, f"{mesh_basename}_stitched.jpg")
+                output_path = os.path.join(mesh_dir, f"{base_name}_stitched.jpg")
         
         # Determine output image size based on UV bounds
         min_u = self.split_info['min_u']
@@ -614,12 +622,20 @@ class FinalizeMeshStitcher:
         if output_path is None:
             mesh_dir = os.path.dirname(self.original_mesh_path)
             mesh_basename = os.path.splitext(os.path.basename(self.original_mesh_path))[0]
+            
+            # Use prediction folder basename if available
+            if self.prediction_folder:
+                prediction_basename = os.path.basename(self.prediction_folder)
+                base_name = f"{mesh_basename}_{prediction_basename}"
+            else:
+                base_name = mesh_basename
+            
             # Default to JPG extension first
             if image_filename:
                 image_base = os.path.splitext(os.path.basename(image_filename))[0]
-                output_path = os.path.join(mesh_dir, f"{mesh_basename}_{image_base}_stitched.jpg")
+                output_path = os.path.join(mesh_dir, f"{base_name}_{image_base}_stitched.jpg")
             else:
-                output_path = os.path.join(mesh_dir, f"{mesh_basename}_stitched.jpg")
+                output_path = os.path.join(mesh_dir, f"{base_name}_stitched.jpg")
         
         # Get original texture size
         original_texture_size = self.cut_info['original_texture_size']
