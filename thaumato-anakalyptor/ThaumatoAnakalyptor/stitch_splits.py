@@ -258,7 +258,6 @@ class MeshStitcher:
         for window_index, window_info in enumerate(tqdm(self.split_info['windows'], desc="Stitching windows")):
             # Find corresponding render
             render_path = self.find_render_for_window(window_info, image_filename, window_index)
-            print(render_path)
             if render_path is None:
                 if image_filename:
                     print(f"Warning: No '{image_filename}' found for window {window_info['window_start']}-{window_info['window_end']}")
@@ -579,6 +578,7 @@ class FinalizeMeshStitcher:
         for cut_info in tqdm(self.cut_info['cuts'], desc="Stitching cuts", disable=False, leave=True, position=0):
             # Find corresponding render
             render_path = self.find_render_for_cut(cut_info, image_filename)
+            print(f"Render path: {render_path}")
             if render_path is None:
                 if image_filename:
                     print(f"Warning: No '{image_filename}' found for cut {cut_info['cut_index']}")
