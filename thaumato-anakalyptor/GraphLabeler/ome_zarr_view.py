@@ -1447,6 +1447,22 @@ class OmeZarrViewWindow(QMainWindow):
         print(f"XY labels: {len(self.point_labels_xy)} points labeled")
         print(f"XZ labels: {len(self.point_labels_xz)} points labeled")
         
+        # Get the mappings for space conversions
+        # close_mask maps undeleted space (2,366,332) to close space (filtered)
+        close_mask_xy = self.persistent_overlay_worker.close_mask
+        close_mask_xz = self.persistent_overlay_worker.close_mask_xz
+        
+        if close_mask_xy is None or close_mask_xz is None:
+            QMessageBox.warning(self, "Error", "No close masks available - try updating the view first")
+            return
+            
+        # Get indices of close nodes in undeleted space
+        close_indices_xy = np.where(close_mask_xy)[0]  # Maps close space → undeleted space
+        close_indices_xz = np.where(close_mask_xz)[0]  # Maps close space → undeleted space
+        
+        print(f"DEBUG: close_indices_xy length: {len(close_indices_xy)} (from {len(close_mask_xy)} undeleted nodes)")
+        print(f"DEBUG: close_indices_xz length: {len(close_indices_xz)} (from {len(close_mask_xz)} undeleted nodes)")
+        
         # Process XY and XZ views separately
         xy_node_labels = {}
         xz_node_labels = {}
@@ -1460,8 +1476,8 @@ class OmeZarrViewWindow(QMainWindow):
                 print(f"DEBUG XY: inverse_indices length: {len(self.persistent_overlay_worker.inverse_indices)}")
                 print(f"DEBUG XY: inverse_indices unique values: {len(np.unique(self.persistent_overlay_worker.inverse_indices))}")
                 
-                # Map displayed points to original points, then to nodes
-                xy_labels_by_node = {}
+                # Map displayed points to original points, then to nodes in close space
+                xy_labels_by_close_node = {}
                 debug_count = 0
                 for display_idx, label in self.point_labels_xy.items():
                     # Find all original points that map to this display point
@@ -1472,36 +1488,36 @@ class OmeZarrViewWindow(QMainWindow):
                     
                     for orig_idx in original_indices:
                         if orig_idx < len(self.persistent_overlay_worker.overlay_point_nodes_indices):
-                            node_idx = self.persistent_overlay_worker.overlay_point_nodes_indices[orig_idx]
-                            if node_idx not in xy_labels_by_node:
-                                xy_labels_by_node[node_idx] = []
-                            xy_labels_by_node[node_idx].append(label)
+                            close_node_idx = self.persistent_overlay_worker.overlay_point_nodes_indices[orig_idx]  # Index in close space
+                            if close_node_idx not in xy_labels_by_close_node:
+                                xy_labels_by_close_node[close_node_idx] = []
+                            xy_labels_by_close_node[close_node_idx].append(label)
                 
                 print(f"DEBUG XY: Total labeled display points: {len(self.point_labels_xy)}")
-                print(f"DEBUG XY: These expand to label assignments across {sum(len(labels) for labels in xy_labels_by_node.values())} original points")
+                print(f"DEBUG XY: These expand to label assignments across {sum(len(labels) for labels in xy_labels_by_close_node.values())} original points")
             else:
                 print("WARNING: No inverse_indices for XY view - using direct mapping")
                 # Fallback to direct mapping
-                xy_labels_by_node = {}
+                xy_labels_by_close_node = {}
                 for point_idx, label in self.point_labels_xy.items():
                     if point_idx < len(self.persistent_overlay_worker.overlay_point_nodes_indices):
-                        node_idx = self.persistent_overlay_worker.overlay_point_nodes_indices[point_idx]
-                        if node_idx not in xy_labels_by_node:
-                            xy_labels_by_node[node_idx] = []
-                        xy_labels_by_node[node_idx].append(label)
+                        close_node_idx = self.persistent_overlay_worker.overlay_point_nodes_indices[point_idx]
+                        if close_node_idx not in xy_labels_by_close_node:
+                            xy_labels_by_close_node[close_node_idx] = []
+                        xy_labels_by_close_node[close_node_idx].append(label)
             
-            print(f"DEBUG XY: Labels grouped into {len(xy_labels_by_node)} nodes")
+            print(f"DEBUG XY: Labels grouped into {len(xy_labels_by_close_node)} close nodes")
             
-            # Count total XY points per node
+            # Count total XY points per close node
             xy_total_points = {}
-            for node_idx in self.persistent_overlay_worker.overlay_point_nodes_indices:
-                xy_total_points[node_idx] = xy_total_points.get(node_idx, 0) + 1
+            for close_node_idx in self.persistent_overlay_worker.overlay_point_nodes_indices:
+                xy_total_points[close_node_idx] = xy_total_points.get(close_node_idx, 0) + 1
             
-            print(f"DEBUG XY: Total points counted for {len(xy_total_points)} nodes")
+            print(f"DEBUG XY: Total points counted for {len(xy_total_points)} close nodes")
             
-            # Apply voting for XY
+            # Apply voting for XY and convert to full space
             debug_node_count = 0
-            for node_idx, labels in xy_labels_by_node.items():
+            for close_node_idx, labels in xy_labels_by_close_node.items():
                 label_counts = {}
                 for label in labels:
                     label_counts[label] = label_counts.get(label, 0) + 1
@@ -1509,18 +1525,25 @@ class OmeZarrViewWindow(QMainWindow):
                 # Find most common label
                 max_label = max(label_counts.items(), key=lambda x: x[1])
                 label, count = max_label
-                total = xy_total_points.get(node_idx, 0)
+                total = xy_total_points.get(close_node_idx, 0)
                 
                 if debug_node_count < 10:  # Only show first 10 nodes
-                    print(f"DEBUG XY: Node {node_idx} - {count} labeled points out of {total} total ({count/total*100:.1f}% if total > 0)")
+                    print(f"DEBUG XY: Close node {close_node_idx} - {count} labeled points out of {total} total ({count/total*100:.1f}% if total > 0)")
                     debug_node_count += 1
                 
                 if count >= 3 and total > 0:
                     percentage = count / total
                     if percentage >= 0.5:
-                        xy_node_labels[node_idx] = (label, percentage, count)
-                        if debug_node_count <= 10:
-                            print(f"  -> ACCEPTED for XY view")
+                        # Map from close space to full space
+                        if close_node_idx < len(close_indices_xy):
+                            undeleted_idx = close_indices_xy[close_node_idx]  # close space → undeleted space
+                            full_space_idx = self.undeleted_nodes_indices[undeleted_idx]  # undeleted space → full space
+                            xy_node_labels[full_space_idx] = (label, percentage, count)
+                            if debug_node_count <= 10:
+                                print(f"  -> ACCEPTED for XY view: close {close_node_idx} → undeleted {undeleted_idx} → full {full_space_idx}")
+                        else:
+                            if debug_node_count <= 10:
+                                print(f"  -> ERROR: close_node_idx {close_node_idx} >= len(close_indices_xy) {len(close_indices_xy)}")
                     else:
                         if debug_node_count <= 10:
                             print(f"  -> REJECTED: percentage {percentage:.1%} < 50%")
@@ -1528,13 +1551,13 @@ class OmeZarrViewWindow(QMainWindow):
                     if debug_node_count <= 10:
                         print(f"  -> REJECTED: count {count} < 3 or total {total} = 0")
             
-            if len(xy_labels_by_node) > 10:
-                print(f"DEBUG XY: ... and {len(xy_labels_by_node) - 10} more nodes")
+            if len(xy_labels_by_close_node) > 10:
+                print(f"DEBUG XY: ... and {len(xy_labels_by_close_node) - 10} more nodes")
             print(f"DEBUG XY: Total nodes with accepted labels: {len(xy_node_labels)}")
         else:
             print("WARNING: No overlay_point_nodes_indices for XY view")
                         
-        # Process XZ labels
+        # Process XZ labels (similar to XY)
         if hasattr(self.persistent_overlay_worker, 'overlay_point_nodes_indices_xz') and self.persistent_overlay_worker.overlay_point_nodes_indices_xz is not None:
             print(f"\nDEBUG XZ: overlay_point_nodes_indices_xz length: {len(self.persistent_overlay_worker.overlay_point_nodes_indices_xz)}")
             
@@ -1543,8 +1566,8 @@ class OmeZarrViewWindow(QMainWindow):
                 print(f"DEBUG XZ: inverse_indices_xz length: {len(self.persistent_overlay_worker.inverse_indices_xz)}")
                 print(f"DEBUG XZ: inverse_indices_xz unique values: {len(np.unique(self.persistent_overlay_worker.inverse_indices_xz))}")
                 
-                # Map displayed points to original points, then to nodes
-                xz_labels_by_node = {}
+                # Map displayed points to original points, then to nodes in close space
+                xz_labels_by_close_node = {}
                 debug_count = 0
                 for display_idx, label in self.point_labels_xz.items():
                     # Find all original points that map to this display point
@@ -1555,31 +1578,31 @@ class OmeZarrViewWindow(QMainWindow):
                     
                     for orig_idx in original_indices:
                         if orig_idx < len(self.persistent_overlay_worker.overlay_point_nodes_indices_xz):
-                            node_idx = self.persistent_overlay_worker.overlay_point_nodes_indices_xz[orig_idx]
-                            if node_idx not in xz_labels_by_node:
-                                xz_labels_by_node[node_idx] = []
-                            xz_labels_by_node[node_idx].append(label)
+                            close_node_idx = self.persistent_overlay_worker.overlay_point_nodes_indices_xz[orig_idx]  # Index in close space
+                            if close_node_idx not in xz_labels_by_close_node:
+                                xz_labels_by_close_node[close_node_idx] = []
+                            xz_labels_by_close_node[close_node_idx].append(label)
                 
                 print(f"DEBUG XZ: Total labeled display points: {len(self.point_labels_xz)}")
-                print(f"DEBUG XZ: These expand to label assignments across {sum(len(labels) for labels in xz_labels_by_node.values())} original points")
+                print(f"DEBUG XZ: These expand to label assignments across {sum(len(labels) for labels in xz_labels_by_close_node.values())} original points")
             else:
                 print("WARNING: No inverse_indices_xz for XZ view - using direct mapping")
                 # Fallback to direct mapping
-                xz_labels_by_node = {}
+                xz_labels_by_close_node = {}
                 for point_idx, label in self.point_labels_xz.items():
                     if point_idx < len(self.persistent_overlay_worker.overlay_point_nodes_indices_xz):
-                        node_idx = self.persistent_overlay_worker.overlay_point_nodes_indices_xz[point_idx]
-                        if node_idx not in xz_labels_by_node:
-                            xz_labels_by_node[node_idx] = []
-                        xz_labels_by_node[node_idx].append(label)
+                        close_node_idx = self.persistent_overlay_worker.overlay_point_nodes_indices_xz[point_idx]
+                        if close_node_idx not in xz_labels_by_close_node:
+                            xz_labels_by_close_node[close_node_idx] = []
+                        xz_labels_by_close_node[close_node_idx].append(label)
             
-            # Count total XZ points per node
+            # Count total XZ points per close node
             xz_total_points = {}
-            for node_idx in self.persistent_overlay_worker.overlay_point_nodes_indices_xz:
-                xz_total_points[node_idx] = xz_total_points.get(node_idx, 0) + 1
+            for close_node_idx in self.persistent_overlay_worker.overlay_point_nodes_indices_xz:
+                xz_total_points[close_node_idx] = xz_total_points.get(close_node_idx, 0) + 1
             
-            # Apply voting for XZ
-            for node_idx, labels in xz_labels_by_node.items():
+            # Apply voting for XZ and convert to full space
+            for close_node_idx, labels in xz_labels_by_close_node.items():
                 label_counts = {}
                 for label in labels:
                     label_counts[label] = label_counts.get(label, 0) + 1
@@ -1587,21 +1610,25 @@ class OmeZarrViewWindow(QMainWindow):
                 # Find most common label
                 max_label = max(label_counts.items(), key=lambda x: x[1])
                 label, count = max_label
-                total = xz_total_points.get(node_idx, 0)
+                total = xz_total_points.get(close_node_idx, 0)
                 
                 if count >= 3 and total > 0:
                     percentage = count / total
                     if percentage >= 0.5:
-                        xz_node_labels[node_idx] = (label, percentage, count)
+                        # Map from close space to full space
+                        if close_node_idx < len(close_indices_xz):
+                            undeleted_idx = close_indices_xz[close_node_idx]  # close space → undeleted space
+                            full_space_idx = self.undeleted_nodes_indices[undeleted_idx]  # undeleted space → full space
+                            xz_node_labels[full_space_idx] = (label, percentage, count)
         
         # Combine results with disambiguation
-        node_updates_xy = {}  # Track XY-specific updates
-        node_updates_xz = {}  # Track XZ-specific updates
+        node_updates_xy = {}  # Track XY-specific updates (in full space)
+        node_updates_xz = {}  # Track XZ-specific updates (in full space)
         all_nodes = set(xy_node_labels.keys()) | set(xz_node_labels.keys())
         
-        for node_idx in all_nodes:
-            xy_data = xy_node_labels.get(node_idx)
-            xz_data = xz_node_labels.get(node_idx)
+        for full_node_idx in all_nodes:
+            xy_data = xy_node_labels.get(full_node_idx)
+            xz_data = xz_node_labels.get(full_node_idx)
             
             if xy_data and xz_data:
                 # Both views have valid labels
@@ -1610,37 +1637,37 @@ class OmeZarrViewWindow(QMainWindow):
                 
                 if xy_label == xz_label:
                     # Same label in both views - assign to XY view by default
-                    node_updates_xy[node_idx] = xy_label
+                    node_updates_xy[full_node_idx] = xy_label
                 else:
                     # Different labels - choose the one with higher percentage
                     if xy_pct > xz_pct:
-                        node_updates_xy[node_idx] = xy_label
-                        print(f"Node {node_idx}: XY label {xy_label} ({xy_pct:.1%}) wins over XZ label {xz_label} ({xz_pct:.1%})")
+                        node_updates_xy[full_node_idx] = xy_label
+                        print(f"Node {full_node_idx}: XY label {xy_label} ({xy_pct:.1%}) wins over XZ label {xz_label} ({xz_pct:.1%})")
                     elif xz_pct > xy_pct:
-                        node_updates_xz[node_idx] = xz_label
-                        print(f"Node {node_idx}: XZ label {xz_label} ({xz_pct:.1%}) wins over XY label {xy_label} ({xy_pct:.1%})")
+                        node_updates_xz[full_node_idx] = xz_label
+                        print(f"Node {full_node_idx}: XZ label {xz_label} ({xz_pct:.1%}) wins over XY label {xy_label} ({xy_pct:.1%})")
                     else:
                         # Same percentage - use the one with more points
                         if xy_count >= xz_count:
-                            node_updates_xy[node_idx] = xy_label
+                            node_updates_xy[full_node_idx] = xy_label
                         else:
-                            node_updates_xz[node_idx] = xz_label
+                            node_updates_xz[full_node_idx] = xz_label
             elif xy_data:
                 # Only XY has valid label
-                node_updates_xy[node_idx] = xy_data[0]
+                node_updates_xy[full_node_idx] = xy_data[0]
             elif xz_data:
                 # Only XZ has valid label
-                node_updates_xz[node_idx] = xz_data[0]
+                node_updates_xz[full_node_idx] = xz_data[0]
                 
         total_updates = len(node_updates_xy) + len(node_updates_xz)
         if total_updates > 0:
-            # Emit separate signals for XY and XZ updates
+            # Emit separate signals for XY and XZ updates (now in full space)
             if node_updates_xy:
                 self.labels_updated_signal.emit(node_updates_xy, "XY")
-                print(f"Emitted {len(node_updates_xy)} XY view updates")
+                print(f"Emitted {len(node_updates_xy)} XY view updates (full space indices)")
             if node_updates_xz:
                 self.labels_updated_signal.emit(node_updates_xz, "XZ")
-                print(f"Emitted {len(node_updates_xz)} XZ view updates")
+                print(f"Emitted {len(node_updates_xz)} XZ view updates (full space indices)")
             
             # Create detailed message
             xy_count = len(node_updates_xy)

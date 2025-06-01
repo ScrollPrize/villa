@@ -3767,18 +3767,6 @@ class PointCloudLabeler(QMainWindow):
         """Handle label updates from OME-Zarr view."""
         print(f"Received label updates for {len(node_updates)} nodes from OME-Zarr view ({view_type})")
         
-        # Debug: Check coordinate spaces
-        print(f"Debug: len(self.points)={len(self.points)}, len(self.labels)={len(self.labels)}")
-        if hasattr(self, 'solver'):
-            undeleted = self.solver.get_undeleted_indices()
-            print(f"Debug: len(undeleted)={len(undeleted)}")
-        
-        # Debug: Check node_updates indices range
-        if node_updates:
-            min_idx = min(node_updates.keys())
-            max_idx = max(node_updates.keys())
-            print(f"Debug: node_updates indices range: {min_idx} to {max_idx}")
-        
         # Track undo/redo
         self.undo_stack.append((self.labels.copy(), self.group.copy()))
         self.redo_stack = []
@@ -3790,73 +3778,53 @@ class PointCloudLabeler(QMainWindow):
         updated_count = 0
         total_affected_nodes = 0
         
-        for solver_node_idx, new_label in node_updates.items():
-            # Direct indexing - no mapping needed since arrays are in undeleted space
-            if not (0 <= solver_node_idx < len(self.labels)):
-                print(f"Warning: node index {solver_node_idx} out of range")
+        for full_node_idx, new_label in node_updates.items():
+            # Node indices are already in full space (all nodes including deleted)
+            if not (0 <= full_node_idx < len(self.labels)):
+                print(f"Warning: Node index {full_node_idx} out of bounds (max: {len(self.labels)-1})")
                 continue
-                
-            # Get the position of the updated node
-            node_pos = self.points[solver_node_idx]
             
-            # Use view-specific logic based on which view the updates came from
+            # Get the node position for radius expansion
+            node_pos = self.points[full_node_idx]
+            
+            # Find nearby nodes using view-specific logic
             if view_type == "XY":
-                # Use XY view logic similar to _apply_brush_path_to_labels
-                affected_indices = self._get_nearby_indices_xy_with_radius(node_pos, radius)
+                nearby_indices = self._get_nearby_indices_xy_with_radius(node_pos, radius)
             elif view_type == "XZ":
-                # Use XZ view logic similar to _apply_brush_path_to_labels_xz
-                affected_indices = self._get_nearby_indices_xz_with_radius(node_pos, radius)
+                nearby_indices = self._get_nearby_indices_xz_with_radius(node_pos, radius)
             else:
-                print(f"Warning: unknown view type {view_type}, using XY logic as fallback")
-                affected_indices = self._get_nearby_indices_xy_with_radius(node_pos, radius)
+                # Fallback: just update the single node
+                nearby_indices = [full_node_idx]
             
-            # Apply the label to all affected nodes
-            if affected_indices:
-                # Handle wrap-around logic based on view type
-                for idx in affected_indices:
-                    if view_type == "XY":
-                        # Handle f_init wrap-around for XY view
-                        point_f_init = self.points[idx, 1]
-                        node_f_init = node_pos[1]
-                        
-                        # Calculate the effective label considering wrap-around
-                        effective_label = new_label
-                        if point_f_init > 180 and node_f_init < -90:
-                            # Point is in upper wrap, adjust label
-                            effective_label = new_label + 1
-                        elif point_f_init < -180 and node_f_init > 90:
-                            # Point is in lower wrap, adjust label
-                            effective_label = new_label - 1
-                        
-                        # Prevent accidental UNLABELED±1
-                        if effective_label in (self.UNLABELED + 1, self.UNLABELED - 1):
-                            effective_label = self.UNLABELED
-                    else:
-                        # For XZ view, no wrap-around adjustment needed
-                        effective_label = new_label
+            # Apply the label to all nearby nodes
+            for idx in nearby_indices:
+                if 0 <= idx < len(self.labels):
+                    if self.labels[idx] != new_label:
+                        self.labels[idx] = new_label
+                        updated_count += 1
+                    total_affected_nodes += 1
                     
-                    self.labels[idx] = effective_label
-                    self.group[idx] = self.active_group
-                
-                total_affected_nodes += len(affected_indices)
-                updated_count += 1
-                print(f"Updated node {solver_node_idx} to label {new_label} ({view_type} view), affecting {len(affected_indices)} nearby nodes within radius {radius}")
-            else:
-                # Just update the single node if no nearby nodes found
-                self.labels[solver_node_idx] = new_label
-                self.group[solver_node_idx] = self.active_group
+                    # Optionally update group as well
+                    if hasattr(self, 'group') and 0 <= idx < len(self.group):
+                        self.group[idx] = new_label
+            
+            # If no nearby nodes found, just update the single node
+            if not nearby_indices:
+                self.labels[full_node_idx] = new_label
+                if hasattr(self, 'group'):
+                    self.group[full_node_idx] = new_label
                 updated_count += 1
                 total_affected_nodes += 1
-                print(f"Updated node {solver_node_idx} to label {new_label} ({view_type} view) - no nearby nodes within radius")
         
-        # Update the views to reflect the changes
-        self.update_views()
+        print(f"Updated {updated_count} nodes total, affecting {total_affected_nodes} nodes with radius expansion")
         
-        # Also update the OME-Zarr view if it's still open
-        if hasattr(self, 'ome_zarr_window') and self.ome_zarr_window is not None:
-            self.ome_zarr_window.update_overlay_labels(self.labels, self.calculated_labels)
+        # Update the display
+        self.update_scatter_colors()
         
-        print(f"Applied {updated_count} label updates from OME-Zarr view ({view_type}), affecting {total_affected_nodes} total nodes with radius {radius}")
+        # Reset selection if we modified selected nodes
+        if hasattr(self, 'selected_node_idx') and self.selected_node_idx is not None:
+            if self.selected_node_idx in node_updates:
+                self.selected_node_idx = None
 
     def _get_nearby_indices_xy_with_radius(self, node_pos, radius):
         """Get nearby node indices using the same XY logic as mouse drawing."""
