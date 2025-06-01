@@ -96,35 +96,47 @@ class MeshStitcher:
         
         # Try prediction folder first if configured
         if self.prediction_folder:
-            # Extract fragment_id from window_name (this is the segment name)
-            fragment_id = window_name
+            # Extract fragment_id from the working folder name, not the mesh filename
+            # mesh_path is like: /path/to/working_mesh_refined_10/mesh_refined_10.obj
+            # We want the folder name: working_mesh_refined_10
+            working_folder_name = os.path.basename(os.path.dirname(mesh_path))
+            fragment_id = working_folder_name
+            
+            print(f"Looking for prediction image with fragment_id: {fragment_id}")
             
             # Build pattern based on optional parameters
             if self.rotation is not None and self.layer is not None:
                 # Both rotation and layer specified
                 pattern = f"{fragment_id}_prediction_rotated_{self.rotation}_layer_{self.layer}.png"
                 prediction_path = os.path.join(self.prediction_folder, pattern)
+                print(f"Checking: {prediction_path}")
                 if os.path.exists(prediction_path):
                     print(f"Found prediction image: {prediction_path}")
                     return prediction_path
             elif self.rotation is not None:
                 # Only rotation specified, any layer
                 pattern = f"{fragment_id}_prediction_rotated_{self.rotation}_layer_*.png"
-                matches = glob.glob(os.path.join(self.prediction_folder, pattern))
+                full_pattern = os.path.join(self.prediction_folder, pattern)
+                print(f"Checking: {full_pattern}")
+                matches = glob.glob(full_pattern)
                 if matches:
                     print(f"Found prediction image: {matches[0]}")
                     return matches[0]
             elif self.layer is not None:
                 # Only layer specified, any rotation
                 pattern = f"{fragment_id}_prediction_rotated_*_layer_{self.layer}.png"
-                matches = glob.glob(os.path.join(self.prediction_folder, pattern))
+                full_pattern = os.path.join(self.prediction_folder, pattern)
+                print(f"Checking: {full_pattern}")
+                matches = glob.glob(full_pattern)
                 if matches:
                     print(f"Found prediction image: {matches[0]}")
                     return matches[0]
             else:
                 # Neither specified, match any rotation and layer
                 pattern = f"{fragment_id}_prediction_rotated_*_layer_*.png"
-                matches = glob.glob(os.path.join(self.prediction_folder, pattern))
+                full_pattern = os.path.join(self.prediction_folder, pattern)
+                print(f"Checking: {full_pattern}")
+                matches = glob.glob(full_pattern)
                 if matches:
                     print(f"Found prediction image: {matches[0]}")
                     return matches[0]
@@ -479,8 +491,13 @@ class FinalizeMeshStitcher:
         
         # Try prediction folder first if configured
         if self.prediction_folder:
-            # Extract fragment_id from cut_name (this is the segment name)
-            fragment_id = cut_name
+            # Extract fragment_id from the working folder name, not the mesh filename
+            # mesh_path is like: /path/to/working_mesh_refined_10/mesh_refined_10.obj
+            # We want the folder name: working_mesh_refined_10
+            working_folder_name = os.path.basename(os.path.dirname(mesh_path))
+            fragment_id = working_folder_name
+            
+            print(f"Looking for prediction image with fragment_id: {fragment_id}")
             
             # Build pattern based on optional parameters
             if self.rotation is not None and self.layer is not None:
@@ -526,7 +543,6 @@ class FinalizeMeshStitcher:
         
         for ext in possible_extensions:
             pattern = os.path.join(cut_folder, f"{cut_name}.{ext[2:]}")
-            print(f"Pattern: {pattern}")
             matches = glob.glob(pattern)
             if matches:
                 return matches[0]
