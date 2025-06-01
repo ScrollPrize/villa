@@ -906,6 +906,8 @@ class PointCloudLabeler(QMainWindow):
         # Connect the destroyed signal so that when the window is closed,
         # we automatically set our pointer to None.
         self.ome_zarr_window.destroyed.connect(self.on_ome_zarr_view_destroyed)
+        # Connect the labels updated signal
+        self.ome_zarr_window.labels_updated_signal.connect(self.on_ome_zarr_labels_updated)
         self.ome_zarr_window.show()
 
     def on_ome_zarr_view_destroyed(self):
@@ -3760,3 +3762,30 @@ class PointCloudLabeler(QMainWindow):
         autosave_filename = f"autosave_{timestamp}_{name_without_ext}{ext}"
         
         return os.path.join(autosave_dir, autosave_filename)
+
+    def on_ome_zarr_labels_updated(self, node_updates):
+        """Handle label updates from OME-Zarr view."""
+        print(f"Received label updates for {len(node_updates)} nodes from OME-Zarr view")
+        
+        # Track undo/redo
+        self.undo_stack.append((self.labels.copy(), self.group.copy()))
+        self.redo_stack = []
+        
+        # Apply the label updates
+        updated_count = 0
+        for node_idx, new_label in node_updates.items():
+            if 0 <= node_idx < len(self.labels):
+                self.labels[node_idx] = new_label
+                updated_count += 1
+                print(f"Updated node {node_idx} to label {new_label}")
+            else:
+                print(f"Warning: node index {node_idx} out of range")
+        
+        # Update the views to reflect the changes
+        self.update_views()
+        
+        # Also update the OME-Zarr view if it's still open
+        if hasattr(self, 'ome_zarr_window') and self.ome_zarr_window is not None:
+            self.ome_zarr_window.update_overlay_labels(self.labels, self.calculated_labels)
+        
+        print(f"Applied {updated_count} label updates from OME-Zarr view")
