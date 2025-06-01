@@ -60,7 +60,8 @@ class PatchOptimizer:
         n = n.permute(3,0,1,2)
 
         # 3) data fidelity
-        data = - (u*U).sum() - (v*V).sum() - (n*N).sum()
+        data = -((u * U).sum().pow(2)) - ((v * V).sum().pow(2)) - ((n * N).sum().pow(2))
+
 
         data *= 10**(-3) # TODO: insert another weight here or find a good normalization strategy
         # 4) smoothness on rotated fields
