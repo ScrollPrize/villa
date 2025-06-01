@@ -1,7 +1,7 @@
 import numpy as np
-from PyQt5.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFileDialog, QMessageBox, QDialog, QFormLayout, QDialogButtonBox, QLineEdit, QComboBox, QPushButton, QLabel, QProgressDialog, QSpinBox, QDoubleSpinBox, QCheckBox, QApplication
+from PyQt5.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFileDialog, QMessageBox, QDialog, QFormLayout, QDialogButtonBox, QLineEdit, QComboBox, QPushButton, QLabel, QProgressDialog, QSpinBox, QDoubleSpinBox, QCheckBox, QApplication, QGraphicsPathItem
 from PyQt5.QtCore import QTimer, QThread, pyqtSignal, QObject, pyqtSlot, Qt, QEvent, QPointF
-from PyQt5.QtGui import QImage, QPainter
+from PyQt5.QtGui import QImage, QPainter, QPainterPath, QPen, QColor
 import pyqtgraph as pg
 import pyqtgraph.exporters
 import cv2
@@ -131,11 +131,15 @@ def brush_for_winding(w, r, g, b):
     """
     Given a winding value w (assumed numeric), return a pyqtgraph brush
     using a three-color scheme: winding 1 -> red, 2 -> green, 3 -> blue,
-    4 -> red, etc.
+    4 -> red, etc. Handles negative values properly.
     """
     # Round to nearest integer.
     w_int = int(round(w / 360.0))
+    # Handle negative values
     mod = w_int % 3
+    # Python's modulo handles negatives differently, so we adjust
+    if mod < 0:
+        mod += 3
     if mod == 1:
         return g   # green
     elif mod == 2:
@@ -201,9 +205,11 @@ def vectorized_brush_for_winding(w_array, brush_red, brush_green, brush_blue):
             b = 255 * (1 - f)
         brushes.append(pg.mkBrush(r, g, b))
     
-    # Map winding values (in degrees) to a normalized index in [0, 12).
+    # Map winding values (in degrees) to a normalized index in [0, steps).
     w_int = np.rint(w_array / (3 * d_angle)).astype(np.int64)
     mod = w_int % steps
+    # Handle negative values
+    mod = np.where(mod < 0, mod + steps, mod)
     # Create an empty array of objects (brushes).
     result = np.empty(mod.shape, dtype=object)
     for i in range(steps):
@@ -379,6 +385,7 @@ class PersistentScrollGraphWorker(QObject):
             # Get close nodes labels.
             close_windings = windings[self.close_mask]
             close_computed = windings_computed[self.close_mask]
+            print(f"[Worker compute_labels_xy] Processing {len(close_windings)} close node windings")
             # Transfer to per-point windings with self.overlay_point_nodes_indices.
             overlay_windings = close_windings[self.overlay_point_nodes_indices]
             overlay_windings_computed = close_computed[self.overlay_point_nodes_indices]
@@ -386,6 +393,7 @@ class PersistentScrollGraphWorker(QObject):
             overlay_windings, overlay_windings_computed = compute_mean_windings_precomputed(
                 self.inverse_indices, overlay_windings, overlay_windings_computed, self.UNLABELED
             )
+            print(f"[Worker compute_labels_xy] Computed mean windings for {len(overlay_windings)} unique points")
             self.overlay_labels_computed.emit((overlay_windings, overlay_windings_computed))
         except Exception as e:
             print("Error in PersistentScrollGraphWorker:", e)
@@ -452,6 +460,8 @@ class OmeZarrViewWindow(QMainWindow):
     overlay_request = pyqtSignal(int, str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int)
     overlay_request_xz = pyqtSignal(float, str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int)
     label_request = pyqtSignal(np.ndarray, np.ndarray)
+    # Signal to update labels in gui_main
+    labels_updated_signal = pyqtSignal(dict)
 
     def __init__(self, graph_labels, solver, experiment_path, ome_zarr_path,
                  graph_pkl_path, h5_path, umbilicus_path, parent=None):
@@ -490,6 +500,24 @@ class OmeZarrViewWindow(QMainWindow):
         self.calc_brush_red   = pg.mkBrush(255, 50, 0, 100)
         self.calc_brush_green = pg.mkBrush(0, 255, 50, 100)
         self.calc_brush_blue  = pg.mkBrush(50, 0, 255, 100)
+        
+        # Per-point label storage for direct labeling in the view
+        self.point_labels_xy = {}  # Dict mapping point index to label
+        self.point_labels_xz = {}  # Dict mapping point index to label
+        
+        # Current label for painting
+        self.current_label = 0
+        
+        # For pipette mode
+        self.pipette_mode = False
+        
+        # For stroke-based painting
+        self._stroke_backup = None
+        self._current_path_xy = None
+        self._current_path_xz = None
+        
+        # Drawing radius for brush
+        self.drawing_radius = 10.0
         
         # For XY view updates.
         self.pending_z_center = None
@@ -534,6 +562,48 @@ class OmeZarrViewWindow(QMainWindow):
             self.resolution_combobox.setCurrentIndex(0)
         self.resolution_combobox.currentIndexChanged.connect(self.on_resolution_changed)
         settings_layout.addWidget(self.resolution_combobox)
+        
+        # Add label spinbox
+        settings_layout.addStretch()
+        settings_layout.addWidget(QLabel("Label:"))
+        self.label_spinbox = QSpinBox()
+        self.label_spinbox.setRange(-10000, 1000)
+        self.label_spinbox.setValue(0)
+        self.label_spinbox.valueChanged.connect(self.on_label_changed)
+        settings_layout.addWidget(self.label_spinbox)
+        
+        # Add pipette mode indicator
+        self.pipette_label = QLabel("Pipette: OFF")
+        settings_layout.addWidget(self.pipette_label)
+        
+        # Add erase button
+        self.erase_button = QPushButton("Erase Label")
+        self.erase_button.clicked.connect(lambda: self.label_spinbox.setValue(self.UNLABELED))
+        settings_layout.addWidget(self.erase_button)
+        
+        # Add drawing radius control
+        settings_layout.addWidget(QLabel("Radius:"))
+        self.radius_spinbox = QDoubleSpinBox()
+        self.radius_spinbox.setRange(1.0, 50.0)
+        self.radius_spinbox.setValue(self.drawing_radius)
+        self.radius_spinbox.setDecimals(1)
+        self.radius_spinbox.valueChanged.connect(self.update_drawing_radius)
+        settings_layout.addWidget(self.radius_spinbox)
+        
+        self.labels_status = QLabel("Custom labels: 0")
+        settings_layout.addWidget(self.labels_status)
+        
+        # Add gradient coloring checkbox
+        self.gradient_coloring_checkbox = QCheckBox("Gradient Coloring")
+        self.gradient_coloring_checkbox.setChecked(True)
+        self.gradient_coloring_checkbox.toggled.connect(self.update_views)
+        settings_layout.addWidget(self.gradient_coloring_checkbox)
+        
+        # Add apply labels button
+        self.apply_labels_button = QPushButton("Apply Labels to Graph")
+        self.apply_labels_button.clicked.connect(self.apply_labels_to_graph)
+        settings_layout.addWidget(self.apply_labels_button)
+        
         # Load initial resolution
         self.on_resolution_changed(0)
         
@@ -553,6 +623,27 @@ class OmeZarrViewWindow(QMainWindow):
         views_layout.addWidget(self.xz_view)
         
         self.load_placeholder_images()
+        
+        # Create overlay items for stroke preview
+        self._overlay = QGraphicsPathItem()
+        pen = QPen(QColor(50, 150, 255, 150))
+        pen.setWidthF(self.drawing_radius * 2)
+        pen.setCapStyle(Qt.RoundCap)
+        self._overlay.setPen(pen)
+        self._overlay.setZValue(1000)
+        self.xy_view.addItem(self._overlay)
+        
+        self._overlay_xz = QGraphicsPathItem()
+        pen_xz = QPen(QColor(50, 150, 255, 150))
+        pen_xz.setWidthF(self.drawing_radius * 2)
+        pen_xz.setCapStyle(Qt.RoundCap)
+        self._overlay_xz.setPen(pen_xz)
+        self._overlay_xz.setZValue(1000)
+        self.xz_view.addItem(self._overlay_xz)
+        
+        # Install event filters for labeling functionality
+        self.xy_view.getView().scene().installEventFilter(self)
+        self.xz_view.getView().scene().installEventFilter(self)
         
         # Umbilicus dot overlay.
         self.umbilicus_dot = pg.ScatterPlotItem(pen=pg.mkPen(None), brush=pg.mkBrush('r'), size=20)
@@ -597,6 +688,10 @@ class OmeZarrViewWindow(QMainWindow):
             return
         z_index = int(self.pending_z_center * 4 - 500)
         self.current_z_index = z_index  # Store for later use.
+        
+        # Clear point labels for the new slice
+        self.point_labels_xy.clear()
+        
         self.loader_worker_running = True
         print(f"Loading OME-Zarr XY slice at index {z_index} (from z slice center {self.pending_z_center})")
         # Launch loader worker at selected resolution
@@ -606,6 +701,8 @@ class OmeZarrViewWindow(QMainWindow):
 
         try:
             pos = umbilicus_xy_at_z(self.umbilicus_data, self.current_z_index)
+            scale = 2**(self.current_resolution)
+            pos /= scale
             # pos is in (x, y) order.
             self.umbilicus_dot.setData([pos[1]], [pos[0]])
         except Exception as e:
@@ -643,26 +740,64 @@ class OmeZarrViewWindow(QMainWindow):
         brush_mask = np.abs(self.last_overlay_windings // 360 - self.UNLABELED) > 2
         brush_mask_computed = np.abs(self.last_overlay_windings_computed // 360 - self.UNLABELED) > 2
 
-        print(f"Percent valid windings: {np.sum(brush_mask) / len(brush_mask) * 100:.2f}%")
-        print(f"Percent valid computed windings: {np.sum(brush_mask_computed) / len(brush_mask_computed) * 100:.2f}%")
+        print(f"[get_brushes] Valid windings: {np.sum(brush_mask)} / {len(brush_mask)} ({np.sum(brush_mask) / len(brush_mask) * 100:.2f}%)")
+        print(f"[get_brushes] Valid computed windings: {np.sum(brush_mask_computed)} / {len(brush_mask_computed)} ({np.sum(brush_mask_computed) / len(brush_mask_computed) * 100:.2f}%)")
+        print(f"[get_brushes] Custom labels in point_labels_xy: {len(self.point_labels_xy)}")
 
         # Flatten the arrays to work with one-dimensional data.
         overlay_windings_flat = self.last_overlay_windings.flatten()
         overlay_windings_computed_flat = self.last_overlay_windings_computed.flatten()
 
-        # Compute the brush arrays in a vectorized fashion.
-        brushes_primary = vectorized_brush_for_winding(overlay_windings_flat, self.red_brush, self.green_brush, self.blue_brush)
-        brushes_computed = vectorized_brush_for_winding(overlay_windings_computed_flat, self.calc_brush_red, self.calc_brush_green, self.calc_brush_blue)
-
         # Create an empty array for the final brushes.
         result = np.empty(overlay_windings_flat.shape, dtype=object)
-        # Where the primary mask is true, assign primary brushes.
-        result[brush_mask] = brushes_primary[brush_mask]
-        # Where the primary mask is false but the computed mask is true, assign computed brushes.
-        condition_computed = np.logical_and(~brush_mask, brush_mask_computed)
+        
+        # Check if gradient checkbox exists and is checked
+        use_gradient = hasattr(self, 'gradient_coloring_checkbox') and self.gradient_coloring_checkbox.isChecked()
+        
+        # First, check for custom labels in point_labels_xy
+        has_custom_label = np.zeros(len(result), dtype=bool)
+        for idx, label in self.point_labels_xy.items():
+            if idx < len(result):
+                # Convert label to winding angle for brush selection
+                winding_angle = label * 360.0
+                if use_gradient:
+                    custom_brush = vectorized_brush_for_winding(np.array([winding_angle]), self.red_brush, self.green_brush, self.blue_brush)[0]
+                else:
+                    custom_brush = brush_for_winding(winding_angle, self.red_brush, self.green_brush, self.blue_brush)
+                result[idx] = custom_brush
+                has_custom_label[idx] = True
+        
+        # For points without custom labels, use the winding values which include gui_main labels
+        # Compute the brush arrays based on checkbox state
+        if use_gradient:
+            brushes_primary = vectorized_brush_for_winding(overlay_windings_flat, self.red_brush, self.green_brush, self.blue_brush)
+            brushes_computed = vectorized_brush_for_winding(overlay_windings_computed_flat, self.calc_brush_red, self.calc_brush_green, self.calc_brush_blue)
+        else:
+            # Use simple 3-color cycling
+            brushes_primary = np.empty(overlay_windings_flat.shape, dtype=object)
+            brushes_computed = np.empty(overlay_windings_computed_flat.shape, dtype=object)
+            for i in range(len(overlay_windings_flat)):
+                brushes_primary[i] = brush_for_winding(overlay_windings_flat[i], self.red_brush, self.green_brush, self.blue_brush)
+                brushes_computed[i] = brush_for_winding(overlay_windings_computed_flat[i], self.calc_brush_red, self.calc_brush_green, self.calc_brush_blue)
+        
+        # Apply brushes based on masks
+        mask_no_custom = ~has_custom_label
+        
+        # Priority order:
+        # 1. Custom labels (already applied above)
+        # 2. GUI main labels (brush_mask = True)
+        # 3. Computed labels (brush_mask = False, brush_mask_computed = True)
+        # 4. White brush for truly unlabeled
+        
+        # Apply primary brushes where we have valid labels from gui_main
+        result[mask_no_custom & brush_mask] = brushes_primary[mask_no_custom & brush_mask]
+        
+        # Apply computed brushes where we don't have gui_main labels but do have computed labels
+        condition_computed = np.logical_and(~brush_mask, brush_mask_computed) & mask_no_custom
         result[condition_computed] = brushes_computed[condition_computed]
-        # For all other cases, use the white brush.
-        result[~(brush_mask | brush_mask_computed)] = self.white_brush
+        
+        # For truly unlabeled points, use white brush
+        result[mask_no_custom & ~(brush_mask | brush_mask_computed)] = self.white_brush
 
         return result.tolist()
 
@@ -705,20 +840,62 @@ class OmeZarrViewWindow(QMainWindow):
         brush_mask = np.abs(self.last_overlay_windings_xz // 360 - self.UNLABELED) > 2
         brush_mask_computed = np.abs(self.last_overlay_windings_computed_xz // 360 - self.UNLABELED) > 2
 
-        print(f"XZ view: Percent valid windings: {np.sum(brush_mask) / len(brush_mask) * 100:.2f}%")
-        print(f"XZ view: Percent valid computed windings: {np.sum(brush_mask_computed) / len(brush_mask_computed) * 100:.2f}%")
+        print(f"[get_brushes_xz] Valid windings: {np.sum(brush_mask)} / {len(brush_mask)} ({np.sum(brush_mask) / len(brush_mask) * 100:.2f}%)")
+        print(f"[get_brushes_xz] Valid computed windings: {np.sum(brush_mask_computed)} / {len(brush_mask_computed)} ({np.sum(brush_mask_computed) / len(brush_mask_computed) * 100:.2f}%)")
+        print(f"[get_brushes_xz] Custom labels in point_labels_xz: {len(self.point_labels_xz)}")
 
         overlay_windings_flat = self.last_overlay_windings_xz.flatten()
         overlay_windings_computed_flat = self.last_overlay_windings_computed_xz.flatten()
 
-        brushes_primary = vectorized_brush_for_winding(overlay_windings_flat, self.red_brush, self.green_brush, self.blue_brush)
-        brushes_computed = vectorized_brush_for_winding(overlay_windings_computed_flat, self.calc_brush_red, self.calc_brush_green, self.calc_brush_blue)
-
         result = np.empty(overlay_windings_flat.shape, dtype=object)
-        result[brush_mask] = brushes_primary[brush_mask]
-        condition_computed = np.logical_and(~brush_mask, brush_mask_computed)
+        
+        # Check if gradient checkbox exists and is checked
+        use_gradient = hasattr(self, 'gradient_coloring_checkbox') and self.gradient_coloring_checkbox.isChecked()
+        
+        # First, check for custom labels in point_labels_xz
+        has_custom_label = np.zeros(len(result), dtype=bool)
+        for idx, label in self.point_labels_xz.items():
+            if idx < len(result):
+                # Convert label to winding angle for brush selection
+                winding_angle = label * 360.0
+                if use_gradient:
+                    custom_brush = vectorized_brush_for_winding(np.array([winding_angle]), self.red_brush, self.green_brush, self.blue_brush)[0]
+                else:
+                    custom_brush = brush_for_winding(winding_angle, self.red_brush, self.green_brush, self.blue_brush)
+                result[idx] = custom_brush
+                has_custom_label[idx] = True
+        
+        # For points without custom labels, use the winding values which include gui_main labels
+        # Compute the brush arrays based on checkbox state
+        if use_gradient:
+            brushes_primary = vectorized_brush_for_winding(overlay_windings_flat, self.red_brush, self.green_brush, self.blue_brush)
+            brushes_computed = vectorized_brush_for_winding(overlay_windings_computed_flat, self.calc_brush_red, self.calc_brush_green, self.calc_brush_blue)
+        else:
+            # Use simple 3-color cycling
+            brushes_primary = np.empty(overlay_windings_flat.shape, dtype=object)
+            brushes_computed = np.empty(overlay_windings_computed_flat.shape, dtype=object)
+            for i in range(len(overlay_windings_flat)):
+                brushes_primary[i] = brush_for_winding(overlay_windings_flat[i], self.red_brush, self.green_brush, self.blue_brush)
+                brushes_computed[i] = brush_for_winding(overlay_windings_computed_flat[i], self.calc_brush_red, self.calc_brush_green, self.calc_brush_blue)
+        
+        # Apply brushes based on masks
+        mask_no_custom = ~has_custom_label
+        
+        # Priority order:
+        # 1. Custom labels (already applied above)
+        # 2. GUI main labels (brush_mask = True)  
+        # 3. Computed labels (brush_mask = False, brush_mask_computed = True)
+        # 4. White brush for truly unlabeled
+        
+        # Apply primary brushes where we have valid labels from gui_main
+        result[mask_no_custom & brush_mask] = brushes_primary[mask_no_custom & brush_mask]
+        
+        # Apply computed brushes where we don't have gui_main labels but do have computed labels
+        condition_computed = np.logical_and(~brush_mask, brush_mask_computed) & mask_no_custom
         result[condition_computed] = brushes_computed[condition_computed]
-        result[~(brush_mask | brush_mask_computed)] = self.white_brush
+        
+        # For truly unlabeled points, use white brush
+        result[mask_no_custom & ~(brush_mask | brush_mask_computed)] = self.white_brush
 
         return result.tolist()
 
@@ -765,29 +942,37 @@ class OmeZarrViewWindow(QMainWindow):
     
     # --- Color Update Trigger ---
     def update_overlay_labels(self, labels, computed_labels):
+        print(f"[ome_zarr_view] update_overlay_labels called with {len(labels)} labels, {np.sum(np.abs(labels - self.UNLABELED) > 2)} labeled points")
         self.labels = labels
         self.computed_labels = computed_labels
         self.debounce_timer_labels.stop()
-        self.debounce_timer_labels.start(5000)
+        self.debounce_timer_labels.start(100)  # Reduced from 5000ms to 100ms for more responsive updates
 
     def _trigger_overlay_labels_update(self):
         windings = self.labels * 360.0 + self.f_init
         windings_computed = self.computed_labels * 360.0 + self.f_init
         try:
-            print("Requesting overlay labels update.")
+            labeled_mask = np.abs(self.labels - self.UNLABELED) > 2
+            print(f"[_trigger_overlay_labels_update] Requesting update with {np.sum(labeled_mask)} labeled points")
+            if np.sum(labeled_mask) > 0:
+                sample_labels = self.labels[labeled_mask][:5]  # Show first 5 labeled points
+                sample_windings = windings[labeled_mask][:5]
+                print(f"[_trigger_overlay_labels_update] Sample labels: {sample_labels} -> windings: {sample_windings}")
             self.label_request.emit(windings, windings_computed)
         except Exception as e:
             print("Error requesting overlay labels:", e)
 
     def on_overlay_labels_computed(self, data):
         if not hasattr(self, "overlay_scatter"):
+            print("[on_overlay_labels_computed] No overlay_scatter, returning early")
             return
         overlay_windings, overlay_windings_computed = data
-        print("Overlay labels computed.")
+        print(f"[on_overlay_labels_computed] Received windings for {len(overlay_windings)} points")
         self.last_overlay_windings = overlay_windings
         self.last_overlay_windings_computed = overlay_windings_computed
         brushes = self.get_brushes()
         self.overlay_scatter.setBrush(brushes)
+        print(f"[on_overlay_labels_computed] Updated scatter plot with {len(brushes)} brushes")
 
     def on_overlay_labels_computed_xz(self, data):
         if not hasattr(self, "overlay_scatter_xz"):
@@ -809,6 +994,10 @@ class OmeZarrViewWindow(QMainWindow):
         if self.pending_finit_center is None:
             return
         print(f"Loading OME-Zarr XZ slice with f init center {self.pending_finit_center}, type of {type(self.pending_finit_center)}")
+        
+        # Clear point labels for the new slice
+        self.point_labels_xz.clear()
+        
         # Launch XZ loader worker at selected resolution
         self.xz_loader_worker = OmeZarrXZLoaderWorker(self.ome_zarr_path, self.current_resolution,
                                                     self.pending_finit_center, self.umbilicus_path)
@@ -849,6 +1038,383 @@ class OmeZarrViewWindow(QMainWindow):
         self.xz_view.export(os.path.join("GraphLabelerViews", f"xz_view_{current_timestamp}.png"))
         print("OME-Zarr XZ view updated with new slice.")
     
+    def on_label_changed(self, value):
+        """Handle label spinbox value change."""
+        self.current_label = value
+        print(f"Current label set to: {value}")
+    
+    def keyPressEvent(self, event):
+        """Handle key press events."""
+        if event.key() == Qt.Key_P:
+            # Toggle pipette mode
+            self.pipette_mode = not self.pipette_mode
+            if self.pipette_mode:
+                self.pipette_label.setText("Pipette: ON")
+                self.pipette_label.setStyleSheet("color: green;")
+                print("Pipette mode enabled - click a point to sample its label")
+            else:
+                self.pipette_label.setText("Pipette: OFF")
+                self.pipette_label.setStyleSheet("")
+                print("Pipette mode disabled")
+        else:
+            super().keyPressEvent(event)
+    
+    def eventFilter(self, source, event):
+        """Filter events for pipette functionality and stroke-based painting."""
+        if event.type() == QEvent.GraphicsSceneMousePress:
+            # Check which view was clicked
+            if source == self.xy_view.getView().scene():
+                if self.pipette_mode:
+                    self.handle_pipette_click_xy(event)
+                else:
+                    self.start_stroke_xy(event)
+                return True
+            elif source == self.xz_view.getView().scene():
+                if self.pipette_mode:
+                    self.handle_pipette_click_xz(event)
+                else:
+                    self.start_stroke_xz(event)
+                return True
+        elif event.type() == QEvent.GraphicsSceneMouseMove:
+            if source == self.xy_view.getView().scene() and self._current_path_xy is not None:
+                self.extend_stroke_xy(event)
+                return True
+            elif source == self.xz_view.getView().scene() and self._current_path_xz is not None:
+                self.extend_stroke_xz(event)
+                return True
+        elif event.type() == QEvent.GraphicsSceneMouseRelease:
+            if source == self.xy_view.getView().scene() and self._current_path_xy is not None:
+                self.finish_stroke_xy(event)
+                return True
+            elif source == self.xz_view.getView().scene() and self._current_path_xz is not None:
+                self.finish_stroke_xz(event)
+                return True
+        return super().eventFilter(source, event)
+    
+    def handle_pipette_click_xy(self, event):
+        """Handle pipette click in XY view."""
+        if not hasattr(self, 'overlay_scatter'):
+            return
+        
+        # Get mouse position in data coordinates
+        pos = self.xy_view.getView().mapSceneToView(event.scenePos())
+        mouse_x, mouse_y = pos.x(), pos.y()
+        
+        # Get scatter plot data
+        data = self.overlay_scatter.data
+        if data is None or len(data) == 0:
+            return
+        
+        x_coords = data['x']
+        y_coords = data['y']
+        
+        # Find nearest point
+        distances = np.sqrt((x_coords - mouse_x)**2 + (y_coords - mouse_y)**2)
+        nearest_idx = np.argmin(distances)
+        
+        # Check if point has a custom label first
+        if nearest_idx in self.point_labels_xy and False:
+            sampled_label = self.point_labels_xy[nearest_idx]
+            print(f"Sampled custom label: {sampled_label}")
+        else:
+            # Sample from the winding value
+            if hasattr(self, 'last_overlay_windings') and self.last_overlay_windings is not None:
+                winding = self.last_overlay_windings.flatten()[nearest_idx]
+                sampled_label = int(round(winding / 360.0))
+                print(f"Sampled winding label: {sampled_label}")
+            else:
+                print("No winding data available")
+                return
+        
+        # Update the spinbox
+        self.label_spinbox.setValue(sampled_label)
+        
+        # Disable pipette mode after sampling
+        self.pipette_mode = False
+        self.pipette_label.setText("Pipette: OFF")
+        self.pipette_label.setStyleSheet("")
+    
+    def handle_pipette_click_xz(self, event):
+        """Handle pipette click in XZ view."""
+        if not hasattr(self, 'overlay_scatter_xz'):
+            return
+        
+        # Get mouse position in data coordinates
+        pos = self.xz_view.getView().mapSceneToView(event.scenePos())
+        mouse_x, mouse_y = pos.x(), pos.y()
+        
+        # Get scatter plot data
+        data = self.overlay_scatter_xz.data
+        if data is None or len(data) == 0:
+            return
+        
+        x_coords = data['x']
+        y_coords = data['y']
+        
+        # Find nearest point
+        distances = np.sqrt((x_coords - mouse_x)**2 + (y_coords - mouse_y)**2)
+        nearest_idx = np.argmin(distances)
+        
+        # Check if point has a custom label first
+        if nearest_idx in self.point_labels_xz and False:
+            sampled_label = self.point_labels_xz[nearest_idx]
+            print(f"Sampled custom label: {sampled_label}")
+        else:
+            # Sample from the winding value
+            if hasattr(self, 'last_overlay_windings_xz') and self.last_overlay_windings_xz is not None:
+                winding = self.last_overlay_windings_xz.flatten()[nearest_idx]
+                sampled_label = int(round(winding / 360.0))
+                print(f"Sampled winding label: {sampled_label}")
+            else:
+                print("No winding data available")
+                return
+        
+        # Update the spinbox
+        self.label_spinbox.setValue(sampled_label)
+        
+        # Disable pipette mode after sampling
+        self.pipette_mode = False
+        self.pipette_label.setText("Pipette: OFF")
+        self.pipette_label.setStyleSheet("")
+    
+    def update_drawing_radius(self, value):
+        self.drawing_radius = value
+        # Update overlay pen widths
+        pen = self._overlay.pen()
+        pen.setWidthF(self.drawing_radius * 2)
+        self._overlay.setPen(pen)
+        
+        pen_xz = self._overlay_xz.pen()
+        pen_xz.setWidthF(self.drawing_radius * 2)
+        self._overlay_xz.setPen(pen_xz)
+        print(f"Drawing radius updated to: {self.drawing_radius}")
+    
+    def _current_label_qcolor(self):
+        """Return a semi-transparent QColor matching the current label."""
+        lab = self.label_spinbox.value()
+        alpha = 150
+        
+        if lab == self.UNLABELED:
+            # Draw erase strokes in dark gray/black
+            return QColor(50, 50, 50, alpha)
+        
+        # Use gradient coloring for consistency with the displayed points
+        # Map label to angle (label * 360 degrees)
+        angle = (lab * 360.0) % 360
+        if angle < 0:
+            angle += 360
+            
+        if angle < 120:
+            # Transition: Red to Green
+            f = angle / 120.0
+            r = int(255 * (1 - f))
+            g = int(255 * f)
+            b = 0
+        elif angle < 240:
+            # Transition: Green to Blue
+            f = (angle - 120) / 120.0
+            r = 0
+            g = int(255 * (1 - f))
+            b = int(255 * f)
+        else:
+            # Transition: Blue to Red
+            f = (angle - 240) / 120.0
+            r = int(255 * f)
+            g = 0
+            b = int(255 * (1 - f))
+            
+        return QColor(r, g, b, alpha)
+    
+    def start_stroke_xy(self, event):
+        """Start a brush stroke in XY view."""
+        if self._stroke_backup is None:
+            self._stroke_backup = self.point_labels_xy.copy()
+        
+        pos = self.xy_view.getView().mapSceneToView(event.scenePos())
+        self._current_path_xy = QPainterPath(QPointF(pos.x(), pos.y()))
+        
+        pen = self._overlay.pen()
+        pen.setColor(self._current_label_qcolor())
+        self._overlay.setPen(pen)
+        self._overlay.setPath(self._current_path_xy)
+        self._overlay.setVisible(True)
+    
+    def extend_stroke_xy(self, event):
+        """Extend the brush stroke in XY view."""
+        pos = self.xy_view.getView().mapSceneToView(event.scenePos())
+        self._current_path_xy.lineTo(QPointF(pos.x(), pos.y()))
+        self._overlay.setPath(self._current_path_xy)
+    
+    def finish_stroke_xy(self, event):
+        """Finish the brush stroke and apply labels in XY view."""
+        # Extract path points
+        pts = [(self._current_path_xy.elementAt(i).x,
+                self._current_path_xy.elementAt(i).y)
+               for i in range(self._current_path_xy.elementCount())]
+        
+        # Apply labels along the path
+        self._apply_brush_path_to_labels_xy(pts)
+        
+        # Clear the overlay
+        self._stroke_backup = None
+        self._current_path_xy = None
+        self._overlay.setPath(QPainterPath())
+        self._overlay.setVisible(False)
+    
+    def start_stroke_xz(self, event):
+        """Start a brush stroke in XZ view."""
+        if self._stroke_backup is None:
+            self._stroke_backup = self.point_labels_xz.copy()
+        
+        pos = self.xz_view.getView().mapSceneToView(event.scenePos())
+        self._current_path_xz = QPainterPath(QPointF(pos.x(), pos.y()))
+        
+        pen = self._overlay_xz.pen()
+        pen.setColor(self._current_label_qcolor())
+        self._overlay_xz.setPen(pen)
+        self._overlay_xz.setPath(self._current_path_xz)
+        self._overlay_xz.setVisible(True)
+    
+    def extend_stroke_xz(self, event):
+        """Extend the brush stroke in XZ view."""
+        pos = self.xz_view.getView().mapSceneToView(event.scenePos())
+        self._current_path_xz.lineTo(QPointF(pos.x(), pos.y()))
+        self._overlay_xz.setPath(self._current_path_xz)
+    
+    def finish_stroke_xz(self, event):
+        """Finish the brush stroke and apply labels in XZ view."""
+        # Extract path points
+        pts = [(self._current_path_xz.elementAt(i).x,
+                self._current_path_xz.elementAt(i).y)
+               for i in range(self._current_path_xz.elementCount())]
+        
+        # Apply labels along the path
+        self._apply_brush_path_to_labels_xz(pts)
+        
+        # Clear the overlay
+        self._stroke_backup = None
+        self._current_path_xz = None
+        self._overlay_xz.setPath(QPainterPath())
+        self._overlay_xz.setVisible(False)
+    
+    def _interpolate_path(self, path, r):
+        """Densify a list of (x,y) points so no segment exceeds half the radius r."""
+        if not path:
+            return []
+        step = r * 0.5
+        interp = []
+        for (x0, y0), (x1, y1) in zip(path, path[1:]):
+            interp.append((x0, y0))
+            dx = x1 - x0
+            dy = y1 - y0
+            dist = np.hypot(dx, dy)
+            if dist > step:
+                n = int(dist / step)
+                for k in range(1, n + 1):
+                    t = k / (n + 1)
+                    interp.append((x0 + t * dx, y0 + t * dy))
+        interp.append(path[-1])
+        return interp
+    
+    def _apply_brush_path_to_labels_xy(self, data_path):
+        """Apply labels along the brush path in XY view."""
+        if not hasattr(self, 'overlay_scatter'):
+            return
+        
+        # Get scatter plot data
+        data = self.overlay_scatter.data
+        if data is None or len(data) == 0:
+            return
+        
+        # Densify the path
+        r = self.drawing_radius
+        data_path = self._interpolate_path(data_path, r)
+        
+        current_label = self.label_spinbox.value()
+        x_coords = data['x']
+        y_coords = data['y']
+        
+        # Find points within radius of the path
+        hit = set()
+        for px, py in data_path:
+            distances = np.sqrt((x_coords - px)**2 + (y_coords - py)**2)
+            close_indices = np.where(distances <= r)[0]
+            hit.update(close_indices)
+        
+        # Apply label to hit points
+        for idx in hit:
+            if current_label == self.UNLABELED:
+                # Erase label
+                if idx in self.point_labels_xy:
+                    del self.point_labels_xy[idx]
+            else:
+                # Set label
+                self.point_labels_xy[idx] = current_label
+        
+        # Update display
+        brushes = self.get_brushes()
+        self.overlay_scatter.setBrush(brushes)
+        self.update_labels_status()
+    
+    def _apply_brush_path_to_labels_xz(self, data_path):
+        """Apply labels along the brush path in XZ view."""
+        if not hasattr(self, 'overlay_scatter_xz'):
+            return
+        
+        # Get scatter plot data
+        data = self.overlay_scatter_xz.data
+        if data is None or len(data) == 0:
+            return
+        
+        # Densify the path
+        r = self.drawing_radius
+        data_path = self._interpolate_path(data_path, r)
+        
+        current_label = self.label_spinbox.value()
+        x_coords = data['x']
+        y_coords = data['y']
+        
+        # Find points within radius of the path
+        hit = set()
+        for px, py in data_path:
+            distances = np.sqrt((x_coords - px)**2 + (y_coords - py)**2)
+            close_indices = np.where(distances <= r)[0]
+            hit.update(close_indices)
+        
+        # Apply label to hit points
+        for idx in hit:
+            if current_label == self.UNLABELED:
+                # Erase label
+                if idx in self.point_labels_xz:
+                    del self.point_labels_xz[idx]
+            else:
+                # Set label
+                self.point_labels_xz[idx] = current_label
+        
+        # Update display
+        brushes = self.get_brushes_xz()
+        self.overlay_scatter_xz.setBrush(brushes)
+        self.update_labels_status()
+
+    def update_labels_status(self):
+        """Update the status label with the count of custom labels."""
+        total_labels = len(self.point_labels_xy) + len(self.point_labels_xz)
+        self.labels_status.setText(f"Custom labels: {total_labels}")
+
+    def clear_custom_labels(self):
+        """Clear all custom point labels."""
+        self.point_labels_xy.clear()
+        self.point_labels_xz.clear()
+        self.update_labels_status()
+        # Refresh the display
+        if hasattr(self, 'overlay_scatter'):
+            brushes = self.get_brushes()
+            self.overlay_scatter.setBrush(brushes)
+        if hasattr(self, 'overlay_scatter_xz'):
+            brushes = self.get_brushes_xz()
+            self.overlay_scatter_xz.setBrush(brushes)
+        print("Cleared all custom labels")
+
     def closeEvent(self, event):
         if self.debounce_timer.isActive():
             self.debounce_timer.stop()
@@ -859,3 +1425,227 @@ class OmeZarrViewWindow(QMainWindow):
             self.overlay_thread.wait()
         print("OME-Zarr View Window is closing.")
         super().closeEvent(event)
+
+    def update_views(self):
+        """Trigger view updates when gradient checkbox is toggled."""
+        # Force brush update on both views
+        if hasattr(self, 'overlay_scatter'):
+            brushes = self.get_brushes()
+            self.overlay_scatter.setBrush(brushes)
+        if hasattr(self, 'overlay_scatter_xz'):
+            brushes = self.get_brushes_xz()
+            self.overlay_scatter_xz.setBrush(brushes)
+
+    def apply_labels_to_graph(self):
+        """Apply point labels back to graph nodes based on voting criteria."""
+        if not hasattr(self, 'persistent_overlay_worker'):
+            QMessageBox.warning(self, "Error", "Overlay worker not initialized")
+            return
+            
+        # Debug: Check if we have the necessary mappings
+        print(f"\nDEBUG: Starting apply_labels_to_graph")
+        print(f"XY labels: {len(self.point_labels_xy)} points labeled")
+        print(f"XZ labels: {len(self.point_labels_xz)} points labeled")
+        
+        # Process XY and XZ views separately
+        xy_node_labels = {}
+        xz_node_labels = {}
+        
+        # Process XY labels
+        if hasattr(self.persistent_overlay_worker, 'overlay_point_nodes_indices') and self.persistent_overlay_worker.overlay_point_nodes_indices is not None:
+            print(f"\nDEBUG XY: overlay_point_nodes_indices length: {len(self.persistent_overlay_worker.overlay_point_nodes_indices)}")
+            
+            # Check if we have inverse_indices for XY
+            if hasattr(self.persistent_overlay_worker, 'inverse_indices') and self.persistent_overlay_worker.inverse_indices is not None:
+                print(f"DEBUG XY: inverse_indices length: {len(self.persistent_overlay_worker.inverse_indices)}")
+                print(f"DEBUG XY: inverse_indices unique values: {len(np.unique(self.persistent_overlay_worker.inverse_indices))}")
+                
+                # Map displayed points to original points, then to nodes
+                xy_labels_by_node = {}
+                debug_count = 0
+                for display_idx, label in self.point_labels_xy.items():
+                    # Find all original points that map to this display point
+                    original_indices = np.where(self.persistent_overlay_worker.inverse_indices == display_idx)[0]
+                    if debug_count < 5:  # Only show first 5 for debugging
+                        print(f"DEBUG XY: Display point {display_idx} (label={label}) maps to {len(original_indices)} original points")
+                        debug_count += 1
+                    
+                    for orig_idx in original_indices:
+                        if orig_idx < len(self.persistent_overlay_worker.overlay_point_nodes_indices):
+                            node_idx = self.persistent_overlay_worker.overlay_point_nodes_indices[orig_idx]
+                            if node_idx not in xy_labels_by_node:
+                                xy_labels_by_node[node_idx] = []
+                            xy_labels_by_node[node_idx].append(label)
+                
+                print(f"DEBUG XY: Total labeled display points: {len(self.point_labels_xy)}")
+                print(f"DEBUG XY: These expand to label assignments across {sum(len(labels) for labels in xy_labels_by_node.values())} original points")
+            else:
+                print("WARNING: No inverse_indices for XY view - using direct mapping")
+                # Fallback to direct mapping
+                xy_labels_by_node = {}
+                for point_idx, label in self.point_labels_xy.items():
+                    if point_idx < len(self.persistent_overlay_worker.overlay_point_nodes_indices):
+                        node_idx = self.persistent_overlay_worker.overlay_point_nodes_indices[point_idx]
+                        if node_idx not in xy_labels_by_node:
+                            xy_labels_by_node[node_idx] = []
+                        xy_labels_by_node[node_idx].append(label)
+            
+            print(f"DEBUG XY: Labels grouped into {len(xy_labels_by_node)} nodes")
+            
+            # Count total XY points per node
+            xy_total_points = {}
+            for node_idx in self.persistent_overlay_worker.overlay_point_nodes_indices:
+                xy_total_points[node_idx] = xy_total_points.get(node_idx, 0) + 1
+            
+            print(f"DEBUG XY: Total points counted for {len(xy_total_points)} nodes")
+            
+            # Apply voting for XY
+            debug_node_count = 0
+            for node_idx, labels in xy_labels_by_node.items():
+                label_counts = {}
+                for label in labels:
+                    label_counts[label] = label_counts.get(label, 0) + 1
+                
+                # Find most common label
+                max_label = max(label_counts.items(), key=lambda x: x[1])
+                label, count = max_label
+                total = xy_total_points.get(node_idx, 0)
+                
+                if debug_node_count < 10:  # Only show first 10 nodes
+                    print(f"DEBUG XY: Node {node_idx} - {count} labeled points out of {total} total ({count/total*100:.1f}% if total > 0)")
+                    debug_node_count += 1
+                
+                if count >= 3 and total > 0:
+                    percentage = count / total
+                    if percentage >= 0.5:
+                        xy_node_labels[node_idx] = (label, percentage, count)
+                        if debug_node_count <= 10:
+                            print(f"  -> ACCEPTED for XY view")
+                    else:
+                        if debug_node_count <= 10:
+                            print(f"  -> REJECTED: percentage {percentage:.1%} < 50%")
+                else:
+                    if debug_node_count <= 10:
+                        print(f"  -> REJECTED: count {count} < 3 or total {total} = 0")
+            
+            if len(xy_labels_by_node) > 10:
+                print(f"DEBUG XY: ... and {len(xy_labels_by_node) - 10} more nodes")
+            print(f"DEBUG XY: Total nodes with accepted labels: {len(xy_node_labels)}")
+        else:
+            print("WARNING: No overlay_point_nodes_indices for XY view")
+                        
+        # Process XZ labels
+        if hasattr(self.persistent_overlay_worker, 'overlay_point_nodes_indices_xz') and self.persistent_overlay_worker.overlay_point_nodes_indices_xz is not None:
+            print(f"\nDEBUG XZ: overlay_point_nodes_indices_xz length: {len(self.persistent_overlay_worker.overlay_point_nodes_indices_xz)}")
+            
+            # Check if we have inverse_indices for XZ
+            if hasattr(self.persistent_overlay_worker, 'inverse_indices_xz') and self.persistent_overlay_worker.inverse_indices_xz is not None:
+                print(f"DEBUG XZ: inverse_indices_xz length: {len(self.persistent_overlay_worker.inverse_indices_xz)}")
+                print(f"DEBUG XZ: inverse_indices_xz unique values: {len(np.unique(self.persistent_overlay_worker.inverse_indices_xz))}")
+                
+                # Map displayed points to original points, then to nodes
+                xz_labels_by_node = {}
+                debug_count = 0
+                for display_idx, label in self.point_labels_xz.items():
+                    # Find all original points that map to this display point
+                    original_indices = np.where(self.persistent_overlay_worker.inverse_indices_xz == display_idx)[0]
+                    if debug_count < 5:  # Only show first 5 for debugging
+                        print(f"DEBUG XZ: Display point {display_idx} (label={label}) maps to {len(original_indices)} original points")
+                        debug_count += 1
+                    
+                    for orig_idx in original_indices:
+                        if orig_idx < len(self.persistent_overlay_worker.overlay_point_nodes_indices_xz):
+                            node_idx = self.persistent_overlay_worker.overlay_point_nodes_indices_xz[orig_idx]
+                            if node_idx not in xz_labels_by_node:
+                                xz_labels_by_node[node_idx] = []
+                            xz_labels_by_node[node_idx].append(label)
+                
+                print(f"DEBUG XZ: Total labeled display points: {len(self.point_labels_xz)}")
+                print(f"DEBUG XZ: These expand to label assignments across {sum(len(labels) for labels in xz_labels_by_node.values())} original points")
+            else:
+                print("WARNING: No inverse_indices_xz for XZ view - using direct mapping")
+                # Fallback to direct mapping
+                xz_labels_by_node = {}
+                for point_idx, label in self.point_labels_xz.items():
+                    if point_idx < len(self.persistent_overlay_worker.overlay_point_nodes_indices_xz):
+                        node_idx = self.persistent_overlay_worker.overlay_point_nodes_indices_xz[point_idx]
+                        if node_idx not in xz_labels_by_node:
+                            xz_labels_by_node[node_idx] = []
+                        xz_labels_by_node[node_idx].append(label)
+            
+            # Count total XZ points per node
+            xz_total_points = {}
+            for node_idx in self.persistent_overlay_worker.overlay_point_nodes_indices_xz:
+                xz_total_points[node_idx] = xz_total_points.get(node_idx, 0) + 1
+            
+            # Apply voting for XZ
+            for node_idx, labels in xz_labels_by_node.items():
+                label_counts = {}
+                for label in labels:
+                    label_counts[label] = label_counts.get(label, 0) + 1
+                
+                # Find most common label
+                max_label = max(label_counts.items(), key=lambda x: x[1])
+                label, count = max_label
+                total = xz_total_points.get(node_idx, 0)
+                
+                if count >= 3 and total > 0:
+                    percentage = count / total
+                    if percentage >= 0.5:
+                        xz_node_labels[node_idx] = (label, percentage, count)
+        
+        # Combine results with disambiguation
+        node_updates = {}
+        all_nodes = set(xy_node_labels.keys()) | set(xz_node_labels.keys())
+        
+        for node_idx in all_nodes:
+            xy_data = xy_node_labels.get(node_idx)
+            xz_data = xz_node_labels.get(node_idx)
+            
+            if xy_data and xz_data:
+                # Both views have valid labels
+                xy_label, xy_pct, xy_count = xy_data
+                xz_label, xz_pct, xz_count = xz_data
+                
+                if xy_label == xz_label:
+                    # Same label in both views
+                    node_updates[node_idx] = xy_label
+                else:
+                    # Different labels - choose the one with higher percentage
+                    if xy_pct > xz_pct:
+                        node_updates[node_idx] = xy_label
+                        print(f"Node {node_idx}: XY label {xy_label} ({xy_pct:.1%}) wins over XZ label {xz_label} ({xz_pct:.1%})")
+                    elif xz_pct > xy_pct:
+                        node_updates[node_idx] = xz_label
+                        print(f"Node {node_idx}: XZ label {xz_label} ({xz_pct:.1%}) wins over XY label {xy_label} ({xy_pct:.1%})")
+                    else:
+                        # Same percentage - use the one with more points
+                        if xy_count >= xz_count:
+                            node_updates[node_idx] = xy_label
+                        else:
+                            node_updates[node_idx] = xz_label
+            elif xy_data:
+                # Only XY has valid label
+                node_updates[node_idx] = xy_data[0]
+            elif xz_data:
+                # Only XZ has valid label
+                node_updates[node_idx] = xz_data[0]
+                
+        if node_updates:
+            # Emit signal to update gui_main
+            self.labels_updated_signal.emit(node_updates)
+            
+            # Create detailed message
+            xy_only = sum(1 for n in node_updates if n in xy_node_labels and n not in xz_node_labels)
+            xz_only = sum(1 for n in node_updates if n in xz_node_labels and n not in xy_node_labels)
+            both = sum(1 for n in node_updates if n in xy_node_labels and n in xz_node_labels)
+            
+            msg = f"Updated {len(node_updates)} nodes:\n"
+            msg += f"- {xy_only} from XY view only\n"
+            msg += f"- {xz_only} from XZ view only\n"
+            msg += f"- {both} from both views"
+            
+            QMessageBox.information(self, "Labels Applied", msg)
+        else:
+            QMessageBox.information(self, "No Updates", 
+                                    "No nodes met the criteria (≥3 points and ≥50% agreement)\nCheck console for debug information")
