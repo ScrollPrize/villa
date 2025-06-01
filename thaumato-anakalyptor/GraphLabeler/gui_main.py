@@ -3774,29 +3774,18 @@ class PointCloudLabeler(QMainWindow):
         # Get the drawing radius
         radius = self.radius_spinbox.value()
         
-        # Get the mapping from solver node indices to points array indices
-        undeleted_indices = np.array(self.solver.get_undeleted_indices())
-        print(f"Undeleted indices mapping: {len(undeleted_indices)} undeleted nodes to {len(self.points)} total points")
-        
         # Apply the label updates with radius expansion using view-specific logic
         updated_count = 0
         total_affected_nodes = 0
         
         for solver_node_idx, new_label in node_updates.items():
-            # Map from solver node index to points array index
-            if not (0 <= solver_node_idx < len(undeleted_indices)):
-                print(f"Warning: solver node index {solver_node_idx} out of range for undeleted indices")
+            # Direct indexing - no mapping needed since arrays are in undeleted space
+            if not (0 <= solver_node_idx < len(self.labels)):
+                print(f"Warning: node index {solver_node_idx} out of range")
                 continue
                 
-            points_idx = undeleted_indices[solver_node_idx]
-            if not (0 <= points_idx < len(self.points)):
-                print(f"Warning: mapped points index {points_idx} out of range")
-                continue
-                
-            print(f"Mapping solver node {solver_node_idx} -> points index {points_idx}")
-            
             # Get the position of the updated node
-            node_pos = self.points[points_idx]
+            node_pos = self.points[solver_node_idx]
             
             # Use view-specific logic based on which view the updates came from
             if view_type == "XY":
@@ -3839,14 +3828,14 @@ class PointCloudLabeler(QMainWindow):
                 
                 total_affected_nodes += len(affected_indices)
                 updated_count += 1
-                print(f"Updated solver node {solver_node_idx} (points index {points_idx}) to label {new_label} ({view_type} view), affecting {len(affected_indices)} nearby nodes within radius {radius}")
+                print(f"Updated node {solver_node_idx} to label {new_label} ({view_type} view), affecting {len(affected_indices)} nearby nodes within radius {radius}")
             else:
                 # Just update the single node if no nearby nodes found
-                self.labels[points_idx] = new_label
-                self.group[points_idx] = self.active_group
+                self.labels[solver_node_idx] = new_label
+                self.group[solver_node_idx] = self.active_group
                 updated_count += 1
                 total_affected_nodes += 1
-                print(f"Updated solver node {solver_node_idx} (points index {points_idx}) to label {new_label} ({view_type} view) - no nearby nodes within radius")
+                print(f"Updated node {solver_node_idx} to label {new_label} ({view_type} view) - no nearby nodes within radius")
         
         # Update the views to reflect the changes
         self.update_views()
