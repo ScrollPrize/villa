@@ -1499,8 +1499,8 @@ class OmeZarrViewWindow(QMainWindow):
             print(f"DEBUG XY: inverse_indices unique values: {len(np.unique(self.persistent_overlay_worker.inverse_indices))}")
             
             # Find all close nodes that map to the display points
-            labels_extended_all_points = np.array(points_labels)[self.persistent_overlay_worker.inverse_indices]
-            labels_extended_nodes = labels_extended_all_points[self.persistent_overlay_worker.overlay_point_nodes_indices]
+            labels_extended_all_points = np.array(self.point_labels_xy)[self.persistent_overlay_worker.inverse_indices]
+            labels_extended_nodes = self.persistent_overlay_worker.overlay_point_nodes_indices[labels_extended_all_points]
             
             # Count total XY points per close node
             xy_nodes_labels = {}
@@ -1547,8 +1547,8 @@ class OmeZarrViewWindow(QMainWindow):
             
             print(f"DEBUG XZ: inverse_indices_xz length: {len(self.persistent_overlay_worker.inverse_indices_xz)}")
 
-            labels_extended_all_points = np.array(points_labels)[self.persistent_overlay_worker.inverse_indices]
-            labels_extended_nodes = labels_extended_all_points[self.persistent_overlay_worker.overlay_point_nodes_indices]
+            labels_extended_all_points = np.array(self.point_labels_xz)[self.persistent_overlay_worker.inverse_indices_xz]
+            labels_extended_nodes = self.persistent_overlay_worker.overlay_point_nodes_indices_xz[labels_extended_all_points]
             
             xz_nodes_labels = {}
             for i in range(len(labels_extended_all_points)):
