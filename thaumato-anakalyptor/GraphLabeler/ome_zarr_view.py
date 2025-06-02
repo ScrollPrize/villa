@@ -29,7 +29,7 @@ def load_graph_pkl(graph_pkl_path, use_h5=False):
     Load graph data and return as arrays/lists for faster access.
     Returns (centroids, node_keys, sample_points) where:
     - centroids: numpy 2D array (n_nodes, 3) as float16
-    - node_keys: numpy 2D array (n_nodes, 4) as uint16 (preserves 4-tuple structure)
+    - node_keys: numpy 2D array (n_nodes, 4) as int16 (preserves 4-tuple structure, can be negative)
     - sample_points: list of 1D float16 arrays (only if not use_h5)
     
     If NPZ exists, loads from there. Otherwise creates NPZ from PKL or H5 source.
@@ -43,7 +43,7 @@ def load_graph_pkl(graph_pkl_path, use_h5=False):
         try:
             npz_data = np.load(npz_path, allow_pickle=True)
             centroids = npz_data['centroids']  # float16, 2D
-            node_keys = npz_data['node_keys']   # uint16, 2D
+            node_keys = npz_data['node_keys']   # int16, 2D
             
             if use_h5:
                 sample_points = None
@@ -163,7 +163,11 @@ def load_graph_pkl(graph_pkl_path, use_h5=False):
         try:
             # Convert key (should be 4-tuple) to numpy array
             if isinstance(key, (tuple, list)) and len(key) == 4:
-                key_array = np.array(key, dtype=np.uint16)
+                key_array = np.array(key, dtype=np.int16)
+                # Check for overflow
+                original_key = np.array(key, dtype=np.int64)
+                if not np.array_equal(key_array.astype(np.int64), original_key):
+                    print(f"Warning: Node key {key} has values outside int16 range, values may be clipped", file=sys.stderr)
                 node_keys_list.append(key_array)
             else:
                 print(f"Warning: Node key {key} is not a 4-tuple, skipping", file=sys.stderr)
@@ -194,7 +198,7 @@ def load_graph_pkl(graph_pkl_path, use_h5=False):
     
     # Convert lists to final arrays
     centroids = np.array(centroids_list, dtype=np.float16)  # 2D array (n, 3)
-    node_keys = np.array(node_keys_list, dtype=np.uint16)   # 2D array (n, 4)
+    node_keys = np.array(node_keys_list, dtype=np.int16)   # 2D array (n, 4)
     
     print(f"[Debug] Final node_keys shape: {node_keys.shape}, centroids shape: {centroids.shape}", file=sys.stderr)
     
