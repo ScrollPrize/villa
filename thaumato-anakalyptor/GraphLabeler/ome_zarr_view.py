@@ -18,7 +18,7 @@ try:
     del sys.modules['scroll_graph_util']
 except KeyError:
     print("Module 'scroll_graph_util' not found in sys.modules; continuing.")
-from scroll_graph_util import compute_mean_windings_precomputed, load_xyz_from_file, umbilicus_xy_at_z
+from scroll_graph_util import compute_mean_windings_precomputed, load_xyz_from_file, umbilicus_xy_at_z, get_points_XY_from_arrays, get_points_XZ_from_arrays
 
 ########################################
 # Utility Functions
@@ -540,45 +540,23 @@ class PersistentScrollGraphWorker(QObject):
 
     def get_points_XY(self, z_index, h5_path, labels, computed_labels, f_init, undeleted_nodes_indices, unlabeled, block_size):
         """
-        Reimplemented to work with arrays instead of graph object.
+        Array-based implementation using the new scroll_graph_util functions.
         """
-        # Convert arrays to the format expected by scroll_graph_util functions
-        # This is a placeholder - you'll need to implement the actual logic
-        # based on what the original get_points_XY method did
-        
-        # For now, return dummy data with the correct structure
-        n_nodes = len(self.node_keys)
-        overlay_points = self.centroids.copy()  # Use centroids as points
-        overlay_point_nodes_indices = np.arange(min(1000, n_nodes))  # Limit to first 1000
-        overlay_windings = np.ones(len(overlay_point_nodes_indices)) * unlabeled
-        overlay_windings_computed = np.ones(len(overlay_point_nodes_indices)) * unlabeled
-        inverse_indices = np.arange(len(overlay_point_nodes_indices))
-        winding = labels.copy() if len(labels) > 0 else np.array([unlabeled])
-        winding_computed = computed_labels.copy() if len(computed_labels) > 0 else np.array([unlabeled])
-        close_mask = np.ones(len(winding), dtype=bool)
-        
-        return (overlay_points[:len(overlay_point_nodes_indices)], overlay_point_nodes_indices, 
-                overlay_windings, overlay_windings_computed, inverse_indices, 
-                winding, winding_computed, close_mask)
+        return get_points_XY_from_arrays(
+            self.centroids, self.node_keys, self.sample_points,
+            z_index, h5_path, labels, computed_labels, f_init, 
+            undeleted_nodes_indices, unlabeled, block_size
+        )
 
     def get_points_XZ(self, f_target, umbilicus_data, h5_path, labels, computed_labels, f_init, undeleted_nodes_indices, unlabeled, block_size):
         """
-        Reimplemented to work with arrays instead of graph object.
+        Array-based implementation using the new scroll_graph_util functions.
         """
-        # Similar to get_points_XY, implement the XZ version
-        n_nodes = len(self.node_keys)
-        overlay_points = self.centroids.copy()  # Use centroids as points
-        overlay_point_nodes_indices = np.arange(min(1000, n_nodes))  # Limit to first 1000
-        overlay_windings = np.ones(len(overlay_point_nodes_indices)) * unlabeled
-        overlay_windings_computed = np.ones(len(overlay_point_nodes_indices)) * unlabeled
-        inverse_indices = np.arange(len(overlay_point_nodes_indices))
-        winding = labels.copy() if len(labels) > 0 else np.array([unlabeled])
-        winding_computed = computed_labels.copy() if len(computed_labels) > 0 else np.array([unlabeled])
-        close_mask = np.ones(len(winding), dtype=bool)
-        
-        return (overlay_points[:len(overlay_point_nodes_indices)], overlay_point_nodes_indices, 
-                overlay_windings, overlay_windings_computed, inverse_indices, 
-                winding, winding_computed, close_mask)
+        return get_points_XZ_from_arrays(
+            self.centroids, self.node_keys, self.sample_points,
+            f_target, umbilicus_data, h5_path, labels, computed_labels, f_init,
+            undeleted_nodes_indices, unlabeled, block_size
+        )
 
 ########################################
 # Main OME-Zarr View Window
