@@ -439,3 +439,318 @@ class ScrollGraph(Graph):
         print(f"Computed mean winding for {points.shape} unique 3D points for XZ view on umbilicus plane with f_target {f_target}")
         
         return points, point_nodes_indices, windings, windings_computed, inverse_indices, winding, winding_computed, centroid_close_mask
+
+########################################
+# Array-based versions of ScrollGraph methods
+########################################
+
+def load_nodes_from_arrays(centroids, node_keys, sample_points, close_node_indices, winding_angles_nodes, winding_angles_nodes_computed, h5_filename=None):
+    """
+    Load nodes from array-based data instead of graph object.
+    
+    Parameters:
+        centroids: numpy 2D array (n_nodes, 3) as float16
+        node_keys: numpy 1D array (n_nodes,) as uint16
+        sample_points: list of 1D float16 arrays (or None for H5 mode)
+        close_node_indices: indices of nodes to load
+        winding_angles_nodes: winding angles for each node
+        winding_angles_nodes_computed: computed winding angles for each node
+        h5_filename: path to H5 file (if None, uses sample_points)
+    
+    Returns:
+        points_all: concatenated points with winding info
+        point_nodes_indices: mapping from points back to node indices
+    """
+    use_h5 = h5_filename is not None and h5_filename.endswith(".h5")
+    
+    if use_h5:
+        # Use H5 file loading (similar to original load_nodes method)
+        return load_nodes_h5_from_arrays(centroids, node_keys, close_node_indices, winding_angles_nodes, winding_angles_nodes_computed, h5_filename)
+    else:
+        # Use sample_points from arrays
+        return load_nodes_graph_from_arrays(sample_points, close_node_indices, winding_angles_nodes, winding_angles_nodes_computed)
+
+def load_nodes_h5_from_arrays(centroids, node_keys, close_node_indices, winding_angles_nodes, winding_angles_nodes_computed, h5_filename):
+    """Load nodes from H5 file using array-based node information."""
+    nodes_points = []
+    point_nodes_indices = []
+    
+    # Build groups dictionary using array data
+    groups_dict = {}
+    for i, node_idx in enumerate(close_node_indices):
+        # Get centroid for this node
+        centroid = centroids[node_idx] * 4.0 - 500  # Scale to scroll coordinates
+        start_coord = [int(centroid[1]), int(centroid[0]), int(centroid[2])]  # [y, z, x] order
+        group_name = f"{start_coord[0]:06}_{start_coord[1]:06}_{start_coord[2]:06}"
+        surface_nr = int(node_keys[node_idx])  # Use node key as surface number
+        groups_dict.setdefault(group_name, []).append((surface_nr, i))
+    
+    total_surfaces = sum(len(entries) for entries in groups_dict.values())
+    
+    # Load from H5 file
+    with h5py.File(h5_filename, "r") as h5f, tqdm(total=total_surfaces, desc="Loading nodes from arrays") as pbar:
+        for group_name, entries in groups_dict.items():
+            if group_name not in h5f:
+                print(f"Group {group_name} not found in {h5_filename}")
+                pbar.update(len(entries))
+                continue
+            grp = h5f[group_name]
+            
+            for surface_nr, idx in entries:
+                surface_name = f"surface_{surface_nr}"
+                if surface_name not in grp:
+                    print(f"Surface {surface_name} not found in {h5_filename}")
+                    pbar.update(1)
+                    continue
+                surface = grp[surface_name]
+                try:
+                    points = surface["points"][()]
+                    if points.shape[1] != 3:
+                        raise ValueError(f"Invalid points shape: {points.shape}")
+                    
+                    # Add winding angles
+                    winding_angle = winding_angles_nodes[idx]
+                    winding_angle_computed = winding_angles_nodes_computed[idx]
+                    winding_col = np.full((points.shape[0], 1), winding_angle, dtype=np.float32)
+                    winding_col_computed = np.full((points.shape[0], 1), winding_angle_computed, dtype=np.float32)
+                    points = np.concatenate([points, winding_col, winding_col_computed], axis=1)
+                    nodes_points.append(points)
+                    point_nodes_indices.extend([idx for _ in range(points.shape[0])])
+                except Exception as e:
+                    print(f"Error loading subvolume {group_name} patch {surface_nr}: {e}")
+                pbar.update(1)
+    
+    if nodes_points:
+        points_all = np.concatenate(nodes_points, axis=0)
+    else:
+        points_all = np.empty((0, 5), dtype=np.float32)
+    return points_all, np.array(point_nodes_indices)
+
+def load_nodes_graph_from_arrays(sample_points, close_node_indices, winding_angles_nodes, winding_angles_nodes_computed):
+    """Load nodes from sample_points arrays."""
+    nodes_points = []
+    point_nodes_indices = []
+    
+    with tqdm(total=len(close_node_indices), desc="Loading nodes from sample_points") as pbar:
+        for i, node_idx in enumerate(close_node_indices):
+            try:
+                if sample_points is None or node_idx >= len(sample_points):
+                    print(f"No sample points for node index {node_idx}")
+                    pbar.update(1)
+                    continue
+                    
+                points_1d = sample_points[node_idx]
+                if len(points_1d) == 0 or len(points_1d) % 3 != 0:
+                    print(f"Invalid sample points shape for node {node_idx}: {len(points_1d)}")
+                    pbar.update(1)
+                    continue
+                
+                # Reshape 1D array to Nx3
+                points = points_1d.reshape(-1, 3)
+                
+                # Add winding angles
+                winding_angle = winding_angles_nodes[i]
+                winding_angle_computed = winding_angles_nodes_computed[i]
+                winding_col = np.full((points.shape[0], 1), winding_angle, dtype=np.float32)
+                winding_col_computed = np.full((points.shape[0], 1), winding_angle_computed, dtype=np.float32)
+                points = np.concatenate([points, winding_col, winding_col_computed], axis=1)
+                nodes_points.append(points)
+                point_nodes_indices.extend([i for _ in range(points.shape[0])])
+            except Exception as e:
+                print(f"Error loading node {node_idx} from sample_points: {e}")
+            pbar.update(1)
+    
+    if nodes_points:
+        points_all = np.concatenate(nodes_points, axis=0)
+    else:
+        points_all = np.empty((0, 5), dtype=np.float32)
+    return points_all, np.array(point_nodes_indices)
+
+def get_points_XY_from_arrays(centroids, node_keys, sample_points, z_index, h5_filename, labels, computed_labels, f_init, undeleted_nodes_indices, unlabeled, block_size=200):
+    """
+    Array-based version of ScrollGraph.get_points_XY.
+    
+    Parameters:
+        centroids: numpy 2D array (n_nodes, 3) as float16
+        node_keys: numpy 1D array (n_nodes,) as uint16
+        sample_points: list of 1D float16 arrays (or None for H5)
+        z_index: Z slice index
+        h5_filename: path to H5 file
+        labels: current labels for each node
+        computed_labels: computed labels for each node
+        f_init: initial winding offset per node
+        undeleted_nodes_indices: indices of undeleted nodes
+        unlabeled: value indicating unlabeled node
+        block_size: tolerance for node filtering
+    
+    Returns:
+        Same as original get_points_XY method
+    """
+    use_h5 = h5_filename is not None and h5_filename.endswith(".h5")
+    if not use_h5:
+        block_size *= 2  # Use more nodes for fuller pointcloud display
+    
+    # Get subset of nodes corresponding to undeleted indices
+    node_keys_subset = node_keys[undeleted_nodes_indices]
+    centroids_subset = centroids[undeleted_nodes_indices]
+    
+    winding_angles_nodes = np.asarray(labels) * 360.0 + np.asarray(f_init)
+    winding_angles_nodes_computed = np.asarray(computed_labels) * 360.0 + np.asarray(f_init)
+    assert len(winding_angles_nodes) == len(node_keys_subset), f"Length mismatch: {len(winding_angles_nodes)} != {len(node_keys_subset)}"
+
+    # Check which nodes are close to the z_index
+    # centroids are in [y, z, x] order, scale to scroll coordinates
+    scaled_centroids = centroids_subset * 4.0 - 500
+    close_mask = np.abs(scaled_centroids[:, 1] - z_index) < block_size  # Check z coordinate
+    
+    close_node_indices = np.where(close_mask)[0]  # Indices in the subset
+    close_angles = winding_angles_nodes[close_mask]
+    close_angles_computed = winding_angles_nodes_computed[close_mask]
+
+    print(f"Found {len(close_node_indices)} close nodes at z_index {z_index} of total {len(node_keys_subset)} undeleted nodes")
+
+    # Load points from these nodes
+    plane_point_filter_distance = 3
+    if not use_h5:
+        # Map subset indices back to full array indices for sample_points access
+        full_indices = undeleted_nodes_indices[close_node_indices]
+        points, point_nodes_indices = load_nodes_graph_from_arrays(sample_points, full_indices, close_angles, close_angles_computed)
+        plane_point_filter_distance = 10
+    else:
+        # For H5, we can use the subset indices directly
+        points, point_nodes_indices = load_nodes_h5_from_arrays(centroids_subset, node_keys_subset, close_node_indices, close_angles, close_angles_computed, h5_filename)
+
+    print(f"Loaded {points.shape} points for XY view at z_index {z_index}")
+
+    # Scale points to scroll coordinates
+    points[:, :3] = points[:, :3] * 4.0 - 500
+    # Swap axis: [y, z, x] -> [z, y, x]
+    points = points[:, [1, 0, 2, 3, 4]]
+
+    # Filter points in z slice
+    print(f"Filtering points for XY view with distance {plane_point_filter_distance}")
+    mask = np.abs(points[:, 0] - z_index) < plane_point_filter_distance
+    points = points[mask]
+    point_nodes_indices = point_nodes_indices[mask]
+
+    print(f"Filtered {points.shape} points for XY view at z_index {z_index}")
+
+    # Sort points by ZXY
+    points_sort_indices = np.lexsort((points[:, 0], points[:, 1], points[:, 2], points[:, 3], points[:, 4]))
+    points = points[points_sort_indices]
+    point_nodes_indices = point_nodes_indices[points_sort_indices]
+
+    # Compute unique points with mean winding angle
+    points, windings, windings_computed, inverse_indices, winding, winding_computed = compute_mean_winding(points[:, :3], points[:, 3], points[:, 4], unlabeled)
+
+    print(f"Computed mean winding for {points.shape} unique 3D points for XY view at z_index {z_index}")
+
+    return points, point_nodes_indices, windings, windings_computed, inverse_indices, winding, winding_computed, close_mask
+
+def get_points_XZ_from_arrays(centroids, node_keys, sample_points, f_target, umbilicus_data, h5_filename, labels, computed_labels, f_init, undeleted_nodes_indices, unlabeled, block_size=200):
+    """
+    Array-based version of ScrollGraph.get_points_XZ.
+    
+    Parameters:
+        centroids: numpy 2D array (n_nodes, 3) as float16
+        node_keys: numpy 1D array (n_nodes,) as uint16  
+        sample_points: list of 1D float16 arrays (or None for H5)
+        f_target: angle defining the target umbilicus plane
+        umbilicus_data: umbilicus center data
+        h5_filename: path to H5 file
+        labels: current labels for each node
+        computed_labels: computed labels for each node
+        f_init: initial winding offset per node
+        undeleted_nodes_indices: indices of undeleted nodes
+        unlabeled: value indicating unlabeled node
+        block_size: tolerance for node filtering
+    
+    Returns:
+        Same as original get_points_XZ method
+    """
+    # Convert target angle to radians and compute vectors
+    f_target_rad = np.deg2rad(f_target)
+    normal = np.array([-np.sin(f_target_rad), np.cos(f_target_rad)])
+    tangent = np.array([-np.cos(f_target_rad), -np.sin(f_target_rad)])
+
+    print(f"Angle: {f_target} degrees, normal: {normal}, tangent: {tangent}")
+    
+    use_h5 = h5_filename is not None and h5_filename.endswith(".h5")
+    if not use_h5:
+        block_size *= 2
+    
+    # Get subset of nodes corresponding to undeleted indices
+    node_keys_subset = node_keys[undeleted_nodes_indices]
+    centroids_subset = centroids[undeleted_nodes_indices]
+    
+    winding_angles_nodes = np.asarray(labels) * 360.0 + np.asarray(f_init)
+    winding_angles_nodes_computed = np.asarray(computed_labels) * 360.0 + np.asarray(f_init)
+    assert len(winding_angles_nodes) == len(node_keys_subset), f"Length mismatch: {len(winding_angles_nodes)} != {len(node_keys_subset)}"
+    
+    # Filter nodes based on centroid distance from umbilicus plane
+    # Scale centroids to scroll coordinates
+    scaled_centroids = centroids_subset * 4.0 - 500
+    
+    # Extract centroid_xy and z_val arrays - centroids are [y, z, x], we want [x, y]
+    centroid_xy = scaled_centroids[:, [2, 0]]  # [x, y]
+    z_vals = scaled_centroids[:, 1]  # z values
+    
+    # Get umbilicus centers for all z slices
+    centers = umbilicus_xy_at_z_vector(umbilicus_data, z_vals)
+    
+    # Compute distances to umbilicus plane
+    distances = np.abs((centroid_xy - centers) @ normal)
+    centroid_close_mask = distances < block_size
+    
+    close_node_indices = np.where(centroid_close_mask)[0]
+    close_angles = winding_angles_nodes[centroid_close_mask]
+    close_angles_computed = winding_angles_nodes_computed[centroid_close_mask]
+    
+    print(f"Found {len(close_node_indices)} close nodes based on umbilicus plane filtering out of {len(node_keys_subset)} undeleted nodes.")
+    
+    plane_point_filter_distance = 3
+    # Load points from these nodes
+    if not use_h5:
+        # Map subset indices back to full array indices for sample_points access
+        full_indices = undeleted_nodes_indices[close_node_indices]
+        points, point_nodes_indices = load_nodes_graph_from_arrays(sample_points, full_indices, close_angles, close_angles_computed)
+        plane_point_filter_distance = 10
+    else:
+        points, point_nodes_indices = load_nodes_h5_from_arrays(centroids_subset, node_keys_subset, close_node_indices, close_angles, close_angles_computed, h5_filename)
+    
+    print(f"Loaded {points.shape} points for XZ view on umbilicus plane with f_target {f_target}")
+    
+    # Scale point coordinates
+    points[:, :3] = points[:, :3] * 4.0 - 500
+    # Swap axis: [y, z, x] -> [z, x, y]
+    points = points[:, [1, 2, 0, 3, 4]]
+    
+    # Vectorized per-point filtering
+    z_vals = points[:, 0]
+    centers = umbilicus_xy_at_z_vector(umbilicus_data, z_vals)
+    diff = points[:, 1:3] - centers  # [x, y] difference
+    distance = np.abs(np.sum(diff * normal, axis=1))
+    
+    print(f"Filtering points for XZ view with distance {plane_point_filter_distance}")
+    points_distance_mask = distance < plane_point_filter_distance
+    
+    points = points[points_distance_mask]
+    point_nodes_indices = point_nodes_indices[points_distance_mask]
+    centers = centers[points_distance_mask]
+    print(f"Filtered {points.shape} points based on per-point distance to the umbilicus plane.")
+    
+    # Update point coordinates for XZ umbilicus plane view
+    new_x = np.sum((points[:, [1,2]] - centers) * tangent, axis=1)
+    points[:, 1] = new_x
+    
+    # Sort points lexicographically
+    points_sort_indices = np.lexsort((points[:, 0], points[:, 1], points[:, 2], points[:, 3], points[:, 4]))
+    points = points[points_sort_indices]
+    point_nodes_indices = point_nodes_indices[points_sort_indices]
+    
+    # Compute unique points with mean winding values
+    points, windings, windings_computed, inverse_indices, winding, winding_computed = \
+        compute_mean_winding(points[:, :3], points[:, 3], points[:, 4], unlabeled)
+    print(f"Computed mean winding for {points.shape} unique 3D points for XZ view on umbilicus plane with f_target {f_target}")
+    
+    return points, point_nodes_indices, windings, windings_computed, inverse_indices, winding, winding_computed, centroid_close_mask
