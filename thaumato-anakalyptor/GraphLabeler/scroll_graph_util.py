@@ -164,7 +164,7 @@ class ScrollGraph(Graph):
                         winding_col_computed = np.full((points.shape[0], 1), winding_angle_computed, dtype=np.float32)
                         points = np.concatenate([points, winding_col, winding_col_computed], axis=1)
                         nodes_points.append(points)
-                        point_nodes_indices.extend([idx] * points.shape[0])
+                        point_nodes_indices.extend([idx for _ in range(points.shape[0])])
                     except Exception as e:
                         print(f"Error loading subvolume {group_name} patch {surface_nr} from {h5_filename}: {e}")
                     pbar.update(1)
@@ -212,7 +212,7 @@ class ScrollGraph(Graph):
                         winding_col_computed = np.full((points.shape[0], 1), winding_angle_computed, dtype=np.float32)
                         points = np.concatenate([points, winding_col, winding_col_computed], axis=1)
                         nodes_points.append(points)
-                        point_nodes_indices.extend([idx] * points.shape[0])
+                        point_nodes_indices.extend([idx for _ in range(points.shape[0])])
                     except Exception as e:
                         print(f"Error loading node {node_key} from the graph: {e}")
                     pbar.update(1)

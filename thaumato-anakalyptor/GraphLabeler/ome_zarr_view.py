@@ -1502,6 +1502,8 @@ class OmeZarrViewWindow(QMainWindow):
             labels_extended_all_points = np.array(self.point_labels_xy)[self.persistent_overlay_worker.inverse_indices]
             points_indices = np.arange(len(labels_extended_all_points))
             extended_nodes = self.persistent_overlay_worker.overlay_point_nodes_indices[points_indices]
+
+            print(f"Number of unique nodes: {len(np.unique(extended_nodes))}")
             
             # Count total XY points per close node
             xy_nodes_labels = {}
