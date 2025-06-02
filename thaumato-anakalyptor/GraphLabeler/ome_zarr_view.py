@@ -1403,7 +1403,9 @@ class OmeZarrViewWindow(QMainWindow):
 
     def update_labels_status(self):
         """Update the status label with the count of custom labels."""
-        total_labels = np.sum(np.abs(np.array(self.point_labels_xy) - self.UNLABELED) > 2) + np.sum(np.abs(np.array(self.point_labels_xz) - self.UNLABELED) > 2)
+        total_labels_xy = np.sum(np.abs(np.array(self.point_labels_xy) - self.UNLABELED) > 2) if not self.point_labels_xy is None else 0
+        total_labels_xz = np.sum(np.abs(np.array(self.point_labels_xz) - self.UNLABELED) > 2) if not self.point_labels_xz is None else 0
+        total_labels = total_labels_xy + total_labels_xz
         self.labels_status.setText(f"Custom labels: {total_labels}")
 
     def clear_custom_labels(self):
