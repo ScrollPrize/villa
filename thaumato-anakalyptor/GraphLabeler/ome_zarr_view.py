@@ -1529,6 +1529,7 @@ class OmeZarrViewWindow(QMainWindow):
                         undeleted_idx = close_indices_xy[node_of_point]  # close space → undeleted space
                         full_space_idx = self.undeleted_nodes_indices[undeleted_idx]  # undeleted space → full space
                         xy_node_labels[full_space_idx] = (label, percentage, count)
+                        print(f"  -> ACCEPTED: node {full_space_idx} with label {label} ({percentage:.1%}), total {total} points")
                 else:
                     print(f"  -> REJECTED: count {count} < 3 or total {total} = 0")
                     print(f"  -> REJECTED: percentage {percentage:.1%} < 50%")
