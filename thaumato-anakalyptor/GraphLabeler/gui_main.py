@@ -901,7 +901,11 @@ class PointCloudLabeler(QMainWindow):
             ome_zarr_path=self.ome_zarr_path,
             graph_pkl_path=self.graph_pkl_path,
             h5_path=self.h5_path,
-            umbilicus_path=self.umbilicus_path
+            umbilicus_path=self.umbilicus_path,
+            # Pass color configuration from main GUI
+            active_brushes=self.active_brushes,
+            num_colors=self.num_colors,
+            unlabeled_value=self.UNLABELED
         )
         # Connect the destroyed signal so that when the window is closed,
         # we automatically set our pointer to None.

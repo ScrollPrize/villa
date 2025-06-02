@@ -464,14 +464,19 @@ class OmeZarrViewWindow(QMainWindow):
     labels_updated_signal = pyqtSignal(dict, str)  # (node_updates, view_type)
 
     def __init__(self, graph_labels, solver, experiment_path, ome_zarr_path,
-                 graph_pkl_path, h5_path, umbilicus_path, parent=None):
+                 graph_pkl_path, h5_path, umbilicus_path, parent=None,
+                 active_brushes=None, num_colors=3, unlabeled_value=-9999):
         super().__init__(parent)
         self.setWindowTitle("OME-Zarr Views")
         self.setAttribute(Qt.WA_DeleteOnClose)
 
         os.makedirs("GraphLabelerViews", exist_ok=True)
 
-        self.UNLABELED = -9999
+        self.UNLABELED = unlabeled_value
+        # Store color configuration from main GUI
+        self.active_brushes = active_brushes
+        self.num_colors = num_colors
+        
         self.graph_labels = graph_labels
         self.solver = solver
         self.experiment_path = experiment_path
@@ -1205,7 +1210,7 @@ class OmeZarrViewWindow(QMainWindow):
         print(f"Drawing radius updated to: {self.drawing_radius}")
     
     def _current_label_qcolor(self):
-        """Return a semi-transparent QColor matching the current label."""
+        """Return a semi-transparent QColor matching the current label, using the same logic as main GUI."""
         lab = self.label_spinbox.value()
         alpha = 150
         
@@ -1213,7 +1218,17 @@ class OmeZarrViewWindow(QMainWindow):
             # Draw erase strokes in dark gray/black
             return QColor(50, 50, 50, alpha)
         
-        # Use gradient coloring for consistency with the displayed points
+        # Use the same logic as main GUI if we have active_brushes
+        if self.active_brushes is not None and len(self.active_brushes) > 0:
+            # Pick brush based on current number of colors (label % num_colors)
+            idx = lab % self.num_colors
+            # Select the corresponding active brush from the configured list
+            if idx < len(self.active_brushes):
+                brush = self.active_brushes[idx]
+                base = brush.color()
+                return QColor(base.red(), base.green(), base.blue(), alpha)
+        
+        # Fallback to original gradient logic if no brushes available
         # Map label to angle (label * 360 degrees)
         angle = (lab * 360.0) % 360
         if angle < 0:
