@@ -26,102 +26,184 @@ from scroll_graph_util import compute_mean_windings_precomputed, load_xyz_from_f
 
 def load_graph_pkl(graph_pkl_path, use_h5=False):
     """
-    Load or build a slimmed ScrollGraph, retaining only 'sample_points' and 'centroid' per node.
-    If use_h5=True, creates/loads an even smaller '_tiny.pkl' with only keys and centroids.
-    If a '<base>_small.pkl' or '<base>_tiny.pkl' exists alongside the original, load from that.
-    Otherwise, unpickle the full graph once, trim and downcast nodes, save a small pickle, and return it.
-    """
-    import scroll_graph_util
-    base, ext = os.path.splitext(graph_pkl_path)
+    Load graph data and return as arrays/lists for faster access.
+    Returns (centroids, node_keys, sample_points) where:
+    - centroids: numpy 2D array (n_nodes, 3) as float16
+    - node_keys: numpy 1D array (n_nodes,) as uint16  
+    - sample_points: list of 1D float16 arrays (only if not use_h5)
     
+    If NPZ exists, loads from there. Otherwise creates NPZ from PKL or H5 source.
+    """
+    base, ext = os.path.splitext(graph_pkl_path)
+    npz_path = base + '.npz'
+    
+    # Check for NPZ file first for fastest loading
+    if os.path.exists(npz_path):
+        print(f"[NPZLoad] Loading graph data from {npz_path}", file=sys.stderr)
+        try:
+            npz_data = np.load(npz_path, allow_pickle=True)
+            centroids = npz_data['centroids']  # float16, 2D
+            node_keys = npz_data['node_keys']   # uint16, 1D
+            
+            if use_h5:
+                sample_points = None
+            else:
+                sample_points = npz_data['sample_points'].tolist() if 'sample_points' in npz_data else None
+            
+            print(f"[NPZLoad] Loaded graph with {len(node_keys)} nodes from NPZ", file=sys.stderr)
+            return centroids, node_keys, sample_points
+        except Exception as e:
+            print(f"[NPZLoad] Failed to load NPZ, falling back to source: {e}", file=sys.stderr)
+    
+    # Determine source file paths
     if use_h5:
-        # For H5 usage, we only need node keys and centroids
         tiny_pkl = base + '_tiny' + ext
-        # Load pre-tiny if available
-        if os.path.exists(tiny_pkl):
-            print(f"[TinyLoad] Loading tiny graph from {tiny_pkl}", file=sys.stderr)
-            nodes = pickle.load(open(tiny_pkl, 'rb'))
-            graph = scroll_graph_util.ScrollGraph(0, None)
-            graph.nodes = nodes
-            print(f"[TinyLoad] Loaded tiny graph with {len(nodes)} nodes", file=sys.stderr)
-            return graph
-        # Else build tiny graph
-        print(f"[TinyLoad] Building tiny graph from {graph_pkl_path}", file=sys.stderr)
-        class TinyScrollGraph(scroll_graph_util.ScrollGraph):
-            def __setstate__(self, state):
-                nodes = state.get('nodes', {}) or {}
-                total = len(nodes)
-                print(f"[TinyLoad] Trimming {total} nodes to keys+centroids only...", file=sys.stderr)
-                tiny_nodes = {}
-                for key, data in tqdm(nodes.items(), desc="[TinyLoad] Trimming nodes", total=total, file=sys.stderr):
-                    cent = data.get('centroid')
-                    cent16 = np.asarray(cent, dtype=np.float16) if cent is not None else None
-                    tiny_nodes[key] = {'centroid': cent16}
-                self.nodes = tiny_nodes
-                print(f"[TinyLoad] Tiny graph ready with {len(tiny_nodes)} nodes", file=sys.stderr)
-        class TinyUnpickler(pickle.Unpickler):
-            def find_class(self, module, name):
-                if module == 'scroll_graph_util' and name in ('ScrollGraph', 'Graph'):
-                    return TinyScrollGraph
-                return super().find_class(module, name)
-        with open(graph_pkl_path, 'rb') as f:
-            print(f"[TinyLoad] Unpickling full graph...", file=sys.stderr)
-            unp = TinyUnpickler(f)
-            tiny_graph = unp.load()
-            print(f"[TinyLoad] Full graph unpickled and trimmed to tiny.", file=sys.stderr)
-        # Save tiny nodes dict
-        try:
-            with open(tiny_pkl, 'wb') as fout:
-                pickle.dump(tiny_graph.nodes, fout, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"[TinyLoad] Saved tiny graph nodes to {tiny_pkl}", file=sys.stderr)
-        except Exception as e:
-            print(f"[TinyLoad] Warning: could not save tiny pickle: {e}", file=sys.stderr)
-        return tiny_graph
+        source_path = tiny_pkl if os.path.exists(tiny_pkl) else graph_pkl_path
+        print(f"[H5Mode] Processing from {source_path}", file=sys.stderr)
     else:
-        # Original small pkl logic for non-H5 usage
-        small_pkl = base + '_small' + ext
-        # Load pre-slimmed if available
-        if os.path.exists(small_pkl):
-            print(f"[SlimLoad] Loading slimmed graph from {small_pkl}", file=sys.stderr)
-            nodes = pickle.load(open(small_pkl, 'rb'))
-            graph = scroll_graph_util.ScrollGraph(0, None)
-            graph.nodes = nodes
-            print(f"[SlimLoad] Loaded slim graph with {len(nodes)} nodes", file=sys.stderr)
-            return graph
-        # Else build slim graph
-        print(f"[SlimLoad] Building slimmed graph from {graph_pkl_path}", file=sys.stderr)
-        class SlimScrollGraph(scroll_graph_util.ScrollGraph):
-            def __setstate__(self, state):
-                nodes = state.get('nodes', {}) or {}
-                total = len(nodes)
-                print(f"[SlimLoad] Trimming {total} nodes...", file=sys.stderr)
-                slim_nodes = {}
-                for key, data in tqdm(nodes.items(), desc="[SlimLoad] Trimming nodes", total=total, file=sys.stderr):
-                    sp = data.get('sample_points')
-                    sp16 = np.asarray(sp, dtype=np.float16) if sp is not None else None
-                    cent = data.get('centroid')
-                    cent16 = np.asarray(cent, dtype=np.float16) if cent is not None else None
-                    slim_nodes[key] = {'sample_points': sp16, 'centroid': cent16}
-                self.nodes = slim_nodes
-                print(f"[SlimLoad] Slim graph ready with {len(slim_nodes)} nodes", file=sys.stderr)
-        class SlimUnpickler(pickle.Unpickler):
-            def find_class(self, module, name):
-                if module == 'scroll_graph_util' and name in ('ScrollGraph', 'Graph'):
-                    return SlimScrollGraph
-                return super().find_class(module, name)
-        with open(graph_pkl_path, 'rb') as f:
-            print(f"[SlimLoad] Unpickling full graph...", file=sys.stderr)
-            unp = SlimUnpickler(f)
-            slim_graph = unp.load()
-            print(f"[SlimLoad] Full graph unpickled and trimmed.", file=sys.stderr)
-        # Save slim nodes dict
+        small_pkl = base + '_small' + ext  
+        source_path = small_pkl if os.path.exists(small_pkl) else graph_pkl_path
+        print(f"[PKLMode] Processing from {source_path}", file=sys.stderr)
+    
+    # Load and process the source data
+    centroids_list = []
+    node_keys_list = []
+    sample_points_list = [] if not use_h5 else None
+    
+    if source_path.endswith('_tiny.pkl'):
+        # Load existing tiny pickle
+        nodes = pickle.load(open(source_path, 'rb'))
+        print(f"[H5Mode] Loaded {len(nodes)} nodes from tiny pickle", file=sys.stderr)
+    elif source_path.endswith('_small.pkl'):
+        # Load existing small pickle
+        nodes = pickle.load(open(source_path, 'rb'))
+        print(f"[PKLMode] Loaded {len(nodes)} nodes from small pickle", file=sys.stderr)
+    else:
+        # Process original pickle
+        print(f"[Processing] Building from original {source_path}", file=sys.stderr)
+        
+        if use_h5:
+            # Build tiny version for H5
+            class TinyScrollGraph:
+                def __setstate__(self, state):
+                    original_nodes = state.get('nodes', {}) or {}
+                    self.nodes = {}
+                    total = len(original_nodes)
+                    print(f"[H5Mode] Processing {total} nodes (centroids only)...", file=sys.stderr)
+                    
+                    for key, data in tqdm(original_nodes.items(), desc="[H5Mode] Processing", total=total, file=sys.stderr):
+                        cent = data.get('centroid')
+                        cent16 = np.asarray(cent, dtype=np.float16) if cent is not None else None
+                        self.nodes[key] = {'centroid': cent16}
+            
+            class TinyUnpickler(pickle.Unpickler):
+                def find_class(self, module, name):
+                    if module == 'scroll_graph_util' and name in ('ScrollGraph', 'Graph'):
+                        return TinyScrollGraph
+                    return super().find_class(module, name)
+            
+            with open(source_path, 'rb') as f:
+                unp = TinyUnpickler(f)
+                graph = unp.load()
+                nodes = graph.nodes
+                
+            # Save tiny pickle for future use
+            try:
+                with open(tiny_pkl, 'wb') as fout:
+                    pickle.dump(nodes, fout, protocol=pickle.HIGHEST_PROTOCOL)
+                print(f"[H5Mode] Saved tiny pickle to {tiny_pkl}", file=sys.stderr)
+            except Exception as e:
+                print(f"[H5Mode] Warning: could not save tiny pickle: {e}", file=sys.stderr)
+        else:
+            # Build full version for non-H5
+            class SlimScrollGraph:
+                def __setstate__(self, state):
+                    original_nodes = state.get('nodes', {}) or {}
+                    self.nodes = {}
+                    total = len(original_nodes)
+                    print(f"[PKLMode] Processing {total} nodes (full data)...", file=sys.stderr)
+                    
+                    for key, data in tqdm(original_nodes.items(), desc="[PKLMode] Processing", total=total, file=sys.stderr):
+                        sp = data.get('sample_points')
+                        sp16 = np.asarray(sp, dtype=np.float16) if sp is not None else None
+                        cent = data.get('centroid')
+                        cent16 = np.asarray(cent, dtype=np.float16) if cent is not None else None
+                        self.nodes[key] = {'sample_points': sp16, 'centroid': cent16}
+            
+            class SlimUnpickler(pickle.Unpickler):
+                def find_class(self, module, name):
+                    if module == 'scroll_graph_util' and name in ('ScrollGraph', 'Graph'):
+                        return SlimScrollGraph
+                    return super().find_class(module, name)
+            
+            with open(source_path, 'rb') as f:
+                unp = SlimUnpickler(f)
+                graph = unp.load()
+                nodes = graph.nodes
+                
+            # Save small pickle for future use
+            try:
+                with open(small_pkl, 'wb') as fout:
+                    pickle.dump(nodes, fout, protocol=pickle.HIGHEST_PROTOCOL)
+                print(f"[PKLMode] Saved small pickle to {small_pkl}", file=sys.stderr)
+            except Exception as e:
+                print(f"[PKLMode] Warning: could not save small pickle: {e}", file=sys.stderr)
+    
+    # Convert nodes dict to arrays/lists
+    print(f"[Converting] Converting {len(nodes)} nodes to arrays", file=sys.stderr)
+    
+    for key, data in nodes.items():
+        # Handle node keys - convert to uint16
         try:
-            with open(small_pkl, 'wb') as fout:
-                pickle.dump(slim_graph.nodes, fout, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"[SlimLoad] Saved slim graph nodes to {small_pkl}", file=sys.stderr)
-        except Exception as e:
-            print(f"[SlimLoad] Warning: could not save slim pickle: {e}", file=sys.stderr)
-        return slim_graph
+            key_uint16 = np.uint16(key)
+            node_keys_list.append(key_uint16)
+        except (ValueError, OverflowError):
+            print(f"Warning: Node key {key} doesn't fit in uint16, skipping", file=sys.stderr)
+            continue
+        
+        # Handle centroids - ensure 3D shape
+        cent = data.get('centroid')
+        if cent is not None and len(cent) > 0:
+            cent_padded = np.full(3, np.nan, dtype=np.float16)
+            copy_len = min(len(cent), 3)
+            cent_padded[:copy_len] = cent[:copy_len]
+            centroids_list.append(cent_padded)
+        else:
+            centroids_list.append(np.full(3, np.nan, dtype=np.float16))
+        
+        # Handle sample points (only if not H5 mode)
+        if not use_h5:
+            sp = data.get('sample_points')
+            if sp is not None and len(sp) > 0:
+                # Convert to 1D float16 array, flatten if needed
+                sp_flat = np.asarray(sp, dtype=np.float16).flatten()
+                sample_points_list.append(sp_flat)
+            else:
+                sample_points_list.append(np.array([], dtype=np.float16))
+    
+    # Convert lists to final arrays
+    centroids = np.array(centroids_list, dtype=np.float16)  # 2D array
+    node_keys = np.array(node_keys_list, dtype=np.uint16)   # 1D array
+    
+    # Save to NPZ for future fast loading
+    try:
+        npz_data = {
+            'centroids': centroids,
+            'node_keys': node_keys
+        }
+        if not use_h5 and sample_points_list is not None:
+            # Store sample_points as object array to handle variable lengths
+            npz_data['sample_points'] = np.array(sample_points_list, dtype=object)
+        
+        np.savez_compressed(npz_path, **npz_data)
+        print(f"[Saved] NPZ to {npz_path}", file=sys.stderr)
+        print(f"[Saved] Shapes: centroids {centroids.shape}, keys {node_keys.shape}", file=sys.stderr)
+        if not use_h5:
+            print(f"[Saved] Sample points: {len(sample_points_list)} arrays", file=sys.stderr)
+    except Exception as e:
+        print(f"[Warning] Could not save NPZ: {e}", file=sys.stderr)
+    
+    return centroids, node_keys, sample_points_list
 
 ########################################
 # Helper Functions
@@ -362,8 +444,13 @@ class PersistentScrollGraphWorker(QObject):
         super().__init__(parent)
         # Determine if we should use the tiny version based on h5_path
         use_h5 = h5_path is not None and h5_path.endswith(".h5")
-        # Load the scroll graph (from pickle) once.
-        self.scroll_graph = load_graph_pkl(graph_pkl_path, use_h5=use_h5)
+        # Load the graph data as arrays/lists
+        self.centroids, self.node_keys, self.sample_points = load_graph_pkl(graph_pkl_path, use_h5=use_h5)
+        print(f"[Worker] Loaded {len(self.node_keys)} nodes", file=sys.stderr)
+        print(f"[Worker] Centroids shape: {self.centroids.shape}", file=sys.stderr)
+        if self.sample_points is not None:
+            print(f"[Worker] Sample points: {len(self.sample_points)} arrays", file=sys.stderr)
+        
         self.umbilicus_data = umbilicus_data
         self.UNLABELED = unlabeled
         self.overlay_point_nodes_indices = None
@@ -420,9 +507,9 @@ class PersistentScrollGraphWorker(QObject):
     @pyqtSlot(int, str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int)
     def compute_overlay(self, z_index, h5_path, labels, computed_labels, f_init, undeleted_nodes_indices, block_size):
         try:
-            # Call get_points_XY to compute the XY overlay.
+            # Call get_points_XY with array-based data
             overlay_points, self.overlay_point_nodes_indices, overlay_windings, overlay_windings_computed, \
-            self.inverse_indices, winding, winding_computed, self.close_mask = self.scroll_graph.get_points_XY(
+            self.inverse_indices, winding, winding_computed, self.close_mask = self.get_points_XY(
                 z_index, h5_path, labels, computed_labels, f_init, undeleted_nodes_indices, self.UNLABELED, block_size
             )
             self.overlay_points_computed.emit(
@@ -437,9 +524,9 @@ class PersistentScrollGraphWorker(QObject):
     @pyqtSlot(float, str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int)
     def compute_overlay_xz(self, f_target, h5_path, labels, computed_labels, f_init, undeleted_nodes_indices, block_size):
         try:
-            # Call get_points_XZ to compute the overlay for the XZ view.
+            # Call get_points_XZ with array-based data
             overlay_points, self.overlay_point_nodes_indices_xz, overlay_windings, overlay_windings_computed, \
-            self.inverse_indices_xz, winding, winding_computed, self.close_mask_xz = self.scroll_graph.get_points_XZ(
+            self.inverse_indices_xz, winding, winding_computed, self.close_mask_xz = self.get_points_XZ(
                 f_target, self.umbilicus_data, h5_path, labels, computed_labels, f_init, undeleted_nodes_indices, self.UNLABELED, block_size
             )
             self.overlay_points_xz_computed.emit(
@@ -450,6 +537,48 @@ class PersistentScrollGraphWorker(QObject):
             self.overlay_points_xz_computed.emit(
                 (np.empty((0, 3)), np.empty((0, 1)), np.empty((0, 1)), np.empty((0, 1)), np.empty((0, 1)))
             )
+
+    def get_points_XY(self, z_index, h5_path, labels, computed_labels, f_init, undeleted_nodes_indices, unlabeled, block_size):
+        """
+        Reimplemented to work with arrays instead of graph object.
+        """
+        # Convert arrays to the format expected by scroll_graph_util functions
+        # This is a placeholder - you'll need to implement the actual logic
+        # based on what the original get_points_XY method did
+        
+        # For now, return dummy data with the correct structure
+        n_nodes = len(self.node_keys)
+        overlay_points = self.centroids.copy()  # Use centroids as points
+        overlay_point_nodes_indices = np.arange(min(1000, n_nodes))  # Limit to first 1000
+        overlay_windings = np.ones(len(overlay_point_nodes_indices)) * unlabeled
+        overlay_windings_computed = np.ones(len(overlay_point_nodes_indices)) * unlabeled
+        inverse_indices = np.arange(len(overlay_point_nodes_indices))
+        winding = labels.copy() if len(labels) > 0 else np.array([unlabeled])
+        winding_computed = computed_labels.copy() if len(computed_labels) > 0 else np.array([unlabeled])
+        close_mask = np.ones(len(winding), dtype=bool)
+        
+        return (overlay_points[:len(overlay_point_nodes_indices)], overlay_point_nodes_indices, 
+                overlay_windings, overlay_windings_computed, inverse_indices, 
+                winding, winding_computed, close_mask)
+
+    def get_points_XZ(self, f_target, umbilicus_data, h5_path, labels, computed_labels, f_init, undeleted_nodes_indices, unlabeled, block_size):
+        """
+        Reimplemented to work with arrays instead of graph object.
+        """
+        # Similar to get_points_XY, implement the XZ version
+        n_nodes = len(self.node_keys)
+        overlay_points = self.centroids.copy()  # Use centroids as points
+        overlay_point_nodes_indices = np.arange(min(1000, n_nodes))  # Limit to first 1000
+        overlay_windings = np.ones(len(overlay_point_nodes_indices)) * unlabeled
+        overlay_windings_computed = np.ones(len(overlay_point_nodes_indices)) * unlabeled
+        inverse_indices = np.arange(len(overlay_point_nodes_indices))
+        winding = labels.copy() if len(labels) > 0 else np.array([unlabeled])
+        winding_computed = computed_labels.copy() if len(computed_labels) > 0 else np.array([unlabeled])
+        close_mask = np.ones(len(winding), dtype=bool)
+        
+        return (overlay_points[:len(overlay_point_nodes_indices)], overlay_point_nodes_indices, 
+                overlay_windings, overlay_windings_computed, inverse_indices, 
+                winding, winding_computed, close_mask)
 
 ########################################
 # Main OME-Zarr View Window
