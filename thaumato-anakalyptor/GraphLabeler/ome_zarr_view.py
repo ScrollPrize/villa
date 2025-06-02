@@ -805,8 +805,8 @@ class OmeZarrViewWindow(QMainWindow):
 
     def on_overlay_points_computed(self, overlay_data):
         # overlay_data is a tuple: (overlay_points, overlay_windings, overlay_windings_computed, winding, winding_computed)
-        overlay_points, overlay_windings, overlay_windings_computed, self.winding, self.winding_computed  = overlay_data
-        print(f"Overlay points computed: {overlay_points.shape} unique points found.")
+        self.overlay_points, overlay_windings, overlay_windings_computed, self.winding, self.winding_computed  = overlay_data
+        print(f"Overlay points computed: {self.overlay_points.shape} unique points found.")
         self.last_overlay_windings = overlay_windings
         self.last_overlay_windings_computed = overlay_windings_computed
         brushes = self.get_brushes()
@@ -912,8 +912,8 @@ class OmeZarrViewWindow(QMainWindow):
 
     def on_overlay_points_xz_computed(self, overlay_data):
         # overlay_data is a tuple: (overlay_points_xz, overlay_windings, overlay_windings_computed, winding, winding_computed)
-        overlay_points_xz, overlay_windings, overlay_windings_computed, winding, winding_computed = overlay_data
-        print(f"Overlay XZ points computed: {overlay_points_xz.shape} unique points found.")
+        self.overlay_points_xz, overlay_windings, overlay_windings_computed, winding, winding_computed = overlay_data
+        print(f"Overlay XZ points computed: {self.overlay_points_xz.shape} unique points found.")
         self.last_overlay_windings_xz = overlay_windings
         self.last_overlay_windings_computed_xz = overlay_windings_computed
         brushes = self.get_brushes_xz()
