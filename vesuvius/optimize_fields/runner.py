@@ -21,8 +21,8 @@ def parse_args():
                    help="Penalty coefficient for the Frobenious norm of the Jacobian of u,v, and n")
     p.add_argument('--mu4', type=float, default=1e-2,
                    help="Penalty coefficient for the divergence of u,v, and n")
-    p.add_argument('--lr',  type=float, default=1e-1)
-    p.add_argument('--iters', type=int, default=100) # TODO: callback for convergence?
+    p.add_argument('--lr',  type=float, default=1.0)
+    p.add_argument('--iters', type=int, default=1000) # TODO: callback for convergence?
     p.add_argument('--ghost', type=int, default=1,
                    help="Padding voxels on each side for finite diffs")
     p.add_argument('--device', default='cuda')
