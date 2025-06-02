@@ -500,10 +500,10 @@ class OmeZarrViewWindow(QMainWindow):
         self.calc_brush_red   = pg.mkBrush(255, 50, 0, 100)
         self.calc_brush_green = pg.mkBrush(0, 255, 50, 100)
         self.calc_brush_blue  = pg.mkBrush(50, 0, 255, 100)
-        
+
         # Per-point label storage for direct labeling in the view
-        self.point_labels_xy = [self.UNLABELED for _ in range(len(self.overlay_points))]  # List mapping point index to label
-        self.point_labels_xz = [self.UNLABELED for _ in range(len(self.overlay_points_xz))]  # List mapping point index to label
+        self.point_labels_xy = None  # List mapping point index to label
+        self.point_labels_xz = None  # List mapping point index to label
         
         # Current label for painting
         self.current_label = 0
@@ -690,7 +690,8 @@ class OmeZarrViewWindow(QMainWindow):
         self.current_z_index = z_index  # Store for later use.
         
         # Clear point labels for the new slice
-        self.point_labels_xy = [self.UNLABELED for _ in range(len(self.overlay_points))]
+        if not self.point_labels_xy is None:
+            self.point_labels_xy[:] = self.UNLABELED
         
         self.loader_worker_running = True
         print(f"Loading OME-Zarr XY slice at index {z_index} (from z slice center {self.pending_z_center})")
@@ -816,6 +817,7 @@ class OmeZarrViewWindow(QMainWindow):
         # Assume overlay_points columns: [z, x, y, ...] for XY view.
         x_coords = self.overlay_points[:, 1]
         y_coords = self.overlay_points[:, 2]
+        self.point_labels_xy = [self.UNLABELED for _ in range(len(self.overlay_points))]
         
         if hasattr(self, "overlay_scatter"):
             print("Updating existing overlay scatter plot with new colors.")
@@ -924,7 +926,8 @@ class OmeZarrViewWindow(QMainWindow):
         # Assume overlay_points_xz for the XZ view: first column is the sample (x) coordinate and second column is z.
         x_coords = self.overlay_points_xz[:, 0]
         z_coords = self.L - self.overlay_points_xz[:, 1]
-        
+        self.point_labels_xz = [self.UNLABELED for _ in range(len(self.overlay_points_xz))]
+
         if hasattr(self, "overlay_scatter_xz"):
             print("Updating existing XZ overlay scatter plot with new colors.")
             self.overlay_scatter_xz.setData(x=x_coords, y=z_coords, brush=brushes)
@@ -1000,7 +1003,8 @@ class OmeZarrViewWindow(QMainWindow):
         print(f"Loading OME-Zarr XZ slice with f init center {self.pending_finit_center}, type of {type(self.pending_finit_center)}")
         
         # Clear point labels for the new slice
-        self.point_labels_xz = [self.UNLABELED for _ in range(len(self.overlay_points_xz))]
+        if not self.point_labels_xz is None:
+            self.point_labels_xz[:] = self.UNLABELED
         
         # Launch XZ loader worker at selected resolution
         self.xz_loader_worker = OmeZarrXZLoaderWorker(self.ome_zarr_path, self.current_resolution,
