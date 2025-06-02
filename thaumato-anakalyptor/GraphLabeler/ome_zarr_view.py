@@ -29,7 +29,7 @@ def load_graph_pkl(graph_pkl_path, use_h5=False):
     Load graph data and return as arrays/lists for faster access.
     Returns (centroids, node_keys, sample_points) where:
     - centroids: numpy 2D array (n_nodes, 3) as float16
-    - node_keys: numpy 1D array (n_nodes,) as uint16  
+    - node_keys: numpy 2D array (n_nodes, 4) as uint16 (preserves 4-tuple structure)
     - sample_points: list of 1D float16 arrays (only if not use_h5)
     
     If NPZ exists, loads from there. Otherwise creates NPZ from PKL or H5 source.
@@ -43,7 +43,7 @@ def load_graph_pkl(graph_pkl_path, use_h5=False):
         try:
             npz_data = np.load(npz_path, allow_pickle=True)
             centroids = npz_data['centroids']  # float16, 2D
-            node_keys = npz_data['node_keys']   # uint16, 1D
+            node_keys = npz_data['node_keys']   # uint16, 2D
             
             if use_h5:
                 sample_points = None
@@ -152,13 +152,24 @@ def load_graph_pkl(graph_pkl_path, use_h5=False):
     # Convert nodes dict to arrays/lists
     print(f"[Converting] Converting {len(nodes)} nodes to arrays", file=sys.stderr)
     
+    # First, let's see what the keys look like
+    sample_keys = list(nodes.keys())[:5] if nodes else []
+    print(f"[Debug] Sample node keys: {sample_keys}", file=sys.stderr)
+    if sample_keys:
+        print(f"[Debug] First key type: {type(sample_keys[0])}", file=sys.stderr)
+    
     for key, data in nodes.items():
-        # Handle node keys - convert to uint16
+        # Handle node keys - preserve 4-tuple structure
         try:
-            key_uint16 = np.uint16(key)
-            node_keys_list.append(key_uint16)
-        except (ValueError, OverflowError):
-            print(f"Warning: Node key {key} doesn't fit in uint16, skipping", file=sys.stderr)
+            # Convert key (should be 4-tuple) to numpy array
+            if isinstance(key, (tuple, list)) and len(key) == 4:
+                key_array = np.array(key, dtype=np.uint16)
+                node_keys_list.append(key_array)
+            else:
+                print(f"Warning: Node key {key} is not a 4-tuple, skipping", file=sys.stderr)
+                continue
+        except (ValueError, OverflowError) as e:
+            print(f"Warning: Node key {key} conversion failed: {e}, skipping", file=sys.stderr)
             continue
         
         # Handle centroids - ensure 3D shape
@@ -182,8 +193,10 @@ def load_graph_pkl(graph_pkl_path, use_h5=False):
                 sample_points_list.append(np.array([], dtype=np.float16))
     
     # Convert lists to final arrays
-    centroids = np.array(centroids_list, dtype=np.float16)  # 2D array
-    node_keys = np.array(node_keys_list, dtype=np.uint16)   # 1D array
+    centroids = np.array(centroids_list, dtype=np.float16)  # 2D array (n, 3)
+    node_keys = np.array(node_keys_list, dtype=np.uint16)   # 2D array (n, 4)
+    
+    print(f"[Debug] Final node_keys shape: {node_keys.shape}, centroids shape: {centroids.shape}", file=sys.stderr)
     
     # Save to NPZ for future fast loading
     try:
@@ -860,9 +873,22 @@ class OmeZarrViewWindow(QMainWindow):
         if self.point_labels_xy is None:
             self.point_labels_xy = [self.UNLABELED for _ in range(len(overlay_windings_flat))]
 
-        print(f"[get_brushes] Valid windings: {np.sum(brush_mask)} / {len(brush_mask)} ({np.sum(brush_mask) / len(brush_mask) * 100:.2f}%)")
-        print(f"[get_brushes] Valid computed windings: {np.sum(brush_mask_computed)} / {len(brush_mask_computed)} ({np.sum(brush_mask_computed) / len(brush_mask_computed) * 100:.2f}%)")
+        # Check for empty arrays to avoid division by zero
+        if len(brush_mask) > 0:
+            print(f"[get_brushes] Valid windings: {np.sum(brush_mask)} / {len(brush_mask)} ({np.sum(brush_mask) / len(brush_mask) * 100:.2f}%)")
+        else:
+            print(f"[get_brushes] Valid windings: 0 / 0 (no data)")
+            
+        if len(brush_mask_computed) > 0:
+            print(f"[get_brushes] Valid computed windings: {np.sum(brush_mask_computed)} / {len(brush_mask_computed)} ({np.sum(brush_mask_computed) / len(brush_mask_computed) * 100:.2f}%)")
+        else:
+            print(f"[get_brushes] Valid computed windings: 0 / 0 (no data)")
+            
         print(f"[get_brushes] Custom labels in point_labels_xy: {len(self.point_labels_xy)}")
+
+        # Handle empty arrays case
+        if len(overlay_windings_flat) == 0:
+            return []
 
         # Create an empty array for the final brushes.
         result = np.empty(overlay_windings_flat.shape, dtype=object)
@@ -965,10 +991,22 @@ class OmeZarrViewWindow(QMainWindow):
         if self.point_labels_xz is None:
             self.point_labels_xz = [self.UNLABELED for _ in range(len(overlay_windings_flat))]
 
-        print(f"[get_brushes_xz] Valid windings: {np.sum(brush_mask)} / {len(brush_mask)} ({np.sum(brush_mask) / len(brush_mask) * 100:.2f}%)")
-        print(f"[get_brushes_xz] Valid computed windings: {np.sum(brush_mask_computed)} / {len(brush_mask_computed)} ({np.sum(brush_mask_computed) / len(brush_mask_computed) * 100:.2f}%)")
+        # Check for empty arrays to avoid division by zero
+        if len(brush_mask) > 0:
+            print(f"[get_brushes_xz] Valid windings: {np.sum(brush_mask)} / {len(brush_mask)} ({np.sum(brush_mask) / len(brush_mask) * 100:.2f}%)")
+        else:
+            print(f"[get_brushes_xz] Valid windings: 0 / 0 (no data)")
+            
+        if len(brush_mask_computed) > 0:
+            print(f"[get_brushes_xz] Valid computed windings: {np.sum(brush_mask_computed)} / {len(brush_mask_computed)} ({np.sum(brush_mask_computed) / len(brush_mask_computed) * 100:.2f}%)")
+        else:
+            print(f"[get_brushes_xz] Valid computed windings: 0 / 0 (no data)")
+            
         print(f"[get_brushes_xz] Custom labels in point_labels_xz: {len(self.point_labels_xz)}")
 
+        # Handle empty arrays case
+        if len(overlay_windings_flat) == 0:
+            return []
 
         result = np.empty(overlay_windings_flat.shape, dtype=object)
         
