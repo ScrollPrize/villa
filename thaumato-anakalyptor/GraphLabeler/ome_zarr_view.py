@@ -814,8 +814,8 @@ class OmeZarrViewWindow(QMainWindow):
         scale = 2**(self.current_resolution)
         self.overlay_points /= scale
         # Assume overlay_points columns: [z, x, y, ...] for XY view.
-        x_coords = overlay_points[:, 1]
-        y_coords = overlay_points[:, 2]
+        x_coords = self.overlay_points[:, 1]
+        y_coords = self.overlay_points[:, 2]
         
         if hasattr(self, "overlay_scatter"):
             print("Updating existing overlay scatter plot with new colors.")
@@ -922,8 +922,8 @@ class OmeZarrViewWindow(QMainWindow):
         scale = 2**(self.current_resolution)
         self.overlay_points_xz /= scale
         # Assume overlay_points_xz for the XZ view: first column is the sample (x) coordinate and second column is z.
-        x_coords = overlay_points_xz[:, 0]
-        z_coords = self.L - overlay_points_xz[:, 1]
+        x_coords = self.overlay_points_xz[:, 0]
+        z_coords = self.L - self.overlay_points_xz[:, 1]
         
         if hasattr(self, "overlay_scatter_xz"):
             print("Updating existing XZ overlay scatter plot with new colors.")
