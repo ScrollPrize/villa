@@ -1525,8 +1525,8 @@ class OmeZarrViewWindow(QMainWindow):
                 max_label = max(label_counts.items(), key=lambda x: x[1])
                 label, count = max_label
                 
+                percentage = count / total
                 if count >= 3 and total > 0:
-                    percentage = count / total
                     if percentage >= 0.5:
                         # Map from close space to full space
                         undeleted_idx = close_indices_xy[node_of_point]  # close space → undeleted space
