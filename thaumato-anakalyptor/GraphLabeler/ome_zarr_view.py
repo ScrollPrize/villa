@@ -1500,7 +1500,8 @@ class OmeZarrViewWindow(QMainWindow):
             
             # Find all close nodes that map to the display points
             labels_extended_all_points = np.array(self.point_labels_xy)[self.persistent_overlay_worker.inverse_indices]
-            labels_extended_nodes = self.persistent_overlay_worker.overlay_point_nodes_indices[labels_extended_all_points]
+            points_indices = np.arange(len(labels_extended_all_points))
+            extended_nodes = self.persistent_overlay_worker.overlay_point_nodes_indices[points_indices]
             
             # Count total XY points per close node
             xy_nodes_labels = {}
@@ -1508,7 +1509,7 @@ class OmeZarrViewWindow(QMainWindow):
                 label_point = labels_extended_all_points[i]
                 if abs(label_point - self.UNLABELED) < 2:
                     continue
-                node_of_point = labels_extended_nodes[i]
+                node_of_point = extended_nodes[i]
                 if node_of_point not in xy_nodes_labels:
                     xy_nodes_labels[node_of_point] = []
                 xy_nodes_labels[node_of_point].append(label_point)
@@ -1549,14 +1550,15 @@ class OmeZarrViewWindow(QMainWindow):
             print(f"DEBUG XZ: inverse_indices_xz length: {len(self.persistent_overlay_worker.inverse_indices_xz)}")
 
             labels_extended_all_points = np.array(self.point_labels_xz)[self.persistent_overlay_worker.inverse_indices_xz]
-            labels_extended_nodes = self.persistent_overlay_worker.overlay_point_nodes_indices_xz[labels_extended_all_points]
+            points_indices = np.arange(len(labels_extended_all_points))
+            extended_nodes = self.persistent_overlay_worker.overlay_point_nodes_indices_xz[points_indices]
             
             xz_nodes_labels = {}
             for i in range(len(labels_extended_all_points)):
                 label_point = labels_extended_all_points[i]
                 if abs(label_point - self.UNLABELED) < 2:
                     continue
-                node_of_point = labels_extended_nodes[i]
+                node_of_point = extended_nodes[i]
                 if node_of_point not in xz_nodes_labels:
                     xz_nodes_labels[node_of_point] = []
                 xz_nodes_labels[node_of_point].append(label_point)
