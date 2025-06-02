@@ -3793,9 +3793,9 @@ class PointCloudLabeler(QMainWindow):
             
             # Find nearby nodes using view-specific logic
             if view_type == "XY":
-                nearby_indices = self._get_nearby_indices_xy_with_radius(node_pos, radius)
+                nearby_indices = self._get_nearby_indices_xy_with_radius(node_pos, radius/2.0)
             elif view_type == "XZ":
-                nearby_indices = self._get_nearby_indices_xz_with_radius(node_pos, radius)
+                nearby_indices = self._get_nearby_indices_xz_with_radius(node_pos, radius/2.0)
             else:
                 # Fallback: just update the single node
                 nearby_indices = [full_node_idx]
