@@ -741,13 +741,16 @@ class OmeZarrViewWindow(QMainWindow):
         brush_mask = np.abs(self.last_overlay_windings // 360 - self.UNLABELED) > 2
         brush_mask_computed = np.abs(self.last_overlay_windings_computed // 360 - self.UNLABELED) > 2
 
-        print(f"[get_brushes] Valid windings: {np.sum(brush_mask)} / {len(brush_mask)} ({np.sum(brush_mask) / len(brush_mask) * 100:.2f}%)")
-        print(f"[get_brushes] Valid computed windings: {np.sum(brush_mask_computed)} / {len(brush_mask_computed)} ({np.sum(brush_mask_computed) / len(brush_mask_computed) * 100:.2f}%)")
-        print(f"[get_brushes] Custom labels in point_labels_xy: {len(self.point_labels_xy)}")
-
         # Flatten the arrays to work with one-dimensional data.
         overlay_windings_flat = self.last_overlay_windings.flatten()
         overlay_windings_computed_flat = self.last_overlay_windings_computed.flatten()
+
+        if self.point_labels_xy is None:
+            self.point_labels_xy = [self.UNLABELED for _ in range(len(overlay_windings_flat))]
+
+        print(f"[get_brushes] Valid windings: {np.sum(brush_mask)} / {len(brush_mask)} ({np.sum(brush_mask) / len(brush_mask) * 100:.2f}%)")
+        print(f"[get_brushes] Valid computed windings: {np.sum(brush_mask_computed)} / {len(brush_mask_computed)} ({np.sum(brush_mask_computed) / len(brush_mask_computed) * 100:.2f}%)")
+        print(f"[get_brushes] Custom labels in point_labels_xy: {len(self.point_labels_xy)}")
 
         # Create an empty array for the final brushes.
         result = np.empty(overlay_windings_flat.shape, dtype=object)
@@ -844,12 +847,16 @@ class OmeZarrViewWindow(QMainWindow):
         brush_mask = np.abs(self.last_overlay_windings_xz // 360 - self.UNLABELED) > 2
         brush_mask_computed = np.abs(self.last_overlay_windings_computed_xz // 360 - self.UNLABELED) > 2
 
+        overlay_windings_flat = self.last_overlay_windings_xz.flatten()
+        overlay_windings_computed_flat = self.last_overlay_windings_computed_xz.flatten()
+
+        if self.point_labels_xz is None:
+            self.point_labels_xz = [self.UNLABELED for _ in range(len(overlay_windings_flat))]
+
         print(f"[get_brushes_xz] Valid windings: {np.sum(brush_mask)} / {len(brush_mask)} ({np.sum(brush_mask) / len(brush_mask) * 100:.2f}%)")
         print(f"[get_brushes_xz] Valid computed windings: {np.sum(brush_mask_computed)} / {len(brush_mask_computed)} ({np.sum(brush_mask_computed) / len(brush_mask_computed) * 100:.2f}%)")
         print(f"[get_brushes_xz] Custom labels in point_labels_xz: {len(self.point_labels_xz)}")
 
-        overlay_windings_flat = self.last_overlay_windings_xz.flatten()
-        overlay_windings_computed_flat = self.last_overlay_windings_computed_xz.flatten()
 
         result = np.empty(overlay_windings_flat.shape, dtype=object)
         
