@@ -1497,13 +1497,7 @@ class OmeZarrViewWindow(QMainWindow):
                 if node_of_point not in xy_nodes_labels:
                     xy_nodes_labels[node_of_point] = []
                 xy_nodes_labels[node_of_point].append(label_point)
-                
-            for node_of_point, labels in xy_nodes_labels.items():
-                label_counts = {}
-                for label in labels:
             
-            print(f"DEBUG XY: Total points counted for {len(xy_total_points)} close nodes")
-
             # for each node find the most common label
             for node_of_point, labels in xy_nodes_labels.items():
                 label_counts = {}
