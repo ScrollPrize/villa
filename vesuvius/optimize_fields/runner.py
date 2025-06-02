@@ -66,9 +66,10 @@ def main():
             U_np, V_np, N_np \
             in tqdm(ds, total=len(ds), desc="patches"):
         # Skip empty
-        if (U_np == 0).all() and (V_np == 0).all():
+        if (U_np == 0).all() and (V_np == 0).all()  and (N_np == 0).all():
             ds_u[:, z0:z1, y0:y1, x0:x1] = 0
             ds_v[:, z0:z1, y0:y1, x0:x1] = 0
+            ds_n[:, z0:z1, y0:y1, x0:x1] = 0
             continue
 
         # To torch

@@ -5,9 +5,7 @@ from torch.optim import AdamW
 from tqdm.auto import tqdm
 from optimize_fields.utils import gradient, divergence, rotate_by_quaternion
 
-#TODO: use NORMAL N in loss!
 
-#TODO: optimize Ising problem for orientation!
 
 class PatchOptimizer:
     """
@@ -60,8 +58,11 @@ class PatchOptimizer:
         n = n.permute(3,0,1,2)
 
         # 3) data fidelity
-        data = -((u * U).sum().pow(2)) - ((v * V).sum().pow(2)) - ((n * N).sum().pow(2))
-
+        term_u = ( (u * U).sum(dim=0) ).pow(2).sum()
+        term_v = ( (v * V).sum(dim=0) ).pow(2).sum()
+        term_n = ( (n * N).sum(dim=0) ).pow(2).sum()
+        
+        data = -(term_u + term_v + term_n)
 
         data *= 10**(-3) # TODO: insert another weight here or find a good normalization strategy
         # 4) smoothness on rotated fields
