@@ -1451,8 +1451,10 @@ class OmeZarrViewWindow(QMainWindow):
             
         # Debug: Check if we have the necessary mappings
         print(f"\nDEBUG: Starting apply_labels_to_graph")
-        print(f"XY labels: {np.sum(np.abs(np.array(self.point_labels_xy) - self.UNLABELED) > 2)} points labeled")
-        print(f"XZ labels: {np.sum(np.abs(np.array(self.point_labels_xz) - self.UNLABELED) > 2)} points labeled")
+        total_labels_xy = np.sum(np.abs(np.array(self.point_labels_xy) - self.UNLABELED) > 2) if not self.point_labels_xy is None else 0
+        total_labels_xz = np.sum(np.abs(np.array(self.point_labels_xz) - self.UNLABELED) > 2) if not self.point_labels_xz is None else 0
+        print(f"XY labels: {total_labels_xy} points labeled")
+        print(f"XZ labels: {total_labels_xz} points labeled")
         
         # Get the mappings for space conversions
         # close_mask maps undeleted space to close space (filtered)
