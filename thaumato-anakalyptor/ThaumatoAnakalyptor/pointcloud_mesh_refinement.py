@@ -2045,6 +2045,12 @@ def mesh_uv_wraps(filtered_winding_path, output_dir, winding_direction=False):
         # Then compute vertex normals (these will be aligned with triangle normals)
         mesh.compute_vertex_normals()
 
+        # 5) final cleanup (you can reuse your clean_mesh here)
+        mesh = clean_mesh(mesh,
+                      longest_edge_pct=100,
+                      area_pct=100,
+                      edge_length_thresh=1500)
+
         # Normalize UVs after cleaning and get natural image size
         mesh, natural_image_size = normalize_uvs(mesh, verbose=True)
 
@@ -2579,7 +2585,7 @@ def main():
             color_by_angle=args.color_by_angle
         )
     filtered_path = os.path.join(os.path.dirname(args.mesh), "windings_filtered")
-    # mesh_uv_wraps(filtered_path, output_dir=os.path.join(os.path.dirname(filtered_path), "uv_meshes"), winding_direction=winding_direction)
+    mesh_uv_wraps(filtered_path, output_dir=os.path.join(os.path.dirname(filtered_path), "uv_meshes"), winding_direction=winding_direction)
     mesh_uv_global(filtered_path, output_path=os.path.join(os.path.dirname(filtered_path), "mesh_refined.obj"), winding_direction=winding_direction)
 
 if __name__ == "__main__":
