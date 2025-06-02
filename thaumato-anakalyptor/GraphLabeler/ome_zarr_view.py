@@ -502,8 +502,8 @@ class OmeZarrViewWindow(QMainWindow):
         self.calc_brush_blue  = pg.mkBrush(50, 0, 255, 100)
         
         # Per-point label storage for direct labeling in the view
-        self.point_labels_xy = []  # List mapping point index to label
-        self.point_labels_xz = []  # List mapping point index to label
+        self.point_labels_xy = [self.UNLABELED for _ in range(len(self.overlay_points))]  # List mapping point index to label
+        self.point_labels_xz = [self.UNLABELED for _ in range(len(self.overlay_points_xz))]  # List mapping point index to label
         
         # Current label for painting
         self.current_label = 0
@@ -690,7 +690,7 @@ class OmeZarrViewWindow(QMainWindow):
         self.current_z_index = z_index  # Store for later use.
         
         # Clear point labels for the new slice
-        self.point_labels_xy = []
+        self.point_labels_xy = [self.UNLABELED for _ in range(len(self.overlay_points))]
         
         self.loader_worker_running = True
         print(f"Loading OME-Zarr XY slice at index {z_index} (from z slice center {self.pending_z_center})")
@@ -1000,7 +1000,7 @@ class OmeZarrViewWindow(QMainWindow):
         print(f"Loading OME-Zarr XZ slice with f init center {self.pending_finit_center}, type of {type(self.pending_finit_center)}")
         
         # Clear point labels for the new slice
-        self.point_labels_xz = []
+        self.point_labels_xz = [self.UNLABELED for _ in range(len(self.overlay_points_xz))]
         
         # Launch XZ loader worker at selected resolution
         self.xz_loader_worker = OmeZarrXZLoaderWorker(self.ome_zarr_path, self.current_resolution,
@@ -1397,8 +1397,8 @@ class OmeZarrViewWindow(QMainWindow):
 
     def clear_custom_labels(self):
         """Clear all custom point labels."""
-        self.point_labels_xy = []
-        self.point_labels_xz = []
+        self.point_labels_xy = [self.UNLABELED for _ in range(len(self.overlay_points))]
+        self.point_labels_xz = [self.UNLABELED for _ in range(len(self.overlay_points_xz))]
         self.update_labels_status()
         # Refresh the display
         if hasattr(self, 'overlay_scatter'):
