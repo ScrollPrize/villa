@@ -450,7 +450,7 @@ def load_nodes_from_arrays(centroids, node_keys, sample_points, close_node_indic
     
     Parameters:
         centroids: numpy 2D array (n_nodes, 3) as float16
-        node_keys: numpy 1D array (n_nodes,) as uint16
+        node_keys: numpy 2D array (n_nodes, 4) as uint16 (4-tuple structure)
         sample_points: list of 1D float16 arrays (or None for H5 mode)
         close_node_indices: indices of nodes to load
         winding_angles_nodes: winding angles for each node
@@ -482,7 +482,12 @@ def load_nodes_h5_from_arrays(centroids, node_keys, close_node_indices, winding_
         centroid = centroids[node_idx] * 4.0 - 500  # Scale to scroll coordinates
         start_coord = [int(centroid[1]), int(centroid[0]), int(centroid[2])]  # [y, z, x] order
         group_name = f"{start_coord[0]:06}_{start_coord[1]:06}_{start_coord[2]:06}"
-        surface_nr = int(node_keys[node_idx])  # Use node key as surface number
+        # Use the hash of the 4-tuple as surface number, or first element if it fits in int range
+        node_key_tuple = tuple(node_keys[node_idx])
+        try:
+            surface_nr = int(node_key_tuple[0]) if node_key_tuple[0] < 2**31 else hash(node_key_tuple) % (2**31)
+        except (ValueError, OverflowError):
+            surface_nr = hash(node_key_tuple) % (2**31)
         groups_dict.setdefault(group_name, []).append((surface_nr, i))
     
     total_surfaces = sum(len(entries) for entries in groups_dict.values())
@@ -572,7 +577,7 @@ def get_points_XY_from_arrays(centroids, node_keys, sample_points, z_index, h5_f
     
     Parameters:
         centroids: numpy 2D array (n_nodes, 3) as float16
-        node_keys: numpy 1D array (n_nodes,) as uint16
+        node_keys: numpy 2D array (n_nodes, 4) as uint16 (4-tuple structure)
         sample_points: list of 1D float16 arrays (or None for H5)
         z_index: Z slice index
         h5_filename: path to H5 file
@@ -653,7 +658,7 @@ def get_points_XZ_from_arrays(centroids, node_keys, sample_points, f_target, umb
     
     Parameters:
         centroids: numpy 2D array (n_nodes, 3) as float16
-        node_keys: numpy 1D array (n_nodes,) as uint16  
+        node_keys: numpy 2D array (n_nodes, 4) as uint16 (4-tuple structure)
         sample_points: list of 1D float16 arrays (or None for H5)
         f_target: angle defining the target umbilicus plane
         umbilicus_data: umbilicus center data
@@ -728,7 +733,7 @@ def get_points_XZ_from_arrays(centroids, node_keys, sample_points, f_target, umb
     # Vectorized per-point filtering
     z_vals = points[:, 0]
     centers = umbilicus_xy_at_z_vector(umbilicus_data, z_vals)
-    diff = points[:, 1:3] - centers  # [x, y] difference
+    diff = points[:, 1:3] - centers
     distance = np.abs(np.sum(diff * normal, axis=1))
     
     print(f"Filtering points for XZ view with distance {plane_point_filter_distance}")
