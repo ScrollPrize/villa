@@ -101,6 +101,10 @@ class PointCloudLabeler(QMainWindow):
         self.spline_items = []
         self.spline_segments = {}
         
+        # Manual spline points storage (for shift+click straight lines)
+        self.manual_spline_points = []  # List of (f_init, f_star, label) tuples
+        self.manual_point_markers = []  # Visual markers for shift-clicked points
+        
         # Create menu.
         self._create_menu()
         
@@ -1208,6 +1212,7 @@ class PointCloudLabeler(QMainWindow):
             <li>"Update Spline" fits polynomial lines to labeled winding sheets (for big structures like spiral/winding shapes).</li>
             <li>"Assign Line Labels" snaps nearby unlabeled points to those fitted lines if they're close.</li>
             <li>"Clear Splines" removes any drawn splines.</li>
+            <li><strong>Manual Splines:</strong> <span class="shortcut">Shift+Left Click</span> in XY view to place points for straight-line splines with automatic wrapping between different labels.</li>
         </ul>
 
         <h3 class="section-title">7. Common Controls (Bottom Row)</h3>
@@ -1238,6 +1243,7 @@ class PointCloudLabeler(QMainWindow):
             <li><span class="shortcut">Up/Down Arrow</span>: Increase/decrease the label spinbox.</li>
             <li><span class="shortcut">C</span>: Hide/show <em>all</em> labeled points.</li>
             <li><span class="shortcut">L</span>: Hide/show the estimated color shading for unlabeled points.</li>
+            <li><span class="shortcut">Shift+Left Click (XY view)</span>: Add manual spline point for straight line drawing with wrapping.</li>
         </ul>
 
         <h3 class="section-title">10. Resetting Points</h3>
@@ -1831,6 +1837,13 @@ class PointCloudLabeler(QMainWindow):
         # Only handle left mouse button for drawing operations
         if ev.button() != Qt.LeftButton:
             ev.ignore()  # Let other buttons pass through to plot widget
+            return
+            
+        # Manual spline drawing with shift+left click (XY view only)
+        if view_name == 'xy' and ev.modifiers() & Qt.ShiftModifier:
+            ev.accept()
+            pt = self.xy_plot.plotItem.vb.mapSceneToView(ev.scenePos())
+            self.add_manual_spline_point(pt.x(), pt.y())
             return
             
         # pipette / group‑pipette remain unchanged:
@@ -2783,28 +2796,38 @@ class PointCloudLabeler(QMainWindow):
         progress.setWindowModality(Qt.WindowModal)
         progress.show()
         assign_count = 0
+        manual_assign_count = 0
         update_interval = max(total_points // 100, 1)
         for j, idx in enumerate(valid_idx):
             ul = effective_labels[idx]
-            if ul not in self.spline_segments:
-                if j % update_interval == 0:
-                    progress.setValue(j)
-                if progress.wasCanceled():
-                    break
-                continue
-            pt = np.array([pts[idx, 0], f_init_adjusted[idx]])
-            d_self = np.min([vectorized_point_to_polyline_distance(pt, seg) for seg in self.spline_segments[ul]])
-            d_minus = np.inf
-            if (ul - 1) in self.spline_segments:
-                d_minus = np.min([vectorized_point_to_polyline_distance(pt, seg) for seg in self.spline_segments[ul - 1]])
-            d_plus = np.inf
-            if (ul + 1) in self.spline_segments:
-                d_plus = np.min([vectorized_point_to_polyline_distance(pt, seg) for seg in self.spline_segments[ul + 1]])
-            if d_self < thresh and d_self < d_minus and d_self < d_plus and calc_labels[idx] != self.UNLABELED:
-                global_idx = global_indices[idx]
-                self.labels[global_idx] = calc_labels[idx]
-                self.group[global_idx] = 0 # Use GT group when assigning line labels
-                assign_count += 1
+            
+            # Check polynomial splines
+            poly_assigned = False
+            if ul in self.spline_segments:
+                pt = np.array([pts[idx, 0], f_init_adjusted[idx]])
+                d_self = np.min([vectorized_point_to_polyline_distance(pt, seg) for seg in self.spline_segments[ul]])
+                d_minus = np.inf
+                if (ul - 1) in self.spline_segments:
+                    d_minus = np.min([vectorized_point_to_polyline_distance(pt, seg) for seg in self.spline_segments[ul - 1]])
+                d_plus = np.inf
+                if (ul + 1) in self.spline_segments:
+                    d_plus = np.min([vectorized_point_to_polyline_distance(pt, seg) for seg in self.spline_segments[ul + 1]])
+                if d_self < thresh and d_self < d_minus and d_self < d_plus and calc_labels[idx] != self.UNLABELED:
+                    global_idx = global_indices[idx]
+                    self.labels[global_idx] = calc_labels[idx]
+                    self.group[global_idx] = 0 # Use GT group when assigning line labels
+                    assign_count += 1
+                    poly_assigned = True
+            
+            # Check manual lines if not assigned to polynomial splines
+            if not poly_assigned:
+                manual_label, manual_distance = self.get_manual_line_label_for_point(pts[idx, 0], f_init_adjusted[idx])
+                if manual_label is not None and manual_distance < thresh:
+                    global_idx = global_indices[idx]
+                    self.labels[global_idx] = manual_label
+                    self.group[global_idx] = 0  # Use GT group when assigning manual line labels
+                    manual_assign_count += 1
+            
             if j % update_interval == 0:
                 progress.setValue(j)
             if progress.wasCanceled():
@@ -2812,6 +2835,11 @@ class PointCloudLabeler(QMainWindow):
         progress.close()
         self.update_views()
         print(f"Assigned line labels to {assign_count} points (threshold: {thresh}).")
+        if manual_assign_count > 0:
+            total_count = assign_count + manual_assign_count
+            print(f"  - Total: {total_count} points")
+            print(f"  - Polynomial splines: {assign_count} points")
+            print(f"  - Manual lines: {manual_assign_count} points")
 
     def assign_line_labels_all(self):
         # Track undo/redo
@@ -2838,16 +2866,29 @@ class PointCloudLabeler(QMainWindow):
         # Only work on candidate points that are not already "labeled" (UNLABELED).
         cand_mask = np.abs(self.labels[mask] - self.UNLABELED) < 2
         if not np.any(cand_mask):
+            print(f"No unlabeled candidate points found in Z-slab (all {np.sum(mask)} points already labeled)")
             return
         cand_globals = global_indices[cand_mask]
         # For distance computations we only need the x,y coordinates.
         candidate_pts = pts[cand_mask, :2]  # shape (m, 2)
         m = candidate_pts.shape[0]
+        print(f"Found {m} unlabeled candidate points in Z-slab")
 
         # Get sorted list of winding labels (ul) available in spline_segments in the allowed range.
-        labels_to_check = sorted([ul for ul in self.spline_segments if assign_min <= ul <= assign_max])
+        labels_to_check = sorted([ul for ul in self.spline_segments if isinstance(ul, int) and assign_min <= ul <= assign_max])
         L = len(labels_to_check)
-        if L == 0:
+        
+        # Debug info about splines and manual lines
+        has_manual_lines = "manual_lines" in self.spline_segments
+        manual_lines_count = len(self.spline_segments["manual_lines"]) if has_manual_lines else 0
+        print(f"Polynomial spline labels available: {labels_to_check} (count: {L})")
+        print(f"Manual lines available: {has_manual_lines} (segments: {manual_lines_count})")
+        print(f"Manual spline points: {len(self.manual_spline_points)}")
+        print(f"Spline winding range: {assign_min} to {assign_max}")
+        print(f"Distance threshold: {thresh}")
+        
+        if L == 0 and not has_manual_lines:
+            print("No polynomial splines or manual lines available for assignment")
             return
 
         # --- Helper: Compute distance from many points to a set of line segments.
@@ -2908,19 +2949,99 @@ class PointCloudLabeler(QMainWindow):
             to_assign = (assigned_idx == -1) & cond[k, :]
             assigned_idx[to_assign] = k
 
+        # Check manual lines for unassigned points
+        unassigned_mask = (assigned_idx == -1)
+        if np.any(unassigned_mask) and "manual_lines" in self.spline_segments:
+            manual_labels = np.full(m, None, dtype=object)
+            manual_distances = np.full(m, np.inf)
+            
+            progress.setLabelText("Checking manual lines...")
+            progress.setValue(L)
+            
+            # Compute distance to manual lines for all unassigned points
+            unassigned_points = candidate_pts[unassigned_mask]
+            unassigned_indices = np.where(unassigned_mask)[0]
+            
+            print(f"Checking {len(unassigned_indices)} unassigned points against manual lines...")
+            
+            # Optimize: Process in batches to avoid memory issues and provide progress updates
+            batch_size = 10000  # Process 10k points at a time
+            total_batches = (len(unassigned_indices) + batch_size - 1) // batch_size
+            
+            for batch_idx in range(total_batches):
+                # Update progress
+                progress.setValue(L + int((batch_idx / total_batches) * 10))  # Use 10 progress units for manual lines
+                if progress.wasCanceled():
+                    break
+                
+                # Process batch
+                start_idx = batch_idx * batch_size
+                end_idx = min((batch_idx + 1) * batch_size, len(unassigned_indices))
+                batch_indices = unassigned_indices[start_idx:end_idx]
+                
+                print(f"Processing batch {batch_idx + 1}/{total_batches} ({end_idx - start_idx} points)")
+                
+                # Process each point in the batch
+                for i, pt_idx in enumerate(batch_indices):
+                    f_star, f_init = candidate_pts[pt_idx]
+                    label, distance = self.get_manual_line_label_for_point(f_star, f_init)
+                    if label is not None and distance < thresh:
+                        manual_labels[pt_idx] = label
+                        manual_distances[pt_idx] = distance
+                
+                # Let the GUI update
+                QApplication.processEvents()
+            
+            # Count assignments
+            manual_assignment_count = np.sum([label is not None for label in manual_labels])
+            print(f"Manual lines: {manual_assignment_count} points will be assigned")
+            
+            # Mark points for manual line assignment
+            for i in range(m):
+                if unassigned_mask[i] and manual_labels[i] is not None:
+                    assigned_idx[i] = -2  # Special marker for manual line assignment
+        elif not np.any(unassigned_mask):
+            print("All points were assigned to polynomial splines")
+        elif "manual_lines" not in self.spline_segments:
+            print("No manual lines available for unassigned points")
+
         # Update the labels (and groups) for candidate points where an assignment was found.
-        assigned = assigned_idx != -1
-        for idx, k in zip(cand_globals[assigned], assigned_idx[assigned]):
-            # Get the label to assign.
+        poly_assigned = assigned_idx >= 0
+        manual_assigned = assigned_idx == -2
+        
+        for idx, k in zip(cand_globals[poly_assigned], assigned_idx[poly_assigned]):
+            # Get the label to assign from polynomial splines.
             self.labels[idx] = labels_to_check[k]
             self.group[idx] = 0  # GT group
             assert self.points[idx, 2] >= z_min_val and self.points[idx, 2] <= z_max_val, f"Point {idx} out of range: {self.points[idx, 2]} not in [{z_min_val}, {z_max_val}]"
+        
+        for i, idx in enumerate(cand_globals[manual_assigned]):
+            # Get the label to assign from manual lines.
+            point_idx = np.where(cand_globals == idx)[0][0]
+            self.labels[idx] = manual_labels[point_idx]
+            self.group[idx] = 0  # GT group
+            assert self.points[idx, 2] >= z_min_val and self.points[idx, 2] <= z_max_val, f"Point {idx} out of range: {self.points[idx, 2]} not in [{z_min_val}, {z_max_val}]"
 
-        assign_count = np.sum(assigned)
+        poly_count = np.sum(poly_assigned)
+        manual_count = np.sum(manual_assigned)
+        total_assigned = poly_count + manual_count
         progress.close()
         self.recompute = True
         self.update_views()
-        print(f"Assigned all line labels to {assign_count} of {m} points (threshold: {thresh}).")
+        
+        print(f"\n=== ASSIGNMENT SUMMARY ===")
+        print(f"Total candidate points: {m}")
+        print(f"Successfully assigned: {total_assigned} points (threshold: {thresh})")
+        print(f"  - Polynomial splines: {poly_count} points")
+        print(f"  - Manual lines: {manual_count} points")
+        print(f"  - Unassigned: {m - total_assigned} points")
+        
+        if total_assigned == 0:
+            print("⚠️  No points were assigned! Check:")
+            print("   1. Distance threshold (Line dist thresh)")
+            print("   2. Spline winding range min/max values")
+            print("   3. That manual line labels are in the allowed range")
+            print("   4. That points are actually close to manual lines")
 
     def delete_range(self):
         self._split_range(make_group=False)
@@ -3566,6 +3687,16 @@ class PointCloudLabeler(QMainWindow):
             self.xy_plot.removeItem(item)
         self.spline_items = []
         self.spline_segments = {}
+        
+        # Clear manual spline points and markers
+        for marker in self.manual_point_markers:
+            self.xy_plot.removeItem(marker)
+        self.manual_point_markers = []
+        self.manual_spline_points = []
+        
+        # Clear cached sorted points
+        if hasattr(self, '_cached_sorted_manual_points'):
+            delattr(self, '_cached_sorted_manual_points')
     
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_S and not self.s_pressed:
@@ -3881,3 +4012,322 @@ class PointCloudLabeler(QMainWindow):
         # Filter indices to only those in the f_init slab
         filtered_indices = [i for i in indices if finit_min_val <= self.points[i, 1] <= finit_max_val]
         return filtered_indices
+
+    def add_manual_spline_point(self, f_star, f_init, label=None):
+        """Add a manual spline point and regenerate line segments."""
+        if label is None:
+            label = self.label_spinbox.value()
+        
+        # Add point to list
+        point = (f_init, f_star, label)
+        self.manual_spline_points.append(point)
+        print(f"Added manual spline point: f_init={f_init:.1f}, f_star={f_star:.1f}, label={label}")
+        
+        # Create visual marker (winding color, 6x size)
+        marker_size = self.point_size * 6
+        
+        # Use winding color based on label (same logic as active brushes)
+        mod = label % self.num_colors
+        winding_color = self.active_brushes[mod].color()
+        
+        marker = pg.ScatterPlotItem(
+            x=[f_star], y=[f_init], 
+            size=marker_size, 
+            pen=None, 
+            brush=pg.mkBrush(winding_color.red(), winding_color.green(), winding_color.blue())
+        )
+        self.xy_plot.addItem(marker)
+        self.manual_point_markers.append(marker)
+        
+        # Regenerate line segments
+        self.generate_manual_line_segments()
+        
+    def generate_manual_line_segments(self):
+        """Generate straight line segments between manual spline points with wrapping."""
+        # Clear existing manual line segments
+        if "manual_lines" in self.spline_segments:
+            del self.spline_segments["manual_lines"]
+        if "manual_line_pairs" in self.spline_segments:
+            del self.spline_segments["manual_line_pairs"]
+        if "manual_line_ranges" in self.spline_segments:
+            del self.spline_segments["manual_line_ranges"]
+        
+        # Clear cached sorted points since manual points changed
+        if hasattr(self, '_cached_sorted_manual_points'):
+            delattr(self, '_cached_sorted_manual_points')
+        
+        if len(self.manual_spline_points) < 2:
+            return
+            
+        # Sort points by effective f_init position (accounting for label wrapping)
+        sorted_points = []
+        for f_init, f_star, label in self.manual_spline_points:
+            effective_f_init = f_init + label * 360.0  # Unwrap to continuous space
+            sorted_points.append((effective_f_init, f_init, f_star, label))
+        
+        sorted_points.sort(key=lambda x: x[0])  # Sort by effective f_init
+        
+        # Generate line segments between consecutive points and track which point pair each segment belongs to
+        line_segments = []
+        segment_point_pairs = []  # Track which point pair each segment belongs to
+        segment_effective_ranges = []  # Track effective position ranges for proper coloring
+        
+        for i in range(len(sorted_points) - 1):
+            eff_f_init1, f_init1, f_star1, label1 = sorted_points[i]
+            eff_f_init2, f_init2, f_star2, label2 = sorted_points[i + 1]
+            
+            segments, segment_infos = self.create_wrapped_line_segments(
+                f_init1, f_star1, label1,
+                f_init2, f_star2, label2
+            )
+            
+            # Track which point pair each segment belongs to and its effective range
+            for segment, (eff_start, eff_end) in zip(segments, segment_infos):
+                line_segments.append(segment)
+                segment_point_pairs.append((i, i + 1, label1, label2))  # Store indices and labels of the point pair
+                segment_effective_ranges.append((eff_start, eff_end, eff_f_init1, eff_f_init2))  # Store effective range info
+        
+        # Store line segments, their corresponding point pairs, and effective ranges
+        if line_segments:
+            self.spline_segments["manual_lines"] = line_segments
+            self.spline_segments["manual_line_pairs"] = segment_point_pairs  # Store the mapping
+            self.spline_segments["manual_line_ranges"] = segment_effective_ranges  # Store effective ranges
+            print(f"Generated {len(line_segments)} manual line segments between {len(sorted_points)} points")
+            
+            # Debug: show labels of manual points
+            point_labels = [point[3] for point in sorted_points]
+            print(f"Manual point labels: {point_labels}")
+        else:
+            print("No manual line segments generated")
+            
+        # Add visual lines to plot
+        self.update_manual_line_display()
+    
+    def create_wrapped_line_segments(self, f_init1, f_star1, label1, f_init2, f_star2, label2):
+        """Create line segments with proper wrapping between two points."""
+        segments = []
+        segment_infos = []  # Track effective position info for each segment
+        
+        # Calculate label difference and required wraps
+        label_diff = label2 - label1
+        
+        # Convert to effective coordinates
+        eff_f_init1 = f_init1
+        eff_f_init2 = f_init2 + label_diff * 360.0
+        
+        # Generate line points with wrapping
+        n_points = max(10, int(abs(eff_f_init2 - eff_f_init1) / 10))  # At least 10 points, more for longer lines
+        f_init_points = np.linspace(eff_f_init1, eff_f_init2, n_points)
+        f_star_points = np.linspace(f_star1, f_star2, n_points)
+        
+        # Convert back to wrapped coordinates and create segments
+        current_segment_f_star = []
+        current_segment_f_init = []
+        current_segment_eff_start = None
+        current_segment_eff_end = None
+        
+        for i, (f_init_eff, f_star) in enumerate(zip(f_init_points, f_star_points)):
+            # Wrap f_init to [-180, 180] range
+            f_init_wrapped = ((f_init_eff + 180) % 360) - 180
+            
+            # Check if we need to start a new segment (crossing boundary)
+            if (current_segment_f_init and 
+                abs(f_init_wrapped - current_segment_f_init[-1]) > 180):
+                
+                # Finish current segment
+                if len(current_segment_f_init) >= 2:
+                    segment = np.array([[fs, fi] for fs, fi in zip(current_segment_f_star, current_segment_f_init)])
+                    segments.append(segment)
+                    # Store effective position range for this segment
+                    segment_infos.append((current_segment_eff_start, current_segment_eff_end))
+                
+                # Start new segment
+                current_segment_f_star = [f_star]
+                current_segment_f_init = [f_init_wrapped]
+                current_segment_eff_start = f_init_eff
+                current_segment_eff_end = f_init_eff
+            else:
+                current_segment_f_star.append(f_star)
+                current_segment_f_init.append(f_init_wrapped)
+                if current_segment_eff_start is None:
+                    current_segment_eff_start = f_init_eff
+                current_segment_eff_end = f_init_eff
+        
+        # Add final segment
+        if len(current_segment_f_init) >= 2:
+            segment = np.array([[fs, fi] for fs, fi in zip(current_segment_f_star, current_segment_f_init)])
+            segments.append(segment)
+            segment_infos.append((current_segment_eff_start, current_segment_eff_end))
+        
+        return segments, segment_infos
+    
+    def update_manual_line_display(self):
+        """Update the visual display of manual line segments."""
+        # Remove existing manual line items
+        items_to_remove = []
+        for item in self.spline_items:
+            if hasattr(item, '_is_manual_line'):
+                items_to_remove.append(item)
+        
+        for item in items_to_remove:
+            self.xy_plot.removeItem(item)
+            self.spline_items.remove(item)
+                
+        # Add new manual line segments with winding colors
+        if ("manual_lines" in self.spline_segments and 
+            "manual_line_pairs" in self.spline_segments and 
+            "manual_line_ranges" in self.spline_segments):
+            line_segments = self.spline_segments["manual_lines"]
+            segment_point_pairs = self.spline_segments["manual_line_pairs"]
+            segment_effective_ranges = self.spline_segments["manual_line_ranges"]
+            
+            # Draw each segment with appropriate color based on its position along the line
+            for i, (segment, (idx1, idx2, label1, label2), (eff_start, eff_end, line_eff_start, line_eff_end)) in enumerate(
+                zip(line_segments, segment_point_pairs, segment_effective_ranges)):
+                if len(segment) >= 2:
+                    # Calculate the position of this segment along the line progression
+                    if line_eff_end != line_eff_start:
+                        # Use the midpoint of the segment's effective range
+                        segment_mid = (eff_start + eff_end) / 2
+                        progress = (segment_mid - line_eff_start) / (line_eff_end - line_eff_start)
+                        progress = max(0.0, min(1.0, progress))  # Clamp to [0, 1]
+                        
+                        # Interpolate the label based on progress along the line
+                        interpolated_label = label1 + progress * (label2 - label1)
+                    else:
+                        # Fallback if line has no length
+                        interpolated_label = (label1 + label2) / 2
+                    
+                    # Use winding color based on the interpolated label
+                    mod = int(round(interpolated_label)) % self.num_colors
+                    winding_color = self.active_brushes[mod].color()
+                    pen = pg.mkPen(color=(winding_color.red(), winding_color.green(), winding_color.blue()), width=2)
+                    
+                    line_item = pg.PlotDataItem(x=segment[:, 0], y=segment[:, 1], pen=pen)
+                    line_item._is_manual_line = True  # Mark as manual line for removal
+                    self.xy_plot.addItem(line_item)
+                    self.spline_items.append(line_item)
+        elif "manual_lines" in self.spline_segments and "manual_line_pairs" in self.spline_segments:
+            # Fallback for when we have pairs but no ranges (intermediate state)
+            line_segments = self.spline_segments["manual_lines"]
+            segment_point_pairs = self.spline_segments["manual_line_pairs"]
+            
+            # Draw each segment with average color (better than old method but not perfect)
+            for i, (segment, (idx1, idx2, label1, label2)) in enumerate(zip(line_segments, segment_point_pairs)):
+                if len(segment) >= 2:
+                    # Use the average label of the two manual points this segment connects
+                    avg_label = int((label1 + label2) / 2)
+                    
+                    # Use winding color based on the average label
+                    mod = avg_label % self.num_colors
+                    winding_color = self.active_brushes[mod].color()
+                    pen = pg.mkPen(color=(winding_color.red(), winding_color.green(), winding_color.blue()), width=2)
+                    
+                    line_item = pg.PlotDataItem(x=segment[:, 0], y=segment[:, 1], pen=pen)
+                    line_item._is_manual_line = True  # Mark as manual line for removal
+                    self.xy_plot.addItem(line_item)
+                    self.spline_items.append(line_item)
+        elif "manual_lines" in self.spline_segments:
+            # Fallback for old format without segment_point_pairs (shouldn't happen with new code)
+            # Get sorted manual points for color determination
+            sorted_points = []
+            for f_init, f_star, label in self.manual_spline_points:
+                effective_f_init = f_init + label * 360.0
+                sorted_points.append((effective_f_init, f_init, f_star, label))
+            sorted_points.sort(key=lambda x: x[0])
+            
+            # Draw each segment with approximate color (this is the old buggy method)
+            for i, segment in enumerate(self.spline_segments["manual_lines"]):
+                if len(segment) >= 2:
+                    # Determine which pair of manual points this segment connects
+                    # Use fallback logic (may be incorrect for wrapped segments)
+                    if i < len(sorted_points) - 1:
+                        label1 = sorted_points[i][3]
+                        label2 = sorted_points[i + 1][3]
+                        avg_label = int((label1 + label2) / 2)
+                    else:
+                        # Fallback to first label if we can't determine
+                        avg_label = sorted_points[0][3] if sorted_points else 1
+                    
+                    # Use winding color based on label
+                    mod = avg_label % self.num_colors
+                    winding_color = self.active_brushes[mod].color()
+                    pen = pg.mkPen(color=(winding_color.red(), winding_color.green(), winding_color.blue()), width=2)
+                    
+                    line_item = pg.PlotDataItem(x=segment[:, 0], y=segment[:, 1], pen=pen)
+                    line_item._is_manual_line = True  # Mark as manual line for removal
+                    self.xy_plot.addItem(line_item)
+                    self.spline_items.append(line_item)
+
+    def get_manual_line_label_for_point(self, point_f_star, point_f_init):
+        """
+        Determine what label a point should get if assigned to the closest manual line.
+        Returns (label, distance) or (None, inf) if no manual lines exist.
+        Optimized for performance.
+        """
+        if "manual_lines" not in self.spline_segments or not self.manual_spline_points:
+            return None, float('inf')
+        
+        # Cache sorted points if not already cached
+        if not hasattr(self, '_cached_sorted_manual_points'):
+            sorted_points = []
+            for f_init, f_star, label in self.manual_spline_points:
+                effective_f_init = f_init + label * 360.0
+                sorted_points.append((effective_f_init, f_init, f_star, label))
+            sorted_points.sort(key=lambda x: x[0])
+            self._cached_sorted_manual_points = sorted_points
+        
+        sorted_points = self._cached_sorted_manual_points
+        min_distance = float('inf')
+        best_label = None
+        point = np.array([point_f_star, point_f_init])
+        
+        # Quick distance check to each manual line segment
+        for segment in self.spline_segments["manual_lines"]:
+            if len(segment) < 2:
+                continue
+            
+            # Vectorized distance calculation for entire segment at once
+            # Convert segment to vectors for vectorized operations
+            p1_array = segment[:-1]  # All points except last
+            p2_array = segment[1:]   # All points except first
+            
+            # Vectorized line segment distance calculation
+            v = p2_array - p1_array  # Vectors from p1 to p2
+            w = point - p1_array     # Vectors from p1 to point
+            
+            # Project point onto line segments (vectorized)
+            c1 = np.sum(w * v, axis=1)
+            c2 = np.sum(v * v, axis=1)
+            
+            # Avoid division by zero
+            t = np.zeros_like(c1)
+            valid_segments = c2 > 1e-8
+            t[valid_segments] = np.clip(c1[valid_segments] / c2[valid_segments], 0, 1)
+            
+            # Calculate closest points on segments
+            closest_points = p1_array + t[:, np.newaxis] * v
+            
+            # Calculate distances
+            distances = np.linalg.norm(point - closest_points, axis=1)
+            
+            # Find minimum distance for this segment
+            if len(distances) > 0:
+                seg_min_distance = np.min(distances)
+                if seg_min_distance < min_distance:
+                    min_distance = seg_min_distance
+                    
+                    # Simple label assignment: use the label of the closest manual point
+                    # Find which manual point pair this segment belongs to (simplified)
+                    seg_min_idx = np.argmin(distances)
+                    closest_point = closest_points[seg_min_idx]
+                    
+                    # Find the closest manual point by distance
+                    min_point_dist = float('inf')
+                    for _, f_init, f_star, label in sorted_points:
+                        point_dist = abs(closest_point[0] - f_star) + abs(closest_point[1] - f_init)
+                        if point_dist < min_point_dist:
+                            min_point_dist = point_dist
+                            best_label = label
+        
+        return best_label, min_distance
