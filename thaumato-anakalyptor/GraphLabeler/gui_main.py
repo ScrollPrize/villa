@@ -3462,7 +3462,10 @@ class PointCloudLabeler(QMainWindow):
             self.redo_stack.append((self.labels.copy(), self.group.copy()))
             self.labels = prev_state.copy()
             self.group = prev_group.copy()
+            print(f"Undo performed (undo stack: {len(self.undo_stack)}, redo stack: {len(self.redo_stack)})")
             self.update_views()
+        else:
+            print("Nothing to undo")
     
     def redo(self):
         if self.redo_stack:
@@ -3470,7 +3473,10 @@ class PointCloudLabeler(QMainWindow):
             self.undo_stack.append((self.labels.copy(), self.group.copy()))
             self.labels = next_state.copy()
             self.group = next_group.copy()
+            print(f"Redo performed (undo stack: {len(self.undo_stack)}, redo stack: {len(self.redo_stack)})")
             self.update_views()
+        else:
+            print("Nothing to redo")
 
     def update_undo_redo(self):
         # Clear out undo stack if it is larger than 50
@@ -3780,9 +3786,14 @@ class PointCloudLabeler(QMainWindow):
         """Handle label updates from OME-Zarr view."""
         print(f"Received label updates for {len(node_updates)} nodes from OME-Zarr view ({view_type})")
         
-        # Track undo/redo
+        # Track undo/redo - save current state before applying changes
         self.undo_stack.append((self.labels.copy(), self.group.copy()))
         self.redo_stack = []
+        
+        # Manage undo stack size
+        self.update_undo_redo()
+        
+        print(f"Saved current state to undo stack (stack size: {len(self.undo_stack)})")
         
         # Get the drawing radius
         radius = self.radius_spinbox.value()

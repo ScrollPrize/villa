@@ -1,7 +1,8 @@
 import numpy as np
 from PyQt5.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFileDialog, QMessageBox, QDialog, QFormLayout, QDialogButtonBox, QLineEdit, QComboBox, QPushButton, QLabel, QProgressDialog, QSpinBox, QDoubleSpinBox, QCheckBox, QApplication, QGraphicsPathItem
 from PyQt5.QtCore import QTimer, QThread, pyqtSignal, QObject, pyqtSlot, Qt, QEvent, QPointF
-from PyQt5.QtGui import QImage, QPainter, QPainterPath, QPen, QColor
+from PyQt5.QtGui import QImage, QPainter, QPainterPath, QPen, QColor, QKeySequence
+from PyQt5.QtWidgets import QShortcut
 import pyqtgraph as pg
 import pyqtgraph.exporters
 import cv2
@@ -585,6 +586,8 @@ class OmeZarrViewWindow(QMainWindow):
         super().__init__(parent)
         self.setWindowTitle("OME-Zarr Views")
         self.setAttribute(Qt.WA_DeleteOnClose)
+        # Ensure window can receive keyboard events
+        self.setFocusPolicy(Qt.StrongFocus)
 
         os.makedirs("GraphLabelerViews", exist_ok=True)
 
@@ -744,6 +747,17 @@ class OmeZarrViewWindow(QMainWindow):
         self.redo_button.clicked.connect(self._redo_labels)
         settings_layout.addWidget(self.redo_button)
         
+        # Add QShortcut-based keyboard shortcuts as backup
+        self.undo_shortcut = QShortcut(QKeySequence.Undo, self)
+        self.undo_shortcut.activated.connect(self._undo_labels)
+        
+        self.redo_shortcut = QShortcut(QKeySequence.Redo, self)
+        self.redo_shortcut.activated.connect(self._redo_labels)
+        
+        # Alternative redo shortcut (Ctrl+Y)
+        self.redo_shortcut_y = QShortcut(QKeySequence("Ctrl+Y"), self)
+        self.redo_shortcut_y.activated.connect(self._redo_labels)
+        
         # Load initial resolution
         self.on_resolution_changed(0)
         
@@ -809,6 +823,11 @@ class OmeZarrViewWindow(QMainWindow):
         
         # Initialize undo/redo button states
         self._update_undo_redo_buttons()
+        
+        # Ensure window gets focus for keyboard events
+        self.activateWindow()
+        self.raise_()
+        self.setFocus()
 
     def load_placeholder_images(self):
         red_image = np.zeros((512,512,3), dtype=np.uint8)
@@ -1228,12 +1247,16 @@ class OmeZarrViewWindow(QMainWindow):
     
     def keyPressEvent(self, event):
         """Handle key press events."""
+        print(f"[DEBUG] Key pressed: {event.key()}, modifiers: {event.modifiers()}")
+        
         if event.key() == Qt.Key_Z and (event.modifiers() & Qt.ControlModifier):
             # Undo
+            print("[DEBUG] Undo triggered")
             self._undo_labels()
             event.accept()
         elif event.key() == Qt.Key_Y and (event.modifiers() & Qt.ControlModifier):
             # Redo
+            print("[DEBUG] Redo triggered")
             self._redo_labels()
             event.accept()
         elif event.key() == Qt.Key_P:
@@ -1249,6 +1272,7 @@ class OmeZarrViewWindow(QMainWindow):
                 print("Pipette mode disabled")
             event.accept()
         else:
+            print(f"[DEBUG] Key not handled: {event.key()}")
             super().keyPressEvent(event)
     
     def eventFilter(self, source, event):
@@ -1931,4 +1955,8 @@ class OmeZarrViewWindow(QMainWindow):
         
         # Clear the labels
         self.clear_custom_labels()
+        
+        # Explicitly refresh the display
+        self._refresh_label_display()
+        
         print("Reset manual labels")
