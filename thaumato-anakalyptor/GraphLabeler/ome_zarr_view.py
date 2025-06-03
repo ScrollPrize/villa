@@ -640,6 +640,11 @@ class OmeZarrViewWindow(QMainWindow):
         # Drawing radius for brush
         self.drawing_radius = 3.5
         
+        # Undo/Redo functionality for manual labeling
+        self.undo_stack = []
+        self.redo_stack = []
+        self.max_undo_steps = 50  # Limit memory usage
+        
         # For XY view updates.
         self.pending_z_center = None
         self.debounce_timer = QTimer(self)
@@ -725,6 +730,20 @@ class OmeZarrViewWindow(QMainWindow):
         self.apply_labels_button.clicked.connect(self.apply_labels_to_graph)
         settings_layout.addWidget(self.apply_labels_button)
         
+        # Add reset labels button
+        self.reset_labels_button = QPushButton("Reset Labels")
+        self.reset_labels_button.clicked.connect(self.reset_manual_labels)
+        settings_layout.addWidget(self.reset_labels_button)
+        
+        # Add undo/redo buttons
+        self.undo_button = QPushButton("Undo (Ctrl+Z)")
+        self.undo_button.clicked.connect(self._undo_labels)
+        settings_layout.addWidget(self.undo_button)
+        
+        self.redo_button = QPushButton("Redo (Ctrl+Y)")
+        self.redo_button.clicked.connect(self._redo_labels)
+        settings_layout.addWidget(self.redo_button)
+        
         # Load initial resolution
         self.on_resolution_changed(0)
         
@@ -787,6 +806,9 @@ class OmeZarrViewWindow(QMainWindow):
         # We'll store the last computed overlay windings to support dummy color updates.
         self.last_overlay_windings = None
         self.last_overlay_windings_computed = None
+        
+        # Initialize undo/redo button states
+        self._update_undo_redo_buttons()
 
     def load_placeholder_images(self):
         red_image = np.zeros((512,512,3), dtype=np.uint8)
@@ -1206,7 +1228,15 @@ class OmeZarrViewWindow(QMainWindow):
     
     def keyPressEvent(self, event):
         """Handle key press events."""
-        if event.key() == Qt.Key_P:
+        if event.key() == Qt.Key_Z and (event.modifiers() & Qt.ControlModifier):
+            # Undo
+            self._undo_labels()
+            event.accept()
+        elif event.key() == Qt.Key_Y and (event.modifiers() & Qt.ControlModifier):
+            # Redo
+            self._redo_labels()
+            event.accept()
+        elif event.key() == Qt.Key_P:
             # Toggle pipette mode
             self.pipette_mode = not self.pipette_mode
             if self.pipette_mode:
@@ -1217,6 +1247,7 @@ class OmeZarrViewWindow(QMainWindow):
                 self.pipette_label.setText("Pipette: OFF")
                 self.pipette_label.setStyleSheet("")
                 print("Pipette mode disabled")
+            event.accept()
         else:
             super().keyPressEvent(event)
     
@@ -1350,6 +1381,92 @@ class OmeZarrViewWindow(QMainWindow):
         self._overlay_xz.setPen(pen_xz)
         print(f"Drawing radius updated to: {self.drawing_radius}")
     
+    def _save_labels_state(self):
+        """Save current state of both XY and XZ labels for undo."""
+        current_state = {
+            'xy_labels': self.point_labels_xy.copy() if self.point_labels_xy else [],
+            'xz_labels': self.point_labels_xz.copy() if self.point_labels_xz else []
+        }
+        self.undo_stack.append(current_state)
+        
+        # Limit undo stack size
+        if len(self.undo_stack) > self.max_undo_steps:
+            self.undo_stack.pop(0)
+        
+        # Clear redo stack when new action is performed
+        self.redo_stack.clear()
+        
+        # Update button states
+        self._update_undo_redo_buttons()
+    
+    def _undo_labels(self):
+        """Undo the last labeling action."""
+        if not self.undo_stack:
+            print("Nothing to undo")
+            return
+        
+        # Save current state to redo stack
+        current_state = {
+            'xy_labels': self.point_labels_xy.copy() if self.point_labels_xy else [],
+            'xz_labels': self.point_labels_xz.copy() if self.point_labels_xz else []
+        }
+        self.redo_stack.append(current_state)
+        
+        # Restore previous state
+        previous_state = self.undo_stack.pop()
+        self.point_labels_xy = previous_state['xy_labels'].copy()
+        self.point_labels_xz = previous_state['xz_labels'].copy()
+        
+        # Update display
+        self._refresh_label_display()
+        self.update_labels_status()
+        print("Undid labeling action")
+        
+        # Update button states
+        self._update_undo_redo_buttons()
+    
+    def _redo_labels(self):
+        """Redo the last undone labeling action."""
+        if not self.redo_stack:
+            print("Nothing to redo")
+            return
+        
+        # Save current state to undo stack
+        current_state = {
+            'xy_labels': self.point_labels_xy.copy() if self.point_labels_xy else [],
+            'xz_labels': self.point_labels_xz.copy() if self.point_labels_xz else []
+        }
+        self.undo_stack.append(current_state)
+        
+        # Restore redo state
+        redo_state = self.redo_stack.pop()
+        self.point_labels_xy = redo_state['xy_labels'].copy()
+        self.point_labels_xz = redo_state['xz_labels'].copy()
+        
+        # Update display
+        self._refresh_label_display()
+        self.update_labels_status()
+        print("Redid labeling action")
+        
+        # Update button states
+        self._update_undo_redo_buttons()
+    
+    def _update_undo_redo_buttons(self):
+        """Update undo/redo button enabled state based on stack contents."""
+        if hasattr(self, 'undo_button'):
+            self.undo_button.setEnabled(len(self.undo_stack) > 0)
+        if hasattr(self, 'redo_button'):
+            self.redo_button.setEnabled(len(self.redo_stack) > 0)
+    
+    def _refresh_label_display(self):
+        """Refresh the display after undo/redo operations."""
+        if hasattr(self, 'overlay_scatter') and self.point_labels_xy:
+            brushes = self.get_brushes()
+            self.overlay_scatter.setBrush(brushes)
+        if hasattr(self, 'overlay_scatter_xz') and self.point_labels_xz:
+            brushes = self.get_brushes_xz()
+            self.overlay_scatter_xz.setBrush(brushes)
+    
     def _current_label_qcolor(self):
         """Return a semi-transparent QColor matching the current label, using the same logic as main GUI."""
         lab = self.label_spinbox.value()
@@ -1398,8 +1515,8 @@ class OmeZarrViewWindow(QMainWindow):
     
     def start_stroke_xy(self, event):
         """Start a brush stroke in XY view."""
-        if self._stroke_backup is None:
-            self._stroke_backup = self.point_labels_xy.copy()
+        # Save state for undo before starting new stroke
+        self._save_labels_state()
         
         pos = self.xy_view.getView().mapSceneToView(event.scenePos())
         self._current_path_xy = QPainterPath(QPointF(pos.x(), pos.y()))
@@ -1427,15 +1544,14 @@ class OmeZarrViewWindow(QMainWindow):
         self._apply_brush_path_to_labels_xy(pts)
         
         # Clear the overlay
-        self._stroke_backup = None
         self._current_path_xy = None
         self._overlay.setPath(QPainterPath())
         self._overlay.setVisible(False)
     
     def start_stroke_xz(self, event):
         """Start a brush stroke in XZ view."""
-        if self._stroke_backup is None:
-            self._stroke_backup = self.point_labels_xz.copy()
+        # Save state for undo before starting new stroke
+        self._save_labels_state()
         
         pos = self.xz_view.getView().mapSceneToView(event.scenePos())
         self._current_path_xz = QPainterPath(QPointF(pos.x(), pos.y()))
@@ -1463,7 +1579,6 @@ class OmeZarrViewWindow(QMainWindow):
         self._apply_brush_path_to_labels_xz(pts)
         
         # Clear the overlay
-        self._stroke_backup = None
         self._current_path_xz = None
         self._overlay_xz.setPath(QPainterPath())
         self._overlay_xz.setVisible(False)
@@ -1775,6 +1890,9 @@ class OmeZarrViewWindow(QMainWindow):
                 self.labels_updated_signal.emit(node_updates_xz, "XZ")
                 print(f"Emitted {len(node_updates_xz)} XZ view updates (full space indices)")
             
+            # Reset manual labels after successful application
+            self.clear_custom_labels()
+            
             # Create detailed message
             xy_count = len(node_updates_xy)
             xz_count = len(node_updates_xz)
@@ -1786,6 +1904,7 @@ class OmeZarrViewWindow(QMainWindow):
                 available_views.append(f"{xz_count} from XZ view")
             
             msg = f"Updated {total_updates} nodes:\n- " + "\n- ".join(available_views)
+            msg += "\n\nManual labels have been cleared from OME-Zarr view."
             
             QMessageBox.information(self, "Labels Applied", msg)
         else:
@@ -1801,3 +1920,33 @@ class OmeZarrViewWindow(QMainWindow):
             msg += "Check console for debug information"
             
             QMessageBox.information(self, "No Updates", msg)
+
+    def reset_manual_labels(self):
+        """Reset manual labels with confirmation dialog."""
+        # Check if there are any manual labels to clear
+        total_labels_xy = np.sum(np.abs(np.array(self.point_labels_xy) - self.UNLABELED) > 2) if self.point_labels_xy else 0
+        total_labels_xz = np.sum(np.abs(np.array(self.point_labels_xz) - self.UNLABELED) > 2) if self.point_labels_xz else 0
+        total_labels = total_labels_xy + total_labels_xz
+        
+        if total_labels == 0:
+            QMessageBox.information(self, "Reset Labels", "No manual labels to reset.")
+            return
+        
+        # Confirmation dialog
+        reply = QMessageBox.question(
+            self, 
+            "Reset Labels", 
+            f"Are you sure you want to reset {total_labels} manual labels?\n\nThis action cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, 
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.No:
+            return
+        
+        # Save state for undo before clearing
+        self._save_labels_state()
+        
+        # Clear the labels
+        self.clear_custom_labels()
+        print(f"Reset {total_labels} manual labels")
