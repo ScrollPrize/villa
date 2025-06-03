@@ -1599,7 +1599,7 @@ class OmeZarrViewWindow(QMainWindow):
             brushes = self.get_brushes_xz()
             self.overlay_scatter_xz.setBrush(brushes)
 
-    def apply_labels_to_graph(self, min_count=15, min_percentage=0.5):
+    def apply_labels_to_graph(self, min_count=25, min_percentage=0.75):
         """Apply point labels back to graph nodes based on voting criteria."""
         if not hasattr(self, 'persistent_overlay_worker'):
             QMessageBox.warning(self, "Error", "Overlay worker not initialized")
