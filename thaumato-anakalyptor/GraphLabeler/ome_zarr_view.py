@@ -1599,7 +1599,7 @@ class OmeZarrViewWindow(QMainWindow):
             brushes = self.get_brushes_xz()
             self.overlay_scatter_xz.setBrush(brushes)
 
-    def apply_labels_to_graph(self, min_count=25, min_percentage=0.75):
+    def apply_labels_to_graph(self, min_count=25, min_percentage=0.5):
         """Apply point labels back to graph nodes based on voting criteria."""
         if not hasattr(self, 'persistent_overlay_worker'):
             QMessageBox.warning(self, "Error", "Overlay worker not initialized")
@@ -1646,8 +1646,6 @@ class OmeZarrViewWindow(QMainWindow):
             # Get indices of close nodes in undeleted space
             close_indices_xy = np.where(close_mask_xy)[0]  # Maps close space → undeleted space
             
-            
-            
             # Find all close nodes that map to the display points
             labels_extended_all_points = np.array(self.point_labels_xy)[self.persistent_overlay_worker.inverse_indices]
             points_indices = np.arange(len(labels_extended_all_points))
@@ -1657,22 +1655,28 @@ class OmeZarrViewWindow(QMainWindow):
             
             # Count total XY points per close node
             xy_nodes_labels = {}
+            xy_valid_nodes = {}
             for i in range(len(labels_extended_all_points)):
                 label_point = labels_extended_all_points[i]
-                if abs(label_point - self.UNLABELED) < 2:
-                    continue
                 node_of_point = extended_nodes[i]
+                if abs(label_point - self.UNLABELED) >=2:
+                    xy_valid_nodes[node_of_point] = True
                 if node_of_point not in xy_nodes_labels:
                     xy_nodes_labels[node_of_point] = []
                 xy_nodes_labels[node_of_point].append(label_point)
             # for each node find the most common label
-            for node_of_point, labels in xy_nodes_labels.items():
+            for node_of_point in xy_valid_nodes.keys():
+                if not xy_valid_nodes[node_of_point]:
+                    continue
+                labels = xy_nodes_labels[node_of_point]
                 label_counts = {}
                 total = len(labels)
                 for label in labels:
                     label_counts[label] = label_counts.get(label, 0) + 1
                 max_label = max(label_counts.items(), key=lambda x: x[1])
                 label, count = max_label
+                if abs(label - self.UNLABELED) < 2:
+                    continue
                 
                 percentage = count / total
                 if count >= min_count and total > 0:
@@ -1687,29 +1691,33 @@ class OmeZarrViewWindow(QMainWindow):
             # Get indices of close nodes in undeleted space
             close_indices_xz = np.where(close_mask_xz)[0]  # Maps close space → undeleted space
             
-            
-
             labels_extended_all_points = np.array(self.point_labels_xz)[self.persistent_overlay_worker.inverse_indices_xz]
             points_indices = np.arange(len(labels_extended_all_points))
             extended_nodes = self.persistent_overlay_worker.overlay_point_nodes_indices_xz[points_indices]
             
             xz_nodes_labels = {}
+            xz_valid_nodes = {}
             for i in range(len(labels_extended_all_points)):
                 label_point = labels_extended_all_points[i]
-                if abs(label_point - self.UNLABELED) < 2:
-                    continue
                 node_of_point = extended_nodes[i]
+                if abs(label_point - self.UNLABELED) >=2:
+                    xz_valid_nodes[node_of_point] = True
                 if node_of_point not in xz_nodes_labels:
                     xz_nodes_labels[node_of_point] = []
                 xz_nodes_labels[node_of_point].append(label_point)
                 
-            for node_of_point, labels in xz_nodes_labels.items():
+            for node_of_point in xz_valid_nodes.keys():
+                if not xz_valid_nodes[node_of_point]:
+                    continue
+                labels = xz_nodes_labels[node_of_point]
                 label_counts = {}
                 total = len(labels)
                 for label in labels:
                     label_counts[label] = label_counts.get(label, 0) + 1
                 max_label = max(label_counts.items(), key=lambda x: x[1])
                 label, count = max_label
+                if abs(label - self.UNLABELED) < 2:
+                    continue
                 
                 percentage = count / total
                 if count >= min_count and total > 0:
