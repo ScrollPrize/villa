@@ -638,7 +638,7 @@ class OmeZarrViewWindow(QMainWindow):
         self._current_path_xz = None
         
         # Drawing radius for brush
-        self.drawing_radius = 10.0
+        self.drawing_radius = 3.5
         
         # For XY view updates.
         self.pending_z_center = None
