@@ -1681,11 +1681,6 @@ class OmeZarrViewWindow(QMainWindow):
                         undeleted_idx = close_indices_xy[node_of_point]  # close space → undeleted space
                         xy_node_labels[undeleted_idx] = (label, percentage, count)
                         print(f"  -> ACCEPTED: node {undeleted_idx} with label {label} ({percentage:.1%}), total {total} points")
-                # else:
-                #     print(f"  -> REJECTED: count {count} < 3 or total {total} = 0")
-                #     print(f"  -> REJECTED: percentage {percentage:.1%} < 50%")
-            
-        else:
                         
         # Process XZ labels if available (similar to XY)
         if xz_available:
@@ -1723,10 +1718,6 @@ class OmeZarrViewWindow(QMainWindow):
                         undeleted_idx = close_indices_xz[node_of_point]  # close space → undeleted space
                         xz_node_labels[undeleted_idx] = (label, percentage, count)
                         print(f"  -> ACCEPTED: node {undeleted_idx} with label {label} ({percentage:.1%}), total {total} points")
-                # else:
-                #     print(f"  -> REJECTED: count {count} < 3 or total {total} = 0")
-                #     print(f"  -> REJECTED: percentage {percentage:.1%} < 50%")
-        else:
 
         # Combine results with disambiguation
         node_updates_xy = {}  # Track XY-specific updates (in full space)
