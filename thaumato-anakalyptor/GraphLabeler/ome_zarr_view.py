@@ -152,12 +152,6 @@ def load_graph_pkl(graph_pkl_path, use_h5=False):
     # Convert nodes dict to arrays/lists
     print(f"[Converting] Converting {len(nodes)} nodes to arrays", file=sys.stderr)
     
-    # First, let's see what the keys look like
-    sample_keys = list(nodes.keys())[:5] if nodes else []
-    print(f"[Debug] Sample node keys: {sample_keys}", file=sys.stderr)
-    if sample_keys:
-        print(f"[Debug] First key type: {type(sample_keys[0])}", file=sys.stderr)
-    
     for key, data in nodes.items():
         # Handle node keys - preserve 4-tuple structure
         try:
@@ -199,8 +193,6 @@ def load_graph_pkl(graph_pkl_path, use_h5=False):
     # Convert lists to final arrays
     centroids = np.array(centroids_list, dtype=np.float16)  # 2D array (n, 3)
     node_keys = np.array(node_keys_list, dtype=np.int16)   # 2D array (n, 4)
-    
-    print(f"[Debug] Final node_keys shape: {node_keys.shape}, centroids shape: {centroids.shape}", file=sys.stderr)
     
     # Save to NPZ for future fast loading
     try:
@@ -1614,7 +1606,6 @@ class OmeZarrViewWindow(QMainWindow):
             return
             
         # Debug: Check if we have the necessary mappings
-        print(f"\nDEBUG: Starting apply_labels_to_graph")
         total_labels_xy = np.sum(np.abs(np.array(self.point_labels_xy) - self.UNLABELED) > 2) if not self.point_labels_xy is None else 0
         total_labels_xz = np.sum(np.abs(np.array(self.point_labels_xz) - self.UNLABELED) > 2) if not self.point_labels_xz is None else 0
         print(f"XY labels: {total_labels_xy} points labeled")
@@ -1645,7 +1636,6 @@ class OmeZarrViewWindow(QMainWindow):
                                "3. Try again")
             return
         
-        print(f"DEBUG: XY view available: {xy_available}, XZ view available: {xz_available}")
         
         # Process XY and XZ views separately
         xy_node_labels = {}
@@ -1655,12 +1645,8 @@ class OmeZarrViewWindow(QMainWindow):
         if xy_available:
             # Get indices of close nodes in undeleted space
             close_indices_xy = np.where(close_mask_xy)[0]  # Maps close space → undeleted space
-            print(f"DEBUG XY: close_indices_xy length: {len(close_indices_xy)} (from {len(close_mask_xy)} undeleted nodes)")
             
-            print(f"DEBUG XY: overlay_point_nodes_indices length: {len(self.persistent_overlay_worker.overlay_point_nodes_indices)}")
             
-            print(f"DEBUG XY: inverse_indices length: {len(self.persistent_overlay_worker.inverse_indices)}")
-            print(f"DEBUG XY: inverse_indices unique values: {len(np.unique(self.persistent_overlay_worker.inverse_indices))}")
             
             # Find all close nodes that map to the display points
             labels_extended_all_points = np.array(self.point_labels_xy)[self.persistent_overlay_worker.inverse_indices]
@@ -1679,7 +1665,6 @@ class OmeZarrViewWindow(QMainWindow):
                 if node_of_point not in xy_nodes_labels:
                     xy_nodes_labels[node_of_point] = []
                 xy_nodes_labels[node_of_point].append(label_point)
-            print(f"DEBUG XY: xy_nodes_labels length: {len(xy_nodes_labels)}")
             # for each node find the most common label
             for node_of_point, labels in xy_nodes_labels.items():
                 label_counts = {}
@@ -1700,19 +1685,14 @@ class OmeZarrViewWindow(QMainWindow):
                 #     print(f"  -> REJECTED: count {count} < 3 or total {total} = 0")
                 #     print(f"  -> REJECTED: percentage {percentage:.1%} < 50%")
             
-            print(f"DEBUG XY: Total nodes with accepted labels: {len(xy_node_labels)}")
         else:
-            print("DEBUG: Skipping XY processing - view not available or no labels")
                         
         # Process XZ labels if available (similar to XY)
         if xz_available:
             # Get indices of close nodes in undeleted space
             close_indices_xz = np.where(close_mask_xz)[0]  # Maps close space → undeleted space
-            print(f"DEBUG XZ: close_indices_xz length: {len(close_indices_xz)} (from {len(close_mask_xz)} undeleted nodes)")
             
-            print(f"DEBUG XZ: overlay_point_nodes_indices_xz length: {len(self.persistent_overlay_worker.overlay_point_nodes_indices_xz)}")
             
-            print(f"DEBUG XZ: inverse_indices_xz length: {len(self.persistent_overlay_worker.inverse_indices_xz)}")
 
             labels_extended_all_points = np.array(self.point_labels_xz)[self.persistent_overlay_worker.inverse_indices_xz]
             points_indices = np.arange(len(labels_extended_all_points))
@@ -1746,9 +1726,7 @@ class OmeZarrViewWindow(QMainWindow):
                 # else:
                 #     print(f"  -> REJECTED: count {count} < 3 or total {total} = 0")
                 #     print(f"  -> REJECTED: percentage {percentage:.1%} < 50%")
-            print(f"DEBUG XZ: Total nodes with accepted labels: {len(xz_node_labels)}")
         else:
-            print("DEBUG: Skipping XZ processing - view not available or no labels")
 
         # Combine results with disambiguation
         node_updates_xy = {}  # Track XY-specific updates (in full space)

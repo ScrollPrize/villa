@@ -3848,35 +3848,16 @@ class PointCloudLabeler(QMainWindow):
 
     def _get_nearby_indices_xz_with_radius(self, node_pos, radius):
         """Get nearby node indices using the same XZ logic as mouse drawing."""
-        # Use the exact same logic as _apply_brush_path_to_labels_xz
+        # Use the exact same logic as pick_label_at_xz and get_nearby_indices_xy
+        x, z = node_pos[0], node_pos[2]  # f_star, Z
+        indices = self.kdtree_xz.query_ball_point([x, z], r=radius)
+        
+        # Apply the same f_init filtering as mouse drawing
         finit_center = self.finit_center_spinbox.value()
         finit_thickness = self.finit_thickness_slider.value() / self.scaleFactor
         finit_min_val = finit_center - finit_thickness / 2
         finit_max_val = finit_center + finit_thickness / 2
         
-        # Same slab filtering as mouse drawing
-        slab_mask = (self.points[:, 1] >= finit_min_val) & (self.points[:, 1] <= finit_max_val)
-        slab_indices = np.nonzero(slab_mask)[0]
-        if slab_indices.size == 0:
-            return []
-        
-        # Same shear and coordinate logic as mouse drawing
-        shear_factor = np.tan(np.radians(self.xz_shear_spinbox.value()))
-        if self.show_original_points:
-            pts = self.original_points[slab_indices]
-        else:
-            pts = self.points[slab_indices]
-        
-        x_disp = pts[:, 0] + shear_factor * (pts[:, 1] - finit_center)
-        z_disp = pts[:, 2]
-        coords = np.vstack([x_disp, z_disp]).T
-        
-        # Same temporary KD-tree logic as mouse drawing
-        from scipy.spatial import cKDTree
-        tree = cKDTree(coords)
-        
-        node_x_disp = node_pos[0] + shear_factor * (node_pos[1] - finit_center)
-        node_z_disp = node_pos[2]
-        
-        rel_idxs = tree.query_ball_point([node_x_disp, node_z_disp], r=radius)
-        return [slab_indices[j] for j in rel_idxs]
+        # Filter indices to only those in the f_init slab
+        filtered_indices = [i for i in indices if finit_min_val <= self.points[i, 1] <= finit_max_val]
+        return filtered_indices

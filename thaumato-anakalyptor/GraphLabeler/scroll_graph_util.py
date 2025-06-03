@@ -479,15 +479,6 @@ def load_nodes_h5_from_arrays(centroids, node_keys, close_node_indices, winding_
     # Build groups dictionary using array data - use node keys directly like original code
     groups_dict = {}
     
-    # Debug: Print some sample node keys
-    print(f"[H5Debug] Processing {len(close_node_indices)} close nodes", file=sys.stderr)
-    if len(close_node_indices) > 0:
-        sample_indices = close_node_indices[:min(5, len(close_node_indices))]
-        print(f"[H5Debug] Sample close_node_indices: {sample_indices}", file=sys.stderr)
-        print(f"[H5Debug] Sample node_keys shape: {node_keys.shape}", file=sys.stderr)
-        for i, node_idx in enumerate(sample_indices):
-            print(f"[H5Debug] Node {node_idx}: key = {node_keys[node_idx]}", file=sys.stderr)
-    
     for i, node_idx in enumerate(close_node_indices):
         # Get the node key (4-tuple) for this node - this is the "close_node" in original code
         close_node = node_keys[node_idx]  # This is the 4-tuple node key
@@ -499,24 +490,14 @@ def load_nodes_h5_from_arrays(centroids, node_keys, close_node_indices, winding_
         # Use 4th element as surface number (like original code)
         surface_nr = close_node[3]
         groups_dict.setdefault(group_name, []).append((surface_nr, i))
-        
-        # Debug: Print first few group names
-        if i < 5:
-            print(f"[H5Debug] Node {i}: group_name = {group_name}, surface_nr = {surface_nr}", file=sys.stderr)
     
     total_surfaces = sum(len(entries) for entries in groups_dict.values())
-    print(f"[H5Debug] Generated {len(groups_dict)} unique groups with {total_surfaces} total surfaces", file=sys.stderr)
     
     # Load from H5 file
     with h5py.File(h5_filename, "r") as h5f, tqdm(total=total_surfaces, desc="Loading nodes from arrays") as pbar:
-        # Debug: Print some H5 group names
-        h5_groups = list(h5f.keys())
-        print(f"[H5Debug] H5 file has {len(h5_groups)} groups. Sample: {h5_groups[:5]}", file=sys.stderr)
-        
         for group_name, entries in groups_dict.items():
             if group_name not in h5f:
-                if len([g for g in groups_dict.keys() if g not in h5f]) < 10:  # Only print first 10 missing groups
-                    print(f"[H5Debug] Group {group_name} not found in {h5_filename}")
+                print(f"Group {group_name} not found in {h5_filename}")
                 pbar.update(len(entries))
                 continue
             grp = h5f[group_name]
