@@ -1599,7 +1599,7 @@ class OmeZarrViewWindow(QMainWindow):
             brushes = self.get_brushes_xz()
             self.overlay_scatter_xz.setBrush(brushes)
 
-    def apply_labels_to_graph(self):
+    def apply_labels_to_graph(self, min_count=15, min_percentage=0.5):
         """Apply point labels back to graph nodes based on voting criteria."""
         if not hasattr(self, 'persistent_overlay_worker'):
             QMessageBox.warning(self, "Error", "Overlay worker not initialized")
@@ -1675,8 +1675,8 @@ class OmeZarrViewWindow(QMainWindow):
                 label, count = max_label
                 
                 percentage = count / total
-                if count >= 3 and total > 0:
-                    if percentage >= 0.5:
+                if count >= min_count and total > 0:
+                    if percentage >= min_percentage:
                         # Map from close space to full space
                         undeleted_idx = close_indices_xy[node_of_point]  # close space → undeleted space
                         xy_node_labels[undeleted_idx] = (label, percentage, count)
@@ -1712,8 +1712,8 @@ class OmeZarrViewWindow(QMainWindow):
                 label, count = max_label
                 
                 percentage = count / total
-                if count >= 3 and total > 0:
-                    if percentage >= 0.5:
+                if count >= min_count and total > 0:
+                    if percentage >= min_percentage:
                         # Map from close space to full space
                         undeleted_idx = close_indices_xz[node_of_point]  # close space → undeleted space
                         xz_node_labels[undeleted_idx] = (label, percentage, count)
