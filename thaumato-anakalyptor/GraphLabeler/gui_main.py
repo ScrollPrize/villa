@@ -1828,6 +1828,11 @@ class PointCloudLabeler(QMainWindow):
         return QColor(base.red(), base.green(), base.blue(), alpha)
     
     def _on_mouse_press(self, ev, plot_widget, view_name):
+        # Only handle left mouse button for drawing operations
+        if ev.button() != Qt.LeftButton:
+            ev.ignore()  # Let other buttons pass through to plot widget
+            return
+            
         # pipette / group‑pipette remain unchanged:
         if view_name == 'xy' and self.pipette_mode:
             ev.accept()
@@ -1852,7 +1857,6 @@ class PointCloudLabeler(QMainWindow):
 
         # ---- start a brush stroke in XY ----
         if plot_widget is self.xy_plot \
-        and ev.button() == Qt.LeftButton \
         and self.drawing_mode_checkbox.isChecked() \
         and not self.s_pressed:
             ev.accept()
@@ -1870,7 +1874,6 @@ class PointCloudLabeler(QMainWindow):
 
         # ---- start a brush stroke in XZ ----
         if plot_widget is self.xz_plot \
-        and ev.button() == Qt.LeftButton \
         and self.drawing_mode_checkbox.isChecked() \
         and not self.s_pressed:
             ev.accept()
@@ -1885,12 +1888,16 @@ class PointCloudLabeler(QMainWindow):
             self._overlay_xz.setVisible(True)
             return
 
-        ev.ignore()
+        ev.ignore()  # Let other events pass through
     
     def _on_mouse_drag(self, ev, plot_widget, view_name):
+        # Only handle left mouse button drag for drawing
+        if not (ev.buttons() & Qt.LeftButton):
+            ev.ignore()
+            return
+            
         # ---- extend XY stroke ----
         if plot_widget is self.xy_plot \
-        and (ev.buttons() & Qt.LeftButton) \
         and self.drawing_mode_checkbox.isChecked() \
         and not self.s_pressed:
             ev.accept()
@@ -1901,7 +1908,6 @@ class PointCloudLabeler(QMainWindow):
 
         # ---- extend XZ stroke ----
         if plot_widget is self.xz_plot \
-        and (ev.buttons() & Qt.LeftButton) \
         and self.drawing_mode_checkbox.isChecked() \
         and not self.s_pressed:
             ev.accept()
@@ -1910,12 +1916,16 @@ class PointCloudLabeler(QMainWindow):
             self._overlay_xz.setPath(self._current_path_xz)
             return
 
-        ev.ignore()
+        ev.ignore()  # Let other drag events pass through
     
     def _on_mouse_release(self, ev, plot_widget, view_name):
+        # Only handle left mouse button release for drawing
+        if ev.button() != Qt.LeftButton:
+            ev.ignore()  # Let other buttons pass through to plot widget
+            return
+            
         # ---- finish XY stroke (label or streak) ----
         if plot_widget is self.xy_plot \
-        and ev.button() == Qt.LeftButton \
         and self._stroke_backup is not None:
             ev.accept()
             pts = [(self._current_path_xy.elementAt(i).x,
@@ -1936,7 +1946,6 @@ class PointCloudLabeler(QMainWindow):
 
         # ---- finish XZ stroke (label or streak) ----
         if plot_widget is self.xz_plot \
-        and ev.button() == Qt.LeftButton \
         and self._stroke_backup is not None:
             ev.accept()
             pts = [(self._current_path_xz.elementAt(i).x,
@@ -1954,7 +1963,7 @@ class PointCloudLabeler(QMainWindow):
             self._overlay_xz.setVisible(False)
             return
 
-        ev.accept()  # eat all other releases so the view doesn't pan
+        ev.ignore()  # Let other releases pass through for normal plot interaction
     
     def _apply_brush_path_to_labels(self, data_path):
         """
