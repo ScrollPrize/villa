@@ -70,11 +70,11 @@ def load_graph_pkl(graph_pkl_path, use_h5=False):
     node_keys_list = []
     sample_points_list = [] if not use_h5 else None
     
-    if source_path.endswith('_tiny.pkl'):
+    if source_path.endswith('_tiny.pkl') and os.path.exists(source_path):
         # Load existing tiny pickle
         nodes = pickle.load(open(source_path, 'rb'))
         print(f"[H5Mode] Loaded {len(nodes)} nodes from tiny pickle", file=sys.stderr)
-    elif source_path.endswith('_small.pkl'):
+    elif source_path.endswith('_small.pkl') and os.path.exists(source_path):
         # Load existing small pickle
         nodes = pickle.load(open(source_path, 'rb'))
         print(f"[PKLMode] Loaded {len(nodes)} nodes from small pickle", file=sys.stderr)
@@ -1890,6 +1890,9 @@ class OmeZarrViewWindow(QMainWindow):
                 self.labels_updated_signal.emit(node_updates_xz, "XZ")
                 print(f"Emitted {len(node_updates_xz)} XZ view updates (full space indices)")
             
+            # Save state for undo before clearing manual labels
+            self._save_labels_state()
+            
             # Reset manual labels after successful application
             self.clear_custom_labels()
             
@@ -1922,31 +1925,10 @@ class OmeZarrViewWindow(QMainWindow):
             QMessageBox.information(self, "No Updates", msg)
 
     def reset_manual_labels(self):
-        """Reset manual labels with confirmation dialog."""
-        # Check if there are any manual labels to clear
-        total_labels_xy = np.sum(np.abs(np.array(self.point_labels_xy) - self.UNLABELED) > 2) if self.point_labels_xy else 0
-        total_labels_xz = np.sum(np.abs(np.array(self.point_labels_xz) - self.UNLABELED) > 2) if self.point_labels_xz else 0
-        total_labels = total_labels_xy + total_labels_xz
-        
-        if total_labels == 0:
-            QMessageBox.information(self, "Reset Labels", "No manual labels to reset.")
-            return
-        
-        # Confirmation dialog
-        reply = QMessageBox.question(
-            self, 
-            "Reset Labels", 
-            f"Are you sure you want to reset {total_labels} manual labels?\n\nThis action cannot be undone.",
-            QMessageBox.Yes | QMessageBox.No, 
-            QMessageBox.No
-        )
-        
-        if reply == QMessageBox.No:
-            return
-        
+        """Reset manual labels without confirmation."""
         # Save state for undo before clearing
         self._save_labels_state()
         
         # Clear the labels
         self.clear_custom_labels()
-        print(f"Reset {total_labels} manual labels")
+        print("Reset manual labels")
