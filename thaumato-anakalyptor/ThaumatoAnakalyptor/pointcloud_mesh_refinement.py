@@ -2673,7 +2673,7 @@ def main():
     if not args.skip_grid:
         grid_uv_flattened(
             flattened_winding_path,
-            subsample_radius=30.0,
+            subsample_radius=10.0,
             r_grid=args.r_grid,
             grid_size=args.grid_size,
             display=args.display,
