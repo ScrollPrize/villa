@@ -494,13 +494,20 @@ def clean_mesh(mesh,
     # 2) cull huge triangles by edge-length / area
     verts = np.asarray(mesh.vertices)
     tris  = np.asarray(mesh.triangles)
-    tri_verts = verts[tris]                   # (M,3,3)
+    tri_verts = verts[tris]
+    mesh_uvs = np.asarray(mesh.triangle_uvs).reshape(-1, 3, 2)                # (M,3,3)
 
-    # edge lengths
+    # edge lengths 3d
     e0 = np.linalg.norm(tri_verts[:,1] - tri_verts[:,0], axis=1)
     e1 = np.linalg.norm(tri_verts[:,2] - tri_verts[:,1], axis=1)
     e2 = np.linalg.norm(tri_verts[:,0] - tri_verts[:,2], axis=1)
     longest_edge = np.maximum.reduce([e0, e1, e2])
+
+    # edge lengths uv
+    e0_uv = np.linalg.norm(mesh_uvs[:,1,:] - mesh_uvs[:,0,:], axis=1)
+    e1_uv = np.linalg.norm(mesh_uvs[:,2,:] - mesh_uvs[:,1,:], axis=1)
+    e2_uv = np.linalg.norm(mesh_uvs[:,0,:] - mesh_uvs[:,2,:], axis=1)
+    longest_edge_uv = np.maximum.reduce([e0_uv, e1_uv, e2_uv])
 
     # areas
     cross_prod = np.cross(tri_verts[:,1] - tri_verts[:,0],
@@ -510,7 +517,7 @@ def clean_mesh(mesh,
     edge_thr = np.percentile(longest_edge, longest_edge_pct)
     area_thr = np.percentile(areas, area_pct)
     print(f"Edge threshold: {edge_thr}, area threshold: {area_thr}, edge length threshold: {edge_length_thresh}")
-    bad = np.where((longest_edge > edge_thr) | (areas > area_thr) | (longest_edge > edge_length_thresh))[0]
+    bad = np.where((longest_edge > edge_thr) | (areas > area_thr) | (longest_edge > edge_length_thresh) | (longest_edge_uv > edge_length_thresh))[0]
     bad = list(bad)
     mesh.remove_triangles_by_index(bad)
 
