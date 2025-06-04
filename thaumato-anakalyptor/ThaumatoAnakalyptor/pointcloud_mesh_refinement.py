@@ -1655,7 +1655,8 @@ def grid_uv_flattened(flattened_winding_path,
                        grid_size=50.0,
                        display=False,
                        display_downsample=0.1,
-                       color_by_angle=False):
+                       color_by_angle=False,
+                       debug_winding=None):
     """
     Enhanced grid-based UV flattening with iterative optimization.
     
@@ -1667,6 +1668,7 @@ def grid_uv_flattened(flattened_winding_path,
         display: Whether to display results
         display_downsample: Downsample ratio for display
         color_by_angle: Whether to color by angle in display
+        debug_winding: If set, only process this specific winding number (for debugging)
     """
     winding_filtered_path = os.path.join(os.path.dirname(flattened_winding_path), "windings_filtered")
     
@@ -1677,6 +1679,18 @@ def grid_uv_flattened(flattened_winding_path,
     # Bring the files in order of their winding number
     winding_files_indices = sorted([int(os.path.basename(wf).split("_")[2].split(".")[0]) for wf in winding_files])
     winding_files = [os.path.join(flattened_winding_path, f"flattened_winding_{i}.npz") for i in winding_files_indices]
+    
+    # Filter for debug mode if specified
+    if debug_winding is not None:
+        if debug_winding in winding_files_indices:
+            debug_index = winding_files_indices.index(debug_winding)
+            winding_files_indices = [debug_winding]
+            winding_files = [winding_files[debug_index]]
+            print(f"DEBUG MODE: Processing only winding {debug_winding}")
+        else:
+            print(f"DEBUG MODE: Winding {debug_winding} not found in available windings: {winding_files_indices}")
+            return
+    
     print(f"Will process {len(winding_files)} flattened winding pointclouds for grid sampling the uv space.")
     
     # Load each wrap, subsample with enhanced grid optimization
@@ -2008,7 +2022,7 @@ def get_surrounding_grids(center_grid, grid_dims):
     return neighbors
 
 
-def mesh_uv_wraps(filtered_winding_path, output_dir, winding_direction=False):
+def mesh_uv_wraps(filtered_winding_path, output_dir, winding_direction=False, debug_winding=None):
     """
     For each filtered winding .npz in `filtered_winding_path`:
       1) Load points (Nx3+) and uvs (Nx2)
@@ -2023,6 +2037,7 @@ def mesh_uv_wraps(filtered_winding_path, output_dir, winding_direction=False):
             `flattened_winding_<nr>.npz` with arrays `points, uvs`
         output_dir: str, where to write `wrap_<nr>.obj`
         winding_direction: bool, if True keep flipped UVs, if False flip back
+        debug_winding: If set, only process this specific winding number (for debugging)
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -2032,6 +2047,18 @@ def mesh_uv_wraps(filtered_winding_path, output_dir, winding_direction=False):
     # Bring the files in order of their winding number
     winding_flattened_files_indices = sorted([int(os.path.basename(wf).split("_")[2].split(".")[0]) for wf in winding_flattened_files])
     winding_flattened_files = [os.path.join(filtered_winding_path, f"flattened_winding_{i}.npz") for i in winding_flattened_files_indices]
+    
+    # Filter for debug mode if specified
+    if debug_winding is not None:
+        if debug_winding in winding_flattened_files_indices:
+            debug_index = winding_flattened_files_indices.index(debug_winding)
+            winding_flattened_files_indices = [debug_winding]
+            winding_flattened_files = [winding_flattened_files[debug_index]]
+            print(f"DEBUG MODE: Meshing only winding {debug_winding}")
+        else:
+            print(f"DEBUG MODE: Winding {debug_winding} not found in available windings: {winding_flattened_files_indices}")
+            return
+    
     for fp in winding_flattened_files:
         nr = int(os.path.basename(fp).split("_")[-1].split(".")[0])
         data = np.load(fp)
@@ -2598,6 +2625,8 @@ def main():
                         help="Color 3D display by angular value")
     parser.add_argument("--from_winding", type=int, default=None,
                         help="Start from this winding index")
+    parser.add_argument("--debug_winding", type=int, default=None,
+                        help="Debug mode: only process this specific winding number")
     args = parser.parse_args()
 
     # Load winding direction
@@ -2609,6 +2638,11 @@ def main():
         print(f"Warning: Could not load winding direction: {e}")
         print("Defaulting to winding_direction=False (no UV flipping)")
         winding_direction = False
+
+    # Debug mode messaging
+    if args.debug_winding is not None:
+        print(f"=== DEBUG MODE: Processing only winding {args.debug_winding} ===")
+        print("Note: mesh_uv_global will be skipped in debug mode")
 
     flattened_winding_path = os.path.join(os.path.dirname(args.mesh), "windings_flattened")
     if not args.skip_precomputation and not args.skip_flattening and not args.skip_grid:
@@ -2637,11 +2671,17 @@ def main():
             grid_size=args.grid_size,
             display=args.display,
             display_downsample=args.display_downsample,
-            color_by_angle=args.color_by_angle
+            color_by_angle=args.color_by_angle,
+            debug_winding=args.debug_winding
         )
     filtered_path = os.path.join(os.path.dirname(args.mesh), "windings_filtered")
-    mesh_uv_wraps(filtered_path, output_dir=os.path.join(os.path.dirname(filtered_path), "uv_meshes"), winding_direction=winding_direction)
-    mesh_uv_global(filtered_path, output_path=os.path.join(os.path.dirname(filtered_path), "mesh_refined.obj"), winding_direction=winding_direction)
+    mesh_uv_wraps(filtered_path, output_dir=os.path.join(os.path.dirname(filtered_path), "uv_meshes"), winding_direction=winding_direction, debug_winding=args.debug_winding)
+    
+    # Skip global mesh generation in debug mode
+    if args.debug_winding is None:
+        mesh_uv_global(filtered_path, output_path=os.path.join(os.path.dirname(filtered_path), "mesh_refined.obj"), winding_direction=winding_direction)
+    else:
+        print(f"Skipping mesh_uv_global due to debug mode (--debug_winding {args.debug_winding})")
 
 if __name__ == "__main__":
     main()
