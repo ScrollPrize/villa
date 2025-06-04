@@ -12,7 +12,9 @@ def parse_args():
         description="Optimize (u,v,n) fields chunk-wise and write to Zarr"
     )
     p.add_argument('--store', dest='input_store', required=True,
-                  help="Zarr group containing datasets ['U','V','N']")
+                  help="Zarr group containing datasets ['U','V','N'] obtained from fibers")
+    p.add_argument('--store-normal', dest='input_store_normal', required=False,
+                  help="Zarr group containing datasets ['U','V','N'] obtained from surfaces")
     p.add_argument('--output', required=True,
                    help="Output Zarr directory for u,v,n")
     p.add_argument('--chunk', default="384,384,384",
@@ -34,12 +36,15 @@ def main():
     cz, cy, cx = map(int, args.chunk.split(','))
 
     # Open inputs
-    
+
     store  = open_zarr(args.input_store, 'r')
-    
     src_U  = store['U']
     src_V  = store['V']
-    src_N  = store['N']
+    if args.input_store_normal is None: #if surface directions are not given, take normal from fibers
+        src_N  = store['N']
+    else:
+        store_normal  = open_zarr(args.input_store_normal, 'r')
+        src_N  = store_normal['N']
     
     # Figure out volume shape for output (always 3×Z×Y×X)
     C, Z, Y, X = src_U.shape
