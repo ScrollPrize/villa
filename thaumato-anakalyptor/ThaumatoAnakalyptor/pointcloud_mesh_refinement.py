@@ -1832,6 +1832,34 @@ def optimize_grid_points(points, uvs, initial_indices, r_grid, grid_size):
         n = n[n != i]
         neighbours.append(n)
 
+    # Initialize error tracking for each position in selected_indices
+    current_errors = np.zeros(len(selected_indices))
+    
+    def calculate_error_for_index(idx):
+        """Calculate error for a specific index position in selected_indices"""
+        current_neighbours = neighbours[idx]
+        if len(current_neighbours) == 0:
+            return 0.0
+            
+        neighbours_uvs = uvs[selected_indices[current_neighbours]]
+        neighbours_points = points[selected_indices[current_neighbours]]
+        current_uv = uvs[selected_indices[idx]]
+        current_point = points[selected_indices[idx]]
+        
+        d_uvs = np.linalg.norm(neighbours_uvs - current_uv, axis=1)
+        d_3d = np.linalg.norm(neighbours_points - current_point, axis=1)
+        es = np.abs(d_uvs - d_3d)
+        es = es[es < 50]
+        return np.mean(es) if len(es) > 0 else 0.0
+    
+    # Calculate initial errors for all indices
+    print("Calculating initial errors...")
+    for i in range(len(selected_indices)):
+        current_errors[i] = calculate_error_for_index(i)
+    
+    initial_mean_error = np.mean(current_errors)
+    print(f"Initial mean error: {initial_mean_error:.4f}")
+
     queue = [ind for ind in range(len(selected_indices))]
     computed_indices = np.zeros(len(selected_indices), dtype=bool)
     iterations = 0
@@ -1854,8 +1882,11 @@ def optimize_grid_points(points, uvs, initial_indices, r_grid, grid_size):
         if computed_indices[current_index]:
             continue
 
-        # Flush the same line
-        print(f"\r{' ' * 60}\rQueue length: {len(queue)}, iterations: {iterations}", end="", flush=True)
+        # Calculate and print progress every 100 iterations or when queue is small
+        if iterations % 100 == 0 or len(queue) < 100:
+            mean_error = np.mean(current_errors)
+            print(f"\rQueue: {len(queue):>5}, Iter: {iterations:>7}, Mean Error: {mean_error:.6f}", end="", flush=True)
+        
         current_neighbours = neighbours[current_index]
         # map to indices in selected_indices
         neighbours_uvs = uvs[selected_indices[current_neighbours]]
@@ -1881,20 +1912,36 @@ def optimize_grid_points(points, uvs, initial_indices, r_grid, grid_size):
             candidate_errors.append(candidate_error)
         
         # find the candidate with the smallest error
-        best_candidate = current_candidates[np.argmin(candidate_errors)]
+        best_candidate_idx = np.argmin(candidate_errors)
+        best_candidate = current_candidates[best_candidate_idx]
+        best_error = candidate_errors[best_candidate_idx]
+        
         # Check if is another candidate than the current one saved in selected_indices
         if best_candidate != selected_indices[current_index]:
             selected_indices[current_index] = best_candidate
+            current_errors[current_index] = best_error
+            
+            # Update errors for affected neighbors (since their distances changed)
+            for neighbor_idx in current_neighbours:
+                current_errors[neighbor_idx] = calculate_error_for_index(neighbor_idx)
+            
             # Add all neighbours to queue
             for o in range(len(current_neighbours)):
                 if computed_indices[current_neighbours[o]]:
                     queue.append(current_neighbours[o])
                     computed_indices[current_neighbours[o]] = False
+        else:
+            # Update the error even if we didn't change the candidate
+            current_errors[current_index] = best_error
 
         computed_indices[current_index] = True
 
     selected_indices = np.unique(selected_indices)
-    print(f"\nFinal selected indices: {len(selected_indices)} vs {len(initial_indices)}")
+    final_mean_error = np.mean(current_errors)
+    print(f"\nOptimization completed:")
+    print(f"Final selected indices: {len(selected_indices)} vs {len(initial_indices)} initial")
+    print(f"Final mean error: {final_mean_error:.6f} (initial: {initial_mean_error:.6f})")
+    print(f"Error improvement: {((initial_mean_error - final_mean_error) / initial_mean_error * 100):.2f}%")
     return selected_indices.tolist()
 
 def get_neighbor_grids(center_grid, grid_dims, r_grid, grid_size):
