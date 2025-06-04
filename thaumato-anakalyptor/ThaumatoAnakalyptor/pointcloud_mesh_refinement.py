@@ -1880,7 +1880,7 @@ def optimize_grid_points(points, uvs, initial_indices, r_grid, grid_size):
         # Check if is another candidate than the current one saved in selected_indices
         if best_candidate != selected_indices[current_index]:
             selected_indices[current_index] = best_candidate
-            # Add al neighbours to queue
+            # Add all neighbours to queue
             for o in range(len(current_neighbours)):
                 if computed_indices[current_neighbours[o]]:
                     queue.append(current_neighbours[o])
