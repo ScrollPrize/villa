@@ -66,6 +66,9 @@ setup(
         'pytorch-lightning',
         'libigl',
         'psutil'
+        'wandb',
+        'tensorstore',
+        'blosc2'
     ],
     python_requires='>=3.8',
     include_package_data=True,
