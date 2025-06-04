@@ -1914,9 +1914,11 @@ class PointCloudLabeler(QMainWindow):
         and self.drawing_mode_checkbox.isChecked() \
         and not self.s_pressed:
             ev.accept()
-            pt = self.xy_plot.plotItem.vb.mapSceneToView(ev.scenePos())
-            self._current_path_xy.lineTo(QPointF(pt.x(), pt.y()))
-            self._overlay.setPath(self._current_path_xy)
+            # Check if path exists before trying to extend it
+            if hasattr(self, '_current_path_xy') and self._current_path_xy is not None:
+                pt = self.xy_plot.plotItem.vb.mapSceneToView(ev.scenePos())
+                self._current_path_xy.lineTo(QPointF(pt.x(), pt.y()))
+                self._overlay.setPath(self._current_path_xy)
             return
 
         # ---- extend XZ stroke ----
@@ -1924,9 +1926,11 @@ class PointCloudLabeler(QMainWindow):
         and self.drawing_mode_checkbox.isChecked() \
         and not self.s_pressed:
             ev.accept()
-            pt = self.xz_plot.plotItem.vb.mapSceneToView(ev.scenePos())
-            self._current_path_xz.lineTo(QPointF(pt.x(), pt.y()))
-            self._overlay_xz.setPath(self._current_path_xz)
+            # Check if path exists before trying to extend it
+            if hasattr(self, '_current_path_xz') and self._current_path_xz is not None:
+                pt = self.xz_plot.plotItem.vb.mapSceneToView(ev.scenePos())
+                self._current_path_xz.lineTo(QPointF(pt.x(), pt.y()))
+                self._overlay_xz.setPath(self._current_path_xz)
             return
 
         ev.ignore()  # Let other drag events pass through
@@ -4021,7 +4025,6 @@ class PointCloudLabeler(QMainWindow):
         # Add point to list
         point = (f_init, f_star, label)
         self.manual_spline_points.append(point)
-        print(f"Added manual spline point: f_init={f_init:.1f}, f_star={f_star:.1f}, label={label}")
         
         # Create visual marker (winding color, 6x size)
         marker_size = self.point_size * 6
@@ -4041,7 +4044,7 @@ class PointCloudLabeler(QMainWindow):
         
         # Regenerate line segments
         self.generate_manual_line_segments()
-        
+    
     def generate_manual_line_segments(self):
         """Generate straight line segments between manual spline points with wrapping."""
         # Clear existing manual line segments
@@ -4097,14 +4100,6 @@ class PointCloudLabeler(QMainWindow):
             self.spline_segments["manual_line_pairs"] = segment_point_pairs  # Store the mapping
             self.spline_segments["manual_line_ranges"] = segment_effective_ranges  # Store effective ranges
             self.spline_segments["manual_line_labels"] = segment_integer_labels  # Store integer labels
-            print(f"Generated {len(line_segments)} manual line segments between {len(sorted_points)} points")
-            print(f"Segment labels: {segment_integer_labels}")
-            
-            # Debug: show labels of manual points
-            point_labels = [point[3] for point in sorted_points]
-            print(f"Manual point labels: {point_labels}")
-        else:
-            print("No manual line segments generated")
             
         # Add visual lines to plot
         self.update_manual_line_display()
@@ -4115,16 +4110,12 @@ class PointCloudLabeler(QMainWindow):
         segment_infos = []  # Track effective position info for each segment
         segment_labels = []  # Track the integer label for each segment
         
-        print(f"DEBUG: Creating line from ({f_init1:.1f}, {f_star1:.1f}, label={label1}) to ({f_init2:.1f}, {f_star2:.1f}, label={label2})")
-        
         # Calculate label difference and required wraps
         label_diff = label2 - label1
         
         # Convert to effective coordinates
         eff_f_init1 = f_init1
         eff_f_init2 = f_init2 + label_diff * 360.0
-        
-        print(f"DEBUG: Effective coordinates: {eff_f_init1:.1f} to {eff_f_init2:.1f}")
         
         # Generate many points along the line to properly capture label transitions
         total_distance = abs(eff_f_init2 - eff_f_init1)
@@ -4139,13 +4130,11 @@ class PointCloudLabeler(QMainWindow):
         
         if label1 == label2:
             # If both endpoints have the same label, use that label for the entire line
-            print(f"DEBUG: Same label case, using label {label1} for entire line")
             for i, (eff_f_init, f_star) in enumerate(zip(eff_f_init_points, f_star_points)):
                 f_init_wrapped = ((eff_f_init + 180) % 360) - 180
                 point_data.append((eff_f_init, f_init_wrapped, f_star, int(label1)))
         else:
             # For lines with different endpoint labels, detect wrap crossings
-            print(f"DEBUG: Different label case, detecting wrap crossings from {label1} to {label2}")
             current_label = int(label1)
             prev_wrapped = ((eff_f_init_points[0] + 180) % 360) - 180
             
@@ -4160,13 +4149,11 @@ class PointCloudLabeler(QMainWindow):
                         if prev_wrapped > 150 and f_init_wrapped < -150:
                             current_label += 1
                             wrap_crossed = True
-                            print(f"DEBUG: Positive wrap crossing at point {i}, label now {current_label}")
                     else:  # Moving in negative label direction
                         # Check for -180 to 180 crossing (negative wrap)
                         if prev_wrapped < -150 and f_init_wrapped > 150:
                             current_label -= 1
                             wrap_crossed = True
-                            print(f"DEBUG: Negative wrap crossing at point {i}, label now {current_label}")
                 
                 # Clamp the label to not exceed the endpoint label
                 if label2 > label1:
@@ -4176,8 +4163,6 @@ class PointCloudLabeler(QMainWindow):
                 
                 point_data.append((eff_f_init, f_init_wrapped, f_star, current_label))
                 prev_wrapped = f_init_wrapped
-        
-        print(f"DEBUG: Generated {len(point_data)} points, label range: {[p[3] for p in point_data[:5]]} ... {[p[3] for p in point_data[-5:]]}")
         
         # Group consecutive points with the same integer label
         if not point_data:
@@ -4207,8 +4192,6 @@ class PointCloudLabeler(QMainWindow):
             segments.extend(sub_segments['segments'])
             segment_infos.extend(sub_segments['infos'])
             segment_labels.extend([current_label] * len(sub_segments['segments']))
-        
-        print(f"DEBUG: Final segments have labels: {segment_labels}")
         
         return segments, segment_infos, segment_labels
     
