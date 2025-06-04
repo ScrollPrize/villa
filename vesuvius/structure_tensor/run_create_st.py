@@ -162,6 +162,11 @@ def run_structure_tensor_part(args, part_id, gpu_id, shared_output_path):
     # Set overlap to 0.0 for no overlap
     cmd.extend(['--overlap', '0.0'])
     
+    # Pass a valid step_size (if user supplied one), else default to 1.0−overlap
+    if args.step_size is not None:
+        cmd.extend(['--step_size', str(args.step_size)])
+    else:
+        cmd.extend(['--step_size', str(1.0 - args.overlap)])
     # Add other optional arguments
     if args.patch_size:
         cmd.extend(['--patch_size', args.patch_size])
@@ -293,6 +298,8 @@ def parse_arguments():
                         help='Override patch size, comma-separated (e.g., "192,192,192")')
     parser.add_argument('--overlap', type=float, default=0.0, 
                         help='Overlap between patches (0-1), default 0.0 for structure tensor')
+    parser.add_argument('--step_size', type=float, default=None,
+                        help='Step‐size factor for sliding window (0 < step_size ≤ 1). If unset, will be inferred as 1.0 − overlap.')
     parser.add_argument('--batch_size', type=int, default=1, 
                         help='Batch size for inference')
     

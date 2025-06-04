@@ -29,10 +29,12 @@ class StructureTensorInferer(Inferer, nn.Module):
                  sigma: float = 1.0,
                  smooth_components: bool = False,
                  volume: int = None,  # Add volume attribute
+                 step_size: float = 1.0,
                  **kwargs):
         # --- Initialize Module first so register_buffer exists ---
         nn.Module.__init__(self)
-
+        
+        self.step_size = step_size
         # --- Remove any incoming normalization_scheme so it can't collide ---
         kwargs.pop('normalization_scheme', None)
 
@@ -657,6 +659,8 @@ def main():
                         help='Override patch size, comma-separated (e.g., "192,192,192")')
     parser.add_argument('--overlap', type=float, default=0.0, 
                         help='Overlap between patches (0-1), default 0.0 for structure tensor')
+    parser.add_argument('--step_size', type=float, default=None,
+                        help='Step‐size factor for sliding window (0 < step_size ≤ 1). If unset, will be inferred as 1.0 − overlap.')
     parser.add_argument('--batch_size', type=int, default=1, 
                         help='Batch size for inference')
     parser.add_argument('--num_parts', type=int, default=1, 
@@ -729,6 +733,12 @@ def main():
     if args.mode == 'structure-tensor':
         # Run structure tensor computation
         print("\n--- Initializing Structure Tensor Inferer ---")
+        # Decide on step_size: if unset, default to (1 – overlap)
+        if args.step_size is None:
+            inferred_step = 1.0 - args.overlap
+        else:
+            inferred_step = args.step_size
+
         inferer = StructureTensorInferer(
             model_path='dummy',  # Not used for structure tensor
             input_dir=args.input_dir,
@@ -739,6 +749,7 @@ def main():
             num_parts=args.num_parts,
             part_id=args.part_id,
             overlap=args.overlap,
+            step_size=inferred_step,
             batch_size=args.batch_size,
             patch_size=patch_size,
             device=args.device,
