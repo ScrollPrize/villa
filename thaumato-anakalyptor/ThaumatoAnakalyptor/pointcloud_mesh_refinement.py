@@ -1872,7 +1872,9 @@ def optimize_grid_points(points, uvs, initial_indices, r_grid, grid_size):
             candidate_point = candidates_points[j]
             d_uvs = np.linalg.norm(neighbours_uvs - candidate_uv, axis=1)
             d_3d = np.linalg.norm(neighbours_points - candidate_point, axis=1)
-            candidate_error = np.mean(np.abs(d_uvs - d_3d))
+            es = np.abs(d_uvs - d_3d)
+            es = es[es < 50]
+            candidate_error = np.mean(es)
             candidate_errors.append(candidate_error)
         
         # find the candidate with the smallest error
