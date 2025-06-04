@@ -1827,7 +1827,10 @@ def optimize_grid_points(points, uvs, initial_indices, r_grid, grid_size):
     neighbours = []
     for i in range(len(selected_indices)):
         # extract neighbours
-        neighbours.append(np.array(uv_tree_neighbours.query_ball_point(uvs[selected_indices[i]], r_grid)))
+        n = np.array(uv_tree_neighbours.query_ball_point(uvs[selected_indices[i]], r_grid))
+        # remove own index
+        n = n[n != i]
+        neighbours.append(n)
 
     queue = [ind for ind in range(len(selected_indices))]
     computed_indices = np.zeros(len(selected_indices), dtype=bool)
