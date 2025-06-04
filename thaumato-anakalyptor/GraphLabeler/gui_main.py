@@ -4051,6 +4051,8 @@ class PointCloudLabeler(QMainWindow):
             del self.spline_segments["manual_line_pairs"]
         if "manual_line_ranges" in self.spline_segments:
             del self.spline_segments["manual_line_ranges"]
+        if "manual_line_labels" in self.spline_segments:
+            del self.spline_segments["manual_line_labels"]
         
         # Clear cached sorted points since manual points changed
         if hasattr(self, '_cached_sorted_manual_points'):
@@ -4067,32 +4069,36 @@ class PointCloudLabeler(QMainWindow):
         
         sorted_points.sort(key=lambda x: x[0])  # Sort by effective f_init
         
-        # Generate line segments between consecutive points and track which point pair each segment belongs to
+        # Generate line segments between consecutive points and track labels
         line_segments = []
         segment_point_pairs = []  # Track which point pair each segment belongs to
         segment_effective_ranges = []  # Track effective position ranges for proper coloring
+        segment_integer_labels = []  # Track the integer label for each segment
         
         for i in range(len(sorted_points) - 1):
             eff_f_init1, f_init1, f_star1, label1 = sorted_points[i]
             eff_f_init2, f_init2, f_star2, label2 = sorted_points[i + 1]
             
-            segments, segment_infos = self.create_wrapped_line_segments(
+            segments, segment_infos, segment_labels = self.create_wrapped_line_segments(
                 f_init1, f_star1, label1,
                 f_init2, f_star2, label2
             )
             
-            # Track which point pair each segment belongs to and its effective range
-            for segment, (eff_start, eff_end) in zip(segments, segment_infos):
+            # Track which point pair each segment belongs to and its properties
+            for segment, (eff_start, eff_end), seg_label in zip(segments, segment_infos, segment_labels):
                 line_segments.append(segment)
                 segment_point_pairs.append((i, i + 1, label1, label2))  # Store indices and labels of the point pair
                 segment_effective_ranges.append((eff_start, eff_end, eff_f_init1, eff_f_init2))  # Store effective range info
+                segment_integer_labels.append(seg_label)  # Store the integer label for this segment
         
-        # Store line segments, their corresponding point pairs, and effective ranges
+        # Store line segments and their properties
         if line_segments:
             self.spline_segments["manual_lines"] = line_segments
             self.spline_segments["manual_line_pairs"] = segment_point_pairs  # Store the mapping
             self.spline_segments["manual_line_ranges"] = segment_effective_ranges  # Store effective ranges
+            self.spline_segments["manual_line_labels"] = segment_integer_labels  # Store integer labels
             print(f"Generated {len(line_segments)} manual line segments between {len(sorted_points)} points")
+            print(f"Segment labels: {segment_integer_labels}")
             
             # Debug: show labels of manual points
             point_labels = [point[3] for point in sorted_points]
@@ -4107,6 +4113,9 @@ class PointCloudLabeler(QMainWindow):
         """Create line segments with proper wrapping between two points."""
         segments = []
         segment_infos = []  # Track effective position info for each segment
+        segment_labels = []  # Track the integer label for each segment
+        
+        print(f"DEBUG: Creating line from ({f_init1:.1f}, {f_star1:.1f}, label={label1}) to ({f_init2:.1f}, {f_star2:.1f}, label={label2})")
         
         # Calculate label difference and required wraps
         label_diff = label2 - label1
@@ -4115,51 +4124,126 @@ class PointCloudLabeler(QMainWindow):
         eff_f_init1 = f_init1
         eff_f_init2 = f_init2 + label_diff * 360.0
         
-        # Generate line points with wrapping
-        n_points = max(10, int(abs(eff_f_init2 - eff_f_init1) / 10))  # At least 10 points, more for longer lines
-        f_init_points = np.linspace(eff_f_init1, eff_f_init2, n_points)
+        print(f"DEBUG: Effective coordinates: {eff_f_init1:.1f} to {eff_f_init2:.1f}")
+        
+        # Generate many points along the line to properly capture label transitions
+        total_distance = abs(eff_f_init2 - eff_f_init1)
+        n_points = max(100, int(total_distance / 5))  # At least 100 points, more for longer lines
+        
+        # Generate points along the effective line
+        eff_f_init_points = np.linspace(eff_f_init1, eff_f_init2, n_points)
         f_star_points = np.linspace(f_star1, f_star2, n_points)
         
-        # Convert back to wrapped coordinates and create segments
-        current_segment_f_star = []
-        current_segment_f_init = []
-        current_segment_eff_start = None
-        current_segment_eff_end = None
+        # Calculate the correct integer label for each point
+        point_data = []
         
-        for i, (f_init_eff, f_star) in enumerate(zip(f_init_points, f_star_points)):
-            # Wrap f_init to [-180, 180] range
-            f_init_wrapped = ((f_init_eff + 180) % 360) - 180
+        if label1 == label2:
+            # If both endpoints have the same label, use that label for the entire line
+            print(f"DEBUG: Same label case, using label {label1} for entire line")
+            for i, (eff_f_init, f_star) in enumerate(zip(eff_f_init_points, f_star_points)):
+                f_init_wrapped = ((eff_f_init + 180) % 360) - 180
+                point_data.append((eff_f_init, f_init_wrapped, f_star, int(label1)))
+        else:
+            # For lines with different endpoint labels, detect wrap crossings
+            print(f"DEBUG: Different label case, detecting wrap crossings from {label1} to {label2}")
+            current_label = int(label1)
+            prev_wrapped = ((eff_f_init_points[0] + 180) % 360) - 180
             
-            # Check if we need to start a new segment (crossing boundary)
-            if (current_segment_f_init and 
-                abs(f_init_wrapped - current_segment_f_init[-1]) > 180):
+            for i, (eff_f_init, f_star) in enumerate(zip(eff_f_init_points, f_star_points)):
+                f_init_wrapped = ((eff_f_init + 180) % 360) - 180
                 
-                # Finish current segment
-                if len(current_segment_f_init) >= 2:
-                    segment = np.array([[fs, fi] for fs, fi in zip(current_segment_f_star, current_segment_f_init)])
-                    segments.append(segment)
-                    # Store effective position range for this segment
-                    segment_infos.append((current_segment_eff_start, current_segment_eff_end))
+                # Check if we crossed a wrap boundary (180 to -180 or -180 to 180)
+                if i > 0:
+                    wrap_crossed = False
+                    if label2 > label1:  # Moving in positive label direction
+                        # Check for 180 to -180 crossing (positive wrap)
+                        if prev_wrapped > 150 and f_init_wrapped < -150:
+                            current_label += 1
+                            wrap_crossed = True
+                            print(f"DEBUG: Positive wrap crossing at point {i}, label now {current_label}")
+                    else:  # Moving in negative label direction
+                        # Check for -180 to 180 crossing (negative wrap)
+                        if prev_wrapped < -150 and f_init_wrapped > 150:
+                            current_label -= 1
+                            wrap_crossed = True
+                            print(f"DEBUG: Negative wrap crossing at point {i}, label now {current_label}")
                 
-                # Start new segment
-                current_segment_f_star = [f_star]
-                current_segment_f_init = [f_init_wrapped]
-                current_segment_eff_start = f_init_eff
-                current_segment_eff_end = f_init_eff
+                # Clamp the label to not exceed the endpoint label
+                if label2 > label1:
+                    current_label = min(current_label, int(label2))
+                else:
+                    current_label = max(current_label, int(label2))
+                
+                point_data.append((eff_f_init, f_init_wrapped, f_star, current_label))
+                prev_wrapped = f_init_wrapped
+        
+        print(f"DEBUG: Generated {len(point_data)} points, label range: {[p[3] for p in point_data[:5]]} ... {[p[3] for p in point_data[-5:]]}")
+        
+        # Group consecutive points with the same integer label
+        if not point_data:
+            return segments, segment_infos, segment_labels
+            
+        current_segment = []
+        current_label = point_data[0][3]
+        
+        for eff_f_init, f_init_wrapped, f_star, correct_label in point_data:
+            if correct_label != current_label and current_segment:
+                # Finish current segment and start new one
+                if len(current_segment) >= 2:
+                    # Check for wrap-around discontinuities within this segment
+                    sub_segments = self._split_segment_at_discontinuities(current_segment, current_label)
+                    segments.extend(sub_segments['segments'])
+                    segment_infos.extend(sub_segments['infos'])
+                    segment_labels.extend([current_label] * len(sub_segments['segments']))
+                
+                current_segment = [(eff_f_init, f_init_wrapped, f_star)]
+                current_label = correct_label
             else:
-                current_segment_f_star.append(f_star)
-                current_segment_f_init.append(f_init_wrapped)
-                if current_segment_eff_start is None:
-                    current_segment_eff_start = f_init_eff
-                current_segment_eff_end = f_init_eff
+                current_segment.append((eff_f_init, f_init_wrapped, f_star))
         
         # Add final segment
-        if len(current_segment_f_init) >= 2:
-            segment = np.array([[fs, fi] for fs, fi in zip(current_segment_f_star, current_segment_f_init)])
-            segments.append(segment)
-            segment_infos.append((current_segment_eff_start, current_segment_eff_end))
+        if len(current_segment) >= 2:
+            sub_segments = self._split_segment_at_discontinuities(current_segment, current_label)
+            segments.extend(sub_segments['segments'])
+            segment_infos.extend(sub_segments['infos'])
+            segment_labels.extend([current_label] * len(sub_segments['segments']))
         
-        return segments, segment_infos
+        print(f"DEBUG: Final segments have labels: {segment_labels}")
+        
+        return segments, segment_infos, segment_labels
+    
+    def _split_segment_at_discontinuities(self, segment_points, segment_label):
+        """Split a segment at wrap-around discontinuities."""
+        segments = []
+        infos = []
+        
+        current_segment_points = []
+        
+        for i, (eff_f_init, f_init_wrapped, f_star) in enumerate(segment_points):
+            if (current_segment_points and 
+                abs(f_init_wrapped - current_segment_points[-1][1]) > 180):
+                # Found a discontinuity, finish current segment
+                if len(current_segment_points) >= 2:
+                    segment_array = np.array([[pt[2], pt[1]] for pt in current_segment_points])  # [f_star, f_init_wrapped]
+                    segments.append(segment_array)
+                    eff_start = current_segment_points[0][0]
+                    eff_end = current_segment_points[-1][0]
+                    infos.append((eff_start, eff_end))
+                
+                # Start new segment
+                current_segment_points = [(eff_f_init, f_init_wrapped, f_star)]
+            else:
+                current_segment_points.append((eff_f_init, f_init_wrapped, f_star))
+        
+        # Add final segment
+        if len(current_segment_points) >= 2:
+            segment_array = np.array([[pt[2], pt[1]] for pt in current_segment_points])  # [f_star, f_init_wrapped]
+            segments.append(segment_array)
+            eff_start = current_segment_points[0][0]
+            eff_end = current_segment_points[-1][0]
+            infos.append((eff_start, eff_end))
+        
+        return {'segments': segments, 'infos': infos}
     
     def update_manual_line_display(self):
         """Update the visual display of manual line segments."""
@@ -4175,13 +4259,31 @@ class PointCloudLabeler(QMainWindow):
                 
         # Add new manual line segments with winding colors
         if ("manual_lines" in self.spline_segments and 
+            "manual_line_labels" in self.spline_segments):
+            line_segments = self.spline_segments["manual_lines"]
+            segment_integer_labels = self.spline_segments["manual_line_labels"]
+            
+            # Draw each segment with appropriate color based on its integer label
+            for segment, seg_label in zip(line_segments, segment_integer_labels):
+                if len(segment) >= 2:
+                    # Use winding color based on the integer label
+                    mod = int(seg_label) % self.num_colors
+                    winding_color = self.active_brushes[mod].color()
+                    pen = pg.mkPen(color=(winding_color.red(), winding_color.green(), winding_color.blue()), width=2)
+                    
+                    line_item = pg.PlotDataItem(x=segment[:, 0], y=segment[:, 1], pen=pen)
+                    line_item._is_manual_line = True  # Mark as manual line for removal
+                    self.xy_plot.addItem(line_item)
+                    self.spline_items.append(line_item)
+        elif ("manual_lines" in self.spline_segments and 
             "manual_line_pairs" in self.spline_segments and 
             "manual_line_ranges" in self.spline_segments):
+            # Fallback for old format with ranges but no integer labels
             line_segments = self.spline_segments["manual_lines"]
             segment_point_pairs = self.spline_segments["manual_line_pairs"]
             segment_effective_ranges = self.spline_segments["manual_line_ranges"]
             
-            # Draw each segment with appropriate color based on its position along the line
+            # Draw each segment with interpolated color (fallback method)
             for i, (segment, (idx1, idx2, label1, label2), (eff_start, eff_end, line_eff_start, line_eff_end)) in enumerate(
                 zip(line_segments, segment_point_pairs, segment_effective_ranges)):
                 if len(segment) >= 2:
@@ -4208,11 +4310,11 @@ class PointCloudLabeler(QMainWindow):
                     self.xy_plot.addItem(line_item)
                     self.spline_items.append(line_item)
         elif "manual_lines" in self.spline_segments and "manual_line_pairs" in self.spline_segments:
-            # Fallback for when we have pairs but no ranges (intermediate state)
+            # Fallback for when we have pairs but no ranges (older format)
             line_segments = self.spline_segments["manual_lines"]
             segment_point_pairs = self.spline_segments["manual_line_pairs"]
             
-            # Draw each segment with average color (better than old method but not perfect)
+            # Draw each segment with average color (basic fallback)
             for i, (segment, (idx1, idx2, label1, label2)) in enumerate(zip(line_segments, segment_point_pairs)):
                 if len(segment) >= 2:
                     # Use the average label of the two manual points this segment connects
@@ -4227,63 +4329,27 @@ class PointCloudLabeler(QMainWindow):
                     line_item._is_manual_line = True  # Mark as manual line for removal
                     self.xy_plot.addItem(line_item)
                     self.spline_items.append(line_item)
-        elif "manual_lines" in self.spline_segments:
-            # Fallback for old format without segment_point_pairs (shouldn't happen with new code)
-            # Get sorted manual points for color determination
-            sorted_points = []
-            for f_init, f_star, label in self.manual_spline_points:
-                effective_f_init = f_init + label * 360.0
-                sorted_points.append((effective_f_init, f_init, f_star, label))
-            sorted_points.sort(key=lambda x: x[0])
-            
-            # Draw each segment with approximate color (this is the old buggy method)
-            for i, segment in enumerate(self.spline_segments["manual_lines"]):
-                if len(segment) >= 2:
-                    # Determine which pair of manual points this segment connects
-                    # Use fallback logic (may be incorrect for wrapped segments)
-                    if i < len(sorted_points) - 1:
-                        label1 = sorted_points[i][3]
-                        label2 = sorted_points[i + 1][3]
-                        avg_label = int((label1 + label2) / 2)
-                    else:
-                        # Fallback to first label if we can't determine
-                        avg_label = sorted_points[0][3] if sorted_points else 1
-                    
-                    # Use winding color based on label
-                    mod = avg_label % self.num_colors
-                    winding_color = self.active_brushes[mod].color()
-                    pen = pg.mkPen(color=(winding_color.red(), winding_color.green(), winding_color.blue()), width=2)
-                    
-                    line_item = pg.PlotDataItem(x=segment[:, 0], y=segment[:, 1], pen=pen)
-                    line_item._is_manual_line = True  # Mark as manual line for removal
-                    self.xy_plot.addItem(line_item)
-                    self.spline_items.append(line_item)
 
     def get_manual_line_label_for_point(self, point_f_star, point_f_init):
         """
         Determine what label a point should get if assigned to the closest manual line.
         Returns (label, distance) or (None, inf) if no manual lines exist.
-        Optimized for performance.
+        Uses the stored integer labels for each segment.
         """
-        if "manual_lines" not in self.spline_segments or not self.manual_spline_points:
+        if ("manual_lines" not in self.spline_segments or 
+            "manual_line_labels" not in self.spline_segments or
+            not self.manual_spline_points):
             return None, float('inf')
         
-        # Cache sorted points if not already cached
-        if not hasattr(self, '_cached_sorted_manual_points'):
-            sorted_points = []
-            for f_init, f_star, label in self.manual_spline_points:
-                effective_f_init = f_init + label * 360.0
-                sorted_points.append((effective_f_init, f_init, f_star, label))
-            sorted_points.sort(key=lambda x: x[0])
-            self._cached_sorted_manual_points = sorted_points
+        line_segments = self.spline_segments["manual_lines"]
+        segment_labels = self.spline_segments["manual_line_labels"]
         
-        sorted_points = self._cached_sorted_manual_points
         min_distance = float('inf')
         best_label = None
         point = np.array([point_f_star, point_f_init])
         
-        # Quick distance check to each manual line segment
-        for segment in self.spline_segments["manual_lines"]:
+        # Check distance to each manual line segment and use its stored label
+        for segment, seg_label in zip(line_segments, segment_labels):
             if len(segment) < 2:
                 continue
             
@@ -4316,18 +4382,6 @@ class PointCloudLabeler(QMainWindow):
                 seg_min_distance = np.min(distances)
                 if seg_min_distance < min_distance:
                     min_distance = seg_min_distance
-                    
-                    # Simple label assignment: use the label of the closest manual point
-                    # Find which manual point pair this segment belongs to (simplified)
-                    seg_min_idx = np.argmin(distances)
-                    closest_point = closest_points[seg_min_idx]
-                    
-                    # Find the closest manual point by distance
-                    min_point_dist = float('inf')
-                    for _, f_init, f_star, label in sorted_points:
-                        point_dist = abs(closest_point[0] - f_star) + abs(closest_point[1] - f_init)
-                        if point_dist < min_point_dist:
-                            min_point_dist = point_dist
-                            best_label = label
+                    best_label = int(seg_label)  # Use the stored integer label
         
         return best_label, min_distance
