@@ -419,16 +419,21 @@ def filter_by_edge_error_mad(points, uvs, refined_indices, r_uv, k=3.0):
     errors = np.array([err for _, err in error_list])
 
     # 3) median and MAD
-    med   = np.median(errors)
-    mad   = np.median(np.abs(errors - med))
-    thr   = med + k * mad
+    # med   = np.median(errors)
+    # mad   = np.median(np.abs(errors - med))
+    # thr   = med + k * mad
+
+    q3   = np.percentile(errors, 0.75)
+    median   = np.percentile(errors, 0.5)
+    thr   = median + k * (q3 - median)
 
     # 4) filter
     kept_indices = [idx for idx, err in error_list if err <= thr]
 
     # 5) print stats
-    print(f"Median error: {med:.4f}")
-    print(f"MAD:          {mad:.4f}")
+    print(f"Median error: {median:.4f}")
+    print(f"Q3 error: {q3:.4f}")
+    # print(f"MAD:          {mad:.4f}")
     print(f"Threshold:    median + {k}·MAD = {thr:.4f}")
     print(f"Processed {len(errors)} points → kept {len(kept_indices)}")
 
@@ -748,50 +753,50 @@ def build_neighbor_graph(coords,
             distance_lists[j].append(d)
     # Additional cross-bin connectivity: angle bins and z bins (REACTIVATED)
     # Angle-based cross connectivity: connect nearest neighbors in adjacent angle bins
-    if angles is not None and angle_bin_size > 0 and angle_bin_k > 0:
-        print(f"Building angle-based cross-bin connectivity (bin_size={angle_bin_size}, k={angle_bin_k})...")
-        bin_idx = np.floor(angle_vals / angle_bin_size).astype(int)
-        bins = {}
-        for idx, b in enumerate(bin_idx):
-            bins.setdefault(b, []).append(idx)
-        print(f"Created {len(bins)} angle bins")
-        
-        # build KD-tree per angle bin
-        bin_trees = {b: cKDTree(pts[ids]) for b, ids in bins.items() if len(ids) >= 1}
-        connections_added = 0
-        
-        mesh_indices = np.nonzero(is_mesh)[0]
-        print(f"Processing {len(mesh_indices)} mesh points for angle-based connectivity...")
-        
-        for i in mesh_indices:
-            b = bin_idx[i]
-            # connect across two adjacent angular bins on each side
-            for b2 in (b - 2, b - 1, b + 1, b + 2):
-                if b2 in bin_trees:
-                    ids = bins[b2]
-                    tree_b = bin_trees[b2]
-                    k = min(angle_bin_k, len(ids))
-                    dists_b, idxs_b = tree_b.query(pts[i], k=k)
-                    if k == 1:
-                        dists_b = [dists_b]
-                        idxs_b = [idxs_b]
-                    for local_j in range(len(idxs_b)):
-                        lj = idxs_b[local_j]
-                        j = ids[lj]
-                        # angle threshold filter
-                        if angle_threshold is not None and angle_vals is not None:
-                            if abs(angle_vals[i] - angle_vals[j]) > angle_threshold:
-                                continue
-                        d = np.linalg.norm(pts[i] - pts[j])
-                        neighbor_lists[i].append(j)
-                        distance_lists[i].append(d)
-                        neighbor_lists[j].append(i)
-                        distance_lists[j].append(d)
-                        connections_added += 1
-        print(f"Added {connections_added} angle-based cross-bin connections")
-        
+    if False:  # COMMENTED OUT - replaced with Z-Angle connectivity below
+        if angles is not None and angle_bin_size > 0 and angle_bin_k > 0:
+            print(f"Building angle-based cross-bin connectivity (bin_size={angle_bin_size}, k={angle_bin_k})...")
+            bin_idx = np.floor(angle_vals / angle_bin_size).astype(int)
+            bins = {}
+            for idx, b in enumerate(bin_idx):
+                bins.setdefault(b, []).append(idx)
+            print(f"Created {len(bins)} angle bins")
+            
+            # build KD-tree per angle bin
+            bin_trees = {b: cKDTree(pts[ids]) for b, ids in bins.items() if len(ids) >= 1}
+            connections_added = 0
+            
+            mesh_indices = np.nonzero(is_mesh)[0]
+            print(f"Processing {len(mesh_indices)} mesh points for angle-based connectivity...")
+            
+            for i in mesh_indices:
+                b = bin_idx[i]
+                # connect across two adjacent angular bins on each side
+                for b2 in (b - 2, b - 1, b + 1, b + 2):
+                    if b2 in bin_trees:
+                        ids = bins[b2]
+                        tree_b = bin_trees[b2]
+                        k = min(angle_bin_k, len(ids))
+                        dists_b, idxs_b = tree_b.query(pts[i], k=k)
+                        if k == 1:
+                            dists_b = [dists_b]
+                            idxs_b = [idxs_b]
+                        for local_j in range(len(idxs_b)):
+                            lj = idxs_b[local_j]
+                            j = ids[lj]
+                            # angle threshold filter
+                            if angle_threshold is not None and angle_vals is not None:
+                                if abs(angle_vals[i] - angle_vals[j]) > angle_threshold:
+                                    continue
+                            d = np.linalg.norm(pts[i] - pts[j])
+                            neighbor_lists[i].append(j)
+                            distance_lists[i].append(d)
+                            neighbor_lists[j].append(i)
+                            distance_lists[j].append(d)
+                            connections_added += 1
+            print(f"Added {connections_added} angle-based cross-bin connections")
     # Z-based cross connectivity: connect nearest neighbors in adjacent z bins
-    if z_bin_size > 0 and z_bin_k > 0:
+    if False:  # COMMENTED OUT - replaced with Z-Angle connectivity below
         print(f"Building Z-based cross-bin connectivity (bin_size={z_bin_size}, k={z_bin_k})...")
         z_vals = pts[:, 2]
         z_idx = np.floor(z_vals / z_bin_size).astype(int)
@@ -831,6 +836,115 @@ def build_neighbor_graph(coords,
                         distance_lists[j].append(d)
                         z_connections_added += 1
         print(f"Added {z_connections_added} Z-based cross-bin connections")
+    
+    # NEW: Z-Angle based connectivity using KDTree
+    if angles is not None:
+        print("Building Z-Angle based connectivity using KDTree...")
+        
+        # Create KDTree on z and angle coordinates (4x weight on angle)
+        z_vals = pts[:, 2]
+        angle_weight_factor = 4.0
+        weighted_angles = angle_vals * angle_weight_factor
+        za_coords = np.column_stack([z_vals, weighted_angles])  # (N, 2)
+        za_tree = cKDTree(za_coords)
+        
+        connections_added = 0
+        max_distance_filter = 300.0  # Filter connections further than 300 units apart
+        
+        # Process all points (not just mesh points)
+        print(f"Processing {len(pts)} points for Z-Angle based connectivity...")
+        
+        # VECTORIZED APPROACH: Pre-generate all query positions
+        print("Pre-generating all query positions...")
+        angle_offsets = [-5.0, 5.0, -0.5, 0.5]
+        z_offsets = [-15, -5, 5, 15]
+        
+        # Create meshgrid of all combinations
+        n_points = len(pts)
+        n_queries_per_point = len(angle_offsets) * len(z_offsets)
+        
+        # Pre-allocate arrays
+        all_query_positions = np.zeros((n_points * n_queries_per_point, 2))
+        point_indices = np.zeros(n_points * n_queries_per_point, dtype=int)
+        query_angle_offsets_flat = np.zeros(n_points * n_queries_per_point)
+        
+        # Fill arrays vectorized
+        idx = 0
+        for angle_offset in angle_offsets:
+            for z_offset in z_offsets:
+                # Generate queries for all points at once
+                query_angles = angle_vals + angle_offset
+                query_z = z_vals + z_offset
+                weighted_query_angles = query_angles * angle_weight_factor
+                
+                # Store in pre-allocated arrays
+                all_query_positions[idx:idx+n_points, 0] = query_z
+                all_query_positions[idx:idx+n_points, 1] = weighted_query_angles
+                point_indices[idx:idx+n_points] = np.arange(n_points)
+                query_angle_offsets_flat[idx:idx+n_points] = abs(angle_offset)
+                
+                idx += n_points
+        
+        print(f"Generated {len(all_query_positions)} query positions, now doing batch KDTree query...")
+        
+        # Single batch KDTree query for all positions
+        batch_dists, batch_indices = za_tree.query(all_query_positions, k=1)
+        
+        print("Processing query results...")
+        # VECTORIZED CONNECTION PROCESSING
+        print("Creating boolean masks for filtering...")
+        
+        # Extract arrays for vectorized operations
+        point_i_array = point_indices
+        found_idx_array = batch_indices
+        max_angle_diff_array = 2.0 * query_angle_offsets_flat
+        
+        # Create boolean masks for all filtering conditions
+        # 1. Skip self-connections
+        not_self_mask = found_idx_array != point_i_array
+        
+        # 2. Calculate all 3D distances at once
+        point_coords = pts[point_i_array]
+        found_coords = pts[found_idx_array]
+        distances_3d = np.linalg.norm(point_coords - found_coords, axis=1)
+        distance_mask = distances_3d <= max_distance_filter
+        
+        # 3. Apply global angle threshold if specified
+        if angle_threshold is not None:
+            angle_diffs_global = np.abs(angle_vals[point_i_array] - angle_vals[found_idx_array])
+            global_angle_mask = angle_diffs_global <= angle_threshold
+        else:
+            global_angle_mask = np.ones(len(point_i_array), dtype=bool)
+        
+        # 4. Apply query-specific angle difference filter
+        angle_diffs_query = np.abs(angle_vals[point_i_array] - angle_vals[found_idx_array])
+        query_angle_mask = angle_diffs_query < max_angle_diff_array
+        
+        # Combine all masks
+        valid_mask = not_self_mask & distance_mask & global_angle_mask & query_angle_mask
+        
+        print(f"Filtered connections: {np.sum(valid_mask)} valid out of {len(valid_mask)} total")
+        
+        # Extract valid connections
+        valid_point_i = point_i_array[valid_mask]
+        valid_found_idx = found_idx_array[valid_mask]
+        valid_distances = distances_3d[valid_mask]
+        
+        print("Adding valid connections to neighbor lists...")
+        # Add connections to neighbor lists (this part still needs a loop for list operations)
+        for i in tqdm(range(len(valid_point_i)), desc="Adding connections"):
+            pi = valid_point_i[i]
+            fi = valid_found_idx[i]
+            dist = valid_distances[i]
+            
+            # Add bidirectional connections (skip duplicate check for speed - will be handled later)
+            neighbor_lists[pi].append(fi)
+            distance_lists[pi].append(dist)
+            neighbor_lists[fi].append(pi)
+            distance_lists[fi].append(dist)
+            connections_added += 1
+        
+        print(f"Added {connections_added} Z-Angle based connections (filtered by distance < {max_distance_filter})")
     # Random additional connectivity around mesh points - DEACTIVATED
     # if angle_vals is not None:
     #     # for each mesh point, connect to random neighbors within angle/z window
@@ -941,7 +1055,8 @@ def flatten_pointcloud(base_path,
                        display=False,
                        display_downsample=0.1,
                        color_by_angle=False,
-                       from_winding=None):
+                       from_winding=None,
+                       debug_winding=None):
     """
     Flatten pointcloud by concatenating winding segments and building neighbor graphs.
 
@@ -956,6 +1071,7 @@ def flatten_pointcloud(base_path,
         angle_weight (float, optional): Scale factor for 4th-dimension when computing distances in KD-tree.
         downsample_ratio (float, optional): Fraction of points to randomly keep when loading windings (default 0.1).
         flattening_downsample_ratio (float, optional): Fraction of points to use in first step of flattening solver (default 0.3).
+        debug_winding (int, optional): If set, only process the winding group centered around this winding number.
     """
     winding_width=3
     winding_path = os.path.join(base_path, "windings")
@@ -999,6 +1115,33 @@ def flatten_pointcloud(base_path,
     prev_uvs_v = {}
     prev_points = {}
 
+    # Debug mode: filter processing range to center around debug_winding
+    if debug_winding is not None:
+        if debug_winding in winding_files_indices:
+            debug_idx = winding_files_indices.index(debug_winding)
+            # Calculate the range to center debug_winding in the middle of winding_width
+            half_width = winding_width // 2
+            debug_start = max(0, debug_idx - half_width)
+            debug_end = min(len(winding_files_indices), debug_idx + half_width + 1)
+            
+            # Ensure we have exactly winding_width windings if possible
+            if debug_end - debug_start < winding_width:
+                if debug_start == 0:
+                    debug_end = min(len(winding_files_indices), debug_start + winding_width)
+                elif debug_end == len(winding_files_indices):
+                    debug_start = max(0, debug_end - winding_width)
+            
+            debug_winding_indices = winding_files_indices[debug_start:debug_end]
+            print(f"DEBUG MODE: Processing winding group {debug_winding_indices} (centered around {debug_winding})")
+            print(f"DEBUG MODE: Will process range {debug_start} to {debug_end} from original indices")
+            
+            # Override the mesh detection to include our debug range
+            first_mesh_idx = debug_start
+            last_mesh_idx = debug_end - 1
+        else:
+            print(f"DEBUG MODE: Winding {debug_winding} not found in available windings: {winding_files_indices}")
+            return flattened_winding_path
+
     # process windings in segments
     winding_us = None
     winding_vs = None
@@ -1038,6 +1181,14 @@ def flatten_pointcloud(base_path,
         if start > last_mesh_idx:
             print(f"Finished processing: reached winding {start} (past last mesh winding)")
             break
+            
+        # Debug mode: only process the specific debug range
+        if debug_winding is not None:
+            if start < debug_start or start >= debug_end:
+                continue
+            # In debug mode, process only one segment centered around debug_winding
+            if start != debug_start:
+                continue
             
         end = min(start + winding_width, len(winding_files))
         print(f"Processing windings {start} to {end}: {winding_files[start:end]}")
@@ -1466,6 +1617,7 @@ def flatten_pointcloud(base_path,
         
         undeleted_indices = np.array(solver.get_undeleted_indices())
         uvs = np.array(solver.get_uvs())
+
         print(f"After full refinement solve: u min={uvs[:,0].min()}, u max={uvs[:,0].max()}, v min={uvs[:,1].min()}, v max={uvs[:,1].max()}")
         
         # Process results
@@ -1473,11 +1625,22 @@ def flatten_pointcloud(base_path,
         winding_vs = []
         w_i = 0
         w_i_total = 0
+        
+        # Create directory for UV-colored pointclouds
+        uv_colored_winding_path = os.path.join(base_path, "windings_uv_colored")
+        
+        # Calculate global UV ranges for consistent coloring across windings
+        global_u_min, global_u_max = uvs[:, 0].min(), uvs[:, 0].max()
+        global_v_min, global_v_max = uvs[:, 1].min(), uvs[:, 1].max()
+        global_u_range = (global_u_min, global_u_max)
+        global_v_range = (global_v_min, global_v_max)
+        
         for i in range(len(winding_indices)):
             undeleted_indices_winding = undeleted_indices[np.logical_and(undeleted_indices >= w_i_total, undeleted_indices < w_i_total + winding_indices[i])]
             winding_u = uvs[w_i:w_i + len(undeleted_indices_winding), 0]
             winding_v = uvs[w_i:w_i + len(undeleted_indices_winding), 1]
             points_winding = points[undeleted_indices_winding]
+            uvs_winding = np.column_stack([winding_u, winding_v])
 
             # store for next segment initialization
             wrap_nr = winding_files_indices[start + i]
@@ -1486,6 +1649,11 @@ def flatten_pointcloud(base_path,
             prev_points[wrap_nr] = points_winding
             winding_us.append(winding_u)
             winding_vs.append(winding_v)
+            
+            # Save UV-colored pointcloud for this winding
+            save_colored_pointcloud_uv(uv_colored_winding_path, wrap_nr, points_winding, uvs_winding, 
+                                     global_u_range, global_v_range)
+            
             w_i += len(undeleted_indices_winding)
             w_i_total += winding_indices[i]
 
@@ -1728,11 +1896,15 @@ def grid_uv_flattened(flattened_winding_path,
         print(f"Subsampling {winding_files[i]} with {points.shape[0]} points")
         print(f"Min max uvs: {np.min(uvs[:, 0])}, {np.max(uvs[:, 0])}, {np.min(uvs[:, 1])}, {np.max(uvs[:, 1])}")
         
-        kept_indices = subsample_min_dist(uvs, subsample_radius)
+        if True:
+            kept_indices = subsample_min_dist(uvs, subsample_radius)
+        else:
+            kept_indices = np.arange(len(uvs))
         print(f"Subsampled {winding_files[i]} to {len(kept_indices)} points")
         
         # Filter by density
-        kept_indices = filter_by_density(uvs, kept_indices, 3 * subsample_radius, int((subsample_radius**0.5)*2))
+        if True:
+            kept_indices = filter_by_density(uvs, kept_indices, 3 * subsample_radius, int((subsample_radius**0.5)*2))
         points_subsampled = points[kept_indices]
         uvs_subsampled = uvs[kept_indices]
         print(f"Subsampled {winding_files[i]} to {points_subsampled.shape[0]} points")
@@ -1755,7 +1927,8 @@ def grid_uv_flattened(flattened_winding_path,
                                      downsample_ratio=display_downsample)
     
         # Refine by medoid
-        kept_indices = refine_by_medoid(points, uvs, kept_indices, subsample_radius)
+        if True:
+            kept_indices = refine_by_medoid(points, uvs, kept_indices, subsample_radius)
         points_refined = points[kept_indices]
         uvs_refined = uvs[kept_indices]
         
@@ -1766,7 +1939,7 @@ def grid_uv_flattened(flattened_winding_path,
 
         # Apply enhanced grid-based optimization AFTER refine_by_medoid
         print(f"Starting grid-based optimization with r_grid={r_grid}, grid_size={grid_size}")
-        if False:
+        if True:
             optimized_indices = optimize_grid_points(points, uvs, kept_indices, r_grid, grid_size)
         else:
             optimized_indices = kept_indices
@@ -1805,7 +1978,8 @@ def grid_uv_flattened(flattened_winding_path,
 
         # Final edge error filtering
         # kept_indices, errors = filter_by_edge_error(points[:,:3], uvs, kept_indices, 10 * subsample_radius, int(1.5*subsample_radius))
-        optimized_indices, errors = filter_by_edge_error_mad(points[:,:3], uvs, optimized_indices, 10 * subsample_radius, k=5.0) # automatic threshold finding
+        if True:
+            optimized_indices, errors = filter_by_edge_error_mad(points[:,:3], uvs, optimized_indices, 10 * subsample_radius, k=200.0) # automatic threshold finding
         points_final = points[optimized_indices]
         uvs_final = uvs[optimized_indices]
         
@@ -2616,6 +2790,289 @@ def filter_mesh_by_mask(mesh, natural_image_size, verbose=True, show_debug=False
             print("Warning: All triangles were filtered out!")
         return mesh
 
+def uv_to_rgb_colors(uvs, u_range=None, v_range=None):
+    """
+    Convert UV coordinates to RGB colors using HSV color space.
+    
+    Args:
+        uvs: array of shape (N, 2) with UV coordinates
+        u_range: tuple (min_u, max_u) for normalization, if None auto-detect
+        v_range: tuple (min_v, max_v) for normalization, if None auto-detect
+        
+    Returns:
+        colors: array of shape (N, 3) with RGB colors in range [0, 1]
+    """
+    uvs = np.asarray(uvs)
+    
+    # Determine ranges for normalization
+    if u_range is None:
+        u_min, u_max = uvs[:, 0].min(), uvs[:, 0].max()
+    else:
+        u_min, u_max = u_range
+        
+    if v_range is None:
+        v_min, v_max = uvs[:, 1].min(), uvs[:, 1].max()
+    else:
+        v_min, v_max = v_range
+    
+    # Normalize UV coordinates to [0, 1]
+    u_norm = (uvs[:, 0] - u_min) / (u_max - u_min) if u_max > u_min else np.zeros_like(uvs[:, 0])
+    v_norm = (uvs[:, 1] - v_min) / (v_max - v_min) if v_max > v_min else np.zeros_like(uvs[:, 1])
+    
+    # Convert to HSV color space
+    # U coordinate -> Hue (0-360 degrees, mapped to 0-1 for cv2)
+    # V coordinate -> Saturation (0-1)
+    # Value -> constant high value for good visibility
+    hue = u_norm  # Map U to hue (0-1, cv2 expects 0-1 for hue)
+    saturation = v_norm  # Map V to saturation
+    value = np.ones_like(hue) * 0.9  # High constant value for brightness
+    
+    # Stack HSV components
+    hsv = np.stack([hue, saturation, value], axis=1)
+    
+    # Convert HSV to RGB using cv2 (expects values in [0, 1] for float input)
+    hsv_uint8 = (hsv * 255).astype(np.uint8)
+    rgb_uint8 = cv2.cvtColor(hsv_uint8.reshape(-1, 1, 3), cv2.COLOR_HSV2RGB).reshape(-1, 3)
+    
+    # Convert back to float [0, 1]
+    colors = rgb_uint8.astype(np.float64) / 255.0
+    
+    return colors
+
+def save_colored_pointcloud_uv(winding_path, winding_nr, points, uvs, u_range=None, v_range=None):
+    """
+    Save a pointcloud PLY file with colors based on UV coordinates.
+    
+    Args:
+        winding_path: Path to save the winding pointcloud
+        winding_nr: Winding number for filename
+        points: Array of 3D points (N, 3+)
+        uvs: Array of UV coordinates (N, 2)
+        u_range: Optional tuple (min_u, max_u) for color normalization
+        v_range: Optional tuple (min_v, max_v) for color normalization
+    """
+    # Make folder if it doesn't exist
+    os.makedirs(winding_path, exist_ok=True)
+    
+    # Generate colors based on UV coordinates
+    colors = uv_to_rgb_colors(uvs, u_range, v_range)
+    
+    # Create Open3D pointcloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points[:, :3].astype(np.float64))
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+    
+    # Save to PLY file
+    file_path = os.path.join(winding_path, f"winding_{int(winding_nr)}_uv_colored.ply")
+    o3d.io.write_point_cloud(file_path, pcd)
+    print(f"Saved UV-colored pointcloud: {file_path}")
+
+def flatten_mesh_final(mesh_path, output_path, verbose=True):
+    """
+    Final mesh flattening using triangle connectivity and graph solver.
+    
+    Args:
+        mesh_path: Path to the original mesh file
+        output_path: Path to save the final flattened mesh
+        verbose: Whether to print progress info
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        # Load the original mesh
+        if verbose:
+            print(f"Loading original mesh from {mesh_path}")
+        mesh = o3d.io.read_triangle_mesh(mesh_path)
+        
+        if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+            print("ERROR: Mesh has no vertices or triangles")
+            return False
+            
+        vertices = np.asarray(mesh.vertices)
+        triangles = np.asarray(mesh.triangles)
+        
+        if verbose:
+            print(f"Loaded mesh: {len(vertices)} vertices, {len(triangles)} triangles")
+        
+        # Load metadata for angles if available
+        metadata_file = os.path.join(os.path.dirname(mesh_path), "mesh_metadata.pkl")
+        if os.path.exists(metadata_file):
+            with open(metadata_file, 'rb') as f:
+                metadata = pickle.load(f)
+            has_points, angles = metadata
+            angles = np.reshape(angles, (-1,))
+            if verbose:
+                print(f"Loaded angles from metadata: min={angles.min():.1f}, max={angles.max():.1f}")
+        else:
+            # Generate dummy angles based on some coordinate (e.g., using atan2 of x,y)
+            angles = np.degrees(np.arctan2(vertices[:, 1], vertices[:, 0]))
+            if verbose:
+                print("No metadata found, generated angles from vertex coordinates")
+        
+        # Build neighbor graph from triangle connectivity
+        if verbose:
+            print("Building neighbor graph from triangle connectivity...")
+        
+        n_vertices = len(vertices)
+        neighbor_lists = [[] for _ in range(n_vertices)]
+        distance_lists = [[] for _ in range(n_vertices)]
+        
+        # For each triangle, connect all pairs of vertices
+        for tri in triangles:
+            v0, v1, v2 = tri
+            
+            # Calculate distances between triangle vertices
+            d01 = np.linalg.norm(vertices[v0] - vertices[v1])
+            d02 = np.linalg.norm(vertices[v0] - vertices[v2])
+            d12 = np.linalg.norm(vertices[v1] - vertices[v2])
+            
+            # Add bidirectional connections
+            connections = [
+                (v0, v1, d01), (v1, v0, d01),
+                (v0, v2, d02), (v2, v0, d02),
+                (v1, v2, d12), (v2, v1, d12)
+            ]
+            
+            for vi, vj, dist in connections:
+                if vj not in neighbor_lists[vi]:
+                    neighbor_lists[vi].append(vj)
+                    distance_lists[vi].append(dist)
+        
+        if verbose:
+            total_connections = sum(len(neighbors) for neighbors in neighbor_lists)
+            avg_connections = total_connections / n_vertices if n_vertices > 0 else 0
+            print(f"Built graph: {total_connections} total connections, {avg_connections:.1f} avg per vertex")
+        
+        # Initialize UV coordinates 
+        # Use angles as initial U coordinate and Z as initial V coordinate
+        initial_u = angles.copy()
+        initial_v = vertices[:, 2].copy()  # Use Z coordinate as initial V
+        
+        # Normalize initial coordinates
+        initial_u = (initial_u - initial_u.min()) / (initial_u.max() - initial_u.min()) * 360.0
+        initial_v = (initial_v - initial_v.min()) / (initial_v.max() - initial_v.min()) * 100.0
+        
+        if verbose:
+            print(f"Initial UV range: U=[{initial_u.min():.1f}, {initial_u.max():.1f}], V=[{initial_v.min():.1f}, {initial_v.max():.1f}]")
+        
+        # Set up the solver
+        if verbose:
+            print("Setting up graph solver...")
+        
+        solver = graph_problem_gpu_py.Solver(
+            neighbor_lists,
+            distance_lists,
+            angles,              # winding angles
+            initial_u,           # initial U coordinates  
+            vertices[:, 2],      # Z coordinates
+            initial_v,           # initial V coordinates
+            vertices[:, 0],      # X coordinates
+            vertices[:, 1],      # Y coordinates
+            vertices[:, 2]       # Z coordinates
+        )
+        
+        if verbose:
+            print("Solver initialized successfully")
+        
+        # Run the flattening solver
+        if verbose:
+            print("Running flattening solver...")
+            
+        # Calculate angle and Z ranges for solver parameters
+        angle_min, angle_max = angles.min(), angles.max()
+        z_min, z_max = vertices[:, 2].min(), vertices[:, 2].max()
+        
+        if verbose:
+            print(f"Solver ranges: angles=[{angle_min:.1f}, {angle_max:.1f}], z=[{z_min:.1f}, {z_max:.1f}]")
+        
+        # First solve with moderate iterations
+        solver.solve_flattening(
+            num_iterations=50000, 
+            visualize=True,
+            angle_tug_min=angle_min + (angle_max - angle_min) * 0.1,
+            angle_tug_max=angle_max - (angle_max - angle_min) * 0.1,
+            z_tug_min=z_min + (z_max - z_min) * 0.1,
+            z_tug_max=z_max - (z_max - z_min) * 0.1,
+            tug_step=0.001
+        )
+        
+        # Get final UV coordinates
+        final_uvs = np.array(solver.get_uvs())
+        undeleted_indices = np.array(solver.get_undeleted_indices())
+        
+        if verbose:
+            print(f"Solver completed: {len(undeleted_indices)} vertices retained")
+            print(f"Final UV range: U=[{final_uvs[:,0].min():.2f}, {final_uvs[:,0].max():.2f}], V=[{final_uvs[:,1].min():.2f}, {final_uvs[:,1].max():.2f}]")
+        
+        # Create new mesh with original vertices but flattened UVs
+        if verbose:
+            print("Creating final mesh with flattened UVs...")
+        
+        # Keep only undeleted vertices and triangles
+        final_vertices = vertices[undeleted_indices]
+        
+        # Update triangle indices to point to new vertex array
+        vertex_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(undeleted_indices)}
+        valid_triangles = []
+        
+        for tri in triangles:
+            # Check if all vertices of the triangle are undeleted
+            if all(v in vertex_mapping for v in tri):
+                new_tri = [vertex_mapping[v] for v in tri]
+                valid_triangles.append(new_tri)
+        
+        valid_triangles = np.array(valid_triangles)
+        
+        if verbose:
+            print(f"Final mesh: {len(final_vertices)} vertices, {len(valid_triangles)} triangles")
+        
+        # Create the final mesh
+        final_mesh = o3d.geometry.TriangleMesh()
+        final_mesh.vertices = o3d.utility.Vector3dVector(final_vertices)
+        final_mesh.triangles = o3d.utility.Vector3iVector(valid_triangles)
+        
+        # Create per-triangle UVs (3 UVs per triangle)
+        triangle_uvs = []
+        for tri in valid_triangles:
+            for vertex_idx in tri:
+                triangle_uvs.append(final_uvs[vertex_idx])
+        
+        triangle_uvs = np.array(triangle_uvs)
+        final_mesh.triangle_uvs = o3d.utility.Vector2dVector(triangle_uvs)
+        
+        # Compute normals
+        final_mesh.compute_vertex_normals()
+        final_mesh.compute_triangle_normals()
+        
+        # Normalize UVs and get natural image size
+        final_mesh, natural_image_size = normalize_uvs(final_mesh, verbose=verbose)
+        
+        # Apply mesh cleaning and filtering
+        if verbose:
+            print("Applying mesh cleaning and filtering...")
+        
+        final_mesh = clean_mesh(final_mesh, 
+                               longest_edge_pct=95, 
+                               area_pct=95, 
+                               edge_length_thresh=500)
+        
+        final_mesh = filter_mesh_by_mask(final_mesh, natural_image_size, verbose=verbose)
+        
+        # Save the final mesh
+        success = save_mesh_with_uvs(final_mesh, output_path, natural_image_size, verbose=verbose)
+        
+        if success and verbose:
+            print(f"Successfully saved final flattened mesh to {output_path}")
+            
+        return success
+        
+    except Exception as e:
+        print(f"ERROR in flatten_mesh_final: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 def main():
     parser = argparse.ArgumentParser(description="Refine pointcloud using mesh and downsampling")
     parser.add_argument("--mesh", required=True, help="Path to mesh file (.ply or .obj)")
@@ -2670,12 +3127,13 @@ def main():
             flattening_downsample_ratio_mesh=args.flattening_downsample_ratio_mesh,
             display_downsample=args.display_downsample,
             color_by_angle=args.color_by_angle,
-            from_winding=args.from_winding
+            from_winding=args.from_winding,
+            debug_winding=args.debug_winding
         )
     if not args.skip_grid:
         grid_uv_flattened(
             flattened_winding_path,
-            subsample_radius=10.0,
+            subsample_radius=30.0,
             r_grid=args.r_grid,
             grid_size=args.grid_size,
             display=args.display,
@@ -2691,6 +3149,18 @@ def main():
         mesh_uv_global(filtered_path, output_path=os.path.join(os.path.dirname(filtered_path), "mesh_refined.obj"), winding_direction=winding_direction)
     else:
         print(f"Skipping mesh_uv_global due to debug mode (--debug_winding {args.debug_winding})")
+
+    # Final flatten pointcloud mesh 
+    if args.debug_winding is None:
+        print("\n=== FINAL MESH FLATTENING ===")
+        final_mesh_output = os.path.join(os.path.dirname(args.mesh), "mesh_final_flattened.obj")
+        success = flatten_mesh_final(args.mesh, final_mesh_output, verbose=True)
+        if success:
+            print(f"Final mesh flattening completed successfully: {final_mesh_output}")
+        else:
+            print("Final mesh flattening failed")
+    else:
+        print("Skipping final mesh flattening due to debug mode")
 
 if __name__ == "__main__":
     main()
