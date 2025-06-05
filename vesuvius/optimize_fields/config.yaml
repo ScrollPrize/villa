@@ -1,0 +1,27 @@
+# config.yaml
+
+# required:
+input_store: "/home/giorgio/scrolls/scroll1/volumes/s1a_fibers_4down_UV.zarr"
+input_store_normal: "/home/giorgio/scrolls/scroll1/volumes/s1a_surfaces_4down_N.zarr"
+output: "/home/giorgio/scrolls/scroll1/volumes/s1a_optimized_4down.zarr"
+chunk: "128,128,128"
+
+# penalties and hyperparams:
+mu0: 0.01
+mu1: 0.01
+mu4: 0.01
+decay_max: 0.5
+lr: 1.0
+iters: 2000
+ghost: 8
+device: "cuda"
+
+# optional labels‐overlay:
+labels_store: "/home/giorgio/scrolls/scroll1/volumes/s1_059_4down.zarr"
+skip: 10
+viz_every: 2
+
+# wandb logging controls:
+log_iter_every: 10
+log_patch_every: 5
+wandb_project: "optimize_fields_viz"

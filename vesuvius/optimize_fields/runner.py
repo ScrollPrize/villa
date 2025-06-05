@@ -35,6 +35,8 @@ def parse_args():
                    help="Penalty coefficient for the Frobenius norm of the Jacobian of u,v, and n")
     p.add_argument('--mu4', type=float, default=1e-2,
                    help="Penalty coefficient for the divergence of u,v, and n")
+    p.add_argument('--decay_max', type=float, default=0.5,
+                   help="Maximum blending weight for smoothness term (will linearly grow up to this).")
     p.add_argument('--lr',  type=float, default=1.0)
     p.add_argument('--iters', type=int, default=1000, 
                    help="Number of inner‐loop optimization steps per patch")
@@ -84,6 +86,7 @@ def main():
             "mu1": args.mu1,
             "mu4": args.mu4,
             "lr": args.lr,
+            "decay_max": args.decay_max,
             "iters_per_patch": args.iters,
             "ghost": args.ghost,
         }
@@ -124,7 +127,8 @@ def main():
         iters=args.iters,
         device=device,
         log_iter_every=args.log_iter_every,
-        log_patch_every=args.log_patch_every
+        log_patch_every=args.log_patch_every,
+        decay_max=args.decay_max
     )
     # ── NEW: If user passed --labels_store, open it once and remember:
     if args.labels_store is not None:
@@ -217,8 +221,8 @@ def main():
             slice_u = u_trim[:, mid, :, :]
             slice_v = v_trim[:, mid, :, :]
 
-            nx = slice_n[0, ::skip, ::skip]
-            ny = slice_n[1, ::skip, ::skip]
+            nx = slice_n[1, ::skip, ::skip]
+            ny = slice_n[0, ::skip, ::skip]
 
             ux = slice_u[0, ::skip, ::skip]
             uy = slice_u[1, ::skip, ::skip]
@@ -246,7 +250,7 @@ def main():
             # Draw each arrow‐set with contrasting colors and a smaller 'scale'
             ax.quiver(
                 Xf, Yf, Nfx, Nfy,
-                color="black",   # choose black on gray/white
+                color="green",   # choose black on gray/white
                 scale=20,        # smaller scale → longer arrows
                 width=0.008,
                 headlength=3,    # nonzero headlength so you see the arrowheads
