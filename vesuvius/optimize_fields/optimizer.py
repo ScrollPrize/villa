@@ -194,6 +194,7 @@ class PatchOptimizer:
         mu0: float,
         mu1: float,
         mu4: float,
+        mu5: float,
         lr: float,
         iters: int,
         device: torch.device,
@@ -205,7 +206,7 @@ class PatchOptimizer:
         grad_clip: float = 0.0
     ):
         self.device = device
-        self.mu0, self.mu1, self.mu4 = mu0, mu1, mu4
+        self.mu0, self.mu1, self.mu4, self.mu5 = float(mu0), float(mu1), float(mu4), float(mu5)
         self.lr, self.iters = lr, iters
         self.decay_max = decay_max
         self.log_iter_every = log_iter_every
@@ -228,7 +229,7 @@ class PatchOptimizer:
         # Global step counter (for wandb logging across patches)
         self.global_step = 0
 
-    @torch.compile(fullgraph=True, mode="max-autotune", dynamic=True)
+    #@torch.compile(fullgraph=True, mode="max-autotune", dynamic=True)
     def _compute_losses(self, q: torch.Tensor, U: torch.Tensor, V: torch.Tensor, N: torch.Tensor, alpha: float):
         """
         Given a normalized quaternion field q of shape (4, D, H, W),
@@ -287,8 +288,60 @@ class PatchOptimizer:
             divergence(n).pow(2).sum()
         )
 
-        total = data + smooth + div_pen
-        return total, data.detach(), smooth.detach(), div_pen.detach()
+                # ── Curl‐of‐curl penalty ───────────────────────────────────────────────────────
+        # We will compute curl_u = ∇×u, then curlcurl_u = ∇×(∇×u), and likewise for v,n.
+
+        # 1) first curl:
+        curl_u = torch.zeros_like(u)  # shape (3,D,H,W)
+        curl_v = torch.zeros_like(v)
+        curl_n = torch.zeros_like(n)
+
+        # (curl u)_x = ∂_y u_z - ∂_z u_y
+        curl_u[0] = grad_u[2, 1] - grad_u[1, 2]
+        curl_v[0] = grad_v[2, 1] - grad_v[1, 2]
+        curl_n[0] = grad_n[2, 1] - grad_n[1, 2]
+
+        # (curl u)_y = ∂_z u_x - ∂_x u_z
+        curl_u[1] = grad_u[0, 2] - grad_u[2, 0]
+        curl_v[1] = grad_v[0, 2] - grad_v[2, 0]
+        curl_n[1] = grad_n[0, 2] - grad_n[2, 0]
+
+        # (curl u)_z = ∂_x u_y - ∂_y u_x
+        curl_u[2] = grad_u[1, 0] - grad_u[0, 1]
+        curl_v[2] = grad_v[1, 0] - grad_v[0, 1]
+        curl_n[2] = grad_n[1, 0] - grad_n[0, 1]
+
+        # 2) second curl (i.e. curl of curl):
+        g2_u = gradient(curl_u)  # shape (3,3,D,H,W)
+        g2_v = gradient(curl_v)
+        g2_n = gradient(curl_n)
+
+        curlcurl_u = torch.zeros_like(curl_u)  # shape (3,D,H,W)
+        curlcurl_v = torch.zeros_like(curl_v)
+        curlcurl_n = torch.zeros_like(curl_n)
+
+        # (curlcurl u)_x = ∂_y (curl u)_z - ∂_z (curl u)_y
+        curlcurl_u[0] = g2_u[2, 1] - g2_u[1, 2]
+        curlcurl_v[0] = g2_v[2, 1] - g2_v[1, 2]
+        curlcurl_n[0] = g2_n[2, 1] - g2_n[1, 2]
+
+        # (curlcurl u)_y = ∂_z (curl u)_x - ∂_x (curl u)_z
+        curlcurl_u[1] = g2_u[0, 2] - g2_u[2, 0]
+        curlcurl_v[1] = g2_v[0, 2] - g2_v[2, 0]
+        curlcurl_n[1] = g2_n[0, 2] - g2_n[2, 0]
+
+        # (curlcurl u)_z = ∂_x (curl u)_y - ∂_y (curl u)_x
+        curlcurl_u[2] = g2_u[1, 0] - g2_u[0, 1]
+        curlcurl_v[2] = g2_v[1, 0] - g2_v[0, 1]
+        curlcurl_n[2] = g2_n[1, 0] - g2_n[0, 1]
+
+        # 3) squared‐L2 norms:
+        curlcurl_term = alpha * self.mu5 * (curlcurl_u.pow(2).sum() \
+                     + curlcurl_v.pow(2).sum() \
+                     + curlcurl_n.pow(2).sum())
+
+        total = data + smooth + div_pen + curlcurl_term
+        return total, data.detach(), smooth.detach(), div_pen.detach(), curlcurl_term.detach()
 
     def __call__(self, U: torch.Tensor, V: torch.Tensor, N: torch.Tensor, chunk_idx: int) -> torch.Tensor:
         """
@@ -340,7 +393,7 @@ class PatchOptimizer:
 
         # 5) Compute loss at identity WITHOUT backward or step
         with torch.no_grad():
-            total0, data0, smooth0, div0 = self._compute_losses(q_manifold, U, V, N, alpha=0.5)
+            total0, data0, smooth0, div0, curlcurl0 = self._compute_losses(q_manifold, U, V, N, alpha=0.5)
 
         if abs(total0.item()) < 1e-12:
             # Log once at step=0 if needed
@@ -353,6 +406,7 @@ class PatchOptimizer:
                     "loss/data": float(data0.item()),
                     "loss/smooth": float(smooth0.item()),
                     "loss/div": float(div0.item()),
+                    "loss/curlcurl": float(curlcurl0.item()),
                     "lr": 0.0
                 }, step=self.global_step)
                 self.global_step += 1
@@ -379,7 +433,7 @@ class PatchOptimizer:
             # alpha_i can grow linearly up to decay_max, but here we keep it fixed at 0.5
             alpha_i = 0.5
             
-            total_loss, data_term, smooth_term, div_term = self._compute_losses(q_manifold, U, V, N, alpha_i)
+            total_loss, data_term, smooth_term, div_term, curlcurl_term = self._compute_losses(q_manifold, U, V, N, alpha_i)
 
             if not torch.isfinite(total_loss):
                 print(f"[patch {chunk_idx}, iter {iter_i}] ⚠ total_loss is not finite: {total_loss}")
@@ -421,6 +475,7 @@ class PatchOptimizer:
                     "loss/data": float(data_term.item()),
                     "loss/smooth": float(smooth_term.item()),
                     "loss/div": float(div_term.item()),
+                    "loss/curlcurl": float(curlcurl_term.item()),
                     "lr": float(lr_now)
                 }, step=self.global_step)
                 self.global_step += 1
@@ -428,7 +483,7 @@ class PatchOptimizer:
         # Final log after finishing all iterations (if we did any real steps)
         if do_log_this_patch and torch.isfinite(total_loss) and (self.global_step > 0):
             with torch.no_grad():
-                final_total, final_data, final_smooth, final_div = self._compute_losses(
+                final_total, final_data, final_smooth, final_div, final_curlcurl = self._compute_losses(
                     q_manifold, U, V, N, alpha=alpha_i
                 )
             wandb.log({
@@ -438,7 +493,8 @@ class PatchOptimizer:
                 "loss/total_final": float(final_total.item()),
                 "loss/data_final": float(final_data.item()),
                 "loss/smooth_final": float(final_smooth.item()),
-                "loss/div_final": float(final_div.item())
+                "loss/div_final": float(final_div.item()),
+                "loss/curlcurl_final": float(final_curlcurl.item()),
             }, step=self.global_step)
 
         return q_manifold.detach()
@@ -497,6 +553,7 @@ if __name__ == "__main__":
         mu0=1e-3,
         mu1=1e-2,
         mu4=1e-2,
+        mu5=1e-3,
         lr=0.1,
         iters=10000,
         device=device,

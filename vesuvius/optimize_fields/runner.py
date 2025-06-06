@@ -35,6 +35,8 @@ def parse_args():
                    help="Penalty coefficient for the Frobenius norm of the Jacobian of u,v, and n")
     p.add_argument('--mu4', type=float, default=1e-2,
                    help="Penalty coefficient for the divergence of u,v, and n")
+    p.add_argument('--mu5', type=float, default=1e-2,
+                   help="Penalty coefficient for the curl of curl of u,v, and n")
     p.add_argument('--decay_max', type=float, default=0.5,
                    help="Maximum blending weight for smoothness term (will linearly grow up to this).")
     p.add_argument('--lr', type=float, default=1.0,
@@ -98,6 +100,7 @@ def main():
             "mu0": args.mu0,
             "mu1": args.mu1,
             "mu4": args.mu4,
+            "mu5": args.mu5,
             "lr": args.lr,
             "decay_max": args.decay_max,
             "iters_per_patch": args.iters,
@@ -137,6 +140,7 @@ def main():
         mu0=args.mu0,
         mu1=args.mu1,
         mu4=args.mu4,
+        mu5=args.mu5,
         lr=args.lr,
         iters=args.iters,
         device=device,
