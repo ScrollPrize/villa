@@ -3,7 +3,6 @@
 import torch
 import torch.nn.functional as F
 
-
 def rotate_by_quaternion(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """
     q: (...,4) unit quaternion with components [w,z,y,x]
@@ -18,6 +17,7 @@ def rotate_by_quaternion(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     uuv = torch.cross(zyx, uv, dim=-1)           # (...,3)
     return v + 2*(w*uv + uuv)
 
+@torch.compile(fullgraph=True, mode="max-autotune", dynamic=True)
 def gradient(field: torch.Tensor) -> torch.Tensor:
     """
     Finite‐difference gradient of a 3‐component field.
@@ -60,7 +60,7 @@ def gradient(field: torch.Tensor) -> torch.Tensor:
     grad = torch.stack((dz, dy, dx), dim=1)
     return grad
 
-
+@torch.compile(fullgraph=True, mode="max-autotune", dynamic=True)
 def divergence(field: torch.Tensor) -> torch.Tensor:
     """
     Divergence of a 3‐component field via its gradient.

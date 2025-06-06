@@ -7,10 +7,13 @@ output: "/home/giorgio/scrolls/scroll1/volumes/s1a_optimized_4down.zarr"
 chunk: "128,128,128"
 
 # penalties and hyperparams:
-mu0: 0.01
-mu1: 0.01
-mu4: 0.01
+mu0: 0.001
+mu1: 0.0001
+mu4: 0.0001
 decay_max: 0.5
+grad_clip: 0.5
+optimizer_type: "adam"
+init_type: "random"
 lr: 1.0
 iters: 2000
 ghost: 8
