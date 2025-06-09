@@ -484,12 +484,14 @@ class Solver {
             // calculate_histogram_edges(graph, "histogram_edges_start.png");
             largest_connected_component();
         }
-        Solver(std::vector<std::vector<int>> connections, std::vector<std::vector<float>> distances, std::vector<float> winding_angles, std::vector<float> current_angles, std::vector<float> z, std::vector<float> current_z, std::vector<float> coords_x, std::vector<float> coords_y, std::vector<float> coords_z, float o=2.0, int z_min=-2147483648, int z_max=2147483647) : o(o) {
+        Solver(std::vector<std::vector<int>> connections, std::vector<std::vector<float>> distances, std::vector<float> winding_angles, std::vector<float> current_angles, std::vector<float> z, std::vector<float> current_z, std::vector<float> coords_x, std::vector<float> coords_y, std::vector<float> coords_z, float o=2.0, int z_min=-2147483648, int z_max=2147483647, bool select_largest_connected_component=true) : o(o) {
             // Load graph from binary file
             auto [graph_, max_certainty] = load_flattening_graph_from_lists(connections, distances, winding_angles, current_angles, z, current_z, coords_x, coords_y, coords_z);
             graph = graph_;
             // calculate_histogram_edges(graph, "histogram_edges_start.png");
-            largest_connected_component();
+            if (select_largest_connected_component) {
+                largest_connected_component();
+            }
         }
         ~Solver() {
             if (h_all_edges) {
@@ -1231,7 +1233,7 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("o") = 2.0f,
             py::arg("z_min") = -2147483648,
             py::arg("z_max") = 2147483647)
-        .def(py::init<std::vector<std::vector<int>>, std::vector<std::vector<float>>, std::vector<float>, std::vector<float>, std::vector<float>, std::vector<float>, std::vector<float>, std::vector<float>, std::vector<float>, float, int, int>(),
+        .def(py::init<std::vector<std::vector<int>>, std::vector<std::vector<float>>, std::vector<float>, std::vector<float>, std::vector<float>, std::vector<float>, std::vector<float>, std::vector<float>, std::vector<float>, float, int, int, bool>(),
             "Class method to solve the graph with manual input",
             py::arg("connections"),
             py::arg("distances"),
@@ -1244,7 +1246,8 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             py::arg("coords_z"),
             py::arg("o") = 2.0f,
             py::arg("z_min") = -2147483648,
-            py::arg("z_max") = 2147483647)
+            py::arg("z_max") = 2147483647,
+            py::arg("select_largest_connected_component") = true)
         .def("invert_graph", &Solver::invert_graph,
             "Method to invert the winding direction of the graph")
         .def("flip_graph", &Solver::flip_graph,

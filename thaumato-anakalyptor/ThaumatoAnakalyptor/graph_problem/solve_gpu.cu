@@ -4693,6 +4693,7 @@ int fix_winding_nodes(std::vector<Node>& graph, int nr_nodes, int seed_node_old)
 }
 
 std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float o, float spring_constant, float step_sigma, int teflon_winding_nr, bool visualize, bool adjust_median, bool blow_away) {
+    cudaDeviceReset();
     std::vector<Node> graph_copy = graph;
     if (i_round < 0) {
         o = o * 0.25f;
@@ -4807,6 +4808,7 @@ std::vector<Node> run_solver_f_star(std::vector<Node>& graph, int num_iterations
 }
 
 std::vector<Node> run_solver_ring(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float other_block_factor, float std_target, float std_target_step, bool increase_same_block_weight, bool convergence_speedup, float convergence_thresh, bool wiggle, bool standard_winding_direction, float scale_left, float scale_right, bool enable_delete_nodes) {
+    cudaDeviceReset();
     float sides_moving_eps = 0.0025f;
 
     // Allocate space for min and max f_star values on the GPU
@@ -5002,6 +5004,7 @@ void spanning_tree_winding_number(std::vector<Node>& graph) {
 }
 
 std::vector<Node> run_solver_winding_number(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, float other_block_factor, int seed_node, int side_fix_nr, bool display) {
+    cudaDeviceReset();
     std::vector<Node> graph_copy = graph;
     size_t fix_count = 0;
     size_t fixed_deficit = 0;
@@ -5149,6 +5152,7 @@ std::vector<Node> run_solver_winding_number(std::vector<Node>& graph, int num_it
 }
 
 std::vector<Node> run_solver_random(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, bool display) {
+    cudaDeviceReset();
     // Allocate space for min and max f_star values on the GPU
     size_t num_nodes = graph.size();
     size_t num_valid_nodes = valid_indices.size();
@@ -5260,6 +5264,7 @@ std::vector<Node> run_solver_random(std::vector<Node>& graph, int num_iterations
 }
 
 std::vector<Node> run_solver(std::vector<Node>& graph, float o, float spring_constant, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, int i_round, int seed_node, float other_block_factor, int down_index, int up_index, int side_fix_nr, float std_target, float std_target_step, bool increase_same_block_weight) {
+    cudaDeviceReset();
     if (i_round < 0) {
         o = o * 0.25f;
     }

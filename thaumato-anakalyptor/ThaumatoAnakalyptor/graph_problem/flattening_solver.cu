@@ -196,7 +196,7 @@ __global__ void flattening_update_kernel(
         // Add linear scaling when distance is less than 0.5 of desired distance (only if enabled)
         float force_multiplier = 1.0f;
         float activation_ratio = 0.75f;
-        float activation_ratio_push_in = 2.0f;
+        // float activation_ratio_push_in = 2.0f;
         if (enable_spring_push_multiplier && dist < activation_ratio * edge.k) {
             // Linear scaling: 1x at 0.5*edge.k -> 5x at 0.0
             float ratio = dist / (activation_ratio * edge.k);  // ratio goes from 1.0 at 0.5*edge.k to 0.0 at dist=0
@@ -370,6 +370,8 @@ std::vector<Node> run_solver_flattening(
     bool visualize,
     bool enable_spring_push_multiplier
 ) {
+    cudaSetDevice(0);
+    cudaDeviceReset();
     std::vector<Node> graph_copy = graph;
     size_t N = graph_copy.size();
     size_t M = valid_indices.size();

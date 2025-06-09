@@ -551,6 +551,7 @@ inline void plot_nodes(const std::vector<Node>& graph, const std::string& filena
 }
 
 std::vector<Node> run_solver_f_star_with_labels(std::vector<Node>& graph, int num_iterations, std::vector<size_t>& valid_indices, Edge** h_all_edges, float** h_all_sides, float spring_constant, float other_block_factor, float lr, float error_cutoff, bool visualize) {
+    cudaDeviceReset();
     std::vector<Node> graph_copy = graph;
     std::cout << "Visualize: " << visualize << std::endl;
     // Allocate space for min and max f_star values on the GPU
