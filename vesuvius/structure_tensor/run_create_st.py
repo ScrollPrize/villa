@@ -158,7 +158,8 @@ def run_structure_tensor_part(args, part_id, gpu_id, shared_output_path):
         cmd.append('--structure-tensor-only')
     if args.volume is not None:
         cmd.extend(['--volume', str(args.volume)])
-    
+    if args.swap_eigenvectors:
+        cmd.append('--swap-eigenvectors')
     # Set overlap to 0.0 for no overlap
     cmd.extend(['--overlap', '0.0'])
     
