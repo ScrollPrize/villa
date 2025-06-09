@@ -48,9 +48,7 @@ def load_eigenvector_field(
         mode='r',
         storage_options={'anon': False} if eigen_zarr.startswith('s3://') else None
     )
-    # eigenvectors is a 9×Z×Y×X array; we only slice out the 3 we need
-    start = eig_index * 3
-    # if this is a group, pull out the 'eigenvectors' array
+    
     if isinstance(root, zarr.hierarchy.Group):
         try:
             arr = root['eigenvectors']
