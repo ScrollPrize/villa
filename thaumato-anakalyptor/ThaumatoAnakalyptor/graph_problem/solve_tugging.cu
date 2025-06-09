@@ -203,6 +203,7 @@ std::vector<Node> run_solver_tugging(
     float diff_step,
     bool visualize
 ) {
+    cudaDeviceReset();
     std::cout << "Running tugging solver..." << std::endl;
     std::vector<Node> graph_copy = graph;
     auto [min_percentile, max_percentile] = min_max_percentile_f_star(graph_copy, 0.1f);

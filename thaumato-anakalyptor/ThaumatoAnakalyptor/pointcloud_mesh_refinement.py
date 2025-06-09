@@ -473,6 +473,120 @@ def display_3d_pointcloud(points, color_by_angle=False, downsample_ratio=0.1):
     ax.set_zlabel("Z")
     plt.show()
 
+def identify_spike_indices(
+    mesh: o3d.geometry.TriangleMesh,
+    mad_factor: float = 3.0,
+    angle_threshold: float = 45.0
+) -> np.ndarray:
+    """
+    Identify vertices in a mesh that have spike-like properties by comparing
+    face normals to vertex normals and using MAD-based outlier detection.
+    
+    Args:
+        mesh: The input TriangleMesh
+        mad_factor: How aggressively to consider spikiness as an outlier 
+                   (e.g., 3.0 means spikiness > median + 3*MAD is 'spiky')
+        angle_threshold: Maximum allowed angle between face and vertex normals in degrees
+    
+    Returns:
+        np.ndarray: Boolean array where True indicates a non-spiky vertex (to keep)
+    """
+    # 1) Ensure we have normals computed
+    mesh.compute_vertex_normals()
+    mesh.compute_triangle_normals()
+
+    # Extract arrays for faster NumPy processing
+    vertex_normals = np.asarray(mesh.vertex_normals)   # (V, 3)
+    face_normals   = np.asarray(mesh.triangle_normals) # (F, 3)
+    faces          = np.asarray(mesh.triangles)        # (F, 3)
+
+    # 2) Vectorized spikiness computation (face-normal vs. vertex-normal angle)
+    face_vertex_normals = vertex_normals[faces]                # (F, 3, 3)
+    dot_vals = np.sum(face_normals[:, None, :] * face_vertex_normals, axis=2)  # (F, 3)
+    np.clip(dot_vals, -1.0, 1.0, out=dot_vals)
+    angles = np.arccos(dot_vals)                # (F, 3)
+
+    # Accumulate angle sums & counts for each vertex
+    spikiness_sum = np.zeros(len(vertex_normals), dtype=np.float64)
+    counts        = np.zeros(len(vertex_normals), dtype=np.int32)
+
+    # Add angles for each of the 3 vertices of each face
+    np.add.at(spikiness_sum, faces[:, 0], angles[:, 0])
+    np.add.at(spikiness_sum, faces[:, 1], angles[:, 1])
+    np.add.at(spikiness_sum, faces[:, 2], angles[:, 2])
+    np.add.at(counts,        faces[:, 0], 1)
+    np.add.at(counts,        faces[:, 1], 1)
+    np.add.at(counts,        faces[:, 2], 1)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        spikiness = np.where(counts > 0, spikiness_sum / counts, 0.0)
+
+    # 3) MAD-based outlier detection on spikiness
+    med_spike = np.median(spikiness)
+    abs_dev   = np.abs(spikiness - med_spike)
+    mad       = np.median(abs_dev)
+    
+    if mad < 1e-12:
+        # If everything is basically the same, no spiky outliers
+        is_spiky = np.full_like(spikiness, False, dtype=bool)
+    else:
+        threshold_spike = med_spike + mad_factor * mad
+        is_spiky = spikiness > threshold_spike
+
+    # Convert angles to degrees for threshold comparison
+    angles_deg = np.degrees(spikiness)
+    
+    # Combine MAD-based detection with absolute angle threshold
+    keep_indices = ~(is_spiky | (angles_deg > angle_threshold))
+    
+    print(f"Identified {np.sum(~keep_indices)} spike vertices out of {len(keep_indices)} total vertices")
+    print(f"Median spikiness: {np.degrees(np.median(spikiness)):.2f}°")
+    print(f"MAD: {np.degrees(mad):.2f}°")
+    print(f"Threshold: {np.degrees(threshold_spike):.2f}°")
+    
+    return keep_indices
+
+def filter_by_spikes(points, uvs, mad_factor=3.0, angle_threshold=45.0):
+    """
+    Filter points by creating a temporary mesh and identifying non-spiky vertices.
+    
+    Args:
+        points: array of shape (N, 3) with 3D coordinates
+        uvs: array of shape (N, 2) with UV coordinates
+        mad_factor: How aggressively to consider spikiness as an outlier
+        angle_threshold: Maximum allowed angle between face and vertex normals in degrees
+        
+    Returns:
+        kept_indices: list of indices to keep (non-spiky points)
+    """
+    if len(points) < 3:
+        print("Not enough points for triangulation")
+        return []
+        
+    # Create Delaunay triangulation in UV space
+    try:
+        tri = Delaunay(uvs)
+        faces = tri.simplices  # M×3 array of vertex-indices
+    except Exception as e:
+        print(f"Delaunay triangulation failed: {e}")
+        return []
+        
+    # Build Open3D mesh
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(points)
+    mesh.triangles = o3d.utility.Vector3iVector(faces)
+    
+    # Compute normals
+    mesh.compute_triangle_normals()
+    mesh.compute_vertex_normals()
+    
+    # Identify non-spiky vertices
+    keep_mask = identify_spike_indices(mesh, mad_factor=mad_factor, angle_threshold=angle_threshold)
+    kept_indices = np.where(keep_mask)[0].tolist()
+    
+    print(f"Spike filtering: {len(points)} -> {len(kept_indices)} points")
+    return kept_indices
+
 def clean_mesh(mesh,
                longest_edge_pct=95,
                area_pct=95,
@@ -1788,6 +1902,11 @@ def create_mtl_file(mtl_path, texture_image_name):
     with open(mtl_path, 'w') as file:
         file.write(content)
 
+def read_mtl_image_path(mtl_path):
+    with open(mtl_path, 'r') as file:
+        content = file.read()
+    return content.split("map_Kd ")[1].split("\n")[0]
+
 def save_mesh_with_uvs(mesh, output_path, natural_image_size, create_mask_png=True, verbose=True):
     """
     Save a mesh with UV coordinates (should already be normalized to 0-1 range).
@@ -1845,6 +1964,7 @@ def grid_uv_flattened(flattened_winding_path,
         color_by_angle: Whether to color by angle in display
         debug_winding: If set, only process this specific winding number (for debugging)
     """
+    subsample_radius_ = 50
     winding_filtered_path = os.path.join(os.path.dirname(flattened_winding_path), "windings_filtered")
     
     # find and order all winding pointclouds
@@ -1903,7 +2023,7 @@ def grid_uv_flattened(flattened_winding_path,
         print(f"Subsampled {winding_files[i]} to {len(kept_indices)} points")
         
         # Filter by density
-        if True:
+        if False:
             kept_indices = filter_by_density(uvs, kept_indices, 3 * subsample_radius, int((subsample_radius**0.5)*2))
         points_subsampled = points[kept_indices]
         uvs_subsampled = uvs[kept_indices]
@@ -1925,9 +2045,9 @@ def grid_uv_flattened(flattened_winding_path,
             display_3d_pointcloud(points_subsampled,
                                      color_by_angle=color_by_angle,
                                      downsample_ratio=display_downsample)
-    
+
         # Refine by medoid
-        if True:
+        if False:
             kept_indices = refine_by_medoid(points, uvs, kept_indices, subsample_radius)
         points_refined = points[kept_indices]
         uvs_refined = uvs[kept_indices]
@@ -1939,7 +2059,7 @@ def grid_uv_flattened(flattened_winding_path,
 
         # Apply enhanced grid-based optimization AFTER refine_by_medoid
         print(f"Starting grid-based optimization with r_grid={r_grid}, grid_size={grid_size}")
-        if True:
+        if False:
             optimized_indices = optimize_grid_points(points, uvs, kept_indices, r_grid, grid_size)
         else:
             optimized_indices = kept_indices
@@ -1977,9 +2097,24 @@ def grid_uv_flattened(flattened_winding_path,
                                   downsample_ratio=display_downsample)
 
         # Final edge error filtering
-        # kept_indices, errors = filter_by_edge_error(points[:,:3], uvs, kept_indices, 10 * subsample_radius, int(1.5*subsample_radius))
+        if False:
+            # Do the edge error filtering
+            optimized_indices, errors = filter_by_edge_error_mad(points[:,:3], uvs, optimized_indices, 
+                                                              10 * subsample_radius_, k=200.0) # automatic threshold finding
+        
+        # Filter by spikes
+        thr = 55.0
         if True:
-            optimized_indices, errors = filter_by_edge_error_mad(points[:,:3], uvs, optimized_indices, 10 * subsample_radius, k=200.0) # automatic threshold finding
+            # Do the spike filtering
+            for _ in range(5):
+                print("Filtering by spikes...")
+                spike_indices = filter_by_spikes(points[optimized_indices, :3], uvs[optimized_indices], mad_factor=15.0, angle_threshold=thr)
+                thr += 2.0
+                # Map spike indices back to original indices
+                optimized_indices = [optimized_indices[i] for i in spike_indices]
+                print(f"After spike filtering: {len(optimized_indices)} points")
+
+        # Create final filtered points and UVs
         points_final = points[optimized_indices]
         uvs_final = uvs[optimized_indices]
         
@@ -2314,7 +2449,7 @@ def mesh_uv_wraps(filtered_winding_path, output_dir, winding_direction=False, de
         mesh = clean_mesh(mesh,
                       longest_edge_pct=100,
                       area_pct=100,
-                      edge_length_thresh=500)
+                      edge_length_thresh=750)
 
         # Normalize UVs after cleaning and get natural image size
         mesh, natural_image_size = normalize_uvs(mesh, verbose=True)
@@ -2493,7 +2628,7 @@ def mesh_uv_global(filtered_winding_path, output_path, winding_direction=False):
     mesh = clean_mesh(mesh,
                       longest_edge_pct=100,
                       area_pct=100,
-                      edge_length_thresh=100)
+                      edge_length_thresh=750)
 
     # Normalize UVs after cleaning and get natural image size
     mesh, natural_image_size = normalize_uvs(mesh, verbose=True)
@@ -2891,6 +3026,12 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
             
         vertices = np.asarray(mesh.vertices)
         triangles = np.asarray(mesh.triangles)
+        uvs = np.asarray(mesh.triangle_uvs).reshape(-1, 3, 2)
+
+        image_name = read_mtl_image_path(mesh_path.replace(".obj", ".mtl"))
+        image_path = os.path.join(os.path.dirname(mesh_path), image_name)
+        image = cv2.imread(image_path)
+        image_size = image.shape[:2][::-1]
         
         if verbose:
             print(f"Loaded mesh: {len(vertices)} vertices, {len(triangles)} triangles")
@@ -2917,10 +3058,21 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
         n_vertices = len(vertices)
         neighbor_lists = [[] for _ in range(n_vertices)]
         distance_lists = [[] for _ in range(n_vertices)]
-        
+        initial_u = np.zeros(n_vertices)
+        initial_v = np.zeros(n_vertices)
         # For each triangle, connect all pairs of vertices
-        for tri in triangles:
+        for i, tri in enumerate(triangles):
             v0, v1, v2 = tri
+            # update the initial uvs
+            us0, vs0 = uvs[i, 0] * image_size
+            us1, vs1 = uvs[i, 1] * image_size
+            us2, vs2 = uvs[i, 2] * image_size
+            initial_u[v0] = us0
+            initial_v[v0] = vs0
+            initial_u[v1] = us1
+            initial_v[v1] = vs1
+            initial_u[v2] = us2
+            initial_v[v2] = vs2
             
             # Calculate distances between triangle vertices
             d01 = np.linalg.norm(vertices[v0] - vertices[v1])
@@ -2944,15 +3096,6 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
             avg_connections = total_connections / n_vertices if n_vertices > 0 else 0
             print(f"Built graph: {total_connections} total connections, {avg_connections:.1f} avg per vertex")
         
-        # Initialize UV coordinates 
-        # Use angles as initial U coordinate and Z as initial V coordinate
-        initial_u = angles.copy()
-        initial_v = vertices[:, 2].copy()  # Use Z coordinate as initial V
-        
-        # Normalize initial coordinates
-        initial_u = (initial_u - initial_u.min()) / (initial_u.max() - initial_u.min()) * 360.0
-        initial_v = (initial_v - initial_v.min()) / (initial_v.max() - initial_v.min()) * 100.0
-        
         if verbose:
             print(f"Initial UV range: U=[{initial_u.min():.1f}, {initial_u.max():.1f}], V=[{initial_v.min():.1f}, {initial_v.max():.1f}]")
         
@@ -2969,7 +3112,8 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
             initial_v,           # initial V coordinates
             vertices[:, 0],      # X coordinates
             vertices[:, 1],      # Y coordinates
-            vertices[:, 2]       # Z coordinates
+            vertices[:, 2],      # Z coordinates
+            select_largest_connected_component=False
         )
         
         if verbose:
@@ -2989,12 +3133,7 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
         # First solve with moderate iterations
         solver.solve_flattening(
             num_iterations=50000, 
-            visualize=True,
-            angle_tug_min=angle_min + (angle_max - angle_min) * 0.1,
-            angle_tug_max=angle_max - (angle_max - angle_min) * 0.1,
-            z_tug_min=z_min + (z_max - z_min) * 0.1,
-            z_tug_max=z_max - (z_max - z_min) * 0.1,
-            tug_step=0.001
+            visualize=True
         )
         
         # Get final UV coordinates
@@ -3028,9 +3167,13 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
             print(f"Final mesh: {len(final_vertices)} vertices, {len(valid_triangles)} triangles")
         
         # Create the final mesh
+        final_vertices = final_vertices.astype(np.float64)
+        valid_triangles = valid_triangles.astype(np.int32)
         final_mesh = o3d.geometry.TriangleMesh()
         final_mesh.vertices = o3d.utility.Vector3dVector(final_vertices)
+        print("Added final vertices")
         final_mesh.triangles = o3d.utility.Vector3iVector(valid_triangles)
+        print("Final mesh created")
         
         # Create per-triangle UVs (3 UVs per triangle)
         triangle_uvs = []
@@ -3038,8 +3181,9 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
             for vertex_idx in tri:
                 triangle_uvs.append(final_uvs[vertex_idx])
         
-        triangle_uvs = np.array(triangle_uvs)
+        triangle_uvs = np.array(triangle_uvs).reshape(-1,2).astype(np.float64)
         final_mesh.triangle_uvs = o3d.utility.Vector2dVector(triangle_uvs)
+        print("Added triangle UVs")
         
         # Compute normals
         final_mesh.compute_vertex_normals()
@@ -3053,9 +3197,9 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
             print("Applying mesh cleaning and filtering...")
         
         final_mesh = clean_mesh(final_mesh, 
-                               longest_edge_pct=95, 
-                               area_pct=95, 
-                               edge_length_thresh=500)
+                               longest_edge_pct=100, 
+                               area_pct=100, 
+                               edge_length_thresh=750)
         
         final_mesh = filter_mesh_by_mask(final_mesh, natural_image_size, verbose=verbose)
         
@@ -3084,6 +3228,7 @@ def main():
     parser.add_argument("--skip_precomputation", action="store_true", help="Skip precomputation of winding pointclouds")
     parser.add_argument("--skip_flattening", action="store_true", help="Skip flattening of winding pointclouds")    
     parser.add_argument("--skip_grid", action="store_true", help="Skip grid UV of flattened winding pointclouds")
+    parser.add_argument("--skip_meshing", action="store_true", help="Skip meshing of flattened winding pointclouds")
     parser.add_argument("--display", action="store_true", help="Display pointclouds and meshes")
     parser.add_argument("--display_downsample", type=float, default=0.1,
                         help="Random downsample ratio for 3D display (0..1)")
@@ -3094,6 +3239,11 @@ def main():
     parser.add_argument("--debug_winding", type=int, default=None,
                         help="Debug mode: only process this specific winding number")
     args = parser.parse_args()
+
+    skip_grid = args.skip_grid
+    skip_flattening = args.skip_flattening or skip_grid
+    skip_precomputation = args.skip_precomputation or skip_flattening
+    skip_meshing = args.skip_meshing or skip_precomputation
 
     # Load winding direction
     winding_direction_path = os.path.join(os.path.dirname(args.mesh), "winding_direction.txt")
@@ -3141,20 +3291,23 @@ def main():
             color_by_angle=args.color_by_angle,
             debug_winding=args.debug_winding
         )
+    
     filtered_path = os.path.join(os.path.dirname(args.mesh), "windings_filtered")
-    mesh_uv_wraps(filtered_path, output_dir=os.path.join(os.path.dirname(filtered_path), "uv_meshes"), winding_direction=winding_direction, debug_winding=args.debug_winding)
+    if not skip_meshing:
+        mesh_uv_wraps(filtered_path, output_dir=os.path.join(os.path.dirname(filtered_path), "uv_meshes"), winding_direction=winding_direction, debug_winding=args.debug_winding)
     
     # Skip global mesh generation in debug mode
-    if args.debug_winding is None:
-        mesh_uv_global(filtered_path, output_path=os.path.join(os.path.dirname(filtered_path), "mesh_refined.obj"), winding_direction=winding_direction)
-    else:
+    final_mesh_path = os.path.join(os.path.dirname(filtered_path), "mesh_refined.obj")
+    if args.debug_winding is None and not skip_meshing:
+        mesh_uv_global(filtered_path, output_path=final_mesh_path, winding_direction=winding_direction)
+    elif args.debug_winding is not None:
         print(f"Skipping mesh_uv_global due to debug mode (--debug_winding {args.debug_winding})")
 
     # Final flatten pointcloud mesh 
     if args.debug_winding is None:
         print("\n=== FINAL MESH FLATTENING ===")
         final_mesh_output = os.path.join(os.path.dirname(args.mesh), "mesh_final_flattened.obj")
-        success = flatten_mesh_final(args.mesh, final_mesh_output, verbose=True)
+        success = flatten_mesh_final(final_mesh_path, final_mesh_output, verbose=True)
         if success:
             print(f"Final mesh flattening completed successfully: {final_mesh_output}")
         else:
