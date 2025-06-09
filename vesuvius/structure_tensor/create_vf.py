@@ -93,7 +93,7 @@ class VectorFieldComputer:
             # 5) write out
             U_ds[:, z0:z1, y0:y1, x0:x1] = U_block.cpu().numpy()
             V_ds[:, z0:z1, y0:y1, x0:x1] = V_block.cpu().numpy()
-            N_ds[:, z0:z1, y0:y1, x0:x1] = V_block.cpu().numpy()
+            N_ds[:, z0:z1, y0:y1, x0:x1] = N_block.cpu().numpy()
             torch.cuda.empty_cache()
 
         print(f"✔ chunked U, V written to {output_zarr}")
