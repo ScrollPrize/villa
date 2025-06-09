@@ -65,7 +65,7 @@ setup(
         'opencv-python',
         'pytorch-lightning',
         'libigl',
-        'psutil'
+        'psutil',
         'wandb',
         'tensorstore',
         'blosc2'
