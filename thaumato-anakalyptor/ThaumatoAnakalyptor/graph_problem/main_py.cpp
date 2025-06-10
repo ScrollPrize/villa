@@ -526,6 +526,17 @@ class Solver {
             run_solver_f_star(subgraph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, o_, spring_constant, step_sigma, teflon_winding_nr, visualize, adjust_median, blow_away);
             updateGraphWithSubgraph(graph, undeleted_mask, subgraph);
         }
+        void solve_f_star_normalized(int num_iterations, float spring_constant = 1.0f, int i_round = -1, float o = 0.0f, float step_sigma = 360.0f, int teflon_winding_nr = 9999, bool visualize = false, bool adjust_median = true, bool blow_away = false) {
+            // use the f_star solver for the intermediate solution
+            // store only the valid indices to speed up the loop
+            auto [undeleted_mask, count_undeleted] = get_undeleted_mask();
+            std::vector<Node> subgraph = graph;
+            bool create_subgraph = 1.0f * count_undeleted / graph.size() < 0.5f;
+            subgraph = createSubgraph(graph, undeleted_mask);
+            std::vector<size_t> valid_indices = get_valid_indices(subgraph);
+            run_solver_f_star_normalized(subgraph, num_iterations, valid_indices, &h_all_edges, &h_all_sides, i_round, o, spring_constant, step_sigma, teflon_winding_nr, visualize, adjust_median, blow_away);
+            updateGraphWithSubgraph(graph, undeleted_mask, subgraph);
+        }
         void solve_f_star_with_labels(int num_iterations, float spring_constant, float other_block_factor = 1.0f, float lr = 10.0f, float error_cutoff = -1.0f, bool display = false) {
             // use the f_star solver for the intermediate solution
             // store only the valid indices to speed up the loop
@@ -1269,6 +1280,17 @@ PYBIND11_MODULE(graph_problem_gpu_py, m) {
             "Method to intermediately solve the graph with a mean winding angle approach",
             py::arg("num_iterations") = 10000,
             py::arg("spring_constant") = 1.2f,
+            py::arg("i_round") = -1,
+            py::arg("o") = 0.0f,
+            py::arg("step_sigma") = 360.0f,
+            py::arg("teflon_winding_nr") = 9999,
+            py::arg("visualize") = false,
+            py::arg("adjust_median") = true,
+            py::arg("blow_away") = false)
+        .def("solve_f_star_normalized", &Solver::solve_f_star_normalized,
+            "Method to intermediately solve the graph with a mean winding angle approach and normalized labels",
+            py::arg("num_iterations") = 5000,
+            py::arg("spring_constant") = 1.0f,
             py::arg("i_round") = -1,
             py::arg("o") = 0.0f,
             py::arg("step_sigma") = 360.0f,
