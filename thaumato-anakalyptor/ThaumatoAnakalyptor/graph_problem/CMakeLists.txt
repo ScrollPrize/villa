@@ -106,6 +106,7 @@ pybind11_add_module(graph_problem_gpu_py
     solve_gpu.cu
     solve_tugging.cu
     mean_solver.cu
+    mean_normalized_solver.cu
     flattening_solver.cu
     mst_union.cpp
     node_structs.cpp

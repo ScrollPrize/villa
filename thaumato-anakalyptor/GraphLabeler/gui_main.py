@@ -353,7 +353,7 @@ class PointCloudLabeler(QMainWindow):
 
         # --- Solver selection dropdown ---
         self.solver_combo = QComboBox()
-        self.solver_combo.addItems(["F*", "Linear", "F*3", "F*4", "Ripple", "Smooth", "Ripple Smooth Combined", "Tugging", "F*Slab", "Winding Number", "Union", "Random", "Create Good Edges", "Set Labels"])
+        self.solver_combo.addItems(["F*", "Linear", "F*3", "F*4", "Ripple", "Smooth", "Ripple Smooth Combined", "Tugging", "F*Slab", "Winding Number", "Union", "Random", "Create Good Edges", "Set Labels", "F*Normalized"])
         self.solver_combo.setCurrentIndex(6) # Default to "Ripple Smooth Combined"
         top_controls_layout.addWidget(QLabel("Select Solver:"))
         top_controls_layout.addWidget(self.solver_combo)
@@ -3523,6 +3523,8 @@ class PointCloudLabeler(QMainWindow):
                     self.solver.solve_f_star_with_labels(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, other_block_factor=other_block_factor, lr=0.25, error_cutoff=-1.0, display=True)
                     # self.solver.solve_f_star_with_labels(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, other_block_factor=other_block_factor, lr=0.05, error_cutoff=-1.0, display=True)
                     self.solver.solve_winding_number(num_iterations=500, i_round=-3, seed_node=-1, other_block_factor=15.0, side_fix_nr=-1, display=False)
+                elif selected_solver == "F*Normalized":
+                    self.solver.solve_f_star_normalized(num_iterations=int(self.solve_iterations_spinbox.value()), spring_constant=1.0, o=0.0, step_sigma=36000000.0, teflon_winding_nr=self.teflon_label, i_round=6, visualize=True)
                 elif selected_solver == "Create Good Edges":
                     self.solver.label_good_neighbors(r=self.solve_other_block_r_spinbox.value(), delta_neg=180.0, delta_top=10.0, delta_perfect=5.0, min_neighbors=5)
                 elif selected_solver == "Tugging":
