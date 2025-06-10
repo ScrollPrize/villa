@@ -441,10 +441,13 @@ class ChunkDataset(Dataset):
 
 # solve the eigenvalue problem and sanitize the output
 def _eigh_and_sanitize(M: torch.Tensor):
+    # 1) enforce symmetry (numerically more stable? M is already symmetrical)
+    M = 0.5 * (M + M.transpose(-1, -2))
+
     w, v = torch.linalg.eigh(M) 
     # sanitize once
-    w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
-    v = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+    w = torch.nan_to_num(w.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    v = torch.nan_to_num(v.float(), nan=0.0, posinf=0.0, neginf=0.0)
     return w, v
 
 
@@ -458,7 +461,7 @@ def _compute_eigenvectors(
 
     # build + sanitize
     x = block.view(6, N)
-    M = torch.empty((N,3,3), dtype=block.dtype, device=block.device)
+    M = torch.empty((N,3,3), dtype=torch.float64, device=block.device)
     M[:, 0, 0] = x[0]; M[:, 0, 1] = x[1]; M[:, 0, 2] = x[2]
     M[:, 1, 0] = x[1]; M[:, 1, 1] = x[3]; M[:, 1, 2] = x[4]
     M[:, 2, 0] = x[2]; M[:, 2, 1] = x[4]; M[:, 2, 2] = x[5]
@@ -618,6 +621,24 @@ def _finalize_structure_tensor_torch(
             # flatten back
             eigvecs_block = v.reshape(9, *eigvecs_block.shape[1:])
             eigvals_block = w
+
+        # impose handedness
+        v = torch.from_numpy(eigvecs_block.reshape(3, 3, *eigvecs_block.shape[1:])).to(device)
+        V_flat = v.reshape(3,3,-1).permute(2,0,1)    # [N,3,3]
+        det = torch.linalg.det(V_flat)               # [N]
+        mask = det < 0
+        # flip the *entire* 3rd eigenvector (row index = 2)
+        if mask.any():
+            V_flat[mask, 2, :] *= -1
+        # back to original layout
+        v_corrected = V_flat.permute(1,2,0).reshape(3,3,*eigvecs_block.shape[1:])
+
+        # orient eigenvectors such that, on average, the first eigenvector is upwards wrt global coordinates [+1,0,0]
+        upwards = v_corrected[0, :, ...].mean(dim=(1,2,3))
+        if upwards[0] < 0:
+            v_corrected *= -1
+
+        eigvecs_block = v_corrected.reshape(9, *eigvecs_block.shape[1:]).cpu().numpy()
 
         # write to groups
         eigenvectors_arr[:, z0:z1, y0:y1, x0:x1] = eigvecs_block
