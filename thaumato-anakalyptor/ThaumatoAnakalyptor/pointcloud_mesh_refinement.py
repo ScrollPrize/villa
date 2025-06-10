@@ -3211,7 +3211,7 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
             print(f"Final mesh: {len(vertices)} vertices, {len(triangles)} triangles")
 
         # Update old mesh for debug
-        debug = True
+        debug = False
         if debug:
             # Update UVs for each triangle
             triangle_uvs_old = []
