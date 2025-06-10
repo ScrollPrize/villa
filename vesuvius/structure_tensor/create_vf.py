@@ -84,6 +84,14 @@ class VectorFieldComputer:
                 U_ext = self.smoother.smooth(Su).squeeze(0).clone()
                 V_ext = self.smoother.smooth(Sv).squeeze(0).clone()
                 N_ext = self.smoother.smooth(Sn).squeeze(0).clone()
+
+                if torch.any(N_block != 0):
+                    avg_N = torch.mean(N_ext, dim=(1,2,3))
+                    avg_N_block = torch.mean(N_block, dim=(1,2,3))
+                    if torch.sum(avg_N*avg_N_block) < 0:
+                        N_ext *= -1
+                        V_ext *= -1
+
                 # 4) crop & accumulate
                 iz0, iy0, ix0 = z0-zp, y0-yp, x0-xp
                 U_block += U_ext[:, iz0:iz0+Dz, iy0:iy0+Dy, ix0:ix0+Dx]
@@ -96,4 +104,4 @@ class VectorFieldComputer:
             N_ds[:, z0:z1, y0:y1, x0:x1] = N_block.cpu().numpy()
             torch.cuda.empty_cache()
 
-        print(f"✔ chunked U, V written to {output_zarr}")
+        print(f"✔ chunked U, V, N written to {output_zarr}")
