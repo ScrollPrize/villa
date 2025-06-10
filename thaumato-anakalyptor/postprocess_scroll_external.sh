@@ -169,7 +169,7 @@ fi
 # step 4: graph to mesh
 if (( start_idx <= 4 )); then
   echo ">>> Step 4: Running graph_to_mesh"
-  mesh_cmd="python3 -m ThaumatoAnakalyptor.graph_to_mesh --path /workspace/experiments/point_cloud_colorized_verso_subvolume_blocks --graph /workspace/experiments/1352_3600_5002/point_cloud_colorized_verso_subvolume_graph_BP_solved.pkl --start_point 1352 3600 5002 --angle_step 2.0 --z_spacing 5 --unfix_factor 3.0 --max_z_step_size 500 --downsample --split_width 40000 --continue_from 3"
+  mesh_cmd="python3 -m ThaumatoAnakalyptor.graph_to_mesh --path /workspace/experiments/point_cloud_colorized_verso_subvolume_blocks --graph /workspace/experiments/1352_3600_5002/point_cloud_colorized_verso_subvolume_graph_BP_solved.pkl --start_point 1352 3600 5002 --angle_step 2.0 --z_spacing 5 --unfix_factor 3.0 --max_z_step_size 500 --downsample --split_width 40000 --disable_valid_clip --continue_from 3"
   run_in_docker_with_retry "$mesh_cmd"
 fi
 
