@@ -1765,8 +1765,11 @@ def flatten_pointcloud(base_path,
             winding_vs.append(winding_v)
             
             # Save UV-colored pointcloud for this winding
-            save_colored_pointcloud_uv(uv_colored_winding_path, wrap_nr, points_winding, uvs_winding, 
-                                     global_u_range, global_v_range)
+            try:
+                save_colored_pointcloud_uv(uv_colored_winding_path, wrap_nr, points_winding, uvs_winding, 
+                                        global_u_range, global_v_range)
+            except Exception as e:
+                print(f"Error saving UV-colored pointcloud for winding {wrap_nr}: {e}")
             
             w_i += len(undeleted_indices_winding)
             w_i_total += winding_indices[i]
@@ -3126,19 +3129,41 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
         # Calculate angle and Z ranges for solver parameters
         angle_min, angle_max = angles.min(), angles.max()
         z_min, z_max = vertices[:, 2].min(), vertices[:, 2].max()
-        
+        zero_ranges = [(angle_min-360, angle_max+360)]
         if verbose:
             print(f"Solver ranges: angles=[{angle_min:.1f}, {angle_max:.1f}], z=[{z_min:.1f}, {z_max:.1f}]")
         
         # First solve with moderate iterations
         solver.solve_flattening(
             num_iterations=50000, 
-            visualize=True
+            visualize=True,
+            zero_ranges=zero_ranges,
+            tug_step=0.0005
         )
         
         # Get final UV coordinates
         final_uvs = np.array(solver.get_uvs())
         undeleted_indices = np.array(solver.get_undeleted_indices())
+
+        # Filter out vertices that have an V value outside the 5,95 percentile -+ 500
+        v_min, v_max = np.percentile(final_uvs[:, 1], [5, 95])
+        v_min = v_min - 500
+        v_max = v_max + 500
+        mask = (final_uvs[:, 1] >= v_min) & (final_uvs[:, 1] <= v_max)
+        mask_bad_indices = np.logical_not(mask)
+        bad_indices = np.where(mask_bad_indices)[0]
+        # remove indices from undeleted_indices by entries
+        u_set = set(undeleted_indices)
+        i_set = set(bad_indices)
+        u_set_prime = u_set - i_set
+        undeleted_indices = np.array(list(u_set_prime))
+
+        # Filter triangles if fnot all vertices are undeleted
+        valid_triangles = []
+        for tri in tqdm(triangles, desc="Filtering triangles"):
+            if all(v in undeleted_indices for v in tri):
+                valid_triangles.append(tri)
+        valid_triangles = np.array(valid_triangles).astype(np.int32)
         
         if verbose:
             print(f"Solver completed: {len(undeleted_indices)} vertices retained")
@@ -3147,28 +3172,12 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
         # Create new mesh with original vertices but flattened UVs
         if verbose:
             print("Creating final mesh with flattened UVs...")
-        
-        # Keep only undeleted vertices and triangles
-        final_vertices = vertices[undeleted_indices]
-        
-        # Update triangle indices to point to new vertex array
-        vertex_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(undeleted_indices)}
-        valid_triangles = []
-        
-        for tri in triangles:
-            # Check if all vertices of the triangle are undeleted
-            if all(v in vertex_mapping for v in tri):
-                new_tri = [vertex_mapping[v] for v in tri]
-                valid_triangles.append(new_tri)
-        
-        valid_triangles = np.array(valid_triangles)
-        
+                
         if verbose:
-            print(f"Final mesh: {len(final_vertices)} vertices, {len(valid_triangles)} triangles")
+            print(f"Final mesh: {len(final_vertices)} vertices, {len(triangles)} triangles")
         
         # Create the final mesh
-        final_vertices = final_vertices.astype(np.float64)
-        valid_triangles = valid_triangles.astype(np.int32)
+        final_vertices = vertices
         final_mesh = o3d.geometry.TriangleMesh()
         final_mesh.vertices = o3d.utility.Vector3dVector(final_vertices)
         print("Added final vertices")
@@ -3240,10 +3249,10 @@ def main():
                         help="Debug mode: only process this specific winding number")
     args = parser.parse_args()
 
-    skip_grid = args.skip_grid
+    skip_meshing = args.skip_meshing
+    skip_grid = args.skip_grid or skip_meshing
     skip_flattening = args.skip_flattening or skip_grid
     skip_precomputation = args.skip_precomputation or skip_flattening
-    skip_meshing = args.skip_meshing or skip_precomputation
 
     # Load winding direction
     winding_direction_path = os.path.join(os.path.dirname(args.mesh), "winding_direction.txt")
@@ -3261,14 +3270,14 @@ def main():
         print("Note: mesh_uv_global will be skipped in debug mode")
 
     flattened_winding_path = os.path.join(os.path.dirname(args.mesh), "windings_flattened")
-    if not args.skip_precomputation and not args.skip_flattening and not args.skip_grid:
+    if not skip_precomputation:
         generate_winding_pointclouds(
             args.mesh,
             display=args.display,
             display_downsample=args.display_downsample,
             color_by_angle=args.color_by_angle
         )
-    if not args.skip_flattening and not args.skip_grid:
+    if not skip_flattening:
         flattened_winding_path = flatten_pointcloud(
             os.path.dirname(args.mesh),
             display=args.display,
@@ -3280,7 +3289,7 @@ def main():
             from_winding=args.from_winding,
             debug_winding=args.debug_winding
         )
-    if not args.skip_grid:
+    if not skip_grid:
         grid_uv_flattened(
             flattened_winding_path,
             subsample_radius=30.0,
