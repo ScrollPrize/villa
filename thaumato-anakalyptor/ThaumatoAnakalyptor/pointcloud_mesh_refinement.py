@@ -608,7 +608,7 @@ def clean_mesh(mesh,
         mesh: the cleaned mesh
     """
     # 1) basic topological cleanup
-    mesh.remove_duplicated_vertices()
+    # mesh.remove_duplicated_vertices()
 
     # 2) cull huge triangles by edge-length / area
     verts = np.asarray(mesh.vertices)
@@ -617,16 +617,16 @@ def clean_mesh(mesh,
     mesh_uvs = np.asarray(mesh.triangle_uvs).reshape(-1, 3, 2)                # (M,3,3)
 
     # edge lengths 3d
-    e0 = np.linalg.norm(tri_verts[:,1] - tri_verts[:,0], axis=1)
-    e1 = np.linalg.norm(tri_verts[:,2] - tri_verts[:,1], axis=1)
-    e2 = np.linalg.norm(tri_verts[:,0] - tri_verts[:,2], axis=1)
-    longest_edge = np.maximum.reduce([e0, e1, e2])
+    e0 = np.linalg.norm(tri_verts[:,1,:] - tri_verts[:,0,:], axis=1)
+    e1 = np.linalg.norm(tri_verts[:,2,:] - tri_verts[:,1,:], axis=1)
+    e2 = np.linalg.norm(tri_verts[:,0,:] - tri_verts[:,2,:], axis=1)
+    longest_edge = np.maximum.reduce([e0, e1, e2], axis=0)
 
     # edge lengths uv
     e0_uv = np.linalg.norm(mesh_uvs[:,1,:] - mesh_uvs[:,0,:], axis=1)
     e1_uv = np.linalg.norm(mesh_uvs[:,2,:] - mesh_uvs[:,1,:], axis=1)
     e2_uv = np.linalg.norm(mesh_uvs[:,0,:] - mesh_uvs[:,2,:], axis=1)
-    longest_edge_uv = np.maximum.reduce([e0_uv, e1_uv, e2_uv])
+    longest_edge_uv = np.maximum.reduce([e0_uv, e1_uv, e2_uv], axis=0)
 
     # areas
     cross_prod = np.cross(tri_verts[:,1] - tri_verts[:,0],
@@ -638,12 +638,41 @@ def clean_mesh(mesh,
     print(f"Edge threshold: {edge_thr}, area threshold: {area_thr}, edge length threshold: {edge_length_thresh}")
     bad = np.where((longest_edge > edge_thr) | (areas > area_thr) | (longest_edge > edge_length_thresh) | (longest_edge_uv > edge_length_thresh))[0]
     bad = list(bad)
+    min_bad = np.min(bad) if len(bad) > 0 else None
+    max_bad = np.max(bad) if len(bad) > 0 else None
+    print(f"Removing bad indices of triangles, min max index: {min_bad}, {max_bad}. Number of bad triangles: {len(bad)}")
     mesh.remove_triangles_by_index(bad)
 
     # 3) final cleanup
     mesh.remove_unreferenced_vertices()
     mesh.compute_vertex_normals()
     mesh.compute_triangle_normals()
+
+    if True:
+        # Remove connected components that have too small of an area
+        triangle_clusters, cluster_n_triangles, cluster_area = mesh.cluster_connected_triangles()
+        triangle_clusters = np.asarray(triangle_clusters)
+        cluster_area = np.asarray(cluster_area)
+        
+        # Find the largest cluster
+        largest_cluster_idx = np.argmax(cluster_area)
+        largest_cluster_area = cluster_area[largest_cluster_idx]
+        
+        # Remove clusters with area less than threshold
+        area_threshold = 1000000  # absolute area threshold
+        small_clusters = np.where(cluster_area < area_threshold)[0]
+        triangles_to_remove = np.where(np.isin(triangle_clusters, small_clusters))[0]
+        
+        if len(triangles_to_remove) > 0:
+            print(f"Removing {len(triangles_to_remove)} triangles from {len(small_clusters)} small components")
+            # print(f"Areas: {[f'{a:.2f}' for a in cluster_area[small_clusters]]}")
+            print(f"Largest component area: {largest_cluster_area:.2f}")
+            mesh.remove_triangles_by_index(triangles_to_remove)
+            mesh.remove_unreferenced_vertices()
+            
+            # Recompute normals after removing components
+            mesh.compute_vertex_normals()
+            mesh.compute_triangle_normals()
 
     # 4) warn if still self-intersecting
     if False and hasattr(mesh, "is_self_intersecting") and mesh.is_self_intersecting():
@@ -1021,7 +1050,7 @@ def build_neighbor_graph(coords,
         point_coords = pts[point_i_array]
         found_coords = pts[found_idx_array]
         distances_3d = np.linalg.norm(point_coords - found_coords, axis=1)
-        distance_mask = distances_3d <= max_distance_filter
+        distance_mask = np.logical_or(distances_3d <= max_distance_filter, np.logical_or(is_mesh[point_i_array], is_mesh[found_idx_array]))
         
         # 3. Apply global angle threshold if specified
         if angle_threshold is not None:
@@ -1499,7 +1528,7 @@ def flatten_pointcloud(base_path,
         ds_fixed_nodes = len(first_winding_relative) if 'first_winding_relative' in locals() and first_winding_relative else 0
         ds_unfixed_nodes = ds_total_nodes - ds_fixed_nodes
         print(f"Downsampled solver: {ds_unfixed_nodes} unfixed nodes out of {ds_total_nodes} total nodes ({ds_fixed_nodes} fixed)")
-        solver_ds.solve_flattening(num_iterations=25000, visualize=True, 
+        solver_ds.solve_flattening(num_iterations=25000, visualize=False, 
                                    angle_tug_min=min_angle+90, angle_tug_max=max_angle-90, 
                                    z_tug_min=z_min+100, z_tug_max=z_max-100, 
                                    tug_step=0.5, zero_ranges=zero_ranges_initial)
@@ -1513,7 +1542,7 @@ def flatten_pointcloud(base_path,
         ds_fixed_nodes_2 = len(first_winding_relative) if 'first_winding_relative' in locals() and first_winding_relative else 0
         ds_unfixed_nodes_2 = ds_total_nodes_2 - ds_fixed_nodes_2
         print(f"Downsampled solver (2nd pass): {ds_unfixed_nodes_2} unfixed nodes out of {ds_total_nodes_2} total nodes ({ds_fixed_nodes_2} fixed)")
-        solver_ds.solve_flattening(num_iterations=75000, visualize=True, zero_ranges=zero_ranges, tug_step=0.0005, enable_spring_push_multiplier=True)
+        solver_ds.solve_flattening(num_iterations=75000, visualize=False, zero_ranges=zero_ranges, tug_step=0.0005, enable_spring_push_multiplier=True)
         
         uvs_ds_final = np.array(solver_ds.get_uvs())
         undeleted_ds_indices = np.array(solver_ds.get_undeleted_indices())
@@ -1718,7 +1747,7 @@ def flatten_pointcloud(base_path,
         # FIX: Add the missing tug parameters that were used in the downsampled solve
         solver.solve_flattening(
             num_iterations=10000, 
-            visualize=True
+            visualize=False
         )
         
         # Check if positions actually changed
@@ -2452,7 +2481,7 @@ def mesh_uv_wraps(filtered_winding_path, output_dir, winding_direction=False, de
         mesh = clean_mesh(mesh,
                       longest_edge_pct=100,
                       area_pct=100,
-                      edge_length_thresh=750)
+                      edge_length_thresh=250)
 
         # Normalize UVs after cleaning and get natural image size
         mesh, natural_image_size = normalize_uvs(mesh, verbose=True)
@@ -2486,7 +2515,7 @@ def mesh_uv_global(filtered_winding_path, output_path, winding_direction=False):
     files = sorted(glob.glob(os.path.join(filtered_winding_path, "flattened_winding_*.npz")))
     print(f"mesh_uv_global: Found {len(files)} files to process")
     wrap_ids = []
-    pts_list, uvs_list = [], []
+    pts_list, uvs_list, winding_angles = [], [], []
     for fp in files:
         try:
             nr = int(os.path.basename(fp).split("_")[-1].split(".")[0])
@@ -2494,6 +2523,7 @@ def mesh_uv_global(filtered_winding_path, output_path, winding_direction=False):
             data = np.load(fp)
             P = data["points"]   # (Ni, ≥4)
             U = data["uvs"]      # (Ni, 2)
+            WA = data["points"][:, 3].astype(np.float64)
             print(f"    Loaded {len(P)} points, {len(U)} UVs")
             
             # Skip empty files
@@ -2504,6 +2534,7 @@ def mesh_uv_global(filtered_winding_path, output_path, winding_direction=False):
             pts_list.append(P[:, :3])
             uvs_list.append(U)
             wrap_ids.append(np.full((len(P),), nr, dtype=int))
+            winding_angles.append(WA)
             print(f"    Added wrap {nr} to mesh: {len(P)} points")
         except Exception as e:
             print(f"  Error loading file {fp}: {e}")
@@ -2520,6 +2551,7 @@ def mesh_uv_global(filtered_winding_path, output_path, winding_direction=False):
     all_pts = np.vstack(pts_list)
     all_uvs = np.vstack(uvs_list)
     all_wr = np.concatenate(wrap_ids)
+    winding_angles = np.concatenate(winding_angles)
     print(f"Global arrays: {all_pts.shape} points, {all_uvs.shape} UVs")
 
     # ALWAYS flip U coordinates first (left becomes right)
@@ -2604,6 +2636,14 @@ def mesh_uv_global(filtered_winding_path, output_path, winding_direction=False):
         print("Reversing triangle winding order for global mesh")
         final_faces = faces[:, [0, 2, 1]]  # Swap vertices 1 and 2 to reverse winding
 
+    # filter out faces with min max winding angle diff > 50 deg
+    winding_angles_faces = winding_angles[final_faces]
+    min_angles = np.min(winding_angles_faces, axis=1)
+    max_angles = np.max(winding_angles_faces, axis=1)
+    winding_angle_diffs = max_angles - min_angles
+    faces_mask = np.abs(winding_angle_diffs) < 50
+    final_faces = final_faces[faces_mask]
+
     # only allow "neighboring-wrap" triangles
     w0 = all_wr[final_faces[:,0]]
     w1 = all_wr[final_faces[:,1]]
@@ -2631,7 +2671,7 @@ def mesh_uv_global(filtered_winding_path, output_path, winding_direction=False):
     mesh = clean_mesh(mesh,
                       longest_edge_pct=100,
                       area_pct=100,
-                      edge_length_thresh=750)
+                      edge_length_thresh=250)
 
     # Normalize UVs after cleaning and get natural image size
     mesh, natural_image_size = normalize_uvs(mesh, verbose=True)
@@ -3027,9 +3067,9 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
             print("ERROR: Mesh has no vertices or triangles")
             return False
             
-        vertices = np.asarray(mesh.vertices)
-        triangles = np.asarray(mesh.triangles)
-        uvs = np.asarray(mesh.triangle_uvs).reshape(-1, 3, 2)
+        vertices = np.array(mesh.vertices)
+        triangles = np.array(mesh.triangles)
+        uvs = np.array(mesh.triangle_uvs).reshape(-1, 3, 2)
 
         image_name = read_mtl_image_path(mesh_path.replace(".obj", ".mtl"))
         image_path = os.path.join(os.path.dirname(mesh_path), image_name)
@@ -3135,15 +3175,16 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
         
         # First solve with moderate iterations
         solver.solve_flattening(
-            num_iterations=50000, 
-            visualize=True,
+            num_iterations=150000, 
+            visualize=False,  # Disable visualization to avoid X11 errors
             zero_ranges=zero_ranges,
             tug_step=0.0005
         )
         
         # Get final UV coordinates
-        final_uvs = np.array(solver.get_uvs())
+        final_uvs = np.zeros((len(vertices), 2))
         undeleted_indices = np.array(solver.get_undeleted_indices())
+        final_uvs[undeleted_indices] = np.array(solver.get_uvs())
 
         # Filter out vertices that have an V value outside the 5,95 percentile -+ 500
         v_min, v_max = np.percentile(final_uvs[:, 1], [5, 95])
@@ -3157,13 +3198,6 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
         i_set = set(bad_indices)
         u_set_prime = u_set - i_set
         undeleted_indices = np.array(list(u_set_prime))
-
-        # Filter triangles if fnot all vertices are undeleted
-        valid_triangles = []
-        for tri in tqdm(triangles, desc="Filtering triangles"):
-            if all(v in undeleted_indices for v in tri):
-                valid_triangles.append(tri)
-        valid_triangles = np.array(valid_triangles).astype(np.int32)
         
         if verbose:
             print(f"Solver completed: {len(undeleted_indices)} vertices retained")
@@ -3174,28 +3208,37 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
             print("Creating final mesh with flattened UVs...")
                 
         if verbose:
-            print(f"Final mesh: {len(final_vertices)} vertices, {len(triangles)} triangles")
+            print(f"Final mesh: {len(vertices)} vertices, {len(triangles)} triangles")
+
+        # Update old mesh for debug
+        debug = True
+        if debug:
+            # Update UVs for each triangle
+            triangle_uvs_old = []
+            for vertex_idx in triangles.reshape(-1):
+                triangle_uvs_old.append(final_uvs[vertex_idx])
+            
+            triangle_uvs_old = np.array(triangle_uvs_old).reshape(-1,2).astype(np.float64)
+            mesh.triangle_uvs = o3d.utility.Vector2dVector(triangle_uvs_old)
+            # Save the final mesh
+            success = save_mesh_with_uvs(mesh, os.path.join(os.path.dirname(mesh_path), "mesh_flattened_old_debug.obj"), image_size, verbose=verbose)
+        # Create the final mesh by copying the original
+        final_mesh = o3d.geometry.TriangleMesh(mesh)
+
+        # Remove triangles by index
+        final_mesh.remove_triangles_by_index(bad_indices)
+        triangles = np.array(final_mesh.triangles)
         
-        # Create the final mesh
-        final_vertices = vertices
-        final_mesh = o3d.geometry.TriangleMesh()
-        final_mesh.vertices = o3d.utility.Vector3dVector(final_vertices)
-        print("Added final vertices")
-        final_mesh.triangles = o3d.utility.Vector3iVector(valid_triangles)
-        print("Final mesh created")
-        
-        # Create per-triangle UVs (3 UVs per triangle)
+        # Update UVs for each triangle
         triangle_uvs = []
-        for tri in valid_triangles:
-            for vertex_idx in tri:
-                triangle_uvs.append(final_uvs[vertex_idx])
+        for vertex_idx in triangles.reshape(-1):
+            triangle_uvs.append(final_uvs[vertex_idx])
         
         triangle_uvs = np.array(triangle_uvs).reshape(-1,2).astype(np.float64)
         final_mesh.triangle_uvs = o3d.utility.Vector2dVector(triangle_uvs)
         print("Added triangle UVs")
         
-        # Compute normals
-        final_mesh.compute_vertex_normals()
+        # Compute triangle normals (vertex normals already copied from original mesh)
         final_mesh.compute_triangle_normals()
         
         # Normalize UVs and get natural image size
@@ -3204,19 +3247,22 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
         # Apply mesh cleaning and filtering
         if verbose:
             print("Applying mesh cleaning and filtering...")
-        
-        final_mesh = clean_mesh(final_mesh, 
-                               longest_edge_pct=100, 
-                               area_pct=100, 
-                               edge_length_thresh=750)
-        
-        final_mesh = filter_mesh_by_mask(final_mesh, natural_image_size, verbose=verbose)
-        
+                
         # Save the final mesh
         success = save_mesh_with_uvs(final_mesh, output_path, natural_image_size, verbose=verbose)
         
         if success and verbose:
             print(f"Successfully saved final flattened mesh to {output_path}")
+
+        if debug:
+            # Mesh without uvs
+            mesh_non_uvs = o3d.geometry.TriangleMesh()
+            mesh_non_uvs.vertices = final_mesh.vertices
+            mesh_non_uvs.triangles = final_mesh.triangles
+            mesh_non_uvs.vertex_normals = final_mesh.vertex_normals
+            mesh_non_uvs.triangle_normals = final_mesh.triangle_normals
+            # save directly
+            o3d.io.write_triangle_mesh(os.path.join(os.path.dirname(mesh_path), "mesh_flattened_old_debug_no_uvs.obj"), mesh_non_uvs)
             
         return success
         

@@ -466,16 +466,18 @@ std::vector<Node> run_solver_flattening(
         // Apply: commit temporaries to f_init and f_star
         flattening_apply_kernel<<<blocks, TPB>>>(d_graph, d_valid, (int)M);
         cudaDeviceSynchronize();
-        if (visualize && it % step_size == 0) {
+        if (it % step_size == 0) {
             // Print
             std::cout << "\rIteration: " << it << std::flush;  // Updates the same line
-            // Copy back for visualization
-            Node* h_buf = new Node[N];
-            cudaMemcpy(h_buf, d_graph, N * sizeof(Node), cudaMemcpyDeviceToHost);
-            std::vector<Node> graph_copy_(h_buf, h_buf + N);
-            delete[] h_buf;
-            // Scatter plot f_star vs f_init
-            plot_nodes(graph_copy_, "");
+            if (visualize) {
+                // Copy back for visualization
+                Node* h_buf = new Node[N];
+                cudaMemcpy(h_buf, d_graph, N * sizeof(Node), cudaMemcpyDeviceToHost);
+                std::vector<Node> graph_copy_(h_buf, h_buf + N);
+                delete[] h_buf;
+                // Scatter plot f_star vs f_init
+                plot_nodes(graph_copy_, "");
+            }
         }
     }
     std::cout << std::endl;
