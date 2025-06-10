@@ -66,7 +66,7 @@ __global__ void update_nodes_kernel_f_star_step(Node* d_graph, size_t* d_valid_i
             // certainty *= fmaxf(1.0f, 0.25f * k_dif / 360.0f);
         }
         else {
-            step_edge *= 0.2f;
+            // step_edge *= 0.2f;
             float dk = n2n1 - spring_constant * k;
             float fitting_factor = fmaxf(1.0f, 1.0f / (1.0f + 0.01f * fabsf(dk)));
             float same_block_factor2 = fmaxf(1.0f, 1.0f * node.num_same_block_edges);
@@ -79,9 +79,9 @@ __global__ void update_nodes_kernel_f_star_step(Node* d_graph, size_t* d_valid_i
         // calculate f star update
         float predicted_winding_angle = d_graph[target_node].f_tilde - spring_constant * k;
         float error_k = node_f_tilde - predicted_winding_angle;
-        if (!edge.same_block && std::abs(error_k) > 0.250f) {
-            step_edge *= 10.2f;
-        }
+        // if (!edge.same_block && std::abs(error_k) > 0.250f) {
+        //     step_edge *= 10.2f;
+        // }
         float k_diff = predicted_winding_angle - node.f_star;
         // Normalize step_edge based on distance from target node
         float node_dist = sqrtf(error_k * error_k + k * k);
