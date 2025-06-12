@@ -245,13 +245,13 @@ def main():
             slice_u = u_trim[:, mid, :, :]
             slice_v = v_trim[:, mid, :, :]
 
-            nx = slice_n[1, ::skip, ::skip]
-            ny = slice_n[0, ::skip, ::skip]
+            nx = slice_n[2, ::skip, ::skip]
+            ny = slice_n[1, ::skip, ::skip]
 
-            ux = slice_u[0, ::skip, ::skip]
+            ux = slice_u[2, ::skip, ::skip]
             uy = slice_u[1, ::skip, ::skip]
 
-            vx = slice_v[0, ::skip, ::skip]
+            vx = slice_v[2, ::skip, ::skip]
             vy = slice_v[1, ::skip, ::skip]
 
             mask_q = mask[::skip, ::skip]
