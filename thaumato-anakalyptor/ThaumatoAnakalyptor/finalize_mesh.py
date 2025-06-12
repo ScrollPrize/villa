@@ -245,6 +245,7 @@ def cut_meshes(mesh, texture_size, cut_size):
         res = cut_mesh_size(mesh, texture_size, current_min_x, cut_size)
         if res is None:
             print(f"Warning: No triangles included in the cut, skipping")
+            current_min_x += cut_size
             continue
         cut_mesh, cut_mesh_texture_size, triangle_info = res
         if not cut_mesh.is_empty():
