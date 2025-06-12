@@ -3130,7 +3130,7 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
         initial_u = np.zeros(n_vertices)
         initial_v = np.zeros(n_vertices)
         # For each triangle, connect all pairs of vertices
-        for i, tri in enumerate(triangles):
+        for i, tri in tqdm(enumerate(triangles), desc="Building neighbor graph", total=len(triangles)):
             v0, v1, v2 = tri
             # update the initial uvs
             us0, vs0 = uvs[i, 0] * image_size
@@ -3202,7 +3202,7 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
         # First solve with moderate iterations
         solver.solve_flattening(
             num_iterations=150000, 
-            visualize=False,  # Disable visualization to avoid X11 errors
+            visualize=True,  # Disable visualization to avoid X11 errors
             zero_ranges=zero_ranges,
             tug_step=0.0005
         )
