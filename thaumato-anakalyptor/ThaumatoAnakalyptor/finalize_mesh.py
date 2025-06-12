@@ -143,6 +143,10 @@ def cut_mesh_size(mesh, texture_size, min_x, cut_size):
     print(f"  Included triangles: {included_triangles}")
     print(f"  Excluded triangles: {excluded_triangles}")
     print(f"  Inclusion rate: {included_triangles/total_triangles_in_mesh*100:.2f}%")
+
+    if included_triangles == 0:
+        print(f"Warning: No triangles included in the cut, returning empty mesh")
+        return None
     
     # Check UV coordinate ranges
     u_coords = uv_scaled[:, 0]
@@ -238,7 +242,11 @@ def cut_meshes(mesh, texture_size, cut_size):
         print(f"\nProcessing cut {cut_index} from {current_min_x} to {min(current_min_x + cut_size, max_x)}")
         
         # Cut the mesh
-        cut_mesh, cut_mesh_texture_size, triangle_info = cut_mesh_size(mesh, texture_size, current_min_x, cut_size)
+        res = cut_mesh_size(mesh, texture_size, current_min_x, cut_size)
+        if res is None:
+            print(f"Warning: No triangles included in the cut, skipping")
+            continue
+        cut_mesh, cut_mesh_texture_size, triangle_info = res
         if not cut_mesh.is_empty():
             # Track triangles included in this cut
             cut_triangles = set(triangle_info['original_triangle_indices'])
