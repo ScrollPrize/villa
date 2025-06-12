@@ -3202,7 +3202,7 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
         # First solve with moderate iterations
         solver.solve_flattening(
             num_iterations=150000, 
-            visualize=True,  # Disable visualization to avoid X11 errors
+            visualize=False,  # Disable visualization to avoid X11 errors
             zero_ranges=zero_ranges,
             tug_step=0.0005
         )
