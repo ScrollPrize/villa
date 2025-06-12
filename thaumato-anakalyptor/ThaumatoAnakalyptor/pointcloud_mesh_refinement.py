@@ -3070,7 +3070,18 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
         # Load the original mesh
         if verbose:
             print(f"Loading original mesh from {mesh_path}")
+        mtl_name = mesh_path.replace(".obj", ".mtl")
+        mtl_name_bak = mtl_name + ".bak"
+        try: # Fix to not load the huge png images
+            os.rename(mtl_name, mtl_name_bak)
+        except:
+            pass
+        # Load the mesh
         mesh = o3d.io.read_triangle_mesh(mesh_path)
+        try: # Fix to not load the huge png images
+            os.rename(mtl_name_bak, mtl_name)
+        except:
+            pass
         
         if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
             print("ERROR: Mesh has no vertices or triangles")
