@@ -1824,10 +1824,15 @@ def normalize_uvs(mesh, verbose=True):
     Returns:
         tuple: (mesh with normalized UVs, natural_image_size as (width, height))
     """
-    if not hasattr(mesh, 'triangle_uvs') or len(mesh.triangle_uvs) == 0:
+    if not hasattr(mesh, 'triangle_uvs'):
         if verbose:
             print("Warning: Mesh has no UV coordinates, skipping UV normalization")
         return mesh, (2048, 2048)  # Default fallback size
+    
+    if  len(mesh.vertices) == 0:
+        if verbose:
+            print("Warning: Mesh has no vertices, skipping UV normalization")
+        return None  # Return None if mesh has no vertices
     
     # Get UV coordinates
     uvs = np.asarray(mesh.triangle_uvs)
@@ -2484,7 +2489,11 @@ def mesh_uv_wraps(filtered_winding_path, output_dir, winding_direction=False, de
                       edge_length_thresh=250)
 
         # Normalize UVs after cleaning and get natural image size
-        mesh, natural_image_size = normalize_uvs(mesh, verbose=True)
+        res = normalize_uvs(mesh, verbose=True)
+        if res is None:
+            print(f"Warning: Mesh {nr} has no vertices, skipping")
+            continue
+        mesh, natural_image_size = res
 
         # Apply advanced mask-based filtering
         mesh = filter_mesh_by_mask(mesh, natural_image_size, verbose=True, show_debug=False)
