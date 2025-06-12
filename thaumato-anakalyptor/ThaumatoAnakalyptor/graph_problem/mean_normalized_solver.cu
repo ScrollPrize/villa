@@ -59,19 +59,27 @@ __global__ void update_nodes_kernel_f_star_step(Node* d_graph, size_t* d_valid_i
 
         float step_edge = 1.0f;
         // Node winding angle update calculation
+        float k_ = k;
         if (edge.same_block) {
+            // step_edge *= 5.0f;
             // update closeness
             node.same_block_closeness += fabsf(k_dif);
             // certainty *= fmaxf(1.0f, 0.25f * node.same_block_closeness_old / 360.0f);
             // certainty *= fmaxf(1.0f, 0.25f * k_dif / 360.0f);
+            if (k < 0.0f) {
+                k_ += 360.0f;
+            }
+            else if (k > 360.0f) {
+                k_ -= 360.0f;
+            }
         }
         else {
-            // step_edge *= 0.2f;
-            float dk = n2n1 - spring_constant * k;
-            float fitting_factor = fmaxf(1.0f, 1.0f / (1.0f + 0.01f * fabsf(dk)));
-            float same_block_factor2 = fmaxf(1.0f, 1.0f * node.num_same_block_edges);
-            float edges_factor = sqrt(1.0f * (node.num_edges - node.num_same_block_edges) * (d_graph[target_node].num_edges - d_graph[target_node].num_same_block_edges));
-            float certainty_factor = 0.05f * fitting_factor * same_block_factor2 * edges_factor;
+            step_edge *= 1.5f;
+            // float dk = n2n1 - spring_constant * k;
+            // float fitting_factor = fmaxf(1.0f, 1.0f / (1.0f + 0.01f * fabsf(dk)));
+            // float same_block_factor2 = fmaxf(1.0f, 1.0f * node.num_same_block_edges);
+            // float edges_factor = sqrt(1.0f * (node.num_edges - node.num_same_block_edges) * (d_graph[target_node].num_edges - d_graph[target_node].num_same_block_edges));
+            // float certainty_factor = 0.05f * fitting_factor * same_block_factor2 * edges_factor;
             // float certainty_factor = 0.05f * same_block_factor2 * edges_factor;
             // certainty *= certainty_factor;
             // k *= 0.02f; // wrong other block edges make the adjacent windings be closer together, if k is "the perfect" angle step, then we would have too steep winding lines, since they wrap around that would then lead to places where the lines need to bend abruptly to compensate for the too steepness compared to the distance between the windings
@@ -84,8 +92,10 @@ __global__ void update_nodes_kernel_f_star_step(Node* d_graph, size_t* d_valid_i
         // }
         float k_diff = predicted_winding_angle - node.f_star;
         // Normalize step_edge based on distance from target node
-        float node_dist = sqrtf(error_k * error_k + k * k);
+        float node_dist = sqrtf(error_k * error_k + k_ * k_);
         float dist_factor = - error_k / node_dist;
+        float abs_dist_factor = fabsf(fmaxf(fabsf(dist_factor), 0.001f) - 0.5f);
+        dist_factor = dist_factor * abs_dist_factor * abs_dist_factor;
         float step_loss = expf(-(k_diff * k_diff) / (2.0f * step_sigma * step_sigma));
         // step_loss = 1.0f; // only for testing, to make scroll windings straight in the end use the bell curve
         // sum_w_f_tilde_k += step_edge * certainty * step_loss * (predicted_winding_angle - node.f_star + 0.5f * d_graph[target_node].f_star_momentum) / 1.5f;
