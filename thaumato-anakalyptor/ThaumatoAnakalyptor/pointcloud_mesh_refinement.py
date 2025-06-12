@@ -3093,7 +3093,13 @@ def flatten_mesh_final(mesh_path, output_path, verbose=True):
 
         image_name = read_mtl_image_path(mesh_path.replace(".obj", ".mtl"))
         image_path = os.path.join(os.path.dirname(mesh_path), image_name)
-        image = cv2.imread(image_path)
+        from PIL import Image, ImageFile
+        # disable PIL’s “decompression bomb” protection
+        Image.MAX_IMAGE_PIXELS = None
+        # allow loading even if the file is truncated/corrupt
+        ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+        image = np.array(Image.open(image_path))
         image_size = image.shape[:2][::-1]
         
         if verbose:
