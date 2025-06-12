@@ -229,15 +229,6 @@ class PatchOptimizer:
         # Global step counter (for wandb logging across patches)
         self.global_step = 0
 
-        if hasattr(torch, "compile"):
-            # compile the inner loss compute
-            self._compute_losses = torch.compile(
-                self._compute_losses,
-                fullgraph=True,
-                mode="max-autotune",
-                dynamic=True,
-            )
-
     #@torch.compile(fullgraph=True, mode="max-autotune", dynamic=True)
     def _compute_losses(self, q: torch.Tensor, U: torch.Tensor, V: torch.Tensor, N: torch.Tensor, alpha: float):
         """
@@ -507,6 +498,14 @@ class PatchOptimizer:
             }, step=self.global_step)
 
         return q_manifold.detach()
+
+if hasattr(torch, "compile"):
+    PatchOptimizer._compute_losses = torch.compile(
+        PatchOptimizer._compute_losses,
+        fullgraph=True,
+        mode="max-autotune",
+        dynamic=True,
+    )
 
 
 # ── Standalone sanity check with an “intelligent” UVN ───────────────────────────────────
