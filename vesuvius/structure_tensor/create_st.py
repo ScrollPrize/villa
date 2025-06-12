@@ -81,7 +81,10 @@ class StructureTensorInferer(Inferer, nn.Module):
             self.register_buffer("_gauss3d",   g3[None,None])     # [1,1,D,H,W]
             self.register_buffer("_gauss3d_tensor",
                                  self._gauss3d.expand(6, -1, -1, -1, -1))
-            self._pad     = radius
+            self._pad = radius
+        else:
+            # no Gaussian padding when σ=0
+            self._pad = 0
 
         # Build 3D Pavel Holoborodko kernels and store as plain tensors
         # http://www.holoborodko.com/pavel/image-processing/edge-detection/

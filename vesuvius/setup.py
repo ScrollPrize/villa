@@ -69,6 +69,7 @@ setup(
         'wandb',
         'tensorstore',
         'geoopt @ git+https://github.com/geoopt/geoopt.git@master#egg=geoopt',
+        'pytest',
         'blosc2'
     ],
     python_requires='>=3.8',

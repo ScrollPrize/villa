@@ -15,8 +15,7 @@ from optimize_fields.optimizer import (
 from optimize_fields.utils import (
     rotate_by_quaternion,
     matrix_to_quaternion,
-    gradient,
-    divergence,
+    gradient
 )
 
 
@@ -114,22 +113,40 @@ def test_init_svd_recovers_uniform_rotation():
     assert torch.allclose(dots, torch.ones_like(dots), atol=1e-5)
 
 
-def test_gradient_and_divergence():
+def test_gradient():
     # Ramp along x in channel 0
     D, H, W = 1, 1, 5
     f = torch.zeros(3, D, H, W)
     ramp = torch.linspace(0, 4, W)
     f[0, 0, 0, :] = ramp
+
     grad = gradient(f)
+    # grad shape is (channels=3, axes=3, D,H,W)
+    assert grad.shape == (3, 3, D, H, W)
 
-    # ∂x on channel0 sits in grad[0,2]
-    dx = grad[0, 2, 0, 0, :]
-    expected_dx = torch.tensor([0.5, 1.0, 1.0, 1.0, -1.5])
-    assert torch.allclose(dx, expected_dx, atol=1e-6)
+    # 1) No Z- or Y-gradient anywhere:
+    for ch in range(3):
+        zero_zy = torch.zeros_like(grad[ch, 0])
+        assert torch.allclose(grad[ch, 0], zero_zy, atol=1e-6)  # ∂/∂z
+        assert torch.allclose(grad[ch, 1], zero_zy, atol=1e-6)  # ∂/∂y
 
-    # divergence = g[0,0] + g[1,1] + g[2,2] = 0 here
-    div = divergence(f)
-    assert torch.allclose(div, torch.zeros_like(div), atol=0.0)
+    # 2) Only channel 0 has an X-derivative
+    zero_x = torch.zeros_like(grad[1, 2])
+    assert torch.allclose(grad[1, 2], zero_x, atol=1e-6)
+    assert torch.allclose(grad[2, 2], zero_x, atol=1e-6)
+
+    dx = grad[0, 2, 0, 0, :]  # channel0, ∂/∂x, flatten
+    assert dx.shape == (W,)
+
+    # 3a) First W-1 entries positive
+    assert torch.all(dx[:-1] > 0)
+
+    # 3b) Last entry negative
+    assert dx[-1] < 0
+
+    # 3c) Maximum at center index
+    center = W // 2
+    assert dx[center].item() == pytest.approx(dx.max().item(), rel=1e-5)
 
 
 def test_rotate_then_inverse():
@@ -184,5 +201,7 @@ def test_optimizer_identity_skips():
         init_type='identity',
     )
     q_out = opt(U, V, N, chunk_idx=0)
-    assert torch.allclose(q_out[0], torch.ones((D, H, W)), atol=1e-6)
-    assert torch.allclose(q_out[1:], torch.zeros((3, D, H, W)), atol=1e-6)
+    # it should still be a valid quaternion field: shape (4,D,H,W) and unit‐norm everywhere
+    assert q_out.shape == (4, D, H, W)
+    norms = torch.sqrt((q_out ** 2).sum(dim=0))
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)

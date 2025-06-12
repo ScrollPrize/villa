@@ -7,10 +7,10 @@ output: "/home/giorgio/scrolls/scroll1/volumes/optim.zarr"
 chunk: "128,128,128"
 
 # penalties and hyperparams:
-mu0: 1e-2
+mu0: 1e-3
 mu1: 1e-4
 mu4: 1e-4
-mu5: 1e-5
+mu5: 1e-4
 decay_max: 0.5
 grad_clip: 0.5
 optimizer_type: "adam"

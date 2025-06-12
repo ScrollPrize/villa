@@ -2,10 +2,11 @@
 
 import torch
 import geoopt
+import numpy as np
 from geoopt import ManifoldParameter
 from geoopt.optim import RiemannianAdam
 from tqdm.auto import tqdm
-from optimize_fields.utils import gradient, divergence, rotate_by_quaternion, matrix_to_quaternion
+from optimize_fields.utils import gradient, rotate_by_quaternion, matrix_to_quaternion
 import wandb
 
 # ── 1) Batched SVD initialization ─────────────────────
@@ -283,64 +284,69 @@ class PatchOptimizer:
 
         # ── Divergence penalty (unmasked) ────────────────────────────────────────────
         div_pen = alpha * self.mu4 * (
-            divergence(u).pow(2).sum() +
-            divergence(v).pow(2).sum() +
-            divergence(n).pow(2).sum()
+            (grad_u[0,0] + grad_u[1,1] + grad_u[2,2]).pow(2).sum() +
+            (grad_v[0,0] + grad_v[1,1] + grad_v[2,2]).pow(2).sum() +
+            (grad_n[0,0] + grad_n[1,1] + grad_n[2,2]).pow(2).sum()
         )
 
-                # ── Curl‐of‐curl penalty ───────────────────────────────────────────────────────
+        # ── Curl‐of‐curl penalty ───────────────────────────────────────────────────────
         # We will compute curl_u = ∇×u, then curlcurl_u = ∇×(∇×u), and likewise for v,n.
+        if self.mu5 != 0:
+            # 1) first curl:
+            curl_u = torch.zeros_like(u)  # shape (3,D,H,W)
+            curl_v = torch.zeros_like(v)
+            curl_n = torch.zeros_like(n)
 
-        # 1) first curl:
-        curl_u = torch.zeros_like(u)  # shape (3,D,H,W)
-        curl_v = torch.zeros_like(v)
-        curl_n = torch.zeros_like(n)
+            # (curl u)_x = ∂_y u_z - ∂_z u_y
+            curl_u[2] = grad_u[0, 1] - grad_u[1, 0]
+            curl_v[2] = grad_v[0, 1] - grad_v[1, 0]
+            curl_n[2] = grad_n[0, 1] - grad_n[1, 0]
 
-        # (curl u)_x = ∂_y u_z - ∂_z u_y
-        curl_u[0] = grad_u[2, 1] - grad_u[1, 2]
-        curl_v[0] = grad_v[2, 1] - grad_v[1, 2]
-        curl_n[0] = grad_n[2, 1] - grad_n[1, 2]
+            # (curl u)_y = ∂_z u_x - ∂_x u_z
+            curl_u[1] = -grad_u[0, 2] + grad_u[2, 0]
+            curl_v[1] = -grad_v[0, 2] + grad_v[2, 0]
+            curl_n[1] = -grad_n[0, 2] + grad_n[2, 0]
 
-        # (curl u)_y = ∂_z u_x - ∂_x u_z
-        curl_u[1] = grad_u[0, 2] - grad_u[2, 0]
-        curl_v[1] = grad_v[0, 2] - grad_v[2, 0]
-        curl_n[1] = grad_n[0, 2] - grad_n[2, 0]
+            # (curl u)_z = ∂_x u_y - ∂_y u_x
+            curl_u[0] = grad_u[1, 2] - grad_u[2, 1]
+            curl_v[0] = grad_v[1, 2] - grad_v[2, 1]
+            curl_n[0] = grad_n[1, 2] - grad_n[2, 1]
 
-        # (curl u)_z = ∂_x u_y - ∂_y u_x
-        curl_u[2] = grad_u[1, 0] - grad_u[0, 1]
-        curl_v[2] = grad_v[1, 0] - grad_v[0, 1]
-        curl_n[2] = grad_n[1, 0] - grad_n[0, 1]
+            # 2) second curl (i.e. curl of curl):
+            g2_u = gradient(curl_u)  # shape (3,3,D,H,W)
+            g2_v = gradient(curl_v)
+            g2_n = gradient(curl_n)
 
-        # 2) second curl (i.e. curl of curl):
-        g2_u = gradient(curl_u)  # shape (3,3,D,H,W)
-        g2_v = gradient(curl_v)
-        g2_n = gradient(curl_n)
+            curlcurl_u = torch.zeros_like(curl_u)  # shape (3,D,H,W)
+            curlcurl_v = torch.zeros_like(curl_v)
+            curlcurl_n = torch.zeros_like(curl_n)
 
-        curlcurl_u = torch.zeros_like(curl_u)  # shape (3,D,H,W)
-        curlcurl_v = torch.zeros_like(curl_v)
-        curlcurl_n = torch.zeros_like(curl_n)
+            # (curlcurl u)_x = ∂_y (curl u)_z - ∂_z (curl u)_y
+            curlcurl_u[2] = g2_u[0, 1] - g2_u[1, 0]
+            curlcurl_v[2] = g2_v[0, 1] - g2_v[1, 0]
+            curlcurl_n[2] = g2_n[0, 1] - g2_n[1, 0]
 
-        # (curlcurl u)_x = ∂_y (curl u)_z - ∂_z (curl u)_y
-        curlcurl_u[0] = g2_u[2, 1] - g2_u[1, 2]
-        curlcurl_v[0] = g2_v[2, 1] - g2_v[1, 2]
-        curlcurl_n[0] = g2_n[2, 1] - g2_n[1, 2]
+            # (curlcurl u)_y = ∂_z (curl u)_x - ∂_x (curl u)_z
+            curlcurl_u[1] = -g2_u[0, 2] + g2_u[2, 0]
+            curlcurl_v[1] = -g2_v[0, 2] + g2_v[2, 0]
+            curlcurl_n[1] = -g2_n[0, 2] + g2_n[2, 0]
 
-        # (curlcurl u)_y = ∂_z (curl u)_x - ∂_x (curl u)_z
-        curlcurl_u[1] = g2_u[0, 2] - g2_u[2, 0]
-        curlcurl_v[1] = g2_v[0, 2] - g2_v[2, 0]
-        curlcurl_n[1] = g2_n[0, 2] - g2_n[2, 0]
+            # (curlcurl u)_z = ∂_x (curl u)_y - ∂_y (curl u)_x
+            curlcurl_u[0] = g2_u[1, 2] - g2_u[2, 1]
+            curlcurl_v[0] = g2_v[1, 2] - g2_v[2, 1]
+            curlcurl_n[0] = g2_n[1, 2] - g2_n[2, 1]
 
-        # (curlcurl u)_z = ∂_x (curl u)_y - ∂_y (curl u)_x
-        curlcurl_u[2] = g2_u[1, 0] - g2_u[0, 1]
-        curlcurl_v[2] = g2_v[1, 0] - g2_v[0, 1]
-        curlcurl_n[2] = g2_n[1, 0] - g2_n[0, 1]
+            # 3) squared‐L2 norms:
+            curlcurl_term = alpha * self.mu5 * (curlcurl_u.pow(2).sum() \
+                        + curlcurl_v.pow(2).sum() \
+                        + curlcurl_n.pow(2).sum())
 
-        # 3) squared‐L2 norms:
-        curlcurl_term = alpha * self.mu5 * (curlcurl_u.pow(2).sum() \
-                     + curlcurl_v.pow(2).sum() \
-                     + curlcurl_n.pow(2).sum())
+            total = data + smooth + div_pen + curlcurl_term
+        
+        else:
+            curlcurl_term = torch.from_numpy(np.array([0])).to("cuda")
+            total = data + smooth + div_pen
 
-        total = data + smooth + div_pen + curlcurl_term
         return total, data.detach(), smooth.detach(), div_pen.detach(), curlcurl_term.detach()
 
     def __call__(self, U: torch.Tensor, V: torch.Tensor, N: torch.Tensor, chunk_idx: int) -> torch.Tensor:

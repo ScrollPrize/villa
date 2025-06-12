@@ -17,64 +17,45 @@ def rotate_by_quaternion(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     uuv = torch.cross(zyx, uv, dim=-1)           # (...,3)
     return (v + 2*(w*uv + uuv)).clone()
 
-#@torch.compile(fullgraph=True, mode="max-autotune", dynamic=True)
+# ─── Pavel Holoborodko kernels ────────────────────────────────────────
+# 1D derivative and smoothing kernels (float32, CPU)
+_d = torch.tensor([2.,  1., -16., -27., 0., 27., 16., -1., -2.], dtype=torch.float32)
+_s = torch.tensor([1., 4., 6., 4., 1.], dtype=torch.float32)
+
+# build 3D “derivative-of-Gaussian” kernels
+_kz = (_d.view(9,1,1) * _s.view(1,5,1) * _s.view(1,1,5)) / (96*16*16)  # (9,5,5)
+_ky = (_s.view(5,1,1) * _d.view(1,9,1) * _s.view(1,1,5)) / (96*16*16)  # (5,9,5)
+_kx = (_s.view(5,1,1) * _s.view(1,5,1) * _d.view(1,1,9)) / (96*16*16)  # (5,5,9)
+
+# compute per-kernel padding (half‐sizes)
+_pad_kz = ( _kz.shape[0]//2, _kz.shape[1]//2, _kz.shape[2]//2 )  # (4,2,2)
+_pad_ky = ( _ky.shape[0]//2, _ky.shape[1]//2, _ky.shape[2]//2 )  # (2,4,2)
+_pad_kx = ( _kx.shape[0]//2, _kx.shape[1]//2, _kx.shape[2]//2 )  # (2,2,4)
+
 def gradient(field: torch.Tensor) -> torch.Tensor:
     """
-    Finite‐difference gradient of a 3‐component field.
-
+    Pavel Holoborodko 3D gradient via 9×5×5 derivative-of-Gaussian filters.
     Args:
-      field: Tensor of shape (3, D, H, W)
+      field: (3, D, H, W)
     Returns:
-      grad: Tensor of shape (3, 3, D, H, W),
-            where grad[c, i, ...] = ∂_{axis i} field[c, ...]
+      grad:  (3, 3, D, H, W), axes = (z, y, x)
     """
-    # batch‐ify channels: (1,3,D,H,W)
-    f = field.unsqueeze(0)
-
+    # batchify
+    f = field.unsqueeze(0)                # → (1,3,D,H,W)
     device = f.device
-    dtype = f.dtype
 
-    # central difference kernel [-0.5, 0, +0.5]
-    k = torch.tensor([-0.5, 0.0, +0.5], device=device, dtype=dtype)
+    # move the base kernels onto the same device as `f`
+    kz5 = _kz.view(1,1,9,5,5).repeat(3,1,1,1,1).to(device)
+    ky5 = _ky.view(1,1,5,9,5).repeat(3,1,1,1,1).to(device)
+    kx5 = _kx.view(1,1,5,5,9).repeat(3,1,1,1,1).to(device)
 
-    # build 5D kernels for each axis, replicated per‐channel
-    # shape should be (3,1,3,3,3) → then groups=3
-    # ∂x (pad only width)
-    kx = k.view(1,1,1,1,3).repeat(3, 1, 1, 1, 1)
-    # ∂y (pad only height)
-    ky = k.view(1,1,1,3,1).repeat(3, 1, 1, 1, 1)
-    # ∂z (pad only depth)
-    kz = k.view(1,1,3,1,1).repeat(3, 1, 1, 1, 1)
+    # three grouped conv3d calls, each padded so output = (D,H,W)
+    dz = F.conv3d(f, kz5, padding=_pad_kz, groups=3).squeeze(0)
+    dy = F.conv3d(f, ky5, padding=_pad_ky, groups=3).squeeze(0)
+    dx = F.conv3d(f, kx5, padding=_pad_kx, groups=3).squeeze(0)
 
-    # perform grouped conv3d: each of the 3 input channels uses its own 1×3 filter
-    dx = F.conv3d(f, kx, padding=(0, 0, 1), groups=3)  # → (1,3,D,H,W)
-    dy = F.conv3d(f, ky, padding=(0, 1, 0), groups=3)
-    dz = F.conv3d(f, kz, padding=(1, 0, 0), groups=3)
-
-    # remove batch dim: (3,D,H,W)
-    dx = dx.squeeze(0)
-    dy = dy.squeeze(0)
-    dz = dz.squeeze(0)
-
-    # stack into (3,3,D,H,W): first dim = channel, second = derivative axis
-    grad = torch.stack((dz, dy, dx), dim=1)
-    return grad
-
-#@torch.compile(fullgraph=True, mode="max-autotune", dynamic=True)
-def divergence(field: torch.Tensor) -> torch.Tensor:
-    """
-    Divergence of a 3‐component field via its gradient.
-
-    Args:
-      field: Tensor of shape (3, D, H, W)
-    Returns:
-      div: Tensor of shape (D, H, W)
-    """
-    # grad has shape (3,3,D,H,W): grad[c, i, ...]
-    g = gradient(field)
-    # trace: ∂x u_x + ∂y u_y + ∂z u_z
-    # which is g[0,0] + g[1,1] + g[2,2]
-    return g[0,0] + g[1,1] + g[2,2]
+    # stack → (3 channels, 3 derivative-axes, D, H, W)
+    return torch.stack((dz, dy, dx), dim=1)
 
 def matrix_to_quaternion(R: torch.Tensor) -> torch.Tensor:
     """
@@ -200,12 +181,6 @@ def matrix_to_quaternion(R: torch.Tensor) -> torch.Tensor:
 if hasattr(torch, "compile"):
     gradient = torch.compile(
         gradient,
-        fullgraph=True,
-        mode="max-autotune",
-        dynamic=True,
-    )
-    divergence = torch.compile(
-        divergence,
         fullgraph=True,
         mode="max-autotune",
         dynamic=True,
