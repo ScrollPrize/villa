@@ -68,7 +68,7 @@ setup(
         'psutil',
         'wandb',
         'tensorstore',
-        'geoopt @ git+https://github.com/geoopt/geoopt.git@main#egg=geoopt',
+        'geoopt @ git+https://github.com/geoopt/geoopt.git@master#egg=geoopt',
         'blosc2'
     ],
     python_requires='>=3.8',
