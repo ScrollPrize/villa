@@ -15,7 +15,7 @@ def rotate_by_quaternion(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     # cross products
     uv  = torch.cross(    zyx, v, dim=-1)        # (...,3)
     uuv = torch.cross(zyx, uv, dim=-1)           # (...,3)
-    return v + 2*(w*uv + uuv)
+    return (v + 2*(w*uv + uuv)).clone()
 
 #@torch.compile(fullgraph=True, mode="max-autotune", dynamic=True)
 def gradient(field: torch.Tensor) -> torch.Tensor:
@@ -195,3 +195,18 @@ def matrix_to_quaternion(R: torch.Tensor) -> torch.Tensor:
     q = q * (1.0 - 2.0 * w_sign)  # multiply entire (w,x,y,z) by -1 where w<0
 
     return q  # shape (..., 4)
+
+
+if hasattr(torch, "compile"):
+    gradient = torch.compile(
+        gradient,
+        fullgraph=True,
+        mode="max-autotune",
+        dynamic=True,
+    )
+    divergence = torch.compile(
+        divergence,
+        fullgraph=True,
+        mode="max-autotune",
+        dynamic=True,
+    )

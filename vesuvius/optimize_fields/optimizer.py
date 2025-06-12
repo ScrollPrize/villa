@@ -126,6 +126,7 @@ def _init_svd(
 
     # Convert each 3×3 to quaternion (num_flat, 4)
     q_flat = matrix_to_quaternion(new_R)  # (num_flat, 4)
+    assert torch.allclose(q_flat.norm(dim=-1), torch.ones_like(dets), atol=1e-6)
 
     # For any invalid voxels, force quaternion = [1,0,0,0]
     q_canon = torch.tensor([1.0, 0.0, 0.0, 0.0], device=U.device, dtype=U.dtype).view(1, 4).expand(num_flat, 4)
@@ -136,7 +137,6 @@ def _init_svd(
     q_init_nhwc = q_flat.reshape(D, H, W, 4)               # (D, H, W, 4)
     q_init = q_init_nhwc.permute(3, 0, 1, 2).contiguous()  # (4, D, H, W)
     return q_init
-
 
 # ── 2) Identity initialization  ───────────────────────────────────────
 #TODO: compile this
@@ -228,6 +228,15 @@ class PatchOptimizer:
 
         # Global step counter (for wandb logging across patches)
         self.global_step = 0
+
+        if hasattr(torch, "compile"):
+            # compile the inner loss compute
+            self._compute_losses = torch.compile(
+                self._compute_losses,
+                fullgraph=True,
+                mode="max-autotune",
+                dynamic=True,
+            )
 
     #@torch.compile(fullgraph=True, mode="max-autotune", dynamic=True)
     def _compute_losses(self, q: torch.Tensor, U: torch.Tensor, V: torch.Tensor, N: torch.Tensor, alpha: float):
