@@ -229,7 +229,7 @@ class MeshStitcher:
         
         return mask.astype(bool)
 
-    def stitch_renders(self, output_path=None, image_filename=None):
+    def stitch_renders(self, output_path=None, image_filename=None, scale=1.0):
         """
         Stitch the split renders back into the original UV mapping image.
         
@@ -237,6 +237,7 @@ class MeshStitcher:
             output_path: Path to save the stitched image. If None, saves next to original mesh.
             image_filename: Specific filename to look for in each window folder (e.g., 'composite.jpg', 'prediction.png')
                           If None, will search for files matching the window mesh names
+            scale: Scale factor for output image (0 to 1). Default is 1.0 (no scaling).
         """
         if output_path is None:
             mesh_dir = os.path.dirname(self.original_mesh_path)
@@ -390,6 +391,14 @@ class MeshStitcher:
                     print(f"Warning: Error processing triangle {triangle_idx}: {e}")
                     continue
         
+        # Scale the output image if requested
+        if scale < 1.0:
+            new_width = int(output_image.shape[1] * scale)
+            new_height = int(output_image.shape[0] * scale)
+            print(f"Scaling output image to {new_width}x{new_height} (scale={scale})")
+            output_image = cv2.resize(output_image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            coverage_mask = cv2.resize(coverage_mask.astype(np.uint8), (new_width, new_height), interpolation=cv2.INTER_AREA).astype(bool)
+
         # Save output image
         output_pil = Image.fromarray(output_image)
         
@@ -610,7 +619,7 @@ class FinalizeMeshStitcher:
         
         return mask.astype(bool)
 
-    def stitch_renders(self, output_path=None, image_filename=None):
+    def stitch_renders(self, output_path=None, image_filename=None, scale=1.0):
         """
         Stitch the cut renders back into the original texture image using simple image translation.
         
@@ -618,6 +627,7 @@ class FinalizeMeshStitcher:
             output_path: Path to save the stitched image. If None, saves next to original mesh.
             image_filename: Specific filename to look for in each cut folder (e.g., 'composite.jpg', 'prediction.png')
                           If None, will search for files matching the cut mesh names
+            scale: Scale factor for output image (0 to 1). Default is 1.0 (no scaling).
         """
         if output_path is None:
             mesh_dir = os.path.dirname(self.original_mesh_path)
@@ -760,6 +770,14 @@ class FinalizeMeshStitcher:
                     
                     print(f"  Max-pooled {region_width * region_height} pixels")
         
+        # Scale the output image if requested
+        if scale < 1.0:
+            new_width = int(output_image.shape[1] * scale)
+            new_height = int(output_image.shape[0] * scale)
+            print(f"Scaling output image to {new_width}x{new_height} (scale={scale})")
+            output_image = cv2.resize(output_image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            coverage_mask = cv2.resize(coverage_mask.astype(np.uint8), (new_width, new_height), interpolation=cv2.INTER_AREA).astype(bool)
+
         # Save output image
         output_pil = Image.fromarray(output_image)
 
@@ -835,8 +853,14 @@ def main():
     parser.add_argument('--prediction_folder', type=str, help='Path to folder containing prediction images with naming pattern {window_name}_prediction_rotated_{r}_layer_{i}.png', default=None)
     parser.add_argument('--rotation', type=int, help='Optional rotation filter for prediction images (e.g., 0, 90, 180, 270). If not specified, matches any rotation.', default=None)
     parser.add_argument('--layer', type=int, help='Optional layer filter for prediction images (e.g., 0, 1, 2). If not specified, matches any layer.', default=None)
+    parser.add_argument('--scale', type=float, help='Scale factor for output image (0 to 1). Default is 1.0 (no scaling).', default=1.0)
     
     args = parser.parse_args()
+    
+    # Validate scale parameter
+    if args.scale <= 0 or args.scale > 1:
+        print("Error: Scale factor must be between 0 and 1")
+        return
     
     print(f"Stitching renders from {args.original_mesh}")
     if args.image_filename:
@@ -888,7 +912,7 @@ def main():
         else:  # finalize_mesh
             stitcher = FinalizeMeshStitcher(args.original_mesh, args.prediction_folder, args.rotation, args.layer)
         
-        output_path = stitcher.stitch_renders(args.output, args.image_filename)
+        output_path = stitcher.stitch_renders(args.output, args.image_filename, args.scale)
         print(f"Stitching complete! Output saved to: {output_path}")
         
     except Exception as e:
