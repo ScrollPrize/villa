@@ -762,6 +762,16 @@ class FinalizeMeshStitcher:
         
         # Save output image
         output_pil = Image.fromarray(output_image)
+
+        try:
+            output_path_tif = output_path.replace('.jpg', '.tif') # Base was JPG
+            output_pil.save(output_path_tif, compression='tiff_lzw', save_all=True)
+            print(f"Stitched standard TIFF image saved to: {output_path_tif} (LZW lossless)")
+            output_path = output_path_tif
+            return output_path
+        except Exception as e_tiff_lzw:
+            print(f"CRITICAL: Failed to save image in any supported format: {e_tiff_lzw}")
+            print(f"Please check image dimensions and available disk space.")
         
         try:
             print("Attempting to save as JPG...")
@@ -806,12 +816,12 @@ class FinalizeMeshStitcher:
                             print(f"CRITICAL: Failed to save image in any supported format: {e_tiff_lzw}")
                             print(f"Please check image dimensions and available disk space.")
 
-        # Also save coverage mask for debugging (always PNG)
-        coverage_base = os.path.splitext(output_path)[0]
-        coverage_path = f"{coverage_base}_coverage.png"
-        coverage_pil = Image.fromarray((coverage_mask * 255).astype(np.uint8))
-        coverage_pil.save(coverage_path)
-        print(f"Coverage mask saved to: {coverage_path}")
+        # # Also save coverage mask for debugging (always PNG)
+        # coverage_base = os.path.splitext(output_path)[0]
+        # coverage_path = f"{coverage_base}_coverage.png"
+        # coverage_pil = Image.fromarray((coverage_mask * 255).astype(np.uint8))
+        # coverage_pil.save(coverage_path)
+        # print(f"Coverage mask saved to: {coverage_path}")
         
         return output_path
 
