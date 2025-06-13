@@ -1,15 +1,10 @@
 import argparse
-import shutil
+import cupy as cp
+from cupyx.scipy import ndimage as ndi 
 import torch
 from torch import nn
 import torch.nn.functional as F
-import fsspec
 import numpy as np
-import os
-import subprocess
-import time
-import traceback
-from pathlib import Path
 from tqdm.auto import tqdm
 from torch.utils.data import Dataset, DataLoader
 import zarr
@@ -232,8 +227,8 @@ class StructureTensorInferer(Inferer, nn.Module):
     def compute_structure_tensor(self, x: torch.Tensor, sigma=None):
         # x: [N,1,Z,Y,X]
         if sigma is None: sigma = self.sigma
-        if sigma > 0:
-            x = F.conv3d(x, self._gauss3d, padding=(self._pad,)*3)
+        #if sigma > 0:
+        #    x = F.conv3d(x, self._gauss3d, padding=(self._pad,)*3)
 
         # 2) apply Pavel
         gz = F.conv3d(x, self.pavel_kz, padding=(4,2,2))
@@ -364,8 +359,10 @@ class StructureTensorInferer(Inferer, nn.Module):
 
                     # --- dynamic slicing if no channel axis
                     if input_src.ndim == 3:
+                    #    raw = input_src[2000:2128, 2000:2128, 2000:2128].astype('float32')
                         raw = input_src[za:zb, ya:yb, xa:xb].astype('float32')
                     else:
+                    #    raw = input_src[:, 2000:2128, 2000:2128, 2000:2128].astype('float32')
                         raw = input_src[:, za:zb, ya:yb, xa:xb].astype('float32')
                     # ---
 
@@ -373,15 +370,50 @@ class StructureTensorInferer(Inferer, nn.Module):
 
                     # Apply fiber-volume mask if needed
                     if self.volume is not None:
-                        data = (data == self.volume).float()
-
-                    # Ensure shape is [1, C, Zp, Yp, Xp]
-                    if data.ndim == 3:
-                        x = data.unsqueeze(0).unsqueeze(0)   # (1,1,Z,Y,X)
-                    elif data.ndim == 4:
-                        x = data.unsqueeze(0)               # (1,C,Z,Y,X)
+                        masked = (data == self.volume)
                     else:
-                        raise RuntimeError(f"Unexpected data ndim={data.ndim}")
+                        masked = data > 0
+
+                    # Convert PyTorch CUDA tensor to CuPy array without moving to CPU
+                    data_gpu = cp.asarray(masked.contiguous())
+
+                    # Apply EDT on GPU
+                    edt = ndi.distance_transform_edt(data_gpu)
+                    #print("EDT min/max:", edt.min(), edt.max())
+                    #print("Unique values (truncated):", cp.unique(edt)[:10])
+                    # Convert back to PyTorch CUDA tensor
+                    x = (
+                        torch.as_tensor(edt, device=self.device)  # [Z,Y,X] on GPU
+                            .float()
+                            .unsqueeze(0)  # Add channel dim
+                            .unsqueeze(0)  # Add batch dim
+                    )
+
+                    ### Visualization
+                    '''
+                    if i == 0:  # only visualize the first patch
+                        import napari
+                        viewer = napari.Viewer()
+                        # === (3) Pre-Gaussian smoothed version
+                        edt_torch = torch.as_tensor(edt, device=self.device)
+                        if self.sigma > 0:
+                            smoothed = F.conv3d(
+                                edt_torch[None, None, ...].float(),
+                                self._gauss3d, padding=(self._pad,)*3
+                            ).squeeze()
+                            pre_smooth = F.conv3d(
+                                masked[None, None, ...].float(),
+                                self._gauss3d, padding=(self._pad,)*3
+                            ).squeeze()
+                        else:
+                            smoothed = edt_torch
+                            pre_smooth = masked
+                        viewer.add_image(raw.squeeze(), name='Raw', colormap='gray')
+                        viewer.add_image(masked.float().squeeze().cpu(), name='Mask == volume')
+                        viewer.add_image(pre_smooth.squeeze().cpu(), name='Gaussian Smoothed PRE-EDT')
+                        viewer.add_image(cp.asnumpy(edt), name='Distance Transform', contrast_limits=[0, edt.max().get()])
+                        viewer.add_image(smoothed.squeeze().cpu(), name='Gaussian Smoothed EDT')
+                        napari.run()'''
 
                     # Compute over padded patch
                     with torch.no_grad():
@@ -445,7 +477,7 @@ class ChunkDataset(Dataset):
 # solve the eigenvalue problem and sanitize the output
 def _eigh_and_sanitize(M: torch.Tensor):
     # 1) enforce symmetry (numerically more stable? M is already symmetrical)
-    M = 0.5 * (M + M.transpose(-1, -2))
+    # M = 0.5 * (M + M.transpose(-1, -2))
 
     w, v = torch.linalg.eigh(M) 
     # sanitize once
@@ -549,6 +581,9 @@ def _finalize_structure_tensor_torch(
         overwrite=True
     )
 
+    eigenvectors_arr.attrs['layout'] = 'eigenvectors[vector, component, z, y, x]'
+    eigenvectors_arr.attrs['description'] = 'Right-handed orthonormal basis sorted by eigenvalue magnitude'
+    eigenvectors_arr.attrs['swapped_0_1'] = bool(swap_eigenvectors)
     # prepare eigenvalues group
     eigenvalues_arr = root_store.create_dataset(
         'eigenvalues',
@@ -559,7 +594,9 @@ def _finalize_structure_tensor_torch(
         write_empty_chunks=False,
         overwrite=True
     )
-    
+    eigenvalues_arr.attrs['layout'] = 'eigenvalues[index, z, y, x]'
+    eigenvalues_arr.attrs['description'] = 'Eigenvalues sorted ascending (λ0 ≤ λ1 ≤ λ2)'
+
     # build chunk list
     def gen_bounds():
         for z0 in range(0, Z, cz):
