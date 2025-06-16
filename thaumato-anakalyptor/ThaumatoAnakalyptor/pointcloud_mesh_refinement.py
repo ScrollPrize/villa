@@ -710,7 +710,7 @@ def generate_winding_pointclouds(mesh_path,
     
     # Step 1: Process each slab and split into per-winding files
     for slab_idx, slab_path in enumerate(tqdm(slabs, desc="Processing slabs to per-winding files")):
-        points = load_pointcloud_slab(slab_path).astype(np.float16)
+        points = load_pointcloud_slab(slab_path).astype(np.float32)
         # From TA to original coordinates
         if len(points.shape) != 2:
             continue
@@ -1187,6 +1187,31 @@ def create_flattening_downsample_indices(points, is_mesh_flags, downsample_ratio
     print(f"Downsampling for solver: kept {len(kept_mesh)} mesh + {len(kept_slab)} slab = {len(all_kept)} total points")
     
     return all_kept
+
+def save_original_winding_pointclouds(base_path):
+    winding_path = os.path.join(base_path, "windings")
+    flattened_winding_path = os.path.join(base_path, "windings_flattened")
+    # find and order all winding pointclouds
+    winding_files = glob.glob(os.path.join(winding_path, "winding_*.npz"))
+    print(f"Found {len(winding_files)} winding pointclouds.")
+    # Bring the files in order of their winding number
+    winding_files_indices = sorted([int(os.path.basename(wf).split("_")[1].split(".")[0]) for wf in winding_files])
+
+    # Detect first and last windings with mesh vertices
+    for i, winding_idx in tqdm(enumerate(winding_files_indices), desc="Saving original winding pointclouds"):
+        data = load_winding_pointcloud(winding_path, winding_idx)
+        points = data[:,:3]
+        angle = data[:,3]
+        # Save pointcloud
+        path_up = os.path.join(base_path, "windings_original_up", f"winding_{winding_idx}.obj")
+        path_down = os.path.join(base_path, "windings_original_down", f"winding_{winding_idx}.obj")
+        # split in two parts along z. up to 6k and over
+        z_vals = points[:, 2]
+        mask_up = z_vals < 6000.0
+        points_up = points[mask_up]
+        points_down = points[~mask_up] - np.array([0,0,6000.0])
+        save_pointcloud_winding(path_up, winding_idx, points_up)
+        save_pointcloud_winding(path_down, winding_idx, points_down)
 
 def flatten_pointcloud(base_path,
                        k_neighbors=10,
@@ -3349,6 +3374,10 @@ def main():
             display_downsample=args.display_downsample,
             color_by_angle=args.color_by_angle
         )
+    debug = False
+    if debug:
+        save_original_winding_pointclouds(os.path.dirname(args.mesh))
+        return
     if not skip_flattening:
         flattened_winding_path = flatten_pointcloud(
             os.path.dirname(args.mesh),
