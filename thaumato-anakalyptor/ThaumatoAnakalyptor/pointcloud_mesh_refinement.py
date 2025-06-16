@@ -2486,7 +2486,7 @@ def mesh_uv_wraps(filtered_winding_path, output_dir, winding_direction=False, de
         mesh = clean_mesh(mesh,
                       longest_edge_pct=100,
                       area_pct=100,
-                      edge_length_thresh=250)
+                      edge_length_thresh=500)
 
         # Normalize UVs after cleaning and get natural image size
         res = normalize_uvs(mesh, verbose=True)
@@ -2680,7 +2680,7 @@ def mesh_uv_global(filtered_winding_path, output_path, winding_direction=False):
     mesh = clean_mesh(mesh,
                       longest_edge_pct=100,
                       area_pct=100,
-                      edge_length_thresh=250)
+                      edge_length_thresh=500)
 
     # Normalize UVs after cleaning and get natural image size
     mesh, natural_image_size = normalize_uvs(mesh, verbose=True)
