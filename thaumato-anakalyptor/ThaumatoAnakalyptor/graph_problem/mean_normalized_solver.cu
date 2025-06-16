@@ -93,17 +93,18 @@ __global__ void update_nodes_kernel_f_star_step(Node* d_graph, size_t* d_valid_i
         float k_diff = predicted_winding_angle - node.f_star;
         // Normalize step_edge based on distance from target node
         float node_dist = sqrtf(error_k * error_k + k_ * k_);
-        float k_factor = 1.0f / fmaxf(fabsf(k_), 0.00001f);
-        k_factor = - error_k * k_factor;
-        k_factor = fminf(-360.0f, fmaxf(360.0f, k_factor));
+        // float k_factor = 1.0f / fmaxf(fabsf(k_), 0.0000001f);
+        // k_factor = - error_k * k_factor;
+        // k_factor = fminf(-1.0f, fmaxf(1.0f, k_factor));
         float dist_factor = - error_k / node_dist;
-        float abs_dist_factor = fabsf(fmaxf(fabsf(dist_factor), 0.001f) - 0.5f);
-        dist_factor = dist_factor * abs_dist_factor * abs_dist_factor;
+        float dist_f_sign = dist_factor > 0.0f ? 1.0f : -1.0f;
+        float abs_dist_factor = fabsf(fmaxf(fabsf(dist_factor), 0.001f) - 0.30f);
+        dist_factor = dist_f_sign * abs_dist_factor * abs_dist_factor * abs_dist_factor;
         float step_loss = expf(-(k_diff * k_diff) / (2.0f * step_sigma * step_sigma));
         // step_loss = 1.0f; // only for testing, to make scroll windings straight in the end use the bell curve
         // sum_w_f_tilde_k += step_edge * certainty * step_loss * (predicted_winding_angle - node.f_star + 0.5f * d_graph[target_node].f_star_momentum) / 1.5f;
-        // sum_w_f_tilde_k += step_edge * certainty * step_loss * dist_factor;
-        sum_w_f_tilde_k += step_edge * certainty * step_loss * k_factor;
+        sum_w_f_tilde_k += step_edge * certainty * step_loss * (0.8f*dist_factor + 0.3f);
+        // sum_w_f_tilde_k += step_edge * certainty * step_loss * k_factor;
         sum_w += step_edge * certainty * step_loss;
 
         // Calculate node happiness: mean difference between k and target f_tilde - node f_tilde target + target node happiness weighted multiplied by the certainty
