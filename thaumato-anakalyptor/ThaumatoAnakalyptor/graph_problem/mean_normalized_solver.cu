@@ -103,7 +103,7 @@ __global__ void update_nodes_kernel_f_star_step(Node* d_graph, size_t* d_valid_i
         float step_loss = expf(-(k_diff * k_diff) / (2.0f * step_sigma * step_sigma));
         // step_loss = 1.0f; // only for testing, to make scroll windings straight in the end use the bell curve
         // sum_w_f_tilde_k += step_edge * certainty * step_loss * (predicted_winding_angle - node.f_star + 0.5f * d_graph[target_node].f_star_momentum) / 1.5f;
-        sum_w_f_tilde_k += step_edge * certainty * step_loss * (0.8f*dist_factor + 0.3f);
+        sum_w_f_tilde_k += step_edge * certainty * step_loss * (0.8f*dist_factor + 0.5f);
         // sum_w_f_tilde_k += step_edge * certainty * step_loss * k_factor;
         sum_w += step_edge * certainty * step_loss;
 
