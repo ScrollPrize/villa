@@ -3132,31 +3132,18 @@ s32 vs_ply_read(const char *filename,
   f32 *normals = NULL;
   s32 *indices = NULL;
 
+  if (!vertices) goto failure;
+
   if (has_normals) {
     normals = malloc(vertex_count * 3 * sizeof(f32));
-    if (!normals) {
-      free(vertices);
-      fclose(fp);
-      return 1;
-    }
+    if (!normals) goto failure;
   }
 
   if (got_face && face_count > 0) {
     indices = malloc(face_count * 3 * sizeof(s32));
-    if (!indices) {
-      free(vertices);
-      free(normals);
-      fclose(fp);
-      return 1;
-    }
+    if (!indices) goto failure;
   }
 
-  if (!vertices) {
-    free(normals);
-    free(indices);
-    fclose(fp);
-    return 1;
-  }
 
   // Read vertex data
   if (is_binary) {
@@ -3165,26 +3152,16 @@ s32 vs_ply_read(const char *filename,
       double temp[6];  // Temporary buffer for doubles (3 for position, 3 for normals)
       for (s32 i = 0; i < vertex_count; i++) {
         // Read position as double and convert to f32
-        if (fread(temp, sizeof(double), 3, fp) != 3) {
-          free(vertices);
-          free(normals);
-          free(indices);
-          fclose(fp);
-          return 1;
-        }
+        if (fread(temp, sizeof(double), 3, fp) != 3) goto failure;
+
         vertices[i * 3] = (f32)temp[0];
         vertices[i * 3 + 1] = (f32)temp[1];
         vertices[i * 3 + 2] = (f32)temp[2];
 
         // Read normals if present
         if (has_normals) {
-          if (fread(temp, sizeof(double), 3, fp) != 3) {
-            free(vertices);
-            free(normals);
-            free(indices);
-            fclose(fp);
-            return 1;
-          }
+          if (fread(temp, sizeof(double), 3, fp) != 3) goto failure;
+
           normals[i * 3] = (f32)temp[0];
           normals[i * 3 + 1] = (f32)temp[1];
           normals[i * 3 + 2] = (f32)temp[2];
@@ -3194,24 +3171,10 @@ s32 vs_ply_read(const char *filename,
       // Reading floats directly
       for (s32 i = 0; i < vertex_count; i++) {
         // Read position
-        if (fread(&vertices[i * 3], sizeof(f32), 3, fp) != 3) {
-          free(vertices);
-          free(normals);
-          free(indices);
-          fclose(fp);
-          return 1;
-        }
+        if (fread(&vertices[i * 3], sizeof(f32), 3, fp) != 3) goto failure;
 
         // Read normals if present
-        if (has_normals) {
-          if (fread(&normals[i * 3], sizeof(f32), 3, fp) != 3) {
-            free(vertices);
-            free(normals);
-            free(indices);
-            fclose(fp);
-            return 1;
-          }
-        }
+        if (has_normals && fread(&normals[i * 3], sizeof(f32), 3, fp) != 3) goto failure;
       }
     }
   } else {
@@ -3221,13 +3184,9 @@ s32 vs_ply_read(const char *filename,
       if (has_normals) {
         if (fscanf(fp, "%lf %lf %lf %lf %lf %lf",
                    &temp[0], &temp[1], &temp[2],
-                   &temp[3], &temp[4], &temp[5]) != 6) {
-          free(vertices);
-          free(normals);
-          free(indices);
-          fclose(fp);
-          return 1;
-        }
+                   &temp[3], &temp[4], &temp[5]) != 6)
+	  goto failure;
+         
         vertices[i * 3] = (f32)temp[0];
         vertices[i * 3 + 1] = (f32)temp[1];
         vertices[i * 3 + 2] = (f32)temp[2];
@@ -3236,13 +3195,9 @@ s32 vs_ply_read(const char *filename,
         normals[i * 3 + 2] = (f32)temp[5];
       } else {
         if (fscanf(fp, "%lf %lf %lf",
-                   &temp[0], &temp[1], &temp[2]) != 3) {
-          free(vertices);
-          free(normals);
-          free(indices);
-          fclose(fp);
-          return 1;
-        }
+                   &temp[0], &temp[1], &temp[2]) != 3)
+	  goto failure;
+        
         vertices[i * 3] = (f32)temp[0];
         vertices[i * 3 + 1] = (f32)temp[1];
         vertices[i * 3 + 2] = (f32)temp[2];
@@ -3256,44 +3211,22 @@ s32 vs_ply_read(const char *filename,
     if (is_binary) {
       for (s32 i = 0; i < face_count; i++) {
         unsigned char vertex_per_face;
-        if (fread(&vertex_per_face, sizeof(unsigned char), 1, fp) != 1 || vertex_per_face != 3) {
-          free(vertices);
-          free(normals);
-          free(indices);
-          fclose(fp);
-          return 1;
-        }
 
-        if (fread(&indices[index_count], sizeof(s32), 3, fp) != 3) {
-          free(vertices);
-          free(normals);
-          free(indices);
-          fclose(fp);
-          return 1;
-        }
+        if (fread(&vertex_per_face, sizeof(unsigned char), 1, fp) != 1 || vertex_per_face != 3) goto failure;
+        if (fread(&indices[index_count], sizeof(s32), 3, fp) != 3) goto failure;
+        
         index_count += 3;
       }
     } else {
       for (s32 i = 0; i < face_count; i++) {
         s32 vertex_per_face;
-        if (fscanf(fp, "%d", &vertex_per_face) != 1 || vertex_per_face != 3) {
-          free(vertices);
-          free(normals);
-          free(indices);
-          fclose(fp);
-          return 1;
-        }
+        if (fscanf(fp, "%d", &vertex_per_face) != 1 || vertex_per_face != 3) goto failure;
 
         if (fscanf(fp, "%d %d %d",
                    &indices[index_count],
                    &indices[index_count + 1],
-                   &indices[index_count + 2]) != 3) {
-          free(vertices);
-          free(normals);
-          free(indices);
-          fclose(fp);
-          return 1;
-        }
+                   &indices[index_count + 2]) != 3)
+			  goto failure;
         index_count += 3;
       }
     }
@@ -3309,6 +3242,13 @@ s32 vs_ply_read(const char *filename,
   *out_index_count = index_count;
 
   return 0;
+
+failure:
+  free(vertices);
+  free(normals);
+  free(indices);
+  fclose(fp);
+  return 1;
 }
 
 // ppm
@@ -4737,9 +4677,11 @@ chunk* vs_zarr_read_chunk(char* path, zarr_metadata metadata) {
     fseek(fp, 0, SEEK_SET);
     u8* compressed_data = malloc(size);
     fread(compressed_data,1,size,fp);
+    chunk* ret = vs_zarr_decompress_chunk(size, compressed_data, metadata);
 
-    chunk* ret= vs_zarr_decompress_chunk(size, compressed_data, metadata);
     free(compressed_data);
+    fclose(fp);
+
     return ret;
 }
 
@@ -4788,7 +4730,6 @@ chunk* vs_zarr_decompress_chunk(long size, void* compressed_data, zarr_metadata 
 
     return ret;
 }
-
 
 int vs_zarr_write_chunk(char *path, zarr_metadata metadata, chunk* c) {
     // the directory to the file path might not exist so we will mkdir for it here
