@@ -165,7 +165,13 @@ __global__ void flattening_update_kernel(
         const Node& nb = d_graph[edge.target_node];
         if (nb.deleted) continue;
         float dz = nb.f_init - node.f_init;
+        float z_side = nb.wnr_side - node.wnr_side; // this holds original z value
+        bool wrong_z_side = dz * z_side < 0.0f;
+        float z_factor = wrong_z_side ? 0.1f : 1.0f;
         float ds = nb.f_star - node.f_star;
+        float angle_side = nb.wnr_side_old - node.wnr_side_old; // this holds original angle value
+        bool wrong_angle_side = ds * angle_side < 0.0f && a_max > a_min;
+        float angle_factor = wrong_angle_side ? 0.1f : 1.0f;
         // Accumulate initial-z difference tug
         float dist = sqrtf(dz*dz + ds*ds);
         if (dist == 0.0f) {
@@ -211,8 +217,9 @@ __global__ void flattening_update_kernel(
         
         float ux = dz / dist;
         float us = ds / dist;
-        acc_z += error * ux * sign * force_multiplier;
-        acc_s += error * us * sign * force_multiplier;
+        float error_factor = fmaxf(1.0f, error / dist);
+        acc_z += error * error_factor * error_factor * ux * sign * force_multiplier * z_factor;
+        acc_s += error * error_factor * error_factor * us * sign * force_multiplier * angle_factor;
         sum_w += 1.0f;
     }
     
@@ -312,11 +319,13 @@ __global__ void flattening_update_kernel(
         
     float step_z = acc_z / sum_w + angle_acc_z / angle_sum_w;
     float step_s = acc_s / sum_w + angle_acc_s / angle_sum_w;
+    step_z *= 0.25f;
+    step_s *= 0.25f;
     
     // Additional z tug (only if a non-zero interval is specified)
     if (z_max > z_min) {
-        if (node.wnr_side > z_max)      step_z += tug_step;
-        else if (node.wnr_side < z_min) step_z -= tug_step;
+        if (node.wnr_side > z_max)      step_z += 3 * tug_step;
+        else if (node.wnr_side < z_min) step_z -= 3 * tug_step;
     }
     // Additional angle tug (only if a non-zero interval is specified)
     if (a_max > a_min) {
