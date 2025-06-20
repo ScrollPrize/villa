@@ -1262,8 +1262,8 @@ class WalkToSheet():
         result_ts = []
         result_normals = []
         for i in range(len(ordered_pointset)):
-            result_ts.append([None]*len(ordered_pointset[i]))
-            result_normals.append([None]*len(ordered_pointset[i]))
+            result_ts.append([None for _ in range(len(ordered_pointset[i]))])
+            result_normals.append([None for _ in range(len(ordered_pointset[i]))])
             
         for i in tqdm(range(len(ordered_pointset))):
             curve_angle_vector = angle_vector[i]
@@ -1294,8 +1294,8 @@ class WalkToSheet():
         result_ts = []
         result_normals = []
         for i in range(len(ordered_pointset)):
-            result_ts.append([None]*len(ordered_pointset[i]))
-            result_normals.append([None]*len(ordered_pointset[i]))
+            result_ts.append([None for _ in range(len(ordered_pointset[i]))])
+            result_normals.append([None for _ in range(len(ordered_pointset[i]))])
             
         args = []
         list_same_v_i = []
@@ -1655,6 +1655,7 @@ class WalkToSheet():
                 interpolated_normals = [interpolated_normals[i] for i in interpolated_subsample_indices]
                 ordered_umbilicus_points_ = [ordered_umbilicus_points_[i] for i in interpolated_subsample_indices]
                 angle_vector = [angle_vector[i] for i in interpolated_subsample_indices]
+                valid_angles = [valid_angles[i] for i in interpolated_subsample_indices]
 
                 print("Finished Cpp rolled_ordered_pointset")
 
