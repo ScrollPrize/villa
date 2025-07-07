@@ -1,5 +1,5 @@
 # Python venvs, IDE files, build artifacts
-**/.venv/
+**/.venv*/
 **/.idea/*
 *.pyc
 *.tif
