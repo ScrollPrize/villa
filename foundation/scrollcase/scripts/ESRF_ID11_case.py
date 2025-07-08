@@ -1,9 +1,10 @@
 from pathlib import Path
 
-from build123d import *
-import scrollcase as sc
-from ocp_vscode import show, Camera
+from build123d import *  # type: ignore
 from meshlib import mrmeshpy as mm
+from ocp_vscode import show, Camera
+
+import scrollcase as sc
 
 NO_SCROLL = 0
 
@@ -18,12 +19,12 @@ def build_case():
 
     show(case, reset_camera=Camera.KEEP)
 
-    return case
+    return left, right
 
 
-case = build_case()
+left, right = build_case()
 
 # Convert to mesh
 # case_mesh = sc.mesh.brep_to_mesh(case.solids()[0])
 
-# mm.saveMesh(disc_mesh, Path("disc.stl"))
+# mm.saveMesh(disc_mesh, Path("ESRF_ID11_case.stl"))

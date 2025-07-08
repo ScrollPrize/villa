@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import logging
 
-from build123d import *
+from build123d import *  # type: ignore
 
 from . import curved_divider_wall
 
@@ -455,7 +455,7 @@ def ESRF_ID11_base(case: ScrollCaseConfig):
     return ESRF_ID11_base_part
 
 
-def build_case(case: ScrollCaseConfig) -> tuple[Solid, Solid]:
+def build_case(config: ScrollCaseConfig) -> tuple[Solid, Solid]:
     """Build the scroll case.
 
     Args:
@@ -465,73 +465,85 @@ def build_case(case: ScrollCaseConfig) -> tuple[Solid, Solid]:
         tuple[Solid, Solid]: The left and right halves of the scroll case.
     """
     logger.info(
-        f"Constructing case with scroll radius: {case.scroll_radius_mm}, height: {case.scroll_height_mm}"
+        f"Constructing case with scroll radius: {config.scroll_radius_mm}, height: {config.scroll_height_mm}"
     )
 
-    with BuildPart(Location((0, 0, case.cylinder_bottom))) as case_part:
+    with BuildPart(Location((0, 0, config.cylinder_bottom))) as case:
         # Top and bottom caps
-        with Locations((0, 0, case.cylinder_height)):
-            add(top_cap(case))
-        with Locations((0, 0, -case.square_height_mm)):
-            add(bottom_cap(case))
+        with Locations((0, 0, config.cylinder_height)):
+            add(top_cap(config))
+        with Locations((0, 0, -config.square_height_mm)):
+            add(bottom_cap(config))
 
         with BuildPart() as divider_wall:
             with BuildLine() as spline_ln:
                 ln = curved_divider_wall.divider_curve(
-                    case.lining_outer_radius,
-                    case.wall_thickness_mm,
+                    config.lining_outer_radius,
+                    config.wall_thickness_mm,
                 )
+                assert ln is type(Edge)
                 tangent = ln % 0.5
                 orthogonal_plane = Plane(
-                    origin=(0, 0, case.cylinder_bottom),
+                    origin=(0, 0, config.cylinder_bottom),
                     z_dir=tangent,
                 )
             with BuildSketch(orthogonal_plane) as spline_sk:
                 Rectangle(
-                    case.wall_thickness_mm * 2,
-                    case.cylinder_height,
+                    config.wall_thickness_mm * 2,
+                    config.cylinder_height,
                     align=(Align.CENTER, Align.MAX),
                 )
             sweep()
 
             with BuildSketch(
                 Plane(
-                    origin=(0, 0, case.cylinder_bottom),
+                    origin=(0, 0, config.cylinder_bottom),
                     z_dir=(0, 0, 1),
                 )
             ):
                 with Locations(
-                    (-case.lining_outer_radius + case.wall_thickness_mm, 0),
-                    (case.lining_outer_radius - case.wall_thickness_mm, 0),
+                    (-config.lining_outer_radius + config.wall_thickness_mm, 0),
+                    (config.lining_outer_radius - config.wall_thickness_mm, 0),
                 ):
-                    Circle(case.wall_thickness_mm)
-            extrude(amount=case.cylinder_height)
+                    Circle(config.wall_thickness_mm)
+            extrude(amount=config.cylinder_height)
 
         divider_solid_part = curved_divider_wall.divider_solid(
-            case.lining_outer_radius,
-            case.square_loft_radius,
-            case.wall_thickness_mm,
-        ).part.move(Location((0, 0, case.cylinder_bottom - case.square_height_mm)))
+            config.lining_outer_radius,
+            config.square_loft_radius,
+            config.wall_thickness_mm,
+        ).part
+        assert divider_solid_part is not None
+        divider_solid_part = divider_solid_part.move(
+            Location((0, 0, config.cylinder_bottom - config.square_height_mm))
+        )
 
-        left = case_part.part - divider_solid_part
-        right = case_part.part & divider_solid_part
+        case_part = case.part
+        assert case_part is not None
+        left = case_part - divider_solid_part
+        right = case_part & divider_solid_part
 
     # Base
     with BuildPart(
-        Location((0, 0, case.cylinder_bottom - case.square_height_mm))
+        Location((0, 0, config.cylinder_bottom - config.square_height_mm))
     ) as base_disc:
-        add(mount_disc(case))
+        add(mount_disc(config))
 
         # Extra space at bottom of right case half
-        with Locations((0, 0, -case.right_cap_buffer)):
+        with Locations((0, 0, -config.right_cap_buffer)):
             remove_part = curved_divider_wall.divider_solid(
-                case.lining_outer_radius,
-                case.square_loft_radius,
-                case.wall_thickness_mm,
+                config.lining_outer_radius,
+                config.square_loft_radius,
+                config.wall_thickness_mm,
             ).part
+            assert remove_part is not None
             add(remove_part, mode=Mode.SUBTRACT)
 
-    left = left.solid() + base_disc.solid()
+    left = left.solid()
+    assert left is type(Solid)
+    left += base_disc.solid()
+
     right = right.solid()
+    assert right is type(Solid)
 
     return left, right
