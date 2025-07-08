@@ -40,7 +40,9 @@ def build_case(config: sc.case.ScrollCaseConfig):
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("mesh", nargs="?", default=None)
+    parser.add_argument("--mesh", type=Path)
+    parser.add_argument("--output-dir", default="test_output")
+    parser.add_argument("--scroll-name", default="TEST_SCROLL")
     args = parser.parse_args()
 
     if args.mesh is None:
@@ -55,7 +57,7 @@ if __name__ == "__main__":
 
         show(case_left, case_right, reset_camera=Camera.KEEP)
     else:
-        assert Path.is_file(Path(args.mesh))
+        assert args.mesh.is_file()
         scroll_mesh = sc.mesh.ScrollMesh(args.mesh)
         (
             _,
@@ -81,7 +83,7 @@ if __name__ == "__main__":
         ) = sc.mesh.build_lining(scroll_mesh)
 
         config = sc.case.ScrollCaseConfig(
-            height, radius, label_line_1=f"PHercTODO", label_line_2="v1"
+            height, radius, label_line_1=f"PHerc{args.scroll_name}", label_line_2="v1"
         )
         case_left, case_right = build_case(config)
 
@@ -93,11 +95,10 @@ if __name__ == "__main__":
             case_left, cavity_mesh_neg, lining_mesh_neg
         )
 
-        output_dir = "herp"
-        padded_scroll = "derp"
-        scroll_stl_path = Path(output_dir) / f"{padded_scroll}_scroll.stl"
-        right_stl_path = Path(output_dir) / f"{padded_scroll}_right.stl"
-        left_stl_path = Path(output_dir) / f"{padded_scroll}_left.stl"
+        scroll_stl_path = Path(args.output_dir) / f"{args.scroll_name}_scroll.stl"
+        right_stl_path = Path(args.output_dir) / f"{args.scroll_name}_right.stl"
+        left_stl_path = Path(args.output_dir) / f"{args.scroll_name}_left.stl"
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         mm.saveMesh(mesh_scroll, scroll_stl_path)
         mm.saveMesh(combined_mesh_right, right_stl_path)
         mm.saveMesh(combined_mesh_left, left_stl_path)
