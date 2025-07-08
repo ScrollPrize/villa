@@ -88,6 +88,18 @@ class ScrollCaseConfig:
         )
 
     @property
+    def id11_cylinder_height(self):
+        return (
+            60
+            + self.scroll_height_mm / 2
+            + self.lining_offset_mm
+            + self.wall_thickness_mm
+            + self.lining_offset_mm
+            + self.m4_nut_diameter_mm
+            + self.lining_offset_mm
+        )
+
+    @property
     def cylinder_bottom(self):
         return -self.lining_offset_mm - self.wall_thickness_mm - self.lower_margin_mm
 
