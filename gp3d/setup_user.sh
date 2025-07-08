@@ -44,15 +44,6 @@ $MINICONDA_PREFIX/bin/conda init bash
 print_status "Updating conda..."
 conda update -n base -c defaults conda -y
 
-print_status "Creating Python 3.12 environment..."
-conda create -n py312 python=3.12 -y
-
-print_status "Activating py312 environment..."
-conda activate py312
-
-print_status "Installing PyTorch with CUDA support..."
-pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-
 print_status "Updating all conda packages..."
 conda update --all -y
 
@@ -64,8 +55,9 @@ pip list --outdated --format=json | \
     python3 -c "import json, sys; print('\n'.join([x['name'] for x in json.load(sys.stdin)]))" | \
     xargs -n1 pip install -U 2>/dev/null || true
 
-print_status "Verifying PyTorch CUDA support..."
-python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA version: {torch.version.cuda if torch.cuda.is_available() else \"N/A\"}'); print(f'GPU count: {torch.cuda.device_count() if torch.cuda.is_available() else 0}')"
+print_status "Installing PyTorch with CUDA support..."
+pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
 
 print_status "Python environment setup complete!"
 print_status ""

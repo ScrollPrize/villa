@@ -5,8 +5,20 @@ from tqdm import tqdm
 from numcodecs import Blosc
 import math
 import os
-import os
 import time
+import argparse
+import re
+
+
+def extract_uuid_from_url(url):
+    """Extract UUID from URL pattern like .../UUID/surface_volume/1 or .../UUID/ink_labels/1"""
+    # Match pattern for UUID followed by either surface_volume or ink_labels
+    pattern = r'/([^/]+)/(surface_volume|ink_labels)/\d+/?$'
+    match = re.search(pattern, url)
+    if match:
+        return match.group(1)
+    else:
+        raise ValueError(f"Could not extract UUID from URL: {url}")
 
 
 def download_zarr_with_conversion(remote_url, local_path, fetch_chunk_size=(64, 512, 512)):
@@ -137,6 +149,56 @@ def download_zarr_with_conversion(remote_url, local_path, fetch_chunk_size=(64, 
     print(f"Chunks: {local_array.chunks}")
     print(f"Compressor: {local_array.compressor}")
 
+
+def main():
+    parser = argparse.ArgumentParser(description='Download and convert WebKnossos zarr data')
+    parser.add_argument('--surface_volume', required=True,
+                        help='URL to surface volume data (e.g., http://path.com/to/UUID/surface_volume/1)')
+    parser.add_argument('--ink_labels', required=True,
+                        help='URL to ink labels data (e.g., http://path.com/to/UUID/ink_labels/1)')
+
+    args = parser.parse_args()
+
+    # Extract UUID from URLs
+    try:
+        surface_uuid = extract_uuid_from_url(args.surface_volume)
+        ink_uuid = extract_uuid_from_url(args.ink_labels)
+
+        # Verify both URLs have the same UUID
+        if surface_uuid != ink_uuid:
+            print(f"Warning: Different UUIDs detected in URLs!")
+            print(f"Surface volume UUID: {surface_uuid}")
+            print(f"Ink labels UUID: {ink_uuid}")
+            print("Using surface volume UUID for output paths...")
+
+        uuid = surface_uuid
+
+    except ValueError as e:
+        print(f"Error: {e}")
+        return
+
+    # Create output directories if they don't exist
+    fragments_dir = "/vesuvius/fragments"
+    inklabels_dir = "/vesuvius/inklabels"
+
+    os.makedirs(fragments_dir, exist_ok=True)
+    os.makedirs(inklabels_dir, exist_ok=True)
+
+    # Construct output paths
+    surface_output = os.path.join(fragments_dir, f"{uuid}.zarr")
+    ink_output = os.path.join(inklabels_dir, f"{uuid}.zarr")
+
+    print(f"\nExtracted UUID: {uuid}")
+    print(f"Surface volume will be saved to: {surface_output}")
+    print(f"Ink labels will be saved to: {ink_output}")
+    print("")
+
+    # Download surface volume
+    download_zarr_with_conversion(args.surface_volume, surface_output)
+
+    # Download ink labels
+    download_zarr_with_conversion(args.ink_labels, ink_output)
+
+
 if __name__ == '__main__':
-    download_zarr_with_conversion("http://dl.ash2txt.org:8080/data/annotations/zarr/YRkpZecXiB57JOGm/surface_volume/1", f"/vesuvius/fragments/YRkpZecXiB57JOGm.zarr")
-    download_zarr_with_conversion("http://dl.ash2txt.org:8080/data/annotations/zarr/YRkpZecXiB57JOGm/ink_labels/1", f"/vesuvius/inklabels/YRkpZecXiB57JOGm.zarr")
+    main()
