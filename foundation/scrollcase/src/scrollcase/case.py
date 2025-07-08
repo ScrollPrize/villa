@@ -34,6 +34,7 @@ class ScrollCaseConfig:
     square_edge_fillet: float = 6.25
     right_cap_buffer: float = 0.5
 
+    m4_clearance_hole_diameter_tight_mm: float = 4.3
     m4_clearance_hole_diameter_very_loose_mm: float = 5
     m4_head_counter_bore_diameter_mm: float = 8
     m4_head_counter_bore_depth_mm: float = 2
@@ -62,6 +63,11 @@ class ScrollCaseConfig:
 
     # Tomo stage bolt holes
     tomo_stage_bolt_hole_spacing_from_center_mm: float = 25
+
+    # ESRF ID11 base params
+    esrf_id11_diffractometer_plate_width_mm: float = 100
+    esrf_id11_diffractometer_bolt_short_spacing_mm: float = 40
+    esrf_id11_diffractometer_bolt_long_spacing_mm: float = 86
 
     @property
     def lining_outer_radius(self):
@@ -302,6 +308,151 @@ def bottom_cap(
         extrude(amount=-case.text_depth_mm, mode=Mode.SUBTRACT)
 
     return bottom_cap_part
+
+
+def ESRF_ID11_base(case: ScrollCaseConfig):
+    with BuildPart() as ESRF_ID11_base_part:
+        with BuildSketch():
+            with BuildLine():
+                Line(
+                    (
+                        -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                        case.esrf_id11_diffractometer_plate_width_mm / 2,
+                    ),
+                    (
+                        case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                        case.esrf_id11_diffractometer_plate_width_mm / 2,
+                    ),
+                )
+                Line(
+                    (
+                        case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                        case.esrf_id11_diffractometer_plate_width_mm / 2,
+                    ),
+                    (
+                        case.esrf_id11_diffractometer_plate_width_mm / 2,
+                        case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                    ),
+                )
+                Line(
+                    (
+                        case.esrf_id11_diffractometer_plate_width_mm / 2,
+                        case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                    ),
+                    (
+                        case.esrf_id11_diffractometer_plate_width_mm / 2,
+                        -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                    ),
+                )
+                Line(
+                    (
+                        case.esrf_id11_diffractometer_plate_width_mm / 2,
+                        -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                    ),
+                    (
+                        case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                        -case.esrf_id11_diffractometer_plate_width_mm / 2,
+                    ),
+                )
+                Line(
+                    (
+                        case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                        -case.esrf_id11_diffractometer_plate_width_mm / 2,
+                    ),
+                    (
+                        -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                        -case.esrf_id11_diffractometer_plate_width_mm / 2,
+                    ),
+                )
+                Line(
+                    (
+                        -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                        -case.esrf_id11_diffractometer_plate_width_mm / 2,
+                    ),
+                    (
+                        -case.esrf_id11_diffractometer_plate_width_mm / 2,
+                        -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                    ),
+                )
+                Line(
+                    (
+                        -case.esrf_id11_diffractometer_plate_width_mm / 2,
+                        -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                    ),
+                    (
+                        -case.esrf_id11_diffractometer_plate_width_mm / 2,
+                        case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                    ),
+                )
+                Line(
+                    (
+                        -case.esrf_id11_diffractometer_plate_width_mm / 2,
+                        case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                    ),
+                    (
+                        -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                        case.esrf_id11_diffractometer_plate_width_mm / 2,
+                    ),
+                )
+            make_face()
+        extrude(amount=case.square_height_mm)
+
+        with Locations(
+            (
+                -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                case.esrf_id11_diffractometer_bolt_long_spacing_mm / 2,
+                case.square_height_mm,
+            ),
+            (
+                case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                case.esrf_id11_diffractometer_bolt_long_spacing_mm / 2,
+                case.square_height_mm,
+            ),
+            (
+                case.esrf_id11_diffractometer_bolt_long_spacing_mm / 2,
+                case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                case.square_height_mm,
+            ),
+            (
+                case.esrf_id11_diffractometer_bolt_long_spacing_mm / 2,
+                -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                case.square_height_mm,
+            ),
+            (
+                case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                -case.esrf_id11_diffractometer_bolt_long_spacing_mm / 2,
+                case.square_height_mm,
+            ),
+            (
+                -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                -case.esrf_id11_diffractometer_bolt_long_spacing_mm / 2,
+                case.square_height_mm,
+            ),
+            (
+                -case.esrf_id11_diffractometer_bolt_long_spacing_mm / 2,
+                -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                case.square_height_mm,
+            ),
+            (
+                -case.esrf_id11_diffractometer_bolt_long_spacing_mm / 2,
+                case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                case.square_height_mm,
+            ),
+        ):
+            Cylinder(
+                case.m4_clearance_hole_diameter_tight_mm / 2,
+                case.square_height_mm,
+                mode=Mode.SUBTRACT,
+                align=(Align.CENTER, Align.CENTER, Align.MAX),
+            )
+            Cylinder(
+                case.m4_head_counter_bore_diameter_mm / 2,
+                case.m4_head_counter_bore_depth_mm,
+                mode=Mode.SUBTRACT,
+                align=(Align.CENTER, Align.CENTER, Align.MAX),
+            )
+
+    return ESRF_ID11_base_part
 
 
 def build_case(case: ScrollCaseConfig) -> tuple[Solid, Solid]:
