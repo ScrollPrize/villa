@@ -69,6 +69,7 @@ rm cuda-keyring_1.1-1_all.deb
 apt update
 apt install -y nvidia-driver-570
 apt install -y cuda-toolkit-12-8
+apt install -y cudnn9-cuda-12
 
 print_status "Configuring NVMe drives..."
 

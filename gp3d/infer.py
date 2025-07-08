@@ -1,4 +1,5 @@
 import os
+import argparse
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -235,26 +236,42 @@ def inference_worker(rank, world_size, checkpoint_path, fragment_id):
 
 
 def main():
-    world_size = torch.cuda.device_count()
-    if world_size == 0:
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Run ink detection inference on a fragment')
+    parser.add_argument('checkpoint_path', type=str,
+                        help='Path to the model checkpoint (.ckpt file)')
+    parser.add_argument('fragment_id', type=str,
+                        help='Fragment ID to process (e.g., 20231005123336)')
+    parser.add_argument('--gpus', type=int, default=None,
+                        help='Number of GPUs to use (default: all available)')
+
+    args = parser.parse_args()
+
+    # Determine number of GPUs to use
+    available_gpus = torch.cuda.device_count()
+    if available_gpus == 0:
         print("No CUDA devices found!")
         return
 
-    print(f"Found {world_size} CUDA devices")
+    if args.gpus is None:
+        world_size = available_gpus
+    else:
+        world_size = min(args.gpus, available_gpus)
 
-    # Configuration
-    checkpoint_path = "/vesuvius/inkdet_outputs/resnet3d50_epoch=76.ckpt"
-    fragment_id = "20231005123336"
+    print(f"Found {available_gpus} CUDA devices, using {world_size}")
 
     # Check if checkpoint exists
-    if not os.path.exists(checkpoint_path):
-        print(f"Checkpoint not found: {checkpoint_path}")
+    if not os.path.exists(args.checkpoint_path):
+        print(f"Checkpoint not found: {args.checkpoint_path}")
         return
+
+    print(f"Checkpoint: {args.checkpoint_path}")
+    print(f"Fragment ID: {args.fragment_id}")
 
     # Run distributed inference
     mp.spawn(
         inference_worker,
-        args=(world_size, checkpoint_path, fragment_id),
+        args=(world_size, args.checkpoint_path, args.fragment_id),
         nprocs=world_size,
         join=True
     )

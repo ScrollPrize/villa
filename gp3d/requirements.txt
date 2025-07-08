@@ -8,8 +8,12 @@ opencv-python
 scikit-image
 scipy
 tqdm
-zarr
+zarr==2.18.7
 numcodecs
 numba
 webknossos
 pytorch-warmup
+webknossos[all]==0.16.2
+warmup_scheduler
+transformer_engine[pytorch]
+einops
