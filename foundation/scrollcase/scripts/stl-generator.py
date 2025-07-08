@@ -24,10 +24,10 @@ import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+from meshlib import mrmeshpy as mm
 from tqdm import tqdm
 
 from scrollcase import mesh, case
-from meshlib import mrmeshpy as mm  # for saving STL files
 
 
 def pad_scroll_name(scroll_number: str) -> str:
