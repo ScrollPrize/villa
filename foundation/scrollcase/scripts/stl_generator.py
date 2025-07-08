@@ -1,6 +1,6 @@
 # Giorgio Angelotti, 2025
 """
-stl-generator.py
+stl_generator.py
 
 A script to generate and export final STL models for all scroll cases found in a given input root directory.
 Each subfolder in the input directory should be named as the scroll number and contain a file named
@@ -15,7 +15,7 @@ Additionally, a CSV summary (scroll_summary.csv) is created in the output root w
    "Scroll ID", "Height (mm)", "Diameter (mm)"
 
 Usage:
-    python stl-generator.py --input /path/to/scrolls --output /path/to/output
+    python stl_generator.py --input /path/to/scrolls --output /path/to/output
 """
 
 import argparse
