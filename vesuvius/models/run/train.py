@@ -368,6 +368,16 @@ class BaseTrainer:
         scaler = self._get_scaler(device.type, use_amp=use_amp)
         train_dataloader, val_dataloader, train_indices, val_indices = self._configure_dataloaders(train_dataset, val_dataset)
 
+        # Initialise wandb if wandb_project is set
+        if self.mgr.wandb_project:
+            import wandb  # lazy import in case it's not available
+            wandb.init(
+                entity=self.mgr.wandb_entity,
+                project=self.mgr.wandb_project,
+                group=self.mgr.model_name,
+                config=self.mgr.convert_to_dict()
+            )
+
         if model.save_config:
             self.mgr.save_config()
 
@@ -613,7 +623,16 @@ class BaseTrainer:
 
                     # Scale loss by accumulation steps to maintain same effective batch size
                     total_loss = total_loss / grad_accumulate_n
-                
+
+                if self.mgr.wandb_project:
+                    wandb.log({
+                        **{
+                            f"loss_{t_name}": epoch_losses[t_name][-1]
+                            for t_name in self.mgr.targets
+                        },
+                        "loss_total": total_loss.detach().cpu().item()
+                    })
+
                 # backward 
                 scaler.scale(total_loss).backward()
 
@@ -1283,6 +1302,10 @@ def update_config_from_args(mgr, args):
             print(f"Mask ratio: {args.mask_ratio}")
             if args.mask_patch_size:
                 print(f"Mask patch size: {mask_patch_size}")
+    
+    # Handle Weights & Biases arguments
+    mgr.wandb_project = args.wandb_project
+    mgr.wandb_entity = args.wandb_entity
 
 
 def main():
@@ -1351,6 +1374,12 @@ def main():
                        help="Learning rate scheduler type (default: from config or 'poly')")
     parser.add_argument("--warmup-steps", type=int,
                        help="Number of warmup steps for cosine_warmup scheduler (default: 10%% of first cycle)")
+    
+    # Weights & Biases arguments
+    parser.add_argument("--wandb-project", type=str, default=None,
+                       help="Weights & Biases project name (default: from config; wandb logging disabled if not set anywhere)")
+    parser.add_argument("--wandb-entity", type=str, default=None,
+                       help="Weights & Biases team/username (default: from config)")
 
     args = parser.parse_args()
 
