@@ -35,12 +35,17 @@ class ScrollCaseConfig:
     square_height_mm: float = 10
     square_edge_fillet: float = 6.25
     right_cap_buffer: float = 0.5
-    # Based on M4 bolts
-    cap_bolt_hole_diameter_mm: float = 5
-    cap_bolt_counter_bore_diameter_mm: float = 8
-    cap_bolt_counter_bore_depth_mm: float = 2
-    cap_bolt_nut_diameter_mm: float = 9
-    cap_bolt_nut_depth_mm: float = 3.5
+
+    m4_clearance_hole_diameter_very_loose_mm: float = 5
+    m4_head_counter_bore_diameter_mm: float = 8
+    m4_head_counter_bore_depth_mm: float = 2
+    m4_nut_diameter_mm: float = 9
+    m4_nut_depth_mm: float = 3.5
+
+    m6_clearance_hole_diameter_semi_loose_mm: float = 6.8
+    m6_head_counter_bore_diameter_mm: float = 10.5
+    m6_head_counter_bore_depth_mm: float = 5
+    m6_clearance_hole_diameter_for_tapping_mm: float = 5.2
 
     # Mounting disc
     mount_disc_diameter_mm: float = 112.5
@@ -54,12 +59,8 @@ class ScrollCaseConfig:
     text_font_size: float = 8
     text_depth_mm: float = 0.5
 
-    # Base bolt holes (based on M6)
-    base_bolt_hole_diameter_mm: float = 6.8
-    base_bolt_hole_counter_bore_diameter_mm: float = 10.5
-    base_bolt_hole_counter_bore_depth_mm: float = 5
+    # Base bolt holes
     base_bolt_hole_spacing_from_center_mm: float = 50
-    base_bolt_hole_diameter_for_tapping_mm: float = 5.2
 
     # Tomo stage bolt holes
     tomo_stage_bolt_hole_spacing_from_center_mm: float = 25
@@ -176,7 +177,7 @@ def cap(case: ScrollCaseConfig, with_bolt_protrusions: bool = True):
                 ),
             ):
                 Cylinder(
-                    case.cap_bolt_hole_diameter_mm / 2,
+                    case.m4_clearance_hole_diameter_very_loose_mm / 2,
                     4 * case.square_height_mm,
                     rotation=(90, 0, 0),
                     mode=Mode.SUBTRACT,
@@ -186,17 +187,17 @@ def cap(case: ScrollCaseConfig, with_bolt_protrusions: bool = True):
             with Locations(
                 (
                     -case.square_loft_radius - case.square_height_mm / 2,
-                    case.square_height_mm - case.cap_bolt_counter_bore_depth_mm,
+                    case.square_height_mm - case.m4_head_counter_bore_depth_mm,
                     case.square_height_mm / 2,
                 ),
                 (
                     case.square_loft_radius + case.square_height_mm / 2,
-                    case.square_height_mm - case.cap_bolt_counter_bore_depth_mm,
+                    case.square_height_mm - case.m4_head_counter_bore_depth_mm,
                     case.square_height_mm / 2,
                 ),
             ):
                 Cylinder(
-                    case.cap_bolt_counter_bore_diameter_mm / 2,
+                    case.m4_head_counter_bore_diameter_mm / 2,
                     2 * case.square_height_mm,
                     mode=Mode.SUBTRACT,
                     rotation=(90, 0, 0),
@@ -207,18 +208,16 @@ def cap(case: ScrollCaseConfig, with_bolt_protrusions: bool = True):
             with Locations(
                 (
                     -case.square_loft_radius - case.square_height_mm / 2,
-                    -case.square_height_mm + case.cap_bolt_nut_depth_mm,
+                    -case.square_height_mm + case.m4_nut_depth_mm,
                     case.square_height_mm / 2,
                 ),
                 (
                     case.square_loft_radius + case.square_height_mm / 2,
-                    -case.square_height_mm + case.cap_bolt_nut_depth_mm,
+                    -case.square_height_mm + case.m4_nut_depth_mm,
                     case.square_height_mm / 2,
                 ),
             ):
-                hex = hex_nut(
-                    case.cap_bolt_nut_diameter_mm, case.cap_bolt_nut_depth_mm + 10
-                )
+                hex = hex_nut(case.m4_nut_diameter_mm, case.m4_nut_depth_mm + 10)
                 add(hex, mode=Mode.SUBTRACT, rotation=(90, 0, 0))
 
     return cap_part
@@ -280,14 +279,14 @@ def bottom_cap(
                 ),
             ):
                 Cylinder(
-                    case.base_bolt_hole_diameter_mm / 2,
+                    case.m6_clearance_hole_diameter_semi_loose_mm / 2,
                     case.square_height_mm,
                     mode=Mode.SUBTRACT,
                     align=(Align.CENTER, Align.CENTER, Align.MAX),
                 )
                 Cylinder(
-                    case.base_bolt_hole_counter_bore_diameter_mm / 2,
-                    case.base_bolt_hole_counter_bore_depth_mm,
+                    case.m6_head_counter_bore_diameter_mm / 2,
+                    case.m6_head_counter_bore_depth_mm,
                     mode=Mode.SUBTRACT,
                     align=(Align.CENTER, Align.CENTER, Align.MAX),
                 )
