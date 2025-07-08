@@ -20,7 +20,6 @@ Usage:
 
 import argparse
 import csv
-from functools import partial
 import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -60,7 +59,6 @@ def process_scroll(padded_scroll: str, mesh_file: str, output_dir: str):
     # Process the mesh to build the lining.
     scroll_mesh_params = mesh.ScrollMesh(
         mesh_file,
-        # smoothing_callback=partial(mesh.mesh_smooth_denoise, gamma=20),
     )
     (
         lining_mesh_pos,
