@@ -238,9 +238,9 @@ def inference_worker(rank, world_size, checkpoint_path, fragment_id):
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Run ink detection inference on a fragment')
-    parser.add_argument('checkpoint_path', type=str,
+    parser.add_argument('--checkpoint_path', type=str, required=True,
                         help='Path to the model checkpoint (.ckpt file)')
-    parser.add_argument('fragment_id', type=str,
+    parser.add_argument('--fragment_id', type=str, required=True,
                         help='Fragment ID to process (e.g., 20231005123336)')
     parser.add_argument('--gpus', type=int, default=None,
                         help='Number of GPUs to use (default: all available)')
