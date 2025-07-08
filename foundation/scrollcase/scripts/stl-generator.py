@@ -15,7 +15,7 @@ Additionally, a CSV summary (scroll_summary.csv) is created in the output root w
    "Scroll ID", "Height (mm)", "Diameter (mm)"
 
 Usage:
-    python stl-generator.py --input /path/to/scrolls --output /path/to/output [--config /path/to/config.yml]
+    python stl-generator.py --input /path/to/scrolls --output /path/to/output
 """
 
 import argparse
@@ -46,15 +46,13 @@ def pad_scroll_name(scroll_number: str) -> str:
     return padded
 
 
-def process_scroll(padded_scroll: str, mesh_file: str, output_dir: str, config=None):
+def process_scroll(padded_scroll: str, mesh_file: str, output_dir: str):
     """
     Process a single scroll:
       - Processes the mesh to build the lining.
       - Builds the scroll case.
       - Combines the case halves with the mesh lining.
       - Exports the combined STL files.
-
-    The configuration from the YAML file (if provided) is used to override default parameters for the scroll case.
 
     Returns a tuple: (padded_scroll, height, diameter)
     """
@@ -83,9 +81,6 @@ def process_scroll(padded_scroll: str, mesh_file: str, output_dir: str, config=N
         "label_line_1": f"PHerc{padded_scroll}",
         "label_line_2": "v3",
     }
-    # If a YAML config was provided and contains "scroll_case", update the defaults.
-    if config is not None and "scroll_case" in config:
-        scroll_case_defaults.update(config["scroll_case"])
 
     scroll_case = case.ScrollCase(**scroll_case_defaults)
     case_left, case_right = case.build_case(scroll_case)
@@ -139,11 +134,6 @@ def main():
         required=True,
         help="Output root directory where generated STL files and CSV summary will be saved.",
     )
-    parser.add_argument(
-        "--config",
-        required=False,
-        help="Optional YAML configuration file containing scroll case parameters.",
-    )
     args = parser.parse_args()
 
     input_root = args.input
@@ -153,16 +143,6 @@ def main():
         logger.error(f"Input root directory does not exist: {input_root}")
         return
 
-    # Load YAML configuration if provided.
-    config = {}
-    if args.config:
-        try:
-            with open(args.config, "r") as f:
-                config = yaml.safe_load(f) or {}
-        except Exception as e:
-            logger.error(f"Error loading YAML config: {e}")
-            return
-
     # List subdirectories (each representing a scroll number)
     subdirs = [
         d for d in os.listdir(input_root) if os.path.isdir(os.path.join(input_root, d))
@@ -171,7 +151,7 @@ def main():
         logger.error("No subdirectories found in the input root directory.")
         return
 
-    # Prepare a list of tasks: each task is a tuple (padded_scroll, mesh_file, scroll_output_dir, config)
+    # Prepare a list of tasks: each task is a tuple (padded_scroll, mesh_file, scroll_output_dir)
     tasks = []
     for scroll_number in subdirs:
         padded_scroll = pad_scroll_name(scroll_number)
@@ -186,7 +166,7 @@ def main():
         # Create output folder for this scroll case using the padded scroll name
         scroll_output_dir = os.path.join(output_root, padded_scroll)
         os.makedirs(scroll_output_dir, exist_ok=True)
-        tasks.append((padded_scroll, mesh_file, scroll_output_dir, config))
+        tasks.append((padded_scroll, mesh_file, scroll_output_dir))
 
     # List to accumulate CSV summary data as tuples: (Scroll ID, Height, Diameter)
     scroll_summary = []
@@ -194,8 +174,8 @@ def main():
     # Process scrolls concurrently using ProcessPoolExecutor with a tqdm progress bar
     with ProcessPoolExecutor() as executor:
         future_to_scroll = {
-            executor.submit(process_scroll, padded, mesh_file, out_dir, config): padded
-            for padded, mesh_file, out_dir, config in tasks
+            executor.submit(process_scroll, padded, mesh_file, out_dir): padded
+            for padded, mesh_file, out_dir in tasks
         }
         for future in tqdm(
             as_completed(future_to_scroll),
