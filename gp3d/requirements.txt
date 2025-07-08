@@ -1,0 +1,15 @@
+numpy
+torch
+torchvision
+torchaudio
+pytorch-lightning
+segmentation-models-pytorch
+opencv-python
+scikit-image
+scipy
+tqdm
+zarr
+numcodecs
+numba
+webknossos
+pytorch-warmup

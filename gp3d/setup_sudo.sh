@@ -25,7 +25,7 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-print_status "Starting AWS GPU instance provisioning..."
+print_status "Starting AWS GPU instance system provisioning..."
 
 print_status "Updating and upgrading system packages..."
 apt update
@@ -70,22 +70,6 @@ apt update
 apt install -y nvidia-driver-570
 apt install -y cuda-toolkit-12-8
 
-print_status "Installing Miniconda with Python 3.12..."
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh
-bash /tmp/miniconda.sh -b -p /opt/miniconda3
-rm /tmp/miniconda.sh
-
-# Add conda to PATH for all users
-echo 'export PATH=/opt/miniconda3/bin:$PATH' >> /etc/profile.d/conda.sh
-chmod +x /etc/profile.d/conda.sh
-source /etc/profile.d/conda.sh
-
-/opt/miniconda3/bin/conda init bash
-/opt/miniconda3/bin/conda update -n base -c defaults conda -y
-/opt/miniconda3/bin/conda create -n py312 python=3.12 -y
-print_status "Installing PyTorch with CUDA support..."
-/opt/miniconda3/bin/conda run -n py312 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-
 print_status "Configuring NVMe drives..."
 
 apt install -y btrfs-progs
@@ -119,16 +103,6 @@ if [ -d /vesuvius ]; then
     chown root:root /vesuvius
 fi
 
-print_status "Updating all conda packages..."
-/opt/miniconda3/bin/conda update --all -y
-
-print_status "Updating pip and all packages..."
-/opt/miniconda3/bin/conda run -n py312 pip install --upgrade pip
-
-/opt/miniconda3/bin/conda run -n py312 pip list --outdated --format=json | \
-    python3 -c "import json, sys; print('\n'.join([x['name'] for x in json.load(sys.stdin)]))" | \
-    xargs -n1 /opt/miniconda3/bin/conda run -n py312 pip install -U 2>/dev/null || true
-
 print_status "Verifying installations..."
 
 if nvidia-smi &>/dev/null; then
@@ -138,7 +112,6 @@ else
     print_error "NVIDIA driver installation failed"
 fi
 
-
 if mountpoint -q /vesuvius; then
     print_status "/vesuvius is mounted"
     df -h /vesuvius
@@ -147,6 +120,6 @@ else
     print_warning "/vesuvius is not mounted (no NVMe drives found or mount failed)"
 fi
 
-print_status "Provisioning complete!"
+print_status "System provisioning complete!"
 print_status "Note: You may need to reboot for all changes to take effect"
-print_status "To activate the conda environment, run: conda activate py312"
+print_status "Next: Run provision-python.sh as a regular user to set up Python environment"
