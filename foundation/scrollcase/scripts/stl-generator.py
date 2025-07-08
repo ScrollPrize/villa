@@ -25,7 +25,6 @@ import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-import yaml  # Requires PyYAML
 from tqdm import tqdm
 
 from scrollcase import mesh, case
