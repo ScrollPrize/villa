@@ -79,7 +79,7 @@ def process_scroll(padded_scroll: str, mesh_file: str, output_dir: str):
         "label_line_2": "v3",
     }
 
-    scroll_case = case.ScrollCase(**scroll_case_defaults)
+    scroll_case = case.ScrollCaseConfig(**scroll_case_defaults)
     case_left, case_right = case.build_case(scroll_case)
 
     # Combine the BRep case halves with the mesh lining.

@@ -10,7 +10,7 @@ from meshlib import mrmeshpy as mm
 NO_SCROLL = 0
 
 
-def build_thread(case: sc.case.ScrollCase):
+def build_thread(case: sc.case.ScrollCaseConfig):
     with BuildPart() as thread:
         add(
             IsoThread(
@@ -44,7 +44,9 @@ def build_thread(case: sc.case.ScrollCase):
 
 
 def build_interface_plate(thread_holes: bool = False):
-    case = sc.case.ScrollCase(scroll_height_mm=NO_SCROLL, scroll_radius_mm=NO_SCROLL)
+    case = sc.case.ScrollCaseConfig(
+        scroll_height_mm=NO_SCROLL, scroll_radius_mm=NO_SCROLL
+    )
 
     with BuildPart() as interface_plate:
         add(

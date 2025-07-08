@@ -12,7 +12,9 @@ RISER_HEIGHT = 150
 
 
 def build_riser():
-    case = sc.case.ScrollCase(scroll_height_mm=NO_SCROLL, scroll_radius_mm=NO_SCROLL)
+    case = sc.case.ScrollCaseConfig(
+        scroll_height_mm=NO_SCROLL, scroll_radius_mm=NO_SCROLL
+    )
 
     with BuildPart() as riser:
         # Wide base cylinder

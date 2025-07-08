@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class ScrollCase:
+class ScrollCaseConfig:
     # Z=0 is the scroll bottom
 
     # Scroll dimensions defined per-scroll
@@ -108,7 +108,7 @@ def hex_nut(diameter_mm: float, depth_mm: float):
     return hex_part
 
 
-def mount_disc(case: ScrollCase):
+def mount_disc(case: ScrollCaseConfig):
     with BuildPart() as mount_disc_part:
         cyl = Cylinder(
             case.mount_disc_diameter_mm / 2,
@@ -134,7 +134,7 @@ def mount_disc(case: ScrollCase):
         return mount_disc_part
 
 
-def cap(case: ScrollCase, with_bolt_protrusions: bool = True):
+def cap(case: ScrollCaseConfig, with_bolt_protrusions: bool = True):
     with BuildPart() as cap_part:
         with BuildSketch():
             # Main rectangle
@@ -224,7 +224,7 @@ def cap(case: ScrollCase, with_bolt_protrusions: bool = True):
     return cap_part
 
 
-def top_cap(case: ScrollCase, with_bolt_protrusions: bool = True):
+def top_cap(case: ScrollCaseConfig, with_bolt_protrusions: bool = True):
     with BuildPart() as top_cap_part:
         add(cap(case, with_bolt_protrusions=with_bolt_protrusions))
 
@@ -248,7 +248,7 @@ def top_cap(case: ScrollCase, with_bolt_protrusions: bool = True):
 
 
 def bottom_cap(
-    case: ScrollCase,
+    case: ScrollCaseConfig,
     with_bolt_protrusions: bool = True,
     with_counter_bore: bool = True,
 ):
@@ -307,7 +307,7 @@ def bottom_cap(
     return bottom_cap_part
 
 
-def build_case(case: ScrollCase) -> tuple[Solid, Solid]:
+def build_case(case: ScrollCaseConfig) -> tuple[Solid, Solid]:
     """Build the scroll case.
 
     Args:
