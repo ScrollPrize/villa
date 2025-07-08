@@ -1,3 +1,4 @@
+from argparse import ArgumentParser
 from pathlib import Path
 
 from build123d import *  # type: ignore
@@ -28,23 +29,78 @@ def build_case(config: sc.case.ScrollCaseConfig):
             Location((0, 0, config.square_height_mm))
         )
 
-        left = case_part - divider_solid_part
-        right = case_part & divider_solid_part
+        left = (case_part - divider_solid_part).solid()
+        right = (case_part & divider_solid_part).solid()
+
+        assert isinstance(left, Solid)
+        assert isinstance(right, Solid)
 
     return left, right
 
 
 if __name__ == "__main__":
-    EXAMPLE_SCROLL_DIM = 50
+    parser = ArgumentParser()
+    parser.add_argument("mesh", nargs="?", default=None)
+    args = parser.parse_args()
 
-    config = sc.case.ScrollCaseConfig(
-        scroll_height_mm=EXAMPLE_SCROLL_DIM,
-        scroll_radius_mm=EXAMPLE_SCROLL_DIM / 2,
-    )
+    if args.mesh is None:
+        EXAMPLE_SCROLL_DIM = 50
 
-    left, right = build_case(config)
+        config = sc.case.ScrollCaseConfig(
+            scroll_height_mm=EXAMPLE_SCROLL_DIM,
+            scroll_radius_mm=EXAMPLE_SCROLL_DIM / 2,
+        )
 
-    show(left, right, reset_camera=Camera.KEEP)
+        case_left, case_right = build_case(config)
+
+        show(case_left, case_right, reset_camera=Camera.KEEP)
+    else:
+        assert Path.is_file(Path(args.mesh))
+        scroll_mesh = sc.mesh.ScrollMesh(args.mesh)
+        (
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            height,
+        ) = sc.mesh.build_lining(scroll_mesh)
+
+        vertical_offset = 60 - height / 2
+
+        scroll_mesh = sc.mesh.ScrollMesh(args.mesh, vertical_offset=vertical_offset)
+        (
+            lining_mesh_pos,
+            lining_mesh_neg,
+            cavity_mesh_pos,
+            cavity_mesh_neg,
+            mesh_scroll,
+            radius,
+            height,
+        ) = sc.mesh.build_lining(scroll_mesh)
+
+        config = sc.case.ScrollCaseConfig(
+            height, radius, label_line_1=f"PHercTODO", label_line_2="v1"
+        )
+        case_left, case_right = build_case(config)
+
+        # Combine the BRep case halves with the mesh lining.
+        combined_mesh_right = sc.mesh.combine_brep_case_lining(
+            case_right, cavity_mesh_pos, lining_mesh_pos
+        )
+        combined_mesh_left = sc.mesh.combine_brep_case_lining(
+            case_left, cavity_mesh_neg, lining_mesh_neg
+        )
+
+        output_dir = "herp"
+        padded_scroll = "derp"
+        scroll_stl_path = Path(output_dir) / f"{padded_scroll}_scroll.stl"
+        right_stl_path = Path(output_dir) / f"{padded_scroll}_right.stl"
+        left_stl_path = Path(output_dir) / f"{padded_scroll}_left.stl"
+        mm.saveMesh(mesh_scroll, scroll_stl_path)
+        mm.saveMesh(combined_mesh_right, right_stl_path)
+        mm.saveMesh(combined_mesh_left, left_stl_path)
 
     # Convert to mesh
     # case_mesh = sc.mesh.brep_to_mesh(case.solids()[0])
