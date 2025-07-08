@@ -1,5 +1,6 @@
 import logging
-from build123d import *
+
+from build123d import *  # type: ignore
 
 logger = logging.getLogger(__name__)
 

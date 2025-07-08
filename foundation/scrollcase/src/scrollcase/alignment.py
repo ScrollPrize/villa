@@ -3,17 +3,17 @@ from scipy.spatial import ConvexHull
 import logging
 from . import smallest_circle
 import plotly.graph_objs as go
-import plotly.express as px
 import numpy as np
 from scipy.optimize import minimize
 
 logger = logging.getLogger(__name__)
 
+
 def _project_points_onto_plane(
     points: np.ndarray, normal: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Project points onto a plane with given unit normal.
-    
+
     Returns:
       points_global: Points projected onto the plane (in global coords).
       points_local: 2D coordinates in the plane.
@@ -29,15 +29,18 @@ def _project_points_onto_plane(
     v = np.cross(normal, u)
     d = np.dot(points, normal)
     points_global = points - d[:, None] * normal
-    points_local = np.hstack([np.dot(points_global, u)[:, None], np.dot(points_global, v)[:, None]])
+    points_local = np.hstack(
+        [np.dot(points_global, u)[:, None], np.dot(points_global, v)[:, None]]
+    )
     return points_global, points_local, d, np.vstack([u, v])
+
 
 def fit_cylinder(
     points: np.ndarray, tol: float = 1e-4, _debug: bool = False
 ) -> tuple[np.ndarray, np.ndarray, float, float]:
     """
     Robustly fit a cylinder to the input points.
-    
+
     Returns:
         rotation_matrix: 3x3 rotation matrix transforming points into cylinder coords.
         translation_vector: Translation to align the cylinder so that its bottom is at Z=0.
@@ -47,7 +50,7 @@ def fit_cylinder(
     # Compute convex hull to reduce the number of points
     hull = ConvexHull(points)
     hull_points = points[hull.vertices]
-    
+
     # --- Step 1: PCA for an initial guess ---
     mean = np.mean(hull_points, axis=0)
     cov = np.cov(hull_points - mean, rowvar=False)
@@ -68,16 +71,22 @@ def fit_cylinder(
     best_normal = result.x / np.linalg.norm(result.x)
     best_radius = result.fun
 
-    logger.info(f"Robust fit: best direction: {best_normal} with objective value {best_radius}")
+    logger.info(
+        f"Robust fit: best direction: {best_normal} with objective value {best_radius}"
+    )
 
     # --- Step 3: Recompute circle and cylinder parameters ---
-    projection_global, projection_local, d, basis = _project_points_onto_plane(hull_points, best_normal)
+    projection_global, projection_local, d, basis = _project_points_onto_plane(
+        hull_points, best_normal
+    )
     center_2d, radius = smallest_circle.smallest_enclosing_circle(projection_local)
     height = max(d) - min(d)
 
     # Build the rotation matrix. The two basis vectors become X & Y, and best_normal is Z.
     rotation_matrix = np.column_stack([basis.T, best_normal])
-    rotation_matrix = rotation_matrix.T  # so that applying it rotates points into cylinder coords
+    rotation_matrix = (
+        rotation_matrix.T
+    )  # so that applying it rotates points into cylinder coords
 
     # Compute global center of the circle in the plane and translation such that bottom is at Z=0.
     global_center = basis.T @ center_2d
