@@ -513,13 +513,13 @@ def build_case(config: ScrollCaseConfig) -> tuple[Solid, Solid]:
             config.square_loft_radius,
             config.wall_thickness_mm,
         ).part
-        assert divider_solid_part is not None
+        assert isinstance(divider_solid_part, Part)
         divider_solid_part = divider_solid_part.move(
             Location((0, 0, config.cylinder_bottom - config.square_height_mm))
         )
 
         case_part = case.part
-        assert case_part is not None
+        assert isinstance(case_part, Part)
         left = case_part - divider_solid_part
         right = case_part & divider_solid_part
 
@@ -536,7 +536,7 @@ def build_case(config: ScrollCaseConfig) -> tuple[Solid, Solid]:
                 config.square_loft_radius,
                 config.wall_thickness_mm,
             ).part
-            assert remove_part is not None
+            assert isinstance(remove_part, Part)
             add(remove_part, mode=Mode.SUBTRACT)
 
     left = left.solid()

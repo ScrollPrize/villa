@@ -6,25 +6,27 @@ from ocp_vscode import show, Camera
 
 import scrollcase as sc
 
-NO_SCROLL = 0
+EXAMPLE_SCROLL_DIM = 50
 
 
-def build_case():
-    config = sc.case.ScrollCaseConfig(
-        scroll_height_mm=NO_SCROLL, scroll_radius_mm=NO_SCROLL
-    )
-
+def build_case(config: sc.case.ScrollCaseConfig):
     with BuildPart() as case:
         add(sc.case.ESRF_ID11_base(config))
+        # add(sc.case.)
 
     show(case, reset_camera=Camera.KEEP)
 
-    return left, right
+    return case, case
 
 
-left, right = build_case()
+if __name__ == "__main__":
+    config = sc.case.ScrollCaseConfig(
+        scroll_height_mm=EXAMPLE_SCROLL_DIM, scroll_radius_mm=EXAMPLE_SCROLL_DIM
+    )
 
-# Convert to mesh
-# case_mesh = sc.mesh.brep_to_mesh(case.solids()[0])
+    left, right = build_case(config)
 
-# mm.saveMesh(disc_mesh, Path("ESRF_ID11_case.stl"))
+    # Convert to mesh
+    # case_mesh = sc.mesh.brep_to_mesh(case.solids()[0])
+
+    # mm.saveMesh(disc_mesh, Path("ESRF_ID11_case.stl"))
