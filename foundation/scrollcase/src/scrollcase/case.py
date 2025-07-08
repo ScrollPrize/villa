@@ -481,7 +481,7 @@ def build_case(config: ScrollCaseConfig) -> tuple[Solid, Solid]:
                     config.lining_outer_radius,
                     config.wall_thickness_mm,
                 )
-                assert ln is type(Edge)
+                assert isinstance(ln, Wire)
                 tangent = ln % 0.5
                 orthogonal_plane = Plane(
                     origin=(0, 0, config.cylinder_bottom),
@@ -540,10 +540,11 @@ def build_case(config: ScrollCaseConfig) -> tuple[Solid, Solid]:
             add(remove_part, mode=Mode.SUBTRACT)
 
     left = left.solid()
-    assert left is type(Solid)
+    assert isinstance(left, Solid)
     left += base_disc.solid()
+    assert isinstance(left, Solid)
 
     right = right.solid()
-    assert right is type(Solid)
+    assert isinstance(right, Solid)
 
     return left, right
