@@ -4,17 +4,12 @@
 *.pyc
 *.tif
 node_modules/.yarn-integrity
+**/*.egg-info*/
 
 # Vesuvius outputs & metadata
 /vesuvius/outputs/
 /vesuvius/sandbox/
 /vesuvius/utils/tests/s5_test.zarr
-/vesuvius/vesuvius.egg-info/
-
-# BatchGenerators & nnU-Net egg-info
-/segmentation/models/batchgeneratorsv2/batchgeneratorsv2.egg-info/
-/segmentation/models/arch/nnunet/nnunetv2.egg-info/
-/segmentation/models/arch/nnunet/nnunetv2.egg-info/SOURCES.txt
 
 # WandB (allow general wandb but ignore this one)
 !**/wandb/**
@@ -23,9 +18,5 @@ node_modules/.yarn-integrity
 /segmentation/napari_trainer/checkpoints
 segmentation/napari_trainer/cline_rules.md
 segmentation/napari_trainer/test_1638_debug.png
-/vesuvius/vesuvius.egg-info
-/vesuvius/vesuvius.egg-info
-vesuvius/vesuvius.egg-info/PKG-INFO
-/vesuvius/vesuvius.egg-info
 /vesuvius/checkpoints
 /vesuvius/scripts/checkpoints
