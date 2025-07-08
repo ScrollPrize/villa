@@ -115,3 +115,5 @@ e.g.
 ```bash
 python3 infer.py --checkpoint_path /vesuvius/inkdet_outputs/resnet3d50_epoch=76.ckpt --fragment_id YRkpZecXiB57JOGm
 ```
+
+The ink detection will be output to `/vesuvius/inkdet_outputs/{fragment_id}_ink_prediction.png`, e.g.  `/vesuvius/inkdet_outputs/YRkpZecXiB57JOGm_ink_prediction.png`
