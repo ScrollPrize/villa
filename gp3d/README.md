@@ -107,7 +107,7 @@ Ensure that your fragment zarr exists under `/vesuvius/fragments`, e.g. `/vesuvi
 
 ```bash
 cd /vesuvius/villa/gp3d
-python3 --checkpoint_path < path to your checkpoint > --fragment_id < your fragment id>
+python3 infer.py --checkpoint_path < path to your checkpoint > --fragment_id < your fragment id>
 ```
 
 e.g.
