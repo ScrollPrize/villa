@@ -1,8 +1,6 @@
-import logging
 from dataclasses import dataclass
-from typing import Optional
+import logging
 
-import numpy as np
 from build123d import *
 
 from . import curved_divider_wall
