@@ -5,7 +5,7 @@ from typing import Optional
 import numpy as np
 from build123d import *
 
-from . import divider_utils
+from . import curved_divider_wall
 
 logger = logging.getLogger(__name__)
 
@@ -329,7 +329,7 @@ def build_case(case: ScrollCaseConfig) -> tuple[Solid, Solid]:
 
         with BuildPart() as divider_wall:
             with BuildLine() as spline_ln:
-                ln = divider_utils.divider_curve(
+                ln = curved_divider_wall.divider_curve(
                     case.lining_outer_radius,
                     case.wall_thickness_mm,
                 )
@@ -359,7 +359,7 @@ def build_case(case: ScrollCaseConfig) -> tuple[Solid, Solid]:
                     Circle(case.wall_thickness_mm)
             extrude(amount=case.cylinder_height)
 
-        divider_solid_part = divider_utils.divider_solid(
+        divider_solid_part = curved_divider_wall.divider_solid(
             case.lining_outer_radius,
             case.square_loft_radius,
             case.wall_thickness_mm,
@@ -376,7 +376,7 @@ def build_case(case: ScrollCaseConfig) -> tuple[Solid, Solid]:
 
         # Extra space at bottom of right case half
         with Locations((0, 0, -case.right_cap_buffer)):
-            remove_part = divider_utils.divider_solid(
+            remove_part = curved_divider_wall.divider_solid(
                 case.lining_outer_radius,
                 case.square_loft_radius,
                 case.wall_thickness_mm,
