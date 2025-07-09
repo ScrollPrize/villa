@@ -132,7 +132,7 @@ Between **6 May 2025 and 12 May 2025** we scanned three additional fr
 ### Fragment 500P2
 
 <div className="flex flex-wrap mb-4">
-  <div className="w-[45%] mb-2 mr-2 max-w-[260px]"><img src="/img/data/esrf/500p2_ir.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 500P2 – infrared</figcaption></div>
+  <div className="w-[45%] mb-2 mr-2 max-w-[260px]"><img src="/img/data/PHerc0500P2-ir.jpg" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 500P2 – infrared</figcaption></div>
 </div>
 - **2.215 µm, 110 keV** · OME‑Zarr ≈ 130 GB  
 - **4.317 µm, 111 keV** · OME‑Zarr ≈ 35 GB  
@@ -142,7 +142,7 @@ Between **6 May 2025 and 12 May 2025** we scanned three additional fr
 ### Fragment 343P
 
 <div className="flex flex-wrap mb-4">
-  <div className="w-[45%] mb-2 mr-2 max-w-[260px]"><img src="/img/data/esrf/343p_ir.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 343P – infrared</figcaption></div>
+  <div className="w-[45%] mb-2 mr-2 max-w-[260px]"><img src="/img/data/PHerc0343P-ir.jpg" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 343P – infrared</figcaption></div>
 </div>
 - **2.215 µm, 111 keV** · OME‑Zarr ≈ 95 GB  
 - **4.320 µm, 116 keV (bin×2)** · OME‑Zarr ≈ 25 GB  
@@ -152,7 +152,7 @@ Between **6 May 2025 and 12 May 2025** we scanned three additional fr
 ### Fragment 9B
 
 <div className="flex flex-wrap mb-4">
-  <div className="w-[45%] mb-2 mr-2 max-w-[260px]"><img src="/img/data/esrf/9b_ir.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 9B – infrared</figcaption></div>
+  <div className="w-[45%] mb-2 mr-2 max-w-[260px]"><img src="/img/data/PHerc0009B-ir.jpg" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 9B – infrared</figcaption></div>
 </div>
 - **4.320 µm, 116 keV (bin×2)** · OME‑Zarr ≈ 28 GB  
 - Multispectral stack (16 bands)  
