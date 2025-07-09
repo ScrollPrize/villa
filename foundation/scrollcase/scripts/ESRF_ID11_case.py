@@ -20,6 +20,17 @@ def build_case(config: sc.case.ScrollCaseConfig):
         )
         add(wall)
 
+        with Locations(
+            (0, 0, config.square_height_mm + 5), (0, 0, config.id11_cylinder_height - 5)
+        ):
+            Cylinder(
+                config.m4_clearance_hole_diameter_tight_mm / 2,
+                10,
+                align=(Align.CENTER, Align.CENTER, Align.CENTER),
+                mode=Mode.SUBTRACT,
+                rotation=(90, -42, 0),
+            )
+
         case_part = case.part
         divider_solid_part = solid.part
         assert isinstance(case_part, Part)
@@ -58,6 +69,8 @@ if __name__ == "__main__":
         show(case_left, case_right, reset_camera=Camera.KEEP)
     else:
         assert args.mesh.is_file()
+
+        # Load it first just to get the height
         scroll_mesh = sc.mesh.ScrollMesh(args.mesh)
         (
             _,
@@ -69,6 +82,7 @@ if __name__ == "__main__":
             height,
         ) = sc.mesh.build_lining(scroll_mesh)
 
+        # Fixed 60mm vertical target from ID11 stage specs
         vertical_offset = 60 - height / 2
 
         scroll_mesh = sc.mesh.ScrollMesh(args.mesh, vertical_offset=vertical_offset)
@@ -102,8 +116,3 @@ if __name__ == "__main__":
         mm.saveMesh(mesh_scroll, scroll_stl_path)
         mm.saveMesh(combined_mesh_right, right_stl_path)
         mm.saveMesh(combined_mesh_left, left_stl_path)
-
-    # Convert to mesh
-    # case_mesh = sc.mesh.brep_to_mesh(case.solids()[0])
-
-    # mm.saveMesh(disc_mesh, Path("ESRF_ID11_case.stl"))
