@@ -10,7 +10,7 @@ from meshlib import mrmeshpy as mm
 NO_SCROLL = 0
 
 
-def build_thread(case: sc.case.ScrollCase):
+def build_thread(case: sc.case.ScrollCaseConfig):
     with BuildPart() as thread:
         add(
             IsoThread(
@@ -44,7 +44,9 @@ def build_thread(case: sc.case.ScrollCase):
 
 
 def build_interface_plate(thread_holes: bool = False):
-    case = sc.case.ScrollCase(scroll_height_mm=NO_SCROLL, scroll_radius_mm=NO_SCROLL)
+    case = sc.case.ScrollCaseConfig(
+        scroll_height_mm=NO_SCROLL, scroll_radius_mm=NO_SCROLL
+    )
 
     with BuildPart() as interface_plate:
         add(
@@ -86,7 +88,7 @@ def build_interface_plate(thread_holes: bool = False):
                 add(build_thread(case))
             else:
                 Cylinder(
-                    case.base_bolt_hole_diameter_for_tapping_mm / 2,
+                    case.m6_clearance_hole_diameter_for_tapping_mm / 2,
                     case.square_height_mm,
                     mode=Mode.SUBTRACT,
                     align=(Align.CENTER, Align.CENTER, Align.MAX),
@@ -116,14 +118,14 @@ def build_interface_plate(thread_holes: bool = False):
             ),
         ):
             Cylinder(
-                case.base_bolt_hole_diameter_mm / 2,
+                case.m6_clearance_hole_diameter_semi_loose_mm / 2,
                 case.square_height_mm,
                 mode=Mode.SUBTRACT,
                 align=(Align.CENTER, Align.CENTER, Align.MAX),
             )
             Cylinder(
-                case.base_bolt_hole_counter_bore_diameter_mm / 2,
-                case.base_bolt_hole_counter_bore_depth_mm,
+                case.m6_head_counter_bore_diameter_mm / 2,
+                case.m6_head_counter_bore_depth_mm,
                 mode=Mode.SUBTRACT,
                 align=(Align.CENTER, Align.CENTER, Align.MAX),
             )

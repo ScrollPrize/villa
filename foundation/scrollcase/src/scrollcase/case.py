@@ -1,17 +1,15 @@
-import logging
 from dataclasses import dataclass
-from typing import Optional
+import logging
 
-import numpy as np
-from build123d import *
+from build123d import *  # type: ignore
 
-from . import divider_utils
+from . import curved_divider_wall
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class ScrollCase:
+class ScrollCaseConfig:
     # Z=0 is the scroll bottom
 
     # Scroll dimensions defined per-scroll
@@ -35,12 +33,18 @@ class ScrollCase:
     square_height_mm: float = 10
     square_edge_fillet: float = 6.25
     right_cap_buffer: float = 0.5
-    # Based on M4 bolts
-    cap_bolt_hole_diameter_mm: float = 5
-    cap_bolt_counter_bore_diameter_mm: float = 8
-    cap_bolt_counter_bore_depth_mm: float = 2
-    cap_bolt_nut_diameter_mm: float = 9
-    cap_bolt_nut_depth_mm: float = 3.5
+
+    m4_clearance_hole_diameter_tight_mm: float = 4.3
+    m4_clearance_hole_diameter_very_loose_mm: float = 5
+    m4_head_counter_bore_diameter_mm: float = 8
+    m4_head_counter_bore_depth_mm: float = 2
+    m4_nut_diameter_mm: float = 9
+    m4_nut_depth_mm: float = 3.5
+
+    m6_clearance_hole_diameter_semi_loose_mm: float = 6.8
+    m6_head_counter_bore_diameter_mm: float = 10.5
+    m6_head_counter_bore_depth_mm: float = 5
+    m6_clearance_hole_diameter_for_tapping_mm: float = 5.2
 
     # Mounting disc
     mount_disc_diameter_mm: float = 112.5
@@ -54,15 +58,16 @@ class ScrollCase:
     text_font_size: float = 8
     text_depth_mm: float = 0.5
 
-    # Base bolt holes (based on M6)
-    base_bolt_hole_diameter_mm: float = 6.8
-    base_bolt_hole_counter_bore_diameter_mm: float = 10.5
-    base_bolt_hole_counter_bore_depth_mm: float = 5
+    # Base bolt holes
     base_bolt_hole_spacing_from_center_mm: float = 50
-    base_bolt_hole_diameter_for_tapping_mm: float = 5.2
 
     # Tomo stage bolt holes
     tomo_stage_bolt_hole_spacing_from_center_mm: float = 25
+
+    # ESRF ID11 base params
+    esrf_id11_diffractometer_plate_width_mm: float = 100
+    esrf_id11_diffractometer_bolt_short_spacing_mm: float = 40
+    esrf_id11_diffractometer_bolt_long_spacing_mm: float = 86
 
     @property
     def lining_outer_radius(self):
@@ -80,6 +85,18 @@ class ScrollCase:
             + 2 * self.wall_thickness_mm
             + self.lower_margin_mm
             + self.upper_margin_mm
+        )
+
+    @property
+    def id11_cylinder_height(self):
+        return (
+            60
+            + self.scroll_height_mm / 2
+            + self.lining_offset_mm
+            + self.wall_thickness_mm
+            + self.lining_offset_mm
+            + self.m4_nut_diameter_mm
+            + self.lining_offset_mm
         )
 
     @property
@@ -108,7 +125,7 @@ def hex_nut(diameter_mm: float, depth_mm: float):
     return hex_part
 
 
-def mount_disc(case: ScrollCase):
+def mount_disc(case: ScrollCaseConfig):
     with BuildPart() as mount_disc_part:
         cyl = Cylinder(
             case.mount_disc_diameter_mm / 2,
@@ -134,7 +151,7 @@ def mount_disc(case: ScrollCase):
         return mount_disc_part
 
 
-def cap(case: ScrollCase, with_bolt_protrusions: bool = True):
+def cap(case: ScrollCaseConfig, with_bolt_protrusions: bool = True):
     with BuildPart() as cap_part:
         with BuildSketch():
             # Main rectangle
@@ -176,7 +193,7 @@ def cap(case: ScrollCase, with_bolt_protrusions: bool = True):
                 ),
             ):
                 Cylinder(
-                    case.cap_bolt_hole_diameter_mm / 2,
+                    case.m4_clearance_hole_diameter_very_loose_mm / 2,
                     4 * case.square_height_mm,
                     rotation=(90, 0, 0),
                     mode=Mode.SUBTRACT,
@@ -186,17 +203,17 @@ def cap(case: ScrollCase, with_bolt_protrusions: bool = True):
             with Locations(
                 (
                     -case.square_loft_radius - case.square_height_mm / 2,
-                    case.square_height_mm - case.cap_bolt_counter_bore_depth_mm,
+                    case.square_height_mm - case.m4_head_counter_bore_depth_mm,
                     case.square_height_mm / 2,
                 ),
                 (
                     case.square_loft_radius + case.square_height_mm / 2,
-                    case.square_height_mm - case.cap_bolt_counter_bore_depth_mm,
+                    case.square_height_mm - case.m4_head_counter_bore_depth_mm,
                     case.square_height_mm / 2,
                 ),
             ):
                 Cylinder(
-                    case.cap_bolt_counter_bore_diameter_mm / 2,
+                    case.m4_head_counter_bore_diameter_mm / 2,
                     2 * case.square_height_mm,
                     mode=Mode.SUBTRACT,
                     rotation=(90, 0, 0),
@@ -207,24 +224,22 @@ def cap(case: ScrollCase, with_bolt_protrusions: bool = True):
             with Locations(
                 (
                     -case.square_loft_radius - case.square_height_mm / 2,
-                    -case.square_height_mm + case.cap_bolt_nut_depth_mm,
+                    -case.square_height_mm + case.m4_nut_depth_mm,
                     case.square_height_mm / 2,
                 ),
                 (
                     case.square_loft_radius + case.square_height_mm / 2,
-                    -case.square_height_mm + case.cap_bolt_nut_depth_mm,
+                    -case.square_height_mm + case.m4_nut_depth_mm,
                     case.square_height_mm / 2,
                 ),
             ):
-                hex = hex_nut(
-                    case.cap_bolt_nut_diameter_mm, case.cap_bolt_nut_depth_mm + 10
-                )
+                hex = hex_nut(case.m4_nut_diameter_mm, case.m4_nut_depth_mm + 10)
                 add(hex, mode=Mode.SUBTRACT, rotation=(90, 0, 0))
 
     return cap_part
 
 
-def top_cap(case: ScrollCase, with_bolt_protrusions: bool = True):
+def top_cap(case: ScrollCaseConfig, with_bolt_protrusions: bool = True):
     with BuildPart() as top_cap_part:
         add(cap(case, with_bolt_protrusions=with_bolt_protrusions))
 
@@ -248,7 +263,7 @@ def top_cap(case: ScrollCase, with_bolt_protrusions: bool = True):
 
 
 def bottom_cap(
-    case: ScrollCase,
+    case: ScrollCaseConfig,
     with_bolt_protrusions: bool = True,
     with_counter_bore: bool = True,
 ):
@@ -280,14 +295,14 @@ def bottom_cap(
                 ),
             ):
                 Cylinder(
-                    case.base_bolt_hole_diameter_mm / 2,
+                    case.m6_clearance_hole_diameter_semi_loose_mm / 2,
                     case.square_height_mm,
                     mode=Mode.SUBTRACT,
                     align=(Align.CENTER, Align.CENTER, Align.MAX),
                 )
                 Cylinder(
-                    case.base_bolt_hole_counter_bore_diameter_mm / 2,
-                    case.base_bolt_hole_counter_bore_depth_mm,
+                    case.m6_head_counter_bore_diameter_mm / 2,
+                    case.m6_head_counter_bore_depth_mm,
                     mode=Mode.SUBTRACT,
                     align=(Align.CENTER, Align.CENTER, Align.MAX),
                 )
@@ -307,7 +322,152 @@ def bottom_cap(
     return bottom_cap_part
 
 
-def build_case(case: ScrollCase) -> tuple[Solid, Solid]:
+def ESRF_ID11_base(case: ScrollCaseConfig):
+    with BuildPart() as ESRF_ID11_base_part:
+        with BuildSketch():
+            with BuildLine():
+                Line(
+                    (
+                        -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                        case.esrf_id11_diffractometer_plate_width_mm / 2,
+                    ),
+                    (
+                        case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                        case.esrf_id11_diffractometer_plate_width_mm / 2,
+                    ),
+                )
+                Line(
+                    (
+                        case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                        case.esrf_id11_diffractometer_plate_width_mm / 2,
+                    ),
+                    (
+                        case.esrf_id11_diffractometer_plate_width_mm / 2,
+                        case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                    ),
+                )
+                Line(
+                    (
+                        case.esrf_id11_diffractometer_plate_width_mm / 2,
+                        case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                    ),
+                    (
+                        case.esrf_id11_diffractometer_plate_width_mm / 2,
+                        -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                    ),
+                )
+                Line(
+                    (
+                        case.esrf_id11_diffractometer_plate_width_mm / 2,
+                        -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                    ),
+                    (
+                        case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                        -case.esrf_id11_diffractometer_plate_width_mm / 2,
+                    ),
+                )
+                Line(
+                    (
+                        case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                        -case.esrf_id11_diffractometer_plate_width_mm / 2,
+                    ),
+                    (
+                        -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                        -case.esrf_id11_diffractometer_plate_width_mm / 2,
+                    ),
+                )
+                Line(
+                    (
+                        -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                        -case.esrf_id11_diffractometer_plate_width_mm / 2,
+                    ),
+                    (
+                        -case.esrf_id11_diffractometer_plate_width_mm / 2,
+                        -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                    ),
+                )
+                Line(
+                    (
+                        -case.esrf_id11_diffractometer_plate_width_mm / 2,
+                        -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                    ),
+                    (
+                        -case.esrf_id11_diffractometer_plate_width_mm / 2,
+                        case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                    ),
+                )
+                Line(
+                    (
+                        -case.esrf_id11_diffractometer_plate_width_mm / 2,
+                        case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                    ),
+                    (
+                        -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                        case.esrf_id11_diffractometer_plate_width_mm / 2,
+                    ),
+                )
+            make_face()
+        extrude(amount=case.square_height_mm)
+
+        with Locations(
+            (
+                -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                case.esrf_id11_diffractometer_bolt_long_spacing_mm / 2,
+                case.square_height_mm,
+            ),
+            (
+                case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                case.esrf_id11_diffractometer_bolt_long_spacing_mm / 2,
+                case.square_height_mm,
+            ),
+            (
+                case.esrf_id11_diffractometer_bolt_long_spacing_mm / 2,
+                case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                case.square_height_mm,
+            ),
+            (
+                case.esrf_id11_diffractometer_bolt_long_spacing_mm / 2,
+                -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                case.square_height_mm,
+            ),
+            (
+                case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                -case.esrf_id11_diffractometer_bolt_long_spacing_mm / 2,
+                case.square_height_mm,
+            ),
+            (
+                -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                -case.esrf_id11_diffractometer_bolt_long_spacing_mm / 2,
+                case.square_height_mm,
+            ),
+            (
+                -case.esrf_id11_diffractometer_bolt_long_spacing_mm / 2,
+                -case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                case.square_height_mm,
+            ),
+            (
+                -case.esrf_id11_diffractometer_bolt_long_spacing_mm / 2,
+                case.esrf_id11_diffractometer_bolt_short_spacing_mm / 2,
+                case.square_height_mm,
+            ),
+        ):
+            Cylinder(
+                case.m4_clearance_hole_diameter_tight_mm / 2,
+                case.square_height_mm,
+                mode=Mode.SUBTRACT,
+                align=(Align.CENTER, Align.CENTER, Align.MAX),
+            )
+            Cylinder(
+                case.m4_head_counter_bore_diameter_mm / 2,
+                case.m4_head_counter_bore_depth_mm,
+                mode=Mode.SUBTRACT,
+                align=(Align.CENTER, Align.CENTER, Align.MAX),
+            )
+
+    return ESRF_ID11_base_part
+
+
+def build_case(config: ScrollCaseConfig) -> tuple[Solid, Solid]:
     """Build the scroll case.
 
     Args:
@@ -317,73 +477,58 @@ def build_case(case: ScrollCase) -> tuple[Solid, Solid]:
         tuple[Solid, Solid]: The left and right halves of the scroll case.
     """
     logger.info(
-        f"Constructing case with scroll radius: {case.scroll_radius_mm}, height: {case.scroll_height_mm}"
+        f"Constructing case with scroll radius: {config.scroll_radius_mm}, height: {config.scroll_height_mm}"
     )
 
-    with BuildPart(Location((0, 0, case.cylinder_bottom))) as case_part:
+    with BuildPart(Location((0, 0, config.cylinder_bottom))) as case:
         # Top and bottom caps
-        with Locations((0, 0, case.cylinder_height)):
-            add(top_cap(case))
-        with Locations((0, 0, -case.square_height_mm)):
-            add(bottom_cap(case))
+        with Locations((0, 0, config.cylinder_height)):
+            add(top_cap(config))
+        with Locations((0, 0, -config.square_height_mm)):
+            add(bottom_cap(config))
 
-        with BuildPart() as divider_wall:
-            with BuildLine() as spline_ln:
-                ln = divider_utils.divider_curve(
-                    case.lining_outer_radius,
-                    case.wall_thickness_mm,
-                )
-                tangent = ln % 0.5
-                orthogonal_plane = Plane(
-                    origin=(0, 0, case.cylinder_bottom),
-                    z_dir=tangent,
-                )
-            with BuildSketch(orthogonal_plane) as spline_sk:
-                Rectangle(
-                    case.wall_thickness_mm * 2,
-                    case.cylinder_height,
-                    align=(Align.CENTER, Align.MAX),
-                )
-            sweep()
+        divider_wall, divider_solid = curved_divider_wall.divider_wall_and_solid(
+            config.lining_outer_radius,
+            config.wall_thickness_mm,
+            config.cylinder_height,
+            config.square_loft_radius * 2,
+        )
+        add(divider_wall)
 
-            with BuildSketch(
-                Plane(
-                    origin=(0, 0, case.cylinder_bottom),
-                    z_dir=(0, 0, 1),
-                )
-            ):
-                with Locations(
-                    (-case.lining_outer_radius + case.wall_thickness_mm, 0),
-                    (case.lining_outer_radius - case.wall_thickness_mm, 0),
-                ):
-                    Circle(case.wall_thickness_mm)
-            extrude(amount=case.cylinder_height)
+        case_part = case.part
+        divider_solid_part = divider_solid.part
+        assert isinstance(case_part, Part)
+        assert isinstance(divider_solid_part, Part)
 
-        divider_solid_part = divider_utils.divider_solid(
-            case.lining_outer_radius,
-            case.square_loft_radius,
-            case.wall_thickness_mm,
-        ).part.move(Location((0, 0, case.cylinder_bottom - case.square_height_mm)))
+        divider_solid_part = divider_solid_part.move(
+            Location((0, 0, config.cylinder_bottom - config.square_height_mm))
+        )
 
-        left = case_part.part - divider_solid_part
-        right = case_part.part & divider_solid_part
+        left = case_part - divider_solid_part
+        right = case_part & divider_solid_part
 
     # Base
     with BuildPart(
-        Location((0, 0, case.cylinder_bottom - case.square_height_mm))
+        Location((0, 0, config.cylinder_bottom - config.square_height_mm))
     ) as base_disc:
-        add(mount_disc(case))
+        add(mount_disc(config))
 
         # Extra space at bottom of right case half
-        with Locations((0, 0, -case.right_cap_buffer)):
-            remove_part = divider_utils.divider_solid(
-                case.lining_outer_radius,
-                case.square_loft_radius,
-                case.wall_thickness_mm,
+        with Locations((0, 0, -config.right_cap_buffer)):
+            remove_part = curved_divider_wall.build_divider_solid(
+                config.lining_outer_radius,
+                config.square_loft_radius * 2,
+                config.wall_thickness_mm,
             ).part
+            assert isinstance(remove_part, Part)
             add(remove_part, mode=Mode.SUBTRACT)
 
-    left = left.solid() + base_disc.solid()
+    left = left.solid()
+    assert isinstance(left, Solid)
+    left += base_disc.solid()
+    assert isinstance(left, Solid)
+
     right = right.solid()
+    assert isinstance(right, Solid)
 
     return left, right

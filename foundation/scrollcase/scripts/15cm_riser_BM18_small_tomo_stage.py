@@ -12,7 +12,9 @@ RISER_HEIGHT = 150
 
 
 def build_riser():
-    case = sc.case.ScrollCase(scroll_height_mm=NO_SCROLL, scroll_radius_mm=NO_SCROLL)
+    case = sc.case.ScrollCaseConfig(
+        scroll_height_mm=NO_SCROLL, scroll_radius_mm=NO_SCROLL
+    )
 
     with BuildPart() as riser:
         # Wide base cylinder
@@ -46,14 +48,14 @@ def build_riser():
             ),
         ):
             Cylinder(
-                case.base_bolt_hole_diameter_mm / 2,
+                case.m6_clearance_hole_diameter_semi_loose_mm / 2,
                 case.square_height_mm,
                 mode=Mode.SUBTRACT,
                 align=(Align.CENTER, Align.CENTER, Align.MAX),
             )
             Cylinder(
-                case.base_bolt_hole_counter_bore_diameter_mm / 2,
-                case.base_bolt_hole_counter_bore_depth_mm,
+                case.m6_head_counter_bore_diameter_mm / 2,
+                case.m6_head_counter_bore_depth_mm,
                 mode=Mode.SUBTRACT,
                 align=(Align.CENTER, Align.CENTER, Align.MAX),
             )
@@ -110,7 +112,7 @@ def build_riser():
             ),
         ):
             Cylinder(
-                case.base_bolt_hole_diameter_for_tapping_mm / 2,
+                case.m6_clearance_hole_diameter_for_tapping_mm / 2,
                 case.square_height_mm * 3,
                 mode=Mode.SUBTRACT,
                 align=(Align.CENTER, Align.CENTER, Align.MAX),
