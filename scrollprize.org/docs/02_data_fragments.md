@@ -44,7 +44,7 @@ hide_table_of_contents: true
 
 Scanning protocols, coordinate systems, and data formats mirror those used for the [full scrolls](data_scrolls). Every fragment dataset contains:
 
-* **3 D X‑ray volumes** at several resolutions / beam energies.
+* **3D X‑ray volumes** at several resolutions / beam energies.
 * **Multispectral photographs** (RGB + IR).
 * **Hand‑labeled ink masks** for at least one surface volume, suitable for supervised ML.
 
