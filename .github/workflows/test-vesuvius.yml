@@ -26,8 +26,8 @@ jobs:
     - name: Install vesuvius package locally
       working-directory: vesuvius
       run: |
-        python -m pip install --upgrade pip uv
-        uv pip install --system .
+        python -m pip install --upgrade pip
+        pip install --system .
     
     - name: Test vesuvius import
       working-directory: /tmp
