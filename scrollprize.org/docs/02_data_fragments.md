@@ -50,14 +50,14 @@ Scanning protocols, coordinate systems, and data formats mirror those used for t
 
 We group the fragments by the facility where they were scanned:
 
-1. **EduceLab Fragments (2023)** – Six fragments scanned at Diamond Light Source (UK).
+1. **DLS Fragments (2023)** – Six fragments scanned at Diamond Light Source (UK).
 2. **ESRF Fragments (2025)** – Three fragments scanned on beamline BM18 at the European Synchrotron Radiation Facility (Grenoble, FR).
 
 > **Work‑in‑progress 👷‍♀️**   File formats, folder names, and alignment conventions may still shift.  Expect additional volumes, surface volumes and meshes and ink labels to appear over time!
 
 ---
 
-## 1 · EduceLab Fragments (Diamond Light Source)
+## 1 · DLS (Diamond Light Source) Fragments
 
 The first six fragments to be released. They were scanned at Diamond Light Source.
 For more technical details, see [EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT](https://arxiv.org/abs/2304.02084) and [EduceLab Herculaneum Scroll Data (2023) Info Sheet](https://drive.google.com/file/d/1I6JNrR6A9pMdANbn6uAuXbcDNwjk8qZ2/view?usp=sharing).
@@ -176,7 +176,8 @@ Between **6 May 2025 and 12 May 2025** we scanned three additional fr
                  ├─ ir.png
                  ├─ inklabels.png
                  └─ alignment.psd
-/esrf_fragments/          # ESRF 2025 datasets (OME‑Zarr)
+                 
+/fragments/          # ESRF 2025 datasets (OME‑Zarr)
   └─ PHerc0500P2/
        ├─ 2.215um_HEL_TA_0.4m_110keV.zarr/
        ├─ 4.317um_HA_… .zarr/
