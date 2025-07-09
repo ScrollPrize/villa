@@ -1,0 +1,28 @@
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*$py.class
+*.so
+.Python
+env/
+venv/
+discord_env/
+
+# Vector store data
+discord_vector_store/
+discord_vector_store_full/
+
+# IDE
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+sample_text.json
