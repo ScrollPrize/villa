@@ -2,7 +2,9 @@ import numpy as np
 import random
 from typing import Tuple
 import sys
+
 sys.setrecursionlimit(1000000)
+
 
 def _is_in_circle(pt: np.ndarray, center: np.ndarray, radius: float) -> bool:
     """Check if point `pt` is inside or on the circle defined by (center, radius).
@@ -15,7 +17,7 @@ def _is_in_circle(pt: np.ndarray, center: np.ndarray, radius: float) -> bool:
     Returns:
         bool: True if the point is inside or on the circle, False otherwise.
     """
-    return np.linalg.norm(pt - center) <= radius + 1e-14
+    return bool(np.linalg.norm(pt - center) <= radius + 1e-14)
 
 
 def _circle_two_points(p1: np.ndarray, p2: np.ndarray) -> Tuple[np.ndarray, float]:
@@ -30,7 +32,7 @@ def _circle_two_points(p1: np.ndarray, p2: np.ndarray) -> Tuple[np.ndarray, floa
     """
     center = (p1 + p2) / 2.0
     radius = np.linalg.norm(p1 - center)
-    return center, radius
+    return center, float(radius)
 
 
 def _circle_three_points(
@@ -79,7 +81,7 @@ def _circle_three_points(
 
     center = np.array([ux, uy], dtype=float)
     radius = np.linalg.norm(p1 - center)
-    return center, radius
+    return center, float(radius)
 
 
 def _make_circle(boundary_points: list[np.ndarray]) -> Tuple[np.ndarray, float]:

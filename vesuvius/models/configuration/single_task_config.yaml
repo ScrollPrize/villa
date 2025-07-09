@@ -1,17 +1,20 @@
-tr_setup:
-  model_name: SingleTask_Binary_Segmentation
-
 tr_config:
-  patch_size: [64, 64, 64]
+  patch_size: [128, 128, 128]
+  initial_lr: 0.001
 
 dataset_config:
   binarize_labels: false
   min_labeled_ratio: 0 
   min_bbox_percent: 0 
+  normalization_scheme: "minmax"
   skip_patch_validation: true
   targets:
-    eigenvalues:
+    img:
       activation: "none"
-      weight: 1
-      out_channels: 3
+      out_channels: 1
+      losses:
+        - name: "L1Loss"
+          weight: 1.0
 
+model_config:
+  features_per_stage: [64,128,256,320,512,512]

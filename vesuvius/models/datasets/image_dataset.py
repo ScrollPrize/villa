@@ -323,11 +323,16 @@ class ImageDataset(BaseDataset):
         
         # Find all label files to determine which images and targets we need
         # Support multiple image formats
+        print(f"DEBUG: Searching for label files in {labels_dir}")
         supported_extensions = ['.tif', '.tiff', '.png', '.jpg', '.jpeg']
         label_files = []
         for ext in supported_extensions:
-            label_files.extend(labels_dir.glob(f"*{ext}"))
+            print(f"DEBUG: Looking for files with extension {ext}")
+            found_files = list(labels_dir.glob(f"*{ext}"))
+            print(f"DEBUG: Found {len(found_files)} files with extension {ext}")
+            label_files.extend(found_files)
         
+        print(f"DEBUG: Total label files found: {len(label_files)}")
         if not label_files:
             raise ValueError(f"No image files found in {labels_dir} with supported extensions: {supported_extensions}")
         
@@ -337,8 +342,11 @@ class ImageDataset(BaseDataset):
         # Track files to convert for progress bar
         files_to_process = []
         
+        print(f"DEBUG: Processing {len(label_files)} label files...")
         # First pass: idenimagey all files that need processing
-        for label_file in label_files:
+        for idx, label_file in enumerate(label_files):
+            if idx % 100 == 0:
+                print(f"DEBUG: Processing label file {idx}/{len(label_files)}")
             stem = label_file.stem  # Remove image extension
             
             # Parse label filename: image1_ink.tif -> image_id="image1", target="ink"
@@ -399,7 +407,11 @@ class ImageDataset(BaseDataset):
         array_info = {}  # Track which arrays go where
         arrays_to_create = []  # Track arrays that need pre-creation
         
-        for target, image_id, image_file, label_file, mask_file in files_to_process:
+        print(f"DEBUG: Found {len(files_to_process)} files to process")
+        print(f"DEBUG: Building conversion tasks...")
+        for idx, (target, image_id, image_file, label_file, mask_file) in enumerate(files_to_process):
+            if idx % 100 == 0:
+                print(f"DEBUG: Building conversion task {idx}/{len(files_to_process)}")
             # Determine array names
             if image_file.stem.endswith(f"_{target}"):
                 image_array_name = f"{image_id}_{target}"
@@ -414,10 +426,18 @@ class ImageDataset(BaseDataset):
             # Image conversion
             if image_array_name not in images_group or self._needs_update(image_file, images_group, image_array_name):
                 # Read shape for pre-creation
-                if str(image_file).lower().endswith(('.tif', '.tiff')):
-                    img_shape = tifffile.imread(str(image_file)).shape
-                else:
-                    img_shape = cv2.imread(str(image_file)).shape
+                print(f"DEBUG [{idx}]: Checking image file: {image_file.name}")
+                try:
+                    if str(image_file).lower().endswith(('.tif', '.tiff')):
+                        print(f"DEBUG [{idx}]: Reading TIFF shape...")
+                        img_shape = tifffile.imread(str(image_file)).shape
+                    else:
+                        print(f"DEBUG [{idx}]: Reading non-TIFF shape...")
+                        img_shape = cv2.imread(str(image_file)).shape
+                    print(f"DEBUG [{idx}]: Successfully read shape: {img_shape}")
+                except Exception as e:
+                    print(f"ERROR [{idx}]: Failed to read {image_file.name}: {str(e)}")
+                    raise
                 arrays_to_create.append((images_group, image_array_name, img_shape))
                 conversion_tasks.append((image_file, images_zarr_path, image_array_name, self.patch_size, True))
             
@@ -534,14 +554,20 @@ class ImageDataset(BaseDataset):
         # Convert to the expected format for BaseDataset
         self.target_volumes = {}
         
+        # Also store volume IDs in order for each target
+        self.volume_ids = {}
+        
         for target, images_dict in targets_data.items():
             self.target_volumes[target] = []
+            self.volume_ids[target] = []
             
             for image_id, data_dict in images_dict.items():
                 volume_info = {
-                    'data': data_dict
+                    'data': data_dict,
+                    'volume_id': image_id  # Store the volume ID
                 }
                 self.target_volumes[target].append(volume_info)
+                self.volume_ids[target].append(image_id)
             
             print(f"Target '{target}' has {len(self.target_volumes[target])} volumes")
         

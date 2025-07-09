@@ -152,9 +152,11 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Synthetic instance labels and volume generation](https://lcparker/synthetic-pages) by lcparker
     - Generate artificial 3D volumes with corresponding instance labels for use in pretraining instance segmentation networks
- 
+
 - [Mask3D for instance segmentation on scroll volumes](https://lcparker/Mask3D) by lcparker
     - SOTA instance segmentation network, configured to work with scroll volumes
+    - [Effects of pretraining on synthetically generated data](https://github.com/lcparker/pretraining-advantage), plus pretrained and finetuned weights for the Mask3D network
+
 
 
 ### 📦 Materials

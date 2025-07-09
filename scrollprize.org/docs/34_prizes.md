@@ -162,7 +162,7 @@ We favor submissions that:
 We maintain a [public wishlist](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22help%20wanted%22) of ideas that would make excellent progress prize submissions.
 Some are additionally labeled as [good first issues](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) for newcomers!
 
-Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, April 30th, 2025!
+Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, June 30th, 2025!
 
 <details>
 <summary>Submission criteria and requirements</summary>
@@ -181,7 +181,7 @@ Submissions are evaluated monthly, and multiple submissions/awards per month are
    * Designed for modular integration
 </details>
 
-[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSc0yrAetoErg3BPt9FYblj3Emhg9eZcdJYJ15M7K63izO9ICQ/viewform?usp=dialog)
+[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSeyVRnHEu-7XG_JxYNCnP8Tzej6PE9itrGTFJAAtKJjB0C9Qg/viewform?usp=dialog)
 
 ***
 

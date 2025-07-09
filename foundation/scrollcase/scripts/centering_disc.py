@@ -20,7 +20,9 @@ NO_SCROLL = 0
 
 
 def build_disc():
-    case = sc.case.ScrollCase(scroll_height_mm=NO_SCROLL, scroll_radius_mm=NO_SCROLL)
+    case = sc.case.ScrollCaseConfig(
+        scroll_height_mm=NO_SCROLL, scroll_radius_mm=NO_SCROLL
+    )
 
     # Base
     with BuildPart() as centering_disc:

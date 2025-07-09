@@ -303,16 +303,30 @@ def is_cache_valid(
     bool
         True if cache is valid, False otherwise
     """
-    # Check all configuration parameters match
-    config_keys = [
+    # Define core configuration keys that must always be checked
+    core_config_keys = [
         'patch_size', 'min_labeled_ratio', 'min_bbox_percent',
         'skip_patch_validation', 'targets', 'is_2d_dataset'
     ]
     
-    for key in config_keys:
+    # Check core configuration parameters
+    for key in core_config_keys:
         if key not in cache_data or cache_data.get(key) != current_config.get(key):
             print(f"Cache invalid: {key} mismatch")
             return False
+    
+    # Check additional configuration parameters that might be present
+    # This handles dataset-specific parameters like those from MAE dataset
+    additional_keys = [
+        'dataset_type', 'normalization_scheme', 'use_bounding_box', 'nonzero_validated'
+    ]
+    
+    for key in additional_keys:
+        # Only check if the key exists in current config
+        if key in current_config:
+            if key not in cache_data or cache_data.get(key) != current_config.get(key):
+                print(f"Cache invalid: {key} mismatch (expected {current_config.get(key)}, got {cache_data.get(key)})")
+                return False
     
     # Check data freshness
     cached_checksums = cache_data.get('data_checksums', {})
@@ -327,6 +341,13 @@ def is_cache_valid(
             if cached_mtime != current_mtime:
                 print(f"Cache invalid: {file_path} was modified")
                 return False
+    
+    # Final check: ensure all keys in current_config match those in cache_data
+    # This catches any dataset-specific parameters we might have missed
+    for key, value in current_config.items():
+        if key in cache_data and cache_data[key] != value:
+            print(f"Cache invalid: config parameter '{key}' mismatch (expected {value}, got {cache_data[key]})")
+            return False
     
     return True
 

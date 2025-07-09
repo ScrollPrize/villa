@@ -1,0 +1,60 @@
+# Minimal MAE Pretraining Configuration
+# Using autoconfigure to automatically determine network architecture
+
+tr_setup:
+  model_name: MAE_Pretrain_Vesuvius
+  autoconfigure: true
+
+tr_config:
+  patch_size: [128, 128, 128]  # 3D patches for pretraining
+  batch_size: 2
+  initial_lr: 0.0001
+
+  normalization_scheme: "robust"  # Use robust normalization for MAE (median/MAD based)
+
+dataset_config:
+  # skip_bounding_box: true  # Skip bounding box computation and search entire volume for patches
+  # data_paths:
+  #   - "s3://scrollprize-volumes/esrf/20250506/2.215um_HEL_TA_0.4m_110keV_scroll-fragment_0500P2_TA_0001_masked.zarr/"
+  #   - "s3://scrollprize-volumes/esrf/20250506/4.317um_HA2200_HEL_111keV_1.2m_scroll-fragment-0500P2_D_0001_masked.zarr/"
+  #   - "s3://scrollprize-volumes/esrf/20250506/SCROLLS_HEL_2.215um_0.4m_111keV_PHerc0343P_TA_0001_masked.zarr/"
+  #   - "s3://scrollprize-volumes/esrf/20250506/SCROLLS_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0175A_TA_0001_masked.zarr/"
+  #   - "s3://scrollprize-volumes/esrf/20250506/SCROLLS_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0800_TA_B_0001_masked.zarr/"
+  #   - "s3://scrollprize-volumes/esrf/20250506/SCROLLS_HEL_4.320um_1.0m_116keV_binmean_2_PHerc1218_TA_0001_masked.zarr/"
+  #   - "s3://scrollprize-volumes/esrf/20250506/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0009B_TA_0001_masked.zarr/"
+  #   - "s3://scrollprize-volumes/esrf/20250506/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0175B_TA_0001_masked.zarr/"
+  #   - "s3://scrollprize-volumes/esrf/20250506/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0306B_TA_0001_masked.zarr/"
+  #   - "s3://scrollprize-volumes/esrf/20250506/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0343_TA_0001_masked.zarr/"
+  #   - "s3://scrollprize-volumes/esrf/20250506/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0343P_TA_0001_masked.zarr/"
+  #   - "s3://scrollprize-volumes/esrf/20250506/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0483A_TA_0001_masked.zarr/"
+  #   - "s3://scrollprize-volumes/esrf/20250506/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0490A_TA_0001_masked.zarr/"
+  #   - "s3://scrollprize-volumes/esrf/20250506/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0490B_TA_0001_masked.zarr/"
+  #   - "s3://scrollprize-volumes/esrf/20250506/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc1447_C_TA_0001_masked.zarr/"
+  #   - "s3://scrollprize-volumes/esrf/20250506/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc1451_TA_0001_masked.zarr/"
+  #   - "https://dl.ash2txt.org/community-uploads/james/Scroll1/Scroll1_8um.zarr/"
+  #   - "https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s5/s5_masked_ome.zarr/"
+
+  skip_bounding_box: true
+  dataset_class: "MAEPretrainDataset"
+  mask_ratio: 0.75  # Maximum mask ratio (75% of patches)
+  min_mask_ratio: 0.10  # Starting mask ratio (10% of patches)
+  
+  targets:
+    reconstruction:
+      activation: "none"
+      losses:
+        - name: "MaskedReconstructionLoss"
+          weight: 1.0
+          config:
+            base_loss: "mse"
+            variance_threshold: 0.1  # Skip normalization if std < 0.1 to avoid numerical instability
+            use_robust_norm: true  # Use median/MAD instead of mean/std
+            max_loss_value: 100.0  # Clamp loss to prevent extreme spikes
+            log_high_losses: true  # Log when high losses occur for debugging
+
+model_config:
+  # Enable MAE mode - this is the key flag
+  mae_mode: true
+  
+  # Optional: Use residual blocks for better gradient flow
+  basic_encoder_block: "BasicBlockD"

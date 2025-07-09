@@ -16,10 +16,9 @@ class ConfigManager:
     def __init__(self, verbose):
         self._config_path = None
         self.data = None # note that config manager DOES NOT hold data, 
-                         # it just holds the path to the data
+                         # it just holds the path to the data, currently an annoying holdover from old napari trainer
         self.verbose = verbose
-        self.selected_loss_function = "CEDiceLoss" # this is just a default loss value 
-                                                          # so we can init without it being empty
+        self.selected_loss_function = None
 
     def load_config(self, config_path):
         config_path = Path(config_path)
@@ -32,31 +31,35 @@ class ConfigManager:
         self.model_config = config.get("model_config", {}) 
         self.dataset_config = config.get("dataset_config", {})
 
-        # Load inference parameters from inference_config section if it exists
-        # but store them as direct attributes instead of keeping inference_config
+        # Load targets from dataset_config or model_config if available
+        self.targets = self.dataset_config.get("targets", {})
+        if not self.targets and "targets" in self.model_config:
+            self.targets = self.model_config.get("targets", {})
+
+        # Load inference parameters directly
         infer_config = config.get("inference_config", {})
-        self._set_inference_attributes(infer_config)
+        self.infer_checkpoint_path = infer_config.get("checkpoint_path", None)
+        self.infer_patch_size = infer_config.get("patch_size", None)
+        self.infer_batch_size = infer_config.get("batch_size", None)
+        self.infer_output_targets = infer_config.get("output_targets", ['all'])
+        self.infer_overlap = infer_config.get("overlap", 0.50)
+        self.load_strict = infer_config.get("load_strict", True)
+        self.infer_num_dataloader_workers = infer_config.get("num_dataloader_workers", None)
 
-        # Load auxiliary tasks configuration
         self.auxiliary_tasks = config.get("auxiliary_tasks", {})
-        self._validate_auxiliary_tasks()
-
         self._init_attributes()
-        
-        # Apply auxiliary tasks after loading config
+    
         if self.auxiliary_tasks and self.targets:
             self._apply_auxiliary_tasks()
 
         return config
 
     def _init_attributes(self):
-        self.train_patch_size = tuple(self.tr_configs.get("patch_size", [192, 192, 192]))
-        self.in_channels = 1
+
 
         self.model_name = self.tr_info.get("model_name", "Model")
         self.autoconfigure = bool(self.tr_info.get("autoconfigure", True))
         self.tr_val_split = float(self.tr_info.get("tr_val_split", 0.95))
-        self.dilate_label = int(self.tr_info.get("dilate_label", 0))
         self.compute_loss_on_labeled_only = bool(self.tr_info.get("compute_loss_on_labeled_only", False))
 
         ckpt_out_base = self.tr_info.get("ckpt_out_base", "./checkpoints/")
@@ -67,52 +70,41 @@ class ConfigManager:
         self.checkpoint_path = Path(ckpt_path) if ckpt_path else None
         self.load_weights_only = bool(self.tr_info.get("load_weights_only", False))
 
-        # Training config
-        self.optimizer = self.tr_configs.get("optimizer", "SGD")
-        
-        # Set optimizer-specific defaults for learning rate and weight decay
-        if self.optimizer == "AdamW":
-            # AdamW always goes inf/nan w/ 0.01 lr so we use 1e-3
-            default_lr = 1e-3  # 0.001
-            default_weight_decay = 0.01 
-        elif self.optimizer == "SGD":
-            # SGD can handle higher learning rates, on par w/ nnunetv2
-            default_lr = 0.01
-            default_weight_decay = 3e-5  # 0.00003
-        elif self.optimizer == "Adam":
-            default_lr = 1e-3
-            default_weight_decay = 0
-        else:
-            default_lr = 1e-3
-            default_weight_decay = 0
-        
-        # Use config values if provided, otherwise use optimizer-specific defaults
-        self.initial_lr = float(self.tr_configs.get("initial_lr", default_lr))
-        self.weight_decay = float(self.tr_configs.get("weight_decay", default_weight_decay))
-        
-        # Print message if using optimizer-specific defaults
-        if "initial_lr" not in self.tr_configs and self.verbose:
-            print(f"Using {self.optimizer}-specific default learning rate: {self.initial_lr}")
-        if "weight_decay" not in self.tr_configs and self.verbose:
-            print(f"Using {self.optimizer}-specific default weight decay: {self.weight_decay}")
+        ### Training config ### 
+        self.train_patch_size = tuple(self.tr_configs.get("patch_size", [192, 192, 192]))
+        self.in_channels = 1
         self.train_batch_size = int(self.tr_configs.get("batch_size", 2))
         self.gradient_accumulation = int(self.tr_configs.get("gradient_accumulation", 1))
-        self.max_steps_per_epoch = int(self.tr_configs.get("", 200))
+        self.max_steps_per_epoch = int(self.tr_configs.get("max_steps_per_epoch", 200))
         self.max_val_steps_per_epoch = int(self.tr_configs.get("max_val_steps_per_epoch", 25))
         self.train_num_dataloader_workers = int(self.tr_configs.get("num_dataloader_workers", 4))
         self.max_epoch = int(self.tr_configs.get("max_epoch", 1000))
-
-        # Dataset config
+        self.optimizer = self.tr_configs.get("optimizer", "SGD")
+        self.initial_lr = float(self.tr_configs.get("initial_lr", 0.0001))
+        self.weight_decay = float(self.tr_configs.get("weight_decay", 0.0001))
+        
+        ### Dataset config ###
         self.min_labeled_ratio = float(self.dataset_config.get("min_labeled_ratio", 0.10))
         self.min_bbox_percent = float(self.dataset_config.get("min_bbox_percent", 0.95))
 
         # Skip patch validation -- consider all possible patch positions as valid
         self.skip_patch_validation = bool(self.dataset_config.get("skip_patch_validation", False))
-
-        # Cache valid patches
+        
+        # Skip finding the minimum bounding box which would contain all the labels.
+        # its a bit of a waste of computation when considering the downsampled zarr patches are quite fast to check
+        self.skip_bounding_box = bool(self.dataset_config.get("skip_bounding_box", True))
         self.cache_valid_patches = bool(self.dataset_config.get("cache_valid_patches", True))
-        self.binarize_labels = bool(self.dataset_config.get("binarize_labels", True)) 
-        self.target_value = self.dataset_config.get("target_value", "auto")  # "auto", int, or dict
+        
+        # this horrific name is so you can set specific loss functions for specific label volumes,
+        # say for example one volume doesn't have the same labels as the others.
+        self.volume_task_loss_config = self.dataset_config.get("volume_task_loss_config", {})
+        if self.volume_task_loss_config and self.verbose:
+            print(f"Volume-task loss configuration loaded: {self.volume_task_loss_config}")
+        
+        # Label threshold - values below this will be set to 0, values at or above will be set to target_value
+        self.label_threshold = self.dataset_config.get("label_threshold", None)
+        if self.label_threshold is not None:
+            self.label_threshold = float(self.label_threshold)
         
         # Spatial transformations control
         self.no_spatial = bool(self.dataset_config.get("no_spatial", False))
@@ -120,19 +112,7 @@ class ConfigManager:
         # Normalization configuration
         self.normalization_scheme = self.dataset_config.get("normalization_scheme", "zscore")
         self.intensity_properties = self.dataset_config.get("intensity_properties", {})
-        self.use_mask_for_norm = bool(self.dataset_config.get("use_mask_for_norm", False))
-
-        # Only initialize targets from config if not already created dynamically
-        if not hasattr(self, 'targets') or not self.targets:
-            self.targets = self.dataset_config.get("targets", {})
-            if self.verbose and self.targets:
-                print(f"Loaded targets from config: {self.targets}")
-
-        if self.verbose:
-            print(f"Binarization settings - binarize_labels: {self.binarize_labels}, target_value: {self.target_value}")
-
-        # Validate configuration consistency
-        self._validate_binarization_config()
+        self.use_mask_for_norm = bool(self.dataset_config.get("use_mask_for_norm", False))                
 
         # model config
 
@@ -157,11 +137,9 @@ class ConfigManager:
             # Look for either 'out_channels' or 'channels' in the task info
             if 'out_channels' in task_info:
                 channels = task_info['out_channels']
-            elif 'channels' in task_info:
-                channels = task_info['channels']
             else:
                 if self.verbose:
-                    print(f"Target {target_name} has no channel specification - will auto-detect from data")
+                    print(f"Target {target_name} has no channel specification - will attempt to auto-detect from data")
                 channels = None  # Placeholder, will be set during auto-detection
 
             if channels is not None:
@@ -215,71 +193,12 @@ class ConfigManager:
         else:
             self.out_channels = None  # Will be set during auto-detection
 
-        if data_dict:
-            first_target = next(iter(data_dict.values()))[0]
-            if 'data' in first_target and 'data' in first_target['data']:
-                img_data = first_target['data']['data']
-                data_is_2d = len(img_data.shape) == 2
-                config_is_2d = len(self.train_patch_size) == 2
-
-                if data_is_2d != config_is_2d:
-                    self._reconfigure_dimensionality(data_is_2d)
 
         if self.verbose:
             print(f"Set targets: {list(self.targets.keys())}")
             print(f"Output channels: {self.out_channels}")
 
         return data_dict
-
-    def _set_inference_attributes(self, infer_config):
-        """
-        Set inference-specific attributes from the inference_config dictionary.
-        This replaces storing the entire inference_config dictionary.
-
-        Parameters
-        ----------
-        infer_config : dict
-            Dictionary with inference configuration parameters
-        """
-        # Set inference attributes directly from the config
-        self.infer_checkpoint_path = infer_config.get("checkpoint_path", None)
-
-        # For attributes that depend on training attributes, we'll set defaults in _init_attributes
-        # since training attributes might not be set yet
-        if "patch_size" in infer_config:
-            self.infer_patch_size = tuple(infer_config.get("patch_size"))
-
-        if "batch_size" in infer_config:
-            self.infer_batch_size = int(infer_config.get("batch_size"))
-
-        self.infer_output_targets = infer_config.get("output_targets", ['all'])
-        self.infer_overlap = float(infer_config.get("overlap", 0.50))
-        self.load_strict = bool(infer_config.get("load_strict", True))
-
-        if "num_dataloader_workers" in infer_config:
-            self.infer_num_dataloader_workers = int(infer_config.get("num_dataloader_workers"))
-
-        if self.verbose:
-            print("Set inference attributes from config")
-
-    def _reconfigure_dimensionality(self, data_is_2d):
-        """
-        Adjust patch size based on data dimensionality. 
-        NetworkFromConfig will handle operation selection automatically.
-        """
-        if data_is_2d:
-            # Data is 2D but config is 3D - adjust patch size
-            if len(self.train_patch_size) > 2:
-                if self.verbose:
-                    print(f"Data is 2D but config patch_size is 3D. Adjusting patch_size from {self.train_patch_size} to 2D.")
-                self.train_patch_size = self.train_patch_size[-2:]
-                self.tr_configs["patch_size"] = list(self.train_patch_size)
-        else:
-            # Data is 3D but config is 2D - this is less common but could happen
-            if len(self.train_patch_size) == 2:
-                if self.verbose:
-                    print(f"Data is 3D but config patch_size is 2D. NetworkFromConfig will handle operation selection.")
-                # Let NetworkFromConfig handle this case - it has better validation logic
 
     def save_config(self):
         tr_setup = deepcopy(self.tr_info)
@@ -326,7 +245,8 @@ class ConfigManager:
 
     def update_config(self, patch_size=None, min_labeled_ratio=None, max_epochs=None, loss_function=None, 
                      binarize_labels=None, target_value=None, skip_patch_validation=None,
-                     normalization_scheme=None, intensity_properties=None):
+                     normalization_scheme=None, intensity_properties=None, label_threshold=None,
+                     skip_bounding_box=None):
         if patch_size is not None:
             if isinstance(patch_size, (list, tuple)) and len(patch_size) >= 2:
                 self.train_patch_size = tuple(patch_size)
@@ -389,102 +309,17 @@ class ConfigManager:
             if self.verbose:
                 print(f"Updated intensity properties: {self.intensity_properties}")
 
-    def _validate_binarization_config(self):
-        """
-        Validate the binarization configuration parameters for consistency.
-        """
-        if not self.binarize_labels and isinstance(self.target_value, dict):
+        if label_threshold is not None:
+            self.label_threshold = float(label_threshold) if label_threshold is not None else None
+            self.dataset_config["label_threshold"] = self.label_threshold
             if self.verbose:
-                print("Warning: target_value is a dict but binarize_labels is False. Target value mapping will be ignored.")
+                print(f"Updated label_threshold: {self.label_threshold}")
 
-        if isinstance(self.target_value, dict):
-            for target_name, value in self.target_value.items():
-                if isinstance(value, dict):
-                    # Check if this is the new format with mapping and regions
-                    if 'mapping' in value:
-                        # New format with mapping and optional regions
-                        mapping = value['mapping']
-                        regions = value.get('regions', {})
-
-                        # Validate mapping
-                        for orig_val, new_val in mapping.items():
-                            if not isinstance(orig_val, (int, float)) or not isinstance(new_val, (int, float)):
-                                raise ValueError(f"Invalid mapping in target '{target_name}': {orig_val} -> {new_val}. Both values must be numeric.")
-
-                        # Validate regions
-                        if regions:
-                            mapped_values = set(mapping.values())
-                            for region_id, source_classes in regions.items():
-                                if not isinstance(region_id, (int, float)):
-                                    raise ValueError(f"Region ID must be numeric, got {region_id} ({type(region_id).__name__})")
-                                if region_id in mapped_values:
-                                    raise ValueError(
-                                        f"Region ID {region_id} conflicts with existing mapped class in target '{target_name}'. "
-                                        f"Mapped classes: {sorted(mapped_values)}"
-                                    )
-                                if not isinstance(source_classes, list):
-                                    raise ValueError(
-                                        f"Region {region_id} in target '{target_name}' must specify a list of source classes, "
-                                        f"got {type(source_classes).__name__}"
-                                    )
-                                for src_class in source_classes:
-                                    if not isinstance(src_class, (int, float)):
-                                        raise ValueError(
-                                            f"Source class {src_class} in region {region_id} must be numeric"
-                                        )
-                    else:
-                        # Old format: direct mapping
-                        for orig_val, new_val in value.items():
-                            if not isinstance(orig_val, (int, float)) or not isinstance(new_val, (int, float)):
-                                raise ValueError(f"Invalid multi-class mapping in target '{target_name}': {orig_val} -> {new_val}. Both values must be numeric.")
-                elif not isinstance(value, (int, float)):
-                    raise ValueError(f"Invalid target_value for '{target_name}': {value}. Must be int, float, or dict for multi-class mapping.")
-        elif self.target_value not in ["auto"] and not isinstance(self.target_value, (int, float)):
-            raise ValueError(f"Invalid target_value: {self.target_value}. Must be 'auto', int, float, or dict.")
-
-    def _validate_auxiliary_tasks(self):
-        """
-        Validate auxiliary tasks configuration.
-        """
-        if not self.auxiliary_tasks:
-            return
-            
-        supported_task_types = {"distance_transform"}
-        
-        for task_name, task_config in self.auxiliary_tasks.items():
-            if not isinstance(task_config, dict):
-                raise ValueError(f"Auxiliary task '{task_name}' must be a dictionary")
-                
-            task_type = task_config.get("type")
-            if not task_type:
-                raise ValueError(f"Auxiliary task '{task_name}' must specify a 'type'")
-                
-            if task_type not in supported_task_types:
-                raise ValueError(f"Unsupported auxiliary task type '{task_type}'. Supported types: {supported_task_types}")
-                
-            # Validate distance transform specific settings
-            if task_type == "distance_transform":
-                source_target = task_config.get("source_target")
-                if not source_target:
-                    raise ValueError(f"Distance transform auxiliary task '{task_name}' must specify a 'source_target'")
-                    
-                # Set default loss function for distance transform if not specified
-                if "loss_fn" not in task_config:
-                    task_config["loss_fn"] = "MSELoss"
-                    if self.verbose:
-                        print(f"Set default loss function 'MSELoss' for distance transform task '{task_name}'")
-                        
-                # Set default number of output channels (1 for distance maps)
-                if "out_channels" not in task_config:
-                    task_config["out_channels"] = 1
-                    
-                # Validate loss weight if specified
-                loss_weight = task_config.get("loss_weight", 1.0)
-                if not isinstance(loss_weight, (int, float)) or loss_weight < 0:
-                    raise ValueError(f"Loss weight for auxiliary task '{task_name}' must be a non-negative number")
-                    
-        if self.verbose and self.auxiliary_tasks:
-            print(f"Validated auxiliary tasks: {list(self.auxiliary_tasks.keys())}")
+        if skip_bounding_box is not None:
+            self.skip_bounding_box = bool(skip_bounding_box)
+            self.dataset_config["skip_bounding_box"] = self.skip_bounding_box
+            if self.verbose:
+                print(f"Updated skip_bounding_box: {self.skip_bounding_box}")
 
     def _apply_auxiliary_tasks(self):
         """
@@ -498,26 +333,50 @@ class ConfigManager:
             
             if task_type == "distance_transform":
                 source_target = aux_config["source_target"]
-                
-                # Check if source target exists
+            
                 if source_target not in self.targets:
                     raise ValueError(f"Source target '{source_target}' for auxiliary task '{aux_task_name}' not found in targets")
                 
-                # Create auxiliary target configuration
                 aux_target_name = f"{aux_task_name}"  # dt = distance transform
-                self.targets[aux_target_name] = {
-                    "out_channels": aux_config["out_channels"],
-                    "loss_fn": aux_config["loss_fn"],
-                    "activation": "none",  # Distance transforms need raw output
+                target_config = {
+                    "out_channels": aux_config.get("out_channels", 1),
+                    "activation": "none", 
                     "auxiliary_task": True,
                     "task_type": "distance_transform",
                     "source_target": source_target,
-                    "loss_weight": aux_config.get("loss_weight", 1.0),
-                    "weight": aux_config.get("loss_weight", 1.0)  # Also set as 'weight' for loss computation
+                    "weight": aux_config.get("loss_weight", 1.0)
                 }
+                
+
+                target_config["losses"] = aux_config["losses"]
+                self.targets[aux_target_name] = target_config
                 
                 if self.verbose:
                     print(f"Added distance transform auxiliary task '{aux_target_name}' from source '{source_target}'")
+                    
+            elif task_type == "surface_normals":
+                source_target = aux_config["source_target"]
+                
+                if source_target not in self.targets:
+                    raise ValueError(f"Source target '{source_target}' for auxiliary task '{aux_task_name}' not found in targets")
+                
+                aux_target_name = f"{aux_task_name}"
+                target_config = {
+                    "out_channels": aux_config.get("out_channels", None), 
+                    "activation": "none", 
+                    "auxiliary_task": True,
+                    "task_type": "surface_normals",
+                    "source_target": source_target,
+                    "weight": aux_config.get("loss_weight", 1.0),  
+                    "use_source_mask": True  
+                }
+                
+
+                target_config["losses"] = aux_config["losses"]
+                self.targets[aux_target_name] = target_config
+                
+                if self.verbose:
+                    print(f"Added surface normals auxiliary task '{aux_target_name}' from source '{source_target}'")
                     
         if self.verbose and self.auxiliary_tasks:
             print(f"Applied {len(self.auxiliary_tasks)} auxiliary tasks to targets")
@@ -566,11 +425,7 @@ class ConfigManager:
                     if self.verbose:
                         print(f"Auto-detected {detected_channels} channels for target '{target_name}'")
                     
-                    # Also update loss function if not set
-                    if 'loss_fn' not in self.targets[target_name]:
-                        self.targets[target_name]['loss_fn'] = 'BCEDiceLoss'
 
-        # Rebuild out_channels tuple
         if targets_updated:
             self.out_channels = tuple(
                 self.targets[t_name].get('out_channels', 2) 

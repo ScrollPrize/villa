@@ -89,8 +89,13 @@ def sample_from_zarr_with_progress(zarr_array, num_samples, vol_idx):
             xs = np.random.randint(0, w, size=batch_count)
             
             for z, y, x in zip(zs, ys, xs):
-                value = zarr_array[int(z), int(y), int(x)]
-                sampled_values.append(float(value))
+                try:
+                    value = zarr_array[int(z), int(y), int(x)]
+                    sampled_values.append(float(value))
+                except (ValueError, IndexError) as e:
+                    # Skip this sample if chunk is missing or corrupted
+                    print(f"Warning: Skipping sample at ({z}, {y}, {x}) due to error: {e}")
+                    continue
             
             if use_progress:
                 pbar.update(batch_count)
@@ -99,6 +104,14 @@ def sample_from_zarr_with_progress(zarr_array, num_samples, vol_idx):
     
     if use_progress:
         pbar.close()
+    
+    # Check if we collected any valid samples
+    if len(sampled_values) == 0:
+        raise ValueError(
+            f"Failed to collect any valid samples from zarr array with shape {shape}. "
+            f"This may indicate corrupted data, missing chunks, or incorrect array boundaries. "
+            f"Attempted to sample {num_samples} values from volume {vol_idx}."
+        )
     
     return sampled_values
 

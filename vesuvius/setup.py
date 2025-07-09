@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from setuptools import setup, find_packages
 from setuptools.command.install import install
 import warnings
@@ -23,6 +24,12 @@ class CustomInstallCommand(install):
         warnings.warn(message, UserWarning)
 
 
+def get_local_package_path(relative_path):
+    """Convert relative path to absolute file:// URL"""
+    current_file = Path(__file__).resolve()
+    target_path = (current_file.parent / relative_path).resolve()
+    return f"file://{target_path}"
+
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
@@ -40,7 +47,7 @@ setup(
         "aiohttp",
         "fsspec",
         "huggingface_hub",
-        "zarr",
+        "zarr>=2,<3",
         "tqdm",
         "lxml",
         "nest_asyncio",
@@ -48,10 +55,10 @@ setup(
         "pyyaml",
         "Pillow",
         "Torch",
-        "nnUNetv2",
         "scipy",
         "batchgenerators",
-        "batchgeneratorsv2",
+        f"batchgeneratorsv2 @ {get_local_package_path("../segmentation/models/batchgeneratorsv2")}",
+        f"nnUNetv2 @ {get_local_package_path("../segmentation/models/arch/nnunet")}",
         "dynamic_network_architectures",
         "monai",
         "magicgui",
