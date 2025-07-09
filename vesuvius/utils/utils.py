@@ -3,11 +3,11 @@ import torch.nn as nn
 from tqdm import tqdm
 
 
-def find_mask_patches(mask_array, label_array, patch_size, stride=None, min_mask_coverage=1.0, min_labeled_ratio=0.05, skip_mask_check=False):
+def find_mask_patches(mask_array, label_array, patch_size, stride=None, min_mask_coverage=1.0, min_labeled_ratio=0.05, skip_mask_check=False, min_nonzero_ratio=None):
     """
     Find 3D patches where:
     1. The patch is fully contained within the masked region (unless skip_mask_check=True)
-    2. The patch contains a minimum ratio of labeled voxels
+    2. The patch contains a minimum ratio of labeled voxels OR non-zero voxels
     
     Parameters:
     -----------
@@ -25,6 +25,8 @@ def find_mask_patches(mask_array, label_array, patch_size, stride=None, min_mask
         Minimum ratio of labeled voxels in the entire patch (0.05 = 5%)
     skip_mask_check : bool, optional
         If True, skip the mask coverage check entirely
+    min_nonzero_ratio : float, optional
+        If provided, check for minimum ratio of non-zero voxels instead of labeled voxels
     
     Returns:
     --------
@@ -68,21 +70,27 @@ def find_mask_patches(mask_array, label_array, patch_size, stride=None, min_mask
                         if mask_coverage < min_mask_coverage:
                             continue
                         
-                    # LABEL REQUIREMENT:
-                    # Calculate ratio of labeled voxels in the patch
-                    labeled_ratio = np.count_nonzero(label_patch) / label_patch.size
-                    
-                    # Only include patches with sufficient labeled voxels
-                    if labeled_ratio >= min_labeled_ratio:
-                        patches.append({'start_pos': [z, y, x]})
+                    # LABEL/NONZERO REQUIREMENT:
+                    if min_nonzero_ratio is not None:
+                        # Check for non-zero ratio (for MAE pretraining)
+                        nonzero_ratio = np.count_nonzero(label_patch) / label_patch.size
+                        if nonzero_ratio >= min_nonzero_ratio:
+                            patches.append({'start_pos': [z, y, x]})
+                    else:
+                        # Calculate ratio of labeled voxels in the patch
+                        labeled_ratio = np.count_nonzero(label_patch) / label_patch.size
+                        
+                        # Only include patches with sufficient labeled voxels
+                        if labeled_ratio >= min_labeled_ratio:
+                            patches.append({'start_pos': [z, y, x]})
     
     return patches
 
-def find_mask_patches_2d(mask_array, label_array, patch_size, stride=None, min_mask_coverage=1.0, min_labeled_ratio=0.05, skip_mask_check=False):
+def find_mask_patches_2d(mask_array, label_array, patch_size, stride=None, min_mask_coverage=1.0, min_labeled_ratio=0.05, skip_mask_check=False, min_nonzero_ratio=None):
     """
     Find 2D patches where:
     1. The patch is fully contained within the masked region (unless skip_mask_check=True)
-    2. The patch contains a minimum ratio of labeled pixels
+    2. The patch contains a minimum ratio of labeled pixels OR non-zero pixels
     
     Parameters:
     -----------
@@ -100,6 +108,8 @@ def find_mask_patches_2d(mask_array, label_array, patch_size, stride=None, min_m
         Minimum ratio of labeled pixels in the entire patch (0.05 = 5%)
     skip_mask_check : bool, optional
         If True, skip the mask coverage check entirely
+    min_nonzero_ratio : float, optional
+        If provided, check for minimum ratio of non-zero pixels instead of labeled pixels
     
     Returns:
     --------
@@ -141,13 +151,19 @@ def find_mask_patches_2d(mask_array, label_array, patch_size, stride=None, min_m
                     if mask_coverage < min_mask_coverage:
                         continue
                     
-                # LABEL REQUIREMENT:
-                # Calculate ratio of labeled pixels in the patch
-                labeled_ratio = np.count_nonzero(label_patch) / label_patch.size
-                
-                # Only include patches with sufficient labeled pixels
-                if labeled_ratio >= min_labeled_ratio:
-                    patches.append({'start_pos': [0, y, x]})  # [dummy_z, y, x]
+                # LABEL/NONZERO REQUIREMENT:
+                if min_nonzero_ratio is not None:
+                    # Check for non-zero ratio (for MAE pretraining)
+                    nonzero_ratio = np.count_nonzero(label_patch) / label_patch.size
+                    if nonzero_ratio >= min_nonzero_ratio:
+                        patches.append({'start_pos': [0, y, x]})  # [dummy_z, y, x]
+                else:
+                    # Calculate ratio of labeled pixels in the patch
+                    labeled_ratio = np.count_nonzero(label_patch) / label_patch.size
+                    
+                    # Only include patches with sufficient labeled pixels
+                    if labeled_ratio >= min_labeled_ratio:
+                        patches.append({'start_pos': [0, y, x]})  # [dummy_z, y, x]
     
     return patches
 

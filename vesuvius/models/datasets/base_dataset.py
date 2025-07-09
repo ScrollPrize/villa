@@ -10,6 +10,7 @@ from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
 from functools import partial
 from scipy.ndimage import distance_transform_edt
+from skimage.filters import scharr
 from models.augmentation.transforms.spatial.transpose import TransposeAxesTransform
 # Augmentations will be handled directly in this file
 from models.augmentation.transforms.utils.random import RandomTransform
@@ -67,11 +68,11 @@ class BaseDataset(Dataset):
         self.patch_size = mgr.train_patch_size   # Expected to be [z, y, x]
         self.min_labeled_ratio = mgr.min_labeled_ratio
         self.min_bbox_percent = mgr.min_bbox_percent
-        self.dilate_label = mgr.dilate_label
 
         # New binarization control parameters
-        self.binarize_labels = mgr.binarize_labels
-        self.target_value = mgr.target_value
+        self.binarize_labels = getattr(mgr, 'binarize_labels', False)
+        self.target_value = getattr(mgr, 'target_value', 1)
+        self.label_threshold = getattr(mgr, 'label_threshold', None)
         
         # Skip patch validation (defaults to False)
         self.skip_patch_validation = getattr(mgr, 'skip_patch_validation', False)
@@ -173,7 +174,9 @@ class BaseDataset(Dataset):
             self.transforms = self._create_training_transforms()
             print("Training transforms initialized")
         
-        self._get_valid_patches()
+        # Only run validation if not handled by subclass (e.g., MAEPretrainDataset)
+        if not getattr(self, '_mae_will_handle_validation', False):
+            self._get_valid_patches()
 
     def _initialize_volumes(self):
         """
@@ -336,8 +339,66 @@ class BaseDataset(Dataset):
             'is_2d_dataset': self.is_2d_dataset
         }
     
+    def _load_approved_patches(self):
+        """
+        Load approved patches from vc_proofreader export file.
+        
+        Returns
+        -------
+        bool
+            True if patches were successfully loaded, False otherwise
+        """
+        approved_patches_file = Path(self.mgr.approved_patches_file)
+        
+        if not approved_patches_file.exists():
+            print(f"Approved patches file not found: {approved_patches_file}")
+            return False
+        
+        try:
+            with open(approved_patches_file, 'r') as f:
+                data = json.load(f)
+            
+            # Validate the file format
+            if 'metadata' not in data or 'approved_patches' not in data:
+                print(f"Invalid approved patches file format: missing required keys")
+                return False
+            
+            metadata = data['metadata']
+            approved_patches = data['approved_patches']
+            
+            # Validate patch size compatibility
+            if metadata.get('patch_size') != self.patch_size:
+                print(f"Warning: Patch size mismatch. Expected {self.patch_size}, got {metadata.get('patch_size')}")
+                # Could choose to continue or return False depending on requirements
+            
+            # Convert approved patches to the format expected by BaseDataset
+            self.valid_patches = []
+            for patch_info in approved_patches:
+                self.valid_patches.append({
+                    "volume_index": patch_info.get("volume_index", 0),
+                    "position": patch_info["coords"]
+                })
+            
+            print(f"Successfully loaded {len(self.valid_patches)} approved patches from {approved_patches_file}")
+            print(f"Approved patches metadata:")
+            print(f"  - Patch size: {metadata.get('patch_size')}")
+            print(f"  - Coordinate system: {metadata.get('coordinate_system', 'unknown')}")
+            print(f"  - Total approved: {metadata.get('total_approved', len(approved_patches))}")
+            print(f"  - Export timestamp: {metadata.get('export_timestamp', 'unknown')}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error loading approved patches file: {e}")
+            return False
+    
     def _get_valid_patches(self):
         """Find valid patches based on mask coverage and labeled ratio requirements."""
+        # Check if we should load approved patches from vc_proofreader
+        if hasattr(self.mgr, 'approved_patches_file') and self.mgr.approved_patches_file:
+            if self._load_approved_patches():
+                return
+        
         # Try to load from cache first
         if self.cache_enabled and self.cache_dir is not None and self.data_path is not None:
             print("\nAttempting to load patches from cache...")
@@ -420,7 +481,7 @@ class BaseDataset(Dataset):
                     label_data_for_patches = label_data
                 
                 # Check if mask is available
-                has_mask = 'mask' in vdata
+                has_mask = 'mask' in vdata and vdata['mask'] is not None
                 
                 if has_mask:
                     mask_data = vdata['mask']
@@ -589,13 +650,29 @@ class BaseDataset(Dataset):
         first_target_name = list(self.target_volumes.keys())[0]
         img_arr = self.target_volumes[first_target_name][vol_idx]['data']['data']
         
-        # Extract image patch with appropriate dimensionality
-        if is_2d:
-            img_patch = img_arr[y:y+dy, x:x+dx]
-            img_patch = pad_or_crop_2d(img_patch, (dy, dx))
-        else:
-            img_patch = img_arr[z:z+dz, y:y+dy, x:x+dx]
-            img_patch = pad_or_crop_3d(img_patch, (dz, dy, dx))
+        try:
+            # Extract image patch with appropriate dimensionality
+            if is_2d:
+                img_patch = img_arr[y:y+dy, x:x+dx]
+                # Check if we got valid data
+                if img_patch.size == 0:
+                    raise ValueError(f"Empty patch extracted at position y={y}, x={x}")
+                img_patch = pad_or_crop_2d(img_patch, (dy, dx))
+            else:
+                img_patch = img_arr[z:z+dz, y:y+dy, x:x+dx]
+                # Check if we got valid data
+                if img_patch.size == 0:
+                    raise ValueError(f"Empty patch extracted at position z={z}, y={y}, x={x}")
+                img_patch = pad_or_crop_3d(img_patch, (dz, dy, dx))
+        except ValueError as e:
+            # Handle corrupt or missing chunks by creating a zero patch
+            print(f"Warning: Failed to extract image patch at vol={vol_idx}, z={z}, y={y}, x={x}: {str(e)}")
+            print(f"Creating zero patch of size {'('+str(dy)+','+str(dx)+')' if is_2d else '('+str(dz)+','+str(dy)+','+str(dx)+')'}")
+            
+            if is_2d:
+                img_patch = np.zeros((dy, dx), dtype=np.float32)
+            else:
+                img_patch = np.zeros((dz, dy, dx), dtype=np.float32)
         
         # Apply normalization
         if self.normalizer is not None:
@@ -654,6 +731,11 @@ class BaseDataset(Dataset):
                 else:
                     # Single-channel 2D
                     label_patch = label_arr[y:y+dy, x:x+dx]
+                
+                # Apply threshold if configured (before binarization)
+                if self.label_threshold is not None and not self.targets.get(t_name, {}).get('auxiliary_task', False):
+                    # Apply threshold: values below threshold become 0
+                    label_patch = np.where(label_patch < self.label_threshold, 0, label_patch)
                 
                 # Apply binarization only if configured to do so and not an auxiliary task
                 if self.binarize_labels and not self.targets.get(t_name, {}).get('auxiliary_task', False):
@@ -714,6 +796,11 @@ class BaseDataset(Dataset):
                 else:
                     # Single-channel 3D
                     label_patch = label_arr[z:z+dz, y:y+dy, x:x+dx]
+                
+                # Apply threshold if configured (before binarization)
+                if self.label_threshold is not None and not self.targets.get(t_name, {}).get('auxiliary_task', False):
+                    # Apply threshold: values below threshold become 0
+                    label_patch = np.where(label_patch < self.label_threshold, 0, label_patch)
                 
                 # Apply binarization only if configured to do so
                 if self.binarize_labels:
@@ -809,6 +896,32 @@ class BaseDataset(Dataset):
             print(f"Warning: No target value configured for '{t_name}', defaulting to 1")
             return 1
 
+    def _get_volume_id(self, vol_idx):
+        """
+        Get the volume identifier for a given volume index.
+        
+        Parameters
+        ----------
+        vol_idx : int
+            Volume index
+            
+        Returns
+        -------
+        str or None
+            Volume identifier if available, None otherwise
+        """
+        # Get the first target to access volume info
+        first_target = list(self.target_volumes.keys())[0]
+        
+        # Check if volume_id was stored during initialization
+        if vol_idx < len(self.target_volumes[first_target]):
+            volume_info = self.target_volumes[first_target][vol_idx]
+            if 'volume_id' in volume_info:
+                return volume_info['volume_id']
+        
+        # Fallback to None if not available
+        return None
+
     
     def _extract_ignore_mask(self, vol_idx, z, y, x, dz, dy, dx, is_2d):
         """
@@ -830,6 +943,47 @@ class BaseDataset(Dataset):
         dict or None
             Dictionary of ignore masks per target if available, None otherwise
         """
+        # Initialize ignore masks dictionary
+        ignore_masks = {}
+        
+        # Check for volume-task loss configuration
+        if hasattr(self.mgr, 'volume_task_loss_config') and self.mgr.volume_task_loss_config:
+            # Get the volume ID for this patch
+            volume_id = self._get_volume_id(vol_idx)
+            
+            if volume_id and volume_id in self.mgr.volume_task_loss_config:
+                # Get enabled tasks for this volume
+                enabled_tasks = self.mgr.volume_task_loss_config[volume_id]
+                
+                # Create ignore masks for disabled tasks
+                for t_name in self.target_volumes.keys():
+                    if t_name not in enabled_tasks:
+                        # Create a full ignore mask (all ones) for this disabled task
+                        if is_2d:
+                            mask_shape = (1, dy, dx)
+                        else:
+                            mask_shape = (1, dz, dy, dx)
+                        
+                        ignore_masks[t_name] = np.ones(mask_shape, dtype=np.float32)
+                        
+                        # Log only once per volume-task combination
+                        if not hasattr(self, '_logged_disabled_tasks'):
+                            self._logged_disabled_tasks = set()
+                        
+                        log_key = (volume_id, t_name)
+                        if log_key not in self._logged_disabled_tasks:
+                            print(f"Task '{t_name}' disabled for volume '{volume_id}' - creating ignore mask")
+                            self._logged_disabled_tasks.add(log_key)
+        
+        # Check for auxiliary task source masks
+        if hasattr(self, '_aux_source_masks'):
+            for aux_task_name, source_mask in self._aux_source_masks.items():
+                if aux_task_name in self.targets:
+                    # Invert the mask: source_mask has 1 where source > 0 (compute), 
+                    # but ignore_mask needs 1 where we ignore (source == 0)
+                    ignore_mask = 1.0 - source_mask
+                    ignore_masks[aux_task_name] = ignore_mask
+        
         # Check only the first target for the mask
         first_target_name = list(self.target_volumes.keys())[0]
         volume_info = self.target_volumes[first_target_name][vol_idx]
@@ -1098,13 +1252,13 @@ class BaseDataset(Dataset):
             transforms.append(
             SpatialTransform(
                 self.mgr.train_patch_size, patch_center_dist_from_border=0, random_crop=False, p_elastic_deform=0,
-                p_rotation=0.2,
-                rotation=rotation_for_DA, p_scaling=0.2, scaling=(0.7, 1.4), p_synchronize_scaling_across_axes=1,
+                p_rotation=0.0,
+                rotation=rotation_for_DA, p_scaling=0.0, scaling=(0.7, 1.4), p_synchronize_scaling_across_axes=1,
                 bg_style_seg_sampling=False  # , mode_seg='nearest'
             )),
             transforms.append(RandomTransform(
                     MirrorTransform(allowed_axes=mirror_axes), 
-                    apply_probability=0.5
+                    apply_probability=0.0
                 )),
             transforms.append(RandomTransform(
                     GaussianBlurTransform(
@@ -1119,7 +1273,7 @@ class BaseDataset(Dataset):
                 TransposeAxesTransform(
                     allowed_axes={0, 1, 2},
                     ),
-                    apply_probability=0.2
+                    apply_probability=0.0
             )),
             transforms.append(RandomTransform(
                 GaussianNoiseTransform(
@@ -1281,7 +1435,7 @@ class BaseDataset(Dataset):
 
     def _process_auxiliary_tasks(self, label_patches, is_2d):
         """
-        Process auxiliary tasks by computing additional targets like distance transforms.
+        Process auxiliary tasks by computing additional targets like distance transforms and surface normals.
         
         Parameters
         ----------
@@ -1294,6 +1448,22 @@ class BaseDataset(Dataset):
         if not hasattr(self.mgr, 'auxiliary_tasks') or not self.mgr.auxiliary_tasks:
             return
             
+        # Store source masks for auxiliary tasks that need them
+        if not hasattr(self, '_aux_source_masks'):
+            self._aux_source_masks = {}
+            
+        # Cache for signed distance transforms to avoid recomputation
+        sdt_cache = {}
+        
+        # First pass: check if we need surface normals (which compute SDT)
+        needs_sdt = {}
+        for aux_task_name, aux_config in self.mgr.auxiliary_tasks.items():
+            if aux_config["type"] == "surface_normals":
+                source_target = aux_config["source_target"]
+                if source_target in label_patches:
+                    needs_sdt[source_target] = True
+                    
+        # Process all auxiliary tasks
         for aux_task_name, aux_config in self.mgr.auxiliary_tasks.items():
             task_type = aux_config["type"]
             
@@ -1306,21 +1476,41 @@ class BaseDataset(Dataset):
                     
                 source_patch = label_patches[source_target]
                 
+                # Check if we have cached SDT from surface normals computation
+                cache_key = f"{source_target}_sdt"
+                
                 # Compute distance transform for each channel
                 distance_transforms = []
                 for c in range(source_patch.shape[0]):  # Iterate over channels
-                    # Get binary mask from source patch
-                    channel_patch = source_patch[c]
-                    binary_mask = (channel_patch > 0).astype(np.uint8)
+                    channel_key = f"{cache_key}_{c}"
                     
-                    # Compute Euclidean distance transform
-                    # edt.edt computes distance from foreground to background
-                    if np.any(binary_mask):
-                        # Compute distance transform from foreground pixels
-                        distance_map = distance_transform_edt(binary_mask)
+                    if channel_key in sdt_cache:
+                        # Reuse cached signed distance transform
+                        sdt = sdt_cache[channel_key]
+                        # For distance transform, we want the absolute distance inside the object
+                        # SDT is negative inside, positive outside
+                        distance_map = np.where(sdt < 0, -sdt, 0)
                     else:
-                        # If no foreground pixels, distance map is zero everywhere
-                        distance_map = np.zeros_like(channel_patch)
+                        # Get binary mask from source patch
+                        channel_patch = source_patch[c]
+                        binary_mask = (channel_patch > 0).astype(np.uint8)
+                        
+                        # If this source will be used for surface normals later, compute SDT
+                        if source_target in needs_sdt and np.any(binary_mask):
+                            inside_dist = distance_transform_edt(binary_mask)
+                            outside_dist = distance_transform_edt(1 - binary_mask)
+                            sdt = outside_dist - inside_dist
+                            sdt_cache[channel_key] = sdt
+                            # For distance transform, use the inside distance
+                            distance_map = inside_dist
+                        else:
+                            # Standard distance transform computation
+                            if np.any(binary_mask):
+                                # Compute distance transform from foreground pixels
+                                distance_map = distance_transform_edt(binary_mask)
+                            else:
+                                # If no foreground pixels, distance map is zero everywhere
+                                distance_map = np.zeros_like(channel_patch)
                     
                     distance_transforms.append(distance_map)
                 
@@ -1338,3 +1528,120 @@ class BaseDataset(Dataset):
                 # Add to label_patches with the auxiliary task name
                 aux_target_name = f"{aux_task_name}" 
                 label_patches[aux_target_name] = distance_patch
+                
+            elif task_type == "surface_normals":
+                source_target = aux_config["source_target"]
+                
+                # Check if source target exists in label_patches
+                if source_target not in label_patches:
+                    continue
+                    
+                source_patch = label_patches[source_target]
+                
+                # Compute surface normals for each channel
+                all_normals = []
+                for c in range(source_patch.shape[0]):  # Iterate over channels
+                    # Get binary mask from source patch
+                    channel_patch = source_patch[c]
+                    binary_mask = (channel_patch > 0).astype(np.uint8)
+                    
+                    # Check if we need to cache SDT
+                    cache_key = f"{source_target}_sdt_{c}"
+                    
+                    # Compute surface normals from signed distance transform
+                    normals, sdt = self._compute_surface_normals_from_sdt(binary_mask, is_2d, return_sdt=True)
+                    
+                    # Cache the SDT if it might be needed by distance transform
+                    if cache_key not in sdt_cache:
+                        sdt_cache[cache_key] = sdt
+                    
+                    all_normals.append(normals)
+                
+                # For multi-channel input, we average the normals
+                if len(all_normals) > 1:
+                    # Stack and average
+                    stacked_normals = np.stack(all_normals, axis=0)
+                    normals_patch = np.mean(stacked_normals, axis=0)
+                    # Re-normalize after averaging
+                    magnitude = np.sqrt(np.sum(normals_patch**2, axis=0, keepdims=True))
+                    magnitude = np.maximum(magnitude, 1e-6)
+                    normals_patch = normals_patch / magnitude
+                else:
+                    normals_patch = all_normals[0]
+                
+                # Ensure contiguous and proper dtype
+                normals_patch = np.ascontiguousarray(normals_patch, dtype=np.float32)
+                
+                # Add to label_patches with the auxiliary task name
+                aux_target_name = f"{aux_task_name}"
+                label_patches[aux_target_name] = normals_patch
+                
+                # Store the source mask for this auxiliary task
+                # Create mask where source > 0 (compute loss) vs source == 0 (ignore)
+                source_mask = (source_patch > 0).astype(np.float32)
+                if source_mask.ndim > 1:
+                    # Take max across channels if multi-channel
+                    source_mask = source_mask.max(axis=0, keepdims=True)
+                else:
+                    source_mask = source_mask[np.newaxis, ...]
+                self._aux_source_masks[aux_target_name] = source_mask
+                
+                # Update the target's out_channels based on dimensionality
+                if aux_target_name in self.targets:
+                    self.targets[aux_task_name]["out_channels"] = 2 if is_2d else 3
+                    
+    def _compute_surface_normals_from_sdt(self, binary_mask, is_2d, epsilon=1e-6, return_sdt=False):
+        """
+        Compute surface normals from a binary mask using signed distance transform.
+        
+        Parameters
+        ----------
+        binary_mask : numpy.ndarray
+            Binary segmentation mask
+        is_2d : bool
+            Whether the data is 2D or 3D
+        epsilon : float
+            Small value for numerical stability
+        return_sdt : bool
+            If True, also return the signed distance transform
+        
+        Returns
+        -------
+        numpy.ndarray or tuple
+            If return_sdt is False: Normalized surface normals with shape:
+            - 2D: (2, H, W) containing (nx, ny)
+            - 3D: (3, D, H, W) containing (nx, ny, nz)
+            If return_sdt is True: (normals, sdt)
+        """
+        # 1. Compute signed distance transform
+        inside_dist = distance_transform_edt(binary_mask)
+        outside_dist = distance_transform_edt(1 - binary_mask)
+        sdt = outside_dist - inside_dist
+        
+        # 2. Compute gradients using Scharr filter
+        if is_2d:
+            # For 2D: gradients along x and y
+            grad_x = scharr(sdt, axis=1)  # Gradient along x (width)
+            grad_y = scharr(sdt, axis=0)  # Gradient along y (height)
+            gradients = np.stack([grad_x, grad_y], axis=0)
+        else:
+            # For 3D: gradients along x, y, and z
+            grad_x = scharr(sdt, axis=2)  # Gradient along x (width)
+            grad_y = scharr(sdt, axis=1)  # Gradient along y (height)
+            grad_z = scharr(sdt, axis=0)  # Gradient along z (depth)
+            gradients = np.stack([grad_x, grad_y, grad_z], axis=0)
+        
+        # 3. Normalize gradients to unit vectors
+        magnitude = np.sqrt(np.sum(gradients**2, axis=0, keepdims=True))
+        magnitude = np.maximum(magnitude, epsilon)
+        normals = gradients / magnitude
+        
+        # 4. Handle undefined regions (optional)
+        # Where gradient magnitude is very small, normal direction is undefined
+        undefined_mask = magnitude < epsilon
+        normals = normals * (1 - undefined_mask)
+        
+        if return_sdt:
+            return normals.astype(np.float32), sdt.astype(np.float32)
+        else:
+            return normals.astype(np.float32)

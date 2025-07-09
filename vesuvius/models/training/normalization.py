@@ -128,12 +128,97 @@ class RescaleTo01Normalization(ImageNormalization):
         return image
 
 
+class RobustNormalization(ImageNormalization):
+    """
+    Robust normalization using median and MAD (Median Absolute Deviation).
+    More resistant to outliers than standard z-score normalization.
+    """
+    
+    def __init__(self, percentile_lower: float = 1.0, percentile_upper: float = 99.0, 
+                 clip_values: bool = True, **kwargs):
+        """
+        Initialize robust normalization.
+        
+        Parameters
+        ----------
+        percentile_lower : float
+            Lower percentile for clipping (default: 1.0)
+        percentile_upper : float
+            Upper percentile for clipping (default: 99.0)
+        clip_values : bool
+            Whether to clip values to percentile range before normalization
+        """
+        super().__init__(**kwargs)
+        self.percentile_lower = percentile_lower
+        self.percentile_upper = percentile_upper
+        self.clip_values = clip_values
+    
+    def run(self, image: np.ndarray, mask: np.ndarray = None) -> np.ndarray:
+        """
+        Apply robust normalization using median and MAD.
+        """
+        image = image.astype(self.target_dtype, copy=False)
+        
+        # Compute robust statistics
+        if self.use_mask_for_norm is not None and self.use_mask_for_norm and mask is not None:
+            mask_bool = mask > 0
+            valid_data = image[mask_bool]
+        else:
+            valid_data = image.ravel()
+        
+        # Skip if no valid data
+        if len(valid_data) == 0:
+            return image
+        
+        # Clip to percentiles if requested
+        if self.clip_values and len(valid_data) > 0:
+            lower_val = np.percentile(valid_data, self.percentile_lower)
+            upper_val = np.percentile(valid_data, self.percentile_upper)
+            image = np.clip(image, lower_val, upper_val)
+            
+            # Recompute valid_data after clipping
+            if self.use_mask_for_norm is not None and self.use_mask_for_norm and mask is not None:
+                valid_data = image[mask_bool]
+            else:
+                valid_data = image.ravel()
+        
+        # Compute median
+        median = np.median(valid_data)
+        
+        # Compute MAD (Median Absolute Deviation)
+        mad = np.median(np.abs(valid_data - median))
+        
+        # Scale MAD to be comparable to standard deviation
+        # For normal distribution, std ≈ 1.4826 * MAD
+        scaled_mad = 1.4826 * mad
+        
+        # Avoid division by zero
+        if scaled_mad < 1e-8:
+            # If MAD is too small, fall back to percentile-based scaling
+            if len(valid_data) > 0:
+                p75 = np.percentile(valid_data, 75)
+                p25 = np.percentile(valid_data, 25)
+                iqr = p75 - p25
+                scaled_mad = max(iqr / 1.35, 1e-8)  # IQR to std approximation
+            else:
+                scaled_mad = 1.0
+        
+        # Apply normalization
+        if self.use_mask_for_norm is not None and self.use_mask_for_norm and mask is not None:
+            image[mask_bool] = (image[mask_bool] - median) / scaled_mad
+        else:
+            image = (image - median) / scaled_mad
+            
+        return image
+
+
 # Mapping from string names to normalization classes
 NORMALIZATION_SCHEMES = {
     'zscore': ZScoreNormalization,
     'ct': CTNormalization,
     'rescale_to_01': RescaleTo01Normalization,
     'minmax': RescaleTo01Normalization,  # Alias
+    'robust': RobustNormalization,
     'none': None  # No normalization
 }
 

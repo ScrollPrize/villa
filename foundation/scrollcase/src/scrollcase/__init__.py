@@ -1,8 +1,8 @@
 import importlib
 
-from . import case, mesh
+from . import case, curved_divider_wall, mesh
 
-__all__ = ["case", "mesh"]
+__all__ = ["case", "mesh", "curved_divider_wall"]
 
 
 def __getattr__(name):

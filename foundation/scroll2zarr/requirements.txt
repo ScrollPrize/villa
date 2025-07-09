@@ -1,8 +1,0 @@
-zarr
-tifffile
-scikit-image
-tqdm
-numpy
-scikit-learn
-numcodecs
-opencv-python

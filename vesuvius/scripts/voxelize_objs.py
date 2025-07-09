@@ -167,13 +167,15 @@ def main():
     parser = argparse.ArgumentParser(
         description="Process OBJ meshes and slice them along z to produce label images."
     )
-    parser.add_argument("folder", help="Path to folder containing OBJ meshes")
+    parser.add_argument("folder", help="Path to folder containing OBJ meshes (or parent folder with subfolders of OBJ meshes)")
     parser.add_argument("--scroll", required=True, choices=["scroll1", "scroll2", "scroll3", "scroll4", "scroll5"],
                         help="Scroll shape to use (determines image dimensions)")
     parser.add_argument("--output_path", default="mesh_labels_slices",
                         help="Output folder for label images (default: mesh_labels_slices)")
     parser.add_argument("--num_workers", type=int, default=default_workers,
                         help="Number of worker processes to use (default: half of CPU count)")
+    parser.add_argument("--recursive", action="store_true",
+                        help="Force recursive search in subfolders even if OBJ files exist in the parent folder")
     args = parser.parse_args()
 
     # Use the provided number of worker processes.
@@ -206,7 +208,25 @@ def main():
     os.makedirs(out_path, exist_ok=True)
     print(f"Output folder for label images: {out_path}")
 
-    mesh_paths = glob(os.path.join(folder_path, '*.obj'))
+    # Find OBJ files - either directly or in subfolders
+    if args.recursive:
+        # Force recursive search
+        mesh_paths = glob(os.path.join(folder_path, '**', '*.obj'), recursive=True)
+        print(f"Recursive search enabled")
+    else:
+        # First try direct OBJ files
+        mesh_paths = glob(os.path.join(folder_path, '*.obj'))
+        
+        if not mesh_paths:
+            # No OBJ files found directly, try subfolders
+            mesh_paths = glob(os.path.join(folder_path, '*', '*.obj'))
+            if mesh_paths:
+                print(f"No OBJ files found in {folder_path}, searching in subfolders...")
+        
+    if not mesh_paths:
+        print(f"ERROR: No OBJ files found in {folder_path} or its subfolders")
+        sys.exit(1)
+        
     print(f"Found {len(mesh_paths)} meshes to process")
 
     # Read all meshes in parallel.

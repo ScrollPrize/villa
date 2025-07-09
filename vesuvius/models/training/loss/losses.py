@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn as nn
 from torch.nn import MSELoss, SmoothL1Loss, L1Loss
+from .mae_loss import MaskedReconstructionLoss
 
 
 def compute_per_channel_dice(input, target, epsilon=1e-5, weight=None):
@@ -394,6 +395,73 @@ from torch import nn
 import torch.nn.functional as F
 
 
+class CosineSimilarityLoss(nn.Module):
+    """
+    Cosine Similarity Loss that computes loss only on labeled/masked regions.
+    
+    This loss computes 1 - cosine_similarity for each spatial location,
+    then averages only over the labeled (non-masked) regions.
+    """
+    def __init__(self, dim=1, eps=1e-8, ignore_index=None):
+        """
+        Args:
+            dim: Dimension along which to compute cosine similarity (default: 1 for channel dim)
+            eps: Small value to avoid division by zero
+            ignore_index: Value to ignore in target (creates mask where target != ignore_index)
+        """
+        super(CosineSimilarityLoss, self).__init__()
+        self.dim = dim
+        self.eps = eps
+        self.ignore_index = ignore_index
+        
+    def forward(self, input, target, mask=None):
+        # Ensure input and target have same shape
+        assert input.size() == target.size(), f"Input and target must have same shape, got {input.size()} vs {target.size()}"
+        
+        # Handle mask creation from ignore_index if no explicit mask provided
+        if mask is None and self.ignore_index is not None:
+            # Create mask from ignore_index
+            mask = (target != self.ignore_index).float()
+            # If target has multiple channels, take max across channels
+            if mask.dim() > input.dim() - 1:
+                mask = mask.max(dim=1, keepdim=True)[0]
+        
+        # Compute cosine similarity
+        # Normalize along channel dimension
+        input_norm = F.normalize(input, p=2, dim=self.dim, eps=self.eps)
+        target_norm = F.normalize(target, p=2, dim=self.dim, eps=self.eps)
+        
+        # Compute dot product (cosine similarity)
+        cosine_sim = (input_norm * target_norm).sum(dim=self.dim, keepdim=True)
+        
+        # Loss is 1 - cosine_similarity (so perfect match = 0 loss)
+        loss = 1 - cosine_sim
+        
+        # Apply mask if provided
+        if mask is not None:
+            # Ensure mask has same spatial dimensions
+            if mask.dim() == input.dim() - 1:
+                mask = mask.unsqueeze(1)
+            
+            # Expand mask to match loss dimensions if needed
+            if mask.size(1) == 1 and loss.size(1) > 1:
+                mask = mask.expand_as(loss)
+            
+            # Apply mask
+            masked_loss = loss * mask
+            
+            # Compute mean only over masked elements
+            num_masked = mask.sum()
+            if num_masked > 0:
+                return masked_loss.sum() / num_masked
+            else:
+                # If no valid pixels, return 0 to avoid NaN
+                return torch.tensor(0.0, device=input.device, requires_grad=True)
+        else:
+            # No mask, compute regular mean
+            return loss.mean()
+
+
 class EigenvalueLoss(nn.Module):
     """
     Loss for regressing a *set* of eigen-values that
@@ -537,6 +605,624 @@ class WeightedCrossEntropyLossWrapper(WeightedCrossEntropyLoss):
         # Call parent class forward method
         return super().forward(input, target)
 
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+
+class SignedDistanceLoss(nn.Module):
+    """
+    Band-limited Smooth-L1 loss for signed-distance regression, with optional
+    Eikonal term enforcing ‖∇d_pred‖ ≈ 1 near the surface.
+
+    Parameters
+    ----------
+    rho            Width of the surface band in *voxels* (|d_gt| < rho)          (default: 4)
+    beta           Huber transition point (see torch.nn.SmoothL1Loss)            (default: 1)
+    eikonal        If True, add λ * (‖∇d_pred‖ − 1)^2 in the same band           (default: False)
+    eikonal_weight λ – weight of the Eikonal term relative to data term          (default: 0.01)
+    reduction      "mean" (default) | "sum" | "none"
+    ignore_index   Sentinel value in target to be ignored                        (default: None)
+    """
+    def __init__(
+        self,
+        rho: float = 4.0,
+        beta: float = 1.0,
+        eikonal: bool = False,
+        eikonal_weight: float = 0.01,
+        reduction: str = "mean",
+        ignore_index: float | int | None = None,
+    ):
+        super().__init__()
+        if reduction not in ("mean", "sum", "none"):
+            raise ValueError("reduction must be 'mean', 'sum', or 'none'")
+        self.rho = float(rho)
+        self.beta = float(beta)
+        self.eikonal = bool(eikonal)
+        self.eik_w = float(eikonal_weight)
+        self.reduction = reduction
+        self.ignore_index = ignore_index
+
+    @staticmethod
+    def _gradient_3d(t: torch.Tensor) -> torch.Tensor:
+        """Finite-difference ∇t (same shape as `t`, zero-padded borders)."""
+        dz = F.pad(t[:, :, 2:] - t[:, :, :-2],  (0, 0, 0, 0, 1, 1))
+        dy = F.pad(t[:, :, :, 2:] - t[:, :, :, :-2], (0, 0, 1, 1, 0, 0))
+        dx = F.pad(t[:, :, :, :, 2:] - t[:, :, :, :, :-2], (1, 1, 0, 0, 0, 0))
+        return torch.stack((dz, dy, dx), dim=1) * 0.5   # shape (B,3,D,H,W)
+
+    def forward(self, d_pred: torch.Tensor, d_gt: torch.Tensor) -> torch.Tensor:
+        if d_pred.shape != d_gt.shape:
+            raise ValueError(f"Shape mismatch {d_pred.shape} vs {d_gt.shape}")
+
+        # ── build validity mask ───────────────────────────────────────────────
+        band_mask = (d_gt.abs() < self.rho)
+        if self.ignore_index is not None:
+            band_mask &= d_gt.ne(self.ignore_index)
+
+        if band_mask.sum() == 0:
+            # nothing to optimise (e.g. empty crop) – safe zero loss
+            return torch.zeros(
+                (), dtype=d_pred.dtype, device=d_pred.device,
+                requires_grad=d_pred.requires_grad
+            )
+
+        # ── Smooth-L1 (Huber) inside the band ────────────────────────────────
+        huber = F.smooth_l1_loss(
+            d_pred[band_mask], d_gt[band_mask],
+            beta=self.beta, reduction="none"
+        )
+
+        data_term = huber
+
+        # ── optional Eikonal regulariser ─────────────────────────────────────
+        if self.eikonal:
+            grad = self._gradient_3d(d_pred)           # (B,3,D,H,W)
+            grad_norm = grad.norm(dim=1)               # (B,D,H,W)
+            eik = (grad_norm - 1.0) ** 2
+            eik_data = eik[band_mask]
+            data_term = data_term + self.eik_w * eik_data
+
+        # ── reduction ────────────────────────────────────────────────────────
+        if self.reduction == "sum":
+            return data_term.sum()
+        if self.reduction == "none":
+            out = torch.zeros_like(d_pred)
+            out[band_mask] = data_term
+            return out
+        # "mean"  – average only over valid voxels
+        return data_term.mean()
+
+# ======================================================================
+#  PLANARITY  –  encourages each foreground voxel to live on a thin sheet
+# ======================================================================
+
+import torch, math
+import torch.nn.functional as F
+from torch import nn
+
+class PlanarityLoss(nn.Module):
+    """
+    π-planarity loss  =  mean( mask * (1 – π)^q )
+
+      π = (λ₂ – λ₁) / (λ₀+λ₁+λ₂+eps)         using eigen-values of
+          the 3×3 structure tensor J_ρ = G_ρ * (∇p ∇pᵀ).
+
+    Parameters
+    ----------
+    rho           Gaussian window radius (voxels) for J_ρ          (default 1.5)
+    q             Exponent  (q = 1 → L1,  q ≈ 2 for stronger)      (default 1)
+    prob_thresh   Only penalise voxels where p > prob_thresh       (default 0.5)
+    eps           Numerical stabiliser                             (default 1e-8)
+    reduction     "mean" | "sum" | "none"                          (default "mean")
+    ignore_index  Target value to skip (like Dice etc.)            (default None)
+    """
+
+    def __init__(self,
+                 rho: float = 1.5,
+                 q: float = 1.0,
+                 prob_thresh: float = .5,
+                 eps: float = 1e-8,
+                 reduction: str = 'mean',
+                 ignore_index=None,
+                 normalization: str = 'sigmoid'):
+        super().__init__()
+        if reduction not in ('mean', 'sum', 'none'):
+            raise ValueError('reduction must be mean|sum|none')
+        self.rho, self.q, self.eps = rho, q, eps
+        self.t = prob_thresh
+        self.reduction = reduction
+        self.ignore_index = ignore_index
+        self.normalization = nn.Sigmoid() if normalization == 'sigmoid' \
+                             else (lambda x: x)
+        
+        # Create Sobel kernels for 3D gradients
+        self._create_sobel_kernels()
+
+    def _create_sobel_kernels(self):
+        """Create 3D Sobel kernels for gradient computation."""
+        # Basic 1D kernels
+        smooth = torch.tensor([1., 2., 1.], dtype=torch.float32)
+        diff = torch.tensor([-1., 0., 1.], dtype=torch.float32)
+        
+        # Create 3D Sobel kernels for each direction
+        # For dz (axis 0)
+        kernel_z = diff.view(-1, 1, 1) * smooth.view(1, -1, 1) * smooth.view(1, 1, -1)
+        kernel_z = kernel_z.unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, 3, 3, 3)
+        
+        # For dy (axis 1)
+        kernel_y = smooth.view(-1, 1, 1) * diff.view(1, -1, 1) * smooth.view(1, 1, -1)
+        kernel_y = kernel_y.unsqueeze(0).unsqueeze(0)
+        
+        # For dx (axis 2)
+        kernel_x = smooth.view(-1, 1, 1) * smooth.view(1, -1, 1) * diff.view(1, 1, -1)
+        kernel_x = kernel_x.unsqueeze(0).unsqueeze(0)
+        
+        # Normalize by the sum of absolute values (similar to scipy's normalization)
+        kernel_z = kernel_z / 8.0
+        kernel_y = kernel_y / 8.0
+        kernel_x = kernel_x / 8.0
+        
+        # Stack kernels for all three gradients
+        self.register_buffer('sobel_kernels', torch.cat([kernel_z, kernel_y, kernel_x], dim=0))
+    
+    # ------------------------------------------------------------------
+    def _sobel3d(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute 3D Sobel gradients using conv3d.
+        Input shape: (B, 1, D, H, W)
+        Output shape: (B, 3, D, H, W) for (dz, dy, dx)
+        """
+        # Ensure kernels are on the same device and dtype as input
+        kernels = self.sobel_kernels.to(x.device).to(x.dtype)
+        
+        # Apply convolution for all three gradients at once
+        # Input: (B, 1, D, H, W), Kernel: (3, 1, 3, 3, 3), Output: (B, 3, D, H, W)
+        gradients = F.conv3d(x, kernels, padding=1)
+        
+        return gradients
+
+    def _gauss_blur(self, x: torch.Tensor, sig: float):
+        """
+        Apply 3D Gaussian blur using separable 1D convolutions for efficiency.
+        """
+        # Create 1D Gaussian kernel
+        kernel_size = int(2 * math.ceil(3 * sig) + 1)
+        kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+        
+        # Create 1D Gaussian kernel
+        kernel_1d = torch.arange(kernel_size, dtype=x.dtype, device=x.device)
+        kernel_1d = kernel_1d - (kernel_size - 1) / 2
+        kernel_1d = torch.exp(-0.5 * (kernel_1d / sig) ** 2)
+        kernel_1d = kernel_1d / kernel_1d.sum()
+        
+        # Apply separable convolution
+        B, C, D, H, W = x.shape
+        
+        # Reshape for 1D convolutions
+        padding = (kernel_size - 1) // 2
+        
+        # Conv along Z axis
+        kernel_z = kernel_1d.view(1, 1, -1, 1, 1).repeat(C, 1, 1, 1, 1)
+        x = F.conv3d(x, kernel_z, padding=(padding, 0, 0), groups=C)
+        
+        # Conv along Y axis
+        kernel_y = kernel_1d.view(1, 1, 1, -1, 1).repeat(C, 1, 1, 1, 1)
+        x = F.conv3d(x, kernel_y, padding=(0, padding, 0), groups=C)
+        
+        # Conv along X axis
+        kernel_x = kernel_1d.view(1, 1, 1, 1, -1).repeat(C, 1, 1, 1, 1)
+        x = F.conv3d(x, kernel_x, padding=(0, 0, padding), groups=C)
+        
+        return x
+    
+    def _compute_eigenvalues_3x3_batch(self, J: torch.Tensor) -> torch.Tensor:
+        """
+        Compute eigenvalues for batched 3x3 symmetric matrices using analytical formula.
+        More stable and faster than torch.linalg.eigvalsh for small matrices.
+        
+        Input: J of shape (..., 3, 3)
+        Output: eigenvalues of shape (..., 3) in ascending order
+        """
+        # Extract unique elements of symmetric matrix
+        a11 = J[..., 0, 0]
+        a22 = J[..., 1, 1]
+        a33 = J[..., 2, 2]
+        a12 = J[..., 0, 1]
+        a13 = J[..., 0, 2]
+        a23 = J[..., 1, 2]
+        
+        # Compute invariants
+        # Trace
+        p1 = a11 + a22 + a33
+        
+        # Sum of minors
+        p2 = (a11 * a22 - a12 * a12) + (a11 * a33 - a13 * a13) + (a22 * a33 - a23 * a23)
+        
+        # Determinant
+        p3 = a11 * (a22 * a33 - a23 * a23) - a12 * (a12 * a33 - a13 * a23) + a13 * (a12 * a23 - a13 * a22)
+        
+        # Compute eigenvalues using Cardano's method
+        q = p1 * p1 / 9.0 - p2 / 3.0
+        r = p1 * p1 * p1 / 27.0 - p1 * p2 / 6.0 + p3 / 2.0
+        
+        # Clamp to avoid numerical issues with arccos
+        sqrt_q = torch.sqrt(torch.clamp(q, min=self.eps))
+        theta = torch.acos(torch.clamp(r / (sqrt_q ** 3 + self.eps), min=-1.0, max=1.0))
+        
+        # Eigenvalues
+        sqrt_q_2 = 2.0 * sqrt_q
+        p1_3 = p1 / 3.0
+        
+        lambda1 = p1_3 - sqrt_q_2 * torch.cos(theta / 3.0)
+        lambda2 = p1_3 - sqrt_q_2 * torch.cos((theta - 2.0 * math.pi) / 3.0)
+        lambda3 = p1_3 - sqrt_q_2 * torch.cos((theta - 4.0 * math.pi) / 3.0)
+        
+        # Stack and sort
+        eigenvalues = torch.stack([lambda1, lambda2, lambda3], dim=-1)
+        eigenvalues, _ = torch.sort(eigenvalues, dim=-1)
+        
+        return eigenvalues
+
+    # ------------------------------------------------------------------
+    def forward(self, input: torch.Tensor, target: torch.Tensor | None = None, source_pred: torch.Tensor | None = None):
+        """
+        input  – logits or probabilities  (B,1,D,H,W)
+        target – ground-truth mask, same shape or None
+        source_pred – ignored for PlanarityLoss (accepted for API consistency)
+        """
+        p = self.normalization(input)
+
+        if target is not None and self.ignore_index is not None:
+            valid = target.ne(self.ignore_index)
+        else:
+            valid = torch.ones_like(p, dtype=torch.bool)
+
+        # ---------- gradients & structure tensor ----------------------
+        g = self._sobel3d(p)                           # B,3,D,H,W
+        
+        # Compute structure tensor components (outer products)
+        # J = ∇p ∇p^T, which has 6 unique components for symmetric 3x3
+        J_components = []
+        for i in range(3):
+            for j in range(i, 3):
+                J_components.append(g[:, i:i+1] * g[:, j:j+1])
+        
+        J_components = torch.cat(J_components, dim=1)  # (B, 6, D, H, W)
+        
+        # Apply Gaussian blur to structure tensor components
+        J_components = self._gauss_blur(J_components, self.rho)
+        
+        # Extract components
+        Jxx = J_components[:, 0]
+        Jxy = J_components[:, 1]
+        Jxz = J_components[:, 2]
+        Jyy = J_components[:, 3]
+        Jyz = J_components[:, 4]
+        Jzz = J_components[:, 5]
+        
+        # Reconstruct 3x3 structure tensor
+        # Shape: (B, D, H, W, 3, 3)
+        B, D, H, W = Jxx.shape
+        J = torch.zeros(B, D, H, W, 3, 3, dtype=Jxx.dtype, device=Jxx.device)
+        
+        J[..., 0, 0] = Jxx
+        J[..., 0, 1] = Jxy
+        J[..., 0, 2] = Jxz
+        J[..., 1, 0] = Jxy
+        J[..., 1, 1] = Jyy
+        J[..., 1, 2] = Jyz
+        J[..., 2, 0] = Jxz
+        J[..., 2, 1] = Jyz
+        J[..., 2, 2] = Jzz
+
+        # Compute eigenvalues using optimized method
+        try:
+            # Try analytical method first (faster and more stable)
+            eigenvalues = self._compute_eigenvalues_3x3_batch(J)
+        except:
+            # Fallback to torch.linalg.eigvalsh if analytical method fails
+            # Convert to float32 for eigvalsh (doesn't support float16)
+            J_float32 = J.to(torch.float32)
+            
+            # Add small epsilon to diagonal for numerical stability
+            eps_diag = 1e-6
+            eye = torch.eye(3, dtype=J_float32.dtype, device=J_float32.device)
+            J_float32 = J_float32 + eps_diag * eye
+            
+            eigenvalues = torch.linalg.eigvalsh(J_float32)
+            # Convert back to original dtype
+            eigenvalues = eigenvalues.to(J.dtype)
+        
+        # Extract eigenvalues (already sorted in ascending order)
+        lam0, lam1, lam2 = eigenvalues[..., 0], eigenvalues[..., 1], eigenvalues[..., 2]
+
+        pi = (lam1 - lam0) / (lam0 + lam1 + lam2 + self.eps)
+        loss_vox = (1.0 - pi).clamp(min=0).pow(self.q)
+
+        # ---------- masks & reduction -------------------------------
+        mask = (p > self.t) & valid
+        # Squeeze the channel dimension from mask to match loss_vox dimensions
+        mask = mask.squeeze(1)  # From (B,1,D,H,W) to (B,D,H,W)
+        
+        if self.reduction == 'none':
+            # For 'none' reduction, apply mask but keep spatial dimensions
+            loss_vox = loss_vox * mask.float()
+            return loss_vox.unsqueeze(1)  # Add channel dimension back for consistency
+        else:
+            # For 'mean' or 'sum' reduction, flatten and extract only masked values
+            loss_vox_flat = loss_vox.flatten()
+            mask_flat = mask.flatten()
+            loss_vox_masked = loss_vox_flat[mask_flat]
+            
+            if loss_vox_masked.numel() == 0:
+                return torch.zeros(
+                    (), dtype=input.dtype, device=input.device,
+                    requires_grad=input.requires_grad)
+            
+            if self.reduction == 'sum':
+                return loss_vox_masked.sum()
+            else:  # 'mean'
+                return loss_vox_masked.mean()
+
+# ======================================================================
+#  NORMAL-SMOOTH  –  penalises sharp flips in surface normal field
+# ======================================================================
+
+class NormalSmoothnessLoss(nn.Module):
+    """
+    L_smooth = mean( mask * (1 - ⟨n, n̄⟩)^q )
+
+    where n̄ is n blurred with a Gaussian (σ).
+
+    Parameters
+    ----------
+    sigma          Gaussian σ (vox) for the reference normal n̄     (default 2)
+    q              Exponent (q=2 gives stronger push)              (default 2)
+    prob_thresh    Foreground mask: use voxels where p>prob_thresh (default 0.5)
+    reduction      "mean" | "sum" | "none"                         (default "mean")
+    """
+    def __init__(self,
+                 sigma: float = 2.0,
+                 q: float = 2.0,
+                 prob_thresh: float = .5,
+                 reduction: str = 'mean'):
+        super().__init__()
+        if reduction not in ('mean', 'sum', 'none'):
+            raise ValueError
+        self.sigma, self.q = sigma, q
+        self.t = prob_thresh
+        self.reduction = reduction
+
+    # ------------------------------------------------------------------
+    def _gauss_blur(self, x, sig):
+        """
+        Apply 3D Gaussian blur using separable 1D convolutions for efficiency.
+        """
+        # Create 1D Gaussian kernel
+        kernel_size = int(2 * math.ceil(3 * sig) + 1)
+        kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+        
+        # Create 1D Gaussian kernel
+        kernel_1d = torch.arange(kernel_size, dtype=x.dtype, device=x.device)
+        kernel_1d = kernel_1d - (kernel_size - 1) / 2
+        kernel_1d = torch.exp(-0.5 * (kernel_1d / sig) ** 2)
+        kernel_1d = kernel_1d / kernel_1d.sum()
+        
+        # Apply separable convolution
+        B, C, D, H, W = x.shape
+        
+        # Reshape for 1D convolutions
+        padding = (kernel_size - 1) // 2
+        
+        # Conv along Z axis
+        kernel_z = kernel_1d.view(1, 1, -1, 1, 1).repeat(C, 1, 1, 1, 1)
+        x = F.conv3d(x, kernel_z, padding=(padding, 0, 0), groups=C)
+        
+        # Conv along Y axis
+        kernel_y = kernel_1d.view(1, 1, 1, -1, 1).repeat(C, 1, 1, 1, 1)
+        x = F.conv3d(x, kernel_y, padding=(0, padding, 0), groups=C)
+        
+        # Conv along X axis
+        kernel_x = kernel_1d.view(1, 1, 1, 1, -1).repeat(C, 1, 1, 1, 1)
+        x = F.conv3d(x, kernel_x, padding=(0, 0, padding), groups=C)
+        
+        return x
+
+    # ------------------------------------------------------------------
+    def forward(self,
+                n_pred: torch.Tensor,
+                n_gt: torch.Tensor | None = None,
+                source_pred: torch.Tensor | None = None):
+        """
+        n_pred : (B,3,D,H,W) – predicted surface normals
+        n_gt   : (B,3,D,H,W) – ground truth surface normals (ignored, for compatibility)
+        source_pred : (B,1,D,H,W) – source segmentation predictions (optional, for masking)
+        
+        Note: This loss only uses predicted normals for self-consistency smoothness.
+        """
+        n_pred = F.normalize(n_pred, p=2, dim=1, eps=1e-6)
+        n_bar = self._gauss_blur(n_pred, self.sigma)
+        n_bar = F.normalize(n_bar, p=2, dim=1, eps=1e-6)
+
+        dot = (n_pred * n_bar).sum(1).clamp(-1, 1)   # (B,D,H,W)
+        loss_vox = (1.0 - dot).pow(self.q)
+
+        # Apply masking if source predictions are provided
+        if source_pred is not None:
+            # Apply sigmoid to get probabilities
+            prob = torch.sigmoid(source_pred).squeeze(1)  # (B,D,H,W)
+            mask = (prob > self.t).float()
+            
+            if self.reduction == 'none':
+                return loss_vox * mask
+            else:
+                # Apply mask and compute mean only over valid regions
+                masked_loss = loss_vox * mask
+                num_valid = mask.sum()
+                if num_valid > 0:
+                    if self.reduction == 'sum':
+                        return masked_loss.sum()
+                    else:  # 'mean'
+                        return masked_loss.sum() / num_valid
+                else:
+                    return torch.zeros((), dtype=loss_vox.dtype, device=loss_vox.device, requires_grad=True)
+        else:
+            # No masking
+            if self.reduction == 'sum':
+                return loss_vox.sum()
+            elif self.reduction == 'none':
+                return loss_vox
+            else:  # 'mean'
+                return loss_vox.mean()
+    
+    # ======================================================================
+#  NORMAL-GATED REPULSION  –  keeps separate sheets apart, but lets the
+#                            two faces of *one* sheet stay together
+# ======================================================================
+
+class NormalGatedRepulsionLoss(nn.Module):
+    """
+    L_rep = Σ_{‖Δx‖≤τ}  w_d(Δx) · mean( w_theta )
+
+      w_d     = exp(-‖Δx‖² / σ_d²)
+      w_theta = exp(-θ²     / σ_θ²)   with θ = angle(n_i, n_j)
+
+    Parameters
+    ----------
+    tau            neighbourhood radius (voxels)                  (default 2)
+    sigma_d        if None ⇒ tau/1.5                              (default None)
+    sigma_theta    (deg) normal gating width                      (default 20)
+    reduction      "mean" | "sum"                                 (default "mean")
+    """
+
+    def __init__(self,
+                 tau: int = 2,
+                 sigma_d: float | None = None,
+                 sigma_theta: float = 20.,
+                 reduction: str = 'mean'):
+        super().__init__()
+        if reduction not in ('mean', 'sum'):
+            raise ValueError
+        self.tau = int(tau)
+        self.sigma_d2 = (sigma_d if sigma_d is not None else tau / 1.5) ** 2
+        self.sigma_th2 = math.radians(sigma_theta) ** 2
+        self.reduction = reduction
+
+        # pre-compute neighbour offsets (exclude 0,0,0)
+        offs = range(-self.tau, self.tau + 1)
+        self.offsets = [(dz, dy, dx) for dz in offs for dy in offs for dx in offs
+                        if dz or dy or dx]
+        self.dist2 = {o: float(o[0]**2 + o[1]**2 + o[2]**2) for o in self.offsets}
+        
+        # Pre-compute distance weights as a tensor for vectorized operations
+        self.register_buffer('distance_weights', 
+                           torch.tensor([math.exp(-self.dist2[o] / self.sigma_d2) 
+                                       for o in self.offsets], dtype=torch.float32))
+
+    def _create_shifted_tensors(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Create all shifted versions of the input tensor for neighborhood comparisons.
+        Uses padding and slicing to handle boundaries efficiently.
+        
+        Returns tensor of shape (B, C, num_offsets, D, H, W)
+        """
+        B, C, D, H, W = tensor.shape
+        num_offsets = len(self.offsets)
+        
+        # Pad the tensor to handle boundary cases
+        pad_size = self.tau
+        padded = F.pad(tensor, (pad_size, pad_size, pad_size, pad_size, pad_size, pad_size), 
+                      mode='constant', value=0)
+        
+        # Pre-allocate output tensor
+        shifted_list = []
+        
+        for dz, dy, dx in self.offsets:
+            # Extract shifted version from padded tensor
+            z_start = pad_size + dz
+            y_start = pad_size + dy
+            x_start = pad_size + dx
+            
+            shifted_view = padded[:, :, 
+                                z_start:z_start+D,
+                                y_start:y_start+H,
+                                x_start:x_start+W]
+            shifted_list.append(shifted_view)
+        
+        # Stack all shifted versions along a new dimension
+        shifted = torch.stack(shifted_list, dim=2)  # (B, C, num_offsets, D, H, W)
+        
+        return shifted
+    
+    # ------------------------------------------------------------------
+    def forward(self,
+                n_pred: torch.Tensor,       # (B,3,D,H,W)  – predicted unit normals
+                n_gt: torch.Tensor = None,  # (B,3,D,H,W)  – ground truth normals (ignored)
+                source_pred: torch.Tensor | None = None): # (B,1,D,H,W) – source predictions
+        """
+        Compute normal-gated repulsion loss using predicted normals.
+        Optionally uses source predictions for masking.
+        """
+        B, C, D, H, W = n_pred.shape
+        
+        # Normalize the normals
+        n_pred = F.normalize(n_pred, p=2, dim=1, eps=1e-6)
+        
+        # Create probability mask if source predictions are provided
+        if source_pred is not None:
+            # Apply sigmoid to get probabilities
+            prob = torch.sigmoid(source_pred)  # (B, 1, D, H, W)
+            prob_mask = (prob > 0.5)  # Threshold at 50%
+            
+            # Create shifted versions of probability mask
+            prob_shifted = self._create_shifted_tensors(prob)  # (B, 1, num_offsets, D, H, W)
+            prob_central = prob.unsqueeze(2).expand(-1, -1, len(self.offsets), -1, -1, -1)
+            
+            # Compute masks for valid pairs (both central and neighbor > threshold)
+            mask = (prob_central > 0.5) & (prob_shifted > 0.5)  # (B, 1, num_offsets, D, H, W)
+            mask = mask.squeeze(1).float()  # (B, num_offsets, D, H, W)
+        else:
+            mask = None
+        
+        # Create shifted versions of normals
+        n_pred_shifted = self._create_shifted_tensors(n_pred)  # (B, 3, num_offsets, D, H, W)
+        
+        # Central (unshifted) normals - expand to match shifted shape
+        n_pred_central = n_pred.unsqueeze(2).expand(-1, -1, len(self.offsets), -1, -1, -1)
+        
+        # Compute dot products between central and shifted normals
+        # Sum over channel dimension (dim=1)
+        dot_products = (n_pred_central * n_pred_shifted).sum(dim=1).clamp(-1, 1)  # (B, num_offsets, D, H, W)
+        
+        # Compute angles and angular weights
+        theta2 = torch.acos(dot_products).pow(2)
+        w_theta = torch.exp(-theta2 / self.sigma_th2)
+        
+        # Apply distance weights (broadcast to match shape)
+        w_dist = self.distance_weights.to(n_pred.device).to(n_pred.dtype)
+        w_dist = w_dist.view(1, -1, 1, 1, 1)  # Shape for broadcasting
+        
+        # Compute loss values
+        loss_vox = w_theta * w_dist  # (B, num_offsets, D, H, W)
+        
+        # Apply mask if available
+        if mask is not None:
+            loss_vox = loss_vox * mask
+            total = loss_vox.sum()
+            count = mask.sum()
+            
+            if count == 0:
+                return torch.zeros((), dtype=n_pred.dtype, device=n_pred.device, requires_grad=True)
+        else:
+            total = loss_vox.sum()
+            count = loss_vox.numel()
+        
+        if self.reduction == 'sum':
+            return total
+        return total / count
+
+
 
 #######################################################################################################################
 
@@ -577,6 +1263,23 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight):
     elif name == 'MaskedMSELoss':
         mask_channel = loss_config.get('mask_channel', False)
         base_loss = MaskedMSELoss(ignore_index=ignore_index, mask_channel=mask_channel)
+    elif name == 'MaskedReconstructionLoss':
+        base_loss_type = loss_config.get('base_loss', 'mse')
+        normalize_targets = loss_config.get('normalize_targets', True)
+        reduction = loss_config.get('reduction', 'mean')
+        eps = loss_config.get('eps', 1e-6)
+        variance_threshold = loss_config.get('variance_threshold', 0.1)
+        use_robust_norm = loss_config.get('use_robust_norm', True)
+        max_loss_value = loss_config.get('max_loss_value', 100.0)
+        log_high_losses = loss_config.get('log_high_losses', True)
+        base_loss = MaskedReconstructionLoss(base_loss=base_loss_type, 
+                                         normalize_targets=normalize_targets,
+                                         reduction=reduction,
+                                         eps=eps,
+                                         variance_threshold=variance_threshold,
+                                         use_robust_norm=use_robust_norm,
+                                         max_loss_value=max_loss_value,
+                                         log_high_losses=log_high_losses)
     elif name == 'SmoothL1Loss':
         base_loss = SmoothL1Loss()
     elif name == 'L1Loss':
@@ -593,7 +1296,49 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight):
             ignore_index= ignore_index, 
             eps         = loss_config.get('eps', 1e-8)
         )
+    elif name == 'CosineSimilarityLoss':
+        dim = loss_config.get('dim', 1)
+        eps = loss_config.get('eps', 1e-8)
+        base_loss = CosineSimilarityLoss(dim=dim, eps=eps, ignore_index=ignore_index)
 
+    elif name == 'SignedDistanceLoss':
+        # rho, beta, eikonal, eikonal_weight, reduction are read from the YAML / json
+        base_loss = SignedDistanceLoss(
+            rho             = loss_config.get('rho', 4.0),
+            beta            = loss_config.get('beta', 1.0),
+            eikonal         = loss_config.get('eikonal', True),
+            eikonal_weight  = loss_config.get('eikonal_weight', 0.01),
+            reduction       = loss_config.get('reduction', 'mean'),
+            ignore_index    = ignore_index,
+        )
+        
+    elif name == 'PlanarityLoss':
+        base_loss = PlanarityLoss(
+            rho           = loss_config.get('rho', 1.5),
+            q             = loss_config.get('q', 1.0),
+            prob_thresh   = loss_config.get('prob_thresh', 0.5),
+            reduction     = loss_config.get('reduction', 'mean'),
+            ignore_index  = ignore_index,
+            normalization = loss_config.get('normalization', 'sigmoid')
+        )
+
+    elif name == 'NormalSmoothnessLoss':
+        base_loss = NormalSmoothnessLoss(
+            sigma        = loss_config.get('sigma', 2.0),
+            q            = loss_config.get('q', 2.0),
+            prob_thresh  = loss_config.get('prob_thresh', 0.5),
+            reduction    = loss_config.get('reduction', 'mean')
+        )
+
+    elif name == 'NormalGatedRepulsionLoss':
+        base_loss = NormalGatedRepulsionLoss(
+            tau          = loss_config.get('tau', 2),
+            sigma_d      = loss_config.get('sigma_d', None),
+            sigma_theta  = loss_config.get('sigma_theta', 20.0),
+            reduction    = loss_config.get('reduction', 'mean')
+        )
+
+    
     else:
         raise RuntimeError(f"Unsupported loss function: '{name}'")
     

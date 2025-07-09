@@ -13,7 +13,7 @@ import numpy as np
 import trimesh
 
 from . import alignment
-from . import divider_utils
+from . import curved_divider_wall
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +168,7 @@ class ScrollMesh:
     )
     smoothing_callback: Optional[Callable[[mm.Mesh], mm.Mesh]] = None
     smoothing_unite_with_original: bool = True
+    vertical_offset: Optional[float] = None
 
 
 def assert_one_component(mesh: mm.Mesh):
@@ -254,6 +255,14 @@ def build_lining(
     if mesh_params.rotation_callback is not None:
         mesh_scroll = mesh_params.rotation_callback(mesh_scroll)
 
+    # Optionally translate mesh
+    if mesh_params.vertical_offset is not None:
+        logger.info("Translating mesh by %.2f", mesh_params.vertical_offset)
+        translate_mat = mm.AffineXf3f.translation(
+            mm.Vector3f(0, 0, mesh_params.vertical_offset)
+        )
+        mesh_scroll.transform(translate_mat)
+
     # Offset
     logger.info("Offsetting mesh")
     params = mm.OffsetParameters()
@@ -269,7 +278,7 @@ def build_lining(
 
     # Get divider piece
     divider_piece = (
-        divider_utils.divider_solid(
+        curved_divider_wall.build_divider_solid(
             radius + mesh_params.lining_offset_mm + mesh_params.wall_thickness_mm,
             112.5 / 2,
             mesh_params.wall_thickness_mm,

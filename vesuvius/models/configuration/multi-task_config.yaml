@@ -23,3 +23,11 @@ dataset_config:
       activation: "none"
       weight: 1
       loss_fn: "CEDiceLoss"
+  
+  # Optional: Volume-task loss configuration
+  # Specify which tasks should compute loss for which volumes
+  # If not specified, all tasks compute loss on all volumes
+  # volume_task_loss_config:
+  #   image1: ["hz", "vt"]  # Both tasks enabled for image1
+  #   image2: ["vt"]        # Only vt task enabled for image2
+  #   image3: ["hz"]        # Only hz task enabled for image3

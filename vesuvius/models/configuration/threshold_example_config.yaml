@@ -1,0 +1,31 @@
+# Example configuration demonstrating the label_threshold feature
+# This will set all label values below 0.5 to 0, and values >= 0.5 to the target_value
+
+tr_setup:
+  model_name: Threshold_Example_Model
+
+tr_config:
+  patch_size: [64, 64, 64]
+
+dataset_config:
+  binarize_labels: true
+  target_value: 1  # Values >= threshold will be set to 1
+  label_threshold: 0.5  # NEW: Threshold value - anything below this becomes 0
+  min_labeled_ratio: 0.1
+  targets:
+    ink:
+      out_channels: 2
+      activation: "sigmoid"
+      weight: 1
+      loss_fn: "BCEWithLogitsLoss"
+
+# Example with multi-class and threshold
+# dataset_config:
+#   binarize_labels: true
+#   label_threshold: 0.3  # Apply threshold before multi-class mapping
+#   target_value:
+#     fibers:
+#       mapping:
+#         0: 0  # background (values < 0.3 will already be 0)
+#         1: 1  # class 1 (only if original value >= 0.3)
+#         2: 2  # class 2 (only if original value >= 0.3)

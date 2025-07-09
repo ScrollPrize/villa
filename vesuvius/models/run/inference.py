@@ -24,7 +24,7 @@ class Inferer():
                  input_dir: str = None,
                  output_dir: str = None,
                  input_format: str = 'zarr',
-                 tta_type: str = 'rotation', # 'mirroring' or 'rotation'
+                 tta_type: str = 'mirroring', # 'mirroring' or 'rotation'
                  # tta_combinations: int = 3,
                  # tta_rotation_weights: [list, tuple] = (1, 1, 1),
                  do_tta: bool = True,

@@ -1,0 +1,71 @@
+# Example configuration for training with surface normals auxiliary task
+# This demonstrates how to use surface normals computed from signed distance transforms
+
+tr_config:
+  initial_lr: 0.01
+
+dataset_config:
+  min_labeled_ratio: 0 
+  min_bbox_percent: 0 
+  skip_patch_validation: true
+  target_value:
+    surface: 1  # Binary segmentation for ink detection
+  targets:
+    surface:
+      target_value: 1
+      weight: 1
+      losses:
+        - name: "BCEWithLogitsLoss"
+          weight: 1.0
+        # - name: "PlanarityLoss"
+        #   weight: 0.10
+        #   kwargs:
+        #     rho: 1.0
+        #     q: 1.0
+        #     prob_thresh: 0.5
+        #     normalization: "sigmoid"
+      activation: "none"
+
+# Auxiliary tasks configuration
+auxiliary_tasks:
+  # Distance transform auxiliary task (for comparison)
+  distance_transform:
+    type: distance_transform
+    source_target: surface
+    loss_weight: 0.10
+    losses: 
+      - name: "SignedDistanceLoss"
+        weight: 1.0
+        kwargs:
+            rho:   6          # band ±4 voxels
+            beta:  1          # Huber transition
+            eikonal: true  # Enable Eikonal loss
+    
+  # Surface normals auxiliary task
+
+  surface_normals:
+    type: surface_normals
+    source_target: surface  # Compute normals from ink segmentation
+    loss_weight: 0.10  
+    losses:
+      - name: "CosineSimilarityLoss"
+        weight: 1
+        kwargs:
+          dim: 1
+      - name: "NormalSmoothnessLoss"
+        weight: 0.5
+        kwargs:
+          sigma: 2.0
+          q: 2.0
+      # - name: "NormalGatedRepulsionLoss"
+      #   weight: 0.1
+      #   kwargs:
+      #     tau: 2              # neighborhood radius in voxels
+      #     sigma_theta: 20.0   # normal gating width in degrees
+
+        
+    # out_channels will be automatically set to 2 (2D) or 3 (3D) based on data 
+  
+model_config:
+  features_per_stage: [64,128,256,320,512,768]
+
