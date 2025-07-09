@@ -134,8 +134,8 @@ Between **6 May 2025 and 12 May 2025** we scanned three additional fr
 <div className="flex flex-wrap mb-4">
   <div className="w-[45%] mb-2 mr-2 max-w-[260px]"><img src="/img/data/PHerc0500P2-ir.JPG" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 500P2 – infrared</figcaption></div>
 </div>
-- **2.215 µm, 110 keV** · OME‑Zarr
-- **4.317 µm, 111 keV** · OME‑Zarr 
+- **2.215 µm, 110 keV** · OME‑Zarr · 523.4 GB
+- **4.317 µm, 111 keV** · OME‑Zarr · 100.5 GB
 - Multispectral stack (16 bands, 420–1050 nm)  
 - Case + mesh STL (nylon 12 print‑ready)
 
@@ -144,8 +144,8 @@ Between **6 May 2025 and 12 May 2025** we scanned three additional fr
 <div className="flex flex-wrap mb-4">
   <div className="w-[45%] mb-2 mr-2 max-w-[260px]"><img src="/img/data/PHerc0343P-ir.JPG" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 343P – infrared</figcaption></div>
 </div>
-- **2.215 µm, 111 keV** · OME‑Zarr
-- **4.320 µm, 116 keV (bin×2)** · OME‑Zarr
+- **2.215 µm, 111 keV** · OME‑Zarr · 558.0 GB
+- **4.320 µm, 116 keV (bin×2)** · OME‑Zarr · 19.5 GB
 - Multispectral stack (16 bands)  
 - Case + mesh STL
 
@@ -154,7 +154,7 @@ Between **6 May 2025 and 12 May 2025** we scanned three additional fr
 <div className="flex flex-wrap mb-4">
   <div className="w-[45%] mb-2 mr-2 max-w-[260px]"><img src="/img/data/PHerc0009B-ir.JPG" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 9B – infrared</figcaption></div>
 </div>
-- **4.320 µm, 116 keV (bin×2)** · OME‑Zarr
+- **4.320 µm, 116 keV (bin×2)** · OME‑Zarr · 72.4 GB
 - Multispectral stack (16 bands)  
 - Case + mesh STL
 
