@@ -10,24 +10,7 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from data.utils import open_zarr
-import time
-
-
-def zarr_array_exists(zarr_path):
-    """
-    Check if a zarr array exists at the given path.
-    Works for both local paths and S3 paths.
-    """
-    try:
-        if zarr_path.startswith('s3://'):
-            fs = fsspec.filesystem('s3', anon=False)
-            # Check if .zarray file exists within the zarr directory
-            return fs.exists(os.path.join(zarr_path, '.zarray'))
-        else:
-            # For local paths, check if the .zarray file exists
-            return os.path.exists(os.path.join(zarr_path, '.zarray'))
-    except Exception:
-        return False
+from utils.io.zarr_io import wait_for_zarr_creation
 
 
 def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_classes, spatial_shape, output_chunks, is_multi_task=False, target_info=None):
@@ -311,17 +294,7 @@ def finalize_logits(
         # Other parts wait for part 0 to create the array, then open it in r+ mode
         print(f"Waiting for part 0 to create output array...")
 
-        max_wait_time = 300  # 5 minutes maximum wait time
-        wait_time = 0
-
-        while not zarr_array_exists(output_path):
-            if wait_time >= max_wait_time:
-                raise RuntimeError(f"Timeout waiting for part 0 to create array. Waited {max_wait_time} seconds.")
-
-            if verbose:
-                print(f"  Part {part_id} waiting for array to be created by part 0... ({wait_time}s elapsed)")
-            time.sleep(5)
-            wait_time += 5
+        wait_for_zarr_creation(output_path, verbose=verbose, part_id=part_id)
 
         print(f"Array found! Opening in r+ mode for part {part_id}")
 
