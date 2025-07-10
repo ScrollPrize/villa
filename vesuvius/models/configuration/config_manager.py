@@ -61,6 +61,8 @@ class ConfigManager:
         self.autoconfigure = bool(self.tr_info.get("autoconfigure", True))
         self.tr_val_split = float(self.tr_info.get("tr_val_split", 0.95))
         self.compute_loss_on_labeled_only = bool(self.tr_info.get("compute_loss_on_labeled_only", False))
+        self.wandb_project = self.tr_info.get("wandb_project", None)
+        self.wandb_entity = self.tr_info.get("wandb_entity", None)
 
         ckpt_out_base = self.tr_info.get("ckpt_out_base", "./checkpoints/")
         self.ckpt_out_base = Path(ckpt_out_base)
@@ -200,7 +202,7 @@ class ConfigManager:
 
         return data_dict
 
-    def save_config(self):
+    def convert_to_dict(self):
         tr_setup = deepcopy(self.tr_info)
         tr_config = deepcopy(self.tr_configs)
         model_config = deepcopy(self.model_config)
@@ -209,7 +211,7 @@ class ConfigManager:
         # Create inference_config from individual attributes
         inference_config = {
             "checkpoint_path": self.infer_checkpoint_path,
-            "patch_size": list(self.infer_patch_size),
+            "patch_size": list(self.infer_patch_size) if self.infer_patch_size else None,
             "batch_size": self.infer_batch_size,
             "output_targets": self.infer_output_targets,
             "overlap": self.infer_overlap,
@@ -233,6 +235,12 @@ class ConfigManager:
             "inference_config": inference_config,
         }
 
+        return combined_config
+
+    def save_config(self):
+
+        combined_config = self.convert_to_dict()
+        
         model_ckpt_dir = Path(self.ckpt_out_base) / self.model_name
         model_ckpt_dir.mkdir(parents=True, exist_ok=True)
         config_filename = f"{self.model_name}_config.yaml"
