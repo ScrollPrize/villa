@@ -255,7 +255,7 @@ def merge_inference_outputs(
         delete_weights: bool = True,  # Delete weight accumulator after merge
         verbose: bool = True,
         num_parts: int = 1,  # Number of parts to split processing into
-        part_id: int = 0):  # Part ID for this process (0-indexed)
+        global_part_id: int = 0):  # Part ID for this process (0-indexed)
     """
     Args:
         parent_dir: Directory containing logits_part_X.zarr and coordinates_part_X.zarr.
@@ -271,7 +271,7 @@ def merge_inference_outputs(
         delete_weights: Whether to delete the weight accumulator Zarr after completion.
         verbose: Print progress messages.
         num_parts: Number of parts to split the blending process into.
-        part_id: Part ID for this process (0-indexed). Used for Z-axis partitioning.
+        global_part_id: Part ID for this process (0-indexed). Used for Z-axis partitioning.
     """
 
     # blosc has an issuse with threading , so we disable it
@@ -288,7 +288,7 @@ def merge_inference_outputs(
 
     # Add partitioning information
     if num_parts > 1:
-        print(f"Partitioned blending: Processing part {part_id}/{num_parts}")
+        print(f"Partitioned blending: Processing part {global_part_id}/{num_parts}")
 
     # --- 1. Discover Parts ---
     part_files = {}
@@ -402,7 +402,7 @@ def merge_inference_outputs(
         compressor = None
 
     # --- 3. Create or Open Output Arrays ---
-    if part_id == 0:
+    if global_part_id == 0:
         # Part 0 creates the arrays
         print(f"Creating final output store: {output_path}")
         print(f"  Shape: {output_shape}, Chunks: {output_chunks}")
@@ -439,10 +439,10 @@ def merge_inference_outputs(
         # Other parts wait for part 0 to create the arrays, then open them in r+ mode
         print(f"Waiting for part 0 to create output arrays...")
 
-        wait_for_zarr_creation(output_path, verbose=verbose, part_id=part_id)
-        wait_for_zarr_creation(weight_accumulator_path, verbose=verbose, part_id=part_id)
+        wait_for_zarr_creation(output_path, verbose=verbose, part_id=global_part_id)
+        wait_for_zarr_creation(weight_accumulator_path, verbose=verbose, part_id=global_part_id)
 
-        print(f"Arrays found! Opening in r+ mode for part {part_id}")
+        print(f"Arrays found! Opening in r+ mode for part {global_part_id}")
 
     # --- 4. Generate Gaussian Map ---
     gaussian_map = generate_gaussian_map(patch_size, sigma_scale=sigma_scale)
@@ -451,10 +451,10 @@ def merge_inference_outputs(
     z_range = None
     if num_parts > 1:
         total_z = original_volume_shape[0]  # Z dimension
-        z_start = (part_id * total_z) // num_parts
-        z_end = ((part_id + 1) * total_z) // num_parts
+        z_start = (global_part_id * total_z) // num_parts
+        z_end = ((global_part_id + 1) * total_z) // num_parts
         z_range = (z_start, z_end)
-        print(f"Part {part_id} processing Z-range: {z_start} to {z_end} (out of {total_z})")
+        print(f"Part {global_part_id} processing Z-range: {z_start} to {z_end} (out of {total_z})")
 
     # --- 6. Calculate Processing Chunks ---
     chunks = calculate_chunks(
@@ -617,7 +617,7 @@ def main():
             delete_weights=not args.keep_weights,
             verbose=not args.quiet,
             num_parts=args.num_parts,
-            part_id=args.part_id
+            global_part_id=args.part_id
         )
         return 0
     except Exception as e:
