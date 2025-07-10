@@ -661,7 +661,7 @@ const team = {
     },
     {
       name: "Sean Johnson",
-      title: "Technical Community Manager",
+      title: "Research Assistant",
       href: "https://github.com/bruniss",
     },
     {
