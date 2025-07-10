@@ -14,6 +14,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import math
 from data.utils import open_zarr
 import traceback
+from utils.io.zarr_io import wait_for_zarr_creation
+from utils.k8s import get_tqdm_kwargs
 
 
 def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=np.float32) -> np.ndarray:
@@ -35,8 +37,8 @@ def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=np.
     return gaussian_map_np
 
 
-def process_chunk(chunk_info, parent_dir, output_path, weights_path, gaussian_map, 
-                patch_size, part_files):
+def process_chunk(chunk_info, parent_dir, output_path, gaussian_map,
+                patch_size, part_files, epsilon=1e-8):
     """
     Process a single chunk of the volume, handling all patches that intersect with this chunk.
     
@@ -44,7 +46,6 @@ def process_chunk(chunk_info, parent_dir, output_path, weights_path, gaussian_ma
         chunk_info: Dictionary with chunk boundaries {'z_start', 'z_end', 'y_start', 'y_end', 'x_start', 'x_end'}
         parent_dir: Directory containing part files
         output_path: Path to output zarr
-        weights_path: Path to weights zarr
         gaussian_map: Pre-computed Gaussian map
         patch_size: Size of patches (pZ, pY, pX)
         part_files: Dictionary of part files
@@ -60,8 +61,6 @@ def process_chunk(chunk_info, parent_dir, output_path, weights_path, gaussian_ma
     gaussian_map_spatial_np = gaussian_map[0]  # Shape (pZ, pY, pX)
     
     output_store = open_zarr(output_path, mode='r+', storage_options={'anon': False} if output_path.startswith('s3://') else None)
-    weights_store = open_zarr(weights_path, mode='r+', storage_options={'anon': False} if weights_path.startswith('s3://') else None)
-    
     # Create local accumulators for this chunk - initialize with zeros
     # Shape: (C, chunk_z, chunk_y, chunk_x)
     num_classes = output_store.shape[0]
@@ -145,72 +144,20 @@ def process_chunk(chunk_info, parent_dir, output_path, weights_path, gaussian_ma
             slice(y_start, y_end),
             slice(x_start, x_end)
         )
-        
-        weight_slice = (
-            slice(z_start, z_end),
-            slice(y_start, y_end),
-            slice(x_start, x_end)
-        )
-        
-        output_store[output_slice] = chunk_logits
-        weights_store[weight_slice] = chunk_weights
-    
+
+        normalized = np.zeros_like(chunk_logits)
+        np.divide(chunk_logits, chunk_weights[np.newaxis, :, :, :] + epsilon,
+                  out=normalized, where=chunk_weights[np.newaxis, :, :, :] > 0)
+
+        output_store[output_slice] = normalized
+
     return {
         'chunk': chunk_info,
         'patches_processed': patches_processed
     }
 
-
-# --- Normalization Worker Function ---
-def normalize_chunk(chunk_info, output_path, weights_path, epsilon=1e-8):
-    """
-    Normalize a single chunk by dividing accumulated logits by weights.
-    
-    Args:
-        chunk_info: Dictionary with chunk boundaries {'z_start', 'z_end', 'y_start', 'y_end', 'x_start', 'x_end'}
-        output_path: Path to output zarr
-        weights_path: Path to weights zarr
-        epsilon: Small value to avoid division by zero
-    """
-
-    z_start, z_end = chunk_info['z_start'], chunk_info['z_end']
-    y_start, y_end = chunk_info['y_start'], chunk_info['y_end']
-    x_start, x_end = chunk_info['x_start'], chunk_info['x_end']
-    
-    output_store = open_zarr(output_path, mode='r+', storage_options={'anon': False} if output_path.startswith('s3://') else None)
-    weights_store = open_zarr(weights_path, mode='r', storage_options={'anon': False} if weights_path.startswith('s3://') else None)
-    
-    output_slice = (
-        slice(None), 
-        slice(z_start, z_end),
-        slice(y_start, y_end),
-        slice(x_start, x_end)
-    )
-    
-    weight_slice = (
-        slice(z_start, z_end),
-        slice(y_start, y_end),
-        slice(x_start, x_end)
-    )
-    
-    logits = output_store[output_slice]
-    weights = weights_store[weight_slice]
-    
-    normalized = np.zeros_like(logits)
-    
-    # divide only where weights > 0
-    np.divide(logits, weights[np.newaxis, :, :, :] + epsilon, 
-              out=normalized, where=weights[np.newaxis, :, :, :] > 0)
-    
-    output_store[output_slice] = normalized
-    
-    return {
-        'chunk': chunk_info,
-        'normalized_voxels': np.prod(normalized.shape)
-    }
-
 # --- Utility Functions ---
-def calculate_chunks(volume_shape, output_chunks=None):
+def calculate_chunks(volume_shape, output_chunks=None, z_range=None):
 
     Z, Y, X = volume_shape
 
@@ -226,54 +173,64 @@ def calculate_chunks(volume_shape, output_chunks=None):
                 z_end = min(z_start + z_chunk, Z)
                 y_end = min(y_start + y_chunk, Y)
                 x_end = min(x_start + x_chunk, X)
-                
+
+                # Apply Z-range filtering if specified
+                if z_range is not None:
+                    range_z_start, range_z_end = z_range
+                    # Only include chunks whose end is inside the range
+                    if not (range_z_start < z_end and range_z_end >= z_end):
+                        continue  # Skip chunks outside the Z-range
+
                 chunks.append({
                     'z_start': z_start, 'z_end': z_end,
                     'y_start': y_start, 'y_end': y_end,
                     'x_start': x_start, 'x_end': x_end
                 })
-    
+
     return chunks
 
 # --- Main Merging Function ---
 def merge_inference_outputs(
         parent_dir: str,
         output_path: str,
-        weight_accumulator_path: str = None,  # Optional: Path for weights, default is temp
         sigma_scale: float = 8.0,
         chunk_size: tuple = None,  # Spatial chunk size (Z, Y, X) for output
         num_workers: int = None,  # Number of worker processes to use
         compression_level: int = 1,  # Compression level (0-9, 0=none)
-        delete_weights: bool = True,  # Delete weight accumulator after merge
-        verbose: bool = True):
+        verbose: bool = True,
+        num_parts: int = 1,  # Number of parts to split processing into
+        global_part_id: int = 0):  # Part ID for this process (0-indexed)
     """
     Args:
         parent_dir: Directory containing logits_part_X.zarr and coordinates_part_X.zarr.
         output_path: Path for the final merged Zarr store.
-        weight_accumulator_path: Path for the temporary weight accumulator Zarr.
-                                  If None, defaults to output_path + "_weights.zarr".
         sigma_scale: Determines the sigma for the Gaussian map (patch_size / sigma_scale).
         chunk_size: Spatial chunk size (Z, Y, X) for output Zarr stores.
                     If None, will use patch_size as a starting point.
         num_workers: Number of worker processes to use.
                      If None, defaults to CPU_COUNT - 1.
         compression_level: Zarr compression level (0-9, 0=none)
-        delete_weights: Whether to delete the weight accumulator Zarr after completion.
         verbose: Print progress messages.
+        num_parts: Number of parts to split the blending process into.
+        global_part_id: Part ID for this process (0-indexed). Used for Z-axis partitioning.
     """
+
+    tqdm_kwargs = get_tqdm_kwargs()
+    if not verbose:
+        tqdm_kwargs['disable'] = True
 
     # blosc has an issuse with threading , so we disable it
     numcodecs.blosc.use_threads = False
-    if weight_accumulator_path is None:
-        base, _ = os.path.splitext(output_path)
-        weight_accumulator_path = f"{base}_weights.zarr"
-    
     if num_workers is None:
         # just use half the cpu count 
         num_workers = max(1, mp.cpu_count() // 2)
     
     print(f"Using {num_workers} worker processes (half of CPU count for memory efficiency)")
-        
+
+    # Add partitioning information
+    if num_parts > 1:
+        print(f"Partitioned blending: Processing part {global_part_id}/{num_parts}")
+
     # --- 1. Discover Parts ---
     part_files = {}
     part_pattern = re.compile(r"(logits|coordinates)_part_(\d+)\.zarr")
@@ -353,7 +310,6 @@ def merge_inference_outputs(
 
     # --- 3. Prepare Output Stores ---
     output_shape = (num_classes, *original_volume_shape)  # (C, D, H, W)
-    weights_shape = original_volume_shape  # (D, H, W)
 
     # we use the patch size as the default chunk size throughout the pipeline
     # so that the chunk size is consistent , to avoid partial chunk read/writes
@@ -366,12 +322,10 @@ def merge_inference_outputs(
             patch_size[1],  # y
             patch_size[2]   # x
         )
-        weights_chunks = output_chunks[1:]
         if verbose:
             print(f"  Using chunk_size {output_chunks[1:]} based directly on patch_size")
     else:
-        output_chunks = (1, *chunk_size) 
-        weights_chunks = chunk_size
+        output_chunks = (1, *chunk_size)
         if verbose:
             print(f"  Using specified chunk_size {chunk_size}")
 
@@ -385,57 +339,60 @@ def merge_inference_outputs(
     else:
         compressor = None
 
-    print(f"Creating final output store: {output_path}")
-    print(f"  Shape: {output_shape}, Chunks: {output_chunks}")
-    
-    open_zarr(
-        path=output_path,
-        mode='w',
-        storage_options={'anon': False} if output_path.startswith('s3://') else None,
-        verbose=verbose,
-        shape=output_shape,
-        chunks=output_chunks,
-        compressor=compressor,
-        dtype=np.float32,
-        fill_value=0,
-        write_empty_chunks=False 
-    )
-    
-    print(f"Creating weight accumulator store: {weight_accumulator_path}")
-    print(f"  Shape: {weights_shape}, Chunks: {weights_chunks}")
-        
-    open_zarr(
-        path=weight_accumulator_path,
-        mode='w',
-        storage_options={'anon': False} if weight_accumulator_path.startswith('s3://') else None,
-        verbose=verbose,
-        shape=weights_shape,
-        chunks=weights_chunks,
-        compressor=compressor,
-        dtype=np.float32,
-        fill_value=0,
-        write_empty_chunks=False 
-    )
+    # --- 3. Create or Open Output Arrays ---
+    if global_part_id == 0:
+        # Part 0 creates the arrays
+        print(f"Creating final output store: {output_path}")
+        print(f"  Shape: {output_shape}, Chunks: {output_chunks}")
+
+        open_zarr(
+            path=output_path,
+            mode='w',
+            storage_options={'anon': False} if output_path.startswith('s3://') else None,
+            verbose=verbose,
+            shape=output_shape,
+            chunks=output_chunks,
+            compressor=compressor,
+            dtype=np.float32,
+            fill_value=0,
+            write_empty_chunks=False
+        )
+    else:
+        # Other parts wait for part 0 to create the arrays, then open them in r+ mode
+        print(f"Waiting for part 0 to create output arrays...")
+
+        wait_for_zarr_creation(output_path, verbose=verbose, part_id=global_part_id)
+
+        print(f"Arrays found! Opening in r+ mode for part {global_part_id}")
 
     # --- 4. Generate Gaussian Map ---
     gaussian_map = generate_gaussian_map(patch_size, sigma_scale=sigma_scale)
 
-    # --- 5. Calculate Processing Chunks ---
+    # --- 5. Calculate Z-range for this part ---
+    z_range = None
+    if num_parts > 1:
+        total_z = original_volume_shape[0]  # Z dimension
+        z_start = (global_part_id * total_z) // num_parts
+        z_end = ((global_part_id + 1) * total_z) // num_parts
+        z_range = (z_start, z_end)
+        print(f"Part {global_part_id} processing Z-range: {z_start} to {z_end} (out of {total_z})")
+
+    # --- 6. Calculate Processing Chunks ---
     chunks = calculate_chunks(
         original_volume_shape,
-        output_chunks=output_chunks[1:]  # Skip the class dimension from output_chunks
+        output_chunks=output_chunks[1:],  # Skip the class dimension from output_chunks
+        z_range=z_range
     )
     
     print(f"Divided volume into {len(chunks)} chunks for parallel processing")
-    
-    # --- 6. Process Chunks in Parallel ---
+
+    # --- 7. Process Chunks in Parallel ---
     print("\n--- Accumulating Weighted Patches ---")
-    
+
     process_chunk_partial = partial(
         process_chunk,
         parent_dir=parent_dir,
         output_path=output_path,
-        weights_path=weight_accumulator_path,
         gaussian_map=gaussian_map,
         patch_size=patch_size,
         part_files=part_files
@@ -450,7 +407,7 @@ def merge_inference_outputs(
             as_completed(future_to_chunk),
             total=len(chunks),
             desc="Processing Chunks",
-            disable=not verbose
+            **tqdm_kwargs,
         ):
             try:
                 result = future.result()
@@ -458,37 +415,10 @@ def merge_inference_outputs(
             except Exception as e:
                 print(f"Error processing chunk: {e}")
                 raise e
-    
-    print(f"\nAccumulation complete. Processed {total_patches_processed} patches total.")
-    
-    # --- 7. Normalize in Parallel ---
-    print("\n--- Normalizing Output ---")
-    
-    normalize_chunk_partial = partial(
-        normalize_chunk,
-        output_path=output_path,
-        weights_path=weight_accumulator_path
-    )
-    
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
 
-        futures = {executor.submit(normalize_chunk_partial, chunk): chunk for chunk in chunks}
-        
-        for future in tqdm(
-            as_completed(futures),
-            total=len(chunks),
-            desc="Normalizing Chunks",
-            disable=not verbose
-        ):
-            try:
-                result = future.result() 
-            except Exception as e:
-                print(f"Error normalizing chunk: {e}")
-                raise e
-    
-    print("\nNormalization complete.")
-    
-    # --- 8. Save Metadata ---
+    print(f"\nAccumulation complete. Processed {total_patches_processed} patches total.")
+
+    # --- 9. Save Metadata ---
     output_zarr = open_zarr(
         path=output_path,
         mode='r+',
@@ -504,18 +434,6 @@ def merge_inference_outputs(
         output_zarr.attrs['patch_size'] = patch_size
         output_zarr.attrs['original_volume_shape'] = original_volume_shape
         output_zarr.attrs['sigma_scale'] = sigma_scale
-    
-    # --- 9. Cleanup ---
-    if delete_weights:
-        print(f"Deleting weight accumulator: {weight_accumulator_path}")
-        try:
-            import shutil
-            if os.path.exists(weight_accumulator_path):
-                shutil.rmtree(weight_accumulator_path)
-                print(f"Successfully deleted weight accumulator")
-        except Exception as e:
-            print(f"Warning: Failed to delete weight accumulator: {e}")
-            print(f"You may need to delete it manually: {weight_accumulator_path}")
 
     print(f"\n--- Merging Finished ---")
     print(f"Final merged output saved to: {output_path}")
@@ -532,8 +450,6 @@ def main():
                         help='Directory containing the partial inference results (logits_part_X.zarr, coordinates_part_X.zarr)')
     parser.add_argument('output_path', type=str,
                         help='Path for the final merged Zarr output file.')
-    parser.add_argument('--weights_path', type=str, default=None,
-                        help='Optional path for the temporary weight accumulator Zarr. Defaults to <output_path>_weights.zarr')
     parser.add_argument('--sigma_scale', type=float, default=8.0,
                         help='Sigma scale for Gaussian map (patch_size / sigma_scale). Default: 8.0')
     parser.add_argument('--chunk_size', type=str, default=None,
@@ -542,12 +458,18 @@ def main():
                         help='Number of worker processes. Default: CPU_COUNT - 1')
     parser.add_argument('--compression_level', type=int, default=1, choices=range(10),
                         help='Compression level (0-9, 0=none). Default: 1')
-    parser.add_argument('--keep_weights', action='store_true',
-                        help='Do not delete the weight accumulator Zarr after merging.')
     parser.add_argument('--quiet', action='store_true',
                         help='Disable verbose progress messages (tqdm bars still show).')
+    parser.add_argument('--num_parts', type=int, default=1,
+                        help='Number of parts to split the blending process into. Default: 1')
+    parser.add_argument('--part_id', type=int, default=0,
+                        help='Part ID for this process (0-indexed). Default: 0')
 
     args = parser.parse_args()
+
+    # Validate partitioning arguments
+    if args.part_id < 0 or args.part_id >= args.num_parts:
+        parser.error(f"Invalid part_id {args.part_id} for num_parts {args.num_parts}. part_id must be 0 <= part_id < num_parts")
 
     chunks = None
     if args.chunk_size:
@@ -561,13 +483,13 @@ def main():
         merge_inference_outputs(
             parent_dir=args.parent_dir,
             output_path=args.output_path,
-            weight_accumulator_path=args.weights_path,
             sigma_scale=args.sigma_scale,
             chunk_size=chunks,
             num_workers=args.num_workers,
             compression_level=args.compression_level,
-            delete_weights=not args.keep_weights,
-            verbose=not args.quiet
+            verbose=not args.quiet,
+            num_parts=args.num_parts,
+            global_part_id=args.part_id
         )
         return 0
     except Exception as e:

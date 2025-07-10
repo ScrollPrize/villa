@@ -17,6 +17,7 @@ from data.vc_dataset import VCDataset
 from data.utils import open_zarr
 from pathlib import Path
 from models.build.build_network_from_config import NetworkFromConfig
+from utils.k8s import get_tqdm_kwargs
 
 class Inferer():
     def __init__(self,
@@ -565,8 +566,8 @@ class Inferer():
                 return write_index
             except Exception as e:
                 raise RuntimeError(f"Failed to write patch at index {write_index}: {str(e)}")
-            
-        with tqdm(total=self.num_total_patches, desc=f"Inferring Part {self.part_id}") as pbar:
+
+        with tqdm(total=self.num_total_patches, desc=f"Inferring Part {self.part_id}", **get_tqdm_kwargs()) as pbar:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = []
                 

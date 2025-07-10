@@ -10,7 +10,8 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from data.utils import open_zarr
-
+from utils.io.zarr_io import wait_for_zarr_creation
+from utils.k8s import get_tqdm_kwargs
 
 def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_classes, spatial_shape, output_chunks, is_multi_task=False, target_info=None):
     """
@@ -154,7 +155,9 @@ def finalize_logits(
     delete_intermediates: bool = False,  # If True, will delete the input logits after processing
     chunk_size: tuple = None,  # Optional custom chunk size for output
     num_workers: int = None,  # Number of worker processes to use
-    verbose: bool = True
+    verbose: bool = True,
+    num_parts: int = 1,  # Number of parts to split processing into
+    part_id: int = 0  # Part ID for this process (0-indexed)
 ):
     """
     Process merged logits and apply softmax/argmax to produce final outputs.
@@ -168,14 +171,24 @@ def finalize_logits(
         chunk_size: Optional custom chunk size for output (Z,Y,X)
         num_workers: Number of worker processes to use for parallel processing
         verbose: Print progress messages
+        num_parts: Number of parts to split the finalization process into
+        part_id: Part ID for this process (0-indexed). Used for Z-axis partitioning
     """
+    tqdm_kwargs = get_tqdm_kwargs()
+    if not verbose:
+        tqdm_kwargs['disable'] = True
+
     numcodecs.blosc.use_threads = False
     
     if num_workers is None:
         num_workers = max(1, mp.cpu_count() // 2)
     
     print(f"Using {num_workers} worker processes")
-    
+
+    # Add partitioning information
+    if num_parts > 1:
+        print(f"Partitioned finalization: Processing part {part_id}/{num_parts}")
+
     compressor = numcodecs.Blosc(
         cname='zstd',
         clevel=1,  # compression level is 1 because we're only using this for mostly empty chunks
@@ -260,23 +273,43 @@ def finalize_logits(
             # Plus 1 channel for the argmax
             output_shape = (num_classes + 1, *spatial_shape)
             print(f"Output will have {num_classes + 1} channels: [softmax_c0...softmax_cN, argmax]")
-    
-    print(f"Creating output store: {output_path}")
+
     output_chunks = (1, *output_chunks)  # Chunk each channel separately
-    
-    output_store = open_zarr(
-        path=output_path,
-        mode='w',
-        storage_options={'anon': False} if output_path.startswith('s3://') else None,
-        verbose=verbose,
-        shape=output_shape,
-        chunks=output_chunks,
-        dtype=np.uint8,  
-        compressor=compressor,
-        write_empty_chunks=False,
-        overwrite=True
-    )
-    
+
+    # --- Create or Open Output Array ---
+    if part_id == 0:
+        # Part 0 creates the array
+        print(f"Creating output store: {output_path}")
+        print(f"  Shape: {output_shape}, Chunks: {output_chunks}")
+
+        output_store = open_zarr(
+            path=output_path,
+            mode='w',
+            storage_options={'anon': False} if output_path.startswith('s3://') else None,
+            verbose=verbose,
+            shape=output_shape,
+            chunks=output_chunks,
+            dtype=np.uint8,
+            compressor=compressor,
+            write_empty_chunks=False,
+            overwrite=True
+        )
+    else:
+        # Other parts wait for part 0 to create the array, then open it in r+ mode
+        print(f"Waiting for part 0 to create output array...")
+
+        wait_for_zarr_creation(output_path, verbose=verbose, part_id=part_id)
+
+        print(f"Array found! Opening in r+ mode for part {part_id}")
+
+        # Open existing array in r+ mode (no need to specify shape/chunks)
+        output_store = open_zarr(
+            path=output_path,
+            mode='r+',
+            storage_options={'anon': False} if output_path.startswith('s3://') else None,
+            verbose=verbose
+        )
+
     def get_chunk_indices(shape, chunks):
         # For each dimension, calculate how many chunks we need
         # Skip first dimension (channels)
@@ -296,8 +329,32 @@ def finalize_logits(
             chunks_info.append({'indices': idx})
         
         return chunks_info
-    
-    chunk_infos = get_chunk_indices(input_shape, output_chunks)
+
+    # --- Calculate Z-range for this part ---
+    all_chunk_infos = get_chunk_indices(input_shape, output_chunks)
+
+    if num_parts > 1:
+        total_z = spatial_shape[0]  # Z dimension
+        z_start = (part_id * total_z) // num_parts
+        z_end = ((part_id + 1) * total_z) // num_parts
+        print(f"Part {part_id} processing Z-range: {z_start} to {z_end} (out of {total_z})")
+
+        # Filter chunks to only include those intersecting with this Z-range
+        chunk_infos = []
+        for chunk_info in all_chunk_infos:
+            z_idx, y_idx, x_idx = chunk_info['indices']
+            # Calculate actual Z coordinates for this chunk
+            chunk_z_start = z_idx * output_chunks[1]  # output_chunks[1] is Z chunk size
+            chunk_z_end = min(chunk_z_start + output_chunks[1], spatial_shape[0])
+
+            # Check if chunk intersects with our Z-range
+            if chunk_z_end > z_start and chunk_z_start < z_end:
+                chunk_infos.append(chunk_info)
+
+        print(f"Filtered to {len(chunk_infos)} chunks for part {part_id} (from {len(all_chunk_infos)} total)")
+    else:
+        chunk_infos = all_chunk_infos
+
     total_chunks = len(chunk_infos)
     print(f"Processing data in {total_chunks} chunks using {num_workers} worker processes...")
     
@@ -328,7 +385,7 @@ def finalize_logits(
             as_completed(future_to_chunk),
             total=total_chunks,
             desc="Processing Chunks",
-            disable=not verbose
+            **tqdm_kwargs,
         ):
             try:
                 result = future.result()
@@ -341,21 +398,26 @@ def finalize_logits(
                 raise e
     
     print(f"\nOutput processing complete. Processed {total_chunks - empty_chunks} chunks, skipped {empty_chunks} empty chunks ({empty_chunks/total_chunks:.2%}).")
-    
-    try:
-        if hasattr(input_store, 'attrs') and hasattr(output_store, 'attrs'):
-            for key in input_store.attrs:
-                output_store.attrs[key] = input_store.attrs[key]
-                
-            output_store.attrs['processing_mode'] = mode
-            output_store.attrs['threshold_applied'] = threshold
-            output_store.attrs['empty_chunks_skipped'] = empty_chunks
-            output_store.attrs['total_chunks'] = total_chunks
-            output_store.attrs['empty_chunk_percentage'] = float(empty_chunks/total_chunks) if total_chunks > 0 else 0.0
-    except Exception as e:
-        print(f"Warning: Failed to copy metadata: {e}")
-    
-    if delete_intermediates:
+
+    # Only part 0 updates metadata to avoid conflicts
+    if part_id == 0:
+        try:
+            if hasattr(input_store, 'attrs') and hasattr(output_store, 'attrs'):
+                for key in input_store.attrs:
+                    output_store.attrs[key] = input_store.attrs[key]
+
+                output_store.attrs['processing_mode'] = mode
+                output_store.attrs['threshold_applied'] = threshold
+                output_store.attrs['empty_chunks_skipped'] = empty_chunks
+                output_store.attrs['total_chunks'] = total_chunks
+                output_store.attrs['empty_chunk_percentage'] = float(empty_chunks/total_chunks) if total_chunks > 0 else 0.0
+        except Exception as e:
+            print(f"Warning: Failed to copy metadata: {e}")
+    elif verbose:
+        print(f"Part {part_id} skipping metadata update (handled by part 0)")
+
+    if delete_intermediates and num_parts == 1:
+        # Only delete intermediates when not using partitioning
         print(f"Deleting intermediate logits: {input_path}")
         try:
             # we have to use fsspec for s3/gs/azure paths 
@@ -376,7 +438,9 @@ def finalize_logits(
         except Exception as e:
             print(f"Warning: Failed to delete intermediate logits: {e}")
             print(f"You may need to delete them manually: {input_path}")
-    
+    elif delete_intermediates and num_parts > 1:
+        print(f"Skipping intermediate deletion in partitioned mode. Delete manually after all parts complete: {input_path}")
+
     print(f"Final output saved to: {output_path}")
 
 
@@ -400,9 +464,17 @@ def main():
                       help='Number of worker processes for parallel processing. Default: CPU_COUNT // 2')
     parser.add_argument('--quiet', dest='quiet', action='store_true',
                       help='Suppress verbose output')
-    
+    parser.add_argument('--num_parts', type=int, default=1,
+                      help='Number of parts to split the finalization process into. Default: 1')
+    parser.add_argument('--part_id', type=int, default=0,
+                      help='Part ID for this process (0-indexed). Default: 0')
+
     args = parser.parse_args()
-    
+
+    # Validate partitioning arguments
+    if args.part_id < 0 or args.part_id >= args.num_parts:
+        parser.error(f"Invalid part_id {args.part_id} for num_parts {args.num_parts}. part_id must be 0 <= part_id < num_parts")
+
     chunks = None
     if args.chunk_size:
         try:
@@ -420,7 +492,9 @@ def main():
             delete_intermediates=args.delete_intermediates,
             chunk_size=chunks,
             num_workers=args.num_workers,
-            verbose=not args.quiet
+            verbose=not args.quiet,
+            num_parts=args.num_parts,
+            part_id=args.part_id
         )
         return 0
     except Exception as e:
