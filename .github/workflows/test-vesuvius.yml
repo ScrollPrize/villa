@@ -30,5 +30,7 @@ jobs:
         pip install -e .
     
     - name: Test vesuvius import
+      working-directory: /tmp
       run: |
-        python -c "import vesuvius" 
+        python -c "import vesuvius"
+        vesuvius.predict -h
