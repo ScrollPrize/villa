@@ -6,3 +6,4 @@ numpy
 openai>=1.0.0
 python-dotenv
 py-cord>=2.4.0
+tabulate
