@@ -40,12 +40,22 @@ async def ask(ctx: discord.ApplicationContext, *, question: str):
     
     try:
         # Query the RAG system first
-        result = rag_chatbot.query(question, k=5)
+        result = rag_chatbot.query(question, k=6)
+        
+        # # Debug logging
+        # print(f"Query result keys: {result.keys()}")
+        # print(f"Answer: '{result.get('answer', 'NO ANSWER')}'")
+        # print(f"Answer length: {len(result.get('answer', ''))}")
+        
+        # Check if answer is empty or just whitespace
+        answer_text = result.get('answer', '').strip()
+        if not answer_text:
+            answer_text = "No answer was generated. Please check the sources below."
         
         # Create the main embed with the answer
         embed = discord.Embed(
             title="Answer",
-            description=result['answer'][:4096],  # Discord embed description limit
+            description=answer_text[:4096],  # Discord embed description limit
             color=discord.Color.blue()
         )
         
@@ -71,7 +81,7 @@ async def ask(ctx: discord.ApplicationContext, *, question: str):
             # Create jump link if we have all required IDs
             if message_id != 'unknown' and channel_id != 'unknown' and guild_id != 'unknown':
                 jump_link = f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
-                field_value = f"[Jump to message]({jump_link})\nScore: {source['score']:.3f}\n{content_preview}"
+                field_value = f"[Jump to message]({jump_link})\n{content_preview}"
             else:
                 field_value = f"Score: {source['score']:.3f}\n{content_preview}"
             
@@ -81,31 +91,8 @@ async def ask(ctx: discord.ApplicationContext, *, question: str):
                 inline=False
             )
         
-        # Check if we can create threads (must be in a guild and in a text channel)
-        if ctx.guild and hasattr(ctx.channel, 'create_thread'):
-            # Send initial message
-            initial_msg = await ctx.followup.send(f"📚 **Question:** {question[:100]}{'...' if len(question) > 100 else ''}")
-            
-            # Get the actual message object from the channel
-            try:
-                # Fetch the message we just sent
-                message = await ctx.channel.fetch_message(initial_msg.id)
-                
-                # Create a thread from the message
-                thread = await message.create_thread(
-                    name=f"Q: {question[:50]}{'...' if len(question) > 50 else ''}",
-                    auto_archive_duration=60
-                )
-                
-                # Send the answer in the thread
-                await thread.send(embed=embed)
-            except Exception as e:
-                # If thread creation fails, just send the embed as a followup
-                print(f"Thread creation failed: {e}")
-                await ctx.followup.send(embed=embed)
-        else:
-            # In DMs or channels without thread support, send normally
-            await ctx.followup.send(embed=embed)
+        # For now, just send the response without threads until we debug the answer issue
+        await ctx.followup.send(embed=embed)
         
     except Exception as e:
         error_embed = discord.Embed(

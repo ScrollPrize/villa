@@ -224,13 +224,13 @@ Provide a helpful answer based on the context above"""
         
         # Generate response using GPT-4.0 mini
         response = self.client.chat.completions.create(
-            model="o3-mini",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            # temperature=temperature,
-            max_completion_tokens=max_tokens
+            temperature=temperature,
+            max_tokens=max_tokens
         )
         
         answer = response.choices[0].message.content
@@ -251,7 +251,7 @@ Provide a helpful answer based on the context above"""
                 }
                 for doc, score in zip(documents, scores)
             ],
-            "model": "o3-mini",
+            "model": "gpt-4o-mini",
             "usage": {
                 "prompt_tokens": response.usage.prompt_tokens,
                 "completion_tokens": response.usage.completion_tokens,

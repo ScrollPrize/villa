@@ -5,6 +5,7 @@ from typing import List, Dict, Any
 from discord_parser import DiscordChatParser
 from embedder import create_embedder
 from vector_store import DiscordVectorStore
+from document_filter import filter_criteria
 
 
 def parse_json_files(input_path: str) -> List[Dict[str, Any]]:
@@ -53,6 +54,9 @@ def build_discord_rag(input_path: str, output_path: str = "./discord_vector_stor
         raise ValueError("No documents were successfully parsed from the input files")
     
     print(f"\nTotal messages parsed: {len(documents)}")
+    
+    # Apply filtering
+    documents = filter_criteria(documents)
     
     # Initialize embedder based on type
     print(f"\nInitializing {embedder_type} embedding model...")

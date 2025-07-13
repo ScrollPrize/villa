@@ -3,7 +3,7 @@
 # Script to build vector store from Discord export directory
 
 DISCORD_EXPORT_DIR="/opt/dlami/nvme/discordout-2025-07-08"
-OUTPUT_DIR="./discord_vector_store_full"
+OUTPUT_DIR="./discord_vector_store_full_filtered"
 EMBEDDER_TYPE="openai"
 EMBEDDER_MODEL="text-embedding-3-large"
 
