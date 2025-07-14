@@ -11,7 +11,7 @@ from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from data.utils import open_zarr
 from utils.io.zarr_io import wait_for_zarr_creation
-
+from utils.k8s import get_tqdm_kwargs
 
 def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_classes, spatial_shape, output_chunks, is_multi_task=False, target_info=None):
     """
@@ -174,6 +174,10 @@ def finalize_logits(
         num_parts: Number of parts to split the finalization process into
         part_id: Part ID for this process (0-indexed). Used for Z-axis partitioning
     """
+    tqdm_kwargs = get_tqdm_kwargs()
+    if not verbose:
+        tqdm_kwargs['disable'] = True
+
     numcodecs.blosc.use_threads = False
 
     if num_workers is None:
@@ -381,7 +385,7 @@ def finalize_logits(
             as_completed(future_to_chunk),
             total=total_chunks,
             desc="Processing Chunks",
-            disable=not verbose
+            **tqdm_kwargs,
         ):
             try:
                 result = future.result()

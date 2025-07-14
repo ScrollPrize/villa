@@ -15,6 +15,7 @@ import math
 from data.utils import open_zarr
 import traceback
 from utils.io.zarr_io import wait_for_zarr_creation
+from utils.k8s import get_tqdm_kwargs
 
 
 def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=np.float32) -> np.ndarray:
@@ -274,6 +275,10 @@ def merge_inference_outputs(
         global_part_id: Part ID for this process (0-indexed). Used for Z-axis partitioning.
     """
 
+    tqdm_kwargs = get_tqdm_kwargs()
+    if not verbose:
+        tqdm_kwargs['disable'] = True
+
     # blosc has an issuse with threading , so we disable it
     numcodecs.blosc.use_threads = False
     if weight_accumulator_path is None:
@@ -487,7 +492,7 @@ def merge_inference_outputs(
             as_completed(future_to_chunk),
             total=len(chunks),
             desc="Processing Chunks",
-            disable=not verbose
+            **tqdm_kwargs,
         ):
             try:
                 result = future.result()
@@ -515,7 +520,7 @@ def merge_inference_outputs(
             as_completed(futures),
             total=len(chunks),
             desc="Normalizing Chunks",
-            disable=not verbose
+            **tqdm_kwargs,
         ):
             try:
                 result = future.result()
