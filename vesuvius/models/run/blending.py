@@ -231,8 +231,8 @@ def calculate_chunks(volume_shape, output_chunks=None, z_range=None):
                 # Apply Z-range filtering if specified
                 if z_range is not None:
                     range_z_start, range_z_end = z_range
-                    # Only include chunks that intersect with the specified Z-range
-                    if z_end <= range_z_start or z_start >= range_z_end:
+                    # Only include chunks whose end is inside the range
+                    if not (range_z_start < z_end and range_z_end >= z_end):
                         continue  # Skip chunks outside the Z-range
 
                 chunks.append({
