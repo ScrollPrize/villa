@@ -42,6 +42,27 @@ Vesuvius Challenge has awarded **\$1,570,000** in prizes!
 
 This page lists all the prizes awarded so far:
 
+
+### \$7,000 Open Source (May, 2025)
+
+**Goal:** Updates to tooling<br/>
+**Announcement:** <a href="https://scrollprize.substack.com/p/may-progress-prizes-and-updates-to">Blog post</a>
+
+<div className="flex flex-row flex-wrap">
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://github.com/ScrollPrize/volume-cartographer">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$5,500</div><span className="font-bold">VC3D stability improvements</span>: Philip Allgaier / @spacegaier</div>
+    <img src="https://substackcdn.com/image/fetch/$s_!nbQK!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73a073b2-09f3-478c-b9bd-2e6141703df8_1669x995.png"/>
+  </a>
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://github.com/mvrcii/mask_2d_tif_volume">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$1,000</div><span className="font-bold">Volume masking pipeline</span>: Marcel Roth / @_mvrcii</div>
+    <img src="https://substackcdn.com/image/fetch/$s_!8rDu!,w_720,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F88e68620-0efd-486f-aade-4b37f5da5a9f_1750x548.png"/>
+  </a>
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://github.com/tomhsiao1260/neuroglancer-mini">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$1,000</div><span className="font-bold">neuroglancer-mini</span>: Hsiao Yao and Dalufish / @.yaohsiao and @dalufish</div>
+    <img src="https://private-user-images.githubusercontent.com/31985811/438568274-c69a9014-3250-4d05-8350-abb96975b64c.png?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3NTI1NjU4MzYsIm5iZiI6MTc1MjU2NTUzNiwicGF0aCI6Ii8zMTk4NTgxMS80Mzg1NjgyNzQtYzY5YTkwMTQtMzI1MC00ZDA1LTgzNTAtYWJiOTY5NzViNjRjLnBuZz9YLUFtei1BbGdvcml0aG09QVdTNC1ITUFDLVNIQTI1NiZYLUFtei1DcmVkZW50aWFsPUFLSUFWQ09EWUxTQTUzUFFLNFpBJTJGMjAyNTA3MTUlMkZ1cy1lYXN0LTElMkZzMyUyRmF3czRfcmVxdWVzdCZYLUFtei1EYXRlPTIwMjUwNzE1VDA3NDUzNlomWC1BbXotRXhwaXJlcz0zMDAmWC1BbXotU2lnbmF0dXJlPTBiNzgxMWUzZGJhM2E0ZGY2MGY5YmQ4YzkyNDlhMjMzYzI0NjczNTc5MTU2NDAxNzk1MDI2ZDE5YTA0N2VhNmYmWC1BbXotU2lnbmVkSGVhZGVycz1ob3N0In0.klaQAnTCOBfu5WTVWBPQZ_kKf38g_7KMCa_Wx9qjPnw"/>
+  </a>
+</div>
+    
 ### \$60,000 First Title Prize (May, 2025)
 
 **Goal:** Discover the end title of a sealed Herculaneum scroll.<br/>
