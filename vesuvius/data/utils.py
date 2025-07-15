@@ -91,6 +91,13 @@ def open_zarr(path: str, mode: str = 'r',
             s3_parts = path.replace('s3://', '').split('/')
             parent_path = 's3://' + '/'.join(s3_parts[:-1])
             if parent_path != 's3://':
+                # For AWS, if storage_options does not specify a StorageClass default to INTELLIGENT_TIERING
+                if 'endpoint_url' not in storage_options or 's3.amazonaws.com' in storage_options.get('endpoint_url', ''):
+                    if 's3_additional_kwargs' not in storage_options:
+                        storage_options['s3_additional_kwargs'] = {}
+                    if 'StorageClass' not in storage_options['s3_additional_kwargs']:
+                        storage_options['s3_additional_kwargs']['StorageClass'] = 'INTELLIGENT_TIERING'
+
                 import fsspec
                 fs = fsspec.filesystem('s3', **storage_options)
                 fs.makedirs(parent_path, exist_ok=True)
