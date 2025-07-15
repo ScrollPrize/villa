@@ -95,7 +95,7 @@ We may reward partial work - if your unrolling works but the ink detection isn't
 
 </details>
 
-[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSed2vRgW3HECXW3E6-llYPOST550yr4L0T5AIQp45GAYRcnGQ/viewform?usp=dialog)
+[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSd-ZU3evmsjr61cEjc5BPj45agBFxA6i-Pxo57OF58NIuyUng/viewform?usp=dialog)
 
 ***
 
