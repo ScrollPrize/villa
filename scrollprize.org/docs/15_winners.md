@@ -38,10 +38,21 @@ import PrizeCard from '@site/src/components/PrizeCard';
   />
 </head>
 
-Vesuvius Challenge has awarded **\$1,570,000** in prizes!
+Vesuvius Challenge has awarded **\$1,579,500** in prizes!
 
 This page lists all the prizes awarded so far:
 
+### \$2,500 Open Source (June, 2025)
+
+**Goal:** Improve virtual unwrapping<br/>
+**Announcement:** <a href="https://scrollprize.substack.com/p/summer-haze-comes-with-ink">Blog post</a>
+
+<div className="flex flex-row flex-wrap">
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://github.com/WillStevens/scrollreading/blob/main/report7.pdf">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$2,500</div><span className="font-bold">Stress metrics</span>: William Stevens / @Will Stevens</div>
+    <img src="https://substackcdn.com/image/fetch/$s_!NuGC!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F72a1b937-e98c-4f29-8a2c-4ec2df232ed3_1755x862.png"/>
+  </a>
+</div>
 
 ### \$7,000 Open Source (May, 2025)
 
@@ -50,7 +61,7 @@ This page lists all the prizes awarded so far:
 
 <div className="flex flex-row flex-wrap">
   <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://github.com/ScrollPrize/volume-cartographer">
-    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$5,500</div><span className="font-bold">VC3D stability improvements</span>: Philip Allgaier / @spacegaier</div>
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$5,000</div><span className="font-bold">VC3D stability improvements</span>: Philip Allgaier / @spacegaier</div>
     <img src="https://substackcdn.com/image/fetch/$s_!nbQK!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73a073b2-09f3-478c-b9bd-2e6141703df8_1669x995.png"/>
   </a>
   <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://github.com/mvrcii/mask_2d_tif_volume">
