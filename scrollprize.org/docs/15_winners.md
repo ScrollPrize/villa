@@ -90,6 +90,43 @@ This page lists all the prizes awarded so far:
   />
 </div>
 
+
+### \$7,000 Open Source (April, 2025)
+
+**Goal:** Get us closer to reading entire scrolls <br/>
+**Announcement:** <a href="https://scrollprize.substack.com/p/april-progress-prizes-updates">Blog post</a>
+
+<div className="flex flex-row flex-wrap">
+  <PrizeCard
+    href="https://github.com/WillStevens/scrollreading/blob/main/report6.pdf"
+    prizeAmount="$2,500"
+    title="Further work on ball and spring surface growing and analysis"
+    description="Will Stevens"
+    mediaSrc="/img/progress/202504/will_stevens_202504.webp"
+  />
+  <PrizeCard
+    href="https://github.com/lcparker/synthetic-pages/tree/main"
+    prizeAmount="$2,500"
+    title="Mask-3D fork and work on synthetic data generation"
+    description="Lachlan Parker"
+    mediaSrc="/img/progress/202504/lc_parker_202504.webp"
+  />
+  <PrizeCard
+    href="https://github.com/sgoutteb/khartes_segmata"
+    prizeAmount="$1,000"
+    title="Surface refinement in khartes"
+    description="Stephane Gouttebroze"
+    mediaSrc="/img/progress/202504/stephane_202504.webp"
+  />
+  <PrizeCard
+    href="https://github.com/tomhsiao1260/neuroglancer-mini"
+    prizeAmount="$1,000"
+    title="Simplified fork of neuroglancer"
+    description="Yao Hsao"
+    mediaSrc="/img/progress/202504/yao_202504.jpg"
+  />
+</div>
+
 ### \$10,500 Open Source (February, 2025)
 
 **Goal:** Get us closer to reading entire scrolls.<br/>
