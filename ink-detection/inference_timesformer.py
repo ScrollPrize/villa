@@ -1,23 +1,25 @@
 import os
 import subprocess
-from tap import Tap
 import glob
+import argparse
 
-class InferenceArgumentParser(Tap):
-    segment_id: list[str] =[]           # Leave empty to process all segments in the segment_path
-    segment_path:str='./eval_scrolls'
-    model_path:str= 'outputs/vesuvius/pretraining_all/vesuvius-models/valid_20230827161847_0_fr_i3depoch=7.ckpt'
-    out_path:str=""
-    stride: int = 32
-    start_idx:int=17
-    workers: int = 4
-    batch_size: int = 64
-    size:int=64
-    reverse:int=0
-    device:str='cuda'
-    gpus:int=1
-    model_compile:bool=True
-args = InferenceArgumentParser().parse_args()
+
+parser = argparse.ArgumentParser(description='Inference script for Vesuvius scrolls')
+parser.add_argument('--segment_id', nargs='+', default=[], help='List of segment IDs to process')
+parser.add_argument('--segment_path', type=str, default='./eval_scrolls', help='Path to segments')
+parser.add_argument('--model_path', type=str, required=True, help='Path to model checkpoint')
+parser.add_argument('--out_path', type=str, default='', help='Output path for predictions')
+parser.add_argument('--stride', type=int, default=32, help='Stride for sliding window')
+parser.add_argument('--start_idx', type=int, default=17, help='Starting layer index')
+parser.add_argument('--workers', type=int, default=4, help='Number of workers')
+parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
+parser.add_argument('--size', type=int, default=64, help='Tile size')
+parser.add_argument('--gpus', type=int, default=1, help='Number of GPUs')
+parser.add_argument('--zarr_surface', type=str, default=None, help='Path to zarr surface volume')
+parser.add_argument('--zarr_name', type=str, default=None, help='Name for zarr output')
+parser.add_argument('--wandb', type=bool, default=False, help='Use weights and biases')
+
+args = parser.parse_args()
 
 # Generate a string "0,1,2,...,args.gpus-1"
 gpu_ids = ",".join(str(i) for i in range(args.gpus))
@@ -128,6 +130,74 @@ def read_image_mask(fragment_id,start_idx=18,end_idx=38,rotation=0):
         fragment_mask = np.ones_like(images[:,:,0]) * 255
 
     return images, fragment_mask
+
+
+def get_zarr_splits(zarr_surface_path, start_idx=17, end_idx=43):
+    """
+    Process zarr surface volume for inference, similar to get_img_splits but for zarr data.
+    """
+    import zarr
+
+    images = []
+    xyxys = []
+
+    print(f'Reading zarr surface from {zarr_surface_path}')
+
+    # Load zarr surface
+    surface = zarr.open(zarr_surface_path, mode='r')
+
+    # Extract layers (default 17-43 as in training)
+    surface_data = surface[start_idx:end_idx, :, :]
+
+    z_dim, y_dim, x_dim = surface_data.shape
+    print(f"Zarr surface shape: {surface_data.shape}")
+
+    # Ensure we have the right number of channels
+    assert z_dim == CFG.in_chans, f"Expected {CFG.in_chans} channels, got {z_dim}"
+
+    # Create sliding windows over the entire surface
+    x1_list = list(range(0, x_dim - CFG.tile_size + 1, args.stride))
+    y1_list = list(range(0, y_dim - CFG.tile_size + 1, args.stride))
+
+    for y1 in y1_list:
+        for x1 in x1_list:
+            y2 = y1 + CFG.tile_size
+            x2 = x1 + CFG.tile_size
+
+            # Extract tile and transpose to (y, x, z) format
+            tile = surface_data[:, y1:y2, x1:x2]
+            tile = np.transpose(tile, (1, 2, 0))  # Convert from (z, y, x) to (y, x, z)
+
+            # Clip values similar to image reading
+            tile = np.clip(tile, 0, 200)
+
+            images.append(tile)
+            xyxys.append([x1, y1, x2, y2])
+
+    print(f"Created {len(images)} tiles from zarr surface")
+
+    # Create dataset and dataloader
+    test_dataset = CustomDatasetTest(images, np.stack(xyxys), CFG, transform=A.Compose([
+        A.Resize(CFG.size, CFG.size),
+        A.Normalize(
+            mean=[0] * CFG.in_chans,
+            std=[1] * CFG.in_chans
+        ),
+        ToTensorV2(transpose_mask=True),
+    ]))
+
+    test_loader = DataLoader(test_dataset,
+                             batch_size=args.batch_size,
+                             shuffle=False,
+                             num_workers=args.workers,
+                             pin_memory=(args.gpus == 1),
+                             drop_last=False)
+
+    # Return shape and dummy mask (all ones)
+    shape = (y_dim, x_dim)
+    fragment_mask = np.ones(shape, dtype=np.uint8) * 255
+
+    return test_loader, np.stack(xyxys), shape, fragment_mask
 
 def get_img_splits(fragment_id,s,e,rotation=0):
     images = []
@@ -270,16 +340,51 @@ if __name__ == "__main__":
         w=torch.load(args.model_path,weights_only=False)
         model.load_state_dict(w['state_dict'])
     
-    if args.model_compile:
-        model=torch.compile(model)
+    model=torch.compile(model)
     if args.gpus > 1:
         model = DataParallel(model)  # Wrap model with DataParallel for multi-GPU
     model.to(device)
     model.eval()
-    wandb.init(
-        project="Vesuvius", 
-        name=f"ALL_scrolls_tta", 
+    if args.wandb:
+        wandb.init(
+            project="Vesuvius",
+            name=f"ALL_scrolls_tta",
+            )
+
+    # Check if we're processing zarr or regular segments
+    if args.zarr_surface:
+        # Process zarr surface
+        print(f"Processing zarr surface: {args.zarr_surface}")
+
+        # Get zarr splits
+        test_loader, test_xyxz, test_shape, fragment_mask = get_zarr_splits(
+            args.zarr_surface,
+            start_idx=args.start_idx,
+            end_idx=args.start_idx + CFG.in_chans
         )
+
+        # Run prediction
+        mask_pred = predict_fn(test_loader, model, device, test_xyxz, test_shape)
+        mask_pred = np.clip(np.nan_to_num(mask_pred), a_min=0, a_max=1)
+        mask_pred /= mask_pred.max()
+
+        # Save output
+        if len(args.out_path) > 0:
+            output_name = args.zarr_name if args.zarr_name else "zarr_surface"
+            image_cv = (mask_pred * 255).astype(np.uint8)
+            try:
+                os.makedirs(args.out_path, exist_ok=True)
+            except:
+                pass
+            output_file = os.path.join(args.out_path, f"{output_name}_prediction.png")
+            cv2.imwrite(output_file, image_cv)
+            print(f"Saved prediction to {output_file}")
+
+        # Log to wandb
+        if args.wandb:
+            img = wandb.Image(mask_pred, caption=f"zarr_surface_{args.zarr_name}")
+            wandb.log({'predictions': img})
+        sys.exit(0)
 
     # Set up segments
     if len(args.segment_id) == 0:
@@ -316,11 +421,12 @@ if __name__ == "__main__":
                             cv2.imwrite(os.path.join(args.out_path, f"{fragment_id}_prediction_rotated_{r}_layer_{i}.png"), image_cv)
                         del mask_pred
                 if len(preds) > 0:
-                    img=wandb.Image(
-                    preds[0], 
-                    caption=f"{fragment_id}"
-                    )
-                    wandb.log({'predictions':img})
+                    if args.wandb:
+                        img=wandb.Image(
+                        preds[0],
+                        caption=f"{fragment_id}"
+                        )
+                        wandb.log({'predictions':img})
                     gc.collect()
             except Exception as e:
                 print(f"Failed to process {fragment_id}: {e}")
@@ -333,7 +439,8 @@ if __name__ == "__main__":
             pass
         torch.cuda.empty_cache()
         gc.collect()
-        wandb.finish()
+        if args.wandb:
+            wandb.finish()
 
         # Explicitly shut down the DataParallel model
         if isinstance(model, DataParallel):

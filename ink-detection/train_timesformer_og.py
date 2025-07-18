@@ -3,8 +3,8 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
+import argparse
+import zarr
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
@@ -36,6 +36,9 @@ import torch
 from warmup_scheduler import GradualWarmupScheduler
 import PIL.Image
 PIL.Image.MAX_IMAGE_PIXELS = 933120000
+
+ALL_FRAGMENTS = ['20231210121321','20231022170901','20231106155351','20231005123336','20230820203112','20230826170124','20230702185753','20230522215721','20230531193658','20230903193206','20230902141231','20231007101615','20230929220926','recto','20231016151000','20231012184423','20231031143850']
+
 class CFG:
     # ============== comp exp name =============
     comp_name = 'vesuvius'
@@ -48,7 +51,7 @@ class CFG:
     # ============== training cfg =============
     size = 64
     tile_size = 256
-    stride = tile_size // 8
+    stride = tile_size // 4
     train_batch_size = 196 # 32
     valid_batch_size = train_batch_size
 
@@ -56,9 +59,11 @@ class CFG:
     epochs = 30 # 30
     warmup_factor = 10
     lr = 3e-5
+    use_wandb = False
     # ============== fold =============
     valid_id = None
     # ============== fixed =============
+
 
     min_lr = 1e-6
     weight_decay = 1e-6
@@ -104,6 +109,50 @@ class CFG:
         ToTensorV2(transpose_mask=True),
     ]
     rotate = A.Compose([A.Rotate(5,p=1)])
+
+
+def get_zarr_dataset(zarr_finetune_surface, zarr_finetune_labels):
+    import zarr
+    import cv2
+
+    # Load surface zarr and labels PNG
+    surface = zarr.open(zarr_finetune_surface, mode='r')
+    labels = cv2.imread(zarr_finetune_labels, 0).astype(np.float32) / 255.0
+
+    # Extract layers 17-43 from surface
+    surface_data = surface[17:43, :, :]
+
+    z_dim, y_dim, x_dim = surface_data.shape
+
+    train_images = []
+    train_masks = []
+
+    # Create sliding windows
+    for y_start in range(0, y_dim - CFG.tile_size + 1, CFG.stride):
+        for x_start in range(0, x_dim - CFG.tile_size + 1, CFG.stride):
+            tile_surface = surface_data[:, y_start:y_start + CFG.tile_size, x_start:x_start + CFG.tile_size]
+            tile_labels = labels[y_start:y_start + CFG.tile_size, x_start:x_start + CFG.tile_size]
+
+            if np.all(tile_labels < 0.05):
+                continue
+
+            tile_surface = np.transpose(tile_surface, (1, 2, 0))
+
+            for yi in range(0, CFG.tile_size, CFG.size):
+                for xi in range(0, CFG.tile_size, CFG.size):
+                    if yi + CFG.size > CFG.tile_size or xi + CFG.size > CFG.tile_size:
+                        continue
+
+                    patch_surface = np.ascontiguousarray(tile_surface[yi:yi + CFG.size, xi:xi + CFG.size, :])
+                    patch_label = np.ascontiguousarray(tile_labels[yi:yi + CFG.size, xi:xi + CFG.size, None])
+
+                    train_images.append(patch_surface)
+                    train_masks.append(patch_label)
+
+    print(f"Generated {len(train_images)} training patches from zarr")
+    return train_images, train_masks
+
+
 def set_seed(seed=None, cudnn_deterministic=True):
     if seed is None:
         seed = 42
@@ -121,9 +170,7 @@ def cfg_init(cfg, mode='train'):
     set_seed(cfg.seed)
     if mode == 'train':
         make_dirs(cfg)
-cfg_init(CFG)
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def read_image_mask(fragment_id,start_idx=17,end_idx=43, CFG=CFG):
     fragment_id_ = fragment_id.split("_")[0]
@@ -144,7 +191,7 @@ def read_image_mask(fragment_id,start_idx=17,end_idx=43, CFG=CFG):
     if any(id_ in fragment_id_ for id_ in ['20230701020044','verso','20230901184804','20230901234823','20230531193658','20231007101615','20231005123333','20231011144857','20230522215721', '20230919113918', '20230625171244','20231022170900','20231012173610','20231016151000']):
         images=images[:,:,::-1]
     # Get the list of files that match the pattern
-    inklabel_files = glob.glob(f"train_scrolls/{fragment_id}/*inklabels.*")
+    inklabel_files = glob.glob(f"{CFG.comp_dataset_path}/train_scrolls/{fragment_id}/*inklabels.*")
     if len(inklabel_files) > 0:
         mask = cv2.imread( inklabel_files[0], 0)
     else:
@@ -163,7 +210,7 @@ def worker_function(fragment_id, CFG):
     valid_masks = []
     valid_xyxys = []
 
-    if not os.path.exists(f"train_scrolls/{fragment_id}"):
+    if not os.path.exists(f"{CFG.comp_dataset_path}/train_scrolls/{fragment_id}"):
         fragment_id = fragment_id + "_superseded"
     print('reading ',fragment_id)
     try:
@@ -201,7 +248,7 @@ def worker_function(fragment_id, CFG):
 
     return train_images, train_masks, valid_images, valid_masks, valid_xyxys
 
-def get_train_valid_dataset(fragment_ids=['20231210121321','20231022170901','20231106155351','20231005123336','20230820203112','20230826170124','20230702185753','20230522215721','20230531193658','20230903193206','20230902141231','20231007101615','20230929220926','recto','20231016151000','20231012184423','20231031143850']):
+def get_train_valid_dataset(fragment_ids):
     threads = []
     results = [None] * len(fragment_ids)
 
@@ -366,7 +413,8 @@ class RegressionPLModel(pl.LightningModule):
     
     def on_validation_epoch_end(self):
         self.mask_pred = np.divide(self.mask_pred, self.mask_count, out=np.zeros_like(self.mask_pred), where=self.mask_count!=0)
-        wandb_logger.log_image(key="masks", images=[np.clip(self.mask_pred,0,1)], caption=["probs"])
+        if CFG.use_wandb:
+            wandb_logger.log_image(key="masks", images=[np.clip(self.mask_pred,0,1)], caption=["probs"])
 
         #reset mask
         self.mask_pred = np.zeros(self.hparams.pred_shape)
@@ -413,8 +461,27 @@ def get_scheduler(cfg, optimizer):
 def scheduler_step(scheduler, avg_val_loss, epoch):
     scheduler.step(epoch)
 
+cfg_init(CFG)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 torch.set_float32_matmul_precision('medium')
 #add all of the validation segments into the array to run multiple validation folds
+
+parser = argparse.ArgumentParser(description='Training script for Vesuvius scrolls')
+parser.add_argument('--zarr_finetune_surface', type=str, default=None,
+                    help='Path to zarr surface volume for finetuning (optional)')
+parser.add_argument('--zarr_finetune_labels', type=str, default=None,
+                    help='Path to zarr labels for finetuning (optional)')
+parser.add_argument('--dataset_path', type=str, default=None,
+                    help='Path to the directory that contains the train_scrolls')
+parser.add_argument('--finetune_checkpoint', type=str, default=None,
+                    help='Path to the checkpoint to finetune')
+args = parser.parse_args()
+
+if args.dataset_path:
+    CFG.comp_dataset_path = args.dataset_path
+
 fragments=['20231210121321']
 for fid in fragments:
     CFG.valid_id=fid
@@ -424,7 +491,20 @@ for fid in fragments:
     valid_mask_gt = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id}_inklabels.png", 0)
 
     pred_shape=valid_mask_gt.shape
-    train_images, train_masks, valid_images, valid_masks, valid_xyxys = get_train_valid_dataset()
+
+    if args.zarr_finetune_surface and args.zarr_finetune_labels:
+        # if we are finetuning, then we only need to get the valid fragments images, masks, and xyxys
+        train_valid_fragments = [fid]
+    else:
+        train_valid_fragments = ALL_FRAGMENTS
+
+    train_images, train_masks, valid_images, valid_masks, valid_xyxys = get_train_valid_dataset(train_valid_fragments)
+
+    if args.zarr_finetune_surface and args.zarr_finetune_labels:
+        print("finetuning on zarr volumes")
+        train_images, train_masks = get_zarr_dataset(args.zarr_finetune_surface, args.zarr_finetune_labels)
+        print("done loading from zarr")
+
     valid_xyxys = np.stack(valid_xyxys)
     train_dataset = CustomDataset(
         train_images, CFG, labels=train_masks, transform=get_transforms(data='train', cfg=CFG))
@@ -441,9 +521,13 @@ for fid in fragments:
                                 shuffle=False,
                                 num_workers=CFG.num_workers, pin_memory=True, drop_last=True)
 
-    wandb_logger = WandbLogger(project="vesivus",name=run_slug+f'timesformer_big6_finetune')
+
     model=RegressionPLModel(pred_shape=pred_shape,size=CFG.size)
-    wandb_logger.watch(model, log="all", log_freq=100)
+    if CFG.use_wandb:
+        wandb_logger = WandbLogger(project="vesivus", name=run_slug + f'timesformer_big6_finetune')
+        wandb_logger.watch(model, log="all", log_freq=100)
+    else:
+        wandb_logger = None
     trainer = pl.Trainer(
         max_epochs=20,
         accelerator="gpu",
@@ -454,12 +538,13 @@ for fid in fragments:
         precision='16-mixed',
         gradient_clip_val=1.0,
         gradient_clip_algorithm="norm",
-        strategy='ddp_find_unused_parameters_true',
+        strategy='auto',
         callbacks=[ModelCheckpoint(filename=f'timesformer_wild16_{fid}_fr'+'{epoch}',dirpath=CFG.model_dir,monitor='train/total_loss',mode='min',save_top_k=CFG.epochs),
 
                     ],
 
     )
-    trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
 
-    wandb.finish()
+    trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=valid_loader, ckpt_path=args.finetune_checkpoint)
+    if CFG.use_wandb:
+        wandb.finish()
