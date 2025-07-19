@@ -1,7 +1,7 @@
 from typing import Union, List, Tuple
 import torch
 
-from models.augmentation.transforms.base.basic_transform import SegOnlyTransform
+from vesuvius.models.augmentation.transforms.base.basic_transform import SegOnlyTransform
 
 
 class ConvertSegmentationToRegionsTransform(SegOnlyTransform):

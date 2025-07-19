@@ -2,7 +2,7 @@ from typing import Union, Tuple, List
 
 import torch
 
-from models.augmentation.transforms.base.basic_transform import SegOnlyTransform
+from vesuvius.models.augmentation.transforms.base.basic_transform import SegOnlyTransform
 
 
 class RemoveLabelTansform(SegOnlyTransform):

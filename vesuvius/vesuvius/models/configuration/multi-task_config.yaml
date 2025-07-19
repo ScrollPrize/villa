@@ -2,7 +2,7 @@ tr_setup:
   model_name: MultiTask_Fiber_Segmentation
 
 tr_config:
-  patch_size: [192, 192, 192]
+  patch_size: [128, 128, 128]
   max_steps_per_epoch: 5000
   batch_size: 2
 

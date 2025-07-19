@@ -2,8 +2,8 @@ from typing import Callable, Union
 
 import torch
 
-from models.augmentation.helpers.scalar_type import RandomScalar, sample_scalar
-from models.augmentation.transforms.base.basic_transform import ImageOnlyTransform
+from vesuvius.models.augmentation.helpers.scalar_type import RandomScalar, sample_scalar
+from vesuvius.models.augmentation.transforms.base.basic_transform import ImageOnlyTransform
 
 
 class GammaTransform(ImageOnlyTransform):

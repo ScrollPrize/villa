@@ -5,8 +5,8 @@ import numpy as np
 import torch
 from fft_conv_pytorch import fft_conv
 
-from models.augmentation.helpers.scalar_type import RandomScalar, sample_scalar
-from models.augmentation.transforms.base.basic_transform import ImageOnlyTransform
+from vesuvius.models.augmentation.helpers.scalar_type import RandomScalar, sample_scalar
+from vesuvius.models.augmentation.transforms.base.basic_transform import ImageOnlyTransform
 from skimage.morphology import ball, disk
 from skimage.morphology.binary import binary_erosion, binary_dilation, binary_closing, binary_opening
 

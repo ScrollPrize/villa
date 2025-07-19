@@ -1154,8 +1154,8 @@ def main():
                        help="Training/validation split ratio (0.0-1.0, default: 0.95)")
     parser.add_argument("--loss-on-label-only", action="store_true",
                        help="Compute loss only on labeled regions (use masks for loss calculation)")
-    parser.add_argument("--config-path", type=str,
-                       help="Path to configuration YAML file (if not provided, uses defaults)")
+    parser.add_argument("--config", "--config-path", dest="config_path", type=str, required=True,
+                       help="Path to configuration YAML file (required)")
     parser.add_argument("--verbose", action="store_true",
                        help="Enable verbose output for debugging")
     parser.add_argument("--max-steps-per-epoch", type=int, default=200,
@@ -1201,21 +1201,19 @@ def main():
     args = parser.parse_args()
 
     # Load configuration first to check if we have data_paths
-    from models.configuration.config_manager import ConfigManager
+    from vesuvius.models.configuration.config_manager import ConfigManager
     mgr = ConfigManager(verbose=args.verbose)
 
-    if args.config_path:
-        if not Path(args.config_path).exists():
-            raise ValueError(f"Config file does not exist: {args.config_path}")
-        mgr.load_config(args.config_path)
-        print(f"Loaded configuration from: {args.config_path}")
-    else:
-        mgr.tr_info = {}
-        mgr.tr_configs = {}
-        mgr.model_config = {}
-        mgr.dataset_config = {}
-        mgr._init_attributes()
-        print("Initialized with default configuration")
+    if not Path(args.config_path).exists():
+        print(f"\nError: Config file does not exist: {args.config_path}")
+        print("\nPlease provide a valid configuration file.")
+        print("\nExample usage:")
+        print("  vesuvius.train --config path/to/config.yaml --input path/to/data --output path/to/output")
+        print("\nFor more options, use: vesuvius.train --help")
+        sys.exit(1)
+    
+    mgr.load_config(args.config_path)
+    print(f"Loaded configuration from: {args.config_path}")
 
     # Check if input is required
     if args.input is None:

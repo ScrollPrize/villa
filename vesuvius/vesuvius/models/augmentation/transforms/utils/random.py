@@ -1,6 +1,6 @@
 import torch
 
-from models.augmentation.transforms.base.basic_transform import BasicTransform
+from vesuvius.models.augmentation.transforms.base.basic_transform import BasicTransform
 
 
 class RandomTransform(BasicTransform):

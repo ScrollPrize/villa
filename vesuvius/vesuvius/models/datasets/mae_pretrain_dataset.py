@@ -10,8 +10,8 @@ from functools import partial
 import zarr
 
 from .zarr_dataset import ZarrDataset
-from utils.io.patch_cache_utils import load_cached_patches, save_computed_patches
-from utils.io.zarr_io import _is_ome_zarr
+from vesuvius.utils.io.patch_cache_utils import load_cached_patches, save_computed_patches
+from vesuvius.utils.io.zarr_io import _is_ome_zarr
 
 
 def _validate_patch_batch(args):

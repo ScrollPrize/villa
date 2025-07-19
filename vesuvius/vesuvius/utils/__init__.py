@@ -2,7 +2,7 @@
 import os
 import yaml
 import requests
-from setup.accept_terms import get_installation_path
+from vesuvius.setup.accept_terms import get_installation_path
 
 def list_files():
     """

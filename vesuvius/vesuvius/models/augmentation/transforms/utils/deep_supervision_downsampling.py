@@ -1,7 +1,7 @@
 from typing import Tuple, List, Union
 import torch
 
-from models.augmentation.transforms.base.basic_transform import SegOnlyTransform
+from vesuvius.models.augmentation.transforms.base.basic_transform import SegOnlyTransform
 from torch.nn.functional import interpolate
 
 

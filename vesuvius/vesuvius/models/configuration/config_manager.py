@@ -7,7 +7,7 @@ import yaml
 from pathlib import Path
 import torch
 import torch.nn as nn
-from utils.utils import determine_dimensionality
+from vesuvius.utils.utils import determine_dimensionality
 
 
 Image.MAX_IMAGE_PIXELS = None

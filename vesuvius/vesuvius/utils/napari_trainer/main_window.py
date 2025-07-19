@@ -4,7 +4,7 @@ import napari.viewer
 import scipy.ndimage
 
 from .inference_widget import inference_widget
-from models.configuration.config_manager import ConfigManager
+from vesuvius.models.configuration.config_manager import ConfigManager
 from PIL import Image
 import numpy as np
 from pathlib import Path

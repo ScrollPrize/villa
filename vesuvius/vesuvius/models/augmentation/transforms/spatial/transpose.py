@@ -2,7 +2,7 @@ from typing import Set
 import numpy as np
 import torch
 
-from models.augmentation.transforms.base.basic_transform import BasicTransform
+from vesuvius.models.augmentation.transforms.base.basic_transform import BasicTransform
 
 
 class TransposeAxesTransform(BasicTransform):
