@@ -1,8 +1,12 @@
-  model_config:
-    model_name: "vesuvius_mean_teacher"
-    in_channels: 1
-    train_patch_size: [128, 128, 128]
+model_config:
+  model_name: "vesuvius_mean_teacher"
+  in_channels: 1
+  train_patch_size: [128, 128, 128]
 
+tr_config:
+  patch_size: [128, 128, 128]
+
+dataset_config:
   targets:
     hz:
       activation: "none"

@@ -272,7 +272,7 @@ class MeanTeacherTrainer(BaseTrainer):
         from pathlib import Path
         from datetime import datetime
         
-        output_dir = Path(self.mgr.ckpt_dir)
+        output_dir = Path(self.mgr.ckpt_out_base)
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         
         if hasattr(self.mgr, 'experiment_name') and self.mgr.experiment_name:
@@ -285,12 +285,23 @@ class MeanTeacherTrainer(BaseTrainer):
         
         # Save configuration
         from vesuvius.models.training.save_checkpoint import cleanup_old_configs
+        import yaml
         config_path = os.path.join(ckpt_dir, "config.yaml")
-        self.mgr.save_config(config_path)
-        cleanup_old_configs(ckpt_dir)
+        config_dict = self.mgr.convert_to_dict()
+        with open(config_path, 'w') as f:
+            yaml.safe_dump(config_dict, f, sort_keys=False)
+        cleanup_old_configs(ckpt_dir, self.mgr.model_name, keep_latest=1)
         
         print(f"\nCheckpoints will be saved to: {ckpt_dir}")
         print(f"Starting Mean Teacher training from epoch {start_epoch}")
+        
+        # Initialize checkpoint tracking
+        from collections import deque
+        val_loss_history = {}  # {epoch: validation_loss}
+        checkpoint_history = deque(maxlen=3)
+        best_checkpoints = []
+        debug_gif_history = deque(maxlen=3)
+        best_debug_gifs = []  # List of (val_loss, epoch, gif_path)
         
         # Training loop
         global_step = start_epoch * len(train_dataloader)
@@ -551,7 +562,7 @@ class MeanTeacherTrainer(BaseTrainer):
                                 
                             # Save debug image for first batch
                             if i == 0:
-                                from vesuvius.models.training.save_checkpoint import save_debug
+                                from vesuvius.utils.plotting import save_debug
                                 
                                 b_idx = 0
                                 found_non_zero = False
@@ -605,20 +616,41 @@ class MeanTeacherTrainer(BaseTrainer):
                 
                 # Manage checkpoints based on validation loss
                 if epoch > 0:
-                    manage_checkpoint_history(
-                        checkpoint_history,
-                        val_loss_history,
-                        keep_last_n=getattr(self.mgr, 'keep_last_n_checkpoints', 5),
-                        best_checkpoints=best_checkpoints
+                    from vesuvius.models.training.save_checkpoint import manage_checkpoint_history, manage_debug_gifs
+                    
+                    checkpoint_history, best_checkpoints = manage_checkpoint_history(
+                        checkpoint_history=checkpoint_history,
+                        best_checkpoints=best_checkpoints,
+                        epoch=epoch,
+                        checkpoint_path=ckpt_path,
+                        validation_loss=avg_val_loss,
+                        checkpoint_dir=ckpt_dir,
+                        model_name=self.mgr.model_name,
+                        max_recent=3,
+                        max_best=2
                     )
                     
-                    from vesuvius.models.training.save_checkpoint import manage_debug_gifs
-                    manage_debug_gifs(
-                        debug_gif_history,
-                        val_loss_history,
-                        keep_last_n=getattr(self.mgr, 'keep_last_n_checkpoints', 5),
-                        best_debug_gifs=best_debug_gifs
-                    )
+                    # Only manage debug gifs if we have any
+                    if debug_gif_history:
+                        # Get the most recent debug gif path if it exists for this epoch
+                        recent_gif_path = None
+                        for gif_epoch, gif_path in debug_gif_history:
+                            if gif_epoch == epoch:
+                                recent_gif_path = gif_path
+                                break
+                        
+                        if recent_gif_path:
+                            debug_gif_history, best_debug_gifs = manage_debug_gifs(
+                                debug_gif_history=debug_gif_history,
+                                best_debug_gifs=best_debug_gifs,
+                                epoch=epoch,
+                                gif_path=recent_gif_path,
+                                validation_loss=avg_val_loss,
+                                checkpoint_dir=ckpt_dir,
+                                model_name=self.mgr.model_name,
+                                max_recent=3,
+                                max_best=2
+                            )
                     
                 # Log validation to wandb
                 if self.mgr.wandb_project:

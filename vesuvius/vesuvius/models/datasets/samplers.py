@@ -18,8 +18,8 @@ class TwoStreamBatchSampler(Sampler):
         secondary_batch_size : int
             Number of unlabeled samples per batch
         """
-        self.primary_indices = primary_indices
-        self.secondary_indices = secondary_indices
+        self.primary_indices = list(primary_indices)
+        self.secondary_indices = list(secondary_indices)
         self.batch_size = batch_size
         self.secondary_batch_size = secondary_batch_size
         self.primary_batch_size = batch_size - secondary_batch_size
@@ -27,19 +27,35 @@ class TwoStreamBatchSampler(Sampler):
         assert self.primary_batch_size > 0, "Labeled batch size must be positive"
 
     def __iter__(self):
-        primary_iter = iterate_once(self.primary_indices)
-        secondary_iter = iterate_eternally(self.secondary_indices)
-
-        return (
-            self.primary_indices[
-            next(primary_iter) * self.primary_batch_size:(next(primary_iter) + 1) * self.primary_batch_size]
-            + self.secondary_indices[
-              next(secondary_iter) * self.secondary_batch_size:(next(secondary_iter) + 1) * self.secondary_batch_size]
-            for (primary_iter, secondary_iter) in zip(
-            grouper(iterate_once(self.primary_indices), self.primary_batch_size),
-            grouper(iterate_eternally(self.secondary_indices), self.secondary_batch_size)
-        )
-        )
+        # Shuffle primary indices
+        primary_indices_shuffled = np.random.permutation(self.primary_indices)
+        
+        # Create batches
+        for i in range(0, len(primary_indices_shuffled), self.primary_batch_size):
+            # Get primary batch
+            primary_batch = primary_indices_shuffled[i:i + self.primary_batch_size].tolist()
+            
+            # If we don't have enough primary samples, skip this batch
+            if len(primary_batch) < self.primary_batch_size:
+                break
+            
+            # Get secondary batch (sample with replacement if needed)
+            if len(self.secondary_indices) >= self.secondary_batch_size:
+                secondary_batch = np.random.choice(
+                    self.secondary_indices, 
+                    size=self.secondary_batch_size, 
+                    replace=False
+                ).tolist()
+            else:
+                # If we have fewer secondary indices than needed, sample with replacement
+                secondary_batch = np.random.choice(
+                    self.secondary_indices, 
+                    size=self.secondary_batch_size, 
+                    replace=True
+                ).tolist()
+            
+            # Yield combined batch
+            yield primary_batch + secondary_batch
 
     def __len__(self):
         return len(self.primary_indices) // self.primary_batch_size
@@ -47,7 +63,7 @@ class TwoStreamBatchSampler(Sampler):
 
 def iterate_once(iterable):
     """Helper function for single iteration"""
-    return np.random.permutation(iterable)
+    return iter(np.random.permutation(iterable))
 
 
 def iterate_eternally(indices):

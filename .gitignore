@@ -25,3 +25,4 @@ segmentation/napari_trainer/test_1638_debug.png
 *.log
 /segmentation/models/batchgeneratorsv2/wandb
 /segmentation/models/wandb
+/vesuvius/wandb

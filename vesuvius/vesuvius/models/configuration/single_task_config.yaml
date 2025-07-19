@@ -1,20 +1,21 @@
 tr_config:
-  patch_size: [128, 128, 128]
-  initial_lr: 0.001
+  patch_size: [1128, 128, 128]
+  initial_lr: 0.01
 
 dataset_config:
-  binarize_labels: false
   min_labeled_ratio: 0 
   min_bbox_percent: 0 
-  normalization_scheme: "minmax"
+  normalization_scheme: "zscore"
   skip_patch_validation: true
   targets:
-    img:
+    ink:
       activation: "none"
       out_channels: 1
       losses:
-        - name: "L1Loss"
+        - name: "BCEWithLogitsLoss"
           weight: 1.0
+        - name: "SoftDiceLoss"
+          weight: 1.0
+          kwargs:
+            smooth: 1e-5
 
-model_config:
-  features_per_stage: [64,128,256,320,512,512]
