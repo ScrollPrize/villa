@@ -75,12 +75,12 @@ class ConfigManager:
         self.in_channels = 1
         self.train_batch_size = int(self.tr_configs.get("batch_size", 2))
         self.gradient_accumulation = int(self.tr_configs.get("gradient_accumulation", 1))
-        self.max_steps_per_epoch = int(self.tr_configs.get("max_steps_per_epoch", 200))
+        self.max_steps_per_epoch = int(self.tr_configs.get("max_steps_per_epoch", 250))
         self.max_val_steps_per_epoch = int(self.tr_configs.get("max_val_steps_per_epoch", 25))
         self.train_num_dataloader_workers = int(self.tr_configs.get("num_dataloader_workers", 4))
         self.max_epoch = int(self.tr_configs.get("max_epoch", 1000))
         self.optimizer = self.tr_configs.get("optimizer", "SGD")
-        self.initial_lr = float(self.tr_configs.get("initial_lr", 0.0001))
+        self.initial_lr = float(self.tr_configs.get("initial_lr", 0.01))
         self.weight_decay = float(self.tr_configs.get("weight_decay", 0.0001))
         
         ### Dataset config ###
