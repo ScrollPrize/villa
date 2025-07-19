@@ -4,11 +4,17 @@
     train_patch_size: [128, 128, 128]
 
   targets:
-    sheet:
+    hz:
       activation: "none"
-      weight: 1.0
+      weight: 1
       losses:
-        - name: "BCEWithLogitsLoss"
+        - name: "CEDiceLoss"
           weight: 1.0
-        - name: "SoftDiceLoss"
+          kwargs: {}
+    vt:
+      activation: "none"
+      weight: 1
+      losses:
+        - name: "CEDiceLoss"
           weight: 1.0
+          kwargs: {}
