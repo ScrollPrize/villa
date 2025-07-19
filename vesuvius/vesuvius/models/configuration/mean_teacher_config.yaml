@@ -5,7 +5,7 @@
 
   targets:
     sheet:
-      activation: "sigmoid"
+      activation: "none"
       weight: 1.0
       losses:
         - name: "BCEWithLogitsLoss"
