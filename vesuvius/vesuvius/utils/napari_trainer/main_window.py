@@ -119,7 +119,11 @@ def run_training(patch_size_z: int = 128, patch_size_x: int = 128, patch_size_y:
         if hasattr(_config_manager, 'targets') and _config_manager.targets:
             print(f"\nApplying {loss_function} to all detected targets...")
             for target_name in _config_manager.targets:
-                _config_manager.targets[target_name]['loss_fn'] = loss_function
+                _config_manager.targets[target_name]['losses'] = [{
+                    "name": loss_function,
+                    "weight": 1.0,
+                    "kwargs": {}
+                }]
                 print(f"  - Set loss function for target '{target_name}' to {loss_function}")
         
         print("\nStarting training...")

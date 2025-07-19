@@ -17,7 +17,10 @@ dataset_config:
       out_channels: 2
       activation: "sigmoid"
       weight: 1
-      loss_fn: "BCEWithLogitsLoss"
+      losses:
+        - name: "BCEWithLogitsLoss"
+          weight: 1.0
+          kwargs: {}
 
 # Example with multi-class and threshold
 # dataset_config:

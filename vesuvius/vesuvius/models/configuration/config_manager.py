@@ -174,7 +174,7 @@ class ConfigManager:
         ----------
         targets_dict : dict
             Dictionary with target names as keys and target configuration as values
-            Example: {"ink": {"out_channels": 1, "loss_fn": "BCEWithLogitsLoss", "activation": "sigmoid"}}
+            Example: {"ink": {"out_channels": 1, "losses": [{"name": "BCEWithLogitsLoss", "weight": 1.0, "kwargs": {}}], "activation": "sigmoid"}}
         data_dict : dict
             Dictionary with target names as keys and list of volume data as values
             Example: {"ink": [{"data": {...}, "out_channels": 1, "name": "image1_ink"}]}
@@ -183,8 +183,12 @@ class ConfigManager:
 
         # Apply current loss function to all targets if not already set
         for target_name in self.targets:
-            if "loss_fn" not in self.targets[target_name]:
-                self.targets[target_name]["loss_fn"] = self.selected_loss_function
+            if "losses" not in self.targets[target_name]:
+                self.targets[target_name]["losses"] = [{
+                    "name": self.selected_loss_function,
+                    "weight": 1.0,
+                    "kwargs": {}
+                }]
 
         # Apply auxiliary tasks to targets
         self._apply_auxiliary_tasks()
@@ -299,7 +303,11 @@ class ConfigManager:
             self.selected_loss_function = loss_function
             if hasattr(self, 'targets') and self.targets:
                 for target_name in self.targets:
-                    self.targets[target_name]["loss_fn"] = self.selected_loss_function
+                    self.targets[target_name]["losses"] = [{
+                        "name": self.selected_loss_function,
+                        "weight": 1.0,
+                        "kwargs": {}
+                    }]
                 if self.verbose:
                     print(f"Applied loss function '{self.selected_loss_function}' to all targets")
             elif self.verbose:

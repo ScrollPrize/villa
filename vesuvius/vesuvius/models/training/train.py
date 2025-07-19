@@ -152,32 +152,6 @@ class BaseTrainer:
                         print(f"  - {loss_name} (weight: {loss_weight})")
                     except RuntimeError as e:
                         raise ValueError(f"Failed to create loss function '{loss_name}' for target '{task_name}': {str(e)}")
-            else:
-                # Use old single-loss format
-                loss_fn_name = task_info.get("loss_fn", "BCEDiceLoss")
-                print(f"Target {task_name} using loss function: {loss_fn_name}")
-                
-                loss_config = task_info.get("loss_kwargs", {})
-                weight = loss_config.get("weight", None)
-                ignore_index = loss_config.get("ignore_index", -100)
-                pos_weight = loss_config.get("pos_weight", None)
-                
-                # If compute_loss_on_labeled_only is set and no ignore_index is specified, use -100
-                if hasattr(self.mgr, 'compute_loss_on_labeled_only') and self.mgr.compute_loss_on_labeled_only and ignore_index is None:
-                    ignore_index = -100
-                    print(f"Setting ignore_index=-100 for target '{task_name}' due to compute_loss_on_labeled_only=True")
-                
-                try:
-                    loss_fn = _create_loss(
-                        name=loss_fn_name,
-                        loss_config=loss_config,
-                        weight=weight,
-                        ignore_index=ignore_index,
-                        pos_weight=pos_weight
-                    )
-                    task_losses.append((loss_fn, 1.0))  # Default weight of 1.0 for single loss
-                except RuntimeError as e:
-                    raise ValueError(f"Failed to create loss function '{loss_fn_name}' for target '{task_name}': {str(e)}")
             
             loss_fns[task_name] = task_losses
 

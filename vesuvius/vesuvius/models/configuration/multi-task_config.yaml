@@ -18,11 +18,17 @@ dataset_config:
     hz:
       activation: "none"
       weight: 1
-      loss_fn: "CEDiceLoss"
+      losses:
+        - name: "CEDiceLoss"
+          weight: 1.0
+          kwargs: {}
     vt:
       activation: "none"
       weight: 1
-      loss_fn: "CEDiceLoss"
+      losses:
+        - name: "CEDiceLoss"
+          weight: 1.0
+          kwargs: {}
   
   # Optional: Volume-task loss configuration
   # Specify which tasks should compute loss for which volumes

@@ -75,14 +75,24 @@ targets = {
     "ink": {
         "out_channels": 1,
         "activation": "sigmoid",
-        "loss_fn": "SoftDiceLoss",
-        "weight": 1.0
+        "losses": [
+            {
+                "name": "SoftDiceLoss",
+                "weight": 1.0,
+                "kwargs": {}
+            }
+        ]
     },
     "damage": {
         "out_channels": 1,
-        "activation": "sigmoid", 
-        "loss_fn": "BCEWithLogitsLoss",
-        "weight": 0.5
+        "activation": "sigmoid",
+        "losses": [
+            {
+                "name": "BCEWithLogitsLoss",
+                "weight": 1.0,
+                "kwargs": {}
+            }
+        ]
     }
 }
 ```
