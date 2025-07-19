@@ -829,7 +829,10 @@ def update_config_from_args(mgr, args):
         mgr.compute_loss_on_labeled_only = True
         mgr.tr_info["compute_loss_on_labeled_only"] = True
 
-    # Handle max steps per epoch if provided
+    if args.max_epoch is not None:
+        mgr.max_epoch = args.max_epoch
+        mgr.tr_configs["max_epoch"] = args.max_epoch
+
     if args.max_steps_per_epoch is not None:
         mgr.max_steps_per_epoch = args.max_steps_per_epoch
         mgr.tr_configs["max_steps_per_epoch"] = args.max_steps_per_epoch
@@ -960,6 +963,8 @@ def main():
                         help="Path to configuration YAML file (required)")
     parser.add_argument("--verbose", action="store_true",
                         help="Enable verbose output for debugging")
+    parser.add_argument("--max-epoch", type=int, default=1000,
+                        help="Maximum number of epochs (default: 1000)")
     parser.add_argument("--max-steps-per-epoch", type=int, default=200,
                         help="Maximum training steps per epoch (if not set, uses all data)")
     parser.add_argument("--max-val-steps-per-epoch", type=int, default=30,
