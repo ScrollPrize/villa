@@ -1,0 +1,14 @@
+  model_config:
+    model_name: "vesuvius_mean_teacher"
+    in_channels: 1
+    train_patch_size: [128, 128, 128]
+
+  targets:
+    sheet:
+      activation: "sigmoid"
+      weight: 1.0
+      losses:
+        - name: "BCEWithLogitsLoss"
+          weight: 1.0
+        - name: "SoftDiceLoss"
+          weight: 1.0

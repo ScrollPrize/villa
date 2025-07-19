@@ -982,7 +982,7 @@ def main():
 
     # Trainer selection
     parser.add_argument("--trainer", type=str, default="base",
-                        help="Trainer class to use (default: base). Options: base, self_supervised")
+                        help="Trainer class to use (default: base). Options: base, self_supervised, mean_teacher")
 
     # Self-supervised specific arguments (only used when --trainer self_supervised)
     parser.add_argument("--mask-ratio", type=float, default=0.75,
@@ -1054,11 +1054,15 @@ def main():
         from vesuvius.models.training.self_supervised_trainer import SelfSupervisedTrainer
         trainer = SelfSupervisedTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Self-Supervised Trainer for self-supervised pretraining")
+    elif trainer_name == "mean_teacher":
+        from vesuvius.models.training.train_mean_teacher import MeanTeacherTrainer
+        trainer = MeanTeacherTrainer(mgr=mgr, verbose=args.verbose)
+        print("Using Mean Teacher Trainer for semi-supervised training")
     elif trainer_name == "base":
         trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Base Trainer for supervised training")
     else:
-        raise ValueError(f"Unknown trainer: {trainer_name}. Available options: base, self_supervised")
+        raise ValueError(f"Unknown trainer: {trainer_name}. Available options: base, self_supervised, mean_teacher")
 
     print("Starting training...")
     trainer.train()
