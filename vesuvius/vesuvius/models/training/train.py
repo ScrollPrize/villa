@@ -187,7 +187,7 @@ class BaseTrainer:
         # for cuda, we can use a grad scaler for mixed precision training if amp is enabled
         # for mps or cpu, or when amp is disabled, we create a dummy scaler that does nothing
         if device_type == 'cuda' and use_amp:
-            return torch.cuda.amp.GradScaler()
+            return torch.amp.GradScaler('cuda')
         else:
             class DummyScaler:
                 def scale(self, loss):
@@ -379,7 +379,7 @@ class BaseTrainer:
 
                 # Only use autocast if AMP is enabled
                 if use_amp and self.device.type in ['cuda', 'cpu']:
-                    autocast_ctx = torch.amp.autocast()
+                    autocast_ctx = torch.amp.autocast(device_type=self.device.type)
                 else:
                     autocast_ctx = nullcontext()
 
