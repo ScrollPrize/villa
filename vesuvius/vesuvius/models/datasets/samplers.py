@@ -1,6 +1,6 @@
 import numpy as np
 from torch.utils.data import DataLoader, SubsetRandomSampler, Sampler
-
+import itertools
 
 class TwoStreamBatchSampler(Sampler):
     """Samples labeled and unlabeled data in fixed proportions"""
