@@ -1,10 +1,7 @@
-# IMPORTANT: Set multiprocessing start method before any other imports
-# This is critical for S3/fsspec compatibility
+
 import multiprocessing
 import sys
 
-# Check if we need to set spawn method (for S3 compatibility)
-# This must happen before torch import
 if __name__ == '__main__' and len(sys.argv) > 1:
     # Quick check for S3 paths in command line args
     if any('s3://' in str(arg) for arg in sys.argv) or '--config-path' in sys.argv:
@@ -20,17 +17,17 @@ from tqdm import tqdm
 import numpy as np
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from models.training.lr_schedulers import get_scheduler, PolyLRScheduler
+from vesuvius.models.training.lr_schedulers import get_scheduler, PolyLRScheduler
 from torch.optim import AdamW, SGD
 from torch.utils.data import DataLoader, SubsetRandomSampler
-from utils.utils import init_weights_he
-from models.datasets import NapariDataset, ImageDataset, ZarrDataset, MAEPretrainDataset
-from utils.plotting import save_debug
-from models.build.build_network_from_config import NetworkFromConfig
+from vesuvius.utils.utils import init_weights_he
+from vesuvius.models.datasets import NapariDataset, ImageDataset, ZarrDataset, MAEPretrainDataset
+from vesuvius.utils.plotting import save_debug
+from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 
-from models.training.loss.losses import _create_loss
-from models.training.optimizers import create_optimizer
-from models.training.save_checkpoint import (
+from vesuvius.models.training.loss.losses import _create_loss
+from vesuvius.models.training.optimizers import create_optimizer
+from vesuvius.models.training.save_checkpoint import (
     save_checkpoint, 
     manage_checkpoint_history,
     manage_debug_gifs,
@@ -43,11 +40,11 @@ from contextlib import nullcontext
 from collections import deque   
 import gc
 
-from models.utilities.load_checkpoint import load_checkpoint
-from utilities.get_accelerator import get_accelerator
-from utilities.compute_gradient_norm import compute_gradient_norm
-from utilities.s3_utils import detect_s3_paths, setup_multiprocessing_for_s3
-from models.training.auxiliary_tasks import (
+from vesuvius.models.utilities.load_checkpoint import load_checkpoint
+from vesuvius.models.utilities.get_accelerator import get_accelerator
+from vesuvius.models.utilities.compute_gradient_norm import compute_gradient_norm
+from vesuvius.models.utilities.s3_utils import detect_s3_paths, setup_multiprocessing_for_s3
+from vesuvius.models.training.auxiliary_tasks import (
     compute_auxiliary_loss,
     preserve_auxiliary_targets,
     restore_auxiliary_targets,
