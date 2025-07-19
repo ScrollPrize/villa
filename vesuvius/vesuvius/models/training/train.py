@@ -1,4 +1,3 @@
-
 import multiprocessing
 import sys
 
@@ -28,7 +27,7 @@ from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.training.loss.losses import _create_loss
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.save_checkpoint import (
-    save_checkpoint, 
+    save_checkpoint,
     manage_checkpoint_history,
     manage_debug_gifs,
     cleanup_old_configs,
@@ -37,7 +36,7 @@ from vesuvius.models.training.save_checkpoint import (
 
 from itertools import cycle
 from contextlib import nullcontext
-from collections import deque   
+from collections import deque
 import gc
 
 from vesuvius.models.utilities.load_checkpoint import load_checkpoint
@@ -50,6 +49,7 @@ from vesuvius.models.training.auxiliary_tasks import (
     restore_auxiliary_targets,
     apply_auxiliary_tasks_from_config
 )
+
 
 class BaseTrainer:
     def __init__(self,
@@ -70,7 +70,7 @@ class BaseTrainer:
         else:
             from vesuvius.models.configuration.config_manager import ConfigManager
             self.mgr = ConfigManager(verbose)
-            
+
         self.device = get_accelerator()
 
     # --- build model --- #
@@ -88,10 +88,8 @@ class BaseTrainer:
         model = NetworkFromConfig(self.mgr)
         return model
 
-
     # --- configure dataset --- #
     def _configure_dataset(self, is_training=True):
-        # Standard supervised datasets
         data_format = getattr(self.mgr, 'data_format', 'zarr').lower()
 
         if data_format == 'napari':
@@ -102,10 +100,10 @@ class BaseTrainer:
             dataset = ZarrDataset(mgr=self.mgr, is_training=is_training)
         else:
             raise ValueError(f"Unsupported data format: {data_format}. "
-                           f"Supported formats are: 'napari', 'image', 'zarr'")
+                             f"Supported formats are: 'napari', 'image', 'zarr'")
 
         print(f"Using {data_format} dataset format ({'training' if is_training else 'validation'})")
-        
+
         return dataset
 
     # --- losses ---- #
@@ -113,25 +111,23 @@ class BaseTrainer:
         loss_fns = {}
         for task_name, task_info in self.mgr.targets.items():
             task_losses = []
-            
-            # Check if target uses new multi-loss format
+
             if "losses" in task_info:
                 print(f"Target {task_name} using multiple losses:")
                 for loss_cfg in task_info["losses"]:
                     loss_name = loss_cfg["name"]
                     loss_weight = loss_cfg.get("weight", 1.0)
                     loss_kwargs = loss_cfg.get("kwargs", {})
-                    
-                    # Extract parameters from kwargs
+
                     weight = loss_kwargs.get("weight", None)
                     ignore_index = loss_kwargs.get("ignore_index", -100)
                     pos_weight = loss_kwargs.get("pos_weight", None)
-                    
-                    # If compute_loss_on_labeled_only is set and no ignore_index is specified, use -100
-                    if hasattr(self.mgr, 'compute_loss_on_labeled_only') and self.mgr.compute_loss_on_labeled_only and ignore_index is None:
+
+                    if hasattr(self.mgr,
+                               'compute_loss_on_labeled_only') and self.mgr.compute_loss_on_labeled_only and ignore_index is None:
                         ignore_index = -100
                         print(f"  Setting ignore_index=-100 for {loss_name} due to compute_loss_on_labeled_only=True")
-                    
+
                     try:
                         loss_fn = _create_loss(
                             name=loss_name,
@@ -143,8 +139,9 @@ class BaseTrainer:
                         task_losses.append((loss_fn, loss_weight))
                         print(f"  - {loss_name} (weight: {loss_weight})")
                     except RuntimeError as e:
-                        raise ValueError(f"Failed to create loss function '{loss_name}' for target '{task_name}': {str(e)}")
-            
+                        raise ValueError(
+                            f"Failed to create loss function '{loss_name}' for target '{task_name}': {str(e)}")
+
             loss_fns[task_name] = task_losses
 
         return loss_fns
@@ -175,11 +172,11 @@ class BaseTrainer:
         )
 
         print(f"Using {scheduler_type} learning rate scheduler")
-        
+
         # set some per iteration schedulers so we can easily step them once per iter vs once per epoch
         per_iter_schedulers = ['onecycle', 'cyclic', 'cosine_warmup']
         is_per_iteration = scheduler_type.lower() in per_iter_schedulers
-        
+
         return scheduler, is_per_iteration
 
     # --- scaler --- #
@@ -187,7 +184,7 @@ class BaseTrainer:
         # for cuda, we can use a grad scaler for mixed precision training if amp is enabled
         # for mps or cpu, or when amp is disabled, we create a dummy scaler that does nothing
         if device_type == 'cuda' and use_amp:
-            return torch.amp.GradScaler('cuda')
+            return torch.cuda.amp.GradScaler()
         else:
             class DummyScaler:
                 def scale(self, loss):
@@ -209,7 +206,7 @@ class BaseTrainer:
 
         if val_dataset is None:
             val_dataset = train_dataset
-            
+
         dataset_size = len(train_dataset)
         indices = list(range(dataset_size))
         np.random.shuffle(indices)
@@ -220,22 +217,20 @@ class BaseTrainer:
         batch_size = self.mgr.train_batch_size
 
         train_dataloader = DataLoader(train_dataset,
-                                batch_size=batch_size,
-                                sampler=SubsetRandomSampler(train_indices),
-                                pin_memory=(True if self.device =='cuda' else False),
-                                num_workers=self.mgr.train_num_dataloader_workers
-                                )
+                                      batch_size=batch_size,
+                                      sampler=SubsetRandomSampler(train_indices),
+                                      pin_memory=(True if self.device == 'cuda' else False),
+                                      num_workers=self.mgr.train_num_dataloader_workers
+                                      )
 
         val_dataloader = DataLoader(val_dataset,
                                     batch_size=1,
                                     sampler=SubsetRandomSampler(val_indices),
-                                    pin_memory=(True if self.device =='cuda' else False), 
+                                    pin_memory=(True if self.device == 'cuda' else False),
                                     num_workers=self.mgr.train_num_dataloader_workers
-                             )
-        
+                                    )
 
         return train_dataloader, val_dataloader, train_indices, val_indices
-
 
     def train(self):
         # Check for S3 paths and set up multiprocessing if needed
@@ -245,17 +240,15 @@ class BaseTrainer:
 
         # the is_training flag forces the dataset to perform augmentations
         # we put augmentations in the dataset class so we can use the __getitem__ method
-        # for free multi processing of augmentations 
+        # for free multi processing of augmentations
         train_dataset = self._configure_dataset(is_training=True)
         val_dataset = self._configure_dataset(is_training=False)
-        
 
         self.mgr.auto_detect_channels(train_dataset)
         model = self._build_model()
         optimizer = self._get_optimizer(model)
         loss_fns = self._build_loss()
         scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
-        
 
         model.apply(lambda module: init_weights_he(module, neg_slope=0.2))
         model = model.to(self.device)
@@ -276,9 +269,10 @@ class BaseTrainer:
         use_amp = not getattr(self.mgr, 'no_amp', False)
         if not use_amp:
             print("Automatic Mixed Precision (AMP) is disabled")
-        
+
         scaler = self._get_scaler(self.device.type, use_amp=use_amp)
-        train_dataloader, val_dataloader, train_indices, val_indices = self._configure_dataloaders(train_dataset, val_dataset)
+        train_dataloader, val_dataloader, train_indices, val_indices = self._configure_dataloaders(train_dataset,
+                                                                                                   val_dataset)
 
         # Initialise wandb if wandb_project is set
         if self.mgr.wandb_project:
@@ -291,19 +285,18 @@ class BaseTrainer:
             )
 
         start_epoch = 0
-        
+
         # track the validation loss so we can save the best checkpoints
         val_loss_history = {}  # {epoch: validation_loss}
-        checkpoint_history = deque(maxlen=3)  
-        best_checkpoints = []  
-        debug_gif_history = deque(maxlen=3) 
+        checkpoint_history = deque(maxlen=3)
+        best_checkpoints = []
+        debug_gif_history = deque(maxlen=3)
         best_debug_gifs = []  # List of (val_loss, epoch, gif_path)
-
 
         os.makedirs(self.mgr.ckpt_out_base, exist_ok=True)
         model_ckpt_dir = os.path.join(self.mgr.ckpt_out_base, self.mgr.model_name)
         os.makedirs(model_ckpt_dir, exist_ok=True)
-        
+
         now = datetime.now()
         date_str = now.strftime('%m%d%y')
         time_str = now.strftime('%H%M')
@@ -320,7 +313,7 @@ class BaseTrainer:
                 device=self.device,
                 load_weights_only=getattr(self.mgr, 'load_weights_only', False)
             )
-            
+
             if checkpoint_loaded and self.mgr.load_weights_only:
                 scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
         else:
@@ -340,8 +333,8 @@ class BaseTrainer:
 
             epoch_losses = {t_name: [] for t_name in self.mgr.targets}
             train_iter = iter(train_dataloader)
-            pbar = tqdm(range(num_iters), desc=f'Epoch {epoch+1}/{self.mgr.max_epoch}')
-            
+            pbar = tqdm(range(num_iters), desc=f'Epoch {epoch + 1}/{self.mgr.max_epoch}')
+
             print(f"Using optimizer : {optimizer.__class__.__name__}")
             print(f"Using scheduler : {scheduler.__class__.__name__} (per-iteration: {is_per_iteration_scheduler})")
             print(f"Initial learning rate : {self.mgr.initial_lr}")
@@ -350,7 +343,7 @@ class BaseTrainer:
             for i in pbar:
                 if i % grad_accumulate_n == 0:
                     optimizer.zero_grad(set_to_none=True)
-                
+
                 data_dict = next(train_iter)
 
                 if epoch == 0 and i == 0 and self.mgr.verbose:
@@ -359,13 +352,13 @@ class BaseTrainer:
                         if isinstance(val, dict):
                             print(f"{item}: (dictionary with keys: {list(val.keys())})")
                             for sub_key, sub_val in val.items():
-                                print(f"  {sub_key}: {sub_val.dtype}, {sub_val.shape}, min {sub_val.min()} max {sub_val.max()}")
+                                print(
+                                    f"  {sub_key}: {sub_val.dtype}, {sub_val.shape}, min {sub_val.min()} max {sub_val.max()}")
                         else:
                             print(f"{item}: {val.dtype}, {val.shape}, min {val.min()} max {val.max()}")
 
                 global_step += 1
-                
-                # Standard supervised mode
+
                 inputs = data_dict["image"].to(self.device, dtype=torch.float32)
                 ignore_masks = None
                 if "ignore_masks" in data_dict:
@@ -377,9 +370,8 @@ class BaseTrainer:
                     if k not in ["image", "ignore_masks", "patch_info"]
                 }
 
-                # Only use autocast if AMP is enabled
                 if use_amp and self.device.type in ['cuda', 'cpu']:
-                    autocast_ctx = torch.amp.autocast(device_type=self.device.type)
+                    autocast_ctx = torch.amp.autocast(self.device.type)
                 else:
                     autocast_ctx = nullcontext()
 
@@ -411,13 +403,13 @@ class BaseTrainer:
 
                             # Compute loss
                             # Use auxiliary loss computation helper
-                            loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt_masked, outputs, self.mgr.targets[t_name])
+                            loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt_masked, outputs,
+                                                                self.mgr.targets[t_name])
                             task_total_loss += loss_weight * loss_value
-                        
-                        # Apply task weight
+
                         weighted_loss = task_weight * task_total_loss
                         total_loss += weighted_loss
-                        
+
                         # Store the actual loss value (after task weighting but before grad accumulation scaling)
                         epoch_losses[t_name].append(task_total_loss.detach().cpu().item())
 
@@ -433,7 +425,7 @@ class BaseTrainer:
                         "loss_total": total_loss.detach().cpu().item()
                     })
 
-                # backward 
+                # backward
                 scaler.scale(total_loss).backward()
 
                 if (i + 1) % grad_accumulate_n == 0 or (i + 1) == num_iters:
@@ -442,14 +434,14 @@ class BaseTrainer:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                     scaler.step(optimizer)
                     scaler.update()
-                    
+
                     if is_per_iteration_scheduler:
                         scheduler.step()
 
-                loss_str = " | ".join([f"{t}: {np.mean(epoch_losses[t][-100:]):.4f}" 
-                                      for t in self.mgr.targets if len(epoch_losses[t]) > 0])
+                loss_str = " | ".join([f"{t}: {np.mean(epoch_losses[t][-100:]):.4f}"
+                                       for t in self.mgr.targets if len(epoch_losses[t]) > 0])
                 pbar.set_postfix_str(loss_str)
-                
+
                 del data_dict, inputs, targets_dict, outputs
                 if ignore_masks is not None:
                     del ignore_masks
@@ -457,7 +449,7 @@ class BaseTrainer:
             # Step per-epoch schedulers once after each epoch
             if not is_per_iteration_scheduler:
                 scheduler.step()
-            
+
             gc.collect()
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
@@ -470,7 +462,7 @@ class BaseTrainer:
             ckpt_path = os.path.join(
                 ckpt_dir,
                 f"{self.mgr.model_name}_epoch{epoch}.pth"
-                )
+            )
 
             checkpoint_data = save_checkpoint(
                 model=model,
@@ -496,13 +488,14 @@ class BaseTrainer:
 
                     val_dataloader_iter = iter(val_dataloader)
 
-                    if hasattr(self.mgr, 'max_val_steps_per_epoch') and self.mgr.max_val_steps_per_epoch and self.mgr.max_val_steps_per_epoch > 0:
+                    if hasattr(self.mgr,
+                               'max_val_steps_per_epoch') and self.mgr.max_val_steps_per_epoch and self.mgr.max_val_steps_per_epoch > 0:
                         num_val_iters = min(len(val_indices), self.mgr.max_val_steps_per_epoch)
                     else:
-                        num_val_iters = len(val_indices)  # Use all data 
+                        num_val_iters = len(val_indices)  # Use all data
 
-                    val_pbar = tqdm(range(num_val_iters), desc=f'Validation {epoch+1}')
-                    
+                    val_pbar = tqdm(range(num_val_iters), desc=f'Validation {epoch + 1}')
+
                     for i in val_pbar:
                         try:
                             data_dict = next(val_dataloader_iter)
@@ -510,7 +503,6 @@ class BaseTrainer:
                             val_dataloader_iter = iter(val_dataloader)
                             data_dict = next(val_dataloader_iter)
 
-                        # Standard supervised mode for validation
                         inputs = data_dict["image"].to(self.device, dtype=torch.float32)
                         ignore_masks = None
                         if "ignore_masks" in data_dict:
@@ -525,10 +517,9 @@ class BaseTrainer:
                             if k not in ["image", "ignore_masks", "patch_info"]
                         }
 
-                        # Only use autocast if AMP is enabled
                         if use_amp:
                             context = (
-                                torch.cuda.amp.autocast(dtype=torch.float16) if self.device.type == 'cuda' 
+                                torch.amp.autocast('cuda') if self.device.type == 'cuda'
                                 else nullcontext()
                             )
                         else:
@@ -536,15 +527,13 @@ class BaseTrainer:
 
                         with context:
                             outputs = model(inputs)
-                            
+
                             for t_name, t_gt in targets_dict.items():
                                 t_pred = outputs[t_name]
                                 task_losses = loss_fns[t_name]  # List of (loss_fn, weight) tuples
-                                
-                                # Apply all losses for this target
+
                                 task_total_loss = 0.0
                                 for loss_fn, loss_weight in task_losses:
-                                    # Handle ignore masks
                                     t_gt_masked = t_gt
                                     if ignore_masks is not None and t_name in ignore_masks:
                                         ignore_mask = ignore_masks[t_name].to(self.device, dtype=torch.float32)
@@ -558,19 +547,21 @@ class BaseTrainer:
                                             ignore_mask = ignore_mask.unsqueeze(1)
 
                                         # Apply mask to target: set regions where mask is 1 to ignore_label
-                                        t_gt_masked = torch.where(ignore_mask == 1, torch.tensor(ignore_label, dtype=t_gt.dtype, device=self.device), t_gt)
+                                        t_gt_masked = torch.where(ignore_mask == 1,
+                                                                  torch.tensor(ignore_label, dtype=t_gt.dtype,
+                                                                               device=self.device), t_gt)
 
                                     # Compute loss
                                     loss_value = loss_fn(t_pred, t_gt_masked)
                                     task_total_loss += loss_weight * loss_value
-                                
+
                                 val_losses[t_name].append(task_total_loss.detach().cpu().item())
 
                             if i == 0:
                                 # Find first non-zero sample for debug visualization
                                 b_idx = 0
                                 found_non_zero = False
-                                
+
                                 # Check if the first sample is non-zero
                                 first_target = next(iter(targets_dict.values()))
                                 if torch.any(first_target[0] != 0):
@@ -582,7 +573,7 @@ class BaseTrainer:
                                             b_idx = b
                                             found_non_zero = True
                                             break
-                                
+
                                 # Only create debug gif if we found a non-zero sample
                                 if found_non_zero:
                                     # Slicing shape: [1, c, z, y, x ]
@@ -601,17 +592,17 @@ class BaseTrainer:
                                         input_volume=inputs_first,
                                         targets_dict=targets_dict_first,
                                         outputs_dict=outputs_dict_first,
-                                        tasks_dict=self.mgr.targets, # dictionary, e.g. {"sheet": {"activation":"sigmoid"}, "normals": {"activation":"none"}}
+                                        tasks_dict=self.mgr.targets,
+                                        # dictionary, e.g. {"sheet": {"activation":"sigmoid"}, "normals": {"activation":"none"}}
                                         epoch=epoch,
                                         save_path=debug_img_path
                                     )
                                     debug_gif_history.append((epoch, debug_img_path))
-                            
 
-                            loss_str = " | ".join([f"{t}: {np.mean(val_losses[t]):.4f}" 
-                                                  for t in self.mgr.targets if len(val_losses[t]) > 0])
+                            loss_str = " | ".join([f"{t}: {np.mean(val_losses[t]):.4f}"
+                                                   for t in self.mgr.targets if len(val_losses[t]) > 0])
                             val_pbar.set_postfix_str(loss_str)
-                            
+
                             del outputs, inputs, targets_dict
                             if ignore_masks is not None:
                                 del ignore_masks
@@ -622,12 +613,11 @@ class BaseTrainer:
                         val_avg = np.mean(val_losses[t_name]) if val_losses[t_name] else 0
                         print(f"  Task '{t_name}': Avg validation loss = {val_avg:.4f}")
                         total_val_loss += val_avg
-                    
+
                     # Average validation loss across all tasks
                     avg_val_loss = total_val_loss / len(self.mgr.targets) if self.mgr.targets else 0
                     val_loss_history[epoch] = avg_val_loss
-                    
-                    # Manage checkpoint history
+
                     checkpoint_history, best_checkpoints = manage_checkpoint_history(
                         checkpoint_history=checkpoint_history,
                         best_checkpoints=best_checkpoints,
@@ -639,8 +629,7 @@ class BaseTrainer:
                         max_recent=3,
                         max_best=2
                     )
-                    
-                    # Manage debug GIFs if they were created
+
                     if epoch in [e for e, _ in debug_gif_history]:
                         debug_gif_history, best_debug_gifs = manage_debug_gifs(
                             debug_gif_history=debug_gif_history,
@@ -653,14 +642,12 @@ class BaseTrainer:
                             max_recent=3,
                             max_best=2
                         )
-                    
-                    # Clean up old config files
+
                     cleanup_old_configs(
                         model_ckpt_dir=model_ckpt_dir,
                         model_name=self.mgr.model_name,
                         keep_latest=1
                     )
-
 
         print('Training Finished!')
 
@@ -680,12 +667,12 @@ class BaseTrainer:
 def detect_data_format(data_path):
     """
     Automatically detect the data format based on file extensions in the input directory.
-    
+
     Parameters
     ----------
     data_path : Path
         Path to the data directory containing images/ and labels/ subdirectories
-        
+
     Returns
     -------
     str or None
@@ -694,21 +681,21 @@ def detect_data_format(data_path):
     data_path = Path(data_path)
     images_dir = data_path / "images"
     labels_dir = data_path / "labels"
-    
+
     if not images_dir.exists():
         return None
-        
+
     # Check for zarr directories and image files
     zarr_count = 0
     image_count = 0
-    
+
     # Check images directory
     for item in images_dir.iterdir():
         if item.is_dir() and item.suffix == '.zarr':
             zarr_count += 1
         elif item.is_file() and item.suffix.lower() in ['.tif', '.tiff', '.png', '.jpg', '.jpeg']:
             image_count += 1
-    
+
     # Also check labels directory if it exists
     if labels_dir.exists():
         for item in labels_dir.iterdir():
@@ -716,7 +703,7 @@ def detect_data_format(data_path):
                 zarr_count += 1
             elif item.is_file() and item.suffix.lower() in ['.tif', '.tiff', '.png', '.jpg', '.jpeg']:
                 image_count += 1
-    
+
     # Determine format based on what was found
     if zarr_count > 0 and image_count == 0:
         # Only zarr files found
@@ -736,7 +723,7 @@ def configure_targets(mgr, loss_list=None):
     """
     # Save existing auxiliary tasks before detection
     auxiliary_targets = preserve_auxiliary_targets(mgr.targets if hasattr(mgr, 'targets') and mgr.targets else {})
-    
+
     # Detect data-based targets if not yet configured
     if not getattr(mgr, 'targets', None):
         data_path = Path(mgr.data_path)
@@ -750,10 +737,10 @@ def configure_targets(mgr, loss_list=None):
                 if d.is_dir() and d.suffix == '.zarr' and '_' in d.stem:
                     targets.add(d.stem.rsplit('_', 1)[1])
         elif mgr.data_format.lower() == "image":
-            for ext in ['*.tif','*.tiff','*.png','*.jpg','*.jpeg']:
+            for ext in ['*.tif', '*.tiff', '*.png', '*.jpg', '*.jpeg']:
                 for f in images_dir.glob(ext):
                     if '_' in f.stem:
-                        targets.add(f.stem.rsplit('_',1)[1])
+                        targets.add(f.stem.rsplit('_', 1)[1])
         elif mgr.data_format == "napari":
             print("Warning: target detection not implemented for napari format.")
         if targets:
@@ -767,12 +754,12 @@ def configure_targets(mgr, loss_list=None):
             print(f"Detected targets from data: {sorted(targets)}")
         else:
             print("No targets detected from data. Please configure targets in config file.")
-    
+
     # Re-add auxiliary targets
     if auxiliary_targets:
         mgr.targets = restore_auxiliary_targets(mgr.targets, auxiliary_targets)
         print(f"Re-added auxiliary targets: {list(auxiliary_targets.keys())}")
-    
+
     # Re-apply auxiliary tasks from config
     apply_auxiliary_tasks_from_config(mgr)
 
@@ -798,14 +785,16 @@ def update_config_from_args(mgr, args):
         mgr.dataset_config["data_path"] = str(mgr.data_path)
 
         if args.format:
-            mgr.data_format = args.format; print(f"Using specified data format: {mgr.data_format}")
+            mgr.data_format = args.format;
+            print(f"Using specified data format: {mgr.data_format}")
         else:
             detected = detect_data_format(mgr.data_path)
             if detected:
-                mgr.data_format = detected; print(f"Auto-detected data format: {mgr.data_format}")
+                mgr.data_format = detected;
+                print(f"Auto-detected data format: {mgr.data_format}")
             else:
                 raise ValueError("Data format could not be determined. Please specify --format.")
-        
+
         # Save data_format to dataset_config
         mgr.dataset_config["data_format"] = mgr.data_format
     else:
@@ -827,7 +816,8 @@ def update_config_from_args(mgr, args):
             patch_size = [int(x.strip()) for x in args.patch_size.split(',')]
             mgr.update_config(patch_size=patch_size)
         except ValueError as e:
-            raise ValueError(f"Invalid patch size format: {args.patch_size}. Expected comma-separated integers like '192,192,192'")
+            raise ValueError(
+                f"Invalid patch size format: {args.patch_size}. Expected comma-separated integers like '192,192,192'")
 
     if args.train_split is not None:
         if not 0.0 <= args.train_split <= 1.0:
@@ -904,19 +894,19 @@ def update_config_from_args(mgr, args):
         mgr.tr_configs["gradient_clip"] = args.grad_clip
         if mgr.verbose:
             print(f"Set gradient clipping: {mgr.gradient_clip}")
-    
+
     # Handle scheduler selection
     if args.scheduler is not None:
         mgr.scheduler = args.scheduler
         mgr.tr_configs["scheduler"] = args.scheduler
         if mgr.verbose:
             print(f"Set learning rate scheduler: {mgr.scheduler}")
-        
+
         # If using cosine_warmup, handle its specific parameters
         if args.scheduler == "cosine_warmup":
             if not hasattr(mgr, 'scheduler_kwargs'):
                 mgr.scheduler_kwargs = {}
-            
+
             # Set warmup steps if provided
             if args.warmup_steps is not None:
                 mgr.scheduler_kwargs["warmup_steps"] = args.warmup_steps
@@ -924,14 +914,14 @@ def update_config_from_args(mgr, args):
                 mgr.tr_configs["scheduler_kwargs"] = mgr.scheduler_kwargs
                 if mgr.verbose:
                     print(f"Set warmup steps: {args.warmup_steps}")
-    
+
     # Handle no_amp flag
     if args.no_amp:
         mgr.no_amp = True
         mgr.tr_configs["no_amp"] = True
         if mgr.verbose:
             print(f"Disabled Automatic Mixed Precision (AMP)")
-    
+
     # Handle Weights & Biases arguments
     mgr.wandb_project = args.wandb_project
     mgr.wandb_entity = args.wandb_entity
@@ -948,69 +938,69 @@ def main():
     )
 
     # Required arguments (input is optional for self-supervised pretraining with data_paths)
-    parser.add_argument("-i", "--input", 
-                       help="Input directory containing images/, labels/, and optionally masks/ subdirectories. Optional when using --pretrain with data_paths in config.")
+    parser.add_argument("-i", "--input",
+                        help="Input directory containing images/, labels/, and optionally masks/ subdirectories. Optional when using --pretrain with data_paths in config.")
     parser.add_argument("-o", "--output", default="checkpoints",
-                       help="Output directory for saving checkpoints and configurations (default: checkpoints)")
+                        help="Output directory for saving checkpoints and configurations (default: checkpoints)")
     parser.add_argument("--format", choices=["image", "zarr", "napari"],
-                       help="Data format (image: tif, png, or jpg files, zarr: Zarr arrays, napari: Napari layers). If not specified, will attempt to auto-detect.")
+                        help="Data format (image: tif, png, or jpg files, zarr: Zarr arrays, napari: Napari layers). If not specified, will attempt to auto-detect.")
 
     # Optional arguments
-    parser.add_argument("--batch-size", type=int, 
-                       help="Training batch size (default: from config or 2)")
+    parser.add_argument("--batch-size", type=int,
+                        help="Training batch size (default: from config or 2)")
     parser.add_argument("--patch-size", type=str,
-                       help="Patch size as comma-separated values, e.g., '192,192,192' for 3D or '256,256' for 2D")
-    parser.add_argument("--loss", type=str, 
-                       help="Loss functions as a list, e.g., '[SoftDiceLoss, BCEWithLogitsLoss]' or comma-separated")
+                        help="Patch size as comma-separated values, e.g., '192,192,192' for 3D or '256,256' for 2D")
+    parser.add_argument("--loss", type=str,
+                        help="Loss functions as a list, e.g., '[SoftDiceLoss, BCEWithLogitsLoss]' or comma-separated")
     parser.add_argument("--train-split", type=float,
-                       help="Training/validation split ratio (0.0-1.0, default: 0.95)")
+                        help="Training/validation split ratio (0.0-1.0, default: 0.95)")
     parser.add_argument("--loss-on-label-only", action="store_true",
-                       help="Compute loss only on labeled regions (use masks for loss calculation)")
+                        help="Compute loss only on labeled regions (use masks for loss calculation)")
     parser.add_argument("--config", "--config-path", dest="config_path", type=str, required=True,
-                       help="Path to configuration YAML file (required)")
+                        help="Path to configuration YAML file (required)")
     parser.add_argument("--verbose", action="store_true",
-                       help="Enable verbose output for debugging")
+                        help="Enable verbose output for debugging")
     parser.add_argument("--max-steps-per-epoch", type=int, default=200,
-                       help="Maximum training steps per epoch (if not set, uses all data)")
+                        help="Maximum training steps per epoch (if not set, uses all data)")
     parser.add_argument("--max-val-steps-per-epoch", type=int, default=30,
-                       help="Maximum validation steps per epoch (if not set, uses all data)")
+                        help="Maximum validation steps per epoch (if not set, uses all data)")
     parser.add_argument("--model-name", type=str,
-                       help="Model name for checkpoints and logging (default: from config or 'Model')")
+                        help="Model name for checkpoints and logging (default: from config or 'Model')")
     parser.add_argument("--nonlin", type=str, choices=["LeakyReLU", "ReLU", "SwiGLU", "swiglu", "GLU", "glu"],
-                       help="Activation function to use in the model (default: from config or 'LeakyReLU')")
+                        help="Activation function to use in the model (default: from config or 'LeakyReLU')")
     parser.add_argument("--se", action="store_true", help="Enable squeeze and excitation modules in the encoder")
     parser.add_argument("--se-reduction-ratio", type=float, default=0.0625,
-                       help="Squeeze excitation reduction ratio (default: 0.0625 = 1/16)")
+                        help="Squeeze excitation reduction ratio (default: 0.0625 = 1/16)")
     parser.add_argument("--optimizer", type=str,
-                       help="Optimizer to use for training (default: from config or 'AdamW, available options in models/optimizers.py')")
+                        help="Optimizer to use for training (default: from config or 'AdamW, available options in models/optimizers.py')")
     parser.add_argument("--no-spatial", action="store_true",
-                       help="Disable spatial/geometric transformations (rotations, flips, etc.) during training")
+                        help="Disable spatial/geometric transformations (rotations, flips, etc.) during training")
     parser.add_argument("--grad-clip", type=float, default=12.0,
-                       help="Gradient clipping value (default: 12.0)")
+                        help="Gradient clipping value (default: 12.0)")
     parser.add_argument("--no-amp", action="store_true",
-                       help="Disable Automatic Mixed Precision (AMP) for training")
-    
+                        help="Disable Automatic Mixed Precision (AMP) for training")
+
     # Trainer selection
     parser.add_argument("--trainer", type=str, default="base",
-                       help="Trainer class to use (default: base). Options: base, self_supervised")
-    
+                        help="Trainer class to use (default: base). Options: base, self_supervised")
+
     # Self-supervised specific arguments (only used when --trainer self_supervised)
     parser.add_argument("--mask-ratio", type=float, default=0.75,
-                       help="Mask ratio for self-supervised pretraining (default: 0.75)")
+                        help="Mask ratio for self-supervised pretraining (default: 0.75)")
     parser.add_argument("--mask-patch-size", type=str,
-                       help="Mask patch size for self-supervised training as comma-separated values, e.g., '8,16,16' for 3D")
-    
+                        help="Mask patch size for self-supervised training as comma-separated values, e.g., '8,16,16' for 3D")
+
     # Learning rate scheduler arguments
-    parser.add_argument("--scheduler", type=str, 
-                       help="Learning rate scheduler type (default: from config or 'poly')")
+    parser.add_argument("--scheduler", type=str,
+                        help="Learning rate scheduler type (default: from config or 'poly')")
     parser.add_argument("--warmup-steps", type=int,
-                       help="Number of warmup steps for cosine_warmup scheduler (default: 10%% of first cycle)")
-    
+                        help="Number of warmup steps for cosine_warmup scheduler (default: 10%% of first cycle)")
+
     # Weights & Biases arguments
     parser.add_argument("--wandb-project", type=str, default=None,
-                       help="Weights & Biases project name (default: from config; wandb logging disabled if not set anywhere)")
+                        help="Weights & Biases project name (default: from config; wandb logging disabled if not set anywhere)")
     parser.add_argument("--wandb-entity", type=str, default=None,
-                       help="Weights & Biases team/username (default: from config)")
+                        help="Weights & Biases team/username (default: from config)")
 
     args = parser.parse_args()
 
@@ -1025,7 +1015,7 @@ def main():
         print("  vesuvius.train --config path/to/config.yaml --input path/to/data --output path/to/output")
         print("\nFor more options, use: vesuvius.train --help")
         sys.exit(1)
-    
+
     mgr.load_config(args.config_path)
     print(f"Loaded configuration from: {args.config_path}")
 
@@ -1050,9 +1040,9 @@ def main():
         # Configure self-supervised specific parameters
         if not hasattr(mgr, 'dataset_config'):
             mgr.dataset_config = {}
-        
+
         mgr.dataset_config["mask_ratio"] = args.mask_ratio
-        
+
         # Parse mask patch size if provided
         if args.mask_patch_size:
             try:
@@ -1060,7 +1050,7 @@ def main():
                 mgr.dataset_config["mask_patch_size"] = mask_patch_size
             except ValueError:
                 raise ValueError(f"Invalid mask patch size format: {args.mask_patch_size}")
-        
+
         from vesuvius.models.training.self_supervised_trainer import SelfSupervisedTrainer
         trainer = SelfSupervisedTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Self-Supervised Trainer for self-supervised pretraining")
