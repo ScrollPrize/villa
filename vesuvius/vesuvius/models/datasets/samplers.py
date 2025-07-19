@@ -4,6 +4,7 @@ import itertools
 
 class TwoStreamBatchSampler(Sampler):
     """Samples labeled and unlabeled data in fixed proportions"""
+
     def __init__(self, primary_indices, secondary_indices, batch_size, secondary_batch_size):
         """
         Parameters

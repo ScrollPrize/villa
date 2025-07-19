@@ -29,19 +29,26 @@ def convert_image_to_zarr_worker(args):
     image_path, zarr_group_path, array_name, patch_size, pre_created = args
     
     try:
+        # Read the image file
         if str(image_path).lower().endswith(('.tif', '.tiff')):
             # Use tifffile for TIFF files to handle 3D data
             img = tifffile.imread(str(image_path))
         else:
             # Use cv2 for other image formats (2D only)
             img = cv2.imread(str(image_path))
-
+        
+        # Convert to uint8 with proper scaling based on dtype
         img = convert_to_uint8_dtype_range(img)
+        
+        # Open the Zarr group
         group = zarr.open_group(str(zarr_group_path), mode='r+')
         
         if pre_created:
+            # Array already exists, just write the data
             group[array_name][:] = img
         else:
+            # Create the array (fallback for single-threaded mode)
+            # Use patch size directly as chunks
             if len(img.shape) == 2:  # 2D
                 chunks = tuple(patch_size[:2])  # [h, w]
             else:  # 3D
