@@ -1260,7 +1260,7 @@ class BaseDataset(Dataset):
             )),
             transforms.append(RandomTransform(
                     MirrorTransform(allowed_axes=mirror_axes), 
-                    apply_probability=0.0
+                    apply_probability=0.2
                 )),
             transforms.append(RandomTransform(
                     GaussianBlurTransform(
@@ -1269,13 +1269,13 @@ class BaseDataset(Dataset):
                         synchronize_axes=False,
                         p_per_channel=1.0
                     ),
-                    apply_probability=0.2
+                    apply_probability=0.3
                 )),
             transforms.append(RandomTransform(
                 TransposeAxesTransform(
                     allowed_axes={0, 1, 2},
                     ),
-                    apply_probability=0.0
+                    apply_probability=0.3
             )),
             transforms.append(RandomTransform(
                 GaussianNoiseTransform(
@@ -1297,7 +1297,7 @@ class BaseDataset(Dataset):
                     multiplier_range=BGContrast((0.75, 1.25)),
                     synchronize_channels=False,
                     p_per_channel=1
-                ), apply_probability=0.15
+                ), apply_probability=0.20
             ))
             transforms.append(RandomTransform(
                 ContrastTransform(
@@ -1345,7 +1345,7 @@ class BaseDataset(Dataset):
                     force_square=False,  # same as original
                     p_per_sample=0.4,  # same as original
                     p_per_channel=0.5  # same as original
-                ), apply_probability=0.5
+                ), apply_probability=0.3
             ))
             transforms.append(RandomTransform(
                 InhomogeneousSliceIlluminationTransform(
