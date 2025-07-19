@@ -89,8 +89,8 @@ def _validate_patch_batch(args):
     return valid_positions, chunk_idx, positions_checked, len(valid_positions)
 
 
-class MAEPretrainDataset(ZarrDataset):
-    """Dataset for masked autoencoder pretraining on unlabeled data.
+class SelfSupervisedPretrainDataset(ZarrDataset):
+    """Dataset for self-supervised pretraining on unlabeled data.
     
     This dataset loads only image data (no labels) and applies random masking
     for self-supervised pretraining using masked autoencoding.
@@ -106,7 +106,7 @@ class MAEPretrainDataset(ZarrDataset):
         normalize_targets: bool = False,
         **kwargs
     ):
-        """Initialize MAE pretraining dataset.
+        """Initialize self-supervised pretraining dataset.
         
         Args:
             mgr: ConfigManager instance
@@ -116,7 +116,7 @@ class MAEPretrainDataset(ZarrDataset):
             normalize_targets: Whether to normalize reconstruction targets
             **kwargs: Additional arguments
         """
-        # Store MAE-specific parameters - get from config if available
+        # Store self-supervised specific parameters - get from config if available
         dataset_config = getattr(mgr, 'dataset_config', {})
         self.mask_ratio = dataset_config.get('mask_ratio', mask_ratio)
         self.min_mask_ratio = dataset_config.get('min_mask_ratio', 0.10)  # Default to 10%
@@ -126,18 +126,18 @@ class MAEPretrainDataset(ZarrDataset):
         # Get skip_bounding_box from mgr
         self.skip_bounding_box = getattr(mgr, 'skip_bounding_box', False)
         
-        # For MAE, we don't skip patch validation - we'll use our custom validation
+        # For self-supervised training, we don't skip patch validation - we'll use our custom validation
         mgr.skip_patch_validation = False
         
-        # Force minmax normalization for MAE (no intensity sampling needed)
+        # Force minmax normalization for self-supervised training (no intensity sampling needed)
         mgr.normalization_scheme = 'minmax'
         if hasattr(mgr, 'dataset_config'):
             mgr.dataset_config['normalization_scheme'] = 'minmax'
         
         # Set a flag to prevent base class from running validation
-        self._mae_will_handle_validation = True
+        self._self_supervised_will_handle_validation = True
         
-        # Call parent init - ZarrDataset will handle MAE mode through _initialize_volumes
+        # Call parent init - ZarrDataset will handle self-supervised mode through _initialize_volumes
         super().__init__(mgr, is_training, **kwargs)
         
         # Set mask patch size based on dimensionality after initialization
@@ -173,10 +173,10 @@ class MAEPretrainDataset(ZarrDataset):
         self._get_valid_patches()
     
     def _get_config_params(self):
-        """Get configuration parameters for caching, including MAE-specific params."""
+        """Get configuration parameters for caching, including self-supervised specific params."""
         base_params = super()._get_config_params()
-        base_params['dataset_type'] = 'mae_pretrain'
-        base_params['normalization_scheme'] = 'minmax'  # Always use minmax for MAE
+        base_params['dataset_type'] = 'self_supervised_pretrain'
+        base_params['normalization_scheme'] = 'minmax'  # Always use minmax for self-supervised training
         base_params['skip_bounding_box'] = self.skip_bounding_box  # Include skip_bounding_box flag
         base_params['nonzero_validated'] = True  # Flag that patches are pre-validated for non-zero data
         return base_params
@@ -517,19 +517,19 @@ class MAEPretrainDataset(ZarrDataset):
         """Override to generate and validate patches using multiprocessing."""
         # Check if patches have already been loaded (e.g., by parent class)
         if self.valid_patches:
-            print(f"MAE patches already loaded: {len(self.valid_patches)} patches available")
+            print(f"Self-supervised patches already loaded: {len(self.valid_patches)} patches available")
             return
             
         # Try to load from cache first
         if self.cache_enabled and self.cache_dir is not None and self.data_path is not None:
-            print("\nAttempting to load MAE patches from cache...")
+            print("\nAttempting to load self-supervised patches from cache...")
             config_params = self._get_config_params()
-            print(f"MAE cache configuration: {config_params}")
+            print(f"Self-supervised cache configuration: {config_params}")
             
             # Generate cache key for debugging
             from utils.io.patch_cache_utils import compute_cache_key
             cache_key = compute_cache_key(config_params)
-            print(f"MAE cache key: {cache_key}")
+            print(f"Self-supervised cache key: {cache_key}")
             
             cache_result = load_cached_patches(
                 self.cache_dir,
@@ -539,13 +539,13 @@ class MAEPretrainDataset(ZarrDataset):
             if cache_result is not None:
                 cached_patches, cached_intensity_properties, cached_normalization_scheme = cache_result
                 self.valid_patches = cached_patches
-                print(f"Successfully loaded {len(self.valid_patches)} pre-validated MAE patches from cache\n")
+                print(f"Successfully loaded {len(self.valid_patches)} pre-validated self-supervised patches from cache\n")
                 return
             else:
-                print("No valid MAE cache found, will compute patches...")
+                print("No valid self-supervised cache found, will compute patches...")
         
         # Generate and validate patches using multiprocessing
-        print("Generating and validating MAE patches using multiprocessing...")
+        print("Generating and validating self-supervised patches using multiprocessing...")
         ref_target = list(self.target_volumes.keys())[0]
         total_volumes = len(self.target_volumes[ref_target])
         
@@ -554,7 +554,7 @@ class MAEPretrainDataset(ZarrDataset):
         print(f"Using {num_workers} workers for parallel validation")
         
         for vol_idx, volume_info in enumerate(tqdm(self.target_volumes[ref_target], 
-                                                    desc="Processing volumes for MAE", 
+                                                    desc="Processing volumes for self-supervised training", 
                                                     total=total_volumes)):
             vdata = volume_info['data']
             data_array = vdata['data']  # This is the image data (zarr array)
@@ -851,7 +851,7 @@ class MAEPretrainDataset(ZarrDataset):
         
         # Save to cache after computing all patches
         if self.cache_enabled and self.cache_dir is not None and self.data_path is not None:
-            print(f"\nAttempting to save {len(self.valid_patches)} validated MAE patches to cache...")
+            print(f"\nAttempting to save {len(self.valid_patches)} validated self-supervised patches to cache...")
             config_params = self._get_config_params()
             config_params['nonzero_validated'] = True  # Flag for pre-validated patches
             success = save_computed_patches(
@@ -863,9 +863,9 @@ class MAEPretrainDataset(ZarrDataset):
                 normalization_scheme=self.normalization_scheme
             )
             if success:
-                print(f"Successfully saved validated MAE patches to cache directory: {self.cache_dir}\n")
+                print(f"Successfully saved validated self-supervised patches to cache directory: {self.cache_dir}\n")
             else:
-                print("Failed to save MAE patches to cache\n")
+                print("Failed to save self-supervised patches to cache\n")
     
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         """Get a training sample with masking applied.
@@ -905,7 +905,7 @@ class MAEPretrainDataset(ZarrDataset):
         masked_img = masked_img[np.newaxis, ...]
         
         # Create output dict compatible with training pipeline
-        # For MAE mode, train.py expects:
+        # For self-supervised mode, train.py expects:
         # - "masked_image": the masked input
         # - "image": the original image (for reconstruction target)  
         # - "mask": the mask for loss computation
@@ -915,7 +915,7 @@ class MAEPretrainDataset(ZarrDataset):
             "mask": torch.from_numpy(mask[np.newaxis, ...].copy()).float(),  # Mask for loss computation
         }
         
-        # Note: We don't apply augmentations in MAE mode because:
+        # Note: We don't apply augmentations in self-supervised mode because:
         # 1. The masking is already a form of augmentation
         # 2. Standard augmentations might interfere with reconstruction task
         

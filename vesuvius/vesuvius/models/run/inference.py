@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 multiprocessing.set_start_method('spawn', force=True)
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
-from vesuvius.utils.models.load_nnunet_model import load_model_for_inference
+from vesuvius.utils.load_nnunet_model import load_model_for_inference
 from vesuvius.vesuvius.data.vc_dataset import VCDataset
 from vesuvius.vesuvius.data.utils import open_zarr
 from pathlib import Path

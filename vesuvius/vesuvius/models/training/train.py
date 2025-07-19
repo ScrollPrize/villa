@@ -21,7 +21,7 @@ from vesuvius.models.training.lr_schedulers import get_scheduler, PolyLRSchedule
 from torch.optim import AdamW, SGD
 from torch.utils.data import DataLoader, SubsetRandomSampler
 from vesuvius.utils.utils import init_weights_he
-from vesuvius.models.datasets import NapariDataset, ImageDataset, ZarrDataset, MAEPretrainDataset
+from vesuvius.models.datasets import NapariDataset, ImageDataset, ZarrDataset
 from vesuvius.utils.plotting import save_debug
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 
@@ -91,28 +91,20 @@ class BaseTrainer:
 
     # --- configure dataset --- #
     def _configure_dataset(self, is_training=True):
-        # Check if MAE dataset class is specified
-        dataset_class = self.mgr.dataset_config.get('dataset_class', None)
-        
-        if dataset_class == 'MAEPretrainDataset':
-            # MAE pretraining dataset
-            dataset = MAEPretrainDataset(mgr=self.mgr, is_training=is_training)
-            print(f"Using MAE pretraining dataset ({'training' if is_training else 'validation'})")
+        # Standard supervised datasets
+        data_format = getattr(self.mgr, 'data_format', 'zarr').lower()
+
+        if data_format == 'napari':
+            dataset = NapariDataset(mgr=self.mgr, is_training=is_training)
+        elif data_format == 'image':
+            dataset = ImageDataset(mgr=self.mgr, is_training=is_training)
+        elif data_format == 'zarr':
+            dataset = ZarrDataset(mgr=self.mgr, is_training=is_training)
         else:
-            # Standard supervised datasets
-            data_format = getattr(self.mgr, 'data_format', 'zarr').lower()
+            raise ValueError(f"Unsupported data format: {data_format}. "
+                           f"Supported formats are: 'napari', 'image', 'zarr'")
 
-            if data_format == 'napari':
-                dataset = NapariDataset(mgr=self.mgr, is_training=is_training)
-            elif data_format == 'image':
-                dataset = ImageDataset(mgr=self.mgr, is_training=is_training)
-            elif data_format == 'zarr':
-                dataset = ZarrDataset(mgr=self.mgr, is_training=is_training)
-            else:
-                raise ValueError(f"Unsupported data format: {data_format}. "
-                               f"Supported formats are: 'napari', 'image', 'zarr'")
-
-            print(f"Using {data_format} dataset format ({'training' if is_training else 'validation'})")
+        print(f"Using {data_format} dataset format ({'training' if is_training else 'validation'})")
         
         return dataset
 
@@ -339,19 +331,6 @@ class BaseTrainer:
 
         # ---- training! ----- #
         for epoch in range(start_epoch, self.mgr.max_epoch):
-            
-            # Update mask ratio for MAE pretraining if applicable
-            if self.mgr.model_config.get('mae_mode', False) and hasattr(train_dataset, 'set_mask_ratio'):
-                # Use the target mask ratio directly (no curriculum)
-                target_mask_ratio = train_dataset.mask_ratio
-                
-                # Update both train and val datasets
-                train_dataset.set_mask_ratio(target_mask_ratio)
-                if hasattr(val_dataset, 'set_mask_ratio'):
-                    val_dataset.set_mask_ratio(target_mask_ratio)
-                
-                print(f"\n[MAE] Epoch {epoch + 1}: Mask ratio = {target_mask_ratio:.2%}")
-
             model.train()
 
             if getattr(self.mgr, 'max_steps_per_epoch', None) and self.mgr.max_steps_per_epoch > 0:
@@ -386,51 +365,21 @@ class BaseTrainer:
 
                 global_step += 1
                 
-                # Initialize mae_mask and ignore_masks as None
-                mae_mask = None
+                # Standard supervised mode
+                inputs = data_dict["image"].to(self.device, dtype=torch.float32)
                 ignore_masks = None
-                
-                # Handle MAE mode differently
-                if self.mgr.model_config.get('mae_mode', False):
-                    # MAE pretraining mode
-                    inputs = data_dict["masked_image"].to(self.device, dtype=torch.float32)
-                    original_image = data_dict["image"].to(self.device, dtype=torch.float32)
-                    mask = data_dict["mask"].to(self.device, dtype=torch.float32)
-                    
-                    # Check if the original image patch is all zeros
-                    # We check each sample in the batch independently
-                    batch_size = original_image.shape[0]
-                    non_zero_mask = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
-                    
-                    for b in range(batch_size):
-                        # Check if this sample has any non-zero values
-                        non_zero_mask[b] = torch.any(original_image[b] != 0)
-                    
-                    # If all samples in batch are zero, skip this iteration
-                    if not torch.any(non_zero_mask):
-                        # nothing to accumulate this iter → just continue
-                        continue
+                if "ignore_masks" in data_dict:
+                    ignore_masks = {t_name: mask.to(self.device) for t_name, mask in data_dict["ignore_masks"].items()}
 
-                    
-                    # Create targets dict for MAE
-                    targets_dict = {"reconstruction": original_image}
-                    mae_mask = {"reconstruction": mask}
-                    # ignore_masks stays None for MAE
-                else:
-                    # Standard supervised mode
-                    inputs = data_dict["image"].to(self.device, dtype=torch.float32)
-                    if "ignore_masks" in data_dict:
-                        ignore_masks = {t_name: mask.to(self.device) for t_name, mask in data_dict["ignore_masks"].items()}
-
-                    targets_dict = {
-                        k: v.to(self.device, dtype=torch.float32)
-                        for k, v in data_dict.items()
-                        if k not in ["image", "ignore_masks", "masked_image", "mask", "patch_info"]
-                    }
+                targets_dict = {
+                    k: v.to(self.device, dtype=torch.float32)
+                    for k, v in data_dict.items()
+                    if k not in ["image", "ignore_masks", "patch_info"]
+                }
 
                 # Only use autocast if AMP is enabled
                 if use_amp and self.device.type in ['cuda', 'cpu']:
-                    autocast_ctx = torch.cuda.amp.autocast(dtype=torch.float16)
+                    autocast_ctx = torch.amp.autocast()
                 else:
                     autocast_ctx = nullcontext()
 
@@ -442,11 +391,9 @@ class BaseTrainer:
                         t_pred = outputs[t_name]
                         task_losses = loss_fns[t_name]  # List of (loss_fn, weight) tuples
                         task_weight = self.mgr.targets[t_name].get("weight", 1.0)
-                        
-                        # Apply all losses for this target
+
                         task_total_loss = 0.0
                         for loss_fn, loss_weight in task_losses:
-                            # Handle ignore masks
                             t_gt_masked = t_gt
                             if ignore_masks is not None and t_name in ignore_masks:
                                 ignore_mask = ignore_masks[t_name]
@@ -463,13 +410,8 @@ class BaseTrainer:
                                 t_gt_masked = torch.where(ignore_mask == 1, ignore_tensor, t_gt)
 
                             # Compute loss
-                            # Check if this is MAE reconstruction loss
-                            if self.mgr.model_config.get('mae_mode', False) and t_name == 'reconstruction' and mae_mask is not None:
-                                # MAE loss expects mask as third argument
-                                loss_value = loss_fn(t_pred, t_gt_masked, mae_mask[t_name])
-                            else:
-                                # Use auxiliary loss computation helper
-                                loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt_masked, outputs, self.mgr.targets[t_name])
+                            # Use auxiliary loss computation helper
+                            loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt_masked, outputs, self.mgr.targets[t_name])
                             task_total_loss += loss_weight * loss_value
                         
                         # Apply task weight
@@ -525,13 +467,11 @@ class BaseTrainer:
                 avg_loss = np.mean(epoch_losses[t_name]) if epoch_losses[t_name] else 0
                 print(f"  {t_name}: Avg Loss = {avg_loss:.4f}")
 
-            # Use the checkpoint directory created at the start of training
             ckpt_path = os.path.join(
                 ckpt_dir,
                 f"{self.mgr.model_name}_epoch{epoch}.pth"
                 )
-            
-            # Save checkpoint using the new save_checkpoint function
+
             checkpoint_data = save_checkpoint(
                 model=model,
                 optimizer=optimizer,
@@ -541,11 +481,9 @@ class BaseTrainer:
                 model_config=model.final_config,
                 train_dataset=train_dataset
             )
-            
-            # Add to checkpoint history (simple append, management happens later)
+
             checkpoint_history.append((epoch, ckpt_path))
-            
-            # Explicit cleanup after checkpoint save
+
             del checkpoint_data
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
@@ -572,44 +510,20 @@ class BaseTrainer:
                             val_dataloader_iter = iter(val_dataloader)
                             data_dict = next(val_dataloader_iter)
 
-                        # Handle MAE mode vs standard mode for validation
-                        mae_mask = None
+                        # Standard supervised mode for validation
+                        inputs = data_dict["image"].to(self.device, dtype=torch.float32)
                         ignore_masks = None
-                        
-                        if self.mgr.model_config.get('mae_mode', False):
-                            # MAE validation mode
-                            inputs = data_dict["masked_image"].to(self.device, dtype=torch.float32)
-                            original_image = data_dict["image"].to(self.device, dtype=torch.float32)
-                            mask = data_dict["mask"].to(self.device, dtype=torch.float32)
-                            
-                            # Check for all-zero patches in validation too
-                            batch_size = original_image.shape[0]
-                            val_non_zero_mask = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
-                            
-                            for b in range(batch_size):
-                                val_non_zero_mask[b] = torch.any(original_image[b] != 0)
-                            
-                            # Skip if all samples are zero
-                            if not torch.any(val_non_zero_mask):
-                                continue
-                            
-                            # Create targets dict for MAE
-                            targets_dict = {"reconstruction": original_image}
-                            mae_mask = {"reconstruction": mask}
-                        else:
-                            # Standard supervised mode
-                            inputs = data_dict["image"].to(self.device, dtype=torch.float32)
-                            if "ignore_masks" in data_dict:
-                                ignore_masks = {
-                                    t_name: mask.to(self.device, dtype=torch.float32)
-                                    for t_name, mask in data_dict["ignore_masks"].items()
-                                }
-
-                            targets_dict = {
-                                k: v.to(self.device, dtype=torch.float32)
-                                for k, v in data_dict.items()
-                                if k not in ["image", "ignore_masks", "masked_image", "mask", "patch_info"]
+                        if "ignore_masks" in data_dict:
+                            ignore_masks = {
+                                t_name: mask.to(self.device, dtype=torch.float32)
+                                for t_name, mask in data_dict["ignore_masks"].items()
                             }
+
+                        targets_dict = {
+                            k: v.to(self.device, dtype=torch.float32)
+                            for k, v in data_dict.items()
+                            if k not in ["image", "ignore_masks", "patch_info"]
+                        }
 
                         # Only use autocast if AMP is enabled
                         if use_amp:
@@ -647,26 +561,7 @@ class BaseTrainer:
                                         t_gt_masked = torch.where(ignore_mask == 1, torch.tensor(ignore_label, dtype=t_gt.dtype, device=self.device), t_gt)
 
                                     # Compute loss
-                                    # Check if this is MAE reconstruction loss
-                                    if self.mgr.model_config.get('mae_mode', False) and t_name == 'reconstruction' and mae_mask is not None:
-                                        # For MAE validation, also filter by non-zero samples
-                                        if 'val_non_zero_mask' in locals() and torch.any(val_non_zero_mask):
-                                            # Extract only non-zero samples
-                                            t_pred_filtered = t_pred[val_non_zero_mask]
-                                            t_gt_filtered = t_gt_masked[val_non_zero_mask]
-                                            mask_filtered = mae_mask[t_name][val_non_zero_mask]
-                                            
-                                            if t_pred_filtered.shape[0] > 0:
-                                                # MAE loss expects mask as third argument
-                                                loss_value = loss_fn(t_pred_filtered, t_gt_filtered, mask_filtered)
-                                            else:
-                                                # No valid samples, return zero loss
-                                                loss_value = torch.tensor(0.0, device=self.device, requires_grad=True)
-                                        else:
-                                            # Fallback to normal computation
-                                            loss_value = loss_fn(t_pred, t_gt_masked, mae_mask[t_name])
-                                    else:
-                                        loss_value = loss_fn(t_pred, t_gt_masked)
+                                    loss_value = loss_fn(t_pred, t_gt_masked)
                                     task_total_loss += loss_weight * loss_value
                                 
                                 val_losses[t_name].append(task_total_loss.detach().cpu().item())
@@ -676,27 +571,17 @@ class BaseTrainer:
                                 b_idx = 0
                                 found_non_zero = False
                                 
-                                # Check if we're in MAE mode and have val_non_zero_mask
-                                if self.mgr.model_config.get('mae_mode', False) and 'val_non_zero_mask' in locals():
-                                    # Find first non-zero sample
-                                    for b in range(val_non_zero_mask.shape[0]):
-                                        if val_non_zero_mask[b]:
+                                # Check if the first sample is non-zero
+                                first_target = next(iter(targets_dict.values()))
+                                if torch.any(first_target[0] != 0):
+                                    found_non_zero = True
+                                else:
+                                    # Look for a non-zero sample
+                                    for b in range(first_target.shape[0]):
+                                        if torch.any(first_target[b] != 0):
                                             b_idx = b
                                             found_non_zero = True
                                             break
-                                else:
-                                    # For non-MAE mode, check if the first sample is non-zero
-                                    # Check the first target to see if it's non-zero
-                                    first_target = next(iter(targets_dict.values()))
-                                    if torch.any(first_target[0] != 0):
-                                        found_non_zero = True
-                                    else:
-                                        # Look for a non-zero sample
-                                        for b in range(first_target.shape[0]):
-                                            if torch.any(first_target[b] != 0):
-                                                b_idx = b
-                                                found_non_zero = True
-                                                break
                                 
                                 # Only create debug gif if we found a non-zero sample
                                 if found_non_zero:
@@ -1047,53 +932,6 @@ def update_config_from_args(mgr, args):
         if mgr.verbose:
             print(f"Disabled Automatic Mixed Precision (AMP)")
     
-    # Handle MAE pretraining mode
-    if args.pretrain:
-        # Enable MAE mode
-        if not hasattr(mgr, 'model_config') or mgr.model_config is None:
-            mgr.model_config = {}
-        mgr.model_config["mae_mode"] = True
-        
-        # Set dataset class
-        if not hasattr(mgr, 'dataset_config') or mgr.dataset_config is None:
-            mgr.dataset_config = {}
-        mgr.dataset_config["dataset_class"] = "MAEPretrainDataset"
-        
-        # Set MAE-specific parameters
-        mgr.dataset_config["mask_ratio"] = args.mask_ratio
-        
-        # Parse mask patch size if provided
-        if args.mask_patch_size:
-            try:
-                mask_patch_size = [int(x.strip()) for x in args.mask_patch_size.split(',')]
-                mgr.dataset_config["mask_patch_size"] = mask_patch_size
-            except ValueError:
-                raise ValueError(f"Invalid mask patch size format: {args.mask_patch_size}")
-        
-        # Configure reconstruction target
-        if "targets" not in mgr.dataset_config:
-            mgr.dataset_config["targets"] = {}
-        mgr.dataset_config["targets"]["reconstruction"] = {
-            "activation": "none",
-            "losses": [{
-                "name": "MaskedReconstructionLoss",
-                "weight": 1.0,
-                "config": {
-                    "base_loss": "mse",
-                    "normalize_targets": True
-                }
-            }]
-        }
-        
-        # Update targets in mgr
-        mgr.targets = mgr.dataset_config["targets"]
-        
-        if mgr.verbose:
-            print("Enabled MAE pretraining mode")
-            print(f"Mask ratio: {args.mask_ratio}")
-            if args.mask_patch_size:
-                print(f"Mask patch size: {mask_patch_size}")
-    
     # Handle Weights & Biases arguments
     mgr.wandb_project = args.wandb_project
     mgr.wandb_entity = args.wandb_entity
@@ -1109,7 +947,7 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    # Required arguments (input is optional for MAE pretraining with data_paths)
+    # Required arguments (input is optional for self-supervised pretraining with data_paths)
     parser.add_argument("-i", "--input", 
                        help="Input directory containing images/, labels/, and optionally masks/ subdirectories. Optional when using --pretrain with data_paths in config.")
     parser.add_argument("-o", "--output", default="checkpoints",
@@ -1152,13 +990,15 @@ def main():
     parser.add_argument("--no-amp", action="store_true",
                        help="Disable Automatic Mixed Precision (AMP) for training")
     
-    # MAE Pretraining arguments
-    parser.add_argument("--pretrain", action="store_true",
-                       help="Enable MAE pretraining mode (unsupervised masked autoencoder training)")
+    # Trainer selection
+    parser.add_argument("--trainer", type=str, default="base",
+                       help="Trainer class to use (default: base). Options: base, self_supervised")
+    
+    # Self-supervised specific arguments (only used when --trainer self_supervised)
     parser.add_argument("--mask-ratio", type=float, default=0.75,
-                       help="Mask ratio for MAE pretraining (default: 0.75)")
+                       help="Mask ratio for self-supervised pretraining (default: 0.75)")
     parser.add_argument("--mask-patch-size", type=str,
-                       help="Mask patch size for MAE as comma-separated values, e.g., '8,16,16' for 3D")
+                       help="Mask patch size for self-supervised training as comma-separated values, e.g., '8,16,16' for 3D")
     
     # Learning rate scheduler arguments
     parser.add_argument("--scheduler", type=str, 
@@ -1191,11 +1031,11 @@ def main():
 
     # Check if input is required
     if args.input is None:
-        # Check if we're using MAE pretraining with data_paths
-        if args.pretrain and mgr.dataset_config.get('data_paths'):
-            print("Using data_paths from config for MAE pretraining")
+        # Check if we're using self-supervised trainer with data_paths
+        if args.trainer == "self_supervised" and mgr.dataset_config.get('data_paths'):
+            print("Using data_paths from config for self-supervised pretraining")
         else:
-            raise ValueError("--input is required unless using --pretrain with data_paths in config")
+            raise ValueError("--input is required unless using self_supervised trainer with data_paths in config")
     else:
         if not Path(args.input).exists():
             raise ValueError(f"Input directory does not exist: {args.input}")
@@ -1204,7 +1044,31 @@ def main():
 
     update_config_from_args(mgr, args)
 
-    trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
+    # Select trainer based on --trainer argument
+    trainer_name = args.trainer.lower()
+    if trainer_name == "self_supervised":
+        # Configure self-supervised specific parameters
+        if not hasattr(mgr, 'dataset_config'):
+            mgr.dataset_config = {}
+        
+        mgr.dataset_config["mask_ratio"] = args.mask_ratio
+        
+        # Parse mask patch size if provided
+        if args.mask_patch_size:
+            try:
+                mask_patch_size = [int(x.strip()) for x in args.mask_patch_size.split(',')]
+                mgr.dataset_config["mask_patch_size"] = mask_patch_size
+            except ValueError:
+                raise ValueError(f"Invalid mask patch size format: {args.mask_patch_size}")
+        
+        from vesuvius.models.training.self_supervised_trainer import SelfSupervisedTrainer
+        trainer = SelfSupervisedTrainer(mgr=mgr, verbose=args.verbose)
+        print("Using Self-Supervised Trainer for self-supervised pretraining")
+    elif trainer_name == "base":
+        trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
+        print("Using Base Trainer for supervised training")
+    else:
+        raise ValueError(f"Unknown trainer: {trainer_name}. Available options: base, self_supervised")
 
     print("Starting training...")
     trainer.train()

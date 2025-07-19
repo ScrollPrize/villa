@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn as nn
 from torch.nn import MSELoss, SmoothL1Loss, L1Loss
-from .mae_loss import MaskedReconstructionLoss
+from .self_supervised_loss import MaskedReconstructionLoss
 
 
 def compute_per_channel_dice(input, target, epsilon=1e-5, weight=None):

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 class MaskedReconstructionLoss(nn.Module):
     """
-    Masked-region reconstruction loss for 2-D or 3-D MAE style pre-training.
+    Masked-region reconstruction loss for 2-D or 3-D self-supervised pre-training.
 
     Args
     ----

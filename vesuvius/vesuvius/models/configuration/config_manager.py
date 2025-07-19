@@ -31,12 +31,10 @@ class ConfigManager:
         self.model_config = config.get("model_config", {}) 
         self.dataset_config = config.get("dataset_config", {})
 
-        # Load targets from dataset_config or model_config if available
         self.targets = self.dataset_config.get("targets", {})
         if not self.targets and "targets" in self.model_config:
             self.targets = self.model_config.get("targets", {})
 
-        # Load inference parameters directly
         infer_config = config.get("inference_config", {})
         self.infer_checkpoint_path = infer_config.get("checkpoint_path", None)
         self.infer_patch_size = infer_config.get("patch_size", None)

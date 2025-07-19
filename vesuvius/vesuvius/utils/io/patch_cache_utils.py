@@ -316,7 +316,7 @@ def is_cache_valid(
             return False
     
     # Check additional configuration parameters that might be present
-    # This handles dataset-specific parameters like those from MAE dataset
+    # This handles dataset-specific parameters like those from self-supervised dataset
     additional_keys = [
         'dataset_type', 'normalization_scheme', 'use_bounding_box', 'nonzero_validated'
     ]

@@ -71,10 +71,10 @@ class NetworkFromConfig(nn.Module):
         self.in_channels = getattr(mgr, 'in_channels', 1)
         self.autoconfigure = mgr.autoconfigure
         
-        # Check if we're in MAE pretraining mode
-        self.mae_mode = mgr.model_config.get('mae_mode', False)
-        if self.mae_mode:
-            print("Initializing network in MAE pretraining mode")
+        # Check if we're in self-supervised pretraining mode
+        self.self_supervised_mode = mgr.model_config.get('self_supervised_mode', False)
+        if self.self_supervised_mode:
+            print("Initializing network in self-supervised pretraining mode")
 
         if hasattr(mgr, 'model_config') and mgr.model_config:
             model_config = mgr.model_config
@@ -310,9 +310,9 @@ class NetworkFromConfig(nn.Module):
         self.task_decoders = nn.ModuleDict()
         self.task_activations = nn.ModuleDict()
         
-        if self.mae_mode:
-            # In MAE mode, create a lightweight reconstruction head
-            self._build_mae_reconstruction_head()
+        if self.self_supervised_mode:
+            # In self-supervised mode, create a lightweight reconstruction head
+            self._build_self_supervised_reconstruction_head()
         else:
             # Standard supervised mode - create task-specific decoders
             for target_name, target_info in self.targets.items():
@@ -422,8 +422,8 @@ class NetworkFromConfig(nn.Module):
         # Check input channels and warn if mismatch
         self.check_input_channels(x)
 
-        if self.mae_mode:
-            return self.forward_mae(x)
+        if self.self_supervised_mode:
+            return self.forward_self_supervised(x)
         else:
             skips = self.shared_encoder(x)
             results = {}
@@ -435,8 +435,8 @@ class NetworkFromConfig(nn.Module):
                 results[task_name] = logits
             return results
     
-    def _build_mae_reconstruction_head(self):
-        """Build a lightweight reconstruction head for MAE pretraining.
+    def _build_self_supervised_reconstruction_head(self):
+        """Build a lightweight reconstruction head for self-supervised pretraining.
         
         Uses a simplified decoder with fewer stages for efficiency.
         """
@@ -445,14 +445,14 @@ class NetworkFromConfig(nn.Module):
         # The decoder needs configuration for all encoder stages - 1
         n_encoder_stages = len(self.shared_encoder.output_channels)
         
-        # Option to use fewer convolutions per stage for MAE (lighter decoder)
-        mae_n_conv_per_stage = model_config.get("mae_n_conv_per_stage", 1)
-        if isinstance(mae_n_conv_per_stage, int):
+        # Option to use fewer convolutions per stage for self-supervised training (lighter decoder)
+        self_supervised_n_conv_per_stage = model_config.get("self_supervised_n_conv_per_stage", 1)
+        if isinstance(self_supervised_n_conv_per_stage, int):
             # If it's an int, apply to all decoder stages
-            n_conv_per_stage = [mae_n_conv_per_stage] * (n_encoder_stages - 1)
+            n_conv_per_stage = [self_supervised_n_conv_per_stage] * (n_encoder_stages - 1)
         else:
             # If it's a list, make sure it has the right length
-            n_conv_per_stage = mae_n_conv_per_stage
+            n_conv_per_stage = self_supervised_n_conv_per_stage
             if len(n_conv_per_stage) < n_encoder_stages - 1:
                 # Pad with 1s if not enough values provided
                 n_conv_per_stage = n_conv_per_stage + [1] * (n_encoder_stages - 1 - len(n_conv_per_stage))
@@ -460,15 +460,15 @@ class NetworkFromConfig(nn.Module):
         # Create reconstruction decoder
         self.reconstruction_decoder = Decoder(
             encoder=self.shared_encoder,
-            basic_block=model_config.get("mae_decoder_block", "ConvBlock"),
+            basic_block=model_config.get("self_supervised_decoder_block", "ConvBlock"),
             num_classes=self.in_channels,  # Reconstruct input channels
             n_conv_per_stage=n_conv_per_stage,
             deep_supervision=False
         )
         
         # Option 2 (Alternative): Simple convolutional head
-        # This would be used if mae_use_simple_head is True in config
-        if model_config.get("mae_use_simple_head", False):
+        # This would be used if self_supervised_use_simple_head is True in config
+        if model_config.get("self_supervised_use_simple_head", False):
             # Get the number of channels from the encoder's bottleneck
             bottleneck_channels = self.shared_encoder.stages[-1].output_channels
             
@@ -494,10 +494,10 @@ class NetworkFromConfig(nn.Module):
                     nn.Conv3d(128, self.in_channels, kernel_size=1)
                 )
         
-        print(f"MAE reconstruction decoder created with {n_encoder_stages - 1} stages")
+        print(f"Self-supervised reconstruction decoder created with {n_encoder_stages - 1} stages")
     
-    def forward_mae(self, x):
-        """Forward pass for MAE pretraining.
+    def forward_self_supervised(self, x):
+        """Forward pass for self-supervised pretraining.
         
         Args:
             x: Masked input tensor
@@ -509,7 +509,7 @@ class NetworkFromConfig(nn.Module):
         skips = self.shared_encoder(x)
         
         # Reconstruct using the decoder
-        if hasattr(self, 'reconstruction_head') and self.mgr.model_config.get("mae_use_simple_head", False):
+        if hasattr(self, 'reconstruction_head') and self.mgr.model_config.get("self_supervised_use_simple_head", False):
             # Use simple head - only use bottleneck features
             reconstruction = self.reconstruction_head(skips[-1])
             # Upsample to original size if needed

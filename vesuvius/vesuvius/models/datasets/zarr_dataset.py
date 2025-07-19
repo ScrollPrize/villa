@@ -19,14 +19,14 @@ class ZarrDataset(BaseDataset):
     """
     
     
-    def _initialize_mae_volumes(self, images_dir):
-        """Initialize volumes for MAE pretraining - only loads images."""
+    def _initialize_self_supervised_volumes(self, images_dir):
+        """Initialize volumes for self-supervised pretraining - only loads images."""
         # Check if data_paths is specified in dataset_config
         data_paths = getattr(self.mgr, 'dataset_config', {}).get('data_paths', None)
         
         if data_paths:
             # Use specified paths directly
-            print(f"Using {len(data_paths)} specified data paths for MAE pretraining")
+            print(f"Using {len(data_paths)} specified data paths for self-supervised pretraining")
             image_paths = data_paths
         else:
             # Fall back to original behavior - scan images directory
@@ -39,10 +39,10 @@ class ZarrDataset(BaseDataset):
             if not image_dirs:
                 raise ValueError(f"No zarr directories found in {images_dir}")
             
-            print(f"Found {len(image_dirs)} image volumes for MAE pretraining")
+            print(f"Found {len(image_dirs)} image volumes for self-supervised pretraining")
             image_paths = [str(d) for d in image_dirs]
         
-        # For MAE, we create a fake "reconstruction" target
+        # For self-supervised training, we create a fake "reconstruction" target
         self.target_volumes = {'reconstruction': []}
         self.volume_ids = {'reconstruction': []}
         
@@ -98,13 +98,13 @@ class ZarrDataset(BaseDataset):
                         data_array = zarr.open(str(resolved_path), mode='r')
                         is_ome = False
                 
-                # For MAE, we only need the image data
+                # For self-supervised training, we only need the image data
                 # Use the image data as the "label" to satisfy BaseDataset's dimensionality check
                 volume_info = {
                     'data': {
                         'data': data_array,
                         'label': data_array,  # Use image data to satisfy BaseDataset
-                        'mask': None    # No masks for MAE
+                        'mask': None    # No masks for self-supervised training
                     },
                     'volume_id': image_id,
                     'zarr_path': image_path  # Store the original path for later use
@@ -116,12 +116,12 @@ class ZarrDataset(BaseDataset):
                 # Print information about the loaded array
                 path_type = "remote" if is_remote else "local"
                 zarr_type = "OME-Zarr" if is_ome else "regular zarr"
-                print(f"Loaded {image_id} for MAE with shape {data_array.shape} ({zarr_type}, {path_type} path)")
+                print(f"Loaded {image_id} for self-supervised training with shape {data_array.shape} ({zarr_type}, {path_type} path)")
                     
             except Exception as e:
                 raise ValueError(f"Error opening zarr path {image_path}: {e}")
         
-        print(f"Total volumes loaded for MAE pretraining: {len(self.target_volumes['reconstruction'])}")
+        print(f"Total volumes loaded for self-supervised pretraining: {len(self.target_volumes['reconstruction'])}")
     
     def _initialize_volumes(self):
         """
@@ -163,27 +163,27 @@ class ZarrDataset(BaseDataset):
             ├── image2_ink.zarr/
             └── ...
         """
-        # Check if we're in MAE mode - if so, only load images
-        mae_mode = getattr(self.mgr, 'model_config', {}).get('mae_mode', False)
-        if mae_mode:
-            # For MAE mode, check if data_paths is specified
+        # Check if we're in self-supervised mode - if so, only load images
+        self_supervised_mode = getattr(self.mgr, 'model_config', {}).get('self_supervised_mode', False)
+        if self_supervised_mode:
+            # For self-supervised mode, check if data_paths is specified
             data_paths = getattr(self.mgr, 'dataset_config', {}).get('data_paths', None)
             if data_paths:
                 # Use data_paths directly, no need for data_path
-                self._initialize_mae_volumes(None)
+                self._initialize_self_supervised_volumes(None)
                 return
             else:
                 # Fall back to traditional approach - need data_path
                 if not hasattr(self.mgr, 'data_path'):
-                    raise ValueError("ConfigManager must have 'data_path' attribute for Zarr dataset (or use 'data_paths' in dataset_config for MAE mode)")
+                    raise ValueError("ConfigManager must have 'data_path' attribute for Zarr dataset (or use 'data_paths' in dataset_config for self-supervised mode)")
                 data_path = Path(self.mgr.data_path)
                 if not data_path.exists():
                     raise ValueError(f"Data path does not exist: {data_path}")
                 images_dir = data_path / "images"
-                self._initialize_mae_volumes(images_dir)
+                self._initialize_self_supervised_volumes(images_dir)
                 return
         
-        # For non-MAE mode, we always need data_path
+        # For non-self-supervised mode, we always need data_path
         if not hasattr(self.mgr, 'data_path'):
             raise ValueError("ConfigManager must have 'data_path' attribute for Zarr dataset")
         

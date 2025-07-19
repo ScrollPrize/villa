@@ -176,8 +176,8 @@ class BaseDataset(Dataset):
             self.transforms = self._create_training_transforms()
             print("Training transforms initialized")
         
-        # Only run validation if not handled by subclass (e.g., MAEPretrainDataset)
-        if not getattr(self, '_mae_will_handle_validation', False):
+        # Only run validation if not handled by subclass (e.g., SelfSupervisedPretrainDataset)
+        if not getattr(self, '_self_supervised_will_handle_validation', False):
             self._get_valid_patches()
 
     def _initialize_volumes(self):
