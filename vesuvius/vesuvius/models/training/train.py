@@ -50,6 +50,8 @@ from vesuvius.models.training.auxiliary_tasks import (
     apply_auxiliary_tasks_from_config
 )
 
+from vesuvius.models.training.wandb_logging import save_train_val_filenames
+
 
 class BaseTrainer:
     def __init__(self,
@@ -231,112 +233,6 @@ class BaseTrainer:
                                     )
 
         return train_dataloader, val_dataloader, train_indices, val_indices
-    
-    def _save_train_val_filenames(self, train_dataset, val_dataset, train_indices, val_indices, ckpt_dir):
-        """
-        Save the filenames of the volumes used in training and validation sets along with patch locations.
-        
-        Parameters
-        ----------
-        train_dataset : Dataset
-            Training dataset
-        val_dataset : Dataset  
-            Validation dataset
-        train_indices : list
-            Indices used for training patches
-        val_indices : list
-            Indices used for validation patches
-        ckpt_dir : str
-            Directory to save the split information
-        """
-        import json
-        
-        # Extract volume information and patch locations from datasets
-        train_patches = []
-        val_patches = []
-        train_volumes = set()
-        val_volumes = set()
-        
-        # Get volume IDs and patch locations for training set
-        for idx in train_indices:
-            patch_info = train_dataset.valid_patches[idx]
-            vol_idx = patch_info["volume_index"]
-            position = patch_info["position"]  # [z, y, x] coordinates
-            
-            # Get volume ID if available
-            volume_id = f"volume_{vol_idx}"  # Default if no volume_ids
-            if hasattr(train_dataset, 'volume_ids'):
-                first_target = list(train_dataset.volume_ids.keys())[0]
-                if vol_idx < len(train_dataset.volume_ids[first_target]):
-                    volume_id = train_dataset.volume_ids[first_target][vol_idx]
-            
-            train_volumes.add(volume_id)
-            train_patches.append({
-                "patch_index": idx,
-                "volume_id": volume_id,
-                "volume_index": vol_idx,
-                "position": position  # [z, y, x] coordinates
-            })
-        
-        # Get volume IDs and patch locations for validation set
-        for idx in val_indices:
-            patch_info = val_dataset.valid_patches[idx]
-            vol_idx = patch_info["volume_index"]
-            position = patch_info["position"]  # [z, y, x] coordinates
-            
-            # Get volume ID if available
-            volume_id = f"volume_{vol_idx}"  # Default if no volume_ids
-            if hasattr(val_dataset, 'volume_ids'):
-                first_target = list(val_dataset.volume_ids.keys())[0]
-                if vol_idx < len(val_dataset.volume_ids[first_target]):
-                    volume_id = val_dataset.volume_ids[first_target][vol_idx]
-            
-            val_volumes.add(volume_id)
-            val_patches.append({
-                "patch_index": idx,
-                "volume_id": volume_id,
-                "volume_index": vol_idx,
-                "position": position  # [z, y, x] coordinates
-            })
-        
-        # Save split information with patch details
-        split_info = {
-            "metadata": {
-                "train_patch_count": len(train_indices),
-                "val_patch_count": len(val_indices),
-                "train_volume_count": len(train_volumes),
-                "val_volume_count": len(val_volumes),
-                "train_volumes": sorted(list(train_volumes)),
-                "val_volumes": sorted(list(val_volumes)),
-                "train_val_split": self.mgr.tr_val_split,
-                "patch_size": self.mgr.train_patch_size,
-                "timestamp": datetime.now().isoformat()
-            },
-            "train_patches": train_patches,
-            "val_patches": val_patches
-        }
-        
-        # Save to JSON file
-        split_file = os.path.join(ckpt_dir, "train_val_split.json")
-        with open(split_file, 'w') as f:
-            json.dump(split_info, f, indent=2)
-        
-        print(f"\nSaved train/validation split information to: {split_file}")
-        print(f"Training volumes ({len(train_volumes)}): {sorted(list(train_volumes))}")
-        print(f"Validation volumes ({len(val_volumes)}): {sorted(list(val_volumes))}")
-        print(f"Training patches: {len(train_indices)} with locations saved")
-        print(f"Validation patches: {len(val_indices)} with locations saved")
-        
-        # Log to wandb if enabled
-        if self.mgr.wandb_project:
-            import wandb
-            wandb.log({
-                "train_volumes": len(train_volumes),
-                "val_volumes": len(val_volumes),
-                "train_patches": len(train_indices),
-                "val_patches": len(val_indices),
-                "train_val_split_ratio": self.mgr.tr_val_split
-            })
 
     def train(self):
         # Check for S3 paths and set up multiprocessing if needed
@@ -379,75 +275,18 @@ class BaseTrainer:
         scaler = self._get_scaler(self.device.type, use_amp=use_amp)
         train_dataloader, val_dataloader, train_indices, val_indices = self._configure_dataloaders(train_dataset,
                                                                                                    val_dataset)
-
-        # Initialise wandb if wandb_project is set
         if self.mgr.wandb_project:
             import wandb  # lazy import in case it's not available
-            
-            # Prepare config manager parameters
+            train_val_splits = save_train_val_filenames(train_dataset, val_dataset, train_indices, val_indices)
             mgr_config = self.mgr.convert_to_dict()
-            
-            # Initialize wandb with config manager parameters
+            mgr_config.update({'train_val_splits': train_val_splits})
+
             wandb.init(
                 entity=self.mgr.wandb_entity,
                 project=self.mgr.wandb_project,
                 group=self.mgr.model_name,
                 config=mgr_config
             )
-            
-            # Log the final model configuration after model is built
-            if hasattr(model, 'final_config'):
-                wandb.config.update({"model_final_config": model.final_config})
-                
-            # Log model architecture summary
-            total_params = sum(p.numel() for p in model.parameters())
-            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            wandb.config.update({
-                "model_total_parameters": total_params,
-                "model_trainable_parameters": trainable_params,
-                "model_architecture": str(model.__class__.__name__)
-            })
-            
-            # Save configs as artifacts for better tracking
-            artifact = wandb.Artifact(
-                name=f"{self.mgr.model_name}_configs",
-                type="model_configs",
-                description="Model and training configurations"
-            )
-            
-            # Save config manager parameters as JSON
-            import json
-            with artifact.new_file("config_manager.json") as f:
-                json.dump(mgr_config, f, indent=2)
-                
-            # Save final model config if available
-            if hasattr(model, 'final_config'):
-                with artifact.new_file("model_final_config.json") as f:
-                    json.dump(model.final_config, f, indent=2)
-                    
-            # Log the artifact
-            wandb.log_artifact(artifact)
-            
-            # Create a summary table with key parameters
-            summary_table = wandb.Table(columns=["Parameter", "Value"])
-            summary_table.add_data("Model Name", self.mgr.model_name)
-            summary_table.add_data("Model Architecture", str(model.__class__.__name__))
-            summary_table.add_data("Total Parameters", f"{total_params:,}")
-            summary_table.add_data("Trainable Parameters", f"{trainable_params:,}")
-            summary_table.add_data("Batch Size", self.mgr.train_batch_size)
-            summary_table.add_data("Patch Size", str(self.mgr.train_patch_size))
-            summary_table.add_data("Learning Rate", self.mgr.initial_lr)
-            summary_table.add_data("Optimizer", optimizer.__class__.__name__)
-            summary_table.add_data("Scheduler", scheduler.__class__.__name__)
-            summary_table.add_data("Max Epochs", self.mgr.max_epoch)
-            summary_table.add_data("Train/Val Split", self.mgr.tr_val_split)
-            summary_table.add_data("Gradient Accumulation", grad_accumulate_n)
-            summary_table.add_data("Mixed Precision", "Enabled" if use_amp else "Disabled")
-            summary_table.add_data("Device", str(self.device))
-            summary_table.add_data("Number of Targets", len(self.mgr.targets))
-            summary_table.add_data("Targets", ", ".join(self.mgr.targets.keys()))
-            
-            wandb.log({"training_configuration": summary_table})
 
         start_epoch = 0
 
@@ -469,7 +308,7 @@ class BaseTrainer:
         os.makedirs(ckpt_dir, exist_ok=True)
         
         # Save train/validation filenames
-        self._save_train_val_filenames(train_dataset, val_dataset, train_indices, val_indices, ckpt_dir)
+
 
         if hasattr(self.mgr, 'checkpoint_path') and self.mgr.checkpoint_path:
             model, optimizer, scheduler, start_epoch, checkpoint_loaded = load_checkpoint(
@@ -583,15 +422,6 @@ class BaseTrainer:
 
                     # Scale loss by accumulation steps to maintain same effective batch size
                     total_loss = total_loss / grad_accumulate_n
-
-                if self.mgr.wandb_project:
-                    wandb.log({
-                        **{
-                            f"loss_{t_name}": epoch_losses[t_name][-1]
-                            for t_name in self.mgr.targets
-                        },
-                        "loss_total": total_loss.detach().cpu().item()
-                    })
 
                 # backward
                 scaler.scale(total_loss).backward()
@@ -766,10 +596,6 @@ class BaseTrainer:
                                         save_path=debug_img_path
                                     )
                                     debug_gif_history.append((epoch, debug_img_path))
-                                    
-                                    # Log debug GIF to wandb
-                                    if self.mgr.wandb_project:
-                                        wandb.log({"debug_gif": wandb.Image(debug_img_path)})
 
                             loss_str = " | ".join([f"{t}: {np.mean(val_losses[t]):.4f}"
                                                    for t in self.mgr.targets if len(val_losses[t]) > 0])
@@ -796,9 +622,15 @@ class BaseTrainer:
 
                     # Log validation losses to wandb
                     if self.mgr.wandb_project:
-                        wandb.log(val_loss_dict)
-
-
+                        wandb.log({
+                            **{
+                                f"loss_{t_name}": epoch_losses[t_name][-1]
+                                for t_name in self.mgr.targets
+                            },
+                            "loss_total": total_loss.detach().cpu().item(),
+                            "val_loss_total": avg_val_loss.detach().cpu().item(),
+                            "debug_gif": wandb.Video(debug_img_path)
+                        })
 
                     checkpoint_history, best_checkpoints = manage_checkpoint_history(
                         checkpoint_history=checkpoint_history,
