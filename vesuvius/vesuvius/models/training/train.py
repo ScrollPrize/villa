@@ -51,6 +51,22 @@ from vesuvius.models.training.auxiliary_tasks import (
 )
 
 
+def convert_numpy_to_list(obj):
+    """Convert numpy arrays to lists recursively for JSON serialization"""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: convert_numpy_to_list(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_numpy_to_list(v) for v in obj]
+    elif isinstance(obj, (np.integer, np.floating)):
+        return obj.item()
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    else:
+        return obj
+
+
 class BaseTrainer:
     def __init__(self,
                  mgr=None,
@@ -184,7 +200,7 @@ class BaseTrainer:
         # for cuda, we can use a grad scaler for mixed precision training if amp is enabled
         # for mps or cpu, or when amp is disabled, we create a dummy scaler that does nothing
         if device_type == 'cuda' and use_amp:
-            return torch.cuda.amp.GradScaler()
+            return torch.amp.GradScaler('cuda')
         else:
             class DummyScaler:
                 def scale(self, loss):
@@ -327,16 +343,13 @@ class BaseTrainer:
         print(f"Training patches: {len(train_indices)} with locations saved")
         print(f"Validation patches: {len(val_indices)} with locations saved")
         
-        # Log to wandb if enabled
-        if self.mgr.wandb_project:
-            import wandb
-            wandb.log({
-                "train_volumes": len(train_volumes),
-                "val_volumes": len(val_volumes),
-                "train_patches": len(train_indices),
-                "val_patches": len(val_indices),
-                "train_val_split_ratio": self.mgr.tr_val_split
-            })
+        # Store split information for later use in configuration table
+        self._split_info = {
+            "train_volumes": len(train_volumes),
+            "val_volumes": len(val_volumes),
+            "train_patches": len(train_indices),
+            "val_patches": len(val_indices)
+        }
 
     def train(self):
         # Check for S3 paths and set up multiprocessing if needed
@@ -397,7 +410,7 @@ class BaseTrainer:
             
             # Log the final model configuration after model is built
             if hasattr(model, 'final_config'):
-                wandb.config.update({"model_final_config": model.final_config})
+                wandb.config.update({"model_final_config": convert_numpy_to_list(model.final_config)})
                 
             # Log model architecture summary
             total_params = sum(p.numel() for p in model.parameters())
@@ -418,36 +431,15 @@ class BaseTrainer:
             # Save config manager parameters as JSON
             import json
             with artifact.new_file("config_manager.json") as f:
-                json.dump(mgr_config, f, indent=2)
+                json.dump(convert_numpy_to_list(mgr_config), f, indent=2)
                 
             # Save final model config if available
             if hasattr(model, 'final_config'):
                 with artifact.new_file("model_final_config.json") as f:
-                    json.dump(model.final_config, f, indent=2)
+                    json.dump(convert_numpy_to_list(model.final_config), f, indent=2)
                     
             # Log the artifact
             wandb.log_artifact(artifact)
-            
-            # Create a summary table with key parameters
-            summary_table = wandb.Table(columns=["Parameter", "Value"])
-            summary_table.add_data("Model Name", self.mgr.model_name)
-            summary_table.add_data("Model Architecture", str(model.__class__.__name__))
-            summary_table.add_data("Total Parameters", f"{total_params:,}")
-            summary_table.add_data("Trainable Parameters", f"{trainable_params:,}")
-            summary_table.add_data("Batch Size", self.mgr.train_batch_size)
-            summary_table.add_data("Patch Size", str(self.mgr.train_patch_size))
-            summary_table.add_data("Learning Rate", self.mgr.initial_lr)
-            summary_table.add_data("Optimizer", optimizer.__class__.__name__)
-            summary_table.add_data("Scheduler", scheduler.__class__.__name__)
-            summary_table.add_data("Max Epochs", self.mgr.max_epoch)
-            summary_table.add_data("Train/Val Split", self.mgr.tr_val_split)
-            summary_table.add_data("Gradient Accumulation", grad_accumulate_n)
-            summary_table.add_data("Mixed Precision", "Enabled" if use_amp else "Disabled")
-            summary_table.add_data("Device", str(self.device))
-            summary_table.add_data("Number of Targets", len(self.mgr.targets))
-            summary_table.add_data("Targets", ", ".join(self.mgr.targets.keys()))
-            
-            wandb.log({"training_configuration": summary_table})
 
         start_epoch = 0
 
@@ -489,6 +481,47 @@ class BaseTrainer:
 
         global_step = 0
         grad_accumulate_n = self.mgr.gradient_accumulation
+
+        # Log configuration table to wandb once at the beginning
+        if self.mgr.wandb_project:
+            summary_table = wandb.Table(columns=["Parameter", "Value"])
+            
+            # Model configuration
+            summary_table.add_data("Model Name", self.mgr.model_name)
+            summary_table.add_data("Model Architecture", str(model.__class__.__name__))
+            summary_table.add_data("Total Parameters", f"{total_params:,}")
+            summary_table.add_data("Trainable Parameters", f"{trainable_params:,}")
+            
+            # Training configuration
+            summary_table.add_data("Batch Size", str(self.mgr.train_batch_size))
+            summary_table.add_data("Patch Size", str(self.mgr.train_patch_size))
+            summary_table.add_data("Learning Rate", str(self.mgr.initial_lr))
+            summary_table.add_data("Optimizer", optimizer.__class__.__name__)
+            summary_table.add_data("Scheduler", scheduler.__class__.__name__)
+            summary_table.add_data("Max Epochs", str(self.mgr.max_epoch))
+            summary_table.add_data("Train/Val Split", str(self.mgr.tr_val_split))
+            summary_table.add_data("Gradient Accumulation", str(grad_accumulate_n))
+            summary_table.add_data("Mixed Precision", "Enabled" if use_amp else "Disabled")
+            summary_table.add_data("Device", str(self.device))
+            
+            # Target configuration
+            summary_table.add_data("Number of Targets", str(len(self.mgr.targets)))
+            summary_table.add_data("Targets", ", ".join(self.mgr.targets.keys()))
+            
+            # Dataset configuration
+            if hasattr(self, '_split_info'):
+                summary_table.add_data("Train Volumes", str(self._split_info['train_volumes']))
+                summary_table.add_data("Val Volumes", str(self._split_info['val_volumes']))
+                summary_table.add_data("Train Patches", str(self._split_info['train_patches']))
+                summary_table.add_data("Val Patches", str(self._split_info['val_patches']))
+            
+            # Add any additional config manager parameters
+            if hasattr(self.mgr, 'data_root'):
+                summary_table.add_data("Data Root", str(self.mgr.data_root))
+            if hasattr(self.mgr, 'ckpt_out_base'):
+                summary_table.add_data("Checkpoint Directory", str(self.mgr.ckpt_out_base))
+            
+            wandb.log({"training_configuration": summary_table})
 
         # ---- training! ----- #
         for epoch in range(start_epoch, self.mgr.max_epoch):
@@ -756,7 +789,7 @@ class BaseTrainer:
                                         outputs_dict_first[t_name] = p_tensor[b_idx: b_idx + 1]
 
                                     debug_img_path = f"{ckpt_dir}/{self.mgr.model_name}_debug_epoch{epoch}.gif"
-                                    save_debug(
+                                    frames_array = save_debug(
                                         input_volume=inputs_first,
                                         targets_dict=targets_dict_first,
                                         outputs_dict=outputs_dict_first,
@@ -767,9 +800,8 @@ class BaseTrainer:
                                     )
                                     debug_gif_history.append((epoch, debug_img_path))
                                     
-                                    # Log debug GIF to wandb
-                                    if self.mgr.wandb_project:
-                                        wandb.log({"debug_gif": wandb.Image(debug_img_path)})
+                                    if self.mgr.wandb_project and frames_array is not None:
+                                        wandb.log({"debug_gif": wandb.Video(frames_array, format='mp4')})
 
                             loss_str = " | ".join([f"{t}: {np.mean(val_losses[t]):.4f}"
                                                    for t in self.mgr.targets if len(val_losses[t]) > 0])
