@@ -329,47 +329,6 @@ class BaseTrainer:
         global_step = 0
         grad_accumulate_n = self.mgr.gradient_accumulation
 
-        # Log configuration table to wandb once at the beginning
-        if self.mgr.wandb_project:
-            summary_table = wandb.Table(columns=["Parameter", "Value"])
-            
-            # Model configuration
-            summary_table.add_data("Model Name", self.mgr.model_name)
-            summary_table.add_data("Model Architecture", str(model.__class__.__name__))
-            summary_table.add_data("Total Parameters", f"{total_params:,}")
-            summary_table.add_data("Trainable Parameters", f"{trainable_params:,}")
-            
-            # Training configuration
-            summary_table.add_data("Batch Size", str(self.mgr.train_batch_size))
-            summary_table.add_data("Patch Size", str(self.mgr.train_patch_size))
-            summary_table.add_data("Learning Rate", str(self.mgr.initial_lr))
-            summary_table.add_data("Optimizer", optimizer.__class__.__name__)
-            summary_table.add_data("Scheduler", scheduler.__class__.__name__)
-            summary_table.add_data("Max Epochs", str(self.mgr.max_epoch))
-            summary_table.add_data("Train/Val Split", str(self.mgr.tr_val_split))
-            summary_table.add_data("Gradient Accumulation", str(grad_accumulate_n))
-            summary_table.add_data("Mixed Precision", "Enabled" if use_amp else "Disabled")
-            summary_table.add_data("Device", str(self.device))
-            
-            # Target configuration
-            summary_table.add_data("Number of Targets", str(len(self.mgr.targets)))
-            summary_table.add_data("Targets", ", ".join(self.mgr.targets.keys()))
-            
-            # Dataset configuration
-            if hasattr(self, '_split_info'):
-                summary_table.add_data("Train Volumes", str(self._split_info['train_volumes']))
-                summary_table.add_data("Val Volumes", str(self._split_info['val_volumes']))
-                summary_table.add_data("Train Patches", str(self._split_info['train_patches']))
-                summary_table.add_data("Val Patches", str(self._split_info['val_patches']))
-            
-            # Add any additional config manager parameters
-            if hasattr(self.mgr, 'data_root'):
-                summary_table.add_data("Data Root", str(self.mgr.data_root))
-            if hasattr(self.mgr, 'ckpt_out_base'):
-                summary_table.add_data("Checkpoint Directory", str(self.mgr.ckpt_out_base))
-            
-            wandb.log({"training_configuration": summary_table})
-
         # ---- training! ----- #
         for epoch in range(start_epoch, self.mgr.max_epoch):
             model.train()
@@ -531,7 +490,7 @@ class BaseTrainer:
                                'max_val_steps_per_epoch') and self.mgr.max_val_steps_per_epoch and self.mgr.max_val_steps_per_epoch > 0:
                         num_val_iters = min(len(val_indices), self.mgr.max_val_steps_per_epoch)
                     else:
-                        num_val_iters = len(val_indices)  # Use all data
+                        num_val_iters = len(val_indices)
 
                     val_pbar = tqdm(range(num_val_iters), desc=f'Validation {epoch + 1}')
 
@@ -647,6 +606,26 @@ class BaseTrainer:
                             if ignore_masks is not None:
                                 del ignore_masks
 
+                            # Log validation losses to wandb
+                            if self.mgr.wandb_project:
+                                wandb_log_dict = {
+                                    **{
+                                        f"train_loss_{t_name}": np.mean(epoch_losses[t_name])
+                                        for t_name in self.mgr.targets
+                                    },
+                                    **val_loss_dict,
+                                    "epoch": epoch
+                                }
+
+                                avg_train_loss = np.mean(
+                                    [np.mean(losses) for losses in epoch_losses.values() if losses])
+                                wandb_log_dict["train_loss_total"] = avg_train_loss
+
+                                if 'frames_array' in locals() and frames_array is not None:
+                                    wandb_log_dict["debug_gif"] = wandb.Video(frames_array)
+
+                                wandb.log(wandb_log_dict)
+
                     print(f"\n[Validation] Epoch {epoch + 1} summary:")
                     total_val_loss = 0.0
                     val_loss_dict = {}
@@ -661,17 +640,7 @@ class BaseTrainer:
                     val_loss_history[epoch] = avg_val_loss
                     val_loss_dict["val_loss_total"] = avg_val_loss
 
-                    # Log validation losses to wandb
-                    if self.mgr.wandb_project:
-                        wandb.log({
-                            **{
-                                f"loss_{t_name}": epoch_losses[t_name][-1]
-                                for t_name in self.mgr.targets
-                            },
-                            "loss_total": total_loss.detach().cpu().item(),
-                            "val_loss_total": avg_val_loss.detach().cpu().item(),
-                            "debug_gif": wandb.Video(debug_img_path)
-                        })
+
 
                     checkpoint_history, best_checkpoints = manage_checkpoint_history(
                         checkpoint_history=checkpoint_history,
