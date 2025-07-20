@@ -5,12 +5,12 @@ import shutil
 from pathlib import Path
 
 # Set paths
-base_dir = Path("/mnt/raid_nvme/datasets/nnUNet_raw/Dataset_071_320_patches")
+base_dir = Path("/mnt/raid_nvme/datasets/nnUNet_raw/Dataset059")
 images_dir = base_dir / "images"
 labels_dir = base_dir / "labels"
 
 # Create output directories
-output_base = base_dir.parent / "Dataset_071_320_patches_10percent_sample"
+output_base = base_dir.parent / "Dataset_059_10_percent_sample"
 output_images = output_base / "images"
 output_labels = output_base / "labels"
 
