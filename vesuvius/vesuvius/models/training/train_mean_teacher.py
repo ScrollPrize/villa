@@ -124,17 +124,58 @@ class MeanTeacherTrainer(BaseTrainer):
             val_dataset = train_dataset
             
         dataset_size = len(train_dataset)
-        indices = list(range(dataset_size))
-        np.random.shuffle(indices)
         
-        # Split indices: test_ratio for test, labeled_ratio of remaining for labeled, rest for unlabeled
-        test_split = int(np.floor(self.test_ratio * dataset_size))
-        test_indices = indices[:test_split]
-        remaining_indices = indices[test_split:]
+        # Automatically detect which samples have labels
+        print("\nDetecting labeled vs unlabeled samples...")
+        labeled_indices = []
+        unlabeled_indices = []
         
-        labeled_split = int(np.floor(self.labeled_ratio * len(remaining_indices)))
-        labeled_indices = remaining_indices[:labeled_split]
-        unlabeled_indices = remaining_indices[labeled_split:]
+        # Access the dataset's patch information directly
+        for idx, patch_info in enumerate(tqdm(train_dataset.valid_patches, desc="Checking patches for labels")):
+            vol_idx = patch_info["volume_index"]
+            
+            # Extract patch coordinates
+            if train_dataset.is_2d_dataset:
+                y, x = patch_info["y"], patch_info["x"]
+                dy, dx = patch_info["dy"], patch_info["dx"]
+            else:
+                z, y, x = patch_info["z"], patch_info["y"], patch_info["x"]
+                dz, dy, dx = patch_info["dz"], patch_info["dy"], patch_info["dx"]
+            
+            has_label = False
+            
+            # Check each target's label array for this specific patch region
+            for target_name in self.mgr.targets:
+                if target_name in train_dataset.target_volumes:
+                    volume_info = train_dataset.target_volumes[target_name][vol_idx]
+                    label_array = volume_info['data']['label']
+                    
+                    # Extract the patch region from label array
+                    if train_dataset.is_2d_dataset:
+                        label_patch = label_array[y:y+dy, x:x+dx]
+                    else:
+                        label_patch = label_array[z:z+dz, y:y+dy, x:x+dx]
+                    
+                    # Check if this patch region has any non-zero values
+                    if np.any(label_patch != 0):
+                        has_label = True
+                        break
+            
+            if has_label:
+                labeled_indices.append(idx)
+            else:
+                unlabeled_indices.append(idx)
+
+
+        
+        # Shuffle indices
+        np.random.shuffle(labeled_indices)
+        np.random.shuffle(unlabeled_indices)
+        
+        # Split off test set from labeled data
+        test_split = int(np.floor(self.test_ratio * len(labeled_indices)))
+        test_indices = labeled_indices[:test_split]
+        labeled_indices = labeled_indices[test_split:]
         
         print(f"\nDataset split:")
         print(f"  Total samples: {dataset_size}")
@@ -145,8 +186,13 @@ class MeanTeacherTrainer(BaseTrainer):
         batch_size = self.mgr.train_batch_size
         
         # Calculate labeled and unlabeled samples per batch
-        labeled_bs = max(1, batch_size // (1 + self.unlabeled_batch_ratio))
-        unlabeled_bs = batch_size - labeled_bs
+        # If we have no unlabeled data, use all labeled
+        if len(unlabeled_indices) == 0:
+            labeled_bs = batch_size
+            unlabeled_bs = 0
+        else:
+            labeled_bs = max(1, batch_size // (1 + self.unlabeled_batch_ratio))
+            unlabeled_bs = batch_size - labeled_bs
         
         print(f"\nBatch composition:")
         print(f"  Labeled samples per batch: {labeled_bs}")
@@ -338,8 +384,7 @@ class MeanTeacherTrainer(BaseTrainer):
                 ema_inputs = unlabeled_inputs + noise
                 
                 optimizer.zero_grad()
-                
-                # Setup autocast context
+
                 if use_amp:
                     context = torch.amp.autocast('cuda') if self.device.type == 'cuda' else nullcontext()
                 else:
@@ -375,7 +420,7 @@ class MeanTeacherTrainer(BaseTrainer):
                         epoch_losses[t_name].append(task_total_loss.detach().cpu().item())
                         
                     # Compute consistency loss on unlabeled data
-                    consistency_weight = self.get_current_consistency_weight(epoch)
+                    consistency_weight = self.get_current_consistency_weight(global_step // 150)
                     
                     if consistency_weight > 0 and unlabeled_inputs.shape[0] > 0:
                         # Get predictions for consistency
@@ -383,16 +428,13 @@ class MeanTeacherTrainer(BaseTrainer):
                             student_pred_unlabeled = outputs[t_name][self.labeled_bs:]
                             teacher_pred_unlabeled = ema_outputs[t_name]
                             
-                            # Apply activation to get probabilities
+                            # Apply activation to get probabilities for uncertainty computation
                             activation = self.mgr.targets[t_name].get("activation", "sigmoid")
                             if activation == "sigmoid":
-                                student_prob = torch.sigmoid(student_pred_unlabeled)
                                 teacher_prob = torch.sigmoid(teacher_pred_unlabeled)
                             elif activation == "softmax":
-                                student_prob = torch.softmax(student_pred_unlabeled, dim=1)
                                 teacher_prob = torch.softmax(teacher_pred_unlabeled, dim=1)
                             else:
-                                student_prob = student_pred_unlabeled
                                 teacher_prob = teacher_pred_unlabeled
                                 
                             # Compute uncertainty from teacher predictions
@@ -404,8 +446,20 @@ class MeanTeacherTrainer(BaseTrainer):
                             # Create mask for low-uncertainty regions
                             mask = (uncertainty < threshold).float()
                             
-                            # Compute consistency loss (MSE between predictions)
-                            consistency_dist = F.mse_loss(student_prob, teacher_prob.detach(), reduction='none')
+                            # Compute consistency loss using softmax_mse_loss approach
+                            # Apply softmax/sigmoid to logits and compute MSE
+                            if activation == "sigmoid":
+                                student_softmax = torch.sigmoid(student_pred_unlabeled)
+                                teacher_softmax = torch.sigmoid(teacher_pred_unlabeled)
+                            elif activation == "softmax":
+                                student_softmax = torch.softmax(student_pred_unlabeled, dim=1)
+                                teacher_softmax = torch.softmax(teacher_pred_unlabeled, dim=1)
+                            else:
+                                student_softmax = student_pred_unlabeled
+                                teacher_softmax = teacher_pred_unlabeled
+                            
+                            # Compute MSE loss (matching softmax_mse_loss implementation)
+                            consistency_dist = (student_softmax - teacher_softmax.detach()) ** 2
                             
                             # Apply uncertainty mask
                             if consistency_dist.dim() > mask.dim():
@@ -415,7 +469,7 @@ class MeanTeacherTrainer(BaseTrainer):
                             masked_consistency = mask * consistency_dist
                             
                             # Average over spatial dimensions
-                            consistency_loss = masked_consistency.sum() / (mask.sum() + 1e-16)
+                            consistency_loss = masked_consistency.sum() / (2 * mask.sum() + 1e-16)
                             
                             # Add to total loss
                             total_loss += consistency_weight * consistency_loss
