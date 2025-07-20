@@ -6,12 +6,12 @@ Based on: https://github.com/HiLab-git/SSL4MIS/blob/master/code/train_uncertaint
 # Mean Teacher Training Constants
 LABELED_RATIO = 0.1  # 10% of data is labeled
 TEST_RATIO = 0.1  # 10% of data for test set
-UNLABELED_BATCH_RATIO = 1  # 1:1 ratio of unlabeled to labeled samples per batch
+UNLABELED_BATCH_RATIO = 0.1  # 1:1 ratio of unlabeled to labeled samples per batch
 
 # EMA and Consistency Parameters
 EMA_DECAY = 0.999  # Exponential moving average decay for teacher model
 CONSISTENCY_WEIGHT = 1.0  # Weight for consistency loss
-CONSISTENCY_RAMPUP = 40  # Number of epochs for consistency weight rampup
+CONSISTENCY_RAMPUP = 200  # Number of epochs for consistency weight rampup
 
 # Uncertainty Parameters
 UNCERTAINTY_THRESHOLD_BASE = 0.75  # Base threshold for uncertainty filtering
@@ -30,8 +30,6 @@ from torch.utils.data import DataLoader, SubsetRandomSampler, Sampler
 from vesuvius.models.datasets.samplers import TwoStreamBatchSampler
 from .train import BaseTrainer
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
-
-
 
 
 class MeanTeacherTrainer(BaseTrainer):
@@ -124,23 +122,26 @@ class MeanTeacherTrainer(BaseTrainer):
             val_dataset = train_dataset
             
         dataset_size = len(train_dataset)
-        
-        # Automatically detect which samples have labels
+
         print("\nDetecting labeled vs unlabeled samples...")
         labeled_indices = []
         unlabeled_indices = []
-        
-        # Access the dataset's patch information directly
+
         for idx, patch_info in enumerate(tqdm(train_dataset.valid_patches, desc="Checking patches for labels")):
             vol_idx = patch_info["volume_index"]
-            
-            # Extract patch coordinates
+
             if train_dataset.is_2d_dataset:
-                y, x = patch_info["y"], patch_info["x"]
-                dy, dx = patch_info["dy"], patch_info["dx"]
+                _, y, x = patch_info["position"]  # [dummy_z, y, x]
+                if len(train_dataset.patch_size) >= 2:
+                    dy, dx = train_dataset.patch_size[-2:]
+                else:
+                    raise ValueError(f"patch_size {train_dataset.patch_size} insufficient for 2D data")
             else:
-                z, y, x = patch_info["z"], patch_info["y"], patch_info["x"]
-                dz, dy, dx = patch_info["dz"], patch_info["dy"], patch_info["dx"]
+                z, y, x = patch_info["position"]  # [z, y, x]
+                if len(train_dataset.patch_size) >= 3:
+                    dz, dy, dx = train_dataset.patch_size[:3]
+                else:
+                    raise ValueError(f"patch_size {train_dataset.patch_size} insufficient for 3D data - need at least 3 dimensions")
             
             has_label = False
             
@@ -184,9 +185,7 @@ class MeanTeacherTrainer(BaseTrainer):
         print(f"  Unlabeled samples: {len(unlabeled_indices)} ({len(unlabeled_indices)/dataset_size*100:.1f}%)")
         
         batch_size = self.mgr.train_batch_size
-        
-        # Calculate labeled and unlabeled samples per batch
-        # If we have no unlabeled data, use all labeled
+
         if len(unlabeled_indices) == 0:
             labeled_bs = batch_size
             unlabeled_bs = 0
