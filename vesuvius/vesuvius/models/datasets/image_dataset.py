@@ -344,46 +344,60 @@ class ImageDataset(BaseDataset):
         else:
             print("No labels directory, will discover unlabeled images")
         
-        # Group files by target and image idenimageier
+        # Group files by target and image identifier
         targets_data = defaultdict(lambda: defaultdict(dict))
         
         # Track files to convert for progress bar
         files_to_process = []
         
-        # If no labels but unlabeled data is allowed, discover images directly
-        if not label_files and self.allow_unlabeled_data:
-            print("No label files found, discovering unlabeled images...")
-            image_files = []
-            for ext in supported_extensions:
-                found_files = list(images_dir.glob(f"*{ext}"))
-                image_files.extend(found_files)
+        # FIRST: Discover ALL images in the images directory
+        print("Discovering all images in the images directory...")
+        all_image_files = []
+        for ext in supported_extensions:
+            found_files = list(images_dir.glob(f"*{ext}"))
+            all_image_files.extend(found_files)
+        
+        if not all_image_files:
+            raise ValueError(f"No image files found in {images_dir}")
+        
+        print(f"Found {len(all_image_files)} total images")
+        
+        # Create a set to track which images have labels
+        labeled_image_ids = set()
+        
+        # Process label files to identify which images are labeled
+        if label_files:
+            print(f"Processing {len(label_files)} label files to identify labeled images...")
+            for label_file in label_files:
+                stem = label_file.stem
+                if '_' not in stem:
+                    continue
+                parts = stem.rsplit('_', 1)
+                if len(parts) != 2:
+                    continue
+                image_id, target = parts
+                if target in configured_targets:
+                    labeled_image_ids.add(image_id)
+        
+        print(f"Found {len(labeled_image_ids)} images with labels")
+        
+        # Track unlabeled images separately for now
+        unlabeled_images = []
+        
+        # Process all images, identifying unlabeled ones
+        unlabeled_count = 0
+        for image_file in all_image_files:
+            stem = image_file.stem
             
-            if not image_files:
-                raise ValueError(f"No image files found in {images_dir}")
+            # Check if this image has any labels
+            has_label = stem in labeled_image_ids
             
-            print(f"Found {len(image_files)} unlabeled images")
-            
-            # Process each image as unlabeled for all configured targets
-            for image_file in image_files:
-                stem = image_file.stem
-                
-                # Check if needs conversion to zarr
-                array_name = stem
-                if self._needs_update(image_file, images_group, array_name):
-                    files_to_process.append((image_file, images_group, array_name, 'image'))
-                
-                # Create entries for each configured target with None labels
-                for target in configured_targets:
-                    # Skip auxiliary tasks
-                    if self.mgr.targets.get(target, {}).get('auxiliary_task', False):
-                        continue
-                    
-                    targets_data[target][stem] = {
-                        'data': array_name,  # Will be loaded from zarr later
-                        'label': None,  # None indicates unlabeled
-                        'mask': None
-                    }
-            
+            if not has_label and self.allow_unlabeled_data:
+                # This is an unlabeled image
+                unlabeled_count += 1
+                unlabeled_images.append((stem, image_file))
+        
+        print(f"Found {unlabeled_count} unlabeled images that will be added to the dataset")
         print(f"DEBUG: Processing {len(label_files)} label files...")
         # First pass: identify all files that need processing
         for idx, label_file in enumerate(label_files):
@@ -444,6 +458,16 @@ class ImageDataset(BaseDataset):
             
             files_to_process.append((target, image_id, image_file, label_file, mask_file))
         
+        # Add unlabeled images to files_to_process
+        print(f"Adding {len(unlabeled_images)} unlabeled images to processing queue...")
+        for image_id, image_file in unlabeled_images:
+            # Add an entry for each configured target with None for label and mask
+            for target in configured_targets:
+                # Skip auxiliary tasks
+                if self.mgr.targets.get(target, {}).get('auxiliary_task', False):
+                    continue
+                files_to_process.append((target, image_id, image_file, None, None))
+        
         # Collect all conversion tasks that need to be done
         conversion_tasks = []
         array_info = {}  # Track which arrays go where
@@ -483,9 +507,9 @@ class ImageDataset(BaseDataset):
                 arrays_to_create.append((images_group, image_array_name, img_shape))
                 conversion_tasks.append((image_file, images_zarr_path, image_array_name, self.patch_size, True))
             
-            # Label conversion
-            label_array_name = f"{image_id}_{target}"
-            if label_array_name not in labels_group or self._needs_update(label_file, labels_group, label_array_name):
+            # Label conversion (only if label file exists)
+            label_array_name = f"{image_id}_{target}" if label_file else None
+            if label_file and (label_array_name not in labels_group or self._needs_update(label_file, labels_group, label_array_name)):
                 # Read shape for pre-creation
                 if str(label_file).lower().endswith(('.tif', '.tiff')):
                     label_shape = tifffile.imread(str(label_file)).shape
@@ -563,36 +587,38 @@ class ImageDataset(BaseDataset):
         # Now load all arrays from the Zarr groups
         print("\nLoading Zarr arrays...")
         
-        # Load labeled data from files_to_process
+        # Load data from files_to_process (both labeled and unlabeled)
         for target, image_id, image_file, label_file, mask_file in files_to_process:
             info = array_info[(target, image_id)]
             
             # Load arrays from groups
             data_array = images_group[info['image_array_name']]
-            label_array = labels_group[info['label_array_name']]
+            
+            # Load label array only if it exists
+            label_array = None
+            if info['label_array_name'] and info['label_array_name'] in labels_group:
+                label_array = labels_group[info['label_array_name']]
             
             # Store in the nested dictionary
             data_dict = {
                 'data': data_array,
-                'label': label_array
+                'label': label_array  # Will be None for unlabeled data
             }
             
             # Load mask if available
-            if info['mask_array_name']:
+            if info.get('mask_array_name') and info['mask_array_name'] in masks_group:
                 mask_array = masks_group[info['mask_array_name']]
                 data_dict['mask'] = mask_array
+            else:
+                data_dict['mask'] = None
             
             targets_data[target][image_id] = data_dict
-            print(f"Loaded {image_id}_{target} with shape {data_array.shape}")
-        
-        # Load any unlabeled data that was already added to targets_data
-        for target, images_dict in targets_data.items():
-            for image_id, data_dict in images_dict.items():
-                # If data is just a string (array name), load it from zarr
-                if isinstance(data_dict.get('data'), str):
-                    array_name = data_dict['data']
-                    data_dict['data'] = images_group[array_name]
-                    print(f"Loaded unlabeled image {image_id} for target {target} with shape {data_dict['data'].shape}")
+            
+            # Print appropriate message
+            if label_array is not None:
+                print(f"Loaded labeled {image_id}_{target} with shape {data_array.shape}")
+            else:
+                print(f"Loaded unlabeled {image_id}_{target} with shape {data_array.shape}")
         
         # Check that all configured targets were found (excluding auxiliary tasks)
         found_targets = set(targets_data.keys())
