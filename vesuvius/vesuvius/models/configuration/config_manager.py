@@ -101,10 +101,6 @@ class ConfigManager:
         if self.volume_task_loss_config and self.verbose:
             print(f"Volume-task loss configuration loaded: {self.volume_task_loss_config}")
         
-        # Label threshold - values below this will be set to 0, values at or above will be set to target_value
-        self.label_threshold = self.dataset_config.get("label_threshold", None)
-        if self.label_threshold is not None:
-            self.label_threshold = float(self.label_threshold)
         
         # Spatial transformations control
         self.no_spatial = bool(self.dataset_config.get("no_spatial", False))
@@ -254,8 +250,8 @@ class ConfigManager:
         print(f"Configuration saved to: {config_path}")
 
     def update_config(self, patch_size=None, min_labeled_ratio=None, max_epochs=None, loss_function=None, 
-                     binarize_labels=None, target_value=None, skip_patch_validation=None,
-                     normalization_scheme=None, intensity_properties=None, label_threshold=None,
+                     skip_patch_validation=None,
+                     normalization_scheme=None, intensity_properties=None,
                      skip_bounding_box=None):
         if patch_size is not None:
             if isinstance(patch_size, (list, tuple)) and len(patch_size) >= 2:
@@ -278,18 +274,6 @@ class ConfigManager:
             self.dataset_config["min_labeled_ratio"] = self.min_labeled_ratio
             if self.verbose:
                 print(f"Updated min labeled ratio: {self.min_labeled_ratio:.2f}")
-
-        if binarize_labels is not None:
-            self.binarize_labels = bool(binarize_labels)
-            self.dataset_config["binarize_labels"] = self.binarize_labels
-            if self.verbose:
-                print(f"Updated binarize_labels: {self.binarize_labels}")
-
-        if target_value is not None:
-            self.target_value = target_value
-            self.dataset_config["target_value"] = self.target_value
-            if self.verbose:
-                print(f"Updated target_value: {self.target_value}")
 
         if skip_patch_validation is not None:
             self.skip_patch_validation = bool(skip_patch_validation)
@@ -322,12 +306,6 @@ class ConfigManager:
             self.dataset_config["intensity_properties"] = self.intensity_properties
             if self.verbose:
                 print(f"Updated intensity properties: {self.intensity_properties}")
-
-        if label_threshold is not None:
-            self.label_threshold = float(label_threshold) if label_threshold is not None else None
-            self.dataset_config["label_threshold"] = self.label_threshold
-            if self.verbose:
-                print(f"Updated label_threshold: {self.label_threshold}")
 
         if skip_bounding_box is not None:
             self.skip_bounding_box = bool(skip_bounding_box)

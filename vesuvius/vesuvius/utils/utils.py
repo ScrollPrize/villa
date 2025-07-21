@@ -72,7 +72,7 @@ def find_mask_patches(mask_array, label_array, patch_size, stride=None, min_mask
                         
                     # LABEL/NONZERO REQUIREMENT:
                     if min_nonzero_ratio is not None:
-                        # Check for non-zero ratio (for self-supervised pretraining)
+                        # Check for non-zero ratio
                         nonzero_ratio = np.count_nonzero(label_patch) / label_patch.size
                         if nonzero_ratio >= min_nonzero_ratio:
                             patches.append({'start_pos': [z, y, x]})
@@ -153,7 +153,7 @@ def find_mask_patches_2d(mask_array, label_array, patch_size, stride=None, min_m
                     
                 # LABEL/NONZERO REQUIREMENT:
                 if min_nonzero_ratio is not None:
-                    # Check for non-zero ratio (for MAE pretraining)
+                    # Check for non-zero ratio
                     nonzero_ratio = np.count_nonzero(label_patch) / label_patch.size
                     if nonzero_ratio >= min_nonzero_ratio:
                         patches.append({'start_pos': [0, y, x]})  # [dummy_z, y, x]

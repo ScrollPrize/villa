@@ -125,10 +125,6 @@ class BaseTrainer:
                     ignore_index = loss_kwargs.get("ignore_index", -100)
                     pos_weight = loss_kwargs.get("pos_weight", None)
 
-                    if hasattr(self.mgr,
-                               'compute_loss_on_labeled_only') and self.mgr.compute_loss_on_labeled_only and ignore_index is None:
-                        ignore_index = -100
-                        print(f"  Setting ignore_index=-100 for {loss_name} due to compute_loss_on_labeled_only=True")
 
                     try:
                         loss_fn = _create_loss(
@@ -367,14 +363,11 @@ class BaseTrainer:
                 global_step += 1
 
                 inputs = data_dict["image"].to(self.device, dtype=torch.float32)
-                ignore_masks = None
-                if "ignore_masks" in data_dict:
-                    ignore_masks = {t_name: mask.to(self.device) for t_name, mask in data_dict["ignore_masks"].items()}
 
                 targets_dict = {
                     k: v.to(self.device, dtype=torch.float32)
                     for k, v in data_dict.items()
-                    if k not in ["image", "ignore_masks", "patch_info"]
+                    if k not in ["image", "patch_info"]
                 }
 
                 if use_amp and self.device.type in ['cuda', 'cpu']:
@@ -393,24 +386,9 @@ class BaseTrainer:
 
                         task_total_loss = 0.0
                         for loss_fn, loss_weight in task_losses:
-                            t_gt_masked = t_gt
-                            if ignore_masks is not None and t_name in ignore_masks:
-                                ignore_mask = ignore_masks[t_name]
-
-                                if i == 0 and task_losses.index((loss_fn, loss_weight)) == 0:
-                                    print(f"Using custom ignore mask for target {t_name}")
-
-                                ignore_label = getattr(loss_fn, 'ignore_index', -100)
-
-                                if ignore_mask.dim() == t_gt.dim() - 1:
-                                    ignore_mask = ignore_mask.unsqueeze(1)
-
-                                ignore_tensor = torch.tensor(ignore_label, dtype=t_gt.dtype, device=t_gt.device)
-                                t_gt_masked = torch.where(ignore_mask == 1, ignore_tensor, t_gt)
-
                             # Compute loss
                             # Use auxiliary loss computation helper
-                            loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt_masked, outputs,
+                            loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt, outputs,
                                                                 self.mgr.targets[t_name])
                             task_total_loss += loss_weight * loss_value
 
@@ -441,8 +419,6 @@ class BaseTrainer:
                 pbar.set_postfix_str(loss_str)
 
                 del data_dict, inputs, targets_dict, outputs
-                if ignore_masks is not None:
-                    del ignore_masks
 
             # Step per-epoch schedulers once after each epoch
             if not is_per_iteration_scheduler:
@@ -502,17 +478,11 @@ class BaseTrainer:
                             data_dict = next(val_dataloader_iter)
 
                         inputs = data_dict["image"].to(self.device, dtype=torch.float32)
-                        ignore_masks = None
-                        if "ignore_masks" in data_dict:
-                            ignore_masks = {
-                                t_name: mask.to(self.device, dtype=torch.float32)
-                                for t_name, mask in data_dict["ignore_masks"].items()
-                            }
 
                         targets_dict = {
                             k: v.to(self.device, dtype=torch.float32)
                             for k, v in data_dict.items()
-                            if k not in ["image", "ignore_masks", "patch_info"]
+                            if k not in ["image", "patch_info"]
                         }
 
                         if use_amp:
@@ -532,25 +502,8 @@ class BaseTrainer:
 
                                 task_total_loss = 0.0
                                 for loss_fn, loss_weight in task_losses:
-                                    t_gt_masked = t_gt
-                                    if ignore_masks is not None and t_name in ignore_masks:
-                                        ignore_mask = ignore_masks[t_name].to(self.device, dtype=torch.float32)
-
-                                        if hasattr(loss_fn, 'ignore_index'):
-                                            ignore_label = loss_fn.ignore_index
-                                        else:
-                                            ignore_label = -100
-
-                                        if ignore_mask.dim() == t_gt.dim() - 1:
-                                            ignore_mask = ignore_mask.unsqueeze(1)
-
-                                        # Apply mask to target: set regions where mask is 1 to ignore_label
-                                        t_gt_masked = torch.where(ignore_mask == 1,
-                                                                  torch.tensor(ignore_label, dtype=t_gt.dtype,
-                                                                               device=self.device), t_gt)
-
                                     # Compute loss
-                                    loss_value = loss_fn(t_pred, t_gt_masked)
+                                    loss_value = loss_fn(t_pred, t_gt)
                                     task_total_loss += loss_weight * loss_value
 
                                 val_losses[t_name].append(task_total_loss.detach().cpu().item())
@@ -603,8 +556,6 @@ class BaseTrainer:
                             val_pbar.set_postfix_str(loss_str)
 
                             del outputs, inputs, targets_dict
-                            if ignore_masks is not None:
-                                del ignore_masks
 
                             # Log validation losses to wandb
                             if self.mgr.wandb_project:
@@ -849,9 +800,6 @@ def update_config_from_args(mgr, args):
         mgr.tr_val_split = args.train_split
         mgr.tr_info["tr_val_split"] = args.train_split
 
-    if args.loss_on_label_only:
-        mgr.compute_loss_on_labeled_only = True
-        mgr.tr_info["compute_loss_on_labeled_only"] = True
 
     if args.max_epoch is not None:
         mgr.max_epoch = args.max_epoch
@@ -964,9 +912,9 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    # Required arguments (input is optional for self-supervised pretraining with data_paths)
-    parser.add_argument("-i", "--input",
-                        help="Input directory containing images/, labels/, and optionally masks/ subdirectories. Optional when using --pretrain with data_paths in config.")
+    # Required arguments
+    parser.add_argument("-i", "--input", required=True,
+                        help="Input directory containing images/ and labels/ subdirectories.")
     parser.add_argument("-o", "--output", default="checkpoints",
                         help="Output directory for saving checkpoints and configurations (default: checkpoints)")
     parser.add_argument("--format", choices=["image", "zarr", "napari"],
@@ -981,8 +929,6 @@ def main():
                         help="Loss functions as a list, e.g., '[SoftDiceLoss, BCEWithLogitsLoss]' or comma-separated")
     parser.add_argument("--train-split", type=float,
                         help="Training/validation split ratio (0.0-1.0, default: 0.95)")
-    parser.add_argument("--loss-on-label-only", action="store_true",
-                        help="Compute loss only on labeled regions (use masks for loss calculation)")
     parser.add_argument("--config", "--config-path", dest="config_path", type=str, required=True,
                         help="Path to configuration YAML file (required)")
     parser.add_argument("--verbose", action="store_true",
@@ -1011,13 +957,7 @@ def main():
 
     # Trainer selection
     parser.add_argument("--trainer", type=str, default="base",
-                        help="Trainer class to use (default: base). Options: base, self_supervised, mean_teacher")
-
-    # Self-supervised specific arguments (only used when --trainer self_supervised)
-    parser.add_argument("--mask-ratio", type=float, default=0.75,
-                        help="Mask ratio for self-supervised pretraining (default: 0.75)")
-    parser.add_argument("--mask-patch-size", type=str,
-                        help="Mask patch size for self-supervised training as comma-separated values, e.g., '8,16,16' for 3D")
+                        help="Trainer class to use (default: base). Options: base, mean_teacher")
 
     # Learning rate scheduler arguments
     parser.add_argument("--scheduler", type=str,
@@ -1048,16 +988,9 @@ def main():
     mgr.load_config(args.config_path)
     print(f"Loaded configuration from: {args.config_path}")
 
-    # Check if input is required
-    if args.input is None:
-        # Check if we're using self-supervised trainer with data_paths
-        if args.trainer == "self_supervised" and mgr.dataset_config.get('data_paths'):
-            print("Using data_paths from config for self-supervised pretraining")
-        else:
-            raise ValueError("--input is required unless using self_supervised trainer with data_paths in config")
-    else:
-        if not Path(args.input).exists():
-            raise ValueError(f"Input directory does not exist: {args.input}")
+    # Check if input exists
+    if not Path(args.input).exists():
+        raise ValueError(f"Input directory does not exist: {args.input}")
 
     Path(args.output).mkdir(parents=True, exist_ok=True)
 
@@ -1065,25 +998,7 @@ def main():
 
     # Select trainer based on --trainer argument
     trainer_name = args.trainer.lower()
-    if trainer_name == "self_supervised":
-        # Configure self-supervised specific parameters
-        if not hasattr(mgr, 'dataset_config'):
-            mgr.dataset_config = {}
-
-        mgr.dataset_config["mask_ratio"] = args.mask_ratio
-
-        # Parse mask patch size if provided
-        if args.mask_patch_size:
-            try:
-                mask_patch_size = [int(x.strip()) for x in args.mask_patch_size.split(',')]
-                mgr.dataset_config["mask_patch_size"] = mask_patch_size
-            except ValueError:
-                raise ValueError(f"Invalid mask patch size format: {args.mask_patch_size}")
-
-        from vesuvius.models.training.self_supervised_trainer import SelfSupervisedTrainer
-        trainer = SelfSupervisedTrainer(mgr=mgr, verbose=args.verbose)
-        print("Using Self-Supervised Trainer for self-supervised pretraining")
-    elif trainer_name == "mean_teacher":
+    if trainer_name == "mean_teacher":
         from vesuvius.models.training.train_mean_teacher import MeanTeacherTrainer
         trainer = MeanTeacherTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Mean Teacher Trainer for semi-supervised training")
@@ -1091,7 +1006,7 @@ def main():
         trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Base Trainer for supervised training")
     else:
-        raise ValueError(f"Unknown trainer: {trainer_name}. Available options: base, self_supervised, mean_teacher")
+        raise ValueError(f"Unknown trainer: {trainer_name}. Available options: base, mean_teacher")
 
     print("Starting training...")
     trainer.train()

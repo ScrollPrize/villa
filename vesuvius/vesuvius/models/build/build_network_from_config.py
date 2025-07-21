@@ -70,11 +70,6 @@ class NetworkFromConfig(nn.Module):
         # Get input channels from manager if available, otherwise default to 1
         self.in_channels = getattr(mgr, 'in_channels', 1)
         self.autoconfigure = mgr.autoconfigure
-        
-        # Check if we're in self-supervised pretraining mode
-        self.self_supervised_mode = mgr.model_config.get('self_supervised_mode', False)
-        if self.self_supervised_mode:
-            print("Initializing network in self-supervised pretraining mode")
 
         if hasattr(mgr, 'model_config') and mgr.model_config:
             model_config = mgr.model_config
@@ -310,35 +305,31 @@ class NetworkFromConfig(nn.Module):
         self.task_decoders = nn.ModuleDict()
         self.task_activations = nn.ModuleDict()
         
-        if self.self_supervised_mode:
-            # In self-supervised mode, create a lightweight reconstruction head
-            self._build_self_supervised_reconstruction_head()
-        else:
-            # Standard supervised mode - create task-specific decoders
-            for target_name, target_info in self.targets.items():
-                # Determine output channels - use task-specific channels if specified, otherwise match input channels
-                if 'out_channels' in target_info:
-                    out_channels = target_info['out_channels']
-                elif 'channels' in target_info:
-                    out_channels = target_info['channels']
-                else:
-                    # Default to matching input channels for adaptive behavior
-                    out_channels = self.in_channels
-                    print(f"No channel specification found for task '{target_name}', defaulting to {out_channels} channels (matching input)")
+        # Standard supervised mode - create task-specific decoders
+        for target_name, target_info in self.targets.items():
+            # Determine output channels - use task-specific channels if specified, otherwise match input channels
+            if 'out_channels' in target_info:
+                out_channels = target_info['out_channels']
+            elif 'channels' in target_info:
+                out_channels = target_info['channels']
+            else:
+                # Default to matching input channels for adaptive behavior
+                out_channels = self.in_channels
+                print(f"No channel specification found for task '{target_name}', defaulting to {out_channels} channels (matching input)")
 
-                # Update target_info with the determined channels
-                target_info["out_channels"] = out_channels
+            # Update target_info with the determined channels
+            target_info["out_channels"] = out_channels
 
-                activation_str = target_info.get("activation", "sigmoid")
-                self.task_decoders[target_name] = Decoder(
-                    encoder=self.shared_encoder,
-                    basic_block=model_config.get("basic_decoder_block", "ConvBlock"),
-                    num_classes=out_channels,
-                    n_conv_per_stage=model_config.get("n_conv_per_stage_decoder", [1] * (self.num_stages - 1)),
-                    deep_supervision=False
-                )
-                self.task_activations[target_name] = get_activation_module(activation_str)
-                print(f"Task '{target_name}' configured with {out_channels} output channels")
+            activation_str = target_info.get("activation", "sigmoid")
+            self.task_decoders[target_name] = Decoder(
+                encoder=self.shared_encoder,
+                basic_block=model_config.get("basic_decoder_block", "ConvBlock"),
+                num_classes=out_channels,
+                n_conv_per_stage=model_config.get("n_conv_per_stage_decoder", [1] * (self.num_stages - 1)),
+                deep_supervision=False
+            )
+            self.task_activations[target_name] = get_activation_module(activation_str)
+            print(f"Task '{target_name}' configured with {out_channels} output channels")
 
         # --------------------------------------------------------------------
         # Build final configuration snapshot.
@@ -422,103 +413,12 @@ class NetworkFromConfig(nn.Module):
         # Check input channels and warn if mismatch
         self.check_input_channels(x)
 
-        if self.self_supervised_mode:
-            return self.forward_self_supervised(x)
-        else:
-            skips = self.shared_encoder(x)
-            results = {}
-            for task_name, decoder in self.task_decoders.items():
-                logits = decoder(skips)
-                activation_fn = self.task_activations[task_name]
-                if activation_fn is not None and not self.training:
-                    logits = activation_fn(logits)
-                results[task_name] = logits
-            return results
-    
-    def _build_self_supervised_reconstruction_head(self):
-        """Build a lightweight reconstruction head for self-supervised pretraining.
-        
-        Uses a simplified decoder with fewer stages for efficiency.
-        """
-        model_config = self.mgr.model_config
-        
-        # The decoder needs configuration for all encoder stages - 1
-        n_encoder_stages = len(self.shared_encoder.output_channels)
-        
-        # Option to use fewer convolutions per stage for self-supervised training (lighter decoder)
-        self_supervised_n_conv_per_stage = model_config.get("self_supervised_n_conv_per_stage", 1)
-        if isinstance(self_supervised_n_conv_per_stage, int):
-            # If it's an int, apply to all decoder stages
-            n_conv_per_stage = [self_supervised_n_conv_per_stage] * (n_encoder_stages - 1)
-        else:
-            # If it's a list, make sure it has the right length
-            n_conv_per_stage = self_supervised_n_conv_per_stage
-            if len(n_conv_per_stage) < n_encoder_stages - 1:
-                # Pad with 1s if not enough values provided
-                n_conv_per_stage = n_conv_per_stage + [1] * (n_encoder_stages - 1 - len(n_conv_per_stage))
-        
-        # Create reconstruction decoder
-        self.reconstruction_decoder = Decoder(
-            encoder=self.shared_encoder,
-            basic_block=model_config.get("self_supervised_decoder_block", "ConvBlock"),
-            num_classes=self.in_channels,  # Reconstruct input channels
-            n_conv_per_stage=n_conv_per_stage,
-            deep_supervision=False
-        )
-        
-        # Option 2 (Alternative): Simple convolutional head
-        # This would be used if self_supervised_use_simple_head is True in config
-        if model_config.get("self_supervised_use_simple_head", False):
-            # Get the number of channels from the encoder's bottleneck
-            bottleneck_channels = self.shared_encoder.stages[-1].output_channels
-            
-            # Simple conv head
-            if self.op_dims == 2:
-                self.reconstruction_head = nn.Sequential(
-                    nn.Conv2d(bottleneck_channels, 256, kernel_size=3, padding=1),
-                    nn.InstanceNorm2d(256),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(256, 128, kernel_size=3, padding=1),
-                    nn.InstanceNorm2d(128),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(128, self.in_channels, kernel_size=1)
-                )
-            else:  # 3D
-                self.reconstruction_head = nn.Sequential(
-                    nn.Conv3d(bottleneck_channels, 256, kernel_size=3, padding=1),
-                    nn.InstanceNorm3d(256),
-                    nn.ReLU(inplace=True),
-                    nn.Conv3d(256, 128, kernel_size=3, padding=1),
-                    nn.InstanceNorm3d(128),
-                    nn.ReLU(inplace=True),
-                    nn.Conv3d(128, self.in_channels, kernel_size=1)
-                )
-        
-        print(f"Self-supervised reconstruction decoder created with {n_encoder_stages - 1} stages")
-    
-    def forward_self_supervised(self, x):
-        """Forward pass for self-supervised pretraining.
-        
-        Args:
-            x: Masked input tensor
-            
-        Returns:
-            Dictionary with 'reconstruction' key containing the reconstructed image
-        """
-        # Encode the masked input
         skips = self.shared_encoder(x)
-        
-        # Reconstruct using the decoder
-        if hasattr(self, 'reconstruction_head') and self.mgr.model_config.get("self_supervised_use_simple_head", False):
-            # Use simple head - only use bottleneck features
-            reconstruction = self.reconstruction_head(skips[-1])
-            # Upsample to original size if needed
-            if reconstruction.shape[2:] != x.shape[2:]:
-                reconstruction = F.interpolate(reconstruction, size=x.shape[2:], 
-                                             mode='trilinear' if self.op_dims == 3 else 'bilinear',
-                                             align_corners=False)
-        else:
-            # Use decoder-based reconstruction
-            reconstruction = self.reconstruction_decoder(skips)
-        
-        return {"reconstruction": reconstruction}
+        results = {}
+        for task_name, decoder in self.task_decoders.items():
+            logits = decoder(skips)
+            activation_fn = self.task_activations[task_name]
+            if activation_fn is not None and not self.training:
+                logits = activation_fn(logits)
+            results[task_name] = logits
+        return results

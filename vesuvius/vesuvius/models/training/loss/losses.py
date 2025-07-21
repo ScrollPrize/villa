@@ -2,7 +2,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn as nn
 from torch.nn import MSELoss, SmoothL1Loss, L1Loss
-from .self_supervised_loss import MaskedReconstructionLoss
 
 
 def compute_per_channel_dice(input, target, epsilon=1e-5, weight=None):
@@ -1263,23 +1262,6 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight):
     elif name == 'MaskedMSELoss':
         mask_channel = loss_config.get('mask_channel', False)
         base_loss = MaskedMSELoss(ignore_index=ignore_index, mask_channel=mask_channel)
-    elif name == 'MaskedReconstructionLoss':
-        base_loss_type = loss_config.get('base_loss', 'mse')
-        normalize_targets = loss_config.get('normalize_targets', True)
-        reduction = loss_config.get('reduction', 'mean')
-        eps = loss_config.get('eps', 1e-6)
-        variance_threshold = loss_config.get('variance_threshold', 0.1)
-        use_robust_norm = loss_config.get('use_robust_norm', True)
-        max_loss_value = loss_config.get('max_loss_value', 100.0)
-        log_high_losses = loss_config.get('log_high_losses', True)
-        base_loss = MaskedReconstructionLoss(base_loss=base_loss_type, 
-                                         normalize_targets=normalize_targets,
-                                         reduction=reduction,
-                                         eps=eps,
-                                         variance_threshold=variance_threshold,
-                                         use_robust_norm=use_robust_norm,
-                                         max_loss_value=max_loss_value,
-                                         log_high_losses=log_high_losses)
     elif name == 'SmoothL1Loss':
         base_loss = SmoothL1Loss()
     elif name == 'L1Loss':

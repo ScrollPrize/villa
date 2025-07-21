@@ -1,10 +1,20 @@
 """
-Multiprocessing-enabled intensity property computation for normalization.
+Intensity property computation and management for dataset normalization.
+
+This module handles:
+- Computing intensity statistics from dataset volumes
+- Saving/loading intensity properties to/from cache
+- Multiprocessing-enabled sampling for large datasets
 """
+import os
+import json
 import numpy as np
+from pathlib import Path
+from datetime import datetime
 from tqdm import tqdm
 from multiprocessing import Pool
 from functools import partial
+from typing import Dict, List, Any, Optional, Tuple
 
 
 def sample_volume_task(task):
@@ -170,7 +180,6 @@ def compute_intensity_properties_parallel(target_volumes, sample_ratio=0.01, max
             sampling_tasks.append((vol_idx, img_data, shape, vol_samples))
     
     # Use multiprocessing to sample from volumes in parallel
-    import os
     num_workers = os.cpu_count() // 2
     print(f"\nSampling from {len(sampling_tasks)} volumes using {num_workers} workers...")
     
@@ -236,5 +245,199 @@ def compute_intensity_properties_parallel(target_volumes, sample_ratio=0.01, max
     print(f"  0.5 percentile: {percentile_00_5:.4f}")
     print(f"  99.5 percentile: {percentile_99_5:.4f}")
     print()
+    
+    return intensity_properties
+
+
+def get_intensity_properties_filename(cache_dir: Path) -> Path:
+    """
+    Get filename for intensity properties JSON file.
+    
+    Parameters
+    ----------
+    cache_dir : Path
+        Directory to store cache files
+        
+    Returns
+    -------
+    Path
+        Full path to the intensity properties JSON file
+    """
+    # Create cache directory if it doesn't exist
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / "intensity_properties.json"
+
+
+def save_intensity_properties(cache_dir: Path, intensity_properties: Dict[str, float], normalization_scheme: str) -> bool:
+    """
+    Save intensity properties to a separate JSON file.
+    
+    Parameters
+    ----------
+    cache_dir : Path
+        Directory to store cache files
+    intensity_properties : dict
+        Computed intensity properties
+    normalization_scheme : str
+        Normalization scheme used
+        
+    Returns
+    -------
+    bool
+        True if save was successful
+    """
+    filename = get_intensity_properties_filename(cache_dir)
+    
+    data = {
+        'intensity_properties': intensity_properties,
+        'normalization_scheme': normalization_scheme,
+        'timestamp': datetime.now().isoformat()
+    }
+    
+    try:
+        with open(filename, 'w') as f:
+            json.dump(data, f, indent=2)
+        print(f"Saved intensity properties to: {filename}")
+        return True
+    except Exception as e:
+        print(f"Warning: Failed to save intensity properties: {e}")
+        return False
+
+
+def load_intensity_properties(cache_dir: Path) -> Optional[Tuple[Dict[str, float], str]]:
+    """
+    Load intensity properties from JSON file.
+    
+    Parameters
+    ----------
+    cache_dir : Path
+        Directory containing cache files
+        
+    Returns
+    -------
+    tuple or None
+        (intensity_properties, normalization_scheme) if successful, None otherwise
+    """
+    filename = get_intensity_properties_filename(cache_dir)
+    
+    if not filename.exists():
+        print(f"No intensity properties file found at: {filename}")
+        return None
+    
+    try:
+        with open(filename, 'r') as f:
+            data = json.load(f)
+        
+        intensity_properties = data.get('intensity_properties')
+        normalization_scheme = data.get('normalization_scheme')
+        timestamp = data.get('timestamp', 'unknown')
+        
+        if intensity_properties and normalization_scheme:
+            print(f"Loaded intensity properties from: {filename} (saved at {timestamp})")
+            return intensity_properties, normalization_scheme
+        else:
+            print(f"Invalid intensity properties file: {filename}")
+            return None
+            
+    except Exception as e:
+        print(f"Warning: Failed to load intensity properties from {filename}: {e}")
+        return None
+
+
+def initialize_intensity_properties(target_volumes, 
+                                  normalization_scheme,
+                                  existing_properties=None,
+                                  cache_enabled=True,
+                                  cache_dir=None,
+                                  mgr=None,
+                                  sample_ratio=0.001,
+                                  max_samples=1000000):
+    """
+    Initialize intensity properties for dataset normalization.
+    
+    This function handles the complete workflow of:
+    1. Using existing properties if provided
+    2. Loading from cache if available
+    3. Computing if necessary
+    4. Saving to cache
+    5. Updating the config manager
+    
+    Parameters
+    ----------
+    target_volumes : dict
+        The target volumes from the dataset
+    normalization_scheme : str
+        Normalization scheme ('zscore', 'ct', etc.)
+    existing_properties : dict, optional
+        Pre-computed intensity properties
+    cache_enabled : bool
+        Whether to use caching
+    cache_dir : Path, optional
+        Directory for cache files
+    mgr : object, optional
+        Config manager to update with properties
+    sample_ratio : float
+        Ratio of data to sample (default: 0.01 for 1%)
+    max_samples : int
+        Maximum number of samples to collect (default: 1,000,000)
+        
+    Returns
+    -------
+    dict
+        Intensity properties for normalization
+    """
+    # If properties already exist, use them
+    if existing_properties:
+        return existing_properties
+    
+    # Only compute/load for schemes that need it
+    if normalization_scheme not in ['zscore', 'ct']:
+        return {}
+    
+    loaded_from_cache = False
+    intensity_properties = {}
+    
+    # Try to load from cache first
+    if cache_enabled and cache_dir is not None:
+        print("\nChecking for cached intensity properties...")
+        intensity_result = load_intensity_properties(cache_dir)
+        
+        if intensity_result is not None:
+            cached_properties, cached_scheme = intensity_result
+            if cached_scheme == normalization_scheme:
+                intensity_properties = cached_properties
+                loaded_from_cache = True
+                
+                # Update the config manager if provided
+                if mgr is not None:
+                    mgr.intensity_properties = cached_properties
+                    if hasattr(mgr, 'dataset_config'):
+                        mgr.dataset_config['intensity_properties'] = cached_properties
+                
+                print("\nLoaded intensity properties from JSON cache - skipping computation")
+                print("Cached intensity properties:")
+                for key, value in cached_properties.items():
+                    print(f"  {key}: {value:.4f}")
+            else:
+                print(f"Cached normalization scheme '{cached_scheme}' doesn't match current '{normalization_scheme}'")
+    
+    # Compute if not loaded from cache
+    if not loaded_from_cache:
+        print(f"\nComputing intensity properties for {normalization_scheme} normalization...")
+        intensity_properties = compute_intensity_properties_parallel(
+            target_volumes, 
+            sample_ratio=sample_ratio, 
+            max_samples=max_samples
+        )
+        
+        # Update the config manager if provided
+        if mgr is not None and hasattr(mgr, 'intensity_properties'):
+            mgr.intensity_properties = intensity_properties
+            if hasattr(mgr, 'dataset_config'):
+                mgr.dataset_config['intensity_properties'] = intensity_properties
+        
+        # Save to cache for future use
+        if cache_enabled and cache_dir is not None:
+            save_intensity_properties(cache_dir, intensity_properties, normalization_scheme)
     
     return intensity_properties
