@@ -9,13 +9,14 @@ TEST_RATIO = 0.1  # 10% of data for test set
 UNLABELED_BATCH_RATIO = 0.1  # 1:1 ratio of unlabeled to labeled samples per batch
 
 # EMA and Consistency Parameters
-EMA_DECAY = 0.999  # Exponential moving average decay for teacher model
-CONSISTENCY_WEIGHT = 1.0  # Weight for consistency loss
+EMA_DECAY = 0.99  # Exponential moving average decay for teacher model (matching reference)
+CONSISTENCY_WEIGHT = 0.1  # Weight for consistency loss (matching reference)
 CONSISTENCY_RAMPUP = 200  # Number of epochs for consistency weight rampup
 
 # Uncertainty Parameters
 UNCERTAINTY_THRESHOLD_BASE = 0.75  # Base threshold for uncertainty filtering
 UNCERTAINTY_THRESHOLD_RAMPUP = 0.25  # Additional rampup for uncertainty threshold
+MONTE_CARLO_SAMPLES = 8  # Number of forward passes for uncertainty estimation
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -52,6 +53,7 @@ class MeanTeacherTrainer(BaseTrainer):
         # Uncertainty parameters - use constants defined at top of file
         self.uncertainty_threshold_base = getattr(self.mgr, 'uncertainty_threshold_base', UNCERTAINTY_THRESHOLD_BASE)
         self.uncertainty_threshold_rampup = getattr(self.mgr, 'uncertainty_threshold_rampup', UNCERTAINTY_THRESHOLD_RAMPUP)
+        self.monte_carlo_samples = getattr(self.mgr, 'monte_carlo_samples', MONTE_CARLO_SAMPLES)
         
         self.teacher_model = None
         self.student_model = None
@@ -434,17 +436,46 @@ class MeanTeacherTrainer(BaseTrainer):
                             student_pred_unlabeled = outputs[t_name][self.labeled_bs:]
                             teacher_pred_unlabeled = ema_outputs[t_name]
                             
-                            # Apply activation to get probabilities for uncertainty computation
+                            # Apply activation to get probabilities
                             activation = self.mgr.targets[t_name].get("activation", "sigmoid")
-                            if activation == "sigmoid":
-                                teacher_prob = torch.sigmoid(teacher_pred_unlabeled)
-                            elif activation == "softmax":
-                                teacher_prob = torch.softmax(teacher_pred_unlabeled, dim=1)
-                            else:
-                                teacher_prob = teacher_pred_unlabeled
+                            
+                            # Monte Carlo uncertainty estimation with T forward passes
+                            T = self.monte_carlo_samples
+                            batch_size = unlabeled_inputs.shape[0]
+                            
+                            # Prepare repeated batch for efficient forward passes
+                            unlabeled_repeated = unlabeled_inputs.repeat(2, 1, 1, 1) if len(unlabeled_inputs.shape) == 4 else unlabeled_inputs.repeat(2, 1, 1, 1, 1)
+                            stride = unlabeled_repeated.shape[0] // 2
+                            
+                            # Collect predictions from multiple forward passes
+                            mc_predictions = []
+                            
+                            for i in range(T // 2):
+                                # Add noise to inputs
+                                noise = torch.clamp(torch.randn_like(unlabeled_repeated) * 0.1, -0.2, 0.2)
+                                noisy_inputs = unlabeled_repeated + noise
                                 
-                            # Compute uncertainty from teacher predictions
-                            uncertainty = self.compute_uncertainty(teacher_prob)
+                                # Forward pass through teacher
+                                with torch.no_grad():
+                                    mc_outputs = self.teacher_model(noisy_inputs)
+                                    mc_pred = mc_outputs[t_name]
+                                    
+                                    # Apply activation
+                                    if activation == "sigmoid":
+                                        mc_pred = torch.sigmoid(mc_pred)
+                                    elif activation == "softmax":
+                                        mc_pred = torch.softmax(mc_pred, dim=1)
+                                    
+                                    # Split the batch back
+                                    mc_predictions.append(mc_pred[:stride])
+                                    mc_predictions.append(mc_pred[stride:])
+                            
+                            # Stack and average predictions
+                            mc_predictions = torch.stack(mc_predictions, dim=0)  # [T, B, C, ...]
+                            mean_predictions = mc_predictions.mean(dim=0)  # [B, C, ...]
+                            
+                            # Compute uncertainty from averaged predictions
+                            uncertainty = self.compute_uncertainty(mean_predictions)
                             
                             # Get uncertainty threshold
                             threshold = self.get_uncertainty_threshold(global_step, self.mgr.max_epoch * num_iters)
