@@ -1,5 +1,5 @@
 tr_config:
-  patch_size: [128, 128, 128]
+  patch_size: [128, 128]
   initial_lr: 0.01
 
 dataset_config:
@@ -8,7 +8,7 @@ dataset_config:
   normalization_scheme: "zscore"
   skip_patch_validation: true
   targets:
-    surface:
+    ink:
       activation: "none"
       out_channels: 1
       losses:

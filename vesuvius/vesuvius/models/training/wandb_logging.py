@@ -77,7 +77,7 @@ def save_train_val_filenames(self, train_dataset, val_dataset, train_indices, va
             "val_volumes": sorted(list(val_volumes)),
             "train_val_split": self.mgr.tr_val_split,
             "patch_size": self.mgr.train_patch_size,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.datetime.now().isoformat()
         },
         "train_patches": train_patches,
         "val_patches": val_patches

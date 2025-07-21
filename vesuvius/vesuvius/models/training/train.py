@@ -43,14 +43,11 @@ from vesuvius.models.utilities.load_checkpoint import load_checkpoint
 from vesuvius.models.utilities.get_accelerator import get_accelerator
 from vesuvius.models.utilities.compute_gradient_norm import compute_gradient_norm
 from vesuvius.models.utilities.s3_utils import detect_s3_paths, setup_multiprocessing_for_s3
-from vesuvius.models.training.auxiliary_tasks import (
-    compute_auxiliary_loss,
-    preserve_auxiliary_targets,
-    restore_auxiliary_targets,
-    apply_auxiliary_tasks_from_config
-)
+from vesuvius.models.training.auxiliary_tasks import compute_auxiliary_loss
 
 from vesuvius.models.training.wandb_logging import save_train_val_filenames
+from vesuvius.models.utilities.cli_utils import update_config_from_args
+from vesuvius.models.configuration.config_utils import configure_targets
 
 class BaseTrainer:
     def __init__(self,
@@ -229,7 +226,8 @@ class BaseTrainer:
 
         return train_dataloader, val_dataloader, train_indices, val_indices
 
-    def train(self):
+    def _initialize_training(self):
+        """Initialize all training components and return them as a dict."""
         # Check for S3 paths and set up multiprocessing if needed
         if detect_s3_paths(self.mgr):
             print("\nDetected S3 paths in configuration")
@@ -253,16 +251,6 @@ class BaseTrainer:
         if self.device.type == 'cuda':
             model = torch.compile(model)
 
-        if not hasattr(torch, 'no_op'):
-            class NullContextManager:
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, exc_type, exc_val, exc_tb):
-                    pass
-
-            torch.no_op = lambda: NullContextManager()
-
         use_amp = not getattr(self.mgr, 'no_amp', False)
         if not use_amp:
             print("Automatic Mixed Precision (AMP) is disabled")
@@ -270,28 +258,6 @@ class BaseTrainer:
         scaler = self._get_scaler(self.device.type, use_amp=use_amp)
         train_dataloader, val_dataloader, train_indices, val_indices = self._configure_dataloaders(train_dataset,
                                                                                                    val_dataset)
-        if self.mgr.wandb_project:
-            import wandb  # lazy import in case it's not available
-            train_val_splits = save_train_val_filenames(train_dataset, val_dataset, train_indices, val_indices)
-            mgr_config = self.mgr.convert_to_dict()
-            mgr_config.update({'train_val_splits': train_val_splits})
-
-            wandb.init(
-                entity=self.mgr.wandb_entity,
-                project=self.mgr.wandb_project,
-                group=self.mgr.model_name,
-                config=mgr_config
-            )
-
-        start_epoch = 0
-
-        # track the validation loss so we can save the best checkpoints
-        val_loss_history = {}  # {epoch: validation_loss}
-        checkpoint_history = deque(maxlen=3)
-        best_checkpoints = []
-        debug_gif_history = deque(maxlen=3)
-        best_debug_gifs = []  # List of (val_loss, epoch, gif_path)
-
         os.makedirs(self.mgr.ckpt_out_base, exist_ok=True)
         model_ckpt_dir = os.path.join(self.mgr.ckpt_out_base, self.mgr.model_name)
         os.makedirs(model_ckpt_dir, exist_ok=True)
@@ -301,10 +267,8 @@ class BaseTrainer:
         time_str = now.strftime('%H%M')
         ckpt_dir = os.path.join('checkpoints', f"{self.mgr.model_name}_{date_str}{time_str}")
         os.makedirs(ckpt_dir, exist_ok=True)
-        
-        # Save train/validation filenames
 
-
+        start_epoch = 0
         if hasattr(self.mgr, 'checkpoint_path') and self.mgr.checkpoint_path:
             model, optimizer, scheduler, start_epoch, checkpoint_loaded = load_checkpoint(
                 checkpoint_path=self.mgr.checkpoint_path,
@@ -318,8 +282,265 @@ class BaseTrainer:
 
             if checkpoint_loaded and self.mgr.load_weights_only:
                 scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
+        
+        return {
+            'model': model,
+            'optimizer': optimizer,
+            'scheduler': scheduler,
+            'is_per_iteration_scheduler': is_per_iteration_scheduler,
+            'loss_fns': loss_fns,
+            'scaler': scaler,
+            'train_dataset': train_dataset,
+            'val_dataset': val_dataset,
+            'train_dataloader': train_dataloader,
+            'val_dataloader': val_dataloader,
+            'train_indices': train_indices,
+            'val_indices': val_indices,
+            'use_amp': use_amp,
+            'start_epoch': start_epoch,
+            'ckpt_dir': ckpt_dir,
+            'model_ckpt_dir': model_ckpt_dir
+        }
+    
+    def _initialize_wandb(self, train_dataset, val_dataset, train_indices, val_indices):
+        """Initialize Weights & Biases logging if configured."""
+        if self.mgr.wandb_project:
+            import wandb  # lazy import in case it's not available
+            train_val_splits = save_train_val_filenames(self, train_dataset, val_dataset, train_indices, val_indices)
+            mgr_config = self.mgr.convert_to_dict()
+            mgr_config.update({'train_val_splits': train_val_splits})
+
+            wandb.init(
+                entity=self.mgr.wandb_entity,
+                project=self.mgr.wandb_project,
+                group=self.mgr.model_name,
+                config=mgr_config
+            )
+
+    def _train_step(self, model, data_dict, loss_fns, use_amp, autocast_ctx, epoch, step, verbose=False):
+        """Execute a single training step and return loss values."""
+        global_step = step
+        
+        if epoch == 0 and step == 0 and verbose:
+            print("Items from the first batch -- Double check that your shapes and values are expected:")
+            for item, val in data_dict.items():
+                if isinstance(val, dict):
+                    print(f"{item}: (dictionary with keys: {list(val.keys())})")
+                    for sub_key, sub_val in val.items():
+                        print(
+                            f"  {sub_key}: {sub_val.dtype}, {sub_val.shape}, min {sub_val.min()} max {sub_val.max()}")
+                else:
+                    print(f"{item}: {val.dtype}, {val.shape}, min {val.min()} max {val.max()}")
+
+        inputs = data_dict["image"].to(self.device, dtype=torch.float32)
+        targets_dict = {
+            k: v.to(self.device, dtype=torch.float32)
+            for k, v in data_dict.items()
+            if k not in ["image", "patch_info", "is_unlabeled"]
+        }
+
+        with autocast_ctx:
+            outputs = model(inputs)
+            total_loss, task_losses = self._compute_train_loss(outputs, targets_dict, loss_fns)
+        
+        return total_loss, task_losses, inputs, targets_dict, outputs
+    
+    def _compute_train_loss(self, outputs, targets_dict, loss_fns):
+        """Compute training loss for all tasks."""
+        total_loss = 0.0
+        task_losses = {}
+        
+        for t_name, t_gt in targets_dict.items():
+            t_pred = outputs[t_name]
+            task_loss_fns = loss_fns[t_name]  # List of (loss_fn, weight) tuples
+            task_weight = self.mgr.targets[t_name].get("weight", 1.0)
+
+            task_total_loss = 0.0
+            for loss_fn, loss_weight in task_loss_fns:
+                # Use auxiliary loss computation helper
+                loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt, outputs,
+                                                    self.mgr.targets[t_name])
+                task_total_loss += loss_weight * loss_value
+
+            weighted_loss = task_weight * task_total_loss
+            total_loss += weighted_loss
+            
+            # Store the actual loss value (after task weighting but before grad accumulation scaling)
+            task_losses[t_name] = task_total_loss.detach().cpu().item()
+        
+        return total_loss, task_losses
+    
+    def _update_gradients(self, scaler, total_loss, optimizer, model, step, num_iters, grad_accumulate_n):
+        """Handle gradient accumulation, clipping, and optimizer step."""
+        # Scale loss by accumulation steps to maintain same effective batch size
+        scaled_loss = total_loss / grad_accumulate_n
+        
+        # backward
+        scaler.scale(scaled_loss).backward()
+        
+        if (step + 1) % grad_accumulate_n == 0 or (step + 1) == num_iters:
+            scaler.unscale_(optimizer)
+            grad_clip = getattr(self.mgr, 'gradient_clip', 12.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            return True  # Optimizer step was taken
+
+        return False  # No optimizer step this iteration
+
+    def _validation_step(self, model, data_dict, loss_fns, use_amp):
+        """Execute a single validation step and return loss values."""
+        inputs = data_dict["image"].to(self.device, dtype=torch.float32)
+        targets_dict = {
+            k: v.to(self.device, dtype=torch.float32)
+            for k, v in data_dict.items()
+            if k not in ["image", "patch_info", "is_unlabeled"]
+        }
+
+        if use_amp:
+            context = (
+                torch.amp.autocast('cuda') if self.device.type == 'cuda'
+                else nullcontext()
+            )
         else:
-            start_epoch = 0
+            context = nullcontext()
+
+        with context:
+            outputs = model(inputs)
+            task_losses = self._compute_validation_loss(outputs, targets_dict, loss_fns)
+        
+        return task_losses, inputs, targets_dict, outputs
+    
+    def _compute_validation_loss(self, outputs, targets_dict, loss_fns):
+        """Compute validation loss for all tasks."""
+        task_losses = {}
+        
+        for t_name, t_gt in targets_dict.items():
+            t_pred = outputs[t_name]
+            task_loss_fns = loss_fns[t_name]  # List of (loss_fn, weight) tuples
+
+            task_total_loss = 0.0
+            for loss_fn, loss_weight in task_loss_fns:
+                # Compute loss
+                loss_value = loss_fn(t_pred, t_gt)
+                task_total_loss += loss_weight * loss_value
+
+            task_losses[t_name] = task_total_loss.detach().cpu().item()
+        
+        return task_losses
+
+    def _on_epoch_end(self, epoch, model, optimizer, scheduler, train_dataset, 
+                       ckpt_dir, model_ckpt_dir, checkpoint_history, best_checkpoints, 
+                       avg_val_loss):
+        """Handle end-of-epoch operations: checkpointing, cleanup, etc."""
+        ckpt_path = os.path.join(
+            ckpt_dir,
+            f"{self.mgr.model_name}_epoch{epoch}.pth"
+        )
+
+        checkpoint_data = save_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epoch=epoch,
+            checkpoint_path=ckpt_path,
+            model_config=model.final_config,
+            train_dataset=train_dataset
+        )
+
+        checkpoint_history.append((epoch, ckpt_path))
+
+        del checkpoint_data
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+            
+        # Manage checkpoint history
+        checkpoint_history, best_checkpoints = manage_checkpoint_history(
+            checkpoint_history=checkpoint_history,
+            best_checkpoints=best_checkpoints,
+            epoch=epoch,
+            checkpoint_path=ckpt_path,
+            validation_loss=avg_val_loss,
+            checkpoint_dir=ckpt_dir,
+            model_name=self.mgr.model_name,
+            max_recent=3,
+            max_best=2
+        )
+        
+        cleanup_old_configs(
+            model_ckpt_dir=model_ckpt_dir,
+            model_name=self.mgr.model_name,
+            keep_latest=1
+        )
+        
+        return checkpoint_history, best_checkpoints, ckpt_path
+    
+    def _prepare_metrics_for_logging(self, epoch, step, epoch_losses, current_lr=None, val_losses=None):
+        """Prepare metrics dict for logging but do NOT call wandb.log."""
+        metrics = {"epoch": epoch, "step": step}
+        
+        # Add training losses
+        for t_name in self.mgr.targets:
+            if t_name in epoch_losses and len(epoch_losses[t_name]) > 0:
+                # Use recent average for training losses
+                metrics[f"train_loss_{t_name}"] = np.mean(epoch_losses[t_name][-100:])
+        
+        # Add total training loss
+        if epoch_losses:
+            recent_losses = [np.mean(losses[-100:]) for losses in epoch_losses.values() if len(losses) > 0]
+            if recent_losses:
+                metrics["train_loss_total"] = np.mean(recent_losses)
+        
+        # Add learning rate if provided
+        if current_lr is not None:
+            metrics["learning_rate"] = current_lr
+        
+        # Add validation losses if provided
+        if val_losses is not None:
+            total_val_loss = 0.0
+            for t_name in self.mgr.targets:
+                if t_name in val_losses and len(val_losses[t_name]) > 0:
+                    val_avg = np.mean(val_losses[t_name])
+                    metrics[f"val_loss_{t_name}"] = val_avg
+                    total_val_loss += val_avg
+            
+            # Add total validation loss
+            if self.mgr.targets:
+                metrics["val_loss_total"] = total_val_loss / len(self.mgr.targets)
+        
+        return metrics
+
+    def train(self):
+        # Initialize all training components
+        training_state = self._initialize_training()
+        
+        # Unpack the state
+        model = training_state['model']
+        optimizer = training_state['optimizer']
+        scheduler = training_state['scheduler']
+        is_per_iteration_scheduler = training_state['is_per_iteration_scheduler']
+        loss_fns = training_state['loss_fns']
+        scaler = training_state['scaler']
+        train_dataset = training_state['train_dataset']
+        val_dataset = training_state['val_dataset']
+        train_dataloader = training_state['train_dataloader']
+        val_dataloader = training_state['val_dataloader']
+        train_indices = training_state['train_indices']
+        val_indices = training_state['val_indices']
+        use_amp = training_state['use_amp']
+        start_epoch = training_state['start_epoch']
+        ckpt_dir = training_state['ckpt_dir']
+        model_ckpt_dir = training_state['model_ckpt_dir']
+        
+        # Initialize wandb if configured
+        self._initialize_wandb(train_dataset, val_dataset, train_indices, val_indices)
+
+        # Track validation loss history and checkpoints
+        val_loss_history = {}  # {epoch: validation_loss}
+        checkpoint_history = deque(maxlen=3)
+        best_checkpoints = []
+        debug_gif_history = deque(maxlen=3)
+        best_debug_gifs = []  # List of (val_loss, epoch, gif_path)
 
         global_step = 0
         grad_accumulate_n = self.mgr.gradient_accumulation
@@ -328,7 +549,7 @@ class BaseTrainer:
         for epoch in range(start_epoch, self.mgr.max_epoch):
             model.train()
 
-            if getattr(self.mgr, 'max_steps_per_epoch', None) and self.mgr.max_steps_per_epoch > 0:
+            if getattr(self.mgr, 'max_steps_per_epoch', None) is not None and self.mgr.max_steps_per_epoch > 0:
                 num_iters = min(len(train_dataloader), self.mgr.max_steps_per_epoch)
             else:
                 num_iters = len(train_dataloader)
@@ -347,75 +568,62 @@ class BaseTrainer:
                     optimizer.zero_grad(set_to_none=True)
 
                 data_dict = next(train_iter)
-
-                if epoch == 0 and i == 0 and self.mgr.verbose:
-                    print("Items from the first batch -- Double check that your shapes and values are expected:")
-                    for item, val in data_dict.items():
-                        if isinstance(val, dict):
-                            print(f"{item}: (dictionary with keys: {list(val.keys())})")
-                            for sub_key, sub_val in val.items():
-                                print(
-                                    f"  {sub_key}: {sub_val.dtype}, {sub_val.shape}, min {sub_val.min()} max {sub_val.max()}")
-                        else:
-                            print(f"{item}: {val.dtype}, {val.shape}, min {val.min()} max {val.max()}")
-
                 global_step += 1
-
-                inputs = data_dict["image"].to(self.device, dtype=torch.float32)
-
-                targets_dict = {
-                    k: v.to(self.device, dtype=torch.float32)
-                    for k, v in data_dict.items()
-                    if k not in ["image", "patch_info"]
-                }
-
+                
+                # Setup autocast context
                 if use_amp and self.device.type in ['cuda', 'cpu']:
                     autocast_ctx = torch.amp.autocast(self.device.type)
                 else:
                     autocast_ctx = nullcontext()
-
-                with autocast_ctx:
-                    outputs = model(inputs)
-                    total_loss = 0.0
-
-                    for t_name, t_gt in targets_dict.items():
-                        t_pred = outputs[t_name]
-                        task_losses = loss_fns[t_name]  # List of (loss_fn, weight) tuples
-                        task_weight = self.mgr.targets[t_name].get("weight", 1.0)
-
-                        task_total_loss = 0.0
-                        for loss_fn, loss_weight in task_losses:
-                            # Compute loss
-                            # Use auxiliary loss computation helper
-                            loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt, outputs,
-                                                                self.mgr.targets[t_name])
-                            task_total_loss += loss_weight * loss_value
-
-                        weighted_loss = task_weight * task_total_loss
-                        total_loss += weighted_loss
-
-                        # Store the actual loss value (after task weighting but before grad accumulation scaling)
-                        epoch_losses[t_name].append(task_total_loss.detach().cpu().item())
-
-                    # Scale loss by accumulation steps to maintain same effective batch size
-                    total_loss = total_loss / grad_accumulate_n
-
-                # backward
-                scaler.scale(total_loss).backward()
-
-                if (i + 1) % grad_accumulate_n == 0 or (i + 1) == num_iters:
-                    scaler.unscale_(optimizer)
-                    grad_clip = getattr(self.mgr, 'gradient_clip', 12.0)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    scaler.step(optimizer)
-                    scaler.update()
-
-                    if is_per_iteration_scheduler:
-                        scheduler.step()
-
+                
+                # Execute training step
+                total_loss, task_losses, inputs, targets_dict, outputs = self._train_step(
+                    model=model,
+                    data_dict=data_dict,
+                    loss_fns=loss_fns,
+                    use_amp=use_amp,
+                    autocast_ctx=autocast_ctx,
+                    epoch=epoch,
+                    step=i,
+                    verbose=self.mgr.verbose
+                )
+                
+                # Accumulate losses for tracking
+                for t_name, loss_value in task_losses.items():
+                    epoch_losses[t_name].append(loss_value)
+                
+                # Update gradients
+                optimizer_stepped = self._update_gradients(
+                    scaler=scaler,
+                    total_loss=total_loss,
+                    optimizer=optimizer,
+                    model=model,
+                    step=i,
+                    num_iters=num_iters,
+                    grad_accumulate_n=grad_accumulate_n
+                )
+                
+                if optimizer_stepped and is_per_iteration_scheduler:
+                    scheduler.step()
+                
+                # Update progress bar
                 loss_str = " | ".join([f"{t}: {np.mean(epoch_losses[t][-100:]):.4f}"
                                        for t in self.mgr.targets if len(epoch_losses[t]) > 0])
                 pbar.set_postfix_str(loss_str)
+                
+                # Get current learning rate for logging
+                current_lr = optimizer.param_groups[0]['lr']
+                
+                # Log metrics to wandb once per step
+                if self.mgr.wandb_project:
+                    metrics = self._prepare_metrics_for_logging(
+                        epoch=epoch,
+                        step=global_step,
+                        epoch_losses=epoch_losses,
+                        current_lr=current_lr
+                    )
+                    import wandb
+                    wandb.log(metrics)
 
                 del data_dict, inputs, targets_dict, outputs
 
@@ -432,37 +640,16 @@ class BaseTrainer:
                 avg_loss = np.mean(epoch_losses[t_name]) if epoch_losses[t_name] else 0
                 print(f"  {t_name}: Avg Loss = {avg_loss:.4f}")
 
-            ckpt_path = os.path.join(
-                ckpt_dir,
-                f"{self.mgr.model_name}_epoch{epoch}.pth"
-            )
-
-            checkpoint_data = save_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch=epoch,
-                checkpoint_path=ckpt_path,
-                model_config=model.final_config,
-                train_dataset=train_dataset
-            )
-
-            checkpoint_history.append((epoch, ckpt_path))
-
-            del checkpoint_data
-            if self.device.type == 'cuda':
-                torch.cuda.empty_cache()
-
             # ---- validation ----- #
             if epoch % 1 == 0:
                 model.eval()
                 with torch.no_grad():
                     val_losses = {t_name: [] for t_name in self.mgr.targets}
+                    frames_array = None
 
                     val_dataloader_iter = iter(val_dataloader)
 
-                    if hasattr(self.mgr,
-                               'max_val_steps_per_epoch') and self.mgr.max_val_steps_per_epoch and self.mgr.max_val_steps_per_epoch > 0:
+                    if hasattr(self.mgr, 'max_val_steps_per_epoch') and self.mgr.max_val_steps_per_epoch is not None and self.mgr.max_val_steps_per_epoch > 0:
                         num_val_iters = min(len(val_indices), self.mgr.max_val_steps_per_epoch)
                     else:
                         num_val_iters = len(val_indices)
@@ -476,38 +663,19 @@ class BaseTrainer:
                             val_dataloader_iter = iter(val_dataloader)
                             data_dict = next(val_dataloader_iter)
 
-                        inputs = data_dict["image"].to(self.device, dtype=torch.float32)
-
-                        targets_dict = {
-                            k: v.to(self.device, dtype=torch.float32)
-                            for k, v in data_dict.items()
-                            if k not in ["image", "patch_info"]
-                        }
-
-                        if use_amp:
-                            context = (
-                                torch.amp.autocast('cuda') if self.device.type == 'cuda'
-                                else nullcontext()
-                            )
-                        else:
-                            context = nullcontext()
-
-                        with context:
-                            outputs = model(inputs)
-
-                            for t_name, t_gt in targets_dict.items():
-                                t_pred = outputs[t_name]
-                                task_losses = loss_fns[t_name]  # List of (loss_fn, weight) tuples
-
-                                task_total_loss = 0.0
-                                for loss_fn, loss_weight in task_losses:
-                                    # Compute loss
-                                    loss_value = loss_fn(t_pred, t_gt)
-                                    task_total_loss += loss_weight * loss_value
-
-                                val_losses[t_name].append(task_total_loss.detach().cpu().item())
-
-                            if i == 0:
+                        # Execute validation step
+                        task_losses, inputs, targets_dict, outputs = self._validation_step(
+                            model=model,
+                            data_dict=data_dict,
+                            loss_fns=loss_fns,
+                            use_amp=use_amp
+                        )
+                        
+                        # Accumulate validation losses
+                        for t_name, loss_value in task_losses.items():
+                            val_losses[t_name].append(loss_value)
+                        
+                        if i == 0:
                                 # Find first non-zero sample for debug visualization
                                 b_idx = 0
                                 found_non_zero = False
@@ -549,61 +717,59 @@ class BaseTrainer:
                                     )
                                     debug_gif_history.append((epoch, debug_img_path))
 
-                            loss_str = " | ".join([f"{t}: {np.mean(val_losses[t]):.4f}"
-                                                   for t in self.mgr.targets if len(val_losses[t]) > 0])
+                        loss_str = " | ".join([f"{t}: {np.mean(val_losses[t]):.4f}"
+                                               for t in self.mgr.targets if len(val_losses[t]) > 0])
+                        val_pbar.set_postfix_str(loss_str)
+                        
+                        # Log validation metrics to wandb once per validation step
+                        if self.mgr.wandb_project:
+                            global_step += 1
+                            # Prepare metrics for this validation step
+                            val_metrics = {"epoch": epoch, "step": global_step}
+                            for t_name, loss_value in task_losses.items():
+                                val_metrics[f"val_loss_{t_name}"] = loss_value
+                            
+                            # Add total validation loss for this step
+                            total_step_loss = sum(task_losses.values())
+                            val_metrics["val_loss_total"] = total_step_loss / len(task_losses) if task_losses else 0
+                            
+                            # Add debug gif only on first validation step
+                            if i == 0 and 'frames_array' in locals() and frames_array is not None:
+                                import wandb
+                                val_metrics["debug_gif"] = wandb.Video(frames_array)
+                            
+                            import wandb
+                            wandb.log(val_metrics)
+                        
+                        del outputs, inputs, targets_dict
 
-                            val_pbar.set_postfix_str(loss_str)
-
-                            del outputs, inputs, targets_dict
-
-                            # Log validation losses to wandb
-                            if self.mgr.wandb_project:
-                                wandb_log_dict = {
-                                    **{
-                                        f"train_loss_{t_name}": np.mean(epoch_losses[t_name])
-                                        for t_name in self.mgr.targets
-                                    },
-                                    **val_loss_dict,
-                                    "epoch": epoch
-                                }
-
-                                avg_train_loss = np.mean(
-                                    [np.mean(losses) for losses in epoch_losses.values() if losses])
-                                wandb_log_dict["train_loss_total"] = avg_train_loss
-
-                                if 'frames_array' in locals() and frames_array is not None:
-                                    wandb_log_dict["debug_gif"] = wandb.Video(frames_array)
-
-                                wandb.log(wandb_log_dict)
-
+                    # Calculate average validation losses for summary
                     print(f"\n[Validation] Epoch {epoch + 1} summary:")
                     total_val_loss = 0.0
-                    val_loss_dict = {}
                     for t_name in self.mgr.targets:
                         val_avg = np.mean(val_losses[t_name]) if val_losses[t_name] else 0
                         print(f"  Task '{t_name}': Avg validation loss = {val_avg:.4f}")
                         total_val_loss += val_avg
-                        val_loss_dict[f"val_loss_{t_name}"] = val_avg
 
                     # Average validation loss across all tasks
                     avg_val_loss = total_val_loss / len(self.mgr.targets) if self.mgr.targets else 0
                     val_loss_history[epoch] = avg_val_loss
-                    val_loss_dict["val_loss_total"] = avg_val_loss
-
-
-
-                    checkpoint_history, best_checkpoints = manage_checkpoint_history(
+                    
+                    # Handle epoch end operations (checkpointing, cleanup)
+                    checkpoint_history, best_checkpoints, ckpt_path = self._on_epoch_end(
+                        epoch=epoch,
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        train_dataset=train_dataset,
+                        ckpt_dir=ckpt_dir,
+                        model_ckpt_dir=model_ckpt_dir,
                         checkpoint_history=checkpoint_history,
                         best_checkpoints=best_checkpoints,
-                        epoch=epoch,
-                        checkpoint_path=ckpt_path,
-                        validation_loss=avg_val_loss,
-                        checkpoint_dir=ckpt_dir,
-                        model_name=self.mgr.model_name,
-                        max_recent=3,
-                        max_best=2
+                        avg_val_loss=avg_val_loss
                     )
-
+                    
+                    # Manage debug GIFs
                     if epoch in [e for e, _ in debug_gif_history]:
                         debug_gif_history, best_debug_gifs = manage_debug_gifs(
                             debug_gif_history=debug_gif_history,
@@ -616,12 +782,6 @@ class BaseTrainer:
                             max_recent=3,
                             max_best=2
                         )
-
-                    cleanup_old_configs(
-                        model_ckpt_dir=model_ckpt_dir,
-                        model_name=self.mgr.model_name,
-                        keep_latest=1
-                    )
 
         print('Training Finished!')
 
@@ -638,267 +798,9 @@ class BaseTrainer:
         )
 
 
-def detect_data_format(data_path):
-    """
-    Automatically detect the data format based on file extensions in the input directory.
-
-    Parameters
-    ----------
-    data_path : Path
-        Path to the data directory containing images/ and labels/ subdirectories
-
-    Returns
-    -------
-    str or None
-        Detected format ('zarr' or 'image') or None if cannot be determined
-    """
-    data_path = Path(data_path)
-    images_dir = data_path / "images"
-    labels_dir = data_path / "labels"
-
-    if not images_dir.exists():
-        return None
-
-    # Check for zarr directories and image files
-    zarr_count = 0
-    image_count = 0
-
-    # Check images directory
-    for item in images_dir.iterdir():
-        if item.is_dir() and item.suffix == '.zarr':
-            zarr_count += 1
-        elif item.is_file() and item.suffix.lower() in ['.tif', '.tiff', '.png', '.jpg', '.jpeg']:
-            image_count += 1
-
-    # Also check labels directory if it exists
-    if labels_dir.exists():
-        for item in labels_dir.iterdir():
-            if item.is_dir() and item.suffix == '.zarr':
-                zarr_count += 1
-            elif item.is_file() and item.suffix.lower() in ['.tif', '.tiff', '.png', '.jpg', '.jpeg']:
-                image_count += 1
-
-    # Determine format based on what was found
-    if zarr_count > 0 and image_count == 0:
-        # Only zarr files found
-        return 'zarr'
-    elif image_count > 0:
-        # If there are any image files, it's image format
-        # (even if there are zarr files too, as they may have been created during training)
-        return 'image'
-    else:
-        # No recognized files found
-        return None
 
 
-def configure_targets(mgr, loss_list=None):
-    """
-    Detect available targets from the data directory and apply optional loss_list.
-    """
-    # Save existing auxiliary tasks before detection
-    auxiliary_targets = preserve_auxiliary_targets(mgr.targets if hasattr(mgr, 'targets') and mgr.targets else {})
 
-    # Detect data-based targets if not yet configured
-    if not getattr(mgr, 'targets', None):
-        data_path = Path(mgr.data_path)
-        images_dir = data_path / "images"
-        if not images_dir.exists():
-            raise ValueError(f"Images directory not found: {images_dir}")
-
-        targets = set()
-        if mgr.data_format == "zarr":
-            for d in images_dir.iterdir():
-                if d.is_dir() and d.suffix == '.zarr' and '_' in d.stem:
-                    targets.add(d.stem.rsplit('_', 1)[1])
-        elif mgr.data_format.lower() == "image":
-            for ext in ['*.tif', '*.tiff', '*.png', '*.jpg', '*.jpeg']:
-                for f in images_dir.glob(ext):
-                    if '_' in f.stem:
-                        targets.add(f.stem.rsplit('_', 1)[1])
-        elif mgr.data_format == "napari":
-            print("Warning: target detection not implemented for napari format.")
-        if targets:
-            mgr.targets = {}
-            for t in sorted(targets):
-                mgr.targets[t] = {
-                    "out_channels": 2,
-                    "activation": "softmax",
-                    "loss_fn": "CrossEntropyLoss"
-                }
-            print(f"Detected targets from data: {sorted(targets)}")
-        else:
-            print("No targets detected from data. Please configure targets in config file.")
-
-    # Re-add auxiliary targets
-    if auxiliary_targets:
-        mgr.targets = restore_auxiliary_targets(mgr.targets, auxiliary_targets)
-        print(f"Re-added auxiliary targets: {list(auxiliary_targets.keys())}")
-
-    # Re-apply auxiliary tasks from config
-    apply_auxiliary_tasks_from_config(mgr)
-
-    # Apply loss_list to configured targets, if provided
-    if loss_list:
-        names = list(mgr.targets.keys())
-        for i, tname in enumerate(names):
-            fn = loss_list[i] if i < len(loss_list) else loss_list[-1]
-            mgr.targets[tname]["loss_fn"] = fn
-            print(f"Applied {fn} to target '{tname}'")
-
-
-def update_config_from_args(mgr, args):
-    """
-    Update ConfigManager with command line arguments.
-    """
-    # Only set data_path if input is provided
-    if args.input is not None:
-        mgr.data_path = Path(args.input)
-        # Save data_path to dataset_config
-        if not hasattr(mgr, 'dataset_config'):
-            mgr.dataset_config = {}
-        mgr.dataset_config["data_path"] = str(mgr.data_path)
-
-        if args.format:
-            mgr.data_format = args.format;
-            print(f"Using specified data format: {mgr.data_format}")
-        else:
-            detected = detect_data_format(mgr.data_path)
-            if detected:
-                mgr.data_format = detected;
-                print(f"Auto-detected data format: {mgr.data_format}")
-            else:
-                raise ValueError("Data format could not be determined. Please specify --format.")
-
-        # Save data_format to dataset_config
-        mgr.dataset_config["data_format"] = mgr.data_format
-    else:
-        # When using data_paths, we don't need data_path or data_format
-        print("No input directory specified - using data_paths from config")
-
-    # Set checkpoint output directory
-    mgr.ckpt_out_base = Path(args.output)
-    mgr.tr_info["ckpt_out_base"] = str(mgr.ckpt_out_base)
-
-    # Update optional parameters if provided
-    if args.batch_size is not None:
-        mgr.train_batch_size = args.batch_size
-        mgr.tr_configs["batch_size"] = args.batch_size
-
-    if args.patch_size is not None:
-        # Parse patch size from string like "192,192,192" or "256,256"
-        try:
-            patch_size = [int(x.strip()) for x in args.patch_size.split(',')]
-            mgr.update_config(patch_size=patch_size)
-        except ValueError as e:
-            raise ValueError(
-                f"Invalid patch size format: {args.patch_size}. Expected comma-separated integers like '192,192,192'")
-
-    if args.train_split is not None:
-        if not 0.0 <= args.train_split <= 1.0:
-            raise ValueError(f"Train split must be between 0.0 and 1.0, got {args.train_split}")
-        mgr.tr_val_split = args.train_split
-        mgr.tr_info["tr_val_split"] = args.train_split
-
-
-    if args.max_epoch is not None:
-        mgr.max_epoch = args.max_epoch
-        mgr.tr_configs["max_epoch"] = args.max_epoch
-
-    if args.max_steps_per_epoch is not None:
-        mgr.max_steps_per_epoch = args.max_steps_per_epoch
-        mgr.tr_configs["max_steps_per_epoch"] = args.max_steps_per_epoch
-
-    if args.max_val_steps_per_epoch is not None:
-        mgr.max_val_steps_per_epoch = args.max_val_steps_per_epoch
-        mgr.tr_configs["max_val_steps_per_epoch"] = args.max_val_steps_per_epoch
-
-    # Handle model name
-    if args.model_name is not None:
-        mgr.model_name = args.model_name
-        mgr.tr_info["model_name"] = args.model_name
-        if mgr.verbose:
-            print(f"Set model name: {mgr.model_name}")
-
-    # Handle nonlinearity/activation function
-    if args.nonlin is not None:
-        if not hasattr(mgr, 'model_config') or mgr.model_config is None:
-            mgr.model_config = {}
-        mgr.model_config["nonlin"] = args.nonlin
-        if mgr.verbose:
-            print(f"Set activation function: {args.nonlin}")
-
-    # Handle squeeze and excitation
-    if args.se:
-        if not hasattr(mgr, 'model_config') or mgr.model_config is None:
-            mgr.model_config = {}
-        mgr.model_config["squeeze_excitation"] = True
-        mgr.model_config["squeeze_excitation_reduction_ratio"] = args.se_reduction_ratio
-        if mgr.verbose:
-            print(f"Enabled squeeze and excitation with reduction ratio: {args.se_reduction_ratio}")
-
-    # Handle optimizer selection
-    if args.optimizer is not None:
-        mgr.optimizer = args.optimizer
-        mgr.tr_configs["optimizer"] = args.optimizer
-        if mgr.verbose:
-            print(f"Set optimizer: {mgr.optimizer}")
-
-    # Handle loss functions
-    if args.loss is not None:
-        import ast
-        # parse loss list
-        try:
-            loss_list = ast.literal_eval(args.loss)
-            loss_list = loss_list if isinstance(loss_list, list) else [loss_list]
-        except Exception:
-            loss_list = [s.strip() for s in args.loss.split(',')]
-        configure_targets(mgr, loss_list)
-
-    # Handle no_spatial flag
-    if args.no_spatial:
-        mgr.no_spatial = True
-        if hasattr(mgr, 'dataset_config'):
-            mgr.dataset_config['no_spatial'] = True
-        if mgr.verbose:
-            print(f"Disabled spatial transformations (--no-spatial flag set)")
-
-    # Handle gradient clipping
-    if args.grad_clip is not None:
-        mgr.gradient_clip = args.grad_clip
-        mgr.tr_configs["gradient_clip"] = args.grad_clip
-        if mgr.verbose:
-            print(f"Set gradient clipping: {mgr.gradient_clip}")
-
-    # Handle scheduler selection
-    if args.scheduler is not None:
-        mgr.scheduler = args.scheduler
-        mgr.tr_configs["scheduler"] = args.scheduler
-        if mgr.verbose:
-            print(f"Set learning rate scheduler: {mgr.scheduler}")
-
-        # If using cosine_warmup, handle its specific parameters
-        if args.scheduler == "cosine_warmup":
-            if not hasattr(mgr, 'scheduler_kwargs'):
-                mgr.scheduler_kwargs = {}
-
-            # Set warmup steps if provided
-            if args.warmup_steps is not None:
-                mgr.scheduler_kwargs["warmup_steps"] = args.warmup_steps
-                # Save scheduler_kwargs to tr_configs
-                mgr.tr_configs["scheduler_kwargs"] = mgr.scheduler_kwargs
-                if mgr.verbose:
-                    print(f"Set warmup steps: {args.warmup_steps}")
-
-    # Handle no_amp flag
-    if args.no_amp:
-        mgr.no_amp = True
-        mgr.tr_configs["no_amp"] = True
-        if mgr.verbose:
-            print(f"Disabled Automatic Mixed Precision (AMP)")
-
-    # Handle Weights & Biases arguments
-    mgr.wandb_project = args.wandb_project
-    mgr.wandb_entity = args.wandb_entity
 
 
 def main():
@@ -938,6 +840,8 @@ def main():
                         help="Maximum training steps per epoch (if not set, uses all data)")
     parser.add_argument("--max-val-steps-per-epoch", type=int, default=30,
                         help="Maximum validation steps per epoch (if not set, uses all data)")
+    parser.add_argument("--full-epoch", action="store_true",
+                        help="Iterate over entire train and validation datasets once per epoch (overrides max-steps-per-epoch)")
     parser.add_argument("--model-name", type=str,
                         help="Model name for checkpoints and logging (default: from config or 'Model')")
     parser.add_argument("--nonlin", type=str, choices=["LeakyReLU", "ReLU", "SwiGLU", "swiglu", "GLU", "glu"],

@@ -32,10 +32,8 @@ def sample_volume_task(task):
         (vol_idx, sampled_values)
     """
     vol_idx, img_data, shape, num_samples = task
-    
-    # Memory-efficient sampling
+
     if hasattr(img_data, 'chunks'):  # Zarr array
-        # Sample from zarr array without loading everything
         sampled_values = sample_from_zarr_with_progress(img_data, num_samples, vol_idx)
     else:  # Numpy array
         # For numpy arrays, we can flatten and sample
@@ -67,13 +65,11 @@ def sample_from_zarr_with_progress(zarr_array, num_samples, vol_idx):
     shape = zarr_array.shape
     ndim = len(shape)
     sampled_values = []
-    
-    # Show progress for large sample counts
+
     use_progress = num_samples > 10000
     if use_progress:
         pbar = tqdm(total=num_samples, desc=f"Sampling zarr volume {vol_idx}", leave=False)
-    
-    # Generate random indices in batches for efficiency
+
     batch_size = min(1000, num_samples)
     
     if ndim == 2:
@@ -103,7 +99,6 @@ def sample_from_zarr_with_progress(zarr_array, num_samples, vol_idx):
                     value = zarr_array[int(z), int(y), int(x)]
                     sampled_values.append(float(value))
                 except (ValueError, IndexError) as e:
-                    # Skip this sample if chunk is missing or corrupted
                     print(f"Warning: Skipping sample at ({z}, {y}, {x}) due to error: {e}")
                     continue
             
@@ -114,8 +109,7 @@ def sample_from_zarr_with_progress(zarr_array, num_samples, vol_idx):
     
     if use_progress:
         pbar.close()
-    
-    # Check if we collected any valid samples
+
     if len(sampled_values) == 0:
         raise ValueError(
             f"Failed to collect any valid samples from zarr array with shape {shape}. "

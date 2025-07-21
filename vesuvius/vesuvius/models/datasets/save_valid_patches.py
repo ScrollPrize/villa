@@ -179,13 +179,13 @@ def load_cached_patches(train_data_paths: List,
             print("Cache configuration mismatch - recomputing patches")
             return None
         
-        # Convert cached patches back to original format
+        # Convert cached patches back to expected format for base_dataset
         valid_patches = []
         for patch in cache_data["valid_patches"]:
             valid_patches.append({
-                "volume_idx": patch["volume_index"],
+                "volume_index": patch["volume_index"],
                 "volume_name": patch["volume_name"],
-                "start_pos": patch["start_position"]
+                "position": patch["start_position"]
             })
         
         print(f"Loaded {len(valid_patches)} valid patches from cache: {cache_file_path}")

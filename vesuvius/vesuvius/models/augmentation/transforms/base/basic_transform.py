@@ -43,7 +43,7 @@ class BasicTransform(abc.ABC):
         # Dynamic handling for any other keys (e.g., custom targets like 'ink', 'normals')
         # Skip 'ignore_masks' as it shouldn't be transformed
         known_keys = {'image', 'regression_target', 'segmentation', 'dist_map', 
-                      'geols_labels', 'keypoints', 'bbox', 'ignore_masks'}
+                      'geols_labels', 'keypoints', 'bbox', 'ignore_masks', 'is_unlabeled'}
         
         for key in data_dict.keys():
             if key not in known_keys and data_dict[key] is not None:

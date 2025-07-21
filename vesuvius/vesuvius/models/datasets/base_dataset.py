@@ -98,8 +98,7 @@ class BaseDataset(Dataset):
         self._initialize_volumes()
         ref_target = list(self.target_volumes.keys())[0]
         ref_volume_data = self.target_volumes[ref_target][0]['data']
-        
-        # Determine dimensionality from label if available, otherwise from image data
+
         if 'label' in ref_volume_data and ref_volume_data['label'] is not None:
             ref_shape = ref_volume_data['label'].shape
         else:
@@ -109,6 +108,9 @@ class BaseDataset(Dataset):
         
         if self.is_2d_dataset:
             print("Detected 2D dataset")
+            if len(self.patch_size) == 3:
+                self.patch_size = list(self.patch_size[-2:])
+                print(f"Adjusted patch size for 2D data: {self.patch_size}")
         else:
             print("Detected 3D dataset")
 
@@ -229,7 +231,6 @@ class BaseDataset(Dataset):
                 stride = (d // 2, h // 2, w // 2)  # 50% overlap by default
             
             positions = []
-            # Calculate total iterations for progress bar
             z_positions = list(range(0, D - d + 1, stride[0]))
             y_positions = list(range(0, H - h + 1, stride[1]))
             x_positions = list(range(0, W - w + 1, stride[2]))
@@ -281,17 +282,15 @@ class BaseDataset(Dataset):
         if hasattr(self.mgr, 'approved_patches_file') and self.mgr.approved_patches_file:
             if self._load_approved_patches():
                 return
-        
-        # Get configuration parameters
-        bbox_threshold = getattr(self.mgr, 'bbox_threshold', 0.97)
+
+        bbox_threshold = getattr(self.mgr, 'min_bbox_percent', 0.97)
         downsample_level = getattr(self.mgr, 'downsample_level', 1)
         num_workers = getattr(self.mgr, 'num_workers', 4)
-        
-        # Try to load from cache first
+
         if self.cache_enabled and len(self.zarr_arrays) > 0:
             cached_patches = load_cached_patches(
                 train_data_paths=self.data_paths,
-                label_paths=self.data_paths,  # Using same paths for labels
+                label_paths=self.data_paths,
                 patch_size=tuple(self.patch_size),
                 min_labeled_ratio=self.min_labeled_ratio,
                 bbox_threshold=bbox_threshold,
@@ -303,8 +302,7 @@ class BaseDataset(Dataset):
                 self.valid_patches = cached_patches
                 print(f"Successfully loaded {len(self.valid_patches)} patches from cache\n")
                 return
-        
-        # Compute patches using zarr arrays
+
         if len(self.zarr_arrays) == 0:
             raise ValueError("No zarr arrays available for patch finding. Subclasses must populate self.zarr_arrays")
             
@@ -324,7 +322,8 @@ class BaseDataset(Dataset):
         for patch in valid_patches:
             self.valid_patches.append({
                 "volume_index": patch["volume_idx"],
-                "position": patch["start_pos"]  # (z,y,x)
+                "volume_name": patch["volume_name"],
+                "position": patch["start_pos"]  # (z,y,x) for 3D or (y,x) for 2D
             })
         
         # Save to cache after computing
@@ -365,7 +364,7 @@ class BaseDataset(Dataset):
         
         # Extract coordinates based on dimensionality
         if self.is_2d_dataset:
-            _, y, x = patch_info["position"]
+            y, x = patch_info["position"]
             dy, dx = self.patch_size[-2:]  # Last 2 dimensions
             z, dz = 0, 0
             target_shape = (dy, dx)
@@ -464,9 +463,7 @@ class BaseDataset(Dataset):
             
             label_patch = np.ascontiguousarray(label_patch, dtype=np.float32)
             label_patches[t_name] = label_patch
-        
-        # Process auxiliary tasks
-        self._process_auxiliary_tasks(label_patches, self.is_2d_dataset)
+
         
         # Build result dictionary with torch tensors
         result = {
@@ -485,12 +482,10 @@ class BaseDataset(Dataset):
         Create training transforms using custom batchgeneratorsv2.
         Returns None for validation (no augmentations).
         """
-        # Get spatial transformation flag
         no_spatial = getattr(self.mgr, 'no_spatial', False)
             
         dimension = len(self.mgr.train_patch_size)
-        
-        # Handle both 2D and 3D patch sizes
+
         if dimension == 2:
             patch_h, patch_w = self.mgr.train_patch_size
             patch_d = None  # Not used for 2D
@@ -500,8 +495,7 @@ class BaseDataset(Dataset):
             raise ValueError(f"Invalid patch size dimension: {dimension}. Expected 2 or 3.")
 
         transforms = []
-        
-        # SpatialTransform handles both 2D and 3D automatically
+
         if not no_spatial:
             # Configure rotation based on patch aspect ratio
             if dimension == 2:

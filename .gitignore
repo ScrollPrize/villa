@@ -26,3 +26,6 @@ segmentation/napari_trainer/test_1638_debug.png
 /segmentation/models/batchgeneratorsv2/wandb
 /segmentation/models/wandb
 /vesuvius/wandb
+/checkpoints
+vesuvius/.DS_Store
+/wandb
