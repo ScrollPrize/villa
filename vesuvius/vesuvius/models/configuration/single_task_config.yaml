@@ -1,6 +1,6 @@
 tr_config:
-  patch_size: [128, 128]
-  initial_lr: 0.01
+  patch_size: [512, 512]
+  initial_lr: 0.0001
 
 dataset_config:
   min_labeled_ratio: 0 
@@ -12,6 +12,6 @@ dataset_config:
       activation: "none"
       out_channels: 1
       losses:
-        - name: "BCEWithLogitsLoss"
+        - name: "CEDiceLoss"
           weight: 1.0
 
