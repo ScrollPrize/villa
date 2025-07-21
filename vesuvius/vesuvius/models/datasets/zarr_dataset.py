@@ -198,20 +198,73 @@ class ZarrDataset(BaseDataset):
         # Check required directories exist
         if not images_dir.exists():
             raise ValueError(f"Images directory does not exist: {images_dir}")
-        if not labels_dir.exists():
-            raise ValueError(f"Labels directory does not exist: {labels_dir}")
+        
+        # Labels directory is optional when allow_unlabeled_data is True
+        has_labels_dir = labels_dir.exists()
+        if not has_labels_dir and not self.allow_unlabeled_data:
+            raise ValueError(f"Labels directory does not exist: {labels_dir} and allow_unlabeled_data=False")
+        elif not has_labels_dir:
+            print(f"Labels directory not found, loading unlabeled data only")
         
         # Get the configured targets
         configured_targets = set(self.mgr.targets.keys())
         print(f"Looking for configured targets: {configured_targets}")
         
-        # Find all label directories to determine which images and targets we need
-        label_dirs = [d for d in labels_dir.iterdir() if d.is_dir() and d.suffix == '.zarr']
-        if not label_dirs:
-            raise ValueError(f"No .zarr directories found in {labels_dir}")
+        # Find all label directories if they exist
+        if has_labels_dir:
+            label_dirs = [d for d in labels_dir.iterdir() if d.is_dir() and d.suffix == '.zarr']
+            if not label_dirs and not self.allow_unlabeled_data:
+                raise ValueError(f"No .zarr directories found in {labels_dir} and allow_unlabeled_data=False")
+        else:
+            label_dirs = []
         
         # Group files by target and image identifier
         targets_data = defaultdict(lambda: defaultdict(dict))
+        
+        # If no labels but unlabeled data is allowed, discover images directly
+        if not label_dirs and self.allow_unlabeled_data:
+            print("No label directories found, discovering unlabeled images...")
+            image_dirs = [d for d in images_dir.iterdir() if d.is_dir() and d.suffix == '.zarr']
+            
+            if not image_dirs:
+                raise ValueError(f"No .zarr directories found in {images_dir}")
+            
+            # Process each image directory as unlabeled
+            for image_dir in image_dirs:
+                stem = image_dir.stem  # Remove .zarr extension
+                
+                # For unlabeled data, we'll create entries for each configured target
+                for target in configured_targets:
+                    # Skip auxiliary tasks
+                    if self.mgr.targets.get(target, {}).get('auxiliary_task', False):
+                        continue
+                    
+                    # Open zarr arrays
+                    try:
+                        resolved_image_path = Path(image_dir).resolve()
+                        
+                        # Open image zarr
+                        if _is_ome_zarr(resolved_image_path):
+                            root = zarr.open_group(str(resolved_image_path), mode='r')
+                            if '0' in root:
+                                data_array = root['0']
+                            else:
+                                data_array = zarr.open(str(resolved_image_path), mode='r')
+                        else:
+                            data_array = zarr.open(str(resolved_image_path), mode='r')
+                        
+                        # Store with None for label to indicate unlabeled
+                        data_dict = {
+                            'data': data_array,
+                            'label': None  # None indicates unlabeled data
+                        }
+                        
+                        targets_data[target][stem] = data_dict
+                        print(f"Registered unlabeled image {stem} for target {target} with shape {data_array.shape}")
+                        
+                    except Exception as e:
+                        print(f"Warning: Could not open zarr {image_dir}: {e}")
+                        continue
         
         # Process each label directory
         for label_dir in label_dirs:
@@ -317,8 +370,11 @@ class ZarrDataset(BaseDataset):
         non_auxiliary_targets = {t for t in configured_targets 
                                 if not self.mgr.targets.get(t, {}).get('auxiliary_task', False)}
         missing_targets = non_auxiliary_targets - found_targets
-        if missing_targets:
+        if missing_targets and not self.allow_unlabeled_data:
             raise ValueError(f"Configured targets not found in data: {missing_targets}")
+        elif missing_targets:
+            print(f"Warning: Some configured targets not found in labeled data: {missing_targets}")
+            print("These targets will only have unlabeled data.")
         
         # Convert to the expected format for BaseDataset
         self.target_volumes = {}

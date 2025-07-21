@@ -311,8 +311,13 @@ class ImageDataset(BaseDataset):
         # Check required directories exist
         if not images_dir.exists():
             raise ValueError(f"Images directory does not exist: {images_dir}")
-        if not labels_dir.exists():
-            raise ValueError(f"Labels directory does not exist: {labels_dir}")
+        
+        # Labels directory is optional when allow_unlabeled_data is True
+        has_labels_dir = labels_dir.exists()
+        if not has_labels_dir and not self.allow_unlabeled_data:
+            raise ValueError(f"Labels directory does not exist: {labels_dir} and allow_unlabeled_data=False")
+        elif not has_labels_dir:
+            print(f"Labels directory not found, loading unlabeled images only")
         
         # Get or create Zarr groups
         images_group, labels_group, masks_group = self._get_or_create_zarr_groups()
@@ -321,20 +326,23 @@ class ImageDataset(BaseDataset):
         configured_targets = set(self.mgr.targets.keys())
         print(f"Looking for configured targets: {configured_targets}")
         
-        # Find all label files to determine which images and targets we need
-        # Support multiple image formats
-        print(f"DEBUG: Searching for label files in {labels_dir}")
+        # Find all label files if labels directory exists
         supported_extensions = ['.tif', '.tiff', '.png', '.jpg', '.jpeg']
         label_files = []
-        for ext in supported_extensions:
-            print(f"DEBUG: Looking for files with extension {ext}")
-            found_files = list(labels_dir.glob(f"*{ext}"))
-            print(f"DEBUG: Found {len(found_files)} files with extension {ext}")
-            label_files.extend(found_files)
         
-        print(f"DEBUG: Total label files found: {len(label_files)}")
-        if not label_files:
-            raise ValueError(f"No image files found in {labels_dir} with supported extensions: {supported_extensions}")
+        if has_labels_dir:
+            print(f"DEBUG: Searching for label files in {labels_dir}")
+            for ext in supported_extensions:
+                print(f"DEBUG: Looking for files with extension {ext}")
+                found_files = list(labels_dir.glob(f"*{ext}"))
+                print(f"DEBUG: Found {len(found_files)} files with extension {ext}")
+                label_files.extend(found_files)
+            
+            print(f"DEBUG: Total label files found: {len(label_files)}")
+            if not label_files and not self.allow_unlabeled_data:
+                raise ValueError(f"No image files found in {labels_dir} with supported extensions: {supported_extensions}")
+        else:
+            print("No labels directory, will discover unlabeled images")
         
         # Group files by target and image idenimageier
         targets_data = defaultdict(lambda: defaultdict(dict))
@@ -342,8 +350,42 @@ class ImageDataset(BaseDataset):
         # Track files to convert for progress bar
         files_to_process = []
         
+        # If no labels but unlabeled data is allowed, discover images directly
+        if not label_files and self.allow_unlabeled_data:
+            print("No label files found, discovering unlabeled images...")
+            image_files = []
+            for ext in supported_extensions:
+                found_files = list(images_dir.glob(f"*{ext}"))
+                image_files.extend(found_files)
+            
+            if not image_files:
+                raise ValueError(f"No image files found in {images_dir}")
+            
+            print(f"Found {len(image_files)} unlabeled images")
+            
+            # Process each image as unlabeled for all configured targets
+            for image_file in image_files:
+                stem = image_file.stem
+                
+                # Check if needs conversion to zarr
+                array_name = stem
+                if self._needs_update(image_file, images_group, array_name):
+                    files_to_process.append((image_file, images_group, array_name, 'image'))
+                
+                # Create entries for each configured target with None labels
+                for target in configured_targets:
+                    # Skip auxiliary tasks
+                    if self.mgr.targets.get(target, {}).get('auxiliary_task', False):
+                        continue
+                    
+                    targets_data[target][stem] = {
+                        'data': array_name,  # Will be loaded from zarr later
+                        'label': None,  # None indicates unlabeled
+                        'mask': None
+                    }
+            
         print(f"DEBUG: Processing {len(label_files)} label files...")
-        # First pass: idenimagey all files that need processing
+        # First pass: identify all files that need processing
         for idx, label_file in enumerate(label_files):
             if idx % 100 == 0:
                 print(f"DEBUG: Processing label file {idx}/{len(label_files)}")
@@ -521,6 +563,7 @@ class ImageDataset(BaseDataset):
         # Now load all arrays from the Zarr groups
         print("\nLoading Zarr arrays...")
         
+        # Load labeled data from files_to_process
         for target, image_id, image_file, label_file, mask_file in files_to_process:
             info = array_info[(target, image_id)]
             
@@ -542,14 +585,26 @@ class ImageDataset(BaseDataset):
             targets_data[target][image_id] = data_dict
             print(f"Loaded {image_id}_{target} with shape {data_array.shape}")
         
+        # Load any unlabeled data that was already added to targets_data
+        for target, images_dict in targets_data.items():
+            for image_id, data_dict in images_dict.items():
+                # If data is just a string (array name), load it from zarr
+                if isinstance(data_dict.get('data'), str):
+                    array_name = data_dict['data']
+                    data_dict['data'] = images_group[array_name]
+                    print(f"Loaded unlabeled image {image_id} for target {target} with shape {data_dict['data'].shape}")
+        
         # Check that all configured targets were found (excluding auxiliary tasks)
         found_targets = set(targets_data.keys())
         # Filter out auxiliary tasks from the check - they are generated dynamically
         non_auxiliary_targets = {t for t in configured_targets 
                                 if not self.mgr.targets.get(t, {}).get('auxiliary_task', False)}
         missing_targets = non_auxiliary_targets - found_targets
-        if missing_targets:
+        if missing_targets and not self.allow_unlabeled_data:
             raise ValueError(f"Configured targets not found in data: {missing_targets}")
+        elif missing_targets:
+            print(f"Warning: Some configured targets not found in labeled data: {missing_targets}")
+            print("These targets will only have unlabeled data.")
         
         # Convert to the expected format for BaseDataset
         self.target_volumes = {}

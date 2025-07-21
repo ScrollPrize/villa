@@ -79,6 +79,9 @@ class BaseDataset(Dataset):
         # Skip patch validation (defaults to False)
         self.skip_patch_validation = getattr(mgr, 'skip_patch_validation', False)
         
+        # Allow unlabeled data (defaults to False for backward compatibility)
+        self.allow_unlabeled_data = getattr(mgr, 'allow_unlabeled_data', False)
+        
         # Initialize normalization (will be set after computing intensity properties)
         self.normalization_scheme = getattr(mgr, 'normalization_scheme', 'zscore')
         self.intensity_properties = getattr(mgr, 'intensity_properties', {})
@@ -101,8 +104,15 @@ class BaseDataset(Dataset):
         
         self._initialize_volumes()
         ref_target = list(self.target_volumes.keys())[0]
-        ref_volume = self.target_volumes[ref_target][0]['data']['label']
-        self.is_2d_dataset = len(ref_volume.shape) == 2
+        ref_volume_data = self.target_volumes[ref_target][0]['data']
+        
+        # Determine dimensionality from label if available, otherwise from image data
+        if 'label' in ref_volume_data and ref_volume_data['label'] is not None:
+            ref_shape = ref_volume_data['label'].shape
+        else:
+            ref_shape = ref_volume_data['data'].shape
+        
+        self.is_2d_dataset = len(ref_shape) == 2 or (len(ref_shape) == 3 and ref_shape[0] <= 20)
         
         if self.is_2d_dataset:
             print("Detected 2D dataset")
@@ -440,13 +450,24 @@ class BaseDataset(Dataset):
                                                     desc="Processing volumes", 
                                                     total=total_volumes)):
             vdata = volume_info['data']
-            is_2d = len(vdata['label'].shape) == 2
+            
+            # Determine dimensionality from label if available, otherwise from image data
+            if 'label' in vdata and vdata['label'] is not None:
+                shape_ref = vdata['label'].shape
+            else:
+                shape_ref = vdata['data'].shape
+            
+            is_2d = len(shape_ref) == 2 or (len(shape_ref) == 3 and shape_ref[0] <= 20)
             
             if self.skip_patch_validation:
                 # Skip validation - generate all sliding window positions
                 print(f"Skipping patch validation for volume {vol_idx} - using all sliding window positions")
                 
-                volume_shape = vdata['label'].shape
+                # Use label shape if available, otherwise use image shape
+                if 'label' in vdata and vdata['label'] is not None:
+                    volume_shape = vdata['label'].shape
+                else:
+                    volume_shape = vdata['data'].shape
                 
                 # Handle multi-channel labels (e.g., eigenvalues with shape [C, D, H, W])
                 if len(volume_shape) == 4 and not is_2d:
@@ -465,22 +486,42 @@ class BaseDataset(Dataset):
                 print(f"Generated {len(patches)} patches from {'2D' if is_2d else '3D'} data using sliding window")
             else:
                 # Original validation logic
-                label_data = vdata['label']  # Get the label data explicitly
+                label_data = vdata.get('label')  # Get the label data if it exists
                 
-                # Handle multi-channel labels for patch finding
-                if len(label_data.shape) == 4 and not is_2d:
-                    # 4D data: [C, D, H, W] - use first channel for patch finding to avoid loading entire array
-                    print(f"Detected 4D label data with shape {label_data.shape} for volume {vol_idx}")
-                    print(f"Using first channel (of {label_data.shape[0]}) for patch validation to avoid memory issues")
-                    label_data_for_patches = label_data[0]  # [D, H, W] - only loads first channel
-                elif len(label_data.shape) == 3 and is_2d:
-                    # 3D data for 2D: [C, H, W] - use first channel
-                    print(f"Detected multi-channel 2D label data with shape {label_data.shape} for volume {vol_idx}")
-                    print(f"Using first channel (of {label_data.shape[0]}) for patch validation to avoid memory issues")
-                    label_data_for_patches = label_data[0]  # [H, W] - only loads first channel
+                # If no labels and unlabeled data is allowed, use image data for patch finding
+                if label_data is None and self.allow_unlabeled_data:
+                    print(f"No labels found for volume {vol_idx}, using image data for patch validation")
+                    image_data = vdata['data']
+                    # Handle multi-channel images for patch finding
+                    if len(image_data.shape) == 4 and not is_2d:
+                        # 4D data: [C, D, H, W] - use first channel
+                        print(f"Using first channel of image data for patch validation")
+                        image_data_for_patches = image_data[0]
+                    elif len(image_data.shape) == 3 and is_2d:
+                        # 3D data for 2D: [C, H, W] - use first channel
+                        print(f"Using first channel of image data for patch validation")
+                        image_data_for_patches = image_data[0]
+                    else:
+                        image_data_for_patches = image_data
+                    # Create zero array to simulate unlabeled patches
+                    label_data_for_patches = np.zeros_like(image_data_for_patches)
+                elif label_data is None:
+                    raise ValueError(f"No labels found for volume {vol_idx} and allow_unlabeled_data=False")
                 else:
-                    # Normal 3D or 2D data
-                    label_data_for_patches = label_data
+                    # Handle multi-channel labels for patch finding
+                    if len(label_data.shape) == 4 and not is_2d:
+                        # 4D data: [C, D, H, W] - use first channel for patch finding to avoid loading entire array
+                        print(f"Detected 4D label data with shape {label_data.shape} for volume {vol_idx}")
+                        print(f"Using first channel (of {label_data.shape[0]}) for patch validation to avoid memory issues")
+                        label_data_for_patches = label_data[0]  # [D, H, W] - only loads first channel
+                    elif len(label_data.shape) == 3 and is_2d:
+                        # 3D data for 2D: [C, H, W] - use first channel
+                        print(f"Detected multi-channel 2D label data with shape {label_data.shape} for volume {vol_idx}")
+                        print(f"Using first channel (of {label_data.shape[0]}) for patch validation to avoid memory issues")
+                        label_data_for_patches = label_data[0]  # [H, W] - only loads first channel
+                    else:
+                        # Normal 3D or 2D data
+                        label_data_for_patches = label_data
                 
                 # Check if mask is available
                 has_mask = 'mask' in vdata and vdata['mask'] is not None
@@ -710,7 +751,20 @@ class BaseDataset(Dataset):
         
         for t_name, volumes_list in self.target_volumes.items():
             volume_info = volumes_list[vol_idx]
-            label_arr = volume_info['data']['label']
+            label_arr = volume_info['data'].get('label')
+            
+            # If no label exists and unlabeled data is allowed, create zero array
+            if label_arr is None:
+                if self.allow_unlabeled_data:
+                    # Create zero array with same shape as patch
+                    if is_2d:
+                        label_patch = np.zeros((dy, dx), dtype=np.float32)
+                    else:
+                        label_patch = np.zeros((dz, dy, dx), dtype=np.float32)
+                    label_patches[t_name] = label_patch
+                    continue
+                else:
+                    raise ValueError(f"No label found for target '{t_name}' and allow_unlabeled_data=False")
             
             # Check if label has channel dimension
             has_channels = False
