@@ -52,7 +52,6 @@ from vesuvius.models.training.auxiliary_tasks import (
 
 from vesuvius.models.training.wandb_logging import save_train_val_filenames
 
-
 class BaseTrainer:
     def __init__(self,
                  mgr=None,

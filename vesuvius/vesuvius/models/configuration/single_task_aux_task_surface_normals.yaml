@@ -8,11 +8,8 @@ dataset_config:
   min_labeled_ratio: 0 
   min_bbox_percent: 0 
   skip_patch_validation: true
-  target_value:
-    surface: 1  # Binary segmentation for ink detection
   targets:
     surface:
-      target_value: 1
       weight: 1
       losses:
         - name: "BCEWithLogitsLoss"

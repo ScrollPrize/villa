@@ -1,13 +1,9 @@
 dataset_config:
-  binarize_labels: true
   min_labeled_ratio: 0 
   min_bbox_percent: 0 
   skip_patch_validation: true
-  target_value:
-    hz: 1  
   targets:
     hz:
-      target_value: 1
       activation: "none"
       weight: 1
       out_channels: 1

@@ -264,7 +264,7 @@ class BaseDataset(Dataset):
                         positions.append({
                             'start_pos': [z, y, W - w]
                         })
-        
+
         seen = set()
         unique_positions = []
         for pos in positions:
@@ -343,126 +343,60 @@ class BaseDataset(Dataset):
 
     def __len__(self):
         return len(self.valid_patches)
-
-    def _validate_dimensionality(self, data_item, ref_item=None):
-        """
-        Validate and ensure consistent dimensionality between different data samples.
-        
-        Parameters
-        ----------
-        data_item : numpy.ndarray
-            The data item to validate
-        ref_item : numpy.ndarray, optional
-            A reference item to compare against
             
-        Returns
-        -------
-        bool
-            True if the data is 2D, False if 3D
+    def _extract_patch(self, patch_info):
         """
-        is_2d = len(data_item.shape) == 2
-        
-        if ref_item is not None:
-            ref_is_2d = len(ref_item.shape) == 2
-            if is_2d != ref_is_2d:
-                raise ValueError(
-                    f"Dimensionality mismatch: Data item is {'2D' if is_2d else '3D'} "
-                    f"but reference item is {'2D' if ref_is_2d else '3D'}"
-                )
-        
-        return is_2d
-            
-    def _extract_patch_coords(self, patch_info):
-        """
-        Extract patch coordinates and sizes based on dataset dimensionality.
+        Extract both image and label patches from the volume and return as tensors.
         
         Parameters
         ----------
         patch_info : dict
-            Dictionary containing patch position information
-        
+            Dictionary containing patch position and volume index information
+            
         Returns
         -------
-        tuple
-            (z, y, x, dz, dy, dx, is_2d) coordinates and dimensions
+        dict
+            Dictionary containing:
+            - 'image': torch tensor of the image patch [C, H, W] or [C, D, H, W]
+            - target labels: torch tensors for each target
+            - 'is_unlabeled': bool indicating if patch has no valid labels
         """
+        vol_idx = patch_info["volume_index"]
+        
+        # Extract coordinates based on dimensionality
         if self.is_2d_dataset:
-            # For 2D, position is [dummy_z, y, x] and patch_size should be [h, w]
-            _, y, x = patch_info["position"]  # Unpack properly ignoring dummy z value
-            
-            # Handle patch_size dimensionality - take last 2 dimensions for 2D
-            if len(self.patch_size) >= 2:
-                dy, dx = self.patch_size[-2:]  # Take last 2 elements (height, width)
-            else:
-                raise ValueError(f"patch_size {self.patch_size} insufficient for 2D data")
-                
-            z, dz = 0, 0  # Not used for 2D
-            is_2d = True
+            _, y, x = patch_info["position"]
+            dy, dx = self.patch_size[-2:]  # Last 2 dimensions
+            z, dz = 0, 0
+            target_shape = (dy, dx)
         else:
-            # For 3D, position is (z, y, x) and patch_size is (d, h, w)
             z, y, x = patch_info["position"]
-            
-            # Handle patch_size dimensionality
             if len(self.patch_size) >= 3:
-                dz, dy, dx = self.patch_size[:3]  # Take first 3 elements
-            elif len(self.patch_size) == 2:
-                # 2D patch_size for 3D data - assume depth of 1
+                dz, dy, dx = self.patch_size[:3]
+            else:
                 dy, dx = self.patch_size
                 dz = 1
-            else:
-                raise ValueError(f"patch_size {self.patch_size} insufficient for 3D data")
-                
-            is_2d = False
-            
-        return z, y, x, dz, dy, dx, is_2d
-    
-    def _extract_image_patch(self, vol_idx, z, y, x, dz, dy, dx, is_2d):
-        """
-        Extract and normalize an image patch from the volume.
+            target_shape = (dz, dy, dx)
         
-        Parameters
-        ----------
-        vol_idx : int
-            Volume index
-        z, y, x : int
-            Starting coordinates
-        dz, dy, dx : int
-            Patch dimensions
-        is_2d : bool
-            Whether the data is 2D
-            
-        Returns
-        -------
-        numpy.ndarray
-            Normalized image patch with channel dimension [C, H, W] or [C, D, H, W]
-        """
-        # Get the image from the first target (all targets share the same image)
+        # Get the image data
         first_target_name = list(self.target_volumes.keys())[0]
         img_arr = self.target_volumes[first_target_name][vol_idx]['data']['data']
         
+        # Extract image patch
         try:
-            # Extract image patch with appropriate dimensionality
-            if is_2d:
+            if self.is_2d_dataset:
                 img_patch = img_arr[y:y+dy, x:x+dx]
-                # Check if we got valid data
                 if img_patch.size == 0:
-                    raise ValueError(f"Empty patch extracted at position y={y}, x={x}")
+                    raise ValueError("Empty patch")
                 img_patch = pad_or_crop_2d(img_patch, (dy, dx))
             else:
                 img_patch = img_arr[z:z+dz, y:y+dy, x:x+dx]
-                # Check if we got valid data
                 if img_patch.size == 0:
-                    raise ValueError(f"Empty patch extracted at position z={z}, y={y}, x={x}")
+                    raise ValueError("Empty patch")
                 img_patch = pad_or_crop_3d(img_patch, (dz, dy, dx))
-        except ValueError as e:
-            # Handle corrupt or missing chunks by creating a zero patch
+        except Exception as e:
             print(f"Warning: Failed to extract image patch at vol={vol_idx}, z={z}, y={y}, x={x}: {str(e)}")
-            print(f"Creating zero patch of size {'('+str(dy)+','+str(dx)+')' if is_2d else '('+str(dz)+','+str(dy)+','+str(dx)+')'}")
-            
-            if is_2d:
-                img_patch = np.zeros((dy, dx), dtype=np.float32)
-            else:
-                img_patch = np.zeros((dz, dy, dx), dtype=np.float32)
+            img_patch = np.zeros(target_shape, dtype=np.float32)
         
         # Apply normalization
         if self.normalizer is not None:
@@ -470,183 +404,89 @@ class BaseDataset(Dataset):
         else:
             img_patch = img_patch.astype(np.float32)
         
-        # Add channel dimension and ensure contiguous
-        img_patch = np.ascontiguousarray(img_patch[np.newaxis, ...])     
-        return img_patch
-    
-    def _extract_label_patches(self, vol_idx, z, y, x, dz, dy, dx, is_2d):
-        """
-        Extract all label patches for all targets.
+        # Add channel dimension
+        img_patch = np.ascontiguousarray(img_patch[np.newaxis, ...])
         
-        Parameters
-        ----------
-        vol_idx : int
-            Volume index
-        z, y, x : int
-            Starting coordinates
-        dz, dy, dx : int
-            Patch dimensions
-        is_2d : bool
-            Whether the data is 2D
-            
-        Returns
-        -------
-        dict
-            Dictionary of label patches for each target
-        """
+        # Extract label patches and check if unlabeled
         label_patches = {}
+        is_unlabeled = True  # Assume unlabeled until we find valid labels
         
         for t_name, volumes_list in self.target_volumes.items():
-            volume_info = volumes_list[vol_idx]
-            label_arr = volume_info['data'].get('label')
+            label_arr = volumes_list[vol_idx]['data'].get('label')
             
-            # If no label exists and unlabeled data is allowed, create zero array
             if label_arr is None:
-                if self.allow_unlabeled_data:
-                    # Create zero array with same shape as patch
-                    if is_2d:
-                        label_patch = np.zeros((dy, dx), dtype=np.float32)
-                    else:
-                        label_patch = np.zeros((dz, dy, dx), dtype=np.float32)
-                    label_patches[t_name] = label_patch
-                    continue
-                else:
-                    raise ValueError(f"No label found for target '{t_name}' and allow_unlabeled_data=False")
-            
-            # Check if label has channel dimension
-            has_channels = False
-            if is_2d and len(label_arr.shape) == 3:
-                # 2D multi-channel: [C, H, W]
-                has_channels = True
-                n_channels = label_arr.shape[0]
-            elif not is_2d and len(label_arr.shape) == 4:
-                # 3D multi-channel: [C, D, H, W]
-                has_channels = True
-                n_channels = label_arr.shape[0]
-            
-            if is_2d:
-                if has_channels:
-                    # Multi-channel 2D: extract channels one at a time to avoid memory issues
-                    channel_patches = []
-                    for c in range(n_channels):
-                        channel_patches.append(label_arr[c, y:y+dy, x:x+dx])
-                    label_patch = np.stack(channel_patches, axis=0)
-                else:
-                    # Single-channel 2D
-                    label_patch = label_arr[y:y+dy, x:x+dx]
-                
-                if has_channels:
-                    # Pad each channel separately
-                    padded_channels = []
-                    for c in range(n_channels):
-                        padded_channels.append(pad_or_crop_2d(label_patch[c], (dy, dx)))
-                    label_patch = np.stack(padded_channels, axis=0)
-                else:
-                    label_patch = pad_or_crop_2d(label_patch, (dy, dx))
+                # No label exists - create zero array
+                label_patch = np.zeros(target_shape, dtype=np.float32)
             else:
-                if has_channels:
-                    # Multi-channel 3D: extract channels one at a time to avoid memory issues
-                    channel_patches = []
-                    for c in range(n_channels):
-                        channel_patches.append(label_arr[c, z:z+dz, y:y+dy, x:x+dx])
-                    label_patch = np.stack(channel_patches, axis=0)
-                else:
-                    # Single-channel 3D
-                    label_patch = label_arr[z:z+dz, y:y+dy, x:x+dx]
+                # Extract label patch
+                has_channels = (self.is_2d_dataset and len(label_arr.shape) == 3) or \
+                              (not self.is_2d_dataset and len(label_arr.shape) == 4)
                 
-                if has_channels:
-                    # Pad each channel separately
-                    padded_channels = []
-                    for c in range(n_channels):
-                        padded_channels.append(pad_or_crop_3d(label_patch[c], (dz, dy, dx)))
-                    label_patch = np.stack(padded_channels, axis=0)
-                else:
-                    label_patch = pad_or_crop_3d(label_patch, (dz, dy, dx))
+                try:
+                    if self.is_2d_dataset:
+                        if has_channels:
+                            label_patch = label_arr[:, y:y+dy, x:x+dx]
+                        else:
+                            label_patch = label_arr[y:y+dy, x:x+dx]
+                        
+                        # Pad/crop
+                        if has_channels:
+                            n_channels = label_patch.shape[0]
+                            padded = [pad_or_crop_2d(label_patch[c], (dy, dx)) for c in range(n_channels)]
+                            label_patch = np.stack(padded, axis=0)
+                        else:
+                            label_patch = pad_or_crop_2d(label_patch, (dy, dx))
+                    else:
+                        if has_channels:
+                            label_patch = label_arr[:, z:z+dz, y:y+dy, x:x+dx]
+                        else:
+                            label_patch = label_arr[z:z+dz, y:y+dy, x:x+dx]
+                        
+                        # Pad/crop
+                        if has_channels:
+                            n_channels = label_patch.shape[0]
+                            padded = [pad_or_crop_3d(label_patch[c], (dz, dy, dx)) for c in range(n_channels)]
+                            label_patch = np.stack(padded, axis=0)
+                        else:
+                            label_patch = pad_or_crop_3d(label_patch, (dz, dy, dx))
+                    
+                    # Check if patch has any non-zero labels
+                    if np.any(label_patch > 0):
+                        is_unlabeled = False
+                        
+                except Exception as e:
+                    print(f"Warning: Failed to extract label patch for {t_name}: {str(e)}")
+                    label_patch = np.zeros(target_shape, dtype=np.float32)
+                
+                # Add channel dimension if needed
+                if not has_channels:
+                    label_patch = label_patch[np.newaxis, ...]
             
-            # Add channel dimension if not already present
-            if not has_channels:
-                label_patch = label_patch[np.newaxis, ...]
-            # Ensure contiguous
             label_patch = np.ascontiguousarray(label_patch, dtype=np.float32)
             label_patches[t_name] = label_patch
-            
-        # Process auxiliary tasks - generate distance transforms and other auxiliary targets
-        self._process_auxiliary_tasks(label_patches, is_2d)
-            
-        return label_patches
-
-
-    def _get_volume_id(self, vol_idx):
-        """
-        Get the volume identifier for a given volume index.
         
-        Parameters
-        ----------
-        vol_idx : int
-            Volume index
-            
-        Returns
-        -------
-        str or None
-            Volume identifier if available, None otherwise
-        """
-        # Get the first target to access volume info
-        first_target = list(self.target_volumes.keys())[0]
+        # Process auxiliary tasks
+        self._process_auxiliary_tasks(label_patches, self.is_2d_dataset)
         
-        # Check if volume_id was stored during initialization
-        if vol_idx < len(self.target_volumes[first_target]):
-            volume_info = self.target_volumes[first_target][vol_idx]
-            if 'volume_id' in volume_info:
-                return volume_info['volume_id']
+        # Build result dictionary with torch tensors
+        result = {
+            'image': torch.from_numpy(img_patch),
+            'is_unlabeled': is_unlabeled
+        }
         
-        # Fallback to None if not available
-        return None
-
-    
-    def _prepare_tensors(self, img_patch, label_patches, vol_idx, is_2d):
-        """
-        Convert numpy arrays to PyTorch tensors.
-        
-        All input arrays already have channel dimensions from extraction methods.
-        
-        Parameters
-        ----------
-        img_patch : numpy.ndarray
-            Image patch with shape [C, H, W] or [C, D, H, W]
-        label_patches : dict
-            Dictionary of label patches for each target with shape [C, H, W] or [C, D, H, W]
-        vol_idx : int
-            Volume index
-        is_2d : bool
-            Whether the data is 2D
-            
-        Returns
-        -------
-        dict
-            Dictionary of tensors for training
-        """
-        data_dict = {}
-        
-        # Simply convert image to tensor (already has channel dimension)
-        data_dict["image"] = torch.from_numpy(img_patch)
-        
-        # Process all labels - just convert to tensors
+        # Convert all label patches to tensors
         for t_name, label_patch in label_patches.items():
-            # Convert to tensor (already has proper shape and channel dimension)
-            data_dict[t_name] = torch.from_numpy(label_patch)
+            result[t_name] = torch.from_numpy(label_patch)
         
-        return data_dict
-    
+        return result
 
     def _create_training_transforms(self):
         """
         Create training transforms using custom batchgeneratorsv2.
         Returns None for validation (no augmentations).
         """
-        # Check if spatial transformations are disabled
-        if getattr(self.mgr, 'no_spatial', False):
-            print("Spatial transformations disabled (no_spatial=True)")
-            return None
+        # Get spatial transformation flag
+        no_spatial = getattr(self.mgr, 'no_spatial', False)
             
         dimension = len(self.mgr.train_patch_size)
         
@@ -658,25 +498,47 @@ class BaseDataset(Dataset):
             patch_d, patch_h, patch_w = self.mgr.train_patch_size
         else:
             raise ValueError(f"Invalid patch size dimension: {dimension}. Expected 2 or 3.")
-        if dimension == 2:
-            if max(self.mgr.train_patch_size) / min(self.mgr.train_patch_size) > 1.5:
-                rotation_for_DA = (-15. / 360 * 2. * np.pi, 15. / 360 * 2. * np.pi)
-            else:
-                rotation_for_DA = (-180. / 360 * 2. * np.pi, 180. / 360 * 2. * np.pi)
-            mirror_axes = (0, 1)
-        elif dimension == 3:
-            rotation_for_DA = (-30. / 360 * 2. * np.pi, 30. / 360 * 2. * np.pi)
-            mirror_axes = (0, 1, 2)
 
         transforms = []
         
-        if dimension == 2:
-            # 2D transforms (no transpose transform)
+        # SpatialTransform handles both 2D and 3D automatically
+        if not no_spatial:
+            # Configure rotation based on patch aspect ratio
+            if dimension == 2:
+                if max(self.mgr.train_patch_size) / min(self.mgr.train_patch_size) > 1.5:
+                    rotation_for_DA = (-15. / 360 * 2. * np.pi, 15. / 360 * 2. * np.pi)
+                else:
+                    rotation_for_DA = (-180. / 360 * 2. * np.pi, 180. / 360 * 2. * np.pi)
+                mirror_axes = (0, 1)
+            else:  # 3D
+                rotation_for_DA = (-30. / 360 * 2. * np.pi, 30. / 360 * 2. * np.pi)
+                mirror_axes = (0, 1, 2)
             
+            # Add SpatialTransform for rotations, scaling, elastic deformations
+            transforms.append(
+                SpatialTransform(
+                    self.mgr.train_patch_size, 
+                    patch_center_dist_from_border=0,
+                    random_crop=False,
+                    p_elastic_deform=0.2,
+                    elastic_deform_scale=(0, 0.25),
+                    elastic_deform_magnitude=(0, 0.25),
+                    p_rotation=0.2,
+                    rotation=rotation_for_DA,
+                    p_scaling=0.2,
+                    scaling=(0.7, 1.4),
+                    p_synchronize_scaling_across_axes=1,
+                    bg_style_seg_sampling=False
+                )
+            )
+            
+            # Add mirroring
             transforms.append(RandomTransform(
-                MirrorTransform(allowed_axes=(0, 1)), 
+                MirrorTransform(allowed_axes=mirror_axes), 
                 apply_probability=0.5
-            )),
+            ))
+        
+        if dimension == 2:
             transforms.append(RandomTransform(
                 GaussianBlurTransform(
                     blur_sigma=(0.5, 1.5),
@@ -686,34 +548,69 @@ class BaseDataset(Dataset):
                 ),
                 apply_probability=0.2
             ))
+            transforms.append(RandomTransform(
+                MultiplicativeBrightnessTransform(
+                    multiplier_range=BGContrast((0.75, 1.25)),
+                    synchronize_channels=False,
+                    p_per_channel=1
+                ), apply_probability=0.15
+            ))
+            transforms.append(RandomTransform(
+                ContrastTransform(
+                    contrast_range=BGContrast((0.75, 1.25)),
+                    preserve_range=True,
+                    synchronize_channels=False,
+                    p_per_channel=1
+                ), apply_probability=0.15
+            ))
+            transforms.append(RandomTransform(
+                GaussianNoiseTransform(
+                    noise_variance=(0, 0.1),
+                    p_per_channel=1,
+                    synchronize_channels=True
+                ), apply_probability=0.1
+            ))
+            transforms.append(RandomTransform(
+                GammaTransform(
+                    gamma=BGContrast((0.7, 1.5)),
+                    p_invert_image=0,
+                    synchronize_channels=False,
+                    p_per_channel=1,
+                    p_retain_stats=1
+                ), apply_probability=0.2
+            ))
+
+            rectangle_sizes_2d = tuple(
+                (max(1, size // 10), size // 3) for size in self.mgr.train_patch_size
+            )
+            transforms.append(RandomTransform(
+                BlankRectangleTransform(
+                    rectangle_size=rectangle_sizes_2d,
+                    rectangle_value=np.mean,
+                    num_rectangles=(1, 5),
+                    force_square=False,
+                    p_per_sample=0.3,
+                    p_per_channel=0.5
+                ), apply_probability=0.2
+            ))
         else:
-            # 3D transforms
-            transforms.append(
-            SpatialTransform(
-                self.mgr.train_patch_size, patch_center_dist_from_border=0, random_crop=False, p_elastic_deform=0,
-                p_rotation=0.0,
-                rotation=rotation_for_DA, p_scaling=0.0, scaling=(0.7, 1.4), p_synchronize_scaling_across_axes=1,
-                bg_style_seg_sampling=False  # , mode_seg='nearest'
-            )),
+            if not no_spatial:
+                # Only add transpose transform if all three dimensions are equal
+                if patch_d == patch_h == patch_w:
+                    transforms.append(RandomTransform(
+                        TransposeAxesTransform(allowed_axes={0, 1, 2}), 
+                        apply_probability=0.5
+                    ))
+
             transforms.append(RandomTransform(
-                    MirrorTransform(allowed_axes=mirror_axes), 
-                    apply_probability=0.2
-                )),
-            transforms.append(RandomTransform(
-                    GaussianBlurTransform(
-                        blur_sigma=(0.5, 1.0),
-                        synchronize_channels=True,
-                        synchronize_axes=False,
-                        p_per_channel=1.0
-                    ),
-                    apply_probability=0.3
-                )),
-            transforms.append(RandomTransform(
-                TransposeAxesTransform(
-                    allowed_axes={0, 1, 2},
-                    ),
-                    apply_probability=0.3
-            )),
+                GaussianBlurTransform(
+                    blur_sigma=(0.5, 1.0),
+                    synchronize_channels=True,
+                    synchronize_axes=False,
+                    p_per_channel=1.0
+                ),
+                apply_probability=0.3
+            ))
             transforms.append(RandomTransform(
                 GaussianNoiseTransform(
                     noise_variance=(0, 0.1),
@@ -772,77 +669,60 @@ class BaseDataset(Dataset):
                     p_retain_stats=1
                 ), apply_probability=0.3
             ))
+            rectangle_sizes_3d = tuple(
+                (max(1, size // 10), size // 3) for size in self.mgr.train_patch_size
+            )
             transforms.append(RandomTransform(
                 BlankRectangleTransform(
-                    rectangle_size=((max(1, self.mgr.train_patch_size[0] // 10), self.mgr.train_patch_size[0] // 3),
-                                    (max(1, self.mgr.train_patch_size[1] // 10), self.mgr.train_patch_size[1] // 3),
-                                    (max(1, self.mgr.train_patch_size[2] // 10), self.mgr.train_patch_size[2] // 3)),
-                    rectangle_value=np.mean,  # keeping the mean value
-                    num_rectangles=(1, 5),  # same as original
-                    force_square=False,  # same as original
-                    p_per_sample=0.4,  # same as original
-                    p_per_channel=0.5  # same as original
+                    rectangle_size=rectangle_sizes_3d,
+                    rectangle_value=np.mean,
+                    num_rectangles=(1, 5),
+                    force_square=False,
+                    p_per_sample=0.4,
+                    p_per_channel=0.5
                 ), apply_probability=0.3
             ))
             transforms.append(RandomTransform(
                 InhomogeneousSliceIlluminationTransform(
-                    num_defects=(2, 5),  # Range for number of defects
-                    defect_width=(5, 20),  # Range for defect width
-                    mult_brightness_reduction_at_defect=(0.3, 0.7),  # Range for brightness reduction
-                    base_p=(0.2, 0.4),  # Base probability range
-                    base_red=(0.5, 0.9),  # Base reduction range
-                    p_per_sample=1.0,  # Probability per sample
-                    per_channel=True,  # Apply per channel
-                    p_per_channel=0.5  # Probability per channel
+                    num_defects=(2, 5),
+                    defect_width=(5, 20),
+                    mult_brightness_reduction_at_defect=(0.3, 0.7),
+                    base_p=(0.2, 0.4),
+                    base_red=(0.5, 0.9),
+                    p_per_sample=1.0,
+                    per_channel=True,
+                    p_per_channel=0.5
                 ), apply_probability=0.25
             ))
-
-            # Only add transpose transform if all three dimensions (z, y, x) are equal
-            if patch_d == patch_h == patch_w:
-                transforms.insert(1, RandomTransform(
-                    TransposeAxesTransform(allowed_axes={0, 1, 2}), 
-                    apply_probability=0.5
-                ))
-                print(f"Added transpose transform for 3D (equal dimensions: {patch_d}x{patch_h}x{patch_w})")
-            else:
-                print(f"Skipped transpose transform for 3D (unequal dimensions: {patch_d}x{patch_h}x{patch_w})")
-
+        
+        if no_spatial:
+            print("Spatial transformations disabled (no_spatial=True)")
+        
         return ComposeTransforms(transforms)
     
     def __getitem__(self, index):
         """
-        Get a patch from the dataset.
+        Returns a dictionary with the following format:
+        {
+            'image': torch.Tensor,           # Shape: [C, H, W] (2D) or [C, D, H, W] (3D)
+            'is_unlabeled': bool,            # True if patch has no valid labels
+            'target_name_1': torch.Tensor,   # Shape: [C, H, W] (2D) or [C, D, H, W] (3D)
+            'target_name_2': torch.Tensor,   # Additional targets as configured
+            ...                              # (e.g., 'ink', 'normals', 'distance_transform', etc.)
+        }
         
-        Parameters
-        ----------
-        index : int
-            Index of the patch
-            
-        Returns
-        -------
-        dict
-            Dictionary of tensors for training
+        Where:
+        - C = number of channels (usually 1 for image, can vary for targets)
+        - H, W = height and width of patch
+        - D = depth of patch (3D only)
+        - All tensors are float32
+        - Labels are 0 for background, >0 for foreground
+        - Unlabeled patches will have all-zero label tensors
         """
-        # 1. Get patch info and coordinates
         patch_info = self.valid_patches[index]
-        vol_idx = patch_info["volume_index"]
-        z, y, x, dz, dy, dx, is_2d = self._extract_patch_coords(patch_info)
-        
-        # 2. Extract and normalize image patch
-        img_patch = self._extract_image_patch(vol_idx, z, y, x, dz, dy, dx, is_2d)
-        
-        # 3. Extract label patches for all targets
-        label_patches = self._extract_label_patches(vol_idx, z, y, x, dz, dy, dx, is_2d)
-    
-        # 4. Convert to tensors and format for the model
-        data_dict = self._prepare_tensors(img_patch, label_patches, vol_idx, is_2d)
-        
-        # Clean up intermediate numpy arrays
-        del img_patch, label_patches
-        
-        # 5. Apply augmentations if in training mode
+        data_dict = self._extract_patch(patch_info)
+
         if self.is_training and self.transforms is not None:
-            # Apply transforms directly to the torch tensors
             data_dict = self.transforms(**data_dict)
         
         return data_dict

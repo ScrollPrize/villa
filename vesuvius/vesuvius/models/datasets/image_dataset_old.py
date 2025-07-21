@@ -1,0 +1,539 @@
+import numpy as np
+import zarr
+from pathlib import Path
+from collections import defaultdict
+from tqdm import tqdm
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import cpu_count
+from .base_dataset import BaseDataset
+from vesuvius.utils.type_conversion import convert_to_uint8_dtype_range
+import cv2
+import tifffile
+
+def convert_image_to_zarr_worker(args):
+    """
+    Worker function to convert a single image file to a Zarr array.
+    This function is defined at module level to be picklable for multiprocessing.
+    
+    Parameters
+    ----------
+    args : tuple
+        (image_path, zarr_group_path, array_name, patch_size, pre_created)
+        
+    Returns
+    -------
+    tuple
+        (array_name, shape, success, error_msg)
+    """
+    image_path, zarr_group_path, array_name, patch_size, pre_created = args
+    
+    try:
+        # Read the image file
+        if str(image_path).lower().endswith(('.tif', '.tiff')):
+            # Use tifffile for TIFF files to handle 3D data
+            img = tifffile.imread(str(image_path))
+        else:
+            # Use cv2 for other image formats (2D only)
+            img = cv2.imread(str(image_path))
+        
+        # Convert to uint8 with proper scaling based on dtype
+        img = convert_to_uint8_dtype_range(img)
+        
+        # Open the Zarr group
+        group = zarr.open_group(str(zarr_group_path), mode='r+')
+        
+        if pre_created:
+            # Array already exists, just write the data
+            group[array_name][:] = img
+        else:
+            # Create the array (fallback for single-threaded mode)
+            # Use patch size directly as chunks
+            if len(img.shape) == 2:  # 2D
+                chunks = tuple(patch_size[:2])  # [h, w]
+            else:  # 3D
+                chunks = tuple(patch_size)  # [d, h, w]
+            
+            group.create_dataset(
+                array_name,
+                data=img,
+                shape=img.shape,
+                dtype=np.uint8,
+                chunks=chunks,
+                compressor=None,
+                overwrite=True,
+                write_empty_chunks=False
+            )
+        
+        return array_name, img.shape, True, None
+        
+    except Exception as e:
+        return array_name, None, False, str(e)
+
+class ImageDataset(BaseDataset):
+    """
+    A PyTorch Dataset for handling both 2D and 3D data from image files.
+    
+    This dataset automatically converts files to Zarr format on first use
+    for much faster random access during training. The Zarr files are stored
+    as groups in the data path:
+    - images.zarr/  (contains image1, image2, etc. as arrays)
+    - labels.zarr/  (contains image1_task, image2_task, etc. as arrays)
+    
+    Expected directory structure:
+    data_path/
+    ├── images/
+    │   ├── image1.tif          # Multi-task: single image for all tasks
+    │   ├── image1_task.tif     # Single-task: task-specific image
+    │   └── ...
+    └── labels/
+        ├── image1_task.tif     # Always task-specific
+        └── ...
+    """
+    
+    def _get_or_create_zarr_groups(self):
+        """
+        Get or create the Zarr groups for images and labels.
+        
+        Returns
+        -------
+        tuple
+            (images_group, labels_group)
+        """
+        images_zarr_path = self.data_path / "images.zarr"
+        labels_zarr_path = self.data_path / "labels.zarr"
+        
+        images_group = zarr.open_group(str(images_zarr_path), mode='a')
+        labels_group = zarr.open_group(str(labels_zarr_path), mode='a')
+        
+        return images_group, labels_group
+    
+    def _read_image_shape(self, image_path):
+        """Read the shape of an image file without loading all data."""
+        if str(image_path).lower().endswith(('.tif', '.tiff')):
+            with tifffile.TiffFile(str(image_path)) as tif:
+                return tif.series[0].shape
+        else:
+            img = cv2.imread(str(image_path))
+            return img.shape
+    
+    def _needs_update(self, image_file, zarr_group, array_name):
+        """Check if an image file is newer than its corresponding Zarr array."""
+        if array_name not in zarr_group:
+            return True
+        
+        image_mtime = os.path.getmtime(image_file)
+        group_store_path = Path(zarr_group.store.path)
+        
+        if group_store_path.exists():
+            array_meta_path = group_store_path / array_name / ".zarray"
+            if array_meta_path.exists():
+                zarr_mtime = os.path.getmtime(array_meta_path)
+                return image_mtime > zarr_mtime
+        
+        return True
+    
+    def _find_image_files(self, directory, extensions):
+        """Find all image files with given extensions in a directory."""
+        files = []
+        for ext in extensions:
+            files.extend(directory.glob(f"*{ext}"))
+        return files
+    
+    def _initialize_volumes(self):
+        """
+        Initialize volumes from image files, converting to Zarr format for fast access.
+        
+        Expected directory structure:
+        
+        For multi-task scenarios:
+        data_path/
+        ├── images/
+        │   ├── image1.tif      # Single image file
+        │   ├── image2.tif      # Single image file
+        │   └── ...
+        ├── labels/
+        │   ├── image1_ink.tif
+        │   ├── image1_damage.tif
+        │   ├── image2_ink.tif
+        │   ├── image2_damage.tif
+        │   └── ...
+        └── masks/
+            ├── image1_ink.tif
+            ├── image1_damage.tif
+            ├── image2_ink.tif
+            ├── image2_damage.tif
+            └── ...
+            
+        For single-task scenarios:
+        data_path/
+        ├── images/
+        │   ├── image1_ink.tif
+        │   ├── image2_ink.tif
+        │   └── ...
+        ├── labels/
+        │   ├── image1_ink.tif
+        │   ├── image2_ink.tif
+        │   └── ...
+        └── masks/
+            ├── image1_ink.tif
+            ├── image2_ink.tif
+            └── ...
+        """
+        if not hasattr(self.mgr, 'data_path'):
+            raise ValueError("ConfigManager must have 'data_path' attribute for image dataset")
+        
+        self.data_path = Path(self.mgr.data_path)
+        if not self.data_path.exists():
+            raise ValueError(f"Data path does not exist: {self.data_path}")
+        
+        images_dir = self.data_path / "images"
+        labels_dir = self.data_path / "labels"
+        masks_dir = self.data_path / "masks"
+        
+        # Check required directories exist
+        if not images_dir.exists():
+            raise ValueError(f"Images directory does not exist: {images_dir}")
+        
+        # Labels directory is optional when allow_unlabeled_data is True
+        has_labels_dir = labels_dir.exists()
+        if not has_labels_dir and not self.allow_unlabeled_data:
+            raise ValueError(f"Labels directory does not exist: {labels_dir} and allow_unlabeled_data=False")
+        elif not has_labels_dir:
+            print(f"Labels directory not found, loading unlabeled images only")
+        
+        # Get or create Zarr groups
+        images_group, labels_group, masks_group = self._get_or_create_zarr_groups()
+        
+        # Get the configured targets
+        configured_targets = set(self.mgr.targets.keys())
+        print(f"Looking for configured targets: {configured_targets}")
+        
+        # Find all label files if labels directory exists
+        supported_extensions = ['.tif', '.tiff', '.png', '.jpg', '.jpeg']
+        label_files = []
+        
+        if has_labels_dir:
+            print(f"DEBUG: Searching for label files in {labels_dir}")
+            for ext in supported_extensions:
+                print(f"DEBUG: Looking for files with extension {ext}")
+                found_files = list(labels_dir.glob(f"*{ext}"))
+                print(f"DEBUG: Found {len(found_files)} files with extension {ext}")
+                label_files.extend(found_files)
+            
+            print(f"DEBUG: Total label files found: {len(label_files)}")
+            if not label_files and not self.allow_unlabeled_data:
+                raise ValueError(f"No image files found in {labels_dir} with supported extensions: {supported_extensions}")
+        else:
+            print("No labels directory, will discover unlabeled images")
+        
+        # Group files by target and image identifier
+        targets_data = defaultdict(lambda: defaultdict(dict))
+        
+        # Track files to convert for progress bar
+        files_to_process = []
+        
+        # FIRST: Discover ALL images in the images directory
+        print("Discovering all images in the images directory...")
+        all_image_files = []
+        for ext in supported_extensions:
+            found_files = list(images_dir.glob(f"*{ext}"))
+            all_image_files.extend(found_files)
+        
+        if not all_image_files:
+            raise ValueError(f"No image files found in {images_dir}")
+        
+        print(f"Found {len(all_image_files)} total images")
+        
+        # Create a set to track which images have labels
+        labeled_image_ids = set()
+        
+        # Process label files to identify which images are labeled
+        if label_files:
+            print(f"Processing {len(label_files)} label files to identify labeled images...")
+            for label_file in label_files:
+                stem = label_file.stem
+                if '_' not in stem:
+                    continue
+                parts = stem.rsplit('_', 1)
+                if len(parts) != 2:
+                    continue
+                image_id, target = parts
+                if target in configured_targets:
+                    labeled_image_ids.add(image_id)
+        
+        print(f"Found {len(labeled_image_ids)} images with labels")
+        
+        # Track unlabeled images separately for now
+        unlabeled_images = []
+        
+        # Process all images, identifying unlabeled ones
+        unlabeled_count = 0
+        for image_file in all_image_files:
+            stem = image_file.stem
+            
+            # Check if this image has any labels
+            has_label = stem in labeled_image_ids
+            
+            if not has_label and self.allow_unlabeled_data:
+                # This is an unlabeled image
+                unlabeled_count += 1
+                unlabeled_images.append((stem, image_file))
+        
+        print(f"Found {unlabeled_count} unlabeled images that will be added to the dataset")
+        print(f"DEBUG: Processing {len(label_files)} label files...")
+        # First pass: identify all files that need processing
+        for idx, label_file in enumerate(label_files):
+            if idx % 100 == 0:
+                print(f"DEBUG: Processing label file {idx}/{len(label_files)}")
+            stem = label_file.stem  # Remove image extension
+            
+            # Parse label filename: image1_ink.tif -> image_id="image1", target="ink"
+            if '_' not in stem:
+                print(f"Skipping label file without underscore: {label_file.name}")
+                continue
+            
+            # Split on the last underscore to handle cases like "image1_test_ink"
+            parts = stem.rsplit('_', 1)
+            if len(parts) != 2:
+                print(f"Invalid label filename format: {label_file.name}")
+                continue
+            
+            image_id, target = parts
+            
+            # Only process targets that are in the configuration
+            if target not in configured_targets:
+                print(f"Skipping {image_id}_{target} - not in configured targets")
+                continue
+            
+            # Look for corresponding image file
+            # Get the extension of the label file to try matching first
+            label_ext = label_file.suffix
+            
+            # First try without task suffix (multi-task scenario)
+            image_file = None
+            for ext in [label_ext] + supported_extensions:
+                test_file = images_dir / f"{image_id}{ext}"
+                if test_file.exists():
+                    image_file = test_file
+                    break
+            
+            # If not found, try with task suffix (single-task/backward compatibility)
+            if image_file is None:
+                for ext in [label_ext] + supported_extensions:
+                    test_file = images_dir / f"{image_id}_{target}{ext}"
+                    if test_file.exists():
+                        image_file = test_file
+                        break
+            
+            if image_file is None:
+                tried_names = [f"{image_id}{ext}" for ext in supported_extensions]
+                tried_names.extend([f"{image_id}_{target}{ext}" for ext in supported_extensions])
+                raise ValueError(f"Image file not found for {image_id} (tried {', '.join(tried_names)})")
+            
+            # Look for mask file (always with task suffix)
+            mask_file = None
+            for ext in [label_ext] + supported_extensions:
+                test_file = masks_dir / f"{image_id}_{target}{ext}"
+                if test_file.exists():
+                    mask_file = test_file
+                    break
+            
+            files_to_process.append((target, image_id, image_file, label_file, mask_file))
+        
+        # Add unlabeled images to files_to_process
+        print(f"Adding {len(unlabeled_images)} unlabeled images to processing queue...")
+        for image_id, image_file in unlabeled_images:
+            # Add an entry for each configured target with None for label and mask
+            for target in configured_targets:
+                # Skip auxiliary tasks
+                if self.mgr.targets.get(target, {}).get('auxiliary_task', False):
+                    continue
+                files_to_process.append((target, image_id, image_file, None, None))
+        
+        # Collect all conversion tasks that need to be done
+        conversion_tasks = []
+        array_info = {}  # Track which arrays go where
+        arrays_to_create = []  # Track arrays that need pre-creation
+        
+        print(f"DEBUG: Found {len(files_to_process)} files to process")
+        print(f"DEBUG: Building conversion tasks...")
+        for idx, (target, image_id, image_file, label_file, mask_file) in enumerate(files_to_process):
+            if idx % 100 == 0:
+                print(f"DEBUG: Building conversion task {idx}/{len(files_to_process)}")
+            # Determine array names
+            if image_file.stem.endswith(f"_{target}"):
+                image_array_name = f"{image_id}_{target}"
+            else:
+                image_array_name = image_id
+            
+            # Check if conversions are needed
+            images_zarr_path = self.data_path / "images.zarr"
+            labels_zarr_path = self.data_path / "labels.zarr" 
+            masks_zarr_path = self.data_path / "masks.zarr"
+            
+            # Image conversion
+            if image_array_name not in images_group or self._needs_update(image_file, images_group, image_array_name):
+                # Read shape for pre-creation
+                print(f"DEBUG [{idx}]: Checking image file: {image_file.name}")
+                try:
+                    if str(image_file).lower().endswith(('.tif', '.tiff')):
+                        print(f"DEBUG [{idx}]: Reading TIFF shape...")
+                        img_shape = tifffile.imread(str(image_file)).shape
+                    else:
+                        print(f"DEBUG [{idx}]: Reading non-TIFF shape...")
+                        img_shape = cv2.imread(str(image_file)).shape
+                    print(f"DEBUG [{idx}]: Successfully read shape: {img_shape}")
+                except Exception as e:
+                    print(f"ERROR [{idx}]: Failed to read {image_file.name}: {str(e)}")
+                    raise
+                arrays_to_create.append((images_group, image_array_name, img_shape))
+                conversion_tasks.append((image_file, images_zarr_path, image_array_name, self.patch_size, True))
+            
+            # Label conversion (only if label file exists)
+            label_array_name = f"{image_id}_{target}" if label_file else None
+            if label_file and (label_array_name not in labels_group or self._needs_update(label_file, labels_group, label_array_name)):
+                # Read shape for pre-creation
+                if str(label_file).lower().endswith(('.tif', '.tiff')):
+                    label_shape = tifffile.imread(str(label_file)).shape
+                else:
+                    label_shape = cv2.imread(str(label_file)).shape
+                arrays_to_create.append((labels_group, label_array_name, label_shape))
+                conversion_tasks.append((label_file, labels_zarr_path, label_array_name, self.patch_size, True))
+            
+            # Mask conversion if available
+            mask_array_name = None
+            if mask_file:
+                mask_array_name = f"{image_id}_{target}"
+                if mask_array_name not in masks_group or self._needs_update(mask_file, masks_group, mask_array_name):
+                    # Read shape for pre-creation
+                    if str(mask_file).lower().endswith(('.tif', '.tiff')):
+                        mask_shape = tifffile.imread(str(mask_file)).shape
+                    else:
+                        mask_shape = cv2.imread(str(mask_file)).shape
+                    arrays_to_create.append((masks_group, mask_array_name, mask_shape))
+                    conversion_tasks.append((mask_file, masks_zarr_path, mask_array_name, self.patch_size, True))
+            
+            # Store info for later
+            array_info[(target, image_id)] = {
+                'image_array_name': image_array_name,
+                'label_array_name': label_array_name,
+                'mask_array_name': mask_array_name if mask_file else None
+            }
+        
+        # Perform parallel conversions if needed
+        if conversion_tasks:
+            print(f"\nConverting {len(conversion_tasks)} image files to Zarr format...")
+            
+            # Pre-create all Zarr arrays to avoid race conditions
+            print("Pre-creating Zarr array structure...")
+            for group, array_name, shape in arrays_to_create:
+                # Determine chunks based on shape
+                if len(shape) == 2:  # 2D
+                    chunks = tuple(self.patch_size[:2])
+                else:  # 3D
+                    chunks = tuple(self.patch_size)
+                
+                # Create empty array
+                group.create_dataset(
+                    array_name,
+                    shape=shape,
+                    dtype=np.uint8,
+                    chunks=chunks,
+                    compressor=None,
+                    overwrite=True,
+                    write_empty_chunks=False
+                )
+            
+            print(f"Using {cpu_count()} workers for parallel conversion...")
+            
+            with ProcessPoolExecutor(max_workers=cpu_count()) as executor:
+                # Submit all tasks
+                futures = {executor.submit(convert_image_to_zarr_worker, task): task for task in conversion_tasks}
+                
+                # Process completed tasks with progress bar
+                with tqdm(total=len(futures), desc="Converting images to Zarr") as pbar:
+                    for future in as_completed(futures):
+                        array_name, shape, success, error_msg = future.result()
+                        
+                        if success:
+                            pbar.set_description(f"Converted {array_name}")
+                        else:
+                            print(f"ERROR converting {array_name}: {error_msg}")
+                        
+                        pbar.update(1)
+            
+            print("✓ Conversion complete!")
+        else:
+            print("✓ All Zarr arrays are up to date!")
+        
+        # Now load all arrays from the Zarr groups
+        print("\nLoading Zarr arrays...")
+        
+        # Load data from files_to_process (both labeled and unlabeled)
+        for target, image_id, image_file, label_file, mask_file in files_to_process:
+            info = array_info[(target, image_id)]
+            
+            # Load arrays from groups
+            data_array = images_group[info['image_array_name']]
+            
+            # Load label array only if it exists
+            label_array = None
+            if info['label_array_name'] and info['label_array_name'] in labels_group:
+                label_array = labels_group[info['label_array_name']]
+            
+            # Store in the nested dictionary
+            data_dict = {
+                'data': data_array,
+                'label': label_array  # Will be None for unlabeled data
+            }
+            
+            # Load mask if available
+            if info.get('mask_array_name') and info['mask_array_name'] in masks_group:
+                mask_array = masks_group[info['mask_array_name']]
+                data_dict['mask'] = mask_array
+            else:
+                data_dict['mask'] = None
+            
+            targets_data[target][image_id] = data_dict
+            
+            # Print appropriate message
+            if label_array is not None:
+                print(f"Loaded labeled {image_id}_{target} with shape {data_array.shape}")
+            else:
+                print(f"Loaded unlabeled {image_id}_{target} with shape {data_array.shape}")
+        
+        # Check that all configured targets were found (excluding auxiliary tasks)
+        found_targets = set(targets_data.keys())
+        # Filter out auxiliary tasks from the check - they are generated dynamically
+        non_auxiliary_targets = {t for t in configured_targets 
+                                if not self.mgr.targets.get(t, {}).get('auxiliary_task', False)}
+        missing_targets = non_auxiliary_targets - found_targets
+        if missing_targets and not self.allow_unlabeled_data:
+            raise ValueError(f"Configured targets not found in data: {missing_targets}")
+        elif missing_targets:
+            print(f"Warning: Some configured targets not found in labeled data: {missing_targets}")
+            print("These targets will only have unlabeled data.")
+        
+        # Convert to the expected format for BaseDataset
+        self.target_volumes = {}
+        
+        # Also store volume IDs in order for each target
+        self.volume_ids = {}
+        
+        for target, images_dict in targets_data.items():
+            self.target_volumes[target] = []
+            self.volume_ids[target] = []
+            
+            for image_id, data_dict in images_dict.items():
+                volume_info = {
+                    'data': data_dict,
+                    'volume_id': image_id  # Store the volume ID
+                }
+                self.target_volumes[target].append(volume_info)
+                self.volume_ids[target].append(image_id)
+            
+            print(f"Target '{target}' has {len(self.target_volumes[target])} volumes")
+        
+        print(f"\nTotal targets loaded: {list(self.target_volumes.keys())}")
+        print("✓ Zarr cache ready")

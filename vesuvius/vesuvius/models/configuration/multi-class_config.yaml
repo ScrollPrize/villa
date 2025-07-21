@@ -8,13 +8,6 @@ tr_config:
   patch_size: [128, 128, 128]  # 3D patch size for patch extraction [z, y, x]
 
 dataset_config:
-  binarize_labels: true
-  target_value:
-    fibers:
-      mapping:
-        0: 0  # background
-        1: 1  # horizontal fiber 
-        2: 2  # vertical fiber 
   min_labeled_ratio: 0.1
   min_bbox_percent: 0.5
   targets:
