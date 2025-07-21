@@ -151,6 +151,10 @@ class MeanTeacherTrainer(BaseTrainer):
                     volume_info = train_dataset.target_volumes[target_name][vol_idx]
                     label_array = volume_info['data']['label']
                     
+                    # Check if label exists (not None) for unlabeled data
+                    if label_array is None:
+                        continue
+                    
                     # Extract the patch region from label array
                     if train_dataset.is_2d_dataset:
                         label_patch = label_array[y:y+dy, x:x+dx]
@@ -379,8 +383,11 @@ class MeanTeacherTrainer(BaseTrainer):
                 unlabeled_inputs = inputs[self.labeled_bs:]
                 
                 # Add noise to unlabeled inputs for teacher
-                noise = torch.clamp(torch.randn_like(unlabeled_inputs) * 0.1, -0.2, 0.2)
-                ema_inputs = unlabeled_inputs + noise
+                if unlabeled_inputs.shape[0] > 0:
+                    noise = torch.clamp(torch.randn_like(unlabeled_inputs) * 0.1, -0.2, 0.2)
+                    ema_inputs = unlabeled_inputs + noise
+                else:
+                    ema_inputs = unlabeled_inputs
                 
                 optimizer.zero_grad()
 
