@@ -857,10 +857,12 @@ def main():
                         help="Gradient clipping value (default: 12.0)")
     parser.add_argument("--no-amp", action="store_true",
                         help="Disable Automatic Mixed Precision (AMP) for training")
+    parser.add_argument("--skip-intensity-sampling", action="store_true",
+                        help="Skip intensity sampling during dataset initialization")
 
     # Trainer selection
     parser.add_argument("--trainer", type=str, default="base",
-                        help="Trainer class to use (default: base). Options: base, mean_teacher")
+                        help="Trainer class to use (default: base). Options: base, uncertainty_aware_mean_teacher")
 
     # Learning rate scheduler arguments
     parser.add_argument("--scheduler", type=str,
@@ -901,15 +903,17 @@ def main():
 
     # Select trainer based on --trainer argument
     trainer_name = args.trainer.lower()
-    if trainer_name == "mean_teacher":
-        from vesuvius.models.training.train_mean_teacher import MeanTeacherTrainer
-        trainer = MeanTeacherTrainer(mgr=mgr, verbose=args.verbose)
-        print("Using Mean Teacher Trainer for semi-supervised training")
+    if trainer_name == "uncertainty_aware_mean_teacher":
+        # Enable unlabeled data for uncertainty-aware mean teacher training
+        mgr.allow_unlabeled_data = True
+        from vesuvius.models.training.train_uncertainty_aware_mean_teacher import UncertaintyAwareMeanTeacher3DTrainer
+        trainer = UncertaintyAwareMeanTeacher3DTrainer(mgr=mgr, verbose=args.verbose)
+        print("Using Uncertainty-Aware Mean Teacher Trainer for semi-supervised 3D training")
     elif trainer_name == "base":
         trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Base Trainer for supervised training")
     else:
-        raise ValueError(f"Unknown trainer: {trainer_name}. Available options: base, mean_teacher")
+        raise ValueError(f"Unknown trainer: {trainer_name}. Available options: base, uncertainty_aware_mean_teacher")
 
     print("Starting training...")
     trainer.train()

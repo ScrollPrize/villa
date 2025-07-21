@@ -209,25 +209,26 @@ class ImageDataset(BaseDataset):
                 files_to_process.append((target, image_id, image_array_name, label_array_name))
 
         if self.allow_unlabeled_data:
-            labeled_image_ids = {f[1] for f in files_to_process}
+            # Collect the image array names that already have labels
+            labeled_image_names = {f[2] for f in files_to_process}
             
             for image_file in all_image_files:
                 stem = image_file.stem
 
-                if stem in labeled_image_ids:
+                # Skip if this image already has a label
+                if stem in labeled_image_names:
                     continue
 
-                for target in configured_targets:
-                    if '_' in stem and not stem.endswith(f"_{target}"):
-                        continue
-                    
-                    image_array_name = stem
+                # For unlabeled data, we need to include all images regardless of naming pattern
+                image_array_name = stem
 
-                    if self._needs_update(image_file, images_group, image_array_name):
-                        shape = self._read_image_shape(image_file)
-                        conversion_tasks.append((image_file, self.data_path / "images.zarr", image_array_name, self.patch_size, shape))
-                    
-                    image_id = stem.split('_')[0] if '_' in stem else stem
+                if self._needs_update(image_file, images_group, image_array_name):
+                    shape = self._read_image_shape(image_file)
+                    conversion_tasks.append((image_file, self.data_path / "images.zarr", image_array_name, self.patch_size, shape))
+                
+                image_id = stem.split('_')[0] if '_' in stem else stem
+                # Add this unlabeled image for each configured target
+                for target in configured_targets:
                     files_to_process.append((target, image_id, image_array_name, None))
 
         if conversion_tasks:

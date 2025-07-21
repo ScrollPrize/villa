@@ -114,16 +114,32 @@ class BaseDataset(Dataset):
         else:
             print("Detected 3D dataset")
 
-        self.intensity_properties = initialize_intensity_properties(
-            target_volumes=self.target_volumes,
-            normalization_scheme=self.normalization_scheme,
-            existing_properties=self.intensity_properties,
-            cache_enabled=self.cache_enabled,
-            cache_dir=self.cache_dir,
-            mgr=self.mgr,
-            sample_ratio=0.001,
-            max_samples=1000000
-        )
+        # Check if we should skip intensity sampling
+        skip_intensity_sampling = getattr(mgr, 'skip_intensity_sampling', False)
+        
+        if skip_intensity_sampling:
+            print("Skipping intensity sampling as requested")
+            # Use default values if intensity properties not provided
+            if not self.intensity_properties:
+                self.intensity_properties = {
+                    'mean': 0.0,
+                    'std': 1.0,
+                    'min': 0.0,
+                    'max': 1.0,
+                    'percentile_00_5': 0.0,
+                    'percentile_99_5': 1.0
+                }
+        else:
+            self.intensity_properties = initialize_intensity_properties(
+                target_volumes=self.target_volumes,
+                normalization_scheme=self.normalization_scheme,
+                existing_properties=self.intensity_properties,
+                cache_enabled=self.cache_enabled,
+                cache_dir=self.cache_dir,
+                mgr=self.mgr,
+                sample_ratio=0.001,
+                max_samples=1000000
+            )
 
         self.normalizer = get_normalization(self.normalization_scheme, self.intensity_properties)
 
@@ -132,7 +148,25 @@ class BaseDataset(Dataset):
             self.transforms = self._create_training_transforms()
             print("Training transforms initialized")
 
-        self._get_valid_patches()
+        if not self.skip_patch_validation:
+            self._get_valid_patches()
+        else:
+            print("Skipping patch validation as requested")
+            # Generate all possible patches without validation
+            self.valid_patches = []
+            for vol_idx, zarr_array in enumerate(self.zarr_arrays):
+                vol_name = self.zarr_names[vol_idx] if vol_idx < len(self.zarr_names) else f"volume_{vol_idx}"
+                positions = self._get_all_sliding_window_positions(
+                    volume_shape=zarr_array.shape,
+                    patch_size=self.patch_size
+                )
+                for pos_dict in positions:
+                    self.valid_patches.append({
+                        "volume_index": vol_idx,
+                        "volume_name": vol_name,
+                        "position": pos_dict['start_pos']
+                    })
+            print(f"Generated {len(self.valid_patches)} patches without validation")
 
     def _initialize_volumes(self):
         """

@@ -1,5 +1,5 @@
 tr_config:
-  patch_size: [512, 512]
+  patch_size: [128, 128,128]
   initial_lr: 0.0001
 
 dataset_config:
@@ -8,10 +8,10 @@ dataset_config:
   normalization_scheme: "zscore"
   skip_patch_validation: true
   targets:
-    ink:
+    surface:
       activation: "none"
       out_channels: 1
       losses:
-        - name: "CEDiceLoss"
+        - name: "BCEDiceLoss"
           weight: 1.0
 
