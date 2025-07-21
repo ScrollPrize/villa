@@ -131,40 +131,15 @@ class MeanTeacherTrainer(BaseTrainer):
 
         for idx, patch_info in enumerate(tqdm(train_dataset.valid_patches, desc="Checking patches for labels")):
             vol_idx = patch_info["volume_index"]
-
-            if train_dataset.is_2d_dataset:
-                _, y, x = patch_info["position"]  # [dummy_z, y, x]
-                if len(train_dataset.patch_size) >= 2:
-                    dy, dx = train_dataset.patch_size[-2:]
-                else:
-                    raise ValueError(f"patch_size {train_dataset.patch_size} insufficient for 2D data")
-            else:
-                z, y, x = patch_info["position"]  # [z, y, x]
-                if len(train_dataset.patch_size) >= 3:
-                    dz, dy, dx = train_dataset.patch_size[:3]
-                else:
-                    raise ValueError(f"patch_size {train_dataset.patch_size} insufficient for 3D data - need at least 3 dimensions")
             
             has_label = False
             
-            # Check each target's label array for this specific patch region
+            # Check if any target has a label (non-None) in the original data structure
             for target_name in self.mgr.targets:
                 if target_name in train_dataset.target_volumes:
                     volume_info = train_dataset.target_volumes[target_name][vol_idx]
-                    label_array = volume_info['data']['label']
-                    
-                    # Check if label exists (not None) for unlabeled data
-                    if label_array is None:
-                        continue
-                    
-                    # Extract the patch region from label array
-                    if train_dataset.is_2d_dataset:
-                        label_patch = label_array[y:y+dy, x:x+dx]
-                    else:
-                        label_patch = label_array[z:z+dz, y:y+dy, x:x+dx]
-                    
-                    # Check if this patch region has any non-zero values
-                    if np.any(label_patch != 0):
+                    # Check the original data dict structure - if 'label' is None, it's unlabeled
+                    if volume_info['data'].get('label') is not None:
                         has_label = True
                         break
             
