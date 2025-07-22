@@ -114,8 +114,27 @@ def update_config_from_args(mgr, args):
         if not hasattr(mgr, 'model_config') or mgr.model_config is None:
             mgr.model_config = {}
         mgr.model_config["pool_type"] = args.pool_type
-        if mgr.verbose:
-            print(f"Set pooling type: {args.pool_type}")
+        
+        # Update pool_op to reflect the actual pooling operation that will be used
+        if args.pool_type != 'conv':
+            # Import get_matching_pool_op to determine the correct pool class
+            from vesuvius.models.utilities.utils import get_matching_pool_op, determine_dimensionality
+            
+            # Get dimensionality info
+            dim_info = determine_dimensionality(mgr.train_patch_size)
+            op_dims = dim_info["op_dims"]
+            
+            # Get the matching pool operation
+            pool_class = get_matching_pool_op(dimension=op_dims, pool_type=args.pool_type)
+            mgr.model_config["pool_op"] = f"nn.{pool_class.__name__}"
+            
+            if mgr.verbose:
+                print(f"Set pooling type: {args.pool_type} (using {pool_class.__name__})")
+        else:
+            # When pool_type is 'conv', no pooling op is used
+            mgr.model_config["pool_op"] = None
+            if mgr.verbose:
+                print(f"Set pooling type: conv (using strided convolutions, no pooling)")
 
     # Handle optimizer selection
     if args.optimizer is not None:

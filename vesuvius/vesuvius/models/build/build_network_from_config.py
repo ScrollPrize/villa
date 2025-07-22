@@ -364,6 +364,7 @@ class NetworkFromConfig(nn.Module):
             "stochastic_depth_p": model_config.get("stochastic_depth_p", 0.0),
             "squeeze_excitation": model_config.get("squeeze_excitation", False),
             "squeeze_excitation_reduction_ratio": model_config.get("squeeze_excitation_reduction_ratio", 1.0/16.0),
+            "pool_type": model_config.get("pool_type", "conv"),
             "op_dims": self.op_dims,
             "patch_size": self.patch_size,
             "batch_size": self.batch_size,
