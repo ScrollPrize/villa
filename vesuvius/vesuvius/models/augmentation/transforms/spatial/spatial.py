@@ -132,9 +132,17 @@ class SpatialTransform(BasicTransform):
             center_location_in_pixels = [i / 2 for i in shape]
         else:
             center_location_in_pixels = []
-            for d in range(0, 3):
-                mn = self.patch_center_dist_from_border[d]
-                mx = shape[d] - self.patch_center_dist_from_border[d]
+            # Use actual number of spatial dimensions instead of hardcoded 3
+            num_spatial_dims = len(shape)
+            for d in range(num_spatial_dims):
+                # Handle case where patch_center_dist_from_border might be shorter
+                if isinstance(self.patch_center_dist_from_border, (list, tuple)):
+                    dist = self.patch_center_dist_from_border[d] if d < len(self.patch_center_dist_from_border) else self.patch_center_dist_from_border[-1]
+                else:
+                    dist = self.patch_center_dist_from_border
+                    
+                mn = dist
+                mx = shape[d] - dist
                 if mx < mn:
                     center_location_in_pixels.append(shape[d] / 2)
                 else:
