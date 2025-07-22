@@ -84,11 +84,10 @@ class NetworkFromConfig(nn.Module):
         # --------------------------------------------------------------------
         self.conv_op = model_config.get("conv_op", "nn.Conv3d")
         self.conv_op_kwargs = model_config.get("conv_op_kwargs", {"bias": False})
-        self.pool_op = model_config.get("pool_op", "nn.AvgPool3d")
-        self.dropout_op = model_config.get("dropout_op", "nn.Dropout3d")
-        self.dropout_op_kwargs = model_config.get("dropout_op_kwargs", {"p": 0.0})
+        self.dropout_op = model_config.get("dropout_op", None)
+        self.dropout_op_kwargs = model_config.get("dropout_op_kwargs", None)
         self.norm_op = model_config.get("norm_op", "nn.InstanceNorm3d")
-        self.norm_op_kwargs = model_config.get("norm_op_kwargs", {"affine": False, "eps": 1e-5})
+        self.norm_op_kwargs = model_config.get("norm_op_kwargs", {"affine": True, "eps": 1e-5})
         self.conv_bias = model_config.get("conv_bias", True)
         self.nonlin = model_config.get("nonlin", "nn.LeakyReLU")
         self.nonlin_kwargs = model_config.get("nonlin_kwargs", {"inplace": True})
@@ -115,14 +114,6 @@ class NetworkFromConfig(nn.Module):
                 self.conv_op = nn.Conv3d
                 print("Using 3D convolutions (nn.Conv3d)")
 
-        if isinstance(self.pool_op, str):
-            if self.op_dims == 2:
-                self.pool_op = nn.AvgPool2d
-                print("Using 2D pooling (nn.AvgPool2d)")
-            else:
-                self.pool_op = nn.AvgPool3d
-                print("Using 3D pooling (nn.AvgPool3d)")
-
         if isinstance(self.norm_op, str):
             if self.op_dims == 2:
                 self.norm_op = nn.InstanceNorm2d
@@ -138,10 +129,15 @@ class NetworkFromConfig(nn.Module):
             else:
                 self.dropout_op = nn.Dropout3d
                 print("Using 3D dropout (nn.Dropout3d)")
+        elif self.dropout_op is None:
+            # Keep it as None - nnUNet default
+            pass
 
         if self.nonlin in ["nn.LeakyReLU", "LeakyReLU"]:
             self.nonlin = nn.LeakyReLU
-            self.nonlin_kwargs = {"negative_slope": 1e-2, "inplace": True}
+            # Keep the original nonlin_kwargs from config, don't override
+            if "negative_slope" not in self.nonlin_kwargs:
+                self.nonlin_kwargs["negative_slope"] = 0.01  # PyTorch default
         elif self.nonlin in ["nn.ReLU", "ReLU"]:
             self.nonlin = nn.ReLU
             self.nonlin_kwargs = {"inplace": True}
@@ -346,7 +342,6 @@ class NetworkFromConfig(nn.Module):
             "n_blocks_per_stage": self.n_blocks_per_stage,
             "n_conv_per_stage_decoder": model_config.get("n_conv_per_stage_decoder", [1] * (self.num_stages - 1)),
             "kernel_sizes": self.kernel_sizes,
-            "pool_op": self.pool_op.__name__ if hasattr(self.pool_op, "__name__") else self.pool_op,
             "pool_op_kernel_sizes": self.pool_op_kernel_sizes,
             "conv_op": self.conv_op.__name__ if hasattr(self.conv_op, "__name__") else self.conv_op,
             "conv_bias": self.conv_bias,

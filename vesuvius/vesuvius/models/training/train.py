@@ -849,8 +849,6 @@ def main():
     parser.add_argument("--se", action="store_true", help="Enable squeeze and excitation modules in the encoder")
     parser.add_argument("--se-reduction-ratio", type=float, default=0.0625,
                         help="Squeeze excitation reduction ratio (default: 0.0625 = 1/16)")
-    parser.add_argument("--pool-op", type=str,
-                        help="Pooling operation class name (e.g., 'nn.AvgPool2d', 'nn.MaxPool3d'). If not specified, uses config default")
     parser.add_argument("--pool-type", type=str, choices=["avg", "max", "conv"],
                         help="Type of pooling to use in encoder ('avg', 'max', or 'conv' for strided convolutions). Default: 'conv'")
     parser.add_argument("--optimizer", type=str,

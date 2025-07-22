@@ -120,9 +120,8 @@ class ConfigManager:
         # Determine dims for ops based on patch size
         dim_props = determine_dimensionality(self.train_patch_size, self.verbose)
         self.model_config["conv_op"] = dim_props["conv_op"]
-        self.model_config["pool_op"] = dim_props["pool_op"]
         self.model_config["norm_op"] = dim_props["norm_op"]
-        self.model_config["dropout_op"] = dim_props["dropout_op"]
+        # Don't set dropout_op - let it default to None to match nnUNet
         self.spacing = dim_props["spacing"]
         self.op_dims = dim_props["op_dims"]
 
@@ -260,9 +259,8 @@ class ConfigManager:
 
                 dim_props = determine_dimensionality(self.train_patch_size, self.verbose)
                 self.model_config["conv_op"] = dim_props["conv_op"]
-                self.model_config["pool_op"] = dim_props["pool_op"]
                 self.model_config["norm_op"] = dim_props["norm_op"]
-                self.model_config["dropout_op"] = dim_props["dropout_op"]
+                # Don't set dropout_op - let it default to None to match nnUNet
                 self.spacing = dim_props["spacing"]
                 self.op_dims = dim_props["op_dims"]
 

@@ -424,9 +424,7 @@ def determine_dimensionality(patch_size, pool_type='avg', verbose=False):
         return {
             "op_dims": 2,
             "conv_op": "nn.Conv2d",
-            "pool_op": "nn.AvgPool2d",
             "norm_op": "nn.InstanceNorm2d",
-            "dropout_op": "nn.Dropout2d",
             "spacing": [1] * 2,
             "default_kernel": [3, 3],
             "default_pool": [1, 1],
@@ -438,9 +436,7 @@ def determine_dimensionality(patch_size, pool_type='avg', verbose=False):
         return {
             "op_dims": 3,
             "conv_op": "nn.Conv3d",
-            "pool_op": "nn.AvgPool3d",
             "norm_op": "nn.InstanceNorm3d",
-            "dropout_op": "nn.Dropout3d",
             "spacing": [1] * 3,
             "default_kernel": [3, 3, 3],
             "default_pool": [1, 1, 1],
