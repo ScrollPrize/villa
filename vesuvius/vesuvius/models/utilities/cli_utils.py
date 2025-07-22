@@ -101,6 +101,22 @@ def update_config_from_args(mgr, args):
         if mgr.verbose:
             print(f"Enabled squeeze and excitation with reduction ratio: {args.se_reduction_ratio}")
 
+    # Handle pool_op
+    if args.pool_op is not None:
+        if not hasattr(mgr, 'model_config') or mgr.model_config is None:
+            mgr.model_config = {}
+        mgr.model_config["pool_op"] = args.pool_op
+        if mgr.verbose:
+            print(f"Set pooling operation: {args.pool_op}")
+
+    # Handle pool_type
+    if args.pool_type is not None:
+        if not hasattr(mgr, 'model_config') or mgr.model_config is None:
+            mgr.model_config = {}
+        mgr.model_config["pool_type"] = args.pool_type
+        if mgr.verbose:
+            print(f"Set pooling type: {args.pool_type}")
+
     # Handle optimizer selection
     if args.optimizer is not None:
         mgr.optimizer = args.optimizer

@@ -89,7 +89,7 @@ class NetworkFromConfig(nn.Module):
         self.dropout_op_kwargs = model_config.get("dropout_op_kwargs", {"p": 0.0})
         self.norm_op = model_config.get("norm_op", "nn.InstanceNorm3d")
         self.norm_op_kwargs = model_config.get("norm_op_kwargs", {"affine": False, "eps": 1e-5})
-        self.conv_bias = model_config.get("conv_bias", False)
+        self.conv_bias = model_config.get("conv_bias", True)
         self.nonlin = model_config.get("nonlin", "nn.LeakyReLU")
         self.nonlin_kwargs = model_config.get("nonlin_kwargs", {"inplace": True})
 
@@ -300,7 +300,8 @@ class NetworkFromConfig(nn.Module):
             bottleneck_channels=model_config.get("bottleneck_channels", None),
             stochastic_depth_p=model_config.get("stochastic_depth_p", 0.0),
             squeeze_excitation=model_config.get("squeeze_excitation", False),
-            squeeze_excitation_reduction_ratio=model_config.get("squeeze_excitation_reduction_ratio", 1.0/16.0)
+            squeeze_excitation_reduction_ratio=model_config.get("squeeze_excitation_reduction_ratio", 1.0/16.0),
+            pool_type=model_config.get("pool_type", "conv")
         )
         self.task_decoders = nn.ModuleDict()
         self.task_activations = nn.ModuleDict()

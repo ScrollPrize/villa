@@ -399,7 +399,7 @@ def get_n_blocks_per_stage(num_stages):
             blocks.append(6)
     return blocks
 
-def determine_dimensionality(patch_size, verbose=False):
+def determine_dimensionality(patch_size, pool_type='avg', verbose=False):
     """
     Centralized function to determine dimensionality and set appropriate operations
     based on patch size.
@@ -408,6 +408,8 @@ def determine_dimensionality(patch_size, verbose=False):
     ----------
     patch_size : tuple or list
         The patch size dimensions
+    pool_type : str, optional
+        Type of pooling operation ('avg', 'max', or 'conv'). Default is 'avg'
     verbose : bool, optional
         Whether to print debug information
         
