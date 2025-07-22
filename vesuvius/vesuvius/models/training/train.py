@@ -723,7 +723,6 @@ class BaseTrainer:
                         
                         # Log validation metrics to wandb once per validation step
                         if self.mgr.wandb_project:
-                            global_step += 1
                             # Prepare metrics for this validation step
                             val_metrics = {"epoch": epoch, "step": global_step}
                             for t_name, loss_value in task_losses.items():
