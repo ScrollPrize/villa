@@ -22,7 +22,7 @@ def sigmoid_rampup(current, rampup_length):
         return float(np.exp(-5.0 * phase * phase))
 
 
-def softmax_mse_loss(input_logits, target_logits, sigmoid=False):
+def softmax_mse_loss(input_logits, target_logits, use_sigmoid=False):
     """Takes softmax on both sides and returns MSE loss
     
     Note:
@@ -31,7 +31,7 @@ def softmax_mse_loss(input_logits, target_logits, sigmoid=False):
     - Sends gradients to inputs but not the targets.
     """
     assert input_logits.size() == target_logits.size()
-    if sigmoid:
+    if use_sigmoid:
         input_softmax = torch.sigmoid(input_logits)
         target_softmax = torch.sigmoid(target_logits)
     else:
@@ -142,25 +142,21 @@ class UncertaintyAwareMeanTeacher3DTrainer(BaseTrainer):
         """Get consistency weight with ramp-up schedule."""
         return self.consistency_weight * sigmoid_rampup(epoch, consistency_rampup)
     
-    def compute_uncertainty(self, ema_model, unlabeled_inputs, T=8):
+    def compute_uncertainty_and_teacher_outputs(self, ema_model, unlabeled_inputs, T=8):
         """
-        Compute uncertainty using multiple stochastic forward passes.
+        Compute uncertainty and teacher predictions using multiple stochastic forward passes.
         
         Returns:
             uncertainty: Uncertainty map for each spatial location
-            mean_prediction: Mean prediction across T forward passes
+            mean_predictions: Dict of mean predictions for each task across T forward passes
         """
         B, C, D, H, W = unlabeled_inputs.shape
         
-        # Prepare for T forward passes (process in batches for efficiency)
-        batch_size_per_pass = B
-        num_passes = T
-        
-        # Store predictions
-        all_preds = []
+        # Collect predictions for all tasks
+        all_task_preds = {}
         
         with torch.no_grad():
-            for i in range(num_passes):
+            for i in range(T):
                 # Add noise for stochastic prediction
                 noise = torch.clamp(
                     torch.randn_like(unlabeled_inputs) * self.noise_scale,
@@ -172,41 +168,53 @@ class UncertaintyAwareMeanTeacher3DTrainer(BaseTrainer):
                 # Forward pass through teacher
                 outputs = ema_model(noisy_inputs)
                 
-                # Handle dictionary outputs
-                if isinstance(outputs, dict):
-                    # Use the first task's output for consistency
-                    first_task = list(outputs.keys())[0]
-                    pred = outputs[first_task]
-                else:
-                    pred = outputs
+                # Ensure we have dict outputs
+                if not isinstance(outputs, dict):
+                    outputs = {'default': outputs}
                 
-                # Apply activation based on task configuration
-                if hasattr(self.mgr, 'targets'):
-                    first_task = list(self.mgr.targets.keys())[0]
-                    activation = self.mgr.targets[first_task].get('activation', 'softmax')
-                    
-                    if activation == 'softmax':
-                        pred = F.softmax(pred, dim=1)
-                    elif activation == 'sigmoid':
-                        pred = torch.sigmoid(pred)
-                    else:
-                        # For 'none' or other activations, assume softmax for uncertainty
-                        pred = F.softmax(pred, dim=1)
-                else:
-                    pred = F.softmax(pred, dim=1)
-                
-                all_preds.append(pred)
+                # Collect predictions for each task
+                for task_name, pred in outputs.items():
+                    if task_name not in all_task_preds:
+                        all_task_preds[task_name] = []
+                    all_task_preds[task_name].append(pred)
         
-        # Stack predictions: (T, B, num_classes, D, H, W)
-        all_preds = torch.stack(all_preds, dim=0)
+        # Compute mean predictions and uncertainty for each task
+        mean_predictions = {}
+        uncertainties = []
         
-        # Compute mean prediction
-        mean_pred = torch.mean(all_preds, dim=0)  # (B, num_classes, D, H, W)
+        for task_name, preds_list in all_task_preds.items():
+            # Stack predictions: (T, B, C, D, H, W)
+            stacked_preds = torch.stack(preds_list, dim=0)
+            
+            # Compute mean prediction (raw logits)
+            mean_pred_logits = torch.mean(stacked_preds, dim=0)
+            mean_predictions[task_name] = mean_pred_logits
+            
+            # For uncertainty, we need to apply appropriate activation
+            # Check if this is a single-channel output (binary classification)
+            out_channels = stacked_preds.shape[2]  # Channel dimension is 2 for (T, B, C, D, H, W)
+            
+            if out_channels == 1:
+                # Binary task - use sigmoid
+                activated_preds = torch.sigmoid(stacked_preds)
+                mean_activated = torch.mean(activated_preds, dim=0)
+                # Uncertainty for binary: entropy of mean prediction
+                eps = 1e-6
+                uncertainty = -1.0 * (mean_activated * torch.log(mean_activated + eps) + 
+                                    (1 - mean_activated) * torch.log(1 - mean_activated + eps))
+            else:
+                # Multi-class task - use softmax
+                activated_preds = F.softmax(stacked_preds, dim=2)  # Softmax over channel dimension
+                mean_activated = torch.mean(activated_preds, dim=0)
+                # Uncertainty for multi-class: entropy of mean prediction
+                uncertainty = -1.0 * torch.sum(mean_activated * torch.log(mean_activated + 1e-6), dim=1, keepdim=True)
+            
+            uncertainties.append(uncertainty)
         
-        # Compute uncertainty as entropy of mean prediction
-        uncertainty = -1.0 * torch.sum(mean_pred * torch.log(mean_pred + 1e-6), dim=1, keepdim=True)
+        # Average uncertainty across tasks
+        avg_uncertainty = torch.mean(torch.stack(uncertainties, dim=0), dim=0)
         
-        return uncertainty, mean_pred
+        return avg_uncertainty, mean_predictions
     
     def _initialize_training(self):
         """Override to add EMA model initialization and TwoStreamBatchSampler."""
@@ -372,15 +380,15 @@ class UncertaintyAwareMeanTeacher3DTrainer(BaseTrainer):
             if num_unlabeled > 0:
                 # Get consistency weight with ramp-up
                 consistency_weight = self.get_current_consistency_weight(
-                    global_step // 150,  # Convert to epoch-like scale
+                    global_step,  # Use global_step directly like reference
                     self.consistency_rampup
                 )
                 
                 # Extract unlabeled samples
                 unlabeled_inputs = inputs[is_unlabeled]
                 
-                # Compute uncertainty and mean teacher prediction
-                uncertainty, teacher_pred_mean = self.compute_uncertainty(
+                # Compute uncertainty and teacher predictions for all tasks
+                uncertainty, teacher_predictions = self.compute_uncertainty_and_teacher_outputs(
                     ema_model, unlabeled_inputs, T=self.uncertainty_T
                 )
                 
@@ -403,16 +411,14 @@ class UncertaintyAwareMeanTeacher3DTrainer(BaseTrainer):
                 for task_name in student_unlabeled_outputs.keys():
                     student_pred = student_unlabeled_outputs[task_name]
                     
-                    # Get teacher prediction for this task
-                    with torch.no_grad():
-                        teacher_outputs = ema_model(unlabeled_inputs)
-                        if isinstance(teacher_outputs, dict):
-                            teacher_pred = teacher_outputs[task_name]
-                        else:
-                            teacher_pred = teacher_outputs
+                    # Get teacher prediction for this task (already computed)
+                    teacher_pred = teacher_predictions[task_name]
                     
-                    # Compute MSE between softmax outputs
-                    consistency_dist = softmax_mse_loss(student_pred, teacher_pred)
+                    # Determine if we should use sigmoid based on output channels
+                    use_sigmoid = (student_pred.shape[1] == 1)  # Single channel = binary task
+                    
+                    # Compute MSE between activated outputs
+                    consistency_dist = softmax_mse_loss(student_pred, teacher_pred, use_sigmoid=use_sigmoid)
                     
                     # Apply uncertainty mask and average
                     masked_consistency = torch.sum(mask * consistency_dist) / (2 * torch.sum(mask) + 1e-16)
