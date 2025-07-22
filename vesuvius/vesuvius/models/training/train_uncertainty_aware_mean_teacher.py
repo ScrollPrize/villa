@@ -223,34 +223,29 @@ class UncertaintyAwareMeanTeacher3DTrainer(BaseTrainer):
         train_dataset = training_state['train_dataset']
         train_indices = training_state['train_indices']
         
-        # Get labeled/unlabeled indices directly from dataset if available
-        if hasattr(train_dataset, 'get_labeled_unlabeled_patch_indices') and False:  # Disabled for now, use scanning method
-            print("\nGetting labeled/unlabeled indices from dataset...")
-            all_labeled_indices, all_unlabeled_indices = train_dataset.get_labeled_unlabeled_patch_indices()
+        # Get labeled/unlabeled indices based on volume metadata
+        print("\nIdentifying labeled/unlabeled samples based on volume metadata...")
+        labeled_indices = []
+        unlabeled_indices = []
+        
+        # Get the first target name to access volume info
+        first_target = list(train_dataset.target_volumes.keys())[0]
+        
+        for idx in train_indices:
+            # Get the patch info without loading the actual data
+            patch_info = train_dataset.valid_patches[idx]
+            volume_idx = patch_info['volume_index']
             
-            # Filter to only include indices in train_indices
-            train_indices_set = set(train_indices)
-            labeled_indices = [idx for idx in all_labeled_indices if idx in train_indices_set]
-            unlabeled_indices = [idx for idx in all_unlabeled_indices if idx in train_indices_set]
+            # Check if this volume has a label
+            volume_info = train_dataset.target_volumes[first_target][volume_idx]
+            has_label = volume_info.get('has_label', True)  # Default to True for backward compatibility
             
-            print(f"Found {len(labeled_indices)} labeled and {len(unlabeled_indices)} unlabeled samples in training set")
-        else:
-            # Fallback: scan dataset to identify labeled and unlabeled indices
-            print("\nScanning dataset to identify labeled and unlabeled samples...")
-            labeled_indices = []
-            unlabeled_indices = []
-            
-            from tqdm import tqdm
-            for idx in tqdm(train_indices, desc="Categorizing samples"):
-                # Get the sample directly using __getitem__
-                sample = train_dataset[idx]
-                
-                if sample.get('is_unlabeled', False):
-                    unlabeled_indices.append(idx)
-                else:
-                    labeled_indices.append(idx)
-            
-            print(f"Found {len(labeled_indices)} labeled and {len(unlabeled_indices)} unlabeled samples in training set")
+            if has_label:
+                labeled_indices.append(idx)
+            else:
+                unlabeled_indices.append(idx)
+        
+        print(f"Found {len(labeled_indices)} labeled and {len(unlabeled_indices)} unlabeled samples in training set")
         
         # Create TwoStreamBatchSampler if we have both labeled and unlabeled data
         if len(labeled_indices) > 0 and len(unlabeled_indices) > 0:
