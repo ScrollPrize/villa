@@ -230,11 +230,10 @@ class UncertaintyAwareMeanTeacher3DTrainer(BaseTrainer):
         
         from tqdm import tqdm
         for idx in tqdm(train_indices, desc="Categorizing samples"):
-            # Get the patch info for this index
-            patch_info = train_dataset.all_patch_infos[idx]
-            sample = train_dataset.extract_patch(patch_info)
+            # Get the sample directly using __getitem__
+            sample = train_dataset[idx]
             
-            if sample['is_unlabeled']:
+            if sample.get('is_unlabeled', False):
                 unlabeled_indices.append(idx)
             else:
                 labeled_indices.append(idx)
