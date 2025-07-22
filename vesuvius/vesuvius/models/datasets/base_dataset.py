@@ -458,6 +458,8 @@ class BaseDataset(Dataset):
             if label_arr is None:
                 # No label exists - create zero array
                 label_patch = np.zeros(target_shape, dtype=np.float32)
+                # Add channel dimension for consistency with labeled data
+                label_patch = label_patch[np.newaxis, ...]
             else:
                 # Extract label patch
                 has_channels = (self.is_2d_dataset and len(label_arr.shape) == 3) or \
@@ -498,6 +500,8 @@ class BaseDataset(Dataset):
                 except Exception as e:
                     print(f"Warning: Failed to extract label patch for {t_name}: {str(e)}")
                     label_patch = np.zeros(target_shape, dtype=np.float32)
+                    # Mark that we need to add channel dimension
+                    has_channels = False
                 
                 # Add channel dimension if needed
                 if not has_channels:
