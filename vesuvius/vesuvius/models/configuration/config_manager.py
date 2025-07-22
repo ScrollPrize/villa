@@ -18,7 +18,7 @@ class ConfigManager:
         self.data = None # note that config manager DOES NOT hold data, 
                          # it just holds the path to the data, currently an annoying holdover from old napari trainer
         self.verbose = verbose
-        self.selected_loss_function = None
+        self.selected_loss_function = "nnUNet_DC_and_CE_loss"
 
     def load_config(self, config_path):
         config_path = Path(config_path)
@@ -34,6 +34,11 @@ class ConfigManager:
         self.targets = self.dataset_config.get("targets", {})
         if not self.targets and "targets" in self.model_config:
             self.targets = self.model_config.get("targets", {})
+            
+        # Set default out_channels to 2 if not specified
+        for target_name, target_info in self.targets.items():
+            if 'out_channels' not in target_info and 'channels' not in target_info:
+                target_info['out_channels'] = 2
 
         infer_config = config.get("inference_config", {})
         self.infer_checkpoint_path = infer_config.get("checkpoint_path", None)
@@ -132,13 +137,13 @@ class ConfigManager:
             # Look for either 'out_channels' or 'channels' in the task info
             if 'out_channels' in task_info:
                 channels = task_info['out_channels']
+            elif 'channels' in task_info:
+                channels = task_info['channels']
             else:
-                if self.verbose:
-                    print(f"Target {target_name} has no channel specification - will attempt to auto-detect from data")
-                channels = None  # Placeholder, will be set during auto-detection
+                channels = 2  # Default to 2
+                task_info['out_channels'] = 2
 
-            if channels is not None:
-                self.out_channels += (channels,)
+            self.out_channels += (channels,)
 
         # Inference attributes should already be set by _set_inference_attributes
         # If they weren't set (e.g., no inference_config in YAML), set defaults here
@@ -173,6 +178,11 @@ class ConfigManager:
             Example: {"ink": [{"data": {...}, "out_channels": 1, "name": "image1_ink"}]}
         """
         self.targets = deepcopy(targets_dict)
+        
+        # Ensure all targets have out_channels, default to 2
+        for target_name, target_info in self.targets.items():
+            if 'out_channels' not in target_info and 'channels' not in target_info:
+                target_info['out_channels'] = 2
 
         # Apply current loss function to all targets if not already set
         for target_name in self.targets:
@@ -366,13 +376,12 @@ class ConfigManager:
                     unique_values = torch.unique(label_tensor)
                     num_unique = len(unique_values)
                     
+                    # Always use at least 2 channels
                     if num_unique <= 2:
-                        # Binary case - always use 2 channels (background/foreground)
                         detected_channels = 2
                     else:
                         # Multi-class case - use max value + 1
                         detected_channels = int(torch.max(label_tensor).item()) + 1
-                        # Ensure at least 2 channels
                         detected_channels = max(detected_channels, 2)
                     
                     self.targets[target_name]['out_channels'] = detected_channels
