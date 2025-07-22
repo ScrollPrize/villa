@@ -62,20 +62,25 @@ class ImageDataset(BaseDataset):
         labeled_indices = []
         unlabeled_indices = []
         
+        # First, let's understand the actual structure
+        # Since all targets share the same volume indexing, check the first target
+        first_target = list(self.target_volumes.keys())[0]
+        
         for idx, patch_info in enumerate(self.valid_patches):
             vol_idx = patch_info['volume_index']
             
-            # Check if ANY target has a label for this volume
-            # A patch is considered labeled if at least one target has a label
-            has_any_label = False
-            for target in self.target_volumes.keys():
-                if self.volume_has_label.get((target, vol_idx), False):
-                    has_any_label = True
-                    break
-            
-            if has_any_label:
-                labeled_indices.append(idx)
+            # Get the volume info for this index
+            if vol_idx < len(self.target_volumes[first_target]):
+                volume_info = self.target_volumes[first_target][vol_idx]
+                has_label = volume_info.get('has_label', False)
+                
+                if has_label:
+                    labeled_indices.append(idx)
+                else:
+                    unlabeled_indices.append(idx)
             else:
+                # This shouldn't happen, but let's be safe
+                print(f"Warning: patch {idx} references volume {vol_idx} which doesn't exist")
                 unlabeled_indices.append(idx)
         
         return labeled_indices, unlabeled_indices
