@@ -52,6 +52,34 @@ def convert_image_to_zarr_worker(args):
         return array_name, None, False, str(e)
 
 class ImageDataset(BaseDataset):
+    def get_labeled_unlabeled_patch_indices(self):
+        """Get indices of patches that are labeled vs unlabeled.
+        
+        Returns:
+            labeled_indices: List of patch indices with labels
+            unlabeled_indices: List of patch indices without labels
+        """
+        labeled_indices = []
+        unlabeled_indices = []
+        
+        for idx, patch_info in enumerate(self.all_patch_infos):
+            vol_idx = patch_info['volume_index']
+            
+            # Check if ANY target has a label for this volume
+            # A patch is considered labeled if at least one target has a label
+            has_any_label = False
+            for target in self.target_volumes.keys():
+                if self.volume_has_label.get((target, vol_idx), False):
+                    has_any_label = True
+                    break
+            
+            if has_any_label:
+                labeled_indices.append(idx)
+            else:
+                unlabeled_indices.append(idx)
+        
+        return labeled_indices, unlabeled_indices
+    
     """
     A PyTorch Dataset for handling both 2D and 3D data from image files.
     
@@ -266,6 +294,10 @@ class ImageDataset(BaseDataset):
 
         print("\nLoading Zarr arrays...")
         
+        # Track which volume indices have labels
+        # We need to track per target since each target can have different labeled/unlabeled volumes
+        self.volume_has_label = {}  # Maps (target, volume_idx) to bool
+        
         for target, image_id, image_array_name, label_array_name in files_to_process:
             data_array = images_group[image_array_name]
             label_array = labels_group[label_array_name] if label_array_name and label_array_name in labels_group else None
@@ -275,10 +307,15 @@ class ImageDataset(BaseDataset):
                 'label': label_array
             }
 
+            volume_idx = len(self.target_volumes[target])
             self.target_volumes[target].append({
                 'data': data_dict,
-                'volume_id': image_id
+                'volume_id': image_id,
+                'has_label': label_array is not None
             })
+            
+            # Track if this volume has a label for this target
+            self.volume_has_label[(target, volume_idx)] = (label_array is not None)
 
             if label_array is not None:
                 self.zarr_arrays.append(label_array)
@@ -292,3 +329,8 @@ class ImageDataset(BaseDataset):
             raise ValueError("No data found for any configured targets")
         
         print(f"Total targets loaded: {list(self.target_volumes.keys())}")
+        
+        # Count labeled vs unlabeled
+        labeled_count = sum(1 for has_label in self.volume_has_label.values() if has_label)
+        unlabeled_count = sum(1 for has_label in self.volume_has_label.values() if not has_label)
+        print(f"Labeled volume entries: {labeled_count}, Unlabeled volume entries: {unlabeled_count}")
