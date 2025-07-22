@@ -62,7 +62,7 @@ class ImageDataset(BaseDataset):
         labeled_indices = []
         unlabeled_indices = []
         
-        for idx, patch_info in enumerate(self.all_patch_infos):
+        for idx, patch_info in enumerate(self.valid_patches):
             vol_idx = patch_info['volume_index']
             
             # Check if ANY target has a label for this volume
