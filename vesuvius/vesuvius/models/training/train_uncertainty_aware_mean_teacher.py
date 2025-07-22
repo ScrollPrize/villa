@@ -8,6 +8,8 @@ from vesuvius.models.training.train import BaseTrainer
 from vesuvius.models.training.auxiliary_tasks import compute_auxiliary_loss
 import gc
 from collections import deque
+from torch.utils.data import Sampler
+import random
 
 
 def sigmoid_rampup(current, rampup_length):
@@ -38,6 +40,60 @@ def softmax_mse_loss(input_logits, target_logits, sigmoid=False):
     
     mse_loss = (input_softmax - target_softmax) ** 2
     return mse_loss
+
+
+class TwoStreamBatchSampler(Sampler):
+    """Samples batches with a fixed number of labeled and unlabeled samples.
+    
+    Args:
+        labeled_indices: List of indices for labeled samples
+        unlabeled_indices: List of indices for unlabeled samples
+        batch_size: Total batch size
+        labeled_batch_size: Number of labeled samples per batch
+    """
+    
+    def __init__(self, labeled_indices, unlabeled_indices, batch_size, labeled_batch_size):
+        self.labeled_indices = labeled_indices
+        self.unlabeled_indices = unlabeled_indices
+        self.batch_size = batch_size
+        self.labeled_batch_size = labeled_batch_size
+        self.unlabeled_batch_size = batch_size - labeled_batch_size
+        
+        assert self.labeled_batch_size > 0, "Need at least one labeled sample per batch"
+        assert self.unlabeled_batch_size > 0, "Need at least one unlabeled sample per batch"
+        assert len(self.labeled_indices) >= self.labeled_batch_size, "Not enough labeled samples"
+        assert len(self.unlabeled_indices) >= self.unlabeled_batch_size, "Not enough unlabeled samples"
+        
+    def __iter__(self):
+        # Shuffle indices
+        labeled_indices = self.labeled_indices.copy()
+        unlabeled_indices = self.unlabeled_indices.copy()
+        random.shuffle(labeled_indices)
+        random.shuffle(unlabeled_indices)
+        
+        # Calculate number of batches based on labeled data
+        n_batches = len(labeled_indices) // self.labeled_batch_size
+        
+        for i in range(n_batches):
+            # Get labeled samples for this batch
+            labeled_batch = labeled_indices[i * self.labeled_batch_size:(i + 1) * self.labeled_batch_size]
+            
+            # Get unlabeled samples (cycle through if needed)
+            unlabeled_start = (i * self.unlabeled_batch_size) % len(unlabeled_indices)
+            unlabeled_end = unlabeled_start + self.unlabeled_batch_size
+            
+            if unlabeled_end <= len(unlabeled_indices):
+                unlabeled_batch = unlabeled_indices[unlabeled_start:unlabeled_end]
+            else:
+                # Wrap around
+                unlabeled_batch = unlabeled_indices[unlabeled_start:] + unlabeled_indices[:unlabeled_end - len(unlabeled_indices)]
+            
+            # Combine and yield
+            batch = labeled_batch + unlabeled_batch
+            yield batch
+    
+    def __len__(self):
+        return len(self.labeled_indices) // self.labeled_batch_size
 
 
 class UncertaintyAwareMeanTeacher3DTrainer(BaseTrainer):
@@ -153,7 +209,7 @@ class UncertaintyAwareMeanTeacher3DTrainer(BaseTrainer):
         return uncertainty, mean_pred
     
     def _initialize_training(self):
-        """Override to add EMA model initialization."""
+        """Override to add EMA model initialization and TwoStreamBatchSampler."""
         # Get base training components
         training_state = super()._initialize_training()
         
@@ -163,10 +219,73 @@ class UncertaintyAwareMeanTeacher3DTrainer(BaseTrainer):
         
         training_state['ema_model'] = ema_model
         
+        # Replace the train dataloader with TwoStreamBatchSampler
+        train_dataset = training_state['train_dataset']
+        train_indices = training_state['train_indices']
+        
+        # Scan dataset to identify labeled and unlabeled indices
+        print("\nScanning dataset to identify labeled and unlabeled samples...")
+        labeled_indices = []
+        unlabeled_indices = []
+        
+        from tqdm import tqdm
+        for idx in tqdm(train_indices, desc="Categorizing samples"):
+            # Get the patch info for this index
+            patch_info = train_dataset.all_patch_infos[idx]
+            sample = train_dataset.extract_patch(patch_info)
+            
+            if sample['is_unlabeled']:
+                unlabeled_indices.append(idx)
+            else:
+                labeled_indices.append(idx)
+        
+        print(f"Found {len(labeled_indices)} labeled and {len(unlabeled_indices)} unlabeled samples in training set")
+        
+        # Create TwoStreamBatchSampler if we have both labeled and unlabeled data
+        if len(labeled_indices) > 0 and len(unlabeled_indices) > 0:
+            batch_size = self.mgr.train_batch_size
+            # Use half the batch for labeled, half for unlabeled (same as reference)
+            labeled_batch_size = getattr(self.mgr, 'labeled_batch_size', batch_size // 2)
+            
+            # Ensure we have valid batch sizes
+            labeled_batch_size = min(labeled_batch_size, len(labeled_indices))
+            unlabeled_batch_size = batch_size - labeled_batch_size
+            
+            if unlabeled_batch_size > 0 and len(unlabeled_indices) >= unlabeled_batch_size:
+                print(f"Using TwoStreamBatchSampler with {labeled_batch_size} labeled + {unlabeled_batch_size} unlabeled per batch")
+                
+                batch_sampler = TwoStreamBatchSampler(
+                    labeled_indices=labeled_indices,
+                    unlabeled_indices=unlabeled_indices,
+                    batch_size=batch_size,
+                    labeled_batch_size=labeled_batch_size
+                )
+                
+                # Create new dataloader with the TwoStreamBatchSampler
+                from torch.utils.data import DataLoader
+                train_dataloader = DataLoader(
+                    train_dataset,
+                    batch_sampler=batch_sampler,
+                    pin_memory=(True if self.device.type == 'cuda' else False),
+                    num_workers=self.mgr.train_num_dataloader_workers
+                )
+                
+                training_state['train_dataloader'] = train_dataloader
+                # Store labeled batch size for use in train_step
+                training_state['labeled_batch_size'] = labeled_batch_size
+            else:
+                print(f"WARNING: Not enough unlabeled data for TwoStreamBatchSampler. Using standard dataloader.")
+                print(f"  Batch size: {batch_size}, Unlabeled batch size: {unlabeled_batch_size}, Available unlabeled: {len(unlabeled_indices)}")
+                training_state['labeled_batch_size'] = None
+        else:
+            print(f"WARNING: Cannot use mean teacher training without both labeled and unlabeled data!")
+            print(f"  Labeled samples: {len(labeled_indices)}, Unlabeled samples: {len(unlabeled_indices)}")
+            training_state['labeled_batch_size'] = None
+        
         return training_state
     
     def _train_step(self, model, ema_model, data_dict, loss_fns, use_amp, autocast_ctx, 
-                    epoch, step, global_step, verbose=False):
+                    epoch, step, global_step, labeled_batch_size=None, verbose=False):
         """
         Execute a single training step with mean teacher approach.
         
@@ -193,17 +312,32 @@ class UncertaintyAwareMeanTeacher3DTrainer(BaseTrainer):
         }
         
         # Check if we have unlabeled data in this batch
-        is_unlabeled = data_dict.get("is_unlabeled", None)
-        if is_unlabeled is not None:
-            is_unlabeled = is_unlabeled.to(self.device)
-            labeled_mask = ~is_unlabeled
-            num_labeled = labeled_mask.sum().item()
-            num_unlabeled = is_unlabeled.sum().item()
+        if labeled_batch_size is not None:
+            # Using TwoStreamBatchSampler - fixed ordering: first labeled_batch_size are labeled, rest are unlabeled
+            num_labeled = labeled_batch_size
+            num_unlabeled = inputs.shape[0] - labeled_batch_size
+            labeled_mask = torch.zeros(inputs.shape[0], dtype=torch.bool, device=self.device)
+            labeled_mask[:labeled_batch_size] = True
+            is_unlabeled = ~labeled_mask
+            if verbose and step == 0:
+                print(f"\n[DEBUG] Using TwoStreamBatchSampler: {num_labeled} labeled, {num_unlabeled} unlabeled samples")
         else:
-            # All data is labeled
-            labeled_mask = torch.ones(inputs.shape[0], dtype=torch.bool, device=self.device)
-            num_labeled = inputs.shape[0]
-            num_unlabeled = 0
+            # Fall back to is_unlabeled flag from dataset
+            is_unlabeled = data_dict.get("is_unlabeled", None)
+            if is_unlabeled is not None:
+                is_unlabeled = is_unlabeled.to(self.device)
+                labeled_mask = ~is_unlabeled
+                num_labeled = labeled_mask.sum().item()
+                num_unlabeled = is_unlabeled.sum().item()
+                if verbose and step == 0:
+                    print(f"\n[DEBUG] Batch has mixed data: {num_labeled} labeled, {num_unlabeled} unlabeled samples")
+            else:
+                # All data is labeled
+                labeled_mask = torch.ones(inputs.shape[0], dtype=torch.bool, device=self.device)
+                num_labeled = inputs.shape[0]
+                num_unlabeled = 0
+                if verbose and step == 0:
+                    print(f"\n[DEBUG] Batch has only labeled data: {num_labeled} samples")
         
         with autocast_ctx:
             # Forward pass through student
@@ -288,6 +422,13 @@ class UncertaintyAwareMeanTeacher3DTrainer(BaseTrainer):
                 task_losses['consistency_weight'] = consistency_weight
                 task_losses['uncertainty_threshold'] = threshold
                 task_losses['uncertainty_mask_ratio'] = mask.mean().item()
+                task_losses['consistency_loss_total'] = consistency_loss.detach().cpu().item()
+                task_losses['weighted_consistency_loss'] = weighted_consistency_loss.detach().cpu().item()
+                
+            # Log batch composition
+            task_losses['num_labeled'] = num_labeled
+            task_losses['num_unlabeled'] = num_unlabeled
+            task_losses['rampup_progress'] = min(1.0, global_step / self.consistency_rampup)
         
         return total_loss, task_losses, inputs, targets_dict, outputs
     
@@ -313,6 +454,7 @@ class UncertaintyAwareMeanTeacher3DTrainer(BaseTrainer):
         start_epoch = training_state['start_epoch']
         ckpt_dir = training_state['ckpt_dir']
         model_ckpt_dir = training_state['model_ckpt_dir']
+        labeled_batch_size = training_state.get('labeled_batch_size', None)
         
         # Initialize wandb if configured
         self._initialize_wandb(train_dataset, val_dataset, train_indices, val_indices)
@@ -383,6 +525,7 @@ class UncertaintyAwareMeanTeacher3DTrainer(BaseTrainer):
                     epoch=epoch,
                     step=i,
                     global_step=global_step,
+                    labeled_batch_size=labeled_batch_size,
                     verbose=self.mgr.verbose
                 )
                 
@@ -433,10 +576,19 @@ class UncertaintyAwareMeanTeacher3DTrainer(BaseTrainer):
                         current_lr=current_lr
                     )
                     # Add mean teacher specific metrics
-                    if 'consistency_weight' in task_losses:
-                        metrics['consistency_weight'] = task_losses['consistency_weight']
-                    if 'uncertainty_threshold' in task_losses:
-                        metrics['uncertainty_threshold'] = task_losses['uncertainty_threshold']
+                    mean_teacher_params = [
+                        'consistency_weight', 'uncertainty_threshold', 'uncertainty_mask_ratio',
+                        'consistency_loss_total', 'weighted_consistency_loss',
+                        'num_labeled', 'num_unlabeled', 'rampup_progress'
+                    ]
+                    for param in mean_teacher_params:
+                        if param in task_losses:
+                            metrics[param] = task_losses[param]
+                    
+                    # Add constant parameters (logged for reference)
+                    metrics['ema_decay'] = self.ema_decay
+                    metrics['noise_scale'] = self.noise_scale
+                    metrics['uncertainty_T'] = self.uncertainty_T
                     
                     import wandb
                     wandb.log(metrics)
