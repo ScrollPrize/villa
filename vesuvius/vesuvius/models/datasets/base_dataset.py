@@ -154,10 +154,18 @@ class BaseDataset(Dataset):
             print("Skipping patch validation as requested")
             # Generate all possible patches without validation
             self.valid_patches = []
-            for vol_idx, zarr_array in enumerate(self.zarr_arrays):
-                vol_name = self.zarr_names[vol_idx] if vol_idx < len(self.zarr_names) else f"volume_{vol_idx}"
+            
+            # Get the first target to access all volumes (since all targets share the same volumes)
+            first_target = list(self.target_volumes.keys())[0]
+            all_volumes = self.target_volumes[first_target]
+            
+            for vol_idx, volume_info in enumerate(all_volumes):
+                # Get the image array (data) for this volume
+                img_array = volume_info['data']['data']
+                vol_name = volume_info.get('volume_id', f"volume_{vol_idx}")
+                
                 positions = self._get_all_sliding_window_positions(
-                    volume_shape=zarr_array.shape,
+                    volume_shape=img_array.shape,
                     patch_size=self.patch_size
                 )
                 for pos_dict in positions:

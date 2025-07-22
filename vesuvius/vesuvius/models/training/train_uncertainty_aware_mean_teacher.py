@@ -224,7 +224,7 @@ class UncertaintyAwareMeanTeacher3DTrainer(BaseTrainer):
         train_indices = training_state['train_indices']
         
         # Get labeled/unlabeled indices directly from dataset if available
-        if hasattr(train_dataset, 'get_labeled_unlabeled_patch_indices'):
+        if hasattr(train_dataset, 'get_labeled_unlabeled_patch_indices') and False:  # Disabled for now, use scanning method
             print("\nGetting labeled/unlabeled indices from dataset...")
             all_labeled_indices, all_unlabeled_indices = train_dataset.get_labeled_unlabeled_patch_indices()
             
