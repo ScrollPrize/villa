@@ -721,25 +721,6 @@ class BaseTrainer:
                                                for t in self.mgr.targets if len(val_losses[t]) > 0])
                         val_pbar.set_postfix_str(loss_str)
                         
-                        # Log validation metrics to wandb once per validation step
-                        if self.mgr.wandb_project:
-                            # Prepare metrics for this validation step
-                            val_metrics = {"epoch": epoch, "step": global_step}
-                            for t_name, loss_value in task_losses.items():
-                                val_metrics[f"val_loss_{t_name}"] = loss_value
-                            
-                            # Add total validation loss for this step
-                            total_step_loss = sum(task_losses.values())
-                            val_metrics["val_loss_total"] = total_step_loss / len(task_losses) if task_losses else 0
-                            
-                            # Add debug gif only on first validation step
-                            if i == 0 and 'frames_array' in locals() and frames_array is not None:
-                                import wandb
-                                val_metrics["debug_gif"] = wandb.Video(frames_array)
-                            
-                            import wandb
-                            wandb.log(val_metrics)
-                        
                         del outputs, inputs, targets_dict
 
                     # Calculate average validation losses for summary
@@ -753,6 +734,22 @@ class BaseTrainer:
                     # Average validation loss across all tasks
                     avg_val_loss = total_val_loss / len(self.mgr.targets) if self.mgr.targets else 0
                     val_loss_history[epoch] = avg_val_loss
+                    
+                    # Log aggregated validation metrics to wandb
+                    if self.mgr.wandb_project:
+                        val_metrics = {"epoch": epoch, "step": global_step}
+                        for t_name in self.mgr.targets:
+                            if t_name in val_losses and len(val_losses[t_name]) > 0:
+                                val_metrics[f"val_loss_{t_name}"] = np.mean(val_losses[t_name])
+                        val_metrics["val_loss_total"] = avg_val_loss
+                        
+                        # Add debug gif if it was created
+                        if 'frames_array' in locals() and frames_array is not None:
+                            import wandb
+                            val_metrics["debug_gif"] = wandb.Video(frames_array)
+                        
+                        import wandb
+                        wandb.log(val_metrics)
                     
                     # Handle epoch end operations (checkpointing, cleanup)
                     checkpoint_history, best_checkpoints, ckpt_path = self._on_epoch_end(
