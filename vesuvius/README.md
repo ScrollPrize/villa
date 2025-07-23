@@ -91,7 +91,7 @@ ___
 6. Infer on the same layer, or another by importing an image, selecting it in the inference widget, and hitting `Run Inference`
 
 
-![alt text](docs/images/napari_trainer.png)
+![alt text](vesuvius/docs/images/napari_trainer.png)
 
 ___
 
@@ -105,7 +105,7 @@ ___
 6. Skip patches or continue with `spacebar` or `next pair`
 7. Patches are saved in the output dir, and their locations in the .json progress file
 
-![alt text](docs/images/proofreader.png)
+![alt text](vesuvius/docs/images/proofreader.png)
 
 ### Training with `vesuvius.train`
 
@@ -152,11 +152,11 @@ Training will output the current losses in the `tqdm` progress bar, and will sav
 
 By default, the last 10 checkpoints are saved. This is not a smart way to do it, and will be changed to just store the last 3 + last 2 best validation. 
 
-Training will run for 1,000 epochs by default, with 200 batches/epoch. This can be modified through the configuration file, which can be optionally provided to `vesuvius.train`, and some examples are provided in the [models folder](models/configuration/)
+Training will run for 1,000 epochs by default, with 200 batches/epoch. This can be modified through the configuration file, which can be optionally provided to `vesuvius.train`, and some examples are provided in the [models folder](vesuvius/models/configuration/)
 
 ### Running inference with `vesuvius.inference_pipeline`
 
-Detailed documentation is available in [the inference readme](docs/inference.md)
+Detailed documentation is available in [the inference readme](vesuvius/docs/inference.md)
 
 The inference script used here is unfortunately (by necessity) quite convoluted. It **stores a very large amount of intermediate data** , in the form of float16 logits from patches. In the case that you do not have a lot of storage space, it might make sense to borrow some of the functions from the inferer, and rewrite the inference process to write directly to uint8 final arrays.
 
@@ -181,5 +181,5 @@ You can use local models or models hosted on huggingface hub, so long as they ar
 To use a local model point at either the `nnUNet_results` folder which contains the `dataset.json` and the `fold` directories, or if using a vesuvius model, the `checkpoint.pth` file
 
 ### Rendering and Flattening objs
-Documentation is provided in [the rendering folder](rendering/README.md)
+Documentation is provided in [the rendering folder](vesuvius/rendering/README.md)
 

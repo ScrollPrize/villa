@@ -19,18 +19,15 @@ from datetime import datetime
 from tqdm import tqdm
 import numpy as np
 import torch
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from models.training.lr_schedulers import get_scheduler, PolyLRScheduler
-from torch.optim import AdamW, SGD
+from vesuvius.models.training.lr_schedulers import get_scheduler, PolyLRScheduler
 from torch.utils.data import DataLoader, SubsetRandomSampler
-from utils.utils import init_weights_he
-from models.datasets import NapariDataset, ImageDataset, ZarrDataset, MAEPretrainDataset
-from utils.plotting import save_debug
-from models.build.build_network_from_config import NetworkFromConfig
+from vesuvius.utils.utils import init_weights_he
+from vesuvius.models.datasets import NapariDataset, ImageDataset, ZarrDataset, MAEPretrainDataset
+from vesuvius.utils.plotting import save_debug
+from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 
-from models.training.loss.losses import _create_loss
-from models.training.optimizers import create_optimizer
-from itertools import cycle
+from vesuvius.models.training.loss.losses import _create_loss
+from vesuvius.models.training.optimizers import create_optimizer
 from contextlib import nullcontext
 from collections import deque   
 import gc
@@ -1311,7 +1308,6 @@ def update_config_from_args(mgr, args):
 def main():
     """Main entry point for the training script."""
     import argparse
-    import ast
 
     parser = argparse.ArgumentParser(
         description="Train Vesuvius neural networks for ink detection and segmentation",
@@ -1384,7 +1380,7 @@ def main():
     args = parser.parse_args()
 
     # Load configuration first to check if we have data_paths
-    from models.configuration.config_manager import ConfigManager
+    from vesuvius.models.configuration.config_manager import ConfigManager
     mgr = ConfigManager(verbose=args.verbose)
 
     if args.config_path:
