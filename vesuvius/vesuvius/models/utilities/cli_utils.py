@@ -183,6 +183,16 @@ def update_config_from_args(mgr, args):
         if mgr.verbose:
             print(f"Disabled Automatic Mixed Precision (AMP)")
 
+    # Handle early stopping patience
+    if hasattr(args, 'early_stopping_patience') and args.early_stopping_patience is not None:
+        mgr.early_stopping_patience = args.early_stopping_patience
+        mgr.tr_configs["early_stopping_patience"] = args.early_stopping_patience
+        if mgr.verbose:
+            if args.early_stopping_patience == 0:
+                print(f"Early stopping disabled")
+            else:
+                print(f"Set early stopping patience: {args.early_stopping_patience} epochs")
+
     # Handle Weights & Biases arguments
     mgr.wandb_project = args.wandb_project
     mgr.wandb_entity = args.wandb_entity

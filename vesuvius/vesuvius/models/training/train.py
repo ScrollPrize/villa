@@ -545,6 +545,15 @@ class BaseTrainer:
         global_step = 0
         grad_accumulate_n = self.mgr.gradient_accumulation
 
+        # Early stopping setup
+        early_stopping_patience = getattr(self.mgr, 'early_stopping_patience', 5)
+        if early_stopping_patience > 0:
+            best_val_loss = float('inf')
+            patience_counter = 0
+            print(f"Early stopping enabled with patience: {early_stopping_patience} epochs")
+        else:
+            print("Early stopping disabled")
+
         # ---- training! ----- #
         for epoch in range(start_epoch, self.mgr.max_epoch):
             model.train()
@@ -751,6 +760,22 @@ class BaseTrainer:
                         import wandb
                         wandb.log(val_metrics)
                     
+                    # Early stopping check
+                    if early_stopping_patience > 0:
+                        if avg_val_loss < best_val_loss:
+                            best_val_loss = avg_val_loss
+                            patience_counter = 0
+                            print(f"[Early Stopping] New best validation loss: {best_val_loss:.4f}")
+                        else:
+                            patience_counter += 1
+                            print(f"[Early Stopping] No improvement for {patience_counter}/{early_stopping_patience} epochs")
+                            
+                        if patience_counter >= early_stopping_patience:
+                            print(f"\n[Early Stopping] Validation loss did not improve for {early_stopping_patience} epochs.")
+                            print(f"Best validation loss: {best_val_loss:.4f}")
+                            print("Stopping training early.")
+                            break
+                    
                     # Handle epoch end operations (checkpointing, cleanup)
                     checkpoint_history, best_checkpoints, ckpt_path = self._on_epoch_end(
                         epoch=epoch,
@@ -857,6 +882,8 @@ def main():
                         help="Disable Automatic Mixed Precision (AMP) for training")
     parser.add_argument("--skip-intensity-sampling", action="store_true",
                         help="Skip intensity sampling during dataset initialization")
+    parser.add_argument("--early-stopping-patience", type=int, default=5,
+                        help="Number of epochs to wait for validation loss improvement before early stopping (default: 5, set to 0 to disable)")
 
     # Trainer selection
     parser.add_argument("--trainer", type=str, default="base",
