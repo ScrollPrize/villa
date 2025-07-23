@@ -317,8 +317,9 @@ class BaseTrainer:
                 config=mgr_config
             )
 
-    def _train_step(self, model, data_dict, loss_fns, use_amp, autocast_ctx, epoch, step, verbose=False):
-        """Execute a single training step and return loss values."""
+    def _train_step(self, model, data_dict, loss_fns, use_amp, autocast_ctx, epoch, step, verbose=False,
+                    scaler=None, optimizer=None, num_iters=None, grad_accumulate_n=1):
+        """Execute a single training step including gradient updates."""
         global_step = step
         
         if epoch == 0 and step == 0 and verbose:
@@ -343,7 +344,23 @@ class BaseTrainer:
             outputs = model(inputs)
             total_loss, task_losses = self._compute_train_loss(outputs, targets_dict, loss_fns)
         
-        return total_loss, task_losses, inputs, targets_dict, outputs
+        # Handle gradient accumulation, clipping, and optimizer step
+        # Scale loss by accumulation steps to maintain same effective batch size
+        scaled_loss = total_loss / grad_accumulate_n
+        
+        # backward
+        scaler.scale(scaled_loss).backward()
+        
+        optimizer_stepped = False
+        if (step + 1) % grad_accumulate_n == 0 or (step + 1) == num_iters:
+            scaler.unscale_(optimizer)
+            grad_clip = getattr(self.mgr, 'gradient_clip', 12.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer_stepped = True  # Optimizer step was taken
+        
+        return total_loss, task_losses, inputs, targets_dict, outputs, optimizer_stepped
     
     def _compute_train_loss(self, outputs, targets_dict, loss_fns):
         """Compute training loss for all tasks."""
@@ -370,23 +387,6 @@ class BaseTrainer:
         
         return total_loss, task_losses
     
-    def _update_gradients(self, scaler, total_loss, optimizer, model, step, num_iters, grad_accumulate_n):
-        """Handle gradient accumulation, clipping, and optimizer step."""
-        # Scale loss by accumulation steps to maintain same effective batch size
-        scaled_loss = total_loss / grad_accumulate_n
-        
-        # backward
-        scaler.scale(scaled_loss).backward()
-        
-        if (step + 1) % grad_accumulate_n == 0 or (step + 1) == num_iters:
-            scaler.unscale_(optimizer)
-            grad_clip = getattr(self.mgr, 'gradient_clip', 12.0)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            return True  # Optimizer step was taken
-
-        return False  # No optimizer step this iteration
 
     def _validation_step(self, model, data_dict, loss_fns, use_amp):
         """Execute a single validation step and return loss values."""
@@ -586,7 +586,7 @@ class BaseTrainer:
                     autocast_ctx = nullcontext()
                 
                 # Execute training step
-                total_loss, task_losses, inputs, targets_dict, outputs = self._train_step(
+                total_loss, task_losses, inputs, targets_dict, outputs, optimizer_stepped = self._train_step(
                     model=model,
                     data_dict=data_dict,
                     loss_fns=loss_fns,
@@ -594,23 +594,16 @@ class BaseTrainer:
                     autocast_ctx=autocast_ctx,
                     epoch=epoch,
                     step=i,
-                    verbose=self.mgr.verbose
+                    verbose=self.mgr.verbose,
+                    scaler=scaler,
+                    optimizer=optimizer,
+                    num_iters=num_iters,
+                    grad_accumulate_n=grad_accumulate_n
                 )
                 
                 # Accumulate losses for tracking
                 for t_name, loss_value in task_losses.items():
                     epoch_losses[t_name].append(loss_value)
-                
-                # Update gradients
-                optimizer_stepped = self._update_gradients(
-                    scaler=scaler,
-                    total_loss=total_loss,
-                    optimizer=optimizer,
-                    model=model,
-                    step=i,
-                    num_iters=num_iters,
-                    grad_accumulate_n=grad_accumulate_n
-                )
                 
                 if optimizer_stepped and is_per_iteration_scheduler:
                     scheduler.step()
@@ -701,7 +694,6 @@ class BaseTrainer:
                                             found_non_zero = True
                                             break
 
-                                # Only create debug gif if we found a non-zero sample
                                 if found_non_zero:
                                     # Slicing shape: [1, c, z, y, x ]
                                     inputs_first = inputs[b_idx: b_idx + 1]
