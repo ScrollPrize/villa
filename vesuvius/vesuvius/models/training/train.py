@@ -546,7 +546,7 @@ class BaseTrainer:
         grad_accumulate_n = self.mgr.gradient_accumulation
 
         # Early stopping setup
-        early_stopping_patience = getattr(self.mgr, 'early_stopping_patience', 5)
+        early_stopping_patience = getattr(self.mgr, 'early_stopping_patience', 20)
         if early_stopping_patience > 0:
             best_val_loss = float('inf')
             patience_counter = 0
@@ -882,7 +882,7 @@ def main():
                         help="Disable Automatic Mixed Precision (AMP) for training")
     parser.add_argument("--skip-intensity-sampling", action="store_true",
                         help="Skip intensity sampling during dataset initialization")
-    parser.add_argument("--early-stopping-patience", type=int, default=5,
+    parser.add_argument("--early-stopping-patience", type=int, default=20,
                         help="Number of epochs to wait for validation loss improvement before early stopping (default: 5, set to 0 to disable)")
 
     # Trainer selection
