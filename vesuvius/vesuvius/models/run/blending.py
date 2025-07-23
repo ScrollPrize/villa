@@ -12,7 +12,7 @@ from functools import partial
 import numcodecs
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import math
-from data.utils import open_zarr
+from vesuvius.data.utils import open_zarr
 import traceback
 
 

@@ -4,7 +4,7 @@ import napari.viewer
 import scipy.ndimage
 
 from .inference_widget import inference_widget
-from models.configuration.config_manager import ConfigManager
+from vesuvius.models.configuration.config_manager import ConfigManager
 from PIL import Image
 import numpy as np
 from pathlib import Path
@@ -110,7 +110,7 @@ def run_training(patch_size_z: int = 128, patch_size_x: int = 128, patch_size_y:
         return
     
     try:
-        from models.run.train import BaseTrainer
+        from vesuvius.models.run.train import BaseTrainer
         
         # Create trainer - it will initialize the dataset which will detect targets
         trainer = BaseTrainer(mgr=_config_manager, verbose=True)

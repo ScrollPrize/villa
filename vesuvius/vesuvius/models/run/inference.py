@@ -12,11 +12,11 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 multiprocessing.set_start_method('spawn', force=True)
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
-from utils.models.load_nnunet_model import load_model_for_inference
-from data.vc_dataset import VCDataset
-from data.utils import open_zarr
+from vesuvius.utils.models.load_nnunet_model import load_model_for_inference
+from vesuvius.data.vc_dataset import VCDataset
+from vesuvius.data.utils import open_zarr
 from pathlib import Path
-from models.build.build_network_from_config import NetworkFromConfig
+from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 
 class Inferer():
     def __init__(self,

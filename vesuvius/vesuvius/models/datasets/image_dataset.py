@@ -7,7 +7,7 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count
 from .base_dataset import BaseDataset
-from utils.type_conversion import convert_to_uint8_dtype_range
+from vesuvius.utils.type_conversion import convert_to_uint8_dtype_range
 import cv2
 import tifffile
 

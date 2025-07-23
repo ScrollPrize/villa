@@ -39,7 +39,7 @@ class ModelLoader:
         else:
             print(f"Warning: No model configuration found in checkpoint. Using empty config.")
         
-        from models.build.build_network_from_config import NetworkFromConfig
+        from vesuvius.models.build.build_network_from_config import NetworkFromConfig
         
         class MinimalConfigManager:
             def __init__(self, model_config):

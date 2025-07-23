@@ -15,7 +15,7 @@ from pathlib import Path
 import os
 import yaml
 import requests
-from setup.accept_terms import get_installation_path
+from vesuvius.setup.accept_terms import get_installation_path
 import zarr
 
 # Define the functions needed here to avoid circular imports

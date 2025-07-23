@@ -11,32 +11,32 @@ from multiprocessing import Pool, cpu_count
 from functools import partial
 from scipy.ndimage import distance_transform_edt
 from skimage.filters import scharr
-from models.augmentation.transforms.spatial.transpose import TransposeAxesTransform
+from vesuvius.models.augmentation.transforms.spatial.transpose import TransposeAxesTransform
 # Augmentations will be handled directly in this file
-from models.augmentation.transforms.utils.random import RandomTransform
-from models.augmentation.helpers.scalar_type import RandomScalar
-from models.augmentation.transforms.intensity.brightness import MultiplicativeBrightnessTransform
-from models.augmentation.transforms.intensity.contrast import ContrastTransform, BGContrast
-from models.augmentation.transforms.intensity.gamma import GammaTransform
-from models.augmentation.transforms.intensity.gaussian_noise import GaussianNoiseTransform
-from models.augmentation.transforms.noise.gaussian_blur import GaussianBlurTransform
-from models.augmentation.transforms.spatial.low_resolution import SimulateLowResolutionTransform
-from models.augmentation.transforms.spatial.mirroring import MirrorTransform
-from models.augmentation.transforms.spatial.spatial import SpatialTransform
-from models.augmentation.transforms.utils.compose import ComposeTransforms
-from models.augmentation.transforms.noise.extranoisetransforms import BlankRectangleTransform
-from models.augmentation.transforms.intensity.illumination import InhomogeneousSliceIlluminationTransform
+from vesuvius.models.augmentation.transforms.utils.random import RandomTransform
+from vesuvius.models.augmentation.helpers.scalar_type import RandomScalar
+from vesuvius.models.augmentation.transforms.intensity.brightness import MultiplicativeBrightnessTransform
+from vesuvius.models.augmentation.transforms.intensity.contrast import ContrastTransform, BGContrast
+from vesuvius.models.augmentation.transforms.intensity.gamma import GammaTransform
+from vesuvius.models.augmentation.transforms.intensity.gaussian_noise import GaussianNoiseTransform
+from vesuvius.models.augmentation.transforms.noise.gaussian_blur import GaussianBlurTransform
+from vesuvius.models.augmentation.transforms.spatial.low_resolution import SimulateLowResolutionTransform
+from vesuvius.models.augmentation.transforms.spatial.mirroring import MirrorTransform
+from vesuvius.models.augmentation.transforms.spatial.spatial import SpatialTransform
+from vesuvius.models.augmentation.transforms.utils.compose import ComposeTransforms
+from vesuvius.models.augmentation.transforms.noise.extranoisetransforms import BlankRectangleTransform
+from vesuvius.models.augmentation.transforms.intensity.illumination import InhomogeneousSliceIlluminationTransform
 
-from utils.utils import find_mask_patches, find_mask_patches_2d, pad_or_crop_3d, pad_or_crop_2d
-from utils.io.patch_cache_utils import (
+from vesuvius.utils.utils import find_mask_patches, find_mask_patches_2d, pad_or_crop_3d, pad_or_crop_2d
+from vesuvius.utils.io.patch_cache_utils import (
     get_data_checksums,
     load_cached_patches,
     save_computed_patches,
     save_intensity_properties,
     load_intensity_properties
 )
-from ..training.normalization import get_normalization
-from .intensity_sampling import compute_intensity_properties_parallel
+from vesuvius.models.training.normalization import get_normalization
+from vesuvius.models.datasets.intensity_sampling import compute_intensity_properties_parallel
 
 class BaseDataset(Dataset):
     """

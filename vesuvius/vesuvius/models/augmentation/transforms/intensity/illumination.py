@@ -2,7 +2,7 @@ from typing import Tuple
 import numpy as np
 from scipy.ndimage import gaussian_filter
 import torch
-from models.augmentation.transforms.base.basic_transform import BasicTransform
+from vesuvius.models.augmentation.transforms.base.basic_transform import BasicTransform
 
 class InhomogeneousSliceIlluminationTransform(BasicTransform):
     """

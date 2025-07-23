@@ -15,8 +15,8 @@ from torch.utils.data import Dataset, DataLoader
 import zarr
 import numcodecs
 
-from models.run.inference import Inferer
-from data.utils import open_zarr
+from vesuvius.models.run.inference import Inferer
+from vesuvius.data.utils import open_zarr
 
 
 class StructureTensorInferer(Inferer, nn.Module):

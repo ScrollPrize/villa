@@ -2,7 +2,7 @@ from copy import deepcopy
 
 import torch
 
-from models.augmentation.transforms.base.basic_transform import BasicTransform
+from vesuvius.models.augmentation.transforms.base.basic_transform import BasicTransform
 
 
 class Convert3DTo2DTransform(BasicTransform):

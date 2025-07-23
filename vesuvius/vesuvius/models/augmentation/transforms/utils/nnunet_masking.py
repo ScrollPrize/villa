@@ -1,6 +1,6 @@
 from typing import List
 
-from models.augmentation.transforms.base.basic_transform import BasicTransform
+from vesuvius.models.augmentation.transforms.base.basic_transform import BasicTransform
 
 
 class MaskImageTransform(BasicTransform):

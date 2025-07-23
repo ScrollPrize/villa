@@ -22,7 +22,7 @@ import torch
 from vesuvius.models.training.lr_schedulers import get_scheduler, PolyLRScheduler
 from torch.utils.data import DataLoader, SubsetRandomSampler
 from vesuvius.utils.utils import init_weights_he
-from vesuvius.models.datasets import NapariDataset, ImageDataset, ZarrDataset, MAEPretrainDataset
+from vesuvius.models.datasets import NapariDataset, ImageDataset, ZarrDataset
 from vesuvius.utils.plotting import save_debug
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 

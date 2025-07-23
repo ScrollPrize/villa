@@ -1,7 +1,7 @@
 from typing import Union, Tuple, List, Callable
 import numpy as np
 import torch
-from models.augmentation.transforms.base.basic_transform import BasicTransform, ImageOnlyTransform
+from vesuvius.models.augmentation.transforms.base.basic_transform import BasicTransform, ImageOnlyTransform
 
 class ColorFunctionExtractor:
     def __init__(self, rectangle_value):

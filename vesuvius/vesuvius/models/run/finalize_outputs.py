@@ -9,7 +9,7 @@ import shutil
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
-from data.utils import open_zarr
+from vesuvius.data.utils import open_zarr
 
 
 def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_classes, spatial_shape, output_chunks, is_multi_task=False, target_info=None):

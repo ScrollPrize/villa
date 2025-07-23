@@ -13,13 +13,13 @@ def test_imports():
     """Test that all required modules can be imported"""
     print("Testing imports...")
     try:
-        from models.configuration.config_manager import ConfigManager
+        from vesuvius.models.configuration.config_manager import ConfigManager
         print("✓ ConfigManager imported successfully")
         
-        from models.run.train import BaseTrainer
+        from vesuvius.models.run.train import BaseTrainer
         print("✓ BaseTrainer imported successfully")
         
-        from models.datasets import NapariDataset
+        from vesuvius.models.datasets import NapariDataset
         print("✓ NapariDataset imported successfully")
         
         # The napari trainer requires Qt bindings which may not be available in test env
@@ -41,7 +41,7 @@ def test_config_manager():
     """Test ConfigManager functionality"""
     print("\nTesting ConfigManager...")
     try:
-        from models.configuration.config_manager import ConfigManager
+        from vesuvius.models.configuration.config_manager import ConfigManager
         
         mgr = ConfigManager(verbose=False)  # Use verbose=False for cleaner test output
         print("✓ ConfigManager created successfully")
@@ -84,8 +84,8 @@ def test_napari_dataset_structure():
     """Test NapariDataset structure"""
     print("\nTesting NapariDataset structure...")
     try:
-        from models.datasets.napari_dataset import NapariDataset
-        from models.datasets.base_dataset import BaseDataset
+        from vesuvius.models.datasets.napari_dataset import NapariDataset
+        from vesuvius.models.datasets.base_dataset import BaseDataset
         
         # Check inheritance
         assert issubclass(NapariDataset, BaseDataset), "NapariDataset should inherit from BaseDataset"

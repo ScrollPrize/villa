@@ -6,8 +6,8 @@ import torch
 from skimage.data import camera
 from torch.nn.functional import pad, conv3d, conv1d, conv2d
 
-from models.augmentation.helpers.scalar_type import RandomScalar, sample_scalar
-from models.augmentation.transforms.base.basic_transform import ImageOnlyTransform
+from vesuvius.models.augmentation.helpers.scalar_type import RandomScalar, sample_scalar
+from vesuvius.models.augmentation.transforms.base.basic_transform import ImageOnlyTransform
 from fft_conv_pytorch import fft_conv
 
 

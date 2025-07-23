@@ -3,7 +3,7 @@ import zarr
 from pathlib import Path
 from collections import defaultdict
 from .base_dataset import BaseDataset
-from utils.io.zarr_io import _is_ome_zarr
+from vesuvius.utils.io.zarr_io import _is_ome_zarr
 
 class ZarrDataset(BaseDataset):
     """

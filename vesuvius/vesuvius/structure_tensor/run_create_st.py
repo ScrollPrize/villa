@@ -17,7 +17,7 @@ import zarr
 import numpy as np
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from data.utils import open_zarr
+from vesuvius.data.utils import open_zarr
 
 
 def get_available_gpus():
