@@ -182,7 +182,7 @@ class BaseTrainer:
         # for cuda, we can use a grad scaler for mixed precision training if amp is enabled
         # for mps or cpu, or when amp is disabled, we create a dummy scaler that does nothing
         if device_type == 'cuda' and use_amp:
-            return torch.amp.GradScaler()
+            return torch.amp.GradScaler('cuda')
         else:
             class DummyScaler:
                 def scale(self, loss):
@@ -207,6 +207,13 @@ class BaseTrainer:
             
         dataset_size = len(train_dataset)
         indices = list(range(dataset_size))
+
+        # Set seed for reproducible train/val split
+        if hasattr(self.mgr, 'seed'):
+            np.random.seed(self.mgr.seed)
+            if self.mgr.verbose:
+                print(f"Using seed {self.mgr.seed} for train/val split")
+
         np.random.shuffle(indices)
 
         train_val_split = self.mgr.tr_val_split
@@ -214,30 +221,19 @@ class BaseTrainer:
         train_indices, val_indices = indices[:split], indices[split:]
         batch_size = self.mgr.train_batch_size
 
-        device_type = 'mps' if hasattr(torch, 'mps') and torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu'
-
-        # For MPS device, set num_workers=0 to avoid pickling error
-        if device_type == 'mps':
-            num_workers = 0
-        else:
-            # For CUDA or CPU, use the configured number of workers
-            # If train_num_dataloader_workers is not set, default to 4
-            if hasattr(self.mgr, 'train_num_dataloader_workers'):
-                num_workers = self.mgr.train_num_dataloader_workers
-            else:
-                num_workers = 4
-
         train_dataloader = DataLoader(train_dataset,
-                                batch_size=batch_size,
-                                sampler=SubsetRandomSampler(train_indices),
-                                pin_memory=(device_type == 'cuda'),  # pin_memory=True for CUDA
-                                num_workers=num_workers)
+                                      batch_size=batch_size,
+                                      sampler=SubsetRandomSampler(train_indices),
+                                      pin_memory=(True if self.device == 'cuda' else False),
+                                      num_workers=self.mgr.train_num_dataloader_workers
+                                      )
 
         val_dataloader = DataLoader(val_dataset,
                                     batch_size=1,
                                     sampler=SubsetRandomSampler(val_indices),
-                                    pin_memory=(device_type == 'cuda'), 
-                                    num_workers=num_workers)
+                                    pin_memory=(True if self.device == 'cuda' else False),
+                                    num_workers=self.mgr.train_num_dataloader_workers
+                                    )
 
         return train_dataloader, val_dataloader, train_indices, val_indices
 
