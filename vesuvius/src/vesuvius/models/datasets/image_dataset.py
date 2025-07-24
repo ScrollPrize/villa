@@ -115,6 +115,7 @@ class ImageDataset(BaseDataset):
         """Read the shape of an image file without loading all data."""
         if str(image_path).lower().endswith(('.tif', '.tiff')):
             img = tifffile.imread(str(image_path))
+            return img.shape
         else:
             img = cv2.imread(str(image_path))
             return img.shape
