@@ -94,7 +94,7 @@ class SpatialTransform(BasicTransform):
             else:
                 deformation_scales = [
                     sample_scalar(self.elastic_deform_scale, image=data_dict['image'], dim=i, patch_size=self.patch_size)
-                    for i in range(0, 3)
+                    for i in range(0, dim)
                     ]
 
             # sigmas must be in pixels, as this will be applied to the deformation field
@@ -103,7 +103,7 @@ class SpatialTransform(BasicTransform):
             magnitude = [
                 sample_scalar(self.elastic_deform_magnitude, image=data_dict['image'], patch_size=self.patch_size,
                               dim=i, deformation_scale=deformation_scales[i])
-                for i in range(0, 3)]
+                for i in range(0, dim)]
             # doing it like this for better memory layout for blurring
             offsets = torch.normal(mean=0, std=1, size=(dim, *self.patch_size))
 
@@ -120,7 +120,10 @@ class SpatialTransform(BasicTransform):
 
                 mx = torch.max(torch.abs(offsets[d]))
                 offsets[d] /= (mx / np.clip(magnitude[d], a_min=1e-8, a_max=np.inf))
-            offsets = torch.permute(offsets, (1, 2, 3, 0))
+            if dim == 3:
+                offsets = torch.permute(offsets, (1, 2, 3, 0))
+            else:  # dim == 2
+                offsets = torch.permute(offsets, (1, 2, 0))
         else:
             offsets = None
 
@@ -129,9 +132,17 @@ class SpatialTransform(BasicTransform):
             center_location_in_pixels = [i / 2 for i in shape]
         else:
             center_location_in_pixels = []
-            for d in range(0, 3):
-                mn = self.patch_center_dist_from_border[d]
-                mx = shape[d] - self.patch_center_dist_from_border[d]
+            # Use actual number of spatial dimensions instead of hardcoded 3
+            num_spatial_dims = len(shape)
+            for d in range(num_spatial_dims):
+                # Handle case where patch_center_dist_from_border might be shorter
+                if isinstance(self.patch_center_dist_from_border, (list, tuple)):
+                    dist = self.patch_center_dist_from_border[d] if d < len(self.patch_center_dist_from_border) else self.patch_center_dist_from_border[-1]
+                else:
+                    dist = self.patch_center_dist_from_border
+
+                mn = dist
+                mx = shape[d] - dist
                 if mx < mn:
                     center_location_in_pixels.append(shape[d] / 2)
                 else:

@@ -7,7 +7,7 @@ import hashlib
 import json
 import pickle
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 
 
 def get_data_checksums(data_path: Path) -> Dict[str, float]:
@@ -109,108 +109,12 @@ def get_cache_filename(cache_dir: Path, config_params: Dict[str, Any]) -> Path:
     return cache_dir / f"patches_cache_{cache_key}.pkl"
 
 
-def get_intensity_properties_filename(cache_dir: Path) -> Path:
-    """
-    Get filename for intensity properties JSON file.
-    
-    Parameters
-    ----------
-    cache_dir : Path
-        Directory to store cache files
-        
-    Returns
-    -------
-    Path
-        Full path to the intensity properties JSON file
-    """
-    # Create cache directory if it doesn't exist
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / "intensity_properties.json"
-
-
-def save_intensity_properties(cache_dir: Path, intensity_properties: Dict[str, float], normalization_scheme: str) -> bool:
-    """
-    Save intensity properties to a separate JSON file.
-    
-    Parameters
-    ----------
-    cache_dir : Path
-        Directory to store cache files
-    intensity_properties : dict
-        Computed intensity properties
-    normalization_scheme : str
-        Normalization scheme used
-        
-    Returns
-    -------
-    bool
-        True if save was successful
-    """
-    filename = get_intensity_properties_filename(cache_dir)
-    
-    data = {
-        'intensity_properties': intensity_properties,
-        'normalization_scheme': normalization_scheme,
-        'timestamp': datetime.now().isoformat()
-    }
-    
-    try:
-        with open(filename, 'w') as f:
-            json.dump(data, f, indent=2)
-        print(f"Saved intensity properties to: {filename}")
-        return True
-    except Exception as e:
-        print(f"Warning: Failed to save intensity properties: {e}")
-        return False
-
-
-def load_intensity_properties(cache_dir: Path) -> Optional[Tuple[Dict[str, float], str]]:
-    """
-    Load intensity properties from JSON file.
-    
-    Parameters
-    ----------
-    cache_dir : Path
-        Directory containing cache files
-        
-    Returns
-    -------
-    tuple or None
-        (intensity_properties, normalization_scheme) if successful, None otherwise
-    """
-    filename = get_intensity_properties_filename(cache_dir)
-    
-    if not filename.exists():
-        print(f"No intensity properties file found at: {filename}")
-        return None
-    
-    try:
-        with open(filename, 'r') as f:
-            data = json.load(f)
-        
-        intensity_properties = data.get('intensity_properties')
-        normalization_scheme = data.get('normalization_scheme')
-        timestamp = data.get('timestamp', 'unknown')
-        
-        if intensity_properties and normalization_scheme:
-            print(f"Loaded intensity properties from: {filename} (saved at {timestamp})")
-            return intensity_properties, normalization_scheme
-        else:
-            print(f"Invalid intensity properties file: {filename}")
-            return None
-            
-    except Exception as e:
-        print(f"Warning: Failed to load intensity properties from {filename}: {e}")
-        return None
-
 
 def save_patches_cache(
     cache_file: Path,
     valid_patches: List[Dict],
     config_params: Dict[str, Any],
-    data_checksums: Dict[str, float],
-    intensity_properties: Optional[Dict[str, float]] = None,
-    normalization_scheme: Optional[str] = None
+    data_checksums: Dict[str, float]
 ) -> bool:
     """
     Save valid patches to cache file.
@@ -225,10 +129,6 @@ def save_patches_cache(
         Configuration parameters used for patch computation
     data_checksums : dict
         File modification times for data freshness checking
-    intensity_properties : dict, optional
-        Computed intensity properties for normalization
-    normalization_scheme : str, optional
-        Normalization scheme used
         
     Returns
     -------
@@ -240,9 +140,7 @@ def save_patches_cache(
         'creation_time': datetime.now().isoformat(),
         'data_checksums': data_checksums,
         'valid_patches': valid_patches,
-        'num_patches': len(valid_patches),
-        'intensity_properties': intensity_properties,
-        'normalization_scheme': normalization_scheme
+        'num_patches': len(valid_patches)
     }
     
     try:
@@ -316,7 +214,7 @@ def is_cache_valid(
             return False
     
     # Check additional configuration parameters that might be present
-    # This handles dataset-specific parameters like those from MAE dataset
+    # This handles dataset-specific parameters
     additional_keys = [
         'dataset_type', 'normalization_scheme', 'use_bounding_box', 'nonzero_validated'
     ]
@@ -356,7 +254,7 @@ def load_cached_patches(
     cache_dir: Path,
     config_params: Dict[str, Any],
     data_path: Path
-) -> Optional[Tuple[List[Dict], Optional[Dict[str, float]], Optional[str]]]:
+) -> Optional[List[Dict]]:
     """
     High-level function to load cached patches if available and valid.
     
@@ -371,9 +269,8 @@ def load_cached_patches(
         
     Returns
     -------
-    tuple or None
-        (valid_patches, intensity_properties, normalization_scheme) if cache is valid,
-        None otherwise
+    list or None
+        valid_patches if cache is valid, None otherwise
     """
     # Get cache filename
     cache_file = get_cache_filename(cache_dir, config_params)
@@ -389,12 +286,8 @@ def load_cached_patches(
     # Validate cache
     if is_cache_valid(cache_data, config_params, current_checksums):
         valid_patches = cache_data.get('valid_patches', [])
-        intensity_properties = cache_data.get('intensity_properties')
-        normalization_scheme = cache_data.get('normalization_scheme')
         print(f"Loaded {len(valid_patches)} patches from cache (created {cache_data.get('creation_time', 'unknown')})")
-        if intensity_properties:
-            print("Also loaded cached intensity properties")
-        return valid_patches, intensity_properties, normalization_scheme
+        return valid_patches
     else:
         print("Cache is invalid or outdated, will recompute patches")
         return None
@@ -404,9 +297,7 @@ def save_computed_patches(
     valid_patches: List[Dict],
     cache_dir: Path,
     config_params: Dict[str, Any],
-    data_path: Path,
-    intensity_properties: Optional[Dict[str, float]] = None,
-    normalization_scheme: Optional[str] = None
+    data_path: Path
 ) -> bool:
     """
     High-level function to save computed patches to cache.
@@ -421,10 +312,6 @@ def save_computed_patches(
         Configuration parameters used for patch computation
     data_path : Path
         Path to the dataset for checksum generation
-    intensity_properties : dict, optional
-        Computed intensity properties for normalization
-    normalization_scheme : str, optional
-        Normalization scheme used
         
     Returns
     -------
@@ -438,4 +325,4 @@ def save_computed_patches(
     cache_file = get_cache_filename(cache_dir, config_params)
     
     # Save cache
-    return save_patches_cache(cache_file, valid_patches, config_params, data_checksums, intensity_properties, normalization_scheme)
+    return save_patches_cache(cache_file, valid_patches, config_params, data_checksums)

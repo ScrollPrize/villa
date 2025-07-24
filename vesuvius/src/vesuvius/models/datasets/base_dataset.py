@@ -29,16 +29,11 @@ from vesuvius.models.augmentation.transforms.utils.compose import ComposeTransfo
 from vesuvius.models.augmentation.transforms.noise.extranoisetransforms import BlankRectangleTransform
 from vesuvius.models.augmentation.transforms.intensity.illumination import InhomogeneousSliceIlluminationTransform
 
-from vesuvius.utils.utils import find_mask_patches, find_mask_patches_2d, pad_or_crop_3d, pad_or_crop_2d
-from vesuvius.utils.io.patch_cache_utils import (
-    get_data_checksums,
-    load_cached_patches,
-    save_computed_patches,
-    save_intensity_properties,
-    load_intensity_properties
-)
-from vesuvius.models.training.normalization import get_normalization
-from vesuvius.models.datasets.intensity_sampling import compute_intensity_properties_parallel
+from vesuvius.utils.utils import pad_or_crop_3d, pad_or_crop_2d
+from ..training.normalization import get_normalization
+from .intensity_properties import initialize_intensity_properties
+from .find_valid_patches import find_valid_patches
+from .save_valid_patches import save_valid_patches, load_cached_patches
 
 class BaseDataset(Dataset):
     """
@@ -71,9 +66,15 @@ class BaseDataset(Dataset):
         self.min_labeled_ratio = mgr.min_labeled_ratio
         self.min_bbox_percent = mgr.min_bbox_percent
         
-        # Skip patch validation (defaults to False)
+        # if you are certain your data contains dense labels (everything is labeled), you can choose
+        # to skip the valid patch finding
         self.skip_patch_validation = getattr(mgr, 'skip_patch_validation', False)
-        
+
+        # for semi-supervised workflows, unlabeled data is obviously needed,
+        # we want a flag for this so in fully supervised workflows we can assert that all images have
+        # corresponding labels (so we catch it early)
+        self.allow_unlabeled_data = getattr(mgr, 'allow_unlabeled_data', False)
+
         # Initialize normalization (will be set after computing intensity properties)
         self.normalization_scheme = getattr(mgr, 'normalization_scheme', 'zscore')
         self.intensity_properties = getattr(mgr, 'intensity_properties', {})
@@ -81,12 +82,12 @@ class BaseDataset(Dataset):
 
         self.target_volumes = {}
         self.valid_patches = []
-        self.is_2d_dataset = None  
-        
-        # Store data_path as an attribute for cache handling
+        self.is_2d_dataset = None
         self.data_path = Path(mgr.data_path) if hasattr(mgr, 'data_path') else None
-        
-        # Cache-related attributes
+        self.zarr_arrays = []
+        self.zarr_names = []
+        self.data_paths = []
+
         self.cache_enabled = getattr(mgr, 'cache_valid_patches', True)
         self.cache_dir = None
         if self.data_path is not None:
@@ -96,84 +97,84 @@ class BaseDataset(Dataset):
         
         self._initialize_volumes()
         ref_target = list(self.target_volumes.keys())[0]
-        ref_volume = self.target_volumes[ref_target][0]['data']['label']
-        self.is_2d_dataset = len(ref_volume.shape) == 2
+        ref_volume_data = self.target_volumes[ref_target][0]['data']
+
+        if 'label' in ref_volume_data and ref_volume_data['label'] is not None:
+            ref_shape = ref_volume_data['label'].shape
+        else:
+            ref_shape = ref_volume_data['data'].shape
+
+        self.is_2d_dataset = len(ref_shape) == 2 or (len(ref_shape) == 3 and ref_shape[0] <= 20)
         
         if self.is_2d_dataset:
             print("Detected 2D dataset")
+            if len(self.patch_size) == 3:
+                self.patch_size = list(self.patch_size[-2:])
+                print(f"Adjusted patch size for 2D data: {self.patch_size}")
         else:
             print("Detected 3D dataset")
-        
-        # Try to load intensity properties from JSON file first
-        loaded_from_cache = False
-        if self.cache_enabled and self.cache_dir is not None and self.normalization_scheme in ['zscore', 'ct'] and not self.intensity_properties:
-            # Try to load from separate JSON file
-            print("\nChecking for cached intensity properties...")
-            intensity_result = load_intensity_properties(self.cache_dir)
-            if intensity_result is not None:
-                cached_intensity_properties, cached_normalization_scheme = intensity_result
-                if cached_normalization_scheme == self.normalization_scheme:
-                    self.intensity_properties = cached_intensity_properties
-                    self.mgr.intensity_properties = cached_intensity_properties
-                    if hasattr(self.mgr, 'dataset_config'):
-                        self.mgr.dataset_config['intensity_properties'] = cached_intensity_properties
-                    print("\nLoaded intensity properties from JSON cache - skipping computation")
-                    print("Cached intensity properties:")
-                    for key, value in cached_intensity_properties.items():
-                        print(f"  {key}: {value:.4f}")
-                    loaded_from_cache = True
-                else:
-                    print(f"Cached normalization scheme '{cached_normalization_scheme}' doesn't match current '{self.normalization_scheme}'")
-            
-        # Also check patches cache for backward compatibility
-        if self.cache_enabled and self.cache_dir is not None and self.data_path is not None and not loaded_from_cache:
-            config_params = self._get_config_params()
-            cache_result = load_cached_patches(
-                self.cache_dir,
-                config_params,
-                self.data_path
+
+        # Check if we should skip intensity sampling
+        skip_intensity_sampling = getattr(mgr, 'skip_intensity_sampling', False)
+
+        if skip_intensity_sampling:
+            print("Skipping intensity sampling as requested")
+            # Use default values if intensity properties not provided
+            if not self.intensity_properties:
+                self.intensity_properties = {
+                    'mean': 0.0,
+                    'std': 1.0,
+                    'min': 0.0,
+                    'max': 1.0,
+                    'percentile_00_5': 0.0,
+                    'percentile_99_5': 1.0
+                }
+        else:
+            self.intensity_properties = initialize_intensity_properties(
+                target_volumes=self.target_volumes,
+                normalization_scheme=self.normalization_scheme,
+                existing_properties=self.intensity_properties,
+                cache_enabled=self.cache_enabled,
+                cache_dir=self.cache_dir,
+                mgr=self.mgr,
+                sample_ratio=0.001,
+                max_samples=1000000
             )
-            if cache_result is not None:
-                cached_patches, cached_intensity_properties, cached_normalization_scheme = cache_result
-                # If we have cached intensity properties and don't already have them, use the cached ones
-                if cached_intensity_properties and not self.intensity_properties:
-                    self.intensity_properties = cached_intensity_properties
-                    self.mgr.intensity_properties = cached_intensity_properties
-                    if hasattr(self.mgr, 'dataset_config'):
-                        self.mgr.dataset_config['intensity_properties'] = cached_intensity_properties
-                    print("\nLoaded intensity properties from patches cache - skipping computation")
-                    print("Cached intensity properties:")
-                    for key, value in cached_intensity_properties.items():
-                        print(f"  {key}: {value:.4f}")
-                    loaded_from_cache = True
-                    # Also save to JSON for visibility
-                    save_intensity_properties(self.cache_dir, cached_intensity_properties, cached_normalization_scheme or self.normalization_scheme)
-        
-        # Compute intensity properties if not provided and not loaded from cache
-        if self.normalization_scheme in ['zscore', 'ct'] and not self.intensity_properties and not loaded_from_cache:
-            print(f"\nComputing intensity properties for {self.normalization_scheme} normalization...")
-            self.intensity_properties = compute_intensity_properties_parallel(self.target_volumes, sample_ratio=0.001, max_samples=1000000)
-            # Update the config manager with computed properties
-            if hasattr(self.mgr, 'intensity_properties'):
-                self.mgr.intensity_properties = self.intensity_properties
-                self.mgr.dataset_config['intensity_properties'] = self.intensity_properties
-            
-            # Save to separate JSON file for visibility
-            if self.cache_enabled and self.cache_dir is not None:
-                save_intensity_properties(self.cache_dir, self.intensity_properties, self.normalization_scheme)
-        
-        # Now initialize the normalizer with the computed or provided properties
+
         self.normalizer = get_normalization(self.normalization_scheme, self.intensity_properties)
-        
-        # Initialize transforms for training
+
         self.transforms = None
         if self.is_training:
             self.transforms = self._create_training_transforms()
             print("Training transforms initialized")
-        
-        # Only run validation if not handled by subclass (e.g., MAEPretrainDataset)
-        if not getattr(self, '_mae_will_handle_validation', False):
+
+        if not self.skip_patch_validation:
             self._get_valid_patches()
+        else:
+            print("Skipping patch validation as requested")
+            # Generate all possible patches without validation
+            self.valid_patches = []
+
+            # Get the first target to access all volumes (since all targets share the same volumes)
+            first_target = list(self.target_volumes.keys())[0]
+            all_volumes = self.target_volumes[first_target]
+
+            for vol_idx, volume_info in enumerate(all_volumes):
+                # Get the image array (data) for this volume
+                img_array = volume_info['data']['data']
+                vol_name = volume_info.get('volume_id', f"volume_{vol_idx}")
+
+                positions = self._get_all_sliding_window_positions(
+                    volume_shape=img_array.shape,
+                    patch_size=self.patch_size
+                )
+                for pos_dict in positions:
+                    self.valid_patches.append({
+                        "volume_index": vol_idx,
+                        "volume_name": vol_name,
+                        "position": pos_dict['start_pos']
+                    })
+            print(f"Generated {len(self.valid_patches)} patches without validation")
 
     def _initialize_volumes(self):
         """
@@ -182,20 +183,25 @@ class BaseDataset(Dataset):
         This method must be implemented by subclasses to specify how
         data is loaded from their specific data source (napari, TIFs, Zarr, etc.).
         
-        The implementation should populate self.target_volumes in the format:
-        {
-            'target_name': [
-                {
-                    'data': {
-                        'data': numpy_array,      # Image data
-                        'label': numpy_array,     # Label data  
-                        'mask': numpy_array       # Mask data (optional)
-                    }
-                },
-                ...  # Additional volumes for this target
-            ],
-            ...  # Additional targets
-        }
+        The implementation should:
+        1. Populate self.target_volumes in the format:
+           {
+               'target_name': [
+                   {
+                       'data': {
+                           'data': numpy_array,      # Image data
+                           'label': numpy_array      # Label data
+                       }
+                   },
+                   ...  # Additional volumes for this target
+               ],
+               ...  # Additional targets
+           }
+
+        2. Populate zarr arrays for patch finding:
+           - self.zarr_arrays: List of zarr arrays (label volumes)
+           - self.zarr_names: List of names for each volume
+           - self.data_paths: List of data paths for each volume
         """
         raise NotImplementedError("Subclasses must implement _initialize_volumes() method")
 
@@ -226,7 +232,6 @@ class BaseDataset(Dataset):
                 stride = (h // 2, w // 2)  # 50% overlap by default
             
             positions = []
-            # Calculate total iterations for progress bar
             y_positions = list(range(0, H - h + 1, stride[0]))
             total_positions = len(y_positions) * len(range(0, W - w + 1, stride[1]))
             
@@ -268,7 +273,6 @@ class BaseDataset(Dataset):
                 stride = (d // 2, h // 2, w // 2)  # 50% overlap by default
             
             positions = []
-            # Calculate total iterations for progress bar
             z_positions = list(range(0, D - d + 1, stride[0]))
             y_positions = list(range(0, H - h + 1, stride[1]))
             x_positions = list(range(0, W - w + 1, stride[2]))
@@ -282,10 +286,7 @@ class BaseDataset(Dataset):
                                 'start_pos': [z, y, x]
                             })
                             pbar.update(1)
-            
-            # Ensure we cover the edges in 3D
-            # This is more complex but follows the same principle
-            # Add patches to cover the edges if the stride doesn't naturally cover them
+
             if D - d > 0 and (D - d) % stride[0] != 0:
                 for y in range(0, H - h + 1, stride[1]):
                     for x in range(0, W - w + 1, stride[2]):
@@ -306,8 +307,7 @@ class BaseDataset(Dataset):
                         positions.append({
                             'start_pos': [z, y, W - w]
                         })
-        
-        # Remove duplicates while preserving order
+
         seen = set()
         unique_positions = []
         for pos in positions:
@@ -317,359 +317,132 @@ class BaseDataset(Dataset):
                 unique_positions.append(pos)
         
         return unique_positions
-
-    def _get_config_params(self):
-        """
-        Get configuration parameters for caching.
-        
-        Returns
-        -------
-        dict
-            Configuration parameters
-        """
-        return {
-            'patch_size': self.patch_size,
-            'min_labeled_ratio': self.min_labeled_ratio,
-            'min_bbox_percent': self.min_bbox_percent,
-            'skip_patch_validation': self.skip_patch_validation,
-            'targets': sorted(self.targets.keys()),
-            'is_2d_dataset': self.is_2d_dataset
-        }
-    
-    def _load_approved_patches(self):
-        """
-        Load approved patches from vc_proofreader export file.
-        
-        Returns
-        -------
-        bool
-            True if patches were successfully loaded, False otherwise
-        """
-        approved_patches_file = Path(self.mgr.approved_patches_file)
-        
-        if not approved_patches_file.exists():
-            print(f"Approved patches file not found: {approved_patches_file}")
-            return False
-        
-        try:
-            with open(approved_patches_file, 'r') as f:
-                data = json.load(f)
-            
-            # Validate the file format
-            if 'metadata' not in data or 'approved_patches' not in data:
-                print(f"Invalid approved patches file format: missing required keys")
-                return False
-            
-            metadata = data['metadata']
-            approved_patches = data['approved_patches']
-            
-            # Validate patch size compatibility
-            if metadata.get('patch_size') != self.patch_size:
-                print(f"Warning: Patch size mismatch. Expected {self.patch_size}, got {metadata.get('patch_size')}")
-                # Could choose to continue or return False depending on requirements
-            
-            # Convert approved patches to the format expected by BaseDataset
-            self.valid_patches = []
-            for patch_info in approved_patches:
-                self.valid_patches.append({
-                    "volume_index": patch_info.get("volume_index", 0),
-                    "position": patch_info["coords"]
-                })
-            
-            print(f"Successfully loaded {len(self.valid_patches)} approved patches from {approved_patches_file}")
-            print(f"Approved patches metadata:")
-            print(f"  - Patch size: {metadata.get('patch_size')}")
-            print(f"  - Coordinate system: {metadata.get('coordinate_system', 'unknown')}")
-            print(f"  - Total approved: {metadata.get('total_approved', len(approved_patches))}")
-            print(f"  - Export timestamp: {metadata.get('export_timestamp', 'unknown')}")
-            
-            return True
-            
-        except Exception as e:
-            print(f"Error loading approved patches file: {e}")
-            return False
     
     def _get_valid_patches(self):
-        """Find valid patches based on mask coverage and labeled ratio requirements."""
+        """Find valid patches based on labeled ratio requirements."""
         # Check if we should load approved patches from vc_proofreader
         if hasattr(self.mgr, 'approved_patches_file') and self.mgr.approved_patches_file:
             if self._load_approved_patches():
                 return
-        
-        # Try to load from cache first
-        if self.cache_enabled and self.cache_dir is not None and self.data_path is not None:
-            print("\nAttempting to load patches from cache...")
-            config_params = self._get_config_params()
-            print(f"Cache configuration: {config_params}")
-            cache_result = load_cached_patches(
-                self.cache_dir,
-                config_params,
-                self.data_path
+
+        bbox_threshold = getattr(self.mgr, 'min_bbox_percent', 0.97)
+        downsample_level = getattr(self.mgr, 'downsample_level', 1)
+        num_workers = getattr(self.mgr, 'num_workers', 4)
+
+        if self.cache_enabled and len(self.zarr_arrays) > 0:
+            cached_patches = load_cached_patches(
+                train_data_paths=self.data_paths,
+                label_paths=self.data_paths,
+                patch_size=tuple(self.patch_size),
+                min_labeled_ratio=self.min_labeled_ratio,
+                bbox_threshold=bbox_threshold,
+                downsample_level=downsample_level,
+                cache_path=str(self.cache_dir) if self.cache_dir else None
             )
-            if cache_result is not None:
-                cached_patches, cached_intensity_properties, cached_normalization_scheme = cache_result
+
+            if cached_patches is not None:
                 self.valid_patches = cached_patches
                 print(f"Successfully loaded {len(self.valid_patches)} patches from cache\n")
-                
-                # Load cached intensity properties if available and not already set
-                if cached_intensity_properties and not self.intensity_properties:
-                    self.intensity_properties = cached_intensity_properties
-                    self.mgr.intensity_properties = cached_intensity_properties
-                    if hasattr(self.mgr, 'dataset_config'):
-                        self.mgr.dataset_config['intensity_properties'] = cached_intensity_properties
-                    print("Loaded intensity properties from cache - skipping computation")
-                    print("Cached intensity properties:")
-                    for key, value in cached_intensity_properties.items():
-                        print(f"  {key}: {value:.4f}")
-                    
                 return
-            else:
-                print("No valid cache found, will compute patches...")
-            
-        # If no valid cache, compute patches
-        print("Computing valid patches...")
-        ref_target = list(self.target_volumes.keys())[0]
-        total_volumes = len(self.target_volumes[ref_target])
 
-        for vol_idx, volume_info in enumerate(tqdm(self.target_volumes[ref_target], 
-                                                    desc="Processing volumes", 
-                                                    total=total_volumes)):
-            vdata = volume_info['data']
-            is_2d = len(vdata['label'].shape) == 2
-            
-            if self.skip_patch_validation:
-                # Skip validation - generate all sliding window positions
-                print(f"Skipping patch validation for volume {vol_idx} - using all sliding window positions")
-                
-                volume_shape = vdata['label'].shape
-                
-                # Handle multi-channel labels (e.g., eigenvalues with shape [C, D, H, W])
-                if len(volume_shape) == 4 and not is_2d:
-                    # Skip first dimension (channels) for 3D multi-channel data
-                    volume_shape = volume_shape[1:]  # [D, H, W]
-                elif len(volume_shape) == 3 and is_2d:
-                    # Skip first dimension (channels) for 2D multi-channel data
-                    volume_shape = volume_shape[1:]  # [H, W]
-                
-                if is_2d:
-                    patch_size = self.patch_size[:2]  # [h, w]
-                else:
-                    patch_size = self.patch_size  # [d, h, w]
-                
-                patches = self._get_all_sliding_window_positions(volume_shape, patch_size)
-                print(f"Generated {len(patches)} patches from {'2D' if is_2d else '3D'} data using sliding window")
-            else:
-                # Original validation logic
-                label_data = vdata['label']  # Get the label data explicitly
-                
-                # Handle multi-channel labels for patch finding
-                if len(label_data.shape) == 4 and not is_2d:
-                    # 4D data: [C, D, H, W] - use first channel for patch finding to avoid loading entire array
-                    print(f"Detected 4D label data with shape {label_data.shape} for volume {vol_idx}")
-                    print(f"Using first channel (of {label_data.shape[0]}) for patch validation to avoid memory issues")
-                    label_data_for_patches = label_data[0]  # [D, H, W] - only loads first channel
-                elif len(label_data.shape) == 3 and is_2d:
-                    # 3D data for 2D: [C, H, W] - use first channel
-                    print(f"Detected multi-channel 2D label data with shape {label_data.shape} for volume {vol_idx}")
-                    print(f"Using first channel (of {label_data.shape[0]}) for patch validation to avoid memory issues")
-                    label_data_for_patches = label_data[0]  # [H, W] - only loads first channel
-                else:
-                    # Normal 3D or 2D data
-                    label_data_for_patches = label_data
-                
-                # Check if mask is available
-                has_mask = 'mask' in vdata and vdata['mask'] is not None
-                
-                if has_mask:
-                    mask_data = vdata['mask']
-                    # Handle multi-channel masks similarly
-                    if len(mask_data.shape) == 4 and not is_2d:
-                        mask_data_for_patches = mask_data[0]  # Use first channel only
-                    elif len(mask_data.shape) == 3 and is_2d:
-                        mask_data_for_patches = mask_data[0]  # Use first channel only
-                    else:
-                        mask_data_for_patches = mask_data
-                    print(f"Using mask for patch extraction in volume {vol_idx}")
-                else:
-                    # When no mask is available, we'll skip mask checks entirely
-                    # The mask_data shape is still needed for the patch finding functions
-                    mask_data_for_patches = label_data_for_patches  # Just for shape, won't be used with skip_mask_check=True
-                    print(f"No mask found for volume {vol_idx}, skipping mask coverage checks")
-                
-                if is_2d:
-                    h, w = self.patch_size[0], self.patch_size[1]  # y, x
-                    patches = find_mask_patches_2d(
-                        mask_data_for_patches,
-                        label_data_for_patches,
-                        patch_size=[h, w], 
-                        min_mask_coverage=1.0,
-                        min_labeled_ratio=self.min_labeled_ratio,
-                        skip_mask_check=not has_mask  # Skip mask check if no mask provided
-                    )
-                    print(f"Found {len(patches)} patches from 2D data with min labeled ratio {self.min_labeled_ratio}")
-                else:
-                    patches = find_mask_patches(
-                        mask_data_for_patches,
-                        label_data_for_patches,
-                        patch_size=self.patch_size, 
-                        min_mask_coverage=1.0,
-                        min_labeled_ratio=self.min_labeled_ratio,
-                        skip_mask_check=not has_mask  # Skip mask check if no mask provided
-                    )
-                    print(f"Found {len(patches)} patches from 3D data with min labeled ratio {self.min_labeled_ratio}")
+        if len(self.zarr_arrays) == 0:
+            raise ValueError("No zarr arrays available for patch finding. Subclasses must populate self.zarr_arrays")
 
-            for p in patches:
-                self.valid_patches.append({
-                    "volume_index": vol_idx,
-                    "position": p["start_pos"]  # (z,y,x)
-                })
-        
-        # Save to cache after computing all patches
-        if self.cache_enabled and self.cache_dir is not None and self.data_path is not None:
-            print(f"\nAttempting to save {len(self.valid_patches)} patches to cache...")
-            config_params = self._get_config_params()
-            success = save_computed_patches(
-                self.valid_patches,
-                self.cache_dir,
-                config_params,
-                self.data_path,
-                intensity_properties=self.intensity_properties,
-                normalization_scheme=self.normalization_scheme
+        print("Computing valid patches using zarr arrays...")
+        valid_patches = find_valid_patches(
+            label_arrays=self.zarr_arrays,
+            label_names=self.zarr_names,
+            patch_size=tuple(self.patch_size),
+            bbox_threshold=bbox_threshold,
+            label_threshold=self.min_labeled_ratio,
+            num_workers=num_workers,
+            downsample_level=downsample_level
+        )
+
+        # Convert to the expected format
+        self.valid_patches = []
+        for patch in valid_patches:
+            self.valid_patches.append({
+                "volume_index": patch["volume_idx"],
+                "volume_name": patch["volume_name"],
+                "position": patch["start_pos"]  # (z,y,x) for 3D or (y,x) for 2D
+            })
+
+        # Save to cache after computing
+        if self.cache_enabled and self.cache_dir is not None and len(self.zarr_arrays) > 0:
+            cache_path = save_valid_patches(
+                valid_patches=valid_patches,
+                train_data_paths=self.data_paths,
+                label_paths=self.data_paths,
+                patch_size=tuple(self.patch_size),
+                min_labeled_ratio=self.min_labeled_ratio,
+                bbox_threshold=bbox_threshold,
+                downsample_level=downsample_level,
+                cache_path=str(self.cache_dir) if self.cache_dir else None
             )
-            if success:
-                print(f"Successfully saved patches to cache directory: {self.cache_dir}\n")
-            else:
-                print("Failed to save patches to cache\n")
-        else:
-            if not self.cache_enabled:
-                print("Patch caching is disabled")
-            elif self.cache_dir is None:
-                print("Cache directory is not set")
-            elif self.data_path is None:
-                print("Data path is not set")
+            print(f"Saved patches to cache: {cache_path}")
 
     def __len__(self):
         return len(self.valid_patches)
-
-    def _validate_dimensionality(self, data_item, ref_item=None):
-        """
-        Validate and ensure consistent dimensionality between different data samples.
-        
-        Parameters
-        ----------
-        data_item : numpy.ndarray
-            The data item to validate
-        ref_item : numpy.ndarray, optional
-            A reference item to compare against
             
-        Returns
-        -------
-        bool
-            True if the data is 2D, False if 3D
+    def _extract_patch(self, patch_info):
         """
-        is_2d = len(data_item.shape) == 2
-        
-        if ref_item is not None:
-            ref_is_2d = len(ref_item.shape) == 2
-            if is_2d != ref_is_2d:
-                raise ValueError(
-                    f"Dimensionality mismatch: Data item is {'2D' if is_2d else '3D'} "
-                    f"but reference item is {'2D' if ref_is_2d else '3D'}"
-                )
-        
-        return is_2d
-            
-    def _extract_patch_coords(self, patch_info):
-        """
-        Extract patch coordinates and sizes based on dataset dimensionality.
+        Extract both image and label patches from the volume and return as tensors.
         
         Parameters
         ----------
         patch_info : dict
-            Dictionary containing patch position information
-        
+            Dictionary containing patch position and volume index information
+
         Returns
         -------
-        tuple
-            (z, y, x, dz, dy, dx, is_2d) coordinates and dimensions
+        dict
+            Dictionary containing:
+            - 'image': torch tensor of the image patch [C, H, W] or [C, D, H, W]
+            - target labels: torch tensors for each target
+            - 'is_unlabeled': bool indicating if patch has no valid labels
         """
+        vol_idx = patch_info["volume_index"]
+
+        # Extract coordinates based on dimensionality
         if self.is_2d_dataset:
-            # For 2D, position is [dummy_z, y, x] and patch_size should be [h, w]
-            _, y, x = patch_info["position"]  # Unpack properly ignoring dummy z value
-            
-            # Handle patch_size dimensionality - take last 2 dimensions for 2D
-            if len(self.patch_size) >= 2:
-                dy, dx = self.patch_size[-2:]  # Take last 2 elements (height, width)
+            # For 2D datasets, position might be [0, y, x] or [y, x]
+            pos = patch_info["position"]
+            if len(pos) == 3:
+                _, y, x = pos  # Ignore dummy z coordinate
             else:
-                raise ValueError(f"patch_size {self.patch_size} insufficient for 2D data")
-                
-            z, dz = 0, 0  # Not used for 2D
-            is_2d = True
+                y, x = pos
+            dy, dx = self.patch_size[-2:]  # Last 2 dimensions
+            z, dz = 0, 0
+            target_shape = (dy, dx)
         else:
-            # For 3D, position is (z, y, x) and patch_size is (d, h, w)
             z, y, x = patch_info["position"]
-            
-            # Handle patch_size dimensionality
             if len(self.patch_size) >= 3:
-                dz, dy, dx = self.patch_size[:3]  # Take first 3 elements
-            elif len(self.patch_size) == 2:
-                # 2D patch_size for 3D data - assume depth of 1
+                dz, dy, dx = self.patch_size[:3]
+            else:
                 dy, dx = self.patch_size
                 dz = 1
-            else:
-                raise ValueError(f"patch_size {self.patch_size} insufficient for 3D data")
-                
-            is_2d = False
-            
-        return z, y, x, dz, dy, dx, is_2d
-    
-    def _extract_image_patch(self, vol_idx, z, y, x, dz, dy, dx, is_2d):
-        """
-        Extract and normalize an image patch from the volume.
+            target_shape = (dz, dy, dx)
         
-        Parameters
-        ----------
-        vol_idx : int
-            Volume index
-        z, y, x : int
-            Starting coordinates
-        dz, dy, dx : int
-            Patch dimensions
-        is_2d : bool
-            Whether the data is 2D
-            
-        Returns
-        -------
-        numpy.ndarray
-            Normalized image patch with channel dimension [C, H, W] or [C, D, H, W]
-        """
-        # Get the image from the first target (all targets share the same image)
+        # Get the image data
         first_target_name = list(self.target_volumes.keys())[0]
         img_arr = self.target_volumes[first_target_name][vol_idx]['data']['data']
         
+        # Extract image patch
         try:
-            # Extract image patch with appropriate dimensionality
-            if is_2d:
+            if self.is_2d_dataset:
                 img_patch = img_arr[y:y+dy, x:x+dx]
-                # Check if we got valid data
                 if img_patch.size == 0:
-                    raise ValueError(f"Empty patch extracted at position y={y}, x={x}")
+                    raise ValueError("Empty patch")
                 img_patch = pad_or_crop_2d(img_patch, (dy, dx))
             else:
                 img_patch = img_arr[z:z+dz, y:y+dy, x:x+dx]
-                # Check if we got valid data
                 if img_patch.size == 0:
-                    raise ValueError(f"Empty patch extracted at position z={z}, y={y}, x={x}")
+                    raise ValueError("Empty patch")
                 img_patch = pad_or_crop_3d(img_patch, (dz, dy, dx))
-        except ValueError as e:
-            # Handle corrupt or missing chunks by creating a zero patch
+        except Exception as e:
             print(f"Warning: Failed to extract image patch at vol={vol_idx}, z={z}, y={y}, x={x}: {str(e)}")
-            print(f"Creating zero patch of size {'('+str(dy)+','+str(dx)+')' if is_2d else '('+str(dz)+','+str(dy)+','+str(dx)+')'}")
-            
-            if is_2d:
-                img_patch = np.zeros((dy, dx), dtype=np.float32)
-            else:
-                img_patch = np.zeros((dz, dy, dx), dtype=np.float32)
+            img_patch = np.zeros(target_shape, dtype=np.float32)
         
         # Apply normalization
         if self.normalizer is not None:
@@ -677,434 +450,93 @@ class BaseDataset(Dataset):
         else:
             img_patch = img_patch.astype(np.float32)
         
-        # Add channel dimension and ensure contiguous
-        img_patch = np.ascontiguousarray(img_patch[np.newaxis, ...])     
-        return img_patch
-    
-    def _extract_label_patches(self, vol_idx, z, y, x, dz, dy, dx, is_2d):
-        """
-        Extract all label patches for all targets.
+        # Add channel dimension
+        img_patch = np.ascontiguousarray(img_patch[np.newaxis, ...])
         
-        Parameters
-        ----------
-        vol_idx : int
-            Volume index
-        z, y, x : int
-            Starting coordinates
-        dz, dy, dx : int
-            Patch dimensions
-        is_2d : bool
-            Whether the data is 2D
-            
-        Returns
-        -------
-        dict
-            Dictionary of label patches for each target
-        """
+        # Extract label patches and check if unlabeled
         label_patches = {}
-        
-        for t_name, volumes_list in self.target_volumes.items():
-            volume_info = volumes_list[vol_idx]
-            label_arr = volume_info['data']['label']
-            
-            # Check if label has channel dimension
-            has_channels = False
-            if is_2d and len(label_arr.shape) == 3:
-                # 2D multi-channel: [C, H, W]
-                has_channels = True
-                n_channels = label_arr.shape[0]
-            elif not is_2d and len(label_arr.shape) == 4:
-                # 3D multi-channel: [C, D, H, W]
-                has_channels = True
-                n_channels = label_arr.shape[0]
-            
-            if is_2d:
-                if has_channels:
-                    # Multi-channel 2D: extract channels one at a time to avoid memory issues
-                    channel_patches = []
-                    for c in range(n_channels):
-                        channel_patches.append(label_arr[c, y:y+dy, x:x+dx])
-                    label_patch = np.stack(channel_patches, axis=0)
-                else:
-                    # Single-channel 2D
-                    label_patch = label_arr[y:y+dy, x:x+dx]
-                    
-                    if isinstance(target_value, dict):
-                        # Check if this is a multi-class config with regions
-                        if 'mapping' in target_value:
-                            # New format with mapping and optional regions
-                            mapping = target_value['mapping']
-                            regions = target_value.get('regions', {})
-                            
-                            # First apply standard mapping
-                            new_label_patch = np.zeros_like(label_patch)
-                            for original_val, new_val in mapping.items():
-                                mask = (label_patch == original_val)
-                                new_label_patch[mask] = new_val
-                            
-                            # Then apply regions (which override)
-                            for region_id, source_classes in regions.items():
-                                # Create mask for any pixel that belongs to source classes
-                                region_mask = np.zeros_like(new_label_patch, dtype=bool)
-                                for source_class in source_classes:
-                                    region_mask |= (new_label_patch == source_class)
-                                # Override those pixels with the region ID
-                                new_label_patch[region_mask] = region_id
-                            
-                            label_patch = new_label_patch
-                        else:
-                            # Old format: direct mapping
-                            new_label_patch = np.zeros_like(label_patch)
-                            for original_val, new_val in target_value.items():
-                                mask = (label_patch == original_val)
-                                new_label_patch[mask] = new_val
-                            label_patch = new_label_patch
-                    else:
-                        # Single class binarization: keep zeros as zero, set non-zeros to target_value
-                        binary_mask = (label_patch > 0)
-                        new_label_patch = np.zeros_like(label_patch)
-                        new_label_patch[binary_mask] = target_value
-                        label_patch = new_label_patch
-                
-                if has_channels:
-                    # Pad each channel separately
-                    padded_channels = []
-                    for c in range(n_channels):
-                        padded_channels.append(pad_or_crop_2d(label_patch[c], (dy, dx)))
-                    label_patch = np.stack(padded_channels, axis=0)
-                else:
-                    label_patch = pad_or_crop_2d(label_patch, (dy, dx))
-            else:
-                if has_channels:
-                    # Multi-channel 3D: extract channels one at a time to avoid memory issues
-                    channel_patches = []
-                    for c in range(n_channels):
-                        channel_patches.append(label_arr[c, z:z+dz, y:y+dy, x:x+dx])
-                    label_patch = np.stack(channel_patches, axis=0)
-                else:
-                    # Single-channel 3D
-                    label_patch = label_arr[z:z+dz, y:y+dy, x:x+dx]
+        is_unlabeled = True  # Assume unlabeled until we find valid labels
 
-                if has_channels:
-                    # Pad each channel separately
-                    padded_channels = []
-                    for c in range(n_channels):
-                        padded_channels.append(pad_or_crop_3d(label_patch[c], (dz, dy, dx)))
-                    label_patch = np.stack(padded_channels, axis=0)
-                else:
-                    label_patch = pad_or_crop_3d(label_patch, (dz, dy, dx))
+        for t_name, volumes_list in self.target_volumes.items():
+            label_arr = volumes_list[vol_idx]['data'].get('label')
             
-            # Add channel dimension if not already present
-            if not has_channels:
+            if label_arr is None:
+                # No label exists - create zero array
+                label_patch = np.zeros(target_shape, dtype=np.float32)
+                # Add channel dimension for consistency with labeled data
                 label_patch = label_patch[np.newaxis, ...]
-            # Ensure contiguous
+            else:
+                # Extract label patch
+                has_channels = (self.is_2d_dataset and len(label_arr.shape) == 3) or \
+                              (not self.is_2d_dataset and len(label_arr.shape) == 4)
+
+                try:
+                    if self.is_2d_dataset:
+                        if has_channels:
+                            label_patch = label_arr[:, y:y+dy, x:x+dx]
+                        else:
+                            label_patch = label_arr[y:y+dy, x:x+dx]
+
+                        # Pad/crop
+                        if has_channels:
+                            n_channels = label_patch.shape[0]
+                            padded = [pad_or_crop_2d(label_patch[c], (dy, dx)) for c in range(n_channels)]
+                            label_patch = np.stack(padded, axis=0)
+                        else:
+                            label_patch = pad_or_crop_2d(label_patch, (dy, dx))
+                    else:
+                        if has_channels:
+                            label_patch = label_arr[:, z:z+dz, y:y+dy, x:x+dx]
+                        else:
+                            label_patch = label_arr[z:z+dz, y:y+dy, x:x+dx]
+
+                        # Pad/crop
+                        if has_channels:
+                            n_channels = label_patch.shape[0]
+                            padded = [pad_or_crop_3d(label_patch[c], (dz, dy, dx)) for c in range(n_channels)]
+                            label_patch = np.stack(padded, axis=0)
+                        else:
+                            label_patch = pad_or_crop_3d(label_patch, (dz, dy, dx))
+
+                    # Check if patch has any non-zero labels
+                    if np.any(label_patch > 0):
+                        is_unlabeled = False
+
+                except Exception as e:
+                    print(f"Warning: Failed to extract label patch for {t_name}: {str(e)}")
+                    label_patch = np.zeros(target_shape, dtype=np.float32)
+                    # Mark that we need to add channel dimension
+                    has_channels = False
+
+                # Add channel dimension if needed
+                if not has_channels:
+                    label_patch = label_patch[np.newaxis, ...]
+
             label_patch = np.ascontiguousarray(label_patch, dtype=np.float32)
             label_patches[t_name] = label_patch
-            
-        # Process auxiliary tasks - generate distance transforms and other auxiliary targets
-        self._process_auxiliary_tasks(label_patches, is_2d)
-            
-        return label_patches
 
-    def _get_volume_id(self, vol_idx):
-        """
-        Get the volume identifier for a given volume index.
-        
-        Parameters
-        ----------
-        vol_idx : int
-            Volume index
-            
-        Returns
-        -------
-        str or None
-            Volume identifier if available, None otherwise
-        """
-        # Get the first target to access volume info
-        first_target = list(self.target_volumes.keys())[0]
-        
-        # Check if volume_id was stored during initialization
-        if vol_idx < len(self.target_volumes[first_target]):
-            volume_info = self.target_volumes[first_target][vol_idx]
-            if 'volume_id' in volume_info:
-                return volume_info['volume_id']
-        
-        # Fallback to None if not available
-        return None
 
-    
-    def _extract_ignore_mask(self, vol_idx, z, y, x, dz, dy, dx, is_2d):
-        """
-        Extract ignore mask if available.
+        # Build result dictionary with torch tensors
+        result = {
+            'image': torch.from_numpy(img_patch),
+            'is_unlabeled': is_unlabeled
+        }
         
-        Parameters
-        ----------
-        vol_idx : int
-            Volume index
-        z, y, x : int
-            Starting coordinates
-        dz, dy, dx : int
-            Patch dimensions
-        is_2d : bool
-            Whether the data is 2D
-            
-        Returns
-        -------
-        dict or None
-            Dictionary of ignore masks per target if available, None otherwise
-        """
-        # Initialize ignore masks dictionary
-        ignore_masks = {}
-        
-        # Check for volume-task loss configuration
-        if hasattr(self.mgr, 'volume_task_loss_config') and self.mgr.volume_task_loss_config:
-            # Get the volume ID for this patch
-            volume_id = self._get_volume_id(vol_idx)
-            
-            if volume_id and volume_id in self.mgr.volume_task_loss_config:
-                # Get enabled tasks for this volume
-                enabled_tasks = self.mgr.volume_task_loss_config[volume_id]
-                
-                # Create ignore masks for disabled tasks
-                for t_name in self.target_volumes.keys():
-                    if t_name not in enabled_tasks:
-                        # Create a full ignore mask (all ones) for this disabled task
-                        if is_2d:
-                            mask_shape = (1, dy, dx)
-                        else:
-                            mask_shape = (1, dz, dy, dx)
-                        
-                        ignore_masks[t_name] = np.ones(mask_shape, dtype=np.float32)
-                        
-                        # Log only once per volume-task combination
-                        if not hasattr(self, '_logged_disabled_tasks'):
-                            self._logged_disabled_tasks = set()
-                        
-                        log_key = (volume_id, t_name)
-                        if log_key not in self._logged_disabled_tasks:
-                            print(f"Task '{t_name}' disabled for volume '{volume_id}' - creating ignore mask")
-                            self._logged_disabled_tasks.add(log_key)
-        
-        # Check only the first target for the mask
-        first_target_name = list(self.target_volumes.keys())[0]
-        volume_info = self.target_volumes[first_target_name][vol_idx]
-        vdata = volume_info['data']
-        
-        if 'mask' in vdata:
-            # Use explicit mask if available - same mask for all targets
-            mask_arr = vdata['mask']
-            
-            # Check if mask has channel dimension
-            has_channels = False
-            if is_2d and len(mask_arr.shape) == 3:
-                has_channels = True
-                n_channels = mask_arr.shape[0]
-            elif not is_2d and len(mask_arr.shape) == 4:
-                has_channels = True
-                n_channels = mask_arr.shape[0]
-            
-            if is_2d:
-                if has_channels:
-                    # Extract channels one at a time to avoid memory issues
-                    channel_patches = []
-                    for c in range(n_channels):
-                        channel_patches.append(mask_arr[c, y:y+dy, x:x+dx])
-                    mask_patch = np.stack(channel_patches, axis=0)
-                    # Pad each channel separately
-                    padded_channels = []
-                    for c in range(n_channels):
-                        padded_channels.append(pad_or_crop_2d(mask_patch[c], (dy, dx)))
-                    mask_patch = np.stack(padded_channels, axis=0)
-                else:
-                    mask_patch = mask_arr[y:y+dy, x:x+dx]
-                    mask_patch = pad_or_crop_2d(mask_patch, (dy, dx))
-            else:
-                if has_channels:
-                    # Extract channels one at a time to avoid memory issues
-                    channel_patches = []
-                    for c in range(n_channels):
-                        channel_patches.append(mask_arr[c, z:z+dz, y:y+dy, x:x+dx])
-                    mask_patch = np.stack(channel_patches, axis=0)
-                    # Pad each channel separately
-                    padded_channels = []
-                    for c in range(n_channels):
-                        padded_channels.append(pad_or_crop_3d(mask_patch[c], (dz, dy, dx)))
-                    mask_patch = np.stack(padded_channels, axis=0)
-                else:
-                    mask_patch = mask_arr[z:z+dz, y:y+dy, x:x+dx]
-                    mask_patch = pad_or_crop_3d(mask_patch, (dz, dy, dx))
-            
-            # Convert to binary mask and invert (1 = ignore, 0 = compute)
-            single_mask = (mask_patch == 0).astype(np.float32)
-            
-            # Add channel dimension if not already present
-            if not has_channels:
-                single_mask = single_mask[np.newaxis, ...]  # [1, H, W] or [1, D, H, W]
-            
-            # Return same mask for all targets
-            return {t_name: single_mask for t_name in self.target_volumes.keys()}
-            
-        elif hasattr(self.mgr, 'compute_loss_on_labeled_only') and self.mgr.compute_loss_on_labeled_only:
-            # Create separate masks from each target's labels
-            ignore_masks = {}
-            
-            for t_name, volumes_list in self.target_volumes.items():
-                label_arr = volumes_list[vol_idx]['data']['label']
-                
-                # Check if label has channel dimension
-                has_channels = False
-                if is_2d and len(label_arr.shape) == 3:
-                    has_channels = True
-                    n_channels = label_arr.shape[0]
-                elif not is_2d and len(label_arr.shape) == 4:
-                    has_channels = True
-                    n_channels = label_arr.shape[0]
-                
-                # Extract label patch
-                if is_2d:
-                    if has_channels:
-                        # Extract channels one at a time to avoid memory issues
-                        channel_patches = []
-                        for c in range(n_channels):
-                            channel_patches.append(label_arr[c, y:y+dy, x:x+dx])
-                        label_patch = np.stack(channel_patches, axis=0)
-                        # Pad each channel separately
-                        padded_channels = []
-                        for c in range(n_channels):
-                            padded_channels.append(pad_or_crop_2d(label_patch[c], (dy, dx)))
-                        label_patch = np.stack(padded_channels, axis=0)
-                    else:
-                        label_patch = label_arr[y:y+dy, x:x+dx]
-                        label_patch = pad_or_crop_2d(label_patch, (dy, dx))
-                else:
-                    if has_channels:
-                        # Extract channels one at a time to avoid memory issues
-                        channel_patches = []
-                        for c in range(n_channels):
-                            channel_patches.append(label_arr[c, z:z+dz, y:y+dy, x:x+dx])
-                        label_patch = np.stack(channel_patches, axis=0)
-                        # Pad each channel separately
-                        padded_channels = []
-                        for c in range(n_channels):
-                            padded_channels.append(pad_or_crop_3d(label_patch[c], (dz, dy, dx)))
-                        label_patch = np.stack(padded_channels, axis=0)
-                    else:
-                        label_patch = label_arr[z:z+dz, y:y+dy, x:x+dx]
-                        label_patch = pad_or_crop_3d(label_patch, (dz, dy, dx))
-                
-                # Create binary mask from this target's label (1 = ignore unlabeled, 0 = compute on labeled)
-                # For multi-channel, we might want to consider all channels
-                if has_channels:
-                    # Take the max across channels - if any channel has a value, consider it labeled
-                    mask = (label_patch.max(axis=0) == 0).astype(np.float32)
-                else:
-                    mask = (label_patch == 0).astype(np.float32)
-                
-                # Add channel dimension
-                mask = mask[np.newaxis, ...]  # Shape: [1, H, W] or [1, D, H, W]
-                ignore_masks[t_name] = mask
-            
-            return ignore_masks
-        
-        return None
-
-    
-    def _prepare_tensors(self, img_patch, label_patches, ignore_mask, vol_idx, is_2d):
-        """
-        Convert numpy arrays to PyTorch tensors.
-        
-        All input arrays already have channel dimensions from extraction methods.
-        
-        Parameters
-        ----------
-        img_patch : numpy.ndarray
-            Image patch with shape [C, H, W] or [C, D, H, W]
-        label_patches : dict
-            Dictionary of label patches for each target with shape [C, H, W] or [C, D, H, W]
-        ignore_mask : dict or None
-            Dictionary of ignore masks per target if available
-        vol_idx : int
-            Volume index
-        is_2d : bool
-            Whether the data is 2D
-            
-        Returns
-        -------
-        dict
-            Dictionary of tensors for training
-        """
-        data_dict = {}
-        
-        # Simply convert image to tensor (already has channel dimension)
-        data_dict["image"] = torch.from_numpy(img_patch)
-        
-        # Add ignore masks if available
-        if ignore_mask is not None:
-            data_dict["ignore_masks"] = {
-                t_name: torch.from_numpy(mask) 
-                for t_name, mask in ignore_mask.items()
-            }
-        
-        # Process all labels based on target configuration
+        # Convert all label patches to tensors
         for t_name, label_patch in label_patches.items():
-            # Skip target value processing for auxiliary tasks
-            if t_name in self.targets:
-                # Auxiliary tasks are regression targets, just convert to tensor
-                data_dict[t_name] = torch.from_numpy(label_patch)
-                continue
-
-            # Get the number of output channels for this target
-            if t_name not in self.targets:
-                print(f"Warning: Target '{t_name}' not found in self.targets. Available targets: {list(self.targets.keys())}")
-                # Create a default entry
-                self.targets[t_name] = {"out_channels": 2}
-            out_channels = self.targets[t_name].get("out_channels", 2)
-            
-            if out_channels > 2:
-                # Multi-class segmentation - update metadata
-                unique_vals = np.unique(label_patch)
-                num_classes = int(unique_vals.max()) + 1
-                self.targets[t_name]["out_channels"] = max(num_classes, out_channels)
-            
-            # Check if we need to convert to one-hot for binary segmentation
-            if out_channels == 2 and label_patch.shape[0] == 1:
-                # Binary segmentation with 2 output channels - convert to one-hot
-                # label_patch has shape [1, H, W] or [1, D, H, W]
-                label_tensor = torch.from_numpy(label_patch).long()
-                
-                # Create one-hot encoding
-                if is_2d:
-                    # Shape: [1, H, W] -> [2, H, W]
-                    one_hot = torch.zeros(2, label_tensor.shape[1], label_tensor.shape[2])
-                    one_hot[0] = (label_tensor[0] == 0).float()  # Background channel
-                    one_hot[1] = (label_tensor[0] == 1).float()  # Foreground channel
-                else:
-                    # Shape: [1, D, H, W] -> [2, D, H, W]
-                    one_hot = torch.zeros(2, label_tensor.shape[1], label_tensor.shape[2], label_tensor.shape[3])
-                    one_hot[0] = (label_tensor[0] == 0).float()  # Background channel
-                    one_hot[1] = (label_tensor[0] == 1).float()  # Foreground channel
-                
-                data_dict[t_name] = one_hot
-            else:
-                # Simply convert to tensor (already has proper shape and channel dimension)
-                data_dict[t_name] = torch.from_numpy(label_patch)
+            result[t_name] = torch.from_numpy(label_patch)
         
-        return data_dict
-    
+        return result
 
     def _create_training_transforms(self):
         """
         Create training transforms using custom batchgeneratorsv2.
         Returns None for validation (no augmentations).
         """
-        # Check if spatial transformations are disabled
-        if getattr(self.mgr, 'no_spatial', False):
-            print("Spatial transformations disabled (no_spatial=True)")
-            return None
+        no_spatial = getattr(self.mgr, 'no_spatial', False)
             
         dimension = len(self.mgr.train_patch_size)
-        
-        # Handle both 2D and 3D patch sizes
+
         if dimension == 2:
             patch_h, patch_w = self.mgr.train_patch_size
             patch_d = None  # Not used for 2D
@@ -1112,25 +544,46 @@ class BaseDataset(Dataset):
             patch_d, patch_h, patch_w = self.mgr.train_patch_size
         else:
             raise ValueError(f"Invalid patch size dimension: {dimension}. Expected 2 or 3.")
-        if dimension == 2:
-            if max(self.mgr.train_patch_size) / min(self.mgr.train_patch_size) > 1.5:
-                rotation_for_DA = (-15. / 360 * 2. * np.pi, 15. / 360 * 2. * np.pi)
-            else:
-                rotation_for_DA = (-180. / 360 * 2. * np.pi, 180. / 360 * 2. * np.pi)
-            mirror_axes = (0, 1)
-        elif dimension == 3:
-            rotation_for_DA = (-30. / 360 * 2. * np.pi, 30. / 360 * 2. * np.pi)
-            mirror_axes = (0, 1, 2)
 
         transforms = []
-        
-        if dimension == 2:
-            # 2D transforms (no transpose transform)
+
+        if not no_spatial:
+            # Configure rotation based on patch aspect ratio
+            if dimension == 2:
+                if max(self.mgr.train_patch_size) / min(self.mgr.train_patch_size) > 1.5:
+                    rotation_for_DA = (-15. / 360 * 2. * np.pi, 15. / 360 * 2. * np.pi)
+                else:
+                    rotation_for_DA = (-180. / 360 * 2. * np.pi, 180. / 360 * 2. * np.pi)
+                mirror_axes = (0, 1)
+            else:  # 3D
+                rotation_for_DA = (-30. / 360 * 2. * np.pi, 30. / 360 * 2. * np.pi)
+                mirror_axes = (0, 1, 2)
+
+            # Add SpatialTransform for rotations, scaling, elastic deformations
+            transforms.append(
+                SpatialTransform(
+                    self.mgr.train_patch_size,
+                    patch_center_dist_from_border=0,
+                    random_crop=False,
+                    p_elastic_deform=0.2,
+                    elastic_deform_scale=(0, 0.25),
+                    elastic_deform_magnitude=(0, 0.25),
+                    p_rotation=0.2,
+                    rotation=rotation_for_DA,
+                    p_scaling=0.2,
+                    scaling=(0.7, 1.4),
+                    p_synchronize_scaling_across_axes=1,
+                    bg_style_seg_sampling=False
+                )
+            )
             
+            # Add mirroring
             transforms.append(RandomTransform(
-                MirrorTransform(allowed_axes=(0, 1)), 
+                MirrorTransform(allowed_axes=mirror_axes),
                 apply_probability=0.5
-            )),
+            ))
+
+        if dimension == 2:
             transforms.append(RandomTransform(
                 GaussianBlurTransform(
                     blur_sigma=(0.5, 1.5),
@@ -1140,34 +593,69 @@ class BaseDataset(Dataset):
                 ),
                 apply_probability=0.2
             ))
+            transforms.append(RandomTransform(
+                MultiplicativeBrightnessTransform(
+                    multiplier_range=BGContrast((0.75, 1.25)),
+                    synchronize_channels=False,
+                    p_per_channel=1
+                ), apply_probability=0.15
+            ))
+            transforms.append(RandomTransform(
+                ContrastTransform(
+                    contrast_range=BGContrast((0.75, 1.25)),
+                    preserve_range=True,
+                    synchronize_channels=False,
+                    p_per_channel=1
+                ), apply_probability=0.15
+            ))
+            transforms.append(RandomTransform(
+                GaussianNoiseTransform(
+                    noise_variance=(0, 0.1),
+                    p_per_channel=1,
+                    synchronize_channels=True
+                ), apply_probability=0.1
+            ))
+            transforms.append(RandomTransform(
+                GammaTransform(
+                    gamma=BGContrast((0.7, 1.5)),
+                    p_invert_image=0,
+                    synchronize_channels=False,
+                    p_per_channel=1,
+                    p_retain_stats=1
+                ), apply_probability=0.2
+            ))
+
+            rectangle_sizes_2d = tuple(
+                (max(1, size // 10), size // 3) for size in self.mgr.train_patch_size
+            )
+            transforms.append(RandomTransform(
+                BlankRectangleTransform(
+                    rectangle_size=rectangle_sizes_2d,
+                    rectangle_value=np.mean,
+                    num_rectangles=(1, 5),
+                    force_square=False,
+                    p_per_sample=0.3,
+                    p_per_channel=0.5
+                ), apply_probability=0.2
+            ))
         else:
-            # 3D transforms
-            transforms.append(
-            SpatialTransform(
-                self.mgr.train_patch_size, patch_center_dist_from_border=0, random_crop=False, p_elastic_deform=0,
-                p_rotation=0.0,
-                rotation=rotation_for_DA, p_scaling=0.0, scaling=(0.7, 1.4), p_synchronize_scaling_across_axes=1,
-                bg_style_seg_sampling=False  # , mode_seg='nearest'
-            )),
+            if not no_spatial:
+                # Only add transpose transform if all three dimensions are equal
+                if patch_d == patch_h == patch_w:
+                    transforms.append(RandomTransform(
+                        TransposeAxesTransform(allowed_axes={0, 1, 2}),
+                        apply_probability=0.5
+                    ))
+
             transforms.append(RandomTransform(
-                    MirrorTransform(allowed_axes=mirror_axes), 
-                    apply_probability=0.0
-                )),
-            transforms.append(RandomTransform(
-                    GaussianBlurTransform(
-                        blur_sigma=(0.5, 1.0),
-                        synchronize_channels=True,
-                        synchronize_axes=False,
-                        p_per_channel=1.0
-                    ),
-                    apply_probability=0.2
-                )),
-            transforms.append(RandomTransform(
-                TransposeAxesTransform(
-                    allowed_axes={0, 1, 2},
-                    ),
-                    apply_probability=0.0
-            )),
+                GaussianBlurTransform(
+                    blur_sigma=(0.5, 1.0),
+                    synchronize_channels=True,
+                    synchronize_axes=False,
+                    p_per_channel=1.0
+                ),
+                apply_probability=0.3
+            ))
             transforms.append(RandomTransform(
                 GaussianNoiseTransform(
                     noise_variance=(0, 0.1),
@@ -1188,7 +676,7 @@ class BaseDataset(Dataset):
                     multiplier_range=BGContrast((0.75, 1.25)),
                     synchronize_channels=False,
                     p_per_channel=1
-                ), apply_probability=0.15
+                ), apply_probability=0.20
             ))
             transforms.append(RandomTransform(
                 ContrastTransform(
@@ -1226,102 +714,61 @@ class BaseDataset(Dataset):
                     p_retain_stats=1
                 ), apply_probability=0.3
             ))
+            rectangle_sizes_3d = tuple(
+                (max(1, size // 10), size // 3) for size in self.mgr.train_patch_size
+            )
             transforms.append(RandomTransform(
                 BlankRectangleTransform(
-                    rectangle_size=((max(1, self.mgr.train_patch_size[0] // 10), self.mgr.train_patch_size[0] // 3),
-                                    (max(1, self.mgr.train_patch_size[1] // 10), self.mgr.train_patch_size[1] // 3),
-                                    (max(1, self.mgr.train_patch_size[2] // 10), self.mgr.train_patch_size[2] // 3)),
-                    rectangle_value=np.mean,  # keeping the mean value
-                    num_rectangles=(1, 5),  # same as original
-                    force_square=False,  # same as original
-                    p_per_sample=0.4,  # same as original
-                    p_per_channel=0.5  # same as original
-                ), apply_probability=0.5
+                    rectangle_size=rectangle_sizes_3d,
+                    rectangle_value=np.mean,
+                    num_rectangles=(1, 5),
+                    force_square=False,
+                    p_per_sample=0.4,
+                    p_per_channel=0.5
+                ), apply_probability=0.3
             ))
             transforms.append(RandomTransform(
                 InhomogeneousSliceIlluminationTransform(
-                    num_defects=(2, 5),  # Range for number of defects
-                    defect_width=(5, 20),  # Range for defect width
-                    mult_brightness_reduction_at_defect=(0.3, 0.7),  # Range for brightness reduction
-                    base_p=(0.2, 0.4),  # Base probability range
-                    base_red=(0.5, 0.9),  # Base reduction range
-                    p_per_sample=1.0,  # Probability per sample
-                    per_channel=True,  # Apply per channel
-                    p_per_channel=0.5  # Probability per channel
+                    num_defects=(2, 5),
+                    defect_width=(5, 20),
+                    mult_brightness_reduction_at_defect=(0.3, 0.7),
+                    base_p=(0.2, 0.4),
+                    base_red=(0.5, 0.9),
+                    p_per_sample=1.0,
+                    per_channel=True,
+                    p_per_channel=0.5
                 ), apply_probability=0.25
             ))
 
-            # Only add transpose transform if all three dimensions (z, y, x) are equal
-            if patch_d == patch_h == patch_w:
-                transforms.insert(1, RandomTransform(
-                    TransposeAxesTransform(allowed_axes={0, 1, 2}), 
-                    apply_probability=0.5
-                ))
-                print(f"Added transpose transform for 3D (equal dimensions: {patch_d}x{patch_h}x{patch_w})")
-            else:
-                print(f"Skipped transpose transform for 3D (unequal dimensions: {patch_d}x{patch_h}x{patch_w})")
+        if no_spatial:
+            print("Spatial transformations disabled (no_spatial=True)")
 
         return ComposeTransforms(transforms)
     
     def __getitem__(self, index):
         """
-        Get a patch from the dataset.
+        Returns a dictionary with the following format:
+        {
+            'image': torch.Tensor,           # Shape: [C, H, W] (2D) or [C, D, H, W] (3D)
+            'is_unlabeled': bool,            # True if patch has no valid labels
+            'target_name_1': torch.Tensor,   # Shape: [C, H, W] (2D) or [C, D, H, W] (3D)
+            'target_name_2': torch.Tensor,   # Additional targets as configured
+            ...                              # (e.g., 'ink', 'normals', 'distance_transform', etc.)
+        }
         
-        Parameters
-        ----------
-        index : int
-            Index of the patch
-            
-        Returns
-        -------
-        dict
-            Dictionary of tensors for training
+        Where:
+        - C = number of channels (usually 1 for image, can vary for targets)
+        - H, W = height and width of patch
+        - D = depth of patch (3D only)
+        - All tensors are float32
+        - Labels are 0 for background, >0 for foreground
+        - Unlabeled patches will have all-zero label tensors
         """
-        # 1. Get patch info and coordinates
         patch_info = self.valid_patches[index]
-        vol_idx = patch_info["volume_index"]
-        z, y, x, dz, dy, dx, is_2d = self._extract_patch_coords(patch_info)
-        
-        # 2. Extract and normalize image patch
-        img_patch = self._extract_image_patch(vol_idx, z, y, x, dz, dy, dx, is_2d)
-        
-        # 3. Extract label patches for all targets
-        label_patches = self._extract_label_patches(vol_idx, z, y, x, dz, dy, dx, is_2d)
-        
-        # 4. Extract ignore mask if available
-        ignore_mask = self._extract_ignore_mask(vol_idx, z, y, x, dz, dy, dx, is_2d)
-    
-        # 5. Convert to tensors and format for the model
-        data_dict = self._prepare_tensors(img_patch, label_patches, ignore_mask, vol_idx, is_2d)
-        
-        # Clean up intermediate numpy arrays
-        del img_patch, label_patches
-        if ignore_mask is not None:
-            del ignore_mask
-        
-        # 6. Apply augmentations if in training mode
+        data_dict = self._extract_patch(patch_info)
+
         if self.is_training and self.transforms is not None:
-            # Apply transforms directly to the torch tensors
             data_dict = self.transforms(**data_dict)
         
         return data_dict
-    
-    def clear_transform_cache(self):
-        """
-        Clear any cached state in transforms to prevent memory accumulation.
-        This should be called periodically during training.
-        """
-        if hasattr(self, 'transforms') and self.transforms is not None:
-            # Clear any potential cached state in individual transforms
-            if hasattr(self.transforms, 'transforms'):
-                for transform in self.transforms.transforms:
-                    # Clear any cached random state or parameters
-                    if hasattr(transform, '_cached_params'):
-                        delattr(transform, '_cached_params')
-                    # For RandomTransform, clear the wrapped transform too
-                    if hasattr(transform, 'transform') and hasattr(transform.transform, '_cached_params'):
-                        delattr(transform.transform, '_cached_params')
-            
-            # Force garbage collection of any lingering references
-            import gc
-            gc.collect()
+

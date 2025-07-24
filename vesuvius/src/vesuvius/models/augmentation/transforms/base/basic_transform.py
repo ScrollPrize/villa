@@ -18,37 +18,43 @@ class BasicTransform(abc.ABC):
         return self.apply(data_dict, **params)
 
     def apply(self, data_dict, **params):
+        # Check if this is unlabeled data
+        is_unlabeled = data_dict.get('is_unlabeled', False)
+
         # Special handling for known keys
         if data_dict.get('image') is not None:
+            # Always transform images, even for unlabeled data
             data_dict['image'] = self._apply_to_image(data_dict['image'], **params)
 
-        if data_dict.get('regression_target') is not None:
-            data_dict['regression_target'] = self._apply_to_segmentation(data_dict['regression_target'], **params)
+        # Skip all label transforms for unlabeled data
+        if not is_unlabeled:
+            if data_dict.get('regression_target') is not None:
+                data_dict['regression_target'] = self._apply_to_segmentation(data_dict['regression_target'], **params)
 
-        if data_dict.get('segmentation') is not None:
-            data_dict['segmentation'] = self._apply_to_segmentation(data_dict['segmentation'], **params)
+            if data_dict.get('segmentation') is not None:
+                data_dict['segmentation'] = self._apply_to_segmentation(data_dict['segmentation'], **params)
 
-        if data_dict.get('dist_map') is not None:
-            data_dict['dist_map'] = self._apply_to_dist_map(data_dict['dist_map'], **params)
+            if data_dict.get('dist_map') is not None:
+                data_dict['dist_map'] = self._apply_to_dist_map(data_dict['dist_map'], **params)
 
-        if data_dict.get('geols_labels') is not None:
-            data_dict['geols_labels'] = self._apply_to_dist_map(data_dict['geols_labels'], **params)
+            if data_dict.get('geols_labels') is not None:
+                data_dict['geols_labels'] = self._apply_to_dist_map(data_dict['geols_labels'], **params)
 
-        if data_dict.get('keypoints') is not None:
-            data_dict['keypoints'] = self._apply_to_keypoints(data_dict['keypoints'], **params)
+            if data_dict.get('keypoints') is not None:
+                data_dict['keypoints'] = self._apply_to_keypoints(data_dict['keypoints'], **params)
 
-        if data_dict.get('bbox') is not None:
-            data_dict['bbox'] = self._apply_to_bbox(data_dict['bbox'], **params)
-            
-        # Dynamic handling for any other keys (e.g., custom targets like 'ink', 'normals')
-        # Skip 'ignore_masks' as it shouldn't be transformed
-        known_keys = {'image', 'regression_target', 'segmentation', 'dist_map', 
-                      'geols_labels', 'keypoints', 'bbox', 'ignore_masks'}
-        
-        for key in data_dict.keys():
-            if key not in known_keys and data_dict[key] is not None:
-                # Assume custom targets should be treated as segmentation
-                data_dict[key] = self._apply_to_segmentation(data_dict[key], **params)
+            if data_dict.get('bbox') is not None:
+                data_dict['bbox'] = self._apply_to_bbox(data_dict['bbox'], **params)
+
+            # Dynamic handling for any other keys (e.g., custom targets like 'ink', 'normals')
+            # Skip 'ignore_masks' as it shouldn't be transformed
+            known_keys = {'image', 'regression_target', 'segmentation', 'dist_map',
+                          'geols_labels', 'keypoints', 'bbox', 'ignore_masks', 'is_unlabeled'}
+
+            for key in data_dict.keys():
+                if key not in known_keys and data_dict[key] is not None:
+                    # Assume custom targets should be treated as segmentation
+                    data_dict[key] = self._apply_to_segmentation(data_dict[key], **params)
 
         return data_dict
 
