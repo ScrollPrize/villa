@@ -126,9 +126,7 @@ class ConfigManager:
         # Determine dims for ops based on patch size
         dim_props = determine_dimensionality(self.train_patch_size, self.verbose)
         self.model_config["conv_op"] = dim_props["conv_op"]
-        self.model_config["pool_op"] = dim_props["pool_op"]
         self.model_config["norm_op"] = dim_props["norm_op"]
-        self.model_config["dropout_op"] = dim_props["dropout_op"]
         self.spacing = dim_props["spacing"]
         self.op_dims = dim_props["op_dims"]
 
@@ -139,13 +137,13 @@ class ConfigManager:
             # Look for either 'out_channels' or 'channels' in the task info
             if 'out_channels' in task_info:
                 channels = task_info['out_channels']
+            elif 'channels' in task_info:
+                channels = task_info['channels']
             else:
-                if self.verbose:
-                    print(f"Target {target_name} has no channel specification - will attempt to auto-detect from data")
-                channels = None  # Placeholder, will be set during auto-detection
+                channels = 2  # Default to 2
+                task_info['out_channels'] = 2
 
-            if channels is not None:
-                self.out_channels += (channels,)
+            self.out_channels += (channels,)
 
         # Inference attributes should already be set by _set_inference_attributes
         # If they weren't set (e.g., no inference_config in YAML), set defaults here
@@ -262,9 +260,7 @@ class ConfigManager:
 
                 dim_props = determine_dimensionality(self.train_patch_size, self.verbose)
                 self.model_config["conv_op"] = dim_props["conv_op"]
-                self.model_config["pool_op"] = dim_props["pool_op"]
                 self.model_config["norm_op"] = dim_props["norm_op"]
-                self.model_config["dropout_op"] = dim_props["dropout_op"]
                 self.spacing = dim_props["spacing"]
                 self.op_dims = dim_props["op_dims"]
 
