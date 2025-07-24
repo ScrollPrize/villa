@@ -257,43 +257,22 @@ class BaseTrainer:
         loss_fns = self._build_loss()
         scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
 
-        if torch.cuda.is_available():
-            device = torch.device('cuda')
-            print("Using CUDA device")
-        elif hasattr(torch, 'mps') and torch.backends.mps.is_available():
-            device = torch.device('mps')
-            print("Using MPS device (Apple Silicon)")
-        else:
-            device = torch.device('cpu')
-            print("Using CPU device")
-
         model.apply(lambda module: init_weights_he(module, neg_slope=0.2))
-        model = model.to(device)
+        model = model.to(self.device)
 
-        # Only compile the model if it's on CUDA (not supported on MPS/CPU)
-        if device.type == 'cuda':
-            model = torch.compile(model, mode="default", fullgraph=False)
+        if self.device.type == 'cuda':
+            model = torch.compile(model)
 
-        if not hasattr(torch, 'no_op'):
-            class NullContextManager:
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, exc_type, exc_val, exc_tb):
-                    pass
-
-            torch.no_op = lambda: NullContextManager()
-
-
-        # Check if AMP is disabled
         use_amp = not getattr(self.mgr, 'no_amp', False)
         if not use_amp:
             print("Automatic Mixed Precision (AMP) is disabled")
-        elif device.type == 'cuda':
-            print("Using Automatic Mixed Precision (AMP) for training")
         
-        scaler = self._get_scaler(device.type, use_amp=use_amp)
-        train_dataloader, val_dataloader, train_indices, val_indices = self._configure_dataloaders(train_dataset, val_dataset)
+        scaler = self._get_scaler(self.device.type, use_amp=use_amp)
+        train_dataloader, val_dataloader, train_indices, val_indices = self._configure_dataloaders(train_dataset,
+                                                                                                   val_dataset)
+        os.makedirs(self.mgr.ckpt_out_base, exist_ok=True)
+        model_ckpt_dir = os.path.join(self.mgr.ckpt_out_base, self.mgr.model_name)
+        os.makedirs(model_ckpt_dir, exist_ok=True)
 
         # Initialise wandb if wandb_project is set
         if self.mgr.wandb_project:
