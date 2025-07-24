@@ -36,8 +36,8 @@ with open("README.md", "r", encoding="utf-8") as fh:
 setup(
     name="vesuvius",
     version=version,
-    py_modules=["vesuvius"],
-    packages=find_packages(),
+    packages=find_packages(where="src"),
+    package_dir={"": "src"},
     url="https://github.com/ScrollPrize/villa",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -88,7 +88,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "vesuvius.accept_terms=setup.accept_terms:main",
+            "vesuvius.accept_terms=vesuvius.setup.accept_terms:main",
             "vesuvius.predict=vesuvius.models.run.inference:main",
             "vesuvius.blend_logits=vesuvius.models.run.blending:main",
             "vesuvius.finalize_outputs=vesuvius.models.run.finalize_outputs:main",

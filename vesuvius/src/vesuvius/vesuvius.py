@@ -3,14 +3,14 @@ Vesuvius module - provides access to the package components.
 """
 
 # Import key modules
-from vesuvius import models, data, utils, setup
+from . import models, data, utils, setup
 import os
 import yaml
-from vesuvius.setup.accept_terms import get_installation_path
+from .setup.accept_terms import get_installation_path
 
 # Import specific classes for direct access
-from vesuvius.data import Volume
-from vesuvius.data.vc_dataset import VCDataset
+from .data import Volume
+from .data.vc_dataset import VCDataset
 
 # Define important utility functions directly in the module to avoid import issues
 def list_files():
