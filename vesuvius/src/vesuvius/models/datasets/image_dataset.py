@@ -60,7 +60,6 @@ class ImageDataset(BaseDataset):
     as groups in the data path:
     - images.zarr/  (contains image1, image2, etc. as arrays)
     - labels.zarr/  (contains image1_ink, image2_ink, etc. as arrays)  
-    - masks.zarr/   (contains image1_ink, image2_ink, etc. as arrays)
     """
     
     def __init__(self, mgr, is_training=True):
@@ -98,23 +97,21 @@ class ImageDataset(BaseDataset):
     
     def _get_or_create_zarr_groups(self):
         """
-        Get or create the Zarr groups for images, labels, and masks.
+        Get or create the Zarr groups for images, labels.
         
         Returns
         -------
         tuple
-            (images_group, labels_group, masks_group)
+            (images_group, labels_group)
         """
         # Create paths for the Zarr groups
         images_zarr_path = self.data_path / "images.zarr"
         labels_zarr_path = self.data_path / "labels.zarr"
-        masks_zarr_path = self.data_path / "masks.zarr"
 
         images_group = zarr.open_group(str(images_zarr_path), mode='a')
         labels_group = zarr.open_group(str(labels_zarr_path), mode='a')
-        masks_group = zarr.open_group(str(masks_zarr_path), mode='a')
         
-        return images_group, labels_group, masks_group
+        return images_group, labels_group
     
     def _image_to_zarr_array(self, image_path, zarr_group, array_name):
         """
@@ -246,12 +243,6 @@ class ImageDataset(BaseDataset):
         │   ├── image2.tif      # Single image file
         │   └── ...
         ├── labels/
-        │   ├── image1_ink.tif
-        │   ├── image1_damage.tif
-        │   ├── image2_ink.tif
-        │   ├── image2_damage.tif
-        │   └── ...
-        └── masks/
             ├── image1_ink.tif
             ├── image1_damage.tif
             ├── image2_ink.tif
@@ -265,13 +256,10 @@ class ImageDataset(BaseDataset):
         │   ├── image2_ink.tif
         │   └── ...
         ├── labels/
-        │   ├── image1_ink.tif
-        │   ├── image2_ink.tif
-        │   └── ...
-        └── masks/
             ├── image1_ink.tif
             ├── image2_ink.tif
             └── ...
+
         """
         if not hasattr(self.mgr, 'data_path'):
             raise ValueError("ConfigManager must have 'data_path' attribute for image dataset")
@@ -282,7 +270,6 @@ class ImageDataset(BaseDataset):
         
         images_dir = self.data_path / "images"
         labels_dir = self.data_path / "labels"
-        masks_dir = self.data_path / "masks"
 
         if not images_dir.exists():
             raise ValueError(f"Images directory does not exist: {images_dir}")
@@ -290,7 +277,7 @@ class ImageDataset(BaseDataset):
             raise ValueError(f"Labels directory does not exist: {labels_dir}")
         
         # Get or create Zarr groups
-        images_group, labels_group, masks_group = self._get_or_create_zarr_groups()
+        images_group, labels_group = self._get_or_create_zarr_groups()
         
         # Get the configured targets
         configured_targets = set(self.mgr.targets.keys())
@@ -366,16 +353,9 @@ class ImageDataset(BaseDataset):
                 tried_names = [f"{image_id}{ext}" for ext in supported_extensions]
                 tried_names.extend([f"{image_id}_{target}{ext}" for ext in supported_extensions])
                 raise ValueError(f"Image file not found for {image_id} (tried {', '.join(tried_names)})")
+
             
-            # Look for mask file (always with task suffix)
-            mask_file = None
-            for ext in [label_ext] + supported_extensions:
-                test_file = masks_dir / f"{image_id}_{target}{ext}"
-                if test_file.exists():
-                    mask_file = test_file
-                    break
-            
-            files_to_process.append((target, image_id, image_file, label_file, mask_file))
+            files_to_process.append((target, image_id, image_file, label_file))
         
         # Collect all conversion tasks that need to be done
         conversion_tasks = []
@@ -384,7 +364,7 @@ class ImageDataset(BaseDataset):
         
         print(f"DEBUG: Found {len(files_to_process)} files to process")
         print(f"DEBUG: Building conversion tasks...")
-        for idx, (target, image_id, image_file, label_file, mask_file) in enumerate(files_to_process):
+        for idx, (target, image_id, image_file, label_file) in enumerate(files_to_process):
             if idx % 100 == 0:
                 print(f"DEBUG: Building conversion task {idx}/{len(files_to_process)}")
             # Determine array names
@@ -395,8 +375,7 @@ class ImageDataset(BaseDataset):
             
             # Check if conversions are needed
             images_zarr_path = self.data_path / "images.zarr"
-            labels_zarr_path = self.data_path / "labels.zarr" 
-            masks_zarr_path = self.data_path / "masks.zarr"
+            labels_zarr_path = self.data_path / "labels.zarr"
             
             # Image conversion
             if image_array_name not in images_group or self._needs_update(image_file, images_group, image_array_name):
@@ -426,25 +405,11 @@ class ImageDataset(BaseDataset):
                     label_shape = cv2.imread(str(label_file)).shape
                 arrays_to_create.append((labels_group, label_array_name, label_shape))
                 conversion_tasks.append((label_file, labels_zarr_path, label_array_name, self.patch_size, True))
-            
-            # Mask conversion if available
-            mask_array_name = None
-            if mask_file:
-                mask_array_name = f"{image_id}_{target}"
-                if mask_array_name not in masks_group or self._needs_update(mask_file, masks_group, mask_array_name):
-                    # Read shape for pre-creation
-                    if str(mask_file).lower().endswith(('.tif', '.tiff')):
-                        mask_shape = tifffile.imread(str(mask_file)).shape
-                    else:
-                        mask_shape = cv2.imread(str(mask_file)).shape
-                    arrays_to_create.append((masks_group, mask_array_name, mask_shape))
-                    conversion_tasks.append((mask_file, masks_zarr_path, mask_array_name, self.patch_size, True))
-            
+
             # Store info for later
             array_info[(target, image_id)] = {
                 'image_array_name': image_array_name,
-                'label_array_name': label_array_name,
-                'mask_array_name': mask_array_name if mask_file else None
+                'label_array_name': label_array_name
             }
         
         # Perform parallel conversions if needed
@@ -496,7 +461,7 @@ class ImageDataset(BaseDataset):
         # Now load all arrays from the Zarr groups
         print("\nLoading Zarr arrays...")
         
-        for target, image_id, image_file, label_file, mask_file in files_to_process:
+        for target, image_id, image_file, label_file in files_to_process:
             info = array_info[(target, image_id)]
             
             # Load arrays from groups
@@ -508,12 +473,7 @@ class ImageDataset(BaseDataset):
                 'data': data_array,
                 'label': label_array
             }
-            
-            # Load mask if available
-            if info['mask_array_name']:
-                mask_array = masks_group[info['mask_array_name']]
-                data_dict['mask'] = mask_array
-            
+
             targets_data[target][image_id] = data_dict
             print(f"Loaded {image_id}_{target} with shape {data_array.shape}")
         
