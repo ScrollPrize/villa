@@ -29,3 +29,5 @@ segmentation/napari_trainer/test_1638_debug.png
 /checkpoints
 vesuvius/.DS_Store
 /wandb
+vesuvius/vesuvius/.DS_Store
+vesuvius/vesuvius/models/.DS_Store

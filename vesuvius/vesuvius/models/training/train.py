@@ -203,6 +203,13 @@ class BaseTrainer:
 
         dataset_size = len(train_dataset)
         indices = list(range(dataset_size))
+        
+        # Set seed for reproducible train/val split
+        if hasattr(self.mgr, 'seed'):
+            np.random.seed(self.mgr.seed)
+            if self.mgr.verbose:
+                print(f"Using seed {self.mgr.seed} for train/val split")
+        
         np.random.shuffle(indices)
 
         train_val_split = self.mgr.tr_val_split
@@ -843,6 +850,8 @@ def main():
                         help="Loss functions as a list, e.g., '[SoftDiceLoss, BCEWithLogitsLoss]' or comma-separated")
     parser.add_argument("--train-split", type=float,
                         help="Training/validation split ratio (0.0-1.0, default: 0.95)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for train/validation split (default: 42)")
     parser.add_argument("--config", "--config-path", dest="config_path", type=str, required=True,
                         help="Path to configuration YAML file (required)")
     parser.add_argument("--verbose", action="store_true",

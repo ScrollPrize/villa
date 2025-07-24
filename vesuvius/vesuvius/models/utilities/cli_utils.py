@@ -55,6 +55,11 @@ def update_config_from_args(mgr, args):
         mgr.tr_val_split = args.train_split
         mgr.tr_info["tr_val_split"] = args.train_split
 
+    if args.seed is not None:
+        mgr.seed = args.seed
+        mgr.tr_info["seed"] = args.seed
+        if mgr.verbose:
+            print(f"Set random seed for train/val split: {mgr.seed}")
 
     if args.max_epoch is not None:
         mgr.max_epoch = args.max_epoch
