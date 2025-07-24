@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from vesuvius.utils.utils import determine_dimensionality
+from vesuvius.models.training.auxiliary_tasks import create_auxiliary_task
 
 
 Image.MAX_IMAGE_PIXELS = None
@@ -35,6 +36,11 @@ class ConfigManager:
         self.targets = self.dataset_config.get("targets", {})
         if not self.targets and "targets" in self.model_config:
             self.targets = self.model_config.get("targets", {})
+
+        # Set default out_channels to 2 if not specified
+        for target_name, target_info in self.targets.items():
+            if 'out_channels' not in target_info and 'channels' not in target_info:
+                target_info['out_channels'] = 2
 
         # Load inference parameters directly
         infer_config = config.get("inference_config", {})
@@ -102,11 +108,7 @@ class ConfigManager:
         self.volume_task_loss_config = self.dataset_config.get("volume_task_loss_config", {})
         if self.volume_task_loss_config and self.verbose:
             print(f"Volume-task loss configuration loaded: {self.volume_task_loss_config}")
-        
-        # Label threshold - values below this will be set to 0, values at or above will be set to target_value
-        self.label_threshold = self.dataset_config.get("label_threshold", None)
-        if self.label_threshold is not None:
-            self.label_threshold = float(self.label_threshold)
+
         
         # Spatial transformations control
         self.no_spatial = bool(self.dataset_config.get("no_spatial", False))
@@ -179,6 +181,11 @@ class ConfigManager:
         """
         self.targets = deepcopy(targets_dict)
 
+        # Ensure all targets have out_channels, default to 2
+        for target_name, target_info in self.targets.items():
+            if 'out_channels' not in target_info and 'channels' not in target_info:
+                target_info['out_channels'] = 2
+
         # Apply current loss function to all targets if not already set
         for target_name in self.targets:
             if "loss_fn" not in self.targets[target_name]:
@@ -250,8 +257,8 @@ class ConfigManager:
         print(f"Configuration saved to: {config_path}")
 
     def update_config(self, patch_size=None, min_labeled_ratio=None, max_epochs=None, loss_function=None, 
-                     binarize_labels=None, target_value=None, skip_patch_validation=None,
-                     normalization_scheme=None, intensity_properties=None, label_threshold=None,
+                     skip_patch_validation=None,
+                     normalization_scheme=None, intensity_properties=None,
                      skip_bounding_box=None):
         if patch_size is not None:
             if isinstance(patch_size, (list, tuple)) and len(patch_size) >= 2:
@@ -272,18 +279,6 @@ class ConfigManager:
             self.dataset_config["min_labeled_ratio"] = self.min_labeled_ratio
             if self.verbose:
                 print(f"Updated min labeled ratio: {self.min_labeled_ratio:.2f}")
-
-        if binarize_labels is not None:
-            self.binarize_labels = bool(binarize_labels)
-            self.dataset_config["binarize_labels"] = self.binarize_labels
-            if self.verbose:
-                print(f"Updated binarize_labels: {self.binarize_labels}")
-
-        if target_value is not None:
-            self.target_value = target_value
-            self.dataset_config["target_value"] = self.target_value
-            if self.verbose:
-                print(f"Updated target_value: {self.target_value}")
 
         if skip_patch_validation is not None:
             self.skip_patch_validation = bool(skip_patch_validation)
@@ -313,12 +308,6 @@ class ConfigManager:
             if self.verbose:
                 print(f"Updated intensity properties: {self.intensity_properties}")
 
-        if label_threshold is not None:
-            self.label_threshold = float(label_threshold) if label_threshold is not None else None
-            self.dataset_config["label_threshold"] = self.label_threshold
-            if self.verbose:
-                print(f"Updated label_threshold: {self.label_threshold}")
-
         if skip_bounding_box is not None:
             self.skip_bounding_box = bool(skip_bounding_box)
             self.dataset_config["skip_bounding_box"] = self.skip_bounding_box
@@ -331,56 +320,20 @@ class ConfigManager:
         """
         if not self.auxiliary_tasks:
             return
-            
+
         for aux_task_name, aux_config in self.auxiliary_tasks.items():
             task_type = aux_config["type"]
-            
-            if task_type == "distance_transform":
-                source_target = aux_config["source_target"]
-            
-                if source_target not in self.targets:
-                    raise ValueError(f"Source target '{source_target}' for auxiliary task '{aux_task_name}' not found in targets")
-                
-                aux_target_name = f"{aux_task_name}"  # dt = distance transform
-                target_config = {
-                    "out_channels": aux_config.get("out_channels", 1),
-                    "activation": "none", 
-                    "auxiliary_task": True,
-                    "task_type": "distance_transform",
-                    "source_target": source_target,
-                    "weight": aux_config.get("loss_weight", 1.0)
-                }
-                
+            source_target = aux_config["source_target"]
 
-                target_config["losses"] = aux_config["losses"]
-                self.targets[aux_target_name] = target_config
-                
-                if self.verbose:
-                    print(f"Added distance transform auxiliary task '{aux_target_name}' from source '{source_target}'")
-                    
-            elif task_type == "surface_normals":
-                source_target = aux_config["source_target"]
-                
-                if source_target not in self.targets:
-                    raise ValueError(f"Source target '{source_target}' for auxiliary task '{aux_task_name}' not found in targets")
-                
-                aux_target_name = f"{aux_task_name}"
-                target_config = {
-                    "out_channels": aux_config.get("out_channels", None), 
-                    "activation": "none", 
-                    "auxiliary_task": True,
-                    "task_type": "surface_normals",
-                    "source_target": source_target,
-                    "weight": aux_config.get("loss_weight", 1.0),  
-                    "use_source_mask": True  
-                }
-                
+            if source_target not in self.targets:
+                raise ValueError(f"Source target '{source_target}' for auxiliary task '{aux_task_name}' not found in targets")
 
-                target_config["losses"] = aux_config["losses"]
-                self.targets[aux_target_name] = target_config
-                
-                if self.verbose:
-                    print(f"Added surface normals auxiliary task '{aux_target_name}' from source '{source_target}'")
+            # Use factory to create auxiliary task configuration
+            target_config = create_auxiliary_task(task_type, aux_task_name, aux_config, source_target)
+            self.targets[aux_task_name] = target_config
+
+            if self.verbose:
+                print(f"Added {task_type} auxiliary task '{aux_task_name}' from source '{source_target}'")
                     
         if self.verbose and self.auxiliary_tasks:
             print(f"Applied {len(self.auxiliary_tasks)} auxiliary tasks to targets")
@@ -414,13 +367,12 @@ class ConfigManager:
                     unique_values = torch.unique(label_tensor)
                     num_unique = len(unique_values)
                     
+                    # Always use at least 2 channels
                     if num_unique <= 2:
-                        # Binary case - always use 2 channels (background/foreground)
                         detected_channels = 2
                     else:
                         # Multi-class case - use max value + 1
                         detected_channels = int(torch.max(label_tensor).item()) + 1
-                        # Ensure at least 2 channels
                         detected_channels = max(detected_channels, 2)
                     
                     self.targets[target_name]['out_channels'] = detected_channels
