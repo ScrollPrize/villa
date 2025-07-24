@@ -552,7 +552,7 @@ class BaseTrainer:
                     targets_dict = {
                         k: v.to(device, dtype=torch.float32)
                         for k, v in data_dict.items()
-                        if k not in ["image", "ignore_masks", "masked_image", "mask", "patch_info"]
+                        if k not in ["image", "ignore_masks", "masked_image", "mask", "patch_info", "is_unlabeled"]
                     }
 
                 # Only use autocast if AMP is enabled
