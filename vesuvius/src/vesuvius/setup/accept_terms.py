@@ -3,33 +3,37 @@ import os
 import site
 import argparse
 
+
 def is_colab():
     try:
         import google.colab
+
         return True
     except ImportError:
         return False
-    
+
+
 def get_installation_path():
     """
     Get the installation path of the package.
-    
+
     Returns:
         str: The installation path.
-    
+
     Note:
         - For editable installs, this returns the directory containing the vesuvius.py file
         - For standard installs, this returns the site-packages directory
     """
     # Try to find if we're installed in editable mode
     import os
+
     current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    vesuvius_py_path = os.path.join(current_dir, 'vesuvius.py')
-    
+    vesuvius_py_path = os.path.join(current_dir, "vesuvius.py")
+
     # If vesuvius.py exists in the parent directory, we're in editable mode
     if os.path.exists(vesuvius_py_path):
         return current_dir
-    
+
     # Otherwise, use the site-packages location
     if is_colab():
         install_path = site.getsitepackages()[0]
@@ -37,13 +41,16 @@ def get_installation_path():
         install_path = site.getsitepackages()[-1]
     return install_path
 
+
 def save_agreement():
-    install_path = get_installation_path()
-    agreement_file_path = os.path.join(install_path, 'vesuvius', 'setup', 'agreement.txt')
-    
-    with open(agreement_file_path, 'w+') as file:
+    # Create agreement file in the setup directory
+    setup_dir = os.path.dirname(os.path.abspath(__file__))
+    agreement_file_path = os.path.join(setup_dir, "agreement.txt")
+
+    with open(agreement_file_path, "w+") as file:
         file.write("yes")
     print(f"Agreement saved to {agreement_file_path}")
+
 
 def display_terms_and_conditions(accept_terms):
     terms = """
@@ -68,21 +75,29 @@ def display_terms_and_conditions(accept_terms):
     * All EduceLab-Scrolls data is copyrighted by EduceLab/The University of Kentucky. Permission to use the data linked herein according to the terms outlined above is granted to Vesuvius Challenge.
     """
     print(terms)
-    
+
     if not accept_terms:
-        print("You must accept the terms and conditions to use this package. Run `$ vesuvius.accept_terms --yes` to accept.")
+        print(
+            "You must accept the terms and conditions to use this package. Run `$ vesuvius.accept_terms --yes` to accept."
+        )
         sys.exit(1)
     else:
         save_agreement()
         print("Thank you for accepting the terms and conditions.")
 
+
 def main():
-    parser = argparse.ArgumentParser(description='Script to accept Terms and Conditions')
-    parser.add_argument('--yes', action='store_true', help='Automatically accept terms and conditions')
-    
+    parser = argparse.ArgumentParser(
+        description="Script to accept Terms and Conditions"
+    )
+    parser.add_argument(
+        "--yes", action="store_true", help="Automatically accept terms and conditions"
+    )
+
     args = parser.parse_args()
-    
+
     display_terms_and_conditions(args.yes)
+
 
 if __name__ == "__main__":
     main()
