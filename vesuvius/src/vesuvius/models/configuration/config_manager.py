@@ -19,7 +19,7 @@ class ConfigManager:
         self.data = None # note that config manager DOES NOT hold data, 
                          # it just holds the path to the data, currently an annoying holdover from old napari trainer
         self.verbose = verbose
-        self.selected_loss_function = None
+        self.selected_loss_function = "nnUNet_DC_and_CE_loss"
 
     def load_config(self, config_path):
         config_path = Path(config_path)
