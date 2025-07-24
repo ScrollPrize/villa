@@ -70,11 +70,6 @@ class NetworkFromConfig(nn.Module):
         # Get input channels from manager if available, otherwise default to 1
         self.in_channels = getattr(mgr, 'in_channels', 1)
         self.autoconfigure = mgr.autoconfigure
-        
-        # Check if we're in MAE pretraining mode
-        self.mae_mode = mgr.model_config.get('mae_mode', False)
-        if self.mae_mode:
-            print("Initializing network in MAE pretraining mode")
 
         if hasattr(mgr, 'model_config') and mgr.model_config:
             model_config = mgr.model_config
@@ -89,12 +84,11 @@ class NetworkFromConfig(nn.Module):
         # --------------------------------------------------------------------
         self.conv_op = model_config.get("conv_op", "nn.Conv3d")
         self.conv_op_kwargs = model_config.get("conv_op_kwargs", {"bias": False})
-        self.pool_op = model_config.get("pool_op", "nn.AvgPool3d")
-        self.dropout_op = model_config.get("dropout_op", "nn.Dropout3d")
-        self.dropout_op_kwargs = model_config.get("dropout_op_kwargs", {"p": 0.0})
+        self.dropout_op = model_config.get("dropout_op", None)
+        self.dropout_op_kwargs = model_config.get("dropout_op_kwargs", None)
         self.norm_op = model_config.get("norm_op", "nn.InstanceNorm3d")
-        self.norm_op_kwargs = model_config.get("norm_op_kwargs", {"affine": False, "eps": 1e-5})
-        self.conv_bias = model_config.get("conv_bias", False)
+        self.norm_op_kwargs = model_config.get("norm_op_kwargs", {"affine": True, "eps": 1e-5})
+        self.conv_bias = model_config.get("conv_bias", True)
         self.nonlin = model_config.get("nonlin", "nn.LeakyReLU")
         self.nonlin_kwargs = model_config.get("nonlin_kwargs", {"inplace": True})
 
@@ -120,14 +114,6 @@ class NetworkFromConfig(nn.Module):
                 self.conv_op = nn.Conv3d
                 print("Using 3D convolutions (nn.Conv3d)")
 
-        if isinstance(self.pool_op, str):
-            if self.op_dims == 2:
-                self.pool_op = nn.AvgPool2d
-                print("Using 2D pooling (nn.AvgPool2d)")
-            else:
-                self.pool_op = nn.AvgPool3d
-                print("Using 3D pooling (nn.AvgPool3d)")
-
         if isinstance(self.norm_op, str):
             if self.op_dims == 2:
                 self.norm_op = nn.InstanceNorm2d
@@ -143,10 +129,13 @@ class NetworkFromConfig(nn.Module):
             else:
                 self.dropout_op = nn.Dropout3d
                 print("Using 3D dropout (nn.Dropout3d)")
+        elif self.dropout_op is None:
+            pass
 
         if self.nonlin in ["nn.LeakyReLU", "LeakyReLU"]:
             self.nonlin = nn.LeakyReLU
-            self.nonlin_kwargs = {"negative_slope": 1e-2, "inplace": True}
+            if "negative_slope" not in self.nonlin_kwargs:
+                self.nonlin_kwargs["negative_slope"] = 0.01  # PyTorch default
         elif self.nonlin in ["nn.ReLU", "ReLU"]:
             self.nonlin = nn.ReLU
             self.nonlin_kwargs = {"inplace": True}
@@ -305,40 +294,37 @@ class NetworkFromConfig(nn.Module):
             bottleneck_channels=model_config.get("bottleneck_channels", None),
             stochastic_depth_p=model_config.get("stochastic_depth_p", 0.0),
             squeeze_excitation=model_config.get("squeeze_excitation", False),
-            squeeze_excitation_reduction_ratio=model_config.get("squeeze_excitation_reduction_ratio", 1.0/16.0)
+            squeeze_excitation_reduction_ratio=model_config.get("squeeze_excitation_reduction_ratio", 1.0/16.0),
+            pool_type=model_config.get("pool_type", "conv")
         )
         self.task_decoders = nn.ModuleDict()
         self.task_activations = nn.ModuleDict()
         
-        if self.mae_mode:
-            # In MAE mode, create a lightweight reconstruction head
-            self._build_mae_reconstruction_head()
-        else:
-            # Standard supervised mode - create task-specific decoders
-            for target_name, target_info in self.targets.items():
-                # Determine output channels - use task-specific channels if specified, otherwise match input channels
-                if 'out_channels' in target_info:
-                    out_channels = target_info['out_channels']
-                elif 'channels' in target_info:
-                    out_channels = target_info['channels']
-                else:
-                    # Default to matching input channels for adaptive behavior
-                    out_channels = self.in_channels
-                    print(f"No channel specification found for task '{target_name}', defaulting to {out_channels} channels (matching input)")
+        # Standard supervised mode - create task-specific decoders
+        for target_name, target_info in self.targets.items():
+            # Determine output channels - use task-specific channels if specified, otherwise match input channels
+            if 'out_channels' in target_info:
+                out_channels = target_info['out_channels']
+            elif 'channels' in target_info:
+                out_channels = target_info['channels']
+            else:
+                # Default to matching input channels for adaptive behavior
+                out_channels = self.in_channels
+                print(f"No channel specification found for task '{target_name}', defaulting to {out_channels} channels (matching input)")
 
-                # Update target_info with the determined channels
-                target_info["out_channels"] = out_channels
+            # Update target_info with the determined channels
+            target_info["out_channels"] = out_channels
 
-                activation_str = target_info.get("activation", "sigmoid")
-                self.task_decoders[target_name] = Decoder(
-                    encoder=self.shared_encoder,
-                    basic_block=model_config.get("basic_decoder_block", "ConvBlock"),
-                    num_classes=out_channels,
-                    n_conv_per_stage=model_config.get("n_conv_per_stage_decoder", [1] * (self.num_stages - 1)),
-                    deep_supervision=False
-                )
-                self.task_activations[target_name] = get_activation_module(activation_str)
-                print(f"Task '{target_name}' configured with {out_channels} output channels")
+            activation_str = target_info.get("activation", "sigmoid")
+            self.task_decoders[target_name] = Decoder(
+                encoder=self.shared_encoder,
+                basic_block=model_config.get("basic_decoder_block", "ConvBlock"),
+                num_classes=out_channels,
+                n_conv_per_stage=model_config.get("n_conv_per_stage_decoder", [1] * (self.num_stages - 1)),
+                deep_supervision=False
+            )
+            self.task_activations[target_name] = get_activation_module(activation_str)
+            print(f"Task '{target_name}' configured with {out_channels} output channels")
 
         # --------------------------------------------------------------------
         # Build final configuration snapshot.
@@ -354,7 +340,6 @@ class NetworkFromConfig(nn.Module):
             "n_blocks_per_stage": self.n_blocks_per_stage,
             "n_conv_per_stage_decoder": model_config.get("n_conv_per_stage_decoder", [1] * (self.num_stages - 1)),
             "kernel_sizes": self.kernel_sizes,
-            "pool_op": self.pool_op.__name__ if hasattr(self.pool_op, "__name__") else self.pool_op,
             "pool_op_kernel_sizes": self.pool_op_kernel_sizes,
             "conv_op": self.conv_op.__name__ if hasattr(self.conv_op, "__name__") else self.conv_op,
             "conv_bias": self.conv_bias,
@@ -372,6 +357,7 @@ class NetworkFromConfig(nn.Module):
             "stochastic_depth_p": model_config.get("stochastic_depth_p", 0.0),
             "squeeze_excitation": model_config.get("squeeze_excitation", False),
             "squeeze_excitation_reduction_ratio": model_config.get("squeeze_excitation_reduction_ratio", 1.0/16.0),
+            "pool_type": model_config.get("pool_type", "conv"),
             "op_dims": self.op_dims,
             "patch_size": self.patch_size,
             "batch_size": self.batch_size,
@@ -422,103 +408,12 @@ class NetworkFromConfig(nn.Module):
         # Check input channels and warn if mismatch
         self.check_input_channels(x)
 
-        if self.mae_mode:
-            return self.forward_mae(x)
-        else:
-            skips = self.shared_encoder(x)
-            results = {}
-            for task_name, decoder in self.task_decoders.items():
-                logits = decoder(skips)
-                activation_fn = self.task_activations[task_name]
-                if activation_fn is not None and not self.training:
-                    logits = activation_fn(logits)
-                results[task_name] = logits
-            return results
-    
-    def _build_mae_reconstruction_head(self):
-        """Build a lightweight reconstruction head for MAE pretraining.
-        
-        Uses a simplified decoder with fewer stages for efficiency.
-        """
-        model_config = self.mgr.model_config
-        
-        # The decoder needs configuration for all encoder stages - 1
-        n_encoder_stages = len(self.shared_encoder.output_channels)
-        
-        # Option to use fewer convolutions per stage for MAE (lighter decoder)
-        mae_n_conv_per_stage = model_config.get("mae_n_conv_per_stage", 1)
-        if isinstance(mae_n_conv_per_stage, int):
-            # If it's an int, apply to all decoder stages
-            n_conv_per_stage = [mae_n_conv_per_stage] * (n_encoder_stages - 1)
-        else:
-            # If it's a list, make sure it has the right length
-            n_conv_per_stage = mae_n_conv_per_stage
-            if len(n_conv_per_stage) < n_encoder_stages - 1:
-                # Pad with 1s if not enough values provided
-                n_conv_per_stage = n_conv_per_stage + [1] * (n_encoder_stages - 1 - len(n_conv_per_stage))
-        
-        # Create reconstruction decoder
-        self.reconstruction_decoder = Decoder(
-            encoder=self.shared_encoder,
-            basic_block=model_config.get("mae_decoder_block", "ConvBlock"),
-            num_classes=self.in_channels,  # Reconstruct input channels
-            n_conv_per_stage=n_conv_per_stage,
-            deep_supervision=False
-        )
-        
-        # Option 2 (Alternative): Simple convolutional head
-        # This would be used if mae_use_simple_head is True in config
-        if model_config.get("mae_use_simple_head", False):
-            # Get the number of channels from the encoder's bottleneck
-            bottleneck_channels = self.shared_encoder.stages[-1].output_channels
-            
-            # Simple conv head
-            if self.op_dims == 2:
-                self.reconstruction_head = nn.Sequential(
-                    nn.Conv2d(bottleneck_channels, 256, kernel_size=3, padding=1),
-                    nn.InstanceNorm2d(256),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(256, 128, kernel_size=3, padding=1),
-                    nn.InstanceNorm2d(128),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(128, self.in_channels, kernel_size=1)
-                )
-            else:  # 3D
-                self.reconstruction_head = nn.Sequential(
-                    nn.Conv3d(bottleneck_channels, 256, kernel_size=3, padding=1),
-                    nn.InstanceNorm3d(256),
-                    nn.ReLU(inplace=True),
-                    nn.Conv3d(256, 128, kernel_size=3, padding=1),
-                    nn.InstanceNorm3d(128),
-                    nn.ReLU(inplace=True),
-                    nn.Conv3d(128, self.in_channels, kernel_size=1)
-                )
-        
-        print(f"MAE reconstruction decoder created with {n_encoder_stages - 1} stages")
-    
-    def forward_mae(self, x):
-        """Forward pass for MAE pretraining.
-        
-        Args:
-            x: Masked input tensor
-            
-        Returns:
-            Dictionary with 'reconstruction' key containing the reconstructed image
-        """
-        # Encode the masked input
         skips = self.shared_encoder(x)
-        
-        # Reconstruct using the decoder
-        if hasattr(self, 'reconstruction_head') and self.mgr.model_config.get("mae_use_simple_head", False):
-            # Use simple head - only use bottleneck features
-            reconstruction = self.reconstruction_head(skips[-1])
-            # Upsample to original size if needed
-            if reconstruction.shape[2:] != x.shape[2:]:
-                reconstruction = F.interpolate(reconstruction, size=x.shape[2:], 
-                                             mode='trilinear' if self.op_dims == 3 else 'bilinear',
-                                             align_corners=False)
-        else:
-            # Use decoder-based reconstruction
-            reconstruction = self.reconstruction_decoder(skips)
-        
-        return {"reconstruction": reconstruction}
+        results = {}
+        for task_name, decoder in self.task_decoders.items():
+            logits = decoder(skips)
+            activation_fn = self.task_activations[task_name]
+            if activation_fn is not None and not self.training:
+                logits = activation_fn(logits)
+            results[task_name] = logits
+        return results

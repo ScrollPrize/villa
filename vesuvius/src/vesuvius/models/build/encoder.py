@@ -124,7 +124,7 @@ class Encoder(nn.Module,):
 
             else:
                 stage_modules = []
-                conv_stride = strides[s]
+                conv_stride = strides[s] if pool_op is None else 1
                 stage_modules.append(StackedConvBlocks(
                     n_blocks_per_stage[s], conv_op, input_channels, features_per_stage[s], kernel_sizes[s], conv_stride,
                     conv_bias, norm_op, norm_op_kwargs, dropout_op, dropout_op_kwargs, nonlin, nonlin_kwargs
