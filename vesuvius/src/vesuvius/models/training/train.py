@@ -90,32 +90,22 @@ class BaseTrainer:
         model = NetworkFromConfig(self.mgr)
         return model
 
-
     # --- configure dataset --- #
     def _configure_dataset(self, is_training=True):
-        # Check if MAE dataset class is specified
-        dataset_class = self.mgr.dataset_config.get('dataset_class', None)
-        
-        if dataset_class == 'MAEPretrainDataset':
-            # MAE pretraining dataset
-            dataset = MAEPretrainDataset(mgr=self.mgr, is_training=is_training)
-            print(f"Using MAE pretraining dataset ({'training' if is_training else 'validation'})")
+        data_format = getattr(self.mgr, 'data_format', 'zarr').lower()
+
+        if data_format == 'napari':
+            dataset = NapariDataset(mgr=self.mgr, is_training=is_training)
+        elif data_format == 'image':
+            dataset = ImageDataset(mgr=self.mgr, is_training=is_training)
+        elif data_format == 'zarr':
+            dataset = ZarrDataset(mgr=self.mgr, is_training=is_training)
         else:
-            # Standard supervised datasets
-            data_format = getattr(self.mgr, 'data_format', 'zarr').lower()
+            raise ValueError(f"Unsupported data format: {data_format}. "
+                             f"Supported formats are: 'napari', 'image', 'zarr'")
 
-            if data_format == 'napari':
-                dataset = NapariDataset(mgr=self.mgr, is_training=is_training)
-            elif data_format == 'image':
-                dataset = ImageDataset(mgr=self.mgr, is_training=is_training)
-            elif data_format == 'zarr':
-                dataset = ZarrDataset(mgr=self.mgr, is_training=is_training)
-            else:
-                raise ValueError(f"Unsupported data format: {data_format}. "
-                               f"Supported formats are: 'napari', 'image', 'zarr'")
+        print(f"Using {data_format} dataset format ({'training' if is_training else 'validation'})")
 
-            print(f"Using {data_format} dataset format ({'training' if is_training else 'validation'})")
-        
         return dataset
 
     # --- losses ---- #
