@@ -1389,10 +1389,13 @@ def main():
         mgr.load_config(args.config_path)
         print(f"Loaded configuration from: {args.config_path}")
     else:
+        if args.input is None:
+            parser.error("Either --config-path or -i/--input must be provided")
         mgr.tr_info = {}
         mgr.tr_configs = {}
         mgr.model_config = {}
         mgr.dataset_config = {}
+        mgr.targets = {}  # Initialize targets to prevent AttributeError
         mgr._init_attributes()
         print("Initialized with default configuration")
 
