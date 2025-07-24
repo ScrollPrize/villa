@@ -52,48 +52,58 @@ def convert_image_to_zarr_worker(args):
         return array_name, None, False, str(e)
 
 class ImageDataset(BaseDataset):
+    def get_labeled_unlabeled_patch_indices(self):
+        """Get indices of patches that are labeled vs unlabeled.
+
+        Returns:
+            labeled_indices: List of patch indices with labels
+            unlabeled_indices: List of patch indices without labels
+        """
+        labeled_indices = []
+        unlabeled_indices = []
+
+        # First, let's understand the actual structure
+        # Since all targets share the same volume indexing, check the first target
+        first_target = list(self.target_volumes.keys())[0]
+
+        for idx, patch_info in enumerate(self.valid_patches):
+            vol_idx = patch_info['volume_index']
+
+            # Get the volume info for this index
+            if vol_idx < len(self.target_volumes[first_target]):
+                volume_info = self.target_volumes[first_target][vol_idx]
+                has_label = volume_info.get('has_label', False)
+
+                if has_label:
+                    labeled_indices.append(idx)
+                else:
+                    unlabeled_indices.append(idx)
+            else:
+                # This shouldn't happen, but let's be safe
+                print(f"Warning: patch {idx} references volume {vol_idx} which doesn't exist")
+                unlabeled_indices.append(idx)
+
+        return labeled_indices, unlabeled_indices
+
     """
-    A PyTorch Dataset for handling both 2D data from jpeg/png/image and 3D data from image files.
+    A PyTorch Dataset for handling both 2D and 3D data from image files.
     
     This dataset automatically converts files to Zarr format on first use
     for much faster random access during training. The Zarr files are stored
     as groups in the data path:
     - images.zarr/  (contains image1, image2, etc. as arrays)
-    - labels.zarr/  (contains image1_ink, image2_ink, etc. as arrays)  
-    """
+    - labels.zarr/  (contains image1_task, image2_task, etc. as arrays)
     
-    def __init__(self, mgr, is_training=True):
-        """
-        Initialize the dataset with configuration from the manager.
-        
-        By default, datasets skip patch validation for performance,
-        considering all sliding window positions as valid.
-        
-        Users can enable patch validation by setting min_labeled_ratio > 0
-        or min_bbox_percent > 0 in the configuration.
-        
-        Parameters
-        ----------
-        mgr : ConfigManager
-            Manager containing configuration parameters
-        is_training : bool
-            Whether this dataset is for training (applies augmentations) or validation
-        """
-        # Check if user has specified validation parameters
-        min_labeled_ratio = getattr(mgr, 'min_labeled_ratio', 0)
-        min_bbox_percent = getattr(mgr, 'min_bbox_percent', 0)
-        
-        # Only skip validation if neither parameter is set
-        # This allows users to opt-in to validation by setting either parameter
-        if min_labeled_ratio == 0 and min_bbox_percent == 0:
-            # Default behavior: skip validation for performance
-            mgr.skip_patch_validation = True
-        else:
-            # User has specified validation parameters, enable validation
-            mgr.skip_patch_validation = False
-            print(f"Patch validation enabled with min_labeled_ratio={min_labeled_ratio}, min_bbox_percent={min_bbox_percent}")
-        
-        super().__init__(mgr, is_training=is_training)
+    Expected directory structure:
+    data_path/
+    ├── images/
+    │   ├── image1.tif          # Multi-task: single image for all tasks
+    │   ├── image1_task.tif     # Single-task: task-specific image
+    │   └── ...
+    └── labels/
+        ├── image1_task.tif     # Always task-specific
+        └── ...
+    """
     
     def _get_or_create_zarr_groups(self):
         """
