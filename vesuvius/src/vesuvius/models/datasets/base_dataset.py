@@ -9,8 +9,10 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
 from functools import partial
-from scipy.ndimage import distance_transform_edt
-from skimage.filters import scharr
+from vesuvius.models.training.auxiliary_tasks import (
+    compute_distance_transform,
+    compute_surface_normals_from_sdt
+)
 from vesuvius.models.augmentation.transforms.spatial.transpose import TransposeAxesTransform
 # Augmentations will be handled directly in this file
 from vesuvius.models.augmentation.transforms.utils.random import RandomTransform
@@ -68,11 +70,6 @@ class BaseDataset(Dataset):
         self.patch_size = mgr.train_patch_size   # Expected to be [z, y, x]
         self.min_labeled_ratio = mgr.min_labeled_ratio
         self.min_bbox_percent = mgr.min_bbox_percent
-
-        # New binarization control parameters
-        self.binarize_labels = getattr(mgr, 'binarize_labels', False)
-        self.target_value = getattr(mgr, 'target_value', 1)
-        self.label_threshold = getattr(mgr, 'label_threshold', None)
         
         # Skip patch validation (defaults to False)
         self.skip_patch_validation = getattr(mgr, 'skip_patch_validation', False)
@@ -731,15 +728,6 @@ class BaseDataset(Dataset):
                 else:
                     # Single-channel 2D
                     label_patch = label_arr[y:y+dy, x:x+dx]
-                
-                # Apply threshold if configured (before binarization)
-                if self.label_threshold is not None and not self.targets.get(t_name, {}).get('auxiliary_task', False):
-                    # Apply threshold: values below threshold become 0
-                    label_patch = np.where(label_patch < self.label_threshold, 0, label_patch)
-                
-                # Apply binarization only if configured to do so and not an auxiliary task
-                if self.binarize_labels and not self.targets.get(t_name, {}).get('auxiliary_task', False):
-                    target_value = self._get_target_value(t_name)
                     
                     if isinstance(target_value, dict):
                         # Check if this is a multi-class config with regions
@@ -796,53 +784,7 @@ class BaseDataset(Dataset):
                 else:
                     # Single-channel 3D
                     label_patch = label_arr[z:z+dz, y:y+dy, x:x+dx]
-                
-                # Apply threshold if configured (before binarization)
-                if self.label_threshold is not None and not self.targets.get(t_name, {}).get('auxiliary_task', False):
-                    # Apply threshold: values below threshold become 0
-                    label_patch = np.where(label_patch < self.label_threshold, 0, label_patch)
-                
-                # Apply binarization only if configured to do so
-                if self.binarize_labels:
-                    target_value = self._get_target_value(t_name)
-                    
-                    if isinstance(target_value, dict):
-                        # Check if this is a multi-class config with regions
-                        if 'mapping' in target_value:
-                            # New format with mapping and optional regions
-                            mapping = target_value['mapping']
-                            regions = target_value.get('regions', {})
-                            
-                            # First apply standard mapping
-                            new_label_patch = np.zeros_like(label_patch)
-                            for original_val, new_val in mapping.items():
-                                mask = (label_patch == original_val)
-                                new_label_patch[mask] = new_val
-                            
-                            # Then apply regions (which override)
-                            for region_id, source_classes in regions.items():
-                                # Create mask for any pixel that belongs to source classes
-                                region_mask = np.zeros_like(new_label_patch, dtype=bool)
-                                for source_class in source_classes:
-                                    region_mask |= (new_label_patch == source_class)
-                                # Override those pixels with the region ID
-                                new_label_patch[region_mask] = region_id
-                            
-                            label_patch = new_label_patch
-                        else:
-                            # Old format: direct mapping
-                            new_label_patch = np.zeros_like(label_patch)
-                            for original_val, new_val in target_value.items():
-                                mask = (label_patch == original_val)
-                                new_label_patch[mask] = new_val
-                            label_patch = new_label_patch
-                    else:
-                        # Single class binarization: keep zeros as zero, set non-zeros to target_value
-                        binary_mask = (label_patch > 0)
-                        new_label_patch = np.zeros_like(label_patch)
-                        new_label_patch[binary_mask] = target_value
-                        label_patch = new_label_patch
-                        
+
                 if has_channels:
                     # Pad each channel separately
                     padded_channels = []
@@ -863,38 +805,6 @@ class BaseDataset(Dataset):
         self._process_auxiliary_tasks(label_patches, is_2d)
             
         return label_patches
-
-    def _get_target_value(self, t_name):
-        """
-        Extract target value from configuration.
-        
-        Parameters
-        ----------
-        t_name : str
-            Target name
-            
-        Returns
-        -------
-        int or dict
-            Target value(s) - can be int for single class or dict for multi-class
-        """
-        # Check if this is an auxiliary task - they don't need target values
-        if t_name in self.targets and self.targets[t_name].get('auxiliary_task', False):
-            return None  # Auxiliary tasks don't have target values
-        
-        # Don't warn about missing target value if binarization is disabled
-        if not self.binarize_labels:
-            return 1  # Return default without warning
-        
-        # Check if target_value is configured
-        if isinstance(self.target_value, dict) and t_name in self.target_value:
-            return self.target_value[t_name]
-        elif isinstance(self.target_value, int):
-            return self.target_value
-        else:
-            # Default to 1 if not configured
-            print(f"Warning: No target value configured for '{t_name}', defaulting to 1")
-            return 1
 
     def _get_volume_id(self, vol_idx):
         """
@@ -974,15 +884,6 @@ class BaseDataset(Dataset):
                         if log_key not in self._logged_disabled_tasks:
                             print(f"Task '{t_name}' disabled for volume '{volume_id}' - creating ignore mask")
                             self._logged_disabled_tasks.add(log_key)
-        
-        # Check for auxiliary task source masks
-        if hasattr(self, '_aux_source_masks'):
-            for aux_task_name, source_mask in self._aux_source_masks.items():
-                if aux_task_name in self.targets:
-                    # Invert the mask: source_mask has 1 where source > 0 (compute), 
-                    # but ignore_mask needs 1 where we ignore (source == 0)
-                    ignore_mask = 1.0 - source_mask
-                    ignore_masks[aux_task_name] = ignore_mask
         
         # Check only the first target for the mask
         first_target_name = list(self.target_volumes.keys())[0]
@@ -1147,19 +1048,11 @@ class BaseDataset(Dataset):
         # Process all labels based on target configuration
         for t_name, label_patch in label_patches.items():
             # Skip target value processing for auxiliary tasks
-            if t_name in self.targets and self.targets[t_name].get('auxiliary_task', False):
+            if t_name in self.targets:
                 # Auxiliary tasks are regression targets, just convert to tensor
                 data_dict[t_name] = torch.from_numpy(label_patch)
                 continue
-                
-            # Check if this is a multi-class target
-            target_value = self._get_target_value(t_name)
-            is_multiclass = (
-                isinstance(target_value, dict) and 
-                'mapping' in target_value and 
-                ('regions' in target_value or len(target_value['mapping']) > 2)
-            )
-            
+
             # Get the number of output channels for this target
             if t_name not in self.targets:
                 print(f"Warning: Target '{t_name}' not found in self.targets. Available targets: {list(self.targets.keys())}")
@@ -1167,7 +1060,7 @@ class BaseDataset(Dataset):
                 self.targets[t_name] = {"out_channels": 2}
             out_channels = self.targets[t_name].get("out_channels", 2)
             
-            if is_multiclass or out_channels > 2:
+            if out_channels > 2:
                 # Multi-class segmentation - update metadata
                 unique_vals = np.unique(label_patch)
                 num_classes = int(unique_vals.max()) + 1
@@ -1432,216 +1325,3 @@ class BaseDataset(Dataset):
             # Force garbage collection of any lingering references
             import gc
             gc.collect()
-
-    def _process_auxiliary_tasks(self, label_patches, is_2d):
-        """
-        Process auxiliary tasks by computing additional targets like distance transforms and surface normals.
-        
-        Parameters
-        ----------
-        label_patches : dict
-            Dictionary of label patches for each target
-        is_2d : bool
-            Whether the data is 2D
-        """
-        # Check if manager has auxiliary tasks
-        if not hasattr(self.mgr, 'auxiliary_tasks') or not self.mgr.auxiliary_tasks:
-            return
-            
-        # Store source masks for auxiliary tasks that need them
-        if not hasattr(self, '_aux_source_masks'):
-            self._aux_source_masks = {}
-            
-        # Cache for signed distance transforms to avoid recomputation
-        sdt_cache = {}
-        
-        # First pass: check if we need surface normals (which compute SDT)
-        needs_sdt = {}
-        for aux_task_name, aux_config in self.mgr.auxiliary_tasks.items():
-            if aux_config["type"] == "surface_normals":
-                source_target = aux_config["source_target"]
-                if source_target in label_patches:
-                    needs_sdt[source_target] = True
-                    
-        # Process all auxiliary tasks
-        for aux_task_name, aux_config in self.mgr.auxiliary_tasks.items():
-            task_type = aux_config["type"]
-            
-            if task_type == "distance_transform":
-                source_target = aux_config["source_target"]
-                
-                # Check if source target exists in label_patches
-                if source_target not in label_patches:
-                    continue
-                    
-                source_patch = label_patches[source_target]
-                
-                # Check if we have cached SDT from surface normals computation
-                cache_key = f"{source_target}_sdt"
-                
-                # Compute distance transform for each channel
-                distance_transforms = []
-                for c in range(source_patch.shape[0]):  # Iterate over channels
-                    channel_key = f"{cache_key}_{c}"
-                    
-                    if channel_key in sdt_cache:
-                        # Reuse cached signed distance transform
-                        sdt = sdt_cache[channel_key]
-                        # For distance transform, we want the absolute distance inside the object
-                        # SDT is negative inside, positive outside
-                        distance_map = np.where(sdt < 0, -sdt, 0)
-                    else:
-                        # Get binary mask from source patch
-                        channel_patch = source_patch[c]
-                        binary_mask = (channel_patch > 0).astype(np.uint8)
-                        
-                        # If this source will be used for surface normals later, compute SDT
-                        if source_target in needs_sdt and np.any(binary_mask):
-                            inside_dist = distance_transform_edt(binary_mask)
-                            outside_dist = distance_transform_edt(1 - binary_mask)
-                            sdt = outside_dist - inside_dist
-                            sdt_cache[channel_key] = sdt
-                            # For distance transform, use the inside distance
-                            distance_map = inside_dist
-                        else:
-                            # Standard distance transform computation
-                            if np.any(binary_mask):
-                                # Compute distance transform from foreground pixels
-                                distance_map = distance_transform_edt(binary_mask)
-                            else:
-                                # If no foreground pixels, distance map is zero everywhere
-                                distance_map = np.zeros_like(channel_patch)
-                    
-                    distance_transforms.append(distance_map)
-                
-                # Stack distance transforms and ensure proper format
-                if len(distance_transforms) == 1:
-                    # Single channel output
-                    distance_patch = distance_transforms[0][np.newaxis, ...]
-                else:
-                    # Multi-channel output
-                    distance_patch = np.stack(distance_transforms, axis=0)
-                
-                # Ensure contiguous and proper dtype
-                distance_patch = np.ascontiguousarray(distance_patch, dtype=np.float32)
-                
-                # Add to label_patches with the auxiliary task name
-                aux_target_name = f"{aux_task_name}" 
-                label_patches[aux_target_name] = distance_patch
-                
-            elif task_type == "surface_normals":
-                source_target = aux_config["source_target"]
-                
-                # Check if source target exists in label_patches
-                if source_target not in label_patches:
-                    continue
-                    
-                source_patch = label_patches[source_target]
-                
-                # Compute surface normals for each channel
-                all_normals = []
-                for c in range(source_patch.shape[0]):  # Iterate over channels
-                    # Get binary mask from source patch
-                    channel_patch = source_patch[c]
-                    binary_mask = (channel_patch > 0).astype(np.uint8)
-                    
-                    # Check if we need to cache SDT
-                    cache_key = f"{source_target}_sdt_{c}"
-                    
-                    # Compute surface normals from signed distance transform
-                    normals, sdt = self._compute_surface_normals_from_sdt(binary_mask, is_2d, return_sdt=True)
-                    
-                    # Cache the SDT if it might be needed by distance transform
-                    if cache_key not in sdt_cache:
-                        sdt_cache[cache_key] = sdt
-                    
-                    all_normals.append(normals)
-                
-                # For multi-channel input, we average the normals
-                if len(all_normals) > 1:
-                    # Stack and average
-                    stacked_normals = np.stack(all_normals, axis=0)
-                    normals_patch = np.mean(stacked_normals, axis=0)
-                    # Re-normalize after averaging
-                    magnitude = np.sqrt(np.sum(normals_patch**2, axis=0, keepdims=True))
-                    magnitude = np.maximum(magnitude, 1e-6)
-                    normals_patch = normals_patch / magnitude
-                else:
-                    normals_patch = all_normals[0]
-                
-                # Ensure contiguous and proper dtype
-                normals_patch = np.ascontiguousarray(normals_patch, dtype=np.float32)
-                
-                # Add to label_patches with the auxiliary task name
-                aux_target_name = f"{aux_task_name}"
-                label_patches[aux_target_name] = normals_patch
-                
-                # Store the source mask for this auxiliary task
-                # Create mask where source > 0 (compute loss) vs source == 0 (ignore)
-                source_mask = (source_patch > 0).astype(np.float32)
-                if source_mask.ndim > 1:
-                    # Take max across channels if multi-channel
-                    source_mask = source_mask.max(axis=0, keepdims=True)
-                else:
-                    source_mask = source_mask[np.newaxis, ...]
-                self._aux_source_masks[aux_target_name] = source_mask
-                
-                # Update the target's out_channels based on dimensionality
-                if aux_target_name in self.targets:
-                    self.targets[aux_task_name]["out_channels"] = 2 if is_2d else 3
-                    
-    def _compute_surface_normals_from_sdt(self, binary_mask, is_2d, epsilon=1e-6, return_sdt=False):
-        """
-        Compute surface normals from a binary mask using signed distance transform.
-        
-        Parameters
-        ----------
-        binary_mask : numpy.ndarray
-            Binary segmentation mask
-        is_2d : bool
-            Whether the data is 2D or 3D
-        epsilon : float
-            Small value for numerical stability
-        return_sdt : bool
-            If True, also return the signed distance transform
-        
-        Returns
-        -------
-        numpy.ndarray or tuple
-            If return_sdt is False: Normalized surface normals with shape:
-            - 2D: (2, H, W) containing (nx, ny)
-            - 3D: (3, D, H, W) containing (nx, ny, nz)
-            If return_sdt is True: (normals, sdt)
-        """
-        # 1. Compute signed distance transform
-        inside_dist = distance_transform_edt(binary_mask)
-        outside_dist = distance_transform_edt(1 - binary_mask)
-        sdt = outside_dist - inside_dist
-        
-        # 2. Compute gradients using Scharr filter
-        if is_2d:
-            # For 2D: gradients along x and y
-            grad_x = scharr(sdt, axis=1)  # Gradient along x (width)
-            grad_y = scharr(sdt, axis=0)  # Gradient along y (height)
-            gradients = np.stack([grad_x, grad_y], axis=0)
-        else:
-            # For 3D: gradients along x, y, and z
-            grad_x = scharr(sdt, axis=2)  # Gradient along x (width)
-            grad_y = scharr(sdt, axis=1)  # Gradient along y (height)
-            grad_z = scharr(sdt, axis=0)  # Gradient along z (depth)
-            gradients = np.stack([grad_x, grad_y, grad_z], axis=0)
-        
-        # 3. Normalize gradients to unit vectors
-        magnitude = np.sqrt(np.sum(gradients**2, axis=0, keepdims=True))
-        magnitude = np.maximum(magnitude, epsilon)
-        normals = gradients / magnitude
-        
-        # 4. Handle undefined regions (optional)
-        # Where gradient magnitude is very small, normal direction is undefined
-        undefined_mask = magnitude < epsilon
-        normals = normals * (1 - undefined_mask)
-        
-        if return_sdt:
-            return normals.astype(np.float32), sdt.astype(np.float32)
-        else:
-            return normals.astype(np.float32)
