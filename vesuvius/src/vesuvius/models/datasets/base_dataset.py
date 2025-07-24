@@ -1097,14 +1097,10 @@ class BaseDataset(Dataset):
         Create training transforms using custom batchgeneratorsv2.
         Returns None for validation (no augmentations).
         """
-        # Check if spatial transformations are disabled
-        if getattr(self.mgr, 'no_spatial', False):
-            print("Spatial transformations disabled (no_spatial=True)")
-            return None
+        no_spatial = getattr(self.mgr, 'no_spatial', False)
             
         dimension = len(self.mgr.train_patch_size)
-        
-        # Handle both 2D and 3D patch sizes
+
         if dimension == 2:
             patch_h, patch_w = self.mgr.train_patch_size
             patch_d = None  # Not used for 2D
@@ -1112,25 +1108,46 @@ class BaseDataset(Dataset):
             patch_d, patch_h, patch_w = self.mgr.train_patch_size
         else:
             raise ValueError(f"Invalid patch size dimension: {dimension}. Expected 2 or 3.")
-        if dimension == 2:
-            if max(self.mgr.train_patch_size) / min(self.mgr.train_patch_size) > 1.5:
-                rotation_for_DA = (-15. / 360 * 2. * np.pi, 15. / 360 * 2. * np.pi)
-            else:
-                rotation_for_DA = (-180. / 360 * 2. * np.pi, 180. / 360 * 2. * np.pi)
-            mirror_axes = (0, 1)
-        elif dimension == 3:
-            rotation_for_DA = (-30. / 360 * 2. * np.pi, 30. / 360 * 2. * np.pi)
-            mirror_axes = (0, 1, 2)
 
         transforms = []
-        
-        if dimension == 2:
-            # 2D transforms (no transpose transform)
+
+        if not no_spatial:
+            # Configure rotation based on patch aspect ratio
+            if dimension == 2:
+                if max(self.mgr.train_patch_size) / min(self.mgr.train_patch_size) > 1.5:
+                    rotation_for_DA = (-15. / 360 * 2. * np.pi, 15. / 360 * 2. * np.pi)
+                else:
+                    rotation_for_DA = (-180. / 360 * 2. * np.pi, 180. / 360 * 2. * np.pi)
+                mirror_axes = (0, 1)
+            else:  # 3D
+                rotation_for_DA = (-30. / 360 * 2. * np.pi, 30. / 360 * 2. * np.pi)
+                mirror_axes = (0, 1, 2)
+
+            # Add SpatialTransform for rotations, scaling, elastic deformations
+            transforms.append(
+                SpatialTransform(
+                    self.mgr.train_patch_size,
+                    patch_center_dist_from_border=0,
+                    random_crop=False,
+                    p_elastic_deform=0.2,
+                    elastic_deform_scale=(0, 0.25),
+                    elastic_deform_magnitude=(0, 0.25),
+                    p_rotation=0.2,
+                    rotation=rotation_for_DA,
+                    p_scaling=0.2,
+                    scaling=(0.7, 1.4),
+                    p_synchronize_scaling_across_axes=1,
+                    bg_style_seg_sampling=False
+                )
+            )
             
+            # Add mirroring
             transforms.append(RandomTransform(
-                MirrorTransform(allowed_axes=(0, 1)), 
+                MirrorTransform(allowed_axes=mirror_axes),
                 apply_probability=0.5
-            )),
+            ))
+
+        if dimension == 2:
             transforms.append(RandomTransform(
                 GaussianBlurTransform(
                     blur_sigma=(0.5, 1.5),
@@ -1140,34 +1157,69 @@ class BaseDataset(Dataset):
                 ),
                 apply_probability=0.2
             ))
+            transforms.append(RandomTransform(
+                MultiplicativeBrightnessTransform(
+                    multiplier_range=BGContrast((0.75, 1.25)),
+                    synchronize_channels=False,
+                    p_per_channel=1
+                ), apply_probability=0.15
+            ))
+            transforms.append(RandomTransform(
+                ContrastTransform(
+                    contrast_range=BGContrast((0.75, 1.25)),
+                    preserve_range=True,
+                    synchronize_channels=False,
+                    p_per_channel=1
+                ), apply_probability=0.15
+            ))
+            transforms.append(RandomTransform(
+                GaussianNoiseTransform(
+                    noise_variance=(0, 0.1),
+                    p_per_channel=1,
+                    synchronize_channels=True
+                ), apply_probability=0.1
+            ))
+            transforms.append(RandomTransform(
+                GammaTransform(
+                    gamma=BGContrast((0.7, 1.5)),
+                    p_invert_image=0,
+                    synchronize_channels=False,
+                    p_per_channel=1,
+                    p_retain_stats=1
+                ), apply_probability=0.2
+            ))
+
+            rectangle_sizes_2d = tuple(
+                (max(1, size // 10), size // 3) for size in self.mgr.train_patch_size
+            )
+            transforms.append(RandomTransform(
+                BlankRectangleTransform(
+                    rectangle_size=rectangle_sizes_2d,
+                    rectangle_value=np.mean,
+                    num_rectangles=(1, 5),
+                    force_square=False,
+                    p_per_sample=0.3,
+                    p_per_channel=0.5
+                ), apply_probability=0.2
+            ))
         else:
-            # 3D transforms
-            transforms.append(
-            SpatialTransform(
-                self.mgr.train_patch_size, patch_center_dist_from_border=0, random_crop=False, p_elastic_deform=0,
-                p_rotation=0.0,
-                rotation=rotation_for_DA, p_scaling=0.0, scaling=(0.7, 1.4), p_synchronize_scaling_across_axes=1,
-                bg_style_seg_sampling=False  # , mode_seg='nearest'
-            )),
+            if not no_spatial:
+                # Only add transpose transform if all three dimensions are equal
+                if patch_d == patch_h == patch_w:
+                    transforms.append(RandomTransform(
+                        TransposeAxesTransform(allowed_axes={0, 1, 2}),
+                        apply_probability=0.5
+                    ))
+
             transforms.append(RandomTransform(
-                    MirrorTransform(allowed_axes=mirror_axes), 
-                    apply_probability=0.0
-                )),
-            transforms.append(RandomTransform(
-                    GaussianBlurTransform(
-                        blur_sigma=(0.5, 1.0),
-                        synchronize_channels=True,
-                        synchronize_axes=False,
-                        p_per_channel=1.0
-                    ),
-                    apply_probability=0.2
-                )),
-            transforms.append(RandomTransform(
-                TransposeAxesTransform(
-                    allowed_axes={0, 1, 2},
-                    ),
-                    apply_probability=0.0
-            )),
+                GaussianBlurTransform(
+                    blur_sigma=(0.5, 1.0),
+                    synchronize_channels=True,
+                    synchronize_axes=False,
+                    p_per_channel=1.0
+                ),
+                apply_probability=0.3
+            ))
             transforms.append(RandomTransform(
                 GaussianNoiseTransform(
                     noise_variance=(0, 0.1),
@@ -1188,7 +1240,7 @@ class BaseDataset(Dataset):
                     multiplier_range=BGContrast((0.75, 1.25)),
                     synchronize_channels=False,
                     p_per_channel=1
-                ), apply_probability=0.15
+                ), apply_probability=0.20
             ))
             transforms.append(RandomTransform(
                 ContrastTransform(
@@ -1226,40 +1278,34 @@ class BaseDataset(Dataset):
                     p_retain_stats=1
                 ), apply_probability=0.3
             ))
+            rectangle_sizes_3d = tuple(
+                (max(1, size // 10), size // 3) for size in self.mgr.train_patch_size
+            )
             transforms.append(RandomTransform(
                 BlankRectangleTransform(
-                    rectangle_size=((max(1, self.mgr.train_patch_size[0] // 10), self.mgr.train_patch_size[0] // 3),
-                                    (max(1, self.mgr.train_patch_size[1] // 10), self.mgr.train_patch_size[1] // 3),
-                                    (max(1, self.mgr.train_patch_size[2] // 10), self.mgr.train_patch_size[2] // 3)),
-                    rectangle_value=np.mean,  # keeping the mean value
-                    num_rectangles=(1, 5),  # same as original
-                    force_square=False,  # same as original
-                    p_per_sample=0.4,  # same as original
-                    p_per_channel=0.5  # same as original
-                ), apply_probability=0.5
+                    rectangle_size=rectangle_sizes_3d,
+                    rectangle_value=np.mean,
+                    num_rectangles=(1, 5),
+                    force_square=False,
+                    p_per_sample=0.4,
+                    p_per_channel=0.5
+                ), apply_probability=0.3
             ))
             transforms.append(RandomTransform(
                 InhomogeneousSliceIlluminationTransform(
-                    num_defects=(2, 5),  # Range for number of defects
-                    defect_width=(5, 20),  # Range for defect width
-                    mult_brightness_reduction_at_defect=(0.3, 0.7),  # Range for brightness reduction
-                    base_p=(0.2, 0.4),  # Base probability range
-                    base_red=(0.5, 0.9),  # Base reduction range
-                    p_per_sample=1.0,  # Probability per sample
-                    per_channel=True,  # Apply per channel
-                    p_per_channel=0.5  # Probability per channel
+                    num_defects=(2, 5),
+                    defect_width=(5, 20),
+                    mult_brightness_reduction_at_defect=(0.3, 0.7),
+                    base_p=(0.2, 0.4),
+                    base_red=(0.5, 0.9),
+                    p_per_sample=1.0,
+                    per_channel=True,
+                    p_per_channel=0.5
                 ), apply_probability=0.25
             ))
 
-            # Only add transpose transform if all three dimensions (z, y, x) are equal
-            if patch_d == patch_h == patch_w:
-                transforms.insert(1, RandomTransform(
-                    TransposeAxesTransform(allowed_axes={0, 1, 2}), 
-                    apply_probability=0.5
-                ))
-                print(f"Added transpose transform for 3D (equal dimensions: {patch_d}x{patch_h}x{patch_w})")
-            else:
-                print(f"Skipped transpose transform for 3D (unequal dimensions: {patch_d}x{patch_h}x{patch_w})")
+        if no_spatial:
+            print("Spatial transformations disabled (no_spatial=True)")
 
         return ComposeTransforms(transforms)
     
