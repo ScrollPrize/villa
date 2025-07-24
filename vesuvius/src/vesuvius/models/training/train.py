@@ -28,56 +28,29 @@ from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 
 from vesuvius.models.training.loss.losses import _create_loss
 from vesuvius.models.training.optimizers import create_optimizer
+from vesuvius.models.training.save_checkpoint import (
+    save_checkpoint,
+    manage_checkpoint_history,
+    manage_debug_gifs,
+    cleanup_old_configs,
+    save_final_checkpoint
+)
+
+from vesuvius.models.utilities.load_checkpoint import load_checkpoint
+from vesuvius.models.utilities.get_accelerator import get_accelerator
+from vesuvius.models.utilities.compute_gradient_norm import compute_gradient_norm
+from vesuvius.models.utilities.s3_utils import detect_s3_paths, setup_multiprocessing_for_s3
+from vesuvius.models.training.auxiliary_tasks import compute_auxiliary_loss
+from vesuvius.models.training.wandb_logging import save_train_val_filenames
+from vesuvius.models.utilities.cli_utils import update_config_from_args
+from vesuvius.models.configuration.config_utils import configure_targets
+
+
+from itertools import cycle
 from contextlib import nullcontext
-from collections import deque   
+from collections import deque
 import gc
 
-
-def _detect_s3_paths(mgr):
-    """
-    Detect if any data paths are S3 URLs.
-    
-    Parameters
-    ----------
-    mgr : ConfigManager
-        Configuration manager instance
-        
-    Returns
-    -------
-    bool
-        True if S3 paths are detected, False otherwise
-    """
-    # Check data_paths in dataset_config
-    if hasattr(mgr, 'dataset_config') and mgr.dataset_config:
-        data_paths = mgr.dataset_config.get('data_paths', [])
-        if data_paths:
-            for path in data_paths:
-                if isinstance(path, str) and path.startswith('s3://'):
-                    return True
-    
-    # Check data_path
-    if hasattr(mgr, 'data_path') and mgr.data_path:
-        if str(mgr.data_path).startswith('s3://'):
-            return True
-            
-    return False
-
-
-def _setup_multiprocessing_for_s3():
-
-    multiprocessing.set_start_method('spawn', force=True)
-    print(f"multprocessing start method is currently set to {multiprocessing.get_start_method()}")
-
-
-def compute_gradient_norm(model):
-    """Compute the L2 norm of gradients across all parameters."""
-    total_norm = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            param_norm = p.grad.data.norm(2)
-            total_norm += param_norm.item() ** 2
-    total_norm = total_norm ** 0.5
-    return total_norm
 
 
 class BaseTrainer:
@@ -99,6 +72,8 @@ class BaseTrainer:
         else:
             from vesuvius.models.configuration.config_manager import ConfigManager
             self.mgr = ConfigManager(verbose)
+
+        self.device = get_accelerator()
 
     # --- build model --- #
     def _build_model(self):
