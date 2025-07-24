@@ -37,7 +37,8 @@ jobs:
         vesuvius.train -h
     - name: Test vesuvius.predict
       run: |
-        vesuvius.predict -h 
+        vesuvius.predict -h
+    - name : Test vesuvius.blend_logits
       run: | 
         vesuvius.blend_logits -h
     - name: Test vesuvius.finalize_outputs
