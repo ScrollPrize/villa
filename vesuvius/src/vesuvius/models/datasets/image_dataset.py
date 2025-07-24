@@ -143,36 +143,7 @@ class ImageDataset(BaseDataset):
         return files
     
     def _initialize_volumes(self):
-        """
-        Initialize volumes from image files, converting to Zarr format for fast access.
-        
-        Expected directory structure:
-        
-        For multi-task scenarios:
-        data_path/
-        ├── images/
-        │   ├── image1.tif      # Single image file
-        │   ├── image2.tif      # Single image file
-        │   └── ...
-        ├── labels/
-            ├── image1_ink.tif
-            ├── image1_damage.tif
-            ├── image2_ink.tif
-            ├── image2_damage.tif
-            └── ...
-            
-        For single-task scenarios:
-        data_path/
-        ├── images/
-        │   ├── image1_ink.tif
-        │   ├── image2_ink.tif
-        │   └── ...
-        ├── labels/
-            ├── image1_ink.tif
-            ├── image2_ink.tif
-            └── ...
-
-        """
+        """Initialize volumes from image files, converting to Zarr format for fast access."""
         if not hasattr(self.mgr, 'data_path'):
             raise ValueError("ConfigManager must have 'data_path' attribute for image dataset")
         
