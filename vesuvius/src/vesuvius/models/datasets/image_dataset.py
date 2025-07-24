@@ -221,27 +221,21 @@ class ImageDataset(BaseDataset):
         configured_targets = set(self.mgr.targets.keys())
         print(f"Looking for configured targets: {configured_targets}")
 
-        print(f"DEBUG: Searching for label files in {labels_dir}")
         supported_extensions = ['.tif', '.tiff', '.png', '.jpg', '.jpeg']
         label_files = []
         for ext in supported_extensions:
-            print(f"DEBUG: Looking for files with extension {ext}")
             found_files = list(labels_dir.glob(f"*{ext}"))
-            print(f"DEBUG: Found {len(found_files)} files with extension {ext}")
             label_files.extend(found_files)
 
-        print(f"DEBUG: Total label files found: {len(label_files)}")
+        print(f"Total label files found: {len(label_files)}")
         if not label_files:
             raise ValueError(f"No image files found in {labels_dir} with supported extensions: {supported_extensions}")
 
 
         targets_data = defaultdict(lambda: defaultdict(dict))
         files_to_process = []
-        
-        print(f"DEBUG: Processing {len(label_files)} label files...")
+
         for idx, label_file in enumerate(label_files):
-            if idx % 100 == 0:
-                print(f"DEBUG: Processing label file {idx}/{len(label_files)}")
             stem = label_file.stem  # Remove image extension
 
             if '_' not in stem:
@@ -289,11 +283,8 @@ class ImageDataset(BaseDataset):
         array_info = {}  # Track which arrays go where
         arrays_to_create = []  # Track arrays that need pre-creation
         
-        print(f"DEBUG: Found {len(files_to_process)} files to process")
-        print(f"DEBUG: Building conversion tasks...")
+        print(f"Found {len(files_to_process)} files to process")
         for idx, (target, image_id, image_file, label_file) in enumerate(files_to_process):
-            if idx % 100 == 0:
-                print(f"DEBUG: Building conversion task {idx}/{len(files_to_process)}")
             # Determine array names
             if image_file.stem.endswith(f"_{target}"):
                 image_array_name = f"{image_id}_{target}"
@@ -304,16 +295,11 @@ class ImageDataset(BaseDataset):
             labels_zarr_path = self.data_path / "labels.zarr"
 
             if image_array_name not in images_group or self._needs_update(image_file, images_group, image_array_name):
-                # Read shape for pre-creation
-                print(f"DEBUG [{idx}]: Checking image file: {image_file.name}")
                 try:
                     if str(image_file).lower().endswith(('.tif', '.tiff')):
-                        print(f"DEBUG [{idx}]: Reading TIFF shape...")
                         img_shape = tifffile.imread(str(image_file)).shape
                     else:
-                        print(f"DEBUG [{idx}]: Reading non-TIFF shape...")
                         img_shape = cv2.imread(str(image_file)).shape
-                    print(f"DEBUG [{idx}]: Successfully read shape: {img_shape}")
                 except Exception as e:
                     print(f"ERROR [{idx}]: Failed to read {image_file.name}: {str(e)}")
                     raise
@@ -402,7 +388,7 @@ class ImageDataset(BaseDataset):
             raise ValueError(f"Configured targets not found in data: {missing_targets}")
 
         self.target_volumes = {}
-        
+
         self.volume_ids = {}
         
         for target, images_dict in targets_data.items():
