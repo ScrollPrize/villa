@@ -57,15 +57,6 @@ def expand_as_one_hot(input, C, ignore_index=None):
 
 
 def convert_to_numpy(*inputs):
-    """
-    Coverts input tensors to numpy ndarrays
-
-    Args:
-        inputs (iteable of torch.Tensor): torch tensor
-
-    Returns:
-        tuple of ndarrays
-    """
 
     def _to_numpy(i):
         assert isinstance(i, torch.Tensor), "Expected input to be torch.Tensor"

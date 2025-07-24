@@ -3,13 +3,8 @@ from vesuvius.models.utilities.data_format_utils import detect_data_format
 
 
 def update_config_from_args(mgr, args):
-    """
-    Update ConfigManager with command line arguments.
-    """
-    # Only set data_path if input is provided
     if args.input is not None:
         mgr.data_path = Path(args.input)
-        # Save data_path to dataset_config
         if not hasattr(mgr, 'dataset_config'):
             mgr.dataset_config = {}
         mgr.dataset_config["data_path"] = str(mgr.data_path)
@@ -25,17 +20,13 @@ def update_config_from_args(mgr, args):
             else:
                 raise ValueError("Data format could not be determined. Please specify --format.")
 
-        # Save data_format to dataset_config
         mgr.dataset_config["data_format"] = mgr.data_format
     else:
-        # When using data_paths, we don't need data_path or data_format
         print("No input directory specified - using data_paths from config")
 
-    # Set checkpoint output directory
     mgr.ckpt_out_base = Path(args.output)
     mgr.tr_info["ckpt_out_base"] = str(mgr.ckpt_out_base)
 
-    # Update optional parameters if provided
     if args.batch_size is not None:
         mgr.train_batch_size = args.batch_size
         mgr.tr_configs["batch_size"] = args.batch_size
@@ -82,14 +73,12 @@ def update_config_from_args(mgr, args):
         if mgr.verbose:
             print(f"Full epoch mode enabled - will iterate over entire train and validation datasets")
 
-    # Handle model name
     if args.model_name is not None:
         mgr.model_name = args.model_name
         mgr.tr_info["model_name"] = args.model_name
         if mgr.verbose:
             print(f"Set model name: {mgr.model_name}")
 
-    # Handle nonlinearity/activation function
     if args.nonlin is not None:
         if not hasattr(mgr, 'model_config') or mgr.model_config is None:
             mgr.model_config = {}
@@ -97,7 +86,6 @@ def update_config_from_args(mgr, args):
         if mgr.verbose:
             print(f"Set activation function: {args.nonlin}")
 
-    # Handle squeeze and excitation
     if args.se:
         if not hasattr(mgr, 'model_config') or mgr.model_config is None:
             mgr.model_config = {}
@@ -106,7 +94,6 @@ def update_config_from_args(mgr, args):
         if mgr.verbose:
             print(f"Enabled squeeze and excitation with reduction ratio: {args.se_reduction_ratio}")
 
-    # Handle pool_type
     if args.pool_type is not None:
         if not hasattr(mgr, 'model_config') or mgr.model_config is None:
             mgr.model_config = {}
@@ -118,19 +105,15 @@ def update_config_from_args(mgr, args):
             else:
                 print(f"Set pooling type: {args.pool_type}")
 
-    # Handle optimizer selection
     if args.optimizer is not None:
         mgr.optimizer = args.optimizer
         mgr.tr_configs["optimizer"] = args.optimizer
         if mgr.verbose:
             print(f"Set optimizer: {mgr.optimizer}")
 
-    # Handle loss functions
     if args.loss is not None:
         import ast
-        # Import here to avoid circular dependency
         from vesuvius.models.configuration.config_utils import configure_targets
-        # parse loss list
         try:
             loss_list = ast.literal_eval(args.loss)
             loss_list = loss_list if isinstance(loss_list, list) else [loss_list]
@@ -138,15 +121,13 @@ def update_config_from_args(mgr, args):
             loss_list = [s.strip() for s in args.loss.split(',')]
         configure_targets(mgr, loss_list)
 
-    # Handle no_spatial flag
     if args.no_spatial:
         mgr.no_spatial = True
         if hasattr(mgr, 'dataset_config'):
             mgr.dataset_config['no_spatial'] = True
         if mgr.verbose:
             print(f"Disabled spatial transformations (--no-spatial flag set)")
-    
-    # Handle skip_intensity_sampling flag
+
     if args.skip_intensity_sampling:
         mgr.skip_intensity_sampling = True
         if hasattr(mgr, 'dataset_config'):
@@ -154,26 +135,22 @@ def update_config_from_args(mgr, args):
         if mgr.verbose:
             print(f"Skipping intensity sampling (--skip-intensity-sampling flag set)")
 
-    # Handle gradient clipping
     if args.grad_clip is not None:
         mgr.gradient_clip = args.grad_clip
         mgr.tr_configs["gradient_clip"] = args.grad_clip
         if mgr.verbose:
             print(f"Set gradient clipping: {mgr.gradient_clip}")
 
-    # Handle scheduler selection
     if args.scheduler is not None:
         mgr.scheduler = args.scheduler
         mgr.tr_configs["scheduler"] = args.scheduler
         if mgr.verbose:
             print(f"Set learning rate scheduler: {mgr.scheduler}")
 
-        # If using cosine_warmup, handle its specific parameters
         if args.scheduler == "cosine_warmup":
             if not hasattr(mgr, 'scheduler_kwargs'):
                 mgr.scheduler_kwargs = {}
 
-            # Set warmup steps if provided
             if args.warmup_steps is not None:
                 mgr.scheduler_kwargs["warmup_steps"] = args.warmup_steps
                 # Save scheduler_kwargs to tr_configs
@@ -181,14 +158,12 @@ def update_config_from_args(mgr, args):
                 if mgr.verbose:
                     print(f"Set warmup steps: {args.warmup_steps}")
 
-    # Handle no_amp flag
     if args.no_amp:
         mgr.no_amp = True
         mgr.tr_configs["no_amp"] = True
         if mgr.verbose:
             print(f"Disabled Automatic Mixed Precision (AMP)")
 
-    # Handle early stopping patience
     if hasattr(args, 'early_stopping_patience') and args.early_stopping_patience is not None:
         mgr.early_stopping_patience = args.early_stopping_patience
         mgr.tr_configs["early_stopping_patience"] = args.early_stopping_patience
@@ -198,6 +173,5 @@ def update_config_from_args(mgr, args):
             else:
                 print(f"Set early stopping patience: {args.early_stopping_patience} epochs")
 
-    # Handle Weights & Biases arguments
     mgr.wandb_project = args.wandb_project
     mgr.wandb_entity = args.wandb_entity
