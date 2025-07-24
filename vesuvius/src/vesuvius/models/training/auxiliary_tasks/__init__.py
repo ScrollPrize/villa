@@ -22,15 +22,3 @@ from .aux_surface_normals import (
     create_surface_normals_config,
     compute_surface_normals_from_sdt
 )
-
-__all__ = [
-    'create_auxiliary_task',
-    'compute_auxiliary_loss',
-    'preserve_auxiliary_targets',
-    'restore_auxiliary_targets',
-    'apply_auxiliary_tasks_from_config',
-    'create_distance_transform_config',
-    'compute_distance_transform',
-    'create_surface_normals_config',
-    'compute_surface_normals_from_sdt'
-]

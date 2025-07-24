@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from vesuvius.utils.utils import determine_dimensionality
+from vesuvius.models.training.auxiliary_tasks import create_auxiliary_task
 
 
 Image.MAX_IMAGE_PIXELS = None
@@ -319,8 +320,6 @@ class ConfigManager:
         """
         if not self.auxiliary_tasks:
             return
-
-        from models.training.auxiliary_tasks import create_auxiliary_task
 
         for aux_task_name, aux_config in self.auxiliary_tasks.items():
             task_type = aux_config["type"]
