@@ -15,40 +15,21 @@ def convert_image_to_zarr_worker(args):
     """
     Worker function to convert a single image file to a Zarr array.
     This function is defined at module level to be picklable for multiprocessing.
-    
-    Parameters
-    ----------
-    args : tuple
-        (image_path, zarr_group_path, array_name, patch_size, pre_created)
-        
-    Returns
-    -------
-    tuple
-        (array_name, shape, success, error_msg)
     """
     image_path, zarr_group_path, array_name, patch_size, pre_created = args
     
     try:
-        # Read the image file
         if str(image_path).lower().endswith(('.tif', '.tiff')):
-            # Use tifffile for TIFF files to handle 3D data
             img = tifffile.imread(str(image_path))
         else:
-            # Use cv2 for other image formats (2D only)
             img = cv2.imread(str(image_path))
-        
-        # Convert to uint8 with proper scaling based on dtype
+
         img = convert_to_uint8_dtype_range(img)
-        
-        # Open the Zarr group
         group = zarr.open_group(str(zarr_group_path), mode='r+')
         
         if pre_created:
-            # Array already exists, just write the data
             group[array_name][:] = img
         else:
-            # Create the array (fallback for single-threaded mode)
-            # Use patch size directly as chunks
             if len(img.shape) == 2:  # 2D
                 chunks = tuple(patch_size[:2])  # [h, w]
             else:  # 3D
@@ -128,8 +109,7 @@ class ImageDataset(BaseDataset):
         images_zarr_path = self.data_path / "images.zarr"
         labels_zarr_path = self.data_path / "labels.zarr"
         masks_zarr_path = self.data_path / "masks.zarr"
-        
-        # Open or create the groups
+
         images_group = zarr.open_group(str(images_zarr_path), mode='a')
         labels_group = zarr.open_group(str(labels_zarr_path), mode='a')
         masks_group = zarr.open_group(str(masks_zarr_path), mode='a')
@@ -159,7 +139,6 @@ class ImageDataset(BaseDataset):
             # Use tifffile for TIFF files to handle 3D data
             img = tifffile.imread(str(image_path))
         else:
-            # Use cv2 for other image formats (2D only)
             img = cv2.imread(str(image_path))
         
         # Convert to uint8 with proper scaling based on dtype
@@ -204,11 +183,8 @@ class ImageDataset(BaseDataset):
         """
         if array_name not in zarr_group:
             return True
-        
-        # Check modification times
+
         image_mtime = os.path.getmtime(image_file)
-        
-        # For groups, check the array metadata file modification time
         group_store_path = Path(zarr_group.store.path)
         if group_store_path.exists():
             array_meta_path = group_store_path / array_name / ".zarray"
@@ -307,8 +283,7 @@ class ImageDataset(BaseDataset):
         images_dir = self.data_path / "images"
         labels_dir = self.data_path / "labels"
         masks_dir = self.data_path / "masks"
-        
-        # Check required directories exist
+
         if not images_dir.exists():
             raise ValueError(f"Images directory does not exist: {images_dir}")
         if not labels_dir.exists():
