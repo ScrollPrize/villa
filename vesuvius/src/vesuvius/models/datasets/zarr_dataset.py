@@ -19,10 +19,6 @@ class ZarrDataset(BaseDataset):
         │   ├── image2_ink.zarr/
         │   └── ...
         ├── labels/
-        │   ├── image1_ink.zarr/
-        │   ├── image2_ink.zarr/
-        │   └── ...
-        └── masks/
             ├── image1_ink.zarr/
             ├── image2_ink.zarr/
             └── ...
@@ -36,7 +32,6 @@ class ZarrDataset(BaseDataset):
         
         images_dir = data_path / "images"
         labels_dir = data_path / "labels"
-        masks_dir = data_path / "masks"
         
         # Check required directories exist
         if not images_dir.exists():
@@ -79,8 +74,6 @@ class ZarrDataset(BaseDataset):
                 if not image_dir.exists():
                     raise ValueError(f"Image directory not found for {image_id} (tried {image_id}.zarr and {image_id}_{target}.zarr)")
 
-            mask_dir = masks_dir / f"{image_id}_{target}.zarr"
-
             try:
                 # Resolve symlinks if needed
                 resolved_image_path = Path(image_dir).resolve()
@@ -108,22 +101,6 @@ class ZarrDataset(BaseDataset):
                     'data': data_array,
                     'label': label_array
                 }
-
-                if mask_dir.exists():
-                    resolved_mask_path = Path(mask_dir).resolve()
-
-                    if _is_ome_zarr(resolved_mask_path):
-                        root = zarr.open_group(str(resolved_mask_path), mode='r')
-                        if '0' in root:
-                            mask_array = root['0']
-                        else:
-                            mask_array = zarr.open(str(resolved_mask_path), mode='r')
-                    else:
-                        mask_array = zarr.open(str(resolved_mask_path), mode='r')
-                    data_dict['mask'] = mask_array
-                    print(f"Found mask for {image_id}_{target}")
-                else:
-                    print(f"No mask directory found for {image_id}_{target}, will use no mask")
                 
                 targets_data[target][image_id] = data_dict
 
