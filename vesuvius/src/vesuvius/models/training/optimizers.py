@@ -4,13 +4,10 @@ from torch import optim
 
 def create_optimizer(optimizer_config, model):
     optim_name = optimizer_config.get('name', 'Adam')
-    # common optimizer settings
     learning_rate = optimizer_config.get('learning_rate', 1e-3)
     weight_decay = optimizer_config.get('weight_decay', 0)
     optim_name = optim_name.lower()
 
-    # grab optimizer specific settings and init
-    # optimizer
     if optim_name == 'adadelta':
         rho = optimizer_config.get('rho', 0.9)
         optimizer = optim.Adadelta(model.parameters(), lr=learning_rate, rho=rho,
