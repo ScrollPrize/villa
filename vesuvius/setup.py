@@ -95,7 +95,6 @@ setup(
             "vesuvius.inference_pipeline=vesuvius.models.run.vesuvius_pipeline:run_pipeline",
             "vesuvius.compute_st=vesuvius.structure_tensor.run_create_st:main",
             "vesuvius.napari_trainer=vesuvius.utils.napari_trainer.main_window:main",
-            "vesuvius.proofreader=vesuvius.utils.vc_proofreader.main:main",
             "vesuvius.voxelize_obj=vesuvius.scripts.voxelize_objs:main",
             "vesuvius.refine_labels=vesuvius.scripts.edt_frangi_label:main",
             "vesuvius.render_obj=vesuvius.rendering.mesh_to_surface:main",
