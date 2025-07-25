@@ -1,24 +1,36 @@
 # config.py
-
-scroll = "1451"
 config = {
-    # Zarr paths can be local file system paths or HTTP URLs.
-    "image_zarr": "/mnt/raid_nvme/volpkgs/PHerc1451.volpkg/volumes/4.320um_1.0m_116keV_binmean_2_PHerc1451.zarr",  # Replace with your image zarr path
-    "label_zarr": "/mnt/raid_nvme/volpkgs/PHerc1451.volpkg/volumes/1451_nnunetpredictor_059_ome.zarr",    # Replace with your label zarr path
-
-    #/mnt/raid_nvme/ced_volumes/s1_paths_vx_ced_raw_ome.zarr
-
-    # Output directory where subfolders "imagesTr" and "labelsTr" will be created.
-    "dataset_out_path": f"/mnt/raid_nvme/new_train_labels/{scroll}/",
-
-    # Patch extraction settings (patch_size is specified in display resolution units).
-    "patch_size": 256,
-    "sampling": "sequence",  # Options: "sequence" or "random"
-
-    # Progress saving options.
-    "save_progress": True,                                    # Set to True to enable saving progress.
-    "progress_file": f"/mnt/raid_nvme/esrf_labels/{scroll}/progress.json",                # Path to the file where progress is saved.
-    
-    # Output zarr for approved labels
-    "output_label_zarr": f"/mnt/raid_nvme/esrf_labels/{scroll}/labels.zarr",      # Path for the output label zarr (binary uint8)
+    'PHerc172': {
+        'volume_path' : 'https://volumes.aws.ash2txt.org/dls/PHerc0172-20241024131838-53keV-7.91um_masked.zarr/',
+        'label_path'  : 'https://volumes.aws.ash2txt.org/volpkgs/PHerc0172.volpkg/volumes/s5_090_nnunetpredictor_ome.zarr/',
+        'energy'      : '53',
+        'resolution'  : '7.91'
+    },
+    'PHerc1447': {
+        'volume_path' : 'https://volumes.aws.ash2txt.org/volpkgs/PHerc1447.volpkg/volumes/4.320um_1.0m_116keV_binmean_2_PHerc1447.zarr/',
+        'label_path'  : 'https://volumes.aws.ash2txt.org/volpkgs/PHerc1447.volpkg/volumes/1447_nnunetpredictor_059_ome.zarr/',
+        'energy'      : '116',
+        'resolution'  : '8.64'
+    },
+    'PHerc0175A': {
+        'volume_path' : 'https://volumes.aws.ash2txt.org/volpkgs/PHerc0175A.volpkg/volumes/4.320um_1.0m_116keV_binmean_2_PHerc0175A.zarr/',
+        'label_path'  : 'https://volumes.aws.ash2txt.org/volpkgs/PHerc0175A.volpkg/volumes/4.32bin_116_1m_PHerc0175A_059_ome.zarr/',
+        'energy'      : '116',
+        'resolution'  : '8.64'
+    },
+    'PHerc0343': {
+        'volume_path' : 'https://volumes.aws.ash2txt.org/volpkgs/PHerc0343.volpkg/volumes/4.320um_1.0m_116keV_binmean_2_PHerc0343.zarr/',
+        'label_path'  : 'https://volumes.aws.ash2txt.org/volpkgs/PHerc0343.volpkg/343_binary_vespipeline_ome.zarr/',
+        'energy'      : '116',
+        'resolution'  : '8.64'
+    },
+    'PHerc0800': {
+        'volume_path' : 'https://volumes.aws.ash2txt.org/volpkgs/PHerc0800.volpkg/volumes/4.320um_1.0m_116keV_binmean_2_PHerc0800.zarr/',
+        'label_path'  : 'https://volumes.aws.ash2txt.org/volpkgs/PHerc0800.volpkg/volumes/0800_nnunetpredictor_059_ome.zarr/',
+        'energy'      : '116',
+        'resolution'  : '8.64'
+    }
 }
+
+
+
