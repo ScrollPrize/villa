@@ -5,15 +5,15 @@ import napari
 import zarr
 import tifffile
 from magicgui import magicgui
-from skimage.filters import threshold_otsu
-from skimage.morphology import binary_erosion, binary_dilation, binary_opening, binary_closing, disk, ball
-from skimage.measure import label, regionprops
 
 # Try to import config defaults; if not found, use empty defaults.
 try:
     from .config import config
 except ImportError:
-    config = {}
+    try:
+        from config import config
+    except ImportError:
+        config = {}
 
 state = {
     # Volumes (using highest resolution only)
@@ -34,13 +34,6 @@ state = {
     'output_label_zarr': None,  # Path to output zarr for labels
     'output_zarr_array': None,  # Zarr array object for appending labels
     'output_zarr_index': 0,  # Current index in the output zarr
-    # Threshold management
-    'original_label_patch': None,  # Store the original label patch before thresholding
-    'threshold_value': 115,  # Default threshold value
-    'use_otsu': False,  # Whether to use Otsu thresholding
-    'label_min': 0,  # Min value in current label patch
-    'label_max': 255,  # Max value in current label patch
-    'min_component_size': 100  # Minimum component size for filtering
 }
 
 
@@ -109,224 +102,6 @@ def extract_patch(volume, coord, patch_size):
             raise
 
 
-def filter_small_components(binary_patch, min_size=30):
-    """
-    Filter out small connected components from a binary patch.
-    Works layer by layer for 3D data.
-    
-    Args:
-        binary_patch: Binary image (0 or 1)
-        min_size: Minimum component size to keep
-    
-    Returns:
-        Filtered binary patch
-    """
-    if binary_patch is None or min_size <= 0:
-        return binary_patch
-    
-    result = np.zeros_like(binary_patch, dtype=np.uint8)
-    
-    if binary_patch.ndim == 2:
-        # 2D case: process the single layer
-        labeled = label(binary_patch)
-        for region in regionprops(labeled):
-            if region.area >= min_size:
-                result[labeled == region.label] = 1
-    elif binary_patch.ndim == 3:
-        # 3D case: process layer by layer
-        for z in range(binary_patch.shape[0]):
-            labeled = label(binary_patch[z])
-            for region in regionprops(labeled):
-                if region.area >= min_size:
-                    result[z][labeled == region.label] = 1
-    
-    return result
-
-
-def apply_threshold(original_patch, threshold_value=None, use_otsu=False, min_component_size=0):
-    """
-    Apply threshold to the original label patch and optionally filter small components.
-    
-    Args:
-        original_patch: The original label patch with raw values
-        threshold_value: Manual threshold value (ignored if use_otsu is True)
-        use_otsu: Whether to use Otsu thresholding
-        min_component_size: Minimum component size to keep (0 = no filtering)
-    
-    Returns:
-        Binary patch (uint8) with values 0 or 1
-    """
-    if original_patch is None:
-        return None
-    
-    if use_otsu:
-        # Calculate Otsu threshold
-        try:
-            threshold = threshold_otsu(original_patch)
-        except ValueError:
-            # If all values are the same, Otsu fails
-            threshold = threshold_value if threshold_value is not None else 1
-    else:
-        threshold = threshold_value if threshold_value is not None else 1
-    
-    # Apply threshold
-    binary_patch = (original_patch >= threshold).astype(np.uint8)
-    
-    # Apply morphological opening with kernel size 1 right after threshold
-    binary_patch = apply_morphology(binary_patch, 'opening', 1, kernel_size=1)
-    
-    # Apply component filtering if requested
-    if min_component_size > 0:
-        binary_patch = filter_small_components(binary_patch, min_component_size)
-    
-    return binary_patch
-
-
-def update_label_layer():
-    """
-    Update the label layer in napari based on current threshold settings.
-    This is called when the threshold slider or Otsu checkbox changes.
-    """
-    global state, viewer
-    
-    if state.get('original_label_patch') is None:
-        return
-    
-    # Apply threshold to get binary patch with component filtering
-    binary_patch = apply_threshold(
-        state['original_label_patch'],
-        state.get('threshold_value', 1),
-        state.get('use_otsu', False),
-        state.get('min_component_size', 0)
-    )
-    
-    # Update the napari layer
-    if "patch_label" in viewer.layers:
-        viewer.layers["patch_label"].data = binary_patch
-    else:
-        viewer.add_labels(binary_patch, name="patch_label")
-
-
-def apply_morphology(binary_patch, operation, iterations, kernel_size=1):
-    """
-    Apply morphological operations to a binary patch.
-    
-    Args:
-        binary_patch: Binary image (0 or 1)
-        operation: Type of operation ('erosion', 'dilation', 'opening', 'closing')
-        iterations: Number of iterations to apply
-        kernel_size: Size of the structuring element (radius for ball/disk)
-    
-    Returns:
-        Processed binary patch
-    """
-    if binary_patch is None or operation == 'none':
-        return binary_patch
-    
-    # Determine if 2D or 3D
-    is_3d = binary_patch.ndim == 3
-    
-    # Create structuring element
-    if is_3d:
-        selem = ball(kernel_size)  # 3D ball with specified radius
-    else:
-        selem = disk(kernel_size)  # 2D disk with specified radius
-    
-    # Apply operation
-    result = binary_patch.copy()
-    for _ in range(iterations):
-        if operation == 'erosion':
-            result = binary_erosion(result, selem)
-        elif operation == 'dilation':
-            result = binary_dilation(result, selem)
-        elif operation == 'opening':
-            result = binary_opening(result, selem)
-        elif operation == 'closing':
-            result = binary_closing(result, selem)
-    
-    return result.astype(np.uint8)
-
-
-# Create the threshold control widget
-threshold_control = None
-
-@magicgui(
-    threshold_value={"widget_type": "SpinBox", "min": 0, "max": 255, "value": 115},
-    use_otsu={"widget_type": "CheckBox", "value": False},
-    min_component_size={"widget_type": "SpinBox", "min": 0, "max": 1000, "value": 100},
-    auto_call=True
-)
-def threshold_control(threshold_value: int = 115, use_otsu: bool = False, min_component_size: int = 30):
-    """
-    Control threshold for binarizing labels and filter small components.
-    
-    Args:
-        threshold_value: Manual threshold value (0-255)
-        use_otsu: Use Otsu's method for automatic thresholding
-        min_component_size: Minimum component size to keep (0 = no filtering)
-    """
-    global state
-    
-    # Update state
-    state['threshold_value'] = threshold_value
-    state['use_otsu'] = use_otsu
-    state['min_component_size'] = min_component_size
-    
-    # Update the label layer
-    update_label_layer()
-    
-    # Update slider enable/disable based on Otsu checkbox
-    threshold_control.threshold_value.enabled = not use_otsu
-    
-    # If using Otsu, calculate and display the threshold value
-    if use_otsu and state.get('original_label_patch') is not None:
-        try:
-            otsu_val = threshold_otsu(state['original_label_patch'])
-            print(f"Otsu threshold: {otsu_val:.2f}")
-        except ValueError:
-            print("Otsu threshold calculation failed (uniform image)")
-
-
-# Create the morphology control widget
-morphology_control = None
-
-@magicgui(
-    operation={"choices": ["none", "erosion", "dilation", "opening", "closing"], "value": "none"},
-    iterations={"widget_type": "SpinBox", "min": 1, "max": 10, "value": 1},
-    kernel_size={"widget_type": "SpinBox", "min": 1, "max": 10, "value": 1},
-    call_button="Apply",
-    auto_call=False
-)
-def morphology_control(operation: str = "none", iterations: int = 1, kernel_size: int = 1):
-    """
-    Apply morphological operations to the current label layer in napari.
-    
-    Args:
-        operation: Type of morphological operation
-        iterations: Number of iterations to apply
-        kernel_size: Size of the structuring element (radius for ball/disk)
-    """
-    global viewer
-    
-    # Check if we have a label layer
-    if "patch_label" not in viewer.layers:
-        print("No label layer found in napari.")
-        return
-    
-    if operation == "none":
-        print("No operation selected.")
-        return
-    
-    # Get current label data from napari
-    current_label = viewer.layers["patch_label"].data
-    
-    # Apply morphological operation
-    processed_label = apply_morphology(current_label, operation, iterations, kernel_size)
-    
-    # Update the napari layer with the processed result
-    viewer.layers["patch_label"].data = processed_label
-    
-    print(f"Applied {operation} with {iterations} iteration(s) and kernel size {kernel_size}.")
 
 
 def update_progress():
@@ -343,8 +118,9 @@ def update_progress():
             export_data = {
                 "metadata": {
                     "patch_size": state.get('patch_size'),
-                    "image_zarr": init_volume.image_zarr.value if hasattr(init_volume, 'image_zarr') else '',
-                    "label_zarr": init_volume.label_zarr.value if hasattr(init_volume, 'label_zarr') else '',
+                    "volume_selection": init_volume.volume_selection.value if hasattr(init_volume, 'volume_selection') else '',
+                    "image_zarr": state.get('image_zarr', ''),
+                    "label_zarr": state.get('label_zarr', ''),
                     "volume_shape": list(state['image_volume'].shape) if state.get('image_volume') is not None else None,
                     "coordinate_system": "highest_resolution",
                     "export_timestamp": __import__('datetime').datetime.now().isoformat(),
@@ -434,25 +210,8 @@ def load_next_patch():
         percentage = (nonzero / total * 100) if total > 0 else 0
 
         if percentage >= min_label_percentage:
-            # Store the original label patch
-            state['original_label_patch'] = label_patch.copy()
-            
-            # Update min/max for threshold slider
-            if label_patch.size > 0:
-                state['label_min'] = int(np.min(label_patch))
-                state['label_max'] = int(np.max(label_patch))
-                # Update threshold slider range
-                if 'threshold_control' in globals() and threshold_control is not None:
-                    threshold_control.threshold_value.min = state['label_min']
-                    threshold_control.threshold_value.max = state['label_max']
-            
-            # Apply threshold using current settings with component filtering
-            binary_patch = apply_threshold(
-                label_patch,
-                state.get('threshold_value', 1),
-                state.get('use_otsu', False),
-                state.get('min_component_size', 0)
-            )
+            # Convert label patch to binary (any non-zero value becomes 1)
+            binary_patch = (label_patch > 0).astype(np.uint8)
             
             # Record this patch as pending (waiting for the user decision)
             entry = {"index": idx, "coords": coord, "percentage": percentage, "status": "pending"}
@@ -473,7 +232,6 @@ def load_next_patch():
             else:
                 viewer.add_labels(binary_patch, name="patch_label")
             print(f"Loaded patch at {coord} with {percentage:.2f}% labeled (threshold: {min_label_percentage}%).")
-            print(f"Label range: [{state['label_min']}, {state['label_max']}]")
             return
         else:
             # Record an auto-skipped patch
@@ -548,13 +306,14 @@ def save_current_patch():
 
 
 @magicgui(
+    volume_selection={"choices": list(config.keys()) if config else ["No volumes available"]},
     sampling={"choices": ["random", "sequence"]},
     min_label_percentage={"min": 0, "max": 100},
     min_z={"widget_type": "SpinBox", "min": 0, "max": 999999},
+    call_button="Initialize Volumes"
 )
 def init_volume(
-        image_zarr: str = config.get("image_zarr", ""),
-        label_zarr: str = config.get("label_zarr", ""),
+        volume_selection: str = list(config.keys())[0] if config else "",
         dataset_out_path: str = config.get("dataset_out_path", ""),
         output_label_zarr: str = config.get("output_label_zarr", ""),
         patch_size: int = config.get("patch_size", 64),
@@ -569,6 +328,20 @@ def init_volume(
     """
     global state, viewer
 
+    # Get the selected volume configuration
+    if not config or volume_selection not in config:
+        print(f"Error: Volume '{volume_selection}' not found in config.")
+        return
+    
+    selected_config = config[volume_selection]
+    image_zarr = selected_config['volume_path']
+    label_zarr = selected_config['label_path']
+    energy = selected_config.get('energy', 'Unknown')
+    resolution = selected_config.get('resolution', 'Unknown')
+    
+    print(f"Selected: {volume_selection}")
+    print(f"  Energy: {energy} keV")
+    print(f"  Resolution: {resolution} μm")
 
     # Try to open as array first (for zarrs with array at root)
     image_volume = zarr.open(image_zarr, mode='r')
@@ -584,6 +357,8 @@ def init_volume(
     # Save the loaded volumes.
     state['image_volume'] = image_volume
     state['label_volume'] = label_volume
+    state['image_zarr'] = image_zarr
+    state['label_zarr'] = label_zarr
     state['dataset_out_path'] = dataset_out_path
     state['patch_size'] = patch_size
 
@@ -723,25 +498,8 @@ def prev_pair():
     image_patch = extract_patch(state['image_volume'], coord, patch_size)
     label_patch = extract_patch(state['label_volume'], coord, patch_size)
     
-    # Store the original label patch
-    state['original_label_patch'] = label_patch.copy()
-    
-    # Update min/max for threshold slider
-    if label_patch.size > 0:
-        state['label_min'] = int(np.min(label_patch))
-        state['label_max'] = int(np.max(label_patch))
-        # Update threshold slider range
-        if 'threshold_control' in globals() and threshold_control is not None:
-            threshold_control.threshold_value.min = state['label_min']
-            threshold_control.threshold_value.max = state['label_max']
-    
-    # Apply threshold using current settings with component filtering
-    binary_patch = apply_threshold(
-        label_patch,
-        state.get('threshold_value', 1),
-        state.get('use_otsu', False),
-        state.get('min_component_size', 0)
-    )
+    # Convert label patch to binary
+    binary_patch = (label_patch > 0).astype(np.uint8)
     
     state['current_patch'] = {"coords": coord, "image": image_patch, "label": binary_patch, "index": entry['index']}
 
@@ -756,36 +514,8 @@ def prev_pair():
         viewer.add_labels(binary_patch, name="patch_label")
     update_progress()
     print(f"Reverted to patch at {coord}.")
-    print(f"Label range: [{state['label_min']}, {state['label_max']}]")
 
 
-# Create the reset label button
-@magicgui(call_button="Reset Label")
-def reset_label():
-    """
-    Reset the label layer to the original patch with current threshold settings.
-    This discards all manual edits and morphological operations.
-    """
-    global state, viewer
-    
-    if state.get('original_label_patch') is None:
-        print("No original label patch available.")
-        return
-    
-    # Apply threshold to get binary patch from original with component filtering
-    binary_patch = apply_threshold(
-        state['original_label_patch'],
-        state.get('threshold_value', 1),
-        state.get('use_otsu', False),
-        state.get('min_component_size', 0)
-    )
-    
-    # Update the napari layer
-    if "patch_label" in viewer.layers:
-        viewer.layers["patch_label"].data = binary_patch
-        print("Label reset to original with current threshold settings.")
-    else:
-        print("No label layer found in napari.")
 
 
 # Create the jump control widget
@@ -856,9 +586,6 @@ def main():
     viewer = napari.Viewer()
     viewer.window.add_dock_widget(init_volume, name="Initialize Volumes", area="right")
     viewer.window.add_dock_widget(prev_pair, name="Previous Patch", area="right")
-    viewer.window.add_dock_widget(threshold_control, name="Threshold Control", area="right")
-    viewer.window.add_dock_widget(morphology_control, name="Morphology Operations", area="right")
-    viewer.window.add_dock_widget(reset_label, name="Reset Label", area="right")
     viewer.window.add_dock_widget(jump_control, name="Jump Control", area="right")
     viewer.window.add_dock_widget(iter_pair, name="Iterate Patches", area="right")
 
