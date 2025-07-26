@@ -16,6 +16,8 @@ auxiliary_tasks:
   distance_transform:
     type: distance_transform
     source_target: hz
-    loss_fn: "MSELoss"
-    loss_weight: 1.0
+    losses:
+      - name: "MSELoss"
+        weight: 1.0
+        kwargs: {}
     out_channels: 1
