@@ -1,10 +1,12 @@
 import os
 import json
+import glob
 import numpy as np
 import napari
 import zarr
 import tifffile
 from magicgui import magicgui
+from datetime import datetime
 
 # Try to import config defaults; if not found, use empty defaults.
 try:
@@ -32,8 +34,7 @@ state = {
     # New progress log: a list of dicts recording every patch processed.
     'progress_log': [],  # Each entry: { "index": int, "coords": tuple, "percentage": float, "status": str }
     'output_label_zarr': None,  # Path to output zarr for labels
-    'output_zarr_array': None,  # Zarr array object for appending labels
-    'output_zarr_index': 0,  # Current index in the output zarr
+    'output_zarr_array': None,  # Zarr array object for writing labels
 }
 
 
@@ -102,8 +103,6 @@ def extract_patch(volume, coord, patch_size):
             raise
 
 
-
-
 def update_progress():
     """
     Write the progress log to a JSON file if progress saving is enabled.
@@ -123,8 +122,12 @@ def update_progress():
                     "label_zarr": state.get('label_zarr', ''),
                     "volume_shape": list(state['image_volume'].shape) if state.get('image_volume') is not None else None,
                     "coordinate_system": "highest_resolution",
-                    "export_timestamp": __import__('datetime').datetime.now().isoformat(),
-                    "total_approved": len(approved_patches)
+                    "export_timestamp": datetime.now().isoformat(),
+                    "session_start_timestamp": state.get('session_start_timestamp', ''),
+                    "total_approved": len(approved_patches),
+                    "dataset_out_path": state.get('dataset_out_path', ''),
+                    "images_out_dir": state.get('images_out_dir', ''),
+                    "labels_out_dir": state.get('labels_out_dir', '')
                 },
                 "approved_patches": [],
                 "progress_log": state['progress_log']  # Keep original progress log for compatibility
@@ -132,11 +135,24 @@ def update_progress():
             
             # Add approved patch information in zarr_dataset format
             for entry in approved_patches:
+                # Generate filenames based on coordinates
+                coord = entry['coords']
+                if len(coord) == 3:
+                    coord_str = f"z{coord[0]}_y{coord[1]}_x{coord[2]}"
+                elif len(coord) == 2:
+                    coord_str = f"y{coord[0]}_x{coord[1]}"
+                else:
+                    coord_str = "_".join(str(c) for c in coord)
+                
                 patch_info = {
                     "volume_index": 0,  # Single volume for now
                     "coords": list(entry['coords']),
                     "percentage": entry['percentage'],
-                    "index": entry['index']
+                    "index": entry['index'],
+                    "date_processed": entry.get('date_processed', ''),
+                    "image_filename": f"{coord_str}_0000.tif",
+                    "label_filename": f"{coord_str}.tif",
+                    "patch_size": state.get('patch_size')
                 }
                 export_data["approved_patches"].append(patch_info)
             
@@ -160,7 +176,12 @@ def load_progress():
                 state['progress_log'] = data.get("progress_log", [])
                 # This value will be overridden later if a new patch grid is computed.
                 state['current_index'] = len(state['progress_log'])
-                print(f"Loaded progress file with {len(state['progress_log'])} entries.")
+                
+                # Count approved patches
+                approved_count = len([e for e in state['progress_log'] if e.get('status') == 'approved'])
+                print(f"Loaded progress file: {state['progress_file']}")
+                print(f"  Total entries: {len(state['progress_log'])}")
+                print(f"  Approved patches: {approved_count}")
             except Exception as e:
                 print("Error loading progress:", e)
 
@@ -214,7 +235,13 @@ def load_next_patch():
             binary_patch = (label_patch > 0).astype(np.uint8)
             
             # Record this patch as pending (waiting for the user decision)
-            entry = {"index": idx, "coords": coord, "percentage": percentage, "status": "pending"}
+            entry = {
+                "index": idx, 
+                "coords": coord, 
+                "percentage": percentage, 
+                "status": "pending",
+                "date_processed": datetime.now().isoformat()
+            }
             state['progress_log'].append(entry)
             state['current_patch'] = {
                 'coords': coord,
@@ -235,7 +262,13 @@ def load_next_patch():
             return
         else:
             # Record an auto-skipped patch
-            entry = {"index": idx, "coords": coord, "percentage": percentage, "status": "auto-skipped"}
+            entry = {
+                "index": idx, 
+                "coords": coord, 
+                "percentage": percentage, 
+                "status": "auto-skipped",
+                "date_processed": datetime.now().isoformat()
+            }
             state['progress_log'].append(entry)
             print(f"Skipping patch at {coord} ({percentage:.2f}% labeled, below threshold of {min_label_percentage}%).")
     print("No more patches available.")
@@ -292,21 +325,19 @@ def save_current_patch():
     # Save to output zarr if configured
     if state.get('output_zarr_array') is not None:
         try:
-            # Resize the zarr array to accommodate the new patch
-            new_shape = (state['output_zarr_index'] + 1,) + state['output_zarr_array'].shape[1:]
-            state['output_zarr_array'].resize(new_shape)
+            # Write the label patch to the correct location in the full volume
+            slices = tuple(slice(c, c + patch_size) for c in coord)
+            state['output_zarr_array'][slices] = label_patch
             
-            # Write the label patch to the zarr
-            state['output_zarr_array'][state['output_zarr_index']] = label_patch
-            state['output_zarr_index'] += 1
-            
-            print(f"Saved label patch to zarr at index {state['output_zarr_index'] - 1}")
+            print(f"Saved label patch to zarr at coordinates {coord}")
         except Exception as e:
             print(f"Error saving to output zarr: {e}")
 
 
 @magicgui(
     volume_selection={"choices": list(config.keys()) if config else ["No volumes available"]},
+    energy={"widget_type": "LineEdit", "enabled": False},
+    resolution={"widget_type": "LineEdit", "enabled": False},
     sampling={"choices": ["random", "sequence"]},
     min_label_percentage={"min": 0, "max": 100},
     min_z={"widget_type": "SpinBox", "min": 0, "max": 999999},
@@ -314,19 +345,89 @@ def save_current_patch():
 )
 def init_volume(
         volume_selection: str = list(config.keys())[0] if config else "",
+        energy: str = "",
+        resolution: str = "",
         dataset_out_path: str = config.get("dataset_out_path", ""),
         output_label_zarr: str = config.get("output_label_zarr", ""),
-        patch_size: int = config.get("patch_size", 64),
+        patch_size: int = config.get("patch_size", 384),
         sampling: str = config.get("sampling", "sequence"),
-        save_progress: bool = config.get("save_progress", False),
+        save_progress: bool = config.get("save_progress", True),
         progress_file: str = config.get("progress_file", ""),
-        min_label_percentage: int = config.get("min_label_percentage", 0),
-        min_z: int = 0,  # minimum z index from which to start patching (only for 3D)
+        min_label_percentage: int = config.get("min_label_percentage", 1),
+        min_z: int = 2500,  # minimum z index from which to start patching (only for 3D)
 ):
     """
     Load image and label volumes from Zarr using highest resolution only.
     """
     global state, viewer
+    
+    # Generate timestamp for use in default paths
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # If no dataset_out_path provided, check for existing directories
+    if not dataset_out_path:
+        # Look for existing dataset directories for this volume
+        existing_dirs = glob.glob(f"{volume_selection}_*")
+        existing_dirs = [d for d in existing_dirs if os.path.isdir(d)]
+        
+        if existing_dirs:
+            # Use the most recent directory
+            dataset_out_path = max(existing_dirs, key=os.path.getmtime)
+            print(f"Found existing dataset directory: {dataset_out_path}")
+        else:
+            # No existing directory, create new one
+            dataset_out_path = f"{volume_selection}_{timestamp}"
+            
+        # Update the widget to show the path
+        init_volume.dataset_out_path.value = dataset_out_path
+    
+    # Check if dataset_out_path exists and look for existing progress files
+    existing_progress_file = None
+    if os.path.exists(dataset_out_path):
+        # Look for existing progress files in the directory
+        progress_files = glob.glob(os.path.join(dataset_out_path, f"{volume_selection}_*_progress.json"))
+        if progress_files:
+            # Use the most recent progress file
+            existing_progress_file = max(progress_files, key=os.path.getmtime)
+            print(f"Found existing progress file: {existing_progress_file}")
+    
+    # Generate default output_label_zarr if not provided
+    if not output_label_zarr:
+        # Check if there's an existing zarr in the dataset path
+        if os.path.exists(dataset_out_path):
+            existing_zarrs = glob.glob(os.path.join(dataset_out_path, f"{volume_selection}_*_labels.zarr"))
+            if existing_zarrs:
+                output_label_zarr = existing_zarrs[0]  # Use the first found
+            else:
+                output_label_zarr = os.path.join(dataset_out_path, f"{volume_selection}_{timestamp}_labels.zarr")
+        else:
+            output_label_zarr = os.path.join(dataset_out_path, f"{volume_selection}_{timestamp}_labels.zarr")
+        # Update the widget to show the generated path
+        init_volume.output_label_zarr.value = output_label_zarr
+    
+    # Handle progress file path
+    if save_progress:
+        if not progress_file:
+            # Use existing progress file if found, otherwise generate new
+            if existing_progress_file:
+                progress_file = existing_progress_file
+            else:
+                progress_filename = f"{volume_selection}_{timestamp}_progress.json"
+                if dataset_out_path:
+                    progress_file = os.path.join(dataset_out_path, progress_filename)
+                else:
+                    progress_file = progress_filename
+        else:
+            # Check if progress_file is just a filename (no directory path)
+            if os.path.dirname(progress_file) == "":
+                progress_filename = progress_file
+                # If we have a filename without path, place it in dataset_out_path
+                if dataset_out_path:
+                    progress_file = os.path.join(dataset_out_path, progress_filename)
+            # else: Full path provided, use as is
+            
+        # Update the widget to show the final progress file path
+        init_volume.progress_file.value = progress_file
 
     # Get the selected volume configuration
     if not config or volume_selection not in config:
@@ -361,6 +462,7 @@ def init_volume(
     state['label_zarr'] = label_zarr
     state['dataset_out_path'] = dataset_out_path
     state['patch_size'] = patch_size
+    state['session_start_timestamp'] = timestamp  # Use the same timestamp from earlier
 
     # Save progress options.
     state['save_progress'] = save_progress
@@ -386,34 +488,36 @@ def init_volume(
     # Initialize output zarr if path is provided
     if output_label_zarr:
         try:
-            # Determine patch shape based on dimensionality
-            if num_spatial == 2:
-                patch_shape = (patch_size, patch_size)
-            else:
-                patch_shape = (patch_size, patch_size, patch_size)
+            # Get the shape of the input volume
+            vol_shape = image_volume.shape[:num_spatial]
             
             # Check if zarr already exists
             if os.path.exists(output_label_zarr):
                 # Open existing zarr
-                state['output_zarr_array'] = zarr.open(output_label_zarr, mode='r+')
-                state['output_zarr_index'] = state['output_zarr_array'].shape[0]
-                print(f"Opened existing output zarr with {state['output_zarr_index']} patches.")
+                state['output_zarr_array'] = zarr.open(output_label_zarr, mode='r+', write_empty_chunks=False)
+                print(f"Opened existing output zarr at {output_label_zarr}")
+                print(f"  Shape: {state['output_zarr_array'].shape}")
+                print(f"  Chunks: {state['output_zarr_array'].chunks}")
             else:
-                # Create new zarr with appropriate shape
-                # First dimension is for patches (will grow), rest are spatial dimensions
-                initial_shape = (0,) + patch_shape
-                chunks = (1,) + patch_shape  # One patch per chunk
+                if num_spatial == 2:
+                    chunks = (128,128)
+                else:
+                    chunks = (128,128,128)
                 
                 state['output_zarr_array'] = zarr.open(
                     output_label_zarr,
                     mode='w',
-                    shape=initial_shape,
+                    shape=vol_shape,
                     chunks=chunks,
                     dtype='uint8',
-                    compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.BITSHUFFLE)
+                    compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.BITSHUFFLE),
+                    write_empty_chunks=False
                 )
-                state['output_zarr_index'] = 0
                 print(f"Created new output zarr at {output_label_zarr}")
+                print(f"  Shape: {vol_shape}")
+                print(f"  Chunks: {chunks}")
+                print(f"  Compression: zstd with bitshuffle")
+                print(f"  write_empty_chunks: False")
         except Exception as e:
             print(f"Error initializing output zarr: {e}")
             state['output_zarr_array'] = None
@@ -441,6 +545,8 @@ def init_volume(
 
     print(f"Loaded volumes with shape {vol_shape}.")
     print(f"Found {len(state['patch_coords'])} patch positions using '{sampling}' sampling.")
+    if state['current_index'] > 0:
+        print(f"Starting from patch index {state['current_index']} (resuming from previous session)")
     load_next_patch()
 
 
@@ -585,15 +691,30 @@ def main():
     global viewer
     viewer = napari.Viewer()
     viewer.window.add_dock_widget(init_volume, name="Initialize Volumes", area="right")
-    viewer.window.add_dock_widget(prev_pair, name="Previous Patch", area="right")
     viewer.window.add_dock_widget(jump_control, name="Jump Control", area="right")
+    viewer.window.add_dock_widget(prev_pair, name="Previous Patch", area="right")
     viewer.window.add_dock_widget(iter_pair, name="Iterate Patches", area="right")
+    
+    # Set up event handler to update energy and resolution when volume selection changes
+    @init_volume.volume_selection.changed.connect
+    def update_energy_resolution():
+        selected = init_volume.volume_selection.value
+        if selected in config:
+            init_volume.energy.value = f"{config[selected].get('energy', 'Unknown')} keV"
+            init_volume.resolution.value = f"{config[selected].get('resolution', 'Unknown')} μm"
+    
+    # Initialize with the default selection
+    if config:
+        default_selection = list(config.keys())[0]
+        init_volume.energy.value = f"{config[default_selection].get('energy', 'Unknown')} keV"
+        init_volume.resolution.value = f"{config[default_selection].get('resolution', 'Unknown')} μm"
 
     # --- Keybindings ---
     @viewer.bind_key("Space")
     def next_pair_key(event):
         """Call the next pair function when the spacebar is pressed."""
-        iter_pair()
+        # Call iter_pair with the current value of the approved checkbox
+        iter_pair(iter_pair.approved.value)
 
     @viewer.bind_key("a")
     def toggle_approved_key(event):

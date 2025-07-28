@@ -29,7 +29,13 @@ config = {
         'label_path'  : 'https://volumes.aws.ash2txt.org/volpkgs/PHerc0800.volpkg/volumes/0800_nnunetpredictor_059_ome.zarr/',
         'energy'      : '116',
         'resolution'  : '8.64'
-    }
+    },
+    'PHerc1451': {
+        'volume_path' : 'https://volumes.aws.ash2txt.org/volpkgs/PHerc1451.volpkg/volumes/4.320um_1.0m_116keV_binmean_2_PHerc1451.zarr/',
+        'label_path'  : 'https://volumes.aws.ash2txt.org/volpkgs/PHerc1451.volpkg/volumes/PHerc1451_116KeV_4.32_bin_1m_059_ome.zarr/',
+        'energy'      : '116',
+        'resolution'  : '8.64'
+    },
 }
 
 
