@@ -133,13 +133,11 @@ dependencies:
       - dicom2nifti==2.6.2
       - docstring-parser==0.17.0
       - docutils==0.21.2
-      - dynamic-network-architectures==0.3.1
       - edt==3.0.0
       - einops==0.8.1
       - executing==2.2.0
       - fasteners==0.19
       - fastjsonschema==2.21.1
-      - fft-conv-pytorch==1.2.0
       - filelock==3.18.0
       - flask==3.1.1
       - flexcache==0.3
@@ -155,7 +153,6 @@ dependencies:
       - heapdict==1.0.1
       - hf-xet==1.1.5
       - hsluv==5.0.4
-      - huggingface-hub==0.34.1
       - idna==3.10
       - imagecodecs==2025.3.30
       - imageio==2.37.0
@@ -284,7 +281,6 @@ dependencies:
       - stack-data==0.6.3
       - superqt==0.7.5
       - sympy==1.13.1
-      - tensorstore==0.1.76
       - threadpoolctl==3.6.0
       - tifffile==2025.6.11
       - tomli-w==1.2.0
@@ -293,7 +289,6 @@ dependencies:
       - tqdm==4.67.1
       - traceback2==1.4.0
       - traitlets==5.14.3
-      - triton==3.2.0
       - typer==0.16.0
       - typing-extensions==4.14.1
       - typing-inspection==0.4.1
