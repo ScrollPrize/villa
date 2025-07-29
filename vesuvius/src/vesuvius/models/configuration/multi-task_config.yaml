@@ -7,10 +7,6 @@ tr_config:
   batch_size: 2
 
 dataset_config:
-  binarize_labels: true
-  target_value:
-    hz: 1  # Binary task
-    vt: 1  # Binary task
   min_labeled_ratio: 0
   min_bbox_percent: 0
   skip_patch_validation: true
@@ -19,14 +15,14 @@ dataset_config:
       activation: "none"
       weight: 1
       losses:
-        - name: "CEDiceLoss"
+        - name: "nnUNet_DC_and_CE_loss"
           weight: 1.0
           kwargs: {}
     vt:
       activation: "none"
       weight: 1
       losses:
-        - name: "CEDiceLoss"
+        - name: "nnUNet_DC_and_CE_loss"
           weight: 1.0
           kwargs: {}
   
