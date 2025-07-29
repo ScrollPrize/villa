@@ -12,7 +12,6 @@ dataset_config:
   min_bbox_percent: 0.5
   targets:
     fibers:
-      out_channels: 3
       activation: "none"
       weight: 1
       losses:

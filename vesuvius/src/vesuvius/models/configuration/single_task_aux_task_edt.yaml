@@ -6,7 +6,7 @@ dataset_config:
     hz:
       activation: "none"
       weight: 1
-      out_channels: 1
+
 
 auxiliary_tasks:
   distance_transform:
@@ -16,4 +16,3 @@ auxiliary_tasks:
       - name: "MSELoss"
         weight: 1.0
         kwargs: {}
-    out_channels: 1
