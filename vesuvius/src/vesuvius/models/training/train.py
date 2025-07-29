@@ -955,7 +955,7 @@ def main():
     if trainer_name == "uncertainty_aware_mean_teacher":
         # Enable unlabeled data for uncertainty-aware mean teacher training
         mgr.allow_unlabeled_data = True
-        from vesuvius.models.training.train_uncertainty_aware_mean_teacher import UncertaintyAwareMeanTeacher3DTrainer
+        from vesuvius.models.training.trainers.train_uncertainty_aware_mean_teacher import UncertaintyAwareMeanTeacher3DTrainer
         trainer = UncertaintyAwareMeanTeacher3DTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Uncertainty-Aware Mean Teacher Trainer for semi-supervised 3D training")
     elif trainer_name == "base":
