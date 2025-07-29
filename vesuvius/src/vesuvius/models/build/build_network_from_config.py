@@ -44,7 +44,7 @@ https://github.com/MIC-DKFZ/nnUNet
 """
 
 import torch.nn as nn
-from ..utils import get_pool_and_conv_props, get_n_blocks_per_stage
+from ..utilities.utils import get_pool_and_conv_props, get_n_blocks_per_stage
 from .encoder import Encoder
 from .decoder import Decoder
 from .activations import SwiGLUBlock, GLUBlock

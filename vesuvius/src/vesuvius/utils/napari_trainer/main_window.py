@@ -110,7 +110,7 @@ def run_training(patch_size_z: int = 128, patch_size_x: int = 128, patch_size_y:
         return
     
     try:
-        from vesuvius.models.run.train import BaseTrainer
+        from vesuvius.models.training.train import BaseTrainer
         
         # Create trainer - it will initialize the dataset which will detect targets
         trainer = BaseTrainer(mgr=_config_manager, verbose=True)
