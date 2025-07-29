@@ -334,6 +334,15 @@ def save_debug(
         print(f"[Epoch {epoch}] Saving GIF to: {save_path}")
         imageio.mimsave(save_path, frames, fps=fps)
 
+        # Return frames array for wandb logging
+        # Convert list of BGR images to array with shape (frames, height, width, channels)
+        frames_array = np.stack(frames, axis=0)
+        # Convert BGR to RGB for wandb
+        frames_array = frames_array[..., ::-1]
+        # Transpose to (frames, channels, height, width) as required by wandb
+        frames_array = np.transpose(frames_array, (0, 3, 1, 2))
+        return frames_array
+
 
 
 import os
