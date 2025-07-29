@@ -54,7 +54,7 @@ setup(
         "pynrrd",
         "pyyaml",
         "Pillow",
-        "Torch",
+        "torch>=2.6",
         "scipy",
         "batchgenerators",
         f"batchgeneratorsv2 @ {get_local_package_path("../segmentation/models/batchgeneratorsv2")}",
