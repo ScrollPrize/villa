@@ -9,7 +9,6 @@ dataset_config:
   targets:
     surface:
       activation: "none"
-      out_channels: 1
       losses:
         - name: "nnUNet_DC_and_CE_loss"
           weight: 1.0
