@@ -88,7 +88,7 @@ class ConfigManager:
         self.train_num_dataloader_workers = int(self.tr_configs.get("num_dataloader_workers", 4))
         self.max_epoch = int(self.tr_configs.get("max_epoch", 1000))
         self.optimizer = self.tr_configs.get("optimizer", "SGD")
-        self.initial_lr = float(self.tr_configs.get("initial_lr", 0.0001))
+        self.initial_lr = float(self.tr_configs.get("initial_lr", 0.01))
         self.weight_decay = float(self.tr_configs.get("weight_decay", 0.0001))
         
         ### Dataset config ###

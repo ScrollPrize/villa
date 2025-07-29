@@ -575,6 +575,11 @@ class BaseTrainer:
             epoch_losses = {t_name: [] for t_name in self.mgr.targets}
             train_iter = iter(train_dataloader)
             pbar = tqdm(range(num_iters), desc=f'Epoch {epoch + 1}/{self.mgr.max_epoch}')
+            
+            # Variables to store train samples for debug visualization
+            train_sample_input = None
+            train_sample_targets = None
+            train_sample_outputs = None
 
             print(f"Using optimizer : {optimizer.__class__.__name__}")
             print(f"Using scheduler : {scheduler.__class__.__name__} (per-iteration: {is_per_iteration_scheduler})")
@@ -610,19 +615,39 @@ class BaseTrainer:
                     grad_accumulate_n=grad_accumulate_n
                 )
 
-                # Accumulate losses for tracking
                 for t_name, loss_value in task_losses.items():
                     epoch_losses[t_name].append(loss_value)
+                
+
+                if i == 0 and train_sample_input is None:
+                    # Find first sample with non-zero target
+                    first_target_key = list(targets_dict.keys())[0]
+                    first_target = targets_dict[first_target_key]
+                    
+                    b_idx = 0
+                    found_non_zero = False
+                    for b in range(first_target.shape[0]):
+                        if torch.any(first_target[b] != 0):
+                            b_idx = b
+                            found_non_zero = True
+                            break
+                    
+                    if found_non_zero:
+                        train_sample_input = inputs[b_idx: b_idx + 1]
+                        train_sample_targets = {}
+                        for t_name, t_tensor in targets_dict.items():
+                            train_sample_targets[t_name] = t_tensor[b_idx: b_idx + 1]
+                        train_sample_outputs = {}
+                        for t_name, p_tensor in outputs.items():
+                            train_sample_outputs[t_name] = p_tensor[b_idx: b_idx + 1]
 
                 if optimizer_stepped and is_per_iteration_scheduler:
                     scheduler.step()
 
-                # Update progress bar
                 loss_str = " | ".join([f"{t}: {np.mean(epoch_losses[t][-100:]):.4f}"
                                        for t in self.mgr.targets if len(epoch_losses[t]) > 0])
                 pbar.set_postfix_str(loss_str)
-                
-                # Get current learning rate for logging
+
                 current_lr = optimizer.param_groups[0]['lr']
 
                 # Log metrics to wandb once per step
@@ -638,7 +663,6 @@ class BaseTrainer:
 
                 del data_dict, inputs, targets_dict, outputs
 
-            # Step per-epoch schedulers once after each epoch
             if not is_per_iteration_scheduler:
                 scheduler.step()
 
@@ -674,7 +698,6 @@ class BaseTrainer:
                             val_dataloader_iter = iter(val_dataloader)
                             data_dict = next(val_dataloader_iter)
 
-                        # Execute validation step
                         task_losses, inputs, targets_dict, outputs = self._validation_step(
                             model=model,
                             data_dict=data_dict,
@@ -682,7 +705,6 @@ class BaseTrainer:
                             use_amp=use_amp
                         )
 
-                        # Accumulate validation losses
                         for t_name, loss_value in task_losses.items():
                             val_losses[t_name].append(loss_value)
 
@@ -723,7 +745,10 @@ class BaseTrainer:
                                         tasks_dict=self.mgr.targets,
                                         # dictionary, e.g. {"sheet": {"activation":"sigmoid"}, "normals": {"activation":"none"}}
                                         epoch=epoch,
-                                        save_path=debug_img_path
+                                        save_path=debug_img_path,
+                                        train_input=train_sample_input,
+                                        train_targets_dict=train_sample_targets,
+                                        train_outputs_dict=train_sample_outputs
                                     )
                                     debug_gif_history.append((epoch, debug_img_path))
 
