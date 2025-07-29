@@ -188,8 +188,12 @@ class ConfigManager:
 
         # Apply current loss function to all targets if not already set
         for target_name in self.targets:
-            if "loss_fn" not in self.targets[target_name]:
-                self.targets[target_name]["loss_fn"] = self.selected_loss_function
+            if "losses" not in self.targets[target_name]:
+                self.targets[target_name]["losses"] = [{
+                    "name": self.selected_loss_function,
+                    "weight": 1.0,
+                    "kwargs": {}
+                }]
 
         # Apply auxiliary tasks to targets
         self._apply_auxiliary_tasks()
@@ -290,7 +294,11 @@ class ConfigManager:
             self.selected_loss_function = loss_function
             if hasattr(self, 'targets') and self.targets:
                 for target_name in self.targets:
-                    self.targets[target_name]["loss_fn"] = self.selected_loss_function
+                    self.targets[target_name]["losses"] = [{
+                        "name": self.selected_loss_function,
+                        "weight": 1.0,
+                        "kwargs": {}
+                    }]
                 if self.verbose:
                     print(f"Applied loss function '{self.selected_loss_function}' to all targets")
             elif self.verbose:

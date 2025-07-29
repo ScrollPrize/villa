@@ -22,7 +22,10 @@ dataset_config:
       out_channels: 3
       activation: "softmax"
       weight: 1
-      loss_fn: "CrossEntropyLoss"
+      losses:
+        - name: "CrossEntropyLoss"
+          weight: 1.0
+          kwargs: {}
 
 inference_config:
   targets:
