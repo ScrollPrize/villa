@@ -7,6 +7,7 @@ import zarr
 import tifffile
 from magicgui import magicgui
 from datetime import datetime
+import cc3d
 
 # Try to import config defaults; if not found, use empty defaults.
 try:
@@ -692,6 +693,108 @@ def jump_control(z_jump: int = 500):
 
 
 
+# Create the set unlabeled to ignore widget
+@magicgui(
+    ignore_index={"widget_type": "LineEdit", "value": ""},
+    call_button="Set Unlabeled to Ignore"
+)
+def set_unlabeled_to_ignore(ignore_index: str = ""):
+    """
+    Set all unlabeled (zero) regions in the current label patch to the specified ignore index.
+    If no index is provided, uses the maximum value in the current label array + 1.
+    """
+    global viewer
+    
+    if "patch_label" not in viewer.layers:
+        print("No label layer found in napari.")
+        return
+    
+    # Get the current label data
+    label_data = viewer.layers["patch_label"].data
+    
+    # Determine the ignore index
+    if ignore_index.strip():
+        try:
+            ignore_val = int(ignore_index)
+        except ValueError:
+            print(f"Invalid ignore index: {ignore_index}. Must be an integer.")
+            return
+    else:
+        # Use max value + 1
+        max_val = np.max(label_data)
+        ignore_val = max_val + 1
+        # Update the widget to show the computed value
+        set_unlabeled_to_ignore.ignore_index.value = str(ignore_val)
+    
+    # Create a copy to avoid modifying the original
+    new_label_data = label_data.copy()
+    
+    # Set all zero (unlabeled) regions to the ignore value
+    new_label_data[label_data == 0] = ignore_val
+    
+    # Update the napari layer
+    viewer.layers["patch_label"].data = new_label_data
+    
+    print(f"Set all unlabeled regions to ignore index: {ignore_val}")
+    print(f"  Unlabeled pixels modified: {np.sum(label_data == 0)}")
+
+
+# Create the remove small objects widget
+@magicgui(
+    min_voxel_size={"widget_type": "SpinBox", "min": 0, "max": 10000, "step": 25, "value": 50},
+    call_button="Remove Small Objects"
+)
+def remove_small_objects(min_voxel_size: int = 50):
+    """
+    Remove objects smaller than the specified voxel size using connected components analysis.
+    
+    Args:
+        min_voxel_size: Minimum number of voxels for an object to be kept
+    """
+    global viewer
+    
+    if "patch_label" not in viewer.layers:
+        print("No label layer found in napari.")
+        return
+    
+    # Get the current label data
+    label_data = viewer.layers["patch_label"].data
+    
+    # Ensure data is integer type for cc3d
+    label_data_int = label_data.astype(np.uint32)
+    
+    # Run connected components
+    print(f"Running connected components analysis...")
+    labels_out = cc3d.connected_components(label_data_int)
+    
+    # Get statistics for each component
+    stats = cc3d.statistics(labels_out)
+    
+    # Create a mapping of which labels to keep
+    # Note: label 0 is background, so we start from 1
+    num_components = len(stats['voxel_counts']) - 1  # Exclude background
+    removed_count = 0
+    total_voxels_removed = 0
+    
+    # Create a new array for the filtered result
+    filtered_labels = np.zeros_like(labels_out)
+    
+    for label_id in range(1, len(stats['voxel_counts'])):
+        voxel_count = stats['voxel_counts'][label_id]
+        if voxel_count >= min_voxel_size:
+            # Keep this component
+            filtered_labels[labels_out == label_id] = 1
+        else:
+            removed_count += 1
+            total_voxels_removed += voxel_count
+    
+    # Update the napari layer
+    viewer.layers["patch_label"].data = filtered_labels.astype(np.uint8)
+    
+    print(f"Removed {removed_count} objects smaller than {min_voxel_size} voxels")
+    print(f"  Total voxels removed: {total_voxels_removed}")
+    print(f"  Objects remaining: {num_components - removed_count}")
+
 
 def main():
     """Main entry point for the proofreader application."""
@@ -699,6 +802,8 @@ def main():
     viewer = napari.Viewer()
     viewer.window.add_dock_widget(init_volume, name="Initialize Volumes", area="right")
     viewer.window.add_dock_widget(jump_control, name="Jump Control", area="right")
+    viewer.window.add_dock_widget(set_unlabeled_to_ignore, name="Set Unlabeled to Ignore", area="right")
+    viewer.window.add_dock_widget(remove_small_objects, name="Remove Small Objects", area="right")
     viewer.window.add_dock_widget(prev_pair, name="Previous Patch", area="right")
     viewer.window.add_dock_widget(iter_pair, name="Iterate Patches", area="right")
     
