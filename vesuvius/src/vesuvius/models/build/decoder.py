@@ -6,7 +6,7 @@ import numpy as np
 from typing import Union, Tuple, List, Type
 
 import torch
-from vesuvius.models.utils import get_matching_convtransp
+from vesuvius.models.utilities.utils import get_matching_convtransp
 from .resblocks import StackedResidualBlocks
 from .simple_conv_blocks import StackedConvBlocks
 from torch import nn

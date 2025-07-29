@@ -7,7 +7,7 @@ from torch import nn
 from torch.nn.modules.conv import _ConvNd
 from torch.nn.modules.dropout import _DropoutNd
 
-from vesuvius.models.utils import maybe_convert_scalar_to_list
+from vesuvius.models.utilities.utils import maybe_convert_scalar_to_list
 from .activations import SwiGLUBlock, GLUBlock
 
 
