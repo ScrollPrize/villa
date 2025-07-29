@@ -406,12 +406,7 @@ class BaseDataset(Dataset):
 
         # Extract coordinates based on dimensionality
         if self.is_2d_dataset:
-            # For 2D datasets, position might be [0, y, x] or [y, x]
-            pos = patch_info["position"]
-            if len(pos) == 3:
-                _, y, x = pos  # Ignore dummy z coordinate
-            else:
-                y, x = pos
+            y, x = patch_info["position"]
             dy, dx = self.patch_size[-2:]  # Last 2 dimensions
             z, dz = 0, 0
             target_shape = (dy, dx)

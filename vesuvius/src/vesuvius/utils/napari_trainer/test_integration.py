@@ -16,7 +16,7 @@ def test_imports():
         from vesuvius.models.configuration.config_manager import ConfigManager
         print("✓ ConfigManager imported successfully")
         
-        from vesuvius.models.run.train import BaseTrainer
+        from vesuvius.models.training.train import BaseTrainer
         print("✓ BaseTrainer imported successfully")
         
         from vesuvius.models.datasets import NapariDataset

@@ -1,10 +1,7 @@
-# IMPORTANT: Set multiprocessing start method before any other imports
-# This is critical for S3/fsspec compatibility
 import multiprocessing
 import sys
 
-# Check if we need to set spawn method (for S3 compatibility)
-# This must happen before torch import
+### this is at the top because s3fs/fsspec do not work with fork
 if __name__ == '__main__' and len(sys.argv) > 1:
     # Quick check for S3 paths in command line args
     if any('s3://' in str(arg) for arg in sys.argv) or '--config-path' in sys.argv:
@@ -930,7 +927,13 @@ def main():
 
     # Select trainer based on --trainer argument
     trainer_name = args.trainer.lower()
-    if trainer_name == "base":
+    if trainer_name == "uncertainty_aware_mean_teacher":
+        # Enable unlabeled data for uncertainty-aware mean teacher training
+        mgr.allow_unlabeled_data = True
+        from vesuvius.models.training.train_uncertainty_aware_mean_teacher import UncertaintyAwareMeanTeacher3DTrainer
+        trainer = UncertaintyAwareMeanTeacher3DTrainer(mgr=mgr, verbose=args.verbose)
+        print("Using Uncertainty-Aware Mean Teacher Trainer for semi-supervised 3D training")
+    elif trainer_name == "base":
         trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Base Trainer for supervised training")
     else:

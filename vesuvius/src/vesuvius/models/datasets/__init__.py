@@ -10,5 +10,4 @@ __all__ = [
     'NapariDataset', 
     'ImageDataset',
     'ZarrDataset'
-
 ]
