@@ -212,17 +212,14 @@ def load_next_patch():
         idx = state['current_index']
         coord = coords[idx]
         print(f"Loading patch {idx} at coordinate {coord}...")
-        print("  Extracting image patch...")
-        image_patch = extract_patch(image_volume, coord, patch_size)
         print("  Extracting label patch...")
         label_patch = extract_patch(label_volume, coord, patch_size)
-        print("  Patches extracted successfully.")
+        print("  Label patch extracted successfully.")
         
-        # Check if patches are empty (all zeros) due to empty zarr chunks
-        if np.all(image_patch == 0):
-            print("  Warning: Image patch is all zeros (empty zarr chunk)")
+        # Check if label patch is empty (all zeros) due to empty zarr chunks
         if np.all(label_patch == 0):
             print("  Warning: Label patch is all zeros (empty zarr chunk)")
+        
         state['current_index'] += 1
 
         # Calculate the percentage of labeled (nonzero) pixels.
@@ -231,6 +228,14 @@ def load_next_patch():
         percentage = (nonzero / total * 100) if total > 0 else 0
 
         if percentage >= min_label_percentage:
+            # Only extract image patch if label percentage meets threshold
+            print("  Extracting image patch...")
+            image_patch = extract_patch(image_volume, coord, patch_size)
+            print("  Image patch extracted successfully.")
+            
+            # Check if image patch is empty (all zeros) due to empty zarr chunks
+            if np.all(image_patch == 0):
+                print("  Warning: Image patch is all zeros (empty zarr chunk)")
             # Convert label patch to binary (any non-zero value becomes 1)
             binary_patch = (label_patch > 0).astype(np.uint8)
             
@@ -291,8 +296,8 @@ def save_current_patch():
     coord = patch['coords']
     patch_size = state['patch_size']
 
-    # Extract image patch from the volume
-    image_patch = extract_patch(state['image_volume'], coord, patch_size)
+    # Use the stored image patch instead of re-extracting
+    image_patch = patch['image']
     
     # Get the edited label from napari viewer
     if "patch_label" in viewer.layers:
@@ -601,8 +606,10 @@ def prev_pair():
     state['current_index'] = entry['index']  # Rewind the current_index.
     coord = entry['coords']
     patch_size = state['patch_size']
-    image_patch = extract_patch(state['image_volume'], coord, patch_size)
+    # Extract label patch first (it's lighter and we already know it meets the threshold)
     label_patch = extract_patch(state['label_volume'], coord, patch_size)
+    # Now extract image patch
+    image_patch = extract_patch(state['image_volume'], coord, patch_size)
     
     # Convert label patch to binary
     binary_patch = (label_patch > 0).astype(np.uint8)
