@@ -978,16 +978,16 @@ def main():
         from vesuvius.models.training.trainers.train_uncertainty_aware_mean_teacher import UncertaintyAwareMeanTeacher3DTrainer
         trainer = UncertaintyAwareMeanTeacher3DTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Uncertainty-Aware Mean Teacher Trainer for semi-supervised 3D training")
-    elif trainer_name == "medial_surface_loss":
+    elif trainer_name == "medial_surface_recall":
         # Enable unlabeled data for uncertainty-aware mean teacher training
-        from vesuvius.models.training.trainers.train_skeleton_recall import SkeletonRecallTrainer
-        trainer = SkeletonRecallTrainer(mgr=mgr, verbose=args.verbose)
-        print("Using SkeletonRecallTrainer")
+        from vesuvius.models.training.trainers.train_medial_surface_recall import MedialSurfaceRecallTrainer
+        trainer = MedialSurfaceRecallTrainer(mgr=mgr, verbose=args.verbose)
+        print("Using MedialSurfaceRecallTrainer")
     elif trainer_name == "base":
         trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Base Trainer for supervised training")
     else:
-        raise ValueError(f"Unknown trainer: {trainer_name}. Available options: base, uncertainty_aware_mean_teacher, skeleton_recall_trainer")
+        raise ValueError(f"Unknown trainer: {trainer_name}. Available options: base, uncertainty_aware_mean_teacher, medial_surface_recall")
 
     print("Starting training...")
     trainer.train()

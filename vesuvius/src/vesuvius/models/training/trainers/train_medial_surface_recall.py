@@ -45,7 +45,7 @@ class MedialSurfaceTransform(BasicTransform):
         data_dict["skel"] = torch.from_numpy(seg_all_skel)
         return data_dict
 
-class SkeletonRecallTrainer(BaseTrainer):
+class MedialSurfaceRecallTrainer(BaseTrainer):
     def __init__(self, mgr=None, verbose: bool = True):
         super().__init__(mgr, verbose)
         self.skel_transform = MedialSurfaceTransform(do_tube=False)
