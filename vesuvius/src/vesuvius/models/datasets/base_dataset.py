@@ -659,14 +659,6 @@ class BaseDataset(Dataset):
                 ), apply_probability=0.3
             ))
             transforms.append(RandomTransform(
-                GaussianBlurTransform(
-                    blur_sigma=(0.5, 1.),
-                    synchronize_channels=False,
-                    synchronize_axes=False,
-                    p_per_channel=0.5, benchmark=True
-                ), apply_probability=0.3
-            ))
-            transforms.append(RandomTransform(
                 MultiplicativeBrightnessTransform(
                     multiplier_range=BGContrast((0.75, 1.25)),
                     synchronize_channels=False,
