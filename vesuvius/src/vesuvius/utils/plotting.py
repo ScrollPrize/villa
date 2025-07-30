@@ -123,7 +123,9 @@ def save_debug(
     fps: int = 5,
     train_input: torch.Tensor = None,   # Optional train sample input
     train_targets_dict: dict = None,    # Optional train sample targets
-    train_outputs_dict: dict = None     # Optional train sample outputs
+    train_outputs_dict: dict = None,    # Optional train sample outputs
+    skeleton_dict: dict = None,         # Optional skeleton data for visualization
+    train_skeleton_dict: dict = None    # Optional train skeleton data
 ):
 
     inp_np = input_volume.cpu().numpy()[0]  # => shape [C, Z, H, W] for 3D or [C, H, W] for 2D
@@ -234,6 +236,28 @@ def save_debug(
                 arr_np = apply_activation_if_needed(arr_np, activation_str)
             train_preds_np[t_name] = arr_np
 
+    # Process skeleton data if provided
+    skeleton_np = {}
+    train_skeleton_np = {}
+    
+    if skeleton_dict is not None:
+        for t_name, s_tensor in skeleton_dict.items():
+            arr_np = s_tensor.cpu().numpy()
+            if arr_np.ndim > (3 if is_2d else 4):
+                arr_np = arr_np[0]
+            elif arr_np.ndim == (3 if is_2d else 4):
+                arr_np = arr_np[0]
+            skeleton_np[t_name] = arr_np
+    
+    if train_skeleton_dict is not None:
+        for t_name, s_tensor in train_skeleton_dict.items():
+            arr_np = s_tensor.cpu().numpy()
+            if arr_np.ndim > (3 if is_2d else 4):
+                arr_np = arr_np[0]
+            elif arr_np.ndim == (3 if is_2d else 4):
+                arr_np = arr_np[0]
+            train_skeleton_np[t_name] = arr_np
+
     show_normal_magnitude = False
 
     if is_2d:
@@ -257,6 +281,16 @@ def save_debug(
                 slice_2d = gt_slice  # shape => [C, H, W]
             gt_img = add_text_label(convert_slice_to_bgr(slice_2d), f"Val GT {t_name}")
             val_row1_imgs.append(gt_img)
+            
+            # Add skeleton visualization if available
+            if skeleton_np and t_name in skeleton_np:
+                skel_slice = skeleton_np[t_name]
+                if skel_slice.shape[0] == 1:
+                    skel_2d = skel_slice[0]  # shape => [H, W]
+                else:
+                    skel_2d = skel_slice  # shape => [C, H, W]
+                skel_img = add_text_label(convert_slice_to_bgr(skel_2d), f"Val Skel {t_name}")
+                val_row1_imgs.append(skel_img)
         
         rows.append(np.hstack(val_row1_imgs))
         
@@ -277,6 +311,10 @@ def save_debug(
                 bgr_pred = convert_slice_to_bgr(pd_slice, show_magnitude=show_normal_magnitude)
             pred_img = add_text_label(bgr_pred, f"Val Pred {t_name}")
             val_row2_imgs.append(pred_img)
+            
+            # Add blank tile for skeleton column alignment
+            if skeleton_np and t_name in skeleton_np:
+                val_row2_imgs.append(blank_tile)
         
         rows.append(np.hstack(val_row2_imgs))
 
@@ -298,6 +336,16 @@ def save_debug(
                     slice_2d = train_gt_slice  # shape => [C, H, W]
                 train_gt_img = add_text_label(convert_slice_to_bgr(slice_2d), f"Train GT {t_name}")
                 train_row1_imgs.append(train_gt_img)
+                
+                # Add skeleton visualization if available
+                if train_skeleton_np and t_name in train_skeleton_np:
+                    train_skel_slice = train_skeleton_np[t_name]
+                    if train_skel_slice.shape[0] == 1:
+                        skel_2d = train_skel_slice[0]  # shape => [H, W]
+                    else:
+                        skel_2d = train_skel_slice  # shape => [C, H, W]
+                    train_skel_img = add_text_label(convert_slice_to_bgr(skel_2d), f"Train Skel {t_name}")
+                    train_row1_imgs.append(train_skel_img)
             
             rows.append(np.hstack(train_row1_imgs))
             
@@ -318,6 +366,10 @@ def save_debug(
                     bgr_pred = convert_slice_to_bgr(train_pd_slice, show_magnitude=show_normal_magnitude)
                 train_pred_img = add_text_label(bgr_pred, f"Train Pred {t_name}")
                 train_row2_imgs.append(train_pred_img)
+                
+                # Add blank tile for skeleton column alignment
+                if train_skeleton_np and t_name in train_skeleton_np:
+                    train_row2_imgs.append(blank_tile)
             
             rows.append(np.hstack(train_row2_imgs))
 
@@ -365,6 +417,16 @@ def save_debug(
                     slice_2d = gt_slice[:, z_idx, :, :]  # shape => [3, H, W] or however
                 gt_img = add_text_label(convert_slice_to_bgr(slice_2d), f"Val GT {t_name}")
                 val_row1_imgs.append(gt_img)
+                
+                # Add skeleton visualization if available
+                if skeleton_np and t_name in skeleton_np:
+                    skel_slice = skeleton_np[t_name]
+                    if skel_slice.shape[0] == 1:
+                        skel_2d = skel_slice[0, z_idx, :, :]  # shape => [H, W]
+                    else:
+                        skel_2d = skel_slice[:, z_idx, :, :]  # shape => [C, H, W]
+                    skel_img = add_text_label(convert_slice_to_bgr(skel_2d), f"Val Skel {t_name}")
+                    val_row1_imgs.append(skel_img)
 
             rows.append(np.hstack(val_row1_imgs))
 
@@ -386,6 +448,10 @@ def save_debug(
                     bgr_pred = convert_slice_to_bgr(slice_3d, show_magnitude=show_normal_magnitude)
                 pred_img = add_text_label(bgr_pred, f"Val Pred {t_name}")
                 val_row2_imgs.append(pred_img)
+                
+                # Add blank tile for skeleton column alignment
+                if skeleton_np and t_name in skeleton_np:
+                    val_row2_imgs.append(blank_tile)
 
             rows.append(np.hstack(val_row2_imgs))
 
@@ -410,6 +476,16 @@ def save_debug(
                         slice_2d = train_gt_slice[:, z_idx, :, :]  # shape => [3, H, W] or however
                     train_gt_img = add_text_label(convert_slice_to_bgr(slice_2d), f"Train GT {t_name}")
                     train_row1_imgs.append(train_gt_img)
+                    
+                    # Add skeleton visualization if available
+                    if train_skeleton_np and t_name in train_skeleton_np:
+                        train_skel_slice = train_skeleton_np[t_name]
+                        if train_skel_slice.shape[0] == 1:
+                            skel_2d = train_skel_slice[0, z_idx, :, :]  # shape => [H, W]
+                        else:
+                            skel_2d = train_skel_slice[:, z_idx, :, :]  # shape => [C, H, W]
+                        train_skel_img = add_text_label(convert_slice_to_bgr(skel_2d), f"Train Skel {t_name}")
+                        train_row1_imgs.append(train_skel_img)
                 
                 rows.append(np.hstack(train_row1_imgs))
                 
@@ -431,6 +507,10 @@ def save_debug(
                         bgr_pred = convert_slice_to_bgr(slice_3d, show_magnitude=show_normal_magnitude)
                     train_pred_img = add_text_label(bgr_pred, f"Train Pred {t_name}")
                     train_row2_imgs.append(train_pred_img)
+                    
+                    # Add blank tile for skeleton column alignment
+                    if train_skeleton_np and t_name in train_skeleton_np:
+                        train_row2_imgs.append(blank_tile)
                 
                 rows.append(np.hstack(train_row2_imgs))
 

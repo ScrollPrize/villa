@@ -10,6 +10,6 @@ dataset_config:
     surface:
       activation: "none"
       losses:
-        - name: "nnUNet_DC_and_CE_loss"
+        - name: "MedialSurfaceRecall"
           weight: 1.0
 

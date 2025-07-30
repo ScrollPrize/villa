@@ -326,6 +326,20 @@ class BaseTrainer:
                 config=mgr_config
             )
 
+    def _get_model_outputs(self, model, data_dict, autocast_ctx):
+        """Extract model outputs from data_dict."""
+        inputs = data_dict["image"].to(self.device, dtype=torch.float32)
+        targets_dict = {
+            k: v.to(self.device, dtype=torch.float32)
+            for k, v in data_dict.items()
+            if k not in ["image", "patch_info", "is_unlabeled"]
+        }
+        
+        with autocast_ctx:
+            outputs = model(inputs)
+        
+        return inputs, targets_dict, outputs
+
     def _train_step(self, model, data_dict, loss_fns, use_amp, autocast_ctx, epoch, step, verbose=False,
                     scaler=None, optimizer=None, num_iters=None, grad_accumulate_n=1):
         """Execute a single training step including gradient updates."""
@@ -342,15 +356,9 @@ class BaseTrainer:
                 else:
                     print(f"{item}: {val.dtype}, {val.shape}, min {val.min()} max {val.max()}")
 
-        inputs = data_dict["image"].to(self.device, dtype=torch.float32)
-        targets_dict = {
-            k: v.to(self.device, dtype=torch.float32)
-            for k, v in data_dict.items()
-            if k not in ["image", "patch_info", "is_unlabeled"]
-        }
-
+        inputs, targets_dict, outputs = self._get_model_outputs(model, data_dict, autocast_ctx)
+        
         with autocast_ctx:
-            outputs = model(inputs)
             total_loss, task_losses = self._compute_train_loss(outputs, targets_dict, loss_fns)
 
         # Handle gradient accumulation, clipping, and optimizer step
@@ -738,6 +746,16 @@ class BaseTrainer:
                                         outputs_dict_first[t_name] = p_tensor[b_idx: b_idx + 1]
 
                                     debug_img_path = f"{ckpt_dir}/{self.mgr.model_name}_debug_epoch{epoch}.gif"
+                                    
+                                    # Extract skeleton data if using SkeletonRecallTrainer
+                                    skeleton_dict = None
+                                    train_skeleton_dict = None
+                                    if hasattr(self, 'skel_transform'):
+                                        if 'skel' in targets_dict_first:
+                                            skeleton_dict = {'segmentation': targets_dict_first.get('skel')}
+                                        if train_sample_targets and 'skel' in train_sample_targets:
+                                            train_skeleton_dict = {'segmentation': train_sample_targets.get('skel')}
+                                    
                                     frames_array = save_debug(
                                         input_volume=inputs_first,
                                         targets_dict=targets_dict_first,
@@ -748,7 +766,9 @@ class BaseTrainer:
                                         save_path=debug_img_path,
                                         train_input=train_sample_input,
                                         train_targets_dict=train_sample_targets,
-                                        train_outputs_dict=train_sample_outputs
+                                        train_outputs_dict=train_sample_outputs,
+                                        skeleton_dict=skeleton_dict,
+                                        train_skeleton_dict=train_skeleton_dict
                                     )
                                     debug_gif_history.append((epoch, debug_img_path))
 
@@ -958,11 +978,16 @@ def main():
         from vesuvius.models.training.trainers.train_uncertainty_aware_mean_teacher import UncertaintyAwareMeanTeacher3DTrainer
         trainer = UncertaintyAwareMeanTeacher3DTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Uncertainty-Aware Mean Teacher Trainer for semi-supervised 3D training")
+    elif trainer_name == "medial_surface_recall":
+        # Enable unlabeled data for uncertainty-aware mean teacher training
+        from vesuvius.models.training.trainers.train_medial_surface_recall import MedialSurfaceRecallTrainer
+        trainer = MedialSurfaceRecallTrainer(mgr=mgr, verbose=args.verbose)
+        print("Using MedialSurfaceRecallTrainer")
     elif trainer_name == "base":
         trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Base Trainer for supervised training")
     else:
-        raise ValueError(f"Unknown trainer: {trainer_name}. Available options: base, uncertainty_aware_mean_teacher")
+        raise ValueError(f"Unknown trainer: {trainer_name}. Available options: base, uncertainty_aware_mean_teacher, medial_surface_recall")
 
     print("Starting training...")
     trainer.train()
