@@ -939,7 +939,7 @@ class NormalGatedRepulsionLoss(nn.Module):
 
 #######################################################################################################################
 
-def _create_loss(name, loss_config, weight, ignore_index, pos_weight):
+def _create_loss(name, loss_config, weight, ignore_index, pos_weight, mgr=None):
     # Define losses that don't natively support ignore_index
     losses_without_ignore_support = ['BCEWithLogitsLoss', 'MSELoss', 'SmoothL1Loss', 'L1Loss', 'WeightedSmoothL1Loss']
     
@@ -1076,6 +1076,8 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight):
         )
 
     elif name == 'MedialSurfaceRecall':
+        if mgr and hasattr(mgr, 'trainer_class') and mgr.trainer_class != 'medial_surface_recall':
+            raise RuntimeError(f"MedialSurfaceRecall loss requires --trainer medial_surface_recall")
         from vesuvius.models.training.loss.skeleton_recall import DC_SkelREC_and_CE_loss
         soft_dice_kwargs = {
             'batch_dice': loss_config.get('batch_dice', False),

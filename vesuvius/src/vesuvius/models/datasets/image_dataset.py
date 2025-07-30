@@ -281,7 +281,7 @@ class ImageDataset(BaseDataset):
 
             worker_tasks = [(f[0], f[1], f[2], f[3], True) for f in conversion_tasks]
             
-            with ProcessPoolExecutor(max_workers=cpu_count()) as executor:
+            with ProcessPoolExecutor(max_workers=max(1, cpu_count() // 4)) as executor:
                 futures = {executor.submit(convert_image_to_zarr_worker, task): task for task in worker_tasks}
                 
                 with tqdm(total=len(futures), desc="Converting to Zarr") as pbar:
