@@ -128,21 +128,27 @@ def augment_rician_noise(data: torch.Tensor, noise_variance: Tuple[float, float]
     """
     Adds Rician noise to the input tensor.
     
+    Rician noise occurs in MRI when taking the magnitude of complex data with 
+    Gaussian noise in both real and imaginary parts.
+    
     Args:
-        data: Input tensor
+        data: Input tensor (treated as the underlying signal magnitude)
         noise_variance: Range for variance of the Gaussian distributions
         
     Returns:
         Tensor with added Rician noise
     """
     variance = np.random.uniform(*noise_variance)
+    std_dev = np.sqrt(variance)
     
-    # Generate two independent Gaussian distributions
-    noise1 = torch.normal(0, np.sqrt(variance), size=data.shape)
-    noise2 = torch.normal(0, np.sqrt(variance), size=data.shape)
+    # Generate independent Gaussian noise for real and imaginary components
+    # The data is treated as the underlying signal magnitude
+    real_noise = torch.normal(0, std_dev, size=data.shape, device=data.device, dtype=data.dtype)
+    imag_noise = torch.normal(0, std_dev, size=data.shape, device=data.device, dtype=data.dtype)
     
-    # Calculate Rician noise
-    return torch.sqrt((data + noise1) ** 2 + noise2 ** 2)
+    # In Rician noise, the signal is in the real component, imaginary starts at 0
+    # Result is the magnitude of complex signal + noise
+    return torch.sqrt((data + real_noise) ** 2 + imag_noise ** 2)
 
 class RicianNoiseTransform(BasicTransform):
     """
@@ -239,7 +245,22 @@ class SmearTransform(ImageOnlyTransform):
                 count = 0
                 for j in range(i - self.num_prev_slices, i):
                     # Shift the previous slice by the given offset.
-                    shifted = np.roll(moved[j], shift=self.shift, axis=(0, 1))
+                    # Handle different dimensionalities of the slice
+                    if moved[j].ndim == 0:
+                        # Scalar case - no shift possible
+                        shifted = moved[j]
+                    elif moved[j].ndim == 1:
+                        # 1D slice - shift only along the single axis
+                        shifted = np.roll(moved[j], shift=self.shift[0], axis=0)
+                    elif moved[j].ndim == 2:
+                        # 2D slice - shift along both axes
+                        shifted = np.roll(moved[j], shift=self.shift, axis=(0, 1))
+                    else:
+                        # Higher dimensional slice - shift only the first two spatial axes
+                        # Use only the first two components of shift
+                        shift_truncated = self.shift[:2] if len(self.shift) >= 2 else (self.shift[0], 0)
+                        shifted = np.roll(moved[j], shift=shift_truncated, axis=(0, 1))
+                    
                     aggregated += shifted.astype(np.float32)
                     count += 1
                 if count > 0:

@@ -26,7 +26,7 @@ from vesuvius.models.augmentation.transforms.spatial.low_resolution import Simul
 from vesuvius.models.augmentation.transforms.spatial.mirroring import MirrorTransform
 from vesuvius.models.augmentation.transforms.spatial.spatial import SpatialTransform
 from vesuvius.models.augmentation.transforms.utils.compose import ComposeTransforms
-from vesuvius.models.augmentation.transforms.noise.extranoisetransforms import BlankRectangleTransform
+from vesuvius.models.augmentation.transforms.noise.extranoisetransforms import BlankRectangleTransform, RicianNoiseTransform, SmearTransform
 from vesuvius.models.augmentation.transforms.intensity.illumination import InhomogeneousSliceIlluminationTransform
 
 from vesuvius.utils.utils import pad_or_crop_3d, pad_or_crop_2d
@@ -551,7 +551,7 @@ class BaseDataset(Dataset):
                     rotation_for_DA = (-180. / 360 * 2. * np.pi, 180. / 360 * 2. * np.pi)
                 mirror_axes = (0, 1)
             else:  # 3D
-                rotation_for_DA = (-30. / 360 * 2. * np.pi, 30. / 360 * 2. * np.pi)
+                rotation_for_DA = (-np.pi, np.pi)
                 mirror_axes = (0, 1, 2)
 
             # Add SpatialTransform for rotations, scaling, elastic deformations
@@ -560,23 +560,23 @@ class BaseDataset(Dataset):
                     self.mgr.train_patch_size,
                     patch_center_dist_from_border=0,
                     random_crop=False,
-                    p_elastic_deform=0.2,
-                    elastic_deform_scale=(0, 0.25),
-                    elastic_deform_magnitude=(0, 0.25),
-                    p_rotation=0.2,
+                    p_elastic_deform=0.3,
+                    elastic_deform_scale=(0, 100),
+                    elastic_deform_magnitude=(0, 0.5),
+                    p_rotation=0.5,
                     rotation=rotation_for_DA,
                     p_scaling=0.2,
-                    scaling=(0.7, 1.4),
+                    scaling=(0.5, 2.0),
                     p_synchronize_scaling_across_axes=1,
                     bg_style_seg_sampling=False
                 )
             )
             
-            # Add mirroring
-            transforms.append(RandomTransform(
-                MirrorTransform(allowed_axes=mirror_axes),
-                apply_probability=0.5
-            ))
+            # # Add mirroring
+            # transforms.append(RandomTransform(
+            #     MirrorTransform(allowed_axes=mirror_axes),
+            #     apply_probability=0.5
+            # ))
 
         if dimension == 2:
             transforms.append(RandomTransform(
@@ -593,7 +593,7 @@ class BaseDataset(Dataset):
                     multiplier_range=BGContrast((0.75, 1.25)),
                     synchronize_channels=False,
                     p_per_channel=1
-                ), apply_probability=0.15
+                ), apply_probability=0.3
             ))
             transforms.append(RandomTransform(
                 ContrastTransform(
@@ -601,14 +601,14 @@ class BaseDataset(Dataset):
                     preserve_range=True,
                     synchronize_channels=False,
                     p_per_channel=1
-                ), apply_probability=0.15
+                ), apply_probability=0.3
             ))
             transforms.append(RandomTransform(
                 GaussianNoiseTransform(
                     noise_variance=(0, 0.1),
                     p_per_channel=1,
                     synchronize_channels=True
-                ), apply_probability=0.1
+                ), apply_probability=0.3
             ))
             transforms.append(RandomTransform(
                 GammaTransform(
@@ -653,10 +653,10 @@ class BaseDataset(Dataset):
             ))
             transforms.append(RandomTransform(
                 GaussianNoiseTransform(
-                    noise_variance=(0, 0.1),
+                    noise_variance=(0, 0.20),
                     p_per_channel=1,
                     synchronize_channels=True
-                ), apply_probability=0.1
+                ), apply_probability=0.3
             ))
             transforms.append(RandomTransform(
                 GaussianBlurTransform(
@@ -664,32 +664,32 @@ class BaseDataset(Dataset):
                     synchronize_channels=False,
                     synchronize_axes=False,
                     p_per_channel=0.5, benchmark=True
-                ), apply_probability=0.2
+                ), apply_probability=0.3
             ))
             transforms.append(RandomTransform(
                 MultiplicativeBrightnessTransform(
                     multiplier_range=BGContrast((0.75, 1.25)),
                     synchronize_channels=False,
                     p_per_channel=1
-                ), apply_probability=0.20
+                ), apply_probability=0.3
             ))
             transforms.append(RandomTransform(
                 ContrastTransform(
-                    contrast_range=BGContrast((0.75, 1.25)),
+                    contrast_range=BGContrast((0.50, 1.50)),
                     preserve_range=True,
                     synchronize_channels=False,
                     p_per_channel=1
-                ), apply_probability=0.15
+                ), apply_probability=0.25
             ))
             transforms.append(RandomTransform(
                 SimulateLowResolutionTransform(
-                    scale=(0.5, 1),
+                    scale=(0.3, 1.5),
                     synchronize_channels=False,
                     synchronize_axes=True,
                     ignore_axes=None,
                     allowed_channels=None,
                     p_per_channel=0.5
-                ), apply_probability=0.25
+                ), apply_probability=0.3
             ))
             transforms.append(RandomTransform(
                 GammaTransform(
@@ -733,6 +733,19 @@ class BaseDataset(Dataset):
                     per_channel=True,
                     p_per_channel=0.5
                 ), apply_probability=0.25
+            ))
+            transforms.append(RandomTransform(
+                SmearTransform(
+                    shift=(10, 0),
+                    alpha=0.5,
+                    num_prev_slices=1,
+                    smear_axis=1
+                ), apply_probability=0.3
+            ))
+            transforms.append(RandomTransform(
+                RicianNoiseTransform(
+                    noise_variance=(0, 0.1),
+                ), apply_probability=0.3
             ))
 
         if no_spatial:
