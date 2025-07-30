@@ -41,6 +41,10 @@ from vesuvius.models.training.auxiliary_tasks import compute_auxiliary_loss
 from vesuvius.models.training.wandb_logging import save_train_val_filenames
 from vesuvius.models.utilities.cli_utils import update_config_from_args
 from vesuvius.models.configuration.config_utils import configure_targets
+from vesuvius.models.evaluation.connected_components import ConnectedComponentsMetric
+from vesuvius.models.evaluation.critical_components import CriticalComponentsMetric
+from vesuvius.models.evaluation.iou_dice import IOUDiceMetric
+from vesuvius.models.evaluation.hausdorff import HausdorffDistanceMetric
 
 
 from itertools import cycle
@@ -129,7 +133,8 @@ class BaseTrainer:
                             loss_config=loss_kwargs,
                             weight=weight,
                             ignore_index=ignore_index,
-                            pos_weight=pos_weight
+                            pos_weight=pos_weight,
+                            mgr=self.mgr
                         )
                         task_losses.append((loss_fn, loss_weight))
                         print(f"  - {loss_name} (weight: {loss_weight})")
@@ -175,6 +180,30 @@ class BaseTrainer:
         return scheduler, is_per_iteration
 
     # --- scaler --- #
+    def _initialize_evaluation_metrics(self):
+        """Initialize evaluation metrics for validation."""
+        metrics = {}
+        for task_name, task_config in self.mgr.targets.items():
+            task_metrics = []
+            
+            # Add connected components metric
+            num_classes = task_config.get('num_classes', 2)
+            task_metrics.append(ConnectedComponentsMetric(num_classes=num_classes))
+            
+            # Add critical components metric (only for binary segmentation tasks)
+            if num_classes == 2:
+                task_metrics.append(CriticalComponentsMetric())
+            
+            # Add IOU/Dice metric
+            task_metrics.append(IOUDiceMetric(num_classes=num_classes))
+            
+            # Add Hausdorff distance metric
+            task_metrics.append(HausdorffDistanceMetric(num_classes=num_classes))
+            
+            metrics[task_name] = task_metrics
+        
+        return metrics
+    
     def _get_scaler(self, device_type='cuda', use_amp=True):
         # for cuda, we can use a grad scaler for mixed precision training if amp is enabled
         # for mps or cpu, or when amp is disabled, we create a dummy scaler that does nothing
@@ -689,6 +718,9 @@ class BaseTrainer:
                 with torch.no_grad():
                     val_losses = {t_name: [] for t_name in self.mgr.targets}
                     frames_array = None
+                    
+                    # Initialize evaluation metrics
+                    evaluation_metrics = self._initialize_evaluation_metrics()
 
                     val_dataloader_iter = iter(val_dataloader)
 
@@ -715,6 +747,15 @@ class BaseTrainer:
 
                         for t_name, loss_value in task_losses.items():
                             val_losses[t_name].append(loss_value)
+                        
+                        # Compute evaluation metrics for each task
+                        for t_name in self.mgr.targets:
+                            if t_name in outputs and t_name in targets_dict:
+                                for metric in evaluation_metrics[t_name]:
+                                    # Only compute CriticalComponentsMetric on first 10 batches
+                                    if isinstance(metric, CriticalComponentsMetric) and i >= 10:
+                                        continue
+                                    metric.update(pred=outputs[t_name], gt=targets_dict[t_name])
 
                         if i == 0:
                                 # Find first non-zero sample for debug visualization
@@ -787,6 +828,21 @@ class BaseTrainer:
 
                     avg_val_loss = total_val_loss / len(self.mgr.targets) if self.mgr.targets else 0
                     val_loss_history[epoch] = avg_val_loss
+                    
+                    # Aggregate and print evaluation metrics
+                    print("\n[Validation Metrics]")
+                    metric_results = {}
+                    for t_name in self.mgr.targets:
+                        if t_name in evaluation_metrics:
+                            print(f"  Task '{t_name}':")
+                            for metric in evaluation_metrics[t_name]:
+                                aggregated = metric.aggregate()
+                                for metric_name, value in aggregated.items():
+                                    full_metric_name = f"{t_name}_{metric.name}_{metric_name}"
+                                    metric_results[full_metric_name] = value
+                                    # Include the metric base name in the console output
+                                    display_name = f"{metric.name}_{metric_name}"
+                                    print(f"    {display_name}: {value:.4f}")
 
                     if self.mgr.wandb_project:
                         val_metrics = {"epoch": epoch, "step": global_step}
@@ -794,6 +850,10 @@ class BaseTrainer:
                             if t_name in val_losses and len(val_losses[t_name]) > 0:
                                 val_metrics[f"val_loss_{t_name}"] = np.mean(val_losses[t_name])
                         val_metrics["val_loss_total"] = avg_val_loss
+                        
+                        # Add evaluation metrics to wandb
+                        for metric_name, value in metric_results.items():
+                            val_metrics[f"val_{metric_name}"] = value
 
                         if 'frames_array' in locals() and frames_array is not None:
                             import wandb
@@ -972,14 +1032,14 @@ def main():
 
     # Select trainer based on --trainer argument
     trainer_name = args.trainer.lower()
+    mgr.trainer_class = trainer_name  # Store trainer class in config manager
+    
     if trainer_name == "uncertainty_aware_mean_teacher":
-        # Enable unlabeled data for uncertainty-aware mean teacher training
         mgr.allow_unlabeled_data = True
         from vesuvius.models.training.trainers.train_uncertainty_aware_mean_teacher import UncertaintyAwareMeanTeacher3DTrainer
         trainer = UncertaintyAwareMeanTeacher3DTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Uncertainty-Aware Mean Teacher Trainer for semi-supervised 3D training")
     elif trainer_name == "medial_surface_recall":
-        # Enable unlabeled data for uncertainty-aware mean teacher training
         from vesuvius.models.training.trainers.train_medial_surface_recall import MedialSurfaceRecallTrainer
         trainer = MedialSurfaceRecallTrainer(mgr=mgr, verbose=args.verbose)
         print("Using MedialSurfaceRecallTrainer")
