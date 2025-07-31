@@ -857,7 +857,7 @@ class BaseTrainer:
 
                         if 'frames_array' in locals() and frames_array is not None:
                             import wandb
-                            val_metrics["debug_gif"] = wandb.Video(frames_array)
+                            val_metrics["debug_gif"] = wandb.Video(frames_array, format="gif")
 
                         import wandb
                         wandb.log(val_metrics)
