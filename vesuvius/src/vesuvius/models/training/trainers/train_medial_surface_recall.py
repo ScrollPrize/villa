@@ -6,6 +6,7 @@ from vesuvius.models.training.train import BaseTrainer
 from vesuvius.models.augmentation.transforms.base.basic_transform import BasicTransform
 from vesuvius.models.training.loss.skeleton_recall import DC_SkelREC_and_CE_loss
 from vesuvius.models.training.loss.nnunet_losses import MemoryEfficientSoftDiceLoss
+from vesuvius.models.training.loss.betti_losses import BettiMatchingLoss
 
 class MedialSurfaceTransform(BasicTransform):
     def __init__(self, do_tube: bool = False):

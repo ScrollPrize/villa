@@ -2,14 +2,70 @@ import os
 from pathlib import Path
 from setuptools import setup, find_packages
 from setuptools.command.install import install
+from setuptools.command.develop import develop
 import warnings
+import sys
+import subprocess
+import platform
 
 version = os.environ.get("VERSION", "0.1.10")
 
 
-class CustomInstallCommand(install):
-    def run(self):
-        install.run(self)
+class PostInstallMixin:
+    """Mixin for post-installation tasks"""
+    def build_betti_matching(self):
+        """Clone and build Betti-Matching-3D"""
+        # Determine where to put the Betti module
+        vesuvius_root = Path(__file__).parent.resolve()
+        betti_dir = vesuvius_root / "external" / "Betti-Matching-3D"
+        
+        try:
+            # Create external directory if it doesn't exist
+            betti_dir.parent.mkdir(exist_ok=True)
+            
+            # Clone if not exists
+            if not betti_dir.exists():
+                print("\nCloning Betti-Matching-3D...")
+                subprocess.run([
+                    "git", "clone", 
+                    "https://github.com/nstucki/Betti-Matching-3D.git",
+                    str(betti_dir)
+                ], check=True)
+            
+            # Build
+            build_dir = betti_dir / "build"
+            build_dir.mkdir(exist_ok=True)
+            
+            print("\nBuilding Betti-Matching-3D...")
+            
+            # Configure with CMake
+            cmake_cmd = ["cmake", ".."]
+            if platform.system() == "Darwin" and platform.machine() == "arm64":
+                cmake_cmd = ["cmake", "-DCMAKE_OSX_ARCHITECTURES=arm64", ".."]
+            
+            subprocess.run(cmake_cmd, cwd=build_dir, check=True)
+            
+            # Build
+            subprocess.run(["make"], cwd=build_dir, check=True)
+            
+            print("\nBetti-Matching-3D built successfully!")
+            
+        except subprocess.CalledProcessError as e:
+            warnings.warn(
+                f"\nFailed to build Betti-Matching-3D: {e}\n"
+                f"You may need to build it manually:\n"
+                f"  cd {betti_dir}\n"
+                f"  mkdir build && cd build\n"
+                f"  cmake ..\n"
+                f"  make\n",
+                UserWarning
+            )
+    
+    def post_install(self):
+        """Run post-installation tasks"""
+        # Build Betti-Matching-3D
+        self.build_betti_matching()
+        
         message = """
         ============================================================
         Thank you for installing vesuvius!
@@ -22,6 +78,18 @@ class CustomInstallCommand(install):
         ============================================================
         """
         warnings.warn(message, UserWarning)
+
+
+class CustomInstallCommand(PostInstallMixin, install):
+    def run(self):
+        install.run(self)
+        self.post_install()
+
+
+class CustomDevelopCommand(PostInstallMixin, develop):
+    def run(self):
+        develop.run(self)
+        self.post_install()
 
 
 def get_local_package_path(relative_path):
@@ -42,6 +110,7 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     install_requires=[
+        "pybind11>=2.5.0",
         "numpy",
         "requests",
         "aiohttp",
@@ -114,5 +183,6 @@ setup(
     ],
     cmdclass={
         "install": CustomInstallCommand,
+        "develop": CustomDevelopCommand,
     },
 )

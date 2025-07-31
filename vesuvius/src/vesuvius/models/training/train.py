@@ -112,8 +112,11 @@ class BaseTrainer:
     # --- losses ---- #
     def _build_loss(self):
         loss_fns = {}
+        self._deferred_losses = {}  # Store losses that should be added later
+        
         for task_name, task_info in self.mgr.targets.items():
             task_losses = []
+            deferred_losses = []
 
             if "losses" in task_info:
                 print(f"Target {task_name} using multiple losses:")
@@ -121,11 +124,11 @@ class BaseTrainer:
                     loss_name = loss_cfg["name"]
                     loss_weight = loss_cfg.get("weight", 1.0)
                     loss_kwargs = loss_cfg.get("kwargs", {})
+                    start_epoch = loss_cfg.get("start_epoch", 0)
 
                     weight = loss_kwargs.get("weight", None)
                     ignore_index = loss_kwargs.get("ignore_index", -100)
                     pos_weight = loss_kwargs.get("pos_weight", None)
-
 
                     try:
                         loss_fn = _create_loss(
@@ -136,14 +139,61 @@ class BaseTrainer:
                             pos_weight=pos_weight,
                             mgr=self.mgr
                         )
-                        task_losses.append((loss_fn, loss_weight))
-                        print(f"  - {loss_name} (weight: {loss_weight})")
+                        
+                        if start_epoch > 0:
+                            # Store for later addition
+                            deferred_losses.append({
+                                'loss_fn': loss_fn,
+                                'weight': loss_weight,
+                                'start_epoch': start_epoch,
+                                'name': loss_name
+                            })
+                            print(f"  - {loss_name} (weight: {loss_weight}) - will start at epoch {start_epoch}")
+                        else:
+                            # Add immediately
+                            task_losses.append((loss_fn, loss_weight))
+                            print(f"  - {loss_name} (weight: {loss_weight})")
                     except RuntimeError as e:
                         raise ValueError(
                             f"Failed to create loss function '{loss_name}' for target '{task_name}': {str(e)}")
 
             loss_fns[task_name] = task_losses
+            if deferred_losses:
+                self._deferred_losses[task_name] = deferred_losses
 
+        return loss_fns
+
+    def _update_loss_for_epoch(self, loss_fns, epoch):
+        """Update loss functions based on current epoch. Can be overridden by subclasses."""
+        # Check if there are any deferred losses to add
+        if hasattr(self, '_deferred_losses') and self._deferred_losses:
+            # Create a copy of the dictionary keys to avoid modification during iteration
+            task_names = list(self._deferred_losses.keys())
+            
+            for task_name in task_names:
+                deferred_list = self._deferred_losses[task_name]
+                # Filter losses that should start this epoch
+                losses_to_add = []
+                remaining_deferred = []
+                
+                for deferred_loss in deferred_list:
+                    if epoch >= deferred_loss['start_epoch']:
+                        losses_to_add.append(deferred_loss)
+                    else:
+                        remaining_deferred.append(deferred_loss)
+                
+                # Add the losses that should start now
+                for loss_info in losses_to_add:
+                    loss_fns[task_name].append((loss_info['loss_fn'], loss_info['weight']))
+                    print(f"\nEpoch {epoch}: Adding {loss_info['name']} to task '{task_name}' (weight: {loss_info['weight']})")
+                
+                # Update the deferred list
+                if remaining_deferred:
+                    self._deferred_losses[task_name] = remaining_deferred
+                else:
+                    # Remove the task from deferred losses if no more losses to add
+                    del self._deferred_losses[task_name]
+        
         return loss_fns
 
     # --- optimizer ---- #
@@ -467,8 +517,9 @@ class BaseTrainer:
 
             task_total_loss = 0.0
             for loss_fn, loss_weight in task_loss_fns:
-                # Compute loss
-                loss_value = loss_fn(t_pred, t_gt)
+                # Use auxiliary loss computation helper (same as training)
+                loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt, outputs,
+                                                    self.mgr.targets[t_name])
                 task_total_loss += loss_weight * loss_value
 
             task_losses[t_name] = task_total_loss.detach().cpu().item()
@@ -602,6 +653,9 @@ class BaseTrainer:
 
         # ---- training! ----- #
         for epoch in range(start_epoch, self.mgr.max_epoch):
+            # Update loss functions for this epoch
+            loss_fns = self._update_loss_for_epoch(loss_fns, epoch)
+            
             model.train()
 
             if getattr(self.mgr, 'max_steps_per_epoch', None) is not None and self.mgr.max_steps_per_epoch > 0:
@@ -919,12 +973,6 @@ class BaseTrainer:
             model_config=model.final_config,
             train_dataset=train_dataset
         )
-
-
-
-
-
-
 
 def main():
     """Main entry point for the training script."""

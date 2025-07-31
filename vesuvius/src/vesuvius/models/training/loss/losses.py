@@ -2,6 +2,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn as nn
 from torch.nn import MSELoss, SmoothL1Loss, L1Loss
+import sys
+import os
 
 # Import nnUNet losses
 from .nnunet_losses import (
@@ -1109,6 +1111,26 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight, mgr=None):
             weight_srec=loss_config.get('weight_srec', 1),
             ignore_label=ignore_index,
             dice_class=MemoryEfficientSoftDiceLoss
+        )
+    
+    # Betti Matching losses
+    elif name == 'BettiMatchingLoss':
+        from .betti_losses import BettiMatchingLoss
+        base_loss = BettiMatchingLoss(
+            relative=loss_config.get('relative', False),
+            filtration=loss_config.get('filtration', 'superlevel'),
+            construction=loss_config.get('construction', 'V'),
+            comparison=loss_config.get('comparison', 'union')
+        )
+    
+    elif name == 'DiceBettiMatchingLoss':
+        from .betti_losses import DiceBettiMatchingLoss
+        base_loss = DiceBettiMatchingLoss(
+            alpha=loss_config.get('alpha', 0.5),
+            relative=loss_config.get('relative', False),
+            filtration=loss_config.get('filtration', 'superlevel'),
+            construction=loss_config.get('construction', 'V'),
+            comparison=loss_config.get('comparison', 'union')
         )
     
     else:

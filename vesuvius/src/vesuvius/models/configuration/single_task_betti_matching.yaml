@@ -14,5 +14,7 @@ dataset_config:
           weight: 1.0
         - name: "BettiMatchingLoss"
           weight: 1.0
-          start_epoch: 100
+          kwargs:
+            filtration: 'superlevel'
+          start_epoch: 1
 

@@ -70,16 +70,22 @@ def compute_auxiliary_loss(loss_fn, t_pred: torch.Tensor, t_gt_masked: torch.Ten
             # Try to pass source predictions as keyword argument
             # This way, losses that don't expect it won't break
             try:
-                loss_value = loss_fn(t_pred, t_gt_masked, source_pred=outputs[source_target_name])
+                result = loss_fn(t_pred, t_gt_masked, source_pred=outputs[source_target_name])
             except TypeError:
                 # Fallback to standard call if loss doesn't accept source_pred
-                loss_value = loss_fn(t_pred, t_gt_masked)
+                result = loss_fn(t_pred, t_gt_masked)
         else:
-            loss_value = loss_fn(t_pred, t_gt_masked)
+            result = loss_fn(t_pred, t_gt_masked)
     else:
-        loss_value = loss_fn(t_pred, t_gt_masked)
+        result = loss_fn(t_pred, t_gt_masked)
     
-    return loss_value
+    # Handle losses that return (loss, dict) tuple (e.g., Betti matching losses)
+    if isinstance(result, tuple) and len(result) == 2:
+        loss_value, loss_dict = result
+        # The loss_dict can be logged separately if needed
+        return loss_value
+    else:
+        return result
 
 
 def preserve_auxiliary_targets(targets: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
