@@ -841,7 +841,9 @@ class BaseTrainer:
 
                                     targets_dict_first = {}
                                     for t_name, t_tensor in targets_dict.items():
-                                        targets_dict_first[t_name] = t_tensor[b_idx: b_idx + 1]
+                                        # Skip 'skel' as it's not a real task, just computed data
+                                        if t_name != 'skel':
+                                            targets_dict_first[t_name] = t_tensor[b_idx: b_idx + 1]
 
                                     outputs_dict_first = {}
                                     for t_name, p_tensor in outputs.items():
