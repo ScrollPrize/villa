@@ -326,7 +326,20 @@ class BaseTrainer:
             model = torch.compile(model)
 
         use_amp = not getattr(self.mgr, 'no_amp', False)
-        if not use_amp:
+        
+        # betti loss (and maybe some future ones) require disabling amp because they call .detach()
+        # which breaks the grad chain
+        for task_name, task_info in self.mgr.targets.items():
+            if "losses" in task_info:
+                for loss_cfg in task_info["losses"]:
+                    if loss_cfg["name"] == "BettiMatchingLoss":
+                        use_amp = False
+                        print(f"Automatic Mixed Precision (AMP) disabled due to BettiMatchingLoss (incompatible with gradient computation)")
+                        break
+            if not use_amp:
+                break
+        
+        if not use_amp and getattr(self.mgr, 'no_amp', False):
             print("Automatic Mixed Precision (AMP) is disabled")
         
         scaler = self._get_scaler(self.device.type, use_amp=use_amp)
