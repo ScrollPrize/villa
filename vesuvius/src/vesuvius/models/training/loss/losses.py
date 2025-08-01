@@ -1117,21 +1117,9 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight, mgr=None):
     elif name == 'BettiMatchingLoss':
         from .betti_losses import BettiMatchingLoss
         base_loss = BettiMatchingLoss(
-            relative=loss_config.get('relative', False),
-            filtration=loss_config.get('filtration', 'superlevel'),
-            construction=loss_config.get('construction', 'V'),
-            comparison=loss_config.get('comparison', 'union')
+            filtration=loss_config.get('filtration', 'superlevel')
         )
-    
-    elif name == 'DiceBettiMatchingLoss':
-        from .betti_losses import DiceBettiMatchingLoss
-        base_loss = DiceBettiMatchingLoss(
-            alpha=loss_config.get('alpha', 0.5),
-            relative=loss_config.get('relative', False),
-            filtration=loss_config.get('filtration', 'superlevel'),
-            construction=loss_config.get('construction', 'V'),
-            comparison=loss_config.get('comparison', 'union')
-        )
+
     
     else:
         raise RuntimeError(f"Unsupported loss function: '{name}'")

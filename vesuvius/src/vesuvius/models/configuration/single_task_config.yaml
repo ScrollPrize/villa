@@ -12,7 +12,5 @@ dataset_config:
       losses:
         - name: "MedialSurfaceRecall"
           weight: 1.0
-        - name: "BettiMatchingLoss"
-          weight: 1.0
-          start_epoch: 100
+
 

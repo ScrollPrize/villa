@@ -112,7 +112,7 @@ class BaseTrainer:
     # --- losses ---- #
     def _build_loss(self):
         loss_fns = {}
-        self._deferred_losses = {}  # Store losses that should be added later
+        self._deferred_losses = {}  # losses that may be added later in training (at a selected epoch)
         
         for task_name, task_info in self.mgr.targets.items():
             task_losses = []
@@ -164,15 +164,12 @@ class BaseTrainer:
         return loss_fns
 
     def _update_loss_for_epoch(self, loss_fns, epoch):
-        """Update loss functions based on current epoch. Can be overridden by subclasses."""
-        # Check if there are any deferred losses to add
         if hasattr(self, '_deferred_losses') and self._deferred_losses:
-            # Create a copy of the dictionary keys to avoid modification during iteration
             task_names = list(self._deferred_losses.keys())
             
             for task_name in task_names:
                 deferred_list = self._deferred_losses[task_name]
-                # Filter losses that should start this epoch
+
                 losses_to_add = []
                 remaining_deferred = []
                 
@@ -181,17 +178,14 @@ class BaseTrainer:
                         losses_to_add.append(deferred_loss)
                     else:
                         remaining_deferred.append(deferred_loss)
-                
-                # Add the losses that should start now
+
                 for loss_info in losses_to_add:
                     loss_fns[task_name].append((loss_info['loss_fn'], loss_info['weight']))
                     print(f"\nEpoch {epoch}: Adding {loss_info['name']} to task '{task_name}' (weight: {loss_info['weight']})")
-                
-                # Update the deferred list
+
                 if remaining_deferred:
                     self._deferred_losses[task_name] = remaining_deferred
                 else:
-                    # Remove the task from deferred losses if no more losses to add
                     del self._deferred_losses[task_name]
         
         return loss_fns
@@ -231,25 +225,19 @@ class BaseTrainer:
 
     # --- scaler --- #
     def _initialize_evaluation_metrics(self):
-        """Initialize evaluation metrics for validation."""
+
         metrics = {}
         for task_name, task_config in self.mgr.targets.items():
             task_metrics = []
-            
-            # Add connected components metric
+
             num_classes = task_config.get('num_classes', 2)
             task_metrics.append(ConnectedComponentsMetric(num_classes=num_classes))
-            
-            # Add critical components metric (only for binary segmentation tasks)
+
             if num_classes == 2:
                 task_metrics.append(CriticalComponentsMetric())
-            
-            # Add IOU/Dice metric
+
             task_metrics.append(IOUDiceMetric(num_classes=num_classes))
-            
-            # Add Hausdorff distance metric
             task_metrics.append(HausdorffDistanceMetric(num_classes=num_classes))
-            
             metrics[task_name] = task_metrics
         
         return metrics
@@ -284,7 +272,6 @@ class BaseTrainer:
         dataset_size = len(train_dataset)
         indices = list(range(dataset_size))
 
-        # Set seed for reproducible train/val split
         if hasattr(self.mgr, 'seed'):
             np.random.seed(self.mgr.seed)
             if self.mgr.verbose:
@@ -314,7 +301,6 @@ class BaseTrainer:
         return train_dataloader, val_dataloader, train_indices, val_indices
 
     def _initialize_training(self):
-        """Initialize all training components and return them as a dict."""
         # Check for S3 paths and set up multiprocessing if needed
         if detect_s3_paths(self.mgr):
             print("\nDetected S3 paths in configuration")
@@ -405,8 +391,7 @@ class BaseTrainer:
                 config=mgr_config
             )
 
-    def _get_model_outputs(self, model, data_dict, autocast_ctx):
-        """Extract model outputs from data_dict."""
+    def _get_model_outputs(self, model, data_dict):
         inputs = data_dict["image"].to(self.device, dtype=torch.float32)
         targets_dict = {
             k: v.to(self.device, dtype=torch.float32)
@@ -414,8 +399,7 @@ class BaseTrainer:
             if k not in ["image", "patch_info", "is_unlabeled"]
         }
         
-        with autocast_ctx:
-            outputs = model(inputs)
+        outputs = model(inputs)
         
         return inputs, targets_dict, outputs
 
@@ -435,9 +419,8 @@ class BaseTrainer:
                 else:
                     print(f"{item}: {val.dtype}, {val.shape}, min {val.min()} max {val.max()}")
 
-        inputs, targets_dict, outputs = self._get_model_outputs(model, data_dict, autocast_ctx)
-        
         with autocast_ctx:
+            inputs, targets_dict, outputs = self._get_model_outputs(model, data_dict)
             total_loss, task_losses = self._compute_train_loss(outputs, targets_dict, loss_fns)
 
         # Handle gradient accumulation, clipping, and optimizer step
@@ -454,12 +437,11 @@ class BaseTrainer:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
-            optimizer_stepped = True  # Optimizer step was taken
+            optimizer_stepped = True
 
         return total_loss, task_losses, inputs, targets_dict, outputs, optimizer_stepped
 
     def _compute_train_loss(self, outputs, targets_dict, loss_fns):
-        """Compute training loss for all tasks."""
         total_loss = 0.0
         task_losses = {}
 
@@ -470,7 +452,9 @@ class BaseTrainer:
 
             task_total_loss = 0.0
             for loss_fn, loss_weight in task_loss_fns:
-                # Use auxiliary loss computation helper
+                # this naming is extremely confusing, i know. we route all loss through the aux helper
+                # because it just simplifies adding addtl losses for aux tasks if present.
+                # TODO: rework this janky setup to make it more clear
                 loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt, outputs,
                                                     self.mgr.targets[t_name])
                 task_total_loss += loss_weight * loss_value
@@ -485,7 +469,6 @@ class BaseTrainer:
 
 
     def _validation_step(self, model, data_dict, loss_fns, use_amp):
-        """Execute a single validation step and return loss values."""
         inputs = data_dict["image"].to(self.device, dtype=torch.float32)
         targets_dict = {
             k: v.to(self.device, dtype=torch.float32)
@@ -508,7 +491,6 @@ class BaseTrainer:
         return task_losses, inputs, targets_dict, outputs
 
     def _compute_validation_loss(self, outputs, targets_dict, loss_fns):
-        """Compute validation loss for all tasks."""
         task_losses = {}
 
         for t_name, t_gt in targets_dict.items():
@@ -517,7 +499,9 @@ class BaseTrainer:
 
             task_total_loss = 0.0
             for loss_fn, loss_weight in task_loss_fns:
-                # Use auxiliary loss computation helper (same as training)
+                # this naming is extremely confusing, i know. we route all loss through the aux helper
+                # because it just simplifies adding addtl losses for aux tasks if present.
+                # TODO: rework this janky setup to make it more clear
                 loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt, outputs,
                                                     self.mgr.targets[t_name])
                 task_total_loss += loss_weight * loss_value
@@ -573,7 +557,10 @@ class BaseTrainer:
         return checkpoint_history, best_checkpoints, ckpt_path
 
     def _prepare_metrics_for_logging(self, epoch, step, epoch_losses, current_lr=None, val_losses=None):
-        """Prepare metrics dict for logging but do NOT call wandb.log."""
+
+        # this is a separate method just so i have an easy way to accumulate metrics
+        # TODO: make this easier
+
         metrics = {"epoch": epoch, "step": step}
 
         # Add training losses
@@ -608,7 +595,7 @@ class BaseTrainer:
         return metrics
 
     def train(self):
-        # Initialize all training components
+
         training_state = self._initialize_training()
 
         # Unpack the state
@@ -629,10 +616,8 @@ class BaseTrainer:
         ckpt_dir = training_state['ckpt_dir']
         model_ckpt_dir = training_state['model_ckpt_dir']
 
-        # Initialize wandb if configured
         self._initialize_wandb(train_dataset, val_dataset, train_indices, val_indices)
 
-        # Track validation loss history and checkpoints
         val_loss_history = {}  # {epoch: validation_loss}
         checkpoint_history = deque(maxlen=3)
         best_checkpoints = []
@@ -642,7 +627,6 @@ class BaseTrainer:
         global_step = 0
         grad_accumulate_n = self.mgr.gradient_accumulation
 
-        # Early stopping setup
         early_stopping_patience = getattr(self.mgr, 'early_stopping_patience', 20)
         if early_stopping_patience > 0:
             best_val_loss = float('inf')
