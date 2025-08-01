@@ -34,11 +34,11 @@ class MedialSurfaceTransform(BasicTransform):
                 for z in range(Z):
                     skel[z] |= skeletonize(bin_seg[0][z])
 
-                for y in range(Y):
-                    skel[:, y, :] |= skeletonize(bin_seg[0][:, y, :])
-
-                for x in range(X):
-                    skel[:, :, x] |= skeletonize(bin_seg[0][:, :, x])
+                # for y in range(Y):
+                #     skel[:, y, :] |= skeletonize(bin_seg[0][:, y, :])
+                #
+                # for x in range(X):
+                #     skel[:, :, x] |= skeletonize(bin_seg[0][:, :, x])
 
                 skel = (skel > 0).astype(np.int16)
                 if self.do_tube:
