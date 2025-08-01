@@ -584,15 +584,14 @@ class BaseDataset(Dataset):
                     self.mgr.train_patch_size,
                     patch_center_dist_from_border=0,
                     random_crop=False,
-                    p_elastic_deform=0.3,
-                    elastic_deform_scale=(0, 0.5),
-                    elastic_deform_magnitude=(0, 100),
+                    p_elastic_deform=0,
                     p_rotation=0.5,
                     rotation=rotation_for_DA,
                     p_scaling=0.2,
-                    scaling=(0.5, 2.0),
+                    scaling=(0.7, 1.4),
                     p_synchronize_scaling_across_axes=1,
-                    bg_style_seg_sampling=False
+                    bg_style_seg_sampling=False,  # =, mode_seg='nearest'
+                    elastic_deform_magnitude=(10, 50)
                 )
             )
             
@@ -670,7 +669,7 @@ class BaseDataset(Dataset):
                 if patch_d == patch_h == patch_w:
                     transforms.append(RandomTransform(
                         TransposeAxesTransform(allowed_axes={0, 1, 2}),
-                        apply_probability=0.5
+                        apply_probability=0.2
                     ))
 
             one_of_noise = OneOfTransform([
@@ -745,15 +744,15 @@ class BaseDataset(Dataset):
 
             transforms.append(RandomTransform(
                 one_of_noise,
-                apply_probability=0.3
+                apply_probability=0.2
             ))
             transforms.append(RandomTransform(
                 one_of_intensity,
-                apply_probability=0.3
+                apply_probability=0.2
             ))
             transforms.append(RandomTransform(
                 one_of_blur,
-                apply_probability=0.3
+                apply_probability=0.2
             ))
 
             rectangle_sizes_3d = tuple(
@@ -763,7 +762,7 @@ class BaseDataset(Dataset):
                 BlankRectangleTransform(
                     rectangle_size=rectangle_sizes_3d,
                     rectangle_value=np.mean,
-                    num_rectangles=(1, 5),
+                    num_rectangles=(1, 3),
                     force_square=False,
                     p_per_sample=0.4,
                     p_per_channel=0.5
