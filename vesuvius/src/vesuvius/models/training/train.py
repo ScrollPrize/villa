@@ -839,11 +839,9 @@ class BaseTrainer:
                                     # Slicing shape: [1, c, z, y, x ]
                                     inputs_first = inputs[b_idx: b_idx + 1]
 
-                                    targets_dict_first = {}
+                                    targets_dict_first_all = {}
                                     for t_name, t_tensor in targets_dict.items():
-                                        # Skip 'skel' as it's not a real task, just computed data
-                                        if t_name != 'skel':
-                                            targets_dict_first[t_name] = t_tensor[b_idx: b_idx + 1]
+                                        targets_dict_first_all[t_name] = t_tensor[b_idx: b_idx + 1]
 
                                     outputs_dict_first = {}
                                     for t_name, p_tensor in outputs.items():
@@ -855,10 +853,15 @@ class BaseTrainer:
                                     skeleton_dict = None
                                     train_skeleton_dict = None
                                     if hasattr(self, 'skel_transform'):
-                                        if 'skel' in targets_dict_first:
-                                            skeleton_dict = {'segmentation': targets_dict_first.get('skel')}
+                                        if 'skel' in targets_dict_first_all:
+                                            skeleton_dict = {'segmentation': targets_dict_first_all.get('skel')}
                                         if train_sample_targets and 'skel' in train_sample_targets:
                                             train_skeleton_dict = {'segmentation': train_sample_targets.get('skel')}
+                                    
+                                    targets_dict_first = {}
+                                    for t_name, t_tensor in targets_dict_first_all.items():
+                                        if t_name != 'skel':
+                                            targets_dict_first[t_name] = t_tensor
                                     
                                     frames_array = save_debug(
                                         input_volume=inputs_first,
