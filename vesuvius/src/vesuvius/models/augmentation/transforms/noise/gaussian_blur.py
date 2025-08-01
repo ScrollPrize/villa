@@ -74,7 +74,7 @@ class GaussianBlurTransform(ImageOnlyTransform):
                  synchronize_channels: bool = False,  # todo make this p_synchronize_channels
                  synchronize_axes: bool = False,  # todo make this p_synchronize_axes
                  p_per_channel: float = 1,
-                 benchmark: bool = False
+                 benchmark: bool = True
                  ):
         """
         uses separable gaussian filters for all the speed

@@ -16,6 +16,7 @@ from vesuvius.models.training.auxiliary_tasks import (
 from vesuvius.models.augmentation.transforms.spatial.transpose import TransposeAxesTransform
 # Augmentations will be handled directly in this file
 from vesuvius.models.augmentation.transforms.utils.random import RandomTransform
+from vesuvius.models.augmentation.transforms.utils.oneoftransform import OneOfTransform
 from vesuvius.models.augmentation.helpers.scalar_type import RandomScalar
 from vesuvius.models.augmentation.transforms.intensity.brightness import MultiplicativeBrightnessTransform
 from vesuvius.models.augmentation.transforms.intensity.contrast import ContrastTransform, BGContrast
@@ -583,15 +584,14 @@ class BaseDataset(Dataset):
                     self.mgr.train_patch_size,
                     patch_center_dist_from_border=0,
                     random_crop=False,
-                    p_elastic_deform=0.3,
-                    elastic_deform_scale=(0, 100),
-                    elastic_deform_magnitude=(0, 0.5),
+                    p_elastic_deform=0,
                     p_rotation=0.5,
                     rotation=rotation_for_DA,
                     p_scaling=0.2,
-                    scaling=(0.5, 2.0),
+                    scaling=(0.7, 1.4),
                     p_synchronize_scaling_across_axes=1,
-                    bg_style_seg_sampling=False
+                    bg_style_seg_sampling=False,  # =, mode_seg='nearest'
+                    elastic_deform_magnitude=(10, 50)
                 )
             )
             
@@ -624,20 +624,21 @@ class BaseDataset(Dataset):
                     p_per_channel=1
                 ), apply_probability=0.3
             ))
+
             transforms.append(RandomTransform(
                 ContrastTransform(
-                    contrast_range=BGContrast((0.75, 1.25)),
+                    contrast_range=BGContrast((0.5, 1.5)),
                     preserve_range=True,
                     synchronize_channels=False,
                     p_per_channel=1
-                ), apply_probability=0.3
+                ), apply_probability=0.15
             ))
             transforms.append(RandomTransform(
                 GaussianNoiseTransform(
-                    noise_variance=(0, 0.1),
+                    noise_variance=(0, 0.15),
                     p_per_channel=1,
                     synchronize_channels=True
-                ), apply_probability=0.3
+                ), apply_probability=0.15
             ))
             transforms.append(RandomTransform(
                 GammaTransform(
@@ -668,41 +669,32 @@ class BaseDataset(Dataset):
                 if patch_d == patch_h == patch_w:
                     transforms.append(RandomTransform(
                         TransposeAxesTransform(allowed_axes={0, 1, 2}),
-                        apply_probability=0.5
+                        apply_probability=0.2
                     ))
 
-            transforms.append(RandomTransform(
+            one_of_noise = OneOfTransform([
+                GaussianNoiseTransform(
+                    noise_variance=(0, 0.20),
+                    p_per_channel=1,
+                    synchronize_channels=True
+                ),
+                RicianNoiseTransform(
+                    noise_variance=(0, 0.1),
+                ),
+                SmearTransform(
+                    shift=(10, 0),
+                    alpha=0.5,
+                    num_prev_slices=1,
+                    smear_axis=1
+                )
+            ])
+            one_of_blur = OneOfTransform([
                 GaussianBlurTransform(
                     blur_sigma=(0.5, 1.0),
                     synchronize_channels=True,
                     synchronize_axes=False,
                     p_per_channel=1.0
                 ),
-                apply_probability=0.3
-            ))
-            transforms.append(RandomTransform(
-                GaussianNoiseTransform(
-                    noise_variance=(0, 0.20),
-                    p_per_channel=1,
-                    synchronize_channels=True
-                ), apply_probability=0.3
-            ))
-            transforms.append(RandomTransform(
-                MultiplicativeBrightnessTransform(
-                    multiplier_range=BGContrast((0.75, 1.25)),
-                    synchronize_channels=False,
-                    p_per_channel=1
-                ), apply_probability=0.3
-            ))
-            transforms.append(RandomTransform(
-                ContrastTransform(
-                    contrast_range=BGContrast((0.50, 1.50)),
-                    preserve_range=True,
-                    synchronize_channels=False,
-                    p_per_channel=1
-                ), apply_probability=0.25
-            ))
-            transforms.append(RandomTransform(
                 SimulateLowResolutionTransform(
                     scale=(0.3, 1.5),
                     synchronize_channels=False,
@@ -710,40 +702,34 @@ class BaseDataset(Dataset):
                     ignore_axes=None,
                     allowed_channels=None,
                     p_per_channel=0.5
-                ), apply_probability=0.3
-            ))
-            transforms.append(RandomTransform(
-                GammaTransform(
-                    gamma=BGContrast((0.7, 1.5)),
-                    p_invert_image=1,
+                )
+            ])
+            one_of_intensity = OneOfTransform([
+                MultiplicativeBrightnessTransform(
+                    multiplier_range=BGContrast((0.75, 1.25)),
                     synchronize_channels=False,
-                    p_per_channel=1,
-                    p_retain_stats=1
-                ), apply_probability=0.1
-            ))
-            transforms.append(RandomTransform(
+                    p_per_channel=1
+                ),
+                ContrastTransform(
+                    contrast_range=BGContrast((0.50, 1.50)),
+                    preserve_range=True,
+                    synchronize_channels=False,
+                    p_per_channel=1
+                ),
                 GammaTransform(
                     gamma=BGContrast((0.7, 1.5)),
                     p_invert_image=0,
                     synchronize_channels=False,
                     p_per_channel=1,
                     p_retain_stats=1
-                ), apply_probability=0.3
-            ))
-            rectangle_sizes_3d = tuple(
-                (max(1, size // 10), size // 3) for size in self.mgr.train_patch_size
-            )
-            transforms.append(RandomTransform(
-                BlankRectangleTransform(
-                    rectangle_size=rectangle_sizes_3d,
-                    rectangle_value=np.mean,
-                    num_rectangles=(1, 5),
-                    force_square=False,
-                    p_per_sample=0.4,
-                    p_per_channel=0.5
-                ), apply_probability=0.3
-            ))
-            transforms.append(RandomTransform(
+                ),
+                GammaTransform(
+                    gamma=BGContrast((0.7, 1.5)),
+                    p_invert_image=1,
+                    synchronize_channels=False,
+                    p_per_channel=1,
+                    p_retain_stats=1
+                ),
                 InhomogeneousSliceIlluminationTransform(
                     num_defects=(2, 5),
                     defect_width=(5, 20),
@@ -753,19 +739,33 @@ class BaseDataset(Dataset):
                     p_per_sample=1.0,
                     per_channel=True,
                     p_per_channel=0.5
-                ), apply_probability=0.25
+                )
+            ])
+
+            transforms.append(RandomTransform(
+                one_of_noise,
+                apply_probability=0.2
             ))
             transforms.append(RandomTransform(
-                SmearTransform(
-                    shift=(10, 0),
-                    alpha=0.5,
-                    num_prev_slices=1,
-                    smear_axis=1
-                ), apply_probability=0.3
+                one_of_intensity,
+                apply_probability=0.2
             ))
             transforms.append(RandomTransform(
-                RicianNoiseTransform(
-                    noise_variance=(0, 0.1),
+                one_of_blur,
+                apply_probability=0.2
+            ))
+
+            rectangle_sizes_3d = tuple(
+                (max(1, size // 10), size // 3) for size in self.mgr.train_patch_size
+            )
+            transforms.append(RandomTransform(
+                BlankRectangleTransform(
+                    rectangle_size=rectangle_sizes_3d,
+                    rectangle_value=np.mean,
+                    num_rectangles=(1, 3),
+                    force_square=False,
+                    p_per_sample=0.4,
+                    p_per_channel=0.5
                 ), apply_probability=0.3
             ))
 
