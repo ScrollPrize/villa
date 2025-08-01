@@ -595,6 +595,12 @@ class BaseDataset(Dataset):
                 )
             )
             
+            # Add morphological closing after spatial transform if needed for skeleton
+            if self._needs_skeleton_transform():
+                from vesuvius.models.augmentation.transforms.utils.morphological_closing import MorphologicalClosingTransform
+                transforms.append(MorphologicalClosingTransform(structure_size=2))
+                print("Added MorphologicalClosingTransform after spatial transforms")
+            
             # # Add mirroring
             # transforms.append(RandomTransform(
             #     MirrorTransform(allowed_axes=mirror_axes),
