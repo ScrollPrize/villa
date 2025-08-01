@@ -28,7 +28,7 @@ class MedialSurfaceTransform(BasicTransform):
             seg_all = data_dict[target_key].numpy()
             # Add tubed skeleton GT
             bin_seg = (seg_all > 0)
-            seg_all_skel = np.zeros_like(bin_seg, dtype=np.int16)
+            seg_all_skel = np.zeros_like(bin_seg, dtype=np.float32)
 
             # Skeletonize
             if not np.sum(bin_seg[0]) == 0:
@@ -45,14 +45,14 @@ class MedialSurfaceTransform(BasicTransform):
                 # for x in range(X):
                 #     skel[:, :, x] |= skeletonize(bin_seg[0][:, :, x])
 
-                skel = (skel > 0).astype(np.int16)
+                skel = (skel > 0).astype(np.float32)
                 if self.do_tube:
                     skel = dilation(dilation(skel))
                 if self.do_open:
                     skel = opening(skel)
                 if self.do_close:
                     skel = closing(skel)
-                skel *= seg_all[0].astype(np.int16)
+                skel = skel.astype(np.float32) * seg_all[0].astype(np.float32)
                 seg_all_skel[0] = skel
 
             # Store skeleton for each target with a unique key
