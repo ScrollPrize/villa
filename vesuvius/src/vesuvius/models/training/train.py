@@ -732,9 +732,15 @@ class BaseTrainer:
                     
                     if found_non_zero:
                         train_sample_input = inputs[b_idx: b_idx + 1]
-                        train_sample_targets = {}
+                        # First collect all targets including skel
+                        train_sample_targets_all = {}
                         for t_name, t_tensor in targets_dict.items():
-                            train_sample_targets[t_name] = t_tensor[b_idx: b_idx + 1]
+                            train_sample_targets_all[t_name] = t_tensor[b_idx: b_idx + 1]
+                        # Now create train_sample_targets without skel for save_debug
+                        train_sample_targets = {}
+                        for t_name, t_tensor in train_sample_targets_all.items():
+                            if t_name != 'skel':
+                                train_sample_targets[t_name] = t_tensor
                         train_sample_outputs = {}
                         for t_name, p_tensor in outputs.items():
                             train_sample_outputs[t_name] = p_tensor[b_idx: b_idx + 1]
@@ -855,8 +861,9 @@ class BaseTrainer:
                                     if hasattr(self, 'skel_transform'):
                                         if 'skel' in targets_dict_first_all:
                                             skeleton_dict = {'segmentation': targets_dict_first_all.get('skel')}
-                                        if train_sample_targets and 'skel' in train_sample_targets:
-                                            train_skeleton_dict = {'segmentation': train_sample_targets.get('skel')}
+                                        # Check if train_sample_targets_all exists (from earlier training step)
+                                        if 'train_sample_targets_all' in locals() and train_sample_targets_all and 'skel' in train_sample_targets_all:
+                                            train_skeleton_dict = {'segmentation': train_sample_targets_all.get('skel')}
                                     
                                     targets_dict_first = {}
                                     for t_name, t_tensor in targets_dict_first_all.items():
