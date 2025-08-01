@@ -1113,7 +1113,6 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight, mgr=None):
             dice_class=MemoryEfficientSoftDiceLoss
         )
     
-    # Betti Matching losses
     elif name == 'BettiMatchingLoss':
         from .betti_losses import BettiMatchingLoss
         base_loss = BettiMatchingLoss(
