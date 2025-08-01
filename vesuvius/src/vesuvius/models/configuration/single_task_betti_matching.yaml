@@ -13,8 +13,8 @@ dataset_config:
         - name: "MedialSurfaceRecall"
           weight: 1.0
         - name: "BettiMatchingLoss"
-          weight: 1.0
+          weight: 0.25
           kwargs:
             filtration: 'superlevel'
-          start_epoch: 1
+          start_epoch: 25
 
