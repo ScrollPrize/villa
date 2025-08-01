@@ -392,9 +392,9 @@ class BaseTrainer:
             )
 
     def _get_model_outputs(self, model, data_dict):
-        inputs = data_dict["image"].to(self.device, dtype=torch.float32)
+        inputs = data_dict["image"].to(self.device)
         targets_dict = {
-            k: v.to(self.device, dtype=torch.float32)
+            k: v.to(self.device)
             for k, v in data_dict.items()
             if k not in ["image", "patch_info", "is_unlabeled"]
         }
@@ -469,9 +469,9 @@ class BaseTrainer:
 
 
     def _validation_step(self, model, data_dict, loss_fns, use_amp):
-        inputs = data_dict["image"].to(self.device, dtype=torch.float32)
+        inputs = data_dict["image"].to(self.device)
         targets_dict = {
-            k: v.to(self.device, dtype=torch.float32)
+            k: v.to(self.device)
             for k, v in data_dict.items()
             if k not in ["image", "patch_info", "is_unlabeled"]
         }
