@@ -17,30 +17,44 @@ class MedialSurfaceTransform(BasicTransform):
         self.do_tube = do_tube
 
     def apply(self, data_dict, **params):
-        seg_all = data_dict['segmentation'].numpy()
+        seg_tensor = data_dict['segmentation'].float()
+        seg_all = seg_tensor.cpu().numpy()
         # Add tubed skeleton GT
         bin_seg = (seg_all > 0)
         seg_all_skel = np.zeros_like(bin_seg, dtype=np.int16)
 
         # Skeletonize
         if not np.sum(bin_seg[0]) == 0:
-            skel = np.zeros_like(bin_seg[0])
+            # Handle both 4D (C, Z, Y, X) and 3D (Z, Y, X) cases
+            if bin_seg[0].ndim == 4:
+                # If there's a channel dimension, use first channel
+                bin_seg_3d = bin_seg[0][0]  # Extract first channel
+                seg_all_3d = seg_all[0][0]
+            else:
+                bin_seg_3d = bin_seg[0]
+                seg_all_3d = seg_all[0]
+                
+            skel = np.zeros_like(bin_seg_3d)
             Z, Y, X = skel.shape
 
             for z in range(Z):
-                skel[z] |= skeletonize(bin_seg[0][z])
+                skel[z] |= skeletonize(bin_seg_3d[z])
 
             for y in range(Y):
-                skel[:, y, :] |= skeletonize(bin_seg[0][:, y, :])
+                skel[:, y, :] |= skeletonize(bin_seg_3d[:, y, :])
 
             for x in range(X):
-                skel[:, :, x] |= skeletonize(bin_seg[0][:, :, x])
+                skel[:, :, x] |= skeletonize(bin_seg_3d[:, :, x])
 
             skel = (skel > 0).astype(np.int16)
             if self.do_tube:
                 skel = dilation(dilation(skel))
-            skel *= seg_all[0].astype(np.int16)
-            seg_all_skel[0] = skel
+            skel *= seg_all_3d.astype(np.int16)
+
+            if bin_seg[0].ndim == 4:
+                seg_all_skel[0][0] = skel
+            else:
+                seg_all_skel[0] = skel
 
         data_dict["skel"] = torch.from_numpy(seg_all_skel)
         return data_dict
@@ -60,7 +74,14 @@ class MedialSurfaceRecallTrainer(BaseTrainer):
 
         # Apply skeleton transform to get skel from segmentation
         # The transform expects 'segmentation' key, so we need to create a temp dict
-        temp_dict = {"segmentation": targets_dict.get("segmentation", targets_dict.get("ink", None))}
+        # Get the first target from targets_dict (should be the main segmentation target)
+        main_target = None
+        for target_name in self.mgr.targets.keys():
+            if target_name in targets_dict:
+                main_target = targets_dict[target_name]
+                break
+        
+        temp_dict = {"segmentation": main_target}
         if temp_dict["segmentation"] is not None:
             temp_dict = self.skel_transform.apply(temp_dict)
             targets_dict["skel"] = temp_dict["skel"].to(self.device)

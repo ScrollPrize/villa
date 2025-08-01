@@ -41,7 +41,7 @@ class SoftSkeletonRecallLoss(nn.Module):
                 y_onehot = y[:, 1:]
             else:
                 gt = y.long()
-                y_onehot = torch.zeros(shp_x, device=x.device, dtype=y.dtype)
+                y_onehot = torch.zeros(shp_x, device=x.device, dtype=x.dtype)
                 y_onehot.scatter_(1, gt, 1)
                 y_onehot = y_onehot[:, 1:]
 

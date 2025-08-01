@@ -491,10 +491,14 @@ class BaseTrainer:
         }
 
         if use_amp:
-            context = (
-                torch.amp.autocast('cuda') if self.device.type == 'cuda'
-                else nullcontext()
-            )
+            if self.device.type == 'cuda':
+                if torch.cuda.is_bf16_supported():
+                    context = torch.amp.autocast('cuda', dtype=torch.bfloat16)
+                else:
+                    context = torch.amp.autocast('cuda')
+            else:
+                context = torch.amp.autocast(self.device.type)
+            
         else:
             context = nullcontext()
 
