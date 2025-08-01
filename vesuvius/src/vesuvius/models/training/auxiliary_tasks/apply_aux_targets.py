@@ -41,7 +41,8 @@ def create_auxiliary_task(task_type: str, aux_task_name: str, aux_config: Dict[s
 
 
 def compute_auxiliary_loss(loss_fn, t_pred: torch.Tensor, t_gt_masked: torch.Tensor, 
-                          outputs: Dict[str, torch.Tensor], target_info: Dict[str, Any]) -> torch.Tensor:
+                          outputs: Dict[str, torch.Tensor], target_info: Dict[str, Any],
+                          skeleton_data: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Handle special loss computation for auxiliary tasks.
     
@@ -57,29 +58,49 @@ def compute_auxiliary_loss(loss_fn, t_pred: torch.Tensor, t_gt_masked: torch.Ten
         Dictionary of all model outputs
     target_info : dict
         Target configuration information
+    skeleton_data : torch.Tensor, optional
+        Pre-computed skeleton data for skeleton-aware losses
         
     Returns
     -------
     torch.Tensor
         Computed loss value
     """
+    # Check if this is a skeleton-aware loss
+    loss_name = loss_fn.__class__.__name__ if hasattr(loss_fn, '__class__') else str(loss_fn)
+    skeleton_losses = ['DC_SkelREC_and_CE_loss', 'SoftSkeletonRecallLoss']
+    
+    if loss_name in skeleton_losses:
+        if skeleton_data is not None:
+            # Pass skeleton data as third argument for skeleton-aware losses
+            result = loss_fn(t_pred, t_gt_masked, skeleton_data)
+        else:
+            # For skeleton losses, we must have skeleton data
+            raise ValueError(f"Skeleton loss {loss_name} requires skeleton data but none was provided. "
+                           f"Make sure MedialSurfaceTransform is in your transform pipeline.")
     # Check if this target has a source_target (indicating it's an auxiliary task)
-    if 'source_target' in target_info:
+    elif 'source_target' in target_info:
         source_target_name = target_info['source_target']
         if source_target_name in outputs:
             # Try to pass source predictions as keyword argument
             # This way, losses that don't expect it won't break
             try:
-                loss_value = loss_fn(t_pred, t_gt_masked, source_pred=outputs[source_target_name])
+                result = loss_fn(t_pred, t_gt_masked, source_pred=outputs[source_target_name])
             except TypeError:
                 # Fallback to standard call if loss doesn't accept source_pred
-                loss_value = loss_fn(t_pred, t_gt_masked)
+                result = loss_fn(t_pred, t_gt_masked)
         else:
-            loss_value = loss_fn(t_pred, t_gt_masked)
+            result = loss_fn(t_pred, t_gt_masked)
     else:
-        loss_value = loss_fn(t_pred, t_gt_masked)
+        result = loss_fn(t_pred, t_gt_masked)
     
-    return loss_value
+    # Handle losses that return (loss, dict) tuple (e.g., Betti matching losses)
+    if isinstance(result, tuple) and len(result) == 2:
+        loss_value, loss_dict = result
+        # The loss_dict can be logged separately if needed
+        return loss_value
+    else:
+        return result
 
 
 def preserve_auxiliary_targets(targets: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:

@@ -112,8 +112,11 @@ class BaseTrainer:
     # --- losses ---- #
     def _build_loss(self):
         loss_fns = {}
+        self._deferred_losses = {}  # losses that may be added later in training (at a selected epoch)
+        
         for task_name, task_info in self.mgr.targets.items():
             task_losses = []
+            deferred_losses = []
 
             if "losses" in task_info:
                 print(f"Target {task_name} using multiple losses:")
@@ -121,11 +124,11 @@ class BaseTrainer:
                     loss_name = loss_cfg["name"]
                     loss_weight = loss_cfg.get("weight", 1.0)
                     loss_kwargs = loss_cfg.get("kwargs", {})
+                    start_epoch = loss_cfg.get("start_epoch", 0)
 
                     weight = loss_kwargs.get("weight", None)
                     ignore_index = loss_kwargs.get("ignore_index", -100)
                     pos_weight = loss_kwargs.get("pos_weight", None)
-
 
                     try:
                         loss_fn = _create_loss(
@@ -136,14 +139,55 @@ class BaseTrainer:
                             pos_weight=pos_weight,
                             mgr=self.mgr
                         )
-                        task_losses.append((loss_fn, loss_weight))
-                        print(f"  - {loss_name} (weight: {loss_weight})")
+                        
+                        if start_epoch > 0:
+                            # Store for later addition
+                            deferred_losses.append({
+                                'loss_fn': loss_fn,
+                                'weight': loss_weight,
+                                'start_epoch': start_epoch,
+                                'name': loss_name
+                            })
+                            print(f"  - {loss_name} (weight: {loss_weight}) - will start at epoch {start_epoch}")
+                        else:
+                            # Add immediately
+                            task_losses.append((loss_fn, loss_weight))
+                            print(f"  - {loss_name} (weight: {loss_weight})")
                     except RuntimeError as e:
                         raise ValueError(
                             f"Failed to create loss function '{loss_name}' for target '{task_name}': {str(e)}")
 
             loss_fns[task_name] = task_losses
+            if deferred_losses:
+                self._deferred_losses[task_name] = deferred_losses
 
+        return loss_fns
+
+    def _update_loss_for_epoch(self, loss_fns, epoch):
+        if hasattr(self, '_deferred_losses') and self._deferred_losses:
+            task_names = list(self._deferred_losses.keys())
+            
+            for task_name in task_names:
+                deferred_list = self._deferred_losses[task_name]
+
+                losses_to_add = []
+                remaining_deferred = []
+                
+                for deferred_loss in deferred_list:
+                    if epoch >= deferred_loss['start_epoch']:
+                        losses_to_add.append(deferred_loss)
+                    else:
+                        remaining_deferred.append(deferred_loss)
+
+                for loss_info in losses_to_add:
+                    loss_fns[task_name].append((loss_info['loss_fn'], loss_info['weight']))
+                    print(f"\nEpoch {epoch}: Adding {loss_info['name']} to task '{task_name}' (weight: {loss_info['weight']})")
+
+                if remaining_deferred:
+                    self._deferred_losses[task_name] = remaining_deferred
+                else:
+                    del self._deferred_losses[task_name]
+        
         return loss_fns
 
     # --- optimizer ---- #
@@ -181,25 +225,19 @@ class BaseTrainer:
 
     # --- scaler --- #
     def _initialize_evaluation_metrics(self):
-        """Initialize evaluation metrics for validation."""
+
         metrics = {}
         for task_name, task_config in self.mgr.targets.items():
             task_metrics = []
-            
-            # Add connected components metric
+
             num_classes = task_config.get('num_classes', 2)
             task_metrics.append(ConnectedComponentsMetric(num_classes=num_classes))
-            
-            # Add critical components metric (only for binary segmentation tasks)
+
             if num_classes == 2:
                 task_metrics.append(CriticalComponentsMetric())
-            
-            # Add IOU/Dice metric
+
             task_metrics.append(IOUDiceMetric(num_classes=num_classes))
-            
-            # Add Hausdorff distance metric
             task_metrics.append(HausdorffDistanceMetric(num_classes=num_classes))
-            
             metrics[task_name] = task_metrics
         
         return metrics
@@ -207,7 +245,8 @@ class BaseTrainer:
     def _get_scaler(self, device_type='cuda', use_amp=True):
         # for cuda, we can use a grad scaler for mixed precision training if amp is enabled
         # for mps or cpu, or when amp is disabled, we create a dummy scaler that does nothing
-        if device_type == 'cuda' and use_amp:
+        # Only use GradScaler for float16, not bfloat16
+        if device_type == 'cuda' and use_amp and not torch.cuda.is_bf16_supported():
             return torch.amp.GradScaler('cuda')
         else:
             class DummyScaler:
@@ -234,7 +273,6 @@ class BaseTrainer:
         dataset_size = len(train_dataset)
         indices = list(range(dataset_size))
 
-        # Set seed for reproducible train/val split
         if hasattr(self.mgr, 'seed'):
             np.random.seed(self.mgr.seed)
             if self.mgr.verbose:
@@ -264,7 +302,6 @@ class BaseTrainer:
         return train_dataloader, val_dataloader, train_indices, val_indices
 
     def _initialize_training(self):
-        """Initialize all training components and return them as a dict."""
         # Check for S3 paths and set up multiprocessing if needed
         if detect_s3_paths(self.mgr):
             print("\nDetected S3 paths in configuration")
@@ -290,7 +327,20 @@ class BaseTrainer:
             model = torch.compile(model)
 
         use_amp = not getattr(self.mgr, 'no_amp', False)
-        if not use_amp:
+        
+        # betti loss (and maybe some future ones) require disabling amp because they call .detach()
+        # which breaks the grad chain
+        for task_name, task_info in self.mgr.targets.items():
+            if "losses" in task_info:
+                for loss_cfg in task_info["losses"]:
+                    if loss_cfg["name"] == "BettiMatchingLoss":
+                        use_amp = False
+                        print(f"Automatic Mixed Precision (AMP) disabled due to BettiMatchingLoss (incompatible with gradient computation)")
+                        break
+            if not use_amp:
+                break
+        
+        if not use_amp and getattr(self.mgr, 'no_amp', False):
             print("Automatic Mixed Precision (AMP) is disabled")
         
         scaler = self._get_scaler(self.device.type, use_amp=use_amp)
@@ -355,17 +405,15 @@ class BaseTrainer:
                 config=mgr_config
             )
 
-    def _get_model_outputs(self, model, data_dict, autocast_ctx):
-        """Extract model outputs from data_dict."""
-        inputs = data_dict["image"].to(self.device, dtype=torch.float32)
+    def _get_model_outputs(self, model, data_dict):
+        inputs = data_dict["image"].to(self.device)
         targets_dict = {
-            k: v.to(self.device, dtype=torch.float32)
+            k: v.to(self.device)
             for k, v in data_dict.items()
             if k not in ["image", "patch_info", "is_unlabeled"]
         }
         
-        with autocast_ctx:
-            outputs = model(inputs)
+        outputs = model(inputs)
         
         return inputs, targets_dict, outputs
 
@@ -385,9 +433,8 @@ class BaseTrainer:
                 else:
                     print(f"{item}: {val.dtype}, {val.shape}, min {val.min()} max {val.max()}")
 
-        inputs, targets_dict, outputs = self._get_model_outputs(model, data_dict, autocast_ctx)
-        
         with autocast_ctx:
+            inputs, targets_dict, outputs = self._get_model_outputs(model, data_dict)
             total_loss, task_losses = self._compute_train_loss(outputs, targets_dict, loss_fns)
 
         # Handle gradient accumulation, clipping, and optimizer step
@@ -404,25 +451,30 @@ class BaseTrainer:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
-            optimizer_stepped = True  # Optimizer step was taken
+            optimizer_stepped = True
 
         return total_loss, task_losses, inputs, targets_dict, outputs, optimizer_stepped
 
     def _compute_train_loss(self, outputs, targets_dict, loss_fns):
-        """Compute training loss for all tasks."""
         total_loss = 0.0
         task_losses = {}
 
         for t_name, t_gt in targets_dict.items():
+            if t_name == 'skel' or t_name.endswith('_skel') or t_name == 'is_unlabeled':
+                continue  # Skip skeleton data and metadata as they're not predicted outputs
             t_pred = outputs[t_name]
             task_loss_fns = loss_fns[t_name]  # List of (loss_fn, weight) tuples
             task_weight = self.mgr.targets[t_name].get("weight", 1.0)
 
             task_total_loss = 0.0
             for loss_fn, loss_weight in task_loss_fns:
-                # Use auxiliary loss computation helper
+                # this naming is extremely confusing, i know. we route all loss through the aux helper
+                # because it just simplifies adding addtl losses for aux tasks if present.
+                # TODO: rework this janky setup to make it more clear
+                # Get skeleton data if available
+                skeleton_data = targets_dict.get(f'{t_name}_skel', None)
                 loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt, outputs,
-                                                    self.mgr.targets[t_name])
+                                                    self.mgr.targets[t_name], skeleton_data)
                 task_total_loss += loss_weight * loss_value
 
             weighted_loss = task_weight * task_total_loss
@@ -435,19 +487,22 @@ class BaseTrainer:
 
 
     def _validation_step(self, model, data_dict, loss_fns, use_amp):
-        """Execute a single validation step and return loss values."""
-        inputs = data_dict["image"].to(self.device, dtype=torch.float32)
+        inputs = data_dict["image"].to(self.device)
         targets_dict = {
-            k: v.to(self.device, dtype=torch.float32)
+            k: v.to(self.device)
             for k, v in data_dict.items()
             if k not in ["image", "patch_info", "is_unlabeled"]
         }
 
         if use_amp:
-            context = (
-                torch.amp.autocast('cuda') if self.device.type == 'cuda'
-                else nullcontext()
-            )
+            if self.device.type == 'cuda':
+                if torch.cuda.is_bf16_supported():
+                    context = torch.amp.autocast('cuda', dtype=torch.bfloat16)
+                else:
+                    context = torch.amp.autocast('cuda')
+            else:
+                context = torch.amp.autocast(self.device.type)
+            
         else:
             context = nullcontext()
 
@@ -458,17 +513,20 @@ class BaseTrainer:
         return task_losses, inputs, targets_dict, outputs
 
     def _compute_validation_loss(self, outputs, targets_dict, loss_fns):
-        """Compute validation loss for all tasks."""
         task_losses = {}
 
         for t_name, t_gt in targets_dict.items():
+            if t_name == 'skel' or t_name.endswith('_skel') or t_name == 'is_unlabeled':
+                continue  # Skip skeleton data and metadata as they're not predicted outputs
             t_pred = outputs[t_name]
             task_loss_fns = loss_fns[t_name]  # List of (loss_fn, weight) tuples
 
             task_total_loss = 0.0
             for loss_fn, loss_weight in task_loss_fns:
-                # Compute loss
-                loss_value = loss_fn(t_pred, t_gt)
+                # Get skeleton data if available
+                skeleton_data = targets_dict.get(f'{t_name}_skel', None)
+                loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt, outputs,
+                                                    self.mgr.targets[t_name], skeleton_data)
                 task_total_loss += loss_weight * loss_value
 
             task_losses[t_name] = task_total_loss.detach().cpu().item()
@@ -522,7 +580,10 @@ class BaseTrainer:
         return checkpoint_history, best_checkpoints, ckpt_path
 
     def _prepare_metrics_for_logging(self, epoch, step, epoch_losses, current_lr=None, val_losses=None):
-        """Prepare metrics dict for logging but do NOT call wandb.log."""
+
+        # this is a separate method just so i have an easy way to accumulate metrics
+        # TODO: make this easier
+
         metrics = {"epoch": epoch, "step": step}
 
         # Add training losses
@@ -557,7 +618,7 @@ class BaseTrainer:
         return metrics
 
     def train(self):
-        # Initialize all training components
+
         training_state = self._initialize_training()
 
         # Unpack the state
@@ -578,10 +639,8 @@ class BaseTrainer:
         ckpt_dir = training_state['ckpt_dir']
         model_ckpt_dir = training_state['model_ckpt_dir']
 
-        # Initialize wandb if configured
         self._initialize_wandb(train_dataset, val_dataset, train_indices, val_indices)
 
-        # Track validation loss history and checkpoints
         val_loss_history = {}  # {epoch: validation_loss}
         checkpoint_history = deque(maxlen=3)
         best_checkpoints = []
@@ -591,7 +650,6 @@ class BaseTrainer:
         global_step = 0
         grad_accumulate_n = self.mgr.gradient_accumulation
 
-        # Early stopping setup
         early_stopping_patience = getattr(self.mgr, 'early_stopping_patience', 20)
         if early_stopping_patience > 0:
             best_val_loss = float('inf')
@@ -602,6 +660,9 @@ class BaseTrainer:
 
         # ---- training! ----- #
         for epoch in range(start_epoch, self.mgr.max_epoch):
+            # Update loss functions for this epoch
+            loss_fns = self._update_loss_for_epoch(loss_fns, epoch)
+            
             model.train()
 
             if getattr(self.mgr, 'max_steps_per_epoch', None) is not None and self.mgr.max_steps_per_epoch > 0:
@@ -631,7 +692,12 @@ class BaseTrainer:
                 global_step += 1
                 
                 # Setup autocast context
-                if use_amp and self.device.type in ['cuda', 'cpu']:
+                if use_amp and self.device.type == 'cuda':
+                    if torch.cuda.is_bf16_supported():
+                        autocast_ctx = torch.amp.autocast('cuda', dtype=torch.bfloat16)
+                    else:
+                        autocast_ctx = torch.amp.autocast('cuda')
+                elif use_amp and self.device.type in ['cpu', 'mlx']:
                     autocast_ctx = torch.amp.autocast(self.device.type)
                 else:
                     autocast_ctx = nullcontext()
@@ -671,9 +737,15 @@ class BaseTrainer:
                     
                     if found_non_zero:
                         train_sample_input = inputs[b_idx: b_idx + 1]
-                        train_sample_targets = {}
+                        # First collect all targets including skel
+                        train_sample_targets_all = {}
                         for t_name, t_tensor in targets_dict.items():
-                            train_sample_targets[t_name] = t_tensor[b_idx: b_idx + 1]
+                            train_sample_targets_all[t_name] = t_tensor[b_idx: b_idx + 1]
+                        # Now create train_sample_targets without skel for save_debug
+                        train_sample_targets = {}
+                        for t_name, t_tensor in train_sample_targets_all.items():
+                            if t_name != 'skel':
+                                train_sample_targets[t_name] = t_tensor
                         train_sample_outputs = {}
                         for t_name, p_tensor in outputs.items():
                             train_sample_outputs[t_name] = p_tensor[b_idx: b_idx + 1]
@@ -778,9 +850,9 @@ class BaseTrainer:
                                     # Slicing shape: [1, c, z, y, x ]
                                     inputs_first = inputs[b_idx: b_idx + 1]
 
-                                    targets_dict_first = {}
+                                    targets_dict_first_all = {}
                                     for t_name, t_tensor in targets_dict.items():
-                                        targets_dict_first[t_name] = t_tensor[b_idx: b_idx + 1]
+                                        targets_dict_first_all[t_name] = t_tensor[b_idx: b_idx + 1]
 
                                     outputs_dict_first = {}
                                     for t_name, p_tensor in outputs.items():
@@ -791,11 +863,17 @@ class BaseTrainer:
                                     # Extract skeleton data if using SkeletonRecallTrainer
                                     skeleton_dict = None
                                     train_skeleton_dict = None
-                                    if hasattr(self, 'skel_transform'):
-                                        if 'skel' in targets_dict_first:
-                                            skeleton_dict = {'segmentation': targets_dict_first.get('skel')}
-                                        if train_sample_targets and 'skel' in train_sample_targets:
-                                            train_skeleton_dict = {'segmentation': train_sample_targets.get('skel')}
+                                    # Check if skeleton data is available in the batch
+                                    if 'skel' in targets_dict_first_all:
+                                        skeleton_dict = {'segmentation': targets_dict_first_all.get('skel')}
+                                    # Check if train_sample_targets_all exists (from earlier training step)
+                                    if 'train_sample_targets_all' in locals() and train_sample_targets_all and 'skel' in train_sample_targets_all:
+                                        train_skeleton_dict = {'segmentation': train_sample_targets_all.get('skel')}
+                                    
+                                    targets_dict_first = {}
+                                    for t_name, t_tensor in targets_dict_first_all.items():
+                                        if t_name != 'skel':
+                                            targets_dict_first[t_name] = t_tensor
                                     
                                     frames_array = save_debug(
                                         input_volume=inputs_first,
@@ -920,12 +998,6 @@ class BaseTrainer:
             train_dataset=train_dataset
         )
 
-
-
-
-
-
-
 def main():
     """Main entry point for the training script."""
     import argparse
@@ -984,8 +1056,12 @@ def main():
                         help="Gradient clipping value (default: 12.0)")
     parser.add_argument("--no-amp", action="store_true",
                         help="Disable Automatic Mixed Precision (AMP) for training")
-    parser.add_argument("--skip-intensity-sampling", action="store_true",
-                        help="Skip intensity sampling during dataset initialization")
+    parser.add_argument("--skip-intensity-sampling", dest="skip_intensity_sampling", 
+                        action="store_true", default=True,
+                        help="Skip intensity sampling during dataset initialization (default: True)")
+    parser.add_argument("--no-skip-intensity-sampling", dest="skip_intensity_sampling",
+                        action="store_false",
+                        help="Enable intensity sampling during dataset initialization")
     parser.add_argument("--early-stopping-patience", type=int, default=20,
                         help="Number of epochs to wait for validation loss improvement before early stopping (default: 5, set to 0 to disable)")
 
@@ -1039,15 +1115,11 @@ def main():
         from vesuvius.models.training.trainers.train_uncertainty_aware_mean_teacher import UncertaintyAwareMeanTeacher3DTrainer
         trainer = UncertaintyAwareMeanTeacher3DTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Uncertainty-Aware Mean Teacher Trainer for semi-supervised 3D training")
-    elif trainer_name == "medial_surface_recall":
-        from vesuvius.models.training.trainers.train_medial_surface_recall import MedialSurfaceRecallTrainer
-        trainer = MedialSurfaceRecallTrainer(mgr=mgr, verbose=args.verbose)
-        print("Using MedialSurfaceRecallTrainer")
     elif trainer_name == "base":
         trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Base Trainer for supervised training")
     else:
-        raise ValueError(f"Unknown trainer: {trainer_name}. Available options: base, uncertainty_aware_mean_teacher, medial_surface_recall")
+        raise ValueError(f"Unknown trainer: {trainer_name}. Available options: base, uncertainty_aware_mean_teacher")
 
     print("Starting training...")
     trainer.train()

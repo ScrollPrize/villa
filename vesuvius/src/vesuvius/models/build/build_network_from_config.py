@@ -56,7 +56,7 @@ def get_activation_module(activation_str: str):
     elif act_str == "sigmoid":
         return nn.Sigmoid()
     elif act_str == "softmax":
-        return nn.Sigmoid()
+        return nn.Softmax()
     else:
         raise ValueError(f"Unknown activation type: {activation_str}")
 
@@ -315,7 +315,7 @@ class NetworkFromConfig(nn.Module):
             # Update target_info with the determined channels
             target_info["out_channels"] = out_channels
 
-            activation_str = target_info.get("activation", "sigmoid")
+            activation_str = target_info.get("activation", "none")
             self.task_decoders[target_name] = Decoder(
                 encoder=self.shared_encoder,
                 basic_block=model_config.get("basic_decoder_block", "ConvBlock"),

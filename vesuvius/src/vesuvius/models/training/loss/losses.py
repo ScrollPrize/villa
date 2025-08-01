@@ -2,6 +2,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn as nn
 from torch.nn import MSELoss, SmoothL1Loss, L1Loss
+import sys
+import os
 
 # Import nnUNet losses
 from .nnunet_losses import (
@@ -1076,8 +1078,6 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight, mgr=None):
         )
 
     elif name == 'MedialSurfaceRecall':
-        if mgr and hasattr(mgr, 'trainer_class') and mgr.trainer_class != 'medial_surface_recall':
-            raise RuntimeError(f"MedialSurfaceRecall loss requires --trainer medial_surface_recall")
         from vesuvius.models.training.loss.skeleton_recall import DC_SkelREC_and_CE_loss
         soft_dice_kwargs = {
             'batch_dice': loss_config.get('batch_dice', False),
@@ -1110,6 +1110,13 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight, mgr=None):
             ignore_label=ignore_index,
             dice_class=MemoryEfficientSoftDiceLoss
         )
+
+    elif name == 'BettiMatchingLoss':
+        from .betti_losses import BettiMatchingLoss
+        base_loss = BettiMatchingLoss(
+            filtration=loss_config.get('filtration', 'superlevel')
+        )
+
     
     else:
         raise RuntimeError(f"Unsupported loss function: '{name}'")

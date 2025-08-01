@@ -128,12 +128,16 @@ def update_config_from_args(mgr, args):
         if mgr.verbose:
             print(f"Disabled spatial transformations (--no-spatial flag set)")
 
-    if args.skip_intensity_sampling:
-        mgr.skip_intensity_sampling = True
+    # Handle skip_intensity_sampling (default is True now)
+    if hasattr(args, 'skip_intensity_sampling'):
+        mgr.skip_intensity_sampling = args.skip_intensity_sampling
         if hasattr(mgr, 'dataset_config'):
-            mgr.dataset_config['skip_intensity_sampling'] = True
+            mgr.dataset_config['skip_intensity_sampling'] = args.skip_intensity_sampling
         if mgr.verbose:
-            print(f"Skipping intensity sampling (--skip-intensity-sampling flag set)")
+            if args.skip_intensity_sampling:
+                print(f"Skipping intensity sampling (default behavior)")
+            else:
+                print(f"Intensity sampling enabled (--no-skip-intensity-sampling flag set)")
 
     if args.grad_clip is not None:
         mgr.gradient_clip = args.grad_clip

@@ -25,3 +25,4 @@ segmentation/models/batchgeneratorsv2/build/
 segmentation/napari_trainer/cline_rules.md
 segmentation/napari_trainer/test_1638_debug.png
 /wandb
+/vesuvius/external

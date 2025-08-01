@@ -147,6 +147,11 @@ class BaseDataset(Dataset):
         if self.is_training:
             self.transforms = self._create_training_transforms()
             print("Training transforms initialized")
+        else:
+            # For validation, we might still need skeleton transform
+            self.transforms = self._create_validation_transforms()
+            if self.transforms is not None:
+                print("Validation transforms initialized")
 
         if not self.skip_patch_validation:
             self._get_valid_patches()
@@ -204,6 +209,24 @@ class BaseDataset(Dataset):
            - self.data_paths: List of data paths for each volume
         """
         raise NotImplementedError("Subclasses must implement _initialize_volumes() method")
+
+    def _needs_skeleton_transform(self):
+        """
+        Check if any configured loss requires skeleton data.
+        
+        Returns
+        -------
+        bool
+            True if skeleton transform should be added to the pipeline
+        """
+        skeleton_losses = ['MedialSurfaceRecall', 'DC_SkelREC_and_CE_loss', 'SoftSkeletonRecallLoss']
+        
+        for target_name, target_info in self.targets.items():
+            if "losses" in target_info:
+                for loss_cfg in target_info["losses"]:
+                    if loss_cfg["name"] in skeleton_losses:
+                        return True
+        return False
 
     def _get_all_sliding_window_positions(self, volume_shape, patch_size, stride=None):
         """
@@ -572,6 +595,12 @@ class BaseDataset(Dataset):
                 )
             )
             
+            # Add morphological closing after spatial transform if needed for skeleton
+            if self._needs_skeleton_transform():
+                from vesuvius.models.augmentation.transforms.utils.morphological_closing import MorphologicalClosingTransform
+                transforms.append(MorphologicalClosingTransform(structure_size=2))
+                print("Added MorphologicalClosingTransform after spatial transforms")
+            
             # # Add mirroring
             # transforms.append(RandomTransform(
             #     MirrorTransform(allowed_axes=mirror_axes),
@@ -743,6 +772,30 @@ class BaseDataset(Dataset):
         if no_spatial:
             print("Spatial transformations disabled (no_spatial=True)")
 
+        # Check if we need skeleton transform
+        if self._needs_skeleton_transform():
+            # Import here to avoid circular dependencies
+            from vesuvius.models.augmentation.transforms.utils.skeleton_transform import MedialSurfaceTransform
+            transforms.append(MedialSurfaceTransform(do_tube=False))
+            print("Added MedialSurfaceTransform to training pipeline")
+
+        return ComposeTransforms(transforms)
+    
+    def _create_validation_transforms(self):
+        """
+        Create validation transforms.
+        For validation, we only apply skeleton transform if needed (no augmentations).
+        """
+        if not self._needs_skeleton_transform():
+            return None
+            
+        # Import here to avoid circular dependencies
+        from vesuvius.models.augmentation.transforms.utils.skeleton_transform import MedialSurfaceTransform
+        
+        transforms = []
+        transforms.append(MedialSurfaceTransform(do_tube=False))
+        print("Added MedialSurfaceTransform to validation pipeline")
+        
         return ComposeTransforms(transforms)
     
     def __getitem__(self, index):
@@ -767,7 +820,7 @@ class BaseDataset(Dataset):
         patch_info = self.valid_patches[index]
         data_dict = self._extract_patch(patch_info)
 
-        if self.is_training and self.transforms is not None:
+        if self.transforms is not None:
             data_dict = self.transforms(**data_dict)
         
         return data_dict
