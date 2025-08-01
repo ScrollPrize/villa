@@ -77,6 +77,9 @@ def save_debug(
     """Save debug visualization as GIF (3D) or PNG (2D)"""
     
     # Get input array
+    # Convert BFloat16 to Float32 before numpy conversion
+    if input_volume.dtype == torch.bfloat16:
+        input_volume = input_volume.float()
     inp_np = input_volume.cpu().numpy()[0]  # Remove batch dim
     is_2d = len(inp_np.shape) == 3  # [C, H, W] format for 2D data
     
@@ -90,6 +93,9 @@ def save_debug(
     # Process all targets
     targets_np = {}
     for t_name, t_tensor in targets_dict.items():
+        # Convert BFloat16 to Float32 before numpy conversion
+        if t_tensor.dtype == torch.bfloat16:
+            t_tensor = t_tensor.float()
         arr_np = t_tensor.cpu().numpy()
         # Remove batch dimension if present
         while arr_np.ndim > (3 if is_2d else 4):
@@ -99,6 +105,9 @@ def save_debug(
     # Process all predictions
     preds_np = {}
     for t_name, p_tensor in outputs_dict.items():
+        # Convert BFloat16 to Float32 before numpy conversion
+        if p_tensor.dtype == torch.bfloat16:
+            p_tensor = p_tensor.float()
         arr_np = p_tensor.cpu().numpy()
         # Remove batch dimension if present
         if arr_np.ndim > (3 if is_2d else 4):
@@ -126,12 +135,18 @@ def save_debug(
     train_preds_np = {}
     
     if train_input is not None and train_targets_dict is not None and train_outputs_dict is not None:
+        # Convert BFloat16 to Float32 before numpy conversion
+        if train_input.dtype == torch.bfloat16:
+            train_input = train_input.float()
         train_inp_np = train_input.cpu().numpy()[0]
         if train_inp_np.shape[0] == 1:
             train_inp_np = train_inp_np[0]
 
         # Process all train targets
         for t_name, t_tensor in train_targets_dict.items():
+            # Convert BFloat16 to Float32 before numpy conversion
+            if t_tensor.dtype == torch.bfloat16:
+                t_tensor = t_tensor.float()
             arr_np = t_tensor.cpu().numpy()
             # Remove batch dimension if present
             while arr_np.ndim > (3 if is_2d else 4):
@@ -140,6 +155,9 @@ def save_debug(
 
         # Process all train predictions
         for t_name, p_tensor in train_outputs_dict.items():
+            # Convert BFloat16 to Float32 before numpy conversion
+            if p_tensor.dtype == torch.bfloat16:
+                p_tensor = p_tensor.float()
             arr_np = p_tensor.cpu().numpy()
             # Remove batch dimension if present
             if arr_np.ndim > (3 if is_2d else 4):

@@ -65,7 +65,7 @@ class ConfigManager:
 
         self.model_name = self.tr_info.get("model_name", "Model")
         self.autoconfigure = bool(self.tr_info.get("autoconfigure", True))
-        self.tr_val_split = float(self.tr_info.get("tr_val_split", 0.95))
+        self.tr_val_split = float(self.tr_info.get("tr_val_split", 0.80))
         self.compute_loss_on_labeled_only = bool(self.tr_info.get("compute_loss_on_labeled_only", False))
         self.wandb_project = self.tr_info.get("wandb_project", None)
         self.wandb_entity = self.tr_info.get("wandb_entity", None)
