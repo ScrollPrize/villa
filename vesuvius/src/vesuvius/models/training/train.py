@@ -1029,8 +1029,12 @@ def main():
                         help="Gradient clipping value (default: 12.0)")
     parser.add_argument("--no-amp", action="store_true",
                         help="Disable Automatic Mixed Precision (AMP) for training")
-    parser.add_argument("--skip-intensity-sampling", action="store_true",
-                        help="Skip intensity sampling during dataset initialization")
+    parser.add_argument("--skip-intensity-sampling", dest="skip_intensity_sampling", 
+                        action="store_true", default=True,
+                        help="Skip intensity sampling during dataset initialization (default: True)")
+    parser.add_argument("--no-skip-intensity-sampling", dest="skip_intensity_sampling",
+                        action="store_false",
+                        help="Enable intensity sampling during dataset initialization")
     parser.add_argument("--early-stopping-patience", type=int, default=20,
                         help="Number of epochs to wait for validation loss improvement before early stopping (default: 5, set to 0 to disable)")
 

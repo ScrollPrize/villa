@@ -1112,7 +1112,7 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight, mgr=None):
             ignore_label=ignore_index,
             dice_class=MemoryEfficientSoftDiceLoss
         )
-    
+
     elif name == 'BettiMatchingLoss':
         from .betti_losses import BettiMatchingLoss
         base_loss = BettiMatchingLoss(

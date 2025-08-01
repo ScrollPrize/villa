@@ -50,14 +50,10 @@ class MedialSurfaceRecallTrainer(BaseTrainer):
         super().__init__(mgr, verbose)
         self.skel_transform = MedialSurfaceTransform(do_tube=False)
 
-    def _get_model_outputs(self,
-                           model,
-                           data_dict,
-                           autocast_ctx):
-
-        inputs = data_dict["image"].to(self.device, dtype=torch.float32)
+    def _get_model_outputs(self, model, data_dict):
+        inputs = data_dict["image"].to(self.device)
         targets_dict = {
-            k: v.to(self.device, dtype=torch.float32)
+            k: v.to(self.device)
             for k, v in data_dict.items()
             if k not in ["image", "patch_info", "is_unlabeled"]
         }
@@ -67,10 +63,9 @@ class MedialSurfaceRecallTrainer(BaseTrainer):
         temp_dict = {"segmentation": targets_dict.get("segmentation", targets_dict.get("ink", None))}
         if temp_dict["segmentation"] is not None:
             temp_dict = self.skel_transform.apply(temp_dict)
-            targets_dict["skel"] = temp_dict["skel"].to(self.device, dtype=torch.float32)
+            targets_dict["skel"] = temp_dict["skel"].to(self.device)
 
-        with autocast_ctx:
-            outputs = model(inputs)
+        outputs = model(inputs)
 
         return inputs, targets_dict, outputs
 
