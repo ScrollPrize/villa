@@ -245,8 +245,7 @@ class BaseTrainer:
     def _get_scaler(self, device_type='cuda', use_amp=True):
         # for cuda, we can use a grad scaler for mixed precision training if amp is enabled
         # for mps or cpu, or when amp is disabled, we create a dummy scaler that does nothing
-        # Only use GradScaler for float16, not bfloat16
-        
+
         class DummyScaler:
             def scale(self, loss):
                 return loss
@@ -259,12 +258,19 @@ class BaseTrainer:
 
             def update(self):
                 pass
-        
-        if device_type == 'cuda' and use_amp and not torch.cuda.is_bf16_supported():
-            # Using float16 - need gradient scaling
+
+
+        if device_type == 'cuda' and use_amp:
+            # Use GradScaler for both float16 and bfloat16
+            # even though according to every single thing i've read you dont need grad scaling with bf16
+            # my model learns essentially nothing with it disabled. i have no idea why.
+            if torch.cuda.is_bf16_supported():
+                print("Using GradScaler with bfloat16 autocast")
+            else:
+                print("Using GradScaler with float16 autocast")
             return torch.amp.GradScaler('cuda')
         else:
-            # Using bfloat16, or not using amp, or not on cuda - no gradient scaling needed
+            # Not using amp or not on cuda - no gradient scaling needed
             return DummyScaler()
 
     # --- dataloaders --- #
