@@ -460,6 +460,8 @@ class BaseTrainer:
         task_losses = {}
 
         for t_name, t_gt in targets_dict.items():
+            if t_name == 'skel' or t_name.endswith('_skel') or t_name == 'is_unlabeled':
+                continue  # Skip skeleton data and metadata as they're not predicted outputs
             t_pred = outputs[t_name]
             task_loss_fns = loss_fns[t_name]  # List of (loss_fn, weight) tuples
             task_weight = self.mgr.targets[t_name].get("weight", 1.0)
@@ -469,8 +471,10 @@ class BaseTrainer:
                 # this naming is extremely confusing, i know. we route all loss through the aux helper
                 # because it just simplifies adding addtl losses for aux tasks if present.
                 # TODO: rework this janky setup to make it more clear
+                # Get skeleton data if available
+                skeleton_data = targets_dict.get(f'{t_name}_skel', None)
                 loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt, outputs,
-                                                    self.mgr.targets[t_name])
+                                                    self.mgr.targets[t_name], skeleton_data)
                 task_total_loss += loss_weight * loss_value
 
             weighted_loss = task_weight * task_total_loss
@@ -512,16 +516,17 @@ class BaseTrainer:
         task_losses = {}
 
         for t_name, t_gt in targets_dict.items():
+            if t_name == 'skel' or t_name.endswith('_skel') or t_name == 'is_unlabeled':
+                continue  # Skip skeleton data and metadata as they're not predicted outputs
             t_pred = outputs[t_name]
             task_loss_fns = loss_fns[t_name]  # List of (loss_fn, weight) tuples
 
             task_total_loss = 0.0
             for loss_fn, loss_weight in task_loss_fns:
-                # this naming is extremely confusing, i know. we route all loss through the aux helper
-                # because it just simplifies adding addtl losses for aux tasks if present.
-                # TODO: rework this janky setup to make it more clear
+                # Get skeleton data if available
+                skeleton_data = targets_dict.get(f'{t_name}_skel', None)
                 loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt, outputs,
-                                                    self.mgr.targets[t_name])
+                                                    self.mgr.targets[t_name], skeleton_data)
                 task_total_loss += loss_weight * loss_value
 
             task_losses[t_name] = task_total_loss.detach().cpu().item()
@@ -858,12 +863,12 @@ class BaseTrainer:
                                     # Extract skeleton data if using SkeletonRecallTrainer
                                     skeleton_dict = None
                                     train_skeleton_dict = None
-                                    if hasattr(self, 'skel_transform'):
-                                        if 'skel' in targets_dict_first_all:
-                                            skeleton_dict = {'segmentation': targets_dict_first_all.get('skel')}
-                                        # Check if train_sample_targets_all exists (from earlier training step)
-                                        if 'train_sample_targets_all' in locals() and train_sample_targets_all and 'skel' in train_sample_targets_all:
-                                            train_skeleton_dict = {'segmentation': train_sample_targets_all.get('skel')}
+                                    # Check if skeleton data is available in the batch
+                                    if 'skel' in targets_dict_first_all:
+                                        skeleton_dict = {'segmentation': targets_dict_first_all.get('skel')}
+                                    # Check if train_sample_targets_all exists (from earlier training step)
+                                    if 'train_sample_targets_all' in locals() and train_sample_targets_all and 'skel' in train_sample_targets_all:
+                                        train_skeleton_dict = {'segmentation': train_sample_targets_all.get('skel')}
                                     
                                     targets_dict_first = {}
                                     for t_name, t_tensor in targets_dict_first_all.items():
@@ -1110,15 +1115,11 @@ def main():
         from vesuvius.models.training.trainers.train_uncertainty_aware_mean_teacher import UncertaintyAwareMeanTeacher3DTrainer
         trainer = UncertaintyAwareMeanTeacher3DTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Uncertainty-Aware Mean Teacher Trainer for semi-supervised 3D training")
-    elif trainer_name == "medial_surface_recall":
-        from vesuvius.models.training.trainers.train_medial_surface_recall import MedialSurfaceRecallTrainer
-        trainer = MedialSurfaceRecallTrainer(mgr=mgr, verbose=args.verbose)
-        print("Using MedialSurfaceRecallTrainer")
     elif trainer_name == "base":
         trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Base Trainer for supervised training")
     else:
-        raise ValueError(f"Unknown trainer: {trainer_name}. Available options: base, uncertainty_aware_mean_teacher, medial_surface_recall")
+        raise ValueError(f"Unknown trainer: {trainer_name}. Available options: base, uncertainty_aware_mean_teacher")
 
     print("Starting training...")
     trainer.train()
