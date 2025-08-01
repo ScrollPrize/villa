@@ -41,7 +41,7 @@ class SoftSkeletonRecallLoss(nn.Module):
                 y_onehot = y[:, 1:]
             else:
                 gt = y.long()
-                y_onehot = torch.zeros(shp_x, device=x.device, dtype=x.dtype)
+                y_onehot = torch.zeros(shp_x, device=x.device, dtype=y.dtype)
                 y_onehot.scatter_(1, gt, 1)
                 y_onehot = y_onehot[:, 1:]
 
@@ -95,10 +95,6 @@ class DC_SkelREC_and_CE_loss(nn.Module):
         :param target:
         :return:
         """
-        
-        # early check for skel for sanity sake
-        if self.weight_srec != 0 and skel is None:
-            raise ValueError("skel cannot be None when weight_srec != 0, somewhere in the pipeline your skeleton was not computed")
 
         if self.ignore_label is not None:
             assert target.shape[1] == 1, 'ignore label is not implemented for one hot encoded target variables ' \
