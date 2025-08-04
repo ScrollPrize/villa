@@ -5,7 +5,9 @@ import json
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin, urlparse
+import webbrowser
 
+import neuroglancer
 import requests
 import zarr
 
@@ -98,11 +100,72 @@ if __name__ == "__main__":
         raise ValueError(f"Invalid OME-ZARR file: {args.moving}")
 
     # Establish voxel size for each volume
-    fixed_voxel_size = get_voxel_size(args.fixed, args.fixed_voxel_size)
-    moving_voxel_size = get_voxel_size(args.moving, args.moving_voxel_size)
+    fixed_voxel_size_um = get_voxel_size(args.fixed, args.fixed_voxel_size)
+    moving_voxel_size_um = get_voxel_size(args.moving, args.moving_voxel_size)
+    scale_factor = moving_voxel_size_um / fixed_voxel_size_um
 
-    print(f"Fixed voxel size: {fixed_voxel_size}")
-    print(f"Moving voxel size: {moving_voxel_size}")
+    print(f"Fixed voxel size (um): {fixed_voxel_size_um}")
+    print(f"Moving voxel size (um): {moving_voxel_size_um}")
 
-    # fixed_vol = zarr.open(args.fixed, mode="r")
-    # moving_vol = zarr.open(args.moving, mode="r")
+    # Open fixed in neuroglancer
+    viewer = neuroglancer.Viewer()
+    with viewer.txn() as state:
+        # This does not behave as expected. Leaving dimensions out of it for now.
+        # We can just map from voxel space to voxel space and change this later if decided.
+        # Per https://neuroglancer-docs.web.app/datasource/zarr/index.html#coordinate-spaces
+        # and https://neuroglancer-docs.web.app/concepts/coordinate_spaces.html#data-source-coordinate-space,
+        # Zarr dimensions should probably be set in the Zarr itself.
+        # state.dimensions = neuroglancer.CoordinateSpace(
+        #     names=["x", "y", "z"],
+        #     units=["um", "um", "um"],
+        #     scales=[fixed_voxel_size_um, fixed_voxel_size_um, fixed_voxel_size_um],
+        # )
+
+        # Some unitless dimensions for now
+        dimensions = neuroglancer.CoordinateSpace(
+            names=["x", "y", "z"],
+            units="",
+            scales=[1, 1, 1],
+        )
+
+        fixed_source = neuroglancer.LayerDataSource(
+            url=f"zarr://{args.fixed}",
+            transform=neuroglancer.CoordinateSpaceTransform(
+                output_dimensions=dimensions,
+            ),
+        )
+        state.layers.append(
+            name="fixed",
+            layer=neuroglancer.ImageLayer(
+                source=fixed_source,
+            ),
+        )
+
+        moving_source = neuroglancer.LayerDataSource(
+            url=f"zarr://{args.moving}",
+            transform=neuroglancer.CoordinateSpaceTransform(
+                output_dimensions=dimensions,
+                matrix=[
+                    [scale_factor, 0, 0, 0],
+                    [0, scale_factor, 0, 0],
+                    [0, 0, scale_factor, 0],
+                ],
+            ),
+        )
+        state.layers.append(
+            name="moving",
+            layer=neuroglancer.ImageLayer(
+                source=moving_source,
+            ),
+        )
+
+    # Open in browser
+    webbrowser.open_new(viewer.get_viewer_url())
+
+    # Try manipulating the transform programmatically
+    # Make them red and green and set transparency?
+    # Allow clicking to set points
+    # Have some mechanism to have current active layer
+    # Once enough points: find affine transform
+    # Apply affine transform in real time to the moving layer
+    # Save the affine transform
