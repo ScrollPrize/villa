@@ -114,7 +114,6 @@ if __name__ == "__main__":
     print(f"Fixed voxel size (um): {fixed_voxel_size_um}")
     print(f"Moving voxel size (um): {moving_voxel_size_um}")
 
-    # Open fixed in neuroglancer
     viewer = neuroglancer.Viewer()
     with viewer.txn() as state:
         # This does not behave as expected. Leaving dimensions out of it for now.
@@ -135,6 +134,7 @@ if __name__ == "__main__":
             scales=[1, 1, 1],
         )
 
+        # Open fixed in neuroglancer
         fixed_source = neuroglancer.LayerDataSource(
             url=f"zarr://{args.fixed}",
             transform=neuroglancer.CoordinateSpaceTransform(
@@ -146,8 +146,16 @@ if __name__ == "__main__":
             layer=neuroglancer.ImageLayer(
                 source=fixed_source,
             ),
+            shader="""
+void main() {
+    emitRGBA(vec4(toNormalized(getDataValue()), 0, toNormalized(getDataValue()), 1));
+}
+""",
+            blend="additive",
+            opacity=1.0,
         )
 
+        # Open moving in neuroglancer
         moving_shape = zarr.open(args.moving, mode="r")["0"].shape
         z, y, x = moving_shape
 
@@ -167,6 +175,13 @@ if __name__ == "__main__":
             layer=neuroglancer.ImageLayer(
                 source=moving_source,
             ),
+            shader="""
+void main() {
+    emitRGBA(vec4(0, toNormalized(getDataValue()), 0, 1));
+}
+""",
+            blend="additive",
+            opacity=1.0,
         )
 
     # Open in browser
