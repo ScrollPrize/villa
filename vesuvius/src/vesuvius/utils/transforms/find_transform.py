@@ -146,7 +146,7 @@ if __name__ == "__main__":
             matrix = state.layers["moving"].layer.source[0].transform.matrix
             # add homogeneous coordinate
             matrix = np.concatenate([matrix, [[0, 0, 0, 1]]], axis=0)
-            # TODO incorporate translation to rotate about center
+            # TODO LEFT OFFincorporate translation to rotate about center
             # rotate 90 degrees around z axis
             matrix = np.matmul(
                 matrix,
@@ -178,7 +178,7 @@ if __name__ == "__main__":
             scales=[1, 1, 1],
         )
 
-        # Open fixed in neuroglancer
+        # Open fixed volume
         fixed_source = neuroglancer.LayerDataSource(
             url=f"zarr://{args.fixed}",
             transform=neuroglancer.CoordinateSpaceTransform(
@@ -195,7 +195,7 @@ if __name__ == "__main__":
             opacity=1.0,
         )
 
-        # Open moving in neuroglancer
+        # Open moving volume
         moving_shape = zarr.open(args.moving, mode="r")["0"].shape
         z, y, x = moving_shape
 
@@ -220,7 +220,7 @@ if __name__ == "__main__":
             opacity=1.0,
         )
 
-    # Open in browser
+    # Open viewer in browser
     webbrowser.open_new(viewer.get_viewer_url())
 
     # Buttons or command line args to do basic rotations, flips, moves
