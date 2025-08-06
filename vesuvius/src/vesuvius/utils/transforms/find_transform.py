@@ -143,18 +143,6 @@ if __name__ == "__main__":
         s.input_event_bindings.viewer["keyc"] = "toggle-color"
 
     with viewer.txn() as state:
-
-        # This does not behave as expected. Leaving dimensions out of it for now.
-        # We can just map from voxel space to voxel space and change this later if decided.
-        # Per https://neuroglancer-docs.web.app/datasource/zarr/index.html#coordinate-spaces
-        # and https://neuroglancer-docs.web.app/concepts/coordinate_spaces.html#data-source-coordinate-space,
-        # Zarr dimensions should probably be set in the Zarr itself.
-        # state.dimensions = neuroglancer.CoordinateSpace(
-        #     names=["x", "y", "z"],
-        #     units=["um", "um", "um"],
-        #     scales=[fixed_voxel_size_um, fixed_voxel_size_um, fixed_voxel_size_um],
-        # )
-
         # Some unitless dimensions for now
         dimensions = neuroglancer.CoordinateSpace(
             names=["x", "y", "z"],
