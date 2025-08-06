@@ -148,7 +148,7 @@ if __name__ == "__main__":
             ),
             shader="""
 void main() {
-    emitRGBA(vec4(toNormalized(getDataValue()), 0, toNormalized(getDataValue()), 1));
+    emitRGB(vec3(toNormalized(getDataValue()), 0, toNormalized(getDataValue())));
 }
 """,
             blend="additive",
@@ -177,7 +177,7 @@ void main() {
             ),
             shader="""
 void main() {
-    emitRGBA(vec4(0, toNormalized(getDataValue()), 0, 1));
+    emitRGB(vec3(0, toNormalized(getDataValue()), 0));
 }
 """,
             blend="additive",
@@ -188,7 +188,6 @@ void main() {
     webbrowser.open_new(viewer.get_viewer_url())
 
     # Try manipulating the transform programmatically
-    # Make them red and green and set transparency?
     # Buttons or command line args to do basic rotations
     # Allow clicking to set points
     # Have some mechanism to have current active layer
