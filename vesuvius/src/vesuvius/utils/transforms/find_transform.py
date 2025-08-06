@@ -96,7 +96,7 @@ if __name__ == "__main__":
 
     if not sys.flags.interactive:
         print(
-            "Running in non-interactive mode. Use `python -i find_transform.py` to run in interactive mode (required for neuroglancer)."
+            f"Running in non-interactive mode. Use `python -i {Path(__file__).name}` to run in interactive mode (required for neuroglancer)."
         )
         sys.exit(1)
 
