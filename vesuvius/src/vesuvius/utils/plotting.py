@@ -7,13 +7,17 @@ from pathlib import Path
 
 def minmax_scale_to_8bit(arr_np):
     """Convert array to 8-bit by scaling to 0-255 range"""
+    # Ensure float32 for computation
+    if arr_np.dtype != np.float32 and arr_np.dtype != np.float64:
+        arr_np = arr_np.astype(np.float32)
+    
     min_val = arr_np.min()
     max_val = arr_np.max()
     if max_val > min_val:
         arr_np = (arr_np - min_val) / (max_val - min_val) * 255
     else:
-        arr_np = np.zeros_like(arr_np)
-    return arr_np.astype(np.uint8)
+        arr_np = np.zeros_like(arr_np, dtype=np.float32) * 255
+    return np.clip(arr_np, 0, 255).astype(np.uint8)
 
 
 def add_text_label(img, text):
@@ -302,13 +306,24 @@ def save_debug(
             
             # Stack rows for this frame
             frame = np.vstack(rows)
+            # Ensure frame is uint8 and contiguous
+            frame = np.ascontiguousarray(frame, dtype=np.uint8)
             frames.append(frame)
         
         # Save GIF
         out_dir = Path(save_path).parent
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"[Epoch {epoch}] Saving GIF to: {save_path}")
-        imageio.mimsave(save_path, frames, fps=fps)
+        try:
+            # Ensure all frames are properly formatted before saving
+            frames_final = [np.ascontiguousarray(f, dtype=np.uint8) for f in frames]
+            imageio.mimsave(save_path, frames_final, fps=fps, loop=0)
+            # Return frames list for wandb logging (wandb expects list of frames or (T, H, W, C) array)
+            return frames_final
+        except Exception as e:
+            print(f"Error saving GIF: {e}")
+            print(f"Skipping debug visualization due to error")
+            return None
 
 
 def apply_activation_if_needed(activation_str):
