@@ -1,6 +1,7 @@
 """Find the transform between two provided volumes."""
 
 import argparse
+import copy
 import json
 from pathlib import Path
 import sys
@@ -9,6 +10,7 @@ from urllib.parse import urljoin, urlparse
 import webbrowser
 
 import neuroglancer
+import numpy as np
 import requests
 import zarr
 
@@ -135,12 +137,38 @@ if __name__ == "__main__":
                 state.layers["fixed"].shader = ""
                 state.layers["moving"].shader = ""
             else:
-                state.layers["fixed"].shader = MAGENTA_SHADER
-                state.layers["moving"].shader = GREEN_SHADER
+                state.layers["fixed"].shader = GREEN_SHADER
+                state.layers["moving"].shader = MAGENTA_SHADER
+
+    def rotate_90(_):
+        # TODO: make this work for any axis based on which viewport is active
+        with viewer.txn() as state:
+            matrix = state.layers["moving"].layer.source[0].transform.matrix
+            # add homogeneous coordinate
+            matrix = np.concatenate([matrix, [[0, 0, 0, 1]]], axis=0)
+            # TODO incorporate translation to rotate about center
+            # rotate 90 degrees around z axis
+            matrix = np.matmul(
+                matrix,
+                np.array(
+                    [
+                        [0, -1, 0, 0],
+                        [1, 0, 0, 0],
+                        [0, 0, 1, 0],
+                        [0, 0, 0, 1],
+                    ]
+                ),
+            )
+            # remove homogeneous coordinate
+            matrix = matrix[:-1, :]
+            # set new transform
+            state.layers["moving"].layer.source[0].transform.matrix = matrix
 
     viewer.actions.add("toggle-color", toggle_color)
+    viewer.actions.add("rotate-90", rotate_90)
     with viewer.config_state.txn() as s:
         s.input_event_bindings.viewer["keyc"] = "toggle-color"
+        s.input_event_bindings.viewer["alt+keyr"] = "rotate-90"
 
     with viewer.txn() as state:
         # Some unitless dimensions for now
@@ -162,8 +190,7 @@ if __name__ == "__main__":
             layer=neuroglancer.ImageLayer(
                 source=fixed_source,
             ),
-            # Magenta shader
-            shader=MAGENTA_SHADER,
+            shader=GREEN_SHADER,
             blend="additive",
             opacity=1.0,
         )
@@ -188,8 +215,7 @@ if __name__ == "__main__":
             layer=neuroglancer.ImageLayer(
                 source=moving_source,
             ),
-            # Green shader
-            shader=GREEN_SHADER,
+            shader=MAGENTA_SHADER,
             blend="additive",
             opacity=1.0,
         )
@@ -197,8 +223,7 @@ if __name__ == "__main__":
     # Open in browser
     webbrowser.open_new(viewer.get_viewer_url())
 
-    # Buttons or command line args to do basic rotations, flips, moves?
-    # Try manipulating the transform programmatically
+    # Buttons or command line args to do basic rotations, flips, moves
     # Allow clicking to set points
     # Have some mechanism to have current active layer
     # Once enough points: find affine transform
