@@ -13,6 +13,19 @@ import requests
 import zarr
 
 
+GREEN_SHADER = """
+void main() {
+    emitRGB(vec3(0, toNormalized(getDataValue()), 0));
+}
+"""
+
+MAGENTA_SHADER = """
+void main() {
+    emitRGB(vec3(toNormalized(getDataValue()), 0, toNormalized(getDataValue())));
+}
+"""
+
+
 def check_ome_zarr(path: str) -> bool:
     """Check if the path is a valid OME-ZARR file."""
     try:
@@ -115,7 +128,22 @@ if __name__ == "__main__":
     print(f"Moving voxel size (um): {moving_voxel_size_um}")
 
     viewer = neuroglancer.Viewer()
+
+    def toggle_color(_):
+        with viewer.txn() as state:
+            if "vec3" in state.layers["fixed"].shader:
+                state.layers["fixed"].shader = ""
+                state.layers["moving"].shader = ""
+            else:
+                state.layers["fixed"].shader = MAGENTA_SHADER
+                state.layers["moving"].shader = GREEN_SHADER
+
+    viewer.actions.add("toggle-color", toggle_color)
+    with viewer.config_state.txn() as s:
+        s.input_event_bindings.viewer["keyc"] = "toggle-color"
+
     with viewer.txn() as state:
+
         # This does not behave as expected. Leaving dimensions out of it for now.
         # We can just map from voxel space to voxel space and change this later if decided.
         # Per https://neuroglancer-docs.web.app/datasource/zarr/index.html#coordinate-spaces
@@ -146,11 +174,8 @@ if __name__ == "__main__":
             layer=neuroglancer.ImageLayer(
                 source=fixed_source,
             ),
-            shader="""
-void main() {
-    emitRGB(vec3(toNormalized(getDataValue()), 0, toNormalized(getDataValue())));
-}
-""",
+            # Magenta shader
+            shader=MAGENTA_SHADER,
             blend="additive",
             opacity=1.0,
         )
@@ -175,11 +200,8 @@ void main() {
             layer=neuroglancer.ImageLayer(
                 source=moving_source,
             ),
-            shader="""
-void main() {
-    emitRGB(vec3(0, toNormalized(getDataValue()), 0));
-}
-""",
+            # Green shader
+            shader=GREEN_SHADER,
             blend="additive",
             opacity=1.0,
         )
@@ -187,10 +209,11 @@ void main() {
     # Open in browser
     webbrowser.open_new(viewer.get_viewer_url())
 
+    # Buttons or command line args to do basic rotations, flips, moves?
     # Try manipulating the transform programmatically
-    # Buttons or command line args to do basic rotations
     # Allow clicking to set points
     # Have some mechanism to have current active layer
     # Once enough points: find affine transform
     # Apply affine transform in real time to the moving layer
     # Save the affine transform
+    # Three column layout? Maybe not.
