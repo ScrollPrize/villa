@@ -585,7 +585,7 @@ class BaseDataset(Dataset):
                     patch_center_dist_from_border=0,
                     random_crop=False,
                     p_elastic_deform=0,
-                    p_rotation=0.5,
+                    p_rotation=0.2,
                     rotation=rotation_for_DA,
                     p_scaling=0.2,
                     scaling=(0.7, 1.4),
@@ -768,6 +768,64 @@ class BaseDataset(Dataset):
                     p_per_channel=0.5
                 ), apply_probability=0.3
             ))
+            # transforms.append(RandomTransform(
+            #     GaussianNoiseTransform(
+            #         noise_variance=(0, 0.1),
+            #         p_per_channel=1,
+            #         synchronize_channels=True
+            #     ), apply_probability=0.1
+            # ))
+            # transforms.append(RandomTransform(
+            #     GaussianBlurTransform(
+            #         blur_sigma=(0.5, 1.),
+            #         synchronize_channels=False,
+            #         synchronize_axes=False,
+            #         p_per_channel=0.5, benchmark=True
+            #     ), apply_probability=0.2
+            # ))
+            # transforms.append(RandomTransform(
+            #     MultiplicativeBrightnessTransform(
+            #         multiplier_range=BGContrast((0.75, 1.25)),
+            #         synchronize_channels=False,
+            #         p_per_channel=1
+            #     ), apply_probability=0.15
+            # ))
+            # transforms.append(RandomTransform(
+            #     ContrastTransform(
+            #         contrast_range=BGContrast((0.75, 1.25)),
+            #         preserve_range=True,
+            #         synchronize_channels=False,
+            #         p_per_channel=1
+            #     ), apply_probability=0.15
+            # ))
+            # transforms.append(RandomTransform(
+            #     SimulateLowResolutionTransform(
+            #         scale=(0.5, 1),
+            #         synchronize_channels=False,
+            #         synchronize_axes=True,
+            #         ignore_axes=None,
+            #         allowed_channels=None,
+            #         p_per_channel=0.5
+            #     ), apply_probability=0.25
+            # ))
+            # transforms.append(RandomTransform(
+            #     GammaTransform(
+            #         gamma=BGContrast((0.7, 1.5)),
+            #         p_invert_image=1,
+            #         synchronize_channels=False,
+            #         p_per_channel=1,
+            #         p_retain_stats=1
+            #     ), apply_probability=0.1
+            # ))
+            # transforms.append(RandomTransform(
+            #     GammaTransform(
+            #         gamma=BGContrast((0.7, 1.5)),
+            #         p_invert_image=0,
+            #         synchronize_channels=False,
+            #         p_per_channel=1,
+            #         p_retain_stats=1
+            #     ), apply_probability=0.3
+            # ))
 
         if no_spatial:
             print("Spatial transformations disabled (no_spatial=True)")

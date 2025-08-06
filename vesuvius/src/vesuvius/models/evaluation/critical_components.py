@@ -46,6 +46,12 @@ class CriticalComponentsMetric(BaseMetric):
             Dictionary with positive and negative critical components
         """
         # Convert to numpy and handle different tensor shapes
+        # Convert BFloat16 to Float32 before numpy conversion
+        if pred.dtype == torch.bfloat16:
+            pred = pred.float()
+        if gt.dtype == torch.bfloat16:
+            gt = gt.float()
+        
         pred_np = pred.detach().cpu().numpy()
         gt_np = gt.detach().cpu().numpy()
         

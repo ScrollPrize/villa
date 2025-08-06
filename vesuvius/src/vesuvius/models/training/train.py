@@ -233,11 +233,11 @@ class BaseTrainer:
             num_classes = task_config.get('num_classes', 2)
             task_metrics.append(ConnectedComponentsMetric(num_classes=num_classes))
 
-            if num_classes == 2:
-                task_metrics.append(CriticalComponentsMetric())
+            # if num_classes == 2:
+            #     task_metrics.append(CriticalComponentsMetric())
 
             task_metrics.append(IOUDiceMetric(num_classes=num_classes))
-            task_metrics.append(HausdorffDistanceMetric(num_classes=num_classes))
+            # task_metrics.append(HausdorffDistanceMetric(num_classes=num_classes))
             metrics[task_name] = task_metrics
         
         return metrics
@@ -833,7 +833,6 @@ class BaseTrainer:
                         for t_name in self.mgr.targets:
                             if t_name in outputs and t_name in targets_dict:
                                 for metric in evaluation_metrics[t_name]:
-                                    # Only compute CriticalComponentsMetric on first 10 batches
                                     if isinstance(metric, CriticalComponentsMetric) and i >= 10:
                                         continue
                                     metric.update(pred=outputs[t_name], gt=targets_dict[t_name])
@@ -916,7 +915,6 @@ class BaseTrainer:
                     avg_val_loss = total_val_loss / len(self.mgr.targets) if self.mgr.targets else 0
                     val_loss_history[epoch] = avg_val_loss
                     
-                    # Aggregate and print evaluation metrics
                     print("\n[Validation Metrics]")
                     metric_results = {}
                     for t_name in self.mgr.targets:
@@ -925,9 +923,8 @@ class BaseTrainer:
                             for metric in evaluation_metrics[t_name]:
                                 aggregated = metric.aggregate()
                                 for metric_name, value in aggregated.items():
-                                    full_metric_name = f"{t_name}_{metric.name}_{metric_name}"
+                                    full_metric_name = f"{t_name}_{metric_name}"
                                     metric_results[full_metric_name] = value
-                                    # Include the metric base name in the console output
                                     display_name = f"{metric.name}_{metric_name}"
                                     print(f"    {display_name}: {value:.4f}")
 
@@ -944,7 +941,14 @@ class BaseTrainer:
 
                         if 'frames_array' in locals() and frames_array is not None:
                             import wandb
-                            val_metrics["debug_gif"] = wandb.Video(frames_array, format="gif")
+                            # Stack the list of frames into a proper numpy array (T, H, W, C)
+                            frames_np = np.stack(frames_array, axis=0)
+                            # Convert BGR to RGB for wandb
+                            frames_np = frames_np[..., ::-1]
+                            # Transpose to (frames, channels, height, width) as required by wandb
+                            frames_np = np.transpose(frames_np, (0, 3, 1, 2))
+                            
+                            val_metrics["debug_gif"] = wandb.Video(frames_np, format="gif")
 
                         import wandb
                         wandb.log(val_metrics)
