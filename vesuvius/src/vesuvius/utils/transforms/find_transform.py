@@ -3,6 +3,7 @@
 import argparse
 import json
 from pathlib import Path
+import sys
 from typing import Optional
 from urllib.parse import urljoin, urlparse
 import webbrowser
@@ -93,6 +94,12 @@ if __name__ == "__main__":
     parser.add_argument("--moving-voxel-size", type=float)
     args = parser.parse_args()
 
+    if not sys.flags.interactive:
+        print(
+            "Running in non-interactive mode. Use `python -i find_transform.py` to run in interactive mode (required for neuroglancer)."
+        )
+        sys.exit(1)
+
     # Make sure Zarrs are openable
     if not check_ome_zarr(args.fixed):
         raise ValueError(f"Invalid OME-ZARR file: {args.fixed}")
@@ -141,6 +148,9 @@ if __name__ == "__main__":
             ),
         )
 
+        moving_shape = zarr.open(args.moving, mode="r")["0"].shape
+        z, y, x = moving_shape
+
         moving_source = neuroglancer.LayerDataSource(
             url=f"zarr://{args.moving}",
             transform=neuroglancer.CoordinateSpaceTransform(
@@ -164,6 +174,7 @@ if __name__ == "__main__":
 
     # Try manipulating the transform programmatically
     # Make them red and green and set transparency?
+    # Buttons or command line args to do basic rotations
     # Allow clicking to set points
     # Have some mechanism to have current active layer
     # Once enough points: find affine transform
