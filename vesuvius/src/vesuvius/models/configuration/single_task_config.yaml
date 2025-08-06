@@ -1,5 +1,6 @@
 tr_config:
-  patch_size: [128,128,128]
+  patch_size: [192,192,192]
+  initial_lr: 0.001
 
 dataset_config:
   min_labeled_ratio: 0 
@@ -10,7 +11,7 @@ dataset_config:
     surface:
       activation: "none"
       losses:
-        - name: "nnUNet_DC_and_CE_loss"
+        - name: "MedialSurfaceRecall"
           weight: 1.0
 
 
