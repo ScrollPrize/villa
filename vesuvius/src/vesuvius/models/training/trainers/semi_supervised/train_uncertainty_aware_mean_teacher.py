@@ -11,12 +11,13 @@ from vesuvius.models.training.train import BaseTrainer
 from vesuvius.models.training.trainers.semi_supervised import ramps
 from vesuvius.models.training.trainers.semi_supervised.two_stream_batch_sampler import TwoStreamBatchSampler
 
+
 # reimplemented from https://github.com/HiLab-git/SSL4MIS/blob/master/code/train_uncertainty_aware_mean_teacher_3D.py
 
 
 def softmax_mse_loss(input_logits, target_logits):
     """Takes softmax of both sides and returns MSE loss
-    
+
     Returns element-wise squared differences
     """
     assert input_logits.size() == target_logits.size()
@@ -25,8 +26,8 @@ def softmax_mse_loss(input_logits, target_logits):
     mse_loss = (input_softmax - target_softmax) ** 2
     
     return mse_loss
-        
-        
+
+
 class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
     def __init__(self, mgr=None, verbose: bool = True):
         super().__init__(mgr, verbose)
@@ -48,7 +49,7 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         self.global_step = 0
         self.labeled_indices = None
         self.unlabeled_indices = None
-        
+    
     def _create_ema_model(self, model):
         """Create an EMA (teacher) model from the student model."""
         ema_model = self._build_model()
@@ -109,7 +110,8 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
             )
         
         print(f"Semi-supervised split: {num_labeled} labeled, {len(self.unlabeled_indices)} unlabeled")
-        print(f"Batch composition: {self.labeled_batch_size} labeled + {unlabeled_batch_size} unlabeled = {self.mgr.train_batch_size} total")
+        print(
+            f"Batch composition: {self.labeled_batch_size} labeled + {unlabeled_batch_size} unlabeled = {self.mgr.train_batch_size} total")
         
         batch_sampler = TwoStreamBatchSampler(
             primary_indices=self.labeled_indices,
@@ -151,7 +153,6 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
             if k not in ["image", "patch_info", "is_unlabeled", "dataset_indices"]
         }
         
-  
         batch_size = inputs.shape[0]
         
         if self.training and batch_size == self.mgr.train_batch_size:
@@ -164,7 +165,7 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
             is_unlabeled = torch.zeros(batch_size, device=self.device)
         
         outputs = model(inputs)
-    
+        
         targets_dict['is_unlabeled'] = is_unlabeled
         
         return inputs, targets_dict, outputs
@@ -206,14 +207,13 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         uncertainty = -1.0 * torch.sum(mean_pred * torch.log(mean_pred + 1e-6), dim=1, keepdim=True)
         
         return uncertainty, mean_pred
-        
+    
     def _compute_train_loss(self, outputs, targets_dict, loss_fns, autocast_ctx=None):
         """
         Override to add consistency loss with uncertainty weighting
         """
         
-        # First compute the supervised loss using the base class method
-        total_loss, task_losses = super()._compute_train_loss(outputs, targets_dict, loss_fns)
+        # Get unlabeled mask
         is_unlabeled = targets_dict.get('is_unlabeled', None)
         
         # doesnt really make sense to use this trainer without unlabeled data
@@ -226,6 +226,22 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         
         labeled_mask = ~is_unlabeled.bool()
         unlabeled_mask = is_unlabeled.bool()
+        
+        # filter outputs and targets for labeled data only -- we dont want to (and probably would not even be able to)
+        # attempt to compute supervised loss on unlabeled data
+        labeled_outputs = {}
+        labeled_targets = {}
+        
+        for key, value in outputs.items():
+            if key != '_inputs':  # Skip our temporary storage
+                labeled_outputs[key] = value[labeled_mask]
+        
+        for key, value in targets_dict.items():
+            if key != 'is_unlabeled':  # Skip the unlabeled flag
+                labeled_targets[key] = value[labeled_mask]
+        
+        # Compute supervised loss only on labeled data
+        total_loss, task_losses = super()._compute_train_loss(labeled_outputs, labeled_targets, loss_fns)
         
         inputs = outputs.get('_inputs', None)
         if inputs is None:
@@ -262,7 +278,7 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         # Apply uncertainty-based weighting
         # Use sigmoid ramp-up for threshold
         current_iter = self.global_step
-
+        
         max_steps_per_epoch = getattr(self.mgr, 'max_steps_per_epoch', 100)
         max_epochs = getattr(self.mgr, 'max_epoch', 100)
         max_iterations = max_steps_per_epoch * max_epochs
@@ -286,7 +302,7 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
     def _train_step(self, model, data_dict, loss_fns, use_amp, autocast_ctx, epoch, step, verbose=False,
                     scaler=None, optimizer=None, num_iters=None, grad_accumulate_n=1):
         """Override to store inputs in outputs and update EMA model"""
-
+        
         self.global_step = epoch * (num_iters or getattr(self.mgr, 'max_steps_per_epoch', 100)) + step
         
         with autocast_ctx:
