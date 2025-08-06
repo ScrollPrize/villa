@@ -28,6 +28,12 @@ def compute_iou_dice(pred: torch.Tensor,
                      smooth: float = 1e-6) -> Dict[str, float]:
     
     # Move to CPU and convert to numpy for processing
+    # Convert BFloat16 to Float32 before numpy conversion
+    if pred.dtype == torch.bfloat16:
+        pred = pred.float()
+    if gt.dtype == torch.bfloat16:
+        gt = gt.float()
+    
     pred_np = pred.detach().cpu().numpy()
     gt_np = gt.detach().cpu().numpy()
     
