@@ -19,7 +19,7 @@ def create_optimizer(optimizer_config, model):
     elif optim_name == 'adamw':
         betas = tuple(optimizer_config.get('betas', (0.9, 0.999)))
         optimizer = optim.AdamW(model.parameters(), lr=learning_rate, betas=betas,
-                                weight_decay=weight_decay, fused=True)
+                                weight_decay=weight_decay)
     elif optim_name == 'sparseadam':
         betas = tuple(optimizer_config.get('betas', (0.9, 0.999)))
         optimizer = optim.SparseAdam(model.parameters(), lr=learning_rate, betas=betas)
