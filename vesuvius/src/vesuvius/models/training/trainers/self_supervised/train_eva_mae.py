@@ -55,6 +55,9 @@ class TrainEVAMAE(BaseTrainer):
             self.mask_ratio = getattr(mgr, 'mask_ratio', self.mask_ratio)
             self.vit_patch_size = getattr(mgr, 'vit_patch_size', self.vit_patch_size)
             
+            # Set only_spatial_and_intensity flag for MAE training
+            mgr.only_spatial_and_intensity = True
+            
             if not hasattr(mgr, 'targets'):
                 mgr.targets = {}
             mgr.targets['mae'] = {
