@@ -37,18 +37,15 @@ void main() {
 """
 
 
-def check_ome_zarr(path: str) -> bool:
-    """Check if the path is a valid OME-ZARR file."""
+def sanity_check_zarr_store(store: zarr.storage.FSStore):
+    """Check if the store is a valid OME-ZARR file."""
     try:
-        with zarr.open(path, mode="r") as store:
-            # Basic functionality checks
-            assert store is not None
-            assert hasattr(store, "keys")
-            assert hasattr(store, "attrs")
-            return True
-    except Exception as e:
-        print(f"Error opening {path}: {e}")
-        return False
+        # Basic functionality checks
+        assert store is not None
+        assert hasattr(store, "keys")
+        assert hasattr(store, "attrs")
+    except AssertionError as e:
+        raise ValueError(f"Invalid OME-ZARR file: {store.path}") from e
 
 
 def get_dimensions(
@@ -61,6 +58,7 @@ def get_dimensions(
 
     # Get volume dimensions in voxels
     with zarr.open(path, mode="r") as store:
+        sanity_check_zarr_store(store)
         voxels_x, voxels_y, voxels_z = store["0"].shape
 
     # Get voxel size from metadata.json if it exists
@@ -129,6 +127,58 @@ def get_dimensions(
         )
 
 
+def add_moving_and_fixed_layers(
+    state: neuroglancer.ViewerState,
+    fixed_path: str,
+    moving_path: str,
+    scale_factor: float,
+):
+    # Some unitless dimensions for now
+    dimensions = neuroglancer.CoordinateSpace(
+        names=["x", "y", "z"],
+        units="",
+        scales=[1, 1, 1],
+    )
+
+    # Open fixed volume
+    fixed_source = neuroglancer.LayerDataSource(
+        url=f"zarr://{fixed_path}",
+        transform=neuroglancer.CoordinateSpaceTransform(
+            output_dimensions=dimensions,
+        ),
+    )
+    state.layers.append(
+        name="fixed",
+        layer=neuroglancer.ImageLayer(
+            source=fixed_source,
+        ),
+        shader=GREEN_SHADER,
+        blend="additive",
+        opacity=1.0,
+    )
+
+    moving_source = neuroglancer.LayerDataSource(
+        url=f"zarr://{moving_path}",
+        transform=neuroglancer.CoordinateSpaceTransform(
+            output_dimensions=dimensions,
+            matrix=[
+                [scale_factor, 0, 0, 0],
+                [0, scale_factor, 0, 0],
+                [0, 0, scale_factor, 0],
+            ],
+        ),
+    )
+    state.layers.append(
+        name="moving",
+        layer=neuroglancer.ImageLayer(
+            source=moving_source,
+        ),
+        shader=MAGENTA_SHADER,
+        blend="additive",
+        opacity=1.0,
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixed", type=str, required=True)
@@ -143,19 +193,10 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
-    # Make sure Zarrs are openable
-    if not check_ome_zarr(args.fixed):
-        raise ValueError(f"Invalid OME-ZARR file: {args.fixed}")
-    if not check_ome_zarr(args.moving):
-        raise ValueError(f"Invalid OME-ZARR file: {args.moving}")
-
-    # Establish voxel size for each volume
+    # Get dimensions from each volume
     fixed_dimensions = get_dimensions(args.fixed, args.fixed_voxel_size)
     moving_dimensions = get_dimensions(args.moving, args.moving_voxel_size)
     scale_factor = moving_dimensions.voxel_size_um / fixed_dimensions.voxel_size_um
-
-    print(f"Fixed voxel size (um): {fixed_dimensions.voxel_size_um}")
-    print(f"Moving voxel size (um): {moving_dimensions.voxel_size_um}")
 
     viewer = neuroglancer.Viewer()
 
@@ -168,8 +209,7 @@ if __name__ == "__main__":
                 state.layers["fixed"].shader = GREEN_SHADER
                 state.layers["moving"].shader = MAGENTA_SHADER
 
-    def rotate_90(_):
-        # TODO: make this work for any axis based on which viewport is active
+    def rotate_z_plus_90(_):
         with viewer.txn() as state:
             original_matrix = state.layers["moving"].layer.source[0].transform.matrix
             # Add homogeneous coordinate
@@ -225,62 +265,15 @@ if __name__ == "__main__":
             state.layers["moving"].layer.source[0].transform.matrix = matrix
 
     viewer.actions.add("toggle-color", toggle_color)
-    viewer.actions.add("rotate-90", rotate_90)
+    viewer.actions.add("rotate-z-plus-90", rotate_z_plus_90)
+
     with viewer.config_state.txn() as s:
         s.input_event_bindings.viewer["keyc"] = "toggle-color"
-        s.input_event_bindings.viewer["alt+keyr"] = "rotate-90"
+        s.input_event_bindings.viewer["alt+keyr"] = "rotate-z-plus-90"
 
     with viewer.txn() as state:
-        # Some unitless dimensions for now
-        dimensions = neuroglancer.CoordinateSpace(
-            names=["x", "y", "z"],
-            units="",
-            scales=[1, 1, 1],
-        )
+        add_moving_and_fixed_layers(state, args.fixed, args.moving, scale_factor)
 
-        # Open fixed volume
-        fixed_source = neuroglancer.LayerDataSource(
-            url=f"zarr://{args.fixed}",
-            transform=neuroglancer.CoordinateSpaceTransform(
-                output_dimensions=dimensions,
-            ),
-        )
-        state.layers.append(
-            name="fixed",
-            layer=neuroglancer.ImageLayer(
-                source=fixed_source,
-            ),
-            shader=GREEN_SHADER,
-            blend="additive",
-            opacity=1.0,
-        )
-
-        # Open moving volume
-        moving_shape = zarr.open(args.moving, mode="r")["0"].shape
-        z, y, x = moving_shape
-
-        moving_source = neuroglancer.LayerDataSource(
-            url=f"zarr://{args.moving}",
-            transform=neuroglancer.CoordinateSpaceTransform(
-                output_dimensions=dimensions,
-                matrix=[
-                    [scale_factor, 0, 0, 0],
-                    [0, scale_factor, 0, 0],
-                    [0, 0, scale_factor, 0],
-                ],
-            ),
-        )
-        state.layers.append(
-            name="moving",
-            layer=neuroglancer.ImageLayer(
-                source=moving_source,
-            ),
-            shader=MAGENTA_SHADER,
-            blend="additive",
-            opacity=1.0,
-        )
-
-    # Open viewer in browser
     webbrowser.open_new(viewer.get_viewer_url())
 
     # Buttons or command line args to do basic rotations, flips, moves
