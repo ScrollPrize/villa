@@ -55,6 +55,11 @@ class TrainEVAMAE(BaseTrainer):
             self.mask_ratio = getattr(mgr, 'mask_ratio', self.mask_ratio)
             self.vit_patch_size = getattr(mgr, 'vit_patch_size', self.vit_patch_size)
             
+            # Override learning rate, weight decay, and warmup for MAE training
+            mgr.initial_lr = self.initial_lr
+            mgr.weight_decay = self.weight_decay
+            mgr.warmup_duration = self.warmup_duration_whole_net
+            
             # Set only_spatial_and_intensity flag for MAE training
             mgr.only_spatial_and_intensity = True
             
@@ -100,7 +105,7 @@ class TrainEVAMAE(BaseTrainer):
         if stage == "warmup_all":
             print("Training whole net with warmup")
             optimizer = torch.optim.AdamW(
-                params, self.initial_lr, weight_decay=self.weight_decay, amsgrad=False, betas=(0.9, 0.98)
+                params, self.mgr.initial_lr, weight_decay=self.mgr.weight_decay, amsgrad=False, betas=(0.9, 0.98)
             )
             self.training_stage = stage
         else:
@@ -111,8 +116,8 @@ class TrainEVAMAE(BaseTrainer):
             else:
                 optimizer = torch.optim.AdamW(
                     params,
-                    self.initial_lr,
-                    weight_decay=self.weight_decay,
+                    self.mgr.initial_lr,
+                    weight_decay=self.mgr.weight_decay,
                     amsgrad=False,
                     betas=(0.9, 0.98)
                 )
@@ -124,10 +129,10 @@ class TrainEVAMAE(BaseTrainer):
     def _get_scheduler(self, optimizer):
         """Override to create MAE-specific learning rate scheduler."""
         if self.current_epoch < self.warmup_duration_whole_net:
-            scheduler = Lin_incr_LRScheduler(optimizer, self.initial_lr, self.warmup_duration_whole_net)
+            scheduler = Lin_incr_LRScheduler(optimizer, self.mgr.initial_lr, self.warmup_duration_whole_net)
         else:
             scheduler = PolyLRScheduler_offset(
-                optimizer, self.initial_lr, self.mgr.max_epoch, self.warmup_duration_whole_net
+                optimizer, self.mgr.initial_lr, self.mgr.max_epoch, self.warmup_duration_whole_net
             )
         # Return tuple (scheduler, is_per_iteration) - these are per-epoch schedulers
         return scheduler, False

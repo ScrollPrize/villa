@@ -1,5 +1,6 @@
 tr_config:
   patch_size: [128,128,128]
+  initial_lr: 3e-5
 
 model_config:
   architecture_type: "primus_m"
