@@ -356,12 +356,29 @@ def _make_translator(axis: str, amount: float):
     return handler
 
 
+def write_transform_to_file(_):
+    """Write a transform to a file."""
+    with viewer.txn() as state:
+        transform = state.layers["moving"].layer.source[0].transform.matrix
+        # Add homogeneous coordinate
+        transform = np.concatenate([transform, [[0, 0, 0, 1]]], axis=0)
+        # Write to file
+        if args.output_transform is None:
+            print("--output-transform not provided, printing transform to stdout:")
+            print(transform)
+            print("To save to file, use --output-transform <path>")
+        else:
+            print(f"Writing transform to {args.output_transform}")
+            np.savetxt(args.output_transform, transform)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixed", type=str, required=True)
     parser.add_argument("--moving", type=str, required=True)
     parser.add_argument("--fixed-voxel-size", type=float)
     parser.add_argument("--moving-voxel-size", type=float)
+    parser.add_argument("--output-transform", type=str)
     args = parser.parse_args()
 
     if not sys.flags.interactive:
@@ -381,6 +398,7 @@ if __name__ == "__main__":
     TRANSLATE_STEP = 10
 
     viewer.actions.add("toggle-color", toggle_color)
+    viewer.actions.add("write-transform", write_transform_to_file)
     viewer.actions.add("rot-x-plus-small", _make_rotator("x", SMALL_ROTATE_STEP))
     viewer.actions.add("rot-x-minus-small", _make_rotator("x", -SMALL_ROTATE_STEP))
     viewer.actions.add("rot-y-plus-small", _make_rotator("y", SMALL_ROTATE_STEP))
@@ -405,6 +423,7 @@ if __name__ == "__main__":
 
     with viewer.config_state.txn() as s:
         s.input_event_bindings.viewer["keyc"] = "toggle-color"
+        s.input_event_bindings.viewer["keyw"] = "write-transform"
         s.input_event_bindings.viewer["alt+keya"] = "rot-x-plus-small"
         s.input_event_bindings.viewer["alt+keyq"] = "rot-x-minus-small"
         s.input_event_bindings.viewer["alt+keys"] = "rot-y-plus-small"
@@ -437,4 +456,3 @@ if __name__ == "__main__":
     # Once enough points: find affine transform
     # Apply affine transform in real time to the moving layer
     # Save the affine transform
-    # Three column layout? Maybe not.
