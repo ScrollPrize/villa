@@ -753,10 +753,10 @@ class BaseTrainer:
                         train_sample_targets_all = {}
                         for t_name, t_tensor in targets_dict.items():
                             train_sample_targets_all[t_name] = t_tensor[b_idx: b_idx + 1]
-                        # Now create train_sample_targets without skel for save_debug
+                        # Now create train_sample_targets without skel and is_unlabeled for save_debug
                         train_sample_targets = {}
                         for t_name, t_tensor in train_sample_targets_all.items():
-                            if t_name != 'skel':
+                            if t_name not in ['skel', 'is_unlabeled']:
                                 train_sample_targets[t_name] = t_tensor
                         train_sample_outputs = {}
                         for t_name, p_tensor in outputs.items():
@@ -885,7 +885,7 @@ class BaseTrainer:
                                     
                                     targets_dict_first = {}
                                     for t_name, t_tensor in targets_dict_first_all.items():
-                                        if t_name != 'skel':
+                                        if t_name not in ['skel', 'is_unlabeled']:
                                             targets_dict_first[t_name] = t_tensor
                                     
                                     frames_array = save_debug(
