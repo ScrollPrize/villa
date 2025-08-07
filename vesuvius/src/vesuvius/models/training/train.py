@@ -400,13 +400,36 @@ class BaseTrainer:
             'model_ckpt_dir': model_ckpt_dir
         }
 
-    def _initialize_wandb(self, train_dataset, val_dataset, train_indices, val_indices):
+    def _initialize_wandb(self, train_dataset, val_dataset, train_indices, val_indices, ckpt_dir=None):
         """Initialize Weights & Biases logging if configured."""
         if self.mgr.wandb_project:
             import wandb  # lazy import in case it's not available
+            import json
+            import os
+            from datetime import datetime
+            
+            # Save train/val splits to local file instead of wandb config
             train_val_splits = save_train_val_filenames(self, train_dataset, val_dataset, train_indices, val_indices)
+            
+            # Use checkpoint directory if provided, otherwise use current directory
+            save_dir = ckpt_dir if ckpt_dir else os.getcwd()
+            
+            # Create a filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            splits_filename = f"train_val_splits_{self.mgr.model_name}_{timestamp}.json"
+            splits_filepath = os.path.join(save_dir, splits_filename)
+            
+            # Save to local file
+            with open(splits_filepath, 'w') as f:
+                json.dump(train_val_splits, f, indent=2)
+            print(f"Saved train/val splits to: {splits_filepath}")
+            
+            # Create wandb config without the large train_val_splits data
             mgr_config = self.mgr.convert_to_dict()
-            mgr_config.update({'train_val_splits': train_val_splits})
+            # Add a reference to the local file instead of the actual data
+            mgr_config['train_val_splits_file'] = splits_filepath
+            mgr_config['train_patch_count'] = len(train_indices)
+            mgr_config['val_patch_count'] = len(val_indices)
 
             wandb.init(
                 entity=self.mgr.wandb_entity,
@@ -414,6 +437,11 @@ class BaseTrainer:
                 group=self.mgr.model_name,
                 config=mgr_config
             )
+            
+            # Log the splits file as an artifact for reference
+            artifact = wandb.Artifact(f"train_val_splits_{timestamp}", type="dataset")
+            artifact.add_file(splits_filepath)
+            wandb.log_artifact(artifact)
 
     def _get_model_outputs(self, model, data_dict):
         inputs = data_dict["image"].to(self.device)
@@ -649,7 +677,7 @@ class BaseTrainer:
         ckpt_dir = training_state['ckpt_dir']
         model_ckpt_dir = training_state['model_ckpt_dir']
 
-        self._initialize_wandb(train_dataset, val_dataset, train_indices, val_indices)
+        self._initialize_wandb(train_dataset, val_dataset, train_indices, val_indices, ckpt_dir)
 
         val_loss_history = {}  # {epoch: validation_loss}
         checkpoint_history = deque(maxlen=3)
