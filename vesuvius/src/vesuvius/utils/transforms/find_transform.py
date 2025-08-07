@@ -329,7 +329,7 @@ def apply_matrix_to_centered(
     state.layers["moving"].layer.source[0].transform.matrix = matrix
 
 
-def _make_rotate_command(axis: str, angle_deg: float):
+def _make_rotator(axis: str, angle_deg: float):
     def handler(_):
         with viewer.txn() as state:
             rotate_mat = make_rotation_matrix(axis, angle_deg)
@@ -338,7 +338,7 @@ def _make_rotate_command(axis: str, angle_deg: float):
     return handler
 
 
-def _make_flip_command(axis: str):
+def _make_flipper(axis: str):
     def handler(_):
         with viewer.txn() as state:
             flip_mat = make_flip_matrix(axis)
@@ -347,7 +347,7 @@ def _make_flip_command(axis: str):
     return handler
 
 
-def _make_translate_command(axis: str, amount: float):
+def _make_translator(axis: str, amount: float):
     def handler(_):
         with viewer.txn() as state:
             translate_mat = make_translate_matrix(axis, amount)
@@ -376,52 +376,56 @@ if __name__ == "__main__":
 
     viewer = neuroglancer.Viewer()
 
+    SMALL_ROTATE_STEP = 1
+    LARGE_ROTATE_STEP = 90
+    TRANSLATE_STEP = 10
+
     viewer.actions.add("toggle-color", toggle_color)
-    viewer.actions.add("rotate-x-plus-small", _make_rotate_command("x", 1))
-    viewer.actions.add("rotate-x-minus-small", _make_rotate_command("x", -1))
-    viewer.actions.add("rotate-y-plus-small", _make_rotate_command("y", 1))
-    viewer.actions.add("rotate-y-minus-small", _make_rotate_command("y", -1))
-    viewer.actions.add("rotate-z-plus-small", _make_rotate_command("z", 1))
-    viewer.actions.add("rotate-z-minus-small", _make_rotate_command("z", -1))
-    viewer.actions.add("rotate-x-plus-large", _make_rotate_command("x", 90))
-    viewer.actions.add("rotate-x-minus-large", _make_rotate_command("x", -90))
-    viewer.actions.add("rotate-y-plus-large", _make_rotate_command("y", 90))
-    viewer.actions.add("rotate-y-minus-large", _make_rotate_command("y", -90))
-    viewer.actions.add("rotate-z-plus-large", _make_rotate_command("z", 90))
-    viewer.actions.add("rotate-z-minus-large", _make_rotate_command("z", -90))
-    viewer.actions.add("flip-x", _make_flip_command("x"))
-    viewer.actions.add("flip-y", _make_flip_command("y"))
-    viewer.actions.add("flip-z", _make_flip_command("z"))
-    viewer.actions.add("translate-x-plus-small", _make_translate_command("x", 10))
-    viewer.actions.add("translate-x-minus-small", _make_translate_command("x", -10))
-    viewer.actions.add("translate-y-plus-small", _make_translate_command("y", 10))
-    viewer.actions.add("translate-y-minus-small", _make_translate_command("y", -10))
-    viewer.actions.add("translate-z-plus-small", _make_translate_command("z", 10))
-    viewer.actions.add("translate-z-minus-small", _make_translate_command("z", -10))
+    viewer.actions.add("rot-x-plus-small", _make_rotator("x", SMALL_ROTATE_STEP))
+    viewer.actions.add("rot-x-minus-small", _make_rotator("x", -SMALL_ROTATE_STEP))
+    viewer.actions.add("rot-y-plus-small", _make_rotator("y", SMALL_ROTATE_STEP))
+    viewer.actions.add("rot-y-minus-small", _make_rotator("y", -SMALL_ROTATE_STEP))
+    viewer.actions.add("rot-z-plus-small", _make_rotator("z", SMALL_ROTATE_STEP))
+    viewer.actions.add("rot-z-minus-small", _make_rotator("z", -SMALL_ROTATE_STEP))
+    viewer.actions.add("rot-x-plus-large", _make_rotator("x", LARGE_ROTATE_STEP))
+    viewer.actions.add("rot-x-minus-large", _make_rotator("x", -LARGE_ROTATE_STEP))
+    viewer.actions.add("rot-y-plus-large", _make_rotator("y", LARGE_ROTATE_STEP))
+    viewer.actions.add("rot-y-minus-large", _make_rotator("y", -LARGE_ROTATE_STEP))
+    viewer.actions.add("rot-z-plus-large", _make_rotator("z", LARGE_ROTATE_STEP))
+    viewer.actions.add("rot-z-minus-large", _make_rotator("z", -LARGE_ROTATE_STEP))
+    viewer.actions.add("flip-x", _make_flipper("x"))
+    viewer.actions.add("flip-y", _make_flipper("y"))
+    viewer.actions.add("flip-z", _make_flipper("z"))
+    viewer.actions.add("trans-x-plus-small", _make_translator("x", TRANSLATE_STEP))
+    viewer.actions.add("trans-x-minus-small", _make_translator("x", -TRANSLATE_STEP))
+    viewer.actions.add("trans-y-plus-small", _make_translator("y", TRANSLATE_STEP))
+    viewer.actions.add("trans-y-minus-small", _make_translator("y", -TRANSLATE_STEP))
+    viewer.actions.add("trans-z-plus-small", _make_translator("z", TRANSLATE_STEP))
+    viewer.actions.add("trans-z-minus-small", _make_translator("z", -TRANSLATE_STEP))
 
     with viewer.config_state.txn() as s:
         s.input_event_bindings.viewer["keyc"] = "toggle-color"
-        s.input_event_bindings.viewer["alt+keya"] = "rotate-x-plus-small"
-        s.input_event_bindings.viewer["alt+keyq"] = "rotate-x-minus-small"
-        s.input_event_bindings.viewer["alt+keys"] = "rotate-y-plus-small"
-        s.input_event_bindings.viewer["alt+keyw"] = "rotate-y-minus-small"
-        s.input_event_bindings.viewer["alt+keyd"] = "rotate-z-plus-small"
-        s.input_event_bindings.viewer["alt+keye"] = "rotate-z-minus-small"
-        s.input_event_bindings.viewer["alt+shift+keya"] = "rotate-x-plus-large"
-        s.input_event_bindings.viewer["alt+shift+keyq"] = "rotate-x-minus-large"
-        s.input_event_bindings.viewer["alt+shift+keys"] = "rotate-y-plus-large"
-        s.input_event_bindings.viewer["alt+shift+keyw"] = "rotate-y-minus-large"
-        s.input_event_bindings.viewer["alt+shift+keyd"] = "rotate-z-plus-large"
-        s.input_event_bindings.viewer["alt+shift+keye"] = "rotate-z-minus-large"
+        s.input_event_bindings.viewer["alt+keya"] = "rot-x-plus-small"
+        s.input_event_bindings.viewer["alt+keyq"] = "rot-x-minus-small"
+        s.input_event_bindings.viewer["alt+keys"] = "rot-y-plus-small"
+        s.input_event_bindings.viewer["alt+keyw"] = "rot-y-minus-small"
+        s.input_event_bindings.viewer["alt+keyd"] = "rot-z-plus-small"
+        s.input_event_bindings.viewer["alt+keye"] = "rot-z-minus-small"
+        s.input_event_bindings.viewer["alt+shift+keya"] = "rot-x-plus-large"
+        s.input_event_bindings.viewer["alt+shift+keyq"] = "rot-x-minus-large"
+        s.input_event_bindings.viewer["alt+shift+keys"] = "rot-y-plus-large"
+        s.input_event_bindings.viewer["alt+shift+keyw"] = "rot-y-minus-large"
+        s.input_event_bindings.viewer["alt+shift+keyd"] = "rot-z-plus-large"
+        s.input_event_bindings.viewer["alt+shift+keye"] = "rot-z-minus-large"
         s.input_event_bindings.viewer["alt+keyf"] = "flip-x"
         s.input_event_bindings.viewer["alt+keyg"] = "flip-y"
         s.input_event_bindings.viewer["alt+keyh"] = "flip-z"
-        s.input_event_bindings.viewer["alt+keyj"] = "translate-x-plus-small"
-        s.input_event_bindings.viewer["alt+keyu"] = "translate-x-minus-small"
-        s.input_event_bindings.viewer["alt+keyk"] = "translate-y-plus-small"
-        s.input_event_bindings.viewer["alt+keyi"] = "translate-y-minus-small"
-        s.input_event_bindings.viewer["alt+keyl"] = "translate-z-plus-small"
-        s.input_event_bindings.viewer["alt+keyo"] = "translate-z-minus-small"
+        s.input_event_bindings.viewer["alt+keyj"] = "trans-x-plus-small"
+        s.input_event_bindings.viewer["alt+keyu"] = "trans-x-minus-small"
+        s.input_event_bindings.viewer["alt+keyk"] = "trans-y-plus-small"
+        s.input_event_bindings.viewer["alt+keyi"] = "trans-y-minus-small"
+        s.input_event_bindings.viewer["alt+keyl"] = "trans-z-plus-small"
+        s.input_event_bindings.viewer["alt+keyo"] = "trans-z-minus-small"
 
     with viewer.txn() as state:
         add_moving_and_fixed_layers(state, args.fixed, args.moving, scale_factor)
