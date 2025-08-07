@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from vesuvius.models.training.lr_schedulers import get_scheduler, PolyLRScheduler
 from torch.utils.data import DataLoader, SubsetRandomSampler
-from vesuvius.utils.utils import init_weights_he
+from vesuvius.models.utils import InitWeights_He
 from vesuvius.models.datasets import NapariDataset, ImageDataset, ZarrDataset
 from vesuvius.utils.plotting import save_debug
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
@@ -330,7 +330,7 @@ class BaseTrainer:
         loss_fns = self._build_loss()
         scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
 
-        model.apply(lambda module: init_weights_he(module, neg_slope=0.2))
+        model.apply(InitWeights_He(neg_slope=0.2))
         model = model.to(self.device)
 
         if self.device.type == 'cuda':
@@ -729,6 +729,8 @@ class BaseTrainer:
                 )
 
                 for t_name, loss_value in task_losses.items():
+                    if t_name not in epoch_losses:
+                        epoch_losses[t_name] = []
                     epoch_losses[t_name].append(loss_value)
                 
 
@@ -751,10 +753,10 @@ class BaseTrainer:
                         train_sample_targets_all = {}
                         for t_name, t_tensor in targets_dict.items():
                             train_sample_targets_all[t_name] = t_tensor[b_idx: b_idx + 1]
-                        # Now create train_sample_targets without skel for save_debug
+                        # Now create train_sample_targets without skel and is_unlabeled for save_debug
                         train_sample_targets = {}
                         for t_name, t_tensor in train_sample_targets_all.items():
-                            if t_name != 'skel':
+                            if t_name not in ['skel', 'is_unlabeled']:
                                 train_sample_targets[t_name] = t_tensor
                         train_sample_outputs = {}
                         for t_name, p_tensor in outputs.items():
@@ -764,7 +766,7 @@ class BaseTrainer:
                     scheduler.step()
 
                 loss_str = " | ".join([f"{t}: {np.mean(epoch_losses[t][-100:]):.4f}"
-                                       for t in self.mgr.targets if len(epoch_losses[t]) > 0])
+                                       for t in epoch_losses.keys() if len(epoch_losses[t]) > 0])
                 pbar.set_postfix_str(loss_str)
 
                 current_lr = optimizer.param_groups[0]['lr']
@@ -796,7 +798,9 @@ class BaseTrainer:
 
             # ---- validation ----- #
             if epoch % 1 == 0:
-                model.eval()
+                # For MAE training, don't set to eval mode to keep patch dropping active
+                if not hasattr(self, '_is_mae_training'):
+                    model.eval()
                 with torch.no_grad():
                     val_losses = {t_name: [] for t_name in self.mgr.targets}
                     frames_array = None
@@ -881,7 +885,7 @@ class BaseTrainer:
                                     
                                     targets_dict_first = {}
                                     for t_name, t_tensor in targets_dict_first_all.items():
-                                        if t_name != 'skel':
+                                        if t_name not in ['skel', 'is_unlabeled']:
                                             targets_dict_first[t_name] = t_tensor
                                     
                                     frames_array = save_debug(
@@ -1126,9 +1130,14 @@ def main():
     
     if trainer_name == "uncertainty_aware_mean_teacher":
         mgr.allow_unlabeled_data = True
-        from vesuvius.models.training.trainers.train_uncertainty_aware_mean_teacher import UncertaintyAwareMeanTeacher3DTrainer
-        trainer = UncertaintyAwareMeanTeacher3DTrainer(mgr=mgr, verbose=args.verbose)
+        from vesuvius.models.training.trainers.semi_supervised.train_uncertainty_aware_mean_teacher import TrainUncertaintyAwareMeanTeacher
+        trainer = TrainUncertaintyAwareMeanTeacher(mgr=mgr, verbose=args.verbose)
         print("Using Uncertainty-Aware Mean Teacher Trainer for semi-supervised 3D training")
+    elif trainer_name == "primus_mae":
+        mgr.allow_unlabeled_data = True
+        from vesuvius.models.training.trainers.self_supervised.train_eva_mae import TrainEVAMAE
+        trainer = TrainEVAMAE(mgr=mgr, verbose=args.verbose)
+        print("Using EVA (Primus) Architecture for MAE Pretraining")
     elif trainer_name == "base":
         trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Base Trainer for supervised training")
