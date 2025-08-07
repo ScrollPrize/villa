@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from vesuvius.models.training.lr_schedulers import get_scheduler, PolyLRScheduler
 from torch.utils.data import DataLoader, SubsetRandomSampler
-from vesuvius.utils.utils import init_weights_he
+from vesuvius.models.utils import InitWeights_He
 from vesuvius.models.datasets import NapariDataset, ImageDataset, ZarrDataset
 from vesuvius.utils.plotting import save_debug
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
@@ -330,7 +330,7 @@ class BaseTrainer:
         loss_fns = self._build_loss()
         scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
 
-        model.apply(lambda module: init_weights_he(module, neg_slope=0.2))
+        model.apply(lambda module: InitWeights_He(module, neg_slope=0.2))
         model = model.to(self.device)
 
         if self.device.type == 'cuda':
