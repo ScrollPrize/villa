@@ -224,54 +224,69 @@ def make_rotation_matrix(axis: str, angle_deg: float):
         )
 
 
+def apply_matrix_to_centered(
+    state: neuroglancer.ViewerState,
+    transform_matrix: np.ndarray,
+    volume_dimensions: Dimensions,
+):
+    """Apply a transformation matrix to a layer, centered on the volume's center.
+
+    Args:
+        state: The neuroglancer viewer state
+        layer_name: Name of the layer to transform
+        transform_matrix: 4x4 homogeneous transformation matrix to apply
+        volume_dimensions: Dimensions of the volume being transformed
+    """
+    original_matrix = state.layers["moving"].layer.source[0].transform.matrix
+    # Add homogeneous coordinate
+    original_matrix = np.concatenate([original_matrix, [[0, 0, 0, 1]]], axis=0)
+
+    # Current position of volume center in fixed space
+    cx, cy, cz, _ = original_matrix @ np.array(
+        [
+            volume_dimensions.voxels_x / 2,
+            volume_dimensions.voxels_y / 2,
+            volume_dimensions.voxels_z / 2,
+            1,
+        ]
+    )
+
+    # Center volume about origin
+    translate_to_origin_mat = np.array(
+        [
+            [1, 0, 0, -cx],
+            [0, 1, 0, -cy],
+            [0, 0, 1, -cz],
+            [0, 0, 0, 1],
+        ]
+    )
+    # Translate back to original position
+    translate_back_mat = np.array(
+        [
+            [1, 0, 0, cx],
+            [0, 1, 0, cy],
+            [0, 0, 1, cz],
+            [0, 0, 0, 1],
+        ]
+    )
+
+    matrix = (
+        translate_back_mat
+        @ transform_matrix
+        @ translate_to_origin_mat
+        @ original_matrix
+    )
+    # Remove homogeneous coordinate
+    matrix = matrix[:-1, :]
+    # Set new transform
+    state.layers["moving"].layer.source[0].transform.matrix = matrix
+
+
 def _make_rotate_command(axis: str, angle_deg: float):
     def handler(_):
         with viewer.txn() as state:
-            original_matrix = state.layers["moving"].layer.source[0].transform.matrix
-            # Add homogeneous coordinate
-            original_matrix = np.concatenate([original_matrix, [[0, 0, 0, 1]]], axis=0)
-
-            # Current position of moving volume center in fixed space
-            cx, cy, cz, _ = original_matrix @ np.array(
-                [
-                    moving_dimensions.voxels_x / 2,
-                    moving_dimensions.voxels_y / 2,
-                    moving_dimensions.voxels_z / 2,
-                    1,
-                ]
-            )
-
-            # Center moving volume about origin
-            translate_to_origin_mat = np.array(
-                [
-                    [1, 0, 0, -cx],
-                    [0, 1, 0, -cy],
-                    [0, 0, 1, -cz],
-                    [0, 0, 0, 1],
-                ]
-            )
-            # Rotate around axis
             rotate_mat = make_rotation_matrix(axis, angle_deg)
-            # Translate back to original position
-            translate_back_mat = np.array(
-                [
-                    [1, 0, 0, cx],
-                    [0, 1, 0, cy],
-                    [0, 0, 1, cz],
-                    [0, 0, 0, 1],
-                ]
-            )
-
-            matrix = (
-                translate_back_mat
-                @ rotate_mat
-                @ translate_to_origin_mat
-                @ original_matrix
-            )
-            # Remove homogeneous coordinate
-            matrix = matrix[:-1, :]
-            # Set new transform
-            state.layers["moving"].layer.source[0].transform.matrix = matrix
+            apply_matrix_to_centered(state, rotate_mat, moving_dimensions)
 
     return handler
 
