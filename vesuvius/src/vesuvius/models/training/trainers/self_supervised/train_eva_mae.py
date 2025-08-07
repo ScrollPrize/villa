@@ -77,6 +77,7 @@ class TrainEVAMAE(BaseTrainer):
         
         self.training_stage = None
         self.current_epoch = 0
+        self._is_mae_training = True  # Flag to keep model in training mode during validation
         
     def _build_loss(self):
         """Build MAE loss function."""

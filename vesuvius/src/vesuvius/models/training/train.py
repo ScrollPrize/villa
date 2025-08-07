@@ -796,7 +796,9 @@ class BaseTrainer:
 
             # ---- validation ----- #
             if epoch % 1 == 0:
-                model.eval()
+                # For MAE training, don't set to eval mode to keep patch dropping active
+                if not hasattr(self, '_is_mae_training'):
+                    model.eval()
                 with torch.no_grad():
                     val_losses = {t_name: [] for t_name in self.mgr.targets}
                     frames_array = None
