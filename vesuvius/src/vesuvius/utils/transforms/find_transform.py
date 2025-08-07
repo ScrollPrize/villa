@@ -54,9 +54,10 @@ def check_ome_zarr(path: str) -> bool:
 def get_dimensions(
     path: str, provided_voxel_size: Optional[float] = None
 ) -> Dimensions:
-    """Get voxel size from metadata.json if it exists, otherwise use provided value.
+    """Get volume dimensions (from Zarr) and voxel size (from metadata.json if it exists, otherwise use provided value).
 
-    If both are provided, make sure they are the same."""
+    If both are provided, make sure they are the same.
+    """
 
     # Get volume dimensions in voxels
     with zarr.open(path, mode="r") as store:
@@ -170,25 +171,57 @@ if __name__ == "__main__":
     def rotate_90(_):
         # TODO: make this work for any axis based on which viewport is active
         with viewer.txn() as state:
-            matrix = state.layers["moving"].layer.source[0].transform.matrix
-            # add homogeneous coordinate
-            matrix = np.concatenate([matrix, [[0, 0, 0, 1]]], axis=0)
-            # TODO LEFT OFFincorporate translation to rotate about center
-            # rotate 90 degrees around z axis
-            matrix = np.matmul(
-                matrix,
-                np.array(
-                    [
-                        [0, -1, 0, 0],
-                        [1, 0, 0, 0],
-                        [0, 0, 1, 0],
-                        [0, 0, 0, 1],
-                    ]
-                ),
+            original_matrix = state.layers["moving"].layer.source[0].transform.matrix
+            # Add homogeneous coordinate
+            original_matrix = np.concatenate([original_matrix, [[0, 0, 0, 1]]], axis=0)
+
+            # Current position of moving volume center in fixed space
+            cx, cy, cz, _ = original_matrix @ np.array(
+                [
+                    moving_dimensions.voxels_x / 2,
+                    moving_dimensions.voxels_y / 2,
+                    moving_dimensions.voxels_z / 2,
+                    1,
+                ]
             )
-            # remove homogeneous coordinate
+
+            # Center moving volume about origin
+            translate_to_origin_mat = np.array(
+                [
+                    [1, 0, 0, -cx],
+                    [0, 1, 0, -cy],
+                    [0, 0, 1, -cz],
+                    [0, 0, 0, 1],
+                ]
+            )
+            # Rotate 90 degrees around z axis
+            rotate_mat = np.array(
+                [
+                    [0, -1, 0, 0],
+                    [1, 0, 0, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 1],
+                ]
+            )
+            # Translate back to original position
+            translate_back_mat = np.array(
+                [
+                    [1, 0, 0, cx],
+                    [0, 1, 0, cy],
+                    [0, 0, 1, cz],
+                    [0, 0, 0, 1],
+                ]
+            )
+
+            matrix = (
+                translate_back_mat
+                @ rotate_mat
+                @ translate_to_origin_mat
+                @ original_matrix
+            )
+            # Remove homogeneous coordinate
             matrix = matrix[:-1, :]
-            # set new transform
+            # Set new transform
             state.layers["moving"].layer.source[0].transform.matrix = matrix
 
     viewer.actions.add("toggle-color", toggle_color)
