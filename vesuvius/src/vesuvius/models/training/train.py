@@ -729,6 +729,8 @@ class BaseTrainer:
                 )
 
                 for t_name, loss_value in task_losses.items():
+                    if t_name not in epoch_losses:
+                        epoch_losses[t_name] = []
                     epoch_losses[t_name].append(loss_value)
                 
 
@@ -764,7 +766,7 @@ class BaseTrainer:
                     scheduler.step()
 
                 loss_str = " | ".join([f"{t}: {np.mean(epoch_losses[t][-100:]):.4f}"
-                                       for t in self.mgr.targets if len(epoch_losses[t]) > 0])
+                                       for t in epoch_losses.keys() if len(epoch_losses[t]) > 0])
                 pbar.set_postfix_str(loss_str)
 
                 current_lr = optimizer.param_groups[0]['lr']
@@ -1131,7 +1133,7 @@ def main():
         from vesuvius.models.training.trainers.semi_supervised.train_uncertainty_aware_mean_teacher import TrainUncertaintyAwareMeanTeacher
         trainer = TrainUncertaintyAwareMeanTeacher(mgr=mgr, verbose=args.verbose)
         print("Using Uncertainty-Aware Mean Teacher Trainer for semi-supervised 3D training")
-    if trainer_name == "primus_mae":
+    elif trainer_name == "primus_mae":
         mgr.allow_unlabeled_data = True
         from vesuvius.models.training.trainers.self_supervised.train_eva_mae import TrainEVAMAE
         trainer = TrainEVAMAE(mgr=mgr, verbose=args.verbose)

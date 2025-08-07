@@ -155,7 +155,7 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         
         batch_size = inputs.shape[0]
         
-        if self.training and batch_size == self.mgr.train_batch_size:
+        if model.training and batch_size == self.mgr.train_batch_size:
             # TwoStreamBatchSampler orders data like so : [labeled..., unlabeled...]
             # i.e :  labeled_batch_size samples are labeled, rest are unlabeled
             is_unlabeled = torch.zeros(batch_size, device=self.device)
@@ -166,7 +166,9 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         
         outputs = model(inputs)
         
-        targets_dict['is_unlabeled'] = is_unlabeled
+        # Store is_unlabeled separately - don't add to targets_dict as it breaks visualization
+        if model.training:
+            targets_dict['is_unlabeled'] = is_unlabeled
         
         return inputs, targets_dict, outputs
     
@@ -178,12 +180,15 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         volume_batch_r = unlabeled_inputs.repeat(2, 1, 1, 1, 1)
         stride = volume_batch_r.shape[0] // 2
         
+        # Get number of output channels (assuming single task or first task)
+        num_classes = self.mgr.out_channels[0] if isinstance(self.mgr.out_channels, tuple) else self.mgr.out_channels
+        
         if unlabeled_inputs.dim() == 5:  # 3D case: [B, C, D, H, W]
             _, c, d, h, w = unlabeled_inputs.shape
-            preds = torch.zeros([stride * T, self.mgr.num_classes, d, h, w]).to(self.device)
+            preds = torch.zeros([stride * T, num_classes, d, h, w]).to(self.device)
         else:  # 2D case: [B, C, H, W]
             _, c, h, w = unlabeled_inputs.shape
-            preds = torch.zeros([stride * T, self.mgr.num_classes, h, w]).to(self.device)
+            preds = torch.zeros([stride * T, num_classes, h, w]).to(self.device)
         
         with torch.no_grad():
             for i in range(T // 2):
@@ -193,13 +198,18 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
                 )
                 ema_inputs = volume_batch_r + noise
                 with autocast_ctx:
-                    preds[2 * stride * i:2 * stride * (i + 1)] = self.ema_model(ema_inputs)
+                    ema_outputs = self.ema_model(ema_inputs)
+                    # Extract the first task's output from the dictionary
+                    first_task = list(ema_outputs.keys())[0]
+                    if first_task == '_inputs':
+                        first_task = list(ema_outputs.keys())[1] if len(ema_outputs.keys()) > 1 else list(ema_outputs.keys())[0]
+                    preds[2 * stride * i:2 * stride * (i + 1)] = ema_outputs[first_task]
         
         preds = F.softmax(preds, dim=1)
         if unlabeled_inputs.dim() == 5:
-            preds = preds.reshape(T, stride, self.mgr.num_classes, d, h, w)
+            preds = preds.reshape(T, stride, num_classes, d, h, w)
         else:
-            preds = preds.reshape(T, stride, self.mgr.num_classes, h, w)
+            preds = preds.reshape(T, stride, num_classes, h, w)
         
         mean_pred = torch.mean(preds, dim=0)  # [stride, num_classes, ...]
         
@@ -271,9 +281,10 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
                 raise ValueError("No task outputs found besides _inputs")
         
         student_unlabeled = outputs[first_task][unlabeled_mask]
+        teacher_unlabeled = teacher_outputs[first_task]
         
         # Compute consistency loss (element-wise)
-        consistency_dist = softmax_mse_loss(student_unlabeled, teacher_outputs)
+        consistency_dist = softmax_mse_loss(student_unlabeled, teacher_unlabeled)
         
         # Apply uncertainty-based weighting
         # Use sigmoid ramp-up for threshold
