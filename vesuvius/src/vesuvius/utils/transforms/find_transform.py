@@ -222,6 +222,41 @@ def make_rotation_matrix(axis: str, angle_deg: float):
                 [0, 0, 0, 1],
             ]
         )
+    else:
+        raise ValueError(f"Invalid axis: {axis}")
+
+
+def make_flip_matrix(axis: str):
+    """Make a flip matrix for the given axis."""
+    if axis == "x":
+        return np.array(
+            [
+                [-1, 0, 0, 0],
+                [0, 1, 0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1],
+            ]
+        )
+    elif axis == "y":
+        return np.array(
+            [
+                [1, 0, 0, 0],
+                [0, -1, 0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1],
+            ]
+        )
+    elif axis == "z":
+        return np.array(
+            [
+                [1, 0, 0, 0],
+                [0, 1, 0, 0],
+                [0, 0, -1, 0],
+                [0, 0, 0, 1],
+            ]
+        )
+    else:
+        raise ValueError(f"Invalid axis: {axis}")
 
 
 def apply_matrix_to_centered(
@@ -291,6 +326,15 @@ def _make_rotate_command(axis: str, angle_deg: float):
     return handler
 
 
+def _make_flip_command(axis: str):
+    def handler(_):
+        with viewer.txn() as state:
+            flip_mat = make_flip_matrix(axis)
+            apply_matrix_to_centered(state, flip_mat, moving_dimensions)
+
+    return handler
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixed", type=str, required=True)
@@ -324,6 +368,9 @@ if __name__ == "__main__":
     viewer.actions.add("rotate-y-minus-90", _make_rotate_command("y", -90))
     viewer.actions.add("rotate-z-plus-90", _make_rotate_command("z", 90))
     viewer.actions.add("rotate-z-minus-90", _make_rotate_command("z", -90))
+    viewer.actions.add("flip-x", _make_flip_command("x"))
+    viewer.actions.add("flip-y", _make_flip_command("y"))
+    viewer.actions.add("flip-z", _make_flip_command("z"))
 
     with viewer.config_state.txn() as s:
         s.input_event_bindings.viewer["keyc"] = "toggle-color"
@@ -339,6 +386,9 @@ if __name__ == "__main__":
         s.input_event_bindings.viewer["alt+shift+arrowdown"] = "rotate-y-minus-90"
         s.input_event_bindings.viewer["alt+shift+keyr"] = "rotate-z-plus-90"
         s.input_event_bindings.viewer["alt+shift+keye"] = "rotate-z-minus-90"
+        s.input_event_bindings.viewer["alt+keyj"] = "flip-x"
+        s.input_event_bindings.viewer["alt+keyk"] = "flip-y"
+        s.input_event_bindings.viewer["alt+keyl"] = "flip-z"
 
     with viewer.txn() as state:
         add_moving_and_fixed_layers(state, args.fixed, args.moving, scale_factor)
