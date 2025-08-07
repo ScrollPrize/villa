@@ -265,7 +265,8 @@ class BaseTrainer:
             # even though according to every single thing i've read you dont need grad scaling with bf16
             # my model learns essentially nothing with it disabled. i have no idea why.
             if torch.cuda.is_bf16_supported():
-                print("Using GradScaler with bfloat16 autocast")
+                print("bfloat16 is supported, grad scaling is not required. using DummyScaler")
+                return DummyScaler()
             else:
                 print("Using GradScaler with float16 autocast")
             return torch.amp.GradScaler('cuda')
