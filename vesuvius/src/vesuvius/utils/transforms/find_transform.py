@@ -37,7 +37,7 @@ void main() {
 """
 
 
-def sanity_check_zarr_store(store: zarr.storage.FSStore):
+def sanity_check_zarr_store(store):
     """Check if the store is a valid OME-ZARR file."""
     try:
         # Basic functionality checks
@@ -48,7 +48,7 @@ def sanity_check_zarr_store(store: zarr.storage.FSStore):
         raise ValueError(f"Invalid OME-ZARR file: {store.path}") from e
 
 
-def get_dimensions(
+def get_volume_dimensions(
     path: str, provided_voxel_size: Optional[float] = None
 ) -> Dimensions:
     """Get volume dimensions (from Zarr) and voxel size (from metadata.json if it exists, otherwise use provided value).
@@ -179,37 +179,53 @@ def add_moving_and_fixed_layers(
     )
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--fixed", type=str, required=True)
-    parser.add_argument("--moving", type=str, required=True)
-    parser.add_argument("--fixed-voxel-size", type=float)
-    parser.add_argument("--moving-voxel-size", type=float)
-    args = parser.parse_args()
+def toggle_color(_):
+    with viewer.txn() as state:
+        if "vec3" in state.layers["fixed"].shader:
+            state.layers["fixed"].shader = ""
+            state.layers["moving"].shader = ""
+        else:
+            state.layers["fixed"].shader = GREEN_SHADER
+            state.layers["moving"].shader = MAGENTA_SHADER
 
-    if not sys.flags.interactive:
-        print(
-            f"Running in non-interactive mode. Use `python -i {Path(__file__).name}` to run in interactive mode (required for neuroglancer)."
+
+def make_rotation_matrix(axis: str, angle_deg: float):
+    """Make a rotation matrix for the given axis and angle."""
+    angle_rad = np.deg2rad(angle_deg)
+    cos_theta = np.cos(angle_rad)
+    sin_theta = np.sin(angle_rad)
+
+    if axis == "x":
+        return np.array(
+            [
+                [1, 0, 0, 0],
+                [0, cos_theta, -sin_theta, 0],
+                [0, sin_theta, cos_theta, 0],
+                [0, 0, 0, 1],
+            ]
         )
-        sys.exit(1)
+    elif axis == "y":
+        return np.array(
+            [
+                [cos_theta, 0, sin_theta, 0],
+                [0, 1, 0, 0],
+                [-sin_theta, 0, cos_theta, 0],
+                [0, 0, 0, 1],
+            ]
+        )
+    elif axis == "z":
+        return np.array(
+            [
+                [cos_theta, -sin_theta, 0, 0],
+                [sin_theta, cos_theta, 0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1],
+            ]
+        )
 
-    # Get dimensions from each volume
-    fixed_dimensions = get_dimensions(args.fixed, args.fixed_voxel_size)
-    moving_dimensions = get_dimensions(args.moving, args.moving_voxel_size)
-    scale_factor = moving_dimensions.voxel_size_um / fixed_dimensions.voxel_size_um
 
-    viewer = neuroglancer.Viewer()
-
-    def toggle_color(_):
-        with viewer.txn() as state:
-            if "vec3" in state.layers["fixed"].shader:
-                state.layers["fixed"].shader = ""
-                state.layers["moving"].shader = ""
-            else:
-                state.layers["fixed"].shader = GREEN_SHADER
-                state.layers["moving"].shader = MAGENTA_SHADER
-
-    def rotate_z_plus_90(_):
+def _make_rotate_command(axis: str, angle_deg: float):
+    def handler(_):
         with viewer.txn() as state:
             original_matrix = state.layers["moving"].layer.source[0].transform.matrix
             # Add homogeneous coordinate
@@ -234,15 +250,8 @@ if __name__ == "__main__":
                     [0, 0, 0, 1],
                 ]
             )
-            # Rotate 90 degrees around z axis
-            rotate_mat = np.array(
-                [
-                    [0, -1, 0, 0],
-                    [1, 0, 0, 0],
-                    [0, 0, 1, 0],
-                    [0, 0, 0, 1],
-                ]
-            )
+            # Rotate around axis
+            rotate_mat = make_rotation_matrix(axis, angle_deg)
             # Translate back to original position
             translate_back_mat = np.array(
                 [
@@ -264,12 +273,57 @@ if __name__ == "__main__":
             # Set new transform
             state.layers["moving"].layer.source[0].transform.matrix = matrix
 
+    return handler
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fixed", type=str, required=True)
+    parser.add_argument("--moving", type=str, required=True)
+    parser.add_argument("--fixed-voxel-size", type=float)
+    parser.add_argument("--moving-voxel-size", type=float)
+    args = parser.parse_args()
+
+    if not sys.flags.interactive:
+        print(
+            f"Running in non-interactive mode. Use `python -i {Path(__file__).name}` to run in interactive mode (required for neuroglancer)."
+        )
+        sys.exit(1)
+
+    fixed_dimensions = get_volume_dimensions(args.fixed, args.fixed_voxel_size)
+    moving_dimensions = get_volume_dimensions(args.moving, args.moving_voxel_size)
+    scale_factor = moving_dimensions.voxel_size_um / fixed_dimensions.voxel_size_um
+
+    viewer = neuroglancer.Viewer()
+
     viewer.actions.add("toggle-color", toggle_color)
-    viewer.actions.add("rotate-z-plus-90", rotate_z_plus_90)
+    viewer.actions.add("rotate-x-plus-5", _make_rotate_command("x", 5))
+    viewer.actions.add("rotate-x-minus-5", _make_rotate_command("x", -5))
+    viewer.actions.add("rotate-y-plus-5", _make_rotate_command("y", 5))
+    viewer.actions.add("rotate-y-minus-5", _make_rotate_command("y", -5))
+    viewer.actions.add("rotate-z-plus-5", _make_rotate_command("z", 5))
+    viewer.actions.add("rotate-z-minus-5", _make_rotate_command("z", -5))
+    viewer.actions.add("rotate-x-plus-90", _make_rotate_command("x", 90))
+    viewer.actions.add("rotate-x-minus-90", _make_rotate_command("x", -90))
+    viewer.actions.add("rotate-y-plus-90", _make_rotate_command("y", 90))
+    viewer.actions.add("rotate-y-minus-90", _make_rotate_command("y", -90))
+    viewer.actions.add("rotate-z-plus-90", _make_rotate_command("z", 90))
+    viewer.actions.add("rotate-z-minus-90", _make_rotate_command("z", -90))
 
     with viewer.config_state.txn() as s:
         s.input_event_bindings.viewer["keyc"] = "toggle-color"
-        s.input_event_bindings.viewer["alt+keyr"] = "rotate-z-plus-90"
+        s.input_event_bindings.viewer["alt+arrowright"] = "rotate-x-plus-5"
+        s.input_event_bindings.viewer["alt+arrowleft"] = "rotate-x-minus-5"
+        s.input_event_bindings.viewer["alt+arrowup"] = "rotate-y-plus-5"
+        s.input_event_bindings.viewer["alt+arrowdown"] = "rotate-y-minus-5"
+        s.input_event_bindings.viewer["alt+keyr"] = "rotate-z-plus-5"
+        s.input_event_bindings.viewer["alt+keye"] = "rotate-z-minus-5"
+        s.input_event_bindings.viewer["alt+shift+arrowright"] = "rotate-x-plus-90"
+        s.input_event_bindings.viewer["alt+shift+arrowleft"] = "rotate-x-minus-90"
+        s.input_event_bindings.viewer["alt+shift+arrowup"] = "rotate-y-plus-90"
+        s.input_event_bindings.viewer["alt+shift+arrowdown"] = "rotate-y-minus-90"
+        s.input_event_bindings.viewer["alt+shift+keyr"] = "rotate-z-plus-90"
+        s.input_event_bindings.viewer["alt+shift+keye"] = "rotate-z-minus-90"
 
     with viewer.txn() as state:
         add_moving_and_fixed_layers(state, args.fixed, args.moving, scale_factor)
