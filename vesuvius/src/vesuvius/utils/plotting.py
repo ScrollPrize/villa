@@ -315,13 +315,46 @@ def save_debug(
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"[Epoch {epoch}] Saving GIF to: {save_path}")
         try:
-            # Ensure all frames are properly formatted before saving
-            frames_final = [np.ascontiguousarray(f, dtype=np.uint8) for f in frames]
-            imageio.mimsave(save_path, frames_final, fps=fps, loop=0)
-            # Return frames list for wandb logging (wandb expects list of frames or (T, H, W, C) array)
-            return frames_final
+            # Validate frames before saving
+            if not frames:
+                print(f"Warning: No frames to save")
+                return None
+            
+            # Check frame dimensions and types
+            for i, frame in enumerate(frames):
+                if frame.dtype != np.uint8:
+                    frames[i] = frame.astype(np.uint8)
+                if not frame.flags['C_CONTIGUOUS']:
+                    frames[i] = np.ascontiguousarray(frame)
+            
+            # Use PIL for better stability with GIF creation
+            try:
+                from PIL import Image
+                # Convert numpy arrays to PIL Images
+                pil_frames = [Image.fromarray(frame) for frame in frames]
+                # Save as GIF using PIL
+                pil_frames[0].save(
+                    save_path,
+                    save_all=True,
+                    append_images=pil_frames[1:],
+                    duration=1000//fps,  # PIL uses milliseconds per frame
+                    loop=0
+                )
+                print(f"Successfully saved GIF using PIL to: {save_path}")
+                # Return frames for wandb logging
+                return frames
+            except ImportError:
+                # Fall back to imageio if PIL is not available
+                print("PIL not available, using imageio")
+                # Ensure all frames are properly formatted before saving
+                frames_final = [np.ascontiguousarray(f, dtype=np.uint8) for f in frames]
+                imageio.mimsave(save_path, frames_final, fps=fps, loop=0)
+                return frames_final
         except Exception as e:
             print(f"Error saving GIF: {e}")
+            print(f"Error type: {type(e).__name__}")
+            import traceback
+            print(f"Traceback: {traceback.format_exc()}")
             print(f"Skipping debug visualization due to error")
             return None
 
