@@ -371,6 +371,11 @@ def write_transform_to_file(_):
             print(f"Writing transform to {args.output_transform}")
             np.savetxt(args.output_transform, transform)
 
+        # In either case print the state URL
+        print(
+            f"State URL: https://neuroglancer-demo.appspot.com/#!{neuroglancer.url_state.to_url_fragment(state)}"
+        )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
