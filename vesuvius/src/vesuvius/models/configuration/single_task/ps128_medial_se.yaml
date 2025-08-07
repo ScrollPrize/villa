@@ -1,6 +1,8 @@
 tr_config:
   patch_size: [128,128,128]
 
+model_config:
+  squeeze_excitation: true
 
 dataset_config:
   min_labeled_ratio: 0 
