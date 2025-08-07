@@ -259,6 +259,18 @@ def make_flip_matrix(axis: str):
         raise ValueError(f"Invalid axis: {axis}")
 
 
+def make_translate_matrix(axis: str, amount: float):
+    """Make a translation matrix for the given axis and amount."""
+    if axis == "x":
+        return np.array([[1, 0, 0, amount], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+    elif axis == "y":
+        return np.array([[1, 0, 0, 0], [0, 1, 0, amount], [0, 0, 1, 0], [0, 0, 0, 1]])
+    elif axis == "z":
+        return np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, amount], [0, 0, 0, 1]])
+    else:
+        raise ValueError(f"Invalid axis: {axis}")
+
+
 def apply_matrix_to_centered(
     state: neuroglancer.ViewerState,
     transform_matrix: np.ndarray,
@@ -335,6 +347,15 @@ def _make_flip_command(axis: str):
     return handler
 
 
+def _make_translate_command(axis: str, amount: float):
+    def handler(_):
+        with viewer.txn() as state:
+            translate_mat = make_translate_matrix(axis, amount)
+            apply_matrix_to_centered(state, translate_mat, moving_dimensions)
+
+    return handler
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixed", type=str, required=True)
@@ -371,6 +392,12 @@ if __name__ == "__main__":
     viewer.actions.add("flip-x", _make_flip_command("x"))
     viewer.actions.add("flip-y", _make_flip_command("y"))
     viewer.actions.add("flip-z", _make_flip_command("z"))
+    viewer.actions.add("translate-x-plus-10", _make_translate_command("x", 10))
+    viewer.actions.add("translate-x-minus-10", _make_translate_command("x", -10))
+    viewer.actions.add("translate-y-plus-10", _make_translate_command("y", 10))
+    viewer.actions.add("translate-y-minus-10", _make_translate_command("y", -10))
+    viewer.actions.add("translate-z-plus-10", _make_translate_command("z", 10))
+    viewer.actions.add("translate-z-minus-10", _make_translate_command("z", -10))
 
     with viewer.config_state.txn() as s:
         s.input_event_bindings.viewer["keyc"] = "toggle-color"
@@ -389,13 +416,18 @@ if __name__ == "__main__":
         s.input_event_bindings.viewer["alt+keyf"] = "flip-x"
         s.input_event_bindings.viewer["alt+keyg"] = "flip-y"
         s.input_event_bindings.viewer["alt+keyh"] = "flip-z"
+        s.input_event_bindings.viewer["alt+keyj"] = "translate-x-plus-10"
+        s.input_event_bindings.viewer["alt+keyu"] = "translate-x-minus-10"
+        s.input_event_bindings.viewer["alt+keyk"] = "translate-y-plus-10"
+        s.input_event_bindings.viewer["alt+keyi"] = "translate-y-minus-10"
+        s.input_event_bindings.viewer["alt+keyl"] = "translate-z-plus-10"
+        s.input_event_bindings.viewer["alt+keyo"] = "translate-z-minus-10"
 
     with viewer.txn() as state:
         add_moving_and_fixed_layers(state, args.fixed, args.moving, scale_factor)
 
     webbrowser.open_new(viewer.get_viewer_url())
 
-    # Buttons or command line args to do basic rotations, flips, moves
     # Allow clicking to set points
     # Have some mechanism to have current active layer
     # Once enough points: find affine transform
