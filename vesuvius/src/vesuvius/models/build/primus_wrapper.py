@@ -179,7 +179,7 @@ class PrimusEncoder(nn.Module):
         restored_x, restoration_mask = self.restore_full_sequence(x, keep_indices, num_patches)
         
         # Reshape back to spatial format
-        x = rearrange(restored_x, "b (w h d) c -> b c w h d", h=H, w=W, d=D)
+        x = rearrange(restored_x, "b (w h d) c -> b c w h d", h=H, w=W, d=D).contiguous()
         
         # Prepare full resolution mask if requested (following original Primus)
         if ret_mask and restoration_mask is not None:

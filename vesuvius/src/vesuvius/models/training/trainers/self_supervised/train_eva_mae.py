@@ -43,11 +43,11 @@ class TrainEVAMAE(BaseTrainer):
     def __init__(self, mgr=None, verbose: bool = True):
 
         self.mask_ratio = 0.75  # Default to 75% masking
-        self.drop_path_rate = 0.0  # Stochastic depth
+        self.drop_path_rate = 0.2  # Stochastic depth
         self.attention_drop_rate = 0.0  # Attention dropout
         self.grad_clip = 1
-        self.initial_lr = 3e-5
-        self.weight_decay = 5e-3
+        self.initial_lr = 3e-4
+        self.weight_decay = 5e-2
         self.warmup_duration_whole_net = 50  # lin increase whole network
         self.vit_patch_size = (8, 8, 8)
         
@@ -67,6 +67,7 @@ class TrainEVAMAE(BaseTrainer):
                 mgr.targets = {}
             mgr.targets['mae'] = {
                 'num_classes': 1,  # Regression task
+                'out_channels': 1,  # Reconstruct single channel input
                 'weight': 1.0
             }
             
