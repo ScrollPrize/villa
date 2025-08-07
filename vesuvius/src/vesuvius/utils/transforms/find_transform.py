@@ -5,7 +5,7 @@ import copy
 import json
 from pathlib import Path
 import sys
-from typing import Optional
+from typing import Optional, NamedTuple
 from urllib.parse import urljoin, urlparse
 import webbrowser
 
@@ -13,6 +13,15 @@ import neuroglancer
 import numpy as np
 import requests
 import zarr
+
+
+class Dimensions(NamedTuple):
+    """Structure for volume dimensions with x, y, z coordinates and voxel size."""
+
+    voxels_x: int
+    voxels_y: int
+    voxels_z: int
+    voxel_size_um: float
 
 
 GREEN_SHADER = """
@@ -42,10 +51,18 @@ def check_ome_zarr(path: str) -> bool:
         return False
 
 
-def get_voxel_size(path: str, provided_voxel_size: Optional[float] = None) -> float:
+def get_dimensions(
+    path: str, provided_voxel_size: Optional[float] = None
+) -> Dimensions:
     """Get voxel size from metadata.json if it exists, otherwise use provided value.
 
     If both are provided, make sure they are the same."""
+
+    # Get volume dimensions in voxels
+    with zarr.open(path, mode="r") as store:
+        voxels_x, voxels_y, voxels_z = store["0"].shape
+
+    # Get voxel size from metadata.json if it exists
     # Check if path is a URL or local path
     parsed = urlparse(path)
     is_remote = parsed.scheme in ("http", "https")
@@ -93,12 +110,22 @@ def get_voxel_size(path: str, provided_voxel_size: Optional[float] = None) -> fl
             assert (
                 metadata_voxel_size_um == provided_voxel_size
             ), "Voxel size from metadata.json and provided voxel size do not match"
-        return metadata_voxel_size_um
+        return Dimensions(
+            voxels_x=voxels_x,
+            voxels_y=voxels_y,
+            voxels_z=voxels_z,
+            voxel_size_um=metadata_voxel_size_um,
+        )
     else:
         assert (
             provided_voxel_size is not None
         ), f"No metadata.json found at {metadata_path} and no voxel size provided directly"
-        return provided_voxel_size
+        return Dimensions(
+            voxels_x=voxels_x,
+            voxels_y=voxels_y,
+            voxels_z=voxels_z,
+            voxel_size_um=provided_voxel_size,
+        )
 
 
 if __name__ == "__main__":
@@ -122,12 +149,12 @@ if __name__ == "__main__":
         raise ValueError(f"Invalid OME-ZARR file: {args.moving}")
 
     # Establish voxel size for each volume
-    fixed_voxel_size_um = get_voxel_size(args.fixed, args.fixed_voxel_size)
-    moving_voxel_size_um = get_voxel_size(args.moving, args.moving_voxel_size)
-    scale_factor = moving_voxel_size_um / fixed_voxel_size_um
+    fixed_dimensions = get_dimensions(args.fixed, args.fixed_voxel_size)
+    moving_dimensions = get_dimensions(args.moving, args.moving_voxel_size)
+    scale_factor = moving_dimensions.voxel_size_um / fixed_dimensions.voxel_size_um
 
-    print(f"Fixed voxel size (um): {fixed_voxel_size_um}")
-    print(f"Moving voxel size (um): {moving_voxel_size_um}")
+    print(f"Fixed voxel size (um): {fixed_dimensions.voxel_size_um}")
+    print(f"Moving voxel size (um): {moving_dimensions.voxel_size_um}")
 
     viewer = neuroglancer.Viewer()
 
