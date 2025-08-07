@@ -86,9 +86,9 @@ class PrimusEncoder(nn.Module):
             scale_attn_inner=scale_attn_inner,
         )
         
-        # Initialize mask token for restoration
-        self.mask_token: torch.Tensor
-        self.register_buffer("mask_token", torch.zeros(1, 1, self.embed_dim))
+        # Initialize mask token for restoration as learnable parameter
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        nn.init.normal_(self.mask_token, std=1e-6)
         
         # Initialize register tokens if needed
         if num_register_tokens > 0:
@@ -202,7 +202,7 @@ class PrimusEncoder(nn.Module):
 
 class PrimusDecoder(nn.Module):
     """
-    Decoder wrapper for Primus that uses PatchDecode for upsampling.
+    Decoder wrapper for Primus that uses Eva decoder layers followed by PatchDecode for upsampling.
     Compatible with NetworkFromConfig's decoder interface.
     """
     
@@ -212,11 +212,14 @@ class PrimusDecoder(nn.Module):
         num_classes: int,
         norm="LayerNormNd",
         activation="GELU",
+        decoder_depth: int = 2,  # Number of Eva decoder layers
+        decoder_num_heads: int = 12,  # Number of heads in decoder
     ):
         super().__init__()
         
         self.encoder = encoder
         self.num_classes = num_classes
+        self.decoder_depth = decoder_depth
         
         # Parse normalization layer
         norm_layer = self._get_norm_layer(norm)
@@ -224,8 +227,31 @@ class PrimusDecoder(nn.Module):
         # Parse activation function  
         act_fn = self._get_activation(activation)
         
+        # Initialize Eva decoder layers if depth > 0
+        if decoder_depth > 0:
+            self.eva_decoder = Eva(
+                embed_dim=encoder.embed_dim,
+                depth=decoder_depth,
+                num_heads=decoder_num_heads,
+                ref_feat_shape=encoder.patch_grid,
+                num_reg_tokens=0,  # No register tokens in decoder
+                use_rot_pos_emb=True,
+                use_abs_pos_emb=True,
+                mlp_ratio=4 * 2 / 3,
+                drop_path_rate=0.0,  # No drop path in decoder
+                patch_drop_rate=0.0,  # No patch drop in decoder
+                proj_drop_rate=0.0,
+                attn_drop_rate=0.0,
+                rope_impl=RotaryEmbeddingCat,
+                rope_kwargs=None,
+                init_values=0.1,
+                scale_attn_inner=True,
+            )
+        else:
+            self.eva_decoder = None
+        
         # Initialize PatchDecode for upsampling
-        self.decoder = PatchDecode(
+        self.patch_decoder = PatchDecode(
             patch_size=encoder.patch_embed_size,
             embed_dim=encoder.embed_dim,
             out_channels=num_classes,
@@ -292,8 +318,22 @@ class PrimusDecoder(nn.Module):
         # Primus encoder returns a single feature map
         x = features[0] if isinstance(features, list) else features
         
+        # Get spatial dimensions from feature map
+        B, C, W, H, D = x.shape
+        
+        # Apply Eva decoder layers if present
+        if self.eva_decoder is not None:
+            # Reshape to sequence format for Eva
+            x = rearrange(x, "b c w h d -> b (w h d) c")
+            
+            # Process through Eva decoder
+            x, _ = self.eva_decoder(x)
+            
+            # Reshape back to spatial format
+            x = rearrange(x, "b (w h d) c -> b c w h d", h=H, w=W, d=D).contiguous()
+        
         # Apply patch decoder for upsampling
-        output = self.decoder(x)
+        output = self.patch_decoder(x)
         
         return output
 
@@ -314,6 +354,10 @@ class PrimusNetwork(nn.Module):
         **kwargs
     ):
         super().__init__()
+        
+        # Extract decoder parameters from kwargs
+        self.decoder_depth = kwargs.pop('decoder_depth', 2)
+        self.decoder_num_heads = kwargs.pop('decoder_num_heads', 12)
         
         # Initialize shared encoder
         self.shared_encoder = PrimusEncoder(
@@ -336,6 +380,8 @@ class PrimusNetwork(nn.Module):
             self.task_decoders[target_name] = PrimusDecoder(
                 encoder=self.shared_encoder,
                 num_classes=out_channels,
+                decoder_depth=self.decoder_depth,
+                decoder_num_heads=self.decoder_num_heads,
             )
             
             # Set up activation if specified
