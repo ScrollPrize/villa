@@ -144,11 +144,15 @@ class PrimusEncoder(nn.Module):
             
         return restored, restored_mask
     
-    def forward(self, x):
+    def forward(self, x, ret_mask=False):
         """
         Forward pass through the Primus encoder.
         Returns a list with a single feature map to maintain compatibility.
+        If ret_mask is True, also returns the full resolution mask for MAE training.
         """
+        # Store original shape for mask expansion
+        FW, FH, FD = x.shape[2:]  # Full resolution W, H, D
+        
         # Apply patch embedding
         x = self.patch_embed(x)
         B, C, W, H, D = x.shape
@@ -177,8 +181,22 @@ class PrimusEncoder(nn.Module):
         # Reshape back to spatial format
         x = rearrange(restored_x, "b (w h d) c -> b c w h d", h=H, w=W, d=D)
         
+        # Prepare full resolution mask if requested (following original Primus)
+        if ret_mask and restoration_mask is not None:
+            mask = rearrange(restoration_mask, "b (w h d) -> b w h d", h=H, w=W, d=D)
+            # Expand mask to full resolution
+            full_mask = (
+                mask.repeat_interleave(FW // W, dim=1)
+                .repeat_interleave(FH // H, dim=2)
+                .repeat_interleave(FD // D, dim=3)
+            )
+            full_mask = full_mask[:, None, ...]  # Add channel dimension [B, 1, W, H, D]
+        else:
+            full_mask = None
+        
         # Return as a list to maintain compatibility with skip connection interface
-        # The decoder will expect a list of feature maps
+        if ret_mask:
+            return [x], full_mask
         return [x]
 
 

@@ -553,6 +553,7 @@ class BaseDataset(Dataset):
         Returns None for validation (no augmentations).
         """
         no_spatial = getattr(self.mgr, 'no_spatial', False)
+        only_spatial_and_intensity = getattr(self.mgr, 'only_spatial_and_intensity', False)
             
         dimension = len(self.mgr.train_patch_size)
 
@@ -608,15 +609,7 @@ class BaseDataset(Dataset):
             # ))
 
         if dimension == 2:
-            transforms.append(RandomTransform(
-                GaussianBlurTransform(
-                    blur_sigma=(0.5, 1.5),
-                    synchronize_channels=True,
-                    synchronize_axes=False,
-                    p_per_channel=1.0
-                ),
-                apply_probability=0.2
-            ))
+            # Always add intensity augmentations
             transforms.append(RandomTransform(
                 MultiplicativeBrightnessTransform(
                     multiplier_range=BGContrast((0.75, 1.25)),
@@ -633,13 +626,7 @@ class BaseDataset(Dataset):
                     p_per_channel=1
                 ), apply_probability=0.15
             ))
-            transforms.append(RandomTransform(
-                GaussianNoiseTransform(
-                    noise_variance=(0, 0.15),
-                    p_per_channel=1,
-                    synchronize_channels=True
-                ), apply_probability=0.15
-            ))
+            
             transforms.append(RandomTransform(
                 GammaTransform(
                     gamma=BGContrast((0.7, 1.5)),
@@ -649,20 +636,40 @@ class BaseDataset(Dataset):
                     p_retain_stats=1
                 ), apply_probability=0.2
             ))
+            
+            # Only add noise/blur/rectangle transforms if not in only_spatial_and_intensity mode
+            if not only_spatial_and_intensity:
+                transforms.append(RandomTransform(
+                    GaussianBlurTransform(
+                        blur_sigma=(0.5, 1.5),
+                        synchronize_channels=True,
+                        synchronize_axes=False,
+                        p_per_channel=1.0
+                    ),
+                    apply_probability=0.2
+                ))
+                
+                transforms.append(RandomTransform(
+                    GaussianNoiseTransform(
+                        noise_variance=(0, 0.15),
+                        p_per_channel=1,
+                        synchronize_channels=True
+                    ), apply_probability=0.15
+                ))
 
-            rectangle_sizes_2d = tuple(
-                (max(1, size // 10), size // 3) for size in self.mgr.train_patch_size
-            )
-            transforms.append(RandomTransform(
-                BlankRectangleTransform(
-                    rectangle_size=rectangle_sizes_2d,
-                    rectangle_value=np.mean,
-                    num_rectangles=(1, 5),
-                    force_square=False,
-                    p_per_sample=0.3,
-                    p_per_channel=0.5
-                ), apply_probability=0.2
-            ))
+                rectangle_sizes_2d = tuple(
+                    (max(1, size // 10), size // 3) for size in self.mgr.train_patch_size
+                )
+                transforms.append(RandomTransform(
+                    BlankRectangleTransform(
+                        rectangle_size=rectangle_sizes_2d,
+                        rectangle_value=np.mean,
+                        num_rectangles=(1, 5),
+                        force_square=False,
+                        p_per_sample=0.3,
+                        p_per_channel=0.5
+                    ), apply_probability=0.2
+                ))
         else:
             if not no_spatial:
                 # Only add transpose transform if all three dimensions are equal

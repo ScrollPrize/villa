@@ -4,11 +4,11 @@ from typing import Tuple, Callable, Optional
 import numpy as np
 import torch
 from timm.layers import (
-    PatchDropout,
     trunc_normal_,
     apply_keep_indices_nlc,
     RotaryEmbeddingCat,
 )
+from timm.layers.patch_dropout import PatchDropoutWithIndices  # Using this instead of PatchDropout for indices support
 from timm.models.eva import EvaBlock
 from torch import nn
 from torch.nn import LayerNorm
@@ -21,8 +21,11 @@ class Eva(nn.Module):
     This class implements the EVA and EVA02 models that were based on the BEiT ViT variant
       * EVA - abs pos embed, global avg pool
       * EVA02 - abs + rope pos embed, global avg pool, SwiGLU, scale Norm in MLP (ala normformer)
-
-
+    
+    Key differences from reference implementation:
+      * Uses PatchDropoutWithIndices instead of PatchDropout(return_indices=True)
+      * For 2D ROPE embeddings, directly indexes instead of using apply_keep_indices_nlc 
+        to avoid batch dimension issues with apply_rot_embed_cat
     """
 
     def __init__(
@@ -79,10 +82,11 @@ class Eva(nn.Module):
         )
         self.pos_drop = nn.Dropout(p=pos_drop_rate)
         if patch_drop_rate > 0:
-            self.patch_drop = PatchDropout(
+            # NOTE: Using PatchDropoutWithIndices from timm which properly returns indices
+            # The reference uses PatchDropout with return_indices=True but that param doesn't exist in standard timm
+            self.patch_drop = PatchDropoutWithIndices(
                 patch_drop_rate,
                 num_prefix_tokens=self.num_prefix_tokens,
-                return_indices=True,
             )
         else:
             self.patch_drop = None
@@ -94,7 +98,7 @@ class Eva(nn.Module):
             # )
             if len(ref_feat_shape) == 3:
                 rope_dim = round(embed_dim // num_heads / 1.5)
-                assert rope_dim == embed_dim / num_heads / 1.5, "rope dim must be divsible by (num_heads * 1.5)"
+                assert rope_dim == embed_dim / num_heads / 1.5, "rope dim must be divisible by (num_heads * 1.5)"
                 assert rope_dim % 4 == 0, "rope dim must be divisible by 4"
             else:
                 rope_dim = embed_dim // num_heads
@@ -193,7 +197,16 @@ class Eva(nn.Module):
         if self.patch_drop is not None:
             x, keep_indices = self.patch_drop(x)
             if rot_pos_embed is not None and keep_indices is not None:
-                rot_pos_embed = apply_keep_indices_nlc(x, rot_pos_embed, keep_indices)
+                # IMPORTANT: Different from reference implementation
+                # apply_keep_indices_nlc adds batch dimension which is incompatible with apply_rot_embed_cat
+                # For 2D tensors [seq_len, dim], we index directly (this applies to both 2D and 3D spatial inputs)
+                # For higher-dim tensors (e.g., [num_heads, seq_len, head_dim]), we would use apply_keep_indices_nlc
+                if rot_pos_embed.ndim == 2:
+                    # All batches have same keep_indices with PatchDropout, so we use the first batch's indices
+                    rot_pos_embed = rot_pos_embed[keep_indices[0]]
+                else:
+                    # For higher-dim rope (e.g., [num_heads, seq_len, head_dim]), use apply_keep_indices_nlc
+                    rot_pos_embed = apply_keep_indices_nlc(x, rot_pos_embed, keep_indices)
             return x, rot_pos_embed, keep_indices
         else:
             return x, rot_pos_embed, None

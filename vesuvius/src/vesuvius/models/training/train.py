@@ -330,7 +330,7 @@ class BaseTrainer:
         loss_fns = self._build_loss()
         scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
 
-        model.apply(lambda module: InitWeights_He(module, neg_slope=0.2))
+        model.apply(InitWeights_He(neg_slope=0.2))
         model = model.to(self.device)
 
         if self.device.type == 'cuda':
@@ -1129,6 +1129,11 @@ def main():
         from vesuvius.models.training.trainers.semi_supervised.train_uncertainty_aware_mean_teacher import TrainUncertaintyAwareMeanTeacher
         trainer = TrainUncertaintyAwareMeanTeacher(mgr=mgr, verbose=args.verbose)
         print("Using Uncertainty-Aware Mean Teacher Trainer for semi-supervised 3D training")
+    if trainer_name == "primus_mae":
+        mgr.allow_unlabeled_data = True
+        from vesuvius.models.training.trainers.self_supervised.train_eva_mae import TrainEVAMAE
+        trainer = TrainEVAMAE(mgr=mgr, verbose=args.verbose)
+        print("Using EVA (Primus) Architecture for MAE Pretraining")
     elif trainer_name == "base":
         trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Base Trainer for supervised training")

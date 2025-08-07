@@ -48,7 +48,7 @@ from ..utilities.utils import get_pool_and_conv_props, get_n_blocks_per_stage
 from .encoder import Encoder
 from .decoder import Decoder
 from .activations import SwiGLUBlock, GLUBlock
-from .primus_wrapper import PrimusEncoder, PrimusDecoder, PrimusNetwork
+from .primus_wrapper import PrimusEncoder, PrimusDecoder
 
 def get_activation_module(activation_str: str):
     act_str = activation_str.lower()
@@ -521,12 +521,40 @@ class NetworkFromConfig(nn.Module):
             return False
         return True
 
-    def forward(self, x):
+    def forward(self, x, return_mae_mask=False):
         # Check input channels and warn if mismatch
         self.check_input_channels(x)
 
         # Get features from encoder (works for both U-Net and Primus)
-        features = self.shared_encoder(x)
+        # For MAE training with Primus, we need to get the mask
+        if return_mae_mask:
+            # MAE training requires mask from the encoder
+            if not isinstance(self.shared_encoder, PrimusEncoder):
+                raise RuntimeError(
+                    "MAE training (return_mae_mask=True) is only supported with Primus architecture. "
+                    f"Current encoder type: {type(self.shared_encoder).__name__}"
+                )
+            
+            # Get features with mask from Primus encoder
+            encoder_output = self.shared_encoder(x, ret_mask=True)
+            
+            if not isinstance(encoder_output, tuple) or len(encoder_output) != 2:
+                raise RuntimeError(
+                    "Primus encoder did not return expected (features, mask) tuple "
+                    "for MAE training. This is likely a bug in PrimusEncoder."
+                )
+            
+            features, restoration_mask = encoder_output
+            
+            if restoration_mask is None:
+                raise RuntimeError(
+                    "Primus encoder returned None for restoration_mask. "
+                    "Ensure patch_drop_rate is set > 0 in model config for MAE training."
+                )
+        else:
+            # Standard forward pass
+            features = self.shared_encoder(x)
+            restoration_mask = None
         
         results = {}
         for task_name, decoder in self.task_decoders.items():
@@ -535,4 +563,8 @@ class NetworkFromConfig(nn.Module):
             if activation_fn is not None and not self.training:
                 logits = activation_fn(logits)
             results[task_name] = logits
+        
+        # Return MAE mask if requested (for MAE training)
+        if return_mae_mask:
+            return results, restoration_mask
         return results
