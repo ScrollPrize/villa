@@ -377,51 +377,51 @@ if __name__ == "__main__":
     viewer = neuroglancer.Viewer()
 
     viewer.actions.add("toggle-color", toggle_color)
-    viewer.actions.add("rotate-x-plus-5", _make_rotate_command("x", 5))
-    viewer.actions.add("rotate-x-minus-5", _make_rotate_command("x", -5))
-    viewer.actions.add("rotate-y-plus-5", _make_rotate_command("y", 5))
-    viewer.actions.add("rotate-y-minus-5", _make_rotate_command("y", -5))
-    viewer.actions.add("rotate-z-plus-5", _make_rotate_command("z", 5))
-    viewer.actions.add("rotate-z-minus-5", _make_rotate_command("z", -5))
-    viewer.actions.add("rotate-x-plus-90", _make_rotate_command("x", 90))
-    viewer.actions.add("rotate-x-minus-90", _make_rotate_command("x", -90))
-    viewer.actions.add("rotate-y-plus-90", _make_rotate_command("y", 90))
-    viewer.actions.add("rotate-y-minus-90", _make_rotate_command("y", -90))
-    viewer.actions.add("rotate-z-plus-90", _make_rotate_command("z", 90))
-    viewer.actions.add("rotate-z-minus-90", _make_rotate_command("z", -90))
+    viewer.actions.add("rotate-x-plus-small", _make_rotate_command("x", 1))
+    viewer.actions.add("rotate-x-minus-small", _make_rotate_command("x", -1))
+    viewer.actions.add("rotate-y-plus-small", _make_rotate_command("y", 1))
+    viewer.actions.add("rotate-y-minus-small", _make_rotate_command("y", -1))
+    viewer.actions.add("rotate-z-plus-small", _make_rotate_command("z", 1))
+    viewer.actions.add("rotate-z-minus-small", _make_rotate_command("z", -1))
+    viewer.actions.add("rotate-x-plus-large", _make_rotate_command("x", 90))
+    viewer.actions.add("rotate-x-minus-large", _make_rotate_command("x", -90))
+    viewer.actions.add("rotate-y-plus-large", _make_rotate_command("y", 90))
+    viewer.actions.add("rotate-y-minus-large", _make_rotate_command("y", -90))
+    viewer.actions.add("rotate-z-plus-large", _make_rotate_command("z", 90))
+    viewer.actions.add("rotate-z-minus-large", _make_rotate_command("z", -90))
     viewer.actions.add("flip-x", _make_flip_command("x"))
     viewer.actions.add("flip-y", _make_flip_command("y"))
     viewer.actions.add("flip-z", _make_flip_command("z"))
-    viewer.actions.add("translate-x-plus-10", _make_translate_command("x", 10))
-    viewer.actions.add("translate-x-minus-10", _make_translate_command("x", -10))
-    viewer.actions.add("translate-y-plus-10", _make_translate_command("y", 10))
-    viewer.actions.add("translate-y-minus-10", _make_translate_command("y", -10))
-    viewer.actions.add("translate-z-plus-10", _make_translate_command("z", 10))
-    viewer.actions.add("translate-z-minus-10", _make_translate_command("z", -10))
+    viewer.actions.add("translate-x-plus-small", _make_translate_command("x", 10))
+    viewer.actions.add("translate-x-minus-small", _make_translate_command("x", -10))
+    viewer.actions.add("translate-y-plus-small", _make_translate_command("y", 10))
+    viewer.actions.add("translate-y-minus-small", _make_translate_command("y", -10))
+    viewer.actions.add("translate-z-plus-small", _make_translate_command("z", 10))
+    viewer.actions.add("translate-z-minus-small", _make_translate_command("z", -10))
 
     with viewer.config_state.txn() as s:
         s.input_event_bindings.viewer["keyc"] = "toggle-color"
-        s.input_event_bindings.viewer["alt+keya"] = "rotate-x-plus-5"
-        s.input_event_bindings.viewer["alt+keyq"] = "rotate-x-minus-5"
-        s.input_event_bindings.viewer["alt+keys"] = "rotate-y-plus-5"
-        s.input_event_bindings.viewer["alt+keyw"] = "rotate-y-minus-5"
-        s.input_event_bindings.viewer["alt+keyd"] = "rotate-z-plus-5"
-        s.input_event_bindings.viewer["alt+keye"] = "rotate-z-minus-5"
-        s.input_event_bindings.viewer["alt+shift+keya"] = "rotate-x-plus-90"
-        s.input_event_bindings.viewer["alt+shift+keyq"] = "rotate-x-minus-90"
-        s.input_event_bindings.viewer["alt+shift+keys"] = "rotate-y-plus-90"
-        s.input_event_bindings.viewer["alt+shift+keyw"] = "rotate-y-minus-90"
-        s.input_event_bindings.viewer["alt+shift+keyd"] = "rotate-z-plus-90"
-        s.input_event_bindings.viewer["alt+shift+keye"] = "rotate-z-minus-90"
+        s.input_event_bindings.viewer["alt+keya"] = "rotate-x-plus-small"
+        s.input_event_bindings.viewer["alt+keyq"] = "rotate-x-minus-small"
+        s.input_event_bindings.viewer["alt+keys"] = "rotate-y-plus-small"
+        s.input_event_bindings.viewer["alt+keyw"] = "rotate-y-minus-small"
+        s.input_event_bindings.viewer["alt+keyd"] = "rotate-z-plus-small"
+        s.input_event_bindings.viewer["alt+keye"] = "rotate-z-minus-small"
+        s.input_event_bindings.viewer["alt+shift+keya"] = "rotate-x-plus-large"
+        s.input_event_bindings.viewer["alt+shift+keyq"] = "rotate-x-minus-large"
+        s.input_event_bindings.viewer["alt+shift+keys"] = "rotate-y-plus-large"
+        s.input_event_bindings.viewer["alt+shift+keyw"] = "rotate-y-minus-large"
+        s.input_event_bindings.viewer["alt+shift+keyd"] = "rotate-z-plus-large"
+        s.input_event_bindings.viewer["alt+shift+keye"] = "rotate-z-minus-large"
         s.input_event_bindings.viewer["alt+keyf"] = "flip-x"
         s.input_event_bindings.viewer["alt+keyg"] = "flip-y"
         s.input_event_bindings.viewer["alt+keyh"] = "flip-z"
-        s.input_event_bindings.viewer["alt+keyj"] = "translate-x-plus-10"
-        s.input_event_bindings.viewer["alt+keyu"] = "translate-x-minus-10"
-        s.input_event_bindings.viewer["alt+keyk"] = "translate-y-plus-10"
-        s.input_event_bindings.viewer["alt+keyi"] = "translate-y-minus-10"
-        s.input_event_bindings.viewer["alt+keyl"] = "translate-z-plus-10"
-        s.input_event_bindings.viewer["alt+keyo"] = "translate-z-minus-10"
+        s.input_event_bindings.viewer["alt+keyj"] = "translate-x-plus-small"
+        s.input_event_bindings.viewer["alt+keyu"] = "translate-x-minus-small"
+        s.input_event_bindings.viewer["alt+keyk"] = "translate-y-plus-small"
+        s.input_event_bindings.viewer["alt+keyi"] = "translate-y-minus-small"
+        s.input_event_bindings.viewer["alt+keyl"] = "translate-z-plus-small"
+        s.input_event_bindings.viewer["alt+keyo"] = "translate-z-minus-small"
 
     with viewer.txn() as state:
         add_moving_and_fixed_layers(state, args.fixed, args.moving, scale_factor)
