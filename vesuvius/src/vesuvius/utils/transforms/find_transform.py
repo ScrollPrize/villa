@@ -1,7 +1,6 @@
 """Find the transform between two provided volumes."""
 
 import argparse
-import copy
 import json
 from pathlib import Path
 import sys
@@ -128,55 +127,56 @@ def get_volume_dimensions(
 
 
 def add_moving_and_fixed_layers(
-    state: neuroglancer.ViewerState,
+    viewer: neuroglancer.Viewer,
     fixed_path: str,
     moving_path: str,
     scale_factor: float,
-):
-    # Some unitless dimensions for now
-    dimensions = neuroglancer.CoordinateSpace(
-        names=["x", "y", "z"],
-        units="",
-        scales=[1, 1, 1],
-    )
+) -> None:
+    with viewer.txn() as state:
+        # Some unitless dimensions for now
+        dimensions = neuroglancer.CoordinateSpace(
+            names=["x", "y", "z"],
+            units="",
+            scales=[1, 1, 1],
+        )
 
-    # Open fixed volume
-    fixed_source = neuroglancer.LayerDataSource(
-        url=f"zarr://{fixed_path}",
-        transform=neuroglancer.CoordinateSpaceTransform(
-            output_dimensions=dimensions,
-        ),
-    )
-    state.layers.append(
-        name="fixed",
-        layer=neuroglancer.ImageLayer(
-            source=fixed_source,
-        ),
-        shader=GREEN_SHADER,
-        blend="additive",
-        opacity=1.0,
-    )
+        # Open fixed volume
+        fixed_source = neuroglancer.LayerDataSource(
+            url=f"zarr://{fixed_path}",
+            transform=neuroglancer.CoordinateSpaceTransform(
+                output_dimensions=dimensions,
+            ),
+        )
+        state.layers.append(
+            name="fixed",
+            layer=neuroglancer.ImageLayer(
+                source=fixed_source,
+            ),
+            shader=GREEN_SHADER,
+            blend="additive",
+            opacity=1.0,
+        )
 
-    moving_source = neuroglancer.LayerDataSource(
-        url=f"zarr://{moving_path}",
-        transform=neuroglancer.CoordinateSpaceTransform(
-            output_dimensions=dimensions,
-            matrix=[
-                [scale_factor, 0, 0, 0],
-                [0, scale_factor, 0, 0],
-                [0, 0, scale_factor, 0],
-            ],
-        ),
-    )
-    state.layers.append(
-        name="moving",
-        layer=neuroglancer.ImageLayer(
-            source=moving_source,
-        ),
-        shader=MAGENTA_SHADER,
-        blend="additive",
-        opacity=1.0,
-    )
+        moving_source = neuroglancer.LayerDataSource(
+            url=f"zarr://{moving_path}",
+            transform=neuroglancer.CoordinateSpaceTransform(
+                output_dimensions=dimensions,
+                matrix=[
+                    [scale_factor, 0, 0, 0],
+                    [0, scale_factor, 0, 0],
+                    [0, 0, scale_factor, 0],
+                ],
+            ),
+        )
+        state.layers.append(
+            name="moving",
+            layer=neuroglancer.ImageLayer(
+                source=moving_source,
+            ),
+            shader=MAGENTA_SHADER,
+            blend="additive",
+            opacity=1.0,
+        )
 
 
 def toggle_color(_):
@@ -356,8 +356,19 @@ def _make_translator(axis: str, amount: float):
     return handler
 
 
-def write_transform_to_file(_):
+def write_transform_to_file(transform: np.ndarray, output_path: str) -> None:
     """Write a transform to a file."""
+    np.savetxt(output_path, transform)
+
+
+def read_transform_from_file(input_path: str) -> np.ndarray:
+    """Read a transform from a file."""
+    with open(input_path, "r") as f:
+        return np.loadtxt(f, dtype=np.float64)
+
+
+def write_current_transform(_):
+    """Write the current transform and print the shareable URL."""
     with viewer.txn() as state:
         transform = state.layers["moving"].layer.source[0].transform.matrix
         # Add homogeneous coordinate
@@ -369,41 +380,21 @@ def write_transform_to_file(_):
             print("To save to file, use --output-transform <path>")
         else:
             print(f"Writing transform to {args.output_transform}")
-            np.savetxt(args.output_transform, transform)
+            write_transform_to_file(transform, args.output_transform)
 
         # In either case print the state URL
         print(
-            f"State URL: https://neuroglancer-demo.appspot.com/#!{neuroglancer.url_state.to_url_fragment(state)}"
+            f"Shareable URL: https://neuroglancer-demo.appspot.com/#!{neuroglancer.url_state.to_url_fragment(state)}"
         )
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--fixed", type=str, required=True)
-    parser.add_argument("--moving", type=str, required=True)
-    parser.add_argument("--fixed-voxel-size", type=float)
-    parser.add_argument("--moving-voxel-size", type=float)
-    parser.add_argument("--output-transform", type=str)
-    args = parser.parse_args()
-
-    if not sys.flags.interactive:
-        print(
-            f"Running in non-interactive mode. Use `python -i {Path(__file__).name}` to run in interactive mode (required for neuroglancer)."
-        )
-        sys.exit(1)
-
-    fixed_dimensions = get_volume_dimensions(args.fixed, args.fixed_voxel_size)
-    moving_dimensions = get_volume_dimensions(args.moving, args.moving_voxel_size)
-    scale_factor = moving_dimensions.voxel_size_um / fixed_dimensions.voxel_size_um
-
-    viewer = neuroglancer.Viewer()
-
+def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
     SMALL_ROTATE_STEP = 1
     LARGE_ROTATE_STEP = 90
     TRANSLATE_STEP = 10
 
     viewer.actions.add("toggle-color", toggle_color)
-    viewer.actions.add("write-transform", write_transform_to_file)
+    viewer.actions.add("write-transform", write_current_transform)
     viewer.actions.add("rot-x-plus-small", _make_rotator("x", SMALL_ROTATE_STEP))
     viewer.actions.add("rot-x-minus-small", _make_rotator("x", -SMALL_ROTATE_STEP))
     viewer.actions.add("rot-y-plus-small", _make_rotator("y", SMALL_ROTATE_STEP))
@@ -451,8 +442,69 @@ if __name__ == "__main__":
         s.input_event_bindings.viewer["alt+keyl"] = "trans-z-plus-small"
         s.input_event_bindings.viewer["alt+keyo"] = "trans-z-minus-small"
 
-    with viewer.txn() as state:
-        add_moving_and_fixed_layers(state, args.fixed, args.moving, scale_factor)
+
+def set_initial_transform(viewer: neuroglancer.Viewer, initial_transform: str) -> None:
+    if initial_transform is not None:
+        with viewer.txn() as state:
+            matrix = read_transform_from_file(initial_transform)
+            # Remove homogeneous coordinate
+            matrix = matrix[:-1, :]
+            state.layers["moving"].layer.source[0].transform.matrix = matrix
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--fixed",
+        type=str,
+        required=True,
+        help="Path to fixed volume (local or remote Zarr)",
+    )
+    parser.add_argument(
+        "--moving",
+        type=str,
+        required=True,
+        help="Path to moving volume (local or remote Zarr)",
+    )
+    parser.add_argument(
+        "--fixed-voxel-size",
+        type=float,
+        help="Voxel size of fixed volume in microns (if not provided, will try to read from metadata.json)",
+    )
+    parser.add_argument(
+        "--moving-voxel-size",
+        type=float,
+        help="Voxel size of moving volume in microns (if not provided, will try to read from metadata.json)",
+    )
+    parser.add_argument(
+        "--output-transform",
+        type=str,
+        help="Path to write the transform to (if not provided, print to stdout)",
+    )
+    parser.add_argument(
+        "--initial-transform",
+        type=str,
+        help="Path to read an initial transform from (if not provided, no initial transform will be applied)",
+    )
+    args = parser.parse_args()
+
+    if not sys.flags.interactive:
+        print(
+            f"Running in non-interactive mode. Use `python -i {Path(__file__).name}` to run in interactive mode (required for neuroglancer)."
+        )
+        sys.exit(1)
+
+    fixed_dimensions = get_volume_dimensions(args.fixed, args.fixed_voxel_size)
+    moving_dimensions = get_volume_dimensions(args.moving, args.moving_voxel_size)
+    scale_factor = moving_dimensions.voxel_size_um / fixed_dimensions.voxel_size_um
+
+    viewer = neuroglancer.Viewer()
+
+    add_actions_and_keybinds(viewer)
+
+    add_moving_and_fixed_layers(viewer, args.fixed, args.moving, scale_factor)
+
+    set_initial_transform(viewer, args.initial_transform)
 
     webbrowser.open_new(viewer.get_viewer_url())
 
@@ -460,4 +512,3 @@ if __name__ == "__main__":
     # Have some mechanism to have current active layer
     # Once enough points: find affine transform
     # Apply affine transform in real time to the moving layer
-    # Save the affine transform
