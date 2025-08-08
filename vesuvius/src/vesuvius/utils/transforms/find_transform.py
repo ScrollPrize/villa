@@ -511,4 +511,3 @@ if __name__ == "__main__":
     # Allow clicking to set points
     # Have some mechanism to have current active layer
     # Once enough points: find affine transform
-    # Apply affine transform in real time to the moving layer
