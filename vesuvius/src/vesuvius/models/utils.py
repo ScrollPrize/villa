@@ -20,6 +20,44 @@ def get_number_of_learnable_parameters(model):
 def number_of_features_per_level(init_channel_number, num_levels):
     return [init_channel_number * 2 ** k for k in range(num_levels)]
 
+def empty_cache(device: torch.device):
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    elif device.type == 'mps':
+        from torch import mps
+        mps.empty_cache()
+    else:
+        pass
+    
+class InitWeights_He(object):
+    def __init__(self, neg_slope: float = 1e-2):
+        self.neg_slope = neg_slope
+
+    def __call__(self, module):
+        if isinstance(module, nn.Conv3d) or isinstance(module, nn.Conv2d) or isinstance(module, nn.ConvTranspose2d) or isinstance(module, nn.ConvTranspose3d):
+            module.weight = nn.init.kaiming_normal_(module.weight, a=self.neg_slope)
+            if module.bias is not None:
+                module.bias = nn.init.constant_(module.bias, 0)
+
+
+class InitWeights_XavierUniform(object):
+    def __init__(self, gain: int = 1):
+        self.gain = gain
+
+    def __call__(self, module):
+        if isinstance(module, nn.Conv3d) or isinstance(module, nn.Conv2d) or isinstance(module, nn.ConvTranspose2d) or isinstance(module, nn.ConvTranspose3d):
+            module.weight = nn.init.xavier_uniform_(module.weight, self.gain)
+            if module.bias is not None:
+                module.bias = nn.init.constant_(module.bias, 0)
+
+
+def init_last_bn_before_add_to_0(module):
+    if isinstance(module, BasicBlockD):
+        module.conv2.norm.weight = nn.init.constant_(module.conv2.norm.weight, 0)
+        module.conv2.norm.bias = nn.init.constant_(module.conv2.norm.bias, 0)
+    if isinstance(module, BottleneckD):
+        module.conv3.norm.weight = nn.init.constant_(module.conv3.norm.weight, 0)
+        module.conv3.norm.bias = nn.init.constant_(module.conv3.norm.bias, 0)
 
 def expand_as_one_hot(input, C, ignore_index=None):
     """

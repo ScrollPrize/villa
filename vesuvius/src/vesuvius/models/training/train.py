@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from vesuvius.models.training.lr_schedulers import get_scheduler, PolyLRScheduler
 from torch.utils.data import DataLoader, SubsetRandomSampler
-from vesuvius.utils.utils import init_weights_he
+from vesuvius.models.utils import InitWeights_He
 from vesuvius.models.datasets import NapariDataset, ImageDataset, ZarrDataset
 from vesuvius.utils.plotting import save_debug
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
@@ -163,6 +163,23 @@ class BaseTrainer:
 
         return loss_fns
 
+    def _update_scheduler_for_epoch(self, scheduler, optimizer, epoch):
+        """
+        Update the learning rate scheduler for the current epoch.
+        Override this method in subclasses to implement epoch-based scheduler switching.
+        
+        Args:
+            scheduler: Current scheduler
+            optimizer: Current optimizer
+            epoch: Current epoch number
+            
+        Returns:
+            tuple: (scheduler, is_per_iteration_scheduler)
+        """
+        # By default, just return the existing scheduler
+        # Subclasses can override to switch schedulers at specific epochs
+        return scheduler, getattr(self, '_is_per_iteration_scheduler', False)
+    
     def _update_loss_for_epoch(self, loss_fns, epoch):
         if hasattr(self, '_deferred_losses') and self._deferred_losses:
             task_names = list(self._deferred_losses.keys())
@@ -329,8 +346,9 @@ class BaseTrainer:
         optimizer = self._get_optimizer(model)
         loss_fns = self._build_loss()
         scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
+        self._is_per_iteration_scheduler = is_per_iteration_scheduler  # Store for later use
 
-        model.apply(lambda module: init_weights_he(module, neg_slope=0.2))
+        model.apply(InitWeights_He(neg_slope=0.2))
         model = model.to(self.device)
 
         if self.device.type == 'cuda':
@@ -400,13 +418,36 @@ class BaseTrainer:
             'model_ckpt_dir': model_ckpt_dir
         }
 
-    def _initialize_wandb(self, train_dataset, val_dataset, train_indices, val_indices):
+    def _initialize_wandb(self, train_dataset, val_dataset, train_indices, val_indices, ckpt_dir=None):
         """Initialize Weights & Biases logging if configured."""
         if self.mgr.wandb_project:
             import wandb  # lazy import in case it's not available
+            import json
+            import os
+            from datetime import datetime
+            
+            # Save train/val splits to local file instead of wandb config
             train_val_splits = save_train_val_filenames(self, train_dataset, val_dataset, train_indices, val_indices)
+            
+            # Use checkpoint directory if provided, otherwise use current directory
+            save_dir = ckpt_dir if ckpt_dir else os.getcwd()
+            
+            # Create a filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            splits_filename = f"train_val_splits_{self.mgr.model_name}_{timestamp}.json"
+            splits_filepath = os.path.join(save_dir, splits_filename)
+            
+            # Save to local file
+            with open(splits_filepath, 'w') as f:
+                json.dump(train_val_splits, f, indent=2)
+            print(f"Saved train/val splits to: {splits_filepath}")
+            
+            # Create wandb config without the large train_val_splits data
             mgr_config = self.mgr.convert_to_dict()
-            mgr_config.update({'train_val_splits': train_val_splits})
+            # Add a reference to the local file instead of the actual data
+            mgr_config['train_val_splits_file'] = splits_filepath
+            mgr_config['train_patch_count'] = len(train_indices)
+            mgr_config['val_patch_count'] = len(val_indices)
 
             wandb.init(
                 entity=self.mgr.wandb_entity,
@@ -414,6 +455,11 @@ class BaseTrainer:
                 group=self.mgr.model_name,
                 config=mgr_config
             )
+            
+            # Log the splits file as an artifact for reference
+            artifact = wandb.Artifact(f"train_val_splits_{timestamp}", type="dataset")
+            artifact.add_file(splits_filepath)
+            wandb.log_artifact(artifact)
 
     def _get_model_outputs(self, model, data_dict):
         inputs = data_dict["image"].to(self.device)
@@ -649,7 +695,7 @@ class BaseTrainer:
         ckpt_dir = training_state['ckpt_dir']
         model_ckpt_dir = training_state['model_ckpt_dir']
 
-        self._initialize_wandb(train_dataset, val_dataset, train_indices, val_indices)
+        self._initialize_wandb(train_dataset, val_dataset, train_indices, val_indices, ckpt_dir)
 
         val_loss_history = {}  # {epoch: validation_loss}
         checkpoint_history = deque(maxlen=3)
@@ -672,6 +718,9 @@ class BaseTrainer:
         for epoch in range(start_epoch, self.mgr.max_epoch):
             # Update loss functions for this epoch
             loss_fns = self._update_loss_for_epoch(loss_fns, epoch)
+            
+            # Update scheduler for this epoch (for epoch-based scheduler switching)
+            scheduler, is_per_iteration_scheduler = self._update_scheduler_for_epoch(scheduler, optimizer, epoch)
             
             model.train()
 
@@ -729,6 +778,8 @@ class BaseTrainer:
                 )
 
                 for t_name, loss_value in task_losses.items():
+                    if t_name not in epoch_losses:
+                        epoch_losses[t_name] = []
                     epoch_losses[t_name].append(loss_value)
                 
 
@@ -751,10 +802,10 @@ class BaseTrainer:
                         train_sample_targets_all = {}
                         for t_name, t_tensor in targets_dict.items():
                             train_sample_targets_all[t_name] = t_tensor[b_idx: b_idx + 1]
-                        # Now create train_sample_targets without skel for save_debug
+                        # Now create train_sample_targets without skel and is_unlabeled for save_debug
                         train_sample_targets = {}
                         for t_name, t_tensor in train_sample_targets_all.items():
-                            if t_name != 'skel':
+                            if t_name not in ['skel', 'is_unlabeled']:
                                 train_sample_targets[t_name] = t_tensor
                         train_sample_outputs = {}
                         for t_name, p_tensor in outputs.items():
@@ -764,7 +815,7 @@ class BaseTrainer:
                     scheduler.step()
 
                 loss_str = " | ".join([f"{t}: {np.mean(epoch_losses[t][-100:]):.4f}"
-                                       for t in self.mgr.targets if len(epoch_losses[t]) > 0])
+                                       for t in epoch_losses.keys() if len(epoch_losses[t]) > 0])
                 pbar.set_postfix_str(loss_str)
 
                 current_lr = optimizer.param_groups[0]['lr']
@@ -796,7 +847,9 @@ class BaseTrainer:
 
             # ---- validation ----- #
             if epoch % 1 == 0:
-                model.eval()
+                # For MAE training, don't set to eval mode to keep patch dropping active
+                if not hasattr(self, '_is_mae_training'):
+                    model.eval()
                 with torch.no_grad():
                     val_losses = {t_name: [] for t_name in self.mgr.targets}
                     frames_array = None
@@ -881,7 +934,7 @@ class BaseTrainer:
                                     
                                     targets_dict_first = {}
                                     for t_name, t_tensor in targets_dict_first_all.items():
-                                        if t_name != 'skel':
+                                        if t_name not in ['skel', 'is_unlabeled']:
                                             targets_dict_first[t_name] = t_tensor
                                     
                                     frames_array = save_debug(
@@ -1126,9 +1179,14 @@ def main():
     
     if trainer_name == "uncertainty_aware_mean_teacher":
         mgr.allow_unlabeled_data = True
-        from vesuvius.models.training.trainers.train_uncertainty_aware_mean_teacher import UncertaintyAwareMeanTeacher3DTrainer
-        trainer = UncertaintyAwareMeanTeacher3DTrainer(mgr=mgr, verbose=args.verbose)
+        from vesuvius.models.training.trainers.semi_supervised.train_uncertainty_aware_mean_teacher import TrainUncertaintyAwareMeanTeacher
+        trainer = TrainUncertaintyAwareMeanTeacher(mgr=mgr, verbose=args.verbose)
         print("Using Uncertainty-Aware Mean Teacher Trainer for semi-supervised 3D training")
+    elif trainer_name == "primus_mae":
+        mgr.allow_unlabeled_data = True
+        from vesuvius.models.training.trainers.self_supervised.train_eva_mae import TrainEVAMAE
+        trainer = TrainEVAMAE(mgr=mgr, verbose=args.verbose)
+        print("Using EVA (Primus) Architecture for MAE Pretraining")
     elif trainer_name == "base":
         trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Base Trainer for supervised training")
