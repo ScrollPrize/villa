@@ -50,8 +50,9 @@ def sanity_check_zarr_store(store):
 def get_volume_dimensions(
     path: str, provided_voxel_size: Optional[float] = None
 ) -> Dimensions:
-    """Get volume dimensions (from Zarr) and voxel size (from metadata.json if it exists, otherwise use provided value).
+    """Get volume dimensions (from Zarr array shape).
 
+    Also get voxel size in microns (from metadata.json if it exists, otherwise use provided value).
     If both are provided, make sure they are the same.
     """
 
@@ -161,6 +162,8 @@ def add_moving_and_fixed_layers(
             url=f"zarr://{moving_path}",
             transform=neuroglancer.CoordinateSpaceTransform(
                 output_dimensions=dimensions,
+                # Scale the moving volume to match the fixed volume
+                # If an initial transform is provided, it will be applied after this and override it
                 matrix=[
                     [scale_factor, 0, 0, 0],
                     [0, scale_factor, 0, 0],
