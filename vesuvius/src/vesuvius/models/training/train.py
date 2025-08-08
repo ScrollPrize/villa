@@ -163,6 +163,23 @@ class BaseTrainer:
 
         return loss_fns
 
+    def _update_scheduler_for_epoch(self, scheduler, optimizer, epoch):
+        """
+        Update the learning rate scheduler for the current epoch.
+        Override this method in subclasses to implement epoch-based scheduler switching.
+        
+        Args:
+            scheduler: Current scheduler
+            optimizer: Current optimizer
+            epoch: Current epoch number
+            
+        Returns:
+            tuple: (scheduler, is_per_iteration_scheduler)
+        """
+        # By default, just return the existing scheduler
+        # Subclasses can override to switch schedulers at specific epochs
+        return scheduler, getattr(self, '_is_per_iteration_scheduler', False)
+    
     def _update_loss_for_epoch(self, loss_fns, epoch):
         if hasattr(self, '_deferred_losses') and self._deferred_losses:
             task_names = list(self._deferred_losses.keys())
@@ -329,6 +346,7 @@ class BaseTrainer:
         optimizer = self._get_optimizer(model)
         loss_fns = self._build_loss()
         scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
+        self._is_per_iteration_scheduler = is_per_iteration_scheduler  # Store for later use
 
         model.apply(InitWeights_He(neg_slope=0.2))
         model = model.to(self.device)
@@ -700,6 +718,9 @@ class BaseTrainer:
         for epoch in range(start_epoch, self.mgr.max_epoch):
             # Update loss functions for this epoch
             loss_fns = self._update_loss_for_epoch(loss_fns, epoch)
+            
+            # Update scheduler for this epoch (for epoch-based scheduler switching)
+            scheduler, is_per_iteration_scheduler = self._update_scheduler_for_epoch(scheduler, optimizer, epoch)
             
             model.train()
 

@@ -132,15 +132,11 @@ class TrainEVAMAE(BaseTrainer):
         return optimizer
     
     def _get_scheduler(self, optimizer):
-        """Override to create MAE-specific learning rate scheduler."""
-        if self.current_epoch < self.warmup_duration_whole_net:
-            scheduler = Lin_incr_LRScheduler(optimizer, self.mgr.initial_lr, self.warmup_duration_whole_net)
-        else:
-            scheduler = PolyLRScheduler_offset(
-                optimizer, self.mgr.initial_lr, self.mgr.max_epoch, self.warmup_duration_whole_net
-            )
-        # Return tuple (scheduler, is_per_iteration) - these are per-epoch schedulers
-        return scheduler, False
+        """Override to create initial MAE scheduler (warmup)."""
+        # Always start with warmup scheduler
+        # The _update_scheduler_for_epoch method will handle switching at epoch 50
+        scheduler = Lin_incr_LRScheduler(optimizer, self.mgr.initial_lr, self.warmup_duration_whole_net)
+        return scheduler, False  # Epoch-based scheduler
     
     def _get_model_outputs(self, model, data_dict):
         """Override to handle MAE forward pass with masking."""
@@ -225,4 +221,31 @@ class TrainEVAMAE(BaseTrainer):
         loss = mae_loss_fn(mae_output, mae_target, mask)
         task_losses = {'mae': loss.detach().cpu().item()}
         return task_losses
+    
+    def _update_scheduler_for_epoch(self, scheduler, optimizer, epoch):
+        """
+        Override to switch from warmup to main scheduler at epoch 50.
+        """
+        # Track current epoch for other methods that might need it
+        self.current_epoch = epoch
+        
+        # Check if we need to switch schedulers
+        if epoch == 0 and self.training_stage != "warmup_all":
+            # First epoch - use warmup scheduler
+            print(f"[Epoch {epoch}] Initializing warmup scheduler (first {self.warmup_duration_whole_net} epochs)")
+            scheduler = Lin_incr_LRScheduler(optimizer, self.mgr.initial_lr, self.warmup_duration_whole_net)
+            self.training_stage = "warmup_all"
+            return scheduler, False  # Epoch-based scheduler
+            
+        elif epoch == self.warmup_duration_whole_net and self.training_stage != "train":
+            # Switch to main training scheduler
+            print(f"[Epoch {epoch}] Switching from warmup to PolyLR scheduler")
+            scheduler = PolyLRScheduler_offset(
+                optimizer, self.mgr.initial_lr, self.mgr.max_epoch, self.warmup_duration_whole_net
+            )
+            self.training_stage = "train"
+            return scheduler, False  # Epoch-based scheduler
+        
+        # Otherwise keep the current scheduler
+        return scheduler, False
     
