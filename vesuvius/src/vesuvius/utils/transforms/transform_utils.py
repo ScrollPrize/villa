@@ -3,8 +3,10 @@ from pathlib import Path
 from typing import Optional, NamedTuple
 from urllib.parse import urljoin, urlparse
 
+import numpy as np
 import requests
 import zarr
+import SimpleITK as sitk
 
 
 class Dimensions(NamedTuple):
@@ -105,3 +107,40 @@ def get_volume_dimensions(
             voxels_z=voxels_z,
             voxel_size_um=provided_voxel_size,
         )
+
+
+def affine_matrix_to_sitk_transform(matrix: np.ndarray) -> sitk.AffineTransform:
+    """Convert a 4x4 homogeneous transformation matrix to a SimpleITK AffineTransform.
+
+    Args:
+        matrix: 4x4 homogeneous transformation matrix (numpy array)
+
+    Returns:
+        SimpleITK AffineTransform object
+    """
+    # Ensure matrix is 4x4
+    if matrix.shape != (4, 4):
+        raise ValueError(f"Matrix must be 4x4, got shape {matrix.shape}")
+
+    # Extract the 3x3 affine matrix and translation components
+    affine_matrix = matrix[:3, :3].flatten().tolist()
+    translation = matrix[:3, 3].tolist()
+
+    # Create and configure the AffineTransform
+    transform = sitk.AffineTransform(3)
+    transform.SetMatrix(affine_matrix)
+    transform.SetTranslation(translation)
+
+    return transform
+
+
+def invert_affine_matrix(matrix: np.ndarray) -> np.ndarray:
+    """Invert a 4x4 homogeneous transformation matrix.
+
+    Args:
+        matrix: 4x4 homogeneous transformation matrix (numpy array)
+
+    Returns:
+        Inverted 4x4 homogeneous transformation matrix (numpy array)
+    """
+    return np.linalg.inv(matrix)
