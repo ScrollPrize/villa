@@ -1,0 +1,16 @@
+tr_config:
+  patch_size: [192,192,192]
+
+dataset_config:
+  min_labeled_ratio: 0 
+  min_bbox_percent: 0 
+  normalization_scheme: "zscore"
+  skip_patch_validation: true
+  targets:
+    surface:
+      activation: "none"
+      losses:
+        - name: "MedialSurfaceRecall"
+          weight: 1.0
+
+

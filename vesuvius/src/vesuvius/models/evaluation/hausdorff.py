@@ -29,6 +29,12 @@ def compute_hausdorff_distance(pred: torch.Tensor,
                                percentile: float = 95.0) -> Dict[str, float]:
     
     # Move to CPU and convert to numpy for processing
+    # Convert BFloat16 to Float32 before numpy conversion
+    if pred.dtype == torch.bfloat16:
+        pred = pred.float()
+    if gt.dtype == torch.bfloat16:
+        gt = gt.float()
+    
     pred_np = pred.detach().cpu().numpy()
     gt_np = gt.detach().cpu().numpy()
     

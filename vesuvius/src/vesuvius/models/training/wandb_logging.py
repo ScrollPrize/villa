@@ -30,12 +30,14 @@ def save_train_val_filenames(self, train_dataset, val_dataset, train_indices, va
         vol_idx = patch_info["volume_index"]
         position = patch_info["position"]  # [z, y, x] coordinates
 
-        # Get volume ID if available
-        volume_id = f"volume_{vol_idx}"  # Default if no volume_ids
-        if hasattr(train_dataset, 'volume_ids'):
-            first_target = list(train_dataset.volume_ids.keys())[0]
-            if vol_idx < len(train_dataset.volume_ids[first_target]):
-                volume_id = train_dataset.volume_ids[first_target][vol_idx]
+        # Get volume ID from patch info or from volume data
+        volume_id = patch_info.get("volume_name", f"volume_{vol_idx}")
+        
+        # If not in patch info, try to get from target_volumes
+        if volume_id == f"volume_{vol_idx}" and hasattr(train_dataset, 'target_volumes'):
+            first_target = list(train_dataset.target_volumes.keys())[0]
+            if vol_idx < len(train_dataset.target_volumes[first_target]):
+                volume_id = train_dataset.target_volumes[first_target][vol_idx].get('volume_id', volume_id)
 
         train_volumes.add(volume_id)
         train_patches.append({
@@ -51,12 +53,14 @@ def save_train_val_filenames(self, train_dataset, val_dataset, train_indices, va
         vol_idx = patch_info["volume_index"]
         position = patch_info["position"]  # [z, y, x] coordinates
 
-        # Get volume ID if available
-        volume_id = f"volume_{vol_idx}"  # Default if no volume_ids
-        if hasattr(val_dataset, 'volume_ids'):
-            first_target = list(val_dataset.volume_ids.keys())[0]
-            if vol_idx < len(val_dataset.volume_ids[first_target]):
-                volume_id = val_dataset.volume_ids[first_target][vol_idx]
+        # Get volume ID from patch info or from volume data
+        volume_id = patch_info.get("volume_name", f"volume_{vol_idx}")
+        
+        # If not in patch info, try to get from target_volumes
+        if volume_id == f"volume_{vol_idx}" and hasattr(val_dataset, 'target_volumes'):
+            first_target = list(val_dataset.target_volumes.keys())[0]
+            if vol_idx < len(val_dataset.target_volumes[first_target]):
+                volume_id = val_dataset.target_volumes[first_target][vol_idx].get('volume_id', volume_id)
 
         val_volumes.add(volume_id)
         val_patches.append({

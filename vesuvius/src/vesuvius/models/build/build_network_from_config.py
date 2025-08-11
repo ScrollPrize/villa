@@ -48,6 +48,7 @@ from ..utilities.utils import get_pool_and_conv_props, get_n_blocks_per_stage
 from .encoder import Encoder
 from .decoder import Decoder
 from .activations import SwiGLUBlock, GLUBlock
+from .primus_wrapper import PrimusEncoder, PrimusDecoder
 
 def get_activation_module(activation_str: str):
     act_str = activation_str.lower()
@@ -78,6 +79,12 @@ class NetworkFromConfig(nn.Module):
             model_config = {}
 
         self.save_config = False
+        
+        self.architecture_type = model_config.get("architecture_type", "unet")
+        
+        if self.architecture_type.lower().startswith("primus"):
+            self._init_primus(mgr, model_config)
+            return
 
         # --------------------------------------------------------------------
         # Common nontrainable parameters (ops, activation, etc.)
@@ -372,6 +379,116 @@ class NetworkFromConfig(nn.Module):
         print("NetworkFromConfig initialized with final configuration:")
         for k, v in self.final_config.items():
             print(f"  {k}: {v}")
+    
+    def _init_primus(self, mgr, model_config):
+        """
+        Initialize Primus transformer architecture.
+        """
+        print(f"--- Initializing Primus architecture ---")
+        
+        # Extract Primus variant (S, B, M, L) from architecture_type
+        arch_type = self.architecture_type.lower()
+        if arch_type == "primus_s":
+            config_name = "S"
+        elif arch_type == "primus_b":
+            config_name = "B"
+        elif arch_type == "primus_m":
+            config_name = "M"
+        elif arch_type == "primus_l":
+            config_name = "L"
+        else:
+            # Try to extract from the string (e.g., "Primus-B")
+            parts = arch_type.split("-")
+            if len(parts) > 1:
+                config_name = parts[1].upper()
+            else:
+                config_name = "M"  # Default to M
+        
+        print(f"Using Primus-{config_name} configuration")
+        
+        patch_embed_size = model_config.get("patch_embed_size", (8, 8, 8))
+        if isinstance(patch_embed_size, int):
+            patch_embed_size = (patch_embed_size,) * 3
+        
+        # Ensure input shape is specified
+        input_shape = model_config.get("input_shape", self.patch_size)
+        if input_shape is None:
+            raise ValueError("input_shape must be specified for Primus architecture")
+        
+        # Get Primus-specific parameters
+        primus_kwargs = {
+            "drop_path_rate": model_config.get("drop_path_rate", 0.0),
+            "patch_drop_rate": model_config.get("patch_drop_rate", 0.0),
+            "proj_drop_rate": model_config.get("proj_drop_rate", 0.0),
+            "attn_drop_rate": model_config.get("attn_drop_rate", 0.0),
+            "num_register_tokens": model_config.get("num_register_tokens", 0),
+            "use_rot_pos_emb": model_config.get("use_rot_pos_emb", True),
+            "use_abs_pos_embed": model_config.get("use_abs_pos_embed", True),
+            "mlp_ratio": model_config.get("mlp_ratio", 4 * 2 / 3),
+            "init_values": model_config.get("init_values", 0.1 if config_name != "S" else 0.1),
+            "scale_attn_inner": model_config.get("scale_attn_inner", True),
+        }
+        
+        # Get decoder normalization and activation settings
+        decoder_norm_str = model_config.get("decoder_norm", "LayerNormNd")
+        decoder_act_str = model_config.get("decoder_act", "GELU")
+        print(f"Using decoder normalization: {decoder_norm_str}")
+        print(f"Using decoder activation: {decoder_act_str}")
+        
+        # Initialize shared Primus encoder
+        self.shared_encoder = PrimusEncoder(
+            input_channels=self.in_channels,
+            config_name=config_name,
+            patch_embed_size=patch_embed_size,
+            input_shape=input_shape,
+            **primus_kwargs
+        )
+        
+        # Initialize task-specific decoders
+        self.task_decoders = nn.ModuleDict()
+        self.task_activations = nn.ModuleDict()
+        
+        for target_name, target_info in self.targets.items():
+            # Determine output channels
+            if 'out_channels' in target_info:
+                out_channels = target_info['out_channels']
+            elif 'channels' in target_info:
+                out_channels = target_info['channels']
+            else:
+                out_channels = self.in_channels
+                print(f"No channel specification found for task '{target_name}', defaulting to {out_channels} channels")
+            
+            # Update target_info
+            target_info["out_channels"] = out_channels
+            
+            # Create Primus decoder for this task
+            activation_str = target_info.get("activation", "none")
+            self.task_decoders[target_name] = PrimusDecoder(
+                encoder=self.shared_encoder,
+                num_classes=out_channels,
+                norm=decoder_norm_str,
+                activation=decoder_act_str,
+            )
+            self.task_activations[target_name] = get_activation_module(activation_str)
+            print(f"Primus task '{target_name}' configured with {out_channels} output channels")
+        
+        # Store configuration for reference
+        self.final_config = {
+            "model_name": self.mgr.model_name,
+            "architecture_type": self.architecture_type,
+            "primus_variant": config_name,
+            "patch_embed_size": patch_embed_size,
+            "input_shape": input_shape,
+            "in_channels": self.in_channels,
+            "targets": self.targets,
+            "decoder_norm": decoder_norm_str,
+            "decoder_act": decoder_act_str,
+            **primus_kwargs
+        }
+        
+        print("Primus network initialized with configuration:")
+        for k, v in self.final_config.items():
+            print(f"  {k}: {v}")
 
     @classmethod
     def create_with_input_channels(cls, mgr, input_channels):
@@ -404,16 +521,50 @@ class NetworkFromConfig(nn.Module):
             return False
         return True
 
-    def forward(self, x):
+    def forward(self, x, return_mae_mask=False):
         # Check input channels and warn if mismatch
         self.check_input_channels(x)
 
-        skips = self.shared_encoder(x)
+        # Get features from encoder (works for both U-Net and Primus)
+        # For MAE training with Primus, we need to get the mask
+        if return_mae_mask:
+            # MAE training requires mask from the encoder
+            if not isinstance(self.shared_encoder, PrimusEncoder):
+                raise RuntimeError(
+                    "MAE training (return_mae_mask=True) is only supported with Primus architecture. "
+                    f"Current encoder type: {type(self.shared_encoder).__name__}"
+                )
+            
+            # Get features with mask from Primus encoder
+            encoder_output = self.shared_encoder(x, ret_mask=True)
+            
+            if not isinstance(encoder_output, tuple) or len(encoder_output) != 2:
+                raise RuntimeError(
+                    "Primus encoder did not return expected (features, mask) tuple "
+                    "for MAE training. This is likely a bug in PrimusEncoder."
+                )
+            
+            features, restoration_mask = encoder_output
+            
+            if restoration_mask is None:
+                raise RuntimeError(
+                    "Primus encoder returned None for restoration_mask. "
+                    "Ensure patch_drop_rate is set > 0 in model config for MAE training."
+                )
+        else:
+            # Standard forward pass
+            features = self.shared_encoder(x)
+            restoration_mask = None
+        
         results = {}
         for task_name, decoder in self.task_decoders.items():
-            logits = decoder(skips)
+            logits = decoder(features)
             activation_fn = self.task_activations[task_name]
             if activation_fn is not None and not self.training:
                 logits = activation_fn(logits)
             results[task_name] = logits
+        
+        # Return MAE mask if requested (for MAE training)
+        if return_mae_mask:
+            return results, restoration_mask
         return results

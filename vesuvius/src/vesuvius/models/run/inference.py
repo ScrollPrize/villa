@@ -142,6 +142,13 @@ class Inferer():
                 device_str=str(self.device),
                 verbose=self.verbose
             )
+            
+            # Check if this is a train.py model from HuggingFace
+            if isinstance(model_info, dict) and model_info.get('is_train_py', False):
+                checkpoint_path = Path(model_info['checkpoint_path'])
+                if self.verbose:
+                    print(f"Loading train.py checkpoint from HuggingFace: {checkpoint_path}")
+                model_info = self._load_train_py_model(checkpoint_path)
         else:
             # Check if this is a train.py checkpoint (single .pth file)
             model_path = Path(self.model_path)
@@ -169,6 +176,23 @@ class Inferer():
         # patch size and number of classes from model_info
         self.model_patch_size = tuple(model_info.get('patch_size', (192, 192, 192)))
         self.num_classes = model_info.get('num_seg_heads', None)
+        
+        # Check if this is a multi-task model from targets info
+        if 'targets' in model_info and model_info['targets']:
+            self.is_multi_task = True
+            self.target_info = {}
+            self.num_classes = 0
+            for target_name, target_config in model_info['targets'].items():
+                target_channels = target_config.get('out_channels', 1)
+                self.target_info[target_name] = {
+                    'out_channels': target_channels,
+                    'start_channel': self.num_classes,
+                    'end_channel': self.num_classes + target_channels
+                }
+                self.num_classes += target_channels
+            if self.verbose:
+                print(f"Detected multi-task model with targets: {list(model_info['targets'].keys())}")
+                print(f"Total output channels: {self.num_classes}")
         
         # use models patch size if one wasn't specified
         if self.patch_size is None:

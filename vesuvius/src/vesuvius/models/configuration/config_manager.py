@@ -65,7 +65,7 @@ class ConfigManager:
 
         self.model_name = self.tr_info.get("model_name", "Model")
         self.autoconfigure = bool(self.tr_info.get("autoconfigure", True))
-        self.tr_val_split = float(self.tr_info.get("tr_val_split", 0.95))
+        self.tr_val_split = float(self.tr_info.get("tr_val_split", 0.90))
         self.compute_loss_on_labeled_only = bool(self.tr_info.get("compute_loss_on_labeled_only", False))
         self.wandb_project = self.tr_info.get("wandb_project", None)
         self.wandb_entity = self.tr_info.get("wandb_entity", None)
@@ -89,7 +89,7 @@ class ConfigManager:
         self.max_epoch = int(self.tr_configs.get("max_epoch", 1000))
         self.optimizer = self.tr_configs.get("optimizer", "SGD")
         self.initial_lr = float(self.tr_configs.get("initial_lr", 0.01))
-        self.weight_decay = float(self.tr_configs.get("weight_decay", 0.0001))
+        self.weight_decay = float(self.tr_configs.get("weight_decay", 0.00003))
         
         ### Dataset config ###
         self.min_labeled_ratio = float(self.dataset_config.get("min_labeled_ratio", 0.10))

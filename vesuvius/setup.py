@@ -49,6 +49,7 @@ setup(
         "huggingface_hub",
         "zarr>=2,<3",
         "tqdm",
+        "timm",
         "lxml",
         "nest_asyncio",
         "pynrrd",

@@ -18,7 +18,7 @@ try:
 except ImportError:
     HF_AVAILABLE = False
 
-__all__ = ['load_model', 'initialize_network', 'load_model_for_inference']
+__all__ = ['load_model', 'initialize_network', 'load_model_for_inference', 'load_model_from_checkpoint']
 
 def initialize_network(architecture_class_name: str,
                       arch_init_kwargs: dict,
@@ -256,13 +256,44 @@ def load_model_for_inference(
             print(f"Loading model from Hugging Face: {hf_model_path}, fold {fold}")
         
         # Download from Hugging Face and load
-        with tempfile.TemporaryDirectory() as temp_dir:
+        # Create persistent temp directory for the download
+        temp_dir = tempfile.mkdtemp(prefix='vesuvius_hf_model_')
+        
+        try:
             download_path = snapshot_download(
                 repo_id=hf_model_path,
                 local_dir=temp_dir,
                 token=hf_token
             )
 
+            # Check for train.py checkpoint files (Model_epoch*.pth pattern)
+            train_py_checkpoints = [f for f in os.listdir(download_path) 
+                                   if f.startswith('Model_epoch') and f.endswith('.pth')]
+            
+            if train_py_checkpoints:
+                # This is a train.py model checkpoint
+                if should_print:
+                    print(f"Detected train.py checkpoint: {train_py_checkpoints[0]}")
+                
+                # Use the first train.py checkpoint found
+                checkpoint_path = os.path.join(download_path, train_py_checkpoints[0])
+                
+                # Load using the dedicated function
+                model, mgr = load_model_from_checkpoint(checkpoint_path, device=device_str)
+                
+                # Build model info dict compatible with inference
+                model_info = {
+                    'network': model,
+                    'patch_size': mgr.train_patch_size if hasattr(mgr, 'train_patch_size') else (192, 192, 192),
+                    'num_seg_heads': len(mgr.targets) if mgr.targets else 1,
+                    'normalization_scheme': mgr.normalization_scheme if hasattr(mgr, 'normalization_scheme') else None,
+                    'intensity_properties': mgr.intensity_properties if hasattr(mgr, 'intensity_properties') else None,
+                    'targets': mgr.targets if hasattr(mgr, 'targets') and mgr.targets else None,
+                    'temp_dir': temp_dir  # Keep reference to temp dir for cleanup
+                }
+                
+                return model_info
+            
             # Check if this is a flat repository structure (no fold directories)
             has_checkpoint = os.path.exists(os.path.join(download_path, checkpoint_name))
             has_plans = os.path.exists(os.path.join(download_path, 'plans.json'))
@@ -285,6 +316,14 @@ def load_model_for_inference(
                 verbose=local_verbose,
                 rank=rank
             )
+            model_info['temp_dir'] = temp_dir  # Keep reference for cleanup
+            return model_info
+            
+        except Exception as e:
+            # Clean up temp dir on error
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            raise e
     else:
         if should_print:
             print(f"Loading model from {model_folder}, fold {fold}")
@@ -315,6 +354,131 @@ def load_model_for_inference(
             print(f"Detected single-channel model")
     
     return model_info
+
+def load_model_from_checkpoint(checkpoint_path, device='cuda'):
+    """Load model from train.py checkpoint using vesuvius utilities"""
+    
+    # First load the checkpoint to extract configuration
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    
+    # Import required modules
+    from vesuvius.models.configuration.config_manager import ConfigManager
+    from vesuvius.models.build.build_network_from_config import NetworkFromConfig
+    
+    # Create a ConfigManager instance
+    mgr = ConfigManager(verbose=True)
+    
+    # Initialize the required dictionaries that _init_attributes expects
+    mgr.tr_info = {}
+    mgr.tr_configs = {}
+    mgr.model_config = {}
+    mgr.dataset_config = {}
+    
+    # Extract critical info BEFORE _init_attributes to ensure proper initialization
+    if 'model_config' in checkpoint:
+        # Get patch size first as it determines 2D/3D operations
+        if 'patch_size' in checkpoint['model_config']:
+            patch_size = checkpoint['model_config']['patch_size']
+            mgr.tr_configs['patch_size'] = list(patch_size)
+            print(f"Pre-loading patch_size from checkpoint: {patch_size}")
+    
+    # Extract targets early if available, as _init_attributes needs it
+    if 'model_config' in checkpoint and 'targets' in checkpoint['model_config']:
+        mgr.targets = checkpoint['model_config']['targets']
+        mgr.dataset_config['targets'] = checkpoint['model_config']['targets']
+    else:
+        mgr.targets = {}
+    
+    # Initialize ConfigManager attributes with defaults first
+    mgr._init_attributes()
+    
+    # Extract critical parameters from checkpoint
+    if 'model_config' in checkpoint:
+        model_config = checkpoint['model_config']
+        
+        # Critical parameters that must be set before building network
+        if 'patch_size' in model_config:
+            mgr.train_patch_size = tuple(model_config['patch_size'])
+            mgr.tr_configs["patch_size"] = list(model_config['patch_size'])
+            print(f"Loaded patch_size from checkpoint: {mgr.train_patch_size}")
+            
+            # Re-determine dimensionality based on loaded patch size
+            from vesuvius.utils.utils import determine_dimensionality
+            dim_props = determine_dimensionality(mgr.train_patch_size, mgr.verbose)
+            mgr.model_config["conv_op"] = dim_props["conv_op"]
+            mgr.model_config["pool_op"] = dim_props["pool_op"]
+            mgr.model_config["norm_op"] = dim_props["norm_op"]
+            mgr.model_config["dropout_op"] = dim_props["dropout_op"]
+            mgr.spacing = dim_props["spacing"]
+            mgr.op_dims = dim_props["op_dims"]
+        
+        if 'targets' in model_config:
+            mgr.targets = model_config['targets']
+            print(f"Loaded targets from checkpoint: {list(mgr.targets.keys())}")
+        
+        if 'in_channels' in model_config:
+            mgr.in_channels = model_config['in_channels']
+            print(f"Loaded in_channels from checkpoint: {mgr.in_channels}")
+            
+        if 'autoconfigure' in model_config:
+            mgr.autoconfigure = model_config['autoconfigure']
+            print(f"Loaded autoconfigure from checkpoint: {mgr.autoconfigure}")
+        
+        # Set the entire model_config on mgr
+        mgr.model_config = model_config
+        
+        # Also set individual attributes for any that might be accessed directly
+        for key, value in model_config.items():
+            if not hasattr(mgr, key):
+                setattr(mgr, key, value)
+    
+    # Load dataset configuration if available (contains normalization info)
+    if 'dataset_config' in checkpoint:
+        dataset_config = checkpoint['dataset_config']
+        
+        if 'normalization_scheme' in dataset_config:
+            mgr.normalization_scheme = dataset_config['normalization_scheme']
+            print(f"Loaded normalization_scheme from checkpoint: {mgr.normalization_scheme}")
+            
+        if 'intensity_properties' in dataset_config:
+            mgr.intensity_properties = dataset_config['intensity_properties']
+            print(f"Loaded intensity_properties from checkpoint")
+            
+        # Also update dataset_config on mgr
+        mgr.dataset_config.update(dataset_config)
+    
+    # Build the model using the config
+    model = NetworkFromConfig(mgr)
+    
+    # For inference, we'll load the model weights directly instead of using load_checkpoint
+    # to avoid optimizer state issues
+    print("Loading model weights from checkpoint...")
+    model_state = checkpoint['model']
+    
+    # Check if this is a compiled model (has _orig_mod prefix)
+    is_compiled = any("_orig_mod." in key for key in model_state.keys())
+    
+    if is_compiled:
+        print("Detected compiled model checkpoint, handling state dict conversion...")
+        # Remove _orig_mod. prefix from all keys
+        new_state_dict = {}
+        for key, value in model_state.items():
+            if key.startswith("_orig_mod."):
+                new_key = key.replace("_orig_mod.", "")
+                new_state_dict[new_key] = value
+            else:
+                new_state_dict[key] = value
+        model_state = new_state_dict
+    
+    model.load_state_dict(model_state)
+    
+    # Move model to device
+    model = model.to(device)
+    
+    # Set model to eval mode
+    model.eval()
+    
+    return model, mgr
 
 if __name__ == "__main__":
     import argparse

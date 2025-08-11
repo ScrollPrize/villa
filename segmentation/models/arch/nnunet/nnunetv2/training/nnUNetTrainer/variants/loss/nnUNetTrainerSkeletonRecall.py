@@ -548,6 +548,9 @@ class nnUNetTrainerMedialSurfaceRecall(nnUNetTrainerSkeletonRecall):
             )
         )
 
+        from vesuvius.models.augmentation.transforms.utils.morphological_closing import MorphologicalClosingTransform
+        transforms.append(MorphologicalClosingTransform(structure_size=2))
+
         if do_dummy_2d_data_aug:
             transforms.append(Convert2DTo3DTransform())
 

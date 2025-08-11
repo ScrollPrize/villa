@@ -1,0 +1,16 @@
+tr_config:
+  patch_size: [128,128,128]
+  initial_lr: 3e-5
+
+model_config:
+  architecture_type: "primus_m"
+  patch_drop_rate: 0.75
+
+dataset_config:
+  min_labeled_ratio: 0
+  min_bbox_percent: 0
+  normalization_scheme: "zscore"
+  skip_patch_validation: true
+
+
+

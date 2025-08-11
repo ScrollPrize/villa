@@ -211,9 +211,21 @@ class nnUNetTrainer(object):
 
         # Hyperparameters initialization
         if yaml_config_path is None:
-            yaml_path = files('nnunetv2.training.nnUNetTrainer.configs').joinpath('default.yaml')
-            with yaml_path.open('r') as file:
-                yaml_config = yaml.safe_load(file)
+            try:
+                yaml_path = files('nnunetv2.training.nnUNetTrainer.configs').joinpath('default.yaml')
+                with yaml_path.open('r') as file:
+                    yaml_config = yaml.safe_load(file)
+            except (ModuleNotFoundError, FileNotFoundError):
+                # Use default values if config file is not found
+                yaml_config = {
+                    'num_epochs': 1000,
+                    'initial_lr': 1e-2,
+                    'weight_decay': 3e-5,
+                    'num_iterations_per_epoch': 250,
+                    'num_val_iterations_per_epoch': 50,
+                    'oversample_foreground_percent': 0.33,
+                    'enable_deep_supervision': True
+                }
         else:
             yaml_config = yaml.safe_load(open(yaml_config_path))
         yaml_config['architecture'] = configuration

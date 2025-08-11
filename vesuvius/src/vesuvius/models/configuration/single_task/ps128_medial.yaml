@@ -1,6 +1,7 @@
 tr_config:
   patch_size: [128,128,128]
 
+
 dataset_config:
   min_labeled_ratio: 0 
   min_bbox_percent: 0 
