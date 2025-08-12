@@ -185,9 +185,7 @@ def apply_matrix_to_centered(
         transform_matrix: 4x4 homogeneous transformation matrix to apply
         volume_dimensions: Dimensions of the volume being transformed
     """
-    original_matrix = state.layers["moving"].layer.source[0].transform.matrix
-    # Add homogeneous coordinate
-    original_matrix = np.concatenate([original_matrix, [[0, 0, 0, 1]]], axis=0)
+    original_matrix = get_current_transform(state)
 
     # Current position of volume center in fixed space
     cx, cy, cz, _ = original_matrix @ np.array(
@@ -224,10 +222,7 @@ def apply_matrix_to_centered(
         @ translate_to_origin_mat
         @ original_matrix
     )
-    # Remove homogeneous coordinate
-    matrix = matrix[:-1, :]
-    # Set new transform
-    state.layers["moving"].layer.source[0].transform.matrix = matrix
+    set_current_transform(state, matrix)
 
 
 def _make_rotator(axis: str, angle_deg: float):
@@ -268,30 +263,42 @@ def read_transform_from_file(input_path: str) -> np.ndarray:
         return np.loadtxt(f, dtype=np.float64)
 
 
+def get_current_transform(state: neuroglancer.ViewerState) -> np.ndarray:
+    """Get the current transform from the viewer state."""
+    transform = state.layers["moving"].layer.source[0].transform.matrix
+    # Add homogeneous coordinate
+    transform = np.concatenate([transform, [[0, 0, 0, 1]]], axis=0)
+    return transform
+
+
+def set_current_transform(
+    state: neuroglancer.ViewerState, transform: np.ndarray
+) -> None:
+    """Set the current transform in the viewer state."""
+    # Remove homogeneous coordinate
+    transform = transform[:-1, :]
+    state.layers["moving"].layer.source[0].transform.matrix = transform
+
+
 def fine_align(_):
     """Run zarr alignment and update the moving layer with the result."""
     with viewer.txn() as state:
-        current_transform = state.layers["moving"].layer.source[0].transform.matrix
-        # Add homogeneous coordinate
-        current_transform = np.concatenate([current_transform, [[0, 0, 0, 1]]], axis=0)
+        current_transform = get_current_transform(state)
 
         # Run alignment
         print("Running zarr alignment...")
         refined_transform = align_zarrs(args.fixed, args.moving, current_transform)
+        print(f"Refined transform: {refined_transform}")
 
         # Apply the refined transform
-        # Remove homogeneous coordinate
-        refined_transform = refined_transform[:-1, :]
-        state.layers["moving"].layer.source[0].transform.matrix = refined_transform
+        set_current_transform(state, refined_transform)
         print("Alignment complete - transform updated")
 
 
 def write_current_transform(_):
     """Write the current transform and print the shareable URL."""
     with viewer.txn() as state:
-        transform = state.layers["moving"].layer.source[0].transform.matrix
-        # Add homogeneous coordinate
-        transform = np.concatenate([transform, [[0, 0, 0, 1]]], axis=0)
+        transform = get_current_transform(state)
         # Write to file
         if args.output_transform is None:
             print("--output-transform not provided, printing transform to stdout:")
@@ -368,9 +375,7 @@ def set_initial_transform(viewer: neuroglancer.Viewer, initial_transform: str) -
     if initial_transform is not None:
         with viewer.txn() as state:
             matrix = read_transform_from_file(initial_transform)
-            # Remove homogeneous coordinate
-            matrix = matrix[:-1, :]
-            state.layers["moving"].layer.source[0].transform.matrix = matrix
+            set_current_transform(state, matrix)
 
 
 if __name__ == "__main__":
