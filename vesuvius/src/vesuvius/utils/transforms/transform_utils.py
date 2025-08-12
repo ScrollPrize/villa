@@ -134,6 +134,21 @@ def affine_matrix_to_sitk_transform(matrix: np.ndarray) -> sitk.AffineTransform:
     return transform
 
 
+def sitk_transform_to_affine_matrix(transform: sitk.AffineTransform) -> np.ndarray:
+    """Convert a SimpleITK AffineTransform to a 4x4 homogeneous transformation matrix.
+
+    Args:
+        transform: SimpleITK AffineTransform object
+
+    Returns:
+        Inverted 4x4 homogeneous transformation matrix (numpy array)
+    """
+    matrix = np.eye(4)
+    matrix[:3, :3] = np.array(transform.GetMatrix()).reshape(3, 3)
+    matrix[:3, 3] = transform.GetTranslation()
+    return matrix
+
+
 def invert_affine_matrix(matrix: np.ndarray) -> np.ndarray:
     """Invert a 4x4 homogeneous transformation matrix.
 
