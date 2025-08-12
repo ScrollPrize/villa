@@ -53,8 +53,8 @@ int main() {
     vs_chunk_free(yzchunk);
 
     // Fetch an .obj
-    char* buf = NULL;
-    long len = vs_download("https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/paths/20231016151002/20231016151002.obj", &buf);
+    char buf;
+    long len = vs_download("https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/paths/20231016151002/20231016151002.obj", (void*)&buf);
     if (len <= 0) {
         LOG_ERROR("failed to fetch obj");
         return 1;
@@ -63,7 +63,7 @@ int main() {
     if (meshfp == NULL) {
         return 1;
     }
-    fwrite(buf,1,len,meshfp);
+    fwrite(&buf, 1, len, meshfp);
 
     f32* vertices;
     s32* indices;
@@ -79,11 +79,8 @@ int main() {
         return 1;
     }
 
-
     mesh* mymesh = vs_mesh_new(vertices,NULL,indices,NULL,vertex_count,index_count);
-    if (mymesh == NULL) {
 
-    }
     printf("Fetched triangle mesh with %d vertices and %d indices\n", mymesh->vertex_count, mymesh->index_count);
 
     // Calculate the bounding box of the triangle mesh
