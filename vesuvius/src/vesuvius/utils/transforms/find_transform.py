@@ -24,35 +24,29 @@ void main() {
 }
 """
 
-# Global lists to store points in their respective volume coordinates
-fixed_points = []
-moving_points = []
-
-
-def create_fixed_points_layer(dimensions: neuroglancer.CoordinateSpace):
-    """Create an annotation layer for tracking fixed points."""
-    return neuroglancer.LocalAnnotationLayer(
-        dimensions=dimensions,
-        shader="""
+GREEN_POINTS_SHADER = """
 void main() {
     setColor(vec3(0, 1, 0));  // Green color
     setPointMarkerSize(5.0);
 }
-""",
-    )
+"""
 
-
-def create_moving_points_layer(dimensions: neuroglancer.CoordinateSpace):
-    """Create an annotation layer for tracking moving points."""
-    return neuroglancer.LocalAnnotationLayer(
-        dimensions=dimensions,
-        shader="""
+MAGENTA_POINTS_SHADER = """
 void main() {
     setColor(vec3(1, 0, 1));  // Magenta color
     setPointMarkerSize(5.0);
 }
-""",
-    )
+"""
+
+UNITLESS_DIMENSIONS = neuroglancer.CoordinateSpace(
+    names=["z", "y", "x"],
+    units="",
+    scales=[1, 1, 1],
+)
+
+# Global lists to store points in their respective volume coordinates
+fixed_points = []
+moving_points = []
 
 
 def add_moving_and_fixed_layers(
@@ -62,18 +56,11 @@ def add_moving_and_fixed_layers(
     scale_factor: float,
 ) -> None:
     with viewer.txn() as state:
-        # Some unitless dimensions for now
-        dimensions = neuroglancer.CoordinateSpace(
-            names=["z", "y", "x"],
-            units="",
-            scales=[1, 1, 1],
-        )
-
         # Open fixed volume
         fixed_source = neuroglancer.LayerDataSource(
             url=f"zarr://{fixed_path}",
             transform=neuroglancer.CoordinateSpaceTransform(
-                output_dimensions=dimensions,
+                output_dimensions=UNITLESS_DIMENSIONS,
             ),
         )
         state.layers.append(
@@ -89,7 +76,7 @@ def add_moving_and_fixed_layers(
         moving_source = neuroglancer.LayerDataSource(
             url=f"zarr://{moving_path}",
             transform=neuroglancer.CoordinateSpaceTransform(
-                output_dimensions=dimensions,
+                output_dimensions=UNITLESS_DIMENSIONS,
                 # Scale the moving volume to match the fixed volume
                 # If an initial transform is provided, it will be applied after this and override it
                 matrix=[
@@ -310,106 +297,84 @@ def set_current_transform(
     state.layers["moving"].layer.source[0].transform.matrix = transform
 
 
-def add_fixed_point(action_state):
-    """Add a point to the fixed points layer at the current mouse position."""
+def add_point(action_state, point_type):
+    """Add a point to the specified points layer at the current mouse position."""
     with viewer.txn() as state:
         # Get mouse position from the action state
         mouse_position = action_state.mouse_voxel_coordinates
-        if mouse_position is not None:
-            # Convert to list format and store
-            point = [
-                float(mouse_position[0]),
-                float(mouse_position[1]),
-                float(mouse_position[2]),
-            ]
-            fixed_points.append(point)
-
-            # Create the layer if it doesn't exist
-            if "fixed_points" not in state.layers:
-                dimensions = neuroglancer.CoordinateSpace(
-                    names=["z", "y", "x"],
-                    units="",
-                    scales=[1, 1, 1],
-                )
-                state.layers.append(
-                    name="fixed_points",
-                    layer=create_fixed_points_layer(dimensions),
-                    visible=True,
-                )
-
-            # Add annotation to the layer
-            state.layers["fixed_points"].layer.annotations.append(
-                neuroglancer.PointAnnotation(
-                    point=point, id=f"fixed_point_{len(fixed_points)}"
-                )
-            )
-            print(f"Added fixed point at: {point}")
-        else:
+        if mouse_position is None:
             print("No mouse position available")
+            return
 
+        # Convert to fixed space point
+        fixed_space_point = [
+            float(mouse_position[0]),
+            float(mouse_position[1]),
+            float(mouse_position[2]),
+        ]
 
-def add_moving_point(action_state):
-    """Add a point to the moving points layer at the current mouse position."""
-    with viewer.txn() as state:
-        # Get mouse position from the action state (in fixed space)
-        mouse_position = action_state.mouse_voxel_coordinates
-        if mouse_position is not None:
-            # Convert to homogeneous coordinates
-            fixed_point = np.array(
-                [
-                    float(mouse_position[0]),
-                    float(mouse_position[1]),
-                    float(mouse_position[2]),
-                    1.0,
-                ]
-            )
+        if point_type == "fixed":
+            # Store in fixed space
+            stored_point = fixed_space_point.copy()
+            fixed_points.append(stored_point)
+            layer_name = "fixed_points"
+            shader = GREEN_POINTS_SHADER
+            point_id = f"fixed_point_{len(fixed_points)}"
+            display_point = fixed_space_point
 
-            # Get current transform and compute inverse using utility function
+        elif point_type == "moving":
+            # Transform to moving space for storage
+            fixed_point_homogeneous = np.array([*fixed_space_point, 1.0])
             current_transform = get_current_transform(state)
             inverse_transform = invert_affine_matrix(current_transform)
+            moving_point_homogeneous = inverse_transform @ fixed_point_homogeneous
 
-            # Transform from fixed space to moving space for storage
-            moving_point_homogeneous = inverse_transform @ fixed_point
-            moving_point = [
+            stored_point = [
                 float(moving_point_homogeneous[0]),
                 float(moving_point_homogeneous[1]),
                 float(moving_point_homogeneous[2]),
             ]
+            moving_points.append(stored_point)
+            layer_name = "moving_points"
+            shader = MAGENTA_POINTS_SHADER
+            point_id = f"moving_point_{len(moving_points)}"
+            display_point = fixed_space_point  # Display in fixed space
 
-            # Store in moving space coordinates
-            moving_points.append(moving_point)
-
-            # But display the annotation at the fixed space location (where mouse clicked)
-            fixed_space_point = [
-                float(mouse_position[0]),
-                float(mouse_position[1]),
-                float(mouse_position[2]),
-            ]
-
-            # Create the layer if it doesn't exist
-            if "moving_points" not in state.layers:
-                dimensions = neuroglancer.CoordinateSpace(
-                    names=["z", "y", "x"],
-                    units="",
-                    scales=[1, 1, 1],
-                )
-                state.layers.append(
-                    name="moving_points",
-                    layer=create_moving_points_layer(dimensions),
-                    visible=True,
-                )
-
-            # Add annotation to the layer at fixed space location
-            state.layers["moving_points"].layer.annotations.append(
-                neuroglancer.PointAnnotation(
-                    point=fixed_space_point, id=f"moving_point_{len(moving_points)}"
-                )
-            )
-            print(
-                f"Added moving point at: {moving_point} (fixed space: {fixed_point[:3]})"
-            )
         else:
-            print("No mouse position available")
+            raise ValueError(f"Unknown point type: {point_type}")
+
+        # Create the layer if it doesn't exist
+        if layer_name not in state.layers:
+            state.layers.append(
+                name=layer_name,
+                layer=neuroglancer.LocalAnnotationLayer(
+                    dimensions=UNITLESS_DIMENSIONS,
+                    shader=shader,
+                ),
+                visible=True,
+            )
+
+        # Add annotation to the layer
+        state.layers[layer_name].layer.annotations.append(
+            neuroglancer.PointAnnotation(point=display_point, id=point_id)
+        )
+
+        if point_type == "fixed":
+            print(f"Added fixed point at: {stored_point}")
+        else:
+            print(
+                f"Added moving point at: {stored_point} (fixed space: {fixed_space_point})"
+            )
+
+
+def add_fixed_point(action_state):
+    """Add a point to the fixed points layer at the current mouse position."""
+    add_point(action_state, "fixed")
+
+
+def add_moving_point(action_state):
+    """Add a point to the moving points layer at the current mouse position."""
+    add_point(action_state, "moving")
 
 
 def fine_align(_):
