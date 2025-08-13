@@ -24,6 +24,22 @@ void main() {
 }
 """
 
+# Global list to store fixed points in fixed volume coordinates
+fixed_points = []
+
+
+def create_fixed_points_layer(dimensions: neuroglancer.CoordinateSpace):
+    """Create an annotation layer for tracking fixed points."""
+    return neuroglancer.LocalAnnotationLayer(
+        dimensions=dimensions,
+        shader="""
+void main() {
+    setColor(vec3(0, 1, 0));  // Green color
+    setPointMarkerSize(5.0);
+}
+""",
+    )
+
 
 def add_moving_and_fixed_layers(
     viewer: neuroglancer.Viewer,
@@ -280,6 +296,45 @@ def set_current_transform(
     state.layers["moving"].layer.source[0].transform.matrix = transform
 
 
+def add_fixed_point(action_state):
+    """Add a point to the fixed points layer at the current mouse position."""
+    with viewer.txn() as state:
+        # Get mouse position from the action state
+        mouse_position = action_state.mouse_voxel_coordinates
+        if mouse_position is not None:
+            # Convert to list format and store
+            point = [
+                float(mouse_position[0]),
+                float(mouse_position[1]),
+                float(mouse_position[2]),
+            ]
+            fixed_points.append(point)
+
+            # Create the layer if it doesn't exist
+            if "fixed_points" not in state.layers:
+                dimensions = neuroglancer.CoordinateSpace(
+                    names=["z", "y", "x"],
+                    units="",
+                    scales=[1, 1, 1],
+                )
+                state.layers.append(
+                    name="fixed_points",
+                    layer=create_fixed_points_layer(dimensions),
+                    visible=True,
+                )
+
+            # Add annotation to the layer
+            state.layers["fixed_points"].layer.annotations.append(
+                neuroglancer.PointAnnotation(
+                    point=point,
+                    id=f"fixed_point_{len(fixed_points)}"
+                )
+            )
+            print(f"Added fixed point at: {point}")
+        else:
+            print("No mouse position available")
+
+
 def fine_align(_):
     """Run zarr alignment and update the moving layer with the result."""
     with viewer.txn() as state:
@@ -322,6 +377,7 @@ def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
     viewer.actions.add("toggle-color", toggle_color)
     viewer.actions.add("write-transform", write_current_transform)
     viewer.actions.add("fine-align", fine_align)
+    viewer.actions.add("add-fixed-point", add_fixed_point)
     viewer.actions.add("rot-x-plus-small", _make_rotator("x", SMALL_ROTATE_STEP))
     viewer.actions.add("rot-x-minus-small", _make_rotator("x", -SMALL_ROTATE_STEP))
     viewer.actions.add("rot-y-plus-small", _make_rotator("y", SMALL_ROTATE_STEP))
@@ -348,6 +404,7 @@ def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
         s.input_event_bindings.viewer["keyc"] = "toggle-color"
         s.input_event_bindings.viewer["keyw"] = "write-transform"
         s.input_event_bindings.viewer["keyf"] = "fine-align"
+        s.input_event_bindings.viewer["alt+digit1"] = "add-fixed-point"
         s.input_event_bindings.viewer["alt+keya"] = "rot-x-plus-small"
         s.input_event_bindings.viewer["alt+keyq"] = "rot-x-minus-small"
         s.input_event_bindings.viewer["alt+keys"] = "rot-y-plus-small"
