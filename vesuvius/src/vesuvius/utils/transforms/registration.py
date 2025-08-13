@@ -59,9 +59,9 @@ def align_zarrs(zarr1_path: str, zarr2_path: str, M_init_ng: np.ndarray) -> np.n
     registration = sitk.ImageRegistrationMethod()
     registration.SetMovingInitialTransform(T_moving_init)
     registration.SetInitialTransform(sitk.AffineTransform(3))
-    registration.SetMetricAsMeanSquares()
+    registration.SetMetricAsMattesMutualInformation()
     registration.SetOptimizerAsRegularStepGradientDescent(
-        learningRate=0.1,
+        learningRate=0.01,
         minStep=0.00001,
         numberOfIterations=100,
     )
