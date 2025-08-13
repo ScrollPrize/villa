@@ -52,7 +52,8 @@ def align_zarrs(zarr1_path: str, zarr2_path: str, M_init_ng: np.ndarray) -> np.n
     M_init = invert_affine_matrix(matrix_swap_between_xyz_and_zyx(M_init_ng))
     T_moving_init = affine_matrix_to_sitk_transform(M_init)
 
-    check_images_with_transform(fixed_image, moving_image, T_moving_init)
+    # Debugging: visualize the images with the initial transform to make sure they're aligned
+    # check_images_with_transform(fixed_image, moving_image, T_moving_init)
 
     # Use a new identity affine as the initial transform
     registration = sitk.ImageRegistrationMethod()
