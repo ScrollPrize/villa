@@ -9,7 +9,7 @@ import neuroglancer
 import numpy as np
 
 from registration import align_zarrs
-from transform_utils import Dimensions, get_volume_dimensions
+from transform_utils import Dimensions, get_volume_dimensions, invert_affine_matrix
 
 
 GREEN_SHADER = """
@@ -24,8 +24,9 @@ void main() {
 }
 """
 
-# Global list to store fixed points in fixed volume coordinates
+# Global lists to store points in their respective volume coordinates
 fixed_points = []
+moving_points = []
 
 
 def create_fixed_points_layer(dimensions: neuroglancer.CoordinateSpace):
@@ -35,6 +36,19 @@ def create_fixed_points_layer(dimensions: neuroglancer.CoordinateSpace):
         shader="""
 void main() {
     setColor(vec3(0, 1, 0));  // Green color
+    setPointMarkerSize(5.0);
+}
+""",
+    )
+
+
+def create_moving_points_layer(dimensions: neuroglancer.CoordinateSpace):
+    """Create an annotation layer for tracking moving points."""
+    return neuroglancer.LocalAnnotationLayer(
+        dimensions=dimensions,
+        shader="""
+void main() {
+    setColor(vec3(1, 0, 1));  // Magenta color
     setPointMarkerSize(5.0);
 }
 """,
@@ -326,11 +340,74 @@ def add_fixed_point(action_state):
             # Add annotation to the layer
             state.layers["fixed_points"].layer.annotations.append(
                 neuroglancer.PointAnnotation(
-                    point=point,
-                    id=f"fixed_point_{len(fixed_points)}"
+                    point=point, id=f"fixed_point_{len(fixed_points)}"
                 )
             )
             print(f"Added fixed point at: {point}")
+        else:
+            print("No mouse position available")
+
+
+def add_moving_point(action_state):
+    """Add a point to the moving points layer at the current mouse position."""
+    with viewer.txn() as state:
+        # Get mouse position from the action state (in fixed space)
+        mouse_position = action_state.mouse_voxel_coordinates
+        if mouse_position is not None:
+            # Convert to homogeneous coordinates
+            fixed_point = np.array(
+                [
+                    float(mouse_position[0]),
+                    float(mouse_position[1]),
+                    float(mouse_position[2]),
+                    1.0,
+                ]
+            )
+
+            # Get current transform and compute inverse using utility function
+            current_transform = get_current_transform(state)
+            inverse_transform = invert_affine_matrix(current_transform)
+
+            # Transform from fixed space to moving space for storage
+            moving_point_homogeneous = inverse_transform @ fixed_point
+            moving_point = [
+                float(moving_point_homogeneous[0]),
+                float(moving_point_homogeneous[1]),
+                float(moving_point_homogeneous[2]),
+            ]
+
+            # Store in moving space coordinates
+            moving_points.append(moving_point)
+
+            # But display the annotation at the fixed space location (where mouse clicked)
+            fixed_space_point = [
+                float(mouse_position[0]),
+                float(mouse_position[1]),
+                float(mouse_position[2]),
+            ]
+
+            # Create the layer if it doesn't exist
+            if "moving_points" not in state.layers:
+                dimensions = neuroglancer.CoordinateSpace(
+                    names=["z", "y", "x"],
+                    units="",
+                    scales=[1, 1, 1],
+                )
+                state.layers.append(
+                    name="moving_points",
+                    layer=create_moving_points_layer(dimensions),
+                    visible=True,
+                )
+
+            # Add annotation to the layer at fixed space location
+            state.layers["moving_points"].layer.annotations.append(
+                neuroglancer.PointAnnotation(
+                    point=fixed_space_point, id=f"moving_point_{len(moving_points)}"
+                )
+            )
+            print(
+                f"Added moving point at: {moving_point} (fixed space: {fixed_point[:3]})"
+            )
         else:
             print("No mouse position available")
 
@@ -378,6 +455,7 @@ def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
     viewer.actions.add("write-transform", write_current_transform)
     viewer.actions.add("fine-align", fine_align)
     viewer.actions.add("add-fixed-point", add_fixed_point)
+    viewer.actions.add("add-moving-point", add_moving_point)
     viewer.actions.add("rot-x-plus-small", _make_rotator("x", SMALL_ROTATE_STEP))
     viewer.actions.add("rot-x-minus-small", _make_rotator("x", -SMALL_ROTATE_STEP))
     viewer.actions.add("rot-y-plus-small", _make_rotator("y", SMALL_ROTATE_STEP))
@@ -405,6 +483,7 @@ def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
         s.input_event_bindings.viewer["keyw"] = "write-transform"
         s.input_event_bindings.viewer["keyf"] = "fine-align"
         s.input_event_bindings.viewer["alt+digit1"] = "add-fixed-point"
+        s.input_event_bindings.viewer["alt+digit2"] = "add-moving-point"
         s.input_event_bindings.viewer["alt+keya"] = "rot-x-plus-small"
         s.input_event_bindings.viewer["alt+keyq"] = "rot-x-minus-small"
         s.input_event_bindings.viewer["alt+keys"] = "rot-y-plus-small"
