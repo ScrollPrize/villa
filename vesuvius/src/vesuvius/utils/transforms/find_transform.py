@@ -9,7 +9,12 @@ import neuroglancer
 import numpy as np
 
 from registration import align_zarrs
-from transform_utils import Dimensions, get_volume_dimensions, invert_affine_matrix
+from transform_utils import (
+    Dimensions,
+    get_volume_dimensions,
+    invert_affine_matrix,
+    fit_affine_transform_from_points,
+)
 
 
 GREEN_SHADER = """
@@ -365,6 +370,17 @@ def add_point(action_state, point_type):
             print(
                 f"Added moving point at: {stored_point} (fixed space: {fixed_space_point})"
             )
+
+        # Check if we can fit a transform automatically
+        if len(fixed_points) == len(moving_points) and len(fixed_points) >= 4:
+            fitted_transform = fit_affine_transform_from_points(
+                fixed_points, moving_points
+            )
+            if fitted_transform is not None:
+                set_current_transform(state, fitted_transform)
+                print(
+                    f"Automatically updated transform from {len(fixed_points)} point pairs"
+                )
 
 
 def add_fixed_point(action_state):

@@ -229,6 +229,37 @@ def matrix_swap_between_xyz_and_zyx(matrix: np.ndarray) -> np.ndarray:
     return output_matrix
 
 
+def fit_affine_transform_from_points(fixed_points, moving_points):
+    """Fit an affine transform from corresponding point pairs.
+
+    Args:
+        fixed_points: List of points in fixed space (Nx3)
+        moving_points: List of points in moving space (Nx3)
+
+    Returns:
+        4x4 affine transformation matrix or None if insufficient points
+    """
+    if len(fixed_points) != len(moving_points) or len(fixed_points) < 4:
+        return None
+
+    # Convert to numpy arrays
+    fixed_array = np.array(fixed_points)  # Points in fixed space
+    moving_array = np.array(moving_points)  # Points in moving space
+
+    # Add homogeneous coordinate to moving points
+    moving_homogeneous = np.column_stack([moving_array, np.ones(len(moving_array))])
+
+    # Solve for transform: fixed = transform @ moving_homogeneous.T
+    # We want: transform @ moving_homogeneous.T = fixed_array.T
+    # So: transform = fixed_array.T @ pinv(moving_homogeneous.T)
+    transform_3x4 = fixed_array.T @ np.linalg.pinv(moving_homogeneous.T)
+
+    # Add bottom row to make it 4x4
+    transform_4x4 = np.vstack([transform_3x4, [0, 0, 0, 1]])
+
+    return transform_4x4
+
+
 def check_images_with_transform(
     fixed_image: sitk.Image, moving_image: sitk.Image, transform: sitk.Transform
 ) -> None:
