@@ -71,7 +71,6 @@ def align_zarrs(zarr1_path: str, zarr2_path: str, M_init_ng: np.ndarray) -> np.n
         print(
             f"Iteration: {registration.GetOptimizerIteration()}, "
             f"Metric: {registration.GetMetricValue():.6f}"
-            f"Matrix: {registration.GetInitialTransform().GetParameters()}"
         )
 
     registration.AddCommand(sitk.sitkIterationEvent, lambda: print_metric(registration))
