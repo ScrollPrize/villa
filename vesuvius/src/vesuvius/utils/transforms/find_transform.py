@@ -34,7 +34,7 @@ def add_moving_and_fixed_layers(
     with viewer.txn() as state:
         # Some unitless dimensions for now
         dimensions = neuroglancer.CoordinateSpace(
-            names=["x", "y", "z"],
+            names=["z", "y", "x"],
             units="",
             scales=[1, 1, 1],
         )
@@ -433,9 +433,3 @@ if __name__ == "__main__":
     set_initial_transform(viewer, args.initial_transform)
 
     webbrowser.open_new(viewer.get_viewer_url())
-
-    # TODO
-    # Create registration file with stub registration method and map it in this file to a keybind
-    # Figure out what resolutions are available
-    # If low enough, try SimpleITK registration using lowest resolution
-    # Then try with higher and/or chunking?
