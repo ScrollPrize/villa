@@ -2,7 +2,12 @@ import numpy as np
 import SimpleITK as sitk
 import zarr
 
-from transform_utils import affine_matrix_to_sitk_transform, invert_affine_matrix
+from transform_utils import (
+    affine_matrix_to_sitk_transform,
+    invert_affine_matrix,
+    sitk_transform_to_affine_matrix,
+    visualize_images_with_transform,
+)
 
 
 def align_zarrs(
@@ -40,18 +45,7 @@ def align_zarrs(
     moving_image = sitk.ShiftScale(moving_image, shift=0.0, scale=1.0 / 255.0)
 
     # SimpleITK uses a different convention for the initial transform, so we need to invert it
-    sitk_initial_transform = affine_matrix_to_sitk_transform(
-        invert_affine_matrix(initial_transform)
-    )
-    # Transform mapping virtual image to fixed image
-    fixed_scale_factor = 1.0 / 2**fixed_level
-    # Transform mapping virtual image to moving image
-    moving_scale_factor = 1.0 / 2**moving_level
-
-    # Create fixed image transform
-    fixed_image_transform = sitk.ScaleTransform(3, [fixed_scale_factor] * 3)
-    # Create moving image transform
-    moving_image_transform = sitk.ScaleTransform(3, [moving_scale_factor] * 3)
+    visualize_images_with_transform(fixed_image, moving_image, sitk_initial_transform)
 
     # Initialize the registration
     registration = sitk.ImageRegistrationMethod()

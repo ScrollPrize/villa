@@ -183,3 +183,24 @@ def matrix_swap_between_xyz_and_zyx(matrix: np.ndarray) -> np.ndarray:
     output_matrix = reorder_matrix @ matrix @ reorder_matrix.T
 
     return output_matrix
+
+
+def visualize_images_with_transform(
+    fixed_image: sitk.Image, moving_image: sitk.Image, transform: sitk.Transform
+) -> None:
+    """
+    Visualize two images with a transform between them.
+    """
+    # Resample moving image to fixed image space to check overlap
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetReferenceImage(fixed_image)
+    resampler.SetTransform(transform)
+    resampler.SetInterpolator(sitk.sitkLinear)
+    resampled_moving = resampler.Execute(moving_image)
+
+    composite_image = sitk.Compose(
+        fixed_image, resampled_moving, fixed_image // 2.0 + resampled_moving // 2.0
+    )
+    # Cast to uint8 for display
+    composite_image = sitk.Cast(composite_image, sitk.sitkVectorUInt8)
+    sitk.Show(composite_image, "Composite: Fixed (R), Resampled Moving (G)")
