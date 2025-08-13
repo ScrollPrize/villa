@@ -9,6 +9,52 @@ import zarr
 import SimpleITK as sitk
 
 
+############ TODO REMOVE AND FIX ON SERVER SIDE ############
+import fsspec
+
+
+# Monkey patch the HTTP filesystem to convert 500 errors to 404 for missing chunks
+try:
+    from fsspec.implementations.http import HTTPFileSystem
+
+    original_raise_not_found = HTTPFileSystem._raise_not_found_for_status
+except (ImportError, AttributeError):
+    # Fallback for older fsspec versions
+    original_raise_not_found = (
+        fsspec.implementations.http.HTTPFileSystem._raise_not_found_for_status
+    )
+
+
+def patched_raise_not_found_for_status(self, response, url):
+    """Convert 500 errors to 404 for missing Zarr chunks."""
+    if response.status == 500 and "zarr" in url.lower():
+        # Treat 500 as missing chunk (404) for Zarr URLs
+        from aiohttp.client_exceptions import ClientResponseError
+
+        raise ClientResponseError(
+            request_info=response.request_info,
+            history=response.history,
+            status=404,  # Convert 500 to 404
+            message="Not Found (converted from 500)",
+            headers=response.headers,
+        )
+    else:
+        return original_raise_not_found(self, response, url)
+
+
+# Apply the patch
+try:
+    from fsspec.implementations.http import HTTPFileSystem
+
+    HTTPFileSystem._raise_not_found_for_status = patched_raise_not_found_for_status
+except (ImportError, AttributeError):
+    # Fallback for older fsspec versions
+    fsspec.implementations.http.HTTPFileSystem._raise_not_found_for_status = (
+        patched_raise_not_found_for_status
+    )
+############ TODO REMOVE AND FIX ON SERVER SIDE ############
+
+
 class Dimensions(NamedTuple):
     """Structure for volume dimensions with x, y, z coordinates and voxel size."""
 
