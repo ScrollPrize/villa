@@ -66,6 +66,21 @@ def align_zarrs(zarr1_path: str, zarr2_path: str, M_init_ng: np.ndarray) -> np.n
     )
     registration.SetInterpolator(sitk.sitkLinear)
 
+    # Create mask images (anywhere there is a non-zero value in the fixed and moving images)
+    fixed_mask = sitk.BinaryThreshold(
+        fixed_image, lowerThreshold=0, upperThreshold=0, insideValue=0, outsideValue=1
+    )
+    moving_mask = sitk.BinaryThreshold(
+        moving_image, lowerThreshold=0, upperThreshold=0, insideValue=0, outsideValue=1
+    )
+
+    # Set spacing
+    fixed_mask.SetSpacing(fixed_image.GetSpacing())
+    moving_mask.SetSpacing(moving_image.GetSpacing())
+
+    registration.SetMetricFixedMask(fixed_mask)
+    registration.SetMetricMovingMask(moving_mask)
+
     # Add callback to print metric every iteration
     def print_metric(registration: sitk.ImageRegistrationMethod):
         print(
