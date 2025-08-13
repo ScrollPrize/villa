@@ -185,11 +185,11 @@ def matrix_swap_between_xyz_and_zyx(matrix: np.ndarray) -> np.ndarray:
     return output_matrix
 
 
-def visualize_images_with_transform(
+def check_images_with_transform(
     fixed_image: sitk.Image, moving_image: sitk.Image, transform: sitk.Transform
 ) -> None:
     """
-    Visualize two images with a transform between them.
+    Check overlap between two images with a transform between them.
     """
     # Resample moving image to fixed image space to check overlap
     resampler = sitk.ResampleImageFilter()
@@ -204,3 +204,26 @@ def visualize_images_with_transform(
     # Cast to uint8 for display
     composite_image = sitk.Cast(composite_image, sitk.sitkVectorUInt8)
     sitk.Show(composite_image, "Composite: Fixed (R), Resampled Moving (G)")
+
+    # Check overlap by looking at non-zero regions
+    fixed_array = sitk.GetArrayFromImage(fixed_image)
+    moving_array = sitk.GetArrayFromImage(resampled_moving)
+
+    fixed_nonzero = np.count_nonzero(fixed_array)
+    moving_nonzero = np.count_nonzero(moving_array)
+
+    # Simple overlap check: count voxels where both images have non-zero values
+    overlap_mask = (fixed_array > 0) & (moving_array > 0)
+    overlap_count = np.count_nonzero(overlap_mask)
+
+    print(f"Fixed image non-zero voxels: {fixed_nonzero}")
+    print(f"Moving image non-zero voxels: {moving_nonzero}")
+    print(f"Overlap voxels: {overlap_count}")
+    print(
+        f"Overlap percentage: {overlap_count / max(fixed_nonzero, moving_nonzero) * 100:.2f}%"
+    )
+
+    if overlap_count == 0:
+        raise ValueError(
+            "No overlap detected! Images are too far apart for registration."
+        )

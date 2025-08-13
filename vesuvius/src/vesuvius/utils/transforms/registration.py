@@ -6,7 +6,7 @@ from transform_utils import (
     affine_matrix_to_sitk_transform,
     invert_affine_matrix,
     sitk_transform_to_affine_matrix,
-    visualize_images_with_transform,
+    check_images_with_transform,
 )
 
 
@@ -47,11 +47,11 @@ def align_zarrs(
     fixed_image = sitk.Cast(fixed_image, sitk.sitkFloat32)
     moving_image = sitk.Cast(moving_image, sitk.sitkFloat32)
 
-    # SimpleITK uses a different convention for the initial transform, so we need to invert it
+    # SimpleITK transforms from fixed to moving, so we need to invert the neuroglancer transform
     inverted_initial_transform = invert_affine_matrix(initial_transform)
     sitk_initial_transform = affine_matrix_to_sitk_transform(inverted_initial_transform)
 
-    visualize_images_with_transform(fixed_image, moving_image, sitk_initial_transform)
+    check_images_with_transform(fixed_image, moving_image, sitk_initial_transform)
 
     # Initialize the registration
     registration = sitk.ImageRegistrationMethod()
