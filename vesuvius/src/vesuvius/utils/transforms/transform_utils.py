@@ -122,9 +122,6 @@ def affine_matrix_to_sitk_transform(matrix: np.ndarray) -> sitk.AffineTransform:
     if matrix.shape != (4, 4):
         raise ValueError(f"Matrix must be 4x4, got shape {matrix.shape}")
 
-    # Convert from neuroglancer to sitk
-    matrix = matrix_swap_between_xyz_and_zyx(matrix)
-
     # Extract the 3x3 affine matrix and translation components
     affine_matrix = matrix[:3, :3].flatten().tolist()
     translation = matrix[:3, 3].tolist()
@@ -137,7 +134,9 @@ def affine_matrix_to_sitk_transform(matrix: np.ndarray) -> sitk.AffineTransform:
     return transform
 
 
-def sitk_transform_to_affine_matrix(transform: sitk.AffineTransform) -> np.ndarray:
+def sitk_affine_transform_to_matrix(
+    transform: sitk.AffineTransform,
+) -> np.ndarray:
     """Convert a SimpleITK AffineTransform to a 4x4 homogeneous transformation matrix.
 
     Args:
@@ -149,7 +148,6 @@ def sitk_transform_to_affine_matrix(transform: sitk.AffineTransform) -> np.ndarr
     matrix = np.eye(4)
     matrix[:3, :3] = np.array(transform.GetMatrix()).reshape(3, 3)
     matrix[:3, 3] = transform.GetTranslation()
-    matrix = matrix_swap_between_xyz_and_zyx(matrix)
     return matrix
 
 
@@ -179,7 +177,7 @@ def matrix_swap_between_xyz_and_zyx(matrix: np.ndarray) -> np.ndarray:
         ]
     )
 
-    # Apply the reordering: M_out = R * M_in * R^T
+    # Apply the reordering
     output_matrix = reorder_matrix @ matrix @ reorder_matrix.T
 
     return output_matrix
