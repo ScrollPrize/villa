@@ -33,37 +33,55 @@ def align_zarrs(
     fixed_image = fixed_zarr[fixed_level]
     moving_image = moving_zarr[moving_level]
 
+    fixed_scale_factor = 2**fixed_level
+    moving_scale_factor = 2**moving_level
+
     fixed_image = sitk.GetImageFromArray(fixed_image)
     moving_image = sitk.GetImageFromArray(moving_image)
+
+    # Set image spacing based on scale factor
+    fixed_image.SetSpacing([fixed_scale_factor] * 3)
+    moving_image.SetSpacing([moving_scale_factor] * 3)
 
     # Cast images to float32 for SimpleITK compatibility
     fixed_image = sitk.Cast(fixed_image, sitk.sitkFloat32)
     moving_image = sitk.Cast(moving_image, sitk.sitkFloat32)
 
-    # Normalize images to [0,1] range based on uint8 scale [0,255]
-    fixed_image = sitk.ShiftScale(fixed_image, shift=0.0, scale=1.0 / 255.0)
-    moving_image = sitk.ShiftScale(moving_image, shift=0.0, scale=1.0 / 255.0)
-
     # SimpleITK uses a different convention for the initial transform, so we need to invert it
+    inverted_initial_transform = invert_affine_matrix(initial_transform)
+    sitk_initial_transform = affine_matrix_to_sitk_transform(inverted_initial_transform)
+
     visualize_images_with_transform(fixed_image, moving_image, sitk_initial_transform)
 
     # Initialize the registration
     registration = sitk.ImageRegistrationMethod()
     registration.SetInitialTransform(sitk_initial_transform)
-    registration.SetFixedInitialTransform(fixed_image_transform)
-    registration.SetMovingInitialTransform(moving_image_transform)
-    registration.SetMetricAsMattesMutualInformation()
-    registration.SetOptimizerAsGradientDescent(
-        learningRate=0.01, numberOfIterations=100
+    registration.SetMetricAsMeanSquares()
+    registration.SetOptimizerAsRegularStepGradientDescent(
+        learningRate=0.1,
+        minStep=0.00001,
+        numberOfIterations=1000,
     )
     registration.SetInterpolator(sitk.sitkLinear)
 
+    # Add callback to print metric every iteration
+    def print_metric(registration):
+        print(
+            f"Iteration: {registration.GetOptimizerIteration()}, "
+            f"Metric: {registration.GetMetricValue():.6f}"
+        )
+
+    registration.AddCommand(sitk.sitkIterationEvent, lambda: print_metric(registration))
+
     # Set the registration to run
     out_transform = registration.Execute(fixed_image, moving_image)
-    out_matrix = out_transform.GetMatrix()
-    # invert the matrix
-    out_matrix = invert_affine_matrix(out_matrix)
 
-    # In many cases you want the center of rotation to be the physical center of the fixed image (the CenteredTransformCenteredTransformInitializerFilter ensures this).
+    print(f"Final metric value: {registration.GetMetricValue()}")
+    print(
+        f"Optimizer's stopping condition, {registration.GetOptimizerStopConditionDescription()}"
+    )
 
-    return out_matrix
+    out_matrix = sitk_transform_to_affine_matrix(out_transform)
+    inverted_out_matrix = invert_affine_matrix(out_matrix)
+
+    return inverted_out_matrix
