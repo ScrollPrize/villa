@@ -1,4 +1,8 @@
-"""Find the transform between two provided volumes."""
+"""Find the transform between two provided volumes.
+
+Note that neuroglancer uses ZYX coordinates, so that convention is followed for neuroglancer-related bits (most of this file).
+Elsewhere, for example writing to a JSON file, we use XYZ coordinates.
+"""
 
 from typing import Optional
 from pathlib import Path
@@ -120,7 +124,7 @@ def make_rotation_matrix(axis: str, angle_deg: float):
     cos_theta = np.cos(angle_rad)
     sin_theta = np.sin(angle_rad)
 
-    if axis == "x":
+    if axis == "z":
         return np.array(
             [
                 [1, 0, 0, 0],
@@ -138,7 +142,7 @@ def make_rotation_matrix(axis: str, angle_deg: float):
                 [0, 0, 0, 1],
             ]
         )
-    elif axis == "z":
+    elif axis == "x":
         return np.array(
             [
                 [cos_theta, -sin_theta, 0, 0],
@@ -153,7 +157,7 @@ def make_rotation_matrix(axis: str, angle_deg: float):
 
 def make_flip_matrix(axis: str):
     """Make a flip matrix for the given axis."""
-    if axis == "x":
+    if axis == "z":
         return np.array(
             [
                 [-1, 0, 0, 0],
@@ -171,7 +175,7 @@ def make_flip_matrix(axis: str):
                 [0, 0, 0, 1],
             ]
         )
-    elif axis == "z":
+    elif axis == "x":
         return np.array(
             [
                 [1, 0, 0, 0],
@@ -186,11 +190,11 @@ def make_flip_matrix(axis: str):
 
 def make_translate_matrix(axis: str, amount: float):
     """Make a translation matrix for the given axis and amount."""
-    if axis == "x":
+    if axis == "z":
         return np.array([[1, 0, 0, amount], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
     elif axis == "y":
         return np.array([[1, 0, 0, 0], [0, 1, 0, amount], [0, 0, 1, 0], [0, 0, 0, 1]])
-    elif axis == "z":
+    elif axis == "x":
         return np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, amount], [0, 0, 0, 1]])
     else:
         raise ValueError(f"Invalid axis: {axis}")
