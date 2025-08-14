@@ -212,11 +212,11 @@ def apply_matrix_to_centered(
     original_matrix = get_current_transform(state)
 
     # Current position of volume center in fixed space
-    cx, cy, cz, _ = original_matrix @ np.array(
+    cz, cy, cx, _ = original_matrix @ np.array(
         [
-            volume_dimensions.voxels_x / 2,
-            volume_dimensions.voxels_y / 2,
             volume_dimensions.voxels_z / 2,
+            volume_dimensions.voxels_y / 2,
+            volume_dimensions.voxels_x / 2,
             1,
         ]
     )
@@ -224,18 +224,18 @@ def apply_matrix_to_centered(
     # Center volume about origin
     translate_to_origin_mat = np.array(
         [
-            [1, 0, 0, -cx],
+            [1, 0, 0, -cz],
             [0, 1, 0, -cy],
-            [0, 0, 1, -cz],
+            [0, 0, 1, -cx],
             [0, 0, 0, 1],
         ]
     )
     # Translate back to original position
     translate_back_mat = np.array(
         [
-            [1, 0, 0, cx],
+            [1, 0, 0, cz],
             [0, 1, 0, cy],
-            [0, 0, 1, cz],
+            [0, 0, 1, cx],
             [0, 0, 0, 1],
         ]
     )
