@@ -53,6 +53,9 @@ void main() {
 }
 """
 
+FIXED_POINTS_LAYER_STR = "fixed_points"
+MOVING_POINTS_LAYER_STR = "moving_points"
+
 UNITLESS_DIMENSIONS = neuroglancer.CoordinateSpace(
     names=["z", "y", "x"],
     units="",
@@ -312,12 +315,12 @@ def save_current_transform(
     fixed_landmarks = []
     moving_landmarks = []
 
-    if "fixed_points" in state.layers:
-        fixed_annotations = state.layers["fixed_points"].layer.annotations
+    if FIXED_POINTS_LAYER_STR in state.layers:
+        fixed_annotations = state.layers[FIXED_POINTS_LAYER_STR].layer.annotations
         fixed_landmarks = [list(ann.point) for ann in fixed_annotations]
 
-    if "moving_points" in state.layers:
-        moving_annotations = state.layers["moving_points"].layer.annotations
+    if MOVING_POINTS_LAYER_STR in state.layers:
+        moving_annotations = state.layers[MOVING_POINTS_LAYER_STR].layer.annotations
         moving_landmarks = [list(ann.point) for ann in moving_annotations]
 
     # Convert to XYZ coordinates for the schema
@@ -363,18 +366,20 @@ def set_current_transform(
     state.layers["moving"].layer.source[0].transform.matrix = transform
 
     # Also update moving_points layer if it exists
-    if "moving_points" in state.layers:
-        state.layers["moving_points"].layer.source[0].transform.matrix = transform
+    if MOVING_POINTS_LAYER_STR in state.layers:
+        state.layers[MOVING_POINTS_LAYER_STR].layer.source[
+            0
+        ].transform.matrix = transform
 
 
 def add_point_from_coords(state: neuroglancer.ViewerState, point_coords, point_type):
     """Add a point to the specified points layer from given coordinates."""
     # For loading from JSON, we already have the coordinates in the right space
     if point_type == "fixed":
-        layer_name = "fixed_points"
+        layer_name = FIXED_POINTS_LAYER_STR
         shader = GREEN_POINTS_SHADER
     elif point_type == "moving":
-        layer_name = "moving_points"
+        layer_name = MOVING_POINTS_LAYER_STR
         shader = MAGENTA_POINTS_SHADER
     else:
         raise ValueError(f"Unknown point type: {point_type}")
@@ -384,7 +389,7 @@ def add_point_from_coords(state: neuroglancer.ViewerState, point_coords, point_t
         num_points = len(state.layers[layer_name].layer.annotations)
     else:
         num_points = 0
-    point_id = f"{point_type}_point_{num_points + 1}"
+    point_id = f"{point_type[0]}p_{num_points + 1}"
 
     # Make the layer if it does not exist
     if layer_name not in state.layers:
@@ -411,9 +416,12 @@ def add_point_from_coords(state: neuroglancer.ViewerState, point_coords, point_t
     )
 
     # Check if we can fit a transform automatically
-    if "fixed_points" in state.layers and "moving_points" in state.layers:
-        fixed_annotations = state.layers["fixed_points"].layer.annotations
-        moving_annotations = state.layers["moving_points"].layer.annotations
+    if (
+        FIXED_POINTS_LAYER_STR in state.layers
+        and MOVING_POINTS_LAYER_STR in state.layers
+    ):
+        fixed_annotations = state.layers[FIXED_POINTS_LAYER_STR].layer.annotations
+        moving_annotations = state.layers[MOVING_POINTS_LAYER_STR].layer.annotations
 
         if (
             len(fixed_annotations) == len(moving_annotations)
