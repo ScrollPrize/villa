@@ -275,11 +275,6 @@ def _make_translator(axis: str, amount: float):
     return handler
 
 
-def write_transform_to_file(transform: np.ndarray, output_path: str) -> None:
-    """Write a transform to a file."""
-    np.savetxt(output_path, transform)
-
-
 def load_transform(viewer_state: neuroglancer.ViewerState, input_path: str) -> None:
     """Read a transform from a file. If provided, also loads landmarks into viewer state."""
     matrix_xyz, fixed_landmarks_xyz, moving_landmarks_xyz = read_transform_json(
