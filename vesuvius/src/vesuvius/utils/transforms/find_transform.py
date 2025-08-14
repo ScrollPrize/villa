@@ -1,7 +1,8 @@
 """Find the transform between two provided volumes."""
 
-import argparse
+from typing import Optional
 from pathlib import Path
+import argparse
 import sys
 import webbrowser
 
@@ -296,10 +297,10 @@ def load_transform(viewer_state: neuroglancer.ViewerState, input_path: str) -> N
         add_point_from_coords(viewer_state, point, "moving")
 
 
-def save_transform(
-    state: neuroglancer.ViewerState, output_path: str, fixed_volume_path: str
+def save_current_transform(
+    state: neuroglancer.ViewerState, output_path: Optional[str], fixed_volume_path: str
 ) -> None:
-    """Save the current transform and landmarks to a JSON file."""
+    """Save the current transform and landmarks to a JSON file, and print the shareable URL."""
     # Get current transform (in ZYX coordinates)
     matrix = get_current_transform(state)
 
@@ -320,12 +321,24 @@ def save_transform(
     xyz_moving_landmarks = points_swap_xyz_zyx(moving_landmarks)
     xyz_fixed_landmarks = points_swap_xyz_zyx(fixed_landmarks)
 
-    write_transform_json(
-        output_path,
-        Path(fixed_volume_path).stem,
-        xyz_matrix,
-        xyz_fixed_landmarks,
-        xyz_moving_landmarks,
+    # Write to file or print to stdout
+    if output_path is None:
+        print("--output-transform not provided, printing transform to stdout:")
+        print(matrix)
+        print("To save to file, use --output-transform <path>")
+    else:
+        print(f"Writing transform to {output_path}")
+        write_transform_json(
+            output_path,
+            Path(fixed_volume_path).stem,
+            xyz_matrix,
+            xyz_fixed_landmarks,
+            xyz_moving_landmarks,
+        )
+
+    # Print the state URL
+    print(
+        f"Shareable URL: https://neuroglancer-demo.appspot.com/#!{neuroglancer.url_state.to_url_fragment(state)}"
     )
 
 
@@ -482,20 +495,7 @@ def fine_align(_):
 def write_current_transform(_):
     """Write the current transform and print the shareable URL."""
     with viewer.txn() as state:
-        transform = get_current_transform(state)
-        # Write to file
-        if args.output_transform is None:
-            print("--output-transform not provided, printing transform to stdout:")
-            print(transform)
-            print("To save to file, use --output-transform <path>")
-        else:
-            print(f"Writing transform to {args.output_transform}")
-            save_transform(state, args.output_transform, args.fixed)
-
-        # In either case print the state URL
-        print(
-            f"Shareable URL: https://neuroglancer-demo.appspot.com/#!{neuroglancer.url_state.to_url_fragment(state)}"
-        )
+        save_current_transform(state, args.output_transform, args.fixed)
 
 
 def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
