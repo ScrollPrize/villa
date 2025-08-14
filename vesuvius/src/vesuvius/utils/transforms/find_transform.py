@@ -327,7 +327,7 @@ def save_transform(
 
     write_transform_json(
         output_path,
-        Path(fixed_volume_path).name,
+        Path(fixed_volume_path).stem,
         xyz_matrix,
         xyz_fixed_landmarks,
         xyz_moving_landmarks,
