@@ -5,7 +5,7 @@
   "required": [
     "schema_version",
     "fixed_volume",
-    "affine_transformation_matrix",
+    "transformation_matrix",
     "fixed_landmarks",
     "moving_landmarks"
   ],
@@ -19,7 +19,7 @@
       "type": "string",
       "description": "Path or identifier of the fixed volume to which this volume is registered"
     },
-    "affine_transformation_matrix": {
+    "transformation_matrix": {
       "type": "array",
       "description": "3x4 affine transformation matrix in XYZ coordinate order (homogeneous coordinate row omitted). First 3x3 is the rotation matrix, last column is the translation vector. Applied as p_fixed = M @ p_moving after the homogeneous row is added to the matrix.",
       "items": {

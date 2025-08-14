@@ -15,6 +15,8 @@ google-apitools==0.5.32
 google-auth==2.40.3
 httplib2==0.22.0
 idna==3.10
+jsonschema==4.25.0
+jsonschema-specifications==2025.4.1
 multidict==6.6.3
 neuroglancer==2.40.1
 numcodecs==0.15.1
@@ -25,7 +27,9 @@ propcache==0.3.2
 pyasn1==0.6.1
 pyasn1-modules==0.4.2
 pyparsing==3.2.3
+referencing==0.36.2
 requests==2.32.4
+rpds-py==0.27.0
 rsa==4.9.1
 simpleitk==2.5.2
 six==1.17.0

@@ -6,7 +6,7 @@ from transform_utils import (
     affine_matrix_to_sitk_transform,
     invert_affine_matrix,
     sitk_affine_transform_to_matrix,
-    matrix_swap_between_xyz_and_zyx,
+    matrix_swap_xyz_zyx,
     check_images_with_transform,
 )
 
@@ -49,7 +49,7 @@ def align_zarrs(zarr1_path: str, zarr2_path: str, M_init_ng: np.ndarray) -> np.n
 
     # Convert the neuroglancer matrix (ZYX) to a SimpleITK ordering (XYZ)
     # Also invert it so it maps from virtual to moving (expected by SimpleITK) instead of moving to fixed (neuroglancer)
-    M_init = invert_affine_matrix(matrix_swap_between_xyz_and_zyx(M_init_ng))
+    M_init = invert_affine_matrix(matrix_swap_xyz_zyx(M_init_ng))
     T_moving_init = affine_matrix_to_sitk_transform(M_init)
 
     # Debugging: visualize the images with the initial transform to make sure they're aligned
@@ -107,7 +107,7 @@ def align_zarrs(zarr1_path: str, zarr2_path: str, M_init_ng: np.ndarray) -> np.n
 
     # Invert the matrix to get the transform from moving to fixed
     # Also convert to neuroglancer ordering (ZYX)
-    M_out_ng = matrix_swap_between_xyz_and_zyx(invert_affine_matrix(M_out))
+    M_out_ng = matrix_swap_xyz_zyx(invert_affine_matrix(M_out))
 
     # Return a neuroglancer-suitable matrix
     return M_out_ng

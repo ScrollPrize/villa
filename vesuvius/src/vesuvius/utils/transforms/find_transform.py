@@ -14,6 +14,10 @@ from transform_utils import (
     get_volume_dimensions,
     invert_affine_matrix,
     fit_affine_transform_from_points,
+    matrix_swap_xyz_zyx,
+    points_swap_xyz_zyx,
+    read_transform_json,
+    write_transform_json,
 )
 
 
@@ -31,14 +35,14 @@ void main() {
 
 GREEN_POINTS_SHADER = """
 void main() {
-    setColor(vec3(0, 1, 0));  // Green color
+    setColor(vec3(0, 1, 0));
     setPointMarkerSize(5.0);
 }
 """
 
 MAGENTA_POINTS_SHADER = """
 void main() {
-    setColor(vec3(1, 0, 1));  // Magenta color
+    setColor(vec3(1, 0, 1));
     setPointMarkerSize(5.0);
 }
 """
@@ -275,10 +279,84 @@ def write_transform_to_file(transform: np.ndarray, output_path: str) -> None:
     np.savetxt(output_path, transform)
 
 
-def read_transform_from_file(input_path: str) -> np.ndarray:
-    """Read a transform from a file."""
-    with open(input_path, "r") as f:
-        return np.loadtxt(f, dtype=np.float64)
+def load_transform(viewer_state: neuroglancer.ViewerState, input_path: str) -> None:
+    """Read a transform from a file. If provided, also loads landmarks into viewer state."""
+    matrix_xyz, fixed_landmarks_xyz, moving_landmarks_xyz = read_transform_json(
+        input_path
+    )
+
+    # Convert to ZYX for neuroglancer
+    matrix = matrix_swap_xyz_zyx(matrix_xyz)
+    fixed_landmarks = points_swap_xyz_zyx(fixed_landmarks_xyz)
+    moving_landmarks = points_swap_xyz_zyx(moving_landmarks_xyz)
+
+    set_current_transform(viewer_state, matrix)
+
+    # Load landmarks into layers if viewer state is provided and landmarks exist
+    if fixed_landmarks:
+        # Create fixed points layer
+        viewer_state.layers.append(
+            name="fixed_points",
+            layer=neuroglancer.LocalAnnotationLayer(
+                dimensions=UNITLESS_DIMENSIONS,
+                shader=GREEN_POINTS_SHADER,
+            ),
+            visible=True,
+        )
+        # Add points
+        for i, point in enumerate(fixed_landmarks):
+            viewer_state.layers["fixed_points"].layer.annotations.append(
+                neuroglancer.PointAnnotation(point=point, id=f"fixed_point_{i+1}")
+            )
+
+    if moving_landmarks:
+        # Create moving points layer
+        viewer_state.layers.append(
+            name="moving_points",
+            layer=neuroglancer.LocalAnnotationLayer(
+                dimensions=UNITLESS_DIMENSIONS,
+                shader=MAGENTA_POINTS_SHADER,
+            ),
+            visible=True,
+        )
+        # Add points
+        for i, point in enumerate(moving_landmarks):
+            viewer_state.layers["moving_points"].layer.annotations.append(
+                neuroglancer.PointAnnotation(point=point, id=f"moving_point_{i+1}")
+            )
+
+
+def save_transform(
+    state: neuroglancer.ViewerState, output_path: str, fixed_volume_path: str
+) -> None:
+    """Save the current transform and landmarks to a JSON file."""
+    # Get current transform (in ZYX coordinates)
+    matrix = get_current_transform(state)
+
+    # Get points from layers if they exist
+    fixed_landmarks = []
+    moving_landmarks = []
+
+    if "fixed_points" in state.layers:
+        fixed_annotations = state.layers["fixed_points"].layer.annotations
+        fixed_landmarks = [list(ann.point) for ann in fixed_annotations]
+
+    if "moving_points" in state.layers:
+        moving_annotations = state.layers["moving_points"].layer.annotations
+        moving_landmarks = [list(ann.point) for ann in moving_annotations]
+
+    # Convert to XYZ coordinates for the schema
+    xyz_matrix = matrix_swap_xyz_zyx(matrix)
+    xyz_moving_landmarks = points_swap_xyz_zyx(moving_landmarks)
+    xyz_fixed_landmarks = points_swap_xyz_zyx(fixed_landmarks)
+
+    write_transform_json(
+        output_path,
+        Path(fixed_volume_path).name,
+        xyz_matrix,
+        xyz_fixed_landmarks,
+        xyz_moving_landmarks,
+    )
 
 
 def get_current_transform(state: neuroglancer.ViewerState) -> np.ndarray:
@@ -442,7 +520,7 @@ def write_current_transform(_):
             print("To save to file, use --output-transform <path>")
         else:
             print(f"Writing transform to {args.output_transform}")
-            write_transform_to_file(transform, args.output_transform)
+            save_transform(state, args.output_transform, args.fixed)
 
         # In either case print the state URL
         print(
@@ -514,8 +592,7 @@ def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
 def set_initial_transform(viewer: neuroglancer.Viewer, initial_transform: str) -> None:
     if initial_transform is not None:
         with viewer.txn() as state:
-            matrix = read_transform_from_file(initial_transform)
-            set_current_transform(state, matrix)
+            load_transform(state, initial_transform)
 
 
 if __name__ == "__main__":
@@ -559,6 +636,14 @@ if __name__ == "__main__":
             f"Running in non-interactive mode. Use `python -i {Path(__file__).name}` to run in interactive mode (required for neuroglancer)."
         )
         sys.exit(1)
+
+    if args.output_transform is not None:
+        if not args.output_transform.endswith(".json"):
+            raise ValueError("Output transform path must end with .json")
+        if not Path(args.output_transform).parent.exists():
+            raise ValueError(
+                f"Output transform path {args.output_transform} does not exist"
+            )
 
     fixed_dimensions = get_volume_dimensions(args.fixed, args.fixed_voxel_size)
     moving_dimensions = get_volume_dimensions(args.moving, args.moving_voxel_size)

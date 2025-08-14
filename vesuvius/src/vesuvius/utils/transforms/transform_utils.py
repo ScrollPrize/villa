@@ -3,11 +3,11 @@ from pathlib import Path
 from typing import Optional, NamedTuple
 from urllib.parse import urljoin, urlparse
 
+import jsonschema
 import numpy as np
 import requests
-import zarr
 import SimpleITK as sitk
-
+import zarr
 
 ############ TODO REMOVE AND FIX ON SERVER SIDE ############
 import fsspec
@@ -209,7 +209,7 @@ def invert_affine_matrix(matrix: np.ndarray) -> np.ndarray:
     return np.linalg.inv(matrix)
 
 
-def matrix_swap_between_xyz_and_zyx(matrix: np.ndarray) -> np.ndarray:
+def matrix_swap_xyz_zyx(matrix: np.ndarray) -> np.ndarray:
     """
     Swap a 4x4 affine transform matrix between neuroglancer (ZYX order) and SITK (XYZ order).
     """
@@ -227,6 +227,11 @@ def matrix_swap_between_xyz_and_zyx(matrix: np.ndarray) -> np.ndarray:
     output_matrix = reorder_matrix @ matrix @ reorder_matrix.T
 
     return output_matrix
+
+
+def points_swap_xyz_zyx(points: list) -> list:
+    """Swap points between neuroglancer (ZYX order) and SITK (XYZ order)."""
+    return [[point[2], point[1], point[0]] for point in points]
 
 
 def fit_affine_transform_from_points(fixed_points, moving_points):
@@ -302,3 +307,55 @@ def check_images_with_transform(
         raise ValueError(
             "No overlap detected! Images are too far apart for registration."
         )
+
+
+def read_transform_json(input_path: str) -> tuple[np.ndarray, list, list]:
+    """Read transform and landmarks from JSON file."""
+    # Load the schema
+    schema_path = Path(__file__).parent / "transform_schema.json"
+    with open(schema_path, "r") as f:
+        schema = json.load(f)
+
+    # Load and validate the data
+    with open(input_path, "r") as f:
+        data = json.load(f)
+
+    # Validate against schema
+    try:
+        jsonschema.validate(data, schema)
+    except jsonschema.ValidationError as e:
+        raise ValueError(f"JSON file does not match schema: {e.message}")
+
+    matrix = np.array(data["transformation_matrix"])
+    matrix = np.vstack([matrix, [0, 0, 0, 1]])  # Add homogeneous row
+
+    return matrix, data["fixed_landmarks"], data["moving_landmarks"]
+
+
+def write_transform_json(
+    output_path: str,
+    fixed_volume: str,
+    matrix: np.ndarray,
+    fixed_landmarks: list,
+    moving_landmarks: list,
+) -> None:
+    """Write transform and landmarks to JSON file in the schema format."""
+    # Convert numpy types to native Python types for JSON serialization
+    matrix_list = matrix[:-1, :].tolist()  # Remove homogeneous row and convert to list
+    fixed_landmarks_list = [
+        [float(coord) for coord in point] for point in fixed_landmarks
+    ]
+    moving_landmarks_list = [
+        [float(coord) for coord in point] for point in moving_landmarks
+    ]
+
+    data = {
+        "schema_version": "1.0.0",
+        "fixed_volume": fixed_volume,
+        "transformation_matrix": matrix_list,
+        "fixed_landmarks": fixed_landmarks_list,
+        "moving_landmarks": moving_landmarks_list,
+    }
+
+    with open(output_path, "w") as f:
+        json.dump(data, f, indent=2)
