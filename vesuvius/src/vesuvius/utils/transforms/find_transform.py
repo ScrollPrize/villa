@@ -301,6 +301,10 @@ def set_current_transform(
     transform = transform[:-1, :]
     state.layers["moving"].layer.source[0].transform.matrix = transform
 
+    # Also update moving_points layer if it exists
+    if "moving_points" in state.layers:
+        state.layers["moving_points"].layer.source[0].transform.matrix = transform
+
 
 def add_point(action_state, point_type):
     """Add a point to the specified points layer at the current mouse position."""
@@ -343,7 +347,7 @@ def add_point(action_state, point_type):
             layer_name = "moving_points"
             shader = MAGENTA_POINTS_SHADER
             point_id = f"moving_point_{len(moving_points)}"
-            display_point = fixed_space_point  # Display in fixed space
+            display_point = stored_point  # Store in moving space coordinates
 
         else:
             raise ValueError(f"Unknown point type: {point_type}")
@@ -358,6 +362,10 @@ def add_point(action_state, point_type):
                 ),
                 visible=True,
             )
+            # For moving points layer, apply the current transform immediately
+            if point_type == "moving":
+                current_transform = get_current_transform(state)
+                set_current_transform(state, current_transform)
 
         # Add annotation to the layer
         state.layers[layer_name].layer.annotations.append(
