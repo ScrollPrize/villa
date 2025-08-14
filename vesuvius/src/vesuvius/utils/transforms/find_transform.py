@@ -54,7 +54,7 @@ UNITLESS_DIMENSIONS = neuroglancer.CoordinateSpace(
 )
 
 
-def add_moving_and_fixed_layers(
+def init_volume_layers(
     viewer: neuroglancer.Viewer,
     fixed_path: str,
     moving_path: str,
@@ -402,7 +402,9 @@ def add_point(action_state, point_type):
             layer_name = "fixed_points"
             shader = GREEN_POINTS_SHADER
             # Get current number of points in layer for ID
-            if layer_name in state.layers:
+            if layer_name in state.layers and hasattr(
+                state.layers[layer_name].layer, "annotations"
+            ):
                 num_points = len(state.layers[layer_name].layer.annotations)
             else:
                 num_points = 0
@@ -424,7 +426,9 @@ def add_point(action_state, point_type):
             layer_name = "moving_points"
             shader = MAGENTA_POINTS_SHADER
             # Get current number of points in layer for ID
-            if layer_name in state.layers:
+            if layer_name in state.layers and hasattr(
+                state.layers[layer_name].layer, "annotations"
+            ):
                 num_points = len(state.layers[layer_name].layer.annotations)
             else:
                 num_points = 0
@@ -434,7 +438,7 @@ def add_point(action_state, point_type):
         else:
             raise ValueError(f"Unknown point type: {point_type}")
 
-        # Create the layer if it doesn't exist
+        # Make the layer if it does not exist
         if layer_name not in state.layers:
             state.layers.append(
                 name=layer_name,
@@ -442,10 +446,13 @@ def add_point(action_state, point_type):
                     dimensions=UNITLESS_DIMENSIONS,
                     shader=shader,
                 ),
-                visible=True,
             )
-            # For moving points layer, apply the current transform immediately
-            if point_type == "moving":
+
+            # For moving points layer, apply the current transform when adding first point
+            if (
+                point_type == "moving"
+                and len(state.layers[layer_name].layer.annotations) == 0
+            ):
                 current_transform = get_current_transform(state)
                 set_current_transform(state, current_transform)
 
@@ -454,12 +461,7 @@ def add_point(action_state, point_type):
             neuroglancer.PointAnnotation(point=display_point, id=point_id)
         )
 
-        if point_type == "fixed":
-            print(f"Added fixed point at: {stored_point}")
-        else:
-            print(
-                f"Added moving point at: {stored_point} (fixed space: {fixed_space_point})"
-            )
+        print(f"Added {point_type} point at: {display_point}")
 
         # Check if we can fit a transform automatically
         if "fixed_points" in state.layers and "moving_points" in state.layers:
@@ -653,7 +655,7 @@ if __name__ == "__main__":
 
     add_actions_and_keybinds(viewer)
 
-    add_moving_and_fixed_layers(viewer, args.fixed, args.moving, scale_factor)
+    init_volume_layers(viewer, args.fixed, args.moving, scale_factor)
 
     set_initial_transform(viewer, args.initial_transform)
 
