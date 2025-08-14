@@ -49,10 +49,6 @@ UNITLESS_DIMENSIONS = neuroglancer.CoordinateSpace(
     scales=[1, 1, 1],
 )
 
-# Global lists to store points in their respective volume coordinates
-fixed_points = []
-moving_points = []
-
 
 def add_moving_and_fixed_layers(
     viewer: neuroglancer.Viewer,
@@ -325,10 +321,14 @@ def add_point(action_state, point_type):
         if point_type == "fixed":
             # Store in fixed space
             stored_point = fixed_space_point.copy()
-            fixed_points.append(stored_point)
             layer_name = "fixed_points"
             shader = GREEN_POINTS_SHADER
-            point_id = f"fixed_point_{len(fixed_points)}"
+            # Get current number of points in layer for ID
+            if layer_name in state.layers:
+                num_points = len(state.layers[layer_name].layer.annotations)
+            else:
+                num_points = 0
+            point_id = f"fixed_point_{num_points + 1}"
             display_point = fixed_space_point
 
         elif point_type == "moving":
@@ -343,10 +343,14 @@ def add_point(action_state, point_type):
                 float(moving_point_homogeneous[1]),
                 float(moving_point_homogeneous[2]),
             ]
-            moving_points.append(stored_point)
             layer_name = "moving_points"
             shader = MAGENTA_POINTS_SHADER
-            point_id = f"moving_point_{len(moving_points)}"
+            # Get current number of points in layer for ID
+            if layer_name in state.layers:
+                num_points = len(state.layers[layer_name].layer.annotations)
+            else:
+                num_points = 0
+            point_id = f"moving_point_{num_points + 1}"
             display_point = stored_point  # Store in moving space coordinates
 
         else:
@@ -380,15 +384,26 @@ def add_point(action_state, point_type):
             )
 
         # Check if we can fit a transform automatically
-        if len(fixed_points) == len(moving_points) and len(fixed_points) >= 4:
-            fitted_transform = fit_affine_transform_from_points(
-                fixed_points, moving_points
-            )
-            if fitted_transform is not None:
-                set_current_transform(state, fitted_transform)
-                print(
-                    f"Automatically updated transform from {len(fixed_points)} point pairs"
+        if "fixed_points" in state.layers and "moving_points" in state.layers:
+            fixed_annotations = state.layers["fixed_points"].layer.annotations
+            moving_annotations = state.layers["moving_points"].layer.annotations
+
+            if (
+                len(fixed_annotations) == len(moving_annotations)
+                and len(fixed_annotations) >= 4
+            ):
+                # Extract point coordinates from annotations
+                fixed_points_list = [list(ann.point) for ann in fixed_annotations]
+                moving_points_list = [list(ann.point) for ann in moving_annotations]
+
+                fitted_transform = fit_affine_transform_from_points(
+                    fixed_points_list, moving_points_list
                 )
+                if fitted_transform is not None:
+                    set_current_transform(state, fitted_transform)
+                    print(
+                        f"Automatically updated transform from {len(fixed_annotations)} point pairs"
+                    )
 
 
 def add_fixed_point(action_state):
