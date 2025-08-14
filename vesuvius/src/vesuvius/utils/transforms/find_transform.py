@@ -7,6 +7,7 @@ import webbrowser
 
 import neuroglancer
 import numpy as np
+import time
 
 from registration import align_zarrs
 from transform_utils import (
@@ -564,6 +565,9 @@ def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
 
 
 def set_initial_transform(viewer: neuroglancer.Viewer, initial_transform: str) -> None:
+    # Wait a second to make sure the viewer is ready
+    time.sleep(1)
+
     if initial_transform is not None:
         with viewer.txn() as state:
             load_transform(state, initial_transform)
@@ -629,6 +633,6 @@ if __name__ == "__main__":
 
     init_volume_layers(viewer, args.fixed, args.moving, scale_factor)
 
-    set_initial_transform(viewer, args.initial_transform)
-
     webbrowser.open_new(viewer.get_viewer_url())
+
+    set_initial_transform(viewer, args.initial_transform)
