@@ -292,38 +292,12 @@ def load_transform(viewer_state: neuroglancer.ViewerState, input_path: str) -> N
 
     set_current_transform(viewer_state, matrix)
 
-    # Load landmarks into layers if viewer state is provided and landmarks exist
-    if fixed_landmarks:
-        # Create fixed points layer
-        viewer_state.layers.append(
-            name="fixed_points",
-            layer=neuroglancer.LocalAnnotationLayer(
-                dimensions=UNITLESS_DIMENSIONS,
-                shader=GREEN_POINTS_SHADER,
-            ),
-            visible=True,
-        )
-        # Add points
-        for i, point in enumerate(fixed_landmarks):
-            viewer_state.layers["fixed_points"].layer.annotations.append(
-                neuroglancer.PointAnnotation(point=point, id=f"fixed_point_{i+1}")
-            )
+    # Load landmarks into layers using the same logic as interactive point adding
+    for point in fixed_landmarks:
+        add_point_from_coords(viewer_state, point, "fixed")
 
-    if moving_landmarks:
-        # Create moving points layer
-        viewer_state.layers.append(
-            name="moving_points",
-            layer=neuroglancer.LocalAnnotationLayer(
-                dimensions=UNITLESS_DIMENSIONS,
-                shader=MAGENTA_POINTS_SHADER,
-            ),
-            visible=True,
-        )
-        # Add points
-        for i, point in enumerate(moving_landmarks):
-            viewer_state.layers["moving_points"].layer.annotations.append(
-                neuroglancer.PointAnnotation(point=point, id=f"moving_point_{i+1}")
-            )
+    for point in moving_landmarks:
+        add_point_from_coords(viewer_state, point, "moving")
 
 
 def save_transform(
@@ -380,6 +354,72 @@ def set_current_transform(
         state.layers["moving_points"].layer.source[0].transform.matrix = transform
 
 
+def add_point_from_coords(state: neuroglancer.ViewerState, point_coords, point_type):
+    """Add a point to the specified points layer from given coordinates."""
+    # For loading from JSON, we already have the coordinates in the right space
+    if point_type == "fixed":
+        layer_name = "fixed_points"
+        shader = GREEN_POINTS_SHADER
+    elif point_type == "moving":
+        layer_name = "moving_points"
+        shader = MAGENTA_POINTS_SHADER
+    else:
+        raise ValueError(f"Unknown point type: {point_type}")
+
+    # Get current number of points in layer for ID
+    if layer_name in state.layers:
+        num_points = len(state.layers[layer_name].layer.annotations)
+    else:
+        num_points = 0
+    point_id = f"{point_type}_point_{num_points + 1}"
+
+    # Make the layer if it does not exist
+    if layer_name not in state.layers:
+        state.layers.append(
+            name=layer_name,
+            layer=neuroglancer.LocalAnnotationLayer(
+                dimensions=UNITLESS_DIMENSIONS,
+                shader=shader,
+            ),
+        )
+
+        # For moving points layer, apply the current transform when adding first point
+        # (to have the moving points render in the correct position)
+        if (
+            point_type == "moving"
+            and len(state.layers[layer_name].layer.annotations) == 0
+        ):
+            current_transform = get_current_transform(state)
+            set_current_transform(state, current_transform)
+
+    # Add annotation to the layer
+    state.layers[layer_name].layer.annotations.append(
+        neuroglancer.PointAnnotation(point=point_coords, id=point_id)
+    )
+
+    # Check if we can fit a transform automatically
+    if "fixed_points" in state.layers and "moving_points" in state.layers:
+        fixed_annotations = state.layers["fixed_points"].layer.annotations
+        moving_annotations = state.layers["moving_points"].layer.annotations
+
+        if (
+            len(fixed_annotations) == len(moving_annotations)
+            and len(fixed_annotations) >= 4
+        ):
+            # Extract point coordinates from annotations
+            fixed_points_list = [list(ann.point) for ann in fixed_annotations]
+            moving_points_list = [list(ann.point) for ann in moving_annotations]
+
+            transform = fit_affine_transform_from_points(
+                fixed_points_list, moving_points_list
+            )
+            if transform is not None:
+                set_current_transform(state, transform)
+                print(
+                    f"Automatically updated transform from {len(fixed_annotations)} point pairs"
+                )
+
+
 def add_point(action_state, point_type):
     """Add a point to the specified points layer at the current mouse position."""
     with viewer.txn() as state:
@@ -396,21 +436,11 @@ def add_point(action_state, point_type):
             float(mouse_position[2]),
         ]
 
+        print(f"Adding {point_type} point at {fixed_space_point}")
+
         if point_type == "fixed":
             # Store in fixed space
-            stored_point = fixed_space_point.copy()
-            layer_name = "fixed_points"
-            shader = GREEN_POINTS_SHADER
-            # Get current number of points in layer for ID
-            if layer_name in state.layers and hasattr(
-                state.layers[layer_name].layer, "annotations"
-            ):
-                num_points = len(state.layers[layer_name].layer.annotations)
-            else:
-                num_points = 0
-            point_id = f"fixed_point_{num_points + 1}"
-            display_point = fixed_space_point
-
+            add_point_from_coords(state, fixed_space_point, "fixed")
         elif point_type == "moving":
             # Transform to moving space for storage
             fixed_point_homogeneous = np.array([*fixed_space_point, 1.0])
@@ -418,72 +448,14 @@ def add_point(action_state, point_type):
             inverse_transform = invert_affine_matrix(current_transform)
             moving_point_homogeneous = inverse_transform @ fixed_point_homogeneous
 
-            stored_point = [
+            moving_space_point = [
                 float(moving_point_homogeneous[0]),
                 float(moving_point_homogeneous[1]),
                 float(moving_point_homogeneous[2]),
             ]
-            layer_name = "moving_points"
-            shader = MAGENTA_POINTS_SHADER
-            # Get current number of points in layer for ID
-            if layer_name in state.layers and hasattr(
-                state.layers[layer_name].layer, "annotations"
-            ):
-                num_points = len(state.layers[layer_name].layer.annotations)
-            else:
-                num_points = 0
-            point_id = f"moving_point_{num_points + 1}"
-            display_point = stored_point  # Store in moving space coordinates
-
+            add_point_from_coords(state, moving_space_point, "moving")
         else:
             raise ValueError(f"Unknown point type: {point_type}")
-
-        # Make the layer if it does not exist
-        if layer_name not in state.layers:
-            state.layers.append(
-                name=layer_name,
-                layer=neuroglancer.LocalAnnotationLayer(
-                    dimensions=UNITLESS_DIMENSIONS,
-                    shader=shader,
-                ),
-            )
-
-            # For moving points layer, apply the current transform when adding first point
-            if (
-                point_type == "moving"
-                and len(state.layers[layer_name].layer.annotations) == 0
-            ):
-                current_transform = get_current_transform(state)
-                set_current_transform(state, current_transform)
-
-        # Add annotation to the layer
-        state.layers[layer_name].layer.annotations.append(
-            neuroglancer.PointAnnotation(point=display_point, id=point_id)
-        )
-
-        print(f"Added {point_type} point at: {display_point}")
-
-        # Check if we can fit a transform automatically
-        if "fixed_points" in state.layers and "moving_points" in state.layers:
-            fixed_annotations = state.layers["fixed_points"].layer.annotations
-            moving_annotations = state.layers["moving_points"].layer.annotations
-
-            if (
-                len(fixed_annotations) == len(moving_annotations)
-                and len(fixed_annotations) >= 4
-            ):
-                # Extract point coordinates from annotations
-                fixed_points_list = [list(ann.point) for ann in fixed_annotations]
-                moving_points_list = [list(ann.point) for ann in moving_annotations]
-
-                fitted_transform = fit_affine_transform_from_points(
-                    fixed_points_list, moving_points_list
-                )
-                if fitted_transform is not None:
-                    set_current_transform(state, fitted_transform)
-                    print(
-                        f"Automatically updated transform from {len(fixed_annotations)} point pairs"
-                    )
 
 
 def add_fixed_point(action_state):
