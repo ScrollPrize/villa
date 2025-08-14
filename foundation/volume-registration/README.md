@@ -71,6 +71,12 @@ After there are 4+ pairs of landmark points, the transform is automatically fit 
 
 - `Alt + [` - Navigate to previous fixed point
 - `Alt + ]` - Navigate to next fixed point
+- `Alt + Shift + j` - Perturb fixed point +X
+- `Alt + Shift + u` - Perturb fixed point -X
+- `Alt + Shift + k` - Perturb fixed point +Y
+- `Alt + Shift + i` - Perturb fixed point -Y
+- `Alt + Shift + l` - Perturb fixed point +Z
+- `Alt + Shift + o` - Perturb fixed point -Z
 
 #### Automatically refining the transform
 > **_NOTE:_**  Not particularly recommended, as the current implementation uses low-resolution levels of the Zarr input volumes, and does not result in precise transforms.

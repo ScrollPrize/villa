@@ -416,29 +416,7 @@ def add_point_from_coords(state: neuroglancer.ViewerState, point_coords, point_t
     )
 
     # Check if we can fit a transform automatically
-    if (
-        FIXED_POINTS_LAYER_STR in state.layers
-        and MOVING_POINTS_LAYER_STR in state.layers
-    ):
-        fixed_annotations = state.layers[FIXED_POINTS_LAYER_STR].layer.annotations
-        moving_annotations = state.layers[MOVING_POINTS_LAYER_STR].layer.annotations
-
-        if (
-            len(fixed_annotations) == len(moving_annotations)
-            and len(fixed_annotations) >= 4
-        ):
-            # Extract point coordinates from annotations
-            fixed_points_list = [list(ann.point) for ann in fixed_annotations]
-            moving_points_list = [list(ann.point) for ann in moving_annotations]
-
-            transform = fit_affine_transform_from_points(
-                fixed_points_list, moving_points_list
-            )
-            if transform is not None:
-                set_current_transform(state, transform)
-                print(
-                    f"Automatically updated transform from {len(fixed_annotations)} point pairs"
-                )
+    update_transform_if_sufficient_points(state)
 
 
 def add_point(action_state, point_type):
@@ -621,6 +599,35 @@ def navigate_to_next_fixed_point(action_state):
     navigate_to_fixed_point(action_state, "next")
 
 
+def update_transform_if_sufficient_points(state):
+    """Update transform if there are 4+ matching point pairs."""
+    if (
+        FIXED_POINTS_LAYER_STR in state.layers
+        and MOVING_POINTS_LAYER_STR in state.layers
+    ):
+        fixed_annotations = state.layers[FIXED_POINTS_LAYER_STR].layer.annotations
+        moving_annotations = state.layers[MOVING_POINTS_LAYER_STR].layer.annotations
+
+        if (
+            len(fixed_annotations) == len(moving_annotations)
+            and len(fixed_annotations) >= 4
+        ):
+            # Extract point coordinates from annotations
+            fixed_points_list = [list(ann.point) for ann in fixed_annotations]
+            moving_points_list = [list(ann.point) for ann in moving_annotations]
+
+            transform = fit_affine_transform_from_points(
+                fixed_points_list, moving_points_list
+            )
+            if transform is not None:
+                set_current_transform(state, transform)
+                print(
+                    f"Automatically updated transform from {len(fixed_annotations)} point pairs"
+                )
+                return True
+    return False
+
+
 def renumber_point_ids(state, point_type):
     """Renumber point IDs to keep them sequential after deletion."""
     if point_type == "fixed":
@@ -636,6 +643,57 @@ def renumber_point_ids(state, point_type):
     annotations = state.layers[layer_name].layer.annotations
     for i, ann in enumerate(annotations):
         ann.id = f"{prefix}_{i + 1}"
+
+
+def perturb_nearest_fixed_point(action_state, axis, amount):
+    """Perturb the nearest fixed point by the given amount along the specified axis."""
+    with viewer.txn() as state:
+        # Get current cursor position
+        current_position = action_state.mouse_voxel_coordinates
+        if current_position is None:
+            # Fallback to viewer position if mouse position is not available
+            current_position = state.position
+
+        # Find nearest fixed point
+        nearest_index, distance, _ = find_nearest_point(
+            current_position, state, "fixed"
+        )
+
+        if nearest_index is None:
+            print("No fixed points available to perturb")
+            return
+
+        # Get the fixed point annotation
+        fixed_annotations = state.layers[FIXED_POINTS_LAYER_STR].layer.annotations
+        point_annotation = fixed_annotations[nearest_index]
+
+        # Update the point coordinates
+        current_point = list(point_annotation.point)
+        if axis == "x":
+            current_point[2] += amount  # X is index 2 in ZYX
+        elif axis == "y":
+            current_point[1] += amount  # Y is index 1 in ZYX
+        elif axis == "z":
+            current_point[0] += amount  # Z is index 0 in ZYX
+
+        point_annotation.point = current_point
+
+        print(
+            f"Perturbed fixed point {point_annotation.id} by {amount} along {axis}-axis"
+        )
+        print(f"New position: {current_point}")
+
+        # Update transform if sufficient points exist
+        update_transform_if_sufficient_points(state)
+
+
+def _make_point_perturber(axis: str, amount: float):
+    """Create a function that perturbs the nearest fixed point along the given axis."""
+
+    def handler(action_state):
+        perturb_nearest_fixed_point(action_state, axis, amount)
+
+    return handler
 
 
 def delete_nearest_point(action_state):
@@ -674,30 +732,8 @@ def delete_nearest_point(action_state):
         )
         print(f"Distance from cursor: {distance:.2f}")
 
-        # If we deleted a point and there are still 4+ pairs, refit the transform
-        if (
-            FIXED_POINTS_LAYER_STR in state.layers
-            and MOVING_POINTS_LAYER_STR in state.layers
-        ):
-            fixed_annotations = state.layers[FIXED_POINTS_LAYER_STR].layer.annotations
-            moving_annotations = state.layers[MOVING_POINTS_LAYER_STR].layer.annotations
-
-            if (
-                len(fixed_annotations) == len(moving_annotations)
-                and len(fixed_annotations) >= 4
-            ):
-                # Extract point coordinates from annotations
-                fixed_points_list = [list(ann.point) for ann in fixed_annotations]
-                moving_points_list = [list(ann.point) for ann in moving_annotations]
-
-                transform = fit_affine_transform_from_points(
-                    fixed_points_list, moving_points_list
-                )
-                if transform is not None:
-                    set_current_transform(state, transform)
-                    print(
-                        f"Automatically updated transform from {len(fixed_annotations)} point pairs"
-                    )
+        # Update transform if sufficient points remain
+        update_transform_if_sufficient_points(state)
 
 
 def write_current_transform(_):
@@ -740,6 +776,12 @@ def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
     viewer.actions.add("trans-y-minus-small", _make_translator("y", -TRANSLATE_STEP))
     viewer.actions.add("trans-z-plus-small", _make_translator("z", TRANSLATE_STEP))
     viewer.actions.add("trans-z-minus-small", _make_translator("z", -TRANSLATE_STEP))
+    viewer.actions.add("perturb-fixed-point-x-plus", _make_point_perturber("x", 1))
+    viewer.actions.add("perturb-fixed-point-x-minus", _make_point_perturber("x", -1))
+    viewer.actions.add("perturb-fixed-point-y-plus", _make_point_perturber("y", 1))
+    viewer.actions.add("perturb-fixed-point-y-minus", _make_point_perturber("y", -1))
+    viewer.actions.add("perturb-fixed-point-z-plus", _make_point_perturber("z", 1))
+    viewer.actions.add("perturb-fixed-point-z-minus", _make_point_perturber("z", -1))
 
     with viewer.config_state.txn() as s:
         s.input_event_bindings.viewer["keyc"] = "toggle-color"
@@ -769,6 +811,12 @@ def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
         s.input_event_bindings.viewer["alt+keyi"] = "trans-y-minus-small"
         s.input_event_bindings.viewer["alt+keyl"] = "trans-z-plus-small"
         s.input_event_bindings.viewer["alt+keyo"] = "trans-z-minus-small"
+        s.input_event_bindings.viewer["alt+shift+keyj"] = "perturb-fixed-point-x-plus"
+        s.input_event_bindings.viewer["alt+shift+keyu"] = "perturb-fixed-point-x-minus"
+        s.input_event_bindings.viewer["alt+shift+keyk"] = "perturb-fixed-point-y-plus"
+        s.input_event_bindings.viewer["alt+shift+keyi"] = "perturb-fixed-point-y-minus"
+        s.input_event_bindings.viewer["alt+shift+keyl"] = "perturb-fixed-point-z-plus"
+        s.input_event_bindings.viewer["alt+shift+keyo"] = "perturb-fixed-point-z-minus"
         s.input_event_bindings.viewer["alt+bracketleft"] = "previous-fixed-point"
         s.input_event_bindings.viewer["alt+bracketright"] = "next-fixed-point"
 
