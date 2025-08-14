@@ -35,27 +35,27 @@ Typically one finds a transform by following these steps (details below):
 
 #### Visualization
 
-- `Alt + c` - Toggle volume color
+- `c` - Toggle volume color
 
 #### Coarse initial alignment
 
 First one roughly positions the moving volume using the following commands:
 
-- `Alt + a` - Rotate -X
-- `Alt + q` - Rotate +X
-- `Alt + s` - Rotate -Y
-- `Alt + w` - Rotate +Y
-- `Alt + d` - Rotate -Z
-- `Alt + e` - Rotate +Z
+- `Alt + a` - Rotate +X
+- `Alt + q` - Rotate -X
+- `Alt + s` - Rotate +Y
+- `Alt + w` - Rotate -Y
+- `Alt + d` - Rotate +Z
+- `Alt + e` - Rotate -Z
 - `Alt + f` - Flip X
 - `Alt + g` - Flip Y
 - `Alt + h` - Flip Z
-- `Alt + j` - Translate -X
-- `Alt + u` - Translate +X
-- `Alt + k` - Translate -Y
-- `Alt + i` - Translate +Y
-- `Alt + l` - Translate -Z
-- `Alt + o` - Translate +Z
+- `Alt + j` - Translate +X
+- `Alt + u` - Translate -X
+- `Alt + k` - Translate +Y
+- `Alt + i` - Translate -Y
+- `Alt + l` - Translate +Z
+- `Alt + o` - Translate -Z
 
 #### Adding landmark points
 
@@ -65,6 +65,7 @@ After there are 4+ pairs of landmark points, the transform is automatically fit 
 
 - `Alt + 1` - Add landmark point to fixed volume at cursor position
 - `Alt + 2` - Add landmark point to moving volume at cursor position
+- `Alt + x` - Delete nearest landmark point
 
 #### Refining landmark points
 
@@ -77,8 +78,8 @@ After there are 4+ pairs of landmark points, the transform is automatically fit 
 The transform can be automatically refined using image registration via SimpleITK.
 The registration method uses the lower resolution Zarr levels and the Mattes mutual information metric to register the volumes.
 
-- `Alt + f` - Fit the transform to the landmark points using SimpleITK
+- `f` - Fit the transform to the landmark points using SimpleITK
 
 #### Saving the transform
 
-- `Alt + w` - Write the current transform to the output file
+- `w` - Write the current transform to the output file

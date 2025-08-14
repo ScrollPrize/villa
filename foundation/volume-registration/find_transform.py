@@ -581,6 +581,136 @@ def navigate_to_next_fixed_point(action_state):
     navigate_to_fixed_point(action_state, "next")
 
 
+def find_nearest_point_any_type(current_position, state):
+    """Find the nearest point (fixed or moving) to the current cursor position.
+
+    Returns: (point_type, point_index, distance) where point_type is 'fixed' or 'moving'
+    """
+    min_distance = float("inf")
+    nearest_point_type = None
+    nearest_index = None
+
+    # Check fixed points
+    if FIXED_POINTS_LAYER_STR in state.layers:
+        fixed_annotations = state.layers[FIXED_POINTS_LAYER_STR].layer.annotations
+        for i, ann in enumerate(fixed_annotations):
+            point = list(ann.point)
+            distance = np.sqrt(
+                (current_position[0] - point[0]) ** 2
+                + (current_position[1] - point[1]) ** 2
+                + (current_position[2] - point[2]) ** 2
+            )
+            if distance < min_distance:
+                min_distance = distance
+                nearest_point_type = "fixed"
+                nearest_index = i
+
+    # Check moving points (transform to fixed coordinates first)
+    if MOVING_POINTS_LAYER_STR in state.layers:
+        moving_annotations = state.layers[MOVING_POINTS_LAYER_STR].layer.annotations
+        current_transform = get_current_transform(state)
+
+        for i, ann in enumerate(moving_annotations):
+            # Transform moving point to fixed coordinates
+            moving_point_homogeneous = np.array([*ann.point, 1.0])
+            fixed_point_homogeneous = current_transform @ moving_point_homogeneous
+            fixed_point = fixed_point_homogeneous[:3]
+
+            distance = np.sqrt(
+                (current_position[0] - fixed_point[0]) ** 2
+                + (current_position[1] - fixed_point[1]) ** 2
+                + (current_position[2] - fixed_point[2]) ** 2
+            )
+            if distance < min_distance:
+                min_distance = distance
+                nearest_point_type = "moving"
+                nearest_index = i
+
+    if nearest_point_type is None:
+        return None, None, None
+
+    return nearest_point_type, nearest_index, min_distance
+
+
+def renumber_point_ids(state, point_type):
+    """Renumber point IDs to keep them sequential after deletion."""
+    if point_type == "fixed":
+        layer_name = FIXED_POINTS_LAYER_STR
+        prefix = "fp"
+    else:
+        layer_name = MOVING_POINTS_LAYER_STR
+        prefix = "mp"
+
+    if layer_name not in state.layers:
+        return
+
+    annotations = state.layers[layer_name].layer.annotations
+    for i, ann in enumerate(annotations):
+        ann.id = f"{prefix}_{i + 1}"
+
+
+def delete_nearest_point(action_state):
+    """Delete the nearest point (fixed or moving) to the current cursor position."""
+    with viewer.txn() as state:
+        # Get current cursor position
+        current_position = action_state.mouse_voxel_coordinates
+        if current_position is None:
+            # Fallback to viewer position if mouse position is not available
+            current_position = state.position
+
+        # Find nearest point of any type
+        point_type, point_index, distance = find_nearest_point_any_type(
+            current_position, state
+        )
+
+        if point_type is None:
+            print("No points available to delete")
+            return
+
+        # Delete the point
+        if point_type == "fixed":
+            layer_name = FIXED_POINTS_LAYER_STR
+        else:
+            layer_name = MOVING_POINTS_LAYER_STR
+
+        annotations = state.layers[layer_name].layer.annotations
+        deleted_point = annotations[point_index]
+        del annotations[point_index]
+
+        # Renumber remaining points to keep IDs sequential
+        renumber_point_ids(state, point_type)
+
+        print(
+            f"Deleted {point_type} point {deleted_point.id} at {list(deleted_point.point)}"
+        )
+        print(f"Distance from cursor: {distance:.2f}")
+
+        # If we deleted a point and there are still 4+ pairs, refit the transform
+        if (
+            FIXED_POINTS_LAYER_STR in state.layers
+            and MOVING_POINTS_LAYER_STR in state.layers
+        ):
+            fixed_annotations = state.layers[FIXED_POINTS_LAYER_STR].layer.annotations
+            moving_annotations = state.layers[MOVING_POINTS_LAYER_STR].layer.annotations
+
+            if (
+                len(fixed_annotations) == len(moving_annotations)
+                and len(fixed_annotations) >= 4
+            ):
+                # Extract point coordinates from annotations
+                fixed_points_list = [list(ann.point) for ann in fixed_annotations]
+                moving_points_list = [list(ann.point) for ann in moving_annotations]
+
+                transform = fit_affine_transform_from_points(
+                    fixed_points_list, moving_points_list
+                )
+                if transform is not None:
+                    set_current_transform(state, transform)
+                    print(
+                        f"Automatically updated transform from {len(fixed_annotations)} point pairs"
+                    )
+
+
 def write_current_transform(_):
     """Write the current transform and print the shareable URL."""
     with viewer.txn() as state:
@@ -597,6 +727,7 @@ def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
     viewer.actions.add("fine-align", fine_align)
     viewer.actions.add("add-fixed-point", add_fixed_point)
     viewer.actions.add("add-moving-point", add_moving_point)
+    viewer.actions.add("delete-nearest-point", delete_nearest_point)
     viewer.actions.add("previous-fixed-point", navigate_to_previous_fixed_point)
     viewer.actions.add("next-fixed-point", navigate_to_next_fixed_point)
     viewer.actions.add("rot-x-plus-small", _make_rotator("x", SMALL_ROTATE_STEP))
@@ -622,9 +753,10 @@ def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
     viewer.actions.add("trans-z-minus-small", _make_translator("z", -TRANSLATE_STEP))
 
     with viewer.config_state.txn() as s:
-        s.input_event_bindings.viewer["alt+keyc"] = "toggle-color"
-        s.input_event_bindings.viewer["alt+keyw"] = "write-transform"
-        s.input_event_bindings.viewer["alt+keyf"] = "fine-align"
+        s.input_event_bindings.viewer["keyc"] = "toggle-color"
+        s.input_event_bindings.viewer["keyw"] = "write-transform"
+        s.input_event_bindings.viewer["keyf"] = "fine-align"
+        s.input_event_bindings.viewer["alt+keyx"] = "delete-nearest-point"
         s.input_event_bindings.viewer["alt+digit1"] = "add-fixed-point"
         s.input_event_bindings.viewer["alt+digit2"] = "add-moving-point"
         s.input_event_bindings.viewer["alt+keya"] = "rot-x-plus-small"
