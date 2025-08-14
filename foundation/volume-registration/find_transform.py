@@ -504,6 +504,83 @@ def fine_align(_):
         print("Alignment complete - transform updated")
 
 
+def find_nearest_fixed_point(current_position, fixed_points):
+    """Find the nearest fixed point to the current cursor position."""
+    if not fixed_points:
+        return None
+
+    min_distance = float("inf")
+    nearest_point = None
+
+    for point in fixed_points:
+        # Calculate Euclidean distance
+        distance = np.sqrt(
+            (current_position[0] - point[0]) ** 2
+            + (current_position[1] - point[1]) ** 2
+            + (current_position[2] - point[2]) ** 2
+        )
+        if distance < min_distance:
+            min_distance = distance
+            nearest_point = point
+
+    return nearest_point
+
+
+def navigate_to_fixed_point(action_state, direction):
+    """Navigate to the previous/next fixed point relative to current cursor position."""
+    with viewer.txn() as state:
+        # Get current cursor position
+        current_position = action_state.mouse_voxel_coordinates
+        if current_position is None:
+            # Fallback to viewer position if mouse position is not available
+            current_position = state.position
+
+        # Get all fixed points
+        if FIXED_POINTS_LAYER_STR not in state.layers:
+            print("No fixed points available")
+            return
+
+        fixed_annotations = state.layers[FIXED_POINTS_LAYER_STR].layer.annotations
+        if len(fixed_annotations) == 0:
+            print("No fixed points available")
+            return
+
+        fixed_points = [list(ann.point) for ann in fixed_annotations]
+
+        # Find nearest point to current position
+        nearest_point = find_nearest_fixed_point(current_position, fixed_points)
+        if nearest_point is None:
+            return
+
+        # Find index of nearest point
+        nearest_index = None
+        for i, point in enumerate(fixed_points):
+            if point == nearest_point:
+                nearest_index = i
+                break
+
+        # Calculate target index based on direction
+        if direction == "previous":
+            target_index = (nearest_index - 1) % len(fixed_points)
+        else:  # next
+            target_index = (nearest_index + 1) % len(fixed_points)
+
+        target_point = fixed_points[target_index]
+
+        # Navigate viewer to target point
+        state.position = target_point
+
+
+def navigate_to_previous_fixed_point(action_state):
+    """Navigate to the previous fixed point."""
+    navigate_to_fixed_point(action_state, "previous")
+
+
+def navigate_to_next_fixed_point(action_state):
+    """Navigate to the next fixed point."""
+    navigate_to_fixed_point(action_state, "next")
+
+
 def write_current_transform(_):
     """Write the current transform and print the shareable URL."""
     with viewer.txn() as state:
@@ -520,6 +597,8 @@ def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
     viewer.actions.add("fine-align", fine_align)
     viewer.actions.add("add-fixed-point", add_fixed_point)
     viewer.actions.add("add-moving-point", add_moving_point)
+    viewer.actions.add("previous-fixed-point", navigate_to_previous_fixed_point)
+    viewer.actions.add("next-fixed-point", navigate_to_next_fixed_point)
     viewer.actions.add("rot-x-plus-small", _make_rotator("x", SMALL_ROTATE_STEP))
     viewer.actions.add("rot-x-minus-small", _make_rotator("x", -SMALL_ROTATE_STEP))
     viewer.actions.add("rot-y-plus-small", _make_rotator("y", SMALL_ROTATE_STEP))
@@ -569,6 +648,8 @@ def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
         s.input_event_bindings.viewer["alt+keyi"] = "trans-y-minus-small"
         s.input_event_bindings.viewer["alt+keyl"] = "trans-z-plus-small"
         s.input_event_bindings.viewer["alt+keyo"] = "trans-z-minus-small"
+        s.input_event_bindings.viewer["alt+bracketleft"] = "previous-fixed-point"
+        s.input_event_bindings.viewer["alt+bracketright"] = "next-fixed-point"
 
 
 def set_initial_transform(viewer: neuroglancer.Viewer, initial_transform: str) -> None:

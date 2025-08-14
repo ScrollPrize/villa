@@ -62,6 +62,11 @@ After there are 4+ pairs of landmark points, the transform is automatically fit 
 - `Alt + 1` - Add landmark point to fixed volume at cursor position
 - `Alt + 2` - Add landmark point to moving volume at cursor position
 
+#### Refining landmark points
+
+- `Alt + [` - Navigate to previous fixed point
+- `Alt + ]` - Navigate to next fixed point
+
 #### Automatically refining the transform
 > **_NOTE:_**  Not particularly recommended, as the current implementation uses low-resolution levels of the Zarr input volumes, and does not result in precise transforms.
 
