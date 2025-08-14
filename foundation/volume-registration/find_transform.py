@@ -504,26 +504,75 @@ def fine_align(_):
         print("Alignment complete - transform updated")
 
 
-def find_nearest_fixed_point(current_position, fixed_points):
-    """Find the nearest fixed point to the current cursor position."""
-    if not fixed_points:
-        return None
+def find_nearest_point(current_position, state, point_type_filter=None):
+    """Find the nearest point to the current cursor position.
 
+    Args:
+        current_position: [x, y, z] coordinates to search from
+        state: neuroglancer viewer state
+        point_type_filter: Optional filter - "fixed", "moving", or None for any type
+
+    Returns:
+        For point_type_filter=None: (point_type, point_index, distance, point_coords)
+        For specific filter: (point_index, distance, point_coords) or (None, None, None)
+    """
     min_distance = float("inf")
-    nearest_point = None
+    nearest_point_type = None
+    nearest_index = None
+    nearest_coords = None
 
-    for point in fixed_points:
-        # Calculate Euclidean distance
-        distance = np.sqrt(
-            (current_position[0] - point[0]) ** 2
-            + (current_position[1] - point[1]) ** 2
-            + (current_position[2] - point[2]) ** 2
-        )
-        if distance < min_distance:
-            min_distance = distance
-            nearest_point = point
+    # Check fixed points
+    if (
+        point_type_filter is None or point_type_filter == "fixed"
+    ) and FIXED_POINTS_LAYER_STR in state.layers:
+        fixed_annotations = state.layers[FIXED_POINTS_LAYER_STR].layer.annotations
+        for i, ann in enumerate(fixed_annotations):
+            point = list(ann.point)
+            distance = np.sqrt(
+                (current_position[0] - point[0]) ** 2
+                + (current_position[1] - point[1]) ** 2
+                + (current_position[2] - point[2]) ** 2
+            )
+            if distance < min_distance:
+                min_distance = distance
+                nearest_point_type = "fixed"
+                nearest_index = i
+                nearest_coords = point
 
-    return nearest_point
+    # Check moving points (transform to fixed coordinates first)
+    if (
+        point_type_filter is None or point_type_filter == "moving"
+    ) and MOVING_POINTS_LAYER_STR in state.layers:
+        moving_annotations = state.layers[MOVING_POINTS_LAYER_STR].layer.annotations
+        current_transform = get_current_transform(state)
+
+        for i, ann in enumerate(moving_annotations):
+            # Transform moving point to fixed coordinates
+            moving_point_homogeneous = np.array([*ann.point, 1.0])
+            fixed_point_homogeneous = current_transform @ moving_point_homogeneous
+            fixed_point = fixed_point_homogeneous[:3]
+
+            distance = np.sqrt(
+                (current_position[0] - fixed_point[0]) ** 2
+                + (current_position[1] - fixed_point[1]) ** 2
+                + (current_position[2] - fixed_point[2]) ** 2
+            )
+            if distance < min_distance:
+                min_distance = distance
+                nearest_point_type = "moving"
+                nearest_index = i
+                nearest_coords = list(ann.point)  # Return original moving coordinates
+
+    if nearest_point_type is None:
+        if point_type_filter is None:
+            return None, None, None, None
+        else:
+            return None, None, None
+
+    if point_type_filter is None:
+        return nearest_point_type, nearest_index, min_distance, nearest_coords
+    else:
+        return nearest_index, min_distance, nearest_coords
 
 
 def navigate_to_fixed_point(action_state, direction):
@@ -545,27 +594,18 @@ def navigate_to_fixed_point(action_state, direction):
             print("No fixed points available")
             return
 
-        fixed_points = [list(ann.point) for ann in fixed_annotations]
-
-        # Find nearest point to current position
-        nearest_point = find_nearest_fixed_point(current_position, fixed_points)
-        if nearest_point is None:
+        # Find nearest fixed point to current position
+        nearest_index, _, _ = find_nearest_point(current_position, state, "fixed")
+        if nearest_index is None:
             return
-
-        # Find index of nearest point
-        nearest_index = None
-        for i, point in enumerate(fixed_points):
-            if point == nearest_point:
-                nearest_index = i
-                break
 
         # Calculate target index based on direction
         if direction == "previous":
-            target_index = (nearest_index - 1) % len(fixed_points)
+            target_index = (nearest_index - 1) % len(fixed_annotations)
         else:  # next
-            target_index = (nearest_index + 1) % len(fixed_points)
+            target_index = (nearest_index + 1) % len(fixed_annotations)
 
-        target_point = fixed_points[target_index]
+        target_point = list(fixed_annotations[target_index].point)
 
         # Navigate viewer to target point
         state.position = target_point
@@ -579,57 +619,6 @@ def navigate_to_previous_fixed_point(action_state):
 def navigate_to_next_fixed_point(action_state):
     """Navigate to the next fixed point."""
     navigate_to_fixed_point(action_state, "next")
-
-
-def find_nearest_point_any_type(current_position, state):
-    """Find the nearest point (fixed or moving) to the current cursor position.
-
-    Returns: (point_type, point_index, distance) where point_type is 'fixed' or 'moving'
-    """
-    min_distance = float("inf")
-    nearest_point_type = None
-    nearest_index = None
-
-    # Check fixed points
-    if FIXED_POINTS_LAYER_STR in state.layers:
-        fixed_annotations = state.layers[FIXED_POINTS_LAYER_STR].layer.annotations
-        for i, ann in enumerate(fixed_annotations):
-            point = list(ann.point)
-            distance = np.sqrt(
-                (current_position[0] - point[0]) ** 2
-                + (current_position[1] - point[1]) ** 2
-                + (current_position[2] - point[2]) ** 2
-            )
-            if distance < min_distance:
-                min_distance = distance
-                nearest_point_type = "fixed"
-                nearest_index = i
-
-    # Check moving points (transform to fixed coordinates first)
-    if MOVING_POINTS_LAYER_STR in state.layers:
-        moving_annotations = state.layers[MOVING_POINTS_LAYER_STR].layer.annotations
-        current_transform = get_current_transform(state)
-
-        for i, ann in enumerate(moving_annotations):
-            # Transform moving point to fixed coordinates
-            moving_point_homogeneous = np.array([*ann.point, 1.0])
-            fixed_point_homogeneous = current_transform @ moving_point_homogeneous
-            fixed_point = fixed_point_homogeneous[:3]
-
-            distance = np.sqrt(
-                (current_position[0] - fixed_point[0]) ** 2
-                + (current_position[1] - fixed_point[1]) ** 2
-                + (current_position[2] - fixed_point[2]) ** 2
-            )
-            if distance < min_distance:
-                min_distance = distance
-                nearest_point_type = "moving"
-                nearest_index = i
-
-    if nearest_point_type is None:
-        return None, None, None
-
-    return nearest_point_type, nearest_index, min_distance
 
 
 def renumber_point_ids(state, point_type):
@@ -659,7 +648,7 @@ def delete_nearest_point(action_state):
             current_position = state.position
 
         # Find nearest point of any type
-        point_type, point_index, distance = find_nearest_point_any_type(
+        point_type, point_index, distance, _ = find_nearest_point(
             current_position, state
         )
 
