@@ -33,6 +33,10 @@ Typically one finds a transform by following these steps (details below):
 - Adding manual landmark points to each volume based on visual features, refining the alignment.
 - (Optional and not recommended at this time) Using SimpleITK to fit a transform. The current implementation uses low-resolution levels of the Zarr input volumes, and does not result in precise transforms.
 
+#### Visualization
+
+- `Alt + c` - Toggle volume color
+
 #### Coarse initial alignment
 
 First one roughly positions the moving volume using the following commands:
@@ -73,8 +77,8 @@ After there are 4+ pairs of landmark points, the transform is automatically fit 
 The transform can be automatically refined using image registration via SimpleITK.
 The registration method uses the lower resolution Zarr levels and the Mattes mutual information metric to register the volumes.
 
-- `f` - Fit the transform to the landmark points using SimpleITK
+- `Alt + f` - Fit the transform to the landmark points using SimpleITK
 
 #### Saving the transform
 
-- `w` - Write the current transform to the output file
+- `Alt + w` - Write the current transform to the output file

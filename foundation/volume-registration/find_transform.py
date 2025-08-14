@@ -622,9 +622,9 @@ def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
     viewer.actions.add("trans-z-minus-small", _make_translator("z", -TRANSLATE_STEP))
 
     with viewer.config_state.txn() as s:
-        s.input_event_bindings.viewer["keyc"] = "toggle-color"
-        s.input_event_bindings.viewer["keyw"] = "write-transform"
-        s.input_event_bindings.viewer["keyf"] = "fine-align"
+        s.input_event_bindings.viewer["alt+keyc"] = "toggle-color"
+        s.input_event_bindings.viewer["alt+keyw"] = "write-transform"
+        s.input_event_bindings.viewer["alt+keyf"] = "fine-align"
         s.input_event_bindings.viewer["alt+digit1"] = "add-fixed-point"
         s.input_event_bindings.viewer["alt+digit2"] = "add-moving-point"
         s.input_event_bindings.viewer["alt+keya"] = "rot-x-plus-small"
