@@ -38,9 +38,20 @@ import PrizeCard from '@site/src/components/PrizeCard';
   />
 </head>
 
-Vesuvius Challenge has awarded **\$1,579,500** in prizes!
+Vesuvius Challenge has awarded **\$1,580,500** in prizes!
 
 This page lists all the prizes awarded so far:
+
+### \$1,000 Open Source (July, 2025)
+
+**Goal:** Improve virtual unwrapping<br/>
+**Announcement:** <a href="https://scrollprize.substack.com/p/unveiling-the-mystery-of-compressed">Blog post</a>
+
+<div className="flex flex-row flex-wrap">
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://github.com/WillStevens/scrollreading/blob/main/report8.pdf">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$1,000</div><span className="font-bold">Data handling and ball-spring method</span>: William Stevens / @Will Stevens</div>
+  </a>
+</div>
 
 ### \$2,500 Open Source (June, 2025)
 
