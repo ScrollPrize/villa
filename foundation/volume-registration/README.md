@@ -1,0 +1,91 @@
+# Volume registration
+
+This directory contains a script (`find_transform.py`) to find a transform between two volumes.
+It runs a local [neuroglancer](https://github.com/google/neuroglancer) instance to display the volumes, and adds functionality to find a transform between them.
+Live visual overlay allows the transform to be found by manually aligning the volumes.
+
+## Installation
+
+```bash
+uv venv
+. .venv/bin/activate
+uv pip install -r requirements.txt
+```
+
+## Usage
+
+### Example invocation:
+
+```bash
+python -i find_transform.py \
+--fixed https://volumes.aws.ash2txt.org/esrf/20250717/SCROLLS_HEL_4.681um_113keV_1.2m_binmean_2_PHerc_0500P2_HA_0001_masked.zarr/ \
+--fixed-voxel-size 9.362 \
+--moving https://volumes.aws.ash2txt.org/esrf/20250506/2.215um_HEL_TA_0.4m_110keV_scroll-fragment_0500P2_TA_0001_masked.zarr/ \
+--output-transform output_transform.json \
+--initial-transform initial_transform.json
+```
+
+### Overview
+
+Typically one finds a transform by following these steps (details below):
+
+- Performing a coarse initial alignment by rotating, translating, and flipping the moving volume using keybinds until it roughly aligns with the fixed volume.
+- Adding manual landmark points to each volume based on visual features, refining the alignment.
+- (Optional and not recommended at this time) Using SimpleITK to fit a transform. The current implementation uses low-resolution levels of the Zarr input volumes, and does not result in precise transforms.
+
+#### Visualization
+
+- `c` - Toggle volume color
+
+#### Coarse initial alignment
+
+First one roughly positions the moving volume using the following commands:
+
+- `Alt + a` - Rotate +X
+- `Alt + q` - Rotate -X
+- `Alt + s` - Rotate +Y
+- `Alt + w` - Rotate -Y
+- `Alt + d` - Rotate +Z
+- `Alt + e` - Rotate -Z
+- `Alt + f` - Flip X
+- `Alt + g` - Flip Y
+- `Alt + h` - Flip Z
+- `Alt + j` - Translate +X
+- `Alt + u` - Translate -X
+- `Alt + k` - Translate +Y
+- `Alt + i` - Translate -Y
+- `Alt + l` - Translate +Z
+- `Alt + o` - Translate -Z
+
+#### Adding landmark points
+
+Next, landmark points are added to each volume based on visual features.
+These refine the transform.
+After there are 4+ pairs of landmark points, the transform is automatically fit to the landmark points each time a point pair is added.
+
+- `Alt + 1` - Add landmark point to fixed volume at cursor position
+- `Alt + 2` - Add landmark point to moving volume at cursor position
+- `Alt + x` - Delete nearest landmark point
+
+#### Refining landmark points
+
+- `Alt + [` - Navigate to previous fixed point
+- `Alt + ]` - Navigate to next fixed point
+- `Alt + Shift + j` - Perturb fixed point +X
+- `Alt + Shift + u` - Perturb fixed point -X
+- `Alt + Shift + k` - Perturb fixed point +Y
+- `Alt + Shift + i` - Perturb fixed point -Y
+- `Alt + Shift + l` - Perturb fixed point +Z
+- `Alt + Shift + o` - Perturb fixed point -Z
+
+#### Automatically refining the transform
+> **_NOTE:_**  Not particularly recommended, as the current implementation uses low-resolution levels of the Zarr input volumes, and does not result in precise transforms.
+
+The transform can be automatically refined using image registration via SimpleITK.
+The registration method uses the lower resolution Zarr levels and the Mattes mutual information metric to register the volumes.
+
+- `f` - Fit the transform to the landmark points using SimpleITK
+
+#### Saving the transform
+
+- `w` - Write the current transform to the output file
