@@ -38,9 +38,20 @@ import PrizeCard from '@site/src/components/PrizeCard';
   />
 </head>
 
-Vesuvius Challenge has awarded **\$1,579,500** in prizes!
+Vesuvius Challenge has awarded **\$1,580,500** in prizes!
 
 This page lists all the prizes awarded so far:
+
+### \$1,000 Open Source (July, 2025)
+
+**Goal:** Improve virtual unwrapping<br/>
+**Announcement:** <a href="https://scrollprize.substack.com/p/unveiling-the-mystery-of-compressed">Blog post</a>
+
+<div className="flex flex-row flex-wrap">
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://github.com/WillStevens/scrollreading/blob/main/report8.pdf">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$1,000</div><span className="font-bold">Data handling and ball-spring method</span>: William Stevens / @Will Stevens</div>
+  </a>
+</div>
 
 ### \$2,500 Open Source (June, 2025)
 
@@ -70,7 +81,6 @@ This page lists all the prizes awarded so far:
   </a>
   <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://github.com/tomhsiao1260/neuroglancer-mini">
     <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$1,000</div><span className="font-bold">neuroglancer-mini</span>: Hsiao Yao and Dalufish / @.yaohsiao and @dalufish</div>
-    <img src="https://private-user-images.githubusercontent.com/31985811/438568274-c69a9014-3250-4d05-8350-abb96975b64c.png?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3NTI1NjU4MzYsIm5iZiI6MTc1MjU2NTUzNiwicGF0aCI6Ii8zMTk4NTgxMS80Mzg1NjgyNzQtYzY5YTkwMTQtMzI1MC00ZDA1LTgzNTAtYWJiOTY5NzViNjRjLnBuZz9YLUFtei1BbGdvcml0aG09QVdTNC1ITUFDLVNIQTI1NiZYLUFtei1DcmVkZW50aWFsPUFLSUFWQ09EWUxTQTUzUFFLNFpBJTJGMjAyNTA3MTUlMkZ1cy1lYXN0LTElMkZzMyUyRmF3czRfcmVxdWVzdCZYLUFtei1EYXRlPTIwMjUwNzE1VDA3NDUzNlomWC1BbXotRXhwaXJlcz0zMDAmWC1BbXotU2lnbmF0dXJlPTBiNzgxMWUzZGJhM2E0ZGY2MGY5YmQ4YzkyNDlhMjMzYzI0NjczNTc5MTU2NDAxNzk1MDI2ZDE5YTA0N2VhNmYmWC1BbXotU2lnbmVkSGVhZGVycz1ob3N0In0.klaQAnTCOBfu5WTVWBPQZ_kKf38g_7KMCa_Wx9qjPnw"/>
   </a>
 </div>
     
