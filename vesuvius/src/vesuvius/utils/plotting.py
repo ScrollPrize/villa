@@ -1,8 +1,8 @@
 import torch
 import cv2
-import imageio
 import numpy as np
 from pathlib import Path
+from PIL import Image, ImageDraw
 
 
 def minmax_scale_to_8bit(arr_np):
@@ -22,12 +22,24 @@ def minmax_scale_to_8bit(arr_np):
 
 def add_text_label(img, text):
     """Add text label to the top of an image"""
+    # Ensure img is proper format
+    if img.dtype != np.uint8:
+        img = img.astype(np.uint8)
+    if not img.flags['C_CONTIGUOUS']:
+        img = np.ascontiguousarray(img)
+    
     h, w = img.shape[:2]
     label_height = 30
+    
+    # Create labeled image
     labeled_img = np.zeros((h + label_height, w, 3), dtype=np.uint8)
     labeled_img[label_height:, :, :] = img
-    cv2.putText(labeled_img, text, (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    return labeled_img
+    
+    # Use PIL for text rendering to avoid OpenCV segfaults
+    pil_img = Image.fromarray(labeled_img)
+    draw = ImageDraw.Draw(pil_img)
+    draw.text((5, 5), text, fill=(255, 255, 255))
+    return np.array(pil_img, dtype=np.uint8)
 
 
 def convert_slice_to_bgr(slice_2d_or_3d):
@@ -234,7 +246,8 @@ def save_debug(
         out_dir = Path(save_path).parent
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"[Epoch {epoch}] Saving PNG to: {save_path}")
-        imageio.imwrite(save_path, final_img)
+        # Use PIL for saving
+        Image.fromarray(final_img).save(save_path)
         
     else:
         # Build frames for 3D GIF
@@ -310,49 +323,45 @@ def save_debug(
             frame = np.ascontiguousarray(frame, dtype=np.uint8)
             frames.append(frame)
         
-        # Save GIF
+        # Save GIF using PIL only
         out_dir = Path(save_path).parent
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"[Epoch {epoch}] Saving GIF to: {save_path}")
+        
         try:
-            # Validate frames before saving
+            # Validate frames
             if not frames:
                 print(f"Warning: No frames to save")
                 return None
             
-            # Check frame dimensions and types
-            for i, frame in enumerate(frames):
+            # Convert numpy arrays to PIL Images
+            pil_frames = []
+            for frame in frames:
+                # Ensure proper format
                 if frame.dtype != np.uint8:
-                    frames[i] = frame.astype(np.uint8)
+                    frame = frame.astype(np.uint8)
                 if not frame.flags['C_CONTIGUOUS']:
-                    frames[i] = np.ascontiguousarray(frame)
+                    frame = np.ascontiguousarray(frame)
+                pil_frames.append(Image.fromarray(frame))
             
-            # Use PIL for better stability with GIF creation
-            try:
-                from PIL import Image
-                # Convert numpy arrays to PIL Images
-                pil_frames = [Image.fromarray(frame) for frame in frames]
-                # Save as GIF using PIL
-                pil_frames[0].save(
-                    save_path,
-                    save_all=True,
-                    append_images=pil_frames[1:],
-                    duration=1000//fps,  # PIL uses milliseconds per frame
-                    loop=0
-                )
-                print(f"Successfully saved GIF using PIL to: {save_path}")
-                # Return frames for wandb logging
-                return frames
-            except ImportError:
-                # Fall back to imageio if PIL is not available
-                print("PIL not available, using imageio")
-                # Ensure all frames are properly formatted before saving
-                frames_final = [np.ascontiguousarray(f, dtype=np.uint8) for f in frames]
-                imageio.mimsave(save_path, frames_final, fps=fps, loop=0)
-                return frames_final
+            # Save as GIF using PIL
+            pil_frames[0].save(
+                save_path,
+                save_all=True,
+                append_images=pil_frames[1:],
+                duration=1000//fps,  # PIL uses milliseconds per frame
+                loop=0
+            )
+            print(f"Successfully saved GIF to: {save_path}")
+            
+            # Clean up PIL frames to free memory
+            for pil_frame in pil_frames:
+                pil_frame.close()
+            
+            return frames
+            
         except Exception as e:
             print(f"Error saving GIF: {e}")
-            print(f"Error type: {type(e).__name__}")
             import traceback
             print(f"Traceback: {traceback.format_exc()}")
             print(f"Skipping debug visualization due to error")
