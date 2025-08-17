@@ -1,10 +1,11 @@
 tr_config:
   patch_size: [192,192,192]
+  gradient_accumulation: 2
 
 dataset_config:
   min_labeled_ratio: 0 
   min_bbox_percent: 0 
-  normalization_scheme: "zscore"
+  normalization_scheme: "ct"
   skip_patch_validation: true
   targets:
     surface:

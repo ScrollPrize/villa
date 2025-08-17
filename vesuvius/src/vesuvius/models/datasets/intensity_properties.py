@@ -298,9 +298,118 @@ def save_intensity_properties(cache_dir: Path, intensity_properties: Dict[str, f
         return False
 
 
+def save_intensity_props_formatted(output_path: Path, intensity_properties: Dict[str, float], channel: int = 0) -> bool:
+    """
+    Save intensity properties in the specific format requested for CT normalization.
+    
+    Parameters
+    ----------
+    output_path : Path
+        Path to save the intensity_props.json file
+    intensity_properties : dict
+        Computed intensity properties
+    channel : int
+        Channel index (default is 0 for single channel data)
+        
+    Returns
+    -------
+    bool
+        True if save was successful
+    """
+    # Format the data in the requested structure
+    formatted_data = {
+        "foreground_intensity_properties_per_channel": {
+            str(channel): {
+                "max": intensity_properties.get('max', 0.0),
+                "mean": intensity_properties.get('mean', 0.0),
+                "median": intensity_properties.get('median', 0.0),
+                "min": intensity_properties.get('min', 0.0),
+                "percentile_00_5": intensity_properties.get('percentile_00_5', 0.0),
+                "percentile_99_5": intensity_properties.get('percentile_99_5', 0.0),
+                "std": intensity_properties.get('std', 0.0)
+            }
+        }
+    }
+    
+    try:
+        with open(output_path, 'w') as f:
+            json.dump(formatted_data, f, indent=4)
+        print(f"Saved formatted intensity properties to: {output_path}")
+        return True
+    except Exception as e:
+        print(f"Warning: Failed to save formatted intensity properties: {e}")
+        return False
+
+
+def load_intensity_props_formatted(file_path: Path, channel: int = 0) -> Optional[Dict[str, float]]:
+    """
+    Load intensity properties from the formatted JSON file for CT normalization.
+    Supports both simple format and nnUNet format.
+    
+    Parameters
+    ----------
+    file_path : Path
+        Path to the intensity_props.json file
+    channel : int
+        Channel index to load (default is 0)
+        
+    Returns
+    -------
+    dict or None
+        Intensity properties if successful, None otherwise
+    """
+    if not file_path.exists():
+        print(f"No intensity properties file found at: {file_path}")
+        return None
+    
+    try:
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+        
+        # Check for simple format first (direct properties at root level)
+        if 'mean' in data and 'std' in data:
+            # Simple format - return directly
+            return {
+                'mean': data.get('mean', 0.0),
+                'std': data.get('std', 0.0),
+                'min': data.get('min', 0.0),
+                'max': data.get('max', 0.0),
+                'median': data.get('median', 0.0),
+                'percentile_00_5': data.get('percentile_00_5', 0.0),
+                'percentile_99_5': data.get('percentile_99_5', 0.0)
+            }
+        
+        # Check for nnUNet format with channels
+        channel_key = str(channel)
+        if 'foreground_intensity_properties_per_channel' in data:
+            if channel_key in data['foreground_intensity_properties_per_channel']:
+                props = data['foreground_intensity_properties_per_channel'][channel_key]
+                # Return in the format expected by CTNormalization
+                return {
+                    'mean': props.get('mean', 0.0),
+                    'std': props.get('std', 0.0),
+                    'min': props.get('min', 0.0),
+                    'max': props.get('max', 0.0),
+                    'median': props.get('median', 0.0),
+                    'percentile_00_5': props.get('percentile_00_5', 0.0),
+                    'percentile_99_5': props.get('percentile_99_5', 0.0)
+                }
+            else:
+                print(f"Channel {channel} not found in intensity properties file")
+                return None
+        else:
+            print(f"Unrecognized format in intensity properties file: {file_path}")
+            return None
+            
+    except Exception as e:
+        print(f"Warning: Failed to load intensity properties from {file_path}: {e}")
+        return None
+
+
 def load_intensity_properties(cache_dir: Path) -> Optional[Tuple[Dict[str, float], str]]:
     """
     Load intensity properties from JSON file.
+    Checks both the standard format and simple intensity_props.json format.
     
     Parameters
     ----------
@@ -312,30 +421,36 @@ def load_intensity_properties(cache_dir: Path) -> Optional[Tuple[Dict[str, float
     tuple or None
         (intensity_properties, normalization_scheme) if successful, None otherwise
     """
+    # First try the standard filename
     filename = get_intensity_properties_filename(cache_dir)
     
-    if not filename.exists():
-        print(f"No intensity properties file found at: {filename}")
-        return None
-    
-    try:
-        with open(filename, 'r') as f:
-            data = json.load(f)
-        
-        intensity_properties = data.get('intensity_properties')
-        normalization_scheme = data.get('normalization_scheme')
-        timestamp = data.get('timestamp', 'unknown')
-        
-        if intensity_properties and normalization_scheme:
-            print(f"Loaded intensity properties from: {filename} (saved at {timestamp})")
-            return intensity_properties, normalization_scheme
-        else:
-            print(f"Invalid intensity properties file: {filename}")
-            return None
+    if filename.exists():
+        try:
+            with open(filename, 'r') as f:
+                data = json.load(f)
             
-    except Exception as e:
-        print(f"Warning: Failed to load intensity properties from {filename}: {e}")
-        return None
+            intensity_properties = data.get('intensity_properties')
+            normalization_scheme = data.get('normalization_scheme')
+            timestamp = data.get('timestamp', 'unknown')
+            
+            if intensity_properties and normalization_scheme:
+                print(f"Loaded intensity properties from: {filename} (saved at {timestamp})")
+                return intensity_properties, normalization_scheme
+        except Exception as e:
+            print(f"Warning: Failed to load from {filename}: {e}")
+    
+    # If standard file doesn't exist or failed, try the simple format
+    simple_filename = cache_dir / "intensity_props.json"
+    if simple_filename.exists():
+        print(f"Trying simple format intensity properties file: {simple_filename}")
+        props = load_intensity_props_formatted(simple_filename, channel=0)
+        if props:
+            # For simple format, we assume CT normalization since that's what uses these properties
+            print(f"Loaded simple format intensity properties from: {simple_filename}")
+            return props, 'ct'
+    
+    print(f"No valid intensity properties file found in: {cache_dir}")
+    return None
 
 
 def initialize_intensity_properties(target_volumes, 
@@ -433,5 +548,8 @@ def initialize_intensity_properties(target_volumes,
         # Save to cache for future use
         if cache_enabled and cache_dir is not None:
             save_intensity_properties(cache_dir, intensity_properties, normalization_scheme)
+            # Also save the formatted version for CT normalization
+            formatted_path = cache_dir / "intensity_props.json"
+            save_intensity_props_formatted(formatted_path, intensity_properties, channel=0)
     
     return intensity_properties
