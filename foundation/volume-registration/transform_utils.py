@@ -309,7 +309,9 @@ def check_images_with_transform(
         )
 
 
-def read_transform_json(input_path: str) -> tuple[np.ndarray, list, list]:
+def read_transform_json(
+    input_path: str, invert: bool = False
+) -> tuple[np.ndarray, list, list]:
     """Read transform and landmarks from JSON file."""
     # Load the schema
     schema_path = Path(__file__).parent / "transform_schema.json"
@@ -329,7 +331,14 @@ def read_transform_json(input_path: str) -> tuple[np.ndarray, list, list]:
     matrix = np.array(data["transformation_matrix"])
     matrix = np.vstack([matrix, [0, 0, 0, 1]])  # Add homogeneous row
 
-    return matrix, data["fixed_landmarks"], data["moving_landmarks"]
+    fixed_landmarks = data["fixed_landmarks"]
+    moving_landmarks = data["moving_landmarks"]
+
+    if invert:
+        matrix = invert_affine_matrix(matrix)
+        fixed_landmarks, moving_landmarks = moving_landmarks, fixed_landmarks
+
+    return matrix, fixed_landmarks, moving_landmarks
 
 
 def write_transform_json(

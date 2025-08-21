@@ -283,10 +283,14 @@ def _make_translator(axis: str, amount: float):
     return handler
 
 
-def load_transform(viewer_state: neuroglancer.ViewerState, input_path: str) -> None:
+def load_transform(
+    viewer_state: neuroglancer.ViewerState,
+    input_path: str,
+    invert_initial_transform: bool,
+) -> None:
     """Read a transform from a file. If provided, also loads landmarks into viewer state."""
     matrix_xyz, fixed_landmarks_xyz, moving_landmarks_xyz = read_transform_json(
-        input_path
+        input_path, invert_initial_transform
     )
 
     # Convert to ZYX for neuroglancer
@@ -821,13 +825,17 @@ def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
         s.input_event_bindings.viewer["alt+bracketright"] = "next-fixed-point"
 
 
-def set_initial_transform(viewer: neuroglancer.Viewer, initial_transform: str) -> None:
+def set_initial_transform(
+    viewer: neuroglancer.Viewer,
+    initial_transform: str,
+    invert_initial_transform: bool,
+) -> None:
     # Wait a second to make sure the viewer is ready
     time.sleep(1)
 
     if initial_transform is not None:
         with viewer.txn() as state:
-            load_transform(state, initial_transform)
+            load_transform(state, initial_transform, invert_initial_transform)
 
 
 if __name__ == "__main__":
@@ -864,6 +872,11 @@ if __name__ == "__main__":
         type=str,
         help="Path to read an initial transform from (if not provided, no initial transform will be applied)",
     )
+    parser.add_argument(
+        "--invert-initial-transform",
+        action="store_true",
+        help="Invert the initial transform before applying it",
+    )
     args = parser.parse_args()
 
     if not sys.flags.interactive:
@@ -892,4 +905,4 @@ if __name__ == "__main__":
 
     webbrowser.open_new(viewer.get_viewer_url())
 
-    set_initial_transform(viewer, args.initial_transform)
+    set_initial_transform(viewer, args.initial_transform, args.invert_initial_transform)
