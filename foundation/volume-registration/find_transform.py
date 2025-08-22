@@ -747,9 +747,10 @@ def write_current_transform(_):
 
 
 def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
-    SMALL_ROTATE_STEP = 1
-    LARGE_ROTATE_STEP = 90
-    TRANSLATE_STEP = 10
+    SMALL_ROTATE = 1
+    LARGE_ROTATE = 90
+    SMALL_TRANSLATE = 10
+    LARGE_TRANSLATE = 1000
 
     viewer.actions.add("toggle-color", toggle_color)
     viewer.actions.add("write-transform", write_current_transform)
@@ -759,27 +760,33 @@ def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
     viewer.actions.add("delete-nearest-point", delete_nearest_point)
     viewer.actions.add("previous-fixed-point", navigate_to_previous_fixed_point)
     viewer.actions.add("next-fixed-point", navigate_to_next_fixed_point)
-    viewer.actions.add("rot-x-plus-small", _make_rotator("x", SMALL_ROTATE_STEP))
-    viewer.actions.add("rot-x-minus-small", _make_rotator("x", -SMALL_ROTATE_STEP))
-    viewer.actions.add("rot-y-plus-small", _make_rotator("y", SMALL_ROTATE_STEP))
-    viewer.actions.add("rot-y-minus-small", _make_rotator("y", -SMALL_ROTATE_STEP))
-    viewer.actions.add("rot-z-plus-small", _make_rotator("z", SMALL_ROTATE_STEP))
-    viewer.actions.add("rot-z-minus-small", _make_rotator("z", -SMALL_ROTATE_STEP))
-    viewer.actions.add("rot-x-plus-large", _make_rotator("x", LARGE_ROTATE_STEP))
-    viewer.actions.add("rot-x-minus-large", _make_rotator("x", -LARGE_ROTATE_STEP))
-    viewer.actions.add("rot-y-plus-large", _make_rotator("y", LARGE_ROTATE_STEP))
-    viewer.actions.add("rot-y-minus-large", _make_rotator("y", -LARGE_ROTATE_STEP))
-    viewer.actions.add("rot-z-plus-large", _make_rotator("z", LARGE_ROTATE_STEP))
-    viewer.actions.add("rot-z-minus-large", _make_rotator("z", -LARGE_ROTATE_STEP))
+    viewer.actions.add("rot-x-plus-small", _make_rotator("x", SMALL_ROTATE))
+    viewer.actions.add("rot-x-minus-small", _make_rotator("x", -SMALL_ROTATE))
+    viewer.actions.add("rot-y-plus-small", _make_rotator("y", SMALL_ROTATE))
+    viewer.actions.add("rot-y-minus-small", _make_rotator("y", -SMALL_ROTATE))
+    viewer.actions.add("rot-z-plus-small", _make_rotator("z", SMALL_ROTATE))
+    viewer.actions.add("rot-z-minus-small", _make_rotator("z", -SMALL_ROTATE))
+    viewer.actions.add("rot-x-plus-large", _make_rotator("x", LARGE_ROTATE))
+    viewer.actions.add("rot-x-minus-large", _make_rotator("x", -LARGE_ROTATE))
+    viewer.actions.add("rot-y-plus-large", _make_rotator("y", LARGE_ROTATE))
+    viewer.actions.add("rot-y-minus-large", _make_rotator("y", -LARGE_ROTATE))
+    viewer.actions.add("rot-z-plus-large", _make_rotator("z", LARGE_ROTATE))
+    viewer.actions.add("rot-z-minus-large", _make_rotator("z", -LARGE_ROTATE))
     viewer.actions.add("flip-x", _make_flipper("x"))
     viewer.actions.add("flip-y", _make_flipper("y"))
     viewer.actions.add("flip-z", _make_flipper("z"))
-    viewer.actions.add("trans-x-plus-small", _make_translator("x", TRANSLATE_STEP))
-    viewer.actions.add("trans-x-minus-small", _make_translator("x", -TRANSLATE_STEP))
-    viewer.actions.add("trans-y-plus-small", _make_translator("y", TRANSLATE_STEP))
-    viewer.actions.add("trans-y-minus-small", _make_translator("y", -TRANSLATE_STEP))
-    viewer.actions.add("trans-z-plus-small", _make_translator("z", TRANSLATE_STEP))
-    viewer.actions.add("trans-z-minus-small", _make_translator("z", -TRANSLATE_STEP))
+    viewer.actions.add("trans-x-plus-small", _make_translator("x", SMALL_TRANSLATE))
+    viewer.actions.add("trans-x-minus-small", _make_translator("x", -SMALL_TRANSLATE))
+    viewer.actions.add("trans-y-plus-small", _make_translator("y", SMALL_TRANSLATE))
+    viewer.actions.add("trans-y-minus-small", _make_translator("y", -SMALL_TRANSLATE))
+    viewer.actions.add("trans-z-plus-small", _make_translator("z", SMALL_TRANSLATE))
+    viewer.actions.add("trans-z-minus-small", _make_translator("z", -SMALL_TRANSLATE))
+    viewer.actions.add("trans-x-plus-large", _make_translator("x", LARGE_TRANSLATE))
+    viewer.actions.add("trans-x-minus-large", _make_translator("x", -LARGE_TRANSLATE))
+    viewer.actions.add("trans-y-plus-large", _make_translator("y", LARGE_TRANSLATE))
+    viewer.actions.add("trans-y-minus-large", _make_translator("y", -LARGE_TRANSLATE))
+    viewer.actions.add("trans-z-plus-large", _make_translator("z", LARGE_TRANSLATE))
+    viewer.actions.add("trans-z-minus-large", _make_translator("z", -LARGE_TRANSLATE))
     viewer.actions.add("perturb-fixed-point-x-plus", _make_point_perturber("x", 1))
     viewer.actions.add("perturb-fixed-point-x-minus", _make_point_perturber("x", -1))
     viewer.actions.add("perturb-fixed-point-y-plus", _make_point_perturber("y", 1))
@@ -815,14 +822,20 @@ def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
         s.input_event_bindings.viewer["alt+keyi"] = "trans-y-minus-small"
         s.input_event_bindings.viewer["alt+keyl"] = "trans-z-plus-small"
         s.input_event_bindings.viewer["alt+keyo"] = "trans-z-minus-small"
-        s.input_event_bindings.viewer["alt+shift+keyj"] = "perturb-fixed-point-x-plus"
-        s.input_event_bindings.viewer["alt+shift+keyu"] = "perturb-fixed-point-x-minus"
-        s.input_event_bindings.viewer["alt+shift+keyk"] = "perturb-fixed-point-y-plus"
-        s.input_event_bindings.viewer["alt+shift+keyi"] = "perturb-fixed-point-y-minus"
-        s.input_event_bindings.viewer["alt+shift+keyl"] = "perturb-fixed-point-z-plus"
-        s.input_event_bindings.viewer["alt+shift+keyo"] = "perturb-fixed-point-z-minus"
+        s.input_event_bindings.viewer["alt+shift+keyj"] = "trans-x-plus-large"
+        s.input_event_bindings.viewer["alt+shift+keyu"] = "trans-x-minus-large"
+        s.input_event_bindings.viewer["alt+shift+keyk"] = "trans-y-plus-large"
+        s.input_event_bindings.viewer["alt+shift+keyi"] = "trans-y-minus-large"
+        s.input_event_bindings.viewer["alt+shift+keyl"] = "trans-z-plus-large"
+        s.input_event_bindings.viewer["alt+shift+keyo"] = "trans-z-minus-large"
         s.input_event_bindings.viewer["alt+bracketleft"] = "previous-fixed-point"
         s.input_event_bindings.viewer["alt+bracketright"] = "next-fixed-point"
+        s.input_event_bindings.viewer["shift+keyj"] = "perturb-fixed-point-x-plus"
+        s.input_event_bindings.viewer["shift+keyu"] = "perturb-fixed-point-x-minus"
+        s.input_event_bindings.viewer["shift+keyk"] = "perturb-fixed-point-y-plus"
+        s.input_event_bindings.viewer["shift+keyi"] = "perturb-fixed-point-y-minus"
+        s.input_event_bindings.viewer["shift+keyl"] = "perturb-fixed-point-z-plus"
+        s.input_event_bindings.viewer["shift+keyo"] = "perturb-fixed-point-z-minus"
 
 
 def set_initial_transform(
