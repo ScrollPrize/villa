@@ -7,9 +7,7 @@ Live visual overlay allows the transform to be found by manually aligning the vo
 ## Installation
 
 ```bash
-uv venv
-. .venv/bin/activate
-uv pip install -r requirements.txt
+pip install -r requirements.txt
 ```
 
 ## Usage
@@ -41,21 +39,21 @@ Typically one finds a transform by following these steps (details below):
 
 First one roughly positions the moving volume using the following commands:
 
-- `Alt + a` - Rotate +X
-- `Alt + q` - Rotate -X
-- `Alt + s` - Rotate +Y
-- `Alt + w` - Rotate -Y
-- `Alt + d` - Rotate +Z
-- `Alt + e` - Rotate -Z
+- `Alt + a` - Rotate +X (`+ Shift` for bigger step)
+- `Alt + q` - Rotate -X (`+ Shift` for bigger step)
+- `Alt + s` - Rotate +Y (`+ Shift` for bigger step)
+- `Alt + w` - Rotate -Y (`+ Shift` for bigger step)
+- `Alt + d` - Rotate +Z (`+ Shift` for bigger step)
+- `Alt + e` - Rotate -Z (`+ Shift` for bigger step)
 - `Alt + f` - Flip X
 - `Alt + g` - Flip Y
 - `Alt + h` - Flip Z
-- `Alt + j` - Translate +X
-- `Alt + u` - Translate -X
-- `Alt + k` - Translate +Y
-- `Alt + i` - Translate -Y
-- `Alt + l` - Translate +Z
-- `Alt + o` - Translate -Z
+- `Alt + j` - Translate +X (`+ Shift` for bigger step)
+- `Alt + u` - Translate -X (`+ Shift` for bigger step)
+- `Alt + k` - Translate +Y (`+ Shift` for bigger step)
+- `Alt + i` - Translate -Y (`+ Shift` for bigger step)
+- `Alt + l` - Translate +Z (`+ Shift` for bigger step)
+- `Alt + o` - Translate -Z (`+ Shift` for bigger step)
 
 #### Adding landmark points
 
@@ -65,18 +63,18 @@ After there are 4+ pairs of landmark points, the transform is automatically fit 
 
 - `Alt + 1` - Add landmark point to fixed volume at cursor position
 - `Alt + 2` - Add landmark point to moving volume at cursor position
-- `Alt + x` - Delete nearest landmark point
 
 #### Refining landmark points
 
+- `Alt + x` - Delete nearest landmark point
 - `Alt + [` - Navigate to previous fixed point
 - `Alt + ]` - Navigate to next fixed point
-- `Alt + Shift + j` - Perturb fixed point +X
-- `Alt + Shift + u` - Perturb fixed point -X
-- `Alt + Shift + k` - Perturb fixed point +Y
-- `Alt + Shift + i` - Perturb fixed point -Y
-- `Alt + Shift + l` - Perturb fixed point +Z
-- `Alt + Shift + o` - Perturb fixed point -Z
+- `Shift + j` - Perturb fixed point +X
+- `Shift + u` - Perturb fixed point -X
+- `Shift + k` - Perturb fixed point +Y
+- `Shift + i` - Perturb fixed point -Y
+- `Shift + l` - Perturb fixed point +Z
+- `Shift + o` - Perturb fixed point -Z
 
 #### Automatically refining the transform
 > **_NOTE:_**  Not particularly recommended, as the current implementation uses low-resolution levels of the Zarr input volumes, and does not result in precise transforms.
@@ -88,4 +86,4 @@ The registration method uses the lower resolution Zarr levels and the Mattes mut
 
 #### Saving the transform
 
-- `w` - Write the current transform to the output file
+- `w` - Write the current transform to the output file. This also prints a shareable neuroglancer URL that can be used to view the volumes with the transform applied.
