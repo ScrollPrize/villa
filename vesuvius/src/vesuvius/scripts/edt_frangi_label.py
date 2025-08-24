@@ -31,6 +31,27 @@ def normalize(volume):
     return volume
 
 
+def hessian_2d(image, gauss_sigma=2, sigma=6):
+    image_smoothed = gaussian_filter(image, sigma=gauss_sigma)
+    image_smoothed = normalize(image_smoothed)
+
+    joint_hessian = np.zeros((image.shape[0], image.shape[1], 2, 2), dtype=float)
+
+    Dy = np.gradient(image_smoothed, axis=0, edge_order=2)
+    joint_hessian[:, :, 1, 1] = np.gradient(Dy, axis=0, edge_order=2)
+    joint_hessian[:, :, 0, 1] = np.gradient(Dy, axis=1, edge_order=2)
+    del Dy
+
+    Dx = np.gradient(image_smoothed, axis=1, edge_order=2)
+    joint_hessian[:, :, 0, 0] = np.gradient(Dx, axis=1, edge_order=2)
+    joint_hessian[:, :, 1, 0] = joint_hessian[:, :, 0, 1]
+    del Dx
+
+    joint_hessian = joint_hessian * (sigma ** 2)
+    zero_mask = np.trace(joint_hessian, axis1=2, axis2=3) == 0
+    return joint_hessian, zero_mask
+
+
 def hessian(volume, gauss_sigma=2, sigma=6):
     volume_smoothed = gaussian_filter(volume, sigma=gauss_sigma)
     volume_smoothed = normalize(volume_smoothed)
@@ -55,6 +76,28 @@ def hessian(volume, gauss_sigma=2, sigma=6):
     joint_hessian = joint_hessian * (sigma ** 2)
     zero_mask = np.trace(joint_hessian, axis1=3, axis2=4) == 0
     return joint_hessian, zero_mask
+
+
+def detect_ridges_2d(image, gamma=1.5, beta=0.5, gauss_sigma=2, sigma=6):
+    joint_hessian, zero_mask = hessian_2d(image, gauss_sigma, sigma)
+    eigvals = LA.eigvalsh(joint_hessian, 'U')
+    idxs = np.argsort(np.abs(eigvals), axis=-1)
+    eigvals = np.take_along_axis(eigvals, idxs, axis=-1)
+    eigvals[zero_mask, :] = 0
+
+    L1 = np.abs(eigvals[:, :, 0])
+    L2 = eigvals[:, :, 1]
+    L2abs = np.abs(L2)
+
+    S = np.sqrt(np.square(eigvals).sum(axis=-1))
+    background_term = 1 - np.exp(-0.5 * np.square(S / gamma))
+
+    Rb = divide_nonzero(L1, L2abs)
+    blob_term = np.exp(-0.5 * np.square(Rb / beta))
+
+    ridges = background_term * blob_term
+    ridges[L2 > 0] = 0
+    return ridges
 
 
 def detect_ridges(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, sigma=6):
@@ -95,14 +138,28 @@ def dilate_by_inverse_edt(binary_volume, dilation_distance):
 def process_file(file_path, output_folder, dilation_distance=3, ridge_threshold=0.5):
     try:
         volume = tifffile.imread(file_path)
-        binary_volume = (volume > 0).astype(np.uint8)
-        dilated_volume = dilate_by_inverse_edt(binary_volume, dilation_distance)
-        dilated_float = dilated_volume.astype(np.float32)
-        ridges = detect_ridges(dilated_float)
-        binary_ridges = (ridges > ridge_threshold).astype(np.uint8)
+        
+        # Check if input is 2D or 3D
+        if volume.ndim == 2:
+            # 2D processing
+            binary_volume = (volume > 0).astype(np.uint8)
+            dilated_volume = dilate_by_inverse_edt(binary_volume, dilation_distance)
+            dilated_float = dilated_volume.astype(np.float32)
+            ridges = detect_ridges_2d(dilated_float)
+            binary_ridges = (ridges > ridge_threshold).astype(np.uint8)
+        elif volume.ndim == 3:
+            # 3D processing
+            binary_volume = (volume > 0).astype(np.uint8)
+            dilated_volume = dilate_by_inverse_edt(binary_volume, dilation_distance)
+            dilated_float = dilated_volume.astype(np.float32)
+            ridges = detect_ridges(dilated_float)
+            binary_ridges = (ridges > ridge_threshold).astype(np.uint8)
+        else:
+            raise ValueError(f"Unsupported image dimensions: {volume.ndim}. Only 2D and 3D images are supported.")
+        
         filename = os.path.basename(file_path)
         output_path = os.path.join(output_folder, filename)
-        tifffile.imwrite(output_path, binary_ridges)
+        tifffile.imwrite(output_path, binary_ridges, compression='packbits')
         return file_path, True
     except Exception as e:
         return file_path, False, str(e)
@@ -118,11 +175,11 @@ def worker(args):
 # ---------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Process a folder of multipage TIFFs with inverse EDT dilation and custom ridge detection."
+        description="Process a folder of 2D or 3D TIFF files with inverse EDT dilation and custom ridge detection."
     )
-    parser.add_argument("input_folder", help="Folder containing input multipage TIFF files.")
+    parser.add_argument("input_folder", help="Folder containing input TIFF files (2D or 3D).")
     parser.add_argument("output_folder", help="Folder where processed TIFF files will be saved.")
-    parser.add_argument("--dilation_distance", type=float, default=3, help="Dilation distance (in voxels).")
+    parser.add_argument("--dilation_distance", type=float, default=3, help="Dilation distance (in pixels/voxels).")
     parser.add_argument("--ridge_threshold", type=float, default=0.5,
                         help="Threshold for binarizing the ridge detection.")
     parser.add_argument("--num_workers", type=int, default=multiprocessing.cpu_count(),
