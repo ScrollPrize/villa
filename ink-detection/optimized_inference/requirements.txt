@@ -1,0 +1,26 @@
+# Core ML dependencies
+segmentation_models_pytorch 
+albumentations 
+pytorch-lightning==2.0.9 
+timesformer-pytorch
+numpy==1.26.4
+torch>=2.0.0
+
+# Scientific computing
+scipy
+tqdm
+
+# Computer vision
+opencv-python>=4.5.0
+
+# FastAPI and web server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+
+# AWS S3 integration
+boto3>=1.26.0
+botocore>=1.29.0
+
+# FastAPI file upload support
+python-multipart>=0.0.6
