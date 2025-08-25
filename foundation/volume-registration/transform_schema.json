@@ -1,0 +1,62 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "version": "1.0.0",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "fixed_volume",
+    "transformation_matrix",
+    "fixed_landmarks",
+    "moving_landmarks"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0",
+      "description": "Version of the transformation data format schema"
+    },
+    "fixed_volume": {
+      "type": "string",
+      "description": "Path or identifier of the fixed volume to which this volume is registered"
+    },
+    "transformation_matrix": {
+      "type": "array",
+      "description": "3x4 affine transformation matrix in XYZ coordinate order (homogeneous coordinate row omitted). First 3x3 is the rotation matrix, last column is the translation vector. Applied as p_fixed = M @ p_moving after the homogeneous row is added to the matrix.",
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "number"
+        },
+        "minItems": 4,
+        "maxItems": 4
+      },
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "fixed_landmarks": {
+      "type": "array",
+      "description": "Array of (x, y, z) points in the fixed volume (voxel coordinates)",
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "number"
+        },
+        "minItems": 3,
+        "maxItems": 3
+      }
+    },
+    "moving_landmarks": {
+      "type": "array",
+      "description": "Corresponding (x, y, z) points in the moving volume (voxel coordinates)",
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "number"
+        },
+        "minItems": 3,
+        "maxItems": 3
+      }
+    }
+  },
+  "additionalProperties": false
+}

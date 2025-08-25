@@ -240,7 +240,7 @@ class BaseDataset(Dataset):
         patch_size : tuple
             Size of patches to extract
         stride : tuple, optional
-            Stride for sliding window, defaults to 50% overlap
+            Stride for sliding window, defaults to no overlap (stride = patch_size)
             
         Returns
         -------
@@ -253,40 +253,32 @@ class BaseDataset(Dataset):
             h, w = patch_size
             
             if stride is None:
-                stride = (h // 2, w // 2)  # 50% overlap by default
+                stride = (h, w)  # No overlap by default
             
             positions = []
+            
+            # Generate regular grid positions
             y_positions = list(range(0, H - h + 1, stride[0]))
-            total_positions = len(y_positions) * len(range(0, W - w + 1, stride[1]))
+            x_positions = list(range(0, W - w + 1, stride[1]))
+            
+            # Check if we need edge patches to cover the entire volume
+            # Add final position at bottom edge if there's remaining space
+            if y_positions and y_positions[-1] + h < H:
+                y_positions.append(H - h)
+            
+            # Add final position at right edge if there's remaining space  
+            if x_positions and x_positions[-1] + w < W:
+                x_positions.append(W - w)
+            
+            total_positions = len(y_positions) * len(x_positions)
             
             with tqdm(total=total_positions, desc="Generating 2D sliding window positions", leave=False) as pbar:
                 for y in y_positions:
-                    for x in range(0, W - w + 1, stride[1]):
+                    for x in x_positions:
                         positions.append({
                             'start_pos': [0, y, x]  # [dummy_z, y, x] for 2D
                         })
                         pbar.update(1)
-            
-            # Ensure we cover the edges
-            # Add patches at the bottom edge if needed
-            if H - h > positions[-1]['start_pos'][1]:
-                for x in range(0, W - w + 1, stride[1]):
-                    positions.append({
-                        'start_pos': [0, H - h, x]
-                    })
-            
-            # Add patches at the right edge if needed
-            if W - w > positions[-1]['start_pos'][2]:
-                for y in range(0, H - h + 1, stride[0]):
-                    positions.append({
-                        'start_pos': [0, y, W - w]
-                    })
-            
-            # Add the bottom-right corner if needed
-            if H - h > positions[-1]['start_pos'][1] or W - w > positions[-1]['start_pos'][2]:
-                positions.append({
-                    'start_pos': [0, H - h, W - w]
-                })
                 
         else:
             # 3D case
@@ -294,12 +286,28 @@ class BaseDataset(Dataset):
             d, h, w = patch_size
             
             if stride is None:
-                stride = (d // 2, h // 2, w // 2)  # 50% overlap by default
+                stride = (d, h, w)  # No overlap by default
             
             positions = []
+            
+            # Generate regular grid positions
             z_positions = list(range(0, D - d + 1, stride[0]))
             y_positions = list(range(0, H - h + 1, stride[1]))
             x_positions = list(range(0, W - w + 1, stride[2]))
+            
+            # Check if we need edge patches to cover the entire volume
+            # Add final position at depth edge if there's remaining space
+            if z_positions and z_positions[-1] + d < D:
+                z_positions.append(D - d)
+            
+            # Add final position at bottom edge if there's remaining space
+            if y_positions and y_positions[-1] + h < H:
+                y_positions.append(H - h)
+            
+            # Add final position at right edge if there's remaining space
+            if x_positions and x_positions[-1] + w < W:
+                x_positions.append(W - w)
+            
             total_positions = len(z_positions) * len(y_positions) * len(x_positions)
             
             with tqdm(total=total_positions, desc="Generating 3D sliding window positions", leave=False) as pbar:
@@ -310,27 +318,6 @@ class BaseDataset(Dataset):
                                 'start_pos': [z, y, x]
                             })
                             pbar.update(1)
-
-            if D - d > 0 and (D - d) % stride[0] != 0:
-                for y in range(0, H - h + 1, stride[1]):
-                    for x in range(0, W - w + 1, stride[2]):
-                        positions.append({
-                            'start_pos': [D - d, y, x]
-                        })
-            
-            if H - h > 0 and (H - h) % stride[1] != 0:
-                for z in range(0, D - d + 1, stride[0]):
-                    for x in range(0, W - w + 1, stride[2]):
-                        positions.append({
-                            'start_pos': [z, H - h, x]
-                        })
-            
-            if W - w > 0 and (W - w) % stride[2] != 0:
-                for z in range(0, D - d + 1, stride[0]):
-                    for y in range(0, H - h + 1, stride[1]):
-                        positions.append({
-                            'start_pos': [z, y, W - w]
-                        })
 
         seen = set()
         unique_positions = []
