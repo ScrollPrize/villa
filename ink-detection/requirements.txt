@@ -10,3 +10,4 @@ matplotlib
 timesformer-pytorch
 typed-argument-parser
 numpy==1.26.4
+webknossos
