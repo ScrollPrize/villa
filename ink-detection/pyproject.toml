@@ -1,0 +1,14 @@
+[project]
+name = "ink-detection"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "webknossos>=2.4.7",
+]
+
+[tool.uv.workspace]
+members = [
+    "orchestrator",
+]
