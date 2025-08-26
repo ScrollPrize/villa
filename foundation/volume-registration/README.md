@@ -31,6 +31,8 @@ Typically one finds a transform by following these steps (details below):
 - Adding manual landmark points to each volume based on visual features, refining the alignment.
 - (Optional and not recommended at this time) Using SimpleITK to fit a transform. The current implementation uses low-resolution levels of the Zarr input volumes, and does not result in precise transforms.
 
+[Overview video](https://drive.google.com/file/d/1d05znwDmNCJdOsLd8VlH0clRorNhtcKg/view?usp=drive_link)
+
 #### Visualization
 
 - `c` - Toggle volume color
