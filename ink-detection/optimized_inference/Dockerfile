@@ -30,7 +30,6 @@ ENV PYTHONPATH=/app
 ENV CUDA_VISIBLE_DEVICES=0
 
 COPY --from=build /opt/venv /opt/venv
-COPY config.py /app
 COPY entrypoint.py /app
 COPY inference_timesformer.py /app
 
