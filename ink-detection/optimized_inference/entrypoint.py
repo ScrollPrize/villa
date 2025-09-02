@@ -40,12 +40,6 @@ class Inputs:
     end_layer: int
     force_reverse: bool = False
 
-
-MODEL_TO_HF_REPO: Dict[str, str] = {
-    "timesformer-scroll5": "scrollprize/timesformer_scroll5_27112024",
-}
-
-
 def parse_env() -> Inputs:
     try:
         model_key = os.environ["MODEL"].strip()
@@ -173,11 +167,56 @@ def load_layers_to_numpy(layer_paths: List[str]) -> np.ndarray:
     return stacked_layers
 
 
-def download_model_weights(hf_repo: str, dest_dir: str) -> str:
+def download_model_weights(model_name: str, dest_dir: str, s3_client) -> str:
+    """
+    Resolve model weights by checking S3 registry first, then fall back to Hugging Face.
+
+    Search order preference for files: .ckpt, .safetensors, .bin, .pt
+    """
     os.makedirs(dest_dir, exist_ok=True)
-    logger.info(f"Downloading model from Hugging Face: {hf_repo}")
-    local_dir = snapshot_download(repo_id=hf_repo, local_dir=dest_dir, local_dir_use_symlinks=False)
-    # Heuristics: prefer .ckpt, then .bin, then .pt
+
+    registry_bucket = "scrollprize-models-registry"
+    registry_prefix = f"ink-detection/{model_name.strip().rstrip('/')}/"
+
+    def _prefer(weights: List[str]) -> Optional[str]:
+        if not weights:
+            return None
+        order = [".ckpt", ".safetensors", ".bin", ".pt"]
+        for ext in order:
+            matches = [w for w in weights if w.lower().endswith(ext)]
+            if matches:
+                return sorted(matches)[0]
+        return sorted(weights)[0]
+
+    # 1) Try S3 registry first
+    logger.info(
+        f"Attempting to locate weights in S3 registry s3://{registry_bucket}/{registry_prefix}"
+    )
+    try:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        found_keys: List[str] = []
+        for page in paginator.paginate(Bucket=registry_bucket, Prefix=registry_prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                lower = key.lower()
+                if lower.endswith(".ckpt") or lower.endswith(".safetensors") or lower.endswith(".bin") or lower.endswith(".pt"):
+                    found_keys.append(key)
+
+        chosen_key = _prefer(found_keys)
+        if chosen_key:
+            logger.info(f"Found weights in S3 registry: s3://{registry_bucket}/{chosen_key}")
+            local_path = os.path.join(dest_dir, os.path.basename(chosen_key))
+            s3_client.download_file(registry_bucket, chosen_key, local_path)
+            logger.info(f"Downloaded weights from S3 to: {local_path}")
+            return local_path
+        else:
+            logger.info("No suitable weights found in S3 registry. Falling back to Hugging Face.")
+    except Exception as e:
+        logger.warning(f"S3 registry lookup failed ({e}). Falling back to Hugging Face.")
+
+    # 2) Fall back to Hugging Face
+    logger.info(f"Downloading model from Hugging Face: {model_name}")
+    local_dir = snapshot_download(repo_id=model_name, local_dir=dest_dir, local_dir_use_symlinks=False)
     candidates = []
     for root, _, files in os.walk(local_dir):
         for f in files:
@@ -185,13 +224,8 @@ def download_model_weights(hf_repo: str, dest_dir: str) -> str:
             if lf.endswith(".ckpt") or lf.endswith(".safetensors") or lf.endswith(".bin") or lf.endswith(".pt"):
                 candidates.append(os.path.join(root, f))
     if not candidates:
-        raise RuntimeError("No model weight files (.ckpt/.bin/.pt/.safetensors) found in downloaded repo")
-    # Prefer .ckpt explicitly if available
-    ckpts = [p for p in candidates if p.lower().endswith(".ckpt")]
-    if ckpts:
-        chosen = sorted(ckpts)[0]
-    else:
-        chosen = sorted(candidates)[0]
+        raise RuntimeError("No model weight files (.ckpt/.safetensors/.bin/.pt) found in downloaded repo")
+    chosen = _prefer(candidates)
     logger.info(f"Using model weights: {chosen}")
     return chosen
 
@@ -302,11 +336,10 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
-    # Resolve and download model weights
-    logger.info(f"Resolving HuggingFace repo for model key: {inputs.model_key}")
-    hf_repo = MODEL_TO_HF_REPO.get(inputs.model_key, inputs.model_key)
-    logger.info(f"Downloading model weights from repo: {hf_repo} to {models_dir}")
-    weight_path = download_model_weights(hf_repo, models_dir)
+    # Resolve and download model weights (S3-first, then HF fallback)
+    logger.info(f"Resolving model for key: {inputs.model_key}")
+    logger.info(f"Looking for weights in S3 registry, else HF repo: {inputs.model_key}")
+    weight_path = download_model_weights(inputs.model_key, models_dir, s3_client)
     logger.info(f"Loading model from weights at: {weight_path}")
     model = load_model(weight_path, device)
 
