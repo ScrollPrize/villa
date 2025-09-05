@@ -1,12 +1,14 @@
 #pragma once
 #include "vc/core/util/Surface.hpp"
 
+struct Chunked3dFloatFromUint8;
 struct Chunked3dVec3fFromUint8;
 
 struct DirectionField
 {
     std::string direction;
     std::unique_ptr<Chunked3dVec3fFromUint8> field_ptr;
+    std::unique_ptr<Chunked3dFloatFromUint8> weight_ptr;
 };
 
 QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMeta*> &surfs_v, const nlohmann::json &params, float voxelsize = 1.0);
