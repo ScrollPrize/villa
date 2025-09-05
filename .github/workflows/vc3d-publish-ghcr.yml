@@ -2,7 +2,7 @@ name: Build & Push Docker Image (ghcr.io)
 
 on:
   push:
-    branches: ["dev-next", "latest"]
+    branches: ["main", "latest"]
   workflow_dispatch:
 
 concurrency: docker

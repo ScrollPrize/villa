@@ -76,7 +76,7 @@ sudo docker run hello-world
 
 **Pull the container image**
 
-While it is possible to build this from source, we recommend just pulling the container image from our [volume-cartographer repository](https://github.com/ScrollPrize/volume-cartographer) by entering the following command:
+While it is possible to build this from source, we recommend just pulling the container image from our [volume-cartographer repository](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer) by entering the following command:
 ```bash
 sudo docker pull ghcr.io/scrollprize/volume-cartographer:edge
 ```
