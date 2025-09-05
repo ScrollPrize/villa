@@ -6,7 +6,7 @@ CT scans of ancient, badly damaged manuscripts, but can be applied in many
 volumetric analysis applications.
 
 This repository is a version of [EduceLab](https://educelab.engr.uky.edu/)'s Volume Cartographer.
-Via Vesuvius Challenge, it has gone through through a few forks:
+Via Vesuvius Challenge, it has gone through a few forks:
 [EduceLab](https://github.com/educelab/volume-cartographer) (original) ->
 [Julian Schilliger](https://github.com/schillij95/volume-cartographer-papyrus) (optical flow segmentation) ->
 [Philip Allgaier](https://github.com/spacegaier/volume-cartographer) (performance/usability improvements) ->
