@@ -16,9 +16,6 @@ jobs:
         working-directory: ./volume-cartographer
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -28,6 +25,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
+            context: volume-cartographer
             file: ubuntu-24.04-noble.Dockerfile
             push: false
             tags: ${{ github.repository_owner }}/volume-cartographer:latest
