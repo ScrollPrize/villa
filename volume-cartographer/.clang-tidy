@@ -1,0 +1,99 @@
+---
+Checks:          '*,-altera-*,-android-*,-boost-*,-cert-*,-darwin-*,-fuchsia-*,-linuxkernel-*,-llvm-*,-llvmlibc-*,-objc-*,-zircon-*,-readability-math-missing-parentheses,-google-readability-casting,-bugprone-incorrect-roundings,-modernize-use-integer-sign-comparison,-performance-avoid-endl,-hicpp-uppercase-literal-suffix,-readability-uppercase-literal-suffix,-misc-use-anonymous-namespace,-readability-function-cognitive-complexity,-cppcoreguidelines-owning-memory,-readability-identifier-length,-cppcoreguidelines-special-member-functions,-hicpp-special-member-functions,-modernize-use-trailing-return-type,-misc-const-correctness,-cppcoreguidelines-avoid-magic-numbers,-hicpp-signed-bitwise,-google-readability-braces-around-statements,-hicpp-braces-around-statements,-readability-braces-around-statements,-readability-magic-numbers,-bugprone-narrowing-conversions,-cppcoreguidelines-narrowing-conversions,-cppcoreguidelines-pro-bounds-pointer-arithmetic,-readability-isolate-declaration,-cppcoreguidelines-init-variables,-bugprone-reserved-identifier,-google-default-arguments,-cppcoreguidelines-non-private-member-variables-in-classes,-misc-non-private-member-variables-in-classes,-misc-unused-parameters,-bugprone-easily-swappable-parameters,-cppcoreguidelines-macro-usage,-cppcoreguidelines-prefer-member-initializer,-readability-else-after-return,-concurrency-mt-unsafe,-bugprone-implicit-widening-of-multiplication-result,-bugprone-integer-division,-modernize-use-ranges,-cppcoreguidelines-avoid-c-arrays,-hicpp-avoid-c-arrays,-modernize-avoid-c-arrays,-readability-redundant-access-specifiers,-cppcoreguidelines-pro-bounds-constant-array-index,-google-build-using-namespace,-modernize-raw-string-literal,-cppcoreguidelines-pro-type-member-init,-hicpp-member-init,-readability-implicit-bool-conversion,-bugprone-switch-missing-default-case,-hicpp-multiway-paths-covered'
+WarningsAsErrors: ''
+AnalyzeTemporaryDtors: false
+CheckOptions:    
+  - key:             cert-oop11-cpp.UseCERTSemantics
+    value:           '1'
+  - key:             google-readability-braces-around-statements.ShortStatementLines
+    value:           '1'
+  - key:             google-readability-function-size.StatementThreshold
+    value:           '800'
+  - key:             google-readability-namespace-comments.ShortNamespaceLines
+    value:           '10'
+  - key:             google-readability-namespace-comments.SpacesBeforeComments
+    value:           '2'
+  - key:             google-runtime-int.TypeSuffix
+    value:           '_t'
+  - key:             modernize-loop-convert.MaxCopySize
+    value:           '16'
+  - key:             modernize-loop-convert.MinConfidence
+    value:           reasonable
+  - key:             modernize-loop-convert.NamingStyle
+    value:           CamelCase
+  - key:             modernize-pass-by-value.IncludeStyle
+    value:           llvm
+  - key:             modernize-replace-auto-ptr.IncludeStyle
+    value:           llvm
+  - key:             modernize-use-nullptr.NullMacros
+    value:           'NULL'
+  - key:             readability-identifier-naming.ClassCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.ClassConstantCase
+    value:           UPPER_CASE
+  - key:             readability-identifier-naming.ClassMemberCase
+    value:           camelBack
+  - key:             readability-identifier-naming.ClassMethodCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.ConstexprFunctionCase
+    value:           camelBack
+  - key:             readability-identifier-naming.ConstexprMethodCase
+    value:           camelBack
+  - key:             readability-identifier-naming.ConstexprVariableCase
+    value:           UPPER_CASE
+  - key:             readability-identifier-naming.EnumCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.EnumConstantCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.GlobalConstantCase
+    value:           UPPER_CASE
+  - key:             readability-identifier-naming.GlobalFunctionCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.GlobalVariableCase
+    value:           camelBack
+  - key:             readability-identifier-naming.GlobalVariablePrefix
+    value:           "g_"
+  - key:             readability-identifier-naming.LocalVariableCase
+    value:           camelBack
+  - key:             readability-identifier-naming.MemberCase
+    value:           camelBack
+  - key:             readability-identifier-naming.NamespaceCase
+    value:           lower_case
+  - key:             readability-identifier-naming.ParameterCase
+    value:           camelBack
+  - key:             readability-identifier-naming.ParameterPackCase
+    value:           camelBack
+  - key:             readability-identifier-naming.PublicMemberCase
+    value:           camelBack
+  - key:             readability-identifier-naming.PrivateMemberCase
+    value:           camelBack
+  - key:             readability-identifier-naming.PrivateMemberSuffix
+    value:           "_"
+  - key:             readability-identifier-naming.PrivateMethodCase
+    value:           lower_case
+  - key:             readability-identifier-naming.PrivateMethodSuffix
+    value:           "_"
+  - key:             readability-identifier-naming.ProtectedMemberCase
+    value:           camelBack
+  - key:             readability-identifier-naming.ProtectedMemberSuffix
+    value:           "_"
+  - key:             readability-identifier-naming.StaticConstantCase
+    value:           UPPER_CASE
+  - key:             readability-identifier-naming.StructCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.TemplateParameterCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.TemplateUsingCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.TypeTemplateParameterCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.ValueTemplateParameterCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.UnionCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.UsingCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.VariableCase
+    value:           camelBack
+...
+

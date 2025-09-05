@@ -1,0 +1,257 @@
+stages:
+    - test
+    - lint
+    - docs
+    - collect
+    - deploy
+    - release
+
+variables:
+    MACOSX_DEPLOYMENT_TARGET: "12.7"
+
+### Prototype build jobs ###
+.build_script: &build_script
+    - mkdir -p build/
+    - cd build/
+    - echo $CMAKE_CMD
+    - $CMAKE_CMD
+    - ninja
+
+.test_script: &test_script
+    - ctest -V
+
+.build:
+    variables:
+        EXTRA_CMAKE_FLAGS: ""
+    before_script:
+        - export CMAKE_CMD="cmake -GNinja $EXTRA_CMAKE_FLAGS .."
+    script:
+        - *build_script
+    rules:
+        - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+        - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+          when: never
+        - if: '$CI_COMMIT_BRANCH'
+
+.build_and_test:
+    extends: .build
+    script:
+        - *build_script
+        - *test_script
+    rules:
+        - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+        - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+          when: never
+        - if: '$CI_COMMIT_BRANCH'
+    artifacts:
+        name: "${CI_BUILD_STAGE}_${CI_BUILD_REF_NAME}"
+        paths:
+            - build/Testing/Temporary/
+        when: always
+        expire_in: 2 weeks
+
+### Debian ###
+test:debian:static:
+    extends: .build_and_test
+    stage: test
+    needs: []
+    image: ghcr.io/educelab/ci-docker:static.12.0
+    variables:
+        CMAKE_PREFIX_PATH: "/usr/local/Qt-6.6.1/"
+        EXTRA_CMAKE_FLAGS: "-DVC_BUILD_ACVD=ON -DVC_BUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVC_BUILD_TESTS=ON"
+    tags:
+        - docker
+
+test:debian:dynamic:
+    extends: .build_and_test
+    stage: test
+    needs: []
+    image: ghcr.io/educelab/ci-docker:dynamic.12.0
+    variables:
+        CMAKE_PREFIX_PATH: "/usr/local/Qt-6.6.1/"
+        EXTRA_CMAKE_FLAGS: "-DVC_BUILD_ACVD=ON -DBUILD_SHARED_LIBS=ON -DVC_BUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVC_BUILD_TESTS=ON"
+    tags:
+        - docker
+
+### macOS ###
+test:macos:static:
+    extends: .build_and_test
+    stage: test
+    needs: []
+    variables:
+        CMAKE_PREFIX_PATH: "/usr/local/educelab/vc-deps-1.8.1-static-debug:/usr/local/Qt/6.6.1/macos/lib/cmake/"
+        EXTRA_CMAKE_FLAGS: "-DVC_BUILD_ACVD=ON -DVC_BUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVC_BUILD_TESTS=ON"
+    tags:
+        - macos
+        - test
+
+test:macos:dynamic:
+    extends: .build_and_test
+    stage: test
+    needs: []
+    variables:
+        CMAKE_PREFIX_PATH: "/usr/local/educelab/vc-deps-1.8.1-dynamic-debug:/usr/local/Qt/6.6.1/macos/lib/cmake/"
+        EXTRA_CMAKE_FLAGS: "-DVC_BUILD_ACVD=ON -DBUILD_SHARED_LIBS=ON -DVC_BUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVC_BUILD_TESTS=ON"
+    tags:
+        - macos
+        - test
+
+### Extra checks ###
+lint:clang-format:
+    stage: lint
+    needs: []
+    before_script:
+        - git fetch --all
+    script:
+        - utils/scripts/clang-format.py --print-output
+    allow_failure: true
+    tags:
+        - macos
+        - lint
+    rules:
+        - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+        - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+          when: never
+        - if: '$CI_COMMIT_BRANCH'
+
+### Documentation ###
+pages:
+    stage: docs
+    needs: []
+    image: ghcr.io/educelab/ci-docker:static.12.0
+    before_script:
+        - apt-get -y update
+        - apt-get install --fix-missing --fix-broken -y doxygen graphviz
+    script:
+        - mkdir -p build/
+        - mkdir -p public/
+        - cmake -S . -B build/ -DVC_BUILD_DOCS=ON -DVC_BUILD_APPS=OFF -DVC_BUILD_UTILS=OFF
+        - cmake --build build/ --target docs
+        - mv build/docs/html/ public/docs/
+    artifacts:
+        paths:
+            - public
+        expire_in: 30 days
+    allow_failure: true
+    tags:
+        - docker
+    rules:
+        - if: '$CI_COMMIT_BRANCH == "develop"'
+
+### Collect & Deploy ###
+.deploy_variables: &deploy_variables
+    - export DATETIME=$(date '+%s')
+    - export VERSION=$(utils/scripts/version-gen.sh)
+    - export VERSHORT=$(utils/scripts/version-gen.sh --short)
+    - export SHA=$(git log -1 --format="%h")
+    - export ARCH=$(uname -m)
+
+.rules:release: &rules_release
+    - if: '$CI_COMMIT_TAG =~ /^v.*$/'
+
+.rules:nightly:collect: &rules_nightly_collect
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$BUILD_NIGHTLY == "true"'
+
+.rules:nightly:deploy: &rules_nightly_deploy
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_COMMIT_BRANCH == "develop" && $BUILD_NIGHTLY == "true"'
+
+.collect:package:macos:
+    extends: .build
+    variables:
+        CMAKE_PREFIX_PATH: "/usr/local/Qt/6.6.1/macos/lib/cmake/"
+        CMAKE_INSTALL_PREFIX: "packaged_install/"
+        EXTRA_CMAKE_FLAGS: "-DCMAKE_BUILD_TYPE=Release -DVC_PREBUILT_LIBS=ON -DVC_BUILD_ACVD=ON"
+        MACOSX_DEPLOYMENT_TARGET: "12.7"
+    before_script:
+        - git submodule update --init
+        - cmake -S vc-deps/ -B vc-deps/build/ -GNinja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_MESSAGE=NEVER -DVCDEPS_BUILD_ACVD=OFF
+        - cmake --build vc-deps/build/
+    script:
+        - cmake -S . -B build/ -GNinja ${EXTRA_CMAKE_FLAGS}
+        - cmake --build build/
+        - cmake --install build/ --prefix ${CMAKE_INSTALL_PREFIX}
+        - python3 utils/scripts/macos_codesign_release.py -i ${CMAKE_INSTALL_PREFIX}
+        - *deploy_variables
+        - PKG_NAME="VC-${VERSHORT}-${ARCH}.zip"
+        - ditto -c -k ${CMAKE_INSTALL_PREFIX} ${PKG_NAME}
+        - echo "PACKAGE_NAME=${PKG_NAME}" >> collect.env
+    artifacts:
+        name: "${CI_BUILD_STAGE}_${CI_BUILD_REF_NAME}"
+        paths:
+            - ./*.zip
+        reports:
+            dotenv: collect.env
+        expire_in: 1 day
+    tags:
+        - macos
+        - deploy
+
+collect:binaries:macos:release:
+    extends:
+        - .collect:package:macos
+    stage: collect
+    rules:
+        *rules_release
+    script:
+        - cmake -S . -B build/ -GNinja ${EXTRA_CMAKE_FLAGS}
+        - cmake --build build/
+        - cmake --install build/ --prefix ${CMAKE_INSTALL_PREFIX}
+        - python3 utils/scripts/macos_codesign_release.py -i ${CMAKE_INSTALL_PREFIX}
+        - *deploy_variables
+        - PKG_NAME="VC-${CI_COMMIT_TAG:1}-Darwin-${ARCH}.zip"
+        - ditto -c -k ${CMAKE_INSTALL_PREFIX} ${PKG_NAME}
+        - echo "PACKAGE_NAME=${PKG_NAME}" >> collect.env
+
+collect:binaries:macos:nightly:
+    extends:
+        - .collect:package:macos
+    stage: collect
+    rules:
+        *rules_nightly_collect
+    variables:
+        EXTRA_CMAKE_FLAGS: "-DCMAKE_BUILD_TYPE=Release -DVC_VERSION_DATESTAMP=ON -DVC_PREBUILT_LIBS=ON -DVC_BUILD_ACVD=ON"
+
+release:create:gitlab:
+    stage: release
+    image: registry.gitlab.com/gitlab-org/release-cli:edge
+    needs: ["collect:binaries:macos:release"]
+    rules:
+        *rules_release
+    script:
+        - >
+            release-cli create
+            --name "$CI_COMMIT_TAG"
+            --description "Auto-created release $CI_COMMIT_TAG"
+            --tag-name "$CI_COMMIT_TAG"
+            --ref "$CI_COMMIT_TAG"
+    tags:
+        - docker
+
+release:upload:github:
+    stage: release
+    image: debian:bullseye
+    needs: ["collect:binaries:macos:release"]
+    rules:
+      *rules_release
+    before_script:
+        - type -p curl >/dev/null || (apt update && apt install curl -y)
+        - curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+        - chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+        - echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+        - apt update
+        - apt install gh -y
+    script:
+        - >
+            gh release upload
+            "$CI_COMMIT_TAG" 
+            "${PACKAGE_NAME}"
+            -R educelab/volume-cartographer
+            --clobber
+    tags:
+        - docker

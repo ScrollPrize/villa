@@ -1,0 +1,51 @@
+@PACKAGE_INIT@
+
+# Setup for dependency management
+include(CMakeFindDependencyMacro)
+### Setup search path for custom FindXXX.cmake modules ###
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_LIST_DIR}/Modules/")
+
+#####################################################################
+# Dependencies: This section should mirror VCFindDependencies.cmake #
+#####################################################################
+### Modern JSON ###
+find_package(nlohmann_json v3.9.1 QUIET REQUIRED)
+
+### Filesystem ###
+if(@VC_USE_BOOSTFS@)
+    find_dependency(Boost @Boost_MAJOR_VERSION@.@Boost_MINOR_VERSION@ QUIET REQUIRED COMPONENTS system filesystem)
+    add_compile_definitions(VC_USE_BOOSTFS)
+else()
+    find_dependency(Filesystem QUIET REQUIRED)
+endif()
+
+### ITK ###
+find_dependency(ITK @ITK_VERSION_MAJOR@.@ITK_VERSION_MINOR@ QUIET REQUIRED)
+include(${ITK_USE_FILE})
+
+### VTK ###
+find_dependency(VTK @VTK_VERSION_MAJOR@.@VTK_VERSION_MINOR@ QUIET REQUIRED)
+include(${VTK_USE_FILE})
+
+### ACVD ###
+find_package(ACVD @ACVD_VERSION@ QUIET REQUIRED)
+
+### Eigen3 ###
+find_dependency(Eigen3 @Eigen3_VERSION_MAJOR@.@Eigen3_VERSION_MINOR@ QUIET REQUIRED)
+
+### OpenCV ###
+find_dependency(OpenCV @OpenCV_VERSION_MAJOR@.@OpenCV_VERSION_MINOR@ QUIET REQUIRED)
+
+### TIFF ###
+find_dependency(TIFF QUIET REQUIRED)
+
+### spdlog ###
+find_dependency(spdlog CONFIG QUIET REQUIRED)
+
+### smgl ###
+find_dependency(smgl @smgl_VERSION@ CONFIG QUIET REQUIRED)
+#####################################################################
+
+### Include VC targets ###
+include("${CMAKE_CURRENT_LIST_DIR}/@targets_export_name@.cmake")
+check_required_components("@PROJECT_NAME@")
