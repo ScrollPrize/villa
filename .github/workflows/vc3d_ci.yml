@@ -18,6 +18,6 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-            file: ubuntu-24.04-noble.Dockerfile
+            file: volume-cartographer/ubuntu-24.04-noble.Dockerfile
             push: false
             tags: ${{ github.repository_owner }}/volume-cartographer:latest
