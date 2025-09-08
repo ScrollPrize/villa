@@ -581,19 +581,11 @@ class BaseDataset(Dataset):
                     elastic_deform_magnitude=(25, 75)
                 )
             )
-            
-            # Add morphological closing after spatial transform if needed for skeleton
-            if self._needs_skeleton_transform():
-                from vesuvius.models.augmentation.transforms.utils.morphological_closing import MorphologicalClosingTransform
-                transforms.append(MorphologicalClosingTransform(structure_size=2))
-                print("Added MorphologicalClosingTransform after spatial transforms")
-            
-            # Add mirroring in the same places nnUNet would (no wrapper)
+
             if mirror_axes is not None and len(mirror_axes) > 0:
                 transforms.append(MirrorTransform(allowed_axes=mirror_axes))
 
         if dimension == 2:
-            # Intensity and artifact transforms aligned with nnUNet SkeletonRecall
             if not only_spatial_and_intensity:
                 transforms.append(RandomTransform(
                     BlankRectangleTransform(
@@ -694,7 +686,6 @@ class BaseDataset(Dataset):
                         apply_probability=0.2
                     ))
 
-            # Artifacts and intensity transforms individually (remove OneOf bundles)
             if not only_spatial_and_intensity:
                 transforms.append(RandomTransform(
                     BlankRectangleTransform(
@@ -792,64 +783,6 @@ class BaseDataset(Dataset):
                     p_retain_stats=1
                 ), apply_probability=0.4
             ))
-            # transforms.append(RandomTransform(
-            #     GaussianNoiseTransform(
-            #         noise_variance=(0, 0.1),
-            #         p_per_channel=1,
-            #         synchronize_channels=True
-            #     ), apply_probability=0.1
-            # ))
-            # transforms.append(RandomTransform(
-            #     GaussianBlurTransform(
-            #         blur_sigma=(0.5, 1.),
-            #         synchronize_channels=False,
-            #         synchronize_axes=False,
-            #         p_per_channel=0.5, benchmark=True
-            #     ), apply_probability=0.2
-            # ))
-            # transforms.append(RandomTransform(
-            #     MultiplicativeBrightnessTransform(
-            #         multiplier_range=BGContrast((0.75, 1.25)),
-            #         synchronize_channels=False,
-            #         p_per_channel=1
-            #     ), apply_probability=0.15
-            # ))
-            # transforms.append(RandomTransform(
-            #     ContrastTransform(
-            #         contrast_range=BGContrast((0.75, 1.25)),
-            #         preserve_range=True,
-            #         synchronize_channels=False,
-            #         p_per_channel=1
-            #     ), apply_probability=0.15
-            # ))
-            # transforms.append(RandomTransform(
-            #     SimulateLowResolutionTransform(
-            #         scale=(0.5, 1),
-            #         synchronize_channels=False,
-            #         synchronize_axes=True,
-            #         ignore_axes=None,
-            #         allowed_channels=None,
-            #         p_per_channel=0.5
-            #     ), apply_probability=0.25
-            # ))
-            # transforms.append(RandomTransform(
-            #     GammaTransform(
-            #         gamma=BGContrast((0.7, 1.5)),
-            #         p_invert_image=1,
-            #         synchronize_channels=False,
-            #         p_per_channel=1,
-            #         p_retain_stats=1
-            #     ), apply_probability=0.1
-            # ))
-            # transforms.append(RandomTransform(
-            #     GammaTransform(
-            #         gamma=BGContrast((0.7, 1.5)),
-            #         p_invert_image=0,
-            #         synchronize_channels=False,
-            #         p_per_channel=1,
-            #         p_retain_stats=1
-            #     ), apply_probability=0.3
-            # ))
 
         if no_spatial:
             print("Spatial transformations disabled (no_spatial=True)")
@@ -857,9 +790,7 @@ class BaseDataset(Dataset):
         if only_spatial_and_intensity:
             print("Only spatial and intensity augmentations enabled (only_spatial_and_intensity=True)")
 
-        # Check if we need skeleton transform
         if self._needs_skeleton_transform():
-            # Import here to avoid circular dependencies
             from vesuvius.models.augmentation.transforms.utils.skeleton_transform import MedialSurfaceTransform
             transforms.append(MedialSurfaceTransform(do_tube=False))
             print("Added MedialSurfaceTransform to training pipeline")
