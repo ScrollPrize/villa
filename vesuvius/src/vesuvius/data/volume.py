@@ -105,6 +105,7 @@ class Volume:
                  normalization_scheme: str = 'none',
                  global_mean: Optional[float] = None,
                  global_std: Optional[float] = None,
+                 intensity_props: Optional[Dict[str, float]] = None,
                  return_as_type: str = 'none',
                  return_as_tensor: bool = False,
                  verbose: bool = False,
@@ -156,6 +157,7 @@ class Volume:
         self.normalization_scheme = normalization_scheme
         self.global_mean = global_mean
         self.global_std = global_std
+        self.intensity_props = intensity_props or None
         self.return_as_type = return_as_type
         self.return_as_tensor = return_as_tensor
         self.path = path
@@ -163,13 +165,17 @@ class Volume:
         self.inklabel = None  # Initialize inklabel
 
         # --- Input Validation ---
-        valid_schemes = ['none', 'instance_zscore', 'global_zscore', 'instance_minmax']
+        valid_schemes = ['none', 'instance_zscore', 'global_zscore', 'instance_minmax', 'ct']
         if self.normalization_scheme not in valid_schemes:
             raise ValueError(
                 f"Invalid normalization_scheme: '{self.normalization_scheme}'. Must be one of {valid_schemes}")
 
         if self.normalization_scheme == 'global_zscore' and (self.global_mean is None or self.global_std is None):
             raise ValueError("global_mean and global_std must be provided when normalization_scheme is 'global_zscore'")
+        if self.normalization_scheme == 'ct':
+            required = ['mean', 'std', 'percentile_00_5', 'percentile_99_5']
+            if not self.intensity_props or not all(k in self.intensity_props for k in required):
+                raise ValueError("CT normalization requires intensity_props with keys: 'mean', 'std', 'percentile_00_5', 'percentile_99_5'")
 
         try:
             # --- Zarr Direct Path Handling ---
@@ -817,6 +823,18 @@ class Volume:
                 denominator = max(max_val - min_val, 1e-8)  # Epsilon for stability
                 data_slice[c] = (data_slice[c] - min_val) / denominator
             if self.verbose: print(f"  Applied instance Min-Max scaling to [0, 1].")
+
+        elif self.normalization_scheme == 'ct':
+            # nnU-Net CT normalization: clip to percentiles then z-score with global mean/std
+            lb = float(self.intensity_props['percentile_00_5'])
+            ub = float(self.intensity_props['percentile_99_5'])
+            mean = float(self.intensity_props['mean'])
+            std = float(self.intensity_props['std'])
+            # Clip in-place per channel
+            data_slice = np.clip(data_slice, lb, ub)
+            data_slice = (data_slice - mean) / max(std, 1e-8)
+            if self.verbose: print(
+                f"  Applied CT normalization (clip to [{lb:.4f}, {ub:.4f}], mean={mean:.4f}, std={std:.4f}).")
 
         elif self.normalization_scheme != 'none':
             raise ValueError(f"Internal Error: Unknown normalization scheme '{self.normalization_scheme}' encountered.")

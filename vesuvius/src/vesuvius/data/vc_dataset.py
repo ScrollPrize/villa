@@ -38,6 +38,7 @@ class VCDataset(Dataset):
             normalization_scheme: str = 'instance_zscore', # Default to instance z-score
             global_mean: Optional[float] = None,
             global_std: Optional[float] = None,
+            intensity_props: Optional[dict] = None,
             return_as_type: str = 'np.float16', # Default float type for model input
             # return_as_tensor: bool = True, # Forcing True below
             domain: Optional[str] = None,
@@ -155,6 +156,8 @@ class VCDataset(Dataset):
                 print(f"  Normalization: {normalization_scheme}")
                 if normalization_scheme == 'global_zscore':
                      print(f"    Global Mean: {global_mean}, Global Std: {global_std}")
+                if normalization_scheme == 'ct':
+                     print(f"    Intensity props keys: {list((intensity_props or {}).keys())}")
                 print(f"  Return Type (NumPy): {return_as_type}")
                 print(f"  Return As Tensor: {self.return_as_tensor}") # Use internal dataset flag
                 print(f"  Input Channels: {num_input_channels}")
@@ -190,6 +193,7 @@ class VCDataset(Dataset):
                 normalization_scheme=normalization_scheme,
                 global_mean=global_mean,
                 global_std=global_std,
+                intensity_props=intensity_props,
                 return_as_type=return_as_type,
                 return_as_tensor=self.return_as_tensor, # Ensure Volume returns tensors directly
                 verbose=verbose,
