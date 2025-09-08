@@ -4,22 +4,38 @@ from tqdm import tqdm
 import argparse
 from pathlib import Path
 from multiprocessing import Pool
+from PIL import Image
 
 
 def apply_mask(args):
-    img_path, mask_path, output_path, fill_value = args
+    img_path, mask_path, output_path, fill_value, downsample_factor = args
     
     try:
         # Read image and mask
         img = tifffile.imread(img_path)
         mask = tifffile.imread(mask_path)
-        
+
         # Check if shapes match
         if img.shape != mask.shape:
             return f"Error: Shape mismatch for {img_path.name} - Image: {img.shape}, Mask: {mask.shape}"
-        
-        # Apply mask (set to fill_value where mask is 0)
-        masked_img = np.where(mask > 0, img, fill_value)
+
+        # Prepare processing mask, optionally downsampled then restored to original size
+        if downsample_factor is None or downsample_factor < 1:
+            downsample_factor = 1
+
+        if downsample_factor > 1:
+            h, w = mask.shape
+            ds_w = max(1, (w + downsample_factor - 1) // downsample_factor)
+            ds_h = max(1, (h + downsample_factor - 1) // downsample_factor)
+            mask_img = Image.fromarray((mask > 0).astype(np.uint8) * 255)
+            mask_ds = mask_img.resize((ds_w, ds_h), resample=Image.NEAREST)
+            mask_restored = mask_ds.resize((w, h), resample=Image.NEAREST)
+            proc_mask = np.array(mask_restored) > 0
+        else:
+            proc_mask = mask > 0
+
+        # Apply mask (set to fill_value where proc_mask is False)
+        masked_img = np.where(proc_mask, img, fill_value)
         
         # Convert to uint8 before saving
         masked_img = masked_img.astype(np.uint8)
@@ -41,6 +57,8 @@ def main():
     parser.add_argument('--workers', type=int, default=16, help='Number of worker processes (default: 16)')
     parser.add_argument('--suffix', type=str, default='', help='Suffix to match mask files (e.g., "_mask" if masks are named "image_mask.tif")')
     parser.add_argument('--fill-value', type=float, default=0, help='Value to set for pixels outside the mask (default: 0)')
+    parser.add_argument('--downsample-factor', type=int, default=1,
+                        help='Integer factor to downsample image and mask before applying (default: 1 = no downsampling)')
     
     args = parser.parse_args()
     
@@ -91,7 +109,7 @@ def main():
         
         if mask_path.exists():
             output_path = output_dir / img_path.name
-            worker_args.append((img_path, mask_path, output_path, args.fill_value))
+            worker_args.append((img_path, mask_path, output_path, args.fill_value, args.downsample_factor))
         else:
             missing_masks.append(img_path.name)
     
@@ -114,6 +132,7 @@ def main():
     print(f"Output directory: {output_dir}")
     print(f"Using {args.workers} workers")
     print(f"Fill value for masked areas: {args.fill_value}")
+    print(f"Downsample factor: {args.downsample_factor}")
     
     # Process with multiprocessing
     with Pool(processes=args.workers) as pool:

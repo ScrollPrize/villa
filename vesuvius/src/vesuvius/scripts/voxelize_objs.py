@@ -168,7 +168,7 @@ def main():
         description="Process OBJ meshes and slice them along z to produce label images."
     )
     parser.add_argument("folder", help="Path to folder containing OBJ meshes (or parent folder with subfolders of OBJ meshes)")
-    parser.add_argument("--scroll", required=True, choices=["scroll1", "scroll2", "scroll3", "scroll4", "scroll5"],
+    parser.add_argument("--scroll", required=True, choices=["scroll1", "scroll2", "scroll3", "scroll4", "scroll5", "0500p2", "0139", "343p_2um_116", "343p_9um"],
                         help="Scroll shape to use (determines image dimensions)")
     parser.add_argument("--output_path", default="mesh_labels_slices",
                         help="Output folder for label images (default: mesh_labels_slices)")
@@ -193,7 +193,10 @@ def main():
         "scroll2": (10112, 11984), # (h, w) for scroll2
         "scroll3": (3550, 3400),   # (h, w) for scroll3
         "scroll4": (3440, 3340),   # (h, w) for scroll4
-        "scroll5": (6700, 9100)    # (h, w) for scroll5
+        "scroll5": (6700, 9100),    # (h, w) for scroll5
+        "0500p2" : (4712, 4712),
+        "343p_2um_116" : (13155, 13155),
+        "343p_9um" : (5057, 5057)
     }
     if args.scroll not in scroll_shapes:
         print("Invalid scroll shape specified.")
