@@ -479,7 +479,7 @@ cv::Mat renderApprovedPatches(const std::string& target_segment_id, const fs::pa
               << " cells, cell size: " << cell_size << std::endl;
 
     // Process with stride
-    int stride = 8;
+    int stride = 4;
     cv::Size process_size(gen_size.width / stride, gen_size.height / stride);
     cv::Mat_<cv::Vec3b> output_sparse(process_size, cv::Vec3b(255, 255, 255));
 
@@ -519,9 +519,9 @@ cv::Mat renderApprovedPatches(const std::string& target_segment_id, const fs::pa
             bool found_in_patch = false;
 
             for (int patch_idx : candidates) {
-                float dist = patch_surfaces[patch_idx]->containsPoint(point, tolerance);
+                bool found = patch_surfaces[patch_idx]->containsPoint(point, tolerance);
 
-                if (dist >= 0 && dist <= tolerance) {
+                if (found) {
                     output_sparse(j, i) = getColormapColor(patch_idx, patch_surfaces.size());
                     patch_counts[patch_idx]++;
                     found_in_patch = true;
