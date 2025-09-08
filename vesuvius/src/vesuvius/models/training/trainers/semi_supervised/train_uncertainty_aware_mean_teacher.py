@@ -340,11 +340,15 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         # Remove _inputs from outputs to avoid issues downstream
         outputs.pop('_inputs', None)
         
-        return total_loss, task_losses, inputs, targets_dict, outputs, optimizer_stepped
+        # Remove is_unlabeled from targets_dict before returning to avoid breaking debug gif capture
+        # The base trainer's debug sample capture logic expects only actual targets in targets_dict
+        targets_dict_clean = {k: v for k, v in targets_dict.items() if k != 'is_unlabeled'}
+
+        return total_loss, task_losses, inputs, targets_dict_clean, outputs, optimizer_stepped
     
-    def train(self):
-        """Override train method to add EMA model initialization"""
-        training_state = self._initialize_training()
+    def _initialize_training(self):
+        """Override to initialize EMA model after base initialization"""
+        training_state = super()._initialize_training()
         
         # Create EMA model after the student model is initialized
         model = training_state['model']
@@ -353,6 +357,4 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         print(f"Uncertainty estimation using {self.uncertainty_T} forward passes")
         print(f"Consistency weight ramp-up over {self.consistency_rampup} epochs")
         
-        # Call the parent train method with our EMA model ready
-        # The parent train will use our overridden _train_step and _compute_train_loss
-        super().train()
+        return training_state
