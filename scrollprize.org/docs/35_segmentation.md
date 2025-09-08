@@ -78,7 +78,7 @@ sudo docker run hello-world
 
 While it is possible to build this from source, we recommend just pulling the container image from our [volume-cartographer repository](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer) by entering the following command:
 ```bash
-sudo docker pull ghcr.io/scrollprize/volume-cartographer:edge
+sudo docker pull ghcr.io/scrollprize/villa/volume-cartographer:edge
 ```
 
 **Launch VC3D**
@@ -93,7 +93,7 @@ sudo docker run -it --rm \
   -e DISPLAY=$DISPLAY \
   -e QT_QPA_PLATFORM=xcb \
   -e QT_X11_NO_MITSHM=1 \
-ghcr.io/scrollprize/volume-cartographer:edge
+ghcr.io/scrollprize/villa/volume-cartographer:edge
 ```
 The -v flag is used to mount a folder to the docker image, allowing you to use files that exist on your local filesystem. It will be mounted under the path following the ':'. You can place as many folders here as you would like.
 
