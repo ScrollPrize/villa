@@ -1,5 +1,5 @@
 #include <omp.h>
-
+#include <random>
 
 #include <opencv2/highgui.hpp>
 #include <opencv2/core.hpp>
@@ -30,6 +30,26 @@ static float dist_loss_2d_w = 1.0f;        // Weight for 2D distance constraints
 static float dist_loss_3d_w = 2.0f;        // Weight for 3D distance constraints
 static float straight_min_count = 1.0f;    // Minimum number of straight constraints
 static int inlier_base_threshold = 20;     // Starting threshold for inliers
+
+// ---- Deterministic helpers --------------------------------------------------
+static inline uint64_t mix64(uint64_t x) {
+    // SplitMix64
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+static inline double det_jitter01(int y, int x, uint64_t salt) {
+    uint64_t h = mix64((uint64_t(y) << 32) ^ uint64_t(x) ^ salt);
+    // map to [0,1)
+    const double inv = 1.0 / double(UINT64_C(1) << 53);
+    return double(h >> 11) * inv;
+}
+static inline double det_jitter_symm(int y, int x, uint64_t salt) {
+    // map to ~[-1,1)
+    return 2.0 * det_jitter01(y, x, salt) - 1.0;
+}
+// -----------------------------------------------------------------------------
 
 static cv::Vec3f at_int_inv(const cv::Mat_<cv::Vec3f> &points, cv::Vec2f p)
 {
@@ -1100,6 +1120,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     dist_loss_3d_w = params.value("dist_loss_3d_w", 2.0f);              // Weight for 3D distance constraints
     straight_min_count = params.value("straight_min_count", 1.0f);      // Minimum number of straight constraints
     inlier_base_threshold = params.value("inlier_base_threshold", 20);  // Starting threshold for inliers
+    uint64_t deterministic_seed = uint64_t(params.value("deterministic_seed", 5489));
 
     // Optional hard z-range constraint: [z_min, z_max]
     bool enforce_z_range = false;
@@ -1139,6 +1160,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     std::cout << "  z_loc_loss_w: " << z_loc_loss_w << std::endl;
     std::cout << "  dist_loss_2d_w: " << dist_loss_2d_w << std::endl;
     std::cout << "  dist_loss_3d_w: " << dist_loss_3d_w << std::endl;
+    std::cout << "  deterministic_seed: " << deterministic_seed << std::endl;
     if (enforce_z_range)
         std::cout << "  z_range: [" << z_min << ", " << z_max << "]" << std::endl;
 
@@ -1207,12 +1229,20 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
 
     cv::Vec2i seed_loc = {seed_points.rows/2, seed_points.cols/2};
 
-    int tries = 0;
-    while (seed_points(seed_loc)[0] == -1 || (enforce_z_range && (seed_points(seed_loc)[2] < z_min || seed_points(seed_loc)[2] > z_max))) {
-        seed_loc = {rand() % seed_points.rows, rand() % seed_points.cols };
-        std::cout << "try loc " << seed_loc << std::endl;
-        if (++tries > 10000)
-            break;
+    // Deterministic seed search around center using PRNG seeded by param
+    {
+        std::mt19937_64 rng(deterministic_seed);
+        std::uniform_int_distribution<int> ry(0, seed_points.rows - 1);
+        std::uniform_int_distribution<int> rx(0, seed_points.cols - 1);
+        int tries = 0;
+        while (seed_points(seed_loc)[0] == -1 ||
+               (enforce_z_range && (seed_points(seed_loc)[2] < z_min || seed_points(seed_loc)[2] > z_max))) {
+            seed_loc = {ry(rng), rx(rng)};
+            if (++tries > 10000) break;
+        }
+        if (tries > 0) {
+            std::cout << "deterministic seed search tries: " << tries << " got " << seed_loc << std::endl;
+        }
     }
 
     data.loc(seed,{y0,x0}) = {seed_loc[0], seed_loc[1]};
@@ -1367,7 +1397,11 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
 
                 avg /= ref_count;
 
-                data_th.loc(ref_surf,p) = avg + cv::Vec2d((rand() % 1000)/500.0-1, (rand() % 1000)/500.0-1);
+                // Deterministic symmetric jitter in [-1,1), per cell & per surface pointer
+                uint64_t salt = deterministic_seed ^ mix64(uint64_t(reinterpret_cast<uintptr_t>(ref_surf)));
+                double j0 = det_jitter_symm(p[0], p[1], salt);
+                double j1 = det_jitter_symm(p[0], p[1], salt ^ 0x9e3779b97f4a7c15ULL);
+                data_th.loc(ref_surf,p) = avg + cv::Vec2d(j0, j1);
 
                 ceres::Problem problem;
 
