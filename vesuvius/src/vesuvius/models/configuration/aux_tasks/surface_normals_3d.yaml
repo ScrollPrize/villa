@@ -1,14 +1,16 @@
 tr_setup:
-  model_name: "inplane_medialsurf"
+  model_name: "surface_normals_3d"
 
 tr_config:
   batch_size: 2
-  enable_deep_supervision: false
+  enable_deep_supervision: true
 
 dataset_config:
+  # Baseline sampling; adjust as needed
   min_labeled_ratio: 0
   min_bbox_percent: 0
   skip_patch_validation: true
+
   targets:
     surface:
       weight: 1.0
@@ -18,20 +20,20 @@ dataset_config:
           weight: 1.0
 
 auxiliary_tasks:
-  inplane_direction:
-    type: inplane_direction
+  surface_normals:
+    type: surface_normals
     source_target: surface
-    compute_from: sdt
-    grad_sigma: 1.0
-    tensor_sigma: 1.5
-    loss_weight: 0.5
+    loss_weight: 1.0
+    # out_channels auto-detected as op_dims (3D -> 3)
     losses:
-      - name: "SignInvariantCosineLoss"
+      - name: "CosineSimilarityLoss"
         weight: 1.0
         kwargs:
           dim: 1
           eps: 1e-8
-          ignore_index: -100
-
-
+      - name: "NormalSmoothnessLoss"
+        weight: 0.5
+        kwargs:
+          sigma: 2.0
+          q: 2.0
 
