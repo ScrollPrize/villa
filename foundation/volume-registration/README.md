@@ -16,9 +16,9 @@ pip install -r requirements.txt
 
 ```bash
 python -i find_transform.py \
---fixed https://volumes.aws.ash2txt.org/esrf/20250717/SCROLLS_HEL_4.681um_113keV_1.2m_binmean_2_PHerc_0500P2_HA_0001_masked.zarr/ \
+--fixed [REDACTED] \
 --fixed-voxel-size 9.362 \
---moving https://volumes.aws.ash2txt.org/esrf/20250506/2.215um_HEL_TA_0.4m_110keV_scroll-fragment_0500P2_TA_0001_masked.zarr/ \
+--moving [REDACTED] \
 --output-transform output_transform.json \
 --initial-transform initial_transform.json
 ```
@@ -30,6 +30,8 @@ Typically one finds a transform by following these steps (details below):
 - Performing a coarse initial alignment by rotating, translating, and flipping the moving volume using keybinds until it roughly aligns with the fixed volume.
 - Adding manual landmark points to each volume based on visual features, refining the alignment.
 - (Optional and not recommended at this time) Using SimpleITK to fit a transform. The current implementation uses low-resolution levels of the Zarr input volumes, and does not result in precise transforms.
+
+[Overview video](https://drive.google.com/file/d/1d05znwDmNCJdOsLd8VlH0clRorNhtcKg/view?usp=drive_link)
 
 #### Visualization
 

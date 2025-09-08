@@ -1,0 +1,78 @@
+set(CMAKE_AUTORCC ON)
+
+set(CHUNK_CACHE_SIZE_GB "10" CACHE STRING "size of the chunk cache in gigabytes")
+add_definitions(-DCHUNK_CACHE_SIZE_GB=${CHUNK_CACHE_SIZE_GB})
+
+set(srcs
+    VCAppMain.cpp
+    CWindow.cpp
+    CWindowContextMenu.cpp
+    CVolumeViewer.cpp
+    CVolumeViewerView.cpp
+    SettingsDialog.cpp
+    CSurfaceCollection.cpp
+    OpChain.cpp
+    OpsList.cpp
+    OpsSettings.cpp
+    formsetsrc.cpp
+    SurfaceTreeWidget.hpp
+    SurfaceTreeWidget.cpp
+    SeedingWidget.cpp
+    SeedingWidget.hpp
+    DrawingWidget.cpp
+    DrawingWidget.hpp
+    PathData.cpp
+    PathData.hpp
+    CSegmentationEditorWindow.cpp
+    CSegmentationEditorWindow.hpp
+    SegmentRenderThread.cpp
+    SegmentRenderThread.hpp
+    ProgressUtil.cpp
+    ProgressUtil.hpp
+    CommandLineToolRunner.cpp
+    CommandLineToolRunner.hpp
+    ToolDialogs.cpp
+    ToolDialogs.hpp
+    ConsoleOutputWidget.cpp
+    ConsoleOutputWidget.hpp
+    CPointCollectionWidget.cpp
+    COutlinedTextItem.hpp
+    COutlinedTextItem.cpp
+)
+
+if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)
+    list(APPEND srcs "${CMAKE_SOURCE_DIR}/misc/sanitizer_config.c")
+endif()
+
+
+add_executable(VC3D ${srcs} resources.qrc)
+
+target_link_libraries(VC3D
+    vc_core
+    vc_ui
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+)
+
+if (${VC_INSTALL_APPS})
+    install(
+        TARGETS VC3D
+        BUNDLE DESTINATION . COMPONENT Programs
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT Programs
+    )
+
+    install(
+            PROGRAMS ${CMAKE_SOURCE_DIR}/scripts/vc_sync.py ${CMAKE_SOURCE_DIR}/scripts/flatboi.py
+            DESTINATION ${CMAKE_INSTALL_BINDIR}
+            COMPONENT Programs
+    )
+
+
+    qt_generate_deploy_app_script(
+        TARGET VC3D
+        OUTPUT_SCRIPT vc_gui_deploy_script
+        NO_UNSUPPORTED_PLATFORM_ERROR
+    )
+    install(SCRIPT ${vc_gui_deploy_script} COMPONENT Programs)
+endif()
