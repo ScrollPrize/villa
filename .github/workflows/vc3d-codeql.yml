@@ -5,7 +5,6 @@ on:
     paths:
       - 'volume-cartographer/**'
       - '.github/workflows/vc3d-codeql.yml'
-  workflow_dispatch:
   schedule:
     # Friday 11:43 UTC
     - cron: '43 11 * * 5'
