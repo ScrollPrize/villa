@@ -117,6 +117,22 @@ class BaseTrainer:
         loss_fns = {}
         self._deferred_losses = {}  # losses that may be added later in training (at a selected epoch)
         
+        def _pretty_loss_name(loss_fn, fallback_name: str):
+            """Return a human-friendly loss name including base loss under wrappers."""
+            try:
+                names = []
+                lf = loss_fn
+                # Unwrap nested wrappers exposing `.loss`
+                while hasattr(lf, 'loss'):
+                    names.append(lf.__class__.__name__)
+                    lf = lf.loss
+                base = lf.__class__.__name__
+                if names:
+                    return f"{' + '.join(names)} ({base})"
+                return base
+            except Exception:
+                return fallback_name
+
         for task_name, task_info in self.mgr.targets.items():
             task_losses = []
             deferred_losses = []
@@ -155,11 +171,11 @@ class BaseTrainer:
                                 'start_epoch': start_epoch,
                                 'name': loss_name
                             })
-                            print(f"  - {loss_name} (weight: {loss_weight}) - will start at epoch {start_epoch}")
+                            print(f"  - {_pretty_loss_name(loss_fn, loss_name)} (weight: {loss_weight}) - will start at epoch {start_epoch}")
                         else:
                             # Add immediately
                             task_losses.append((loss_fn, loss_weight))
-                            print(f"  - {loss_name} (weight: {loss_weight})")
+                            print(f"  - {_pretty_loss_name(loss_fn, loss_name)} (weight: {loss_weight})")
                     except RuntimeError as e:
                         raise ValueError(
                             f"Failed to create loss function '{loss_name}' for target '{task_name}': {str(e)}")
@@ -746,7 +762,8 @@ class BaseTrainer:
             task_loss_fns = loss_fns[t_name]  # List of (loss_fn, weight) tuples
             task_weight = self.mgr.targets[t_name].get("weight", 1.0)
 
-            task_total_loss = 0.0
+            # Initialize as tensor on same device/dtype to keep downstream ops consistent
+            task_total_loss = torch.zeros((), device=t_pred.device, dtype=t_pred.dtype)
             for loss_fn, loss_weight in task_loss_fns:
                 # this naming is extremely confusing, i know. we route all loss through the aux helper
                 # because it just simplifies adding addtl losses for aux tasks if present.
@@ -808,7 +825,8 @@ class BaseTrainer:
             t_pred = outputs[t_name]
             task_loss_fns = loss_fns[t_name]  # List of (loss_fn, weight) tuples
 
-            task_total_loss = 0.0
+            # Initialize as tensor on same device/dtype to keep downstream ops consistent
+            task_total_loss = torch.zeros((), device=t_pred.device, dtype=t_pred.dtype)
             for loss_fn, loss_weight in task_loss_fns:
                 # Get skeleton data if available
                 skeleton_data = targets_dict.get(f'{t_name}_skel', None)

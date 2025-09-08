@@ -42,6 +42,11 @@ def create_auxiliary_task(task_type: str, aux_task_name: str, aux_config: Dict[s
     elif task_type == "inplane_direction":
         from .aux_inplane_direction import create_inplane_direction_config
         return create_inplane_direction_config(aux_task_name, aux_config, source_target_name)
+    elif task_type == "nearest_component":
+        from .aux_nearest_component import create_nearest_component_config
+        # Need to know dimensionality; caller supplies mgr usually. Fallback to 3D.
+        # Here we don't have mgr, so default to 3D; config_manager will usually set channels anyway.
+        return create_nearest_component_config(aux_task_name, aux_config, source_target_name, is_2d=False)
     else:
         raise ValueError(f"Unknown auxiliary task type: {task_type}")
 

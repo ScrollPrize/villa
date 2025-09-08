@@ -140,14 +140,21 @@ class ConfigManager:
         self.in_channels = self.model_config.get("in_channels", 1)
         self.out_channels = ()
         for target_name, task_info in self.targets.items():
-            # Look for either 'out_channels' or 'channels' in the task info
+            # Determine channels, with special handling for derived tasks
             if 'out_channels' in task_info:
                 channels = task_info['out_channels']
             elif 'channels' in task_info:
                 channels = task_info['channels']
             else:
-                channels = 2  # Default to 2
-                task_info['out_channels'] = 2
+                task_type = str(task_info.get('task_type', '')).lower()
+                if task_type == 'nearest_component':
+                    # vector (op_dims) + 1 scalar distance
+                    ch = (self.op_dims if hasattr(self, 'op_dims') and self.op_dims in (2, 3) else len(self.train_patch_size)) + 1
+                    channels = ch
+                    task_info['out_channels'] = ch
+                else:
+                    channels = 2  # Default to 2
+                    task_info['out_channels'] = 2
 
             self.out_channels += (channels,)
 

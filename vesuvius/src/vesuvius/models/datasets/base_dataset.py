@@ -533,22 +533,23 @@ class BaseDataset(Dataset):
         for t_name, label_patch in label_patches.items():
             result[t_name] = torch.from_numpy(label_patch)
 
-        # --- Auto-generate auxiliary targets from source labels, if configured ---
-        # We generate ground-truth for auxiliary tasks (e.g., distance_transform, surface_normals)
-        # based on their declared source_target. This enables related regression/regularization
-        # losses to run without having to precompute and store aux labels on disk.
+        # --- Auto-generate computed targets from source labels, if configured ---
+        # We generate ground-truth for tasks (e.g., distance_transform, surface_normals, inplane_direction,
+        # nearest_component) based on their declared source_target. This enables related regression/regularization
+        # losses to run without having to precompute and store labels on disk.
         try:
             regression_keys = []
             for aux_name, tinfo in getattr(self.mgr, 'targets', {}).items():
+                # Only generate for explicitly marked auxiliary tasks
                 if not tinfo.get('auxiliary_task', False):
                     continue
+                task_type = str(tinfo.get('task_type', '')).lower()
 
                 source_t = tinfo.get('source_target')
                 if not source_t or source_t not in label_patches:
                     # Source not available in this batch (or not configured)
                     continue
 
-                task_type = tinfo.get('task_type', '').lower()
                 src_patch = label_patches[source_t]  # numpy array, shape (C, ...) float32
 
                 # Build a binary mask from the first channel of the source label
@@ -605,6 +606,15 @@ class BaseDataset(Dataset):
                         grad_sigma=float(tinfo.get('grad_sigma', 1.0)),
                         tensor_sigma=float(tinfo.get('tensor_sigma', 1.5)),
                         ignore_index=tinfo.get('ignore_index', -100),
+                    )
+                    result[aux_name] = torch.from_numpy(aux_patch)
+                    regression_keys.append(aux_name)
+                elif task_type == 'nearest_component':
+                    from vesuvius.models.training.auxiliary_tasks import compute_nearest_component
+                    aux_patch = compute_nearest_component(
+                        binary_mask,
+                        self.is_2d_dataset,
+                        sdf_sigma=float(tinfo.get('sdf_sigma', 0.0)),
                     )
                     result[aux_name] = torch.from_numpy(aux_patch)
                     regression_keys.append(aux_name)

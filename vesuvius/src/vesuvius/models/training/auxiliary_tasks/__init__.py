@@ -32,3 +32,8 @@ from .aux_inplane_direction import (
     create_inplane_direction_config,
     compute_inplane_direction
 )
+
+from .aux_nearest_component import (
+    create_nearest_component_config,
+    compute_nearest_component
+)

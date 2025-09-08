@@ -262,6 +262,39 @@ class SignInvariantCosineLoss(nn.Module):
         else:
             return loss.mean()
 
+
+class ChannelSelectLoss(nn.Module):
+    """
+    Wrapper to apply a base loss to a channel subset along dim=1.
+
+    channels can be:
+    - 'last'            -> select last channel only
+    - 'all_but_last'    -> select all except last
+    - list/tuple of int -> explicit indices
+    """
+    def __init__(self, base_loss: nn.Module, channels):
+        super().__init__()
+        self.loss = base_loss
+        self.channels = channels
+
+    def _select(self, x):
+        if self.channels == 'last':
+            return x[:, -1:, ...]
+        elif self.channels == 'all_but_last':
+            return x[:, :-1, ...]
+        elif isinstance(self.channels, (list, tuple)):
+            return x[:, self.channels, ...]
+        else:
+            raise ValueError(f"Unsupported channels spec: {self.channels}")
+
+    def forward(self, input, target, mask=None, **kwargs):
+        x = self._select(input)
+        y = self._select(target)
+        # Some wrapped losses don't accept a mask kwarg. Try with mask, fallback without.
+        try:
+            return self.loss(x, y, mask=mask, **kwargs)
+        except TypeError:
+            return self.loss(x, y, **kwargs)
 class EigenvalueLoss(nn.Module):
     """
     Loss for regressing a *set* of eigen-values that
@@ -1025,6 +1058,24 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight, mgr=None):
         dim = int(loss_config.get('dim', 1))
         eps = float(loss_config.get('eps', 1e-8))
         base_loss = SignInvariantCosineLoss(dim=dim, eps=eps, ignore_index=ignore_index)
+
+    elif name == 'ChannelSelectLoss':
+        base_cfg = loss_config.get('base', {})
+        if not base_cfg or 'name' not in base_cfg:
+            raise RuntimeError("ChannelSelectLoss requires 'base' config with a 'name'")
+        base_name = base_cfg['name']
+        base_kwargs = base_cfg.get('kwargs', {})
+        # Recursively create the base loss
+        inner = _create_loss(
+            name=base_name,
+            loss_config=base_kwargs,
+            weight=weight,
+            ignore_index=ignore_index,
+            pos_weight=pos_weight,
+            mgr=mgr,
+        )
+        channels = loss_config.get('channels', 'all_but_last')
+        base_loss = ChannelSelectLoss(inner, channels)
 
     elif name == 'SignedDistanceLoss':
         # rho, beta, eikonal, eikonal_weight, reduction are read from the YAML / json
