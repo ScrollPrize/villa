@@ -1,17 +1,19 @@
-* @nat @giorgioangel
+* @giorgioangel
 
-/crackle-viewer/ @giorgioangel
+/crackle-viewer/ @stephenrparsons @jrudolph
 
-/foundation/ @giorgioangel @danielhavir @stephenrparsons
+/foundation/ @jrudolph @stephenrparsons
 
 /ink-detection/ @younader
 
 /scroll-renderer/ @giorgioangel
 
-/scrollprize.org/ @nat @stephenrparsons @skyward7187 @bruniss
+/scrollprize.org/ @stephenrparsons @skyward7187 @giorgioangel
 
-/thaumato-anakalyptor/ @giorgioangel
+/thaumato-anakalyptor/ @stephenrparsons
 
-/vesuvius/ @stephenrparsons @giorgioangel
+/vesuvius/ @stephenrparsons @jrudolph
 
-/vesuvius-c/ @stephenrparsons
+/vesuvius-c/ @stephenrparsons @jrudolph
+
+/volume-cartographer/ @hendrikschilling @SuperOptimizer
