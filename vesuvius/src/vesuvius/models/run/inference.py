@@ -45,6 +45,7 @@ class Inferer():
                  batch_size: int = 1,
                  patch_size: [list, tuple] = None,
                  save_softmax: bool = False,
+                 tiff_activation: str = None,
                  normalization_scheme: str = 'instance_zscore',
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
                  num_dataloader_workers: int = 4,
@@ -75,6 +76,10 @@ class Inferer():
         self.batch_size = batch_size
         self.patch_size = tuple(patch_size) if patch_size is not None else None  # Can be None, will derive from model
         self.save_softmax = save_softmax
+        # TIFF activation control: 'softmax' | 'argmax' | 'none'; None => derive from save_softmax
+        if tiff_activation is not None and tiff_activation not in ('softmax', 'argmax', 'none'):
+            raise ValueError(f"Invalid tiff_activation '{tiff_activation}'. Must be one of: softmax, argmax, none")
+        self.tiff_activation = tiff_activation
         self.verbose = verbose
         self.normalization_scheme = normalization_scheme
         self.input_format = input_format
@@ -958,8 +963,9 @@ class Inferer():
         if tifffile is None:
             raise RuntimeError("tifffile is required for TIFF output but is not installed")
 
-        # Choose between softmax probabilities or argmax labels
-        if self.save_softmax:
+        # Choose activation for TIFF output: softmax | argmax | none
+        mode = self.tiff_activation if self.tiff_activation is not None else ('softmax' if self.save_softmax else 'argmax')
+        if mode == 'softmax':
             # Softmax over channel dimension
             # logits_acc: (C,Y,X) for 2D; (C,Z,Y,X) for 3D
             if self.is_2d_model:
@@ -976,7 +982,7 @@ class Inferer():
                     out_arr = out_arr[:, 0, :, :]
             # Convert softmax probabilities to uint8 [0, 255]
             out_arr = np.clip(out_arr * 255.0, 0, 255).astype(np.uint8)
-        else:
+        elif mode == 'argmax':
             # Argmax over channels to produce label map
             if self.is_2d_model:
                 out_arr = np.argmax(logits_acc, axis=0)  # (Y,X)
@@ -989,6 +995,12 @@ class Inferer():
                 out_arr = (out_arr.astype(np.uint8) * 255).astype(np.uint8)
             else:
                 out_arr = out_arr.astype(np.uint8)
+        else:
+            # mode == 'none': write raw logits as float32
+            out_arr = logits_acc.astype(np.float32)
+            if not self.is_2d_model and Z == 1:
+                # Collapse singleton Z for 3D TIFFs that were actually 2D
+                out_arr = out_arr[:, 0, :, :]
 
         tifffile.imwrite(str(out_path), out_arr, compression='zlib')
         return str(out_path)
@@ -1203,7 +1215,9 @@ class Inferer():
 
                 if small_enough:
                     # In-memory full-image blending, save final per-image output
-                    out_suffix = "softmax" if self.save_softmax else "argmax"
+                    # Name output according to activation mode
+                    mode = self.tiff_activation if self.tiff_activation is not None else ('softmax' if self.save_softmax else 'argmax')
+                    out_suffix = "logits" if mode == 'none' else mode
                     out_name = f"{tif.stem}_{out_suffix}.tif"
                     out_path = Path(self.output_dir) / out_name
                     saved = self._infer_single_tiff_in_memory(img, out_path)
@@ -1265,7 +1279,11 @@ def main():
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference')
     parser.add_argument('--patch_size', type=str, default=None, 
                       help='Optional: Override patch size, comma-separated (e.g., "192,192,192"). If not provided, uses the model\'s default patch size.')
-    parser.add_argument('--save_softmax', action='store_true', help='Save softmax outputs')
+    parser.add_argument('--save_softmax', action='store_true', help='Save softmax outputs (deprecated; use --tif-activation softmax)')
+    # Preferred flag for controlling TIFF activation
+    parser.add_argument('--tif-activation', dest='tiff_activation', type=str, default=None,
+                        choices=['softmax', 'argmax', 'none'],
+                        help='Activation for TIFF outputs: softmax, argmax, or none (raw logits)')
     parser.add_argument('--normalization', type=str, default='instance_zscore', 
                       help='Normalization scheme (instance_zscore, global_zscore, instance_minmax, ct, none)')
     parser.add_argument('--intensity-properties-json', type=str, default=None,
@@ -1331,6 +1349,7 @@ def main():
         batch_size=args.batch_size,
         patch_size=patch_size,  # Will use model's patch size if None
         save_softmax=args.save_softmax,
+        tiff_activation=args.tiff_activation,
         normalization_scheme=args.normalization,
         device=args.device,
         verbose=args.verbose,
