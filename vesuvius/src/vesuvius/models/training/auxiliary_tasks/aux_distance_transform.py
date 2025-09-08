@@ -37,6 +37,10 @@ def create_distance_transform_config(aux_task_name: str, aux_config: Dict[str, A
         "source_target": source_target_name,
         "weight": aux_config.get("loss_weight", 1.0)
     }
+    # Allow user to choose which distance to predict: 'signed' | 'inside' | 'outside'
+    target_config["distance_type"] = str(aux_config.get("distance_type", "signed")).lower()
+    # Prefer linear interpolation when downsampling targets for deep supervision
+    target_config["ds_interpolation"] = aux_config.get("ds_interpolation", "linear")
     
     # Add losses configuration if present
     if "losses" in aux_config:

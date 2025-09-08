@@ -39,6 +39,8 @@ def create_surface_normals_config(aux_task_name: str, aux_config: Dict[str, Any]
         "weight": aux_config.get("loss_weight", 1.0),
         "use_source_mask": True  # Use source mask for loss computation
     }
+    # Prefer linear interpolation when downsampling targets for deep supervision
+    target_config["ds_interpolation"] = aux_config.get("ds_interpolation", "linear")
     
     # Add losses configuration if present
     if "losses" in aux_config:
