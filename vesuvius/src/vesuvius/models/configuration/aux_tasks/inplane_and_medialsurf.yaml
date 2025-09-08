@@ -26,9 +26,12 @@ auxiliary_tasks:
     tensor_sigma: 1.5
     loss_weight: 0.5
     losses:
-      - name: "MaskedMSELoss"
+      - name: "SignInvariantCosineLoss"
         weight: 1.0
         kwargs:
+          dim: 1
+          eps: 1e-8
           ignore_index: -100
+
 
 
