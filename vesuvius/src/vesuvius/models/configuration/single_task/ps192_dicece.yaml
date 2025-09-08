@@ -1,16 +1,17 @@
 tr_config:
   patch_size: [192,192,192]
+  enable_deep_supervision: true
+  augment_on_device: false
 
 dataset_config:
   min_labeled_ratio: 0 
-  min_bbox_percent: 0 
-  normalization_scheme: "zscore"
+  min_bbox_percent: 0
   skip_patch_validation: true
   targets:
     surface:
       activation: "none"
       losses:
-        - name: "nnUNet_DC_and_CE_loss"
+        - name: "MedialSurfaceRecall"
           weight: 1.0
 
 

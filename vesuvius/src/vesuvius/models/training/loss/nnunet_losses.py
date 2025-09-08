@@ -305,7 +305,7 @@ class DeepSupervisionWrapper(nn.Module):
         self.weights = weights
 
     def forward(self, net_output: Union[torch.Tensor, List[torch.Tensor]], 
-                target: Union[torch.Tensor, List[torch.Tensor]]):
+                target: Union[torch.Tensor, List[torch.Tensor]], *args, **kwargs):
         """
         net_output and target can be either Tensors or lists of Tensors.
         If lists, they represent outputs at different resolutions for deep supervision.
@@ -318,8 +318,25 @@ class DeepSupervisionWrapper(nn.Module):
             loss = 0
             for i, weight in enumerate(self.weights):
                 if weight != 0:
-                    loss += weight * self.loss(net_output[i], target[i])
+                    # Pass through any additional args/kwargs (e.g., skeleton_data). If an arg is a list/tuple,
+                    # use the i-th element to match the current supervision scale.
+                    if args:
+                        f_args = [a[i] if isinstance(a, (list, tuple)) else a for a in args]
+                    else:
+                        f_args = []
+                    if kwargs:
+                        f_kwargs = {k: (v[i] if isinstance(v, (list, tuple)) else v) for k, v in kwargs.items()}
+                    else:
+                        f_kwargs = {}
+                    res = self.loss(net_output[i], target[i], *f_args, **f_kwargs)
+                    # Some losses (e.g., Betti) may return (loss, aux_dict); extract loss
+                    if isinstance(res, tuple) and len(res) == 2:
+                        res = res[0]
+                    loss += weight * res
             return loss
         else:
             # Regular case, no deep supervision
-            return self.loss(net_output, target)
+            res = self.loss(net_output, target, *args, **kwargs)
+            if isinstance(res, tuple) and len(res) == 2:
+                return res[0]
+            return res

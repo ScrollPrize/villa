@@ -22,3 +22,18 @@ from .aux_surface_normals import (
     create_surface_normals_config,
     compute_surface_normals_from_sdt
 )
+
+from .aux_structure_tensor import (
+    create_structure_tensor_config,
+    compute_structure_tensor
+)
+
+from .aux_inplane_direction import (
+    create_inplane_direction_config,
+    compute_inplane_direction
+)
+
+from .aux_nearest_component import (
+    create_nearest_component_config,
+    compute_nearest_component
+)

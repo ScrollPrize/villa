@@ -20,12 +20,21 @@ class MedialSurfaceTransform(BasicTransform):
         self.do_close = do_close
 
     def apply(self, data_dict, **params):
-        # Find target keys (exclude 'image' and 'is_unlabeled')
-        target_keys = [k for k in data_dict.keys() if k not in ['image', 'is_unlabeled']]
-        
+        # Collect regression keys to avoid processing continuous aux targets
+        regression_keys = set(data_dict.get('regression_keys', []) or [])
+        # Find eligible target keys: tensor-valued, not image/meta, not regression aux
+        target_keys = [
+            k for k, v in data_dict.items()
+            if k not in ['image', 'is_unlabeled', 'regression_keys']
+            and isinstance(v, torch.Tensor)
+            and k not in regression_keys
+        ]
+
         # Process each target
         for target_key in target_keys:
-            seg_all = data_dict[target_key].numpy()
+            t = data_dict[target_key]
+            orig_device = t.device
+            seg_all = t.detach().cpu().numpy()
             # Add tubed skeleton GT
             bin_seg = (seg_all > 0)
             seg_all_skel = np.zeros_like(bin_seg, dtype=np.float32)
@@ -56,6 +65,6 @@ class MedialSurfaceTransform(BasicTransform):
                 seg_all_skel[0] = skel
 
             # Store skeleton for each target with a unique key
-            data_dict[f"{target_key}_skel"] = torch.from_numpy(seg_all_skel)
+            data_dict[f"{target_key}_skel"] = torch.from_numpy(seg_all_skel).to(orig_device)
         
         return data_dict

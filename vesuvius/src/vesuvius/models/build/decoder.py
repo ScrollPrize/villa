@@ -17,7 +17,7 @@ class Decoder(nn.Module):
     def __init__(self,
                  encoder,
                  basic_block: str,
-                 num_classes: int,
+                 num_classes: Union[int, None],
                  n_conv_per_stage: Union[int, Tuple[int, ...], List[int]],
                  deep_supervision,
                  nonlin_first: bool = False,
@@ -46,8 +46,10 @@ class Decoder(nn.Module):
         """
         super().__init__()
         self.deep_supervision = deep_supervision
+        # If num_classes is None, operate in features-only mode (no seg heads)
+        self.return_features_only = num_classes is None
         self.encoder = encoder
-        self.num_classes = num_classes
+        self.num_classes = num_classes if num_classes is not None else 0
         n_stages_encoder = len(encoder.output_channels)
         if isinstance(n_conv_per_stage, int):
             n_conv_per_stage = [n_conv_per_stage] * (n_stages_encoder - 1)
@@ -94,10 +96,12 @@ class Decoder(nn.Module):
                     nonlin_kwargs=nonlin_kwargs,
                 ))
 
-                # we always build the deep supervision outputs so that we can always load parameters. If we don't do this
-                # then a model trained with deep_supervision=True could not easily be loaded at inference time where
-                # deep supervision is not needed. It's just a convenience thing
-                seg_layers.append(encoder.conv_op(input_features_skip, num_classes, 1, 1, 0, bias=True))
+                # Only build segmentation layers if we are not in features-only mode
+                if not self.return_features_only:
+                    # we always build the deep supervision outputs so that we can always load parameters. If we don't do this
+                    # then a model trained with deep_supervision=True could not easily be loaded at inference time where
+                    # deep supervision is not needed. It's just a convenience thing
+                    seg_layers.append(encoder.conv_op(input_features_skip, self.num_classes, 1, 1, 0, bias=True))
 
         if basic_block == 'ConvBlock':
             stages = []
@@ -125,14 +129,17 @@ class Decoder(nn.Module):
                     nonlin_first
                 ))
 
-                # we always build the deep supervision outputs so that we can always load parameters. If we don't do this
-                # then a model trained with deep_supervision=True could not easily be loaded at inference time where
-                # deep supervision is not needed. It's just a convenience thing
-                seg_layers.append(encoder.conv_op(input_features_skip, num_classes, 1, 1, 0, bias=True))
+                # Only build segmentation layers if we are not in features-only mode
+                if not self.return_features_only:
+                    # we always build the deep supervision outputs so that we can always load parameters. If we don't do this
+                    # then a model trained with deep_supervision=True could not easily be loaded at inference time where
+                    # deep supervision is not needed. It's just a convenience thing
+                    seg_layers.append(encoder.conv_op(input_features_skip, self.num_classes, 1, 1, 0, bias=True))
 
         self.stages = nn.ModuleList(stages)
         self.transpconvs = nn.ModuleList(transpconvs)
-        self.seg_layers = nn.ModuleList(seg_layers)
+        # In features-only mode there are no segmentation layers
+        self.seg_layers = nn.ModuleList(seg_layers) if not self.return_features_only else nn.ModuleList()
 
     def forward(self, skips):
         """
@@ -146,20 +153,27 @@ class Decoder(nn.Module):
             x = self.transpconvs[s](lres_input)
             x = torch.cat((x, skips[-(s + 2)]), 1)
             x = self.stages[s](x)
-            if self.deep_supervision:
+            if self.return_features_only:
+                # No segmentation heads; just propagate features
+                pass
+            elif self.deep_supervision:
                 seg_outputs.append(self.seg_layers[s](x))
             elif s == (len(self.stages) - 1):
                 seg_outputs.append(self.seg_layers[-1](x))
             lres_input = x
 
-        # invert seg outputs so that the largest segmentation prediction is returned first
-        seg_outputs = seg_outputs[::-1]
-
-        if not self.deep_supervision:
-            r = seg_outputs[0]
+        if self.return_features_only:
+            # Return final high-resolution decoder features
+            return lres_input
         else:
-            r = seg_outputs
-        return r
+            # invert seg outputs so that the largest segmentation prediction is returned first
+            seg_outputs = seg_outputs[::-1]
+
+            if not self.deep_supervision:
+                r = seg_outputs[0]
+            else:
+                r = seg_outputs
+            return r
 
 
 

@@ -11,12 +11,13 @@ from multiprocessing import Pool, cpu_count
 from functools import partial
 from vesuvius.models.training.auxiliary_tasks import (
     compute_distance_transform,
-    compute_surface_normals_from_sdt
+    compute_surface_normals_from_sdt,
+    compute_structure_tensor,
+    compute_inplane_direction,
 )
 from vesuvius.models.augmentation.transforms.spatial.transpose import TransposeAxesTransform
 # Augmentations will be handled directly in this file
 from vesuvius.models.augmentation.transforms.utils.random import RandomTransform
-from vesuvius.models.augmentation.transforms.utils.oneoftransform import OneOfTransform
 from vesuvius.models.augmentation.helpers.scalar_type import RandomScalar
 from vesuvius.models.augmentation.transforms.intensity.brightness import MultiplicativeBrightnessTransform
 from vesuvius.models.augmentation.transforms.intensity.contrast import ContrastTransform, BGContrast
@@ -338,7 +339,7 @@ class BaseDataset(Dataset):
 
         bbox_threshold = getattr(self.mgr, 'min_bbox_percent', 0.97)
         downsample_level = getattr(self.mgr, 'downsample_level', 1)
-        num_workers = getattr(self.mgr, 'num_workers', 4)
+        num_workers = getattr(self.mgr, 'num_workers', 8)
 
         if self.cache_enabled and len(self.zarr_arrays) > 0:
             cached_patches = load_cached_patches(
@@ -531,6 +532,99 @@ class BaseDataset(Dataset):
         # Convert all label patches to tensors
         for t_name, label_patch in label_patches.items():
             result[t_name] = torch.from_numpy(label_patch)
+
+        # --- Auto-generate computed targets from source labels, if configured ---
+        # We generate ground-truth for tasks (e.g., distance_transform, surface_normals, inplane_direction,
+        # nearest_component) based on their declared source_target. This enables related regression/regularization
+        # losses to run without having to precompute and store labels on disk.
+        try:
+            regression_keys = []
+            for aux_name, tinfo in getattr(self.mgr, 'targets', {}).items():
+                # Only generate for explicitly marked auxiliary tasks
+                if not tinfo.get('auxiliary_task', False):
+                    continue
+                task_type = str(tinfo.get('task_type', '')).lower()
+
+                source_t = tinfo.get('source_target')
+                if not source_t or source_t not in label_patches:
+                    # Source not available in this batch (or not configured)
+                    continue
+
+                src_patch = label_patches[source_t]  # numpy array, shape (C, ...) float32
+
+                # Build a binary mask from the first channel of the source label
+                # Foreground is > 0 in our label convention
+                if self.is_2d_dataset:
+                    # (C, H, W) -> (H, W)
+                    binary_mask = (src_patch[0] > 0).astype(np.uint8)
+                else:
+                    # (C, D, H, W) -> (D, H, W)
+                    binary_mask = (src_patch[0] > 0).astype(np.uint8)
+
+                if task_type == 'distance_transform':
+                    # Compute distances according to requested type: 'signed' | 'inside' | 'outside'
+                    from scipy.ndimage import distance_transform_edt
+                    inside = distance_transform_edt(binary_mask)
+                    outside = distance_transform_edt(1 - binary_mask)
+                    dist_type = str(tinfo.get('distance_type', 'signed')).lower()
+
+                    if dist_type == 'inside':
+                        distance = inside.astype(np.float32)
+                    elif dist_type == 'outside':
+                        distance = outside.astype(np.float32)
+                    else:  # 'signed' (default)
+                        distance = (outside - inside).astype(np.float32)
+
+                    # Add channel dimension (1, ...)
+                    aux_patch = distance[np.newaxis, ...]
+                    aux_patch = np.ascontiguousarray(aux_patch, dtype=np.float32)
+                    result[aux_name] = torch.from_numpy(aux_patch)
+                    regression_keys.append(aux_name)
+
+                elif task_type == 'surface_normals':
+                    # Compute normals from SDT; returns (2,H,W) for 2D or (3,D,H,W) for 3D
+                    normals, _ = compute_surface_normals_from_sdt(binary_mask, is_2d=self.is_2d_dataset, return_sdt=False)
+                    aux_patch = np.ascontiguousarray(normals, dtype=np.float32)
+                    result[aux_name] = torch.from_numpy(aux_patch)
+                    regression_keys.append(aux_name)
+                elif task_type == 'structure_tensor':
+                    aux_patch = compute_structure_tensor(
+                        binary_mask,
+                        self.is_2d_dataset,
+                        compute_from=str(tinfo.get('compute_from', 'sdt')).lower(),
+                        grad_sigma=float(tinfo.get('grad_sigma', 1.0)),
+                        tensor_sigma=float(tinfo.get('tensor_sigma', 1.5)),
+                        ignore_index=tinfo.get('ignore_index', -100),
+                    )
+                    result[aux_name] = torch.from_numpy(aux_patch)
+                    regression_keys.append(aux_name)
+                elif task_type == 'inplane_direction':
+                    aux_patch = compute_inplane_direction(
+                        binary_mask,
+                        self.is_2d_dataset,
+                        compute_from=str(tinfo.get('compute_from', 'sdt')).lower(),
+                        grad_sigma=float(tinfo.get('grad_sigma', 1.0)),
+                        tensor_sigma=float(tinfo.get('tensor_sigma', 1.5)),
+                        ignore_index=tinfo.get('ignore_index', -100),
+                    )
+                    result[aux_name] = torch.from_numpy(aux_patch)
+                    regression_keys.append(aux_name)
+                elif task_type == 'nearest_component':
+                    from vesuvius.models.training.auxiliary_tasks import compute_nearest_component
+                    aux_patch = compute_nearest_component(
+                        binary_mask,
+                        self.is_2d_dataset,
+                        sdf_sigma=float(tinfo.get('sdf_sigma', 0.0)),
+                    )
+                    result[aux_name] = torch.from_numpy(aux_patch)
+                    regression_keys.append(aux_name)
+                else:
+                    # Unknown auxiliary type; skip gracefully
+                    continue
+            if regression_keys:
+                result['regression_keys'] = regression_keys
+        except Exception as e:
+            print(f"Warning: Failed to generate auxiliary targets for patch index {index}: {e}")
         
         return result
 
@@ -573,47 +667,102 @@ class BaseDataset(Dataset):
                     patch_center_dist_from_border=0,
                     random_crop=False,
                     p_elastic_deform=0,
-                    p_rotation=0.2,
+                    p_rotation=0.5,
                     rotation=rotation_for_DA,
                     p_scaling=0.2,
                     scaling=(0.7, 1.4),
                     p_synchronize_scaling_across_axes=1,
                     bg_style_seg_sampling=False,  # =, mode_seg='nearest'
-                    elastic_deform_magnitude=(10, 50)
+                    elastic_deform_magnitude=(5, 25)
                 )
             )
-            
-            # Add morphological closing after spatial transform if needed for skeleton
-            if self._needs_skeleton_transform():
-                from vesuvius.models.augmentation.transforms.utils.morphological_closing import MorphologicalClosingTransform
-                transforms.append(MorphologicalClosingTransform(structure_size=2))
-                print("Added MorphologicalClosingTransform after spatial transforms")
-            
-            # # Add mirroring
-            # transforms.append(RandomTransform(
-            #     MirrorTransform(allowed_axes=mirror_axes),
-            #     apply_probability=0.5
-            # ))
+
+            if mirror_axes is not None and len(mirror_axes) > 0:
+                transforms.append(MirrorTransform(allowed_axes=mirror_axes))
 
         if dimension == 2:
-            # Always add intensity augmentations
+            if not only_spatial_and_intensity:
+                transforms.append(RandomTransform(
+                    BlankRectangleTransform(
+                        rectangle_size=tuple(
+                            (max(1, size // 6), size // 3) for size in self.mgr.train_patch_size
+                        ),
+                        rectangle_value=np.mean,
+                        num_rectangles=(1, 5),
+                        force_square=False,
+                        p_per_sample=0.4,
+                        p_per_channel=0.5
+                    ), apply_probability=0.5
+                ))
+
+            # Illumination
+            transforms.append(RandomTransform(
+                InhomogeneousSliceIlluminationTransform(
+                    num_defects=(2, 5),
+                    defect_width=(25, 50),
+                    mult_brightness_reduction_at_defect=(0.3, 1.5),
+                    base_p=(0.2, 0.4),
+                    base_red=(0.5, 0.9),
+                    p_per_sample=1.0,
+                    per_channel=True,
+                    p_per_channel=0.5
+                ), apply_probability=0.4
+            ))
+
+            # Noise and blur
+            if not only_spatial_and_intensity:
+                transforms.append(RandomTransform(
+                    GaussianNoiseTransform(
+                        noise_variance=(0, 0.15),
+                        p_per_channel=1,
+                        synchronize_channels=True
+                    ), apply_probability=0.4
+                ))
+                transforms.append(RandomTransform(
+                    GaussianBlurTransform(
+                        blur_sigma=(0.5, 1.5),
+                        synchronize_channels=False,
+                        synchronize_axes=False,
+                        p_per_channel=0.5, benchmark=False
+                    ), apply_probability=0.4
+                ))
+
+            # Brightness/contrast/gamma
             transforms.append(RandomTransform(
                 MultiplicativeBrightnessTransform(
-                    multiplier_range=BGContrast((0.75, 1.25)),
+                    multiplier_range=BGContrast((0.5, 1.5)),
                     synchronize_channels=False,
                     p_per_channel=1
                 ), apply_probability=0.3
             ))
-
             transforms.append(RandomTransform(
                 ContrastTransform(
                     contrast_range=BGContrast((0.5, 1.5)),
                     preserve_range=True,
                     synchronize_channels=False,
                     p_per_channel=1
-                ), apply_probability=0.15
+                ), apply_probability=0.3
             ))
-            
+            if not only_spatial_and_intensity:
+                transforms.append(RandomTransform(
+                    SimulateLowResolutionTransform(
+                        scale=(0.25, 1),
+                        synchronize_channels=False,
+                        synchronize_axes=True,
+                        ignore_axes=None,
+                        allowed_channels=None,
+                        p_per_channel=0.5
+                    ), apply_probability=0.4
+                ))
+            transforms.append(RandomTransform(
+                GammaTransform(
+                    gamma=BGContrast((0.7, 1.5)),
+                    p_invert_image=1,
+                    synchronize_channels=False,
+                    p_per_channel=1,
+                    p_retain_stats=1
+                ), apply_probability=0.2
+            ))
             transforms.append(RandomTransform(
                 GammaTransform(
                     gamma=BGContrast((0.7, 1.5)),
@@ -621,42 +770,8 @@ class BaseDataset(Dataset):
                     synchronize_channels=False,
                     p_per_channel=1,
                     p_retain_stats=1
-                ), apply_probability=0.2
+                ), apply_probability=0.4
             ))
-            
-            # Only add noise/blur/rectangle transforms if not in only_spatial_and_intensity mode
-            if not only_spatial_and_intensity:
-                transforms.append(RandomTransform(
-                    GaussianBlurTransform(
-                        blur_sigma=(0.5, 1.5),
-                        synchronize_channels=True,
-                        synchronize_axes=False,
-                        p_per_channel=1.0
-                    ),
-                    apply_probability=0.2
-                ))
-                
-                transforms.append(RandomTransform(
-                    GaussianNoiseTransform(
-                        noise_variance=(0, 0.15),
-                        p_per_channel=1,
-                        synchronize_channels=True
-                    ), apply_probability=0.15
-                ))
-
-                rectangle_sizes_2d = tuple(
-                    (max(1, size // 10), size // 3) for size in self.mgr.train_patch_size
-                )
-                transforms.append(RandomTransform(
-                    BlankRectangleTransform(
-                        rectangle_size=rectangle_sizes_2d,
-                        rectangle_value=np.mean,
-                        num_rectangles=(1, 5),
-                        force_square=False,
-                        p_per_sample=0.3,
-                        p_per_channel=0.5
-                    ), apply_probability=0.2
-                ))
         else:
             if not no_spatial:
                 # Only add transpose transform if all three dimensions are equal
@@ -666,165 +781,103 @@ class BaseDataset(Dataset):
                         apply_probability=0.2
                     ))
 
-            # Always add intensity transforms  
-            one_of_intensity = OneOfTransform([
+            if not only_spatial_and_intensity:
+                transforms.append(RandomTransform(
+                    BlankRectangleTransform(
+                        rectangle_size=tuple(
+                            (max(1, size // 6), size // 3) for size in self.mgr.train_patch_size
+                        ),
+                        rectangle_value=np.mean,
+                        num_rectangles=(1, 5),
+                        force_square=False,
+                        p_per_sample=0.4,
+                        p_per_channel=0.5
+                    ), apply_probability=0.5
+                ))
+
+                transforms.append(RandomTransform(
+                    SmearTransform(
+                        shift=(5, 0),
+                        alpha=0.2,
+                        num_prev_slices=3,
+                        smear_axis=3
+                    ), apply_probability=0.3
+                ))
+
+            transforms.append(RandomTransform(
+                InhomogeneousSliceIlluminationTransform(
+                    num_defects=(2, 5),
+                    defect_width=(25, 50),
+                    mult_brightness_reduction_at_defect=(0.3, 1.5),
+                    base_p=(0.2, 0.4),
+                    base_red=(0.5, 0.9),
+                    p_per_sample=1.0,
+                    per_channel=True,
+                    p_per_channel=0.5
+                ), apply_probability=0.4
+            ))
+
+            if not only_spatial_and_intensity:
+                transforms.append(RandomTransform(
+                    GaussianNoiseTransform(
+                        noise_variance=(0, 0.15),
+                        p_per_channel=1,
+                        synchronize_channels=True
+                    ), apply_probability=0.4
+                ))
+                transforms.append(RandomTransform(
+                    GaussianBlurTransform(
+                        blur_sigma=(0.5, 1.5),
+                        synchronize_channels=False,
+                        synchronize_axes=False,
+                        p_per_channel=0.5, benchmark=False
+                    ), apply_probability=0.4
+                ))
+
+            transforms.append(RandomTransform(
                 MultiplicativeBrightnessTransform(
-                    multiplier_range=BGContrast((0.75, 1.25)),
+                    multiplier_range=BGContrast((0.5, 1.5)),
                     synchronize_channels=False,
                     p_per_channel=1
-                ),
+                ), apply_probability=0.3
+            ))
+            transforms.append(RandomTransform(
                 ContrastTransform(
-                    contrast_range=BGContrast((0.50, 1.50)),
+                    contrast_range=BGContrast((0.5, 1.5)),
                     preserve_range=True,
                     synchronize_channels=False,
                     p_per_channel=1
-                ),
-                GammaTransform(
-                    gamma=BGContrast((0.7, 1.5)),
-                    p_invert_image=0,
-                    synchronize_channels=False,
-                    p_per_channel=1,
-                    p_retain_stats=1
-                ),
+                ), apply_probability=0.3
+            ))
+            if not only_spatial_and_intensity:
+                transforms.append(RandomTransform(
+                    SimulateLowResolutionTransform(
+                        scale=(0.25, 1),
+                        synchronize_channels=False,
+                        synchronize_axes=True,
+                        ignore_axes=None,
+                        allowed_channels=None,
+                        p_per_channel=0.5
+                    ), apply_probability=0.4
+                ))
+            transforms.append(RandomTransform(
                 GammaTransform(
                     gamma=BGContrast((0.7, 1.5)),
                     p_invert_image=1,
                     synchronize_channels=False,
                     p_per_channel=1,
                     p_retain_stats=1
-                ),
-                InhomogeneousSliceIlluminationTransform(
-                    num_defects=(2, 5),
-                    defect_width=(5, 20),
-                    mult_brightness_reduction_at_defect=(0.3, 0.7),
-                    base_p=(0.2, 0.4),
-                    base_red=(0.5, 0.9),
-                    p_per_sample=1.0,
-                    per_channel=True,
-                    p_per_channel=0.5
-                )
-            ])
-            
-            transforms.append(RandomTransform(
-                one_of_intensity,
-                apply_probability=0.2
+                ), apply_probability=0.2
             ))
-            
-            # Only add noise/blur/rectangle transforms if not in only_spatial_and_intensity mode
-            if not only_spatial_and_intensity:
-                one_of_noise = OneOfTransform([
-                    GaussianNoiseTransform(
-                        noise_variance=(0, 0.20),
-                        p_per_channel=1,
-                        synchronize_channels=True
-                    ),
-                    RicianNoiseTransform(
-                        noise_variance=(0, 0.1),
-                    ),
-                    SmearTransform(
-                        shift=(10, 0),
-                        alpha=0.5,
-                        num_prev_slices=1,
-                        smear_axis=1
-                    )
-                ])
-                one_of_blur = OneOfTransform([
-                    GaussianBlurTransform(
-                        blur_sigma=(0.5, 1.0),
-                        synchronize_channels=True,
-                        synchronize_axes=False,
-                        p_per_channel=1.0
-                    ),
-                    SimulateLowResolutionTransform(
-                        scale=(0.3, 1.5),
-                        synchronize_channels=False,
-                        synchronize_axes=True,
-                        ignore_axes=None,
-                        allowed_channels=None,
-                        p_per_channel=0.5
-                    )
-                ])
-
-                transforms.append(RandomTransform(
-                    one_of_noise,
-                    apply_probability=0.2
-                ))
-                transforms.append(RandomTransform(
-                    one_of_blur,
-                    apply_probability=0.2
-                ))
-
-                rectangle_sizes_3d = tuple(
-                    (max(1, size // 10), size // 3) for size in self.mgr.train_patch_size
-                )
-                transforms.append(RandomTransform(
-                    BlankRectangleTransform(
-                        rectangle_size=rectangle_sizes_3d,
-                        rectangle_value=np.mean,
-                        num_rectangles=(1, 3),
-                        force_square=False,
-                        p_per_sample=0.4,
-                        p_per_channel=0.5
-                    ), apply_probability=0.3
-                ))
-            # transforms.append(RandomTransform(
-            #     GaussianNoiseTransform(
-            #         noise_variance=(0, 0.1),
-            #         p_per_channel=1,
-            #         synchronize_channels=True
-            #     ), apply_probability=0.1
-            # ))
-            # transforms.append(RandomTransform(
-            #     GaussianBlurTransform(
-            #         blur_sigma=(0.5, 1.),
-            #         synchronize_channels=False,
-            #         synchronize_axes=False,
-            #         p_per_channel=0.5, benchmark=True
-            #     ), apply_probability=0.2
-            # ))
-            # transforms.append(RandomTransform(
-            #     MultiplicativeBrightnessTransform(
-            #         multiplier_range=BGContrast((0.75, 1.25)),
-            #         synchronize_channels=False,
-            #         p_per_channel=1
-            #     ), apply_probability=0.15
-            # ))
-            # transforms.append(RandomTransform(
-            #     ContrastTransform(
-            #         contrast_range=BGContrast((0.75, 1.25)),
-            #         preserve_range=True,
-            #         synchronize_channels=False,
-            #         p_per_channel=1
-            #     ), apply_probability=0.15
-            # ))
-            # transforms.append(RandomTransform(
-            #     SimulateLowResolutionTransform(
-            #         scale=(0.5, 1),
-            #         synchronize_channels=False,
-            #         synchronize_axes=True,
-            #         ignore_axes=None,
-            #         allowed_channels=None,
-            #         p_per_channel=0.5
-            #     ), apply_probability=0.25
-            # ))
-            # transforms.append(RandomTransform(
-            #     GammaTransform(
-            #         gamma=BGContrast((0.7, 1.5)),
-            #         p_invert_image=1,
-            #         synchronize_channels=False,
-            #         p_per_channel=1,
-            #         p_retain_stats=1
-            #     ), apply_probability=0.1
-            # ))
-            # transforms.append(RandomTransform(
-            #     GammaTransform(
-            #         gamma=BGContrast((0.7, 1.5)),
-            #         p_invert_image=0,
-            #         synchronize_channels=False,
-            #         p_per_channel=1,
-            #         p_retain_stats=1
-            #     ), apply_probability=0.3
-            # ))
+            transforms.append(RandomTransform(
+                GammaTransform(
+                    gamma=BGContrast((0.7, 1.5)),
+                    p_invert_image=0,
+                    synchronize_channels=False,
+                    p_per_channel=1,
+                    p_retain_stats=1
+                ), apply_probability=0.4
+            ))
 
         if no_spatial:
             print("Spatial transformations disabled (no_spatial=True)")
@@ -832,9 +885,7 @@ class BaseDataset(Dataset):
         if only_spatial_and_intensity:
             print("Only spatial and intensity augmentations enabled (only_spatial_and_intensity=True)")
 
-        # Check if we need skeleton transform
         if self._needs_skeleton_transform():
-            # Import here to avoid circular dependencies
             from vesuvius.models.augmentation.transforms.utils.skeleton_transform import MedialSurfaceTransform
             transforms.append(MedialSurfaceTransform(do_tube=False))
             print("Added MedialSurfaceTransform to training pipeline")
@@ -880,8 +931,8 @@ class BaseDataset(Dataset):
         patch_info = self.valid_patches[index]
         data_dict = self._extract_patch(patch_info)
 
-        if self.transforms is not None:
+        # Apply CPU-side transforms only if not deferring to on-device augmentation
+        if self.transforms is not None and not (self.is_training and getattr(self.mgr, 'augment_on_device', False)):
             data_dict = self.transforms(**data_dict)
-        
-        return data_dict
 
+        return data_dict

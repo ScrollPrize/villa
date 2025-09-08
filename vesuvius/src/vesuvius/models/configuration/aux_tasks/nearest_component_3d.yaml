@@ -1,0 +1,46 @@
+tr_setup:
+  model_name: "nearest_component_3d"
+
+tr_config:
+  enable_deep_supervision: true
+
+dataset_config:
+  # Standard sampling options; adjust as needed
+  min_labeled_ratio: 0
+  min_bbox_percent: 0
+  skip_patch_validation: true
+
+  targets:
+    surface:
+      weight: 1.0
+      activation: "none"
+      losses:
+        - name: "MedialSurfaceRecall"
+          weight: 1.0
+
+auxiliary_tasks:
+  nearest_component:
+    type: nearest_component
+    source_target: surface
+    loss_weight: 0.25
+    sdf_sigma: 0.5  # optional smoothing of SDF for stability
+    # out_channels auto-detected as op_dims + 1 (3D -> 4)
+    losses:
+      # Direction channels: apply sign-invariant cosine to all-but-last channels
+      - name: "ChannelSelectLoss"
+        weight: 1.0
+        kwargs:
+          channels: all_but_last
+          base:
+            name: "SignInvariantCosineLoss"
+            kwargs:
+              dim: 1
+              eps: 1e-8
+      # Distance channel: SmoothL1 on last channel
+      - name: "ChannelSelectLoss"
+        weight: 1.0
+        kwargs:
+          channels: last
+          base:
+            name: "SmoothL1Loss"
+            kwargs: {}

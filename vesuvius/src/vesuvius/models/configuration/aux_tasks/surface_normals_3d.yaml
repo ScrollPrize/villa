@@ -1,0 +1,38 @@
+tr_setup:
+  model_name: "surface_normals_3d"
+
+tr_config:
+  enable_deep_supervision: true
+
+dataset_config:
+  # Baseline sampling; adjust as needed
+  min_labeled_ratio: 0
+  min_bbox_percent: 0
+  skip_patch_validation: true
+
+  targets:
+    surface:
+      weight: 1.0
+      activation: "none"
+      losses:
+        - name: "MedialSurfaceRecall"
+          weight: 1.0
+
+auxiliary_tasks:
+  surface_normals:
+    type: surface_normals
+    source_target: surface
+    loss_weight: 0.25
+    # out_channels auto-detected as op_dims (3D -> 3)
+    losses:
+      - name: "CosineSimilarityLoss"
+        weight: 1.0
+        kwargs:
+          dim: 1
+          eps: 1e-8
+      - name: "NormalSmoothnessLoss"
+        weight: 0.5
+        kwargs:
+          sigma: 2.0
+          q: 2.0
+

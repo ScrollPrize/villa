@@ -10,9 +10,13 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from vesuvius.data.utils import open_zarr
+from math import ceil
+from scipy.ndimage import zoom
+import json
+from datetime import datetime
 
 
-def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_classes, spatial_shape, output_chunks, is_multi_task=False, target_info=None):
+def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_classes, spatial_shape, spatial_chunks, is_multi_task=False, target_info=None, squeeze_single_channel: bool = False):
     """
     Process a single chunk of the volume in parallel.
     
@@ -33,7 +37,7 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
     
     spatial_slices = tuple(
         slice(idx * chunk, min((idx + 1) * chunk, shape_dim))
-        for idx, chunk, shape_dim in zip(chunk_idx, output_chunks[1:], spatial_shape)
+        for idx, chunk, shape_dim in zip(chunk_idx, spatial_chunks, spatial_shape)
     )
     
     input_store = open_zarr(
@@ -141,8 +145,11 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
         # Processed chunk is homogeneous (e.g., all 0s or all 255s), skip writing
         return {'chunk_idx': chunk_idx, 'processed_voxels': 0, 'empty': True}
 
-    output_slice = (slice(None),) + spatial_slices
-    output_store[output_slice] = output_np
+    if squeeze_single_channel:
+        output_store[spatial_slices] = output_np[0]
+    else:
+        output_slice = (slice(None),) + spatial_slices
+        output_store[output_slice] = output_np
     return {'chunk_idx': chunk_idx, 'processed_voxels': np.prod(output_data.shape)}
 
 
@@ -261,27 +268,42 @@ def finalize_logits(
             output_shape = (num_classes + 1, *spatial_shape)
             print(f"Output will have {num_classes + 1} channels: [softmax_c0...softmax_cN, argmax]")
     
-    print(f"Creating output store: {output_path}")
-    output_chunks = (1, *output_chunks)  # Chunk each channel separately
-    
+    # Decide channel count and squeeze behavior
+    if mode == "binary":
+        out_channels = (len(target_info) if (is_multi_task and target_info) else 1)
+    else:
+        out_channels = (1 if threshold else (num_classes + 1))
+    squeeze_single_channel = (out_channels == 1)
+
+    # Prepare shapes and chunks for level 0
+    if squeeze_single_channel:
+        final_shape_lvl0 = spatial_shape
+        spatial_chunks = output_chunks
+        chunks_lvl0 = spatial_chunks
+    else:
+        final_shape_lvl0 = (out_channels, *spatial_shape)
+        spatial_chunks = output_chunks
+        chunks_lvl0 = (1, *spatial_chunks)
+
+    # Create multiscale root level 0 array at <output_path>/0
+    root_path = output_path.rstrip('/')
+    level0_path = os.path.join(root_path, '0')
+    print(f"Creating output multiscale level 0 store: {level0_path}")
     output_store = open_zarr(
-        path=output_path,
+        path=level0_path,
         mode='w',
-        storage_options={'anon': False} if output_path.startswith('s3://') else None,
+        storage_options={'anon': False} if level0_path.startswith('s3://') else None,
         verbose=verbose,
-        shape=output_shape,
-        chunks=output_chunks,
-        dtype=np.uint8,  
+        shape=final_shape_lvl0,
+        chunks=chunks_lvl0,
+        dtype=np.uint8,
         compressor=compressor,
         write_empty_chunks=False,
         overwrite=True
     )
     
-    def get_chunk_indices(shape, chunks):
+    def get_chunk_indices(spatial_shape, spatial_chunks):
         # For each dimension, calculate how many chunks we need
-        # Skip first dimension (channels)
-        spatial_shape = shape[1:] 
-        spatial_chunks = chunks[1:]
         
         # Generate all combinations of chunk indices
         from itertools import product
@@ -297,7 +319,7 @@ def finalize_logits(
         
         return chunks_info
     
-    chunk_infos = get_chunk_indices(input_shape, output_chunks)
+    chunk_infos = get_chunk_indices(spatial_shape, spatial_chunks)
     total_chunks = len(chunk_infos)
     print(f"Processing data in {total_chunks} chunks using {num_workers} worker processes...")
     
@@ -307,12 +329,13 @@ def finalize_logits(
     process_chunk_partial = partial(
         process_chunk,
         input_path=input_path,
-        output_path=output_path,
+        output_path=level0_path,
         mode=mode,
         threshold=threshold,
         num_classes=num_classes,
         spatial_shape=spatial_shape,
-        output_chunks=output_chunks,
+        spatial_chunks=spatial_chunks,
+        squeeze_single_channel=squeeze_single_channel,
         is_multi_task=is_multi_task,
         target_info=target_info
     )
@@ -354,6 +377,152 @@ def finalize_logits(
             output_store.attrs['empty_chunk_percentage'] = float(empty_chunks/total_chunks) if total_chunks > 0 else 0.0
     except Exception as e:
         print(f"Warning: Failed to copy metadata: {e}")
+
+    # Build multiscale pyramid (levels 1..5) with 2x downsampling
+    def build_multiscales(root_path: str, levels: int = 6):
+        try:
+            # Open level 0 lazily
+            lvl0 = open_zarr(os.path.join(root_path, '0'), mode='r', storage_options={'anon': False} if root_path.startswith('s3://') else None)
+            lvl0_shape = lvl0.shape
+            has_channel = (len(lvl0_shape) == 4)
+            datasets = [{'path': '0'}]
+
+            prev_path = os.path.join(root_path, '0')
+            prev_shape = lvl0_shape
+
+            for i in range(1, levels):
+                # Compute next level shape
+                if has_channel:
+                    C, Z, Y, X = prev_shape
+                    tZ, tY, tX = max(1, ceil(Z/2)), max(1, ceil(Y/2)), max(1, ceil(X/2))
+                    next_shape = (C, tZ, tY, tX)
+                    # Use the same chunks as level 0 (channel, z, y, x), clipped to shape when necessary
+                    zc = min(chunks_lvl0[1], tZ)
+                    yc = min(chunks_lvl0[2], tY)
+                    xc = min(chunks_lvl0[3], tX)
+                    chunks = (chunks_lvl0[0], zc, yc, xc)
+                else:
+                    Z, Y, X = prev_shape
+                    tZ, tY, tX = max(1, ceil(Z/2)), max(1, ceil(Y/2)), max(1, ceil(X/2))
+                    next_shape = (tZ, tY, tX)
+                    # Use the same spatial chunks as level 0, clipped to shape
+                    zc = min(chunks_lvl0[0], tZ)
+                    yc = min(chunks_lvl0[1], tY)
+                    xc = min(chunks_lvl0[2], tX)
+                    chunks = (zc, yc, xc)
+
+                lvl_path = os.path.join(root_path, str(i))
+                ds_store = open_zarr(
+                    path=lvl_path,
+                    mode='w',
+                    storage_options={'anon': False} if lvl_path.startswith('s3://') else None,
+                    shape=next_shape,
+                    chunks=chunks,
+                    dtype=lvl0.dtype,
+                    compressor=compressor,
+                    write_empty_chunks=False,
+                    overwrite=True
+                )
+
+                # Iterate output tiles and compute from prev level tiles
+                # Open prev store lazily
+                prev_store = open_zarr(prev_path, mode='r', storage_options={'anon': False} if prev_path.startswith('s3://') else None)
+
+                # Determine iteration grid based on ds_store chunks
+                if has_channel:
+                    _, Zp, Yp, Xp = next_shape
+                    zc, yc, xc = chunks[1], chunks[2], chunks[3]
+                else:
+                    Zp, Yp, Xp = next_shape
+                    zc, yc, xc = chunks[0], chunks[1], chunks[2]
+
+                for oz in range(0, Zp, zc):
+                    for oy in range(0, Yp, yc):
+                        for ox in range(0, Xp, xc):
+                            oz1 = min(oz + zc, Zp)
+                            oy1 = min(oy + yc, Yp)
+                            ox1 = min(ox + xc, Xp)
+
+                            # Corresponding prev indices
+                            pz0, py0, px0 = oz * 2, oy * 2, ox * 2
+                            pz1, py1, px1 = min(oz1 * 2, prev_shape[-3]), min(oy1 * 2, prev_shape[-2]), min(ox1 * 2, prev_shape[-1])
+
+                            if has_channel:
+                                prev_block = prev_store[(slice(None), slice(pz0, pz1), slice(py0, py1), slice(px0, px1))]
+                                # Pad to even along spatial dims
+                                pad_z = (0, (prev_block.shape[1] % 2))
+                                pad_y = (0, (prev_block.shape[2] % 2))
+                                pad_x = (0, (prev_block.shape[3] % 2))
+                                prev_block = np.pad(prev_block, ((0, 0), pad_z, pad_y, pad_x), mode='edge')
+                                # Reshape and average
+                                Cb, Zb, Yb, Xb = prev_block.shape
+                                block_ds = prev_block.reshape(Cb, Zb//2, 2, Yb//2, 2, Xb//2, 2).mean(axis=(2, 4, 6))
+                                ds_store[(slice(None), slice(oz, oz1), slice(oy, oy1), slice(ox, ox1))] = block_ds
+                            else:
+                                prev_block = prev_store[(slice(pz0, pz1), slice(py0, py1), slice(px0, px1))]
+                                pad_z = (0, (prev_block.shape[0] % 2))
+                                pad_y = (0, (prev_block.shape[1] % 2))
+                                pad_x = (0, (prev_block.shape[2] % 2))
+                                prev_block = np.pad(prev_block, (pad_z, pad_y, pad_x), mode='edge')
+                                Zb, Yb, Xb = prev_block.shape
+                                block_ds = prev_block.reshape(Zb//2, 2, Yb//2, 2, Xb//2, 2).mean(axis=(1, 3, 5))
+                                ds_store[(slice(oz, oz1), slice(oy, oy1), slice(ox, ox1))] = block_ds
+
+                datasets.append({'path': str(i)})
+                prev_path = lvl_path
+                prev_shape = next_shape
+
+            # Write OME-NGFF multiscales metadata on the root group
+            try:
+                root = zarr.open_group(root_path, mode='a', storage_options={'anon': False} if root_path.startswith('s3://') else None)
+                axes = []
+                if has_channel:
+                    axes.append({'name': 'c', 'type': 'channel'})
+                axes.extend([
+                    {'name': 'z', 'type': 'space'},
+                    {'name': 'y', 'type': 'space'},
+                    {'name': 'x', 'type': 'space'}
+                ])
+                root.attrs['multiscales'] = [{
+                    'version': '0.4',
+                    'axes': axes,
+                    'datasets': datasets
+                }]
+            except Exception as me:
+                print(f"Warning: Failed to write multiscales metadata: {me}")
+        except Exception as be:
+            print(f"Warning: Failed to build multiscales: {be}")
+
+    build_multiscales(root_path)
+
+    # Write metadata.json at the root of the zarr with inference args and run time
+    try:
+        meta = {}
+        if hasattr(input_store, 'attrs') and 'inference_args' in input_store.attrs:
+            meta.update(input_store.attrs['inference_args'])
+        # Add/override finalize context
+        meta.update({
+            'finalize_mode': mode,
+            'finalize_threshold': bool(threshold),
+            'finalize_time': datetime.utcnow().isoformat() + 'Z',
+            'input_logits_path': input_path,
+            'output_path': output_path
+        })
+        # Write using fsspec so it works for local and remote
+        proto = output_path.split('://', 1)[0] if '://' in output_path else None
+        meta_path = os.path.join(output_path, 'metadata.json')
+        if proto in ('s3', 'gs', 'azure'):
+            fs = fsspec.filesystem(proto, anon=False if proto == 's3' else None)
+            with fs.open(meta_path, 'w') as f:
+                json.dump(meta, f, indent=2)
+        else:
+            os.makedirs(output_path, exist_ok=True)
+            with open(meta_path, 'w') as f:
+                json.dump(meta, f, indent=2)
+        if verbose:
+            print(f"Wrote metadata.json to {meta_path}")
+    except Exception as me:
+        print(f"Warning: Failed to write metadata.json: {me}")
     
     if delete_intermediates:
         print(f"Deleting intermediate logits: {input_path}")
@@ -377,7 +546,7 @@ def finalize_logits(
             print(f"Warning: Failed to delete intermediate logits: {e}")
             print(f"You may need to delete them manually: {input_path}")
     
-    print(f"Final output saved to: {output_path}")
+    print(f"Final multiscale output saved to: {output_path}")
 
 
 # --- Command Line Interface ---

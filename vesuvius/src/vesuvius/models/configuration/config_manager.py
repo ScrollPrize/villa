@@ -82,9 +82,11 @@ class ConfigManager:
         self.train_patch_size = tuple(self.tr_configs.get("patch_size", [192, 192, 192]))
         self.in_channels = 1
         self.train_batch_size = int(self.tr_configs.get("batch_size", 2))
+        # Enable nnUNet-style deep supervision (disabled by default)
+        self.enable_deep_supervision = bool(self.tr_configs.get("enable_deep_supervision", True))
         self.gradient_accumulation = int(self.tr_configs.get("gradient_accumulation", 1))
-        self.max_steps_per_epoch = int(self.tr_configs.get("max_steps_per_epoch", 200))
-        self.max_val_steps_per_epoch = int(self.tr_configs.get("max_val_steps_per_epoch", 25))
+        self.max_steps_per_epoch = int(self.tr_configs.get("max_steps_per_epoch", 250))
+        self.max_val_steps_per_epoch = int(self.tr_configs.get("max_val_steps_per_epoch", 50))
         self.train_num_dataloader_workers = int(self.tr_configs.get("num_dataloader_workers", 8))
         self.max_epoch = int(self.tr_configs.get("max_epoch", 1000))
         self.optimizer = self.tr_configs.get("optimizer", "SGD")
@@ -112,6 +114,8 @@ class ConfigManager:
         
         # Spatial transformations control
         self.no_spatial = bool(self.dataset_config.get("no_spatial", False))
+        # Control where augmentations run; default to CPU (in Dataset workers)
+        self.augment_on_device = bool(self.tr_configs.get("augment_on_device", False))
 
         # Normalization configuration
         self.normalization_scheme = self.dataset_config.get("normalization_scheme", "zscore")
@@ -136,14 +140,21 @@ class ConfigManager:
         self.in_channels = self.model_config.get("in_channels", 1)
         self.out_channels = ()
         for target_name, task_info in self.targets.items():
-            # Look for either 'out_channels' or 'channels' in the task info
+            # Determine channels, with special handling for derived tasks
             if 'out_channels' in task_info:
                 channels = task_info['out_channels']
             elif 'channels' in task_info:
                 channels = task_info['channels']
             else:
-                channels = 2  # Default to 2
-                task_info['out_channels'] = 2
+                task_type = str(task_info.get('task_type', '')).lower()
+                if task_type == 'nearest_component':
+                    # vector (op_dims) + 1 scalar distance
+                    ch = (self.op_dims if hasattr(self, 'op_dims') and self.op_dims in (2, 3) else len(self.train_patch_size)) + 1
+                    channels = ch
+                    task_info['out_channels'] = ch
+                else:
+                    channels = 2  # Default to 2
+                    task_info['out_channels'] = 2
 
             self.out_channels += (channels,)
 
@@ -371,17 +382,19 @@ class ConfigManager:
                     label_tensor = sample[target_name]
                     
                     # Determine number of channels based on label data
-                    # For binary labels (0/1), we always use 2 channels minimum
-                    unique_values = torch.unique(label_tensor)
-                    num_unique = len(unique_values)
-                    
-                    # Always use at least 2 channels
-                    if num_unique <= 2:
-                        detected_channels = 2
+                    # Regression/continuous aux targets: use channel dimension directly
+                    if label_tensor.dtype.is_floating_point or (label_tensor.ndim >= 3 and label_tensor.shape[0] > 1):
+                        detected_channels = int(label_tensor.shape[0])
                     else:
-                        # Multi-class case - use max value + 1
-                        detected_channels = int(torch.max(label_tensor).item()) + 1
-                        detected_channels = max(detected_channels, 2)
+                        # For discrete labels, infer from unique values
+                        unique_values = torch.unique(label_tensor)
+                        num_unique = len(unique_values)
+                        if num_unique <= 2:
+                            detected_channels = 2
+                        else:
+                            # Multi-class case - use max value + 1
+                            detected_channels = int(torch.max(label_tensor).item()) + 1
+                            detected_channels = max(detected_channels, 2)
                     
                     self.targets[target_name]['out_channels'] = detected_channels
                     targets_updated = True

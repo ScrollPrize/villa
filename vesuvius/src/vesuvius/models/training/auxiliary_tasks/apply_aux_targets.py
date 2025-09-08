@@ -36,6 +36,17 @@ def create_auxiliary_task(task_type: str, aux_task_name: str, aux_config: Dict[s
     elif task_type == "surface_normals":
         from .aux_surface_normals import create_surface_normals_config
         return create_surface_normals_config(aux_task_name, aux_config, source_target_name)
+    elif task_type == "structure_tensor":
+        from .aux_structure_tensor import create_structure_tensor_config
+        return create_structure_tensor_config(aux_task_name, aux_config, source_target_name)
+    elif task_type == "inplane_direction":
+        from .aux_inplane_direction import create_inplane_direction_config
+        return create_inplane_direction_config(aux_task_name, aux_config, source_target_name)
+    elif task_type == "nearest_component":
+        from .aux_nearest_component import create_nearest_component_config
+        # Need to know dimensionality; caller supplies mgr usually. Fallback to 3D.
+        # Here we don't have mgr, so default to 3D; config_manager will usually set channels anyway.
+        return create_nearest_component_config(aux_task_name, aux_config, source_target_name, is_2d=False)
     else:
         raise ValueError(f"Unknown auxiliary task type: {task_type}")
 
@@ -66,13 +77,14 @@ def compute_auxiliary_loss(loss_fn, t_pred: torch.Tensor, t_gt_masked: torch.Ten
     torch.Tensor
         Computed loss value
     """
-    # Check if this is a skeleton-aware loss
-    loss_name = loss_fn.__class__.__name__ if hasattr(loss_fn, '__class__') else str(loss_fn)
+    # Check if this is a skeleton-aware loss. Support DeepSupervisionWrapper by peeking at wrapped loss
+    base_loss = getattr(loss_fn, 'loss', loss_fn)
+    loss_name = base_loss.__class__.__name__ if hasattr(base_loss, '__class__') else str(base_loss)
     skeleton_losses = ['DC_SkelREC_and_CE_loss', 'SoftSkeletonRecallLoss']
     
     if loss_name in skeleton_losses:
         if skeleton_data is not None:
-            # Pass skeleton data as third argument for skeleton-aware losses
+            # Pass skeleton data as third argument (DeepSupervisionWrapper will forward it)
             result = loss_fn(t_pred, t_gt_masked, skeleton_data)
         else:
             # For skeleton losses, we must have skeleton data

@@ -57,7 +57,8 @@ def get_activation_module(activation_str: str):
     elif act_str == "sigmoid":
         return nn.Sigmoid()
     elif act_str == "softmax":
-        return nn.Softmax()
+        # Use channel dimension by default
+        return nn.Softmax(dim=1)
     else:
         raise ValueError(f"Unknown activation type: {activation_str}")
 
@@ -306,23 +307,55 @@ class NetworkFromConfig(nn.Module):
         )
         self.task_decoders = nn.ModuleDict()
         self.task_activations = nn.ModuleDict()
-        
-        # Standard supervised mode - create task-specific decoders
+        self.task_heads = nn.ModuleDict()
+
+        # Decide decoder sharing strategy
+        separate_decoders_default = model_config.get("separate_decoders", False)
+
+        # Determine which tasks use separate decoders vs shared head
+        tasks_using_separate = set()
+        tasks_using_shared = set()
+
+        # First, normalize out_channels for each task and decide strategy
         for target_name, target_info in self.targets.items():
-            # Determine output channels - use task-specific channels if specified, otherwise match input channels
             if 'out_channels' in target_info:
                 out_channels = target_info['out_channels']
             elif 'channels' in target_info:
                 out_channels = target_info['channels']
             else:
-                # Default to matching input channels for adaptive behavior
                 out_channels = self.in_channels
                 print(f"No channel specification found for task '{target_name}', defaulting to {out_channels} channels (matching input)")
-
-            # Update target_info with the determined channels
             target_info["out_channels"] = out_channels
 
-            activation_str = target_info.get("activation", "none")
+            # Determine per-task override for decoder sharing
+            use_separate = target_info.get("separate_decoder", separate_decoders_default)
+            if use_separate:
+                tasks_using_separate.add(target_name)
+            else:
+                tasks_using_shared.add(target_name)
+
+        # If at least one task uses shared, build a single shared decoder trunk (features-only)
+        if len(tasks_using_shared) > 0:
+            self.shared_decoder = Decoder(
+                encoder=self.shared_encoder,
+                basic_block=model_config.get("basic_decoder_block", "ConvBlock"),
+                num_classes=None,  # features-only mode
+                n_conv_per_stage=model_config.get("n_conv_per_stage_decoder", [1] * (self.num_stages - 1)),
+                deep_supervision=False
+            )
+            # Heads map from decoder feature channels at highest resolution to task outputs
+            head_in_ch = self.shared_encoder.output_channels[0]
+            for target_name in tasks_using_shared:
+                out_ch = self.targets[target_name]["out_channels"]
+                self.task_heads[target_name] = self.conv_op(head_in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=True)
+                activation_str = self.targets[target_name].get("activation", "none")
+                self.task_activations[target_name] = get_activation_module(activation_str)
+                print(f"Task '{target_name}' configured with shared decoder + head ({out_ch} channels)")
+
+        # Build separate decoders for tasks that requested them
+        for target_name in tasks_using_separate:
+            out_channels = self.targets[target_name]["out_channels"]
+            activation_str = self.targets[target_name].get("activation", "none")
             self.task_decoders[target_name] = Decoder(
                 encoder=self.shared_encoder,
                 basic_block=model_config.get("basic_decoder_block", "ConvBlock"),
@@ -331,7 +364,7 @@ class NetworkFromConfig(nn.Module):
                 deep_supervision=False
             )
             self.task_activations[target_name] = get_activation_module(activation_str)
-            print(f"Task '{target_name}' configured with {out_channels} output channels")
+            print(f"Task '{target_name}' configured with separate decoder ({out_channels} channels)")
 
         # --------------------------------------------------------------------
         # Build final configuration snapshot.
@@ -371,6 +404,7 @@ class NetworkFromConfig(nn.Module):
             "in_channels": self.in_channels,
             "autoconfigure": self.autoconfigure,
             "targets": self.targets,
+            "separate_decoders": separate_decoders_default,
             # Include autoconfiguration results if available
             "num_pool_per_axis": getattr(self, 'num_pool_per_axis', None),
             "must_be_divisible_by": getattr(self, 'must_be_divisible_by', None)
@@ -444,12 +478,18 @@ class NetworkFromConfig(nn.Module):
             **primus_kwargs
         )
         
-        # Initialize task-specific decoders
+        # Initialize decoders/heads based on sharing strategy
         self.task_decoders = nn.ModuleDict()
         self.task_activations = nn.ModuleDict()
-        
+        self.task_heads = nn.ModuleDict()
+
+        separate_decoders_default = model_config.get("separate_decoders", False)
+        decoder_head_channels = model_config.get("decoder_head_channels", 32)
+
+        tasks_using_shared, tasks_using_separate = set(), set()
+
+        # Decide per-task channels and strategy
         for target_name, target_info in self.targets.items():
-            # Determine output channels
             if 'out_channels' in target_info:
                 out_channels = target_info['out_channels']
             elif 'channels' in target_info:
@@ -457,20 +497,46 @@ class NetworkFromConfig(nn.Module):
             else:
                 out_channels = self.in_channels
                 print(f"No channel specification found for task '{target_name}', defaulting to {out_channels} channels")
-            
-            # Update target_info
             target_info["out_channels"] = out_channels
-            
-            # Create Primus decoder for this task
-            activation_str = target_info.get("activation", "none")
+
+            use_separate = target_info.get("separate_decoder", separate_decoders_default)
+            if use_separate:
+                tasks_using_separate.add(target_name)
+            else:
+                tasks_using_shared.add(target_name)
+
+        # Shared Primus decoder trunk
+        if len(tasks_using_shared) > 0:
+            self.shared_decoder = PrimusDecoder(
+                encoder=self.shared_encoder,
+                num_classes=decoder_head_channels,
+                norm=decoder_norm_str,
+                activation=decoder_act_str,
+                decoder_depth=model_config.get("decoder_depth", 2),
+                decoder_num_heads=model_config.get("decoder_num_heads", 12),
+            )
+            for target_name in tasks_using_shared:
+                out_ch = self.targets[target_name]["out_channels"]
+                # Primus is 3D
+                self.task_heads[target_name] = nn.Conv3d(decoder_head_channels, out_ch, kernel_size=1, stride=1, padding=0, bias=True)
+                activation_str = self.targets[target_name].get("activation", "none")
+                self.task_activations[target_name] = get_activation_module(activation_str)
+                print(f"Primus task '{target_name}' configured with shared decoder + head ({out_ch} channels)")
+
+        # Separate Primus decoders per task
+        for target_name in tasks_using_separate:
+            out_channels = self.targets[target_name]["out_channels"]
+            activation_str = self.targets[target_name].get("activation", "none")
             self.task_decoders[target_name] = PrimusDecoder(
                 encoder=self.shared_encoder,
                 num_classes=out_channels,
                 norm=decoder_norm_str,
                 activation=decoder_act_str,
+                decoder_depth=model_config.get("decoder_depth", 2),
+                decoder_num_heads=model_config.get("decoder_num_heads", 12),
             )
             self.task_activations[target_name] = get_activation_module(activation_str)
-            print(f"Primus task '{target_name}' configured with {out_channels} output channels")
+            print(f"Primus task '{target_name}' configured with separate decoder ({out_channels} channels)")
         
         # Store configuration for reference
         self.final_config = {
@@ -483,6 +549,8 @@ class NetworkFromConfig(nn.Module):
             "targets": self.targets,
             "decoder_norm": decoder_norm_str,
             "decoder_act": decoder_act_str,
+            "separate_decoders": separate_decoders_default,
+            "decoder_head_channels": decoder_head_channels,
             **primus_kwargs
         }
         
@@ -557,12 +625,29 @@ class NetworkFromConfig(nn.Module):
             restoration_mask = None
         
         results = {}
+        shared_features = None
+
+        # Handle tasks with separate decoders first
         for task_name, decoder in self.task_decoders.items():
             logits = decoder(features)
-            activation_fn = self.task_activations[task_name]
+            # Some decoders may return a list (deep supervision). Use highest-resolution output.
+            if isinstance(logits, (list, tuple)) and len(logits) > 0:
+                logits = logits[0]
+            activation_fn = self.task_activations[task_name] if task_name in self.task_activations else None
             if activation_fn is not None and not self.training:
                 logits = activation_fn(logits)
             results[task_name] = logits
+
+        # Handle tasks that use shared decoder + heads
+        if hasattr(self, 'task_heads') and len(self.task_heads) > 0:
+            if shared_features is None:
+                shared_features = self.shared_decoder(features)
+            for task_name, head in self.task_heads.items():
+                logits = head(shared_features)
+                activation_fn = self.task_activations[task_name] if task_name in self.task_activations else None
+                if activation_fn is not None and not self.training:
+                    logits = activation_fn(logits)
+                results[task_name] = logits
         
         # Return MAE mask if requested (for MAE training)
         if return_mae_mask:

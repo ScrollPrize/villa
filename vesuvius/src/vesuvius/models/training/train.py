@@ -16,6 +16,7 @@ from datetime import datetime
 from tqdm import tqdm
 import numpy as np
 import torch
+import torch.nn.functional as F
 from vesuvius.models.training.lr_schedulers import get_scheduler, PolyLRScheduler
 from torch.utils.data import DataLoader, SubsetRandomSampler
 from vesuvius.models.utils import InitWeights_He
@@ -24,6 +25,7 @@ from vesuvius.utils.plotting import save_debug
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 
 from vesuvius.models.training.loss.losses import _create_loss
+from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.save_checkpoint import (
     save_checkpoint,
@@ -45,7 +47,8 @@ from vesuvius.models.evaluation.connected_components import ConnectedComponentsM
 from vesuvius.models.evaluation.critical_components import CriticalComponentsMetric
 from vesuvius.models.evaluation.iou_dice import IOUDiceMetric
 from vesuvius.models.evaluation.hausdorff import HausdorffDistanceMetric
-
+from vesuvius.models.datasets.intensity_properties import load_intensity_props_formatted
+from vesuvius.models.evaluation.skeleton_branch_points import SkeletonBranchPointsMetric
 
 from itertools import cycle
 from contextlib import nullcontext
@@ -114,6 +117,22 @@ class BaseTrainer:
         loss_fns = {}
         self._deferred_losses = {}  # losses that may be added later in training (at a selected epoch)
         
+        def _pretty_loss_name(loss_fn, fallback_name: str):
+            """Return a human-friendly loss name including base loss under wrappers."""
+            try:
+                names = []
+                lf = loss_fn
+                # Unwrap nested wrappers exposing `.loss`
+                while hasattr(lf, 'loss'):
+                    names.append(lf.__class__.__name__)
+                    lf = lf.loss
+                base = lf.__class__.__name__
+                if names:
+                    return f"{' + '.join(names)} ({base})"
+                return base
+            except Exception:
+                return fallback_name
+
         for task_name, task_info in self.mgr.targets.items():
             task_losses = []
             deferred_losses = []
@@ -139,6 +158,10 @@ class BaseTrainer:
                             pos_weight=pos_weight,
                             mgr=self.mgr
                         )
+                        # If deep supervision is enabled, wrap the loss in nnUNet-style DS wrapper
+                        if getattr(self.mgr, 'enable_deep_supervision', False) and getattr(self, '_ds_weights', None) is not None:
+                            # Wrap all losses incl. skeleton-aware; wrapper now forwards extra args
+                            loss_fn = DeepSupervisionWrapper(loss_fn, self._ds_weights)
                         
                         if start_epoch > 0:
                             # Store for later addition
@@ -148,11 +171,11 @@ class BaseTrainer:
                                 'start_epoch': start_epoch,
                                 'name': loss_name
                             })
-                            print(f"  - {loss_name} (weight: {loss_weight}) - will start at epoch {start_epoch}")
+                            print(f"  - {_pretty_loss_name(loss_fn, loss_name)} (weight: {loss_weight}) - will start at epoch {start_epoch}")
                         else:
                             # Add immediately
                             task_losses.append((loss_fn, loss_weight))
-                            print(f"  - {loss_name} (weight: {loss_weight})")
+                            print(f"  - {_pretty_loss_name(loss_fn, loss_name)} (weight: {loss_weight})")
                     except RuntimeError as e:
                         raise ValueError(
                             f"Failed to create loss function '{loss_name}' for target '{task_name}': {str(e)}")
@@ -162,6 +185,113 @@ class BaseTrainer:
                 self._deferred_losses[task_name] = deferred_losses
 
         return loss_fns
+
+    # --- deep supervision helpers --- #
+    def _set_deep_supervision_enabled(self, model, enabled: bool):
+        if not hasattr(model, 'task_decoders'):
+            return
+        for _, dec in model.task_decoders.items():
+            if hasattr(dec, 'deep_supervision'):
+                dec.deep_supervision = enabled
+
+    def _get_deep_supervision_scales(self, model):
+        cfg = getattr(model, 'final_config', {})
+        pool_kernels = cfg.get('pool_op_kernel_sizes', None)
+        if pool_kernels is None:
+            return None
+        arr = np.vstack(pool_kernels)
+        # 1 / cumprod of pooling kernels, drop the last (lowest resolution not used for logits loss weight)
+        scales = list(list(i) for i in 1 / np.cumprod(arr, axis=0))[:-1]
+        return scales
+
+    def _compute_ds_weights(self, n: int):
+        if n <= 0:
+            return None
+        weights = np.array([1 / (2 ** i) for i in range(n)], dtype=np.float32)
+        # Do not use the lowest resolution output
+        weights[-1] = 0.0
+        s = weights.sum()
+        if s > 0:
+            weights = weights / s
+        return weights.tolist()
+
+    def _get_interp_mode_for_target(self, target_name: str, ndim: int):
+        """Return (mode, align_corners) for F.interpolate based on YAML ds_interpolation and dims.
+        Supported values:
+          - 'nearest' (default)
+          - 'linear' (mapped to 'bilinear' in 2D, 'trilinear' in 3D)
+          - 'bilinear' (2D only; 3D -> 'trilinear')
+          - 'trilinear' (3D only; 2D -> 'bilinear')
+          - 'area' (2D only; 3D falls back to 'nearest')
+        """
+        cfg = self.mgr.targets.get(target_name, {}) if hasattr(self.mgr, 'targets') else {}
+        req = str(cfg.get('ds_interpolation', 'nearest')).lower()
+
+        # Default
+        mode = 'nearest'
+        align = None
+
+        if req == 'nearest':
+            return 'nearest', None
+
+        if req in ('linear', 'bilinear', 'trilinear'):
+            if ndim == 4:  # BCHW (2D)
+                mode = 'bilinear'
+            elif ndim == 5:  # BCDHW (3D)
+                mode = 'trilinear'
+            align = False
+            return mode, align
+
+        if req == 'area':
+            if ndim == 4:
+                return 'area', None
+            else:
+                # area not supported for 3D, fall back safe
+                return 'nearest', None
+
+        # Fallback safe
+        return 'nearest', None
+
+    def _downsample_targets_for_ds(self, outputs, targets_dict):
+        """Downsample ground truth targets to match deep supervision outputs.
+        Only modifies keys that are predicted (present in outputs).
+        Returns a copy of targets_dict with lists of tensors per key.
+        """
+        if getattr(self, '_ds_scales', None) is None:
+            return targets_dict
+        new_targets = dict(targets_dict)
+        for t_name, pred in outputs.items():
+            # Skip if no ground truth for this prediction (e.g., auxiliary outputs not supervised)
+            if t_name not in targets_dict:
+                continue
+            # Only act if the network returns deep supervision (list) for this output
+            if isinstance(pred, (list, tuple)):
+                base_t = targets_dict[t_name]
+                if base_t.ndim not in (4, 5):  # BCHW or BCDHW
+                    continue
+                ds_targets = []
+                mode, align_corners = self._get_interp_mode_for_target(t_name, base_t.ndim)
+                for s in self._ds_scales:
+                    # interpolate targets per selected mode
+                    if align_corners is None:
+                        ds_t = F.interpolate(base_t.float(), scale_factor=s, mode=mode)
+                    else:
+                        ds_t = F.interpolate(base_t.float(), scale_factor=s, mode=mode, align_corners=align_corners)
+                    ds_targets.append(ds_t.to(base_t.dtype))
+                new_targets[t_name] = ds_targets
+
+                # Also downsample associated skeleton target if present
+                skel_key = f"{t_name}_skel"
+                if skel_key in targets_dict:
+                    base_skel = targets_dict[skel_key]
+                    if base_skel.ndim in (4, 5):
+                        ds_skels = []
+                        for s in self._ds_scales:
+                            # keep skeletons as nearest to preserve topology
+                            ds_s = F.interpolate(base_skel.float(), scale_factor=s, mode='nearest')
+                            ds_skels.append(ds_s.to(base_skel.dtype))
+                        new_targets[skel_key] = ds_skels
+        return new_targets
 
     def _update_scheduler_for_epoch(self, scheduler, optimizer, epoch):
         """
@@ -254,6 +384,7 @@ class BaseTrainer:
             #     task_metrics.append(CriticalComponentsMetric())
 
             task_metrics.append(IOUDiceMetric(num_classes=num_classes))
+            task_metrics.append(SkeletonBranchPointsMetric(num_classes=num_classes))
             # task_metrics.append(HausdorffDistanceMetric(num_classes=num_classes))
             metrics[task_name] = task_metrics
         
@@ -278,14 +409,8 @@ class BaseTrainer:
 
 
         if device_type == 'cuda' and use_amp:
-            # Use GradScaler for both float16 and bfloat16
-            # even though according to every single thing i've read you dont need grad scaling with bf16
-            # my model learns essentially nothing with it disabled. i have no idea why.
-            if torch.cuda.is_bf16_supported():
-                print("bfloat16 is supported, grad scaling is not required. using DummyScaler")
-                return DummyScaler()
-            else:
-                print("Using GradScaler with float16 autocast")
+            # Use standard GradScaler when AMP is enabled on CUDA
+            print("Using GradScaler with CUDA AMP")
             return torch.amp.GradScaler('cuda')
         else:
             # Not using amp or not on cuda - no gradient scaling needed
@@ -294,37 +419,61 @@ class BaseTrainer:
     # --- dataloaders --- #
     def _configure_dataloaders(self, train_dataset, val_dataset=None):
 
-        if val_dataset is None:
-            val_dataset = train_dataset
-            
-        dataset_size = len(train_dataset)
-        indices = list(range(dataset_size))
+        # If no separate validation dataset provided, fall back to random split of train
+        if val_dataset is None or val_dataset is train_dataset:
+            dataset_size = len(train_dataset)
+            indices = list(range(dataset_size))
 
-        if hasattr(self.mgr, 'seed'):
-            np.random.seed(self.mgr.seed)
+            if hasattr(self.mgr, 'seed'):
+                np.random.seed(self.mgr.seed)
+                if self.mgr.verbose:
+                    print(f"Using seed {self.mgr.seed} for train/val split")
+
+            np.random.shuffle(indices)
+
+            train_val_split = self.mgr.tr_val_split
+            split = int(np.floor(train_val_split * dataset_size))
+            train_indices, val_indices = indices[:split], indices[split:]
+        else:
+            # Separate validation dataset provided. Use full validation set, and
+            # exclude any training patches whose volume_name appears in validation.
+            val_indices = list(range(len(val_dataset)))
+
+            # Build set of validation volume names to filter training patches
+            val_volume_names = set()
+            for vp in getattr(val_dataset, 'valid_patches', []):
+                name = vp.get('volume_name')
+                if name is not None:
+                    val_volume_names.add(name)
+
+            train_indices = []
+            for i, vp in enumerate(getattr(train_dataset, 'valid_patches', [])):
+                name = vp.get('volume_name')
+                if name is None or name not in val_volume_names:
+                    train_indices.append(i)
+
             if self.mgr.verbose:
-                print(f"Using seed {self.mgr.seed} for train/val split")
+                print(f"Using external validation set: {len(val_indices)} val patches")
+                print(f"Excluding {len(train_dataset) - len(train_indices)} train patches overlapping validation volumes")
 
-        np.random.shuffle(indices)
-
-        train_val_split = self.mgr.tr_val_split
-        split = int(np.floor(train_val_split * dataset_size))
-        train_indices, val_indices = indices[:split], indices[split:]
         batch_size = self.mgr.train_batch_size
 
-        train_dataloader = DataLoader(train_dataset,
-                                      batch_size=batch_size,
-                                      sampler=SubsetRandomSampler(train_indices),
-                                      pin_memory=(True if self.device == 'cuda' else False),
-                                      num_workers=self.mgr.train_num_dataloader_workers
-                                      )
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            sampler=SubsetRandomSampler(train_indices),
+            pin_memory=(True if self.device == 'cuda' else False),
+            num_workers=self.mgr.train_num_dataloader_workers,
+            prefetch_factor=2
+        )
 
-        val_dataloader = DataLoader(val_dataset,
-                                    batch_size=1,
-                                    sampler=SubsetRandomSampler(val_indices),
-                                    pin_memory=(True if self.device == 'cuda' else False),
-                                    num_workers=self.mgr.train_num_dataloader_workers
-                                    )
+        val_dataloader = DataLoader(
+            val_dataset if val_dataset is not None else train_dataset,
+            batch_size=1,
+            sampler=SubsetRandomSampler(val_indices),
+            pin_memory=(True if self.device == 'cuda' else False),
+            num_workers=self.mgr.train_num_dataloader_workers,
+        )
 
         return train_dataloader, val_dataloader, train_indices, val_indices
 
@@ -338,11 +487,47 @@ class BaseTrainer:
         # we put augmentations in the dataset class so we can use the __getitem__ method
         # for free multi processing of augmentations 
         train_dataset = self._configure_dataset(is_training=True)
-        val_dataset = self._configure_dataset(is_training=False)
+        # Keep a handle to the training dataset for on-device augmentation
+        self._train_dataset = train_dataset
+
+        # Build validation dataset; support separate directory via mgr.val_data_path
+        if hasattr(self.mgr, 'val_data_path') and self.mgr.val_data_path is not None:
+            from copy import deepcopy
+            from vesuvius.models.utilities.data_format_utils import detect_data_format as _detect_df
+
+            val_mgr = deepcopy(self.mgr)
+            val_mgr.data_path = Path(self.mgr.val_data_path)
+
+            detected_val_fmt = _detect_df(val_mgr.data_path)
+            if detected_val_fmt is None:
+                raise ValueError(f"Could not determine data format for validation directory: {val_mgr.data_path}")
+            val_mgr.data_format = detected_val_fmt
+
+            if val_mgr.data_format == 'napari':
+                val_dataset = NapariDataset(mgr=val_mgr, is_training=False)
+            elif val_mgr.data_format == 'image':
+                val_dataset = ImageDataset(mgr=val_mgr, is_training=False)
+            elif val_mgr.data_format == 'zarr':
+                val_dataset = ZarrDataset(mgr=val_mgr, is_training=False)
+            else:
+                raise ValueError(f"Unsupported validation data format: {val_mgr.data_format}")
+            print(f"Using {val_mgr.data_format} dataset format (validation from --val-dir)")
+        else:
+            val_dataset = self._configure_dataset(is_training=False)
         
 
         self.mgr.auto_detect_channels(train_dataset)
         model = self._build_model()
+
+        # Deep supervision setup (enable on decoders, compute scales & weights)
+        self._ds_scales = None
+        self._ds_weights = None
+        if getattr(self.mgr, 'enable_deep_supervision', False):
+            self._set_deep_supervision_enabled(model, True)
+            self._ds_scales = self._get_deep_supervision_scales(model)
+            if self._ds_scales is not None:
+                self._ds_weights = self._compute_ds_weights(len(self._ds_scales))
+
         optimizer = self._get_optimizer(model)
         loss_fns = self._build_loss()
         scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
@@ -463,15 +648,51 @@ class BaseTrainer:
 
     def _get_model_outputs(self, model, data_dict):
         inputs = data_dict["image"].to(self.device)
+        # Only include tensor targets; skip metadata and lists (e.g., 'regression_keys')
         targets_dict = {
             k: v.to(self.device)
             for k, v in data_dict.items()
-            if k not in ["image", "patch_info", "is_unlabeled"]
+            if k not in ["image", "patch_info", "is_unlabeled", "regression_keys"]
+            and hasattr(v, "to")
         }
         
         outputs = model(inputs)
+
+        # If deep supervision is enabled, prepare lists of downsampled targets
+        if getattr(self.mgr, 'enable_deep_supervision', False):
+            targets_dict = self._downsample_targets_for_ds(outputs, targets_dict)
         
         return inputs, targets_dict, outputs
+
+    def _apply_transforms_per_sample(self, tfm, batched_dict):
+        """Apply a ComposeTransforms pipeline to each sample in a batched dict.
+        Expects tensors shaped [B, C, ...]. Returns a new batched dict with tensors stacked on dim 0.
+        Non-tensor fields that are lists/tuples of length B are passed per-sample and returned as lists.
+        """
+        if 'image' not in batched_dict or not isinstance(batched_dict['image'], torch.Tensor):
+            return batched_dict
+        B = batched_dict['image'].shape[0]
+        out_accum = {}
+        for b in range(B):
+            sample = {}
+            for k, v in batched_dict.items():
+                if isinstance(v, torch.Tensor) and v.shape[0] == B:
+                    sample[k] = v[b]
+                elif isinstance(v, (list, tuple)) and len(v) == B:
+                    sample[k] = v[b]
+                else:
+                    sample[k] = v
+            sample_out = tfm(**sample)
+            for k, v in sample_out.items():
+                out_accum.setdefault(k, []).append(v)
+
+        batched_out = {}
+        for k, vals in out_accum.items():
+            if isinstance(vals[0], torch.Tensor):
+                batched_out[k] = torch.stack(vals, dim=0)
+            else:
+                batched_out[k] = vals
+        return batched_out
 
     def _train_step(self, model, data_dict, loss_fns, use_amp, autocast_ctx, epoch, step, verbose=False,
                     scaler=None, optimizer=None, num_iters=None, grad_accumulate_n=1):
@@ -489,8 +710,27 @@ class BaseTrainer:
                 else:
                     print(f"{item}: {val.dtype}, {val.shape}, min {val.min()} max {val.max()}")
 
+        # Optionally run augmentations on the model device instead of Dataset workers
+        if getattr(self.mgr, 'augment_on_device', False) and getattr(self, '_train_dataset', None) is not None:
+            tfm = getattr(self._train_dataset, 'transforms', None)
+            if tfm is None:
+                data_for_forward = data_dict
+            else:
+                # Move tensors to device
+                dd = {}
+                for k, v in data_dict.items():
+                    dd[k] = v.to(self.device) if isinstance(v, torch.Tensor) else v
+
+                # Apply transforms per-sample (transforms expect unbatched (C, ...) tensors)
+                try:
+                    data_for_forward = self._apply_transforms_per_sample(tfm, dd)
+                except Exception as e:
+                    raise RuntimeError(f"On-device augmentation failed: {e}")
+        else:
+            data_for_forward = data_dict
+
         with autocast_ctx:
-            inputs, targets_dict, outputs = self._get_model_outputs(model, data_dict)
+            inputs, targets_dict, outputs = self._get_model_outputs(model, data_for_forward)
             total_loss, task_losses = self._compute_train_loss(outputs, targets_dict, loss_fns)
 
         # Handle gradient accumulation, clipping, and optimizer step
@@ -522,14 +762,22 @@ class BaseTrainer:
             task_loss_fns = loss_fns[t_name]  # List of (loss_fn, weight) tuples
             task_weight = self.mgr.targets[t_name].get("weight", 1.0)
 
-            task_total_loss = 0.0
+            # Initialize as tensor on same device/dtype to keep downstream ops consistent
+            task_total_loss = torch.zeros((), device=t_pred.device, dtype=t_pred.dtype)
             for loss_fn, loss_weight in task_loss_fns:
                 # this naming is extremely confusing, i know. we route all loss through the aux helper
                 # because it just simplifies adding addtl losses for aux tasks if present.
                 # TODO: rework this janky setup to make it more clear
                 # Get skeleton data if available
                 skeleton_data = targets_dict.get(f'{t_name}_skel', None)
-                loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt, outputs,
+                # If DS is enabled and loss isn't wrapped (edge case), fall back to highest-res
+                pred_for_loss, gt_for_loss = t_pred, t_gt
+                if isinstance(t_pred, (list, tuple)) and not isinstance(loss_fn, DeepSupervisionWrapper):
+                    pred_for_loss = t_pred[0]
+                    if isinstance(t_gt, (list, tuple)):
+                        gt_for_loss = t_gt[0]
+
+                loss_value = compute_auxiliary_loss(loss_fn, pred_for_loss, gt_for_loss, outputs,
                                                     self.mgr.targets[t_name], skeleton_data)
                 task_total_loss += loss_weight * loss_value
 
@@ -544,26 +792,26 @@ class BaseTrainer:
 
     def _validation_step(self, model, data_dict, loss_fns, use_amp):
         inputs = data_dict["image"].to(self.device)
+        # Only include tensor targets; skip metadata and lists (e.g., 'regression_keys')
         targets_dict = {
             k: v.to(self.device)
             for k, v in data_dict.items()
-            if k not in ["image", "patch_info", "is_unlabeled"]
+            if k not in ["image", "patch_info", "is_unlabeled", "regression_keys"]
+            and hasattr(v, "to")
         }
 
         if use_amp:
             if self.device.type == 'cuda':
-                if torch.cuda.is_bf16_supported():
-                    context = torch.amp.autocast('cuda', dtype=torch.bfloat16)
-                else:
-                    context = torch.amp.autocast('cuda')
+                context = torch.amp.autocast('cuda')
             else:
                 context = torch.amp.autocast(self.device.type)
-            
         else:
             context = nullcontext()
 
         with context:
             outputs = model(inputs)
+            if getattr(self.mgr, 'enable_deep_supervision', False):
+                targets_dict = self._downsample_targets_for_ds(outputs, targets_dict)
             task_losses = self._compute_validation_loss(outputs, targets_dict, loss_fns)
         
         return task_losses, inputs, targets_dict, outputs
@@ -577,11 +825,19 @@ class BaseTrainer:
             t_pred = outputs[t_name]
             task_loss_fns = loss_fns[t_name]  # List of (loss_fn, weight) tuples
 
-            task_total_loss = 0.0
+            # Initialize as tensor on same device/dtype to keep downstream ops consistent
+            task_total_loss = torch.zeros((), device=t_pred.device, dtype=t_pred.dtype)
             for loss_fn, loss_weight in task_loss_fns:
                 # Get skeleton data if available
                 skeleton_data = targets_dict.get(f'{t_name}_skel', None)
-                loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt, outputs,
+                # If DS is enabled and loss isn't wrapped (edge case), fall back to highest-res
+                pred_for_loss, gt_for_loss = t_pred, t_gt
+                if isinstance(t_pred, (list, tuple)) and not isinstance(loss_fn, DeepSupervisionWrapper):
+                    pred_for_loss = t_pred[0]
+                    if isinstance(t_gt, (list, tuple)):
+                        gt_for_loss = t_gt[0]
+
+                loss_value = compute_auxiliary_loss(loss_fn, pred_for_loss, gt_for_loss, outputs,
                                                     self.mgr.targets[t_name], skeleton_data)
                 task_total_loss += loss_weight * loss_value
 
@@ -750,12 +1006,9 @@ class BaseTrainer:
                 data_dict = next(train_iter)
                 global_step += 1
                 
-                # Setup autocast context
+                # Setup autocast context (no explicit dtype overrides)
                 if use_amp and self.device.type == 'cuda':
-                    if torch.cuda.is_bf16_supported():
-                        autocast_ctx = torch.amp.autocast('cuda', dtype=torch.bfloat16)
-                    else:
-                        autocast_ctx = torch.amp.autocast('cuda')
+                    autocast_ctx = torch.amp.autocast('cuda')
                 elif use_amp and self.device.type in ['cpu', 'mlx']:
                     autocast_ctx = torch.amp.autocast(self.device.type)
                 else:
@@ -784,32 +1037,42 @@ class BaseTrainer:
                 
 
                 if i == 0 and train_sample_input is None:
-                    # Find first sample with non-zero target
+                    # Find first sample with non-zero target, but capture even if all zeros
                     first_target_key = list(targets_dict.keys())[0]
-                    first_target = targets_dict[first_target_key]
-                    
+                    first_target_any = targets_dict[first_target_key]
+                    # Handle deep supervision lists
+                    first_target_tensor = first_target_any[0] if isinstance(first_target_any, (list, tuple)) else first_target_any
+
                     b_idx = 0
                     found_non_zero = False
-                    for b in range(first_target.shape[0]):
-                        if torch.any(first_target[b] != 0):
+                    for b in range(first_target_tensor.shape[0]):
+                        if torch.any(first_target_tensor[b] != 0):
                             b_idx = b
                             found_non_zero = True
                             break
-                    
-                    if found_non_zero:
+
+                    # Always capture training sample for debug gif, even if all zeros
+                    if True:
                         train_sample_input = inputs[b_idx: b_idx + 1]
-                        # First collect all targets including skel
+                        # First collect all targets including skel (handle DS lists)
                         train_sample_targets_all = {}
-                        for t_name, t_tensor in targets_dict.items():
-                            train_sample_targets_all[t_name] = t_tensor[b_idx: b_idx + 1]
+                        for t_name, t_val in targets_dict.items():
+                            if isinstance(t_val, (list, tuple)):
+                                train_sample_targets_all[t_name] = t_val[0][b_idx: b_idx + 1]
+                            else:
+                                train_sample_targets_all[t_name] = t_val[b_idx: b_idx + 1]
                         # Now create train_sample_targets without skel and is_unlabeled for save_debug
                         train_sample_targets = {}
                         for t_name, t_tensor in train_sample_targets_all.items():
                             if t_name not in ['skel', 'is_unlabeled']:
                                 train_sample_targets[t_name] = t_tensor
+                        # Collect outputs (handle DS lists)
                         train_sample_outputs = {}
-                        for t_name, p_tensor in outputs.items():
-                            train_sample_outputs[t_name] = p_tensor[b_idx: b_idx + 1]
+                        for t_name, p_val in outputs.items():
+                            if isinstance(p_val, (list, tuple)):
+                                train_sample_outputs[t_name] = p_val[0][b_idx: b_idx + 1]
+                            else:
+                                train_sample_outputs[t_name] = p_val[b_idx: b_idx + 1]
 
                 if optimizer_stepped and is_per_iteration_scheduler:
                     scheduler.step()
@@ -883,21 +1146,28 @@ class BaseTrainer:
                         for t_name, loss_value in task_losses.items():
                             val_losses[t_name].append(loss_value)
                         
-                        # Compute evaluation metrics for each task
+                        # Compute evaluation metrics for each task (handle deep supervision lists)
                         for t_name in self.mgr.targets:
                             if t_name in outputs and t_name in targets_dict:
+                                pred_val = outputs[t_name]
+                                gt_val = targets_dict[t_name]
+                                if isinstance(pred_val, (list, tuple)):
+                                    pred_val = pred_val[0]
+                                if isinstance(gt_val, (list, tuple)):
+                                    gt_val = gt_val[0]
                                 for metric in evaluation_metrics[t_name]:
                                     if isinstance(metric, CriticalComponentsMetric) and i >= 10:
                                         continue
-                                    metric.update(pred=outputs[t_name], gt=targets_dict[t_name])
+                                    metric.update(pred=pred_val, gt=gt_val)
 
                         if i == 0:
-                                # Find first non-zero sample for debug visualization
+                                # Find first non-zero sample for debug visualization, but save even if all zeros
                                 b_idx = 0
                                 found_non_zero = False
 
                                 # Check if the first sample is non-zero
-                                first_target = next(iter(targets_dict.values()))
+                                first_target_any = next(iter(targets_dict.values()))
+                                first_target = first_target_any[0] if isinstance(first_target_any, (list, tuple)) else first_target_any
                                 if torch.any(first_target[0] != 0):
                                     found_non_zero = True
                                 else:
@@ -908,17 +1178,25 @@ class BaseTrainer:
                                             found_non_zero = True
                                             break
 
-                                if found_non_zero:
+                                # Always save debug gif, even if sample is all zeros
+                                # This ensures visualization works with limited labeled data
+                                if True:  # Was: if found_non_zero:
                                     # Slicing shape: [1, c, z, y, x ]
                                     inputs_first = inputs[b_idx: b_idx + 1]
 
                                     targets_dict_first_all = {}
-                                    for t_name, t_tensor in targets_dict.items():
-                                        targets_dict_first_all[t_name] = t_tensor[b_idx: b_idx + 1]
+                                    for t_name, t_val in targets_dict.items():
+                                        if isinstance(t_val, (list, tuple)):
+                                            targets_dict_first_all[t_name] = t_val[0][b_idx: b_idx + 1]
+                                        else:
+                                            targets_dict_first_all[t_name] = t_val[b_idx: b_idx + 1]
 
                                     outputs_dict_first = {}
-                                    for t_name, p_tensor in outputs.items():
-                                        outputs_dict_first[t_name] = p_tensor[b_idx: b_idx + 1]
+                                    for t_name, p_val in outputs.items():
+                                        if isinstance(p_val, (list, tuple)):
+                                            outputs_dict_first[t_name] = p_val[0][b_idx: b_idx + 1]
+                                        else:
+                                            outputs_dict_first[t_name] = p_val[b_idx: b_idx + 1]
 
                                     debug_img_path = f"{ckpt_dir}/{self.mgr.model_name}_debug_epoch{epoch}.gif"
                                     
@@ -1082,6 +1360,8 @@ def main():
                         help="Output directory for saving checkpoints and configurations (default: checkpoints)")
     parser.add_argument("--format", choices=["image", "zarr", "napari"],
                         help="Data format (image: tif, png, or jpg files, zarr: Zarr arrays, napari: Napari layers). If not specified, will attempt to auto-detect.")
+    parser.add_argument("--val-dir", type=str,
+                        help="Optional validation directory containing images/ and labels/ subdirectories. If provided, validation uses only this data and training uses the remaining train set.")
 
     # Optional arguments
     parser.add_argument("--batch-size", type=int,
@@ -1147,6 +1427,8 @@ def main():
                         help="Weights & Biases project name (default: from config; wandb logging disabled if not set anywhere)")
     parser.add_argument("--wandb-entity", type=str, default=None,
                         help="Weights & Biases team/username (default: from config)")
+    parser.add_argument("--intensity-properties-json", type=str, default=None,
+                        help="Path to nnU-Net-style intensity properties JSON (dataset_fingerprint.json or intensity_props.json). If provided, training uses CT normalization with these properties and skips sampling.")
 
     args = parser.parse_args()
 
@@ -1169,9 +1451,38 @@ def main():
     if not Path(args.input).exists():
         raise ValueError(f"Input directory does not exist: {args.input}")
 
+    # Validate optional separate validation directory early for clearer errors
+    if args.val_dir is not None and not Path(args.val_dir).exists():
+        raise ValueError(f"Validation directory does not exist: {args.val_dir}")
+
     Path(args.output).mkdir(parents=True, exist_ok=True)
 
     update_config_from_args(mgr, args)
+
+    # If a separate validation directory is provided, store it on the manager
+    if args.val_dir is not None:
+        from pathlib import Path as _Path
+        mgr.val_data_path = _Path(args.val_dir)
+
+    # If user supplies intensity properties JSON, load and inject into config for CT normalization
+    if args.intensity_properties_json is not None:
+        ip_path = Path(args.intensity_properties_json)
+        if not ip_path.exists():
+            raise ValueError(f"Intensity properties JSON not found: {ip_path}")
+        props = load_intensity_props_formatted(ip_path, channel=0)
+        if not props:
+            raise ValueError(f"Failed to parse intensity properties JSON: {ip_path}")
+        # Update manager config to use CT normalization with provided properties
+        if hasattr(mgr, 'update_config'):
+            mgr.update_config(normalization_scheme='ct', intensity_properties=props)
+        else:
+            # Fallback: set directly on dataset_config
+            mgr.dataset_config = getattr(mgr, 'dataset_config', {})
+            mgr.dataset_config['normalization_scheme'] = 'ct'
+            mgr.dataset_config['intensity_properties'] = props
+        # Ensure we skip intensity sampling in dataset init if flag is present
+        setattr(mgr, 'skip_intensity_sampling', True)
+        print("Using provided intensity properties for CT normalization. Sampling disabled.")
 
     # Select trainer based on --trainer argument
     trainer_name = args.trainer.lower()

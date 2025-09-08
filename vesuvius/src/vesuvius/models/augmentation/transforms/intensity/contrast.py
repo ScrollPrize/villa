@@ -48,6 +48,7 @@ class ContrastTransform(ImageOnlyTransform):
     def _apply_to_image(self, img: torch.Tensor, **params) -> torch.Tensor:
         if len(params['apply_to_channel']) == 0:
             return img
+        multipliers = params['multipliers'].to(img.device)
         # array notation is not faster, let's leave it like this
         for i in range(len(params['apply_to_channel'])):
             c = params['apply_to_channel'][i]
@@ -58,7 +59,7 @@ class ContrastTransform(ImageOnlyTransform):
 
             # this is faster than having it in one line because this circumvents reallocating memory
             img[c] -= mean
-            img[c] *= params['multipliers'][i]
+            img[c] *= multipliers[i]
             img[c] += mean
 
             if self.preserve_range:
