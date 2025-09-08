@@ -3,6 +3,36 @@ import cv2
 import numpy as np
 from pathlib import Path
 from PIL import Image, ImageDraw
+import multiprocessing as mp
+
+
+# Worker must be at module scope for multiprocessing pickling (spawn context)
+def _save_gif_worker(frames_list, path, _fps):
+    try:
+        if not frames_list:
+            # No frames to write; treat as success but nothing done
+            return
+        pil_frames = []
+        for frame in frames_list:
+            if frame.dtype != np.uint8:
+                frame = frame.astype(np.uint8)
+            if not frame.flags['C_CONTIGUOUS']:
+                frame = np.ascontiguousarray(frame)
+            pil_frames.append(Image.fromarray(frame))
+        pil_frames[0].save(
+            path,
+            save_all=True,
+            append_images=pil_frames[1:],
+            duration=max(1, 1000 // max(1, _fps)),
+            loop=0,
+        )
+        for pf in pil_frames:
+            pf.close()
+    except Exception:
+        # Ensure non-zero exit code on failure so parent can detect it
+        import sys, traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 def minmax_scale_to_8bit(arr_np):
@@ -253,7 +283,7 @@ def save_debug(
         # Build frames for 3D GIF
         frames = []
         z_dim = inp_np.shape[0] if inp_np.ndim == 3 else inp_np.shape[1]
-        
+
         for z_idx in range(z_dim):
             rows = []
             
@@ -323,48 +353,27 @@ def save_debug(
             frame = np.ascontiguousarray(frame, dtype=np.uint8)
             frames.append(frame)
         
-        # Save GIF using PIL only
+        # Save GIF in a subprocess to avoid crashing main training process on encoder segfaults
         out_dir = Path(save_path).parent
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"[Epoch {epoch}] Saving GIF to: {save_path}")
-        
-        try:
-            # Validate frames
-            if not frames:
-                print(f"Warning: No frames to save")
-                return None
-            
-            # Convert numpy arrays to PIL Images
-            pil_frames = []
-            for frame in frames:
-                # Ensure proper format
-                if frame.dtype != np.uint8:
-                    frame = frame.astype(np.uint8)
-                if not frame.flags['C_CONTIGUOUS']:
-                    frame = np.ascontiguousarray(frame)
-                pil_frames.append(Image.fromarray(frame))
-            
-            # Save as GIF using PIL
-            pil_frames[0].save(
-                save_path,
-                save_all=True,
-                append_images=pil_frames[1:],
-                duration=1000//fps,  # PIL uses milliseconds per frame
-                loop=0
-            )
+
+        # Use spawn context for better isolation
+        ctx = mp.get_context("spawn")
+        proc = ctx.Process(target=_save_gif_worker, args=(frames, str(save_path), fps))
+        proc.start()
+        proc.join(30)  # timeout safeguard (seconds)
+
+        if proc.is_alive():
+            proc.terminate()
+            print("Warning: GIF save timed out; skipping debug visualization")
+            return None
+
+        if proc.exitcode == 0:
             print(f"Successfully saved GIF to: {save_path}")
-            
-            # Clean up PIL frames to free memory
-            for pil_frame in pil_frames:
-                pil_frame.close()
-            
             return frames
-            
-        except Exception as e:
-            print(f"Error saving GIF: {e}")
-            import traceback
-            print(f"Traceback: {traceback.format_exc()}")
-            print(f"Skipping debug visualization due to error")
+        else:
+            print(f"Warning: GIF save failed in subprocess (exit code {proc.exitcode}); skipping")
             return None
 
 
