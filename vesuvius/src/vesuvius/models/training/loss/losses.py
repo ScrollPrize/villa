@@ -167,7 +167,7 @@ class CosineSimilarityLoss(nn.Module):
         self.eps = eps
         self.ignore_index = ignore_index
         
-    def forward(self, input, target, mask=None):
+    def forward(self, input, target, mask=None, **kwargs):
         # Ensure input and target have same shape
         assert input.size() == target.size(), f"Input and target must have same shape, got {input.size()} vs {target.size()}"
         
@@ -214,6 +214,53 @@ class CosineSimilarityLoss(nn.Module):
             # No mask, compute regular mean
             return loss.mean()
 
+
+class SignInvariantCosineLoss(nn.Module):
+    """
+    Sign-invariant cosine loss for vector fields with optional masking.
+
+    Computes 1 - |cos(theta)| per voxel along the channel dimension, then
+    averages only over masked (non-ignored) elements when a mask or ignore_index
+    is provided.
+    """
+    def __init__(self, dim=1, eps=1e-8, ignore_index=None):
+        super(SignInvariantCosineLoss, self).__init__()
+        self.dim = dim
+        self.eps = eps
+        self.ignore_index = ignore_index
+
+    def forward(self, input, target, mask=None, **kwargs):
+        # Ensure input and target have same shape
+        assert input.size() == target.size(), f"Input and target must have same shape, got {input.size()} vs {target.size()}"
+
+        # Derive mask from ignore_index if not explicitly given
+        if mask is None and self.ignore_index is not None:
+            mask = (target != self.ignore_index).float()
+            if mask.dim() > input.dim() - 1:
+                mask = mask.max(dim=1, keepdim=True)[0]
+
+        # Normalize both vectors along channel dim
+        input_norm = F.normalize(input, p=2, dim=self.dim, eps=self.eps)
+        target_norm = F.normalize(target, p=2, dim=self.dim, eps=self.eps)
+
+        # Cosine similarity and sign invariance via absolute value
+        cosine_sim = (input_norm * target_norm).sum(dim=self.dim, keepdim=True)
+        loss = 1 - cosine_sim.abs()
+
+        # Apply mask if provided
+        if mask is not None:
+            if mask.dim() == input.dim() - 1:
+                mask = mask.unsqueeze(1)
+            if mask.size(1) == 1 and loss.size(1) > 1:
+                mask = mask.expand_as(loss)
+            masked_loss = loss * mask
+            num_masked = mask.sum()
+            if num_masked > 0:
+                return masked_loss.sum() / num_masked
+            else:
+                return torch.tensor(0.0, device=input.device, requires_grad=True)
+        else:
+            return loss.mean()
 
 class EigenvalueLoss(nn.Module):
     """
@@ -970,9 +1017,14 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight, mgr=None):
             eps         = loss_config.get('eps', 1e-8)
         )
     elif name == 'CosineSimilarityLoss':
-        dim = loss_config.get('dim', 1)
-        eps = loss_config.get('eps', 1e-8)
+        dim = int(loss_config.get('dim', 1))
+        eps = float(loss_config.get('eps', 1e-8))
         base_loss = CosineSimilarityLoss(dim=dim, eps=eps, ignore_index=ignore_index)
+
+    elif name == 'SignInvariantCosineLoss':
+        dim = int(loss_config.get('dim', 1))
+        eps = float(loss_config.get('eps', 1e-8))
+        base_loss = SignInvariantCosineLoss(dim=dim, eps=eps, ignore_index=ignore_index)
 
     elif name == 'SignedDistanceLoss':
         # rho, beta, eikonal, eikonal_weight, reduction are read from the YAML / json
