@@ -1,0 +1,52 @@
+name: "CodeQL"
+
+on:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Friday 11:43 UTC
+    - cron: '43 11 * * 5'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+       # required for all workflows
+      security-events: write
+      # required to fetch internal or private CodeQL packs
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install requirements
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential git cmake 
+          sudo apt-get -y install qt6-base-dev libboost-system-dev libboost-program-options-dev 
+          sudo apt-get -y install libceres-dev xtensor-dev libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev 
+          sudo apt-get -y install libgsl-dev libsdl2-dev libcurl4-openssl-dev
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          build-mode: manual
+
+      - name: Build
+        shell: bash
+        run: |
+          cmake -S . -B build/ -DVC_WITH_CUDA_SPARSE=off
+          make -C build/ -j$(nproc --all) --no-print-directory
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:c-cpp"

@@ -1,0 +1,64 @@
+{
+  "title": "Volume Cartographer",
+  "description": "A cross-platform C++ library and toolkit for the recovery and restoration of damaged cultural artifacts.",
+  "upload_type": "software",
+  "license": "other-open",
+  "creators": [
+    {
+      "orcid": "0000-0002-3887-1237",
+      "affiliation": "University of Kentucky",
+      "name": "Parker, C. Seth"
+    },
+    {
+      "orcid": "0000-0002-9628-0232",
+      "affiliation": "University of Kentucky",
+      "name": "Gessel, Kristina"
+    },
+    {
+      "orcid": "0000-0002-0428-9732",
+      "affiliation": "University of Kentucky",
+      "name": "Parsons, Stephen"
+    },
+    {
+      "affiliation": "University of Kentucky",
+      "name": "Chappell, Jacob"
+    },
+    {"name": "Athie Teruel, Bruno"},
+    {"name": "Bentley, Nikki"},
+    {"name": "Bertelsman, Ali"},
+    {"name": "Broadbent, John"},
+    {"name": "Chapman, Sydney"},
+    {"name": "Coleman, Abigail"},
+    {"name": "Du, Chao"},
+    {"name": "Gardella, Callie"},
+    {"name": "Graczyk, Nick"},
+    {"name": "Hatch, Hannah"},
+    {"name": "Hogg, Lula"},
+    {"name": "Karlage, Sean"},
+    {"name": "Nguyen, Tam"},
+    {"name": "Pack, James"},
+    {"name": "Pennington, David"},
+    {"name": "Revers, Allison"},
+    {"name": "Roup, Mike"},
+    {"name": "Royal, Michael"},
+    {"name": "Seevers, Kyra"},
+    {"name": "Shankle, Melissa"},
+    {"name": "Syamil, Raiffa"},
+    {"name": "Taber, Ryan"},
+    {"name": "Posma, JP"},
+    {"name": "Schilliger, Julian"}
+  ],
+  "keywords" : [
+    "c-plus-plus",
+    "virtual unwrapping",
+    "volumetric processing",
+    "cultural heritage"
+  ],
+  "related_identifiers": [
+    {
+      "scheme": "url",
+      "identifier": "https://github.com/educelab/volume-cartographer",
+      "relation": "isSupplementTo"
+    }
+  ]
+}
