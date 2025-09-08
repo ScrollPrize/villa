@@ -24,7 +24,7 @@ auxiliary_tasks:
     compute_from: sdt
     grad_sigma: 1.0
     tensor_sigma: 1.5
-    loss_weight: 0.5
+    loss_weight: 0.25
     losses:
       - name: "SignInvariantCosineLoss"
         weight: 1.0

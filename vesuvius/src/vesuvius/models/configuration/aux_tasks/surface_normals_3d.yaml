@@ -2,7 +2,6 @@ tr_setup:
   model_name: "surface_normals_3d"
 
 tr_config:
-  batch_size: 2
   enable_deep_supervision: true
 
 dataset_config:
@@ -23,7 +22,7 @@ auxiliary_tasks:
   surface_normals:
     type: surface_normals
     source_target: surface
-    loss_weight: 1.0
+    loss_weight: 0.25
     # out_channels auto-detected as op_dims (3D -> 3)
     losses:
       - name: "CosineSimilarityLoss"
