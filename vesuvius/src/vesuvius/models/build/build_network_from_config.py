@@ -633,7 +633,7 @@ class NetworkFromConfig(nn.Module):
             # Some decoders may return a list (deep supervision). Use highest-resolution output.
             if isinstance(logits, (list, tuple)) and len(logits) > 0:
                 logits = logits[0]
-            activation_fn = self.task_activations.get(task_name, None)
+            activation_fn = self.task_activations[task_name] if task_name in self.task_activations else None
             if activation_fn is not None and not self.training:
                 logits = activation_fn(logits)
             results[task_name] = logits
@@ -644,7 +644,7 @@ class NetworkFromConfig(nn.Module):
                 shared_features = self.shared_decoder(features)
             for task_name, head in self.task_heads.items():
                 logits = head(shared_features)
-                activation_fn = self.task_activations.get(task_name, None)
+                activation_fn = self.task_activations[task_name] if task_name in self.task_activations else None
                 if activation_fn is not None and not self.training:
                     logits = activation_fn(logits)
                 results[task_name] = logits
