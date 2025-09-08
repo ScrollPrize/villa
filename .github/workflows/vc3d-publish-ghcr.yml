@@ -65,6 +65,7 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
+          context: "{{defaultContext}}:volume-cartographer"
           file: ubuntu-24.04-noble.Dockerfile
           platforms: linux/amd64
           labels: ${{ steps.meta.outputs.labels }}
@@ -126,6 +127,7 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
+          context: "{{defaultContext}}:volume-cartographer"
           file: ubuntu-24.04-noble.Dockerfile
           platforms: linux/arm64
           labels: ${{ steps.meta.outputs.labels }}
