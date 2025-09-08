@@ -79,24 +79,34 @@ def ensure_clean_dir(path: str) -> None:
 def list_layers_objects(
     s3_client, bucket: str, prefix: str, start_layer: int, end_layer: int
 ) -> List[Tuple[str, str]]:
-    # Return list of (key, basename) for .tif/.tiff files inside any "layers/" folder under prefix
+    # Return list of (key, basename) for .tif/.tiff/.png/.jpeg/.jpg files inside any "layers/" folder under prefix
     paginator = s3_client.get_paginator("list_objects_v2")
     keys: List[Tuple[str, str]] = []
+    SUPPORTED_IMAGE_FORMATS = {'.tif', '.tiff', '.png', '.jpeg', '.jpg'}
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
-            lower = key.lower()
-            if "/layers/" in lower and (lower.endswith(".tif") or lower.endswith(".tiff")):
-                base = os.path.basename(key)
-                name, _ = os.path.splitext(base)
-                try:
-                    # tolerate leading zeros, e.g., 01, 02, ...
-                    layer_idx = int(name)
-                except ValueError:
-                    continue
-                # FIXED: Make this consistent with local script (exclusive end)
-                if start_layer <= layer_idx < end_layer:  # Changed <= to <
-                    keys.append((key, base))
+            
+            # Check if it's a layer file with supported format
+            if "/layers/" not in key.lower():
+                continue
+                
+            base = os.path.basename(key)
+            name, ext = os.path.splitext(base)
+            
+            # Check if the file extension is supported
+            if ext.lower() not in SUPPORTED_IMAGE_FORMATS:
+                continue
+                
+            try:
+                # Tolerate leading zeros, e.g., 01, 02, ...
+                layer_idx = int(name)
+            except ValueError:
+                continue
+                
+            # Check if layer index is within range (exclusive end)
+            if start_layer <= layer_idx < end_layer:
+                keys.append((key, base))
     if not keys:
         raise RuntimeError(
             f"No layers found within range [{start_layer}, {end_layer}) under s3://{bucket}/{prefix}"
