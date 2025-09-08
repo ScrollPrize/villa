@@ -6,7 +6,7 @@ If you want to run the entire pipeline in one go on a single machine (even with 
 
 The inference pipeline consists of three main stages:
 
-1. __Prediction (`vesuvius.predict`)__: Runs model inference on input data, creating logits (model outputs before softmax/argmax).
+1. __Prediction (`vesuvius.predict`)__: Runs model inference on input data, creating logits (model outputs before softmax/argmax). Supports Zarr/Volume sources and 2D/3D TIFF inputs.
 2. __Blending (`vesuvius.blend_logits`)__: Combines overlapping predictions using Gaussian weighting.
 3. __Finalization (`vesuvius.finalize_outputs`)__: Processes logits into final segmentation outputs (probabilities or class predictions).
 
@@ -24,7 +24,7 @@ This component runs the model on input data, creating raw logits.
 
 - Takes input volumetric data and applies a trained nnUNetv2 model to produce prediction logits
 - Supports data partitioning for distributed processing
-- Handles Test-Time Augmentation (TTA) y
+- Handles Test-Time Augmentation (TTA)
 
 ### Distributed Capability: ✅ Fully Distributed
 
@@ -35,9 +35,9 @@ This component runs the model on input data, creating raw logits.
 | Parameter | Type | Description | Default | Recommendation |
 |-----------|------|-------------|---------|---------------|
 | `--model_path` | str | Path to the trained nnUNet model folder or HF model (can start with "hf://") | Required | |
-| `--input_dir` | str | Path to the input volume (Zarr store) | Required | |
+| `--input_dir` | str | Path to input data: Zarr store, volume selector, single `.tif/.tiff` file, or directory of TIFFs | Required | |
 | `--output_dir` | str | Directory to store output predictions | Required | |
-| `--input_format` | str | Format of input data (`zarr`, `volume`) | `zarr` | Empty, Defaults |
+| `--input_format` | str | Format hint (`zarr`, `volume`, `tiff`). Detection is automatic for `.tif/.tiff`. | `zarr` | Empty, Defaults |
 | `--tta_type` | str | Test-time augmentation type (`mirroring`, `rotation`) | `rotation` | Empty, Defaults |
 | `--disable_tta` | flag | Disable test-time augmentation | `False` | Empty, Defaults |
 | `--num_parts` | int | Number of parts to split processing into | `1` | |
@@ -101,6 +101,41 @@ To run distributed inference across multiple machines:
     compression of the final array is still a good idea, as its mostly blank. 
 - Set an appropriate `--overlap` value (0.5 is a good default)
 
+### TIFF Inputs (2D/3D)
+
+`vesuvius.predict` now supports `.tif/.tiff` inputs. You can pass either a single file or a folder of TIFFs in `--input_dir`. The format is auto-detected; optionally set `--input_format tiff`.
+
+- Detection: If `input_dir` is a `.tif/.tiff` file or a directory containing TIFFs, TIFF mode is used automatically.
+- Normalization: The same normalization as stored in the model checkpoint is applied (maps legacy `zscore` to global or instance z-score depending on availability of global stats).
+- TTA: Works the same as with Zarr inputs.
+
+Two execution paths are used depending on image size:
+
+- In-memory blending (no temporary zarr):
+  - 3D TIFFs up to `1024 x 1024 x 1024`
+  - 2D TIFFs up to `10000 x 10000`
+  - Produces per-image logits directly as TIFF: `<stem>_logits.tif` saved in `output_dir`.
+  - Output shape is channels-first (C,Z,Y,X) for 3D, or (C,Y,X) for 2D.
+  - Blending and finalization stages are not required for these outputs unless you want different post-processing.
+
+- Large TIFFs (fallback to tiled path):
+  - For larger images, the predictor writes per-patch logits and coordinates to zarr in `output_dir` (same as the Zarr pipeline).
+  - Run `vesuvius.blend_logits` and then `vesuvius.finalize_outputs` as usual.
+
+Examples:
+
+```bash
+# Single 2D or 3D TIFF (auto-detect)
+vesuvius.predict --model_path /path/to/model \
+  --input_dir /path/to/image.tif \
+  --output_dir /path/to/out
+
+# Directory of TIFFs
+vesuvius.predict --model_path /path/to/model \
+  --input_dir /path/to/tif_folder \
+  --output_dir /path/to/out
+```
+
 ## 2. `vesuvius.blend_logits` - Merging Predictions
 
 This component combines prediction outputs from multiple parts into a single coherent volume.
@@ -138,7 +173,7 @@ After all predict jobs have completed:
 
 ```bash
 vesuvius.blend_logits /path/to/prediction_parts /path/to/output/merged_logits.zarr \
-            --num_workers 16 
+  --num_workers 16
 ```
 
 ### Memory Considerations
@@ -196,6 +231,8 @@ vesuvius.finalize_outputs /path/to/merged_logits.zarr /path/to/final_output.zarr
 
   - __Binary mode__: 1 channel [binary_mask]
   - __Multiclass mode__: 1 channel [argmax]
+
+Note on TIFF logits: Finalization currently operates on Zarr logits. For TIFF logits written by the in-memory path, you can either consume them directly downstream (they are probabilities/logits per class), or convert them to a zarr store if you want to reuse the existing finalization utility.
 
 ## Full Distributed Workflow Example
 
