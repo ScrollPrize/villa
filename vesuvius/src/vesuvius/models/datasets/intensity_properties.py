@@ -243,6 +243,165 @@ def compute_intensity_properties_parallel(target_volumes, sample_ratio=0.01, max
     return intensity_properties
 
 
+def _sample_foreground_from_numpy(img_data: np.ndarray, lbl_data: np.ndarray, num_samples: int) -> list:
+    """
+    Sample foreground intensities (label > 0) from numpy arrays.
+
+    If there are fewer than num_samples foreground voxels, samples with replacement.
+    """
+    if img_data.shape != lbl_data.shape:
+        raise ValueError(f"Image and label shape mismatch: {img_data.shape} vs {lbl_data.shape}")
+
+    fg_idx = np.argwhere(lbl_data > 0)
+    if fg_idx.size == 0:
+        return []
+    rs = np.random.RandomState(1234)
+    if len(fg_idx) >= num_samples:
+        sel = rs.choice(len(fg_idx), size=num_samples, replace=False)
+    else:
+        sel = rs.choice(len(fg_idx), size=num_samples, replace=True)
+    coords = fg_idx[sel]
+    # Support 2D and 3D
+    if img_data.ndim == 2:
+        vals = [float(img_data[y, x]) for (y, x) in coords]
+    elif img_data.ndim == 3:
+        vals = [float(img_data[z, y, x]) for (z, y, x) in coords]
+    else:
+        raise ValueError(f"Unsupported image dimensionality: {img_data.ndim}")
+    return vals
+
+
+def _sample_foreground_from_zarr(img_zarr, lbl_zarr, num_samples: int, vol_idx: int) -> list:
+    """
+    Sample foreground intensities (label > 0) from zarr arrays without loading entire arrays.
+
+    Strategy: random coordinate proposals with acceptance if lbl>0, up to a capped number of trials.
+    Falls back to loading the full label if acceptance is too low.
+    """
+    shape = lbl_zarr.shape
+    ndim = len(shape)
+    if ndim not in (2, 3):
+        raise ValueError(f"Unsupported label dimensionality: {ndim}")
+
+    rs = np.random.RandomState(1234)
+    sampled = []
+    max_trials = max(num_samples * 20, 20000)
+    trials = 0
+    use_progress = num_samples > 10000
+    pbar = tqdm(total=num_samples, desc=f"Sampling fg zarr vol {vol_idx}", leave=False) if use_progress else None
+
+    while len(sampled) < num_samples and trials < max_trials:
+        trials += 1
+        if ndim == 2:
+            y = int(rs.randint(0, shape[0]))
+            x = int(rs.randint(0, shape[1]))
+            try:
+                if float(lbl_zarr[y, x]) > 0:
+                    sampled.append(float(img_zarr[y, x]))
+                    if pbar: pbar.update(1)
+            except Exception:
+                continue
+        else:
+            z = int(rs.randint(0, shape[0]))
+            y = int(rs.randint(0, shape[1]))
+            x = int(rs.randint(0, shape[2]))
+            try:
+                if float(lbl_zarr[z, y, x]) > 0:
+                    sampled.append(float(img_zarr[z, y, x]))
+                    if pbar: pbar.update(1)
+            except Exception:
+                continue
+
+    if pbar:
+        pbar.close()
+
+    # If acceptance was too low, fall back to loading label fully (best effort)
+    if len(sampled) < max(100, int(0.1 * num_samples)):
+        try:
+            lbl = lbl_zarr[:]
+            img = img_zarr[:]
+            sampled = _sample_foreground_from_numpy(img, lbl, num_samples)
+        except Exception:
+            # Return whatever we have
+            pass
+    return sampled
+
+
+def compute_foreground_intensity_properties_parallel(target_volumes: Dict[str, List[Dict[str, Any]]],
+                                                     sample_ratio: float = 0.01,
+                                                     max_samples: int = 1000000) -> Dict[str, float]:
+    """
+    Compute intensity properties using only foreground voxels (label > 0), mimicking nnU-Net.
+
+    - Aggregates foreground samples across all volumes
+    - Computes mean, std, min, max, median, 0.5th and 99.5th percentiles
+    """
+    first_target = list(target_volumes.keys())[0]
+    volumes_list = target_volumes[first_target]
+
+    # Determine total image voxels for proportional sampling
+    total_voxels = 0
+    volume_entries = []
+    for vol_idx, vinfo in enumerate(volumes_list):
+        img = vinfo['data']['data']
+        lbl = vinfo['data'].get('label')
+        if lbl is None:
+            continue  # skip unlabeled volumes
+        vol_size = int(np.prod(img.shape))
+        total_voxels += vol_size
+        volume_entries.append((vol_idx, img, lbl, vol_size))
+
+    if total_voxels == 0 or not volume_entries:
+        raise ValueError("No labeled volumes available to compute foreground intensity properties")
+
+    target_samples_from_ratio = int(total_voxels * sample_ratio)
+    target_samples = min(target_samples_from_ratio, max_samples)
+    if target_samples == 0:
+        target_samples = min(10000, max_samples)
+
+    # Proportionally assign samples per volume based on volume size
+    per_volume_tasks = []
+    for vol_idx, img, lbl, vol_size in volume_entries:
+        vol_samples = int(target_samples * (vol_size / total_voxels))
+        vol_samples = max(vol_samples, 1)
+        per_volume_tasks.append((vol_idx, img, lbl, vol_samples))
+
+    print(f"Sampling foreground intensities from {len(per_volume_tasks)} volumes ...")
+    all_values = []
+    # Parallel over volumes
+    with Pool(min(len(per_volume_tasks), os.cpu_count() or 2)) as pool:
+        def _worker(args):
+            v_idx, img, lbl, ns = args
+            try:
+                if hasattr(img, 'chunks') or hasattr(lbl, 'chunks'):
+                    return v_idx, _sample_foreground_from_zarr(img, lbl, ns, v_idx)
+                else:
+                    return v_idx, _sample_foreground_from_numpy(np.asarray(img), np.asarray(lbl), ns)
+            except Exception as e:
+                print(f"Warning: failed sampling foreground from volume {v_idx}: {e}")
+                return v_idx, []
+
+        for v_idx, vals in tqdm(pool.imap_unordered(_worker, per_volume_tasks), total=len(per_volume_tasks), desc="Sampling fg"):
+            all_values.extend(vals)
+
+    if len(all_values) == 0:
+        raise ValueError("Failed to collect any foreground intensity samples. Check your labels (must be >0 for foreground).")
+
+    all_values = np.asarray(all_values, dtype=np.float32)
+    percentiles = np.percentile(all_values, [0.5, 99.5])
+    intensity_properties = {
+        'mean': float(np.mean(all_values)),
+        'std': float(np.std(all_values)),
+        'percentile_00_5': float(percentiles[0]),
+        'percentile_99_5': float(percentiles[1]),
+        'min': float(np.min(all_values)),
+        'max': float(np.max(all_values)),
+        'median': float(np.median(all_values)),
+    }
+    print("Computed foreground intensity properties (nnU-Net style):")
+    for k, v in intensity_properties.items():
+        print(f"  {k}: {v:.6f}")
+    return intensity_properties
 def get_intensity_properties_filename(cache_dir: Path) -> Path:
     """
     Get filename for intensity properties JSON file.
@@ -366,7 +525,20 @@ def load_intensity_props_formatted(file_path: Path, channel: int = 0) -> Optiona
         with open(file_path, 'r') as f:
             data = json.load(f)
         
-        # Check for simple format first (direct properties at root level)
+        # Check for our cached wrapper format first
+        if 'intensity_properties' in data and isinstance(data['intensity_properties'], dict):
+            props = data['intensity_properties']
+            return {
+                'mean': props.get('mean', 0.0),
+                'std': props.get('std', 0.0),
+                'min': props.get('min', 0.0),
+                'max': props.get('max', 0.0),
+                'median': props.get('median', 0.0),
+                'percentile_00_5': props.get('percentile_00_5', 0.0),
+                'percentile_99_5': props.get('percentile_99_5', 0.0)
+            }
+
+        # Check for simple format next (direct properties at root level)
         if 'mean' in data and 'std' in data:
             # Simple format - return directly
             return {
@@ -532,10 +704,11 @@ def initialize_intensity_properties(target_volumes,
     
     # Compute if not loaded from cache
     if not loaded_from_cache:
-        print(f"\nComputing intensity properties for {normalization_scheme} normalization...")
-        intensity_properties = compute_intensity_properties_parallel(
-            target_volumes, 
-            sample_ratio=sample_ratio, 
+        print(f"\nComputing intensity properties for {normalization_scheme} normalization (foreground only)...")
+        # Match nnU-Net: compute on foreground voxels as defined by labels (>0)
+        intensity_properties = compute_foreground_intensity_properties_parallel(
+            target_volumes,
+            sample_ratio=sample_ratio,
             max_samples=max_samples
         )
         
