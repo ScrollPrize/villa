@@ -45,7 +45,8 @@ from vesuvius.models.evaluation.connected_components import ConnectedComponentsM
 from vesuvius.models.evaluation.critical_components import CriticalComponentsMetric
 from vesuvius.models.evaluation.iou_dice import IOUDiceMetric
 from vesuvius.models.evaluation.hausdorff import HausdorffDistanceMetric
-
+from vesuvius.models.datasets.intensity_properties import load_intensity_props_formatted
+from vesuvius.models.evaluation.skeleton_branch_points import SkeletonBranchPointsMetric
 
 from itertools import cycle
 from contextlib import nullcontext
@@ -254,6 +255,7 @@ class BaseTrainer:
             #     task_metrics.append(CriticalComponentsMetric())
 
             task_metrics.append(IOUDiceMetric(num_classes=num_classes))
+            task_metrics.append(SkeletonBranchPointsMetric(num_classes=num_classes))
             # task_metrics.append(HausdorffDistanceMetric(num_classes=num_classes))
             metrics[task_name] = task_metrics
         
@@ -294,37 +296,60 @@ class BaseTrainer:
     # --- dataloaders --- #
     def _configure_dataloaders(self, train_dataset, val_dataset=None):
 
-        if val_dataset is None:
-            val_dataset = train_dataset
-            
-        dataset_size = len(train_dataset)
-        indices = list(range(dataset_size))
+        # If no separate validation dataset provided, fall back to random split of train
+        if val_dataset is None or val_dataset is train_dataset:
+            dataset_size = len(train_dataset)
+            indices = list(range(dataset_size))
 
-        if hasattr(self.mgr, 'seed'):
-            np.random.seed(self.mgr.seed)
+            if hasattr(self.mgr, 'seed'):
+                np.random.seed(self.mgr.seed)
+                if self.mgr.verbose:
+                    print(f"Using seed {self.mgr.seed} for train/val split")
+
+            np.random.shuffle(indices)
+
+            train_val_split = self.mgr.tr_val_split
+            split = int(np.floor(train_val_split * dataset_size))
+            train_indices, val_indices = indices[:split], indices[split:]
+        else:
+            # Separate validation dataset provided. Use full validation set, and
+            # exclude any training patches whose volume_name appears in validation.
+            val_indices = list(range(len(val_dataset)))
+
+            # Build set of validation volume names to filter training patches
+            val_volume_names = set()
+            for vp in getattr(val_dataset, 'valid_patches', []):
+                name = vp.get('volume_name')
+                if name is not None:
+                    val_volume_names.add(name)
+
+            train_indices = []
+            for i, vp in enumerate(getattr(train_dataset, 'valid_patches', [])):
+                name = vp.get('volume_name')
+                if name is None or name not in val_volume_names:
+                    train_indices.append(i)
+
             if self.mgr.verbose:
-                print(f"Using seed {self.mgr.seed} for train/val split")
+                print(f"Using external validation set: {len(val_indices)} val patches")
+                print(f"Excluding {len(train_dataset) - len(train_indices)} train patches overlapping validation volumes")
 
-        np.random.shuffle(indices)
-
-        train_val_split = self.mgr.tr_val_split
-        split = int(np.floor(train_val_split * dataset_size))
-        train_indices, val_indices = indices[:split], indices[split:]
         batch_size = self.mgr.train_batch_size
 
-        train_dataloader = DataLoader(train_dataset,
-                                      batch_size=batch_size,
-                                      sampler=SubsetRandomSampler(train_indices),
-                                      pin_memory=(True if self.device == 'cuda' else False),
-                                      num_workers=self.mgr.train_num_dataloader_workers
-                                      )
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            sampler=SubsetRandomSampler(train_indices),
+            pin_memory=(True if self.device == 'cuda' else False),
+            num_workers=self.mgr.train_num_dataloader_workers,
+        )
 
-        val_dataloader = DataLoader(val_dataset,
-                                    batch_size=1,
-                                    sampler=SubsetRandomSampler(val_indices),
-                                    pin_memory=(True if self.device == 'cuda' else False),
-                                    num_workers=self.mgr.train_num_dataloader_workers
-                                    )
+        val_dataloader = DataLoader(
+            val_dataset if val_dataset is not None else train_dataset,
+            batch_size=1,
+            sampler=SubsetRandomSampler(val_indices),
+            pin_memory=(True if self.device == 'cuda' else False),
+            num_workers=self.mgr.train_num_dataloader_workers,
+        )
 
         return train_dataloader, val_dataloader, train_indices, val_indices
 
@@ -338,7 +363,31 @@ class BaseTrainer:
         # we put augmentations in the dataset class so we can use the __getitem__ method
         # for free multi processing of augmentations 
         train_dataset = self._configure_dataset(is_training=True)
-        val_dataset = self._configure_dataset(is_training=False)
+
+        # Build validation dataset; support separate directory via mgr.val_data_path
+        if hasattr(self.mgr, 'val_data_path') and self.mgr.val_data_path is not None:
+            from copy import deepcopy
+            from vesuvius.models.utilities.data_format_utils import detect_data_format as _detect_df
+
+            val_mgr = deepcopy(self.mgr)
+            val_mgr.data_path = Path(self.mgr.val_data_path)
+
+            detected_val_fmt = _detect_df(val_mgr.data_path)
+            if detected_val_fmt is None:
+                raise ValueError(f"Could not determine data format for validation directory: {val_mgr.data_path}")
+            val_mgr.data_format = detected_val_fmt
+
+            if val_mgr.data_format == 'napari':
+                val_dataset = NapariDataset(mgr=val_mgr, is_training=False)
+            elif val_mgr.data_format == 'image':
+                val_dataset = ImageDataset(mgr=val_mgr, is_training=False)
+            elif val_mgr.data_format == 'zarr':
+                val_dataset = ZarrDataset(mgr=val_mgr, is_training=False)
+            else:
+                raise ValueError(f"Unsupported validation data format: {val_mgr.data_format}")
+            print(f"Using {val_mgr.data_format} dataset format (validation from --val-dir)")
+        else:
+            val_dataset = self._configure_dataset(is_training=False)
         
 
         self.mgr.auto_detect_channels(train_dataset)
@@ -784,7 +833,7 @@ class BaseTrainer:
                 
 
                 if i == 0 and train_sample_input is None:
-                    # Find first sample with non-zero target
+                    # Find first sample with non-zero target, but capture even if all zeros
                     first_target_key = list(targets_dict.keys())[0]
                     first_target = targets_dict[first_target_key]
                     
@@ -796,7 +845,9 @@ class BaseTrainer:
                             found_non_zero = True
                             break
                     
-                    if found_non_zero:
+                    # Always capture training sample for debug gif, even if all zeros
+                    # This ensures visualization works with limited labeled data
+                    if True:  # Was: if found_non_zero:
                         train_sample_input = inputs[b_idx: b_idx + 1]
                         # First collect all targets including skel
                         train_sample_targets_all = {}
@@ -892,7 +943,7 @@ class BaseTrainer:
                                     metric.update(pred=outputs[t_name], gt=targets_dict[t_name])
 
                         if i == 0:
-                                # Find first non-zero sample for debug visualization
+                                # Find first non-zero sample for debug visualization, but save even if all zeros
                                 b_idx = 0
                                 found_non_zero = False
 
@@ -908,7 +959,9 @@ class BaseTrainer:
                                             found_non_zero = True
                                             break
 
-                                if found_non_zero:
+                                # Always save debug gif, even if sample is all zeros
+                                # This ensures visualization works with limited labeled data
+                                if True:  # Was: if found_non_zero:
                                     # Slicing shape: [1, c, z, y, x ]
                                     inputs_first = inputs[b_idx: b_idx + 1]
 
@@ -1082,6 +1135,8 @@ def main():
                         help="Output directory for saving checkpoints and configurations (default: checkpoints)")
     parser.add_argument("--format", choices=["image", "zarr", "napari"],
                         help="Data format (image: tif, png, or jpg files, zarr: Zarr arrays, napari: Napari layers). If not specified, will attempt to auto-detect.")
+    parser.add_argument("--val-dir", type=str,
+                        help="Optional validation directory containing images/ and labels/ subdirectories. If provided, validation uses only this data and training uses the remaining train set.")
 
     # Optional arguments
     parser.add_argument("--batch-size", type=int,
@@ -1147,6 +1202,8 @@ def main():
                         help="Weights & Biases project name (default: from config; wandb logging disabled if not set anywhere)")
     parser.add_argument("--wandb-entity", type=str, default=None,
                         help="Weights & Biases team/username (default: from config)")
+    parser.add_argument("--intensity-properties-json", type=str, default=None,
+                        help="Path to nnU-Net-style intensity properties JSON (dataset_fingerprint.json or intensity_props.json). If provided, training uses CT normalization with these properties and skips sampling.")
 
     args = parser.parse_args()
 
@@ -1169,9 +1226,38 @@ def main():
     if not Path(args.input).exists():
         raise ValueError(f"Input directory does not exist: {args.input}")
 
+    # Validate optional separate validation directory early for clearer errors
+    if args.val_dir is not None and not Path(args.val_dir).exists():
+        raise ValueError(f"Validation directory does not exist: {args.val_dir}")
+
     Path(args.output).mkdir(parents=True, exist_ok=True)
 
     update_config_from_args(mgr, args)
+
+    # If a separate validation directory is provided, store it on the manager
+    if args.val_dir is not None:
+        from pathlib import Path as _Path
+        mgr.val_data_path = _Path(args.val_dir)
+
+    # If user supplies intensity properties JSON, load and inject into config for CT normalization
+    if args.intensity_properties_json is not None:
+        ip_path = Path(args.intensity_properties_json)
+        if not ip_path.exists():
+            raise ValueError(f"Intensity properties JSON not found: {ip_path}")
+        props = load_intensity_props_formatted(ip_path, channel=0)
+        if not props:
+            raise ValueError(f"Failed to parse intensity properties JSON: {ip_path}")
+        # Update manager config to use CT normalization with provided properties
+        if hasattr(mgr, 'update_config'):
+            mgr.update_config(normalization_scheme='ct', intensity_properties=props)
+        else:
+            # Fallback: set directly on dataset_config
+            mgr.dataset_config = getattr(mgr, 'dataset_config', {})
+            mgr.dataset_config['normalization_scheme'] = 'ct'
+            mgr.dataset_config['intensity_properties'] = props
+        # Ensure we skip intensity sampling in dataset init if flag is present
+        setattr(mgr, 'skip_intensity_sampling', True)
+        print("Using provided intensity properties for CT normalization. Sampling disabled.")
 
     # Select trainer based on --trainer argument
     trainer_name = args.trainer.lower()
