@@ -8,6 +8,8 @@ import tifffile
 from magicgui import magicgui
 from datetime import datetime
 import cc3d
+from typing import Optional, Tuple
+
 
 # Try to import config defaults; if not found, use empty defaults.
 try:
@@ -32,6 +34,7 @@ state = {
     'save_progress': False,  # Whether to save progress to a file
     'progress_file': "",  # Path to the progress file
     'min_label_percentage': 0,  # Minimum percentage (0-100) required in a patch
+    'target_label_value': None,  # Target value to calculate percentage from (None means all non-zero)
     # New progress log: a list of dicts recording every patch processed.
     'progress_log': [],  # Each entry: { "index": int, "coords": tuple, "percentage": float, "status": str }
     'output_label_zarr': None,  # Path to output zarr for labels
@@ -223,8 +226,13 @@ def load_next_patch():
         
         state['current_index'] += 1
 
-        # Calculate the percentage of labeled (nonzero) pixels.
-        nonzero = np.count_nonzero(label_patch)
+        # Calculate the percentage of labeled pixels.
+        # If target_label_value is specified, only count that value
+        target_value = state.get('target_label_value')
+        if target_value is not None:
+            nonzero = np.sum(label_patch == target_value)
+        else:
+            nonzero = np.count_nonzero(label_patch)
         total = label_patch.size
         percentage = (nonzero / total * 100) if total > 0 else 0
 
@@ -237,8 +245,6 @@ def load_next_patch():
             # Check if image patch is empty (all zeros) due to empty zarr chunks
             if np.all(image_patch == 0):
                 print("  Warning: Image patch is all zeros (empty zarr chunk)")
-            # Convert label patch to binary (any non-zero value becomes 1)
-            binary_patch = (label_patch > 0).astype(np.uint8)
             
             # Record this patch as pending (waiting for the user decision)
             entry = {
@@ -252,7 +258,7 @@ def load_next_patch():
             state['current_patch'] = {
                 'coords': coord,
                 'image': image_patch,
-                'label': binary_patch,
+                'label': label_patch,
                 'index': idx
             }
             # Update or add napari layers.
@@ -261,10 +267,11 @@ def load_next_patch():
             else:
                 viewer.add_image(image_patch, name="patch_image", colormap='gray')
             if "patch_label" in viewer.layers:
-                viewer.layers["patch_label"].data = binary_patch
+                viewer.layers["patch_label"].data = label_patch
             else:
-                viewer.add_labels(binary_patch, name="patch_label")
-            print(f"Loaded patch at {coord} with {percentage:.2f}% labeled (threshold: {min_label_percentage}%).")
+                viewer.add_labels(label_patch, name="patch_label")
+            target_msg = f" (target value: {state.get('target_label_value')})" if state.get('target_label_value') is not None else ""
+            print(f"Loaded patch at {coord} with {percentage:.2f}% labeled{target_msg} (threshold: {min_label_percentage}%).")
             return
         else:
             # Record an auto-skipped patch
@@ -276,7 +283,8 @@ def load_next_patch():
                 "date_processed": datetime.now().isoformat()
             }
             state['progress_log'].append(entry)
-            print(f"Skipping patch at {coord} ({percentage:.2f}% labeled, below threshold of {min_label_percentage}%).")
+            target_msg = f" of target value {state.get('target_label_value')}" if state.get('target_label_value') is not None else ""
+            print(f"Skipping patch at {coord} ({percentage:.2f}% labeled{target_msg}, below threshold of {min_label_percentage}%).")
     print("No more patches available.")
 
 
@@ -303,12 +311,11 @@ def save_current_patch():
     # Get the edited label from napari viewer
     if "patch_label" in viewer.layers:
         label_patch = viewer.layers["patch_label"].data
-        # Ensure it's binarized
-        label_patch = (label_patch > 0).astype(np.uint8)
+        # Keep original dtype
+        label_patch = label_patch.astype(np.uint8)
     else:
         print("Warning: No label layer found in napari, using original label.")
         label_patch = extract_patch(state['label_volume'], coord, patch_size)
-        label_patch = (label_patch > 0).astype(np.uint8)
 
     # Construct coordinate string.
     if len(coord) == 3:
@@ -346,6 +353,7 @@ def save_current_patch():
     resolution={"widget_type": "LineEdit", "enabled": False},
     sampling={"choices": ["random", "sequence"]},
     min_label_percentage={"min": 0, "max": 100},
+    target_label_value={"widget_type": "LineEdit", "label": "Target Label Value (optional)"},
     min_z={"widget_type": "SpinBox", "min": 0, "max": 999999},
     call_button="Initialize Volumes"
 )
@@ -360,6 +368,7 @@ def init_volume(
         save_progress: bool = config.get("save_progress", True),
         progress_file: str = config.get("progress_file", ""),
         min_label_percentage: int = config.get("min_label_percentage", 1),
+        target_label_value: str = config.get("target_label_value", ""),
         min_z: int = 2500,  # minimum z index from which to start patching (only for 3D)
 ):
     """
@@ -468,15 +477,28 @@ def init_volume(
     state['label_zarr'] = label_zarr
     state['dataset_out_path'] = dataset_out_path
     state['patch_size'] = patch_size
+    # Remember sampling strategy for later grid recomputations
+    state['sampling'] = sampling
     state['session_start_timestamp'] = timestamp  # Use the same timestamp from earlier
 
     # Save progress options.
     state['save_progress'] = save_progress
     state['progress_file'] = progress_file
 
-    # Save the minimum label percentage.
+    # Save the minimum label percentage and target value.
     state['min_label_percentage'] = min_label_percentage
     
+    # Parse and save target label value if provided
+    if target_label_value.strip():
+        try:
+            state['target_label_value'] = int(target_label_value)
+            print(f"Target label value set to: {state['target_label_value']}")
+        except ValueError:
+            print(f"Warning: Invalid target label value '{target_label_value}'. Using all non-zero values.")
+            state['target_label_value'] = None
+    else:
+        state['target_label_value'] = None
+
     # Save output zarr path
     state['output_label_zarr'] = output_label_zarr
 
@@ -566,9 +588,19 @@ def iter_pair(approved: bool):
       - Updates the progress file.
       - Resets the approved checkbox.
     """
-    # Update the minimum label percentage from the current value in the init_volume widget.
+    # Update the minimum label percentage and target value from the current values in the init_volume widget.
     # This assumes that the init_volume widget is still available as a global variable.
     state['min_label_percentage'] = init_volume.min_label_percentage.value
+
+    # Update target label value if changed
+    target_value_str = init_volume.target_label_value.value.strip()
+    if target_value_str:
+        try:
+            state['target_label_value'] = int(target_value_str)
+        except ValueError:
+            state['target_label_value'] = None
+    else:
+        state['target_label_value'] = None
 
     # Update the pending entry from load_next_patch.
     if state['progress_log'] and state['progress_log'][-1]['status'] == "pending":
@@ -612,10 +644,7 @@ def prev_pair():
     # Now extract image patch
     image_patch = extract_patch(state['image_volume'], coord, patch_size)
     
-    # Convert label patch to binary
-    binary_patch = (label_patch > 0).astype(np.uint8)
-    
-    state['current_patch'] = {"coords": coord, "image": image_patch, "label": binary_patch, "index": entry['index']}
+    state['current_patch'] = {"coords": coord, "image": image_patch, "label": label_patch, "index": entry['index']}
 
     # Update the viewer with this patch.
     if "patch_image" in viewer.layers:
@@ -623,9 +652,9 @@ def prev_pair():
     else:
         viewer.add_image(image_patch, name="patch_image", colormap='gray')
     if "patch_label" in viewer.layers:
-        viewer.layers["patch_label"].data = binary_patch
+        viewer.layers["patch_label"].data = label_patch
     else:
-        viewer.add_labels(binary_patch, name="patch_label")
+        viewer.add_labels(label_patch, name="patch_label")
     update_progress()
     print(f"Reverted to patch at {coord}.")
 
@@ -634,7 +663,7 @@ def prev_pair():
 
 # Create the jump control widget
 @magicgui(
-    z_jump={"widget_type": "SpinBox", "min": 50, "max": 10000, "step": 50, "value": 500},
+    z_jump={"widget_type": "SpinBox", "min": 1, "max": 10000, "step": 1, "value": 500},
     call_button="Jump"
 )
 def jump_control(z_jump: int = 500):
@@ -658,38 +687,106 @@ def jump_control(z_jump: int = 500):
         print("Jump function only works with 3D volumes.")
         return
     
-    # Calculate new z coordinate
+    # Calculate requested z coordinate
     current_z, current_y, current_x = current_coord
-    new_z = current_z + z_jump
-    
-    # Check if new z is within volume bounds
-    vol_shape = state['image_volume'].shape
-    if new_z >= vol_shape[0]:
-        print(f"Cannot jump to z={new_z}, volume only has {vol_shape[0]} layers.")
-        return
-    
-    # Find the closest patch coordinate at the new z level
-    patch_size = state['patch_size']
-    target_coord = (new_z, current_y, current_x)
-    
-    # Snap to patch grid
-    snapped_coord = tuple((c // patch_size) * patch_size for c in target_coord)
-    
-    # Find this coordinate in our patch list
-    if snapped_coord in state['patch_coords']:
-        new_index = state['patch_coords'].index(snapped_coord)
-        state['current_index'] = new_index
-        print(f"Jumped from z={current_z} to z={new_z} (snapped to {snapped_coord})")
-        load_next_patch()
-        update_progress()
-    else:
-        # Find the closest available coordinate
-        new_index = find_closest_coord_index(snapped_coord, state['patch_coords'])
+    requested_z = current_z + z_jump
+
+    # Gather available z positions for the current (y, x) on the patch grid
+    same_xy_coords = [c for c in state['patch_coords'] if len(c) == 3 and c[1] == current_y and c[2] == current_x]
+    if not same_xy_coords:
+        # Fallback to previous behavior if for some reason we don't have same-(y,x) coords
+        new_index = find_closest_coord_index((requested_z, current_y, current_x), state['patch_coords'])
         state['current_index'] = new_index
         actual_coord = state['patch_coords'][new_index]
-        print(f"Jumped from z={current_z} to closest available coordinate {actual_coord}")
+        print(f"Jumped from z={current_z} to nearest available {actual_coord} (fallback).")
         load_next_patch()
         update_progress()
+        return
+
+    # Sort candidates by z and build candidate list
+    same_xy_coords.sort(key=lambda c: c[0])
+    candidate_zs = [c[0] for c in same_xy_coords]
+
+    # If exact requested z is not on the current grid for this (y, x),
+    # rebase the grid starting at requested_z to honor exact jump.
+    if requested_z not in candidate_zs:
+        print(f"Requested jump +{z_jump} to z={requested_z}; not on current grid. Recomputing from z={requested_z}...")
+        goto_z(z_abs=requested_z)
+        return
+
+    # Resolve the chosen coordinate exactly
+    chosen_coord = (requested_z, current_y, current_x)
+    new_index = state['patch_coords'].index(chosen_coord)
+    state['current_index'] = new_index
+    print(f"Requested jump +{z_jump} to z={requested_z}; moved to exact {chosen_coord}.")
+    load_next_patch()
+    update_progress()
+
+
+@magicgui(
+    z_abs={"widget_type": "SpinBox", "min": 0, "max": 999999},
+    call_button="Go to Z"
+)
+def goto_z(z_abs: int = 0):
+    """
+    Recompute the patch grid starting at absolute z and continue from there.
+    Attempts to start at the same (y, x) as the current patch.
+    """
+    global state
+
+    if state.get('image_volume') is None or state.get('patch_size') is None:
+        print("No volume initialized.")
+        return
+
+    # Only for 3D volumes
+    if len(state['image_volume'].shape) < 3:
+        print("Go to Z only applies to 3D volumes.")
+        return
+
+    num_spatial = 3
+    vol_shape = state['image_volume'].shape[:num_spatial]
+    patch_size = state['patch_size']
+    sampling = state.get('sampling', 'sequence')
+
+    # Bounds check: ensure there will be at least one patch starting at z_abs
+    max_start_z = vol_shape[0] - patch_size
+    if z_abs > max_start_z:
+        print(f"Cannot start at z={z_abs}; max valid start is {max_start_z} for patch_size={patch_size}.")
+        return
+
+    # Remember current (y, x) if we have a current patch shown
+    target_xy = None
+    if state.get('current_patch') and len(state['current_patch']['coords']) == 3:
+        _, cy, cx = state['current_patch']['coords']
+        target_xy = (cy, cx)
+
+    # Recompute patch grid from z_abs forward
+    new_patch_coords = generate_patch_coords(vol_shape, patch_size, sampling, min_z=z_abs)
+    state['patch_coords'] = new_patch_coords
+
+    # Choose starting index
+    if target_xy is not None:
+        desired = (z_abs, target_xy[0], target_xy[1])
+        if desired in new_patch_coords:
+            new_index = new_patch_coords.index(desired)
+        else:
+            # Fallback: nearest coordinate with same (y, x) at or after z_abs, else nearest overall
+            same_xy = [c for c in new_patch_coords if c[1] == target_xy[0] and c[2] == target_xy[1]]
+            if same_xy:
+                # Prefer the first at/after z_abs
+                same_xy.sort(key=lambda c: c[0])
+                after = [c for c in same_xy if c[0] >= z_abs]
+                chosen = after[0] if after else same_xy[-1]
+                new_index = new_patch_coords.index(chosen)
+            else:
+                new_index = find_closest_coord_index(desired, new_patch_coords)
+    else:
+        new_index = 0
+
+    state['current_index'] = new_index
+    print(f"Recomputed grid from z={z_abs}; starting at index {new_index} with coord {state['patch_coords'][new_index]}.")
+    load_next_patch()
+    update_progress()
 
 
 
@@ -794,6 +891,14 @@ def remove_small_objects(min_voxel_size: int = 50):
     print(f"Removed {removed_count} objects smaller than {min_voxel_size} voxels")
     print(f"  Total voxels removed: {total_voxels_removed}")
     print(f"  Objects remaining: {num_components - removed_count}")
+
+
+def _get_layer_data(layer_name: str) -> Optional[np.ndarray]:
+    global viewer
+    if layer_name in viewer.layers:
+        return viewer.layers[layer_name].data
+    print(f"Layer '{layer_name}' not found.")
+    return None
 
 
 def main():
