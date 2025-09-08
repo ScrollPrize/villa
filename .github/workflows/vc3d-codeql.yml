@@ -2,7 +2,9 @@ name: "CodeQL"
 
 on:
   pull_request:
-  workflow_dispatch:
+    paths:
+      - 'volume-cartographer/**'
+      - '.github/workflows/vc3d-codeql.yml'
   schedule:
     # Friday 11:43 UTC
     - cron: '43 11 * * 5'
@@ -21,6 +23,10 @@ jobs:
       security-events: write
       # required to fetch internal or private CodeQL packs
       packages: read
+    defaults:
+      run:
+        working-directory: ./volume-cartographer
+
 
     steps:
       - name: Checkout repository

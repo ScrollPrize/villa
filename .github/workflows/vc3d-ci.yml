@@ -1,13 +1,19 @@
-name: Continous Integration (CI)
+name: Continuous Integration (CI)
 
 on:
   pull_request:
-  workflow_dispatch:
+    paths:
+      - 'volume-cartographer/**'
+      - '.github/workflows/vc3d-ci.yml'
 
 jobs:
   docker:
     name: Build Docker Image
     runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: ./volume-cartographer
+
     steps:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -18,6 +24,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
+            context: "{{defaultContext}}:volume-cartographer"
             file: ubuntu-24.04-noble.Dockerfile
             push: false
             tags: ${{ github.repository_owner }}/volume-cartographer:latest

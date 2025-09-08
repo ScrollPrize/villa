@@ -71,7 +71,7 @@ This page lists all the prizes awarded so far:
 **Announcement:** <a href="https://scrollprize.substack.com/p/may-progress-prizes-and-updates-to">Blog post</a>
 
 <div className="flex flex-row flex-wrap">
-  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://github.com/ScrollPrize/volume-cartographer">
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://github.com/ScrollPrize/villa/tree/main/volume-cartographer">
     <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$5,000</div><span className="font-bold">VC3D stability improvements</span>: Philip Allgaier / @spacegaier</div>
     <img src="https://substackcdn.com/image/fetch/$s_!nbQK!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73a073b2-09f3-478c-b9bd-2e6141703df8_1669x995.png"/>
   </a>

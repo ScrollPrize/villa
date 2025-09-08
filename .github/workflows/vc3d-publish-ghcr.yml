@@ -2,8 +2,10 @@ name: Build & Push Docker Image (ghcr.io)
 
 on:
   push:
-    branches: ["dev-next", "latest"]
-  workflow_dispatch:
+    branches: ["main", "latest"]
+    paths:
+      - 'volume-cartographer/**'
+      - '.github/workflows/vc3d-publish-ghcr.yml'
 
 concurrency: docker
 
@@ -63,6 +65,7 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
+          context: "{{defaultContext}}:volume-cartographer"
           file: ubuntu-24.04-noble.Dockerfile
           platforms: linux/amd64
           labels: ${{ steps.meta.outputs.labels }}
@@ -124,6 +127,7 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
+          context: "{{defaultContext}}:volume-cartographer"
           file: ubuntu-24.04-noble.Dockerfile
           platforms: linux/arm64
           labels: ${{ steps.meta.outputs.labels }}

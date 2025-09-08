@@ -39,10 +39,10 @@ Originally developed by [Youssef Nader](https://github.com/younader) and [Luke F
 
 ## Automatic Unwrapping (Segmentation) Pipelines
 
-### [VC3D (surface tracer)](https://github.com/ScrollPrize/volume-cartographer)
+### [VC3D (surface tracer)](volume-cartographer)
 A semi-automatic segmentation pipeline to extract papyrus sheets from CT scans of ancient scrolls.
-As of July 2025, it is the approach currently used by the official team, and it is contained in an another repository.
-Developed by [Hendrik Schilling](https://github.com/hendrikschilling) and [Sean Johnson](https://github.com/bruniss) as a fork of Volume Cartographer.
+As of September 2025, it is the approach used by the Vesuvius Challenge team.
+Developed by [Hendrik Schilling](https://github.com/hendrikschilling) and [Sean Johnson](https://github.com/bruniss) as a fork of [Volume Cartographer](https://github.com/educelab/volume-cartographer).
 
 ### [spiral fitting](https://github.com/pmh47/spiral-fitting)
 A fully automatic unwrapping pipeline that fits a spiral to the CT scan.
