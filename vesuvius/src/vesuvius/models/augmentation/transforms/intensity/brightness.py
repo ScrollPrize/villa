@@ -28,7 +28,9 @@ class MultiplicativeBrightnessTransform(ImageOnlyTransform):
             return img
         # even though this is array notation it's a lot slower. Shame shame
         # img[params['apply_to_channel']] *= params['multipliers'].view(-1, *[1]*(img.ndim - 1))
-        for c, m in zip(params['apply_to_channel'], params['multipliers']):
+        multipliers = params['multipliers'].to(img.device)
+        for idx, c in enumerate(params['apply_to_channel']):
+            m = multipliers[idx]
             img[c] *= m
         return img
 

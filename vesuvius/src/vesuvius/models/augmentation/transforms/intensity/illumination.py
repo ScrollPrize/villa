@@ -39,35 +39,42 @@ class InhomogeneousSliceIlluminationTransform(BasicTransform):
         else:
             raise ValueError('Invalid input for sampling.')
 
-    def _build_defects(self, num_slices: int) -> np.ndarray:
-        int_factors = np.ones(num_slices)
+    def _build_defects_torch(self, num_slices: int, device, dtype) -> torch.Tensor:
+        """
+        Torch implementation of illumination defects (device-native).
+        Returns a tensor of shape [num_slices] on the given device/dtype.
+        """
+        int_factors = torch.ones(num_slices, device=device, dtype=dtype)
 
         # Gaussian shaped illumination changes
         num_gaussians = int(np.round(self._sample(self.num_defects)))
-        for _ in range(num_gaussians):
-            sigma = self._sample(self.defect_width)
-            pos = np.random.choice(num_slices)
-            tmp = np.zeros(num_slices)
-            tmp[pos] = 1
-            tmp = gaussian_filter(tmp, sigma, mode='constant', truncate=3)
-            tmp = tmp / tmp.max()
-            strength = self._sample(self.mult_brightness_reduction_at_defect)
-            int_factors *= (1 - (tmp * (1 - strength)))
+        if num_gaussians > 0:
+            x = torch.arange(num_slices, device=device, dtype=dtype)
+            for _ in range(num_gaussians):
+                sigma = float(self._sample(self.defect_width))
+                pos = int(np.random.choice(num_slices))
+                # Build normalized Gaussian bump centered at pos
+                tmp = torch.exp(-0.5 * ((x - pos) / max(sigma, 1e-6)) ** 2)
+                tmp = tmp / torch.clamp(tmp.max(), min=1e-6)
+                strength = float(self._sample(self.mult_brightness_reduction_at_defect))
+                int_factors = int_factors * (1 - (tmp * (1 - strength)))
 
-        int_factors = np.clip(int_factors, 0.1, 1)
-        ps = np.ones(num_slices) / num_slices
-        ps += (1 - int_factors) / num_slices
-        ps /= ps.sum()
-        
-        idx = np.random.choice(
-            num_slices, 
-            int(np.round(self._sample(self.base_p) * num_slices)), 
-            replace=False, 
-            p=ps
-        )
-        noise = np.random.uniform(*self.base_red, size=len(idx))
-        int_factors[idx] *= noise
-        int_factors = np.clip(int_factors, 0.1, 2)
+        int_factors = int_factors.clamp(0.1, 1.0)
+
+        # Sampling probabilities for base reductions (CPU rng fine here; used only for indices)
+        ps = torch.ones(num_slices, device=device, dtype=dtype) / num_slices
+        ps = (ps + (1 - int_factors) / num_slices)
+        ps = ps / torch.clamp(ps.sum(), min=1e-6)
+
+        k = int(np.round(self._sample(self.base_p) * num_slices))
+        if k > 0:
+            # Use torch.multinomial for sampling without replacement
+            idx = torch.multinomial(ps, num_samples=k, replacement=False)
+            noise_low, noise_high = self.base_red
+            noise = torch.rand(idx.shape[0], device=device, dtype=dtype) * (noise_high - noise_low) + noise_low
+            int_factors[idx] = int_factors[idx] * noise
+
+        int_factors = int_factors.clamp(0.1, 2.0)
         return int_factors
 
     def get_parameters(self, **data_dict) -> dict:
@@ -81,13 +88,13 @@ class InhomogeneousSliceIlluminationTransform(BasicTransform):
             if self.per_channel:
                 for c in range(img.shape[0]):
                     if np.random.uniform() < self.p_per_channel:
-                        defects = self._build_defects(img.shape[1])
-                        result[c] *= torch.from_numpy(defects[:, None, None]).float()
+                        defects = self._build_defects_torch(img.shape[1], device=result.device, dtype=result.dtype)
+                        result[c] *= defects.view(-1, 1, 1)
             else:
-                defects = self._build_defects(img.shape[1])
+                defects = self._build_defects_torch(img.shape[1], device=result.device, dtype=result.dtype)
                 for c in range(img.shape[0]):
                     if np.random.uniform() < self.p_per_channel:
-                        result[c] *= torch.from_numpy(defects[:, None, None]).float()
+                        result[c] *= defects.view(-1, 1, 1)
         
         return result
 

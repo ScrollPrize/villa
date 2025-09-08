@@ -48,12 +48,17 @@ class BasicTransform(abc.ABC):
 
             # Dynamic handling for any other keys (e.g., custom targets like 'ink', 'normals')
             # Skip 'ignore_masks' as it shouldn't be transformed
+            regression_keys = set(data_dict.get('regression_keys', []) or [])
             known_keys = {'image', 'regression_target', 'segmentation', 'dist_map',
-                          'geols_labels', 'keypoints', 'bbox', 'ignore_masks', 'is_unlabeled'}
+                          'geols_labels', 'keypoints', 'bbox', 'ignore_masks', 'is_unlabeled', 'regression_keys'}
 
-            for key in data_dict.keys():
-                if key not in known_keys and data_dict[key] is not None:
-                    # Assume custom targets should be treated as segmentation
+            for key in list(data_dict.keys()):
+                if key in known_keys or data_dict.get(key) is None:
+                    continue
+                # Choose interpolation mode based on whether the key is marked as regression
+                if key in regression_keys:
+                    data_dict[key] = self._apply_to_regr_target(data_dict[key], **params)
+                else:
                     data_dict[key] = self._apply_to_segmentation(data_dict[key], **params)
 
         return data_dict

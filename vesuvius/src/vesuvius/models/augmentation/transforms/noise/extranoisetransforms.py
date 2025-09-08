@@ -95,10 +95,26 @@ class BlankRectangleTransform(BasicTransform):
                         # Create slice for the rectangle
                         my_slice = tuple([c, *[slice(i, j) for i, j in zip(lb, ub)]])
                         
-                        # Get intensity value and convert to torch tensor before assignment
-                        intensity = self.color_fn(result[my_slice].cpu().numpy())
-                        intensity = torch.tensor(intensity, device=result.device, dtype=result.dtype)
-                        result[my_slice] = intensity
+                        # Compute intensity value; prefer torch-native paths, fallback to numpy for custom callables
+                        rv = getattr(self.color_fn, 'rectangle_value', None)
+                        slice_t = result[my_slice]
+                        intensity_t: torch.Tensor
+                        if isinstance(rv, (int, float)):
+                            intensity_t = torch.tensor(rv, device=result.device, dtype=result.dtype)
+                        elif isinstance(rv, (tuple, list)) and len(rv) == 2 and all(isinstance(x, (int, float)) for x in rv):
+                            low, high = float(rv[0]), float(rv[1])
+                            r = torch.rand((), device=result.device, dtype=result.dtype)
+                            intensity_t = r * (high - low) + low
+                        elif callable(rv) and getattr(rv, '__name__', '') in ('mean', 'median'):
+                            if rv.__name__ == 'mean':
+                                intensity_t = slice_t.mean().to(dtype=result.dtype)
+                            else:
+                                intensity_t = slice_t.median().values.to(dtype=result.dtype)
+                        else:
+                            # Fallback to user-provided callable on CPU numpy, then convert back
+                            intensity = self.color_fn(slice_t.detach().cpu().numpy())
+                            intensity_t = torch.tensor(intensity, device=result.device, dtype=result.dtype)
+                        result[my_slice] = intensity_t
         
         return result
 
@@ -214,61 +230,53 @@ class SmearTransform(ImageOnlyTransform):
         return {}
 
     def _apply_to_image(self, img: torch.Tensor, **params) -> torch.Tensor:
-        # Ensure the image is on CPU and convert to numpy.
-        device = img.device
-        img_np = img.detach().cpu().numpy()
-        # We assume the input image has shape (C, ...) where the remaining dimensions are spatial.
-        C = img_np.shape[0]
-        spatial_shape = img_np.shape[1:]
+        # Pure torch implementation; runs on CPU or GPU depending on img.device
+        C = img.shape[0]
+        spatial_shape = img.shape[1:]
         num_spatial_dims = len(spatial_shape)
-        # Validate smear_axis: must be between 1 and number of spatial dimensions.
         if not (1 <= self.smear_axis <= num_spatial_dims):
-            raise ValueError(f"smear_axis must be between 1 and {num_spatial_dims} for input with shape {img_np.shape}")
-        # For each channel, we want to operate on the corresponding spatial image.
-        # Since the channel dimension is separate, we adjust the smear axis to a "local" axis in the channel image.
-        # (For example, if smear_axis is 1 in the full tensor, then for the channel image it is 0.)
-        local_smear_axis = self.smear_axis - 1
+            raise ValueError(f"smear_axis must be between 1 and {num_spatial_dims} for input with shape {tuple(img.shape)}")
 
-        transformed = np.copy(img_np)
+        local_smear_axis = self.smear_axis - 1
+        transformed = img.clone()
+        # Determine dims for moveaxis in torch
         for ch in range(C):
-            chan_img = img_np[ch]  # shape: spatial_shape (e.g., for a 3D image: (D, H, W))
-            # Proceed only if the size along the smear axis is greater than num_prev_slices.
+            chan_img = img[ch]
             if chan_img.shape[local_smear_axis] <= self.num_prev_slices:
                 continue
-
-            # To iterate easily along the smear axis, bring that axis to the front.
-            moved = np.moveaxis(chan_img, local_smear_axis, 0)  # shape: (N, ...) where N = size along smear axis
+            # Move the smear axis to front: build permutation
+            dims = list(range(chan_img.ndim))
+            if local_smear_axis != 0:
+                dims = [local_smear_axis] + [d for d in dims if d != local_smear_axis]
+                moved = chan_img.permute(*dims)
+            else:
+                moved = chan_img
             N = moved.shape[0]
-            # Iterate over slices starting from index num_prev_slices.
             for i in range(self.num_prev_slices, N):
-                aggregated = np.zeros_like(moved[i], dtype=np.float32)
+                aggregated = torch.zeros_like(moved[i], dtype=torch.float32, device=moved.device)
                 count = 0
                 for j in range(i - self.num_prev_slices, i):
-                    # Shift the previous slice by the given offset.
-                    # Handle different dimensionalities of the slice
-                    if moved[j].ndim == 0:
-                        # Scalar case - no shift possible
-                        shifted = moved[j]
-                    elif moved[j].ndim == 1:
-                        # 1D slice - shift only along the single axis
-                        shifted = np.roll(moved[j], shift=self.shift[0], axis=0)
-                    elif moved[j].ndim == 2:
-                        # 2D slice - shift along both axes
-                        shifted = np.roll(moved[j], shift=self.shift, axis=(0, 1))
+                    slice_j = moved[j]
+                    # Determine shift behavior based on dimensionality of slice
+                    if slice_j.ndim == 0:
+                        shifted = slice_j
+                    elif slice_j.ndim == 1:
+                        shifted = torch.roll(slice_j, shifts=self.shift[0], dims=0)
                     else:
-                        # Higher dimensional slice - shift only the first two spatial axes
-                        # Use only the first two components of shift
-                        shift_truncated = self.shift[:2] if len(self.shift) >= 2 else (self.shift[0], 0)
-                        shifted = np.roll(moved[j], shift=shift_truncated, axis=(0, 1))
-                    
-                    aggregated += shifted.astype(np.float32)
+                        # Shift along first two axes of the slice
+                        s0 = self.shift[0] if len(self.shift) >= 1 else 0
+                        s1 = self.shift[1] if len(self.shift) >= 2 else 0
+                        shifted = torch.roll(slice_j, shifts=(s0, s1), dims=(0, 1))
+                    aggregated += shifted.to(aggregated.dtype)
                     count += 1
                 if count > 0:
-                    aggregated /= count
-                # Blend the aggregated slice with the current slice.
-                moved[i] = ((1 - self.alpha) * moved[i].astype(np.float32) + self.alpha * aggregated).astype(moved[i].dtype)
-            # Restore the original axis order.
-            transformed[ch] = np.moveaxis(moved, 0, local_smear_axis)
-        # Convert back to a torch tensor (preserving dtype and device).
-        out = torch.from_numpy(transformed).to(device)
-        return out
+                    aggregated = aggregated / float(count)
+                moved[i] = ((1 - self.alpha) * moved[i].to(torch.float32) + self.alpha * aggregated).to(moved.dtype)
+            # Restore original axis order
+            if local_smear_axis != 0:
+                inv_perm = list(range(1, moved.ndim))
+                inv_perm.insert(local_smear_axis, 0)
+                transformed[ch] = moved.permute(*inv_perm)
+            else:
+                transformed[ch] = moved
+        return transformed

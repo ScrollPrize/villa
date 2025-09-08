@@ -34,7 +34,14 @@ class GammaTransform(ImageOnlyTransform):
         }
 
     def _apply_to_image(self, img: torch.Tensor, **params) -> torch.Tensor:
-        for c, r, i, g in zip(params['apply_to_channel'], params['retain_stats'], params['invert_image'], params['gamma']):
+        gamma_vals = params['gamma'].to(img.device)
+        # convert booleans to python types for control flow
+        retain_stats = [bool(x) for x in params['retain_stats']]
+        invert_flags = [bool(x) for x in params['invert_image']]
+        for idx, c in enumerate(params['apply_to_channel']):
+            r = retain_stats[idx]
+            i = invert_flags[idx]
+            g = gamma_vals[idx]
             if i:
                 img[c] *= -1
             if r:

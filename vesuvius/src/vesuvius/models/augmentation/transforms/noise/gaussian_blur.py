@@ -25,7 +25,7 @@ def blur_dimension(img: torch.Tensor, sigma: float, dim_to_blur: int, force_use_
     assert img.ndim - 1 > dim_to_blur, "dim_to_blur must be a valid spatial dimension of the input image."
     # Adjustments for kernel based on image dimensions
     spatial_dims = img.ndim - 1  # Number of spatial dimensions in the input image
-    kernel = _build_kernel(sigma, truncate=truncate)
+    kernel = _build_kernel(sigma, truncate=truncate, device=img.device, dtype=img.dtype)
 
     ksize = kernel.shape[0]
 
@@ -64,7 +64,11 @@ def blur_dimension(img: torch.Tensor, sigma: float, dim_to_blur: int, force_use_
 
     # Apply convolution
     # remember that weights are [c_out, c_in, ...]
-    img_blurred = conv_op(img_padded[None], kernel.expand(img_padded.shape[0], *[-1] * (kernel.ndim - 1)), groups=img_padded.shape[0])[0]
+    img_blurred = conv_op(
+        img_padded[None],
+        kernel.expand(img_padded.shape[0], *[-1] * (kernel.ndim - 1)).to(img_padded.device),
+        groups=img_padded.shape[0]
+    )[0]
     return img_blurred
 
 
@@ -169,12 +173,12 @@ class GaussianBlurTransform(ImageOnlyTransform):
             return blur_dimension(img, sigma, dim_to_blur, force_use_fft=self.benchmark_use_fft[shp][kernel_size])
 
 
-def _build_kernel(sigma: float, truncate: float = 4) -> torch.Tensor:
+def _build_kernel(sigma: float, truncate: float = 4, device=None, dtype=None) -> torch.Tensor:
     kernel_size = _compute_kernel_size(sigma, truncate=truncate)
     ksize_half = (kernel_size - 1) * 0.5
 
-    x = torch.linspace(-ksize_half, ksize_half, steps=kernel_size)
-    pdf = torch.exp(-0.5 * (x / sigma).pow(2))
+    x = torch.linspace(-ksize_half, ksize_half, steps=kernel_size, device=device, dtype=dtype or torch.float32)
+    pdf = torch.exp(-0.5 * (x / torch.tensor(sigma, device=x.device, dtype=x.dtype)).pow(2))
     kernel1d = pdf / pdf.sum()
 
     return kernel1d
