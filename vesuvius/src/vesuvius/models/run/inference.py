@@ -21,6 +21,7 @@ from vesuvius.models.run.blending import generate_gaussian_map
 from vesuvius.models.run.tta import infer_with_tta
 from vesuvius.data.volume import Volume
 from datetime import datetime
+from vesuvius.models.datasets.intensity_properties import load_intensity_props_formatted
 
 # Optional import for TIFF IO
 try:
@@ -89,6 +90,7 @@ class Inferer():
         self.hf_token = hf_token
         self.model_patch_size = None
         self.num_classes = None
+        self.intensity_props = None
 
         # Internal: detect if input is a TIFF file or folder of TIFFs
         self._tiff_inputs = []
@@ -375,7 +377,7 @@ class Inferer():
 
     def _resolve_normalization(self):
         """Resolve normalization scheme and parameters consistently for all paths.
-        Returns a tuple: (normalization_scheme, global_mean, global_std).
+        Returns a tuple: (normalization_scheme, global_mean, global_std, intensity_props).
         """
         normalization_scheme = self.model_normalization_scheme or self.normalization_scheme
         # Map legacy 'zscore' from train.py checkpoints to explicit schemes
@@ -391,20 +393,45 @@ class Inferer():
 
         global_mean = None
         global_std = None
+        intensity_props = None
+
+        # Allow explicit nnU-Net-style intensity props JSON (ct normalization)
+        if hasattr(self, 'intensity_props_json') and self.intensity_props_json:
+            try:
+                props = load_intensity_props_formatted(Path(self.intensity_props_json), channel=0)
+                if props:
+                    intensity_props = props
+                    normalization_scheme = 'ct'
+                    if self.verbose:
+                        print(f"Loaded intensity properties from JSON for CT normalization: {self.intensity_props_json}")
+            except Exception as e:
+                print(f"Warning: Failed to load intensity properties from {self.intensity_props_json}: {e}")
+
         if normalization_scheme == 'global_zscore' and self.model_intensity_properties:
             global_mean = self.model_intensity_properties.get('mean')
             global_std = self.model_intensity_properties.get('std')
             if self.verbose and global_mean is not None and global_std is not None:
                 print(f"Using global normalization from checkpoint: mean={global_mean:.4f}, std={global_std:.4f}")
 
-        return normalization_scheme, global_mean, global_std
+        # Prefer CT if model checkpoint contains full CT stats and user didn't supply JSON
+        if intensity_props is None and self.model_intensity_properties and all(k in self.model_intensity_properties for k in ['percentile_00_5', 'percentile_99_5', 'mean', 'std']):
+            intensity_props = {
+                'mean': self.model_intensity_properties['mean'],
+                'std': self.model_intensity_properties['std'],
+                'percentile_00_5': self.model_intensity_properties['percentile_00_5'],
+                'percentile_99_5': self.model_intensity_properties['percentile_99_5']
+            }
+            normalization_scheme = 'ct'
+            if self.verbose:
+                print("Using CT normalization from checkpoint intensity properties")
+        return normalization_scheme, global_mean, global_std, intensity_props
 
     def _create_dataset_and_loader(self):
         # Use step_size instead of overlap (step_size is [0-1] representing stride as fraction of patch size)
         # step_size of 0.5 means 50% overlap
         
         # Resolve normalization scheme and parameters consistently
-        normalization_scheme, global_mean, global_std = self._resolve_normalization()
+        normalization_scheme, global_mean, global_std, intensity_props = self._resolve_normalization()
         
         self.dataset = VCDataset(
             input_path=self.input,
@@ -415,6 +442,7 @@ class Inferer():
             normalization_scheme=normalization_scheme,
             global_mean=global_mean,
             global_std=global_std,
+            intensity_props=intensity_props,
             input_format=self.input_format,
             verbose=self.verbose,
             mode='infer',
@@ -753,7 +781,7 @@ class Inferer():
         # Backwards-compatible alias; keep name used elsewhere
         return self._resolve_normalization()
 
-    def _normalize_numpy(self, arr: np.ndarray, normalization_scheme: str, global_mean: float = None, global_std: float = None) -> np.ndarray:
+    def _normalize_numpy(self, arr: np.ndarray, normalization_scheme: str, global_mean: float = None, global_std: float = None, intensity_props: dict = None) -> np.ndarray:
         # arr is 2D (Y,X) or 3D (Z,Y,X); work in float32
         a = arr.astype(np.float32, copy=False)
         if normalization_scheme == 'none':
@@ -772,6 +800,16 @@ class Inferer():
             mn = float(a.min()); mx = float(a.max())
             denom = max(mx - mn, 1e-8)
             return (a - mn) / denom
+        if normalization_scheme == 'ct':
+            if not intensity_props or not all(k in intensity_props for k in ('percentile_00_5', 'percentile_99_5', 'mean', 'std')):
+                # Fallback: no-op if props missing
+                return a
+            lb = float(intensity_props['percentile_00_5'])
+            ub = float(intensity_props['percentile_99_5'])
+            mu = float(intensity_props['mean'])
+            sd = float(intensity_props['std'])
+            a = np.clip(a, lb, ub)
+            return (a - mu) / max(sd, 1e-8)
         # Default: no-op
         return a
 
@@ -798,7 +836,7 @@ class Inferer():
         if self.patch_size is None or self.num_classes is None:
             raise RuntimeError("Model/patch metadata missing before TIFF inference.")
 
-        normalization_scheme, gmean, gstd = self._resolve_normalization_for_tiff()
+        normalization_scheme, gmean, gstd, iprops = self._resolve_normalization_for_tiff()
 
         if self.is_2d_model:
             if img.ndim != 2:
@@ -875,13 +913,13 @@ class Inferer():
                 y1, x1 = min(y + pY, Y), min(x + pX, X)
                 sub = img[y:y1, x:x1]
                 # Normalize per-patch for consistency with dataset/large-TIFF path
-                sub = self._normalize_numpy(sub, normalization_scheme, gmean, gstd)
+                sub = self._normalize_numpy(sub, normalization_scheme, gmean, gstd, iprops)
             else:
                 z, y, x = coord
                 z1, y1, x1 = min(z + pZ, Z), min(y + pY, Y), min(x + pX, X)
                 sub = img[z:z1, y:y1, x:x1]
                 # Normalize per-patch for consistency
-                sub = self._normalize_numpy(sub, normalization_scheme, gmean, gstd)
+                sub = self._normalize_numpy(sub, normalization_scheme, gmean, gstd, iprops)
             # Optional: skip empty patches
             if self.skip_empty_patches:
                 if sub.size == 0:
@@ -973,7 +1011,7 @@ class Inferer():
         # Create zarr output stores
         self._create_output_stores()
 
-        normalization_scheme, gmean, gstd = self._resolve_normalization_for_tiff()
+        normalization_scheme, gmean, gstd, iprops = self._resolve_normalization_for_tiff()
         if self.is_2d_model:
             pY, pX = self.patch_size
             pZ = 1
@@ -987,7 +1025,7 @@ class Inferer():
                     _, y, x = coord
                     y1, x1 = min(y + pY, Y), min(x + pX, X)
                     sub = img[y:y1, x:x1]
-                    sub = self._normalize_numpy(sub, normalization_scheme, gmean, gstd)
+                    sub = self._normalize_numpy(sub, normalization_scheme, gmean, gstd, iprops)
                     patch = np.zeros((pY, pX), dtype=np.float32)
                     patch[:sub.shape[0], :sub.shape[1]] = sub
                     t = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).to(self.device)  # (1,1,pY,pX)
@@ -995,7 +1033,7 @@ class Inferer():
                     z, y, x = coord
                     z1, y1, x1 = min(z + pZ, Z), min(y + pY, Y), min(x + pX, X)
                     sub = img[z:z1, y:y1, x:x1]
-                    sub = self._normalize_numpy(sub, normalization_scheme, gmean, gstd)
+                    sub = self._normalize_numpy(sub, normalization_scheme, gmean, gstd, iprops)
                     patch = np.zeros((pZ, pY, pX), dtype=np.float32)
                     patch[:sub.shape[0], :sub.shape[1], :sub.shape[2]] = sub
                     t = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).to(self.device)
@@ -1025,13 +1063,14 @@ class Inferer():
 
     def _infer_2d_over_slices_volume(self):
         # Prepare normalization
-        normalization_scheme, gmean, gstd = self._resolve_normalization_for_tiff()
+        normalization_scheme, gmean, gstd, iprops = self._resolve_normalization_for_tiff()
 
         # Initialize Volume
         vol_kwargs = dict(
             normalization_scheme=normalization_scheme,
             global_mean=gmean,
             global_std=gstd,
+            intensity_props=iprops,
             return_as_type='np.float32',
             return_as_tensor=False,
             verbose=self.verbose
@@ -1228,7 +1267,9 @@ def main():
                       help='Optional: Override patch size, comma-separated (e.g., "192,192,192"). If not provided, uses the model\'s default patch size.')
     parser.add_argument('--save_softmax', action='store_true', help='Save softmax outputs')
     parser.add_argument('--normalization', type=str, default='instance_zscore', 
-                      help='Normalization scheme (instance_zscore, global_zscore, instance_minmax, none)')
+                      help='Normalization scheme (instance_zscore, global_zscore, instance_minmax, ct, none)')
+    parser.add_argument('--intensity-properties-json', type=str, default=None,
+                      help='Path to nnU-Net style intensity properties JSON (dataset_fingerprint.json or intensity_props.json) for CT normalization')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda, cpu)')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
     parser.add_argument('--skip-empty-patches', dest='skip_empty_patches', action='store_true', 
@@ -1294,6 +1335,9 @@ def main():
         device=args.device,
         verbose=args.verbose,
         skip_empty_patches=args.skip_empty_patches,  # Skip empty patches flag
+        # Intensity properties JSON for CT normalization
+        # Store on the instance to be picked up in _resolve_normalization
+        # (set after object creation below)
         # Pass Volume-specific parameters to VCDataset
         scroll_id=scroll_id,
         segment_id=segment_id,
@@ -1307,6 +1351,8 @@ def main():
     )
 
     try:
+        # Stash intensity properties JSON path directly on inferer for resolution
+        inferer.intensity_props_json = args.intensity_properties_json
         print("\n--- Starting Inference ---")
         result = inferer.infer()
 
