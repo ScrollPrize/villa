@@ -1,17 +1,19 @@
-#include "vc/core/util/Surface.hpp"
-#include "vc/core/types/Volume.hpp"
-#include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/types/ChunkedTensor.hpp"
-#include "vc/core/util/Slicing.hpp"
+#include <unordered_set>
+#include <algorithm>
+#include <random>
+#include <iomanip>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <iostream>
 #include <random>
 #include <fstream>
 #include <nlohmann/json.hpp>
-#include <algorithm>
-#include <random>
-#include <iomanip>
+
+#include "vc/core/util/Surface.hpp"
+#include "vc/core/types/Volume.hpp"
+#include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/types/ChunkedTensor.hpp"
+#include "vc/core/util/Slicing.hpp"
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -73,7 +75,7 @@ public:
     }
 
     cv::Mat render(const std::string& segment_id, const fs::path& output_path,
-                   std::string source, float opacity = 0.4) {
+                   std::string source, float opacity = 0.4, const std::string& patch_filter = "") {
 
         // Special handling for sequence and approved_patches sources
         if (source == "sequence") {
@@ -81,7 +83,11 @@ public:
         }
 
         if (source == "approved_patches") {
-            return renderApprovedPatches(segment_id, output_path, opacity);
+            return renderApprovedPatches(segment_id, output_path, opacity, patch_filter);
+        }
+
+        if (source == "duplicate_check") {
+            return renderDuplicateCheck(segment_id, output_path);
         }
 
         // Handle contributing and overlapping sources with alignment
@@ -200,8 +206,180 @@ public:
 
 private:
 
-// Modified renderApprovedPatches function
-cv::Mat renderApprovedPatches(const std::string& target_segment_id, const fs::path& output_path, float opacity) {
+cv::Mat renderDuplicateCheck(const std::string& segment_id, const fs::path& output_path) {
+    // Hardcoded tolerance - change this value as needed
+    // 0 = exact matching, 1 = 2x2x2 blocks, 2 = 4x4x4 blocks, 3 = 8x8x8 blocks
+    int tolerance = 3;
+
+    std::cout << "Checking for duplicate sampled points in segment: " << segment_id << std::endl;
+    std::cout << "Using tolerance level: " << tolerance << " (groups points in "
+              << (1 << tolerance) << "x" << (1 << tolerance) << "x" << (1 << tolerance)
+              << " voxel blocks)" << std::endl;
+
+    // Load segment
+    auto segment_meta = vpkg_->loadSurface(segment_id);
+    if (!segment_meta) {
+        throw std::runtime_error("Failed to load segment: " + segment_id);
+    }
+
+    QuadSurface* surf = segment_meta->surface();
+    cv::Mat_<cv::Vec3f> raw_points = surf->rawPoints();
+
+    // Create output image - white background for invalid points
+    cv::Mat_<cv::Vec3b> output(raw_points.size(), cv::Vec3b(255, 255, 255));
+
+    // Track which integer voxel coordinates we've seen
+    std::unordered_set<std::string> seen_voxels;
+
+    // Statistics
+    int valid_count = 0;
+    int duplicate_count = 0;
+    int invalid_count = 0;
+
+    // Create bitmask for zeroing low bits based on tolerance
+    int bitmask = ~((1 << tolerance) - 1);
+
+    std::cout << "Processing " << raw_points.cols << "x" << raw_points.rows << " points..." << std::endl;
+
+    // Iterate through all raw points (no interpolation)
+    for (int j = 0; j < raw_points.rows; j++) {
+        if (j % 100 == 0) {
+            std::cout << "Processing row " << j << "/" << raw_points.rows << std::endl;
+        }
+
+        for (int i = 0; i < raw_points.cols; i++) {
+            const cv::Vec3f& point = raw_points(j, i);
+
+            // Check if point is invalid (-1,-1,-1 or NaN)
+            if (point[0] == -1 || std::isnan(point[0]) || std::isnan(point[1]) || std::isnan(point[2])) {
+                // Invalid points stay white (already set)
+                invalid_count++;
+                continue;
+            }
+
+            // Round coordinates to get integer voxel indices
+            int voxel_x = std::round(point[0]);
+            int voxel_y = std::round(point[1]);
+            int voxel_z = std::round(point[2]);
+
+            // Apply tolerance by zeroing low bits
+            voxel_x = voxel_x & bitmask;
+            voxel_y = voxel_y & bitmask;
+            voxel_z = voxel_z & bitmask;
+
+            // Create unique key for this voxel
+            std::string voxel_key = std::to_string(voxel_x) + "," +
+                                   std::to_string(voxel_y) + "," +
+                                   std::to_string(voxel_z);
+
+            // Check if we've seen this voxel before
+            if (seen_voxels.find(voxel_key) != seen_voxels.end()) {
+                // Duplicate found - mark as red
+                output(j, i) = cv::Vec3b(0, 0, 255); // BGR format, so (0,0,255) is red
+                duplicate_count++;
+            } else {
+                // First time seeing this voxel - mark as black (valid)
+                output(j, i) = cv::Vec3b(0, 0, 0);
+                seen_voxels.insert(voxel_key);
+                valid_count++;
+            }
+        }
+    }
+
+    // Print statistics
+    std::cout << "\n=== Duplicate Check Statistics ===" << std::endl;
+    std::cout << "Total points: " << (raw_points.cols * raw_points.rows) << std::endl;
+    std::cout << "Valid unique points: " << valid_count << std::endl;
+    std::cout << "Duplicate points: " << duplicate_count;
+    if (duplicate_count > 0) {
+        float duplicate_percentage = (100.0f * duplicate_count) / (valid_count + duplicate_count);
+        std::cout << " (" << std::fixed << std::setprecision(2) << duplicate_percentage << "% of valid points)";
+    }
+    std::cout << std::endl;
+    std::cout << "Invalid points: " << invalid_count << std::endl;
+    std::cout << "Unique voxels sampled: " << seen_voxels.size() << std::endl;
+
+    // Optional: Create a heatmap showing duplicate density
+    if (duplicate_count > 0) {
+        std::cout << "\nDuplicates detected! Creating additional heatmap..." << std::endl;
+
+        // Count duplicates per voxel
+        std::unordered_map<std::string, int> voxel_counts;
+        for (int j = 0; j < raw_points.rows; j++) {
+            for (int i = 0; i < raw_points.cols; i++) {
+                const cv::Vec3f& point = raw_points(j, i);
+                if (point[0] == -1 || std::isnan(point[0])) continue;
+
+                int voxel_x = std::round(point[0]);
+                int voxel_y = std::round(point[1]);
+                int voxel_z = std::round(point[2]);
+
+                // Apply same tolerance by zeroing low bits
+                voxel_x = voxel_x & bitmask;
+                voxel_y = voxel_y & bitmask;
+                voxel_z = voxel_z & bitmask;
+
+                std::string voxel_key = std::to_string(voxel_x) + "," +
+                                       std::to_string(voxel_y) + "," +
+                                       std::to_string(voxel_z);
+                voxel_counts[voxel_key]++;
+            }
+        }
+
+        // Find max count for normalization
+        int max_count = 0;
+        for (const auto& [key, count] : voxel_counts) {
+            if (count > max_count) max_count = count;
+        }
+
+        // Create heatmap
+        cv::Mat_<cv::Vec3b> heatmap(raw_points.size(), cv::Vec3b(255, 255, 255));
+        for (int j = 0; j < raw_points.rows; j++) {
+            for (int i = 0; i < raw_points.cols; i++) {
+                const cv::Vec3f& point = raw_points(j, i);
+                if (point[0] == -1 || std::isnan(point[0])) continue;
+
+                int voxel_x = std::round(point[0]);
+                int voxel_y = std::round(point[1]);
+                int voxel_z = std::round(point[2]);
+
+                // Apply same tolerance by zeroing low bits
+                voxel_x = voxel_x & bitmask;
+                voxel_y = voxel_y & bitmask;
+                voxel_z = voxel_z & bitmask;
+
+                std::string voxel_key = std::to_string(voxel_x) + "," +
+                                       std::to_string(voxel_y) + "," +
+                                       std::to_string(voxel_z);
+
+                int count = voxel_counts[voxel_key];
+                if (count == 1) {
+                    heatmap(j, i) = cv::Vec3b(0, 0, 0); // Black for unique
+                } else {
+                    // Color based on duplicate count - from yellow to red
+                    float intensity = std::min(1.0f, (float)(count - 1) / (max_count - 1));
+                    int green = 255 * (1.0f - intensity);
+                    heatmap(j, i) = cv::Vec3b(0, green, 255); // BGR
+                }
+            }
+        }
+
+        // Save heatmap
+        fs::path heatmap_path = output_path.parent_path() / (output_path.stem().string() + "_heatmap.png");
+        cv::imwrite(heatmap_path.string(), heatmap);
+        std::cout << "Heatmap saved to: " << heatmap_path << std::endl;
+        std::cout << "Max duplicates for single voxel: " << max_count << std::endl;
+    }
+
+    // Save main output
+    cv::imwrite(output_path.string(), output);
+    std::cout << "Duplicate check visualization saved to: " << output_path << std::endl;
+
+    return output;
+}
+
+cv::Mat renderApprovedPatches(const std::string& target_segment_id, const fs::path& output_path,
+                              float opacity, const std::string& patch_filter = "") {
     auto target_meta = vpkg_->loadSurface(target_segment_id);
     QuadSurface* target_surf = target_meta->surface();
 
@@ -237,15 +415,45 @@ cv::Mat renderApprovedPatches(const std::string& target_segment_id, const fs::pa
 
     // Load patches
     std::vector<std::string> patch_ids = getOverlapIds(target_segment_id, target_meta, "approved_patches");
+
+    // Parse filter if provided
+    std::unordered_set<std::string> filter_set;
+    if (!patch_filter.empty()) {
+        std::stringstream ss(patch_filter);
+        std::string patch_id;
+        while (std::getline(ss, patch_id, ',')) {
+            // Trim whitespace
+            patch_id.erase(0, patch_id.find_first_not_of(" \t"));
+            patch_id.erase(patch_id.find_last_not_of(" \t") + 1);
+            if (!patch_id.empty()) {
+                filter_set.insert(patch_id);
+            }
+        }
+        std::cout << "Filtering to " << filter_set.size() << " specified patches" << std::endl;
+    }
+
+    // Load only the patches we want to render
     std::vector<QuadSurface*> patch_surfaces;
+    std::vector<std::string> active_patch_ids;  // Track which patches we're actually using
+
     for (const auto& patch_id : patch_ids) {
+        // Skip if filter is active and this patch isn't in the filter
+        if (!filter_set.empty() && filter_set.find(patch_id) == filter_set.end()) {
+            continue;
+        }
+
         auto patch_meta = vpkg_->loadSurface(patch_id);
         if (patch_meta) {
             patch_surfaces.push_back(patch_meta->surface());
+            active_patch_ids.push_back(patch_id);
         }
     }
 
-    std::cout << "Loaded " << patch_surfaces.size() << " patches" << std::endl;
+    std::cout << "Loaded " << patch_surfaces.size() << " patches";
+    if (!filter_set.empty()) {
+        std::cout << " (filtered from " << patch_ids.size() << " total)";
+    }
+    std::cout << std::endl;
 
     // Build spatial index
     std::cout << "Building spatial index..." << std::endl;
@@ -290,8 +498,7 @@ cv::Mat renderApprovedPatches(const std::string& target_segment_id, const fs::pa
     for (int j = 0; j < process_size.height; j++) {
         #pragma omp critical
         {
-                std::cout << "Processing row " << j << "/" << process_size.height << std::endl;
-
+            std::cout << "Processing row " << j << "/" << process_size.height << std::endl;
         }
 
         for (int i = 0; i < process_size.width; i++) {
@@ -340,7 +547,7 @@ cv::Mat renderApprovedPatches(const std::string& target_segment_id, const fs::pa
     int patches_hit = 0;
     for (int i = 0; i < patch_surfaces.size(); i++) {
         if (patch_counts[i] > 0) {
-            std::cout << "Patch " << i << ": " << patch_counts[i] << " points" << std::endl;
+            std::cout << "Patch " << active_patch_ids[i] << ": " << patch_counts[i] << " points" << std::endl;
             patches_hit++;
         }
     }
@@ -768,13 +975,14 @@ cv::Mat renderApprovedPatches(const std::string& target_segment_id, const fs::pa
 };
 
 int main(int argc, char* argv[]) {
-    if (argc != 6) {
-        std::cout << "Usage: " << argv[0] << " <volpkg-path> <volume-id> <segment-id> <overlap-source> <output-png> " << std::endl;
+    if (argc < 6 || argc > 7) {
+        std::cout << "Usage: " << argv[0] << " <volpkg-path> <volume-id> <segment-id> <overlap-source> <output-png> [patch-filter]" << std::endl;
         std::cout << "  volpkg-path: Path to volume package" << std::endl;
         std::cout << "  volume-id: ID of volume to use" << std::endl;
         std::cout << "  segment-id: ID of segment to render" << std::endl;
-        std::cout << "  overlap-source: Source for overlaps (overlapping|contributing|sequence|approved_patches)" << std::endl;
+        std::cout << "  overlap-source: Source for overlaps (overlapping|contributing|sequence|approved_patches|duplicate_check)" << std::endl;
         std::cout << "  output-png: Output file path" << std::endl;
+        std::cout << "  patch-filter: (optional) Comma-separated list of patch IDs to render (only for approved_patches)" << std::endl;
         return EXIT_SUCCESS;
     }
 
@@ -785,9 +993,15 @@ int main(int argc, char* argv[]) {
     fs::path output_path = argv[5];
     float opacity = 0.5f;
 
+    std::string patch_filter = "";
+    if (argc == 7) {
+        patch_filter = argv[6];
+    }
+
     if (overlap_source != "overlapping" && overlap_source != "sequence" &&
-        overlap_source != "contributing" && overlap_source != "approved_patches") {
-        std::cerr << "Error: Invalid overlap source. Must be one of: overlapping, contributing, sequence, approved_patches" << std::endl;
+    overlap_source != "contributing" && overlap_source != "approved_patches" &&
+    overlap_source != "duplicate_check") {
+        std::cerr << "Error: Invalid overlap source. Must be one of: overlapping, contributing, sequence, approved_patches, duplicate_check" << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -798,7 +1012,7 @@ int main(int argc, char* argv[]) {
 
     try {
         SegmentRenderer renderer(volpkg_path, volume_id);
-        renderer.render(segment_id, output_path, overlap_source, opacity);
+        renderer.render(segment_id, output_path, overlap_source, opacity, patch_filter);
         return EXIT_SUCCESS;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
