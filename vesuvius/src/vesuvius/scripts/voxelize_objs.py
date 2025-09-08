@@ -19,6 +19,7 @@ default_workers = max(1, multiprocessing.cpu_count() // 2)
 # intersections of triangles with the z-plane.
 MAX_INTERSECTIONS = 3  # Maximum number of intersections per triangle
 
+
 @jit(nopython=True)
 def get_intersection_point_2d(start, end, z_plane):
     """
@@ -48,6 +49,7 @@ def get_intersection_point_2d(start, end, z_plane):
     x = start[0] + t * (end[0] - start[0])
     y = start[1] + t * (end[1] - start[1])
     return np.array([x, y], dtype=np.float32)
+
 
 @jit(nopython=True)
 def rasterize_line_label(x0, y0, x1, y1, w, h, label_img, mesh_label):
@@ -79,6 +81,7 @@ def rasterize_line_label(x0, y0, x1, y1, w, h, label_img, mesh_label):
             label_img[iy, ix] = mesh_label
         x_f += x_inc
         y_f += y_inc
+
 
 @jit(nopython=True)
 def process_slice_points_label(vertices, triangles, mesh_labels, zslice, w, h):
@@ -129,6 +132,7 @@ def process_slice_points_label(vertices, triangles, mesh_labels, zslice, w, h):
 
     return label_img
 
+
 def process_mesh(mesh_path, mesh_index):
     """
     Load a mesh from disk, return (vertices, triangles, labels_for_those_triangles).
@@ -147,6 +151,7 @@ def process_mesh(mesh_path, mesh_index):
 
     return vertices, triangles, labels
 
+
 def process_slice(args):
     """
     Process a single z-slice, writing out a label TIF if non-empty.
@@ -162,13 +167,17 @@ def process_slice(args):
 
     return zslice
 
+
 def main():
     # Parse command-line arguments.
     parser = argparse.ArgumentParser(
         description="Process OBJ meshes and slice them along z to produce label images."
     )
-    parser.add_argument("folder", help="Path to folder containing OBJ meshes (or parent folder with subfolders of OBJ meshes)")
-    parser.add_argument("--scroll", required=True, choices=["scroll1", "scroll2", "scroll3", "scroll4", "scroll5"],
+    parser.add_argument("folder",
+                        help="Path to folder containing OBJ meshes (or parent folder with subfolders of OBJ meshes)")
+    parser.add_argument("--scroll", required=True,
+                        choices=["scroll1", "scroll2", "scroll3", "scroll4", "scroll5", "0500p2", "0139",
+                                 "343p_2um_116", "343p_9um"],
                         help="Scroll shape to use (determines image dimensions)")
     parser.add_argument("--output_path", default="mesh_labels_slices",
                         help="Output folder for label images (default: mesh_labels_slices)")
@@ -189,11 +198,14 @@ def main():
 
     # Set the image dimensions based on the specified scroll.
     scroll_shapes = {
-        "scroll1": (7888, 8096),   # (h, w) for scroll1
-        "scroll2": (10112, 11984), # (h, w) for scroll2
-        "scroll3": (3550, 3400),   # (h, w) for scroll3
-        "scroll4": (3440, 3340),   # (h, w) for scroll4
-        "scroll5": (6700, 9100)    # (h, w) for scroll5
+        "scroll1": (7888, 8096),  # (h, w) for scroll1
+        "scroll2": (10112, 11984),  # (h, w) for scroll2
+        "scroll3": (3550, 3400),  # (h, w) for scroll3
+        "scroll4": (3440, 3340),  # (h, w) for scroll4
+        "scroll5": (6700, 9100),  # (h, w) for scroll5
+        "0500p2": (4712, 4712),
+        "343p_2um_116": (13155, 13155),
+        "343p_9um": (5057, 5057)
     }
     if args.scroll not in scroll_shapes:
         print("Invalid scroll shape specified.")
@@ -216,17 +228,17 @@ def main():
     else:
         # First try direct OBJ files
         mesh_paths = glob(os.path.join(folder_path, '*.obj'))
-        
+
         if not mesh_paths:
             # No OBJ files found directly, try subfolders
             mesh_paths = glob(os.path.join(folder_path, '*', '*.obj'))
             if mesh_paths:
                 print(f"No OBJ files found in {folder_path}, searching in subfolders...")
-        
+
     if not mesh_paths:
         print(f"ERROR: No OBJ files found in {folder_path} or its subfolders")
         sys.exit(1)
-        
+
     print(f"Found {len(mesh_paths)} meshes to process")
 
     # Read all meshes in parallel.
@@ -265,6 +277,7 @@ def main():
     with ProcessPoolExecutor(max_workers=N_PROCESSES) as executor:
         for _ in tqdm(executor.map(process_slice, slice_args), total=len(slice_args), desc="Slices processed"):
             pass
+
 
 if __name__ == "__main__":
     main()
