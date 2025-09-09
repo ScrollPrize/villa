@@ -34,7 +34,9 @@ class TrainFineTuneMAEUNet(BaseTrainer):
         # Internal flag to avoid re-freezing every call
         self._encoder_frozen = False
 
-    # --- scheduler with optional warmup --- #
+        mgr.enable_deep_supervision = False
+
+        # --- scheduler with optional warmup --- #
     def _get_scheduler(self, optimizer):
         # If user explicitly configured a scheduler via config/CLI, defer to BaseTrainer
         user_specified = hasattr(self.mgr, 'scheduler') and self.mgr.scheduler is not None
@@ -148,9 +150,42 @@ class TrainFineTuneMAEUNet(BaseTrainer):
             print(f"Warning: Failed to load pretrained checkpoint: {e}")
             return state
 
-        if 'model' not in loaded:
-            print("Warning: Pretrained checkpoint missing 'model' state_dict; skipping.")
+        # Resolve model state dict from common layouts
+        model_state = None
+        if isinstance(loaded, dict):
+            if 'model' in loaded and isinstance(loaded['model'], dict):
+                model_state = loaded['model']
+            elif 'state_dict' in loaded and isinstance(loaded['state_dict'], dict):
+                model_state = loaded['state_dict']
+            else:
+                # Heuristic: if all values are tensors, treat as state_dict directly
+                try:
+                    if all(hasattr(v, 'shape') for v in loaded.values()):
+                        model_state = loaded
+                except Exception:
+                    pass
+        elif hasattr(loaded, 'keys'):
+            model_state = loaded
+
+        if model_state is None:
+            print("Warning: Pretrained checkpoint does not contain a recognizable state_dict; skipping.")
             return state
+
+        # Strip common wrapper prefixes (DDP 'module.', torch.compile '._orig_mod.')
+        def _strip_prefixes(sd):
+            prefixes = ('module.', '_orig_mod.')
+            def strip_key(k: str) -> str:
+                changed = True
+                while changed:
+                    changed = False
+                    for p in prefixes:
+                        if k.startswith(p):
+                            k = k[len(p):]
+                            changed = True
+                return k
+            return {strip_key(k): v for k, v in sd.items()}
+
+        pre_sd = _strip_prefixes(model_state)
 
         model = state['model']
         mod = model
@@ -158,7 +193,6 @@ class TrainFineTuneMAEUNet(BaseTrainer):
             mod = mod._orig_mod
 
         model_sd = mod.state_dict()
-        pre_sd = loaded['model']
 
         load_keys = []
         skipped_shape = []
@@ -184,14 +218,43 @@ class TrainFineTuneMAEUNet(BaseTrainer):
                 # Unknown or unsupported key for finetuning
                 pass
 
+        # If nothing loaded, try relaxed key remapping:
+        #  - remove leading 'module.' once more (in case upstream mapping failed)
+        #  - map 'encoder.'/'decoder.' to 'shared_encoder.'/'shared_decoder.'
+        if len(load_keys) == 0:
+            alt_loaded = []
+            for k, v in list(pre_sd.items()):
+                new_k = None
+                if k.startswith('module.'):
+                    k = k[len('module.') :]
+                if k.startswith('encoder.'):
+                    new_k = 'shared_encoder.' + k[len('encoder.') :]
+                elif self.load_decoder_from_pretrain and k.startswith('decoder.'):
+                    new_k = 'shared_decoder.' + k[len('decoder.') :]
+                if new_k is not None and new_k in model_sd and model_sd[new_k].shape == v.shape:
+                    model_sd[new_k] = v
+                    alt_loaded.append(new_k)
+            if alt_loaded:
+                load_keys.extend(alt_loaded)
+
         missing_before = [k for k in mod.state_dict().keys() if k not in model_sd]
         mod.load_state_dict(model_sd, strict=False)
 
-        print(f"Loaded {len(load_keys)} layers from MAE checkpoint into current model.")
+        if len(load_keys) == 0:
+            # Help debug by showing a few keys
+            try:
+                ch_keys = list(pre_sd.keys())
+                tg_keys = list(model_sd.keys())
+                print("Loaded 0 layers from MAE checkpoint. Key mismatch likely. Samples:")
+                print(f"  ckpt key sample: {ch_keys[:3]} ... {ch_keys[-3:]}")
+                print(f"  model key sample: {tg_keys[:3]} ... {tg_keys[-3:]}")
+            except Exception:
+                pass
+        else:
+            print(f"Loaded {len(load_keys)} layers from MAE checkpoint into current model.")
         if skipped_head:
             print(f"Skipped {len(skipped_head)} head/decoder params from pretrain (by design).")
         if skipped_shape:
             print(f"Skipped {len(skipped_shape)} params due to shape mismatch.")
 
         return state
-
