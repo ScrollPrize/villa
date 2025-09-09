@@ -40,7 +40,7 @@ def minmax_scale_to_8bit(arr_np):
     # Ensure float32 for computation
     if arr_np.dtype != np.float32 and arr_np.dtype != np.float64:
         arr_np = arr_np.astype(np.float32)
-    
+
     min_val = arr_np.min()
     max_val = arr_np.max()
     if max_val > min_val:
@@ -57,14 +57,14 @@ def add_text_label(img, text):
         img = img.astype(np.uint8)
     if not img.flags['C_CONTIGUOUS']:
         img = np.ascontiguousarray(img)
-    
+
     h, w = img.shape[:2]
     label_height = 30
-    
+
     # Create labeled image
     labeled_img = np.zeros((h + label_height, w, 3), dtype=np.uint8)
     labeled_img[label_height:, :, :] = img
-    
+
     # Use PIL for text rendering to avoid OpenCV segfaults
     pil_img = Image.fromarray(labeled_img)
     draw = ImageDraw.Draw(pil_img)
@@ -78,60 +78,104 @@ def convert_slice_to_bgr(slice_2d_or_3d):
         # Single channel - convert to BGR
         ch_8u = minmax_scale_to_8bit(slice_2d_or_3d)
         return cv2.cvtColor(ch_8u, cv2.COLOR_GRAY2BGR)
-    
+
     elif slice_2d_or_3d.ndim == 3:
         if slice_2d_or_3d.shape[0] == 1:
             # Single channel with channel dimension
             ch_8u = minmax_scale_to_8bit(slice_2d_or_3d[0])
             return cv2.cvtColor(ch_8u, cv2.COLOR_GRAY2BGR)
-        
+
         elif slice_2d_or_3d.shape[0] == 3:
             # RGB or normal map - just transpose and scale
             rgb = np.transpose(slice_2d_or_3d, (1, 2, 0))
             return minmax_scale_to_8bit(rgb)
-        
+
         elif slice_2d_or_3d.shape[0] == 2:
             # Binary segmentation - use foreground channel (channel 1)
             ch_8u = minmax_scale_to_8bit(slice_2d_or_3d[1])
             return cv2.cvtColor(ch_8u, cv2.COLOR_GRAY2BGR)
-        
+
         else:
             # Multi-channel - just use first channel
             ch_8u = minmax_scale_to_8bit(slice_2d_or_3d[0])
             return cv2.cvtColor(ch_8u, cv2.COLOR_GRAY2BGR)
-    
+
     else:
         raise ValueError(f"Expected 2D or 3D array, got shape {slice_2d_or_3d.shape}")
 
 
+def convert_inplane_dir_to_bgr(vec_slice, ignore_index=None):
+    """Convert an in-plane direction field slice to a color wheel RGB/BGR visualization.
+
+    Expects a slice shaped (2,H,W) or (3,H,W). For 3 channels, uses the first two (x,y)
+    components for the color mapping. Background (where any component equals ignore_index)
+    will be rendered as black.
+    """
+    # Ensure float32 ndarray
+    if not isinstance(vec_slice, np.ndarray):
+        vec_slice = np.asarray(vec_slice)
+    if vec_slice.dtype != np.float32 and vec_slice.dtype != np.float64:
+        vec_slice = vec_slice.astype(np.float32)
+
+    if vec_slice.ndim != 3 or vec_slice.shape[0] not in (2, 3):
+        # Fallback to generic conversion
+        return convert_slice_to_bgr(vec_slice)
+
+    vx = vec_slice[0]
+    vy = vec_slice[1]
+
+    # Mask handling (ignore_index marks background)
+    if ignore_index is not None:
+        bg_mask = (vec_slice[0] == ignore_index) | (vec_slice[1] == ignore_index)
+    else:
+        bg_mask = np.zeros_like(vx, dtype=bool)
+
+    # Compute angle and map to HSV color wheel
+    angle = np.arctan2(vy, vx)  # [-pi, pi]
+    hue = (angle + np.pi) / (2 * np.pi)  # [0, 1]
+
+    # OpenCV uses H in [0,179] for 8-bit HSV
+    H = (hue * 179.0).astype(np.uint8)
+    S = np.full_like(H, fill_value=255, dtype=np.uint8)
+    V = np.full_like(H, fill_value=255, dtype=np.uint8)
+
+    # Apply background mask: set value to 0 (black)
+    if bg_mask.any():
+        V[bg_mask] = 0
+
+    hsv = np.stack([H, S, V], axis=-1)  # (H, W, 3)
+    bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    return bgr
+
+
 def save_debug(
-    input_volume: torch.Tensor,          # shape [1, C, Z, H, W] for 3D or [1, C, H, W] for 2D
-    targets_dict: dict,                 # e.g. {"sheet": tensor([1, Z, H, W]), "normals": tensor([3, Z, H, W])}
-    outputs_dict: dict,                 # same shape structure
-    tasks_dict: dict,                   # e.g. {"sheet": {"activation":"sigmoid"}, "normals": {"activation":"none"}}
-    epoch: int,
-    save_path: str = "debug.gif",       # Will be modified to PNG for 2D data
-    show_normal_magnitude: bool = True, # We'll set this to False below to avoid extra sub-panels
-    fps: int = 5,
-    train_input: torch.Tensor = None,   # Optional train sample input
-    train_targets_dict: dict = None,    # Optional train sample targets
-    train_outputs_dict: dict = None,    # Optional train sample outputs
-    skeleton_dict: dict = None,         # Optional skeleton data for visualization
-    train_skeleton_dict: dict = None,   # Optional train skeleton data
-    apply_activation: bool = True       # Whether to apply activation functions
+        input_volume: torch.Tensor,  # shape [1, C, Z, H, W] for 3D or [1, C, H, W] for 2D
+        targets_dict: dict,  # e.g. {"sheet": tensor([1, Z, H, W]), "normals": tensor([3, Z, H, W])}
+        outputs_dict: dict,  # same shape structure
+        tasks_dict: dict,  # e.g. {"sheet": {"activation":"sigmoid"}, "normals": {"activation":"none"}}
+        epoch: int,
+        save_path: str = "debug.gif",  # Will be modified to PNG for 2D data
+        show_normal_magnitude: bool = True,  # We'll set this to False below to avoid extra sub-panels
+        fps: int = 5,
+        train_input: torch.Tensor = None,  # Optional train sample input
+        train_targets_dict: dict = None,  # Optional train sample targets
+        train_outputs_dict: dict = None,  # Optional train sample outputs
+        skeleton_dict: dict = None,  # Optional skeleton data for visualization
+        train_skeleton_dict: dict = None,  # Optional train skeleton data
+        apply_activation: bool = True  # Whether to apply activation functions
 ):
     """Save debug visualization as GIF (3D) or PNG (2D)"""
-    
+
     # Get input array
     # Convert BFloat16 to Float32 before numpy conversion
     if input_volume.dtype == torch.bfloat16:
         input_volume = input_volume.float()
     inp_np = input_volume.cpu().numpy()[0]  # Remove batch dim
     is_2d = len(inp_np.shape) == 3  # [C, H, W] format for 2D data
-    
+
     if is_2d:
         save_path = save_path.replace('.gif', '.png')
-    
+
     # Remove channel dim if single channel
     if inp_np.shape[0] == 1:
         inp_np = inp_np[0]
@@ -158,28 +202,25 @@ def save_debug(
         # Remove batch dimension if present
         if arr_np.ndim > (3 if is_2d else 4):
             arr_np = arr_np[0]
-        
-        # Apply activation based on number of channels
-        if not apply_activation:
-            # No activation requested
-            pass
-        elif arr_np.shape[0] == 1:
-            # Single channel - apply sigmoid
-            arr_np = torch.sigmoid(torch.from_numpy(arr_np)).numpy()
-        elif arr_np.shape[0] == 2:
-            # Two channels - apply softmax
-            arr_np = torch.softmax(torch.from_numpy(arr_np), dim=0).numpy()
-        elif arr_np.shape[0] > 2:
-            # More than 2 channels - apply argmax
-            arr_np = torch.argmax(torch.from_numpy(arr_np), dim=0).numpy()
-        
+
+        # Apply activation unless task is a regression-style vector field
+        is_inplane_dir = bool(tasks_dict and t_name in tasks_dict and str(
+            tasks_dict[t_name].get("task_type", "")).lower() == "inplane_direction")
+        if apply_activation and not is_inplane_dir:
+            if arr_np.shape[0] == 1:
+                arr_np = torch.sigmoid(torch.from_numpy(arr_np)).numpy()
+            elif arr_np.shape[0] == 2:
+                arr_np = torch.softmax(torch.from_numpy(arr_np), dim=0).numpy()
+            elif arr_np.shape[0] > 2:
+                arr_np = torch.argmax(torch.from_numpy(arr_np), dim=0).numpy()
+
         preds_np[t_name] = arr_np
 
     # Process train data if provided
     train_inp_np = None
     train_targets_np = {}
     train_preds_np = {}
-    
+
     if train_input is not None and train_targets_dict is not None and train_outputs_dict is not None:
         # Convert BFloat16 to Float32 before numpy conversion
         if train_input.dtype == torch.bfloat16:
@@ -208,69 +249,90 @@ def save_debug(
             # Remove batch dimension if present
             if arr_np.ndim > (3 if is_2d else 4):
                 arr_np = arr_np[0]
-            
-            # Apply activation based on number of channels
-            if not apply_activation:
-                # No activation requested
-                pass
-            elif arr_np.shape[0] == 1:
-                # Single channel - apply sigmoid
-                arr_np = torch.sigmoid(torch.from_numpy(arr_np)).numpy()
-            elif arr_np.shape[0] == 2:
-                # Two channels - apply softmax
-                arr_np = torch.softmax(torch.from_numpy(arr_np), dim=0).numpy()
-            elif arr_np.shape[0] > 2:
-                # More than 2 channels - apply argmax
-                arr_np = torch.argmax(torch.from_numpy(arr_np), dim=0).numpy()
-            
+
+            # Apply activation unless task is a regression-style vector field
+            is_inplane_dir = bool(tasks_dict and t_name in tasks_dict and str(
+                tasks_dict[t_name].get("task_type", "")).lower() == "inplane_direction")
+            if apply_activation and not is_inplane_dir:
+                if arr_np.shape[0] == 1:
+                    arr_np = torch.sigmoid(torch.from_numpy(arr_np)).numpy()
+                elif arr_np.shape[0] == 2:
+                    arr_np = torch.softmax(torch.from_numpy(arr_np), dim=0).numpy()
+                elif arr_np.shape[0] > 2:
+                    arr_np = torch.argmax(torch.from_numpy(arr_np), dim=0).numpy()
+
             train_preds_np[t_name] = arr_np
 
     # Create visualization
     # Get actual prediction tasks (not skeleton data)
     pred_task_names = sorted(list(preds_np.keys()))
-    
+
     if is_2d:
         # Build image grid for 2D
         rows = []
-        
+
         # Val row: input, targets (including skels), preds
         val_imgs = [add_text_label(convert_slice_to_bgr(inp_np), "Val Input")]
-        
+
         # Show all targets (including skeleton data)
         for t_name in sorted(targets_np.keys()):
             gt = targets_np[t_name]
             gt_slice = gt[0] if gt.shape[0] == 1 else gt
             label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
-            val_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice), label))
-        
+            if tasks_dict and t_name in tasks_dict and str(
+                    tasks_dict[t_name].get("task_type", "")).lower() == "inplane_direction":
+                ig_idx = tasks_dict[t_name].get("ignore_index", -100)
+                img_bgr = convert_inplane_dir_to_bgr(gt_slice, ignore_index=ig_idx)
+            else:
+                img_bgr = convert_slice_to_bgr(gt_slice)
+            val_imgs.append(add_text_label(img_bgr, label))
+
         # Show predictions (only for actual model outputs)
         for t_name in pred_task_names:
             pred = preds_np[t_name]
             pred_slice = pred[0] if pred.ndim == 3 and pred.shape[0] == 1 else pred
-            val_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice), f"Pred {t_name}"))
-        
+            if tasks_dict and t_name in tasks_dict and str(
+                    tasks_dict[t_name].get("task_type", "")).lower() == "inplane_direction":
+                ig_idx = tasks_dict[t_name].get("ignore_index", -100)
+                img_bgr = convert_inplane_dir_to_bgr(pred_slice, ignore_index=ig_idx)
+            else:
+                img_bgr = convert_slice_to_bgr(pred_slice)
+            val_imgs.append(add_text_label(img_bgr, f"Pred {t_name}"))
+
         rows.append(np.hstack(val_imgs))
-        
+
         # Train row if available
         if train_inp_np is not None:
             train_imgs = [add_text_label(convert_slice_to_bgr(train_inp_np), "Train Input")]
-            
+
             # Show all train targets (including skeleton data)
             for t_name in sorted(train_targets_np.keys()):
                 gt = train_targets_np[t_name]
                 gt_slice = gt[0] if gt.shape[0] == 1 else gt
                 label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
-                train_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice), label))
-            
+                if tasks_dict and t_name in tasks_dict and str(
+                        tasks_dict[t_name].get("task_type", "")).lower() == "inplane_direction":
+                    ig_idx = tasks_dict[t_name].get("ignore_index", -100)
+                    img_bgr = convert_inplane_dir_to_bgr(gt_slice, ignore_index=ig_idx)
+                else:
+                    img_bgr = convert_slice_to_bgr(gt_slice)
+                train_imgs.append(add_text_label(img_bgr, label))
+
             # Show train predictions (only for actual model outputs)
             for t_name in pred_task_names:
                 if t_name in train_preds_np:
                     pred = train_preds_np[t_name]
                     pred_slice = pred[0] if pred.ndim == 3 and pred.shape[0] == 1 else pred
-                    train_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice), f"Pred {t_name}"))
-            
+                    if tasks_dict and t_name in tasks_dict and str(
+                            tasks_dict[t_name].get("task_type", "")).lower() == "inplane_direction":
+                        ig_idx = tasks_dict[t_name].get("ignore_index", -100)
+                        img_bgr = convert_inplane_dir_to_bgr(pred_slice, ignore_index=ig_idx)
+                    else:
+                        img_bgr = convert_slice_to_bgr(pred_slice)
+                    train_imgs.append(add_text_label(img_bgr, f"Pred {t_name}"))
+
             rows.append(np.hstack(train_imgs))
-        
+
         # Stack rows and save
         final_img = np.vstack(rows)
         out_dir = Path(save_path).parent
@@ -278,7 +340,7 @@ def save_debug(
         print(f"[Epoch {epoch}] Saving PNG to: {save_path}")
         # Use PIL for saving
         Image.fromarray(final_img).save(save_path)
-        
+
     else:
         # Build frames for 3D GIF
         frames = []
@@ -286,13 +348,13 @@ def save_debug(
 
         for z_idx in range(z_dim):
             rows = []
-            
+
             # Get slices
             inp_slice = inp_np[z_idx] if inp_np.ndim == 3 else inp_np[:, z_idx, :, :]
-            
+
             # Val row
             val_imgs = [add_text_label(convert_slice_to_bgr(inp_slice), "Val Input")]
-            
+
             # Show all targets (including skeleton data)
             for t_name in sorted(targets_np.keys()):
                 gt = targets_np[t_name]
@@ -301,8 +363,14 @@ def save_debug(
                 else:
                     gt_slice = gt[:, z_idx, :, :]
                 label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
-                val_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice), label))
-            
+                if tasks_dict and t_name in tasks_dict and str(
+                        tasks_dict[t_name].get("task_type", "")).lower() == "inplane_direction":
+                    ig_idx = tasks_dict[t_name].get("ignore_index", -100)
+                    img_bgr = convert_inplane_dir_to_bgr(gt_slice, ignore_index=ig_idx)
+                else:
+                    img_bgr = convert_slice_to_bgr(gt_slice)
+                val_imgs.append(add_text_label(img_bgr, label))
+
             # Show predictions (only for actual model outputs)
             for t_name in pred_task_names:
                 pred = preds_np[t_name]
@@ -313,15 +381,21 @@ def save_debug(
                         pred_slice = pred[:, z_idx, :, :]
                 else:
                     pred_slice = pred[z_idx, :, :]
-                val_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice), f"Pred {t_name}"))
-            
+                if tasks_dict and t_name in tasks_dict and str(
+                        tasks_dict[t_name].get("task_type", "")).lower() == "inplane_direction":
+                    ig_idx = tasks_dict[t_name].get("ignore_index", -100)
+                    img_bgr = convert_inplane_dir_to_bgr(pred_slice, ignore_index=ig_idx)
+                else:
+                    img_bgr = convert_slice_to_bgr(pred_slice)
+                val_imgs.append(add_text_label(img_bgr, f"Pred {t_name}"))
+
             rows.append(np.hstack(val_imgs))
-            
+
             # Train row if available
             if train_inp_np is not None:
                 train_slice = train_inp_np[z_idx] if train_inp_np.ndim == 3 else train_inp_np[:, z_idx, :, :]
                 train_imgs = [add_text_label(convert_slice_to_bgr(train_slice), "Train Input")]
-                
+
                 # Show all train targets (including skeleton data)
                 for t_name in sorted(train_targets_np.keys()):
                     gt = train_targets_np[t_name]
@@ -330,8 +404,14 @@ def save_debug(
                     else:
                         gt_slice = gt[:, z_idx, :, :]
                     label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
-                    train_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice), label))
-                
+                    if tasks_dict and t_name in tasks_dict and str(
+                            tasks_dict[t_name].get("task_type", "")).lower() == "inplane_direction":
+                        ig_idx = tasks_dict[t_name].get("ignore_index", -100)
+                        img_bgr = convert_inplane_dir_to_bgr(gt_slice, ignore_index=ig_idx)
+                    else:
+                        img_bgr = convert_slice_to_bgr(gt_slice)
+                    train_imgs.append(add_text_label(img_bgr, label))
+
                 # Show train predictions (only for actual model outputs)
                 for t_name in pred_task_names:
                     if t_name in train_preds_np:
@@ -343,16 +423,22 @@ def save_debug(
                                 pred_slice = pred[:, z_idx, :, :]
                         else:
                             pred_slice = pred[z_idx, :, :]
-                        train_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice), f"Pred {t_name}"))
-                
+                        if tasks_dict and t_name in tasks_dict and str(
+                                tasks_dict[t_name].get("task_type", "")).lower() == "inplane_direction":
+                            ig_idx = tasks_dict[t_name].get("ignore_index", -100)
+                            img_bgr = convert_inplane_dir_to_bgr(pred_slice, ignore_index=ig_idx)
+                        else:
+                            img_bgr = convert_slice_to_bgr(pred_slice)
+                        train_imgs.append(add_text_label(img_bgr, f"Pred {t_name}"))
+
                 rows.append(np.hstack(train_imgs))
-            
+
             # Stack rows for this frame
             frame = np.vstack(rows)
             # Ensure frame is uint8 and contiguous
             frame = np.ascontiguousarray(frame, dtype=np.uint8)
             frames.append(frame)
-        
+
         # Save GIF in a subprocess to avoid crashing main training process on encoder segfaults
         out_dir = Path(save_path).parent
         out_dir.mkdir(parents=True, exist_ok=True)
