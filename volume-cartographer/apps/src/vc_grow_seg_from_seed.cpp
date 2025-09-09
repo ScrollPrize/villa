@@ -100,8 +100,18 @@ static auto load_direction_fields(json const&params, ChunkCache *chunk_cache, st
                 direction_dss.push_back(z5::filesystem::openDataset(dirs_ds_handle));
             }
             std::cout << "direction field dataset shape " << direction_dss.front()->shape() << std::endl;
+            std::unique_ptr<z5::Dataset> maybe_weight_ds;
+            if (direction_field.contains("weight_zarr")) {
+                std::string const weight_zarr_path = direction_field["weight_zarr"];
+                z5::filesystem::handle::Group weight_group(weight_zarr_path);
+                z5::filesystem::handle::Dataset weight_ds_handle(weight_group, std::to_string(ome_scale), ".");
+                maybe_weight_ds = z5::filesystem::openDataset(weight_ds_handle);
+            }
             std::string const unique_id = std::to_string(std::hash<std::string>{}(dirs_group.path().string() + std::to_string(ome_scale)));
-            direction_fields.emplace_back(direction, std::make_unique<Chunked3dVec3fFromUint8>(std::move(direction_dss), scale_factor, chunk_cache, cache_root, unique_id));
+            direction_fields.emplace_back(
+                direction,
+                std::make_unique<Chunked3dVec3fFromUint8>(std::move(direction_dss), scale_factor, chunk_cache, cache_root, unique_id),
+                maybe_weight_ds ? std::make_unique<Chunked3dFloatFromUint8>(std::move(maybe_weight_ds), scale_factor, chunk_cache, cache_root, unique_id + "_conf") : std::unique_ptr<Chunked3dFloatFromUint8>());
         }
     }
     return direction_fields;

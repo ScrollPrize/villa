@@ -393,7 +393,8 @@ struct SpaceLineLossAcc {
 };
 
 struct FiberDirectionLoss {
-    FiberDirectionLoss(Chunked3dVec3fFromUint8 &fiber_dirs, float w) : _fiber_dirs(fiber_dirs), _w(w) {};
+    FiberDirectionLoss(Chunked3dVec3fFromUint8 &fiber_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w) :
+        _fiber_dirs(fiber_dirs), _maybe_weights(maybe_weights), _w(w) {};
     template <typename E>
     bool operator()(const E* const l_base, const E* const l_u_off, E* residual) const {
 
@@ -417,7 +418,9 @@ struct FiberDirectionLoss {
         E const patch_u_dist = sqrt(patch_u_disp_zyx[0] * patch_u_disp_zyx[0] + patch_u_disp_zyx[1] * patch_u_disp_zyx[1] + patch_u_disp_zyx[2] * patch_u_disp_zyx[2]);
         E const abs_dot = abs(patch_u_disp_zyx[0] * fiber_dir_zyx[0] + patch_u_disp_zyx[1] * fiber_dir_zyx[1] + patch_u_disp_zyx[2] * fiber_dir_zyx[2]) / patch_u_dist;
 
-        residual[0] = E(_w) * (E(1) - abs_dot);
+        E const weight_at_point = _maybe_weights ? E((*_maybe_weights)(unjet(l_base[2]), unjet(l_base[1]), unjet(l_base[0]))) : E(1);
+
+        residual[0] = E(_w) * (E(1) - abs_dot) * weight_at_point;
 
         return true;
     }
@@ -427,15 +430,17 @@ struct FiberDirectionLoss {
 
     float _w;
     Chunked3dVec3fFromUint8 &_fiber_dirs;
+    Chunked3dFloatFromUint8 *_maybe_weights;
 
-    static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &fiber_dirs, float w = 1.0)
+    static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &fiber_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w = 1.0)
     {
-        return new ceres::AutoDiffCostFunction<FiberDirectionLoss, 1, 3, 3>(new FiberDirectionLoss(fiber_dirs, w));
+        return new ceres::AutoDiffCostFunction<FiberDirectionLoss, 1, 3, 3>(new FiberDirectionLoss(fiber_dirs, maybe_weights, w));
     }
 };
 
 struct NormalDirectionLoss {
-    NormalDirectionLoss(Chunked3dVec3fFromUint8 &normal_dirs, float w) : _normal_dirs(normal_dirs), _w(w) {};
+    NormalDirectionLoss(Chunked3dVec3fFromUint8 &normal_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w) :
+        _normal_dirs(normal_dirs), _maybe_weights(maybe_weights), _w(w) {};
     template <typename E>
     bool operator()(const E* const l_base, const E* const l_u_off, const E* const l_v_off, E* residual) const {
 
@@ -472,7 +477,9 @@ struct NormalDirectionLoss {
 
         E const abs_dot = abs(patch_normal_zyx[0] * target_normal_zyx[0] + patch_normal_zyx[1] * target_normal_zyx[1] + patch_normal_zyx[2] * target_normal_zyx[2]) / patch_normal_length;
 
-        residual[0] = E(_w) * (E(1) - abs_dot);
+        E const weight_at_point = _maybe_weights ? E((*_maybe_weights)(unjet(l_base[2]), unjet(l_base[1]), unjet(l_base[0]))) : E(1);
+
+        residual[0] = E(_w) * (E(1) - abs_dot) * weight_at_point;
 
         return true;
     }
@@ -482,9 +489,10 @@ struct NormalDirectionLoss {
 
     float _w;
     Chunked3dVec3fFromUint8 &_normal_dirs;
+    Chunked3dFloatFromUint8 *_maybe_weights;
 
-    static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &normal_dirs, float w = 1.0)
+    static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &normal_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w = 1.0)
     {
-        return new ceres::AutoDiffCostFunction<NormalDirectionLoss, 1, 3, 3, 3>(new NormalDirectionLoss(normal_dirs, w));
+        return new ceres::AutoDiffCostFunction<NormalDirectionLoss, 1, 3, 3, 3>(new NormalDirectionLoss(normal_dirs, maybe_weights, w));
     }
 };
