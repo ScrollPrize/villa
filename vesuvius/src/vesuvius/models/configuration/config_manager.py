@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from vesuvius.utils.utils import determine_dimensionality
 from vesuvius.models.training.auxiliary_tasks import create_auxiliary_task
+import os
 
 
 Image.MAX_IMAGE_PIXELS = None
@@ -104,6 +105,16 @@ class ConfigManager:
         # its a bit of a waste of computation when considering the downsampled zarr patches are quite fast to check
         self.skip_bounding_box = bool(self.dataset_config.get("skip_bounding_box", True))
         self.cache_valid_patches = bool(self.dataset_config.get("cache_valid_patches", True))
+
+        # Worker configuration for image→Zarr pipeline
+        # Parallel workers for initial image/Zarr checks
+        self.image_check_workers = int(self.dataset_config.get(
+            "image_check_workers", max(1, os.cpu_count() // 4)
+        ))
+        # Parallel workers for actual image→Zarr writes
+        self.image_to_zarr_workers = int(self.dataset_config.get(
+            "image_to_zarr_workers", max(1, os.cpu_count() // 4)
+        ))
         
         # this horrific name is so you can set specific loss functions for specific label volumes,
         # say for example one volume doesn't have the same labels as the others.

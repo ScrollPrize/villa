@@ -11,6 +11,63 @@ from vesuvius.utils.type_conversion import convert_to_uint8_dtype_range
 import cv2
 import tifffile
 
+def _read_image_shape_worker(image_path: Path):
+    try:
+        p = str(image_path).lower()
+        if p.endswith((".tif", ".tiff")):
+            img = tifffile.imread(str(image_path))
+            return tuple(img.shape), None
+        else:
+            img = cv2.imread(str(image_path))
+            return tuple(img.shape), None
+    except Exception as e:
+        return None, str(e)
+
+def check_image_update_worker(args):
+    """Check if a Zarr dataset needs update and read image shape.
+
+    Args:
+        args: tuple(image_path: Path, zarr_group_path: Path, array_name: str)
+
+    Returns:
+        (array_name, zarr_group_path, needs_update: bool, shape: tuple|None, error: str|None)
+    """
+    image_path, zarr_group_path, array_name = args
+    try:
+        # Read image shape
+        shape, err = _read_image_shape_worker(image_path)
+        if err is not None:
+            return array_name, zarr_group_path, False, None, f"shape_error: {err}"
+
+        # Open group and apply needs-update logic
+        group = zarr.open_group(str(zarr_group_path), mode='a')
+        if array_name not in group:
+            return array_name, zarr_group_path, True, shape, None
+
+        image_mtime = os.path.getmtime(image_path)
+        group_store_path = Path(group.store.path)
+
+        try:
+            completed = bool(group[array_name].attrs.get("completed", False))
+        except Exception:
+            completed = False
+        if not completed:
+            return array_name, zarr_group_path, True, shape, None
+
+        if group_store_path.exists():
+            attrs_path = group_store_path / array_name / ".zattrs"
+            meta_path = group_store_path / array_name / ".zarray"
+            if attrs_path.exists():
+                zarr_mtime = os.path.getmtime(attrs_path)
+                return array_name, zarr_group_path, image_mtime > zarr_mtime, shape, None
+            if meta_path.exists():
+                zarr_mtime = os.path.getmtime(meta_path)
+                return array_name, zarr_group_path, image_mtime > zarr_mtime, shape, None
+
+        return array_name, zarr_group_path, False, shape, None
+    except Exception as e:
+        return array_name, zarr_group_path, False, None, str(e)
+
 def convert_image_to_zarr_worker(args):
     """
     Worker function to convert a single image file to a Zarr array.
@@ -27,14 +84,18 @@ def convert_image_to_zarr_worker(args):
         group = zarr.open_group(str(zarr_group_path), mode='r+')
         
         if pre_created:
-            group[array_name][:] = img
+            # Fill pre-created dataset then mark as completed
+            arr = group[array_name]
+            arr[:] = img
+            # Set completion marker atomically at the end
+            arr.attrs["completed"] = True
         else:
             if len(img.shape) == 2:  # 2D
                 chunks = tuple(patch_size[:2])  # [h, w]
             else:  # 3D
                 chunks = tuple(patch_size)  # [d, h, w]
             
-            group.create_dataset(
+            arr = group.create_dataset(
                 array_name,
                 data=img,
                 shape=img.shape,
@@ -44,6 +105,8 @@ def convert_image_to_zarr_worker(args):
                 overwrite=True,
                 write_empty_chunks=False
             )
+            # Mark as completed since we wrote data during creation
+            arr.attrs["completed"] = True
         
         return array_name, img.shape, True, None
         
@@ -128,13 +191,29 @@ class ImageDataset(BaseDataset):
         image_mtime = os.path.getmtime(image_file)
         group_store_path = Path(zarr_group.store.path)
 
+        # If the dataset exists but is not marked completed, we should (re)process it
+        try:
+            completed = bool(zarr_group[array_name].attrs.get("completed", False))
+        except Exception:
+            completed = False
+
+        if not completed:
+            return True
+
+        # If completed, only update if the source image is newer than the last attrs write
         if group_store_path.exists():
-            array_meta_path = group_store_path / array_name / ".zarray"
-            if array_meta_path.exists():
-                zarr_mtime = os.path.getmtime(array_meta_path)
+            # Prefer .zattrs (updated when we set completed=True); fall back to .zarray
+            attrs_path = group_store_path / array_name / ".zattrs"
+            meta_path = group_store_path / array_name / ".zarray"
+            if attrs_path.exists():
+                zarr_mtime = os.path.getmtime(attrs_path)
+                return image_mtime > zarr_mtime
+            if meta_path.exists():
+                zarr_mtime = os.path.getmtime(meta_path)
                 return image_mtime > zarr_mtime
         
-        return True
+        # Default: no update needed if completed and no newer source
+        return False
     
     def _find_image_files(self, directory, extensions):
         """Find all image files with given extensions in a directory."""
@@ -227,13 +306,9 @@ class ImageDataset(BaseDataset):
                 image_array_name = image_id if not image_file.stem.endswith(f"_{target}") else f"{image_id}_{target}"
                 label_array_name = f"{image_id}_{target}"
 
-                if self._needs_update(image_file, images_group, image_array_name):
-                    shape = self._read_image_shape(image_file)
-                    conversion_tasks.append((image_file, self.data_path / "images.zarr", image_array_name, self.patch_size, shape))
-
-                if self._needs_update(label_file, labels_group, label_array_name):
-                    shape = self._read_image_shape(label_file)
-                    conversion_tasks.append((label_file, self.data_path / "labels.zarr", label_array_name, self.patch_size, shape))
+                # Defer update checks and shape reads to parallel workers
+                conversion_tasks.append((image_file, self.data_path / "images.zarr", image_array_name, self.patch_size, None))
+                conversion_tasks.append((label_file, self.data_path / "labels.zarr", label_array_name, self.patch_size, None))
 
                 files_to_process.append((target, image_id, image_array_name, label_array_name))
 
@@ -251,9 +326,8 @@ class ImageDataset(BaseDataset):
                 # For unlabeled data, we need to include all images regardless of naming pattern
                 image_array_name = stem
 
-                if self._needs_update(image_file, images_group, image_array_name):
-                    shape = self._read_image_shape(image_file)
-                    conversion_tasks.append((image_file, self.data_path / "images.zarr", image_array_name, self.patch_size, shape))
+                # Defer update checks and shape reads to parallel workers
+                conversion_tasks.append((image_file, self.data_path / "images.zarr", image_array_name, self.patch_size, None))
 
                 image_id = stem.split('_')[0] if '_' in stem else stem
                 # Add this unlabeled image for each configured target
@@ -261,37 +335,77 @@ class ImageDataset(BaseDataset):
                     files_to_process.append((target, image_id, image_array_name, None))
 
         if conversion_tasks:
-            print(f"\nConverting {len(conversion_tasks)} image files to Zarr format...")
-            print("Pre-creating Zarr arrays...")
+            # Deduplicate checks by (zarr_path, array_name)
+            check_map = {}
+            for file_path, zarr_path, array_name, patch_size, _ in conversion_tasks:
+                key = (str(zarr_path), array_name)
+                check_map[key] = (file_path, zarr_path, array_name, patch_size)
 
-            for file_path, zarr_path, array_name, patch_size, shape in conversion_tasks:
+            check_items = list(check_map.values())
+            print(f"\nChecking {len(check_items)} images/zarr entries in parallel...")
 
-                group = images_group if "images.zarr" in str(zarr_path) else labels_group
-                chunks = tuple(patch_size[:2]) if len(shape) == 2 else tuple(patch_size)
-
-                group.create_dataset(
-                    array_name,
-                    shape=shape,
-                    dtype=np.uint8,
-                    chunks=chunks,
-                    compressor=None,
-                    overwrite=True,
-                    write_empty_chunks=False
-                )
-
-            worker_tasks = [(f[0], f[1], f[2], f[3], True) for f in conversion_tasks]
-            
-            with ProcessPoolExecutor(max_workers=max(1, cpu_count() // 4)) as executor:
-                futures = {executor.submit(convert_image_to_zarr_worker, task): task for task in worker_tasks}
-                
-                with tqdm(total=len(futures), desc="Converting to Zarr") as pbar:
+            # Run parallel checks to determine needs_update and shapes
+            check_workers = getattr(self.mgr, 'image_check_workers', max(1, cpu_count() // 4))
+            results = []
+            with ProcessPoolExecutor(max_workers=max(1, int(check_workers))) as executor:
+                futures = {
+                    executor.submit(
+                        check_image_update_worker,
+                        (item[0], item[1], item[2])
+                    ): item for item in check_items
+                }
+                with tqdm(total=len(futures), desc="Checking images") as pbar:
                     for future in as_completed(futures):
-                        array_name, shape, success, error_msg = future.result()
-                        if not success:
-                            print(f"ERROR converting {array_name}: {error_msg}")
+                        array_name, zarr_group_path, needs_update, shape, error = future.result()
+                        results.append((array_name, zarr_group_path, needs_update, shape, error))
                         pbar.update(1)
-            
-            print("✓ Conversion complete!")
+
+            # Build final conversion list from results
+            conversion_tasks = []
+            for (file_path, zarr_path, array_name, patch_size) in check_items:
+                # find corresponding result
+                for rn, rz, needs_update, shape, error in results:
+                    if rn == array_name and str(rz) == str(zarr_path):
+                        if error:
+                            print(f"ERROR checking {array_name}: {error}")
+                        if needs_update and shape is not None:
+                            conversion_tasks.append((file_path, zarr_path, array_name, patch_size, shape))
+                        break
+
+            if conversion_tasks:
+                print(f"\nConverting {len(conversion_tasks)} image files to Zarr format...")
+                print("Pre-creating Zarr arrays...")
+
+                for file_path, zarr_path, array_name, patch_size, shape in conversion_tasks:
+                    group = images_group if "images.zarr" in str(zarr_path) else labels_group
+                    chunks = tuple(patch_size[:2]) if len(shape) == 2 else tuple(patch_size)
+
+                    arr = group.create_dataset(
+                        array_name,
+                        shape=shape,
+                        dtype=np.uint8,
+                        chunks=chunks,
+                        compressor=None,
+                        overwrite=True,
+                        write_empty_chunks=False
+                    )
+                    # Mark as not completed yet so resume can detect unfinished arrays
+                    arr.attrs["completed"] = False
+
+                worker_tasks = [(f[0], f[1], f[2], f[3], True) for f in conversion_tasks]
+
+                zarr_workers = getattr(self.mgr, 'image_to_zarr_workers', max(1, cpu_count() // 4))
+                with ProcessPoolExecutor(max_workers=max(1, int(zarr_workers))) as executor:
+                    futures = {executor.submit(convert_image_to_zarr_worker, task): task for task in worker_tasks}
+
+                    with tqdm(total=len(futures), desc="Converting to Zarr") as pbar:
+                        for future in as_completed(futures):
+                            array_name, shape, success, error_msg = future.result()
+                            if not success:
+                                print(f"ERROR converting {array_name}: {error_msg}")
+                            pbar.update(1)
+
+                print("✓ Conversion complete!")
 
         print("\nLoading Zarr arrays...")
         
