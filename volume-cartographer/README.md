@@ -1,11 +1,11 @@
-[![Volume Cartographer](docs/images/banner.svg)](https://github.com/educelab/volume-cartographer)
+![Volume Cartographer](docs/imgs/banner.svg)
 
 **Volume Cartographer** is a toolkit and set of cross-platform C++ libraries for
 virtually unwrapping volumetric datasets. It was designed to recover text from
 CT scans of ancient, badly damaged manuscripts, but can be applied in many
 volumetric analysis applications.
 
-This repository is a version of [EduceLab](https://educelab.engr.uky.edu/)'s Volume Cartographer.
+This repository (a.k.a. **"VC3D"**) is a version of [EduceLab](https://educelab.engr.uky.edu/)'s original.
 Via Vesuvius Challenge, it has gone through a few forks:
 [EduceLab](https://github.com/educelab/volume-cartographer) (original) ->
 [Julian Schilliger](https://github.com/schillij95/volume-cartographer-papyrus) (optical flow segmentation) ->

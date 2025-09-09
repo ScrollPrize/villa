@@ -15,7 +15,7 @@ auto main(int argc, char* argv[]) -> int
     cv::setNumThreads(std::thread::hardware_concurrency());
     
     QApplication app(argc, argv);
-    QApplication::setOrganizationName("EduceLab");
+    QApplication::setOrganizationName("Vesuvius Challenge");
     QApplication::setApplicationName("VC3D");
     QApplication::setWindowIcon(QIcon(":/images/logo.png"));
     QApplication::setApplicationVersion(QString::fromStdString(ProjectInfo::VersionString()));

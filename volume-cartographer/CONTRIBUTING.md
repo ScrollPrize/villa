@@ -1,13 +1,12 @@
 # Contributing to Volume Cartographer
 
-Volume Cartographer is maintained by [EduceLab](https://cs.uky.edu/dri) and 
-developed in collaboration with our community of contributors. We welcome bug 
+We welcome bug 
 reports, feature requests, and code contributions.
 
 ## Bug Reports and Feature Requests
 If you think you have found a bug or if you would like to request a new
 feature, please check our
-[issue tracker](https://github.com/educelab/volume-cartographer/issues) to make 
+[issue tracker](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3AVC3D) to make 
 sure an issue has not already been opened on your topic.
 
 ## Workflow
@@ -55,18 +54,6 @@ branch:
 git clang-format develop
 ```
 
-Unfortunately, `clang-format` does not handle all style issues. For a general
-overview of the EduceLab C++ style, please refer to our
-[C++ style guide](https://gitlab.com/educelab/style-guides/-/blob/master/C++%20Style%20Guide.md).
-
 ## License
 Any changes intentionally contributed to this repository are assumed to
 be licensed under the terms outlined in `LICENSE`.
-
-## Attribution
-This project actively maintains a
-[citable record on Zenodo](https://doi.org/10.5281/zenodo.4604881).
-We are happy to list our active community of contributors as authors on
-this record. After you have contributed 5 or more commits to this project,
-please open a new pull request which adds your name and ORCID to
-[.zenodo.json](.zenodo.json).
