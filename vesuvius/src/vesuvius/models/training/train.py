@@ -644,7 +644,20 @@ class BaseTrainer:
                 raise ValueError(f"Unsupported validation data format: {val_mgr.data_format}")
             print(f"Using {val_mgr.data_format} dataset format (validation from --val-dir)")
         else:
-            val_dataset = self._configure_dataset(is_training=False)
+            # Reuse same source for validation without re-running expensive image checks
+            from copy import deepcopy
+            val_mgr = deepcopy(self.mgr)
+            setattr(val_mgr, 'skip_image_checks', True)
+
+            data_format = getattr(self.mgr, 'data_format', 'zarr').lower()
+            if data_format == 'napari':
+                val_dataset = NapariDataset(mgr=val_mgr, is_training=False)
+            elif data_format == 'image':
+                val_dataset = ImageDataset(mgr=val_mgr, is_training=False)
+            elif data_format == 'zarr':
+                val_dataset = ZarrDataset(mgr=val_mgr, is_training=False)
+            else:
+                raise ValueError(f"Unsupported validation data format: {data_format}")
         
 
         self.mgr.auto_detect_channels(train_dataset)
@@ -987,9 +1000,10 @@ class BaseTrainer:
                        ckpt_dir, model_ckpt_dir, checkpoint_history, best_checkpoints,
                        avg_val_loss):
         """Handle end-of-epoch operations: checkpointing, cleanup, etc."""
+        # Use human-friendly 1-based epoch numbering in filenames
         ckpt_path = os.path.join(
             ckpt_dir,
-            f"{self.mgr.model_name}_epoch{epoch}.pth"
+            f"{self.mgr.model_name}_epoch{epoch + 1}.pth"
         )
 
         # unwrap DDP for saving if needed
@@ -1353,7 +1367,8 @@ class BaseTrainer:
                                         else:
                                             outputs_dict_first[t_name] = p_val[b_idx: b_idx + 1]
 
-                                    debug_img_path = f"{ckpt_dir}/{self.mgr.model_name}_debug_epoch{epoch}.gif"
+                                    # Use human-friendly 1-based epoch numbering in debug image filenames
+                                    debug_img_path = f"{ckpt_dir}/{self.mgr.model_name}_debug_epoch{epoch + 1}.gif"
                                     
                                     # handle skel data from skeleton-based losses
                                     skeleton_dict = None
@@ -1547,6 +1562,8 @@ def main():
                            help="Rebuild model from checkpoint's model_config before loading weights")
     grp_paths.add_argument("--intensity-properties-json", type=str, default=None,
                            help="nnU-Net style intensity properties JSON for CT normalization")
+    grp_paths.add_argument("--skip-image-checks", action="store_true",
+                           help="Skip expensive image/zarr existence checks and conversions; assumes images.zarr/labels.zarr already exist")
 
     # Data & Splits
     grp_data.add_argument("--batch-size", type=int,

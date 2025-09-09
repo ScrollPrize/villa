@@ -337,7 +337,8 @@ class ImageDataset(BaseDataset):
                 for target in configured_targets:
                     files_to_process.append((target, image_id, image_array_name, None))
 
-        if conversion_tasks:
+        skip_checks = bool(getattr(self.mgr, 'skip_image_checks', False))
+        if conversion_tasks and not skip_checks:
             # Determine if this process should perform the expensive checks/conversions
             ddp = dist.is_available() and dist.is_initialized()
             is_rank0 = (not ddp) or (dist.get_rank() == 0)
@@ -418,6 +419,8 @@ class ImageDataset(BaseDataset):
             # Synchronize all ranks so that conversions (if any) are complete
             if ddp:
                 dist.barrier()
+        elif skip_checks:
+            print("\nSkipping image/zarr existence checks and conversions (assumed ready)")
 
         print("\nLoading Zarr arrays...")
         

@@ -27,6 +27,14 @@ def update_config_from_args(mgr, args):
     mgr.ckpt_out_base = Path(args.output)
     mgr.tr_info["ckpt_out_base"] = str(mgr.ckpt_out_base)
 
+    # Skip image/zarr preflight checks if requested
+    if hasattr(args, 'skip_image_checks') and args.skip_image_checks:
+        mgr.skip_image_checks = True
+        if hasattr(mgr, 'dataset_config'):
+            mgr.dataset_config['skip_image_checks'] = True
+        if mgr.verbose:
+            print("Skipping image/zarr preflight checks as requested (--skip-image-checks)")
+
     if args.batch_size is not None:
         mgr.train_batch_size = args.batch_size
         mgr.tr_configs["batch_size"] = args.batch_size

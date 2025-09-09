@@ -125,9 +125,10 @@ def manage_checkpoint_history(checkpoint_history, best_checkpoints, epoch,
             print(f"Removed checkpoint: {ckpt_file}")
     
     print(f"\nCheckpoint management:")
-    print(f"  Last {max_recent} checkpoints: {[f'epoch{e}' for e, _ in checkpoint_history]}")
+    # Display 1-based epoch numbers for user-facing logs
+    print(f"  Last {max_recent} checkpoints: {[f'epoch{e+1}' for e, _ in checkpoint_history]}")
     if best_checkpoints:
-        print(f"  Best {max_best} checkpoints: {[f'epoch{e} (loss={l:.4f})' for l, e, _ in best_checkpoints[:max_best]]}")
+        print(f"  Best {max_best} checkpoints: {[f'epoch{e+1} (loss={l:.4f})' for l, e, _ in best_checkpoints[:max_best]]}")
     
     return checkpoint_history, best_checkpoints
 
