@@ -16,9 +16,9 @@ pip install -r requirements.txt
 
 ```bash
 python -i find_transform.py \
---fixed [REDACTED] \
+--fixed SCROLLS_HEL_4.681um_113keV_1.2m_binmean_2_PHerc_0500P2_HA_0001_masked.zarr/ \
 --fixed-voxel-size 9.362 \
---moving [REDACTED] \
+--moving PHerc500P2-0.5um_masked.zarr/ \
 --output-transform output_transform.json \
 --initial-transform initial_transform.json
 ```
