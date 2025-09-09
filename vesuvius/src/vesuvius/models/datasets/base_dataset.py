@@ -106,7 +106,24 @@ class BaseDataset(Dataset):
         else:
             ref_shape = ref_volume_data['data'].shape
 
-        self.is_2d_dataset = len(ref_shape) == 2 or (len(ref_shape) == 3 and ref_shape[0] <= 20)
+        # Allow explicit override from config to avoid misclassification.
+        force_2d = getattr(self.mgr, 'force_2d', False)
+        if not force_2d and hasattr(self.mgr, 'dataset_config'):
+            force_2d = bool(self.mgr.dataset_config.get('force_2d', False))
+        force_3d = getattr(self.mgr, 'force_3d', False)
+        if not force_3d and hasattr(self.mgr, 'dataset_config'):
+            force_3d = bool(self.mgr.dataset_config.get('force_3d', False))
+
+        if force_2d and force_3d:
+            raise ValueError("Both force_2d and force_3d are set; choose only one.")
+
+        if force_2d:
+            self.is_2d_dataset = True
+        elif force_3d:
+            self.is_2d_dataset = False
+        else:
+            # Only treat as 2D when the data truly has 2 dimensions
+            self.is_2d_dataset = (len(ref_shape) == 2)
         
         if self.is_2d_dataset:
             print("Detected 2D dataset")
@@ -277,7 +294,7 @@ class BaseDataset(Dataset):
                 for y in y_positions:
                     for x in x_positions:
                         positions.append({
-                            'start_pos': [0, y, x]  # [dummy_z, y, x] for 2D
+                            'start_pos': [y, x]  # 2D uses [y, x]
                         })
                         pbar.update(1)
                 
@@ -619,8 +636,8 @@ class BaseDataset(Dataset):
                     result[aux_name] = torch.from_numpy(aux_patch)
                     regression_keys.append(aux_name)
                 else:
-                    # Unknown auxiliary type; skip gracefully
-                    continue
+                    raise ValueError('Unknown auxiliary task type')
+
             if regression_keys:
                 result['regression_keys'] = regression_keys
         except Exception as e:
@@ -629,10 +646,6 @@ class BaseDataset(Dataset):
         return result
 
     def _create_training_transforms(self):
-        """
-        Create training transforms using custom batchgeneratorsv2.
-        Returns None for validation (no augmentations).
-        """
         no_spatial = getattr(self.mgr, 'no_spatial', False)
         only_spatial_and_intensity = getattr(self.mgr, 'only_spatial_and_intensity', False)
             
@@ -899,8 +912,7 @@ class BaseDataset(Dataset):
         """
         if not self._needs_skeleton_transform():
             return None
-            
-        # Import here to avoid circular dependencies
+
         from vesuvius.models.augmentation.transforms.utils.skeleton_transform import MedialSurfaceTransform
         
         transforms = []
@@ -928,10 +940,22 @@ class BaseDataset(Dataset):
         - Labels are 0 for background, >0 for foreground
         - Unlabeled patches will have all-zero label tensors
         """
+
+        if not self.valid_patches:
+            raise IndexError("Dataset contains no valid patches. Check data paths and patch generation settings.")
+        if index >= len(self.valid_patches) or index < -len(self.valid_patches):
+            # Allow optional wrap-around if explicitly enabled in config
+            wrap = bool(getattr(self.mgr, 'wrap_indices', False)) or \
+                   bool(getattr(self.mgr, 'wrap_dataset_indices', False)) or \
+                   (hasattr(self.mgr, 'dataset_config') and bool(self.mgr.dataset_config.get('wrap_indices', False)))
+            if wrap:
+                index = index % len(self.valid_patches)
+            else:
+                raise IndexError(f"Index {index} out of range for dataset of length {len(self.valid_patches)}")
         patch_info = self.valid_patches[index]
         data_dict = self._extract_patch(patch_info)
 
-        # Apply CPU-side transforms only if not deferring to on-device augmentation
+        # if we don't want to perform augmentation on gpu , we might as well do here with cpu in the dataloader workers
         if self.transforms is not None and not (self.is_training and getattr(self.mgr, 'augment_on_device', False)):
             data_dict = self.transforms(**data_dict)
 
