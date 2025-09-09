@@ -384,7 +384,7 @@ class BaseTrainer:
             #     task_metrics.append(CriticalComponentsMetric())
 
             task_metrics.append(IOUDiceMetric(num_classes=num_classes))
-            task_metrics.append(SkeletonBranchPointsMetric(num_classes=num_classes))
+            # task_metrics.append(SkeletonBranchPointsMetric(num_classes=num_classes))
             # task_metrics.append(HausdorffDistanceMetric(num_classes=num_classes))
             metrics[task_name] = task_metrics
         
@@ -419,8 +419,18 @@ class BaseTrainer:
     # --- dataloaders --- #
     def _configure_dataloaders(self, train_dataset, val_dataset=None):
 
-        # If no separate validation dataset provided, fall back to random split of train
-        if val_dataset is None or val_dataset is train_dataset:
+        # If no separate validation dataset provided, or both datasets point to the same source,
+        # fall back to a random split of the training dataset.
+        same_source = False
+        if val_dataset is not None:
+            try:
+                train_path = getattr(train_dataset, 'data_path', None)
+                val_path = getattr(val_dataset, 'data_path', None)
+                same_source = (train_path is not None and val_path is not None and train_path == val_path)
+            except Exception:
+                same_source = False
+
+        if val_dataset is None or val_dataset is train_dataset or same_source:
             dataset_size = len(train_dataset)
             indices = list(range(dataset_size))
 
@@ -434,6 +444,8 @@ class BaseTrainer:
             train_val_split = self.mgr.tr_val_split
             split = int(np.floor(train_val_split * dataset_size))
             train_indices, val_indices = indices[:split], indices[split:]
+            if same_source and self.mgr.verbose:
+                print("Validation dataset shares the same source as training; using random split")
         else:
             # Separate validation dataset provided. Use full validation set, and
             # exclude any training patches whose volume_name appears in validation.
@@ -478,19 +490,17 @@ class BaseTrainer:
         return train_dataloader, val_dataloader, train_indices, val_indices
 
     def _initialize_training(self):
-        # Check for S3 paths and set up multiprocessing if needed
         if detect_s3_paths(self.mgr):
             print("\nDetected S3 paths in configuration")
             setup_multiprocessing_for_s3()
 
         # the is_training flag forces the dataset to perform augmentations
         # we put augmentations in the dataset class so we can use the __getitem__ method
-        # for free multi processing of augmentations 
+        # for free multi processing of augmentations , alternatively you can perform on-device within the train loop
         train_dataset = self._configure_dataset(is_training=True)
         # Keep a handle to the training dataset for on-device augmentation
         self._train_dataset = train_dataset
 
-        # Build validation dataset; support separate directory via mgr.val_data_path
         if hasattr(self.mgr, 'val_data_path') and self.mgr.val_data_path is not None:
             from copy import deepcopy
             from vesuvius.models.utilities.data_format_utils import detect_data_format as _detect_df
@@ -519,15 +529,8 @@ class BaseTrainer:
         self.mgr.auto_detect_channels(train_dataset)
         model = self._build_model()
 
-        # Deep supervision setup (enable on decoders, compute scales & weights)
         self._ds_scales = None
         self._ds_weights = None
-        if getattr(self.mgr, 'enable_deep_supervision', False):
-            self._set_deep_supervision_enabled(model, True)
-            self._ds_scales = self._get_deep_supervision_scales(model)
-            if self._ds_scales is not None:
-                self._ds_weights = self._compute_ds_weights(len(self._ds_scales))
-
         optimizer = self._get_optimizer(model)
         loss_fns = self._build_loss()
         scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
@@ -535,9 +538,6 @@ class BaseTrainer:
 
         model.apply(InitWeights_He(neg_slope=0.2))
         model = model.to(self.device)
-
-        if self.device.type == 'cuda':
-            model = torch.compile(model)
 
         use_amp = not getattr(self.mgr, 'no_amp', False)
         
@@ -584,6 +584,23 @@ class BaseTrainer:
             if checkpoint_loaded and self.mgr.load_weights_only:
                 scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
 
+        ds_enabled = bool(getattr(self.mgr, 'enable_deep_supervision', False))
+        self._set_deep_supervision_enabled(model, ds_enabled)
+        if ds_enabled:
+            self._ds_scales = self._get_deep_supervision_scales(model)
+            if self._ds_scales is not None:
+                self._ds_weights = self._compute_ds_weights(len(self._ds_scales))
+        else:
+            self._ds_scales = None
+            self._ds_weights = None
+        loss_fns = self._build_loss()
+
+        if self.device.type == 'cuda':
+            try:
+                model = torch.compile(model)
+            except Exception as e:
+                print(f"torch.compile failed; continuing without compile. Reason: {e}")
+
         return {
             'model': model,
             'optimizer': optimizer,
@@ -610,14 +627,11 @@ class BaseTrainer:
             import json
             import os
             from datetime import datetime
-            
-            # Save train/val splits to local file instead of wandb config
+
             train_val_splits = save_train_val_filenames(self, train_dataset, val_dataset, train_indices, val_indices)
-            
-            # Use checkpoint directory if provided, otherwise use current directory
+
             save_dir = ckpt_dir if ckpt_dir else os.getcwd()
-            
-            # Create a filename with timestamp
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             splits_filename = f"train_val_splits_{self.mgr.model_name}_{timestamp}.json"
             splits_filepath = os.path.join(save_dir, splits_filename)
@@ -627,9 +641,8 @@ class BaseTrainer:
                 json.dump(train_val_splits, f, indent=2)
             print(f"Saved train/val splits to: {splits_filepath}")
             
-            # Create wandb config without the large train_val_splits data
+
             mgr_config = self.mgr.convert_to_dict()
-            # Add a reference to the local file instead of the actual data
             mgr_config['train_val_splits_file'] = splits_filepath
             mgr_config['train_patch_count'] = len(train_indices)
             mgr_config['val_patch_count'] = len(val_indices)
@@ -716,7 +729,6 @@ class BaseTrainer:
             if tfm is None:
                 data_for_forward = data_dict
             else:
-                # Move tensors to device
                 dd = {}
                 for k, v in data_dict.items():
                     dd[k] = v.to(self.device) if isinstance(v, torch.Tensor) else v
@@ -768,7 +780,6 @@ class BaseTrainer:
                 # this naming is extremely confusing, i know. we route all loss through the aux helper
                 # because it just simplifies adding addtl losses for aux tasks if present.
                 # TODO: rework this janky setup to make it more clear
-                # Get skeleton data if available
                 skeleton_data = targets_dict.get(f'{t_name}_skel', None)
                 # If DS is enabled and loss isn't wrapped (edge case), fall back to highest-res
                 pred_for_loss, gt_for_loss = t_pred, t_gt
@@ -825,10 +836,8 @@ class BaseTrainer:
             t_pred = outputs[t_name]
             task_loss_fns = loss_fns[t_name]  # List of (loss_fn, weight) tuples
 
-            # Initialize as tensor on same device/dtype to keep downstream ops consistent
             task_total_loss = torch.zeros((), device=t_pred.device, dtype=t_pred.dtype)
             for loss_fn, loss_weight in task_loss_fns:
-                # Get skeleton data if available
                 skeleton_data = targets_dict.get(f'{t_name}_skel', None)
                 # If DS is enabled and loss isn't wrapped (edge case), fall back to highest-res
                 pred_for_loss, gt_for_loss = t_pred, t_gt
@@ -1040,7 +1049,6 @@ class BaseTrainer:
                     # Find first sample with non-zero target, but capture even if all zeros
                     first_target_key = list(targets_dict.keys())[0]
                     first_target_any = targets_dict[first_target_key]
-                    # Handle deep supervision lists
                     first_target_tensor = first_target_any[0] if isinstance(first_target_any, (list, tuple)) else first_target_any
 
                     b_idx = 0
@@ -1051,22 +1059,18 @@ class BaseTrainer:
                             found_non_zero = True
                             break
 
-                    # Always capture training sample for debug gif, even if all zeros
                     if True:
                         train_sample_input = inputs[b_idx: b_idx + 1]
-                        # First collect all targets including skel (handle DS lists)
                         train_sample_targets_all = {}
                         for t_name, t_val in targets_dict.items():
                             if isinstance(t_val, (list, tuple)):
                                 train_sample_targets_all[t_name] = t_val[0][b_idx: b_idx + 1]
                             else:
                                 train_sample_targets_all[t_name] = t_val[b_idx: b_idx + 1]
-                        # Now create train_sample_targets without skel and is_unlabeled for save_debug
                         train_sample_targets = {}
                         for t_name, t_tensor in train_sample_targets_all.items():
                             if t_name not in ['skel', 'is_unlabeled']:
                                 train_sample_targets[t_name] = t_tensor
-                        # Collect outputs (handle DS lists)
                         train_sample_outputs = {}
                         for t_name, p_val in outputs.items():
                             if isinstance(p_val, (list, tuple)):
@@ -1083,7 +1087,6 @@ class BaseTrainer:
 
                 current_lr = optimizer.param_groups[0]['lr']
 
-                # Log metrics to wandb once per step
                 if self.mgr.wandb_project:
                     metrics = self._prepare_metrics_for_logging(
                         epoch=epoch,
@@ -1144,6 +1147,9 @@ class BaseTrainer:
                         )
 
                         for t_name, loss_value in task_losses.items():
+                            # Ensure we have a slot for dynamically introduced tasks (e.g., 'mae')
+                            if t_name not in val_losses:
+                                val_losses[t_name] = []
                             val_losses[t_name].append(loss_value)
                         
                         # Compute evaluation metrics for each task (handle deep supervision lists)
@@ -1155,7 +1161,8 @@ class BaseTrainer:
                                     pred_val = pred_val[0]
                                 if isinstance(gt_val, (list, tuple)):
                                     gt_val = gt_val[0]
-                                for metric in evaluation_metrics[t_name]:
+                                # If no metrics configured for this task (e.g., MAE), skip safely
+                                for metric in evaluation_metrics.get(t_name, []):
                                     if isinstance(metric, CriticalComponentsMetric) and i >= 10:
                                         continue
                                     metric.update(pred=pred_val, gt=gt_val)
@@ -1165,7 +1172,6 @@ class BaseTrainer:
                                 b_idx = 0
                                 found_non_zero = False
 
-                                # Check if the first sample is non-zero
                                 first_target_any = next(iter(targets_dict.values()))
                                 first_target = first_target_any[0] if isinstance(first_target_any, (list, tuple)) else first_target_any
                                 if torch.any(first_target[0] != 0):
@@ -1178,8 +1184,6 @@ class BaseTrainer:
                                             found_non_zero = True
                                             break
 
-                                # Always save debug gif, even if sample is all zeros
-                                # This ensures visualization works with limited labeled data
                                 if True:  # Was: if found_non_zero:
                                     # Slicing shape: [1, c, z, y, x ]
                                     inputs_first = inputs[b_idx: b_idx + 1]
@@ -1200,10 +1204,9 @@ class BaseTrainer:
 
                                     debug_img_path = f"{ckpt_dir}/{self.mgr.model_name}_debug_epoch{epoch}.gif"
                                     
-                                    # Extract skeleton data if using SkeletonRecallTrainer
+                                    # handle skel data from skeleton-based losses
                                     skeleton_dict = None
                                     train_skeleton_dict = None
-                                    # Check if skeleton data is available in the batch
                                     if 'skel' in targets_dict_first_all:
                                         skeleton_dict = {'segmentation': targets_dict_first_all.get('skel')}
                                     # Check if train_sample_targets_all exists (from earlier training step)
@@ -1331,7 +1334,6 @@ class BaseTrainer:
 
         print('Training Finished!')
 
-        # Save final checkpoint
         final_model_path = save_final_checkpoint(
             model=model,
             optimizer=optimizer,
@@ -1353,86 +1355,111 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    # Required arguments
-    parser.add_argument("-i", "--input", required=True,
-                        help="Input directory containing images/ and labels/ subdirectories.")
-    parser.add_argument("-o", "--output", default="checkpoints",
-                        help="Output directory for saving checkpoints and configurations (default: checkpoints)")
-    parser.add_argument("--format", choices=["image", "zarr", "napari"],
-                        help="Data format (image: tif, png, or jpg files, zarr: Zarr arrays, napari: Napari layers). If not specified, will attempt to auto-detect.")
-    parser.add_argument("--val-dir", type=str,
-                        help="Optional validation directory containing images/ and labels/ subdirectories. If provided, validation uses only this data and training uses the remaining train set.")
+    grp_required = parser.add_argument_group("Required")
+    grp_paths = parser.add_argument_group("Paths & Format")
+    grp_data = parser.add_argument_group("Data & Splits")
+    grp_model = parser.add_argument_group("Model")
+    grp_train = parser.add_argument_group("Training Control")
+    grp_optim = parser.add_argument_group("Optimization")
+    grp_sched = parser.add_argument_group("Scheduler")
+    grp_trainer = parser.add_argument_group("Trainer Selection")
+    grp_logging = parser.add_argument_group("Logging & Tracking")
 
-    # Optional arguments
-    parser.add_argument("--batch-size", type=int,
-                        help="Training batch size (default: from config or 2)")
-    parser.add_argument("--patch-size", type=str,
-                        help="Patch size as comma-separated values, e.g., '192,192,192' for 3D or '256,256' for 2D")
-    parser.add_argument("--loss", type=str,
-                        help="Loss functions as a list, e.g., '[SoftDiceLoss, BCEWithLogitsLoss]' or comma-separated")
-    parser.add_argument("--train-split", type=float,
-                        help="Training/validation split ratio (0.0-1.0, default: 0.95)")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for train/validation split (default: 42)")
-    parser.add_argument("--config", "--config-path", dest="config_path", type=str, required=True,
-                        help="Path to configuration YAML file (required)")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Enable verbose output for debugging")
-    parser.add_argument("--max-epoch", type=int, default=1000,
-                        help="Maximum number of epochs (default: 1000)")
-    parser.add_argument("--max-steps-per-epoch", type=int, default=200,
-                        help="Maximum training steps per epoch (if not set, uses all data)")
-    parser.add_argument("--max-val-steps-per-epoch", type=int, default=30,
-                        help="Maximum validation steps per epoch (if not set, uses all data)")
-    parser.add_argument("--full-epoch", action="store_true",
-                        help="Iterate over entire train and validation datasets once per epoch (overrides max-steps-per-epoch)")
-    parser.add_argument("--model-name", type=str,
-                        help="Model name for checkpoints and logging (default: from config or 'Model')")
-    parser.add_argument("--nonlin", type=str, choices=["LeakyReLU", "ReLU", "SwiGLU", "swiglu", "GLU", "glu"],
-                        help="Activation function to use in the model (default: from config or 'LeakyReLU')")
-    parser.add_argument("--se", action="store_true", help="Enable squeeze and excitation modules in the encoder")
-    parser.add_argument("--se-reduction-ratio", type=float, default=0.0625,
-                        help="Squeeze excitation reduction ratio (default: 0.0625 = 1/16)")
-    parser.add_argument("--pool-type", type=str, choices=["avg", "max", "conv"],
-                        help="Type of pooling to use in encoder ('avg', 'max', or 'conv' for strided convolutions). Default: 'conv'")
-    parser.add_argument("--optimizer", type=str,
-                        help="Optimizer to use for training (default: from config or 'AdamW, available options in models/optimizers.py')")
-    parser.add_argument("--no-spatial", action="store_true",
-                        help="Disable spatial/geometric transformations (rotations, flips, etc.) during training")
-    parser.add_argument("--grad-clip", type=float, default=12.0,
-                        help="Gradient clipping value (default: 12.0)")
-    parser.add_argument("--no-amp", action="store_true",
-                        help="Disable Automatic Mixed Precision (AMP) for training")
-    parser.add_argument("--skip-intensity-sampling", dest="skip_intensity_sampling", 
-                        action="store_true", default=True,
-                        help="Skip intensity sampling during dataset initialization (default: True)")
-    parser.add_argument("--no-skip-intensity-sampling", dest="skip_intensity_sampling",
-                        action="store_false",
-                        help="Enable intensity sampling during dataset initialization")
-    parser.add_argument("--early-stopping-patience", type=int, default=20,
-                        help="Number of epochs to wait for validation loss improvement before early stopping (default: 5, set to 0 to disable)")
+    # Required
+    grp_required.add_argument("-i", "--input", required=True,
+                              help="Input directory containing images/ and labels/ subdirectories.")
+    grp_required.add_argument("--config", "--config-path", dest="config_path", type=str, required=True,
+                              help="Path to configuration YAML file")
 
-    # Trainer selection
-    parser.add_argument("--trainer", type=str, default="base",
-                        help="Trainer class to use (default: base). Options: base, uncertainty_aware_mean_teacher")
+    # Paths & Format
+    grp_paths.add_argument("-o", "--output", default="checkpoints",
+                           help="Output directory for saving checkpoints and configs")
+    grp_paths.add_argument("--format", choices=["image", "zarr", "napari"],
+                           help="Data format (auto-detected if omitted)")
+    grp_paths.add_argument("--val-dir", type=str,
+                           help="Optional validation directory with images/ and labels/")
+    grp_paths.add_argument("--checkpoint", "--checkpoint-path", dest="checkpoint_path", type=str,
+                           help="Path to checkpoint (.pt/.pth) or weights-only state_dict file")
+    grp_paths.add_argument("--load-weights-only", action="store_true",
+                           help="Load only model weights from checkpoint; ignore optimizer/scheduler and allow partial load")
+    grp_paths.add_argument("--rebuild-from-ckpt-config", action="store_true",
+                           help="Rebuild model from checkpoint's model_config before loading weights")
+    grp_paths.add_argument("--intensity-properties-json", type=str, default=None,
+                           help="nnU-Net style intensity properties JSON for CT normalization")
 
-    # Learning rate scheduler arguments
-    parser.add_argument("--scheduler", type=str,
-                        help="Learning rate scheduler type (default: from config or 'poly')")
-    parser.add_argument("--warmup-steps", type=int,
-                        help="Number of warmup steps for cosine_warmup scheduler (default: 10%% of first cycle)")
+    # Data & Splits
+    grp_data.add_argument("--batch-size", type=int,
+                          help="Training batch size")
+    grp_data.add_argument("--patch-size", type=str,
+                          help="Patch size CSV, e.g. '192,192,192' (3D) or '256,256' (2D)")
+    grp_data.add_argument("--loss", type=str,
+                          help="Loss functions, e.g. '[SoftDiceLoss, BCEWithLogitsLoss]' or CSV")
+    grp_data.add_argument("--train-split", type=float,
+                          help="Training/validation split ratio in [0,1]")
+    grp_data.add_argument("--seed", type=int, default=42,
+                          help="Random seed for split/initialization")
+    grp_data.add_argument("--skip-intensity-sampling", dest="skip_intensity_sampling",
+                          action="store_true", default=True,
+                          help="Skip intensity sampling during dataset init")
+    grp_data.add_argument("--no-skip-intensity-sampling", dest="skip_intensity_sampling",
+                          action="store_false",
+                          help="Enable intensity sampling during dataset init")
+    grp_data.add_argument("--no-spatial", action="store_true",
+                          help="Disable spatial/geometric augmentations")
 
-    # Weights & Biases arguments
-    parser.add_argument("--wandb-project", type=str, default=None,
-                        help="Weights & Biases project name (default: from config; wandb logging disabled if not set anywhere)")
-    parser.add_argument("--wandb-entity", type=str, default=None,
-                        help="Weights & Biases team/username (default: from config)")
-    parser.add_argument("--intensity-properties-json", type=str, default=None,
-                        help="Path to nnU-Net-style intensity properties JSON (dataset_fingerprint.json or intensity_props.json). If provided, training uses CT normalization with these properties and skips sampling.")
+    # Model
+    grp_model.add_argument("--model-name", type=str,
+                           help="Model name for checkpoints and logging")
+    grp_model.add_argument("--nonlin", type=str, choices=["LeakyReLU", "ReLU", "SwiGLU", "swiglu", "GLU", "glu"],
+                           help="Activation function")
+    grp_model.add_argument("--se", action="store_true", help="Enable squeeze and excitation modules in the encoder")
+    grp_model.add_argument("--se-reduction-ratio", type=float, default=0.0625,
+                           help="Squeeze excitation reduction ratio")
+    grp_model.add_argument("--pool-type", type=str, choices=["avg", "max", "conv"],
+                           help="Type of pooling in encoder ('conv' = strided conv)")
+
+    # Training Control
+    grp_train.add_argument("--max-epoch", type=int, default=1000,
+                           help="Maximum number of epochs")
+    grp_train.add_argument("--max-steps-per-epoch", type=int, default=200,
+                           help="Max training steps per epoch (use all data if unset)")
+    grp_train.add_argument("--max-val-steps-per-epoch", type=int, default=30,
+                           help="Max validation steps per epoch (use all data if unset)")
+    grp_train.add_argument("--full-epoch", action="store_true",
+                           help="Iterate over entire train/val set per epoch (overrides max-steps)")
+    grp_train.add_argument("--early-stopping-patience", type=int, default=20,
+                           help="Epochs to wait for val loss improvement (0 disables)")
+
+    # Optimization
+    grp_optim.add_argument("--optimizer", type=str,
+                           help="Optimizer (see models/optimizers.py)")
+    grp_optim.add_argument("--grad-clip", type=float, default=12.0,
+                           help="Gradient clipping value")
+    grp_optim.add_argument("--no-amp", action="store_true",
+                           help="Disable Automatic Mixed Precision (AMP)")
+
+    # Scheduler
+    grp_sched.add_argument("--scheduler", type=str,
+                           help="Learning rate scheduler (default: from config or 'poly')")
+    grp_sched.add_argument("--warmup-steps", type=int,
+                           help="Number of warmup steps for cosine_warmup scheduler")
+
+    # Trainer Selection
+    grp_trainer.add_argument("--trainer", type=str, default="base",
+                             help="Trainer: base, mean_teacher, uncertainty_aware_mean_teacher, primus_mae, unet_mae, finetune_mae_unet")
+    grp_trainer.add_argument("--ssl-warmup", type=int, default=None,
+                             help="Semi-supervised: epochs to ignore EMA consistency loss (0 disables)")
+
+    # Logging & Tracking
+    grp_logging.add_argument("--wandb-project", type=str, default=None,
+                             help="Weights & Biases project (omit to disable wandb)")
+    grp_logging.add_argument("--wandb-entity", type=str, default=None,
+                             help="Weights & Biases team/username")
+    grp_logging.add_argument("--verbose", action="store_true",
+                             help="Enable verbose debug output")
 
     args = parser.parse_args()
 
-    # Load configuration first to check if we have data_paths
     from vesuvius.models.configuration.config_manager import ConfigManager
     mgr = ConfigManager(verbose=args.verbose)
 
@@ -1447,11 +1474,9 @@ def main():
     mgr.load_config(args.config_path)
     print(f"Loaded configuration from: {args.config_path}")
 
-    # Check if input exists
     if not Path(args.input).exists():
         raise ValueError(f"Input directory does not exist: {args.input}")
 
-    # Validate optional separate validation directory early for clearer errors
     if args.val_dir is not None and not Path(args.val_dir).exists():
         raise ValueError(f"Validation directory does not exist: {args.val_dir}")
 
@@ -1459,7 +1484,6 @@ def main():
 
     update_config_from_args(mgr, args)
 
-    # If a separate validation directory is provided, store it on the manager
     if args.val_dir is not None:
         from pathlib import Path as _Path
         mgr.val_data_path = _Path(args.val_dir)
@@ -1472,37 +1496,50 @@ def main():
         props = load_intensity_props_formatted(ip_path, channel=0)
         if not props:
             raise ValueError(f"Failed to parse intensity properties JSON: {ip_path}")
-        # Update manager config to use CT normalization with provided properties
         if hasattr(mgr, 'update_config'):
             mgr.update_config(normalization_scheme='ct', intensity_properties=props)
         else:
-            # Fallback: set directly on dataset_config
             mgr.dataset_config = getattr(mgr, 'dataset_config', {})
             mgr.dataset_config['normalization_scheme'] = 'ct'
             mgr.dataset_config['intensity_properties'] = props
-        # Ensure we skip intensity sampling in dataset init if flag is present
         setattr(mgr, 'skip_intensity_sampling', True)
         print("Using provided intensity properties for CT normalization. Sampling disabled.")
 
-    # Select trainer based on --trainer argument
     trainer_name = args.trainer.lower()
-    mgr.trainer_class = trainer_name  # Store trainer class in config manager
+    mgr.trainer_class = trainer_name
     
     if trainer_name == "uncertainty_aware_mean_teacher":
         mgr.allow_unlabeled_data = True
         from vesuvius.models.training.trainers.semi_supervised.train_uncertainty_aware_mean_teacher import TrainUncertaintyAwareMeanTeacher
         trainer = TrainUncertaintyAwareMeanTeacher(mgr=mgr, verbose=args.verbose)
         print("Using Uncertainty-Aware Mean Teacher Trainer for semi-supervised 3D training")
+    elif trainer_name == "mean_teacher":
+        mgr.allow_unlabeled_data = True
+        from vesuvius.models.training.trainers.semi_supervised.train_mean_teacher import TrainMeanTeacher
+        trainer = TrainMeanTeacher(mgr=mgr, verbose=args.verbose)
+        print("Using Regular Mean Teacher Trainer for semi-supervised training")
     elif trainer_name == "primus_mae":
         mgr.allow_unlabeled_data = True
         from vesuvius.models.training.trainers.self_supervised.train_eva_mae import TrainEVAMAE
         trainer = TrainEVAMAE(mgr=mgr, verbose=args.verbose)
         print("Using EVA (Primus) Architecture for MAE Pretraining")
+    elif trainer_name == "unet_mae":
+        mgr.allow_unlabeled_data = True
+        from vesuvius.models.training.trainers.self_supervised.train_unet_mae import TrainUNetMAE
+        trainer = TrainUNetMAE(mgr=mgr, verbose=args.verbose)
+        print("Using UNet-style MAE Trainer (NetworkFromConfig)")
+    elif trainer_name == "finetune_mae_unet":
+        from vesuvius.models.training.trainers.self_supervised.train_finetune_mae_unet import TrainFineTuneMAEUNet
+        trainer = TrainFineTuneMAEUNet(mgr=mgr, verbose=args.verbose)
+        print("Using Fine-Tune MAE->UNet Trainer (NetworkFromConfig)")
     elif trainer_name == "base":
         trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Base Trainer for supervised training")
     else:
-        raise ValueError(f"Unknown trainer: {trainer_name}. Available options: base, uncertainty_aware_mean_teacher")
+        raise ValueError(
+            "Unknown trainer: {trainer}. Available options: base, mean_teacher, "
+            "uncertainty_aware_mean_teacher, primus_mae, unet_mae, finetune_mae_unet".format(trainer=trainer_name)
+        )
 
     print("Starting training...")
     trainer.train()
