@@ -408,6 +408,30 @@ class BaseTrainer:
         
         return loss_fns
 
+    def _update_dataloaders_for_epoch(self,
+                                      train_dataloader,
+                                      val_dataloader,
+                                      train_dataset,
+                                      val_dataset,
+                                      epoch):
+        """
+        Optionally update/rebuild dataloaders for the current epoch.
+
+        By default, returns the provided dataloaders unchanged. Trainers can override
+        this to switch sampling strategies across epochs (e.g., warmup phases).
+
+        Args:
+            train_dataloader: The current training dataloader
+            val_dataloader: The current validation dataloader
+            train_dataset: The training dataset instance
+            val_dataset: The validation dataset instance
+            epoch: Current epoch number (0-indexed)
+
+        Returns:
+            tuple: (train_dataloader, val_dataloader)
+        """
+        return train_dataloader, val_dataloader
+
     # --- optimizer ---- #
     def _get_optimizer(self, model):
 
@@ -1097,6 +1121,15 @@ class BaseTrainer:
             
             # Update scheduler for this epoch (for epoch-based scheduler switching)
             scheduler, is_per_iteration_scheduler = self._update_scheduler_for_epoch(scheduler, optimizer, epoch)
+            
+            # Optionally update dataloaders for this epoch (e.g., warmup strategies)
+            train_dataloader, val_dataloader = self._update_dataloaders_for_epoch(
+                train_dataloader=train_dataloader,
+                val_dataloader=val_dataloader,
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                epoch=epoch
+            )
             
             model.train()
 

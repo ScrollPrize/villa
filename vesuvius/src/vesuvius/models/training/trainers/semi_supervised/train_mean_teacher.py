@@ -151,9 +151,14 @@ class TrainMeanTeacher(BaseTrainer):
         batch_size = inputs.shape[0]
 
         if model.training and batch_size == self.mgr.train_batch_size:
-            # TwoStreamBatchSampler orders labeled first, then unlabeled
-            is_unlabeled = torch.zeros(batch_size, device=self.device)
-            is_unlabeled[self.labeled_batch_size:] = 1.0
+            # During SSL warmup epochs, treat the whole batch as labeled-only
+            in_warmup = getattr(self, 'warmup', 0) > 0 and getattr(self, '_current_epoch', 0) < self.warmup
+            if in_warmup:
+                is_unlabeled = torch.zeros(batch_size, device=self.device)
+            else:
+                # TwoStreamBatchSampler orders labeled first, then unlabeled
+                is_unlabeled = torch.zeros(batch_size, device=self.device)
+                is_unlabeled[self.labeled_batch_size:] = 1.0
         else:
             is_unlabeled = torch.zeros(batch_size, device=self.device)
 
@@ -173,24 +178,30 @@ class TrainMeanTeacher(BaseTrainer):
     def _compute_train_loss(self, outputs, targets_dict, loss_fns, autocast_ctx=None):
         # Supervised on labeled data only
         is_unlabeled = targets_dict.get('is_unlabeled', None)
-        if is_unlabeled is None or not is_unlabeled.any():
+        current_epoch = getattr(self, '_current_epoch', 0)
+        in_warmup = getattr(self, 'warmup', 0) > 0 and current_epoch < self.warmup
+        # Only enforce presence of unlabeled data when not in warmup
+        if not in_warmup and (is_unlabeled is None or not is_unlabeled.any()):
             raise ValueError(
                 "MeanTeacher trainer requires unlabeled data in each training batch. "
                 "Ensure TwoStreamBatchSampler is used and batch composition is correct."
             )
 
-        labeled_mask = is_unlabeled == 0
-        unlabeled_mask = is_unlabeled == 1
+        labeled_mask = is_unlabeled == 0 if is_unlabeled is not None else None
+        unlabeled_mask = is_unlabeled == 1 if is_unlabeled is not None else None
 
-        labeled_outputs = {k: v[labeled_mask] for k, v in outputs.items() if k != '_inputs'}
-        labeled_targets = {k: v[labeled_mask] for k, v in targets_dict.items() if k != 'is_unlabeled'}
+        if labeled_mask is not None:
+            labeled_outputs = {k: v[labeled_mask] for k, v in outputs.items() if k != '_inputs'}
+            labeled_targets = {k: v[labeled_mask] for k, v in targets_dict.items() if k != 'is_unlabeled'}
+        else:
+            labeled_outputs = {k: v for k, v in outputs.items() if k != '_inputs'}
+            labeled_targets = {k: v for k, v in targets_dict.items() if k != 'is_unlabeled'}
 
         total_loss, task_losses = super()._compute_train_loss(labeled_outputs, labeled_targets, loss_fns)
 
         # Consistency loss on unlabeled subset (skip during warmup epochs)
         do_consistency = True
-        current_epoch = getattr(self, '_current_epoch', 0)
-        if getattr(self, 'warmup', 0) > 0 and current_epoch < self.warmup:
+        if in_warmup:
             do_consistency = False
 
         if do_consistency:
@@ -273,3 +284,48 @@ class TrainMeanTeacher(BaseTrainer):
         if getattr(self, 'warmup', 0) > 0:
             print(f"Warmup enabled: ignoring EMA consistency loss for first {self.warmup} epoch(s)")
         return training_state
+
+    def _update_dataloaders_for_epoch(self,
+                                      train_dataloader,
+                                      val_dataloader,
+                                      train_dataset,
+                                      val_dataset,
+                                      epoch):
+        """
+        During warmup epochs, switch to a supervised dataloader over labeled data only.
+        After warmup, (re)enable the two-stream semi-supervised dataloader.
+        """
+        in_warmup = getattr(self, 'warmup', 0) > 0 and epoch < self.warmup
+        # If we don't have a labeled split yet, keep existing dataloaders
+        if self.labeled_indices is None or self.unlabeled_indices is None:
+            return train_dataloader, val_dataloader
+
+        if in_warmup:
+            # Build a standard supervised dataloader over labeled subset
+            from torch.utils.data import Subset, SubsetRandomSampler
+            from torch.utils.data.distributed import DistributedSampler
+            per_device_batch = self.mgr.train_batch_size
+            labeled_subset = Subset(train_dataset, self.labeled_indices)
+            if self.is_distributed:
+                sampler = DistributedSampler(labeled_subset, num_replicas=self.world_size, rank=self.rank,
+                                             shuffle=True, drop_last=False)
+            else:
+                sampler = SubsetRandomSampler(list(range(len(labeled_subset))))
+            pin_mem = True if self.device == torch.device('cuda') or self.device.type == 'cuda' else False
+            dl_kwargs = {}
+            if self.mgr.train_num_dataloader_workers and self.mgr.train_num_dataloader_workers > 0:
+                dl_kwargs['prefetch_factor'] = 2
+            new_train_dl = DataLoader(
+                labeled_subset,
+                batch_size=per_device_batch,
+                sampler=sampler,
+                shuffle=False,
+                pin_memory=pin_mem,
+                num_workers=self.mgr.train_num_dataloader_workers,
+                **dl_kwargs
+            )
+            return new_train_dl, val_dataloader
+        else:
+            # Ensure we are using the two-stream loader after warmup
+            new_train_dl, new_val_dl, _, _ = self._configure_dataloaders(train_dataset, val_dataset)
+            return new_train_dl, new_val_dl
