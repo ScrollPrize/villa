@@ -51,8 +51,8 @@ class TrainMeanTeacher(BaseTrainer):
         for param_student, param_teacher in zip(model.parameters(), ema_model.parameters()):
             param_teacher.data.copy_(param_student.data)
             param_teacher.requires_grad = False
-        # Train mode mirrors SSL4MIS behavior if dropout/BN are present; harmless otherwise
-        ema_model.train()
+        # Use eval mode for stable teacher targets (freeze BN/dropout behavior)
+        ema_model.eval()
         return ema_model
 
     def _update_ema_variables(self, model, ema_model, alpha, global_step):
@@ -108,7 +108,7 @@ class TrainMeanTeacher(BaseTrainer):
         train_dataloader = DataLoader(
             train_dataset,
             batch_sampler=batch_sampler,
-            pin_memory=(True if self.device == 'cuda' else False),
+            pin_memory=(True if getattr(self.device, 'type', str(self.device)) == 'cuda' else False),
             num_workers=self.mgr.train_num_dataloader_workers,
         )
 
@@ -130,7 +130,7 @@ class TrainMeanTeacher(BaseTrainer):
             val_dataset,
             batch_size=1,
             sampler=SubsetRandomSampler(val_indices),
-            pin_memory=(True if self.device == 'cuda' else False),
+            pin_memory=(True if getattr(self.device, 'type', str(self.device)) == 'cuda' else False),
             num_workers=self.mgr.train_num_dataloader_workers,
         )
 
@@ -219,18 +219,31 @@ class TrainMeanTeacher(BaseTrainer):
                 with autocast_ctx:
                     teacher_outputs = self.ema_model(teacher_inputs)
 
-            # Choose first task head for consistency, skip sentinel keys
-            first_task = next((k for k in outputs.keys() if k != '_inputs'), None)
+            # Select task head for consistency, prefer explicit config if provided
+            consistency_target = getattr(self.mgr, 'consistency_target', None)
+            first_task = None
+            if consistency_target is not None and consistency_target in outputs:
+                first_task = consistency_target
+            else:
+                # Fallback to the first available prediction key
+                first_task = next((k for k in outputs.keys() if k != '_inputs'), None)
             if first_task is None:
                 raise ValueError("No task outputs found for consistency loss.")
 
             student_unlabeled = outputs[first_task][unlabeled_mask]
             teacher_unlabeled = teacher_outputs[first_task]
 
-            # MSE on softmax probabilities (regular mean teacher)
-            student_soft = F.softmax(student_unlabeled, dim=1)
-            teacher_soft = F.softmax(teacher_unlabeled, dim=1)
-            consistency_loss = torch.mean((student_soft - teacher_soft) ** 2)
+            # Consistency on probabilities: handle binary (1-channel) vs multi-class
+            if student_unlabeled.shape[1] == 1:
+                # Binary case: use sigmoid probabilities
+                student_prob = torch.sigmoid(student_unlabeled)
+                teacher_prob = torch.sigmoid(teacher_unlabeled)
+                consistency_loss = F.mse_loss(student_prob, teacher_prob)
+            else:
+                # Multi-class: MSE on softmax probabilities
+                student_soft = F.softmax(student_unlabeled, dim=1)
+                teacher_soft = F.softmax(teacher_unlabeled, dim=1)
+                consistency_loss = F.mse_loss(student_soft, teacher_soft)
 
             consistency_weight = self._get_current_consistency_weight(self.global_step // 150)
             weighted_consistency = consistency_weight * consistency_loss
