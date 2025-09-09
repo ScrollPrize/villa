@@ -81,6 +81,11 @@ class TrainEVAMAE(BaseTrainer):
             mgr.model_config['patch_embed_size'] = self.vit_patch_size
             mgr.model_config['decoder_depth'] = self.decoder_depth
             mgr.model_config['decoder_num_heads'] = self.decoder_num_heads
+
+            # Ensure gradient clipping matches reference (nnssl uses 1.0)
+            # Base trainer reads clipping value from mgr.gradient_clip
+            if not hasattr(mgr, 'gradient_clip'):
+                mgr.gradient_clip = self.grad_clip
         
         super().__init__(mgr, verbose)
         
