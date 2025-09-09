@@ -418,17 +418,19 @@ class Inferer():
             if self.verbose and global_mean is not None and global_std is not None:
                 print(f"Using global normalization from checkpoint: mean={global_mean:.4f}, std={global_std:.4f}")
 
-        # Prefer CT if model checkpoint contains full CT stats and user didn't supply JSON
-        if intensity_props is None and self.model_intensity_properties and all(k in self.model_intensity_properties for k in ['percentile_00_5', 'percentile_99_5', 'mean', 'std']):
-            intensity_props = {
-                'mean': self.model_intensity_properties['mean'],
-                'std': self.model_intensity_properties['std'],
-                'percentile_00_5': self.model_intensity_properties['percentile_00_5'],
-                'percentile_99_5': self.model_intensity_properties['percentile_99_5']
-            }
-            normalization_scheme = 'ct'
-            if self.verbose:
-                print("Using CT normalization from checkpoint intensity properties")
+        # Only use CT normalization if it was actually configured
+        # Do NOT auto-switch a model trained with zscore to CT at inference time.
+        if normalization_scheme == 'ct':
+            # If user/model requested CT, source intensity props from checkpoint when available
+            if intensity_props is None and self.model_intensity_properties and all(k in self.model_intensity_properties for k in ['percentile_00_5', 'percentile_99_5', 'mean', 'std']):
+                intensity_props = {
+                    'mean': self.model_intensity_properties['mean'],
+                    'std': self.model_intensity_properties['std'],
+                    'percentile_00_5': self.model_intensity_properties['percentile_00_5'],
+                    'percentile_99_5': self.model_intensity_properties['percentile_99_5']
+                }
+                if self.verbose:
+                    print("Using CT normalization from checkpoint intensity properties")
         return normalization_scheme, global_mean, global_std, intensity_props
 
     def _create_dataset_and_loader(self):
@@ -448,6 +450,7 @@ class Inferer():
             global_mean=global_mean,
             global_std=global_std,
             intensity_props=intensity_props,
+            return_as_type='np.float32',
             input_format=self.input_format,
             verbose=self.verbose,
             mode='infer',
@@ -911,6 +914,10 @@ class Inferer():
                     weights_acc[iz0:iz1, iy0:iy1, ix0:ix1] += w_slice
 
         # Iterate positions
+        # For TIFF in-memory inference we never skip patches based on "emptiness".
+        # Skipping leads to uncovered regions (weights remain 0), which shows up
+        # as blank holes in the blended logits/probabilities/labels. Always
+        # evaluating all patches guarantees full coverage.
         for coord in tqdm(coords, desc=f"Inferring {out_path.name}"):
             # Build padded patch tensor (C=1)
             if self.is_2d_model:
@@ -925,13 +932,7 @@ class Inferer():
                 sub = img[z:z1, y:y1, x:x1]
                 # Normalize per-patch for consistency
                 sub = self._normalize_numpy(sub, normalization_scheme, gmean, gstd, iprops)
-            # Optional: skip empty patches
-            if self.skip_empty_patches:
-                if sub.size == 0:
-                    continue
-                smin = float(sub.min()); smax = float(sub.max())
-                if smin == smax:
-                    continue
+            # Do NOT skip "empty" patches here; ensure weights cover the full image.
             # Pad to patch size
             if self.is_2d_model:
                 patch = np.zeros((pY, pX), dtype=np.float32)
