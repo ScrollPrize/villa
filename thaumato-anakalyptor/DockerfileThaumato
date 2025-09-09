@@ -1,0 +1,176 @@
+# Use an official CUDA base image
+FROM nvidia/cuda:11.3.1-base-ubuntu20.04
+
+# Install prerequisites
+RUN apt-get update && apt-get install -y \
+python3-pip \
+curl \
+wget \
+bzip2 \
+git \
+&& rm -rf /var/lib/apt/lists/*
+
+# Install Miniconda (you can choose a specific version if you want)
+RUN curl -Lo miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
+&& chmod +x miniconda.sh \
+&& ./miniconda.sh -b -p /opt/conda \
+&& rm miniconda.sh
+
+# Add Miniconda to PATH
+ENV PATH /opt/conda/bin:$PATH
+
+RUN export TORCH_CUDA_ARCH_LIST="6.0 6.1 6.2 7.0 7.2 7.5 8.0 8.6"
+
+# Create Conda environment from the file
+RUN conda create --name "thaumato" python=3.10.9 pip=23.1 -y
+
+# Set the Conda environment path
+ENV CONDA_DEFAULT_ENV thaumato
+ENV PATH /opt/conda/envs/$CONDA_DEFAULT_ENV/bin:$PATH
+
+# Install cython and pyyaml first
+RUN pip install "cython<3.0.0" pyyaml==5.4.1 --no-build-isolation -v
+
+# Copy your environment.yml file
+COPY environment_thaumato.yml /workspace/
+
+# Update the environment using the yml file
+RUN conda env update --name thaumato -f /workspace/environment_thaumato.yml
+
+# Copy mask3d third party for installation
+COPY ./ThaumatoAnakalyptor/mask3d/third_party/ /workspace/ThaumatoAnakalyptor/mask3d/third_party/
+
+# Install the Python packages
+RUN pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 --extra-index-url https://download.pytorch.org/whl/cu113 \
+&& pip install torch-scatter==2.1.1 -f https://data.pyg.org/whl/torch-1.12.1+cu113.html \
+&& pip install 'git+https://github.com/facebookresearch/detectron2.git@710e7795d0eeadf9def0e7ef957eea13532e34cf' --no-deps 
+
+RUN git clone --recursive "https://github.com/NVIDIA/MinkowskiEngine" /workspace/ThaumatoAnakalyptor/mask3d/third_party/MinkowskiEngine \
+&& cd /workspace/ThaumatoAnakalyptor/mask3d/third_party/MinkowskiEngine && git checkout 02fc608bea4c0549b0a7b00ca1bf15dee4a0b228
+
+RUN export TORCH_CUDA_ARCH_LIST="6.0 6.1 6.2 7.0 7.2 7.5 8.0 8.6" \
+&& cd /workspace/ThaumatoAnakalyptor/mask3d/third_party/MinkowskiEngine \
+&& python setup.py install --force_cuda --blas=openblas
+
+RUN export TORCH_CUDA_ARCH_LIST="6.0 6.1 6.2 7.0 7.2 7.5 8.0 8.6" \
+&& git clone https://github.com/ScanNet/ScanNet.git /workspace/ThaumatoAnakalyptor/mask3d/third_party/ScanNet \
+&& cd /workspace/ThaumatoAnakalyptor/mask3d/third_party/ScanNet/Segmentator && git checkout 3e5726500896748521a6ceb81271b0f5b2c0e7d2 \
+&& make \
+&& cd /workspace/ThaumatoAnakalyptor/mask3d/third_party/pointnet2 && python setup.py install
+
+RUN pip install pytorch-lightning==1.9.5 \
+&& pip install torchmetrics==0.11.4 colorcet py7zr numba==0.60.0
+
+RUN apt-get update && apt-get install -y libgl1-mesa-glx
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+&& apt-get -y install build-essential \
+&& apt-get install -y wget \
+&& rm -rf /var/lib/apt/lists/* \
+&& wget https://github.com/Kitware/CMake/releases/download/v3.24.1/cmake-3.24.1-Linux-x86_64.sh \
+-q -O /tmp/cmake-install.sh \
+&& chmod u+x /tmp/cmake-install.sh \
+&& mkdir /opt/cmake-3.24.1 \
+&& /tmp/cmake-install.sh --skip-license --prefix=/opt/cmake-3.24.1 \
+&& rm /tmp/cmake-install.sh \
+&& ln -s /opt/cmake-3.24.1/bin/* /usr/local/bin
+
+# This fix: libGL error: No matching fbConfigs or visuals found
+ENV LIBGL_ALWAYS_INDIRECT=1
+
+# Set the XDG_RUNTIME_DIR environment variable for the 'qtuser'
+ENV XDG_RUNTIME_DIR=/workspace
+
+RUN cd /
+
+RUN apt-get update && apt-get install -y python3-pyqt5 libopencv-dev
+
+# print the current working directory
+RUN pwd
+# print the contents of the current working directory
+RUN ls -la
+
+# Install Python 3, PyQt5
+RUN apt-cache search libsdl
+RUN apt-get install -y libsdl2-dev libgsl-dev
+
+# Install virtualenv
+RUN pip install virtualenv
+
+# Create a virtual environment for the second set of dependencies
+RUN virtualenv youssefGP
+
+# Activate the virtual environment and install packages from the requirements.txt file at a specific commit
+RUN /bin/bash -c "source youssefGP/bin/activate && \
+pip3 install -r https://raw.githubusercontent.com/younader/Vesuvius-Grandprize-Winner/940634f1fe3ffb9a585b733dda6c3dd234540b41/requirements.txt"
+
+# Install gdown to handle Google Drive file downloads
+RUN pip install gdown
+
+# Download the canonical timesformer weights from Google Drive using gdown
+RUN mkdir -p /workspace/Vesuvius-Grandprize-Winner
+RUN rm -f /workspace/Vesuvius-Grandprize-Winner/timesformer_wild15_20230702185753_0_fr_i3depoch=12.ckpt
+RUN gdown --id 13Iu-dR-1sKq_oGJfNa86LcBSv1o4XA37 -O /workspace/Vesuvius-Grandprize-Winner/timesformer_wild15_20230702185753_0_fr_i3depoch=12.ckpt
+
+# Copy scripts and modules
+COPY ./ThaumatoAnakalyptor/mask3d/ /workspace/ThaumatoAnakalyptor/mask3d/
+
+# Download the canonical mask3d weights from Google Drive using gdown
+RUN mkdir -p /workspace/ThaumatoAnakalyptor/mask3d/saved/train
+RUN rm -f /workspace/ThaumatoAnakalyptor/mask3d/saved/train/last-epoch.ckpt
+RUN gdown --id 1ifag-_ode1dtIguJb0BQXxQ-BwFYos0c -O /workspace/ThaumatoAnakalyptor/mask3d/saved/train/last-epoch.ckpt
+
+# Install necessary tools and Eigen3
+RUN apt-get update && \
+apt-get install -y \
+libeigen3-dev  \ 
+libarchive-dev \
+libtbb-dev  \
+libopencv-dev
+
+RUN pip uninstall opencv-python-headless opencv-python -y
+RUN pip install opencv-python
+
+# build C++ ThaumatoAnakalyptor code with the submodules
+RUN git clone --recurse-submodules https://github.com/schillij95/ThaumatoAnakalyptor /ThaumatoAnakalyptor_temp
+RUN mkdir -p /workspace
+RUN cp -rn /ThaumatoAnakalyptor_temp/. /workspace && rm -rf /ThaumatoAnakalyptor_temp
+
+WORKDIR /workspace/ThaumatoAnakalyptor/sheet_generation/
+
+# Remove the existing build directory to clear any old configurations
+RUN rm -rf build && mkdir -p build
+
+WORKDIR /workspace/ThaumatoAnakalyptor/sheet_generation/build/
+# print out the contents of the current working directory
+RUN ls -la
+
+RUN cmake .. \
+&& cmake --build .
+
+# Build the graph_problem
+WORKDIR /workspace/ThaumatoAnakalyptor/graph_problem/
+
+# Install argparse
+RUN curl -L https://raw.githubusercontent.com/p-ranav/argparse/master/include/argparse/argparse.hpp -o /workspace/ThaumatoAnakalyptor/graph_problem/argparse.hpp
+
+# Remove the existing build directory to clear any old configurations
+RUN rm -rf build && mkdir -p build
+
+WORKDIR /workspace/ThaumatoAnakalyptor/graph_problem/build/
+# print out the contents of the current working directory
+RUN ls -la
+
+RUN cmake -DENABLE_GPU=OFF .. \
+&& cmake --build .
+
+WORKDIR /
+
+# Add user for GUI
+# RUN adduser --quiet --disabled-password qtuser && usermod -a -G audio qtuser
+RUN usermod -a -G audio root
+
+# Set working directory
+WORKDIR /workspace/

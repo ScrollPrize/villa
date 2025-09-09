@@ -1,0 +1,56 @@
+[project]
+name = "batchgeneratorsv2"
+version = "0.2.1"
+requires-python = ">=3.9"
+description = "Batchgenerators but better"
+readme = "readme.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Fabian Isensee", email = "f.isensee@dkfz-heidelberg.de"},
+    { name = "Helmholtz Imaging Applied Computer Vision Lab" }
+]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Healthcare Industry",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+keywords = [
+    'deep learning',
+    'image segmentation',
+    'semantic segmentation',
+    'medical image analysis',
+    'medical image segmentation',
+    'nnU-Net',
+    'nnunet'
+]
+dependencies = [
+    "torch>=2.0.0",
+    "numpy",
+    "fft-conv-pytorch",
+    "batchgenerators>=0.25"
+]
+
+#[project.urls]
+#homepage = ""
+#repository = ""
+
+
+#[project.optional-dependencies]
+#dev = [
+#
+#]
+
+[tool.codespell]
+skip = '.git,*.pdf,*.svg'
+#
+# ignore-words-list = ''
+
+[tool.setuptools.packages.find]
+where = [""]
+include = ["batchgeneratorsv2.*"]

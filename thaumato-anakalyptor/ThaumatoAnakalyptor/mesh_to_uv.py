@@ -1,0 +1,1178 @@
+### Julian Schilliger - ThaumatoAnakalyptor - Vesuvius Challenge 2023
+
+import os
+import open3d as o3d
+import numpy as np
+from collections import deque
+from math import atan2, pi, sqrt
+from .sheet_to_mesh import load_xyz_from_file, scale_points, shuffling_points_axis, umbilicus_xy_at_z
+from scipy.interpolate import interp1d
+from copy import deepcopy
+import struct
+import json
+from datetime import datetime
+from tqdm import tqdm
+import scipy.ndimage
+import cv2
+from scipy.spatial import Delaunay
+from scipy.spatial import KDTree
+
+def current_time_string() -> str:
+    """
+    Generate a string representing the current time in the format YYYYMMDDHHMMSS.
+
+    Returns:
+        str: The formatted time string.
+    """
+    return datetime.now().strftime('%Y%m%d%H%M%S')
+
+class IOException(Exception):
+    pass
+
+class PointSet:
+    FORMAT_VERSION = '1' 
+    HEADER_TERMINATOR = '<>\n' 
+
+def write_ordered_point_set_binary(path, ps: np.ndarray):
+    """
+    Write the ordered point set (numpy array) to a binary file.
+    
+    Parameters:
+        path (str): Path to the output file.
+        ps (numpy.ndarray): 3D numpy array representing the point set.
+    """
+    ps = ps.astype(np.float64)
+    with open(os.path.join(path, "pointset.vcps"), 'wb') as outfile:
+        header = make_ordered_header(ps)
+        outfile.write(header.encode())
+
+        for y in range(ps.shape[0]):
+            for x in range(ps.shape[1]):
+                # Assuming type 'double' corresponds to 'd' in struct format
+                packed_data = struct.pack('ddd', *ps[y, x])
+                outfile.write(packed_data)
+
+def make_ordered_header(ps: np.ndarray) -> str:
+    """
+    Generate the header string for the point set.
+    
+    Parameters:
+        ps (numpy.ndarray): 3D numpy array representing the point set.
+    
+    Returns:
+        str: Header string.
+    """
+    header = [
+        f"width: {ps.shape[1]}",
+        f"height: {ps.shape[0]}",
+        f"dim: {ps.shape[2]}",
+        "ordered: true",
+        "type: double",
+        f"version: {PointSet.FORMAT_VERSION}",
+        PointSet.HEADER_TERMINATOR
+    ]
+    
+    return '\n'.join(header)
+
+def create_meta_json(path:str, name: str, volume: str):
+    """
+    Create a meta.json file with the provided parameters.
+
+    Parameters:
+        path (str): Path to the output file.
+        name (str): Name for the "name" and "uuid" fields.
+        volume (str): Volume identifier.
+
+    Returns:
+        None
+    """
+    uuid = name # same
+    data = {
+        "name": name,
+        "type": "seg",
+        "uuid": uuid,
+        "vcps": "pointset.vcps",
+        "volume": volume
+    }
+
+    with open(os.path.join(path, "meta.json"), "w") as outfile:
+        json.dump(data, outfile, indent=4)
+
+def load_obj(path: str) -> o3d.geometry.TriangleMesh:
+    """
+    Load an .obj file and return the TriangleMesh object.
+    """
+    return o3d.io.read_triangle_mesh(path)
+
+def save_obj_with_uvs(path: str, mesh: o3d.geometry.TriangleMesh, uvs: list):
+    """
+    Save a TriangleMesh object with UV coordinates to an .obj file.
+    
+    Args:
+        path (str): The path to save the .obj file.
+        mesh (o3d.geometry.TriangleMesh): The mesh to save.
+        uvs (list): A list of UV coordinates.
+    """
+    # Check if the number of UV coordinates matches the number of vertices in the mesh
+    if len(uvs) != len(mesh.vertices):
+        raise ValueError("The number of UV coordinates does not match the number of mesh vertices.")
+    
+    # Assign the UV coordinates to the mesh
+    mesh.triangle_uvs = o3d.utility.Vector2dVector(uvs)
+    
+    # Save the mesh to an .obj file
+    o3d.io.write_triangle_mesh(path, mesh)
+
+def sanity_check_vertex_normals(mesh):
+    """
+    Check if the vertex normals of the mesh are normalized.
+    """
+    vertex_normals = np.asarray(mesh.vertex_normals)
+    vertex_normals_norm = np.linalg.norm(vertex_normals, axis=1)
+    print(f"Min and max vertex normal norm: {np.min(vertex_normals_norm)}, {np.max(vertex_normals_norm)}")
+    assert np.allclose(vertex_normals_norm, 1.0)
+    print("Assert done, sanity check passed.")
+
+def save_obj(path: str, mesh: o3d.geometry.TriangleMesh):
+    """
+    Save a TriangleMesh object with UV coordinates to an .obj file.
+    
+    Args:
+        path (str): The path to save the .obj file.
+        mesh (o3d.geometry.TriangleMesh): The mesh to save.
+    """
+    sanity_check_vertex_normals(mesh)
+    # make folder if not exists
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Save the mesh to an .obj file
+    o3d.io.write_triangle_mesh(path, mesh)
+    create_mtl_file(path.replace("obj", "mtl"), path.split("/")[-1].split(".")[0] + ".png")
+
+def create_mtl_file(mtl_path, texture_image_name):
+    texture_image_name = texture_image_name.split(".")[0] + "_0." + texture_image_name.split(".")[-1]
+    content = f"""# Material file generated by ThaumatoAnakalyptor
+    newmtl default
+    Ka 1.0 1.0 1.0
+    Kd 1.0 1.0 1.0
+    Ks 0.0 0.0 0.0
+    illum 2
+    d 1.0
+    map_Kd {texture_image_name}
+    """
+
+    with open(mtl_path, 'w') as file:
+        file.write(content)
+
+def filter_mesh_by_edge_length(mesh, mesh_flattened, max_edge_length):
+    """
+    Filters out triangles in an Open3D TriangleMesh that have any edge longer than max_edge_length.
+
+    :param mesh: Open3D TriangleMesh object.
+    :param max_edge_length: Maximum allowable length for any edge of a triangle.
+    :return: Filtered Open3D TriangleMesh object.
+    """
+    def edge_lengths(p1, p2, p3):
+        return [np.linalg.norm(p2 - p1), np.linalg.norm(p3 - p2), np.linalg.norm(p1 - p3)]
+
+    # Extracting vertices and triangles from the mesh
+    triangles = np.asarray(mesh.triangles)
+    triangles_flattened = np.asarray(mesh_flattened.triangles)
+    vertices_flattened = np.asarray(mesh_flattened.vertices)
+
+    # Filter out triangles with long edges
+    filtered_triangles = []
+    filtered_triangles_flattened = []
+    for i, triangle_flattened in enumerate(triangles_flattened):
+        p1, p2, p3 = vertices_flattened[triangle_flattened]
+        lengths = edge_lengths(p1, p2, p3)
+        if all(length < max_edge_length for length in lengths):
+            filtered_triangles.append(triangles[i])
+            filtered_triangles_flattened.append(triangle_flattened)
+
+    mesh.triangles = o3d.utility.Vector3iVector(filtered_triangles)
+    mesh_flattened.triangles = o3d.utility.Vector3iVector(filtered_triangles_flattened)
+
+def orient_normals_towards_umbilicus_mesh(mesh, umbilicus_func):
+    # Convert points and normals to numpy arrays
+    points = np.asarray(mesh.vertices)
+    normals = np.asarray(mesh.vertex_normals)
+    triangle_normals = np.asarray(mesh.triangle_normals)
+    
+    # Get the curve points corresponding to the y-values of the points using umbilicus_func
+    curve_points = umbilicus_func(points[:,2])
+
+    # Compute vectors from points to curve points
+    direction_to_curve = curve_points - points
+    
+    # Avoid division by zero in normalization
+    direction_to_curve_norm = np.linalg.norm(direction_to_curve, axis=1)
+    valid = direction_to_curve_norm != 0
+    normalized_directions = np.zeros_like(direction_to_curve)
+    normalized_directions[valid] = direction_to_curve[valid] / direction_to_curve_norm[valid][:, np.newaxis]
+
+    # Compute dot products for each point-normal pair
+    dot_products = np.einsum('ij,ij->i', normalized_directions, normals)
+
+    # Identify which normals need to be reversed
+    to_reverse = dot_products < 0
+    reverse_flag = to_reverse.sum() > (~to_reverse).sum()
+
+    # Reverse the necessary normals
+    if reverse_flag:
+        normals *= -1
+        mesh.triangles = o3d.utility.Vector3iVector(np.fliplr(np.asarray(mesh.triangles)))
+        # change orientation of triangles
+
+    # Normalize the normals
+    normals /= np.linalg.norm(normals, axis=1)[:, np.newaxis]
+    triangle_normals /= np.linalg.norm(triangle_normals, axis=1)[:, np.newaxis]
+
+    # Assign the new normals to the mesh
+    mesh.vertex_normals = o3d.utility.Vector3dVector(normals)
+    mesh.triangle_normals = o3d.utility.Vector3dVector(triangle_normals)
+
+    return mesh
+
+def smooth_mesh_normals(mesh, mesh_flattened, neighbor_radius=200):
+    print(f"Start smoothing mesh normals with neighbor radius {neighbor_radius}...")
+    # Convert points and normals to numpy arrays
+    points = np.asarray(mesh_flattened.vertices)
+    normals = np.asarray(mesh.vertex_normals)
+
+    # Build a KDTree for efficient neighbor search
+    tree = KDTree(points)
+
+    # Initialize an array to store the new normals
+    new_normals = np.zeros_like(normals)
+
+    # Iterate over each vertex
+    for i, point in enumerate(points):
+        # Find neighbors within the specified radius
+        indices = tree.query_ball_point(point, neighbor_radius)
+
+        # Calculate the mean normal of the neighbors
+        mean_normal = np.mean(normals[indices], axis=0)
+        new_normals[i] = mean_normal / np.linalg.norm(mean_normal)  # Normalize the mean normal
+
+    # Update the mesh normals
+    mesh.vertex_normals = o3d.utility.Vector3dVector(new_normals)
+
+    print("Finished smoothing mesh normals.")
+    
+    return mesh
+
+class UmbilicusEntry:
+    def __init__(self, x, y, z):
+        self.x = x
+        self.y = y
+        self.z = z
+
+class MeshFlattener:
+    def __init__(self, input_mesh, umbilicus_path, umbilicus_data=None, omnidirectional_view=False):
+        self.omnidirectional_view = omnidirectional_view
+        self.mesh = input_mesh
+        self.vertices_np = np.asarray(self.mesh.vertices).copy()  # Create a copy of the vertices as a NumPy array
+        self.visited_vertices = set()
+
+        axis_indices = [2, 0, 1]
+        self.axis_indices = axis_indices
+
+        # Load the umbilicus data
+        umbilicus_data = load_xyz_from_file(umbilicus_path)
+        # scale and swap axis
+        umbilicus_data = scale_points(umbilicus_data, 1.0, axis_offset=-500)
+        umbilicus_data, _ = shuffling_points_axis(umbilicus_data, umbilicus_data, axis_indices)
+        # Separate the coordinates
+        x, y, z = umbilicus_data.T
+        # Create interpolation functions for x and z based on y
+        self.fx = interp1d(z, x, kind='linear', fill_value="extrapolate")
+        self.fy = interp1d(z, y, kind='linear', fill_value="extrapolate")
+        self.interpolate_umbilicus = lambda z: self.umbilicus_xy_at_z(z)
+
+    def umbilicus_xy_at_z(self, z_new):
+        """
+        Interpolate between points in the provided 2D array based on z values.
+
+        :param z_new: A 1D numpy array of y-values.
+        :return: A 2D numpy array with interpolated points for each z value.
+        """
+
+        # Calculate interpolated x and z values
+        x_new = self.fx(z_new)
+        y_new = self.fy(z_new)
+
+        # Return the combined x, y, and z values as a 2D array
+        return x_new, y_new, z_new
+
+    def normalize_angle_diff(self, angle_diff):
+        if angle_diff > pi:
+            angle_diff -= 2 * pi
+        elif angle_diff < -pi:
+            angle_diff += 2 * pi
+        return angle_diff*180/pi
+
+    def angle_between_vertices(self, v1, v2):
+        z1 = v1[2]
+        umbilicus_xy1 = self.interpolate_umbilicus([z1])
+        dx1 = v1[0] - umbilicus_xy1[0][0]
+        dy1 = v1[1] - umbilicus_xy1[1][0]
+
+        z2 = v2[2]
+        umbilicus_xy2 = self.interpolate_umbilicus([z2])
+        dx2 = v2[0] - umbilicus_xy2[0][0]
+        dy2 = v2[1] - umbilicus_xy2[1][0]
+        
+        angle1 = atan2(dy1, dx1)
+        angle2 = atan2(dy2, dx2)
+        return self.normalize_angle_diff(angle2 - angle1)
+
+    def compute_uv_with_bfs(self, start_vertex_idx):
+        # check
+        index_c, count_c, area_c = self.mesh.cluster_connected_triangles()
+        print(f"Found {len(area_c)} clusters.")
+
+        bfs_queue = deque()
+        processing = [False] * self.vertices_np.shape[0]
+        uv_coordinates = {}
+
+        # Set the start vertex and angle
+        start_index_angle = self.angle_between_vertices(np.array([0.0, 0.0, 0.0]), self.vertices_np[start_vertex_idx])
+        bfs_queue.append((start_vertex_idx, start_index_angle))
+
+        i = 0
+        # tqdm progress bar
+        pbar = tqdm(total=self.vertices_np.shape[0], desc="BFS Angle Calculation Progress")
+        while bfs_queue:
+            pbar.update(1)
+            i += 1
+            vertex_idx, current_angle = bfs_queue.popleft()
+            
+            if vertex_idx in self.visited_vertices:
+                continue
+
+            self.visited_vertices.add(vertex_idx)
+            z = self.vertices_np[vertex_idx, 2]
+            umbilicus_xy = self.interpolate_umbilicus([z])
+            dx = self.vertices_np[vertex_idx, 0] - umbilicus_xy[0][0]
+            dy = self.vertices_np[vertex_idx, 1] - umbilicus_xy[1][0]
+            distance = sqrt(dx * dx + dy * dy)
+
+            uv_coordinates[vertex_idx] = (current_angle, distance)
+            adjacent_vertex_indices = self.get_adjacent_vertices(vertex_idx)
+            for next_vertex_idx in adjacent_vertex_indices:
+                if processing[next_vertex_idx]:
+                    continue
+                angle_diff = self.angle_between_vertices(self.vertices_np[vertex_idx], self.vertices_np[next_vertex_idx])
+                bfs_queue.append((next_vertex_idx, current_angle + angle_diff))
+                processing[next_vertex_idx] = True
+
+        for vertex_idx, (u, v) in uv_coordinates.items():
+            self.vertices_np[vertex_idx, 0] = u
+            self.vertices_np[vertex_idx, 1] = v
+        
+        if not self.have_visited_all_vertices():
+            # Red writing
+            print(f"\033[91mWarning: Not all vertices were visited during BFS! {len(self.visited_vertices)} visited, {self.vertices_np.shape[0]} total.\033[0m")
+        else:
+            # Green writing
+            print("\033[92mAll vertices were visited.\033[0m")
+
+        self.reset_visited()
+
+    def scale_uv_x_slice_z(self, vertices, z_slice):
+        slice_mask = (vertices[:, 2] >= z_slice[0]) & (vertices[:, 2] < z_slice[1])
+        vertices_slice = vertices[slice_mask]
+
+        min_x = np.min(vertices_slice[:, 0])
+        max_x = np.max(vertices_slice[:, 0])
+        
+        window_size = 1.0
+        offset_window_average = 25.0
+        addition_offset = 0
+        processed_vertices = [False] * np.sum(slice_mask)
+        new_vertices = deepcopy(vertices_slice)
+
+        window_start = min_x
+        while window_start <= max_x:
+            vertices_mask = (vertices_slice[:, 0] >= window_start) & (vertices_slice[:, 0] < window_start + window_size)
+            vertices_mask_offset = (vertices_slice[:, 0] >= window_start-offset_window_average) & (vertices_slice[:, 0] < window_start + window_size+offset_window_average)
+            y_values_in_window = vertices_slice[vertices_mask_offset, 1]
+
+            avg_y_distance = np.mean(y_values_in_window) if y_values_in_window.size else 0
+            x_addition_scale = (window_size / 360.0) * avg_y_distance * 2 * pi
+
+            indices_in_window = np.where(vertices_mask)
+            for idx in indices_in_window[0]:
+                if not processed_vertices[idx]:
+                    new_vertices[idx, 0] = addition_offset + ((vertices_slice[idx, 0] - window_start) / window_size) * x_addition_scale
+                    new_vertices[idx, 1] -= avg_y_distance
+                    processed_vertices[idx] = True
+
+            addition_offset += x_addition_scale
+            window_start += window_size
+
+        return new_vertices, slice_mask
+
+    def scale_uv_x(self):
+        print("Scaling in x direction...")
+        self.scale_uv_x_complete()
+
+    def scale_uv_x_(self):
+        min_x = np.min(self.vertices_np[:, 0])
+        max_x = np.max(self.vertices_np[:, 0])
+        dist_x = max_x - min_x
+        min_z = np.min(self.vertices_np[:, 2])
+        max_z = np.max(self.vertices_np[:, 2])
+        slice_window = 300
+        slice_step = 100
+        max_size = 0
+        new_vertices = deepcopy(self.vertices_np)
+        for slice in range(int(np.floor(min_z)), int(np.ceil(max_z))+1, slice_step):
+            slice_z = [slice-slice_window, slice+slice_window + slice_step]
+            print(f"Slice z: {slice_z}")
+            vertices_slice_z_raw, slice_mask_with_offset = self.scale_uv_x_slice_z(self.vertices_np, slice_z)
+            mask_slice = (vertices_slice_z_raw[:, 2] >= slice) & (vertices_slice_z_raw[:, 2] < slice+slice_step)
+            slice_mask_with_offset_where = np.where(slice_mask_with_offset)[0] # numpy returns copy, cannot do new_vertices[slice_mask_with_offset][mask_slice]
+            slice_mask_with_offset_where_filtered = slice_mask_with_offset_where[mask_slice]
+            if np.sum(mask_slice) == 0 or np.sum(slice_mask_with_offset_where_filtered) == 0:
+                continue
+            vertices_slice_z = vertices_slice_z_raw[mask_slice]
+            # scale slice x value to 0-1
+            min_x_ = np.min(new_vertices[slice_mask_with_offset_where_filtered][:, 0])
+            max_x_ = np.max(new_vertices[slice_mask_with_offset_where_filtered][:, 0])
+            zero_offset = (min_x_ - min_x) / dist_x
+            one_offset = (max_x - max_x_) / dist_x
+            middle_scale_factor = (max_x_ - min_x_) / dist_x
+            max_ = np.max(vertices_slice_z[:, 0])
+            min_ = np.min(vertices_slice_z[:, 0])
+            s = max_-min_
+            if s == 0:
+                s = 1.0
+                print("Warning: Slice has size 0, adjusting based on offset values... s may be 1.")
+            max_size = max(max_size, s)
+
+            vertices_slice_z[:, 0] = zero_offset + middle_scale_factor*(vertices_slice_z[:, 0] - min_) / s
+            new_vertices[slice_mask_with_offset_where_filtered] = vertices_slice_z
+
+        mask_bad = np.logical_or(new_vertices[:, 0] < 0, new_vertices[:, 0] > 1)
+        indices_bad = np.where(mask_bad)
+        print(f"Found {len(indices_bad[0])} bad indices. {indices_bad}")
+        new_vertices[:, 0] = new_vertices[:, 0] * max_size
+        self.vertices_np = new_vertices
+
+    def scale_uv_z(self):
+        print("Scaling in z direction...")
+        # swap x and z axis
+        self.vertices_np[:, [0, 2]] = self.vertices_np[:, [2, 0]]
+        self.scale_uv_x_()
+        # swap back
+        self.vertices_np[:, [0, 2]] = self.vertices_np[:, [2, 0]]
+
+    # # Old function with less accurate flattening related to z height
+    def scale_uv_x_complete(self):
+        min_x = np.min(self.vertices_np[:, 0])
+        max_x = np.max(self.vertices_np[:, 0])
+        print(f"Min and max x: {min_x}, {max_x}")
+
+        window_size = 0.02
+        offset_window_average = 7.0
+        addition_offset = 0
+        processed_vertices = set()
+        new_vertices = deepcopy(self.vertices_np)
+
+        # Sort vertices by x-coordinate
+        sorted_indices = np.argsort(self.vertices_np[:, 0])
+        self.sorted_vertices_np = self.vertices_np[sorted_indices]
+
+        y_offsets = []
+        x_additions = []
+        
+        # window_start = min_x
+        # while window_start <= max_x:
+        window_start_index = 0
+        window_end_index = 0
+        window_start_offset_index = 0
+        window_end_offset_index = 0
+        num_vertices = len(self.vertices_np)
+        stop_x_ind = int(np.floor((max_x - min_x) / window_size)) + 1
+        for window_start_ind in tqdm(range(stop_x_ind)):
+            window_start = window_start_ind * window_size
+
+            # Move window_start_index to the start of the window
+            while window_start_index < num_vertices and self.vertices_np[window_start_index, 0] < window_start:
+                window_start_index += 1
+
+            # Move window_end_index to the end of the window
+            window_end_index = window_start_index
+            while window_end_index < num_vertices and self.vertices_np[window_end_index, 0] <= window_start + window_size:
+                window_end_index += 1
+
+            # Move window_start_offset_index to the start of the window with offset
+            while window_start_offset_index < num_vertices and self.vertices_np[window_start_offset_index, 0] < window_start - offset_window_average:
+                window_start_offset_index += 1
+            
+            # Move window_end_offset_index to the end of the window with offset
+            window_end_offset_index = window_start_offset_index
+            while window_end_offset_index < num_vertices and self.vertices_np[window_end_offset_index, 0] <= window_start + window_size + offset_window_average:
+                window_end_offset_index += 1
+
+            # vertices_mask = (self.vertices_np[:, 0] >= window_start) & (self.vertices_np[:, 0] < window_start + window_size)
+            # vertices_mask_offset = (self.vertices_np[:, 0] >= window_start-offset_window_average) & (self.vertices_np[:, 0] < window_start + window_size+offset_window_average)
+            # y_values_in_window = self.vertices_np[vertices_mask_offset, 1]
+
+            # avg_y_distance = np.mean(y_values_in_window) if y_values_in_window.size else 0
+            avg_y_distance = np.mean(self.vertices_np[window_start_offset_index:window_end_offset_index, 1]) if window_end_offset_index > window_start_offset_index else 0
+            x_addition_scale = (window_size / 360.0) * avg_y_distance * 2 * pi
+            y_offsets.append(avg_y_distance)
+            x_additions.append(x_addition_scale)
+
+            # indices_in_window = np.where(vertices_mask)
+            # for idx in indices_in_window[0]:
+            for idx in range(window_start_index, window_end_index):
+                if idx not in processed_vertices:
+                    new_vertices[idx, 0] = addition_offset + ((self.vertices_np[idx, 0] - window_start) / window_size) * x_addition_scale
+                    new_vertices[idx, 1] -= avg_y_distance
+                    processed_vertices.add(idx)
+
+            addition_offset += x_addition_scale
+            # window_start += window_size
+
+        self.vertices_np = new_vertices
+
+        # build y_offsets in x direction as heightmap
+        x_heightmap = np.zeros(int(np.ceil(np.sum(x_additions)) + 1))
+        y_counter = 0.0
+        additions_start = 0.0
+        for y_counter, y_o in enumerate(y_offsets):
+            additions_end = int(additions_start + x_additions[y_counter])
+            for i in range(int(additions_start), additions_end + 1):
+                if i >= len(x_heightmap):
+                    continue
+                x_heightmap[i] = y_o
+            additions_start += x_additions[y_counter]
+        self.x_heightmap = x_heightmap
+
+    def have_visited_all_vertices(self):
+        """
+        Check if all vertices have been visited.
+        :return: True if all vertices are visited, False otherwise.
+        """
+        return len(self.visited_vertices) == self.vertices_np.shape[0]
+
+    def reset_visited(self):
+        """
+        Reset the set of visited vertices.
+        """
+        self.visited_vertices.clear()
+
+    def get_adjacent_vertices(self, vertex_idx):
+        # Check if the adjacency list exists for the mesh
+        if not hasattr(self, 'adjacency_list'):
+            print("Generating adjacency list...")
+            self.mesh.compute_adjacency_list()  # Compute the adjacency list if it doesn't exist
+            self.adjacency_list = self.mesh.adjacency_list
+        # Get and return adjacent vertex indices directly
+        adjacent = self.adjacency_list[vertex_idx]
+        return adjacent
+
+    def get_unrolled_mesh(self):
+        flattened_mesh = o3d.geometry.TriangleMesh()
+        flattened_mesh.vertices = o3d.utility.Vector3dVector(self.vertices_np)
+        flattened_mesh.triangles = self.mesh.triangles
+        flattened_mesh = flattened_mesh.compute_vertex_normals()
+        flattened_mesh = flattened_mesh.normalize_normals()
+        flattened_mesh = flattened_mesh.compute_triangle_normals()
+        flattened_mesh.orient_triangles()
+        self.flattened_mesh = flattened_mesh
+        print("Flattened mesh created.")
+    
+    def remove_unaligned_triangles(self):
+        """
+        Remove triangles that are not aligned with the x-axis.
+        """
+        self.flattened_mesh = self.flattened_mesh.compute_triangle_normals()
+        # Get the triangle normals
+        triangle_normals = np.asarray(self.flattened_mesh.triangle_normals)
+        # Normalize the triangle normals
+        triangle_normals = triangle_normals / np.linalg.norm(triangle_normals, axis=1)[:, None]
+        print(f"Triangle normals shape: {triangle_normals.shape}")
+        # Get the indices of the triangles that are too faar away from the y axis direction (30 degree)
+        normal_treshold = 0.3
+        mask_abs = np.abs(triangle_normals[:, 1]) < normal_treshold
+        # Find which normal direction is "up"
+        triangles_masked = triangle_normals[mask_abs]
+        direction_plus = triangles_masked[:, 1] >= normal_treshold
+        direction_minus = triangles_masked[:, 1] <= -normal_treshold
+        direction = np.sum(direction_plus) >= np.sum(direction_minus)
+        direction_mask = direction_plus if direction else direction_minus
+
+        unaligned_triangle_indices = np.where(direction_mask)[0]
+        # Remove the unaligned triangles from the mesh
+        self.flattened_mesh.remove_triangles_by_index(unaligned_triangle_indices)
+        self.mesh.remove_triangles_by_index(unaligned_triangle_indices)
+        self.flattened_mesh.remove_unreferenced_vertices()
+        self.mesh.remove_unreferenced_vertices()
+
+    def unoccluded_vertices(self, ray_vector=np.array([0, -1, 0])):
+        # Convert the mesh to tensor form for raycasting
+        mesh = o3d.t.geometry.TriangleMesh.from_legacy(self.flattened_mesh)
+
+        # Create scene and add the mesh
+        scene = o3d.t.geometry.RaycastingScene()
+        scene.add_triangles(mesh)
+
+        # Set ray origins to be safely above the mesh's highest vertex
+        vertices = np.asarray(self.flattened_mesh.vertices)
+        ray_origins = np.copy(vertices)
+        max_y = np.max(ray_origins[:, 1])
+        safe_distance = max_y + 1.0  # Add 1 unit above the highest vertex, adjust if needed
+
+        ray_vector = ray_vector / np.linalg.norm(ray_vector)
+        ray_origins = ((safe_distance - ray_origins[:, 1]) / ray_vector[1])[:, np.newaxis] * ray_vector.reshape((1, 3)) + ray_origins
+
+        # Normalize ray_vector
+        ray_directions = np.zeros_like(ray_origins)  # Downwards along negative y-axis
+        ray_directions[:, 0] = ray_vector[0]
+        ray_directions[:, 1] = ray_vector[1]
+        ray_directions[:, 2] = ray_vector[2]
+
+        rays = np.hstack([ray_origins, ray_directions]).astype(np.float32)  # Each ray is a 6D vector [origin, direction]
+        ans = scene.cast_rays(rays)
+
+        # Determine visibility by comparing ray hit distance
+        # We use a small epsilon to account for floating point inaccuracies
+        epsilon = 1e-1
+        hit_distances = ans['t_hit'].cpu().numpy()
+        print(np.average(hit_distances))
+        vertex_distances = safe_distance - vertices[:, 1]  # Distance from ray origin to vertex
+        visible_mask = hit_distances - vertex_distances > -epsilon
+        print(f"mean dist {np.average(hit_distances - vertex_distances)}")
+
+        return visible_mask
+    
+    def unoccluded_vertices_omnidirectional(self):
+        if self.omnidirectional_view:
+            ray_vectors = [[0, -1, 0], [1, -2, 0], [-1, -2, 0]] # different flattening approaches might benefit from this
+        else:
+            ray_vectors = [[0, -1, 0]]
+        mask_unoccluded = np.zeros(self.vertices_np.shape[0], dtype=bool)
+        for ray_vector in tqdm(ray_vectors, desc="Raycasting"):
+            mask_ = self.unoccluded_vertices(ray_vector)
+            mask_unoccluded = np.logical_or(mask_unoccluded, mask_)
+        return mask_unoccluded
+    
+    def remove_occluded_triangles(self):
+        mask_unoccluded = self.unoccluded_vertices_omnidirectional()
+        print(f"Found {np.sum(mask_unoccluded)} unoccluded vertices. Of {len(mask_unoccluded)} total.")
+        mask_occluded = np.logical_not(mask_unoccluded)
+        # find triangles that are at least partially occluded
+        triangles = np.asarray(self.flattened_mesh.triangles)
+        triangles_occluded_vertices = mask_occluded[triangles]
+        triangles_occluded = np.any(triangles_occluded_vertices, axis=1)
+        # remove occluded triangles
+        self.flattened_mesh.remove_triangles_by_index(np.where(triangles_occluded)[0])
+        self.mesh.remove_triangles_by_index(np.where(triangles_occluded)[0])
+        self.flattened_mesh.remove_unreferenced_vertices()
+        self.mesh.remove_unreferenced_vertices()
+
+    def triangle_area(self, v1, v2, v3):
+        """Calculate the area of a 3D triangle given its vertices."""
+        AB = v2 - v1
+        AC = v3 - v1
+        return 0.5 * np.linalg.norm(np.cross(AB, AC))
+
+    def mesh_triangle_areas(self, mesh):
+        """Calculate the area of all triangles in a mesh."""
+        areas = []
+        vertices = np.asarray(mesh.vertices)
+        for tri in mesh.triangles:
+            v1, v2, v3 = vertices[tri]
+            areas.append(self.triangle_area(v1, v2, v3))
+        return np.array(areas)
+
+    def remove_small_triangles(self):
+        triangles_mesh_area = self.mesh_triangle_areas(self.mesh)
+        mask = triangles_mesh_area > 0.1
+        print(f"Found {len(mask)-np.sum(mask)} triangles with area < 0.1. Of {len(mask)} total. Mask shape {mask.shape}")
+        self.flattened_mesh.remove_triangles_by_index(np.where(np.logical_not(mask))[0])
+        self.mesh.remove_triangles_by_index(np.where(np.logical_not(mask))[0])
+        self.flattened_mesh.remove_unreferenced_vertices()
+        self.mesh.remove_unreferenced_vertices()
+        
+    def remove_large_triangles(self, mesh):
+        triangles_mesh_area = self.mesh_triangle_areas(mesh)
+        mask = triangles_mesh_area < 1000.0
+        print(f"Found {len(mask)-np.sum(mask)} triangles with area > 0.1. Of {len(mask)} total. Mask shape {mask.shape}")
+        mesh.remove_triangles_by_index(np.where(np.logical_not(mask))[0])
+        mesh.remove_unreferenced_vertices()
+        return mesh
+
+    def select_largest_area_cluster(self):
+        index_c, count_c, area_c = self.mesh.cluster_connected_triangles()
+        print(f"Found {len(area_c)} clusters.")
+        largest_cluster_index = np.argmax(area_c)
+        print(f"Largest cluster index: {largest_cluster_index}")
+        area_scale_factor = (0.008**2)/100
+        print(f"Cluster area: {area_scale_factor*area_c[largest_cluster_index]} cmsq")
+        self.mesh.remove_triangles_by_index(np.where(index_c != largest_cluster_index)[0])
+        self.mesh.remove_unreferenced_vertices()
+        self.flattened_mesh.remove_triangles_by_index(np.where(index_c != largest_cluster_index)[0])
+        self.flattened_mesh.remove_unreferenced_vertices()
+
+    def order_vertices(self):
+        """
+        Order the vertices in the mesh in z direction, then x direction.
+        """
+        # Sort vertices lexicographically first by z, then by x
+        vertices_flattened_np = np.asarray(self.flattened_mesh.vertices)
+        sorted_indices = np.lexsort((vertices_flattened_np[:, 0], vertices_flattened_np[:, 2]))
+
+        # Update vertices and normals using the new sorted order
+        self.flattened_mesh.vertices = o3d.utility.Vector3dVector(vertices_flattened_np[sorted_indices])
+        if self.flattened_mesh.has_vertex_normals():
+            self.flattened_mesh.vertex_normals = o3d.utility.Vector3dVector(np.asarray(self.flattened_mesh.vertex_normals)[sorted_indices])
+
+        # Update the triangle indices based on the new vertex order
+        mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(sorted_indices)}
+        triangles = np.asarray(self.flattened_mesh.triangles)
+        for triangle in triangles:
+            for j, vertex_idx in enumerate(triangle):
+                triangle[j] = mapping[vertex_idx]
+        self.flattened_mesh.triangles = o3d.utility.Vector3iVector(triangles)
+
+        # Update the other mesh as well:
+        # Update vertices and normals using the new sorted order
+        self.mesh.vertices = o3d.utility.Vector3dVector(np.asarray(self.mesh.vertices)[sorted_indices])
+        if self.mesh.has_vertex_normals():
+            self.mesh.vertex_normals = o3d.utility.Vector3dVector(np.asarray(self.mesh.vertex_normals)[sorted_indices])
+
+        # Update the triangle indices based on the new vertex order
+        mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(sorted_indices)}
+        triangles = np.asarray(self.mesh.triangles)
+        for triangle in triangles:
+            for j, vertex_idx in enumerate(triangle):
+                triangle[j] = mapping[vertex_idx]
+        self.mesh.triangles = o3d.utility.Vector3iVector(triangles)
+
+        
+    def compute(self):
+        self.compute_uv_with_bfs(0)
+        self.scale_uv_x()
+        self.get_unrolled_mesh()
+        self.remove_occluded_triangles()
+        self.remove_small_triangles()
+        self.order_vertices()
+
+        return self.mesh, self.flattened_mesh
+    
+class OrthographicUVMapper:
+    def __init__(self, original_mesh, flattened_mesh, x_heightmap, kernel_size, gradient_factor, heatmap_path, umbilicus_path):
+        self.original_mesh = original_mesh
+        self.flattened_mesh = flattened_mesh
+        self.x_heightmap = x_heightmap
+        self.kernel_size = kernel_size
+        self.gradient_factor = gradient_factor
+        self.heatmap_path = heatmap_path
+
+        # Assuming meshes are of type o3d.geometry.TriangleMesh
+        self.original_vertices_np = np.asarray(self.original_mesh.vertices)
+        self.flattened_vertices_np = np.asarray(self.flattened_mesh.vertices)
+
+        self.uv_coordinates = {}
+
+        self.umbilicus_path = umbilicus_path
+        self.init_umbilicus(umbilicus_path)
+
+    def init_umbilicus(self, umbilicus_path):
+        axis_indices = [2, 0, 1]
+        umbilicus_data = load_xyz_from_file(umbilicus_path)
+        # scale and swap axis
+        umbilicus_data = scale_points(umbilicus_data, 1.0, axis_offset=-500)
+        umbilicus_data, _ = shuffling_points_axis(umbilicus_data, umbilicus_data, axis_indices)
+        # Define a wrapper function for umbilicus_xz_at_y
+        self.umbilicus_func = lambda z: umbilicus_xy_at_z(umbilicus_data, z)
+
+    def mask_heightmap(self, size):
+        size = int(np.ceil(size[0])), int(np.ceil(size[1]))
+        # Convert the mesh to tensor form for raycasting
+        mesh = o3d.t.geometry.TriangleMesh.from_legacy(self.flattened_mesh)
+
+        # Create scene and add the mesh
+        scene = o3d.t.geometry.RaycastingScene()
+        scene.add_triangles(mesh)
+
+        # Set ray origins to be safely above the mesh's highest vertex
+        vertices = np.asarray(self.flattened_mesh.vertices)
+        max_y = np.max(vertices[:, 1])
+        safe_distance = max_y + 1.0  # Add 1 unit above the highest vertex, adjust if needed
+        # generate pixels xyz with y = safe_distance
+        pixels_pos = np.zeros((size[0]*size[1], 3))
+        # assign positions
+        for i in range(size[0]):
+            for j in range(size[1]):
+                pixels_pos[i*size[1]+j] = [i, safe_distance, j]
+
+        ray_origins = np.copy(pixels_pos)
+        ray_vector = np.array([0, -1, 0])
+        ray_vector = ray_vector / np.linalg.norm(ray_vector)
+
+        # Normalize ray_vector
+        ray_directions = np.zeros_like(ray_origins)  # Downwards along negative y-axis
+        ray_directions[:, 0] = ray_vector[0]
+        ray_directions[:, 1] = ray_vector[1]
+        ray_directions[:, 2] = ray_vector[2]
+
+        rays = np.hstack([ray_origins, ray_directions]).astype(np.float32)  # Each ray is a 6D vector [origin, direction]
+        ans = scene.cast_rays(rays)
+
+        # Determine visibility by comparing ray hit distance
+        # We use a small epsilon to account for floating point inaccuracies
+        hit_distances = ans['t_hit'].cpu().numpy() - safe_distance
+        print(np.average(hit_distances))
+        visible_mask = hit_distances < float("inf")
+        visible_mask = visible_mask.reshape((size[0], size[1]))
+
+        heightmap_dist = hit_distances.reshape((size[0], size[1]))
+        # add heightmap x offset. self.x_heightmap contains for each x value the y offset
+        heightmap_original = heightmap_dist + self.x_heightmap[:heightmap_dist.shape[0]][:, np.newaxis]
+        heightmap_offset = np.zeros_like(heightmap_original) + self.x_heightmap[:heightmap_dist.shape[0]][:, np.newaxis]
+
+
+        # set all occluded pixels to 0
+        heightmap_offset[np.logical_not(visible_mask)] = 0
+        heightmap_original[np.logical_not(visible_mask)] = 0
+        heightmap_dist[np.logical_not(visible_mask)] = 0
+
+        return visible_mask, heightmap_offset, heightmap_original, heightmap_dist
+    
+    def uv_heatmap(self, size):
+        size = int(np.ceil(size[0])), int(np.ceil(size[1]))
+        visible_mask, heightmap_offset, heightmap_original, heightmap_dist = self.mask_heightmap(size)
+        heatmap = np.zeros_like(heightmap_offset)
+        heatmap[visible_mask] = heightmap_offset[visible_mask] / heightmap_original[visible_mask]
+        print(f"Min and max heatmap: {np.min(heatmap)}, {np.max(heatmap)}")
+        print(f"Min and max heightmap dist: {np.min(heightmap_dist)}, {np.max(heightmap_dist)}")
+        print(f"Number visible pixels: {np.sum(visible_mask)} nr invisible pixels: {np.sum(np.logical_not(visible_mask))}")
+
+        # resize heatmap and visible_mask
+        scaleing = 0.05
+        original_size = heatmap.shape
+        heatmap = cv2.resize(heatmap, (int(np.ceil(scaleing*original_size[1]+1)), int(np.ceil(scaleing*original_size[0]+1))), interpolation=cv2.INTER_AREA)
+        heightmap_offset = cv2.resize(heightmap_offset, (int(np.ceil(scaleing*original_size[1]+1)), int(np.ceil(scaleing*original_size[0]+1))), interpolation=cv2.INTER_AREA)
+        visible_mask_resized = cv2.resize(visible_mask.astype(np.float32), (int(np.ceil(scaleing*original_size[1]+1)), int(np.ceil(scaleing*original_size[0]+1))), interpolation=cv2.INTER_AREA)
+        heightmap_dist_resized = cv2.resize(heightmap_dist, (int(np.ceil(scaleing*original_size[1]+1)), int(np.ceil(scaleing*original_size[0]+1))), interpolation=cv2.INTER_AREA)
+
+        # adjust heatmap and visible mask on each side with kernel size + 1
+        kernel_size_adj = self.kernel_size
+        heatmap_padded = np.zeros((heatmap.shape[0] + 2 * kernel_size_adj, heatmap.shape[1] + 2 * kernel_size_adj))
+        heatmap_padded[kernel_size_adj:-kernel_size_adj, kernel_size_adj:-kernel_size_adj] = heatmap
+        heightmap_offset_padded = np.zeros((heightmap_offset.shape[0] + 2 * kernel_size_adj, heightmap_offset.shape[1] + 2 * kernel_size_adj))
+        heightmap_offset_padded[kernel_size_adj:-kernel_size_adj, kernel_size_adj:-kernel_size_adj] = heightmap_offset
+        visible_mask_padded = np.zeros((visible_mask_resized.shape[0] + 2 * kernel_size_adj, visible_mask_resized.shape[1] + 2 * kernel_size_adj), dtype=bool)
+        visible_mask_padded[kernel_size_adj:-kernel_size_adj, kernel_size_adj:-kernel_size_adj] = visible_mask_resized
+        heightmap_dist_padded = np.zeros((heightmap_dist_resized.shape[0] + 2 * kernel_size_adj, heightmap_dist_resized.shape[1] + 2 * kernel_size_adj))
+        heightmap_dist_padded[kernel_size_adj:-kernel_size_adj, kernel_size_adj:-kernel_size_adj] = heightmap_dist_resized
+
+        # gaussian blurr heatmap and visible mask, import from scipy
+        heatmap_blurred = scipy.ndimage.gaussian_filter(heatmap_padded, sigma=self.kernel_size, truncate=1.0)
+        heightmap_offset_blurred = scipy.ndimage.gaussian_filter(heightmap_offset_padded.astype(np.float32), sigma=self.kernel_size, truncate=1.0)
+        visible_mask_blurred = scipy.ndimage.gaussian_filter(visible_mask_padded.astype(np.float32), sigma=self.kernel_size, truncate=1.0)
+        heightmap_dist_blurred = scipy.ndimage.gaussian_filter(heightmap_dist_padded.astype(np.float32), sigma=self.kernel_size, truncate=1.0)
+
+        # adjust heatmap blurred by dividing by visible mask blurred
+        mask_nonzero = visible_mask_blurred > 0
+        heatmap_blurred[mask_nonzero] /= visible_mask_blurred[mask_nonzero]
+        heightmap_offset_blurred[mask_nonzero] /= visible_mask_blurred[mask_nonzero]
+        heightmap_dist_blurred[mask_nonzero] /= visible_mask_blurred[mask_nonzero]
+
+        # cut away padding
+        heatmap_blurred = heatmap_blurred[kernel_size_adj:-kernel_size_adj, kernel_size_adj:-kernel_size_adj]
+        heightmap_offset_blurred = heightmap_offset_blurred[kernel_size_adj:-kernel_size_adj, kernel_size_adj:-kernel_size_adj]
+        visible_mask_blurred = visible_mask_blurred[kernel_size_adj:-kernel_size_adj, kernel_size_adj:-kernel_size_adj]
+        heightmap_dist_blurred = heightmap_dist_blurred[kernel_size_adj:-kernel_size_adj, kernel_size_adj:-kernel_size_adj]
+        
+        return heatmap_blurred, heightmap_offset_blurred, heightmap_dist_blurred, visible_mask_resized, scaleing
+    
+    def compute_image_gradient(self, image):
+        """
+        Compute the image gradient using Sobel operators.
+        
+        Parameters:
+        - image: A grayscale image of shape (height, width).
+        
+        Returns:
+        - gradient: A numpy array of shape (height, width, 2) where each pixel contains [grad_x, grad_y].
+        """
+        
+        # Compute the x and y gradients using the Sobel operator
+        grad_x = cv2.Sobel(image, cv2.CV_64F, 1, 0, ksize=5)
+        grad_y = cv2.Sobel(image, cv2.CV_64F, 0, 1, ksize=5)
+        
+        # Stack the gradients along the third dimension to get the desired output shape
+        gradient = np.stack((grad_x, grad_y), axis=-1)
+        
+        return gradient
+    
+    def uv_undeformation_map(self, triangle_uvs, size):
+        heatmap, heightmap, heightmap_dist, visible_mask, scaleing = self.uv_heatmap(size)
+        heatmap_gradients = self.compute_image_gradient(heatmap)
+        # save heatmap as png
+        try:
+            heatmap_writing = heatmap.copy()
+            cv2.imwrite(self.heatmap_path, heatmap_writing)
+        except Exception as e:
+            print(f"Error writing heatmap: {str(e)[:500]}")
+
+        # adjust each triangle uv coordinate by the gradient
+        for idx, uv in enumerate(triangle_uvs):
+                uv = np.array(uv)
+                map_index = int(np.ceil(uv[0]*scaleing)), int(np.ceil(uv[1]*scaleing))
+                gradient_uv = heatmap_gradients[map_index]
+                scaled_gradient_uv = gradient_uv * self.gradient_factor
+                uv_heatmap_scaling = scaled_gradient_uv * (1.0 + np.clip(np.abs(heightmap_dist[map_index]/10.0) ** 2, 0, 50))
+                uv = uv + uv_heatmap_scaling
+                triangle_uvs[idx] = uv
+        return triangle_uvs
+
+    def add_tif(self, size):
+        self.size = size
+        # # white tif of size
+        # tif = np.ones((int(np.ceil(1)), int(np.ceil(1)), 3), dtype=np.uint8)
+        
+        # # Convert the numpy array to an Open3D Image and assign it as the mesh texture
+        # texture = o3d.geometry.Image(tif)
+        # self.original_mesh.textures = [texture]
+
+    def compute(self, path, skip_underformation_step=False):
+        """
+        Computes UV coordinates for the original mesh by orthographically
+        projecting its vertices onto the XZ plane.
+        """
+
+        print("Starting to compute UV orthographic coordinates...")
+
+        for idx, vertex in enumerate(self.flattened_vertices_np):
+            u = vertex[0]  # x-coordinate
+            v = vertex[2]  # z-coordinate
+            self.uv_coordinates[idx] = (u, v)
+
+        assert len(self.uv_coordinates) == len(self.original_vertices_np), "Not all vertices have UV coordinates!"
+
+        # Updating UVs in original mesh
+        triangle_uvs = []
+        triangles = np.asarray(self.original_mesh.triangles)
+        for triangle in triangles:
+            triangle_uvs.append([
+                self.uv_coordinates[triangle[0]],
+                self.uv_coordinates[triangle[1]],
+                self.uv_coordinates[triangle[2]]
+            ])
+        triangle_uvs = np.array(triangle_uvs)
+        triangle_uvs = np.reshape(triangle_uvs, (-1, 2))
+
+        max_u = np.ceil(np.max(triangle_uvs[:, 0])) + 1
+        max_v = np.ceil(np.max(triangle_uvs[:, 1])) + 1
+        if not skip_underformation_step:
+            self.uv_undeformation_map(triangle_uvs, [max_u, max_v])
+        
+        # Adjust to 0,0 origin
+        min_u = np.min(triangle_uvs[:, 0])
+        min_v = np.min(triangle_uvs[:, 1])
+        triangle_uvs[:, 0] -= min_u
+        triangle_uvs[:, 1] -= min_v
+        # Scale to 1,1
+        max_u = np.ceil(np.max(triangle_uvs[:, 0])) + 1
+        max_v = np.ceil(np.max(triangle_uvs[:, 1])) + 1
+        print(f"Min and max u: {min_u}->0.0, {max_u}, min and max v: {min_v}->0.0, {max_v}")
+
+        self.add_tif([max_u, max_v])
+
+        triangle_uvs[:, 0] /= max_u
+        triangle_uvs[:, 1] /= max_v
+
+        # Assign the UV coordinates to the mesh
+        self.original_mesh.triangle_uvs = o3d.utility.Vector2dVector(triangle_uvs)
+        int_vec = np.array([0] * triangle_uvs.shape[0]).astype(np.int32)
+        self.original_mesh.triangle_material_ids = o3d.utility.IntVector(int_vec)
+        # Save resulting original mesh with UV map
+        self.original_mesh = self.original_mesh.compute_vertex_normals()
+        self.original_mesh = self.original_mesh.normalize_normals()
+        self.original_mesh = self.original_mesh.compute_triangle_normals()
+        self.original_mesh = self.original_mesh.normalize_normals()
+        oriented_triangles = self.original_mesh.orient_triangles()
+        print(f"Mesh got triangles oriented: {oriented_triangles}")
+        
+        self.original_mesh = orient_normals_towards_umbilicus_mesh(self.original_mesh, self.umbilicus_func)
+        self.original_mesh = self.original_mesh.compute_triangle_normals()
+        self.original_mesh = self.original_mesh.normalize_normals()
+        if not skip_underformation_step:
+            self.original_mesh = smooth_mesh_normals(self.original_mesh, self.flattened_mesh)
+        self.save(path)
+
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(np.array(self.original_mesh.vertices))
+        mesh.triangles = o3d.utility.Vector3iVector(np.array(self.original_mesh.triangles))
+        mesh.triangle_normals = o3d.utility.Vector3dVector(np.array(self.original_mesh.triangle_normals))
+        mesh.vertex_normals = o3d.utility.Vector3dVector(np.array(self.original_mesh.vertex_normals))
+        self.original_mesh = mesh
+        self.save(path[:-4] + "_sanity_check.obj")
+
+    def save(self, path):
+        save_obj(path, self.original_mesh)
+        # png 
+        path_png = path[:-4] + "_0.png"
+        from PIL import Image
+        # This disables the decompression bomb protection in Pillow
+        Image.MAX_IMAGE_PIXELS = None
+
+        # Create a grayscale image with a specified size
+        n, m = int(np.ceil(self.size[0])), int(np.ceil(self.size[1]))  # replace with your dimensions
+        image = Image.new('L', (n, m), color=255)  # 255 for white background, 0 for black
+
+        # Save the image
+        image.save(path_png)
+
+class DelaunyMeshManifold:
+    def __init__(self, mesh_uv, mesh_flattened, umbilicus_path):
+        self.mesh_uv = mesh_uv
+        self.mesh_flattened = mesh_flattened
+        self.umbilicus_path = umbilicus_path
+        self.init_umbilicus(umbilicus_path)
+
+    def init_umbilicus(self, umbilicus_path):
+        axis_indices = [2, 0, 1]
+        umbilicus_data = load_xyz_from_file(umbilicus_path)
+        # scale and swap axis
+        umbilicus_data = scale_points(umbilicus_data, 1.0, axis_offset=-500)
+        umbilicus_data, _ = shuffling_points_axis(umbilicus_data, umbilicus_data, axis_indices)
+        # Define a wrapper function for umbilicus_xz_at_y
+        self.umbilicus_func = lambda z: umbilicus_xy_at_z(umbilicus_data, z)
+
+    def compute(self, path):
+        points = np.asarray(self.mesh_flattened.vertices)
+        points_2d = points[:, [0, 2]]
+        print("Performing Delauny triangulation...")
+        tri = Delaunay(points_2d)
+        print("Done.")
+        triangles = o3d.utility.Vector3iVector(tri.simplices)
+        self.mesh_uv.triangles = triangles
+        self.mesh_flattened.triangles = triangles
+        filter_mesh_by_edge_length(self.mesh_uv, self.mesh_flattened, 1000)
+        # check if mesh in manifold
+        print(f"Mesh is manifold. vertex: {self.mesh_uv.is_vertex_manifold()}, edge: {self.mesh_uv.is_edge_manifold()}, watertight: {self.mesh_uv.is_watertight()}")
+        self.mesh_uv = self.mesh_uv.compute_vertex_normals()
+        self.mesh_uv = self.mesh_uv.normalize_normals()
+        oriented_triangles = self.mesh_uv.orient_triangles()
+        print(f"Delauny mesh got triangles oriented: {oriented_triangles}")
+        self.mesh_uv = orient_normals_towards_umbilicus_mesh(self.mesh_uv, self.umbilicus_func)
+        self.mesh_uv = self.mesh_uv.compute_triangle_normals()
+        self.mesh_uv = self.mesh_uv.normalize_normals()
+        
+        save_obj(path, self.mesh_uv)
+        return self.mesh_uv, self.mesh_flattened
+    
+    
+class OrderedPointSet:
+    def __init__(self, mesh, flattened_mesh, kernel, kernel_expansion_step, line_step, z_step=1):
+        if mesh is None:
+            return
+        self.mesh = mesh
+        self.flattened_mesh = flattened_mesh
+        self.vertices_volume = np.asarray(self.mesh.vertices)
+        self.vertices_np = np.asarray(self.flattened_mesh.vertices)
+        self.kernel = kernel
+        self.kernel_expansion_step = kernel_expansion_step
+        self.line_step = line_step
+        self.z_step = z_step
+
+        self.min_z = int(np.min(self.vertices_np[:, 2]))
+        self.max_z = int(np.max(self.vertices_np[:, 2]))
+        self.min_x = np.min(self.vertices_np[:, 0])
+        self.max_x = np.max(self.vertices_np[:, 0])
+
+    def generate_z_pointset(self, z):
+        line = []
+        for x in range(int(self.min_x), int(self.max_x)+1, self.line_step):
+            # get all points in kernel around x,z, y=inf
+            kernel_mask = (self.vertices_np[:, 0] >= x-self.kernel) & (self.vertices_np[:, 0] < x+self.kernel) 
+            kernel_z = self.kernel
+            while True:
+                kernel_z_mask = (self.vertices_np[:, 2] >= z-kernel_z) & (self.vertices_np[:, 2] < z+kernel_z)
+                mask = np.logical_and(kernel_mask, kernel_z_mask)
+                if np.sum(mask) > 0:
+                    break
+                kernel_z += self.kernel_expansion_step
+            kernel_points = self.vertices_volume[mask]
+            line_point = np.mean(kernel_points, axis=0)
+            line_point[2] = z
+            line.append(line_point)
+        return line
+            
+    
+    def compute(self):
+        pointsets = []
+        self.max_z = 10
+        for i in tqdm(range(self.min_z, self.max_z+1, self.z_step)):
+            pointsets.append(self.generate_z_pointset(i))
+
+        return pointsets
+    
+    def save_vcps(self, path, pointsets, scroll1_id="20230422211403"):
+        pointsets = np.asarray(pointsets)
+        
+        name = current_time_string()
+        # create folder
+        path_id = os.path.join(path, name)
+        os.makedirs(path_id, exist_ok=True)
+        write_ordered_point_set_binary(path_id, pointsets)
+        create_meta_json(path_id, name, scroll1_id)
+
+def compute(path, umbilicus_path, enable_delauny, skip_underformation_step=False):
+    print(f"Adding UV coordinates to mesh {path}")
+
+    mesh = load_obj(path)
+    print(f"Loaded mesh with {len(mesh.vertices)} vertices and {len(mesh.triangles)} triangles.")
+    mesh_flattener = MeshFlattener(mesh, umbilicus_path, omnidirectional_view=not enable_delauny)
+    mesh, flattened_mesh = mesh_flattener.compute()
+    x_heightmap = mesh_flattener.x_heightmap
+
+    path_flattened = path.replace(".obj", "_flattened.obj")
+    save_obj(path_flattened, flattened_mesh)
+
+    if enable_delauny:
+        delauny_triangulator = DelaunyMeshManifold(mesh, flattened_mesh, umbilicus_path)
+        path_delauny = path.replace(".obj", "_delauny.obj")
+        mesh, flattened_mesh = delauny_triangulator.compute(path_delauny)
+
+
+    ortho_mapper = OrthographicUVMapper(mesh, flattened_mesh, x_heightmap, kernel_size=75, gradient_factor=-10.00, heatmap_path=path.replace(".obj", "_heatmap.png"), umbilicus_path=umbilicus_path)
+    path_uv = path.replace(".obj", "_uv.obj")
+    ortho_mapper.compute(path_uv, skip_underformation_step=skip_underformation_step)
+    return path_uv
+        
+def main():
+    cut = ""
+    path = f'/media/julian/SSD4TB/scroll3_surface_points/{cut}point_cloud_colorized_verso_subvolume_blocks.obj'
+    umbilicus_path = '/media/julian/HDD8TB/PHerc0332.volpkg/volumes/2dtifs_8um_grids/umbilicus.txt'
+
+    import argparse
+    # Create an argument parser
+    parser = argparse.ArgumentParser(description='Add UV coordinates to a ThaumatoAnakalyptor papyrus surface mesh (.obj). output mesh has addition "_uv.obj" in name.')
+    parser.add_argument('--path', type=str, help='Path of .obj Mesh', default=path)
+    parser.add_argument('--umbilicus_path', type=str, help='Path of center umbilicus positions for the mesh scroll', default=umbilicus_path)
+    parser.add_argument('--enable_delauny', action='store_true', help='Flag, enables the mesh refinement step with delauny mesh reconstruction from 2D flattening')
+    parser.add_argument('--skip_underformation_step', action='store_true', help='Flag, skips the underformation step')
+
+    # Take arguments back over
+    args = parser.parse_args()
+    print(f"Mesh to UV arguments: {args}")
+
+    path = args.path
+    umbilicus_path = args.umbilicus_path
+    enable_delauny = args.enable_delauny
+    skip_underformation_step = args.skip_underformation_step
+    # Compute UV coordinates for the mesh
+    compute(path, umbilicus_path, enable_delauny, skip_underformation_step)
+
+if __name__ == '__main__':
+    main()

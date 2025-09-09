@@ -1,0 +1,100 @@
+base_path: "/mnt/localdisk/scrolls/Scroll1.volpkg/paths"
+scripts:
+  render_surface_volumes:
+    variables:
+      path_id_: "[0-9a-z_]+"
+      path_id: "[0-9]+"
+    permutations:
+      - "${path_id_}/${path_id}.obj"
+    on_change:
+      - "${base_path}/${path_id_}/${path_id}.obj"
+    recompute_untracked: True
+    recompute_allways: True
+    commands:
+      - command1:
+        workspace: "/workspace"
+        docker_command:
+          volumes:
+            -   host_path: "${base_path}/${path_id_}"
+                container_path: "/scroll.volpkg/paths/${path_id}"
+                write_access: True
+            -   host_path: "/app/scrolls/ThaumatoAnakalyptor/"
+                container_path: "/workspace"
+                write_access: True
+            -   host_path: "/mnt/localdisk/scrolls/1/54keV_7.91um.zarr"
+                container_path: "/54keV_7.91um.zarr"
+                write_access: False
+            -   host_path: "/tmp/.X11-unix"
+                container_path: "/tmp/.X11-unix"
+          environment:
+            DISPLAY: "DISPLAY"
+            MAX_TILE_SIZE: "200000000000"
+            OPENCV_IO_MAX_IMAGE_PIXELS: "4294967295"
+            CV_IO_MAX_IMAGE_PIXELS: "4294967295"
+          name: "thaumato_image"
+        script_commands:
+          - "sh -c 'cd /scroll.volpkg/paths && ls'"
+          - "sh -c 'cd /scroll.volpkg/paths/${path_id} && mkdir -p layers && cd layers && ls && rm -rf *'"
+          - "python3 -m ThaumatoAnakalyptor.mesh_to_surface /scroll.volpkg/paths/${path_id}/${path_id}.obj /54keV_7.91um.zarr --format jpg"
+          - "sh -c 'cd /scroll.volpkg/paths/${path_id}/layers && ls'"
+      - command2:
+        workspace: "/workspace"
+        docker_command:
+          volumes:
+            -   host_path: "${base_path}/${path_id_}"
+                container_path: "/scroll.volpkg/paths/${path_id}"
+                write_access: True
+            -   host_path: "/mnt/localdisk/scrolls/1/54keV_7.91um.zarr"
+                container_path: "/54keV_7.91um.zarr"
+                write_access: False
+            -   host_path: "/mnt/localdisk/julian/scroll2zarr/"
+                container_path: "/workspace"
+                write_access: True
+            -   host_path: "/tmp/.X11-unix"
+                container_path: "/tmp/.X11-unix"
+          environment:
+            DISPLAY: "DISPLAY"
+            MAX_TILE_SIZE: "200000000000"
+            OPENCV_IO_MAX_IMAGE_PIXELS: "4294967295"
+            CV_IO_MAX_IMAGE_PIXELS: "4294967295"
+          name: "scroll2zarr"
+        script_commands:
+          - "sh -c 'cd /scroll.volpkg/paths && rm -rf ${path_id}.zarr'"
+          - "sh -c 'cd /scroll.volpkg/paths/${path_id} && rm -rf ${path_id}.zarr'"
+          - "python3 scroll_to_ome.py /scroll.volpkg/paths/${path_id}/layers /scroll.volpkg/paths/${path_id}/${path_id}.zarr --chunk_size 512 512 4"
+# sudo docker run -it --rm --shm-size=150g -v /home/data/public/full-scrolls:/scrolls -v /home/giorgio/output:/output scroll2zarr python scroll_to_ome.py /scrolls/Scroll2/PHercParis3.volpkg/volumes/20230212125146 /output --standardize
+# base_path: "/media/julian/2"
+# scripts:
+#   render_surface_volumes:
+#     variables:
+#       scroll: "[^/]*?.volpkg"
+#       path_id: "scroll-builder-test_[0-9]+"
+#       obj_id: "[0-9]+"
+#       path: "${scroll}/${path_id}"
+#     permutations:
+#       - "${path}/${obj_id}.obj"
+#     on_change:
+#       - "${base_path}/${path}/${obj_id}.obj"
+#       - "/home/julian/gitThaumato/ThaumatoAnakalyptor/ThaumatoAnakalyptor/mesh_to_surface.py"
+#     recompute_untracked: True
+#     recompute_allways: False
+#     commands:
+#       - command1:
+#         docker_command: 
+#           volumes: 
+#             -   host_path: "${base_path}/${scroll}"
+#                 container_path: "/scroll.volpkg"
+#                 write_access: False
+#             -   host_path: "${base_path}/${scroll}/${path_id}"
+#                 container_path: "/scroll.volpkg/${path_id}"
+#                 write_access: True
+#             -   host_path: "/home/julian/gitThaumato/ThaumatoAnakalyptor/"
+#                 container_path: "/workspace"
+#                 write_access: True
+#             -   host_path: "/tmp/.X11-unix"
+#                 container_path: "/tmp/.X11-unix"
+#           environment:
+#             DISPLAY: "DISPLAY"
+#           name: "thaumato_image"
+#         script_commands: 
+#           - "python3 -m ThaumatoAnakalyptor.mesh_to_surface /scroll.volpkg/${path_id}/${obj_id}.obj /scroll.volpkg/volumes/scroll1_grids --display"

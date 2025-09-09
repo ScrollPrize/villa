@@ -1,0 +1,21 @@
+# Vesuvius Cubes Configuration File
+# This file maps scroll IDs, energy levels, and resolutions to their respective annotated cube URLs
+
+# Example configuration for Scroll 1
+1:
+  # Energy level 54
+  54:
+    # Resolution 7.91
+    7.91:
+      # Cube coordinate in format ZZZZZ_YYYYY_XXXXX
+      02256_02512_04816: "https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumetric-instance-labels/instance-labels/02256_02512_04816/"
+      # You can add more cubes here following the same format
+
+# You can add more scrolls following the same structure:
+# scroll_id:
+#   energy:
+#     resolution:
+#       ZZZZZ_YYYYY_XXXXX: "url_to_cube"
+
+# Note: Replace these example URLs with the actual data sources you want to use
+# For more information, visit: https://github.com/ScrollPrize/villa

@@ -1,0 +1,119 @@
+name: 'Build crackle-viewer'
+
+permissions:
+  contents: write
+  actions: write
+  checks: write
+  deployments: write
+  issues: write
+  packages: write
+  pull-requests: write
+  repository-projects: write
+  security-events: write
+  statuses: write
+  
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'crackle-viewer/**'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'crackle-viewer/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-20.04, macos-12, windows-2019]
+    steps:
+    - uses: actions/checkout@v2
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.11'
+    - name: Install Ubuntu dependencies
+      if: matrix.os == 'ubuntu-20.04'
+      run: sudo apt-get install -y python3-dev python3-pip build-essential gfortran libopenblas-dev liblapack-dev
+    - name: Install PyInstaller and Dependencies
+      working-directory: ${{ github.workspace }}/crackle-viewer
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+    - name: Build with PyInstaller
+      working-directory: ${{ github.workspace }}/crackle-viewer
+      run: |
+        pyinstaller crackle_viewer.spec
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ runner.os }}-Executable
+        path: dist/*
+
+    - name: Create or Get Release
+      id: create_release
+      uses: actions/github-script@v5
+      with:
+        script: |
+          const latestCommitSha = process.env.GITHUB_SHA.substring(0, 7); // Use the first 7 characters of the SHA
+          const fullCommitSha = process.env.GITHUB_SHA; // Full commit SHA for commitish
+          const releaseName = `release-${latestCommitSha}`;
+          const tagName = `v1.0.0-${latestCommitSha}`; // Valid tag name
+
+          let release;
+          try {
+            // Try to get the release by tag
+            release = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag: tagName
+            });
+            console.log(`Release already exists: ${release.data.id}`);
+          } catch (error) {
+            if (error.status === 404) {
+              // If release does not exist, create a new one
+              console.log('Creating new release');
+              release = await github.rest.repos.createRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: tagName,
+                name: releaseName,
+                draft: false,
+                prerelease: false,
+                target_commitish: fullCommitSha
+              });
+            } else {
+              throw error;
+            }
+          }
+
+          core.setOutput('upload_url', release.data.upload_url);
+    
+    - name: Zip Executable and Dependencies
+      shell: pwsh
+      working-directory: ${{ github.workspace }}/crackle-viewer
+      run: |
+        $osType = "${{ runner.os }}"
+        if ($osType -eq "Windows") {
+          # PowerShell command for Windows
+          Compress-Archive -Path dist/* -DestinationPath "$osType-Executable.zip"
+        } else {
+          # Use PowerShell's native capabilities to handle Linux/macOS zipping if necessary
+          & bash -c "cd dist && zip -r ../$osType-Executable.zip ./* && cd .."
+        }
+
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ${{ github.workspace }}/crackle-viewer/${{ runner.os }}-Executable.zip
+        asset_name: ${{ runner.os }}.zip
+        asset_content_type: application/zip

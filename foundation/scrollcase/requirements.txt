@@ -1,0 +1,6 @@
+-e .
+uv
+ipykernel
+nbconvert
+tqdm
+git+https://github.com/gumyr/bd_warehouse

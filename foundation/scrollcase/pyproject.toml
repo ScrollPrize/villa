@@ -1,0 +1,57 @@
+[project]
+dependencies = [
+    "build123d @ git+https://github.com/gumyr/build123d",
+    "bd_warehouse @ git+https://github.com/gumyr/bd_warehouse",
+    "numpy",
+    "trimesh",
+    "ocp-vscode",
+    "meshlib",
+    "plotly",
+]
+name = "scrollcase"
+version = "0.1.0"
+authors = [{ name = "Alex Koen" }]
+description = "Herculaneum scroll case generator"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+target-version = "py310"
+extend-include = ["*.ipynb"]
+
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "I",
+    "N",
+    "A",
+    "B",
+    "F",
+    "D",
+    "FBT",
+    "C4",
+    "SIM",
+    "TD",
+    "PL",
+    "TRY",
+    "NPY",
+    "PERF",
+    "RUF",
+]
+ignore = [
+    "TRY003",  # Exception with string (vs. defining custom exception)
+    "PLR2004", # Magic number
+    "SIM117",  # Multiple with statements
+    "F405",    # Star imports
+]
+pydocstyle.convention = "google"
+
+
+[tool.pyright]
+pythonVersion = "3.10"

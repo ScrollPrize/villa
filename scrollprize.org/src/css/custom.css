@@ -1,0 +1,275 @@
+/**
+ * Any CSS included here will be global. The classic template
+ * bundles Infima by default. Infima is a CSS framework designed to
+ * work well for content-centric websites.
+ */
+
+/* https://dev.to/sajclarke_62/using-tailwindcss-v3-in-docusaurus-in-5-steps-5c26 */
+/* Load KaTeX styles first to avoid overriding other styles */
+@import "katex/dist/katex.min.css";
+
+/* Tailwind should come after KaTeX to avoid getting overridden */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* You can override the default Infima variables here. */
+:root {
+  /* From https://colorbox.io/?c0=%26p%24s%24%3D7%26p%24h%24st%24%3D10%26p%24h%24e%24%3D0%26p%24h%24c%24%3Deqo%26p%24sa%24st%24%3D0.3%26p%24sa%24e%24%3D1%26p%24sa%24r%24%3D1%26p%24sa%24c%24%3Deqo%26p%24b%24st%24%3D1%26p%24b%24e%24%3D0.33%26p%24b%24c%24%3Deqti%26o%24n%24%3DRed%26o%24ms%24%3D%5B%5D%26o%24ro%24%3Dccw */
+  --ifm-color-primary-lightest: #ffbfb3;
+  --ifm-color-primary-lighter: #fe8a7a;
+  --ifm-color-primary-light: #fb564a;
+  --ifm-color-primary: #f42f27;
+  --ifm-color-primary-dark: #e41511;
+  --ifm-color-primary-darker: #a80504;
+  --ifm-color-primary-darkest: #540000;
+  --ifm-code-font-size: 95%;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+  --doc-sidebar-width: 230px !important;
+  /* --ifm-navbar-background-color: white;
+  --ifm-navbar-link-color: white; */
+
+  --ifm-navbar-padding-vertical: 0px;
+  --ifm-navbar-height: 45px; 
+}
+
+/* For readability concerns, you should choose a lighter palette in dark mode. */
+[data-theme='dark'] {
+  --ifm-color-primary-lightest: #ffbfb3;
+  --ifm-color-primary-lighter: #fe8a7a;
+  --ifm-color-primary-light: #fb564a;
+  --ifm-color-primary: #e5502b;
+  --ifm-color-primary-dark: #e41511;
+  --ifm-color-primary-darker: #a80504;
+  --ifm-color-primary-darkest: #540000;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+  --ifm-background-color: #1C1A1D !important;
+}
+
+/* Make headings match homepage */
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-weight: 900;
+  letter-spacing: -0.05em;
+}
+
+.hero {
+  background-image: url("/img/landing/vesuvius.webp");
+  background-size: cover;
+  background-position: center;
+}
+
+figure {
+  margin: 0 0 var(--ifm-paragraph-margin-bottom) 0;
+}
+
+figcaption {
+  margin-top: -1.5em;
+  font-style: italic;
+  font-size: 95%;
+}
+
+.markdown h2 {
+  --ifm-h2-font-size: 2rem;
+  margin-bottom: calc(var(--ifm-heading-vertical-rhythm-bottom) * var(--ifm-leading));
+  margin-top: calc(var(--ifm-h2-vertical-rhythm-top) * var(--ifm-leading));
+}
+
+/* .navbar, */
+.theme-doc-toc-mobile,
+.footer {
+  background-color: var(--ifm-background-color);
+  border-top: 1px solid #2F3237 !important;
+  z-index: 1;
+}
+
+.docs-doc-id-landing main {
+  overflow: hidden;
+}
+
+@media (min-width: 997px) {
+  :root {
+    --ifm-navbar-height: 0;
+  }
+
+  .navbar--fixed-top {
+    display: none;
+  }
+
+  .docs-doc-id-landing .container {
+    padding: 0 32px;
+  }
+}
+
+/* .docs-doc-page .navbar--fixed-top {
+  display: flex;
+} */
+.navbar-sidebar__back {
+  display: none;
+}
+
+.navbar-sidebar__brand {
+  margin-top: 12px;
+}
+
+.docs-doc-id-landing main>.container {
+  max-width: unset !important;
+  padding: unset !important;
+  position: relative;
+}
+
+.docs-doc-id-landing main>.container>.row {
+  margin: 0 !important;
+}
+
+.docs-doc-id-landing main>.container>.row>.col {
+  max-width: 100% !important;
+  padding: 0 !important;
+}
+
+.docs-doc-id-landing .theme-doc-footer,
+.docs-doc-id-landing .pagination-nav {
+  display: none;
+}
+
+.docs-doc-id-landing h2 {
+  margin-top: 8px;
+}
+
+.docs-doc-id-firstletters {
+  background: black;
+  /* --ifm-color-primary: rgb(188, 134, 249); */
+}
+
+.docs-doc-id-firstletters a:not(.menu__link) {
+  font-weight: bold;
+}
+
+.theme-back-to-top-button {
+  display: none;
+}
+
+.theme-doc-sidebar-container {
+  border-right: 1px solid #2F3237 !important;
+}
+
+aside {
+  z-index: 1;
+}
+
+.pagination-nav {
+  display: none;
+}
+
+main {
+  max-width: 60rem !important;
+}
+
+.docs-doc-id-landing main {
+  max-width: unset !important;
+}
+
+.navbar__toggle {
+  margin-right: 12px !important;
+}
+
+.navbar__logo img {
+  width: 16px !important;
+  height: 16px !important;
+  vertical-align: -5px !important;
+}
+
+.custom-top-header .navbar__logo img {
+  vertical-align: -1px !important;
+}
+
+.navbar__title {
+  font-weight: 900;
+  letter-spacing: -0.05rem;
+  font-size: 18px;
+}
+
+.custom-top-header .navbar__title {
+  margin-bottom: 10px;
+}
+
+@media (max-width: 996px) {
+  .custom-top-header {
+    display: none;
+  }
+}
+
+.navbar__brand {
+  margin-left: 8px;
+  opacity: .5;
+}
+
+@media (max-width: 996px) {
+  .navbar__brand {
+    margin-left: 0;
+    opacity: 1;
+  }
+
+  .hash-link {
+    display: none;
+  }
+}
+
+*::-webkit-media-controls-start-playback-button {
+  display: none !important;
+  -webkit-appearance: none;
+}
+
+@keyframes pan {
+  from {
+    transform: translateX(0);
+  }
+
+  to {
+    transform: translateX(-100%);
+    /* Adjust this value based on your image's width */
+  }
+}
+
+.pan-horizontal {
+  animation: pan 40s linear infinite;
+}
+
+.docs-doc-id-grandprize article {
+  font: normal 18px/1.65 "PT Sans", "Helvetica", "Arial", sans-serif;
+}
+
+.docs-doc-id-grandprize article figcaption {
+  font-size: 88%;
+}
+
+.docs-doc-id-grandprize article h2 {
+  font-size: 250%;
+  margin-top: 40px;
+  margin-bottom: 8px;
+}
+
+.docs-doc-id-grandprize article a {
+  font-weight: bold;
+}
+
+.docs-doc-id-grandprize article strong,
+.docs-doc-id-grandprize article b,
+.docs-doc-id-grandprize article h2,
+.docs-doc-id-grandprize article h3 {
+  color: white;
+}
+
+.docs-doc-id-grandprize article h2,
+.docs-doc-id-grandprize article h3 {
+  line-height: 1.1;
+}
+/* Docusaurus inline table of contents */
+[class*="tableOfContentsInline_node_modules-"] ul li {
+  list-style-type: none; /* Remove bullet points */
+  margin-bottom: 0; /* Tighten up the spacing */
+}

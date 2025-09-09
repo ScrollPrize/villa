@@ -1,0 +1,29 @@
+# Python venvs, IDE files, build artifacts
+**/.venv*/
+**/.idea/*
+*.pyc
+*.tif
+node_modules/.yarn-integrity
+**/*.egg-info*/
+
+# Vesuvius outputs & metadata
+/vesuvius/outputs/
+/vesuvius/sandbox/
+/vesuvius/utils/tests/s5_test.zarr
+
+*.DS_Store
+
+**/checkpoints/
+
+# WandB (allow general wandb but ignore this one)
+!**/wandb/**
+/segmentation/models/arch/nnunet/wandb/
+
+*.pth
+segmentation/models/arch/nnunet/build/
+segmentation/models/batchgeneratorsv2/build/
+segmentation/napari_trainer/cline_rules.md
+segmentation/napari_trainer/test_1638_debug.png
+/wandb
+/vesuvius/external
+/segmentation/vc_proofreader/wandb

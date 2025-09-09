@@ -1,0 +1,19 @@
+name: fibers-dataset
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - matplotlib
+  - tifffile
+  - scipy
+  - tqdm
+  - scikit-image
+  - posix_ipc
+  - pip
+  - pip:
+      - vesuvius
+      - kimimaro
+      - webknossos[all]==0.16.2
+      - tensorstore==0.1.71

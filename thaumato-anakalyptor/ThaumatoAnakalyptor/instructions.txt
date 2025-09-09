@@ -1,0 +1,61 @@
+### OUTDATED ONLY USE AS LAST RESORT FOR DEBUGGING IF SOMETHING IS UNCLEAR FROM THE README ####
+
+Setup:
+
+Docker setup: 
+    docker build -t thaumato_image -f DockerfileThaumato .
+There is also a file containing the complete Conda environment. The environment is called "thaumato".
+
+Segmentation with ThaumatoAnakalyptor:
+On the example of scroll 3, I show how to prepare and run a segmentation.
+
+From the base folder, run:
+    docker run --gpus all -it --rm -v $(pwd)/ThaumatoAnakalyptor/:/workspace/ThaumatoAnakalyptor thaumato_image
+
+- Set up spelufo's grid cells of scroll1 in the folder ThaumatoAnakalyptor/scroll1_grids
+or
+- Download the initial scroll scan volume and preprocess it into grid cells: 
+
+
+Segmentation occurs in multiple steps. First the data needs to be preprocessed in order. This steps should be straight-forward.
+    python3 sort_out_empty_tifs.py
+    python3 grid_to_pointcloud.py
+    python3 pointcloud_to_instances.py
+    python3 align_patches_normals_to_umbilicus.py # should not be needed. optional, use ONLY if segmentation step instances_to_sheets fails
+The whole segmentation preprocessing pipeline takes multiple days to complete on my computer (AMD Ryzen 7950x3d, 192GB DDR5 RAM, RTX 4090, at least 4 TB M.2 SSD space needed). The most tasks can be stopped and continued.
+
+Then segmentations can be made with:
+    python3 instances_to_sheets.py
+    python3 show_sheet.py # To look at the current segmentation progress
+When you are happy with the segmentation:
+    python3 sheet_to_mesh.py
+    optional: cut_mesh.py z_cut1 z_cut2 ... z_cutN
+    python3 mesh_to_uv.py
+Optional if the meshing with vc_renderer has issues (happened a lot for me):
+    python3 fix_mesh.py # before mesh_to_uv, update to paths accordingly
+
+If this doesnt work, there are smaller "half wraps" (example: point_cloud_colorized_subvolume_blocks_cut_0.obj) of the segmentation available. All together, they also contain all the segmentation in a smaller sheet size each and should be easier to render.
+Also check out, if the segments are rendered or flattened better with the "original" vr_render. This happened from time to time too. The consistent rendering is still very much a work in progress.
+
+Be sure to check out the parameters in instances_to_sheets.py which has argparse set up for easier generation of new segments.
+instances_to_sheets.py is used to generate the segments and houses all parameters to segment different areas of the scrolls and for how big of segments to generate. A large segment (~200cm^2) takes about half a day to a one day to compute.
+
+Check out the current segmentation from time to time with show_sheet.py. if the segmentation wanders off, reset to a automatically saved progress state, where the segmentation is still accurate and adjust the parameters (for example Z range to exclude the offending position). 
+Reset by copying the progress state into:
+    ThaumatoAnakalyptor/scroll1_surface_points/point_cloud_colorized_subvolume_main_sheet.ta"
+
+Disclaimer: Some of the hardcoded paths might still point to my computer's location of the data and might need changing.
+
+The result is a .obj, which can then be used with my vc_render to generate the surface volumes:
+    export OPENCV_IO_MAX_IMAGE_PIXELS=4294967295
+    export CV_IO_MAX_IMAGE_PIXELS=4294967295
+    vc_render --volpkg ../ --volume 20230205180739 --input-mesh point_cloud_colorized_subvolume_blocks_uv.obj --output-file thaumato.obj --output-ppm thaumato.ppm --uv-plot thaumato_uvs.png --uv-reuse --cache-memory-limit 150G ; vc_layers_from_ppm -v ../ -p thaumato.ppm --output-dir layers/ -f tif -r 32 --cache-memory-limit 150G
+Alternative: "Traditional Flattening might be successfull on the "half-wraps": Check the flattening with and without --enable-mesh-resampling and/or --mesh-resample-smoothing 3.
+
+Unwrapping Approach
+The main idea behind ThaumatoAnakalyptor is to detect the surface of the sheets in the ct scan trough 3d derrivatives of the volume brightness intensity. A sheet when looked at from the side has darker surroundings and a bright interior. Drawing the voxel intensities along the sheets normal axis of a sheet result in an bell curve shape for the intesity. This means, that the positions, where the first derrivative of the brightness is highes/lowest/above a treshold, while the second derrivative is zero/close to zero correspond to the back/front side of the papyrus sheet.
+By 3D gradient analysis of the 3D picture and propperly calculating the sheets normals (first derrivative can be used intelligently to find them) + projecting the 3d gradient to the sheet normals to get for each pixel an appropriate 1D gradient value, and calculating the 2nd derrivative as well from the 1D 1st derrivative. It is possible to find the surface voxels/points by thresholding on 1D 1st and 2nd derrivative.
+The whole Scroll surface point volume then is split into subvolumes of size 200x200x200 and a 3D instance segmentation algorithm is used to cluster the surface points to their respective surface. Overlapping the subvolumes and predicting the sheet patches with overlap lets an random walk algorithm combine them to larger sheets.
+In a next step, the subvolume surface patches are again combined into sheets. These sheets consisting of points and metadate related to their points positions(angular winding position(what winding of the papyrus sheet it belongs to, points might be spacially close in x y z in the scroll, but belong to different windings)) within the sheet are converted with the help of poisson surface reconstruction to form the sheet's mesh that then can be used in the vc_renderer to generate the sheet's surface_volume tif stack.
+Poisson is applied on a half winding each, the resulting meshes then are stitched to form the complete papyrus sheet over multiple wraps.
+

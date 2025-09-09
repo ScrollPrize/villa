@@ -1,0 +1,40 @@
+# Vesuvius Scrolls Configuration File
+# This file maps scroll IDs to their respective URLs for data access
+
+# Scroll - tested 03/24/25
+"1":
+  # Energy level 54
+  "54":
+    # Resolution 7.91
+    "7.91":
+      # URL for the whole volume
+      volume: "https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumes_zarr_standardized/54keV_7.91um_Scroll1A.zarr/"
+      # URLs for segments
+      segments:
+        "20230827161847": "https://dl.ash2txt.org/other/dev/scrolls/1/segments/54keV_7.91um/20230827161847.zarr/"
+
+# Scroll 2 - tested 03/24/25
+"2":
+  "54":
+    "7.91":
+      volume: "https://dl.ash2txt.org/full-scrolls/Scroll2/PHercParis3.volpkg/volumes_zarr_standardized/54keV_7.91um_Scroll2A.zarr/"
+
+# Scroll 3 -  tested 03/24/25
+"3":
+  "54":
+    "7.91":
+      volume: "https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/volumes_zarr_standardized/53keV_7.91um_Scroll3.zarr/"
+
+# Scroll 4 - tested 03/24/25
+"4":
+  "54":
+    "7.91":
+      volume: "https://dl.ash2txt.org/full-scrolls/Scroll4/PHerc1667.volpkg/volumes_zarr/20231117161658.zarr/"
+
+# Scroll 5 - tested 03/24/25
+"5":
+  "53":
+    "7.91":
+      volume: "https://dl.ash2txt.org/full-scrolls/Scroll5/PHerc172.volpkg/volumes_zarr/20241024131838.zarr/"
+
+# For more information, visit: https://github.com/ScrollPrize/villa

@@ -1,0 +1,94 @@
+# YOU DO NOT HAVE TO PROVIDE VALUES IN MOST OF THESE FIELDS
+
+tr_setup:
+  model_name: sheet_only                    # required [str] this is the name your model will checkpoint will be saved as
+  vram_max: 22000                    # required if autoconfigure is true, else optional-- the amount in MB you want the model to use
+  autoconfigure: false               # optional, true -- if true, the network will attempt to set some reasonable defaults based on your vram_max
+  tr_val_split: 0.90                 # optional[float] the percentage of your total dataset used for training, with the other part being used for val
+  dilate_label: false                # optional, false [bool] if true, will apply a small dilation to your labels using a 3x3 spherical kernel -- will skip tasks named "normals"
+  # checkpoint_path: "./ink_157.pth" # optional, none [str] if provided, will load the provided checkpoint and begin training from there
+  load_weights_only: false           # optional, false [bool] if true, will not load the optimizer, scheduler, or epoch state from the model -- set true to fine-tune
+  ckpt_out_base: "./checkpoints"     # [str] the path the model checkpoint is saved to
+  tensorboard_log_dir: "./logs"      # optional, './' [str] the path the tensorboard logs will be stored to
+
+tr_config:
+  optimizer: "SGD"            # optional, AdamW [str] the optimizer to use during training. currently only AdamW and SGD are provided.
+  initial_lr: 0.001             # optional initial learning rate
+  weight_decay: 0.0001             # optional, 0.0001 [float]
+  gradient_accumulation: 1      # optional, 1 [int] if 1, no accumulation, if >1 will accumulate this many 'batches' each batch to simulate larger batch size.
+  num_dataloader_workers: 12    # optional, 4 [int]
+  patch_size: [128, 128, 128]    # optional [list] patch size for training
+  batch_size: 2              # optional [int] batch size for training
+  max_steps_per_epoch: 500      # optional, 500 [int] the number of batches seen by the model each epoch
+  max_val_steps_per_epoch: 25   # optional, 25 [int] the number of batches seen in validation each epoch
+  max_epoch: 500                # optional, 500 [int] the maximum number of epochs to train for
+  ignore_label: null            # [NOT YET IMPLEMENTED] if you have an ignore label, you can set it here and loss will not be computed against it
+  loss_only_on_label: false     # [NOT YET IMPLEMENTED]
+
+model_config:
+  use_timm_encoder: false
+  timm_encoder_class: null
+  basic_block: "ResidualBlock"                      # or ConvBlock
+  features_per_stage: [32, 64, 128, 256, 512]  # optional, [list] or [int] -- if an int is provided will automatically double each layer
+  num_stages: 5                                     # number of layers
+  n_blocks_per_stage: [1, 3, 4, 6, 6]        #
+  n_conv_per_stage_decoder: [1, 1, 1, 1]         # should be n_blocks_per_stage - 1
+  bottleneck_block: 'BasicBlockD'                   # could be BottleneckD but just leave this as-is
+  op_dims: 3                                        # this is the amount of dimensions of your input data, must be 1 , 2, or 3
+  kernel_sizes: [3]                                 # conv kernel size (3, 3, 3) for each block
+  pool_op: 'nn.MaxPool3d'                           # currently defaults to this if 3d, MaxPool2d if 2d
+  conv_bias: false                                  # should be false
+  norm_op: 'nn.InstanceNorm3d'                      # currenlty defaults to instancenorm3d for 3d and 2d for 2d, this doesnt change it
+  dropout_op: 'nn.Dropout3d'
+  dropout_op_kwargs: {'p': 0.0}
+  nonlin: 'nn.LeakyReLU'
+  nonlin_kwargs: {'inplace': True}
+  strides: [1, 2, 2, 2, 2]                   # aka dilation
+  return_skips: True
+  do_stem: True
+  stem_channels: None
+  bottleneck_channels: None
+  stochastic_depth_p: 0.0
+  squeeze_excitation: False
+  squeeze_excitation_reduction_ratio: 1.0 / 16.0
+
+dataset_config:
+  min_bbox_percent: 0.97      # optional, 0.97 [float] a percentage of the patch size that must be encompassed by a bbox containing all the labels in the patch
+  min_labeled_ratio: 0.15     # optional, 0.15 [float] a percentage of the above bbox that must contain labeled data (ie: the density of the labels)
+  use_cache: true             # optional, True [bool] whether to store a patch position cache. strongly recommended
+  cache_folder: "patch_cache/sheet_only" # optional, the location to store the cache
+  volume_paths:
+    - input: /mnt/raid_nvme/s1.zarr
+      sheet: /mnt/raid_nvme/datasets/1-voxel-sheet_slices-closed.zarr/0.zarr
+      ref_label: sheet
+    - input: /mnt/raid_nvme/s4.zarr
+      sheet: /home/sean/Documents/GitHub/VC-Surface-Models/models/normals/s4_sheet.zarr/volume.zarr
+      ref_label: sheet
+  targets:
+    sheet:
+      channels: 1
+      activation: none
+      weight: 1
+      loss_fn: BCEDiceLoss
+      loss_kwargs:
+        alpha: 0.5
+        beta: 0.5
+
+inference_config:                           # these parameters only apply on inference
+  checkpoint_path: "./checkpoints/ckpt.pth" # the checkpoint to load
+  num_dataloader_workers: 12                # number of workers for the inference dataloader
+  input_path: "./data/0901/layers.zarr"     # [str] input volume, CURRENTLY MUST BE ZARR
+  input_format: "zarr"                      # not currently implemented, all data is zarr
+  output_path: "./outputs/0901"              # data is saved to zarr in the output dir as predictions.zarr
+  output_format: "zarr"                     # currently does nothing , can only be zarr
+  output_type: "np.uint8"                   # currently does nothing
+  output_targets: ["ink"]                   # optional, if none all targets will be output
+  load_all: true                            # optional, false - if true, will load entire input_path volume into memory
+  overlap: 0.1                              # optional, .01 - the percentage of overlap each patch should have
+  patch_size: [128, 128, 128]               # this can be different than your training setup , but may negatively impact performance
+  batch_size: 4                             # can typically be higher than your train batch size, watch vram
+  targets:                                  # must be the targets you trained with , including num channels and name.
+    - ink:                                    # to the number of channels your model outputs
+        channels: 1
+        activation: "none"
+        weight: 1

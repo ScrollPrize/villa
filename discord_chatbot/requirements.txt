@@ -1,0 +1,9 @@
+sentence-transformers>=2.7.0
+transformers>=4.51.0
+langchain
+faiss-cpu
+numpy
+openai>=1.0.0
+python-dotenv
+py-cord>=2.4.0
+tabulate
