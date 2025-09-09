@@ -82,8 +82,17 @@ class NetworkFromConfig(nn.Module):
         self.save_config = False
         
         self.architecture_type = model_config.get("architecture_type", "unet")
+        # Determine if deep supervision is requested
+        ds_enabled = bool(getattr(mgr, 'enable_deep_supervision', False))
         
+        # Primus decoders do not emit multi-scale logits; block DS to avoid silent misconfiguration
         if self.architecture_type.lower().startswith("primus"):
+            if ds_enabled:
+                raise ValueError(
+                    "Deep supervision is enabled but the selected architecture 'primus' does not "
+                    "support multi-scale logits. Please disable deep supervision or switch to the 'unet' architecture "
+                    "with separate decoders for the supervised tasks."
+                )
             self._init_primus(mgr, model_config)
             return
 
@@ -310,7 +319,8 @@ class NetworkFromConfig(nn.Module):
         self.task_heads = nn.ModuleDict()
 
         # Decide decoder sharing strategy
-        separate_decoders_default = model_config.get("separate_decoders", False)
+        # If deep supervision is enabled, prefer separate decoders so tasks can emit multi-scale logits
+        separate_decoders_default = model_config.get("separate_decoders", ds_enabled)
 
         # Determine which tasks use separate decoders vs shared head
         tasks_using_separate = set()
@@ -333,6 +343,13 @@ class NetworkFromConfig(nn.Module):
                 tasks_using_separate.add(target_name)
             else:
                 tasks_using_shared.add(target_name)
+
+        # If DS is enabled, force all tasks to use separate decoders (shared path is features-only and can't DS)
+        if ds_enabled and len(tasks_using_shared) > 0:
+            print("Deep supervision enabled: switching shared-decoder tasks to separate decoders for DS support:",
+                  ", ".join(sorted(tasks_using_shared)))
+            tasks_using_separate.update(tasks_using_shared)
+            tasks_using_shared.clear()
 
         # If at least one task uses shared, build a single shared decoder trunk (features-only)
         if len(tasks_using_shared) > 0:
@@ -628,10 +645,12 @@ class NetworkFromConfig(nn.Module):
         shared_features = None
 
         # Handle tasks with separate decoders first
+        ds_enabled = bool(getattr(self.mgr, 'enable_deep_supervision', False))
         for task_name, decoder in self.task_decoders.items():
             logits = decoder(features)
-            # Some decoders may return a list (deep supervision). Use highest-resolution output.
-            if isinstance(logits, (list, tuple)) and len(logits) > 0:
+            # If deep supervision is disabled, collapse to highest-res output for convenience.
+            # If enabled, keep the list so training can supervise all scales.
+            if isinstance(logits, (list, tuple)) and len(logits) > 0 and not ds_enabled:
                 logits = logits[0]
             activation_fn = self.task_activations[task_name] if task_name in self.task_activations else None
             if activation_fn is not None and not self.training:
