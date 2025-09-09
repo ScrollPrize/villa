@@ -16,9 +16,12 @@ from datetime import datetime
 from tqdm import tqdm
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.nn.functional as F
 from vesuvius.models.training.lr_schedulers import get_scheduler, PolyLRScheduler
-from torch.utils.data import DataLoader, SubsetRandomSampler
+from torch.utils.data import DataLoader, SubsetRandomSampler, Subset
+from torch.utils.data.distributed import DistributedSampler
 from vesuvius.models.utils import InitWeights_He
 from vesuvius.models.datasets import NapariDataset, ImageDataset, ZarrDataset
 from vesuvius.utils.plotting import save_debug
@@ -77,7 +80,75 @@ class BaseTrainer:
             from vesuvius.models.configuration.config_manager import ConfigManager
             self.mgr = ConfigManager(verbose)
 
-        self.device = get_accelerator()
+        # --- DDP and GPU selection setup --- #
+        self.is_distributed = False
+        self.rank = 0
+        self.local_rank = 0
+        self.world_size = 1
+
+        # Parse requested GPU IDs from config (from --gpus)
+        gpu_ids = getattr(self.mgr, 'gpu_ids', None)
+        if isinstance(gpu_ids, str):
+            gpu_ids = [int(x) for x in gpu_ids.split(',') if x.strip() != '']
+        self.gpu_ids = gpu_ids if gpu_ids else None
+
+        # Determine if DDP is requested by config or env (torchrun)
+        env_world_size = int(os.environ.get('WORLD_SIZE', '1'))
+        want_ddp = bool(getattr(self.mgr, 'use_ddp', False)) or env_world_size > 1
+
+        # Set device early (before init) if CUDA available
+        if torch.cuda.is_available():
+            # Determine local rank from env (torchrun) or default 0
+            env_local_rank = int(os.environ.get('LOCAL_RANK', os.environ.get('RANK', '0')))
+            self.local_rank = env_local_rank
+            if want_ddp and self.gpu_ids:
+                # Map this process to the user-specified GPU list
+                if len(self.gpu_ids) < env_world_size:
+                    raise ValueError(
+                        f"--gpus specifies {len(self.gpu_ids)} devices, but WORLD_SIZE={env_world_size}. "
+                        f"Launch with torchrun --nproc_per_node={len(self.gpu_ids)} or adjust --gpus."
+                    )
+                assigned_gpu = int(self.gpu_ids[env_local_rank])
+            elif want_ddp:
+                assigned_gpu = env_local_rank
+            elif self.gpu_ids:
+                assigned_gpu = int(self.gpu_ids[0])
+            else:
+                assigned_gpu = 0
+
+            torch.cuda.set_device(assigned_gpu)
+            self.device = torch.device('cuda', assigned_gpu)
+            self.assigned_gpu_id = assigned_gpu
+        else:
+            self.device = get_accelerator()
+            self.assigned_gpu_id = None
+
+        # Initialize process group if needed
+        if want_ddp and dist.is_available():
+            backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+            if not dist.is_initialized():
+                dist.init_process_group(backend=backend, init_method='env://')
+            self.is_distributed = True
+            self.world_size = dist.get_world_size()
+            self.rank = dist.get_rank()
+            # Validate GPU mapping length matches world size when provided
+            if torch.cuda.is_available() and self.gpu_ids and len(self.gpu_ids) != self.world_size:
+                raise ValueError(
+                    f"In DDP, number of GPUs in --gpus ({len(self.gpu_ids)}) must equal WORLD_SIZE ({self.world_size})."
+                )
+
+        # Friendly prints
+        if self.is_distributed and (not self.rank or self.rank == 0):
+            if torch.cuda.is_available():
+                used = self.gpu_ids if self.gpu_ids else list(range(self.world_size))
+                print(f"DDP enabled (world size={self.world_size}). Using GPUs: {used}")
+            else:
+                print(f"DDP enabled on CPU/MPS (world size={self.world_size})")
+        elif not self.is_distributed and torch.cuda.is_available() and self.gpu_ids:
+            if len(self.gpu_ids) > 1:
+                print(f"Multiple GPUs specified {self.gpu_ids} without DDP; using GPU {self.gpu_ids[0]} only.")
+            else:
+                print(f"Using GPU {self.gpu_ids[0]}")
 
     # --- build model --- #
     def _build_model(self):
@@ -468,23 +539,49 @@ class BaseTrainer:
                 print(f"Using external validation set: {len(val_indices)} val patches")
                 print(f"Excluding {len(train_dataset) - len(train_indices)} train patches overlapping validation volumes")
 
-        batch_size = self.mgr.train_batch_size
+        # Batch size semantics: in all modes, --batch-size is per-GPU (per process)
+        per_device_batch = self.mgr.train_batch_size
+
+        # Build subset datasets so DistributedSampler can partition without overlap
+        train_base = train_dataset
+        val_base = val_dataset if val_dataset is not None else train_dataset
+        train_subset = Subset(train_base, train_indices)
+        val_subset = Subset(val_base, val_indices)
+
+        if self.is_distributed:
+            train_sampler = DistributedSampler(
+                train_subset, num_replicas=self.world_size, rank=self.rank, shuffle=True, drop_last=False
+            )
+            # For validation we only run on rank 0; sampler unused there, but keep a sequential sampler for completeness
+            val_sampler = None
+        else:
+            train_sampler = SubsetRandomSampler(list(range(len(train_subset))))
+            val_sampler = SubsetRandomSampler(list(range(len(val_subset))))
+
+        pin_mem = True if self.device.type == 'cuda' else False
+        dl_kwargs = {}
+        if self.mgr.train_num_dataloader_workers and self.mgr.train_num_dataloader_workers > 0:
+            dl_kwargs['prefetch_factor'] = 2
 
         train_dataloader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            sampler=SubsetRandomSampler(train_indices),
-            pin_memory=(True if self.device == 'cuda' else False),
+            train_subset,
+            batch_size=per_device_batch,
+            sampler=train_sampler,
+            shuffle=False,
+            pin_memory=pin_mem,
             num_workers=self.mgr.train_num_dataloader_workers,
-            prefetch_factor=2
+            **dl_kwargs
         )
 
+        # Validation dataloader will only be iterated on rank 0 in DDP
         val_dataloader = DataLoader(
-            val_dataset if val_dataset is not None else train_dataset,
+            val_subset,
             batch_size=1,
-            sampler=SubsetRandomSampler(val_indices),
-            pin_memory=(True if self.device == 'cuda' else False),
+            sampler=val_sampler,
+            shuffle=False,
+            pin_memory=pin_mem,
             num_workers=self.mgr.train_num_dataloader_workers,
+            **dl_kwargs
         )
 
         return train_dataloader, val_dataloader, train_indices, val_indices
@@ -559,6 +656,13 @@ class BaseTrainer:
         scaler = self._get_scaler(self.device.type, use_amp=use_amp)
         train_dataloader, val_dataloader, train_indices, val_indices = self._configure_dataloaders(train_dataset,
                                                                                                    val_dataset)
+        
+        # Wrap model with DDP if distributed
+        if self.is_distributed:
+            if self.device.type == 'cuda':
+                model = DDP(model, device_ids=[self.assigned_gpu_id], output_device=self.assigned_gpu_id, find_unused_parameters=False)
+            else:
+                model = DDP(model)
         os.makedirs(self.mgr.ckpt_out_base, exist_ok=True)
         model_ckpt_dir = os.path.join(self.mgr.ckpt_out_base, self.mgr.model_name)
         os.makedirs(model_ckpt_dir, exist_ok=True)
@@ -622,7 +726,8 @@ class BaseTrainer:
 
     def _initialize_wandb(self, train_dataset, val_dataset, train_indices, val_indices, ckpt_dir=None):
         """Initialize Weights & Biases logging if configured."""
-        if self.mgr.wandb_project:
+        # Only rank 0 should initialize wandb in DDP
+        if self.mgr.wandb_project and (not self.is_distributed or self.rank == 0):
             import wandb  # lazy import in case it's not available
             import json
             import os
@@ -863,13 +968,16 @@ class BaseTrainer:
             f"{self.mgr.model_name}_epoch{epoch}.pth"
         )
 
+        # unwrap DDP for saving if needed
+        model_to_save = model.module if isinstance(model, DDP) else model
+
         checkpoint_data = save_checkpoint(
-            model=model,
+            model=model_to_save,
             optimizer=optimizer,
             scheduler=scheduler,
             epoch=epoch,
             checkpoint_path=ckpt_path,
-            model_config=model.final_config,
+            model_config=getattr(model_to_save, 'final_config', None),
             train_dataset=train_dataset
         )
 
@@ -981,6 +1089,9 @@ class BaseTrainer:
 
         # ---- training! ----- #
         for epoch in range(start_epoch, self.mgr.max_epoch):
+            # Ensure each rank shuffles differently per epoch
+            if self.is_distributed and isinstance(train_dataloader.sampler, DistributedSampler):
+                train_dataloader.sampler.set_epoch(epoch)
             # Update loss functions for this epoch
             loss_fns = self._update_loss_for_epoch(loss_fns, epoch)
             
@@ -996,7 +1107,7 @@ class BaseTrainer:
 
             epoch_losses = {t_name: [] for t_name in self.mgr.targets}
             train_iter = iter(train_dataloader)
-            pbar = tqdm(range(num_iters), desc=f'Epoch {epoch + 1}/{self.mgr.max_epoch}')
+            pbar = tqdm(range(num_iters), desc=f'Epoch {epoch + 1}/{self.mgr.max_epoch}') if (not self.is_distributed or self.rank == 0) else None
             
             # Variables to store train samples for debug visualization
             train_sample_input = None
@@ -1008,7 +1119,7 @@ class BaseTrainer:
             print(f"Initial learning rate : {self.mgr.initial_lr}")
             print(f"Gradient accumulation steps : {grad_accumulate_n}")
 
-            for i in pbar:
+            for i in range(num_iters):
                 if i % grad_accumulate_n == 0:
                     optimizer.zero_grad(set_to_none=True)
 
@@ -1081,13 +1192,14 @@ class BaseTrainer:
                 if optimizer_stepped and is_per_iteration_scheduler:
                     scheduler.step()
 
-                loss_str = " | ".join([f"{t}: {np.mean(epoch_losses[t][-100:]):.4f}"
-                                       for t in epoch_losses.keys() if len(epoch_losses[t]) > 0])
-                pbar.set_postfix_str(loss_str)
+                if pbar is not None:
+                    loss_str = " | ".join([f"{t}: {np.mean(epoch_losses[t][-100:]):.4f}"
+                                           for t in epoch_losses.keys() if len(epoch_losses[t]) > 0])
+                    pbar.set_postfix_str(loss_str)
 
                 current_lr = optimizer.param_groups[0]['lr']
 
-                if self.mgr.wandb_project:
+                if self.mgr.wandb_project and (not self.is_distributed or self.rank == 0):
                     metrics = self._prepare_metrics_for_logging(
                         epoch=epoch,
                         step=global_step,
@@ -1106,13 +1218,14 @@ class BaseTrainer:
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
 
-            print(f"\n[Train] Epoch {epoch + 1} completed.")
-            for t_name in self.mgr.targets:
-                avg_loss = np.mean(epoch_losses[t_name]) if epoch_losses[t_name] else 0
-                print(f"  {t_name}: Avg Loss = {avg_loss:.4f}")
+            if not self.is_distributed or self.rank == 0:
+                print(f"\n[Train] Epoch {epoch + 1} completed.")
+                for t_name in self.mgr.targets:
+                    avg_loss = np.mean(epoch_losses[t_name]) if epoch_losses[t_name] else 0
+                    print(f"  {t_name}: Avg Loss = {avg_loss:.4f}")
 
             # ---- validation ----- #
-            if epoch % 1 == 0:
+            if epoch % 1 == 0 and (not self.is_distributed or self.rank == 0):
                 # For MAE training, don't set to eval mode to keep patch dropping active
                 if not hasattr(self, '_is_mae_training'):
                     model.eval()
@@ -1332,18 +1445,28 @@ class BaseTrainer:
                             max_best=2
                         )
 
-        print('Training Finished!')
+        # Synchronize all ranks before finalization
+        if self.is_distributed:
+            dist.barrier()
 
-        final_model_path = save_final_checkpoint(
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            max_epoch=self.mgr.max_epoch,
-            model_ckpt_dir=model_ckpt_dir,
-            model_name=self.mgr.model_name,
-            model_config=model.final_config,
-            train_dataset=train_dataset
-        )
+        if not self.is_distributed or self.rank == 0:
+            print('Training Finished!')
+
+            model_to_save = model.module if isinstance(model, DDP) else model
+            final_model_path = save_final_checkpoint(
+                model=model_to_save,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                max_epoch=self.mgr.max_epoch,
+                model_ckpt_dir=model_ckpt_dir,
+                model_name=self.mgr.model_name,
+                model_config=getattr(model_to_save, 'final_config', None),
+                train_dataset=train_dataset
+            )
+        
+        # Clean up DDP process group
+        if self.is_distributed and dist.is_initialized():
+            dist.destroy_process_group()
 
 def main():
     """Main entry point for the training script."""
@@ -1429,6 +1552,16 @@ def main():
                            help="Iterate over entire train/val set per epoch (overrides max-steps)")
     grp_train.add_argument("--early-stopping-patience", type=int, default=20,
                            help="Epochs to wait for val loss improvement (0 disables)")
+    grp_train.add_argument("--ddp", action="store_true",
+                           help="Enable DistributedDataParallel (use with torchrun)")
+    grp_train.add_argument("--gpus", type=str, default=None,
+                           help="Comma-separated GPU device IDs to use, e.g. '0,1,3'. With DDP, length must equal WORLD_SIZE")
+    grp_train.add_argument("--nproc-per-node", type=int, default=None,
+                           help="Number of processes to spawn locally for DDP (use instead of torchrun)")
+    grp_train.add_argument("--master-addr", type=str, default="127.0.0.1",
+                           help="Master address for DDP when spawning without torchrun")
+    grp_train.add_argument("--master-port", type=int, default=None,
+                           help="Master port for DDP when spawning without torchrun (default: auto)")
 
     # Optimization
     grp_optim.add_argument("--optimizer", type=str,
@@ -1484,6 +1617,19 @@ def main():
 
     update_config_from_args(mgr, args)
 
+    # Enable DDP if requested or if torchrun sets WORLD_SIZE>1
+    if getattr(args, 'ddp', False) or int(os.environ.get('WORLD_SIZE', '1')) > 1:
+        setattr(mgr, 'use_ddp', True)
+        # In DDP, --batch-size is per-GPU; no extra adjustment needed.
+
+    # Parse GPUs selection if provided
+    if getattr(args, 'gpus', None):
+        try:
+            gpu_ids = [int(x) for x in str(args.gpus).split(',') if x.strip() != '']
+        except ValueError:
+            raise ValueError("--gpus must be a comma-separated list of integers, e.g. '0,1,3'")
+        setattr(mgr, 'gpu_ids', gpu_ids)
+
     if args.val_dir is not None:
         from pathlib import Path as _Path
         mgr.val_data_path = _Path(args.val_dir)
@@ -1504,6 +1650,77 @@ def main():
             mgr.dataset_config['intensity_properties'] = props
         setattr(mgr, 'skip_intensity_sampling', True)
         print("Using provided intensity properties for CT normalization. Sampling disabled.")
+
+    # If DDP is requested but not launched with torchrun, optionally self-spawn processes
+    if getattr(mgr, 'use_ddp', False) and int(os.environ.get('WORLD_SIZE', '1')) == 1:
+        import subprocess, sys, shlex, socket
+
+        # Determine process count
+        nproc = args.nproc_per_node
+        if nproc is None:
+            # Default to number of requested GPUs, else CUDA device count, else 1
+            gpu_ids = getattr(mgr, 'gpu_ids', None)
+            if gpu_ids:
+                nproc = len(gpu_ids)
+            elif torch.cuda.is_available():
+                try:
+                    nproc = torch.cuda.device_count()
+                except Exception:
+                    nproc = 1
+            else:
+                nproc = 1
+
+        if nproc > 1:
+            # Validate GPU mapping length if provided
+            gpu_ids = getattr(mgr, 'gpu_ids', None)
+            if gpu_ids and len(gpu_ids) != nproc:
+                raise ValueError(f"--gpus specifies {len(gpu_ids)} GPUs but --nproc-per-node is {nproc}. They must match.")
+
+            # Find a free port if not provided
+            master_port = args.master_port
+            if master_port is None:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind((args.master_addr, 0))
+                    master_port = s.getsockname()[1]
+
+            print(f"Spawning {nproc} DDP processes (master {args.master_addr}:{master_port}) without torchrun...")
+
+            # Rebuild argv without the spawn-only flags; children don't need them
+            skip_next = False
+            child_argv = []
+            for i, a in enumerate(sys.argv[1:]):
+                if skip_next:
+                    skip_next = False
+                    continue
+                if a in ("--nproc-per-node", "--master-addr", "--master-port"):
+                    skip_next = True
+                    continue
+                child_argv.append(a)
+
+            procs = []
+            for rank in range(nproc):
+                env = os.environ.copy()
+                env.update({
+                    'RANK': str(rank),
+                    'LOCAL_RANK': str(rank),
+                    'WORLD_SIZE': str(nproc),
+                    'MASTER_ADDR': args.master_addr,
+                    'MASTER_PORT': str(master_port),
+                })
+                cmd = [sys.executable, sys.argv[0], *child_argv]
+                # Use unbuffered -u for timely logs on Windows/Unix
+                if '-u' not in cmd:
+                    cmd.insert(1, '-u')
+                procs.append(subprocess.Popen(cmd, env=env))
+
+            exit_code = 0
+            for p in procs:
+                ret = p.wait()
+                if ret != 0:
+                    exit_code = ret
+            sys.exit(exit_code)
+        else:
+            print("DDP requested but only one process determined; proceeding single-process.")
 
     trainer_name = args.trainer.lower()
     mgr.trainer_class = trainer_name
