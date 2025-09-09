@@ -40,7 +40,7 @@ auto ProjectInfo::NameAndVersion() -> std::string
 
 auto ProjectInfo::RepositoryURL() -> std::string
 {
-    static std::string repo("https://gitlab.com/educelab/volume-cartographer");
+    static std::string repo("https://github.com/ScrollPrize/villa/tree/main/volume-cartographer");
     return repo;
 }
 
