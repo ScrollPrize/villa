@@ -1023,15 +1023,15 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                     std::set<SurfaceMeta*> surf_cands = data_out.surfs({j,i});
                     for(auto s : data_out.surfs({j,i}))
                         surf_cands.insert(s->overlapping.begin(), s->overlapping.end());
-                        mutex.unlock();
+                    mutex.unlock_shared();
 
                     for(auto test_surf : surf_cands) {
                         mutex.lock_shared();
                         if (data_out.has(test_surf, {j,i})) {
-                            mutex.unlock();
+                            mutex.unlock_shared();
                             continue;
                         }
-                        mutex.unlock();
+                        mutex.unlock_shared();
 
                         auto ptr = test_surf->surface()->pointer();
                         if (test_surf->surface()->pointTo(ptr, points_out(j, i), same_surface_th, 10) > same_surface_th)
@@ -1128,6 +1128,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     straight_min_count = params.value("straight_min_count", 1.0f);      // Minimum number of straight constraints
     inlier_base_threshold = params.value("inlier_base_threshold", 20);  // Starting threshold for inliers
     uint64_t deterministic_seed = uint64_t(params.value("deterministic_seed", 5489));
+    double deterministic_jitter_px = params.value("deterministic_jitter_px", 0.15);
 
     // Optional hard z-range constraint: [z_min, z_max]
     bool enforce_z_range = false;
@@ -1168,6 +1169,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     std::cout << "  dist_loss_2d_w: " << dist_loss_2d_w << std::endl;
     std::cout << "  dist_loss_3d_w: " << dist_loss_3d_w << std::endl;
     std::cout << "  deterministic_seed: " << deterministic_seed << std::endl;
+    std::cout << "  deterministic_jitter_px: " << deterministic_jitter_px << std::endl;
     if (enforce_z_range)
         std::cout << "  z_range: [" << z_min << ", " << z_max << "]" << std::endl;
 
@@ -1363,7 +1365,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                         data_th.loc(s, added) = data.loc(s, added);
                 }
             }
-            mutex.unlock();
+            mutex.unlock_shared();
             mutex.lock();
             added_points_threads[omp_get_thread_num()].resize(0);
             mutex.unlock();
@@ -1402,10 +1404,12 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
 
                 avg /= ref_count;
 
-                // Deterministic symmetric jitter in [-1,1), per cell & per surface pointer
-                uint64_t salt = deterministic_seed ^ mix64(uint64_t(reinterpret_cast<uintptr_t>(ref_surf)));
-                double j0 = det_jitter_symm(p[0], p[1], salt);
-                double j1 = det_jitter_symm(p[0], p[1], salt ^ 0x9e3779b97f4a7c15ULL);
+                // Deterministic symmetric jitter (tie-breaker) in [-jitter_px, +jitter_px),
+                // salted by a stable key (surface name), not pointer value.
+                uint64_t surf_key = mix64(uint64_t(std::hash<std::string>{}(ref_surf->name())));
+                uint64_t salt = deterministic_seed ^ surf_key;
+                double j0 = det_jitter_symm(p[0], p[1], salt) * deterministic_jitter_px;
+                double j1 = det_jitter_symm(p[0], p[1], salt ^ 0x9e3779b97f4a7c15ULL) * deterministic_jitter_px;
                 data_th.loc(ref_surf,p) = avg + cv::Vec2d(j0, j1);
 
                 ceres::Problem problem;
