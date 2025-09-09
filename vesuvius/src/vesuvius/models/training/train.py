@@ -916,8 +916,13 @@ class BaseTrainer:
             task_loss_fns = loss_fns[t_name]  # List of (loss_fn, weight) tuples
             task_weight = self.mgr.targets[t_name].get("weight", 1.0)
 
-            # Initialize as tensor on same device/dtype to keep downstream ops consistent
-            task_total_loss = torch.zeros((), device=t_pred.device, dtype=t_pred.dtype)
+            # Initialize as tensor on same device/dtype to keep downstream ops consistent.
+            # If predictions are a list/tuple (e.g., deep supervision), use the first tensor.
+            if isinstance(t_pred, (list, tuple)):
+                ref_tensor = t_pred[0]
+            else:
+                ref_tensor = t_pred
+            task_total_loss = torch.zeros((), device=ref_tensor.device, dtype=ref_tensor.dtype)
             for loss_fn, loss_weight in task_loss_fns:
                 # this naming is extremely confusing, i know. we route all loss through the aux helper
                 # because it just simplifies adding addtl losses for aux tasks if present.
@@ -938,7 +943,7 @@ class BaseTrainer:
             total_loss += weighted_loss
 
             # Store the actual loss value (after task weighting but before grad accumulation scaling)
-            task_losses[t_name] = task_total_loss.detach().cpu().item()
+            task_losses[t_name] = weighted_loss.detach().cpu().item()
 
         return total_loss, task_losses
 
@@ -978,7 +983,12 @@ class BaseTrainer:
             t_pred = outputs[t_name]
             task_loss_fns = loss_fns[t_name]  # List of (loss_fn, weight) tuples
 
-            task_total_loss = torch.zeros((), device=t_pred.device, dtype=t_pred.dtype)
+            # If predictions are a list/tuple (e.g., deep supervision), use the first tensor.
+            if isinstance(t_pred, (list, tuple)):
+                ref_tensor = t_pred[0]
+            else:
+                ref_tensor = t_pred
+            task_total_loss = torch.zeros((), device=ref_tensor.device, dtype=ref_tensor.dtype)
             for loss_fn, loss_weight in task_loss_fns:
                 skeleton_data = targets_dict.get(f'{t_name}_skel', None)
                 # If DS is enabled and loss isn't wrapped (edge case), fall back to highest-res
@@ -1202,37 +1212,48 @@ class BaseTrainer:
                 
 
                 if i == 0 and train_sample_input is None:
-                    # Find first sample with non-zero target, but capture even if all zeros
+                    # Prefer choosing a labeled sample for debug when using semi-supervised trainers
                     first_target_key = list(targets_dict.keys())[0]
                     first_target_any = targets_dict[first_target_key]
                     first_target_tensor = first_target_any[0] if isinstance(first_target_any, (list, tuple)) else first_target_any
 
+                    # If the trainer exposes labeled_batch_size, labeled samples are first in the batch
+                    labeled_limit = None
+                    if hasattr(self, 'labeled_batch_size') and inputs.shape[0] == self.mgr.train_batch_size:
+                        labeled_limit = min(self.labeled_batch_size, first_target_tensor.shape[0])
+
+                    # Search for a non-zero target within labeled region (if known), else whole batch
+                    search_range = range(labeled_limit) if labeled_limit is not None else range(first_target_tensor.shape[0])
                     b_idx = 0
-                    found_non_zero = False
-                    for b in range(first_target_tensor.shape[0]):
+                    for b in search_range:
                         if torch.any(first_target_tensor[b] != 0):
                             b_idx = b
-                            found_non_zero = True
                             break
 
-                    if True:
-                        train_sample_input = inputs[b_idx: b_idx + 1]
-                        train_sample_targets_all = {}
-                        for t_name, t_val in targets_dict.items():
-                            if isinstance(t_val, (list, tuple)):
-                                train_sample_targets_all[t_name] = t_val[0][b_idx: b_idx + 1]
-                            else:
-                                train_sample_targets_all[t_name] = t_val[b_idx: b_idx + 1]
-                        train_sample_targets = {}
-                        for t_name, t_tensor in train_sample_targets_all.items():
-                            if t_name not in ['skel', 'is_unlabeled']:
-                                train_sample_targets[t_name] = t_tensor
-                        train_sample_outputs = {}
-                        for t_name, p_val in outputs.items():
-                            if isinstance(p_val, (list, tuple)):
-                                train_sample_outputs[t_name] = p_val[0][b_idx: b_idx + 1]
-                            else:
-                                train_sample_outputs[t_name] = p_val[b_idx: b_idx + 1]
+                    # Fallback: if labeled region found no positives and we limited search,
+                    # keep the first labeled sample rather than drifting into unlabeled indices
+                    if labeled_limit is None:
+                        pass  # already searched full batch
+                    else:
+                        b_idx = min(b_idx, labeled_limit - 1)
+
+                    train_sample_input = inputs[b_idx: b_idx + 1]
+                    train_sample_targets_all = {}
+                    for t_name, t_val in targets_dict.items():
+                        if isinstance(t_val, (list, tuple)):
+                            train_sample_targets_all[t_name] = t_val[0][b_idx: b_idx + 1]
+                        else:
+                            train_sample_targets_all[t_name] = t_val[b_idx: b_idx + 1]
+                    train_sample_targets = {}
+                    for t_name, t_tensor in train_sample_targets_all.items():
+                        if t_name not in ['skel', 'is_unlabeled']:
+                            train_sample_targets[t_name] = t_tensor
+                    train_sample_outputs = {}
+                    for t_name, p_val in outputs.items():
+                        if isinstance(p_val, (list, tuple)):
+                            train_sample_outputs[t_name] = p_val[0][b_idx: b_idx + 1]
+                        else:
+                            train_sample_outputs[t_name] = p_val[b_idx: b_idx + 1]
 
                 if optimizer_stepped and is_per_iteration_scheduler:
                     scheduler.step()
@@ -1633,6 +1654,9 @@ def main():
                              help="Trainer: base, mean_teacher, uncertainty_aware_mean_teacher, primus_mae, unet_mae, finetune_mae_unet")
     grp_trainer.add_argument("--ssl-warmup", type=int, default=None,
                              help="Semi-supervised: epochs to ignore EMA consistency loss (0 disables)")
+    # Only valid for finetune_mae_unet: path to the pretrained MAE checkpoint to initialize from
+    grp_trainer.add_argument("--pretrained_checkpoint", type=str, default=None,
+                             help="Pretrained MAE checkpoint path (required when --trainer finetune_mae_unet). Invalid for other trainers.")
 
     # Logging & Tracking
     grp_logging.add_argument("--wandb-project", type=str, default=None,
@@ -1775,6 +1799,17 @@ def main():
 
     trainer_name = args.trainer.lower()
     mgr.trainer_class = trainer_name
+    
+    # Enforce usage of --pretrained_checkpoint only for the MAE finetune trainer, and require it there
+    if getattr(args, 'pretrained_checkpoint', None):
+        if trainer_name != "finetune_mae_unet":
+            raise ValueError("--pretrained_checkpoint is only valid when using --trainer finetune_mae_unet")
+        # Stash onto mgr so the finetune trainer can load it
+        setattr(mgr, 'pretrained_mae_checkpoint', args.pretrained_checkpoint)
+        mgr.tr_info["pretrained_mae_checkpoint"] = args.pretrained_checkpoint
+    elif trainer_name == "finetune_mae_unet":
+        # For finetune trainer the pretrained checkpoint is mandatory
+        raise ValueError("Missing --pretrained_checkpoint: required for --trainer finetune_mae_unet")
     
     if trainer_name == "uncertainty_aware_mean_teacher":
         mgr.allow_unlabeled_data = True
