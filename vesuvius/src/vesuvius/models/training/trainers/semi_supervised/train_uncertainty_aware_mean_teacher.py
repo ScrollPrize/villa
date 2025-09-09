@@ -127,9 +127,18 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
             num_workers=self.mgr.train_num_dataloader_workers
         )
         
-        train_val_split = self.mgr.tr_val_split
-        val_split = int(np.floor((1 - train_val_split) * num_labeled))
-        val_indices = self.labeled_indices[-val_split:] if val_split > 0 else self.labeled_indices[-5:]
+        # --- choose validation indices ---
+        # If an external validation dataset is provided (e.g., via --val-dir),
+        # its indices are independent from the training dataset. In that case
+        # evaluate over the full validation set (or a sampler can downselect later).
+        if val_dataset is not train_dataset:
+            if self.mgr.verbose:
+                print("Using external validation dataset for uncertainty-aware mean teacher; evaluating on full validation set")
+            val_indices = list(range(len(val_dataset)))
+        else:
+            train_val_split = self.mgr.tr_val_split
+            val_split = int(np.floor((1 - train_val_split) * num_labeled))
+            val_indices = self.labeled_indices[-val_split:] if val_split > 0 else self.labeled_indices[-5:]
         
         from torch.utils.data import SubsetRandomSampler
         val_dataloader = DataLoader(
