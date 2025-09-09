@@ -1006,16 +1006,13 @@ class BaseTrainer:
             f"{self.mgr.model_name}_epoch{epoch + 1}.pth"
         )
 
-        # unwrap DDP for saving if needed
-        model_to_save = model.module if isinstance(model, DDP) else model
-
         checkpoint_data = save_checkpoint(
-            model=model_to_save,
+            model=model,
             optimizer=optimizer,
             scheduler=scheduler,
             epoch=epoch,
             checkpoint_path=ckpt_path,
-            model_config=getattr(model_to_save, 'final_config', None),
+            model_config=getattr(model, 'final_config', None),
             train_dataset=train_dataset
         )
 
@@ -1505,15 +1502,14 @@ class BaseTrainer:
         if not self.is_distributed or self.rank == 0:
             print('Training Finished!')
 
-            model_to_save = model.module if isinstance(model, DDP) else model
             final_model_path = save_final_checkpoint(
-                model=model_to_save,
+                model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 max_epoch=self.mgr.max_epoch,
                 model_ckpt_dir=model_ckpt_dir,
                 model_name=self.mgr.model_name,
-                model_config=getattr(model_to_save, 'final_config', None),
+                model_config=getattr(model, 'final_config', None),
                 train_dataset=train_dataset
             )
         
