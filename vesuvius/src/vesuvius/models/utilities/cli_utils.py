@@ -177,5 +177,34 @@ def update_config_from_args(mgr, args):
             else:
                 print(f"Set early stopping patience: {args.early_stopping_patience} epochs")
 
+    # SSL warmup (mean teacher): ignore EMA consistency loss for N epochs
+    if hasattr(args, 'ssl_warmup') and args.ssl_warmup is not None:
+        mgr.warmup = int(args.ssl_warmup)
+        mgr.tr_configs["ssl_warmup"] = int(args.ssl_warmup)
+        if mgr.verbose:
+            if args.ssl_warmup > 0:
+                print(f"SSL warmup enabled: ignoring EMA consistency loss for first {args.ssl_warmup} epoch(s)")
+            else:
+                print("SSL warmup disabled (0 epochs)")
+
+    # Checkpoint/weights loading controls
+    if hasattr(args, 'checkpoint_path') and args.checkpoint_path is not None:
+        mgr.checkpoint_path = Path(args.checkpoint_path)
+        mgr.tr_info["checkpoint_path"] = str(mgr.checkpoint_path)
+        if mgr.verbose:
+            print(f"Set checkpoint path: {mgr.checkpoint_path}")
+
+    if hasattr(args, 'load_weights_only') and args.load_weights_only:
+        mgr.load_weights_only = True
+        mgr.tr_info["load_weights_only"] = True
+        if mgr.verbose:
+            print("Will load model weights only (ignore optimizer/scheduler)")
+
+    if hasattr(args, 'rebuild_from_ckpt_config') and args.rebuild_from_ckpt_config:
+        mgr.rebuild_from_checkpoint_config = True
+        mgr.tr_info["rebuild_from_checkpoint_config"] = True
+        if mgr.verbose:
+            print("Will rebuild model from checkpoint's model_config before loading weights")
+
     mgr.wandb_project = args.wandb_project
     mgr.wandb_entity = args.wandb_entity
