@@ -1107,7 +1107,8 @@ class BaseTrainer:
 
             epoch_losses = {t_name: [] for t_name in self.mgr.targets}
             train_iter = iter(train_dataloader)
-            pbar = tqdm(range(num_iters), desc=f'Epoch {epoch + 1}/{self.mgr.max_epoch}') if (not self.is_distributed or self.rank == 0) else None
+            # Progress bar for training iterations
+            pbar = tqdm(total=num_iters, desc=f'Epoch {epoch + 1}/{self.mgr.max_epoch}') if (not self.is_distributed or self.rank == 0) else None
             
             # Variables to store train samples for debug visualization
             train_sample_input = None
@@ -1196,6 +1197,7 @@ class BaseTrainer:
                     loss_str = " | ".join([f"{t}: {np.mean(epoch_losses[t][-100:]):.4f}"
                                            for t in epoch_losses.keys() if len(epoch_losses[t]) > 0])
                     pbar.set_postfix_str(loss_str)
+                    pbar.update(1)
 
                 current_lr = optimizer.param_groups[0]['lr']
 
@@ -1210,6 +1212,9 @@ class BaseTrainer:
                     wandb.log(metrics)
 
                 del data_dict, inputs, targets_dict, outputs
+
+            if pbar is not None:
+                pbar.close()
 
             if not is_per_iteration_scheduler:
                 scheduler.step()
