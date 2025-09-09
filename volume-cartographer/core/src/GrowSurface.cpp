@@ -71,6 +71,13 @@ static cv::Vec3f at_int_inv(const cv::Mat_<cv::Vec3f> &points, cv::Vec2f p)
 
 using SurfPoint = std::pair<SurfaceMeta*,cv::Vec2i>;
 
+// Deterministic ordering for cv::Vec2i (row-major: y, then x)
+struct Vec2iLess {
+    bool operator()(const cv::Vec2i& a, const cv::Vec2i& b) const {
+        return (a[0] < b[0]) || (a[0] == b[0] && a[1] < b[1]);
+    }
+};
+
 class resId_t
 {
 public:
@@ -1216,7 +1223,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
 
     std::vector<cv::Vec2i> neighs = {{1,0},{0,1},{-1,0},{0,-1}};
 
-    std::unordered_set<cv::Vec2i,vec2i_hash> fringe;
+    std::set<cv::Vec2i, Vec2iLess> fringe;
 
     cv::Mat_<uint8_t> state(size,0);
     cv::Mat_<uint16_t> inliers_sum_dbg(size,0);
@@ -1297,7 +1304,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
 
     bool at_right_border = false;
     for(int generation=0;generation<stop_gen;generation++) {
-        std::unordered_set<cv::Vec2i,vec2i_hash> cands;
+        std::set<cv::Vec2i, Vec2iLess> cands;
         if (generation == 0) {
             cands.insert(cv::Vec2i(y0-1,x0));
         }
@@ -1325,18 +1332,16 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
 
         std::cout << "go with cands " << cands.size() << " inl_th " << curr_best_inl_th << std::endl;
 
-        OmpThreadPointCol threadcol(3, cands);
+        // Deterministic, sorted vector of candidates
+        std::vector<cv::Vec2i> cands_vec(cands.begin(), cands.end());
 
         std::shared_mutex mutex;
         int best_inliers_gen = 0;
-#pragma omp parallel
-        while (true)
+#pragma omp parallel for schedule(static)
+        for (int idx = 0; idx < static_cast<int>(cands_vec.size()); ++idx)
         {
             int r = 1;
-            cv::Vec2i p = threadcol.next();
-
-            if (p[0] == -1)
-                break;
+            cv::Vec2i p = cands_vec[idx];
 
             if (state(p) & STATE_LOC_VALID)
                 continue;
