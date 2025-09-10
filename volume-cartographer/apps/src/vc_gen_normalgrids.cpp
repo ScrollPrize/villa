@@ -86,6 +86,9 @@ int main(int argc, char* argv[]) {
 
     ChunkCache cache(10llu*1024*1024*1024);
 
+    size_t total_slices_all_dirs = shape[0] + shape[1] + shape[2];
+    std::atomic<size_t> total_processed_all_dirs = 0;
+
     for (SliceDirection dir : {SliceDirection::XY, SliceDirection::XZ, SliceDirection::YZ}) {
         std::atomic<size_t> processed = 0;
         std::atomic<size_t> skipped = 0;
@@ -144,6 +147,7 @@ int main(int argc, char* argv[]) {
             if (fs::exists(out_path)) {
                 skipped++;
                 processed++;
+                total_processed_all_dirs++;
                 continue;
             }
 
@@ -200,6 +204,7 @@ int main(int argc, char* argv[]) {
                 total_segments += num_segments;
                 total_buckets += num_buckets;
                 processed++;
+                total_processed_all_dirs++;
             }
 
             auto now = std::chrono::steady_clock::now();
@@ -209,15 +214,18 @@ int main(int argc, char* argv[]) {
                 if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report_time).count() >= 1) {
                     last_report_time = now;
                     size_t p = processed; // Read atomic once
+                    size_t total_p = total_processed_all_dirs;
                     auto elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
-                    double slices_per_second = p / elapsed_seconds;
-                    double remaining_seconds = (num_slices - p) / slices_per_second;
+                    double slices_per_second = (p - skipped) / elapsed_seconds;
+                    if (slices_per_second == 0) slices_per_second = 1; // Avoid division by zero
+                    double remaining_seconds = (total_slices_all_dirs - total_p) / slices_per_second;
                     
                     int rem_min = static_cast<int>(remaining_seconds) / 60;
                     int rem_sec = static_cast<int>(remaining_seconds) % 60;
 
-                    std::cout << dir_str << " Avg: " << p << " / " << num_slices
-                                << " (" << (100.0 * p / num_slices) << "%)"
+                    std::cout << dir_str << " " << p << "/" << num_slices
+                                << " | Total " << total_p << "/" << total_slices_all_dirs
+                                << " (" << std::fixed << std::setprecision(1) << (100.0 * total_p / total_slices_all_dirs) << "%)"
                                 << ", skipped: " << skipped
                                 << ", ETA: " << rem_min << "m " << rem_sec << "s"
                                 << ", avg size: " << (total_size / (p - skipped))
