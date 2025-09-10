@@ -153,6 +153,15 @@ def update_config_from_args(mgr, args):
         if mgr.verbose:
             print(f"Set gradient clipping: {mgr.gradient_clip}")
 
+    # Gradient accumulation steps
+    if hasattr(args, 'gradient_accumulation') and args.gradient_accumulation is not None:
+        if args.gradient_accumulation < 1:
+            raise ValueError(f"--grad-accum/--gradient-accumulation must be >= 1, got {args.gradient_accumulation}")
+        mgr.gradient_accumulation = int(args.gradient_accumulation)
+        mgr.tr_configs["gradient_accumulation"] = int(args.gradient_accumulation)
+        if mgr.verbose:
+            print(f"Set gradient accumulation steps: {mgr.gradient_accumulation}")
+
     if args.scheduler is not None:
         mgr.scheduler = args.scheduler
         mgr.tr_configs["scheduler"] = args.scheduler

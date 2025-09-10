@@ -1638,6 +1638,8 @@ def main():
     # Optimization
     grp_optim.add_argument("--optimizer", type=str,
                            help="Optimizer (see models/optimizers.py)")
+    grp_optim.add_argument("--grad-accum", "--gradient-accumulation", dest="gradient_accumulation", type=int, default=None,
+                           help="Number of steps to accumulate gradients before optimizer.step()")
     grp_optim.add_argument("--grad-clip", type=float, default=12.0,
                            help="Gradient clipping value")
     grp_optim.add_argument("--no-amp", action="store_true",
