@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from contextlib import nullcontext
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, SubsetRandomSampler
 
 from vesuvius.models.training.train import BaseTrainer
 from vesuvius.models.training.trainers.semi_supervised.two_stream_batch_sampler import TwoStreamBatchSampler
@@ -33,7 +33,7 @@ class TrainMeanTeacher(BaseTrainer):
 
         # Semi-supervised sampling
         self.labeled_batch_size = getattr(mgr, 'labeled_batch_size', mgr.train_batch_size // 2)
-        self.labeled_ratio = getattr(mgr, 'labeled_ratio', 0.1)
+        self.labeled_ratio = getattr(mgr, 'labeled_ratio', 1.0)
         self.num_labeled = getattr(mgr, 'num_labeled', None)
 
         # Runtime state
@@ -43,6 +43,8 @@ class TrainMeanTeacher(BaseTrainer):
         self.unlabeled_indices = None
 
         mgr.enable_deep_supervision = False
+        # One-time validation debug flag
+        self._val_debug_done = False
 
     # --- EMA helpers --- #
     def _create_ema_model(self, model):
@@ -51,7 +53,6 @@ class TrainMeanTeacher(BaseTrainer):
         for param_student, param_teacher in zip(model.parameters(), ema_model.parameters()):
             param_teacher.data.copy_(param_student.data)
             param_teacher.requires_grad = False
-        # Use eval mode for stable teacher targets (freeze BN/dropout behavior)
         ema_model.eval()
         return ema_model
 
@@ -77,16 +78,44 @@ class TrainMeanTeacher(BaseTrainer):
             if self.mgr.verbose:
                 print(f"Using seed {self.mgr.seed} for labeled/unlabeled split")
 
+
         np.random.shuffle(indices)
 
-        if self.num_labeled is not None:
-            num_labeled = min(self.num_labeled, dataset_size)
-        else:
-            num_labeled = int(self.labeled_ratio * dataset_size)
-        num_labeled = max(num_labeled, self.labeled_batch_size)
+        # Re-evaluate labeled/unlabeled from dataset flags to ensure supervision uses true labeled patches
+        labeled_idx, unlabeled_idx = [], []
+        used_fast_path = False
+        if hasattr(train_dataset, 'get_labeled_unlabeled_patch_indices'):
+            try:
+                li, ui = train_dataset.get_labeled_unlabeled_patch_indices()
+                li_set, ui_set = set(li), set(ui)
+                labeled_idx = [i for i in indices if i in li_set]
+                unlabeled_idx = [i for i in indices if i in ui_set]
+                used_fast_path = True
+                if self.mgr.verbose:
+                    print("Using dataset fast-path for labeled/unlabeled split")
+            except Exception as e:
+                print(f"Fast-path split failed: {e}")
+        if not used_fast_path:
+            raise ValueError(
+                "Dataset does not support fast labeled/unlabeled split. "
+                "Ensure you're using the ImageDataset (data_format='image') or implement "
+                "get_labeled_unlabeled_patch_indices() on your dataset."
+            )
 
-        self.labeled_indices = indices[:num_labeled]
-        self.unlabeled_indices = indices[num_labeled:]
+        if self.num_labeled is not None:
+            num_labeled = min(self.num_labeled, len(labeled_idx))
+        else:
+            num_labeled = int(self.labeled_ratio * max(1, len(labeled_idx)))
+        num_labeled = max(num_labeled, self.labeled_batch_size) if labeled_idx else 0
+
+        # Build final ordered indices list: labeled first, then unlabeled
+        self.labeled_indices = labeled_idx[:num_labeled]
+        self.unlabeled_indices = unlabeled_idx
+
+        # If we still need more samples to fill the batch composition, draw extra from remaining labeled
+        if len(self.labeled_indices) < self.labeled_batch_size and len(labeled_idx) > len(self.labeled_indices):
+            extra = self.labeled_batch_size - len(self.labeled_indices)
+            self.labeled_indices += labeled_idx[len(self.labeled_indices):len(self.labeled_indices)+extra]
 
         unlabeled_batch_size = self.mgr.train_batch_size - self.labeled_batch_size
         if len(self.unlabeled_indices) < unlabeled_batch_size:
@@ -94,7 +123,7 @@ class TrainMeanTeacher(BaseTrainer):
                 f"Insufficient unlabeled data: need at least {unlabeled_batch_size}, have {len(self.unlabeled_indices)}."
             )
 
-        print(f"Semi-supervised split: {num_labeled} labeled, {len(self.unlabeled_indices)} unlabeled")
+        print(f"Semi-supervised split: {len(self.labeled_indices)} labeled (from {len(labeled_idx)}), {len(self.unlabeled_indices)} unlabeled")
         print(
             f"Batch composition: {self.labeled_batch_size} labeled + {unlabeled_batch_size} unlabeled = {self.mgr.train_batch_size} total")
 
@@ -122,10 +151,9 @@ class TrainMeanTeacher(BaseTrainer):
             val_indices = list(range(len(val_dataset)))
         else:
             train_val_split = self.mgr.tr_val_split
-            val_split = int(np.floor((1 - train_val_split) * num_labeled))
-            val_indices = self.labeled_indices[-val_split:] if val_split > 0 else self.labeled_indices[-5:]
+            val_split = int(np.floor((1 - train_val_split) * max(1, len(self.labeled_indices))))
+            val_indices = self.labeled_indices[-val_split:] if val_split > 0 else self.labeled_indices[-min(5, len(self.labeled_indices)):]
 
-        from torch.utils.data import SubsetRandomSampler
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=1,
@@ -134,7 +162,7 @@ class TrainMeanTeacher(BaseTrainer):
             num_workers=self.mgr.train_num_dataloader_workers,
         )
 
-        self.train_indices = indices[:num_labeled]
+        self.train_indices = list(self.labeled_indices)
 
         return train_dataloader, val_dataloader, self.labeled_indices, val_indices
 
@@ -150,17 +178,30 @@ class TrainMeanTeacher(BaseTrainer):
 
         batch_size = inputs.shape[0]
 
+        # Build unlabeled mask for this batch
+        def as_float_mask(val):
+            if isinstance(val, torch.Tensor):
+                return val.to(self.device).float()
+            if isinstance(val, (list, tuple)):
+                return torch.tensor(val, device=self.device, dtype=torch.float32)
+            if isinstance(val, bool):
+                return torch.full((batch_size,), float(val), device=self.device)
+            return torch.zeros(batch_size, device=self.device)
+
         if model.training and batch_size == self.mgr.train_batch_size:
-            # During SSL warmup epochs, treat the whole batch as labeled-only
+            # Warmup: trust dataset flags; After warmup: rely on sampler ordering [labeled..., unlabeled...]
             in_warmup = getattr(self, 'warmup', 0) > 0 and getattr(self, '_current_epoch', 0) < self.warmup
+            ds_mask = as_float_mask(data_dict.get('is_unlabeled', None))
             if in_warmup:
-                is_unlabeled = torch.zeros(batch_size, device=self.device)
+                is_unlabeled = ds_mask
             else:
-                # TwoStreamBatchSampler orders labeled first, then unlabeled
-                is_unlabeled = torch.zeros(batch_size, device=self.device)
-                is_unlabeled[self.labeled_batch_size:] = 1.0
+                is_unlabeled = torch.cat([
+                    torch.zeros(self.labeled_batch_size, device=self.device),
+                    torch.ones(batch_size - self.labeled_batch_size, device=self.device)
+                ], dim=0)
         else:
-            is_unlabeled = torch.zeros(batch_size, device=self.device)
+            # Validation/other: default to labeled unless dataset provides flags
+            is_unlabeled = as_float_mask(data_dict.get('is_unlabeled', None))
 
         outputs = model(inputs)
 
@@ -265,6 +306,39 @@ class TrainMeanTeacher(BaseTrainer):
         with autocast_ctx:
             inputs, targets_dict, outputs = self._get_model_outputs(model, data_dict)
             outputs['_inputs'] = inputs
+
+            # One-time debug: inspect shapes and label stats on first step
+            if epoch == 0 and step == 0 and (not self.is_distributed or self.rank == 0):
+                try:
+                    # Prediction head shape
+                    pred_keys = [k for k in outputs.keys() if k != '_inputs']
+                    if pred_keys:
+                        pk = pred_keys[0]
+                        ps = tuple(outputs[pk].shape)
+                        print(f"[MT DEBUG] pred[{pk}] shape: {ps}")
+                    # Labeled/unlabeled counts
+                    is_unlabeled = targets_dict.get('is_unlabeled', None)
+                    if is_unlabeled is not None:
+                        lbl_mask = (is_unlabeled == 0)
+                        ulb_mask = (is_unlabeled == 1)
+                        print(f"[MT DEBUG] labeled count: {int(lbl_mask.sum().item())} | unlabeled count: {int(ulb_mask.sum().item())}")
+                    else:
+                        lbl_mask = None
+                    # Ground truth stats for supervised subset
+                    for k, v in list(targets_dict.items()):
+                        if k in ('is_unlabeled', 'skel'):
+                            continue
+                        t = v[lbl_mask] if lbl_mask is not None else v
+                        try:
+                            t_min = float(t.min().item())
+                            t_max = float(t.max().item())
+                            pos_frac = float((t > 0).float().mean().item())
+                            print(f"[MT DEBUG] gt[{k}] shape: {tuple(t.shape)} | min/max: {t_min}/{t_max} | pos_frac: {pos_frac:.6f}")
+                        except Exception as e:
+                            print(f"[MT DEBUG] gt[{k}] stats error: {e}")
+                except Exception as e:
+                    print(f"[MT DEBUG] error during debug logging: {e}")
+
             total_loss, task_losses = self._compute_train_loss(outputs, targets_dict, loss_fns, autocast_ctx)
 
         scaled_loss = total_loss / grad_accumulate_n
@@ -287,6 +361,43 @@ class TrainMeanTeacher(BaseTrainer):
         targets_dict_clean = {k: v for k, v in targets_dict.items() if k != 'is_unlabeled'}
 
         return total_loss, task_losses, inputs, targets_dict_clean, outputs, optimizer_stepped
+
+    # --- Validation step override for first-batch debug --- #
+    def _validation_step(self, model, data_dict, loss_fns, use_amp):
+        task_losses, inputs, targets_dict, outputs = super()._validation_step(
+            model=model,
+            data_dict=data_dict,
+            loss_fns=loss_fns,
+            use_amp=use_amp,
+        )
+
+        # One-time debug info on first validation batch (rank 0 only)
+        if not self._val_debug_done and (not self.is_distributed or self.rank == 0):
+            self._val_debug_done = True
+            try:
+                # Prediction head shape
+                pred_keys = [k for k in outputs.keys()]
+                if pred_keys:
+                    pk = pred_keys[0]
+                    ps = tuple(outputs[pk][0].shape if isinstance(outputs[pk], (list, tuple)) else outputs[pk].shape)
+                    print(f"[MT DEBUG] [val] pred[{pk}] shape: {ps}")
+
+                # Ground truth stats
+                for k, v in list(targets_dict.items()):
+                    if k in ('is_unlabeled', 'skel'):
+                        continue
+                    t = v[0] if isinstance(v, (list, tuple)) else v
+                    try:
+                        t_min = float(t.min().item())
+                        t_max = float(t.max().item())
+                        pos_frac = float((t > 0).float().mean().item())
+                        print(f"[MT DEBUG] [val] gt[{k}] shape: {tuple(t.shape)} | min/max: {t_min}/{t_max} | pos_frac: {pos_frac:.6f}")
+                    except Exception as e:
+                        print(f"[MT DEBUG] [val] gt[{k}] stats error: {e}")
+            except Exception as e:
+                print(f"[MT DEBUG] [val] error during debug logging: {e}")
+
+        return task_losses, inputs, targets_dict, outputs
 
     def _initialize_training(self):
         training_state = super()._initialize_training()
