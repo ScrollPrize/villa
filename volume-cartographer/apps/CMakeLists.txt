@@ -54,6 +54,33 @@ target_link_libraries(vc_calc_surface_metrics vc_core vc_ui Boost::program_optio
 add_executable(vc_tifxyz_gengt src/vc_tifxyz_gengt.cpp)
 target_link_libraries(vc_tifxyz_gengt vc_core vc_ui Boost::program_options)
 
+set(vc_diffuse_winding_sources
+    diffusion/continuous3d.cpp
+    diffusion/continous.cpp
+    diffusion/discrete.cpp
+    diffusion/spiral_ceres.cpp
+    diffusion/spiral_common.cpp
+    diffusion/spiral.cpp
+    diffusion/spiral2.cpp
+    diffusion/spiral2cont.cpp
+    diffusion/support.cpp
+    diffusion/vc_diffuse_winding.cpp
+)
+
+add_executable(vc_diffuse_winding ${vc_diffuse_winding_sources})
+target_include_directories(vc_diffuse_winding PRIVATE diffusion)
+target_link_libraries(vc_diffuse_winding
+    PRIVATE
+        z5
+        opencv_highgui
+        opencv_ximgproc
+        vc_core
+        vc_ui
+        Boost::program_options
+        OpenMP::OpenMP_CXX
+        Ceres::ceres
+)
+
 add_executable(vc_render_bench src/ZarrExtract.cpp)
 target_link_libraries(vc_render_bench vc_core)
 
@@ -81,6 +108,10 @@ target_link_libraries(vc_ced2d
 add_executable(vc_transform_geom src/vc_transform_geom.cpp)
 target_link_libraries(vc_transform_geom vc_core Boost::program_options)
 
+add_executable(vc_gen_normalgrids src/vc_gen_normalgrids.cpp diffusion/support.cpp)
+target_link_libraries(vc_gen_normalgrids vc_core z5 Boost::program_options opencv_core opencv_imgproc opencv_ximgproc OpenMP::OpenMP_CXX Ceres::ceres)
+target_include_directories(vc_gen_normalgrids PRIVATE diffusion)
+
 add_executable(vc_tifxyz2rgb src/vc_tifxyz2rgb.cpp)
 target_link_libraries(vc_tifxyz2rgb
     vc_core
@@ -105,7 +136,6 @@ target_link_libraries(vc_telea_inpaint
     opencv_photo
 )
 
-
 # Install targets
 if(VC_INSTALL_APPS)
 install(
@@ -125,8 +155,10 @@ install(
         vc_tifxyz_gengt
         vc_fill_quadmesh
         vc_calc_surface_metrics
+        vc_diffuse_winding
         vc_ced2d
         vc_transform_geom
+        vc_gen_normalgrids
         vc_telea_inpaint
         ${extra_apps}
     RUNTIME DESTINATION bin
