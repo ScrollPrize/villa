@@ -1656,6 +1656,13 @@ def main():
                              help="Trainer: base, mean_teacher, uncertainty_aware_mean_teacher, primus_mae, unet_mae, finetune_mae_unet")
     grp_trainer.add_argument("--ssl-warmup", type=int, default=None,
                              help="Semi-supervised: epochs to ignore EMA consistency loss (0 disables)")
+    # Semi-supervised sampling controls (used by mean_teacher/uncertainty_aware_mean_teacher)
+    grp_trainer.add_argument("--labeled-ratio", type=float, default=None,
+                             help="Fraction of labeled patches to use (0-1). If set, overrides trainer default")
+    grp_trainer.add_argument("--num-labeled", type=int, default=None,
+                             help="Absolute number of labeled patches to use (overrides --labeled-ratio if provided)")
+    grp_trainer.add_argument("--labeled-batch-size", type=int, default=None,
+                             help="Number of labeled patches per batch (rest are unlabeled) for two-stream sampler")
     
     # Only valid for finetune_mae_unet: path to the pretrained MAE checkpoint to initialize from
     grp_trainer.add_argument("--pretrained_checkpoint", type=str, default=None,

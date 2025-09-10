@@ -204,6 +204,36 @@ def update_config_from_args(mgr, args):
             else:
                 print("SSL warmup disabled (0 epochs)")
 
+    # Semi-supervised sampling controls
+    if hasattr(args, 'labeled_ratio') and args.labeled_ratio is not None:
+        if not (0.0 <= args.labeled_ratio <= 1.0):
+            raise ValueError(f"--labeled-ratio must be in [0,1], got {args.labeled_ratio}")
+        mgr.labeled_ratio = float(args.labeled_ratio)
+        mgr.tr_configs["labeled_ratio"] = float(args.labeled_ratio)
+        if mgr.verbose:
+            print(f"Set labeled patch ratio: {mgr.labeled_ratio}")
+
+    if hasattr(args, 'num_labeled') and args.num_labeled is not None:
+        if args.num_labeled < 0:
+            # Convention: -1 means use all labeled patches
+            mgr.num_labeled = None
+            mgr.tr_configs["num_labeled"] = None
+            if mgr.verbose:
+                print("Using all labeled patches (num_labeled=-1)")
+        else:
+            mgr.num_labeled = int(args.num_labeled)
+            mgr.tr_configs["num_labeled"] = int(args.num_labeled)
+            if mgr.verbose:
+                print(f"Set absolute labeled patch count: {mgr.num_labeled}")
+
+    if hasattr(args, 'labeled_batch_size') and args.labeled_batch_size is not None:
+        if args.labeled_batch_size < 1:
+            raise ValueError(f"--labeled-batch-size must be >=1, got {args.labeled_batch_size}")
+        mgr.labeled_batch_size = int(args.labeled_batch_size)
+        mgr.tr_configs["labeled_batch_size"] = int(args.labeled_batch_size)
+        if mgr.verbose:
+            print(f"Set labeled batch size: {mgr.labeled_batch_size}")
+
     
 
     # Checkpoint/weights loading controls
