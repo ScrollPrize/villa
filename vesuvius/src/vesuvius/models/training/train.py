@@ -1656,6 +1656,7 @@ def main():
                              help="Trainer: base, mean_teacher, uncertainty_aware_mean_teacher, primus_mae, unet_mae, finetune_mae_unet")
     grp_trainer.add_argument("--ssl-warmup", type=int, default=None,
                              help="Semi-supervised: epochs to ignore EMA consistency loss (0 disables)")
+    
     # Only valid for finetune_mae_unet: path to the pretrained MAE checkpoint to initialize from
     grp_trainer.add_argument("--pretrained_checkpoint", type=str, default=None,
                              help="Pretrained MAE checkpoint path (required when --trainer finetune_mae_unet). Invalid for other trainers.")

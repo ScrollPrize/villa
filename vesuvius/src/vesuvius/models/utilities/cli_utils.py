@@ -204,6 +204,8 @@ def update_config_from_args(mgr, args):
             else:
                 print("SSL warmup disabled (0 epochs)")
 
+    
+
     # Checkpoint/weights loading controls
     if hasattr(args, 'checkpoint_path') and args.checkpoint_path is not None:
         mgr.checkpoint_path = Path(args.checkpoint_path)
