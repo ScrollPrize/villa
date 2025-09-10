@@ -114,7 +114,9 @@ def run_training(patch_size_z: int = 0, patch_size_x: int = 128, patch_size_y: i
     _config_manager.update_config(
         patch_size=new_patch_size,
         min_labeled_ratio=min_labeled_ratio,
-        max_epochs=max_epochs
+        max_epochs=max_epochs,
+        skip_patch_validation=False,
+        min_bbox_percent=0.90
     )
 
     # Now that data_format is set to 'napari', the dataset will handle target detection

@@ -285,6 +285,7 @@ class ConfigManager:
     def update_config(self, patch_size=None, min_labeled_ratio=None, max_epochs=None, loss_function=None, 
                      skip_patch_validation=None,
                      normalization_scheme=None, intensity_properties=None,
+                     min_bbox_percent=None,
                      skip_bounding_box=None):
         if patch_size is not None:
             if isinstance(patch_size, (list, tuple)) and len(patch_size) >= 2:
@@ -322,6 +323,12 @@ class ConfigManager:
             self.dataset_config["skip_patch_validation"] = self.skip_patch_validation
             if self.verbose:
                 print(f"Updated skip_patch_validation: {self.skip_patch_validation}")
+
+        if min_bbox_percent is not None:
+            self.min_bbox_percent = float(min_bbox_percent)
+            self.dataset_config["min_bbox_percent"] = self.min_bbox_percent
+            if self.verbose:
+                print(f"Updated min bbox percent: {self.min_bbox_percent:.2f}")
 
         if loss_function is not None:
             self.selected_loss_function = loss_function
