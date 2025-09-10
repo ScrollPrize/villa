@@ -1,5 +1,5 @@
 tr_config:
-  patch_size: [128,128,128]
+  patch_size: [128,128]
 
 
 dataset_config:

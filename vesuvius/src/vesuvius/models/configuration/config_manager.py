@@ -306,6 +306,17 @@ class ConfigManager:
             if self.verbose:
                 print(f"Updated min labeled ratio: {self.min_labeled_ratio:.2f}")
 
+        # Support setting max epochs from UI (note: internal key is 'max_epoch')
+        if max_epochs is not None:
+            try:
+                self.max_epoch = int(max_epochs)
+            except Exception:
+                # Fallback if a non-int slips through
+                self.max_epoch = int(float(max_epochs))
+            self.tr_configs["max_epoch"] = self.max_epoch
+            if self.verbose:
+                print(f"Updated max epochs: {self.max_epoch}")
+
         if skip_patch_validation is not None:
             self.skip_patch_validation = bool(skip_patch_validation)
             self.dataset_config["skip_patch_validation"] = self.skip_patch_validation
