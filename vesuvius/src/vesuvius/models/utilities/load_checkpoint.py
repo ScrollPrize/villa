@@ -113,6 +113,23 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler, mgr, device, l
 
     model_state = _strip_wrapper_prefixes(model_state)
 
+    # Align checkpoint keys with target model keys regarding DDP ('module.') prefix.
+    # If the model is already wrapped in DDP (model.state_dict has 'module.'), but the
+    # checkpoint was saved from an unwrapped model (no 'module.'), prepend the prefix.
+    try:
+        target_keys = list(model.state_dict().keys())
+        ckpt_keys = list(model_state.keys())
+        target_has_module = all(k.startswith('module.') for k in target_keys) if target_keys else False
+        ckpt_has_module = any(k.startswith('module.') for k in ckpt_keys) if ckpt_keys else False
+        if target_has_module and not ckpt_has_module:
+            model_state = {f"module.{k}": v for k, v in model_state.items()}
+        # Conversely, if target does not have 'module.' but checkpoint does (rare after stripping), strip it.
+        elif (not target_has_module) and ckpt_has_module:
+            model_state = { (k[7:] if k.startswith('module.') else k): v for k, v in model_state.items() }
+    except Exception:
+        # If any issue occurs during prefix alignment, proceed with original model_state
+        pass
+
     # Optionally filter to matching keys/shapes when loading weights only
     target_state = model.state_dict()
     allow_partial = bool(load_weights_only)
