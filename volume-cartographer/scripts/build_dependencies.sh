@@ -204,11 +204,14 @@ cd "$BUILD_DIR"
 
 # OpenCV
 rm -rf opencv
+rm -rf opencv_contrib
 git clone --depth 1 https://github.com/opencv/opencv.git
+git clone --depth 1 https://github.com/opencv/opencv_contrib.git
 cd opencv
 mkdir -p build && cd build
 cmake .. -G Ninja \
     -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
+    -DOPENCV_EXTRA_MODULES_PATH="$BUILD_DIR/opencv_contrib/modules" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=clang \
     -DCMAKE_CXX_COMPILER=clang++ \
