@@ -114,95 +114,66 @@ void ChunkCache::put(const cv::Vec4i &idx, xt::xarray<uint8_t> *ar)
     _gen_store[idx] = _generation;
 }
 
-void readArea3D(xt::xtensor<uint8_t, 3, xt::layout_type::column_major>& out, const cv::Vec3i offset, z5::Dataset* ds, ChunkCache* cache) {
+//algorithm 2: do interpolation on basis of individual chunks
+void readArea3D(xt::xtensor<uint8_t,3,xt::layout_type::column_major> &out, const cv::Vec3i offset, z5::Dataset *ds, ChunkCache *cache)
+{
+    //FIXME assert dims
+    //FIXME based on key math we should check bounds here using volume and chunk size
     int group_idx = cache->groupIdx(ds->path());
-    cv::Vec3i size = {(int)out.shape()[0], (int)out.shape()[1], (int)out.shape()[2]};
+
+    cv::Vec3i size = {out.shape()[0],out.shape()[1],out.shape()[2]};
+
     auto chunksize = ds->chunking().blockShape();
 
-    cv::Vec3i to = offset + size;
+    cv::Vec3i to = offset+size;
     cv::Vec3i offset_valid = offset;
-    for (int i = 0; i < 3; i++) {
-        offset_valid[i] = std::max(0, offset_valid[i]);
-        to[i] = std::max(0, to[i]);
-        offset_valid[i] = std::min((int)ds->shape(i), offset_valid[i]);
-        to[i] = std::min((int)ds->shape(i), to[i]);
+    for(int i=0;i<3;i++) {
+        offset_valid[i] = std::max(0,offset_valid[i]);
+        to[i] = std::max(0,to[i]);
+        offset_valid[i] = std::min(int(ds->shape(i)),offset_valid[i]);
+        to[i] = std::min(int(ds->shape(i)),to[i]);
     }
 
-    std::unordered_map<cv::Vec4i, std::shared_ptr<xt::xarray<uint8_t>>, vec4i_hash> chunks;
-
-    // Stage 1: Collect chunks needed
-    #pragma omp parallel
     {
-        std::unordered_map<cv::Vec4i, std::shared_ptr<xt::xarray<uint8_t>>, vec4i_hash> chunks_local;
-        #pragma omp for collapse(3)
-        for (int z = offset_valid[0]; z < to[0]; ++z) {
-            for (int y = offset_valid[1]; y < to[1]; ++y) {
-                for (int x = offset_valid[2]; x < to[2]; ++x) {
-                    int iz = z / chunksize[0];
-                    int iy = y / chunksize[1];
-                    int ix = x / chunksize[2];
-                    chunks_local[{group_idx, iz, iy, ix}] = nullptr;
-                }
-            }
-        }
-        #pragma omp critical
-        chunks.merge(chunks_local);
-    }
-
-    // Stage 2: Read and cache chunks
-    std::vector<cv::Vec4i> chunks_to_process;
-    for(const auto& it : chunks) {
-        chunks_to_process.push_back(it.first);
-    }
-    std::random_shuffle(chunks_to_process.begin(), chunks_to_process.end());
-
-    #pragma omp parallel for schedule(dynamic, 1)
-    for (const auto& idx : chunks_to_process) {
+        cv::Vec4i last_idx = {-1,-1,-1,-1};
         std::shared_ptr<xt::xarray<uint8_t>> chunk_ref;
-        {
-            std::shared_lock<std::shared_mutex> lock(cache->mutex);
-            chunk_ref = cache->get(idx);
-        }
+        xt::xarray<uint8_t> *chunk = nullptr;
+        for(size_t z = offset_valid[0];z<to[0];z++)
+            for(size_t y = offset_valid[1];y<to[1];y++)
+                for(size_t x = offset_valid[2];x<to[2];x++) {
 
-        if (!chunk_ref) {
-            auto* new_chunk = readChunk<uint8_t>(*ds, {(size_t)idx[1], (size_t)idx[2], (size_t)idx[3]});
-            std::unique_lock<std::shared_mutex> lock(cache->mutex);
-            if (!cache->has(idx)) {
-                cache->put(idx, new_chunk);
-            } else {
-                delete new_chunk;
+                    int iz = z/chunksize[0];
+                    int iy = y/chunksize[1];
+                    int ix = x/chunksize[2];
+
+                    cv::Vec4i idx = {group_idx,iz,iy,ix};
+
+                    if (idx != last_idx) {
+                        last_idx = idx;
+                        cache->mutex.lock();
+
+                        if (!cache->has(idx)) {
+                            cache->mutex.unlock();
+                            // std::cout << "reading chunk " << cv::Vec3i(ix,iy,iz) << " for " << cv::Vec3i(x,y,z) << chunksize << std::endl;
+                            chunk = readChunk<uint8_t>(*ds, {size_t(iz),size_t(iy),size_t(ix)});
+                            cache->mutex.lock();
+                            cache->put(idx, chunk);
+                            chunk_ref = cache->get(idx);
+                        }
+                        else {
+                            chunk_ref = cache->get(idx);
+                            chunk = chunk_ref.get();
+                        }
+                        cache->mutex.unlock();
+                    }
+
+                    if (chunk) {
+                        int lz = z-iz*chunksize[0];
+                        int ly = y-iy*chunksize[1];
+                        int lx = x-ix*chunksize[2];
+                        out(z-offset[0], y-offset[1], x-offset[2]) = chunk->operator()(lz,ly,lx);
+                    }
             }
-        }
-    }
-
-    {
-        std::shared_lock<std::shared_mutex> lock(cache->mutex);
-        for (auto& it : chunks) {
-            it.second = cache->get(it.first);
-        }
-    }
-
-    // Stage 3: Copy data
-    #pragma omp parallel for collapse(3)
-    for (int z = offset_valid[0]; z < to[0]; ++z) {
-        for (int y = offset_valid[1]; y < to[1]; ++y) {
-            for (int x = offset_valid[2]; x < to[2]; ++x) {
-                int iz = z / chunksize[0];
-                int iy = y / chunksize[1];
-                int ix = x / chunksize[2];
-                
-                auto chunk_ref = chunks.at({group_idx, iz, iy, ix});
-                
-                if (chunk_ref) {
-                    int lz = z - iz * chunksize[0];
-                    int ly = y - iy * chunksize[1];
-                    int lx = x - ix * chunksize[2];
-                    out(z - offset[0], y - offset[1], x - offset[2]) = (*chunk_ref)(lz, ly, lx);
-                } else {
-                    out(z - offset[0], y - offset[1], x - offset[2]) = 0;
-                }
-            }
-        }
     }
 }
 

@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <unordered_map>
 
 #include "vc/core/util/xtensor_include.hpp"
 #include XTENSORINCLUDE(containers, xarray.hpp)
@@ -83,7 +84,10 @@ int main(int argc, char* argv[]) {
     std::ofstream o(output_fs_path / "metadata.json");
     o << std::setw(4) << metadata << std::endl;
 
-    ChunkCache cache(4llu*1024*1024*1024);
+    ChunkCache cache(10llu*1024*1024*1024);
+
+    size_t total_slices_all_dirs = shape[0] + shape[1] + shape[2];
+    std::atomic<size_t> total_processed_all_dirs = 0;
 
     for (SliceDirection dir : {SliceDirection::XY, SliceDirection::XZ, SliceDirection::YZ}) {
         std::atomic<size_t> processed = 0;
@@ -91,6 +95,13 @@ int main(int argc, char* argv[]) {
         std::atomic<size_t> total_size = 0;
         std::atomic<size_t> total_segments = 0;
         std::atomic<size_t> total_buckets = 0;
+        
+        struct TimingStats {
+            std::atomic<size_t> count;
+            std::atomic<double> total_time;
+        };
+        std::unordered_map<std::string, TimingStats> timings;
+
         auto last_report_time = std::chrono::steady_clock::now();
         auto start_time = std::chrono::steady_clock::now();
         std::mutex report_mutex;
@@ -136,16 +147,15 @@ int main(int argc, char* argv[]) {
             if (fs::exists(out_path)) {
                 skipped++;
                 processed++;
+                total_processed_all_dirs++;
                 continue;
             }
 
             xt::xtensor<uint8_t, 3, xt::layout_type::column_major> slice_data = xt::zeros<uint8_t>(slice_shape);
-            double read_time, skeleton_time, grid_time;
-            {
-                ALifeTime t;
-                readArea3D(slice_data, offset, ds.get(), &cache);
-                read_time = t.seconds();
-            }
+            
+            ALifeTime t;
+            readArea3D(slice_data, offset, ds.get(), &cache);
+            t.mark("read");
 
             for (int z = 0; z < slice_mat.rows; ++z) {
                 for (int y = 0; y < slice_mat.cols; ++y) {
@@ -164,35 +174,37 @@ int main(int argc, char* argv[]) {
                 processed++;
             } else {
                 decltype(generate_skeleton_graph(binary_slice, vm)) skeleton_res;
-                {
-                    ALifeTime t;
-                    skeleton_res = generate_skeleton_graph(binary_slice, vm);
-                    skeleton_time = t.seconds();
-                }
+                skeleton_res = generate_skeleton_graph(binary_slice, vm);
+                t.mark("skeleton");
                 auto& [skeleton_graph, skeleton_id_img] = skeleton_res;
 
                 vc::core::util::GridStore grid_store(cv::Rect(0, 0, slice_mat.cols, slice_mat.rows), vm["grid-step"].as<int>());
-                {
-                    ALifeTime t;
-                    populate_normal_grid(skeleton_graph, grid_store, spiral_step);
-                    grid_store.save(tmp_path);
-                    fs::rename(tmp_path, out_path);
-                    grid_time = t.seconds();
-                }
+                populate_normal_grid(skeleton_graph, grid_store, spiral_step);
+                grid_store.save(tmp_path);
+                fs::rename(tmp_path, out_path);
+                t.mark("grid");
 
-                snprintf(filename, sizeof(filename), "%06zu.tif", i);
-                cv::imwrite((output_fs_path / (dir_str + "_img") / filename).string(), binary_slice);
+                if (i % 100 == 0) {
+                    snprintf(filename, sizeof(filename), "%06zu.jpg", i);
+                    cv::imwrite((output_fs_path / (dir_str + "_img") / filename).string(), binary_slice);
+                }
                 
                 size_t file_size = fs::file_size(out_path);
                 size_t num_segments = grid_store.numSegments();
                 size_t num_buckets = grid_store.numNonEmptyBuckets();
 
-                std::cout << dir_str << " Slice " << i << ": read " << read_time << "s, skeleton " << skeleton_time << "s, grid " << grid_time << "s" << std::endl;
+                std::cout << dir_str << " Slice " << i << ": " << t.report() << std::endl;
+
+                for(const auto& mark : t.getMarks()) {
+                    timings[mark.first].count++;
+                    timings[mark.first].total_time += mark.second;
+                }
 
                 total_size += file_size;
                 total_segments += num_segments;
                 total_buckets += num_buckets;
                 processed++;
+                total_processed_all_dirs++;
             }
 
             auto now = std::chrono::steady_clock::now();
@@ -202,20 +214,30 @@ int main(int argc, char* argv[]) {
                 if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report_time).count() >= 1) {
                     last_report_time = now;
                     size_t p = processed; // Read atomic once
+                    size_t total_p = total_processed_all_dirs;
                     auto elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
-                    double slices_per_second = p / elapsed_seconds;
-                    double remaining_seconds = (num_slices - p) / slices_per_second;
+                    double slices_per_second = (p - skipped) / elapsed_seconds;
+                    if (slices_per_second == 0) slices_per_second = 1; // Avoid division by zero
+                    double remaining_seconds = (total_slices_all_dirs - total_p) / slices_per_second;
                     
                     int rem_min = static_cast<int>(remaining_seconds) / 60;
                     int rem_sec = static_cast<int>(remaining_seconds) % 60;
 
-                    std::cout << dir_str << " Avg: " << p << " / " << num_slices
-                                << " (" << (100.0 * p / num_slices) << "%)"
+                    std::cout << dir_str << " " << p << "/" << num_slices
+                                << " | Total " << total_p << "/" << total_slices_all_dirs
+                                << " (" << std::fixed << std::setprecision(1) << (100.0 * total_p / total_slices_all_dirs) << "%)"
                                 << ", skipped: " << skipped
                                 << ", ETA: " << rem_min << "m " << rem_sec << "s"
                                 << ", avg size: " << (total_size / (p - skipped))
                                 << ", avg segments: " << (total_segments / (p - skipped))
-                                << ", avg buckets: " << (total_buckets / (p - skipped)) << std::endl;
+                                << ", avg buckets: " << (total_buckets / (p - skipped));
+
+                    for(auto const& [key, val] : timings) {
+                        if (val.count > 0) {
+                            std::cout << ", avg " << key << ": " << (val.total_time / val.count) << "s";
+                        }
+                    }
+                    std::cout << std::endl;
                 }
             }
         }
