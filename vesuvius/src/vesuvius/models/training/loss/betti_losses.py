@@ -16,8 +16,10 @@ try:
     from pathlib import Path
     
     # Look for the external Betti build in the Vesuvius installation
-    vesuvius_module_path = Path(__file__).parent.parent.parent.parent.parent.parent  # Go up to vesuvius root
-    betti_build_path = vesuvius_module_path / "external" / "Betti-Matching-3D" / "build"
+    # Path structure: .../vesuvius/src/vesuvius/models/training/loss/betti_losses.py
+    # Need to go up to .../vesuvius/src/
+    vesuvius_src_path = Path(__file__).parent.parent.parent.parent.parent  # Go up to vesuvius/src
+    betti_build_path = vesuvius_src_path / "external" / "Betti-Matching-3D" / "build"
     
     if betti_build_path.exists():
         sys.path.insert(0, str(betti_build_path))
