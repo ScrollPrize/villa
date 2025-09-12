@@ -746,7 +746,7 @@ static double local_solve(SurfaceMeta *sm, const cv::Vec2i &p, SurfTrackerData &
 }
 
 
-static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(
+static cv::Mat_<cv::Vec3f> surftrack_genpoints_hr(
     SurfTrackerData &data, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points,
     const cv::Rect &used_area, float step, float step_src,
     bool inpaint = false, float approved_weight = 4.0f, bool prefer_approved = true)
@@ -779,7 +779,7 @@ static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(
                         data.isApproved(sm,{j+1,i}) ||
                         data.isApproved(sm,{j+1,i+1})
                     );
-                    const float w_surf = (cell_has_approved ? approved_weight : 4.0f);
+                    const float w_surf = (cell_has_approved ? approved_weight : 1.0f);
 
                     for(int sy=0;sy<=step;sy++)
                         for(int sx=0;sx<=step;sx++) {
@@ -1013,7 +1013,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     std::cout << "optimizer: rms " << sqrt(summary.final_cost/summary.num_residual_blocks) << " count " << summary.num_residual_blocks << std::endl;
 
     {
-        cv::Mat_<cv::Vec3d> points_hr_inp =
+        cv::Mat_<cv::Vec3f> points_hr_inp =
             surftrack_genpoints_hr(data, new_state, points_inpainted, used_area, step, src_step,
                                    /*inpaint=*/true, approved_weight_hr, prefer_approved_in_hr);
         try {
@@ -1027,7 +1027,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
         }
     }
 
-    cv::Mat_<cv::Vec3d> points_hr =
+    cv::Mat_<cv::Vec3f> points_hr =
         surftrack_genpoints_hr(data, new_state, points_inpainted, used_area, step, src_step,
                                /*inpaint=*/false, approved_weight_hr, prefer_approved_in_hr);
     SurfTrackerData data_out;
@@ -1240,7 +1240,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     data.seed_coord = points(seed);
 
     {
-        cv::Mat_<cv::Vec3d> points_hr_inp =
+        cv::Mat_<cv::Vec3f> points_hr_inp =
             surftrack_genpoints_hr(data, state, points, used_area, step, src_step,
                                    /*inpaint=*/true, approved_weight_hr, prefer_approved_in_hr);
         try {
@@ -1916,7 +1916,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
 
         if (generation % 50 == 0 || update_mapping /*|| generation < 10*/) {
             {
-                cv::Mat_<cv::Vec3d> points_hr =
+                cv::Mat_<cv::Vec3f> points_hr =
                     surftrack_genpoints_hr(data, state, points, used_area, step, src_step,
                                            /*inpaint=*/false, approved_weight_hr, prefer_approved_in_hr);
                 auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
@@ -1972,7 +1972,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                         fringe.insert(cv::Vec2i(j,i));
 
             {
-                cv::Mat_<cv::Vec3d> points_hr =
+                cv::Mat_<cv::Vec3f> points_hr =
                     surftrack_genpoints_hr(data, state, points, used_area, step, src_step,
                                            /*inpaint=*/false, approved_weight_hr, prefer_approved_in_hr);
                 auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
@@ -2049,7 +2049,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
     std::cout << "area est: " << area_est_vx2 << " vx^2 (" << area_est_cm2 << " cm^2)" << std::endl;
 
-    cv::Mat_<cv::Vec3d> points_hr =
+    cv::Mat_<cv::Vec3f> points_hr =
         surftrack_genpoints_hr(data, state, points, used_area, step, src_step,
                                /*inpaint=*/false, approved_weight_hr, prefer_approved_in_hr);
 
