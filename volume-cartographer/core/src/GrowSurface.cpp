@@ -749,11 +749,14 @@ static double local_solve(SurfaceMeta *sm, const cv::Vec2i &p, SurfTrackerData &
 static cv::Mat_<cv::Vec3f> surftrack_genpoints_hr(
     SurfTrackerData &data, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points,
     const cv::Rect &used_area, float step, float step_src,
-    bool inpaint = false, float approved_weight = 4.0f, bool prefer_approved = true)
+    bool inpaint = false, float approved_weight = 4.0f, bool prefer_approved = true,
+    bool parallel = true)
 {
+    std::cout << "hr_gen: start used_area=" << used_area << " step=" << step
+              << " inpaint=" << inpaint << " parallel=" << (parallel?1:0) << std::endl;
     cv::Mat_<cv::Vec3f> points_hr(state.rows*step, state.cols*step, {0,0,0});
     cv::Mat_<float> weights_hr(state.rows*step, state.cols*step, 0.0f);
-#pragma omp parallel for //FIXME data access is just not threading friendly ...
+#pragma omp parallel for if(parallel) //FIXME data access is just not threading friendly ...
     for(int j=used_area.y;j<used_area.br().y-1;j++)
         for(int i=used_area.x;i<used_area.br().x-1;i++) {
             if (state(j,i) & (STATE_LOC_VALID|STATE_COORD_VALID)
@@ -816,7 +819,7 @@ static cv::Mat_<cv::Vec3f> surftrack_genpoints_hr(
             }
         }
     }
-#pragma omp parallel for
+#pragma omp parallel for if(parallel)
     for(int j=0;j<points_hr.rows;j++)
         for(int i=0;i<points_hr.cols;i++)
             if (weights_hr(j,i) > 0.0f)
@@ -827,12 +830,13 @@ static cv::Mat_<cv::Vec3f> surftrack_genpoints_hr(
     // [APPROVED] snap exact HR node for approved LR nodes AFTER normalization
     // This ensures snapped coords are not subsequently divided by accumulated weights,
     // avoiding distortion/holes at pinned vertices.
-#pragma omp parallel for
+#pragma omp parallel for if(parallel)
     for (int j = used_area.y; j < used_area.br().y; ++j)
         for (int i = used_area.x; i < used_area.br().x; ++i)
             if ((state(j,i) & (STATE_LOC_VALID | STATE_COORD_VALID)) && data.approvedAt({j,i}))
                 points_hr(j*step, i*step) = cv::Vec3f(points(j,i));
 
+    std::cout << "hr_gen: done" << std::endl;
     return points_hr;
 }
 
@@ -847,7 +851,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     bool pin_approved = true, float approved_weight_hr = 4.0f, bool prefer_approved_in_hr = true,
     bool keep_approved_on_consistency = true,
     int hr_attach_lr_radius = 1,
-    float hr_attach_relax_factor = 2.0f)
+    float hr_attach_relax_factor = 2.0f,
+    bool hr_gen_parallel = true)
 {
     std::cout << "optimizer: optimizing surface " << state.size() << " " << used_area <<  " " << static_bounds << std::endl;
 
@@ -1015,7 +1020,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     {
         cv::Mat_<cv::Vec3f> points_hr_inp =
             surftrack_genpoints_hr(data, new_state, points_inpainted, used_area, step, src_step,
-                                   /*inpaint=*/true, approved_weight_hr, prefer_approved_in_hr);
+                                   /*inpaint=*/true, approved_weight_hr, prefer_approved_in_hr,
+                                   /*parallel=*/hr_gen_parallel);
         try {
             auto dbg_surf = new QuadSurface(points_hr_inp(used_area_hr), {1/src_step,1/src_step});
             std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str()+"_inp_hr";
@@ -1029,7 +1035,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
 
     cv::Mat_<cv::Vec3f> points_hr =
         surftrack_genpoints_hr(data, new_state, points_inpainted, used_area, step, src_step,
-                               /*inpaint=*/false, approved_weight_hr, prefer_approved_in_hr);
+                               /*inpaint=*/false, approved_weight_hr, prefer_approved_in_hr,
+                               /*parallel=*/hr_gen_parallel);
     SurfTrackerData data_out;
     cv::Mat_<cv::Vec3d> points_out(points.size(), {-1,-1,-1});
     cv::Mat_<uint8_t> state_out(state.size(), 0);
@@ -1242,7 +1249,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     {
         cv::Mat_<cv::Vec3f> points_hr_inp =
             surftrack_genpoints_hr(data, state, points, used_area, step, src_step,
-                                   /*inpaint=*/true, approved_weight_hr, prefer_approved_in_hr);
+                                   /*inpaint=*/true, approved_weight_hr, prefer_approved_in_hr,
+                                   /*parallel=*/hr_gen_parallel);
         try {
             auto dbg_surf = new QuadSurface(points_hr_inp(used_area_hr), {1/src_step,1/src_step});
             std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str()+"_opt_inp_hr";
@@ -1918,7 +1926,8 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
             {
                 cv::Mat_<cv::Vec3f> points_hr =
                     surftrack_genpoints_hr(data, state, points, used_area, step, src_step,
-                                           /*inpaint=*/false, approved_weight_hr, prefer_approved_in_hr);
+                                           /*inpaint=*/false, approved_weight_hr, prefer_approved_in_hr,
+                                           /*parallel=*/params.value("hr_gen_parallel", false));
                 auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
                 dbg_surf->meta = new nlohmann::json;
                 (*dbg_surf->meta)["vc_grow_seg_from_segments_params"] = params;
@@ -1950,7 +1959,8 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                                      /*prefer_approved_in_hr=*/prefer_approved_in_hr,
                                      /*keep_approved_on_consistency=*/keep_approved_on_consistency,
                                      /*hr_attach_lr_radius=*/params.value("hr_attach_lr_radius", 1),
-                                     /*hr_attach_relax_factor=*/params.value("hr_attach_relax_factor", 2.0f));
+                                     /*hr_attach_relax_factor=*/params.value("hr_attach_relax_factor", 2.0f),
+                                     /*hr_gen_parallel=*/params.value("hr_gen_parallel", false));
             if (active.area() > 0) {
                 copy(opt_data, data, active);
                 opt_points(active).copyTo(points(active));
@@ -1974,7 +1984,8 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
             {
                 cv::Mat_<cv::Vec3f> points_hr =
                     surftrack_genpoints_hr(data, state, points, used_area, step, src_step,
-                                           /*inpaint=*/false, approved_weight_hr, prefer_approved_in_hr);
+                                           /*inpaint=*/false, approved_weight_hr, prefer_approved_in_hr,
+                                           /*parallel=*/params.value("hr_gen_parallel", false));
                 auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
                 dbg_surf->meta = new nlohmann::json;
                 (*dbg_surf->meta)["vc_grow_seg_from_segments_params"] = params;
