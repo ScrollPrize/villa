@@ -1505,13 +1505,28 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
         // Deterministic, sorted vector of candidates
         std::vector<cv::Vec2i> cands_vec(cands.begin(), cands.end());
 
+        // Priority: candidates near approved points from approved patches first
+        const int approved_priority_radius = params.value("approved_priority_radius", 2);
+        std::vector<cv::Vec2i> cands_prio; cands_prio.reserve(cands_vec.size());
+        std::vector<cv::Vec2i> cands_other; cands_other.reserve(cands_vec.size());
+        for (const auto& p : cands_vec) {
+            bool near_approved = false;
+            for (int oy = std::max(0, p[0] - approved_priority_radius); oy <= std::min(h - 1, p[0] + approved_priority_radius) && !near_approved; ++oy) {
+                for (int ox = std::max(0, p[1] - approved_priority_radius); ox <= std::min(w - 1, p[1] + approved_priority_radius); ++ox) {
+                    if ((state(oy,ox) & STATE_LOC_VALID) && data.approvedAt({oy,ox})) { near_approved = true; break; }
+                }
+            }
+            (near_approved ? cands_prio : cands_other).push_back(p);
+        }
+
         std::shared_mutex mutex;
         int best_inliers_gen = 0;
+
+        auto process_cands = [&](const std::vector<cv::Vec2i>& vec) {
 #pragma omp parallel for schedule(static)
-        for (int idx = 0; idx < static_cast<int>(cands_vec.size()); ++idx)
-        {
+        for (int idx = 0; idx < static_cast<int>(vec.size()); ++idx) {
             int r = 1;
-            cv::Vec2i p = cands_vec[idx];
+            cv::Vec2i p = vec[idx];
 
             if (state(p) & STATE_LOC_VALID)
                 continue;
@@ -1824,6 +1839,11 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 best_inliers_gen = std::max(best_inliers_gen, best_inliers);
             }
         }
+        };
+
+        // Process approved-nearby candidates first, then the rest
+        process_cands(cands_prio);
+        process_cands(cands_other);
 
         if (generation == 1 && flip_x) {
             data.flip_x(x0);
