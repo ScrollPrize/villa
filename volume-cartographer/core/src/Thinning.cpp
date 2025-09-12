@@ -5,6 +5,7 @@
 #include <cmath>
 #include <deque>
 #include <limits>
+#include <iostream>
 
 // Helper for non-maximum suppression
 void nonMaximumSuppression(const cv::Mat& src, cv::Mat& dst, int size) {
@@ -51,24 +52,28 @@ static std::vector<cv::Point> tracePath(
                 float dist = distTransform.at<float>(neighbor);
                 float penalty = 0.0f;
                 if (!path_history.empty()) {
-                    float min_dist_sq = std::numeric_limits<float>::max();
-                    float weight_for_min_dist = 0.0f;
+                    float total_weighted_distance = 0.0f;
+                    float total_weight = 0.0f;
+                    float history_size = static_cast<float>(path_history.size());
+
                     for (size_t k = 0; k < path_history.size(); ++k) {
                         const auto& p_hist = path_history[k];
-                        float d_sq = std::pow(neighbor.x - p_hist.x, 2) + std::pow(neighbor.y - p_hist.y, 2);
-                        if (d_sq < min_dist_sq) {
-                            min_dist_sq = d_sq;
-                            float history_size = static_cast<float>(path_history.size());
-                            if (history_size > 1) {
-                                weight_for_min_dist = 1.0f - (static_cast<float>(k) / (history_size - 1.0f)) * (1.0f - 1.0f/N);
-                            } else {
-                                weight_for_min_dist = 1.0f;
-                            }
+                        float dx_hist = static_cast<float>(neighbor.x - p_hist.x);
+                        float dy_hist = static_cast<float>(neighbor.y - p_hist.y);
+                        float d = std::sqrt(dx_hist * dx_hist + dy_hist * dy_hist);
+
+                        float weight = 1.0f;
+                        if (history_size > 1) {
+                            weight = 1.0f - (static_cast<float>(k) / (history_size - 1.0f)) * (1.0f - 1.0f/N);
+                            // std::cout << k << " " << weight << std::endl;
                         }
+                        
+                        total_weighted_distance += weight * d;
+                        total_weight += weight;
                     }
-                    penalty = weight_for_min_dist * std::sqrt(min_dist_sq);
+                    penalty = total_weighted_distance/total_weight;
                 }
-                float effective_dist = dist - penalty;
+                float effective_dist = dist + penalty;
                 if (effective_dist > maxDist) {
                     maxDist = effective_dist;
                     nextPoint = neighbor;
