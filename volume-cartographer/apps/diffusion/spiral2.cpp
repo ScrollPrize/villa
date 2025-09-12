@@ -65,7 +65,6 @@ void generate_bidir_spiral(
     cv::Mat& vis_frame
 );
 
-void visualize_normal_grid(const vc::core::util::GridStore& normal_grid, const cv::Size& size, const std::string& path);
 void visualize_spiral(cv::Mat& vis, const std::vector<SpiralPoint>& spiral, const cv::Scalar& color, const cv::Scalar& endpoint_color, bool draw_endpoints);
 
 // JSON serialization for SpiralPoint
@@ -326,7 +325,8 @@ int spiral2_main(
     vc::core::util::GridStore normal_grid("test_gridstore.bin");
 
     if (vm.count("debug")) {
-        visualize_normal_grid(normal_grid, slice_mat.size(), "normal_constraints_vis_spiral2.tif");
+        cv::Mat vis = visualize_normal_grid(normal_grid, slice_mat.size());
+        cv::imwrite("normal_constraints_vis_spiral2.tif", vis);
     }
 
     const auto& collections = point_collection.getAllCollections();

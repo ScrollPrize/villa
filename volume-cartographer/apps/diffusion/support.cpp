@@ -9,7 +9,6 @@
 
 #include <opencv2/ximgproc.hpp>
 
-void visualize_normal_grid(const vc::core::util::GridStore& normal_grid, const cv::Size& size, const std::string& path);
 
 
 
@@ -73,7 +72,7 @@ void populate_normal_grid(const std::vector<std::vector<cv::Point>>& traces, vc:
 }
 
 
-void visualize_normal_grid(const vc::core::util::GridStore& normal_grid, const cv::Size& size, const std::string& path) {
+cv::Mat visualize_normal_grid(const vc::core::util::GridStore& normal_grid, const cv::Size& size) {
     cv::Mat normal_constraints_vis = cv::Mat::zeros(size, CV_8UC3);
     cv::RNG rng(12345);
     const auto& all_paths = normal_grid.get_all();
@@ -86,7 +85,7 @@ void visualize_normal_grid(const vc::core::util::GridStore& normal_grid, const c
             cv::circle(normal_constraints_vis, path[i+1], 3, color, -1);
         }
     }
-    cv::imwrite(path, normal_constraints_vis);
+    return normal_constraints_vis;
 }
 
 

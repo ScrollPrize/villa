@@ -57,7 +57,6 @@ void visualize_spiral(
 
 std::pair<SkeletonGraph, cv::Mat> generate_skeleton_graph(const cv::Mat& binary_slice, const po::variables_map& vm);
 void populate_normal_grid(const SkeletonGraph& graph, vc::core::util::GridStore& normal_grid, double spiral_step);
-void visualize_normal_grid(const vc::core::util::GridStore& normal_grid, const cv::Size& size, const std::string& path);
 
 void generate_simple_spiral(
     std::vector<std::vector<SpiralPoint>>& points_per_revolution,
@@ -137,7 +136,8 @@ void run_spiral_generation(
         cv::imwrite("skeleton.tif", skeleton_img);
 
 
-        visualize_normal_grid(normal_grid, slice_mat.size(), "normal_constraints_vis.tif");
+        cv::Mat vis = visualize_normal_grid(normal_grid, slice_mat.size());
+        cv::imwrite("normal_constraints_vis.tif", vis);
     }
 
     if (vm["no-optimized-spiral"].as<bool>()) {
