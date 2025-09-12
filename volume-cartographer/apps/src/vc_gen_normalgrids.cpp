@@ -23,6 +23,8 @@
 #include <vc/core/util/GridStore.hpp>
 #include "support.hpp"
 #include "vc/core/util/LifeTime.hpp"
+#include <opencv2/ximgproc.hpp>
+#include "vc/core/util/Thinning.hpp"
 
 namespace fs = std::filesystem;
 namespace po = boost::program_options;
@@ -54,6 +56,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    cv::setNumThreads(0);
+
     std::string input_path = vm["input"].as<std::string>();
     std::string output_path = vm["output"].as<std::string>();
 
@@ -77,6 +81,12 @@ int main(int argc, char* argv[]) {
     fs::create_directories(output_fs_path / "xy_img");
     fs::create_directories(output_fs_path / "xz_img");
     fs::create_directories(output_fs_path / "yz_img");
+    fs::create_directories(output_fs_path / "xy_thin");
+    fs::create_directories(output_fs_path / "xz_thin");
+    fs::create_directories(output_fs_path / "yz_thin");
+    fs::create_directories(output_fs_path / "xy_traces");
+    fs::create_directories(output_fs_path / "xz_traces");
+    fs::create_directories(output_fs_path / "yz_traces");
 
     nlohmann::json metadata;
     metadata["spiral-step"] = spiral_step;
@@ -151,43 +161,70 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            xt::xtensor<uint8_t, 3, xt::layout_type::column_major> slice_data = xt::zeros<uint8_t>(slice_shape);
-            
             ALifeTime t;
-            readArea3D(slice_data, offset, ds.get(), &cache);
-            t.mark("read");
+            std::vector<std::vector<cv::Point>> traces;
 
-            for (int z = 0; z < slice_mat.rows; ++z) {
-                for (int y = 0; y < slice_mat.cols; ++y) {
-                    switch (dir) {
-                        case SliceDirection::XY: slice_mat.at<uint8_t>(z, y) = slice_data(0, z, y); break;
-                        case SliceDirection::XZ: slice_mat.at<uint8_t>(z, y) = slice_data(z, 0, y); break;
-                        case SliceDirection::YZ: slice_mat.at<uint8_t>(z, y) = slice_data(z, y, 0); break;
+            char traces_filename[256];
+            snprintf(traces_filename, sizeof(traces_filename), "%06zu.grid", i);
+            std::string traces_path = (output_fs_path / (dir_str + "_traces") / traces_filename).string();
+
+            if (fs::exists(traces_path)) {
+                vc::core::util::GridStore trace_store(traces_path);
+                for (const auto& segment : trace_store.get_all()) {
+                    traces.push_back(*segment);
+                }
+                t.mark("traces_from_cache");
+            } else {
+                xt::xtensor<uint8_t, 3, xt::layout_type::column_major> slice_data = xt::zeros<uint8_t>(slice_shape);
+                readArea3D(slice_data, offset, ds.get(), &cache);
+                t.mark("read");
+
+                for (int z = 0; z < slice_mat.rows; ++z) {
+                    for (int y = 0; y < slice_mat.cols; ++y) {
+                        switch (dir) {
+                            case SliceDirection::XY: slice_mat.at<uint8_t>(z, y) = slice_data(0, z, y); break;
+                            case SliceDirection::XZ: slice_mat.at<uint8_t>(z, y) = slice_data(z, 0, y); break;
+                            case SliceDirection::YZ: slice_mat.at<uint8_t>(z, y) = slice_data(z, y, 0); break;
+                        }
                     }
                 }
-            }
-            
-            cv::Mat binary_slice = slice_mat > 0;
 
-            if (cv::countNonZero(binary_slice) == 0) {
-                std::ofstream ofs(out_path); // Create empty file
+                cv::Mat binary_slice = slice_mat > 0;
+
+                if (i % 100 == 0) {
+                    snprintf(filename, sizeof(filename), "%06zu.tif", i);
+                    cv::imwrite((output_fs_path / (dir_str + "_img") / filename).string(), binary_slice);
+                }
+
+                if (cv::countNonZero(binary_slice) == 0) {
+                    std::ofstream ofs(out_path); // Create empty file
+                    processed++;
+                    continue;
+                }
+
+
+                t.mark("prepare_slice");
+                cv::Mat thinned_slice;
+                customThinning(binary_slice, thinned_slice, &traces);
+                t.mark("thinning");
+
+                // vc::core::util::GridStore trace_store(cv::Rect(0, 0, slice_mat.cols, slice_mat.rows), slice_mat.cols);
+                // for (const auto& trace : traces) {
+                //     trace_store.add(trace);
+                // }
+                // trace_store.save(traces_path);
+                // t.mark("write_trace_cache");
+            }
+
+            if (traces.empty()) {
+                std::ofstream ofs(out_path); // Create empty file for empty graphs
                 processed++;
             } else {
-                decltype(generate_skeleton_graph(binary_slice, vm)) skeleton_res;
-                skeleton_res = generate_skeleton_graph(binary_slice, vm);
-                t.mark("skeleton");
-                auto& [skeleton_graph, skeleton_id_img] = skeleton_res;
-
                 vc::core::util::GridStore grid_store(cv::Rect(0, 0, slice_mat.cols, slice_mat.rows), vm["grid-step"].as<int>());
-                populate_normal_grid(skeleton_graph, grid_store, spiral_step);
+                populate_normal_grid(traces, grid_store, spiral_step);
                 grid_store.save(tmp_path);
                 fs::rename(tmp_path, out_path);
                 t.mark("grid");
-
-                if (i % 100 == 0) {
-                    snprintf(filename, sizeof(filename), "%06zu.jpg", i);
-                    cv::imwrite((output_fs_path / (dir_str + "_img") / filename).string(), binary_slice);
-                }
                 
                 size_t file_size = fs::file_size(out_path);
                 size_t num_segments = grid_store.numSegments();
