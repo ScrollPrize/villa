@@ -23,6 +23,7 @@
 #include <shared_mutex>
 
 #include <algorithm>
+#include <random>
 
 
 template<typename T>
@@ -154,7 +155,7 @@ void readArea3D(xt::xtensor<uint8_t, 3, xt::layout_type::column_major>& out, con
     for(const auto& it : chunks) {
         chunks_to_process.push_back(it.first);
     }
-    std::random_shuffle(chunks_to_process.begin(), chunks_to_process.end());
+    std::shuffle(chunks_to_process.begin(), chunks_to_process.end(), std::mt19937(std::random_device()()));
 
     #pragma omp parallel for schedule(dynamic, 1)
     for (const auto& idx : chunks_to_process) {
