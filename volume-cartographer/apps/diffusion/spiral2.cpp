@@ -293,7 +293,9 @@ int spiral2_main(
 
     auto start_skeletonization = std::chrono::high_resolution_clock::now();
     std::clock_t start_cpu_skeletonization = std::clock();
-    auto [skeleton_graph, skeleton_id_img] = generate_skeleton_graph(binary_slice, vm);
+    cv::Mat thinned_slice;
+    cv::ximgproc::thinning(binary_slice, thinned_slice, cv::ximgproc::THINNING_GUOHALL);
+    SkeletonGraph skeleton_graph = trace_skeleton_segments(thinned_slice, vm);
     std::clock_t end_cpu_skeletonization = std::clock();
     auto end_skeletonization = std::chrono::high_resolution_clock::now();
     double real_time_skeletonization = std::chrono::duration<double>(end_skeletonization - start_skeletonization).count();

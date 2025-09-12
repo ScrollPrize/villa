@@ -92,8 +92,6 @@ void visualize_normal_grid(const vc::core::util::GridStore& normal_grid, const c
 
 SkeletonGraph trace_skeleton_segments(const cv::Mat& skeleton, const po::variables_map& vm) {
     SkeletonGraph g;
-    cv::Mat skeleton_id_img = cv::Mat::zeros(skeleton.size(), CV_32S);
-    skeleton_id_img.setTo(-1);
     std::unordered_map<cv::Point, int, PointHash> vertex_map;
     int next_edge_id = 1;
 
@@ -187,9 +185,6 @@ SkeletonGraph trace_skeleton_segments(const cv::Mat& skeleton, const po::variabl
                     auto edge_desc = boost::add_edge(v_id, other_v_id, g).first;
                     g[edge_desc].path = path;
                     g[edge_desc].id = next_edge_id;
-                    for(const auto& path_p : path) {
-                        skeleton_id_img.at<int32_t>(path_p) = next_edge_id;
-                    }
                     next_edge_id++;
                 }
                     }
@@ -264,9 +259,6 @@ SkeletonGraph trace_skeleton_segments(const cv::Mat& skeleton, const po::variabl
                 auto edge_desc = boost::add_edge(v1_id, v2_id, g);
                 g[edge_desc.first].path = path;
                 g[edge_desc.first].id = next_edge_id;
-                for(const auto& path_p : path) {
-                    skeleton_id_img.at<int32_t>(path_p) = next_edge_id;
-                }
                 next_edge_id++;
             }
         }
