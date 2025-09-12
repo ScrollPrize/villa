@@ -7,6 +7,7 @@ import multiprocessing
 import threading
 import fsspec
 import numcodecs
+import yaml
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 # fork causes issues on windows , force to spawn
 multiprocessing.set_start_method('spawn', force=True)
@@ -58,7 +59,9 @@ class Inferer():
                  resolution: float = None,
                  compressor_name: str = 'zstd',
                  compression_level: int = 1,
-                 hf_token: str = None
+                 hf_token: str = None,
+                 # optional fallback when .pth lacks embedded model_config
+                 config_yaml: str = None
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -93,6 +96,7 @@ class Inferer():
         self.compressor_name = compressor_name
         self.compression_level = compression_level
         self.hf_token = hf_token
+        self.config_yaml = config_yaml
         self.model_patch_size = None
         self.num_classes = None
         self.intensity_props = None
@@ -288,7 +292,104 @@ class Inferer():
         # Extract model configuration
         model_config = checkpoint_data.get('model_config', {})
         if not model_config:
-            raise ValueError("No model configuration found in checkpoint")
+            # Attempt to resolve model_config from a YAML file
+            if self.verbose:
+                print("No model configuration found in checkpoint; attempting YAML fallback...")
+
+            def _load_yaml_model_config(yaml_path: Path):
+                try:
+                    with open(yaml_path, 'r') as f:
+                        cfg = yaml.safe_load(f)
+                    if isinstance(cfg, dict):
+                        # Support either combined config with nested 'model_config' or a raw model_config dict
+                        if 'model_config' in cfg and isinstance(cfg['model_config'], dict):
+                            return cfg['model_config'], cfg.get('dataset_config', {})
+                        else:
+                            # Heuristic: treat the whole file as model_config
+                            return cfg, {}
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Failed reading YAML at {yaml_path}: {e}")
+                return None, None
+
+            from pathlib import Path as _Path
+            yaml_model_config = None
+            yaml_dataset_config = None
+
+            # 1) If user provided an explicit YAML, try that first
+            if self.config_yaml is not None:
+                mc, dc = _load_yaml_model_config(_Path(self.config_yaml))
+                if mc:
+                    yaml_model_config, yaml_dataset_config = mc, dc
+                    if self.verbose:
+                        print(f"Loaded model_config from provided YAML: {self.config_yaml}")
+            
+            # 2) Try common filename: <model_name>_config.yaml next to checkpoint
+            if yaml_model_config is None:
+                stem = checkpoint_path.stem
+                # Strip trailing _epochN if present
+                base = stem.split('_epoch')[0]
+                candidate_names = [
+                    f"{base}_config.yaml",
+                    f"{base}.yaml",
+                    f"{base}_cfg.yaml",
+                ]
+                search_dirs = [checkpoint_path.parent, checkpoint_path.parent.parent]
+                for d in search_dirs:
+                    if d is None or not d.exists():
+                        continue
+                    for name in candidate_names:
+                        ypath = d / name
+                        if ypath.exists():
+                            mc, dc = _load_yaml_model_config(ypath)
+                            if mc:
+                                yaml_model_config, yaml_dataset_config = mc, dc
+                                if self.verbose:
+                                    print(f"Loaded model_config from YAML: {ypath}")
+                                break
+                    if yaml_model_config is not None:
+                        break
+
+            # 3) As a last resort, scan for any *.yaml in the checkpoint directory and parent
+            if yaml_model_config is None:
+                for d in [checkpoint_path.parent, checkpoint_path.parent.parent]:
+                    try:
+                        if d is None or not d.exists():
+                            continue
+                        for ypath in sorted(d.glob('*.yaml')):
+                            mc, dc = _load_yaml_model_config(ypath)
+                            if mc:
+                                yaml_model_config, yaml_dataset_config = mc, dc
+                                if self.verbose:
+                                    print(f"Loaded model_config from YAML (scanned): {ypath}")
+                                break
+                        if yaml_model_config is not None:
+                            break
+                    except Exception:
+                        pass
+
+            if yaml_model_config is not None:
+                model_config = yaml_model_config
+                # Optionally pick up normalization info from dataset_config in YAML
+                try:
+                    if isinstance(yaml_dataset_config, dict):
+                        norm = yaml_dataset_config.get('normalization_scheme', None)
+                        iprops = yaml_dataset_config.get('intensity_properties', None)
+                        if norm:
+                            self.model_normalization_scheme = norm
+                            if self.verbose:
+                                print(f"Using normalization_scheme from YAML: {norm}")
+                        if iprops:
+                            self.model_intensity_properties = iprops
+                            if self.verbose:
+                                print("Loaded intensity_properties from YAML")
+                except Exception:
+                    pass
+            else:
+                raise ValueError(
+                    "No model configuration found in checkpoint and no usable YAML located. "
+                    "Provide --config-yaml pointing to the training config, or re-save checkpoints with embedded model_config."
+                )
         
         # Extract normalization info if present
         if 'normalization_scheme' in checkpoint_data:
@@ -828,6 +929,10 @@ class Inferer():
         if len(self.patch_size) == 3:
             pZ, pY, pX = self.patch_size
             Z, Y, X = img_shape
+            # If the image is smaller than the patch in any dimension, fall back to a single origin.
+            # Padding to patch size is handled by the caller before tensor creation.
+            if Z < pZ or Y < pY or X < pX:
+                return [(0, 0, 0)]
             z_positions = compute_steps_for_sliding_window(Z, pZ, self.overlap)
             y_positions = compute_steps_for_sliding_window(Y, pY, self.overlap)
             x_positions = compute_steps_for_sliding_window(X, pX, self.overlap)
@@ -835,6 +940,8 @@ class Inferer():
         else:
             pY, pX = self.patch_size
             Y, X = img_shape
+            if Y < pY or X < pX:
+                return [(0, 0)]
             y_positions = compute_steps_for_sliding_window(Y, pY, self.overlap)
             x_positions = compute_steps_for_sliding_window(X, pX, self.overlap)
             return [(y, x) for y in y_positions for x in x_positions]
@@ -1291,6 +1398,8 @@ def main():
                       help='Path to nnU-Net style intensity properties JSON (dataset_fingerprint.json or intensity_props.json) for CT normalization')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda, cpu)')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
+    parser.add_argument('--config-yaml', dest='config_yaml', type=str, default=None,
+                        help='Path to training YAML config to use if checkpoint lacks embedded model_config')
     parser.add_argument('--skip-empty-patches', dest='skip_empty_patches', action='store_true', 
                       help='Skip patches that are empty (all values the same). Default: True')
     parser.add_argument('--no-skip-empty-patches', dest='skip_empty_patches', action='store_false',
@@ -1367,7 +1476,9 @@ def main():
         compressor_name=args.zarr_compressor,
         compression_level=args.zarr_compression_level,
         # Pass Hugging Face parameters
-        hf_token=args.hf_token
+        hf_token=args.hf_token,
+        # Fallback config for train.py checkpoints without embedded model_config
+        config_yaml=args.config_yaml
     )
 
     try:
