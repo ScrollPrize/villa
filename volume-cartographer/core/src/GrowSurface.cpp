@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <limits>
 #include <algorithm>
+#include <map>
 
 int static dbg_counter = 0;
 // Default values for thresholds Will be configurable through JSON
@@ -852,7 +853,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     bool keep_approved_on_consistency = true,
     int hr_attach_lr_radius = 1,
     float hr_attach_relax_factor = 2.0f,
-    bool hr_gen_parallel = true)
+    bool hr_gen_parallel = true,
+    bool remap_parallel = false)
 {
     std::cout << "optimizer: optimizing surface " << state.size() << " " << used_area <<  " " << static_bounds << std::endl;
 
@@ -1041,7 +1043,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     cv::Mat_<cv::Vec3d> points_out(points.size(), {-1,-1,-1});
     cv::Mat_<uint8_t> state_out(state.size(), 0);
     cv::Mat_<uint8_t> support_count(state.size(), 0);
-#pragma omp parallel for
+    std::cout << "remap: start used_area=" << used_area << " parallel=" << (remap_parallel?1:0) << std::endl;
+#pragma omp parallel for if(remap_parallel)
     for(int j=used_area.y;j<used_area.br().y;j++)
         for(int i=used_area.x;i<used_area.br().x;i++)
             if (static_bounds.contains(cv::Point(i,j))) {
@@ -1145,6 +1148,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                     }
                 }
             }
+    std::cout << "remap: done" << std::endl;
 
     //now filter by consistency
     for(int j=used_area.y;j<used_area.br().y-1;j++)
@@ -1513,10 +1517,12 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
         // Deterministic, sorted vector of candidates
         std::vector<cv::Vec2i> cands_vec(cands.begin(), cands.end());
 
-        // Priority: candidates near approved points from approved patches first
+        // Column-wise processing: grow left-to-right by column (x),
+        // and within each column, process approved-nearby candidates first,
+        // then the rest of the column's candidates.
         const int approved_priority_radius = params.value("approved_priority_radius", 2);
-        std::vector<cv::Vec2i> cands_prio; cands_prio.reserve(cands_vec.size());
-        std::vector<cv::Vec2i> cands_other; cands_other.reserve(cands_vec.size());
+        struct Buckets { std::vector<cv::Vec2i> prio; std::vector<cv::Vec2i> other; };
+        std::map<int, Buckets> by_col;
         for (const auto& p : cands_vec) {
             bool near_approved = false;
             for (int oy = std::max(0, p[0] - approved_priority_radius); oy <= std::min(h - 1, p[0] + approved_priority_radius) && !near_approved; ++oy) {
@@ -1524,7 +1530,8 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                     if ((state(oy,ox) & STATE_LOC_VALID) && data.approvedAt({oy,ox})) { near_approved = true; break; }
                 }
             }
-            (near_approved ? cands_prio : cands_other).push_back(p);
+            auto &bucket = by_col[p[1]];
+            (near_approved ? bucket.prio : bucket.other).push_back(p);
         }
 
         std::shared_mutex mutex;
@@ -1849,9 +1856,13 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
         }
         };
 
-        // Process approved-nearby candidates first, then the rest
-        process_cands(cands_prio);
-        process_cands(cands_other);
+        // Process columns in ascending x. Within each, do approved-nearby first,
+        // then the remaining in that column. This prevents moving past columns
+        // with pending approved work.
+        for (auto &kv : by_col) {
+            process_cands(kv.second.prio);
+            process_cands(kv.second.other);
+        }
 
         if (generation == 1 && flip_x) {
             data.flip_x(x0);
@@ -1960,7 +1971,8 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                                      /*keep_approved_on_consistency=*/keep_approved_on_consistency,
                                      /*hr_attach_lr_radius=*/params.value("hr_attach_lr_radius", 1),
                                      /*hr_attach_relax_factor=*/params.value("hr_attach_relax_factor", 2.0f),
-                                     /*hr_gen_parallel=*/params.value("hr_gen_parallel", false));
+                                     /*hr_gen_parallel=*/params.value("hr_gen_parallel", false),
+                                     /*remap_parallel=*/params.value("remap_parallel", false));
             if (active.area() > 0) {
                 copy(opt_data, data, active);
                 opt_points(active).copyTo(points(active));
