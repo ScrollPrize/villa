@@ -40,7 +40,7 @@ public:
     //read coord at pointer location, potentially with (3) offset
     virtual cv::Vec3f coord(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) = 0;
     virtual cv::Vec3f normal(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) = 0;
-    virtual float pointTo(cv::Vec3f &ptr, const cv::Vec3f &coord, float th, int max_iters = 1000) = 0;
+    virtual float pointTo(cv::Vec3f &ptr, const cv::Vec3f &coord, float th, int max_iters = 75) = 0;
     //coordgenerator relative to ptr&offset
     //needs to be deleted after use
     virtual void gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset) = 0;
@@ -59,7 +59,7 @@ public:
     cv::Vec3f loc(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override;
     cv::Vec3f coord(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override;
     cv::Vec3f normal(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override;
-    float pointTo(cv::Vec3f &ptr, const cv::Vec3f &coord, float th, int max_iters = 1000) override { abort(); };
+    float pointTo(cv::Vec3f &ptr, const cv::Vec3f &coord, float th, int max_iters = 75) override { abort(); };
 
     PlaneSurface() {};
     PlaneSurface(cv::Vec3f origin_, cv::Vec3f normal_);
@@ -98,7 +98,7 @@ public:
     cv::Vec3f coord(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override;
     cv::Vec3f normal(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override;
     void gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset) override;
-    float pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters = 1000) override;
+    float pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters = 75) override;
     cv::Size size();
     [[nodiscard]] cv::Vec2f scale() const;
 
@@ -237,6 +237,11 @@ QuadSurface* surface_intersection(QuadSurface* a, QuadSurface* b, float toleranc
 
 // Control CUDA usage in GrowPatch (space_tracing_quad_phys). Default is true.
 void set_space_tracing_use_cuda(bool enable);
+
+// Control the algorithm used in QuadSurface::pointTo
+// Defaults: proposed=true, pre_iters=10, coarse_stride=16
+void set_pointto_use_proposed(bool enable);
+void set_pointto_proposed_params(int pre_iters, int coarse_stride);
 
 void generate_mask(QuadSurface* surf,
                             cv::Mat_<uint8_t>& mask,

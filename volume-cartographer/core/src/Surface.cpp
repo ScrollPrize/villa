@@ -10,6 +10,21 @@
 
 #include <unordered_map>
 #include <nlohmann/json.hpp>
+#include <limits>
+
+// Global controls for QuadSurface::pointTo behavior
+static bool g_pointto_use_proposed = true;
+static int  g_pointto_pre_iters = 10;
+static int  g_pointto_coarse_stride = 16;
+
+void set_pointto_use_proposed(bool enable) {
+    g_pointto_use_proposed = enable;
+}
+
+void set_pointto_proposed_params(int pre_iters, int coarse_stride) {
+    if (pre_iters > 0) g_pointto_pre_iters = pre_iters;
+    if (coarse_stride >= 0) g_pointto_coarse_stride = coarse_stride;
+}
 
 void write_overlapping_json(const std::filesystem::path& seg_path, const std::set<std::string>& overlapping_names) {
     nlohmann::json overlap_json;
@@ -681,44 +696,116 @@ float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f
 //search the surface point that is closest to th tgt coord
 float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters)
 {
+    // Baseline path when requested
+    if (!g_pointto_use_proposed) {
+        cv::Vec2f loc = cv::Vec2f(ptr[0], ptr[1]) + cv::Vec2f(_center[0]*_scale[0], _center[1]*_scale[1]);
+        cv::Vec3f _out;
+
+        cv::Vec2f step_small = {std::max(1.0f,_scale[0]), std::max(1.0f,_scale[1])};
+        float min_mul = std::min(0.1f*_points->cols/_scale[0], 0.1f*_points->rows/_scale[1]);
+        cv::Vec2f step_large = {min_mul*_scale[0], min_mul*_scale[1]};
+
+        float dist = search_min_loc(*_points, loc, _out, tgt, step_small, _scale[0]*0.1f);
+
+        if (dist < th && dist >= 0) {
+            ptr = cv::Vec3f(loc[0], loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
+            return dist;
+        }
+
+        cv::Vec2f min_loc = loc;
+        float min_dist = dist;
+        if (min_dist < 0)
+            min_dist = 10.0f*(_points->cols/_scale[0]+_points->rows/_scale[1]);
+
+        int r_full = 0;
+        for(int r=0; r<10*max_iters && r_full<max_iters; r++) {
+            loc = {1.0f + float(rand() % (_points->cols-3)), 1.0f + float(rand() % (_points->rows-3))};
+
+            if ((*_points)(int(loc[1]),int(loc[0]))[0] == -1)
+                continue;
+
+            r_full++;
+
+            float dist2 = search_min_loc(*_points, loc, _out, tgt, step_large, _scale[0]*0.1f);
+
+            if (dist2 < th && dist2 >= 0) {
+                dist2 = search_min_loc((*_points), loc, _out, tgt, step_small, _scale[0]*0.1f);
+                ptr = cv::Vec3f(loc[0], loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
+                return dist2;
+            } else if (dist2 >= 0 && dist2 < min_dist) {
+                min_loc = loc;
+                min_dist = dist2;
+            }
+        }
+
+        ptr = cv::Vec3f(min_loc[0], min_loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
+        return min_dist;
+    }
+
+
+    int pre_limit = std::max(0, std::min(g_pointto_pre_iters, max_iters));
+    int rem_limit = std::max(0, max_iters - pre_limit);
+
     cv::Vec2f loc = cv::Vec2f(ptr[0], ptr[1]) + cv::Vec2f(_center[0]*_scale[0], _center[1]*_scale[1]);
     cv::Vec3f _out;
 
     cv::Vec2f step_small = {std::max(1.0f,_scale[0]), std::max(1.0f,_scale[1])};
-    float min_mul = std::min(0.1*_points->cols/_scale[0], 0.1*_points->rows/_scale[1]);
+    float min_mul = std::min(0.1f*_points->cols/_scale[0], 0.1f*_points->rows/_scale[1]);
     cv::Vec2f step_large = {min_mul*_scale[0], min_mul*_scale[1]};
 
-    float dist = search_min_loc(*_points, loc, _out, tgt, step_small, _scale[0]*0.1);
+    if (g_pointto_coarse_stride > 1) {
+        float best_d2 = std::numeric_limits<float>::infinity();
+        int best_x = -1, best_y = -1;
+        for (int y = 1; y < _points->rows - 1; y += g_pointto_coarse_stride) {
+            for (int x = 1; x < _points->cols - 1; x += g_pointto_coarse_stride) {
+                const cv::Vec3f& v = (*_points)(y, x);
+                if (v[0] == -1.f) continue;
+                float dx = v[0] - tgt[0];
+                float dy = v[1] - tgt[1];
+                float dz = v[2] - tgt[2];
+                float d2 = dx*dx + dy*dy + dz*dz;
+                if (d2 < best_d2) { best_d2 = d2; best_x = x; best_y = y; }
+            }
+        }
+        if (best_x >= 0) loc = cv::Vec2f(best_x, best_y);
+    }
 
+    float dist = search_min_loc(*_points, loc, _out, tgt, step_small, _scale[0]*0.1f);
     if (dist < th && dist >= 0) {
         ptr = cv::Vec3f(loc[0], loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
         return dist;
     }
 
     cv::Vec2f min_loc = loc;
-    float min_dist = dist;
-    if (min_dist < 0)
-        min_dist = 10*(_points->cols/_scale[0]+_points->rows/_scale[1]);
+    float min_dist = (dist >= 0 ? dist : 10.0f*(_points->cols/_scale[0]+_points->rows/_scale[1]));
 
-    int r_full = 0;
-    for(int r=0; r<10*max_iters && r_full<max_iters; r++) {
-        loc = {1 + (rand() % (_points->cols-3)), 1 + (rand() % (_points->rows-3))};
-
-        if ((*_points)(loc[1],loc[0])[0] == -1)
-            continue;
-
-        r_full++;
-
-        float dist = search_min_loc(*_points, loc, _out, tgt, step_large, _scale[0]*0.1);
-
-        if (dist < th && dist >= 0) {
-            dist = search_min_loc((*_points), loc, _out, tgt, step_small, _scale[0]*0.1);
-            ptr = cv::Vec3f(loc[0], loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
-            return dist;
-        } else if (dist >= 0 && dist < min_dist) {
-            min_loc = loc;
-            min_dist = dist;
+    auto do_stage = [&](int iter_limit) -> float {
+        int r_full = 0;
+        for (int r = 0; r < 10*iter_limit && r_full < iter_limit; ++r) {
+            cv::Vec2f rand_loc = {1.0f + float(rand() % (_points->cols-3)), 1.0f + float(rand() % (_points->rows-3))};
+            if ((*_points)(int(rand_loc[1]), int(rand_loc[0]))[0] == -1)
+                continue;
+            r_full++;
+            float d2 = search_min_loc(*_points, rand_loc, _out, tgt, step_large, _scale[0]*0.1f);
+            if (d2 < th && d2 >= 0) {
+                d2 = search_min_loc((*_points), rand_loc, _out, tgt, step_small, _scale[0]*0.1f);
+                ptr = cv::Vec3f(rand_loc[0], rand_loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
+                return d2;
+            } else if (d2 >= 0 && d2 < min_dist) {
+                min_loc = rand_loc;
+                min_dist = d2;
+            }
         }
+        return -1.0f;
+    };
+
+    if (pre_limit > 0) {
+        float d2 = do_stage(pre_limit);
+        if (d2 >= 0) return d2;
+    }
+    if (rem_limit > 0) {
+        float d2 = do_stage(rem_limit);
+        if (d2 >= 0) return d2;
     }
 
     ptr = cv::Vec3f(min_loc[0], min_loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
