@@ -1,0 +1,24 @@
+{
+  "out_dir": "../out",
+  "wandb_project": "neural-tracing",
+  "seed": 0,
+  "batch_size": 4,
+  "num_workers": 0,
+  "log_frequency": 50,
+  "mixed_precision": "fp16",
+  "learning_rate": 6e-5,
+  "weight_decay": 1e-4,
+  "lr_warmup_steps": 1000,
+  "num_iterations": 100000,
+    "datasets": [
+        {
+            "volume_path": "/mnt/bcache/projects/vesuvius-scrolls/volpkgs/P0343P.volpkg/volumes/4.320um_1.0m_116keV_binmean_2_PHerc0343P.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/bcache/projects/vesuvius-scrolls/neural-tracing/data/PHerc0343P",
+            "roi_path": "/mnt/bcache/projects/vesuvius-scrolls/neural-tracing/data/PHerc0343_20250904_140149_progress.json"
+        }
+    ],
+    "crop_size": 128,
+    "patch_size": 12,
+    "step_size": 10
+}
