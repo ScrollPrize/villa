@@ -1,5 +1,6 @@
 #include <iostream>
 #include <chrono>
+#include <fstream>
 #include <opencv2/highgui.hpp>
 #include <opencv2/ximgproc.hpp>
 #include "vc/core/util/Thinning.hpp"
@@ -33,7 +34,7 @@ int main(int argc, char** argv) {
     // --- Custom Thinning ---
     cv::Mat customOutput;
     auto startCustom = std::chrono::high_resolution_clock::now();
-    customThinning(inputImage, customOutput, 1000); // Increased iterations
+    customThinning(inputImage, customOutput);
     auto endCustom = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> customTime = endCustom - startCustom;
     std::cout << "Custom thinning took: " << customTime.count() << " ms" << std::endl;

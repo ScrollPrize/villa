@@ -19,20 +19,21 @@ static std::vector<cv::Point> tracePath(
     cv::Point startPoint,
     const cv::Mat& distTransform,
     cv::Mat& outputImage,
-    int iterations,
     const std::deque<cv::Point>& initial_history,
     const cv::Point& seedPoint)
 {
-    const int N = 16;
+    const int N = 4;
     cv::Point currentPoint = startPoint;
     std::deque<cv::Point> path_history = initial_history;
     std::vector<cv::Point> traced_points;
+    int i = 0;
 
-    for (int i = 0; i < iterations; ++i) {
+    while(true) {
         if (currentPoint != seedPoint) {
             outputImage.at<uchar>(currentPoint) = std::min(i + 1, 255);
         }
         traced_points.push_back(currentPoint);
+        i++;
 
         path_history.push_back(currentPoint);
         if (path_history.size() > N) {
@@ -47,7 +48,6 @@ static std::vector<cv::Point> tracePath(
                 if (dx == 0 && dy == 0) continue;
                 cv::Point neighbor(currentPoint.x + dx, currentPoint.y + dy);
                 if (neighbor.x < 0 || neighbor.x >= distTransform.cols || neighbor.y < 0 || neighbor.y >= distTransform.rows) continue;
-                if (path_history.size() > 1 && neighbor == path_history[path_history.size() - 2]) continue;
 
                 float dist = distTransform.at<float>(neighbor);
                 float penalty = 0.0f;
@@ -89,7 +89,7 @@ static std::vector<cv::Point> tracePath(
     return traced_points;
 }
 
-void customThinning(const cv::Mat& inputImage, cv::Mat& outputImage, int iterations) {
+void customThinning(const cv::Mat& inputImage, cv::Mat& outputImage, std::vector<std::vector<cv::Point>>* traces) {
     if (inputImage.empty() || inputImage.type() != CV_8UC1) {
         return;
     }
@@ -111,6 +111,9 @@ void customThinning(const cv::Mat& inputImage, cv::Mat& outputImage, int iterati
 
     // Initialize output image
     outputImage = cv::Mat::zeros(inputImage.size(), CV_8UC1);
+    if (traces) {
+        traces->clear();
+    }
 
     // 3. Trace from each seed
     for (const auto& seed : seedPoints) {
@@ -120,14 +123,28 @@ void customThinning(const cv::Mat& inputImage, cv::Mat& outputImage, int iterati
         outputImage.at<uchar>(seed) = 1; // Mark seed as visited
 
         // --- Trace in the first direction ---
-        std::vector<cv::Point> first_path_points = tracePath(seed, distTransform, outputImage, iterations, {}, seed);
+        std::vector<cv::Point> first_path = tracePath(seed, distTransform, outputImage, {}, seed);
 
         // --- Trace in the second (opposite) direction ---
         std::deque<cv::Point> initial_history;
-        if (first_path_points.size() > 1) {
-            // Use the second point of the first path to block reversal
-            initial_history.push_back(first_path_points[1]);
+        if (first_path.size() > 1) {
+            initial_history.push_back(first_path[1]);
         }
-        tracePath(seed, distTransform, outputImage, iterations, initial_history, seed);
+        std::vector<cv::Point> second_path = tracePath(seed, distTransform, outputImage, initial_history, seed);
+
+        if (traces) {
+            // Combine paths: reverse the second path and append the first (skipping duplicate seed)
+            std::vector<cv::Point> full_trace;
+            full_trace.reserve(second_path.size() + first_path.size() - 1);
+            std::reverse(second_path.begin(), second_path.end());
+            full_trace.insert(full_trace.end(), second_path.begin(), second_path.end());
+            if (!first_path.empty()) {
+                full_trace.insert(full_trace.end(), first_path.begin() + 1, first_path.end());
+            }
+            
+            if (!full_trace.empty()) {
+                traces->push_back(full_trace);
+            }
+        }
     }
 }
