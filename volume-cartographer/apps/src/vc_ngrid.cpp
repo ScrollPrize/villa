@@ -116,7 +116,7 @@ int main(int argc, char* argv[]) {
         std::ofstream o(output_fs_path / "metadata.json");
         o << std::setw(4) << metadata << std::endl;
 
-        ChunkCache cache(4llu*1024*1024*1024);
+        ChunkCache cache(1llu*1024*1024*1024);
 
         size_t total_slices_all_dirs = shape[0] + shape[1] + shape[2];
         std::atomic<size_t> total_processed_all_dirs = 0;
@@ -195,7 +195,11 @@ int main(int argc, char* argv[]) {
                 ALifeTime chunk_timer;
                 readArea3D(chunk_data, chunk_offset, ds.get(), &cache);
                 chunk_timer.mark("read_chunk");
-                double chunk_read_time = chunk_timer.getMarks().front().second;
+
+                for(const auto& mark : chunk_timer.getMarks()) {
+                    timings[mark.first].count++;
+                    timings[mark.first].total_time += mark.second;
+                }
 
 
                 #pragma omp parallel for schedule(dynamic)
@@ -243,8 +247,6 @@ int main(int argc, char* argv[]) {
                 }
 
                 ALifeTime t;
-                // The chunk read time is already accounted for in the first mark of each thread's ALifeTime object.
-                // No need to add it manually. The logic is flawed. Let's remove it.
                 std::vector<std::vector<cv::Point>> traces;
 
                 char traces_filename[256];
@@ -258,7 +260,6 @@ int main(int argc, char* argv[]) {
                     }
                     t.mark("traces_from_cache");
                 } else {
-                    t.mark("read_and_prepare");
 
                     cv::Mat binary_slice = slice_mat > 0;
 
@@ -342,7 +343,11 @@ int main(int argc, char* argv[]) {
 
                         for(auto const& [key, val] : timings) {
                             if (val.count > 0) {
-                                std::cout << ", avg " << key << ": " << (val.total_time / val.count) << "s";
+                                double avg_time = val.total_time / val.count;
+                                if (key == "read_chunk") {
+                                    avg_time /= num_threads;
+                                }
+                                std::cout << ", avg " << key << ": " << avg_time << "s";
                             }
                         }
                         std::cout << std::endl;

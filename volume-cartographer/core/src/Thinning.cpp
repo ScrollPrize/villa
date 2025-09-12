@@ -49,7 +49,7 @@ static std::vector<cv::Point> tracePath(
                 cv::Point neighbor(currentPoint.x + dx, currentPoint.y + dy);
                 if (neighbor.x < 0 || neighbor.x >= distTransform.cols || neighbor.y < 0 || neighbor.y >= distTransform.rows) continue;
 
-                float dist = distTransform.at<float>(neighbor);
+                float dist = static_cast<float>(distTransform.at<uchar>(neighbor));
                 float penalty = 0.0f;
                 if (!path_history.empty()) {
                     float total_weighted_distance = 0.0f;
@@ -81,7 +81,7 @@ static std::vector<cv::Point> tracePath(
             }
         }
 
-        if (nextPoint.x == -1 || distTransform.at<float>(nextPoint) < 0.1 || (outputImage.at<uchar>(nextPoint) != 0 && nextPoint != seedPoint)) {
+        if (nextPoint.x == -1 || distTransform.at<uchar>(nextPoint) == 0 || (outputImage.at<uchar>(nextPoint) != 0 && nextPoint != seedPoint)) {
             break;
         }
         currentPoint = nextPoint;
@@ -96,7 +96,8 @@ void customThinning(const cv::Mat& inputImage, cv::Mat& outputImage, std::vector
 
     // 1. Distance Transform
     cv::Mat distTransform;
-    cv::distanceTransform(inputImage, distTransform, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+    cv::distanceTransform(inputImage, distTransform, cv::DIST_L1, cv::DIST_MASK_5, CV_8U);
+    CV_Assert(distTransform.type() == CV_8U);
 
     // 2. Find seeds via non-maximum suppression
     cv::Mat localMaxima;
