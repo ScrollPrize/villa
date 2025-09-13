@@ -105,7 +105,7 @@ int main(int argc, char** argv) {
   ceres::Solver::Summary summary;
   ceres::Solve(options, &problem, &summary);
 
-  std::cout << summary.BriefReport() << "\n";
+  std::cout << summary.FullReport() << "\n";
 
   std::cout << "p0: " << p0 << std::endl;
   std::cout << "p1: " << p1 << std::endl;
@@ -129,7 +129,7 @@ int main(int argc, char** argv) {
   xt::xtensor<uint8_t, 3, xt::layout_type::column_major> crop =
       xt::zeros<uint8_t>({(size_t)crop_size, (size_t)crop_size, (size_t)crop_size});
   ChunkCache cache(1024*1024*1024);
-  readArea3D(crop, offset, ds.get(), &cache);
+  readArea3D(crop, {offset[2], offset[1], offset[0]}, ds.get(), &cache);
 
   cv::Mat slice_xy(crop_size, crop_size, CV_8U);
   cv::Mat slice_xz(crop_size, crop_size, CV_8U);
@@ -137,9 +137,9 @@ int main(int argc, char** argv) {
 
   for (int i = 0; i < crop_size; ++i) {
     for (int j = 0; j < crop_size; ++j) {
-      slice_xy.at<uint8_t>(j, i) = crop(i, j, half_crop);
-      slice_xz.at<uint8_t>(j, i) = crop(i, half_crop, j);
-      slice_yz.at<uint8_t>(j, i) = crop(half_crop, i, j);
+      slice_xy.at<uint8_t>(j, i) = crop(half_crop, j, i);
+      slice_xz.at<uint8_t>(j, i) = crop(j, half_crop, i);
+      slice_yz.at<uint8_t>(j, i) = crop(j, i, half_crop);
     }
   }
 
@@ -167,12 +167,45 @@ int main(int argc, char** argv) {
   draw_quad(slice_xz, p0, p1, p2, p3, cv::Vec3d(offset[0], offset[1], offset[2]), 1);
   draw_quad(slice_yz, p0, p1, p2, p3, cv::Vec3d(offset[0], offset[1], offset[2]), 2);
 
-  cv::imwrite("slice_xy.tif", slice_xy);
-  cv::imwrite("slice_xz.tif", slice_xz);
-  cv::imwrite("slice_yz.tif", slice_yz);
+  cv::imwrite("slice_xy_crop.tif", slice_xy);
+  cv::imwrite("slice_xz_crop.tif", slice_xz);
+  cv::imwrite("slice_yz_crop.tif", slice_yz);
 
-  std::cout << "Saved slices to slice_xy.tif, slice_xz.tif, and slice_yz.tif"
+  std::cout << "Saved cropped slices to slice_xy_crop.tif, slice_xz_crop.tif, and slice_yz_crop.tif"
             << std::endl;
+
+  auto shape = ds->shape();
+
+  // Read full XY slice
+  cv::Mat full_slice_xy(shape[1], shape[2], CV_8U);
+  xt::xtensor<uint8_t, 3, xt::layout_type::column_major> xy_data = xt::zeros<uint8_t>({(size_t)1, (size_t)shape[1], (size_t)shape[2]});
+  readArea3D(xy_data, {(int)seed_point[2], 0, 0}, ds.get(), &cache);
+  for(int y=0; y<shape[1]; ++y) for(int z=0; z<shape[2]; ++z) full_slice_xy.at<uint8_t>(y,z) = xy_data(0,y,z);
+  cv::cvtColor(full_slice_xy, full_slice_xy, cv::COLOR_GRAY2BGR);
+  cv::rectangle(full_slice_xy, cv::Rect(offset[1], offset[2], crop_size, crop_size), cv::Scalar(0, 255, 255), 1);
+  cv::imwrite("slice_xy_full.tif", full_slice_xy);
+
+  // Read full XZ slice
+  cv::Mat full_slice_xz(shape[0], shape[2], CV_8U);
+  xt::xtensor<uint8_t, 3, xt::layout_type::column_major> xz_data = xt::zeros<uint8_t>({(size_t)shape[0], (size_t)1, (size_t)shape[2]});
+  readArea3D(xz_data, {0, (int)seed_point[1], 0}, ds.get(), &cache);
+  for(int x=0; x<shape[0]; ++x) for(int z=0; z<shape[2]; ++z) full_slice_xz.at<uint8_t>(x,z) = xz_data(x,0,z);
+  cv::cvtColor(full_slice_xz, full_slice_xz, cv::COLOR_GRAY2BGR);
+  cv::rectangle(full_slice_xz, cv::Rect(offset[2], offset[0], crop_size, crop_size), cv::Scalar(0, 255, 255), 1);
+  cv::imwrite("slice_xz_full.tif", full_slice_xz);
+
+  // Read full YZ slice
+  cv::Mat full_slice_yz(shape[0], shape[1], CV_8U);
+  xt::xtensor<uint8_t, 3, xt::layout_type::column_major> yz_data = xt::zeros<uint8_t>({(size_t)shape[0], (size_t)shape[1], (size_t)1});
+  readArea3D(yz_data, {0, 0, (int)seed_point[0]}, ds.get(), &cache);
+  for(int x=0; x<shape[0]; ++x) for(int y=0; y<shape[1]; ++y) full_slice_yz.at<uint8_t>(x,y) = yz_data(x,y,0);
+  cv::cvtColor(full_slice_yz, full_slice_yz, cv::COLOR_GRAY2BGR);
+  cv::rectangle(full_slice_yz, cv::Rect(offset[1], offset[0], crop_size, crop_size), cv::Scalar(0, 255, 255), 1);
+  cv::imwrite("slice_yz_full.tif", full_slice_yz);
+
+  std::cout << "Saved full slices to slice_xy_full.tif, slice_xz_full.tif, and slice_yz_full.tif"
+            << std::endl;
+
 
   for (int plane_idx = 0; plane_idx < 3; ++plane_idx) {
     auto result = ngv.query({(float)seed_point[0], (float)seed_point[1], (float)seed_point[2]}, plane_idx);
@@ -181,7 +214,14 @@ int main(int argc, char** argv) {
             if (grid_ptr) {
                 cv::Mat vis = visualize_normal_grid(*grid_ptr, grid_ptr->size());
                 
-                cv::Rect crop_rect(offset[plane_idx == 0 ? 1 : 0], offset[plane_idx == 2 ? 1 : 2], crop_size, crop_size);
+                cv::Rect crop_rect;
+                if (plane_idx == 0) { // XY plane
+                    crop_rect = cv::Rect(offset[0], offset[1], crop_size, crop_size);
+                } else if (plane_idx == 1) { // XZ plane
+                    crop_rect = cv::Rect(offset[0], offset[2], crop_size, crop_size);
+                } else { // YZ plane
+                    crop_rect = cv::Rect(offset[1], offset[2], crop_size, crop_size);
+                }
                 cv::Mat vis_crop = vis(crop_rect);
 
                 cv::Vec3d grid_offset = {0,0,0};
@@ -192,9 +232,14 @@ int main(int argc, char** argv) {
                 
                 std::string plane_str = (plane_idx == 0) ? "xy" : ((plane_idx == 1) ? "xz" : "yz");
                 static int grid_vis_count = 0;
-                std::string filename = "ng_" + plane_str + "_" + std::to_string(grid_vis_count++) + ".tif";
-                cv::imwrite(filename, vis_crop);
-                std::cout << "Saved normal grid visualization to " << filename << std::endl;
+                std::string filename_crop = "ng_" + plane_str + "_" + std::to_string(grid_vis_count) + "_crop.tif";
+                cv::imwrite(filename_crop, vis_crop);
+                std::cout << "Saved normal grid visualization to " << filename_crop << std::endl;
+
+                std::string filename_full = "ng_" + plane_str + "_" + std::to_string(grid_vis_count) + "_full.tif";
+                cv::imwrite(filename_full, vis);
+                std::cout << "Saved normal grid visualization to " << filename_full << std::endl;
+                grid_vis_count++;
             }
         }
     }
