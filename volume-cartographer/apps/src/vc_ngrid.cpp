@@ -120,8 +120,10 @@ int main(int argc, char* argv[]) {
 
         ChunkCache cache(1llu*1024*1024*1024);
 
-        size_t total_slices_all_dirs = shape[0] + shape[1] + shape[2];
         std::atomic<size_t> total_processed_all_dirs = 0;
+        std::atomic<size_t> total_skipped_all_dirs = 0;
+        double work_progress_per_dir[3] = {0.0, 0.0, 0.0};
+        double display_progress_per_dir[3] = {0.0, 0.0, 0.0};
 
         int dir_idx = 0;
         for (SliceDirection dir : {SliceDirection::XY, SliceDirection::XZ, SliceDirection::YZ}) {
@@ -174,6 +176,7 @@ int main(int argc, char* argv[]) {
                     skipped += chunk_size;
                     processed += chunk_size;
                     total_processed_all_dirs += chunk_size;
+                    total_skipped_all_dirs += chunk_size;
                     continue;
                 }
 
@@ -252,6 +255,7 @@ int main(int argc, char* argv[]) {
                     skipped++;
                     processed++;
                     total_processed_all_dirs++;
+                    total_skipped_all_dirs++;
                     continue;
                 }
 
@@ -333,22 +337,19 @@ int main(int argc, char* argv[]) {
                         last_report_time = now;
                         size_t p = processed; // Read atomic once
                         
-                        size_t s = skipped;
-                        double dir_progress = static_cast<double>(p) / num_slices;
-                        double total_progress = (static_cast<double>(dir_idx) + dir_progress) / 3.0;
+                        display_progress_per_dir[dir_idx] = static_cast<double>(p) / num_slices;
+                        double total_display_progress = (display_progress_per_dir[0] + display_progress_per_dir[1] + display_progress_per_dir[2]) / 3.0;
+
+                        work_progress_per_dir[dir_idx] = static_cast<double>(p - skipped) / num_slices;
+                        double total_work_progress = (work_progress_per_dir[0] + work_progress_per_dir[1] + work_progress_per_dir[2]) / 3.0;
 
                         auto elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
                         
-                        size_t actually_processed = p - s;
-                        double slices_per_second = 0;
-                        if (elapsed_seconds > 1.0 && actually_processed > 0) {
-                            slices_per_second = actually_processed / elapsed_seconds;
-                        }
-
                         double remaining_seconds = std::numeric_limits<double>::infinity();
-                        if (slices_per_second > 0) {
-                            size_t remaining_slices = total_slices_all_dirs - total_processed_all_dirs;
-                            remaining_seconds = remaining_slices / slices_per_second;
+
+                        if (elapsed_seconds > 1.0 && total_work_progress > 1e-6) {
+                            double total_estimated_time = elapsed_seconds / total_work_progress;
+                            remaining_seconds = total_estimated_time * (1.0 - total_display_progress);
                         }
 
                         int rem_min = static_cast<int>(remaining_seconds) / 60;
@@ -356,7 +357,7 @@ int main(int argc, char* argv[]) {
 
                         std::cout << dir_str << " " << p << "/" << num_slices
                                     << " | Total "
-                                    << " (" << std::fixed << std::setprecision(1) << (total_progress * 100.0) << "%)"
+                                    << " (" << std::fixed << std::setprecision(1) << (total_display_progress * 100.0) << "%)"
                                     << ", skipped: " << skipped
                                     << ", ETA: " << rem_min << "m " << rem_sec << "s";
                         
@@ -377,13 +378,17 @@ int main(int argc, char* argv[]) {
                                 }
                                 std::cout << ", avg " << key << ": " << avg_time << "s";
                             }
-                            dir_idx++;
                         }
                         std::cout << std::endl;
                     }
                 }
                 }
             }
+
+            // Mark the current direction as fully processed for the next iteration's average calculation.
+            display_progress_per_dir[dir_idx] = 1.0;
+            work_progress_per_dir[dir_idx] = 1.0;
+            dir_idx++;
         }
 
         std::cout << "Processing complete." << std::endl;
