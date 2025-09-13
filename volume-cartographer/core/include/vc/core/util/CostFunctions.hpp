@@ -497,89 +497,123 @@ struct NormalDirectionLoss {
     }
 };
 
+/**
+ * @brief Ceres cost function to enforce that the surface normal aligns with precomputed normal grids.
+ *
+ * The loss is applied per corner of each quad and per Cartesian plane (XY, XZ, YZ).
+ * For each quad (A, B1, B2, C), the loss is calculated relative to an imaginary plane P
+ * that is one of the Cartesian planes shifted to pass through the base point A.
+ *
+ * 1.  The loss is skipped (residual set to 0) if all points of the quad lie on the same side of P.
+ * 2.  The side of the opposing point C relative to P determines which side point (B1 or B2) is used.
+ *     We select the side point Bn that is on the opposite side of P from C.
+ * 3.  The intersection point E of the line segment C-Bn with the plane P is calculated.
+ * 4.  The loss is then computed using the 2D normal constraint logic between the projected point A
+ *     (with the coordinate defining P removed) and the projected intersection point E.
+ * 5.  The final residual is weighted by the angle between the plane defined by (A, Bn, C) and
+ *     the Cartesian plane P. The weight is 1 for a 90-degree angle and 0 for a 0-degree angle.
+ */
 struct NormalConstraintPlane {
-    static double val(const double& v) { return v; }
-    template <typename JetT>
-    static double val(const JetT& v) { return v.a; }
-
-    const vc::core::util::GridStore& normal_grid;
-    const float roi_radius;
+    const NormalGridVolume& normal_grid_volume;
+    const int plane_idx; // 0: XY, 1: XZ, 2: YZ
     const double weight;
 
-    NormalConstraint(const vc::core::util::GridStore& normal_grid, float roi_radius, double weight)
-    : normal_grid(normal_grid), roi_radius(roi_radius), weight(weight) {}
+    NormalConstraintPlane(const NormalGridVolume& normal_grid_volume, int plane_idx, double weight)
+        : normal_grid_volume(normal_grid_volume), plane_idx(plane_idx), weight(weight) {}
 
-    // Function to calculate the squared distance between two line segments
-    static float seg_dist_sq(cv::Point2f p1, cv::Point2f p2, cv::Point2f p3, cv::Point2f p4) {
-        auto dot = [](cv::Point2f a, cv::Point2f b) { return a.x * b.x + a.y * b.y; };
-        auto dist_sq = [&](cv::Point2f p) { return p.x * p.x + p.y * p.y; };
+    template <typename T>
+    bool operator()(const T* const pA, const T* const pB1, const T* const pB2, const T* const pC, T* residual) const {
+        residual[0] = T(0.0);
 
-        cv::Point2f u = p2 - p1;
-        cv::Point2f v = p4 - p3;
-        cv::Point2f w = p1 - p3;
+        T a_coord = pA[plane_idx];
 
-        float a = dot(u, u);
-        float b = dot(u, v);
-        float c = dot(v, v);
-        float d = dot(u, w);
-        float e = dot(v, w);
-        float D = a * c - b * b;
-        float sc, sN, sD = D;
-        float tc, tN, tD = D;
+        T b1_rel = pB1[plane_idx] - a_coord;
+        T b2_rel = pB2[plane_idx] - a_coord;
+        T c_rel = pC[plane_idx] - a_coord;
 
-        if (D < 1e-7) {
-            sN = 0.0;
-            sD = 1.0;
-            tN = e;
-            tD = c;
-        } else {
-            sN = (b * e - c * d);
-            tN = (a * e - b * d);
-            if (sN < 0.0) {
-                sN = 0.0;
-                tN = e;
-                tD = c;
-            } else if (sN > sD) {
-                sN = sD;
-                tN = e + b;
-                tD = c;
-            }
+        // Skip if all points are on the same side of the plane P through A.
+        if ((b1_rel >= T(0) && b2_rel >= T(0) && c_rel >= T(0)) ||
+            (b1_rel <= T(0) && b2_rel <= T(0) && c_rel <= T(0))) {
+            return true;
         }
 
-        if (tN < 0.0) {
-            tN = 0.0;
-            if (-d < 0.0) sN = 0.0;
-            else if (-d > a) sN = sD;
-            else {
-                sN = -d;
-                sD = a;
-            }
-        } else if (tN > tD) {
-            tN = tD;
-            if ((-d + b) < 0.0) sN = 0.0;
-            else if ((-d + b) > a) sN = sD;
-            else {
-                sN = (-d + b);
-                sD = a;
-            }
+        const T* pBn = nullptr;
+        T bn_rel;
+
+        // Choose Bn on the opposite side of C.
+        if (c_rel > T(0)) {
+            if (b1_rel < T(0)) { pBn = pB1; bn_rel = b1_rel; }
+            else if (b2_rel < T(0)) { pBn = pB2; bn_rel = b2_rel; }
+        } else if (c_rel < T(0)) {
+            if (b1_rel > T(0)) { pBn = pB1; bn_rel = b1_rel; }
+            else if (b2_rel > T(0)) { pBn = pB2; bn_rel = b2_rel; }
         }
 
-        sc = (std::abs(sN) < 1e-7 ? 0.0 : sN / sD);
-        tc = (std::abs(tN) < 1e-7 ? 0.0 : tN / tD);
+        if (pBn == nullptr) {
+            return true; // C is on the plane, or B1/B2 are on the same side as C.
+        }
 
-        cv::Point2f dP = w + (sc * u) - (tc * v);
-        return dist_sq(dP);
+        // Intersection of segment C-Bn with plane P.
+        T t = -c_rel / (bn_rel - c_rel);
+        T pE[3];
+        for (int i = 0; i < 3; ++i) {
+            pE[i] = pC[i] + t * (pBn[i] - pC[i]);
+        }
+
+        // Project A and E onto the 2D plane.
+        T pA_2d[2], pE_2d[2];
+        int coord_idx = 0;
+        for (int i = 0; i < 3; ++i) {
+            if (i == plane_idx) continue;
+            pA_2d[coord_idx] = pA[i];
+            pE_2d[coord_idx] = pE[i];
+            coord_idx++;
+        }
+
+        // Query the normal grids.
+        cv::Point3f query_point(val(pA[0]), val(pA[1]), val(pA[2]));
+        auto grid_query = normal_grid_volume.query(query_point, plane_idx);
+        if (!grid_query) {
+            return true;
+        }
+
+        // Calculate normal loss for both grid planes and interpolate.
+        T loss1 = calculate_normal_loss(pA_2d, pE_2d, *grid_query->grid1);
+        T loss2 = calculate_normal_loss(pA_2d, pE_2d, *grid_query->grid2);
+        T interpolated_loss = (T(1.0) - T(grid_query->weight)) * loss1 + T(grid_query->weight) * loss2;
+
+        // Calculate angular weight.
+        T v_abn[3], v_ac[3];
+        for(int i=0; i<3; ++i) {
+            v_abn[i] = pBn[i] - pA[i];
+            v_ac[i] = pC[i] - pA[i];
+        }
+
+        T cross_product[3] = {
+            v_abn[1] * v_ac[2] - v_abn[2] * v_ac[1],
+            v_abn[2] * v_ac[0] - v_abn[0] * v_ac[2],
+            v_abn[0] * v_ac[1] - v_abn[1] * v_ac[0]
+        };
+
+        T cross_len = ceres::sqrt(cross_product[0]*cross_product[0] + cross_product[1]*cross_product[1] + cross_product[2]*cross_product[2]);
+        T plane_normal_coord = cross_product[plane_idx];
+        
+        T cos_angle = plane_normal_coord / (cross_len + T(1e-9));
+        T angle_weight = T(1.0) - cos_angle * cos_angle; // sin^2(angle)
+
+        residual[0] = T(weight) * interpolated_loss * angle_weight;
+
+        return true;
     }
 
     template <typename T>
-    bool operator()(const T* const p1, const T* const p2, T* residual) const {
+    T calculate_normal_loss(const T* p1, const T* p2, const GridStore& normal_grid) const {
         T edge_vec_x = p2[0] - p1[0];
         T edge_vec_y = p2[1] - p1[1];
 
         T edge_len_sq = edge_vec_x * edge_vec_x + edge_vec_y * edge_vec_y;
         if (edge_len_sq < T(1e-12)) {
-            residual[0] = T(0.0);
-            return true;
+            return T(0.0);
         }
         T edge_len = ceres::sqrt(edge_len_sq);
 
@@ -587,11 +621,10 @@ struct NormalConstraintPlane {
         T edge_normal_y = -edge_vec_x / edge_len;
 
         cv::Point2f midpoint_cv(val(p1[0] + edge_vec_x * 0.5), val(p1[1] + edge_vec_y * 0.5));
-        std::vector<std::shared_ptr<std::vector<cv::Point>>> nearby_paths = normal_grid.get(midpoint_cv, roi_radius);
+        std::vector<std::shared_ptr<std::vector<cv::Point>>> nearby_paths = normal_grid.get(midpoint_cv, 10.0f); // FIXME: ROI radius
 
-        residual[0] = T(0.0);
         if (nearby_paths.empty()) {
-            return true;
+            return T(0.0);
         }
 
         T total_weighted_dot_product = T(0.0);
@@ -608,10 +641,10 @@ struct NormalConstraintPlane {
                 cv::Point2f p1_cv(val(p1[0]), val(p1[1]));
                 cv::Point2f p2_cv(val(p2[0]), val(p2[1]));
 
-                float dist_sq = NormalConstraint::seg_dist_sq(p1_cv, p2_cv, p_a, p_b);
+                float dist_sq = seg_dist_sq(p1_cv, p2_cv, p_a, p_b);
                 dist_sq = std::max(0.1f, dist_sq);
 
-                T weight_n = T(1.0 / ceres::sqrt(dist_sq));
+                T weight_n = T(1.0 / std::sqrt(dist_sq));
 
                 cv::Point2f tangent = p_b - p_a;
                 float length = cv::norm(tangent);
@@ -629,11 +662,41 @@ struct NormalConstraintPlane {
 
         if (total_weight > T(1e-9)) {
             T avg_dot_product = total_weighted_dot_product / total_weight;
-            residual[0] = T(weight) * (T(1.0) - avg_dot_product);
-        } else {
-            residual[0] = T(0.0);
+            return (T(1.0) - avg_dot_product);
         }
+        return T(0.0);
+    }
 
-        return true;
+    static float seg_dist_sq(cv::Point2f p1, cv::Point2f p2, cv::Point2f p3, cv::Point2f p4) {
+        auto dot = [](cv::Point2f a, cv::Point2f b) { return a.x * b.x + a.y * b.y; };
+        auto dist_sq = [&](cv::Point2f p) { return p.x * p.x + p.y * p.y; };
+        cv::Point2f u = p2 - p1;
+        cv::Point2f v = p4 - p3;
+        cv::Point2f w = p1 - p3;
+        float a = dot(u, u); float b = dot(u, v); float c = dot(v, v);
+        float d = dot(u, w); float e = dot(v, w); float D = a * c - b * b;
+        float sc, sN, sD = D; float tc, tN, tD = D;
+        if (D < 1e-7) { sN = 0.0; sD = 1.0; tN = e; tD = c; }
+        else { sN = (b * e - c * d); tN = (a * e - b * d);
+            if (sN < 0.0) { sN = 0.0; tN = e; tD = c; }
+            else if (sN > sD) { sN = sD; tN = e + b; tD = c; }
+        }
+        if (tN < 0.0) { tN = 0.0;
+            if (-d < 0.0) sN = 0.0; else if (-d > a) sN = sD;
+            else { sN = -d; sD = a; }
+        } else if (tN > tD) { tN = tD;
+            if ((-d + b) < 0.0) sN = 0.0; else if ((-d + b) > a) sN = sD;
+            else { sN = (-d + b); sD = a; }
+        }
+        sc = (std::abs(sN) < 1e-7 ? 0.0 : sN / sD);
+        tc = (std::abs(tN) < 1e-7 ? 0.0 : tN / tD);
+        cv::Point2f dP = w + (sc * u) - (tc * v);
+        return dist_sq(dP);
+    }
+
+    static ceres::CostFunction* Create(const NormalGridVolume& normal_grid_volume, int plane_idx, double weight) {
+        return new ceres::AutoDiffCostFunction<NormalConstraintPlane, 1, 3, 3, 3, 3>(
+            new NormalConstraintPlane(normal_grid_volume, plane_idx, weight)
+        );
     }
 };
