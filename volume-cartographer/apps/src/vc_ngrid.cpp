@@ -45,7 +45,8 @@ int main(int argc, char* argv[]) {
         ("input,i", po::value<std::string>()->required(), "Input path (Zarr volume for batch-vol-gen, .grid file for vis)")
         ("output,o", po::value<std::string>()->required(), "Output path (directory for batch-vol-gen, .tif file for vis)")
         ("spiral-step", po::value<double>()->default_value(8.0), "Spiral step for resampling (batch-vol-gen only)")
-        ("grid-step", po::value<int>()->default_value(64), "Grid cell size for the GridStore (batch-vol-gen only)");
+        ("grid-step", po::value<int>()->default_value(64), "Grid cell size for the GridStore (batch-vol-gen only)")
+        ("sparse-volume", po::value<int>()->default_value(4), "Process every N-th slice (batch-vol-gen only)");
 
     po::positional_options_description p;
     p.add("mode", 1);
@@ -113,6 +114,7 @@ int main(int argc, char* argv[]) {
         nlohmann::json metadata;
         metadata["spiral-step"] = spiral_step;
         metadata["grid-step"] = vm["grid-step"].as<int>();
+        metadata["sparse-volume"] = vm["sparse-volume"].as<int>();
         std::ofstream o(output_fs_path / "metadata.json");
         o << std::setw(4) << metadata << std::endl;
 
@@ -205,6 +207,12 @@ int main(int argc, char* argv[]) {
                 #pragma omp parallel for schedule(dynamic)
                 for (size_t i_chunk = 0; i_chunk < chunk_size; ++i_chunk) {
                     size_t i = chunk_start + i_chunk;
+
+                    if (i % vm["sparse-volume"].as<int>() != 0) {
+                        processed++;
+                        total_processed_all_dirs++;
+                        continue;
+                    }
                     cv::Mat slice_mat;
 
                     switch (dir) {
