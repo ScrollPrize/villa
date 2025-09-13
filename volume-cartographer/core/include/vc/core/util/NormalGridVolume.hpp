@@ -25,6 +25,9 @@ namespace vc::core::util {
 
         std::optional<GridQueryResult> query(const cv::Point3f& point, int plane_idx) const;
 
+    public:
+        const nlohmann::json& metadata() const;
+
     private:
         struct pimpl;
         std::unique_ptr<pimpl> pimpl_;

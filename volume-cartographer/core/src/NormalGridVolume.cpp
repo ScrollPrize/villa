@@ -88,4 +88,7 @@ namespace vc::core::util {
         return pimpl_->query(point, plane_idx);
     }
 
+    const nlohmann::json& NormalGridVolume::metadata() const {
+        return pimpl_->metadata;
+    }
 } // namespace vc::core::util
