@@ -1,6 +1,8 @@
 #pragma once
 
 #include "vc/core/types/ChunkedTensor.hpp"
+#include "vc/core/util/NormalGridVolume.hpp"
+#include "vc/core/util/GridStore.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -514,11 +516,11 @@ struct NormalDirectionLoss {
  *     the Cartesian plane P. The weight is 1 for a 90-degree angle and 0 for a 0-degree angle.
  */
 struct NormalConstraintPlane {
-    const NormalGridVolume& normal_grid_volume;
+    const vc::core::util::NormalGridVolume& normal_grid_volume;
     const int plane_idx; // 0: XY, 1: XZ, 2: YZ
     const double weight;
 
-    NormalConstraintPlane(const NormalGridVolume& normal_grid_volume, int plane_idx, double weight)
+    NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight)
         : normal_grid_volume(normal_grid_volume), plane_idx(plane_idx), weight(weight) {}
 
     template <typename T>
@@ -607,7 +609,7 @@ struct NormalConstraintPlane {
     }
 
     template <typename T>
-    T calculate_normal_loss(const T* p1, const T* p2, const GridStore& normal_grid) const {
+    T calculate_normal_loss(const T* p1, const T* p2, const vc::core::util::GridStore& normal_grid) const {
         T edge_vec_x = p2[0] - p1[0];
         T edge_vec_y = p2[1] - p1[1];
 
@@ -694,7 +696,7 @@ struct NormalConstraintPlane {
         return dist_sq(dP);
     }
 
-    static ceres::CostFunction* Create(const NormalGridVolume& normal_grid_volume, int plane_idx, double weight) {
+    static ceres::CostFunction* Create(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight) {
         return new ceres::AutoDiffCostFunction<NormalConstraintPlane, 1, 3, 3, 3, 3>(
             new NormalConstraintPlane(normal_grid_volume, plane_idx, weight)
         );

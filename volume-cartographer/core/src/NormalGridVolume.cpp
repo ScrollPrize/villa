@@ -88,6 +88,9 @@ namespace vc::core::util {
         return pimpl_->query(point, plane_idx);
     }
 
+    NormalGridVolume::~NormalGridVolume() = default;
+    NormalGridVolume::NormalGridVolume(NormalGridVolume&&) noexcept = default;
+    NormalGridVolume& NormalGridVolume::operator=(NormalGridVolume&&) noexcept = default;
     const nlohmann::json& NormalGridVolume::metadata() const {
         return pimpl_->metadata;
     }

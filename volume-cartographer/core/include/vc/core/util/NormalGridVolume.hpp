@@ -16,6 +16,9 @@ namespace vc::core::util {
     class NormalGridVolume {
     public:
         explicit NormalGridVolume(const std::string& path);
+        ~NormalGridVolume();
+        NormalGridVolume(NormalGridVolume&&) noexcept;
+        NormalGridVolume& operator=(NormalGridVolume&&) noexcept;
 
         struct GridQueryResult {
             const GridStore* grid1;

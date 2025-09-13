@@ -9,6 +9,8 @@
 #include "vc/core/types/ChunkedTensor.hpp"
 #include <nlohmann/json.hpp>
 
+#include "vc/core/util/NormalGridVolume.hpp"
+#include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/CostFunctions.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
 
@@ -160,13 +162,13 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_
     int count = 0;
     for (int i = 0; i < 3; ++i) { // For each plane
         // Loss with p as base point A
-        problem.AddResidualBlock(vc::core::util::NormalConstraintPlane::Create(*ngv, i, w), nullptr, pA, pB1, pB2, pC);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w), nullptr, pA, pB1, pB2, pC);
         // Loss with p_tr as base point A
-        problem.AddResidualBlock(vc::core::util::NormalConstraintPlane::Create(*ngv, i, w), nullptr, pB1, pC, pA, pB2);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w), nullptr, pB1, pC, pA, pB2);
         // Loss with p_bl as base point A
-        problem.AddResidualBlock(vc::core::util::NormalConstraintPlane::Create(*ngv, i, w), nullptr, pB2, pA, pC, pB1);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w), nullptr, pB2, pA, pC, pB1);
         // Loss with p_br as base point A
-        problem.AddResidualBlock(vc::core::util::NormalConstraintPlane::Create(*ngv, i, w), nullptr, pC, pB2, pB1, pA);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w), nullptr, pC, pB2, pB1, pA);
         count += 4;
     }
 
@@ -432,7 +434,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t
         for(int ox=std::max(p[1]-radius,0);ox<=std::min(p[1]+radius,locs.cols-1);ox++) {
             cv::Vec2i op = {oy, ox};
             if (cv::norm(p-op) <= radius)
-                emptytrace_create_missing_centered_losses(problem, loss_status, op, state, locs, interp, t, direction_fields, ngv.get(), unit);
+                emptytrace_create_missing_centered_losses(problem, loss_status, op, state, locs, interp, t, direction_fields, ngv, unit);
         }
     for(int oy=std::max(p[0]-r_outer,0);oy<=std::min(p[0]+r_outer,locs.rows-1);oy++)
         for(int ox=std::max(p[1]-r_outer,0);ox<=std::min(p[1]+r_outer,locs.cols-1);ox++) {
