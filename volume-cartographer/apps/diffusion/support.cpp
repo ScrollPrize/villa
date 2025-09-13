@@ -32,9 +32,6 @@ void populate_normal_grid(const SkeletonGraph& g, vc::core::util::GridStore& nor
             }
         }
 
-        if (resampled_path.back() != path.back()) {
-            resampled_path.push_back(path.back());
-        }
 
         if (resampled_path.size() >= 2) {
             normal_grid.add(resampled_path);
@@ -61,9 +58,6 @@ void populate_normal_grid(const std::vector<std::vector<cv::Point>>& traces, vc:
             }
         }
 
-        if (resampled_path.back() != trace.back()) {
-            resampled_path.push_back(trace.back());
-        }
 
         if (resampled_path.size() >= 2) {
             normal_grid.add(resampled_path);
