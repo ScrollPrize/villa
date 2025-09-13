@@ -103,6 +103,10 @@ public:
         return result;
     }
 
+    cv::Size size() const {
+        return bounds_.size();
+    }
+
     size_t get_memory_usage() const {
         size_t grid_memory = grid_.capacity() * sizeof(std::vector<int>);
         for (const auto& cell : grid_) {
@@ -465,6 +469,10 @@ std::vector<std::shared_ptr<std::vector<cv::Point>>> GridStore::get(const cv::Po
 
 std::vector<std::shared_ptr<std::vector<cv::Point>>> GridStore::get_all() const {
     return pimpl_->get_all();
+}
+
+cv::Size GridStore::size() const {
+    return pimpl_->size();
 }
 
 size_t GridStore::get_memory_usage() const {
