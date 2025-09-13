@@ -29,6 +29,8 @@ from vesuvius.models.evaluation.hausdorff import HausdorffDistanceMetric
 from vesuvius.models.evaluation.connected_components import ConnectedComponentsMetric
 from vesuvius.models.evaluation.critical_components import CriticalComponentsMetric
 from vesuvius.models.evaluation.skeleton_branch_points import SkeletonBranchPointsMetric
+from vesuvius.models.evaluation.precision_recall_f1 import PrecisionRecallF1Metric
+from vesuvius.models.evaluation.mean_average_precision import MeanAveragePrecisionMetric
 
 
 def _normalize_metric_names(metric_names: List[str]) -> List[str]:
@@ -44,6 +46,11 @@ def _normalize_metric_names(metric_names: List[str]) -> List[str]:
         "hausdorff95": "hausdorff",
         "iou": "iou_dice",
         "dice": "iou_dice",
+        "f1": "precision_recall_f1",
+        "f1_score": "precision_recall_f1",
+        "precision_recall": "precision_recall_f1",
+        "map": "mean_average_precision",
+        "mAP": "mean_average_precision",
     }
     out = []
     for m in metric_names:
@@ -62,6 +69,8 @@ def build_metrics(metric_names: List[str], num_classes: int) -> List[object]:
         "connected_components",
         "critical_components",
         "skeleton_branch_points",
+        "precision_recall_f1",
+        "mean_average_precision",
     ]
     names = _normalize_metric_names(metric_names)
     if not names or "all" in names:
@@ -79,6 +88,10 @@ def build_metrics(metric_names: List[str], num_classes: int) -> List[object]:
             metrics.append(CriticalComponentsMetric())
         elif name == "skeleton_branch_points":
             metrics.append(SkeletonBranchPointsMetric(num_classes=num_classes))
+        elif name == "precision_recall_f1":
+            metrics.append(PrecisionRecallF1Metric(num_classes=num_classes))
+        elif name == "mean_average_precision":
+            metrics.append(MeanAveragePrecisionMetric(num_classes=num_classes))
         else:
             print(f"Warning: unsupported metric '{name}' ignored. Supported: {', '.join(supported)}")
     return metrics
@@ -678,7 +691,8 @@ def main():
         default="all",
         help=(
             "Comma-separated metrics or 'all'. Supported: "
-            "iou_dice, hausdorff, connected_components, critical_components, skeleton_branch_points"
+            "iou_dice, hausdorff, connected_components, critical_components, skeleton_branch_points, "
+            "precision_recall_f1 (aliases: f1, f1_score), mean_average_precision (alias: map)"
         ),
     )
     parser.add_argument("--csv", default=None, help="Optional path to write a CSV row of the summary metrics.")
