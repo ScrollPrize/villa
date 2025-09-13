@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import csv
 
 import numpy as np
 
@@ -259,6 +260,8 @@ def evaluate_dataset(
     metric_objs = build_metrics(metrics, num_classes=num_classes)
 
     per_image_stats: List[Dict[str, float]] = []
+    per_image_rows: List[Tuple[str, Dict[str, float]]] = []
+    per_image_rows: List[Tuple[str, Dict[str, float]]] = []
 
     for img_path in tqdm(image_list, desc="Processing images", unit="img"):
         base_name = img_path.stem
@@ -394,7 +397,7 @@ def _evaluate_one_label_pred_task(
     with (out_dir / "stats.json").open("w") as f:
         json.dump(_to_json_safe(image_stats), f, indent=2)
 
-    return image_stats
+    return (label_path.stem, image_stats)
 
 
 def evaluate_labels_predictions(
@@ -436,11 +439,17 @@ def evaluate_labels_predictions(
             futures = [ex.submit(_evaluate_one_label_pred_task, *t) for t in tasks]
             for fut in tqdm(as_completed(futures), total=len(futures), desc="Evaluating predictions (parallel)", unit="img"):
                 try:
-                    image_stats = fut.result()
+                    name_stats = fut.result()
                 except Exception as e:
                     print(f"Warning: evaluation task failed: {e}")
                     continue
-                per_image_stats.append(image_stats)
+                if isinstance(name_stats, tuple) and len(name_stats) == 2:
+                    name, image_stats = name_stats
+                    per_image_rows.append((name, image_stats))
+                    per_image_stats.append(image_stats)
+                else:
+                    # Fallback for older return value
+                    per_image_stats.append(name_stats)
     else:
         # Serial path
         metric_objs = build_metrics(metrics, num_classes=num_classes)
@@ -474,10 +483,12 @@ def evaluate_labels_predictions(
                 except Exception as e:
                     print(f"Warning: metric {getattr(metric, 'name', type(metric).__name__)} failed: {e}")
 
-        with (out_dir / "stats.json").open("w") as f:
-            json.dump(_to_json_safe(image_stats), f, indent=2)
+            # Save per-image stats and collect for summary
+            with (out_dir / "stats.json").open("w") as f:
+                json.dump(_to_json_safe(image_stats), f, indent=2)
 
             per_image_stats.append(image_stats)
+            per_image_rows.append((base_name, image_stats))
 
     # Aggregate over images
     summary: Dict[str, float] = {}
@@ -491,7 +502,158 @@ def evaluate_labels_predictions(
     with (output_root / "summary.json").open("w") as f:
         json.dump({"num_images": len(per_image_stats), "metrics": summary}, f, indent=2)
 
+    # Write per-image CSV for this run
+    try:
+        _write_per_image_csv(output_root / "per_image.csv", per_image_rows)
+    except Exception as e:
+        print(f"Warning: failed to write per-image CSV for {output_root.name}: {e}")
+
     return summary
+
+
+def _friendly_metric_key(key: str) -> str:
+    """Return a friendly CSV column name for a metric key.
+
+    For critical components, ensure columns read 'critical components negative|positive|total'.
+    Otherwise, return the key as-is.
+    """
+    k = key.strip()
+    if k in {"negative", "positive", "total"}:
+        return f"critical components {k}"
+    return k
+
+
+def _write_csv_row(csv_path: Path, row_name: str, metrics: Dict[str, float]) -> None:
+    """Write or append a CSV with metrics as columns.
+
+    - First column is 'name' with the predictions folder name.
+    - Columns are metric keys (friendly names applied) in stable sorted order.
+    - If file exists, uses its header order and writes only those columns.
+    """
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Map and round values for stability
+    friendly_items = { _friendly_metric_key(k): float(v) for k, v in metrics.items() }
+
+    if csv_path.exists():
+        # Append using existing header
+        with csv_path.open("r", newline="") as f:
+            reader = csv.reader(f)
+            try:
+                header = next(reader)
+            except StopIteration:
+                header = []
+        if not header:
+            # Treat as new file if header missing
+            header = ["name"] + sorted(friendly_items.keys())
+            with csv_path.open("w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+        # Build row matching header (skip unknowns; missing -> empty)
+        row = []
+        for col in header:
+            if col == "name":
+                row.append(row_name)
+            else:
+                row.append(friendly_items.get(col, ""))
+        with csv_path.open("a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
+    else:
+        # Create new file with header inferred from current metrics
+        # Put common critical-component fields in a pleasant order if present
+        keys = sorted(friendly_items.keys())
+        preferred_order = [
+            "critical components negative",
+            "critical components positive",
+            "critical components total",
+        ]
+        ordered_keys = [k for k in preferred_order if k in friendly_items] + [k for k in keys if k not in preferred_order]
+        header = ["name"] + ordered_keys
+        row = [row_name] + [friendly_items.get(k, "") for k in ordered_keys]
+        with csv_path.open("w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            writer.writerow(row)
+
+
+def _csv_has_row(csv_path: Path, row_name: str) -> bool:
+    """Return True if the CSV exists and already has a row with given name."""
+    if not csv_path.exists():
+        return False
+    with csv_path.open("r", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        if not header:
+            return False
+        name_idx = None
+        for i, col in enumerate(header):
+            if col == "name":
+                name_idx = i
+                break
+        if name_idx is None:
+            return False
+        for row in reader:
+            if len(row) > name_idx and row[name_idx] == row_name:
+                return True
+    return False
+
+
+def _write_per_image_csv(csv_path: Path, rows: List[Tuple[str, Dict[str, float]]]) -> None:
+    """Write a per-image CSV for a run.
+
+    - First column is 'image' (basename without extension)
+    - Other columns are metric keys (friendly names applied).
+    - Columns are the union of keys across images, ordered with critical component fields first,
+      then the rest sorted alphabetically.
+    """
+    if not rows:
+        return
+    # Collect union of keys
+    key_set = set()
+    for _, metrics in rows:
+        key_set.update(_friendly_metric_key(k) for k in metrics.keys())
+
+    preferred = [
+        "critical components negative",
+        "critical components positive",
+        "critical components total",
+    ]
+    ordered_keys = [k for k in preferred if k in key_set] + sorted(k for k in key_set if k not in preferred)
+
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["image"] + ordered_keys)
+        for name, metrics in rows:
+            friendly = { _friendly_metric_key(k): v for k, v in metrics.items() }
+            writer.writerow([name] + [friendly.get(k, "") for k in ordered_keys])
+
+
+def _write_per_image_csv_from_stats_dir(run_output: Path) -> bool:
+    """Build per-image CSV from existing per-image stats.json files in a run output dir.
+
+    Returns True on success, False otherwise.
+    """
+    try:
+        rows: List[Tuple[str, Dict[str, float]]] = []
+        for d in sorted([p for p in run_output.iterdir() if p.is_dir()]):
+            stats_path = d / "stats.json"
+            if not stats_path.exists():
+                continue
+            try:
+                with stats_path.open("r") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    rows.append((d.name, data))
+            except Exception:
+                continue
+        if not rows:
+            return False
+        _write_per_image_csv(run_output / "per_image.csv", rows)
+        return True
+    except Exception:
+        return False
 
 
 def main():
@@ -519,6 +681,7 @@ def main():
             "iou_dice, hausdorff, connected_components, critical_components, skeleton_branch_points"
         ),
     )
+    parser.add_argument("--csv", default=None, help="Optional path to write a CSV row of the summary metrics.")
 
     args = parser.parse_args()
 
@@ -533,14 +696,88 @@ def main():
     if args.labels and args.predictions:
         labels_dir = Path(args.labels)
         predictions_dir = Path(args.predictions)
-        summary = evaluate_labels_predictions(
-            labels_dir=labels_dir,
-            predictions_dir=predictions_dir,
-            output_root=output_root,
-            num_classes=args.num_classes,
-            metrics=metrics,
-            num_workers=max(1, int(args.num_workers or 1)),
-        )
+
+        # Directory mode takes precedence if there are subfolders with TIFFs
+        subdirs = [d for d in predictions_dir.iterdir() if d.is_dir()]
+        subdirs_with_tifs = []
+        for d in subdirs:
+            try:
+                if any(f.is_file() and f.suffix.lower() in {".tif", ".tiff"} for f in d.iterdir()):
+                    subdirs_with_tifs.append(d)
+            except Exception:
+                pass
+
+        if subdirs_with_tifs:
+            print(f"Found {len(subdirs_with_tifs)} prediction folders. Evaluating each...")
+            completed = 0
+            for run_dir in subdirs_with_tifs:
+                run_output = output_root / run_dir.name
+
+                # Resume support: if summary exists, skip heavy eval and only ensure CSV row exists
+                summary_path = run_output / "summary.json"
+                if summary_path.exists():
+                    try:
+                        with summary_path.open("r") as f:
+                            data = json.load(f)
+                        metrics_data = data.get("metrics", {}) if isinstance(data, dict) else {}
+                    except Exception as e:
+                        print(f"Warning: failed to read existing summary for {run_dir.name}: {e}; re-evaluating.")
+                        metrics_data = None
+
+                    if metrics_data is not None:
+                        # Ensure per-image CSV exists; rebuild from per-image stats if missing
+                        per_image_csv = run_output / "per_image.csv"
+                        if not per_image_csv.exists():
+                            try:
+                                _write_per_image_csv_from_stats_dir(run_output)
+                            except Exception:
+                                pass
+                        if args.csv:
+                            csv_path = Path(args.csv)
+                            try:
+                                if not _csv_has_row(csv_path, run_dir.name):
+                                    _write_csv_row(csv_path, run_dir.name, metrics_data)
+                            except Exception as e:
+                                print(f"Warning: failed to append CSV for {run_dir.name}: {e}")
+                        completed += 1
+                        continue
+
+                try:
+                    run_summary = evaluate_labels_predictions(
+                        labels_dir=labels_dir,
+                        predictions_dir=run_dir,
+                        output_root=run_output,
+                        num_classes=args.num_classes,
+                        metrics=metrics,
+                        num_workers=max(1, int(args.num_workers or 1)),
+                    )
+                    if args.csv:
+                        csv_path = Path(args.csv)
+                        try:
+                            _write_csv_row(csv_path, run_dir.name, run_summary)
+                        except Exception as e:
+                            print(f"Warning: failed to append CSV for {run_dir.name}: {e}")
+                    completed += 1
+                except Exception as e:
+                    print(f"Warning: evaluation failed for {run_dir}: {e}")
+
+            print(f"\nCompleted evaluation for {completed}/{len(subdirs_with_tifs)} prediction folders.")
+            return
+
+        # Otherwise if predictions_dir contains TIFFs directly, evaluate once.
+        pred_files = [p for p in predictions_dir.iterdir() if p.is_file() and p.suffix.lower() in {".tif", ".tiff"}]
+        if pred_files:
+            summary = evaluate_labels_predictions(
+                labels_dir=labels_dir,
+                predictions_dir=predictions_dir,
+                output_root=output_root,
+                num_classes=args.num_classes,
+                metrics=metrics,
+                num_workers=max(1, int(args.num_workers or 1)),
+            )
+            csv_row_name = predictions_dir.name
+        else:
+            raise FileNotFoundError(f"No prediction TIFFs found directly in {predictions_dir} or its immediate subdirectories.")
     elif args.model and args.images:
         images_path = Path(args.images)
         labels_dir = Path(args.labels) if args.labels else None
@@ -558,11 +795,22 @@ def main():
             patch_size=patch_size,
             metrics=metrics,
         )
+        # In inference mode, use images path name as the row label
+        csv_row_name = images_path.name
     else:
         raise SystemExit("Provide either --labels and --predictions (evaluation-only) or --model and --images (inference mode).")
 
     print("\nEvaluation complete.")
     print(json.dumps(summary, indent=2))
+
+    # Optional CSV output
+    if args.csv:
+        csv_path = Path(args.csv)
+        try:
+            _write_csv_row(csv_path, csv_row_name, summary)
+            print(f"CSV summary written to {csv_path}")
+        except Exception as e:
+            print(f"Warning: failed to write CSV to {csv_path}: {e}")
 
 
 if __name__ == "__main__":

@@ -55,6 +55,16 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler, mgr, device, l
                         setattr(self, attr_name, getattr(base_mgr, attr_name))
 
         config_wrapper = ConfigWrapper(checkpoint['model_config'], mgr)
+        # Ensure deep supervision setting does not alter decoder sharing on rebuild.
+        # If the checkpoint used a shared decoder (separate_decoders == False), forcing
+        # deep supervision here would switch to separate decoders and break strict loads.
+        try:
+            sep_dec = bool(checkpoint['model_config'].get('separate_decoders', False))
+            if not sep_dec:
+                # Avoid DS-enforced decoder split during rebuild for exact arch match
+                setattr(config_wrapper, 'enable_deep_supervision', False)
+        except Exception:
+            pass
         model = NetworkFromConfig(config_wrapper)
         model = model.to(device)
 

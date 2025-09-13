@@ -1283,7 +1283,9 @@ class BaseTrainer:
                     print(f"  {t_name}: Avg Loss = {avg_loss:.4f}")
 
             # ---- validation ----- #
-            if epoch % 1 == 0 and (not self.is_distributed or self.rank == 0):
+            val_every_n = int(getattr(self.mgr, 'val_every_n', 1))
+            do_validate = ((epoch + 1) % max(1, val_every_n) == 0)
+            if do_validate and (not self.is_distributed or self.rank == 0):
                 # For MAE training, don't set to eval mode to keep patch dropping active
                 if not hasattr(self, '_is_mae_training'):
                     model.eval()
@@ -1614,6 +1616,8 @@ def main():
                            help="Epochs to wait for val loss improvement (0 disables)")
     grp_train.add_argument("--ddp", action="store_true",
                            help="Enable DistributedDataParallel (use with torchrun)")
+    grp_train.add_argument("--val-every-n", dest="val_every_n", type=int, default=1,
+                           help="Perform validation every N epochs (1=every epoch)")
     grp_train.add_argument("--gpus", type=str, default=None,
                            help="Comma-separated GPU device IDs to use, e.g. '0,1,3'. With DDP, length must equal WORLD_SIZE")
     grp_train.add_argument("--nproc-per-node", type=int, default=None,
@@ -1689,6 +1693,15 @@ def main():
     Path(args.output).mkdir(parents=True, exist_ok=True)
 
     update_config_from_args(mgr, args)
+
+    # Validation frequency
+    if hasattr(args, 'val_every_n') and args.val_every_n is not None:
+        if int(args.val_every_n) < 1:
+            raise ValueError(f"--val-every-n must be >= 1, got {args.val_every_n}")
+        setattr(mgr, 'val_every_n', int(args.val_every_n))
+        mgr.tr_configs["val_every_n"] = int(args.val_every_n)
+        if args.verbose:
+            print(f"Validate every {args.val_every_n} epoch(s)")
 
     # Enable DDP if requested or if torchrun sets WORLD_SIZE>1
     if getattr(args, 'ddp', False) or int(os.environ.get('WORLD_SIZE', '1')) > 1:

@@ -175,17 +175,20 @@ def find_valid_patches(label_arrays,
         try:
             if downsample_level == 0:
                 # Use full resolution
-                if hasattr(label_array, '0'):
+                if isinstance(label_array, zarr.Group) and ('0' in label_array):
                     downsampled_array = label_array['0']
                 else:
                     downsampled_array = label_array
             else:
-                # Use downsampled level
-                if hasattr(label_array, str(downsample_level)):
+                # Use downsampled level when available
+                if isinstance(label_array, zarr.Group) and (str(downsample_level) in label_array):
                     downsampled_array = label_array[str(downsample_level)]
                 else:
-                    # For non-multi-resolution zarrs, fall back to full resolution
-                    downsampled_array = label_array['0'] if hasattr(label_array, '0') else label_array
+                    # Fall back to full resolution level '0' if present, otherwise the array itself
+                    if isinstance(label_array, zarr.Group) and ('0' in label_array):
+                        downsampled_array = label_array['0']
+                    else:
+                        downsampled_array = label_array
                     # Update factors since we're using full resolution
                     actual_downsample_factor = 1
                     actual_downsampled_patch_size = patch_size
@@ -214,16 +217,25 @@ def find_valid_patches(label_arrays,
             vol_max_y = downsampled_array.shape[0] if max_y is None else max_y // actual_downsample_factor
             vol_max_x = downsampled_array.shape[1] if max_x is None else max_x // actual_downsample_factor
             
-            # Generate possible start positions for 2D data
-            dpY, dpX = actual_downsampled_patch_size[-2:]  # Take last two dimensions
-            y_step = dpY  # Use full patch size for stepping
-            x_step = dpX  # Use full patch size for stepping
+            # Generate start positions that keep full patches in-bounds
+            dpY, dpX = actual_downsampled_patch_size[-2:]
+            y_step = dpY
+            x_step = dpX
             all_positions = []
-            for y in range(vol_min_y, vol_max_y - dpY + 2, y_step):
-                for x in range(vol_min_x, vol_max_x - dpX + 2, x_step):
+            # Compute in-bounds max starts
+            max_start_y = vol_max_y - dpY
+            max_start_x = vol_max_x - dpX
+            y_positions = list(range(vol_min_y, max_start_y + 1, y_step)) if max_start_y >= vol_min_y else []
+            x_positions = list(range(vol_min_x, max_start_x + 1, x_step)) if max_start_x >= vol_min_x else []
+            if y_positions and (y_positions[-1] + dpY < vol_max_y):
+                y_positions.append(vol_max_y - dpY)
+            if x_positions and (x_positions[-1] + dpX < vol_max_x):
+                x_positions.append(vol_max_x - dpX)
+            for y in y_positions:
+                for x in x_positions:
                     all_positions.append((y, x))
         else:
-            # For 3D data (existing logic)
+            # 3D
             vol_min_z = min_z // actual_downsample_factor if min_z is not None else 0
             vol_min_y = min_y // actual_downsample_factor if min_y is not None else 0
             vol_min_x = min_x // actual_downsample_factor if min_x is not None else 0
@@ -231,15 +243,27 @@ def find_valid_patches(label_arrays,
             vol_max_y = downsampled_array.shape[1] if max_y is None else max_y // actual_downsample_factor
             vol_max_x = downsampled_array.shape[2] if max_x is None else max_x // actual_downsample_factor
             
-            # Generate possible start positions for this volume (at downsampled resolution)
+            # Generate start positions that keep full patches in-bounds
             dpZ, dpY, dpX = actual_downsampled_patch_size
-            z_step = dpZ  # Use full patch size for stepping
-            y_step = dpY  # Use full patch size for stepping
-            x_step = dpX  # Use full patch size for stepping
+            z_step = dpZ
+            y_step = dpY
+            x_step = dpX
             all_positions = []
-            for z in range(vol_min_z, vol_max_z - dpZ + 2, z_step):
-                for y in range(vol_min_y, vol_max_y - dpY + 2, y_step):
-                    for x in range(vol_min_x, vol_max_x - dpX + 2, x_step):
+            max_start_z = vol_max_z - dpZ
+            max_start_y = vol_max_y - dpY
+            max_start_x = vol_max_x - dpX
+            z_positions = list(range(vol_min_z, max_start_z + 1, z_step)) if max_start_z >= vol_min_z else []
+            y_positions = list(range(vol_min_y, max_start_y + 1, y_step)) if max_start_y >= vol_min_y else []
+            x_positions = list(range(vol_min_x, max_start_x + 1, x_step)) if max_start_x >= vol_min_x else []
+            if z_positions and (z_positions[-1] + dpZ < vol_max_z):
+                z_positions.append(vol_max_z - dpZ)
+            if y_positions and (y_positions[-1] + dpY < vol_max_y):
+                y_positions.append(vol_max_y - dpY)
+            if x_positions and (x_positions[-1] + dpX < vol_max_x):
+                x_positions.append(vol_max_x - dpX)
+            for z in z_positions:
+                for y in y_positions:
+                    for x in x_positions:
                         all_positions.append((z, y, x))
         
         if len(all_positions) == 0:
@@ -273,12 +297,30 @@ def find_valid_patches(label_arrays,
                 valid_positions_vol.extend(r.get())
         
         # Add results with proper volume tracking - scale coordinates back to full resolution
+        # Clamp starts to ensure full-size patches are in-bounds at full resolution
+        # Determine full-resolution shape for clamping
+        try:
+            if isinstance(label_array, zarr.Group) and ('0' in label_array):
+                full_res_array = label_array['0']
+            else:
+                full_res_array = label_array
+            full_shape = getattr(full_res_array, 'shape', None)
+        except Exception:
+            full_shape = None
+
         for pos in valid_positions_vol:
             if is_2d:
                 # 2D position (y, x)
                 y, x = pos
                 full_res_y = y * actual_downsample_factor
                 full_res_x = x * actual_downsample_factor
+                # Clamp to ensure full-size patch fits
+                if full_shape is not None:
+                    pY, pX = patch_size[-2:]
+                    max_y = max(0, full_shape[0] - pY)
+                    max_x = max(0, full_shape[1] - pX)
+                    full_res_y = min(full_res_y, max_y)
+                    full_res_x = min(full_res_x, max_x)
                 
                 all_valid_patches.append({
                     'volume_idx': vol_idx,
@@ -291,6 +333,15 @@ def find_valid_patches(label_arrays,
                 full_res_z = z * actual_downsample_factor
                 full_res_y = y * actual_downsample_factor
                 full_res_x = x * actual_downsample_factor
+                # Clamp to ensure full-size patch fits
+                if full_shape is not None:
+                    pZ, pY, pX = patch_size
+                    max_z = max(0, full_shape[0] - pZ)
+                    max_y = max(0, full_shape[1] - pY)
+                    max_x = max(0, full_shape[2] - pX)
+                    full_res_z = min(full_res_z, max_z)
+                    full_res_y = min(full_res_y, max_y)
+                    full_res_x = min(full_res_x, max_x)
                 
                 all_valid_patches.append({
                     'volume_idx': vol_idx,

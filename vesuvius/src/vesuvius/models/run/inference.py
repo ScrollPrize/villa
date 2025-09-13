@@ -958,6 +958,49 @@ class Inferer():
                 raise ValueError("2D model expects 2D TIFF input (H, W)")
             Y, X = img.shape
             pY, pX = self.patch_size
+            # If patch covers the whole image (equal or larger), skip blending/normalization
+            if (pY >= Y and pX >= X):
+                # Prepare single padded patch
+                sub = self._normalize_numpy(img, normalization_scheme, gmean, gstd, iprops)
+                patch = np.zeros((pY, pX), dtype=np.float32)
+                patch[:sub.shape[0], :sub.shape[1]] = sub
+                t = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).to(self.device)
+                with torch.no_grad(), torch.amp.autocast('cuda'):
+                    if self.do_tta:
+                        logits = infer_with_tta(
+                            self.model, t, self.tta_type,
+                            is_multi_task=self.is_multi_task,
+                            concat_multi_task_outputs=self._concat_multi_task_outputs
+                        )
+                    else:
+                        logits = self.model(t)
+                        if self.is_multi_task:
+                            logits = self._concat_multi_task_outputs(logits)
+                out_np = logits.detach().float().cpu().numpy()[0]  # (C,pY,pX)
+                logits_acc = out_np[:, :Y, :X]  # crop to image size, no weighting
+
+                # Convert logits to desired output and save as TIFF
+                if tifffile is None:
+                    raise RuntimeError("tifffile is required for TIFF output but is not installed")
+                mode = self.tiff_activation if self.tiff_activation is not None else ('softmax' if self.save_softmax else 'argmax')
+                if mode == 'softmax':
+                    m = logits_acc.max(axis=0, keepdims=True)
+                    e = np.exp(logits_acc - m)
+                    s = e.sum(axis=0, keepdims=True) + 1e-8
+                    out_arr = (e / s).astype(np.float32)  # (C,Y,X)
+                    out_arr = np.clip(out_arr * 255.0, 0, 255).astype(np.uint8)
+                elif mode == 'argmax':
+                    out_arr = np.argmax(logits_acc, axis=0)  # (Y,X)
+                    if int(self.num_classes) == 2:
+                        out_arr = (out_arr.astype(np.uint8) * 255).astype(np.uint8)
+                    else:
+                        out_arr = out_arr.astype(np.uint8)
+                else:
+                    out_arr = logits_acc.astype(np.float32)
+                tifffile.imwrite(str(out_path), out_arr, compression='zlib')
+                return str(out_path)
+
+            # Regular blending path
             g = generate_gaussian_map((1, pY, pX), sigma_scale=8.0, dtype=np.float32)[0]
             gaussian_map_2d = g[0]
             logits_acc = np.zeros((self.num_classes, Y, X), dtype=np.float32)
@@ -969,6 +1012,54 @@ class Inferer():
                 img = img[np.newaxis, ...]
             Z, Y, X = img.shape  # (Z,Y,X)
             pZ, pY, pX = self.patch_size
+            # If patch covers the whole volume (equal or larger), skip blending/normalization
+            if (pZ >= Z and pY >= Y and pX >= X):
+                sub = self._normalize_numpy(img, normalization_scheme, gmean, gstd, iprops)
+                patch = np.zeros((pZ, pY, pX), dtype=np.float32)
+                patch[:sub.shape[0], :sub.shape[1], :sub.shape[2]] = sub
+                t = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).to(self.device)
+                with torch.no_grad(), torch.amp.autocast('cuda'):
+                    if self.do_tta:
+                        logits = infer_with_tta(
+                            self.model, t, self.tta_type,
+                            is_multi_task=self.is_multi_task,
+                            concat_multi_task_outputs=self._concat_multi_task_outputs
+                        )
+                    else:
+                        logits = self.model(t)
+                        if self.is_multi_task:
+                            logits = self._concat_multi_task_outputs(logits)
+                out_np = logits.detach().float().cpu().numpy()[0]  # (C,pZ,pY,pX)
+                logits_acc = out_np[:, :Z, :Y, :X]  # crop to volume size, no weighting
+
+                # Convert logits to desired output and save as TIFF
+                if tifffile is None:
+                    raise RuntimeError("tifffile is required for TIFF output but is not installed")
+                mode = self.tiff_activation if self.tiff_activation is not None else ('softmax' if self.save_softmax else 'argmax')
+                if mode == 'softmax':
+                    m = logits_acc.max(axis=0, keepdims=True)
+                    e = np.exp(logits_acc - m)
+                    s = e.sum(axis=0, keepdims=True) + 1e-8
+                    out_arr = (e / s).astype(np.float32)  # (C,Z,Y,X)
+                    if Z == 1:
+                        out_arr = out_arr[:, 0, :, :]
+                    out_arr = np.clip(out_arr * 255.0, 0, 255).astype(np.uint8)
+                elif mode == 'argmax':
+                    out_arr = np.argmax(logits_acc, axis=0)  # (Z,Y,X)
+                    if Z == 1:
+                        out_arr = out_arr[0, :, :]
+                    if int(self.num_classes) == 2:
+                        out_arr = (out_arr.astype(np.uint8) * 255).astype(np.uint8)
+                    else:
+                        out_arr = out_arr.astype(np.uint8)
+                else:
+                    out_arr = logits_acc.astype(np.float32)
+                    if Z == 1:
+                        out_arr = out_arr[:, 0, :, :]
+                tifffile.imwrite(str(out_path), out_arr, compression='zlib')
+                return str(out_path)
+
+            # Regular blending path
             gaussian_map = generate_gaussian_map(self.patch_size, sigma_scale=8.0, dtype=np.float32)[0]  # (pZ,pY,pX)
             logits_acc = np.zeros((self.num_classes, Z, Y, X), dtype=np.float32)
             weights_acc = np.zeros((Z, Y, X), dtype=np.float32)
@@ -1061,7 +1152,7 @@ class Inferer():
             run_batch(tensor_batch, batch_coords)
             batch_buf.clear(); batch_coords.clear()
 
-        # Normalize by weights
+        # Normalize by weights (only when using blending)
         eps = 1e-8
         nonzero = weights_acc > 0
         for c in range(self.num_classes):
