@@ -123,6 +123,7 @@ int main(int argc, char* argv[]) {
         size_t total_slices_all_dirs = shape[0] + shape[1] + shape[2];
         std::atomic<size_t> total_processed_all_dirs = 0;
 
+        int dir_idx = 0;
         for (SliceDirection dir : {SliceDirection::XY, SliceDirection::XZ, SliceDirection::YZ}) {
             std::atomic<size_t> processed = 0;
             std::atomic<size_t> skipped = 0;
@@ -331,18 +332,31 @@ int main(int argc, char* argv[]) {
                     if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report_time).count() >= 1) {
                         last_report_time = now;
                         size_t p = processed; // Read atomic once
-                        size_t total_p = total_processed_all_dirs;
-                        auto elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
-                        double slices_per_second = (p - skipped) / elapsed_seconds;
-                        if (slices_per_second == 0) slices_per_second = 1; // Avoid division by zero
-                        double remaining_seconds = (total_slices_all_dirs - total_p) / slices_per_second;
                         
+                        size_t s = skipped;
+                        double dir_progress = static_cast<double>(p) / num_slices;
+                        double total_progress = (static_cast<double>(dir_idx) + dir_progress) / 3.0;
+
+                        auto elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
+                        
+                        size_t actually_processed = p - s;
+                        double slices_per_second = 0;
+                        if (elapsed_seconds > 1.0 && actually_processed > 0) {
+                            slices_per_second = actually_processed / elapsed_seconds;
+                        }
+
+                        double remaining_seconds = std::numeric_limits<double>::infinity();
+                        if (slices_per_second > 0) {
+                            size_t remaining_slices = total_slices_all_dirs - total_processed_all_dirs;
+                            remaining_seconds = remaining_slices / slices_per_second;
+                        }
+
                         int rem_min = static_cast<int>(remaining_seconds) / 60;
                         int rem_sec = static_cast<int>(remaining_seconds) % 60;
 
                         std::cout << dir_str << " " << p << "/" << num_slices
-                                    << " | Total " << total_p << "/" << total_slices_all_dirs
-                                    << " (" << std::fixed << std::setprecision(1) << (100.0 * total_p / total_slices_all_dirs) << "%)"
+                                    << " | Total "
+                                    << " (" << std::fixed << std::setprecision(1) << (total_progress * 100.0) << "%)"
                                     << ", skipped: " << skipped
                                     << ", ETA: " << rem_min << "m " << rem_sec << "s";
                         
@@ -363,6 +377,7 @@ int main(int argc, char* argv[]) {
                                 }
                                 std::cout << ", avg " << key << ": " << avg_time << "s";
                             }
+                            dir_idx++;
                         }
                         std::cout << std::endl;
                     }
