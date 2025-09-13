@@ -496,3 +496,144 @@ struct NormalDirectionLoss {
         return new ceres::AutoDiffCostFunction<NormalDirectionLoss, 1, 3, 3, 3>(new NormalDirectionLoss(normal_dirs, maybe_weights, w));
     }
 };
+
+struct NormalConstraintPlane {
+    static double val(const double& v) { return v; }
+    template <typename JetT>
+    static double val(const JetT& v) { return v.a; }
+
+    const vc::core::util::GridStore& normal_grid;
+    const float roi_radius;
+    const double weight;
+
+    NormalConstraint(const vc::core::util::GridStore& normal_grid, float roi_radius, double weight)
+    : normal_grid(normal_grid), roi_radius(roi_radius), weight(weight) {}
+
+    // Function to calculate the squared distance between two line segments
+    static float seg_dist_sq(cv::Point2f p1, cv::Point2f p2, cv::Point2f p3, cv::Point2f p4) {
+        auto dot = [](cv::Point2f a, cv::Point2f b) { return a.x * b.x + a.y * b.y; };
+        auto dist_sq = [&](cv::Point2f p) { return p.x * p.x + p.y * p.y; };
+
+        cv::Point2f u = p2 - p1;
+        cv::Point2f v = p4 - p3;
+        cv::Point2f w = p1 - p3;
+
+        float a = dot(u, u);
+        float b = dot(u, v);
+        float c = dot(v, v);
+        float d = dot(u, w);
+        float e = dot(v, w);
+        float D = a * c - b * b;
+        float sc, sN, sD = D;
+        float tc, tN, tD = D;
+
+        if (D < 1e-7) {
+            sN = 0.0;
+            sD = 1.0;
+            tN = e;
+            tD = c;
+        } else {
+            sN = (b * e - c * d);
+            tN = (a * e - b * d);
+            if (sN < 0.0) {
+                sN = 0.0;
+                tN = e;
+                tD = c;
+            } else if (sN > sD) {
+                sN = sD;
+                tN = e + b;
+                tD = c;
+            }
+        }
+
+        if (tN < 0.0) {
+            tN = 0.0;
+            if (-d < 0.0) sN = 0.0;
+            else if (-d > a) sN = sD;
+            else {
+                sN = -d;
+                sD = a;
+            }
+        } else if (tN > tD) {
+            tN = tD;
+            if ((-d + b) < 0.0) sN = 0.0;
+            else if ((-d + b) > a) sN = sD;
+            else {
+                sN = (-d + b);
+                sD = a;
+            }
+        }
+
+        sc = (std::abs(sN) < 1e-7 ? 0.0 : sN / sD);
+        tc = (std::abs(tN) < 1e-7 ? 0.0 : tN / tD);
+
+        cv::Point2f dP = w + (sc * u) - (tc * v);
+        return dist_sq(dP);
+    }
+
+    template <typename T>
+    bool operator()(const T* const p1, const T* const p2, T* residual) const {
+        T edge_vec_x = p2[0] - p1[0];
+        T edge_vec_y = p2[1] - p1[1];
+
+        T edge_len_sq = edge_vec_x * edge_vec_x + edge_vec_y * edge_vec_y;
+        if (edge_len_sq < T(1e-12)) {
+            residual[0] = T(0.0);
+            return true;
+        }
+        T edge_len = ceres::sqrt(edge_len_sq);
+
+        T edge_normal_x = edge_vec_y / edge_len;
+        T edge_normal_y = -edge_vec_x / edge_len;
+
+        cv::Point2f midpoint_cv(val(p1[0] + edge_vec_x * 0.5), val(p1[1] + edge_vec_y * 0.5));
+        std::vector<std::shared_ptr<std::vector<cv::Point>>> nearby_paths = normal_grid.get(midpoint_cv, roi_radius);
+
+        residual[0] = T(0.0);
+        if (nearby_paths.empty()) {
+            return true;
+        }
+
+        T total_weighted_dot_product = T(0.0);
+        T total_weight = T(0.0);
+
+        for (const auto& path_ptr : nearby_paths) {
+            const auto& path = *path_ptr;
+            if (path.size() < 2) continue;
+
+            for (size_t i = 0; i < path.size() - 1; ++i) {
+                cv::Point2f p_a = path[i];
+                cv::Point2f p_b = path[i+1];
+
+                cv::Point2f p1_cv(val(p1[0]), val(p1[1]));
+                cv::Point2f p2_cv(val(p2[0]), val(p2[1]));
+
+                float dist_sq = NormalConstraint::seg_dist_sq(p1_cv, p2_cv, p_a, p_b);
+                dist_sq = std::max(0.1f, dist_sq);
+
+                T weight_n = T(1.0 / ceres::sqrt(dist_sq));
+
+                cv::Point2f tangent = p_b - p_a;
+                float length = cv::norm(tangent);
+                if (length > 0) {
+                    tangent /= length;
+                }
+                cv::Point2f normal(-tangent.y, tangent.x);
+
+                T dot_product = ceres::abs(edge_normal_x * T(normal.x) + edge_normal_y * T(normal.y));
+
+                total_weighted_dot_product += weight_n * dot_product;
+                total_weight += weight_n;
+            }
+        }
+
+        if (total_weight > T(1e-9)) {
+            T avg_dot_product = total_weighted_dot_product / total_weight;
+            residual[0] = T(weight) * (T(1.0) - avg_dot_product);
+        } else {
+            residual[0] = T(0.0);
+        }
+
+        return true;
+    }
+};
