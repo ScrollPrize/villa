@@ -44,7 +44,7 @@ int main(int argc, char* argv[]) {
         ("mode", po::value<std::string>()->required(), "Mode to operate in (batch-vol-gen or vis)")
         ("input,i", po::value<std::string>()->required(), "Input path (Zarr volume for batch-vol-gen, .grid file for vis)")
         ("output,o", po::value<std::string>()->required(), "Output path (directory for batch-vol-gen, .tif file for vis)")
-        ("spiral-step", po::value<double>()->default_value(8.0), "Spiral step for resampling (batch-vol-gen only)")
+        ("spiral-step", po::value<double>()->default_value(20.0), "Spiral step for resampling (batch-vol-gen only)")
         ("grid-step", po::value<int>()->default_value(64), "Grid cell size for the GridStore (batch-vol-gen only)")
         ("sparse-volume", po::value<int>()->default_value(4), "Process every N-th slice (batch-vol-gen only)");
 
@@ -74,7 +74,7 @@ int main(int argc, char* argv[]) {
         std::string output_vis = vm["output"].as<std::string>();
 
         vc::core::util::GridStore normal_grid(input_grid);
-        cv::Mat vis = visualize_normal_grid(normal_grid, cv::Size(2048, 2048));
+        cv::Mat vis = visualize_normal_grid(normal_grid, normal_grid.size());
         cv::imwrite(output_vis, vis);
         std::cout << "Visualization saved to " << output_vis << std::endl;
 
@@ -156,13 +156,16 @@ int main(int argc, char* argv[]) {
             if (num_threads == 0) {
                 num_threads = 1;
             }
+            int sparse_volume = vm["sparse-volume"].as<int>();
+            if (!sparse_volume)
+                sparse_volume = 1;
+            int chunk_size_tgt = num_threads*sparse_volume;
 
-            for (size_t chunk_start = 0; chunk_start < num_slices; chunk_start += num_threads) {
-                size_t chunk_end = std::min(chunk_start + num_threads, num_slices);
+            for (size_t chunk_start = 0; chunk_start < num_slices; chunk_start += chunk_size_tgt) {
+                size_t chunk_end = std::min(chunk_start + chunk_size_tgt, num_slices);
                 size_t chunk_size = chunk_end - chunk_start;
 
                 bool all_exist = true;
-                int sparse_volume = vm["sparse-volume"].as<int>();
                 for (size_t i = chunk_start; i < chunk_end; ++i) {
                     if (i % sparse_volume != 0) {
                         continue;
@@ -201,14 +204,16 @@ int main(int argc, char* argv[]) {
                         break;
                 }
 
-                xt::xtensor<uint8_t, 3, xt::layout_type::column_major> chunk_data = xt::zeros<uint8_t>(chunk_shape);
                 ALifeTime chunk_timer;
+                xt::xtensor<uint8_t, 3, xt::layout_type::column_major> chunk_data = xt::xtensor<uint8_t, 3, xt::layout_type::column_major>::from_shape(chunk_shape);
+                chunk_timer.mark("xtensor init");
                 readArea3D(chunk_data, chunk_offset, ds.get(), &cache);
                 chunk_timer.mark("read_chunk");
 
                 for(const auto& mark : chunk_timer.getMarks()) {
                     timings[mark.first].count++;
                     timings[mark.first].total_time += mark.second;
+                    std::cout << mark.first << " " << mark.second << std::endl;
                 }
 
 
