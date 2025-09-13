@@ -336,7 +336,13 @@ int main(int argc, char* argv[]) {
                                     << " | Total " << total_p << "/" << total_slices_all_dirs
                                     << " (" << std::fixed << std::setprecision(1) << (100.0 * total_p / total_slices_all_dirs) << "%)"
                                     << ", skipped: " << skipped
-                                    << ", ETA: " << rem_min << "m " << rem_sec << "s"
+                                    << ", ETA: " << rem_min << "m " << rem_sec << "s";
+                        
+                        auto finish_time_point = std::chrono::system_clock::now() + std::chrono::seconds(static_cast<long>(remaining_seconds));
+                        std::time_t finish_time = std::chrono::system_clock::to_time_t(finish_time_point);
+                        std::tm* finish_tm = std::localtime(&finish_time);
+
+                        std::cout << " (finish at " << std::put_time(finish_tm, "%H:%M:%S") << ")"
                                     << ", avg size: " << (total_size / (p - skipped))
                                     << ", avg segments: " << (total_segments / (p - skipped))
                                     << ", avg buckets: " << (total_buckets / (p - skipped));
