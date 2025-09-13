@@ -162,7 +162,11 @@ int main(int argc, char* argv[]) {
                 size_t chunk_size = chunk_end - chunk_start;
 
                 bool all_exist = true;
+                int sparse_volume = vm["sparse-volume"].as<int>();
                 for (size_t i = chunk_start; i < chunk_end; ++i) {
+                    if (i % sparse_volume != 0) {
+                        continue;
+                    }
                     char filename[256];
                     snprintf(filename, sizeof(filename), "%06zu.grid", i);
                     std::string out_path = (output_fs_path / dir_str / filename).string();
