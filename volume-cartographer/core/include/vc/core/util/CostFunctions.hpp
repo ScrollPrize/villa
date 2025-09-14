@@ -527,28 +527,38 @@ struct NormalConstraintPlane {
     bool operator()(const T* const pA, const T* const pB1, const T* const pB2, const T* const pC, T* residual) const {
         residual[0] = T(0.0);
 
-        T a_coord = pA[plane_idx];
+        // Use consistent XYZ indexing. plane_idx 0=XY (normal Z), 1=XZ (normal Y), 2=YZ (normal X)
+        int normal_axis = 2 - plane_idx;
+        T a_coord = pA[normal_axis];
 
-        T b1_rel = pB1[plane_idx] - a_coord;
-        T b2_rel = pB2[plane_idx] - a_coord;
-        T c_rel = pC[plane_idx] - a_coord;
+        T b1_rel = pB1[normal_axis] - a_coord;
+        T b2_rel = pB2[normal_axis] - a_coord;
+        T c_rel = pC[normal_axis] - a_coord;
 
         // Skip if all points are on the same side of the plane P through A.
-        if ((b1_rel >= T(0) && b2_rel >= T(0) && c_rel >= T(0)) ||
-            (b1_rel <= T(0) && b2_rel <= T(0) && c_rel <= T(0))) {
+        if ((b1_rel > T(0) && b2_rel > T(0) && c_rel > T(0)) ||
+            (b1_rel < T(0) && b2_rel < T(0) && c_rel < T(0))) {
             return true;
         }
 
         const T* pBn = nullptr;
         T bn_rel;
 
-        // Choose Bn on the opposite side of C.
-        if (c_rel > T(0)) {
-            if (b1_rel < T(0)) { pBn = pB1; bn_rel = b1_rel; }
-            else if (b2_rel < T(0)) { pBn = pB2; bn_rel = b2_rel; }
-        } else if (c_rel < T(0)) {
-            if (b1_rel > T(0)) { pBn = pB1; bn_rel = b1_rel; }
-            else if (b2_rel > T(0)) { pBn = pB2; bn_rel = b2_rel; }
+        // Choose Bn.
+        if (ceres::abs(c_rel) < T(1e-9)) { // If C is on the plane...
+            // ...choose a B that is not on the plane.
+            //TODO choose the large one!
+            if (ceres::abs(b1_rel) > T(1e-9)) { pBn = pB1; bn_rel = b1_rel; }
+            else if (ceres::abs(b2_rel) > T(1e-9)) { pBn = pB2; bn_rel = b2_rel; }
+        } else { // If C is not on the plane...
+            // ...choose a B on the opposite side of C (inclusive).
+            if (c_rel > T(0)) {
+                if (b1_rel <= T(0)) { pBn = pB1; bn_rel = b1_rel; }
+                else if (b2_rel <= T(0)) { pBn = pB2; bn_rel = b2_rel; }
+            } else { // c_rel < T(0)
+                if (b1_rel >= T(0)) { pBn = pB1; bn_rel = b1_rel; }
+                else if (b2_rel >= T(0)) { pBn = pB2; bn_rel = b2_rel; }
+            }
         }
 
         if (pBn == nullptr) {
@@ -556,7 +566,11 @@ struct NormalConstraintPlane {
         }
 
         // Intersection of segment C-Bn with plane P.
-        T t = -c_rel / (bn_rel - c_rel);
+        T denominator = bn_rel - c_rel;
+        if (ceres::abs(denominator) < T(1e-9)) {
+            return true; // Avoid division by zero if segment is parallel to plane.
+        }
+        T t = -c_rel / denominator;
         T pE[3];
         for (int i = 0; i < 3; ++i) {
             pE[i] = pC[i] + t * (pBn[i] - pC[i]);
@@ -565,11 +579,15 @@ struct NormalConstraintPlane {
         // Project A and E onto the 2D plane.
         T pA_2d[2], pE_2d[2];
         int coord_idx = 0;
-        for (int i = 0; i < 3; ++i) {
-            if (i == plane_idx) continue;
-            pA_2d[coord_idx] = pA[i];
-            pE_2d[coord_idx] = pE[i];
-            coord_idx++;
+        if (plane_idx == 0) { // XY plane
+            pA_2d[0] = pA[0]; pA_2d[1] = pA[1];
+            pE_2d[0] = pE[0]; pE_2d[1] = pE[1];
+        } else if (plane_idx == 1) { // XZ plane
+            pA_2d[0] = pA[0]; pA_2d[1] = pA[2];
+            pE_2d[0] = pE[0]; pE_2d[1] = pE[2];
+        } else { // YZ plane
+            pA_2d[0] = pA[1]; pA_2d[1] = pA[2];
+            pE_2d[0] = pE[1]; pE_2d[1] = pE[2];
         }
 
         // Query the normal grids.
@@ -585,25 +603,25 @@ struct NormalConstraintPlane {
         T interpolated_loss = (T(1.0) - T(grid_query->weight)) * loss1 + T(grid_query->weight) * loss2;
 
         // Calculate angular weight.
-        T v_abn[3], v_ac[3];
+        double v_abn[3], v_ac[3];
         for(int i=0; i<3; ++i) {
-            v_abn[i] = pBn[i] - pA[i];
-            v_ac[i] = pC[i] - pA[i];
+            v_abn[i] = val(pBn[i]) - val(pA[i]);
+            v_ac[i] = val(pC[i]) - val(pA[i]);
         }
 
-        T cross_product[3] = {
+        double cross_product[3] = {
             v_abn[1] * v_ac[2] - v_abn[2] * v_ac[1],
             v_abn[2] * v_ac[0] - v_abn[0] * v_ac[2],
             v_abn[0] * v_ac[1] - v_abn[1] * v_ac[0]
         };
 
-        T cross_len = ceres::sqrt(cross_product[0]*cross_product[0] + cross_product[1]*cross_product[1] + cross_product[2]*cross_product[2]);
-        T plane_normal_coord = cross_product[plane_idx];
+        double cross_len = std::sqrt(cross_product[0]*cross_product[0] + cross_product[1]*cross_product[1] + cross_product[2]*cross_product[2]);
+        double plane_normal_coord = cross_product[normal_axis];
         
-        T cos_angle = plane_normal_coord / (cross_len + T(1e-9));
-        T angle_weight = T(1.0) - cos_angle * cos_angle; // sin^2(angle)
+        double cos_angle = plane_normal_coord / (cross_len + 1e-9);
+        double angle_weight = 1.0 - cos_angle * cos_angle; // sin^2(angle)
 
-        residual[0] = T(weight) * interpolated_loss * angle_weight;
+        residual[0] = T(weight) * interpolated_loss * T(angle_weight);
 
         return true;
     }
@@ -623,7 +641,7 @@ struct NormalConstraintPlane {
         T edge_normal_y = -edge_vec_x / edge_len;
 
         cv::Point2f midpoint_cv(val(p1[0] + edge_vec_x * 0.5), val(p1[1] + edge_vec_y * 0.5));
-        std::vector<std::shared_ptr<std::vector<cv::Point>>> nearby_paths = normal_grid.get(midpoint_cv, 10.0f); // FIXME: ROI radius
+        std::vector<std::shared_ptr<std::vector<cv::Point>>> nearby_paths = normal_grid.get(midpoint_cv, 64.0f); // FIXME: ROI radius
 
         if (nearby_paths.empty()) {
             return T(0.0);
