@@ -1100,20 +1100,20 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             }
         }
         else {
+            // if (generation > 10 && global_opt) {
+            //     // Beyond 10 generations but while still trying global re-solves, simplify the big problem by fixing locations
+            //     // of points that are already 'certain', in the sense they are not near any other points that don't yet have valid
+            //     // locations
+            //     cv::Mat_<cv::Vec2d> _empty;
+            //     freeze_inner_params(big_problem, 10, state, locs, _empty, loss_status, STATE_LOC_VALID | STATE_COORD_VALID);
+            // }
+
             // For early generations, re-solve the big problem, jointly optimising the locations of all points in the patch
             std::cout << "running big solve" << std::endl;
             ceres::Solve(options_big, &big_problem, &big_summary);
             std::cout << big_summary.BriefReport() << "\n";
             std::cout << "avg err: " << sqrt(big_summary.final_cost/big_summary.num_residual_blocks) << std::endl;
         }
-
-        // if (generation > 10 && global_opt) {
-        //     // Beyond 10 generations but while still trying global re-solves, simplify the big problem by fixing locations
-        //     // of points that are already 'certain', in the sense they are not near any other points that don't yet have valid
-        //     // locations
-        //     cv::Mat_<cv::Vec2d> _empty;
-        //     freeze_inner_params(big_problem, 10, state, locs, _empty, loss_status, STATE_LOC_VALID | STATE_COORD_VALID);
-        // }
 
         cands.resize(0);
 
