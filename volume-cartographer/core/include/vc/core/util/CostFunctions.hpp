@@ -619,7 +619,7 @@ struct NormalConstraintPlane {
         double plane_normal_coord = cross_product[normal_axis];
         
         double cos_angle = plane_normal_coord / (cross_len + 1e-9);
-        double angle_weight = 1.0 - cos_angle * cos_angle; // sin^2(angle)
+        double angle_weight = 1.0 - abs(cos_angle) ;// * cos_angle; // sin^2(angle)
 
         residual[0] = T(weight) * interpolated_loss * T(angle_weight);
 
@@ -664,7 +664,8 @@ struct NormalConstraintPlane {
                 float dist_sq = seg_dist_sq(p1_cv, p2_cv, p_a, p_b);
                 dist_sq = std::max(0.1f, dist_sq);
 
-                T weight_n = T(1.0 / std::sqrt(dist_sq));
+                // T weight_n = T(1.0 / std::sqrt(dist_sq));
+                T weight_n = T(1.0 / dist_sq);
 
                 cv::Point2f tangent = p_b - p_a;
                 float length = cv::norm(tangent);
