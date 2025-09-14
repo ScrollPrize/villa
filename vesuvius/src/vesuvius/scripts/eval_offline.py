@@ -275,6 +275,7 @@ def evaluate_dataset(
     per_image_stats: List[Dict[str, float]] = []
     per_image_rows: List[Tuple[str, Dict[str, float]]] = []
     per_image_rows: List[Tuple[str, Dict[str, float]]] = []
+    per_image_rows: List[Tuple[str, Dict[str, float]]] = []
 
     for img_path in tqdm(image_list, desc="Processing images", unit="img"):
         base_name = img_path.stem
@@ -420,6 +421,7 @@ def evaluate_labels_predictions(
     num_classes: int,
     metrics: List[str],
     num_workers: int = 1,
+    progress_desc: Optional[str] = None,
 ) -> Dict[str, float]:
     # Collect label files
     if not labels_dir.exists() or not labels_dir.is_dir():
@@ -439,6 +441,7 @@ def evaluate_labels_predictions(
             f"Missing {len(missing)} prediction file(s) in {predictions_dir} matching labels: {missing_str}")
 
     per_image_stats: List[Dict[str, float]] = []
+    per_image_rows: List[Tuple[str, Dict[str, float]]] = []
 
     if num_workers and num_workers > 1:
         tasks = []
@@ -450,7 +453,8 @@ def evaluate_labels_predictions(
 
         with ProcessPoolExecutor(max_workers=num_workers) as ex:
             futures = [ex.submit(_evaluate_one_label_pred_task, *t) for t in tasks]
-            for fut in tqdm(as_completed(futures), total=len(futures), desc="Evaluating predictions (parallel)", unit="img"):
+            desc = f"{progress_desc} (parallel)" if progress_desc else "Evaluating predictions (parallel)"
+            for fut in tqdm(as_completed(futures), total=len(futures), desc=desc, unit="img"):
                 try:
                     name_stats = fut.result()
                 except Exception as e:
@@ -466,7 +470,8 @@ def evaluate_labels_predictions(
     else:
         # Serial path
         metric_objs = build_metrics(metrics, num_classes=num_classes)
-        for label_path in tqdm(label_list, desc="Evaluating predictions", unit="img"):
+        desc = progress_desc if progress_desc else "Evaluating predictions"
+        for label_path in tqdm(label_list, desc=desc, unit="img"):
             pred_path = predictions_dir / label_path.name
             base_name = label_path.stem
             out_dir = output_root / base_name
@@ -764,6 +769,7 @@ def main():
                         num_classes=args.num_classes,
                         metrics=metrics,
                         num_workers=max(1, int(args.num_workers or 1)),
+                        progress_desc=run_dir.name,
                     )
                     if args.csv:
                         csv_path = Path(args.csv)
@@ -788,6 +794,7 @@ def main():
                 num_classes=args.num_classes,
                 metrics=metrics,
                 num_workers=max(1, int(args.num_workers or 1)),
+                progress_desc=predictions_dir.name,
             )
             csv_row_name = predictions_dir.name
         else:
