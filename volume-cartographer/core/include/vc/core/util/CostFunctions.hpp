@@ -520,6 +520,15 @@ struct NormalConstraintPlane {
     const int plane_idx; // 0: XY, 1: XZ, 2: YZ
     const double weight;
 
+    // Caching for nearby paths
+    mutable cv::Point2f cached_midpoint1_ = {-1, -1};
+    mutable std::vector<std::shared_ptr<std::vector<cv::Point>>> cached_paths1_;
+    mutable cv::Point2f cached_midpoint2_ = {-1, -1};
+    mutable std::vector<std::shared_ptr<std::vector<cv::Point>>> cached_paths2_;
+    const float cache_radius_ = 16.0f;
+    const float roi_radius_ = 64.0f;
+    const float query_radius_ = roi_radius_ + 16.0f;
+
     NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight)
         : normal_grid_volume(normal_grid_volume), plane_idx(plane_idx), weight(weight) {}
 
@@ -598,8 +607,8 @@ struct NormalConstraintPlane {
         }
 
         // Calculate normal loss for both grid planes and interpolate.
-        T loss1 = calculate_normal_loss(pA_2d, pE_2d, *grid_query->grid1);
-        T loss2 = calculate_normal_loss(pA_2d, pE_2d, *grid_query->grid2);
+        T loss1 = calculate_normal_loss(pA_2d, pE_2d, *grid_query->grid1, true);
+        T loss2 = calculate_normal_loss(pA_2d, pE_2d, *grid_query->grid2, false);
         T interpolated_loss = (T(1.0) - T(grid_query->weight)) * loss1 + T(grid_query->weight) * loss2;
 
         // Calculate angular weight.
@@ -629,7 +638,7 @@ struct NormalConstraintPlane {
     }
 
     template <typename T>
-    T calculate_normal_loss(const T* p1, const T* p2, const vc::core::util::GridStore& normal_grid) const {
+    T calculate_normal_loss(const T* p1, const T* p2, const vc::core::util::GridStore& normal_grid, bool is_grid1) const {
         T edge_vec_x = p2[0] - p1[0];
         T edge_vec_y = p2[1] - p1[1];
 
@@ -643,11 +652,21 @@ struct NormalConstraintPlane {
         T edge_normal_y = -edge_vec_x / edge_len;
 
         cv::Point2f midpoint_cv(val(p1[0] + edge_vec_x * 0.5), val(p1[1] + edge_vec_y * 0.5));
-        std::vector<std::shared_ptr<std::vector<cv::Point>>> nearby_paths = normal_grid.get(midpoint_cv, 64.0f); // FIXME: ROI radius
 
-        if (nearby_paths.empty()) {
+        auto& cached_midpoint = is_grid1 ? cached_midpoint1_ : cached_midpoint2_;
+        auto& cached_paths = is_grid1 ? cached_paths1_ : cached_paths2_;
+
+        float dx = midpoint_cv.x - cached_midpoint.x;
+        float dy = midpoint_cv.y - cached_midpoint.y;
+        if (dx * dx + dy * dy > cache_radius_ * cache_radius_) {
+            cached_paths = normal_grid.get(midpoint_cv, query_radius_);
+            cached_midpoint = midpoint_cv;
+        }
+
+        if (cached_paths.empty()) {
             return T(0.0);
         }
+        const auto& nearby_paths = cached_paths;
 
         T total_weighted_dot_product = T(0.0);
         T total_weight = T(0.0);
@@ -663,10 +682,11 @@ struct NormalConstraintPlane {
                 cv::Point2f p1_cv(val(p1[0]), val(p1[1]));
                 cv::Point2f p2_cv(val(p2[0]), val(p2[1]));
 
-                float dist_sq = seg_dist_sq(p1_cv, p2_cv, p_a, p_b);
+                float dist_sq = seg_dist_sq_appx(p1_cv, p2_cv, p_a, p_b);
+                if (dist_sq > roi_radius_*roi_radius_)
+                    continue;
                 dist_sq = std::max(0.1f, dist_sq);
 
-                // T weight_n = T(1.0 / std::sqrt(dist_sq));
                 T weight_n = T(1.0 / dist_sq);
 
                 cv::Point2f tangent = p_b - p_a;
@@ -688,6 +708,14 @@ struct NormalConstraintPlane {
             return (T(1.0) - avg_dot_product);
         }
         return T(0.0);
+    }
+
+    static float seg_dist_sq_appx(cv::Point2f p1, cv::Point2f p2, cv::Point2f p3, cv::Point2f p4)
+    {
+        cv::Point2f p = 0.5*(p1+p2);
+        cv::Point2f s = 0.5*(p3+p4);
+        cv::Point2f d = p-s;
+        return d.x*d.x+d.y*d.y;
     }
 
     static float seg_dist_sq(cv::Point2f p1, cv::Point2f p2, cv::Point2f p3, cv::Point2f p4) {
