@@ -620,6 +620,8 @@ struct NormalConstraintPlane {
         
         double cos_angle = plane_normal_coord / (cross_len + 1e-9);
         double angle_weight = 1.0 - abs(cos_angle) ;// * cos_angle; // sin^2(angle)
+        //good but slow?
+        // double angle_weight = sqrt(1.0 - abs(cos_angle)+1e-9); // * cos_angle; // sin^2(angle)
 
         residual[0] = T(weight) * interpolated_loss * T(angle_weight);
 
