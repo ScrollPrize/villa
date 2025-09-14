@@ -49,48 +49,6 @@
         <number>0</number>
        </property>
        <item>
-        <layout class="QHBoxLayout" name="toolButtonLayout">
-         <item>
-          <widget class="QPushButton" name="btnSegTool">
-           <property name="sizePolicy">
-            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
-             <horstretch>0</horstretch>
-             <verstretch>0</verstretch>
-            </sizepolicy>
-           </property>
-           <property name="text">
-            <string>Segmentation Tool</string>
-           </property>
-           <property name="icon">
-            <iconset theme="format-justify-fill"/>
-           </property>
-           <property name="checkable">
-            <bool>true</bool>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QPushButton" name="btnPenTool">
-           <property name="sizePolicy">
-            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
-             <horstretch>0</horstretch>
-             <verstretch>0</verstretch>
-            </sizepolicy>
-           </property>
-           <property name="text">
-            <string>Pen Tool</string>
-           </property>
-           <property name="icon">
-            <iconset theme="edit-find-replace"/>
-           </property>
-           <property name="checkable">
-            <bool>true</bool>
-           </property>
-          </widget>
-         </item>
-        </layout>
-       </item>
-       <item>
         <layout class="QVBoxLayout" name="viewerLayout">
          <item>
           <widget class="QTabWidget" name="tabWidget">

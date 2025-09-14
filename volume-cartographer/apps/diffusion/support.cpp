@@ -72,10 +72,7 @@ void visualize_normal_grid(const vc::core::util::GridStore& normal_grid, const c
 
 std::pair<SkeletonGraph, cv::Mat> generate_skeleton_graph(const cv::Mat& binary_slice, const po::variables_map& vm) {
     cv::Mat skeleton;
-    {
-        ALifeTime t("thinning");
-        cv::ximgproc::thinning(binary_slice, skeleton, cv::ximgproc::THINNING_GUOHALL);
-    }
+    cv::ximgproc::thinning(binary_slice, skeleton, cv::ximgproc::THINNING_GUOHALL);
 
     SkeletonGraph g;
     cv::Mat skeleton_id_img = cv::Mat::zeros(skeleton.size(), CV_32S);

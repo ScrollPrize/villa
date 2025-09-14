@@ -536,7 +536,8 @@ static int cond_surftrack_surfloss(int type, SurfaceMeta *sm, const cv::Vec2i& p
 }
 
 //will optimize only the center point
-static int surftrack_add_local(SurfaceMeta *sm, const cv::Vec2i& p, SurfTrackerData &data, ceres::Problem &problem, const cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points, float step, float src_step, int flags = 0, int *straigh_count_ptr = nullptr)
+static int surftrack_add_local(SurfaceMeta *sm, const cv::Vec2i& p, SurfTrackerData &data, ceres::Problem &problem,
+    const cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points, float step, float src_step, int flags = 0, int *straigh_count_ptr = nullptr)
 {
     int count = 0;
     int count_straight = 0;
@@ -798,8 +799,7 @@ static cv::Mat_<cv::Vec3f> surftrack_genpoints_hr(
                         }
                 }
             }
-            // [CONNECTIVITY FIX] Inpaint each missing HR sample individually (not just when the center is empty).
-            if (inpaint) {
+            if (!weights_hr(j*step+1,i*step+1) && inpaint) {
                 const cv::Vec3d& c00 = points(j,i);
                 const cv::Vec3d& c01 = points(j,i+1);
                 const cv::Vec3d& c10 = points(j+1,i);
@@ -1043,10 +1043,6 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     cv::Mat_<cv::Vec3d> points_out(points.size(), {-1,-1,-1});
     cv::Mat_<uint8_t> state_out(state.size(), 0);
     cv::Mat_<uint8_t> support_count(state.size(), 0);
-
-    // [APPROVED FIX] track if a remapped pixel had an approved surface in its LR neighborhood
-    cv::Mat_<uint8_t> approved_near(state.size(), 0);
-
     std::cout << "remap: start used_area=" << used_area << " parallel=" << (remap_parallel?1:0) << std::endl;
 #pragma omp parallel for if(remap_parallel)
     for(int j=used_area.y;j<used_area.br().y;j++)
@@ -1109,10 +1105,6 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                         }
                     }
 
-                    // [APPROVED FIX] remember if this output pixel is near any approved surface
-                    if (!approved_neighborhood.empty())
-                        approved_near(j,i) = 1;
-
                     // Relax acceptance for locally-approved surfaces (configurable)
                     const float approved_attach_relax = hr_attach_relax_factor;
 
@@ -1120,8 +1112,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                         auto ptr = s->surface()->pointer();
                         const bool is_locally_approved = approved_neighborhood.contains(s);
                         const float thr = same_surface_th * (is_locally_approved ? approved_attach_relax : 1.0f);
-                        // [APPROVED FIX] use relaxed thr also inside pointTo
-                        float res = s->surface()->pointTo(ptr, points_out(j, i), thr, 10);
+                        float res = s->surface()->pointTo(ptr, points_out(j, i), same_surface_th, 10);
                         if (res <= thr) {
                             mutex.lock();
                             data_out.surfs({j,i}).insert(s);
@@ -1140,8 +1131,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                         cv::Vec3f best_loc_raw;
                         for (auto s : approved_neighborhood) {
                             auto ptr = s->surface()->pointer();
-                            float thr = same_surface_th * approved_attach_relax;
-                            float res = s->surface()->pointTo(ptr, points_out(j, i), thr, 10); // [APPROVED FIX]
+                            float res = s->surface()->pointTo(ptr, points_out(j, i), same_surface_th, 10);
                             if (res < best_res) {
                                 best_res = res;
                                 best_s = s;
@@ -1243,25 +1233,14 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
         for(int i=used_area.x;i<used_area.br().x-1;i++)
             if (!static_bounds.contains(cv::Point(i,j))) {
                 if (state_out(j,i) & STATE_LOC_VALID) {
-                    // [APPROVED FIX] don't drop pixels in approved neighborhoods; keep geometry even if no surface attached
                     if (data_out.surfs({j,i}).empty() && support_count(j,i) == 0) {
-                        if (approved_near(j,i)) {
-                            state_out(j,i) = STATE_COORD_VALID;
-                            // keep points_out(j,i) as-is
-                        } else {
-                            state_out(j,i) = 0;
-                            points_out(j, i) = {-1,-1,-1};
-                        }
-                    }
-                }
-                else {
-                    // no loc; only keep if approved neighborhood exists
-                    if (approved_near(j,i)) {
-                        state_out(j,i) = STATE_COORD_VALID;
-                    } else {
                         state_out(j,i) = 0;
                         points_out(j, i) = {-1,-1,-1};
                     }
+                }
+                else {
+                    state_out(j,i) = 0;
+                    points_out(j, i) = {-1,-1,-1};
                 }
             }
 
@@ -1747,27 +1726,24 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
             if (points(p)[0] != -1)
                 throw std::runtime_error("oops points(p)[0]");
 
-            // Guard against duplicating existing 3D coords, even for approved shortcuts.
-            // Previously this ran only for non-approved picks, which could result in
-            // repeated identical quads when growing right with approved surfaces.
-            if (best_inliers >= curr_best_inl_th || best_ref_seed)
+            if (!best_approved && (best_inliers >= curr_best_inl_th || best_ref_seed))
             {
                 if (enforce_z_range && (best_coord[2] < z_min || best_coord[2] > z_max)) {
                     // Final guard: reject best candidate outside z-range
                     best_inliers = -1;
                     best_ref_seed = false;
                 } else {
-                    cv::Vec2f tmp_loc_;
-                    cv::Rect used_th = used_area;
-                    float dist = pointTo(tmp_loc_, points(used_th), best_coord, same_surface_th, 1000, 1.0/(step*src_step));
-                    tmp_loc_ += cv::Vec2f(used_th.x,used_th.y);
-                    if (dist <= same_surface_th) {
-                        int state_sum = state(tmp_loc_[1],tmp_loc_[0]) + state(tmp_loc_[1]+1,tmp_loc_[0]) + state(tmp_loc_[1],tmp_loc_[0]+1) + state(tmp_loc_[1]+1,tmp_loc_[0]+1);
-                        best_inliers = -1;
-                        best_ref_seed = false;
-                        if (!state_sum)
-                            throw std::runtime_error("this should not have any location?!");
-                    }
+                cv::Vec2f tmp_loc_;
+                cv::Rect used_th = used_area;
+                float dist = pointTo(tmp_loc_, points(used_th), best_coord, same_surface_th, 1000, 1.0/(step*src_step));
+                tmp_loc_ += cv::Vec2f(used_th.x,used_th.y);
+                if (dist <= same_surface_th) {
+                    int state_sum = state(tmp_loc_[1],tmp_loc_[0]) + state(tmp_loc_[1]+1,tmp_loc_[0]) + state(tmp_loc_[1],tmp_loc_[0]+1) + state(tmp_loc_[1]+1,tmp_loc_[0]+1);
+                    best_inliers = -1;
+                    best_ref_seed = false;
+                    if (!state_sum)
+                        throw std::runtime_error("this should not have any location?!");
+                }
                 }
             }
 
@@ -1798,14 +1774,11 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                     auto ptr = test_surf->surface()->pointer();
                     if (test_surf->surface()->pointTo(ptr, best_coord, same_surface_th, 10) <= same_surface_th) {
                         cv::Vec3f loc = test_surf->surface()->loc_raw(ptr);
-                        cv::Vec3f coord = SurfTrackerData::lookup_int_loc(test_surf, {loc[1], loc[0]});
-                        if (coord[0] == -1) {
-                            continue;
-                        }
+                        data_th.loc(test_surf, p) = {loc[1], loc[0]};
                         int count = 0;
-                        float cost = local_cost_destructive(test_surf, p, data_th, state, points, step, src_step, loc, &count);
+                        float cost = local_cost(test_surf, p, data_th, state, points, step, src_step, &count);
+                        //FIXME opt then check all in extra again!
                         if (cost < local_cost_inl_th) {
-                            data_th.loc(test_surf, p) = {loc[1], loc[0]};
                             data_th.surfs(p).insert(test_surf);
                             if (approved_sm.contains(test_surf)) data_th.setApproved(test_surf, p); // [APPROVED]
                             surftrack_add_local(test_surf, p, data_th, problem, state, points, step, src_step, SURF_LOSS | LOSS_ZLOC);
