@@ -763,11 +763,6 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         std::cout << big_summary.BriefReport() << "\n";
     }
 
-    big_problem.SetParameterBlockConstant(&locs(y0,x0)[0]);
-    big_problem.SetParameterBlockConstant(&locs(y0,x0+1)[0]);
-    big_problem.SetParameterBlockConstant(&locs(y0+1,x0)[0]);
-    big_problem.SetParameterBlockConstant(&locs(y0+1,x0+1)[0]);
-
     // Prepare a new set of Ceres options used later during local solves
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::DENSE_QR;
@@ -790,6 +785,15 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
 
     while (!fringe.empty()) {
         bool global_opt = true; //generation <= 20;
+        // bool global_opt = generation <= 20;
+
+        //stop drifting after some initial opt
+        if (generation == 2) {
+            big_problem.SetParameterBlockConstant(&locs(y0,x0)[0]);
+            big_problem.SetParameterBlockConstant(&locs(y0,x0+1)[0]);
+            big_problem.SetParameterBlockConstant(&locs(y0+1,x0)[0]);
+            big_problem.SetParameterBlockConstant(&locs(y0+1,x0+1)[0]);
+        }
 
         ALifeTime timer_gen;
         timer_gen.del_msg = "time per generation ";
@@ -1074,7 +1078,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             options_big.max_num_iterations = 100;
         }
         else
-            options_big.minimizer_progress_to_stdout = true;
+            options_big.minimizer_progress_to_stdout = false    ;
 
         if (!global_opt) {
             // For late generations, instead of re-solving the global problem, solve many local-ish problems, around each

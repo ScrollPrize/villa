@@ -528,6 +528,8 @@ struct NormalConstraintPlane {
     const float cache_radius_ = 16.0f;
     const float roi_radius_ = 64.0f;
     const float query_radius_ = roi_radius_ + 16.0f;
+    const double snap_trig_th_ = 4.0;
+    const double snap_search_range_ = 8.0;
 
     NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight)
         : normal_grid_volume(normal_grid_volume), plane_idx(plane_idx), weight(weight) {}
@@ -607,8 +609,8 @@ struct NormalConstraintPlane {
         }
 
         // Calculate normal loss for both grid planes and interpolate.
-        T loss1 = calculate_normal_loss(pA_2d, pE_2d, *grid_query->grid1, true);
-        T loss2 = calculate_normal_loss(pA_2d, pE_2d, *grid_query->grid2, false);
+        T loss1 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid1, true);
+        T loss2 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid2, false);
         T interpolated_loss = (T(1.0) - T(grid_query->weight)) * loss1 + T(grid_query->weight) * loss2;
 
         // Calculate angular weight.
@@ -637,8 +639,46 @@ struct NormalConstraintPlane {
         return true;
     }
 
+    static float point_line_dist_sq(const cv::Point2f& p, const cv::Point2f& a, const cv::Point2f& b) {
+        cv::Point2f ab = b - a;
+        cv::Point2f ap = p - a;
+        float ab_len_sq = ab.dot(ab);
+        if (ab_len_sq < 1e-9) {
+            return ap.dot(ap);
+        }
+        float t = ap.dot(ab) / ab_len_sq;
+        t = std::max(0.0f, std::min(1.0f, t));
+        cv::Point2f projection = a + t * ab;
+        return (p - projection).dot(p - projection);
+    }
+
     template <typename T>
-    T calculate_normal_loss(const T* p1, const T* p2, const vc::core::util::GridStore& normal_grid, bool is_grid1) const {
+    static T point_line_dist_sq_differentiable(const T* p, const cv::Point2f& a, const cv::Point2f& b) {
+        T ab_x = T(b.x - a.x);
+        T ab_y = T(b.y - a.y);
+        T ap_x = p[0] - T(a.x);
+        T ap_y = p[1] - T(a.y);
+
+        T ab_len_sq = ab_x * ab_x + ab_y * ab_y;
+        if (ab_len_sq < T(1e-9)) {
+            return ap_x * ap_x + ap_y * ap_y;
+        }
+        T t = (ap_x * ab_x + ap_y * ab_y) / ab_len_sq;
+
+        // Clamping t using conditionals that are safe for Jets
+        if (t < T(0.0)) t = T(0.0);
+        if (t > T(1.0)) t = T(1.0);
+
+        T proj_x = T(a.x) + t * ab_x;
+        T proj_y = T(a.y) + t * ab_y;
+
+        T dx = p[0] - proj_x;
+        T dy = p[1] - proj_y;
+        return dx * dx + dy * dy;
+    }
+
+    template <typename T>
+    T calculate_normal_snapping_loss(const T* p1, const T* p2, const vc::core::util::GridStore& normal_grid, bool is_grid1) const {
         T edge_vec_x = p2[0] - p1[0];
         T edge_vec_y = p2[1] - p1[1];
 
@@ -703,11 +743,83 @@ struct NormalConstraintPlane {
             }
         }
 
+        T normal_loss = T(0.0);
         if (total_weight > T(1e-9)) {
             T avg_dot_product = total_weighted_dot_product / total_weight;
-            return (T(1.0) - avg_dot_product);
+            normal_loss = (T(1.0) - avg_dot_product);
         }
-        return T(0.0);
+
+        // Snapping logic
+        float closest_dist_norm = std::numeric_limits<float>::max();
+        int best_path_idx = -1;
+        int best_seg_idx = -1;
+        bool best_is_next = false;
+
+        cv::Point2f p1_cv(val(p1[0]), val(p1[1]));
+        cv::Point2f p2_cv(val(p2[0]), val(p2[1]));
+
+        for (int path_idx = 0; path_idx < nearby_paths.size(); ++path_idx) {
+            const auto& path = *nearby_paths[path_idx];
+            if (path.size() < 2) continue;
+
+            for (int i = 0; i < path.size() - 1; ++i) {
+                float d2_sq = point_line_dist_sq(p2_cv, path[i], path[i+1]);
+                if (d2_sq >= snap_trig_th_ * snap_trig_th_) continue;
+
+                if (i < path.size() - 2) { // Check next segment
+                    float d1_sq = point_line_dist_sq(p1_cv, path[i+1], path[i+2]);
+                    if (d1_sq < snap_search_range_ * snap_search_range_) {
+                        float dist_norm = 0.5f * (sqrt(d1_sq)/snap_search_range_ + sqrt(d2_sq)/snap_trig_th_);
+                        if (dist_norm < closest_dist_norm) {
+                            closest_dist_norm = dist_norm;
+                            best_path_idx = path_idx;
+                            best_seg_idx = i;
+                            best_is_next = true;
+                        }
+                    }
+                }
+                if (i > 0) { // Check prev segment
+                    float d1_sq = point_line_dist_sq(p1_cv, path[i-1], path[i]);
+                     if (d1_sq < snap_search_range_ * snap_search_range_) {
+                        float dist_norm = 0.5f * (sqrt(d1_sq)/snap_search_range_ + sqrt(d2_sq)/snap_trig_th_);
+                        if (dist_norm < closest_dist_norm) {
+                            closest_dist_norm = dist_norm;
+                            best_path_idx = path_idx;
+                            best_seg_idx = i;
+                            best_is_next = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        T snapping_loss = T(0.0);
+        if (best_path_idx != -1) {
+            const auto& best_path = *nearby_paths[best_path_idx];
+            const auto& seg2_p1 = best_path[best_seg_idx];
+            const auto& seg2_p2 = best_path[best_seg_idx + 1];
+
+            cv::Point2f seg1_p1, seg1_p2;
+            if (best_is_next) {
+                seg1_p1 = best_path[best_seg_idx + 1];
+                seg1_p2 = best_path[best_seg_idx + 2];
+            } else {
+                seg1_p1 = best_path[best_seg_idx - 1];
+                seg1_p2 = best_path[best_seg_idx];
+            }
+
+            T d1_sq = point_line_dist_sq_differentiable(p1, seg1_p1, seg1_p2);
+            T d2_sq = point_line_dist_sq_differentiable(p2, seg2_p1, seg2_p2);
+
+            T d1_norm = ceres::sqrt(d1_sq) / T(snap_search_range_);
+            T d2_norm = ceres::sqrt(d2_sq) / T(snap_trig_th_);
+
+            snapping_loss = (d1_norm * (T(1.0) - d2_norm) + d2_norm);
+        } else {
+            snapping_loss = T(1.0); // Penalty if no snap target found
+        }
+
+        return normal_loss + snapping_loss;
     }
 
     static float seg_dist_sq_appx(cv::Point2f p1, cv::Point2f p2, cv::Point2f p3, cv::Point2f p4)
