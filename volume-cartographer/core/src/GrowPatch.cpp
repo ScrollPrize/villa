@@ -663,6 +663,8 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     int loss_count = 0;
     int generation = 0;
     int succ = 0;  // number of quads successfully added to the patch (each of size approx. step**2)
+    double last_elapsed_seconds = 0.0;
+    int last_succ = 0;
 
     if (resume_surf) {
         float resume_step = 1.0 / resume_surf->scale()[0];
@@ -701,6 +703,8 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, p, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
             succ++;
         }
+        last_succ = succ;
+        last_elapsed_seconds = f_timer.seconds();
         std::cout << "Resuming from generation " << generation << " with " << fringe.size() << " points. Initial loss count: " << loss_count << std::endl;
 
     } else {
@@ -733,6 +737,8 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
 
         std::cout << "init loss count " << loss_count << std::endl;
     }
+
+    big_problem.SetParameterBlockConstant(&locs(y0,x0)[0]);
 
     ceres::Solver::Options options_big;
     options_big.linear_solver_type = ceres::SPARSE_SCHUR;
@@ -1104,12 +1110,12 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             }
         }
         else {
-            // if (generation > 10 && global_opt) {
+            // if (generation > 20 && global_opt) {
             //     // Beyond 10 generations but while still trying global re-solves, simplify the big problem by fixing locations
             //     // of points that are already 'certain', in the sense they are not near any other points that don't yet have valid
             //     // locations
             //     cv::Mat_<cv::Vec2d> _empty;
-            //     freeze_inner_params(big_problem, 10, state, locs, _empty, loss_status, STATE_LOC_VALID | STATE_COORD_VALID);
+            //     freeze_inner_params(big_problem, 20, state, locs, _empty, loss_status, STATE_LOC_VALID | STATE_COORD_VALID);
             // }
 
             // For early generations, re-solve the big problem, jointly optimising the locations of all points in the patch
@@ -1145,11 +1151,31 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         gen_avg_cost.push_back(avg_cost/cost_count);
         gen_max_cost.push_back(max_cost);
 
-        float const current_area_vx2 = double(succ)*step*step;
-        float const current_area_cm2 = current_area_vx2 * voxelsize * voxelsize / 1e8;
-        printf("-> total done %d/ fringe: %ld surf: %fG vx^2 (%f cm^2)\n", succ, (long)fringe.size(), current_area_vx2/1e9, current_area_cm2);
+        // --- Speed Reporting ---
+        double elapsed_seconds = f_timer.seconds();
+        double seconds_this_gen = elapsed_seconds - last_elapsed_seconds;
+        int succ_this_gen = succ - last_succ;
 
-        timer_gen.unit = succ_gen*step*step;
+        double const vx_per_quad = (double)step * step;
+        double const voxelsize_mm = (double)voxelsize / 1000.0;
+        double const voxelsize_m = (double)voxelsize / 1000000.0;
+        double const mm2_per_quad = vx_per_quad * voxelsize_mm * voxelsize_mm;
+        double const m2_per_quad = vx_per_quad * voxelsize_m * voxelsize_m;
+
+        double const total_area_mm2 = succ * mm2_per_quad;
+        double const total_area_m2 = succ * m2_per_quad;
+
+        double avg_speed_mm2_s = (elapsed_seconds > 0) ? (total_area_mm2 / elapsed_seconds) : 0.0;
+        double current_speed_mm2_s = (seconds_this_gen > 0) ? (succ_this_gen * mm2_per_quad / seconds_this_gen) : 0.0;
+        double avg_speed_m2_day = (elapsed_seconds > 0) ? (total_area_m2 / (elapsed_seconds / (24.0 * 3600.0))) : 0.0;
+
+        printf("-> done %d | fringe %ld | area %.2f mm^2 (%.4f m^2) | avg speed %.2f mm^2/s (%.2f m^2/day) | current speed %.2f mm^2/s\n",
+               succ, (long)fringe.size(), total_area_mm2, total_area_m2, avg_speed_mm2_s, avg_speed_m2_day, current_speed_mm2_s);
+
+        last_elapsed_seconds = elapsed_seconds;
+        last_succ = succ;
+
+        timer_gen.unit = succ_gen * vx_per_quad;
         timer_gen.unit_string = "vx^2";
         print_accessor_stats();
 
