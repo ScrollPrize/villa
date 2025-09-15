@@ -49,6 +49,7 @@
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SurfaceVoxelizer.hpp"
@@ -531,6 +532,10 @@ void CWindow::CreateWidgets(void)
     chkFilterHideUnapproved = ui.chkFilterHideUnapproved;
     connect(chkFilterHideUnapproved, &QCheckBox::toggled, [this]() { onSegFilterChanged(0); });
 
+
+    chkFilterInspectOnly = ui.chkFilterInspectOnly;
+    connect(chkFilterInspectOnly, &QCheckBox::toggled, [this]() { onSegFilterChanged(0); });
+
     cmbSegmentationDir = ui.cmbSegmentationDir;
     connect(cmbSegmentationDir, &QComboBox::currentIndexChanged, this, &CWindow::onSegmentationDirChanged);
 
@@ -561,6 +566,7 @@ void CWindow::CreateWidgets(void)
     _chkDefective = ui.chkDefective;
     _chkReviewed = ui.chkReviewed;
     _chkRevisit = ui.chkRevisit;
+    _chkInspect = ui.chkInspect;
     
     for(int i=0;i<3;i++)
         spNorm[i]->setRange(-10,10);
@@ -574,11 +580,13 @@ void CWindow::CreateWidgets(void)
     connect(_chkDefective, &QCheckBox::stateChanged, this, &CWindow::onTagChanged);
     connect(_chkReviewed, &QCheckBox::stateChanged, this, &CWindow::onTagChanged);
     connect(_chkRevisit, &QCheckBox::stateChanged, this, &CWindow::onTagChanged);
+    connect(_chkInspect, &QCheckBox::stateChanged, this, &CWindow::onTagChanged);
 #else
     connect(_chkApproved, &QCheckBox::checkStateChanged, this, &CWindow::onTagChanged);
     connect(_chkDefective, &QCheckBox::checkStateChanged, this, &CWindow::onTagChanged);
     connect(_chkReviewed, &QCheckBox::checkStateChanged, this, &CWindow::onTagChanged);
     connect(_chkRevisit, &QCheckBox::checkStateChanged, this, &CWindow::onTagChanged);
+    connect(_chkInspect, &QCheckBox::checkStateChanged, this, &CWindow::onTagChanged);
 #endif
 
     connect(ui.btnEditMask, &QPushButton::pressed, this, &CWindow::onEditMaskPressed);
@@ -1432,9 +1440,14 @@ static void sync_tag(nlohmann::json &dict, bool checked, std::string name, const
             dict[name]["user"] = username;
         }
         dict[name]["date"] = QDateTime::currentDateTime().toString(Qt::ISODate).toStdString();
+        if (name == "approved")
+            dict["date_last_modified"] = get_surface_time_str();
     }
-    if (!checked && dict.count(name))
+    if (!checked && dict.count(name)) {
         dict.erase(name);
+        if (name == "approved")
+            dict["date_last_modified"] = get_surface_time_str();
+    }
 }
 
 void CWindow::onTagChanged(void)
@@ -1476,9 +1489,10 @@ void CWindow::onTagChanged(void)
             sync_tag(surf->meta->at("tags"), _chkDefective->checkState() == Qt::Checked, "defective", username);
             sync_tag(surf->meta->at("tags"), _chkReviewed->checkState() == Qt::Checked, "reviewed", username);
             sync_tag(surf->meta->at("tags"), _chkRevisit->checkState() == Qt::Checked, "revisit", username);
+            sync_tag(surf->meta->at("tags"), _chkInspect->checkState() == Qt::Checked, "inspect", username);
             surf->save_meta();
         }
-        else if (_chkApproved->checkState() || _chkDefective->checkState() || _chkReviewed->checkState() || _chkRevisit->checkState()) {
+        else if (_chkApproved->checkState() || _chkDefective->checkState() || _chkReviewed->checkState() || _chkRevisit->checkState() || _chkInspect->checkState()) {
             surf->meta->push_back({"tags", nlohmann::json::object()});
             if (_chkApproved->checkState()) {
                 if (!username.empty()) {
@@ -1510,6 +1524,14 @@ void CWindow::onTagChanged(void)
                     surf->meta->at("tags")["revisit"]["user"] = username;
                 } else {
                     surf->meta->at("tags")["revisit"] = nullptr;
+                }
+            }
+            if (_chkInspect->checkState()) {
+                if (!username.empty()) {
+                    surf->meta->at("tags")["inspect"] = nlohmann::json::object();
+                    surf->meta->at("tags")["inspect"]["user"] = username;
+                } else {
+                    surf->meta->at("tags")["inspect"] = nullptr;
                 }
             }
             surf->save_meta();
@@ -1611,6 +1633,7 @@ void CWindow::onSurfaceSelected()
             const QSignalBlocker b2{_chkDefective};
             const QSignalBlocker b3{_chkReviewed};
             const QSignalBlocker b4{_chkRevisit};
+            const QSignalBlocker b5{_chkInspect};
             
             std::cout << "surf " << _surf->path << _surfID <<  _surf->meta << std::endl;
             
@@ -1618,11 +1641,13 @@ void CWindow::onSurfaceSelected()
             _chkDefective->setEnabled(true);
             _chkReviewed->setEnabled(true);
             _chkRevisit->setEnabled(true);
+            _chkInspect->setEnabled(true);
             
             _chkApproved->setCheckState(Qt::Unchecked);
             _chkDefective->setCheckState(Qt::Unchecked);
             _chkReviewed->setCheckState(Qt::Unchecked);
             _chkRevisit->setCheckState(Qt::Unchecked);
+            _chkInspect->setCheckState(Qt::Unchecked);
             if (_surf->meta) {
                 if (_surf->meta->value("tags", nlohmann::json::object_t()).count("approved"))
                     _chkApproved->setCheckState(Qt::Checked);
@@ -1632,12 +1657,15 @@ void CWindow::onSurfaceSelected()
                     _chkReviewed->setCheckState(Qt::Checked);
                 if (_surf->meta->value("tags", nlohmann::json::object_t()).count("revisit"))
                     _chkRevisit->setCheckState(Qt::Checked);
+                if (_surf->meta->value("tags", nlohmann::json::object_t()).count("inspect"))
+                    _chkInspect->setCheckState(Qt::Checked);
             }
             else {
                 _chkApproved->setEnabled(false);
                 _chkDefective->setEnabled(false);
                 _chkReviewed->setEnabled(true);
                 _chkRevisit->setEnabled(true);
+                _chkInspect->setEnabled(true);
             }
         }
     }
@@ -1669,7 +1697,11 @@ void CWindow::FillSurfaceTree()
         double cost = surfMeta->meta->value("avg_cost", -1.f);
         item->setText(3, QString::number(cost, 'f', 3));
         item->setText(4, QString::number(surfMeta->overlapping_str.size()));
-
+        QString timestamp;
+        if (surfMeta->meta && surfMeta->meta->contains("date_last_modified")) {
+            timestamp = QString::fromStdString((*surfMeta->meta)["date_last_modified"].get<std::string>());
+        }
+        item->setText(5, timestamp);
         UpdateSurfaceTreeIcon(item);
     }
 
@@ -1713,7 +1745,8 @@ void CWindow::onSegFilterChanged(int index)
                            chkFilterNoDefective->isChecked() ||
                            chkFilterPartialReview->isChecked() ||
                            chkFilterCurrentOnly->isChecked() ||
-                           chkFilterHideUnapproved->isChecked();
+                               chkFilterHideUnapproved->isChecked() ||
+                               chkFilterInspectOnly->isChecked();
 
     // Check if point set filter has any checked items
     if (!hasActiveFilters && cmbPointSetFilter->count() > 0) {
@@ -1883,6 +1916,15 @@ void CWindow::onSegFilterChanged(int index)
                     show = show && false;  // Hide segments without metadata when filter is active
                 }
             }
+            if (chkFilterInspectOnly->isChecked()) {
+                auto* surface = surfMeta->surface();
+                if (surface && surface->meta) {
+                    auto tags = surface->meta->value("tags", nlohmann::json::object_t());
+                    show = show && (tags.count("inspect") > 0);
+                } else {
+                    show = show && false;  // Hide segments without metadata when filter is active
+                }
+            }
         }
 
         (*it)->setHidden(!show);
@@ -1907,52 +1949,25 @@ void CWindow::onSegFilterChanged(int index)
     }
 }
 
-
 void CWindow::onEditMaskPressed(void)
 {
     if (!_surf)
         return;
-    
-    //FIXME if mask already exists just open it!
-    
-    cv::Mat_<cv::Vec3f> points = _surf->rawPoints();
-
+    std::cout << "oneditmaskpressed" << std::endl;
     std::filesystem::path path = _surf->path/"mask.tif";
-    
+
     if (!std::filesystem::exists(path)) {
         cv::Mat_<uint8_t> img;
         cv::Mat_<uint8_t> mask;
-        //TODO make this aim for some target size instead of a hardcoded decision
-        if (points.cols >= 4000) {
-            readInterpolated3D(img, currentVolume->zarrDataset(2), points*0.25, chunk_cache);
-            
-            mask.create(img.size());
-            
-            for(int j=0;j<img.rows;j++)
-                for(int i=0;i<img.cols;i++)
-                    if (points(j,i)[0] == -1)
-                        mask(j,i) = 0;
-            else
-                mask(j,i) = 255;
-        }
-        else
-        {
-            cv::Mat_<cv::Vec3f> scaled;
-            cv::resize(points, scaled, {0,0}, 1/_surf->_scale[0], 1/_surf->_scale[1], cv::INTER_CUBIC);
-            
-            readInterpolated3D(img, currentVolume->zarrDataset(0), scaled, chunk_cache);
-            cv::resize(img, img, {0,0}, 0.25, 0.25, cv::INTER_CUBIC);
-            
-            mask.create(img.size());
-            
-            for(int j=0;j<img.rows;j++)
-                for(int i=0;i<img.cols;i++)
-                    if (points(j*4*_surf->_scale[1],i*4*_surf->_scale[0])[0] == -1)
-                        mask(j,i) = 0;
-            else
-                mask(j,i) = 255;
-        }
-        
+
+        // Use generate_mask function instead of duplicating logic
+        z5::Dataset* ds_high = currentVolume ? currentVolume->zarrDataset(0) : nullptr;
+        z5::Dataset* ds_low = (currentVolume && currentVolume->numScales() >= 3) ?
+                              currentVolume->zarrDataset(2) : nullptr;
+
+        generate_mask(_surf, mask, img, ds_high, ds_low, chunk_cache);
+
+        // Save the generated mask and image
         std::vector<cv::Mat> layers = {mask, img};
         imwritemulti(path, layers);
     }
@@ -2125,6 +2140,7 @@ void CWindow::onSegmentationDirChanged(int index)
             _chkDefective->setEnabled(false);
             _chkReviewed->setEnabled(false);
             _chkRevisit->setEnabled(false);
+            _chkInspect->setEnabled(false);
         }
         
         // Set the new directory in the VolumePkg
@@ -2368,6 +2384,11 @@ void CWindow::AddSingleSegmentation(const std::string& segId)
         double cost = sm->meta->value("avg_cost", -1.f);
         item->setText(3, QString::number(cost, 'f', 3));
         item->setText(4, QString::number(sm->overlapping_str.size()));
+        QString timestamp;
+        if (sm->meta && sm->meta->contains("date_last_modified")) {
+            timestamp = QString::fromStdString((*sm->meta)["date_last_modified"].get<std::string>());
+        }
+        item->setText(5, timestamp);
         UpdateSurfaceTreeIcon(item);
 
     } catch (const std::exception& e) {
@@ -2395,14 +2416,17 @@ void CWindow::RemoveSingleSegmentation(const std::string& segId)
         const QSignalBlocker b2{_chkDefective};
         const QSignalBlocker b3{_chkReviewed};
         const QSignalBlocker b4{_chkRevisit};
+        const QSignalBlocker b5{_chkInspect};
         _chkApproved->setCheckState(Qt::Unchecked);
         _chkDefective->setCheckState(Qt::Unchecked);
         _chkReviewed->setCheckState(Qt::Unchecked);
         _chkRevisit->setCheckState(Qt::Unchecked);
+        _chkInspect->setCheckState(Qt::Unchecked);
         _chkApproved->setEnabled(false);
         _chkDefective->setEnabled(false);
         _chkReviewed->setEnabled(false);
         _chkRevisit->setEnabled(false);
+        _chkInspect->setEnabled(false);
 
         // Reset window title
         for (auto &viewer : _viewers) {

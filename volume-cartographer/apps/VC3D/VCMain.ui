@@ -233,7 +233,7 @@
              <bool>true</bool>
             </property>
             <property name="columnCount">
-             <number>5</number>
+             <number>6</number>
             </property>
             <attribute name="headerVisible">
              <bool>true</bool>
@@ -273,6 +273,11 @@
             <column>
              <property name="text">
               <string>Overlaps</string>
+             </property>
+            </column>
+            <column>
+             <property name="text">
+              <string>Last Modified</string>
              </property>
             </column>
            </widget>
@@ -397,6 +402,13 @@
                  </property>
                 </widget>
                </item>
+               <item row="2" column="2">
+                <widget class="QCheckBox" name="chkFilterInspectOnly">
+                 <property name="text">
+                  <string>Inspect Only</string>
+                 </property>
+                </widget>
+               </item>
               </layout>
              </item>
             </layout>
@@ -452,6 +464,13 @@
               <widget class="QCheckBox" name="chkRevisit">
                <property name="text">
                 <string>Revisit</string>
+               </property>
+              </widget>
+             </item>
+             <item row="1" column="4">
+              <widget class="QCheckBox" name="chkInspect">
+               <property name="text">
+                <string>Inspect</string>
                </property>
               </widget>
              </item>
