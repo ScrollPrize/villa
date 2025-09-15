@@ -67,7 +67,7 @@ Ink detection is **not required**; the focus is high-quality segmentation, conti
 <summary>Submission criteria and requirements</summary>
 
 ### What to deliver (for each of the two scrolls)
-1. **Segmented sheet manifold(s).** A continuous 3D mesh (or meshes) of the papyrus sheet(s) suitable for flattening.
+1. **Segmented sheet manifold(s).** A continuous 3D mesh (or meshes) of the papyrus sheet(s) suitable for flattening. If the submission includes multiple meshes, the minimum size of each mesh should be larger than a full papyrus sheet wrap in the scroll volume.
 2. **Flattened 2D sheets.** UV maps / atlases covering the **accepted area** you claim as correct.
 3. **Accepted-area mask.** Binary mask(s) over the flattened sheets indicating regions you assert are error-free.
 4. **Video record (if humans involved).** A screen-capture timelapse or periodic snapshots covering all interactive steps.
