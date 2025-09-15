@@ -188,17 +188,10 @@ class BettiMatchingLoss(nn.Module):
             pred_fg = torch.sigmoid(input) if not (input.min() >= 0 and input.max() <= 1) else input
             tgt_fg = target
 
-        # Downsample for efficiency (preserves thin structures reasonably via max-pool)
-        if is_3d:
-            pred_ds = F.max_pool3d(pred_fg, kernel_size=2, stride=2)
-            tgt_ds = F.max_pool3d(tgt_fg, kernel_size=2, stride=2)
-        else:
-            pred_ds = F.max_pool2d(pred_fg, kernel_size=2, stride=2)
-            tgt_ds = F.max_pool2d(tgt_fg, kernel_size=2, stride=2)
 
         # Build lists for a single batched call to the C++ extension
-        preds_fields = [pred_ds[b].squeeze(0) for b in range(batch_size)]
-        tgts_fields = [tgt_ds[b].squeeze(0) for b in range(batch_size)]
+        preds_fields = [pred_fg[b].squeeze(0) for b in range(batch_size)]
+        tgts_fields = [tgt_fg[b].squeeze(0) for b in range(batch_size)]
 
         preds_np = [np.ascontiguousarray(p.detach().cpu().numpy().astype(np.float64)) for p in preds_fields]
         tgts_np = [np.ascontiguousarray(t.detach().cpu().numpy().astype(np.float64)) for t in tgts_fields]
@@ -227,8 +220,9 @@ class BettiMatchingLoss(nn.Module):
             for b in range(batch_size):
                 loss_super, aux_super = _compute_loss_from_result(preds_fields[b], tgts_fields[b], results_super[b])
                 loss_sub, aux_sub = _compute_loss_from_result(preds_fields[b], tgts_fields[b], results_sub[b])
-                total_losses.append(0.5 * (loss_super + loss_sub))
-                aux_parts.append({k: (aux_super[k] + aux_sub[k]) / 2.0 for k in aux_super.keys()})
+                # Match scratch/Betti-matching-master semantics: sum superlevel + sublevel
+                total_losses.append(loss_super + loss_sub)
+                aux_parts.append({k: (aux_super[k] + aux_sub[k]) for k in aux_super.keys()})
         else:
             if self.filtration == 'superlevel':
                 preds_in = [1.0 - p for p in preds_np]
