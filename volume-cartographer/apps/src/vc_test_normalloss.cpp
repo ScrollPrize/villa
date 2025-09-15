@@ -88,14 +88,14 @@ int main(int argc, char** argv) {
     problem.AddResidualBlock(NormalConstraintPlane::Create(ngv, plane_idx, w), nullptr, &p3[0], &p2[0], &p1[0], &p0[0]);
   }
 
-  std::cout << "\n--- Evaluating initial XY loss ---\n" << std::endl;
-  NormalConstraintPlane::dbg_flag = true;
-  auto* xy_loss = NormalConstraintPlane::Create(ngv, 0, w);
-  double residual[1];
-  double* parameters[] = {&p0[0], &p1[0], &p2[0], &p3[0]};
-  xy_loss->Evaluate(parameters, residual, nullptr);
-  std::cout << "Initial XY residual: " << residual[0] << std::endl;
-  NormalConstraintPlane::dbg_flag = false;
+  // std::cout << "\n--- Evaluating initial XY loss ---\n" << std::endl;
+  // NormalConstraintPlane::dbg_flag = true;
+  // auto* xy_loss = NormalConstraintPlane::Create(ngv, 0, w);
+  // double residual[1];
+  // double* parameters[] = {&p0[0], &p1[0], &p2[0], &p3[0]};
+  // xy_loss->Evaluate(parameters, residual, nullptr);
+  // std::cout << "Initial XY residual: " << residual[0] << std::endl;
+  // NormalConstraintPlane::dbg_flag = false;
   std::cout << "\n--- Starting Ceres optimization ---\n" << std::endl;
 
 
@@ -155,10 +155,9 @@ int main(int argc, char** argv) {
                        const cv::Vec3d& offset, int plane_idx) {
     auto project = [&](const cv::Vec3d& p) {
       cv::Vec3d p_local = p - offset;
-      // Match the coordinate systems of the visualized grids
-      if (plane_idx == 0) return cv::Point2f(p_local[1], p_local[2]); // XY plane, vis is (y, z)
-      if (plane_idx == 1) return cv::Point2f(p_local[2], p_local[0]); // XZ plane, vis is (z, x)
-      return cv::Point2f(p_local[1], p_local[0]);                     // YZ plane, vis is (y, x)
+      if (plane_idx == 0) return cv::Point2f(p_local[0], p_local[1]); // XY plane -> (x, y)
+      if (plane_idx == 1) return cv::Point2f(p_local[0], p_local[2]); // XZ plane -> (x, z)
+      return cv::Point2f(p_local[1], p_local[2]);                     // YZ plane -> (y, z)
     };
 
     cv::line(img, project(p0), project(p1), cv::Scalar(0, 0, 255), 1);
