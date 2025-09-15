@@ -74,8 +74,8 @@ Ink detection is **not required**; the focus is high-quality segmentation, conti
 5. **Reproducible pipeline.** Docker/Conda with a one-click script that regenerates meshes, maps, masks, and sheets from organizer-supplied volumes.
 
 ### Pass/fail gates (must be met on **both** scrolls)
-- **Coverage:** - **≥ 65%** of organizer-estimated surface **per scroll** after exclusions of areas masked as errors in the binary masks.
-- **Sheet-switch integrity (SSR):** - **≤ 0.5%** **per scroll** over the audited area.
+- **Coverage:** - **≥ 65%** of (to be estimated) surface **per scroll** after exclusions of areas masked as errors in the binary masks.
+- **Sheet-switch rate:** - **≤ 0.5%** **per scroll** over the audited area.
   - *Definition:* It's the rate of triangles or quads in the delivered meshes that are marked as error-free in the binary masks but are actually errors.
 - **Human effort cap:** - **≤ 72 human-hours per scroll** (i.e., **≤ 144 hours total** across the two).
   - *Counts:* any human touch specific to processing the evaluation scrolls (seed placement, parameter tweaks, manual stitching/edits, quality control passes, mask painting, bookkeeping).
@@ -99,7 +99,7 @@ Ink detection is **not required**; the focus is high-quality segmentation, conti
 - **Single winner:** the **first team** to pass all gates on **both** scrolls during organizer verification receives **$200,000**.  
 - If two teams pass within **96 hours**, tie-breakers:  
   1) Higher **coverage** across the two scrolls;  
-  2) Lower **SSR** across the two;  
+  2) Lower **sheet-switch rate** across the two;  
   3) Fewer **total human-hours** (sum over both);  
   4) Earlier submission timestamp.
 </details>
