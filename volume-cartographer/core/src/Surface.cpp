@@ -26,6 +26,8 @@ void set_pointto_proposed_params(int pre_iters, int coarse_stride) {
     if (coarse_stride >= 0) g_pointto_coarse_stride = coarse_stride;
 }
 
+#include "vc/core/util/DateTime.hpp"
+
 void write_overlapping_json(const std::filesystem::path& seg_path, const std::set<std::string>& overlapping_names) {
     nlohmann::json overlap_json;
     overlap_json["overlapping"] = std::vector<std::string>(overlapping_names.begin(), overlapping_names.end());
@@ -1249,6 +1251,7 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid)
     (*meta)["uuid"] = uuid;
     (*meta)["format"] = "tifxyz";
     (*meta)["scale"] = {_scale[0], _scale[1]};
+    (*meta)["date_last_modified"] = get_surface_time_str();
     std::ofstream o(path/"meta.json.tmp");
     o << std::setw(4) << (*meta) << std::endl;
 
@@ -1262,7 +1265,7 @@ void QuadSurface::save_meta()
         throw std::runtime_error("can't save_meta() without metadata!");
     if (path.empty())
         throw std::runtime_error("no storage path for QuadSurface");
-
+    std::cout << " saving metadata" << std::endl;
     std::ofstream o(path/"meta.json.tmp");
     o << std::setw(4) << (*meta) << std::endl;
 
@@ -1526,6 +1529,9 @@ void generate_mask(QuadSurface* surf,
             }
         }
     }
+    std::cout << "generatemask" << std::endl;
+    (*surf->meta)["date_last_modified"] = get_surface_time_str();
+    surf->save_meta();
 }
 
 QuadSurface* surface_diff(QuadSurface* a, QuadSurface* b, float tolerance) {

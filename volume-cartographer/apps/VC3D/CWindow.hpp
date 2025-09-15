@@ -204,12 +204,14 @@ private:
     QCheckBox* chkFilterPartialReview;
     QCheckBox* chkFilterCurrentOnly;
     QCheckBox* chkFilterHideUnapproved;
+    QCheckBox* chkFilterInspectOnly;
     QComboBox* cmbSegmentationDir;
     
     QCheckBox* _chkApproved;
     QCheckBox* _chkDefective;
     QCheckBox* _chkReviewed;
     QCheckBox* _chkRevisit;
+    QCheckBox* _chkInspect;
     QuadSurface *_surf;
     std::string _surfID;
     

@@ -315,11 +315,11 @@ const prizes = [
   //   href: "/winners",
   // },
   {
-    title: "Read Entire Scroll Prize",
+    title: "Unwrapping at Scale Prize",
     prizeMoney: "$200,000",
-    description: "Read an entire scroll",
+    description: "Automate virtual unwrapping",
     requirement: "",
-    href: "prizes#read-entire-scroll-prize-200000",
+    href: "prizes#unwrapping-at-scale-prize",
   },
   {
     title: "First Letters / First Title Prizes",
