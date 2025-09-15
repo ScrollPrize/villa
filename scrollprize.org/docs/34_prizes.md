@@ -60,7 +60,7 @@ Ink detection is **not required**; the focus is high-quality segmentation, conti
 
 <div className="mb-4">
   <img src="/img/landing/scroll.webp" className="w-[50%]"/>
-  <figcaption className="mt-[-6px]">A full scroll.</figcaption>
+  <figcaption className="mt-[-6px]">A carbonized scroll.</figcaption>
 </div>
 
 <details class="submission-details">
