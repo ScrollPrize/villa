@@ -74,7 +74,7 @@ Ink detection is **not required**; the focus is high-quality segmentation, conti
 5. **Reproducible pipeline.** Container with a one-click script that regenerates meshes, maps, masks, and sheets from organizer-supplied volumes.
 
 ### Pass/fail gates (must be met on **both** scrolls)
-- **Coverage: ≥ 70% (per scroll)** of the (to be estimated) scroll surface after exclusions of areas masked as errors in the binary masks.
+- **Coverage: ≥ 70% (per scroll)** of the (to be estimated) total scroll surface after exclusions of areas masked as errors in the binary masks.
 - **Sheet-switch rate: ≤ 0.5% per scroll** over the audited area.
     - *Definition:* It's the rate of triangles or quads in the delivered meshes that are marked as error-free in the binary masks but actually contain errors.
 - **Human effort cap: ≤ 72 human-hours per scroll** (i.e., **≤ 144 hours total** across the two).
