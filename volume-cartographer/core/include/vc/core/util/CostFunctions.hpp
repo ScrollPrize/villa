@@ -103,6 +103,8 @@ struct DistLoss2D {
     }
 };
 
+
+
 struct StraightLoss {
     StraightLoss(float w) : _w(w) {};
     template <typename T>
@@ -121,7 +123,12 @@ struct StraightLoss {
         
         T dot = (d1[0]*d2[0] + d1[1]*d2[1] + d1[2]*d2[2])/(l1*l2);
         
-        residual[0] = T(_w)*(T(1)-dot);
+
+        if (dot <= T(0.866)) {
+            T penalty = T(0.866)-dot;
+            residual[0] = T(_w)*(T(1)-dot) + T(_w*8)*penalty*penalty;
+        } else
+            residual[0] = T(_w)*(T(1)-dot);
 
         return true;
     }
@@ -819,7 +826,7 @@ struct NormalConstraintPlane {
             snapping_loss = T(1.0); // Penalty if no snap target found
         }
 
-        return normal_loss + snapping_loss;
+        return normal_loss + T(0.1)*snapping_loss;
     }
 
     static float seg_dist_sq_appx(cv::Point2f p1, cv::Point2f p2, cv::Point2f p3, cv::Point2f p4)
