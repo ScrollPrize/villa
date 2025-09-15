@@ -8,7 +8,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A $1,000,000+ machine learning and computer vision competition"
+    content="A $1,500,000+ machine learning and computer vision competition"
   />
 
   <meta property="og:type" content="website" />
@@ -16,7 +16,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A $1,000,000+ machine learning and computer vision competition"
+    content="A $1,500,000+ machine learning and computer vision competition"
   />
   <meta
     property="og:image"
@@ -28,7 +28,7 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A $1,000,000+ machine learning and computer vision competition"
+    content="A $1,500,000+ machine learning and computer vision competition"
   />
   <meta
     property="twitter:image"
@@ -52,14 +52,16 @@ Get a feel for [the data](data) by looking inside a scroll that has not been ope
 
 ### 3. Dive in
 
-Our goal is to read the entire library, starting with a complete scroll:
+Our goal is to read the entire library.
 
-<Admonition type="tip" icon="📜" title="Read an Entire Scroll">
-* Prizes: \$200,000 [Read Entire Scroll Prize](prizes#read-entire-scroll-prize-200000)
+We need help in automating the virtually unwrapping of entire scrolls:
+
+<Admonition type="tip" icon="📜" title="Unwrapping at Scale">
+* Prizes: \$200,000 [Unwrapping at Scale Prize](prizes#unwrapping-at-scale-prize)
 * Starting point: [Data](data), [Tutorials](tutorial)
 </Admonition>
 
-There are currently two primary subproblems where we need your help:
+Contestants can also contribute to our two primary subproblems:
 
 <Admonition type="info" icon="⚙️" title="Segmentation">
 * Prizes: [Progress Prizes](prizes#progress-prizes)

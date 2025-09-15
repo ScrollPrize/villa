@@ -9,7 +9,7 @@ slug: "2024_gp_submissions"
 
   <meta
     name="description"
-    content="A $1,000,000+ machine learning and computer vision competition"
+    content="A $1,500,000+ machine learning and computer vision competition"
   />
 
   <meta property="og:type" content="website" />
@@ -17,7 +17,7 @@ slug: "2024_gp_submissions"
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A $1,000,000+ machine learning and computer vision competition"
+    content="A $1,500,000+ machine learning and computer vision competition"
   />
   <meta
     property="og:image"
@@ -29,7 +29,7 @@ slug: "2024_gp_submissions"
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A $1,000,000+ machine learning and computer vision competition"
+    content="A $1,500,000+ machine learning and computer vision competition"
   />
   <meta
     property="twitter:image"
