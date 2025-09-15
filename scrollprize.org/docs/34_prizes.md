@@ -74,13 +74,13 @@ Ink detection is **not required**; the focus is high-quality segmentation, conti
 5. **Reproducible pipeline.** Docker/Conda with a one-click script that regenerates meshes, maps, masks, and sheets from organizer-supplied volumes.
 
 ### Pass/fail gates (must be met on **both** scrolls)
-- **Coverage:** - **≥ 65%** of (to be estimated) surface **per scroll** after exclusions of areas masked as errors in the binary masks.
-- **Sheet-switch rate:** - **≤ 0.5%** **per scroll** over the audited area.
-  - *Definition:* It's the rate of triangles or quads in the delivered meshes that are marked as error-free in the binary masks but are actually errors.
-- **Human effort cap:** - **≤ 72 human-hours per scroll** (i.e., **≤ 144 hours total** across the two).
-  - *Counts:* any human touch specific to processing the evaluation scrolls (seed placement, parameter tweaks, manual stitching/edits, quality control passes, mask painting, bookkeeping).
-  - *Doesn’t count:* general R&D prior to evaluation, model training on public data, writing docs, idle waiting while jobs run.
-- **Reproducibility:** - Organizers must be able to re-run your container end-to-end on a published reference instance and reproduce metrics.
+- **Coverage: ≥ 65% (per scroll)** of the (to be estimated) scroll surface after exclusions of areas masked as errors in the binary masks.
+- **Sheet-switch rate: ≤ 0.5% per scroll** over the audited area.
+    - *Definition:* It's the rate of triangles or quads in the delivered meshes that are marked as error-free in the binary masks but actually contain errors.
+- **Human effort cap: ≤ 72 human-hours per scroll** (i.e., **≤ 144 hours total** across the two).
+    - *Counts:* any human touch specific to processing the evaluation scrolls (seed placement, parameter tweaks, manual stitching/edits, quality control passes, mask painting, bookkeeping).
+    - *Doesn’t count:* general R&D prior to evaluation, model training on public data, writing docs, idle waiting while jobs run.
+- **Reproducibility:** Organizers must be able to re-run your container end-to-end on a published reference instance and reproduce metrics.
 
 > **No compute cap.** We do not limit hardware or cloud cost.
 
