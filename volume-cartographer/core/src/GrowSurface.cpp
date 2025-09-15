@@ -775,7 +775,7 @@ static cv::Mat_<cv::Vec3f> surftrack_genpoints_hr(
                     cv::Vec2f l10 = data.loc(sm,{j+1,i});
                     cv::Vec2f l11 = data.loc(sm,{j+1,i+1});
 
-                    // [APPROVED] favor if any corner uses an approved mapping of this surface
+                    // favor if any corner uses an approved mapping of this surface
                     bool cell_has_approved = prefer_approved && (
                         data.isApproved(sm,{j,i}) ||
                         data.isApproved(sm,{j,i+1}) ||
@@ -828,7 +828,7 @@ static cv::Mat_<cv::Vec3f> surftrack_genpoints_hr(
             else
                 points_hr(j,i) = {-1,-1,-1};
 
-    // [APPROVED] snap exact HR node for approved LR nodes AFTER normalization
+    // snap exact HR node for approved LR nodes AFTER normalization
     // This ensures snapped coords are not subsequently divided by accumulated weights,
     // avoiding distortion/holes at pinned vertices.
 #pragma omp parallel for if(parallel)
@@ -1000,7 +1000,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                     problem.SetParameterBlockConstant(&points_new(j, i)[0]);
             }
 
-    // [APPROVED] additionally pin approved points anywhere in the active region
+    // additionally pin approved points anywhere in the active region -- kinda hacky because it does not allow the optimizer to work
+    // as well with these points but if we know these points are good then we don't want them to move...
     if (pin_approved) {
         for (int j = used_area.y; j < used_area.br().y; ++j)
             for (int i = used_area.x; i < used_area.br().x; ++i)
@@ -1044,7 +1045,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     cv::Mat_<uint8_t> state_out(state.size(), 0);
     cv::Mat_<uint8_t> support_count(state.size(), 0);
 
-    // [APPROVED FIX] track if a remapped pixel had an approved surface in its LR neighborhood
+    // track if a remapped pixel had an approved surface in its LR neighborhood
     cv::Mat_<uint8_t> approved_near(state.size(), 0);
 
     std::cout << "remap: start used_area=" << used_area << " parallel=" << (remap_parallel?1:0) << std::endl;
@@ -1059,7 +1060,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                 data_out.surfs({j,i}) = data.surfsC({j,i});
                 for(auto &s : data_out.surfs({j,i}))
                     data_out.loc(s, {j,i}) = data.loc(s, {j,i});
-                // [APPROVED] copy approved pairs for static region
+                // copy approved pairs for static region
                 for (auto &s : data_out.surfs({j,i}))
                     if (data.isApproved(s, {j,i}))
                         data_out.setApproved(s, {j,i});
@@ -1109,7 +1110,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                         }
                     }
 
-                    // [APPROVED FIX] remember if this output pixel is near any approved surface
+                    // remember if this output pixel is near any approved surface
                     if (!approved_neighborhood.empty())
                         approved_near(j,i) = 1;
 
@@ -1120,7 +1121,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                         auto ptr = s->surface()->pointer();
                         const bool is_locally_approved = approved_neighborhood.contains(s);
                         const float thr = same_surface_th * (is_locally_approved ? approved_attach_relax : 1.0f);
-                        // [APPROVED FIX] use relaxed thr also inside pointTo
+                        // use relaxed thr also inside pointTo
                         float res = s->surface()->pointTo(ptr, points_out(j, i), thr, 10);
                         if (res <= thr) {
                             mutex.lock();
@@ -1141,7 +1142,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                         for (auto s : approved_neighborhood) {
                             auto ptr = s->surface()->pointer();
                             float thr = same_surface_th * approved_attach_relax;
-                            float res = s->surface()->pointTo(ptr, points_out(j, i), thr, 10); // [APPROVED FIX]
+                            float res = s->surface()->pointTo(ptr, points_out(j, i), thr, 10); //
                             if (res < best_res) {
                                 best_res = res;
                                 best_s = s;
@@ -1166,7 +1167,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
             if (!static_bounds.contains(cv::Point(i,j)) && state_out(j,i) & STATE_VALID) {
                 std::set<SurfaceMeta*> surf_src = data_out.surfs({j,i});
                 for (auto s : surf_src) {
-                    // [APPROVED] never drop approved pairs if requested
+                    // never drop approved pairs if requested
                     if (keep_approved_on_consistency && data_out.isApproved(s, {j,i}))
                         continue;
                     int count;
@@ -1454,7 +1455,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
 
     data.loc(seed,{y0,x0}) = {seed_loc[0], seed_loc[1]};
     data.surfs({y0,x0}).insert(seed);
-    if (approved_sm.contains(seed)) data.setApproved(seed, {y0,x0}); // [APPROVED]
+    if (approved_sm.contains(seed)) data.setApproved(seed, {y0,x0});
     points(y0,x0) = data.lookup_int(seed,{y0,x0});
 
 
@@ -1471,7 +1472,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     //insert initial surfs per location
     for(const auto& p : fringe) {
         data.surfs(p).insert(seed);
-        if (approved_sm.contains(seed)) data.setApproved(seed, p); // [APPROVED]
+        if (approved_sm.contains(seed)) data.setApproved(seed, p);
         cv::Vec3f coord = points(p);
         std::cout << "testing " << p << " from cands: " << seed->overlapping.size() << coord << std::endl;
         for(auto s : seed->overlapping) {
@@ -1480,7 +1481,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 cv::Vec3f loc = s->surface()->loc_raw(ptr);
                 data.surfs(p).insert(s);
                 data.loc(s, p) = {loc[1], loc[0]};
-                if (approved_sm.contains(s)) data.setApproved(s, p); // [APPROVED]
+                if (approved_sm.contains(s)) data.setApproved(s, p);
             }
         }
         std::cout << "fringe point " << p << " surfcount " << data.surfs(p).size() << " init " << data.loc(seed, p) << data.lookup_int(seed, p) << std::endl;
@@ -1586,7 +1587,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                         continue;
                     }
                     data_th.loc(s, added) = data.loc(s, added);
-                    if (data.isApproved(s, added)) data_th.setApproved(s, added); // [APPROVED] copy approvals to thread-local
+                    if (data.isApproved(s, added)) data_th.setApproved(s, added); // copy approvals to thread-local
                 }
             }
             if (misses) {
@@ -1603,7 +1604,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                         auto p_surfs = data_th.surfsC({oy,ox});
                         local_surfs.insert(p_surfs.begin(), p_surfs.end());
                     }
-            // [APPROVED_INTEGRATION] Also test all approved surfaces as "test surfaces"
+            // Also test all approved surfaces as "test surfaces"
             // but we won't use them as ref_surf (since they have no local locs here).
             std::set<SurfaceMeta*> test_surfs = local_surfs;
             if (params.value("consider_all_approved_as_candidates", true)) {
@@ -1853,7 +1854,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                     data.surfs(p).insert(s);
                     data.loc(s, p) = data_th.loc(s, p);
                 }
-                // [APPROVED] rewrite approved flags for this location based on the accepted set
+                // rewrite approved flags for this location based on the accepted set
                 data.clearApprovedAt(p);
                 for (auto &s : accepted)
                     if (data_th.isApproved(s, p))
