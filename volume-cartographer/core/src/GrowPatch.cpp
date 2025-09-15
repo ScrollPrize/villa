@@ -759,7 +759,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     }
 #endif
     options_big.minimizer_progress_to_stdout = false;
-    options_big.max_num_iterations = 100;
+    options_big.max_num_iterations = 1000;
 
     // Solve the initial optimisation problem, just placing the first four vertices around the seed
     ceres::Solver::Summary big_summary;
