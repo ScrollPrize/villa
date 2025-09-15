@@ -98,8 +98,8 @@ Ink detection is **not required**; the focus is high-quality segmentation, conti
 ### Winner determination & tie-breakers
 - **Single winner:** the **first team** to pass all gates on **both** scrolls during organizer verification receives **$200,000**.  
 - If two teams pass within **96 hours**, tie-breakers:  
-  1) Higher **coverage** across the two scrolls;  
-  2) Lower **sheet-switch rate** across the two;  
+  1) Lower **sheet-switch rate** across the two;
+  2) Higher **coverage** across the two scrolls;    
   3) Fewer **total human-hours** (sum over both);  
   4) Earlier submission timestamp.
 </details>
