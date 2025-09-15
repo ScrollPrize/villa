@@ -71,7 +71,7 @@ Ink detection is **not required**; the focus is high-quality segmentation, conti
 2. **Flattened 2D sheets.** UV maps / atlases covering the **accepted area** you claim as correct.
 3. **Accepted-area mask.** Binary mask(s) over the flattened sheets indicating regions you assert are error-free.
 4. **Video record (if humans involved).** A screen-capture timelapse or periodic snapshots covering all interactive steps.
-5. **Reproducible pipeline.** Docker/Conda with a one-click script that regenerates meshes, maps, masks, and sheets from organizer-supplied volumes.
+5. **Reproducible pipeline.** Container with a one-click script that regenerates meshes, maps, masks, and sheets from organizer-supplied volumes.
 
 ### Pass/fail gates (must be met on **both** scrolls)
 - **Coverage: ≥ 65% (per scroll)** of the (to be estimated) scroll surface after exclusions of areas masked as errors in the binary masks.
@@ -89,7 +89,7 @@ Ink detection is **not required**; the focus is high-quality segmentation, conti
 - You may use public volumes/fragments for development. For prize evaluation, organizers provide the exact evaluation volumes for the two scrolls.  
 
 ### Submission package
-- **GitHub repository** with code, Docker/Conda files, and run scripts.  
+- **GitHub repository** with code, container (e.g. Docker, conda, etc.), and run scripts.  
 - **Deliverables:** 3D meshes, flattened sheets (TIFF/PNG), UV maps, accepted-area masks.  
 - **Logs:** timing CSVs per scroll; screen-capture or snapshots; CLI logs; environment/hardware info; container image digest.  
 - **Method note:** 2–6 pages describing pipeline, assumptions, and known failure modes.  
