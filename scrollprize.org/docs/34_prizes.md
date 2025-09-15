@@ -80,7 +80,7 @@ Ink detection is **not required**; the focus is high-quality segmentation, conti
 - **Human effort cap: ≤ 72 human-hours per scroll** (i.e., **≤ 144 hours total** across the two).
     - *Counts:* any human touch specific to processing the evaluation scrolls (seed placement, parameter tweaks, manual stitching/edits, quality control passes, mask painting, bookkeeping).
     - *Doesn’t count:* general R&D prior to evaluation, model training on public data, writing docs, idle waiting while jobs run.
-- **Reproducibility:** Organizers must be able to re-run your container end-to-end on a published reference instance and reproduce metrics.
+- **Reproducibility:** Organizers must be able to re-run your container end-to-end and reproduce deliverables and metrics.
 
 > **No compute cap.** We do not limit hardware or cloud cost.
 
