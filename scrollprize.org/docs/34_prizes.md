@@ -10,7 +10,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A $1,000,000+ machine learning and computer vision competition"
+    content="A $1,500,000+ machine learning and computer vision competition"
   />
 
   <meta property="og:type" content="website" />
@@ -18,7 +18,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A $1,000,000+ machine learning and computer vision competition"
+    content="A $1,500,000+ machine learning and computer vision competition"
   />
   <meta
     property="og:image"
@@ -30,7 +30,7 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A $1,000,000+ machine learning and computer vision competition"
+    content="A $1,500,000+ machine learning and computer vision competition"
   />
   <meta
     property="twitter:image"
@@ -50,52 +50,61 @@ Vesuvius Challenge is ongoing and **YOU** can win the below prizes and help us m
 
 ***
 
-## Read Entire Scroll Prize ($200,000)
+## Unwrapping at Scale Prize
 
-We’re awarding $200,000 to the first team to unwrap an entire scroll and produce readable letters within.
+We’re awarding **$200,000** (single winner) for delivering **automated virtual unwrapping at production scale on two different scrolls**.
 
-We've made great strides by uncovering hidden text from inside a sealed Herculaneum scroll (now multiple!), but we're still reading 5% or less of full scrolls.
-Segmenting and reading an entire scroll, probably using more automated methods, is the next major milestone for our technical endeavor.
-Reach this bar, and $200,000 is yours!
+**Scope (two-scroll generalization).** Your pipeline must pass all requirements on **two distinct scrolls** from our official datasets. **At least one must be Scroll 1 _or_ Scroll 5.** The second can be **a different** scroll from the set.
+
+Ink detection is **not required**; the focus is high-quality segmentation, continuity, and flattening suitable for later reading.
 
 <div className="mb-4">
   <img src="/img/landing/scroll.webp" className="w-[50%]"/>
-  <figcaption className="mt-[-6px]">An Entire Scroll.</figcaption>
+  <figcaption className="mt-[-6px]">A carbonized scroll.</figcaption>
 </div>
 
 <details class="submission-details">
 <summary>Submission criteria and requirements</summary>
 
-1. **Segmentation**
-* Estimate the total area of the scroll’s written surface (in cm2)
-* Compute the total surface area of the segmented mesh (in cm2) in your submission. **You must segment 90% or more of the total estimated area**
-* Segments should be flattened and shown in 2D as if the scroll were unwrapped.
-* The scroll should ideally be captured by a single segmentation (or each connected component of the scroll) rather than separate overlapping segmentations.
-* Segments should pass geometric sanity checks; for example, no self-intersections
+### What to deliver (for each of the two scrolls)
+1. **Segmented sheet manifold(s).** A continuous 3D mesh (or meshes) of the papyrus sheet(s) suitable for flattening.
+2. **Flattened 2D sheets.** UV maps / atlases covering the **accepted area** you claim as correct.
+3. **Accepted-area mask.** Binary mask(s) over the flattened sheets indicating regions you assert are error-free.
+4. **Video record (if humans involved).** A screen-capture timelapse or periodic snapshots covering all interactive steps.
+5. **Reproducible pipeline.** Container with a one-click script that regenerates meshes, maps, masks, and sheets from organizer-supplied volumes.
 
-2. **Ink detection**
-* Your submission must contain ink predictions for the entire flattened mesh, of the same shape as the flattened surface
-* The entire submission is too large to transcribe quickly, so the papyrological team will evaluate each line as:
-    * ✅ **readable** (could read 85% of the characters),
-    * ❌ **not readable** (couldn't),
-    * 🟡 **maybe** (would have to stop and actually do the transcription to determine), or
-    * 🔷 **incomplete** (line incomplete due to the physical boundaries of the scroll)
-* 80% of the total complete lines (incomplete lines will not be judged) must be either 🟡 **maybe** or ✅ **readable**. Multiple papyrologists may review each line, in which case ties will be broken favorably towards the submission.
+### Pass/fail gates (must be met on **both** scrolls)
+- **Coverage: ≥ 70% (per scroll)** of the (to be estimated) total scroll surface after exclusions of areas masked as errors in the binary masks.
+- **Sheet-switch rate: ≤ 0.5% per scroll** over the audited area.
+    - *Definition:* It's the rate of triangles or quads in the delivered meshes that are marked as error-free in the binary masks but actually contain errors.
+- **Human effort cap: ≤ 72 human-hours per scroll** (i.e., **≤ 144 hours total** across the two).
+    - *Counts:* any human touch specific to processing the evaluation scrolls (seed placement, parameter tweaks, manual stitching/edits, quality control passes, mask painting, bookkeeping).
+    - *Doesn’t count:* general R&D prior to evaluation, model training on public data, writing docs, idle waiting while jobs run.
+- **Reproducibility:** Organizers must be able to re-run your container end-to-end and reproduce deliverables and metrics.
 
-As a baseline, here's how the 2023 Grand Prize banner would have scored:
+> **No compute cap.** We do not limit hardware or cloud cost.
 
-<div className="mb-4">
-  <img src="/img/2024-prizes/GP_scores_sample.webp" className="w-[80%]"/>
-  <figcaption className="mt-[-6px]">Visible Ink on Scroll 5 (<a href="/img/ink/2023_GP_banner_lines_score.webp">full banner</a>).</figcaption>
-</div>
+### Data & generalization
+- Two distinct scrolls from our official set. **At least one must be Scroll 1 or Scroll 5.** The second can be a **different** scroll.  
+- You may use public volumes/fragments for development. For prize evaluation, organizers provide the exact evaluation volumes for the two scrolls.  
 
-Total lines: 240. Complete lines: 206. Passing lines: 137. Pass rate: 137 / 206 = **67% (needs to be 80%)**.
+### Submission package
+- **GitHub repository** with code, container (e.g. Docker, conda, etc.), and run scripts.  
+- **Deliverables:** 3D meshes, flattened sheets (TIFF/PNG), UV maps, accepted-area masks.  
+- **Logs:** timing CSVs per scroll; screen-capture or snapshots; CLI logs; environment/hardware info; container image digest.  
+- **Method note:** 2–6 pages describing pipeline, assumptions, and known failure modes.  
+- **Licensing:** if you win, you agree to open-source the method under the CC BY-NC 4.0 License.
 
-We may reward partial work - if your unrolling works but the ink detection isn't all the way there yet, go ahead and submit!
-
+### Winner determination & tie-breakers
+- **Single winner:** the **first team** to pass all gates on **both** scrolls during organizer verification receives **$200,000**.  
+- If two teams pass within **96 hours**, tie-breakers:  
+  1) Lower **sheet-switch rate** across the two;
+  2) Higher **coverage** across the two scrolls;    
+  3) Fewer **total human-hours** (sum over both);  
+  4) Earlier submission timestamp.
 </details>
 
-[Submission Form](https://forms.gle/UJxi6rsS4eriV9L36)
+[Submission Form](https://forms.gle/MqP3XQGX7o2ZFfZW6)
 
 ***
 
@@ -142,6 +151,8 @@ Just as with the Grand Prize, please **do not** make your discovery public until
 
 ***
 
+> ⚠️ The previous prizes are too ambitious? You can still contribute!
+
 ## Progress Prizes
 
 In addition to milestone-based prizes, we offer monthly prizes for open source contributions that help read the scrolls.
@@ -183,22 +194,6 @@ Submissions are evaluated monthly, and multiple submissions/awards per month are
 </details>
 
 [Submission Form](https://forms.gle/xELK9EaQ5yzgD4nD8)
-
-***
-
-## Referral Prize
-
-Refer a successful hire - earn a $5,000 prize.
-
-<details>
-<summary>Submission criteria and requirements</summary>
-
-1. **The Offer:** Earn $5,000 for referring a candidate we hire for our research team!
-2. **Referrer Eligibility:** You must be legally eligible to receive the prize payment.
-3. **Hire Eligibility:** Candidates must be new contacts and legally authorized to receive payment from Vesuvius Challenge.
-4. **How to Refer:** Email jobs@scrollprize.org with subject: "Referral: [Candidate Name]." Include: your name & Discord username (if applicable), your contact information, candidate's name & contact information (confirming their permission), and why they're a good fit.
-5. **Terms:** Hires and prizes are determined at the sole discretion of Curious Cases, Inc. Referral must be submitted per the above instructions. Referral must be received before the candidate applies directly. Your referral must be the first one received for that candidate. The candidate must acknowledge your referral during hiring. The candidate must be hired for a full-time research team role.
-</details>
 
 ***
 

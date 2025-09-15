@@ -9,7 +9,7 @@ const remarkMath = require("remark-math").default; // Extract default export for
 /** @type {import('@docusaurus/types').Config} */
 const config = {
   title: "Vesuvius Challenge",
-  tagline: "A $1,000,000+ machine learning and computer vision competition",
+  tagline: "A $1,500,000+ machine learning and computer vision competition",
   url: "https://scrollprize.org",
   baseUrl: "/",
   onBrokenAnchors: "throw",
@@ -125,7 +125,7 @@ const config = {
           {
             name: "description",
             content:
-                "A $1,000,000+ machine learning and computer vision competition",
+                "A $1,500,000+ machine learning and computer vision competition",
           },
           {
             property: "og:type",
