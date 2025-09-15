@@ -50,7 +50,7 @@ Vesuvius Challenge is ongoing and **YOU** can win the below prizes and help us m
 
 ***
 
-## Unwrapping at Scale — Prize ($200,000)
+## Unwrapping at Scale Prize
 
 We’re awarding **$200,000** (single winner) for delivering **automated virtual unwrapping at production scale on two different scrolls**.
 
