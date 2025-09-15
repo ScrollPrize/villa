@@ -151,6 +151,8 @@ Just as with the Grand Prize, please **do not** make your discovery public until
 
 ***
 
+> ⚠️ The previous prizes are too ambitious? You can still contribute!
+
 ## Progress Prizes
 
 In addition to milestone-based prizes, we offer monthly prizes for open source contributions that help read the scrolls.
