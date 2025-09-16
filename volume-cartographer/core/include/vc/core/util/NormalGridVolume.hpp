@@ -27,6 +27,7 @@ namespace vc::core::util {
         };
 
         std::optional<GridQueryResult> query(const cv::Point3f& point, int plane_idx) const;
+        const GridStore* query_nearest(const cv::Point3f& point, int plane_idx) const;
 
     public:
         const nlohmann::json& metadata() const;
