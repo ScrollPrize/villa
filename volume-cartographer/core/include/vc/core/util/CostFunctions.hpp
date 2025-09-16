@@ -564,7 +564,7 @@ struct NormalConstraintPlane {
      const float roi_radius_ = 64.0f;
      const float query_radius_ = roi_radius_ + 16.0f;
      const double snap_trig_th_ = 4.0;
-     const double snap_search_range_ = 8.0;
+     const double snap_search_range_ = 16.0;
  
      NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight)
          : normal_grid_volume(normal_grid_volume), plane_idx(plane_idx), weight(weight) {}
@@ -731,6 +731,8 @@ struct NormalConstraintPlane {
         if (!path_cache.valid(p1_cv, p2_cv, cache_radius_normal_)) {
             cv::Point2f midpoint_cv = 0.5f * (p1_cv + p2_cv);
             path_cache.put(p1_cv, p2_cv, normal_grid.get(midpoint_cv, query_radius_));
+            // Invalidate snapping cache whenever the path cache is updated
+            snap_loss_caches_[grid_idx] = {};
         }
         const auto& nearby_paths = path_cache.get();
 
