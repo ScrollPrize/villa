@@ -833,8 +833,8 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     int curr_ref_min = ref_max;
 
     while (!fringe.empty()) {
-        bool global_opt = true;
-        // bool global_opt = generation <= 20;
+        // bool global_opt = true;
+        bool global_opt = generation <= 50;
 
         //stop drifting after some initial opt
         if (generation == 3) {
