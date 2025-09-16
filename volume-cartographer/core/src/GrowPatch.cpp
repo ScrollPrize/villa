@@ -455,7 +455,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t
 
 
     ceres::Solver::Options options;
-    options.linear_solver_type = ceres::DENSE_QR;
+    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 100;
     options.function_tolerance = 1e-4;
@@ -464,21 +464,22 @@ static float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t
 //    if (problem.NumParameterBlocks() > 1) {
 //        options.use_inner_iterations = true;
 //    }
-// #ifdef VC_USE_CUDA_SPARSE
-//     // Check if Ceres was actually built with CUDA sparse support
-//     if (g_use_cuda) {
-//         if (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::CUDA_SPARSE)) {
-//             options.linear_solver_type = ceres::SPARSE_SCHUR;
-//             options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
-// /*
-//             if (options.linear_solver_type == ceres::SPARSE_SCHUR) {
-//                 options.use_mixed_precision_solves = true;
-//             }*/
-//         } else {
-//             std::cerr << "Warning: use_cuda=true but Ceres was not built with CUDA sparse support. Falling back to CPU sparse." << std::endl;
-//         }
-//     }
-// #endif
+#ifdef VC_USE_CUDA_SPARSE
+    // Check if Ceres was actually built with CUDA sparse support
+    if (g_use_cuda) {
+        if (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::CUDA_SPARSE)) {
+            // options.linear_solver_type = ceres::SPARSE_SCHUR;
+            options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+            options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
+/*
+            if (options.linear_solver_type == ceres::SPARSE_SCHUR) {
+                options.use_mixed_precision_solves = true;
+            }*/
+        } else {
+            std::cerr << "Warning: use_cuda=true but Ceres was not built with CUDA sparse support. Falling back to CPU sparse." << std::endl;
+        }
+    }
+#endif
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
 
@@ -776,23 +777,23 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     big_problem.SetParameterBlockConstant(&locs(y0,x0)[0]);
 
     ceres::Solver::Options options_big;
-    options_big.linear_solver_type = ceres::SPARSE_SCHUR;
+    options_big.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
     options_big.use_nonmonotonic_steps = true;
-#ifdef VC_USE_CUDA_SPARSE
-    // Check if Ceres was actually built with CUDA sparse support
-    if (g_use_cuda) {
-        if (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::CUDA_SPARSE)) {
-            options_big.linear_solver_type = ceres::SPARSE_SCHUR;
-            options_big.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
-
-            // if (options_big.linear_solver_type == ceres::SPARSE_SCHUR) {
-            //     options_big.use_mixed_precision_solves = true;
-            // }
-        } else {
-            std::cerr << "Warning: use_cuda=true but Ceres was not built with CUDA sparse support. Falling back to CPU sparse." << std::endl;
-        }
-    }
-#endif
+// #ifdef VC_USE_CUDA_SPARSE
+//     // Check if Ceres was actually built with CUDA sparse support
+//     if (g_use_cuda) {
+//         if (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::CUDA_SPARSE)) {
+//             options_big.linear_solver_type = ceres::SPARSE_SCHUR;
+//             options_big.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
+//
+//             // if (options_big.linear_solver_type == ceres::SPARSE_SCHUR) {
+//             //     options_big.use_mixed_precision_solves = true;
+//             // }
+//         } else {
+//             std::cerr << "Warning: use_cuda=true but Ceres was not built with CUDA sparse support. Falling back to CPU sparse." << std::endl;
+//         }
+//     }
+// #endif
     options_big.minimizer_progress_to_stdout = false;
     options_big.max_num_iterations = 100;
 
@@ -1059,11 +1060,11 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                     // We found a good solution to the local problem; add losses for the new point to the global problem, add the
                     // new point to the fringe, and record as successful
                     generations(p) = generation;
-                    if (global_opt) {
-#pragma omp critical
-                        loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, p, state, locs,
-                                                                                interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
-                    }
+//                     if (global_opt) {
+// #pragma omp critical
+//                         loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, p, state, locs,
+//                                                                                 interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
+//                     }
 #pragma omp atomic
                     succ++;
 #pragma omp atomic
@@ -1081,7 +1082,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                         succ_gen_ps.push_back(p);
                     }
 
-                    local_optimization(2, p, state, locs, interp, proc_tensor, direction_fields, ngv.get(), Ts, true);
+                    // local_optimization(2, p, state, locs, interp, proc_tensor, direction_fields, ngv.get(), Ts, true);
                 }
             }  // end parallel iteration over cands
         }
@@ -1117,6 +1118,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         else if (!fringe.empty())
             curr_ref_min = ref_max;
 
+        //FIXME single point emptytrace_create_missing_centered_losses seems to miss points for normals ...
         // for(int j=used_area.y;j<used_area.br().y;j++)
         //     for(int i=used_area.x;i<used_area.br().x;i++) {
         //         if (state(j, i) & STATE_LOC_VALID)
@@ -1164,21 +1166,22 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             }
         }
         else {
-            if (generation > 24 && global_opt) {
-                // Beyond 10 generations but while still trying global re-solves, simplify the big problem by fixing locations
-                // of points that are already 'certain', in the sense they are not near any other points that don't yet have valid
-                // locations
-                cv::Mat_<cv::Vec2d> _empty;
-                freeze_inner_params(big_problem, 24, state, locs, _empty, loss_status, STATE_LOC_VALID | STATE_COORD_VALID);
-            }
+            // if (generation > 24 && global_opt) {
+            //     // Beyond 10 generations but while still trying global re-solves, simplify the big problem by fixing locations
+            //     // of points that are already 'certain', in the sense they are not near any other points that don't yet have valid
+            //     // locations
+            //     cv::Mat_<cv::Vec2d> _empty;
+            //     freeze_inner_params(big_problem, 24, state, locs, _empty, loss_status, STATE_LOC_VALID | STATE_COORD_VALID);
+            // }
 
-            if (generation % 8 == 0) {
+            local_optimization(stop_gen+10, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts, true);
+            // if (generation % 8 == 0) {
                 // For early generations, re-solve the big problem, jointly optimising the locations of all points in the patch
-                std::cout << "running big solve" << std::endl;
-                ceres::Solve(options_big, &big_problem, &big_summary);
-                std::cout << big_summary.BriefReport() << "\n";
-                std::cout << "avg err: " << sqrt(big_summary.final_cost/big_summary.num_residual_blocks) << std::endl;
-            }
+                // std::cout << "running big solve" << std::endl;
+                // ceres::Solve(options_big, &big_problem, &big_summary);
+                // std::cout << big_summary.BriefReport() << "\n";
+                // std::cout << "avg err: " << sqrt(big_summary.final_cost/big_summary.num_residual_blocks) << std::endl;
+            // }
         }
 
         cands.resize(0);
