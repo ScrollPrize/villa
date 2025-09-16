@@ -12,6 +12,7 @@
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/CostFunctions.hpp"
+#include "vc/core/util/HashFunctions.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
 
 #include "vc/core/util/xtensor_include.hpp"
@@ -338,7 +339,10 @@ static int emptytrace_create_centered_losses(ceres::Problem &problem, const cv::
     //
     //     count += gen_direction_loss(problem, p, 1, state, loc, direction_fields);
     //     count += gen_direction_loss(problem, p, -1, state, loc, direction_fields);
-        count += gen_normal_loss(problem, p, state, loc, ngv, normal_loss_w);
+        count += gen_normal_loss(problem, p                  , state, loc, ngv, normal_loss_w);
+        count += gen_normal_loss(problem, p + cv::Vec2i(1,1) , state, loc, ngv, normal_loss_w);
+        count += gen_normal_loss(problem, p + cv::Vec2i(1, 0), state, loc, ngv, normal_loss_w);
+        count += gen_normal_loss(problem, p + cv::Vec2i( 0,1), state, loc, ngv, normal_loss_w);
     }
 
     return count;
@@ -412,7 +416,10 @@ static int emptytrace_create_missing_centered_losses(ceres::Problem &problem, cv
     //
     //     count += conditional_direction_loss(9, p, 1, loss_status, problem, state, loc, direction_fields);
     //     count += conditional_direction_loss(9, p, -1, loss_status, problem, state, loc, direction_fields);
-        count += conditional_normal_loss(10, p, loss_status, problem, state, loc, ngv);
+        count += conditional_normal_loss(10, p                 , loss_status, problem, state, loc, ngv);
+        count += conditional_normal_loss(10, p + cv::Vec2i(1,1), loss_status, problem, state, loc, ngv);
+        count += conditional_normal_loss(10, p + cv::Vec2i(0,1), loss_status, problem, state, loc, ngv);
+        count += conditional_normal_loss(10, p + cv::Vec2i(1,0), loss_status, problem, state, loc, ngv);
     }
 
     return count;
@@ -448,30 +455,30 @@ static float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t
 
 
     ceres::Solver::Options options;
-    options.linear_solver_type = ceres::SPARSE_SCHUR;
+    options.linear_solver_type = ceres::DENSE_QR;
     options.minimizer_progress_to_stdout = false;
-    options.max_num_iterations = 10000;
+    options.max_num_iterations = 100;
     options.function_tolerance = 1e-4;
     options.use_nonmonotonic_steps = true;
 
 //    if (problem.NumParameterBlocks() > 1) {
 //        options.use_inner_iterations = true;
 //    }
-#ifdef VC_USE_CUDA_SPARSE
-    // Check if Ceres was actually built with CUDA sparse support
-    if (g_use_cuda) {
-        if (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::CUDA_SPARSE)) {
-            options.linear_solver_type = ceres::SPARSE_SCHUR;
-            options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
-/*
-            if (options.linear_solver_type == ceres::SPARSE_SCHUR) {
-                options.use_mixed_precision_solves = true;
-            }*/
-        } else {
-            std::cerr << "Warning: use_cuda=true but Ceres was not built with CUDA sparse support. Falling back to CPU sparse." << std::endl;
-        }
-    }
-#endif
+// #ifdef VC_USE_CUDA_SPARSE
+//     // Check if Ceres was actually built with CUDA sparse support
+//     if (g_use_cuda) {
+//         if (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::CUDA_SPARSE)) {
+//             options.linear_solver_type = ceres::SPARSE_SCHUR;
+//             options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
+// /*
+//             if (options.linear_solver_type == ceres::SPARSE_SCHUR) {
+//                 options.use_mixed_precision_solves = true;
+//             }*/
+//         } else {
+//             std::cerr << "Warning: use_cuda=true but Ceres was not built with CUDA sparse support. Falling back to CPU sparse." << std::endl;
+//         }
+//     }
+// #endif
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
 
@@ -661,7 +668,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     cv::Rect used_area;
     ceres::Problem big_problem;
     int loss_count = 0;
-    int generation = 0;
+    int generation = 1;
     int succ = 0;  // number of quads successfully added to the patch (each of size approx. step**2)
     double last_elapsed_seconds = 0.0;
     int last_succ = 0;
@@ -679,12 +686,15 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         int pad_y = (h - resume_points.rows) / 2;
 
         used_area = cv::Rect(pad_x, pad_y, resume_points.cols, resume_points.rows);
-
+ 
         double min_val, max_val;
         cv::minMaxLoc(resume_generations, &min_val, &max_val);
         int start_gen = (rewind_gen == -1) ? static_cast<int>(max_val) : rewind_gen;
         generation = start_gen;
 
+        int min_gen = std::numeric_limits<int>::max();
+        x0 = -1;
+        y0 = -1;
         for (int j = 0; j < resume_points.rows; ++j) {
             for (int i = 0; i < resume_points.cols; ++i) {
                 int target_y = pad_y + j;
@@ -695,6 +705,11 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                     generations(target_y, target_x) = gen;
                     state(target_y, target_x) = STATE_LOC_VALID | STATE_COORD_VALID;
                     fringe.push_back({target_y, target_x});
+                    if (gen < min_gen) {
+                        min_gen = gen;
+                        x0 = target_x;
+                        y0 = target_y;
+                    }
                 }
             }
         }
@@ -703,6 +718,12 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, p, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
             succ++;
         }
+
+        big_problem.SetParameterBlockConstant(&locs(y0,x0)[0]);
+        big_problem.SetParameterBlockConstant(&locs(y0,x0+1)[0]);
+        big_problem.SetParameterBlockConstant(&locs(y0+1,x0)[0]);
+        big_problem.SetParameterBlockConstant(&locs(y0+1,x0+1)[0]);
+
         last_succ = succ;
         last_elapsed_seconds = f_timer.seconds();
         std::cout << "Resuming from generation " << generation << " with " << fringe.size() << " points. Initial loss count: " << loss_count << std::endl;
@@ -720,6 +741,11 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         state(y0+1,x0) = STATE_LOC_VALID | STATE_COORD_VALID;
         state(y0,x0+1) = STATE_LOC_VALID | STATE_COORD_VALID;
         state(y0+1,x0+1) = STATE_LOC_VALID | STATE_COORD_VALID;
+
+        generations(y0,x0) = 1;
+        generations(y0,x0+1) = 1;
+        generations(y0+1,x0) = 1;
+        generations(y0+1,x0+1) = 1;
 
         // This Ceres problem is parameterised by locs; residuals are progressively added as the patch grows enforcing that
         // all points in the patch are correct distance in 2D vs 3D space, not too high curvature, near surface prediction, etc.
@@ -759,15 +785,15 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     }
 #endif
     options_big.minimizer_progress_to_stdout = false;
-    options_big.max_num_iterations = 1000;
+    options_big.max_num_iterations = 100;
 
     // Solve the initial optimisation problem, just placing the first four vertices around the seed
     ceres::Solver::Summary big_summary;
     //just continue on resume no additional global opt
-    if (!resume_surf) {
+    // if (!resume_surf) {
         ceres::Solve(options_big, &big_problem, &big_summary);
         std::cout << big_summary.BriefReport() << "\n";
-    }
+    // }
 
     // Prepare a new set of Ceres options used later during local solves
     ceres::Solver::Options options;
@@ -783,8 +809,8 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
 
     int max_local_opt_r = 4;
 
-    std::vector<float> gen_max_cost;
-    std::vector<float> gen_avg_cost;
+    // std::vector<float> gen_max_cost;
+    // std::vector<float> gen_avg_cost;
 
     int ref_max = 6;
     int curr_ref_min = ref_max;
@@ -794,7 +820,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         // bool global_opt = generation <= 20;
 
         //stop drifting after some initial opt
-        if (generation == 2) {
+        if (generation == 3) {
             big_problem.SetParameterBlockConstant(&locs(y0,x0)[0]);
             big_problem.SetParameterBlockConstant(&locs(y0,x0+1)[0]);
             big_problem.SetParameterBlockConstant(&locs(y0+1,x0)[0]);
@@ -838,8 +864,8 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
 
         std::cout << "cands " << cands.size() << std::endl;
 
-        if (generation % 10 == 0)
-            curr_ref_min = std::min(curr_ref_min, 5);
+        // if (generation % 10 == 0)
+            // curr_ref_min = std::min(curr_ref_min, 5);
 
         int succ_gen = 0;
         std::vector<cv::Vec2i> succ_gen_ps;
@@ -1045,9 +1071,28 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                         fringe.push_back(p);
                         succ_gen_ps.push_back(p);
                     }
+
+                    local_optimization(2, p, state, locs, interp, proc_tensor, direction_fields, ngv.get(), Ts, true);
                 }
             }  // end parallel iteration over cands
         }
+
+        //fring opt
+        // {
+        //     std::unordered_set<cv::Vec2i> fringe_set;
+        //     for(auto p : fringe)
+        //         fringe_set.insert(p);
+        //
+        //     while (fringe_set.size())
+        //         for(auto p : fringe_set) {
+        //             local_optimization(4, p, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts, true);
+        //             for(auto p2 : fringe_set)
+        //                 if (p != p2 && p.dot(p2) <= 1*1)
+        //                     fringe_set.erase(p2);
+        //             fringe_set.erase(p);
+        //             break;
+        //         }
+        // }
 
         // If there are now no fringe points, reduce the required compactness when considering cands for the next generation
         if (fringe.empty() && curr_ref_min > 2) {
@@ -1063,12 +1108,12 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         else if (!fringe.empty())
             curr_ref_min = ref_max;
 
-        for(int j=used_area.y;j<used_area.br().y;j++)
-            for(int i=used_area.x;i<used_area.br().x;i++) {
-                if (state(j, i) & STATE_LOC_VALID)
-                    loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {j,i}, state, locs,
-                                                                interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
-            }
+        // for(int j=used_area.y;j<used_area.br().y;j++)
+        //     for(int i=used_area.x;i<used_area.br().x;i++) {
+        //         if (state(j, i) & STATE_LOC_VALID)
+        //             loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {j,i}, state, locs,
+        //                                                         interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
+        //     }
 
         for(const auto& p: fringe)
             if (locs(p)[0] == -1)
@@ -1110,19 +1155,21 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             }
         }
         else {
-            // if (generation > 20 && global_opt) {
+            // if (generation > 24 && global_opt) {
             //     // Beyond 10 generations but while still trying global re-solves, simplify the big problem by fixing locations
             //     // of points that are already 'certain', in the sense they are not near any other points that don't yet have valid
             //     // locations
             //     cv::Mat_<cv::Vec2d> _empty;
-            //     freeze_inner_params(big_problem, 20, state, locs, _empty, loss_status, STATE_LOC_VALID | STATE_COORD_VALID);
+            //     freeze_inner_params(big_problem, 24, state, locs, _empty, loss_status, STATE_LOC_VALID | STATE_COORD_VALID);
             // }
 
-            // For early generations, re-solve the big problem, jointly optimising the locations of all points in the patch
-            std::cout << "running big solve" << std::endl;
-            ceres::Solve(options_big, &big_problem, &big_summary);
-            std::cout << big_summary.BriefReport() << "\n";
-            std::cout << "avg err: " << sqrt(big_summary.final_cost/big_summary.num_residual_blocks) << std::endl;
+            if (generation % 8 == 0) {
+                // For early generations, re-solve the big problem, jointly optimising the locations of all points in the patch
+                std::cout << "running big solve" << std::endl;
+                ceres::Solve(options_big, &big_problem, &big_summary);
+                std::cout << big_summary.BriefReport() << "\n";
+                std::cout << "avg err: " << sqrt(big_summary.final_cost/big_summary.num_residual_blocks) << std::endl;
+            }
         }
 
         cands.resize(0);
@@ -1133,23 +1180,23 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         used_area_safe.y -= 2;
         used_area_safe.width += 4;
         used_area_safe.height += 4;
-        cv::Mat_<cv::Vec3d> locs_crop = locs(used_area_safe);
-        cv::Mat_<uint8_t> state_crop = state(used_area_safe);
-        double max_cost = 0;
-        double avg_cost = 0;
-        int cost_count = 0;
-        for(int j=2;j<locs_crop.rows-2;j++)
-            for(int i=2;i<locs_crop.cols-2;i++) {
-                ceres::Problem problem;
-                emptytrace_create_centered_losses(problem, {j,i}, state_crop, locs_crop, interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
-                double cost = 0.0;
-                problem.Evaluate(ceres::Problem::EvaluateOptions(), &cost, nullptr, nullptr, nullptr);
-                max_cost = std::max(max_cost, cost);
-                avg_cost += cost;
-                cost_count++;
-            }
-        gen_avg_cost.push_back(avg_cost/cost_count);
-        gen_max_cost.push_back(max_cost);
+        // cv::Mat_<cv::Vec3d> locs_crop = locs(used_area_safe);
+        // cv::Mat_<uint8_t> state_crop = state(used_area_safe);
+        // double max_cost = 0;
+        // double avg_cost = 0;
+        // int cost_count = 0;
+        // for(int j=2;j<locs_crop.rows-2;j++)
+        //     for(int i=2;i<locs_crop.cols-2;i++) {
+        //         ceres::Problem problem;
+        //         emptytrace_create_centered_losses(problem, {j,i}, state_crop, locs_crop, interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
+        //         double cost = 0.0;
+        //         problem.Evaluate(ceres::Problem::EvaluateOptions(), &cost, nullptr, nullptr, nullptr);
+        //         max_cost = std::max(max_cost, cost);
+        //         avg_cost += cost;
+        //         cost_count++;
+        //     }
+        // gen_avg_cost.push_back(avg_cost/cost_count);
+        // gen_max_cost.push_back(max_cost);
 
         // --- Speed Reporting ---
         double elapsed_seconds = f_timer.seconds();
@@ -1169,7 +1216,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         double current_speed_mm2_s = (seconds_this_gen > 0) ? (succ_this_gen * mm2_per_quad / seconds_this_gen) : 0.0;
         double avg_speed_m2_day = (elapsed_seconds > 0) ? (total_area_m2 / (elapsed_seconds / (24.0 * 3600.0))) : 0.0;
 
-        printf("-> done %d | fringe %ld | area %.2f mm^2 (%.4f m^2) | avg speed %.2f mm^2/s (%.2f m^2/day) | current speed %.2f mm^2/s\n",
+        printf("-> done %d | fringe %ld | area %.2f mm^2 (%.6f m^2) | avg speed %.2f mm^2/s (%.6f m^2/day) | current speed %.2f mm^2/s\n",
                succ, (long)fringe.size(), total_area_mm2, total_area_m2, avg_speed_mm2_s, avg_speed_m2_day, current_speed_mm2_s);
 
         last_elapsed_seconds = elapsed_seconds;
@@ -1219,8 +1266,8 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     (*surf->meta)["max_cost"] = max_cost;
     (*surf->meta)["avg_cost"] = avg_cost;
     (*surf->meta)["max_gen"] = generation;
-    (*surf->meta)["gen_avg_cost"] = gen_avg_cost;
-    (*surf->meta)["gen_max_cost"] = gen_max_cost;
+    // (*surf->meta)["gen_avg_cost"] = gen_avg_cost;
+    // (*surf->meta)["gen_max_cost"] = gen_max_cost;
     (*surf->meta)["seed"] = {origin[0],origin[1],origin[2]};
     (*surf->meta)["elapsed_time_s"] = f_timer.seconds();
 

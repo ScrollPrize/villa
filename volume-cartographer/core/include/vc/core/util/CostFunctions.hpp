@@ -531,8 +531,10 @@ struct NormalConstraintPlane {
      struct PointPairCache {
          cv::Point2f p1_ = {-1, -1}, p2_ = {-1, -1};
          T payload_;
+         const vc::core::util::NormalGridVolume* grid_source = nullptr;
  
-         bool valid(const cv::Point2f& p1, const cv::Point2f& p2, float th) const {
+         bool valid(const cv::Point2f& p1, const cv::Point2f& p2, float th, const vc::core::util::NormalGridVolume* current_grid_source) const {
+             if (grid_source != current_grid_source) return false;
              cv::Point2f d1 = p1 - p1_;
              cv::Point2f d2 = p2 - p2_;
              return (d1.dot(d1) + d2.dot(d2)) < th * th;
@@ -540,10 +542,11 @@ struct NormalConstraintPlane {
  
          const T& get() const { return payload_; }
  
-         void put(const cv::Point2f& p1, const cv::Point2f& p2, T payload) {
+         void put(const cv::Point2f& p1, const cv::Point2f& p2, T payload, const vc::core::util::NormalGridVolume* new_grid_source) {
              p1_ = p1;
              p2_ = p2;
              payload_ = std::move(payload);
+             grid_source = new_grid_source;
          }
      };
  
@@ -638,6 +641,7 @@ struct NormalConstraintPlane {
 
         // Query the normal grids.
         cv::Point3f query_point(val(pA[0]), val(pA[1]), val(pA[2]));
+
         auto grid_query = normal_grid_volume.query(query_point, plane_idx);
         if (!grid_query) {
             return true;
@@ -647,6 +651,12 @@ struct NormalConstraintPlane {
         T loss1 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid1, 0);
         T loss2 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid2, 1);
         T interpolated_loss = (T(1.0) - T(grid_query->weight)) * loss1 + T(grid_query->weight) * loss2;
+
+        // auto grid = normal_grid_volume.query_nearest(query_point, plane_idx);
+        // if (!grid)
+        //     return true;
+        //
+        // T interpolated_loss = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid, 0);
 
         // Calculate angular weight.
         double v_abn[3], v_ac[3];
@@ -728,9 +738,9 @@ struct NormalConstraintPlane {
 
         auto& path_cache = path_caches_[grid_idx];
 
-        if (!path_cache.valid(p1_cv, p2_cv, cache_radius_normal_)) {
+        if (!path_cache.valid(p1_cv, p2_cv, cache_radius_normal_, &normal_grid_volume)) {
             cv::Point2f midpoint_cv = 0.5f * (p1_cv + p2_cv);
-            path_cache.put(p1_cv, p2_cv, normal_grid.get(midpoint_cv, query_radius_));
+            path_cache.put(p1_cv, p2_cv, normal_grid.get(midpoint_cv, query_radius_), &normal_grid_volume);
             // Invalidate snapping cache whenever the path cache is updated
             snap_loss_caches_[grid_idx] = {};
         }
@@ -780,45 +790,45 @@ struct NormalConstraintPlane {
 
         // Snapping logic
         auto& snap_cache = snap_loss_caches_[grid_idx];
-        if (!snap_cache.valid(p1_cv, p2_cv, cache_radius_snap_)) {
+        if (!snap_cache.valid(p1_cv, p2_cv, cache_radius_snap_, &normal_grid_volume)) {
             SnapLossPayload payload;
             float closest_dist_norm = std::numeric_limits<float>::max();
-
-            for (int path_idx = 0; path_idx < nearby_paths.size(); ++path_idx) {
-                const auto& path = *nearby_paths[path_idx];
-                if (path.size() < 2) continue;
-
-                for (int i = 0; i < path.size() - 1; ++i) {
-                    float d2_sq = point_line_dist_sq(p2_cv, path[i], path[i+1]);
-                    if (d2_sq >= snap_trig_th_ * snap_trig_th_) continue;
-
-                    if (i < path.size() - 2) { // Check next segment
-                        float d1_sq = point_line_dist_sq(p1_cv, path[i+1], path[i+2]);
-                        if (d1_sq < snap_search_range_ * snap_search_range_) {
-                            float dist_norm = 0.5f * (sqrt(d1_sq)/snap_search_range_ + sqrt(d2_sq)/snap_trig_th_);
-                            if (dist_norm < closest_dist_norm) {
-                                closest_dist_norm = dist_norm;
-                                payload.best_path_idx = path_idx;
-                                payload.best_seg_idx = i;
-                                payload.best_is_next = true;
-                            }
-                        }
-                    }
-                    if (i > 0) { // Check prev segment
-                        float d1_sq = point_line_dist_sq(p1_cv, path[i-1], path[i]);
+ 
+             for (int path_idx = 0; path_idx < nearby_paths.size(); ++path_idx) {
+                 const auto& path = *nearby_paths[path_idx];
+                 if (path.size() < 2) continue;
+ 
+                 for (int i = 0; i < path.size() - 1; ++i) {
+                     float d2_sq = point_line_dist_sq(p2_cv, path[i], path[i+1]);
+                     if (d2_sq >= snap_trig_th_ * snap_trig_th_) continue;
+ 
+                     if (i < path.size() - 2) { // Check next segment
+                         float d1_sq = point_line_dist_sq(p1_cv, path[i+1], path[i+2]);
                          if (d1_sq < snap_search_range_ * snap_search_range_) {
-                            float dist_norm = 0.5f * (sqrt(d1_sq)/snap_search_range_ + sqrt(d2_sq)/snap_trig_th_);
-                            if (dist_norm < closest_dist_norm) {
-                                closest_dist_norm = dist_norm;
-                                payload.best_path_idx = path_idx;
-                                payload.best_seg_idx = i;
-                                payload.best_is_next = false;
-                            }
-                        }
-                    }
-                }
-            }
-            snap_cache.put(p1_cv, p2_cv, payload);
+                             float dist_norm = 0.5f * (sqrt(d1_sq)/snap_search_range_ + sqrt(d2_sq)/snap_trig_th_);
+                             if (dist_norm < closest_dist_norm) {
+                                 closest_dist_norm = dist_norm;
+                                 payload.best_path_idx = path_idx;
+                                 payload.best_seg_idx = i;
+                                 payload.best_is_next = true;
+                             }
+                         }
+                     }
+                     if (i > 0) { // Check prev segment
+                         float d1_sq = point_line_dist_sq(p1_cv, path[i-1], path[i]);
+                          if (d1_sq < snap_search_range_ * snap_search_range_) {
+                             float dist_norm = 0.5f * (sqrt(d1_sq)/snap_search_range_ + sqrt(d2_sq)/snap_trig_th_);
+                             if (dist_norm < closest_dist_norm) {
+                                 closest_dist_norm = dist_norm;
+                                 payload.best_path_idx = path_idx;
+                                 payload.best_seg_idx = i;
+                                 payload.best_is_next = false;
+                             }
+                         }
+                     }
+                 }
+             }
+            snap_cache.put(p1_cv, p2_cv, payload, &normal_grid_volume);
         }
 
         const auto& snap_payload = snap_cache.get();

@@ -264,7 +264,7 @@ public:
 // protected:
     std::unordered_map<SurfPoint,cv::Vec2d,SurfPoint_hash> _data;
     std::unordered_map<resId_t,ceres::ResidualBlockId,resId_hash> _res_blocks;
-    std::unordered_map<cv::Vec2i,std::set<SurfaceMeta*>,vec2i_hash> _surfs;
+    std::unordered_map<cv::Vec2i,std::set<SurfaceMeta*>> _surfs;
     std::set<SurfaceMeta*> _emptysurfs;
     cv::Vec3d seed_coord;
     cv::Vec2i seed_loc;
