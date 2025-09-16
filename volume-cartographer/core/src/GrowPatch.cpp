@@ -430,7 +430,7 @@ static int emptytrace_create_missing_centered_losses(ceres::Problem &problem, cv
 template <typename I, typename T, typename C>
 static float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &locs,
     const I &interp, Chunked3d<T,C> &t, std::vector<DirectionField> const &direction_fields,
-    const vc::core::util::NormalGridVolume *ngv, float unit, bool quiet = false)
+    const vc::core::util::NormalGridVolume *ngv, float unit, bool quiet = false, bool parallel = false)
 {
     ceres::Problem problem;
     cv::Mat_<uint16_t> loss_status(state.size());
@@ -462,7 +462,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t
     options.function_tolerance = 1e-4;
     options.use_nonmonotonic_steps = true;
 
-    if (radius > 10)
+    if (parallel)
         options.num_threads = omp_get_max_threads();
 
 //    if (problem.NumParameterBlocks() > 1) {
@@ -738,7 +738,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         big_problem.SetParameterBlockConstant(&locs(y0+1,x0)[0]);
         big_problem.SetParameterBlockConstant(&locs(y0+1,x0+1)[0]);
 
-        local_optimization(stop_gen+10, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts, false);
+        local_optimization(stop_gen+10, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts, false, true);
 
         last_succ = succ;
         last_elapsed_seconds = f_timer.seconds();
@@ -1182,7 +1182,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             // }
 
             if (generation % 8 == 0) {
-                local_optimization(stop_gen+10, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts, false);
+                local_optimization(stop_gen+10, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts, false, true);
                 // For early generations, re-solve the big problem, jointly optimising the locations of all points in the patch
                 // std::cout << "running big solve" << std::endl;
                 // ceres::Solve(options_big, &big_problem, &big_summary);
