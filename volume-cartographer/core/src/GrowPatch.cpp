@@ -210,14 +210,14 @@ static void freeze_inner_params(ceres::Problem &problem, int edge_dist, const cv
                     problem.SetParameterBlockConstant(&out(j,i)[0]);
                 if (!loc.empty() && problem.HasParameterBlock(&loc(j,i)[0]))
                     problem.SetParameterBlockConstant(&loc(j,i)[0]);
-                set_loss_mask(7, {j,i}, {0,0}, loss_status, 1);
+                // set_loss_mask(7, {j,i}, {0,0}, loss_status, 1);
             }
-            if (dist(j,i) >= edge_dist+1 && !loss_mask(8, {j,i}, {0,0}, loss_status)) {
+            if (dist(j,i) >= edge_dist+2 && !loss_mask(8, {j,i}, {0,0}, loss_status)) {
                 if (problem.HasParameterBlock(&out(j,i)[0]))
                     problem.RemoveParameterBlock(&out(j,i)[0]);
                 if (!loc.empty() && problem.HasParameterBlock(&loc(j,i)[0]))
                     problem.RemoveParameterBlock(&loc(j,i)[0]);
-                set_loss_mask(8, {j,i}, {0,0}, loss_status, 1);
+                // set_loss_mask(8, {j,i}, {0,0}, loss_status, 1);
             }
         }
 }
@@ -714,10 +714,19 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             }
         }
 
-        for (const auto& p : fringe) {
-            loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, p, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
-            succ++;
-        }
+        for(int j=used_area.y;j<used_area.br().y;j++)
+            for(int i=used_area.x;i<used_area.br().x;i++) {
+                if (state(j, i) & STATE_LOC_VALID) {
+                    loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {j,i}, state, locs,
+                                                                interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
+                    succ++;
+                }
+            }
+
+        // for (const auto& p : fringe) {
+        //     loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, p, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
+        //     succ++;
+        // }
 
         big_problem.SetParameterBlockConstant(&locs(y0,x0)[0]);
         big_problem.SetParameterBlockConstant(&locs(y0,x0+1)[0]);
@@ -1155,13 +1164,13 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             }
         }
         else {
-            // if (generation > 24 && global_opt) {
-            //     // Beyond 10 generations but while still trying global re-solves, simplify the big problem by fixing locations
-            //     // of points that are already 'certain', in the sense they are not near any other points that don't yet have valid
-            //     // locations
-            //     cv::Mat_<cv::Vec2d> _empty;
-            //     freeze_inner_params(big_problem, 24, state, locs, _empty, loss_status, STATE_LOC_VALID | STATE_COORD_VALID);
-            // }
+            if (generation > 24 && global_opt) {
+                // Beyond 10 generations but while still trying global re-solves, simplify the big problem by fixing locations
+                // of points that are already 'certain', in the sense they are not near any other points that don't yet have valid
+                // locations
+                cv::Mat_<cv::Vec2d> _empty;
+                freeze_inner_params(big_problem, 24, state, locs, _empty, loss_status, STATE_LOC_VALID | STATE_COORD_VALID);
+            }
 
             if (generation % 8 == 0) {
                 // For early generations, re-solve the big problem, jointly optimising the locations of all points in the patch

@@ -642,21 +642,21 @@ struct NormalConstraintPlane {
         // Query the normal grids.
         cv::Point3f query_point(val(pA[0]), val(pA[1]), val(pA[2]));
 
-        auto grid_query = normal_grid_volume.query(query_point, plane_idx);
-        if (!grid_query) {
-            return true;
-        }
+        // auto grid_query = normal_grid_volume.query(query_point, plane_idx);
+        // if (!grid_query) {
+        //     return true;
+        // }
 
         // Calculate normal loss for both grid planes and interpolate.
-        T loss1 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid1, 0);
-        T loss2 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid2, 1);
-        T interpolated_loss = (T(1.0) - T(grid_query->weight)) * loss1 + T(grid_query->weight) * loss2;
+        // T loss1 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid1, 0);
+        // T loss2 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid2, 1);
+        // T interpolated_loss = (T(1.0) - T(grid_query->weight)) * loss1 + T(grid_query->weight) * loss2;
 
-        // auto grid = normal_grid_volume.query_nearest(query_point, plane_idx);
-        // if (!grid)
-        //     return true;
-        //
-        // T interpolated_loss = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid, 0);
+        auto grid = normal_grid_volume.query_nearest(query_point, plane_idx);
+        if (!grid)
+            return true;
+
+        T interpolated_loss = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid, 0);
 
         // Calculate angular weight.
         double v_abn[3], v_ac[3];
