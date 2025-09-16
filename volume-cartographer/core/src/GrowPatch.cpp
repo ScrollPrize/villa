@@ -800,10 +800,10 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     // Solve the initial optimisation problem, just placing the first four vertices around the seed
     ceres::Solver::Summary big_summary;
     //just continue on resume no additional global opt
-    // if (!resume_surf) {
+    if (!resume_surf) {
         ceres::Solve(options_big, &big_problem, &big_summary);
         std::cout << big_summary.BriefReport() << "\n";
-    // }
+    }
 
     // Prepare a new set of Ceres options used later during local solves
     ceres::Solver::Options options;
