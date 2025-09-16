@@ -526,20 +526,48 @@ struct NormalConstraintPlane {
     const vc::core::util::NormalGridVolume& normal_grid_volume;
     const int plane_idx; // 0: XY, 1: XZ, 2: YZ
     const double weight;
-
-    // Caching for nearby paths
-    mutable cv::Point2f cached_midpoint1_ = {-1, -1};
-    mutable std::vector<std::shared_ptr<std::vector<cv::Point>>> cached_paths1_;
-    mutable cv::Point2f cached_midpoint2_ = {-1, -1};
-    mutable std::vector<std::shared_ptr<std::vector<cv::Point>>> cached_paths2_;
-    const float cache_radius_ = 16.0f;
-    const float roi_radius_ = 64.0f;
-    const float query_radius_ = roi_radius_ + 16.0f;
-    const double snap_trig_th_ = 4.0;
-    const double snap_search_range_ = 8.0;
-
-    NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight)
-        : normal_grid_volume(normal_grid_volume), plane_idx(plane_idx), weight(weight) {}
+ 
+     template<typename T>
+     struct PointPairCache {
+         cv::Point2f p1_ = {-1, -1}, p2_ = {-1, -1};
+         T payload_;
+ 
+         bool valid(const cv::Point2f& p1, const cv::Point2f& p2, float th) const {
+             cv::Point2f d1 = p1 - p1_;
+             cv::Point2f d2 = p2 - p2_;
+             return (d1.dot(d1) + d2.dot(d2)) < th * th;
+         }
+ 
+         const T& get() const { return payload_; }
+ 
+         void put(const cv::Point2f& p1, const cv::Point2f& p2, T payload) {
+             p1_ = p1;
+             p2_ = p2;
+             payload_ = std::move(payload);
+         }
+     };
+ 
+     // Caching for nearby paths
+     using PathCachePayload = std::vector<std::shared_ptr<std::vector<cv::Point>>>;
+     mutable std::array<PointPairCache<PathCachePayload>, 2> path_caches_;
+ 
+     // Caching for snapping loss results
+     struct SnapLossPayload {
+         int best_path_idx = -1;
+         int best_seg_idx = -1;
+         bool best_is_next = false;
+     };
+     mutable std::array<PointPairCache<SnapLossPayload>, 2> snap_loss_caches_;
+ 
+     const float cache_radius_normal_ = 16.0f;
+     const float cache_radius_snap_ = 1.0f;
+     const float roi_radius_ = 64.0f;
+     const float query_radius_ = roi_radius_ + 16.0f;
+     const double snap_trig_th_ = 4.0;
+     const double snap_search_range_ = 8.0;
+ 
+     NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight)
+         : normal_grid_volume(normal_grid_volume), plane_idx(plane_idx), weight(weight) {}
 
     template <typename T>
     bool operator()(const T* const pA, const T* const pB1, const T* const pB2, const T* const pC, T* residual) const {
@@ -616,8 +644,8 @@ struct NormalConstraintPlane {
         }
 
         // Calculate normal loss for both grid planes and interpolate.
-        T loss1 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid1, true);
-        T loss2 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid2, false);
+        T loss1 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid1, 0);
+        T loss2 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid2, 1);
         T interpolated_loss = (T(1.0) - T(grid_query->weight)) * loss1 + T(grid_query->weight) * loss2;
 
         // Calculate angular weight.
@@ -685,7 +713,7 @@ struct NormalConstraintPlane {
     }
 
     template <typename T>
-    T calculate_normal_snapping_loss(const T* p1, const T* p2, const vc::core::util::GridStore& normal_grid, bool is_grid1) const {
+    T calculate_normal_snapping_loss(const T* p1, const T* p2, const vc::core::util::GridStore& normal_grid, int grid_idx) const {
         T edge_vec_x = p2[0] - p1[0];
         T edge_vec_y = p2[1] - p1[1];
 
@@ -698,22 +726,20 @@ struct NormalConstraintPlane {
         T edge_normal_x = edge_vec_y / edge_len;
         T edge_normal_y = -edge_vec_x / edge_len;
 
-        cv::Point2f midpoint_cv(val(p1[0] + edge_vec_x * 0.5), val(p1[1] + edge_vec_y * 0.5));
+        cv::Point2f p1_cv(val(p1[0]), val(p1[1]));
+        cv::Point2f p2_cv(val(p2[0]), val(p2[1]));
+        cv::Point2f midpoint_cv = 0.5f * (p1_cv + p2_cv);
 
-        auto& cached_midpoint = is_grid1 ? cached_midpoint1_ : cached_midpoint2_;
-        auto& cached_paths = is_grid1 ? cached_paths1_ : cached_paths2_;
+        auto& path_cache = path_caches_[grid_idx];
 
-        float dx = midpoint_cv.x - cached_midpoint.x;
-        float dy = midpoint_cv.y - cached_midpoint.y;
-        if (dx * dx + dy * dy > cache_radius_ * cache_radius_) {
-            cached_paths = normal_grid.get(midpoint_cv, query_radius_);
-            cached_midpoint = midpoint_cv;
+        if (!path_cache.valid(p1_cv, p2_cv, cache_radius_normal_)) {
+            path_cache.put(p1_cv, p2_cv, normal_grid.get(midpoint_cv, query_radius_));
         }
+        const auto& nearby_paths = path_cache.get();
 
-        if (cached_paths.empty()) {
+        if (nearby_paths.empty()) {
             return T(0.0);
         }
-        const auto& nearby_paths = cached_paths;
 
         T total_weighted_dot_product = T(0.0);
         T total_weight = T(0.0);
@@ -725,9 +751,6 @@ struct NormalConstraintPlane {
             for (size_t i = 0; i < path.size() - 1; ++i) {
                 cv::Point2f p_a = path[i];
                 cv::Point2f p_b = path[i+1];
-
-                cv::Point2f p1_cv(val(p1[0]), val(p1[1]));
-                cv::Point2f p2_cv(val(p2[0]), val(p2[1]));
 
                 float dist_sq = seg_dist_sq_appx(p1_cv, p2_cv, p_a, p_b);
                 if (dist_sq > roi_radius_*roi_radius_)
@@ -757,62 +780,63 @@ struct NormalConstraintPlane {
         }
 
         // Snapping logic
-        float closest_dist_norm = std::numeric_limits<float>::max();
-        int best_path_idx = -1;
-        int best_seg_idx = -1;
-        bool best_is_next = false;
+        auto& snap_cache = snap_loss_caches_[grid_idx];
+        if (!snap_cache.valid(p1_cv, p2_cv, cache_radius_snap_)) {
+            SnapLossPayload payload;
+            float closest_dist_norm = std::numeric_limits<float>::max();
 
-        cv::Point2f p1_cv(val(p1[0]), val(p1[1]));
-        cv::Point2f p2_cv(val(p2[0]), val(p2[1]));
+            for (int path_idx = 0; path_idx < nearby_paths.size(); ++path_idx) {
+                const auto& path = *nearby_paths[path_idx];
+                if (path.size() < 2) continue;
 
-        for (int path_idx = 0; path_idx < nearby_paths.size(); ++path_idx) {
-            const auto& path = *nearby_paths[path_idx];
-            if (path.size() < 2) continue;
+                for (int i = 0; i < path.size() - 1; ++i) {
+                    float d2_sq = point_line_dist_sq(p2_cv, path[i], path[i+1]);
+                    if (d2_sq >= snap_trig_th_ * snap_trig_th_) continue;
 
-            for (int i = 0; i < path.size() - 1; ++i) {
-                float d2_sq = point_line_dist_sq(p2_cv, path[i], path[i+1]);
-                if (d2_sq >= snap_trig_th_ * snap_trig_th_) continue;
-
-                if (i < path.size() - 2) { // Check next segment
-                    float d1_sq = point_line_dist_sq(p1_cv, path[i+1], path[i+2]);
-                    if (d1_sq < snap_search_range_ * snap_search_range_) {
-                        float dist_norm = 0.5f * (sqrt(d1_sq)/snap_search_range_ + sqrt(d2_sq)/snap_trig_th_);
-                        if (dist_norm < closest_dist_norm) {
-                            closest_dist_norm = dist_norm;
-                            best_path_idx = path_idx;
-                            best_seg_idx = i;
-                            best_is_next = true;
+                    if (i < path.size() - 2) { // Check next segment
+                        float d1_sq = point_line_dist_sq(p1_cv, path[i+1], path[i+2]);
+                        if (d1_sq < snap_search_range_ * snap_search_range_) {
+                            float dist_norm = 0.5f * (sqrt(d1_sq)/snap_search_range_ + sqrt(d2_sq)/snap_trig_th_);
+                            if (dist_norm < closest_dist_norm) {
+                                closest_dist_norm = dist_norm;
+                                payload.best_path_idx = path_idx;
+                                payload.best_seg_idx = i;
+                                payload.best_is_next = true;
+                            }
                         }
                     }
-                }
-                if (i > 0) { // Check prev segment
-                    float d1_sq = point_line_dist_sq(p1_cv, path[i-1], path[i]);
-                     if (d1_sq < snap_search_range_ * snap_search_range_) {
-                        float dist_norm = 0.5f * (sqrt(d1_sq)/snap_search_range_ + sqrt(d2_sq)/snap_trig_th_);
-                        if (dist_norm < closest_dist_norm) {
-                            closest_dist_norm = dist_norm;
-                            best_path_idx = path_idx;
-                            best_seg_idx = i;
-                            best_is_next = false;
+                    if (i > 0) { // Check prev segment
+                        float d1_sq = point_line_dist_sq(p1_cv, path[i-1], path[i]);
+                         if (d1_sq < snap_search_range_ * snap_search_range_) {
+                            float dist_norm = 0.5f * (sqrt(d1_sq)/snap_search_range_ + sqrt(d2_sq)/snap_trig_th_);
+                            if (dist_norm < closest_dist_norm) {
+                                closest_dist_norm = dist_norm;
+                                payload.best_path_idx = path_idx;
+                                payload.best_seg_idx = i;
+                                payload.best_is_next = false;
+                            }
                         }
                     }
                 }
             }
+            snap_cache.put(p1_cv, p2_cv, payload);
         }
 
+        const auto& snap_payload = snap_cache.get();
         T snapping_loss = T(0.0);
-        if (best_path_idx != -1) {
-            const auto& best_path = *nearby_paths[best_path_idx];
-            const auto& seg2_p1 = best_path[best_seg_idx];
-            const auto& seg2_p2 = best_path[best_seg_idx + 1];
+
+        if (snap_payload.best_path_idx != -1) {
+            const auto& best_path = *nearby_paths[snap_payload.best_path_idx];
+            const auto& seg2_p1 = best_path[snap_payload.best_seg_idx];
+            const auto& seg2_p2 = best_path[snap_payload.best_seg_idx + 1];
 
             cv::Point2f seg1_p1, seg1_p2;
-            if (best_is_next) {
-                seg1_p1 = best_path[best_seg_idx + 1];
-                seg1_p2 = best_path[best_seg_idx + 2];
+            if (snap_payload.best_is_next) {
+                seg1_p1 = best_path[snap_payload.best_seg_idx + 1];
+                seg1_p2 = best_path[snap_payload.best_seg_idx + 2];
             } else {
-                seg1_p1 = best_path[best_seg_idx - 1];
-                seg1_p2 = best_path[best_seg_idx];
+                seg1_p1 = best_path[snap_payload.best_seg_idx - 1];
+                seg1_p2 = best_path[snap_payload.best_seg_idx];
             }
 
             T d1_sq = point_line_dist_sq_differentiable(p1, seg1_p1, seg1_p2);
