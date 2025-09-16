@@ -339,10 +339,11 @@ static int emptytrace_create_centered_losses(ceres::Problem &problem, const cv::
     //
     //     count += gen_direction_loss(problem, p, 1, state, loc, direction_fields);
     //     count += gen_direction_loss(problem, p, -1, state, loc, direction_fields);
-        count += gen_normal_loss(problem, p                  , state, loc, ngv, normal_loss_w);
-        count += gen_normal_loss(problem, p + cv::Vec2i(1,1) , state, loc, ngv, normal_loss_w);
-        count += gen_normal_loss(problem, p + cv::Vec2i(1, 0), state, loc, ngv, normal_loss_w);
-        count += gen_normal_loss(problem, p + cv::Vec2i( 0,1), state, loc, ngv, normal_loss_w);
+        //TODO normal_loss currently implies OPTIMIZE_ALL - do physics only for now
+        // count += gen_normal_loss(problem, p                  , state, loc, ngv, normal_loss_w);
+        // count += gen_normal_loss(problem, p + cv::Vec2i(1,1) , state, loc, ngv, normal_loss_w);
+        // count += gen_normal_loss(problem, p + cv::Vec2i(1, 0), state, loc, ngv, normal_loss_w);
+        // count += gen_normal_loss(problem, p + cv::Vec2i( 0,1), state, loc, ngv, normal_loss_w);
     }
 
     return count;
@@ -464,22 +465,22 @@ static float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t
 //    if (problem.NumParameterBlocks() > 1) {
 //        options.use_inner_iterations = true;
 //    }
-#ifdef VC_USE_CUDA_SPARSE
-    // Check if Ceres was actually built with CUDA sparse support
-    if (g_use_cuda) {
-        if (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::CUDA_SPARSE)) {
-            // options.linear_solver_type = ceres::SPARSE_SCHUR;
-            options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-            options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
-/*
-            if (options.linear_solver_type == ceres::SPARSE_SCHUR) {
-                options.use_mixed_precision_solves = true;
-            }*/
-        } else {
-            std::cerr << "Warning: use_cuda=true but Ceres was not built with CUDA sparse support. Falling back to CPU sparse." << std::endl;
-        }
-    }
-#endif
+// #ifdef VC_USE_CUDA_SPARSE
+//     // Check if Ceres was actually built with CUDA sparse support
+//     if (g_use_cuda) {
+//         if (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::CUDA_SPARSE)) {
+//             // options.linear_solver_type = ceres::SPARSE_SCHUR;
+//             options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+//             options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
+// /*
+//             if (options.linear_solver_type == ceres::SPARSE_SCHUR) {
+//                 options.use_mixed_precision_solves = true;
+//             }*/
+//         } else {
+//             std::cerr << "Warning: use_cuda=true but Ceres was not built with CUDA sparse support. Falling back to CPU sparse." << std::endl;
+//         }
+//     }
+// #endif
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
 
@@ -817,7 +818,8 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
 
     int phys_fail_count = 0;
 
-    int max_local_opt_r = 4;
+    // int max_local_opt_r = 4;
+    int local_opt_r = 2;
 
     // std::vector<float> gen_max_cost;
     // std::vector<float> gen_avg_cost;
@@ -882,10 +884,10 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
 
         // Build a structure that allows parallel iteration over cands, while avoiding any two threads simultaneously
         // considering two points that are too close to each other...
-        OmpThreadPointCol cands_threadcol(max_local_opt_r*2+1, cands);
+        OmpThreadPointCol cands_threadcol(local_opt_r*2+1, cands);
 
         // ...then start iterating over candidates in parallel using the above to yield points
-// #pragma omp parallel
+#pragma omp parallel
         {
             CachedChunked3dInterpolator<uint8_t,thresholdedDistance> interp(proc_tensor);
 //             int idx = rand() % cands.size();
@@ -970,26 +972,26 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
 
                 // If the solve couldn't find a good 3D position for the new point, try again with a different random initialisation (this time
                 // around the average neighbor location instead of the best one)
-                if (loss1 > phys_fail_th) {
-                    cv::Vec3d best_loc = locs(p);
-                    double best_loss = loss1;
-                    for (int n=0;n<100;n++) {
-                        int range = step*10;
-                        locs(p) = avg + cv::Vec3d((rand()%(range*2))-range,(rand()%(range*2))-range,(rand()%(range*2))-range);
-                        ceres::Solve(options, &problem, &summary);
-                        loss1 = summary.final_cost;
-                        if (loss1 < best_loss) {
-                            best_loss = loss1;
-                            best_loc = locs(p);
-                        }
-                        if (loss1 < phys_fail_th)
-                            break;
-                    }
-                    loss1 = best_loss;
-                    locs(p) = best_loc;
-                }
+                // if (loss1 > phys_fail_th) {
+                //     cv::Vec3d best_loc = locs(p);
+                //     double best_loss = loss1;
+                //     for (int n=0;n<100;n++) {
+                //         int range = step*10;
+                //         locs(p) = avg + cv::Vec3d((rand()%(range*2))-range,(rand()%(range*2))-range,(rand()%(range*2))-range);
+                //         ceres::Solve(options, &problem, &summary);
+                //         loss1 = summary.final_cost;
+                //         if (loss1 < best_loss) {
+                //             best_loss = loss1;
+                //             best_loc = locs(p);
+                //         }
+                //         if (loss1 < phys_fail_th)
+                //             break;
+                //     }
+                //     loss1 = best_loss;
+                //     locs(p) = best_loc;
+                // }
 
-                cv::Vec3d phys_only_loc = locs(p);
+                // cv::Vec3d phys_only_loc = locs(p);
                 // locs(p) = init;
 
                 // Add to the local problem losses saying the new point should fall near the surface predictions
@@ -1082,7 +1084,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                         succ_gen_ps.push_back(p);
                     }
 
-                    // local_optimization(2, p, state, locs, interp, proc_tensor, direction_fields, ngv.get(), Ts, true);
+                    local_optimization(local_opt_r, p, state, locs, interp, proc_tensor, direction_fields, ngv.get(), Ts, true);
                 }
             }  // end parallel iteration over cands
         }
@@ -1174,14 +1176,14 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             //     freeze_inner_params(big_problem, 24, state, locs, _empty, loss_status, STATE_LOC_VALID | STATE_COORD_VALID);
             // }
 
-            local_optimization(stop_gen+10, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts, true);
-            // if (generation % 8 == 0) {
+            if (generation % 8 == 0) {
+                local_optimization(stop_gen+10, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts, true);
                 // For early generations, re-solve the big problem, jointly optimising the locations of all points in the patch
                 // std::cout << "running big solve" << std::endl;
                 // ceres::Solve(options_big, &big_problem, &big_summary);
                 // std::cout << big_summary.BriefReport() << "\n";
                 // std::cout << "avg err: " << sqrt(big_summary.final_cost/big_summary.num_residual_blocks) << std::endl;
-            // }
+            }
         }
 
         cands.resize(0);
@@ -1250,20 +1252,20 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     state = state(used_area_safe);
     generations = generations(used_area_safe);
 
-    double max_cost = 0;
-    double avg_cost = 0;
-    int count = 0;
-    for(int j=2;j<locs.rows-2;j++)
-        for(int i=2;i<locs.cols-2;i++) {
-            ceres::Problem problem;
-            emptytrace_create_centered_losses(problem, {j,i}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
-            double cost = 0.0;
-            problem.Evaluate(ceres::Problem::EvaluateOptions(), &cost, nullptr, nullptr, nullptr);
-            max_cost = std::max(max_cost, cost);
-            avg_cost += cost;
-            count++;
-        }
-    avg_cost /= count;
+    // double max_cost = 0;
+    // double avg_cost = 0;
+    // int count = 0;
+    // for(int j=2;j<locs.rows-2;j++)
+    //     for(int i=2;i<locs.cols-2;i++) {
+    //         ceres::Problem problem;
+    //         emptytrace_create_centered_losses(problem, {j,i}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
+    //         double cost = 0.0;
+    //         problem.Evaluate(ceres::Problem::EvaluateOptions(), &cost, nullptr, nullptr, nullptr);
+    //         max_cost = std::max(max_cost, cost);
+    //         avg_cost += cost;
+    //         count++;
+    //     }
+    // avg_cost /= count;
 
     float const area_est_vx2 = succ*step*step;
     float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
@@ -1275,8 +1277,8 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     surf->meta = new nlohmann::json;
     (*surf->meta)["area_vx2"] = area_est_vx2;
     (*surf->meta)["area_cm2"] = area_est_cm2;
-    (*surf->meta)["max_cost"] = max_cost;
-    (*surf->meta)["avg_cost"] = avg_cost;
+    // (*surf->meta)["max_cost"] = max_cost;
+    // (*surf->meta)["avg_cost"] = avg_cost;
     (*surf->meta)["max_gen"] = generation;
     // (*surf->meta)["gen_avg_cost"] = gen_avg_cost;
     // (*surf->meta)["gen_max_cost"] = gen_max_cost;
