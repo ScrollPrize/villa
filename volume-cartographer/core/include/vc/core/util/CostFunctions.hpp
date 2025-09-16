@@ -851,8 +851,16 @@ struct NormalConstraintPlane {
             T d1_sq = point_line_dist_sq_differentiable(p1, seg1_p1, seg1_p2);
             T d2_sq = point_line_dist_sq_differentiable(p2, seg2_p1, seg2_p2);
 
-            T d1_norm = ceres::sqrt(d1_sq) / T(snap_search_range_);
-            T d2_norm = ceres::sqrt(d2_sq) / T(snap_trig_th_);
+            T d1_norm, d2_norm;
+            if (d1_sq < T(1e-9))
+                d1_norm = d1_sq / T(snap_search_range_);
+            else
+                d1_norm = ceres::sqrt(d1_sq) / T(snap_search_range_);
+
+            if (d2_sq < T(1e-9))
+                d2_norm = d2_sq / T(snap_trig_th_);
+            else
+                d2_norm = ceres::sqrt(d2_sq) / T(snap_trig_th_);
 
             snapping_loss = (d1_norm * (T(1.0) - d2_norm) + d2_norm);
         } else {
