@@ -1,9 +1,10 @@
 #include "vc/core/util/NormalGridVolume.hpp"
+#include "vc/core/util/HashFunctions.hpp"
 
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <map>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
 
@@ -11,9 +12,10 @@ namespace vc::core::util {
 
     struct NormalGridVolume::pimpl {
         std::string base_path;
+        int sparse_volume;
         nlohmann::json metadata;
         mutable std::mutex mutex;
-        mutable std::map<std::string, std::unique_ptr<GridStore>> grid_cache;
+        mutable std::unordered_map<cv::Vec2i, std::unique_ptr<GridStore>> grid_cache;
         std::vector<std::string> plane_dirs = {"xy", "xz", "yz"};
 
         explicit pimpl(const std::string& path) : base_path(path) {
@@ -22,10 +24,10 @@ namespace vc::core::util {
                 throw std::runtime_error("Failed to open metadata.json in " + base_path);
             }
             metadata_file >> metadata;
+            sparse_volume = metadata.value("sparse-volume", 1);
         }
 
         std::optional<GridQueryResult> query(const cv::Point3f& point, int plane_idx) const {
-            std::lock_guard<std::mutex> lock(mutex);
 
             float coord;
             switch (plane_idx) {
@@ -35,7 +37,6 @@ namespace vc::core::util {
                 default: return std::nullopt;
             }
 
-            int sparse_volume = metadata.value("sparse-volume", 1);
             int slice_idx1 = static_cast<int>(coord / sparse_volume) * sparse_volume;
             int slice_idx2 = slice_idx1 + sparse_volume;
 
@@ -52,7 +53,6 @@ namespace vc::core::util {
         }
 
         const GridStore* query_nearest(const cv::Point3f& point, int plane_idx) const {
-            std::lock_guard<std::mutex> lock(mutex);
 
             float coord;
             switch (plane_idx) {
@@ -62,39 +62,47 @@ namespace vc::core::util {
                 default: return nullptr;
             }
 
-            int sparse_volume = metadata.value("sparse-volume", 1);
             int slice_idx = static_cast<int>(std::round(coord / sparse_volume)) * sparse_volume;
 
             return get_grid(plane_idx, slice_idx);
         }
 
         const GridStore* get_grid(int plane_idx, int slice_idx) const {
+            cv::Vec2i key(plane_idx, slice_idx);
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                auto it = grid_cache.find(key);
+                if (it != grid_cache.end()) {
+                    return it->second.get();
+                }
+            }
+
             const std::string& dir = plane_dirs[plane_idx];
             char filename[256];
             snprintf(filename, sizeof(filename), "%06d.grid", slice_idx);
             std::string grid_path = (fs::path(base_path) / dir / filename).string();
 
-            auto it = grid_cache.find(grid_path);
-            if (it != grid_cache.end()) {
-                return it->second.get();
-            }
-
             if (!fs::exists(grid_path)) {
-                // Cache the fact that it doesn't exist
-                grid_cache[grid_path] = nullptr;
+                std::lock_guard<std::mutex> lock(mutex);
+                grid_cache[key] = nullptr;
                 return nullptr;
             }
 
-            try {
-                auto grid_store = std::make_unique<GridStore>(grid_path);
-                GridStore* ptr = grid_store.get();
-                grid_cache[grid_path] = std::move(grid_store);
-                return ptr;
-            } catch (const std::exception& e) {
-                std::cerr << "Failed to load GridStore from " << grid_path << ": " << e.what() << std::endl;
-                grid_cache[grid_path] = nullptr;
-                return nullptr;
+            auto grid_store = std::make_unique<GridStore>(grid_path);
+            GridStore* ptr;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+
+                auto it = grid_cache.find(key);
+                if (it != grid_cache.end()) {
+                    return it->second.get();
+                }
+
+                ptr = grid_store.get();
+                grid_cache[key] = std::move(grid_store);
             }
+            return ptr;
         }
     };
 

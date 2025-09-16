@@ -17,6 +17,15 @@ namespace std {
             return h1 ^ (h2 << 1);
         }
     };
+
+    struct vec2i_hash {
+        std::size_t operator()(const cv::Vec2i& v) const {
+            // A simple hash combination
+            std::size_t h1 = std::hash<int>()(v[0]);
+            std::size_t h2 = std::hash<int>()(v[1]);
+            return h1 ^ (h2 << 1);
+        }
+    };
 }
 
 struct vec3i_hash {

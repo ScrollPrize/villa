@@ -462,6 +462,9 @@ static float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t
     options.function_tolerance = 1e-4;
     options.use_nonmonotonic_steps = true;
 
+    if (radius > 10)
+        options.num_threads = omp_get_max_threads();
+
 //    if (problem.NumParameterBlocks() > 1) {
 //        options.use_inner_iterations = true;
 //    }
