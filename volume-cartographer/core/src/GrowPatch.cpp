@@ -735,6 +735,8 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         big_problem.SetParameterBlockConstant(&locs(y0+1,x0)[0]);
         big_problem.SetParameterBlockConstant(&locs(y0+1,x0+1)[0]);
 
+        local_optimization(stop_gen+10, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts, false);
+
         last_succ = succ;
         last_elapsed_seconds = f_timer.seconds();
         std::cout << "Resuming from generation " << generation << " with " << fringe.size() << " points. Initial loss count: " << loss_count << std::endl;
@@ -828,7 +830,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     int curr_ref_min = ref_max;
 
     while (!fringe.empty()) {
-        bool global_opt = true; //generation <= 20;
+        bool global_opt = true;
         // bool global_opt = generation <= 20;
 
         //stop drifting after some initial opt
@@ -1177,7 +1179,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             // }
 
             if (generation % 8 == 0) {
-                local_optimization(stop_gen+10, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts, true);
+                local_optimization(stop_gen+10, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts, false);
                 // For early generations, re-solve the big problem, jointly optimising the locations of all points in the patch
                 // std::cout << "running big solve" << std::endl;
                 // ceres::Solve(options_big, &big_problem, &big_summary);
