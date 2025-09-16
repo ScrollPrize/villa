@@ -718,9 +718,6 @@ struct NormalConstraintPlane {
         T edge_vec_y = p2[1] - p1[1];
 
         T edge_len_sq = edge_vec_x * edge_vec_x + edge_vec_y * edge_vec_y;
-        if (edge_len_sq < T(1e-12)) {
-            return T(0.0);
-        }
         T edge_len = ceres::sqrt(edge_len_sq);
 
         T edge_normal_x = edge_vec_y / edge_len;
@@ -728,11 +725,11 @@ struct NormalConstraintPlane {
 
         cv::Point2f p1_cv(val(p1[0]), val(p1[1]));
         cv::Point2f p2_cv(val(p2[0]), val(p2[1]));
-        cv::Point2f midpoint_cv = 0.5f * (p1_cv + p2_cv);
 
         auto& path_cache = path_caches_[grid_idx];
 
         if (!path_cache.valid(p1_cv, p2_cv, cache_radius_normal_)) {
+            cv::Point2f midpoint_cv = 0.5f * (p1_cv + p2_cv);
             path_cache.put(p1_cv, p2_cv, normal_grid.get(midpoint_cv, query_radius_));
         }
         const auto& nearby_paths = path_cache.get();
