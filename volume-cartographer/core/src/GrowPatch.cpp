@@ -652,7 +652,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     cv::Mat_<uint8_t> state(size,0);
     cv::Mat_<uint16_t> generations(size, (uint16_t)0);
     cv::Mat_<uint8_t> phys_fail(size,0);
-    cv::Mat_<float> init_dist(size,0);
+    // cv::Mat_<float> init_dist(size,0);
     cv::Mat_<uint16_t> loss_status(cv::Size(w,h),0);
 
     cv::Vec3f vx = {1,0,0};
@@ -971,24 +971,24 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                 // ceres::Solve(options, &problem, &summary);
 
                 // Measure the worst-case distance from the surface predictions, of edges between the new point and its neighbors
-                double dist;
-                interp.Evaluate(locs(p)[2],locs(p)[1],locs(p)[0], &dist);
-                int count = 0;
-                for (auto &off : neighs) {
-                    if (state(p+off) & STATE_LOC_VALID) {
-                        for(int i=1;i<T;i++) {
-                            float f1 = float(i)/T;
-                            float f2 = 1-f1;
-                            cv::Vec3d l = locs(p)*f1 + locs(p+off)*f2;
-                            double d2;
-                            interp.Evaluate(l[2],l[1],l[0], &d2);
-                            dist = std::max(dist, d2);
-                            count++;
-                        }
-                    }
-                }
+                // double dist;
+                // interp.Evaluate(locs(p)[2],locs(p)[1],locs(p)[0], &dist);
+                // int count = 0;
+                // for (auto &off : neighs) {
+                //     if (state(p+off) & STATE_LOC_VALID) {
+                //         for(int i=1;i<T;i++) {
+                //             float f1 = float(i)/T;
+                //             float f2 = 1-f1;
+                //             cv::Vec3d l = locs(p)*f1 + locs(p+off)*f2;
+                //             double d2;
+                //             interp.Evaluate(l[2],l[1],l[0], &d2);
+                //             dist = std::max(dist, d2);
+                //             count++;
+                //         }
+                //     }
+                // }
 
-                init_dist(p) = dist;
+                // init_dist(p) = dist;
 
                 /*if (dist >= dist_th || summary.final_cost >= 0.1) {
                     // The solution to the local problem is bad -- large loss, or too far from the surface; still add to the global
