@@ -6,7 +6,23 @@ RUN add-apt-repository -y universe
 RUN apt -y update
 RUN apt -y upgrade
 RUN apt -y full-upgrade
-RUN apt -y install build-essential git cmake qt6-base-dev libboost-system-dev libboost-program-options-dev libceres-dev xtensor-dev libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev libgsl-dev libsdl2-dev libcurl4-openssl-dev file curl unzip ca-certificates bzip2 curl wget unzip fuse jq gimp desktop-file-utils ninja-build
+
+# --- install everything EXCEPT xtensor-dev ---
+RUN apt -y install build-essential git cmake qt6-base-dev libboost-system-dev libboost-program-options-dev libceres-dev \
+    libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev libgsl-dev libsdl2-dev libcurl4-openssl-dev file \
+    curl unzip ca-certificates bzip2 wget fuse jq gimp desktop-file-utils ninja-build
+
+# --- pin specific xtl + xtensor versions from .deb files ---
+RUN set -eux; \
+    cd /tmp; \
+    wget -q http://archive.ubuntu.com/ubuntu/pool/universe/x/xtl/xtl-dev_0.7.7-1_all.deb; \
+    wget -q http://archive.ubuntu.com/ubuntu/pool/universe/x/xtensor/libxtensor-dev_0.25.0-2ubuntu1_all.deb; \
+    apt-get update; \
+    # use apt to install local .debs so dependencies are resolved automatically
+    apt-get install -y --no-install-recommends ./xtl-dev_0.7.7-1_all.deb ./libxtensor-dev_0.25.0-2ubuntu1_all.deb; \
+    rm -f /tmp/xtl-dev_0.7.7-1_all.deb /tmp/libxtensor-dev_0.25.0-2ubuntu1_all.deb; \
+    # prevent later upgrades from bumping these version
+    apt-mark hold xtl-dev libxtensor-dev
 
 # ----- Python 3.10 env (micromamba) -----
 RUN ARCH=$(uname -m) && \
