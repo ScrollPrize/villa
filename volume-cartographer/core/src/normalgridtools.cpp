@@ -143,7 +143,7 @@ cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store) {
 
 void align_and_filter_segments(const GridStore& grid_store, GridStore& result) {
     cv::Rect rect(0, 0, grid_store.size().width, grid_store.size().height);
-    int grid_step = 64;
+    int grid_step = 128;
 
     SegmentGrid all(rect, grid_step);
     SegmentGrid unused(rect, grid_step);
@@ -189,7 +189,9 @@ void align_and_filter_segments(const GridStore& grid_store, GridStore& result) {
     }
 
     // Main iterative alignment loop
-    for (int iter = 0; iter < 10000; ++iter) {
+    int iter = 0;
+    while (true) {
+        iter++;
         if (unused.count() == 0) {
             std::cout << "Iteration " << iter << ": No unused segments left. Exiting." << std::endl;
             break;
@@ -369,24 +371,91 @@ void SegmentGrid::remove(const std::shared_ptr<SegmentInfo>& segment_to_remove) 
 }
 
 std::vector<std::shared_ptr<SegmentInfo>> SegmentGrid::nearest_neighbors(const cv::Point2f& point, int n) const {
-    std::vector<std::shared_ptr<SegmentInfo>> neighbors;
-    neighbors.reserve(n);
-
-    std::vector<std::pair<float, std::shared_ptr<SegmentInfo>>> sorted_neighbors;
-    for (const auto& seg : all_segments) {
-        float dist_sq = cv::norm(seg->middle_point - point) * cv::norm(seg->middle_point - point);
-        sorted_neighbors.push_back({dist_sq, seg});
+    if (all_segments.empty()) {
+        return {};
     }
-    std::sort(sorted_neighbors.begin(), sorted_neighbors.end(),
+
+    int center_grid_x = (point.x - rect.x) / grid_step;
+    int center_grid_y = (point.y - rect.y) / grid_step;
+
+    std::vector<std::shared_ptr<SegmentInfo>> candidates;
+    candidates.reserve(n * 2);
+
+    if (n >= count())
+        return get_all_segments();
+
+    int radius = -1;
+    bool enough = false;
+    while (!enough) {
+        radius++;
+
+        if (candidates.size() > n)
+            enough = true;
+        
+
+        for (int y = center_grid_y - radius-1; y <= center_grid_y + radius+1; ++y) {
+            for (int x = center_grid_x - radius-1; x <= center_grid_x + radius+1; ++x) {
+                // Euclidean distance check in grid units
+                float point_grid_x = (point.x - rect.x) / grid_step;
+                float point_grid_y = (point.y - rect.y) / grid_step;
+                float dx = (x + 0.5f) - point_grid_x;
+                float dy = (y + 0.5f) - point_grid_y;
+                float dist_sq = dx * dx + dy * dy;
+                float radius_sq = (radius + 1) * (radius + 1);
+
+                if (dist_sq > radius_sq) {
+                    continue;
+                }
+                if (radius > 0) {
+                    float prev_radius_sq = radius * radius;
+                    if (dist_sq <= prev_radius_sq) {
+                        continue;
+                    }
+                }
+
+                if (y >= 0 && y < grid.size() && x >= 0 && x < grid[0].size()) {
+                    for (const auto& weak_ptr : grid[y][x]) {
+                        if (auto shared_ptr = weak_ptr.lock()) {
+                            candidates.push_back(shared_ptr);
+                            // added_in_this_ring = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Pre-calculate squared distances for efficient sorting
+    std::vector<std::pair<float, std::shared_ptr<SegmentInfo>>> sorted_candidates;
+    sorted_candidates.reserve(candidates.size());
+    for (const auto& seg : candidates) {
+        cv::Point2f diff = seg->middle_point - point;
+        sorted_candidates.push_back({diff.dot(diff), seg});
+    }
+
+    // Sort candidates by pre-calculated squared distance
+    std::sort(sorted_candidates.begin(), sorted_candidates.end(),
         [](const auto& a, const auto& b) {
             return a.first < b.first;
         });
 
-    for (int i = 0; i < std::min((int)sorted_neighbors.size(), n); ++i) {
-        neighbors.push_back(sorted_neighbors[i].second);
+    // Re-populate candidates vector with sorted segments
+    candidates.clear();
+    for (const auto& pair : sorted_candidates) {
+        candidates.push_back(pair.second);
     }
 
-    return neighbors;
+    total_candidates_before_dedup += candidates.size();
+
+    total_candidates_after_dedup += candidates.size();
+    nearest_neighbors_calls++;
+
+    // Return top N
+    if (candidates.size() > n) {
+        candidates.resize(n);
+    }
+
+    return candidates;
 }
 
 std::shared_ptr<SegmentInfo> SegmentGrid::get_random_segment() {
