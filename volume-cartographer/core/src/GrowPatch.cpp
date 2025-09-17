@@ -832,6 +832,9 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     int ref_max = 6;
     int curr_ref_min = ref_max;
 
+    int z_min = params.value("z_min", -1);
+    int z_max = params.value("z_max", std::numeric_limits<int>::max());
+
     while (!fringe.empty()) {
         // bool global_opt = true;
         bool global_opt = generation <= 50;
@@ -960,6 +963,11 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
 
                 // Initial guess for the corresponding 3D location is a perturbation of the position of the best-connected neighbor
                 avg /= ref_count;
+
+                //"fast" skip based on avg z value out of limits
+                if (avg[2] < z_min || avg[2] > z_max)
+                    continue;
+
                 cv::Vec3d init = locs(best_l)+cv::Vec3d((rand()%1000)/10000.0-0.05,(rand()%1000)/10000.0-0.05,(rand()%1000)/10000.0-0.05);
                 locs(p) = init;
 
