@@ -4,6 +4,7 @@ add_library(vc_core
         src/DiskBasedObjectBaseClass.cpp
         src/GridStore.cpp
         src/NormalGridVolume.cpp
+        src/normalgridtools.cpp
         src/Metadata.cpp
         src/Segmentation.cpp
         src/Volume.cpp

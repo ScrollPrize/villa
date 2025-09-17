@@ -28,6 +28,8 @@
 #include "vc/core/util/Thinning.hpp"
 
 #include "support.hpp"
+#include "vc/core/util/normalgridtools.hpp"
+
 namespace fs = std::filesystem;
 namespace po = boost::program_options;
 
@@ -37,13 +39,14 @@ int main(int argc, char* argv[]) {
     po::options_description desc("vc_ngrid: Generate and visualize normal grids.\n\n"
                                  "Modes:\n"
                                  "  batch-vol-gen: Generate normal grids for all slices in a Zarr volume.\n"
-                                 "  vis: Visualize a normal grid from a .grid file.\n\n"
+                                 "  vis: Visualize a normal grid from a .grid file.\n"
+                                 "  find-umbilicus: Find and visualize the umbilicus point from a .grid file.\n\n"
                                  "Options");
     desc.add_options()
         ("help,h", "Print usage message")
-        ("mode", po::value<std::string>()->required(), "Mode to operate in (batch-vol-gen or vis)")
-        ("input,i", po::value<std::string>()->required(), "Input path (Zarr volume for batch-vol-gen, .grid file for vis)")
-        ("output,o", po::value<std::string>()->required(), "Output path (directory for batch-vol-gen, .tif file for vis)")
+        ("mode", po::value<std::string>()->required(), "Mode to operate in (batch-vol-gen, vis, or find-umbilicus)")
+        ("input,i", po::value<std::string>()->required(), "Input path (Zarr volume for batch-vol-gen, .grid file for vis/find-umbilicus)")
+        ("output,o", po::value<std::string>()->required(), "Output path (directory for batch-vol-gen, .tif file for vis/find-umbilicus)")
         ("spiral-step", po::value<double>()->default_value(20.0), "Spiral step for resampling (batch-vol-gen only)")
         ("grid-step", po::value<int>()->default_value(64), "Grid cell size for the GridStore (batch-vol-gen only)")
         ("sparse-volume", po::value<int>()->default_value(4), "Process every N-th slice (batch-vol-gen only)");
@@ -77,6 +80,22 @@ int main(int argc, char* argv[]) {
         cv::Mat vis = visualize_normal_grid(normal_grid, normal_grid.size());
         cv::imwrite(output_vis, vis);
         std::cout << "Visualization saved to " << output_vis << std::endl;
+
+    } else if (mode == "find-umbilicus") {
+        std::string input_grid = vm["input"].as<std::string>();
+        std::string output_vis = vm["output"].as<std::string>();
+
+        vc::core::util::GridStore normal_grid(input_grid);
+        cv::Vec2f umbilicus = vc::core::util::align_and_extract_umbilicus(normal_grid);
+
+        cv::Mat vis = visualize_normal_grid(normal_grid, normal_grid.size());
+        if (!std::isnan(umbilicus[0]) && !std::isnan(umbilicus[1])) {
+            cv::Point umbilicus_pt(cvRound(umbilicus[0]), cvRound(umbilicus[1]));
+            cv::line(vis, cv::Point(umbilicus_pt.x, 0), cv::Point(umbilicus_pt.x, vis.rows), cv::Scalar(0, 255, 0), 1);
+            cv::line(vis, cv::Point(0, umbilicus_pt.y), cv::Point(vis.cols, umbilicus_pt.y), cv::Scalar(0, 255, 0), 1);
+        }
+        cv::imwrite(output_vis, vis);
+        std::cout << "Umbilicus visualization saved to " << output_vis << std::endl;
 
     } else if (mode == "batch-vol-gen") {
         cv::setNumThreads(0);
