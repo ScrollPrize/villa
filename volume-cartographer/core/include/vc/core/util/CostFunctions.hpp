@@ -812,7 +812,11 @@ struct NormalConstraintPlane {
         }
         else if (total_weight > T(1e-9)) {
             T avg_dot_product = total_weighted_dot_product / total_weight;
-            normal_loss = (T(1.0) - avg_dot_product);
+            normal_loss = T(1.0) - avg_dot_product;
+        }
+        else if (total_weight_n > T(1e-9)) {
+            T avg_dot_product_n = total_weighted_dot_product_n / total_weight_n;
+            normal_loss = T(1.0) - avg_dot_product_n;
         }
 
         // Snapping logic

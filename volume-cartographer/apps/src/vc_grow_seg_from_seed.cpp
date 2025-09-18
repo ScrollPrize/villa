@@ -426,7 +426,7 @@ int main(int argc, char *argv[])
         origin = {0,0,0}; // Not used in resume mode, but needs to be initialized
     }
 
-    QuadSurface *surf = space_tracing_quad_phys(ds.get(), 1.0, &chunk_cache, origin, params, cache_root, voxelsize, direction_fields, resume_surf);
+    QuadSurface *surf = space_tracing_quad_phys(ds.get(), 1.0, &chunk_cache, origin, params, cache_root, voxelsize, direction_fields, resume_surf, tgt_dir.string());
  
     if (resume_surf) {
         delete resume_surf;

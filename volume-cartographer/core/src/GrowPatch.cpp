@@ -599,7 +599,7 @@ struct thresholdedDistance
 };
 
 
-QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf)
+QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::string& intermediate_path_dir)
 {
     int stop_gen = params.value("generations", 100);
     float step = params.value("step_size", 20.0f);
@@ -1251,7 +1251,28 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
 
         timer_gen.unit = succ_gen * vx_per_quad;
         timer_gen.unit_string = "vx^2";
-        print_accessor_stats();
+        // print_accessor_stats();
+
+        int snapshot_interval = params.value("snapshot-interval", 0);
+        if (!intermediate_path_dir.empty() && snapshot_interval > 0 && generation % snapshot_interval == 0) {
+            cv::Rect used_area_safe = used_area;
+            used_area_safe.x -= 2;
+            used_area_safe.y -= 2;
+            used_area_safe.width += 4;
+            used_area_safe.height += 4;
+            cv::Mat_<cv::Vec3d> locs_crop = locs(used_area_safe);
+            cv::Mat_<uint16_t> generations_crop = generations(used_area_safe);
+
+            auto surf = new QuadSurface(locs_crop, {1/T, 1/T});
+            surf->setChannel("generations", generations_crop);
+
+            char filename[256];
+            snprintf(filename, sizeof(filename), "snapshot_gen_%04d", generation);
+            std::filesystem::path out_path = std::filesystem::path(intermediate_path_dir) / filename;
+            surf->save(out_path);
+            delete surf;
+            std::cout << "saved snapshot in " << out_path << std::endl;
+        }
 
     }  // end while fringe is non-empty
     delete timer;
