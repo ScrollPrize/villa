@@ -1,10 +1,16 @@
 #include "vc/core/util/GridStore.hpp"
 #include <random>
 #include <iostream>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/highgui.hpp>
 
 #include "vc/core/util/normalgridtools.hpp"
 
 namespace vc::core::util {
+
+long total_candidates_before_dedup = 0;
+long total_candidates_after_dedup = 0;
+long nearest_neighbors_calls = 0;
 
 cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store) {
     auto segments = grid_store.get_all();
@@ -28,7 +34,7 @@ cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store) {
     for (const auto& path : segments) {
         if (path->size() < 2) continue;
         for (size_t i = 0; i < path->size() - 1; ++i) {
-            all_line_segments.push_back({(*path)[i], (*path)[i+1]});
+            all_line_segments.push_back(std::make_pair((*path)[i], (*path)[i+1]));
         }
     }
 
@@ -141,9 +147,9 @@ cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store) {
     return best_umbilicus;
 }
 
-void align_and_filter_segments(const GridStore& grid_store, GridStore& result) {
+void align_and_filter_segments(const GridStore& grid_store, GridStore& result, const cv::Vec2f& center_point) {
     cv::Rect rect(0, 0, grid_store.size().width, grid_store.size().height);
-    int grid_step = 128;
+    int grid_step = 64;
 
     SegmentGrid all(rect, grid_step);
     SegmentGrid unused(rect, grid_step);
@@ -192,6 +198,8 @@ void align_and_filter_segments(const GridStore& grid_store, GridStore& result) {
     int iter = 0;
     while (true) {
         iter++;
+        // if (iter == 10000)
+            // break;
         if (unused.count() == 0) {
             std::cout << "Iteration " << iter << ": No unused segments left. Exiting." << std::endl;
             break;
@@ -212,7 +220,9 @@ void align_and_filter_segments(const GridStore& grid_store, GridStore& result) {
         float min_max_dist = std::numeric_limits<float>::max();
 
         for (const auto& candidate : candidates) {
+            // std::cout << "retrieve from assigned points " << std::endl;
             auto assigned_neighbors = assigned.nearest_neighbors(candidate->middle_point, 10);
+            // std::cout << "done " << std::endl;
 
             if (!assigned_neighbors.size())
                 continue;
@@ -250,7 +260,7 @@ void align_and_filter_segments(const GridStore& grid_store, GridStore& result) {
         }
 
         // 5. Add the best candidate with the correct orientation to assigned
-        std::cout << "Scores - No Flip: " << score_no_flip << ", Flip: " << score_flip << std::endl;
+        // std::cout << "Scores - No Flip: " << score_no_flip << ", Flip: " << score_flip << std::endl;
         if (score_flip > score_no_flip) {
             // std::cout << "Flipping candidate." << std::endl;
             best_candidate->flipped = true;
@@ -260,26 +270,61 @@ void align_and_filter_segments(const GridStore& grid_store, GridStore& result) {
         unused.remove(best_candidate);
 
 
-        if (iter % 1000 == 0) {
-            // 6. Debug visualization
-            GridStore tmp(rect, grid_step);
-            convert_segment_grid_to_grid_store(assigned, tmp);
-
-            cv::Mat vis = visualize_segment_directions(tmp);
-
-            char filename[256];
-            snprintf(filename, sizeof(filename), "assigned_iter_%03d.tif", iter);
-            cv::imwrite(filename, vis);
-        }
+        // if (iter % 1000 == 0) {
+        //     if (nearest_neighbors_calls > 0) {
+        //         double avg_before = static_cast<double>(total_candidates_before_dedup) / nearest_neighbors_calls;
+        //         double avg_after = static_cast<double>(total_candidates_after_dedup) / nearest_neighbors_calls;
+        //         std::cout << "Iteration " << iter << ", Avg. candidates before dedup: " << avg_before
+        //                   << ", after dedup: " << avg_after << std::endl;
+        //     } else {
+        //         std::cout << "Iteration " << iter << std::endl;
+        //     }
+        //     // 6. Debug visualization
+        //     // GridStore tmp(rect, grid_step);
+        //     // convert_segment_grid_to_grid_store(assigned, grid_store, tmp);
+        //     //
+        //     // cv::Mat vis = visualize_segment_directions(tmp);
+        //     //
+        //     // char filename[256];
+        //     // snprintf(filename, sizeof(filename), "assigned_iter_%03d.tif", iter);
+        //     // cv::imwrite(filename, vis);
+        // }
     }
 
 
-    // Create a new GridStore from the aligned segments
-    convert_segment_grid_to_grid_store(assigned, result);
+    // Rebuild the GridStore from the aligned segments
+    // Optional: Final global alignment check based on the umbilicus
+    if (!std::isnan(center_point[0]) && !std::isnan(center_point[1])) {
+        double alignment_score = 0.0;
+        const int num_samples = 1000;
+        for (int i = 0; i < num_samples; ++i) {
+            auto seg = assigned.get_random_segment();
+            if (!seg) continue;
+
+            cv::Vec2f center_to_segment = seg->middle_point - cv::Point2f(center_point);
+            cv::normalize(center_to_segment, center_to_segment);
+            
+            double dot_product = seg->normal.dot(center_to_segment);
+            alignment_score += dot_product * std::abs(dot_product);
+        }
+
+        if (alignment_score < 0) {
+            // The normals are predominantly pointing inwards, so flip them all
+            for (auto& seg : assigned.get_all_segments()) {
+                seg->flipped = !seg->flipped;
+            }
+        }
+        result.meta["umbilicus_x"] = center_point[0];
+        result.meta["umbilicus_y"] = center_point[1];
+    }
+
+    // Rebuild the GridStore from the aligned segments
+    convert_segment_grid_to_grid_store(assigned, grid_store, result);
+    result.meta["aligned"] = true;
 
     // Final visualization of the result
-    cv::Mat final_vis = visualize_segment_directions(result);
-    cv::imwrite("final_aligned_segments.tif", final_vis);
+    // cv::Mat final_vis = visualize_segment_directions(result);
+    // cv::imwrite("final_aligned_segments.tif", final_vis);
 }
 
 cv::Mat visualize_segment_directions(const GridStore& grid_store) {
@@ -301,33 +346,81 @@ cv::Mat visualize_segment_directions(const GridStore& grid_store) {
             cv::Vec2f normal(-tangent[1], tangent[0]);
 
             cv::Point endpoint(center.x + normal[0] * 20, center.y + normal[1] * 20);
+            cv::Point normal_endpoint(center.x + normal[0] * 5, center.y + normal[1] * 5);
 
             cv::circle(vis, center, 3, cv::Scalar(0, 0, 255), -1, cv::LINE_AA); // Red dot at the base
             cv::arrowedLine(vis, center, endpoint, cv::Scalar(255, 255, 255), 1, cv::LINE_AA, 0, 0.3); // White arrow for direction
+            cv::line(vis, center, normal_endpoint, cv::Scalar(0, 255, 0), 1, cv::LINE_AA); // Green line for normal
         }
     }
 
     return vis;
 }
 
-void convert_segment_grid_to_grid_store(const SegmentGrid& segment_grid, GridStore& grid_store) {
-    const auto& segments = segment_grid.get_all_segments();
+void convert_segment_grid_to_grid_store(const SegmentGrid& segment_grid, const GridStore& original_grid_store, GridStore& grid_store) {
+    auto original_paths = original_grid_store.get_all();
 
-    for (const auto& seg_info : segments) {
-        cv::Vec2f tangent = { -seg_info->normal[1], seg_info->normal[0] };
-        
-        // Note: The 'flipped' status from alignment is already applied to seg_info->normal.
-        // We just need to reconstruct the segment points from the normal.
+    // 1. Get all segments and store them in a map by original path index
+    std::unordered_map<size_t, std::vector<std::shared_ptr<SegmentInfo>>> path_segments;
+    for (const auto& seg : segment_grid.get_all_segments()) {
+        path_segments[seg->original_path_idx].push_back(seg);
+    }
 
-        // Reconstruct the two original points from the middle point and tangent.
-        // This is an approximation for visualization since we don't store the original length.
-        // We'll use a fixed length.
-        const float half_len = 5.0f;
-        cv::Point p1(cvRound(seg_info->middle_point.x - tangent[0] * half_len), cvRound(seg_info->middle_point.y - tangent[1] * half_len));
-        cv::Point p2(cvRound(seg_info->middle_point.x + tangent[0] * half_len), cvRound(seg_info->middle_point.y + tangent[1] * half_len));
+    // 2. For each original path, sort its segments and build new sub-paths
+    for (auto& pair : path_segments) {
+        auto& segments_for_path = pair.second;
+        std::sort(segments_for_path.begin(), segments_for_path.end(),
+            [](const auto& a, const auto& b) {
+            return a->original_segment_idx < b->original_segment_idx;
+        });
 
-        std::vector<cv::Point> path = {p1, p2};
-        grid_store.add(path);
+        if (segments_for_path.empty()) continue;
+
+        std::vector<cv::Point> current_sub_path;
+        bool current_flip_status = segments_for_path[0]->flipped;
+
+        bool has_discontinuity = false;
+        for (size_t i = 1; i < segments_for_path.size(); ++i) {
+            if (segments_for_path[i]->original_segment_idx != segments_for_path[i-1]->original_segment_idx + 1) {
+                has_discontinuity = true;
+                break;
+            }
+        }
+
+        if (has_discontinuity) {
+            std::cerr << "Skipping discontinuous path with original_path_idx " << pair.first << std::endl;
+            continue;
+        }
+
+        for (const auto& seg : segments_for_path) {
+            if (seg->flipped != current_flip_status) {
+                if (current_sub_path.size() >= 2) {
+                    if (current_flip_status) {
+                        std::reverse(current_sub_path.begin(), current_sub_path.end());
+                    }
+                    grid_store.add(current_sub_path);
+                }
+                current_sub_path.clear();
+                current_flip_status = seg->flipped;
+            }
+
+            const auto& original_path = *original_paths[seg->original_path_idx];
+            const auto& p1 = original_path[seg->original_segment_idx];
+            const auto& p2 = original_path[seg->original_segment_idx + 1];
+
+            if (current_sub_path.empty()) {
+                current_sub_path.push_back(p1);
+            }
+            current_sub_path.push_back(p2);
+        }
+
+        // Add the last sub-path
+        if (current_sub_path.size() >= 2) {
+            if (current_flip_status) {
+                std::reverse(current_sub_path.begin(), current_sub_path.end());
+            }
+            grid_store.add(current_sub_path);
+        }
     }
 }
 

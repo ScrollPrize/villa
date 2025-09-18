@@ -23,7 +23,7 @@ class GridStore;
  */
 cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store);
 
-void align_and_filter_segments(const GridStore& grid_store, GridStore& result);
+void align_and_filter_segments(const GridStore& grid_store, GridStore& result, const cv::Vec2f& center_point = cv::Vec2f(std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN()));
 
 cv::Mat visualize_segment_directions(const GridStore& grid_store);
 
@@ -32,7 +32,7 @@ class SegmentGrid;
 
 cv::Mat visualize_assigned_segments(const SegmentGrid& assigned, const cv::Size& grid_size);
 
-void convert_segment_grid_to_grid_store(const SegmentGrid& segment_grid, GridStore& grid_store);
+void convert_segment_grid_to_grid_store(const SegmentGrid& segment_grid, const GridStore& original_grid_store, GridStore& grid_store);
 
 struct SegmentInfo {
     cv::Point2f middle_point;

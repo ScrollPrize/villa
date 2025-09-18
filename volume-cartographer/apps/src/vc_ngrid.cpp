@@ -100,17 +100,17 @@ int main(int argc, char* argv[]) {
 
     } else if (mode == "align") {
         std::string input_grid = vm["input"].as<std::string>();
-        std::string output_vis = vm["output"].as<std::string>();
+        std::string output_grid = vm["output"].as<std::string>();
 
         vc::core::util::GridStore normal_grid(input_grid);
         vc::core::util::GridStore res(cv::Rect(0, 0, normal_grid.size().width, normal_grid.size().height), 64);
 
 
-        align_and_filter_segments(normal_grid, res);
+        cv::Vec2f umbilicus = vc::core::util::align_and_extract_umbilicus(normal_grid);
+        align_and_filter_segments(normal_grid, res, umbilicus);
 
-        // cv::Mat vis = vc::core::util::visualize_segment_directions(normal_grid);
-        // cv::imwrite(output_vis, vis);
-        // std::cout << "Segment direction visualization saved to " << output_vis << std::endl;
+        res.save(output_grid);
+        std::cout << "Aligned grid saved to " << output_grid << std::endl;
 
     } else if (mode == "batch-vol-gen") {
         cv::setNumThreads(0);
@@ -350,7 +350,16 @@ int main(int argc, char* argv[]) {
                 } else {
                     vc::core::util::GridStore grid_store(cv::Rect(0, 0, slice_mat.cols, slice_mat.rows), vm["grid-step"].as<int>());
                     populate_normal_grid(traces, grid_store, spiral_step);
-                    grid_store.save(tmp_path);
+
+                    if (dir == SliceDirection::XY) {
+                        cv::Vec2f umbilicus = vc::core::util::align_and_extract_umbilicus(grid_store);
+                        vc::core::util::GridStore aligned_grid(cv::Rect(0, 0, slice_mat.cols, slice_mat.rows), vm["grid-step"].as<int>());
+                        align_and_filter_segments(grid_store, aligned_grid, umbilicus);
+                        aligned_grid.save(tmp_path);
+                    } else {
+                        grid_store.save(tmp_path);
+                    }
+                    
                     fs::rename(tmp_path, out_path);
                     t.mark("grid");
                     
