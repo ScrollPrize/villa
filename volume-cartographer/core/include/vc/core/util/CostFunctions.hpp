@@ -526,6 +526,8 @@ struct NormalConstraintPlane {
     const vc::core::util::NormalGridVolume& normal_grid_volume;
     const int plane_idx; // 0: XY, 1: XZ, 2: YZ
     const double weight;
+    const int z_min;
+    const int z_max;
  
      template<typename T>
      struct PointPairCache {
@@ -569,8 +571,8 @@ struct NormalConstraintPlane {
      const double snap_trig_th_ = 4.0;
      const double snap_search_range_ = 16.0;
  
-     NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight)
-         : normal_grid_volume(normal_grid_volume), plane_idx(plane_idx), weight(weight) {}
+     NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight, bool direction_aware = false, int z_min = -1, int z_max = -1)
+         : normal_grid_volume(normal_grid_volume), plane_idx(plane_idx), weight(weight), direction_aware_(direction_aware), z_min(z_min), z_max(z_max) {}
 
     template <typename T>
     bool operator()(const T* const pA, const T* const pB1, const T* const pB2, const T* const pC, T* residual) const {
@@ -641,6 +643,9 @@ struct NormalConstraintPlane {
 
         // Query the normal grids.
         cv::Point3f query_point(val(pA[0]), val(pA[1]), val(pA[2]));
+
+        if (z_min != -1 && query_point.z < z_min) return true;
+        if (z_max != -1 && query_point.z > z_max) return true;
 
         // auto grid_query = normal_grid_volume.query(query_point, plane_idx);
         // if (!grid_query) {
@@ -753,6 +758,9 @@ struct NormalConstraintPlane {
         T total_weighted_dot_product = T(0.0);
         T total_weight = T(0.0);
 
+        T total_weighted_dot_product_n = T(0.0);
+        T total_weight_n = T(0.0);
+
         for (const auto& path_ptr : nearby_paths) {
             const auto& path = *path_ptr;
             if (path.size() < 2) continue;
@@ -775,15 +783,34 @@ struct NormalConstraintPlane {
                 }
                 cv::Point2f normal(-tangent.y, tangent.x);
 
-                T dot_product = ceres::abs(edge_normal_x * T(normal.x) + edge_normal_y * T(normal.y));
+                T dot_product = edge_normal_x * T(normal.x) + edge_normal_y * T(normal.y);
+                if (!direction_aware_) {
+                    dot_product = ceres::abs(dot_product);
 
-                total_weighted_dot_product += weight_n * dot_product;
-                total_weight += weight_n;
+                    total_weighted_dot_product += weight_n * dot_product;
+                    total_weight += weight_n;
+                }
+                else {
+                    if (dot_product >= 0) {
+                        total_weighted_dot_product += weight_n * dot_product;
+                        total_weight += weight_n;
+                    }
+                    else {
+                        total_weighted_dot_product_n += weight_n * dot_product;
+                        total_weight_n += weight_n;
+                    }
+                }
+
             }
         }
 
         T normal_loss = T(0.0);
-        if (total_weight > T(1e-9)) {
+        if (total_weight > T(1e-9) && total_weight_n > T(1e-9)) {
+            T avg_dot_product = total_weighted_dot_product / total_weight;
+            T avg_dot_product_n = total_weighted_dot_product_n / total_weight_n;
+            normal_loss = T(1.0) - avg_dot_product - avg_dot_product_n;
+        }
+        else if (total_weight > T(1e-9)) {
             T avg_dot_product = total_weighted_dot_product / total_weight;
             normal_loss = (T(1.0) - avg_dot_product);
         }
@@ -905,9 +932,11 @@ struct NormalConstraintPlane {
         return dist_sq(dP);
     }
 
-    static ceres::CostFunction* Create(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight) {
+    static ceres::CostFunction* Create(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight, bool direction_aware = false, int z_min = -1, int z_max = -1) {
         return new ceres::AutoDiffCostFunction<NormalConstraintPlane, 1, 3, 3, 3, 3>(
-            new NormalConstraintPlane(normal_grid_volume, plane_idx, weight)
+            new NormalConstraintPlane(normal_grid_volume, plane_idx, weight, direction_aware, z_min, z_max)
         );
     }
+
+    bool direction_aware_;
 };

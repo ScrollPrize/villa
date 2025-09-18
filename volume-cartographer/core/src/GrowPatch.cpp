@@ -37,7 +37,7 @@ void set_space_tracing_use_cuda(bool enable) {
 
 
 static int gen_straight_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &o1, const cv::Vec2i &o2, const cv::Vec2i &o3, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &dpoints, bool optimize_all, float w = 0.2);
-static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &dpoints, const vc::core::util::NormalGridVolume *ngv, float w = 0.5);
+static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &dpoints, const vc::core::util::NormalGridVolume *ngv, int z_min, int z_max, float w = 0.5);
 static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &out, const vc::core::util::NormalGridVolume *ngv);
 static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &dpoints, float unit, bool optimize_all, ceres::ResidualBlockId *res, float w = 1.0);
 
@@ -143,7 +143,7 @@ static int conditional_straight_loss(int bit, const cv::Vec2i &p, const cv::Vec2
     return set;
 };
 
-static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &dpoints, const vc::core::util::NormalGridVolume *ngv, float w)
+static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &dpoints, const vc::core::util::NormalGridVolume *ngv, int z_min, int z_max, float w)
 {
     if (!ngv) return 0;
 
@@ -164,14 +164,15 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_
     int count = 0;
     // int i = 1;
     for (int i = 0; i < 3; ++i) { // For each plane
+        bool direction_aware = (i == 0); // XY plane
         // Loss with p as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w), nullptr, pA, pB1, pB2, pC);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w, direction_aware, z_min, z_max), nullptr, pA, pB1, pB2, pC);
         // Loss with p_tr as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w), nullptr, pB1, pC, pA, pB2);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w, direction_aware, z_min, z_max), nullptr, pB1, pC, pA, pB2);
         // Loss with p_bl as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w), nullptr, pB2, pA, pC, pB1);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w, direction_aware, z_min, z_max), nullptr, pB2, pA, pC, pB1);
         // Loss with p_br as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w), nullptr, pC, pB2, pB1, pA);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w, direction_aware, z_min, z_max), nullptr, pC, pB2, pB1, pA);
         count += 4;
     }
 
@@ -179,12 +180,12 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_
 }
 
 static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
-    ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &out, const vc::core::util::NormalGridVolume *ngv)
+    ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &out, const vc::core::util::NormalGridVolume *ngv, int z_min, int z_max)
 {
     if (!ngv) return 0;
     int set = 0;
     if (!loss_mask(bit, p, {0,0}, loss_status))
-        set = set_loss_mask(bit, p, {0,0}, loss_status, gen_normal_loss(problem, p, state, out, ngv, normal_loss_w));
+        set = set_loss_mask(bit, p, {0,0}, loss_status, gen_normal_loss(problem, p, state, out, ngv, z_min, z_max, normal_loss_w));
     return set;
 };
 
@@ -299,7 +300,7 @@ int gen_direction_loss(ceres::Problem &problem, const cv::Vec2i &p, const int of
 template <typename I, typename T, typename C>
 static int emptytrace_create_centered_losses(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<uint8_t> &state,
     cv::Mat_<cv::Vec3d> &loc, const I &interp, Chunked3d<T,C> &t, std::vector<DirectionField> const &direction_fields,
-    const vc::core::util::NormalGridVolume *ngv, float unit, int flags = 0)
+    const vc::core::util::NormalGridVolume *ngv, int z_min, int z_max, float unit, int flags = 0)
 {
     //generate losses for point p
     int count = 0;
@@ -373,7 +374,7 @@ static int conditional_direction_loss(int bit, const cv::Vec2i &p, const int u_o
 template <typename I, typename T, typename C>
 static int emptytrace_create_missing_centered_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_status, const cv::Vec2i &p,
     cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, const I &interp, Chunked3d<T,C> &t, std::vector<DirectionField> const &direction_fields,
-    const vc::core::util::NormalGridVolume *ngv, float unit, int flags = SPACE_LOSS | OPTIMIZE_ALL)
+    const vc::core::util::NormalGridVolume *ngv, int z_min, int z_max, float unit, int flags = SPACE_LOSS | OPTIMIZE_ALL)
 {
     //generate losses for point p
     int count = 0;
@@ -417,10 +418,10 @@ static int emptytrace_create_missing_centered_losses(ceres::Problem &problem, cv
     //
     //     count += conditional_direction_loss(9, p, 1, loss_status, problem, state, loc, direction_fields);
     //     count += conditional_direction_loss(9, p, -1, loss_status, problem, state, loc, direction_fields);
-        count += conditional_normal_loss(10, p                 , loss_status, problem, state, loc, ngv);
-        count += conditional_normal_loss(10, p + cv::Vec2i(1,1), loss_status, problem, state, loc, ngv);
-        count += conditional_normal_loss(10, p + cv::Vec2i(0,1), loss_status, problem, state, loc, ngv);
-        count += conditional_normal_loss(10, p + cv::Vec2i(1,0), loss_status, problem, state, loc, ngv);
+        count += conditional_normal_loss(10, p                 , loss_status, problem, state, loc, ngv, z_min, z_max);
+        count += conditional_normal_loss(10, p + cv::Vec2i(1,1), loss_status, problem, state, loc, ngv, z_min, z_max);
+        count += conditional_normal_loss(10, p + cv::Vec2i(0,1), loss_status, problem, state, loc, ngv, z_min, z_max);
+        count += conditional_normal_loss(10, p + cv::Vec2i(1,0), loss_status, problem, state, loc, ngv, z_min, z_max);
     }
 
     return count;
@@ -430,7 +431,7 @@ static int emptytrace_create_missing_centered_losses(ceres::Problem &problem, cv
 template <typename I, typename T, typename C>
 static float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &locs,
     const I &interp, Chunked3d<T,C> &t, std::vector<DirectionField> const &direction_fields,
-    const vc::core::util::NormalGridVolume *ngv, float unit, bool quiet = false, bool parallel = false)
+    const vc::core::util::NormalGridVolume *ngv, int z_min, int z_max, float unit, bool quiet = false, bool parallel = false)
 {
     ceres::Problem problem;
     cv::Mat_<uint16_t> loss_status(state.size());
@@ -445,7 +446,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t
         for(int ox=std::max(p[1]-radius,0);ox<=std::min(p[1]+radius,locs.cols-1);ox++) {
             cv::Vec2i op = {oy, ox};
             if (cv::norm(p-op) <= radius)
-                emptytrace_create_missing_centered_losses(problem, loss_status, op, state, locs, interp, t, direction_fields, ngv, unit);
+                emptytrace_create_missing_centered_losses(problem, loss_status, op, state, locs, interp, t, direction_fields, ngv, z_min, z_max, unit);
         }
     for(int oy=std::max(p[0]-r_outer,0);oy<=std::min(p[0]+r_outer,locs.rows-1);oy++)
         for(int ox=std::max(p[1]-r_outer,0);ox<=std::min(p[1]+r_outer,locs.cols-1);ox++) {
@@ -603,6 +604,8 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     int stop_gen = params.value("generations", 100);
     float step = params.value("step_size", 20.0f);
     int rewind_gen = params.value("rewind_gen", -1);
+    int z_min = params.value("z_min", -1);
+    int z_max = params.value("z_max", std::numeric_limits<int>::max());
     ALifeTime f_timer("empty space tracing\n");
     DSReader reader = {ds,scale,cache};
     std::unique_ptr<vc::core::util::NormalGridVolume> ngv;
@@ -723,7 +726,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             for(int i=used_area.x;i<used_area.br().x;i++) {
                 if (state(j, i) & STATE_LOC_VALID) {
                     loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {j,i}, state, locs,
-                                                                interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
+                                                                interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts);
                     succ++;
                 }
             }
@@ -767,10 +770,10 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         // all points in the patch are correct distance in 2D vs 3D space, not too high curvature, near surface prediction, etc.
 
         // Add losses for every 'active' surface point (just the four currently) that doesn't yet have them
-        loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
-        loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {y0+1,x0}, state, locs,  interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
-        loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {y0,x0+1}, state, locs,  interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
-        loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {y0+1,x0+1}, state, locs,  interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
+        loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts);
+        loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {y0+1,x0}, state, locs,  interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts);
+        loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {y0,x0+1}, state, locs,  interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts);
+        loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {y0+1,x0+1}, state, locs,  interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts);
 
         fringe.push_back({y0,x0});
         fringe.push_back({y0+1,x0});
@@ -831,9 +834,6 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
 
     int ref_max = 6;
     int curr_ref_min = ref_max;
-
-    int z_min = params.value("z_min", -1);
-    int z_max = params.value("z_max", std::numeric_limits<int>::max());
 
     while (!fringe.empty()) {
         // bool global_opt = true;
@@ -976,7 +976,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                 ceres::Problem problem;
 
                 state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
-                int local_loss_count = emptytrace_create_centered_losses(problem, p, state, locs, interp, proc_tensor, direction_fields, ngv.get(), Ts);
+                int local_loss_count = emptytrace_create_centered_losses(problem, p, state, locs, interp, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts);
 
                 ceres::Solver::Summary summary;
                 ceres::Solve(options, &problem, &summary);
@@ -1058,7 +1058,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
 
                         float err = 0;
                         for(int range = 1; range<=max_local_opt_r;range++) {
-                            err = local_optimization(range, p, state, locs, interp, proc_tensor, direction_fields, ngv.get(), Ts);
+                            err = local_optimization(range, p, state, locs, interp, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts);
                             if (err <= phys_fail_th)
                                 break;
                         }
@@ -1097,7 +1097,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                         succ_gen_ps.push_back(p);
                     }
 
-                    local_optimization(local_opt_r, p, state, locs, interp, proc_tensor, direction_fields, ngv.get(), Ts, true);
+                    local_optimization(local_opt_r, p, state, locs, interp, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, true);
                 }
             }  // end parallel iteration over cands
         }
@@ -1176,7 +1176,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                     if (p[0] == -1)
                         break;
 
-                    local_optimization(8, p, state, locs, interp, proc_tensor, direction_fields, ngv.get(), Ts, true);
+                    local_optimization(8, p, state, locs, interp, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, true);
                 }
             }
         }
@@ -1190,7 +1190,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             // }
 
             if (generation % 8 == 0) {
-                local_optimization(stop_gen+10, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts, false, true);
+                local_optimization(stop_gen+10, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, false, true);
                 // For early generations, re-solve the big problem, jointly optimising the locations of all points in the patch
                 // std::cout << "running big solve" << std::endl;
                 // ceres::Solve(options_big, &big_problem, &big_summary);
