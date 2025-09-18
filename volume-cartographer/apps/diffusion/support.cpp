@@ -75,8 +75,19 @@ cv::Mat visualize_normal_grid(const vc::core::util::GridStore& normal_grid, cons
         const auto& path = *path_ptr;
         cv::Scalar color(rng.uniform(0, 256), rng.uniform(0, 256), rng.uniform(0, 256));
         for (size_t i = 0; i < path.size() - 1; ++i) {
-            cv::line(normal_constraints_vis, path[i], path[i+1], color, 1);
-            cv::circle(normal_constraints_vis, path[i+1], 3, color, -1);
+            const auto& p1 = path[i];
+            const auto& p2 = path[i+1];
+
+            cv::line(normal_constraints_vis, p1, p2, color, 1);
+            cv::circle(normal_constraints_vis, p2, 3, color, -1);
+
+            cv::Point center = (p1 + p2) / 2;
+            cv::Vec2f tangent((float)(p2.x - p1.x), (float)(p2.y - p1.y));
+            cv::normalize(tangent, tangent);
+            cv::Vec2f normal(-tangent[1], tangent[0]);
+
+            cv::Point normal_endpoint(center.x + normal[0] * 5, center.y + normal[1] * 5);
+            cv::line(normal_constraints_vis, center, normal_endpoint, cv::Scalar(0, 255, 0), 1, cv::LINE_AA);
         }
     }
     return normal_constraints_vis;
