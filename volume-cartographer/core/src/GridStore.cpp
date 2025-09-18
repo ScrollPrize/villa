@@ -482,6 +482,7 @@ GridStore::GridStore(const cv::Rect& bounds, int cell_size)
 GridStore::GridStore(const std::string& path)
     : pimpl_(std::make_unique<GridStoreImpl>(cv::Rect(), 1)) { // Use a dummy cell_size to avoid division by zero
     pimpl_->load_mmap(path);
+    meta = pimpl_->meta_;
 }
 
 GridStore::~GridStore() = default;
