@@ -3,6 +3,7 @@
 #include <opencv2/opencv.hpp>
 #include <vector>
 #include <memory>
+#include <nlohmann/json.hpp>
 
 namespace vc::core::util {
 
@@ -20,6 +21,8 @@ public:
     size_t get_memory_usage() const;
     size_t numSegments() const;
     size_t numNonEmptyBuckets() const;
+
+    nlohmann::json meta;
 
     void save(const std::string& path) const;
     void load_mmap(const std::string& path);
