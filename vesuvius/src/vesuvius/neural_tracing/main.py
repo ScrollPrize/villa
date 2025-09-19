@@ -13,11 +13,11 @@ from einops import rearrange
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 
-from dataset import PatchWithCubeDataset
+from dataset import PatchInCubeDataset
 from resnet3d import ResNet3DEncoder
 
 
-class Model(torch.nn.Module):
+class PatchConditionedOn3dModel(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
         self.denoiser = diffusers.models.UNet2DConditionModel(
@@ -25,13 +25,22 @@ class Model(torch.nn.Module):
             in_channels=3,
             out_channels=3,
             encoder_hid_dim=128,
+            down_block_types=(
+                "CrossAttnDownBlock2D",
+                "CrossAttnDownBlock2D",
+                "DownBlock2D",
+            ),
+            mid_block_type="UNetMidBlock2DCrossAttn",
+            up_block_types=("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
+            block_out_channels=(320, 640, 1280),
         )
-        self.encoder = ResNet3DEncoder(in_channels=1, channels=[32, 64, 96, 128], blocks=[2, 2, 2, 2])
+        self.encoder = ResNet3DEncoder(in_channels=4, channels=[32, 64, 96, 128], blocks=[2, 2, 2, 2])
+        self.register_buffer('position_embeddings', torch.from_numpy(np.indices((config['crop_size'], config['crop_size'], config['crop_size']), dtype=np.float32)))
 
     def forward(self, inputs, timesteps, volume):
-        conditioning = self.encoder(volume.unsqueeze(1))
+        # TODO: consider adding position-embedding only after resnet
+        conditioning = self.encoder(torch.cat([torch.tile(self.position_embeddings, (volume.shape[0], 1, 1, 1, 1)), volume.unsqueeze(1)], dim=1))
         conditioning = rearrange(conditioning, 'b c z y x -> b (z y x) c')
-        # TODO: positional encoding! either before the resnet or after...
         return self.denoiser(inputs, timesteps, encoder_hidden_states=conditioning)
 
 
@@ -76,10 +85,10 @@ def train(config_path):
     if 'wandb_project' in config and accelerator.is_main_process:
         wandb.init(project=config['wandb_project'], entity=config.get('wandb_entity', None), config=config)
 
-    dataset = PatchWithCubeDataset(config)
+    dataset = PatchInCubeDataset(config)
     train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config['batch_size'], num_workers=config['num_workers'])
 
-    model = Model(config)
+    model = PatchConditionedOn3dModel(config)
 
     noise_scheduler = diffusers.DDPMScheduler(
         num_train_timesteps=1000,
