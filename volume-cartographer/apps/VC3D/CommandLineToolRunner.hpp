@@ -34,7 +34,8 @@ public:
         GrowSegFromSegment,
         GrowSegFromSeeds,
         SegAddOverlap,
-        tifxyz2obj
+        tifxyz2obj,
+        obj2tifxyz
     };
 
     void setVolumePath(const QString& path);
@@ -51,7 +52,10 @@ public:
     void setAddOverlapParams(QString tgtDir, QString tifxyzPath);
     void setToObjParams(QString tifxyzPath, QString objPath);
     void setToObjOptions(bool normalizeUV, bool alignGrid, int decimateIterations, bool cleanSurface, float cleanK);
-
+    void setObj2TifxyzParams(const QString& objPath, const QString& outputDir,
+                             float stretchFactor = 1000.0f,
+                             float meshUnits = 1.0f,
+                             int stepSize = 20);
     bool execute(Tool tool);
     void cancel();
     bool isRunning() const;
@@ -134,4 +138,9 @@ private:
     QTextStream* _logStream;
 
     int _ompThreads{-1};
+
+    QString _objOutputDir;
+    float _objStretchFactor = 1000.0f;
+    float _objMeshUnits = 1.0f;
+    int _objStepSize = 20;
 };

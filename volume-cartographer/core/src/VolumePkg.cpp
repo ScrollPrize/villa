@@ -308,6 +308,12 @@ auto VolumePkg::getSegmentationDirectory() const -> std::string
     return currentSegmentationDir_;
 }
 
+auto VolumePkg::getVolpkgDirectory() const -> std::string
+{
+    return rootDir_;
+}
+
+
 auto VolumePkg::getAvailableSegmentationDirectories() const -> std::vector<std::string>
 {
     std::vector<std::string> dirs;

@@ -148,6 +148,7 @@ private slots:
     void onZoomIn();
     void onZoomOut();
     void onCopyCoordinates();
+    void onImportObjAsPatches();
 
 private:
     bool appInitComplete{false};
@@ -256,6 +257,6 @@ private:
     QShortcut* fCompositeViewShortcut;
     QShortcut* fDirectionHintsShortcut;
 
-
+    QAction* fImportObjAct;
 };  // class CWindow
 

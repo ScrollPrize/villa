@@ -25,7 +25,6 @@
 #include <QTemporaryDir>
 #include <QToolBar>
 #include <QFileInfo>
-
 #include <atomic>
 #include <omp.h>
 #include <opencv2/imgproc.hpp>
@@ -803,6 +802,8 @@ void CWindow::CreateMenus(void)
     fFileMenu->addSeparator();
     fFileMenu->addAction(fSettingsAct);
     fFileMenu->addSeparator();
+    fFileMenu->addAction(fImportObjAct);
+    fFileMenu->addSeparator();
     fFileMenu->addAction(fExitAct);
 
     fEditMenu = new QMenu(tr("&Edit"), this);
@@ -852,6 +853,7 @@ void CWindow::CreateMenus(void)
     menuBar()->addMenu(fActionsMenu);
     menuBar()->addMenu(fSelectionMenu);
     menuBar()->addMenu(fHelpMenu);
+
 }
 
 // Create actions
@@ -915,6 +917,10 @@ void CWindow::CreateActions(void)
         fInpaintTeleaAct->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_I));
     #endif
     connect(fInpaintTeleaAct, &QAction::triggered, this, &CWindow::onInpaintTeleaSelected);
+
+    fImportObjAct = new QAction(tr("Import OBJ as Patch..."), this);
+    connect(fImportObjAct, &QAction::triggered, this, &CWindow::onImportObjAsPatches);
+
 }
 
 void CWindow::UpdateRecentVolpkgActions()
@@ -2916,4 +2922,83 @@ void CWindow::onCopyCoordinates()
         QApplication::clipboard()->setText(coords);
         statusBar()->showMessage(tr("Coordinates copied to clipboard: %1").arg(coords), 2000);
     }
+}
+
+void CWindow::onImportObjAsPatches()
+{
+    if (!fVpkg) {
+        QMessageBox::warning(this, tr("Error"), tr("No volume package loaded."));
+        return;
+    }
+
+    QStringList objFiles = QFileDialog::getOpenFileNames(this,
+        tr("Select OBJ Files"),
+        QDir::homePath(),
+        tr("OBJ Files (*.obj);;All Files (*)"));
+
+    if (objFiles.isEmpty()) {
+        return;
+    }
+
+    auto pathsdirfs = std::filesystem::path(fVpkg->getVolpkgDirectory()) / std::filesystem::path(fVpkg->getSegmentationDirectory());
+    QString pathsDir = QString::fromStdString(pathsdirfs.string());
+
+    QStringList successfulIds;
+    QStringList failedFiles;
+
+    for (const QString& objFile : objFiles) {
+        QFileInfo fileInfo(objFile);
+        QString baseName = fileInfo.completeBaseName();
+        QString outputDir = pathsDir + "/" + baseName;
+
+        // Check if exists
+        if (QDir(outputDir).exists()) {
+            if (QMessageBox::question(this, tr("Overwrite?"),
+                tr("'%1' exists. Overwrite?").arg(baseName),
+                QMessageBox::Yes | QMessageBox::No) == QMessageBox::No) {
+                continue;
+            }
+        }
+
+        // Run the tool
+        QProcess process;
+        process.setProcessChannelMode(QProcess::MergedChannels);
+
+        QStringList args;
+        args << objFile << outputDir;
+        args << QString::number(1000.0f)  // stretch_factor
+             << QString::number(1.0f)      // mesh_units
+             << QString::number(20);        // step_size
+
+        QString toolPath = QCoreApplication::applicationDirPath() + "/vc_obj2tifxyz_legacy";
+
+        process.start(toolPath, args);
+
+        if (!process.waitForStarted(5000)) {
+            failedFiles.append(fileInfo.fileName());
+            continue;
+        }
+
+        process.waitForFinished(-1);
+
+        if (process.exitCode() == 0 && process.exitStatus() == QProcess::NormalExit) {
+            successfulIds.append(baseName);
+        } else {
+            failedFiles.append(fileInfo.fileName());
+        }
+    }
+
+    // Only add the specific new surfaces
+    for (const QString& id : successfulIds) {
+        AddSingleSegmentation(id.toStdString());
+    }
+
+    onSegFilterChanged(0);
+
+    QString message = tr("Imported: %1\nFailed: %2").arg(successfulIds.size()).arg(failedFiles.size());
+    if (!failedFiles.isEmpty()) {
+        message += tr("\n\nFailed files:\n%1").arg(failedFiles.join("\n"));
+    }
+
+    QMessageBox::information(this, tr("Import Results"), message);
 }

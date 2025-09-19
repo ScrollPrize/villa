@@ -45,6 +45,8 @@ public:
     void setSegmentationDirectory(const std::string& dirName);
     [[nodiscard]] std::string getSegmentationDirectory() const;
     [[nodiscard]] std::vector<std::string> getAvailableSegmentationDirectories() const;
+    [[nodiscard]] std::string getVolpkgDirectory() const;
+
 
     void refreshSegmentations();
 

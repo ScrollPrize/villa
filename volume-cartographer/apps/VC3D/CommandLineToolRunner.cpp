@@ -572,6 +572,13 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                 args << "--clean" << QString::number(_optCleanK);
             }
             break;
+        case Tool::obj2tifxyz:
+            args << _objPath
+                 << _objOutputDir
+                 << QString::number(_objStretchFactor)
+                 << QString::number(_objMeshUnits)
+                 << QString::number(_objStepSize);
+            break;
     }
 
     return args;
@@ -597,6 +604,9 @@ QString CommandLineToolRunner::toolName(Tool tool) const
         case Tool::tifxyz2obj:
             return basePath + "vc_tifxyz2obj";
 
+        case Tool::obj2tifxyz:
+            return basePath + "vc_obj2tifxyz_legacy";
+
         default:
             return "unknown_tool";
     }
@@ -606,4 +616,14 @@ QString CommandLineToolRunner::getOutputPath() const
 {
     QFileInfo outputInfo(_outputPattern);
     return outputInfo.dir().path();
+}
+
+void CommandLineToolRunner::setObj2TifxyzParams(const QString& objPath, const QString& outputDir,
+                                                float stretchFactor, float meshUnits, int stepSize)
+{
+    _objPath = objPath;
+    _objOutputDir = outputDir;
+    _objStretchFactor = stretchFactor;
+    _objMeshUnits = meshUnits;
+    _objStepSize = stepSize;
 }
