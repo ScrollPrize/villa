@@ -4,6 +4,7 @@ import time
 import click
 import logging
 import subprocess
+import secrets
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
@@ -41,14 +42,24 @@ class SurfaceTracerEvaluation:
 
         # --- W&B wiring (main process only) ---
         self.wandb_enabled = bool(self.config.get("wandb_project")) and (wandb is not None)
-        ts = int(time.time())
-        default_id = f"surface_tracer_{ts}"
+
+        # Unique suffix for run naming (UTC timestamp + short random hex)
+        ts_str = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        rand4 = secrets.token_hex(2)  # 4 hex chars
+
+        default_base = "surface_tracer"
+        default_id = f"{default_base}_{ts_str}_{rand4}"
+
+        # id and name both get a unique suffix; if user provides a base, we append the suffix
         self.run_id = str(self.config.get("wandb_run_id", default_id))
-        self.run_name = self.config.get("wandb_run_name", default_id)
+        base_name = self.config.get("wandb_run_name", default_base)
+        self.run_name = f"{base_name}_{ts_str}_{rand4}"
+
         self.run_group = self.config.get("wandb_group")
         self.run_tags = list(self.config.get("wandb_tags", []))
         self.job_type = self.config.get("wandb_job_type", "evaluation")
         self.commit_every = int(self.config.get("wandb_commit_every", 10))  # <— throttle knob
+
 
         # one global step across the whole pipeline
         self._global_step = 0
