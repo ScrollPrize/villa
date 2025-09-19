@@ -26,16 +26,16 @@ class SeparableConv3d(nn.Module):
 
 class ResidualBlock3D(nn.Module):
     """
-    Residual block with two SeparableConv3d layers.
+    Residual block with two 3D convolution layers.
     Uses GroupNorm + SiLU.
     """
     def __init__(self, in_channels, out_channels, stride=1, groups=8):
         super().__init__()
-        self.conv1 = SeparableConv3d(in_channels, out_channels, stride=stride)
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
         self.norm1 = nn.GroupNorm(groups, out_channels)
         self.act1 = nn.SiLU(inplace=True)
 
-        self.conv2 = SeparableConv3d(out_channels, out_channels, stride=1)
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
         self.norm2 = nn.GroupNorm(groups, out_channels)
 
         # Skip connection (identity or 1x1 conv if shape mismatch)
@@ -69,7 +69,7 @@ class ResidualBlock3D(nn.Module):
 
 class ResNet3DEncoder(nn.Module):
     """
-    3D ResNet encoder with separable convs.
+    3D ResNet encoder
     - channels: list of channel sizes per stage
     - blocks: list of block counts per stage
     - groups: number of groups for GroupNorm
