@@ -14,11 +14,21 @@
         {
             "volume_path": "/mnt/bcache/projects/vesuvius-scrolls/volpkgs/P0343P.volpkg/volumes/4.320um_1.0m_116keV_binmean_2_PHerc0343P.zarr",
             "volume_scale": 1,
-            "segments_path": "/mnt/bcache/projects/vesuvius-scrolls/neural-tracing/data/PHerc0343P",
-            "roi_path": "/mnt/bcache/projects/vesuvius-scrolls/neural-tracing/data/PHerc0343_20250904_140149_progress.json"
+            "segments_path": "/mnt/bcache/projects/vesuvius-scrolls/neural-tracing/data/PHerc0343P"
+        },
+        {
+            "volume_path": "/mnt/bcache/projects/vesuvius-scrolls/volpkgs/0500P2.volpkg/volumes/111keV_1.2m_scroll-fragment-0500P2.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/bcache/projects/vesuvius-scrolls/neural-tracing/data/PHerc500P2",
+            "segments_scale": 1
+        },
+        {
+            "volume_path": "/home/paul/remote/salina/projects/vesuvius-scrolls/data/zarr/Scroll1_masked.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/bcache/projects/vesuvius-scrolls/neural-tracing/data/PHercParis4/tifxyz"
         }
     ],
     "crop_size": 128,
-    "patch_size": 12,
+    "patch_size": 16,
     "step_size": 10
 }
