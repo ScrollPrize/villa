@@ -6,6 +6,8 @@ import glob
 import torch
 import random
 import numpy as np
+import scipy.ndimage
+import networkx as nx
 from tqdm import tqdm
 from einops import rearrange
 import torch.nn.functional as F
@@ -94,31 +96,6 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
         self._config = config
         self._patches = load_datasets(config)
 
-    def _crop_volume_with_padding(self, volume, center_zyx, crop_size):
-        """Crop volume around center point, padding with zeros if out of bounds."""
-        crop_min = (center_zyx - crop_size // 2).int()
-        crop_max = crop_min + crop_size
-        
-        # Clamp to volume bounds
-        actual_min = torch.maximum(crop_min, torch.zeros_like(crop_min))
-        actual_max = torch.minimum(crop_max, torch.tensor(volume.shape))
-        
-        # Extract valid portion and convert to tensor
-        volume_crop = torch.from_numpy(volume[
-            actual_min[0]:actual_max[0], 
-            actual_min[1]:actual_max[1], 
-            actual_min[2]:actual_max[2]
-        ]).to(torch.float32) / 255.
-        
-        # Pad if needed
-        pad_before = actual_min - crop_min
-        pad_after = crop_max - actual_max
-        if torch.any(pad_before > 0) or torch.any(pad_after > 0):
-            paddings = pad_before[2], pad_after[2], pad_before[1], pad_after[1], pad_before[0], pad_after[0]
-            volume_crop = F.pad(volume_crop, paddings, mode='constant', value=0)
-        
-        return volume_crop, crop_min
-
     def _mark_context_point(self, volume, point):
         center = point.int()
         offsets = torch.tensor([[0, 0, 0], [-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1]])
@@ -140,9 +117,9 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
 
         areas = torch.tensor([patch.area for patch in self._patches])
         area_weights = areas / areas.sum()
-        context_point_distance = self._config['context_point_distance']
-        num_context_points = self._config['num_context_points']
-        assert num_context_points >= 1  # ...since we always include one point at the center of the patch
+        # context_point_distance = self._config['context_point_distance']
+        # num_context_points = self._config['num_context_points']
+        # assert num_context_points >= 1  # ...since we always include one point at the center of the patch
         crop_size = torch.tensor(self._config['crop_size'])
 
         while True:
@@ -152,36 +129,70 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
             random_idx = torch.randint(len(patch.valid_indices) - 1, size=[])
             start_quad_ij = patch.valid_indices[random_idx]
             center_ij = start_quad_ij + torch.rand(size=[2])
+            # TODO: maybe erode inwards before doing this, so we can directly
+            #  avoid sampling points that are too near the edge of the patch
 
-            # Sample other nearby random points as additional context; reject if outside patch
-            angle = torch.rand(size=[num_context_points]) * 2 * torch.pi
-            distance = context_point_distance * patch.scale
-            context_ij = center_ij + distance * torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1)
-            if torch.any(context_ij < 0) or torch.any(context_ij >= torch.tensor(patch.zyxs.shape[:2])):
-                continue
-            if not patch.valid_mask[*context_ij.int().T].all():
-                continue
+            # # Sample other nearby random points as additional context; reject if outside patch
+            # angle = torch.rand(size=[num_context_points]) * 2 * torch.pi
+            # distance = context_point_distance * patch.scale
+            # context_ij = center_ij + distance * torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1)
+            # if torch.any(context_ij < 0) or torch.any(context_ij >= torch.tensor(patch.zyxs.shape[:2])):
+            #     continue
+            # if not patch.valid_mask[*context_ij.int().T].all():
+            #     continue
 
             center_zyx = self._get_zyx_from_patch(center_ij, patch)
-            context_zyxs = [self._get_zyx_from_patch(context_ij, patch) for context_ij in context_ij]
+            # context_zyxs = [self._get_zyx_from_patch(context_ij, patch) for context_ij in context_ij]
 
             # Crop ROI out of the volume; mark context points
-            volume_crop, min_corner_zyx = self._crop_volume_with_padding(patch.volume, center_zyx, crop_size)
+            volume_crop, min_corner_zyx = get_crop_from_volume(patch.volume, center_zyx, crop_size)
             self._mark_context_point(volume_crop, center_zyx - min_corner_zyx)
-            for context_zyx in context_zyxs:
-                self._mark_context_point(volume_crop, context_zyx - min_corner_zyx)
+            # for context_zyx in context_zyxs:
+            #     self._mark_context_point(volume_crop, context_zyx - min_corner_zyx)
 
-            # Build the confidence map, by rasterising the surface
+            # Find quads that are in the volume crop, and reachable from the start quad without leaving the crop
+
+            # FIXME: instead check any corner in crop, and clamp to bounds later
             quad_centers = 0.5 * (patch.zyxs[1:, 1:] + patch.zyxs[:-1, :-1])
             quad_in_crop = patch.valid_mask & torch.all(quad_centers >= min_corner_zyx, dim=-1) & torch.all(quad_centers < min_corner_zyx + crop_size, dim=-1)
+            
+            # Build neighbor graph of quads that are in the volume crop
+            G = nx.Graph()
+            quad_indices = torch.stack(torch.where(quad_in_crop), dim=-1)
+            
+            # Add nodes for each quad in crop using (i, j) as node ID
+            for i, j in quad_indices:
+                G.add_node((i.item(), j.item()))
+            
+            # Add edges between neighboring quads
+            for i, j in quad_indices:
+                # Check 4-connected neighbors
+                neighbors = [(i-1, j), (i+1, j), (i, j-1), (i, j+1)]
+                for ni, nj in neighbors:
+                    if (0 <= ni < quad_in_crop.shape[0] and 
+                        0 <= nj < quad_in_crop.shape[1] and 
+                        quad_in_crop[ni, nj]):
+                        G.add_edge((i.item(), j.item()), (ni.item(), nj.item()))
+            
+            # Find reachable quads starting from start_quad_ij
+            start_node = (start_quad_ij[0].item(), start_quad_ij[1].item())
+            assert G.has_node(start_node)
+            reachable_quads = nx.node_connected_component(G, start_node)
+            reachable_quads = torch.tensor(list(reachable_quads))
+            
+            # Create new mask with only reachable quads
+            quad_reachable_in_crop = torch.zeros_like(quad_in_crop)
+            quad_reachable_in_crop[*reachable_quads.T] = True
+            
+            # Rasterise the (cropped, reachable) surface patch
             filtered_quads_zyxs = torch.stack([
                 torch.stack([
-                    patch.zyxs[:-1, :-1][quad_in_crop],
-                    patch.zyxs[:-1, 1:][quad_in_crop],
+                    patch.zyxs[:-1, :-1][quad_reachable_in_crop],
+                    patch.zyxs[:-1, 1:][quad_reachable_in_crop],
                 ], dim=1),
                 torch.stack([
-                    patch.zyxs[1:, :-1][quad_in_crop],
-                    patch.zyxs[1:, 1:][quad_in_crop],
+                    patch.zyxs[1:, :-1][quad_reachable_in_crop],
+                    patch.zyxs[1:, 1:][quad_reachable_in_crop],
                 ], dim=1),
             ], dim=1)  # quad, top/bottom, left/right, zyx
             oversample_factor = 2
@@ -191,38 +202,28 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
             points_covering_quads = torch.lerp(filtered_quads_zyxs[:, None, 0, :], filtered_quads_zyxs[:, None, 1, :], v_points[None, :, None, None])
             points_covering_quads = torch.lerp(points_covering_quads[:, :, None, 0], points_covering_quads[:, :, None, 1], u_points[None, None, :, None])
             indices_in_crop = (points_covering_quads - min_corner_zyx + 0.5).int().clip(0, crop_size - 1)
-            confidence = torch.zeros([crop_size, crop_size, crop_size], dtype=torch.float32)
-            confidence[*indices_in_crop.view(-1, 3).T] = 1.
+            rasterised = torch.zeros([crop_size, crop_size, crop_size], dtype=torch.float32)
+            rasterised[*indices_in_crop.view(-1, 3).T] = 1.
 
-            # Also construct UV map on the surface
-            # filtered_quads_uvs = torch.stack(torch.where(quad_in_crop), dim=-1)
-            # uv_grid = torch.stack(torch.meshgrid(u_points, v_points, indexing='ij'), dim=-1)
-            # interpolated_uvs = filtered_quads_uvs[:, None, None, :] + uv_grid
-            # uvs = torch.zeros([crop_size, crop_size, crop_size, 2], dtype=torch.float32)
-            # uvs[*indices_in_crop.view(-1, 3).T] = interpolated_uvs.view(-1, 2)
-
-            # Also construct UV map, on the surface and extrapolated into free space
-            from torch_geometric.nn.unpool import knn_interpolate
-            filtered_quads_uvs = torch.stack(torch.where(quad_in_crop), dim=-1)
+            # Construct UV map on the surface
+            filtered_quads_uvs = torch.stack(torch.where(quad_reachable_in_crop), dim=-1)
             uv_grid = torch.stack(torch.meshgrid(u_points, v_points, indexing='ij'), dim=-1)
             interpolated_uvs = filtered_quads_uvs[:, None, None, :] + uv_grid
-            undersample_factor = 4
-            uvs = knn_interpolate(
-                x=interpolated_uvs[:, ::undersample_factor, ::undersample_factor, :].reshape(-1, 2),
-                pos_x=indices_in_crop[:, ::undersample_factor, ::undersample_factor, :].reshape(-1, 3).float(),
-                pos_y=torch.stack(torch.meshgrid(*[torch.arange(crop_size)] *  3, indexing='ij'), dim=-1).view(-1, 3).float(),
-                k=1,
-            ).reshape([crop_size, crop_size, crop_size, 2])
-            uvs = (uvs - center_ij) / ...
-            # FIXME: we need to have UVs in a range that is diffusion-compatible, and also that
-            #  has consistent semantic meaning across different patches
+            uvs = torch.zeros([crop_size, crop_size, crop_size, 2], dtype=torch.float32)
+            uvs[*indices_in_crop.view(-1, 3).T] = interpolated_uvs.view(-1, 2)
+
+            # Extend into free space: find EDT, and use feature transform to get nearest UV
+            edt, ft = scipy.ndimage.morphology.distance_transform_edt((rasterised == 0).numpy(), return_indices=True)
+            edt /= ((crop_size // 2) ** 2 * 3) ** 0.5 + 1.  # worst case: only center point is fg, hence max(edt) is 'radius' to corners
+            uvs = uvs[*ft]
+            uvs = (uvs - center_ij) / patch.scale / (crop_size * 2)  # *2 is somewhat arbitrary; worst-ish-case = patch wrapping round three sides of cube
 
             #TODO: include full 2d slices for additional context
 
             yield {
-                'volume': ...,
-                'confidence': ...,
-                'uv': ...,
+                'volume': volume_crop,
+                'edt': edt,
+                'uv': uvs,
             }
 
 
@@ -232,35 +233,15 @@ class PatchWithCubeDataset(torch.utils.data.IterableDataset):
         self._config = config
         self._patches = load_datasets(config)
 
-    def _get_crop_from_volume(self, volume, center_zyx, crop_size):
-        """Crop volume around center point, padding with zeros if needed"""
-        crop_min = (center_zyx - crop_size // 2).int()
-        crop_max = crop_min + crop_size
-
-        # Clamp to volume bounds
-        actual_min = torch.maximum(crop_min, torch.zeros_like(crop_min))
-        actual_max = torch.minimum(crop_max, torch.tensor(volume.shape))
-
-        # Extract valid portion and convert to tensor
-        volume_crop = torch.from_numpy(volume[
-            actual_min[0]:actual_max[0],
-            actual_min[1]:actual_max[1],
-            actual_min[2]:actual_max[2]
-        ]).to(torch.float32) / 255.
-
-        # Pad if needed
-        pad_before = actual_min - crop_min
-        pad_after = crop_max - actual_max
-        if torch.any(pad_before > 0) or torch.any(pad_after > 0):
-            paddings = pad_before[2], pad_after[2], pad_before[1], pad_after[1], pad_before[0], pad_after[0]
-            volume_crop = F.pad(volume_crop, paddings, mode='constant', value=0)
-
-        return volume_crop
-
-    def _get_crop_from_patch(self, ij, crop_size_vx, patch):
-        # Note ij is measured in quads, while crop_size_vx is measured in voxels
-        crop_size = (crop_size_vx * patch.scale).int()
-        grid = torch.stack(torch.meshgrid(torch.arange(crop_size[0]), torch.arange(crop_size[1])), dim=-1) + ij
+    def _get_crop_from_patch(self, ij, patch_size, step_size, patch):
+        # ij is measured in quads of this patch
+        # patch.scale gives quads per voxel for this patch
+        # patch_size is number of our-model-sized quads we generate; step_size is size in voxels of those quads
+        crop_size_patch_quads = patch_size * step_size * patch.scale
+        grid = torch.stack(torch.meshgrid(
+            torch.linspace(0, crop_size_patch_quads[0], patch_size + 1)[:-1],
+            torch.linspace(0, crop_size_patch_quads[1], patch_size + 1)[:-1],
+        ), dim=-1) + ij
         normalized_grid = grid / torch.tensor(patch.zyxs.shape[:2]) * 2 - 1
         interpolated = F.grid_sample(
             rearrange(patch.zyxs, 'y x zyx -> 1 zyx y x'),
@@ -284,8 +265,9 @@ class PatchWithCubeDataset(torch.utils.data.IterableDataset):
 
         areas = torch.tensor([patch.area for patch in self._patches])
         area_weights = areas / areas.sum()
-        volume_crop_size = torch.tensor(self._config['crop_size'])
-        patch_crop_size_vx = torch.tensor(self._config['patch_size'] * self._config['step_size'])
+        volume_crop_size = torch.tensor(self._config['crop_size'])  # measured in voxels
+        patch_size = torch.tensor(self._config['patch_size'])  # measured in quads of the model
+        step_size = torch.tensor(self._config['step_size'])  # measured in voxels
 
         while True:
             patch = random.choices(self._patches, weights=area_weights)[0]
@@ -297,14 +279,14 @@ class PatchWithCubeDataset(torch.utils.data.IterableDataset):
             center_ij = start_quad_ij + torch.rand(size=[2])
 
             # Extract 2D crop from patch, and 3D crop from volume
-            patch_crop, patch_valid = self._get_crop_from_patch(center_ij, patch_crop_size_vx, patch)
+            patch_crop, patch_valid = self._get_crop_from_patch(center_ij, patch_size, step_size, patch)
             if not patch_valid[patch_crop.shape[0] // 2, patch_crop.shape[1] // 2]:
                 continue  # this can happen due to rounding errors
             center_zyx = patch_crop[patch_crop.shape[0] // 2, patch_crop.shape[1] // 2]
-            volume_crop = self._get_crop_from_volume(patch.volume, center_zyx, volume_crop_size)
+            volume_crop, _ = get_crop_from_volume(patch.volume, center_zyx, volume_crop_size)
 
             # Relativise and normalise the patch coordinates
-            patch_crop = torch.where(patch_valid[..., None], (patch_crop - center_zyx) / patch_crop_size_vx, -1)
+            patch_crop = torch.where(patch_valid[..., None], (patch_crop - center_zyx) / (patch_size * step_size), -1)
 
             #TODO: include full 2d slices for additional context
 
@@ -318,24 +300,36 @@ class PatchWithCubeDataset(torch.utils.data.IterableDataset):
 def load_datasets(config):
     all_patches = []
     for dataset in config['datasets']:
-        ome_zarr = zarr.open(dataset['volume_path'], mode='r')
+        volume_path = dataset['volume_path']
+        if True:
+            # TODO: how does this interact with multiple dataloader workers? cache is created before fork, hence presumably not shared?
+            if "://" in volume_path or "::" in volume_path:
+                store = zarr.storage.FSStore(volume_path, mode='r')
+            else:
+                store = zarr.storage.DirectoryStore(volume_path)
+            store = zarr.storage.LRUStoreCache(store, max_size=20*1024**3)
+            ome_zarr = zarr.open_group(store, mode='r')
+        else:
+            ome_zarr = zarr.open(volume_path, mode='r')
+
         volume_scale = dataset['volume_scale']
         volume = ome_zarr[str(volume_scale)]
-        
+
         patches = load_tifxyz_patches(dataset['segments_path'], dataset.get('z_range', None), volume)
+        patches_wrt_volume_scale = dataset.get('segments_scale', 0)  # if specified, patches are assumed to already target the volume at this scale
 
         if 'roi_path' in dataset:
             # If specified, roi_path is a proofreader log; filter & crop patches to approved cubes
             with open(dataset['roi_path'], 'r') as f:
                 proofreader_json = json.load(f)
-            assert tuple(proofreader_json['metadata']['volume_shape']) == ome_zarr['0'].shape
+            assert tuple(proofreader_json['metadata']['volume_shape']) == ome_zarr[str(patches_wrt_volume_scale)].shape
             approved_cubes = [{
                 'min_zyx': patch['coords'],
                 'size': patch['patch_size'],
             } for patch in proofreader_json['approved_patches']]
             patches = filter_patches_by_roi(patches, approved_cubes)
 
-        patches = [patch.retarget(2 ** volume_scale) for patch in patches]
+        patches = [patch.retarget(2 ** (volume_scale - patches_wrt_volume_scale)) for patch in patches]
 
         all_patches.extend(patches)
         
@@ -394,3 +388,28 @@ def filter_patches_by_roi(patches, approved_cubes):
             filtered_patches.append(Patch(cropped_zyxs, patch.scale, patch.volume))
     return filtered_patches
 
+
+def get_crop_from_volume(volume, center_zyx, crop_size):
+    """Crop volume around center point, padding with zeros if needed"""
+    crop_min = (center_zyx - crop_size // 2).int()
+    crop_max = crop_min + crop_size
+
+    # Clamp to volume bounds
+    actual_min = torch.maximum(crop_min, torch.zeros_like(crop_min))
+    actual_max = torch.minimum(crop_max, torch.tensor(volume.shape))
+
+    # Extract valid portion and convert to tensor
+    volume_crop = torch.from_numpy(volume[
+        actual_min[0]:actual_max[0],
+        actual_min[1]:actual_max[1],
+        actual_min[2]:actual_max[2]
+    ]).to(torch.float32) / 255.
+
+    # Pad if needed
+    pad_before = actual_min - crop_min
+    pad_after = crop_max - actual_max
+    if torch.any(pad_before > 0) or torch.any(pad_after > 0):
+        paddings = pad_before[2], pad_after[2], pad_before[1], pad_after[1], pad_before[0], pad_after[0]
+        volume_crop = F.pad(volume_crop, paddings, mode='constant', value=0)
+
+    return volume_crop, crop_min
