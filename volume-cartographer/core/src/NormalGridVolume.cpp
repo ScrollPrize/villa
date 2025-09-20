@@ -91,14 +91,14 @@ namespace vc::core::util {
 
             auto grid_store = std::make_unique<GridStore>(grid_path);
 
-            if (plane_idx == 0) { // XY plane
-                if (!grid_store->meta.contains("umbilicus_x") || !grid_store->meta.contains("umbilicus_y")) {
-                    throw std::runtime_error("Missing umbilicus metadata in " + grid_path);
-                }
-                if (std::isnan(grid_store->meta["umbilicus_x"].get<float>()) || std::isnan(grid_store->meta["umbilicus_y"].get<float>())) {
-                    throw std::runtime_error("NaN umbilicus metadata in " + grid_path);
-                }
-            }
+            // if (plane_idx == 0) { // XY plane
+            //     if (!grid_store->meta.contains("umbilicus_x") || !grid_store->meta.contains("umbilicus_y")) {
+            //         throw std::runtime_error("Missing umbilicus metadata in " + grid_path);
+            //     }
+            //     if (std::isnan(grid_store->meta["umbilicus_x"].get<float>()) || std::isnan(grid_store->meta["umbilicus_y"].get<float>())) {
+            //         throw std::runtime_error("NaN umbilicus metadata in " + grid_path);
+            //     }
+            // }
 
             GridStore* ptr;
             {

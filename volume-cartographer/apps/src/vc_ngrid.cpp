@@ -351,14 +351,14 @@ int main(int argc, char* argv[]) {
                     vc::core::util::GridStore grid_store(cv::Rect(0, 0, slice_mat.cols, slice_mat.rows), vm["grid-step"].as<int>());
                     populate_normal_grid(traces, grid_store, spiral_step);
 
-                    if (dir == SliceDirection::XY) {
-                        cv::Vec2f umbilicus = vc::core::util::align_and_extract_umbilicus(grid_store);
-                        vc::core::util::GridStore aligned_grid(cv::Rect(0, 0, slice_mat.cols, slice_mat.rows), vm["grid-step"].as<int>());
-                        align_and_filter_segments(grid_store, aligned_grid, umbilicus);
-                        aligned_grid.save(tmp_path);
-                    } else {
+                    // if (dir == SliceDirection::XY) {
+                    //     cv::Vec2f umbilicus = vc::core::util::align_and_extract_umbilicus(grid_store);
+                    //     vc::core::util::GridStore aligned_grid(cv::Rect(0, 0, slice_mat.cols, slice_mat.rows), vm["grid-step"].as<int>());
+                    //     align_and_filter_segments(grid_store, aligned_grid, umbilicus);
+                    //     aligned_grid.save(tmp_path);
+                    // } else {
                         grid_store.save(tmp_path);
-                    }
+                    // }
                     
                     fs::rename(tmp_path, out_path);
                     t.mark("grid");

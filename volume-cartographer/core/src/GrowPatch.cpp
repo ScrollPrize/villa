@@ -164,15 +164,16 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_
     int count = 0;
     // int i = 1;
     for (int i = 0; i < 3; ++i) { // For each plane
-        bool direction_aware = (i == 0); // XY plane
+        // bool direction_aware = (i == 0); // XY plane
+        bool direction_aware = false; // this is not that simple ...
         // Loss with p as base point A
         problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w, direction_aware, z_min, z_max), nullptr, pA, pB1, pB2, pC);
+        // Loss with p_br as base point A
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w, direction_aware, z_min, z_max), nullptr, pC, pB2, pB1, pA);
         // Loss with p_tr as base point A
         problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w, direction_aware, z_min, z_max), nullptr, pB1, pC, pA, pB2);
         // Loss with p_bl as base point A
         problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w, direction_aware, z_min, z_max), nullptr, pB2, pA, pC, pB1);
-        // Loss with p_br as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w, direction_aware, z_min, z_max), nullptr, pC, pB2, pB1, pA);
         count += 4;
     }
 
@@ -318,6 +319,17 @@ static int emptytrace_create_centered_losses(ceres::Problem &problem, const cv::
     count += gen_straight_loss(problem, p, {-1,0},{0,0},{1,0}, state, loc, flags & OPTIMIZE_ALL);
     count += gen_straight_loss(problem, p, {0,0},{1,0},{2,0}, state, loc, flags & OPTIMIZE_ALL);
 
+
+    //diag1
+    count += gen_straight_loss(problem, p, {-2,-2},{-1,-1},{0,0}, state, loc, flags & OPTIMIZE_ALL);
+    count += gen_straight_loss(problem, p, {-1,-1},{0,0},{1,1}, state, loc, flags & OPTIMIZE_ALL);
+    count += gen_straight_loss(problem, p, {0,0},{1,1},{2,2}, state, loc, flags & OPTIMIZE_ALL);
+
+    //diag2
+    count += gen_straight_loss(problem, p, {-2,2},{-1,1},{0,0}, state, loc, flags & OPTIMIZE_ALL);
+    count += gen_straight_loss(problem, p, {-1,1},{0,0},{1,-1}, state, loc, flags & OPTIMIZE_ALL);
+    count += gen_straight_loss(problem, p, {0,0},{1,1},{2,2}, state, loc, flags & OPTIMIZE_ALL);
+
     //direct neighboars
     count += gen_dist_loss(problem, p, {0,-1}, state, loc, unit, flags & OPTIMIZE_ALL, nullptr, space_trace_dist_w);
     count += gen_dist_loss(problem, p, {0,1}, state, loc, unit, flags & OPTIMIZE_ALL, nullptr, space_trace_dist_w);
@@ -389,6 +401,16 @@ static int emptytrace_create_missing_centered_losses(ceres::Problem &problem, cv
         count += conditional_straight_loss(1, p, {-2,0},{-1,0},{0,0}, loss_status, problem, state, loc, flags);
         count += conditional_straight_loss(1, p, {-1,0},{0,0},{1,0}, loss_status, problem, state, loc, flags);
         count += conditional_straight_loss(1, p, {0,0},{1,0},{2,0}, loss_status, problem, state, loc, flags);
+
+        //diag1
+        count += conditional_straight_loss(0, p, {-2,-2},{-1,-1},{0,0}, loss_status, problem, state, loc, flags);
+        count += conditional_straight_loss(0, p, {-1,-1},{0,0},{1,1}, loss_status, problem, state, loc, flags);
+        count += conditional_straight_loss(0, p, {0,0},{1,1},{2,2}, loss_status, problem, state, loc, flags);
+
+        //diag2
+        count += conditional_straight_loss(1, p, {-2,2},{-1,1},{0,0}, loss_status, problem, state, loc, flags);
+        count += conditional_straight_loss(1, p, {-1,1},{0,0},{1,-1}, loss_status, problem, state, loc, flags);
+        count += conditional_straight_loss(1, p, {0,0},{1,-1},{2,-2}, loss_status, problem, state, loc, flags);
     // }
 
     //direct neighboars h
