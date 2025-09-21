@@ -940,3 +940,67 @@ struct NormalConstraintPlane {
 
     bool direction_aware_;
 };
+
+
+struct PointCorrectionLoss {
+    PointCorrectionLoss(const cv::Vec3f& correction_src, const cv::Vec3f& correction_tgt, const cv::Vec2i& grid_loc_int)
+        : correction_src_(correction_src), correction_tgt_(correction_tgt), grid_loc_int_(grid_loc_int) {}
+
+    template <typename T>
+    bool operator()(const T* const p00, const T* const p01, const T* const p10, const T* const p11, const T* const grid_loc, T* residual) const {
+        // Calculate the local coordinates (u,v) within the quad by subtracting the integer grid location.
+        T u = grid_loc[0] - T(grid_loc_int_[0]);
+        T v = grid_loc[1] - T(grid_loc_int_[1]);
+
+        // If the grid location is outside this specific quad (i.e., u,v not in [0,1]), this loss is zero.
+        if (u < T(0.0) || u >= T(1.0) || v < T(0.0) || v >= T(1.0)) {
+            residual[0] = T(0.0);
+            residual[1] = T(0.0);
+            return true;
+        }
+
+        // Bilinear interpolation to find the 3D point on the surface patch corresponding to the grid location.
+        T p_interp[3];
+        p_interp[0] = (T(1) - u) * (T(1) - v) * p00[0] + u * (T(1) - v) * p10[0] + (T(1) - u) * v * p01[0] + u * v * p11[0];
+        p_interp[1] = (T(1) - u) * (T(1) - v) * p00[1] + u * (T(1) - v) * p10[1] + (T(1) - u) * v * p01[1] + u * v * p11[1];
+        p_interp[2] = (T(1) - u) * (T(1) - v) * p00[2] + u * (T(1) - v) * p10[2] + (T(1) - u) * v * p01[2] + u * v * p11[2];
+
+        // Residual 1: 3D Euclidean distance between the interpolated point and the target correction point.
+        T dx_abs = p_interp[0] - T(correction_tgt_[0]);
+        T dy_abs = p_interp[1] - T(correction_tgt_[1]);
+        T dz_abs = p_interp[2] - T(correction_tgt_[2]);
+        residual[0] = ceres::sqrt(dx_abs * dx_abs + dy_abs * dy_abs + dz_abs * dz_abs);
+
+        // Residual 2: 3D point-to-line distance from the interpolated point to the line defined by src -> tgt.
+        T p1[3] = {T(correction_src_[0]), T(correction_src_[1]), T(correction_src_[2])};
+        T p2[3] = {T(correction_tgt_[0]), T(correction_tgt_[1]), T(correction_tgt_[2])};
+
+        T v_line[3] = {p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]};
+        T w_line[3] = {p_interp[0] - p1[0], p_interp[1] - p1[1], p_interp[2] - p1[2]};
+
+        T c1 = w_line[0] * v_line[0] + w_line[1] * v_line[1] + w_line[2] * v_line[2];
+        T c2 = v_line[0] * v_line[0] + v_line[1] * v_line[1] + v_line[2] * v_line[2];
+
+        T b = c1 / c2;
+        T pb[3] = {p1[0] + b * v_line[0], p1[1] + b * v_line[1], p1[2] + b * v_line[2]};
+
+        T dx_line = p_interp[0] - pb[0];
+        T dy_line = p_interp[1] - pb[1];
+        T dz_line = p_interp[2] - pb[2];
+
+        residual[1] = ceres::sqrt(dx_line * dx_line + dy_line * dy_line + dz_line * dz_line);
+
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const cv::Vec3f& correction_src, const cv::Vec3f& correction_tgt, const cv::Vec2i& grid_loc_int) {
+        return new ceres::AutoDiffCostFunction<PointCorrectionLoss, 2, 3, 3, 3, 3, 2>(
+            new PointCorrectionLoss(correction_src, correction_tgt, grid_loc_int)
+        );
+    }
+
+private:
+    const cv::Vec3f correction_src_;
+    const cv::Vec3f correction_tgt_;
+    const cv::Vec2i grid_loc_int_;
+};

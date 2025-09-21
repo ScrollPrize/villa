@@ -119,9 +119,9 @@ static auto load_direction_fields(json const&params, ChunkCache *chunk_cache, st
 
 int main(int argc, char *argv[])
 {
-    std::filesystem::path vol_path, tgt_dir, params_path, resume_path;
+    std::filesystem::path vol_path, tgt_dir, params_path, resume_path, correct_path;
     cv::Vec3d origin;
-    json params;
+    json params, corrections;
 
     bool use_old_args = (argc == 4 || argc == 7) && argv[1][0] != '-' && argv[2][0] != '-' && argv[3][0] != '-';
 
@@ -141,7 +141,8 @@ int main(int argc, char *argv[])
             ("params,p", po::value<std::string>()->required(), "JSON parameters file")
             ("seed,s", po::value<std::vector<float>>()->multitoken(), "Seed coordinates (x y z)")
             ("resume", po::value<std::string>(), "Path to a tifxyz surface to resume from")
-            ("rewind-gen", po::value<int>(), "Generation to rewind to");
+            ("rewind-gen", po::value<int>(), "Generation to rewind to")
+            ("correct", po::value<std::string>(), "JSON file with point-based corrections for resume mode");
 
         po::variables_map vm;
         try {
@@ -173,6 +174,20 @@ int main(int argc, char *argv[])
         }
         if (vm.count("resume")) {
             resume_path = vm["resume"].as<std::string>();
+        }
+
+        if (vm.count("correct")) {
+            if (!vm.count("resume")) {
+                std::cerr << "ERROR: --correct can only be used with --resume" << std::endl;
+                return EXIT_FAILURE;
+            }
+            correct_path = vm["correct"].as<std::string>();
+            std::ifstream correct_f(correct_path.string());
+            if (!correct_f.is_open()) {
+                std::cerr << "ERROR: Could not open corrections file: " << correct_path << std::endl;
+                return EXIT_FAILURE;
+            }
+            corrections = json::parse(correct_f);
         }
         
         std::ifstream params_f(params_path.string());
@@ -426,7 +441,7 @@ int main(int argc, char *argv[])
         origin = {0,0,0}; // Not used in resume mode, but needs to be initialized
     }
 
-    QuadSurface *surf = space_tracing_quad_phys(ds.get(), 1.0, &chunk_cache, origin, params, cache_root, voxelsize, direction_fields, resume_surf, tgt_dir.string());
+    QuadSurface *surf = space_tracing_quad_phys(ds.get(), 1.0, &chunk_cache, origin, params, cache_root, voxelsize, direction_fields, resume_surf, tgt_dir.string(), corrections);
  
     if (resume_surf) {
         delete resume_surf;
