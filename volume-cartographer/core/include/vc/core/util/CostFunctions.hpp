@@ -1050,8 +1050,8 @@ private:
 };
 
 struct PointsCorrectionLoss {
-    PointsCorrectionLoss(const std::vector<cv::Vec3f>& tgts, const std::vector<cv::Vec2i>& grid_loc_ints)
-        : tgts_(tgts), grid_loc_ints_(grid_loc_ints) {}
+    PointsCorrectionLoss(const std::vector<cv::Vec3f>& tgts, cv::Vec2i grid_loc_int)
+        : tgts_(tgts), grid_loc_int_(grid_loc_int) {}
 
     template <typename T>
     bool operator()(T const* const* parameters, T* residuals) const {
@@ -1071,12 +1071,11 @@ struct PointsCorrectionLoss {
 private:
     template <typename T>
     T calculate_residual_for_point(int point_idx, const T* const p00, const T* const p01, const T* const p10, const T* const p11, const T* const grid_loc) const {
-        const cv::Vec2i& grid_loc_int = grid_loc_ints_[point_idx];
         const cv::Vec3f& tgt = tgts_[point_idx];
 
         // Calculate the local coordinates (u,v) within the quad by subtracting the integer grid location.
-        T u = grid_loc[0] - T(grid_loc_int[0]);
-        T v = grid_loc[1] - T(grid_loc_int[1]);
+        T u = grid_loc[0] - T(grid_loc_int_[0]);
+        T v = grid_loc[1] - T(grid_loc_int_[1]);
 
         // If the grid location is outside this specific quad (i.e., u,v not in [0,1]), this loss is zero.
         if (u < T(0.0) || u >= T(1.0) || v < T(0.0) || v >= T(1.0)) {
@@ -1093,9 +1092,15 @@ private:
         T dx_abs = p_interp[0] - T(tgt[0]);
         T dy_abs = p_interp[1] - T(tgt[1]);
         T dz_abs = p_interp[2] - T(tgt[2]);
-        return ceres::sqrt(dx_abs * dx_abs + dy_abs * dy_abs + dz_abs * dz_abs);
+        T residual = T(4)*ceres::sqrt(dx_abs * dx_abs + dy_abs * dy_abs + dz_abs * dz_abs);
+        if (dbg_) {
+            std::cout << "Point " << point_idx << " | 3D dist: " << val(residual) << " | 2D loc: " << val(grid_loc[0]) << ", " << val(grid_loc[1]) << " | int_loc: " << grid_loc_int_[0] << ", " << grid_loc_int_[1] << std::endl;
+        }
+        return residual;
     }
 
     const std::vector<cv::Vec3f>& tgts_;
-    const std::vector<cv::Vec2i>& grid_loc_ints_;
+    const cv::Vec2i grid_loc_int_;
+public:
+    bool dbg_;
 };
