@@ -1048,3 +1048,54 @@ private:
     const cv::Vec3f correction_tgt_;
     const cv::Vec2i grid_loc_int_;
 };
+
+struct PointsCorrectionLoss {
+    PointsCorrectionLoss(const std::vector<cv::Vec3f>& tgts, const std::vector<cv::Vec2i>& grid_loc_ints)
+        : tgts_(tgts), grid_loc_ints_(grid_loc_ints) {}
+
+    template <typename T>
+    bool operator()(T const* const* parameters, T* residuals) const {
+        const T* p00 = parameters[0];
+        const T* p01 = parameters[1];
+        const T* p10 = parameters[2];
+        const T* p11 = parameters[3];
+
+        residuals[0] = T(0.0);
+        for (size_t i = 0; i < tgts_.size(); ++i) {
+            const T* grid_loc = parameters[4 + i];
+            residuals[0] += calculate_residual_for_point(i, p00, p01, p10, p11, grid_loc);
+        }
+        return true;
+    }
+
+private:
+    template <typename T>
+    T calculate_residual_for_point(int point_idx, const T* const p00, const T* const p01, const T* const p10, const T* const p11, const T* const grid_loc) const {
+        const cv::Vec2i& grid_loc_int = grid_loc_ints_[point_idx];
+        const cv::Vec3f& tgt = tgts_[point_idx];
+
+        // Calculate the local coordinates (u,v) within the quad by subtracting the integer grid location.
+        T u = grid_loc[0] - T(grid_loc_int[0]);
+        T v = grid_loc[1] - T(grid_loc_int[1]);
+
+        // If the grid location is outside this specific quad (i.e., u,v not in [0,1]), this loss is zero.
+        if (u < T(0.0) || u >= T(1.0) || v < T(0.0) || v >= T(1.0)) {
+            return T(0.0);
+        }
+
+        // Bilinear interpolation to find the 3D point on the surface patch corresponding to the grid location.
+        T p_interp[3];
+        p_interp[0] = (T(1) - u) * (T(1) - v) * p00[0] + u * (T(1) - v) * p10[0] + (T(1) - u) * v * p01[0] + u * v * p11[0];
+        p_interp[1] = (T(1) - u) * (T(1) - v) * p00[1] + u * (T(1) - v) * p10[1] + (T(1) - u) * v * p01[1] + u * v * p11[1];
+        p_interp[2] = (T(1) - u) * (T(1) - v) * p00[2] + u * (T(1) - v) * p10[2] + (T(1) - u) * v * p01[2] + u * v * p11[2];
+
+        // Residual 1: 3D Euclidean distance between the interpolated point and the target correction point.
+        T dx_abs = p_interp[0] - T(tgt[0]);
+        T dy_abs = p_interp[1] - T(tgt[1]);
+        T dz_abs = p_interp[2] - T(tgt[2]);
+        return ceres::sqrt(dx_abs * dx_abs + dy_abs * dy_abs + dz_abs * dz_abs);
+    }
+
+    const std::vector<cv::Vec3f>& tgts_;
+    const std::vector<cv::Vec2i>& grid_loc_ints_;
+};

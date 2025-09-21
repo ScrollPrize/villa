@@ -30,63 +30,76 @@ public:
     PointCorrection() = default;
     PointCorrection(const VCCollection& corrections) {
         const auto& collections = corrections.getAllCollections();
+        if (collections.empty()) return;
         if (collections.size() != 1) {
-            // Allow empty collections to signal no correction
-            if (collections.empty()) return;
             throw std::runtime_error("Correction data must contain exactly one collection.");
         }
 
         const auto& collection = collections.begin()->second;
+        if (collection.points.empty()) return;
 
-        if (collection.points.size() != 2) {
-            throw std::runtime_error("Correction collection must contain exactly two points.");
+        std::vector<ColPoint> sorted_points;
+        sorted_points.reserve(collection.points.size());
+        for (const auto& pair : collection.points) {
+            sorted_points.push_back(pair.second);
         }
+        std::sort(sorted_points.begin(), sorted_points.end(), [](const auto& a, const auto& b) {
+            return a.id < b.id;
+        });
 
-        auto it = collection.points.begin();
-        const auto& p1 = it->second;
-        it++;
-        const auto& p2 = it->second;
-
-        if (p1.id < p2.id) {
-            src_ = p1.p;
-            tgt_ = p2.p;
-        } else {
-            src_ = p2.p;
-            tgt_ = p1.p;
+        tgts_.reserve(sorted_points.size());
+        for (const auto& col_point : sorted_points) {
+            tgts_.push_back(col_point.p);
         }
         
+        // tgts_.resize(1);
+
         is_valid_ = true;
     }
 
     void init(const cv::Mat_<cv::Vec3f> &points) {
-
-        QuadSurface tmp(points, {1.0f, 1.0f});
-
         if (!is_valid_ || points.empty()) {
             is_valid_ = false;
             return;
         }
 
+        QuadSurface tmp(points, {1.0f, 1.0f});
         cv::Vec3f ptr = tmp.pointer();
-        float d = tmp.pointTo(ptr, tgt_, 1.0f);
+
+        // Initialize anchor point (lowest ID)
+        float d = tmp.pointTo(ptr, tgts_[0], 1.0f);
         cv::Vec3f loc_3d = tmp.loc_raw(ptr);
+        std::cout << "base diff: " << d << loc_3d << std::endl;
         cv::Vec2f loc(loc_3d[0], loc_3d[1]);
-        grid_loc_ = {loc[0], loc[1]};
-        grid_loc_param_ = {grid_loc_[0], grid_loc_[1]};
+        grid_locs_.push_back({loc[0], loc[1]});
+        grid_loc_params_.push_back({loc[0], loc[1]});
+        grid_loc_ints_.push_back({(int)std::floor(loc[0]), (int)std::floor(loc[1])});
+
+        // Initialize other points
+        for (size_t i = 1; i < tgts_.size(); ++i) {
+            d = tmp.pointTo(ptr, tgts_[i], 100.0f, 0);
+            loc_3d = tmp.loc_raw(ptr);
+            std::cout << "point diff: " << d << loc_3d << std::endl;
+            loc = {loc_3d[0], loc_3d[1]};
+            grid_locs_.push_back({loc[0], loc[1]});
+            grid_loc_params_.push_back({loc[0], loc[1]});
+            grid_loc_ints_.push_back({(int)std::floor(loc[0]), (int)std::floor(loc[1])});
+        }
     }
 
     bool isValid() const { return is_valid_; }
-    const cv::Vec3f& src() const { return src_; }
-    const cv::Vec3f& tgt() const { return tgt_; }
-    const cv::Vec2f& grid_loc() const { return grid_loc_; }
-    const cv::Vec2d& grid_loc_param() const { return grid_loc_param_; }
+    const std::vector<cv::Vec3f>& tgts() const { return tgts_; }
+    const std::vector<cv::Vec2f>& grid_locs() const { return grid_locs_; }
+    const std::vector<cv::Vec2d>& grid_loc_params() const { return grid_loc_params_; }
+    const std::vector<cv::Vec2i>& grid_loc_ints() const { return grid_loc_ints_; }
+
 
 private:
     bool is_valid_ = false;
-    cv::Vec3f src_;
-    cv::Vec3f tgt_;
-    cv::Vec2f grid_loc_;
-    cv::Vec2d grid_loc_param_;
+    std::vector<cv::Vec3f> tgts_;
+    std::vector<cv::Vec2f> grid_locs_;
+    std::vector<cv::Vec2d> grid_loc_params_;
+    std::vector<cv::Vec2i> grid_loc_ints_;
 };
 
 struct TraceParameters {
@@ -520,7 +533,7 @@ static int conditional_direction_loss(int bit, const cv::Vec2i &p, const int u_o
 };
 
 //create only missing losses so we can optimize the whole problem
-static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &dpoints, const TraceParameters& trace_params)
+static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &dpoints, TraceParameters& trace_params)
 {
     if (!trace_params.point_correction.isValid()) {
         return 0;
@@ -528,15 +541,53 @@ static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<u
 
     const auto& pc = trace_params.point_correction;
 
-    //FIXME NEED TO CHECK CORNERS!
-    problem.AddResidualBlock(PointCorrectionLoss::Create(pc.src(), pc.tgt(), {p[1],p[0]}), nullptr, &dpoints(p)[0], &dpoints(p + cv::Vec2i(0, 1))[0], &dpoints(p + cv::Vec2i(1, 0))[0], &dpoints(p + cv::Vec2i(1, 1))[0], const_cast<double*>(&pc.grid_loc_param()[0]));
-    problem.SetParameterBlockConstant(&pc.grid_loc_param()[0]);
+    if (pc.grid_loc_params().empty()) {
+        return 0;
+    }
+
+    cv::Vec2i p_br = p + cv::Vec2i(1,1);
+    if (!coord_valid(state(p)) || !coord_valid(state(p[0], p_br[1])) || !coord_valid(state(p_br[0], p[1])) || !coord_valid(state(p_br))) {
+        return 0;
+    }
+
+    //TODO NEED TO CHECK CORNERS!
+    auto cost_function = new ceres::DynamicAutoDiffCostFunction<PointsCorrectionLoss>(
+        new PointsCorrectionLoss(pc.tgts(), pc.grid_loc_ints())
+    );
+
+    std::vector<double*> parameter_blocks;
+    cost_function->AddParameterBlock(3);
+    parameter_blocks.push_back(&dpoints(p)[0]);
+    cost_function->AddParameterBlock(3);
+    parameter_blocks.push_back(&dpoints(p + cv::Vec2i(0, 1))[0]);
+    cost_function->AddParameterBlock(3);
+    parameter_blocks.push_back(&dpoints(p + cv::Vec2i(1, 0))[0]);
+    cost_function->AddParameterBlock(3);
+    parameter_blocks.push_back(&dpoints(p + cv::Vec2i(1, 1))[0]);
+
+    for (const auto& param : pc.grid_loc_params()) {
+        cost_function->AddParameterBlock(2);
+        parameter_blocks.push_back(const_cast<double*>(&param[0]));
+    }
+    cost_function->SetNumResiduals(1);
+
+    // std::cout <<  std::endl;
+    // std::cout << parameter_blocks.size() << " " << pc.grid_loc_params().size() << " " << pc.tgts().size() <<  std::endl;
+    // for(auto &p : parameter_blocks)
+        // std::cout << "pblock " << p << std::endl;
+    // std::cout <<  std::endl;
+
+    problem.AddResidualBlock(cost_function, nullptr, parameter_blocks);
+
+    // for (size_t i = 0; i < pc.grid_loc_params().size(); ++i) {
+    //     problem.SetParameterBlockConstant(parameter_blocks[4 + i]);
+    // }
 
     return 1;
 }
 
 static int conditional_corr_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
-    ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &out, const TraceParameters& trace_params)
+    ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &out, TraceParameters& trace_params)
 {
     if (!trace_params.point_correction.isValid()) return 0;
     int set = 0;
@@ -548,7 +599,7 @@ static int conditional_corr_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t>
 template <typename I, typename T, typename C>
 static int emptytrace_create_missing_centered_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_status, const cv::Vec2i &p,
     cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, const I &interp, Chunked3d<T,C> &t, std::vector<DirectionField> const &direction_fields,
-    const vc::core::util::NormalGridVolume *ngv, int z_min, int z_max, float unit, const TraceParameters& trace_params, int flags = SPACE_LOSS | OPTIMIZE_ALL)
+    const vc::core::util::NormalGridVolume *ngv, int z_min, int z_max, float unit, TraceParameters& trace_params, int flags = SPACE_LOSS | OPTIMIZE_ALL)
 {
     //generate losses for point p
     int count = 0;
@@ -620,7 +671,7 @@ static int emptytrace_create_missing_centered_losses(ceres::Problem &problem, cv
 template <typename I, typename T, typename C>
 static float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &locs,
     const I &interp, Chunked3d<T,C> &t, std::vector<DirectionField> const &direction_fields,
-    const vc::core::util::NormalGridVolume *ngv, int z_min, int z_max, float unit, const TraceParameters& trace_params, bool quiet = false, bool parallel = false)
+    const vc::core::util::NormalGridVolume *ngv, int z_min, int z_max, float unit, TraceParameters& trace_params, bool quiet = false, bool parallel = false)
 {
     ceres::Problem problem;
     cv::Mat_<uint16_t> loss_status(state.size());
@@ -938,13 +989,15 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             trace_params.point_correction.init(locs);
         }
 
-        std::cout << "Resuming opt for " << trace_params.point_correction.grid_loc() << std::endl;
+        if (trace_params.point_correction.isValid()) {
+            std::cout << "Resuming opt for " << trace_params.point_correction.grid_locs()[0] << std::endl;
+        }
 
         if (trace_params.point_correction.isValid()) {
-            cv::Vec2i corr_center_i = { (int)std::round(trace_params.point_correction.grid_loc()[1]), (int)std::round(trace_params.point_correction.grid_loc()[0]) };
+            cv::Vec2i corr_center_i = { (int)std::round(trace_params.point_correction.grid_locs()[0][1]), (int)std::round(trace_params.point_correction.grid_locs()[0][0]) };
             local_optimization(32, corr_center_i, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
 
-            reset_downstream_points(trace_params.point_correction.grid_loc(), state, locs, generations, bounds);
+            // reset_downstream_points(trace_params.point_correction.grid_locs()[0], state, locs, generations, bounds);
 
             if (!intermediate_path_dir.empty()) {
                 cv::Rect used_area_safe = used_area;
