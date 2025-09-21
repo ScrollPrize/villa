@@ -969,7 +969,7 @@ struct PointCorrectionLoss {
         T dx_abs = p_interp[0] - T(correction_tgt_[0]);
         T dy_abs = p_interp[1] - T(correction_tgt_[1]);
         T dz_abs = p_interp[2] - T(correction_tgt_[2]);
-        residual[0] = ceres::sqrt(dx_abs * dx_abs + dy_abs * dy_abs + dz_abs * dz_abs);
+        residual[0] = T(100)*ceres::sqrt(dx_abs * dx_abs + dy_abs * dy_abs + dz_abs * dz_abs);
 
         // Residual 2: 3D point-to-line distance from the interpolated point to the line defined by src -> tgt.
         T p1[3] = {T(correction_src_[0]), T(correction_src_[1]), T(correction_src_[2])};
@@ -988,7 +988,7 @@ struct PointCorrectionLoss {
         T dy_line = p_interp[1] - pb[1];
         T dz_line = p_interp[2] - pb[2];
 
-        residual[1] = ceres::sqrt(dx_line * dx_line + dy_line * dy_line + dz_line * dz_line);
+        residual[1] = T(100)*ceres::sqrt(dx_line * dx_line + dy_line * dy_line + dz_line * dz_line);
 
         return true;
     }

@@ -28,18 +28,15 @@ namespace { // Anonymous namespace for local helpers
 class PointCorrection {
 public:
     PointCorrection() = default;
-    PointCorrection(const nlohmann::json& corrections_json) {
-        if (corrections_json.is_null() || !corrections_json.contains("collections")) {
-            return;
+    PointCorrection(const VCCollection& corrections) {
+        const auto& collections = corrections.getAllCollections();
+        if (collections.size() != 1) {
+            // Allow empty collections to signal no correction
+            if (collections.empty()) return;
+            throw std::runtime_error("Correction data must contain exactly one collection.");
         }
 
-        auto collections_json = corrections_json["collections"];
-        if (!collections_json.is_array() || collections_json.size() != 1) {
-            throw std::runtime_error("Correction JSON must contain exactly one collection.");
-        }
-
-        VCCollection::Collection collection;
-        from_json(collections_json[0], collection);
+        const auto& collection = collections.begin()->second;
 
         if (collection.points.size() != 2) {
             throw std::runtime_error("Correction collection must contain exactly two points.");
@@ -61,15 +58,19 @@ public:
         is_valid_ = true;
     }
 
-    void init(QuadSurface* resume_surf) {
-        if (!is_valid_ || !resume_surf) {
+    void init(const cv::Mat_<cv::Vec3f> &points) {
+
+        QuadSurface tmp(points, {1.0f, 1.0f});
+
+        if (!is_valid_ || points.empty()) {
             is_valid_ = false;
             return;
         }
 
-        cv::Vec3f ptr = resume_surf->pointer();
-        resume_surf->pointTo(ptr, src_, 100.0f, 1000);
-        cv::Vec3f loc = resume_surf->loc(ptr);
+        cv::Vec3f ptr = tmp.pointer();
+        float d = tmp.pointTo(ptr, src_, 1.0f);
+        cv::Vec3f loc_3d = tmp.loc_raw(ptr);
+        cv::Vec2f loc(loc_3d[0], loc_3d[1]);
         grid_loc_ = {loc[0], loc[1]};
         grid_loc_param_ = {grid_loc_[0], grid_loc_[1]};
     }
@@ -468,7 +469,7 @@ static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<u
 
     const auto& pc = trace_params.point_correction;
 
-    problem.AddResidualBlock(PointCorrectionLoss::Create(pc.src(), pc.tgt(), p), nullptr, &dpoints(p)[0], &dpoints(p + cv::Vec2i(0, 1))[0], &dpoints(p + cv::Vec2i(1, 0))[0], &dpoints(p + cv::Vec2i(1, 1))[0], const_cast<double*>(&pc.grid_loc_param()[0]));
+    problem.AddResidualBlock(PointCorrectionLoss::Create(pc.src(), pc.tgt(), {p[1],p[0]}), nullptr, &dpoints(p)[0], &dpoints(p + cv::Vec2i(0, 1))[0], &dpoints(p + cv::Vec2i(1, 0))[0], &dpoints(p + cv::Vec2i(1, 1))[0], const_cast<double*>(&pc.grid_loc_param()[0]));
     problem.SetParameterBlockConstant(&pc.grid_loc_param()[0]);
 
     return 1;
@@ -563,19 +564,6 @@ static float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t
 {
     ceres::Problem problem;
     cv::Mat_<uint16_t> loss_status(state.size());
-    TraceParameters local_trace_params = trace_params;
-
-    if (local_trace_params.point_correction.isValid()) {
-        cv::Rect roi(p[1] - radius, p[0] - radius, 2 * radius + 1, 2 * radius + 1);
-        roi &= cv::Rect(0, 0, locs.cols, locs.rows);
-        cv::Mat_<cv::Vec3d> locs_crop = locs(roi);
-        
-        cv::Mat_<cv::Vec3f> locs_crop_f;
-        locs_crop.convertTo(locs_crop_f, CV_32F);
-
-        QuadSurface temp_surf(locs_crop_f, {1.0f, 1.0f});
-        local_trace_params.point_correction.init(&temp_surf);
-    }
 
     int r_outer = radius+3;
 
@@ -586,8 +574,10 @@ static float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t
     for(int oy=std::max(p[0]-radius,0);oy<=std::min(p[0]+radius,locs.rows-1);oy++)
         for(int ox=std::max(p[1]-radius,0);ox<=std::min(p[1]+radius,locs.cols-1);ox++) {
             cv::Vec2i op = {oy, ox};
-            if (cv::norm(p-op) <= radius)
-                emptytrace_create_missing_centered_losses(problem, loss_status, op, state, locs, interp, t, direction_fields, ngv, z_min, z_max, unit, local_trace_params);
+            if (cv::norm(p-op) <= radius) {
+                std::cout << "xy " << op << p << trace_params.point_correction.grid_loc_param() << std::endl;
+                emptytrace_create_missing_centered_losses(problem, loss_status, op, state, locs, interp, t, direction_fields, ngv, z_min, z_max, unit, trace_params);
+            }
         }
     for(int oy=std::max(p[0]-r_outer,0);oy<=std::min(p[0]+r_outer,locs.rows-1);oy++)
         for(int ox=std::max(p[1]-r_outer,0);ox<=std::min(p[1]+r_outer,locs.cols-1);ox++) {
@@ -596,11 +586,10 @@ static float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t
                 problem.SetParameterBlockConstant(&locs(op)[0]);
         }
 
-
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
     options.minimizer_progress_to_stdout = false;
-    options.max_num_iterations = 100;
+    options.max_num_iterations = 1000;
     options.function_tolerance = 1e-4;
     options.use_nonmonotonic_steps = true;
 
@@ -740,7 +729,7 @@ struct thresholdedDistance
 };
 
 
-QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::string& intermediate_path_dir, const nlohmann::json &corrections)
+QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::string& intermediate_path_dir, const VCCollection &corrections)
 {
     TraceParameters trace_params;
 
@@ -825,11 +814,6 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     int last_succ = 0;
 
     if (resume_surf) {
-        if (!corrections.is_null()) {
-            trace_params.point_correction = PointCorrection(corrections);
-            trace_params.point_correction.init(resume_surf);
-        }
-
         float resume_step = 1.0 / resume_surf->scale()[0];
         if (std::abs(resume_step - step) > 1e-6) {
             throw std::runtime_error("Step size parameter mismatch between new trace and resume surface.");
@@ -889,7 +873,21 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         big_problem.SetParameterBlockConstant(&locs(y0+1,x0)[0]);
         big_problem.SetParameterBlockConstant(&locs(y0+1,x0+1)[0]);
 
-        local_optimization(stop_gen+10, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
+
+        trace_params.point_correction = PointCorrection(corrections);
+        if (trace_params.point_correction.isValid()) {
+            trace_params.point_correction.init(locs);
+        }
+
+        std::cout << "Resuming opt for " << trace_params.point_correction.grid_loc() << std::endl;
+
+        if (trace_params.point_correction.isValid()) {
+            cv::Vec2i corr_center = { (int)std::round(trace_params.point_correction.grid_loc()[1]), (int)std::round(trace_params.point_correction.grid_loc()[0]) };
+            std::cout << "corr_center :" << corr_center << std::endl;
+            local_optimization(15, corr_center, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
+        } else {
+            local_optimization(stop_gen+10, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
+        }
 
         last_succ = succ;
         last_elapsed_seconds = f_timer.seconds();

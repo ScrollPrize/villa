@@ -121,7 +121,8 @@ int main(int argc, char *argv[])
 {
     std::filesystem::path vol_path, tgt_dir, params_path, resume_path, correct_path;
     cv::Vec3d origin;
-    json params, corrections;
+    json params;
+    VCCollection corrections;
 
     bool use_old_args = (argc == 4 || argc == 7) && argv[1][0] != '-' && argv[2][0] != '-' && argv[3][0] != '-';
 
@@ -183,11 +184,10 @@ int main(int argc, char *argv[])
             }
             correct_path = vm["correct"].as<std::string>();
             std::ifstream correct_f(correct_path.string());
-            if (!correct_f.is_open()) {
-                std::cerr << "ERROR: Could not open corrections file: " << correct_path << std::endl;
+            if (!corrections.loadFromJSON(correct_path.string())) {
+                std::cerr << "ERROR: Could not load or parse corrections file: " << correct_path << std::endl;
                 return EXIT_FAILURE;
             }
-            corrections = json::parse(correct_f);
         }
         
         std::ifstream params_f(params_path.string());
