@@ -68,7 +68,7 @@ public:
         }
 
         cv::Vec3f ptr = tmp.pointer();
-        float d = tmp.pointTo(ptr, src_, 1.0f);
+        float d = tmp.pointTo(ptr, tgt_, 1.0f);
         cv::Vec3f loc_3d = tmp.loc_raw(ptr);
         cv::Vec2f loc(loc_3d[0], loc_3d[1]);
         grid_loc_ = {loc[0], loc[1]};
@@ -528,6 +528,7 @@ static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<u
 
     const auto& pc = trace_params.point_correction;
 
+    //FIXME NEED TO CHECK CORNERS!
     problem.AddResidualBlock(PointCorrectionLoss::Create(pc.src(), pc.tgt(), {p[1],p[0]}), nullptr, &dpoints(p)[0], &dpoints(p + cv::Vec2i(0, 1))[0], &dpoints(p + cv::Vec2i(1, 0))[0], &dpoints(p + cv::Vec2i(1, 1))[0], const_cast<double*>(&pc.grid_loc_param()[0]));
     problem.SetParameterBlockConstant(&pc.grid_loc_param()[0]);
 
@@ -944,6 +945,26 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             local_optimization(32, corr_center_i, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
 
             reset_downstream_points(trace_params.point_correction.grid_loc(), state, locs, generations, bounds);
+
+            if (!intermediate_path_dir.empty()) {
+                cv::Rect used_area_safe = used_area;
+                used_area_safe.x -= 2;
+                used_area_safe.y -= 2;
+                used_area_safe.width += 4;
+                used_area_safe.height += 4;
+                cv::Mat_<cv::Vec3d> locs_crop = locs(used_area_safe);
+                cv::Mat_<uint16_t> generations_crop = generations(used_area_safe);
+
+                auto surf = new QuadSurface(locs_crop, {1/T, 1/T});
+                surf->setChannel("generations", generations_crop);
+
+                char filename[256];
+                snprintf(filename, sizeof(filename), "snapshot_gen_%04d_corrected", generation);
+                std::filesystem::path out_path = std::filesystem::path(intermediate_path_dir) / filename;
+                surf->save(out_path);
+                delete surf;
+                std::cout << "saved corrected snapshot in " << out_path << std::endl;
+            }
 
             // Rebuild fringe from valid points
             fringe.clear();
