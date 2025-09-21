@@ -93,6 +93,65 @@ struct TraceParameters {
     PointCorrection point_correction;
 };
 
+static void reset_downstream_points(const cv::Vec2f& corr_loc,
+                                  cv::Mat_<uint8_t>& state,
+                                  cv::Mat_<cv::Vec3d>& locs,
+                                  cv::Mat_<uint16_t>& generations,
+                                  const cv::Rect& bounds)
+{
+    std::queue<cv::Vec2i> q;
+    cv::Mat_<bool> visited(state.size(), false);
+    std::vector<cv::Vec2i> neighs = {{1,0},{0,1},{-1,0},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};
+
+    // Find max generation from the four corners around the float correction point
+    uint16_t max_gen = 0;
+    cv::Vec2i top_left(std::floor(corr_loc[1]), std::floor(corr_loc[0]));
+
+    for (int dy = 0; dy <= 1; ++dy) {
+        for (int dx = 0; dx <= 1; ++dx) {
+            cv::Vec2i p = top_left + cv::Vec2i(dy, dx);
+            if (bounds.contains(cv::Point(p[1], p[0]))) {
+                max_gen = std::max(max_gen, generations(p));
+                q.push(p);
+                visited(p) = true;
+            }
+        }
+    }
+
+    for (int dy = -1; dy <= 2; ++dy) {
+        for (int dx = -1; dx <= 2; ++dx) {
+            cv::Vec2i p = top_left + cv::Vec2i(dy, dx);
+            if (bounds.contains(cv::Point(p[1], p[0])))
+                q.push(p);
+        }
+    }
+
+    std::vector<cv::Vec2i> points_to_reset;
+
+    while (!q.empty()) {
+        cv::Vec2i p = q.front();
+        q.pop();
+        uint16_t current_gen = std::max(generations(p), max_gen);
+
+        for (const auto& n : neighs) {
+            cv::Vec2i next_p = p + n;
+            if (bounds.contains(cv::Point(next_p[1], next_p[0])) && !visited(next_p) && (state(next_p) & STATE_LOC_VALID)) {
+                visited(next_p) = true;
+                if (generations(next_p) > current_gen) {
+                    points_to_reset.push_back(next_p);
+                    q.push(next_p);
+                }
+            }
+        }
+    }
+
+    for (const auto& p : points_to_reset) {
+        state(p) = 0;
+        locs(p) = cv::Vec3d(-1,-1,-1);
+        generations(p) = 0;
+    }
+}
+
 } // namespace
 
 static float space_trace_dist_w = 1.0;
@@ -575,7 +634,6 @@ static float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t
         for(int ox=std::max(p[1]-radius,0);ox<=std::min(p[1]+radius,locs.cols-1);ox++) {
             cv::Vec2i op = {oy, ox};
             if (cv::norm(p-op) <= radius) {
-                std::cout << "xy " << op << p << trace_params.point_correction.grid_loc_param() << std::endl;
                 emptytrace_create_missing_centered_losses(problem, loss_status, op, state, locs, interp, t, direction_fields, ngv, z_min, z_max, unit, trace_params);
             }
         }
@@ -882,9 +940,21 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         std::cout << "Resuming opt for " << trace_params.point_correction.grid_loc() << std::endl;
 
         if (trace_params.point_correction.isValid()) {
-            cv::Vec2i corr_center = { (int)std::round(trace_params.point_correction.grid_loc()[1]), (int)std::round(trace_params.point_correction.grid_loc()[0]) };
-            std::cout << "corr_center :" << corr_center << std::endl;
-            local_optimization(15, corr_center, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
+            cv::Vec2i corr_center_i = { (int)std::round(trace_params.point_correction.grid_loc()[1]), (int)std::round(trace_params.point_correction.grid_loc()[0]) };
+            local_optimization(32, corr_center_i, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
+
+            reset_downstream_points(trace_params.point_correction.grid_loc(), state, locs, generations, bounds);
+
+            // Rebuild fringe from valid points
+            fringe.clear();
+            for (int j = used_area.y; j < used_area.br().y; ++j) {
+                for (int i = used_area.x; i < used_area.br().x; ++i) {
+                    if (state(j, i) & STATE_LOC_VALID) {
+                        fringe.push_back({j, i});
+                    }
+                }
+            }
+
         } else {
             local_optimization(stop_gen+10, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
         }
