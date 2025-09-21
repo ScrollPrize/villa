@@ -705,11 +705,6 @@ const team = {
       href: "https://darthkendraresearch.wordpress.com/",
     },
     {
-      name: "Konrad Rosenberg",
-      title: "Annotation Specialist",
-      href: "https://twitter.com/germanicgems",
-    },
-    {
       name: "Sarah Morejohn",
       title: "Annotation Specialist",
       href: "https://www.linkedin.com/in/sarah-morejohn-1140b049/",
@@ -777,6 +772,11 @@ const team = {
       name: "Adrionna Fey",
       title: "Annotation Specialist",
       href: "https://twitter.com/Meadowsnax1",
+    },
+    {
+      name: "Konrad Rosenberg",
+      title: "Annotation Specialist",
+      href: "https://twitter.com/germanicgems",
     },
     {
       name: "Cooper Miller",
