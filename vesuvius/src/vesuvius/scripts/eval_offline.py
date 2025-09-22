@@ -274,8 +274,6 @@ def evaluate_dataset(
 
     per_image_stats: List[Dict[str, float]] = []
     per_image_rows: List[Tuple[str, Dict[str, float]]] = []
-    per_image_rows: List[Tuple[str, Dict[str, float]]] = []
-    per_image_rows: List[Tuple[str, Dict[str, float]]] = []
 
     for img_path in tqdm(image_list, desc="Processing images", unit="img"):
         base_name = img_path.stem
