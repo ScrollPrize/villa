@@ -1,300 +1,167 @@
-# Overview of the Inference Pipeline
+# Inference Pipeline Overview
 
-**Running on a single machine**
-If you want to run the entire pipeline in one go on a single machine (even with multiple gpus), you can use `vesuvius.inference_pipeline`. This handles all three stages (prediction, blending, and finalization) in a single command without having to run each step separately.
+The Vesuvius tooling exposes three command-line stages plus a convenience orchestrator:
 
+1. `vesuvius.predict` — run a trained model and write patch logits.
+2. `vesuvius.blend_logits` — merge overlapping patches with Gaussian weighting.
+3. `vesuvius.finalize_outputs` — convert logits into probabilities or masks and build a multiscale Zarr.
+4. `vesuvius.inference_pipeline` — execute all steps sequentially on a single machine (optionally using multiple GPUs).
 
-The inference pipeline consists of three main stages:
+All commands honour local paths and remote storage backed by `fsspec` (for example S3). Run `vesuvius.accept_terms --yes` before accessing remote scroll volumes.
 
-1. __Prediction (`vesuvius.predict`)__: Runs model inference on input data, creating logits (model outputs before softmax/argmax). Supports Zarr/Volume sources and 2D/3D TIFF inputs.
-2. __Blending (`vesuvius.blend_logits`)__: Combines overlapping predictions using Gaussian weighting.
-3. __Finalization (`vesuvius.finalize_outputs`)__: Processes logits into final segmentation outputs (probabilities or class predictions).
+## Stage 1 — `vesuvius.predict`
 
-*Note:*
-While the patch size of the model is potentially not the best chunk size for _viewing_ a zarr , we use it throughout this pipeline for reading/writing them. This is due to the performance penalty that you pay when writing partial chunks. 
-
-Because inference outputs are saved as exactly patch size to speed up writing, we keep this same chunk size throughout. It is a good idea to rechunk the final output before using it for downstream tasks.
-
-
-## 1. `vesuvius.predict` - Model Inference
-
-This component runs the model on input data, creating raw logits.
-
-### Purpose
-
-- Takes input volumetric data and applies a trained nnUNetv2 model to produce prediction logits
-- Supports data partitioning for distributed processing
-- Handles Test-Time Augmentation (TTA)
-
-### Distributed Capability: ✅ Fully Distributed
-
-`vesuvius.predict` is designed to run in a distributed manner by dividing the input volume into parts that can be processed independently. Each part can run on a separate machine with no coordination required between parts during inference.
-
-### Key Parameters
-
-| Parameter | Type | Description | Default | Recommendation |
-|-----------|------|-------------|---------|---------------|
-| `--model_path` | str | Path to the trained nnUNet model folder or HF model (can start with "hf://") | Required | |
-| `--input_dir` | str | Path to input data: Zarr store, volume selector, single `.tif/.tiff` file, or directory of TIFFs | Required | |
-| `--output_dir` | str | Directory to store output predictions | Required | |
-| `--input_format` | str | Format hint (`zarr`, `volume`, `tiff`). Detection is automatic for `.tif/.tiff`. | `zarr` | Empty, Defaults |
-| `--tta_type` | str | Test-time augmentation type (`mirroring`, `rotation`) | `rotation` | Empty, Defaults |
-| `--disable_tta` | flag | Disable test-time augmentation | `False` | Empty, Defaults |
-| `--num_parts` | int | Number of parts to split processing into | `1` | |
-| `--part_id` | int | Part ID to process (0-indexed) | `0` | |
-| `--overlap` | float | Overlap between patches (0-1) | `0.5` | Empty, Defaults |
-| `--batch_size` | int | Batch size for inference | `1` | |
-| `--patch_size` | str | Override patch size (comma-separated, e.g. "192,192,192") | Model default | Empty, Defaults |
-| `--save_softmax` | flag | Save softmax outputs | `False` | Empty, Defaults |
-| `--normalization` | str | Normalization scheme (`instance_zscore`, `global_zscore`, `instance_minmax`, `none`) | `instance_zscore` | Same as trained model |
-| `--device` | str | Device to use (`cuda`, `cpu`) | `cuda` | Empty, Defaults |
-| `--verbose` | flag | Enable verbose output | `False` | Empty, Defaults |
-| `--skip-empty-patches` | flag | Skip patches that are empty (all values the same) | `True` | Empty, Defaults |
-| `--zarr-compressor` | str | Zarr compression algorithm (`zstd`, `lz4`, `zlib`, `none`) | `zstd` | Empty, Defaults |
-| `--zarr-compression-level` | int | Compression level (1-9) | `3` | Empty, Defaults |
-| `--scroll_id` | str | Scroll ID to use (if input_format is volume) | `None` | |
-| `--segment_id` | str | Segment ID to use (if input_format is volume) | `None` | |
-| `--energy` | int | Energy level to use (if input_format is volume) | `None` | |
-| `--resolution` | float | Resolution to use (if input_format is volume) | `None` | |
-| `--hf_token` | str | Hugging Face token for accessing private repositories | `None` | |
-
-
-### How to Run Distributed
-
-To run distributed inference across multiple machines:
-
-1. __Split processing into parts__:
-
-   ```bash
-   # Machine 1: Process part 0
-   vesuvius.predict --model_path /path/to/model --input_dir /path/to/input \
-     --output_dir /path/to/output --num_parts 4 --part_id 0
-
-   # Machine 2: Process part 1
-   vesuvius.predict --model_path /path/to/model --input_dir /path/to/input \
-     --output_dir /path/to/output --num_parts 4 --part_id 1
-
-   # Machine 3: Process part 2
-   vesuvius.predict --model_path /path/to/model --input_dir /path/to/input \
-     --output_dir /path/to/output --num_parts 4 --part_id 2
-
-   # Machine 4: Process part 3
-   vesuvius.predict --model_path /path/to/model --input_dir /path/to/input \
-     --output_dir /path/to/output --num_parts 4 --part_id 3
-   ```
-
-2. __Output for each part__:
-
-   - Each machine produces two files:
-
-     - `logits_part_X.zarr`: Contains prediction logits
-     - `coordinates_part_X.zarr`: Contains coordinates of each patch
-
-### Performance Tips
-
-- Use `--skip-empty-patches` to accelerate processing by skipping empty (completely homogonous) patches. note that these are still fed to inference.py from vc_dataset.py
-    but are only "written" in the sense that the index : location mapping is preserved in the coordinate array. we default to using `write_empty_chunks=False` , which 
-    will prevent this from truly being written in the zarr. 
-- Adjust `--batch_size` based on available GPU memory
-- Use `--compression-level` to balance storage space and processing speed
-    - compression is only used due to the giant size of the intermediate arrays. if you have enough tmp storage, feel free to omit for tmp arrays. 
-    compression of the final array is still a good idea, as its mostly blank. 
-- Set an appropriate `--overlap` value (0.5 is a good default)
-
-### TIFF Inputs (2D/3D)
-
-`vesuvius.predict` now supports `.tif/.tiff` inputs. You can pass either a single file or a folder of TIFFs in `--input_dir`. The format is auto-detected; optionally set `--input_format tiff`.
-
-- Detection: If `input_dir` is a `.tif/.tiff` file or a directory containing TIFFs, TIFF mode is used automatically.
-- Normalization: The same normalization as stored in the model checkpoint is applied (maps legacy `zscore` to global or instance z-score depending on availability of global stats).
-- TTA: Works the same as with Zarr inputs.
-
-Two execution paths are used depending on image size:
-
-- In-memory blending (no temporary zarr):
-  - 3D TIFFs up to `1024 x 1024 x 1024`
-  - 2D TIFFs up to `10000 x 10000`
-  - Produces per-image logits directly as TIFF: `<stem>_logits.tif` saved in `output_dir`.
-  - Output shape is channels-first (C,Z,Y,X) for 3D, or (C,Y,X) for 2D.
-  - Blending and finalization stages are not required for these outputs unless you want different post-processing.
-
-- Large TIFFs (fallback to tiled path):
-  - For larger images, the predictor writes per-patch logits and coordinates to zarr in `output_dir` (same as the Zarr pipeline).
-  - Run `vesuvius.blend_logits` and then `vesuvius.finalize_outputs` as usual.
-
-Examples:
+`vesuvius.predict` loads a checkpoint (nnU-Net v2 compatible or a `vesuvius.train` checkpoint) and produces tiled logits. It supports distributed execution by splitting the volume into `num_parts` and assigning each process a unique `part_id`.
 
 ```bash
-# Single 2D or 3D TIFF (auto-detect)
-vesuvius.predict --model_path /path/to/model \
-  --input_dir /path/to/image.tif \
-  --output_dir /path/to/out
-
-# Directory of TIFFs
-vesuvius.predict --model_path /path/to/model \
-  --input_dir /path/to/tif_folder \
-  --output_dir /path/to/out
+vesuvius.predict \
+  --model_path /path/to/model \
+  --input_dir /path/to/input.zarr \
+  --output_dir /tmp/logits \
+  --num_parts 4 \
+  --part_id 0 \
+  --device cuda:0
 ```
 
-## 2. `vesuvius.blend_logits` - Merging Predictions
+### Key Arguments
 
-This component combines prediction outputs from multiple parts into a single coherent volume.
+| Argument | Description |
+|----------|-------------|
+| `--model_path` (required) | Path to a model directory, a `.pth` checkpoint, or `hf://` repository.
+| `--input_dir` (required) | Volume input: Zarr root, TIFF stack, or a directory understood by the `Volume` helper.
+| `--output_dir` (required) | Destination folder for logits (`logits_part_{id}.zarr`) and coordinates.
+| `--input_format` | Force `zarr`, `tiff`, or `volume` detection. Usually optional.
+| `--tta_type` / `--disable_tta` | Choose `rotation` (default) or `mirroring`, or disable test-time augmentation.
+| `--num_parts` / `--part_id` | Partition inference so multiple machines can process different chunks.
+| `--overlap` | Fractional patch overlap (0–1, default `0.5`).
+| `--batch_size` | Inference batch size (default `1`).
+| `--patch_size` | Override the model patch size using a comma-separated list (e.g. `192,192,192`).
+| `--tif-activation` | When writing TIFF outputs, pick `softmax`, `argmax`, or `none`.
+| `--save_softmax` | Legacy flag for saving softmax logits (consider `--tif-activation`).
+| `--normalization` | Runtime normalization (`instance_zscore`, `global_zscore`, `instance_minmax`, `ct`, `none`).
+| `--intensity-properties-json` | nnU-Net style JSON with intensity stats for CT normalization.
+| `--device` | Device string such as `cuda`, `cuda:1`, or `cpu`.
+| `--skip-empty-patches` / `--no-skip-empty-patches` | Toggle automatic removal of homogeneous patches.
+| `--zarr-compressor` / `--zarr-compression-level` | Configure output compression (`zstd` with level `3` by default).
+| `--scroll_id`, `--segment_id`, `--energy`, `--resolution` | Metadata when reading remote scrolls via the `Volume` helper.
+| `--hf_token` | Hugging Face token for private repositories.
+| `--config-yaml` | Training YAML to resolve model architecture when the checkpoint lacks embedded metadata.
+| `--verbose` | Print detailed progress information.
 
-### Purpose
-
-- Merges partial inference results from different parts
-- Applies Gaussian weighting to handle overlapping regions
-- Creates a single, unified prediction volume
-
-### Distributed Capability: ❌ Single Machine
-
-`vesuvius.blend_logits` must run on a single machine as it needs to coordinate the merging of all part files. It processes the data in chunks to manage memory usage.
-
-By default use the chunk size of the input volume (from logits) which is the patch size of the model. 
-
-### Key Parameters
-
-| Parameter | Type | Description | Default | Recommendation |
-|-----------|------|-------------|---------|---------------|
-| `parent_dir` | str | Directory containing the partial inference results (logits_part_X.zarr, coordinates_part_X.zarr) | Required | |
-| `output_path` | str | Path for the final merged Zarr output file | Required | |
-| `--weights_path` | str | Path for the temporary weight accumulator Zarr | `<output_path>_weights.zarr` | Empty, Defaults |
-| `--sigma_scale` | float | Sigma scale for Gaussian blending (patch_size / sigma_scale) | `8.0` | Empty, Defaults |
-| `--chunk_size` | str | Spatial chunk size (Z,Y,X) for output Zarr | Based on patch size | Empty, Defaults |
-| `--num_workers` | int | Number of worker processes | CPU_COUNT / 2 | Empty, Defaults |
-| `--compression_level` | int | Compression level (0-9, 0=none) | `1` | Empty, Defaults |
-| `--keep_weights` | flag | Do not delete the weight accumulator Zarr after merging | `False` | Empty, Defaults |
-| `--quiet` | flag | Disable verbose progress messages | `False` | Empty, Defaults |
-
-
-### How to Run
-
-After all predict jobs have completed:
+Distributed execution simply repeats the command with different `part_id` values. All workers must share the same `output_dir`:
 
 ```bash
-vesuvius.blend_logits /path/to/prediction_parts /path/to/output/merged_logits.zarr \
-  --num_workers 16
+# machine 1
+vesuvius.predict --model_path ... --num_parts 4 --part_id 0 --device cuda:0
+# machine 2
+vesuvius.predict --model_path ... --num_parts 4 --part_id 1 --device cuda:0
 ```
 
-### Memory Considerations
+Each worker writes `logits_part_<id>.zarr` and `coordinates_part_<id>.zarr` into the output directory.
 
-- The blending process is memory-intensive but handles large volumes by:
+## Stage 2 — `vesuvius.blend_logits`
 
-  - Processing in chunkwise to limit memory usage
-  - Using a shared weight accumulator for normalization
-
-## 3. `vesuvius.finalize_outputs` - Post-processing Outputs
-
-This component processes merged logits into final segmentation outputs (probabilities or class predictions).
-
-### Purpose
-
-- Apply softmax/argmax to produce final segmentation outputs
-- Convert to common uint8 format for visualization and further analysis
-- Optionally apply argmax to create binary or multiclass masks
-
-### Distributed Capability: ❌ Single Machine
-
-`vesuvius.finalize_outputs` runs on a single machine. It processes data in chunks to manage memory usage.
-
-### Key Parameters
-
-| Parameter | Type | Description | Default | Recommendation |
-|-----------|------|-------------|---------|---------------|
-| `input_path` | str | Path to the merged logits Zarr store | Required | |
-| `output_path` | str | Path for the finalized output Zarr store | Required | |
-| `--mode` | str | Processing mode (`binary`, `multiclass`) | `binary` | Empty, Defaults |
-| `--threshold` | flag | Apply argmax and only save class predictions | `False` | |
-| `--delete-intermediates` | flag | Delete intermediate logits after processing | `False` | Empty, Defaults |
-| `--chunk-size` | str | Spatial chunk size (Z,Y,X) for output Zarr | Use input chunks | Empty, Defaults |
-| `--num-workers` | int | Number of worker processes | CPU_COUNT / 2 | Empty, Defaults |
-| `--quiet` | flag | Suppress verbose output | `False` | Empty, Defaults |
-
-
-### How to Run
-
-After blending is complete:
+Combine the partial logits by weighting overlaps with a Gaussian window. The command scans the `parent_dir` for matching `logits_part_*.zarr` and `coordinates_part_*.zarr` pairs.
 
 ```bash
-vesuvius.finalize_outputs /path/to/merged_logits.zarr /path/to/final_output.zarr \
-  --mode binary --threshold --delete-intermediates
+vesuvius.blend_logits /tmp/logits /tmp/merged_logits.zarr \
+  --num_workers 16 \
+  --chunk_size 256,256,256
 ```
 
-### Output Format
+### Options
 
-- __Without `--threshold`__:
+| Argument | Description |
+|----------|-------------|
+| `parent_dir` | Folder containing the per-part logits and coordinates Zarr stores.
+| `output_path` | Destination Zarr for the merged logits.
+| `--weights_path` | Optional path for the temporary weight accumulator.
+| `--sigma_scale` | Controls Gaussian falloff (`patch_size / sigma_scale`, default `8.0`).
+| `--chunk_size` | Spatial chunk size (`Z,Y,X`) for the merged Zarr. Leave unset to auto-pick.
+| `--num_workers` | Number of worker processes. Defaults to `CPU_COUNT - 1`.
+| `--compression_level` | Zarr compression level (0–9, default `1`).
+| `--keep_weights` | Preserve the weight accumulator instead of deleting it after blending.
+| `--quiet` | Suppress verbose logging.
 
-  - __Binary mode__: 1 channel [softmax_fg]
-  - __Multiclass mode__: N+1 channels [softmax_c0...softmax_cN, argmax]
+The merged logits retain the same class/channel dimension as the individual parts.
 
-- __With `--threshold`__:
+## Stage 3 — `vesuvius.finalize_outputs`
 
-  - __Binary mode__: 1 channel [binary_mask]
-  - __Multiclass mode__: 1 channel [argmax]
-
-Note on TIFF logits: Finalization currently operates on Zarr logits. For TIFF logits written by the in-memory path, you can either consume them directly downstream (they are probabilities/logits per class), or convert them to a zarr store if you want to reuse the existing finalization utility.
-
-## Full Distributed Workflow Example
-
-The following example shows how to run the entire workflow in a distributed setting with 4 machines:
-
-### 1. Run Prediction on Multiple Machines
+Finalize logits into probabilities or masks and optionally build a multiscale pyramid. The command writes OME-NGFF metadata and (when requested) deletes the intermediate logits directory.
 
 ```bash
-# Machine 1: Process part 0
+vesuvius.finalize_outputs /tmp/merged_logits.zarr /tmp/final_output.zarr \
+  --mode binary \
+  --threshold \
+  --delete-intermediates
+```
+
+### Options
+
+| Argument | Description |
+|----------|-------------|
+| `input_path` | Path to the blended logits Zarr (level `0` is the logits array).
+| `output_path` | Destination multiscale Zarr root.
+| `--mode` | `binary` (default) or `multiclass`.
+| `--threshold` | For binary: emit a single-channel argmax mask. For multiclass: emit just the argmax channel.
+| `--delete-intermediates` | Remove the source logits after a successful run.
+| `--chunk-size` | Spatial chunk size for the output store (`Z,Y,X`). Defaults to the logits chunking.
+| `--num-workers` | Worker processes for finalization (defaults to half of CPU cores).
+| `--quiet` | Suppress verbose logging.
+
+Without `--threshold`, binary mode outputs a single softmax foreground channel; multiclass mode writes one channel per class plus an argmax channel.
+
+## Single-Machine Convenience — `vesuvius.inference_pipeline`
+
+`vesuvius.inference_pipeline` automates the three stages on one machine. It can route different parts to different GPUs and manage intermediate directories.
+
+```bash
+vesuvius.inference_pipeline \
+  --input /data/Scroll1.zarr \
+  --output /results/ink.zarr \
+  --model hf://scrollprize/surface_recto \
+  --mode binary \
+  --threshold \
+  --gpus 0,1 \
+  --parts-per-gpu 2 \
+  --batch-size 2
+```
+
+Important flags:
+
+- `--workdir`: where to place intermediate logits (defaults to `<output>_work`).
+- `--skip-predict`, `--skip-blend`, `--skip-finalize`: rerun only specific stages.
+- `--parts-per-gpu`: how many logical parts each GPU should process.
+- `--keep-intermediates`: retain the intermediate logits/chunks for debugging.
+
+The pipeline command internally invokes the individual CLIs, so pass model- and inference-specific flags exactly as you would to `vesuvius.predict`.
+
+## Full Remote Workflow Example
+
+```bash
+# 1. Run prediction on four machines (part IDs 0–3)
 vesuvius.predict --model_path hf://scrollprize/surface_recto \
-    --input_dir s3://input-bucket/volume.zarr \
-    --output_dir s3://output-bucket/logits.zarr \
+    --input_dir s3://vesuvius/input/Scroll1.zarr \
+    --output_dir s3://vesuvius/tmp/logits \
     --num_parts 4 \
     --part_id 0 \
+    --device cuda:0 \
     --zarr-compressor zstd \
     --zarr-compression-level 3 \
-    --skip-empty-patches \
-    --batch_size 2
+    --skip-empty-patches
 
-# Machine 2: Process part 1
-vesuvius.predict --model_path /path/to/model \
-    --input_dir s3://input-bucket/volume.zarr \
-    --output_dir s3://output-bucket/logits.zarr \
-    --num_parts 4 \
-    --part_id 1 \
-    --zarr-compressor zstd \
-    --zarr-compression-level 3 \
-    --skip-empty-patches \
-    --batch_size 2
+# ...repeat for part_id 1,2,3 on other hosts...
 
-# Machine 3: Process part 2
-vesuvius.predict --model_path /path/to/model \
-    --input_dir s3://input-bucket/volume.zarr \
-    --output_dir s3://output-bucket/predictions \
-    --num_parts 4 \
-    --part_id 2 \
-    --zarr-compressor zstd \
-    --zarr-compression-level 3 \
-    --skip-empty-patches \
-    --batch_size 2
+# 2. Blend logits once all parts finish
+vesuvius.blend_logits s3://vesuvius/tmp/logits s3://vesuvius/tmp/merged_logits.zarr \
+    --num_workers 32 \
+    --chunk_size 256,256,256
 
-
-# Repeat for as many machines as you'd like to schedule this on
-# num_parts should be divisible by  z height /  patch size * overlap%
+# 3. Finalize outputs
+vesuvius.finalize_outputs s3://vesuvius/tmp/merged_logits.zarr s3://vesuvius/output/final.zarr \
+    --mode binary \
+    --threshold \
+    --delete-intermediates
 ```
 
-### 2. Blend Logits on a Single Machine
-
-```bash
-vesuvius.blend_logits s3://output-bucket/predictions \
-            s3://output-bucket/merged_logits.zarr \
-            --num_workers 16 
-```
-
-### 3. Finalize Output on a Single Machine
-
-```bash
-# After blending has completed
-vesuvius.finalize_outputs s3://output-bucket/merged_logits.zarr \
-            s3://output-bucket/final_segmentation.zarr \
-            --delete-intermediates \
-            --num-workers 16
-
-# if you do not want the softmax probabilities, you can use the flag --threshold to take the argmax over the channels and extract only the fg channel
-```
+After finalization the destination Zarr contains a multiscale hierarchy (`0/`, `1/`, …) and a `metadata.json` file describing the inference run. Rechunk the output if you plan to serve it through a viewer that expects different chunk sizes.

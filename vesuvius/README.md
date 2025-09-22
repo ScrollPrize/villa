@@ -14,7 +14,7 @@ From [Vesuvius Challenge](https://scrollprize.org), a Python library for :
 
 `vesuvius` also comes prepackaged with: 
 - extensive data augmentation
-- PyTorch datasets for zarr or image (png, jpg, tif) data
+- Dataset orchestrator with streaming adapters for image (tif/png/jpg), zarr, and napari-backed sources
 
 _this package is in active development_
 
@@ -138,7 +138,7 @@ When this command is run:
 - a ConfigManager class will be instantiated, which will take the arguments given and the configuration file, and store these as properties.
 - The trainer class will execute its class method `__build_model`, which will create an instance of `NetworkFromConfig`
 - `NetworkFromConfig` will dynamically determine the number of pooling operations, stages, feature map sizes, operation dimensionality, and other specified parameters
-- The trainer class will execute its `_configure_dataset` method, and create an instance of the proper Pytorch dataset
+- The trainer class will execute its `_configure_dataset` method, instantiating the `DatasetOrchestrator` with the adapter that matches `data_format`
 - The trainer class will execute the rest of the setup required for training, through the following additional class methods:
   - `_build_loss`
   - `_get_optimizer`
@@ -182,4 +182,3 @@ To use a local model point at either the `nnUNet_results` folder which contains 
 
 ### Rendering and Flattening objs
 Documentation is provided in [the rendering folder](src/vesuvius/rendering/README.md)
-

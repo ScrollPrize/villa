@@ -1,13 +1,19 @@
-# Dataset classes for different data formats
+# Dataset exports
 from .base_dataset import BaseDataset
-from .napari_dataset import NapariDataset
-from .image_dataset import ImageDataset
-from .zarr_dataset import ZarrDataset
+from .orchestrator import DatasetOrchestrator
+
+__all__ = ["BaseDataset", "DatasetOrchestrator"]
 
 
-__all__ = [
-    'BaseDataset',
-    'NapariDataset', 
-    'ImageDataset',
-    'ZarrDataset'
-]
+_LEGACY_DATASETS = {
+    "ImageDataset": "Use DatasetOrchestrator with adapter='image'.",
+    "ZarrDataset": "Use DatasetOrchestrator with adapter='zarr'.",
+    "NapariDataset": "Use DatasetOrchestrator with adapter='napari'.",
+}
+
+
+def __getattr__(name: str):  # pragma: no cover - defensive
+    message = _LEGACY_DATASETS.get(name)
+    if message is not None:
+        raise ImportError(f"{name} has been removed. {message}")
+    raise AttributeError(name)

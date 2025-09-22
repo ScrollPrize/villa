@@ -1,20 +1,18 @@
+import logging
 from pathlib import Path
 import os
 import json
+import math
+from typing import Dict, List, Optional, Tuple, Sequence, Union
+
 import numpy as np
 import torch
+import torch.nn.functional as F
 import fsspec
 import zarr
 from torch.utils.data import Dataset
-from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
 from functools import partial
-from vesuvius.models.training.auxiliary_tasks import (
-    compute_distance_transform,
-    compute_surface_normals_from_sdt,
-    compute_structure_tensor,
-    compute_inplane_direction,
-)
 from vesuvius.models.augmentation.transforms.spatial.transpose import TransposeAxesTransform
 # Augmentations will be handled directly in this file
 from vesuvius.models.augmentation.transforms.utils.random import RandomTransform
@@ -31,11 +29,18 @@ from vesuvius.models.augmentation.transforms.utils.compose import ComposeTransfo
 from vesuvius.models.augmentation.transforms.noise.extranoisetransforms import BlankRectangleTransform, RicianNoiseTransform, SmearTransform
 from vesuvius.models.augmentation.transforms.intensity.illumination import InhomogeneousSliceIlluminationTransform
 
-from vesuvius.utils.utils import pad_or_crop_3d, pad_or_crop_2d
 from ..training.normalization import get_normalization
 from .intensity_properties import initialize_intensity_properties
-from .find_valid_patches import find_valid_patches
-from .save_valid_patches import save_valid_patches, load_cached_patches
+from .slicers import (
+    PlaneSliceConfig,
+    PlaneSlicePatch,
+    PlaneSliceVolume,
+    PlaneSlicer,
+    ChunkSliceConfig,
+    ChunkPatch,
+    ChunkVolume,
+    ChunkSlicer,
+)
 
 class BaseDataset(Dataset):
     """
@@ -59,6 +64,7 @@ class BaseDataset(Dataset):
 
         """
         super().__init__()
+        self.logger = logging.getLogger(__name__)
         self.mgr = mgr
         self.is_training = is_training
 
@@ -84,29 +90,87 @@ class BaseDataset(Dataset):
 
         self.target_volumes = {}
         self.valid_patches = []
+        self.patch_weights = None
+        self._plane_patches: List[PlaneSlicePatch] = []
+        self._chunk_patches: List[ChunkPatch] = []
         self.is_2d_dataset = None
         self.data_path = Path(mgr.data_path) if hasattr(mgr, 'data_path') else None
         self.zarr_arrays = []
         self.zarr_names = []
         self.data_paths = []
 
-        self.cache_enabled = getattr(mgr, 'cache_valid_patches', True)
+        # Slice sampling configuration (2D slices from 3D inputs)
+        self.slice_sampling_enabled = bool(getattr(mgr, 'slice_sampling_enabled', False))
+        self.slice_sample_planes = list(getattr(mgr, 'slice_sample_planes', []))
+        self.slice_plane_weights = dict(getattr(mgr, 'slice_plane_weights', {}))
+        self.slice_plane_patch_sizes = dict(getattr(mgr, 'slice_plane_patch_sizes', {}))
+        self.slice_primary_plane = getattr(mgr, 'slice_primary_plane', None)
+        self.slice_random_rotation_planes = dict(getattr(mgr, 'slice_random_rotation_planes', {}))
+        self.slice_random_tilt_planes = dict(getattr(mgr, 'slice_random_tilt_planes', {}))
+        self.slice_label_interpolation = getattr(mgr, 'slice_label_interpolation', {})
+        self.slice_save_plane_masks = bool(getattr(mgr, 'slice_save_plane_masks', False))
+        self.slice_plane_mask_mode = getattr(mgr, 'slice_plane_mask_mode', 'plane')
+        if self.slice_plane_mask_mode not in ('volume', 'plane'):
+            self.slice_plane_mask_mode = 'plane'
+
+        self.plane_slicer: Optional[PlaneSlicer] = None
+        self.chunk_slicer: Optional[ChunkSlicer] = None
+
+        if self.slice_sampling_enabled and not self.slice_sample_planes:
+            self.slice_sample_planes = ['z']
+            self.slice_plane_weights = {'z': 1.0}
+
+        # Disable cached patch lookup in slice mode (cache incompatible with plane metadata)
+        if self.slice_sampling_enabled and getattr(mgr, 'cache_valid_patches', True):
+            self.logger.info("Slice sampling mode: disabling cache_valid_patches (not supported)")
+            self.cache_enabled = False
+        else:
+            self.cache_enabled = getattr(mgr, 'cache_valid_patches', True)
+
         self.cache_dir = None
         if self.data_path is not None:
             self.cache_dir = self.data_path / '.patches_cache'
-            print(f"Cache directory: {self.cache_dir}")
-            print(f"Cache enabled: {self.cache_enabled}")
-        
+            self.logger.info("Cache directory: %s", self.cache_dir)
+            self.logger.info("Cache enabled: %s", self.cache_enabled)
+
         self._initialize_volumes()
-        ref_target = list(self.target_volumes.keys())[0]
-        ref_volume_data = self.target_volumes[ref_target][0]['data']
 
-        if 'label' in ref_volume_data and ref_volume_data['label'] is not None:
-            ref_shape = ref_volume_data['label'].shape
+        if self.slice_sampling_enabled:
+            self._setup_plane_slicer()
         else:
-            ref_shape = ref_volume_data['data'].shape
+            self._setup_chunk_slicer()
 
-        self.is_2d_dataset = len(ref_shape) == 2 or (len(ref_shape) == 3 and ref_shape[0] <= 20)
+        ref_target = list(self.target_volumes.keys())[0]
+        ref_entry = self.target_volumes[ref_target][0]
+        ref_source = self._get_entry_label(ref_entry)
+        if ref_source is None:
+            ref_source = self._get_entry_image(ref_entry)
+        if ref_source is None:
+            raise ValueError("Unable to determine reference shape; volume lacks image and label sources")
+        ref_shape = self._resolve_spatial_shape(ref_source)
+
+        # Allow explicit override from config to avoid misclassification.
+        force_2d = getattr(self.mgr, 'force_2d', False)
+        if self.slice_sampling_enabled:
+            force_2d = True
+        if not force_2d and hasattr(self.mgr, 'dataset_config'):
+            force_2d = bool(self.mgr.dataset_config.get('force_2d', False))
+        force_3d = getattr(self.mgr, 'force_3d', False)
+        if self.slice_sampling_enabled:
+            force_3d = False
+        if not force_3d and hasattr(self.mgr, 'dataset_config'):
+            force_3d = bool(self.mgr.dataset_config.get('force_3d', False))
+
+        if force_2d and force_3d:
+            raise ValueError("Both force_2d and force_3d are set; choose only one.")
+
+        if force_2d:
+            self.is_2d_dataset = True
+        elif force_3d:
+            self.is_2d_dataset = False
+        else:
+            # Only treat as 2D when the data truly has 2 dimensions
+            self.is_2d_dataset = (len(ref_shape) == 2)
         
         if self.is_2d_dataset:
             print("Detected 2D dataset")
@@ -144,6 +208,10 @@ class BaseDataset(Dataset):
             )
 
         self.normalizer = get_normalization(self.normalization_scheme, self.intensity_properties)
+        if self.plane_slicer is not None:
+            self.plane_slicer.set_normalizer(self.normalizer)
+        if self.chunk_slicer is not None:
+            self.chunk_slicer.set_normalizer(self.normalizer)
 
         self.transforms = None
         if self.is_training:
@@ -159,29 +227,10 @@ class BaseDataset(Dataset):
             self._get_valid_patches()
         else:
             print("Skipping patch validation as requested")
-            # Generate all possible patches without validation
-            self.valid_patches = []
-
-            # Get the first target to access all volumes (since all targets share the same volumes)
-            first_target = list(self.target_volumes.keys())[0]
-            all_volumes = self.target_volumes[first_target]
-
-            for vol_idx, volume_info in enumerate(all_volumes):
-                # Get the image array (data) for this volume
-                img_array = volume_info['data']['data']
-                vol_name = volume_info.get('volume_id', f"volume_{vol_idx}")
-
-                positions = self._get_all_sliding_window_positions(
-                    volume_shape=img_array.shape,
-                    patch_size=self.patch_size
-                )
-                for pos_dict in positions:
-                    self.valid_patches.append({
-                        "volume_index": vol_idx,
-                        "volume_name": vol_name,
-                        "position": pos_dict['start_pos']
-                    })
-            print(f"Generated {len(self.valid_patches)} patches without validation")
+            if self.slice_sampling_enabled:
+                self._generate_all_slice_patches()
+            else:
+                self._build_chunk_index(validate=False)
 
     def _initialize_volumes(self):
         """
@@ -195,22 +244,188 @@ class BaseDataset(Dataset):
            {
                'target_name': [
                    {
-                       'data': {
-                           'data': numpy_array,      # Image data
-                           'label': numpy_array      # Label data
-                       }
+                       'volume_id': str,
+                       'image': ArrayHandle | np.ndarray,
+                       'label': ArrayHandle | np.ndarray | None,
+                       'label_path': str | None,
+                       'label_source': object | None,
+                       'has_label': bool,
                    },
-                   ...  # Additional volumes for this target
+                   ...
                ],
-               ...  # Additional targets
+               ...
            }
 
-        2. Populate zarr arrays for patch finding:
-           - self.zarr_arrays: List of zarr arrays (label volumes)
-           - self.zarr_names: List of names for each volume
-           - self.data_paths: List of data paths for each volume
+        2. Optionally populate zarr metadata used for cache compatibility:
+           - self.zarr_arrays: Sequence of underlying zarr arrays (if available)
+           - self.zarr_names: Names for each stored label volume
+           - self.data_paths: Source paths for each stored label volume
         """
         raise NotImplementedError("Subclasses must implement _initialize_volumes() method")
+
+    def _setup_plane_slicer(self) -> None:
+        if not self.slice_sampling_enabled:
+            return
+
+        if not self.slice_sample_planes:
+            raise ValueError("slice_sample_planes must define at least one plane when slice sampling is enabled")
+
+        target_names = list(self.target_volumes.keys())
+        if not target_names:
+            raise ValueError("Plane slicing requires target volumes to be populated")
+
+        plane_patch_sizes: Dict[str, Sequence[int]] = {}
+        for axis in self.slice_sample_planes:
+            override = self.slice_plane_patch_sizes.get(axis)
+            if override is None:
+                raise KeyError(f"slice_plane_patch_sizes missing entry for plane '{axis}'")
+            if len(override) != 2:
+                raise ValueError(f"Patch size for plane '{axis}' must have length 2; got {override}")
+            plane_patch_sizes[axis] = tuple(int(v) for v in override)
+
+        plane_weights = {axis: float(self.slice_plane_weights.get(axis, 1.0)) for axis in self.slice_sample_planes}
+
+        config = PlaneSliceConfig(
+            sample_planes=tuple(self.slice_sample_planes),
+            plane_weights=plane_weights,
+            plane_patch_sizes=plane_patch_sizes,
+            primary_plane=self.slice_primary_plane,
+            min_labeled_ratio=float(self.min_labeled_ratio),
+            min_bbox_percent=float(self.min_bbox_percent),
+            allow_unlabeled=bool(self.allow_unlabeled_data),
+            random_rotation_planes=dict(self.slice_random_rotation_planes),
+            random_tilt_planes=dict(self.slice_random_tilt_planes),
+            label_interpolation=dict(self.slice_label_interpolation),
+            save_plane_masks=bool(self.slice_save_plane_masks),
+            plane_mask_mode=self.slice_plane_mask_mode,
+        )
+
+        slicer = PlaneSlicer(config=config, target_names=target_names)
+
+        first_target = target_names[0]
+        reference_volumes = self.target_volumes[first_target]
+
+        for idx, reference_info in enumerate(reference_volumes):
+            image_array = self._get_entry_image(reference_info)
+            volume_name = reference_info.get('volume_id', f"volume_{idx}")
+
+            labels: Dict[str, Optional[np.ndarray]] = {}
+            for target_name in target_names:
+                try:
+                    entry = self.target_volumes[target_name][idx]
+                except IndexError as exc:
+                    raise IndexError(
+                        f"Target '{target_name}' missing volume index {idx} required for plane slicing"
+                    ) from exc
+                labels[target_name] = self._get_entry_label(entry)
+
+            slicer.register_volume(
+                PlaneSliceVolume(
+                    index=idx,
+                    name=volume_name,
+                    image=image_array,
+                    labels=labels,
+                )
+            )
+
+        self.plane_slicer = slicer
+
+    def _setup_chunk_slicer(self) -> None:
+        if self.slice_sampling_enabled:
+            return
+
+        target_names = list(self.target_volumes.keys())
+        if not target_names:
+            raise ValueError("Chunk slicing requires target volumes to be populated")
+
+        patch_size = tuple(int(v) for v in self.patch_size)
+        stride_override = getattr(self.mgr, 'chunk_stride', None)
+        if stride_override is not None:
+            stride_override = tuple(int(v) for v in stride_override)
+
+        config = ChunkSliceConfig(
+            patch_size=patch_size,
+            stride=stride_override,
+            min_labeled_ratio=float(self.min_labeled_ratio),
+            min_bbox_percent=float(self.min_bbox_percent),
+            allow_unlabeled=bool(self.allow_unlabeled_data),
+            downsample_level=int(getattr(self.mgr, 'downsample_level', 1)),
+            num_workers=int(getattr(self.mgr, 'num_workers', 8)),
+            cache_enabled=bool(self.cache_enabled),
+            cache_dir=self.cache_dir,
+        )
+
+        slicer = ChunkSlicer(config=config, target_names=target_names)
+
+        first_target = target_names[0]
+        reference_volumes = self.target_volumes[first_target]
+
+        for idx, reference_info in enumerate(reference_volumes):
+            image_array = self._get_entry_image(reference_info)
+            volume_name = reference_info.get('volume_id', f"volume_{idx}")
+
+            labels: Dict[str, Optional[np.ndarray]] = {}
+            label_source = None
+            cache_key_path: Optional[Path] = None
+
+            for target_name in target_names:
+                try:
+                    entry = self.target_volumes[target_name][idx]
+                except IndexError as exc:
+                    raise IndexError(
+                        f"Target '{target_name}' missing volume index {idx} required for chunk slicing"
+                    ) from exc
+                label_array = self._get_entry_label(entry)
+                labels[target_name] = label_array
+                if label_source is None:
+                    source_candidate = self._get_entry_label_source(entry)
+                    if source_candidate is not None:
+                        label_source = source_candidate
+                if cache_key_path is None:
+                    path_candidate = self._get_entry_label_path(entry)
+                    if path_candidate:
+                        cache_key_path = Path(path_candidate)
+
+            slicer.register_volume(
+                ChunkVolume(
+                    index=idx,
+                    name=volume_name,
+                    image=image_array,
+                    labels=labels,
+                    label_source=label_source,
+                    cache_key_path=cache_key_path,
+                )
+            )
+
+        self.chunk_slicer = slicer
+
+    def _build_chunk_index(self, *, validate: bool) -> None:
+        if self.chunk_slicer is None:
+            self._setup_chunk_slicer()
+        if self.chunk_slicer is None:
+            raise RuntimeError("Chunk slicer failed to initialise")
+
+        patches, weights = self.chunk_slicer.build_index(validate=validate)
+        self._chunk_patches = patches
+        self.patch_weights = weights
+        self.valid_patches = [
+            {
+                "volume_index": patch.volume_index,
+                "volume_name": patch.volume_name,
+                "position": list(patch.position),
+                "patch_size": list(patch.patch_size),
+            }
+            for patch in patches
+        ]
+
+        volume_count = len({patch.volume_index for patch in patches})
+        mode = "validated" if validate else "enumerated"
+        self.logger.info(
+            "Prepared %s %s chunk patches across %s volume(s)",
+            len(patches),
+            mode,
+            volume_count,
+        )
 
     def _needs_skeleton_transform(self):
         """
@@ -230,409 +445,111 @@ class BaseDataset(Dataset):
                         return True
         return False
 
-    def _get_all_sliding_window_positions(self, volume_shape, patch_size, stride=None):
-        """
-        Generate all possible sliding window positions for a volume.
-        
-        Parameters
-        ----------
-        volume_shape : tuple
-            Shape of the volume (2D or 3D)
-        patch_size : tuple
-            Size of patches to extract
-        stride : tuple, optional
-            Stride for sliding window, defaults to no overlap (stride = patch_size)
-            
-        Returns
-        -------
-        list
-            List of positions as dictionaries with 'start_pos' key
-        """
-        if len(volume_shape) == 2:
-            # 2D case
-            H, W = volume_shape
-            h, w = patch_size
-            
-            if stride is None:
-                stride = (h, w)  # No overlap by default
-            
-            positions = []
-            
-            # Generate regular grid positions
-            y_positions = list(range(0, H - h + 1, stride[0]))
-            x_positions = list(range(0, W - w + 1, stride[1]))
-            
-            # Check if we need edge patches to cover the entire volume
-            # Add final position at bottom edge if there's remaining space
-            if y_positions and y_positions[-1] + h < H:
-                y_positions.append(H - h)
-            
-            # Add final position at right edge if there's remaining space  
-            if x_positions and x_positions[-1] + w < W:
-                x_positions.append(W - w)
-            
-            total_positions = len(y_positions) * len(x_positions)
-            
-            with tqdm(total=total_positions, desc="Generating 2D sliding window positions", leave=False) as pbar:
-                for y in y_positions:
-                    for x in x_positions:
-                        positions.append({
-                            'start_pos': [0, y, x]  # [dummy_z, y, x] for 2D
-                        })
-                        pbar.update(1)
-                
-        else:
-            # 3D case
-            D, H, W = volume_shape
-            d, h, w = patch_size
-            
-            if stride is None:
-                stride = (d, h, w)  # No overlap by default
-            
-            positions = []
-            
-            # Generate regular grid positions
-            z_positions = list(range(0, D - d + 1, stride[0]))
-            y_positions = list(range(0, H - h + 1, stride[1]))
-            x_positions = list(range(0, W - w + 1, stride[2]))
-            
-            # Check if we need edge patches to cover the entire volume
-            # Add final position at depth edge if there's remaining space
-            if z_positions and z_positions[-1] + d < D:
-                z_positions.append(D - d)
-            
-            # Add final position at bottom edge if there's remaining space
-            if y_positions and y_positions[-1] + h < H:
-                y_positions.append(H - h)
-            
-            # Add final position at right edge if there's remaining space
-            if x_positions and x_positions[-1] + w < W:
-                x_positions.append(W - w)
-            
-            total_positions = len(z_positions) * len(y_positions) * len(x_positions)
-            
-            with tqdm(total=total_positions, desc="Generating 3D sliding window positions", leave=False) as pbar:
-                for z in z_positions:
-                    for y in y_positions:
-                        for x in x_positions:
-                            positions.append({
-                                'start_pos': [z, y, x]
-                            })
-                            pbar.update(1)
-
-        seen = set()
-        unique_positions = []
-        for pos in positions:
-            pos_tuple = tuple(pos['start_pos'])
-            if pos_tuple not in seen:
-                seen.add(pos_tuple)
-                unique_positions.append(pos)
-        
-        return unique_positions
-    
     def _get_valid_patches(self):
         """Find valid patches based on labeled ratio requirements."""
-        # Check if we should load approved patches from vc_proofreader
-        if hasattr(self.mgr, 'approved_patches_file') and self.mgr.approved_patches_file:
-            if self._load_approved_patches():
-                return
-
-        bbox_threshold = getattr(self.mgr, 'min_bbox_percent', 0.97)
-        downsample_level = getattr(self.mgr, 'downsample_level', 1)
-        num_workers = getattr(self.mgr, 'num_workers', 8)
-
-        if self.cache_enabled and len(self.zarr_arrays) > 0:
-            cached_patches = load_cached_patches(
-                train_data_paths=self.data_paths,
-                label_paths=self.data_paths,
-                patch_size=tuple(self.patch_size),
-                min_labeled_ratio=self.min_labeled_ratio,
-                bbox_threshold=bbox_threshold,
-                downsample_level=downsample_level,
-                cache_path=str(self.cache_dir) if self.cache_dir else None
+        if self.slice_sampling_enabled:
+            if self.plane_slicer is None:
+                raise RuntimeError("Plane slicer not initialized despite slice_sampling_enabled=True")
+            patches, weights = self.plane_slicer.build_index(validate=not self.skip_patch_validation)
+            self._plane_patches = patches
+            self.valid_patches = [
+                {
+                    "volume_index": p.volume_index,
+                    "volume_name": p.volume_name,
+                    "plane": p.plane,
+                    "slice_index": p.slice_index,
+                    "position": list(p.position),
+                    "patch_size": list(p.patch_size),
+                }
+                for p in patches
+            ]
+            self.patch_weights = weights
+            volume_count = len({p.volume_index for p in patches}) or len(self.target_volumes.get(next(iter(self.target_volumes)), []))
+            self.logger.info(
+                "Prepared %s plane patches across %s volume(s)",
+                len(self.valid_patches),
+                volume_count,
             )
+            return
 
-            if cached_patches is not None:
-                self.valid_patches = cached_patches
-                print(f"Successfully loaded {len(self.valid_patches)} patches from cache\n")
-                return
-
-        if len(self.zarr_arrays) == 0:
-            raise ValueError("No zarr arrays available for patch finding. Subclasses must populate self.zarr_arrays")
-
-        print("Computing valid patches using zarr arrays...")
-        valid_patches = find_valid_patches(
-            label_arrays=self.zarr_arrays,
-            label_names=self.zarr_names,
-            patch_size=tuple(self.patch_size),
-            bbox_threshold=bbox_threshold,
-            label_threshold=self.min_labeled_ratio,
-            num_workers=num_workers,
-            downsample_level=downsample_level
-        )
-
-        # Convert to the expected format
-        self.valid_patches = []
-        for patch in valid_patches:
-            self.valid_patches.append({
-                "volume_index": patch["volume_idx"],
-                "volume_name": patch["volume_name"],
-                "position": patch["start_pos"]  # (z,y,x) for 3D or (y,x) for 2D
-            })
-
-        # Save to cache after computing
-        if self.cache_enabled and self.cache_dir is not None and len(self.zarr_arrays) > 0:
-            cache_path = save_valid_patches(
-                valid_patches=valid_patches,
-                train_data_paths=self.data_paths,
-                label_paths=self.data_paths,
-                patch_size=tuple(self.patch_size),
-                min_labeled_ratio=self.min_labeled_ratio,
-                bbox_threshold=bbox_threshold,
-                downsample_level=downsample_level,
-                cache_path=str(self.cache_dir) if self.cache_dir else None
-            )
-            print(f"Saved patches to cache: {cache_path}")
+        self._build_chunk_index(validate=not self.skip_patch_validation)
 
     def __len__(self):
         return len(self.valid_patches)
-            
-    def _extract_patch(self, patch_info):
-        """
-        Extract both image and label patches from the volume and return as tensors.
-        
-        Parameters
-        ----------
-        patch_info : dict
-            Dictionary containing patch position and volume index information
 
-        Returns
-        -------
-        dict
-            Dictionary containing:
-            - 'image': torch tensor of the image patch [C, H, W] or [C, D, H, W]
-            - target labels: torch tensors for each target
-            - 'is_unlabeled': bool indicating if patch has no valid labels
-        """
-        vol_idx = patch_info["volume_index"]
+    def _resolve_spatial_shape(self, source) -> Tuple[int, ...]:
+        if hasattr(source, 'spatial_shape'):
+            return tuple(int(v) for v in source.spatial_shape)
+        shape = getattr(source, 'shape', None)
+        if shape is not None:
+            if callable(shape):
+                shape = shape()
+            return tuple(int(v) for v in shape)
+        array = np.asarray(source)
+        return tuple(int(v) for v in array.shape)
 
-        # Extract coordinates based on dimensionality
-        if self.is_2d_dataset:
-            y, x = patch_info["position"]
-            dy, dx = self.patch_size[-2:]  # Last 2 dimensions
-            z, dz = 0, 0
-            target_shape = (dy, dx)
-        else:
-            z, y, x = patch_info["position"]
-            if len(self.patch_size) >= 3:
-                dz, dy, dx = self.patch_size[:3]
-            else:
-                dy, dx = self.patch_size
-                dz = 1
-            target_shape = (dz, dy, dx)
-        
-        # Get the image data
-        first_target_name = list(self.target_volumes.keys())[0]
-        img_arr = self.target_volumes[first_target_name][vol_idx]['data']['data']
-        
-        # Extract image patch
-        try:
-            if self.is_2d_dataset:
-                img_patch = img_arr[y:y+dy, x:x+dx]
-                if img_patch.size == 0:
-                    raise ValueError("Empty patch")
-                img_patch = pad_or_crop_2d(img_patch, (dy, dx))
-            else:
-                img_patch = img_arr[z:z+dz, y:y+dy, x:x+dx]
-                if img_patch.size == 0:
-                    raise ValueError("Empty patch")
-                img_patch = pad_or_crop_3d(img_patch, (dz, dy, dx))
-        except Exception as e:
-            print(f"Warning: Failed to extract image patch at vol={vol_idx}, z={z}, y={y}, x={x}: {str(e)}")
-            img_patch = np.zeros(target_shape, dtype=np.float32)
-        
-        # Apply normalization
-        if self.normalizer is not None:
-            img_patch = self.normalizer.run(img_patch)
-        else:
-            img_patch = img_patch.astype(np.float32)
-        
-        # Add channel dimension
-        img_patch = np.ascontiguousarray(img_patch[np.newaxis, ...])
-        
-        # Extract label patches and check if unlabeled
-        label_patches = {}
-        is_unlabeled = True  # Assume unlabeled until we find valid labels
+    @staticmethod
+    def _get_entry_image(entry):
+        if 'image' in entry:
+            return entry['image']
+        data = entry.get('data')
+        if isinstance(data, dict):
+            return data.get('data')
+        return None
 
-        for t_name, volumes_list in self.target_volumes.items():
-            label_arr = volumes_list[vol_idx]['data'].get('label')
-            
-            if label_arr is None:
-                # No label exists - create zero array
-                label_patch = np.zeros(target_shape, dtype=np.float32)
-                # Add channel dimension for consistency with labeled data
-                label_patch = label_patch[np.newaxis, ...]
-            else:
-                # Extract label patch
-                has_channels = (self.is_2d_dataset and len(label_arr.shape) == 3) or \
-                              (not self.is_2d_dataset and len(label_arr.shape) == 4)
+    @staticmethod
+    def _get_entry_label(entry):
+        if 'label' in entry:
+            return entry['label']
+        data = entry.get('data')
+        if isinstance(data, dict):
+            return data.get('label')
+        return None
 
-                try:
-                    if self.is_2d_dataset:
-                        if has_channels:
-                            label_patch = label_arr[:, y:y+dy, x:x+dx]
-                        else:
-                            label_patch = label_arr[y:y+dy, x:x+dx]
+    @staticmethod
+    def _get_entry_label_source(entry):
+        if 'label_source' in entry:
+            return entry['label_source']
+        data = entry.get('data')
+        if isinstance(data, dict):
+            return data.get('label_source')
+        return None
 
-                        # Pad/crop
-                        if has_channels:
-                            n_channels = label_patch.shape[0]
-                            padded = [pad_or_crop_2d(label_patch[c], (dy, dx)) for c in range(n_channels)]
-                            label_patch = np.stack(padded, axis=0)
-                        else:
-                            label_patch = pad_or_crop_2d(label_patch, (dy, dx))
-                    else:
-                        if has_channels:
-                            label_patch = label_arr[:, z:z+dz, y:y+dy, x:x+dx]
-                        else:
-                            label_patch = label_arr[z:z+dz, y:y+dy, x:x+dx]
+    @staticmethod
+    def _get_entry_label_path(entry):
+        if 'label_path' in entry:
+            return entry['label_path']
+        data = entry.get('data')
+        if isinstance(data, dict):
+            return data.get('label_path')
+        return None
 
-                        # Pad/crop
-                        if has_channels:
-                            n_channels = label_patch.shape[0]
-                            padded = [pad_or_crop_3d(label_patch[c], (dz, dy, dx)) for c in range(n_channels)]
-                            label_patch = np.stack(padded, axis=0)
-                        else:
-                            label_patch = pad_or_crop_3d(label_patch, (dz, dy, dx))
+    def _extract_chunk_patch(self, chunk_patch: ChunkPatch) -> Dict[str, torch.Tensor]:
+        if self.chunk_slicer is None:
+            raise RuntimeError("Chunk slicer not initialized")
+        chunk_result = self.chunk_slicer.extract(chunk_patch, normalizer=self.normalizer)
 
-                    # Check if patch has any non-zero labels
-                    if np.any(label_patch > 0):
-                        is_unlabeled = False
-
-                except Exception as e:
-                    print(f"Warning: Failed to extract label patch for {t_name}: {str(e)}")
-                    label_patch = np.zeros(target_shape, dtype=np.float32)
-                    # Mark that we need to add channel dimension
-                    has_channels = False
-
-                # Add channel dimension if needed
-                if not has_channels:
-                    label_patch = label_patch[np.newaxis, ...]
-
-            label_patch = np.ascontiguousarray(label_patch, dtype=np.float32)
-            label_patches[t_name] = label_patch
-
-
-        # Build result dictionary with torch tensors
-        result = {
-            'image': torch.from_numpy(img_patch),
-            'is_unlabeled': is_unlabeled
+        label_patches: Dict[str, np.ndarray] = {
+            name: np.asarray(array, dtype=np.float32)
+            for name, array in chunk_result.labels.items()
         }
-        
-        # Convert all label patches to tensors
-        for t_name, label_patch in label_patches.items():
-            result[t_name] = torch.from_numpy(label_patch)
 
-        # --- Auto-generate computed targets from source labels, if configured ---
-        # We generate ground-truth for tasks (e.g., distance_transform, surface_normals, inplane_direction,
-        # nearest_component) based on their declared source_target. This enables related regression/regularization
-        # losses to run without having to precompute and store labels on disk.
-        try:
-            regression_keys = []
-            for aux_name, tinfo in getattr(self.mgr, 'targets', {}).items():
-                # Only generate for explicitly marked auxiliary tasks
-                if not tinfo.get('auxiliary_task', False):
-                    continue
-                task_type = str(tinfo.get('task_type', '')).lower()
+        data_dict: Dict[str, torch.Tensor] = {
+            'image': torch.from_numpy(chunk_result.image),
+            'is_unlabeled': chunk_result.is_unlabeled,
+        }
 
-                source_t = tinfo.get('source_target')
-                if not source_t or source_t not in label_patches:
-                    # Source not available in this batch (or not configured)
-                    continue
+        for target_name, array in label_patches.items():
+            data_dict[target_name] = torch.from_numpy(array)
 
-                src_patch = label_patches[source_t]  # numpy array, shape (C, ...) float32
+        patch_info = dict(chunk_result.patch_info)
+        if chunk_patch.weight is not None:
+            patch_info['weight'] = float(chunk_patch.weight)
+        data_dict['patch_info'] = patch_info
 
-                # Build a binary mask from the first channel of the source label
-                # Foreground is > 0 in our label convention
-                if self.is_2d_dataset:
-                    # (C, H, W) -> (H, W)
-                    binary_mask = (src_patch[0] > 0).astype(np.uint8)
-                else:
-                    # (C, D, H, W) -> (D, H, W)
-                    binary_mask = (src_patch[0] > 0).astype(np.uint8)
-
-                if task_type == 'distance_transform':
-                    # Compute distances according to requested type: 'signed' | 'inside' | 'outside'
-                    from scipy.ndimage import distance_transform_edt
-                    inside = distance_transform_edt(binary_mask)
-                    outside = distance_transform_edt(1 - binary_mask)
-                    dist_type = str(tinfo.get('distance_type', 'signed')).lower()
-
-                    if dist_type == 'inside':
-                        distance = inside.astype(np.float32)
-                    elif dist_type == 'outside':
-                        distance = outside.astype(np.float32)
-                    else:  # 'signed' (default)
-                        distance = (outside - inside).astype(np.float32)
-
-                    # Add channel dimension (1, ...)
-                    aux_patch = distance[np.newaxis, ...]
-                    aux_patch = np.ascontiguousarray(aux_patch, dtype=np.float32)
-                    result[aux_name] = torch.from_numpy(aux_patch)
-                    regression_keys.append(aux_name)
-
-                elif task_type == 'surface_normals':
-                    # Compute normals from SDT; returns (2,H,W) for 2D or (3,D,H,W) for 3D
-                    normals, _ = compute_surface_normals_from_sdt(binary_mask, is_2d=self.is_2d_dataset, return_sdt=False)
-                    aux_patch = np.ascontiguousarray(normals, dtype=np.float32)
-                    result[aux_name] = torch.from_numpy(aux_patch)
-                    regression_keys.append(aux_name)
-                elif task_type == 'structure_tensor':
-                    aux_patch = compute_structure_tensor(
-                        binary_mask,
-                        self.is_2d_dataset,
-                        compute_from=str(tinfo.get('compute_from', 'sdt')).lower(),
-                        grad_sigma=float(tinfo.get('grad_sigma', 1.0)),
-                        tensor_sigma=float(tinfo.get('tensor_sigma', 1.5)),
-                        ignore_index=tinfo.get('ignore_index', -100),
-                    )
-                    result[aux_name] = torch.from_numpy(aux_patch)
-                    regression_keys.append(aux_name)
-                elif task_type == 'inplane_direction':
-                    aux_patch = compute_inplane_direction(
-                        binary_mask,
-                        self.is_2d_dataset,
-                        compute_from=str(tinfo.get('compute_from', 'sdt')).lower(),
-                        grad_sigma=float(tinfo.get('grad_sigma', 1.0)),
-                        tensor_sigma=float(tinfo.get('tensor_sigma', 1.5)),
-                        ignore_index=tinfo.get('ignore_index', -100),
-                    )
-                    result[aux_name] = torch.from_numpy(aux_patch)
-                    regression_keys.append(aux_name)
-                elif task_type == 'nearest_component':
-                    from vesuvius.models.training.auxiliary_tasks import compute_nearest_component
-                    aux_patch = compute_nearest_component(
-                        binary_mask,
-                        self.is_2d_dataset,
-                        sdf_sigma=float(tinfo.get('sdf_sigma', 0.0)),
-                    )
-                    result[aux_name] = torch.from_numpy(aux_patch)
-                    regression_keys.append(aux_name)
-                else:
-                    # Unknown auxiliary type; skip gracefully
-                    continue
-            if regression_keys:
-                result['regression_keys'] = regression_keys
-        except Exception as e:
-            print(f"Warning: Failed to generate auxiliary targets for patch index {index}: {e}")
-        
-        return result
+        return data_dict
 
     def _create_training_transforms(self):
-        """
-        Create training transforms using custom batchgeneratorsv2.
-        Returns None for validation (no augmentations).
-        """
         no_spatial = getattr(self.mgr, 'no_spatial', False)
         only_spatial_and_intensity = getattr(self.mgr, 'only_spatial_and_intensity', False)
             
@@ -695,19 +612,19 @@ class BaseDataset(Dataset):
                     ), apply_probability=0.5
                 ))
 
-            # Illumination
-            transforms.append(RandomTransform(
-                InhomogeneousSliceIlluminationTransform(
-                    num_defects=(2, 5),
-                    defect_width=(25, 50),
-                    mult_brightness_reduction_at_defect=(0.3, 1.5),
-                    base_p=(0.2, 0.4),
-                    base_red=(0.5, 0.9),
-                    p_per_sample=1.0,
-                    per_channel=True,
-                    p_per_channel=0.5
-                ), apply_probability=0.4
-            ))
+            # # Illumination
+            # transforms.append(RandomTransform(
+            #     InhomogeneousSliceIlluminationTransform(
+            #         num_defects=(2, 5),
+            #         defect_width=(25, 50),
+            #         mult_brightness_reduction_at_defect=(0.3, 1.5),
+            #         base_p=(0.2, 0.4),
+            #         base_red=(0.5, 0.9),
+            #         p_per_sample=1.0,
+            #         per_channel=True,
+            #         p_per_channel=0.5
+            #     ), apply_probability=0.4
+            # ))
 
             # Noise and blur
             if not only_spatial_and_intensity:
@@ -899,8 +816,7 @@ class BaseDataset(Dataset):
         """
         if not self._needs_skeleton_transform():
             return None
-            
-        # Import here to avoid circular dependencies
+
         from vesuvius.models.augmentation.transforms.utils.skeleton_transform import MedialSurfaceTransform
         
         transforms = []
@@ -928,11 +844,49 @@ class BaseDataset(Dataset):
         - Labels are 0 for background, >0 for foreground
         - Unlabeled patches will have all-zero label tensors
         """
-        patch_info = self.valid_patches[index]
-        data_dict = self._extract_patch(patch_info)
 
-        # Apply CPU-side transforms only if not deferring to on-device augmentation
+        if not self.valid_patches:
+            raise IndexError("Dataset contains no valid patches. Check data paths and patch generation settings.")
+        if index >= len(self.valid_patches) or index < -len(self.valid_patches):
+            # Allow optional wrap-around if explicitly enabled in config
+            wrap = bool(getattr(self.mgr, 'wrap_indices', False)) or \
+                   bool(getattr(self.mgr, 'wrap_dataset_indices', False)) or \
+                   (hasattr(self.mgr, 'dataset_config') and bool(self.mgr.dataset_config.get('wrap_indices', False)))
+            if wrap:
+                index = index % len(self.valid_patches)
+            else:
+                raise IndexError(f"Index {index} out of range for dataset of length {len(self.valid_patches)}")
+        if self.slice_sampling_enabled:
+            plane_patch = self._plane_patches[index]
+            plane_result = self.plane_slicer.extract(plane_patch)
+            data_dict = {
+                'image': torch.from_numpy(plane_result.image),
+                'is_unlabeled': plane_result.is_unlabeled,
+            }
+            for target_name, label_array in plane_result.labels.items():
+                data_dict[target_name] = torch.from_numpy(label_array)
+
+            if plane_result.plane_mask is not None:
+                mask_array = plane_result.plane_mask.astype(np.uint8, copy=False)
+                data_dict['plane_mask'] = torch.from_numpy(mask_array)
+
+            data_dict['patch_info'] = plane_result.patch_info
+        else:
+            if not self._chunk_patches:
+                raise RuntimeError("Chunk slicer index not prepared")
+            chunk_patch = self._chunk_patches[index]
+            data_dict = self._extract_chunk_patch(chunk_patch)
+
+        # if we don't want to perform augmentation on gpu , we might as well do here with cpu in the dataloader workers
+        metadata = data_dict.pop('patch_info', None)
+        plane_mask = data_dict.pop('plane_mask', None)
+
         if self.transforms is not None and not (self.is_training and getattr(self.mgr, 'augment_on_device', False)):
             data_dict = self.transforms(**data_dict)
+
+        if metadata is not None:
+            data_dict['patch_info'] = metadata
+        if plane_mask is not None:
+            data_dict['plane_mask'] = plane_mask
 
         return data_dict

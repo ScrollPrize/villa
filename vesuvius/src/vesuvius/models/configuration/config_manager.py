@@ -81,6 +81,8 @@ class ConfigManager:
 
         ### Training config ### 
         self.train_patch_size = tuple(self.tr_configs.get("patch_size", [192, 192, 192]))
+        # Preserve the user-specified patch size before any slice-mode adjustments
+        self._original_train_patch_size = tuple(self.train_patch_size)
         self.in_channels = 1
         self.train_batch_size = int(self.tr_configs.get("batch_size", 2))
         # Enable nnUNet-style deep supervision (disabled by default)
@@ -105,14 +107,106 @@ class ConfigManager:
         # its a bit of a waste of computation when considering the downsampled zarr patches are quite fast to check
         self.skip_bounding_box = bool(self.dataset_config.get("skip_bounding_box", True))
         self.cache_valid_patches = bool(self.dataset_config.get("cache_valid_patches", True))
-        
+
+        # Worker configuration for image→Zarr pipeline
+        # Parallel workers for initial image/Zarr checks
+        self.image_check_workers = int(self.dataset_config.get(
+            "image_check_workers", max(1, os.cpu_count() // 4)
+        ))
+        # Parallel workers for actual image→Zarr writes
+        self.image_to_zarr_workers = int(self.dataset_config.get(
+            "image_to_zarr_workers", max(1, os.cpu_count() // 4)
+        ))
+
         # this horrific name is so you can set specific loss functions for specific label volumes,
         # say for example one volume doesn't have the same labels as the others.
         self.volume_task_loss_config = self.dataset_config.get("volume_task_loss_config", {})
         if self.volume_task_loss_config and self.verbose:
             print(f"Volume-task loss configuration loaded: {self.volume_task_loss_config}")
 
-        
+
+        # Slice sampling configuration: train 2D slices from 3D inputs
+        self.slice_sampling_config = self.dataset_config.get("slice_sampling", {}) or {}
+        self.slice_sampling_enabled = bool(self.slice_sampling_config.get("enabled", False))
+        self.slice_sample_planes = []
+        self.slice_plane_weights = {}
+        self.slice_plane_patch_sizes = {}
+        self.slice_primary_plane = None
+
+        self.slice_random_rotation_planes = {}
+        self.slice_random_tilt_planes = {}
+        self.slice_label_interpolation = {}
+        self.slice_save_plane_masks = False
+        self.slice_plane_mask_mode = 'plane'
+        self.slice_label_interpolation = {}
+
+        if self.slice_sampling_enabled:
+            planes_cfg = self.slice_sampling_config.get("sample_planes", ["z"])
+            sample_rates_cfg = self.slice_sampling_config.get("sample_rates", None)
+            planes, weights = self._normalize_slice_sampling_planes(planes_cfg, sample_rates_cfg)
+
+            if not planes:
+                planes = ["z"]
+                weights = {"z": 1.0}
+
+            custom_sizes = self.slice_sampling_config.get("plane_patch_sizes", {})
+            patch_sizes = self._resolve_slice_plane_patch_sizes(
+                planes=planes,
+                base_patch_size=self._original_train_patch_size,
+                custom_sizes=custom_sizes
+            )
+
+            self.slice_sample_planes = planes
+            self.slice_plane_weights = weights
+            self.slice_plane_patch_sizes = patch_sizes
+            self.slice_primary_plane = planes[0]
+
+            rotation_cfg = self.slice_sampling_config.get("random_rotations")
+            if rotation_cfg:
+                self.slice_random_rotation_planes = self._normalize_slice_random_rotations(rotation_cfg, planes)
+
+            tilt_cfg = self.slice_sampling_config.get("random_tilts")
+            if tilt_cfg:
+                self.slice_random_tilt_planes = self._normalize_slice_random_tilts(tilt_cfg, planes)
+
+            interp_cfg = self.slice_sampling_config.get("label_interpolation")
+            if interp_cfg:
+                self.slice_label_interpolation = self._normalize_slice_label_interpolation(interp_cfg)
+
+            self.slice_save_plane_masks = bool(self.slice_sampling_config.get("save_plane_masks", False))
+
+            mask_mode = str(self.slice_sampling_config.get("plane_mask_mode", "plane")).lower()
+            if mask_mode not in {"volume", "plane"}:
+                if self.verbose:
+                    print(f"Unrecognized slice plane mask mode '{mask_mode}', defaulting to 'plane'.")
+                mask_mode = 'plane'
+            self.slice_plane_mask_mode = mask_mode
+
+            interp_cfg = self.slice_sampling_config.get("label_interpolation")
+            if interp_cfg:
+                self.slice_label_interpolation = self._normalize_slice_label_interpolation(interp_cfg)
+
+            # Force downstream components to operate in 2D using the primary plane's patch size
+            primary_size = patch_sizes.get(self.slice_primary_plane)
+            if primary_size is None or len(primary_size) != 2:
+                raise ValueError(
+                    "Slice sampling requires a 2D patch size for the primary plane; "
+                    f"got {primary_size} for plane '{self.slice_primary_plane}'."
+                )
+
+            self.train_patch_size = tuple(int(v) for v in primary_size)
+
+            # Ensure dataset detection treats volumes as 2D slices even if stored as 3D
+            self.force_2d = True
+            self.force_3d = False
+
+            if self.verbose:
+                plane_desc = ", ".join(
+                    f"{axis}: size={patch_sizes[axis]}, weight={weights[axis]:.3f}" for axis in planes
+                )
+                print(f"Slice sampling enabled across planes [{plane_desc}]")
+
+
         # Spatial transformations control
         self.no_spatial = bool(self.dataset_config.get("no_spatial", False))
         # Control where augmentations run; default to CPU (in Dataset workers)
@@ -175,6 +269,335 @@ class ConfigManager:
             self.load_strict = True
         if not hasattr(self, 'infer_num_dataloader_workers'):
             self.infer_num_dataloader_workers = int(self.train_num_dataloader_workers)
+
+    def _normalize_slice_sampling_planes(self, planes_cfg, rates_cfg):
+        """Normalize plane selection and weights for slice sampling."""
+
+        def normalize_axes(raw_axes):
+            normalized = []
+            seen = set()
+            for axis in raw_axes:
+                axis_norm = str(axis).lower()
+                if axis_norm not in {"x", "y", "z"}:
+                    raise ValueError(f"Unsupported slice sampling plane '{axis}'. Use any of: x, y, z")
+                if axis_norm not in seen:
+                    normalized.append(axis_norm)
+                    seen.add(axis_norm)
+            return normalized
+
+        def to_positive_float(value, context_label):
+            if value is None:
+                return 1.0
+            try:
+                val = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"Slice sampling {context_label} must be numeric; got {value!r}")
+            if val <= 0:
+                raise ValueError(f"Slice sampling {context_label} must be > 0; got {val}")
+            return val
+
+        # Determine plane order
+        if isinstance(planes_cfg, dict):
+            plane_list = normalize_axes(planes_cfg.keys())
+            weights = {axis: to_positive_float(planes_cfg.get(axis), f"sample_planes[{axis}]") for axis in plane_list}
+            return plane_list, weights
+
+        if isinstance(planes_cfg, str):
+            raw_planes = [part.strip() for part in planes_cfg.split(',') if part.strip()]
+            plane_list = normalize_axes(raw_planes)
+        elif isinstance(planes_cfg, (list, tuple, set)):
+            plane_list = normalize_axes(planes_cfg)
+        else:
+            raise ValueError(
+                "slice_sampling.sample_planes must be a string, list, or mapping of plane->weight"
+            )
+
+        if not plane_list:
+            return [], {}
+
+        # Determine weights
+        weights = {}
+        if isinstance(rates_cfg, dict):
+            for axis in plane_list:
+                weights[axis] = to_positive_float(rates_cfg.get(axis), f"sample_rates[{axis}]")
+        elif isinstance(rates_cfg, (list, tuple)):
+            if len(rates_cfg) == 0:
+                weights = {axis: 1.0 for axis in plane_list}
+            else:
+                last_val = rates_cfg[-1]
+                for idx, axis in enumerate(plane_list):
+                    value = rates_cfg[idx] if idx < len(rates_cfg) else last_val
+                    weights[axis] = to_positive_float(value, f"sample_rates[{axis}]")
+        elif isinstance(rates_cfg, str):
+            parts = [part.strip() for part in rates_cfg.split(',') if part.strip()]
+            if parts:
+                last_val = parts[-1]
+                for idx, axis in enumerate(plane_list):
+                    value = parts[idx] if idx < len(parts) else last_val
+                    weights[axis] = to_positive_float(value, f"sample_rates[{axis}]")
+        elif rates_cfg is not None:
+            scalar = to_positive_float(rates_cfg, "sample_rates")
+            weights = {axis: scalar for axis in plane_list}
+
+        if not weights:
+            weights = {axis: 1.0 for axis in plane_list}
+
+        # Ensure all planes have weights (fill missing with 1.0)
+        for axis in plane_list:
+            weights.setdefault(axis, 1.0)
+
+        return plane_list, weights
+
+    def _resolve_slice_plane_patch_sizes(self, planes, base_patch_size, custom_sizes):
+        """Compute per-plane 2D patch sizes for slice sampling."""
+
+        def to_size_tuple(value, axis):
+            if isinstance(value, (list, tuple)) and len(value) == 2:
+                try:
+                    h = int(value[0])
+                    w = int(value[1])
+                except (TypeError, ValueError):
+                    raise ValueError(f"slice_sampling.plane_patch_sizes[{axis}] must contain integers")
+                if h <= 0 or w <= 0:
+                    raise ValueError(f"slice_sampling.plane_patch_sizes[{axis}] must be > 0; got {(h, w)}")
+                return (h, w)
+            raise ValueError(
+                "slice_sampling.plane_patch_sizes entries must be two-element sequences of positive integers"
+            )
+
+        resolved = {}
+
+        if custom_sizes and not isinstance(custom_sizes, dict):
+            raise ValueError("slice_sampling.plane_patch_sizes must be a mapping of plane->[dim0, dim1]")
+
+        if isinstance(custom_sizes, dict):
+            for axis, size in custom_sizes.items():
+                axis_norm = str(axis).lower()
+                if axis_norm not in {"x", "y", "z"}:
+                    raise ValueError(f"Unsupported plane '{axis}' in plane_patch_sizes")
+                resolved[axis_norm] = to_size_tuple(size, axis_norm)
+
+        base = tuple(int(v) for v in base_patch_size) if base_patch_size else ()
+        if len(base) not in (2, 3):
+            raise ValueError(
+                f"Patch size for slice sampling must have 2 or 3 elements; got {base_patch_size}"
+            )
+
+        if len(base) == 3:
+            dz, dy, dx = base
+        else:  # len(base) == 2
+            dy, dx = base
+            dz = dy  # fallback depth so y/x planes still have a defined size
+
+        defaults = {
+            'z': (dy, dx),
+            'y': (dz, dx),
+            'x': (dz, dy)
+        }
+
+        for axis in planes:
+            if axis in resolved:
+                continue
+            if len(base) == 2:
+                resolved[axis] = (dy, dx)
+            else:
+                resolved[axis] = defaults[axis]
+
+        return resolved
+
+    def _normalize_slice_random_rotations(self, rotation_cfg, planes):
+        """Normalize random rotation settings for slice sampling planes."""
+
+        def _positive_float(val, label):
+            try:
+                fval = float(val)
+            except (TypeError, ValueError):
+                raise ValueError(f"Slice sampling {label} must be numeric; got {val!r}")
+            if fval <= 0:
+                raise ValueError(f"Slice sampling {label} must be > 0; got {fval}")
+            return fval
+
+        def _probability(val, label):
+            if val is None:
+                return 1.0
+            try:
+                fval = float(val)
+            except (TypeError, ValueError):
+                raise ValueError(f"Slice sampling {label} must be numeric; got {val!r}")
+            if fval < 0:
+                raise ValueError(f"Slice sampling {label} must be >= 0; got {fval}")
+            if fval > 1.0:
+                if fval > 100.0:
+                    raise ValueError(
+                        f"Slice sampling {label} must be <= 100 when expressed as percent; got {fval}"
+                    )
+                fval = fval / 100.0
+            if fval > 1.0:
+                raise ValueError(
+                    f"Slice sampling {label} must be between 0 and 1 after conversion; got {fval}"
+                )
+            return fval
+
+        def _normalize_entry(value, axis):
+            if isinstance(value, dict):
+                max_deg = value.get('max_degrees', value.get('max_degree', value.get('degrees', None)))
+                if max_deg is None:
+                    raise ValueError(
+                        f"slice_sampling.random_rotations[{axis}] must provide 'max_degrees' when using a mapping"
+                    )
+                probability = value.get('probability', value.get('prob', value.get('pct', value.get('percentage'))))
+                return {
+                    'max_degrees': _positive_float(max_deg, f"random_rotations[{axis}].max_degrees"),
+                    'probability': _probability(probability, f"random_rotations[{axis}].probability")
+                }
+            return {
+                'max_degrees': _positive_float(value, f"random_rotations[{axis}]") ,
+                'probability': 1.0
+            }
+
+        normalized = {}
+
+        if isinstance(rotation_cfg, bool):
+            if rotation_cfg:
+                for axis in planes:
+                    normalized[axis] = {
+                        'max_degrees': 360.0,
+                        'probability': 1.0
+                    }
+            return normalized
+
+        if isinstance(rotation_cfg, (list, tuple, set)):
+            for axis in rotation_cfg:
+                axis_norm = str(axis).lower()
+                if axis_norm not in planes:
+                    continue
+                normalized[axis_norm] = {
+                    'max_degrees': 360.0,
+                    'probability': 1.0
+                }
+            return normalized
+
+        if isinstance(rotation_cfg, dict):
+            for axis, value in rotation_cfg.items():
+                axis_norm = str(axis).lower()
+                if axis_norm not in planes:
+                    continue
+                normalized[axis_norm] = _normalize_entry(value, axis_norm)
+            return normalized
+
+        raise ValueError(
+            "slice_sampling.random_rotations must be a boolean, list, or mapping of plane->degrees"
+        )
+
+    def _normalize_slice_random_tilts(self, tilt_cfg, planes):
+        """Normalize random tilt settings (per-axis) for slice sampling planes."""
+
+        def to_positive_float(value, context_label):
+            try:
+                val = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"Slice sampling {context_label} must be numeric; got {value!r}")
+            if val <= 0:
+                raise ValueError(f"Slice sampling {context_label} must be > 0; got {val}")
+            return val
+
+        def to_probability(value, context_label):
+            if value is None:
+                return 1.0
+            try:
+                prob = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"Slice sampling {context_label} must be numeric; got {value!r}")
+            if prob < 0:
+                raise ValueError(f"Slice sampling {context_label} must be >= 0; got {prob}")
+            if prob > 1.0:
+                if prob > 100.0:
+                    raise ValueError(
+                        f"Slice sampling {context_label} must be <= 100 when expressed as percent; got {prob}"
+                    )
+                prob = prob / 100.0
+            if prob > 1.0:
+                raise ValueError(
+                    f"Slice sampling {context_label} must be between 0 and 1 after conversion; got {prob}"
+                )
+            return prob
+
+        if not isinstance(tilt_cfg, dict):
+            raise ValueError("slice_sampling.random_tilts must be a mapping of plane->axis tilt settings")
+
+        normalized = {}
+        for plane, axis_cfg in tilt_cfg.items():
+            plane_norm = str(plane).lower()
+            if plane_norm not in planes:
+                continue
+
+            probability = 1.0
+            per_axis = {}
+
+            if isinstance(axis_cfg, (int, float)):
+                per_axis['x'] = to_positive_float(axis_cfg, f"random_tilts[{plane_norm}]")
+            elif isinstance(axis_cfg, dict):
+                probability_value = axis_cfg.get('probability', axis_cfg.get('prob', axis_cfg.get('pct', axis_cfg.get('percentage'))))
+                probability = to_probability(probability_value, f"random_tilts[{plane_norm}].probability")
+
+                for axis_key, value in axis_cfg.items():
+                    axis_lower = str(axis_key).lower()
+                    if axis_lower in {'probability', 'prob', 'pct', 'percentage'}:
+                        continue
+                    if axis_lower not in {'x', 'y', 'z'}:
+                        raise ValueError(
+                            f"slice_sampling.random_tilts[{plane}][{axis_key}] must be one of: x, y, z"
+                        )
+                    per_axis[axis_lower] = to_positive_float(
+                        value,
+                        f"random_tilts[{plane_norm}][{axis_lower}]"
+                    )
+            else:
+                raise ValueError(
+                    f"slice_sampling.random_tilts[{plane}] must be a number or mapping of axis->degrees"
+                )
+
+            if per_axis:
+                normalized[plane_norm] = {
+                    'axes': per_axis,
+                    'probability': probability
+                }
+
+        return normalized
+
+    def _normalize_slice_label_interpolation(self, interp_cfg):
+        normalized = {}
+        if not isinstance(interp_cfg, dict):
+            return normalized
+
+        for target, policy in interp_cfg.items():
+            if isinstance(policy, str):
+                normalized[target] = {'__all__': policy.lower() == 'linear'}
+            elif isinstance(policy, bool):
+                normalized[target] = {'__all__': policy}
+            elif isinstance(policy, dict):
+                target_policy = {}
+                for plane, mode in policy.items():
+                    target_policy[str(plane).lower()] = str(mode).lower() == 'linear'
+                if target_policy:
+                    normalized[target] = target_policy
+        return normalized
+
+    def _normalize_slice_label_interpolation(self, interp_cfg):
+        normalized = {}
+        if not isinstance(interp_cfg, dict):
+            return normalized
+
+        for target, policy in interp_cfg.items():
+            if isinstance(policy, str):
+                normalized[target] = {'__all__': policy.lower() == 'linear'}
+            elif isinstance(policy, dict):
+                target_policy = {}
+                for plane, mode in policy.items():
+                    target_policy[str(plane).lower()] = str(mode).lower() == 'linear'
+                if target_policy:
+                    normalized[target] = target_policy
+        return normalized
 
     def set_targets_and_data(self, targets_dict, data_dict):
         """
@@ -376,22 +799,23 @@ class ConfigManager:
         if self.verbose and self.auxiliary_tasks:
             print(f"Applied {len(self.auxiliary_tasks)} auxiliary tasks to targets")
 
-    def auto_detect_channels(self, dataset):
+    def auto_detect_channels(self, dataset=None, sample=None):
         """
         Automatically detect the number of output channels for each target from the dataset.
-        
+
         Parameters
         ----------
         dataset : BaseDataset
             The dataset to inspect for channel information
+        sample : dict, optional
+            Precomputed dataset sample. When provided, the dataset argument is optional.
         """
-        if not dataset or len(dataset) == 0:
-            print("Warning: Empty dataset, cannot auto-detect channels")
-            return
-            
-        # Get a sample batch to inspect
-        sample = dataset[0]
-        
+        if sample is None:
+            if dataset is None or len(dataset) == 0:
+                print("Warning: Empty dataset, cannot auto-detect channels")
+                return
+            sample = dataset[0]
+
         # Update targets with detected channels
         targets_updated = False
         for target_name in self.targets:

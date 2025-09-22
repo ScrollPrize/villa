@@ -23,26 +23,29 @@ Note that significant portions of this pipeline were borrowed/inspired by [dynam
 
 ## 1. Entry Point: Training Script Initialization
 
-### 1.1 Command Line Entry (`train.py`)
-The training process begins when the user executes the training script:
+### 1.1 Command Line Entry (`vesuvius.train`)
+Invoke the trainer through the bundled console script:
 
 ```bash
-python train.py -i /path/to/data -o /path/to/checkpoints 
+vesuvius.train --config path/to/config.yaml --input /path/to/data --output ./checkpoints
 ```
+
+When running directly from the repository, use `python -m vesuvius.models.training.train` with the same flags.
 
 ### 1.2 Argument Processing
 - **Required arguments**:
-  - `-i/--input`: Data directory containing `images/`, `labels/`, and optionally `masks/` subdirectories
-  - `-o/--output`: Output directory for checkpoints and configurations
-  - `--format`: Data format (zarr, tif, or napari)
-  
-- **Optional arguments**:
-  - `--batch-size`: Training batch size
-  - `--patch-size`: Patch dimensions (e.g., "192,192,192" for 3D)
-  - `--loss`: Loss functions as list or comma-separated
-  - `--train-split`: Training/validation split ratio
-  - `--loss-on-label-only`: Compute loss only on labeled regions
-  - `--config-path`: Path to YAML configuration file
+  - `--config` / `--config-path`: Training YAML containing `tr_setup`, `tr_config`, and `dataset_config`.
+  - `-i/--input`: Dataset root with `images/` and `labels/` subdirectories (or an active napari session when `--format napari`).
+
+- **Common optional arguments** (see `vesuvius.train --help` for the full list):
+  - `-o/--output`: Directory for checkpoints and configs (defaults to `./checkpoints`).
+  - `--format`: Override automatic detection (`image`, `zarr`, or `napari`).
+  - `--val-dir`: Separate validation dataset mirroring the training layout.
+  - `--batch-size`, `--patch-size`, `--loss`: Override values from the YAML.
+  - `--train-split`: Split ratio when a dedicated validation set is not provided.
+  - `--skip-intensity-sampling` / `--no-skip-intensity-sampling`: Control per-dataset intensity statistics.
+  - `--gpus`, `--ddp`, `--nproc-per-node`: Distributed training controls.
+  - `--wandb-project`, `--wandb-entity`, `--verbose`: Logging and diagnostics.
 
 ## 2. Configuration Management
 
@@ -198,9 +201,6 @@ data_path/
 │   ├── image1_ink.zarr/  # Target-specific labels
 │   ├── image1_damage.zarr/
 │   └── ...
-└── masks/                # Optional
-    ├── image1_ink.zarr/  # Regions where loss is computed
-    └── ...
 ```
 
 ### 4.3 Dataset Processing Flow
@@ -211,27 +211,99 @@ data_path/
    - Validates all configured targets have data
 
 2. **Valid Patch Extraction** (`_get_valid_patches`):
-   - Finds regions with sufficient labeled data
-   - Uses masks if available, otherwise uses labels
-   - Filters by `min_labeled_ratio` parameter
-   - Stores patch coordinates for training
+   - Finds regions with sufficient labeled voxels in each target
+   - Filters by `min_labeled_ratio` and `min_bbox_percent`
+   - Stores patch coordinates for training and validation loaders
 
 3. **Patch Retrieval** (`__getitem__`):
    - Get patch coordinates from valid_patches list
    - Extract image patch and normalize to [0,1]
    - Extract label patches for all targets
-   - Extract loss mask if available
+   - Derive auxiliary tensors (distance transforms, normals, etc.) when requested
    - Apply augmentations (2D: albumentations, 3D: custom)
    - Convert to PyTorch tensors with proper dimensions
    - Return dictionary: {"image": tensor, "target1": tensor, ...}
 
 ### 4.4 Data Augmentation
 - **2D Data**: Uses albumentations library
-  - Synchronized transforms for image and all label masks
+  - Synchronized transforms for the image and every target label volume
   - Configured in `compose_augmentations` function
   
 - **3D Data**: Custom volume transformations
   - Currently limited to image-only transforms
+
+### 4.5 Slice Sampling Mode (2D slices from 3D volumes)
+
+Set `dataset_config.slice_sampling.enabled: true` when you want to train a 2D network while keeping your input volumes in their native 3D format. The dataset will draw orthogonal planes on-the-fly, producing `[C, H, W]` tensors that can be fed directly into a 2D model.
+
+Key options (all live under `dataset_config.slice_sampling`):
+
+- `enabled`: Turn the mode on. When `true`, the trainer forces 2D ops and disables cached patch indices.
+- `sample_planes`: Which axes to sample from. Accepts:
+  - A list (`["z", "y", "x"]`) or comma-separated string (`"z,y,x"`).
+  - A mapping of plane → weight (`{z: 2, y: 1, x: 1}`) if you want to specify weights inline.
+- `sample_rates` (optional): Relative sampling weights per plane when `sample_planes` is a list/string. Provide a dict (`{z: 2, y: 1}`), list (`[2, 1, 1]`), or comma-separated string (`"2,1,1"`). Probabilities are normalised internally so the actual volume of available patches does not affect plane frequency.
+- `plane_patch_sizes` (optional): Override the 2D patch size per plane, e.g. `plane_patch_sizes: {y: [64, 256]}` for `(depth, width)` slices. When omitted, the trainer derives sizes from the original 3D patch (z, y, x → [y, x], [z, x], [z, y]).
+- `random_rotations` (optional): Enable oblique slicing. Set to a list (`["x","y"]`), boolean (`true` for all planes), or mapping with per-plane limits. Example:
+
+```yaml
+slice_sampling:
+  random_rotations:
+    x: 360      # degrees of freedom around the volume centre (x-plane becomes arbitrary vertical slices)
+    y:
+      max_degrees: 180
+      probability: 0.35   # apply a rotation ~35% of the time for y-planes
+```
+
+When enabled for `x` or `y`, each sampled patch draws a fresh rotation angle (uniform in ±`max_degrees`/2) and interpolates the image volume along that plane (labels use nearest-neighbour sampling). This keeps z-planes axis-aligned but lets the vertical planes sweep diagonally through the scroll while staying centred on the same voxel window.
+- `random_tilts` (optional): Tilt planes around the global axes to produce fully oblique slices (e.g., tilt a `z` plane in `x` and `y`). Provide per-plane dictionaries of axis → degrees. Example:
+
+```yaml
+slice_sampling:
+  random_tilts:
+    z:
+      x: 25
+      y: 25
+      probability: 0.5    # only tilt the z plane for half the samples
+    y:
+      x: 15               # lean y-planes by up to ±15° around the x-axis
+```
+
+Tilt and rotation angles combine (internally using `grid_sample`), so you can mix yaw + pitch to sample arbitrary planes that still pass through the same patch centre.
+- `label_interpolation` (optional): For specific targets, request linear interpolation (matching the image) when sampling oblique slices, then rebinarise with a 0.5 threshold. Accepts per-target values (`linear`/`nearest`) or per-target/per-plane maps:
+
+```yaml
+slice_sampling:
+  label_interpolation:
+    surface: linear           # apply to all planes
+    surface_aux:
+      x: linear               # only x-planes get linear/binarised
+      y: nearest
+```
+
+- `save_plane_masks` (optional, default `false`): When set, the dataset emits a binary mask describing the sampled plane. Useful for debugging—see the sampler script's `--save-masks` flag.
+- `plane_mask_mode` (optional, default `plane`): Controls the shape of the emitted mask when `save_plane_masks` is enabled. Use `plane` (the default) for a 2D mask matching the slice patch size, or `volume` to pad/crop masks to the largest source volume when you need full-volume context.
+
+Example snippet:
+
+```yaml
+dataset_config:
+  patch_size: [64, 256, 256]   # original 3D dimensions (z, y, x)
+  slice_sampling:
+    enabled: true
+    sample_planes:
+      z: 2        # sample z-plane slices twice as often
+      y: 1
+    plane_patch_sizes:
+      y: [64, 256]  # (depth, width) for y-planes
+```
+
+Additional behaviour:
+
+- Patch validation works per plane. A slice is considered valid when the 2D window meets `min_bbox_percent` and `min_labeled_ratio` thresholds using the projected labels.
+- When sampling weights are provided the dataloader uses a `WeightedRandomSampler` (single-GPU training) so each epoch reflects the requested plane ratios. In distributed runs the sampler falls back to uniform subset sampling per worker.
+- Patch caches are skipped in this mode because additional metadata (plane, slice index) is required for reconstruction.
+- The dataset marks slice origin (`plane`, `slice_index`, `patch_size`) in `valid_patches`, and these fields propagate to train/val split summaries.
 
 ## 5. Training Loop
 
@@ -364,8 +436,8 @@ This design allows mixing fully supervised targets with auxiliary/self-supervise
 
 ### 5.3 Checkpoint Management
 - Saves model weights, optimizer state, and configuration
-- Keeps last 10 checkpoints
-- Maintains single latest configuration file
+- Keeps the three most recent checkpoints plus the two best validation checkpoints
+- Maintains the latest configuration file per run
 - Model-specific directory: `checkpoints/model_name/`
 
 ## 6. Key Features and Design Patterns
@@ -378,7 +450,7 @@ This design allows mixing fully supervised targets with auxiliary/self-supervise
 ### 6.2 Flexible Data Handling
 - Supports 2D and 3D data
 - Multiple data formats (Zarr, TIFF, Napari)
-- Optional masking for sparse labels
+- Semi-supervised workflows via `allow_unlabeled_data`
 
 ### 6.3 Configuration-Driven Design
 - YAML-based configuration
@@ -395,7 +467,7 @@ The training process produces several types of outputs:
 **1. Model Checkpoints** (`model_name_epoch.pth`)
    - Complete training state for resuming
    - Saved after each epoch
-   - Automatic cleanup keeps only the 10 most recent checkpoints
+   - Automatic cleanup retains three recent checkpoints and the two best by validation loss
    - Location: `checkpoints/model_name/`
 
 **2. Configuration Files** (`model_name_config.yaml`)

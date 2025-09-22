@@ -1,254 +1,158 @@
+# Accessing Vesuvius Data
 
-## Usage
+This guide shows how to discover the datasets bundled with the Vesuvius package and how to load them through the Python APIs.
 
-The library can be imported in Python:
+## Importing the Package
+
 ```python
 import vesuvius
 ```
 
-### Listing
+Accept the data sharing terms before trying to access remote assets:
 
-#### Listing files
-To list the available files in the remote repository, use the following code:
+```bash
+vesuvius.accept_terms --yes
+```
+
+## Listing Available Scrolls and Segments
+
+Call `vesuvius.list_files()` to read the packaged `scrolls.yaml` file. The dictionary mirrors the YAML structure: scroll → energy → resolution with entries for the canonical `volume` and any published `segments`.
 
 ```python
 from vesuvius import list_files
 
-files = list_files()
+scans = list_files()
 ```
 
-The output of `list_files` is a dictionary that contains the paths to all the scroll volumes and segment surface volumes available in the data repository. The dictionary structure is as follows:
+Example layout (edited for brevity):
 
-- The top-level keys are `scroll_id`.
-- Under each `scroll_id`, there are keys for different `energy` levels.
-- Under each `energy`, there are keys for different `resolution` levels.
-- Under each `resolution`, there are keys for either `segments` or `volume`.
-
-`segments` can contain `segment_id`s.
-
-Here is a visual representation of what the dictionary can look like:
-
-```plaintext
-{
-  'scroll_id1': {
-    'energy1': {
-      'resolution1': {
-        'segments': {
-          'segment_id1': 'path/to/segment_id1',
-          'segment_id2': 'path/to/segment_id2'
-        },
-        'volume': 'path/to/volumes'
-      },
-      'resolution2': {
-        'segments': {
-          'segment_id1': 'path/to/segment_id1',
-          'segment_id2': 'path/to/segment_id2'
-        },
-        'volume': 'path/to/volumes'
-      }
-    },
-    'energy2': {
-      'resolution1': {
-        'segments': {
-          'segment_id1': 'path/to/segment_id1',
-          'segment_id2': 'path/to/segment_id2'
-        },
-        'volume': 'path/to/volume'
-      },
-    }
-  },
-  'scroll_id2': {
-    'energy1': {
-      'resolution1': {
-        'segments': {
-          'segment_id1': 'path/to/segment_id1',
-          'segment_id2': 'path/to/segment_id2'
-        },
-        'volume': 'path/to/volumes'
-      },
-    }
-  }
-}
-```
-
-This structure allows you to access specific paths based on the `scroll_id`, `energy`, `resolution`, and `segment_id` of the data you are interested in. This function is automatically executed when the library is imported to constantly keep the list of available files updated.
-
-#### Listing cubes
-To list the available instance annotated volumetric cubes:
 ```python
-from vesuvius import cubes
-
-available_cubes = cubes()
-```
-
-Similarly to `list_files` the output of `cubes` is a dictionary:
-```plaintext
 {
-  'scroll_id1': {
-    'energy1': {
-      'resolution1': {
-        'z1_y1_x1': 'path/to/z1_y1_x1',
-        'z2_y2_x2': 'path/to/z2_y2_x2'
+    "1": {
+        "54": {
+            "7.91": {
+                "volume": "https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumes_zarr_standardized/54keV_7.91um_Scroll1A.zarr/",
+                "segments": {
+                    "20230827161847": "https://dl.ash2txt.org/other/dev/scrolls/1/segments/54keV_7.91um/20230827161847.zarr/"
+                }
+            }
         }
-      }
+    },
+    "5": {
+        "53": {
+            "7.91": {
+                "volume": "https://dl.ash2txt.org/full-scrolls/Scroll5/PHerc172.volpkg/volumes_zarr/20241024131838.zarr/"
+            }
+        }
     }
 }
 ```
-`z_y_x` are the coordinates in the relative scroll volume of the origin of the reference frame of the selected cube.
 
-### Importing and using `Volume`
-The `Volume` class is used for accessing volumetric data, both for scrolls and surface volume of segments.
+To refresh the YAML files against the public repository, run:
 
-#### Example usage
 ```python
-from vesuvius import Volume
-# Basic usage
-scroll = Volume(type="Scroll1") # this is going to access directly the canonical scroll 1 volume
+from vesuvius.utils import update_list
 
-# Basic usage specifying scan metadata
-scroll = Volume(type="scroll", scroll_id=1, energy=54, resolution=7.91) # if you want to access a non canonical volume, you have to specify the scan metadata
-
-# With cache (works only with remote repository)
-scroll = Volume(type="scroll", scroll_id=1, energy=54, resolution=7.91, cache=True)
-
-# Deactivate/activate caching (works only with remote repository)
-scroll.activate_caching() # Don't need to do this if loaded the volume with cache=True
-scroll.deactivate_caching()
-
-# With normalization
-scroll = Volume(type="scroll", scroll_id=1, energy=54, resolution=7.91, normalize=True)
-
-# Visualize which subvolumes are available
-scroll.meta()
-
-# To print meta at initialization, use the argument verbose=True
-scroll = Volume(type="Scroll1", verbose=True)
-
-# To access shapes of multiresolution arrays
-subvolume_index = 3  # third subvolume
-shape = scroll.shape(subvolume_index)
-
-# To access dtype
-dtype = scroll.dtype
-
-# Access data using indexing
-data = scroll[:, :, :, subvolume_index]  # Access the entire third subvolume
-
-# When only three or less indices are specified, you are automatically accessing to the main subvolume (subvolume_index = 0)
-
-data = scroll[15] # equal to scroll[15,:,:,0]
-data = scroll[15,12] # equal to scroll [15,12,:,0]
-
-# Slicing is also permitted for the first three indices
-data = scroll[20:300,12:18,20:40,2]
-
-```
-#### With local files
-If you fully downloaded a scroll volume, or a segment, you can directly specify its local path on your device:
-```python
-scroll = Volume(type="scroll", scroll_id=1, energy=54, resolution=7.91, domain="local", path="/path/to/54keV_7.91um.zarr")
-```
-
-#### Segments
-You can access segments in a similar fashion:
-```python
-from vesuvius import Volume
-# Basic usage
-segment = Volume("20230827161847") # access a segment specifying is unique timestamp
-
-# Basic usage specifying scan metadata
-segment = Volume(type="segment", scroll_id=1, energy=54, resolution=7.91, segment_id=20230827161847)
-
-```
-#### Constructor
-```python
-Volume(
-    type: Union[str, int],
-    scroll_id: Optional[int] = None,
-    energy: Optional[int] = None,
-    resolution: Optional[float] = None,
-    segment_id: Optional[int] = None,
-    cache: bool = True,
-    cache_pool: int = 1e10,
-    normalize: bool = False,
-    verbose: bool = True,
-    domain: str = "dl.ash2txt",
-    path: Optional[str] = None
+update_list(
+    "https://dl.ash2txt.org/other/dev/",
+    "https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumetric-instance-labels/instance-labels/"
 )
 ```
-- **type**: Type of volume, either 'scroll', 'scroll#' or 'segment'.
-- **scroll_id**: Identifier for the scroll.
-- **energy**: Energy level.
-- **resolution**: Resolution level.
-- **segment_id**: Identifier for the segment.
-- **cache**: Enable caching.
-- **cache_pool**: Cache pool size in bytes.
-- **normalize**: Normalize the data.
-- **verbose**: Enable verbose output.
-- **domain**: Domain, either 'dl.ash2txt' or 'local'.
-- **path**: Path to the local data.
 
-#### Methods
-- **activate_caching()**: Activates caching.
-- **deactivate_caching()**: Deactivates caching.
-- **shape(subvolume_idx: int = 0)**: Returns the shape of the specified subvolume.
+## Listing Annotated Cubes
 
-### Importing and using `Cube`
-The `Cube` class is used for accessing segmented cube data.
+`vesuvius.list_cubes()` reads `cubes.yaml` and returns the available instance-annotated cubes:
 
-#### Example usage
 ```python
-from vesuvius import Cube
+from vesuvius import list_cubes
 
-# Basic usage
-cube = Cube(scroll_id=1, energy=54, resolution=7.91, z=2256, y=2512, x=4816, cache=True, cache_dir='/path/to/cache')  # with caching
-
-# if caching=True but cache_dir is not selected, the instances will be automatically saved in $HOME / vesuvius / annotated-instances
-
-cube = Cube(scroll_id=1, energy=54, resolution=7.91, z=2256, y=2512, x=4816, cache=False)  # without caching
-
-# With normalization
-cube = Cube(scroll_id=1, energy=54, resolution=7.91, z=2256, y=2512, x=4816, normalize=True)
-
-# Deactivate/activate caching
-cube.activate_caching(cache_dir=None)  # or define your own cache_dir
-cube.deactivate_caching()
-
-# To access the volume and the masks
-volume, mask = cube[:, :, :]  # also works with slicing
+cubes = list_cubes()
 ```
 
-#### Constructor
+The dictionary is keyed by scroll → energy → resolution → cube coordinates. Each cube entry points to the base URL that hosts the corresponding NRRD pair.
+
+## Working with `Volume`
+
+`Volume` wraps multiresolution scroll volumes or segment surfaces. It can open remote assets described in the YAML files or a local Zarr store.
+
 ```python
-Cube(
-    scroll_id: int,
-    energy: int,
-    resolution: float,
-    z: int,
-    y: int,
-    x: int,
-    cache: bool = True,
-    cache_dir: Optional[os.PathLike] = None,
-    normalize: bool = False
+from vesuvius import Volume
+
+# Canonical Scroll 1 (energy/resolution inferred from defaults)
+scroll = Volume("Scroll1")
+
+# Explicit metadata for a scroll volume
+scroll = Volume(type="scroll", scroll_id=1, energy=54, resolution=7.91, normalization_scheme="instance_zscore")
+
+# Segment volumes can be resolved from their timestamp
+segment = Volume(type="segment", segment_id=20230827161847)
+
+# Load a local OME-Zarr directly
+local = Volume(type="zarr", path="/data/Scroll1.zarr", normalization_scheme="instance_minmax")
+
+# Return PyTorch tensors with a specific dtype
+tensor_volume = Volume(
+    type="scroll",
+    scroll_id=5,
+    energy=53,
+    resolution=7.91,
+    return_as_tensor=True,
+    return_as_type="np.float32"
 )
 ```
-- **scroll_id**: Identifier for the scroll.
-- **energy**: Energy level.
-- **resolution**: Resolution level.
-- **z**: Z-coordinate.
-- **y**: Y-coordinate.
-- **x**: X-coordinate.
-- **cache**: Enable caching.
-- **cache_dir**: Directory for cache.
-- **normalize**: Normalize the data.
 
-#### Methods
-- **load_data()**: Loads data.
-- **activate_caching()**: Activates caching.
-- **deactivate_caching()**: Deactivates caching.
+### Key Constructor Arguments
 
-## Additional notes
-- **Terms acceptance**: Ensure that the terms are accepted before using the library.
-- **Caching**: Caching is only supported with the remote repository.
-- **Normalization**: The `normalize` parameter normalizes the data to the maximum value of the dtype.
-- **Local files**: For local files, provide the appropriate path in the `Volume` constructor.
+- `type`: `'scroll'`, `'segment'`, `'zarr'`, a canonical label such as `'Scroll1'`, or a segment timestamp.
+- `scroll_id`, `energy`, `resolution`: optional overrides when the type does not embed them.
+- `segment_id`: integer timestamp for segment volumes.
+- `path`: local or remote URI for direct Zarr access (required when `type='zarr'`).
+- `normalization_scheme`: `'none'` (default), `'instance_zscore'`, `'global_zscore'`, `'instance_minmax'`, or `'ct'`.
+- `global_mean`/`global_std` or `intensity_props`: required when using `global_zscore` or `ct` normalization.
+- `return_as_type`: numpy dtype string such as `'np.uint16'` or `'np.float32'`.
+- `return_as_tensor`: return PyTorch tensors instead of NumPy arrays.
+- `download_only`: download metadata (and ink labels for segments) without opening the full volume.
+- `verbose`: print detailed diagnostics during initialization and reads.
+
+### Inspecting Metadata and Data
+
+```python
+scroll.meta()              # Human-readable summary
+shape_l0 = scroll.shape()  # Shape of resolution level 0
+subshape = scroll.shape(1) # Shape of a downsampled level
+print(scroll.dtype)        # Original dtype
+slice_zyx = scroll[20:200, 10:40, 50:90, 0]  # (z, y, x, level)
+```
+
+If the store is a single-resolution Zarr array, omit the level index (`scroll[20, 10, 50]`). When requesting tensors, the same indexing syntax applies and returns `torch.Tensor` objects.
+
+### Segment Ink Labels
+
+For segments, `Volume` automatically attempts to download the companion PNG ink label. The array is available as `segment.inklabel`. Supply `download_only=True` to fetch the metadata and ink label without loading the voxels.
+
+## Working with `Cube`
+
+`Cube` loads instance-annotated NRRD cubes that pair a mask with the matching sub-volume.
+
+```python
+from vesuvius.data.volume import Cube
+
+cube = Cube(scroll_id=1, energy=54, resolution=7.91, z=2256, y=2512, x=4816, cache=True)
+volume_patch, mask_patch = cube[10, :, :]
+```
+
+Constructor arguments:
+
+- `scroll_id`, `energy`, `resolution`: identify the parent scan.
+- `z`, `y`, `x`: starting coordinates encoded in the cube folder name.
+- `cache`: cache downloads locally (default `False`).
+- `cache_dir`: override the cache directory when caching is enabled.
+- `normalize`: divide voxel intensities by the dtype max.
+
+`Cube.activate_caching(cache_dir=None)` enables caching after construction, while `Cube.deactivate_caching()` disables it.
+
+## Additional Notes
+
+- Remote access requires the packaged configuration files, installed under `vesuvius/install/configs/`.
+- The package never auto-refreshes the YAML files at import time; call `update_list` when you need the newest inventory.
+- For authenticated endpoints (for example, private S3 buckets), ensure your environment provides valid credentials that `fsspec` can read.
