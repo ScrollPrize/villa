@@ -1069,7 +1069,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         if (trace_params.point_correction.isValid()) {
             find_and_reset_downstream_points(trace_params, state, locs, generations, bounds, T);
             cv::Vec2i corr_center_i = { (int)std::round(trace_params.point_correction.grid_locs()[0][1]), (int)std::round(trace_params.point_correction.grid_locs()[0][0]) };
-            local_optimization(32, corr_center_i, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
+            local_optimization(16, corr_center_i, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
 
             if (!intermediate_path_dir.empty()) {
                 cv::Rect used_area_safe = used_area;
