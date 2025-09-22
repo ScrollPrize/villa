@@ -25,6 +25,15 @@
 
 namespace { // Anonymous namespace for local helpers
 
+struct Vec2iLess {
+    bool operator()(const cv::Vec2i& a, const cv::Vec2i& b) const {
+        if (a[0] != b[0]) {
+            return a[0] < b[0];
+        }
+        return a[1] < b[1];
+    }
+};
+
 class PointCorrection {
 public:
     PointCorrection() = default;
@@ -106,51 +115,74 @@ struct TraceParameters {
     PointCorrection point_correction;
 };
 
-static void reset_downstream_points(const cv::Vec2f& corr_loc,
-                                  cv::Mat_<uint8_t>& state,
-                                  cv::Mat_<cv::Vec3d>& locs,
-                                  cv::Mat_<uint16_t>& generations,
-                                  const cv::Rect& bounds)
+static void reset_downstream_points_multi(const std::vector<cv::Vec2f>& seed_locs,
+                                          const std::vector<cv::Vec2f>& all_tgt_locs,
+                                          cv::Mat_<uint8_t>& state,
+                                          cv::Mat_<cv::Vec3d>& locs,
+                                          cv::Mat_<uint16_t>& generations,
+                                          const cv::Rect& bounds)
 {
     std::queue<cv::Vec2i> q;
     cv::Mat_<bool> visited(state.size(), false);
     std::vector<cv::Vec2i> neighs = {{1,0},{0,1},{-1,0},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};
 
-    // Find max generation from the four corners around the float correction point
-    uint16_t max_gen = 0;
-    cv::Vec2i top_left(std::floor(corr_loc[1]), std::floor(corr_loc[0]));
-
-    for (int dy = 0; dy <= 1; ++dy) {
-        for (int dx = 0; dx <= 1; ++dx) {
-            cv::Vec2i p = top_left + cv::Vec2i(dy, dx);
-            if (bounds.contains(cv::Point(p[1], p[0]))) {
-                max_gen = std::max(max_gen, generations(p));
-                q.push(p);
-                visited(p) = true;
+    std::set<cv::Vec2i, Vec2iLess> keep_points;
+    for (const auto& corr_loc : all_tgt_locs) {
+        cv::Vec2i top_left(std::floor(corr_loc[1]), std::floor(corr_loc[0]));
+        for (int dy = 0; dy <= 1; ++dy) {
+            for (int dx = 0; dx <= 1; ++dx) {
+                keep_points.insert(top_left + cv::Vec2i(dy, dx));
             }
         }
     }
 
-    for (int dy = -1; dy <= 2; ++dy) {
-        for (int dx = -1; dx <= 2; ++dx) {
-            cv::Vec2i p = top_left + cv::Vec2i(dy, dx);
-            if (bounds.contains(cv::Point(p[1], p[0])))
-                q.push(p);
+    std::vector<uint16_t> seed_max_gens;
+    for (const auto& corr_loc : seed_locs) {
+        uint16_t max_gen = 0;
+        cv::Vec2i top_left(std::floor(corr_loc[1]), std::floor(corr_loc[0]));
+        for (int dy = 0; dy <= 1; ++dy) {
+            for (int dx = 0; dx <= 1; ++dx) {
+                cv::Vec2i p = top_left + cv::Vec2i(dy, dx);
+                if (bounds.contains(cv::Point(p[1], p[0]))) {
+                    max_gen = std::max(max_gen, generations(p));
+                }
+            }
+        }
+        seed_max_gens.push_back(max_gen);
+
+        for (int dy = -1; dy <= 2; ++dy) {
+            for (int dx = -1; dx <= 2; ++dx) {
+                cv::Vec2i p = top_left + cv::Vec2i(dy, dx);
+                if (bounds.contains(cv::Point(p[1], p[0]))) {
+                    q.push(p);
+                    visited(p) = true;
+                }
+            }
         }
     }
+
 
     std::vector<cv::Vec2i> points_to_reset;
 
     while (!q.empty()) {
         cv::Vec2i p = q.front();
         q.pop();
-        uint16_t current_gen = std::max(generations(p), max_gen);
+
+        uint16_t max_gen_for_p = 0;
+        for(size_t i = 0; i < seed_locs.size(); ++i) {
+            float dist_sq = cv::norm(cv::Vec2f(p) - seed_locs[i]);
+            if (dist_sq < 100*100) { // Heuristic to associate point with nearby seeds
+                 max_gen_for_p = std::max(max_gen_for_p, seed_max_gens[i]);
+            }
+        }
+        if (max_gen_for_p == 0) max_gen_for_p = generations(p);
+
 
         for (const auto& n : neighs) {
             cv::Vec2i next_p = p + n;
             if (bounds.contains(cv::Point(next_p[1], next_p[0])) && !visited(next_p) && (state(next_p) & STATE_LOC_VALID)) {
                 visited(next_p) = true;
-                if (generations(next_p) > current_gen) {
+                if (generations(next_p) > max_gen_for_p && keep_points.find(next_p) == keep_points.end()) {
                     points_to_reset.push_back(next_p);
                     q.push(next_p);
                 }
@@ -162,6 +194,41 @@ static void reset_downstream_points(const cv::Vec2f& corr_loc,
         state(p) = 0;
         locs(p) = cv::Vec3d(-1,-1,-1);
         generations(p) = 0;
+    }
+}
+
+
+static void find_and_reset_downstream_points(const TraceParameters& trace_params,
+                                             cv::Mat_<uint8_t>& state,
+                                             cv::Mat_<cv::Vec3d>& locs,
+                                             cv::Mat_<uint16_t>& generations,
+                                             const cv::Rect& bounds,
+                                             float step_size)
+{
+    if (!trace_params.point_correction.isValid()) return;
+
+    const auto& tgts = trace_params.point_correction.tgts();
+    const auto& tgt_locs = trace_params.point_correction.grid_locs();
+    std::vector<cv::Vec2f> seed_locs;
+
+    for(size_t i = 0; i < tgts.size(); ++i) {
+        const auto& tgt_loc = tgt_locs[i];
+        cv::Vec2i int_loc(std::round(tgt_loc[1]), std::round(tgt_loc[0]));
+
+        if (bounds.contains(cv::Point(int_loc[1], int_loc[0]))) {
+            const cv::Vec3d& surface_point = locs(int_loc);
+            if (surface_point[0] != -1) {
+                float dist = cv::norm(cv::Vec3f(surface_point) - tgts[i]);
+                if (dist > 4.0) {
+                    seed_locs.push_back(tgt_loc);
+                }
+            }
+        }
+    }
+
+    if (!seed_locs.empty()) {
+        std::cout << "reset from seeds: " << seed_locs.size() << std::endl;
+        reset_downstream_points_multi(seed_locs, tgt_locs, state, locs, generations, bounds);
     }
 }
 
@@ -1000,10 +1067,9 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         }
 
         if (trace_params.point_correction.isValid()) {
+            find_and_reset_downstream_points(trace_params, state, locs, generations, bounds, T);
             cv::Vec2i corr_center_i = { (int)std::round(trace_params.point_correction.grid_locs()[0][1]), (int)std::round(trace_params.point_correction.grid_locs()[0][0]) };
             local_optimization(32, corr_center_i, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
-
-            // reset_downstream_points(trace_params.point_correction.grid_locs()[0], state, locs, generations, bounds);
 
             if (!intermediate_path_dir.empty()) {
                 cv::Rect used_area_safe = used_area;

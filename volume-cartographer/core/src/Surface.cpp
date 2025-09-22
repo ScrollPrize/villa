@@ -701,11 +701,40 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
         min_dist = 10*(_points->cols/_scale[0]+_points->rows/_scale[1]);
 
     int r_full = 0;
+    int skip_count = 0;
     for(int r=0; r<10*max_iters && r_full<max_iters; r++) {
         loc = {1 + (rand() % (_points->cols-3)), 1 + (rand() % (_points->rows-3))};
 
-        if ((*_points)(loc[1],loc[0])[0] == -1)
-            continue;
+        if ((*_points)(loc[1],loc[0])[0] == -1) {
+            skip_count++;
+            if (skip_count > max_iters / 10) {
+                cv::Vec2f dir = { (float)(rand() % 3 - 1), (float)(rand() % 3 - 1) };
+                if (dir[0] == 0 && dir[1] == 0) dir = {1, 0};
+
+                cv::Vec2f current_pos = loc;
+                bool first_valid_found = false;
+                for (int i = 0; i < std::max(_points->cols, _points->rows); ++i) {
+                    current_pos += dir;
+                    if (current_pos[0] < 1 || current_pos[0] >= _points->cols - 1 ||
+                        current_pos[1] < 1 || current_pos[1] >= _points->rows - 1) {
+                        break; // Reached border
+                    }
+
+                    if ((*_points)((int)current_pos[1], (int)current_pos[0])[0] != -1) {
+                        if (first_valid_found) {
+                            loc = current_pos;
+                            break; // Found second consecutive valid point
+                        }
+                        first_valid_found = true;
+                    } else {
+                        first_valid_found = false;
+                    }
+                }
+                if ((*_points)(loc[1],loc[0])[0] == -1) continue; // if we didn't find a valid point
+            } else {
+                continue;
+            }
+        }
 
         r_full++;
 

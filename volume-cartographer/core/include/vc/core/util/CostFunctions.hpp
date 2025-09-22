@@ -1092,7 +1092,7 @@ private:
         T dx_abs = p_interp[0] - T(tgt[0]);
         T dy_abs = p_interp[1] - T(tgt[1]);
         T dz_abs = p_interp[2] - T(tgt[2]);
-        T residual = T(4)*ceres::sqrt(dx_abs * dx_abs + dy_abs * dy_abs + dz_abs * dz_abs);
+        T residual = ceres::sqrt(dx_abs * dx_abs + dy_abs * dy_abs + dz_abs * dz_abs);
         if (dbg_) {
             std::cout << "Point " << point_idx << " | 3D dist: " << val(residual) << " | 2D loc: " << val(grid_loc[0]) << ", " << val(grid_loc[1]) << " | int_loc: " << grid_loc_int_[0] << ", " << grid_loc_int_[1] << std::endl;
         }
