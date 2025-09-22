@@ -119,8 +119,8 @@ def run_training(patch_size_z: int = 0, patch_size_x: int = 128, patch_size_y: i
         min_bbox_percent=0.90
     )
 
-    # Now that data_format is set to 'napari', the dataset will handle target detection
-    # The NapariDataset will extract images from the viewer and configure targets automatically
+    # Now that data_format is set to 'napari', the dataset orchestrator will handle target detection
+    # The napari adapter extracts images from the viewer and configures targets automatically
 
     # Check for proper naming convention
     valid_pairs = False

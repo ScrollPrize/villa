@@ -327,6 +327,30 @@ def _sample_foreground_from_zarr(img_zarr, lbl_zarr, num_samples: int, vol_idx: 
     return sampled
 
 
+def _fg_worker(args):
+    """Top-level worker for multiprocessing: must be picklable.
+
+    Parameters
+    ----------
+    args : tuple
+        (v_idx, img, lbl, ns)
+
+    Returns
+    -------
+    tuple
+        (v_idx, sampled_values_list)
+    """
+    v_idx, img, lbl, ns = args
+    try:
+        if hasattr(img, 'chunks') or hasattr(lbl, 'chunks'):
+            return v_idx, _sample_foreground_from_zarr(img, lbl, ns, v_idx)
+        else:
+            return v_idx, _sample_foreground_from_numpy(np.asarray(img), np.asarray(lbl), ns)
+    except Exception as e:
+        print(f"Warning: failed sampling foreground from volume {v_idx}: {e}")
+        return v_idx, []
+
+
 def compute_foreground_intensity_properties_parallel(target_volumes: Dict[str, List[Dict[str, Any]]],
                                                      sample_ratio: float = 0.01,
                                                      max_samples: int = 1000000) -> Dict[str, float]:
@@ -368,20 +392,13 @@ def compute_foreground_intensity_properties_parallel(target_volumes: Dict[str, L
 
     print(f"Sampling foreground intensities from {len(per_volume_tasks)} volumes ...")
     all_values = []
-    # Parallel over volumes
+    # Parallel over volumes (use top-level worker to avoid pickling issues)
     with Pool(min(len(per_volume_tasks), os.cpu_count() or 2)) as pool:
-        def _worker(args):
-            v_idx, img, lbl, ns = args
-            try:
-                if hasattr(img, 'chunks') or hasattr(lbl, 'chunks'):
-                    return v_idx, _sample_foreground_from_zarr(img, lbl, ns, v_idx)
-                else:
-                    return v_idx, _sample_foreground_from_numpy(np.asarray(img), np.asarray(lbl), ns)
-            except Exception as e:
-                print(f"Warning: failed sampling foreground from volume {v_idx}: {e}")
-                return v_idx, []
-
-        for v_idx, vals in tqdm(pool.imap_unordered(_worker, per_volume_tasks), total=len(per_volume_tasks), desc="Sampling fg"):
+        for v_idx, vals in tqdm(
+            pool.imap_unordered(_fg_worker, per_volume_tasks),
+            total=len(per_volume_tasks),
+            desc="Sampling fg"
+        ):
             all_values.extend(vals)
 
     if len(all_values) == 0:

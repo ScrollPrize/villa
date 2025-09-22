@@ -23,7 +23,7 @@ from vesuvius.models.training.lr_schedulers import get_scheduler, PolyLRSchedule
 from torch.utils.data import DataLoader, SubsetRandomSampler, Subset, WeightedRandomSampler
 from torch.utils.data.distributed import DistributedSampler
 from vesuvius.models.utils import InitWeights_He
-from vesuvius.models.datasets import NapariDataset, ImageDataset, ZarrDataset
+from vesuvius.models.datasets import DatasetOrchestrator
 from vesuvius.utils.plotting import save_debug
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 
@@ -42,7 +42,6 @@ from vesuvius.models.utilities.load_checkpoint import load_checkpoint
 from vesuvius.models.utilities.get_accelerator import get_accelerator
 from vesuvius.models.utilities.compute_gradient_norm import compute_gradient_norm
 from vesuvius.models.utilities.s3_utils import detect_s3_paths, setup_multiprocessing_for_s3
-from vesuvius.models.training.auxiliary_tasks import compute_auxiliary_loss
 from vesuvius.models.training.wandb_logging import save_train_val_filenames
 from vesuvius.models.utilities.cli_utils import update_config_from_args
 from vesuvius.models.configuration.config_utils import configure_targets
@@ -167,21 +166,75 @@ class BaseTrainer:
 
     # --- configure dataset --- #
     def _configure_dataset(self, is_training=True):
+        dataset = self._build_dataset_for_mgr(self.mgr, is_training=is_training)
+
         data_format = getattr(self.mgr, 'data_format', 'zarr').lower()
-
-        if data_format == 'napari':
-            dataset = NapariDataset(mgr=self.mgr, is_training=is_training)
-        elif data_format == 'image':
-            dataset = ImageDataset(mgr=self.mgr, is_training=is_training)
-        elif data_format == 'zarr':
-            dataset = ZarrDataset(mgr=self.mgr, is_training=is_training)
-        else:
-            raise ValueError(f"Unsupported data format: {data_format}. "
-                             f"Supported formats are: 'napari', 'image', 'zarr'")
-
         print(f"Using {data_format} dataset format ({'training' if is_training else 'validation'})")
 
         return dataset
+
+    def _build_dataset_for_mgr(self, mgr, *, is_training: bool) -> DatasetOrchestrator:
+        data_format = getattr(mgr, 'data_format', 'zarr').lower()
+
+        adapter_lookup = {
+            'napari': 'napari',
+            'image': 'image',
+            'zarr': 'zarr',
+        }
+
+        try:
+            adapter_name = adapter_lookup[data_format]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unsupported data format: {data_format}. Supported formats are: {sorted(adapter_lookup)}"
+            ) from exc
+
+        adapter_kwargs = {}
+        if adapter_name == 'napari' and hasattr(mgr, 'napari_viewer'):
+            adapter_kwargs['viewer'] = mgr.napari_viewer
+
+        return DatasetOrchestrator(
+            mgr=mgr,
+            adapter=adapter_name,
+            adapter_kwargs=adapter_kwargs,
+            is_training=is_training,
+        )
+
+    # --- hooks for subclasses --------------------------------------------------------------- #
+
+    def _prepare_sample(self, sample: dict, *, is_training: bool) -> dict:
+        """Allow subclasses to inject additional data into a single-sample dictionary."""
+        return sample
+
+    def _prepare_batch(self, batch: dict, *, is_training: bool) -> dict:
+        """Allow subclasses to inject additional data into a batch dictionary."""
+        return batch
+
+    def _should_include_target_in_loss(self, target_name: str) -> bool:
+        if target_name == 'is_unlabeled':
+            return False
+        if target_name.endswith('_skel'):
+            return False
+        return True
+
+    def _compute_loss_value(
+        self,
+        loss_fn,
+        prediction,
+        ground_truth,
+        *,
+        target_name: str,
+        targets_dict: dict,
+        outputs: dict,
+    ):
+        skeleton_data = targets_dict.get(f'{target_name}_skel')
+        base_loss = getattr(loss_fn, 'loss', loss_fn)
+        skeleton_losses = {'DC_SkelREC_and_CE_loss', 'SoftSkeletonRecallLoss'}
+
+        if skeleton_data is not None and base_loss.__class__.__name__ in skeleton_losses:
+            return loss_fn(prediction, ground_truth, skeleton_data)
+
+        return loss_fn(prediction, ground_truth)
 
     # --- losses ---- #
     def _build_loss(self):
@@ -479,7 +532,7 @@ class BaseTrainer:
             #     task_metrics.append(CriticalComponentsMetric())
 
             task_metrics.append(IOUDiceMetric(num_classes=num_classes))
-            task_metrics.append(SkeletonBranchPointsMetric(num_classes=num_classes))
+            # task_metrics.append(SkeletonBranchPointsMetric(num_classes=num_classes))
             # task_metrics.append(HausdorffDistanceMetric(num_classes=num_classes))
             metrics[task_name] = task_metrics
         
@@ -634,19 +687,17 @@ class BaseTrainer:
         return train_dataloader, val_dataloader, train_indices, val_indices
 
     def _initialize_training(self):
-        # Check for S3 paths and set up multiprocessing if needed
         if detect_s3_paths(self.mgr):
             print("\nDetected S3 paths in configuration")
             setup_multiprocessing_for_s3()
 
         # the is_training flag forces the dataset to perform augmentations
         # we put augmentations in the dataset class so we can use the __getitem__ method
-        # for free multi processing of augmentations 
+        # for free multi processing of augmentations , alternatively you can perform on-device within the train loop
         train_dataset = self._configure_dataset(is_training=True)
         # Keep a handle to the training dataset for on-device augmentation
         self._train_dataset = train_dataset
 
-        # Build validation dataset; support separate directory via mgr.val_data_path
         if hasattr(self.mgr, 'val_data_path') and self.mgr.val_data_path is not None:
             from copy import deepcopy
             from vesuvius.models.utilities.data_format_utils import detect_data_format as _detect_df
@@ -659,20 +710,19 @@ class BaseTrainer:
                 raise ValueError(f"Could not determine data format for validation directory: {val_mgr.data_path}")
             val_mgr.data_format = detected_val_fmt
 
-            if val_mgr.data_format == 'napari':
-                val_dataset = NapariDataset(mgr=val_mgr, is_training=False)
-            elif val_mgr.data_format == 'image':
-                val_dataset = ImageDataset(mgr=val_mgr, is_training=False)
-            elif val_mgr.data_format == 'zarr':
-                val_dataset = ZarrDataset(mgr=val_mgr, is_training=False)
-            else:
-                raise ValueError(f"Unsupported validation data format: {val_mgr.data_format}")
+            val_dataset = self._build_dataset_for_mgr(val_mgr, is_training=False)
             print(f"Using {val_mgr.data_format} dataset format (validation from --val-dir)")
         else:
-            val_dataset = self._configure_dataset(is_training=False)
+            # Reuse same source for validation without re-running expensive image checks
+            from copy import deepcopy
+            val_mgr = deepcopy(self.mgr)
+            setattr(val_mgr, 'skip_image_checks', True)
+
+            val_dataset = self._build_dataset_for_mgr(val_mgr, is_training=False)
         
 
-        self.mgr.auto_detect_channels(train_dataset)
+        autodetect_sample = self._prepare_sample(train_dataset[0], is_training=True) if len(train_dataset) > 0 else None
+        self.mgr.auto_detect_channels(dataset=train_dataset, sample=autodetect_sample)
         model = self._build_model()
 
         self._ds_scales = None
@@ -769,14 +819,11 @@ class BaseTrainer:
             import json
             import os
             from datetime import datetime
-            
-            # Save train/val splits to local file instead of wandb config
+
             train_val_splits = save_train_val_filenames(self, train_dataset, val_dataset, train_indices, val_indices)
-            
-            # Use checkpoint directory if provided, otherwise use current directory
+
             save_dir = ckpt_dir if ckpt_dir else os.getcwd()
-            
-            # Create a filename with timestamp
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             splits_filename = f"train_val_splits_{self.mgr.model_name}_{timestamp}.json"
             splits_filepath = os.path.join(save_dir, splits_filename)
@@ -786,9 +833,8 @@ class BaseTrainer:
                 json.dump(train_val_splits, f, indent=2)
             print(f"Saved train/val splits to: {splits_filepath}")
             
-            # Create wandb config without the large train_val_splits data
+
             mgr_config = self.mgr.convert_to_dict()
-            # Add a reference to the local file instead of the actual data
             mgr_config['train_val_splits_file'] = splits_filepath
             mgr_config['train_patch_count'] = len(train_indices)
             mgr_config['val_patch_count'] = len(val_indices)
@@ -858,6 +904,8 @@ class BaseTrainer:
         """Execute a single training step including gradient updates."""
         global_step = step
 
+        data_dict = self._prepare_batch(data_dict, is_training=True)
+
         if epoch == 0 and step == 0 and verbose:
             print("Items from the first batch -- Double check that your shapes and values are expected:")
             for item, val in data_dict.items():
@@ -875,7 +923,6 @@ class BaseTrainer:
             if tfm is None:
                 data_for_forward = data_dict
             else:
-                # Move tensors to device
                 dd = {}
                 for k, v in data_dict.items():
                     dd[k] = v.to(self.device) if isinstance(v, torch.Tensor) else v
@@ -915,45 +962,45 @@ class BaseTrainer:
         task_losses = {}
 
         for t_name, t_gt in targets_dict.items():
-            if t_name == 'skel' or t_name.endswith('_skel') or t_name == 'is_unlabeled':
-                continue  # Skip skeleton data and metadata as they're not predicted outputs
+            if not self._should_include_target_in_loss(t_name):
+                continue
+
             t_pred = outputs[t_name]
-            task_loss_fns = loss_fns[t_name]  # List of (loss_fn, weight) tuples
+            task_loss_fns = loss_fns[t_name]
             task_weight = self.mgr.targets[t_name].get("weight", 1.0)
 
-            # Initialize as tensor on same device/dtype to keep downstream ops consistent.
-            # If predictions are a list/tuple (e.g., deep supervision), use the first tensor.
             if isinstance(t_pred, (list, tuple)):
                 ref_tensor = t_pred[0]
             else:
                 ref_tensor = t_pred
+
             task_total_loss = torch.zeros((), device=ref_tensor.device, dtype=ref_tensor.dtype)
             for loss_fn, loss_weight in task_loss_fns:
-                # this naming is extremely confusing, i know. we route all loss through the aux helper
-                # because it just simplifies adding addtl losses for aux tasks if present.
-                # TODO: rework this janky setup to make it more clear
-                skeleton_data = targets_dict.get(f'{t_name}_skel', None)
-                # If DS is enabled and loss isn't wrapped (edge case), fall back to highest-res
                 pred_for_loss, gt_for_loss = t_pred, t_gt
                 if isinstance(t_pred, (list, tuple)) and not isinstance(loss_fn, DeepSupervisionWrapper):
                     pred_for_loss = t_pred[0]
                     if isinstance(t_gt, (list, tuple)):
                         gt_for_loss = t_gt[0]
 
-                loss_value = compute_auxiliary_loss(loss_fn, pred_for_loss, gt_for_loss, outputs,
-                                                    self.mgr.targets[t_name], skeleton_data)
+                loss_value = self._compute_loss_value(
+                    loss_fn,
+                    pred_for_loss,
+                    gt_for_loss,
+                    target_name=t_name,
+                    targets_dict=targets_dict,
+                    outputs=outputs,
+                )
                 task_total_loss += loss_weight * loss_value
 
             weighted_loss = task_weight * task_total_loss
             total_loss += weighted_loss
-
-            # Store the actual loss value (after task weighting but before grad accumulation scaling)
             task_losses[t_name] = weighted_loss.detach().cpu().item()
 
         return total_loss, task_losses
 
 
     def _validation_step(self, model, data_dict, loss_fns, use_amp):
+        data_dict = self._prepare_batch(data_dict, is_training=False)
         inputs = data_dict["image"].to(self.device)
         # Only include tensor targets; skip metadata and lists (e.g., 'regression_keys')
         targets_dict = {
@@ -983,29 +1030,33 @@ class BaseTrainer:
         task_losses = {}
 
         for t_name, t_gt in targets_dict.items():
-            if t_name == 'skel' or t_name.endswith('_skel') or t_name == 'is_unlabeled':
-                continue  # Skip skeleton data and metadata as they're not predicted outputs
-            t_pred = outputs[t_name]
-            task_loss_fns = loss_fns[t_name]  # List of (loss_fn, weight) tuples
+            if not self._should_include_target_in_loss(t_name):
+                continue
 
-            # If predictions are a list/tuple (e.g., deep supervision), use the first tensor.
+            t_pred = outputs[t_name]
+            task_loss_fns = loss_fns[t_name]
+
             if isinstance(t_pred, (list, tuple)):
                 ref_tensor = t_pred[0]
             else:
                 ref_tensor = t_pred
+
             task_total_loss = torch.zeros((), device=ref_tensor.device, dtype=ref_tensor.dtype)
             for loss_fn, loss_weight in task_loss_fns:
-                # Get skeleton data if available
-                skeleton_data = targets_dict.get(f'{t_name}_skel', None)
-                # If DS is enabled and loss isn't wrapped (edge case), fall back to highest-res
                 pred_for_loss, gt_for_loss = t_pred, t_gt
                 if isinstance(t_pred, (list, tuple)) and not isinstance(loss_fn, DeepSupervisionWrapper):
                     pred_for_loss = t_pred[0]
                     if isinstance(t_gt, (list, tuple)):
                         gt_for_loss = t_gt[0]
 
-                loss_value = compute_auxiliary_loss(loss_fn, pred_for_loss, gt_for_loss, outputs,
-                                                    self.mgr.targets[t_name], skeleton_data)
+                loss_value = self._compute_loss_value(
+                    loss_fn,
+                    pred_for_loss,
+                    gt_for_loss,
+                    target_name=t_name,
+                    targets_dict=targets_dict,
+                    outputs=outputs,
+                )
                 task_total_loss += loss_weight * loss_value
 
             task_losses[t_name] = task_total_loss.detach().cpu().item()
@@ -1139,12 +1190,24 @@ class BaseTrainer:
 
         # ---- training! ----- #
         for epoch in range(start_epoch, self.mgr.max_epoch):
+            # Ensure each rank shuffles differently per epoch
+            if self.is_distributed and isinstance(train_dataloader.sampler, DistributedSampler):
+                train_dataloader.sampler.set_epoch(epoch)
             # Update loss functions for this epoch
             loss_fns = self._update_loss_for_epoch(loss_fns, epoch)
             
             # Update scheduler for this epoch (for epoch-based scheduler switching)
             scheduler, is_per_iteration_scheduler = self._update_scheduler_for_epoch(scheduler, optimizer, epoch)
             
+            # Optionally update dataloaders for this epoch (e.g., warmup strategies)
+            train_dataloader, val_dataloader = self._update_dataloaders_for_epoch(
+                train_dataloader=train_dataloader,
+                val_dataloader=val_dataloader,
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                epoch=epoch
+            )
+
             model.train()
 
             if getattr(self.mgr, 'max_steps_per_epoch', None) is not None and self.mgr.max_steps_per_epoch > 0:
@@ -1154,7 +1217,8 @@ class BaseTrainer:
 
             epoch_losses = {t_name: [] for t_name in self.mgr.targets}
             train_iter = iter(train_dataloader)
-            pbar = tqdm(range(num_iters), desc=f'Epoch {epoch + 1}/{self.mgr.max_epoch}')
+            # Progress bar for training iterations
+            pbar = tqdm(total=num_iters, desc=f'Epoch {epoch + 1}/{self.mgr.max_epoch}') if (not self.is_distributed or self.rank == 0) else None
             
             # Variables to store train samples for debug visualization
             train_sample_input = None
@@ -1166,7 +1230,7 @@ class BaseTrainer:
             print(f"Initial learning rate : {self.mgr.initial_lr}")
             print(f"Gradient accumulation steps : {grad_accumulate_n}")
 
-            for i in pbar:
+            for i in range(num_iters):
                 if i % grad_accumulate_n == 0:
                     optimizer.zero_grad(set_to_none=True)
 
@@ -1258,8 +1322,7 @@ class BaseTrainer:
 
                 current_lr = optimizer.param_groups[0]['lr']
 
-                # Log metrics to wandb once per step
-                if self.mgr.wandb_project:
+                if self.mgr.wandb_project and (not self.is_distributed or self.rank == 0):
                     metrics = self._prepare_metrics_for_logging(
                         epoch=epoch,
                         step=global_step,
@@ -1271,6 +1334,9 @@ class BaseTrainer:
 
                 del data_dict, inputs, targets_dict, outputs
 
+            if pbar is not None:
+                pbar.close()
+
             if not is_per_iteration_scheduler:
                 scheduler.step()
 
@@ -1278,10 +1344,11 @@ class BaseTrainer:
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
 
-            print(f"\n[Train] Epoch {epoch + 1} completed.")
-            for t_name in self.mgr.targets:
-                avg_loss = np.mean(epoch_losses[t_name]) if epoch_losses[t_name] else 0
-                print(f"  {t_name}: Avg Loss = {avg_loss:.4f}")
+            if not self.is_distributed or self.rank == 0:
+                print(f"\n[Train] Epoch {epoch + 1} completed.")
+                for t_name in self.mgr.targets:
+                    avg_loss = np.mean(epoch_losses[t_name]) if epoch_losses[t_name] else 0
+                    print(f"  {t_name}: Avg Loss = {avg_loss:.4f}")
 
             # ---- validation ----- #
             val_every_n = int(getattr(self.mgr, 'val_every_n', 1))

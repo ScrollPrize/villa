@@ -107,7 +107,7 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         if not used_fast_path:
             raise ValueError(
                 "Dataset does not support fast labeled/unlabeled split. "
-                "Ensure you're using the ImageDataset (data_format='image') or implement "
+                "Use DatasetOrchestrator with data_format='image' (adapter='image') or implement "
                 "get_labeled_unlabeled_patch_indices() on your dataset."
             )
 
