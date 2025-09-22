@@ -1,398 +1,180 @@
-# Data Structuring Guide for Vesuvius Python Training
+# Preparing Data for Vesuvius Training
 
-This guide explains how to structure your data and configure labels for different segmentation scenarios using Vesuvius Python: binary segmentation, multi-class segmentation, and multi-task learning.
+The Vesuvius trainer can ingest volumes exported from napari, TIFF collections, or Zarr stores. This guide explains how to organize files and configure targets for common segmentation workloads.
 
-## Table of Contents
-1. [Binary Segmentation](#binary-segmentation)
-2. [Multi-class Segmentation](#multi-class-segmentation)
-3. [Multi-task Learning](#multi-task-learning)
-4. [Label Value Mapping](#label-value-mapping)
-5. [Validation](#validation)
+## Supported Ingestion Paths
 
----
+### Napari Sessions
 
-## Binary Segmentation
-
-Binary segmentation involves classifying each pixel/voxel as either background (0) or foreground (non-zero).
-
-### Napari Dataset Structure
-
-For napari, organize your layers as follows:
-```
-image_layer_name: "my_image"
-label_layer_name: "my_image_ink"  # Format: {image_name}_{task_name}
-mask_layer_name: "my_image_mask"  # Optional
-```
-
-**Example:**
-- Image layer: `"scroll_001"`
-- Label layer: `"scroll_001_ink"`
-- Mask layer: `"scroll_001_mask"` (optional)
-
-### TIF/Zarr Dataset Structure
-
-Directory structure:
-```
-data_path/
-├── images/
-│   └── image1_ink.tif
-├── labels/
-│   └── image1_ink.tif
-└── masks/          # Optional
-    └── image1_ink.tif
-```
-
-**File naming convention:** `{image_id}_{task_name}.{extension}`
-
-### Configuration
-
-```yaml
-dataset_config:
-  binarize_labels: true
-  target_value:
-    ink: 1  # Any non-zero pixels in the label will become 1
-
-# Note: targets configuration is set automatically by the system
-# based on your dataset_config. The system will configure:
-# - channels: 1 (for binary segmentation)
-# - activation: "sigmoid"
-# - loss_fn: Based on configuration or defaults
-```
-
-### Label Values
-- Background: 0
-- Foreground: Any non-zero value (will be mapped to 1)
-
----
-
-## Multi-class Segmentation
-
-Multi-class segmentation assigns each pixel/voxel to one of several classes (mutually exclusive).
-
-### Napari Dataset Structure
+The `vesuvius.napari_trainer` utility reads directly from an open napari viewer. Name layers so that each label layer shares the image prefix:
 
 ```
-image_layer_name: "my_image"
-label_layer_name: "my_image_segmentation"  # Single layer with multiple classes
-mask_layer_name: "my_image_mask"          # Optional
+image_layer_name: "scroll_001"
+label_layer_name: "scroll_001_ink"   # becomes target "ink"
+mask_layer_name: "scroll_001_mask"    # optional label mask
 ```
 
-**Example:**
-- Image layer: `"fragment_1"`
-- Label layer: `"fragment_1_ink"` (contains values 0, 1, 2, 3, etc.)
-- Mask layer: `"fragment_1_mask"` (optional)
+Napari exports are copied in-memory; you do not need to persist `.zarr` files manually unless you want to reuse them outside napari.
 
-### TIF/Zarr Dataset Structure
+### File-Based Datasets (TIFF or Zarr)
+
+Provide a directory with `images/` and `labels/` subfolders. Each label file must end with the target name that it represents:
 
 ```
 data_path/
 ├── images/
-│   └── image1.tif
-├── labels/
-│   └── image1_labels.tif  # Contains multi-class labels
-└── masks/
-    └── image1_mask.tif
+│   ├── fragment01.tif
+│   ├── fragment01_ink.tif      # TIFF with the same voxels as the labels
+│   └── fragment02.tif
+└── labels/
+    ├── fragment01_ink.tif
+    ├── fragment01_damage.tif   # second task for the same fragment
+    └── fragment02_ink.tif
 ```
 
-### Configuration
+For Zarr input, each entry is a directory ending with `.zarr`. Use the same naming convention:
 
-#### Simple Multi-class (No Remapping)
-```yaml
-dataset_config:
-  binarize_labels: false  # Use labels as-is
-  target_value: null
-
-# OR with identity mapping
-dataset_config:
-  binarize_labels: true
-  target_value:
-    segmentation:
-      0: 0  # background
-      1: 1  # ink
-      2: 2  # horizontal fiber
-      3: 3  # vertical fiber 
+```
+images/
+├── fragment01.zarr/
+├── fragment01_ink.zarr/
+└── fragment01_damage.zarr/
+labels/
+├── fragment01_ink.zarr/
+└── fragment01_damage.zarr/
 ```
 
-#### Multi-class with Label Remapping
+The loader automatically matches `fragment01_damage` labels to either `fragment01_damage.zarr` or the shared `fragment01.zarr` image.
 
-Label remapping is useful when:
-1. **Merging similar classes**: Combining related categories (e.g., different damage levels → any damage)
-2. **Simplifying the task**: Reducing the number of classes for easier training
+## Configuring Targets
 
+Targets are defined in the training YAML under `dataset_config.targets`. Each key describes a prediction head and its losses.
 
-**Example: Combining different but similar annotations:**
-```yaml
-dataset_config:
-  binarize_labels: true
-  target_value:
-    damage_segmentation:
-      0: 0  # background
-      1: 1  # ink
-      2: 1  # medium damage  → any damage
-      3: 1  # severe damage  → any damage
-      4: 2  # missing/holes
-```
-
-**Example 2: aligning different annotation schemes:**
-```yaml
-# Original labels from different annotators:
-# Annotator A used: 0=background, 1=ink, 2=faded_ink
-# Annotator B used: 0=background, 1=clear_ink, 2=unclear_ink, 3=traces
-dataset_config:
-  binarize_labels: true
-  target_value:
-    ink_detection:
-      0: 0  # background
-      1: 1  # ink/clear_ink     → visible ink
-      2: 1  # faded_ink/unclear → visible ink  
-      3: 2  # traces            → barely visible
-```
-
-#### Multi-class with Region Combinations
-
-Region combinations allow you to define new classes that represent unions of existing classes:
+### Binary Segmentation Example
 
 ```yaml
+tr_setup:
+  model_name: "ink_segmentation"
+
 dataset_config:
-  binarize_labels: true
-  target_value:
-    tissue_segmentation:
-      mapping:
-        0: 0  # background
-        1: 1  # healthy tissue
-        2: 2  # damaged tissue
-        3: 3  # scar tissue
-      regions:
-        4: [1, 2]      # living tissue (healthy OR damaged)
-        5: [2, 3]      # abnormal tissue (damaged OR scar)
+  normalization_scheme: "zscore"
+  skip_patch_validation: false
+  targets:
+    ink:
+      out_channels: 1
+      activation: "sigmoid"
+      losses:
+        - name: "BCEWithLogitsLoss"
+          weight: 0.5
+        - name: "SoftDiceLoss"
+          weight: 0.5
 ```
 
-**Note:** Region IDs must not conflict with existing mapped class values.
+Expect labels with background `0` and any positive value for foreground. Store them either as a single-channel volume with values `{0, 1}` or the raw grayscale mask produced by annotation tools. The loader converts non-zero entries to foreground when it evaluates patch coverage.
 
-### Label Values
-- 0: Always background
-- 1, 2, 3, ...: Different classes (mutually exclusive)
+### Multi-Class Segmentation
 
----
-
-## Multi-task Learning
-
-Multi-task learning trains a single model (using a shared encoder but separate decoders) to perform multiple segmentation tasks simultaneously. Tasks can overlap (e.g., a pixel can be both "ink" and "damaged").
-
-### Napari Dataset Structure
-
-Multiple label layers, one per task:
-```
-image_layer_name: "my_image"
-label_layer_1: "my_image_ink"      # Task 1
-label_layer_2: "my_image_damage"   # Task 2
-label_layer_3: "my_image_substrate"  # Task 3
-mask_layer_name: "my_image_mask"   # Optional, shared across tasks
-```
-
-**Example:**
-- Image layer: `"fragment_042"`
-- Label layers:
-  - `"fragment_042_ink"` (ink detection)
-  - `"fragment_042_damage"` (damage detection)
-  - `"fragment_042_substrate"` (substrate type - multi-class)
-- Mask layer: `"fragment_042_mask"` (optional)
-
-### TIF/Zarr Dataset Structure
-
-```
-data_path/
-├── images/
-│   ├── image1.tif         # Single image file 
-│   ├── image2.tif         # Single image file 
-│   └── ...
-├── labels/
-│   ├── image1_ink.tif         # Binary labels for ink
-│   ├── image1_damage.tif      # Binary labels for damage
-│   ├── image2_ink.tif         # Binary labels for ink
-│   ├── image2_damage.tif      # Binary labels for damage
-│   └── ...
-└── masks/          # Optional
-    ├── image1_ink.tif         # Can be task-specific
-    ├── image1_damage.tif      # or use same mask
-    ├── image1_ink.tif         # for all tasks
-    └── ...
-```
-
-**Note:** Name your images without task suffixes (e.g., `image1.tif`) and specify the task with a label suffix.
-
-### Configuration for Binary Multi-task
+Provide one label volume per voxel target with integer class IDs. Configure the head with the desired number of channels and a softmax-friendly loss:
 
 ```yaml
-dataset_config:
-  binarize_labels: true
-  target_value:
-    ink: 1      # Binary: contains ink
-    fiber: 1    # Binary: contains fiber
-    rocks: 1    # Binary: contains rocks
+tr_setup:
+  model_name: "material_types"
 
-# The system will automatically configure targets based on your data
-# Each binary task will have:
-# - channels: 1
-# - activation: "sigmoid"
-# - loss_fn: Based on configuration or defaults
+dataset_config:
+  targets:
+    materials:
+      out_channels: 4        # background + three classes
+      activation: "softmax"
+      losses:
+        - name: "nnUNet_DC_and_CE_loss"
+          weight: 1.0
 ```
 
-### Configuration for Mixed Multi-task (Binary + Multi-class)
+If your annotations are already one-hot encoded (multiple channels), store them as multi-channel arrays. The loss functions can operate on either one-hot encodings or single-channel class maps.
+
+### Multi-Task Learning
+
+Add one entry per task. Each target receives its own decoder and loss configuration.
 
 ```yaml
-dataset_config:
-  binarize_labels: true
-  target_value:
-    ink: 1              # Binary task
-    damage: 1           # Binary task
-    substrate_type:     # Multi-class task (simple format)
-      0: 0  # background/air
-      1: 1  # papyrus
-      2: 2  # parchment
-      3: 3  # wood
-    # OR use the structured format for multi-class:
-    # substrate_type:
-    #   mapping:
-    #     0: 0  # background/air
-    #     1: 1  # papyrus
-    #     2: 2  # parchment
-    #     3: 3  # wood
+tr_setup:
+  model_name: "ink_and_damage"
 
-# The system will automatically configure:
-# - Binary tasks: channels=1, activation="sigmoid"
-# - Multi-class tasks: channels=num_classes, activation="softmax"
+dataset_config:
+  targets:
+    ink:
+      out_channels: 1
+      activation: "sigmoid"
+      losses:
+        - name: "SoftDiceLoss"
+          weight: 1.0
+    damage:
+      out_channels: 1
+      activation: "sigmoid"
+      losses:
+        - name: "BCEWithLogitsLoss"
+          weight: 1.0
 ```
 
-### Auxiliary Tasks Labels
+Label files must exist for each task (e.g., `fragment01_ink.tif` and `fragment01_damage.tif`). If one task lacks annotations for a volume, leave that file out; the loader can skip unlabeled pairs when `allow_unlabeled_data: true` is set in the config.
 
-Auxiliary tasks (e.g., `distance_transform`, `surface_normals`) are derived from a primary target (e.g., `ink`/`surface`) and configured under `auxiliary_tasks` in your YAML.
+### Auxiliary Targets
 
-- Auxiliary labels do not need to exist on disk. The dataset auto-generates distance transforms and surface normals per patch from the source target labels.
-- If you want to manage them yourself, you can still precompute and save them under `labels/` using the same naming convention (e.g., `image1_distance_transform.tif`), but it is not required.
-- Auxiliary losses that operate without explicit GT (e.g., `NormalSmoothnessLoss`) can be used without extra labels; masking can be driven by the source task prediction during training.
-
-Example config for distance transform type:
+The trainer can synthesize auxiliary regression targets on the fly. Declare them under `auxiliary_tasks` and reference the source classification task:
 
 ```yaml
 auxiliary_tasks:
   distance_transform:
     type: distance_transform
-    source_target: surface
-    # 'signed' | 'inside' | 'outside'
-    distance_type: signed
+    source_target: ink
+    loss_weight: 0.1
+    losses:
+      - name: "SignedDistanceLoss"
+        weight: 1.0
 ```
 
-Notes:
-- Use `signed` with `SignedDistanceLoss` (default).
-- Use `inside`/`outside` with regression losses such as `MaskedMSELoss` or `WeightedSmoothL1Loss`.
+During training the dataset computes distance transforms from the `ink` labels; you do not need to save additional volumes unless you want complete control over the tensors.
 
----
+## Dataset Parameters Worth Tuning
 
-## Label Value Mapping
+- `normalization_scheme`: one of `zscore`, `instance_zscore`, `instance_minmax`, `ct`, or `none`.
+- `skip_patch_validation`: skip the expensive valid-patch search when labels are dense.
+- `min_labeled_ratio`: minimum fraction of labeled voxels required for a patch to be considered valid (default `0.10`).
+- `min_bbox_percent`: bounding-box coverage threshold used during patch validation (default `0.95`).
+- `allow_unlabeled_data`: permit volumes without labels so you can mix supervised and unsupervised data.
+- `slice_sampling`: optional configuration for extracting 2D slices from 3D inputs.
 
-### Understanding `binarize_labels` and `target_value`
+All fields are documented in `vesuvius/models/configuration/config_manager.py` and in the sample YAML files under `vesuvius/models/configuration/`.
 
-1. **When `binarize_labels: true`**:
-   - The system will remap your label values according to `target_value`
-   - For binary tasks: Any non-zero pixel becomes the specified value
-   - For multi-class: Values are remapped according to the dictionary
+## Label Encoding Guidelines
 
-2. **When `binarize_labels: false`**:
-   - Labels are used as-is without any remapping
-   - Your labels must already be in the correct format (0/1 for binary, 0/1/2/... for multi-class)
-   - `target_value` is ignored
+- Use unsigned integer dtypes (`uint8`, `uint16`, …) whenever possible.
+- Background must be zero; any positive value is treated as foreground when computing valid patches.
+- For multi-class tasks store consecutive integers starting at zero. There is no automatic remapping, so ensure that the values in the label volume match the configured number of channels.
+- When exporting from napari, choose the “labels” layer type to obtain integer masks instead of floating-point overlays.
 
-### Examples of Label Remapping
+## Verifying a Dataset
 
-**Binary Task Original Labels:**
-```
-Label image contains: [0, 1, 2, 5, 10, 255]
-With target_value: ink: 1
-Result after remapping: [0, 1, 1, 1, 1, 1]
-```
-
-**Multi-class with Merging:**
-```
-Original annotation scheme:
-  0: background
-  1: black ink
-  2: brown ink  
-  3: red ink
-  4: blue ink
-  5: damage
-
-Simplified scheme for training:
-target_value:
-  ink_and_damage:
-    0: 0  # background
-    1: 1  # any ink color
-    2: 1  # any ink color
-    3: 1  # any ink color
-    4: 1  # any ink color
-    5: 2  # damage
-
-Result: 3 classes instead of 6
-```
-
----
-
-## Validation
-
-Use the validation script to check your data structure and configuration:
+`vesuvius.train` validates the dataset while it warms up the dataloaders. To perform a quick dry run that checks file layout, patch sampling, and normalization without committing to a full training session:
 
 ```bash
-# For napari datasets
-python vesuvius/models/datasets/validate_labels.py \
-    --config your_config.yaml \
-    --dataset napari
-
-# For TIF datasets
-python vesuvius/models/datasets/validate_labels.py \
-    --config your_config.yaml \
-    --dataset tif \
-    --data-path /path/to/your/data
-
-# For Zarr datasets
-python vesuvius/models/datasets/validate_labels.py \
-    --config your_config.yaml \
-    --dataset zarr \
-    --data-path /path/to/your/data
+vesuvius.train \
+  --config path/to/config.yaml \
+  --input /path/to/data \
+  --output ./checkpoints/debug \
+  --max-epoch 1 \
+  --max-steps-per-epoch 1 \
+  --max-val-steps-per-epoch 1 \
+  --skip-intensity-sampling
 ```
 
-The validation script will:
-1. Analyze the unique values in your label data
-2. Check if your configuration matches the data
-3. Provide recommendations for configuration
-4. Report any mismatches or missing mappings
-
-### Common Issues and Solutions
-
-1. **"No target value configured"**
-   - Add the target to your `target_value` configuration
-
-2. **"Unexpected label values found"**
-   - Your labels contain values not in the configuration
-   - Either add mappings for these values or clean your data
-
-3. **"Values found in data but not in configuration"** (multi-class)
-   - Add mappings for all non-zero values in your labels
-
----
-
-## Best Practices
-
-1. **Consistent Naming**: Use descriptive, consistent task names
-2. **Validate Before Training**: Always run the validation script
-3. **Choose the Right Structure**:
-   - Binary tasks: When detecting presence/absence
-   - Multi-class: When classes are mutually exclusive
-   - Multi-task: When one pixel can represent multiple classes
+Watch the log for messages about missing targets, unlabeled patches, or normalization warnings. The command above produces a single forward/backward pass and exits.
 
 ## Quick Reference
 
-| Scenario | Label Structure | When to Use | Example |
-|----------|----------------|-------------|---------|
-| Binary | 0 = background<br>Non-zero = foreground | Detecting presence/absence | Ink detection |
-| Multi-class | 0, 1, 2, 3... | Mutually exclusive categories | Material type |
-| Multi-task | Multiple binary/multi-class | Multiple overlapping annotations | Ink + damage + substrate |
+| Scenario | Data Layout | Target Config | Label Notes |
+|----------|-------------|---------------|-------------|
+| Binary segmentation | One label file per volume with `{0, 1}` values | `out_channels: 1`, `activation: sigmoid` | Any positive voxel counts as foreground |
+| Multi-class segmentation | Single label map with integer class IDs | `out_channels: N`, `activation: softmax`, CE/Dice losses | Provide sequential integers `[0, N-1]` |
+| Multi-task | Separate label file per target | Multiple entries in `dataset_config.targets` | Targets share the same image volume |
+| Auxiliary regression | Primary label only | Configure under `auxiliary_tasks` | Auxiliary tensors are derived automatically |
