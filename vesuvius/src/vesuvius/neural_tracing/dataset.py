@@ -96,11 +96,11 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
         self._config = config
         self._patches = load_datasets(config)
 
-    def _mark_context_point(self, volume, point):
+    def _mark_context_point(self, volume, point, value=1.):
         center = point.int()
-        offsets = torch.tensor([[0, 0, 0], [-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1]])
+        offsets = torch.tensor([[0, 0, 0], [-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-2, 0, 0], [2, 0, 0], [0, -2, 0], [0, 2, 0], [0, 0, -2], [0, 0, 2]])
         for offset in offsets:
-            volume[tuple(center + offset)] = 1.
+            volume[tuple(center + offset)] = value
 
     def _get_zyx_from_patch(self, ij, patch):
         normalized_ij = ij / torch.tensor(patch.zyxs.shape[:2]) * 2 - 1
@@ -146,7 +146,7 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
 
             # Crop ROI out of the volume; mark context points
             volume_crop, min_corner_zyx = get_crop_from_volume(patch.volume, center_zyx, crop_size)
-            self._mark_context_point(volume_crop, center_zyx - min_corner_zyx)
+            # self._mark_context_point(volume_crop, center_zyx - min_corner_zyx)
             # for context_zyx in context_zyxs:
             #     self._mark_context_point(volume_crop, context_zyx - min_corner_zyx)
 
@@ -176,7 +176,9 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
             
             # Find reachable quads starting from start_quad_ij
             start_node = (start_quad_ij[0].item(), start_quad_ij[1].item())
-            assert G.has_node(start_node)
+            if not G.has_node(start_node):
+                print('WARNING: start_quad_ij not in crop')
+                continue
             reachable_quads = nx.node_connected_component(G, start_node)
             reachable_quads = torch.tensor(list(reachable_quads))
             
@@ -215,15 +217,22 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
             # Extend into free space: find EDT, and use feature transform to get nearest UV
             edt, ft = scipy.ndimage.morphology.distance_transform_edt((rasterised == 0).numpy(), return_indices=True)
             edt /= ((crop_size // 2) ** 2 * 3) ** 0.5 + 1.  # worst case: only center point is fg, hence max(edt) is 'radius' to corners
+            edt = torch.exp(-edt / 0.25)
+            edt = edt.to(torch.float32) * 2 - 1  # ...so it's "signed" but the zero point is arbitrary
             uvs = uvs[*ft]
             uvs = (uvs - center_ij) / patch.scale / (crop_size * 2)  # *2 is somewhat arbitrary; worst-ish-case = patch wrapping round three sides of cube
+            uvws = torch.cat([uvs, edt[..., None]], dim=-1).to(torch.float32)
+
+            localiser = torch.linalg.norm(torch.stack(torch.meshgrid(*[torch.arange(crop_size)] * 3, indexing='ij'), dim=-1).to(torch.float32) - crop_size // 2, dim=-1)
+            localiser = localiser / localiser.amax() * 2 - 1
+            self._mark_context_point(localiser, center_zyx - min_corner_zyx, value=0.)
 
             #TODO: include full 2d slices for additional context
 
             yield {
                 'volume': volume_crop,
-                'edt': edt,
-                'uv': uvs,
+                'localiser': localiser,
+                'uvw': uvws,
             }
 
 
