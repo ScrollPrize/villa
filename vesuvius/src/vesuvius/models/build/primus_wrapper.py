@@ -214,6 +214,7 @@ class PrimusDecoder(nn.Module):
         activation="GELU",
         decoder_depth: int = 2,  # Number of Eva decoder layers
         decoder_num_heads: int = 12,  # Number of heads in decoder
+        drop_path_rate: float = 0.0,  # Stochastic depth in decoder blocks (align with encoder by default)
     ):
         super().__init__()
         
@@ -238,7 +239,7 @@ class PrimusDecoder(nn.Module):
                 use_rot_pos_emb=True,
                 use_abs_pos_emb=True,
                 mlp_ratio=4 * 2 / 3,
-                drop_path_rate=0.0,  # No drop path in decoder
+                drop_path_rate=drop_path_rate,
                 patch_drop_rate=0.0,  # No patch drop in decoder
                 proj_drop_rate=0.0,
                 attn_drop_rate=0.0,

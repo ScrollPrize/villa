@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from vesuvius.utils.utils import determine_dimensionality
 from vesuvius.models.training.auxiliary_tasks import create_auxiliary_task
+import os
 
 
 Image.MAX_IMAGE_PIXELS = None
@@ -274,6 +275,7 @@ class ConfigManager:
     def update_config(self, patch_size=None, min_labeled_ratio=None, max_epochs=None, loss_function=None, 
                      skip_patch_validation=None,
                      normalization_scheme=None, intensity_properties=None,
+                     min_bbox_percent=None,
                      skip_bounding_box=None):
         if patch_size is not None:
             if isinstance(patch_size, (list, tuple)) and len(patch_size) >= 2:
@@ -295,11 +297,28 @@ class ConfigManager:
             if self.verbose:
                 print(f"Updated min labeled ratio: {self.min_labeled_ratio:.2f}")
 
+        # Support setting max epochs from UI (note: internal key is 'max_epoch')
+        if max_epochs is not None:
+            try:
+                self.max_epoch = int(max_epochs)
+            except Exception:
+                # Fallback if a non-int slips through
+                self.max_epoch = int(float(max_epochs))
+            self.tr_configs["max_epoch"] = self.max_epoch
+            if self.verbose:
+                print(f"Updated max epochs: {self.max_epoch}")
+
         if skip_patch_validation is not None:
             self.skip_patch_validation = bool(skip_patch_validation)
             self.dataset_config["skip_patch_validation"] = self.skip_patch_validation
             if self.verbose:
                 print(f"Updated skip_patch_validation: {self.skip_patch_validation}")
+
+        if min_bbox_percent is not None:
+            self.min_bbox_percent = float(min_bbox_percent)
+            self.dataset_config["min_bbox_percent"] = self.min_bbox_percent
+            if self.verbose:
+                print(f"Updated min bbox percent: {self.min_bbox_percent:.2f}")
 
         if loss_function is not None:
             self.selected_loss_function = loss_function

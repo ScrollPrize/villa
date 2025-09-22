@@ -1,11 +1,9 @@
-import os
 from contextlib import nullcontext
-from tqdm import tqdm
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, SubsetRandomSampler
 
 from vesuvius.models.training.train import BaseTrainer
 from vesuvius.models.training.trainers.semi_supervised import ramps
@@ -37,14 +35,17 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         self.consistency_rampup = getattr(mgr, 'consistency_rampup', 200.0)
         self.uncertainty_threshold_start = getattr(mgr, 'uncertainty_threshold_start', 0.75)
         self.uncertainty_threshold_end = getattr(mgr, 'uncertainty_threshold_end', 1.0)
-        self.uncertainty_T = getattr(mgr, 'uncertainty_T', 8)  # Number of stochastic forward passes
+        self.uncertainty_T = getattr(mgr, 'uncertainty_T', 4)  # Number of stochastic forward passes
         self.noise_scale = getattr(mgr, 'noise_scale', 0.1)  # Noise scale for stochastic augmentation
         self.labeled_batch_size = getattr(mgr, 'labeled_batch_size', mgr.train_batch_size // 2)
         
         # Semi-supervised data split parameters
-        self.labeled_ratio = getattr(mgr, 'labeled_ratio', 0.1)  # Fraction of data to use as labeled
+        self.labeled_ratio = getattr(mgr, 'labeled_ratio', 1.0)  # Fraction of data to use as labeled
         self.num_labeled = getattr(mgr, 'num_labeled', None)
         
+        # Deep supervision complicates per-sample masking; keep it off for SSL trainers
+        self.mgr.enable_deep_supervision = False
+
         self.ema_model = None
         self.global_step = 0
         self.labeled_indices = None
@@ -89,16 +90,38 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         
         np.random.shuffle(indices)
         
+        # Determine labeled/unlabeled indices using fast path (file-level)
+        labeled_idx, unlabeled_idx = [], []
+        used_fast_path = False
+        if hasattr(train_dataset, 'get_labeled_unlabeled_patch_indices'):
+            try:
+                li, ui = train_dataset.get_labeled_unlabeled_patch_indices()
+                li_set, ui_set = set(li), set(ui)
+                labeled_idx = [i for i in indices if i in li_set]
+                unlabeled_idx = [i for i in indices if i in ui_set]
+                used_fast_path = True
+                if self.mgr.verbose:
+                    print("Using dataset fast-path for labeled/unlabeled split")
+            except Exception as e:
+                print(f"Fast-path split failed: {e}")
+        if not used_fast_path:
+            raise ValueError(
+                "Dataset does not support fast labeled/unlabeled split. "
+                "Ensure you're using the ImageDataset (data_format='image') or implement "
+                "get_labeled_unlabeled_patch_indices() on your dataset."
+            )
+
+        # Determine how many labeled to use
         if self.num_labeled is not None:
-            num_labeled = min(self.num_labeled, dataset_size)
+            num_labeled = min(self.num_labeled, len(labeled_idx))
         else:
-            num_labeled = int(self.labeled_ratio * dataset_size)
-        
-        num_labeled = max(num_labeled, self.labeled_batch_size)
-        
-        self.labeled_indices = indices[:num_labeled]
-        self.unlabeled_indices = indices[num_labeled:]
-        
+            num_labeled = int(self.labeled_ratio * max(1, len(labeled_idx)))
+        num_labeled = max(num_labeled, self.labeled_batch_size) if labeled_idx else 0
+
+        # Build final ordered lists
+        self.labeled_indices = labeled_idx[:num_labeled]
+        self.unlabeled_indices = unlabeled_idx
+
         unlabeled_batch_size = self.mgr.train_batch_size - self.labeled_batch_size
         if len(self.unlabeled_indices) < unlabeled_batch_size:
             raise ValueError(
@@ -109,7 +132,10 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
                 f"reduce labeled_ratio ({self.labeled_ratio}), or increase dataset size."
             )
         
-        print(f"Semi-supervised split: {num_labeled} labeled, {len(self.unlabeled_indices)} unlabeled")
+        print(
+            f"Semi-supervised split (patch-level): {len(self.labeled_indices)} labeled patches "
+            f"(from {len(labeled_idx)}), {len(self.unlabeled_indices)} unlabeled patches"
+        )
         print(
             f"Batch composition: {self.labeled_batch_size} labeled + {unlabeled_batch_size} unlabeled = {self.mgr.train_batch_size} total")
         
@@ -127,11 +153,19 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
             num_workers=self.mgr.train_num_dataloader_workers
         )
         
-        train_val_split = self.mgr.tr_val_split
-        val_split = int(np.floor((1 - train_val_split) * num_labeled))
-        val_indices = self.labeled_indices[-val_split:] if val_split > 0 else self.labeled_indices[-5:]
-        
-        from torch.utils.data import SubsetRandomSampler
+        # --- choose validation indices ---
+        # If an external validation dataset is provided (e.g., via --val-dir),
+        # its indices are independent from the training dataset. In that case
+        # evaluate over the full validation set (or a sampler can downselect later).
+        if val_dataset is not train_dataset:
+            if self.mgr.verbose:
+                print("Using external validation dataset for uncertainty-aware mean teacher; evaluating on full validation set")
+            val_indices = list(range(len(val_dataset)))
+        else:
+            train_val_split = self.mgr.tr_val_split
+            val_split = int(np.floor((1 - train_val_split) * max(1, len(self.labeled_indices))))
+            val_indices = self.labeled_indices[-val_split:] if val_split > 0 else self.labeled_indices[-5:]
+
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=1,
@@ -140,7 +174,7 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
             num_workers=self.mgr.train_num_dataloader_workers
         )
         
-        self.train_indices = indices[:num_labeled]
+        self.train_indices = list(self.labeled_indices)
         
         return train_dataloader, val_dataloader, self.labeled_indices, val_indices
     
@@ -154,15 +188,26 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         }
         
         batch_size = inputs.shape[0]
-        
+
+        # Build unlabeled mask for this batch
+        def as_float_mask(val):
+            if isinstance(val, torch.Tensor):
+                return val.to(self.device).float()
+            if isinstance(val, (list, tuple)):
+                return torch.tensor(val, device=self.device, dtype=torch.float32)
+            if isinstance(val, bool):
+                return torch.full((batch_size,), float(val), device=self.device)
+            return torch.zeros(batch_size, device=self.device)
+
         if model.training and batch_size == self.mgr.train_batch_size:
-            # TwoStreamBatchSampler orders data like so : [labeled..., unlabeled...]
-            # i.e :  labeled_batch_size samples are labeled, rest are unlabeled
-            is_unlabeled = torch.zeros(batch_size, device=self.device)
-            is_unlabeled[self.labeled_batch_size:] = 1.0
+            # TwoStreamBatchSampler order: [labeled..., unlabeled...]
+            is_unlabeled = torch.cat([
+                torch.zeros(self.labeled_batch_size, device=self.device),
+                torch.ones(batch_size - self.labeled_batch_size, device=self.device)
+            ], dim=0)
         else:
-            # During validation, all samples are labeled
-            is_unlabeled = torch.zeros(batch_size, device=self.device)
+            # Validation/other: default to labeled unless dataset provides flags
+            is_unlabeled = as_float_mask(data_dict.get('is_unlabeled', None))
         
         outputs = model(inputs)
         

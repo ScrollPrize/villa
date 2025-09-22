@@ -53,21 +53,12 @@ class MedialSurfaceTransform(BasicTransform):
                 else:
                     raise ValueError(f"Unsupported segmentation dimensionality {seg_c.ndim} for skeletonization")
 
-                # for y in range(Y):
-                #     skel[:, y, :] |= skeletonize(bin_seg[0][:, y, :])
-                #
-                # for x in range(X):
-                #     skel[:, :, x] |= skeletonize(bin_seg[0][:, :, x])
-
-                skel = (skel > 0).astype(np.float32)
                 if self.do_tube:
                     skel = dilation(dilation(skel))
                 if self.do_open:
                     skel = opening(skel)
                 if self.do_close:
                     skel = closing(skel)
-                skel = skel.astype(np.float32) * seg_all[0].astype(np.float32)
-                seg_all_skel[0] = skel
 
                 seg_all_skel[c] = (skel.astype(np.float32) * seg_all[c].astype(np.float32))
 

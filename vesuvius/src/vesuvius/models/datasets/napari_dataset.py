@@ -20,7 +20,22 @@ class NapariDataset(BaseDataset):
         
         # Store the data in the format expected by BaseDataset
         self.target_volumes = data_dict
-    
+
+        # Populate zarr-like arrays for patch validation utilities
+        # Use in-memory numpy arrays from napari labels directly
+        self.zarr_arrays = []
+        self.zarr_names = []
+        self.data_paths = []
+        for target_name, volumes in data_dict.items():
+            for v in volumes:
+                label_arr = v['data'].get('label')
+                if label_arr is None:
+                    continue
+                name = v.get('name', target_name)
+                self.zarr_arrays.append(label_arr)
+                self.zarr_names.append(name)
+                self.data_paths.append(name)
+
     def _get_images_from_napari(self):
         """
         Extract image/label pairs from napari viewer for the dataset.
