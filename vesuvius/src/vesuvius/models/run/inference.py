@@ -3,10 +3,12 @@ import numpy as np
 import zarr
 import os
 import json
+import shutil
 import multiprocessing
 import threading
 import fsspec
 import numcodecs
+import yaml
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 # fork causes issues on windows , force to spawn
 multiprocessing.set_start_method('spawn', force=True)
@@ -58,7 +60,10 @@ class Inferer():
                  resolution: float = None,
                  compressor_name: str = 'zstd',
                  compression_level: int = 1,
-                 hf_token: str = None
+                 hf_token: str = None,
+                 # optional fallback when .pth lacks embedded model_config
+                 config_yaml: str = None,
+                 slicewise_axes=None
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -93,9 +98,39 @@ class Inferer():
         self.compressor_name = compressor_name
         self.compression_level = compression_level
         self.hf_token = hf_token
+        self.config_yaml = config_yaml
         self.model_patch_size = None
         self.num_classes = None
         self.intensity_props = None
+
+        # Configure slicewise axes for 2D volume inference
+        allowed_axes = {'z', 'y', 'x'}
+        if slicewise_axes is None:
+            resolved_axes = ['z']
+        elif isinstance(slicewise_axes, str):
+            axes_norm = slicewise_axes.lower().strip()
+            if axes_norm == 'all':
+                resolved_axes = ['z', 'y', 'x']
+            else:
+                resolved_axes = [axes_norm]
+        else:
+            resolved_axes = list(slicewise_axes)
+
+        normalized_axes = []
+        for axis in resolved_axes:
+            axis_lower = str(axis).lower().strip()
+            if axis_lower == 'all':
+                normalized_axes = ['z', 'y', 'x']
+                break
+            if axis_lower not in allowed_axes:
+                raise ValueError(f"Invalid slicewise axis '{axis}'. Must be one of {sorted(allowed_axes)} or 'all'.")
+            if axis_lower not in normalized_axes:
+                normalized_axes.append(axis_lower)
+
+        if not normalized_axes:
+            normalized_axes = ['z']
+
+        self.slicewise_axes = tuple(normalized_axes)
 
         # Internal: detect if input is a TIFF file or folder of TIFFs
         self._tiff_inputs = []
@@ -418,17 +453,19 @@ class Inferer():
             if self.verbose and global_mean is not None and global_std is not None:
                 print(f"Using global normalization from checkpoint: mean={global_mean:.4f}, std={global_std:.4f}")
 
-        # Prefer CT if model checkpoint contains full CT stats and user didn't supply JSON
-        if intensity_props is None and self.model_intensity_properties and all(k in self.model_intensity_properties for k in ['percentile_00_5', 'percentile_99_5', 'mean', 'std']):
-            intensity_props = {
-                'mean': self.model_intensity_properties['mean'],
-                'std': self.model_intensity_properties['std'],
-                'percentile_00_5': self.model_intensity_properties['percentile_00_5'],
-                'percentile_99_5': self.model_intensity_properties['percentile_99_5']
-            }
-            normalization_scheme = 'ct'
-            if self.verbose:
-                print("Using CT normalization from checkpoint intensity properties")
+        # Only use CT normalization if it was actually configured
+        # Do NOT auto-switch a model trained with zscore to CT at inference time.
+        if normalization_scheme == 'ct':
+            # If user/model requested CT, source intensity props from checkpoint when available
+            if intensity_props is None and self.model_intensity_properties and all(k in self.model_intensity_properties for k in ['percentile_00_5', 'percentile_99_5', 'mean', 'std']):
+                intensity_props = {
+                    'mean': self.model_intensity_properties['mean'],
+                    'std': self.model_intensity_properties['std'],
+                    'percentile_00_5': self.model_intensity_properties['percentile_00_5'],
+                    'percentile_99_5': self.model_intensity_properties['percentile_99_5']
+                }
+                if self.verbose:
+                    print("Using CT normalization from checkpoint intensity properties")
         return normalization_scheme, global_mean, global_std, intensity_props
 
     def _create_dataset_and_loader(self):
@@ -448,6 +485,7 @@ class Inferer():
             global_mean=global_mean,
             global_std=global_std,
             intensity_props=intensity_props,
+            return_as_type='np.float32',
             input_format=self.input_format,
             verbose=self.verbose,
             mode='infer',
@@ -718,7 +756,7 @@ class Inferer():
                     if non_empty_indices:
                         non_empty_input = input_batch[non_empty_indices]
                         
-                        with torch.no_grad(), torch.amp.autocast('cuda'):
+                        with torch.no_grad(), torch.autocast(device_type=self.device.type):
                             if self.do_tta:
                                 non_empty_output = infer_with_tta(
                                     self.model,
@@ -825,16 +863,513 @@ class Inferer():
         if len(self.patch_size) == 3:
             pZ, pY, pX = self.patch_size
             Z, Y, X = img_shape
-            z_positions = compute_steps_for_sliding_window(Z, pZ, self.overlap)
-            y_positions = compute_steps_for_sliding_window(Y, pY, self.overlap)
-            x_positions = compute_steps_for_sliding_window(X, pX, self.overlap)
+            z_positions = [0] if Z < pZ else compute_steps_for_sliding_window(Z, pZ, self.overlap)
+            y_positions = [0] if Y < pY else compute_steps_for_sliding_window(Y, pY, self.overlap)
+            x_positions = [0] if X < pX else compute_steps_for_sliding_window(X, pX, self.overlap)
             return [(z, y, x) for z in z_positions for y in y_positions for x in x_positions]
         else:
             pY, pX = self.patch_size
             Y, X = img_shape
-            y_positions = compute_steps_for_sliding_window(Y, pY, self.overlap)
-            x_positions = compute_steps_for_sliding_window(X, pX, self.overlap)
+            y_positions = [0] if Y < pY else compute_steps_for_sliding_window(Y, pY, self.overlap)
+            x_positions = [0] if X < pX else compute_steps_for_sliding_window(X, pX, self.overlap)
             return [(y, x) for y in y_positions for x in x_positions]
+
+    def _compute_plane_positions(self, plane_shape, plane_patch_size):
+        """Compute sliding-window start positions for a 2D plane."""
+        from vesuvius.utils.models.helpers import compute_steps_for_sliding_window
+
+        dim0, dim1 = plane_shape
+        p0, p1 = plane_patch_size
+
+        if p0 <= 0 or p1 <= 0:
+            raise ValueError(f"Invalid plane patch size: {plane_patch_size}")
+
+        pos0 = [0] if dim0 <= p0 else compute_steps_for_sliding_window(dim0, p0, self.overlap)
+        pos1 = [0] if dim1 <= p1 else compute_steps_for_sliding_window(dim1, p1, self.overlap)
+
+        if not pos0:
+            pos0 = [0]
+        if not pos1:
+            pos1 = [0]
+
+        return [(int(a), int(b)) for a in pos0 for b in pos1]
+
+    def _create_volume_accumulators(self, volume_shape, chunk_hint=None):
+        """Create accumulation stores for slicewise 2D inference."""
+        Z, Y, X = volume_shape
+        compressor = self._get_zarr_compressor()
+
+        if chunk_hint is None:
+            chunk_z = max(1, min(32, Z))
+            chunk_y = max(1, min(32, Y))
+            chunk_x = max(1, min(32, X))
+        else:
+            chunk_z, chunk_y, chunk_x = chunk_hint
+
+        logits_chunks = (max(1, min(self.num_classes or 1, 2)), chunk_z, chunk_y, chunk_x)
+        weights_chunks = (chunk_z, chunk_y, chunk_x)
+
+        logits_sum_path = os.path.join(self.output_dir, f"logits_sum_part_{self.part_id}.zarr")
+        weights_path = os.path.join(self.output_dir, f"weights_part_{self.part_id}.zarr")
+
+        logits_store = open_zarr(
+            path=logits_sum_path,
+            mode='w',
+            storage_options={'anon': False} if logits_sum_path.startswith('s3://') else None,
+            verbose=self.verbose,
+            shape=(self.num_classes, Z, Y, X),
+            chunks=logits_chunks,
+            dtype=np.float32,
+            compressor=compressor,
+            write_empty_chunks=False
+        )
+
+        weights_store = open_zarr(
+            path=weights_path,
+            mode='w',
+            storage_options={'anon': False} if weights_path.startswith('s3://') else None,
+            verbose=self.verbose,
+            shape=(Z, Y, X),
+            chunks=weights_chunks,
+            dtype=np.float32,
+            compressor=compressor,
+            write_empty_chunks=False
+        )
+
+        return logits_store, logits_sum_path, weights_store, weights_path, (chunk_z, chunk_y, chunk_x)
+
+    def _finalize_volume_logits(self, logits_store, weights_store, final_path, volume_shape, chunk_sizes):
+        """Normalize accumulated logits by weights and write final output store."""
+        Z, Y, X = volume_shape
+        chunk_z, chunk_y, chunk_x = chunk_sizes
+        compressor = self._get_zarr_compressor()
+
+        final_chunks = (max(1, min(self.num_classes or 1, 2)), chunk_z, chunk_y, chunk_x)
+
+        final_store = open_zarr(
+            path=final_path,
+            mode='w',
+            storage_options={'anon': False} if final_path.startswith('s3://') else None,
+            verbose=self.verbose,
+            shape=(self.num_classes, Z, Y, X),
+            chunks=final_chunks,
+            dtype=np.float16,
+            compressor=compressor,
+            write_empty_chunks=False
+        )
+
+        for z0 in range(0, Z, chunk_z):
+            z1 = min(z0 + chunk_z, Z)
+            for y0 in range(0, Y, chunk_y):
+                y1 = min(y0 + chunk_y, Y)
+                for x0 in range(0, X, chunk_x):
+                    x1 = min(x0 + chunk_x, X)
+                    logits_chunk = logits_store.oindex[
+                        (slice(None), slice(z0, z1), slice(y0, y1), slice(x0, x1))
+                    ]
+                    weights_chunk = weights_store.oindex[
+                        (slice(z0, z1), slice(y0, y1), slice(x0, x1))
+                    ]
+
+                    if not np.any(weights_chunk > 0):
+                        final_store.oindex[
+                            (slice(None), slice(z0, z1), slice(y0, y1), slice(x0, x1))
+                        ] = np.zeros_like(logits_chunk, dtype=np.float16)
+                        continue
+
+                    safe_weights = np.where(weights_chunk > 0, weights_chunk, 1.0)
+                    logits_chunk = logits_chunk / safe_weights[None, ...]
+                    zero_mask = weights_chunk <= 0
+                    if np.any(zero_mask):
+                        logits_chunk[:, zero_mask] = 0.0
+
+                    final_store.oindex[
+                        (slice(None), slice(z0, z1), slice(y0, y1), slice(x0, x1))
+                    ] = logits_chunk.astype(np.float16)
+
+        return final_store
+
+    def _cleanup_path(self, path):
+        if not path:
+            return
+        try:
+            if path.startswith('s3://'):
+                fs = fsspec.filesystem('s3', anon=False)
+                if fs.exists(path):
+                    fs.rm(path, recursive=True)
+            else:
+                if os.path.exists(path):
+                    shutil.rmtree(path)
+        except Exception as exc:
+            if self.verbose:
+                print(f"Warning: failed to remove temporary path {path}: {exc}")
+
+    def _accumulate_axis_slices(self, *, volume, axis, slice_positions, slice_count,
+                                 patch_hw, gaussian_map, logits_store, weights_store,
+                                 channels, volume_shape, pbar):
+        patch_h, patch_w = patch_hw
+        Z, Y, X = volume_shape
+
+        def _run_model(patch_array):
+            tensor = torch.from_numpy(patch_array).unsqueeze(0).to(self.device)
+            with torch.no_grad(), torch.autocast(device_type=self.device.type):
+                if self.do_tta:
+                    logits = infer_with_tta(
+                        self.model,
+                        tensor,
+                        self.tta_type,
+                        is_multi_task=self.is_multi_task,
+                        concat_multi_task_outputs=self._concat_multi_task_outputs
+                    )
+                else:
+                    logits = self.model(tensor)
+                    if self.is_multi_task:
+                        logits = self._concat_multi_task_outputs(logits)
+            return logits.detach().float().cpu().numpy()[0]
+
+        for slice_idx in range(slice_count):
+            for pos0, pos1 in slice_positions:
+                if axis == 'z':
+                    y0, x0 = pos0, pos1
+                    y1 = min(y0 + patch_h, Y)
+                    x1 = min(x0 + patch_w, X)
+
+                    if channels > 1:
+                        sub = volume[(slice(None), slice(slice_idx, slice_idx + 1), slice(y0, y1), slice(x0, x1))]
+                        sub = np.asarray(sub)[:, 0, :, :]
+                    else:
+                        sub = volume[(slice(slice_idx, slice_idx + 1), slice(y0, y1), slice(x0, x1))]
+                        sub = np.asarray(sub)[0, :, :]
+
+                    valid_h = y1 - y0
+                    valid_w = x1 - x0
+
+                    if self.skip_empty_patches and (sub.size == 0 or float(np.min(sub)) == float(np.max(sub))):
+                        continue
+
+                    patch = np.zeros((channels, patch_h, patch_w), dtype=np.float32)
+                    if channels > 1:
+                        patch[:, :valid_h, :valid_w] = sub
+                    else:
+                        patch[0, :valid_h, :valid_w] = sub
+
+                    logits_np = _run_model(patch)
+                    logits_slice = logits_np[:, :valid_h, :valid_w]
+                    weight_slice = gaussian_map[:valid_h, :valid_w]
+
+                    logits_region = logits_store.oindex[(slice(None), slice_idx, slice(y0, y1), slice(x0, x1))]
+                    logits_region += logits_slice * weight_slice[None, ...]
+                    logits_store.oindex[(slice(None), slice_idx, slice(y0, y1), slice(x0, x1))] = logits_region
+
+                    weight_region = weights_store.oindex[(slice(slice_idx, slice_idx + 1), slice(y0, y1), slice(x0, x1))][0]
+                    weight_region += weight_slice
+                    weights_store.oindex[(slice(slice_idx, slice_idx + 1), slice(y0, y1), slice(x0, x1))] = weight_region[np.newaxis, ...]
+
+                elif axis == 'y':
+                    z0, x0 = pos0, pos1
+                    z1 = min(z0 + patch_h, Z)
+                    x1 = min(x0 + patch_w, X)
+                    y = slice_idx
+
+                    if channels > 1:
+                        sub = volume[(slice(None), slice(z0, z1), slice(y, y + 1), slice(x0, x1))]
+                        sub = np.asarray(sub)[:, :, 0, :]
+                    else:
+                        sub = volume[(slice(z0, z1), slice(y, y + 1), slice(x0, x1))]
+                        sub = np.asarray(sub)[:, 0, :]
+
+                    valid_h = z1 - z0
+                    valid_w = x1 - x0
+
+                    if self.skip_empty_patches and (sub.size == 0 or float(np.min(sub)) == float(np.max(sub))):
+                        continue
+
+                    patch = np.zeros((channels, patch_h, patch_w), dtype=np.float32)
+                    if channels > 1:
+                        patch[:, :valid_h, :valid_w] = sub
+                    else:
+                        patch[0, :valid_h, :valid_w] = sub
+
+                    logits_np = _run_model(patch)
+                    logits_slice = logits_np[:, :valid_h, :valid_w]
+                    weight_slice = gaussian_map[:valid_h, :valid_w]
+
+                    logits_region = logits_store.oindex[(slice(None), slice(z0, z1), y, slice(x0, x1))]
+                    logits_region += logits_slice * weight_slice[None, ...]
+                    logits_store.oindex[(slice(None), slice(z0, z1), y, slice(x0, x1))] = logits_region
+
+                    weight_region = weights_store.oindex[(slice(z0, z1), y, slice(x0, x1))]
+                    weight_region += weight_slice
+                    weights_store.oindex[(slice(z0, z1), y, slice(x0, x1))] = weight_region
+
+                else:  # axis == 'x'
+                    z0, y0 = pos0, pos1
+                    z1 = min(z0 + patch_h, Z)
+                    y1 = min(y0 + patch_w, Y)
+                    x = slice_idx
+
+                    if channels > 1:
+                        sub = volume[(slice(None), slice(z0, z1), slice(y0, y1), slice(x, x + 1))]
+                        sub = np.asarray(sub)[:, :, :, 0]
+                    else:
+                        sub = volume[(slice(z0, z1), slice(y0, y1), slice(x, x + 1))]
+                        sub = np.asarray(sub)[:, :, 0]
+
+                    valid_h = z1 - z0
+                    valid_w = y1 - y0
+
+                    if self.skip_empty_patches and (sub.size == 0 or float(np.min(sub)) == float(np.max(sub))):
+                        continue
+
+                    patch = np.zeros((channels, patch_h, patch_w), dtype=np.float32)
+                    if channels > 1:
+                        patch[:, :valid_h, :valid_w] = sub
+                    else:
+                        patch[0, :valid_h, :valid_w] = sub
+
+                    logits_np = _run_model(patch)
+                    logits_slice = logits_np[:, :valid_h, :valid_w]
+                    weight_slice = gaussian_map[:valid_h, :valid_w]
+
+                    logits_region = logits_store.oindex[(slice(None), slice(z0, z1), slice(y0, y1), x)]
+                    logits_region += logits_slice * weight_slice[None, ...]
+                    logits_store.oindex[(slice(None), slice(z0, z1), slice(y0, y1), x)] = logits_region
+
+                    weight_region = weights_store.oindex[(slice(z0, z1), slice(y0, y1), x)]
+                    weight_region += weight_slice
+                    weights_store.oindex[(slice(z0, z1), slice(y0, y1), x)] = weight_region
+
+                pbar.update(1)
+
+    def _infer_numpy_volume_slicewise(self, volume_np, patch_hw, normalization_scheme,
+                                      global_mean, global_std, intensity_props):
+        axes_to_process = list(self.slicewise_axes) if getattr(self, 'slicewise_axes', None) else ['z']
+        arr = np.asarray(volume_np)
+
+        if arr.ndim == 3:
+            Z, Y, X = arr.shape
+            volume_data = arr.astype(np.float32)[np.newaxis, ...]
+            channels = 1
+        elif arr.ndim == 4 and arr.shape[0] <= 4:
+            # Assume channel-first (C, Z, Y, X)
+            channels, Z, Y, X = arr.shape
+            volume_data = arr.astype(np.float32)
+        elif arr.ndim == 4 and arr.shape[-1] <= 4:
+            # Assume channel-last (Z, Y, X, C)
+            Z, Y, X, channels = arr.shape
+            volume_data = np.moveaxis(arr.astype(np.float32), -1, 0)
+        else:
+            raise ValueError("Unsupported TIFF shape for 2D slicewise inference. Expected (Z,Y,X) or (C,Z,Y,X).")
+
+        patch_h, patch_w = patch_hw
+        gaussian_map = generate_gaussian_map((1, patch_h, patch_w), sigma_scale=8.0, dtype=np.float32)[0][0]
+        if np.any(gaussian_map == 0):
+            min_nonzero = np.min(gaussian_map[gaussian_map > 0])
+            gaussian_map = np.where(gaussian_map == 0, min_nonzero, gaussian_map)
+
+        axis_configs = {}
+        if 'z' in axes_to_process:
+            coords_z = self._compute_plane_positions((Y, X), patch_hw)
+            axis_configs['z'] = (coords_z, Z)
+        if 'y' in axes_to_process:
+            coords_y = self._compute_plane_positions((Z, X), patch_hw)
+            axis_configs['y'] = (coords_y, Y)
+        if 'x' in axes_to_process:
+            coords_x = self._compute_plane_positions((Z, Y), patch_hw)
+            axis_configs['x'] = (coords_x, X)
+
+        total_positions = 0
+        for axis in axes_to_process:
+            coords, count = axis_configs.get(axis, (None, None))
+            if coords is not None:
+                total_positions += len(coords) * count
+
+        if total_positions == 0:
+            raise RuntimeError("No slice positions generated for the requested slicewise planes.")
+
+        logits_acc = np.zeros((self.num_classes, Z, Y, X), dtype=np.float32)
+        weights_acc = np.zeros((Z, Y, X), dtype=np.float32)
+
+        def normalize_slice(slice_arr):
+            if normalization_scheme in ('none', None):
+                return slice_arr.astype(np.float32, copy=False)
+            if slice_arr.ndim == 2:
+                return self._normalize_numpy(slice_arr.astype(np.float32, copy=False),
+                                             normalization_scheme, global_mean, global_std, intensity_props)
+            normalized = np.zeros_like(slice_arr, dtype=np.float32)
+            for ci in range(slice_arr.shape[0]):
+                normalized[ci] = self._normalize_numpy(slice_arr[ci].astype(np.float32, copy=False),
+                                                       normalization_scheme, global_mean, global_std, intensity_props)
+            return normalized
+
+        def run_model(patch_array):
+            tensor = torch.from_numpy(patch_array).unsqueeze(0).to(self.device)
+            with torch.no_grad(), torch.autocast(device_type=self.device.type):
+                if self.do_tta:
+                    logits = infer_with_tta(
+                        self.model,
+                        tensor,
+                        self.tta_type,
+                        is_multi_task=self.is_multi_task,
+                        concat_multi_task_outputs=self._concat_multi_task_outputs
+                    )
+                else:
+                    logits = self.model(tensor)
+                    if self.is_multi_task:
+                        logits = self._concat_multi_task_outputs(logits)
+            return logits.detach().float().cpu().numpy()[0]
+
+        for axis in axes_to_process:
+            coords, slice_count = axis_configs.get(axis, (None, None))
+            if not coords:
+                continue
+            for slice_idx in range(slice_count):
+                for pos0, pos1 in coords:
+                    if axis == 'z':
+                        y0, x0 = pos0, pos1
+                        y1 = min(y0 + patch_h, Y)
+                        x1 = min(x0 + patch_w, X)
+                        if channels > 1:
+                            sub = volume_data[:, slice_idx, y0:y1, x0:x1]
+                        else:
+                            sub = volume_data[0, slice_idx, y0:y1, x0:x1]
+                        valid_h = y1 - y0
+                        valid_w = x1 - x0
+                        if self.skip_empty_patches:
+                            if sub.size == 0:
+                                continue
+                            smin = float(np.min(sub))
+                            smax = float(np.max(sub))
+                            if smin == smax:
+                                continue
+                        sub_norm = normalize_slice(sub)
+                        patch = np.zeros((channels, patch_h, patch_w), dtype=np.float32)
+                        if channels > 1:
+                            patch[:, :valid_h, :valid_w] = sub_norm
+                        else:
+                            patch[0, :valid_h, :valid_w] = sub_norm
+                        logits_np = run_model(patch)
+                        logits_slice = logits_np[:, :valid_h, :valid_w]
+                        weight_slice = gaussian_map[:valid_h, :valid_w]
+                        logits_acc[:, slice_idx, y0:y1, x0:x1] += logits_slice * weight_slice[None, ...]
+                        weights_acc[slice_idx, y0:y1, x0:x1] += weight_slice
+
+                    elif axis == 'y':
+                        z0, x0 = pos0, pos1
+                        z1 = min(z0 + patch_h, Z)
+                        x1 = min(x0 + patch_w, X)
+                        if channels > 1:
+                            sub = volume_data[:, z0:z1, slice_idx, x0:x1]
+                        else:
+                            sub = volume_data[0, z0:z1, slice_idx, x0:x1]
+                        valid_h = z1 - z0
+                        valid_w = x1 - x0
+                        if self.skip_empty_patches:
+                            if sub.size == 0:
+                                continue
+                            smin = float(np.min(sub))
+                            smax = float(np.max(sub))
+                            if smin == smax:
+                                continue
+                        sub_norm = normalize_slice(sub)
+                        patch = np.zeros((channels, patch_h, patch_w), dtype=np.float32)
+                        if channels > 1:
+                            patch[:, :valid_h, :valid_w] = sub_norm
+                        else:
+                            patch[0, :valid_h, :valid_w] = sub_norm
+                        logits_np = run_model(patch)
+                        logits_slice = logits_np[:, :valid_h, :valid_w]
+                        weight_slice = gaussian_map[:valid_h, :valid_w]
+                        logits_acc[:, z0:z1, slice_idx, x0:x1] += logits_slice * weight_slice[None, ...]
+                        weights_acc[z0:z1, slice_idx, x0:x1] += weight_slice
+
+                    else:  # axis == 'x'
+                        z0, y0 = pos0, pos1
+                        z1 = min(z0 + patch_h, Z)
+                        y1 = min(y0 + patch_w, Y)
+                        if channels > 1:
+                            sub = volume_data[:, z0:z1, y0:y1, slice_idx]
+                        else:
+                            sub = volume_data[0, z0:z1, y0:y1, slice_idx]
+                        valid_h = z1 - z0
+                        valid_w = y1 - y0
+                        if self.skip_empty_patches:
+                            if sub.size == 0:
+                                continue
+                            smin = float(np.min(sub))
+                            smax = float(np.max(sub))
+                            if smin == smax:
+                                continue
+                        sub_norm = normalize_slice(sub)
+                        patch = np.zeros((channels, patch_h, patch_w), dtype=np.float32)
+                        if channels > 1:
+                            patch[:, :valid_h, :valid_w] = sub_norm
+                        else:
+                            patch[0, :valid_h, :valid_w] = sub_norm
+                        logits_np = run_model(patch)
+                        logits_slice = logits_np[:, :valid_h, :valid_w]
+                        weight_slice = gaussian_map[:valid_h, :valid_w]
+                        logits_acc[:, z0:z1, y0:y1, slice_idx] += logits_slice * weight_slice[None, ...]
+                        weights_acc[z0:z1, y0:y1, slice_idx] += weight_slice
+
+        safe_weights = np.where(weights_acc > 0, weights_acc, 1.0)
+        logits_acc = logits_acc / safe_weights[np.newaxis, ...]
+        zero_mask = weights_acc <= 0
+        if np.any(zero_mask):
+            logits_acc[:, zero_mask] = 0.0
+
+        return logits_acc
+
+    def _infer_2d_tiff_volume(self, volume_np: np.ndarray, out_path: Path):
+        if self.patch_size is None or self.num_classes is None:
+            raise RuntimeError("Model/patch metadata missing before TIFF inference.")
+        normalization_scheme, gmean, gstd, iprops = self._resolve_normalization_for_tiff()
+        if len(self.patch_size) == 2:
+            patch_hw = self.patch_size
+        elif len(self.patch_size) == 3 and self.patch_size[0] == 1:
+            patch_hw = self.patch_size[1:]
+        else:
+            raise ValueError(f"2D model requires 2D patch_size, got {self.patch_size}")
+
+        logits_acc_np = self._infer_numpy_volume_slicewise(
+            volume_np=volume_np,
+            patch_hw=patch_hw,
+            normalization_scheme=normalization_scheme,
+            global_mean=gmean,
+            global_std=gstd,
+            intensity_props=iprops
+        )
+
+        C, Z, Y, X = logits_acc_np.shape
+        mode = self.tiff_activation if self.tiff_activation is not None else ('softmax' if self.save_softmax else 'argmax')
+
+        if mode == 'softmax':
+            m = logits_acc_np.max(axis=0, keepdims=True)
+            e = np.exp(logits_acc_np - m)
+            s = e.sum(axis=0, keepdims=True) + 1e-8
+            out_arr = (e / s).astype(np.float32)
+            if Z == 1:
+                out_arr = out_arr[:, 0, :, :]
+            out_arr = np.clip(out_arr * 255.0, 0, 255).astype(np.uint8)
+        elif mode == 'argmax':
+            out_arr = np.argmax(logits_acc_np, axis=0)
+            if Z == 1:
+                out_arr = out_arr[0, :, :]
+            if int(self.num_classes) == 2:
+                out_arr = (out_arr.astype(np.uint8) * 255).astype(np.uint8)
+            else:
+                out_arr = out_arr.astype(np.uint8)
+        else:
+            out_arr = logits_acc_np.astype(np.float32)
+            if Z == 1:
+                out_arr = out_arr[:, 0, :, :]
+
+        if tifffile is None:
+            raise RuntimeError("tifffile is required for TIFF output but is not installed")
+
+        tifffile.imwrite(str(out_path), out_arr, compression='zlib')
+        return str(out_path)
+
 
     def _infer_single_tiff_in_memory(self, img: np.ndarray, out_path: Path):
         # Ensure patch_size and num_classes are set (model loaded)
@@ -848,10 +1383,58 @@ class Inferer():
                 raise ValueError("2D model expects 2D TIFF input (H, W)")
             Y, X = img.shape
             pY, pX = self.patch_size
-            g = generate_gaussian_map((1, pY, pX), sigma_scale=8.0, dtype=np.float32)[0]
-            gaussian_map_2d = g[0]
-            logits_acc = np.zeros((self.num_classes, Y, X), dtype=np.float32)
-            weights_acc = np.zeros((Y, X), dtype=np.float32)
+            # If patch covers the whole image (equal or larger), skip blending/normalization
+            if (pY >= Y and pX >= X):
+                # Prepare single padded patch
+                sub = self._normalize_numpy(img, normalization_scheme, gmean, gstd, iprops)
+                patch = np.zeros((pY, pX), dtype=np.float32)
+                patch[:sub.shape[0], :sub.shape[1]] = sub
+                t = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).to(self.device)
+                with torch.no_grad(), torch.autocast(device_type=self.device.type):
+                    if self.do_tta:
+                        logits = infer_with_tta(
+                            self.model, t, self.tta_type,
+                            is_multi_task=self.is_multi_task,
+                            concat_multi_task_outputs=self._concat_multi_task_outputs
+                        )
+                    else:
+                        logits = self.model(t)
+                        if self.is_multi_task:
+                            logits = self._concat_multi_task_outputs(logits)
+                out_np = logits.detach().float().cpu().numpy()[0]  # (C,pY,pX)
+                logits_acc = out_np[:, :Y, :X]  # crop to image size, no weighting
+
+                # Convert logits to desired output and save as TIFF
+                if tifffile is None:
+                    raise RuntimeError("tifffile is required for TIFF output but is not installed")
+                mode = self.tiff_activation if self.tiff_activation is not None else ('softmax' if self.save_softmax else 'argmax')
+                if mode == 'softmax':
+                    m = logits_acc.max(axis=0, keepdims=True)
+                    e = np.exp(logits_acc - m)
+                    s = e.sum(axis=0, keepdims=True) + 1e-8
+                    out_arr = (e / s).astype(np.float32)  # (C,Y,X)
+                    out_arr = np.clip(out_arr * 255.0, 0, 255).astype(np.uint8)
+                elif mode == 'argmax':
+                    out_arr = np.argmax(logits_acc, axis=0)  # (Y,X)
+                    if int(self.num_classes) == 2:
+                        out_arr = (out_arr.astype(np.uint8) * 255).astype(np.uint8)
+                    else:
+                        out_arr = out_arr.astype(np.uint8)
+                else:
+                    out_arr = logits_acc.astype(np.float32)
+                tifffile.imwrite(str(out_path), out_arr, compression='zlib')
+                return str(out_path)
+
+            # Regular blending path (accumulate on device like nnU-Net)
+            g_np = generate_gaussian_map((1, pY, pX), sigma_scale=8.0, dtype=np.float32)[0][0]  # (pY, pX)
+            gaussian_map_2d = torch.from_numpy(g_np).to(self.device, dtype=torch.float16)
+            # ensure strictly positive weights to avoid division issues
+            if torch.any(gaussian_map_2d == 0):
+                min_nonzero = torch.min(gaussian_map_2d[gaussian_map_2d > 0])
+                gaussian_map_2d = torch.where(gaussian_map_2d == 0, min_nonzero, gaussian_map_2d)
+
+            logits_acc = torch.zeros((self.num_classes, Y, X), dtype=torch.float16, device=self.device)
+            weights_acc = torch.zeros((Y, X), dtype=torch.float16, device=self.device)
             coords = self._compute_patch_positions((Y, X))
         else:
             # Promote 2D to 3D with Z=1
@@ -859,9 +1442,62 @@ class Inferer():
                 img = img[np.newaxis, ...]
             Z, Y, X = img.shape  # (Z,Y,X)
             pZ, pY, pX = self.patch_size
-            gaussian_map = generate_gaussian_map(self.patch_size, sigma_scale=8.0, dtype=np.float32)[0]  # (pZ,pY,pX)
-            logits_acc = np.zeros((self.num_classes, Z, Y, X), dtype=np.float32)
-            weights_acc = np.zeros((Z, Y, X), dtype=np.float32)
+            # If patch covers the whole volume (equal or larger), skip blending/normalization
+            if (pZ >= Z and pY >= Y and pX >= X):
+                sub = self._normalize_numpy(img, normalization_scheme, gmean, gstd, iprops)
+                patch = np.zeros((pZ, pY, pX), dtype=np.float32)
+                patch[:sub.shape[0], :sub.shape[1], :sub.shape[2]] = sub
+                t = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).to(self.device)
+                with torch.no_grad(), torch.autocast(device_type=self.device.type):
+                    if self.do_tta:
+                        logits = infer_with_tta(
+                            self.model, t, self.tta_type,
+                            is_multi_task=self.is_multi_task,
+                            concat_multi_task_outputs=self._concat_multi_task_outputs
+                        )
+                    else:
+                        logits = self.model(t)
+                        if self.is_multi_task:
+                            logits = self._concat_multi_task_outputs(logits)
+                out_np = logits.detach().float().cpu().numpy()[0]  # (C,pZ,pY,pX)
+                logits_acc = out_np[:, :Z, :Y, :X]  # crop to volume size, no weighting
+
+                # Convert logits to desired output and save as TIFF
+                if tifffile is None:
+                    raise RuntimeError("tifffile is required for TIFF output but is not installed")
+                mode = self.tiff_activation if self.tiff_activation is not None else ('softmax' if self.save_softmax else 'argmax')
+                if mode == 'softmax':
+                    m = logits_acc.max(axis=0, keepdims=True)
+                    e = np.exp(logits_acc - m)
+                    s = e.sum(axis=0, keepdims=True) + 1e-8
+                    out_arr = (e / s).astype(np.float32)  # (C,Z,Y,X)
+                    if Z == 1:
+                        out_arr = out_arr[:, 0, :, :]
+                    out_arr = np.clip(out_arr * 255.0, 0, 255).astype(np.uint8)
+                elif mode == 'argmax':
+                    out_arr = np.argmax(logits_acc, axis=0)  # (Z,Y,X)
+                    if Z == 1:
+                        out_arr = out_arr[0, :, :]
+                    if int(self.num_classes) == 2:
+                        out_arr = (out_arr.astype(np.uint8) * 255).astype(np.uint8)
+                    else:
+                        out_arr = out_arr.astype(np.uint8)
+                else:
+                    out_arr = logits_acc.astype(np.float32)
+                    if Z == 1:
+                        out_arr = out_arr[:, 0, :, :]
+                tifffile.imwrite(str(out_path), out_arr, compression='zlib')
+                return str(out_path)
+
+            # Regular blending path (accumulate on device like nnU-Net)
+            g_np = generate_gaussian_map(self.patch_size, sigma_scale=8.0, dtype=np.float32)[0]  # (pZ,pY,pX)
+            gaussian_map = torch.from_numpy(g_np).to(self.device, dtype=torch.float16)
+            if torch.any(gaussian_map == 0):
+                min_nonzero = torch.min(gaussian_map[gaussian_map > 0])
+                gaussian_map = torch.where(gaussian_map == 0, min_nonzero, gaussian_map)
+
+            logits_acc = torch.zeros((self.num_classes, Z, Y, X), dtype=torch.float16, device=self.device)
+            weights_acc = torch.zeros((Z, Y, X), dtype=torch.float16, device=self.device)
             coords = self._compute_patch_positions((Z, Y, X))
 
         # Simple batching for speed
@@ -871,7 +1507,7 @@ class Inferer():
 
         def run_batch(tensor_batch: torch.Tensor, coord_list: list):
             nonlocal logits_acc, weights_acc
-            with torch.no_grad(), torch.amp.autocast('cuda'):
+            with torch.no_grad(), torch.autocast(device_type=self.device.type):
                 if self.do_tta:
                     batch_logits = infer_with_tta(
                         self.model,
@@ -885,32 +1521,35 @@ class Inferer():
                     if self.is_multi_task:
                         batch_logits = self._concat_multi_task_outputs(batch_logits)
 
-            # batch_logits: (B, C, pZ, pY, pX) for 3D, (B, C, pY, pX) for 2D
-            batch_logits_np = batch_logits.detach().float().cpu().numpy()
+            # batch_logits: (B, C, pZ, pY, pX) for 3D, (B, C, pY, pX) for 2D (on device)
             if self.is_2d_model:
                 for i, (y, x) in enumerate(coord_list):
-                    p = batch_logits_np[i]  # (C,pY,pX)
+                    p = batch_logits[i].to(dtype=torch.float16)  # (C,pY,pX) on device
                     iy0 = y; ix0 = x
                     iy1 = min(y + pY, Y); ix1 = min(x + pX, X)
                     py0 = max(0, - (y - 0)); px0 = max(0, - (x - 0))
                     py1 = py0 + (iy1 - iy0); px1 = px0 + (ix1 - ix0)
                     logits_slice = p[:, py0:py1, px0:px1]
                     w_slice = gaussian_map_2d[py0:py1, px0:px1]
-                    logits_acc[:, iy0:iy1, ix0:ix1] += logits_slice * w_slice[np.newaxis, ...]
+                    logits_acc[:, iy0:iy1, ix0:ix1] += logits_slice * w_slice.unsqueeze(0)
                     weights_acc[iy0:iy1, ix0:ix1] += w_slice
             else:
                 for i, (z, y, x) in enumerate(coord_list):
-                    p = batch_logits_np[i]  # (C,pZ,pY,pX)
+                    p = batch_logits[i].to(dtype=torch.float16)  # (C,pZ,pY,pX)
                     iz0 = z; iy0 = y; ix0 = x
                     iz1 = min(z + pZ, Z); iy1 = min(y + pY, Y); ix1 = min(x + pX, X)
                     pz0 = max(0, - (z - 0)); py0 = max(0, - (y - 0)); px0 = max(0, - (x - 0))
                     pz1 = pz0 + (iz1 - iz0); py1 = py0 + (iy1 - iy0); px1 = px0 + (ix1 - ix0)
                     logits_slice = p[:, pz0:pz1, py0:py1, px0:px1]
                     w_slice = gaussian_map[pz0:pz1, py0:py1, px0:px1]
-                    logits_acc[:, iz0:iz1, iy0:iy1, ix0:ix1] += logits_slice * w_slice[np.newaxis, ...]
+                    logits_acc[:, iz0:iz1, iy0:iy1, ix0:ix1] += logits_slice * w_slice.unsqueeze(0)
                     weights_acc[iz0:iz1, iy0:iy1, ix0:ix1] += w_slice
 
         # Iterate positions
+        # For TIFF in-memory inference we never skip patches based on "emptiness".
+        # Skipping leads to uncovered regions (weights remain 0), which shows up
+        # as blank holes in the blended logits/probabilities/labels. Always
+        # evaluating all patches guarantees full coverage.
         for coord in tqdm(coords, desc=f"Inferring {out_path.name}"):
             # Build padded patch tensor (C=1)
             if self.is_2d_model:
@@ -925,13 +1564,7 @@ class Inferer():
                 sub = img[z:z1, y:y1, x:x1]
                 # Normalize per-patch for consistency
                 sub = self._normalize_numpy(sub, normalization_scheme, gmean, gstd, iprops)
-            # Optional: skip empty patches
-            if self.skip_empty_patches:
-                if sub.size == 0:
-                    continue
-                smin = float(sub.min()); smax = float(sub.max())
-                if smin == smax:
-                    continue
+            # Do NOT skip "empty" patches here; ensure weights cover the full image.
             # Pad to patch size
             if self.is_2d_model:
                 patch = np.zeros((pY, pX), dtype=np.float32)
@@ -953,11 +1586,15 @@ class Inferer():
             run_batch(tensor_batch, batch_coords)
             batch_buf.clear(); batch_coords.clear()
 
-        # Normalize by weights
+        # Normalize by weights (only when using blending) on device
         eps = 1e-8
-        nonzero = weights_acc > 0
-        for c in range(self.num_classes):
-            logits_acc[c, nonzero] = logits_acc[c, nonzero] / (weights_acc[nonzero] + eps)
+        # broadcast weights to channel dimension
+        if self.is_2d_model:
+            logits_acc = logits_acc / (weights_acc.clamp_min(eps).unsqueeze(0))
+            logits_acc_np = logits_acc.to(dtype=torch.float32).cpu().numpy()
+        else:
+            logits_acc = logits_acc / (weights_acc.clamp_min(eps).unsqueeze(0))
+            logits_acc_np = logits_acc.to(dtype=torch.float32).cpu().numpy()
 
         # Convert logits to desired output and save as TIFF
         if tifffile is None:
@@ -969,13 +1606,13 @@ class Inferer():
             # Softmax over channel dimension
             # logits_acc: (C,Y,X) for 2D; (C,Z,Y,X) for 3D
             if self.is_2d_model:
-                m = logits_acc.max(axis=0, keepdims=True)
-                e = np.exp(logits_acc - m)
+                m = logits_acc_np.max(axis=0, keepdims=True)
+                e = np.exp(logits_acc_np - m)
                 s = e.sum(axis=0, keepdims=True) + 1e-8
                 out_arr = (e / s).astype(np.float32)  # (C,Y,X)
             else:
-                m = logits_acc.max(axis=0, keepdims=True)
-                e = np.exp(logits_acc - m)
+                m = logits_acc_np.max(axis=0, keepdims=True)
+                e = np.exp(logits_acc_np - m)
                 s = e.sum(axis=0, keepdims=True) + 1e-8
                 out_arr = (e / s).astype(np.float32)  # (C,Z,Y,X)
                 if Z == 1:
@@ -985,9 +1622,9 @@ class Inferer():
         elif mode == 'argmax':
             # Argmax over channels to produce label map
             if self.is_2d_model:
-                out_arr = np.argmax(logits_acc, axis=0)  # (Y,X)
+                out_arr = np.argmax(logits_acc_np, axis=0)  # (Y,X)
             else:
-                out_arr = np.argmax(logits_acc, axis=0)  # (Z,Y,X)
+                out_arr = np.argmax(logits_acc_np, axis=0)  # (Z,Y,X)
                 if Z == 1:
                     out_arr = out_arr[0, :, :]
             # Convert labels to uint8; for binary classes map {0,1}->{0,255}
@@ -997,7 +1634,7 @@ class Inferer():
                 out_arr = out_arr.astype(np.uint8)
         else:
             # mode == 'none': write raw logits as float32
-            out_arr = logits_acc.astype(np.float32)
+            out_arr = logits_acc_np.astype(np.float32)
             if not self.is_2d_model and Z == 1:
                 # Collapse singleton Z for 3D TIFFs that were actually 2D
                 out_arr = out_arr[:, 0, :, :]
@@ -1049,7 +1686,7 @@ class Inferer():
                     patch = np.zeros((pZ, pY, pX), dtype=np.float32)
                     patch[:sub.shape[0], :sub.shape[1], :sub.shape[2]] = sub
                     t = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).to(self.device)
-                with torch.no_grad(), torch.amp.autocast('cuda'):
+                with torch.no_grad(), torch.autocast(device_type=self.device.type):
                     if self.do_tta:
                         logits = infer_with_tta(
                             self.model,
@@ -1101,95 +1738,140 @@ class Inferer():
 
         shape = volume.shape(0)
         if len(shape) == 4:
-            C, Z, Y, X = shape
+            channels, Z, Y, X = shape
         elif len(shape) == 3:
-            C, (Z, Y, X) = 1, shape
+            channels, (Z, Y, X) = 1, shape
         else:
             raise ValueError(f"Unsupported volume shape for 2D inference: {shape}")
 
-        # 2D patch size
         if len(self.patch_size) == 2:
-            pY, pX = self.patch_size
+            patch_hw = tuple(int(v) for v in self.patch_size)
         elif len(self.patch_size) == 3 and self.patch_size[0] == 1:
-            pY, pX = self.patch_size[1:]
+            patch_hw = tuple(int(v) for v in self.patch_size[1:])
         else:
             raise ValueError(f"2D model requires 2D patch_size, got {self.patch_size}")
 
-        # Precompute 2D Gaussian map
-        g = generate_gaussian_map((1, pY, pX), sigma_scale=8.0, dtype=np.float32)[0]
-        gaussian_map_2d = g[0]
+        patch_h, patch_w = patch_hw
+        gaussian_map = generate_gaussian_map((1, patch_h, patch_w), sigma_scale=8.0, dtype=np.float32)[0][0]
 
-        # Compute positions once per slice
-        coords2d = self._compute_patch_positions((Y, X))  # returns (y, x) pairs
+        axes_to_process = list(self.slicewise_axes) if getattr(self, 'slicewise_axes', None) else ['z']
+        axis_configs = {}
+        if 'z' in axes_to_process:
+            coords_z = self._compute_plane_positions((Y, X), patch_hw)
+            axis_configs['z'] = (coords_z, Z)
+        if 'y' in axes_to_process:
+            coords_y = self._compute_plane_positions((Z, X), patch_hw)
+            axis_configs['y'] = (coords_y, Y)
+        if 'x' in axes_to_process:
+            coords_x = self._compute_plane_positions((Z, Y), patch_hw)
+            axis_configs['x'] = (coords_x, X)
 
-        # Build 3D coords list for storage (z, y, x)
-        coords = []
-        for z in range(Z):
-            coords.extend([(z, y, x) for (y, x) in coords2d])
+        total_positions = 0
+        for axis in axes_to_process:
+            coords, count = axis_configs.get(axis, (None, None))
+            if coords is not None:
+                total_positions += len(coords) * count
 
-        # Set and create stores
-        self.patch_start_coords_list = coords
-        self.num_total_patches = len(coords)
-        # Store original volume shape for blending
-        self.original_volume_shape = (Z, Y, X)
-        self._create_output_stores()
+        if total_positions == 0:
+            raise RuntimeError("No slice positions generated for the requested slicewise planes.")
 
-        write_index = 0
-        with tqdm(total=self.num_total_patches, desc=f"2D slices over volume") as pbar:
-            for z in range(Z):
-                for (y, x) in coords2d:
-                    y1, x1 = min(y + pY, Y), min(x + pX, X)
-                    # Read slice window; handle channel dimension
-                    if C > 1:
-                        sub = volume[(slice(None), slice(z, z + 1), slice(y, y1), slice(x, x1))]
-                        sub = sub[:, 0, :, :]  # (C, h, w)
-                    else:
-                        sub = volume[(slice(z, z + 1), slice(y, y1), slice(x, x1))]
-                        sub = sub[0, :, :]  # (h, w)
+        volume_shape = (Z, Y, X)
+        (logits_store,
+         logits_sum_path,
+         weights_store,
+         weights_path,
+         chunk_sizes) = self._create_volume_accumulators(volume_shape)
 
-                    # Skip empty patches if requested
-                    if self.skip_empty_patches:
-                        if sub.size == 0:
-                            continue
-                        smin = float(sub.min()); smax = float(sub.max())
-                        if smin == smax:
-                            continue
+        self.patch_start_coords_list = []
+        self.num_total_patches = total_positions
+        self.original_volume_shape = volume_shape
+        self.coords_store_path = None
 
-                    # Pad to (C, pY, pX)
-                    if C > 1:
-                        patch = np.zeros((C, pY, pX), dtype=np.float32)
-                        patch[:, :sub.shape[1], :sub.shape[2]] = sub
-                    else:
-                        patch = np.zeros((1, pY, pX), dtype=np.float32)
-                        patch[0, :sub.shape[0], :sub.shape[1]] = sub
+        axis_plan = []
+        for axis in axes_to_process:
+            coords, count = axis_configs.get(axis, (None, None))
+            if coords:
+                axis_plan.append((axis, coords, count))
 
-                    # Build tensor (1, C, pY, pX)
-                    t = torch.from_numpy(patch).unsqueeze(0).to(self.device)
+        desc = "2D slices over volume (multi-axis)"
+        with tqdm(total=total_positions, desc=desc) as pbar:
+            for axis_name, positions, slice_count in axis_plan:
+                if not positions:
+                    continue
+                self._accumulate_axis_slices(
+                    volume=volume,
+                    axis=axis_name,
+                    slice_positions=positions,
+                    slice_count=slice_count,
+                    patch_hw=patch_hw,
+                    gaussian_map=gaussian_map,
+                    logits_store=logits_store,
+                    weights_store=weights_store,
+                    channels=channels,
+                    volume_shape=volume_shape,
+                    pbar=pbar
+                )
 
-                    # Inference with TTA
-                    with torch.no_grad(), torch.amp.autocast('cuda'):
-                        if self.do_tta:
-                            logits = infer_with_tta(
-                                self.model,
-                                t,
-                                self.tta_type,
-                                is_multi_task=self.is_multi_task,
-                                concat_multi_task_outputs=self._concat_multi_task_outputs
-                            )
-                        else:
-                            logits = self.model(t)
-                            if self.is_multi_task:
-                                logits = self._concat_multi_task_outputs(logits)
+        final_path = os.path.join(self.output_dir, f"logits_part_{self.part_id}.zarr")
+        final_store = self._finalize_volume_logits(
+            logits_store=logits_store,
+            weights_store=weights_store,
+            final_path=final_path,
+            volume_shape=volume_shape,
+            chunk_sizes=chunk_sizes
+        )
 
-                    out_np = logits.detach().float().cpu().numpy()[0]  # (C_out, pY, pX)
-                    # Store as (C_out,1,pY,pX)
-                    out_np = out_np[:, None, :, :]
-                    self.output_store[write_index] = out_np
-                    write_index += 1
-                    pbar.update(1)
+        final_store.attrs['original_volume_shape'] = list(map(int, volume_shape))
+        final_store.attrs['multi_axis_slicewise'] = True
+        final_store.attrs['slicewise_axes'] = list(axes_to_process)
+        final_store.attrs['patch_size_2d'] = list(map(int, patch_hw))
+        final_store.attrs['overlap'] = float(self.overlap)
+        final_store.attrs['part_id'] = self.part_id
+        final_store.attrs['num_parts'] = self.num_parts
 
-        main_output_path = os.path.join(self.output_dir, f"logits_part_{self.part_id}.zarr")
-        return main_output_path, self.coords_store_path
+        if self.is_multi_task and self.target_info:
+            final_store.attrs['is_multi_task'] = True
+            final_store.attrs['target_info'] = self.target_info
+
+        try:
+            inference_args = {
+                'model_path': str(self.model_path),
+                'model_name': type(self.model).__name__ if self.model is not None else None,
+                'input_dir': str(self.input),
+                'input_format': str(self.input_format),
+                'output_dir': str(self.output_dir),
+                'tta_type': str(self.tta_type),
+                'do_tta': bool(self.do_tta),
+                'overlap': float(self.overlap),
+                'batch_size': int(self.batch_size),
+                'patch_size': list(self.patch_size),
+                'normalization_scheme': str(self.model_normalization_scheme or self.normalization_scheme),
+                'device': str(self.device),
+                'skip_empty_patches': bool(self.skip_empty_patches),
+                'scroll_id': self.scroll_id,
+                'segment_id': self.segment_id,
+                'energy': self.energy,
+                'resolution': self.resolution,
+                'compressor_name': str(self.compressor_name),
+                'compression_level': int(self.compression_level),
+                'timestamp': datetime.utcnow().isoformat() + 'Z',
+                'storage_mode': 'slicewise_multi_axis',
+                'slicewise_axes': list(axes_to_process)
+            }
+            final_store.attrs['inference_args'] = inference_args
+        except Exception as exc:
+            if self.verbose:
+                print(f"Warning: failed to attach inference metadata: {exc}")
+
+        self.output_store = final_store
+
+        del logits_store
+        del weights_store
+
+        self._cleanup_path(logits_sum_path)
+        self._cleanup_path(weights_path)
+
+        return final_path, None
 
     def _run_inference(self):
         if self.verbose: print("Loading model...")
@@ -1212,6 +1894,15 @@ class Inferer():
                     small_enough = (img.shape[0] <= max_3d[0] and img.shape[1] <= max_3d[1] and img.shape[2] <= max_3d[2])
                 else:
                     raise ValueError(f"Unsupported TIFF dimensionality: {img.shape}")
+
+                if self.is_2d_model and img.ndim == 3:
+                    mode = self.tiff_activation if self.tiff_activation is not None else ('softmax' if self.save_softmax else 'argmax')
+                    out_suffix = "logits" if mode == 'none' else mode
+                    out_name = f"{tif.stem}_{out_suffix}.tif"
+                    out_path = Path(self.output_dir) / out_name
+                    saved = self._infer_2d_tiff_volume(img, out_path)
+                    saved_outputs.append(saved)
+                    continue
 
                 if small_enough:
                     # In-memory full-image blending, save final per-image output
@@ -1284,13 +1975,17 @@ def main():
     parser.add_argument('--tif-activation', dest='tiff_activation', type=str, default=None,
                         choices=['softmax', 'argmax', 'none'],
                         help='Activation for TIFF outputs: softmax, argmax, or none (raw logits)')
-    parser.add_argument('--normalization', type=str, default='instance_zscore', 
+    parser.add_argument('--slicewise-planes', type=str, default='z',
+                        help="Comma-separated list of planes for 2D volume inference: choose from 'z','y','x' or 'all' for all axes")
+    parser.add_argument('--normalization', type=str, default='instance_zscore',
                       help='Normalization scheme (instance_zscore, global_zscore, instance_minmax, ct, none)')
     parser.add_argument('--intensity-properties-json', type=str, default=None,
                       help='Path to nnU-Net style intensity properties JSON (dataset_fingerprint.json or intensity_props.json) for CT normalization')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda, cpu)')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
-    parser.add_argument('--skip-empty-patches', dest='skip_empty_patches', action='store_true', 
+    parser.add_argument('--config-yaml', dest='config_yaml', type=str, default=None,
+                        help='Path to training YAML config to use if checkpoint lacks embedded model_config')
+    parser.add_argument('--skip-empty-patches', dest='skip_empty_patches', action='store_true',
                       help='Skip patches that are empty (all values the same). Default: True')
     parser.add_argument('--no-skip-empty-patches', dest='skip_empty_patches', action='store_false',
                       help='Process all patches, even if they appear empty')
@@ -1334,7 +2029,21 @@ def main():
     
     if segment_id is not None and segment_id.isdigit():
         segment_id = int(segment_id)
-    
+
+    slicewise_arg = (args.slicewise_planes or '').strip().lower()
+    if not slicewise_arg:
+        slicewise_axes = None
+    elif slicewise_arg == 'all':
+        slicewise_axes = ['z', 'y', 'x']
+    else:
+        slicewise_axes = [axis.strip() for axis in slicewise_arg.split(',') if axis.strip()]
+        if not slicewise_axes:
+            slicewise_axes = ['z']
+        invalid_axes = [axis for axis in slicewise_axes if axis not in {'z', 'y', 'x'}]
+        if invalid_axes:
+            print(f"Invalid slicewise plane(s): {invalid_axes}. Use any of 'z','y','x', or 'all'.")
+            return 1
+
     print("\n--- Initializing Inferer ---")
     inferer = Inferer(
         model_path=args.model_path,
@@ -1366,7 +2075,10 @@ def main():
         compressor_name=args.zarr_compressor,
         compression_level=args.zarr_compression_level,
         # Pass Hugging Face parameters
-        hf_token=args.hf_token
+        hf_token=args.hf_token,
+        # Fallback config for train.py checkpoints without embedded model_config
+        config_yaml=args.config_yaml,
+        slicewise_axes=slicewise_axes
     )
 
     try:
@@ -1386,79 +2098,95 @@ def main():
             return 0
 
         logits_path, coords_path = result
-        if logits_path and coords_path:
-            # Check if paths exist, using fsspec for S3 paths
+        if logits_path:
             logits_exists = False
-            coords_exists = False
-            
             try:
                 if logits_path.startswith('s3://'):
                     fs = fsspec.filesystem('s3', anon=False)
-                    # Check if .zarray file exists within the zarr directory
                     logits_exists = fs.exists(os.path.join(logits_path, '.zarray'))
                 else:
                     logits_exists = os.path.exists(logits_path)
-                    
-                if coords_path.startswith('s3://'):
-                    fs = fsspec.filesystem('s3', anon=False)
-                    coords_exists = fs.exists(os.path.join(coords_path, '.zarray'))
-                else:
-                    coords_exists = os.path.exists(coords_path)
             except Exception as e:
-                print(f"Warning: Could not verify if output files exist: {e}")
-                print("Attempting to proceed with inspection anyway...")
+                print(f"Warning: Could not verify if logits path exists: {e}")
                 logits_exists = True
-                coords_exists = True
-            
-            if logits_exists and coords_exists:
-                print(f"\n--- Inference Finished ---")
-                print(f"Output logits saved to: {logits_path}")
 
-                print("\n--- Inspecting Output Store ---")
-                try:
-                    output_store = open_zarr(
-                        path=logits_path,
-                        mode='r',
-                        storage_options={'anon': False} if logits_path.startswith('s3://') else None
-                    )
-                    print(f"Output shape: {output_store.shape}")
-                    print(f"Output dtype: {output_store.dtype}")
-                    print(f"Output chunks: {output_store.chunks}")
-                except Exception as inspect_e:
-                    print(f"Could not inspect output Zarr: {inspect_e}")
-                
-                # Print empty patches report if skip_empty_patches was enabled
-                if inferer.skip_empty_patches and hasattr(inferer.dataset, 'get_empty_patches_report'):
-                    report = inferer.dataset.get_empty_patches_report()
-                    print("\n--- Empty Patches Report ---")
-                    print(f"  Empty Patches Skipped: {report['total_skipped']}")
-                    print(f"  Total Available Positions: {report['total_positions']}")
-                    if report['total_skipped'] > 0:
-                        print(f"  Skip Ratio: {report['skip_ratio']:.2%}")
-                        print(f"  Effective Speedup: {1/(1-report['skip_ratio']):.2f}x")
-
-                print("\n--- Inspecting Coordinate Store ---")
-                try:
-                    coords_store = open_zarr(
-                        path=coords_path,
-                        mode='r',
-                        storage_options={'anon': False} if coords_path.startswith('s3://') else None
-                    )
-                    print(f"Coords shape: {coords_store.shape}")
-                    print(f"Coords dtype: {coords_store.dtype}")
-                    first_few_coords = coords_store[0:5]
-                    print(f"First few coordinates:\n{first_few_coords}")
-                except Exception as inspect_e:
-                    print(f"Could not inspect coordinate Zarr: {inspect_e}")
-                return 0
-            else:
-                print(f"\n--- Inference finished, but output paths don't seem to exist ---")
+            if not logits_exists:
+                print(f"\n--- Inference finished, but logits path doesn't seem to exist ---")
                 print(f"Logits path: {logits_path} (exists: {logits_exists})")
-                print(f"Coordinates path: {coords_path} (exists: {coords_exists})")
+                if coords_path:
+                    print(f"Coordinates path: {coords_path}")
                 return 1
-        else:
-            print("\n--- Inference finished, but output paths are None ---")
-            return 1
+
+            print(f"\n--- Inference Finished ---")
+            print(f"Output logits saved to: {logits_path}")
+
+            print("\n--- Inspecting Output Store ---")
+            try:
+                output_store = open_zarr(
+                    path=logits_path,
+                    mode='r',
+                    storage_options={'anon': False} if logits_path.startswith('s3://') else None
+                )
+                print(f"Output shape: {output_store.shape}")
+                print(f"Output dtype: {output_store.dtype}")
+                print(f"Output chunks: {output_store.chunks}")
+            except Exception as inspect_e:
+                print(f"Could not inspect output Zarr: {inspect_e}")
+
+            if (
+                inferer.skip_empty_patches and
+                getattr(inferer, 'dataset', None) is not None and
+                hasattr(inferer.dataset, 'get_empty_patches_report')
+            ):
+                report = inferer.dataset.get_empty_patches_report()
+                print("\n--- Empty Patches Report ---")
+                print(f"  Empty Patches Skipped: {report['total_skipped']}")
+                print(f"  Total Available Positions: {report['total_positions']}")
+                if report['total_positions']:
+                    skip_ratio = report.get('skip_ratio')
+                    if skip_ratio is None:
+                        skip_ratio = report['total_skipped'] / max(report['total_positions'], 1)
+                    print(f"  Skip Ratio: {skip_ratio:.2%}")
+                    if skip_ratio < 1.0:
+                        print(f"  Effective Speedup: {1/(1-skip_ratio):.2f}x")
+
+            if coords_path:
+                coords_exists = False
+                try:
+                    if coords_path.startswith('s3://'):
+                        fs = fsspec.filesystem('s3', anon=False)
+                        coords_exists = fs.exists(os.path.join(coords_path, '.zarray'))
+                    else:
+                        coords_exists = os.path.exists(coords_path)
+                except Exception as e:
+                    print(f"Warning: Could not verify coordinate path: {e}")
+                    coords_exists = True
+
+                if coords_exists:
+                    print("\n--- Inspecting Coordinate Store ---")
+                    try:
+                        coords_store = open_zarr(
+                            path=coords_path,
+                            mode='r',
+                            storage_options={'anon': False} if coords_path.startswith('s3://') else None
+                        )
+                        print(f"Coords shape: {coords_store.shape}")
+                        print(f"Coords dtype: {coords_store.dtype}")
+                        first_few_coords = coords_store[0:5]
+                        print(f"First few coordinates:\n{first_few_coords}")
+                    except Exception as inspect_e:
+                        print(f"Could not inspect coordinate Zarr: {inspect_e}")
+                else:
+                    print(f"Coordinate path {coords_path} not found (expected for direct slicewise mode)")
+            else:
+                print("Coordinate store not produced (multi-axis slicewise mode writes final logits directly).")
+
+            return 0
+
+        print("\n--- Inference finished, but logits path is None ---")
+        if coords_path:
+            print(f"Coordinates path: {coords_path}")
+        return 1
 
     except Exception as main_e:
         print(f"\n--- Inference Failed ---")
