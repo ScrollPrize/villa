@@ -913,8 +913,6 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
             accumulator /= count;
         }
         accumulator.convertTo(img, CV_8U);
-        
-        return img;
     }
     else {
         // Standard single-slice rendering
@@ -933,8 +931,9 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
         }
 
         readInterpolated3D(img, volume->zarrDataset(_ds_sd_idx), coords*_ds_scale, cache, _useFastInterpolation);
-        return img;
     }
+    cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
+    return img;
 }
 
 class LifeTime
