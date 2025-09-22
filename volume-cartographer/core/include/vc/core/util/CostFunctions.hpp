@@ -1063,7 +1063,7 @@ struct PointsCorrectionLoss {
         residuals[0] = T(0.0);
         for (size_t i = 0; i < tgts_.size(); ++i) {
             const T* grid_loc = parameters[4 + i];
-            residuals[0] += calculate_residual_for_point(i, p00, p01, p10, p11, grid_loc);
+            residuals[0] += T(0.05)*calculate_residual_for_point(i, p00, p01, p10, p11, grid_loc);
         }
         return true;
     }

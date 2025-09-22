@@ -122,21 +122,20 @@ static void reset_downstream_points_multi(const std::vector<cv::Vec2f>& seed_loc
                                           cv::Mat_<uint16_t>& generations,
                                           const cv::Rect& bounds)
 {
-    std::queue<cv::Vec2i> q;
+    std::queue<std::pair<cv::Vec2i, uint16_t>> q;
     cv::Mat_<bool> visited(state.size(), false);
     std::vector<cv::Vec2i> neighs = {{1,0},{0,1},{-1,0},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};
 
-    std::set<cv::Vec2i, Vec2iLess> keep_points;
-    for (const auto& corr_loc : all_tgt_locs) {
-        cv::Vec2i top_left(std::floor(corr_loc[1]), std::floor(corr_loc[0]));
-        for (int dy = 0; dy <= 1; ++dy) {
-            for (int dx = 0; dx <= 1; ++dx) {
-                keep_points.insert(top_left + cv::Vec2i(dy, dx));
-            }
+    std::vector<cv::Point2f> hull_points;
+    if (!all_tgt_locs.empty()) {
+        std::vector<cv::Point2f> points_for_hull;
+        points_for_hull.reserve(all_tgt_locs.size());
+        for (const auto& loc : all_tgt_locs) {
+            points_for_hull.emplace_back(loc[0], loc[1]);
         }
+        cv::convexHull(points_for_hull, hull_points);
     }
 
-    std::vector<uint16_t> seed_max_gens;
     for (const auto& corr_loc : seed_locs) {
         uint16_t max_gen = 0;
         cv::Vec2i top_left(std::floor(corr_loc[1]), std::floor(corr_loc[0]));
@@ -148,43 +147,40 @@ static void reset_downstream_points_multi(const std::vector<cv::Vec2f>& seed_loc
                 }
             }
         }
-        seed_max_gens.push_back(max_gen);
 
         for (int dy = -1; dy <= 2; ++dy) {
             for (int dx = -1; dx <= 2; ++dx) {
                 cv::Vec2i p = top_left + cv::Vec2i(dy, dx);
-                if (bounds.contains(cv::Point(p[1], p[0]))) {
-                    q.push(p);
+                if (bounds.contains(cv::Point(p[1], p[0])) && !visited(p)) {
+                    q.push({p, max_gen});
                     visited(p) = true;
                 }
             }
         }
     }
 
-
     std::vector<cv::Vec2i> points_to_reset;
 
     while (!q.empty()) {
-        cv::Vec2i p = q.front();
+        auto [p, current_gen] = q.front();
         q.pop();
-
-        uint16_t max_gen_for_p = 0;
-        for(size_t i = 0; i < seed_locs.size(); ++i) {
-            float dist_sq = cv::norm(cv::Vec2f(p) - seed_locs[i]);
-            if (dist_sq < 100*100) { // Heuristic to associate point with nearby seeds
-                 max_gen_for_p = std::max(max_gen_for_p, seed_max_gens[i]);
-            }
-        }
-        if (max_gen_for_p == 0) max_gen_for_p = generations(p);
-
 
         for (const auto& n : neighs) {
             cv::Vec2i next_p = p + n;
             if (bounds.contains(cv::Point(next_p[1], next_p[0])) && !visited(next_p) && (state(next_p) & STATE_LOC_VALID)) {
-                visited(next_p) = true;
-                if (generations(next_p) > max_gen_for_p && keep_points.find(next_p) == keep_points.end()) {
-                    points_to_reset.push_back(next_p);
-                    q.push(next_p);
+                uint16_t next_gen = generations(next_p);
+                if (next_gen >= current_gen + 1) {
+                    bool keep = false;
+                    if (!hull_points.empty()) {
+                        if (cv::pointPolygonTest(hull_points, { (float)next_p[1], (float)next_p[0] }, false) >= 0) {
+                            keep = true;
+                        }
+                    }
+                    if (!keep) {
+                        visited(next_p) = true;
+                        points_to_reset.push_back(next_p);
+                        q.push({next_p, next_gen});
+                    }
                 }
             }
         }
@@ -211,7 +207,7 @@ static void find_and_reset_downstream_points(const TraceParameters& trace_params
     const auto& tgt_locs = trace_params.point_correction.grid_locs();
     std::vector<cv::Vec2f> seed_locs;
 
-    for(size_t i = 0; i < tgts.size(); ++i) {
+    for(size_t i = 1; i < tgts.size(); ++i) {
         const auto& tgt_loc = tgt_locs[i];
         cv::Vec2i int_loc(std::round(tgt_loc[1]), std::round(tgt_loc[0]));
 
@@ -773,7 +769,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 1000;
-    options.function_tolerance = 1e-4;
+    // options.function_tolerance = 1e-4;
     options.use_nonmonotonic_steps = true;
 
     if (parallel)
@@ -1070,6 +1066,8 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             find_and_reset_downstream_points(trace_params, state, locs, generations, bounds, T);
             cv::Vec2i corr_center_i = { (int)std::round(trace_params.point_correction.grid_locs()[0][1]), (int)std::round(trace_params.point_correction.grid_locs()[0][0]) };
             local_optimization(16, corr_center_i, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
+
+            // trace_params.point_correction = PointCorrection();
 
             if (!intermediate_path_dir.empty()) {
                 cv::Rect used_area_safe = used_area;
