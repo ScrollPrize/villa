@@ -54,17 +54,7 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
     
     input_slice = (slice(None),) + spatial_slices 
     logits_np = input_store[input_slice]
-    
-    # Check if this is an empty chunk (all values are the same, indicating no meaningful data)
-    # This handles empty patches that have been filled with any constant value
-    first_value = logits_np.flat[0]  # Get the first value
-    is_empty = np.allclose(logits_np, first_value, rtol=1e-6)
-    
-    if is_empty:
-        # For empty/homogeneous patches, don't write anything to the output store
-        # This ensures write_empty_chunks=False works correctly
-        return {'chunk_idx': chunk_idx, 'processed_voxels': 0, 'empty': True}
-    
+
     if mode == "binary":
         if is_multi_task and target_info:
             # For multi-task binary, process each target separately
