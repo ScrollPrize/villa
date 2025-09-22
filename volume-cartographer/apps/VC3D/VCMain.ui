@@ -946,22 +946,32 @@
          </property>
         </widget>
        </item>
-       <item row="2" column="2">
-        <widget class="QPushButton" name="btnZoomOut">
-         <property name="text">
-          <string>-</string>
-         </property>
-         <property name="maximumSize">
-          <size>
-           <width>30</width>
-           <height>16777215</height>
-          </size>
-         </property>
-         <property name="toolTip">
-          <string>Zoom Out</string>
-         </property>
-        </widget>
-       </item>
+      <item row="2" column="2">
+       <widget class="QPushButton" name="btnZoomOut">
+        <property name="text">
+         <string>-</string>
+        </property>
+        <property name="maximumSize">
+         <size>
+          <width>30</width>
+          <height>16777215</height>
+         </size>
+        </property>
+        <property name="toolTip">
+         <string>Zoom Out</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="0" colspan="4">
+       <widget class="QCheckBox" name="chkAxisAlignedSlices">
+        <property name="text">
+         <string>Use axis-aligned slice planes</string>
+        </property>
+        <property name="toolTip">
+         <string>Render XZ and YZ viewers on fixed axis-aligned slices</string>
+        </property>
+       </widget>
+      </item>
       </layout>
      </item>
     </layout>

@@ -199,6 +199,14 @@ CWindow::CWindow() :
         }
     });
 
+    fAxisAlignedSlicesShortcut = new QShortcut(QKeySequence("Ctrl+J"), this);
+    fAxisAlignedSlicesShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fAxisAlignedSlicesShortcut, &QShortcut::activated, [this]() {
+        if (chkAxisAlignedSlices) {
+            chkAxisAlignedSlices->toggle();
+        }
+    });
+
     appInitComplete = true;
 }
 
@@ -294,6 +302,7 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
     }
 
     onManualPlaneChanged();
+    applySlicePlaneOrientation(_surf_col->surface("segmentation"));
 }
 
 // Create widgets
@@ -556,7 +565,10 @@ void CWindow::CreateWidgets(void)
     
     connect(btnZoomIn, &QPushButton::clicked, this, &CWindow::onZoomIn);
     connect(btnZoomOut, &QPushButton::clicked, this, &CWindow::onZoomOut);
-    
+
+    chkAxisAlignedSlices = ui.chkAxisAlignedSlices;
+    connect(chkAxisAlignedSlices, &QCheckBox::toggled, this, &CWindow::onAxisAlignedSlicesToggled);
+
     spNorm[0] = ui.dspNX;
     spNorm[1] = ui.dspNY;
     spNorm[2] = ui.dspNZ;
@@ -1284,7 +1296,7 @@ void CWindow::Keybindings(void)
         "5,6: Slice down/up by 10 \n"
         "7,8: Slice down/up by 50 \n"
         "9,0: Slice down/up by 100 \n"
-        "Ctrl+G: Go to slice (opens dialog to insert slice index) \n"
+        "Ctrl+J: Toggle axis-aligned slice planes \n"
         "Ctrl+T: Toggle direction hints (flip_x arrows) \n"
         "T: Segmentation Tool \n"
         "P: Pen Tool \n"
@@ -1372,34 +1384,6 @@ void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf
         //NOTE this comes before the focus poi, so focus is applied by views using these slices
         //FIXME this assumes a single segmentation ... make configurable and cleaner ...
         QuadSurface *segment = dynamic_cast<QuadSurface*>(surf);
-        if (segment) {
-            PlaneSurface *segXZ = dynamic_cast<PlaneSurface*>(_surf_col->surface("seg xz"));
-            PlaneSurface *segYZ = dynamic_cast<PlaneSurface*>(_surf_col->surface("seg yz"));
-            
-            if (!segXZ)
-                segXZ = new PlaneSurface();
-            if (!segYZ)
-                segYZ = new PlaneSurface();
-
-            //FIXME actually properly use ptr
-            auto ptr = segment->pointer();
-            segment->pointTo(ptr, vol_loc, 1.0);
-            
-            cv::Vec3f p2;
-            p2 = segment->coord(ptr, {1,0,0});
-            
-            segXZ->setOrigin(vol_loc);
-            segXZ->setNormal(p2-vol_loc);
-            
-            p2 = segment->coord(ptr, {0,1,0});
-            
-            segYZ->setOrigin(vol_loc);
-            segYZ->setNormal(p2-vol_loc);
-            
-            _surf_col->setSurface("seg xz", segXZ);
-            _surf_col->setSurface("seg yz", segYZ);
-        }
-        
         POI *poi = _surf_col->poi("focus");
         
         if (!poi)
@@ -1410,6 +1394,8 @@ void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf
         poi->n = normal;
         
         _surf_col->setPOI("focus", poi);
+
+        applySlicePlaneOrientation(segment);
 
     }
     else {
@@ -1677,6 +1663,8 @@ void CWindow::onSurfaceSelected()
     }
     else
         std::cout << "ERROR loading " << _surfID << std::endl;
+
+    applySlicePlaneOrientation(_surf);
 
     // If "Current Segment Only" is checked, refresh the filter to update intersections
     if (chkFilterCurrentOnly && chkFilterCurrentOnly->isChecked()) {
@@ -2877,6 +2865,8 @@ void CWindow::onFocusPOIChanged(std::string name, POI* poi)
 
         // Force an update of the filter
         onSegFilterChanged(0);
+
+        applySlicePlaneOrientation();
     }
 }
 
@@ -2931,6 +2921,73 @@ void CWindow::onCopyCoordinates()
     }
 }
 
+void CWindow::onAxisAlignedSlicesToggled(bool enabled)
+{
+    _useAxisAlignedSlices = enabled;
+    applySlicePlaneOrientation();
+}
+
+void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
+{
+    if (!_surf_col) {
+        return;
+    }
+
+    POI *focus = _surf_col->poi("focus");
+    cv::Vec3f origin = focus ? focus->p : cv::Vec3f(0, 0, 0);
+
+    if (_useAxisAlignedSlices) {
+        PlaneSurface *segXZ = dynamic_cast<PlaneSurface*>(_surf_col->surface("seg xz"));
+        PlaneSurface *segYZ = dynamic_cast<PlaneSurface*>(_surf_col->surface("seg yz"));
+
+        if (!segXZ) {
+            segXZ = new PlaneSurface();
+        }
+        if (!segYZ) {
+            segYZ = new PlaneSurface();
+        }
+
+        segXZ->setOrigin(origin);
+        segYZ->setOrigin(origin);
+
+        segXZ->setNormal(cv::Vec3f(0, 1, 0));
+        segYZ->setNormal(cv::Vec3f(1, 0, 0));
+
+        _surf_col->setSurface("seg xz", segXZ);
+        _surf_col->setSurface("seg yz", segYZ);
+        return;
+    } else {
+        auto* segment = dynamic_cast<QuadSurface*>(sourceOverride ? sourceOverride : _surf_col->surface("segmentation"));
+        if (!segment) {
+            return;
+        }
+
+        PlaneSurface *segXZ = dynamic_cast<PlaneSurface*>(_surf_col->surface("seg xz"));
+        PlaneSurface *segYZ = dynamic_cast<PlaneSurface*>(_surf_col->surface("seg yz"));
+
+        if (!segXZ) {
+            segXZ = new PlaneSurface();
+        }
+        if (!segYZ) {
+            segYZ = new PlaneSurface();
+        }
+
+        segXZ->setOrigin(origin);
+        segYZ->setOrigin(origin);
+
+        auto ptr = segment->pointer();
+        segment->pointTo(ptr, origin, 1.0f);
+
+        cv::Vec3f xDir = segment->coord(ptr, {1, 0, 0});
+        cv::Vec3f yDir = segment->coord(ptr, {0, 1, 0});
+        segXZ->setNormal(xDir - origin);
+        segYZ->setNormal(yDir - origin);
+
+        _surf_col->setSurface("seg xz", segXZ);
+        _surf_col->setSurface("seg yz", segYZ);
+        return;
+    }
+}
 void CWindow::onImportObjAsPatches()
 {
     if (!fVpkg) {
