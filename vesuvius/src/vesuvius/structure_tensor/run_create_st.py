@@ -16,7 +16,6 @@ from concurrent.futures import ThreadPoolExecutor
 import zarr
 import numpy as np
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from vesuvius.data.utils import open_zarr
 
 
@@ -129,10 +128,10 @@ def create_shared_output_store(args, input_shape, patch_size):
 def run_structure_tensor_part(args, part_id, gpu_id, shared_output_path):
     """Run the structure tensor computation for a single part."""
     # Import the actual create_st module
-    from structure_tensor import create_st
+    from vesuvius.structure_tensor import create_st
     
     # Build command to run create_st.py's main() directly
-    cmd = [sys.executable, '-m', 'structure_tensor.create_st']
+    cmd = [sys.executable, '-m', 'vesuvius.structure_tensor.create_st']
     
     # Basic arguments
     cmd.extend(['--input_dir', args.input_dir])

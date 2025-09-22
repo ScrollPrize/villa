@@ -40,13 +40,13 @@ scroll_id:
 If you're using the package in development mode (installed with `pip install -e .`), the config files will be located in:
 
 ```
-/path/to/vesuvius/setup/configs/
+/path/to/vesuvius/install/configs/
 ```
 
 If you're using the package installed from PyPI, the config files will be located in:
 
 ```
-/path/to/site-packages/vesuvius/setup/configs/
+/path/to/site-packages/vesuvius/install/configs/
 ```
 
 You can also provide your own configuration files by specifying the file paths when initializing the `Volume` or `Cube` objects.
