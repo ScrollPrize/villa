@@ -292,13 +292,44 @@ void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv
     }
 }
 
+void readInterpolated3D_phased(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
+                        const cv::Mat_<cv::Vec3f> &coords, ChunkCache *cache);
+
 void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
                                const cv::Mat_<cv::Vec3f> &coords, ChunkCache *cache, bool nearest_neighbor) {
     if (nearest_neighbor) {
         return readNearestNeighbor(out,ds,coords,cache);
     }
-  
-    out = cv::Mat_<uint8_t>(coords.size(), 0);
+
+    if (out.size() != coords.size())
+        out = cv::Mat_<uint8_t>(coords.size(), 0);
+
+    auto chunk_shape = ds->chunking().blockShape();
+    double chunk_overhead = (chunk_shape[0] + chunk_shape[1] + chunk_shape[2]) / 3.0;
+    double estimated_memory = coords.total() * chunk_overhead;
+
+    if (estimated_memory > cache->size() * 0.5) {
+        int w = coords.cols;
+        int h = coords.rows;
+        int chunk_width = std::max(1, (int)(((cache->size() * 0.5) / chunk_overhead) / h));
+
+        for (int i = 0; i < w; i += chunk_width) {
+            int current_chunk_width = std::min(chunk_width, w - i);
+            cv::Rect roi(i, 0, current_chunk_width, h);
+            cv::Mat_<cv::Vec3f> coords_chunk = coords(roi);
+            cv::Mat_<uint8_t> out_chunk = out(roi);
+            readInterpolated3D_phased(out_chunk, ds, coords_chunk, cache);
+        }
+    } else {
+        readInterpolated3D_phased(out, ds, coords, cache);
+    }
+}
+
+
+void readInterpolated3D_phased(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
+                        const cv::Mat_<cv::Vec3f> &coords, ChunkCache *cache) {
+
+    assert(out.size() == coords.size());
 
     if (!cache) {
         std::cout << "ERROR should use a shared chunk cache!" << std::endl;
