@@ -327,6 +327,40 @@ def load_model_for_inference(
     else:
         if should_print:
             print(f"Loading model from {model_folder}, fold {fold}")
+
+        # Pre-validate the provided local path and provide a clearer error
+        if not os.path.exists(model_folder):
+            raise FileNotFoundError(
+                f"Model checkpoint not found: path does not exist -> {model_folder}. "
+                f"Provide a valid nnU-Net export directory (with dataset.json and plans.json) or a .pth checkpoint file."
+            )
+
+        # If a folder was provided, check whether it looks like an nnU-Net export folder
+        if os.path.isdir(model_folder):
+            has_dataset = os.path.exists(os.path.join(model_folder, 'dataset.json'))
+            has_plans = os.path.exists(os.path.join(model_folder, 'plans.json'))
+            has_pth_top = any(
+                fname.endswith('.pth') for fname in os.listdir(model_folder)
+                if os.path.isfile(os.path.join(model_folder, fname))
+            )
+
+            # If it is neither an nnU-Net export nor contains any .pth checkpoints at the top level,
+            # emit a clearer, actionable error
+            if not (has_dataset and has_plans) and not has_pth_top:
+                raise FileNotFoundError(
+                    "Model checkpoint not found. Expected either: "
+                    "(a) an nnU-Net model directory containing 'dataset.json' and 'plans.json', "
+                    "or (b) a .pth checkpoint file (pass the file path, not just the folder). "
+                    f"Path checked: {model_folder}"
+                )
+        elif os.path.isfile(model_folder):
+            # File provided but not a .pth
+            if not model_folder.endswith('.pth'):
+                raise FileNotFoundError(
+                    f"Model checkpoint not found: expected a .pth file, got '{model_folder}'. "
+                    "Provide a .pth checkpoint file or an nnU-Net export directory."
+                )
+
         model_info = load_model(
             model_folder=model_folder,
             fold=fold,
@@ -447,16 +481,69 @@ def load_model_from_checkpoint(checkpoint_path, device='cuda'):
         # Also update dataset_config on mgr
         mgr.dataset_config.update(dataset_config)
     
-    # Build the model using the config
+    # Heuristics for missing/ambiguous config when loading train.py checkpoints
+    # 1) Disable deep supervision for inference to avoid forcing separate decoders by default
+    try:
+        mgr.enable_deep_supervision = False
+    except Exception:
+        pass
+
+    # 2) If targets are missing, try to infer from head keys in the state dict
+    if not getattr(mgr, 'targets', None):
+        inferred_targets = {}
+        for k, v in model_state.items():
+            if isinstance(k, str) and k.startswith('task_heads.') and k.endswith('.weight'):
+                try:
+                    tgt_name = k.split('.')[1]
+                except Exception:
+                    continue
+                # v expected shape (out_ch, in_ch, ...)
+                try:
+                    out_ch = int(v.shape[0])
+                except Exception:
+                    out_ch = 1
+                inferred_targets[tgt_name] = {'out_channels': out_ch, 'activation': 'none'}
+        if inferred_targets:
+            mgr.targets = inferred_targets
+            if verbose and should_print:
+                print(f"Inferred targets from checkpoint heads: {list(inferred_targets.keys())}")
+
+    # 3) If decoder sharing strategy is ambiguous, infer from keys
+    try:
+        has_shared = any(str(k).startswith('shared_decoder.') for k in model_state.keys())
+        has_task = any(str(k).startswith('task_decoders.') for k in model_state.keys())
+        if 'separate_decoders' not in mgr.model_config:
+            if has_shared and not has_task:
+                mgr.model_config['separate_decoders'] = False
+            elif has_task and not has_shared:
+                mgr.model_config['separate_decoders'] = True
+            # if both present, leave as-is (custom hybrid)
+            if verbose and should_print:
+                print(f"Decoder strategy inferred: separate_decoders={mgr.model_config.get('separate_decoders', False)}")
+    except Exception:
+        pass
+
+    # Build the model using the (possibly adjusted) config
     model = NetworkFromConfig(mgr)
     
     # For inference, we'll load the model weights directly instead of using load_checkpoint
     # to avoid optimizer state issues
     print("Loading model weights from checkpoint...")
-    model_state = checkpoint['model']
+    # Try to robustly locate the state dict in the checkpoint
+    model_state = checkpoint.get('model')
+    if not isinstance(model_state, dict):
+        # common alternatives
+        for cand_key in ['model_state_dict', 'state_dict', 'network', 'network_weights', 'net', 'student']:
+            if isinstance(checkpoint.get(cand_key), dict):
+                model_state = checkpoint[cand_key]
+                if verbose and should_print:
+                    print(f"Using state dict from checkpoint['{cand_key}']")
+                break
+    if not isinstance(model_state, dict):
+        raise RuntimeError("Could not locate a valid model state_dict in checkpoint. Expected one of: 'model', 'model_state_dict', 'state_dict', 'network', 'network_weights', 'net', 'student'.")
     
     # Check if this is a compiled model (has _orig_mod prefix)
-    is_compiled = any("_orig_mod." in key for key in model_state.keys())
+    is_compiled = any(key.startswith("_orig_mod.") for key in model_state.keys())
     
     if is_compiled:
         print("Detected compiled model checkpoint, handling state dict conversion...")
@@ -469,8 +556,40 @@ def load_model_from_checkpoint(checkpoint_path, device='cuda'):
             else:
                 new_state_dict[key] = value
         model_state = new_state_dict
-    
-    model.load_state_dict(model_state)
+
+    # Strip DistributedDataParallel 'module.' prefix if present
+    if any(key.startswith('module.') for key in model_state.keys()):
+        if verbose and should_print:
+            print("Stripping 'module.' prefix from state dict keys")
+        model_state = {key.replace('module.', '', 1): val for key, val in model_state.items()}
+
+    # If there is a common leading prefix across most keys (e.g., 'model.'), strip it once
+    keys = list(model_state.keys())
+    if len(keys) > 0 and '.' in keys[0]:
+        first_prefix = keys[0].split('.', 1)[0]
+        # check if most keys share this prefix
+        share = sum(1 for k in keys if k.startswith(first_prefix + '.')) / len(keys)
+        if share > 0.9:
+            if verbose and should_print:
+                print(f"Stripping common prefix '{first_prefix}.' from state dict keys")
+            model_state = {k.split('.', 1)[1]: v for k, v in model_state.items()}
+
+    try:
+        model.load_state_dict(model_state)
+    except RuntimeError as e:
+        # Provide a more helpful error with hints on likely causes
+        exp_keys = list(model.state_dict().keys())[:10]
+        got_keys = list(model_state.keys())[:10]
+        msg = (
+            f"Failed to load checkpoint weights into NetworkFromConfig.\n"
+            f"This typically indicates a mismatch between the checkpoint architecture and the rebuilt network.\n"
+            f"- Expected (example keys): {exp_keys}\n"
+            f"- Got (example keys): {got_keys}\n"
+            f"Hints: If your checkpoint lacks 'model_config' (training config), we cannot reconstruct the exact\n"
+            f"architecture. If this is the case, load from an nnU-Net export directory, or provide a YAML\n"
+            f"config that matches the training run and use a loader that consumes it. Original error: {e}"
+        )
+        raise RuntimeError(msg)
     
     # Move model to device
     model = model.to(device)
