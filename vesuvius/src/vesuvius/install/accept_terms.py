@@ -1,7 +1,8 @@
-import sys
+import argparse
 import os
 import site
-import argparse
+import sys
+from pathlib import Path
 
 
 def is_colab():
@@ -21,18 +22,13 @@ def get_installation_path():
         str: The installation path.
 
     Note:
-        - For editable installs, this returns the directory containing the vesuvius.py file
+        - For editable installs, this returns the directory containing the package source.
         - For standard installs, this returns the site-packages directory
     """
-    # Try to find if we're installed in editable mode
-    import os
-
-    current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    vesuvius_py_path = os.path.join(current_dir, "vesuvius.py")
-
-    # If vesuvius.py exists in the parent directory, we're in editable mode
-    if os.path.exists(vesuvius_py_path):
-        return current_dir
+    source_root = Path(__file__).resolve().parents[2]
+    package_root = source_root / "vesuvius"
+    if (package_root / "__init__.py").exists():
+        return str(source_root)
 
     # Otherwise, use the site-packages location
     if is_colab():

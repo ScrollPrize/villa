@@ -15,14 +15,14 @@ from pathlib import Path
 import os
 import yaml
 import requests
-from vesuvius.setup.accept_terms import get_installation_path
+from vesuvius.install.accept_terms import get_installation_path
 import zarr
 
 # Define the functions needed here to avoid circular imports
 def list_files():
     """Load and return the scrolls configuration data from a YAML file."""
     install_path = get_installation_path()
-    scroll_config = os.path.join(install_path, 'vesuvius', 'configs', f'scrolls.yaml')
+    scroll_config = os.path.join(install_path, 'vesuvius', 'install', 'configs', 'scrolls.yaml')
     with open(scroll_config, 'r') as file:
         data = yaml.safe_load(file)
     return data
@@ -244,7 +244,7 @@ class Volume:
             # Use relative paths for config files instead of installation path
             base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             possible_paths = [
-                os.path.join(base_dir, 'setup', 'configs', f'scrolls.yaml'),
+                os.path.join(base_dir, 'install', 'configs', f'scrolls.yaml'),
                 os.path.join(base_dir, 'configs', f'scrolls.yaml')
             ]
             self.configs = None
@@ -1023,7 +1023,7 @@ class Cube:
         """
         self.scroll_id = scroll_id
         install_path = get_installation_path()
-        self.configs = os.path.join(install_path, 'setup', 'configs', f'cubes.yaml')
+        self.configs = os.path.join(install_path, 'vesuvius', 'install', 'configs', f'cubes.yaml')
         self.energy = energy
         self.resolution = resolution
         self.z, self.y, self.x = z, y, x
