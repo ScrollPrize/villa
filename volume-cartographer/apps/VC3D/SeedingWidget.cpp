@@ -3,6 +3,7 @@
 #include <QHBoxLayout>
 #include <QMessageBox>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QApplication>
 #include <QCoreApplication>
 #include <QFileInfo>
@@ -118,7 +119,17 @@ void SeedingWidget::setupUI()
     processesSpinBox->setValue(16);
     processesLayout->addWidget(processesSpinBox);
     mainLayout->addLayout(processesLayout);
-    
+
+    // OMP threads control
+    auto ompLayout = new QHBoxLayout();
+    ompLayout->addWidget(new QLabel("OMP Threads:", this));
+    ompThreadsSpinBox = new QSpinBox(this);
+    ompThreadsSpinBox->setRange(0, 256);
+    ompThreadsSpinBox->setValue(0);
+    ompThreadsSpinBox->setToolTip("If greater than 0, prefixes commands with OMP_NUM_THREADS before execution");
+    ompLayout->addWidget(ompThreadsSpinBox);
+    mainLayout->addLayout(ompLayout);
+
     // Intensity threshold control
     auto thresholdLayout = new QHBoxLayout();
     thresholdLayout->addWidget(new QLabel("Intensity Threshold:", this));
@@ -577,7 +588,8 @@ void SeedingWidget::onRunSegmentationClicked()
     
     const int numProcesses = processesSpinBox->value();
     const int totalPoints = static_cast<int>(allPoints.size());
-    
+    const int ompThreads = ompThreadsSpinBox ? ompThreadsSpinBox->value() : 0;
+
     // Get paths
     std::filesystem::path pathsDir;
     std::filesystem::path seedJsonPath;
@@ -639,7 +651,13 @@ void SeedingWidget::onRunSegmentationClicked()
         QProcess* process = new QProcess(this);
         process->setProcessChannelMode(QProcess::MergedChannels);
         process->setWorkingDirectory(workingDir);
-        
+
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        if (ompThreads > 0) {
+            env.insert("OMP_NUM_THREADS", QString::number(ompThreads));
+        }
+        process->setProcessEnvironment(env);
+
         // Connect finished signal
         connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             [this, process, pointIndex, &completedJobs, &nextPointIndex, &startProcessForPoint, totalPoints]
@@ -683,16 +701,19 @@ void SeedingWidget::onRunSegmentationClicked()
             });
         
         // Start the process
-        QString cmd = QString("%1 \"%2\" \"%3\" \"%4\" %5 %6 %7")
-                         .arg(executablePath)
-                         .arg(QString::fromStdString(volumePath.string()))
-                         .arg(QString::fromStdString(pathsDir.string()))
-                         .arg(QString::fromStdString(seedJsonPath.string()))
-                         .arg(point.p[0])
-                         .arg(point.p[1])
-                         .arg(point.p[2]);
-        
-        std::cout << "Starting job " << pointIndex << ": " << cmd.toStdString() << std::endl;
+        QStringList previewParts;
+        if (ompThreads > 0) {
+            previewParts << QString("OMP_NUM_THREADS=%1").arg(ompThreads);
+        }
+        previewParts << executablePath
+                     << QString("\"%1\"").arg(QString::fromStdString(volumePath.string()))
+                     << QString("\"%1\"").arg(QString::fromStdString(pathsDir.string()))
+                     << QString("\"%1\"").arg(QString::fromStdString(seedJsonPath.string()))
+                     << QString::number(point.p[0])
+                     << QString::number(point.p[1])
+                     << QString::number(point.p[2]);
+
+        std::cout << "Starting job " << pointIndex << ": " << previewParts.join(' ').toStdString() << std::endl;
         
         process->start("nice", QStringList() << "-n" << "19" << "ionice" << "-c" << "3" << executablePath <<
                       QString::fromStdString(volumePath.string()) <<
@@ -1280,7 +1301,8 @@ void SeedingWidget::onExpandSeedsClicked()
     
     const int numProcesses = processesSpinBox->value();
     const int expansionIterations = expansionIterationsSpinBox->value();
-    
+    const int ompThreads = ompThreadsSpinBox ? ompThreadsSpinBox->value() : 0;
+
     // Get paths
     std::filesystem::path pathsDir;
     std::filesystem::path expandJsonPath;
@@ -1334,7 +1356,13 @@ void SeedingWidget::onExpandSeedsClicked()
         QProcess* process = new QProcess(this);
         process->setProcessChannelMode(QProcess::MergedChannels);
         process->setWorkingDirectory(workingDir);
-        
+
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        if (ompThreads > 0) {
+            env.insert("OMP_NUM_THREADS", QString::number(ompThreads));
+        }
+        process->setProcessEnvironment(env);
+
         // Connect finished signal
         connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             [this, process, iterationIndex, &completedJobs, &nextIterationIndex, &startExpansionProcess, expansionIterations]
@@ -1378,13 +1406,16 @@ void SeedingWidget::onExpandSeedsClicked()
             });
         
         // Start the process
-        QString cmd = QString("%1 \"%2\" \"%3\" \"%4\"")
-                         .arg(executablePath)
-                         .arg(QString::fromStdString(volumePath.string()))
-                         .arg(QString::fromStdString(pathsDir.string()))
-                         .arg(QString::fromStdString(expandJsonPath.string()));
-        
-        std::cout << "Starting expansion job " << iterationIndex << ": " << cmd.toStdString() << std::endl;
+        QStringList previewParts;
+        if (ompThreads > 0) {
+            previewParts << QString("OMP_NUM_THREADS=%1").arg(ompThreads);
+        }
+        previewParts << executablePath
+                     << QString("\"%1\"").arg(QString::fromStdString(volumePath.string()))
+                     << QString("\"%1\"").arg(QString::fromStdString(pathsDir.string()))
+                     << QString("\"%1\"").arg(QString::fromStdString(expandJsonPath.string()));
+
+        std::cout << "Starting expansion job " << iterationIndex << ": " << previewParts.join(' ').toStdString() << std::endl;
         
         process->start("nice", QStringList() << "-n" << "19" << "ionice" << "-c" << "3" << executablePath <<
                       QString::fromStdString(volumePath.string()) <<

@@ -722,12 +722,22 @@ def initialize_intensity_properties(target_volumes,
     # Compute if not loaded from cache
     if not loaded_from_cache:
         print(f"\nComputing intensity properties for {normalization_scheme} normalization (foreground only)...")
-        # Match nnU-Net: compute on foreground voxels as defined by labels (>0)
-        intensity_properties = compute_foreground_intensity_properties_parallel(
-            target_volumes,
-            sample_ratio=sample_ratio,
-            max_samples=max_samples
-        )
+        try:
+            # Match nnU-Net: compute on foreground voxels as defined by labels (>0)
+            intensity_properties = compute_foreground_intensity_properties_parallel(
+                target_volumes,
+                sample_ratio=sample_ratio,
+                max_samples=max_samples
+            )
+        except Exception as e:
+            # Safe fallback: for zscore we can skip global props and use per-instance zscore
+            if normalization_scheme == 'zscore':
+                print(f"Warning: Failed to compute intensity properties ({e}). "
+                      f"Falling back to instance z-score (no global props).")
+                intensity_properties = {}
+            else:
+                # For schemes that require global stats (e.g., 'ct'), re-raise
+                raise
         
         # Update the config manager if provided
         if mgr is not None and hasattr(mgr, 'intensity_properties'):
