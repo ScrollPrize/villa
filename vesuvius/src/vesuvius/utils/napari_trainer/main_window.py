@@ -23,7 +23,7 @@ _config_manager = None
 
 @magicgui(filenames={"label": "select config file", "filter": "*.yaml"},
           auto_call=True)
-def filespicker(filenames: Sequence[Path] = str(Path(__file__).parent.parent.parent / 'models' / 'configuration' / 'single_task_config.yaml')) -> Sequence[Path]:
+def filespicker(filenames: Sequence[Path] = str(Path(__file__).parent.parent.parent / 'models' / 'configuration' / 'single_task' / 'ps128_dicece.yaml')) -> Sequence[Path]:
     print("selected config : ", filenames)
     if filenames and _config_manager is not None:
         # Load the first selected file into the config manager
@@ -36,13 +36,13 @@ def filespicker(filenames: Sequence[Path] = str(Path(__file__).parent.parent.par
     patch_size_z={'widget_type': 'SpinBox', 'label': 'Patch Size Z', 'min': 0, 'max': 4096, 'value': 0},
     patch_size_x={'widget_type': 'SpinBox', 'label': 'Patch Size X', 'min': 0, 'max': 4096, 'value': 128},
     patch_size_y={'widget_type': 'SpinBox', 'label': 'Patch Size Y', 'min': 0, 'max': 4096, 'value': 128},
-    min_labeled_percentage={'widget_type': 'SpinBox', 'label': 'Min Labeled Percentage', 'min': 0.0, 'max': 100.0, 'step': 1.0, 'value': 10.0},
+    min_labeled_percentage={'widget_type': 'FloatSpinBox', 'label': 'Min Labeled Percentage', 'min': 0.0, 'max': 100.0, 'step': 1.0, 'value': 10.0},
     max_epochs={'widget_type': 'SpinBox', 'label': 'Max Epochs', 'min': 1, 'max': 1000, 'value': 5},
     loss_function={'widget_type': 'ComboBox', 'choices': ["BCELoss", "BCEWithLogitsLoss", "MSELoss", 
                                                          "L1Loss", "SoftDiceLoss", "BCEDiceLoss", 
                                                          "CrossEntropyLoss", "DiceLoss", "CEDiceLoss"], 'value': "CEDiceLoss"}
 )
-def run_training(patch_size_z: int = 128, patch_size_x: int = 128, patch_size_y: int = 128,
+def run_training(patch_size_z: int = 0, patch_size_x: int = 128, patch_size_y: int = 128,
                 min_labeled_percentage: float = 10.0,
                 max_epochs: int = 5,
                 loss_function: str = "BCEDiceLoss"):
@@ -55,25 +55,7 @@ def run_training(patch_size_z: int = 128, patch_size_x: int = 128, patch_size_y:
     
     # Set data format before updating other configurations
     _config_manager.data_format = 'napari'
-    
-    # Handle 2D case when patch_size_z is 0
-    if patch_size_z == 0:
-        new_patch_size = [patch_size_y, patch_size_x]  # 2D: [height, width]
-    else:
-        new_patch_size = [patch_size_z, patch_size_y, patch_size_x]  # 3D: [depth, height, width]
-    
-    min_labeled_ratio = min_labeled_percentage / 100.0
-    
-    # Update configuration with new parameters
-    _config_manager.update_config(
-        patch_size=new_patch_size,
-        min_labeled_ratio=min_labeled_ratio,
-        max_epochs=max_epochs
-    )
-    
-    # Now that data_format is set to 'napari', the dataset will handle target detection
-    # The NapariDataset will extract images from the viewer and configure targets automatically
-    
+
     # Check if viewer has valid image-label pairs
     viewer = napari.current_viewer()
     if viewer is None:
@@ -93,6 +75,53 @@ def run_training(patch_size_z: int = 128, patch_size_x: int = 128, patch_size_y:
         print("Error: No label layers found in the viewer.")
         return
     
+    # Determine dimensionality from layers if possible
+    all_ndims = []
+    for l in image_layers + label_layers:
+        try:
+            all_ndims.append(int(getattr(l, 'data', None).ndim))
+        except Exception:
+            pass
+    is_2d_view = (len(all_ndims) > 0 and all(n == 2 for n in all_ndims))
+
+    # Handle 2D case when either patch_size_z == 0 or viewer layers are 2D
+    if is_2d_view or patch_size_z == 0:
+        new_patch_size = [patch_size_y, patch_size_x]  # 2D: [height, width]
+        # Force 2D ops in manager to avoid accidental 3D config
+        _config_manager.op_dims = 2
+        # Hint datasets about dimensionality
+        if hasattr(_config_manager, 'dataset_config'):
+            _config_manager.dataset_config['force_2d'] = True
+            _config_manager.dataset_config.pop('force_3d', None)
+        if hasattr(_config_manager, 'model_config'):
+            _config_manager.model_config["conv_op"] = "nn.Conv2d"
+            _config_manager.model_config["norm_op"] = "nn.InstanceNorm2d"
+        print(f"Detected 2D setup; using patch size {new_patch_size} and 2D ops")
+    else:
+        new_patch_size = [patch_size_z, patch_size_y, patch_size_x]  # 3D: [depth, height, width]
+        _config_manager.op_dims = 3
+        if hasattr(_config_manager, 'dataset_config'):
+            _config_manager.dataset_config['force_3d'] = True
+            _config_manager.dataset_config.pop('force_2d', None)
+        if hasattr(_config_manager, 'model_config'):
+            _config_manager.model_config["conv_op"] = "nn.Conv3d"
+            _config_manager.model_config["norm_op"] = "nn.InstanceNorm3d"
+        print(f"Detected 3D setup; using patch size {new_patch_size} and 3D ops")
+
+    min_labeled_ratio = min_labeled_percentage / 100.0
+
+    # Update configuration with new parameters
+    _config_manager.update_config(
+        patch_size=new_patch_size,
+        min_labeled_ratio=min_labeled_ratio,
+        max_epochs=max_epochs,
+        skip_patch_validation=False,
+        min_bbox_percent=0.90
+    )
+
+    # Now that data_format is set to 'napari', the dataset will handle target detection
+    # The NapariDataset will extract images from the viewer and configure targets automatically
+
     # Check for proper naming convention
     valid_pairs = False
     for img_layer in image_layers:
@@ -140,7 +169,7 @@ def main():
     global _config_manager
     _config_manager = ConfigManager(verbose=True)
     # Use an absolute path based on the location of this script
-    default_config_path = Path(__file__).parent.parent.parent / 'models' / 'configuration' / 'single_task_config.yaml'
+    default_config_path = Path(__file__).parent.parent.parent / 'models' / 'configuration' / 'single_task' / 'ps128_dicece.yaml'
     _config_manager.load_config(default_config_path)
     print(f"Default config loaded from {default_config_path}")
 

@@ -222,9 +222,7 @@ def run_inference(viewer: napari.Viewer,
     checkpoint_path = Path(checkpoint_path)
     model_name = checkpoint_path.stem
     image_data = layer.data
-    
-    is_3d = image_data.ndim == 3 and image_data.shape[0] > 1
-    
+
     if roi_size is None:
         if 'patch_size' in model_config:
             config_patch_size = model_config['patch_size']
@@ -237,6 +235,9 @@ def run_inference(viewer: napari.Viewer,
         else:
             raise ValueError("No patch_size or train_patch_size found in model config. Cannot proceed with inference.")
     
+    # Determine inference dimensionality from model roi_size, not raw data shape.
+    # Many napari images are (C, H, W); that should be treated as 2D when roi_size is 2.
+    is_3d = len(roi_size) == 3
     print(f"Final roi_size for inference: {roi_size}")
     print(f"Data shape: {image_data.shape}, Using {'3D' if is_3d else '2D'} inference")
     
@@ -245,6 +246,7 @@ def run_inference(viewer: napari.Viewer,
     elif not is_3d and len(roi_size) != 2:
         raise ValueError(f"2D data requires 2D roi_size, but got {roi_size}")
     
+    # Sanity-check: roi_size must match intended dims
     model_dims = len(roi_size)
     data_dims = 3 if is_3d else 2
     if model_dims != data_dims:
