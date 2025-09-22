@@ -19,7 +19,8 @@ from .base_metric import BaseMetric
 
 class SkeletonBranchPointsMetric(BaseMetric):
     """
-    Computes branch point count differences between prediction and ground truth.
+    Computes branch point differences between prediction and ground truth,
+    averaging branch-point counts over Z slices (per-class).
 
     For each batch item and class, it:
     - Reduces channel predictions to class masks
@@ -27,7 +28,7 @@ class SkeletonBranchPointsMetric(BaseMetric):
       - If `num_classes > 2`: take argmax across channels and binarize per-class
     - For each z-slice, performs 2D skeletonization
     - Counts branch points (skeleton pixels with >2 8-neighbors)
-    Aggregates counts across slices and averages over batch.
+    Computes the mean count across Z slices and then averages over the batch.
     """
 
     def __init__(self, num_classes: int = 2, ignore_index: int = 0, threshold: float = 0.5):
@@ -142,18 +143,22 @@ class SkeletonBranchPointsMetric(BaseMetric):
                 has_pred = bool(pred_mask.any())
                 has_gt = bool(gt_mask.any())
 
-                pred_bp = 0
-                gt_bp = 0
+                pred_bp = 0.0
+                gt_bp = 0.0
 
                 if has_pred:
                     skel_pred_u8 = self._skeletonize_stack_2d(pred_mask)
                     neigh_pred = convolve(skel_pred_u8, neigh_kernel, mode='constant', cval=0)
-                    pred_bp = int(((skel_pred_u8 == 1) & (neigh_pred >= 3)).sum())
+                    pred_bp_per_slice = ((skel_pred_u8 == 1) & (neigh_pred >= 3)).sum(axis=(1, 2))
+                    # Average branch points across Z slices
+                    pred_bp = float(pred_bp_per_slice.mean())
 
                 if has_gt:
                     skel_gt_u8 = self._skeletonize_stack_2d(gt_mask)
                     neigh_gt = convolve(skel_gt_u8, neigh_kernel, mode='constant', cval=0)
-                    gt_bp = int(((skel_gt_u8 == 1) & (neigh_gt >= 3)).sum())
+                    gt_bp_per_slice = ((skel_gt_u8 == 1) & (neigh_gt >= 3)).sum(axis=(1, 2))
+                    # Average branch points across Z slices
+                    gt_bp = float(gt_bp_per_slice.mean())
 
                 results[f"branch_points_pred_class_{c}"] += pred_bp
                 results[f"branch_points_gt_class_{c}"] += gt_bp
