@@ -27,6 +27,14 @@ def update_config_from_args(mgr, args):
     mgr.ckpt_out_base = Path(args.output)
     mgr.tr_info["ckpt_out_base"] = str(mgr.ckpt_out_base)
 
+    # Skip image/zarr preflight checks if requested
+    if hasattr(args, 'skip_image_checks') and args.skip_image_checks:
+        mgr.skip_image_checks = True
+        if hasattr(mgr, 'dataset_config'):
+            mgr.dataset_config['skip_image_checks'] = True
+        if mgr.verbose:
+            print("Skipping image/zarr preflight checks as requested (--skip-image-checks)")
+
     if args.batch_size is not None:
         mgr.train_batch_size = args.batch_size
         mgr.tr_configs["batch_size"] = args.batch_size
@@ -145,6 +153,15 @@ def update_config_from_args(mgr, args):
         if mgr.verbose:
             print(f"Set gradient clipping: {mgr.gradient_clip}")
 
+    # Gradient accumulation steps
+    if hasattr(args, 'gradient_accumulation') and args.gradient_accumulation is not None:
+        if args.gradient_accumulation < 1:
+            raise ValueError(f"--grad-accum/--gradient-accumulation must be >= 1, got {args.gradient_accumulation}")
+        mgr.gradient_accumulation = int(args.gradient_accumulation)
+        mgr.tr_configs["gradient_accumulation"] = int(args.gradient_accumulation)
+        if mgr.verbose:
+            print(f"Set gradient accumulation steps: {mgr.gradient_accumulation}")
+
     if args.scheduler is not None:
         mgr.scheduler = args.scheduler
         mgr.tr_configs["scheduler"] = args.scheduler
@@ -176,6 +193,67 @@ def update_config_from_args(mgr, args):
                 print(f"Early stopping disabled")
             else:
                 print(f"Set early stopping patience: {args.early_stopping_patience} epochs")
+
+    # SSL warmup (mean teacher): ignore EMA consistency loss for N epochs
+    if hasattr(args, 'ssl_warmup') and args.ssl_warmup is not None:
+        mgr.warmup = int(args.ssl_warmup)
+        mgr.tr_configs["ssl_warmup"] = int(args.ssl_warmup)
+        if mgr.verbose:
+            if args.ssl_warmup > 0:
+                print(f"SSL warmup enabled: ignoring EMA consistency loss for first {args.ssl_warmup} epoch(s)")
+            else:
+                print("SSL warmup disabled (0 epochs)")
+
+    # Semi-supervised sampling controls
+    if hasattr(args, 'labeled_ratio') and args.labeled_ratio is not None:
+        if not (0.0 <= args.labeled_ratio <= 1.0):
+            raise ValueError(f"--labeled-ratio must be in [0,1], got {args.labeled_ratio}")
+        mgr.labeled_ratio = float(args.labeled_ratio)
+        mgr.tr_configs["labeled_ratio"] = float(args.labeled_ratio)
+        if mgr.verbose:
+            print(f"Set labeled patch ratio: {mgr.labeled_ratio}")
+
+    if hasattr(args, 'num_labeled') and args.num_labeled is not None:
+        if args.num_labeled < 0:
+            # Convention: -1 means use all labeled patches
+            mgr.num_labeled = None
+            mgr.tr_configs["num_labeled"] = None
+            if mgr.verbose:
+                print("Using all labeled patches (num_labeled=-1)")
+        else:
+            mgr.num_labeled = int(args.num_labeled)
+            mgr.tr_configs["num_labeled"] = int(args.num_labeled)
+            if mgr.verbose:
+                print(f"Set absolute labeled patch count: {mgr.num_labeled}")
+
+    if hasattr(args, 'labeled_batch_size') and args.labeled_batch_size is not None:
+        if args.labeled_batch_size < 1:
+            raise ValueError(f"--labeled-batch-size must be >=1, got {args.labeled_batch_size}")
+        mgr.labeled_batch_size = int(args.labeled_batch_size)
+        mgr.tr_configs["labeled_batch_size"] = int(args.labeled_batch_size)
+        if mgr.verbose:
+            print(f"Set labeled batch size: {mgr.labeled_batch_size}")
+
+
+
+    # Checkpoint/weights loading controls
+    if hasattr(args, 'checkpoint_path') and args.checkpoint_path is not None:
+        mgr.checkpoint_path = Path(args.checkpoint_path)
+        mgr.tr_info["checkpoint_path"] = str(mgr.checkpoint_path)
+        if mgr.verbose:
+            print(f"Set checkpoint path: {mgr.checkpoint_path}")
+
+    if hasattr(args, 'load_weights_only') and args.load_weights_only:
+        mgr.load_weights_only = True
+        mgr.tr_info["load_weights_only"] = True
+        if mgr.verbose:
+            print("Will load model weights only (ignore optimizer/scheduler)")
+
+    if hasattr(args, 'rebuild_from_ckpt_config') and args.rebuild_from_ckpt_config:
+        mgr.rebuild_from_checkpoint_config = True
+        mgr.tr_info["rebuild_from_checkpoint_config"] = True
+        if mgr.verbose:
+            print("Will rebuild model from checkpoint's model_config before loading weights")
 
     mgr.wandb_project = args.wandb_project
     mgr.wandb_entity = args.wandb_entity

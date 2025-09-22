@@ -156,14 +156,14 @@ def find_mask_patches_2d(mask_array, label_array, patch_size, stride=None, min_m
                     # Check for non-zero ratio (for MAE pretraining)
                     nonzero_ratio = np.count_nonzero(label_patch) / label_patch.size
                     if nonzero_ratio >= min_nonzero_ratio:
-                        patches.append({'start_pos': [0, y, x]})  # [dummy_z, y, x]
+                        patches.append({'start_pos': [y, x]})  # 2D uses [y, x]
                 else:
                     # Calculate ratio of labeled pixels in the patch
                     labeled_ratio = np.count_nonzero(label_patch) / label_patch.size
                     
                     # Only include patches with sufficient labeled pixels
                     if labeled_ratio >= min_labeled_ratio:
-                        patches.append({'start_pos': [0, y, x]})  # [dummy_z, y, x]
+                        patches.append({'start_pos': [y, x]})  # 2D uses [y, x]
     
     return patches
 
