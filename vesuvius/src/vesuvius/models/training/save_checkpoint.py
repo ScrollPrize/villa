@@ -36,8 +36,24 @@ def save_checkpoint(model, optimizer, scheduler, epoch, checkpoint_path,
     dict
         The checkpoint dictionary that was saved
     """
+    # Unwrap compiled or DDP-wrapped modules for clean state_dict keys
+    def _unwrap_model(m):
+        # DDP unwrap
+        if hasattr(m, 'module'):
+            m = m.module
+        # torch.compile unwrap
+        # Compiled modules typically have attribute `_orig_mod`
+        if hasattr(m, '_orig_mod'):
+            try:
+                m = m._orig_mod
+            except Exception:
+                pass
+        return m
+
+    model_to_save = _unwrap_model(model)
+
     checkpoint_data = {
-        'model': model.state_dict(),
+        'model': model_to_save.state_dict(),
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict(),
         'epoch': epoch,
@@ -125,9 +141,10 @@ def manage_checkpoint_history(checkpoint_history, best_checkpoints, epoch,
             print(f"Removed checkpoint: {ckpt_file}")
     
     print(f"\nCheckpoint management:")
-    print(f"  Last {max_recent} checkpoints: {[f'epoch{e}' for e, _ in checkpoint_history]}")
+    # Display 1-based epoch numbers for user-facing logs
+    print(f"  Last {max_recent} checkpoints: {[f'epoch{e+1}' for e, _ in checkpoint_history]}")
     if best_checkpoints:
-        print(f"  Best {max_best} checkpoints: {[f'epoch{e} (loss={l:.4f})' for l, e, _ in best_checkpoints[:max_best]]}")
+        print(f"  Best {max_best} checkpoints: {[f'epoch{e+1} (loss={l:.4f})' for l, e, _ in best_checkpoints[:max_best]]}")
     
     return checkpoint_history, best_checkpoints
 

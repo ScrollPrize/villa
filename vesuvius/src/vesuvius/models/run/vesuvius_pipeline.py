@@ -42,7 +42,9 @@ def parse_arguments():
                       help='Path to the model directory or checkpoint')
     parser.add_argument('--model-type', type=str, choices=['nnunet', 'custom'], default='nnunet',
                       help='Model type. "nnunet" (default) or "custom".')
-    
+    parser.add_argument('--config-yaml', dest='config_yaml', type=str, default=None,
+                      help='Training config YAML to use when checkpoint lacks embedded model_config')
+
     # Processing parameters
     parser.add_argument('--mode', type=str, choices=['binary', 'multiclass'], default='binary',
                       help='Processing mode. "binary" for 2-class, "multiclass" for >2 classes. Default: binary')
@@ -195,7 +197,10 @@ def run_predict(args, part_id, gpu_id, z_min=None, z_max=None):
     # Add other optional arguments
     if args.patch_size:
         cmd.extend(['--patch_size', args.patch_size])
-    
+    # Pass through config yaml if provided
+    if getattr(args, 'config_yaml', None):
+        cmd.extend(['--config-yaml', args.config_yaml])
+
     # Performance settings
     cmd.extend(['--batch_size', str(args.batch_size)])
     
