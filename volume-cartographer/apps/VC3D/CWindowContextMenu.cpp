@@ -35,11 +35,20 @@ static bool runProcessBlocking(const QString& program,
     QProcess p;
     if (!workDir.isEmpty()) p.setWorkingDirectory(workDir);
     p.setProcessChannelMode(QProcess::SeparateChannels);
+
+    // Print the entire program invocation
+    std::cout << "Running: " << program.toStdString();
+    for (const QString& arg : args) {
+        std::cout << " " << arg.toStdString();
+    }
+    std::cout << std::endl;
+
     p.start(program, args);
     if (!p.waitForStarted()) { if (err) *err = QObject::tr("Failed to start %1").arg(program); return false; }
     if (!p.waitForFinished(-1)) { if (err) *err = QObject::tr("Timeout running %1").arg(program); return false; }
     if (out) *out = QString::fromLocal8Bit(p.readAllStandardOutput());
     if (err) *err = QString::fromLocal8Bit(p.readAllStandardError());
+
     return (p.exitStatus()==QProcess::NormalExit && p.exitCode()==0);
 }
 
@@ -52,11 +61,15 @@ static QString resolvePythonPath()
     const QString env = QString::fromLocal8Bit(qgetenv("VC_PYTHON"));
     if (!env.isEmpty() && QFileInfo::exists(env)) return env;
 
-    // Prefer micromamba env you mentioned
+    // Prefer micromamba env
     if (QFileInfo::exists("/opt/micromamba/envs/py310/bin/python"))
         return "/opt/micromamba/envs/py310/bin/python";
 
-    // Reasonable fallbacks
+    // Check for miniconda3 if available
+    const QString minicondaPath = QDir::homePath() + "/miniconda3/bin/python3";
+    if (QFileInfo::exists(minicondaPath)) return minicondaPath;
+
+    // Reasonable system fallbacks
     if (QFileInfo::exists("/opt/venv/bin/python3"))  return "/opt/venv/bin/python3";
     if (QFileInfo::exists("/usr/local/bin/python3")) return "/usr/local/bin/python3";
     if (QFileInfo::exists("/usr/bin/python3"))       return "/usr/bin/python3";
@@ -85,6 +98,12 @@ static QString resolveFlatboiScript()
     if (QFileInfo::exists(bin.filePath("flatboi.py"))) {
         return bin.filePath("flatboi.py");
     }
+
+    //are we running from a dev branch? if so lets get out of the cmake-build repo and look under scripts/
+    if (QFileInfo::exists(bin.filePath("../../scripts/flatboi.py"))) {
+        return bin.filePath("../../scripts/flatboi.py");
+    }
+
 
     return QDir(bin.filePath("../scripts")).filePath("flatboi.py");
 }
@@ -664,5 +683,235 @@ void CWindow::onDeleteSegments(const std::vector<std::string>& segmentIds)
                "This may be due to insufficient permissions. "
                "Try running the application with elevated privileges or manually delete the folders.")
             .arg(failedSegments.join(", ")));
+    }
+}
+
+
+void CWindow::onAWSUpload(const std::string& segmentId)
+{
+    auto surfMeta = fVpkg ? fVpkg->getSurface(segmentId) : nullptr;
+    if (currentVolume == nullptr || !surfMeta) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot upload to AWS: No volume or invalid segment selected"));
+        return;
+    }
+    if (_cmdRunner && _cmdRunner->isRunning()) {
+        QMessageBox::warning(this, tr("Warning"), tr("A command line tool is already running."));
+        return;
+    }
+
+    // Paths
+    const std::filesystem::path segDirFs = surfMeta->path;           // tifxyz folder
+    const QString  segDir   = QString::fromStdString(segDirFs.string());
+    const QString  objPath  = QDir(segDir).filePath(QString::fromStdString(segmentId) + ".obj");
+    const QString  flatObj  = QDir(segDir).filePath(QString::fromStdString(segmentId) + "_flatboi.obj");
+    QString        outTifxyz= segDir + "_flatboi";
+
+    if (!QFileInfo::exists(segDir)) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot upload to AWS: Segment directory not found"));
+        return;
+    }
+
+    // Prompt user to select the scroll subdirectory
+    QStringList scrollOptions;
+    scrollOptions << "PHerc0172" << "PHerc0343P" << "PHerc0500P2";
+
+    bool ok;
+    QString selectedScroll = QInputDialog::getItem(
+        this,
+        tr("Select Scroll for Upload"),
+        tr("Select the target scroll directory:"),
+        scrollOptions,
+        0,  // default selection index
+        false,  // editable
+        &ok
+    );
+
+    if (!ok || selectedScroll.isEmpty()) {
+        statusBar()->showMessage(tr("AWS upload cancelled by user"), 3000);
+        return;
+    }
+
+    // Prompt for AWS profile
+    QSettings settings("VC.ini", QSettings::IniFormat);
+    QString defaultProfile = settings.value("aws/default_profile", "").toString();
+
+    QString awsProfile = QInputDialog::getText(
+        this,
+        tr("AWS Profile"),
+        tr("Enter AWS profile name (leave empty for default credentials):"),
+        QLineEdit::Normal,
+        defaultProfile,
+        &ok
+    );
+
+    if (!ok) {
+        statusBar()->showMessage(tr("AWS upload cancelled by user"), 3000);
+        return;
+    }
+
+    // Save the profile for next time if it's not empty
+    if (!awsProfile.isEmpty()) {
+        settings.setValue("aws/default_profile", awsProfile);
+    }
+
+    // Track what we're uploading and any errors
+    QStringList uploadedFiles;
+    QStringList failedFiles;
+
+    // Enhanced upload function with progress reporting
+    auto uploadFileWithProgress = [&](const QString& localPath, const QString& s3Path, const QString& description, bool isDirectory = false) {
+        if (!QFileInfo::exists(localPath)) {
+            return; // Skip if doesn't exist
+        }
+
+        if (isDirectory && !QFileInfo(localPath).isDir()) {
+            return; // Skip if not a directory when expected
+        }
+
+        QStringList awsArgs;
+        awsArgs << "s3" << "cp" << localPath << s3Path;
+
+        if (isDirectory) {
+            awsArgs << "--recursive";
+        }
+
+        // Add profile if specified
+        if (!awsProfile.isEmpty()) {
+            awsArgs << "--profile" << awsProfile;
+        }
+
+        statusBar()->showMessage(tr("Uploading %1...").arg(description), 0);
+
+        QProcess p;
+        p.setWorkingDirectory(segDir);
+        p.setProcessChannelMode(QProcess::MergedChannels);
+
+        p.start("aws", awsArgs);
+
+        if (!p.waitForStarted()) {
+            failedFiles << QString("%1: Failed to start AWS CLI").arg(description);
+            return;
+        }
+
+        // Read output while process is running to show progress
+        while (p.state() != QProcess::NotRunning) {
+            if (p.waitForReadyRead(100)) {
+                QString output = QString::fromLocal8Bit(p.readAllStandardOutput());
+                if (!output.isEmpty()) {
+                    // Parse AWS CLI progress output
+                    QStringList lines = output.split('\n', Qt::SkipEmptyParts);
+                    for (const QString& line : lines) {
+                        if (line.contains("Completed") || line.contains("upload:")) {
+                            // Extract progress info and show in status bar
+                            QString progressMsg = QString("Uploading %1: %2").arg(description, line.trimmed());
+                            statusBar()->showMessage(progressMsg, 0);
+                        }
+                    }
+                }
+            }
+            QCoreApplication::processEvents();
+        }
+
+        p.waitForFinished(-1);
+
+        if (p.exitStatus() == QProcess::NormalExit && p.exitCode() == 0) {
+            uploadedFiles << description;
+        } else {
+            QString error = QString::fromLocal8Bit(p.readAllStandardError());
+            if (error.isEmpty()) {
+                error = QString::fromLocal8Bit(p.readAllStandardOutput());
+            }
+            failedFiles << QString("%1: %2").arg(description, error);
+        }
+    };
+
+    // Function to handle uploads for a given directory (regular or flatboi)
+    auto uploadSegmentContents = [&](const QString& targetDir, const QString& segmentSuffix) {
+        QString segmentName = QString::fromStdString(segmentId) + segmentSuffix;
+
+        // Upload OBJ files to meshes/
+        QString meshPath = QString("s3://vesuvius-challenge/%1/segments/meshes/%2/")
+            .arg(selectedScroll)
+            .arg(segmentName);
+
+        // Upload main OBJ
+        QString objFile = QDir(targetDir).filePath(segmentName + ".obj");
+        uploadFileWithProgress(objFile, meshPath, QString("%1.obj").arg(segmentName));
+
+        // Upload flatboi OBJ
+        QString flatboiObjFile = QDir(targetDir).filePath(segmentName + "_flatboi.obj");
+        uploadFileWithProgress(flatboiObjFile, meshPath, QString("%1_flatboi.obj").arg(segmentName));
+
+        // Check if all 4 required files exist for tif/meta upload
+        QString xTif = QDir(targetDir).filePath("x.tif");
+        QString yTif = QDir(targetDir).filePath("y.tif");
+        QString zTif = QDir(targetDir).filePath("z.tif");
+        QString metaJson = QDir(targetDir).filePath("meta.json");
+
+        if (QFileInfo::exists(xTif) && QFileInfo::exists(yTif) &&
+            QFileInfo::exists(zTif) && QFileInfo::exists(metaJson)) {
+            uploadFileWithProgress(xTif, meshPath, QString("%1/x.tif").arg(segmentName));
+            uploadFileWithProgress(yTif, meshPath, QString("%1/y.tif").arg(segmentName));
+            uploadFileWithProgress(zTif, meshPath, QString("%1/z.tif").arg(segmentName));
+            uploadFileWithProgress(metaJson, meshPath, QString("%1/meta.json").arg(segmentName));
+        }
+
+        // Upload overlapping.json if it exists
+        QString overlappingJson = QDir(targetDir).filePath("overlapping.json");
+        uploadFileWithProgress(overlappingJson, meshPath, QString("%1/overlapping.json").arg(segmentName));
+
+        // Upload layers directory to surface-volumes/
+        QString layersDir = QDir(targetDir).filePath("layers");
+        if (QFileInfo::exists(layersDir) && QFileInfo(layersDir).isDir()) {
+            QString surfaceVolPath = QString("s3://vesuvius-challenge/%1/segments/surface-volumes/%2/layers/")
+                .arg(selectedScroll)
+                .arg(segmentName);
+            uploadFileWithProgress(layersDir, surfaceVolPath, QString("%1/layers").arg(segmentName), true);
+        }
+    };
+
+    // Create a simple progress dialog
+    QProgressDialog progressDlg(tr("Uploading to AWS S3..."), tr("Cancel"), 0, 0, this);
+    progressDlg.setWindowModality(Qt::WindowModal);
+    progressDlg.setAutoClose(false);
+    progressDlg.show();
+
+    // Upload contents of main segment directory
+    uploadSegmentContents(segDir, "");
+
+    // Check for cancel
+    if (progressDlg.wasCanceled()) {
+        statusBar()->showMessage(tr("AWS upload cancelled"), 3000);
+        return;
+    }
+
+    // Upload contents of flatboi directory if it exists
+    if (QFileInfo::exists(outTifxyz) && QFileInfo(outTifxyz).isDir()) {
+        uploadSegmentContents(outTifxyz, "_flatboi");
+    }
+
+    progressDlg.close();
+
+    // Show results
+    if (!uploadedFiles.isEmpty() && failedFiles.isEmpty()) {
+        QMessageBox::information(this, tr("Upload Complete"),
+            tr("Successfully uploaded to S3:\n\n%1").arg(uploadedFiles.join("\n")));
+        statusBar()->showMessage(tr("AWS upload complete"), 5000);
+    } else if (!uploadedFiles.isEmpty() && !failedFiles.isEmpty()) {
+        QMessageBox::warning(this, tr("Partial Upload"),
+            tr("Uploaded:\n%1\n\nFailed:\n%2").arg(uploadedFiles.join("\n"), failedFiles.join("\n")));
+        statusBar()->showMessage(tr("AWS upload partially complete"), 5000);
+    } else if (uploadedFiles.isEmpty() && !failedFiles.isEmpty()) {
+        QMessageBox::critical(this, tr("Upload Failed"),
+            tr("All uploads failed:\n\n%1\n\nPlease check:\n"
+               "- AWS CLI is installed\n"
+               "- AWS credentials are configured\n"
+               "- You have internet connection\n"
+               "- You have permissions for the S3 bucket").arg(failedFiles.join("\n")));
+        statusBar()->showMessage(tr("AWS upload failed"), 5000);
+    } else {
+        QMessageBox::information(this, tr("No Files to Upload"),
+            tr("No files found to upload for segment: %1").arg(QString::fromStdString(segmentId)));
+        statusBar()->showMessage(tr("No files to upload"), 3000);
     }
 }

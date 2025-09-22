@@ -63,6 +63,7 @@ public slots:
     void onAddOverlap(const std::string& segmentId);
     void onConvertToObj(const std::string& segmentId);
     void onSlimFlattenAndRender(const std::string& segmentId);
+    void onAWSUpload(const std::string& segmentId);
     void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
     void onToggleConsoleOutput();
     void onDeleteSegments(const std::vector<std::string>& segmentIds);
