@@ -554,7 +554,7 @@ struct NormalConstraintPlane {
      };
  
      // Caching for nearby paths
-     using PathCachePayload = std::vector<std::shared_ptr<std::vector<cv::Point>>>;
+     using PathCachePayload = std::vector<std::vector<cv::Point>>;
      mutable std::array<PointPairCache<PathCachePayload>, 2> path_caches_;
  
      // Caching for snapping loss results
@@ -733,6 +733,36 @@ struct NormalConstraintPlane {
         return dx * dx + dy * dy;
     }
 
+    PathCachePayload filter_and_split_paths(const std::vector<std::shared_ptr<std::vector<cv::Point>>>& raw_paths, const cv::Point2f& p1, const cv::Point2f& p2) const {
+        PathCachePayload filtered_paths;
+        for (const std::shared_ptr<std::vector<cv::Point>>& path_ptr : raw_paths) {
+            const std::vector<cv::Point>& path = *path_ptr;
+            if (path.size() < 2) continue;
+
+            std::vector<cv::Point> current_sub_path;
+            for (size_t i = 0; i < path.size() - 1; ++i) {
+                const cv::Point2f& p_a = path[i];
+                const cv::Point2f& p_b = path[i+1];
+
+                if (seg_dist_sq_appx(p1, p2, p_a, p_b) <= roi_radius_ * roi_radius_) {
+                    if (current_sub_path.empty()) {
+                        current_sub_path.push_back(p_a);
+                    }
+                    current_sub_path.push_back(p_b);
+                } else {
+                    if (current_sub_path.size() > 1) {
+                        filtered_paths.push_back(current_sub_path);
+                    }
+                    current_sub_path.clear();
+                }
+            }
+            if (current_sub_path.size() > 1) {
+                filtered_paths.push_back(current_sub_path);
+            }
+        }
+        return filtered_paths;
+    }
+
     template <typename T>
     T calculate_normal_snapping_loss(const T* p1, const T* p2, const vc::core::util::GridStore& normal_grid, int grid_idx) const {
         T edge_vec_x = p2[0] - p1[0];
@@ -751,11 +781,13 @@ struct NormalConstraintPlane {
 
         if (!path_cache.valid(p1_cv, p2_cv, cache_radius_normal_, &normal_grid_volume)) {
             cv::Point2f midpoint_cv = 0.5f * (p1_cv + p2_cv);
-            path_cache.put(p1_cv, p2_cv, normal_grid.get(midpoint_cv, query_radius_), &normal_grid_volume);
+            auto raw_paths = normal_grid.get(midpoint_cv, query_radius_);
+            auto filtered_paths = filter_and_split_paths(raw_paths, p1_cv, p2_cv);
+            path_cache.put(p1_cv, p2_cv, std::move(filtered_paths), &normal_grid_volume);
             // Invalidate snapping cache whenever the path cache is updated
             snap_loss_caches_[grid_idx] = {};
         }
-        const auto& nearby_paths = path_cache.get();
+        const PathCachePayload& nearby_paths = path_cache.get();
 
         if (nearby_paths.empty()) {
             return T(0.0);
@@ -764,11 +796,7 @@ struct NormalConstraintPlane {
         T total_weighted_dot_loss = T(0.0);
         T total_weight = T(0.0);
 
-        // T total_weighted_dot_product_n = T(0.0);
-        // T total_weight_n = T(0.0);
-
-        for (const auto& path_ptr : nearby_paths) {
-            const auto& path = *path_ptr;
+        for (const std::vector<cv::Point>& path : nearby_paths) {
             if (path.size() < 2) continue;
 
             for (size_t i = 0; i < path.size() - 1; ++i) {
@@ -796,17 +824,6 @@ struct NormalConstraintPlane {
 
                 total_weighted_dot_loss += weight_n*(T(1.0) - dot_product);
                 total_weight += weight_n;
-                // else {
-                //     if (dot_product >= 0) {
-                //         total_weighted_dot_product += weight_n * dot_product;
-                //         total_weight += weight_n;
-                //     }
-                //     else {
-                //         total_weighted_dot_product_n += weight_n * dot_product;
-                //         total_weight_n += weight_n;
-                //     }
-                // }
-
             }
         }
 
@@ -822,7 +839,7 @@ struct NormalConstraintPlane {
             float closest_dist_norm = std::numeric_limits<float>::max();
  
              for (int path_idx = 0; path_idx < nearby_paths.size(); ++path_idx) {
-                 const auto& path = *nearby_paths[path_idx];
+                 const auto& path = nearby_paths[path_idx];
                  if (path.size() < 2) continue;
  
                  for (int i = 0; i < path.size() - 1; ++i) {
@@ -862,7 +879,7 @@ struct NormalConstraintPlane {
         T snapping_loss = T(0.0);
 
         if (snap_payload.best_path_idx != -1) {
-            const auto& best_path = *nearby_paths[snap_payload.best_path_idx];
+            const auto& best_path = nearby_paths[snap_payload.best_path_idx];
             const auto& seg2_p1 = best_path[snap_payload.best_seg_idx];
             const auto& seg2_p2 = best_path[snap_payload.best_seg_idx + 1];
 
