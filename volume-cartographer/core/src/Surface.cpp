@@ -332,7 +332,7 @@ void QuadSurface::setChannel(const std::string& name, const cv::Mat& channel)
     _channels[name] = channel;
 }
 
-cv::Mat QuadSurface::channel(const std::string& name)
+cv::Mat QuadSurface::channel(const std::string& name, int flags)
 {
     if (_channels.count(name)) {
         cv::Mat& channel = _channels[name];
@@ -340,8 +340,18 @@ cv::Mat QuadSurface::channel(const std::string& name)
             // On-demand loading
             std::filesystem::path channel_path = path / (name + ".tif");
             if (std::filesystem::exists(channel_path)) {
-                channel = cv::imread(channel_path.string(), cv::IMREAD_UNCHANGED);
+                std::vector<cv::Mat> layers;
+                cv::imreadmulti(channel_path.string(), layers, cv::IMREAD_UNCHANGED);
+                if (!layers.empty()) {
+                    channel = layers[0];
+                }
             }
+        }
+
+        if (!channel.empty() && !(flags & SURF_CHANNEL_NORESIZE)) {
+            cv::Mat scaled_channel;
+            cv::resize(channel, scaled_channel, _points->size(), 0, 0, cv::INTER_NEAREST);
+            return scaled_channel;
         }
         return channel;
     }
@@ -1174,18 +1184,15 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid)
     cv::imwrite(path/"y.tif", xyz[1]);
     cv::imwrite(path/"z.tif", xyz[2]);
 
-    std::vector<std::string> channel_names;
     for (auto const& [name, mat] : _channels) {
         if (!mat.empty()) {
             cv::imwrite(path / (name + ".tif"), mat);
-            channel_names.push_back(name);
         }
     }
 
     if (!meta)
         meta = new nlohmann::json;
 
-    (*meta)["channels"] = channel_names;
     (*meta)["bbox"] = {{bbox().low[0],bbox().low[1],bbox().low[2]},{bbox().high[0],bbox().high[1],bbox().high[2]}};
     (*meta)["type"] = "seg";
     (*meta)["uuid"] = uuid;
@@ -1229,7 +1236,7 @@ Rect3D QuadSurface::bbox()
     return _bbox;
 }
 
-QuadSurface *load_quad_from_tifxyz(const std::string &path)
+QuadSurface *load_quad_from_tifxyz(const std::string &path, int flags)
 {
     std::vector<cv::Mat_<float>> xyz = {cv::imread(path+"/x.tif",cv::IMREAD_UNCHANGED),cv::imread(path+"/y.tif",cv::IMREAD_UNCHANGED),cv::imread(path+"/z.tif",cv::IMREAD_UNCHANGED)};
 
@@ -1248,11 +1255,11 @@ QuadSurface *load_quad_from_tifxyz(const std::string &path)
                 (*points)(j,i) = {-1,-1,-1};
             }
 
-    if (std::filesystem::exists(path+"/mask.tif")) {
+    if (!(flags & SURF_LOAD_IGNORE_MASK) && std::filesystem::exists(path+"/mask.tif")) {
         std::vector<cv::Mat> layers;
         cv::imreadmulti(path+"/mask.tif", layers, cv::IMREAD_GRAYSCALE);
         cv::Mat_<uint8_t> mask = layers[0];
-        cv::resize(mask, mask, points->size(), cv::INTER_NEAREST);
+        cv::resize(mask, mask, points->size(), 0, 0, cv::INTER_NEAREST);
         for(int j=0;j<points->rows;j++)
             for(int i=0;i<points->cols;i++)
                 if (!mask(j,i))
@@ -1265,9 +1272,12 @@ QuadSurface *load_quad_from_tifxyz(const std::string &path)
     surf->id   = metadata["uuid"];
     surf->meta = new nlohmann::json(metadata);
 
-    if (metadata.contains("channels")) {
-        for (const auto& name : metadata["channels"]) {
-            surf->setChannel(name.get<std::string>(), cv::Mat());
+    for (const auto& entry : std::filesystem::directory_iterator(path)) {
+        if (entry.path().extension() == ".tif") {
+            std::string filename = entry.path().stem().string();
+            if (filename != "x" && filename != "y" && filename != "z") {
+                surf->setChannel(filename, cv::Mat());
+            }
         }
     }
 

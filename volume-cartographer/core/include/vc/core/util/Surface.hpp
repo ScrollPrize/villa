@@ -11,6 +11,8 @@
 
 #define Z_DBG_GEN_PREFIX "auto_grown_"
 
+#define SURF_LOAD_IGNORE_MASK 1
+#define SURF_CHANNEL_NORESIZE 1
 
 struct Rect3D {
     cv::Vec3f low = {0,0,0};
@@ -118,7 +120,7 @@ public:
     cv::Vec2f _scale;
 
     void setChannel(const std::string& name, const cv::Mat& channel);
-    cv::Mat channel(const std::string& name);
+    cv::Mat channel(const std::string& name, int flags = 0);
 protected:
     std::unordered_map<std::string, cv::Mat> _channels;
     cv::Mat_<cv::Vec3f>* _points = nullptr;
@@ -211,7 +213,7 @@ public:
     std::set<SurfaceMeta*> overlapping;
 };
 
-QuadSurface *load_quad_from_tifxyz(const std::string &path);
+QuadSurface *load_quad_from_tifxyz(const std::string &path, int flags = 0);
 QuadSurface *regularized_local_quad(QuadSurface *src, const cv::Vec3f &ptr, int w, int h, int step_search = 100, int step_out = 5);
 QuadSurface *smooth_vc_segmentation(QuadSurface *src);
 
