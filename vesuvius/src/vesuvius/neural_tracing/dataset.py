@@ -429,7 +429,10 @@ def get_crop_from_volume(volume, center_zyx, crop_size):
         actual_min[0]:actual_max[0],
         actual_min[1]:actual_max[1],
         actual_min[2]:actual_max[2]
-    ]).to(torch.float32) / 255.
+    ]).to(torch.float32)
+    # TODO: should instead always use standardised uint8 volumes!
+    volume_crop /=  255. if volume.dtype == np.uint8 else volume_crop.amax()
+    volume_crop = volume_crop * 2 - 1
 
     # Pad if needed
     pad_before = actual_min - crop_min
