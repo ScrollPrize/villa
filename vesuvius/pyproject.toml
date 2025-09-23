@@ -23,6 +23,7 @@ dependencies = [
     "batchgenerators>=0.25.1",
     "batchgeneratorsv2",
     "blosc2>=2.5.1",
+    "build",
     "connected-components-3d>=3.24.0",
     "dask>=2024.8.0",
     "dask-image>=2024.5.3",
@@ -43,14 +44,15 @@ dependencies = [
     "numba>=0.60.0",
     "numcodecs>=0.12.1",
     "numpy>=2.0.2",
-    "open3d>=0.19.0",
+    "open3d",
+    "open3d>=0.18,<0.19",
     "opencv-python-headless>=4.11.0.86",
     "pandas>=2.3.2",
     "pillow>=11.3.0",
     "psutil>=7.1.0",
     "pybind11>=3.0.1",
     "pynrrd>=1.1.3",
-    "pyqt5>=5.15.11",
+    "pyqt6",
     "pytest>=8.4.2",
     "pytorch-lightning>=2.5.5",
     "pytorch-optimizer>=3.8.0",
@@ -59,6 +61,7 @@ dependencies = [
     "s3fs>=2025.9.0",
     "scikit-image>=0.24.0",
     "scipy>=1.13.1",
+    "setuptools>=80.9.0",
     "simpleitk>=2.5.2",
     "tensorstore>=0.1.69",
     "tifffile>=2024.8.30",
@@ -67,6 +70,7 @@ dependencies = [
     "tqdm>=4.67.1",
     "typed-argument-parser>=1.11.0",
     "wandb[media]>=0.22.0",
+    "wheel",
     "zarr>=2,<3",
 ]
 
@@ -104,6 +108,11 @@ install = "vesuvius.install.custom_install.CustomInstallCommand"
 
 [tool.setuptools.dynamic]
 version = {attr = "vesuvius._version.VERSION"}
+
+[tool.uv]
+required-environments = [
+    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+]
 
 [tool.uv.sources]
 batchgeneratorsv2 = { path = "../segmentation/models/batchgeneratorsv2" }
