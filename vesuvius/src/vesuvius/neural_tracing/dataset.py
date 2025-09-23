@@ -13,6 +13,8 @@ from einops import rearrange
 import torch.nn.functional as F
 from dataclasses import dataclass
 
+import augmentation
+
 
 @dataclass
 class Patch:
@@ -95,6 +97,7 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
     def __init__(self, config):
         self._config = config
         self._patches = load_datasets(config)
+        self._augmentations = augmentation.get_training_augmentations(config['crop_size'], config['augmentation']['no_spatial'], config['augmentation']['only_spatial_and_intensity'])
 
     def _mark_context_point(self, volume, point, value=1.):
         center = point.int()
@@ -228,6 +231,20 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
             self._mark_context_point(localiser, center_zyx - min_corner_zyx, value=0.)
 
             #TODO: include full 2d slices for additional context
+            #  if so, need to augment them consistently with the 3d crop -> tricky for geometric transforms
+
+            # FIXME: the loop is a hack because some augmentation sometimes randomly returns None
+            #  we should instead just remove the relevant augmentation (or fix it!)
+            while True:  
+                augmented = self._augmentations(image=volume_crop[None], dist_map=torch.cat([localiser[None], rearrange(uvws, 'z y x c -> c z y x')], dim=0))
+                if augmented['dist_map'] is not None:
+                    break
+            volume_crop = augmented['image'].squeeze(0)
+            localiser = augmented['dist_map'][0]
+            uvws = rearrange(augmented['dist_map'][1:], 'c z y x -> z y x c')
+            if torch.any(torch.isnan(volume_crop)) or torch.any(torch.isnan(localiser)) or torch.any(torch.isnan(uvws)):
+                # FIXME: why do these NaNs happen occasionally?
+                continue  
 
             yield {
                 'volume': volume_crop,
