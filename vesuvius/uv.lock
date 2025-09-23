@@ -6805,7 +6805,7 @@ requires-dist = [
     { name = "batchgenerators", specifier = ">=0.25.1" },
     { name = "batchgeneratorsv2", directory = "../segmentation/models/batchgeneratorsv2" },
     { name = "blosc2", specifier = ">=2.5.1" },
-    { name = "build", specifier = ">=1.3.0" },
+    { name = "build" },
     { name = "connected-components-3d", specifier = ">=3.24.0" },
     { name = "dask", specifier = ">=2024.8.0" },
     { name = "dask-image", specifier = ">=2024.5.3" },
@@ -6852,7 +6852,7 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "typed-argument-parser", specifier = ">=1.11.0" },
     { name = "wandb", extras = ["media"], specifier = ">=0.22.0" },
-    { name = "wheel", specifier = ">=0.45.1" },
+    { name = "wheel" },
     { name = "zarr", specifier = ">=2,<3" },
 ]
 
