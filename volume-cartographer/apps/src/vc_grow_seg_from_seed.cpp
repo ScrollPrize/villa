@@ -437,7 +437,11 @@ int main(int argc, char *argv[])
 
     QuadSurface* resume_surf = nullptr;
     if (mode == "resume") {
-        resume_surf = load_quad_from_tifxyz(resume_path);
+        if (corrections.getAllCollections().empty())
+           resume_surf = load_quad_from_tifxyz(resume_path);
+        else
+            resume_surf = load_quad_from_tifxyz(resume_path, SURF_LOAD_IGNORE_MASK);
+
         origin = {0,0,0}; // Not used in resume mode, but needs to be initialized
     }
 

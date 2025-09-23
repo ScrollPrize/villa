@@ -115,119 +115,6 @@ struct TraceParameters {
     PointCorrection point_correction;
 };
 
-static void reset_downstream_points_multi(const std::vector<cv::Vec2f>& seed_locs,
-                                          const std::vector<cv::Vec2f>& all_tgt_locs,
-                                          cv::Mat_<uint8_t>& state,
-                                          cv::Mat_<cv::Vec3d>& locs,
-                                          cv::Mat_<uint16_t>& generations,
-                                          const cv::Rect& bounds)
-{
-    std::queue<std::pair<cv::Vec2i, uint16_t>> q;
-    cv::Mat_<bool> visited(state.size(), false);
-    std::vector<cv::Vec2i> neighs = {{1,0},{0,1},{-1,0},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};
-
-    std::vector<cv::Point2f> hull_points;
-    if (!all_tgt_locs.empty()) {
-        std::vector<cv::Point2f> points_for_hull;
-        points_for_hull.reserve(all_tgt_locs.size());
-        for (const auto& loc : all_tgt_locs) {
-            points_for_hull.emplace_back(loc[0], loc[1]);
-        }
-        cv::convexHull(points_for_hull, hull_points);
-    }
-
-    for (const auto& corr_loc : seed_locs) {
-        uint16_t max_gen = 0;
-        cv::Vec2i top_left(std::floor(corr_loc[1]), std::floor(corr_loc[0]));
-        for (int dy = 0; dy <= 1; ++dy) {
-            for (int dx = 0; dx <= 1; ++dx) {
-                cv::Vec2i p = top_left + cv::Vec2i(dy, dx);
-                if (bounds.contains(cv::Point(p[1], p[0]))) {
-                    max_gen = std::max(max_gen, generations(p));
-                }
-            }
-        }
-
-        for (int dy = -1; dy <= 2; ++dy) {
-            for (int dx = -1; dx <= 2; ++dx) {
-                cv::Vec2i p = top_left + cv::Vec2i(dy, dx);
-                if (bounds.contains(cv::Point(p[1], p[0])) && !visited(p)) {
-                    q.push({p, max_gen});
-                    visited(p) = true;
-                }
-            }
-        }
-    }
-
-    std::vector<cv::Vec2i> points_to_reset;
-
-    while (!q.empty()) {
-        auto [p, current_gen] = q.front();
-        q.pop();
-
-        for (const auto& n : neighs) {
-            cv::Vec2i next_p = p + n;
-            if (bounds.contains(cv::Point(next_p[1], next_p[0])) && !visited(next_p) && (state(next_p) & STATE_LOC_VALID)) {
-                uint16_t next_gen = generations(next_p);
-                if (next_gen >= current_gen + 1) {
-                    bool keep = false;
-                    if (!hull_points.empty()) {
-                        if (cv::pointPolygonTest(hull_points, { (float)next_p[1], (float)next_p[0] }, false) >= 0) {
-                            keep = true;
-                        }
-                    }
-                    if (!keep) {
-                        visited(next_p) = true;
-                        points_to_reset.push_back(next_p);
-                        q.push({next_p, next_gen});
-                    }
-                }
-            }
-        }
-    }
-
-    for (const auto& p : points_to_reset) {
-        state(p) = 0;
-        locs(p) = cv::Vec3d(-1,-1,-1);
-        generations(p) = 0;
-    }
-}
-
-
-static void find_and_reset_downstream_points(const TraceParameters& trace_params,
-                                             cv::Mat_<uint8_t>& state,
-                                             cv::Mat_<cv::Vec3d>& locs,
-                                             cv::Mat_<uint16_t>& generations,
-                                             const cv::Rect& bounds,
-                                             float step_size)
-{
-    if (!trace_params.point_correction.isValid()) return;
-
-    const auto& tgts = trace_params.point_correction.tgts();
-    const auto& tgt_locs = trace_params.point_correction.grid_locs();
-    std::vector<cv::Vec2f> seed_locs;
-
-    for(size_t i = 1; i < tgts.size(); ++i) {
-        const auto& tgt_loc = tgt_locs[i];
-        cv::Vec2i int_loc(std::round(tgt_loc[1]), std::round(tgt_loc[0]));
-
-        if (bounds.contains(cv::Point(int_loc[1], int_loc[0]))) {
-            const cv::Vec3d& surface_point = locs(int_loc);
-            if (surface_point[0] != -1) {
-                float dist = cv::norm(cv::Vec3f(surface_point) - tgts[i]);
-                if (dist > 4.0) {
-                    seed_locs.push_back(tgt_loc);
-                }
-            }
-        }
-    }
-
-    if (!seed_locs.empty()) {
-        std::cout << "reset from seeds: " << seed_locs.size() << std::endl;
-        reset_downstream_points_multi(seed_locs, tgt_locs, state, locs, generations, bounds);
-    }
-}
-
 } // namespace
 
 static float space_trace_dist_w = 1.0;
@@ -295,6 +182,9 @@ static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::
         return 0;
     if (!coord_valid(state(p+off)))
         return 0;
+
+    if (dpoints(p)[0] == -1)
+        exit(0);
 
     ceres::ResidualBlockId tmp = problem.AddResidualBlock(DistLoss::Create(unit*cv::norm(off),w), nullptr, &dpoints(p)[0], &dpoints(p+off)[0]);
 
@@ -1007,7 +897,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     cv::Vec3f vy = {0,1,0};
 
     cv::Rect used_area;
-    ceres::Problem big_problem;
+    // ceres::Problem big_problem;
     int loss_count = 0;
     int generation = 1;
     int succ = 0;  // number of quads successfully added to the patch (each of size approx. step**2)
@@ -1041,7 +931,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                 int target_y = pad_y + j;
                 int target_x = pad_x + i;
                 uint16_t gen = resume_generations.at<uint16_t>(j, i);
-                if (gen > 0 && gen <= start_gen) {
+                if (gen > 0 && gen <= start_gen /*&& resume_points(j,i)[0] != -1*/) {
                     locs(target_y, target_x) = resume_points(j, i);
                     generations(target_y, target_x) = gen;
                     state(target_y, target_x) = STATE_LOC_VALID | STATE_COORD_VALID;
@@ -1055,24 +945,24 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             }
         }
 
-        for(int j=used_area.y;j<used_area.br().y;j++)
-            for(int i=used_area.x;i<used_area.br().x;i++) {
-                if (state(j, i) & STATE_LOC_VALID) {
-                    loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {j,i}, state, locs,
-                                                                interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params);
-                    succ++;
-                }
-            }
+        // for(int j=used_area.y;j<used_area.br().y;j++)
+        //     for(int i=used_area.x;i<used_area.br().x;i++) {
+        //         if (state(j, i) & STATE_LOC_VALID) {
+        //             loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {j,i}, state, locs,
+        //                                                         interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params);
+        //             succ++;
+        //         }
+        //     }
 
         // for (const auto& p : fringe) {
         //     loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, p, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), Ts);
         //     succ++;
         // }
 
-        big_problem.SetParameterBlockConstant(&locs(y0,x0)[0]);
-        big_problem.SetParameterBlockConstant(&locs(y0,x0+1)[0]);
-        big_problem.SetParameterBlockConstant(&locs(y0+1,x0)[0]);
-        big_problem.SetParameterBlockConstant(&locs(y0+1,x0+1)[0]);
+        // big_problem.SetParameterBlockConstant(&locs(y0,x0)[0]);
+        // big_problem.SetParameterBlockConstant(&locs(y0,x0+1)[0]);
+        // big_problem.SetParameterBlockConstant(&locs(y0+1,x0)[0]);
+        // big_problem.SetParameterBlockConstant(&locs(y0+1,x0+1)[0]);
 
 
         trace_params.point_correction = PointCorrection(corrections);
@@ -1085,31 +975,46 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         }
 
         if (trace_params.point_correction.isValid()) {
-            find_and_reset_downstream_points(trace_params, state, locs, generations, bounds, T);
+            cv::Mat mask = resume_surf->channel("mask");
+            if (!mask.empty()) {
+                std::vector<cv::Point2f> hull_points;
+                const auto& tgt_locs = trace_params.point_correction.grid_locs();
+                if (!tgt_locs.empty()) {
+                    std::vector<cv::Point2f> points_for_hull;
+                    points_for_hull.reserve(tgt_locs.size());
+                    for (const auto& loc : tgt_locs) {
+                        points_for_hull.emplace_back(loc[0], loc[1]);
+                    }
+                    cv::convexHull(points_for_hull, hull_points);
+                }
+
+                for (int j = 0; j < mask.rows; ++j) {
+                    for (int i = 0; i < mask.cols; ++i) {
+                        if (mask.at<uint8_t>(j, i) == 0) {
+                            int target_y = pad_y + j;
+                            int target_x = pad_x + i;
+                            cv::Point2f p(target_x, target_y);
+                            bool keep = false;
+                            if (!hull_points.empty()) {
+                                if (cv::pointPolygonTest(hull_points, p, false) >= 0) {
+                                    keep = true;
+                                }
+                            }
+                            if (!keep) {
+                                state(target_y, target_x) = 0;
+                                locs(target_y, target_x) = cv::Vec3d(-1,-1,-1);
+                                generations(target_y, target_x) = 0;
+                            }
+                        }
+                    }
+                }
+            }
+
+
             cv::Vec2i corr_center_i = { (int)std::round(trace_params.point_correction.grid_locs()[0][1]), (int)std::round(trace_params.point_correction.grid_locs()[0][0]) };
             local_optimization(16, corr_center_i, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
 
             trace_params.point_correction = PointCorrection();
-
-            // if (!intermediate_path_dir.empty()) {
-            //     cv::Rect used_area_safe = used_area;
-            //     used_area_safe.x -= 2;
-            //     used_area_safe.y -= 2;
-            //     used_area_safe.width += 4;
-            //     used_area_safe.height += 4;
-            //     cv::Mat_<cv::Vec3d> locs_crop = locs(used_area_safe);
-            //     cv::Mat_<uint16_t> generations_crop = generations(used_area_safe);
-            //
-            //     auto surf = new QuadSurface(locs_crop, {1/T, 1/T});
-            //     surf->setChannel("generations", generations_crop);
-            //
-            //     char filename[256];
-            //     snprintf(filename, sizeof(filename), "snapshot_gen_%04d_corrected", generation);
-            //     std::filesystem::path out_path = std::filesystem::path(intermediate_path_dir) / filename;
-            //     surf->save(out_path);
-            //     delete surf;
-            //     std::cout << "saved corrected snapshot in " << out_path << std::endl;
-            // }
 
             // Rebuild fringe from valid points
             fringe.clear();
@@ -1152,10 +1057,10 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         // all points in the patch are correct distance in 2D vs 3D space, not too high curvature, near surface prediction, etc.
 
         // Add losses for every 'active' surface point (just the four currently) that doesn't yet have them
-        loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params);
-        loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {y0+1,x0}, state, locs,  interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params);
-        loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {y0,x0+1}, state, locs,  interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params);
-        loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {y0+1,x0+1}, state, locs,  interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params);
+        // loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params);
+        // loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {y0+1,x0}, state, locs,  interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params);
+        // loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {y0,x0+1}, state, locs,  interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params);
+        // loss_count += emptytrace_create_missing_centered_losses(big_problem, loss_status, {y0+1,x0+1}, state, locs,  interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params);
 
         fringe.push_back({y0,x0});
         fringe.push_back({y0+1,x0});
@@ -1165,7 +1070,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         std::cout << "init loss count " << loss_count << std::endl;
     }
 
-    big_problem.SetParameterBlockConstant(&locs(y0,x0)[0]);
+    // big_problem.SetParameterBlockConstant(&locs(y0,x0)[0]);
 
     ceres::Solver::Options options_big;
     options_big.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
@@ -1191,10 +1096,8 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     // Solve the initial optimisation problem, just placing the first four vertices around the seed
     ceres::Solver::Summary big_summary;
     //just continue on resume no additional global opt
-    if (!resume_surf) {
-        ceres::Solve(options_big, &big_problem, &big_summary);
-        std::cout << big_summary.BriefReport() << "\n";
-    }
+    if (!resume_surf)
+        local_optimization(8, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, true);
 
     // Prepare a new set of Ceres options used later during local solves
     ceres::Solver::Options options;
@@ -1219,15 +1122,15 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
 
     while (!fringe.empty()) {
         // bool global_opt = true;
-        bool global_opt = generation <= 50;
+        bool global_opt = generation <= 50 && !resume_surf;
 
         //stop drifting after some initial opt
-        if (generation == 3) {
-            big_problem.SetParameterBlockConstant(&locs(y0,x0)[0]);
-            big_problem.SetParameterBlockConstant(&locs(y0,x0+1)[0]);
-            big_problem.SetParameterBlockConstant(&locs(y0+1,x0)[0]);
-            big_problem.SetParameterBlockConstant(&locs(y0+1,x0+1)[0]);
-        }
+        // if (generation == 3) {
+        //     big_problem.SetParameterBlockConstant(&locs(y0,x0)[0]);
+        //     big_problem.SetParameterBlockConstant(&locs(y0,x0+1)[0]);
+        //     big_problem.SetParameterBlockConstant(&locs(y0+1,x0)[0]);
+        //     big_problem.SetParameterBlockConstant(&locs(y0+1,x0+1)[0]);
+        // }
 
         ALifeTime timer_gen;
         timer_gen.del_msg = "time per generation ";
