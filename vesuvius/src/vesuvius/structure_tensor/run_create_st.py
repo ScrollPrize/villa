@@ -17,7 +17,7 @@ import zarr
 import numpy as np
 
 from vesuvius.data.utils import open_zarr
-
+from numcodecs import Blosc
 
 def get_available_gpus():
     """Returns a list of available GPU IDs."""
@@ -80,15 +80,15 @@ def create_shared_output_store(args, input_shape, patch_size):
     
     # Get compressor
     if args.zarr_compressor.lower() == 'zstd':
-        compressor = zarr.Blosc(cname='zstd', clevel=args.zarr_compression_level, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='zstd', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
     elif args.zarr_compressor.lower() == 'lz4':
-        compressor = zarr.Blosc(cname='lz4', clevel=args.zarr_compression_level, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='lz4', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
     elif args.zarr_compressor.lower() == 'zlib':
-        compressor = zarr.Blosc(cname='zlib', clevel=args.zarr_compression_level, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='zlib', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
     elif args.zarr_compressor.lower() == 'none':
         compressor = None
     else:
-        compressor = zarr.Blosc(cname='zstd', clevel=1, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='zstd', clevel=1, shuffle=Blosc.SHUFFLE)
     
     print(f"Creating shared output store at: {main_store_path}")
     print(f"Full volume shape: {output_shape}")
@@ -131,7 +131,7 @@ def run_structure_tensor_part(args, part_id, gpu_id, shared_output_path):
     from vesuvius.structure_tensor import create_st
     
     # Build command to run create_st.py's main() directly
-    cmd = [sys.executable, '-m', 'vesuvius.structure_tensor.create_st']
+    cmd = [sys.executable, '-m', 'structure_tensor.create_st']
     
     # Basic arguments
     cmd.extend(['--input_dir', args.input_dir])
@@ -157,10 +157,19 @@ def run_structure_tensor_part(args, part_id, gpu_id, shared_output_path):
         cmd.append('--structure-tensor-only')
     if args.volume is not None:
         cmd.extend(['--volume', str(args.volume)])
-    
+    # Always compute structure tensor only in child processes; eigenanalysis runs once later.
+    # Ensure we only append once.
+    if '--structure-tensor-only' not in cmd:
+        cmd.append('--structure-tensor-only')
+    # (swap-eigenvectors applies to eigenanalysis stage; keep it for the later call.)
     # Set overlap to 0.0 for no overlap
     cmd.extend(['--overlap', '0.0'])
     
+    # Pass a valid step_size (if user supplied one), else default to 1.0−overlap
+    if args.step_size is not None:
+        cmd.extend(['--step_size', str(args.step_size)])
+    else:
+        cmd.extend(['--step_size', str(1.0 - args.overlap)])
     # Add other optional arguments
     if args.patch_size:
         cmd.extend(['--patch_size', args.patch_size])
@@ -196,49 +205,27 @@ def run_structure_tensor_part(args, part_id, gpu_id, shared_output_path):
 
 
 def run_eigenanalysis(zarr_path, chunk_size, compressor, verbose, swap_eigenvectors, num_workers):
-    """Run eigenanalysis on a structure tensor zarr to compute eigenvectors."""
+    """Run eigenanalysis directly (no subprocess) to avoid duplicate prints."""
+    from structure_tensor.create_st import _finalize_structure_tensor_torch
     print("\n--- Running Eigenanalysis ---")
-    
-    # Build command to run create_st.py's eigenanalysis mode
-    cmd = [sys.executable, '-m', 'structure_tensor.create_st']
-    
-    # Basic arguments
-    cmd.extend(['--mode', 'eigenanalysis'])
-    cmd.extend(['--eigen-input', zarr_path])
-    
-    # Optional arguments
-    if chunk_size:
-        cmd.extend(['--chunk-size', chunk_size])
-    
-    if swap_eigenvectors:
-        cmd.append('--swap-eigenvectors')
-    
-    # Compression settings
-    cmd.extend(['--zarr-compressor', compressor.cname if hasattr(compressor, 'cname') else 'zstd'])
-    if hasattr(compressor, 'clevel'):
-        cmd.extend(['--zarr-compression-level', str(compressor.clevel)])
-    
-    cmd.extend(['--num-workers', str(num_workers)])
-    
-    if verbose:
-        cmd.append('--verbose')
-    
-    print(f"Running eigenanalysis: {' '.join(cmd)}")
-    
-    # Run with live stdout/stderr streaming
-    proc = subprocess.Popen(
-        cmd,
-        stdout=None,
-        stderr=None,
-        universal_newlines=True,
-        bufsize=1
+    # normalize chunk_size to a tuple
+    if isinstance(chunk_size, str) and chunk_size:
+        chunk_size = tuple(map(int, chunk_size.split(',')))
+    # call directly
+    _finalize_structure_tensor_torch(
+        zarr_path=zarr_path,
+        chunk_size=chunk_size,
+        num_workers=num_workers,
+        compressor=compressor,
+        verbose=verbose,
+        swap_eigenvectors=swap_eigenvectors,
+        device=None,  # let the helper pick cuda/cpu
+        ome_out=not getattr(run_eigenanalysis, "_no_ome_out", False),
+        ome_downsample=getattr(run_eigenanalysis, "_ome_downsample", 1),
+        ome_scale=getattr(run_eigenanalysis, "_ome_scale", "0"),
+        confidence_metric=getattr(run_eigenanalysis, "_confidence_metric", "fa"),
+        keep_eigen=getattr(run_eigenanalysis, "_keep_eigen", False),
     )
-    
-    rc = proc.wait()
-    if rc != 0:
-        print(f"Eigenanalysis FAILED with return code {rc}")
-        return False
-    
     print("Eigenanalysis completed successfully")
     return True
 
@@ -272,8 +259,8 @@ def parse_arguments():
                         help='Mode of operation: compute structure tensor (with eigenanalysis by default) or perform eigenanalysis only')
     
     # Basic I/O arguments
-    parser.add_argument('--input_dir', type=str, required=True, 
-                        help='Path to the input Zarr volume')
+    parser.add_argument('--input_dir', type=str, required=False,
+                        help='Path to the input Zarr volume (required unless --mode eigenanalysis)')
     parser.add_argument('--output_dir', type=str, required=True, 
                         help='Path to store output results')
     
@@ -292,7 +279,9 @@ def parse_arguments():
                         help='Override patch size, comma-separated (e.g., "192,192,192")')
     parser.add_argument('--overlap', type=float, default=0.0, 
                         help='Overlap between patches (0-1), default 0.0 for structure tensor')
-    parser.add_argument('--batch_size', type=int, default=1, 
+    parser.add_argument('--step_size', type=float, default=None,
+                        help='Step‐size factor for sliding window (0 < step_size ≤ 1). If unset, will be inferred as 1.0 − overlap.')
+    parser.add_argument('--batch_size', type=int, default=1,
                         help='Batch size for inference')
     
     # Eigenanalysis arguments
@@ -307,6 +296,19 @@ def parse_arguments():
     parser.add_argument('--delete-intermediate', action='store_true',
                         help='Delete intermediate structure tensor after eigenanalysis')
     
+    # OME-style output & confidence options for eigenanalysis
+    parser.add_argument('--no-ome-out', action='store_true',
+                        help='Disable OME-style outputs (first/second/normal + confidence).')
+    parser.add_argument('--ome-downsample', type=int, default=1,
+                        help='Downsample factor (pick-every-N) for OME outputs (default: 1).')
+    parser.add_argument('--ome-scale', type=str, default='0',
+                        help='Scale name (group key) to write under, e.g. "0" (default).')
+    parser.add_argument('--confidence-metric', type=str, default='fa',
+                        choices=['fa', 'linearity', 'planarity', 'max_lp'],
+                        help='Confidence scalar to export (default: fa).')
+    parser.add_argument('--keep-eigen', action='store_true',
+                        help='Also write float32 eigenvectors/eigenvalues arrays.')
+
     # Multi-GPU arguments
     parser.add_argument('--gpus', type=str, default='all',
                         help='GPU IDs to use, comma-separated (e.g., "0,1,2") or "all" for all available GPUs')
@@ -331,6 +333,14 @@ def parse_arguments():
 def main():
     args = parse_arguments()
     
+    shared_output_path = None  # always initialize
+    structure_tensor_output = None  # path used by epilogue for eigenanalysis/cleanup
+    # (single-GPU -> output_path; multi-GPU -> shared_output_path)
+
+    if args.mode == 'structure-tensor' and not args.input_dir:
+        print("Error: --input_dir must be provided for structure-tensor mode")
+        return 1
+
     # Validation for eigenanalysis mode
     if args.mode == 'eigenanalysis':
         if not args.eigen_input:
@@ -339,15 +349,15 @@ def main():
     
     # Get compressor for later use
     if args.zarr_compressor.lower() == 'zstd':
-        compressor = zarr.Blosc(cname='zstd', clevel=args.zarr_compression_level, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='zstd', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
     elif args.zarr_compressor.lower() == 'lz4':
-        compressor = zarr.Blosc(cname='lz4', clevel=args.zarr_compression_level, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='lz4', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
     elif args.zarr_compressor.lower() == 'zlib':
-        compressor = zarr.Blosc(cname='zlib', clevel=args.zarr_compression_level, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='zlib', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
     elif args.zarr_compressor.lower() == 'none':
         compressor = None
     else:
-        compressor = zarr.Blosc(cname='zstd', clevel=1, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='zstd', clevel=1, shuffle=Blosc.SHUFFLE)
     
     # Parse chunk size for eigenanalysis if provided
     chunk_size_str = None
@@ -356,6 +366,12 @@ def main():
     
     # Handle eigenanalysis-only mode
     if args.mode == 'eigenanalysis':
+        # stash options on the function so run_eigenanalysis can pass them through
+        run_eigenanalysis._no_ome_out = args.no_ome_out
+        run_eigenanalysis._ome_downsample = args.ome_downsample
+        run_eigenanalysis._ome_scale = args.ome_scale
+        run_eigenanalysis._confidence_metric = args.confidence_metric
+        run_eigenanalysis._keep_eigen = args.keep_eigen
         success = run_eigenanalysis(
             zarr_path=args.eigen_input,
             chunk_size=chunk_size_str,
@@ -368,8 +384,11 @@ def main():
         if success:
             print("\n--- Eigenanalysis Completed Successfully ---")
             print(f"Results saved to:")
-            print(f"  - Eigenvectors: {args.eigen_input}/eigenvectors")
-            print(f"  - Eigenvalues: {args.eigen_input}/eigenvalues")
+            if not args.no_ome_out:
+                print(f"  - first_component/, second_component/, normal/, confidence/ (scale '{args.ome_scale}', ds={args.ome_downsample})")
+            if args.keep_eigen:
+                print(f"  - Eigenvectors: {args.eigen_input}/eigenvectors")
+                print(f"  - Eigenvalues: {args.eigen_input}/eigenvalues")
             return 0
         else:
             print("\n--- Eigenanalysis Failed ---")
@@ -408,7 +427,8 @@ def main():
         if args.patch_size:
             try:
                 patch_size = tuple(map(int, args.patch_size.split(',')))
-                print(f"Using user-specified patch size: {patch_size}")
+                if args.verbose:
+                    print(f"Using user-specified patch size: {patch_size}")
             except Exception as e:
                 print(f"Error parsing patch_size: {e}")
                 print("Using default patch size.")
@@ -483,10 +503,42 @@ def main():
             if success:
                 print(f"\n--- Structure Tensor Processing Completed Successfully ---")
                 print(f"Output saved to: {output_path}")
+
             else:
                 print(f"\n--- Structure Tensor Processing Failed ---")
                 return 1
     
+    # If we computed STs and the user did NOT request structure-tensor-only, run eigenanalysis now
+    if args.mode == 'structure-tensor' and not args.structure_tensor_only:
+        zarr_path = shared_output_path or structure_tensor_output
+        if not zarr_path:
+            print("Error: No structure tensor output path available for eigenanalysis.")
+            return 1
+        # stash options on the function so run_eigenanalysis can pass them through
+        run_eigenanalysis._no_ome_out = args.no_ome_out
+        run_eigenanalysis._ome_downsample = args.ome_downsample
+        run_eigenanalysis._ome_scale = args.ome_scale
+        run_eigenanalysis._confidence_metric = args.confidence_metric
+        run_eigenanalysis._keep_eigen = args.keep_eigen
+        ok = run_eigenanalysis(
+            zarr_path=zarr_path,
+            chunk_size=chunk_size_str,
+            compressor=compressor,
+            verbose=args.verbose,
+            swap_eigenvectors=args.swap_eigenvectors,
+            num_workers=args.num_workers,
+        )
+        if not ok:
+            return 1
+        if args.delete_intermediate:
+            delete_intermediate_file(zarr_path, verbose=args.verbose)
+        print("\n--- All computations completed successfully ---")
+        print(f"  - Structure tensor: {zarr_path}/structure_tensor")
+        if not args.no_ome_out:
+            print(f"  - first_component/, second_component/, normal/, confidence/ (scale '{args.ome_scale}', ds={args.ome_downsample})")
+        if args.keep_eigen:
+            print(f"  - Eigenvectors: {zarr_path}/eigenvectors")
+            print(f"  - Eigenvalues:  {zarr_path}/eigenvalues")
     return 0
 
 
