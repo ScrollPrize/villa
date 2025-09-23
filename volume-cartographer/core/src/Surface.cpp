@@ -1395,57 +1395,6 @@ std::string SurfaceMeta::name()
     return path.filename();
 }
 
-void generate_mask(QuadSurface* surf,
-                            cv::Mat_<uint8_t>& mask,
-                            cv::Mat_<uint8_t>& img,
-                            z5::Dataset* ds_high,
-                            z5::Dataset* ds_low,
-                            ChunkCache* cache) {
-    cv::Mat_<cv::Vec3f> points = surf->rawPoints();
-
-    // Choose resolution based on surface size
-    if (points.cols >= 4000) {
-        // Large surface: work at 0.25x scale
-        if (ds_low && cache) {
-            readInterpolated3D(img, ds_low, points * 0.25, cache);
-        } else {
-            img.create(points.size());
-            img.setTo(0);
-        }
-
-        mask.create(img.size());
-        for(int j = 0; j < img.rows; j++) {
-            for(int i = 0; i < img.cols; i++) {
-                mask(j,i) = (points(j,i)[0] == -1) ? 0 : 255;
-            }
-        }
-    } else {
-        // Small surface: resize and downsample
-        cv::Mat_<cv::Vec3f> scaled;
-        cv::Vec2f scale = surf->scale();
-        cv::resize(points, scaled, {0,0}, 1.0/scale[0], 1.0/scale[1], cv::INTER_CUBIC);
-
-        if (ds_high && cache) {
-            readInterpolated3D(img, ds_high, scaled, cache);
-            cv::resize(img, img, {0,0}, 0.25, 0.25, cv::INTER_CUBIC);
-        } else {
-            img.create(cv::Size(points.cols/4.0, points.rows/4.0));
-            img.setTo(0);
-        }
-
-        mask.create(img.size());
-        for(int j = 0; j < img.rows; j++) {
-            for(int i = 0; i < img.cols; i++) {
-                int orig_j = j * 4 * scale[1];
-                int orig_i = i * 4 * scale[0];
-                mask(j,i) = (points(orig_j, orig_i)[0] == -1) ? 0 : 255;
-            }
-        }
-    }
-    std::cout << "generatemask" << std::endl;
-    (*surf->meta)["date_last_modified"] = get_surface_time_str();
-    surf->save_meta();
-}
 
 QuadSurface* surface_diff(QuadSurface* a, QuadSurface* b, float tolerance) {
     cv::Mat_<cv::Vec3f>* diff_points = new cv::Mat_<cv::Vec3f>(a->rawPoints().clone());

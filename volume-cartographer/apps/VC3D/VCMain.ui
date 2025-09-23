@@ -480,7 +480,17 @@
           <item>
            <widget class="QPushButton" name="btnEditMask">
             <property name="text">
-             <string>Edit Segment Mask</string>
+             <string>Generate Segment Mask</string>
+            </property>
+            <property name="icon">
+             <iconset theme="applications-graphics"/>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPushButton" name="btnAppendMask">
+            <property name="text">
+             <string>Append Surface Mask</string>
             </property>
             <property name="icon">
              <iconset theme="applications-graphics"/>

@@ -52,6 +52,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SurfaceVoxelizer.hpp"
+#include "vc/core/util/Render.hpp"
 
 
 
@@ -601,7 +602,7 @@ void CWindow::CreateWidgets(void)
 #endif
 
     connect(ui.btnEditMask, &QPushButton::pressed, this, &CWindow::onEditMaskPressed);
-    
+    connect(ui.btnAppendMask, &QPushButton::pressed, this, &CWindow::onAppendMaskPressed);  // Add this
     // Connect composite view controls
     connect(ui.chkCompositeEnabled, &QCheckBox::toggled, this, [this](bool checked) {
         // Find the segmentation viewer and update its composite setting
@@ -1948,54 +1949,133 @@ void CWindow::onEditMaskPressed(void)
     if (!_surf)
         return;
 
-    //FIXME if mask already exists just open it!
-
-    cv::Mat_<cv::Vec3f> points = _surf->rawPoints();
-
     std::filesystem::path path = _surf->path/"mask.tif";
 
     if (!std::filesystem::exists(path)) {
-        cv::Mat_<uint8_t> img;
         cv::Mat_<uint8_t> mask;
-        //TODO make this aim for some target size instead of a hardcoded decision
-        if (points.cols >= 4000) {
-            readInterpolated3D(img, currentVolume->zarrDataset(2), points*0.25, chunk_cache);
+        cv::Mat_<cv::Vec3f> coords; // Not used after generation
 
-            mask.create(img.size());
+        // Generate only the binary mask
+        render_binary_mask(_surf, mask, coords);
 
-            for(int j=0;j<img.rows;j++)
-                for(int i=0;i<img.cols;i++)
-                    if (points(j,i)[0] == -1)
-                        mask(j,i) = 0;
-                    else
-                        mask(j,i) = 255;
-        }
-        else
-        {
-            cv::Mat_<cv::Vec3f> scaled;
-            cv::resize(points, scaled, {0,0}, 1/_surf->_scale[0], 1/_surf->_scale[1], cv::INTER_CUBIC);
+        // Save just the mask as single layer
+        cv::imwrite(path.string(), mask);
 
-            readInterpolated3D(img, currentVolume->zarrDataset(0), scaled, chunk_cache);
-            cv::resize(img, img, {0,0}, 0.25, 0.25, cv::INTER_CUBIC);
-
-            mask.create(img.size());
-
-            for(int j=0;j<img.rows;j++)
-                for(int i=0;i<img.cols;i++)
-                    if (points(j*4*_surf->_scale[1],i*4*_surf->_scale[0])[0] == -1)
-                        mask(j,i) = 0;
-                    else
-                        mask(j,i) = 255;
-        }
-
-        std::vector<cv::Mat> layers = {mask, img};
-        imwritemulti(path, layers);
+        // Update metadata
+        (*_surf->meta)["date_last_modified"] = get_surface_time_str();
+        _surf->save_meta();
     }
-    (*_surf->meta)["date_last_modified"] = get_surface_time_str();
-    _surf->save_meta();
+
     QDesktopServices::openUrl(QUrl::fromLocalFile(path.string().c_str()));
 }
 
+void CWindow::onAppendMaskPressed(void)
+{
+    if (!_surf || !currentVolume) {
+        if (!_surf) {
+            QMessageBox::warning(this, tr("Error"), tr("No surface selected."));
+        } else {
+            QMessageBox::warning(this, tr("Error"), tr("No volume loaded."));
+        }
+        return;
+    }
+
+    std::filesystem::path path = _surf->path/"mask.tif";
+
+    cv::Mat_<uint8_t> mask;
+    cv::Mat_<uint8_t> img;
+    std::vector<cv::Mat> existing_layers;
+
+    z5::Dataset* ds = currentVolume->zarrDataset(0);
+
+    try {
+        // Find the segmentation viewer and check if composite is enabled
+        CVolumeViewer* segViewer = nullptr;
+        for (auto& viewer : _viewers) {
+            if (viewer->surfName() == "segmentation") {
+                segViewer = viewer;
+                break;
+            }
+        }
+
+        bool useComposite = segViewer && segViewer->isCompositeEnabled();
+
+        // Check if mask.tif exists
+        if (std::filesystem::exists(path)) {
+            // Load existing mask
+            cv::imreadmulti(path.string(), existing_layers, cv::IMREAD_UNCHANGED);
+
+            if (existing_layers.empty()) {
+                QMessageBox::warning(this, tr("Error"), tr("Could not read existing mask file."));
+                return;
+            }
+
+            // Use the first layer as the mask
+            mask = existing_layers[0];
+            cv::Size maskSize = mask.size();
+
+            if (useComposite) {
+                // Use composite rendering from the segmentation viewer
+                img = segViewer->renderCompositeForSurface(_surf, maskSize);
+            } else {
+                // Original single-layer rendering
+                cv::Vec3f ptr = _surf->pointer();
+                cv::Vec3f offset(-maskSize.width/2.0f, -maskSize.height/2.0f, 0);
+
+                cv::Mat_<cv::Vec3f> coords;
+                _surf->gen(&coords, nullptr, maskSize, ptr, 1.0f, offset);
+
+                render_image_from_coords(coords, img, ds, chunk_cache);
+            }
+            cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
+
+            // Append the new image layer to existing layers
+            existing_layers.push_back(img);
+
+            // Save all layers
+            imwritemulti(path.string(), existing_layers);
+
+            QString message = useComposite ?
+                tr("Appended composite surface image to existing mask (now %1 layers)").arg(existing_layers.size()) :
+                tr("Appended surface image to existing mask (now %1 layers)").arg(existing_layers.size());
+            statusBar()->showMessage(message, 3000);
+
+        } else {
+            // No existing mask, generate both mask and image
+            cv::Mat_<cv::Vec3f> coords;
+            render_binary_mask(_surf, mask, coords);
+            cv::Size maskSize = mask.size();
+
+            if (useComposite) {
+                // Use composite rendering for image
+                img = segViewer->renderCompositeForSurface(_surf, maskSize);
+            } else {
+                // Original rendering
+                render_surface_image(_surf, mask, img, ds, chunk_cache);
+            }
+            cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
+
+            // Save as new multi-layer TIFF
+            std::vector<cv::Mat> layers = {mask, img};
+            imwritemulti(path.string(), layers);
+
+            QString message = useComposite ?
+                tr("Created new surface mask with composite image data") :
+                tr("Created new surface mask with image data");
+            statusBar()->showMessage(message, 3000);
+        }
+
+        // Update metadata
+        (*_surf->meta)["date_last_modified"] = get_surface_time_str();
+        _surf->save_meta();
+
+        QDesktopServices::openUrl(QUrl::fromLocalFile(path.string().c_str()));
+
+    } catch (const std::exception& e) {
+        QMessageBox::critical(this, tr("Error"),
+                            tr("Failed to render surface: %1").arg(e.what()));
+    }
+}
 
 void CWindow::onRefreshSurfaces()
 {

@@ -238,12 +238,6 @@ QuadSurface* surface_intersection(QuadSurface* a, QuadSurface* b, float toleranc
 // Control CUDA usage in GrowPatch (space_tracing_quad_phys). Default is true.
 void set_space_tracing_use_cuda(bool enable);
 
-void generate_mask(QuadSurface* surf,
-                            cv::Mat_<uint8_t>& mask,
-                            cv::Mat_<uint8_t>& img,
-                            z5::Dataset* ds_high = nullptr,
-                            z5::Dataset* ds_low = nullptr,
-                            ChunkCache* cache = nullptr);
 
 class MultiSurfaceIndex {
 private:

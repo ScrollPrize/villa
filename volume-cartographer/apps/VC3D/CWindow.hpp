@@ -140,6 +140,7 @@ private slots:
     void onSegFilterChanged(int index);
     void onSegmentationDirChanged(int index);
     void onEditMaskPressed();
+    void onAppendMaskPressed();
     void onInpaintTeleaSelected();
     void onRefreshSurfaces();
     void onGenerateReviewReport();

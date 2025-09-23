@@ -26,6 +26,8 @@ public:
     void renderVisible(bool force = false);
     void renderIntersections();
     cv::Mat render_area(const cv::Rect &roi);
+    cv::Mat_<uint8_t> render_composite(const cv::Rect &roi);
+    cv::Mat_<uint8_t> renderCompositeForSurface(QuadSurface* surface, cv::Size outputSize);
     void invalidateVis();
     void invalidateIntersect(const std::string &name = "");
     
