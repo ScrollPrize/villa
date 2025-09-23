@@ -604,7 +604,7 @@ static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<u
 
     const auto& pc = trace_params.point_correction;
 
-    if (pc.grid_loc_params().empty()) {
+    if (pc.grid_locs().empty()) {
         return 0;
     }
 
@@ -613,8 +613,28 @@ static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<u
         return 0;
     }
 
-    //TODO NEED TO CHECK CORNERS!
-    auto points_correction_loss = new PointsCorrectionLoss(pc.tgts(), {p[1],p[0]});
+    std::vector<cv::Vec3f> filtered_tgts;
+    std::vector<cv::Vec2f> filtered_grid_locs;
+
+    const auto& all_tgts = pc.tgts();
+    const auto& all_grid_locs = pc.grid_locs();
+    cv::Vec2i quad_loc_int = {p[1], p[0]};
+
+    for (size_t i = 0; i < all_tgts.size(); ++i) {
+        const auto& grid_loc = all_grid_locs[i];
+        float dx = grid_loc[0] - quad_loc_int[0];
+        float dy = grid_loc[1] - quad_loc_int[1];
+        if (dx * dx + dy * dy <= 4.0 * 4.0) {
+            filtered_tgts.push_back(all_tgts[i]);
+            filtered_grid_locs.push_back(all_grid_locs[i]);
+        }
+    }
+
+    if (filtered_tgts.empty()) {
+        return 0;
+    }
+
+    auto points_correction_loss = new PointsCorrectionLoss(filtered_tgts, filtered_grid_locs, quad_loc_int);
     auto cost_function = new ceres::DynamicAutoDiffCostFunction<PointsCorrectionLoss>(
         points_correction_loss
     );
@@ -629,10 +649,6 @@ static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<u
     cost_function->AddParameterBlock(3);
     parameter_blocks.push_back(&dpoints(p + cv::Vec2i(1, 1))[0]);
 
-    for (const auto& param : pc.grid_loc_params()) {
-        cost_function->AddParameterBlock(2);
-        parameter_blocks.push_back(const_cast<double*>(&param[0]));
-    }
     cost_function->SetNumResiduals(1);
 
     // std::cout <<  std::endl;
@@ -1068,7 +1084,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             cv::Vec2i corr_center_i = { (int)std::round(trace_params.point_correction.grid_locs()[0][1]), (int)std::round(trace_params.point_correction.grid_locs()[0][0]) };
             local_optimization(16, corr_center_i, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
 
-            // trace_params.point_correction = PointCorrection();
+            trace_params.point_correction = PointCorrection();
 
             if (!intermediate_path_dir.empty()) {
                 cv::Rect used_area_safe = used_area;
