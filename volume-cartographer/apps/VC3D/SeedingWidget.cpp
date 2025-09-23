@@ -522,16 +522,43 @@ void SeedingWidget::findPeaksAlongRay(
 
     auto addCenterOfSegment = [&](size_t s, size_t e) {
         if (e < s || s >= positions.size() || e >= positions.size()) return;
-        // Prefer the position with the largest distance-transform value within the segment (center of band)
-        size_t best_idx = s;
-        float best_dt = sampleDistAt(positions[s]);
+
+        const float distEps = 1e-4f;
+        const float intensityEps = 1e-3f;
+
+        // Start with the geometric center of the segment as a reasonable default
+        size_t center_idx = s + (e - s) / 2;
+        size_t best_idx = center_idx;
+        float best_dt = sampleDistAt(positions[best_idx]);
+        float best_intensity = intensities[best_idx];
+
         for (size_t k = s; k <= e; ++k) {
             float dt = sampleDistAt(positions[k]);
-            if (dt > best_dt) {
-                best_dt = dt;
+            float intensity = intensities[k];
+
+            bool betterDistance = dt > best_dt + distEps;
+            bool similarDistance = std::fabs(dt - best_dt) <= distEps;
+            bool betterIntensity = intensity > best_intensity + intensityEps;
+            bool similarIntensity = std::fabs(intensity - best_intensity) <= intensityEps;
+
+            if (betterDistance || (similarDistance && betterIntensity)) {
                 best_idx = k;
+                best_dt = dt;
+                best_intensity = intensity;
+                continue;
+            }
+
+            if (similarDistance && similarIntensity) {
+                size_t currentOffset = (best_idx > center_idx) ? (best_idx - center_idx) : (center_idx - best_idx);
+                size_t newOffset = (k > center_idx) ? (k - center_idx) : (center_idx - k);
+                if (newOffset < currentOffset) {
+                    best_idx = k;
+                    best_dt = dt;
+                    best_intensity = intensity;
+                }
             }
         }
+
         _point_collection->addPoint("seeding_peaks", positions[best_idx]);
     };
 
@@ -951,16 +978,42 @@ void SeedingWidget::findPeaksAlongPath(const PathData& path)
 
     auto addCenterOfSegment = [&](size_t s, size_t e) {
         if (e < s || s >= positions.size() || e >= positions.size()) return;
-        // Prefer the position with the largest distance-transform value within the segment (center of band)
-        size_t best_idx = s;
-        float best_dt = sampleDistAt(positions[s]);
+
+        const float distEps = 1e-4f;
+        const float intensityEps = 1e-3f;
+
+        size_t center_idx = s + (e - s) / 2;
+        size_t best_idx = center_idx;
+        float best_dt = sampleDistAt(positions[best_idx]);
+        float best_intensity = intensities[best_idx];
+
         for (size_t k = s; k <= e; ++k) {
             float dt = sampleDistAt(positions[k]);
-            if (dt > best_dt) {
-                best_dt = dt;
+            float intensity = intensities[k];
+
+            bool betterDistance = dt > best_dt + distEps;
+            bool similarDistance = std::fabs(dt - best_dt) <= distEps;
+            bool betterIntensity = intensity > best_intensity + intensityEps;
+            bool similarIntensity = std::fabs(intensity - best_intensity) <= intensityEps;
+
+            if (betterDistance || (similarDistance && betterIntensity)) {
                 best_idx = k;
+                best_dt = dt;
+                best_intensity = intensity;
+                continue;
+            }
+
+            if (similarDistance && similarIntensity) {
+                size_t currentOffset = (best_idx > center_idx) ? (best_idx - center_idx) : (center_idx - best_idx);
+                size_t newOffset = (k > center_idx) ? (k - center_idx) : (center_idx - k);
+                if (newOffset < currentOffset) {
+                    best_idx = k;
+                    best_dt = dt;
+                    best_intensity = intensity;
+                }
             }
         }
+
         _point_collection->addPoint("seeding_peaks", positions[best_idx]);
     };
 
@@ -1491,7 +1544,5 @@ void SeedingWidget::onSurfacesLoaded()
     // Update button states when surfaces are loaded/reloaded
     updateButtonStates();
 }
-
-
 
 
