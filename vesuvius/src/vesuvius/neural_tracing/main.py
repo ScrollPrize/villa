@@ -15,6 +15,9 @@ import torch.nn.functional as F
 
 from dataset import PatchInCubeDataset
 from resnet3d import ResNet3DEncoder
+from vesuvius_unet3d import Vesuvius3dUnetModel
+from song_unet3d import SongUnet3dModel
+from sampling import sample_ddim
 
 
 class PatchConditionedOn3dModel(torch.nn.Module):
@@ -44,22 +47,32 @@ class PatchConditionedOn3dModel(torch.nn.Module):
         return self.denoiser(inputs, timesteps, encoder_hidden_states=conditioning)
 
 
-def prepare_batch(batch, noise_scheduler):
-    clean_zyxs = batch['patch_zyx']
-    # FIXME: should use non-uniform timestep distribution
-    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, size=[clean_zyxs.shape[0]], device=clean_zyxs.device).long()
-    noise = torch.randn_like(clean_zyxs)
-    noisy_zyxs = noise_scheduler.add_noise(clean_zyxs, noise, timesteps)
-    if noise_scheduler.config.prediction_type == 'v_prediction':
-        targets = noise_scheduler.get_velocity(clean_zyxs, noise, timesteps)
+def prepare_batch(batch, noise_scheduler, generative, cfg_uncond_prob):
+    clean_uvw = batch['uvw']
+    if generative:
+        # FIXME: should use non-uniform timestep distribution
+        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, size=[clean_uvw.shape[0]], device=clean_uvw.device).long()
+        noise = torch.randn_like(clean_uvw)
+        noisy_uvw = noise_scheduler.add_noise(clean_uvw, noise, timesteps)
+        conditioning_mask = 0 if torch.rand(clean_uvw.shape[0]) < cfg_uncond_prob else 1
+    else:
+        timesteps = torch.zeros(clean_uvw.shape[0], device=clean_uvw.device, dtype=torch.long)
+        noisy_uvw = torch.zeros_like(clean_uvw)
+        conditioning_mask = 1
+    if (not generative) or noise_scheduler.config.prediction_type == 'sample':
+        targets = clean_uvw
+    elif noise_scheduler.config.prediction_type == 'v_prediction':
+        targets = noise_scheduler.get_velocity(clean_uvw, noise, timesteps)
     elif noise_scheduler.config.prediction_type == 'epsilon':
         targets = noise
-    elif noise_scheduler.config.prediction_type == 'sample':
-        targets = clean_zyxs
     else:
         assert False
-    inputs = rearrange(noisy_zyxs, 'b y x c -> b c y x')
-    targets = rearrange(targets, 'b y x c -> b c y x')
+    inputs = torch.cat([
+        batch['volume'].unsqueeze(1) * conditioning_mask,
+        batch['localiser'].unsqueeze(1) * conditioning_mask,  # TODO: should this one be removed for cfg?
+        rearrange(noisy_uvw, 'b z y x c -> b c z y x')
+    ], dim=1)
+    targets = rearrange(targets, 'b z y x c -> b c z y x')
     return timesteps, inputs, targets
 
 
@@ -88,7 +101,18 @@ def train(config_path):
     dataset = PatchInCubeDataset(config)
     train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config['batch_size'], num_workers=config['num_workers'])
 
-    model = PatchConditionedOn3dModel(config)
+    # model = Vesuvius3dUnetModel(in_channels=5, out_channels=3, config=config)
+    model = SongUnet3dModel(
+        img_resolution=config['crop_size'],
+        in_channels=5,
+        out_channels=3,
+        model_channels=32,
+        channel_mult=[1, 2, 4, 8],
+        num_blocks=2,  # 4
+        encoder_type='residual',
+        dropout=0.1,
+        attn_resolutions=[16, 8],
+    )
 
     noise_scheduler = diffusers.DDPMScheduler(
         num_train_timesteps=1000,
@@ -111,33 +135,61 @@ def train(config_path):
 
     progress_bar = tqdm(total=config['num_iterations'], disable=not accelerator.is_local_main_process)
     for iteration, batch in enumerate(train_dataloader):
-        timesteps, inputs, targets = prepare_batch(batch, noise_scheduler)
-        inputs *= 0.  # TODO: remove this! means we just learn deterministic mapping from conditioning volume to target
-        mask = batch['patch_valid'].unsqueeze(1)
+
+        timesteps, inputs, targets = prepare_batch(batch, noise_scheduler, config['generative'], config['cfg_uncond_prob'])
+        mask = torch.ones_like(targets[:, :1, ...])  # TODO!
+
         wandb_log = {}
         with accelerator.accumulate(model):
-            model_output = model(inputs, timesteps, batch['volume'])
-            target_pred = model_output['sample']
+            target_pred = model(inputs, timesteps)
             # TODO: should this instead weight each element in batch equally regardless of valid area?
             loss = ((target_pred - targets)**2 * mask).sum() / mask.sum()
             if torch.isnan(loss):
                 raise ValueError('loss is NaN')
             accelerator.backward(loss)
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                accelerator.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
+
         wandb_log['loss'] = loss.detach().item()
         progress_bar.set_postfix({'loss': loss.detach().item()})
         progress_bar.update(1)
+
         if iteration % config['log_frequency'] == 0:
             with torch.no_grad():
-                canvas = torch.stack([inputs, target_pred, targets], dim=-1)
-                canvas_mask = torch.stack([mask, torch.ones_like(mask), mask], dim=-1)
+                model.eval()
+
+                canvas = torch.stack([inputs[:, :1].expand(-1, 3, -1, -1, -1), inputs[:, -3:], target_pred, targets], dim=-1)
+                canvas_mask = torch.stack([torch.ones_like(mask), mask, torch.ones_like(mask), mask], dim=-1)
                 canvas = (canvas * 0.5 + 0.5).clip(0, 1) * canvas_mask
-                canvas = rearrange(canvas, 'b zyx y x v -> (b y) (v x) zyx')
-            plt.imsave(f'{out_dir}/{iteration:06}.png', canvas.cpu())
+                canvas = rearrange(canvas[:, :, canvas.shape[2] // 2], 'b uvw y x v -> (b y) (v x) uvw')
+                plt.imsave(f'{out_dir}/{iteration:06}_denoised.png', canvas.cpu())
+
+                eval_num_samples = 4
+                assert targets.shape[0] == 1  # since the argmin needs to be per-iib otherwise, and we need either a loop or a separate dimensions for sample vs batch
+                gt_uvw = rearrange(batch['uvw'], 'b z y x c -> b c z y x')
+                if config['generative']:
+                    sample_uvw = sample_ddim(
+                        model,
+                        torch.tile(inputs[:, :2], (eval_num_samples, 1, 1, 1, 1)),
+                        noise_scheduler,
+                        (eval_num_samples, *targets.shape[1:]),
+                        torch.Generator().manual_seed(config['seed']),
+                        cfg_scale=config['cfg_scale']
+                    )
+                    sample_uvw = sample_uvw[torch.argmin((sample_uvw - gt_uvw).abs().mean(dim=(1, 2, 3, 4)))]
+                else:
+                    sample_uvw = target_pred.squeeze(0)
+                canvas = torch.stack([inputs[:, :1].expand(-1, 3, -1, -1, -1), sample_uvw[None], gt_uvw], dim=-1)
+                canvas_mask = torch.stack([torch.ones_like(mask), torch.ones_like(mask), mask], dim=-1)
+                canvas = (canvas * 0.5 + 0.5).clip(0, 1) * canvas_mask
+                canvas = rearrange(canvas[:, :, canvas.shape[2] // 2], 'b uvw y x v -> (b y) (v x) uvw')
+                plt.imsave(f'{out_dir}/{iteration:06}_sample.png', canvas.cpu())
+
+                model.train()
+
         if wandb.run is not None:
             wandb.log(wandb_log)
 
