@@ -1,14 +1,15 @@
 #!/usr/bin/env python
 from glob import glob
 from itertools import repeat
+import math
 import numpy as np
 import open3d as o3d
 import os
-import tifffile
-from PIL import Image
+import zarr
+from numcodecs import Blosc
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
-from numba import jit, prange, set_num_threads
+from numba import jit, set_num_threads
 import sys
 import argparse
 from tqdm import tqdm  # Progress bar
@@ -19,6 +20,78 @@ default_workers = max(1, multiprocessing.cpu_count() // 2)
 # We no longer need normals for expansion, but we still need to find
 # intersections of triangles with the z-plane.
 MAX_INTERSECTIONS = 3  # Maximum number of intersections per triangle
+PYRAMID_LEVELS = 6
+
+# Global store used to share immutable mesh data with forked worker processes
+# without serializing the large arrays for every slice task.
+_SLICE_STATE = {}
+_SLICE_DATASETS = {}
+
+
+def _set_slice_state(state):
+    global _SLICE_STATE
+    global _SLICE_DATASETS
+    _SLICE_STATE = state
+    _SLICE_DATASETS = {}
+
+
+def _get_worker_datasets():
+    state = _SLICE_STATE
+    if not state:
+        raise RuntimeError("Slice processing state is not initialized in the worker.")
+
+    labels_ds = _SLICE_DATASETS.get("labels")
+    if labels_ds is None:
+        label_root = zarr.open(state["label_store_path"], mode="r+")
+        labels_ds = label_root[state["label_dataset_name"]]
+        _SLICE_DATASETS["labels"] = labels_ds
+
+    normals_ds = None
+    if state["include_normals"]:
+        normals_ds = _SLICE_DATASETS.get("normals")
+        if normals_ds is None:
+            normals_root = zarr.open(state["normals_store_path"], mode="r+")
+            normals_ds = normals_root[state["normals_dataset_name"]]
+            _SLICE_DATASETS["normals"] = normals_ds
+
+    return labels_ds, normals_ds
+
+
+def _write_slice_output_worker(zslice, label_img, normals_img):
+    state = _SLICE_STATE
+    labels_ds, normals_ds = _get_worker_datasets()
+
+    slice_index = zslice - state["z_min"]
+    labels_ds[slice_index, ...] = np.ascontiguousarray(label_img, dtype=labels_ds.dtype)
+
+    if state["include_normals"] and normals_img is not None and normals_ds is not None:
+        normals_ds[slice_index, ...] = np.ascontiguousarray(
+            normals_img.astype(state["normals_dtype"], copy=False)
+        )
+
+
+def _process_zslice(zslice):
+    state = _SLICE_STATE
+    if not state:
+        raise RuntimeError("Slice processing state is not initialized in the worker.")
+
+    _, label_img, normals_img = process_slice(
+        (
+            zslice,
+            state["vertices"],
+            state["triangles"],
+            state["labels"],
+            state["w"],
+            state["h"],
+            state["include_normals"],
+            state["vertex_normals"],
+            state["triangle_normals"],
+            state["use_vertex_normals"],
+        )
+    )
+
+    _write_slice_output_worker(zslice, label_img, normals_img)
+    return zslice
 
 
 @jit(nopython=True)
@@ -350,6 +423,25 @@ def process_slice_points_label_normals(vertices, triangles, mesh_labels,
     return label_img, normal_sums
 
 
+def downsample_2x(array, axes):
+    """Downsample array by a factor of 2 along the provided axes."""
+    ndim = array.ndim
+    norm_axes = [(axis + ndim) % ndim for axis in axes]
+    slices = [slice(None)] * ndim
+    for axis in norm_axes:
+        slices[axis] = slice(0, None, 2)
+    return array[tuple(slices)]
+
+
+def build_pyramid(array, levels, axes):
+    """Return a list of arrays representing a 2x pyramid for the input array."""
+    outputs = [array]
+    for _ in range(1, levels):
+        next_level = downsample_2x(outputs[-1], axes)
+        outputs.append(next_level)
+    return outputs
+
+
 def process_mesh(mesh_path, mesh_index, include_normals):
     """
     Load a mesh from disk, return (vertices, triangles, labels_for_those_triangles).
@@ -401,11 +493,10 @@ def process_mesh(mesh_path, mesh_index, include_normals):
 
 
 def process_slice(args):
-    """Process a single z-slice, optionally writing normals alongside labels."""
-    (zslice, vertices, triangles, labels, w, h, out_path,
+    """Process a single z-slice and return label and optional normal arrays."""
+    (zslice, vertices, triangles, labels, w, h,
      include_normals, vertex_normals, triangle_normals,
-     triangle_use_vertex_normals, normals_out_path,
-     normals_dtype) = args
+     triangle_use_vertex_normals) = args
 
     if include_normals:
         img_label, normals_img = process_slice_points_label_normals(
@@ -415,24 +506,13 @@ def process_slice(args):
         img_label = process_slice_points_label(vertices, triangles, labels, zslice, w, h)
         normals_img = None
 
-    if np.any(img_label):
-        slice_name = str(zslice).zfill(5)
-        label_file = os.path.join(out_path, f"{slice_name}.tif")
-        tifffile.imwrite(label_file, img_label, compression='zlib')
-
-        if include_normals and normals_img is not None:
-            dtype_to_use = normals_dtype if normals_dtype is not None else np.dtype('float16')
-            normals_to_save = normals_img.astype(dtype_to_use)
-            normals_file = os.path.join(normals_out_path, f"{slice_name}.tif")
-            tifffile.imwrite(normals_file, normals_to_save, compression='zlib')
-
-    return zslice
+    return zslice, img_label, normals_img
 
 
 def main():
     # Parse command-line arguments.
     parser = argparse.ArgumentParser(
-        description="Process OBJ meshes and slice them along z to produce label images."
+        description="Process OBJ meshes and slice them along z to produce multiscale OME-Zarr volumes."
     )
     parser.add_argument("folder",
                         help="Path to folder containing OBJ meshes (or parent folder with subfolders of OBJ meshes)")
@@ -440,19 +520,25 @@ def main():
                         choices=["scroll1", "scroll2", "scroll3", "scroll4", "scroll5", "0500p2", "0139",
                                  "343p_2um_116", "343p_9um"],
                         help="Scroll shape to use (determines image dimensions)")
-    parser.add_argument("--output_path", default="mesh_labels_slices",
-                        help="Output folder for label images (default: mesh_labels_slices)")
+    parser.add_argument("--output_path", default="mesh_labels.zarr",
+                        help="Path to the label OME-Zarr store (default: mesh_labels.zarr)")
     parser.add_argument("--num_workers", type=int, default=default_workers,
                         help="Number of worker processes to use (default: half of CPU count)")
     parser.add_argument("--recursive", action="store_true",
                         help="Force recursive search in subfolders even if OBJ files exist in the parent folder")
+    parser.add_argument("--chunk_size", type=int, default=0,
+                        help="Override chunk edge length for Zarr datasets (use 0 for auto)")
     parser.add_argument("--output_normals", action="store_true",
-                        help="Also export per-voxel surface normal slices")
-    parser.add_argument("--normals_output_path", default="mesh_normals_slices",
-                        help="Output folder for surface normal slices (default: mesh_normals_slices)")
+                        help="Also export per-voxel surface normals as an OME-Zarr pyramid")
+    parser.add_argument("--normals_output_path", default="mesh_normals.zarr",
+                        help="Path to the normals OME-Zarr store (default: mesh_normals.zarr)")
     parser.add_argument("--normals_dtype", default="float16",
-                        help="Floating point dtype for normal slices (must be <= float16)")
+                        help="Floating point dtype for the normals pyramid (must be <= float16)")
     args = parser.parse_args()
+
+    if args.chunk_size < 0:
+        print("ERROR: chunk_size must be non-negative.")
+        sys.exit(1)
 
     normals_dtype = None
     if args.output_normals:
@@ -492,16 +578,13 @@ def main():
     h, w = scroll_shapes[args.scroll]
     print(f"Using scroll '{args.scroll}' with dimensions: height={h}, width={w}")
 
-    # Folder where label images will be saved.
     out_path = args.output_path
-    os.makedirs(out_path, exist_ok=True)
-    print(f"Output folder for label images: {out_path}")
+    print(f"Label OME-Zarr output path: {out_path}")
 
     normals_out_path = None
     if args.output_normals:
         normals_out_path = args.normals_output_path
-        os.makedirs(normals_out_path, exist_ok=True)
-        print(f"Output folder for surface normals: {normals_out_path}")
+        print(f"Normals OME-Zarr output path: {normals_out_path}")
 
     # Find OBJ files - either directly or in subfolders
     if args.recursive:
@@ -580,30 +663,256 @@ def main():
     print(f"Processing slices from {z_min} to {z_max} (inclusive).")
     print(f"Total number of slices: {len(z_slices)}")
 
-    # Prepare parallel arguments for slices.
-    slice_args = [
-        (
-            z,
-            vertices,
-            triangles,
-            mesh_labels,
-            w,
-            h,
-            out_path,
-            args.output_normals,
-            vertex_normals,
-            triangle_normals,
-            triangle_use_vertex_normals,
-            normals_out_path,
-            normals_dtype,
-        )
-        for z in z_slices
-    ]
+    num_slices = len(z_slices)
+    num_levels = PYRAMID_LEVELS
+    z_index_lookup = {z: idx for idx, z in enumerate(z_slices)}
 
-    # Run slice processing in parallel with a tqdm progress bar.
-    with ProcessPoolExecutor(max_workers=N_PROCESSES) as executor:
-        for _ in tqdm(executor.map(process_slice, slice_args), total=len(slice_args), desc="Slices processed"):
-            pass
+    compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
+
+    def compute_level_shape(base_shape, level, downsample_axes):
+        shape = list(base_shape)
+        factor = 2 ** level
+        for axis in downsample_axes:
+            shape[axis] = int(math.ceil(shape[axis] / factor))
+        return tuple(shape)
+
+    def compute_chunks(shape, chunk_size):
+        if chunk_size > 0:
+            chunks = [1] + [min(chunk_size, dim) for dim in shape[1:]]
+        else:
+            chunks = list(shape)
+            if chunks:
+                chunks[0] = 1
+            if len(chunks) > 1:
+                chunks[1] = min(512, chunks[1])
+            if len(chunks) > 2:
+                chunks[2] = min(512, chunks[2])
+            for axis in range(3, len(chunks)):
+                chunks[axis] = shape[axis]
+        return tuple(chunks)
+
+    label_store = zarr.DirectoryStore(out_path)
+    label_root = zarr.group(store=label_store, overwrite=True)
+    label_base_shape = (num_slices, h, w)
+    label_datasets = []
+    label_axes = [
+        {"name": "z", "type": "space", "unit": "index"},
+        {"name": "y", "type": "space", "unit": "pixel"},
+        {"name": "x", "type": "space", "unit": "pixel"},
+    ]
+    label_translation = [float(z_slices[0]), 0.0, 0.0]
+    label_datasets_meta = []
+
+    for level in range(num_levels):
+        level_shape = compute_level_shape(label_base_shape, level, (1, 2))
+        level_chunks = compute_chunks(level_shape, args.chunk_size)
+        dataset_name = f"{level}"
+        ds = label_root.create_dataset(
+            dataset_name,
+            shape=level_shape,
+            chunks=level_chunks,
+            dtype=np.uint16,
+            compressor=compressor,
+            overwrite=True,
+        )
+        label_datasets.append(ds)
+        scale_vector = [1.0, float(2 ** level), float(2 ** level)]
+        label_datasets_meta.append(
+            {
+                "path": dataset_name,
+                "coordinateTransformations": [
+                    {"type": "scale", "scale": scale_vector},
+                    {"type": "translation", "translation": list(label_translation)},
+                ],
+            }
+        )
+
+    label_root.attrs["multiscales"] = [
+        {
+            "version": "0.4",
+            "name": "labels",
+            "axes": label_axes,
+            "datasets": label_datasets_meta,
+        }
+    ]
+    label_root.attrs["image-label"] = {
+        "version": "0.4",
+        "colors": [],
+    }
+
+    normals_datasets = []
+    if args.output_normals:
+        normals_store = zarr.DirectoryStore(normals_out_path)
+        normals_root = zarr.group(store=normals_store, overwrite=True)
+        normals_base_shape = (num_slices, h, w, 3)
+        normals_axes = [
+            {"name": "z", "type": "space", "unit": "index"},
+            {"name": "y", "type": "space", "unit": "pixel"},
+            {"name": "x", "type": "space", "unit": "pixel"},
+            {"name": "c", "type": "channel"},
+        ]
+        normals_translation = [float(z_slices[0]), 0.0, 0.0, 0.0]
+        normals_datasets_meta = []
+
+        for level in range(num_levels):
+            level_shape = compute_level_shape(normals_base_shape, level, (1, 2))
+            level_chunks = compute_chunks(level_shape, args.chunk_size)
+            dataset_name = f"{level}"
+            ds = normals_root.create_dataset(
+                dataset_name,
+                shape=level_shape,
+                chunks=level_chunks,
+                dtype=normals_dtype,
+                compressor=compressor,
+                overwrite=True,
+            )
+            normals_datasets.append(ds)
+            scale_vector = [1.0, float(2 ** level), float(2 ** level), 1.0]
+            normals_datasets_meta.append(
+                {
+                    "path": dataset_name,
+                    "coordinateTransformations": [
+                        {"type": "scale", "scale": scale_vector},
+                        {"type": "translation", "translation": list(normals_translation)},
+                    ],
+                }
+            )
+
+        normals_root.attrs["multiscales"] = [
+            {
+                "version": "0.4",
+                "name": "normals",
+                "axes": normals_axes,
+                "datasets": normals_datasets_meta,
+            }
+        ]
+
+    label_dataset_name = label_datasets[0].path
+    normals_dataset_name = normals_datasets[0].path if normals_datasets else None
+
+    slice_state = {
+        "vertices": vertices,
+        "triangles": triangles,
+        "labels": mesh_labels,
+        "w": w,
+        "h": h,
+        "include_normals": bool(args.output_normals),
+        "vertex_normals": vertex_normals,
+        "triangle_normals": triangle_normals,
+        "use_vertex_normals": triangle_use_vertex_normals,
+        "z_min": z_slices[0],
+        "label_store_path": out_path,
+        "label_dataset_name": label_dataset_name,
+        "normals_store_path": normals_out_path,
+        "normals_dataset_name": normals_dataset_name,
+        "normals_dtype": normals_dtype,
+    }
+
+    def _write_slice_output(zslice, label_img, normals_img):
+        slice_index = z_index_lookup[zslice]
+
+        label_datasets[0][slice_index, ...] = np.ascontiguousarray(
+            label_img, dtype=label_datasets[0].dtype
+        )
+
+        if args.output_normals and normals_img is not None:
+            normals_datasets[0][slice_index, ...] = np.ascontiguousarray(
+                normals_img.astype(normals_dtype, copy=False)
+            )
+
+    sequential_slice_args = (
+        vertices,
+        triangles,
+        mesh_labels,
+        w,
+        h,
+        args.output_normals,
+        vertex_normals,
+        triangle_normals,
+        triangle_use_vertex_normals,
+    )
+
+    print("Entering slice rasterization stage", flush=True)
+    if N_PROCESSES > 1:
+        try:
+            mp_context = multiprocessing.get_context("fork")
+        except ValueError:
+            mp_context = None
+
+        if mp_context is None:
+            print(
+                "Fork start method unavailable; running slice rasterization in a single process to avoid high memory usage.",
+                flush=True,
+            )
+        else:
+            _set_slice_state(slice_state)
+            try:
+                print("Starting parallel slice rasterization", flush=True)
+                with ProcessPoolExecutor(
+                    max_workers=N_PROCESSES,
+                    mp_context=mp_context,
+                ) as executor:
+                    for _ in tqdm(
+                        executor.map(_process_zslice, z_slices, chunksize=1),
+                        total=len(z_slices),
+                        desc="Slices processed",
+                    ):
+                        pass
+                print("Finished parallel slice rasterization", flush=True)
+                sequential_slice_args = None
+            finally:
+                _set_slice_state({})
+
+    if sequential_slice_args is not None:
+        print("Running sequential slice rasterization", flush=True)
+        (
+            seq_vertices,
+            seq_triangles,
+            seq_labels,
+            seq_w,
+            seq_h,
+            seq_include_normals,
+            seq_vertex_normals,
+            seq_triangle_normals,
+            seq_use_vertex_normals,
+        ) = sequential_slice_args
+
+        for z in tqdm(z_slices, total=len(z_slices), desc="Slices processed"):
+            zslice, label_img, normals_img = process_slice(
+                (
+                    z,
+                    seq_vertices,
+                    seq_triangles,
+                    seq_labels,
+                    seq_w,
+                    seq_h,
+                    seq_include_normals,
+                    seq_vertex_normals,
+                    seq_triangle_normals,
+                    seq_use_vertex_normals,
+                )
+            )
+            _write_slice_output(zslice, label_img, normals_img)
+
+    def populate_downsampled_levels(datasets, axes, desc):
+        if not datasets:
+            return
+        for level in range(1, len(datasets)):
+            parent = datasets[level - 1]
+            target = datasets[level]
+            num_planes = parent.shape[0]
+            level_desc = f"{desc} level {level}"
+            for idx in tqdm(range(num_planes), desc=level_desc, leave=False):
+                source = np.asarray(parent[idx, ...])
+                downsampled = downsample_2x(source, axes=axes)
+                target[idx, ...] = np.ascontiguousarray(downsampled, dtype=target.dtype)
+
+    populate_downsampled_levels(label_datasets, axes=(0, 1), desc="Labels")
+
+    if args.output_normals:
+        populate_downsampled_levels(normals_datasets, axes=(0, 1), desc="Normals")
+
+    print("Completed OME-Zarr export.")
 
 
 if __name__ == "__main__":
