@@ -162,6 +162,15 @@ def train(config_path):
 
                 model.train()
 
+        if iteration % config['ckpt_frequency'] == 0:
+            torch.save({
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict(),
+                'noise_scheduler': noise_scheduler.config,
+                'step': iteration
+            }, f'{out_dir}/ckpt_{iteration:06}.pth' )
+
         if wandb.run is not None:
             wandb.log(wandb_log)
 
