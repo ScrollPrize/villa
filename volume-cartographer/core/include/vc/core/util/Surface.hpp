@@ -104,8 +104,8 @@ public:
     cv::Size size();
     [[nodiscard]] cv::Vec2f scale() const;
 
-    void save(const std::string &path, const std::string &uuid);
-    void save(std::filesystem::path &path);
+    void save(const std::string &path, const std::string &uuid, bool force_overwrite = false);
+    void save(const std::filesystem::path &path, bool force_overwrite = false);
     void save_meta();
     Rect3D bbox();
 

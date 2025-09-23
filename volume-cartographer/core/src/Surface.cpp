@@ -11,6 +11,15 @@
 #include <unordered_map>
 #include <nlohmann/json.hpp>
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+
+static_assert(__linux__, "Atomic overwrite for QuadSurface::save() is only supported on Linux.");
+
 void write_overlapping_json(const std::filesystem::path& seg_path, const std::set<std::string>& overlapping_names) {
     nlohmann::json overlap_json;
     overlap_json["overlapping"] = std::vector<std::string>(overlapping_names.begin(), overlapping_names.end());
@@ -1156,37 +1165,48 @@ struct DSReader
 };
 
 
-void QuadSurface::save(std::filesystem::path &path_)
+void QuadSurface::save(const std::filesystem::path &path_, bool force_overwrite)
 {
     if (path_.filename().empty())
-        save(path_, path_.parent_path().filename());
+        save(path_, path_.parent_path().filename(), force_overwrite);
     else
-        save(path_, path_.filename());
-
+        save(path_, path_.filename(), force_overwrite);
 }
 
-void QuadSurface::save(const std::string &path_, const std::string &uuid)
+void QuadSurface::save(const std::string &path_, const std::string &uuid, bool force_overwrite)
 {
-    path = path_;
+    std::filesystem::path target_path = path_;
+    std::filesystem::path final_path = path_;
+
+    if (!force_overwrite && std::filesystem::exists(final_path))
+        throw std::runtime_error("path already exists!");
+
+
+    std::filesystem::path temp_path = target_path.parent_path() / ".tmp" / target_path.filename();
+    std::filesystem::create_directories(temp_path.parent_path());
+    path = temp_path;
 
     if (!std::filesystem::create_directories(path)) {
-        if (std::filesystem::exists(path))
-            throw std::runtime_error("dir already exists => cannot run QuadSurface::save(): " + path.string());
-        else
+        if (!std::filesystem::exists(path)) {
             throw std::runtime_error("error creating dir for QuadSurface::save(): " + path.string());
+        }
     }
 
     std::vector<cv::Mat> xyz;
 
     cv::split((*_points), xyz);
 
-    cv::imwrite(path/"x.tif", xyz[0]);
-    cv::imwrite(path/"y.tif", xyz[1]);
-    cv::imwrite(path/"z.tif", xyz[2]);
+    std::vector<int> compression_params;
+    compression_params.push_back(cv::IMWRITE_TIFF_COMPRESSION);
+    compression_params.push_back(cv::IMWRITE_TIFF_COMPRESSION_LZW);
+
+    cv::imwrite(path/"x.tif", xyz[0], compression_params);
+    cv::imwrite(path/"y.tif", xyz[1], compression_params);
+    cv::imwrite(path/"z.tif", xyz[2], compression_params);
 
     for (auto const& [name, mat] : _channels) {
         if (!mat.empty()) {
-            cv::imwrite(path / (name + ".tif"), mat);
+            cv::imwrite(path / (name + ".tif"), mat, compression_params);
         }
     }
 
@@ -1202,7 +1222,38 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid)
     o << std::setw(4) << (*meta) << std::endl;
 
     //rename to make creation atomic
-    std::filesystem::rename(path/"meta.json.tmp", path/+"meta.json");
+    std::filesystem::rename(path/"meta.json.tmp", path/"meta.json");
+
+    if (force_overwrite && std::filesystem::exists(final_path)) {
+        std::filesystem::path versions_path = final_path / "versions";
+        std::filesystem::create_directories(versions_path);
+        int max_version = -1;
+        if (std::filesystem::exists(versions_path)) {
+            for (const auto& entry : std::filesystem::directory_iterator(versions_path)) {
+                if (entry.is_directory()) {
+                    try {
+                        int version = std::stoi(entry.path().filename().string());
+                        if (version > max_version) {
+                            max_version = version;
+                        }
+                    } catch (const std::invalid_argument& e) {
+                        // Ignore non-numeric directory names
+                    }
+                }
+            }
+        }
+        
+        std::filesystem::path new_version_path = versions_path / std::to_string(max_version + 1);
+
+        if (renameat2(AT_FDCWD, temp_path.c_str(), AT_FDCWD, final_path.c_str(), RENAME_EXCHANGE) != 0) {
+            throw std::runtime_error("atomic exchange failed for " + temp_path.string() + " and " + final_path.string() + ": " + strerror(errno));
+        }
+
+        std::filesystem::rename(temp_path/"versions", final_path/"versions");
+        std::filesystem::rename(temp_path, new_version_path);
+    }
+    else
+        std::filesystem::rename(temp_path, final_path);
 }
 
 void QuadSurface::save_meta()

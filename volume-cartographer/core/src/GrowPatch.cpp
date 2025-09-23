@@ -833,7 +833,7 @@ struct thresholdedDistance
 };
 
 
-QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::string& intermediate_path_dir, const VCCollection &corrections)
+QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const nlohmann::json& meta_params, const VCCollection &corrections)
 {
     TraceParameters trace_params;
 
@@ -905,15 +905,40 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     cv::Mat_<uint8_t> phys_fail(size,0);
     // cv::Mat_<float> init_dist(size,0);
     cv::Mat_<uint16_t> loss_status(cv::Size(w,h),0);
+    cv::Rect used_area;
+    int generation = 1;
+    int succ = 0;  // number of quads successfully added to the patch (each of size approx. step**2)
+
+    auto create_surface_from_state = [&, &f_timer = *timer]() {
+        cv::Rect used_area_safe = used_area;
+        used_area_safe.x -= 2;
+        used_area_safe.y -= 2;
+        used_area_safe.width += 4;
+        used_area_safe.height += 4;
+        cv::Mat_<cv::Vec3d> locs_crop = locs(used_area_safe);
+        cv::Mat_<uint16_t> generations_crop = generations(used_area_safe);
+
+        auto surf = new QuadSurface(locs_crop, {1/T, 1/T});
+        surf->setChannel("generations", generations_crop);
+
+        float const area_est_vx2 = succ * step * step;
+        float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
+
+        surf->meta = new nlohmann::json(meta_params);
+        (*surf->meta)["area_vx2"] = area_est_vx2;
+        (*surf->meta)["area_cm2"] = area_est_cm2;
+        (*surf->meta)["max_gen"] = generation;
+        (*surf->meta)["seed"] = {origin[0], origin[1], origin[2]};
+        (*surf->meta)["elapsed_time_s"] = f_timer.seconds();
+
+        return surf;
+    };
 
     cv::Vec3f vx = {1,0,0};
     cv::Vec3f vy = {0,1,0};
 
-    cv::Rect used_area;
     // ceres::Problem big_problem;
     int loss_count = 0;
-    int generation = 1;
-    int succ = 0;  // number of quads successfully added to the patch (each of size approx. step**2)
     double last_elapsed_seconds = 0.0;
     int last_succ = 0;
 
@@ -1584,37 +1609,15 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         // print_accessor_stats();
 
         int snapshot_interval = params.value("snapshot-interval", 0);
-        if (!intermediate_path_dir.empty() && snapshot_interval > 0 && generation % snapshot_interval == 0) {
-            cv::Rect used_area_safe = used_area;
-            used_area_safe.x -= 2;
-            used_area_safe.y -= 2;
-            used_area_safe.width += 4;
-            used_area_safe.height += 4;
-            cv::Mat_<cv::Vec3d> locs_crop = locs(used_area_safe);
-            cv::Mat_<uint16_t> generations_crop = generations(used_area_safe);
-
-            auto surf = new QuadSurface(locs_crop, {1/T, 1/T});
-            surf->setChannel("generations", generations_crop);
-
-            char filename[256];
-            snprintf(filename, sizeof(filename), "snapshot_gen_%04d", generation);
-            std::filesystem::path out_path = std::filesystem::path(intermediate_path_dir) / filename;
-            surf->save(out_path);
+        if (!tgt_path.empty() && snapshot_interval > 0 && generation % snapshot_interval == 0) {
+            QuadSurface* surf = create_surface_from_state();
+            surf->save(tgt_path, true);
             delete surf;
-            std::cout << "saved snapshot in " << out_path << std::endl;
+            std::cout << "saved snapshot in " << tgt_path << std::endl;
         }
 
     }  // end while fringe is non-empty
     delete timer;
-
-    cv::Rect used_area_safe = used_area;
-    used_area_safe.x -= 2;
-    used_area_safe.y -= 2;
-    used_area_safe.width += 4;
-    used_area_safe.height += 4;
-    locs = locs(used_area_safe);
-    state = state(used_area_safe);
-    generations = generations(used_area_safe);
 
     // double max_cost = 0;
     // double avg_cost = 0;
@@ -1635,19 +1638,5 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
     printf("generated approximate surface %f vx^2 (%f cm^2)\n", area_est_vx2, area_est_cm2);
 
-    auto surf = new QuadSurface(locs, {1/T, 1/T});
-    surf->setChannel("generations", generations);
-
-    surf->meta = new nlohmann::json;
-    (*surf->meta)["area_vx2"] = area_est_vx2;
-    (*surf->meta)["area_cm2"] = area_est_cm2;
-    // (*surf->meta)["max_cost"] = max_cost;
-    // (*surf->meta)["avg_cost"] = avg_cost;
-    (*surf->meta)["max_gen"] = generation;
-    // (*surf->meta)["gen_avg_cost"] = gen_avg_cost;
-    // (*surf->meta)["gen_max_cost"] = gen_max_cost;
-    (*surf->meta)["seed"] = {origin[0],origin[1],origin[2]};
-    (*surf->meta)["elapsed_time_s"] = f_timer.seconds();
-
-    return surf;
+    return create_surface_from_state();
 }

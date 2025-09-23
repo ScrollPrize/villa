@@ -445,26 +445,33 @@ int main(int argc, char *argv[])
         origin = {0,0,0}; // Not used in resume mode, but needs to be initialized
     }
 
-    QuadSurface *surf = space_tracing_quad_phys(ds.get(), 1.0, &chunk_cache, origin, params, cache_root, voxelsize, direction_fields, resume_surf, tgt_dir.string(), corrections);
+    json meta_params;
+    meta_params["source"] = "vc_grow_seg_from_seed";
+    meta_params["vc_gsfs_params"] = params;
+    meta_params["vc_gsfs_mode"] = mode;
+    meta_params["vc_gsfs_version"] = "dev";
+    if (mode == "expansion")
+        meta_params["seed_overlap"] = count_overlap;
+
+    std::string uuid = name_prefix + time_str();
+    std::filesystem::path seg_dir = tgt_dir / uuid;
+
+    QuadSurface *surf = space_tracing_quad_phys(ds.get(), 1.0, &chunk_cache, origin, params, cache_root, voxelsize, direction_fields, resume_surf, seg_dir, meta_params, corrections);
  
     if (resume_surf) {
         delete resume_surf;
     }
 
     double area_cm2 = (*surf->meta)["area_cm2"].get<double>();
-    if (area_cm2 < min_area_cm)
+    if (area_cm2 < min_area_cm) {
+        if (std::filesystem::exists(seg_dir)) {
+            std::filesystem::remove_all(seg_dir);
+        }
         return EXIT_SUCCESS;
+    }
 
-    (*surf->meta)["source"] = "vc_grow_seg_from_seed";
-    (*surf->meta)["vc_gsfs_params"] = params;
-    (*surf->meta)["vc_gsfs_mode"] = mode;
-    (*surf->meta)["vc_gsfs_version"] = "dev";
-    if (mode == "expansion")
-        (*surf->meta)["seed_overlap"] = count_overlap;
-    std::string uuid = name_prefix + time_str();
-    std::filesystem::path seg_dir = tgt_dir / uuid;
     std::cout << "saving " << seg_dir << std::endl;
-    surf->save(seg_dir, uuid);
+    surf->save(seg_dir, uuid, true);
 
     SurfaceMeta current;
 
