@@ -13,6 +13,8 @@ from numba import jit, set_num_threads
 import sys
 import argparse
 from tqdm import tqdm  # Progress bar
+import dask.array as da
+from dask.diagnostics import ProgressBar
 
 # Determine default number of workers: half of CPU count (at least 1)
 default_workers = max(1, multiprocessing.cpu_count() // 2)
@@ -26,6 +28,8 @@ PYRAMID_LEVELS = 6
 # without serializing the large arrays for every slice task.
 _SLICE_STATE = {}
 _SLICE_DATASETS = {}
+_DOWNSAMPLE_STATE = {}
+_DOWNSAMPLE_DATASETS = {}
 
 
 def _set_slice_state(state):
@@ -92,6 +96,120 @@ def _process_zslice(zslice):
 
     _write_slice_output_worker(zslice, label_img, normals_img)
     return zslice
+
+
+def _set_downsample_state(state):
+    global _DOWNSAMPLE_STATE
+    global _DOWNSAMPLE_DATASETS
+    _DOWNSAMPLE_STATE = state
+    _DOWNSAMPLE_DATASETS = {}
+
+
+def _get_downsample_datasets():
+    state = _DOWNSAMPLE_STATE
+    if not state:
+        raise RuntimeError("Downsample state is not initialized in the worker.")
+
+    datasets = _DOWNSAMPLE_DATASETS.get("datasets")
+    if datasets is None:
+        root = zarr.open_group(state["store_path"], mode="r+")
+        parent_ds = root[state["parent_dataset_path"]]
+        target_ds = root[state["target_dataset_path"]]
+        datasets = (parent_ds, target_ds)
+        _DOWNSAMPLE_DATASETS["datasets"] = datasets
+    return datasets
+
+
+def _downsample_plane_worker(idx):
+    state = _DOWNSAMPLE_STATE
+    if not state:
+        raise RuntimeError("Downsample state is not initialized in the worker.")
+
+    parent_ds, target_ds = _get_downsample_datasets()
+    axes = state["axes"]
+    source = np.asarray(parent_ds[idx, ...])
+    downsampled = downsample_2x(source, axes=axes)
+    target_ds[idx, ...] = np.ascontiguousarray(downsampled, dtype=target_ds.dtype)
+    return idx
+
+
+def _rechunk_with_dask(zarr_array, chunk_size, desc, num_workers):
+    if zarr_array is None or chunk_size <= 0:
+        return zarr_array
+
+    # Only adjust the spatial axes (z, y, x) to keep channel chunking intact.
+    current_chunks = list(zarr_array.chunks)
+    target_chunks = list(current_chunks)
+    ndim = zarr_array.ndim
+    changed = False
+
+    for axis in range(min(3, ndim)):
+        desired = min(chunk_size, zarr_array.shape[axis])
+        if target_chunks[axis] != desired:
+            target_chunks[axis] = desired
+            changed = True
+
+    if not changed:
+        print(f"{desc} already uses requested chunk size; skipping rechunk.", flush=True)
+        return zarr_array
+
+    target_chunks = tuple(target_chunks)
+    print(f"Rechunking {desc} to chunks {target_chunks} using Dask", flush=True)
+
+    dask_array = da.from_zarr(zarr_array, chunks=target_chunks)
+    tmp_component = _build_tmp_component_name(zarr_array.path)
+    tmp_component_full = _join_parent_path(zarr_array.path, tmp_component)
+
+    # Preserve existing attributes before recreating the dataset.
+    attrs = zarr_array.attrs.asdict()
+
+    root = zarr.open_group(store=zarr_array.store, mode="r+")
+    parent_group = _get_parent_group(root, zarr_array.path)
+
+    if tmp_component in parent_group:
+        del parent_group[tmp_component]
+
+    delayed = da.to_zarr(
+        dask_array,
+        zarr_array.store,
+        component=tmp_component_full,
+        overwrite=True,
+        compute=False,
+    )
+
+    with ProgressBar():
+        delayed.compute(scheduler="threads", num_workers=max(1, num_workers))
+
+    new_array = parent_group[tmp_component]
+    if attrs:
+        new_array.attrs.update(attrs)
+
+    dataset_name = zarr_array.path.rpartition("/")[2] or zarr_array.path
+    if dataset_name in parent_group:
+        del parent_group[dataset_name]
+    parent_group.move(tmp_component, dataset_name)
+
+    refreshed = parent_group[dataset_name]
+    return refreshed
+
+
+def _build_tmp_component_name(path):
+    basename = path.rpartition("/")[2] or path
+    return f"{basename}__rechunk_tmp"
+
+
+def _join_parent_path(path, child):
+    parent, sep, _ = path.rpartition("/")
+    if sep:
+        return f"{parent}/{child}"
+    return child
+
+
+def _get_parent_group(root, path):
+    parent_path, sep, _ = path.rpartition("/")
+    if sep:
+        return root[parent_path]
+    return root
 
 
 @jit(nopython=True)
@@ -676,9 +794,17 @@ def main():
             shape[axis] = int(math.ceil(shape[axis] / factor))
         return tuple(shape)
 
-    def compute_chunks(shape, chunk_size):
+    def compute_chunks(shape, chunk_size, level):
         if chunk_size > 0:
-            chunks = [1] + [min(chunk_size, dim) for dim in shape[1:]]
+            spatial_axes = min(3, len(shape))
+            chunks = []
+            for axis, dim in enumerate(shape):
+                if axis == 0 and level == 0:
+                    chunks.append(1)
+                elif axis < spatial_axes:
+                    chunks.append(min(chunk_size, dim))
+                else:
+                    chunks.append(dim)
         else:
             chunks = list(shape)
             if chunks:
@@ -705,7 +831,7 @@ def main():
 
     for level in range(num_levels):
         level_shape = compute_level_shape(label_base_shape, level, (1, 2))
-        level_chunks = compute_chunks(level_shape, args.chunk_size)
+        level_chunks = compute_chunks(level_shape, args.chunk_size, level)
         dataset_name = f"{level}"
         ds = label_root.create_dataset(
             dataset_name,
@@ -756,7 +882,7 @@ def main():
 
         for level in range(num_levels):
             level_shape = compute_level_shape(normals_base_shape, level, (1, 2))
-            level_chunks = compute_chunks(level_shape, args.chunk_size)
+            level_chunks = compute_chunks(level_shape, args.chunk_size, level)
             dataset_name = f"{level}"
             ds = normals_root.create_dataset(
                 dataset_name,
@@ -894,7 +1020,16 @@ def main():
             )
             _write_slice_output(zslice, label_img, normals_img)
 
-    def populate_downsampled_levels(datasets, axes, desc):
+    if args.chunk_size > 0:
+        label_datasets[0] = _rechunk_with_dask(
+            label_datasets[0], args.chunk_size, "Labels level 0", N_PROCESSES
+        )
+        if args.output_normals:
+            normals_datasets[0] = _rechunk_with_dask(
+                normals_datasets[0], args.chunk_size, "Normals level 0", N_PROCESSES
+            )
+
+    def populate_downsampled_levels(datasets, store_path, axes, desc):
         if not datasets:
             return
         for level in range(1, len(datasets)):
@@ -902,15 +1037,53 @@ def main():
             target = datasets[level]
             num_planes = parent.shape[0]
             level_desc = f"{desc} level {level}"
-            for idx in tqdm(range(num_planes), desc=level_desc, leave=False):
+            if num_planes == 0:
+                continue
+
+            def _downsample_and_store(idx):
                 source = np.asarray(parent[idx, ...])
                 downsampled = downsample_2x(source, axes=axes)
                 target[idx, ...] = np.ascontiguousarray(downsampled, dtype=target.dtype)
 
-    populate_downsampled_levels(label_datasets, axes=(0, 1), desc="Labels")
+            use_parallel = False
+            mp_context = None
+            if N_PROCESSES > 1:
+                try:
+                    mp_context = multiprocessing.get_context("fork")
+                    use_parallel = True
+                except ValueError:
+                    mp_context = None
+
+            if use_parallel and mp_context is not None:
+                state = {
+                    "store_path": store_path,
+                    "parent_dataset_path": parent.path,
+                    "target_dataset_path": target.path,
+                    "axes": tuple(axes),
+                }
+                _set_downsample_state(state)
+                try:
+                    with ProcessPoolExecutor(
+                        max_workers=N_PROCESSES,
+                        mp_context=mp_context,
+                    ) as executor:
+                        for _ in tqdm(
+                            executor.map(_downsample_plane_worker, range(num_planes), chunksize=1),
+                            total=num_planes,
+                            desc=level_desc,
+                            leave=False,
+                        ):
+                            pass
+                finally:
+                    _set_downsample_state({})
+            else:
+                for idx in tqdm(range(num_planes), desc=level_desc, leave=False):
+                    _downsample_and_store(idx)
+
+    populate_downsampled_levels(label_datasets, out_path, axes=(0, 1), desc="Labels")
 
     if args.output_normals:
-        populate_downsampled_levels(normals_datasets, axes=(0, 1), desc="Normals")
+        populate_downsampled_levels(normals_datasets, normals_out_path, axes=(0, 1), desc="Normals")
 
     print("Completed OME-Zarr export.")
 
