@@ -36,34 +36,38 @@ struct Vec2iLess {
 
 class PointCorrection {
 public:
+    struct CorrectionCollection {
+        std::vector<cv::Vec3f> tgts_;
+        std::vector<cv::Vec2f> grid_locs_;
+    };
+
     PointCorrection() = default;
     PointCorrection(const VCCollection& corrections) {
         const auto& collections = corrections.getAllCollections();
         if (collections.empty()) return;
-        if (collections.size() != 1) {
-            throw std::runtime_error("Correction data must contain exactly one collection.");
+
+        for (const auto& pair : collections) {
+            const auto& collection = pair.second;
+            if (collection.points.empty()) continue;
+
+            CorrectionCollection new_collection;
+            std::vector<ColPoint> sorted_points;
+            sorted_points.reserve(collection.points.size());
+            for (const auto& point_pair : collection.points) {
+                sorted_points.push_back(point_pair.second);
+            }
+            std::sort(sorted_points.begin(), sorted_points.end(), [](const auto& a, const auto& b) {
+                return a.id < b.id;
+            });
+
+            new_collection.tgts_.reserve(sorted_points.size());
+            for (const auto& col_point : sorted_points) {
+                new_collection.tgts_.push_back(col_point.p);
+            }
+            collections_.push_back(new_collection);
         }
 
-        const auto& collection = collections.begin()->second;
-        if (collection.points.empty()) return;
-
-        std::vector<ColPoint> sorted_points;
-        sorted_points.reserve(collection.points.size());
-        for (const auto& pair : collection.points) {
-            sorted_points.push_back(pair.second);
-        }
-        std::sort(sorted_points.begin(), sorted_points.end(), [](const auto& a, const auto& b) {
-            return a.id < b.id;
-        });
-
-        tgts_.reserve(sorted_points.size());
-        for (const auto& col_point : sorted_points) {
-            tgts_.push_back(col_point.p);
-        }
-        
-        // tgts_.resize(1);
-
-        is_valid_ = true;
+        is_valid_ = !collections_.empty();
     }
 
     void init(const cv::Mat_<cv::Vec3f> &points) {
@@ -73,42 +77,51 @@ public:
         }
 
         QuadSurface tmp(points, {1.0f, 1.0f});
-        cv::Vec3f ptr = tmp.pointer();
+        
+        for (auto& collection : collections_) {
+            cv::Vec3f ptr = tmp.pointer();
 
-        // Initialize anchor point (lowest ID)
-        float d = tmp.pointTo(ptr, tgts_[0], 1.0f);
-        cv::Vec3f loc_3d = tmp.loc_raw(ptr);
-        std::cout << "base diff: " << d << loc_3d << std::endl;
-        cv::Vec2f loc(loc_3d[0], loc_3d[1]);
-        grid_locs_.push_back({loc[0], loc[1]});
-        grid_loc_params_.push_back({loc[0], loc[1]});
-        grid_loc_ints_.push_back({(int)std::floor(loc[0]), (int)std::floor(loc[1])});
+            // Initialize anchor point (lowest ID)
+            float d = tmp.pointTo(ptr, collection.tgts_[0], 1.0f);
+            cv::Vec3f loc_3d = tmp.loc_raw(ptr);
+            std::cout << "base diff: " << d << loc_3d << std::endl;
+            cv::Vec2f loc(loc_3d[0], loc_3d[1]);
+            collection.grid_locs_.push_back({loc[0], loc[1]});
 
-        // Initialize other points
-        for (size_t i = 1; i < tgts_.size(); ++i) {
-            d = tmp.pointTo(ptr, tgts_[i], 100.0f, 0);
-            loc_3d = tmp.loc_raw(ptr);
-            std::cout << "point diff: " << d << loc_3d << std::endl;
-            loc = {loc_3d[0], loc_3d[1]};
-            grid_locs_.push_back({loc[0], loc[1]});
-            grid_loc_params_.push_back({loc[0], loc[1]});
-            grid_loc_ints_.push_back({(int)std::floor(loc[0]), (int)std::floor(loc[1])});
+            // Initialize other points
+            for (size_t i = 1; i < collection.tgts_.size(); ++i) {
+                d = tmp.pointTo(ptr, collection.tgts_[i], 100.0f, 0);
+                loc_3d = tmp.loc_raw(ptr);
+                std::cout << "point diff: " << d << loc_3d << std::endl;
+                loc = {loc_3d[0], loc_3d[1]};
+                collection.grid_locs_.push_back({loc[0], loc[1]});
+            }
         }
     }
 
     bool isValid() const { return is_valid_; }
-    const std::vector<cv::Vec3f>& tgts() const { return tgts_; }
-    const std::vector<cv::Vec2f>& grid_locs() const { return grid_locs_; }
-    const std::vector<cv::Vec2d>& grid_loc_params() const { return grid_loc_params_; }
-    const std::vector<cv::Vec2i>& grid_loc_ints() const { return grid_loc_ints_; }
+    
+    const std::vector<CorrectionCollection>& collections() const { return collections_; }
 
+    std::vector<cv::Vec3f> all_tgts() const {
+        std::vector<cv::Vec3f> flat_tgts;
+        for (const auto& collection : collections_) {
+            flat_tgts.insert(flat_tgts.end(), collection.tgts_.begin(), collection.tgts_.end());
+        }
+        return flat_tgts;
+    }
+
+    std::vector<cv::Vec2f> all_grid_locs() const {
+        std::vector<cv::Vec2f> flat_locs;
+        for (const auto& collection : collections_) {
+            flat_locs.insert(flat_locs.end(), collection.grid_locs_.begin(), collection.grid_locs_.end());
+        }
+        return flat_locs;
+    }
 
 private:
     bool is_valid_ = false;
-    std::vector<cv::Vec3f> tgts_;
-    std::vector<cv::Vec2f> grid_locs_;
-    std::vector<cv::Vec2d> grid_loc_params_;
-    std::vector<cv::Vec2i> grid_loc_ints_;
+    std::vector<CorrectionCollection> collections_;
 };
 
 struct TraceParameters {
@@ -494,7 +507,8 @@ static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<u
 
     const auto& pc = trace_params.point_correction;
 
-    if (pc.grid_locs().empty()) {
+    const auto& all_grid_locs = pc.all_grid_locs();
+    if (all_grid_locs.empty()) {
         return 0;
     }
 
@@ -506,8 +520,7 @@ static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<u
     std::vector<cv::Vec3f> filtered_tgts;
     std::vector<cv::Vec2f> filtered_grid_locs;
 
-    const auto& all_tgts = pc.tgts();
-    const auto& all_grid_locs = pc.grid_locs();
+    const auto& all_tgts = pc.all_tgts();
     cv::Vec2i quad_loc_int = {p[1], p[0]};
 
     for (size_t i = 0; i < all_tgts.size(); ++i) {
@@ -971,21 +984,24 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         }
 
         if (trace_params.point_correction.isValid()) {
-            std::cout << "Resuming opt for " << trace_params.point_correction.grid_locs()[0] << std::endl;
-        }
-
-        if (trace_params.point_correction.isValid()) {
+            std::cout << "Resuming with " << trace_params.point_correction.all_grid_locs().size() << " correction points." << std::endl;
             cv::Mat mask = resume_surf->channel("mask");
             if (!mask.empty()) {
-                std::vector<cv::Point2f> hull_points;
-                const auto& tgt_locs = trace_params.point_correction.grid_locs();
-                if (!tgt_locs.empty()) {
+                std::vector<std::vector<cv::Point2f>> all_hulls;
+                for (const auto& collection : trace_params.point_correction.collections()) {
+                    if (collection.grid_locs_.empty()) continue;
+
                     std::vector<cv::Point2f> points_for_hull;
-                    points_for_hull.reserve(tgt_locs.size());
-                    for (const auto& loc : tgt_locs) {
+                    points_for_hull.reserve(collection.grid_locs_.size());
+                    for (const auto& loc : collection.grid_locs_) {
                         points_for_hull.emplace_back(loc[0], loc[1]);
                     }
+                    
+                    std::vector<cv::Point2f> hull_points;
                     cv::convexHull(points_for_hull, hull_points);
+                    if (!hull_points.empty()) {
+                        all_hulls.push_back(hull_points);
+                    }
                 }
 
                 for (int j = 0; j < mask.rows; ++j) {
@@ -995,9 +1011,10 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                             int target_x = pad_x + i;
                             cv::Point2f p(target_x, target_y);
                             bool keep = false;
-                            if (!hull_points.empty()) {
-                                if (cv::pointPolygonTest(hull_points, p, false) >= 0) {
+                            for (const auto& hull : all_hulls) {
+                                if (cv::pointPolygonTest(hull, p, false) >= 0) {
                                     keep = true;
+                                    break;
                                 }
                             }
                             if (!keep) {
@@ -1010,9 +1027,19 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                 }
             }
 
+            for (const auto& collection : trace_params.point_correction.collections()) {
+                if (collection.grid_locs_.empty()) continue;
 
-            cv::Vec2i corr_center_i = { (int)std::round(trace_params.point_correction.grid_locs()[0][1]), (int)std::round(trace_params.point_correction.grid_locs()[0][0]) };
-            local_optimization(16, corr_center_i, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
+                cv::Vec2f avg_loc(0,0);
+                for (const auto& loc : collection.grid_locs_) {
+                    avg_loc += loc;
+                }
+                avg_loc *= (1.0f / collection.grid_locs_.size());
+
+                std::cout << "Resuming opt for collection centered at " << avg_loc << std::endl;
+                cv::Vec2i corr_center_i = { (int)std::round(avg_loc[1]), (int)std::round(avg_loc[0]) };
+                local_optimization(16, corr_center_i, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
+            }
 
             trace_params.point_correction = PointCorrection();
 
