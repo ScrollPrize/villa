@@ -14,37 +14,9 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 
 from dataset import PatchInCubeDataset
-from resnet3d import ResNet3DEncoder
 from vesuvius_unet3d import Vesuvius3dUnetModel
 from song_unet3d import SongUnet3dModel
 from sampling import sample_ddim
-
-
-class PatchConditionedOn3dModel(torch.nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.denoiser = diffusers.models.UNet2DConditionModel(
-            sample_size=config['patch_size'],
-            in_channels=3,
-            out_channels=3,
-            encoder_hid_dim=128,
-            down_block_types=(
-                "CrossAttnDownBlock2D",
-                "CrossAttnDownBlock2D",
-                "DownBlock2D",
-            ),
-            mid_block_type="UNetMidBlock2DCrossAttn",
-            up_block_types=("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
-            block_out_channels=(320, 640, 1280),
-        )
-        self.encoder = ResNet3DEncoder(in_channels=4, channels=[32, 64, 96, 128], blocks=[2, 2, 2, 2])
-        self.register_buffer('position_embeddings', torch.from_numpy(np.indices((config['crop_size'], config['crop_size'], config['crop_size']), dtype=np.float32)))
-
-    def forward(self, inputs, timesteps, volume):
-        # TODO: consider adding position-embedding only after resnet
-        conditioning = self.encoder(torch.cat([torch.tile(self.position_embeddings, (volume.shape[0], 1, 1, 1, 1)), volume.unsqueeze(1)], dim=1))
-        conditioning = rearrange(conditioning, 'b c z y x -> b (z y x) c')
-        return self.denoiser(inputs, timesteps, encoder_hidden_states=conditioning)
 
 
 def prepare_batch(batch, noise_scheduler, generative, cfg_uncond_prob):
@@ -194,21 +166,5 @@ def train(config_path):
             wandb.log(wandb_log)
 
 
-@click.command()
-@click.argument('config_path', type=click.Path(exists=True))
-def infer(config_path):
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-    print(f"Inference with config: {config_path}")
-    # TODO: Implement inference logic using config
-
-
-@click.group()
-def main():
-    pass
-
-main.add_command(train)
-main.add_command(infer)
-
 if __name__ == '__main__':
-    main()
+    train()
