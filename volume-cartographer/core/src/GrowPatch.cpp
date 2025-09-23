@@ -1027,6 +1027,12 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                 }
             }
 
+            struct OptCenter {
+                cv::Vec2i center;
+                int radius;
+            };
+            std::vector<OptCenter> opt_centers;
+
             for (const auto& collection : trace_params.point_correction.collections()) {
                 if (collection.grid_locs_.empty()) continue;
 
@@ -1036,12 +1042,24 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                 }
                 avg_loc *= (1.0f / collection.grid_locs_.size());
 
-                std::cout << "Resuming opt for collection centered at " << avg_loc << std::endl;
+                float max_dist = 0.0f;
+                for (const auto& loc : collection.grid_locs_) {
+                    max_dist = std::max(max_dist, (float)cv::norm(loc - avg_loc));
+                }
+
+                int radius = 8 + static_cast<int>(std::ceil(max_dist));
                 cv::Vec2i corr_center_i = { (int)std::round(avg_loc[1]), (int)std::round(avg_loc[0]) };
-                local_optimization(16, corr_center_i, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
+                opt_centers.push_back({corr_center_i, radius});
+
+                std::cout << "correction opt centered at " << avg_loc << " with radius " << radius << std::endl;
+                local_optimization(radius, corr_center_i, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
             }
 
             trace_params.point_correction = PointCorrection();
+
+            for (const auto& opt_params : opt_centers) {
+                local_optimization(opt_params.radius, opt_params.center, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
+            }
 
             // Rebuild fringe from valid points
             fringe.clear();
