@@ -1063,7 +1063,7 @@ struct PointsCorrectionLoss {
         residuals[0] = T(0.0);
         for (size_t i = 0; i < tgts_.size(); ++i) {
             const T* grid_loc = parameters[4 + i];
-            residuals[0] += T(0.05)*calculate_residual_for_point(i, p00, p01, p10, p11, grid_loc);
+            residuals[0] += T(0.1)*calculate_residual_for_point(i, p00, p01, p10, p11, grid_loc);
         }
         return true;
     }
@@ -1071,36 +1071,97 @@ struct PointsCorrectionLoss {
 private:
     template <typename T>
     T calculate_residual_for_point(int point_idx, const T* const p00, const T* const p01, const T* const p10, const T* const p11, const T* const grid_loc) const {
-        const cv::Vec3f& tgt = tgts_[point_idx];
+        const cv::Vec3f& tgt_cv = tgts_[point_idx];
+        T tgt[3] = {T(tgt_cv[0]), T(tgt_cv[1]), T(tgt_cv[2])};
 
-        // Calculate the local coordinates (u,v) within the quad by subtracting the integer grid location.
-        T u = grid_loc[0] - T(grid_loc_int_[0]);
-        T v = grid_loc[1] - T(grid_loc_int_[1]);
+        // T u = grid_loc[0] - T(grid_loc_int_[0]);
+        // T v = grid_loc[1] - T(grid_loc_int_[1]);
+        //
+        // if (u < T(0.0) || u > T(1.0) || v < T(0.0) || v > T(1.0)) {
+        //     return T(0.0);
+        // }
 
-        // If the grid location is outside this specific quad (i.e., u,v not in [0,1]), this loss is zero.
-        if (u < T(0.0) || u >= T(1.0) || v < T(0.0) || v >= T(1.0)) {
-            return T(0.0);
-        }
+        T total_residual = T(0.0);
 
-        // Bilinear interpolation to find the 3D point on the surface patch corresponding to the grid location.
-        T p_interp[3];
-        p_interp[0] = (T(1) - u) * (T(1) - v) * p00[0] + u * (T(1) - v) * p10[0] + (T(1) - u) * v * p01[0] + u * v * p11[0];
-        p_interp[1] = (T(1) - u) * (T(1) - v) * p00[1] + u * (T(1) - v) * p10[1] + (T(1) - u) * v * p01[1] + u * v * p11[1];
-        p_interp[2] = (T(1) - u) * (T(1) - v) * p00[2] + u * (T(1) - v) * p10[2] + (T(1) - u) * v * p01[2] + u * v * p11[2];
+        // Non-differentiable 2D distance weight calculation with linear falloff
+        double grid_loc_val[2] = {val(grid_loc[0]), val(grid_loc[1])};
+        double dx_2d = grid_loc_val[0] - grid_loc_int_[0];
+        double dy_2d = grid_loc_val[1] - grid_loc_int_[1];
+        double dist_2d = std::sqrt(dx_2d * dx_2d + dy_2d * dy_2d);
+        double weight_2d = std::max(0.0, 1.0 - dist_2d / 4.0);
 
-        // Residual 1: 3D Euclidean distance between the interpolated point and the target correction point.
-        T dx_abs = p_interp[0] - T(tgt[0]);
-        T dy_abs = p_interp[1] - T(tgt[1]);
-        T dz_abs = p_interp[2] - T(tgt[2]);
-        T residual = dx_abs * dx_abs + dy_abs * dy_abs + dz_abs * dz_abs;
+        // Corner p00 (neighbors p10, p01)
+        total_residual += calculate_corner_residual(tgt, p00, p10, p01);
+        // Corner p10 (neighbors p00, p11)
+        total_residual += calculate_corner_residual(tgt, p10, p00, p11);
+        // Corner p01 (neighbors p00, p11)
+        total_residual += calculate_corner_residual(tgt, p01, p00, p11);
+        // Corner p11 (neighbors p10, p01)
+        total_residual += calculate_corner_residual(tgt, p11, p10, p01);
+
+        total_residual *= T(weight_2d);
+
         if (dbg_) {
-            std::cout << "Point " << point_idx << " | 3D dist: " << val(residual) << " | 2D loc: " << val(grid_loc[0]) << ", " << val(grid_loc[1]) << " | int_loc: " << grid_loc_int_[0] << ", " << grid_loc_int_[1] << std::endl;
+            std::cout << "Point " << point_idx << " | Residual: " << val(total_residual) << std::endl;
         }
-        return residual;
+        return total_residual;
+    }
+
+    template <typename T>
+    T calculate_corner_residual(const T* tgt, const T* p, const T* n1, const T* n2) const {
+        // Vectors from p to its neighbors
+        T v1[3] = { n1[0] - p[0], n1[1] - p[1], n1[2] - p[2] };
+        T v2[3] = { n2[0] - p[0], n2[1] - p[1], n2[2] - p[2] };
+
+        // Plane normal vector (cross product)
+        T normal[3];
+        normal[0] = v1[1] * v2[2] - v1[2] * v2[1];
+        normal[1] = v1[2] * v2[0] - v1[0] * v2[2];
+        normal[2] = v1[0] * v2[1] - v1[1] * v2[0];
+
+        T norm_len = ceres::sqrt(normal[0]*normal[0] + normal[1]*normal[1] + normal[2]*normal[2]);
+        if (norm_len < T(1e-9)) return T(0.0);
+        normal[0] /= norm_len;
+        normal[1] /= norm_len;
+        normal[2] /= norm_len;
+
+        // Vector from a point on the plane (p) to the target point
+        T w[3] = { tgt[0] - p[0], tgt[1] - p[1], tgt[2] - p[2] };
+
+        // Differentiable (in the point) signed distance from tgt to the plane
+        T dist = normal[0] * w[0] + normal[1] * w[1] + normal[2] * w[2];
+
+        if (dbg_)
+            std::cout << "dist " << dist << std::endl;
+
+        // Non-differentiable weight calculation
+        double tgt_val[3] = {val(tgt[0]), val(tgt[1]), val(tgt[2])};
+        double p_val[3] = {val(p[0]), val(p[1]), val(p[2])};
+        double normal_val[3] = {val(normal[0]), val(normal[1]), val(normal[2])};
+        double w_val[3] = {tgt_val[0] - p_val[0], tgt_val[1] - p_val[1], tgt_val[2] - p_val[2]};
+        double dist_val = normal_val[0] * w_val[0] + normal_val[1] * w_val[1] + normal_val[2] * w_val[2];
+
+        double proj_val[3];
+        proj_val[0] = tgt_val[0] - dist_val * normal_val[0];
+        proj_val[1] = tgt_val[1] - dist_val * normal_val[1];
+        proj_val[2] = tgt_val[2] - dist_val * normal_val[2];
+
+        // Calculate the 3D distance between the projected point and the corner point p
+        double dx_proj = proj_val[0] - p_val[0];
+        double dy_proj = proj_val[1] - p_val[1];
+        double dz_proj = proj_val[2] - p_val[2];
+        double dist_proj_to_corner = std::sqrt(dx_proj*dx_proj + dy_proj*dy_proj + dz_proj*dz_proj);
+
+        // Linear falloff from 1 to 0 over a distance of 80
+        double weight = std::max(0.0, 1.0 - dist_proj_to_corner / 80.0);
+
+        if (dbg_)
+            std::cout << "weight " << weight << std::endl;
+        return T(weight) * ceres::abs(dist);
     }
 
     const std::vector<cv::Vec3f>& tgts_;
     const cv::Vec2i grid_loc_int_;
 public:
-    bool dbg_;
+    bool dbg_ = false;
 };

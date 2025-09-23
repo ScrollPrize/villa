@@ -643,10 +643,10 @@ static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<u
 
     problem.AddResidualBlock(cost_function, nullptr, parameter_blocks);
 
-    points_correction_loss->dbg_ = true;
-    double cost = 0.0;
-    cost_function->Evaluate(parameter_blocks.data(), &cost, nullptr);
-    points_correction_loss->dbg_ = false;
+    // points_correction_loss->dbg_ = true;
+    // double cost = 0.0;
+    // cost_function->Evaluate(parameter_blocks.data(), &cost, nullptr);
+    // points_correction_loss->dbg_ = false;
 
     // for (size_t i = 0; i < pc.grid_loc_params().size(); ++i) {
     //     problem.SetParameterBlockConstant(parameter_blocks[4 + i]);
@@ -795,6 +795,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t
 //     }
 // #endif
     ceres::Solver::Summary summary;
+
     ceres::Solve(options, &problem, &summary);
 
     if (!quiet)
