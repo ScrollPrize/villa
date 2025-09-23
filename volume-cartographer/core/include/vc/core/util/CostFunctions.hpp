@@ -744,7 +744,7 @@ struct NormalConstraintPlane {
                 const cv::Point2f& p_a = path[i];
                 const cv::Point2f& p_b = path[i+1];
 
-                if (seg_dist_sq_appx(p1, p2, p_a, p_b) <= roi_radius_ * roi_radius_) {
+                if (seg_dist_sq_appx(p1, p2, p_a, p_b) <= query_radius_ * query_radius_) {
                     if (current_sub_path.empty()) {
                         current_sub_path.push_back(p_a);
                     }

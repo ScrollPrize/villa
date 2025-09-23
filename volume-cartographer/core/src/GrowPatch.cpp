@@ -785,8 +785,13 @@ static float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 1000;
+
     // options.function_tolerance = 1e-4;
-    options.use_nonmonotonic_steps = true;
+    // options.use_nonmonotonic_steps = true;
+    // options.use_mixed_precision_solves = true;
+    // options.max_num_refinement_iterations = 3;
+    // options.use_inner_iterations = true;
+
 
     if (parallel)
         options.num_threads = omp_get_max_threads();
@@ -1086,25 +1091,25 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
 
             trace_params.point_correction = PointCorrection();
 
-            if (!intermediate_path_dir.empty()) {
-                cv::Rect used_area_safe = used_area;
-                used_area_safe.x -= 2;
-                used_area_safe.y -= 2;
-                used_area_safe.width += 4;
-                used_area_safe.height += 4;
-                cv::Mat_<cv::Vec3d> locs_crop = locs(used_area_safe);
-                cv::Mat_<uint16_t> generations_crop = generations(used_area_safe);
-
-                auto surf = new QuadSurface(locs_crop, {1/T, 1/T});
-                surf->setChannel("generations", generations_crop);
-
-                char filename[256];
-                snprintf(filename, sizeof(filename), "snapshot_gen_%04d_corrected", generation);
-                std::filesystem::path out_path = std::filesystem::path(intermediate_path_dir) / filename;
-                surf->save(out_path);
-                delete surf;
-                std::cout << "saved corrected snapshot in " << out_path << std::endl;
-            }
+            // if (!intermediate_path_dir.empty()) {
+            //     cv::Rect used_area_safe = used_area;
+            //     used_area_safe.x -= 2;
+            //     used_area_safe.y -= 2;
+            //     used_area_safe.width += 4;
+            //     used_area_safe.height += 4;
+            //     cv::Mat_<cv::Vec3d> locs_crop = locs(used_area_safe);
+            //     cv::Mat_<uint16_t> generations_crop = generations(used_area_safe);
+            //
+            //     auto surf = new QuadSurface(locs_crop, {1/T, 1/T});
+            //     surf->setChannel("generations", generations_crop);
+            //
+            //     char filename[256];
+            //     snprintf(filename, sizeof(filename), "snapshot_gen_%04d_corrected", generation);
+            //     std::filesystem::path out_path = std::filesystem::path(intermediate_path_dir) / filename;
+            //     surf->save(out_path);
+            //     delete surf;
+            //     std::cout << "saved corrected snapshot in " << out_path << std::endl;
+            // }
 
             // Rebuild fringe from valid points
             fringe.clear();
