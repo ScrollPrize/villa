@@ -106,11 +106,9 @@ install = "vesuvius.install.custom_install.CustomInstallCommand"
 version = {attr = "vesuvius._version.VERSION"}
 
 [tool.uv]
-required-environments = ["linux_aarch64"]
-
-[tool.uv.environments.linux_aarch64]
-python = "3.11"
-platform = "manylinux_2_39_aarch64"
+required-environments = [
+    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+]
 
 [tool.uv.sources]
 batchgeneratorsv2 = { path = "../segmentation/models/batchgeneratorsv2" }
