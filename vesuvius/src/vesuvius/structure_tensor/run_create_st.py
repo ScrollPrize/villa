@@ -131,7 +131,7 @@ def run_structure_tensor_part(args, part_id, gpu_id, shared_output_path):
     from vesuvius.structure_tensor import create_st
     
     # Build command to run create_st.py's main() directly
-    cmd = [sys.executable, '-m', 'structure_tensor.create_st']
+    cmd = [sys.executable, '-m', 'vesuvius.structure_tensor.create_st']
     
     # Basic arguments
     cmd.extend(['--input_dir', args.input_dir])
@@ -206,7 +206,7 @@ def run_structure_tensor_part(args, part_id, gpu_id, shared_output_path):
 
 def run_eigenanalysis(zarr_path, chunk_size, compressor, verbose, swap_eigenvectors, num_workers):
     """Run eigenanalysis directly (no subprocess) to avoid duplicate prints."""
-    from structure_tensor.create_st import _finalize_structure_tensor_torch
+    from vesuvius.structure_tensor.create_st import _finalize_structure_tensor_torch
     print("\n--- Running Eigenanalysis ---")
     # normalize chunk_size to a tuple
     if isinstance(chunk_size, str) and chunk_size:
