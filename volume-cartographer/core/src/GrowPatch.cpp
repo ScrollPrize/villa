@@ -579,16 +579,16 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_direction_loss(9, p, -1, loss_status, problem, params.state, params.dpoints, trace_data.direction_fields);
 
     //gridstore normals
-    count += conditional_normal_loss(10, p                 , loss_status, problem, params, trace_data, settings);
-    count += conditional_normal_loss(10, p + cv::Vec2i(1,1), loss_status, problem, params, trace_data, settings);
-    count += conditional_normal_loss(10, p + cv::Vec2i(0,1), loss_status, problem, params, trace_data, settings);
-    count += conditional_normal_loss(10, p + cv::Vec2i(1,0), loss_status, problem, params, trace_data, settings);
+    count += conditional_normal_loss(10, p                   , loss_status, problem, params, trace_data, settings);
+    count += conditional_normal_loss(10, p + cv::Vec2i(-1,-1), loss_status, problem, params, trace_data, settings);
+    count += conditional_normal_loss(10, p + cv::Vec2i( 0,-1), loss_status, problem, params, trace_data, settings);
+    count += conditional_normal_loss(10, p + cv::Vec2i(-1, 0), loss_status, problem, params, trace_data, settings);
 
     //snapping
-    count += conditional_corr_loss(11, p,                  loss_status, problem, params.state, params.dpoints, trace_data);
-    count += conditional_corr_loss(11, p + cv::Vec2i(1,1), loss_status, problem, params.state, params.dpoints, trace_data);
-    count += conditional_corr_loss(11, p + cv::Vec2i(0,1), loss_status, problem, params.state, params.dpoints, trace_data);
-    count += conditional_corr_loss(11, p + cv::Vec2i(1,0), loss_status, problem, params.state, params.dpoints, trace_data);
+    count += conditional_corr_loss(11, p,                    loss_status, problem, params.state, params.dpoints, trace_data);
+    count += conditional_corr_loss(11, p + cv::Vec2i(-1,-1), loss_status, problem, params.state, params.dpoints, trace_data);
+    count += conditional_corr_loss(11, p + cv::Vec2i( 0,-1), loss_status, problem, params.state, params.dpoints, trace_data);
+    count += conditional_corr_loss(11, p + cv::Vec2i(-1, 0), loss_status, problem, params.state, params.dpoints, trace_data);
 
     return count;
 }
