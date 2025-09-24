@@ -137,7 +137,7 @@ struct TraceParameters {
 };
 
 struct LossSettings {
-    float w_snap = 1.0;
+    float w_snap = 0.1;
     float w_normal = 1.0;
     float w_straight = 0.2;
     int z_min = -1;
@@ -274,13 +274,13 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TracePar
         // bool direction_aware = (i == 0); // XY plane
         bool direction_aware = false; // this is not that simple ...
         // Loss with p as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings.w_normal, direction_aware, settings.z_min, settings.z_max), nullptr, pA, pB1, pB2, pC);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings.w_normal, settings.w_snap, direction_aware, settings.z_min, settings.z_max), nullptr, pA, pB1, pB2, pC);
         // Loss with p_br as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings.w_normal, direction_aware, settings.z_min, settings.z_max), nullptr, pC, pB2, pB1, pA);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings.w_normal, settings.w_snap, direction_aware, settings.z_min, settings.z_max), nullptr, pC, pB2, pB1, pA);
         // Loss with p_tr as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings.w_normal, direction_aware, settings.z_min, settings.z_max), nullptr, pB1, pC, pA, pB2);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings.w_normal, settings.w_snap, direction_aware, settings.z_min, settings.z_max), nullptr, pB1, pC, pA, pB2);
         // Loss with p_bl as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings.w_normal, direction_aware, settings.z_min, settings.z_max), nullptr, pB2, pA, pC, pB1);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings.w_normal, settings.w_snap, direction_aware, settings.z_min, settings.z_max), nullptr, pB2, pA, pC, pB1);
         count += 4;
     }
 
@@ -396,7 +396,7 @@ static int conditional_corr_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t>
                                  ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, TraceParameters &trace_params);
 
 template <typename I, typename T, typename C>
-static int add_phys_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params,
+static int add_continuous_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params,
     const I &interp, Chunked3d<T,C> &t, const TraceData &trace_data, const LossSettings &settings, float unit)
 {
     //generate losses for point p
@@ -439,10 +439,10 @@ static int add_phys_losses(ceres::Problem &problem, const cv::Vec2i &p, TracePar
     count += gen_dist_loss(problem, p, {-1,-1}, params, unit, settings);
 
     //gridstore normals
-    // count += gen_normal_loss(problem, p                 , params, trace_data, settings);
-    // count += gen_normal_loss(problem, p + cv::Vec2i(1,1), params, trace_data, settings);
-    // count += gen_normal_loss(problem, p + cv::Vec2i(0,1), params, trace_data, settings);
-    // count += gen_normal_loss(problem, p + cv::Vec2i(1,0), params, trace_data, settings);
+    // count += gen_normal_loss(problem, p                   , params, trace_data, settings);
+    // count += gen_normal_loss(problem, p + cv::Vec2i(-1,-1), params, trace_data, settings);
+    // count += gen_normal_loss(problem, p + cv::Vec2i( 0,-1), params, trace_data, settings);
+    // count += gen_normal_loss(problem, p + cv::Vec2i(-1, 0), params, trace_data, settings);
 
     return count;
 }
@@ -1173,7 +1173,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 ceres::Problem problem;
 
                 trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
-                int local_loss_count = add_phys_losses(problem, p, trace_params, interp, proc_tensor, trace_data, loss_settings, Ts);
+                int local_loss_count = add_continuous_losses(problem, p, trace_params, interp, proc_tensor, trace_data, loss_settings, Ts);
 
                 std::vector<double*> parameter_blocks;
                 problem.GetParameterBlocks(&parameter_blocks);
@@ -1199,6 +1199,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     succ_gen_ps.push_back(p);
                 }
 
+                // local_optimization(1, p, trace_params, interp, proc_tensor, trace_data, loss_settings, Ts, true);
                 local_optimization(local_opt_r, p, trace_params, interp, proc_tensor, trace_data, loss_settings, Ts, true);
             }  // end parallel iteration over cands
         }

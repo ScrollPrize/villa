@@ -526,6 +526,7 @@ struct NormalConstraintPlane {
     const vc::core::util::NormalGridVolume& normal_grid_volume;
     const int plane_idx; // 0: XY, 1: XZ, 2: YZ
     const double weight;
+    const double w_snap;
     const int z_min;
     const int z_max;
     bool invert_dir;
@@ -572,8 +573,8 @@ struct NormalConstraintPlane {
      const double snap_trig_th_ = 4.0;
      const double snap_search_range_ = 16.0;
  
-     NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight, bool direction_aware = false, int z_min = -1, int z_max = -1, bool invert_dir = false)
-         : normal_grid_volume(normal_grid_volume), plane_idx(plane_idx), weight(weight), direction_aware_(direction_aware), z_min(z_min), z_max(z_max), invert_dir(invert_dir) {}
+     NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight, double w_snap, bool direction_aware = false, int z_min = -1, int z_max = -1, bool invert_dir = false)
+         : normal_grid_volume(normal_grid_volume), plane_idx(plane_idx), weight(weight), w_snap(w_snap), direction_aware_(direction_aware), z_min(z_min), z_max(z_max), invert_dir(invert_dir) {}
 
     template <typename T>
     bool operator()(const T* const pA, const T* const pB1, const T* const pB2, const T* const pC, T* residual) const {
@@ -911,7 +912,7 @@ struct NormalConstraintPlane {
             snapping_loss = T(1.0); // Penalty if no snap target found
         }
 
-        return normal_loss + T(0.1)*snapping_loss;
+        return normal_loss + T(w_snap)*snapping_loss;
     }
 
     static float seg_dist_sq_appx(cv::Point2f p1, cv::Point2f p2, cv::Point2f p3, cv::Point2f p4)
@@ -949,9 +950,9 @@ struct NormalConstraintPlane {
         return dist_sq(dP);
     }
 
-    static ceres::CostFunction* Create(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight, bool direction_aware = false, int z_min = -1, int z_max = -1, bool invert_dir = false) {
+    static ceres::CostFunction* Create(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight, double w_snap, bool direction_aware = false, int z_min = -1, int z_max = -1, bool invert_dir = false) {
         return new ceres::AutoDiffCostFunction<NormalConstraintPlane, 1, 3, 3, 3, 3>(
-            new NormalConstraintPlane(normal_grid_volume, plane_idx, weight, direction_aware, z_min, z_max, invert_dir)
+            new NormalConstraintPlane(normal_grid_volume, plane_idx, weight, w_snap, direction_aware, z_min, z_max, invert_dir)
         );
     }
 
