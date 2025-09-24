@@ -1077,6 +1077,19 @@ class PlaneSlicer:
                     "tilt_y_rad": float(tilt_angles.get("y", 0.0)),
                     "tilt_z_rad": float(tilt_angles.get("z", 0.0)),
                 },
+                "global_position": [int(slice_idx), int(pos0), int(pos1)] if plane == "z" else (
+                    [int(pos0), int(slice_idx), int(pos1)] if plane == "y" else [int(pos0), int(pos1), int(slice_idx)]
+                ),
+                "global_end": [
+                    int(slice_idx + 1) if plane == "z" else int(pos0 + patch_size[0]),
+                    int(pos0 + patch_size[0]) if plane == "z" else (int(slice_idx + 1) if plane == "y" else int(pos1 + patch_size[1])),
+                    int(pos1 + patch_size[1]) if plane == "z" or plane == "y" else int(slice_idx + 1),
+                ],
+                "source_path": str(getattr(volume.image, "path", None)) if hasattr(volume.image, "path") else None,
+                "label_source_paths": {
+                    name: str(getattr(handle, "path", None)) if hasattr(handle, "path") else None
+                    for name, handle in volume.labels.items()
+                },
             },
         )
 
