@@ -401,6 +401,15 @@ class ChunkSlicer:
                 'tilt_z_rad': 0.0,
             },
             'volume_name': volume.name,
+            'global_position': list(int(v) for v in patch.position),
+            'global_end': [
+                int(start + size) for start, size in zip(patch.position, patch.patch_size)
+            ],
+            'source_path': str(getattr(volume.image, 'path', None)) if hasattr(volume.image, 'path') else None,
+            'label_source_paths': {
+                name: str(getattr(handle, 'path', None)) if hasattr(handle, 'path') else None
+                for name, handle in volume.labels.items()
+            },
         }
 
         return ChunkResult(
@@ -557,12 +566,29 @@ class ChunkSlicer:
                 patch = arr[y : y + ph, x : x + pw]
                 return pad_or_crop_2d(patch, (ph, pw)).astype(np.float32, copy=False)
             if arr.ndim == 3:
-                channels = arr.shape[0]
-                padded = [
-                    pad_or_crop_2d(arr[c, y : y + ph, x : x + pw], (ph, pw)).astype(np.float32, copy=False)
-                    for c in range(channels)
-                ]
-                return np.stack(padded, axis=0)
+                layout = self._infer_label_layout_2d(arr.shape, (y, x))
+                if layout == "channel_first":
+                    channels = arr.shape[0]
+                    padded = [
+                        pad_or_crop_2d(
+                            arr[c, y : y + ph, x : x + pw], (ph, pw)
+                        ).astype(np.float32, copy=False)
+                        for c in range(channels)
+                    ]
+                    return np.stack(padded, axis=0)
+                if layout == "channel_last":
+                    patch = arr[y : y + ph, x : x + pw, :]
+                    flat = patch.reshape(patch.shape[0], patch.shape[1], -1)
+                    flat = np.moveaxis(flat, -1, 0)
+                    padded = [
+                        pad_or_crop_2d(flat[c], (ph, pw)).astype(np.float32, copy=False)
+                        for c in range(flat.shape[0])
+                    ]
+                    return np.stack(padded, axis=0)
+                raise ValueError(
+                    "2D chunk extraction encountered an ambiguous channel layout; "
+                    f"position {position} is compatible with both leading and trailing channel axes for array shape {arr.shape}."
+                )
             raise ValueError(
                 "2D chunk extraction expects label data with shape (H, W) or (C, H, W)"
             )
@@ -577,13 +603,46 @@ class ChunkSlicer:
             patch = arr[z : z + pd, y : y + ph, x : x + pw]
             return pad_or_crop_3d(patch, (pd, ph, pw)).astype(np.float32, copy=False)
         if arr.ndim == 4:
-            channels = arr.shape[0]
+            layout = self._infer_label_layout_3d(arr.shape, (z, y, x))
+            if layout == "channel_first":
+                channels = arr.shape[0]
+                padded = [
+                    pad_or_crop_3d(
+                        arr[c, z : z + pd, y : y + ph, x : x + pw], (pd, ph, pw)
+                    ).astype(np.float32, copy=False)
+                    for c in range(channels)
+                ]
+                return np.stack(padded, axis=0)
+            if layout == "channel_last":
+                patch = arr[z : z + pd, y : y + ph, x : x + pw, :]
+                flat = patch.reshape(patch.shape[0], patch.shape[1], patch.shape[2], -1)
+                flat = np.moveaxis(flat, -1, 0)
+                padded = [
+                    pad_or_crop_3d(flat[c], (pd, ph, pw)).astype(np.float32, copy=False)
+                    for c in range(flat.shape[0])
+                ]
+                return np.stack(padded, axis=0)
+            raise ValueError(
+                "3D chunk extraction encountered an ambiguous 4D label layout; "
+                f"position {position} matches both leading and trailing channel interpretations for array shape {arr.shape}."
+            )
+        if arr.ndim == 5:
+            if not self._position_fits_volume((z, y, x), arr.shape[:3]):
+                raise ValueError(
+                    f"3D chunk extraction position {position} exceeds label array spatial shape {arr.shape[:3]}"
+                )
+            patch = arr[z : z + pd, y : y + ph, x : x + pw, :, :]
+            flat = patch.reshape(patch.shape[0], patch.shape[1], patch.shape[2], -1)
+            flat = np.moveaxis(flat, -1, 0)
             padded = [
-                pad_or_crop_3d(arr[c, z : z + pd, y : y + ph, x : x + pw], (pd, ph, pw)).astype(np.float32, copy=False)
-                for c in range(channels)
+                pad_or_crop_3d(flat[c], (pd, ph, pw)).astype(np.float32, copy=False)
+                for c in range(flat.shape[0])
             ]
             return np.stack(padded, axis=0)
-        raise ValueError("3D chunk extraction expects label data with shape (D, H, W) or (C, D, H, W)")
+        raise ValueError(
+            "3D chunk extraction expects label data with shape (D, H, W), (C, D, H, W), "
+            "(D, H, W, C), or higher-dimensional channel groupings trailing the spatial axes."
+        )
 
     def _finalize_image_patch(self, patch: np.ndarray, position: Tuple[int, ...]) -> np.ndarray:
         if self._is_2d:
@@ -640,3 +699,53 @@ class ChunkSlicer:
             ]
             return np.stack(padded, axis=0)
         raise ValueError("3D chunk extraction expects label data with shape (D, H, W) or (C, D, H, W)")
+
+    @staticmethod
+    def _position_fits_volume(position: Tuple[int, ...], spatial_shape: Sequence[int]) -> bool:
+        if len(position) != len(spatial_shape):
+            raise ValueError(
+                f"Position dimensionality {len(position)} does not match spatial shape {spatial_shape}"
+            )
+        return all(0 <= coord < size for coord, size in zip(position, spatial_shape))
+
+    @classmethod
+    def _infer_label_layout_2d(cls, shape: Tuple[int, ...], position: Tuple[int, int]) -> str:
+        if len(shape) != 3:
+            raise ValueError(f"2D label layout inference expects a 3D array; got shape {shape}")
+
+        channel_first_spatial = (int(shape[1]), int(shape[2]))
+        channel_last_spatial = (int(shape[0]), int(shape[1]))
+
+        first_valid = cls._position_fits_volume(position, channel_first_spatial)
+        last_valid = cls._position_fits_volume(position, channel_last_spatial)
+
+        if first_valid and not last_valid:
+            return "channel_first"
+        if last_valid and not first_valid:
+            return "channel_last"
+        if first_valid and last_valid:
+            return "ambiguous"
+        raise ValueError(
+            f"2D label position {position} falls outside both leading and trailing spatial bounds for array shape {shape}"
+        )
+
+    @classmethod
+    def _infer_label_layout_3d(cls, shape: Tuple[int, ...], position: Tuple[int, int, int]) -> str:
+        if len(shape) != 4:
+            raise ValueError(f"3D label layout inference expects a 4D array; got shape {shape}")
+
+        channel_first_spatial = (int(shape[1]), int(shape[2]), int(shape[3]))
+        channel_last_spatial = (int(shape[0]), int(shape[1]), int(shape[2]))
+
+        first_valid = cls._position_fits_volume(position, channel_first_spatial)
+        last_valid = cls._position_fits_volume(position, channel_last_spatial)
+
+        if first_valid and not last_valid:
+            return "channel_first"
+        if last_valid and not first_valid:
+            return "channel_last"
+        if first_valid and last_valid:
+            return "ambiguous"
+        raise ValueError(
+            f"3D label position {position} falls outside both leading and trailing spatial bounds for array shape {shape}"
+        )
