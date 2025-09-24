@@ -196,7 +196,7 @@ static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::
         return 0;
 
     if (dpoints(p)[0] == -1)
-        exit(0);
+        throw std::runtime_error("invalid loc passed as valid!");
 
     ceres::ResidualBlockId tmp = problem.AddResidualBlock(DistLoss::Create(unit*cv::norm(off),w), nullptr, &dpoints(p)[0], &dpoints(p+off)[0]);
 
@@ -798,7 +798,7 @@ struct thresholdedDistance
 };
 
 
-QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const nlohmann::json& meta_params, const VCCollection &corrections)
+QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const nlohmann::json& meta_params, const VCCollection &corrections)
 {
     TraceParameters trace_params;
 
@@ -907,7 +907,10 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     double last_elapsed_seconds = 0.0;
     int last_succ = 0;
 
+    std::cout << "lets go! " << std::endl;
+
     if (resume_surf) {
+        std::cout << "resuime! " << std::endl;
         float resume_step = 1.0 / resume_surf->scale()[0];
         if (std::abs(resume_step - step) > 1e-6) {
             throw std::runtime_error("Step size parameter mismatch between new trace and resume surface.");
@@ -934,11 +937,10 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                 int target_y = pad_y + j;
                 int target_x = pad_x + i;
                 uint16_t gen = resume_generations.at<uint16_t>(j, i);
-                if (gen > 0 && gen <= start_gen /*&& resume_points(j,i)[0] != -1*/) {
+                if (gen > 0 && gen <= start_gen && resume_points(j,i)[0] != -1) {
                     locs(target_y, target_x) = resume_points(j, i);
                     generations(target_y, target_x) = gen;
                     state(target_y, target_x) = STATE_LOC_VALID | STATE_COORD_VALID;
-                    fringe.push_back({target_y, target_x});
                     if (gen < min_gen) {
                         min_gen = gen;
                         x0 = target_x;
@@ -949,11 +951,10 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         }
 
         trace_params.point_correction = PointCorrection(corrections);
-        if (trace_params.point_correction.isValid()) {
-            trace_params.point_correction.init(locs);
-        }
 
         if (trace_params.point_correction.isValid()) {
+            trace_params.point_correction.init(locs);
+
             std::cout << "Resuming with " << trace_params.point_correction.all_grid_locs().size() << " correction points." << std::endl;
             cv::Mat mask = resume_surf->channel("mask");
             if (!mask.empty()) {
@@ -1031,18 +1032,15 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                 local_optimization(opt_params.radius, opt_params.center, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
             }
 
-            // Rebuild fringe from valid points
-            fringe.clear();
-            for (int j = used_area.y; j < used_area.br().y; ++j) {
-                for (int i = used_area.x; i < used_area.br().x; ++i) {
-                    if (state(j, i) & STATE_LOC_VALID) {
-                        fringe.push_back({j, i});
-                    }
+        }
+
+        // Rebuild fringe from valid points
+        for (int j = used_area.y; j < used_area.br().y; ++j) {
+            for (int i = used_area.x; i < used_area.br().x; ++i) {
+                if (state(j, i) & STATE_LOC_VALID) {
+                    fringe.push_back({j, i});
                 }
             }
-
-        } else {
-            local_optimization(stop_gen+10, {y0,x0}, state, locs, interp_global, proc_tensor, direction_fields, ngv.get(), z_min, z_max, Ts, trace_params, false, true);
         }
 
         last_succ = succ;
@@ -1094,8 +1092,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
 
     int local_opt_r = 2;
 
-    int ref_max = 6;
-    int curr_ref_min = ref_max;
+    std::cout << "lets start fringe: " << fringe.size() << std::endl;
 
     while (!fringe.empty()) {
         bool global_opt = generation <= 50 && !resume_surf;

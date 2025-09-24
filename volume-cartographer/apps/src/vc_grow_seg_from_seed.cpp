@@ -456,7 +456,7 @@ int main(int argc, char *argv[])
     std::string uuid = name_prefix + time_str();
     std::filesystem::path seg_dir = tgt_dir / uuid;
 
-    QuadSurface *surf = space_tracing_quad_phys(ds.get(), 1.0, &chunk_cache, origin, params, cache_root, voxelsize, direction_fields, resume_surf, seg_dir, meta_params, corrections);
+    QuadSurface *surf = tracer(ds.get(), 1.0, &chunk_cache, origin, params, cache_root, voxelsize, direction_fields, resume_surf, seg_dir, meta_params, corrections);
  
     if (resume_surf) {
         delete resume_surf;
