@@ -146,10 +146,14 @@ class ZarrArrayHandle(ArrayHandle):
 
     def __init__(self, array, *, path: Path, spatial_shape: Tuple[int, ...]) -> None:
         self._array = array
+        self._shape = tuple(int(v) for v in getattr(array, "shape", ()))
         super().__init__(path, spatial_shape=spatial_shape, dtype=getattr(array, "dtype", np.float32))
+        self._spatial_ndim = len(self._spatial_shape)
+        self._orientation, self._extra_shape = self._infer_orientation(self._shape, self._spatial_shape)
 
     def read(self) -> np.ndarray:
         data = np.asarray(self._array[...], dtype=self._dtype)
+        data = self._to_channel_first(data)
         return np.ascontiguousarray(data)
 
     def read_window(self, start: Sequence[int], size: Sequence[int]) -> np.ndarray:
@@ -158,6 +162,7 @@ class ZarrArrayHandle(ArrayHandle):
         base_region = tuple(slice(int(s), int(s) + int(l)) for s, l in zip(start, size))
         region = self._expand_region(base_region)
         data = np.asarray(self._array[region], dtype=self._dtype)
+        data = self._to_channel_first(data)
         return np.ascontiguousarray(data)
 
     def raw(self):  # pragma: no cover - simple accessor
@@ -165,12 +170,76 @@ class ZarrArrayHandle(ArrayHandle):
 
     def _expand_region(self, base_region: Tuple[slice, ...]) -> Tuple[slice, ...]:
         ndim = getattr(self._array, 'ndim', len(base_region))
-        if len(base_region) == ndim:
-            return base_region
         if len(base_region) > ndim:
             raise ValueError("Region dimensionality exceeds array dimensionality")
+
+        spatial_ndim = self._spatial_ndim
+        if ndim == len(base_region):
+            return base_region
+
+        shape = self._shape
+        if spatial_ndim and len(shape) == ndim:
+            front = tuple(int(v) for v in shape[:spatial_ndim])
+            back = tuple(int(v) for v in shape[-spatial_ndim:])
+
+            if front == self._spatial_shape:
+                # spatial dimensions lead the array; append remaining axes
+                suffix = (slice(None),) * (ndim - spatial_ndim)
+                return base_region + suffix
+
+            if back == self._spatial_shape:
+                # spatial dimensions trail the array; prepend leading axes
+                prefix = (slice(None),) * (ndim - spatial_ndim)
+                return prefix + base_region
+
         prefix = (slice(None),) * (ndim - len(base_region))
         return prefix + base_region
+
+    @staticmethod
+    def _infer_orientation(
+        shape: Tuple[int, ...], spatial: Tuple[int, ...]
+    ) -> Tuple[str, Tuple[int, ...]]:
+        spatial_ndim = len(spatial)
+
+        if not shape or not spatial:
+            return ("unknown", ())
+
+        if len(shape) == spatial_ndim:
+            return ("none", ())
+
+        front = tuple(int(v) for v in shape[:spatial_ndim])
+        back = tuple(int(v) for v in shape[-spatial_ndim:])
+
+        if front == spatial:
+            return ("spatial_leading", tuple(int(v) for v in shape[spatial_ndim:]))
+        if back == spatial:
+            return ("spatial_trailing", tuple(int(v) for v in shape[:-spatial_ndim]))
+
+        return ("unknown", tuple(int(v) for v in shape))
+
+    def _to_channel_first(self, data: np.ndarray) -> np.ndarray:
+        if not self._extra_shape:
+            return data
+
+        orientation = self._orientation
+        spatial_ndim = self._spatial_ndim
+
+        extra_size = int(np.prod(self._extra_shape))
+
+        if orientation == "spatial_leading":
+            # spatial dims lead the array, extras trail.
+            spatial_shape = data.shape[:spatial_ndim]
+            reshaped = data.reshape(spatial_shape + (extra_size,))
+            return np.moveaxis(reshaped, -1, 0)
+
+        if orientation == "spatial_trailing":
+            # extras lead the array, spatial dims trail.
+            spatial_shape = data.shape[-spatial_ndim:]
+            reshaped = data.reshape((extra_size,) + spatial_shape)
+            return reshaped
+
+        # Unknown orientation; fall back to original layout
+        return data
 
 
 class NumpyArrayHandle(ArrayHandle):

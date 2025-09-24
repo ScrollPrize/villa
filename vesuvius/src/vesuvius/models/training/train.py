@@ -1712,8 +1712,8 @@ def main():
                            help="Number of warmup steps for cosine_warmup scheduler")
 
     # Trainer Selection
-    grp_trainer.add_argument("--trainer", type=str, default="base",
-                             help="Trainer: base, mean_teacher, uncertainty_aware_mean_teacher, primus_mae, unet_mae, finetune_mae_unet")
+    grp_trainer.add_argument("--trainer", "--tr", type=str, default="base",
+                             help="Trainer: base, surface_frame, mean_teacher, uncertainty_aware_mean_teacher, primus_mae, unet_mae, finetune_mae_unet")
     grp_trainer.add_argument("--ssl-warmup", type=int, default=None,
                              help="Semi-supervised: epochs to ignore EMA consistency loss (0 disables)")
     # Semi-supervised sampling controls (used by mean_teacher/uncertainty_aware_mean_teacher)
@@ -1917,9 +1917,14 @@ def main():
     elif trainer_name == "base":
         trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Base Trainer for supervised training")
+    elif trainer_name == "surface_frame":
+        from vesuvius.models.training.surface_frame_trainer import SurfaceFrameTrainer
+
+        trainer = SurfaceFrameTrainer(mgr=mgr, verbose=args.verbose)
+        print("Using Surface Frame Trainer")
     else:
         raise ValueError(
-            "Unknown trainer: {trainer}. Available options: base, mean_teacher, "
+            "Unknown trainer: {trainer}. Available options: base, surface_frame, mean_teacher, "
             "uncertainty_aware_mean_teacher, primus_mae, unet_mae, finetune_mae_unet".format(trainer=trainer_name)
         )
 
