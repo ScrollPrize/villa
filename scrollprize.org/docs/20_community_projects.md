@@ -75,13 +75,13 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 ### 🌟 Highlighted
 
-- [Volume Cartographer](https://github.com/educelab/volume-cartographer): the OG virtual unwrapping toolkit. Includes a graphical interface to annotate scroll segments. First built by [EduceLab](https://educelab.engr.uky.edu/); an [active fork](https://github.com/spacegaier/volume-cartographer) by Philip Allgaier contains many community contributions and is currently used by the segmentation team.
-
 - [Khartes](https://github.com/KhartesViewer/khartes) by Chuck is a tool to manually create and visualize segment meshes, while also visualizing a preview of the rendered segment.
 
-- [Thaumato Anakalyptor](https://github.com/schillij95/ThaumatoAnakalyptor/tree/main) is an automatic tool that combines classical methods such as threshold gradient operator based edge detectors and Deep Learning based instance segmentation of point clouds to detect, merge and render segments. It was built by Julian Schilliger (part of Grand Prize winning submission).
-
 ### 🛠️ Tools
+
+- [Volume Cartographer](https://github.com/educelab/volume-cartographer): the OG virtual unwrapping toolkit. Includes a graphical interface to annotate scroll segments. First built by [EduceLab](https://educelab.engr.uky.edu/); an [active fork](https://github.com/spacegaier/volume-cartographer) by Philip Allgaier contains many community contributions and is currently used by the segmentation team.
+  
+- [Thaumato Anakalyptor](https://github.com/schillij95/ThaumatoAnakalyptor/tree/main) is an automatic tool that combines classical methods such as threshold gradient operator based edge detectors and Deep Learning based instance segmentation of point clouds to detect, merge and render segments. It was built by Julian Schilliger (part of Grand Prize winning submission).
 
 - [Fast Segment Rendering](https://github.com/schillij95/ThaumatoAnakalyptor/blob/main/ThaumatoAnakalyptor/sheet_to_mesh.py) by Julian Schilliger. Fast rendering of segments with GPU acceleration. Capable of saving the surface volume to multiple file formats.
 
