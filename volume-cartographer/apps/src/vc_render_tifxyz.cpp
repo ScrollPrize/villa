@@ -588,13 +588,50 @@ int main(int argc, char *argv[])
             hasAffine = true;
             std::cout << "Loaded affine transform from: " << affineFile << std::endl;
             if (invert_affine) {
-                cv::Mat inv = cv::Mat(affineTransform.matrix).inv();
-                if (inv.empty()) {
-                    std::cerr << "Error: affine matrix is non-invertible.\n";
+                // Invert [A | t; 0 0 0 1] robustly using the 3x3 block inverse.
+                // NOTE: checking inv.empty() never catches singular matrices.
+                cv::Matx33d A(
+                    affineTransform.matrix(0,0), affineTransform.matrix(0,1), affineTransform.matrix(0,2),
+                    affineTransform.matrix(1,0), affineTransform.matrix(1,1), affineTransform.matrix(1,2),
+                    affineTransform.matrix(2,0), affineTransform.matrix(2,1), affineTransform.matrix(2,2)
+                );
+                cv::Vec3d t(
+                    affineTransform.matrix(0,3),
+                    affineTransform.matrix(1,3),
+                    affineTransform.matrix(2,3)
+                );
+
+                cv::Mat A_cv(3,3,CV_64F);
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 3; ++c)
+                        A_cv.at<double>(r,c) = A(r,c);
+
+                cv::Mat Ainv_cv;
+                const bool ok = cv::invert(A_cv, Ainv_cv, cv::DECOMP_SVD);
+                if (!ok) {
+                    std::cerr << "Error: affine linear part is non-invertible.\n";
                     return EXIT_FAILURE;
                 }
-                inv.copyTo(affineTransform.matrix);
-                std::cout << "Note: Inverting affine as requested (--invert-affine).\n";
+
+                cv::Matx33d Ainv;
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 3; ++c)
+                        Ainv(r,c) = Ainv_cv.at<double>(r,c);
+
+                const cv::Vec3d tinv = -(Ainv * t);
+
+                // Write back [A^{-1} | -A^{-1}t ; 0 0 0 1]
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 3; ++c)
+                        affineTransform.matrix(r,c) = Ainv(r,c);
+                    affineTransform.matrix(r,3) = tinv(r);
+                }
+                affineTransform.matrix(3,0) = 0.0;
+                affineTransform.matrix(3,1) = 0.0;
+                affineTransform.matrix(3,2) = 0.0;
+                affineTransform.matrix(3,3) = 1.0;
+
+                std::cout << "Note: Inverting affine as requested (--invert-affine)." << std::endl;
             }
         } catch (const std::exception& e) {
             std::cerr << "Error loading affine transform: " << e.what() << std::endl;
