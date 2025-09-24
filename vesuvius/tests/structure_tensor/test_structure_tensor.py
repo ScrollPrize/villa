@@ -16,12 +16,27 @@ from vesuvius.structure_tensor.create_st import (
 
 
 @pytest.fixture
-def cpu_inferer():
+def inferer_paths(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    return {
+        "model": model_dir,
+        "input": input_dir,
+        "output": output_dir,
+    }
+
+
+@pytest.fixture
+def cpu_inferer(inferer_paths):
     """A small, CPU‐only inferer with no smoothing, fixed patch size."""
     return StructureTensorInferer(
-        model_path="dummy_model",
-        input_dir="dummy_input",
-        output_dir="dummy_output",
+        model_path=str(inferer_paths["model"]),
+        input_dir=str(inferer_paths["input"]),
+        output_dir=str(inferer_paths["output"]),
         sigma=0.0,
         smooth_components=False,
         volume=None,
@@ -39,12 +54,12 @@ def cpu_inferer():
     )
 
 
-def test_gaussian_kernel_normalizes_to_one():
+def test_gaussian_kernel_normalizes_to_one(inferer_paths):
     # Only applies when sigma > 0
     inferer = StructureTensorInferer(
-        model_path="dummy",
-        input_dir="dummy",
-        output_dir="dummy",
+        model_path=str(inferer_paths["model"]),
+        input_dir=str(inferer_paths["input"]),
+        output_dir=str(inferer_paths["output"]),
         sigma=1.0,
         smooth_components=False,
         volume=None,

@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Iterator, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Dict, Iterator, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -24,6 +24,9 @@ class AdapterConfig:
     image_extensions: Sequence[str] = (".tif", ".tiff", ".png", ".jpg", ".jpeg")
     zarr_resolution: Optional[int] = None
     tiff_chunk_shape: Optional[Tuple[int, ...]] = None
+    mesh_dirname: str = "meshes"
+    mesh_extensions: Sequence[str] = (".ply", ".obj")
+    mesh_metadata_filename: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -266,11 +269,15 @@ class LoadedVolume:
     metadata: VolumeMetadata
     image: ArrayHandle
     labels: Mapping[str, Optional[ArrayHandle]]
+    meshes: Optional[Mapping[str, object]] = None  # populated by orchestrator when meshes are attached
 
     def close(self) -> None:
         self.image.close()
         for handle in self.labels.values():
             if handle is not None:
+                handle.close()
+        if self.meshes:
+            for handle in self.meshes.values():
                 handle.close()
 
 

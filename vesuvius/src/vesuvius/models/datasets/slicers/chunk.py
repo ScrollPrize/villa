@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -17,6 +17,7 @@ from ..find_valid_patches import (
     compute_bounding_box_3d,
 )
 from ..save_valid_patches import load_cached_patches, save_valid_patches
+from ..mesh.handles import MeshHandle
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,7 @@ class ChunkVolume:
     labels: Dict[str, Optional[object]]
     label_source: Optional[object]
     cache_key_path: Optional[Path]
+    meshes: Mapping[str, MeshHandle] = field(default_factory=dict)
 
 
 @dataclass
@@ -67,6 +69,7 @@ class ChunkResult:
     labels: Dict[str, np.ndarray]
     is_unlabeled: bool
     patch_info: Dict[str, object]
+    meshes: Dict[str, Dict[str, object]] = field(default_factory=dict)
 
 
 class ChunkSlicer:
@@ -389,6 +392,14 @@ class ChunkSlicer:
 
             labels[target_name] = label_tensor
 
+        mesh_payloads: Dict[str, Dict[str, object]] = {}
+        for mesh_id, handle in volume.meshes.items():
+            payload = handle.read()
+            mesh_payloads[mesh_id] = {
+                "payload": payload,
+                "metadata": handle.metadata,
+            }
+
         patch_info = {
             'plane': 'volume',
             'slice_index': -1,
@@ -411,12 +422,21 @@ class ChunkSlicer:
                 for name, handle in volume.labels.items()
             },
         }
+        if mesh_payloads:
+            patch_info['meshes'] = {
+                mesh_id: {
+                    'path': str(handle.path),
+                    'source_volume': handle.metadata.source_volume_id,
+                }
+                for mesh_id, handle in volume.meshes.items()
+            }
 
         return ChunkResult(
             image=image_tensor.astype(np.float32, copy=False),
             labels=labels,
             is_unlabeled=is_unlabeled,
             patch_info=patch_info,
+            meshes=mesh_payloads,
         )
 
     # Internal helpers ------------------------------------------------------------------------------

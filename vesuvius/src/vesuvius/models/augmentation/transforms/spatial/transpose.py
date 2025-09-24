@@ -23,6 +23,7 @@ class TransposeAxesTransform(BasicTransform):
         """
         super().__init__()
         self.allowed_axes = allowed_axes
+        self._skip_when_vector = True
 
     def get_parameters(self, **data_dict) -> dict:
         """
