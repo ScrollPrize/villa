@@ -1,11 +1,12 @@
 #!/usr/bin/env python
-from glob import glob
-from itertools import repeat
 import math
 import numpy as np
 import open3d as o3d
 import os
 import zarr
+import logging
+from glob import glob
+from itertools import repeat
 from numcodecs import Blosc
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
@@ -30,6 +31,8 @@ _SLICE_STATE = {}
 _SLICE_DATASETS = {}
 _DOWNSAMPLE_STATE = {}
 _DOWNSAMPLE_DATASETS = {}
+
+logger = logging.getLogger(__name__)
 
 
 def _set_slice_state(state):
@@ -120,17 +123,83 @@ def _get_downsample_datasets():
     return datasets
 
 
-def _downsample_plane_worker(idx):
+def _iter_chunk_starts(shape, chunks):
+    if len(shape) < 3 or len(chunks) < 3:
+        raise ValueError("Chunk iteration requires at least three dimensions (z, y, x).")
+
+    z_chunk = max(1, chunks[0])
+    y_chunk = max(1, chunks[1])
+    x_chunk = max(1, chunks[2])
+
+    for z_start in range(0, shape[0], z_chunk):
+        for y_start in range(0, shape[1], y_chunk):
+            for x_start in range(0, shape[2], x_chunk):
+                yield (z_start, y_start, x_start)
+
+
+def _downsample_chunk_worker(chunk_start):
     state = _DOWNSAMPLE_STATE
     if not state:
         raise RuntimeError("Downsample state is not initialized in the worker.")
 
     parent_ds, target_ds = _get_downsample_datasets()
-    axes = state["axes"]
-    source = np.asarray(parent_ds[idx, ...])
-    downsampled = downsample_2x(source, axes=axes)
-    target_ds[idx, ...] = np.ascontiguousarray(downsampled, dtype=target_ds.dtype)
-    return idx
+
+    target_shape = state["target_shape"]
+    target_chunks = state["target_chunks"]
+    parent_shape = state["parent_shape"]
+    down_axes = state["downsample_axes"]
+    ndim = target_ds.ndim
+
+    if len(chunk_start) != 3:
+        raise ValueError("Chunk start must contain three axes (z, y, x).")
+
+    z_start, y_start, x_start = chunk_start
+
+    z_chunk = max(1, target_chunks[0])
+    y_chunk = max(1, target_chunks[1])
+    x_chunk = max(1, target_chunks[2])
+
+    z_stop = min(z_start + z_chunk, target_shape[0])
+    y_stop = min(y_start + y_chunk, target_shape[1])
+    x_stop = min(x_start + x_chunk, target_shape[2])
+
+    target_slices = [
+        slice(z_start, z_stop),
+        slice(y_start, y_stop),
+        slice(x_start, x_stop),
+    ]
+
+    parent_slices = []
+    for axis, (target_slice, parent_dim) in enumerate(zip(target_slices, parent_shape)):
+        start = target_slice.start
+        stop = target_slice.stop
+        if axis in down_axes:
+            parent_start = start * 2
+            parent_stop = min(parent_dim, stop * 2)
+        else:
+            parent_start = start
+            parent_stop = min(parent_dim, parent_start + (stop - start))
+        parent_slices.append(slice(parent_start, parent_stop))
+
+    if ndim > 3:
+        for axis in range(3, ndim):
+            target_slices.append(slice(0, target_shape[axis]))
+            parent_slices.append(slice(0, parent_shape[axis]))
+
+    target_slices = tuple(target_slices)
+    parent_slices = tuple(parent_slices)
+
+    source = np.asarray(parent_ds[parent_slices])
+    downsampled = downsample_2x(source, axes=down_axes)
+
+    expected_shape = tuple(s.stop - s.start for s in target_slices)
+    if downsampled.shape != expected_shape:
+        raise ValueError(
+            f"Downsampled chunk shape {downsampled.shape} does not match target chunk shape {expected_shape}."
+        )
+
+    target_ds[target_slices] = np.ascontiguousarray(downsampled, dtype=target_ds.dtype)
+    return chunk_start
 
 
 def _rechunk_with_dask(zarr_array, chunk_size, desc, num_workers):
@@ -1035,15 +1104,7 @@ def main():
         for level in range(1, len(datasets)):
             parent = datasets[level - 1]
             target = datasets[level]
-            num_planes = parent.shape[0]
             level_desc = f"{desc} level {level}"
-            if num_planes == 0:
-                continue
-
-            def _downsample_and_store(idx):
-                source = np.asarray(parent[idx, ...])
-                downsampled = downsample_2x(source, axes=axes)
-                target[idx, ...] = np.ascontiguousarray(downsampled, dtype=target.dtype)
 
             use_parallel = False
             mp_context = None
@@ -1054,12 +1115,40 @@ def main():
                 except ValueError:
                     mp_context = None
 
+            try:
+                chunk_tasks = list(_iter_chunk_starts(target.shape, target.chunks))
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Unable to prepare chunk iteration for {level_desc}: {exc}"
+                ) from exc
+
+            if not chunk_tasks:
+                continue
+
+            logger.debug(
+                "Prepared %d chunk tasks for %s (parent chunks=%s, target chunks=%s)",
+                len(chunk_tasks),
+                level_desc,
+                parent.chunks,
+                target.chunks,
+            )
+
+            down_axes = tuple(axis + 1 for axis in axes)
+            for axis in down_axes:
+                if axis >= target.ndim:
+                    raise ValueError(
+                        f"Invalid downsample axis {axis} for dataset with {target.ndim} dimensions."
+                    )
+
             if use_parallel and mp_context is not None:
                 state = {
                     "store_path": store_path,
                     "parent_dataset_path": parent.path,
                     "target_dataset_path": target.path,
-                    "axes": tuple(axes),
+                    "downsample_axes": down_axes,
+                    "target_shape": target.shape,
+                    "target_chunks": target.chunks,
+                    "parent_shape": parent.shape,
                 }
                 _set_downsample_state(state)
                 try:
@@ -1068,8 +1157,8 @@ def main():
                         mp_context=mp_context,
                     ) as executor:
                         for _ in tqdm(
-                            executor.map(_downsample_plane_worker, range(num_planes), chunksize=1),
-                            total=num_planes,
+                            executor.map(_downsample_chunk_worker, chunk_tasks, chunksize=1),
+                            total=len(chunk_tasks),
                             desc=level_desc,
                             leave=False,
                         ):
@@ -1077,8 +1166,21 @@ def main():
                 finally:
                     _set_downsample_state({})
             else:
-                for idx in tqdm(range(num_planes), desc=level_desc, leave=False):
-                    _downsample_and_store(idx)
+                state = {
+                    "store_path": store_path,
+                    "parent_dataset_path": parent.path,
+                    "target_dataset_path": target.path,
+                    "downsample_axes": down_axes,
+                    "target_shape": target.shape,
+                    "target_chunks": target.chunks,
+                    "parent_shape": parent.shape,
+                }
+                _set_downsample_state(state)
+                try:
+                    for chunk_start in tqdm(chunk_tasks, desc=level_desc, leave=False):
+                        _downsample_chunk_worker(chunk_start)
+                finally:
+                    _set_downsample_state({})
 
     populate_downsampled_levels(label_datasets, out_path, axes=(0, 1), desc="Labels")
 
