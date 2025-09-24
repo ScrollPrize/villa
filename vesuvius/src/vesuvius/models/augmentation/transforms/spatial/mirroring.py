@@ -9,6 +9,7 @@ class MirrorTransform(BasicTransform):
     def __init__(self, allowed_axes: Tuple[int, ...]):
         super().__init__()
         self.allowed_axes = allowed_axes
+        self._skip_when_vector = True
 
     def get_parameters(self, **data_dict) -> dict:
         axes = [i for i in self.allowed_axes if torch.rand(1) < 0.5]

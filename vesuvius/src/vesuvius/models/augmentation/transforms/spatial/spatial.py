@@ -54,6 +54,7 @@ class SpatialTransform(BasicTransform):
         self.p_synchronize_def_scale_across_axes = p_synchronize_def_scale_across_axes
         self.bg_style_seg_sampling = bg_style_seg_sampling
         self.mode_seg = mode_seg
+        self._skip_when_vector = True
 
     def get_parameters(self, **data_dict) -> dict:
         dim = data_dict['image'].ndim - 1

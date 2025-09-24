@@ -3,7 +3,7 @@ from pathlib import Path
 import os
 import json
 import math
-from typing import Dict, List, Optional, Tuple, Sequence, Union
+from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -70,6 +70,17 @@ class BaseDataset(Dataset):
 
         self.model_name = mgr.model_name
         self.targets = mgr.targets               # e.g. {"ink": {...}, "normals": {...}}
+        self._vector_name_tokens = (
+            "normal",
+            "normals",
+            "t_u",
+            "t_v",
+            "uv",
+            "frame",
+            "vector",
+        )
+        self._vector_target_names: Set[str] = self._discover_vector_targets()
+        self._vector_target_lower: Set[str] = {name.lower() for name in self._vector_target_names}
         self.patch_size = mgr.train_patch_size   # Expected to be [z, y, x]
         self.min_labeled_ratio = mgr.min_labeled_ratio
         self.min_bbox_percent = mgr.min_bbox_percent
@@ -325,6 +336,7 @@ class BaseDataset(Dataset):
                     name=volume_name,
                     image=image_array,
                     labels=labels,
+                    meshes=reference_info.get('meshes', {}),
                 )
             )
 
@@ -394,6 +406,7 @@ class BaseDataset(Dataset):
                     labels=labels,
                     label_source=label_source,
                     cache_key_path=cache_key_path,
+                    meshes=reference_info.get('meshes', {}),
                 )
             )
 
@@ -524,6 +537,74 @@ class BaseDataset(Dataset):
             return data.get('label_path')
         return None
 
+    def _normalize_vector_target_names(self, values) -> Set[str]:
+        result: Set[str] = set()
+        if values is None:
+            return result
+        if isinstance(values, (list, tuple, set)):
+            for item in values:
+                if item is None:
+                    continue
+                result.add(str(item))
+        elif isinstance(values, str):
+            result.add(values)
+        return result
+
+    def _discover_vector_targets(self) -> Set[str]:
+        targets: Set[str] = set()
+
+        dataset_cfg = getattr(self.mgr, 'dataset_config', {}) or {}
+        targets.update(self._normalize_vector_target_names(dataset_cfg.get('vector_targets')))
+
+        mgr_vector = getattr(self.mgr, 'vector_targets', None)
+        if mgr_vector is not None:
+            targets.update(self._normalize_vector_target_names(mgr_vector))
+
+        for name, info in (self.targets or {}).items():
+            if self._target_info_is_vector(info):
+                targets.add(name)
+            elif any(token in name.lower() for token in self._vector_name_tokens):
+                targets.add(name)
+
+        return targets
+
+    @staticmethod
+    def _target_info_is_vector(info) -> bool:
+        if not isinstance(info, dict):
+            return False
+        for key in ('vector', 'is_vector'):
+            value = info.get(key)
+            if isinstance(value, bool) and value:
+                return True
+        for key in ('data_kind', 'kind', 'type', 'representation', 'role'):
+            value = info.get(key)
+            if isinstance(value, str) and value.lower() == 'vector':
+                return True
+        return False
+
+    def _is_vector_target(self, target_name: str) -> bool:
+        name_lower = target_name.lower()
+        if name_lower in self._vector_target_lower:
+            return True
+        if any(token in name_lower for token in self._vector_name_tokens):
+            return True
+        info = self.targets.get(target_name)
+        if info is None and name_lower in self.targets:
+            info = self.targets.get(name_lower)
+        return self._target_info_is_vector(info)
+
+    def _should_skip_spatial_transforms(
+        self,
+        label_patches: Mapping[str, np.ndarray],
+        mesh_payloads: Mapping[str, Dict[str, object]],
+    ) -> bool:
+        if mesh_payloads:
+            return True
+        for target_name in label_patches:
+            if self._is_vector_target(target_name):
+                return True
+        return False
+
     def _extract_chunk_patch(self, chunk_patch: ChunkPatch) -> Dict[str, torch.Tensor]:
         if self.chunk_slicer is None:
             raise RuntimeError("Chunk slicer not initialized")
@@ -541,6 +622,17 @@ class BaseDataset(Dataset):
 
         for target_name, array in label_patches.items():
             data_dict[target_name] = torch.from_numpy(array)
+
+        mesh_payloads = chunk_result.meshes or {}
+        if mesh_payloads:
+            data_dict['meshes'] = mesh_payloads
+
+        should_skip = self._should_skip_spatial_transforms(label_patches, mesh_payloads)
+        if should_skip:
+            data_dict['_skip_spatial_transforms'] = True
+            vector_targets = [name for name in label_patches if self._is_vector_target(name)]
+            if vector_targets:
+                data_dict['vector_targets'] = vector_targets
 
         patch_info = dict(chunk_result.patch_info)
         if chunk_patch.weight is not None:
@@ -871,6 +963,16 @@ class BaseDataset(Dataset):
                 data_dict['plane_mask'] = torch.from_numpy(mask_array)
 
             data_dict['patch_info'] = plane_result.patch_info
+
+            mesh_payloads = plane_result.meshes or {}
+            if mesh_payloads:
+                data_dict['meshes'] = mesh_payloads
+
+            vector_targets = [name for name in plane_result.labels if self._is_vector_target(name)]
+            if mesh_payloads or vector_targets:
+                data_dict['_skip_spatial_transforms'] = True
+                if vector_targets:
+                    data_dict['vector_targets'] = vector_targets
         else:
             if not self._chunk_patches:
                 raise RuntimeError("Chunk slicer index not prepared")
@@ -888,5 +990,7 @@ class BaseDataset(Dataset):
             data_dict['patch_info'] = metadata
         if plane_mask is not None:
             data_dict['plane_mask'] = plane_mask
+
+        data_dict.pop('_skip_spatial_transforms', None)
 
         return data_dict

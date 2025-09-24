@@ -14,7 +14,6 @@ from .base_io import (
 from .image_io import ImageAdapter
 from .napari_io import NapariAdapter
 from .zarr_io import ZarrAdapter
-
 __all__ = [
     "AdapterConfig",
     "ArrayHandle",

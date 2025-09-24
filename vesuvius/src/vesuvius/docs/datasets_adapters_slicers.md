@@ -35,6 +35,7 @@ Defined in `src/vesuvius/models/datasets/adapters/base_io.py`.
 - `VolumeMetadata`: detailed metadata gathered during preparation (spatial shape, dtypes, axis labels, label presence).
 - `ArrayHandle` and its concrete subclasses (`TiffArrayHandle`, `ZarrArrayHandle`, `NumpyArrayHandle`): thin wrappers that expose `.read()` and `.read_window()` so slicers can operate lazily without loading entire volumes.
 - `LoadedVolume`: the normalised container emitted by adapters, bundling metadata with image/label handles.
+- Mesh-specific helpers live under `models/datasets/mesh/`: `MeshMetadata` and `MeshPayload` describe polygonal surfaces, `MeshHandle` lazy-loads them, `LoadedMesh` couples metadata with handles, and `mesh_to_binary_voxels` converts surfaces into occupancy grids when needed.
 
 ### DataSourceAdapter contract
 
@@ -53,6 +54,31 @@ Every adapter subclasses `DataSourceAdapter` (`base_io.py:208`) and implements t
 | `ImageAdapter` (`adapters/image_io.py`) | Streams TIFF or raster stacks from `images/` plus per-target labels from `labels/`. | Uses `TiffArrayHandle` for windowed reads when files are TIFF; accepts grayscale PNG/JPEG fallbacks. Enforces spatial shape parity between images and labels. |
 | `ZarrAdapter` (`adapters/zarr_io.py`) | Reads OME-Zarr or plain zarr hierarchies. | Supports per-target zarr groups suffixed with `_target`. Respects `ome_zarr_resolution` to pick pyramid levels. Reuses zarr objects for zero-copy slicing. |
 | `NapariAdapter` (`adapters/napari_io.py`) | Pulls data directly from an in-memory napari viewer. | Uses faux paths to satisfy `LoadedVolume` but keeps arrays in RAM. Matches label layers named `{image_layer}_{target}`. |
+| `MeshAdapter` (`models/datasets/mesh/filesystem.py`) | Loads `.ply` / `.obj` meshes alongside raster volumes. | Supports JSON/YAML manifests, per-mesh transforms, and mappings that associate each mesh with its source volume so downstream slices can surface the geometry. |
+
+### Mesh and vector payloads
+
+Meshes are optional. Enable them via `dataset_config.meshes` (or `mesh_config` when constructing `DatasetOrchestrator`). Example:
+
+```yaml
+dataset_config:
+  meshes:
+    enabled: true
+    adapter: mesh
+    dirname: meshes
+    manifest: meshes/index.yaml
+    default_source_volume: volume_A
+    source_map:
+      relief_mesh: volume_B
+    transform_map:
+      relief_mesh: [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]
+```
+
+The orchestrator instantiates the requested mesh adapter, links meshes to raster volumes, and injects `MeshHandle` objects into each `target_volumes` entry. Dataset samples then expose a `meshes` dictionary alongside images/labels, and `mesh_to_binary_voxels` can turn any handle into a boolean occupancy grid for auxiliary tasks.
+
+Vector-valued rasters (normals, tangent frames, UV directions, etc.) can be declared through `dataset_config.vector_targets`, `ConfigManager.vector_targets`, or per-target flags like `vector: true` / `type: vector`. Targets whose names include `normal`, `t_u`, `t_v`, `uv`, or `frame` are treated as vectors automatically.
+
+Whenever meshes or vector labels are present in a patch, spatial augmentations (`SpatialTransform`, `MirrorTransform`, `TransposeAxesTransform`, `SmearTransform`, and their `RandomTransform` wrappers) are skipped so orientation-dependent signals remain valid. Intensity-only transforms still execute.
 
 ## Slicer Strategies
 
@@ -141,4 +167,3 @@ class MyDataset(DatasetOrchestrator):
 - If validation returns zero patches, verify label coverage thresholds and ensure `allow_unlabeled_data` is set appropriately.
 - When adding adapters, confirm `VolumeMetadata.spatial_shape` matches across image and label sources; slicers rely on consistent dimensions.
 - Use the cached `.patches_cache/` directory to persist expensive validation runs; clear it when underlying labels change.
-
