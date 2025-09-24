@@ -1199,7 +1199,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     succ_gen_ps.push_back(p);
                 }
 
-                // local_optimization(1, p, trace_params, interp, proc_tensor, trace_data, loss_settings, Ts, true);
+                local_optimization(1, p, trace_params, interp, proc_tensor, trace_data, loss_settings, Ts, true);
                 local_optimization(local_opt_r, p, trace_params, interp, proc_tensor, trace_data, loss_settings, Ts, true);
             }  // end parallel iteration over cands
         }
