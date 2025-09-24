@@ -58,7 +58,7 @@ class SurfaceFrameMultiTermLoss(nn.Module):
         target_flat = target.view(bsz, 9, spatial_size)
 
         mask_flat = self._build_mask(target_flat, mask)
-        valid_voxels = mask_flat.sum()
+        valid_voxels = mask_flat.sum().item()
         if valid_voxels <= 0:
             raise RuntimeError("Surface frame loss received an empty mask; no labeled voxels present.")
 
