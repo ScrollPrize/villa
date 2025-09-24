@@ -1071,7 +1071,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
     std::vector<cv::Vec2i> neighs = {{1,0},{0,1},{-1,0},{0,-1}};
 
-    int local_opt_r = 2;
+    int local_opt_r = 3;
 
     std::cout << "lets start fringe: " << fringe.size() << std::endl;
 
@@ -1199,8 +1199,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     succ_gen_ps.push_back(p);
                 }
 
-                local_optimization(1, p, trace_params, interp, proc_tensor, trace_data, loss_settings, Ts, true);
-                local_optimization(local_opt_r, p, trace_params, interp, proc_tensor, trace_data, loss_settings, Ts, true);
+                for (int i=1;i<local_opt_r;i++)
+                    local_optimization(i, p, trace_params, interp, proc_tensor, trace_data, loss_settings, Ts, true);
             }  // end parallel iteration over cands
         }
 
