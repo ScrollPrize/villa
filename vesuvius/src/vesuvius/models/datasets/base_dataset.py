@@ -355,6 +355,8 @@ class BaseDataset(Dataset):
         if stride_override is not None:
             stride_override = tuple(int(v) for v in stride_override)
 
+        channel_selector = self._resolve_label_channel_selector(target_names)
+
         config = ChunkSliceConfig(
             patch_size=patch_size,
             stride=stride_override,
@@ -365,6 +367,7 @@ class BaseDataset(Dataset):
             num_workers=int(getattr(self.mgr, 'num_workers', 8)),
             cache_enabled=bool(self.cache_enabled),
             cache_dir=self.cache_dir,
+            label_channel_selector=channel_selector,
         )
 
         slicer = ChunkSlicer(config=config, target_names=target_names)
@@ -411,6 +414,50 @@ class BaseDataset(Dataset):
             )
 
         self.chunk_slicer = slicer
+
+    def _resolve_label_channel_selector(
+        self, target_names: Sequence[str]
+    ) -> Optional[Union[int, Tuple[int, ...]]]:
+        for target_name in target_names:
+            info = self.targets.get(target_name) or {}
+            selector = info.get('valid_patch_channel')
+            if selector is not None:
+                return self._normalize_channel_selector(selector)
+        return None
+
+    @staticmethod
+    def _normalize_channel_selector(
+        selector: object,
+    ) -> Optional[Union[int, Tuple[int, ...]]]:
+        if selector is None:
+            return None
+        if isinstance(selector, int):
+            return int(selector)
+        if isinstance(selector, (list, tuple)):
+            if not selector:
+                raise ValueError("valid_patch_channel cannot be an empty sequence")
+            return tuple(int(v) for v in selector)
+        if isinstance(selector, dict):
+            if 'flatten_index' in selector:
+                return int(selector['flatten_index'])
+            if 'index' in selector:
+                value = selector['index']
+            elif 'indices' in selector:
+                value = selector['indices']
+            else:
+                raise ValueError(
+                    "valid_patch_channel dict must contain 'flatten_index', 'index', or 'indices'"
+                )
+            if isinstance(value, int):
+                return int(value)
+            if isinstance(value, (list, tuple)):
+                if not value:
+                    raise ValueError("valid_patch_channel indices cannot be empty")
+                return tuple(int(v) for v in value)
+            raise TypeError(
+                "valid_patch_channel 'index'/'indices' must be int or sequence of ints"
+            )
+        raise TypeError("valid_patch_channel must be int, sequence of ints, or dict")
 
     def _build_chunk_index(self, *, validate: bool) -> None:
         if self.chunk_slicer is None:

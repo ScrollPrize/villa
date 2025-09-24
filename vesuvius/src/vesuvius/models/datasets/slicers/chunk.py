@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -15,6 +15,7 @@ from ..find_valid_patches import (
     find_valid_patches,
     bounding_box_volume,
     compute_bounding_box_3d,
+    collapse_patch_to_spatial,
 )
 from ..save_valid_patches import load_cached_patches, save_valid_patches
 from ..mesh.handles import MeshHandle
@@ -35,6 +36,7 @@ class ChunkSliceConfig:
     num_workers: int
     cache_enabled: bool
     cache_dir: Optional[Path]
+    label_channel_selector: Optional[Union[int, Tuple[int, ...]]] = None
 
 
 @dataclass
@@ -95,6 +97,7 @@ class ChunkSlicer:
         self.normalizer = None
 
         self._is_2d = len(config.patch_size) == 2
+        self._label_channel_selector = config.label_channel_selector
 
     # Registration ---------------------------------------------------------------------------------
 
@@ -246,6 +249,10 @@ class ChunkSlicer:
     ) -> Tuple[List[Tuple[int, Tuple[int, ...]]], List[Dict[str, object]]]:
         """Run find_valid_patches and map results to labeled volume indices."""
 
+        channel_selectors = None
+        if self._label_channel_selector is not None:
+            channel_selectors = [self._label_channel_selector] * len(label_arrays)
+
         valid = find_valid_patches(
             label_arrays=label_arrays,
             label_names=label_names,
@@ -254,6 +261,7 @@ class ChunkSlicer:
             label_threshold=self.config.min_labeled_ratio,
             num_workers=self.config.num_workers,
             downsample_level=self.config.downsample_level,
+            channel_selectors=channel_selectors,
         )
 
         positions: List[Tuple[int, Tuple[int, ...]]] = []
@@ -280,10 +288,12 @@ class ChunkSlicer:
                 if mask_patch is None:
                     continue
 
-                mask = np.asarray(mask_patch)
-                if mask.ndim > len(candidate.patch_size):
-                    mask = mask[0]
-                mask = mask.astype(bool, copy=False)
+                mask = collapse_patch_to_spatial(
+                    mask_patch,
+                    spatial_ndim=len(candidate.patch_size),
+                    channel_selector=self._label_channel_selector,
+                )
+                mask = np.abs(mask) > 0
                 if not mask.any():
                     continue
 

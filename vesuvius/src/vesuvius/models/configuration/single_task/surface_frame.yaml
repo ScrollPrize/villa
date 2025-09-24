@@ -1,0 +1,22 @@
+tr_setup:
+  model_name: "surface_frame_unet"
+
+tr_config:
+  patch_size: [128, 128, 128]
+  batch_size: 4
+
+dataset_config:
+  min_labeled_ratio: 0.25
+  min_bbox_percent: 0.50
+  downsample_level: 2
+  num_workers: 8
+  data_format: "zarr"
+  data_path: "/mnt/raid_nvme/datasets/raw/surf_norm_uv"
+  targets:
+    surface_frame:
+      activation: "none"
+      out_channels: 9
+      loss_weights:
+        direction: 1.0
+        frame: 1.0
+        orthogonality: 1.0
