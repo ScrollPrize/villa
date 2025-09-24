@@ -401,6 +401,15 @@ class ChunkSlicer:
                 'tilt_z_rad': 0.0,
             },
             'volume_name': volume.name,
+            'global_position': list(int(v) for v in patch.position),
+            'global_end': [
+                int(start + size) for start, size in zip(patch.position, patch.patch_size)
+            ],
+            'source_path': str(getattr(volume.image, 'path', None)) if hasattr(volume.image, 'path') else None,
+            'label_source_paths': {
+                name: str(getattr(handle, 'path', None)) if hasattr(handle, 'path') else None
+                for name, handle in volume.labels.items()
+            },
         }
 
         return ChunkResult(
@@ -557,12 +566,23 @@ class ChunkSlicer:
                 patch = arr[y : y + ph, x : x + pw]
                 return pad_or_crop_2d(patch, (ph, pw)).astype(np.float32, copy=False)
             if arr.ndim == 3:
-                channels = arr.shape[0]
-                padded = [
-                    pad_or_crop_2d(arr[c, y : y + ph, x : x + pw], (ph, pw)).astype(np.float32, copy=False)
-                    for c in range(channels)
-                ]
-                return np.stack(padded, axis=0)
+                if arr.shape[0] <= 16:
+                    channels = arr.shape[0]
+                    padded = [
+                        pad_or_crop_2d(arr[c, y : y + ph, x : x + pw], (ph, pw)).astype(np.float32, copy=False)
+                        for c in range(channels)
+                    ]
+                    return np.stack(padded, axis=0)
+                if arr.shape[-1] <= 16:
+                    patch = arr[y : y + ph, x : x + pw, :]
+                    flat = patch.reshape(patch.shape[0], patch.shape[1], -1)
+                    flat = np.moveaxis(flat, -1, 0)
+                    padded = [
+                        pad_or_crop_2d(flat[c], (ph, pw)).astype(np.float32, copy=False)
+                        for c in range(flat.shape[0])
+                    ]
+                    return np.stack(padded, axis=0)
+                raise ValueError("2D chunk extraction encountered unsupported channel layout")
             raise ValueError(
                 "2D chunk extraction expects label data with shape (H, W) or (C, H, W)"
             )
@@ -577,10 +597,30 @@ class ChunkSlicer:
             patch = arr[z : z + pd, y : y + ph, x : x + pw]
             return pad_or_crop_3d(patch, (pd, ph, pw)).astype(np.float32, copy=False)
         if arr.ndim == 4:
-            channels = arr.shape[0]
+            if arr.shape[0] <= 16 and arr.shape[-1] > 16:
+                channels = arr.shape[0]
+                padded = [
+                    pad_or_crop_3d(arr[c, z : z + pd, y : y + ph, x : x + pw], (pd, ph, pw)).astype(np.float32, copy=False)
+                    for c in range(channels)
+                ]
+                return np.stack(padded, axis=0)
+            if arr.shape[-1] <= 16:
+                patch = arr[z : z + pd, y : y + ph, x : x + pw, :]
+                flat = patch.reshape(patch.shape[0], patch.shape[1], patch.shape[2], -1)
+                flat = np.moveaxis(flat, -1, 0)
+                padded = [
+                    pad_or_crop_3d(flat[c], (pd, ph, pw)).astype(np.float32, copy=False)
+                    for c in range(flat.shape[0])
+                ]
+                return np.stack(padded, axis=0)
+            raise ValueError("3D chunk extraction encountered unsupported 4D label layout")
+        if arr.ndim == 5 and arr.shape[-1] <= 16 and arr.shape[-2] <= 16:
+            patch = arr[z : z + pd, y : y + ph, x : x + pw, :, :]
+            flat = patch.reshape(patch.shape[0], patch.shape[1], patch.shape[2], -1)
+            flat = np.moveaxis(flat, -1, 0)
             padded = [
-                pad_or_crop_3d(arr[c, z : z + pd, y : y + ph, x : x + pw], (pd, ph, pw)).astype(np.float32, copy=False)
-                for c in range(channels)
+                pad_or_crop_3d(flat[c], (pd, ph, pw)).astype(np.float32, copy=False)
+                for c in range(flat.shape[0])
             ]
             return np.stack(padded, axis=0)
         raise ValueError("3D chunk extraction expects label data with shape (D, H, W) or (C, D, H, W)")

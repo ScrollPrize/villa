@@ -2,6 +2,7 @@ import torch
 import cv2
 import numpy as np
 from pathlib import Path
+from typing import Dict, Optional
 from PIL import Image, ImageDraw
 import multiprocessing as mp
 
@@ -72,14 +73,69 @@ def add_text_label(img, text):
     return np.array(pil_img, dtype=np.uint8)
 
 
-def convert_slice_to_bgr(slice_2d_or_3d):
+def _vector_to_bgr(vector_3ch):
+    """Map a 3×H×W vector field to a BGR image using directional colouring."""
+    if vector_3ch.shape[0] != 3:
+        raise ValueError(f"Expected 3-channel vector field, got shape {vector_3ch.shape}")
+
+    vec = vector_3ch.astype(np.float32, copy=False)
+    norm = np.linalg.norm(vec, axis=0, keepdims=True)
+    norm = np.maximum(norm, 1e-8)
+    unit = vec / norm
+
+    rgb = (np.transpose(unit, (1, 2, 0)) * 0.5 + 0.5).clip(0.0, 1.0)
+    rgb_uint8 = (rgb * 255.0).astype(np.uint8)
+    return cv2.cvtColor(rgb_uint8, cv2.COLOR_RGB2BGR)
+
+
+def _surface_frame_to_bgr(frame_slice):
+    """Render a 9-channel surface frame slice as a concatenated BGR panel."""
+    if frame_slice.shape[0] != 9:
+        raise ValueError(f"Surface frame slice must have 9 channels, got {frame_slice.shape}")
+
+    h = frame_slice.shape[-2]
+    w = frame_slice.shape[-1]
+
+    reshaped = frame_slice.reshape(3, 3, h, w)
+    panels = []
+    separator = np.zeros((h, 2, 3), dtype=np.uint8)
+    for idx in range(3):
+        panel = _vector_to_bgr(reshaped[idx])
+        panels.append(panel)
+        panels.append(separator.copy())
+
+    combined = np.hstack(panels[:-1])  # drop last separator
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    labels = ("T_u", "T_v", "N")
+    offset = 0
+    for idx, label in enumerate(labels):
+        x = idx * (w + 2) + 10
+        cv2.putText(combined, label, (x, 25), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+    return combined
+
+
+def convert_slice_to_bgr(slice_2d_or_3d, *, task_name: str | None = None, task_cfg: Dict | None = None):
     """Convert a slice to BGR format for visualization"""
+    task_cfg = task_cfg or {}
+    task_type = task_cfg.get("visualization") or task_cfg.get("type")
+    is_surface = (
+        (task_name is not None and task_name.endswith("surface_frame"))
+        or task_type == "surface_frame"
+        or (slice_2d_or_3d.ndim >= 3 and slice_2d_or_3d.shape[0] == 9)
+    )
+
     if slice_2d_or_3d.ndim == 2:
         # Single channel - convert to BGR
         ch_8u = minmax_scale_to_8bit(slice_2d_or_3d)
         return cv2.cvtColor(ch_8u, cv2.COLOR_GRAY2BGR)
-    
+
     elif slice_2d_or_3d.ndim == 3:
+        if is_surface:
+            try:
+                return _surface_frame_to_bgr(slice_2d_or_3d)
+            except ValueError:
+                pass
         if slice_2d_or_3d.shape[0] == 1:
             # Single channel with channel dimension
             ch_8u = minmax_scale_to_8bit(slice_2d_or_3d[0])
@@ -159,19 +215,18 @@ def save_debug(
         if arr_np.ndim > (3 if is_2d else 4):
             arr_np = arr_np[0]
         
-        # Apply activation based on number of channels
-        if not apply_activation:
-            # No activation requested
-            pass
-        elif arr_np.shape[0] == 1:
-            # Single channel - apply sigmoid
-            arr_np = torch.sigmoid(torch.from_numpy(arr_np)).numpy()
-        elif arr_np.shape[0] == 2:
-            # Two channels - apply softmax
-            arr_np = torch.softmax(torch.from_numpy(arr_np), dim=0).numpy()
-        elif arr_np.shape[0] > 2:
-            # More than 2 channels - apply argmax
-            arr_np = torch.argmax(torch.from_numpy(arr_np), dim=0).numpy()
+        task_cfg = tasks_dict.get(t_name, {}) if tasks_dict else {}
+        activation = task_cfg.get("activation", None)
+        is_surface_frame = arr_np.shape[0] == 9 or t_name.endswith("surface_frame")
+
+        # Apply activation based on config/channel count when appropriate
+        if apply_activation and activation not in {"none", "identity"} and not is_surface_frame:
+            if arr_np.shape[0] == 1:
+                arr_np = torch.sigmoid(torch.from_numpy(arr_np)).numpy()
+            elif arr_np.shape[0] == 2:
+                arr_np = torch.softmax(torch.from_numpy(arr_np), dim=0).numpy()
+            else:
+                arr_np = torch.argmax(torch.from_numpy(arr_np), dim=0).numpy()
         
         preds_np[t_name] = arr_np
 
@@ -209,19 +264,17 @@ def save_debug(
             if arr_np.ndim > (3 if is_2d else 4):
                 arr_np = arr_np[0]
             
-            # Apply activation based on number of channels
-            if not apply_activation:
-                # No activation requested
-                pass
-            elif arr_np.shape[0] == 1:
-                # Single channel - apply sigmoid
-                arr_np = torch.sigmoid(torch.from_numpy(arr_np)).numpy()
-            elif arr_np.shape[0] == 2:
-                # Two channels - apply softmax
-                arr_np = torch.softmax(torch.from_numpy(arr_np), dim=0).numpy()
-            elif arr_np.shape[0] > 2:
-                # More than 2 channels - apply argmax
-                arr_np = torch.argmax(torch.from_numpy(arr_np), dim=0).numpy()
+            task_cfg = tasks_dict.get(t_name, {}) if tasks_dict else {}
+            activation = task_cfg.get("activation", None)
+            is_surface_frame = arr_np.shape[0] == 9 or t_name.endswith("surface_frame")
+
+            if apply_activation and activation not in {"none", "identity"} and not is_surface_frame:
+                if arr_np.shape[0] == 1:
+                    arr_np = torch.sigmoid(torch.from_numpy(arr_np)).numpy()
+                elif arr_np.shape[0] == 2:
+                    arr_np = torch.softmax(torch.from_numpy(arr_np), dim=0).numpy()
+                else:
+                    arr_np = torch.argmax(torch.from_numpy(arr_np), dim=0).numpy()
             
             train_preds_np[t_name] = arr_np
 
@@ -241,13 +294,13 @@ def save_debug(
             gt = targets_np[t_name]
             gt_slice = gt[0] if gt.shape[0] == 1 else gt
             label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
-            val_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice), label))
+            val_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), label))
         
         # Show predictions (only for actual model outputs)
         for t_name in pred_task_names:
             pred = preds_np[t_name]
             pred_slice = pred[0] if pred.ndim == 3 and pred.shape[0] == 1 else pred
-            val_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice), f"Pred {t_name}"))
+            val_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pred {t_name}"))
         
         rows.append(np.hstack(val_imgs))
         
@@ -260,14 +313,14 @@ def save_debug(
                 gt = train_targets_np[t_name]
                 gt_slice = gt[0] if gt.shape[0] == 1 else gt
                 label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
-                train_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice), label))
+                train_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), label))
             
             # Show train predictions (only for actual model outputs)
             for t_name in pred_task_names:
                 if t_name in train_preds_np:
                     pred = train_preds_np[t_name]
                     pred_slice = pred[0] if pred.ndim == 3 and pred.shape[0] == 1 else pred
-                    train_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice), f"Pred {t_name}"))
+                    train_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pred {t_name}"))
             
             rows.append(np.hstack(train_imgs))
         
@@ -301,7 +354,7 @@ def save_debug(
                 else:
                     gt_slice = gt[:, z_idx, :, :]
                 label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
-                val_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice), label))
+                val_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), label))
             
             # Show predictions (only for actual model outputs)
             for t_name in pred_task_names:
@@ -313,7 +366,7 @@ def save_debug(
                         pred_slice = pred[:, z_idx, :, :]
                 else:
                     pred_slice = pred[z_idx, :, :]
-                val_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice), f"Pred {t_name}"))
+                val_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pred {t_name}"))
             
             rows.append(np.hstack(val_imgs))
             
@@ -330,7 +383,7 @@ def save_debug(
                     else:
                         gt_slice = gt[:, z_idx, :, :]
                     label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
-                    train_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice), label))
+                    train_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), label))
                 
                 # Show train predictions (only for actual model outputs)
                 for t_name in pred_task_names:
@@ -343,7 +396,7 @@ def save_debug(
                                 pred_slice = pred[:, z_idx, :, :]
                         else:
                             pred_slice = pred[z_idx, :, :]
-                        train_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice), f"Pred {t_name}"))
+                        train_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pred {t_name}"))
                 
                 rows.append(np.hstack(train_imgs))
             
