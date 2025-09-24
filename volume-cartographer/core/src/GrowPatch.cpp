@@ -137,7 +137,6 @@ struct TraceParameters {
 };
 
 struct LossSettings {
-    bool optimize_all = true;
     float w_snap = 1.0;
     float w_normal = 1.0;
     float w_straight = 0.2;
@@ -184,15 +183,6 @@ static int gen_straight_loss(ceres::Problem &problem, const cv::Vec2i &p, const 
 
     problem.AddResidualBlock(StraightLoss::Create(settings.w_straight), nullptr, &params.dpoints(p+o1)[0], &params.dpoints(p+o2)[0], &params.dpoints(p+o3)[0]);
 
-    if (!settings.optimize_all) {
-        if (o1 != cv::Vec2i(0,0))
-            problem.SetParameterBlockConstant(&params.dpoints(p+o1)[0]);
-        if (o2 != cv::Vec2i(0,0))
-            problem.SetParameterBlockConstant(&params.dpoints(p+o2)[0]);
-        if (o3 != cv::Vec2i(0,0))
-            problem.SetParameterBlockConstant(&params.dpoints(p+o3)[0]);
-    }
-
     return 1;
 }
 
@@ -212,9 +202,6 @@ static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::
         throw std::runtime_error("invalid loc passed as valid!");
 
     problem.AddResidualBlock(DistLoss::Create(unit*cv::norm(off),w), nullptr, &params.dpoints(p)[0], &params.dpoints(p+off)[0]);
-
-    if (!settings.optimize_all)
-        problem.SetParameterBlockConstant(&params.dpoints(p+off)[0]);
 
     return 1;
 }
@@ -313,46 +300,46 @@ static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_
 };
 
 
-static void freeze_inner_params(ceres::Problem &problem, int edge_dist, const cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &out,
-    cv::Mat_<cv::Vec2d> &loc, cv::Mat_<uint16_t> &loss_status, int inner_flags)
-{
-    cv::Mat_<float> dist(state.size());
+// static void freeze_inner_params(ceres::Problem &problem, int edge_dist, const cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &out,
+//     cv::Mat_<cv::Vec2d> &loc, cv::Mat_<uint16_t> &loss_status, int inner_flags)
+// {
+//     cv::Mat_<float> dist(state.size());
+//
+//     edge_dist = std::min(edge_dist,254);
+//
+//
+//     cv::Mat_<uint8_t> masked;
+//     bitwise_and(state, cv::Scalar(inner_flags), masked);
+//
+//
+//     cv::distanceTransform(masked, dist, cv::DIST_L1, cv::DIST_MASK_3);
+//
+//     for(int j=0;j<dist.rows;j++)
+//         for(int i=0;i<dist.cols;i++) {
+//             if (dist(j,i) >= edge_dist && !loss_mask(7, {j,i}, {0,0}, loss_status)) {
+//                 if (problem.HasParameterBlock(&out(j,i)[0]))
+//                     problem.SetParameterBlockConstant(&out(j,i)[0]);
+//                 if (!loc.empty() && problem.HasParameterBlock(&loc(j,i)[0]))
+//                     problem.SetParameterBlockConstant(&loc(j,i)[0]);
+//                 // set_loss_mask(7, {j,i}, {0,0}, loss_status, 1);
+//             }
+//             if (dist(j,i) >= edge_dist+2 && !loss_mask(8, {j,i}, {0,0}, loss_status)) {
+//                 if (problem.HasParameterBlock(&out(j,i)[0]))
+//                     problem.RemoveParameterBlock(&out(j,i)[0]);
+//                 if (!loc.empty() && problem.HasParameterBlock(&loc(j,i)[0]))
+//                     problem.RemoveParameterBlock(&loc(j,i)[0]);
+//                 // set_loss_mask(8, {j,i}, {0,0}, loss_status, 1);
+//             }
+//         }
+// }
 
-    edge_dist = std::min(edge_dist,254);
 
-
-    cv::Mat_<uint8_t> masked;
-    bitwise_and(state, cv::Scalar(inner_flags), masked);
-
-
-    cv::distanceTransform(masked, dist, cv::DIST_L1, cv::DIST_MASK_3);
-
-    for(int j=0;j<dist.rows;j++)
-        for(int i=0;i<dist.cols;i++) {
-            if (dist(j,i) >= edge_dist && !loss_mask(7, {j,i}, {0,0}, loss_status)) {
-                if (problem.HasParameterBlock(&out(j,i)[0]))
-                    problem.SetParameterBlockConstant(&out(j,i)[0]);
-                if (!loc.empty() && problem.HasParameterBlock(&loc(j,i)[0]))
-                    problem.SetParameterBlockConstant(&loc(j,i)[0]);
-                // set_loss_mask(7, {j,i}, {0,0}, loss_status, 1);
-            }
-            if (dist(j,i) >= edge_dist+2 && !loss_mask(8, {j,i}, {0,0}, loss_status)) {
-                if (problem.HasParameterBlock(&out(j,i)[0]))
-                    problem.RemoveParameterBlock(&out(j,i)[0]);
-                if (!loc.empty() && problem.HasParameterBlock(&loc(j,i)[0]))
-                    problem.RemoveParameterBlock(&loc(j,i)[0]);
-                // set_loss_mask(8, {j,i}, {0,0}, loss_status, 1);
-            }
-        }
-}
-
-
-struct DSReader
-{
-    z5::Dataset *ds;
-    float scale;
-    ChunkCache *cache;
-};
+// struct DSReader
+// {
+//     z5::Dataset *ds;
+//     float scale;
+//     ChunkCache *cache;
+// };
 
 
 template <typename T, typename C>
@@ -450,6 +437,12 @@ static int add_phys_losses(ceres::Problem &problem, const cv::Vec2i &p, TracePar
     count += gen_dist_loss(problem, p, {-1,1}, params, unit, settings);
     count += gen_dist_loss(problem, p, {1,1}, params, unit, settings);
     count += gen_dist_loss(problem, p, {-1,-1}, params, unit, settings);
+
+    //gridstore normals
+    // count += gen_normal_loss(problem, p                 , params, trace_data, settings);
+    // count += gen_normal_loss(problem, p + cv::Vec2i(1,1), params, trace_data, settings);
+    // count += gen_normal_loss(problem, p + cv::Vec2i(0,1), params, trace_data, settings);
+    // count += gen_normal_loss(problem, p + cv::Vec2i(1,0), params, trace_data, settings);
 
     return count;
 }
@@ -794,7 +787,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     loss_settings.z_min = params.value("z_min", -1);
     loss_settings.z_max = params.value("z_max", std::numeric_limits<int>::max());
     ALifeTime f_timer("empty space tracing\n");
-    DSReader reader = {ds,scale,cache};
+    // DSReader reader = {ds,scale,cache};
     std::unique_ptr<vc::core::util::NormalGridVolume> ngv;
     if (params.contains("normal_grid_path")) {
         ngv = std::make_unique<vc::core::util::NormalGridVolume>(params["normal_grid_path"].get<std::string>());
@@ -846,7 +839,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     std::vector<cv::Vec2i> cands;
 
     float T = step;
-    float Ts = step*reader.scale;
+    float Ts = step*scale;
 
     // The following track the state of the patch; they are each as big as the largest possible patch but initially empty
     // - locs defines the patch! It says for each 2D position, which 3D position it corresponds to
@@ -1180,9 +1173,14 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 ceres::Problem problem;
 
                 trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
-                //TODO also adding normals without snapping would probably be best!
-                loss_settings.optimize_all = false;
                 int local_loss_count = add_phys_losses(problem, p, trace_params, interp, proc_tensor, trace_data, loss_settings, Ts);
+
+                std::vector<double*> parameter_blocks;
+                problem.GetParameterBlocks(&parameter_blocks);
+                for (auto& block : parameter_blocks) {
+                    problem.SetParameterBlockConstant(block);
+                }
+                problem.SetParameterBlockVariable(&trace_params.dpoints(p)[0]);
 
                 ceres::Solver::Summary summary;
                 ceres::Solve(options, &problem, &summary);
@@ -1201,7 +1199,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     succ_gen_ps.push_back(p);
                 }
 
-                loss_settings.optimize_all = true;
                 local_optimization(local_opt_r, p, trace_params, interp, proc_tensor, trace_data, loss_settings, Ts, true);
             }  // end parallel iteration over cands
         }
