@@ -2149,8 +2149,8 @@ void CWindow::onSurfaceContextMenuRequested(const QPoint& pos)
         onRenderSegment(segmentId);
     });
 
-    // SLIM-flatten and render (calls slot implemented in CWindowContextMenu.cpp)
-    QAction* slimFlattenAction = new QAction(tr("SLIM-flatten and render"), this);
+    // SLIM-flatten (calls slot implemented in CWindowContextMenu.cpp)
+    QAction* slimFlattenAction = new QAction(tr("SLIM-flatten"), this);
     connect(slimFlattenAction, &QAction::triggered, [this, segmentId]() {
         onSlimFlatten(segmentId);
     });
