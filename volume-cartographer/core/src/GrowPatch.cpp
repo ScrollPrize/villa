@@ -165,6 +165,10 @@ struct LossSettings {
         return w[type];
     }
 
+    float& operator[](LossType type) {
+        return w[type];
+    }
+
     int z_min = -1;
     int z_max = std::numeric_limits<int>::max();
 };
@@ -1014,13 +1018,24 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 opt_centers.push_back({corr_center_i, radius});
 
                 std::cout << "correction opt centered at " << avg_loc << " with radius " << radius << std::endl;
+                LossSettings loss_inpaint = loss_settings;
+                loss_inpaint[SNAP] = 0.0;
+                loss_inpaint[DIST] *= 0.1;
+                local_optimization(radius, corr_center_i, trace_params, trace_data, loss_inpaint, false, true);
+                loss_inpaint[SNAP] = 0.01;
+                local_optimization(radius, corr_center_i, trace_params, trace_data, loss_inpaint, false, true);
+                loss_inpaint[SNAP] = 0.05;
+                local_optimization(radius, corr_center_i, trace_params, trace_data, loss_inpaint, false, true);
+                local_optimization(radius, corr_center_i, trace_params, trace_data, loss_settings, false, true);
                 local_optimization(radius, corr_center_i, trace_params, trace_data, loss_settings, false, true);
             }
 
             trace_data.point_correction = PointCorrection();
 
             for (const auto& opt_params : opt_centers) {
-                local_optimization(opt_params.radius, opt_params.center, trace_params, trace_data, loss_settings, false, true);
+                LossSettings loss_inpaint = loss_settings;
+                loss_inpaint[DIST] *= 0.1;
+                local_optimization(opt_params.radius, opt_params.center, trace_params, trace_data, loss_inpaint, false, true);
             }
 
         }
