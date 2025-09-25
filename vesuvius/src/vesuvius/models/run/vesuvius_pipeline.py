@@ -46,8 +46,8 @@ def parse_arguments():
                       help='Training config YAML to use when checkpoint lacks embedded model_config')
 
     # Processing parameters
-    parser.add_argument('--mode', type=str, choices=['binary', 'multiclass'], default='binary',
-                      help='Processing mode. "binary" for 2-class, "multiclass" for >2 classes. Default: binary')
+    parser.add_argument('--mode', type=str, choices=['binary', 'multiclass', 'surface_frame'], default='binary',
+                      help='Processing mode. "binary" or "multiclass" for segmentation, "surface_frame" for 9-channel frame regression.')
     parser.add_argument('--threshold', dest='threshold', action='store_true',
                       help='Apply thresholding to get binary/class masks instead of probability maps')
     parser.add_argument('--patch-size', dest='patch_size', type=str, 
@@ -184,6 +184,7 @@ def run_predict(args, part_id, gpu_id, z_min=None, z_max=None):
     # Add part-specific arguments for multi-GPU
     cmd.extend(['--num_parts', str(args.num_parts)])
     cmd.extend(['--part_id', str(part_id)])
+    cmd.extend(['--mode', args.mode])
     
     # TTA (Test Time Augmentation) settings
     if getattr(args, 'tta_type', None):
@@ -272,10 +273,15 @@ def run_finalize(args):
     print(f"DEBUG - All available args: {vars(args)}")
     
     cmd = ['vesuvius.finalize_outputs', args.blended_path, args.output]
-    
+
     # Add mode and threshold arguments
     cmd.extend(['--mode', args.mode])
-    if args.threshold:
+
+    apply_threshold = args.threshold and args.mode != 'surface_frame'
+    if args.mode == 'surface_frame' and args.threshold:
+        print("Surface-frame mode ignores --threshold; emitting raw frame components.")
+
+    if apply_threshold:
         print(f"DEBUG - Adding --threshold flag to command")
         cmd.append('--threshold')
     else:

@@ -16,6 +16,53 @@ import json
 from datetime import datetime
 
 
+def _safe_normalize(vec: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """Normalize a vector field along axis 0 while avoiding division by zero."""
+    norms = np.sqrt(np.sum(vec * vec, axis=0, keepdims=True))
+    inv = np.divide(1.0, norms, out=np.zeros_like(norms), where=norms > eps)
+    return vec * inv
+
+
+def _orthonormalize_surface_frame(tu: np.ndarray, tv: np.ndarray, n: np.ndarray, eps: float = 1e-6) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Project and re-orthonormalize a predicted surface frame (tu, tv, n)."""
+    n_unit = _safe_normalize(n, eps)
+
+    tu_proj = tu - (np.sum(tu * n_unit, axis=0, keepdims=True) * n_unit)
+    tu_unit = _safe_normalize(tu_proj, eps)
+
+    tv_proj = tv - (np.sum(tv * n_unit, axis=0, keepdims=True) * n_unit)
+    tv_proj = tv_proj - (np.sum(tv_proj * tu_unit, axis=0, keepdims=True) * tu_unit)
+    tv_unit = _safe_normalize(tv_proj, eps)
+
+    # Fallback to n × tu when tv collapses
+    tv_norm_sq = np.sum(tv_unit * tv_unit, axis=0, keepdims=True)
+    if np.any(tv_norm_sq <= eps):
+        fallback = np.stack([
+            n_unit[1] * tu_unit[2] - n_unit[2] * tu_unit[1],
+            n_unit[2] * tu_unit[0] - n_unit[0] * tu_unit[2],
+            n_unit[0] * tu_unit[1] - n_unit[1] * tu_unit[0],
+        ], axis=0)
+        fallback_unit = _safe_normalize(fallback, eps)
+        tv_unit = np.where(tv_norm_sq <= eps, fallback_unit, tv_unit)
+
+    n_recomputed = np.stack([
+        tu_unit[1] * tv_unit[2] - tu_unit[2] * tv_unit[1],
+        tu_unit[2] * tv_unit[0] - tu_unit[0] * tv_unit[2],
+        tu_unit[0] * tv_unit[1] - tu_unit[1] * tv_unit[0],
+    ], axis=0)
+    n_unit = _safe_normalize(n_recomputed, eps)
+
+    # Align orientation with the original normal prediction
+    orig_n_unit = _safe_normalize(n, eps)
+    dot_sign = np.sum(n_unit * orig_n_unit, axis=0, keepdims=True)
+    flip_mask = dot_sign < 0
+    if np.any(flip_mask):
+        tv_unit = np.where(flip_mask, -tv_unit, tv_unit)
+        n_unit = np.where(flip_mask, -n_unit, n_unit)
+
+    return tu_unit, tv_unit, n_unit
+
+
 def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_classes, spatial_shape, spatial_chunks, is_multi_task=False, target_info=None, squeeze_single_channel: bool = False):
     """
     Process a single chunk of the volume in parallel.
@@ -54,6 +101,21 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
     
     input_slice = (slice(None),) + spatial_slices 
     logits_np = input_store[input_slice]
+
+    if mode == "surface_frame":
+        logits_np = logits_np.astype(np.float32, copy=False)
+        tu_unit, tv_unit, n_unit = _orthonormalize_surface_frame(
+            logits_np[0:3], logits_np[3:6], logits_np[6:9]
+        )
+        output_np = np.concatenate([tu_unit, tv_unit, n_unit], axis=0).astype(np.float32, copy=False)
+
+        # Skip writing empty chunks (all zeros)
+        if not np.any(np.abs(output_np) > 0):
+            return {'chunk_idx': chunk_idx, 'processed_voxels': 0, 'empty': True}
+
+        output_slice = (slice(None),) + spatial_slices
+        output_store[output_slice] = output_np
+        return {'chunk_idx': chunk_idx, 'processed_voxels': output_np.size}
 
     if mode == "binary":
         if is_multi_task and target_info:
@@ -187,10 +249,20 @@ def finalize_logits(
         storage_options={'anon': False} if input_path.startswith('s3://') else None,
         verbose=verbose
     )
-    
+
+    stored_mode = input_store.attrs.get('processing_mode') if hasattr(input_store, 'attrs') else None
+    if stored_mode and stored_mode != mode:
+        raise ValueError(
+            f"Requested mode '{mode}' does not match blended logits metadata ('{stored_mode}'). "
+            "Re-run with --mode matching the stored processing_mode."
+        )
+
     input_shape = input_store.shape
     num_classes = input_shape[0]
     spatial_shape = input_shape[1:]  # (Z, Y, X)
+
+    if mode == 'surface_frame' and num_classes != 9:
+        raise ValueError(f"Surface-frame mode expects 9 channels, but input has {num_classes}.")
     
     # Check for multi-task metadata
     is_multi_task = False
@@ -229,41 +301,40 @@ def finalize_logits(
         if verbose:
             print(f"Using specified chunk size: {output_chunks}")
     
-    if mode == "binary":
+    output_dtype = np.uint8
+    if mode == "surface_frame":
+        out_channels = num_classes
+        output_shape = (out_channels, *spatial_shape)
+        squeeze_single_channel = False
+        output_dtype = np.float32
+        print("Output will have 9 channels ordered as [t_u(3), t_v(3), n(3)] with float32 precision.")
+    elif mode == "binary":
         if is_multi_task and target_info:
-            # For multi-task binary, output one channel per target
             num_targets = len(target_info)
-            output_shape = (num_targets, *spatial_shape)  # One mask per target
+            output_shape = (num_targets, *spatial_shape)
             if threshold:
                 print(f"Output will have {num_targets} channels: [" + ", ".join(f"{k}_binary_mask" for k in sorted(target_info.keys())) + "]")
             else:
                 print(f"Output will have {num_targets} channels: [" + ", ".join(f"{k}_softmax_fg" for k in sorted(target_info.keys())) + "]")
+            out_channels = num_targets
         else:
-            if threshold:  
-                # If thresholding, only output argmax channel for binary
-                output_shape = (1, *spatial_shape)  # Just the binary mask (argmax)
+            output_shape = (1, *spatial_shape)
+            if threshold:
                 print("Output will have 1 channel: [binary_mask]")
             else:
-                 # Just softmax of FG class
-                output_shape = (1, *spatial_shape) 
                 print("Output will have 1 channel: [softmax_fg]")
+            out_channels = 1
+        squeeze_single_channel = (out_channels == 1)
     else:  # multiclass
-        if threshold:  
-            # If threshold is provided for multiclass, only save the argmax
+        if threshold:
             output_shape = (1, *spatial_shape)
+            out_channels = 1
             print("Output will have 1 channel: [argmax]")
         else:
-            # For multiclass, we'll output num_classes channels (all softmax values)
-            # Plus 1 channel for the argmax
             output_shape = (num_classes + 1, *spatial_shape)
+            out_channels = num_classes + 1
             print(f"Output will have {num_classes + 1} channels: [softmax_c0...softmax_cN, argmax]")
-    
-    # Decide channel count and squeeze behavior
-    if mode == "binary":
-        out_channels = (len(target_info) if (is_multi_task and target_info) else 1)
-    else:
-        out_channels = (1 if threshold else (num_classes + 1))
-    squeeze_single_channel = (out_channels == 1)
+        squeeze_single_channel = (out_channels == 1)
 
     # Prepare shapes and chunks for level 0
     if squeeze_single_channel:
@@ -286,7 +357,7 @@ def finalize_logits(
         verbose=verbose,
         shape=final_shape_lvl0,
         chunks=chunks_lvl0,
-        dtype=np.uint8,
+        dtype=output_dtype,
         compressor=compressor,
         write_empty_chunks=False,
         overwrite=True
@@ -360,11 +431,19 @@ def finalize_logits(
             for key in input_store.attrs:
                 output_store.attrs[key] = input_store.attrs[key]
                 
-            output_store.attrs['processing_mode'] = mode
             output_store.attrs['threshold_applied'] = threshold
             output_store.attrs['empty_chunks_skipped'] = empty_chunks
             output_store.attrs['total_chunks'] = total_chunks
             output_store.attrs['empty_chunk_percentage'] = float(empty_chunks/total_chunks) if total_chunks > 0 else 0.0
+            output_store.attrs['processing_mode'] = mode
+            if mode == "surface_frame":
+                output_store.attrs['surface_frame_layout'] = [
+                    't_u_x', 't_u_y', 't_u_z',
+                    't_v_x', 't_v_y', 't_v_z',
+                    'n_x', 'n_y', 'n_z'
+                ]
+                output_store.attrs['surface_frame_orthonormalized'] = True
+                output_store.attrs['value_dtype'] = 'float32'
     except Exception as e:
         print(f"Warning: Failed to copy metadata: {e}")
 
@@ -447,6 +526,11 @@ def finalize_logits(
                                 # Reshape and average
                                 Cb, Zb, Yb, Xb = prev_block.shape
                                 block_ds = prev_block.reshape(Cb, Zb//2, 2, Yb//2, 2, Xb//2, 2).mean(axis=(2, 4, 6))
+                                if mode == "surface_frame" and Cb == 9:
+                                    tu_ds, tv_ds, n_ds = _orthonormalize_surface_frame(
+                                        block_ds[0:3], block_ds[3:6], block_ds[6:9]
+                                    )
+                                    block_ds = np.concatenate([tu_ds, tv_ds, n_ds], axis=0).astype(block_ds.dtype, copy=False)
                                 ds_store[(slice(None), slice(oz, oz1), slice(oy, oy1), slice(ox, ox1))] = block_ds
                             else:
                                 prev_block = prev_store[(slice(pz0, pz1), slice(py0, py1), slice(px0, px1))]
@@ -547,8 +631,8 @@ def main():
                       help='Path to the merged logits Zarr store')
     parser.add_argument('output_path', type=str,
                       help='Path for the finalized output Zarr store')
-    parser.add_argument('--mode', type=str, choices=['binary', 'multiclass'], default='binary',
-                      help='Processing mode. "binary" for 2-class segmentation, "multiclass" for >2 classes. Default: binary')
+    parser.add_argument('--mode', type=str, choices=['binary', 'multiclass', 'surface_frame'], default='binary',
+                      help='Processing mode. Use "binary"/"multiclass" for segmentation or "surface_frame" for 9-channel frame regression.')
     parser.add_argument('--threshold', dest='threshold', action='store_true',
                       help='If set, applies argmax and only saves the class predictions (no probabilities). Works for both binary and multiclass.')
     parser.add_argument('--delete-intermediates', dest='delete_intermediates', action='store_true',
@@ -561,7 +645,10 @@ def main():
                       help='Suppress verbose output')
     
     args = parser.parse_args()
-    
+
+    if args.mode == 'surface_frame' and args.threshold:
+        parser.error("--threshold is not supported when mode is 'surface_frame'.")
+
     chunks = None
     if args.chunk_size:
         try:

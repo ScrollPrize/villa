@@ -36,6 +36,7 @@ vesuvius.predict \
 | `--overlap` | Fractional patch overlap (0–1, default `0.5`).
 | `--batch_size` | Inference batch size (default `1`).
 | `--patch_size` | Override the model patch size using a comma-separated list (e.g. `192,192,192`).
+| `--mode` | `binary`/`multiclass` (default segmentation) or `surface_frame` to keep 9-channel tangent frames.
 | `--tif-activation` | When writing TIFF outputs, pick `softmax`, `argmax`, or `none`.
 | `--save_softmax` | Legacy flag for saving softmax logits (consider `--tif-activation`).
 | `--normalization` | Runtime normalization (`instance_zscore`, `global_zscore`, `instance_minmax`, `ct`, `none`).
@@ -102,14 +103,14 @@ vesuvius.finalize_outputs /tmp/merged_logits.zarr /tmp/final_output.zarr \
 |----------|-------------|
 | `input_path` | Path to the blended logits Zarr (level `0` is the logits array).
 | `output_path` | Destination multiscale Zarr root.
-| `--mode` | `binary` (default) or `multiclass`.
-| `--threshold` | For binary: emit a single-channel argmax mask. For multiclass: emit just the argmax channel.
+| `--mode` | `binary` (default), `multiclass`, or `surface_frame` (keeps 9-channel frame outputs; no thresholding).
+| `--threshold` | For binary: emit a single-channel argmax mask. For multiclass: emit just the argmax channel. Ignored in `surface_frame` mode.
 | `--delete-intermediates` | Remove the source logits after a successful run.
 | `--chunk-size` | Spatial chunk size for the output store (`Z,Y,X`). Defaults to the logits chunking.
 | `--num-workers` | Worker processes for finalization (defaults to half of CPU cores).
 | `--quiet` | Suppress verbose logging.
 
-Without `--threshold`, binary mode outputs a single softmax foreground channel; multiclass mode writes one channel per class plus an argmax channel.
+Without `--threshold`, binary mode outputs a single softmax foreground channel; multiclass mode writes one channel per class plus an argmax channel. `surface_frame` mode bypasses thresholding entirely and stores orthonormal 9-channel frames in float32.
 
 ## Single-Machine Convenience — `vesuvius.inference_pipeline`
 
@@ -130,6 +131,7 @@ vesuvius.inference_pipeline \
 Important flags:
 
 - `--workdir`: where to place intermediate logits (defaults to `<output>_work`).
+- `--mode surface_frame`: keep 9-channel tangent frames; thresholding is disabled automatically.
 - `--skip-predict`, `--skip-blend`, `--skip-finalize`: rerun only specific stages.
 - `--parts-per-gpu`: how many logical parts each GPU should process.
 - `--keep-intermediates`: retain the intermediate logits/chunks for debugging.
