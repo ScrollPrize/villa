@@ -129,6 +129,10 @@ class ConfigManager:
         self.skip_bounding_box = bool(self.dataset_config.get("skip_bounding_box", True))
         self.cache_valid_patches = bool(self.dataset_config.get("cache_valid_patches", True))
 
+        # Chunk-slicing worker configuration
+        self.downsample_level = int(self.dataset_config.get("downsample_level", 1))
+        self.num_workers = int(self.dataset_config.get("num_workers", 8))
+
         # Worker configuration for image→Zarr pipeline
         # Parallel workers for initial image/Zarr checks
         self.image_check_workers = int(self.dataset_config.get(

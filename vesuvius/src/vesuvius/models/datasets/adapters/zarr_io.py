@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections import defaultdict
 from pathlib import Path
@@ -31,6 +32,7 @@ class ZarrAdapter(DataSourceAdapter):
         self._metadata: Dict[str, VolumeMetadata] = {}
         self._image_arrays: Dict[str, object] = {}
         self._label_arrays: Dict[Tuple[str, str], object] = {}
+        self._axes_cache: Dict[Path, Optional[Sequence[Mapping[str, object]]]] = {}
 
     # Discovery ------------------------------------------------------------------------------------
 
@@ -138,8 +140,10 @@ class ZarrAdapter(DataSourceAdapter):
 
         for item in discovered:
             image_array = self._open_zarr_array(item.image_path)
-            spatial_shape = self._extract_spatial_shape(image_array.shape)
-            axes = self._derive_axes(image_array.shape)
+            spatial_shape = self._extract_spatial_shape(
+                image_array.shape, item.image_path
+            )
+            axes = self._derive_axes(image_array.shape, item.image_path)
 
             label_dtypes: Dict[str, Optional[np.dtype]] = {}
             targets_with_labels: List[str] = []
@@ -150,7 +154,9 @@ class ZarrAdapter(DataSourceAdapter):
                     continue
 
                 label_array = self._open_zarr_array(label_path)
-                label_spatial = self._extract_spatial_shape(label_array.shape)
+                label_spatial = self._extract_spatial_shape(
+                    label_array.shape, label_path
+                )
                 if label_spatial != spatial_shape:
                     raise ValueError(
                         "Label spatial shape mismatch for volume '%s' target '%s': image=%s label=%s"
@@ -182,7 +188,28 @@ class ZarrAdapter(DataSourceAdapter):
         zarr_path = _get_zarr_path(path, resolution_level=resolution)
         return zarr.open(zarr_path, mode="r")
 
-    def _extract_spatial_shape(self, shape: Sequence[int]) -> Tuple[int, ...]:
+    def _extract_spatial_shape(
+        self, shape: Sequence[int], path: Optional[Path] = None
+    ) -> Tuple[int, ...]:
+        axes_metadata = self._load_axes_metadata(path) if path is not None else None
+
+        if axes_metadata:
+            spatial_indices: List[int] = [
+                idx
+                for idx, axis in enumerate(axes_metadata)
+                if str(axis.get("name", "")).lower() in {"z", "y", "x"}
+            ]
+
+            if not spatial_indices:
+                spatial_indices = [
+                    idx
+                    for idx, axis in enumerate(axes_metadata)
+                    if str(axis.get("type", "")).lower() == "space"
+                ]
+
+            if spatial_indices:
+                return tuple(int(shape[idx]) for idx in spatial_indices)
+
         if len(shape) == 2:
             return tuple(int(v) for v in shape)
         if len(shape) == 3:
@@ -191,7 +218,12 @@ class ZarrAdapter(DataSourceAdapter):
             return tuple(int(v) for v in shape[-3:])
         raise ValueError(f"Unsupported array shape {shape} for spatial inference")
 
-    def _derive_axes(self, shape: Sequence[int]) -> str:
+    def _derive_axes(self, shape: Sequence[int], path: Optional[Path] = None) -> str:
+        axes_metadata = self._load_axes_metadata(path) if path is not None else None
+
+        if axes_metadata:
+            return "".join(str(axis.get("name", "?")).upper() for axis in axes_metadata)
+
         if len(shape) == 2:
             return "YX"
         if len(shape) == 3:
@@ -201,6 +233,51 @@ class ZarrAdapter(DataSourceAdapter):
         if len(shape) == 5:
             return "TCZYX"
         return "?"
+
+    def _load_axes_metadata(
+        self, path: Optional[Path]
+    ) -> Optional[Sequence[Mapping[str, object]]]:
+        if path is None:
+            return None
+
+        root = self._resolve_store_root(Path(path))
+        if root is None:
+            return None
+
+        cache_key = root.resolve()
+        if cache_key in self._axes_cache:
+            return self._axes_cache[cache_key]
+
+        attrs_path = root / ".zattrs"
+        axes: Optional[Sequence[Mapping[str, object]]] = None
+        if attrs_path.exists():
+            try:
+                with attrs_path.open("r", encoding="utf-8") as handle:
+                    attrs = json.load(handle)
+                multiscales = attrs.get("multiscales")
+                if isinstance(multiscales, list) and multiscales:
+                    candidate = multiscales[0].get("axes")
+                    if isinstance(candidate, list) and candidate:
+                        axes = tuple(candidate)
+            except Exception as exc:  # pragma: no cover - best effort logging
+                self.logger.debug(
+                    "Failed to load axes metadata for %s: %s", attrs_path, exc
+                )
+
+        self._axes_cache[cache_key] = axes
+        return axes
+
+    def _resolve_store_root(self, path: Path) -> Optional[Path]:
+        current = path
+        if current.is_file():
+            current = current.parent
+
+        for candidate in (current,) + tuple(current.parents):
+            if candidate.is_dir() and (candidate / ".zattrs").exists():
+                return candidate
+            if candidate == candidate.parent:
+                break
+        return None
 
     # Materialisation -----------------------------------------------------------------------------
 

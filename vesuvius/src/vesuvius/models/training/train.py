@@ -661,7 +661,7 @@ class BaseTrainer:
         pin_mem = True if self.device.type == 'cuda' else False
         dl_kwargs = {}
         if self.mgr.train_num_dataloader_workers and self.mgr.train_num_dataloader_workers > 0:
-            dl_kwargs['prefetch_factor'] = 2
+            dl_kwargs['prefetch_factor'] = 1
 
         train_dataloader = DataLoader(
             train_subset,

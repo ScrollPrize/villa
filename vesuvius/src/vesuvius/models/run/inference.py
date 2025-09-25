@@ -63,7 +63,8 @@ class Inferer():
                  hf_token: str = None,
                  # optional fallback when .pth lacks embedded model_config
                  config_yaml: str = None,
-                 slicewise_axes=None
+                 slicewise_axes=None,
+                 output_mode: str = 'binary'
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -99,6 +100,15 @@ class Inferer():
         self.compression_level = compression_level
         self.hf_token = hf_token
         self.config_yaml = config_yaml
+        valid_modes = {'binary', 'multiclass', 'surface_frame'}
+        if output_mode not in valid_modes:
+            raise ValueError(f"Invalid output_mode '{output_mode}'. Must be one of {sorted(valid_modes)}.")
+        if output_mode == 'surface_frame':
+            if save_softmax:
+                raise ValueError("save_softmax is not supported when output_mode is 'surface_frame'.")
+            if tiff_activation not in (None, 'none'):
+                raise ValueError("tiff_activation must be None or 'none' for surface_frame outputs.")
+        self.output_mode = output_mode
         self.model_patch_size = None
         self.num_classes = None
         self.intensity_props = None
@@ -310,6 +320,14 @@ class Inferer():
             except Exception as e:
                 raise RuntimeError(f"Warning: Could not automatically determine number of classes via dummy inference: {e}. \nEnsure your model is loaded correctly and check the expected input shape")
             
+        if self.output_mode == 'surface_frame':
+            if self.is_multi_task:
+                raise ValueError("surface_frame mode expects a single-target model (found multi-task outputs).")
+            if self.num_classes != 9:
+                raise ValueError(f"surface_frame mode expects exactly 9 output channels, but model provides {self.num_classes}.")
+            if self.verbose:
+                print("Validated surface-frame model with 9 output channels.")
+
         return model
     
     def _load_train_py_model(self, checkpoint_path):
@@ -640,6 +658,7 @@ class Inferer():
             self.output_store.attrs['overlap'] = self.overlap
             self.output_store.attrs['part_id'] = self.part_id
             self.output_store.attrs['num_parts'] = self.num_parts
+            self.output_store.attrs['processing_mode'] = self.output_mode
             
             # Store multi-task metadata if applicable
             if self.is_multi_task and self.target_info:
@@ -672,7 +691,8 @@ class Inferer():
                     'resolution': self.resolution,
                     'compressor_name': str(self.compressor_name),
                     'compression_level': int(self.compression_level),
-                    'timestamp': datetime.utcnow().isoformat() + 'Z'
+                    'timestamp': datetime.utcnow().isoformat() + 'Z',
+                    'output_mode': self.output_mode
                 }
                 self.output_store.attrs['inference_args'] = inference_args
             except Exception as me:
@@ -1828,6 +1848,7 @@ class Inferer():
         final_store.attrs['overlap'] = float(self.overlap)
         final_store.attrs['part_id'] = self.part_id
         final_store.attrs['num_parts'] = self.num_parts
+        final_store.attrs['processing_mode'] = self.output_mode
 
         if self.is_multi_task and self.target_info:
             final_store.attrs['is_multi_task'] = True
@@ -1856,7 +1877,8 @@ class Inferer():
                 'compression_level': int(self.compression_level),
                 'timestamp': datetime.utcnow().isoformat() + 'Z',
                 'storage_mode': 'slicewise_multi_axis',
-                'slicewise_axes': list(axes_to_process)
+                'slicewise_axes': list(axes_to_process),
+                'output_mode': self.output_mode
             }
             final_store.attrs['inference_args'] = inference_args
         except Exception as exc:
@@ -1970,6 +1992,8 @@ def main():
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference')
     parser.add_argument('--patch_size', type=str, default=None, 
                       help='Optional: Override patch size, comma-separated (e.g., "192,192,192"). If not provided, uses the model\'s default patch size.')
+    parser.add_argument('--mode', type=str, choices=['binary', 'multiclass', 'surface_frame'], default='binary',
+                      help='Output mode hint for downstream processing. Use "surface_frame" for 9-channel tangent-frame predictions.')
     parser.add_argument('--save_softmax', action='store_true', help='Save softmax outputs (deprecated; use --tif-activation softmax)')
     # Preferred flag for controlling TIFF activation
     parser.add_argument('--tif-activation', dest='tiff_activation', type=str, default=None,
@@ -2078,7 +2102,8 @@ def main():
         hf_token=args.hf_token,
         # Fallback config for train.py checkpoints without embedded model_config
         config_yaml=args.config_yaml,
-        slicewise_axes=slicewise_axes
+        slicewise_axes=slicewise_axes,
+        output_mode=args.mode
     )
 
     try:

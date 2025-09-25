@@ -504,6 +504,10 @@ def merge_inference_outputs(
         output_zarr.attrs['patch_size'] = patch_size
         output_zarr.attrs['original_volume_shape'] = original_volume_shape
         output_zarr.attrs['sigma_scale'] = sigma_scale
+        if 'processing_mode' not in output_zarr.attrs and meta_attrs:
+            pmode = meta_attrs.get('processing_mode')
+            if pmode is not None:
+                output_zarr.attrs['processing_mode'] = pmode
     
     # --- 9. Cleanup ---
     if delete_weights:
