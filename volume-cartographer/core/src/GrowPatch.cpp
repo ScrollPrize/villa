@@ -935,6 +935,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 if (gen > 0 && gen <= start_gen && resume_points(j,i)[0] != -1) {
                     trace_params.dpoints(target_y, target_x) = resume_points(j, i);
                     generations(target_y, target_x) = gen;
+                    succ++;
                     trace_params.state(target_y, target_x) = STATE_LOC_VALID | STATE_COORD_VALID;
                     if (gen < min_gen) {
                         min_gen = gen;
@@ -972,7 +973,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
                 for (int j = 0; j < mask.rows; ++j) {
                     for (int i = 0; i < mask.cols; ++i) {
-                        if (mask.at<uint8_t>(j, i) == 0) {
+                        if (mask.at<uint8_t>(j, i) == 0 && trace_params.state(pad_y + j, pad_x + i)) {
                             int target_y = pad_y + j;
                             int target_x = pad_x + i;
                             cv::Point2f p(target_x, target_y);
@@ -987,6 +988,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                                 trace_params.state(target_y, target_x) = 0;
                                 trace_params.dpoints(target_y, target_x) = cv::Vec3d(-1,-1,-1);
                                 generations(target_y, target_x) = 0;
+                                succ--;
                             }
                         }
                     }
@@ -1079,6 +1081,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
         std::cout << "init loss count " << loss_count << std::endl;
     }
+
+    int succ_start = succ;
 
     // Solve the initial optimisation problem, just placing the first four vertices around the seed
     ceres::Solver::Summary big_summary;
@@ -1276,9 +1280,12 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         double const total_area_mm2 = succ * mm2_per_quad;
         double const total_area_m2 = succ * m2_per_quad;
 
-        double avg_speed_mm2_s = (elapsed_seconds > 0) ? (total_area_mm2 / elapsed_seconds) : 0.0;
+        double const total_area_mm2_run = (succ-succ_start) * mm2_per_quad;
+        double const total_area_m2_run = (succ-succ_start) * m2_per_quad;
+
+        double avg_speed_mm2_s = (elapsed_seconds > 0) ? (total_area_mm2_run / elapsed_seconds) : 0.0;
         double current_speed_mm2_s = (seconds_this_gen > 0) ? (succ_this_gen * mm2_per_quad / seconds_this_gen) : 0.0;
-        double avg_speed_m2_day = (elapsed_seconds > 0) ? (total_area_m2 / (elapsed_seconds / (24.0 * 3600.0))) : 0.0;
+        double avg_speed_m2_day = (elapsed_seconds > 0) ? (total_area_m2_run / (elapsed_seconds / (24.0 * 3600.0))) : 0.0;
 
         printf("-> done %d | fringe %ld | area %.2f mm^2 (%.6f m^2) | avg speed %.2f mm^2/s (%.6f m^2/day) | current speed %.2f mm^2/s\n",
                succ, (long)fringe.size(), total_area_mm2, total_area_m2, avg_speed_mm2_s, avg_speed_m2_day, current_speed_mm2_s);
