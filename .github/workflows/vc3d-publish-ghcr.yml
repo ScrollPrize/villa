@@ -75,8 +75,12 @@ jobs:
           file: ./volume-cartographer/ubuntu-24.04-noble.Dockerfile
           platforms: linux/amd64
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=gha,scope=${{ github.ref }}
+            type=registry,ref=${{ env.REGISTRY_IMAGE_LC }}:buildcache
+          cache-to: |
+            type=gha,mode=max,scope=${{ github.ref }}
+            type=registry,ref=${{ env.REGISTRY_IMAGE_LC }}:buildcache,mode=max
           provenance: true
           outputs: |
             type=image,name=${{ env.REGISTRY_IMAGE_LC }},push-by-digest=true,name-canonical=true,push=true
@@ -98,7 +102,7 @@ jobs:
   build_arm64:
     name: Build & Push Image (arm64)
     runs-on: ubuntu-24.04-arm
-    needs: prepare
+    needs: [prepare, build_x64]
     env:
       REGISTRY_IMAGE_LC: ${{ needs.prepare.outputs.registry_image_lc }}
     steps:
@@ -135,8 +139,12 @@ jobs:
           file: ./volume-cartographer/ubuntu-24.04-noble.Dockerfile
           platforms: linux/arm64
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=gha,scope=${{ github.ref }}
+            type=registry,ref=${{ env.REGISTRY_IMAGE_LC }}:buildcache
+          cache-to: |
+            type=gha,mode=max,scope=${{ github.ref }}
+            type=registry,ref=${{ env.REGISTRY_IMAGE_LC }}:buildcache,mode=max
           provenance: true
           outputs: |
             type=image,name=${{ env.REGISTRY_IMAGE_LC }},push-by-digest=true,name-canonical=true,push=true
