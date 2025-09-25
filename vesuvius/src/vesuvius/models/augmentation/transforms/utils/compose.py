@@ -10,5 +10,7 @@ class ComposeTransforms(BasicTransform):
 
     def apply(self, data_dict, **params):
         for t in self.transforms:
+            if data_dict.get('_skip_spatial_transforms', False) and getattr(t, '_skip_when_vector', False):
+                continue
             data_dict = t(**data_dict)
         return data_dict

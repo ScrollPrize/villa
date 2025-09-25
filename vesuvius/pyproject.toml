@@ -68,6 +68,7 @@ dependencies = [
     "timm>=1.0.20",
     "torch>=2.6",
     "tqdm>=4.67.1",
+    "trimesh>=4.8.2",
     "typed-argument-parser>=1.11.0",
     "wandb[media]>=0.22.0",
     "wheel",

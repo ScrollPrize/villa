@@ -1,3 +1,5 @@
+from typing import Sequence, Union
+
 import numpy as np
 from tqdm import tqdm
 from multiprocessing import Pool
@@ -47,78 +49,149 @@ def bounding_box_volume(bbox):
         return ((maxy - miny + 1) *
                 (maxx - minx + 1))
 
-def check_patch_chunk(chunk, sheet_label, patch_size, bbox_threshold=0.5, label_threshold=0.05):
-    """
-    Worker function to check each patch in 'chunk' with both:
-      - bounding box coverage >= bbox_threshold
-      - overall labeled voxel ratio >= label_threshold
-    """
-    is_2d = len(sheet_label.shape) == 2
+def _resolve_channel_index(selector: Union[int, Sequence[int]], extra_shape: Sequence[int]) -> int:
+    """Convert a channel selector description into a flattened index."""
+
+    total = int(np.prod(extra_shape)) if extra_shape else 1
+
+    if isinstance(selector, int):
+        idx = int(selector)
+    elif isinstance(selector, (tuple, list)):
+        if len(selector) != len(extra_shape):
+            raise ValueError(
+                "Channel selector dimensionality does not match channel axes"
+            )
+        idx = 0
+        for sel, size in zip(selector, extra_shape):
+            sel_int = int(sel)
+            if sel_int < 0:
+                sel_int += int(size)
+            if not (0 <= sel_int < int(size)):
+                raise ValueError(
+                    f"Channel selector index {sel} out of bounds for axis size {size}"
+                )
+            idx = idx * int(size) + sel_int
+    else:
+        raise TypeError("Channel selector must be an int or a sequence of ints")
+
+    if idx < 0:
+        idx += total
+    if not (0 <= idx < total):
+        raise ValueError(
+            f"Resolved channel index {idx} out of bounds for flattened size {total}"
+        )
+    return idx
+
+
+def collapse_patch_to_spatial(
+    patch: np.ndarray,
+    *,
+    spatial_ndim: int,
+    channel_selector: Union[int, Sequence[int], None],
+) -> np.ndarray:
+    """Reduce a patch with extra channel axes down to spatial-only values."""
+
+    arr = np.asarray(patch)
+    if arr.ndim < spatial_ndim:
+        raise ValueError(
+            f"Patch ndim {arr.ndim} is incompatible with spatial dimensions {spatial_ndim}"
+        )
+
+    if arr.ndim == spatial_ndim:
+        return arr
+
+    spatial_shape = arr.shape[:spatial_ndim]
+    extra_shape = arr.shape[spatial_ndim:]
+    flat = arr.reshape(spatial_shape + (int(np.prod(extra_shape)),))
+
+    if channel_selector is None:
+        return np.linalg.norm(flat, axis=-1)
+
+    idx = _resolve_channel_index(channel_selector, extra_shape)
+    return flat[..., idx]
+
+
+def check_patch_chunk(
+    chunk,
+    sheet_label,
+    patch_size,
+    bbox_threshold=0.5,
+    label_threshold=0.05,
+    channel_selector: Union[int, Sequence[int], None] = None,
+):
+    """Identify valid label patches within a chunk of candidate positions."""
+
+    spatial_ndim = len(patch_size)
+    is_2d = spatial_ndim == 2
     valid_positions = []
 
     if is_2d:
-        pH, pW = patch_size[-2:]  # Take last two dimensions
+        pH, pW = patch_size[-2:]
         for (y, x) in chunk:
             patch = sheet_label[y:y + pH, x:x + pW]
-            # Compute bounding box of nonzero pixels in this patch
-            bbox = compute_bounding_box_3d(patch > 0)
+            patch = collapse_patch_to_spatial(
+                patch,
+                spatial_ndim=2,
+                channel_selector=channel_selector,
+            )
+            mask = np.abs(patch) > 0
+            bbox = compute_bounding_box_3d(mask)
             if bbox is None:
-                # No nonzero pixels at all -> skip
                 continue
 
-            # 1) Check bounding box coverage
             bb_vol = bounding_box_volume(bbox)
-            patch_vol = patch.size  # pH * pW
+            patch_vol = patch.size
             if bb_vol / patch_vol < bbox_threshold:
                 continue
 
-            # 2) Check overall labeled fraction
-            labeled_ratio = np.count_nonzero(patch) / patch_vol
+            labeled_ratio = np.count_nonzero(mask) / patch_vol
             if labeled_ratio < label_threshold:
                 continue
 
-            # If we passed both checks, add to valid positions
             valid_positions.append((y, x))
     else:
-        # 3D
         pD, pH, pW = patch_size
         for (z, y, x) in chunk:
             patch = sheet_label[z:z + pD, y:y + pH, x:x + pW]
-            # Compute bounding box of nonzero pixels in this patch
-            bbox = compute_bounding_box_3d(patch > 0)
+            patch = collapse_patch_to_spatial(
+                patch,
+                spatial_ndim=3,
+                channel_selector=channel_selector,
+            )
+            mask = np.abs(patch) > 0
+            bbox = compute_bounding_box_3d(mask)
             if bbox is None:
-                # No nonzero voxels at all -> skip
                 continue
 
-            # 1) Check bounding box coverage
             bb_vol = bounding_box_volume(bbox)
-            patch_vol = patch.size  # pD * pH * pW
+            patch_vol = patch.size
             if bb_vol / patch_vol < bbox_threshold:
                 continue
 
-            # 2) Check overall labeled fraction
-            labeled_ratio = np.count_nonzero(patch) / patch_vol
+            labeled_ratio = np.count_nonzero(mask) / patch_vol
             if labeled_ratio < label_threshold:
                 continue
 
-            # If we passed both checks, add to valid positions
             valid_positions.append((z, y, x))
 
     return valid_positions
 
-def find_valid_patches(label_arrays,
-                        label_names,
-                        patch_size,
-                        bbox_threshold=0.97,  # bounding-box coverage fraction
-                        label_threshold=0.10,  # minimum % of voxels labeled,
-                        min_z = 0,
-                        min_y = 0,
-                        min_x = 0,
-                        max_z = None,
-                        max_y = None,
-                        max_x = None,
-                        num_workers=4,
-                        downsample_level=1):  
+def find_valid_patches(
+    label_arrays,
+    label_names,
+    patch_size,
+    bbox_threshold=0.97,  # bounding-box coverage fraction
+    label_threshold=0.10,  # minimum % of voxels labeled,
+    min_z=0,
+    min_y=0,
+    min_x=0,
+    max_z=None,
+    max_y=None,
+    max_x=None,
+    num_workers=4,
+    downsample_level=1,
+    channel_selectors: Sequence[Union[int, Sequence[int], None]] | None = None,
+):
     """
     Finds patches that contain:
       - a bounding box of labeled voxels >= bbox_threshold fraction of the patch volume
@@ -160,6 +233,9 @@ def find_valid_patches(label_arrays,
         )
     
     # Outer progress bar for volumes
+    if channel_selectors is not None and len(channel_selectors) != len(label_arrays):
+        raise ValueError("channel_selectors must match number of label arrays")
+
     for vol_idx, (label_array, label_name) in enumerate(tqdm(
         zip(label_arrays, label_names), 
         total=len(label_arrays),
@@ -167,11 +243,15 @@ def find_valid_patches(label_arrays,
         position=0
     )):
         print(f"\nProcessing volume '{label_name}' ({vol_idx + 1}/{len(label_arrays)})")
-        
+
+        selector = None
+        if channel_selectors is not None:
+            selector = channel_selectors[vol_idx]
+
         # Access the appropriate resolution level for patch finding
         actual_downsample_factor = downsample_factor
         actual_downsampled_patch_size = downsampled_patch_size
-        
+
         try:
             if downsample_level == 0:
                 # Use full resolution
@@ -198,9 +278,10 @@ def find_valid_patches(label_arrays,
             actual_downsampled_patch_size = patch_size
             print(f"Using full resolution for {label_name} (patch size {actual_downsampled_patch_size})")
         
-        # Check if data is 2D or 3D
-        is_2d = len(downsampled_array.shape) == 2
-        
+        # Check if data is 2D or 3D based on patch dimensionality
+        spatial_ndim = len(actual_downsampled_patch_size)
+        is_2d = spatial_ndim == 2
+
         # Adjust patch size for 2D data if needed
         if is_2d and len(actual_downsampled_patch_size) == 3:
             # For 2D data with 3D patch size, use last 2 dimensions
@@ -211,8 +292,9 @@ def find_valid_patches(label_arrays,
             # For 2D data, we only have y and x dimensions
             vol_min_y = min_y // actual_downsample_factor if min_y is not None else 0
             vol_min_x = min_x // actual_downsample_factor if min_x is not None else 0
-            vol_max_y = downsampled_array.shape[0] if max_y is None else max_y // actual_downsample_factor
-            vol_max_x = downsampled_array.shape[1] if max_x is None else max_x // actual_downsample_factor
+            spatial_shape = downsampled_array.shape[:2]
+            vol_max_y = spatial_shape[0] if max_y is None else max_y // actual_downsample_factor
+            vol_max_x = spatial_shape[1] if max_x is None else max_x // actual_downsample_factor
             
             # Generate possible start positions for 2D data
             dpY, dpX = actual_downsampled_patch_size[-2:]  # Take last two dimensions
@@ -227,9 +309,10 @@ def find_valid_patches(label_arrays,
             vol_min_z = min_z // actual_downsample_factor if min_z is not None else 0
             vol_min_y = min_y // actual_downsample_factor if min_y is not None else 0
             vol_min_x = min_x // actual_downsample_factor if min_x is not None else 0
-            vol_max_z = downsampled_array.shape[0] if max_z is None else max_z // actual_downsample_factor
-            vol_max_y = downsampled_array.shape[1] if max_y is None else max_y // actual_downsample_factor
-            vol_max_x = downsampled_array.shape[2] if max_x is None else max_x // actual_downsample_factor
+            spatial_shape = downsampled_array.shape[:3]
+            vol_max_z = spatial_shape[0] if max_z is None else max_z // actual_downsample_factor
+            vol_max_y = spatial_shape[1] if max_y is None else max_y // actual_downsample_factor
+            vol_max_x = spatial_shape[2] if max_x is None else max_x // actual_downsample_factor
             
             # Generate possible start positions for this volume (at downsampled resolution)
             dpZ, dpY, dpX = actual_downsampled_patch_size
@@ -260,7 +343,8 @@ def find_valid_patches(label_arrays,
                         downsampled_array,
                         actual_downsampled_patch_size,
                         bbox_threshold,  # pass bounding box threshold
-                        label_threshold  # pass label fraction threshold
+                        label_threshold,  # pass label fraction threshold
+                        selector,
                     )
                 )
                 for chunk in position_chunks

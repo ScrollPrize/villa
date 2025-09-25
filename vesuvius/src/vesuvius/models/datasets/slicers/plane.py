@@ -5,13 +5,14 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 from vesuvius.utils.utils import pad_or_crop_2d, pad_or_crop_3d
 
 from ..find_valid_patches import bounding_box_volume, compute_bounding_box_3d
+from ..mesh.handles import MeshHandle
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class PlaneSliceVolume:
     name: str
     image: object
     labels: Dict[str, Optional[object]]
+    meshes: Mapping[str, MeshHandle] = field(default_factory=dict)
     _image_cache: Optional[np.ndarray] = field(default=None, init=False, repr=False)
     _label_cache: Dict[str, Optional[np.ndarray]] = field(default_factory=dict, init=False, repr=False)
 
@@ -70,6 +72,7 @@ class PlaneSliceResult:
     is_unlabeled: bool
     plane_mask: Optional[np.ndarray]
     patch_info: Dict[str, object]
+    meshes: Dict[str, Dict[str, object]] = field(default_factory=dict)
 
 
 class PlaneSlicer:
@@ -1061,6 +1064,14 @@ class PlaneSlicer:
             patch_size=patch_size,
         )
 
+        mesh_payloads: Dict[str, Dict[str, object]] = {}
+        for mesh_id, handle in volume.meshes.items():
+            payload = handle.read()
+            mesh_payloads[mesh_id] = {
+                "payload": payload,
+                "metadata": handle.metadata,
+            }
+
         result = PlaneSliceResult(
             image=img_patch,
             labels=label_patches,
@@ -1091,6 +1102,16 @@ class PlaneSlicer:
                     for name, handle in volume.labels.items()
                 },
             },
+            meshes=mesh_payloads,
         )
+
+        if mesh_payloads:
+            result.patch_info['meshes'] = {
+                mesh_id: {
+                    "path": str(handle.path),
+                    "source_volume": handle.metadata.source_volume_id,
+                }
+                for mesh_id, handle in volume.meshes.items()
+            }
 
         return result

@@ -77,7 +77,7 @@ Additionally, the augmentations provided within this package are from another of
 
 Copying the modules directly into `vesuvius` was a choice of end-user friendliness, as we were using highly modified branches of both libraries, which created conflicts if an end user were to attempt to run any of our models.
 
-_**Detailed documentation for training and inference are located in [the docs folder](src/vesuvius/docs)**_
+_**Detailed documentation for training and inference are located in [the docs folder](docs/docs)**_
 ___
 
 
@@ -91,7 +91,7 @@ ___
 6. Infer on the same layer, or another by importing an image, selecting it in the inference widget, and hitting `Run Inference`
 
 
-![alt text](src/vesuvius/docs/images/napari_trainer.png)
+![alt text](docs/docs/images/napari_trainer.png)
 
 ___
 
@@ -105,7 +105,7 @@ ___
 6. Skip patches or continue with `spacebar` or `next pair`
 7. Patches are saved in the output dir, and their locations in the .json progress file
 
-![alt text](src/vesuvius/docs/images/proofreader.png)
+![alt text](docs/docs/images/proofreader.png)
 
 ### Training with `vesuvius.train`
 
@@ -156,7 +156,7 @@ Training will run for 1,000 epochs by default, with 200 batches/epoch. This can 
 
 ### Running inference with `vesuvius.inference_pipeline`
 
-Detailed documentation is available in [the inference readme](src/vesuvius/docs/inference.md)
+Detailed documentation is available in [the inference readme](docs/docs/inference.md)
 
 The inference script used here is unfortunately (by necessity) quite convoluted. It **stores a very large amount of intermediate data** , in the form of float16 logits from patches. In the case that you do not have a lot of storage space, it might make sense to borrow some of the functions from the inferer, and rewrite the inference process to write directly to uint8 final arrays.
 

@@ -33,15 +33,26 @@ class ConfigManager:
         self.model_config = config.get("model_config", {}) 
         self.dataset_config = config.get("dataset_config", {})
 
-        # Load targets from dataset_config or model_config if available
-        self.targets = self.dataset_config.get("targets", {})
-        if not self.targets and "targets" in self.model_config:
-            self.targets = self.model_config.get("targets", {})
+        data_path_cfg = self.dataset_config.get("data_path")
+        if data_path_cfg is None:
+            self.data_path = config_path.parent.resolve()
+        else:
+            candidate = Path(data_path_cfg)
+            if not candidate.is_absolute():
+                candidate = (config_path.parent / candidate).resolve()
+            self.data_path = candidate
 
-        # Set default out_channels to 2 if not specified
-        for target_name, target_info in self.targets.items():
-            if 'out_channels' not in target_info and 'channels' not in target_info:
-                target_info['out_channels'] = 2
+        # Load targets from dataset_config or model_config if available
+        raw_targets = self.dataset_config.get("targets") or {}
+        if not raw_targets and "targets" in self.model_config:
+            raw_targets = self.model_config.get("targets") or {}
+
+        self.targets = {}
+        for target_name, target_info in raw_targets.items():
+            info_dict = dict(target_info or {})
+            if 'out_channels' not in info_dict and 'channels' not in info_dict:
+                info_dict['out_channels'] = 2
+            self.targets[target_name] = info_dict
 
         # Load inference parameters directly
         infer_config = config.get("inference_config", {})
@@ -99,6 +110,16 @@ class ConfigManager:
         ### Dataset config ###
         self.min_labeled_ratio = float(self.dataset_config.get("min_labeled_ratio", 0.10))
         self.min_bbox_percent = float(self.dataset_config.get("min_bbox_percent", 0.95))
+
+        mesh_cfg = self.dataset_config.get("meshes", {}) or {}
+        allow_unlabeled_cfg = self.dataset_config.get("allow_unlabeled_data")
+        if allow_unlabeled_cfg is None:
+            allow_unlabeled_cfg = self.dataset_config.get("allow_unlabeled")
+        if allow_unlabeled_cfg is None and mesh_cfg.get("enabled"):
+            allow_unlabeled_cfg = True
+        self.allow_unlabeled_data = bool(allow_unlabeled_cfg)
+        if allow_unlabeled_cfg is not None:
+            self.dataset_config["allow_unlabeled_data"] = bool(allow_unlabeled_cfg)
 
         # Skip patch validation -- consider all possible patch positions as valid
         self.skip_patch_validation = bool(self.dataset_config.get("skip_patch_validation", False))

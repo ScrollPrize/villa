@@ -224,6 +224,7 @@ class SmearTransform(ImageOnlyTransform):
         self.alpha = alpha
         self.num_prev_slices = num_prev_slices
         self.smear_axis = smear_axis
+        self._skip_when_vector = True
 
     def get_parameters(self, **data_dict) -> dict:
         # No extra parameters are needed.
