@@ -16,7 +16,7 @@
 #include <tiffio.h>
 #include <mutex>
 #include <cmath>
-
+#include <set>
 
 namespace po = boost::program_options;
 
@@ -32,6 +32,38 @@ struct AffineTransform {
         matrix = cv::Mat_<double>::eye(4, 4);
     }
 };
+
+/**
+ * @brief Invert an affine transform in-place.
+ *        M = [A | t; 0 0 0 1]  ->  M^{-1} = [A^{-1} | -A^{-1} t; 0 0 0 1]
+ * @return bool True on success, false if A is non-invertible.
+ */
+static inline bool invertAffineInPlace(AffineTransform& T)
+{
+    cv::Mat A_cv(3, 3, CV_64F);
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            A_cv.at<double>(r, c) = T.matrix(r, c);
+
+    cv::Mat Ainv_cv;
+    double det = cv::invert(A_cv, Ainv_cv, cv::DECOMP_LU);
+    if (det < 1e-10) {
+        return false;
+    }
+    cv::Matx33d Ainv;
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            Ainv(r, c) = Ainv_cv.at<double>(r, c);
+    const cv::Vec3d t(T.matrix(0,3), T.matrix(1,3), T.matrix(2,3));
+    const cv::Vec3d tinv = -(Ainv * t);
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) T.matrix(r, c) = Ainv(r, c);
+        T.matrix(r, 3) = tinv(r);
+    }
+    T.matrix(3,0) = 0.0; T.matrix(3,1) = 0.0; T.matrix(3,2) = 0.0; T.matrix(3,3) = 1.0;
+    return true;
+}
+
 
 /**
  * @brief Load affine transform from file (JSON)
@@ -84,6 +116,56 @@ AffineTransform loadAffineTransform(const std::string& filename) {
     return transform;
 }
 
+/**
+ * @brief Compose two affines: result = B * A (apply A first, then B)
+ */
+static inline AffineTransform composeAffine(const AffineTransform& A, const AffineTransform& B)
+{
+    AffineTransform R;
+    cv::Mat tmp = B.matrix * A.matrix; // left-multiply: row-vector convention used in code
+    tmp.copyTo(R.matrix);
+    return R;
+}
+
+/**
+ * @brief Pretty-print a 4x4 matrix to stdout.
+ */
+static inline void printMat4x4(const cv::Mat_<double>& M, const char* header)
+{
+    if (header) std::cout << header << "\n";
+    std::cout.setf(std::ios::fixed); std::cout << std::setprecision(6);
+    for (int r = 0; r < 4; ++r) {
+        std::cout << "  [";
+        for (int c = 0; c < 4; ++c) {
+            std::cout << std::setw(12) << M(r,c);
+            if (c < 3) std::cout << ", ";
+        }
+        std::cout << "]\n";
+    }
+    std::cout.unsetf(std::ios::floatfield);
+}
+
+/**
+ * @brief Parse an affine spec string possibly ending with an inversion hint.
+ *        Accepted suffixes: :inv, :invert, :i  (e.g., "path/to/A.json:inv").
+ *        Only the trailing token is interpreted, so Windows "C:\..." paths are safe.
+ */
+
+static inline std::pair<std::string, bool> parseAffineSpec(const std::string& spec)
+{
+    std::string path = spec;
+    bool inv = false;
+    const std::vector<std::string> suffixes = {":inv", ":invert", ":i"};
+    for (const auto& suffix : suffixes) {
+        if (spec.size() > suffix.size() &&
+            spec.substr(spec.size() - suffix.size()) == suffix) {
+            inv = true;
+            path = spec.substr(0, spec.size() - suffix.size());
+            break;
+        }
+    }
+    return {path, inv};
+}
 
 
 /**
@@ -502,10 +584,18 @@ int main(int argc, char *argv[])
             "Crop region width (0 = no crop)")
         ("crop-height", po::value<int>()->default_value(0),
             "Crop region height (0 = no crop)")
+        // Multi-affine interface (preferred):
+        ("affine", po::value<std::vector<std::string>>()->multitoken()->composing(),
+            "One or more affine JSON files, in application order (first listed applies first). "
+            "You may append :inv / :invert / :i to a spec to invert that transform (e.g., --affine A.json:inv). "
+            "Key in JSON: 'transformation_matrix' (3x4 or 4x4).")
+        ("affine-invert", po::value<std::vector<int>>()->multitoken()->composing(),
+            "0-based indices into --affine to invert before composing (e.g., --affine-invert 0 2).")
+        // Backward-compatible single-affine options (deprecated):
         ("affine-transform", po::value<std::string>(),
-            "Path to affine transform file (JSON; key 'transformation_matrix' 3x4 or 4x4)")
+            "[DEPRECATED] Single affine JSON; prefer --affine. Key 'transformation_matrix' (3x4 or 4x4).")
         ("invert-affine", po::bool_switch()->default_value(false),
-            "Invert the given affine before applying (useful if JSON is voxel->world)")
+            "[DEPRECATED] Invert the single --affine-transform.")
         ("scale-segmentation", po::value<float>()->default_value(1.0),
             "Scale segmentation to target scale")
         ("rotate", po::value<double>()->default_value(0.0),
@@ -574,69 +664,70 @@ int main(int argc, char *argv[])
     float scale_seg = parsed["scale-segmentation"].as<float>();
 
     double rotate_angle = parsed["rotate"].as<double>();
-    const bool invert_affine = parsed["invert-affine"].as<bool>();
     int flip_axis = parsed["flip"].as<int>();
     const bool include_tifs = parsed["include-tifs"].as<bool>();
 
     AffineTransform affineTransform;
     bool hasAffine = false;
     
-    if (parsed.count("affine-transform") > 0) {
-        std::string affineFile = parsed["affine-transform"].as<std::string>();
-        try {
-            affineTransform = loadAffineTransform(affineFile);
-            hasAffine = true;
-            std::cout << "Loaded affine transform from: " << affineFile << std::endl;
-            if (invert_affine) {
-                // Invert [A | t; 0 0 0 1] robustly using the 3x3 block inverse.
-                // NOTE: checking inv.empty() never catches singular matrices.
-                cv::Matx33d A(
-                    affineTransform.matrix(0,0), affineTransform.matrix(0,1), affineTransform.matrix(0,2),
-                    affineTransform.matrix(1,0), affineTransform.matrix(1,1), affineTransform.matrix(1,2),
-                    affineTransform.matrix(2,0), affineTransform.matrix(2,1), affineTransform.matrix(2,2)
-                );
-                cv::Vec3d t(
-                    affineTransform.matrix(0,3),
-                    affineTransform.matrix(1,3),
-                    affineTransform.matrix(2,3)
-                );
-
-                cv::Mat A_cv(3,3,CV_64F);
-                for (int r = 0; r < 3; ++r)
-                    for (int c = 0; c < 3; ++c)
-                        A_cv.at<double>(r,c) = A(r,c);
-
-                cv::Mat Ainv_cv;
-                const bool ok = cv::invert(A_cv, Ainv_cv, cv::DECOMP_SVD);
-                if (!ok) {
-                    std::cerr << "Error: affine linear part is non-invertible.\n";
-                    return EXIT_FAILURE;
-                }
-
-                cv::Matx33d Ainv;
-                for (int r = 0; r < 3; ++r)
-                    for (int c = 0; c < 3; ++c)
-                        Ainv(r,c) = Ainv_cv.at<double>(r,c);
-
-                const cv::Vec3d tinv = -(Ainv * t);
-
-                // Write back [A^{-1} | -A^{-1}t ; 0 0 0 1]
-                for (int r = 0; r < 3; ++r) {
-                    for (int c = 0; c < 3; ++c)
-                        affineTransform.matrix(r,c) = Ainv(r,c);
-                    affineTransform.matrix(r,3) = tinv(r);
-                }
-                affineTransform.matrix(3,0) = 0.0;
-                affineTransform.matrix(3,1) = 0.0;
-                affineTransform.matrix(3,2) = 0.0;
-                affineTransform.matrix(3,3) = 1.0;
-
-                std::cout << "Note: Inverting affine as requested (--invert-affine)." << std::endl;
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "Error loading affine transform: " << e.what() << std::endl;
-            return EXIT_FAILURE;
+    // --- New multi-affine loading & composition ---
+    std::vector<std::pair<std::string,bool>> affineSpecs; // (path, invert?)
+    if (parsed.count("affine") > 0) {
+        for (const auto& s : parsed["affine"].as<std::vector<std::string>>()) {
+            affineSpecs.emplace_back(parseAffineSpec(s));
         }
+    }
+    // Back-compat: single --affine-transform [--invert-affine]
+    if (parsed.count("affine-transform") > 0) {
+        const std::string singlePath = parsed["affine-transform"].as<std::string>();
+        const bool singleInv = parsed["invert-affine"].as<bool>();
+        affineSpecs.emplace_back(singlePath, singleInv);
+        std::cout << "[deprecated] Using --affine-transform"
+                  << (singleInv ? " (with inversion)" : "") << "; prefer --affine.\n";
+    }
+    // Optional index-based inversion flags for --affine
+    if (parsed.count("affine-invert") > 0 && !affineSpecs.empty()) {
+        std::set<int> idxInv;
+        for (int idx : parsed["affine-invert"].as<std::vector<int>>()) {
+            if (idx < 0 || idx >= static_cast<int>(affineSpecs.size())) {
+                std::cerr << "Error: --affine-invert index " << idx
+                          << " out of range [0.." << (affineSpecs.size()-1) << "].\n";
+                return EXIT_FAILURE;
+            }
+            idxInv.insert(idx);
+        }
+        int k = 0;
+        for (auto& spec : affineSpecs) {
+            if (idxInv.count(k)) spec.second = true;
+            ++k;
+        }
+    }
+    // Load, optionally invert, then compose (first listed applies first)
+    if (!affineSpecs.empty()) {
+        AffineTransform composed; // identity
+        int k = 0;
+        for (const auto& [path, invertFlag] : affineSpecs) {
+            try {
+                AffineTransform T = loadAffineTransform(path);
+                std::cout << "Loaded affine[" << k << "]: " << path
+                          << (invertFlag ? " (invert)" : "") << std::endl;
+                if (invertFlag) {
+                    if (!invertAffineInPlace(T)) {
+                        std::cerr << "Error: affine[" << k << "] has non-invertible linear part.\n";
+                        return EXIT_FAILURE;
+                    }
+                }
+                composed = composeAffine(composed, T);
+                ++k;
+            } catch (const std::exception& e) {
+                std::cerr << "Error loading affine[" << k << "]: " << e.what() << std::endl;
+                return EXIT_FAILURE;
+
+            }
+        }
+        hasAffine = true;
+        affineTransform = composed;
+        printMat4x4(affineTransform.matrix, "Final composed affine (applied to points first):");
     }
     
     z5::filesystem::handle::Group group(vol_path, z5::FileMode::FileMode::r);
