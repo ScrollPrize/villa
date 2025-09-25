@@ -86,8 +86,10 @@ jobs:
         run: |
           mkdir -p ~/.ccache
           echo 'max_size = 2G' >> ~/.ccache/ccache.conf || true
-          echo "CC='ccache gcc'"  >> $GITHUB_ENV
-          echo "CXX='ccache g++'" >> $GITHUB_ENV
+
+          echo "CC=ccache gcc"  >> $GITHUB_ENV
+          echo "CXX=ccache g++" >> $GITHUB_ENV
+
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
