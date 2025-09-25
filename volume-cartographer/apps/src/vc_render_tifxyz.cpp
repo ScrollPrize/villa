@@ -150,20 +150,23 @@ static inline void printMat4x4(const cv::Mat_<double>& M, const char* header)
  *        Accepted suffixes: :inv, :invert, :i  (e.g., "path/to/A.json:inv").
  *        Only the trailing token is interpreted, so Windows "C:\..." paths are safe.
  */
+
 static inline std::pair<std::string, bool> parseAffineSpec(const std::string& spec)
 {
     std::string path = spec;
     bool inv = false;
-    const auto pos = spec.rfind(':');
-    if (pos != std::string::npos && pos + 1 < spec.size()) {
-        std::string suffix = spec.substr(pos + 1);
-        if (suffix == "inv" || suffix == "invert" || suffix == "i") {
+    const std::vector<std::string> suffixes = {":inv", ":invert", ":i"};
+    for (const auto& suffix : suffixes) {
+        if (spec.size() > suffix.size() &&
+            spec.substr(spec.size() - suffix.size()) == suffix) {
             inv = true;
-            path = spec.substr(0, pos);
+            path = spec.substr(0, spec.size() - suffix.size());
+            break;
         }
     }
     return {path, inv};
 }
+
 
 /**
  * @brief Apply affine transform to a single point
