@@ -207,5 +207,4 @@ jobs:
 
       - name: Inspect resulting image
         run: |
-          TAG=$(echo "$DOCKER_METADATA_OUTPUT_JSON" | jq -r '.tags[0]')
-          docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${TAG}
+          docker buildx imagetools inspect "${{ env.REGISTRY_IMAGE }}:${DOCKER_METADATA_OUTPUT_VERSION}"
