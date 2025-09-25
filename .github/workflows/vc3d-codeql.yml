@@ -1,7 +1,12 @@
-name: "CodeQL"
+name: CodeQL
 
 on:
   pull_request:
+    paths:
+      - 'volume-cartographer/**'
+      - '.github/workflows/vc3d-codeql.yml'
+  push:
+    branches: [ main ]  # scan after merge too
     paths:
       - 'volume-cartographer/**'
       - '.github/workflows/vc3d-codeql.yml'
@@ -13,46 +18,96 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
-  analyze:
-    name: Analyze
+  # ⚡ Fast PR scan: no compile, quick feedback
+  analyze_fast:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL (no build)
+        uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          build-mode: none
+          queries: +security-extended
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:c-cpp"
+
+  # 🧪 Deep scan for push/schedule: compiles with fast settings
+  analyze_deep:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     permissions:
-       # required for all workflows
       security-events: write
-      # required to fetch internal or private CodeQL packs
+      contents: read
       packages: read
     defaults:
       run:
         working-directory: ./volume-cartographer
-
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # history-aware queries if needed
 
-      - name: Install requirements
+      - name: Install build deps
         run: |
-          sudo apt-get -y update
-          sudo apt-get -y install build-essential git cmake 
-          sudo apt-get -y install qt6-base-dev libboost-system-dev libboost-program-options-dev 
-          sudo apt-get -y install libceres-dev xtensor-dev libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev 
-          sudo apt-get -y install libgsl-dev libsdl2-dev libcurl4-openssl-dev
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git cmake ninja-build ccache \
+            qt6-base-dev libboost-system-dev libboost-program-options-dev \
+            libceres-dev xtensor-dev libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev \
+            libgsl-dev libsdl2-dev libcurl4-openssl-dev
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('**/CMakeLists.txt','**/*.cmake') }}
+          restore-keys: ccache-${{ runner.os }}-
+
+      - name: Enable ccache
+        run: |
+          mkdir -p ~/.ccache
+          echo 'max_size = 2G' >> ~/.ccache/ccache.conf || true
+
+          echo "CC=ccache gcc"  >> $GITHUB_ENV
+          echo "CXX=ccache g++" >> $GITHUB_ENV
+
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
           languages: c-cpp
           build-mode: manual
+          queries: +security-extended,+security-and-quality
 
-      - name: Build
-        shell: bash
+      - name: Configure (Ninja, fast flags)
         run: |
-          cmake -S . -B build/ -DVC_WITH_CUDA_SPARSE=off
-          make -C build/ -j$(nproc --all) --no-print-directory
+          cmake -S . -B build -G Ninja \
+                -DVC_WITH_CUDA_SPARSE=off \
+                -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Debug
 
-      - name: Perform CodeQL Analysis
+      - name: Build (fast)
+        run: cmake --build build --parallel
+
+      - name: Analyze
         uses: github/codeql-action/analyze@v3
         with:
           category: "/language:c-cpp"
