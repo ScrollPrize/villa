@@ -97,7 +97,7 @@ jobs:
 
   build_arm64:
     name: Build & Push Image (arm64)
-    runs-on: ubuntu-24.04-arm64
+    runs-on: ubuntu-24.04-arm
     needs: prepare
     env:
       REGISTRY_IMAGE_LC: ${{ needs.prepare.outputs.registry_image_lc }}
