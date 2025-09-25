@@ -183,7 +183,7 @@ void CWindow::onRenderSegment(const std::string& segmentId)
     statusBar()->showMessage(tr("Rendering segment: %1").arg(QString::fromStdString(segmentId)), 5000);
 }
 
-void CWindow::onSlimFlattenAndRender(const std::string& segmentId)
+void CWindow::onSlimFlatten(const std::string& segmentId)
 {
     auto surfMeta = fVpkg ? fVpkg->getSurface(segmentId) : nullptr;
     if (currentVolume == nullptr || !surfMeta) {
@@ -231,7 +231,7 @@ void CWindow::onSlimFlattenAndRender(const std::string& segmentId)
         }
     }
 
-    // 2) SLIM via python: python /src/scripts/flatboi.py <obj> 60
+    // 2) SLIM via python: python /src/scripts/flatboi.py <obj> 20
     statusBar()->showMessage(tr("Running SLIM (flatboi.py)…"), 0);
     {
         const QString py = resolvePythonPath();
@@ -242,7 +242,7 @@ void CWindow::onSlimFlattenAndRender(const std::string& segmentId)
             return;
         }
         QString err;
-        if (!runProcessBlocking(py, QStringList() << script << objPath << "60", segDir, nullptr, &err)) {
+        if (!runProcessBlocking(py, QStringList() << script << objPath << "20", segDir, nullptr, &err)) {
             QMessageBox::critical(this, tr("Error"), tr("flatboi.py failed.\n\n%1").arg(err));
             statusBar()->showMessage(tr("SLIM-flatten failed"), 5000);
             return;
@@ -268,27 +268,27 @@ void CWindow::onSlimFlattenAndRender(const std::string& segmentId)
     }
 
     // 4) render the *_flatboi folder
-    if (!initializeCommandLineRunner()) {
-        QMessageBox::critical(this, tr("Error"), tr("Failed to initialize command runner."));
-        return;
-    }
-    if (_cmdRunner->isRunning()) {
-        QMessageBox::warning(this, tr("Warning"), tr("A command line tool is already running."));
-        return;
-    }
-    {
-        QString outputFormat = "%s/layers/%02d.tif";
-        float scale = 1.0f;
-        int resolution = 0;
-        int layers = 31;
-        const QString outPattern = outputFormat.replace("%s", outTifxyz);
+    //if (!initializeCommandLineRunner()) {
+    //    QMessageBox::critical(this, tr("Error"), tr("Failed to initialize command runner."));
+    //    return;
+    //}
+    //if (_cmdRunner->isRunning()) {
+    //    QMessageBox::warning(this, tr("Warning"), tr("A command line tool is already running."));
+    //    return;
+    //}
+    //{
+    //   QString outputFormat = "%s/layers/%02d.tif";
+    //    float scale = 1.0f;
+    //    int resolution = 0;
+    //    int layers = 31;
+    //    const QString outPattern = outputFormat.replace("%s", outTifxyz);
 
-        _cmdRunner->setSegmentPath(outTifxyz);
-        _cmdRunner->setOutputPattern(outPattern);
-        _cmdRunner->setRenderParams(scale, resolution, layers);
-        _cmdRunner->execute(CommandLineToolRunner::Tool::RenderTifXYZ);
-        statusBar()->showMessage(tr("Rendering flattened segment…"), 0);
-    }
+    //    _cmdRunner->setSegmentPath(outTifxyz);
+    //    _cmdRunner->setOutputPattern(outPattern);
+    //    _cmdRunner->setRenderParams(scale, resolution, layers);
+    //    _cmdRunner->execute(CommandLineToolRunner::Tool::RenderTifXYZ);
+    //    statusBar()->showMessage(tr("Rendering flattened segment…"), 0);
+    //}
 }
 
 
