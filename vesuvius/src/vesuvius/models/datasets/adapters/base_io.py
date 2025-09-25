@@ -11,6 +11,8 @@ from typing import Dict, Iterator, Mapping, MutableMapping, Optional, Sequence, 
 
 import numpy as np
 
+from vesuvius.utils.io.zarr_utils import _is_ome_zarr
+
 
 @dataclass(frozen=True)
 class AdapterConfig:
@@ -153,6 +155,7 @@ class ZarrArrayHandle(ArrayHandle):
         super().__init__(path, spatial_shape=spatial_shape, dtype=getattr(array, "dtype", np.float32))
         self._spatial_ndim = len(self._spatial_shape)
         self._orientation, self._extra_shape = self._infer_orientation(self._shape, self._spatial_shape)
+        self._raw_cache = None
 
     def read(self) -> np.ndarray:
         data = np.asarray(self._array[...], dtype=self._dtype)
@@ -169,7 +172,23 @@ class ZarrArrayHandle(ArrayHandle):
         return np.ascontiguousarray(data)
 
     def raw(self):  # pragma: no cover - simple accessor
-        return self._array
+        if self._raw_cache is not None:
+            return self._raw_cache
+
+        # When backed by an OME-Zarr store, expose the root group so downstream
+        # utilities can access multiple resolution levels (e.g., for patch search).
+        try:
+            if _is_ome_zarr(self._path):
+                import zarr
+
+                self._raw_cache = zarr.open(self._path, mode="r")
+                return self._raw_cache
+        except Exception:
+            # Fallback to the level-specific array if we cannot re-open the root
+            pass
+
+        self._raw_cache = self._array
+        return self._raw_cache
 
     def _expand_region(self, base_region: Tuple[slice, ...]) -> Tuple[slice, ...]:
         ndim = getattr(self._array, 'ndim', len(base_region))

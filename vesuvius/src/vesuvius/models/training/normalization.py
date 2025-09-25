@@ -158,57 +158,78 @@ class RobustNormalization(ImageNormalization):
         Apply robust normalization using median and MAD.
         """
         image = image.astype(self.target_dtype, copy=False)
-        
+
         # Compute robust statistics
         if self.use_mask_for_norm is not None and self.use_mask_for_norm and mask is not None:
             mask_bool = mask > 0
             valid_data = image[mask_bool]
         else:
             valid_data = image.ravel()
-        
+
         # Skip if no valid data
         if len(valid_data) == 0:
             return image
-        
+
+        # Record basic stats before any clipping so we can fall back if MAD collapses
+        std_preclip = float(np.std(valid_data))
+        min_preclip = float(np.min(valid_data))
+        max_preclip = float(np.max(valid_data))
+
         # Clip to percentiles if requested
+        lower_val = upper_val = None
         if self.clip_values and len(valid_data) > 0:
-            lower_val = np.percentile(valid_data, self.percentile_lower)
-            upper_val = np.percentile(valid_data, self.percentile_upper)
-            image = np.clip(image, lower_val, upper_val)
-            
+            lower_val = float(np.percentile(valid_data, self.percentile_lower))
+            upper_val = float(np.percentile(valid_data, self.percentile_upper))
+            np.clip(image, lower_val, upper_val, out=image)
+
             # Recompute valid_data after clipping
             if self.use_mask_for_norm is not None and self.use_mask_for_norm and mask is not None:
                 valid_data = image[mask_bool]
             else:
                 valid_data = image.ravel()
-        
+
         # Compute median
-        median = np.median(valid_data)
-        
+        median = float(np.median(valid_data))
+
         # Compute MAD (Median Absolute Deviation)
-        mad = np.median(np.abs(valid_data - median))
-        
+        mad = float(np.median(np.abs(valid_data - median)))
+
         # Scale MAD to be comparable to standard deviation
         # For normal distribution, std ≈ 1.4826 * MAD
         scaled_mad = 1.4826 * mad
-        
+
         # Avoid division by zero
-        if scaled_mad < 1e-8:
-            # If MAD is too small, fall back to percentile-based scaling
-            if len(valid_data) > 0:
-                p75 = np.percentile(valid_data, 75)
-                p25 = np.percentile(valid_data, 25)
-                iqr = p75 - p25
-                scaled_mad = max(iqr / 1.35, 1e-8)  # IQR to std approximation
+        if not np.isfinite(scaled_mad) or scaled_mad < 1e-6:
+            percentile_span = None
+            if lower_val is not None and upper_val is not None:
+                percentile_span = upper_val - lower_val
             else:
+                percentile_span = max_preclip - min_preclip
+
+            fallback_candidates = []
+            if np.isfinite(std_preclip):
+                fallback_candidates.append(abs(std_preclip))
+            if percentile_span is not None and np.isfinite(percentile_span):
+                fallback_candidates.append(abs(percentile_span) / 2.0)
+
+            scaled_mad = None
+            for candidate in fallback_candidates:
+                if candidate >= 1e-6:
+                    scaled_mad = candidate
+                    break
+
+            if scaled_mad is None or not np.isfinite(scaled_mad):
                 scaled_mad = 1.0
-        
+
         # Apply normalization
         if self.use_mask_for_norm is not None and self.use_mask_for_norm and mask is not None:
             image[mask_bool] = (image[mask_bool] - median) / scaled_mad
         else:
             image = (image - median) / scaled_mad
-            
+
+        # Ensure we never propagate NaNs/Infs downstream
+        np.nan_to_num(image, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
         return image
 
 
