@@ -46,7 +46,8 @@ static inline bool invertAffineInPlace(AffineTransform& T)
             A_cv.at<double>(r, c) = T.matrix(r, c);
 
     cv::Mat Ainv_cv;
-    if (!cv::invert(A_cv, Ainv_cv, cv::DECOMP_SVD)) {
+    double det = cv::invert(A_cv, Ainv_cv, cv::DECOMP_LU);
+    if (det < 1e-10) {
         return false;
     }
     cv::Matx33d Ainv;
