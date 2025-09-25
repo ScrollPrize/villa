@@ -39,7 +39,7 @@ jobs:
         with:
           languages: c-cpp
           build-mode: none
-          queries: +security-extended
+          queries: security-extended
 
       - name: Analyze
         uses: github/codeql-action/analyze@v3
@@ -96,7 +96,7 @@ jobs:
         with:
           languages: c-cpp
           build-mode: manual
-          queries: +security-extended,+security-and-quality
+          queries: security-extended,security-and-quality
 
       - name: Configure (Ninja, fast flags)
         run: |
