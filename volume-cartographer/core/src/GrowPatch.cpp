@@ -136,10 +136,34 @@ struct TraceParameters {
     cv::Mat_<cv::Vec3d> dpoints;
 };
 
+enum LossType {
+    DIST,
+    STRAIGHT,
+    DIRECTON,
+    SNAP,
+    NORMAL,
+    COUNT
+};
+
 struct LossSettings {
-    float w_snap = 0.1;
-    float w_normal = 1.0;
-    float w_straight = 0.2;
+    std::vector<float> w = std::vector<float>(LossType::COUNT, 0.0f);
+    std::vector<cv::Mat_<float>> w_mats = std::vector<cv::Mat_<float>>(LossType::COUNT);
+
+    LossSettings() {
+        w[LossType::SNAP] = 0.1f;
+        w[LossType::NORMAL] = 1.0f;
+        w[LossType::STRAIGHT] = 0.2f;
+        w[LossType::DIST] = 1.0f;
+        w[LossType::DIRECTON] = 1.0f;
+    }
+
+    float operator()(LossType type, const cv::Vec2i& p) const {
+        if (!w_mats[type].empty()) {
+            return w_mats[type](p);
+        }
+        return w[type];
+    }
+
     int z_min = -1;
     int z_max = std::numeric_limits<int>::max();
 };
@@ -158,7 +182,7 @@ void set_space_tracing_use_cuda(bool enable) {
 static int gen_straight_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &o1, const cv::Vec2i &o2, const cv::Vec2i &o3, TraceParameters &params, const LossSettings &settings);
 static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
-static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, float unit, const LossSettings &settings, float w = 1.0);
+static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, float unit, const LossSettings &settings);
 
 static bool loc_valid(int state)
 {
@@ -181,13 +205,13 @@ static int gen_straight_loss(ceres::Problem &problem, const cv::Vec2i &p, const 
     if (!coord_valid(params.state(p+o3)))
         return 0;
 
-    problem.AddResidualBlock(StraightLoss::Create(settings.w_straight), nullptr, &params.dpoints(p+o1)[0], &params.dpoints(p+o2)[0], &params.dpoints(p+o3)[0]);
+    problem.AddResidualBlock(StraightLoss::Create(settings(LossType::STRAIGHT, p)), nullptr, &params.dpoints(p+o1)[0], &params.dpoints(p+o2)[0], &params.dpoints(p+o3)[0]);
 
     return 1;
 }
 
 static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params,
-    float unit, const LossSettings &settings, float w)
+    float unit, const LossSettings &settings)
 {
     // Add a loss saying that dpoints(p) and dpoints(p+off) should themselves be distance |off| apart
     // Here dpoints is a 2D grid mapping surface-space points to 3D volume space
@@ -201,7 +225,7 @@ static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::
     if (params.dpoints(p)[0] == -1)
         throw std::runtime_error("invalid loc passed as valid!");
 
-    problem.AddResidualBlock(DistLoss::Create(unit*cv::norm(off),w), nullptr, &params.dpoints(p)[0], &params.dpoints(p+off)[0]);
+    problem.AddResidualBlock(DistLoss::Create(unit*cv::norm(off),settings(LossType::DIST, p)), nullptr, &params.dpoints(p)[0], &params.dpoints(p+off)[0]);
 
     return 1;
 }
@@ -233,11 +257,11 @@ static int set_loss_mask(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::
 }
 
 static int conditional_dist_loss(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint16_t> &loss_status,
-    ceres::Problem &problem, TraceParameters &params, float unit, const LossSettings &settings, float w = 1.0)
+    ceres::Problem &problem, TraceParameters &params, float unit, const LossSettings &settings)
 {
     int set = 0;
     if (!loss_mask(bit, p, off, loss_status))
-        set = set_loss_mask(bit, p, off, loss_status, gen_dist_loss(problem, p, off, params, unit, settings, w));
+        set = set_loss_mask(bit, p, off, loss_status, gen_dist_loss(problem, p, off, params, unit, settings));
     return set;
 };
 
@@ -274,13 +298,13 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TracePar
         // bool direction_aware = (i == 0); // XY plane
         bool direction_aware = false; // this is not that simple ...
         // Loss with p as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings.w_normal, settings.w_snap, direction_aware, settings.z_min, settings.z_max), nullptr, pA, pB1, pB2, pC);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), direction_aware, settings.z_min, settings.z_max), nullptr, pA, pB1, pB2, pC);
         // Loss with p_br as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings.w_normal, settings.w_snap, direction_aware, settings.z_min, settings.z_max), nullptr, pC, pB2, pB1, pA);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), direction_aware, settings.z_min, settings.z_max), nullptr, pC, pB2, pB1, pA);
         // Loss with p_tr as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings.w_normal, settings.w_snap, direction_aware, settings.z_min, settings.z_max), nullptr, pB1, pC, pA, pB2);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), direction_aware, settings.z_min, settings.z_max), nullptr, pB1, pC, pA, pB2);
         // Loss with p_bl as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings.w_normal, settings.w_snap, direction_aware, settings.z_min, settings.z_max), nullptr, pB2, pA, pC, pB1);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), direction_aware, settings.z_min, settings.z_max), nullptr, pB2, pA, pC, pB1);
         count += 4;
     }
 
@@ -356,7 +380,7 @@ static int gen_space_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<
 }
 
 int gen_direction_loss(ceres::Problem &problem, const cv::Vec2i &p, const int off_dist, cv::Mat_<uint8_t> &state,
-    cv::Mat_<cv::Vec3d> &loc, std::vector<DirectionField> const &direction_fields, float w = 1.f)
+    cv::Mat_<cv::Vec3d> &loc, std::vector<DirectionField> const &direction_fields)
 {
     // Add losses saying that the local basis vectors of the patch at loc(p) should match those of the given fields
 
@@ -371,15 +395,15 @@ int gen_direction_loss(ceres::Problem &problem, const cv::Vec2i &p, const int of
         if (field.direction == "horizontal") {
             if (!loc_valid(state(p_off_horz)))
                 continue;
-            problem.AddResidualBlock(FiberDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), w), nullptr, &loc(p)[0], &loc(p_off_horz)[0]);
+            problem.AddResidualBlock(FiberDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), LossType::DIRECTON), nullptr, &loc(p)[0], &loc(p_off_horz)[0]);
         } else if (field.direction == "vertical") {
             if (!loc_valid(state(p_off_vert)))
                 continue;
-            problem.AddResidualBlock(FiberDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), w), nullptr, &loc(p)[0], &loc(p_off_vert)[0]);
+            problem.AddResidualBlock(FiberDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), LossType::DIRECTON), nullptr, &loc(p)[0], &loc(p_off_vert)[0]);
         } else if (field.direction == "normal") {
             if (!loc_valid(state(p_off_horz)) || !loc_valid(state(p_off_vert)))
                 continue;
-            problem.AddResidualBlock(NormalDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), w), nullptr, &loc(p)[0], &loc(p_off_horz)[0], &loc(p_off_vert)[0]);
+            problem.AddResidualBlock(NormalDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), LossType::DIRECTON), nullptr, &loc(p)[0], &loc(p_off_horz)[0], &loc(p_off_vert)[0]);
         } else {
             assert(false);
         }
