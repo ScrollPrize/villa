@@ -2152,7 +2152,7 @@ void CWindow::onSurfaceContextMenuRequested(const QPoint& pos)
     // SLIM-flatten and render (calls slot implemented in CWindowContextMenu.cpp)
     QAction* slimFlattenAction = new QAction(tr("SLIM-flatten and render"), this);
     connect(slimFlattenAction, &QAction::triggered, [this, segmentId]() {
-        onSlimFlattenAndRender(segmentId);
+        onSlimFlatten(segmentId);
     });
 
     // AWS Upload
