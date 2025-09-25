@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Flatten a volumetric parchment region using predicted surface-frame vectors."""
+"""Flatten a volumetric parchment region using predicted surface-frame vectors.
+THIS IS A WIP , NOT TESTED, NOT GUARANTEED TO BE FUNCTIONAL"""
 
 from __future__ import annotations
 

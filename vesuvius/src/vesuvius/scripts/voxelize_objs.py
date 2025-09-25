@@ -5,6 +5,7 @@ import open3d as o3d
 import os
 import zarr
 import logging
+import json
 from glob import glob
 from itertools import repeat
 from numcodecs import Blosc
@@ -33,6 +34,106 @@ _DOWNSAMPLE_STATE = {}
 _DOWNSAMPLE_DATASETS = {}
 
 logger = logging.getLogger(__name__)
+
+
+def _axis_perm(order):
+    order = order.lower()
+    mapping = {"x": 0, "y": 1, "z": 2}
+    try:
+        perm = tuple(mapping[c] for c in order)
+    except KeyError as exc:
+        raise ValueError(f"Invalid axis label '{exc.args[0]}' in axis order '{order}'.") from exc
+    inv = [0, 0, 0]
+    for idx, axis in enumerate(perm):
+        inv[axis] = idx
+    return perm, tuple(inv)
+
+
+def load_transform_from_json(json_path):
+    with open(json_path, "r") as f:
+        data = json.load(f)
+
+    if "transformation_matrix" not in data:
+        raise ValueError("JSON file must contain 'transformation_matrix'.")
+
+    matrix = np.array(data["transformation_matrix"], dtype=np.float64)
+
+    if matrix.shape == (3, 4):
+        bottom = np.array([[0.0, 0.0, 0.0, 1.0]], dtype=np.float64)
+        matrix4 = np.vstack([matrix, bottom])
+    elif matrix.shape == (4, 4):
+        matrix4 = matrix
+        if not (np.allclose(matrix4[3, :3], 0.0) and np.isclose(matrix4[3, 3], 1.0)):
+            raise ValueError("Bottom row of affine matrix must be [0, 0, 0, 1].")
+    else:
+        raise ValueError(
+            "Transformation matrix must have shape 3x4 or 4x4 (row-major)."
+        )
+
+    return matrix4
+
+
+def _apply_affine_to_points(points, matrix4, perm):
+    if points.size == 0:
+        return points.astype(np.float64, copy=False)
+
+    points64 = np.asarray(points, dtype=np.float64)
+    points_ord = points64[:, perm]
+    ones = np.ones((points_ord.shape[0], 1), dtype=np.float64)
+    homog = np.concatenate([points_ord, ones], axis=1)
+    transformed_ord = (matrix4 @ homog.T).T[:, :3]
+    result = np.empty_like(points64)
+    result[:, perm] = transformed_ord
+    return result
+
+
+def _transform_normals_batch(normals, linear, perm, inv_transpose=None):
+    if normals.size == 0:
+        return normals.astype(np.float64, copy=False)
+
+    normals64 = np.asarray(normals, dtype=np.float64)
+    normals_ord = normals64[:, perm]
+
+    if inv_transpose is None:
+        try:
+            inv_transpose = np.linalg.inv(linear).T
+        except np.linalg.LinAlgError:
+            inv_transpose = None
+
+    if inv_transpose is not None:
+        transformed_ord = normals_ord @ inv_transpose.T
+    else:
+        transformed_ord = normals_ord @ linear.T
+
+    lengths = np.linalg.norm(transformed_ord, axis=1)
+    nonzero = lengths > 0
+    transformed_ord[nonzero] /= lengths[nonzero][:, None]
+    transformed_ord[~nonzero, :] = 0.0
+
+    result = np.empty_like(normals64)
+    result[:, perm] = transformed_ord
+    return result
+
+
+def _apply_affine_to_mesh(mesh, matrix4, perm, inv_transpose):
+    vertices = np.asarray(mesh.vertices)
+    if vertices.size:
+        transformed_vertices = _apply_affine_to_points(vertices, matrix4, perm)
+        mesh.vertices = o3d.utility.Vector3dVector(transformed_vertices)
+
+    linear = matrix4[:3, :3]
+
+    if mesh.has_vertex_normals() and len(mesh.vertex_normals) == len(mesh.vertices):
+        v_normals = np.asarray(mesh.vertex_normals)
+        transformed_normals = _transform_normals_batch(v_normals, linear, perm, inv_transpose)
+        mesh.vertex_normals = o3d.utility.Vector3dVector(transformed_normals)
+
+    if mesh.has_triangle_normals() and len(mesh.triangle_normals) == len(mesh.triangles):
+        t_normals = np.asarray(mesh.triangle_normals)
+        transformed_t_normals = _transform_normals_batch(
+            t_normals, linear, perm, inv_transpose
+        )
+        mesh.triangle_normals = o3d.utility.Vector3dVector(transformed_t_normals)
 
 
 def _set_slice_state(state):
@@ -76,7 +177,12 @@ def _write_slice_output_worker(zslice, label_img, normals_img, frame_img):
     state = _SLICE_STATE
     labels_ds, normals_ds, frame_ds = _get_worker_datasets()
 
-    slice_index = zslice - state["z_min"]
+    slice_index = int(zslice)
+    if slice_index < 0 or slice_index >= labels_ds.shape[0]:
+        raise ValueError(
+            f"Requested slice index {slice_index} is outside the allocated z range "
+            f"[0, {labels_ds.shape[0] - 1}]."
+        )
     labels_ds[slice_index, ...] = np.ascontiguousarray(label_img, dtype=labels_ds.dtype)
 
     if (
@@ -817,13 +923,27 @@ def build_pyramid(array, levels, axes):
     return outputs
 
 
-def process_mesh(mesh_path, mesh_index, include_normals, include_surface_frame):
+def process_mesh(
+    mesh_path,
+    mesh_index,
+    include_normals,
+    include_surface_frame,
+    transform_info,
+):
     """
     Load a mesh from disk, return (vertices, triangles, labels_for_those_triangles).
     We assign mesh_index+1 as the label.
     """
     print(f"Processing mesh: {mesh_path}")
     mesh = o3d.io.read_triangle_mesh(mesh_path)
+
+    if transform_info is not None:
+        _apply_affine_to_mesh(
+            mesh,
+            transform_info["matrix"],
+            transform_info["perm"],
+            transform_info.get("inv_transpose"),
+        )
 
     vertices = np.asarray(mesh.vertices, dtype=np.float32)
     triangles = np.asarray(mesh.triangles, dtype=np.int32)
@@ -1053,10 +1173,29 @@ def main():
     )
     parser.add_argument("folder",
                         help="Path to folder containing OBJ meshes (or parent folder with subfolders of OBJ meshes)")
-    parser.add_argument("--scroll", required=True,
-                        choices=["scroll1", "scroll2", "scroll3", "scroll4", "scroll5", "0500p2", "0139",
-                                 "343p_2um_116", "343p_9um"],
-                        help="Scroll shape to use (determines image dimensions)")
+    parser.add_argument(
+        "--spatial-shape",
+        required=True,
+        type=int,
+        nargs=3,
+        metavar=("Z", "X", "Y"),
+        help="Total output spatial shape as integers in the order (z, x, y)",
+    )
+    parser.add_argument(
+        "--transform",
+        help="Path to JSON file containing an affine transform (3x4 or 4x4, row-major)",
+    )
+    parser.add_argument(
+        "--transform-axis-order",
+        default="xyz",
+        choices=["xyz", "xzy", "yxz", "yzx", "zxy", "zyx"],
+        help="Axis order used by the affine transform definition (default: xyz)",
+    )
+    parser.add_argument(
+        "--transform-invert",
+        action="store_true",
+        help="Invert the provided affine before applying",
+    )
     parser.add_argument("--output_path", default="mesh_labels.zarr",
                         help="Path to the label OME-Zarr store (default: mesh_labels.zarr)")
     parser.add_argument("--num_workers", type=int, default=default_workers,
@@ -1082,6 +1221,48 @@ def main():
     if args.chunk_size < 0:
         print("ERROR: chunk_size must be non-negative.")
         sys.exit(1)
+
+    transform_info = None
+    if args.transform:
+        transform_path = args.transform
+        if not os.path.exists(transform_path):
+            print(f"ERROR: transform file '{transform_path}' does not exist.")
+            sys.exit(1)
+        try:
+            transform_matrix = load_transform_from_json(transform_path)
+        except Exception as exc:
+            print(f"ERROR: failed to load transform: {exc}")
+            sys.exit(1)
+
+        if args.transform_invert:
+            try:
+                transform_matrix = np.linalg.inv(transform_matrix)
+                print("Applying inverse of provided affine (--transform-invert).")
+            except np.linalg.LinAlgError:
+                print("ERROR: Provided affine transform is non-invertible.")
+                sys.exit(1)
+
+        try:
+            perm, _ = _axis_perm(args.transform_axis_order)
+        except ValueError as exc:
+            print(f"ERROR: {exc}")
+            sys.exit(1)
+
+        linear_part = transform_matrix[:3, :3]
+        try:
+            inv_transpose = np.linalg.inv(linear_part).T
+        except np.linalg.LinAlgError:
+            inv_transpose = None
+
+        transform_info = {
+            "matrix": transform_matrix,
+            "perm": perm,
+            "axis_order": args.transform_axis_order,
+            "inv_transpose": inv_transpose,
+        }
+
+        print(f"Loaded affine transform from {transform_path}")
+        print(f"Affine axis order: {args.transform_axis_order}")
 
     normals_dtype = None
     if args.output_normals:
@@ -1112,24 +1293,16 @@ def main():
     folder_path = args.folder
     print(f"Using mesh folder: {folder_path}")
 
-    # Set the image dimensions based on the specified scroll.
-    scroll_shapes = {
-        "scroll1": (7888, 8096),  # (h, w) for scroll1
-        "scroll2": (10112, 11984),  # (h, w) for scroll2
-        "scroll3": (3550, 3400),  # (h, w) for scroll3
-        "scroll4": (3440, 3340),  # (h, w) for scroll4
-        "scroll5": (6700, 9100),  # (h, w) for scroll5
-        "0500p2": (4712, 4712),
-        "343p_2um_116": (13155, 13155),
-        "343p_9um": (5057, 5057)
-    }
-    if args.scroll not in scroll_shapes:
-        print("Invalid scroll shape specified.")
+    z_dim, x_dim, y_dim = args.spatial_shape
+    if z_dim <= 0 or x_dim <= 0 or y_dim <= 0:
+        print("ERROR: spatial shape dimensions must be positive integers.")
         sys.exit(1)
 
-    # Here, the shape is defined as (height, width)
-    h, w = scroll_shapes[args.scroll]
-    print(f"Using scroll '{args.scroll}' with dimensions: height={h}, width={w}")
+    h = y_dim
+    w = x_dim
+    print(
+        f"Using spatial shape (z, x, y)=({z_dim}, {x_dim}, {y_dim}) -> (height, width)=({h}, {w})"
+    )
 
     out_path = args.output_path
     print(f"Label OME-Zarr output path: {out_path}")
@@ -1174,6 +1347,7 @@ def main():
                 range(len(mesh_paths)),
                 repeat(args.output_normals),
                 repeat(args.output_surface_frame),
+                repeat(transform_info),
             )
         )
 
@@ -1261,14 +1435,24 @@ def main():
     # Determine slice range from the vertices.
     z_min = int(np.floor(vertices[:, 2].min()))
     z_max = int(np.ceil(vertices[:, 2].max()))
+
+    if z_min < 0:
+        print(
+            "ERROR: Mesh vertices include negative z coordinates; shift the meshes or adjust the spatial shape origin."
+        )
+        sys.exit(1)
+
+    if z_max >= z_dim:
+        print(
+            f"ERROR: Mesh z-extent [{z_min}, {z_max}] exceeds provided z dimension {z_dim}."
+        )
+        sys.exit(1)
+
     z_slices = np.arange(z_min, z_max + 1)
     print(f"Processing slices from {z_min} to {z_max} (inclusive).")
     print(f"Total number of slices: {len(z_slices)}")
 
-    num_slices = len(z_slices)
     num_levels = PYRAMID_LEVELS
-    z_index_lookup = {z: idx for idx, z in enumerate(z_slices)}
-
     compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
 
     def compute_level_shape(base_shape, level, downsample_axes):
@@ -1303,14 +1487,14 @@ def main():
 
     label_store = zarr.DirectoryStore(out_path)
     label_root = zarr.group(store=label_store, overwrite=True)
-    label_base_shape = (num_slices, h, w)
+    label_base_shape = (z_dim, h, w)
     label_datasets = []
     label_axes = [
         {"name": "z", "type": "space", "unit": "index"},
         {"name": "y", "type": "space", "unit": "pixel"},
         {"name": "x", "type": "space", "unit": "pixel"},
     ]
-    label_translation = [float(z_slices[0]), 0.0, 0.0]
+    label_translation = [0.0, 0.0, 0.0]
     label_datasets_meta = []
 
     for level in range(num_levels):
@@ -1354,14 +1538,14 @@ def main():
     if args.output_normals:
         normals_store = zarr.DirectoryStore(normals_out_path)
         normals_root = zarr.group(store=normals_store, overwrite=True)
-        normals_base_shape = (num_slices, h, w, 3)
+        normals_base_shape = (z_dim, h, w, 3)
         normals_axes = [
             {"name": "z", "type": "space", "unit": "index"},
             {"name": "y", "type": "space", "unit": "pixel"},
             {"name": "x", "type": "space", "unit": "pixel"},
             {"name": "c", "type": "channel"},
         ]
-        normals_translation = [float(z_slices[0]), 0.0, 0.0, 0.0]
+        normals_translation = [0.0, 0.0, 0.0, 0.0]
         normals_datasets_meta = []
 
         for level in range(num_levels):
@@ -1406,7 +1590,7 @@ def main():
     if args.output_surface_frame:
         surface_frame_store = zarr.DirectoryStore(surface_frame_out_path)
         surface_frame_root = zarr.group(store=surface_frame_store, overwrite=True)
-        surface_frame_base_shape = (num_slices, h, w, 3, 3)
+        surface_frame_base_shape = (z_dim, h, w, 3, 3)
         surface_frame_axes = [
             {"name": "z", "type": "space", "unit": "index"},
             {"name": "y", "type": "space", "unit": "pixel"},
@@ -1414,7 +1598,7 @@ def main():
             {"name": "f", "type": "parametric", "description": ["t_u", "t_v", "n"]},
             {"name": "c", "type": "space", "unit": "direction"},
         ]
-        surface_frame_translation = [float(z_slices[0]), 0.0, 0.0, 0.0, 0.0]
+        surface_frame_translation = [0.0, 0.0, 0.0, 0.0, 0.0]
         surface_frame_datasets_meta = []
 
         for level in range(num_levels):
@@ -1475,7 +1659,7 @@ def main():
         "triangle_tangents": triangle_tangents,
         "triangle_bitangents": triangle_bitangents,
         "use_vertex_tangents": triangle_use_vertex_tangents,
-        "z_min": z_slices[0],
+        "volume_depth": z_dim,
         "label_store_path": out_path,
         "label_dataset_name": label_dataset_name,
         "normals_store_path": normals_out_path,
@@ -1487,7 +1671,12 @@ def main():
     }
 
     def _write_slice_output(zslice, label_img, normals_img, frame_img):
-        slice_index = z_index_lookup[zslice]
+        slice_index = int(zslice)
+        if slice_index < 0 or slice_index >= label_datasets[0].shape[0]:
+            raise ValueError(
+                f"Requested slice index {slice_index} is outside the allocated z range "
+                f"[0, {label_datasets[0].shape[0] - 1}]."
+            )
 
         label_datasets[0][slice_index, ...] = np.ascontiguousarray(
             label_img, dtype=label_datasets[0].dtype
