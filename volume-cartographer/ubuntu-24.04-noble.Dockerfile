@@ -12,6 +12,8 @@ RUN apt -y install build-essential git cmake qt6-base-dev libboost-system-dev li
     libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev libgsl-dev libsdl2-dev libcurl4-openssl-dev file \
     curl unzip ca-certificates bzip2 wget fuse jq gimp desktop-file-utils ninja-build
 
+RUN apt-get install -y flex bison zlib1g-dev gfortran libopenblas-dev liblapack-dev libscotch-dev libhwloc-dev
+
 # --- pin specific xtl + xtensor versions from .deb files ---
 RUN set -eux; \
     cd /tmp; \
@@ -67,18 +69,43 @@ ENV PATH="/opt/micromamba/envs/py310/bin:${PATH}"
 
 COPY . /src
 
-RUN mkdir /src/build
+# ------------------------- Build your main project ---------------------------
+RUN mkdir -p /src/build
 WORKDIR /src/build
+RUN cmake -DVC_WITH_CUDA_SPARSE=off -GNinja /src && ninja && cpack -G DEB -V && dpkg -i /src/build/pkgs/vc3d*.deb
 
-RUN cmake -DVC_WITH_CUDA_SPARSE=off -GNinja /src
-RUN ninja
+WORKDIR /src/libs
+RUN mkdir pastix-install
+RUN mkdir scotch-install
+RUN mkdir libigl
+RUN wget https://dl.ash2txt.org/other/dev/libigl.tar.bz2
+RUN tar -xjf /src/libs/pastix_5.2.3.tar.bz2 -C pastix-install --strip-components=1
+RUN tar -xjf /src/libs/libigl.tar.bz2 -C libigl --strip-components=1
+RUN tar -xzf /src/libs/scotch_6.0.4.tar.gz -C scotch-install --strip-components=1
+WORKDIR scotch-install/src
+RUN cp ./Make.inc/Makefile.inc.x86-64_pc_linux2 Makefile.inc
+RUN mkdir /usr/local/scotch
+RUN make scotch
+# Create prefixes we will actually keep (not deleted later)
+RUN make prefix=/usr/local/scotch install
+WORKDIR /src/libs/pastix-install/src
+RUN cp /src/libs/config.in config.in
+RUN make SCOTCH_HOME=/usr/local/scotch
+RUN make SCOTCH_HOME=/usr/local/scotch install
 
-RUN cpack -G DEB -V
+WORKDIR /src/libs/libigl/tutorial/999_Flatboi/build
+RUN cmake .. -DCMAKE_BUILD_TYPE=Release \
+  -DLIBIGL_WITH_PASTIX=ON \
+  -DBLA_VENDOR=OpenBLAS \
+  -DCMAKE_PREFIX_PATH=/usr/local/pastix
+RUN cmake --build . -j"$(nproc)"
 
-RUN dpkg -i /src/build/pkgs/vc3d*.deb
+# Install the flatboi binary into PATH before removing /src
+RUN install -m 0755 ./flatboi /usr/local/bin/flatboi
 
-RUN apt -y autoremove
-RUN rm -r /src
+WORKDIR /src/build
+# --------------------------- Cleanup build tree ------------------------------
+RUN apt -y autoremove && rm -rf /src
 
 # Wrapper: forwards all args to VC3D with nice/ionice and per-call OMP envs
 RUN install -m 0755 /dev/stdin /usr/local/bin/vc3d <<'BASH'
@@ -91,3 +118,4 @@ COPY docker_s3_entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ENV WANDB_ENTITY="vesuvius-challenge"
+
