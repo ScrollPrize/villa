@@ -76,11 +76,11 @@ def train(config_path):
         dataset = PatchInCubeDataset(config)
     train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config['batch_size'], num_workers=config['num_workers'])
 
-    # model = Vesuvius3dUnetModel(in_channels=5, out_channels=3, config=config)
+    # model = Vesuvius3dUnetModel(in_channels=18, out_channels=16, config=config)
     model = SongUnet3dModel(
         img_resolution=config['crop_size'],
-        in_channels=5,
-        out_channels=3,
+        in_channels=18,
+        out_channels=16,
         model_channels=32,
         channel_mult=[1, 2, 4, 8],
         num_blocks=2,  # 4
