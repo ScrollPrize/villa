@@ -13,28 +13,28 @@ from einops import rearrange
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 
-from dataset import PatchInCubeDataset
+from dataset import PatchInCubeDataset, HeatmapDataset
 from vesuvius_unet3d import Vesuvius3dUnetModel
 from song_unet3d import SongUnet3dModel
 from sampling import sample_ddim
 
 
 def prepare_batch(batch, noise_scheduler, generative, cfg_uncond_prob):
-    clean_uvw = batch['uvw']
+    clean_heatmaps = batch['uv_heatmaps']
     if generative:
         # FIXME: should use non-uniform timestep distribution
-        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, size=[clean_uvw.shape[0]], device=clean_uvw.device).long()
-        noise = torch.randn_like(clean_uvw)
-        noisy_uvw = noise_scheduler.add_noise(clean_uvw, noise, timesteps)
-        conditioning_mask = 0 if torch.rand(clean_uvw.shape[0]) < cfg_uncond_prob else 1
+        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, size=[clean_heatmaps.shape[0]], device=clean_heatmaps.device).long()
+        noise = torch.randn_like(clean_heatmaps)
+        noisy_heatmaps = noise_scheduler.add_noise(clean_heatmaps, noise, timesteps)
+        conditioning_mask = 0 if torch.rand(clean_heatmaps.shape[0]) < cfg_uncond_prob else 1
     else:
-        timesteps = torch.zeros(clean_uvw.shape[0], device=clean_uvw.device, dtype=torch.long)
-        noisy_uvw = torch.zeros_like(clean_uvw)
+        timesteps = torch.zeros(clean_heatmaps.shape[0], device=clean_heatmaps.device, dtype=torch.long)
+        noisy_heatmaps = torch.zeros_like(clean_heatmaps)
         conditioning_mask = 1
     if (not generative) or noise_scheduler.config.prediction_type == 'sample':
-        targets = clean_uvw
+        targets = clean_heatmaps
     elif noise_scheduler.config.prediction_type == 'v_prediction':
-        targets = noise_scheduler.get_velocity(clean_uvw, noise, timesteps)
+        targets = noise_scheduler.get_velocity(clean_heatmaps, noise, timesteps)
     elif noise_scheduler.config.prediction_type == 'epsilon':
         targets = noise
     else:
@@ -42,7 +42,7 @@ def prepare_batch(batch, noise_scheduler, generative, cfg_uncond_prob):
     inputs = torch.cat([
         batch['volume'].unsqueeze(1) * conditioning_mask,
         batch['localiser'].unsqueeze(1) * conditioning_mask,  # TODO: should this one be removed for cfg?
-        rearrange(noisy_uvw, 'b z y x c -> b c z y x')
+        rearrange(noisy_heatmaps, 'b z y x c -> b c z y x')
     ], dim=1)
     targets = rearrange(targets, 'b z y x c -> b c z y x')
     return timesteps, inputs, targets
@@ -70,7 +70,10 @@ def train(config_path):
     if 'wandb_project' in config and accelerator.is_main_process:
         wandb.init(project=config['wandb_project'], entity=config.get('wandb_entity', None), config=config)
 
-    dataset = PatchInCubeDataset(config)
+    if config['representation'] == 'heatmap':
+        dataset = HeatmapDataset(config)
+    else:
+        dataset = PatchInCubeDataset(config)
     train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config['batch_size'], num_workers=config['num_workers'])
 
     # model = Vesuvius3dUnetModel(in_channels=5, out_channels=3, config=config)
@@ -133,7 +136,14 @@ def train(config_path):
             with torch.no_grad():
                 model.eval()
 
-                canvas = torch.stack([inputs[:, :1].expand(-1, 3, -1, -1, -1), inputs[:, -3:], target_pred, targets], dim=-1)
+                def squish(x):
+                    return torch.stack([x[:, :8].amax(dim=1), x[:, 8:16].amax(dim=1), torch.zeros_like(x[:, 0])], dim=1)
+                canvas = torch.stack([
+                    inputs[:, :1].expand(-1, 3, -1, -1, -1),
+                    squish(inputs[:, 2:]),
+                    squish(target_pred),
+                    squish(targets),
+                ], dim=-1)
                 canvas_mask = torch.stack([torch.ones_like(mask), mask, torch.ones_like(mask), mask], dim=-1)
                 canvas = (canvas * 0.5 + 0.5).clip(0, 1) * canvas_mask
                 canvas = rearrange(canvas[:, :, canvas.shape[2] // 2], 'b uvw y x v -> (b y) (v x) uvw')
@@ -141,9 +151,9 @@ def train(config_path):
 
                 eval_num_samples = 4
                 assert targets.shape[0] == 1  # since the argmin needs to be per-iib otherwise, and we need either a loop or a separate dimensions for sample vs batch
-                gt_uvw = rearrange(batch['uvw'], 'b z y x c -> b c z y x')
+                gt_heatmaps = rearrange(batch['uv_heatmaps'], 'b z y x c -> b c z y x')
                 if config['generative']:
-                    sample_uvw = sample_ddim(
+                    sample_heatmaps = sample_ddim(
                         model,
                         torch.tile(inputs[:, :2], (eval_num_samples, 1, 1, 1, 1)),
                         noise_scheduler,
@@ -151,10 +161,10 @@ def train(config_path):
                         torch.Generator().manual_seed(config['seed']),
                         cfg_scale=config['cfg_scale']
                     )
-                    sample_uvw = sample_uvw[torch.argmin((sample_uvw - gt_uvw).abs().mean(dim=(1, 2, 3, 4)))]
+                    sample_heatmaps = sample_heatmaps[torch.argmin((sample_heatmaps - gt_heatmaps).abs().mean(dim=(1, 2, 3, 4)))]
                 else:
-                    sample_uvw = target_pred.squeeze(0)
-                canvas = torch.stack([inputs[:, :1].expand(-1, 3, -1, -1, -1), sample_uvw[None], gt_uvw], dim=-1)
+                    sample_heatmaps = target_pred.squeeze(0)
+                canvas = torch.stack([inputs[:, :1].expand(-1, 3, -1, -1, -1), squish(sample_heatmaps[None]), squish(gt_heatmaps)], dim=-1)
                 canvas_mask = torch.stack([torch.ones_like(mask), torch.ones_like(mask), mask], dim=-1)
                 canvas = (canvas * 0.5 + 0.5).clip(0, 1) * canvas_mask
                 canvas = rearrange(canvas[:, :, canvas.shape[2] // 2], 'b uvw y x v -> (b y) (v x) uvw')

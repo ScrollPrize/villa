@@ -12,6 +12,7 @@ from tqdm import tqdm
 from einops import rearrange
 import torch.nn.functional as F
 from dataclasses import dataclass
+from fft_conv_pytorch import fft_conv
 
 import augmentation
 
@@ -99,23 +100,6 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
         self._patches = load_datasets(config)
         self._augmentations = augmentation.get_training_augmentations(config['crop_size'], config['augmentation']['no_spatial'], config['augmentation']['only_spatial_and_intensity'])
 
-    def _mark_context_point(self, volume, point, value=1.):
-        center = point.int()
-        offsets = torch.tensor([[0, 0, 0], [-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-2, 0, 0], [2, 0, 0], [0, -2, 0], [0, 2, 0], [0, 0, -2], [0, 0, 2]])
-        for offset in offsets:
-            volume[tuple(center + offset)] = value
-
-    def _get_zyx_from_patch(self, ij, patch):
-        normalized_ij = ij / torch.tensor(patch.zyxs.shape[:2]) * 2 - 1
-        interpolated = F.grid_sample(
-            rearrange(patch.zyxs, 'h w c -> 1 c h w'), 
-            rearrange(normalized_ij.flip(-1), 'xy -> 1 1 1 xy'), 
-            align_corners=True, 
-            mode='bilinear', 
-            padding_mode='border'
-        )
-        return rearrange(interpolated, '1 c 1 1 -> c')
-
     def __iter__(self):
 
         areas = torch.tensor([patch.area for patch in self._patches])
@@ -144,7 +128,7 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
             # if not patch.valid_mask[*context_ij.int().T].all():
             #     continue
 
-            center_zyx = self._get_zyx_from_patch(center_ij, patch)
+            center_zyx = get_zyx_from_patch(center_ij, patch)
             # context_zyxs = [self._get_zyx_from_patch(context_ij, patch) for context_ij in context_ij]
 
             # Crop ROI out of the volume; mark context points
@@ -228,7 +212,7 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
 
             localiser = torch.linalg.norm(torch.stack(torch.meshgrid(*[torch.arange(crop_size)] * 3, indexing='ij'), dim=-1).to(torch.float32) - crop_size // 2, dim=-1)
             localiser = localiser / localiser.amax() * 2 - 1
-            self._mark_context_point(localiser, center_zyx - min_corner_zyx, value=0.)
+            mark_context_point(localiser, center_zyx - min_corner_zyx, value=0.)
 
             #TODO: include full 2d slices for additional context
             #  if so, need to augment them consistently with the 3d crop -> tricky for geometric transforms
@@ -250,6 +234,95 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
                 'volume': volume_crop,
                 'localiser': localiser,
                 'uvw': uvws,
+            }
+
+
+class HeatmapDataset(torch.utils.data.IterableDataset):
+
+    def __init__(self, config):
+        self._config = config
+        self._patches = load_datasets(config)
+        self._augmentations = augmentation.get_training_augmentations(config['crop_size'], config['augmentation']['no_spatial'], config['augmentation']['only_spatial_and_intensity'])
+
+    def __iter__(self):
+
+        areas = torch.tensor([patch.area for patch in self._patches])
+        area_weights = areas / areas.sum()
+        crop_size = torch.tensor(self._config['crop_size'])
+        step_size = torch.tensor(self._config['step_size'])
+        step_count = torch.tensor(self._config['step_count'])
+
+        while True:
+            patch = random.choices(self._patches, weights=area_weights)[0]
+
+            # Sample a random valid quad in the patch, then a point in that quad
+            random_idx = torch.randint(len(patch.valid_indices) - 1, size=[])
+            start_quad_ij = patch.valid_indices[random_idx]
+            center_ij = start_quad_ij + torch.rand(size=[2])
+            center_zyx = get_zyx_from_patch(center_ij, patch)
+
+            # Crop ROI out of the volume
+            volume_crop, min_corner_zyx = get_crop_from_volume(patch.volume, center_zyx, crop_size)
+
+            # Sample rows of points along U & V axes
+            uv_deltas = torch.arange(1, step_count + 1)[:, None] * step_size * patch.scale
+            u_pos_shifted_ijs = center_ij + uv_deltas * torch.tensor([1, 0])
+            u_neg_shifted_ijs = center_ij - uv_deltas * torch.tensor([1, 0])
+            v_pos_shifted_ijs = center_ij + uv_deltas * torch.tensor([0, 1])
+            v_neg_shifted_ijs = center_ij - uv_deltas * torch.tensor([0, 1])
+
+            # Check all points lie inside the patch
+            if torch.any(u_pos_shifted_ijs < 0) or torch.any(u_pos_shifted_ijs >= torch.tensor(patch.valid_mask.shape[:2])):
+                continue
+            if torch.any(v_pos_shifted_ijs < 0) or torch.any(v_pos_shifted_ijs >= torch.tensor(patch.valid_mask.shape[:2])):
+                continue
+            if not patch.valid_mask[*u_pos_shifted_ijs.int().T].all() or not patch.valid_mask[*v_pos_shifted_ijs.int().T].all():
+                continue
+            if torch.any(u_neg_shifted_ijs < 0) or torch.any(u_neg_shifted_ijs >= torch.tensor(patch.valid_mask.shape[:2])):
+                continue
+            if torch.any(v_neg_shifted_ijs < 0) or torch.any(v_neg_shifted_ijs >= torch.tensor(patch.valid_mask.shape[:2])):
+                continue
+            if not patch.valid_mask[*u_neg_shifted_ijs.int().T].all() or not patch.valid_mask[*v_neg_shifted_ijs.int().T].all():
+                continue
+            # FIXME: should mask instead of skipping (unless zero 'other' points), i.e. don't apply loss on these points
+
+            # Map to 3D space and construct heatmaps
+            u_pos_shifted_zyxs = get_zyx_from_patch(u_pos_shifted_ijs, patch)
+            u_neg_shifted_zyxs = get_zyx_from_patch(u_neg_shifted_ijs, patch)
+            v_pos_shifted_zyxs = get_zyx_from_patch(v_pos_shifted_ijs, patch)
+            v_neg_shifted_zyxs = get_zyx_from_patch(v_neg_shifted_ijs, patch)
+            u_heatmaps = make_heatmaps(u_pos_shifted_zyxs, u_neg_shifted_zyxs, min_corner_zyx, crop_size)
+            v_heatmaps = make_heatmaps(v_pos_shifted_zyxs, v_neg_shifted_zyxs, min_corner_zyx, crop_size)
+            uv_heatmaps = torch.cat([u_heatmaps, v_heatmaps], dim=0)
+
+            # Build localiser volume
+            localiser = torch.linalg.norm(torch.stack(torch.meshgrid(*[torch.arange(crop_size)] * 3, indexing='ij'), dim=-1).to(torch.float32) - crop_size // 2, dim=-1)
+            localiser = localiser / localiser.amax() * 2 - 1
+            mark_context_point(localiser, center_zyx - min_corner_zyx, value=0.)
+
+            #TODO: include full 2d slices for additional context
+            #  if so, need to augment them consistently with the 3d crop -> tricky for geometric transforms
+
+            # FIXME: the loop is a hack because some augmentation sometimes randomly returns None
+            #  we should instead just remove the relevant augmentation (or fix it!)
+            # TODO: consider interaction of augmentation with localiser -- logically should follow translations of
+            #  the center-point, since the heatmaps do, but not follow rotations/scales; however in practice maybe
+            #  ok since it's 'just more augmentation' that won't be applied during tracing
+            while True:
+                augmented = self._augmentations(image=volume_crop[None], dist_map=localiser[None], regression_target=uv_heatmaps)
+                if augmented['dist_map'] is not None:
+                    break
+            volume_crop = augmented['image'].squeeze(0)
+            localiser = augmented['dist_map'].squeeze(0)
+            uv_heatmaps = rearrange(augmented['regression_target'], 'c z y x -> z y x c')
+            if torch.any(torch.isnan(volume_crop)) or torch.any(torch.isnan(localiser)) or torch.any(torch.isnan(u_heatmaps)) or torch.any(torch.isnan(v_heatmaps)):
+                # FIXME: why do these NaNs happen occasionally?
+                continue
+
+            yield {
+                'volume': volume_crop,
+                'localiser': localiser,
+                'uv_heatmaps': uv_heatmaps,
             }
 
 
@@ -321,6 +394,63 @@ class PatchWithCubeDataset(torch.utils.data.IterableDataset):
                 'patch_zyx': patch_crop,
                 'patch_valid': patch_valid,
             }
+
+
+def mark_context_point(volume, point, value=1.):
+    center = (point + 0.5).int()
+    offsets = torch.tensor([[0, 0, 0], [-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-2, 0, 0], [2, 0, 0], [0, -2, 0], [0, 2, 0], [0, 0, -2], [0, 0, 2]])
+    for offset in offsets:
+        volume[tuple(center + offset)] = value
+
+
+def get_zyx_from_patch(ij, patch):
+    original_shape = ij.shape
+    batch_dims = original_shape[:-1]
+    ij_flat = ij.view(-1, 2)
+    normalized_ij = ij_flat / torch.tensor(patch.zyxs.shape[:2]) * 2 - 1
+    interpolated = F.grid_sample(
+        rearrange(patch.zyxs, 'h w c -> 1 c h w'),
+        rearrange(normalized_ij.flip(-1), 'b xy -> 1 b 1 xy'),
+        align_corners=True,
+        mode='bilinear',
+        padding_mode='border'
+    )
+    return rearrange(interpolated, '1 c b 1 -> b c').view(*batch_dims, -1)
+
+
+# FIXME: memoized method instead of global code
+sigma=2.
+kernel_size = int(6 * sigma + 1)
+if kernel_size % 2 == 0:
+    kernel_size += 1
+coords = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
+z_coords, y_coords, x_coords = torch.meshgrid(coords, coords, coords, indexing='ij')
+kernel = torch.exp(-(z_coords**2 + y_coords**2 + x_coords**2) / (2 * sigma**2))
+
+def make_heatmaps(pos_zyxs, neg_zyxs, min_corner_zyx, crop_size):
+
+    assert pos_zyxs.shape[0] == neg_zyxs.shape[0]
+    heatmaps = torch.zeros([crop_size, crop_size, crop_size, pos_zyxs.shape[0]])
+    def scatter(zyxs):
+        coords = torch.cat([
+            (zyxs - min_corner_zyx + 0.5).int(),
+            torch.arange(zyxs.shape[0])[:, None]
+        ], dim=1)
+        # FIXME: the following shouldn't be needed
+        coords = coords[(coords[..., :3] >= 0).all(dim=1) & (coords[..., :3] < crop_size).all(dim=1)]
+        heatmaps[*coords.T] = 1.
+    scatter(pos_zyxs)
+    scatter(neg_zyxs)
+
+    convolved = fft_conv(
+        rearrange(heatmaps, 'z y x c -> c 1 z y x'),
+        kernel[None, None],
+        padding=kernel_size // 2
+    )
+
+    heatmaps_gaussian = rearrange(convolved, 'c 1 z y x -> c z y x')
+
+    return heatmaps_gaussian
 
 
 def load_datasets(config):
