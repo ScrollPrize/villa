@@ -47,12 +47,12 @@ def get_training_augmentations(crop_size, no_spatial, only_spatial_and_intensity
             )
         )
         
-    if not no_spatial:
+    if True:  # diverges from vesuvius!
         # Only add transpose transform if all three dimensions are equal
         if patch_d == patch_h == patch_w:
             transforms.append(RandomTransform(
                 TransposeAxesTransform(allowed_axes={0, 1, 2}),
-                apply_probability=0.2
+                apply_probability=0.5  # diverges from vesuvius!
             ))
 
     # Always add intensity transforms  
