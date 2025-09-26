@@ -117,8 +117,13 @@ def train(config_path):
         wandb_log = {}
         with accelerator.accumulate(model):
             target_pred = model(inputs, timesteps)
-            # TODO: should this instead weight each element in batch equally regardless of valid area?
-            loss = ((target_pred - targets)**2 * mask).sum() / mask.sum()
+            if config['binary']:
+                targets_binary = (targets > 0.5).long()  # FIXME: should instead not do the gaussian conv in data-loader!
+                from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
+                loss = DC_and_BCE_loss(bce_kwargs={}, soft_dice_kwargs={'ddp': False})(target_pred, targets_binary)
+            else:
+                # TODO: should this instead weight each element in batch equally regardless of valid area?
+                loss = ((target_pred - targets) ** 2 * mask).sum() / mask.sum()
             if torch.isnan(loss):
                 raise ValueError('loss is NaN')
             accelerator.backward(loss)
