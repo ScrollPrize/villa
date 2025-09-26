@@ -238,6 +238,21 @@ bool scene2vol(cv::Vec3f &p, cv::Vec3f &n, Surface *_surf, const std::string &_s
     return true;
 }
 
+cv::Vec3f CVolumeViewer::sceneToVolume(const QPointF& scenePoint) const
+{
+    cv::Vec3f p, n;
+    if (scene2vol(p, n,
+                  const_cast<Surface*>(_surf),
+                  _surf_name,
+                  const_cast<CSurfaceCollection*>(_surf_col),
+                  scenePoint,
+                  _vis_center,
+                  _scale)) {
+        return p;
+    }
+    return {0.0f, 0.0f, 0.0f};
+}
+
 void CVolumeViewer::onCursorMove(QPointF scene_loc)
 {
     if (!_surf || !_surf_col)
@@ -333,6 +348,12 @@ void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers m
 {
     if (!_surf)
         return;
+
+    if (_segmentationEditActive && (modifiers & Qt::ControlModifier)) {
+        cv::Vec3f world = sceneToVolume(scene_loc);
+        emit sendSegmentationRadiusWheel(steps, scene_loc, world);
+        return;
+    }
 
     for(auto &col : _intersect_items)
         for(auto &item : col.second)
@@ -441,7 +462,7 @@ void CVolumeViewer::onVolumeClicked(QPointF scene_loc, Qt::MouseButton buttons, 
     if (buttons == Qt::LeftButton) {
         bool isShift = modifiers.testFlag(Qt::ShiftModifier);
 
-        if (isShift) {
+        if (isShift && !_segmentationEditActive) {
             // If a collection is selected, add to it.
             if (_selected_collection_id != 0) {
                 const auto& collections = _point_collection->getAllCollections();
@@ -2099,9 +2120,11 @@ void CVolumeViewer::updateAllOverlays()
     invalidateIntersect();
     renderIntersections();
     renderDirectionHints();
-    renderDirectionStepMarkers();
+   renderDirectionStepMarkers();
     renderPaths();
     refreshPointPositions();
+
+    emit overlaysUpdated();
 }
 
 void CVolumeViewer::setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items)

@@ -55,6 +55,9 @@ public:
     void setShowDirectionHints(bool on) { _showDirectionHints = on; updateAllOverlays(); }
     bool isShowDirectionHints() const { return _showDirectionHints; }
 
+    void setSegmentationEditActive(bool active) { _segmentationEditActive = active; }
+    void setSegmentationEditHighlight(std::optional<std::pair<int,int>> handleKey, const cv::Vec3f& worldPos);
+
     void fitSurfaceInView();
     void updateAllOverlays();
     
@@ -70,6 +73,8 @@ public:
     float getCurrentScale() const { return _scale; }
     // Transform scene coordinates to volume coordinates
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const;
+    QPointF volumePointToScene(const cv::Vec3f& vol_point) { return volumeToScene(vol_point); }
+    Surface* currentSurface() const { return _surf; }
 
     // BBox drawing mode for segmentation view
     void setBBoxMode(bool enabled);
@@ -125,6 +130,8 @@ signals:
     void sendCollectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
     void pointClicked(uint64_t pointId);
+    void overlaysUpdated();
+    void sendSegmentationRadiusWheel(int steps, QPointF scenePoint, cv::Vec3f worldPos);
     // (kept free for potential future signals)
 
 protected:
@@ -218,6 +225,7 @@ protected:
     bool _brushIsSquare = false;
     bool _resetViewOnSurfaceChange = true;
     bool _showDirectionHints = true;
+    bool _segmentationEditActive = false;
 
     int _downscale_override = 0;  // 0=auto, 1=2x, 2=4x, 3=8x, 4=16x, 5=32x
     QTimer* _overlayUpdateTimer;

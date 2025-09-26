@@ -21,6 +21,14 @@ set(srcs
     SeedingWidget.hpp
     DrawingWidget.cpp
     DrawingWidget.hpp
+    SegmentationWidget.cpp
+    SegmentationWidget.hpp
+    SegmentationEditManager.cpp
+    SegmentationEditManager.hpp
+    SegmentationOverlayController.cpp
+    SegmentationOverlayController.hpp
+    ViewerManager.cpp
+    ViewerManager.hpp
     PathData.cpp
     PathData.hpp
     CSegmentationEditorWindow.cpp
