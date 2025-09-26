@@ -2,6 +2,7 @@
 
 #include "CVolumeViewer.hpp"
 #include "SegmentationOverlayController.hpp"
+#include "SegmentationModule.hpp"
 #include "CSurfaceCollection.hpp"
 #include "vc/ui/VCCollection.hpp"
 
@@ -70,6 +71,9 @@ CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
     }
 
     _viewers.push_back(viewer);
+    if (_segmentationModule) {
+        _segmentationModule->attachViewer(viewer);
+    }
     emit viewerCreated(viewer);
     return viewer;
 }
@@ -94,6 +98,18 @@ void ViewerManager::setSegmentationEditActive(bool active)
         if (viewer) {
             viewer->setSegmentationEditActive(active);
         }
+    }
+}
+
+void ViewerManager::setSegmentationModule(SegmentationModule* module)
+{
+    _segmentationModule = module;
+    if (!_segmentationModule) {
+        return;
+    }
+
+    for (auto* viewer : _viewers) {
+        _segmentationModule->attachViewer(viewer);
     }
 }
 

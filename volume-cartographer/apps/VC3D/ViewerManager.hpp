@@ -14,6 +14,7 @@ class CSurfaceCollection;
 class VCCollection;
 class SegmentationOverlayController;
 class ChunkCache;
+class SegmentationModule;
 
 class ViewerManager : public QObject
 {
@@ -33,6 +34,7 @@ public:
 
     void setSegmentationOverlay(SegmentationOverlayController* overlay);
     void setSegmentationEditActive(bool active);
+    void setSegmentationModule(SegmentationModule* module);
 
     bool resetDefaultFor(CVolumeViewer* viewer) const;
     void setResetDefaultFor(CVolumeViewer* viewer, bool value);
@@ -48,6 +50,7 @@ private:
     ChunkCache* _chunkCache;
     SegmentationOverlayController* _segmentationOverlay{nullptr};
     bool _segmentationEditActive{false};
+    SegmentationModule* _segmentationModule{nullptr};
     std::vector<CVolumeViewer*> _viewers;
     std::unordered_map<CVolumeViewer*, bool> _resetDefaults;
 };

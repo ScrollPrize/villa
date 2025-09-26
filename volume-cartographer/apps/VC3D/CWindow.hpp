@@ -12,8 +12,6 @@
 #include "vc/ui/VCCollection.hpp"
 
 #include <QShortcut>
-#include <QCursor>
-
 #include <unordered_map>
 
 #include "CPointCollectionWidget.hpp"
@@ -41,6 +39,7 @@ static constexpr int VOLPKG_SLICE_MIN_INDEX = 0;
 
 //forward declaration to avoid circular inclusion as CommandLineToolRunner needs CWindow.hpp
 class CommandLineToolRunner;
+class SegmentationModule;
 
 class CWindow : public QMainWindow
 {
@@ -162,20 +161,7 @@ private slots:
     void onImportObjAsPatches();
     void onAxisAlignedSlicesToggled(bool enabled);
     void onSegmentationEditingModeChanged(bool enabled);
-    void onSegmentationDownsampleChanged(int value);
-    void onSegmentationRadiusChanged(float radius);
-    void onSegmentationSigmaChanged(float sigma);
-    void onSegmentationApplyRequested();
-    void onSegmentationResetRequested();
     void onSegmentationStopToolsRequested();
-    void onSegmentationMousePress(CVolumeViewer* viewer, const cv::Vec3f& worldPos, const cv::Vec3f& normal, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
-    void onSegmentationMouseMove(CVolumeViewer* viewer, const cv::Vec3f& worldPos, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
-    void onSegmentationMouseRelease(CVolumeViewer* viewer, const cv::Vec3f& worldPos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
-    void onSegmentationRadiusWheel(CVolumeViewer* viewer, int steps, const QPointF& scenePoint, const cv::Vec3f& worldPos);
-    void showSegmentationRadiusIndicator(CVolumeViewer* viewer, const QPointF& scenePoint, float radius);
-    void setSegmentationPointAddMode(bool enabled, bool silent = false);
-    void updateSegmentationCursorForViewers();
-    const QCursor& segmentationAddCursor() const;
     void configureViewerConnections(CVolumeViewer* viewer);
     CVolumeViewer* segmentationViewer() const;
 
@@ -284,43 +270,7 @@ private:
     float _segmentationSigma{10.0f};
     std::unique_ptr<SegmentationEditManager> _segmentationEdit;
     std::unique_ptr<SegmentationOverlayController> _segmentationOverlay;
-    bool _segmentationPointAddMode{false};
-
-    struct SegmentationDragState {
-        bool active{false};
-        int row{0};
-        int col{0};
-        CVolumeViewer* viewer{nullptr};
-        cv::Vec3f startWorld{0, 0, 0};
-        bool moved{false};
-    };
-    SegmentationDragState _segmentationDrag;
-
-    struct SegmentationHoverState {
-        bool valid{false};
-        int row{0};
-        int col{0};
-        cv::Vec3f handleWorld{0, 0, 0};
-        bool hasWorld{false};
-        void set(int r, int c, const cv::Vec3f& world)
-        {
-            row = r;
-            col = c;
-            handleWorld = world;
-            valid = true;
-            hasWorld = true;
-        }
-        void clear()
-        {
-            valid = false;
-            hasWorld = false;
-        }
-    };
-    SegmentationHoverState _segmentationHover;
-
-    cv::Vec3f _segmentationCursorWorld{0, 0, 0};
-    bool _segmentationCursorValid{false};
-
+    std::unique_ptr<SegmentationModule> _segmentationModule;
     // runner for command line tools 
     CommandLineToolRunner* _cmdRunner;
     
