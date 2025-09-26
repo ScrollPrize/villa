@@ -444,6 +444,11 @@ cv::Mat QuadSurface::channel(const std::string& name)
     return cv::Mat();
 }
 
+void QuadSurface::invalidateCache()
+{
+    _bbox = {{-1,-1,-1},{-1,-1,-1}};
+}
+
 void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
                       cv::Mat_<cv::Vec3f>* normals,
                       cv::Size size,
@@ -1281,6 +1286,45 @@ void QuadSurface::save_meta()
 
     //rename to make creation atomic
     std::filesystem::rename(path/"meta.json.tmp", path/"meta.json");
+}
+
+void QuadSurface::saveOverwrite()
+{
+    if (path.empty()) {
+        throw std::runtime_error("saveOverwrite(): surface has no path");
+    }
+
+    std::string uuid;
+    if (!id.empty()) {
+        uuid = id;
+    } else if (meta && meta->contains("uuid")) {
+        uuid = meta->at("uuid").get<std::string>();
+    } else {
+        uuid = path.filename().string();
+    }
+
+    std::filesystem::path target = path;
+    std::filesystem::path tmp = target;
+    tmp += ".tmp_write";
+
+    try {
+        if (std::filesystem::exists(tmp)) {
+            std::filesystem::remove_all(tmp);
+        }
+
+        save(tmp.string(), uuid);
+
+        if (std::filesystem::exists(target)) {
+            std::filesystem::remove_all(target);
+        }
+        std::filesystem::rename(tmp, target);
+    } catch (...) {
+        // Restore path and rethrow
+        path = target;
+        throw;
+    }
+
+    path = target;
 }
 
 Rect3D QuadSurface::bbox()
