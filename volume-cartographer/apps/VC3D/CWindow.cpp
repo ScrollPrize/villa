@@ -25,7 +25,16 @@
 #include <QTemporaryDir>
 #include <QToolBar>
 #include <QFileInfo>
+#include <QTimer>
+#include <QGraphicsSimpleTextItem>
+#include <QPointer>
+#include <QPen>
+#include <QFont>
+#include <QPainter>
 #include <atomic>
+#include <cmath>
+#include <optional>
+#include <utility>
 #include <omp.h>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/highgui.hpp>
@@ -79,12 +88,19 @@ CWindow::CWindow() :
     std::cout << "chunk cache size is " << CHUNK_CACHE_SIZE_GB << " gigabytes " << std::endl;
     
     _surf_col = new CSurfaceCollection();
-    
+
     //_surf_col->setSurface("manual plane", new PlaneSurface({2000,2000,2000},{1,1,1}));
     _surf_col->setSurface("xy plane", new PlaneSurface({2000,2000,2000},{0,0,1}));
     _surf_col->setSurface("xz plane", new PlaneSurface({2000,2000,2000},{0,1,0}));
     _surf_col->setSurface("yz plane", new PlaneSurface({2000,2000,2000},{1,0,0}));
-    
+
+    connect(_surf_col, &CSurfaceCollection::sendPOIChanged, this, &CWindow::onFocusPOIChanged);
+
+    _viewerManager = std::make_unique<ViewerManager>(_surf_col, _point_collection, chunk_cache, this);
+    connect(_viewerManager.get(), &ViewerManager::viewerCreated, this, [this](CVolumeViewer* viewer) {
+        configureViewerConnections(viewer);
+    });
+
     // create UI widgets
     CreateWidgets();
 
@@ -178,13 +194,14 @@ CWindow::CWindow() :
     fCompositeViewShortcut = new QShortcut(QKeySequence("C"), this);
     fCompositeViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fCompositeViewShortcut, &QShortcut::activated, [this]() {
-        // Find the segmentation viewer and toggle its composite view
-        for (auto& viewer : _viewers) {
-            if (viewer->surfName() == "segmentation") {
-                viewer->setCompositeEnabled(!viewer->isCompositeEnabled());
-                break;
-            }
+        if (!_viewerManager) {
+            return;
         }
+        _viewerManager->forEachViewer([](CVolumeViewer* viewer) {
+            if (viewer && viewer->surfName() == "segmentation") {
+                viewer->setCompositeEnabled(!viewer->isCompositeEnabled());
+            }
+        });
     });
 
     // Toggle direction hints overlay (Ctrl+T)
@@ -195,8 +212,12 @@ CWindow::CWindow() :
         bool current = settings.value("viewer/show_direction_hints", true).toBool();
         bool next = !current;
         settings.setValue("viewer/show_direction_hints", next ? "1" : "0");
-        for (auto& viewer : _viewers) {
-            viewer->setShowDirectionHints(next);
+        if (_viewerManager) {
+            _viewerManager->forEachViewer([next](CVolumeViewer* viewer) {
+                if (viewer) {
+                    viewer->setShowDirectionHints(next);
+                }
+            });
         }
     });
 
@@ -224,40 +245,119 @@ CWindow::~CWindow(void)
 
 CVolumeViewer *CWindow::newConnectedCVolumeViewer(std::string surfaceName, QString title, QMdiArea *mdiArea)
 {
-    auto volView = new CVolumeViewer(_surf_col, mdiArea);
-    QMdiSubWindow *win = mdiArea->addSubWindow(volView);
-    win->setWindowTitle(title);
-    win->setWindowFlags(Qt::WindowTitleHint | Qt::WindowMinMaxButtonsHint);
-    volView->setCache(chunk_cache);
-    connect(this, &CWindow::sendVolumeChanged, volView, &CVolumeViewer::OnVolumeChanged);
-    volView->setPointCollection(_point_collection);
-    connect(_point_collection, &VCCollection::pointAdded, volView, &CVolumeViewer::onPointAdded);
-    connect(_point_collection, &VCCollection::pointChanged, volView, &CVolumeViewer::onPointChanged);
-    connect(_point_collection, &VCCollection::pointRemoved, volView, &CVolumeViewer::onPointRemoved);
-    connect(_surf_col, &CSurfaceCollection::sendSurfaceChanged, volView, &CVolumeViewer::onSurfaceChanged);
-    connect(_surf_col, &CSurfaceCollection::sendPOIChanged, volView, &CVolumeViewer::onPOIChanged);
-    connect(_surf_col, &CSurfaceCollection::sendPOIChanged, this, &CWindow::onFocusPOIChanged);
-    connect(_surf_col, &CSurfaceCollection::sendIntersectionChanged, volView, &CVolumeViewer::onIntersectionChanged);
-
-    // Initialize viewer settings from persisted configuration
-    {
-        QSettings settings("VC.ini", QSettings::IniFormat);
-        bool showDirHints = settings.value("viewer/show_direction_hints", true).toBool();
-        volView->setShowDirectionHints(showDirHints);
+    if (!_viewerManager) {
+        return nullptr;
     }
-    connect(volView, &CVolumeViewer::sendVolumeClicked, this, &CWindow::onVolumeClicked);
-    connect(this, &CWindow::sendVolumeClosing, volView, &CVolumeViewer::onVolumeClosing);
 
-    QSettings settings("VC.ini", QSettings::IniFormat);
-    bool resetViewOnSurfaceChange = settings.value("viewer/reset_view_on_surface_change", true).toBool();
-    volView->setResetViewOnSurfaceChange(resetViewOnSurfaceChange);
+    CVolumeViewer* viewer = _viewerManager->createViewer(surfaceName, title, mdiArea);
+    if (!viewer) {
+        return nullptr;
+    }
 
+    return viewer;
+}
 
-    volView->setSurface(surfaceName);
-    
-    _viewers.push_back(volView);
-    
-    return volView;
+void CWindow::configureViewerConnections(CVolumeViewer* viewer)
+{
+    if (!viewer) {
+        return;
+    }
+
+    viewer->setSegmentationEditActive(_segmentationEditingEnabled);
+
+    connect(this, &CWindow::sendVolumeChanged, viewer, &CVolumeViewer::OnVolumeChanged, Qt::UniqueConnection);
+    connect(this, &CWindow::sendVolumeClosing, viewer, &CVolumeViewer::onVolumeClosing, Qt::UniqueConnection);
+    connect(viewer, &CVolumeViewer::sendVolumeClicked, this, &CWindow::onVolumeClicked, Qt::UniqueConnection);
+
+    if (viewer->fGraphicsView) {
+        connect(viewer->fGraphicsView, &CVolumeViewerView::sendMousePress,
+                viewer, &CVolumeViewer::onMousePress, Qt::UniqueConnection);
+        connect(viewer->fGraphicsView, &CVolumeViewerView::sendMouseMove,
+                viewer, &CVolumeViewer::onMouseMove, Qt::UniqueConnection);
+        connect(viewer->fGraphicsView, &CVolumeViewerView::sendMouseRelease,
+                viewer, &CVolumeViewer::onMouseRelease, Qt::UniqueConnection);
+    }
+
+    if (_drawingWidget && !viewer->property("vc_drawing_bound").toBool()) {
+        connect(_drawingWidget, &DrawingWidget::sendPathsChanged,
+                viewer, &CVolumeViewer::onPathsChanged, Qt::UniqueConnection);
+        connect(viewer, &CVolumeViewer::sendMousePressVolume,
+                _drawingWidget, &DrawingWidget::onMousePress, Qt::UniqueConnection);
+        connect(viewer, &CVolumeViewer::sendMouseMoveVolume,
+                _drawingWidget, &DrawingWidget::onMouseMove, Qt::UniqueConnection);
+        connect(viewer, &CVolumeViewer::sendMouseReleaseVolume,
+                _drawingWidget, &DrawingWidget::onMouseRelease, Qt::UniqueConnection);
+        connect(viewer, &CVolumeViewer::sendZSliceChanged,
+                _drawingWidget, &DrawingWidget::updateCurrentZSlice, Qt::UniqueConnection);
+        connect(_drawingWidget, &DrawingWidget::sendDrawingModeActive,
+                this, [this, viewer](bool active) {
+                    viewer->onDrawingModeActive(active,
+                        _drawingWidget->getBrushSize(),
+                        _drawingWidget->getBrushShape() == PathData::BrushShape::SQUARE);
+                }, Qt::UniqueConnection);
+        viewer->setProperty("vc_drawing_bound", true);
+    }
+
+    if (_seedingWidget && !viewer->property("vc_seeding_bound").toBool()) {
+        connect(_seedingWidget, &SeedingWidget::sendPathsChanged,
+                viewer, &CVolumeViewer::onPathsChanged, Qt::UniqueConnection);
+        connect(viewer, &CVolumeViewer::sendMousePressVolume,
+                _seedingWidget, &SeedingWidget::onMousePress, Qt::UniqueConnection);
+        connect(viewer, &CVolumeViewer::sendMouseMoveVolume,
+                _seedingWidget, &SeedingWidget::onMouseMove, Qt::UniqueConnection);
+        connect(viewer, &CVolumeViewer::sendMouseReleaseVolume,
+                _seedingWidget, &SeedingWidget::onMouseRelease, Qt::UniqueConnection);
+        connect(viewer, &CVolumeViewer::sendZSliceChanged,
+                _seedingWidget, &SeedingWidget::updateCurrentZSlice, Qt::UniqueConnection);
+        viewer->setProperty("vc_seeding_bound", true);
+    }
+
+    if (!viewer->property("vc_segmentation_bound").toBool()) {
+        connect(viewer, &CVolumeViewer::sendMousePressVolume,
+                this, [this, viewer](cv::Vec3f vol_loc, cv::Vec3f normal, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
+                    onSegmentationMousePress(viewer, vol_loc, normal, button, modifiers);
+                }, Qt::UniqueConnection);
+        connect(viewer, &CVolumeViewer::sendMouseMoveVolume,
+                this, [this, viewer](cv::Vec3f vol_loc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers) {
+                    onSegmentationMouseMove(viewer, vol_loc, buttons, modifiers);
+                }, Qt::UniqueConnection);
+        connect(viewer, &CVolumeViewer::sendMouseReleaseVolume,
+                this, [this, viewer](cv::Vec3f vol_loc, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
+                    onSegmentationMouseRelease(viewer, vol_loc, button, modifiers);
+                }, Qt::UniqueConnection);
+        connect(viewer, &CVolumeViewer::sendSegmentationRadiusWheel,
+                this, [this, viewer](int steps, QPointF scenePoint, cv::Vec3f worldPos) {
+                    onSegmentationRadiusWheel(viewer, steps, scenePoint, worldPos);
+                }, Qt::UniqueConnection);
+        viewer->setProperty("vc_segmentation_bound", true);
+    }
+
+    if (_point_collection_widget && !viewer->property("vc_points_bound").toBool()) {
+        connect(_point_collection_widget, &CPointCollectionWidget::collectionSelected,
+                viewer, &CVolumeViewer::onCollectionSelected, Qt::UniqueConnection);
+        connect(viewer, &CVolumeViewer::sendCollectionSelected,
+                _point_collection_widget, &CPointCollectionWidget::selectCollection, Qt::UniqueConnection);
+        connect(_point_collection_widget, &CPointCollectionWidget::pointSelected,
+                viewer, &CVolumeViewer::onPointSelected, Qt::UniqueConnection);
+        connect(viewer, &CVolumeViewer::pointSelected,
+                _point_collection_widget, &CPointCollectionWidget::selectPoint, Qt::UniqueConnection);
+        connect(viewer, &CVolumeViewer::pointClicked,
+                _point_collection_widget, &CPointCollectionWidget::selectPoint, Qt::UniqueConnection);
+        viewer->setProperty("vc_points_bound", true);
+    }
+}
+
+CVolumeViewer* CWindow::segmentationViewer() const
+{
+    if (!_viewerManager) {
+        return nullptr;
+    }
+    for (auto* viewer : _viewerManager->viewers()) {
+        if (viewer && viewer->surfName() == "segmentation") {
+            return viewer;
+        }
+    }
+    return nullptr;
 }
 
 void CWindow::setVolume(std::shared_ptr<Volume> newvol)
@@ -341,6 +441,40 @@ void CWindow::CreateWidgets(void)
     // so for now we have both. i suppose i could probably add a 'mode' , but for now i will just hate this section :(
 
 
+    // Create Segmentation widget
+    _segmentationWidget = new SegmentationWidget(ui.dockWidgetSegmentation);
+    ui.dockWidgetSegmentation->setWidget(_segmentationWidget);
+    _segmentationWidget->setDownsample(_segmentationDownsample);
+    _segmentationWidget->setRadius(_segmentationRadius);
+    _segmentationWidget->setSigma(_segmentationSigma);
+    _segmentationWidget->setEditingEnabled(_segmentationEditingEnabled);
+
+    connect(_segmentationWidget, &SegmentationWidget::editingModeChanged,
+            this, &CWindow::onSegmentationEditingModeChanged);
+    connect(_segmentationWidget, &SegmentationWidget::downsampleChanged,
+            this, &CWindow::onSegmentationDownsampleChanged);
+    connect(_segmentationWidget, &SegmentationWidget::radiusChanged,
+            this, &CWindow::onSegmentationRadiusChanged);
+    connect(_segmentationWidget, &SegmentationWidget::sigmaChanged,
+            this, &CWindow::onSegmentationSigmaChanged);
+    connect(_segmentationWidget, &SegmentationWidget::applyRequested,
+            this, &CWindow::onSegmentationApplyRequested);
+    connect(_segmentationWidget, &SegmentationWidget::resetRequested,
+            this, &CWindow::onSegmentationResetRequested);
+    connect(_segmentationWidget, &SegmentationWidget::stopToolsRequested,
+            this, &CWindow::onSegmentationStopToolsRequested);
+
+    _segmentationEdit = std::make_unique<SegmentationEditManager>(this);
+    _segmentationOverlay = std::make_unique<SegmentationOverlayController>(_surf_col, this);
+    _segmentationOverlay->setEditManager(_segmentationEdit.get());
+    _segmentationOverlay->setEditingEnabled(_segmentationEditingEnabled);
+    _segmentationOverlay->setDownsample(_segmentationDownsample);
+    _segmentationOverlay->setRadius(_segmentationRadius);
+    if (_viewerManager) {
+        _viewerManager->setSegmentationOverlay(_segmentationOverlay.get());
+        _viewerManager->setSegmentationEditActive(_segmentationEditingEnabled);
+    }
+
     // Create Drawing widget
     _drawingWidget = new DrawingWidget(ui.dockWidgetDrawing);
     ui.dockWidgetDrawing->setWidget(_drawingWidget);
@@ -363,63 +497,16 @@ void CWindow::CreateWidgets(void)
     
     _seedingWidget->setCache(chunk_cache);
     
-    // Connect seeding and drawing widgets to the volume viewers
-    for (auto& viewer : _viewers) {
-
-        connect(_drawingWidget, &DrawingWidget::sendPathsChanged,
-                viewer, &CVolumeViewer::onPathsChanged);
-        connect(viewer->fGraphicsView, &CVolumeViewerView::sendMousePress,
-                viewer, &CVolumeViewer::onMousePress);
-        connect(viewer->fGraphicsView, &CVolumeViewerView::sendMouseMove,
-                viewer, &CVolumeViewer::onMouseMove);
-        connect(viewer->fGraphicsView, &CVolumeViewerView::sendMouseRelease,
-                viewer, &CVolumeViewer::onMouseRelease);
-        connect(viewer, &CVolumeViewer::sendMousePressVolume,
-                _drawingWidget, &DrawingWidget::onMousePress);
-        connect(viewer, &CVolumeViewer::sendMouseMoveVolume,
-                _drawingWidget, &DrawingWidget::onMouseMove);
-        connect(viewer, &CVolumeViewer::sendMouseReleaseVolume,
-                _drawingWidget, &DrawingWidget::onMouseRelease);
-        connect(viewer, &CVolumeViewer::sendZSliceChanged,
-                _drawingWidget, &DrawingWidget::updateCurrentZSlice);
-
-        // Selection is stored in the viewer; actions are triggered from Selection dock
-        
-        // Connect drawing mode signal to update cursor
-        connect(_drawingWidget, &DrawingWidget::sendDrawingModeActive,
-                [viewer, this](bool active) {
-                    viewer->onDrawingModeActive(active, 
-                        _drawingWidget->getBrushSize(),
-                        _drawingWidget->getBrushShape() == PathData::BrushShape::SQUARE);
-                });
-    }
-    
-    for (auto& viewer : _viewers) {
-        connect(_seedingWidget, &SeedingWidget::sendPathsChanged,
-                viewer, &CVolumeViewer::onPathsChanged);
-        connect(viewer, &CVolumeViewer::sendMousePressVolume,
-                _seedingWidget, &SeedingWidget::onMousePress);
-        connect(viewer, &CVolumeViewer::sendMouseMoveVolume,
-                _seedingWidget, &SeedingWidget::onMouseMove);
-        connect(viewer, &CVolumeViewer::sendMouseReleaseVolume,
-                _seedingWidget, &SeedingWidget::onMouseRelease);
-        connect(viewer, &CVolumeViewer::sendZSliceChanged,
-                _seedingWidget, &SeedingWidget::updateCurrentZSlice);
-    }
-    
     // Create and add the point collection widget
     _point_collection_widget = new CPointCollectionWidget(_point_collection, this);
     _point_collection_widget->setObjectName("pointCollectionDock");
     addDockWidget(Qt::RightDockWidgetArea, _point_collection_widget);
 
     // Selection dock (removed per request; selection actions remain in the menu)
-
-    for (auto& viewer : _viewers) {
-        connect(_point_collection_widget, &CPointCollectionWidget::collectionSelected, viewer, &CVolumeViewer::onCollectionSelected);
-        connect(viewer, &CVolumeViewer::sendCollectionSelected, _point_collection_widget, &CPointCollectionWidget::selectCollection);
-        connect(_point_collection_widget, &CPointCollectionWidget::pointSelected, viewer, &CVolumeViewer::onPointSelected);
-        connect(viewer, &CVolumeViewer::pointSelected, _point_collection_widget, &CPointCollectionWidget::selectPoint);
-        connect(viewer, &CVolumeViewer::pointClicked, _point_collection_widget, &CPointCollectionWidget::selectPoint);
+    if (_viewerManager) {
+        _viewerManager->forEachViewer([this](CVolumeViewer* viewer) {
+            configureViewerConnections(viewer);
+        });
     }
     connect(_point_collection_widget, &CPointCollectionWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
 
@@ -605,12 +692,8 @@ void CWindow::CreateWidgets(void)
     connect(ui.btnAppendMask, &QPushButton::pressed, this, &CWindow::onAppendMaskPressed);  // Add this
     // Connect composite view controls
     connect(ui.chkCompositeEnabled, &QCheckBox::toggled, this, [this](bool checked) {
-        // Find the segmentation viewer and update its composite setting
-        for (auto& viewer : _viewers) {
-            if (viewer->surfName() == "segmentation") {
-                viewer->setCompositeEnabled(checked);
-                break;
-            }
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setCompositeEnabled(checked);
         }
     });
     
@@ -624,57 +707,45 @@ void CWindow::CreateWidgets(void)
             case 3: method = "alpha"; break;
         }
         
-        for (auto& viewer : _viewers) {
-            if (viewer->surfName() == "segmentation") {
-                viewer->setCompositeMethod(method);
-                break;
-            }
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setCompositeMethod(method);
         }
     });
     
     // Connect Layers In Front controls
     connect(ui.spinLayersInFront, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        for (auto& viewer : _viewers) {
-            if (viewer->surfName() == "segmentation") {
-                viewer->setCompositeLayersInFront(value);
-                break;
-            }
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setCompositeLayersInFront(value);
         }
     });
     
     // Connect Layers Behind controls
     connect(ui.spinLayersBehind, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        for (auto& viewer : _viewers) {
-            if (viewer->surfName() == "segmentation") {
-                viewer->setCompositeLayersBehind(value);
-                break;
-            }
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setCompositeLayersBehind(value);
         }
     });
     
     // Connect Alpha Min controls
     connect(ui.spinAlphaMin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        for (auto& viewer : _viewers) {
-            if (viewer->surfName() == "segmentation") {
-                viewer->setCompositeAlphaMin(value);
-                break;
-            }
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setCompositeAlphaMin(value);
         }
     });
     
     // Connect Alpha Max controls
     connect(ui.spinAlphaMax, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        for (auto& viewer : _viewers) {
-            if (viewer->surfName() == "segmentation") {
-                viewer->setCompositeAlphaMax(value);
-                break;
-            }
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setCompositeAlphaMax(value);
         }
     });
     
     // Connect Alpha Threshold controls
     connect(ui.spinAlphaThreshold, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        for (auto& viewer : _viewers) {
+        if (!_viewerManager) {
+            return;
+        }
+        for (auto* viewer : _viewerManager->viewers()) {
             if (viewer->surfName() == "segmentation") {
                 viewer->setCompositeAlphaThreshold(value);
                 break;
@@ -684,7 +755,10 @@ void CWindow::CreateWidgets(void)
     
     // Connect Material controls
     connect(ui.spinMaterial, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        for (auto& viewer : _viewers) {
+        if (!_viewerManager) {
+            return;
+        }
+        for (auto* viewer : _viewerManager->viewers()) {
             if (viewer->surfName() == "segmentation") {
                 viewer->setCompositeMaterial(value);
                 break;
@@ -694,7 +768,10 @@ void CWindow::CreateWidgets(void)
     
     // Connect Reverse Direction control
     connect(ui.chkReverseDirection, &QCheckBox::toggled, this, [this](bool checked) {
-        for (auto& viewer : _viewers) {
+        if (!_viewerManager) {
+            return;
+        }
+        for (auto* viewer : _viewerManager->viewers()) {
             if (viewer->surfName() == "segmentation") {
                 viewer->setCompositeReverseDirection(checked);
                 break;
@@ -702,35 +779,29 @@ void CWindow::CreateWidgets(void)
         }
     });
     bool resetViewOnSurfaceChange = settings.value("viewer/reset_view_on_surface_change", true).toBool();
-    for (auto& viewer : _viewers) {
-        viewer->setResetViewOnSurfaceChange(resetViewOnSurfaceChange);
+    if (_viewerManager) {
+        for (auto* viewer : _viewerManager->viewers()) {
+            viewer->setResetViewOnSurfaceChange(resetViewOnSurfaceChange);
+            _viewerManager->setResetDefaultFor(viewer, resetViewOnSurfaceChange);
+        }
     }
 
     chkFilterCurrentOnly = ui.chkFilterCurrentOnly;
     connect(chkFilterCurrentOnly, &QCheckBox::toggled, [this]() { onSegFilterChanged(0); });
-
-    // Connect Stop tools button from Tools dock
-    if (ui.btnStopTools) {
-        connect(ui.btnStopTools, &QPushButton::clicked, this, [this]() {
-            if (!initializeCommandLineRunner()) return;
-            if (_cmdRunner) {
-                _cmdRunner->cancel();
-                statusBar()->showMessage(tr("Cancelling running tools..."), 3000);
-            }
-        });
-    }
 
 }
 
 void CWindow::onDrawBBoxToggled(bool enabled)
 {
     // Toggle bbox mode on the segmentation viewer
-    for (auto* viewer : _viewers) {
-        if (viewer->surfName() == "segmentation") {
-            viewer->setBBoxMode(enabled);
-            statusBar()->showMessage(enabled ? tr("BBox mode active: drag on Surface view")
-                                             : tr("BBox mode off"), 3000);
-            break;
+    if (_viewerManager) {
+        for (auto* viewer : _viewerManager->viewers()) {
+            if (viewer->surfName() == "segmentation") {
+                viewer->setBBoxMode(enabled);
+                statusBar()->showMessage(enabled ? tr("BBox mode active: drag on Surface view")
+                                                 : tr("BBox mode off"), 3000);
+                break;
+            }
         }
     }
 }
@@ -738,7 +809,9 @@ void CWindow::onSurfaceFromSelection()
 {
     // Use the segmentation viewer's stored selections to create surfaces
     CVolumeViewer* segViewer = nullptr;
-    for (auto* v : _viewers) if (v->surfName() == "segmentation") { segViewer = v; break; }
+    if (_viewerManager) {
+        for (auto* v : _viewerManager->viewers()) if (v->surfName() == "segmentation") { segViewer = v; break; }
+    }
     if (!segViewer) { statusBar()->showMessage(tr("No Surface viewer found"), 3000); return; }
 
     auto sels = segViewer->selections();
@@ -789,8 +862,7 @@ void CWindow::onSurfaceFromSelection()
 void CWindow::onSelectionClear()
 {
     // Clear all stored selections on the segmentation (Surface) viewer
-    CVolumeViewer* segViewer = nullptr;
-    for (auto* v : _viewers) if (v->surfName() == "segmentation") { segViewer = v; break; }
+    CVolumeViewer* segViewer = segmentationViewer();
     if (!segViewer) { statusBar()->showMessage(tr("No Surface viewer found"), 3000); return; }
     segViewer->clearSelections();
     statusBar()->showMessage(tr("Selections cleared"), 2000);
@@ -872,8 +944,74 @@ void CWindow::CreateMenus(void)
 // Create actions
 void CWindow::keyPressEvent(QKeyEvent* event)
 {
-    // Key handling moved to QShortcut objects for application-wide access
-    QMainWindow::keyPressEvent(event);
+    bool handled = false;
+    if (_segmentationEditingEnabled && _segmentationEdit && _segmentationEdit->hasSession()) {
+        if (event->key() == Qt::Key_Shift && event->modifiers() == Qt::ShiftModifier && !event->isAutoRepeat()) {
+            setSegmentationPointAddMode(!_segmentationPointAddMode);
+            handled = true;
+        } else if (event->key() == Qt::Key_R && event->modifiers() == Qt::NoModifier) {
+            std::optional<std::pair<int,int>> target;
+            if (_segmentationDrag.active) {
+                target = std::make_pair(_segmentationDrag.row, _segmentationDrag.col);
+            } else if (_segmentationHover.valid) {
+                target = std::make_pair(_segmentationHover.row, _segmentationHover.col);
+            } else if (_segmentationCursorValid) {
+                if (auto* nearest = _segmentationEdit->findNearestHandle(_segmentationCursorWorld, -1.0f)) {
+                    target = std::make_pair(nearest->row, nearest->col);
+                }
+            }
+            if (target) {
+                if (auto pos = _segmentationEdit->handleWorldPosition(target->first, target->second)) {
+                    POI* poi = _surf_col->poi("focus");
+                    if (!poi) {
+                        poi = new POI;
+                    }
+                    poi->p = *pos;
+                    poi->src = _surf_col->surface("segmentation");
+                    _surf_col->setPOI("focus", poi);
+                    applySlicePlaneOrientation(_segmentationEdit->baseSurface());
+                    if (!_segmentationHover.valid || _segmentationHover.row != target->first || _segmentationHover.col != target->second) {
+                        _segmentationHover.set(target->first, target->second, *pos);
+                    }
+                    if (_segmentationOverlay) {
+                        _segmentationOverlay->setKeyboardHandle(target);
+                        _segmentationOverlay->setHoverHandle(target);
+                    }
+                    handled = true;
+                }
+            }
+        } else if ((event->key() == Qt::Key_Delete || event->key() == Qt::Key_Backspace) && event->modifiers() == Qt::NoModifier) {
+            std::optional<std::pair<int,int>> target;
+            if (_segmentationDrag.active) {
+                target = std::make_pair(_segmentationDrag.row, _segmentationDrag.col);
+            } else if (_segmentationHover.valid) {
+                target = std::make_pair(_segmentationHover.row, _segmentationHover.col);
+            }
+            if (target) {
+                if (_segmentationEdit->removeHandle(target->first, target->second)) {
+                    _segmentationHover.clear();
+                    _segmentationDrag = {};
+                    _surf_col->setSurface("segmentation", _segmentationEdit->previewSurface());
+                    if (_segmentationWidget) {
+                        _segmentationWidget->setPendingChanges(true);
+                    }
+                    if (_segmentationOverlay) {
+                        _segmentationOverlay->setActiveHandle(std::nullopt, false);
+                        _segmentationOverlay->setHoverHandle(std::nullopt, false);
+                        _segmentationOverlay->setKeyboardHandle(std::nullopt, false);
+                        _segmentationOverlay->refreshAll();
+                    }
+                    handled = true;
+                }
+            }
+        }
+    }
+
+    if (!handled) {
+        QMainWindow::keyPressEvent(event);
+    } else {
+        event->accept();
+    }
 }
 
 void CWindow::CreateActions(void)
@@ -1346,8 +1484,12 @@ void CWindow::ShowSettings()
     {
         QSettings settings("VC.ini", QSettings::IniFormat);
         bool showDirHints = settings.value("viewer/show_direction_hints", true).toBool();
-        for (auto &viewer : _viewers) {
-            viewer->setShowDirectionHints(showDirHints);
+        if (_viewerManager) {
+            _viewerManager->forEachViewer([showDirHints](CVolumeViewer* viewer) {
+                if (viewer) {
+                    viewer->setShowDirectionHints(showDirHints);
+                }
+            });
         }
     }
     delete pDlg;
@@ -1588,11 +1730,8 @@ void CWindow::onSurfaceSelected()
     QList<QTreeWidgetItem*> selectedItems = treeWidgetSurfaces->selectedItems();
     if (selectedItems.isEmpty()) {
         // Reset sub window title
-        for (auto &viewer : _viewers) {
-            if (viewer->surfName() == "segmentation") {
-                viewer->setWindowTitle(tr("Surface"));
-                break;
-            }
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setWindowTitle(tr("Surface"));
         }
 
         return;
@@ -1603,11 +1742,8 @@ void CWindow::onSurfaceSelected()
     _surfID = firstSelected->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
 
     // Update sub window title with surface ID
-    for (auto &viewer : _viewers) {
-        if (viewer->surfName() == "segmentation") {
-            viewer->setWindowTitle(tr("Surface %1").arg(QString::fromStdString(_surfID)));
-            break;
-        }
+    if (auto* viewer = segmentationViewer()) {
+        viewer->setWindowTitle(tr("Surface %1").arg(QString::fromStdString(_surfID)));
     }
 
     if (!_opchains.count(_surfID)) {
@@ -1769,10 +1905,12 @@ void CWindow::onSegFilterChanged(int index)
         }
 
         // Apply to viewers
-        for (auto &viewer : _viewers) {
-            if (viewer->surfName() != "segmentation") {
-                viewer->setIntersects(all_intersects);
-            }
+        if (_viewerManager) {
+            _viewerManager->forEachViewer([&all_intersects](CVolumeViewer* viewer) {
+                if (viewer && viewer->surfName() != "segmentation") {
+                    viewer->setIntersects(all_intersects);
+                }
+            });
         }
 
         UpdateVolpkgLabel(0);
@@ -1937,10 +2075,12 @@ void CWindow::onSegFilterChanged(int index)
     UpdateVolpkgLabel(filterCounter);
 
     // Apply the intersection set to all non-segmentation viewers
-    for (auto &viewer : _viewers) {
-        if (viewer->surfName() != "segmentation") {
-            viewer->setIntersects(dbg_intersects);
-        }
+    if (_viewerManager) {
+        _viewerManager->forEachViewer([&dbg_intersects](CVolumeViewer* viewer) {
+            if (viewer && viewer->surfName() != "segmentation") {
+                viewer->setIntersects(dbg_intersects);
+            }
+        });
     }
 }
 
@@ -3005,6 +3145,558 @@ void CWindow::onAxisAlignedSlicesToggled(bool enabled)
 {
     _useAxisAlignedSlices = enabled;
     applySlicePlaneOrientation();
+}
+
+void CWindow::onSegmentationEditingModeChanged(bool enabled)
+{
+    if (_segmentationEditingEnabled == enabled) {
+        return;
+    }
+    _segmentationEditingEnabled = enabled;
+
+    if (_segmentationWidget && _segmentationWidget->isEditingEnabled() != enabled) {
+        _segmentationWidget->setEditingEnabled(enabled);
+    }
+
+    if (enabled) {
+        QuadSurface* activeSurface = dynamic_cast<QuadSurface*>(_surf_col->surface("segmentation"));
+        if (!activeSurface && _opchains.count(_surfID) && _opchains[_surfID]) {
+            activeSurface = _opchains[_surfID]->src();
+        }
+
+        if (activeSurface && _segmentationEdit) {
+            if (_segmentationEdit->beginSession(activeSurface, _segmentationDownsample)) {
+                _segmentationEdit->setRadius(_segmentationRadius);
+                _segmentationEdit->setSigma(_segmentationSigma);
+                _segmentationEdit->setDownsample(_segmentationDownsample);
+                if (auto* preview = _segmentationEdit->previewSurface()) {
+                    _surf_col->setSurface("segmentation", preview);
+                }
+                if (_segmentationWidget) {
+                    _segmentationWidget->setPendingChanges(false);
+                }
+            }
+        }
+        _segmentationHover.clear();
+        _segmentationCursorValid = false;
+        if (_segmentationOverlay) {
+            _segmentationOverlay->setActiveHandle(std::nullopt, false);
+            _segmentationOverlay->setHoverHandle(std::nullopt, false);
+            _segmentationOverlay->refreshAll();
+        }
+        for (auto* v : _viewers) {
+            if (v) {
+                v->clearOverlayGroup("segmentation_radius_indicator");
+            }
+        }
+
+        if (fReviewedShortcut) {
+            fReviewedShortcut->setEnabled(false);
+        }
+        updateSegmentationCursorForViewers();
+    } else {
+        if (_segmentationEdit && _segmentationEdit->hasSession()) {
+            QuadSurface* base = _segmentationEdit->baseSurface();
+            _segmentationEdit->endSession();
+            if (base) {
+                _surf_col->setSurface("segmentation", base);
+            }
+        }
+        if (_segmentationWidget) {
+            _segmentationWidget->setPendingChanges(false);
+        }
+        if (_segmentationPointAddMode) {
+            setSegmentationPointAddMode(false, true);
+        }
+        _segmentationDrag = {};
+        _segmentationHover.clear();
+        _segmentationCursorValid = false;
+        if (_segmentationOverlay) {
+            _segmentationOverlay->setActiveHandle(std::nullopt, false);
+            _segmentationOverlay->setHoverHandle(std::nullopt, false);
+            _segmentationOverlay->setKeyboardHandle(std::nullopt, false);
+            _segmentationOverlay->refreshAll();
+        }
+        for (auto* v : _viewers) {
+            if (v) {
+                v->clearOverlayGroup("segmentation_radius_indicator");
+                v->fGraphicsView->unsetCursor();
+            }
+        }
+
+        if (fReviewedShortcut) {
+            fReviewedShortcut->setEnabled(true);
+        }
+    }
+
+    const QString message = enabled
+        ? tr("Segmentation editing enabled")
+        : tr("Segmentation editing disabled");
+    statusBar()->showMessage(message, 2000);
+
+    if (_segmentationOverlay) {
+        _segmentationOverlay->setEditingEnabled(enabled);
+        _segmentationOverlay->setDownsample(_segmentationDownsample);
+        _segmentationOverlay->setRadius(_segmentationRadius);
+        _segmentationOverlay->refreshAll();
+    }
+
+    for (auto* viewer : _viewers) {
+        if (viewer) {
+            if (viewer->surfName() == "segmentation") {
+                auto it = _viewerResetDefaults.find(viewer);
+                if (it == _viewerResetDefaults.end()) {
+                    _viewerResetDefaults[viewer] = true;
+                    it = _viewerResetDefaults.find(viewer);
+                }
+                if (enabled) {
+                    viewer->setResetViewOnSurfaceChange(false);
+                } else {
+                    viewer->setResetViewOnSurfaceChange(it->second);
+                }
+            }
+            viewer->setSegmentationEditActive(enabled);
+        }
+    }
+
+    if (!enabled) {
+        for (auto* viewer : _viewers) {
+            if (viewer && viewer->fGraphicsView) {
+                viewer->fGraphicsView->setCursor(Qt::ArrowCursor);
+            }
+        }
+    }
+}
+
+void CWindow::onSegmentationDownsampleChanged(int value)
+{
+    if (value == _segmentationDownsample) {
+        return;
+    }
+    _segmentationDownsample = value;
+
+    if (_segmentationOverlay) {
+        _segmentationOverlay->setDownsample(value);
+    }
+
+    if (_segmentationEdit && _segmentationEdit->hasSession()) {
+        _segmentationEdit->setDownsample(value);
+        _surf_col->setSurface("segmentation", _segmentationEdit->previewSurface());
+        if (_segmentationWidget) {
+            _segmentationWidget->setPendingChanges(_segmentationEdit->hasPendingChanges());
+        }
+        if (_segmentationOverlay) {
+            _segmentationOverlay->refreshAll();
+        }
+    } else if (_segmentationOverlay) {
+        _segmentationOverlay->refreshAll();
+    }
+}
+
+void CWindow::onSegmentationRadiusChanged(float radius)
+{
+    if (std::fabs(radius - _segmentationRadius) < 1e-4f) {
+        return;
+    }
+    _segmentationRadius = radius;
+
+    if (_segmentationOverlay) {
+        _segmentationOverlay->setRadius(radius);
+    }
+
+    if (_segmentationEdit && _segmentationEdit->hasSession()) {
+        _segmentationEdit->setRadius(radius);
+        _surf_col->setSurface("segmentation", _segmentationEdit->previewSurface());
+        if (_segmentationWidget) {
+            _segmentationWidget->setPendingChanges(_segmentationEdit->hasPendingChanges());
+        }
+        if (_segmentationOverlay) {
+            _segmentationOverlay->refreshAll();
+        }
+    } else if (_segmentationOverlay) {
+        _segmentationOverlay->refreshAll();
+    }
+}
+
+void CWindow::onSegmentationRadiusWheel(CVolumeViewer* viewer, int steps, const QPointF& scenePoint, const cv::Vec3f& /*worldPos*/)
+{
+    if (!_segmentationEditingEnabled || !_segmentationEdit || !_segmentationEdit->hasSession()) {
+        return;
+    }
+
+    if (steps == 0) {
+        return;
+    }
+
+    const int direction = (steps > 0) ? 1 : -1;
+    const int magnitude = std::max(1, std::abs(steps));
+    const float delta = static_cast<float>(direction * 2 * magnitude);
+
+    float newRadius = std::max(1.0f, _segmentationRadius + delta);
+    if (std::fabs(newRadius - _segmentationRadius) < 1e-4f) {
+        return;
+    }
+
+    _segmentationRadius = newRadius;
+
+    if (_segmentationWidget) {
+        _segmentationWidget->setRadius(newRadius);
+    }
+    if (_segmentationEdit) {
+        _segmentationEdit->setRadius(newRadius);
+        _surf_col->setSurface("segmentation", _segmentationEdit->previewSurface());
+        if (_segmentationWidget) {
+            _segmentationWidget->setPendingChanges(_segmentationEdit->hasPendingChanges());
+        }
+    }
+    if (_segmentationOverlay) {
+        _segmentationOverlay->setRadius(newRadius);
+        _segmentationOverlay->refreshViewer(viewer);
+    }
+
+    showSegmentationRadiusIndicator(viewer, scenePoint, newRadius);
+}
+
+void CWindow::showSegmentationRadiusIndicator(CVolumeViewer* viewer, const QPointF& scenePoint, float radius)
+{
+    if (!viewer) {
+        return;
+    }
+
+    viewer->clearOverlayGroup("segmentation_radius_indicator");
+
+    auto* textItem = new QGraphicsSimpleTextItem(QString::number(radius, 'f', 0));
+    QFont font = textItem->font();
+    font.setPointSizeF(11.0);
+    textItem->setFont(font);
+    textItem->setBrush(QColor(255, 255, 255));
+    textItem->setPen(QPen(Qt::black, 0.8));
+    textItem->setZValue(150.0);
+
+    const QPointF offset(12.0, -12.0);
+    textItem->setPos(scenePoint + offset);
+
+    viewer->setOverlayGroup("segmentation_radius_indicator", {textItem});
+
+    QPointer<CVolumeViewer> guard(viewer);
+    QTimer::singleShot(800, this, [guard]() {
+        if (guard) {
+            guard->clearOverlayGroup("segmentation_radius_indicator");
+        }
+    });
+}
+
+const QCursor& CWindow::segmentationAddCursor() const
+{
+    static QCursor cursor;
+    static bool initialized = false;
+    if (!initialized) {
+        QPixmap pixmap(32, 32);
+        pixmap.fill(Qt::transparent);
+        QPainter painter(&pixmap);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        QPen pen(QColor(0, 200, 0));
+        pen.setWidth(3);
+        painter.setPen(pen);
+        painter.drawEllipse(QPointF(16, 16), 8, 8);
+        painter.drawLine(QPointF(16, 6), QPointF(16, 26));
+        painter.drawLine(QPointF(6, 16), QPointF(26, 16));
+        painter.end();
+        cursor = QCursor(pixmap, 16, 16);
+        initialized = true;
+    }
+    return cursor;
+}
+
+void CWindow::updateSegmentationCursorForViewers()
+{
+    for (auto* viewer : _viewers) {
+        if (!viewer || !viewer->fGraphicsView) {
+            continue;
+        }
+        if (!_segmentationEditingEnabled) {
+            viewer->fGraphicsView->unsetCursor();
+            continue;
+        }
+        if (_segmentationDrag.active && viewer == _segmentationDrag.viewer) {
+            continue;
+        }
+        if (_segmentationPointAddMode) {
+            viewer->fGraphicsView->setCursor(segmentationAddCursor());
+        } else {
+            viewer->fGraphicsView->setCursor(Qt::ArrowCursor);
+        }
+    }
+}
+
+void CWindow::setSegmentationPointAddMode(bool enabled, bool silent)
+{
+    if (_segmentationPointAddMode == enabled) {
+        return;
+    }
+    _segmentationPointAddMode = enabled;
+    updateSegmentationCursorForViewers();
+    if (!silent) {
+        const QString msg = enabled
+            ? tr("Segmentation point-add mode enabled")
+            : tr("Segmentation point-add mode disabled");
+        statusBar()->showMessage(msg, 1500);
+    }
+}
+
+void CWindow::onSegmentationSigmaChanged(float sigma)
+{
+    if (std::fabs(sigma - _segmentationSigma) < 1e-4f) {
+        return;
+    }
+    _segmentationSigma = sigma;
+
+    if (_segmentationEdit && _segmentationEdit->hasSession()) {
+        _segmentationEdit->setSigma(sigma);
+        _surf_col->setSurface("segmentation", _segmentationEdit->previewSurface());
+        if (_segmentationWidget) {
+            _segmentationWidget->setPendingChanges(_segmentationEdit->hasPendingChanges());
+        }
+        if (_segmentationOverlay) {
+            _segmentationOverlay->refreshAll();
+        }
+    } else if (_segmentationOverlay) {
+        _segmentationOverlay->refreshAll();
+    }
+}
+
+void CWindow::onSegmentationApplyRequested()
+{
+    statusBar()->showMessage(tr("Applying segmentation edits"), 2000);
+    if (_segmentationEdit && _segmentationEdit->hasSession()) {
+        _segmentationEdit->applyPreview();
+        _surf_col->setSurface("segmentation", _segmentationEdit->previewSurface());
+        if (_segmentationWidget) {
+            _segmentationWidget->setPendingChanges(false);
+        }
+        if (auto* base = _segmentationEdit->baseSurface()) {
+            try {
+                base->saveOverwrite();
+            } catch (const std::exception& e) {
+                statusBar()->showMessage(tr("Failed to save segmentation: ") + e.what(), 5000);
+            }
+        }
+        _segmentationDrag = {};
+        _segmentationHover.clear();
+        if (_segmentationOverlay) {
+            _segmentationOverlay->setActiveHandle(std::nullopt, false);
+            _segmentationOverlay->setHoverHandle(std::nullopt, false);
+            _segmentationOverlay->setKeyboardHandle(std::nullopt, false);
+            _segmentationOverlay->refreshAll();
+        }
+    }
+}
+
+void CWindow::onSegmentationResetRequested()
+{
+    statusBar()->showMessage(tr("Segmentation edits reset"), 2000);
+    if (_segmentationEdit && _segmentationEdit->hasSession()) {
+        _segmentationEdit->resetPreview();
+        _surf_col->setSurface("segmentation", _segmentationEdit->previewSurface());
+        if (_segmentationWidget) {
+            _segmentationWidget->setPendingChanges(false);
+        }
+        _segmentationDrag = {};
+        _segmentationHover.clear();
+        if (_segmentationOverlay) {
+            _segmentationOverlay->setActiveHandle(std::nullopt, false);
+            _segmentationOverlay->setHoverHandle(std::nullopt, false);
+            _segmentationOverlay->setKeyboardHandle(std::nullopt, false);
+            _segmentationOverlay->refreshAll();
+        }
+    }
+}
+
+void CWindow::onSegmentationStopToolsRequested()
+{
+    if (!initializeCommandLineRunner()) {
+        return;
+    }
+    if (_cmdRunner) {
+        _cmdRunner->cancel();
+        statusBar()->showMessage(tr("Cancelling running tools..."), 3000);
+    }
+}
+
+void CWindow::onSegmentationMousePress(CVolumeViewer* viewer, const cv::Vec3f& worldPos, const cv::Vec3f& /*normal*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
+{
+    if (!_segmentationEditingEnabled || !_segmentationEdit || !_segmentationEdit->hasSession()) {
+        return;
+    }
+    if (button != Qt::LeftButton) {
+        return;
+    }
+    PlaneSurface* planeSurface = viewer ? dynamic_cast<PlaneSurface*>(viewer->currentSurface()) : nullptr;
+    Qt::KeyboardModifiers effectiveModifiers = modifiers & ~Qt::ShiftModifier;
+
+    if (effectiveModifiers.testFlag(Qt::ControlModifier)) {
+        const float tolerance = std::max(10.0f, _segmentationRadius * 0.5f);
+        if (auto* handle = _segmentationEdit->findNearestHandle(worldPos, tolerance)) {
+            if (_segmentationEdit->removeHandle(handle->row, handle->col)) {
+                _segmentationHover.clear();
+                if (_segmentationWidget) {
+                    _segmentationWidget->setPendingChanges(true);
+                }
+                _surf_col->setSurface("segmentation", _segmentationEdit->previewSurface());
+                if (_segmentationOverlay) {
+                    _segmentationOverlay->setActiveHandle(std::nullopt, false);
+                    _segmentationOverlay->setHoverHandle(std::nullopt, false);
+                    _segmentationOverlay->setKeyboardHandle(std::nullopt, false);
+                    _segmentationOverlay->refreshAll();
+                }
+            }
+        }
+        return;
+    }
+    if (!viewer) {
+        return;
+    }
+
+    const float pickTolerance = std::max(5.0f, _segmentationRadius);
+    auto* handle = _segmentationEdit->findNearestHandle(worldPos, pickTolerance);
+    if (!_segmentationPointAddMode && !handle) {
+        return;
+    }
+
+    if (!handle) {
+        const float planeTolerance = planeSurface ? pickTolerance : 0.0f;
+        if (auto added = _segmentationEdit->addHandleAtWorld(worldPos, pickTolerance, planeSurface, planeTolerance)) {
+            cv::Vec3f handleWorld = worldPos;
+            if (auto world = _segmentationEdit->handleWorldPosition(added->first, added->second)) {
+                handleWorld = *world;
+            }
+            _segmentationHover.set(added->first, added->second, handleWorld);
+            if (_segmentationWidget) {
+                _segmentationWidget->setPendingChanges(true);
+            }
+            _surf_col->setSurface("segmentation", _segmentationEdit->previewSurface());
+            if (_segmentationOverlay) {
+                _segmentationOverlay->setActiveHandle(*added);
+                _segmentationOverlay->setHoverHandle(*added);
+                _segmentationOverlay->setKeyboardHandle(*added, false);
+                _segmentationOverlay->refreshAll();
+            }
+        }
+        return;
+    }
+
+    _segmentationDrag.active = true;
+    _segmentationDrag.row = handle->row;
+    _segmentationDrag.col = handle->col;
+    _segmentationDrag.viewer = viewer;
+    _segmentationDrag.startWorld = handle->currentWorld;
+    _segmentationDrag.moved = false;
+
+    _segmentationHover.clear();
+    if (_segmentationOverlay) {
+        _segmentationOverlay->setHoverHandle(std::nullopt);
+        _segmentationOverlay->setActiveHandle(std::make_pair(handle->row, handle->col));
+    }
+
+    if (viewer->fGraphicsView) {
+        viewer->fGraphicsView->setCursor(Qt::ClosedHandCursor);
+    }
+}
+
+void CWindow::onSegmentationMouseMove(CVolumeViewer* viewer, const cv::Vec3f& worldPos, Qt::MouseButtons buttons, Qt::KeyboardModifiers /*modifiers*/)
+{
+    if (!_segmentationEditingEnabled || !_segmentationEdit || !_segmentationEdit->hasSession()) {
+        return;
+    }
+
+    _segmentationCursorWorld = worldPos;
+    _segmentationCursorValid = true;
+
+    if (_segmentationDrag.active && viewer == _segmentationDrag.viewer) {
+        if (!(buttons & Qt::LeftButton)) {
+            return;
+        }
+
+        _segmentationEdit->updateHandleWorldPosition(_segmentationDrag.row, _segmentationDrag.col, worldPos);
+        _segmentationDrag.moved = true;
+        _surf_col->setSurface("segmentation", _segmentationEdit->previewSurface());
+
+        if (_segmentationWidget) {
+            _segmentationWidget->setPendingChanges(_segmentationEdit->hasPendingChanges());
+        }
+
+        if (auto world = _segmentationEdit->handleWorldPosition(_segmentationDrag.row, _segmentationDrag.col)) {
+            _segmentationHover.set(_segmentationDrag.row, _segmentationDrag.col, *world);
+        }
+
+        if (_segmentationOverlay) {
+            _segmentationOverlay->setActiveHandle(std::make_pair(_segmentationDrag.row, _segmentationDrag.col), false);
+            _segmentationOverlay->setHoverHandle(std::nullopt, false);
+            _segmentationOverlay->refreshAll();
+        }
+        return;
+    }
+
+    auto* handle = _segmentationEdit->findNearestHandle(worldPos, -1.0f);
+    if (handle) {
+        const bool changed = !_segmentationHover.valid ||
+                              _segmentationHover.row != handle->row ||
+                              _segmentationHover.col != handle->col;
+        _segmentationHover.set(handle->row, handle->col, handle->currentWorld);
+        if (_segmentationOverlay) {
+            _segmentationOverlay->setHoverHandle(std::make_pair(handle->row, handle->col));
+            if (changed) {
+                _segmentationOverlay->refreshViewer(viewer);
+            }
+        }
+    } else if (_segmentationHover.valid) {
+        _segmentationHover.clear();
+        if (_segmentationOverlay) {
+            _segmentationOverlay->setHoverHandle(std::nullopt);
+            _segmentationOverlay->refreshViewer(viewer);
+        }
+    }
+}
+
+void CWindow::onSegmentationMouseRelease(CVolumeViewer* viewer, const cv::Vec3f& worldPos, Qt::MouseButton button, Qt::KeyboardModifiers /*modifiers*/)
+{
+    if (!_segmentationDrag.active || viewer != _segmentationDrag.viewer) {
+        return;
+    }
+    if (button != Qt::LeftButton) {
+        return;
+    }
+
+    if (viewer && viewer->fGraphicsView) {
+        viewer->fGraphicsView->setCursor(Qt::ArrowCursor);
+    }
+
+    if (_segmentationPointAddMode && _segmentationEdit && _segmentationEdit->hasSession() && !_segmentationDrag.moved) {
+        _segmentationEdit->updateHandleWorldPosition(_segmentationDrag.row, _segmentationDrag.col, worldPos);
+        if (auto world = _segmentationEdit->handleWorldPosition(_segmentationDrag.row, _segmentationDrag.col)) {
+            _segmentationHover.set(_segmentationDrag.row, _segmentationDrag.col, *world);
+        }
+    }
+
+    if (_segmentationEdit && _segmentationEdit->hasSession()) {
+        _surf_col->setSurface("segmentation", _segmentationEdit->previewSurface());
+    }
+
+    if (_segmentationWidget) {
+        _segmentationWidget->setPendingChanges(_segmentationEdit && _segmentationEdit->hasPendingChanges());
+    }
+
+    if (_segmentationOverlay) {
+        _segmentationOverlay->setActiveHandle(std::nullopt, false);
+        if (_segmentationHover.valid) {
+            _segmentationOverlay->setHoverHandle(std::make_pair(_segmentationHover.row, _segmentationHover.col));
+        } else {
+            _segmentationOverlay->setHoverHandle(std::nullopt);
+        }
+    }
+
+    _segmentationDrag = {};
+    updateSegmentationCursorForViewers();
 }
 
 void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)

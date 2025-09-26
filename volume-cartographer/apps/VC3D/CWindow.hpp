@@ -6,16 +6,24 @@
 #include <opencv2/core.hpp>
 #include <QComboBox>
 #include <QCheckBox>
+#include <memory>
 #include "ui_VCMain.h"
 
 #include "vc/ui/VCCollection.hpp"
 
 #include <QShortcut>
+#include <QCursor>
+
+#include <unordered_map>
 
 #include "CPointCollectionWidget.hpp"
 #include "CSurfaceCollection.hpp"
 #include "CVolumeViewer.hpp"
 #include "DrawingWidget.hpp"
+#include "SegmentationEditManager.hpp"
+#include "SegmentationOverlayController.hpp"
+#include "ViewerManager.hpp"
+#include "SegmentationWidget.hpp"
 #include "OpChain.hpp"
 #include "OpsList.hpp"
 #include "OpsSettings.hpp"
@@ -153,6 +161,23 @@ private slots:
     void onCopyCoordinates();
     void onImportObjAsPatches();
     void onAxisAlignedSlicesToggled(bool enabled);
+    void onSegmentationEditingModeChanged(bool enabled);
+    void onSegmentationDownsampleChanged(int value);
+    void onSegmentationRadiusChanged(float radius);
+    void onSegmentationSigmaChanged(float sigma);
+    void onSegmentationApplyRequested();
+    void onSegmentationResetRequested();
+    void onSegmentationStopToolsRequested();
+    void onSegmentationMousePress(CVolumeViewer* viewer, const cv::Vec3f& worldPos, const cv::Vec3f& normal, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+    void onSegmentationMouseMove(CVolumeViewer* viewer, const cv::Vec3f& worldPos, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
+    void onSegmentationMouseRelease(CVolumeViewer* viewer, const cv::Vec3f& worldPos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+    void onSegmentationRadiusWheel(CVolumeViewer* viewer, int steps, const QPointF& scenePoint, const cv::Vec3f& worldPos);
+    void showSegmentationRadiusIndicator(CVolumeViewer* viewer, const QPointF& scenePoint, float radius);
+    void setSegmentationPointAddMode(bool enabled, bool silent = false);
+    void updateSegmentationCursorForViewers();
+    const QCursor& segmentationAddCursor() const;
+    void configureViewerConnections(CVolumeViewer* viewer);
+    CVolumeViewer* segmentationViewer() const;
 
 private:
     bool appInitComplete{false};
@@ -222,6 +247,7 @@ private:
     
   
     SeedingWidget* _seedingWidget;
+    SegmentationWidget* _segmentationWidget{nullptr};
     DrawingWidget* _drawingWidget;
     CPointCollectionWidget* _point_collection_widget;
 
@@ -246,11 +272,54 @@ private:
     bool can_change_volume_();
     
     ChunkCache *chunk_cache;
-    std::vector<CVolumeViewer*> _viewers;
+    std::unique_ptr<ViewerManager> _viewerManager;
     CSurfaceCollection *_surf_col;
     bool _useAxisAlignedSlices{false};
 
     std::unordered_map<std::string, OpChain*> _opchains;
+
+    bool _segmentationEditingEnabled{false};
+    int _segmentationDownsample{12};
+    float _segmentationRadius{10.0f};
+    float _segmentationSigma{10.0f};
+    std::unique_ptr<SegmentationEditManager> _segmentationEdit;
+    std::unique_ptr<SegmentationOverlayController> _segmentationOverlay;
+    bool _segmentationPointAddMode{false};
+
+    struct SegmentationDragState {
+        bool active{false};
+        int row{0};
+        int col{0};
+        CVolumeViewer* viewer{nullptr};
+        cv::Vec3f startWorld{0, 0, 0};
+        bool moved{false};
+    };
+    SegmentationDragState _segmentationDrag;
+
+    struct SegmentationHoverState {
+        bool valid{false};
+        int row{0};
+        int col{0};
+        cv::Vec3f handleWorld{0, 0, 0};
+        bool hasWorld{false};
+        void set(int r, int c, const cv::Vec3f& world)
+        {
+            row = r;
+            col = c;
+            handleWorld = world;
+            valid = true;
+            hasWorld = true;
+        }
+        void clear()
+        {
+            valid = false;
+            hasWorld = false;
+        }
+    };
+    SegmentationHoverState _segmentationHover;
+
+    cv::Vec3f _segmentationCursorWorld{0, 0, 0};
+    bool _segmentationCursorValid{false};
 
     // runner for command line tools 
     CommandLineToolRunner* _cmdRunner;
@@ -268,4 +337,3 @@ private:
 
     QAction* fImportObjAct;
 };  // class CWindow
-
