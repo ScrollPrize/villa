@@ -40,6 +40,7 @@ static constexpr int VOLPKG_SLICE_MIN_INDEX = 0;
 //forward declaration to avoid circular inclusion as CommandLineToolRunner needs CWindow.hpp
 class CommandLineToolRunner;
 class SegmentationModule;
+class SurfacePanelController;
 
 class CWindow : public QMainWindow
 {
@@ -64,7 +65,6 @@ public slots:
     void onManualPlaneChanged(void);
     void onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onOpChainChanged(OpChain *chain);
-    void onTagChanged(void);
     void onSurfaceContextMenuRequested(const QPoint& pos);
     void onRenderSegment(const std::string& segmentId);
     void onGrowSegmentFromSegment(const std::string& segmentId);
@@ -96,15 +96,13 @@ private:
     void CreateActions(void);
 
     void FillSurfaceTree(void);
-    void UpdateSurfaceTreeIcon(SurfaceTreeWidgetItem *item);
-
     void UpdateView(void);
     void UpdateVolpkgLabel(int filterCounter);
 
     void UpdateRecentVolpkgActions(void);
     void UpdateRecentVolpkgList(const QString& path);
     void RemoveEntryFromRecentVolpkg(const QString& path);
-    
+
     // Helper method for command line tools
     bool initializeCommandLineRunner(void);
 
@@ -118,17 +116,6 @@ private:
 
     void OpenVolume(const QString& path);
     void CloseVolume(void);
-    void LoadSurfaces(bool reload = false);
-    
-    // Incremental surface loading methods
-    struct SurfaceChanges {
-        std::vector<std::string> toAdd;
-        std::vector<std::string> toRemove;
-    };
-    SurfaceChanges DetectSurfaceChanges();
-    void AddSingleSegmentation(const std::string& segId);
-    void RemoveSingleSegmentation(const std::string& segId);
-    void LoadSurfacesIncremental();
 
     static void audio_callback(void *user_data, uint8_t *raw_buffer, int bytes);
     void playPing();
@@ -144,7 +131,6 @@ private slots:
     void ShowSettings();
     void ResetSegmentationViews();
     void onSurfaceSelected();
-    void onSegFilterChanged(int index);
     void onSegmentationDirChanged(int index);
     void onEditMaskPressed();
     void onAppendMaskPressed();
@@ -164,6 +150,7 @@ private slots:
     void onSegmentationStopToolsRequested();
     void configureViewerConnections(CVolumeViewer* viewer);
     CVolumeViewer* segmentationViewer() const;
+    void clearSurfaceSelection();
 
 private:
     bool appInitComplete{false};
@@ -208,26 +195,7 @@ private:
     QPushButton* _btnSurfaceFromSelection = nullptr;
 
     QComboBox* volSelect;
-    QCheckBox* chkFilterFocusPoints;
-   QComboBox* cmbPointSetFilter;
-   QPushButton* btnPointSetFilterAll;
-   QPushButton* btnPointSetFilterNone;
-   QComboBox* cmbPointSetFilterMode;
-   QCheckBox* chkFilterUnreviewed;
-    QCheckBox* chkFilterRevisit;
-    QCheckBox* chkFilterNoExpansion;
-    QCheckBox* chkFilterNoDefective;
-    QCheckBox* chkFilterPartialReview;
-    QCheckBox* chkFilterCurrentOnly;
-    QCheckBox* chkFilterHideUnapproved;
-    QCheckBox* chkFilterInspectOnly;
     QComboBox* cmbSegmentationDir;
-    
-    QCheckBox* _chkApproved;
-    QCheckBox* _chkDefective;
-    QCheckBox* _chkReviewed;
-    QCheckBox* _chkRevisit;
-    QCheckBox* _chkInspect;
     QuadSurface *_surf;
     std::string _surfID;
     
@@ -271,6 +239,7 @@ private:
     std::unique_ptr<SegmentationEditManager> _segmentationEdit;
     std::unique_ptr<SegmentationOverlayController> _segmentationOverlay;
     std::unique_ptr<SegmentationModule> _segmentationModule;
+    std::unique_ptr<SurfacePanelController> _surfacePanel;
     // runner for command line tools 
     CommandLineToolRunner* _cmdRunner;
     

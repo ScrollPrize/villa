@@ -1,5 +1,6 @@
 #include "CWindow.hpp"
 #include "CSurfaceCollection.hpp"
+#include "SurfacePanelController.hpp"
 
 #include <QSettings>
 #include <QMessageBox>
@@ -643,22 +644,9 @@ void CWindow::onDeleteSegments(const std::vector<std::string>& segmentIds)
     // Only update UI if we successfully deleted something
     if (needsReload) {
         try {
-            // Use incremental removal to update the UI for each successfully deleted segment
-            for (const auto& segmentId : segmentIds) {
-                // Only remove from UI if it was successfully deleted from disk
-                if (std::find(failedSegments.begin(), failedSegments.end(),
-                            QString::fromStdString(segmentId)) == failedSegments.end() &&
-                    std::find(failedSegments.begin(), failedSegments.end(),
-                            QString::fromStdString(segmentId) + " (permission denied)") == failedSegments.end() &&
-                    std::find(failedSegments.begin(), failedSegments.end(),
-                            QString::fromStdString(segmentId) + " (filesystem error)") == failedSegments.end()) {
-                    RemoveSingleSegmentation(segmentId);
-                }
+            if (_surfacePanel) {
+                _surfacePanel->loadSurfacesIncremental();
             }
-
-            // Update the volpkg label and filters
-            UpdateVolpkgLabel(0);
-            onSegFilterChanged(0);
         } catch (const std::exception& e) {
             std::cerr << "Error updating UI after deletion: " << e.what() << std::endl;
             QMessageBox::warning(this, tr("Warning"),

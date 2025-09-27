@@ -27,6 +27,8 @@ set(srcs
     SegmentationEditManager.hpp
     SegmentationOverlayController.cpp
     SegmentationOverlayController.hpp
+    SurfacePanelController.cpp
+    SurfacePanelController.hpp
     SegmentationModule.cpp
     SegmentationModule.hpp
     ViewerManager.cpp
