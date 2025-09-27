@@ -146,29 +146,7 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     }
 
     if (!enabled) {
-        _drag.reset();
-        _hover.clear();
-        _cursorValid = false;
-        if (_overlay) {
-            _overlay->setActiveHandle(std::nullopt, false);
-            _overlay->setHoverHandle(std::nullopt, false);
-            _overlay->setKeyboardHandle(std::nullopt, false);
-            _overlay->refreshAll();
-        }
-        if (_viewerManager) {
-            _viewerManager->forEachViewer([](CVolumeViewer* v) {
-                if (!v) {
-                    return;
-                }
-                v->clearOverlayGroup("segmentation_radius_indicator");
-                if (v->fGraphicsView) {
-                    v->fGraphicsView->unsetCursor();
-                }
-            });
-        }
-        if (_pointAddMode) {
-            setPointAddMode(false, true);
-        }
+        resetInteractionState();
     } else {
         if (_viewerManager) {
             _viewerManager->forEachViewer([](CVolumeViewer* v) {
@@ -264,9 +242,7 @@ void SegmentationModule::applyEdits()
     if (_surfaces) {
         _surfaces->setSurface("segmentation", _editManager->previewSurface());
     }
-    if (_widget) {
-        _widget->setPendingChanges(false);
-    }
+    emitPendingChanges();
 
     if (auto* base = _editManager->baseSurface()) {
         try {
@@ -276,14 +252,7 @@ void SegmentationModule::applyEdits()
         }
     }
 
-    _drag.reset();
-    _hover.clear();
-    if (_overlay) {
-        _overlay->setActiveHandle(std::nullopt, false);
-        _overlay->setHoverHandle(std::nullopt, false);
-        _overlay->setKeyboardHandle(std::nullopt, false);
-        _overlay->refreshAll();
-    }
+    resetInteractionState();
 }
 
 void SegmentationModule::resetEdits()
@@ -297,18 +266,9 @@ void SegmentationModule::resetEdits()
     if (_surfaces) {
         _surfaces->setSurface("segmentation", _editManager->previewSurface());
     }
-    if (_widget) {
-        _widget->setPendingChanges(false);
-    }
+    emitPendingChanges();
 
-    _drag.reset();
-    _hover.clear();
-    if (_overlay) {
-        _overlay->setActiveHandle(std::nullopt, false);
-        _overlay->setHoverHandle(std::nullopt, false);
-        _overlay->setKeyboardHandle(std::nullopt, false);
-        _overlay->refreshAll();
-    }
+    resetInteractionState();
 }
 
 void SegmentationModule::stopTools()
@@ -437,6 +397,55 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
     return handled;
 }
 
+bool SegmentationModule::beginEditingSession(QuadSurface* activeSurface)
+{
+    if (!_editingEnabled || !_editManager || !activeSurface) {
+        return false;
+    }
+
+    if (!_editManager->beginSession(activeSurface, _downsample)) {
+        return false;
+    }
+
+    _editManager->setRadius(_radius);
+    _editManager->setSigma(_sigma);
+    _editManager->setDownsample(_downsample);
+
+    if (_surfaces) {
+        if (auto* preview = _editManager->previewSurface()) {
+            _surfaces->setSurface("segmentation", preview);
+        }
+    }
+
+    emitPendingChanges();
+    refreshOverlay();
+    updateViewerCursors();
+
+    return true;
+}
+
+void SegmentationModule::endEditingSession()
+{
+    if (!_editManager || !_editManager->hasSession()) {
+        return;
+    }
+
+    QuadSurface* base = _editManager->baseSurface();
+    _editManager->endSession();
+    if (_surfaces && base) {
+        _surfaces->setSurface("segmentation", base);
+    }
+
+    emitPendingChanges();
+    resetInteractionState();
+    updateViewerCursors();
+}
+
+bool SegmentationModule::hasActiveSession() const
+{
+    return _editManager && _editManager->hasSession();
+}
+
 void SegmentationModule::refreshOverlay()
 {
     if (_overlay) {
@@ -450,6 +459,36 @@ void SegmentationModule::emitPendingChanges()
         const bool pending = _editManager->hasPendingChanges();
         _widget->setPendingChanges(pending);
         emit pendingChangesChanged(pending);
+    }
+}
+
+void SegmentationModule::resetInteractionState()
+{
+    _drag.reset();
+    _hover.clear();
+    _cursorValid = false;
+
+    if (_overlay) {
+        _overlay->setActiveHandle(std::nullopt, false);
+        _overlay->setHoverHandle(std::nullopt, false);
+        _overlay->setKeyboardHandle(std::nullopt, false);
+        _overlay->refreshAll();
+    }
+
+    if (_pointAddMode) {
+        setPointAddMode(false, true);
+    }
+
+    if (_viewerManager) {
+        _viewerManager->forEachViewer([](CVolumeViewer* v) {
+            if (!v) {
+                return;
+            }
+            v->clearOverlayGroup("segmentation_radius_indicator");
+            if (v->fGraphicsView) {
+                v->fGraphicsView->unsetCursor();
+            }
+        });
     }
 }
 

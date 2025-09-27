@@ -57,6 +57,10 @@ public:
 
     bool handleKeyPress(QKeyEvent* event);
 
+    bool beginEditingSession(QuadSurface* activeSurface);
+    void endEditingSession();
+    bool hasActiveSession() const;
+
 signals:
     void editingEnabledChanged(bool enabled);
     void statusMessageRequested(const QString& text, int timeoutMs);
@@ -105,6 +109,7 @@ private:
     void bindViewerSignals(CVolumeViewer* viewer);
     void refreshOverlay();
     void emitPendingChanges();
+    void resetInteractionState();
     void showRadiusIndicator(CVolumeViewer* viewer,
                              const QPointF& scenePoint,
                              float radius);
