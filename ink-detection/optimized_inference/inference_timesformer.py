@@ -17,18 +17,24 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from tqdm.auto import tqdm
 import cv2
-import scipy.stats as st
+from math import ceil, floor
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+torch.backends.cudnn.benchmark = True
 
-def gkern(kernlen=21, nsig=3):
-    """Returns a 2D Gaussian kernel."""
-    x = np.linspace(-nsig, nsig, kernlen+1)
-    kern1d = np.diff(st.norm.cdf(x))
-    kern2d = np.outer(kern1d, kern1d)
-    return kern2d/kern2d.sum()
+def gkern(h: int, w: int, sigma: float) -> np.ndarray:
+    """
+    Fast 2D Gaussian weight map of shape (h, w).
+    """
+    y = np.arange(h, dtype=np.float32) - (h - 1) / 2.0
+    x = np.arange(w, dtype=np.float32) - (w - 1) / 2.0
+    xx, yy = np.meshgrid(x, y, indexing="xy")
+    s2 = 2.0 * (sigma ** 2 if sigma > 0 else 1.0)
+    k = np.exp(-(xx*xx + yy*yy) / s2)
+    k_sum = k.sum()
+    return k / (k_sum if k_sum > 0 else 1.0)
 
 class InferenceConfig:
     """Configuration class for inference parameters"""
@@ -37,26 +43,26 @@ class InferenceConfig:
     encoder_depth = 5
     
     # Inference configuration
-    size = 64
+    size = 64 # network input size (after resize)
     tile_size = 64
     stride = 32
     batch_size = 64
-    workers = 4
+    workers = min(4, os.cpu_count() or 4)
     
     # Image processing
     max_clip_value = 200
     pad_size = 256
     
     # Prediction smoothing
-    gaussian_kernel_size = 64
     gaussian_sigma = 1
 
 # Global config instance
 CFG = InferenceConfig()
 
-def preprocess_layers(layers: np.ndarray, 
+def preprocess_layers(layers: np.ndarray,
                      fragment_mask: Optional[np.ndarray] = None,
-                     is_reverse_segment: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+                     is_reverse_segment: bool = False) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+
     """
     Preprocess input layers for inference.
     
@@ -78,14 +84,15 @@ def preprocess_layers(layers: np.ndarray,
         
         # Pad to ensure divisible by pad_size
         h, w, c = layers.shape
+        orig_shape = (h, w)
         pad0 = (CFG.pad_size - h % CFG.pad_size) % CFG.pad_size
         pad1 = (CFG.pad_size - w % CFG.pad_size) % CFG.pad_size
         
         # Apply padding
         layers = np.pad(layers, [(0, pad0), (0, pad1), (0, 0)], constant_values=0)
         
-        # Clip values
-        layers = np.clip(layers, 0, CFG.max_clip_value)
+        # Clip & cast to float32 early
+        layers = np.clip(layers, 0, CFG.max_clip_value).astype(np.float32, copy=False)
         
         # Reverse if needed
         if is_reverse_segment:
@@ -100,14 +107,14 @@ def preprocess_layers(layers: np.ndarray,
         fragment_mask = np.pad(fragment_mask, [(0, pad0), (0, pad1)], constant_values=0)
         
         logger.info(f"Preprocessed layers shape: {layers.shape}, mask shape: {fragment_mask.shape}")
-        return layers, fragment_mask
+        return layers, fragment_mask, orig_shape
         
     except Exception as e:
         logger.error(f"Error in preprocess_layers: {e}")
         raise
 
-def create_inference_dataloader(layers: np.ndarray, 
-                               fragment_mask: np.ndarray) -> Tuple[DataLoader, np.ndarray, Tuple[int, int]]:
+def create_inference_dataloader(layers: np.ndarray,
+                               fragment_mask: np.ndarray) -> Tuple[DataLoader, Tuple[int, int]]:
     """
     Create a DataLoader for inference from preprocessed layers.
     
@@ -118,41 +125,38 @@ def create_inference_dataloader(layers: np.ndarray,
     Returns:
         Tuple of (dataloader, coordinates, original_shape)
     """
-    try:
-        images = []
-        xyxys = []
-        
+    try:     
         h, w, c = layers.shape
         
         # Generate sliding window coordinates
         x1_list = list(range(0, w - CFG.tile_size + 1, CFG.stride))
         y1_list = list(range(0, h - CFG.tile_size + 1, CFG.stride))
         
+        # NOTE: keep only coordinates; do NOT precreate image tiles
+        xyxys = []
         for y1 in y1_list:
             for x1 in x1_list:
                 y2 = y1 + CFG.tile_size
                 x2 = x1 + CFG.tile_size
-                
-                # Only include tiles where mask is not zero (valid regions)
-                if not np.any(fragment_mask[y1:y2, x1:x2] == 0):
-                    tile = layers[y1:y2, x1:x2]
-                    images.append(tile)
+                # Include tiles with ANY overlap with valid mask
+                if np.any(fragment_mask[y1:y2, x1:x2] != 0):
                     xyxys.append([x1, y1, x2, y2])
-        
-        if not images:
-            raise ValueError("No valid tiles found in the input layers")
+        if not xyxys:
+            raise ValueError("No valid tiles found in the input layers (mask fully empty?).")
         
         # Create dataset with transforms
         transform = A.Compose([
             A.Resize(CFG.size, CFG.size),
             A.Normalize(
-                mean=[0] * CFG.in_chans,
-                std=[1] * CFG.in_chans
+                mean=[0.0] * CFG.in_chans,
+                std=[1.0] * CFG.in_chans,
+                max_pixel_value=CFG.max_clip_value
             ),
-            ToTensorV2(transpose_mask=True),
+            ToTensorV2(),
         ])
-        
-        dataset = CustomDatasetTest(images, np.stack(xyxys), transform=transform)
+
+        dataset = SlidingWindowDataset(layers, np.asarray(xyxys, dtype=np.int32), transform=transform)
+
         
         # Create DataLoader
         dataloader = DataLoader(
@@ -160,37 +164,34 @@ def create_inference_dataloader(layers: np.ndarray,
             batch_size=CFG.batch_size,
             shuffle=False,
             num_workers=CFG.workers,
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
             drop_last=False,
         )
         
-        logger.info(f"Created dataloader with {len(images)} tiles")
-        return dataloader, np.stack(xyxys), (h, w)
+        logger.info(f"Created dataloader with {len(dataset)} tiles")
+        return dataloader, (h, w)
         
     except Exception as e:
         logger.error(f"Error creating dataloader: {e}")
         raise
 
-class CustomDatasetTest(Dataset):
-    """Dataset class for inference on image tiles"""
-    
-    def __init__(self, images: List[np.ndarray], xyxys: np.ndarray, transform=None):
-        self.images = images
-        self.xyxys = xyxys
+class SlidingWindowDataset(Dataset):
+    """Tile dataset that materializes each tile lazily from the full layer array."""
+    def __init__(self, layers: np.ndarray, xyxys: np.ndarray, transform=None):
+        self.layers = layers  # (H, W, C)
+        self.xyxys = xyxys    # (N, 4) int32
         self.transform = transform
 
     def __len__(self):
-        return len(self.images)
+        return int(self.xyxys.shape[0])
     
     def __getitem__(self, idx):
-        image = self.images[idx]
-        xy = self.xyxys[idx]
-        
+        x1, y1, x2, y2 = self.xyxys[idx].tolist()
+        tile = self.layers[y1:y2, x1:x2, :]  # view; not pre-stored
         if self.transform:
-            data = self.transform(image=image)
-            image = data['image'].unsqueeze(0)
-        
-        return image, xy
+            data = self.transform(image=tile)
+            tile = data['image'].unsqueeze(0)  # (1, C, H, W) -> keep model input shape
+        return tile, self.xyxys[idx]
     
 class RegressionPLModel(pl.LightningModule):
     """TimeSformer model for ink detection inference"""
@@ -204,7 +205,7 @@ class RegressionPLModel(pl.LightningModule):
             dim=512,
             image_size=64,
             patch_size=16,
-            num_frames=30,
+            num_frames=CFG.in_chans,  # must match channel-depth we feed as frames
             num_classes=16,
             channels=1,
             depth=8,
@@ -230,7 +231,6 @@ class RegressionPLModel(pl.LightningModule):
 def predict_fn(test_loader: DataLoader, 
                model: RegressionPLModel, 
                device: torch.device, 
-               test_xyxys: np.ndarray, 
                pred_shape: Tuple[int, int]) -> np.ndarray:
     """
     Run inference on test data and return prediction mask.
@@ -248,46 +248,53 @@ def predict_fn(test_loader: DataLoader,
     try:
         mask_pred = np.zeros(pred_shape, dtype=np.float32)
         mask_count = np.zeros(pred_shape, dtype=np.float32)
-        mask_count_kernel = np.ones((CFG.size, CFG.size), dtype=np.float32)
-        
-        # Create Gaussian kernel for smoothing
-        kernel = gkern(CFG.gaussian_kernel_size, CFG.gaussian_sigma)
-        kernel = kernel / kernel.max()
-        kernel_tensor = torch.tensor(kernel, device=device, dtype=torch.float32)
+
+        # weights will match the resized prediction spatial size (set below)
+        kernel_tensor = None
         
         model.eval()
         
         with torch.no_grad():
-            for step, (images, xys) in tqdm(enumerate(test_loader), total=len(test_loader), desc="Running inference"):
+            for step, (images, xys) in tqdm(enumerate(test_loader), desc="Running inference"):
                 images = images.to(device)
                 
                 # Forward pass with autocast for efficiency
-                with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
+                amp_device = "cuda" if device.type == "cuda" else "cpu"
+                with torch.autocast(device_type=amp_device):
                     y_preds = model(images)
                 
                 # Apply sigmoid and resize predictions
                 y_preds = torch.sigmoid(y_preds)
+                # ALWAYS resize to tile_size so placement = (y1:y2, x1:x2)
                 y_preds_resized = F.interpolate(
-                    y_preds.float(), 
-                    scale_factor=16, 
-                    mode='bilinear', 
+                    y_preds.float(),
+                    size=(CFG.tile_size, CFG.tile_size),
+                    mode='bilinear',
                     align_corners=False
-                )
+                )  # (B,1,tile,tile)
+                # Build Gaussian weights once with the correct size
+                if kernel_tensor is None:
+                    kh, kw = y_preds_resized.shape[-2], y_preds_resized.shape[-1]
+                    kernel_np = gkern(kh, kw, CFG.gaussian_sigma).astype(np.float32)
+                    kernel_tensor = torch.from_numpy(kernel_np).to(device)  # (kh,kw)
                 
-                # Apply Gaussian smoothing
-                y_preds_smoothed = y_preds_resized * kernel_tensor
-                y_preds_smoothed = y_preds_smoothed.squeeze(1)
+                # Weight predictions
+                y_preds_weighted = (y_preds_resized * kernel_tensor).squeeze(1)  # (B, H, W)
                 
                 # Move to CPU for accumulation
-                y_preds_cpu = y_preds_smoothed.cpu().numpy()
+                y_preds_cpu = y_preds_weighted.cpu().numpy()
+                weight_cpu = kernel_tensor.detach().cpu().numpy().astype(np.float32)
                 
                 # Accumulate predictions
-                for i, (x1, y1, x2, y2) in enumerate(xys):
+                if torch.is_tensor(xys):
+                    xys = xys.cpu().numpy().astype(np.int32)
+                for i in range(xys.shape[0]):
+                    x1, y1, x2, y2 = [int(v) for v in xys[i]]
                     mask_pred[y1:y2, x1:x2] += y_preds_cpu[i]
-                    mask_count[y1:y2, x1:x2] += mask_count_kernel
+                    mask_count[y1:y2, x1:x2] += weight_cpu
         
         # Normalize by count to handle overlapping regions
-        mask_pred = mask_pred / np.clip(mask_count, a_min=1, a_max=None)
+        mask_pred = mask_pred / np.clip(mask_count, a_min=1e-6, a_max=None)
         
         # Clip and normalize to [0, 1]
         mask_pred = np.clip(mask_pred, 0, 1)
@@ -321,7 +328,7 @@ def run_inference(layers: np.ndarray,
         logger.info("Starting inference process...")
         
         # Preprocess layers
-        processed_layers, processed_mask = preprocess_layers(
+        processed_layers, processed_mask, orig_shape = preprocess_layers(
             layers, fragment_mask, is_reverse_segment
         )
         
@@ -331,14 +338,18 @@ def run_inference(layers: np.ndarray,
         )
         
         # Run inference
-        mask_pred = predict_fn(test_loader, model, device, test_xyxys, pred_shape)
+        mask_pred = predict_fn(test_loader, model, device, pred_shape)
         
         # Post-process results
         mask_pred = np.clip(np.nan_to_num(mask_pred), 0, 1)
         
-        # Normalize to [0, 1] if there are any predictions
-        if mask_pred.max() > 0:
-            mask_pred = mask_pred / mask_pred.max()
+        # Crop back to the original unpadded size
+        oh, ow = orig_shape
+        mask_pred = mask_pred[:oh, :ow]
+        # Optional min-max normalization on the valid area only
+        mx = mask_pred.max()
+        if mx > 0:
+            mask_pred = mask_pred / mx
         
         logger.info("Inference completed successfully")
         return mask_pred
@@ -348,9 +359,7 @@ def run_inference(layers: np.ndarray,
         raise
     finally:
         # Cleanup
-        try:
-            del test_loader
-        except:
-            pass
+        try: del test_loader
+        except: pass
         torch.cuda.empty_cache()
         gc.collect()
