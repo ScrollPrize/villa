@@ -157,6 +157,21 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
             const bool isHover = matches(handle.row, handle.col, _hoverHandle);
             const bool isKeyboard = matches(handle.row, handle.col, keyboardHighlight);
 
+            bool include = true;
+            if (!_showAllHandles) {
+                const bool forced = isActive || isHover || isKeyboard;
+                if (!_cursorValid && !forced) {
+                    include = false;
+                } else if (_cursorValid && !forced) {
+                    const float dist = static_cast<float>(cv::norm(handle.currentWorld - _cursorWorld));
+                    include = dist <= _handleDisplayDistance;
+                }
+            }
+
+            if (!include) {
+                continue;
+            }
+
             handlePoints.push_back(handle.currentWorld);
             handleEntries.push_back({handle.currentWorld, isActive, isHover, isKeyboard});
         }
@@ -321,4 +336,20 @@ void SegmentationOverlayController::setKeyboardHandle(std::optional<std::pair<in
     if (refresh) {
         refreshAll();
     }
+}
+
+void SegmentationOverlayController::setHandleVisibility(bool showAll, float distance)
+{
+    const float clamped = std::max(1.0f, distance);
+    if (_showAllHandles == showAll && std::fabs(_handleDisplayDistance - clamped) < 1e-4f) {
+        return;
+    }
+    _showAllHandles = showAll;
+    _handleDisplayDistance = clamped;
+}
+
+void SegmentationOverlayController::setCursorWorld(const cv::Vec3f& world, bool valid)
+{
+    _cursorWorld = world;
+    _cursorValid = valid;
 }

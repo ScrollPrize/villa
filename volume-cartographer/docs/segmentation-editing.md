@@ -25,7 +25,7 @@ relative to `apps/VC3D` unless otherwise noted.
 3. **User interaction loop** – The module mediates input from each
    `CVolumeViewer`, calls into the edit manager for coordinate updates, and pushes
    preview changes back to the shared `CSurfaceCollection` for live rendering
-   (`SegmentationModule.cpp:440-575`).
+   (`SegmentationModule.cpp:524-807`).
 4. **Overlay feedback** – `SegmentationOverlayController` queries the edit
    manager for handle positions and renders them as a viewer overlay with hover
    and selection highlights (`overlays/SegmentationOverlayController.cpp:33-125`).
@@ -39,7 +39,7 @@ relative to `apps/VC3D` unless otherwise noted.
 
 | Component | Responsibility |
 | --- | --- |
-| `SegmentationWidget` (`SegmentationWidget.cpp`) | Qt sidebar with controls for enabling editing, adjusting down-sample, radius, sigma, and triggering Apply/Reset.
+| `SegmentationWidget` (`SegmentationWidget.cpp`) | Qt sidebar with controls for enabling editing, adjusting down-sample/radius/sigma, configuring hole filling behaviour, and triggering Apply/Reset.
 | `SegmentationModule` (`SegmentationModule.cpp/.hpp`) | Orchestrates the session lifecycle, binds viewers, processes input, and drives the overlay/state machines.
 | `SegmentationEditManager` (`SegmentationEditManager.cpp/.hpp`) | Core data model – clones surfaces, manages handle lists, applies deformations, fills holes, and tracks dirty state.
 | `SegmentationOverlayController` (`overlays/SegmentationOverlayController.cpp`) | Draws handle markers inside slice viewers and provides transient radius indicators.
@@ -48,10 +48,10 @@ relative to `apps/VC3D` unless otherwise noted.
 ### Session Lifecycle
 
 1. **Begin** – `beginEditingSession` configures down-sample/radius/sigma, swaps the
-   overlay to editing mode, and flags pending changes (`SegmentationModule.cpp:418-438`).
+   overlay to editing mode, and flags pending changes (`SegmentationModule.cpp:404-426`).
 2. **End** – `endEditingSession` discards the preview surface, restores the base
    surface to the viewer, clears overlays, resets input state, and exits point-add
-   mode (`SegmentationModule.cpp:440-478`).
+   mode (`SegmentationModule.cpp:431-445`).
 3. **Apply/Reset** – Both operations go through `SegmentationEditManager`, either
    copying preview → base (Apply) or restoring preview ← baseline clone (Reset)
    (`SegmentationModule.cpp:216-242`, `205-214`).
@@ -68,7 +68,7 @@ relative to `apps/VC3D` unless otherwise noted.
 - **Manual handles** are the points the user adds or modifies. They are stored in
   the `_handles` vector with `Handle::isManual = true`, survive re-sampling, and
   can be removed with Ctrl-click or the Delete key (`SegmentationEditManager.hpp:38-47`,
-  `SegmentationModule.cpp:508-543`).
+  `SegmentationModule.cpp:540-555`).
 
 All handles cache both their original (`originalWorld`) and current (`currentWorld`)
 positions so deltas can be re-applied whenever radius or sigma settings change
@@ -77,7 +77,7 @@ positions so deltas can be re-applied whenever radius or sigma settings change
 ### Down-sample Control
 
 The widget exposes a spin-box (default 12) that determines the grid stride
-(`SegmentationWidget.cpp:43-109`). Changing it recomputes the full handle set and
+(`SegmentationWidget.cpp:43-114`). Changing it recomputes the full handle set and
 updates the overlay, while the active preview surface remains untouched except
 for the regenerated handles (`SegmentationModule.cpp:167-192`).
 
@@ -87,13 +87,13 @@ for the regenerated handles (`SegmentationModule.cpp:167-192`).
 ### Mouse
 
 - **Left-click (default mode)** – Snaps to the nearest existing handle (within
-  radius tolerance) and starts a drag operation (`SegmentationModule.cpp:462-555`).
+  radius tolerance) and starts a drag operation (`SegmentationModule.cpp:524-607`).
 - **Left-click (point-add mode)** – When Shift is held (or toggled), the module
   calls `addHandleAtWorld` with `allowCreate=true`, enabling new handle creation
-  inside gaps (`SegmentationModule.cpp:347-397`). Point-add mode forces the
-  “Add” cursor (`SegmentationModule.cpp:284-331`, `618-640`, `700-739`).
+  inside gaps (`SegmentationModule.cpp:563-607`). Point-add mode forces the
+  “Add” cursor (`SegmentationModule.cpp:283-325`, `618-640`, `700-739`).
 - **Ctrl + Left-click** – Deletes the closest manual handle if one falls within
-  the radius tolerance (`SegmentationModule.cpp:481-507`).
+  the radius tolerance (`SegmentationModule.cpp:540-555`).
 - **Left Drag** – Updates the handle’s `currentWorld` position continuously and
   re-runs the influence falloff to update nearby grid cells (`SegmentationModule.cpp:556-607`).
 - **Mouse Wheel (with focus in viewer)** – Adjusts the brush radius; Ctrl doubles
@@ -123,13 +123,14 @@ identify the target grid cell to populate (`SegmentationEditManager.cpp:576-603`
 ### Hole Detection & Relaxation
 
 If the chosen grid cell was previously invalid or point-add mode created a new
-slot, the manager performs a local flood fill around the seed (radius six by
-default) to collect the contiguous hole region (`SegmentationEditManager.cpp:407-425`,
-`607-675`). It then iteratively smooths that patch by averaging each unfixed cell
-with neighbouring cells and nearby valid grid samples (25 Jacobi iterations)
-while keeping the seed pinned to the barycentric projection (`SegmentationEditManager.cpp:676-748`).
-This produces a stable local mesh fragment rather than a lone point floating away
-from the existing quad net.
+slot, the manager performs a local flood fill around the seed using the current
+"Hole search radius" (default 6) to collect the contiguous hole region
+(`SegmentationEditManager.cpp:407-425`, `607-675`). It then iteratively smooths
+that patch by averaging each unfixed cell with neighbouring cells and nearby
+valid grid samples for the configured number of iterations (default 25) while
+keeping the seed pinned to the barycentric projection
+(`SegmentationEditManager.cpp:676-748`). This produces a stable local mesh
+fragment rather than a lone point floating away from the existing quad surface.
 
 
 ## Handle Influence and Preview Updates
@@ -152,18 +153,23 @@ over a fresh copy of the original grid to avoid cumulative drift (`SegmentationE
   (`overlays/SegmentationOverlayController.cpp:62-123`).
 - During addition or drag the module sets `_hover`, `_active`, or `_keyboard`
   handles and triggers targeted overlay refreshes to avoid expensive full redraws.
+- Handle markers can be culled to a cursor-centred world radius by toggling the
+  widget's "Show all handles" option; the overlay enforces the configured
+  `handleDisplayDistance` whenever that mode is active.
 - Radius feedback is rendered as a transient overlay with text showing the number
   of grid steps represented by the current radius (`SegmentationModule.cpp:759-807`).
 
 
 ## UI and Settings Persistence
 
-`SegmentationWidget` persists user preferences (down-sample, radius, sigma) into
-`VC.ini` by calling `writeSetting` each time a control changes
-(`SegmentationWidget.cpp:82-164`). When the widget is constructed it restores those
-values so sessions begin with familiar defaults (`SegmentationWidget.cpp:106-153`).
-Pending-change state toggles the Apply button enabling and the status label
-(`SegmentationWidget.cpp:166-225`).
+`SegmentationWidget` persists user preferences (down-sample, radius, sigma, hole
+search radius, hole smoothing iterations, handle visibility mode, handle display
+distance) into `VC.ini` by calling `writeSetting` each time a control changes
+(`SegmentationWidget.cpp`). The "Hole Filling" and "Handle Display" groups mirror
+the parameters the editor and overlay consume for gap repair and visibility
+culling. When the widget is constructed it restores those values so sessions
+begin with familiar defaults. Pending-change state toggles the Apply button
+enabling and the status label (`SegmentationWidget.cpp:304-351`).
 
 
 ## Applying and Saving Changes
@@ -190,12 +196,10 @@ Useful extension points:
 - **Custom influence kernels** – Modify `applyHandleInfluence` to introduce
   alternate falloff curves or anisotropic behaviour. Remember to adjust
   `_radius`/`_sigma` semantics accordingly.
-- **Advanced hole filling** – Adjust the search radius or iterations by tuning
-  `kHoleSearchRadius`/`kHoleSmoothIterations` (`SegmentationEditManager.cpp:112-114`)
-  or replace the relaxation phase entirely. All hooks live inside the edit manager.
+- **Advanced hole filling** – Adjust the search radius or iterations via
+  `SegmentationEditManager::setHoleSearchRadius` /
+  `SegmentationEditManager::setHoleSmoothIterations`, or replace the relaxation
+  phase entirely. All hooks live inside the edit manager.
 - **Per-handle metadata** – Extend `SegmentationEditManager::Handle` if you need to
   annotate handles with provenance flags or custom weights. Ensure
   `regenerateHandles` and serialization logic are updated accordingly.
-
-
-

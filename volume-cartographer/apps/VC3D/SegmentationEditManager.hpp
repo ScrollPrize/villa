@@ -7,6 +7,8 @@
 
 #include <opencv2/core.hpp>
 
+#include "SegmentationInfluenceMode.hpp"
+
 class QuadSurface;
 class PlaneSurface;
 
@@ -27,9 +29,15 @@ public:
     void setDownsample(int value);
     void setRadius(float radius);
     void setSigma(float sigma);
+    void setInfluenceMode(SegmentationInfluenceMode mode);
     [[nodiscard]] int downsample() const { return _downsample; }
     [[nodiscard]] float radius() const { return _radius; }
     [[nodiscard]] float sigma() const { return _sigma; }
+    [[nodiscard]] SegmentationInfluenceMode influenceMode() const { return _influenceMode; }
+    void setHoleSearchRadius(int radius);
+    void setHoleSmoothIterations(int iterations);
+    [[nodiscard]] int holeSearchRadius() const { return _holeSearchRadius; }
+    [[nodiscard]] int holeSmoothIterations() const { return _holeSmoothIterations; }
     [[nodiscard]] bool hasPendingChanges() const { return _dirty; }
 
     void resetPreview();
@@ -44,7 +52,7 @@ public:
     };
 
     [[nodiscard]] const std::vector<Handle>& handles() const { return _handles; }
-    void updateHandleWorldPosition(int row, int col, const cv::Vec3f& newWorldPos);
+    bool updateHandleWorldPosition(int row, int col, const cv::Vec3f& newWorldPos);
     Handle* findNearestHandle(const cv::Vec3f& world, float tolerance);
     std::optional<std::pair<int,int>> addHandleAtWorld(const cv::Vec3f& worldPos,
                                                        float tolerance = 40.0f,
@@ -58,9 +66,12 @@ public:
 private:
     void regenerateHandles();
     void applyHandleInfluence(const Handle& handle);
+    void applyHandleInfluenceGrid(const Handle& handle, const cv::Vec3f& delta);
+    void applyHandleInfluenceGeodesic(const Handle& handle, const cv::Vec3f& delta);
     Handle* findHandle(int row, int col);
     void syncPreviewFromBase();
     void reapplyAllHandles();
+    [[nodiscard]] float estimateGridStepWorld() const;
     bool fillInvalidCellWithLocalSolve(const cv::Vec3f& worldPos,
                                        int seedRow,
                                        int seedCol,
@@ -79,5 +90,8 @@ private:
     int _downsample{12};
     float _radius{1.0f};          // radius expressed in grid steps (Chebyshev distance)
     float _sigma{1.0f};           // strength multiplier applied to neighbouring grid points
+    SegmentationInfluenceMode _influenceMode{SegmentationInfluenceMode::GridChebyshev};
+    int _holeSearchRadius{6};
+    int _holeSmoothIterations{25};
     bool _dirty{false};
 };

@@ -64,6 +64,23 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
 
     bindWidgetSignals();
 
+    if (_widget) {
+        _holeSearchRadius = _widget->holeSearchRadius();
+        _holeSmoothIterations = _widget->holeSmoothIterations();
+        _showHandlesAlways = _widget->handlesAlwaysVisible();
+        _handleDisplayDistance = _widget->handleDisplayDistance();
+        _influenceMode = _widget->influenceMode();
+    }
+    if (_editManager) {
+        _editManager->setHoleSearchRadius(_holeSearchRadius);
+        _editManager->setHoleSmoothIterations(_holeSmoothIterations);
+        _editManager->setInfluenceMode(_influenceMode);
+    }
+    if (_overlay) {
+        _overlay->setHandleVisibility(_showHandlesAlways, _handleDisplayDistance);
+        _overlay->setCursorWorld(cv::Vec3f(0, 0, 0), false);
+    }
+
     if (_viewerManager) {
         _viewerManager->setSegmentationOverlay(_overlay);
         _viewerManager->setSegmentationModule(this);
@@ -87,6 +104,21 @@ void SegmentationModule::bindWidgetSignals()
             Qt::UniqueConnection);
     connect(_widget, &SegmentationWidget::sigmaChanged,
             this, &SegmentationModule::setSigma,
+            Qt::UniqueConnection);
+    connect(_widget, &SegmentationWidget::influenceModeChanged,
+            this, &SegmentationModule::setInfluenceMode,
+            Qt::UniqueConnection);
+    connect(_widget, &SegmentationWidget::holeSearchRadiusChanged,
+            this, &SegmentationModule::setHoleSearchRadius,
+            Qt::UniqueConnection);
+    connect(_widget, &SegmentationWidget::holeSmoothIterationsChanged,
+            this, &SegmentationModule::setHoleSmoothIterations,
+            Qt::UniqueConnection);
+    connect(_widget, &SegmentationWidget::handlesAlwaysVisibleChanged,
+            this, &SegmentationModule::setHandlesAlwaysVisible,
+            Qt::UniqueConnection);
+    connect(_widget, &SegmentationWidget::handleDisplayDistanceChanged,
+            this, &SegmentationModule::setHandleDisplayDistance,
             Qt::UniqueConnection);
     connect(_widget, &SegmentationWidget::applyRequested,
             this, &SegmentationModule::applyEdits,
@@ -231,8 +263,85 @@ void SegmentationModule::setSigma(float sigma)
         }
         emitPendingChanges();
     }
+}
 
-    refreshOverlay();
+void SegmentationModule::setInfluenceMode(SegmentationInfluenceMode mode)
+{
+    if (_influenceMode == mode) {
+        return;
+    }
+    _influenceMode = mode;
+    if (_editManager) {
+        _editManager->setInfluenceMode(mode);
+        if (_editManager->hasSession()) {
+            if (_surfaces) {
+                _surfaces->setSurface("segmentation", _editManager->previewSurface());
+            }
+            emitPendingChanges();
+            refreshOverlay();
+        }
+    }
+}
+
+void SegmentationModule::setHoleSearchRadius(int radius)
+{
+    const int clamped = std::clamp(radius, 1, 64);
+    if (clamped == _holeSearchRadius) {
+        return;
+    }
+    _holeSearchRadius = clamped;
+    if (_widget && _widget->holeSearchRadius() != clamped) {
+        _widget->setHoleSearchRadius(clamped);
+    }
+    if (_editManager) {
+        _editManager->setHoleSearchRadius(_holeSearchRadius);
+    }
+}
+
+void SegmentationModule::setHoleSmoothIterations(int iterations)
+{
+    const int clamped = std::clamp(iterations, 1, 200);
+    if (clamped == _holeSmoothIterations) {
+        return;
+    }
+    _holeSmoothIterations = clamped;
+    if (_widget && _widget->holeSmoothIterations() != clamped) {
+        _widget->setHoleSmoothIterations(clamped);
+    }
+    if (_editManager) {
+        _editManager->setHoleSmoothIterations(_holeSmoothIterations);
+    }
+}
+
+void SegmentationModule::setHandlesAlwaysVisible(bool value)
+{
+    if (_showHandlesAlways == value) {
+        return;
+    }
+    _showHandlesAlways = value;
+    if (_widget && _widget->handlesAlwaysVisible() != value) {
+        _widget->setHandlesAlwaysVisible(value);
+    }
+    if (_overlay) {
+        _overlay->setHandleVisibility(_showHandlesAlways, _handleDisplayDistance);
+        _overlay->refreshAll();
+    }
+}
+
+void SegmentationModule::setHandleDisplayDistance(float distance)
+{
+    const float clamped = std::max(1.0f, distance);
+    if (std::fabs(clamped - _handleDisplayDistance) < 1e-4f) {
+        return;
+    }
+    _handleDisplayDistance = clamped;
+    if (_widget && std::fabs(_widget->handleDisplayDistance() - clamped) > 1e-4f) {
+        _widget->setHandleDisplayDistance(clamped);
+    }
+    if (_overlay) {
+        _overlay->setHandleVisibility(_showHandlesAlways, _handleDisplayDistance);
+        _overlay->refreshAll();
+    }
 }
 
 void SegmentationModule::applyEdits()
@@ -414,6 +523,9 @@ bool SegmentationModule::beginEditingSession(QuadSurface* activeSurface)
     _editManager->setRadius(_radius);
     _editManager->setSigma(_sigma);
     _editManager->setDownsample(_downsample);
+    _editManager->setHoleSearchRadius(_holeSearchRadius);
+    _editManager->setHoleSmoothIterations(_holeSmoothIterations);
+    _editManager->setInfluenceMode(_influenceMode);
 
     if (_surfaces) {
         if (auto* preview = _editManager->previewSurface()) {
@@ -476,6 +588,7 @@ void SegmentationModule::resetInteractionState()
         _overlay->setActiveHandle(std::nullopt, false);
         _overlay->setHoverHandle(std::nullopt, false);
         _overlay->setKeyboardHandle(std::nullopt, false);
+        _overlay->setCursorWorld(cv::Vec3f(0, 0, 0), false);
         _overlay->refreshAll();
     }
 
@@ -615,13 +728,23 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
 
     _cursorWorld = worldPos;
     _cursorValid = true;
+    if (_overlay) {
+        _overlay->setCursorWorld(worldPos, true);
+        if (!_showHandlesAlways) {
+            _overlay->refreshViewer(viewer);
+        }
+    }
 
     if (_drag.active && viewer == _drag.viewer) {
         if (!(buttons & Qt::LeftButton)) {
             return;
         }
 
-        _editManager->updateHandleWorldPosition(_drag.row, _drag.col, worldPos);
+        const bool moved = _editManager->updateHandleWorldPosition(_drag.row, _drag.col, worldPos);
+        if (!moved) {
+            emit statusMessageRequested(tr("Handle move failed; see terminal for details"), kStatusMedium);
+            return;
+        }
         _drag.moved = true;
         if (_surfaces) {
             _surfaces->setSurface("segmentation", _editManager->previewSurface());
@@ -674,7 +797,10 @@ void SegmentationModule::handleMouseRelease(CVolumeViewer* viewer,
     }
 
     if (_pointAddMode && _editManager && _editManager->hasSession() && !_drag.moved) {
-        _editManager->updateHandleWorldPosition(_drag.row, _drag.col, worldPos);
+        const bool moved = _editManager->updateHandleWorldPosition(_drag.row, _drag.col, worldPos);
+        if (!moved) {
+            emit statusMessageRequested(tr("Handle move failed; see terminal for details"), kStatusMedium);
+        }
         if (auto world = _editManager->handleWorldPosition(_drag.row, _drag.col)) {
             _hover.set(_drag.row, _drag.col, *world);
         }

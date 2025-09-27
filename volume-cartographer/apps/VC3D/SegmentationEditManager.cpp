@@ -2,6 +2,8 @@
 
 #include "vc/core/util/Surface.hpp"
 
+#include <QDebug>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -109,8 +111,6 @@ void closestPointOnTriangle(const TriangleSample& tri,
     bary = cv::Vec3f(u, v, w);
 }
 
-constexpr int kHoleSearchRadius = 6;
-constexpr int kHoleSmoothIterations = 25;
 const std::array<cv::Vec2i, 4> kNeighbourOffsets = {
     cv::Vec2i{1, 0},
     cv::Vec2i{-1, 0},
@@ -189,6 +189,33 @@ void SegmentationEditManager::setSigma(float sigma)
     reapplyAllHandles();
 }
 
+void SegmentationEditManager::setInfluenceMode(SegmentationInfluenceMode mode)
+{
+    if (_influenceMode == mode) {
+        return;
+    }
+    _influenceMode = mode;
+    reapplyAllHandles();
+}
+
+void SegmentationEditManager::setHoleSearchRadius(int radius)
+{
+    const int clamped = std::clamp(radius, 1, 64);
+    if (clamped == _holeSearchRadius) {
+        return;
+    }
+    _holeSearchRadius = clamped;
+}
+
+void SegmentationEditManager::setHoleSmoothIterations(int iterations)
+{
+    const int clamped = std::clamp(iterations, 1, 200);
+    if (clamped == _holeSmoothIterations) {
+        return;
+    }
+    _holeSmoothIterations = clamped;
+}
+
 void SegmentationEditManager::resetPreview()
 {
     if (!hasSession() || !_previewPoints || !_originalPoints) {
@@ -224,31 +251,32 @@ void SegmentationEditManager::applyPreview()
 
 constexpr float kMinInfluenceWeight = 1e-3f;
 
-void SegmentationEditManager::updateHandleWorldPosition(int row, int col, const cv::Vec3f& newWorldPos)
+bool SegmentationEditManager::updateHandleWorldPosition(int row, int col, const cv::Vec3f& newWorldPos)
 {
-    if (!hasSession() || !_previewPoints) {
-        return;
+    if (!hasSession() || !_previewPoints || !_originalPoints) {
+        qWarning() << "SegmentationEditManager: cannot move handle without an active session";
+        return false;
     }
 
     Handle* handle = findHandle(row, col);
     if (!handle) {
-        return;
+        qWarning() << "SegmentationEditManager: no handle found at" << row << col << "for movement";
+        return false;
     }
 
     handle->currentWorld = newWorldPos;
-    if (_previewPoints && _originalPoints) {
-        _originalPoints->copyTo(*_previewPoints);
-        for (const auto& h : _handles) {
-            applyHandleInfluence(h);
-        }
-        // Ensure stored current positions match preview values
-        for (auto& h : _handles) {
-            if (h.row >= 0 && h.row < _previewPoints->rows && h.col >= 0 && h.col < _previewPoints->cols) {
-                h.currentWorld = (*_previewPoints)(h.row, h.col);
-            }
-        }
-        _dirty = true;
+    _originalPoints->copyTo(*_previewPoints);
+    for (const auto& h : _handles) {
+        applyHandleInfluence(h);
     }
+    // Ensure stored current positions match preview values
+    for (auto& h : _handles) {
+        if (h.row >= 0 && h.row < _previewPoints->rows && h.col >= 0 && h.col < _previewPoints->cols) {
+            h.currentWorld = (*_previewPoints)(h.row, h.col);
+        }
+    }
+    _dirty = true;
+    return true;
 }
 
 SegmentationEditManager::Handle* SegmentationEditManager::findHandle(int row, int col)
@@ -294,6 +322,7 @@ std::optional<std::pair<int,int>> SegmentationEditManager::addHandleAtWorld(cons
                                                                            bool allowCreate)
 {
     if (!hasSession() || !_previewPoints || !_originalPoints) {
+        qWarning() << "SegmentationEditManager: cannot add handle without an active session";
         return std::nullopt;
     }
 
@@ -396,6 +425,8 @@ std::optional<std::pair<int,int>> SegmentationEditManager::addHandleAtWorld(cons
     }
 
     if (bestRow < 0 || bestCol < 0) {
+        qWarning() << "SegmentationEditManager: failed to locate a suitable cell for new handle near world position"
+                   << worldPos[0] << worldPos[1] << worldPos[2];
         return std::nullopt;
     }
 
@@ -405,7 +436,7 @@ std::optional<std::pair<int,int>> SegmentationEditManager::addHandleAtWorld(cons
     }
 
     if (createdCell) {
-        holeCells = collectHoleCells(bestRow, bestCol, kHoleSearchRadius);
+        holeCells = collectHoleCells(bestRow, bestCol, _holeSearchRadius);
         if (holeCells.empty()) {
             holeCells.emplace_back(bestRow, bestCol);
         }
@@ -433,6 +464,8 @@ std::optional<std::pair<int,int>> SegmentationEditManager::addHandleAtWorld(cons
             _dirty = true;
             return std::make_pair(bestRow, bestCol);
         }
+        qWarning() << "SegmentationEditManager: handle at" << bestRow << bestCol
+                   << "is already user-managed; skipping add";
         return std::nullopt;
     }
 
@@ -738,7 +771,8 @@ void SegmentationEditManager::relaxHolePatch(const std::vector<std::pair<int,int
         }
     }
 
-    for (int iteration = 0; iteration < kHoleSmoothIterations; ++iteration) {
+    const int iterations = std::max(1, _holeSmoothIterations);
+    for (int iteration = 0; iteration < iterations; ++iteration) {
         for (std::size_t i = 0; i < holeCells.size(); ++i) {
             if (nodes[i].fixed) {
                 nodes[i].scratch = nodes[i].value;
@@ -884,10 +918,24 @@ void SegmentationEditManager::applyHandleInfluence(const Handle& handle)
     }
 
     const cv::Vec3f delta = handle.currentWorld - handle.originalWorld;
-    if (cv::norm(delta) < 1e-4f) {
-        return;
+    const bool hasDelta = cv::norm(delta) >= 1e-4f;
+
+    if (hasDelta) {
+        if (_influenceMode == SegmentationInfluenceMode::GeodesicCircular) {
+            applyHandleInfluenceGeodesic(handle, delta);
+        } else {
+            applyHandleInfluenceGrid(handle, delta);
+        }
     }
 
+    if (handle.row >= 0 && handle.row < _previewPoints->rows &&
+        handle.col >= 0 && handle.col < _previewPoints->cols) {
+        (*_previewPoints)(handle.row, handle.col) = handle.currentWorld;
+    }
+}
+
+void SegmentationEditManager::applyHandleInfluenceGrid(const Handle& handle, const cv::Vec3f& delta)
+{
     const cv::Mat_<cv::Vec3f>& original = *_originalPoints;
     cv::Mat_<cv::Vec3f>& preview = *_previewPoints;
 
@@ -903,8 +951,11 @@ void SegmentationEditManager::applyHandleInfluence(const Handle& handle)
 
     for (int r = rowStart; r <= rowEnd; ++r) {
         for (int c = colStart; c <= colEnd; ++c) {
+            if (r == handle.row && c == handle.col) {
+                continue;
+            }
             const cv::Vec3f& orig = original(r, c);
-            if (orig[0] == -1.0f && orig[1] == -1.0f && orig[2] == -1.0f) {
+            if (isInvalidPoint(orig)) {
                 continue;
             }
 
@@ -915,13 +966,9 @@ void SegmentationEditManager::applyHandleInfluence(const Handle& handle)
                 continue;
             }
 
-            if (gridDistance == 0) {
-                continue;
-            }
-
             float normalized = static_cast<float>(gridDistance) / denom;
             normalized = std::clamp(normalized, 0.0f, 1.0f);
-            float falloff = std::max(0.0f, 1.0f - normalized);
+            const float falloff = std::max(0.0f, 1.0f - normalized);
             float weight = strength * falloff;
             weight = std::clamp(weight, 0.0f, maxWeight);
 
@@ -932,11 +979,140 @@ void SegmentationEditManager::applyHandleInfluence(const Handle& handle)
             preview(r, c) = orig + delta * weight;
         }
     }
+}
 
-    // Keep handle point itself in sync
-    if (handle.row >= 0 && handle.row < preview.rows && handle.col >= 0 && handle.col < preview.cols) {
-        preview(handle.row, handle.col) = handle.currentWorld;
+void SegmentationEditManager::applyHandleInfluenceGeodesic(const Handle& handle, const cv::Vec3f& delta)
+{
+    const cv::Mat_<cv::Vec3f>& original = *_originalPoints;
+    cv::Mat_<cv::Vec3f>& preview = *_previewPoints;
+
+    const int gridRadius = std::max(1, static_cast<int>(std::lround(_radius)));
+    const int windowRadius = std::max(gridRadius * 2, gridRadius + 1);
+    const int rowStart = std::max(0, handle.row - windowRadius);
+    const int rowEnd = std::min(preview.rows - 1, handle.row + windowRadius);
+    const int colStart = std::max(0, handle.col - windowRadius);
+    const int colEnd = std::min(preview.cols - 1, handle.col + windowRadius);
+
+    if (rowEnd < rowStart || colEnd < colStart) {
+        return;
     }
+
+    const int windowRows = rowEnd - rowStart + 1;
+    const int windowCols = colEnd - colStart + 1;
+    const int windowSize = windowRows * windowCols;
+
+    auto localIndex = [rowStart, colStart, windowCols](int r, int c) {
+        return (r - rowStart) * windowCols + (c - colStart);
+    };
+
+    auto isValidCell = [&](int r, int c) {
+        if (r < rowStart || r > rowEnd || c < colStart || c > colEnd) {
+            return false;
+        }
+        const cv::Vec3f& orig = original(r, c);
+        return !isInvalidPoint(orig);
+    };
+
+    if (!isValidCell(handle.row, handle.col)) {
+        return;
+    }
+
+    const float strength = std::clamp(_sigma, 0.10f, 2.0f);
+    const float maxWeight = std::min(1.5f, std::max(strength, 0.0f));
+    const float stepWorld = estimateGridStepWorld();
+    const float radiusWorld = std::max(stepWorld, (static_cast<float>(gridRadius) + 0.5f) * stepWorld);
+
+    struct Node
+    {
+        float dist;
+        int row;
+        int col;
+    };
+
+    auto cmp = [](const Node& a, const Node& b) {
+        return a.dist > b.dist;
+    };
+
+    std::priority_queue<Node, std::vector<Node>, decltype(cmp)> queue(cmp);
+    std::vector<float> distances(windowSize, std::numeric_limits<float>::max());
+
+    const int startIndex = localIndex(handle.row, handle.col);
+    distances[startIndex] = 0.0f;
+    queue.push({0.0f, handle.row, handle.col});
+
+    const std::array<cv::Vec2i, 8> neighbourOffsets = {
+        cv::Vec2i{1, 0},
+        cv::Vec2i{-1, 0},
+        cv::Vec2i{0, 1},
+        cv::Vec2i{0, -1},
+        cv::Vec2i{1, 1},
+        cv::Vec2i{1, -1},
+        cv::Vec2i{-1, 1},
+        cv::Vec2i{-1, -1}
+    };
+
+    while (!queue.empty()) {
+        Node current = queue.top();
+        queue.pop();
+
+        const int currentIndex = localIndex(current.row, current.col);
+        if (current.dist > distances[currentIndex]) {
+            continue;
+        }
+        if (current.dist > radiusWorld) {
+            continue;
+        }
+
+        if (!(current.row == handle.row && current.col == handle.col)) {
+            const cv::Vec3f& orig = original(current.row, current.col);
+            float normalized = current.dist / radiusWorld;
+            normalized = std::clamp(normalized, 0.0f, 1.0f);
+            const float falloff = std::max(0.0f, 1.0f - normalized);
+            float weight = strength * falloff;
+            weight = std::clamp(weight, 0.0f, maxWeight);
+            if (weight >= kMinInfluenceWeight) {
+                preview(current.row, current.col) = orig + delta * weight;
+            }
+        }
+
+        const cv::Vec3f& currentOrig = original(current.row, current.col);
+
+        for (const auto& offset : neighbourOffsets) {
+            const int nr = current.row + offset[0];
+            const int nc = current.col + offset[1];
+            if (!isValidCell(nr, nc)) {
+                continue;
+            }
+            const float edgeLength = static_cast<float>(cv::norm(original(nr, nc) - currentOrig));
+            float edgeCost = edgeLength;
+            if (!std::isfinite(edgeCost) || edgeCost < 1e-5f) {
+                edgeCost = stepWorld;
+            }
+            const float newDist = current.dist + edgeCost;
+            if (newDist > radiusWorld) {
+                continue;
+            }
+            const int neighbourIndex = localIndex(nr, nc);
+            if (newDist + 1e-5f < distances[neighbourIndex]) {
+                distances[neighbourIndex] = newDist;
+                queue.push({newDist, nr, nc});
+            }
+        }
+    }
+}
+
+float SegmentationEditManager::estimateGridStepWorld() const
+{
+    if (_baseSurface) {
+        const cv::Vec2f scale = _baseSurface->scale();
+        const float sx = std::fabs(scale[0]);
+        const float sy = std::fabs(scale[1]);
+        const float step = std::max(sx, sy);
+        if (std::isfinite(step) && step > 1e-4f) {
+            return step;
+        }
+    }
+    return 1.0f;
 }
 
 void SegmentationEditManager::syncPreviewFromBase()
