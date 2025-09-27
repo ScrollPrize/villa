@@ -655,11 +655,6 @@ const team = {
       href: "https://thegiorgio.org/",
     },
     {
-      name: "Stephen Parsons",
-      title: "Staff Software Engineer, PhD",
-      href: "https://www2.cs.uky.edu/dri/stephen-parsons/",
-    },
-    {
       name: "Sean Johnson",
       title: "Research Assistant",
       href: "https://github.com/bruniss",
@@ -757,6 +752,11 @@ const team = {
       name: "JP Posma",
       title: "Project Lead",
       href: "https://janpaulposma.nl/",
+    },
+    {
+      name: "Stephen Parsons",
+      title: "Project Lead, PhD",
+      href: "https://www2.cs.uky.edu/dri/stephen-parsons/",
     },
     {
       name: "Ben Kyles",
