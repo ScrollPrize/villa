@@ -1,0 +1,201 @@
+# Segmentation Editing Architecture
+
+## Purpose and Scope
+
+The Segmentation Editor lets annotators reshape a generated `QuadSurface`
+patch interactively. It layers a Qt-based interaction module over the core
+surface utilities so that users can sample the existing grid into draggable
+handles, tweak local geometry, fill missing areas, and persist the result back
+to disk. This document captures the current implementation in detail (late
+2024 state) so new contributors can confidently extend or debug the tool.
+
+The primary runtime is the VC3D application; references below use source paths
+relative to `apps/VC3D` unless otherwise noted.
+
+
+## High-Level Data Flow
+
+1. **Session start** – `SegmentationModule::beginEditingSession` receives the
+   active `QuadSurface` from the segmentation tool. The module forwards the
+   surface into `SegmentationEditManager::beginSession`, which clones the raw
+   points into a preview surface (`SegmentationEditManager.cpp:127-149`).
+2. **Handle generation** – The edit manager down-samples the grid and materialises
+   a handle for each valid cell along that stride while persisting previously
+   added manual handles (`SegmentationEditManager.cpp:728-768`).
+3. **User interaction loop** – The module mediates input from each
+   `CVolumeViewer`, calls into the edit manager for coordinate updates, and pushes
+   preview changes back to the shared `CSurfaceCollection` for live rendering
+   (`SegmentationModule.cpp:440-575`).
+4. **Overlay feedback** – `SegmentationOverlayController` queries the edit
+   manager for handle positions and renders them as a viewer overlay with hover
+   and selection highlights (`overlays/SegmentationOverlayController.cpp:33-125`).
+5. **Preview persistence** – On “Apply”, the preview grid overwrites the base
+   surface and calls `QuadSurface::saveOverwrite` to commit to disk
+   (`SegmentationModule.cpp:216-236`). “Reset” re-syncs the preview from the
+   original clone (`SegmentationEditManager.cpp:192-205`).
+
+
+## Component Overview
+
+| Component | Responsibility |
+| --- | --- |
+| `SegmentationWidget` (`SegmentationWidget.cpp`) | Qt sidebar with controls for enabling editing, adjusting down-sample, radius, sigma, and triggering Apply/Reset.
+| `SegmentationModule` (`SegmentationModule.cpp/.hpp`) | Orchestrates the session lifecycle, binds viewers, processes input, and drives the overlay/state machines.
+| `SegmentationEditManager` (`SegmentationEditManager.cpp/.hpp`) | Core data model – clones surfaces, manages handle lists, applies deformations, fills holes, and tracks dirty state.
+| `SegmentationOverlayController` (`overlays/SegmentationOverlayController.cpp`) | Draws handle markers inside slice viewers and provides transient radius indicators.
+| `QuadSurface` (core layer, `core/include/vc/core/util/Surface.hpp`) | Stores the dense `cv::Mat_<cv::Vec3f>` grid that represents the segmentation surface in world space.
+
+### Session Lifecycle
+
+1. **Begin** – `beginEditingSession` configures down-sample/radius/sigma, swaps the
+   overlay to editing mode, and flags pending changes (`SegmentationModule.cpp:418-438`).
+2. **End** – `endEditingSession` discards the preview surface, restores the base
+   surface to the viewer, clears overlays, resets input state, and exits point-add
+   mode (`SegmentationModule.cpp:440-478`).
+3. **Apply/Reset** – Both operations go through `SegmentationEditManager`, either
+   copying preview → base (Apply) or restoring preview ← baseline clone (Reset)
+   (`SegmentationModule.cpp:216-242`, `205-214`).
+
+
+## Handle Model and Sampling
+
+### Automatic vs Manual Handles
+
+- **Automatic handles** represent a regular lattice of control points derived by
+  stepping through the preview grid with the current down-sample value. These
+  are recreated whenever down-sampling changes or the preview is reset
+  (`SegmentationEditManager.cpp:728-768`).
+- **Manual handles** are the points the user adds or modifies. They are stored in
+  the `_handles` vector with `Handle::isManual = true`, survive re-sampling, and
+  can be removed with Ctrl-click or the Delete key (`SegmentationEditManager.hpp:38-47`,
+  `SegmentationModule.cpp:508-543`).
+
+All handles cache both their original (`originalWorld`) and current (`currentWorld`)
+positions so deltas can be re-applied whenever radius or sigma settings change
+(`SegmentationEditManager.cpp:206-234`, `884-936`).
+
+### Down-sample Control
+
+The widget exposes a spin-box (default 12) that determines the grid stride
+(`SegmentationWidget.cpp:43-109`). Changing it recomputes the full handle set and
+updates the overlay, while the active preview surface remains untouched except
+for the regenerated handles (`SegmentationModule.cpp:167-192`).
+
+
+## Interaction Model
+
+### Mouse
+
+- **Left-click (default mode)** – Snaps to the nearest existing handle (within
+  radius tolerance) and starts a drag operation (`SegmentationModule.cpp:462-555`).
+- **Left-click (point-add mode)** – When Shift is held (or toggled), the module
+  calls `addHandleAtWorld` with `allowCreate=true`, enabling new handle creation
+  inside gaps (`SegmentationModule.cpp:347-397`). Point-add mode forces the
+  “Add” cursor (`SegmentationModule.cpp:284-331`, `618-640`, `700-739`).
+- **Ctrl + Left-click** – Deletes the closest manual handle if one falls within
+  the radius tolerance (`SegmentationModule.cpp:481-507`).
+- **Left Drag** – Updates the handle’s `currentWorld` position continuously and
+  re-runs the influence falloff to update nearby grid cells (`SegmentationModule.cpp:556-607`).
+- **Mouse Wheel (with focus in viewer)** – Adjusts the brush radius; Ctrl doubles
+  the step. The module updates the overlay, the preview surface, and shows an onscreen
+  label (`SegmentationModule.cpp:716-779`).
+
+### Keyboard Shortcuts
+
+- **Shift (hold/tap)** – Toggles point-add mode (`SegmentationModule.cpp:327-336`).
+- **R** – Focuses the current handle in viewer space by setting a POI on the surface
+  and aligning the overlay selection (`SegmentationModule.cpp:337-369`).
+- **Delete / Backspace** – Removes the active/hovered manual handle (`SegmentationModule.cpp:370-409`).
+- Global segmentation shortcuts such as evenly-spacing points (Y/Z/V) are exposed
+  through the keybinding dialog but handled elsewhere (`MenuActionController.cpp:395-449`).
+
+
+## Adding and Filling Points
+
+### Barycentric Projection
+
+When a user adds a handle (normal or point-add mode), the edit manager finds the
+closest valid triangle in the neighbourhood, computes the barycentric coordinates
+of the click, and projects the point onto that face. This works for both interior
+and extrapolated hits (`SegmentationEditManager.cpp:520-569`). The barycentric UVs
+identify the target grid cell to populate (`SegmentationEditManager.cpp:576-603`).
+
+### Hole Detection & Relaxation
+
+If the chosen grid cell was previously invalid or point-add mode created a new
+slot, the manager performs a local flood fill around the seed (radius six by
+default) to collect the contiguous hole region (`SegmentationEditManager.cpp:407-425`,
+`607-675`). It then iteratively smooths that patch by averaging each unfixed cell
+with neighbouring cells and nearby valid grid samples (25 Jacobi iterations)
+while keeping the seed pinned to the barycentric projection (`SegmentationEditManager.cpp:676-748`).
+This produces a stable local mesh fragment rather than a lone point floating away
+from the existing quad net.
+
+
+## Handle Influence and Preview Updates
+
+Dragging a handle computes the displacement vector between the original and
+current positions. The manager applies a Chebyshev-distance falloff out to the
+configured radius, scaling by the sigma “strength” multiplier (`SegmentationEditManager.cpp:884-936`).
+Cells with the sentinel value `(-1,-1,-1)` are skipped so you never accidentally
+revive intentionally blank regions. After each pass the preview grid keeps the
+handle cell in sync exactly.
+
+Whenever radius or sigma changes, `reapplyAllHandles` replays the stored deltas
+over a fresh copy of the original grid to avoid cumulative drift (`SegmentationEditManager.cpp:938-955`).
+
+
+## Overlay and Viewer Integration
+
+- The overlay controller acquires handle data via `SegmentationEditManager::handles`
+  and styles them based on active/hover/keyboard focus states
+  (`overlays/SegmentationOverlayController.cpp:62-123`).
+- During addition or drag the module sets `_hover`, `_active`, or `_keyboard`
+  handles and triggers targeted overlay refreshes to avoid expensive full redraws.
+- Radius feedback is rendered as a transient overlay with text showing the number
+  of grid steps represented by the current radius (`SegmentationModule.cpp:759-807`).
+
+
+## UI and Settings Persistence
+
+`SegmentationWidget` persists user preferences (down-sample, radius, sigma) into
+`VC.ini` by calling `writeSetting` each time a control changes
+(`SegmentationWidget.cpp:82-164`). When the widget is constructed it restores those
+values so sessions begin with familiar defaults (`SegmentationWidget.cpp:106-153`).
+Pending-change state toggles the Apply button enabling and the status label
+(`SegmentationWidget.cpp:166-225`).
+
+
+## Applying and Saving Changes
+
+- **Apply** – Copies the preview grid back to the base surface, invalidates caches,
+  and calls `QuadSurface::saveOverwrite()` inside a try/catch, surfacing errors to
+  the status bar (`SegmentationModule.cpp:216-237`). The widget and overlay are
+  reset afterwards.
+- **Reset** – Restores the preview from the original clone, rebuilds handles, and
+  clears manual state (`SegmentationModule.cpp:205-214`,
+  `SegmentationEditManager.cpp:192-205`).
+- **Stop tools** – Emits a `stopToolsRequested` signal so upstream UI can exit the
+  segmentation workflow gracefully (`SegmentationWidget.cpp:150-163`,
+  `SegmentationModule.cpp:215-221`).
+
+
+## Extending the Editor
+
+Useful extension points:
+
+- **Additional interaction modes** – Introduce new cursor states or gestures by
+  extending `SegmentationModule::handleMouse*` and `_pointAddMode`. Keep the overlay
+  in sync via `SegmentationOverlayController` helpers.
+- **Custom influence kernels** – Modify `applyHandleInfluence` to introduce
+  alternate falloff curves or anisotropic behaviour. Remember to adjust
+  `_radius`/`_sigma` semantics accordingly.
+- **Advanced hole filling** – Adjust the search radius or iterations by tuning
+  `kHoleSearchRadius`/`kHoleSmoothIterations` (`SegmentationEditManager.cpp:112-114`)
+  or replace the relaxation phase entirely. All hooks live inside the edit manager.
+- **Per-handle metadata** – Extend `SegmentationEditManager::Handle` if you need to
+  annotate handles with provenance flags or custom weights. Ensure
+  `regenerateHandles` and serialization logic are updated accordingly.
+
+
+
