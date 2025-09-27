@@ -1432,12 +1432,28 @@ int main(int argc, char *argv[])
             std::filesystem::path out_arg_path;
 
             if (batch_format == "zarr") {
-                // Always make a unique zarr per segmentation:
-                // <parent-of(-o)>/<stem-of(-o)>_<seg-name>
-                const auto parent = base.has_parent_path() ? base.parent_path()
-                                                        : std::filesystem::current_path();
-                const std::string stem = base.filename().string(); // “2um_111kev_1.2m”
-                out_arg_path = parent / (stem + "_" + seg_name);
+                // Treat -o as a DIRECTORY in batch-zarr mode so the wrapper can
+                // find layers_* under that directory.
+                // Write:  <-o>/<prefix>_<seg-name>.zarr
+                // And TIFFs: <-o>/layers_<prefix>_<seg-name>
+                std::filesystem::path base_dir;
+                if ((std::filesystem::exists(base) && std::filesystem::is_directory(base)) || !base.has_extension()) {
+                    base_dir = base;
+                    std::error_code ec;
+                    std::filesystem::create_directories(base_dir, ec); // best-effort
+                } else {
+                    // If -o looks like a file, fall back to its parent
+                    base_dir = base.parent_path();
+                    if (base_dir.empty()) base_dir = std::filesystem::current_path();
+                }
+                // Keep prior naming flavor by using the stem (or filename if empty) as prefix
+                const std::string prefix = base.stem().string().empty()
+                                             ? base.filename().string()
+                                             : base.stem().string();
+                out_arg_path = base_dir / (prefix + "_" + seg_name);
+                std::cout << "[batch] writing Zarr under directory: "
+                          << base_dir.string()
+                          << "  name=" << (prefix + "_" + seg_name) << " (.zarr appended)\n";
             } else {
                 // For TIFF, keep old behavior but handle absolute -o correctly
                 out_arg_path = base.is_absolute() ? (base / seg_name)
