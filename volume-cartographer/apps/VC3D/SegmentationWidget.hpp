@@ -7,6 +7,8 @@ class QSpinBox;
 class QDoubleSpinBox;
 class QCheckBox;
 class QLabel;
+class QString;
+class QVariant;
 
 // SegmentationWidget hosts controls for interactive surface editing
 class SegmentationWidget : public QWidget
@@ -41,11 +43,13 @@ signals:
 private:
     void setupUI();
     void updateEditingUi();
+    void restoreSettings();
+    void writeSetting(const QString& key, const QVariant& value);
 
     QCheckBox* _chkEditing;
     QLabel* _editingStatus;
     QSpinBox* _spinDownsample;
-    QDoubleSpinBox* _spinRadius;
+    QSpinBox* _spinRadius;
     QDoubleSpinBox* _spinSigma;
     QPushButton* _btnApply;
     QPushButton* _btnReset;
@@ -53,7 +57,7 @@ private:
 
     bool _editingEnabled = false;
     int _downsample = 12;
-    float _radius = 10.0f; // world units, adjustable
-    float _sigma = 10.0f;
+    float _radius = 1.0f;   // grid-space radius (Chebyshev distance)
+    float _sigma = 1.0f;    // neighbouring pull strength multiplier
     bool _hasPendingChanges = false;
 };

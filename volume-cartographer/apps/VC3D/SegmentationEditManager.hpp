@@ -67,7 +67,7 @@ private:
     std::unique_ptr<QuadSurface> _previewSurface;
     std::vector<Handle> _handles;
     int _downsample{12};
-    float _radius{10.0f};
-    float _sigma{10.0f};
+    float _radius{1.0f};          // radius expressed in grid steps (Chebyshev distance)
+    float _sigma{1.0f};           // strength multiplier applied to neighbouring grid points
     bool _dirty{false};
 };

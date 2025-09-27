@@ -34,11 +34,13 @@ private:
     bool isOverlayEnabledFor(CVolumeViewer* viewer) const override;
     void collectPrimitives(CVolumeViewer* viewer,
                            ViewerOverlayControllerBase::OverlayBuilder& builder) override;
+    [[nodiscard]] float gridStepWorld() const;
+    [[nodiscard]] float planeToleranceWorld() const;
 
     CSurfaceCollection* _surfCollection;
     bool _editingEnabled{false};
     int _downsample{12};
-    float _radius{10.0f};
+    float _radius{1.0f};
     SegmentationEditManager* _editManager{nullptr};
     std::optional<std::pair<int,int>> _activeHandle;
     std::optional<std::pair<int,int>> _hoverHandle;

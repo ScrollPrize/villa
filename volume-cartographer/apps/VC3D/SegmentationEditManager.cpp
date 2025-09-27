@@ -75,13 +75,24 @@ void SegmentationEditManager::setDownsample(int value)
 
 void SegmentationEditManager::setRadius(float radius)
 {
-    _radius = std::max(1.0f, radius);
+    const int clamped = std::max(1, static_cast<int>(std::lround(radius)));
+    const float snapped = static_cast<float>(clamped);
+    if (std::fabs(snapped - _radius) < 1e-4f) {
+        return;
+    }
+
+    _radius = snapped;
     reapplyAllHandles();
 }
 
 void SegmentationEditManager::setSigma(float sigma)
 {
-    _sigma = std::max(0.1f, sigma);
+    const float clamped = std::clamp(sigma, 0.10f, 2.0f);
+    if (std::fabs(clamped - _sigma) < 1e-4f) {
+        return;
+    }
+
+    _sigma = clamped;
     reapplyAllHandles();
 }
 
@@ -426,19 +437,15 @@ void SegmentationEditManager::applyHandleInfluence(const Handle& handle)
     const cv::Mat_<cv::Vec3f>& original = *_originalPoints;
     cv::Mat_<cv::Vec3f>& preview = *_previewPoints;
 
-    const cv::Vec2f scale = _baseSurface->scale();
-    const float radius = std::max(1.0f, _radius);
-    const float radiusSq = radius * radius;
-    const float sigma = std::max(0.1f, _sigma);
-    const float sigmaSq = sigma * sigma;
+    const int gridRadius = std::max(1, static_cast<int>(std::lround(_radius)));
+    const float strength = std::clamp(_sigma, 0.10f, 2.0f);
+    const float maxWeight = std::min(1.5f, std::max(strength, 0.0f));
+    const float denom = static_cast<float>(gridRadius + 1);
 
-    const int rowRadius = std::max(1, static_cast<int>(std::ceil(radius / std::max(1e-3f, scale[1]))));
-    const int colRadius = std::max(1, static_cast<int>(std::ceil(radius / std::max(1e-3f, scale[0]))));
-
-    const int rowStart = std::max(0, handle.row - rowRadius);
-    const int rowEnd = std::min(preview.rows - 1, handle.row + rowRadius);
-    const int colStart = std::max(0, handle.col - colRadius);
-    const int colEnd = std::min(preview.cols - 1, handle.col + colRadius);
+    const int rowStart = std::max(0, handle.row - gridRadius);
+    const int rowEnd = std::min(preview.rows - 1, handle.row + gridRadius);
+    const int colStart = std::max(0, handle.col - gridRadius);
+    const int colEnd = std::min(preview.cols - 1, handle.col + gridRadius);
 
     for (int r = rowStart; r <= rowEnd; ++r) {
         for (int c = colStart; c <= colEnd; ++c) {
@@ -447,12 +454,23 @@ void SegmentationEditManager::applyHandleInfluence(const Handle& handle)
                 continue;
             }
 
-            const float distSq = static_cast<float>(cv::norm(handle.originalWorld - orig));
-            if (distSq > radiusSq) {
+            const int dr = r - handle.row;
+            const int dc = c - handle.col;
+            const int gridDistance = std::max(std::abs(dr), std::abs(dc));
+            if (gridDistance > gridRadius) {
                 continue;
             }
 
-            const float weight = std::exp(-distSq / (2.0f * sigmaSq));
+            if (gridDistance == 0) {
+                continue;
+            }
+
+            float normalized = static_cast<float>(gridDistance) / denom;
+            normalized = std::clamp(normalized, 0.0f, 1.0f);
+            float falloff = std::max(0.0f, 1.0f - normalized);
+            float weight = strength * falloff;
+            weight = std::clamp(weight, 0.0f, maxWeight);
+
             if (weight < kMinInfluenceWeight) {
                 continue;
             }

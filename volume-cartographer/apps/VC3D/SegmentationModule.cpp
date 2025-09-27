@@ -28,6 +28,7 @@
 namespace
 {
 constexpr float kMinRadius = 1.0f;
+constexpr int kMaxRadiusSteps = 32;
 constexpr int kStatusShort = 1500;
 constexpr int kStatusMedium = 2000;
 constexpr int kStatusLong = 5000;
@@ -51,8 +52,8 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     , _surfaces(surfaces)
     , _editingEnabled(editingEnabled)
     , _downsample(downsample)
-    , _radius(radius)
-    , _sigma(sigma)
+    , _radius(static_cast<float>(std::clamp(static_cast<int>(std::lround(radius)), 1, kMaxRadiusSteps)))
+    , _sigma(std::clamp(sigma, 0.10f, 2.0f))
 {
     if (_overlay && _editManager) {
         _overlay->setEditManager(_editManager);
@@ -186,10 +187,12 @@ void SegmentationModule::setDownsample(int value)
 
 void SegmentationModule::setRadius(float radius)
 {
-    if (std::fabs(radius - _radius) < 1e-4f) {
+    const int snapped = std::clamp(static_cast<int>(std::lround(radius)), 1, kMaxRadiusSteps);
+    const float snappedRadius = static_cast<float>(snapped);
+    if (std::fabs(snappedRadius - _radius) < 1e-4f) {
         return;
     }
-    _radius = std::max(radius, kMinRadius);
+    _radius = snappedRadius;
 
     if (_widget && std::fabs(_widget->radius() - _radius) > 1e-4f) {
         _widget->setRadius(_radius);
@@ -211,10 +214,11 @@ void SegmentationModule::setRadius(float radius)
 
 void SegmentationModule::setSigma(float sigma)
 {
-    if (std::fabs(sigma - _sigma) < 1e-4f) {
+    const float clamped = std::clamp(sigma, 0.10f, 2.0f);
+    if (std::fabs(clamped - _sigma) < 1e-4f) {
         return;
     }
-    _sigma = sigma;
+    _sigma = clamped;
 
     if (_widget && std::fabs(_widget->sigma() - _sigma) > 1e-4f) {
         _widget->setSigma(_sigma);
@@ -492,6 +496,31 @@ void SegmentationModule::resetInteractionState()
     }
 }
 
+float SegmentationModule::gridStepWorld() const
+{
+    if (_editManager && _editManager->hasSession()) {
+        if (auto* surface = _editManager->baseSurface()) {
+            const cv::Vec2f scale = surface->scale();
+            const float sx = std::fabs(scale[0]);
+            const float sy = std::fabs(scale[1]);
+            const float step = std::max(sx, sy);
+            if (std::isfinite(step) && step > 1e-4f) {
+                return step;
+            }
+        }
+    }
+    return 1.0f;
+}
+
+float SegmentationModule::radiusWorldExtent(float gridRadius) const
+{
+    const float step = gridStepWorld();
+    const float cells = std::max(gridRadius, 1.0f);
+    const float baseExtent = (cells + 0.5f) * step;
+    const float minExtent = std::max(step, 3.0f);
+    return std::max(baseExtent, minExtent);
+}
+
 void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
                                           const cv::Vec3f& worldPos,
                                           const cv::Vec3f& normal,
@@ -509,7 +538,7 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
     Qt::KeyboardModifiers effectiveModifiers = modifiers & ~Qt::ShiftModifier;
 
     if (effectiveModifiers.testFlag(Qt::ControlModifier)) {
-        const float tolerance = std::max(10.0f, _radius * 0.5f);
+        const float tolerance = radiusWorldExtent(_radius);
         if (auto* handle = _editManager->findNearestHandle(worldPos, tolerance)) {
             if (_editManager->removeHandle(handle->row, handle->col)) {
                 _hover.clear();
@@ -531,7 +560,7 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
         return;
     }
 
-    const float pickTolerance = std::max(5.0f, _radius);
+    const float pickTolerance = radiusWorldExtent(_radius);
     auto* handle = _editManager->findNearestHandle(worldPos, pickTolerance);
     if (!_pointAddMode && !handle) {
         return;
@@ -686,17 +715,18 @@ void SegmentationModule::handleRadiusWheel(CVolumeViewer* viewer,
         return;
     }
 
-    float delta = steps > 0 ? 1.0f : -1.0f;
+    int deltaSteps = steps > 0 ? 1 : -1;
     if (QApplication::keyboardModifiers().testFlag(Qt::ControlModifier)) {
-        delta *= 2.0f;
+        deltaSteps *= 2;
     }
 
-    float newRadius = std::max(kMinRadius, _radius + delta);
-    if (std::fabs(newRadius - _radius) < 1e-4f) {
+    const int currentSteps = std::clamp(static_cast<int>(std::lround(_radius)), 1, kMaxRadiusSteps);
+    const int newSteps = std::clamp(currentSteps + deltaSteps, 1, kMaxRadiusSteps);
+    if (newSteps == currentSteps) {
         return;
     }
 
-    _radius = newRadius;
+    _radius = static_cast<float>(newSteps);
     if (_widget && std::fabs(_widget->radius() - _radius) > 1e-4f) {
         _widget->setRadius(_radius);
     }
@@ -726,7 +756,9 @@ void SegmentationModule::showRadiusIndicator(CVolumeViewer* viewer,
 
     viewer->clearOverlayGroup("segmentation_radius_indicator");
 
-    auto* textItem = new QGraphicsSimpleTextItem(QString::number(radius, 'f', 0));
+    const int steps = std::clamp(static_cast<int>(std::lround(radius)), 1, kMaxRadiusSteps);
+    const QString label = steps == 1 ? tr("1 step") : tr("%1 steps").arg(steps);
+    auto* textItem = new QGraphicsSimpleTextItem(label);
     QFont font = textItem->font();
     font.setPointSizeF(11.0);
     textItem->setFont(font);

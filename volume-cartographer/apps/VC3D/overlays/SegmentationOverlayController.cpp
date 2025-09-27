@@ -66,10 +66,12 @@ void SegmentationOverlayController::setDownsample(int value)
 
 void SegmentationOverlayController::setRadius(float radius)
 {
-    if (std::fabs(radius - _radius) < 1e-4f) {
+    const int snapped = std::max(1, static_cast<int>(std::lround(radius)));
+    const float snappedRadius = static_cast<float>(snapped);
+    if (std::fabs(snappedRadius - _radius) < 1e-4f) {
         return;
     }
-    _radius = radius;
+    _radius = snappedRadius;
     refreshAll();
 }
 
@@ -92,7 +94,7 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
         return;
     }
 
-    const float planeTolerance = std::max(1.0f, _radius);
+    const float planeTolerance = planeToleranceWorld();
 
     auto* currentSurface = viewer->currentSurface();
     auto* planeSurface = dynamic_cast<PlaneSurface*>(currentSurface);
@@ -250,6 +252,42 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
         auto [radius, style] = pointVisuals(entry.isActive, entry.isHover, entry.isKeyboard);
         builder.addPoint(scenePt, radius, style);
     }
+}
+
+float SegmentationOverlayController::gridStepWorld() const
+{
+    if (_editManager && _editManager->baseSurface()) {
+        const cv::Vec2f scale = _editManager->baseSurface()->scale();
+        const float sx = std::fabs(scale[0]);
+        const float sy = std::fabs(scale[1]);
+        const float step = std::max(sx, sy);
+        if (std::isfinite(step) && step > 1e-4f) {
+            return step;
+        }
+    }
+
+    if (_surfCollection) {
+        if (auto* surface = dynamic_cast<QuadSurface*>(_surfCollection->surface("segmentation"))) {
+            const cv::Vec2f scale = surface->scale();
+            const float sx = std::fabs(scale[0]);
+            const float sy = std::fabs(scale[1]);
+            const float step = std::max(sx, sy);
+            if (std::isfinite(step) && step > 1e-4f) {
+                return step;
+            }
+        }
+    }
+
+    return 1.0f;
+}
+
+float SegmentationOverlayController::planeToleranceWorld() const
+{
+    const float step = gridStepWorld();
+    const float cells = std::max(_radius, 1.0f);
+    const float baseExtent = (cells + 0.5f) * step;
+    const float minExtent = std::max(step, 3.0f);
+    return std::max(baseExtent, minExtent);
 }
 
 void SegmentationOverlayController::setActiveHandle(std::optional<std::pair<int,int>> key, bool refresh)

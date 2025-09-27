@@ -110,6 +110,8 @@ private:
     void refreshOverlay();
     void emitPendingChanges();
     void resetInteractionState();
+    [[nodiscard]] float gridStepWorld() const;
+    [[nodiscard]] float radiusWorldExtent(float gridRadius) const;
     void showRadiusIndicator(CVolumeViewer* viewer,
                              const QPointF& scenePoint,
                              float radius);
@@ -140,8 +142,8 @@ private:
 
     bool _editingEnabled{false};
     int _downsample{12};
-    float _radius{10.0f};
-    float _sigma{10.0f};
+    float _radius{1.0f};
+    float _sigma{1.0f};
 
     bool _pointAddMode{false};
     DragState _drag;
