@@ -561,14 +561,12 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
     }
 
     const float pickTolerance = radiusWorldExtent(_radius);
-    auto* handle = _editManager->findNearestHandle(worldPos, pickTolerance);
-    if (!_pointAddMode && !handle) {
-        return;
-    }
+    const float addTolerance = _pointAddMode ? -1.0f : pickTolerance;
+    const float addPlaneTolerance = planeSurface ? (_pointAddMode ? -1.0f : pickTolerance) : 0.0f;
 
+    auto* handle = _pointAddMode ? nullptr : _editManager->findNearestHandle(worldPos, pickTolerance);
     if (!handle) {
-        const float planeTolerance = planeSurface ? pickTolerance : 0.0f;
-        if (auto added = _editManager->addHandleAtWorld(worldPos, pickTolerance, planeSurface, planeTolerance)) {
+        if (auto added = _editManager->addHandleAtWorld(worldPos, addTolerance, planeSurface, addPlaneTolerance, _pointAddMode)) {
             cv::Vec3f handleWorld = worldPos;
             if (auto world = _editManager->handleWorldPosition(added->first, added->second)) {
                 handleWorld = *world;

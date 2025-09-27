@@ -49,7 +49,8 @@ public:
     std::optional<std::pair<int,int>> addHandleAtWorld(const cv::Vec3f& worldPos,
                                                        float tolerance = 40.0f,
                                                        PlaneSurface* plane = nullptr,
-                                                       float planeTolerance = 0.0f);
+                                                       float planeTolerance = 0.0f,
+                                                       bool allowCreate = false);
     bool removeHandle(int row, int col);
     std::optional<cv::Vec3f> handleWorldPosition(int row, int col) const;
     std::optional<std::pair<int,int>> worldToGridIndex(const cv::Vec3f& worldPos, float* outDistance = nullptr) const;
@@ -60,6 +61,15 @@ private:
     Handle* findHandle(int row, int col);
     void syncPreviewFromBase();
     void reapplyAllHandles();
+    bool fillInvalidCellWithLocalSolve(const cv::Vec3f& worldPos,
+                                       int seedRow,
+                                       int seedCol,
+                                       std::pair<int,int>& outCell,
+                                       cv::Vec3f* outWorld = nullptr);
+    std::vector<std::pair<int,int>> collectHoleCells(int centerRow, int centerCol, int radius) const;
+    void relaxHolePatch(const std::vector<std::pair<int,int>>& holeCells,
+                        const std::pair<int,int>& seedCell,
+                        const cv::Vec3f& seedWorld);
 
     QuadSurface* _baseSurface{nullptr};
     std::unique_ptr<cv::Mat_<cv::Vec3f>> _originalPoints;

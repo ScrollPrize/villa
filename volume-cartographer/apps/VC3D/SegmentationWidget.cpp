@@ -8,6 +8,7 @@
 #include <QPushButton>
 #include <QSettings>
 #include <QSpinBox>
+#include <QVariant>
 #include <QVBoxLayout>
 #include <QSignalBlocker>
 

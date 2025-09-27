@@ -3,8 +3,11 @@
 #include "vc/core/util/Surface.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
+#include <queue>
+#include <unordered_map>
 
 namespace
 {
@@ -24,6 +27,96 @@ void ensurePointValid(cv::Mat_<cv::Vec3f>* mat, int row, int col, const cv::Vec3
         cell = worldPos;
     }
 }
+
+struct TriangleSample
+{
+    cv::Vec3f p0;
+    cv::Vec3f p1;
+    cv::Vec3f p2;
+    cv::Vec2f uv0;
+    cv::Vec2f uv1;
+    cv::Vec2f uv2;
+};
+
+void closestPointOnTriangle(const TriangleSample& tri,
+                            const cv::Vec3f& point,
+                            cv::Vec3f& closest,
+                            cv::Vec3f& bary)
+{
+    const cv::Vec3f& a = tri.p0;
+    const cv::Vec3f& b = tri.p1;
+    const cv::Vec3f& c = tri.p2;
+
+    cv::Vec3f ab = b - a;
+    cv::Vec3f ac = c - a;
+    cv::Vec3f ap = point - a;
+
+    float d1 = ab.dot(ap);
+    float d2 = ac.dot(ap);
+    if (d1 <= 0.0f && d2 <= 0.0f) {
+        closest = a;
+        bary = cv::Vec3f(1.0f, 0.0f, 0.0f);
+        return;
+    }
+
+    cv::Vec3f bp = point - b;
+    float d3 = ab.dot(bp);
+    float d4 = ac.dot(bp);
+    if (d3 >= 0.0f && d4 <= d3) {
+        closest = b;
+        bary = cv::Vec3f(0.0f, 1.0f, 0.0f);
+        return;
+    }
+
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
+        float v = d1 / (d1 - d3);
+        closest = a + v * ab;
+        bary = cv::Vec3f(1.0f - v, v, 0.0f);
+        return;
+    }
+
+    cv::Vec3f cp = point - c;
+    float d5 = ab.dot(cp);
+    float d6 = ac.dot(cp);
+    if (d6 >= 0.0f && d5 <= d6) {
+        closest = c;
+        bary = cv::Vec3f(0.0f, 0.0f, 1.0f);
+        return;
+    }
+
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
+        float w = d2 / (d2 - d6);
+        closest = a + w * ac;
+        bary = cv::Vec3f(1.0f - w, 0.0f, w);
+        return;
+    }
+
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
+        float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        closest = b + w * (c - b);
+        bary = cv::Vec3f(0.0f, 1.0f - w, w);
+        return;
+    }
+
+    float denom = 1.0f / (va + vb + vc);
+    float v = vb * denom;
+    float w = vc * denom;
+    float u = 1.0f - v - w;
+    closest = u * a + v * b + w * c;
+    bary = cv::Vec3f(u, v, w);
+}
+
+constexpr int kHoleSearchRadius = 6;
+constexpr int kHoleSmoothIterations = 25;
+const std::array<cv::Vec2i, 4> kNeighbourOffsets = {
+    cv::Vec2i{1, 0},
+    cv::Vec2i{-1, 0},
+    cv::Vec2i{0, 1},
+    cv::Vec2i{0, -1}
+};
 }
 
 SegmentationEditManager::SegmentationEditManager(QObject* parent)
@@ -197,7 +290,8 @@ SegmentationEditManager::Handle* SegmentationEditManager::findNearestHandle(cons
 std::optional<std::pair<int,int>> SegmentationEditManager::addHandleAtWorld(const cv::Vec3f& worldPos,
                                                                            float tolerance,
                                                                            PlaneSurface* plane,
-                                                                           float planeTolerance)
+                                                                           float planeTolerance,
+                                                                           bool allowCreate)
 {
     if (!hasSession() || !_previewPoints || !_originalPoints) {
         return std::nullopt;
@@ -277,12 +371,59 @@ std::optional<std::pair<int,int>> SegmentationEditManager::addHandleAtWorld(cons
         }
     }
 
+    cv::Vec3f solvedWorld = worldPos;
+    bool createdCell = false;
+    std::vector<std::pair<int,int>> holeCells;
+
+    if (allowCreate) {
+        int seedRow = bestRow;
+        int seedCol = bestCol;
+        if (seedRow < 0 || seedCol < 0) {
+            if (fallbackRow >= 0 && fallbackCol >= 0) {
+                seedRow = fallbackRow;
+                seedCol = fallbackCol;
+            } else if (bestPlaneRow >= 0 && bestPlaneCol >= 0) {
+                seedRow = bestPlaneRow;
+                seedCol = bestPlaneCol;
+            }
+        }
+        std::pair<int,int> newCell;
+        if (fillInvalidCellWithLocalSolve(worldPos, seedRow, seedCol, newCell, &solvedWorld)) {
+            bestRow = newCell.first;
+            bestCol = newCell.second;
+            createdCell = true;
+        }
+    }
+
     if (bestRow < 0 || bestCol < 0) {
         return std::nullopt;
     }
 
-    ensurePointValid(_originalPoints.get(), bestRow, bestCol, worldPos);
-    ensurePointValid(_previewPoints, bestRow, bestCol, worldPos);
+    const bool targetCellInvalid = isInvalidPoint(preview(bestRow, bestCol));
+    if (targetCellInvalid) {
+        createdCell = true;
+    }
+
+    if (createdCell) {
+        holeCells = collectHoleCells(bestRow, bestCol, kHoleSearchRadius);
+        if (holeCells.empty()) {
+            holeCells.emplace_back(bestRow, bestCol);
+        }
+    } else {
+        solvedWorld = preview(bestRow, bestCol);
+    }
+
+    ensurePointValid(_originalPoints.get(), bestRow, bestCol, solvedWorld);
+    ensurePointValid(_previewPoints, bestRow, bestCol, solvedWorld);
+
+    if (createdCell && _originalPoints && _previewPoints) {
+        (*_originalPoints)(bestRow, bestCol) = solvedWorld;
+        (*_previewPoints)(bestRow, bestCol) = solvedWorld;
+
+        if (!holeCells.empty()) {
+            relaxHolePatch(holeCells, std::make_pair(bestRow, bestCol), solvedWorld);
+        }
+    }
 
     if (auto* existing = findHandle(bestRow, bestCol)) {
         if (!existing->isManual) {
@@ -334,6 +475,319 @@ std::optional<std::pair<int,int>> SegmentationEditManager::worldToGridIndex(cons
         *outDistance = dist;
     }
     return std::make_pair(row, col);
+}
+
+bool SegmentationEditManager::fillInvalidCellWithLocalSolve(const cv::Vec3f& worldPos,
+                                                            int seedRow,
+                                                            int seedCol,
+                                                            std::pair<int,int>& outCell,
+                                                            cv::Vec3f* outWorld)
+{
+    if (!_previewPoints) {
+        return false;
+    }
+
+    const cv::Mat_<cv::Vec3f>& preview = *_previewPoints;
+    const int rows = preview.rows;
+    const int cols = preview.cols;
+
+    if (seedRow < 0 || seedCol < 0 || seedRow >= rows || seedCol >= cols) {
+        if (auto idx = worldToGridIndex(worldPos)) {
+            seedRow = idx->first;
+            seedCol = idx->second;
+        } else {
+            seedRow = std::clamp(static_cast<int>(rows / 2), 0, rows - 1);
+            seedCol = std::clamp(static_cast<int>(cols / 2), 0, cols - 1);
+        }
+    }
+
+    std::vector<TriangleSample> triangles;
+    triangles.reserve(512);
+
+    if (rows < 2 || cols < 2) {
+        return false;
+    }
+
+    constexpr int kRadius = 8;
+    const int rowStart = std::max(0, seedRow - kRadius);
+    const int rowEnd = std::min(rows - 2, seedRow + kRadius);
+    const int colStart = std::max(0, seedCol - kRadius);
+    const int colEnd = std::min(cols - 2, seedCol + kRadius);
+
+    const auto accumulateTriangles = [&](int rStart, int rEnd, int cStart, int cEnd) {
+        for (int r = rStart; r <= rEnd; ++r) {
+            for (int c = cStart; c <= cEnd; ++c) {
+                const cv::Vec3f& p00 = preview(r, c);
+                const cv::Vec3f& p10 = preview(r + 1, c);
+                const cv::Vec3f& p01 = preview(r, c + 1);
+                const cv::Vec3f& p11 = preview(r + 1, c + 1);
+
+                if (!isInvalidPoint(p00) && !isInvalidPoint(p10) && !isInvalidPoint(p01)) {
+                    triangles.push_back({p00, p10, p01,
+                                         cv::Vec2f(static_cast<float>(c), static_cast<float>(r)),
+                                         cv::Vec2f(static_cast<float>(c), static_cast<float>(r + 1)),
+                                         cv::Vec2f(static_cast<float>(c + 1), static_cast<float>(r))});
+                }
+
+                if (!isInvalidPoint(p11) && !isInvalidPoint(p01) && !isInvalidPoint(p10)) {
+                    triangles.push_back({p11, p01, p10,
+                                         cv::Vec2f(static_cast<float>(c + 1), static_cast<float>(r + 1)),
+                                         cv::Vec2f(static_cast<float>(c + 1), static_cast<float>(r)),
+                                         cv::Vec2f(static_cast<float>(c), static_cast<float>(r + 1))});
+                }
+            }
+        }
+    };
+
+    if (rowStart <= rowEnd && colStart <= colEnd) {
+        accumulateTriangles(rowStart, rowEnd, colStart, colEnd);
+    }
+
+    if (triangles.empty()) {
+        accumulateTriangles(0, rows - 2, 0, cols - 2);
+    }
+
+    if (triangles.empty()) {
+        return false;
+    }
+
+    bool found = false;
+    float bestDistance = std::numeric_limits<float>::max();
+    cv::Vec2f bestUV(0.0f, 0.0f);
+    cv::Vec3f bestWorld = worldPos;
+
+    for (const TriangleSample& tri : triangles) {
+        cv::Vec3f closest;
+        cv::Vec3f bary;
+        closestPointOnTriangle(tri, worldPos, closest, bary);
+        const float distance = cv::norm(worldPos - closest);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            bestUV = bary[0] * tri.uv0 + bary[1] * tri.uv1 + bary[2] * tri.uv2;
+            found = true;
+            bestWorld = closest;
+        }
+    }
+
+    if (!found) {
+        return false;
+    }
+
+    int targetRow = std::clamp(static_cast<int>(std::lround(bestUV[1])), 0, rows - 1);
+    int targetCol = std::clamp(static_cast<int>(std::lround(bestUV[0])), 0, cols - 1);
+
+    constexpr int kSearchRadius = 4;
+    float bestScore = std::numeric_limits<float>::max();
+    std::optional<std::pair<int,int>> bestCell;
+    for (int r = std::max(0, targetRow - kSearchRadius); r <= std::min(rows - 1, targetRow + kSearchRadius); ++r) {
+        for (int c = std::max(0, targetCol - kSearchRadius); c <= std::min(cols - 1, targetCol + kSearchRadius); ++c) {
+            if (!isInvalidPoint(preview(r, c))) {
+                continue;
+            }
+            const float score = std::hypot(static_cast<float>(r) - bestUV[1],
+                                           static_cast<float>(c) - bestUV[0]);
+            if (score < bestScore) {
+                bestScore = score;
+                bestCell = std::make_pair(r, c);
+            }
+        }
+    }
+
+    if (!bestCell) {
+        return false;
+    }
+
+    outCell = *bestCell;
+    if (outWorld) {
+        *outWorld = bestWorld;
+    }
+    return true;
+}
+
+std::vector<std::pair<int,int>> SegmentationEditManager::collectHoleCells(int centerRow, int centerCol, int radius) const
+{
+    std::vector<std::pair<int,int>> result;
+    if (!_previewPoints) {
+        return result;
+    }
+
+    const cv::Mat_<cv::Vec3f>& preview = *_previewPoints;
+    const int rows = preview.rows;
+    const int cols = preview.cols;
+
+    if (centerRow < 0 || centerCol < 0 || centerRow >= rows || centerCol >= cols) {
+        return result;
+    }
+
+    const int rowStart = std::max(0, centerRow - radius);
+    const int rowEnd = std::min(rows - 1, centerRow + radius);
+    const int colStart = std::max(0, centerCol - radius);
+    const int colEnd = std::min(cols - 1, centerCol + radius);
+
+    const int width = colEnd - colStart + 1;
+    const int height = rowEnd - rowStart + 1;
+    if (width <= 0 || height <= 0) {
+        return result;
+    }
+
+    const auto indexFor = [&](int r, int c) {
+        return (r - rowStart) * width + (c - colStart);
+    };
+
+    std::vector<uint8_t> visited(static_cast<std::size_t>(width * height), 0);
+    std::queue<std::pair<int,int>> frontier;
+
+    if (isInvalidPoint(preview(centerRow, centerCol))) {
+        frontier.emplace(centerRow, centerCol);
+        visited[indexFor(centerRow, centerCol)] = 1;
+    } else {
+        result.emplace_back(centerRow, centerCol);
+        return result;
+    }
+
+    while (!frontier.empty()) {
+        auto [row, col] = frontier.front();
+        frontier.pop();
+        result.emplace_back(row, col);
+
+        for (const auto& offset : kNeighbourOffsets) {
+            const int nr = row + offset[0];
+            const int nc = col + offset[1];
+            if (nr < rowStart || nr > rowEnd || nc < colStart || nc > colEnd) {
+                continue;
+            }
+            const int idx = indexFor(nr, nc);
+            if (visited[idx]) {
+                continue;
+            }
+            if (!isInvalidPoint(preview(nr, nc))) {
+                continue;
+            }
+            visited[idx] = 1;
+            frontier.emplace(nr, nc);
+        }
+    }
+
+    if (result.empty()) {
+        result.emplace_back(centerRow, centerCol);
+    }
+    return result;
+}
+
+void SegmentationEditManager::relaxHolePatch(const std::vector<std::pair<int,int>>& holeCells,
+                                             const std::pair<int,int>& seedCell,
+                                             const cv::Vec3f& seedWorld)
+{
+    if (holeCells.empty() || !_previewPoints || !_originalPoints) {
+        return;
+    }
+
+    const int cols = _previewPoints->cols;
+
+    std::unordered_map<int, int> cellIndex;
+    cellIndex.reserve(holeCells.size());
+    for (std::size_t i = 0; i < holeCells.size(); ++i) {
+        const auto& cell = holeCells[i];
+        cellIndex[cell.first * cols + cell.second] = static_cast<int>(i);
+    }
+
+    struct Node
+    {
+        cv::Vec3f value;
+        cv::Vec3f scratch;
+        bool fixed{false};
+    };
+
+    std::vector<Node> nodes(holeCells.size());
+    for (std::size_t i = 0; i < holeCells.size(); ++i) {
+        const auto& cell = holeCells[i];
+        const bool isSeed = cell == seedCell;
+        nodes[i].fixed = isSeed;
+        nodes[i].value = isSeed ? seedWorld : seedWorld;
+    }
+
+    // Initialise non-seed cells with averages from available neighbours to reduce drift.
+    for (std::size_t i = 0; i < holeCells.size(); ++i) {
+        if (nodes[i].fixed) {
+            continue;
+        }
+        const auto& [row, col] = holeCells[i];
+        cv::Vec3f accum(0.0f, 0.0f, 0.0f);
+        int count = 0;
+        for (const auto& offset : kNeighbourOffsets) {
+            const int nr = row + offset[0];
+            const int nc = col + offset[1];
+            if (nr < 0 || nc < 0 || nr >= _previewPoints->rows || nc >= _previewPoints->cols) {
+                continue;
+            }
+            const int key = nr * cols + nc;
+            auto it = cellIndex.find(key);
+            if (it != cellIndex.end()) {
+                accum += nodes[it->second].value;
+                ++count;
+            } else {
+                const cv::Vec3f& neighbour = (*_previewPoints)(nr, nc);
+                if (!isInvalidPoint(neighbour)) {
+                    accum += neighbour;
+                    ++count;
+                }
+            }
+        }
+        if (count > 0) {
+            nodes[i].value = accum * (1.0f / static_cast<float>(count));
+        }
+    }
+
+    for (int iteration = 0; iteration < kHoleSmoothIterations; ++iteration) {
+        for (std::size_t i = 0; i < holeCells.size(); ++i) {
+            if (nodes[i].fixed) {
+                nodes[i].scratch = nodes[i].value;
+                continue;
+            }
+
+            const auto& [row, col] = holeCells[i];
+            cv::Vec3f accum(0.0f, 0.0f, 0.0f);
+            int count = 0;
+            for (const auto& offset : kNeighbourOffsets) {
+                const int nr = row + offset[0];
+                const int nc = col + offset[1];
+                if (nr < 0 || nc < 0 || nr >= _previewPoints->rows || nc >= _previewPoints->cols) {
+                    continue;
+                }
+                const int key = nr * cols + nc;
+                auto it = cellIndex.find(key);
+                if (it != cellIndex.end()) {
+                    accum += nodes[it->second].value;
+                    ++count;
+                } else {
+                    const cv::Vec3f& neighbour = (*_previewPoints)(nr, nc);
+                    if (!isInvalidPoint(neighbour)) {
+                        accum += neighbour;
+                        ++count;
+                    }
+                }
+            }
+
+            if (count > 0) {
+                nodes[i].scratch = accum * (1.0f / static_cast<float>(count));
+            } else {
+                nodes[i].scratch = nodes[i].value;
+            }
+        }
+
+        for (std::size_t i = 0; i < holeCells.size(); ++i) {
+            if (!nodes[i].fixed) {
+                nodes[i].value = nodes[i].scratch;
+            }
+        }
+    }
+
+    for (std::size_t i = 0; i < holeCells.size(); ++i) {
+        const auto& cell = holeCells[i];
+        const cv::Vec3f& value = nodes[i].value;
+        (*_originalPoints)(cell.first, cell.second) = value;
+        (*_previewPoints)(cell.first, cell.second) = value;
+    }
 }
 
 bool SegmentationEditManager::removeHandle(int row, int col)
