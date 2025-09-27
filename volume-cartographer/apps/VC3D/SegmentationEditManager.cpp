@@ -198,6 +198,15 @@ void SegmentationEditManager::setInfluenceMode(SegmentationInfluenceMode mode)
     reapplyAllHandles();
 }
 
+void SegmentationEditManager::setRowColMode(SegmentationRowColMode mode)
+{
+    if (_rowColMode == mode) {
+        return;
+    }
+    _rowColMode = mode;
+    reapplyAllHandles();
+}
+
 void SegmentationEditManager::setHoleSearchRadius(int radius)
 {
     const int clamped = std::clamp(radius, 1, 64);
@@ -251,7 +260,10 @@ void SegmentationEditManager::applyPreview()
 
 constexpr float kMinInfluenceWeight = 1e-3f;
 
-bool SegmentationEditManager::updateHandleWorldPosition(int row, int col, const cv::Vec3f& newWorldPos)
+bool SegmentationEditManager::updateHandleWorldPosition(int row,
+                                                        int col,
+                                                        const cv::Vec3f& newWorldPos,
+                                                        std::optional<SegmentationRowColAxis> axisHint)
 {
     if (!hasSession() || !_previewPoints || !_originalPoints) {
         qWarning() << "SegmentationEditManager: cannot move handle without an active session";
@@ -262,6 +274,15 @@ bool SegmentationEditManager::updateHandleWorldPosition(int row, int col, const 
     if (!handle) {
         qWarning() << "SegmentationEditManager: no handle found at" << row << col << "for movement";
         return false;
+    }
+
+    if (axisHint.has_value()) {
+        handle->rowColAxis = *axisHint;
+    } else if (_influenceMode == SegmentationInfluenceMode::RowColumn &&
+               handle->rowColAxis == SegmentationRowColAxis::Both) {
+        handle->rowColAxis = (_rowColMode == SegmentationRowColMode::ColumnOnly)
+                                 ? SegmentationRowColAxis::Column
+                                 : SegmentationRowColAxis::Row;
     }
 
     handle->currentWorld = newWorldPos;
@@ -319,7 +340,8 @@ std::optional<std::pair<int,int>> SegmentationEditManager::addHandleAtWorld(cons
                                                                            float tolerance,
                                                                            PlaneSurface* plane,
                                                                            float planeTolerance,
-                                                                           bool allowCreate)
+                                                                           bool allowCreate,
+                                                                           std::optional<SegmentationRowColAxis> axisHint)
 {
     if (!hasSession() || !_previewPoints || !_originalPoints) {
         qWarning() << "SegmentationEditManager: cannot add handle without an active session";
@@ -461,6 +483,9 @@ std::optional<std::pair<int,int>> SegmentationEditManager::addHandleAtWorld(cons
             existing->isManual = true;
             existing->originalWorld = (*_originalPoints)(bestRow, bestCol);
             existing->currentWorld = (*_previewPoints)(bestRow, bestCol);
+            if (axisHint.has_value()) {
+                existing->rowColAxis = *axisHint;
+            }
             _dirty = true;
             return std::make_pair(bestRow, bestCol);
         }
@@ -475,6 +500,13 @@ std::optional<std::pair<int,int>> SegmentationEditManager::addHandleAtWorld(cons
     handle.originalWorld = (*_originalPoints)(bestRow, bestCol);
     handle.currentWorld = (*_previewPoints)(bestRow, bestCol);
     handle.isManual = true;
+    if (axisHint.has_value()) {
+        handle.rowColAxis = *axisHint;
+    } else if (_influenceMode == SegmentationInfluenceMode::RowColumn) {
+        handle.rowColAxis = (_rowColMode == SegmentationRowColMode::ColumnOnly)
+                                ? SegmentationRowColAxis::Column
+                                : SegmentationRowColAxis::Row;
+    }
     _handles.push_back(handle);
 
     _dirty = true;
@@ -890,6 +922,7 @@ void SegmentationEditManager::regenerateHandles()
             handle.originalWorld = wp;
             handle.currentWorld = wp;
             handle.isManual = false;
+            handle.rowColAxis = SegmentationRowColAxis::Both;
             _handles.push_back(handle);
         }
     }
@@ -923,6 +956,8 @@ void SegmentationEditManager::applyHandleInfluence(const Handle& handle)
     if (hasDelta) {
         if (_influenceMode == SegmentationInfluenceMode::GeodesicCircular) {
             applyHandleInfluenceGeodesic(handle, delta);
+        } else if (_influenceMode == SegmentationInfluenceMode::RowColumn) {
+            applyHandleInfluenceRowCol(handle, delta);
         } else {
             applyHandleInfluenceGrid(handle, delta);
         }
@@ -1098,6 +1133,90 @@ void SegmentationEditManager::applyHandleInfluenceGeodesic(const Handle& handle,
                 queue.push({newDist, nr, nc});
             }
         }
+    }
+}
+
+void SegmentationEditManager::applyHandleInfluenceRowCol(const Handle& handle, const cv::Vec3f& delta)
+{
+    const cv::Mat_<cv::Vec3f>& original = *_originalPoints;
+    cv::Mat_<cv::Vec3f>& preview = *_previewPoints;
+
+    const int radius = std::max(1, static_cast<int>(std::lround(_radius)));
+    const float strength = std::clamp(_sigma, 0.10f, 2.0f);
+    const float maxWeight = std::min(1.5f, std::max(strength, 0.0f));
+    const float denom = static_cast<float>(radius + 1);
+
+    if (handle.row < 0 || handle.row >= original.rows ||
+        handle.col < 0 || handle.col >= original.cols) {
+        return;
+    }
+
+    auto computeWeight = [&](int distance) {
+        float normalized = static_cast<float>(distance) / denom;
+        normalized = std::clamp(normalized, 0.0f, 1.0f);
+        float falloff = std::max(0.0f, 1.0f - normalized);
+        float weight = strength * falloff;
+        return std::clamp(weight, 0.0f, maxWeight);
+    };
+
+    auto applyRow = [&]() {
+        const int r = handle.row;
+        const int colStart = std::max(0, handle.col - radius);
+        const int colEnd = std::min(original.cols - 1, handle.col + radius);
+        for (int c = colStart; c <= colEnd; ++c) {
+            if (c == handle.col) {
+                continue;
+            }
+            const cv::Vec3f& orig = original(r, c);
+            if (isInvalidPoint(orig)) {
+                continue;
+            }
+            const int distance = std::abs(c - handle.col);
+            float weight = computeWeight(distance);
+            if (weight < kMinInfluenceWeight) {
+                continue;
+            }
+            preview(r, c) = orig + delta * weight;
+        }
+    };
+
+    auto applyColumn = [&]() {
+        const int c = handle.col;
+        const int rowStart = std::max(0, handle.row - radius);
+        const int rowEnd = std::min(original.rows - 1, handle.row + radius);
+        for (int r = rowStart; r <= rowEnd; ++r) {
+            if (r == handle.row) {
+                continue;
+            }
+            const cv::Vec3f& orig = original(r, c);
+            if (isInvalidPoint(orig)) {
+                continue;
+            }
+            const int distance = std::abs(r - handle.row);
+            float weight = computeWeight(distance);
+            if (weight < kMinInfluenceWeight) {
+                continue;
+            }
+            preview(r, c) = orig + delta * weight;
+        }
+    };
+
+    SegmentationRowColAxis axis = handle.rowColAxis;
+    if (_rowColMode == SegmentationRowColMode::RowOnly) {
+        axis = SegmentationRowColAxis::Row;
+    } else if (_rowColMode == SegmentationRowColMode::ColumnOnly) {
+        axis = SegmentationRowColAxis::Column;
+    } else if (axis == SegmentationRowColAxis::Both) {
+        axis = SegmentationRowColAxis::Row;
+    }
+
+    if (axis == SegmentationRowColAxis::Row) {
+        applyRow();
+    } else if (axis == SegmentationRowColAxis::Column) {
+        applyColumn();
+    } else {
+        applyRow();
+        applyColumn();
     }
 }
 

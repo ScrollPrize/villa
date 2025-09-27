@@ -26,6 +26,7 @@ public:
     [[nodiscard]] float radius() const { return _radius; }
     [[nodiscard]] float sigma() const { return _sigma; }
     [[nodiscard]] SegmentationInfluenceMode influenceMode() const { return _influenceMode; }
+    [[nodiscard]] SegmentationRowColMode rowColMode() const { return _rowColMode; }
     [[nodiscard]] int holeSearchRadius() const { return _holeSearchRadius; }
     [[nodiscard]] int holeSmoothIterations() const { return _holeSmoothIterations; }
     [[nodiscard]] bool handlesAlwaysVisible() const { return _handlesAlwaysVisible; }
@@ -39,6 +40,7 @@ public slots:
     void setRadius(float value);
     void setSigma(float value);
     void setInfluenceMode(SegmentationInfluenceMode mode);
+    void setRowColMode(SegmentationRowColMode mode);
     void setHoleSearchRadius(int value);
     void setHoleSmoothIterations(int value);
     void setHandlesAlwaysVisible(bool value);
@@ -54,6 +56,7 @@ signals:
     void handlesAlwaysVisibleChanged(bool value);
     void handleDisplayDistanceChanged(float value);
     void influenceModeChanged(SegmentationInfluenceMode mode);
+    void rowColModeChanged(SegmentationRowColMode mode);
     void applyRequested();
     void resetRequested();
     void stopToolsRequested();
@@ -70,6 +73,7 @@ private:
     QSpinBox* _spinRadius;
     QDoubleSpinBox* _spinSigma;
     class QComboBox* _comboInfluenceMode;
+    class QComboBox* _comboRowColMode;
     QSpinBox* _spinHoleRadius;
     QSpinBox* _spinHoleIterations;
     QCheckBox* _chkHandlesAlwaysVisible;
@@ -83,6 +87,7 @@ private:
     float _radius = 1.0f;   // grid-space radius (Chebyshev distance)
     float _sigma = 1.0f;    // neighbouring pull strength multiplier
     SegmentationInfluenceMode _influenceMode = SegmentationInfluenceMode::GridChebyshev;
+    SegmentationRowColMode _rowColMode = SegmentationRowColMode::Dynamic;
     int _holeSearchRadius = 6;
     int _holeSmoothIterations = 25;
     bool _handlesAlwaysVisible = true;

@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 
 namespace
 {
@@ -70,11 +71,13 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _showHandlesAlways = _widget->handlesAlwaysVisible();
         _handleDisplayDistance = _widget->handleDisplayDistance();
         _influenceMode = _widget->influenceMode();
+        _rowColMode = _widget->rowColMode();
     }
     if (_editManager) {
         _editManager->setHoleSearchRadius(_holeSearchRadius);
         _editManager->setHoleSmoothIterations(_holeSmoothIterations);
         _editManager->setInfluenceMode(_influenceMode);
+        _editManager->setRowColMode(_rowColMode);
     }
     if (_overlay) {
         _overlay->setHandleVisibility(_showHandlesAlways, _handleDisplayDistance);
@@ -107,6 +110,9 @@ void SegmentationModule::bindWidgetSignals()
             Qt::UniqueConnection);
     connect(_widget, &SegmentationWidget::influenceModeChanged,
             this, &SegmentationModule::setInfluenceMode,
+            Qt::UniqueConnection);
+    connect(_widget, &SegmentationWidget::rowColModeChanged,
+            this, &SegmentationModule::setRowColMode,
             Qt::UniqueConnection);
     connect(_widget, &SegmentationWidget::holeSearchRadiusChanged,
             this, &SegmentationModule::setHoleSearchRadius,
@@ -273,6 +279,27 @@ void SegmentationModule::setInfluenceMode(SegmentationInfluenceMode mode)
     _influenceMode = mode;
     if (_editManager) {
         _editManager->setInfluenceMode(mode);
+        if (_editManager->hasSession()) {
+            if (_surfaces) {
+                _surfaces->setSurface("segmentation", _editManager->previewSurface());
+            }
+            emitPendingChanges();
+            refreshOverlay();
+        }
+    }
+}
+
+void SegmentationModule::setRowColMode(SegmentationRowColMode mode)
+{
+    if (_rowColMode == mode) {
+        return;
+    }
+    _rowColMode = mode;
+    if (_widget && _widget->rowColMode() != mode) {
+        _widget->setRowColMode(mode);
+    }
+    if (_editManager) {
+        _editManager->setRowColMode(mode);
         if (_editManager->hasSession()) {
             if (_surfaces) {
                 _surfaces->setSurface("segmentation", _editManager->previewSurface());
@@ -525,6 +552,7 @@ bool SegmentationModule::beginEditingSession(QuadSurface* activeSurface)
     _editManager->setDownsample(_downsample);
     _editManager->setHoleSearchRadius(_holeSearchRadius);
     _editManager->setHoleSmoothIterations(_holeSmoothIterations);
+    _editManager->setRowColMode(_rowColMode);
     _editManager->setInfluenceMode(_influenceMode);
 
     if (_surfaces) {
@@ -679,7 +707,11 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
 
     auto* handle = _pointAddMode ? nullptr : _editManager->findNearestHandle(worldPos, pickTolerance);
     if (!handle) {
-        if (auto added = _editManager->addHandleAtWorld(worldPos, addTolerance, planeSurface, addPlaneTolerance, _pointAddMode)) {
+        std::optional<SegmentationRowColAxis> axis;
+        if (_influenceMode == SegmentationInfluenceMode::RowColumn) {
+            axis = rowColAxisForViewer(viewer);
+        }
+        if (auto added = _editManager->addHandleAtWorld(worldPos, addTolerance, planeSurface, addPlaneTolerance, _pointAddMode, axis)) {
             cv::Vec3f handleWorld = worldPos;
             if (auto world = _editManager->handleWorldPosition(added->first, added->second)) {
                 handleWorld = *world;
@@ -695,6 +727,8 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
                 _overlay->setKeyboardHandle(*added, false);
                 _overlay->refreshAll();
             }
+        } else {
+            emit statusMessageRequested(tr("Failed to add handle; see terminal for details"), kStatusMedium);
         }
         return;
     }
@@ -740,7 +774,11 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
             return;
         }
 
-        const bool moved = _editManager->updateHandleWorldPosition(_drag.row, _drag.col, worldPos);
+        std::optional<SegmentationRowColAxis> axis;
+        if (_influenceMode == SegmentationInfluenceMode::RowColumn) {
+            axis = rowColAxisForViewer(viewer);
+        }
+        const bool moved = _editManager->updateHandleWorldPosition(_drag.row, _drag.col, worldPos, axis);
         if (!moved) {
             emit statusMessageRequested(tr("Handle move failed; see terminal for details"), kStatusMedium);
             return;
@@ -797,7 +835,11 @@ void SegmentationModule::handleMouseRelease(CVolumeViewer* viewer,
     }
 
     if (_pointAddMode && _editManager && _editManager->hasSession() && !_drag.moved) {
-        const bool moved = _editManager->updateHandleWorldPosition(_drag.row, _drag.col, worldPos);
+        std::optional<SegmentationRowColAxis> axis;
+        if (_influenceMode == SegmentationInfluenceMode::RowColumn) {
+            axis = rowColAxisForViewer(viewer);
+        }
+        const bool moved = _editManager->updateHandleWorldPosition(_drag.row, _drag.col, worldPos, axis);
         if (!moved) {
             emit statusMessageRequested(tr("Handle move failed; see terminal for details"), kStatusMedium);
         }
@@ -922,4 +964,32 @@ const QCursor& SegmentationModule::addCursor()
         initialized = true;
     }
     return cursor;
+}
+
+SegmentationRowColAxis SegmentationModule::rowColAxisForViewer(const CVolumeViewer* viewer) const
+{
+    switch (_rowColMode) {
+    case SegmentationRowColMode::RowOnly:
+        return SegmentationRowColAxis::Row;
+    case SegmentationRowColMode::ColumnOnly:
+        return SegmentationRowColAxis::Column;
+    case SegmentationRowColMode::Dynamic:
+    default:
+        break;
+    }
+
+    if (!viewer) {
+        return SegmentationRowColAxis::Row;
+    }
+
+    std::string name = viewer->surfName();
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (name == "seg yz" || name == "seg xz") {
+        return SegmentationRowColAxis::Column;
+    }
+    if (name == "xy plane" || name == "xy / slices") {
+        return SegmentationRowColAxis::Row;
+    }
+    return SegmentationRowColAxis::Row;
 }

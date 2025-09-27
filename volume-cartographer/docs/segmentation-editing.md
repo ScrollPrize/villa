@@ -136,11 +136,13 @@ fragment rather than a lone point floating away from the existing quad surface.
 ## Handle Influence and Preview Updates
 
 Dragging a handle computes the displacement vector between the original and
-current positions. The manager applies a Chebyshev-distance falloff out to the
-configured radius, scaling by the sigma “strength” multiplier (`SegmentationEditManager.cpp:884-936`).
-Cells with the sentinel value `(-1,-1,-1)` are skipped so you never accidentally
-revive intentionally blank regions. After each pass the preview grid keeps the
-handle cell in sync exactly.
+current positions. The manager applies the selected falloff profile to nearby
+grid cells: the legacy Chebyshev stencil, the geodesic/circular walk, or the
+new Row/Column sweep that only nudges neighbours along the active row/column
+(`SegmentationEditManager.cpp:910-1085`). Cells with the sentinel value
+`(-1,-1,-1)` are skipped so you never accidentally revive intentionally blank
+regions. After each pass the preview grid keeps the handle cell in sync
+exactly.
 
 Whenever radius or sigma changes, `reapplyAllHandles` replays the stored deltas
 over a fresh copy of the original grid to avoid cumulative drift (`SegmentationEditManager.cpp:938-955`).

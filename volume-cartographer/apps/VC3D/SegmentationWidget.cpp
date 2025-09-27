@@ -74,6 +74,7 @@ void SegmentationWidget::setupUI()
     _comboInfluenceMode = new QComboBox(influenceGroup);
     _comboInfluenceMode->addItem(tr("Grid (square)"), static_cast<int>(SegmentationInfluenceMode::GridChebyshev));
     _comboInfluenceMode->addItem(tr("Geodesic (circular)"), static_cast<int>(SegmentationInfluenceMode::GeodesicCircular));
+    _comboInfluenceMode->addItem(tr("Row / Column"), static_cast<int>(SegmentationInfluenceMode::RowColumn));
     _comboInfluenceMode->setToolTip(tr("Choose how handle influence decays across the surface"));
     int modeIndex = _comboInfluenceMode->findData(static_cast<int>(_influenceMode));
     if (modeIndex >= 0) {
@@ -83,6 +84,23 @@ void SegmentationWidget::setupUI()
     modeLayout->addWidget(_comboInfluenceMode);
     modeLayout->addStretch();
     influenceLayout->addLayout(modeLayout);
+
+    auto* rowColLayout = new QHBoxLayout();
+    auto* rowColLabel = new QLabel(tr("Row/Col preference:"), influenceGroup);
+    _comboRowColMode = new QComboBox(influenceGroup);
+    _comboRowColMode->addItem(tr("Row only"), static_cast<int>(SegmentationRowColMode::RowOnly));
+    _comboRowColMode->addItem(tr("Column only"), static_cast<int>(SegmentationRowColMode::ColumnOnly));
+    _comboRowColMode->addItem(tr("Dynamic"), static_cast<int>(SegmentationRowColMode::Dynamic));
+    _comboRowColMode->setToolTip(tr("When using Row / Column mode, choose if influence spreads along rows, columns, or matches the viewer orientation"));
+    int rowColIndex = _comboRowColMode->findData(static_cast<int>(_rowColMode));
+    if (rowColIndex >= 0) {
+        _comboRowColMode->setCurrentIndex(rowColIndex);
+    }
+    rowColLayout->addWidget(rowColLabel);
+    rowColLayout->addWidget(_comboRowColMode);
+    rowColLayout->addStretch();
+    influenceLayout->addLayout(rowColLayout);
+    _comboRowColMode->setEnabled(false);
 
     auto* radiusLayout = new QHBoxLayout();
     auto* radiusLabel = new QLabel(tr("Radius:"), influenceGroup);
@@ -230,7 +248,27 @@ void SegmentationWidget::setupUI()
         }
         _influenceMode = mode;
         writeSetting(QStringLiteral("influence_mode"), static_cast<int>(_influenceMode));
+        if (_comboRowColMode) {
+            _comboRowColMode->setEnabled(_editingEnabled && _influenceMode == SegmentationInfluenceMode::RowColumn);
+        }
         emit influenceModeChanged(_influenceMode);
+    });
+
+    connect(_comboRowColMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (index < 0) {
+            return;
+        }
+        const QVariant modeData = _comboRowColMode->itemData(index);
+        if (!modeData.isValid()) {
+            return;
+        }
+        const auto mode = static_cast<SegmentationRowColMode>(modeData.toInt());
+        if (mode == _rowColMode) {
+            return;
+        }
+        _rowColMode = mode;
+        writeSetting(QStringLiteral("row_col_mode"), static_cast<int>(_rowColMode));
+        emit rowColModeChanged(_rowColMode);
     });
 
     connect(_spinHoleRadius, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
@@ -354,7 +392,27 @@ void SegmentationWidget::setInfluenceMode(SegmentationInfluenceMode mode)
             _comboInfluenceMode->setCurrentIndex(modeIndex);
         }
     }
+    if (_comboRowColMode) {
+        _comboRowColMode->setEnabled(_editingEnabled && _influenceMode == SegmentationInfluenceMode::RowColumn);
+    }
     writeSetting(QStringLiteral("influence_mode"), static_cast<int>(_influenceMode));
+}
+
+void SegmentationWidget::setRowColMode(SegmentationRowColMode mode)
+{
+    if (_rowColMode == mode) {
+        return;
+    }
+    _rowColMode = mode;
+    if (_comboRowColMode) {
+        const QSignalBlocker blocker(_comboRowColMode);
+        int idx = _comboRowColMode->findData(static_cast<int>(_rowColMode));
+        if (idx >= 0) {
+            _comboRowColMode->setCurrentIndex(idx);
+        }
+        _comboRowColMode->setEnabled(_editingEnabled && _influenceMode == SegmentationInfluenceMode::RowColumn);
+    }
+    writeSetting(QStringLiteral("row_col_mode"), static_cast<int>(_rowColMode));
 }
 
 void SegmentationWidget::setHoleSearchRadius(int value)
@@ -444,6 +502,9 @@ void SegmentationWidget::updateEditingUi()
     if (_comboInfluenceMode) {
         _comboInfluenceMode->setEnabled(_editingEnabled);
     }
+    if (_comboRowColMode) {
+        _comboRowColMode->setEnabled(_editingEnabled && _influenceMode == SegmentationInfluenceMode::RowColumn);
+    }
     if (_spinHoleRadius) {
         _spinHoleRadius->setEnabled(_editingEnabled);
     }
@@ -479,8 +540,16 @@ void SegmentationWidget::restoreSettings()
     setSigma(clampedStrength);
 
     const int storedInfluence = settings.value(QStringLiteral("segmentation_edit/influence_mode"), static_cast<int>(_influenceMode)).toInt();
-    const int clampedInfluence = std::clamp(storedInfluence, static_cast<int>(SegmentationInfluenceMode::GridChebyshev), static_cast<int>(SegmentationInfluenceMode::GeodesicCircular));
+    const int clampedInfluence = std::clamp(storedInfluence,
+                                            static_cast<int>(SegmentationInfluenceMode::GridChebyshev),
+                                            static_cast<int>(SegmentationInfluenceMode::RowColumn));
     setInfluenceMode(static_cast<SegmentationInfluenceMode>(clampedInfluence));
+
+    const int storedRowCol = settings.value(QStringLiteral("segmentation_edit/row_col_mode"), static_cast<int>(_rowColMode)).toInt();
+    const int clampedRowCol = std::clamp(storedRowCol,
+                                         static_cast<int>(SegmentationRowColMode::RowOnly),
+                                         static_cast<int>(SegmentationRowColMode::Dynamic));
+    setRowColMode(static_cast<SegmentationRowColMode>(clampedRowCol));
 
     const int storedHoleRadius = settings.value(QStringLiteral("segmentation_edit/hole_search_radius"), _holeSearchRadius).toInt();
     setHoleSearchRadius(std::clamp(storedHoleRadius, 1, 64));

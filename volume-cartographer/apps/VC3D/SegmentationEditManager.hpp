@@ -30,10 +30,12 @@ public:
     void setRadius(float radius);
     void setSigma(float sigma);
     void setInfluenceMode(SegmentationInfluenceMode mode);
+    void setRowColMode(SegmentationRowColMode mode);
     [[nodiscard]] int downsample() const { return _downsample; }
     [[nodiscard]] float radius() const { return _radius; }
     [[nodiscard]] float sigma() const { return _sigma; }
     [[nodiscard]] SegmentationInfluenceMode influenceMode() const { return _influenceMode; }
+    [[nodiscard]] SegmentationRowColMode rowColMode() const { return _rowColMode; }
     void setHoleSearchRadius(int radius);
     void setHoleSmoothIterations(int iterations);
     [[nodiscard]] int holeSearchRadius() const { return _holeSearchRadius; }
@@ -49,16 +51,21 @@ public:
         cv::Vec3f originalWorld;
         cv::Vec3f currentWorld;
         bool isManual{false};
+        SegmentationRowColAxis rowColAxis{SegmentationRowColAxis::Both};
     };
 
     [[nodiscard]] const std::vector<Handle>& handles() const { return _handles; }
-    bool updateHandleWorldPosition(int row, int col, const cv::Vec3f& newWorldPos);
+    bool updateHandleWorldPosition(int row,
+                                   int col,
+                                   const cv::Vec3f& newWorldPos,
+                                   std::optional<SegmentationRowColAxis> axisHint = std::nullopt);
     Handle* findNearestHandle(const cv::Vec3f& world, float tolerance);
     std::optional<std::pair<int,int>> addHandleAtWorld(const cv::Vec3f& worldPos,
                                                        float tolerance = 40.0f,
                                                        PlaneSurface* plane = nullptr,
                                                        float planeTolerance = 0.0f,
-                                                       bool allowCreate = false);
+                                                       bool allowCreate = false,
+                                                       std::optional<SegmentationRowColAxis> axisHint = std::nullopt);
     bool removeHandle(int row, int col);
     std::optional<cv::Vec3f> handleWorldPosition(int row, int col) const;
     std::optional<std::pair<int,int>> worldToGridIndex(const cv::Vec3f& worldPos, float* outDistance = nullptr) const;
@@ -68,6 +75,7 @@ private:
     void applyHandleInfluence(const Handle& handle);
     void applyHandleInfluenceGrid(const Handle& handle, const cv::Vec3f& delta);
     void applyHandleInfluenceGeodesic(const Handle& handle, const cv::Vec3f& delta);
+    void applyHandleInfluenceRowCol(const Handle& handle, const cv::Vec3f& delta);
     Handle* findHandle(int row, int col);
     void syncPreviewFromBase();
     void reapplyAllHandles();
@@ -91,6 +99,7 @@ private:
     float _radius{1.0f};          // radius expressed in grid steps (Chebyshev distance)
     float _sigma{1.0f};           // strength multiplier applied to neighbouring grid points
     SegmentationInfluenceMode _influenceMode{SegmentationInfluenceMode::GridChebyshev};
+    SegmentationRowColMode _rowColMode{SegmentationRowColMode::Dynamic};
     int _holeSearchRadius{6};
     int _holeSmoothIterations{25};
     bool _dirty{false};

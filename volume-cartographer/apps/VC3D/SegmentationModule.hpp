@@ -43,6 +43,7 @@ public:
     [[nodiscard]] float radius() const { return _radius; }
     [[nodiscard]] float sigma() const { return _sigma; }
     [[nodiscard]] SegmentationInfluenceMode influenceMode() const { return _influenceMode; }
+    [[nodiscard]] SegmentationRowColMode rowColMode() const { return _rowColMode; }
     [[nodiscard]] int holeSearchRadius() const { return _holeSearchRadius; }
     [[nodiscard]] int holeSmoothIterations() const { return _holeSmoothIterations; }
     [[nodiscard]] bool handlesAlwaysVisible() const { return _showHandlesAlways; }
@@ -53,6 +54,7 @@ public:
     void setRadius(float radius);
     void setSigma(float sigma);
     void setInfluenceMode(SegmentationInfluenceMode mode);
+    void setRowColMode(SegmentationRowColMode mode);
     void setHoleSearchRadius(int radius);
     void setHoleSmoothIterations(int iterations);
     void setHandlesAlwaysVisible(bool value);
@@ -145,6 +147,7 @@ private:
                            const QPointF& scenePoint,
                            const cv::Vec3f& worldPos);
     const QCursor& addCursor();
+    [[nodiscard]] SegmentationRowColAxis rowColAxisForViewer(const CVolumeViewer* viewer) const;
 
     SegmentationWidget* _widget{nullptr};
     SegmentationEditManager* _editManager{nullptr};
@@ -157,6 +160,7 @@ private:
     float _radius{1.0f};
     float _sigma{1.0f};
     SegmentationInfluenceMode _influenceMode{SegmentationInfluenceMode::GridChebyshev};
+    SegmentationRowColMode _rowColMode{SegmentationRowColMode::Dynamic};
     int _holeSearchRadius{6};
     int _holeSmoothIterations{25};
     bool _showHandlesAlways{true};
