@@ -1,7 +1,8 @@
 #include "ViewerManager.hpp"
 
 #include "CVolumeViewer.hpp"
-#include "SegmentationOverlayController.hpp"
+#include "overlays/SegmentationOverlayController.hpp"
+#include "overlays/PointsOverlayController.hpp"
 #include "SegmentationModule.hpp"
 #include "CSurfaceCollection.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -37,12 +38,6 @@ CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
     viewer->setCache(_chunkCache);
     viewer->setPointCollection(_points);
 
-    if (_points) {
-        connect(_points, &VCCollection::pointAdded, viewer, &CVolumeViewer::onPointAdded);
-        connect(_points, &VCCollection::pointChanged, viewer, &CVolumeViewer::onPointChanged);
-        connect(_points, &VCCollection::pointRemoved, viewer, &CVolumeViewer::onPointRemoved);
-    }
-
     if (_surfaces) {
         connect(_surfaces, &CSurfaceCollection::sendSurfaceChanged, viewer, &CVolumeViewer::onSurfaceChanged);
         connect(_surfaces, &CSurfaceCollection::sendPOIChanged, viewer, &CVolumeViewer::onPOIChanged);
@@ -68,6 +63,10 @@ CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
 
     if (_segmentationOverlay) {
         _segmentationOverlay->attachViewer(viewer);
+    }
+
+    if (_pointsOverlay) {
+        _pointsOverlay->attachViewer(viewer);
     }
 
     _viewers.push_back(viewer);
@@ -111,6 +110,15 @@ void ViewerManager::setSegmentationModule(SegmentationModule* module)
     for (auto* viewer : _viewers) {
         _segmentationModule->attachViewer(viewer);
     }
+}
+
+void ViewerManager::setPointsOverlay(PointsOverlayController* overlay)
+{
+    _pointsOverlay = overlay;
+    if (!_pointsOverlay) {
+        return;
+    }
+    _pointsOverlay->bindToViewerManager(this);
 }
 
 bool ViewerManager::resetDefaultFor(CVolumeViewer* viewer) const

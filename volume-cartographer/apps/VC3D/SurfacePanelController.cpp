@@ -13,18 +13,25 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QAction>
+#include <QMenu>
+#include <QMessageBox>
 #include <QModelIndex>
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QStandardItem>
 #include <QStandardItemModel>
+#include <QStyle>
+#include <QWidget>
+#include <QString>
 #include <QTreeWidget>
 #include <QTreeWidgetItemIterator>
 #include <QVector>
 
 #include <iostream>
 #include <set>
+#include <filesystem>
 
 namespace {
 
@@ -68,6 +75,14 @@ SurfacePanelController::SurfacePanelController(const UiRefs& ui,
 {
     if (_ui.reloadButton) {
         connect(_ui.reloadButton, &QPushButton::clicked, this, &SurfacePanelController::loadSurfacesIncremental);
+    }
+
+    if (_ui.treeWidget) {
+        _ui.treeWidget->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(_ui.treeWidget, &QTreeWidget::itemSelectionChanged,
+                this, &SurfacePanelController::handleTreeSelectionChanged);
+        connect(_ui.treeWidget, &QWidget::customContextMenuRequested,
+                this, &SurfacePanelController::showContextMenu);
     }
 }
 
@@ -298,6 +313,239 @@ void SurfacePanelController::removeSingleSegmentation(const std::string& segId)
     }
 }
 
+void SurfacePanelController::handleTreeSelectionChanged()
+{
+    if (!_ui.treeWidget) {
+        return;
+    }
+
+    const QList<QTreeWidgetItem*> selectedItems = _ui.treeWidget->selectedItems();
+    if (selectedItems.isEmpty()) {
+        _currentSurfaceId.clear();
+        resetTagUi();
+        if (_segmentationViewerProvider) {
+            if (auto* viewer = _segmentationViewerProvider()) {
+                viewer->setWindowTitle(tr("Surface"));
+            }
+        }
+        emit surfaceSelectionCleared();
+        return;
+    }
+
+    auto* firstSelected = selectedItems.first();
+    const QString idQString = firstSelected->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
+    const std::string id = idQString.toStdString();
+
+    OpChain* chain = ensureOpChainFor(id);
+    QuadSurface* surface = chain ? chain->src() : nullptr;
+
+    if (!surface && _volumePkg) {
+        if (auto surfMeta = _volumePkg->getSurface(id)) {
+            surface = surfMeta->surface();
+        }
+    }
+
+    if (surface && _surfaces) {
+        _surfaces->setSurface("segmentation", surface);
+    }
+
+    syncSelectionUi(id, surface);
+
+    if (_segmentationViewerProvider) {
+        if (auto* viewer = _segmentationViewerProvider()) {
+            viewer->setWindowTitle(surface ? tr("Surface %1").arg(idQString)
+                                           : tr("Surface"));
+        }
+    }
+
+    emit surfaceActivated(idQString, surface, chain);
+}
+
+void SurfacePanelController::showContextMenu(const QPoint& pos)
+{
+    if (!_ui.treeWidget) {
+        return;
+    }
+
+    QTreeWidgetItem* item = _ui.treeWidget->itemAt(pos);
+    if (!item) {
+        return;
+    }
+
+    const QList<QTreeWidgetItem*> selectedItems = _ui.treeWidget->selectedItems();
+    QStringList selectedSegmentIds;
+    selectedSegmentIds.reserve(selectedItems.size());
+    for (auto* selectedItem : selectedItems) {
+        selectedSegmentIds << selectedItem->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
+    }
+
+    const QString segmentId = selectedSegmentIds.isEmpty() ?
+        item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() :
+        selectedSegmentIds.front();
+
+    QMenu contextMenu(tr("Context Menu"), _ui.treeWidget);
+
+    QAction* copyPathAction = contextMenu.addAction(tr("Copy Segment Path"));
+    connect(copyPathAction, &QAction::triggered, this, [this, segmentId]() {
+        emit copySegmentPathRequested(segmentId);
+    });
+
+    contextMenu.addSeparator();
+
+    QMenu* seedMenu = contextMenu.addMenu(tr("Run Seed"));
+    QAction* seedWithSeedAction = seedMenu->addAction(tr("Seed from Focus Point"));
+    connect(seedWithSeedAction, &QAction::triggered, this, [this, segmentId]() {
+        emit growSeedsRequested(segmentId, false, false);
+    });
+    QAction* seedWithRandomAction = seedMenu->addAction(tr("Random Seed"));
+    connect(seedWithRandomAction, &QAction::triggered, this, [this, segmentId]() {
+        emit growSeedsRequested(segmentId, false, true);
+    });
+    QAction* seedWithExpandAction = seedMenu->addAction(tr("Expand Seed"));
+    connect(seedWithExpandAction, &QAction::triggered, this, [this, segmentId]() {
+        emit growSeedsRequested(segmentId, true, false);
+    });
+
+    QAction* growSegmentAction = contextMenu.addAction(tr("Run Trace"));
+    connect(growSegmentAction, &QAction::triggered, this, [this, segmentId]() {
+        emit growSegmentRequested(segmentId);
+    });
+
+    QAction* addOverlapAction = contextMenu.addAction(tr("Add overlap"));
+    connect(addOverlapAction, &QAction::triggered, this, [this, segmentId]() {
+        emit addOverlapRequested(segmentId);
+    });
+
+    contextMenu.addSeparator();
+
+    QAction* renderAction = contextMenu.addAction(tr("Render segment"));
+    connect(renderAction, &QAction::triggered, this, [this, segmentId]() {
+        emit renderSegmentRequested(segmentId);
+    });
+
+    QAction* convertToObjAction = contextMenu.addAction(tr("Convert to OBJ"));
+    connect(convertToObjAction, &QAction::triggered, this, [this, segmentId]() {
+        emit convertToObjRequested(segmentId);
+    });
+
+    QAction* slimFlattenAction = contextMenu.addAction(tr("SLIM-flatten"));
+    connect(slimFlattenAction, &QAction::triggered, this, [this, segmentId]() {
+        emit slimFlattenRequested(segmentId);
+    });
+
+    QAction* awsUploadAction = contextMenu.addAction(tr("Upload artifacts to AWS"));
+    connect(awsUploadAction, &QAction::triggered, this, [this, segmentId]() {
+        emit awsUploadRequested(segmentId);
+    });
+
+    contextMenu.addSeparator();
+
+    QAction* inpaintTeleaAction = contextMenu.addAction(tr("Inpaint (Telea) && Rebuild Segment"));
+    connect(inpaintTeleaAction, &QAction::triggered, this, [this]() {
+        emit teleaInpaintRequested();
+    });
+
+    QStringList deletionTargets = selectedSegmentIds;
+    if (deletionTargets.isEmpty()) {
+        deletionTargets << segmentId;
+    }
+
+    QString deleteText = deletionTargets.size() > 1 ?
+        tr("Delete %1 Segments").arg(deletionTargets.size()) :
+        tr("Delete Segment");
+    QAction* deleteAction = contextMenu.addAction(deleteText);
+    deleteAction->setIcon(_ui.treeWidget->style()->standardIcon(QStyle::SP_TrashIcon));
+    connect(deleteAction, &QAction::triggered, this, [this, deletionTargets]() {
+        handleDeleteSegments(deletionTargets);
+    });
+
+    contextMenu.exec(_ui.treeWidget->mapToGlobal(pos));
+}
+
+void SurfacePanelController::handleDeleteSegments(const QStringList& segmentIds)
+{
+    if (segmentIds.isEmpty() || !_volumePkg) {
+        return;
+    }
+
+    QString message;
+    if (segmentIds.size() == 1) {
+        message = tr("Are you sure you want to delete segment '%1'?\n\nThis action cannot be undone.")
+                      .arg(segmentIds.first());
+    } else {
+        message = tr("Are you sure you want to delete %1 segments?\n\nThis action cannot be undone.")
+                      .arg(segmentIds.size());
+    }
+
+    QWidget* parentWidget = _ui.treeWidget ? static_cast<QWidget*>(_ui.treeWidget) : nullptr;
+    QMessageBox::StandardButton reply = QMessageBox::question(
+        parentWidget,
+        tr("Confirm Deletion"),
+        message,
+        QMessageBox::Yes | QMessageBox::No,
+        QMessageBox::No);
+
+    if (reply != QMessageBox::Yes) {
+        return;
+    }
+
+    int successCount = 0;
+    QStringList failedSegments;
+    bool anyChanges = false;
+
+    for (const auto& id : segmentIds) {
+        const std::string idStd = id.toStdString();
+        try {
+            _volumePkg->removeSegmentation(idStd);
+            ++successCount;
+            anyChanges = true;
+            removeSingleSegmentation(idStd);
+        } catch (const std::filesystem::filesystem_error& e) {
+            if (e.code() == std::errc::permission_denied) {
+                failedSegments << id + tr(" (permission denied)");
+            } else {
+                failedSegments << id + tr(" (filesystem error)");
+            }
+            std::cerr << "Failed to delete segment " << idStd << ": " << e.what() << std::endl;
+        } catch (const std::exception& e) {
+            failedSegments << id;
+            std::cerr << "Failed to delete segment " << idStd << ": " << e.what() << std::endl;
+        }
+    }
+
+    if (anyChanges) {
+        try {
+            _volumePkg->refreshSegmentations();
+        } catch (const std::exception& e) {
+            std::cerr << "Error refreshing segmentations after deletion: " << e.what() << std::endl;
+        }
+        applyFilters();
+        if (_filtersUpdated) {
+            _filtersUpdated();
+        }
+        emit surfacesLoaded();
+    }
+
+    if (successCount == segmentIds.size()) {
+        emit statusMessageRequested(tr("Successfully deleted %1 segment(s)").arg(successCount), 5000);
+    } else if (successCount > 0) {
+        QMessageBox::warning(parentWidget,
+                             tr("Partial Success"),
+                             tr("Deleted %1 segment(s), but failed to delete: %2\n\n"
+                                "Note: Permission errors may require manual deletion or running with elevated privileges.")
+                                 .arg(successCount)
+                                 .arg(failedSegments.join(", ")));
+    } else {
+        QMessageBox::critical(parentWidget,
+                              tr("Deletion Failed"),
+                              tr("Failed to delete any segments.\n\n"
+                                 "Failed segments: %1\n\n"
+                                 "This may be due to insufficient permissions. "
+                                 "Try running the application with elevated privileges or manually delete the folders.")
+                                  .arg(failedSegments.join(", ")));
+    }
+}
+
 void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCollection* pointCollection)
 {
     _filters = filters;
@@ -381,13 +629,23 @@ bool SurfacePanelController::toggleTag(Tag tag)
     return true;
 }
 
+void SurfacePanelController::reloadSurfacesFromDisk()
+{
+    loadSurfacesIncremental();
+}
+
+void SurfacePanelController::refreshFiltersOnly()
+{
+    applyFilters();
+}
+
 void SurfacePanelController::connectFilterSignals()
 {
     auto connectToggle = [this](QCheckBox* box) {
         if (!box) {
             return;
         }
-        connect(box, &QCheckBox::toggled, this, [this]() { applyFilters(); }, Qt::UniqueConnection);
+        connect(box, &QCheckBox::toggled, this, [this]() { applyFilters(); });
     };
 
     connectToggle(_filters.focusPoints);
@@ -401,7 +659,7 @@ void SurfacePanelController::connectFilterSignals()
     connectToggle(_filters.currentOnly);
 
     if (_filters.pointSetMode) {
-        connect(_filters.pointSetMode, &QComboBox::currentIndexChanged, this, [this]() { applyFilters(); }, Qt::UniqueConnection);
+        connect(_filters.pointSetMode, &QComboBox::currentIndexChanged, this, [this]() { applyFilters(); });
     }
 
     if (_filters.pointSetAll) {
@@ -415,7 +673,7 @@ void SurfacePanelController::connectFilterSignals()
                 model->setData(model->index(row, 0), Qt::Checked, Qt::CheckStateRole);
             }
             applyFilters();
-        }, Qt::UniqueConnection);
+        });
     }
 
     if (_filters.pointSetNone) {
@@ -429,31 +687,31 @@ void SurfacePanelController::connectFilterSignals()
                 model->setData(model->index(row, 0), Qt::Unchecked, Qt::CheckStateRole);
             }
             applyFilters();
-        }, Qt::UniqueConnection);
+        });
     }
 
     if (_pointCollection) {
         connect(_pointCollection, &VCCollection::collectionAdded, this, [this](uint64_t) {
             rebuildPointSetFilterModel();
             applyFilters();
-        }, Qt::UniqueConnection);
+        });
         connect(_pointCollection, &VCCollection::collectionRemoved, this, [this](uint64_t) {
             rebuildPointSetFilterModel();
             applyFilters();
-        }, Qt::UniqueConnection);
+        });
         connect(_pointCollection, &VCCollection::collectionChanged, this, [this](uint64_t) {
             rebuildPointSetFilterModel();
             applyFilters();
-        }, Qt::UniqueConnection);
+        });
         connect(_pointCollection, &VCCollection::pointAdded, this, [this](const ColPoint&) {
             applyFilters();
-        }, Qt::UniqueConnection);
+        });
         connect(_pointCollection, &VCCollection::pointChanged, this, [this](const ColPoint&) {
             applyFilters();
-        }, Qt::UniqueConnection);
+        });
         connect(_pointCollection, &VCCollection::pointRemoved, this, [this](uint64_t) {
             applyFilters();
-        }, Qt::UniqueConnection);
+        });
     }
 }
 
@@ -464,9 +722,9 @@ void SurfacePanelController::connectTagSignals()
             return;
         }
 #if QT_VERSION < QT_VERSION_CHECK(6, 8, 0)
-        connect(box, &QCheckBox::stateChanged, this, [this](int) { onTagCheckboxToggled(); }, Qt::UniqueConnection);
+        connect(box, &QCheckBox::stateChanged, this, [this](int) { onTagCheckboxToggled(); });
 #else
-        connect(box, &QCheckBox::checkStateChanged, this, [this](Qt::CheckState) { onTagCheckboxToggled(); }, Qt::UniqueConnection);
+        connect(box, &QCheckBox::checkStateChanged, this, [this](Qt::CheckState) { onTagCheckboxToggled(); });
 #endif
     };
 
@@ -486,12 +744,11 @@ void SurfacePanelController::rebuildPointSetFilterModel()
     _configuringFilters = true;
 
     auto* model = new QStandardItemModel(_filters.pointSet);
+    if (_pointSetModelConnection) {
+        disconnect(_pointSetModelConnection);
+        _pointSetModelConnection = QMetaObject::Connection{};
+    }
     if (auto* existingModel = _filters.pointSet->model()) {
-        if (_pointSetModelConnection) {
-            disconnect(_pointSetModelConnection);
-            _pointSetModelConnection = QMetaObject::Connection{};
-        }
-        _filters.pointSet->setModel(nullptr);
         existingModel->deleteLater();
     }
     _filters.pointSet->setModel(model);
@@ -909,4 +1166,22 @@ void SurfacePanelController::setTagCheckboxEnabled(bool enabledApproved,
     if (_tags.inspect) {
         _tags.inspect->setEnabled(enabledInspect);
     }
+}
+
+OpChain* SurfacePanelController::ensureOpChainFor(const std::string& id)
+{
+    if (!_opchains) {
+        return nullptr;
+    }
+
+    auto it = _opchains->find(id);
+    if (it == _opchains->end()) {
+        if (_volumePkg) {
+            if (auto meta = _volumePkg->getSurface(id)) {
+                (*_opchains)[id] = new OpChain(meta->surface());
+            }
+        }
+        it = _opchains->find(id);
+    }
+    return it != _opchains->end() ? it->second : nullptr;
 }

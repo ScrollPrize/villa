@@ -19,7 +19,8 @@
 #include "CVolumeViewer.hpp"
 #include "DrawingWidget.hpp"
 #include "SegmentationEditManager.hpp"
-#include "SegmentationOverlayController.hpp"
+#include "overlays/SegmentationOverlayController.hpp"
+#include "overlays/PointsOverlayController.hpp"
 #include "ViewerManager.hpp"
 #include "SegmentationWidget.hpp"
 #include "OpChain.hpp"
@@ -41,11 +42,14 @@ static constexpr int VOLPKG_SLICE_MIN_INDEX = 0;
 class CommandLineToolRunner;
 class SegmentationModule;
 class SurfacePanelController;
+class MenuActionController;
 
 class CWindow : public QMainWindow
 {
 
     Q_OBJECT
+
+    friend class MenuActionController;
 
 public:
     enum SaveResponse : bool { Cancelled, Continue };
@@ -65,7 +69,6 @@ public slots:
     void onManualPlaneChanged(void);
     void onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onOpChainChanged(OpChain *chain);
-    void onSurfaceContextMenuRequested(const QPoint& pos);
     void onRenderSegment(const std::string& segmentId);
     void onGrowSegmentFromSegment(const std::string& segmentId);
     void onAddOverlap(const std::string& segmentId);
@@ -73,9 +76,6 @@ public slots:
     void onSlimFlatten(const std::string& segmentId);
     void onAWSUpload(const std::string& segmentId);
     void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
-    void onToggleConsoleOutput();
-    void onDeleteSegments(const std::vector<std::string>& segmentIds);
-    void onVoxelizePaths();
    void onFocusPOIChanged(std::string name, POI* poi);
     void onPointDoubleClicked(uint64_t pointId);
 
@@ -123,34 +123,20 @@ private:
     void setVolume(std::shared_ptr<Volume> newvol);
 
 private slots:
-    void Open(void);
-    void Open(const QString& path);
-    void OpenRecent();
-    void Keybindings(void);
-    void About(void);
-    void ShowSettings();
-    void ResetSegmentationViews();
-    void onSurfaceSelected();
     void onSegmentationDirChanged(int index);
     void onEditMaskPressed();
     void onAppendMaskPressed();
-    void onInpaintTeleaSelected();
-    void onRefreshSurfaces();
-    void onGenerateReviewReport();
-    void onDrawBBoxToggled(bool enabled);
-    void onSurfaceFromSelection();
-    void onSelectionClear();
     void onManualLocationChanged();
     void onZoomIn();
     void onZoomOut();
     void onCopyCoordinates();
-    void onImportObjAsPatches();
     void onAxisAlignedSlicesToggled(bool enabled);
     void onSegmentationEditingModeChanged(bool enabled);
     void onSegmentationStopToolsRequested();
     void configureViewerConnections(CVolumeViewer* viewer);
     CVolumeViewer* segmentationViewer() const;
     void clearSurfaceSelection();
+    void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface, OpChain* chain);
 
 private:
     bool appInitComplete{false};
@@ -165,30 +151,6 @@ private:
 
     static const int AMPLITUDE = 28000;
     static const int FREQUENCY = 44100;
-
-    // window components
-    QMenu* fFileMenu;
-    QMenu* fEditMenu;
-    QMenu* fViewMenu;
-    QMenu* fActionsMenu;
-    QMenu* fSelectionMenu;
-    QMenu* fHelpMenu;
-    QMenu* fRecentVolpkgMenu{};
-
-    QAction* fOpenVolAct;
-    QAction* fOpenRecentVolpkg[MAX_RECENT_VOLPKG]{};
-    QAction* fSettingsAct;
-    QAction* fExitAct;
-    QAction* fKeybinds;
-    QAction* fAboutAct;
-    QAction* fResetMdiView;
-    QAction* fShowConsoleOutputAct;
-    QAction* fReportingAct;
-    QAction* fVoxelizePathsAct;
-    QAction* fDrawBBoxAct;
-    QAction* fSelectionSurfaceFromAct;
-    QAction* fSelectionClearAct;
-    QAction* fInpaintTeleaAct = nullptr;
 
     // Selection dock
     QDockWidget* _dockSelection = nullptr;
@@ -232,14 +194,12 @@ private:
 
     std::unordered_map<std::string, OpChain*> _opchains;
 
-    bool _segmentationEditingEnabled{false};
-    int _segmentationDownsample{12};
-    float _segmentationRadius{10.0f};
-    float _segmentationSigma{10.0f};
     std::unique_ptr<SegmentationEditManager> _segmentationEdit;
     std::unique_ptr<SegmentationOverlayController> _segmentationOverlay;
+    std::unique_ptr<PointsOverlayController> _pointsOverlay;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
+    std::unique_ptr<MenuActionController> _menuController;
     // runner for command line tools 
     CommandLineToolRunner* _cmdRunner;
     

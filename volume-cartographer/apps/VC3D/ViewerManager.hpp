@@ -13,6 +13,7 @@ class CVolumeViewer;
 class CSurfaceCollection;
 class VCCollection;
 class SegmentationOverlayController;
+class PointsOverlayController;
 class ChunkCache;
 class SegmentationModule;
 
@@ -35,6 +36,7 @@ public:
     void setSegmentationOverlay(SegmentationOverlayController* overlay);
     void setSegmentationEditActive(bool active);
     void setSegmentationModule(SegmentationModule* module);
+    void setPointsOverlay(PointsOverlayController* overlay);
 
     bool resetDefaultFor(CVolumeViewer* viewer) const;
     void setResetDefaultFor(CVolumeViewer* viewer, bool value);
@@ -49,6 +51,7 @@ private:
     VCCollection* _points;
     ChunkCache* _chunkCache;
     SegmentationOverlayController* _segmentationOverlay{nullptr};
+    PointsOverlayController* _pointsOverlay{nullptr};
     bool _segmentationEditActive{false};
     SegmentationModule* _segmentationModule{nullptr};
     std::vector<CVolumeViewer*> _viewers;

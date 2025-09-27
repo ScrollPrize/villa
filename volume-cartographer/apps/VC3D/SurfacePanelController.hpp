@@ -2,6 +2,8 @@
 
 #include <QObject>
 #include <QPointF>
+#include <QString>
+#include <QStringList>
 
 #include <functional>
 #include <memory>
@@ -90,11 +92,24 @@ public:
 
     bool isCurrentOnlyFilterEnabled() const;
     bool toggleTag(Tag tag);
+    void reloadSurfacesFromDisk();
+    void refreshFiltersOnly();
 
 signals:
     void surfacesLoaded();
     void surfaceSelectionCleared();
     void filtersApplied(int hiddenCount);
+    void surfaceActivated(const QString& id, QuadSurface* surface, OpChain* chain);
+    void copySegmentPathRequested(const QString& segmentId);
+    void renderSegmentRequested(const QString& segmentId);
+    void growSegmentRequested(const QString& segmentId);
+    void addOverlapRequested(const QString& segmentId);
+    void convertToObjRequested(const QString& segmentId);
+    void slimFlattenRequested(const QString& segmentId);
+    void awsUploadRequested(const QString& segmentId);
+    void growSeedsRequested(const QString& segmentId, bool isExpand, bool isRandomSeed);
+    void teleaInpaintRequested();
+    void statusMessageRequested(const QString& message, int timeoutMs);
 
 private:
     struct SurfaceChanges {
@@ -110,6 +125,9 @@ private:
     void connectFilterSignals();
     void connectTagSignals();
     void rebuildPointSetFilterModel();
+    void handleTreeSelectionChanged();
+    void showContextMenu(const QPoint& pos);
+    void handleDeleteSegments(const QStringList& segmentIds);
     void onTagCheckboxToggled();
     void applyFiltersInternal();
     void updateTagCheckboxStatesForSurface(QuadSurface* surface);
@@ -118,6 +136,7 @@ private:
                                bool enabledReviewed,
                                bool enabledRevisit,
                                bool enabledInspect);
+    OpChain* ensureOpChainFor(const std::string& id);
 
     UiRefs _ui;
     CSurfaceCollection* _surfaces{nullptr};

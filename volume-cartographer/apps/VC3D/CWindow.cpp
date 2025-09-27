@@ -4,8 +4,6 @@
 #include <QKeyEvent>
 #include <QSettings>
 #include <QMdiArea>
-#include <QMenu>
-#include <QAction>
 #include <QApplication>
 #include <QClipboard>
 #include <QDateTime>
@@ -53,6 +51,7 @@
 #include "CommandLineToolRunner.hpp"
 #include "SegmentationModule.hpp"
 #include "SurfacePanelController.hpp"
+#include "MenuActionController.hpp"
 
 #include "vc/core/types/Exceptions.hpp"
 #include "vc/core/util/Logging.hpp"
@@ -102,13 +101,15 @@ CWindow::CWindow() :
         configureViewerConnections(viewer);
     });
 
+    _pointsOverlay = std::make_unique<PointsOverlayController>(_point_collection, this);
+    _viewerManager->setPointsOverlay(_pointsOverlay.get());
+
     // create UI widgets
     CreateWidgets();
 
-    // create menu
-    CreateActions();
-    CreateMenus();
-    UpdateRecentVolpkgActions();
+    // create menus/actions controller
+    _menuController = std::make_unique<MenuActionController>(this);
+    _menuController->populateMenus(menuBar());
 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
     if (QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark) {
@@ -155,7 +156,9 @@ CWindow::CWindow() :
         QStringList files = settings.value("volpkg/recent").toStringList();
 
         if (!files.empty() && !files.at(0).isEmpty()) {
-            Open(files[0]);
+            if (_menuController) {
+                _menuController->openVolpkgAt(files[0]);
+            }
         }
     }
 
@@ -359,6 +362,8 @@ void CWindow::clearSurfaceSelection()
     if (treeWidgetSurfaces) {
         treeWidgetSurfaces->clearSelection();
     }
+
+    sendOpChainSelected(nullptr);
 }
 
 void CWindow::setVolume(std::shared_ptr<Volume> newvol)
@@ -427,9 +432,7 @@ void CWindow::CreateWidgets(void)
     mdiArea->tileSubWindows();
 
     treeWidgetSurfaces = ui.treeWidgetSurfaces;
-    treeWidgetSurfaces->setContextMenuPolicy(Qt::CustomContextMenu);
     treeWidgetSurfaces->setSelectionMode(QAbstractItemView::ExtendedSelection);
-    connect(treeWidgetSurfaces, &QWidget::customContextMenuRequested, this, &CWindow::onSurfaceContextMenuRequested);
     btnReloadSurfaces = ui.btnReloadSurfaces;
 
     SurfacePanelController::UiRefs surfaceUi{
@@ -453,6 +456,57 @@ void CWindow::CreateWidgets(void)
     connect(_surfacePanel.get(), &SurfacePanelController::filtersApplied, this, [this](int filterCount) {
         UpdateVolpkgLabel(filterCount);
     });
+    connect(_surfacePanel.get(), &SurfacePanelController::copySegmentPathRequested,
+            this, [this](const QString& segmentId) {
+                if (!fVpkg) {
+                    return;
+                }
+                auto surfMeta = fVpkg->getSurface(segmentId.toStdString());
+                if (!surfMeta) {
+                    return;
+                }
+                const QString path = QString::fromStdString(surfMeta->path.string());
+                QApplication::clipboard()->setText(path);
+                statusBar()->showMessage(tr("Copied segment path to clipboard: %1").arg(path), 3000);
+            });
+    connect(_surfacePanel.get(), &SurfacePanelController::renderSegmentRequested,
+            this, [this](const QString& segmentId) {
+                onRenderSegment(segmentId.toStdString());
+            });
+    connect(_surfacePanel.get(), &SurfacePanelController::growSegmentRequested,
+            this, [this](const QString& segmentId) {
+                onGrowSegmentFromSegment(segmentId.toStdString());
+            });
+    connect(_surfacePanel.get(), &SurfacePanelController::addOverlapRequested,
+            this, [this](const QString& segmentId) {
+                onAddOverlap(segmentId.toStdString());
+            });
+    connect(_surfacePanel.get(), &SurfacePanelController::convertToObjRequested,
+            this, [this](const QString& segmentId) {
+                onConvertToObj(segmentId.toStdString());
+            });
+    connect(_surfacePanel.get(), &SurfacePanelController::slimFlattenRequested,
+            this, [this](const QString& segmentId) {
+                onSlimFlatten(segmentId.toStdString());
+            });
+    connect(_surfacePanel.get(), &SurfacePanelController::awsUploadRequested,
+            this, [this](const QString& segmentId) {
+                onAWSUpload(segmentId.toStdString());
+            });
+    connect(_surfacePanel.get(), &SurfacePanelController::growSeedsRequested,
+            this, [this](const QString& segmentId, bool isExpand, bool isRandomSeed) {
+                onGrowSeeds(segmentId.toStdString(), isExpand, isRandomSeed);
+            });
+    connect(_surfacePanel.get(), &SurfacePanelController::teleaInpaintRequested,
+            this, [this]() {
+                if (_menuController) {
+                    _menuController->triggerTeleaInpaint();
+                }
+            });
+    connect(_surfacePanel.get(), &SurfacePanelController::statusMessageRequested,
+            this, [this](const QString& message, int timeoutMs) {
+                statusBar()->showMessage(message, timeoutMs);
+            });
 
     wOpsList = new OpsList(ui.dockWidgetOpList);
     ui.dockWidgetOpList->setWidget(wOpsList);
@@ -467,17 +521,10 @@ void CWindow::CreateWidgets(void)
     // Create Segmentation widget
     _segmentationWidget = new SegmentationWidget(ui.dockWidgetSegmentation);
     ui.dockWidgetSegmentation->setWidget(_segmentationWidget);
-    _segmentationWidget->setDownsample(_segmentationDownsample);
-    _segmentationWidget->setRadius(_segmentationRadius);
-    _segmentationWidget->setSigma(_segmentationSigma);
-    _segmentationWidget->setEditingEnabled(_segmentationEditingEnabled);
 
     _segmentationEdit = std::make_unique<SegmentationEditManager>(this);
     _segmentationOverlay = std::make_unique<SegmentationOverlayController>(_surf_col, this);
     _segmentationOverlay->setEditManager(_segmentationEdit.get());
-    _segmentationOverlay->setEditingEnabled(_segmentationEditingEnabled);
-    _segmentationOverlay->setDownsample(_segmentationDownsample);
-    _segmentationOverlay->setRadius(_segmentationRadius);
 
     _segmentationModule = std::make_unique<SegmentationModule>(
         _segmentationWidget,
@@ -485,10 +532,10 @@ void CWindow::CreateWidgets(void)
         _segmentationOverlay.get(),
         _viewerManager.get(),
         _surf_col,
-        _segmentationEditingEnabled,
-        _segmentationDownsample,
-        _segmentationRadius,
-        _segmentationSigma,
+        _segmentationWidget->isEditingEnabled(),
+        _segmentationWidget->downsample(),
+        _segmentationWidget->radius(),
+        _segmentationWidget->sigma(),
         this);
 
     connect(_segmentationModule.get(), &SegmentationModule::editingEnabledChanged,
@@ -552,13 +599,14 @@ void CWindow::CreateWidgets(void)
     ui.dockWidgetVolumes->show();
     ui.dockWidgetVolumes->raise();
 
-    connect(treeWidgetSurfaces, &QTreeWidget::itemSelectionChanged, this, &CWindow::onSurfaceSelected);
-    connect(btnReloadSurfaces, &QPushButton::clicked, this, &CWindow::onRefreshSurfaces);
     connect(this, &CWindow::sendOpChainSelected, wOpsList, &OpsList::onOpChainSelected);
     connect(wOpsList, &OpsList::sendOpSelected, wOpsSettings, &OpsSettings::onOpSelected);
 
     connect(wOpsList, &OpsList::sendOpChainChanged, this, &CWindow::onOpChainChanged);
     connect(wOpsSettings, &OpsSettings::sendOpChainChanged, this, &CWindow::onOpChainChanged);
+
+    connect(_surfacePanel.get(), &SurfacePanelController::surfaceActivated,
+            this, &CWindow::onSurfaceActivated);
 
     // new and remove path buttons
     // connect(ui.btnNewPath, SIGNAL(clicked()), this, SLOT(OnNewPathClicked()));
@@ -750,158 +798,7 @@ void CWindow::CreateWidgets(void)
 
 }
 
-void CWindow::onDrawBBoxToggled(bool enabled)
-{
-    // Toggle bbox mode on the segmentation viewer
-    if (_viewerManager) {
-        for (auto* viewer : _viewerManager->viewers()) {
-            if (viewer->surfName() == "segmentation") {
-                viewer->setBBoxMode(enabled);
-                statusBar()->showMessage(enabled ? tr("BBox mode active: drag on Surface view")
-                                                 : tr("BBox mode off"), 3000);
-                break;
-            }
-        }
-    }
-}
-void CWindow::onSurfaceFromSelection()
-{
-    // Use the segmentation viewer's stored selections to create surfaces
-    CVolumeViewer* segViewer = nullptr;
-    if (_viewerManager) {
-        for (auto* v : _viewerManager->viewers()) if (v->surfName() == "segmentation") { segViewer = v; break; }
-    }
-    if (!segViewer) { statusBar()->showMessage(tr("No Surface viewer found"), 3000); return; }
-
-    auto sels = segViewer->selections();
-    if (sels.empty()) {
-        statusBar()->showMessage(tr("No selections to convert"), 3000);
-        return;
-    }
-
-    if (_surfID.empty() || !fVpkg || !fVpkg->getSurface(_surfID)) {
-        statusBar()->showMessage(tr("Select a segmentation first"), 3000);
-        return;
-    }
-
-    auto surfMeta = fVpkg->getSurface(_surfID);
-    std::filesystem::path baseSegPath = surfMeta->path; // .../paths/<uuid>
-    std::filesystem::path parentDir = baseSegPath.parent_path();
-
-    int idx = 1;
-    int created = 0;
-    QString ts = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
-    for (const auto& pr : sels) {
-        const QRectF& rect = pr.first;
-        std::unique_ptr<QuadSurface> filtered(segViewer->makeBBoxFilteredSurfaceFromSceneRect(rect));
-        if (!filtered) continue;
-        std::string newId = _surfID + std::string("_sel_") + ts.toStdString() + std::string("_") + std::to_string(idx++);
-        std::filesystem::path outDir = parentDir / newId;
-        try {
-            filtered->save(outDir.string(), newId);
-            created++;
-        } catch (const std::exception& e) {
-            statusBar()->showMessage(tr("Failed to save selection: ") + e.what(), 5000);
-        }
-    }
-
-    if (created > 0) {
-        try {
-            fVpkg->refreshSegmentations();
-            if (_surfacePanel) {
-                _surfacePanel->loadSurfacesIncremental();
-            }
-            statusBar()->showMessage(tr("Created ") + QString::number(created) + tr(" surface(s) from selection"), 5000);
-        } catch (...) {
-            statusBar()->showMessage(tr("Created surfaces but failed to refresh"), 5000);
-        }
-    } else {
-        statusBar()->showMessage(tr("No surfaces created from selection"), 3000);
-    }
-}
-
-void CWindow::onSelectionClear()
-{
-    // Clear all stored selections on the segmentation (Surface) viewer
-    CVolumeViewer* segViewer = segmentationViewer();
-    if (!segViewer) { statusBar()->showMessage(tr("No Surface viewer found"), 3000); return; }
-    segViewer->clearSelections();
-    statusBar()->showMessage(tr("Selections cleared"), 2000);
-}
-
 // Create menus
-void CWindow::CreateMenus(void)
-{
-    // "Recent Volpkg" menu
-    fRecentVolpkgMenu = new QMenu(tr("Open &recent volpkg"), this);
-    fRecentVolpkgMenu->setEnabled(false);
-    for (auto& action : fOpenRecentVolpkg)
-    {
-        fRecentVolpkgMenu->addAction(action);
-    }
-
-    fFileMenu = new QMenu(tr("&File"), this);
-    fFileMenu->addAction(fOpenVolAct);
-    fFileMenu->addMenu(fRecentVolpkgMenu);
-    fFileMenu->addSeparator();
-    fFileMenu->addAction(fReportingAct);
-    fFileMenu->addSeparator();
-    fFileMenu->addAction(fSettingsAct);
-    fFileMenu->addSeparator();
-    fFileMenu->addAction(fImportObjAct);
-    fFileMenu->addSeparator();
-    fFileMenu->addAction(fExitAct);
-
-    fEditMenu = new QMenu(tr("&Edit"), this);
-
-    fViewMenu = new QMenu(tr("&View"), this);
-    fViewMenu->addAction(ui.dockWidgetVolumes->toggleViewAction());
-    fViewMenu->addAction(ui.dockWidgetSegmentation->toggleViewAction());
-    fViewMenu->addAction(ui.dockWidgetDistanceTransform->toggleViewAction());
-    fViewMenu->addAction(ui.dockWidgetOpList->toggleViewAction());
-    fViewMenu->addAction(ui.dockWidgetDrawing->toggleViewAction());
-    fViewMenu->addAction(ui.dockWidgetOpSettings->toggleViewAction());
-    fViewMenu->addAction(ui.dockWidgetComposite->toggleViewAction());
-    fViewMenu->addAction(ui.dockWidgetLocation->toggleViewAction());
-
-    if (_point_collection_widget) {
-        fViewMenu->addAction(_point_collection_widget->toggleViewAction());
-    }
-
-    fViewMenu->addSeparator();
-    fViewMenu->addAction(fResetMdiView);
-    fViewMenu->addSeparator();
-    fViewMenu->addAction(fShowConsoleOutputAct);
-
-    fActionsMenu = new QMenu(tr("&Actions"), this);
-    fActionsMenu->addAction(fVoxelizePathsAct);
-    fActionsMenu->addAction(fDrawBBoxAct);
-
-    fSelectionMenu = new QMenu(tr("&Selection"), this);
-    fSelectionMenu->addAction(fSelectionSurfaceFromAct);
-    fSelectionMenu->addAction(fSelectionClearAct);
-
-    // Add Telea pipeline to menus
-    fActionsMenu->addSeparator();
-    fActionsMenu->addAction(fInpaintTeleaAct);
-    fSelectionMenu->addSeparator();
-    fSelectionMenu->addAction(fInpaintTeleaAct);
-
-    fHelpMenu = new QMenu(tr("&Help"), this);
-    fHelpMenu->addAction(fKeybinds);
-    fFileMenu->addSeparator();
-
-    fHelpMenu->addAction(fAboutAct);
-
-    menuBar()->addMenu(fFileMenu);
-    menuBar()->addMenu(fEditMenu);
-    menuBar()->addMenu(fViewMenu);
-    menuBar()->addMenu(fActionsMenu);
-    menuBar()->addMenu(fSelectionMenu);
-    menuBar()->addMenu(fHelpMenu);
-
-}
-
 // Create actions
 void CWindow::keyPressEvent(QKeyEvent* event)
 {
@@ -910,135 +807,6 @@ void CWindow::keyPressEvent(QKeyEvent* event)
     }
 
     QMainWindow::keyPressEvent(event);
-}
-
-void CWindow::CreateActions(void)
-{
-    fOpenVolAct = new QAction(style()->standardIcon(QStyle::SP_DialogOpenButton), tr("&Open volpkg..."), this);
-    connect(fOpenVolAct, SIGNAL(triggered()), this, SLOT(Open()));
-    fOpenVolAct->setShortcut(QKeySequence::Open);
-
-    for (auto& action : fOpenRecentVolpkg)
-    {
-        action = new QAction(this);
-        action->setVisible(false);
-        connect(action, &QAction::triggered, this, &CWindow::OpenRecent);
-    }
-
-    fSettingsAct = new QAction(tr("Settings"), this);
-    connect(fSettingsAct, SIGNAL(triggered()), this, SLOT(ShowSettings()));
-
-    fExitAct = new QAction(style()->standardIcon(QStyle::SP_DialogCloseButton), tr("E&xit..."), this);
-    connect(fExitAct, SIGNAL(triggered()), this, SLOT(close()));
-
-    fKeybinds = new QAction(tr("&Keybinds"), this);
-    connect(fKeybinds, SIGNAL(triggered()), this, SLOT(Keybindings()));
-
-    fAboutAct = new QAction(tr("&About..."), this);
-    connect(fAboutAct, SIGNAL(triggered()), this, SLOT(About()));
-
-    fResetMdiView = new QAction(tr("Reset Segmentation Views"), this);
-    connect(fResetMdiView, SIGNAL(triggered()), this, SLOT(ResetSegmentationViews()));
-    
-    fShowConsoleOutputAct = new QAction(tr("Show Console Output"), this);
-    connect(fShowConsoleOutputAct, &QAction::triggered, this, &CWindow::onToggleConsoleOutput);
-    
-    fReportingAct = new QAction(tr("Generate Review Report..."), this);
-    connect(fReportingAct, &QAction::triggered, this, &CWindow::onGenerateReviewReport);
-    
-    fVoxelizePathsAct = new QAction(tr("&Voxelize Paths..."), this);
-    connect(fVoxelizePathsAct, &QAction::triggered, this, &CWindow::onVoxelizePaths);
-
-    fDrawBBoxAct = new QAction(tr("Draw BBox"), this);
-    fDrawBBoxAct->setCheckable(true);
-    connect(fDrawBBoxAct, &QAction::toggled, this, &CWindow::onDrawBBoxToggled);
-
-    // Selection menu actions
-    fSelectionSurfaceFromAct = new QAction(tr("Surface from Selection"), this);
-    connect(fSelectionSurfaceFromAct, &QAction::triggered, this, &CWindow::onSurfaceFromSelection);
-    fSelectionClearAct = new QAction(tr("Clear"), this);
-    connect(fSelectionClearAct, &QAction::triggered, this, &CWindow::onSelectionClear);
-
-    // Inpaint (Telea) -> rebuild segment
-    fInpaintTeleaAct = new QAction(tr("Inpaint (Telea) && Rebuild Segment"), this);
-    fInpaintTeleaAct->setToolTip(tr("Generate RGB, Telea-inpaint it, then convert back to tifxyz into a new segment"));
-    #if (QT_VERSION >= QT_VERSION_CHECK(5, 10, 0))
-        fInpaintTeleaAct->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_I));
-    #endif
-    connect(fInpaintTeleaAct, &QAction::triggered, this, &CWindow::onInpaintTeleaSelected);
-
-    fImportObjAct = new QAction(tr("Import OBJ as Patch..."), this);
-    connect(fImportObjAct, &QAction::triggered, this, &CWindow::onImportObjAsPatches);
-
-}
-
-void CWindow::UpdateRecentVolpkgActions()
-{
-    QSettings settings("VC.ini", QSettings::IniFormat);
-    QStringList files = settings.value("volpkg/recent").toStringList();
-    if (files.isEmpty()) {
-        return;
-    }
-
-    // The automatic conversion to string list from the settings, (always?) adds an
-    // empty entry at the end. Remove it if present.
-    if (files.last().isEmpty()) {
-        files.removeLast();
-    }
-
-    const int numRecentFiles = qMin(files.size(), static_cast<int>(MAX_RECENT_VOLPKG));
-
-    for (int i = 0; i < numRecentFiles; ++i) {
-        // Replace "&" with "&&" since otherwise they will be hidden and interpreted
-        // as mnemonics
-        QString fileName = QFileInfo(files[i]).fileName();
-        fileName.replace("&", "&&");
-        QString path = QFileInfo(files[i]).canonicalPath();
-
-        if (path == "."){
-            path = tr("Directory not available!");
-        } else {
-            path.replace("&", "&&");
-        }
-
-        QString text = tr("&%1 | %2 (%3)").arg(i + 1).arg(fileName).arg(path);
-        fOpenRecentVolpkg[i]->setText(text);
-        fOpenRecentVolpkg[i]->setData(files[i]);
-        fOpenRecentVolpkg[i]->setVisible(true);
-    }
-
-    for (int j = numRecentFiles; j < MAX_RECENT_VOLPKG; ++j) {
-        fOpenRecentVolpkg[j]->setVisible(false);
-    }
-
-    fRecentVolpkgMenu->setEnabled(numRecentFiles > 0);
-}
-
-void CWindow::UpdateRecentVolpkgList(const QString& path)
-{
-    QSettings settings("VC.ini", QSettings::IniFormat);
-    QStringList files = settings.value("volpkg/recent").toStringList();
-    const QString pathCanonical = QFileInfo(path).absoluteFilePath();
-    files.removeAll(pathCanonical);
-    files.prepend(pathCanonical);
-
-    while(files.size() > MAX_RECENT_VOLPKG) {
-        files.removeLast();
-    }
-
-    settings.setValue("volpkg/recent", files);
-
-    UpdateRecentVolpkgActions();
-}
-
-void CWindow::RemoveEntryFromRecentVolpkg(const QString& path)
-{
-    QSettings settings("VC.ini", QSettings::IniFormat);
-    QStringList files = settings.value("volpkg/recent").toStringList();
-    files.removeAll(path);
-    settings.setValue("volpkg/recent", files);
-
-    UpdateRecentVolpkgActions();
 }
 
 // Asks User to Save Data Prior to VC.app Exit
@@ -1204,7 +972,9 @@ void CWindow::OpenVolume(const QString& path)
         _surfacePanel->setVolumePkg(fVpkg);
         _surfacePanel->loadSurfaces(false);
     }
-    UpdateRecentVolpkgList(aVpkgPath);
+    if (_menuController) {
+        _menuController->updateRecentVolpkgList(aVpkgPath);
+    }
     
     // Set volume package in Seeding widget
    if (_seedingWidget) {
@@ -1260,114 +1030,6 @@ void CWindow::CloseVolume(void)
 }
 
 // Handle open request
-void CWindow::Open(void)
-{
-    Open(QString());
-}
-
-// Handle open request
-void CWindow::Open(const QString& path)
-{
-    CloseVolume();
-    OpenVolume(path);
-    UpdateView();  // update the panel when volume package is loaded
-}
-
-void CWindow::OpenRecent()
-{
-    auto action = qobject_cast<QAction*>(sender());
-    if (action)
-        Open(action->data().toString());
-}
-
-// Pop up about dialog
-void CWindow::Keybindings(void)
-{
-    QMessageBox::information(
-        this, tr("Keybindings for Volume Cartographer"),
-        tr("Keyboard: \n"
-        "------------------- \n"
-        "FIXME FIXME FIXME \n"
-        "------------------- \n"
-        "Ctrl+O: Open Volume Package \n"
-        "Ctrl+S: Save Volume Package \n"
-        "A,D: Impact Range down/up \n"
-        "[, ]: Alternative Impact Range down/up \n"
-        "Q,E: Slice scan range down/up (mouse wheel scanning) \n"
-        "Arrow Left/Right: Slice down/up by 1 \n"
-        "1,2: Slice down/up by 1 \n"
-        "3,4: Slice down/up by 5 \n"
-        "5,6: Slice down/up by 10 \n"
-        "7,8: Slice down/up by 50 \n"
-        "9,0: Slice down/up by 100 \n"
-        "Ctrl+J: Toggle axis-aligned slice planes \n"
-        "Ctrl+T: Toggle direction hints (flip_x arrows) \n"
-        "T: Segmentation Tool \n"
-        "P: Pen Tool \n"
-        "Space: Toggle Curve Visibility \n"
-        "C: Alternate Toggle Curve Visibility \n"
-        "J: Highlight Next Curve that is selected for computation \n"
-        "K: Highlight Previous Curve that is selected for computation \n"
-        "F: Return to slice that the currently active tool was started on \n"
-        "L: Mark/unmark current slice as anchor (only in Segmentation Tool) \n"
-        "Y/Z/V: Evenly space Points on Curve (only in Segmentation Tool) \n"
-        "U: Rotate view counterclockwise \n"
-        "O: Rotate view clockwise \n"
-        "X/I: Reset view rotation back to zero \n"
-        "\n"
-        "Mouse: \n"
-        "------------------- \n"
-        "Mouse Wheel: Scroll up/down \n"
-        "Mouse Wheel + Alt: Scroll left/right \n"
-        "Mouse Wheel + Ctrl: Zoom in/out \n"
-        "Mouse Wheel + Shift: Next/previous slice \n"
-        "Mouse Wheel + W Key Hold: Change impact range \n"
-        "Mouse Wheel + R Key Hold: Follow Highlighted Curve \n"
-        "Mouse Wheel + S Key Hold: Rotate view \n"
-        "Mouse Left Click: Add Points to Curve in Pen Tool. Snap Closest Point to Cursor in Segmentation Tool. \n"
-        "Mouse Left Drag: Drag Point / Curve after Mouse Left Click \n"
-        "Mouse Right Drag: Pan slice image\n"
-        "Mouse Back/Forward Button: Follow Highlighted Curve \n"
-        "Highlighting Segment ID: Shift/(Alt as well as Ctrl) Modifier to jump to Segment start/end."));
-}
-
-// Pop up about dialog
-void CWindow::About(void)
-{
-    QMessageBox::information(
-        this, tr("About Volume Cartographer"),
-        tr("Vis Center, University of Kentucky\n\n"
-        "Fork: https://github.com/spacegaier/volume-cartographer"));
-}
-
-void CWindow::ShowSettings()
-{
-    auto pDlg = new SettingsDialog(this);
-    
-    pDlg->exec();
-    // Apply updated settings immediately to viewers
-    {
-        QSettings settings("VC.ini", QSettings::IniFormat);
-        bool showDirHints = settings.value("viewer/show_direction_hints", true).toBool();
-        if (_viewerManager) {
-            _viewerManager->forEachViewer([showDirHints](CVolumeViewer* viewer) {
-                if (viewer) {
-                    viewer->setShowDirectionHints(showDirHints);
-                }
-            });
-        }
-    }
-    delete pDlg;
-}
-
-void CWindow::ResetSegmentationViews()
-{
-    for(auto sub : mdiArea->subWindowList()) {
-        sub->showNormal();
-    }
-    mdiArea->tileSubWindows();
-}
-
 auto CWindow::can_change_volume_() -> bool
 {
     bool canChange = fVpkg != nullptr && fVpkg->numberOfVolumes() > 1;
@@ -1432,52 +1094,25 @@ void CWindow::onOpChainChanged(OpChain *chain)
     _surf_col->setSurface("segmentation", chain);
 }
 
-void CWindow::onSurfaceSelected()
+void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface, OpChain* chain)
 {
-    // Get the first selected item for single-segment operations
-    QList<QTreeWidgetItem*> selectedItems = treeWidgetSurfaces->selectedItems();
-    if (selectedItems.isEmpty()) {
-        // Reset sub window title
-        if (auto* viewer = segmentationViewer()) {
-            viewer->setWindowTitle(tr("Surface"));
-        }
+    _surfID = surfaceId.toStdString();
+    _surf = surface;
 
-        return;
-    }
-    
-    // Use the first selected item for all existing functionality
-    QTreeWidgetItem* firstSelected = selectedItems.first();
-    _surfID = firstSelected->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
-
-    // Update sub window title with surface ID
-    if (auto* viewer = segmentationViewer()) {
-        viewer->setWindowTitle(tr("Surface %1").arg(QString::fromStdString(_surfID)));
+    if (chain) {
+        sendOpChainSelected(chain);
+    } else {
+        sendOpChainSelected(nullptr);
     }
 
-    if (!_opchains.count(_surfID)) {
-        auto surfMeta = fVpkg->getSurface(_surfID);
-        if (surfMeta) {
-            _opchains[_surfID] = new OpChain(surfMeta->surface());
-        }
+    if (_surf) {
+        applySlicePlaneOrientation(_surf);
+    } else {
+        applySlicePlaneOrientation();
     }
 
-    if (_opchains[_surfID]) {
-        _surf_col->setSurface("segmentation", _opchains[_surfID]->src());
-        sendOpChainSelected(_opchains[_surfID]);
-        _surf = _opchains[_surfID]->src();
-        std::cout << "surf " << _surf->path << _surfID <<  _surf->meta << std::endl;
-        if (_surfacePanel) {
-            _surfacePanel->syncSelectionUi(_surfID, _surf);
-        }
-    }
-    else
-        std::cout << "ERROR loading " << _surfID << std::endl;
-
-    applySlicePlaneOrientation(_surf);
-
-    // If "Current Segment Only" is checked, refresh the filter to update intersections
     if (_surfacePanel && _surfacePanel->isCurrentOnlyFilterEnabled()) {
-        _surfacePanel->applyFilters();
+        _surfacePanel->refreshFiltersOnly();
     }
 }
 
@@ -1607,149 +1242,12 @@ void CWindow::onAppendMaskPressed(void)
     }
 }
 
-void CWindow::onRefreshSurfaces()
-{
-    if (_surfacePanel) {
-        _surfacePanel->loadSurfacesIncremental();
-    }
-}
-
 QString CWindow::getCurrentVolumePath() const
 {
     if (currentVolume == nullptr) {
         return QString();
     }
     return QString::fromStdString(currentVolume->path().string());
-}
-
-void CWindow::onToggleConsoleOutput()
-{
-    if (_cmdRunner) {
-        _cmdRunner->showConsoleOutput();
-    } else {
-        QMessageBox::information(this, tr("Console Output"), 
-                                tr("No command line tool has been run yet. The console will be available after running a tool."));
-    }
-}
-void CWindow::onSurfaceContextMenuRequested(const QPoint& pos)
-{
-    QTreeWidgetItem* item = treeWidgetSurfaces->itemAt(pos);
-    if (!item) {
-        return;
-    }
-
-    // Get all selected segments
-    QList<QTreeWidgetItem*> selectedItems = treeWidgetSurfaces->selectedItems();
-    std::vector<std::string> selectedSegmentIds;
-    for (auto* selectedItem : selectedItems) {
-        selectedSegmentIds.push_back(selectedItem->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString());
-    }
-
-    // Use the first selected segment for single-segment operations
-    std::string segmentId = selectedSegmentIds.empty() ?
-        item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() :
-        selectedSegmentIds.front();
-
-    QMenu contextMenu(tr("Context Menu"), this);
-
-    // Copy segment path action
-    QAction* copyPathAction = new QAction(tr("Copy Segment Path"), this);
-    connect(copyPathAction, &QAction::triggered, [this, segmentId]() {
-        if (fVpkg) {
-            auto surfMeta = fVpkg->getSurface(segmentId);
-            if (surfMeta) {
-                QString path = QString::fromStdString(surfMeta->path.string());
-                QApplication::clipboard()->setText(path);
-                statusBar()->showMessage(tr("Copied segment path to clipboard: %1").arg(path), 3000);
-            }
-        }
-    });
-    
-    // Delete segment(s) action
-    QString deleteText = selectedSegmentIds.size() > 1 ? 
-        tr("Delete %1 Segments").arg(selectedSegmentIds.size()) : 
-        tr("Delete Segment");
-    QAction* deleteAction = new QAction(deleteText, this);
-    deleteAction->setIcon(style()->standardIcon(QStyle::SP_TrashIcon));
-    connect(deleteAction, &QAction::triggered, [this, selectedSegmentIds]() {
-        onDeleteSegments(selectedSegmentIds);
-    });
-    
-    // Render segment action
-    QAction* renderAction = new QAction(tr("Render segment"), this);
-    connect(renderAction, &QAction::triggered, [this, segmentId]() {
-        onRenderSegment(segmentId);
-    });
-
-    // SLIM-flatten (calls slot implemented in CWindowContextMenu.cpp)
-    QAction* slimFlattenAction = new QAction(tr("SLIM-flatten"), this);
-    connect(slimFlattenAction, &QAction::triggered, [this, segmentId]() {
-        onSlimFlatten(segmentId);
-    });
-
-    // AWS Upload
-    QAction* awsUploadAction = new QAction(tr("Upload artifacts to AWS"), this);
-    connect(awsUploadAction, &QAction::triggered, [this, segmentId]() {
-        onAWSUpload(segmentId);
-    });
-
-    // Grow segment from segment action
-    QAction* growSegmentAction = new QAction(tr("Run Trace"), this);
-    connect(growSegmentAction, &QAction::triggered, [this, segmentId]() {
-        onGrowSegmentFromSegment(segmentId);
-    });
-    
-    // Add overlap action
-    QAction* addOverlapAction = new QAction(tr("Add overlap"), this);
-    connect(addOverlapAction, &QAction::triggered, [this, segmentId]() {
-        onAddOverlap(segmentId);
-    });
-    
-    // Convert to OBJ action
-    QAction* convertToObjAction = new QAction(tr("Convert to OBJ"), this);
-    connect(convertToObjAction, &QAction::triggered, [this, segmentId]() {
-        onConvertToObj(segmentId);
-    });
-    
-    // Seed submenu with options
-    QMenu* seedMenu = new QMenu(tr("Run Seed"), &contextMenu);
-    QAction* seedWithSeedAction = new QAction(tr("Seed from Focus Point"), seedMenu);
-    connect(seedWithSeedAction, &QAction::triggered, [this, segmentId]() {
-        onGrowSeeds(segmentId, false, false);
-    });
-    QAction* seedWithRandomAction = new QAction(tr("Random Seed"), seedMenu);
-    connect(seedWithRandomAction, &QAction::triggered, [this, segmentId]() {
-        onGrowSeeds(segmentId, false, true);
-    });
-    QAction* seedWithExpandAction = new QAction(tr("Expand Seed"), seedMenu);
-    connect(seedWithExpandAction, &QAction::triggered, [this, segmentId]() {
-        onGrowSeeds(segmentId, true, false);
-    });
-    seedMenu->addAction(seedWithSeedAction);
-    seedMenu->addAction(seedWithRandomAction);
-    seedMenu->addAction(seedWithExpandAction);
-    
-    // Build menu
-    contextMenu.addAction(copyPathAction);
-    contextMenu.addSeparator();
-    contextMenu.addMenu(seedMenu);
-    contextMenu.addAction(growSegmentAction);
-    contextMenu.addAction(addOverlapAction);
-    contextMenu.addSeparator();
-    contextMenu.addAction(renderAction);
-    contextMenu.addAction(convertToObjAction);
-    contextMenu.addAction(slimFlattenAction);
-    contextMenu.addAction(awsUploadAction);
-    contextMenu.addSeparator();
-    // Telea pipeline (RGB -> inpaint -> back to tifxyz)
-    QAction* inpaintTeleaAction = new QAction(tr("Inpaint (Telea) && Rebuild Segment"), this);
-    connect(inpaintTeleaAction, &QAction::triggered, [this]() {
-        onInpaintTeleaSelected();
-    });
-    contextMenu.addAction(inpaintTeleaAction);
-    contextMenu.addAction(deleteAction);
-    
-    contextMenu.exec(treeWidgetSurfaces->mapToGlobal(pos));
 }
 
 void CWindow::onSegmentationDirChanged(int index)
@@ -1787,399 +1285,6 @@ void CWindow::onSegmentationDirChanged(int index)
     }
 }
 
-// ===== Telea inpaint pipeline implementation =====
-namespace {
-
-// Run a CLI tool and collect its merged stdout/stderr; show error box on failure
-static bool run_cli(QWidget* parent, const QString& program, const QStringList& args, QString* outLog = nullptr) {
-    QProcess p;
-    p.setProcessChannelMode(QProcess::MergedChannels);
-    p.start(program, args);
-    if (!p.waitForStarted()) {
-        QMessageBox::critical(parent, QObject::tr("Error"),
-                              QObject::tr("Failed to start %1").arg(program));
-        return false;
-    }
-    p.waitForFinished(-1);
-    const QString log = p.readAll();
-    if (outLog) *outLog = log;
-    if (p.exitStatus() != QProcess::NormalExit || p.exitCode() != 0) {
-        QMessageBox::critical(parent, QObject::tr("Command Failed"),
-                              QObject::tr("%1 exited with code %2.\n\n%3")
-                              .arg(program).arg(p.exitCode()).arg(log));
-        return false;
-    }
-    return true;
-}
-
-// Resolve a tool located next to the application; otherwise fall back to PATH
-static QString find_tool(const char* baseName) {
-#ifdef _WIN32
-    const QString exe = QString::fromLatin1(baseName) + ".exe";
-#else
-    const QString exe = QString::fromLatin1(baseName);
-#endif
-    const QString appDir = QCoreApplication::applicationDirPath();
-    const QString local  = appDir + QDir::separator() + exe;
-    if (QFileInfo::exists(local)) return local;
-    return exe; // rely on PATH
-}
-} // namespace
-
-void CWindow::onInpaintTeleaSelected()
-{
-    if (!fVpkg) {
-        QMessageBox::warning(this, tr("Error"), tr("No volume package loaded."));
-        return;
-    }
-
-    // Use all selected segments (patches/traces)
-    QList<QTreeWidgetItem*> selectedItems = treeWidgetSurfaces->selectedItems();
-    if (selectedItems.isEmpty()) {
-        QMessageBox::information(this, tr("Info"), tr("Select a patch/trace first in the Surfaces list."));
-        return;
-    }
-
-    // Locate tools (next to app or PATH)
-    const QString vc_tifxyz2rgb    = find_tool("vc_tifxyz2rgb");
-    const QString vc_telea_inpaint = find_tool("vc_telea_inpaint");
-    const QString vc_rgb2tifxyz    = find_tool("vc_rgb2tifxyz");
-
-    int successCount = 0, failCount = 0;
-
-    for (QTreeWidgetItem* item : selectedItems) {
-        const std::string id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
-        auto surfMeta = fVpkg->getSurface(id);
-        if (!surfMeta) { ++failCount; continue; }
-
-        const std::filesystem::path segDir    = surfMeta->path;              // .../paths/<id> or .../traces/<id>
-        const std::filesystem::path parentDir = segDir.parent_path();        // .../paths or .../traces
-        const std::filesystem::path metaJson  = segDir / "meta.json";
-
-        if (!std::filesystem::exists(metaJson)) {
-            QMessageBox::warning(this, tr("Error"),
-                                 tr("Missing meta.json for %1").arg(QString::fromStdString(id)));
-            ++failCount; continue;
-        }
-
-        // Time-stamped names and temp dirs
-        const QString stamp  = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmsszzz");
-        const QString rgbPngName = QString::fromStdString(id) + "_xyz_rgb_" + stamp + ".png";
-        const QString newSegName = QString::fromStdString(id) + "_telea_" + stamp;
-
-        QTemporaryDir tmpInDir;   // for RGB input to inpaint
-        QTemporaryDir tmpOutDir;  // for inpainted output
-        if (!tmpInDir.isValid() || !tmpOutDir.isValid()) {
-            QMessageBox::warning(this, tr("Error"), tr("Failed to create temporary directories."));
-            ++failCount; continue;
-        }
-
-        // 1) tifxyz -> RGB (explicit path in temp)
-        const QString rgbPng = QDir(tmpInDir.path()).filePath(rgbPngName);
-        {
-            QStringList args;
-            // Pass the segment directory (contains x.tif, y.tif, z.tif, meta.json)
-            args << QString::fromStdString(segDir.string())
-                 << rgbPng;
-            QString log;
-            if (!run_cli(this, vc_tifxyz2rgb, args, &log)) { ++failCount; continue; }
-        }
-
-        // 2) Telea inpaint (non-recursive, single file)
-        QString inpaintedPng;
-        {
-            QStringList args;
-            args << tmpInDir.path()     // input dir
-                 << tmpOutDir.path()    // output dir
-                 << QString::number(3)  // radius
-                 << QString::number(8)  // black_threshold
-                 << QString::number(1)  // min_area
-                 << QString::number(0); // recursive
-            QString log;
-            if (!run_cli(this, vc_telea_inpaint, args, &log)) { ++failCount; continue; }
-
-            // Expect exactly one PNG out
-            QDir d(tmpOutDir.path());
-            const QStringList outs = d.entryList(QStringList() << "*.png", QDir::Files);
-            if (outs.isEmpty()) {
-                QMessageBox::warning(this, tr("Error"), tr("Telea inpaint produced no PNG."));
-                ++failCount; continue;
-            }
-            inpaintedPng = d.absoluteFilePath(outs.first());
-        }
-
-        // 3) RGB -> tifxyz (new segment beside the original)
-        {
-            QStringList args;
-            args << inpaintedPng
-                 << QString::fromStdString(metaJson.string())   // bounds/scale source
-                 << QString::fromStdString(parentDir.string())  // out_dir
-                 << newSegName
-                 << "--invalid-black";
-            QString log;
-            if (!run_cli(this, vc_rgb2tifxyz, args, &log)) { ++failCount; continue; }
-        }
-
-        ++successCount;
-    }
-
-    // Reload surfaces so new segments appear
-    if (successCount > 0) {
-        try {
-            fVpkg->refreshSegmentations();
-            if (_surfacePanel) {
-                _surfacePanel->loadSurfacesIncremental();
-            }
-        } catch (...) {
-            // best effort
-        }
-    }
-
-    statusBar()->showMessage(tr("Telea inpaint pipeline complete. Success: %1, Failed: %2")
-                             .arg(successCount).arg(failCount), 6000);
-}
-
-
-void CWindow::onGenerateReviewReport()
-{
-    if (!fVpkg) {
-        QMessageBox::warning(this, tr("Error"), tr("No volume package loaded."));
-        return;
-    }
-
-    // Let user choose save location
-    QString fileName = QFileDialog::getSaveFileName(this,
-        tr("Save Review Report"),
-        "review_report.csv",
-        tr("CSV Files (*.csv)"));
-
-    if (fileName.isEmpty()) {
-        return;
-    }
-
-    // Data structure to aggregate by date and username
-    struct UserStats {
-        double totalArea = 0.0;
-        int surfaceCount = 0;
-    };
-    std::map<QString, std::map<QString, UserStats>> dailyStats; // date -> username -> stats
-
-    int totalReviewedCount = 0;
-    double grandTotalArea = 0.0;
-
-    // Iterate through all loaded surfaces
-    for (const auto& id : fVpkg->getLoadedSurfaceIDs()) {
-        auto surfMeta = fVpkg->getSurface(id);
-        
-        if (!surfMeta || !surfMeta->surface() || !surfMeta->surface()->meta) {
-            continue;
-        }
-        
-        nlohmann::json* meta = surfMeta->surface()->meta;
-        
-        // Check if surface has reviewed tag
-        if (!meta->contains("tags") || !meta->at("tags").contains("reviewed")) {
-            continue;
-        }
-        
-        // Get review date
-        QString reviewDate = "Unknown";
-        if (meta->at("tags").at("reviewed").contains("date")) {
-            QString fullDate = QString::fromStdString(meta->at("tags").at("reviewed").at("date").get<std::string>());
-            // Extract just the date portion (YYYY-MM-DD) from ISO date string
-            reviewDate = fullDate.left(10);
-        } else {
-            // Fallback to file modification time
-            QFileInfo metaFile(QString::fromStdString(surfMeta->path.string()) + "/meta.json");
-            if (metaFile.exists()) {
-                reviewDate = metaFile.lastModified().toString("yyyy-MM-dd");
-            }
-        }
-        
-        // Get username
-        QString username = "Unknown";
-        if (meta->at("tags").at("reviewed").contains("user")) {
-            username = QString::fromStdString(meta->at("tags").at("reviewed").at("user").get<std::string>());
-        }
-        
-        // Get area
-        double area = meta->value("area_cm2", 0.0);
-        
-        // Aggregate data
-        dailyStats[reviewDate][username].totalArea += area;
-        dailyStats[reviewDate][username].surfaceCount++;
-        
-        totalReviewedCount++;
-        grandTotalArea += area;
-    }
-    
-    // Open file for writing
-    QFile file(fileName);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        QMessageBox::warning(this, tr("Error"), tr("Could not open file for writing."));
-        return;
-    }
-    
-    QTextStream stream(&file);
-    
-    // Write header
-    stream << "Date,Username,CM² Reviewed,Surface Count\n";
-    
-    // Write aggregated data sorted by date and username
-    for (const auto& dateEntry : dailyStats) {
-        const QString& date = dateEntry.first;
-        for (const auto& userEntry : dateEntry.second) {
-            const QString& username = userEntry.first;
-            const UserStats& stats = userEntry.second;
-            
-            stream << date << ","
-                   << username << ","
-                   << QString::number(stats.totalArea, 'f', 3) << ","
-                   << stats.surfaceCount << "\n";
-        }
-    }
-    
-    file.close();
-    
-    // Show summary message
-    QString message = tr("Review report saved successfully.\n\n"
-                        "Total reviewed surfaces: %1\n"
-                        "Total area reviewed: %2 cm²\n"
-                        "Days covered: %3")
-                        .arg(totalReviewedCount)
-                        .arg(grandTotalArea, 0, 'f', 3)
-                        .arg(dailyStats.size());
-    
-    QMessageBox::information(this, tr("Report Generated"), message);
-}
-void CWindow::onVoxelizePaths()
-{
-    // Check if volume is loaded
-    if (!fVpkg || !currentVolume) {
-        QMessageBox::warning(this, tr("Error"),
-                           tr("Please load a volume package first."));
-        return;
-    }
-
-    // Get output path
-    QString outputPath = QFileDialog::getSaveFileName(
-        this,
-        tr("Save Voxelized Surfaces"),
-        fVpkgPath + "/voxelized_paths.zarr",
-        tr("Zarr Files (*.zarr)")
-    );
-
-    if (outputPath.isEmpty()) return;
-
-    // Create progress dialog (non-modal)
-    QProgressDialog* progress = new QProgressDialog(tr("Voxelizing surfaces..."),
-                                                   tr("Cancel"), 0, 100, this);
-    progress->setWindowModality(Qt::NonModal);
-    progress->setAttribute(Qt::WA_DeleteOnClose);
-
-    // Gather surfaces from current paths directory
-    std::map<std::string, QuadSurface*> surfacesToVoxelize;
-    for (const auto& id : fVpkg->getLoadedSurfaceIDs()) {
-        auto surfMeta = fVpkg->getSurface(id);
-        // Only include surfaces from current segmentation directory
-        if (surfMeta && surfMeta->surface()) {
-            surfacesToVoxelize[id] = surfMeta->surface();
-        }
-    }
-    
-    if (surfacesToVoxelize.empty()) {
-        QMessageBox::warning(this, tr("Error"), 
-                           tr("No surfaces found in current paths directory."));
-        return;
-    }
-    
-    // Set up volume info from current volume
-    SurfaceVoxelizer::VolumeInfo volumeInfo;
-    volumeInfo.width = currentVolume->sliceWidth();
-    volumeInfo.height = currentVolume->sliceHeight();
-    volumeInfo.depth = currentVolume->numSlices();
-    // Get voxel size from volume metadata if available
-    float voxelSize = 1.0f;
-    try {
-        if (currentVolume->metadata().hasKey("voxelsize")) {
-            voxelSize = currentVolume->metadata().get<float>("voxelsize");
-        }
-    } catch (...) {
-        // Default to 1.0 if not found
-        voxelSize = 1.0f;
-    }
-    volumeInfo.voxelSize = voxelSize;
-    
-    // Set up parameters
-    SurfaceVoxelizer::VoxelizationParams params;
-    params.voxelSize = volumeInfo.voxelSize; // Match volume voxel size
-    params.samplingDensity = 0.5f; // Sample every 0.5 surface units
-    params.fillGaps = true;
-    params.chunkSize = 64;
-    
-    // Set OpenMP thread count based on system
-    int numThreads = std::max(1, QThread::idealThreadCount() - 1); // Leave one core free
-    omp_set_num_threads(numThreads);
-    
-    // Run voxelization in separate thread
-    QFutureWatcher<void>* watcher = new QFutureWatcher<void>(this);
-    connect(watcher, &QFutureWatcher<void>::finished, [progress, watcher]() {
-        progress->close();
-        watcher->deleteLater();
-    });
-    
-    // Progress tracking  
-    std::atomic<bool> cancelled(false);
-    connect(progress, &QProgressDialog::canceled, [&cancelled]() {
-        cancelled = true;
-    });
-    
-    auto surfaces = surfacesToVoxelize;  // Copy for lambda capture
-    auto outputStr = outputPath.toStdString();
-    
-    QFuture<void> future = QtConcurrent::run([this, outputStr, surfaces, volumeInfo, params, progress, &cancelled]() {
-        try {
-            SurfaceVoxelizer::voxelizeSurfaces(
-                outputStr,
-                surfaces,
-                volumeInfo,
-                params,
-                [progress, &cancelled](int value) {
-                    if (!cancelled) {
-                        QMetaObject::invokeMethod(progress, [progress, value]() {
-                            progress->setValue(value);
-                        }, Qt::QueuedConnection);
-                    }
-                }
-            );
-        } catch (const std::exception& e) {
-            QString errorMsg = QString::fromStdString(e.what());
-            QMetaObject::invokeMethod(this, [this, errorMsg]() {
-                QMessageBox::critical(this, tr("Error"), 
-                    tr("Voxelization failed: %1").arg(errorMsg));
-            }, Qt::QueuedConnection);
-        }
-    });
-    
-    watcher->setFuture(future);
-    progress->show();  // Show progress dialog non-blocking
-    
-    // When voxelization completes and dialog closes, show success message
-    connect(watcher, &QFutureWatcher<void>::finished, [this, outputPath, surfacesToVoxelize, volumeInfo, progress, &cancelled]() {
-        if (!progress->wasCanceled() && !cancelled) {
-            QMessageBox::information(this, tr("Success"),
-                tr("Surfaces voxelized successfully!\n\n"
-                   "Output saved to: %1\n"
-                   "Surfaces processed: %2\n"
-                   "Volume dimensions: %3x%4x%5")
-                .arg(outputPath)
-                .arg(surfacesToVoxelize.size())
-                .arg(volumeInfo.width)
-                .arg(volumeInfo.height)
-                .arg(volumeInfo.depth));
-        }
-    });
-}
 
 void CWindow::onManualLocationChanged()
 {
@@ -2247,9 +1352,8 @@ void CWindow::onManualLocationChanged()
     
     _surf_col->setPOI("focus", poi);
     
-    // Force an update of the filter
     if (_surfacePanel) {
-        _surfacePanel->applyFilters();
+        _surfacePanel->refreshFiltersOnly();
     }
 }
 
@@ -2279,9 +1383,8 @@ void CWindow::onFocusPOIChanged(std::string name, POI* poi)
             .arg(static_cast<int>(poi->p[1]))
             .arg(static_cast<int>(poi->p[2])));
 
-        // Force an update of the filter
         if (_surfacePanel) {
-            _surfacePanel->applyFilters();
+            _surfacePanel->refreshFiltersOnly();
         }
 
         applySlicePlaneOrientation();
@@ -2360,11 +1463,6 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
         enabled = already;
     }
 
-    _segmentationEditingEnabled = enabled;
-    _segmentationDownsample = _segmentationModule->downsample();
-    _segmentationRadius = _segmentationModule->radius();
-    _segmentationSigma = _segmentationModule->sigma();
-
     if (enabled) {
         QuadSurface* activeSurface = dynamic_cast<QuadSurface*>(_surf_col->surface("segmentation"));
         if (!activeSurface && _opchains.count(_surfID) && _opchains[_surfID]) {
@@ -2378,7 +1476,6 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
                 _segmentationWidget->setEditingEnabled(false);
             }
             _segmentationModule->setEditingEnabled(false);
-            _segmentationEditingEnabled = false;
             return;
         }
 
@@ -2494,81 +1591,4 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
         _surf_col->setSurface("seg yz", segYZ);
         return;
     }
-}
-void CWindow::onImportObjAsPatches()
-{
-    if (!fVpkg) {
-        QMessageBox::warning(this, tr("Error"), tr("No volume package loaded."));
-        return;
-    }
-
-    QStringList objFiles = QFileDialog::getOpenFileNames(this,
-        tr("Select OBJ Files"),
-        QDir::homePath(),
-        tr("OBJ Files (*.obj);;All Files (*)"));
-
-    if (objFiles.isEmpty()) {
-        return;
-    }
-
-    auto pathsdirfs = std::filesystem::path(fVpkg->getVolpkgDirectory()) / std::filesystem::path(fVpkg->getSegmentationDirectory());
-    QString pathsDir = QString::fromStdString(pathsdirfs.string());
-
-    QStringList successfulIds;
-    QStringList failedFiles;
-
-    for (const QString& objFile : objFiles) {
-        QFileInfo fileInfo(objFile);
-        QString baseName = fileInfo.completeBaseName();
-        QString outputDir = pathsDir + "/" + baseName;
-
-        // Check if exists
-        if (QDir(outputDir).exists()) {
-            if (QMessageBox::question(this, tr("Overwrite?"),
-                tr("'%1' exists. Overwrite?").arg(baseName),
-                QMessageBox::Yes | QMessageBox::No) == QMessageBox::No) {
-                continue;
-            }
-        }
-
-        // Run the tool
-        QProcess process;
-        process.setProcessChannelMode(QProcess::MergedChannels);
-
-        QStringList args;
-        args << objFile << outputDir;
-        args << QString::number(1000.0f)  // stretch_factor
-             << QString::number(1.0f)      // mesh_units
-             << QString::number(20);        // step_size
-
-        QString toolPath = QCoreApplication::applicationDirPath() + "/vc_obj2tifxyz_legacy";
-
-        process.start(toolPath, args);
-
-        if (!process.waitForStarted(5000)) {
-            failedFiles.append(fileInfo.fileName());
-            continue;
-        }
-
-        process.waitForFinished(-1);
-
-        if (process.exitCode() == 0 && process.exitStatus() == QProcess::NormalExit) {
-            successfulIds.append(baseName);
-        } else {
-            failedFiles.append(fileInfo.fileName());
-        }
-    }
-
-    if (!successfulIds.isEmpty() && _surfacePanel) {
-        _surfacePanel->loadSurfacesIncremental();
-    } else if (_surfacePanel) {
-        _surfacePanel->applyFilters();
-    }
-
-    QString message = tr("Imported: %1\nFailed: %2").arg(successfulIds.size()).arg(failedFiles.size());
-    if (!failedFiles.isEmpty()) {
-        message += tr("\n\nFailed files:\n%1").arg(failedFiles.join("\n"));
-    }
-
-    QMessageBox::information(this, tr("Import Results"), message);
 }
