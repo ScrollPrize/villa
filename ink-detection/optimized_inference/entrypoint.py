@@ -24,6 +24,7 @@ from inference_timesformer import (
     CFG,
 )
 
+from torch.nn import DataParallel
 
 logging.basicConfig(
     level=logging.INFO,
@@ -332,12 +333,10 @@ def main() -> None:
     layer_paths = download_layers(s3_client, bucket, layer_objects, input_dir)
     logger.info(f"Downloaded {len(layer_paths)} layer files")
 
-    # Load layers to numpy
-    logger.info("Loading layers into numpy array...")
-    layers_np = load_layers_to_numpy(layer_paths)
-    num_layers = layers_np.shape[2]
-    logger.info(f"Loaded layers tensor: shape={layers_np.shape}, dtype={layers_np.dtype}")
-    logger.info(f"Model expects {CFG.in_chans} channels, got {num_layers} layers")  
+    # Stream tiles directly from the downloaded files inside the inference module.
+    num_layers = len(layer_paths)
+    logger.info(f"Prepared {num_layers} layer files for streaming")
+    logger.info(f"Model expects {CFG.in_chans} channels, got {num_layers} layers") 
 
     if CFG.in_chans != num_layers:
         raise ValueError(f"Channel mismatch: model expects {CFG.in_chans}, got {num_layers}")
@@ -353,6 +352,45 @@ def main() -> None:
     logger.info(f"Loading model from weights at: {weight_path}")
     model = load_model(weight_path, device)
 
+    # -------- Performance toggles ------------------------------------------------
+    # TF32 on Ampere+ gives fast GEMMs with tiny accuracy impact for this task.
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+    # torch.compile defaults
+    COMPILE = os.getenv("COMPILE", "1") == "1" and hasattr(torch, "compile")
+    COMPILE_MODE = os.getenv("COMPILE_MODE", "reduce-overhead")  # <- default changed
+    if COMPILE:
+        # Persist Inductor cache across runs (huge win after the first run)
+        os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.abspath("./inductor_cache"))
+        # If not doing max tuning, disable heavy autotuning to avoid OOM spam & overhead
+        if COMPILE_MODE != "max-autotune":
+            os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "0")
+            os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM", "0")
+            os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE", "0")
+        # Optional: CUDA graphs (static shapes); enable if you don’t hit driver bugs
+        if os.getenv("CUDAGRAPHS", "0") == "1":
+            os.environ.setdefault("TORCHINDUCTOR_CUDAGRAPHS", "1")
+        # Compile
+        target = model.module if isinstance(model, DataParallel) else model
+        model_compiled = torch.compile(target, mode=COMPILE_MODE, fullgraph=True, dynamic=False)
+        if isinstance(model, DataParallel):
+            model.module = model_compiled
+        else:
+            model = model_compiled
+        logger.info(f"Enabled torch.compile (mode={COMPILE_MODE})")
+        # Tiny warmup to trigger compilation before the big loop (hides first-iter cost)
+        try:
+            dummy = torch.zeros((1, 1, CFG.in_chans, CFG.size, CFG.size), device=device)
+            with torch.inference_mode():
+                with torch.autocast(device_type=("cuda" if device.type == "cuda" else "cpu"), enabled=True):
+                    _ = model(dummy)
+            del dummy
+        except Exception as e:
+            logger.warning(f"Warmup after compile failed (continuing un-warmed): {e}")
+
     # Determine reverse option similar to local test
     segment_name = os.path.basename(prefix.rstrip("/")) if prefix else bucket
     if inputs.force_reverse:
@@ -362,9 +400,9 @@ def main() -> None:
         is_reverse_segment = False
 
     # Run inference
-    logger.info("Running inference on loaded layers...")
+    logger.info("Running inference from streamed layer files...")
     start_infer_time = time.time()
-    prediction = run_inference(layers_np, model, device, is_reverse_segment=is_reverse_segment)
+    prediction = run_inference(layer_paths, model, device, is_reverse_segment=is_reverse_segment)
     logger.info(f"Inference completed in {time.time() - start_infer_time:.2f} seconds")
 
     # Upload result
