@@ -463,7 +463,7 @@ def load_datasets(config):
                 store = zarr.storage.FSStore(volume_path, mode='r')
             else:
                 store = zarr.storage.DirectoryStore(volume_path)
-            store = zarr.storage.LRUStoreCache(store, max_size=20*1024**3)
+            store = zarr.storage.LRUStoreCache(store, max_size=12*1024**3)
             ome_zarr = zarr.open_group(store, mode='r')
         else:
             ome_zarr = zarr.open(volume_path, mode='r')
