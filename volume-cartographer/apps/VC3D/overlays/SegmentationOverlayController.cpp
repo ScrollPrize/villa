@@ -16,10 +16,10 @@
 namespace
 {
 constexpr const char* kOverlayGroup = "segmentation_edit_points";
-constexpr QColor kBaseFillColor(0, 200, 255, 190);
-constexpr QColor kHoverFillColor(255, 255, 255, 225);
-constexpr QColor kActiveFillColor(255, 215, 0, 235);
-constexpr QColor kKeyboardFillColor(0, 255, 160, 225);
+const QColor kBaseFillColor = QColor(0, 200, 255, 190);
+const QColor kHoverFillColor = QColor(255, 255, 255, 225);
+const QColor kActiveFillColor = QColor(255, 215, 0, 235);
+const QColor kKeyboardFillColor = QColor(0, 255, 160, 225);
 constexpr qreal kBaseRadius = 5.0;
 constexpr qreal kHoverRadiusMultiplier = 1.35;
 constexpr qreal kActiveRadiusMultiplier = 1.55;
@@ -28,10 +28,10 @@ constexpr qreal kBasePenWidth = 1.5;
 constexpr qreal kHoverPenWidth = 2.5;
 constexpr qreal kActivePenWidth = 2.6;
 constexpr qreal kKeyboardPenWidth = 2.4;
-constexpr QColor kBaseBorderColor(255, 255, 255, 200);
-constexpr QColor kHoverBorderColor(Qt::yellow);
-constexpr QColor kActiveBorderColor(255, 180, 0, 255);
-constexpr QColor kKeyboardBorderColor(60, 255, 180, 240);
+const QColor kBaseBorderColor = QColor(255, 255, 255, 200);
+const QColor kHoverBorderColor = QColor(Qt::yellow);
+const QColor kActiveBorderColor = QColor(255, 180, 0, 255);
+const QColor kKeyboardBorderColor = QColor(60, 255, 180, 240);
 constexpr qreal kPointZ = 95.0;
 }
 
@@ -136,20 +136,49 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
     std::optional<std::pair<int,int>> keyboardHighlight;
     if (_editManager && _editManager->hasSession()) {
         keyboardHighlight = _keyboardHandle;
+
+        struct HandleEntry {
+            cv::Vec3f world;
+            bool isActive;
+            bool isHover;
+            bool isKeyboard;
+        };
+
+        std::vector<cv::Vec3f> handlePoints;
+        std::vector<HandleEntry> handleEntries;
         const auto& handles = _editManager->handles();
+        handlePoints.reserve(handles.size());
+        handleEntries.reserve(handles.size());
+
         for (const auto& handle : handles) {
             const bool isActive = matches(handle.row, handle.col, _activeHandle);
             const bool isHover = matches(handle.row, handle.col, _hoverHandle);
             const bool isKeyboard = matches(handle.row, handle.col, keyboardHighlight);
+
+            handlePoints.push_back(handle.currentWorld);
+            handleEntries.push_back({handle.currentWorld, isActive, isHover, isKeyboard});
+        }
+
+        PointFilterOptions filter;
+        filter.clipToSurface = false;
+        filter.computeScenePoints = true;
+        filter.volumePredicate = [planeSurface, planeTolerance, &handleEntries](const cv::Vec3f&, size_t index) {
+            const auto& entry = handleEntries[index];
             if (planeSurface) {
-                float dist = planeSurface->pointDist(handle.currentWorld);
-                if (std::fabs(dist) > planeTolerance && !isActive && !isHover && !isKeyboard) {
-                    continue;
+                float dist = planeSurface->pointDist(entry.world);
+                if (std::fabs(dist) > planeTolerance && !(entry.isActive || entry.isHover || entry.isKeyboard)) {
+                    return false;
                 }
             }
+            return true;
+        };
 
-            QPointF scenePt = viewer->volumePointToScene(handle.currentWorld);
-            auto [radius, style] = pointVisuals(isActive, isHover, isKeyboard);
+        auto filtered = filterPoints(viewer, handlePoints, filter);
+        for (size_t i = 0; i < filtered.volumePoints.size(); ++i) {
+            size_t srcIndex = filtered.sourceIndices.empty() ? i : filtered.sourceIndices[i];
+            const auto& entry = handleEntries[srcIndex];
+            const QPointF& scenePt = filtered.scenePoints[i];
+            auto [radius, style] = pointVisuals(entry.isActive, entry.isHover, entry.isKeyboard);
             builder.addPoint(scenePt, radius, style);
         }
         return;
@@ -170,27 +199,56 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
     const int cols = points.cols;
     const int step = std::max(1, _downsample);
 
+    struct GridEntry {
+        cv::Vec3f world;
+        bool isActive;
+        bool isHover;
+        bool isKeyboard;
+        bool valid;
+    };
+
+    std::vector<cv::Vec3f> gridPoints;
+    std::vector<GridEntry> gridEntries;
+    gridPoints.reserve((rows / step + 1) * (cols / step + 1));
+    gridEntries.reserve(gridPoints.capacity());
+
     for (int y = 0; y < rows; y += step) {
         for (int x = 0; x < cols; x += step) {
             const cv::Vec3f& wp = points(y, x);
-            if (wp[0] == -1.0f && wp[1] == -1.0f && wp[2] == -1.0f) {
-                continue;
-            }
-
+            bool valid = !(wp[0] == -1.0f && wp[1] == -1.0f && wp[2] == -1.0f);
             const bool isActive = matches(y, x, _activeHandle);
             const bool isHover = matches(y, x, _hoverHandle);
             const bool isKeyboard = matches(y, x, keyboardHighlight);
-            if (planeSurface) {
-                float dist = planeSurface->pointDist(wp);
-                if (std::fabs(dist) > planeTolerance && !isActive && !isHover && !isKeyboard) {
-                    continue;
-                }
-            }
 
-            QPointF scenePt = viewer->volumePointToScene(wp);
-            auto [radius, style] = pointVisuals(isActive, isHover, isKeyboard);
-            builder.addPoint(scenePt, radius, style);
+            gridPoints.push_back(wp);
+            gridEntries.push_back({wp, isActive, isHover, isKeyboard, valid});
         }
+    }
+
+    PointFilterOptions filter;
+    filter.clipToSurface = false;
+    filter.computeScenePoints = true;
+    filter.volumePredicate = [planeSurface, planeTolerance, &gridEntries](const cv::Vec3f&, size_t index) {
+        const auto& entry = gridEntries[index];
+        if (!entry.valid) {
+            return false;
+        }
+        if (planeSurface) {
+            float dist = planeSurface->pointDist(entry.world);
+            if (std::fabs(dist) > planeTolerance && !(entry.isActive || entry.isHover || entry.isKeyboard)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto filtered = filterPoints(viewer, gridPoints, filter);
+    for (size_t i = 0; i < filtered.volumePoints.size(); ++i) {
+        size_t srcIndex = filtered.sourceIndices.empty() ? i : filtered.sourceIndices[i];
+        const auto& entry = gridEntries[srcIndex];
+        const QPointF& scenePt = filtered.scenePoints[i];
+        auto [radius, style] = pointVisuals(entry.isActive, entry.isHover, entry.isKeyboard);
+        builder.addPoint(scenePt, radius, style);
     }
 }
 

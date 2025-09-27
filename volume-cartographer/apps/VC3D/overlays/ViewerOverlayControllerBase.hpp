@@ -2,6 +2,7 @@
 
 #include <QObject>
 #include <QMetaObject>
+#include <QMetaType>
 
 #include <QColor>
 #include <QFont>
@@ -11,6 +12,10 @@
 
 #include <opencv2/core.hpp>
 
+#include <cstddef>
+#include <functional>
+#include <limits>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -20,6 +25,7 @@ class ViewerManager;
 class QGraphicsItem;
 class QGraphicsScene;
 class Surface;
+class QPainterPath;
 
 class ViewerOverlayControllerBase : public QObject
 {
@@ -31,12 +37,22 @@ public:
         QColor brushColor{Qt::transparent};
         qreal penWidth{0.0};
         Qt::PenStyle penStyle{Qt::SolidLine};
+        Qt::PenCapStyle penCap{Qt::RoundCap};
+        Qt::PenJoinStyle penJoin{Qt::RoundJoin};
+        std::vector<qreal> dashPattern{};
         qreal z{0.0};
     };
 
     struct PointPrimitive {
         QPointF position;
         qreal radius{3.0};
+        OverlayStyle style{};
+    };
+
+    struct CirclePrimitive {
+        QPointF center;
+        qreal radius{3.0};
+        bool filled{true};
         OverlayStyle style{};
     };
 
@@ -59,7 +75,67 @@ public:
         OverlayStyle style{};
     };
 
-    using OverlayPrimitive = std::variant<PointPrimitive, LineStripPrimitive, RectPrimitive, TextPrimitive>;
+    enum class PathRenderMode {
+        LineStrip,
+        Points
+    };
+
+    enum class PathBrushShape {
+        Circle,
+        Square
+    };
+
+    struct PathPrimitive {
+        std::vector<cv::Vec3f> points;
+        QColor color{Qt::white};
+        qreal lineWidth{3.0};
+        qreal opacity{1.0};
+        bool isEraser{false};
+        int pathId{0};
+        PathBrushShape brushShape{PathBrushShape::Circle};
+        PathRenderMode renderMode{PathRenderMode::LineStrip};
+        qreal pointRadius{3.0};
+        bool closed{false};
+        qreal z{25.0};
+
+        PathPrimitive densify(float samplingInterval = 0.5f) const;
+
+    private:
+        float interpolateZ(float percent, float totalLength, const QPainterPath& path) const;
+    };
+
+    struct ArrowPrimitive {
+        QPointF start;
+        QPointF end;
+        qreal headLength{10.0};
+        qreal headWidth{6.0};
+        OverlayStyle style{};
+    };
+
+    using OverlayPrimitive = std::variant<PointPrimitive,
+                                          CirclePrimitive,
+                                          LineStripPrimitive,
+                                          RectPrimitive,
+                                          TextPrimitive,
+                                          PathPrimitive,
+                                          ArrowPrimitive>;
+
+    struct FilteredPoints {
+        std::vector<cv::Vec3f> volumePoints;
+        std::vector<QPointF> scenePoints;
+        std::vector<size_t> sourceIndices;
+    };
+
+    struct PointFilterOptions {
+        bool clipToSurface{false};
+        float planeDistanceTolerance{std::numeric_limits<float>::infinity()};
+        float quadDistanceTolerance{std::numeric_limits<float>::infinity()};
+        bool requireSceneVisibility{false};
+        std::optional<QRectF> customSceneRect;
+        bool computeScenePoints{true};
+        std::function<bool(const cv::Vec3f&, size_t)> volumePredicate;
+        std::function<bool(const QPointF&, size_t)> scenePredicate;
+    };
 
     explicit ViewerOverlayControllerBase(std::string overlayGroupKey, QObject* parent = nullptr);
     ~ViewerOverlayControllerBase() override;
@@ -71,6 +147,9 @@ public:
 
     void refreshAll();
     void refreshViewer(CVolumeViewer* viewer);
+    static void applyPrimitives(CVolumeViewer* viewer,
+                                const std::string& overlayKey,
+                                std::vector<OverlayPrimitive> primitives);
 
 protected:
     const std::string& overlayGroupKey() const { return _overlayGroupKey; }
@@ -82,6 +161,11 @@ protected:
         void addPoint(const QPointF& position,
                       qreal radius,
                       OverlayStyle style);
+
+        void addCircle(const QPointF& center,
+                       qreal radius,
+                       bool filled,
+                       OverlayStyle style);
 
         void addLineStrip(const std::vector<QPointF>& points,
                           bool closed,
@@ -95,6 +179,14 @@ protected:
                      const QString& text,
                      const QFont& font,
                      OverlayStyle style);
+
+        void addPath(const PathPrimitive& path);
+
+        void addArrow(const QPointF& start,
+                      const QPointF& end,
+                      qreal headLength,
+                      qreal headWidth,
+                      OverlayStyle style);
 
         bool empty() const { return _primitives.empty(); }
         std::vector<OverlayPrimitive> takePrimitives();
@@ -117,6 +209,10 @@ protected:
     bool isScenePointVisible(CVolumeViewer* viewer, const QPointF& scenePoint) const;
     Surface* viewerSurface(CVolumeViewer* viewer) const;
 
+    FilteredPoints filterPoints(CVolumeViewer* viewer,
+                                const std::vector<cv::Vec3f>& points,
+                                const PointFilterOptions& options) const;
+
     void clearOverlay(CVolumeViewer* viewer) const;
 
 private:
@@ -136,3 +232,5 @@ private:
     QMetaObject::Connection _managerCreatedConn;
     QMetaObject::Connection _managerDestroyedConn;
 };
+
+Q_DECLARE_METATYPE(ViewerOverlayControllerBase::PathPrimitive)

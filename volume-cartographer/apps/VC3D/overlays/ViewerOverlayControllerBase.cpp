@@ -11,9 +11,81 @@
 #include <QPainterPath>
 #include <QPen>
 #include <QBrush>
+#include <QVector>
 
 #include <algorithm>
 #include <utility>
+#include <cmath>
+
+ViewerOverlayControllerBase::PathPrimitive
+ViewerOverlayControllerBase::PathPrimitive::densify(float samplingInterval) const
+{
+    if (points.size() < 2) {
+        return *this;
+    }
+
+    QPainterPath painterPath;
+    bool firstPoint = true;
+    for (const auto& pt : points) {
+        if (firstPoint) {
+            painterPath.moveTo(pt[0], pt[1]);
+            firstPoint = false;
+        } else {
+            painterPath.lineTo(pt[0], pt[1]);
+        }
+    }
+
+    float totalLength = painterPath.length();
+    if (totalLength <= 0.0f) {
+        return *this;
+    }
+
+    int numSamples = static_cast<int>(std::ceil(totalLength / samplingInterval));
+    if (numSamples < 2) {
+        return *this;
+    }
+
+    std::vector<cv::Vec3f> densifiedPoints;
+    densifiedPoints.reserve(static_cast<size_t>(numSamples));
+
+    for (int i = 0; i < numSamples; ++i) {
+        float percent = static_cast<float>(i) / static_cast<float>(numSamples - 1);
+        QPointF sampledPoint = painterPath.pointAtPercent(percent);
+        float z = interpolateZ(percent, totalLength, painterPath);
+        densifiedPoints.emplace_back(sampledPoint.x(), sampledPoint.y(), z);
+    }
+
+    PathPrimitive result = *this;
+    result.points = std::move(densifiedPoints);
+    return result;
+}
+
+float ViewerOverlayControllerBase::PathPrimitive::interpolateZ(float percent,
+                                                               float totalLength,
+                                                               const QPainterPath& path) const
+{
+    if (points.size() < 2) {
+        return points.empty() ? 0.0f : points.front()[2];
+    }
+
+    float targetLength = percent * totalLength;
+    float accumulatedLength = 0.0f;
+
+    for (size_t i = 1; i < points.size(); ++i) {
+        const cv::Vec3f& p1 = points[i - 1];
+        const cv::Vec3f& p2 = points[i];
+        float segmentLength = std::sqrt(std::pow(p2[0] - p1[0], 2.0f) + std::pow(p2[1] - p1[1], 2.0f));
+
+        if (accumulatedLength + segmentLength >= targetLength && segmentLength > 0.0f) {
+            float segmentPercent = (targetLength - accumulatedLength) / segmentLength;
+            return p1[2] + segmentPercent * (p2[2] - p1[2]);
+        }
+
+        accumulatedLength += segmentLength;
+    }
+
+    return points.back()[2];
+}
 
 ViewerOverlayControllerBase::OverlayBuilder::OverlayBuilder(CVolumeViewer* viewer)
     : _viewer(viewer)
@@ -27,6 +99,19 @@ void ViewerOverlayControllerBase::OverlayBuilder::addPoint(const QPointF& positi
     PointPrimitive prim;
     prim.position = position;
     prim.radius = radius;
+    prim.style = style;
+    _primitives.emplace_back(std::move(prim));
+}
+
+void ViewerOverlayControllerBase::OverlayBuilder::addCircle(const QPointF& center,
+                                                            qreal radius,
+                                                            bool filled,
+                                                            OverlayStyle style)
+{
+    CirclePrimitive prim;
+    prim.center = center;
+    prim.radius = radius;
+    prim.filled = filled;
     prim.style = style;
     _primitives.emplace_back(std::move(prim));
 }
@@ -65,6 +150,26 @@ void ViewerOverlayControllerBase::OverlayBuilder::addText(const QPointF& positio
     prim.position = position;
     prim.text = text;
     prim.font = font;
+    prim.style = style;
+    _primitives.emplace_back(std::move(prim));
+}
+
+void ViewerOverlayControllerBase::OverlayBuilder::addPath(const PathPrimitive& path)
+{
+    _primitives.emplace_back(path);
+}
+
+void ViewerOverlayControllerBase::OverlayBuilder::addArrow(const QPointF& start,
+                                                           const QPointF& end,
+                                                           qreal headLength,
+                                                           qreal headWidth,
+                                                           OverlayStyle style)
+{
+    ArrowPrimitive prim;
+    prim.start = start;
+    prim.end = end;
+    prim.headLength = headLength;
+    prim.headWidth = headWidth;
     prim.style = style;
     _primitives.emplace_back(std::move(prim));
 }
@@ -215,6 +320,92 @@ std::vector<QPointF> ViewerOverlayControllerBase::volumeToScene(CVolumeViewer* v
     return results;
 }
 
+ViewerOverlayControllerBase::FilteredPoints
+ViewerOverlayControllerBase::filterPoints(CVolumeViewer* viewer,
+                                          const std::vector<cv::Vec3f>& points,
+                                          const PointFilterOptions& options) const
+{
+    FilteredPoints result;
+    if (!viewer || points.empty()) {
+        return result;
+    }
+
+    result.volumePoints.reserve(points.size());
+    if (options.computeScenePoints) {
+        result.scenePoints.reserve(points.size());
+    }
+    result.sourceIndices.reserve(points.size());
+
+    auto* surface = viewer->currentSurface();
+    auto* planeSurface = options.clipToSurface ? dynamic_cast<PlaneSurface*>(surface) : nullptr;
+    auto* quadSurface = options.clipToSurface ? dynamic_cast<QuadSurface*>(surface) : nullptr;
+
+    QRectF visibleRect;
+    if (options.requireSceneVisibility) {
+        visibleRect = visibleSceneRect(viewer);
+    }
+
+    size_t index = 0;
+    for (const auto& point : points) {
+        const size_t srcIndex = index++;
+        bool keep = true;
+
+        if (planeSurface) {
+            float dist = planeSurface->pointDist(point);
+            if (std::fabs(dist) > options.planeDistanceTolerance) {
+                keep = false;
+            }
+        }
+
+        if (keep && quadSurface) {
+            auto ptr = quadSurface->pointer();
+            float res = quadSurface->pointTo(ptr, point, options.quadDistanceTolerance, 100);
+            if (res > options.quadDistanceTolerance) {
+                keep = false;
+            }
+        }
+
+        if (keep && options.volumePredicate) {
+            keep = options.volumePredicate(point, srcIndex);
+        }
+
+        QPointF scenePoint;
+        bool sceneComputed = false;
+        if (keep && (options.requireSceneVisibility || options.customSceneRect.has_value() || options.scenePredicate || options.computeScenePoints)) {
+            scenePoint = volumeToScene(viewer, point);
+            sceneComputed = true;
+
+            bool visibleOk = true;
+            if (options.requireSceneVisibility) {
+                visibleOk = visibleRect.contains(scenePoint);
+            }
+            if (visibleOk && options.customSceneRect) {
+                visibleOk = options.customSceneRect->contains(scenePoint);
+            }
+            if (!visibleOk) {
+                keep = false;
+            }
+
+            if (keep && options.scenePredicate) {
+                keep = options.scenePredicate(scenePoint, srcIndex);
+            }
+        }
+
+        if (keep) {
+            result.volumePoints.push_back(point);
+            if (options.computeScenePoints) {
+                if (!sceneComputed) {
+                    scenePoint = volumeToScene(viewer, point);
+                }
+                result.scenePoints.push_back(scenePoint);
+            }
+            result.sourceIndices.push_back(srcIndex);
+        }
+    }
+
+    return result;
+}
+
 QGraphicsScene* ViewerOverlayControllerBase::viewerScene(CVolumeViewer* viewer) const
 {
     if (!viewer || !viewer->fGraphicsView) {
@@ -255,6 +446,16 @@ void applyStyle(QGraphicsItem* item, const ViewerOverlayControllerBase::OverlayS
     QPen pen(style.penColor);
     pen.setWidthF(style.penWidth);
     pen.setStyle(style.penStyle);
+    pen.setCapStyle(style.penCap);
+    pen.setJoinStyle(style.penJoin);
+    if (!style.dashPattern.empty()) {
+        QVector<qreal> pattern;
+        pattern.reserve(static_cast<int>(style.dashPattern.size()));
+        for (qreal value : style.dashPattern) {
+            pattern.append(value);
+        }
+        pen.setDashPattern(pattern);
+    }
 
     if (auto* pathItem = qgraphicsitem_cast<QGraphicsPathItem*>(item)) {
         pathItem->setPen(pen);
@@ -272,6 +473,179 @@ void applyStyle(QGraphicsItem* item, const ViewerOverlayControllerBase::OverlayS
 }
 } // namespace
 
+void ViewerOverlayControllerBase::applyPrimitives(CVolumeViewer* viewer,
+                                                  const std::string& overlayKey,
+                                                  std::vector<OverlayPrimitive> primitives)
+{
+    if (!viewer) {
+        return;
+    }
+
+    if (primitives.empty()) {
+        viewer->clearOverlayGroup(overlayKey);
+        return;
+    }
+
+    auto* scene = viewer->fGraphicsView ? viewer->fGraphicsView->scene() : nullptr;
+    if (!scene) {
+        viewer->clearOverlayGroup(overlayKey);
+        return;
+    }
+
+    std::vector<QGraphicsItem*> items;
+    items.reserve(primitives.size());
+
+    auto addItem = [&](QGraphicsItem* item, const OverlayStyle& style) {
+        if (!item) {
+            return;
+        }
+        applyStyle(item, style);
+        scene->addItem(item);
+        items.push_back(item);
+    };
+
+    for (const auto& primitive : primitives) {
+        std::visit(
+            [&](const auto& prim) {
+                using T = std::decay_t<decltype(prim)>;
+                if constexpr (std::is_same_v<T, PointPrimitive>) {
+                    auto* item = new QGraphicsEllipseItem(
+                        prim.position.x() - prim.radius,
+                        prim.position.y() - prim.radius,
+                        prim.radius * 2.0,
+                        prim.radius * 2.0);
+                    addItem(item, prim.style);
+                } else if constexpr (std::is_same_v<T, CirclePrimitive>) {
+                    auto* item = new QGraphicsEllipseItem(
+                        prim.center.x() - prim.radius,
+                        prim.center.y() - prim.radius,
+                        prim.radius * 2.0,
+                        prim.radius * 2.0);
+                    auto style = prim.style;
+                    if (!prim.filled) {
+                        style.brushColor = Qt::transparent;
+                    }
+                    addItem(item, style);
+                } else if constexpr (std::is_same_v<T, LineStripPrimitive>) {
+                    if (prim.points.size() < 2) {
+                        return;
+                    }
+                    QPainterPath path(prim.points.front());
+                    for (size_t i = 1; i < prim.points.size(); ++i) {
+                        path.lineTo(prim.points[i]);
+                    }
+                    if (prim.closed) {
+                        path.closeSubpath();
+                    }
+                    auto* item = new QGraphicsPathItem(path);
+                    addItem(item, prim.style);
+                } else if constexpr (std::is_same_v<T, RectPrimitive>) {
+                    auto* item = new QGraphicsRectItem(prim.rect);
+                    auto style = prim.style;
+                    if (!prim.filled) {
+                        style.brushColor = Qt::transparent;
+                    }
+                    addItem(item, style);
+                } else if constexpr (std::is_same_v<T, TextPrimitive>) {
+                    auto* item = new QGraphicsSimpleTextItem(prim.text);
+                    item->setFont(prim.font);
+                    item->setPos(prim.position);
+                    addItem(item, prim.style);
+                } else if constexpr (std::is_same_v<T, PathPrimitive>) {
+                    if (prim.points.empty()) {
+                        return;
+                    }
+
+                    std::vector<QPointF> scenePoints;
+                    scenePoints.reserve(prim.points.size());
+                    for (const auto& p : prim.points) {
+                        scenePoints.emplace_back(viewer->volumePointToScene(p));
+                    }
+
+                    OverlayStyle style;
+                    style.penColor = prim.color;
+                    style.penColor.setAlphaF(std::clamp(prim.opacity, 0.0, 1.0));
+                    style.brushColor = Qt::transparent;
+                    style.penWidth = prim.lineWidth;
+                    style.penCap = prim.brushShape == PathBrushShape::Square ? Qt::SquareCap : Qt::RoundCap;
+                    style.penJoin = prim.brushShape == PathBrushShape::Square ? Qt::MiterJoin : Qt::RoundJoin;
+                    style.z = prim.z;
+
+                    if (prim.isEraser) {
+                        style.penColor = QColor(255, 50, 50);
+                        style.penColor.setAlphaF(std::clamp(prim.opacity, 0.0, 1.0));
+                        style.penStyle = Qt::DashLine;
+                        style.dashPattern = {4.0, 4.0};
+                    }
+
+                    if (prim.renderMode == PathRenderMode::LineStrip) {
+                        if (scenePoints.size() < 2) {
+                            return;
+                        }
+                        QPainterPath path(scenePoints.front());
+                        for (size_t i = 1; i < scenePoints.size(); ++i) {
+                            path.lineTo(scenePoints[i]);
+                        }
+                        if (prim.closed) {
+                            path.closeSubpath();
+                        }
+                        auto* item = new QGraphicsPathItem(path);
+                        addItem(item, style);
+                    } else {
+                        QPainterPath path;
+                        for (const auto& pt : scenePoints) {
+                            if (prim.brushShape == PathBrushShape::Square) {
+                                path.addRect(pt.x() - prim.pointRadius,
+                                             pt.y() - prim.pointRadius,
+                                             prim.pointRadius * 2.0,
+                                             prim.pointRadius * 2.0);
+                            } else {
+                                path.addEllipse(pt, prim.pointRadius, prim.pointRadius);
+                            }
+                        }
+
+                        style.brushColor = prim.color;
+                        style.brushColor.setAlphaF(std::clamp(prim.opacity, 0.0, 1.0));
+                        auto* item = new QGraphicsPathItem(path);
+                        addItem(item, style);
+                    }
+                } else if constexpr (std::is_same_v<T, ArrowPrimitive>) {
+                    QPainterPath path;
+                    path.moveTo(prim.start);
+                    path.lineTo(prim.end);
+
+                    QPointF dir = prim.end - prim.start;
+                    double mag = std::hypot(dir.x(), dir.y());
+                    if (mag < 1e-5) {
+                        return;
+                    }
+                    dir.setX(dir.x() / mag);
+                    dir.setY(dir.y() / mag);
+                    QPointF perp(-dir.y(), dir.x());
+                    QPointF tip = prim.end;
+                    QPointF base = tip - dir * prim.headLength;
+                    QPointF left = base + perp * prim.headWidth;
+                    QPointF right = base - perp * prim.headWidth;
+                    path.moveTo(tip);
+                    path.lineTo(left);
+                    path.moveTo(tip);
+                    path.lineTo(right);
+
+                    auto* item = new QGraphicsPathItem(path);
+                    addItem(item, prim.style);
+                }
+            },
+            primitive);
+    }
+
+    if (items.empty()) {
+        viewer->clearOverlayGroup(overlayKey);
+        return;
+    }
+
+    viewer->setOverlayGroup(overlayKey, items);
+}
+
 void ViewerOverlayControllerBase::rebuildOverlay(CVolumeViewer* viewer)
 {
     if (!viewer) {
@@ -286,75 +660,7 @@ void ViewerOverlayControllerBase::rebuildOverlay(CVolumeViewer* viewer)
     OverlayBuilder builder(viewer);
     collectPrimitives(viewer, builder);
     auto primitives = builder.takePrimitives();
-    if (primitives.empty()) {
-        viewer->clearOverlayGroup(_overlayGroupKey);
-        return;
-    }
-
-    auto* scene = viewer->fGraphicsView ? viewer->fGraphicsView->scene() : nullptr;
-    if (!scene) {
-        viewer->clearOverlayGroup(_overlayGroupKey);
-        return;
-    }
-
-    std::vector<QGraphicsItem*> items;
-    items.reserve(primitives.size());
-
-    for (const auto& primitive : primitives) {
-        std::visit(
-            [&](const auto& prim) {
-                using T = std::decay_t<decltype(prim)>;
-                if constexpr (std::is_same_v<T, PointPrimitive>) {
-                    auto* item = new QGraphicsEllipseItem(
-                        prim.position.x() - prim.radius,
-                        prim.position.y() - prim.radius,
-                        prim.radius * 2.0,
-                        prim.radius * 2.0);
-                    applyStyle(item, prim.style);
-                    scene->addItem(item);
-                    items.push_back(item);
-                } else if constexpr (std::is_same_v<T, LineStripPrimitive>) {
-                    if (prim.points.size() < 2) {
-                        return;
-                    }
-                    QPainterPath path(prim.points.front());
-                    for (size_t i = 1; i < prim.points.size(); ++i) {
-                        path.lineTo(prim.points[i]);
-                    }
-                    if (prim.closed) {
-                        path.closeSubpath();
-                    }
-                    auto* item = new QGraphicsPathItem(path);
-                    applyStyle(item, prim.style);
-                    scene->addItem(item);
-                    items.push_back(item);
-                } else if constexpr (std::is_same_v<T, RectPrimitive>) {
-                    auto* item = new QGraphicsRectItem(prim.rect);
-                    auto style = prim.style;
-                    if (!prim.filled) {
-                        style.brushColor = Qt::transparent;
-                    }
-                    applyStyle(item, style);
-                    scene->addItem(item);
-                    items.push_back(item);
-                } else if constexpr (std::is_same_v<T, TextPrimitive>) {
-                    auto* item = new QGraphicsSimpleTextItem(prim.text);
-                    item->setFont(prim.font);
-                    item->setPos(prim.position);
-                    applyStyle(item, prim.style);
-                    scene->addItem(item);
-                    items.push_back(item);
-                }
-            },
-            primitive);
-    }
-
-    if (items.empty()) {
-        viewer->clearOverlayGroup(_overlayGroupKey);
-        return;
-    }
-
-    viewer->setOverlayGroup(_overlayGroupKey, items);
+    applyPrimitives(viewer, _overlayGroupKey, std::move(primitives));
 }
 
 void ViewerOverlayControllerBase::detachAllViewers()

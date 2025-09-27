@@ -21,6 +21,9 @@
 #include "SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
+#include "overlays/PathsOverlayController.hpp"
+#include "overlays/BBoxOverlayController.hpp"
+#include "overlays/VectorOverlayController.hpp"
 #include "ViewerManager.hpp"
 #include "SegmentationWidget.hpp"
 #include "OpChain.hpp"
@@ -197,6 +200,9 @@ private:
     std::unique_ptr<SegmentationEditManager> _segmentationEdit;
     std::unique_ptr<SegmentationOverlayController> _segmentationOverlay;
     std::unique_ptr<PointsOverlayController> _pointsOverlay;
+    std::unique_ptr<PathsOverlayController> _pathsOverlay;
+    std::unique_ptr<BBoxOverlayController> _bboxOverlay;
+    std::unique_ptr<VectorOverlayController> _vectorOverlay;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<MenuActionController> _menuController;

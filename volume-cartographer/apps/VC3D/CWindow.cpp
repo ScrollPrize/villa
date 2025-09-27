@@ -68,6 +68,7 @@
 
 
 using qga = QGuiApplication;
+using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 
 
 // Constructor
@@ -103,6 +104,15 @@ CWindow::CWindow() :
 
     _pointsOverlay = std::make_unique<PointsOverlayController>(_point_collection, this);
     _viewerManager->setPointsOverlay(_pointsOverlay.get());
+
+    _pathsOverlay = std::make_unique<PathsOverlayController>(this);
+    _viewerManager->setPathsOverlay(_pathsOverlay.get());
+
+    _bboxOverlay = std::make_unique<BBoxOverlayController>(this);
+    _viewerManager->setBBoxOverlay(_bboxOverlay.get());
+
+    _vectorOverlay = std::make_unique<VectorOverlayController>(_surf_col, this);
+    _viewerManager->setVectorOverlay(_vectorOverlay.get());
 
     // create UI widgets
     CreateWidgets();
@@ -295,7 +305,7 @@ void CWindow::configureViewerConnections(CVolumeViewer* viewer)
             this, [this, viewer](bool active) {
                 viewer->onDrawingModeActive(active,
                     _drawingWidget->getBrushSize(),
-                    _drawingWidget->getBrushShape() == PathData::BrushShape::SQUARE);
+                    _drawingWidget->getBrushShape() == PathBrushShape::Square);
             });
         viewer->setProperty("vc_drawing_bound", true);
     }

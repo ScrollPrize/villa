@@ -29,6 +29,12 @@ set(srcs
     overlays/SegmentationOverlayController.hpp
     overlays/PointsOverlayController.cpp
     overlays/PointsOverlayController.hpp
+    overlays/BBoxOverlayController.cpp
+    overlays/BBoxOverlayController.hpp
+    overlays/PathsOverlayController.cpp
+    overlays/PathsOverlayController.hpp
+    overlays/VectorOverlayController.cpp
+    overlays/VectorOverlayController.hpp
     overlays/ViewerOverlayControllerBase.cpp
     overlays/ViewerOverlayControllerBase.hpp
     SurfacePanelController.cpp
@@ -39,8 +45,6 @@ set(srcs
     SegmentationModule.hpp
     ViewerManager.cpp
     ViewerManager.hpp
-    PathData.cpp
-    PathData.hpp
     CSegmentationEditorWindow.cpp
     CSegmentationEditorWindow.hpp
     SegmentRenderThread.cpp

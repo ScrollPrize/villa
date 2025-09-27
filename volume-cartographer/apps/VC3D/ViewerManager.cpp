@@ -3,6 +3,9 @@
 #include "CVolumeViewer.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
+#include "overlays/PathsOverlayController.hpp"
+#include "overlays/BBoxOverlayController.hpp"
+#include "overlays/VectorOverlayController.hpp"
 #include "SegmentationModule.hpp"
 #include "CSurfaceCollection.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -69,6 +72,18 @@ CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
         _pointsOverlay->attachViewer(viewer);
     }
 
+    if (_pathsOverlay) {
+        _pathsOverlay->attachViewer(viewer);
+    }
+
+    if (_bboxOverlay) {
+        _bboxOverlay->attachViewer(viewer);
+    }
+
+    if (_vectorOverlay) {
+        _vectorOverlay->attachViewer(viewer);
+    }
+
     _viewers.push_back(viewer);
     if (_segmentationModule) {
         _segmentationModule->attachViewer(viewer);
@@ -119,6 +134,33 @@ void ViewerManager::setPointsOverlay(PointsOverlayController* overlay)
         return;
     }
     _pointsOverlay->bindToViewerManager(this);
+}
+
+void ViewerManager::setPathsOverlay(PathsOverlayController* overlay)
+{
+    _pathsOverlay = overlay;
+    if (!_pathsOverlay) {
+        return;
+    }
+    _pathsOverlay->bindToViewerManager(this);
+}
+
+void ViewerManager::setBBoxOverlay(BBoxOverlayController* overlay)
+{
+    _bboxOverlay = overlay;
+    if (!_bboxOverlay) {
+        return;
+    }
+    _bboxOverlay->bindToViewerManager(this);
+}
+
+void ViewerManager::setVectorOverlay(VectorOverlayController* overlay)
+{
+    _vectorOverlay = overlay;
+    if (!_vectorOverlay) {
+        return;
+    }
+    _vectorOverlay->bindToViewerManager(this);
 }
 
 bool ViewerManager::resetDefaultFor(CVolumeViewer* viewer) const
