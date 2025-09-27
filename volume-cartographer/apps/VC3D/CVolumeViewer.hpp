@@ -50,6 +50,11 @@ public:
     void setCompositeReverseDirection(bool reverse);
     void setResetViewOnSurfaceChange(bool reset);
     bool isCompositeEnabled() const { return _composite_enabled; }
+    VCCollection* pointCollection() const { return _point_collection; }
+    uint64_t highlightedPointId() const { return _highlighted_point_id; }
+    uint64_t selectedPointId() const { return _selected_point_id; }
+    uint64_t selectedCollectionId() const { return _selected_collection_id; }
+    bool isPointDragActive() const { return _dragged_point_id != 0; }
 
     // Direction hints toggle
     void setShowDirectionHints(bool on) { _showDirectionHints = on; updateAllOverlays(); }
@@ -94,7 +99,6 @@ public slots:
     void onPanRelease(Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onPanStart(Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onCollectionSelected(uint64_t collectionId);
-    void onCollectionChanged(uint64_t collectionId);
     void onSurfaceChanged(std::string name, Surface *surf);
     void onPOIChanged(std::string name, POI *poi);
     void onIntersectionChanged(std::string a, std::string b, Intersection *intersection);
@@ -102,9 +106,6 @@ public slots:
     void onResized();
     void onZoom(int steps, QPointF scene_point, Qt::KeyboardModifiers modifiers);
     void onCursorMove(QPointF);
-    void onPointAdded(const ColPoint& point);
-    void onPointChanged(const ColPoint& point);
-    void onPointRemoved(uint64_t pointId);
     void onPathsChanged(const QList<PathData>& paths);
     void onPointSelected(uint64_t pointId);
 
@@ -138,9 +139,6 @@ protected:
     void ScaleImage(double nFactor);
     void CenterOn(const QPointF& point);
     QPointF volumeToScene(const cv::Vec3f& vol_point);
-    void refreshPointPositions();
-    void renderOrUpdatePoint(const ColPoint& point);
-
     void performDeferredUpdates();
 
 protected:
@@ -199,11 +197,6 @@ protected:
     CSurfaceCollection *_surf_col = nullptr;
     
     VCCollection* _point_collection = nullptr;
-    struct PointGraphics {
-        QGraphicsEllipseItem* circle;
-        COutlinedTextItem* text;
-    };
-    std::unordered_map<uint64_t, PointGraphics> _points_items;
     
     // Point interaction state
     uint64_t _highlighted_point_id = 0;

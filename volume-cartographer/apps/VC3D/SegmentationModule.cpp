@@ -4,7 +4,7 @@
 #include "CVolumeViewerView.hpp"
 #include "CSurfaceCollection.hpp"
 #include "SegmentationEditManager.hpp"
-#include "SegmentationOverlayController.hpp"
+#include "overlays/SegmentationOverlayController.hpp"
 #include "SegmentationWidget.hpp"
 #include "ViewerManager.hpp"
 

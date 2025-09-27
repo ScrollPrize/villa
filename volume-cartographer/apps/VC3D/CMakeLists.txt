@@ -25,10 +25,16 @@ set(srcs
     SegmentationWidget.hpp
     SegmentationEditManager.cpp
     SegmentationEditManager.hpp
-    SegmentationOverlayController.cpp
-    SegmentationOverlayController.hpp
+    overlays/SegmentationOverlayController.cpp
+    overlays/SegmentationOverlayController.hpp
+    overlays/PointsOverlayController.cpp
+    overlays/PointsOverlayController.hpp
+    overlays/ViewerOverlayControllerBase.cpp
+    overlays/ViewerOverlayControllerBase.hpp
     SurfacePanelController.cpp
     SurfacePanelController.hpp
+    MenuActionController.cpp
+    MenuActionController.hpp
     SegmentationModule.cpp
     SegmentationModule.hpp
     ViewerManager.cpp

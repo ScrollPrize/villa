@@ -293,24 +293,21 @@ void CVolumeViewer::onCursorMove(QPointF scene_loc)
         const float highlight_dist_threshold = 10.0f;
         float min_dist_sq = highlight_dist_threshold * highlight_dist_threshold;
 
-        for (const auto& item_pair : _points_items) {
-            auto item = item_pair.second.circle;
-            QPointF point_scene_pos = item->rect().center();
-            QPointF diff = scene_loc - point_scene_pos;
-            float dist_sq = QPointF::dotProduct(diff, diff);
-            if (dist_sq < min_dist_sq) {
-                min_dist_sq = dist_sq;
-                _highlighted_point_id = item_pair.first;
+        const auto& collections = _point_collection->getAllCollections();
+        for (const auto& col_pair : collections) {
+            for (const auto& point_pair : col_pair.second.points) {
+                QPointF point_scene_pos = volumeToScene(point_pair.second.p);
+                QPointF diff = scene_loc - point_scene_pos;
+                float dist_sq = QPointF::dotProduct(diff, diff);
+                if (dist_sq < min_dist_sq) {
+                    min_dist_sq = dist_sq;
+                    _highlighted_point_id = point_pair.second.id;
+                }
             }
         }
 
         if (old_highlighted_id != _highlighted_point_id) {
-            if (auto old_point = _point_collection->getPoint(old_highlighted_id)) {
-                renderOrUpdatePoint(*old_point);
-            }
-            if (auto new_point = _point_collection->getPoint(_highlighted_point_id)) {
-                renderOrUpdatePoint(*new_point);
-            }
+            emit overlaysUpdated();
         }
     }
 }
@@ -498,13 +495,8 @@ void CVolumeViewer::setCache(ChunkCache *cache_)
 
 void CVolumeViewer::setPointCollection(VCCollection* point_collection)
 {
-    if (_point_collection) {
-        disconnect(_point_collection, &VCCollection::collectionChanged, this, &CVolumeViewer::onCollectionChanged);
-    }
     _point_collection = point_collection;
-    if (_point_collection) {
-        connect(_point_collection, &VCCollection::collectionChanged, this, &CVolumeViewer::onCollectionChanged);
-    }
+    emit overlaysUpdated();
 }
 
 void CVolumeViewer::setSurface(const std::string &name)
@@ -650,7 +642,6 @@ void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf)
             fScene->clear();
             _intersect_items.clear();
             slice_vis_items.clear();
-            _points_items.clear();
             _path_items.clear();
             _paths.clear();
             // Scene items are already deleted by fScene->clear(); just drop overlay references
@@ -759,7 +750,7 @@ void CVolumeViewer::onPOIChanged(std::string name, POI *poi)
                 return;
             
             plane->setOrigin(poi->p);
-            refreshPointPositions();
+            emit overlaysUpdated();
             
             _surf_col->setSurface(_surf_name, plane);
         } else if (auto* quad = dynamic_cast<QuadSurface*>(_surf)) {
@@ -1444,110 +1435,6 @@ void CVolumeViewer::renderPaths()
     }
 }
 
-void CVolumeViewer::renderOrUpdatePoint(const ColPoint& point)
-{
-    if (!_surf) return;
-
-    float opacity = 1.0f;
-    float z_dist = -1.0f;
-
-    if (auto* plane = dynamic_cast<PlaneSurface*>(_surf)) {
-        z_dist = std::abs(plane->pointDist(point.p));
-    } else if (auto* quad = dynamic_cast<QuadSurface*>(_surf)) {
-        auto ptr = quad->pointer();
-        z_dist = quad->pointTo(ptr, point.p, 10.0, 100);
-    }
-
-    if (z_dist >= 0) {
-        const float fade_threshold = 10.0f; // Fade over N units
-        if (z_dist < fade_threshold) {
-            opacity = 1.0f - (z_dist / fade_threshold);
-        } else {
-            opacity = 0.0f;
-        }
-    }
-
-    QPointF scene_pos = volumeToScene(point.p);
-    float radius = 5.0f; // pixels
-    
-    const auto& collections = _point_collection->getAllCollections();
-    auto col_it = collections.find(point.collectionId);
-    cv::Vec3f cv_color = (col_it != collections.end()) ? col_it->second.color : cv::Vec3f(1,0,0);
-    QColor color(cv_color[0] * 255, cv_color[1] * 255, cv_color[2] * 255, 255);
-
-    QColor border_color(255, 255, 255, 200);
-    float border_width = 1.5f;
-
-    if (point.id == _highlighted_point_id) {
-        radius = 7.0f;
-        border_color = Qt::yellow;
-        border_width = 2.5f;
-    }
- 
-    if (point.id == _selected_point_id) {
-        border_color = QColor(255, 0, 255, 255); // Bright magenta for selection
-        border_width = 2.5f;
-        radius = 7.0f;
-    }
-
-    PointGraphics pg;
-    bool exists = _points_items.count(point.id);
-    if (exists) {
-        pg = _points_items[point.id];
-    }
-
-    // Update circle
-    if (exists) {
-        pg.circle->setRect(scene_pos.x() - radius, scene_pos.y() - radius, radius * 2, radius * 2);
-        pg.circle->setPen(QPen(border_color, border_width));
-        pg.circle->setBrush(QBrush(color));
-    } else {
-        pg.circle = fScene->addEllipse(
-            scene_pos.x() - radius, scene_pos.y() - radius, radius * 2, radius * 2,
-            QPen(border_color, border_width), QBrush(color)
-        );
-        pg.circle->setZValue(10);
-    }
-    pg.circle->setOpacity(opacity);
-
-    // Update or create text
-    bool has_winding = !std::isnan(point.winding_annotation);
-    if (exists) {
-        pg.text->setPos(scene_pos.x() + radius, scene_pos.y() - radius);
-        pg.text->setVisible(has_winding);
-    } else {
-        pg.text = new COutlinedTextItem();
-        fScene->addItem(pg.text);
-        pg.text->setZValue(11); // Above points
-        pg.text->setDefaultTextColor(Qt::white);
-        pg.text->setPos(scene_pos.x() + radius, scene_pos.y() - radius);
-        pg.text->setVisible(has_winding);
-    }
-    pg.text->setOpacity(opacity);
-    
-    if (has_winding) {
-        bool absolute = col_it != collections.end() ? col_it->second.metadata.absolute_winding_number : false;
-        
-        // Adaptive decimal formatting
-        QString num_text = QString::number(point.winding_annotation, 'g');
-
-        if (!absolute) {
-            if (point.winding_annotation >= 0) {
-                num_text.prepend("+");
-            }
-        }
-        
-        pg.text->setPlainText(num_text);
-
-        // Fixed positioning
-        pg.text->setPos(scene_pos.x() + radius, scene_pos.y() - radius);
-    }
-
-    if (!exists) {
-        _points_items[point.id] = pg;
-    }
-}
-
 void CVolumeViewer::onPathsChanged(const QList<PathData>& paths)
 {
     _paths = paths;
@@ -1941,7 +1828,6 @@ void CVolumeViewer::onVolumeClosing()
         // Clear all item collections
         _intersect_items.clear();
         slice_vis_items.clear();
-        _points_items.clear();
         _path_items.clear();
         _paths.clear();
         _cursor = nullptr;
@@ -1975,61 +1861,10 @@ void CVolumeViewer::onDrawingModeActive(bool active, float brushSize, bool isSqu
     }
 }
 
-void CVolumeViewer::refreshPointPositions()
-{
-    if (!_point_collection) {
-        return;
-    }
-
-    for (const auto& col_pair : _point_collection->getAllCollections()) {
-        for (const auto& point_pair : col_pair.second.points) {
-            if (_points_items.count(point_pair.first)) {
-                renderOrUpdatePoint(point_pair.second);
-            }
-        }
-    }
-}
-void CVolumeViewer::onPointAdded(const ColPoint& point)
-{
-    renderOrUpdatePoint(point);
-}
-
-void CVolumeViewer::onPointChanged(const ColPoint& point)
-{
-    renderOrUpdatePoint(point);
-}
-
-void CVolumeViewer::onPointRemoved(uint64_t pointId)
-{
-    if (_points_items.count(pointId)) {
-        auto& pg = _points_items[pointId];
-        fScene->removeItem(pg.circle);
-        fScene->removeItem(pg.text);
-        delete pg.circle;
-        delete pg.text;
-        _points_items.erase(pointId);
-    }
-}
-
 void CVolumeViewer::onCollectionSelected(uint64_t collectionId)
 {
     _selected_collection_id = collectionId;
-}
-
-void CVolumeViewer::onCollectionChanged(uint64_t collectionId)
-{
-    if (!_point_collection) {
-        return;
-    }
-
-    const auto& collections = _point_collection->getAllCollections();
-    auto it = collections.find(collectionId);
-    if (it != collections.end()) {
-        const auto& collection = it->second;
-        for (const auto& point_pair : collection.points) {
-            renderOrUpdatePoint(point_pair.second);
-        }
-    }
+    emit overlaysUpdated();
 }
 
 void CVolumeViewer::onKeyRelease(int key, Qt::KeyboardModifiers modifiers)
@@ -2048,12 +1883,7 @@ void CVolumeViewer::onPointSelected(uint64_t pointId)
     uint64_t old_selected_id = _selected_point_id;
     _selected_point_id = pointId;
 
-    if (auto old_point = _point_collection->getPoint(old_selected_id)) {
-        renderOrUpdatePoint(*old_point);
-    }
-    if (auto new_point = _point_collection->getPoint(_selected_point_id)) {
-        renderOrUpdatePoint(*new_point);
-    }
+    emit overlaysUpdated();
 }
 
 void CVolumeViewer::setResetViewOnSurfaceChange(bool reset)
@@ -2095,25 +1925,19 @@ void CVolumeViewer::updateAllOverlays()
         const float highlight_dist_threshold = 10.0f;
         float min_dist_sq = highlight_dist_threshold * highlight_dist_threshold;
 
-        for (const auto& item_pair : _points_items) {
-            auto item = item_pair.second.circle;
-            QPointF point_scene_pos = item->rect().center();
-            QPointF diff = scenePos - point_scene_pos;
-            float dist_sq = QPointF::dotProduct(diff, diff);
-            if (dist_sq < min_dist_sq) {
-                min_dist_sq = dist_sq;
-                _highlighted_point_id = item_pair.first;
+        const auto& collections = _point_collection->getAllCollections();
+        for (const auto& col_pair : collections) {
+            for (const auto& point_pair : col_pair.second.points) {
+                QPointF point_scene_pos = volumeToScene(point_pair.second.p);
+                QPointF diff = scenePos - point_scene_pos;
+                float dist_sq = QPointF::dotProduct(diff, diff);
+                if (dist_sq < min_dist_sq) {
+                    min_dist_sq = dist_sq;
+                    _highlighted_point_id = point_pair.second.id;
+                }
             }
         }
 
-        if (old_highlighted_id != _highlighted_point_id) {
-            if (auto old_point = _point_collection->getPoint(old_highlighted_id)) {
-                renderOrUpdatePoint(*old_point);
-            }
-            if (auto new_point = _point_collection->getPoint(_highlighted_point_id)) {
-                renderOrUpdatePoint(*new_point);
-            }
-        }
     }
 
     invalidateVis();
@@ -2122,7 +1946,6 @@ void CVolumeViewer::updateAllOverlays()
     renderDirectionHints();
    renderDirectionStepMarkers();
     renderPaths();
-    refreshPointPositions();
 
     emit overlaysUpdated();
 }
