@@ -65,6 +65,7 @@ def train(config_path):
 
     accelerator = accelerate.Accelerator(
         mixed_precision=config['mixed_precision'],
+        gradient_accumulation_steps=config['grad_acc_steps'] if 'grad_acc_steps' in config else 1,
     )
 
     if 'wandb_project' in config and accelerator.is_main_process:
