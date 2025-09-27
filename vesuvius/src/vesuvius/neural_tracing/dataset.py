@@ -291,9 +291,13 @@ class HeatmapDataset(torch.utils.data.IterableDataset):
             u_neg_shifted_zyxs = get_zyx_from_patch(u_neg_shifted_ijs, patch)
             v_pos_shifted_zyxs = get_zyx_from_patch(v_pos_shifted_ijs, patch)
             v_neg_shifted_zyxs = get_zyx_from_patch(v_neg_shifted_ijs, patch)
-            u_heatmaps = make_heatmaps(u_pos_shifted_zyxs, u_neg_shifted_zyxs, min_corner_zyx, crop_size)
-            v_heatmaps = make_heatmaps(v_pos_shifted_zyxs, v_neg_shifted_zyxs, min_corner_zyx, crop_size)
-            uv_heatmaps = torch.cat([u_heatmaps, v_heatmaps], dim=0)
+
+            if False:  # separate heatmaps for u & v
+                u_heatmaps = make_heatmaps([u_pos_shifted_zyxs, u_neg_shifted_zyxs], min_corner_zyx, crop_size)
+                v_heatmaps = make_heatmaps([v_pos_shifted_zyxs, v_neg_shifted_zyxs], min_corner_zyx, crop_size)
+                uv_heatmaps = torch.cat([u_heatmaps, v_heatmaps], dim=0)
+            else:  # merged u & v
+                uv_heatmaps = make_heatmaps([u_pos_shifted_zyxs, u_neg_shifted_zyxs, v_pos_shifted_zyxs, v_neg_shifted_zyxs], min_corner_zyx, crop_size)
 
             # Build localiser volume
             localiser = torch.linalg.norm(torch.stack(torch.meshgrid(*[torch.arange(crop_size)] * 3, indexing='ij'), dim=-1).to(torch.float32) - crop_size // 2, dim=-1)
@@ -315,7 +319,7 @@ class HeatmapDataset(torch.utils.data.IterableDataset):
             volume_crop = augmented['image'].squeeze(0)
             localiser = augmented['dist_map'].squeeze(0)
             uv_heatmaps = rearrange(augmented['regression_target'], 'c z y x -> z y x c')
-            if torch.any(torch.isnan(volume_crop)) or torch.any(torch.isnan(localiser)) or torch.any(torch.isnan(u_heatmaps)) or torch.any(torch.isnan(v_heatmaps)):
+            if torch.any(torch.isnan(volume_crop)) or torch.any(torch.isnan(localiser)) or torch.any(torch.isnan(uv_heatmaps)):
                 # FIXME: why do these NaNs happen occasionally?
                 continue
 
@@ -427,10 +431,11 @@ coords = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
 z_coords, y_coords, x_coords = torch.meshgrid(coords, coords, coords, indexing='ij')
 kernel = torch.exp(-(z_coords**2 + y_coords**2 + x_coords**2) / (2 * sigma**2))
 
-def make_heatmaps(pos_zyxs, neg_zyxs, min_corner_zyx, crop_size):
+def make_heatmaps(all_zyxs, min_corner_zyx, crop_size):
 
-    assert pos_zyxs.shape[0] == neg_zyxs.shape[0]
-    heatmaps = torch.zeros([crop_size, crop_size, crop_size, pos_zyxs.shape[0]])
+    # zyxs is a list of different 'kinds' of points (positive / negative, U/V); each entry is a list zyxs at different steps
+    assert all(zyxs.shape[0] == all_zyxs[0].shape[0] for zyxs in all_zyxs)
+    heatmaps = torch.zeros([crop_size, crop_size, crop_size, all_zyxs[0].shape[0]])
     def scatter(zyxs):
         coords = torch.cat([
             (zyxs - min_corner_zyx + 0.5).int(),
@@ -439,8 +444,8 @@ def make_heatmaps(pos_zyxs, neg_zyxs, min_corner_zyx, crop_size):
         # FIXME: the following shouldn't be needed
         coords = coords[(coords[..., :3] >= 0).all(dim=1) & (coords[..., :3] < crop_size).all(dim=1)]
         heatmaps[*coords.T] = 1.
-    scatter(pos_zyxs)
-    scatter(neg_zyxs)
+    for zyxs in all_zyxs:
+        scatter(zyxs)
 
     convolved = fft_conv(
         rearrange(heatmaps, 'z y x c -> c 1 z y x'),
@@ -493,7 +498,7 @@ def load_datasets(config):
     return all_patches
 
 
-def load_tifxyz_patches(segments_path, z_range,volume):
+def load_tifxyz_patches(segments_path, z_range, volume):
 
     segment_paths = glob.glob(segments_path + "/*")
     segment_paths = sorted([path for path in segment_paths if os.path.isdir(path)])

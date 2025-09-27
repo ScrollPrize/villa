@@ -77,11 +77,11 @@ def train(config_path):
         dataset = PatchInCubeDataset(config)
     train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config['batch_size'], num_workers=config['num_workers'])
 
-    # model = Vesuvius3dUnetModel(in_channels=18, out_channels=16, config=config)
+    # model = Vesuvius3dUnetModel(in_channels=8, out_channels=6, config=config)
     model = SongUnet3dModel(
         img_resolution=config['crop_size'],
-        in_channels=18,
-        out_channels=16,
+        in_channels=8,
+        out_channels=6,
         model_channels=32,
         channel_mult=[1, 2, 4, 8],
         num_blocks=2,  # 4
@@ -142,23 +142,48 @@ def train(config_path):
             with torch.no_grad():
                 model.eval()
 
-                def squish(x):
-                    return torch.stack([x[:, :8].amax(dim=1), x[:, 8:16].amax(dim=1), torch.zeros_like(x[:, 0])], dim=1)
-                canvas = torch.stack([
-                    inputs[:, :1].expand(-1, 3, -1, -1, -1),
-                    squish(inputs[:, 2:]),
-                    squish(target_pred),
-                    squish(targets),
-                ], dim=-1)
-                canvas_mask = torch.stack([torch.ones_like(mask), mask, torch.ones_like(mask), mask], dim=-1)
-                canvas = (canvas * 0.5 + 0.5).clip(0, 1) * canvas_mask
-                canvas = rearrange(canvas[:, :, canvas.shape[2] // 2], 'b uvw y x v -> (b y) (v x) uvw')
+                if False:
+                    def squish(x):
+                        return torch.stack([x[:, :8].amax(dim=1), x[:, 8:16].amax(dim=1), torch.zeros_like(x[:, 0])], dim=1)
+                    canvas = torch.stack([
+                        inputs[:, :1].expand(-1, 3, -1, -1, -1),
+                        squish(inputs[:, 2:]),
+                        squish(target_pred),
+                        squish(targets),
+                    ], dim=-1)
+                    canvas_mask = torch.stack([torch.ones_like(mask), mask, torch.ones_like(mask), mask], dim=-1)
+                    canvas = (canvas * 0.5 + 0.5).clip(0, 1) * canvas_mask
+                    canvas = rearrange(canvas[:, :, canvas.shape[2] // 2], 'b uvw y x v -> (b y) (v x) uvw')
+                else:
+                    colours_by_step = torch.rand([targets.shape[1], 3], device=inputs.device) * 0.8 + 0.2
+                    def overlay_crosshair(x):
+                        x = x.clone()
+                        red = torch.tensor([0.8, 0, 0], device=x.device)
+                        x[:, x.shape[1] // 2 - 7 : x.shape[1] // 2 - 1, x.shape[2] // 2, :] = red
+                        x[:, x.shape[1] // 2 + 2 : x.shape[1] // 2 + 8, x.shape[2] // 2, :] = red
+                        x[:, x.shape[1] // 2, x.shape[2] // 2 - 7 : x.shape[2] // 2 - 1, :] = red
+                        x[:, x.shape[1] // 2, x.shape[2] // 2 + 2 : x.shape[2] // 2 + 8, :] = red
+                        return x
+                    def inputs_slice(dim):
+                        return overlay_crosshair(inputs[:, 0].select(dim=dim + 1, index=inputs.shape[(dim + 1)] // 2)[..., None].expand(-1, -1, -1, 3) * 0.5 + 0.5)
+                    def projections(x):
+                        coloured = x[..., None] * colours_by_step[None, :, None, None, None, :]
+                        return torch.cat([coloured.amax(dim=(1, dim + 2)) for dim in range(3)], dim=1)
+
+                    canvas = torch.stack([
+                        torch.cat([inputs_slice(dim) for dim in range(3)], dim=1),
+                        projections(inputs[:, 2:]),
+                        projections(F.sigmoid(target_pred)),
+                        projections(targets),
+                    ], dim=-1)
+                    canvas = rearrange(canvas.clip(0, 1), 'b y x rgb v -> (b y) (v x) rgb')
+
                 plt.imsave(f'{out_dir}/{iteration:06}_denoised.png', canvas.cpu())
 
-                eval_num_samples = 4
-                assert targets.shape[0] == 1  # since the argmin needs to be per-iib otherwise, and we need either a loop or a separate dimensions for sample vs batch
-                gt_heatmaps = rearrange(batch['uv_heatmaps'], 'b z y x c -> b c z y x')
                 if config['generative']:
+                    eval_num_samples = 4
+                    assert targets.shape[0] == 1  # since the argmin needs to be per-iib otherwise, and we need either a loop or a separate dimensions for sample vs batch
+                    gt_heatmaps = rearrange(batch['uv_heatmaps'], 'b z y x c -> b c z y x')
                     sample_heatmaps = sample_ddim(
                         model,
                         torch.tile(inputs[:, :2], (eval_num_samples, 1, 1, 1, 1)),
@@ -168,13 +193,11 @@ def train(config_path):
                         cfg_scale=config['cfg_scale']
                     )
                     sample_heatmaps = sample_heatmaps[torch.argmin((sample_heatmaps - gt_heatmaps).abs().mean(dim=(1, 2, 3, 4)))]
-                else:
-                    sample_heatmaps = target_pred.squeeze(0)
-                canvas = torch.stack([inputs[:, :1].expand(-1, 3, -1, -1, -1), squish(sample_heatmaps[None]), squish(gt_heatmaps)], dim=-1)
-                canvas_mask = torch.stack([torch.ones_like(mask), torch.ones_like(mask), mask], dim=-1)
-                canvas = (canvas * 0.5 + 0.5).clip(0, 1) * canvas_mask
-                canvas = rearrange(canvas[:, :, canvas.shape[2] // 2], 'b uvw y x v -> (b y) (v x) uvw')
-                plt.imsave(f'{out_dir}/{iteration:06}_sample.png', canvas.cpu())
+                    canvas = torch.stack([inputs[:, :1].expand(-1, 3, -1, -1, -1), squish(sample_heatmaps[None]), squish(gt_heatmaps)], dim=-1)
+                    canvas_mask = torch.stack([torch.ones_like(mask), torch.ones_like(mask), mask], dim=-1)
+                    canvas = (canvas * 0.5 + 0.5).clip(0, 1) * canvas_mask
+                    canvas = rearrange(canvas[:, :, canvas.shape[2] // 2], 'b uvw y x v -> (b y) (v x) uvw')
+                    plt.imsave(f'{out_dir}/{iteration:06}_sample.png', canvas.cpu())
 
                 model.train()
 
