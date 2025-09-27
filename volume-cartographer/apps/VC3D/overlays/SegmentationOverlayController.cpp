@@ -94,8 +94,6 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
         return;
     }
 
-    const float planeTolerance = planeToleranceWorld();
-
     auto* currentSurface = viewer->currentSurface();
     auto* planeSurface = dynamic_cast<PlaneSurface*>(currentSurface);
 
@@ -144,6 +142,7 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
             bool isActive;
             bool isHover;
             bool isKeyboard;
+            float opacity{1.0f};
         };
 
         std::vector<cv::Vec3f> handlePoints;
@@ -158,7 +157,7 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
             const bool isKeyboard = matches(handle.row, handle.col, keyboardHighlight);
 
             bool include = true;
-            if (!_showAllHandles) {
+            if (!planeSurface && !_showAllHandles) {
                 const bool forced = isActive || isHover || isKeyboard;
                 if (!_cursorValid && !forced) {
                     include = false;
@@ -179,15 +178,18 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
         PointFilterOptions filter;
         filter.clipToSurface = false;
         filter.computeScenePoints = true;
-        filter.volumePredicate = [planeSurface, planeTolerance, &handleEntries](const cv::Vec3f&, size_t index) {
-            const auto& entry = handleEntries[index];
-            if (planeSurface) {
-                float dist = planeSurface->pointDist(entry.world);
-                if (std::fabs(dist) > planeTolerance && !(entry.isActive || entry.isHover || entry.isKeyboard)) {
-                    return false;
-                }
+        filter.volumePredicate = [this, planeSurface, &handleEntries](const cv::Vec3f&, size_t index) {
+            auto& entry = handleEntries[index];
+            if (!planeSurface) {
+                entry.opacity = 1.0f;
+                return true;
             }
-            return true;
+            const float dist = std::fabs(planeSurface->pointDist(entry.world));
+            entry.opacity = sliceOpacity(dist);
+            if (_sliceDisplayMode == SegmentationSliceDisplayMode::Hide) {
+                return entry.opacity > 0.0f;
+            }
+            return entry.opacity > 0.0f;
         };
 
         auto filtered = filterPoints(viewer, handlePoints, filter);
@@ -196,6 +198,12 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
             const auto& entry = handleEntries[srcIndex];
             const QPointF& scenePt = filtered.scenePoints[i];
             auto [radius, style] = pointVisuals(entry.isActive, entry.isHover, entry.isKeyboard);
+            const float opacity = entry.opacity;
+            if (opacity <= 0.0f) {
+                continue;
+            }
+            style.penColor.setAlphaF(style.penColor.alphaF() * opacity);
+            style.brushColor.setAlphaF(style.brushColor.alphaF() * opacity);
             builder.addPoint(scenePt, radius, style);
         }
         return;
@@ -222,6 +230,7 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
         bool isHover;
         bool isKeyboard;
         bool valid;
+        float opacity{1.0f};
     };
 
     std::vector<cv::Vec3f> gridPoints;
@@ -245,18 +254,21 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
     PointFilterOptions filter;
     filter.clipToSurface = false;
     filter.computeScenePoints = true;
-    filter.volumePredicate = [planeSurface, planeTolerance, &gridEntries](const cv::Vec3f&, size_t index) {
-        const auto& entry = gridEntries[index];
+    filter.volumePredicate = [this, planeSurface, &gridEntries](const cv::Vec3f&, size_t index) {
+        auto& entry = gridEntries[index];
         if (!entry.valid) {
             return false;
         }
-        if (planeSurface) {
-            float dist = planeSurface->pointDist(entry.world);
-            if (std::fabs(dist) > planeTolerance && !(entry.isActive || entry.isHover || entry.isKeyboard)) {
-                return false;
-            }
+        if (!planeSurface) {
+            entry.opacity = 1.0f;
+            return true;
         }
-        return true;
+        const float dist = std::fabs(planeSurface->pointDist(entry.world));
+        entry.opacity = sliceOpacity(dist);
+        if (_sliceDisplayMode == SegmentationSliceDisplayMode::Hide) {
+            return entry.opacity > 0.0f;
+        }
+        return entry.opacity > 0.0f;
     };
 
     auto filtered = filterPoints(viewer, gridPoints, filter);
@@ -265,44 +277,26 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
         const auto& entry = gridEntries[srcIndex];
         const QPointF& scenePt = filtered.scenePoints[i];
         auto [radius, style] = pointVisuals(entry.isActive, entry.isHover, entry.isKeyboard);
+        const float opacity = entry.opacity;
+        if (opacity <= 0.0f) {
+            continue;
+        }
+        style.penColor.setAlphaF(style.penColor.alphaF() * opacity);
+        style.brushColor.setAlphaF(style.brushColor.alphaF() * opacity);
         builder.addPoint(scenePt, radius, style);
     }
 }
 
-float SegmentationOverlayController::gridStepWorld() const
+float SegmentationOverlayController::sliceOpacity(float distance) const
 {
-    if (_editManager && _editManager->baseSurface()) {
-        const cv::Vec2f scale = _editManager->baseSurface()->scale();
-        const float sx = std::fabs(scale[0]);
-        const float sy = std::fabs(scale[1]);
-        const float step = std::max(sx, sy);
-        if (std::isfinite(step) && step > 1e-4f) {
-            return step;
-        }
+    const float limit = std::max(_sliceFadeDistance, 0.1f);
+    if (_sliceDisplayMode == SegmentationSliceDisplayMode::Hide) {
+        return distance <= limit ? 1.0f : 0.0f;
     }
-
-    if (_surfCollection) {
-        if (auto* surface = dynamic_cast<QuadSurface*>(_surfCollection->surface("segmentation"))) {
-            const cv::Vec2f scale = surface->scale();
-            const float sx = std::fabs(scale[0]);
-            const float sy = std::fabs(scale[1]);
-            const float step = std::max(sx, sy);
-            if (std::isfinite(step) && step > 1e-4f) {
-                return step;
-            }
-        }
+    if (distance >= limit) {
+        return 0.0f;
     }
-
-    return 1.0f;
-}
-
-float SegmentationOverlayController::planeToleranceWorld() const
-{
-    const float step = gridStepWorld();
-    const float cells = std::max(_radius, 1.0f);
-    const float baseExtent = (cells + 0.5f) * step;
-    const float minExtent = std::max(step, 3.0f);
-    return std::max(baseExtent, minExtent);
+    return 1.0f - (distance / limit);
 }
 
 void SegmentationOverlayController::setActiveHandle(std::optional<std::pair<int,int>> key, bool refresh)
@@ -352,4 +346,23 @@ void SegmentationOverlayController::setCursorWorld(const cv::Vec3f& world, bool 
 {
     _cursorWorld = world;
     _cursorValid = valid;
+}
+
+void SegmentationOverlayController::setSliceFadeDistance(float distance)
+{
+    const float clamped = std::max(0.1f, distance);
+    if (std::fabs(_sliceFadeDistance - clamped) < 1e-4f) {
+        return;
+    }
+    _sliceFadeDistance = clamped;
+    refreshAll();
+}
+
+void SegmentationOverlayController::setSliceDisplayMode(SegmentationSliceDisplayMode mode)
+{
+    if (_sliceDisplayMode == mode) {
+        return;
+    }
+    _sliceDisplayMode = mode;
+    refreshAll();
 }

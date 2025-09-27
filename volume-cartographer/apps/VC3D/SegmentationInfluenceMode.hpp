@@ -23,3 +23,10 @@ enum class SegmentationRowColAxis
     Row = 1,
     Column = 2
 };
+
+// Visibility behaviour for slice viewers when rendering segmentation handles.
+enum class SegmentationSliceDisplayMode
+{
+    Fade = 0,
+    Hide = 1
+};

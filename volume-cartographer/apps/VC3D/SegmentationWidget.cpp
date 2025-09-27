@@ -29,6 +29,12 @@ SegmentationWidget::SegmentationWidget(QWidget* parent)
     , _btnApply(nullptr)
     , _btnReset(nullptr)
     , _btnStopTools(nullptr)
+    , _comboInfluenceMode(nullptr)
+    , _groupSliceVisibility(nullptr)
+    , _spinSliceFadeDistance(nullptr)
+    , _comboSliceDisplayMode(nullptr)
+    , _comboRowColMode(nullptr)
+    , _spinHighlightDistance(nullptr)
 {
     setupUI();
     updateEditingUi();
@@ -131,6 +137,39 @@ void SegmentationWidget::setupUI()
 
     layout->addWidget(influenceGroup);
 
+    _groupSliceVisibility = new QGroupBox(tr("Slice Visibility"), this);
+    auto* sliceLayout = new QVBoxLayout(_groupSliceVisibility);
+
+    auto* sliceFadeLayout = new QHBoxLayout();
+    auto* sliceFadeLabel = new QLabel(tr("Fade distance:"), _groupSliceVisibility);
+    _spinSliceFadeDistance = new QDoubleSpinBox(_groupSliceVisibility);
+    _spinSliceFadeDistance->setDecimals(1);
+    _spinSliceFadeDistance->setRange(0.1, 500.0);
+    _spinSliceFadeDistance->setSingleStep(0.5);
+    _spinSliceFadeDistance->setValue(static_cast<double>(_sliceFadeDistance));
+    _spinSliceFadeDistance->setToolTip(tr("World-space distance from the slice plane where handles begin to fade or hide"));
+    sliceFadeLayout->addWidget(sliceFadeLabel);
+    sliceFadeLayout->addWidget(_spinSliceFadeDistance);
+    sliceFadeLayout->addStretch();
+    sliceLayout->addLayout(sliceFadeLayout);
+
+    auto* sliceModeLayout = new QHBoxLayout();
+    auto* sliceModeLabel = new QLabel(tr("Beyond distance:"), _groupSliceVisibility);
+    _comboSliceDisplayMode = new QComboBox(_groupSliceVisibility);
+    _comboSliceDisplayMode->addItem(tr("Fade"), static_cast<int>(SegmentationSliceDisplayMode::Fade));
+    _comboSliceDisplayMode->addItem(tr("Hide"), static_cast<int>(SegmentationSliceDisplayMode::Hide));
+    int sliceModeIndex = _comboSliceDisplayMode->findData(static_cast<int>(_sliceDisplayMode));
+    if (sliceModeIndex >= 0) {
+        _comboSliceDisplayMode->setCurrentIndex(sliceModeIndex);
+    }
+    _comboSliceDisplayMode->setToolTip(tr("Choose whether slice viewers fade handles out or hide them past the distance"));
+    sliceModeLayout->addWidget(sliceModeLabel);
+    sliceModeLayout->addWidget(_comboSliceDisplayMode);
+    sliceModeLayout->addStretch();
+    sliceLayout->addLayout(sliceModeLayout);
+
+    layout->addWidget(_groupSliceVisibility);
+
     auto* holeGroup = new QGroupBox(tr("Hole Filling"), this);
     auto* holeLayout = new QVBoxLayout(holeGroup);
 
@@ -181,6 +220,19 @@ void SegmentationWidget::setupUI()
     handleDistanceLayout->addWidget(_spinHandleDisplayDistance);
     handleDistanceLayout->addStretch();
     handleDisplayLayout->addLayout(handleDistanceLayout);
+
+    auto* highlightLayout = new QHBoxLayout();
+    auto* highlightLabel = new QLabel(tr("Highlight distance:"), handleDisplayGroup);
+    _spinHighlightDistance = new QDoubleSpinBox(handleDisplayGroup);
+    _spinHighlightDistance->setRange(0.5, 500.0);
+    _spinHighlightDistance->setSingleStep(0.5);
+    _spinHighlightDistance->setDecimals(1);
+    _spinHighlightDistance->setValue(static_cast<double>(_highlightDistance));
+    _spinHighlightDistance->setToolTip(tr("World-space radius used to select the nearest handle for hover highlighting"));
+    highlightLayout->addWidget(highlightLabel);
+    highlightLayout->addWidget(_spinHighlightDistance);
+    highlightLayout->addStretch();
+    handleDisplayLayout->addLayout(highlightLayout);
 
     layout->addWidget(handleDisplayGroup);
 
@@ -269,6 +321,43 @@ void SegmentationWidget::setupUI()
         _rowColMode = mode;
         writeSetting(QStringLiteral("row_col_mode"), static_cast<int>(_rowColMode));
         emit rowColModeChanged(_rowColMode);
+    });
+
+    connect(_spinSliceFadeDistance, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        float distance = static_cast<float>(std::max(0.1, value));
+        if (std::fabs(distance - _sliceFadeDistance) < 1e-4f) {
+            return;
+        }
+        _sliceFadeDistance = distance;
+        writeSetting(QStringLiteral("slice_fade_distance"), _sliceFadeDistance);
+        emit sliceFadeDistanceChanged(_sliceFadeDistance);
+    });
+
+    connect(_comboSliceDisplayMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (index < 0) {
+            return;
+        }
+        const QVariant modeData = _comboSliceDisplayMode->itemData(index);
+        if (!modeData.isValid()) {
+            return;
+        }
+        const auto mode = static_cast<SegmentationSliceDisplayMode>(modeData.toInt());
+        if (mode == _sliceDisplayMode) {
+            return;
+        }
+        _sliceDisplayMode = mode;
+        writeSetting(QStringLiteral("slice_display_mode"), static_cast<int>(_sliceDisplayMode));
+        emit sliceDisplayModeChanged(_sliceDisplayMode);
+    });
+
+    connect(_spinHighlightDistance, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        float distance = static_cast<float>(std::max(0.5, value));
+        if (std::fabs(distance - _highlightDistance) < 1e-4f) {
+            return;
+        }
+        _highlightDistance = distance;
+        writeSetting(QStringLiteral("highlight_distance"), _highlightDistance);
+        emit highlightDistanceChanged(_highlightDistance);
     });
 
     connect(_spinHoleRadius, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
@@ -398,6 +487,36 @@ void SegmentationWidget::setInfluenceMode(SegmentationInfluenceMode mode)
     writeSetting(QStringLiteral("influence_mode"), static_cast<int>(_influenceMode));
 }
 
+void SegmentationWidget::setSliceFadeDistance(float value)
+{
+    const float clamped = std::clamp(value, 0.1f, 500.0f);
+    if (std::fabs(clamped - _sliceFadeDistance) < 1e-4f) {
+        return;
+    }
+    _sliceFadeDistance = clamped;
+    if (_spinSliceFadeDistance) {
+        const QSignalBlocker blocker(_spinSliceFadeDistance);
+        _spinSliceFadeDistance->setValue(static_cast<double>(_sliceFadeDistance));
+    }
+    writeSetting(QStringLiteral("slice_fade_distance"), _sliceFadeDistance);
+}
+
+void SegmentationWidget::setSliceDisplayMode(SegmentationSliceDisplayMode mode)
+{
+    if (_sliceDisplayMode == mode) {
+        return;
+    }
+    _sliceDisplayMode = mode;
+    if (_comboSliceDisplayMode) {
+        const QSignalBlocker blocker(_comboSliceDisplayMode);
+        int index = _comboSliceDisplayMode->findData(static_cast<int>(_sliceDisplayMode));
+        if (index >= 0) {
+            _comboSliceDisplayMode->setCurrentIndex(index);
+        }
+    }
+    writeSetting(QStringLiteral("slice_display_mode"), static_cast<int>(_sliceDisplayMode));
+}
+
 void SegmentationWidget::setRowColMode(SegmentationRowColMode mode)
 {
     if (_rowColMode == mode) {
@@ -456,6 +575,9 @@ void SegmentationWidget::setHandlesAlwaysVisible(bool value)
     if (_spinHandleDisplayDistance) {
         _spinHandleDisplayDistance->setEnabled(_editingEnabled && !_handlesAlwaysVisible);
     }
+    if (_spinHighlightDistance) {
+        _spinHighlightDistance->setEnabled(_editingEnabled);
+    }
     writeSetting(QStringLiteral("handles_always_visible"), _handlesAlwaysVisible);
 }
 
@@ -472,6 +594,20 @@ void SegmentationWidget::setHandleDisplayDistance(float value)
         _spinHandleDisplayDistance->setEnabled(_editingEnabled && !_handlesAlwaysVisible);
     }
     writeSetting(QStringLiteral("handle_display_distance"), _handleDisplayDistance);
+}
+
+void SegmentationWidget::setHighlightDistance(float value)
+{
+    const float clamped = std::clamp(value, 0.5f, 500.0f);
+    if (std::fabs(clamped - _highlightDistance) < 1e-4f) {
+        return;
+    }
+    _highlightDistance = clamped;
+    if (_spinHighlightDistance) {
+        const QSignalBlocker blocker(_spinHighlightDistance);
+        _spinHighlightDistance->setValue(static_cast<double>(_highlightDistance));
+    }
+    writeSetting(QStringLiteral("highlight_distance"), _highlightDistance);
 }
 
 void SegmentationWidget::setPendingChanges(bool pending)
@@ -505,6 +641,9 @@ void SegmentationWidget::updateEditingUi()
     if (_comboRowColMode) {
         _comboRowColMode->setEnabled(_editingEnabled && _influenceMode == SegmentationInfluenceMode::RowColumn);
     }
+    if (_groupSliceVisibility) {
+        _groupSliceVisibility->setEnabled(_editingEnabled);
+    }
     if (_spinHoleRadius) {
         _spinHoleRadius->setEnabled(_editingEnabled);
     }
@@ -516,6 +655,9 @@ void SegmentationWidget::updateEditingUi()
     }
     if (_spinHandleDisplayDistance) {
         _spinHandleDisplayDistance->setEnabled(_editingEnabled && !_handlesAlwaysVisible);
+    }
+    if (_spinHighlightDistance) {
+        _spinHighlightDistance->setEnabled(_editingEnabled);
     }
     if (_btnApply) {
         _btnApply->setEnabled(_editingEnabled && _hasPendingChanges);
@@ -545,6 +687,15 @@ void SegmentationWidget::restoreSettings()
                                             static_cast<int>(SegmentationInfluenceMode::RowColumn));
     setInfluenceMode(static_cast<SegmentationInfluenceMode>(clampedInfluence));
 
+    const double storedSliceFade = settings.value(QStringLiteral("segmentation_edit/slice_fade_distance"), static_cast<double>(_sliceFadeDistance)).toDouble();
+    setSliceFadeDistance(static_cast<float>(std::clamp(storedSliceFade, 0.1, 500.0)));
+
+    const int storedSliceMode = settings.value(QStringLiteral("segmentation_edit/slice_display_mode"), static_cast<int>(_sliceDisplayMode)).toInt();
+    const int clampedSliceMode = std::clamp(storedSliceMode,
+                                            static_cast<int>(SegmentationSliceDisplayMode::Fade),
+                                            static_cast<int>(SegmentationSliceDisplayMode::Hide));
+    setSliceDisplayMode(static_cast<SegmentationSliceDisplayMode>(clampedSliceMode));
+
     const int storedRowCol = settings.value(QStringLiteral("segmentation_edit/row_col_mode"), static_cast<int>(_rowColMode)).toInt();
     const int clampedRowCol = std::clamp(storedRowCol,
                                          static_cast<int>(SegmentationRowColMode::RowOnly),
@@ -562,6 +713,9 @@ void SegmentationWidget::restoreSettings()
 
     const double storedHandleDistance = settings.value(QStringLiteral("segmentation_edit/handle_display_distance"), static_cast<double>(_handleDisplayDistance)).toDouble();
     setHandleDisplayDistance(static_cast<float>(std::clamp(storedHandleDistance, 1.0, 500.0)));
+
+    const double storedHighlightDistance = settings.value(QStringLiteral("segmentation_edit/highlight_distance"), static_cast<double>(_highlightDistance)).toDouble();
+    setHighlightDistance(static_cast<float>(std::clamp(storedHighlightDistance, 0.5, 500.0)));
 }
 
 void SegmentationWidget::writeSetting(const QString& key, const QVariant& value)

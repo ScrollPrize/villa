@@ -34,7 +34,7 @@ public:
     
     std::set<std::string> intersects();
     void setIntersects(const std::set<std::string> &set);
-    std::string surfName() { return _surf_name; };
+    std::string surfName() const { return _surf_name; };
     void recalcScales();
     
     // Composite view methods

@@ -31,6 +31,8 @@
 #include <atomic>
 #include <cmath>
 #include <optional>
+#include <cctype>
+#include <algorithm>
 #include <utility>
 #include <omp.h>
 #include <opencv2/imgproc.hpp>
@@ -69,6 +71,48 @@
 
 using qga = QGuiApplication;
 using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
+
+namespace
+{
+void configureFloatingBehaviour(QDockWidget* dock)
+{
+    if (!dock) {
+        return;
+    }
+
+    QObject::connect(dock, &QDockWidget::topLevelChanged, dock, [dock](bool floating) {
+        if (!floating) {
+            return;
+        }
+
+        const Qt::WindowFlags flags = dock->windowFlags();
+        if (flags.testFlag(Qt::Tool)) {
+            dock->setWindowFlag(Qt::Tool, false);
+        }
+        if (flags.testFlag(Qt::WindowStaysOnTopHint)) {
+            dock->setWindowFlag(Qt::WindowStaysOnTopHint, false);
+        }
+        if (!flags.testFlag(Qt::Window)) {
+            dock->setWindowFlag(Qt::Window, true);
+        }
+        dock->show();
+    });
+
+    if (dock->isFloating()) {
+        const Qt::WindowFlags flags = dock->windowFlags();
+        if (flags.testFlag(Qt::Tool)) {
+            dock->setWindowFlag(Qt::Tool, false);
+        }
+        if (flags.testFlag(Qt::WindowStaysOnTopHint)) {
+            dock->setWindowFlag(Qt::WindowStaysOnTopHint, false);
+        }
+        if (!flags.testFlag(Qt::Window)) {
+            dock->setWindowFlag(Qt::Window, true);
+        }
+        dock->show();
+    }
+}
+}
 
 
 // Constructor
@@ -601,6 +645,17 @@ void CWindow::CreateWidgets(void)
     
     // Make Drawing dock the active tab by default
     ui.dockWidgetDrawing->raise();
+
+    // Ensure floating docks behave as regular windows on Wayland and other platforms
+    configureFloatingBehaviour(ui.dockWidgetSegmentation);
+    configureFloatingBehaviour(ui.dockWidgetDistanceTransform);
+    configureFloatingBehaviour(ui.dockWidgetDrawing);
+    configureFloatingBehaviour(ui.dockWidgetOpList);
+    configureFloatingBehaviour(ui.dockWidgetOpSettings);
+    configureFloatingBehaviour(ui.dockWidgetComposite);
+    configureFloatingBehaviour(ui.dockWidgetVolumes);
+    configureFloatingBehaviour(ui.dockWidgetLocation);
+    configureFloatingBehaviour(_point_collection_widget);
     
     // Tab the composite widget with the Volume Package widget on the left dock
     tabifyDockWidget(ui.dockWidgetVolumes, ui.dockWidgetComposite);

@@ -81,6 +81,16 @@ The widget exposes a spin-box (default 12) that determines the grid stride
 updates the overlay, while the active preview surface remains untouched except
 for the regenerated handles (`SegmentationModule.cpp:167-192`).
 
+Slice viewers now mirror the VCCollection behaviour: a dedicated “Slice
+Visibility” section lets you tune how far from the plane handles remain visible
+and whether they fade out or disappear altogether (`SegmentationWidget.cpp:132-226`,
+`SegmentationOverlayController.cpp`).
+
+Handle hover highlighting also mirrors VCCollection. A configurable
+“Highlight distance” limits which handle the cursor can latch onto, keeping the
+UI from constantly snapping to faraway points (`SegmentationWidget.cpp`,
+`SegmentationModule.cpp:750`).
+
 
 ## Interaction Model
 

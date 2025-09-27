@@ -72,6 +72,9 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _handleDisplayDistance = _widget->handleDisplayDistance();
         _influenceMode = _widget->influenceMode();
         _rowColMode = _widget->rowColMode();
+        _sliceFadeDistance = _widget->sliceFadeDistance();
+        _sliceDisplayMode = _widget->sliceDisplayMode();
+        _highlightDistance = _widget->highlightDistance();
     }
     if (_editManager) {
         _editManager->setHoleSearchRadius(_holeSearchRadius);
@@ -81,6 +84,8 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     }
     if (_overlay) {
         _overlay->setHandleVisibility(_showHandlesAlways, _handleDisplayDistance);
+        _overlay->setSliceFadeDistance(_sliceFadeDistance);
+        _overlay->setSliceDisplayMode(_sliceDisplayMode);
         _overlay->setCursorWorld(cv::Vec3f(0, 0, 0), false);
     }
 
@@ -113,6 +118,15 @@ void SegmentationModule::bindWidgetSignals()
             Qt::UniqueConnection);
     connect(_widget, &SegmentationWidget::rowColModeChanged,
             this, &SegmentationModule::setRowColMode,
+            Qt::UniqueConnection);
+    connect(_widget, &SegmentationWidget::highlightDistanceChanged,
+            this, &SegmentationModule::setHighlightDistance,
+            Qt::UniqueConnection);
+    connect(_widget, &SegmentationWidget::sliceFadeDistanceChanged,
+            this, &SegmentationModule::setSliceFadeDistance,
+            Qt::UniqueConnection);
+    connect(_widget, &SegmentationWidget::sliceDisplayModeChanged,
+            this, &SegmentationModule::setSliceDisplayMode,
             Qt::UniqueConnection);
     connect(_widget, &SegmentationWidget::holeSearchRadiusChanged,
             this, &SegmentationModule::setHoleSearchRadius,
@@ -289,6 +303,37 @@ void SegmentationModule::setInfluenceMode(SegmentationInfluenceMode mode)
     }
 }
 
+void SegmentationModule::setSliceFadeDistance(float distance)
+{
+    const float clamped = std::clamp(distance, 0.1f, 500.0f);
+    if (std::fabs(clamped - _sliceFadeDistance) < 1e-4f) {
+        return;
+    }
+    _sliceFadeDistance = clamped;
+    if (_widget && std::fabs(_widget->sliceFadeDistance() - clamped) > 1e-4f) {
+        _widget->setSliceFadeDistance(clamped);
+    }
+    if (_overlay) {
+        _overlay->setSliceFadeDistance(_sliceFadeDistance);
+        _overlay->refreshAll();
+    }
+}
+
+void SegmentationModule::setSliceDisplayMode(SegmentationSliceDisplayMode mode)
+{
+    if (_sliceDisplayMode == mode) {
+        return;
+    }
+    _sliceDisplayMode = mode;
+    if (_widget && _widget->sliceDisplayMode() != mode) {
+        _widget->setSliceDisplayMode(mode);
+    }
+    if (_overlay) {
+        _overlay->setSliceDisplayMode(_sliceDisplayMode);
+        _overlay->refreshAll();
+    }
+}
+
 void SegmentationModule::setRowColMode(SegmentationRowColMode mode)
 {
     if (_rowColMode == mode) {
@@ -368,6 +413,25 @@ void SegmentationModule::setHandleDisplayDistance(float distance)
     if (_overlay) {
         _overlay->setHandleVisibility(_showHandlesAlways, _handleDisplayDistance);
         _overlay->refreshAll();
+    }
+}
+
+void SegmentationModule::setHighlightDistance(float distance)
+{
+    const float clamped = std::clamp(distance, 0.5f, 500.0f);
+    if (std::fabs(clamped - _highlightDistance) < 1e-4f) {
+        return;
+    }
+    _highlightDistance = clamped;
+    if (_widget && std::fabs(_widget->highlightDistance() - clamped) > 1e-4f) {
+        _widget->setHighlightDistance(clamped);
+    }
+    if (_hover.valid) {
+        _hover.clear();
+        if (_overlay) {
+            _overlay->setHoverHandle(std::nullopt);
+            _overlay->refreshAll();
+        }
     }
 }
 
@@ -477,7 +541,7 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         } else if (_hover.valid) {
             target = std::make_pair(_hover.row, _hover.col);
         } else if (_cursorValid) {
-            if (auto* nearest = _editManager->findNearestHandle(_cursorWorld, -1.0f)) {
+            if (auto* nearest = _editManager->findNearestHandle(_cursorWorld, _highlightDistance)) {
                 target = std::make_pair(nearest->row, nearest->col);
             }
         }
@@ -799,7 +863,7 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
         return;
     }
 
-    auto* handle = _editManager->findNearestHandle(worldPos, -1.0f);
+    auto* handle = _editManager->findNearestHandle(worldPos, _highlightDistance);
     if (handle) {
         const bool changed = !_hover.valid || _hover.row != handle->row || _hover.col != handle->col;
         _hover.set(handle->row, handle->col, handle->currentWorld);
