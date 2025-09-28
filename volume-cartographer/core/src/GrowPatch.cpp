@@ -17,6 +17,56 @@
 
 #include "vc/tracer/Tracer.hpp"
 
+// -----------------------------------------------------------------------------
+// Robust geometric area helpers (areas returned in voxel^2)
+// -----------------------------------------------------------------------------
+static inline double tri_area_vox2(const cv::Vec3d& a,
+                                   const cv::Vec3d& b,
+                                   const cv::Vec3d& c)
+{
+    const cv::Vec3d u = b - a;
+    const cv::Vec3d v = c - a;
+    // cross(u, v)
+    const cv::Vec3d w(u[1]*v[2] - u[2]*v[1],
+                      u[2]*v[0] - u[0]*v[2],
+                      u[0]*v[1] - u[1]*v[0]);
+    return 0.5 * std::sqrt(w.dot(w));
+}
+
+static inline double quad_area_vox2(const cv::Vec3d& p00,
+                                    const cv::Vec3d& p10,
+                                    const cv::Vec3d& p01,
+                                    const cv::Vec3d& p11)
+{
+    // Split consistently along the (p00 -> p11) diagonal
+    return tri_area_vox2(p00, p10, p11) + tri_area_vox2(p00, p11, p01);
+}
+
+// Try to count a quad (top-left index j,i) if its four corners are STATE_LOC_VALID
+// Returns the quad area (voxel^2) if counted; 0 otherwise. Caller must ensure
+// any check+set of 'quad_done(j,i)' is synchronized if used from parallel code.
+static inline double maybe_quad_area_and_mark(int j, int i,
+                                              const cv::Mat_<uint8_t>& state,
+                                              const cv::Mat_<cv::Vec3d>& locs,
+                                              cv::Mat_<uint8_t>& quad_done)
+{
+    if (j < 0 || i < 0 || j >= quad_done.rows || i >= quad_done.cols) return 0.0;
+    if (quad_done(j,i)) return 0.0;
+    if ( (state(j,   i  ) & STATE_LOC_VALID) &&
+         (state(j+1, i  ) & STATE_LOC_VALID) &&
+         (state(j,   i+1) & STATE_LOC_VALID) &&
+         (state(j+1, i+1) & STATE_LOC_VALID) )
+    {
+        double a = quad_area_vox2(locs(j,   i  ),
+                                  locs(j+1, i  ),
+                                  locs(j,   i+1),
+                                  locs(j+1, i+1));
+        quad_done(j,i) = 1;
+        return a;
+    }
+    return 0.0;
+}
+
 static float space_trace_dist_w = 1.0;
 float dist_th = 1.5;
 
@@ -595,6 +645,21 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     cv::Mat_<float> init_dist(size,0);
     cv::Mat_<uint16_t> loss_status(cv::Size(w,h),0);
 
+    // Per-quad "already counted" mask for area accumulation (rows-1) x (cols-1)
+    cv::Mat_<uint8_t> quad_done(cv::Size(std::max(0, w-1), std::max(0, h-1)), 0);
+    // Live accumulated area in voxel^2 (for progress logging). This is updated
+    // O(1) per accepted vertex by counting up to four newly-complete quads.
+    double area_accum_vox2 = 0.0;
+
+    auto init_area_scan = [&](void) {
+        // Populate quad_done + area_accum_vox2 for any quads already complete (resume path or post-init solve).
+        area_accum_vox2 = 0.0;
+        quad_done.setTo(0);
+        for (int j = 0; j < state.rows - 1; ++j)
+            for (int i = 0; i < state.cols - 1; ++i)
+                area_accum_vox2 += maybe_quad_area_and_mark(j, i, state, locs, quad_done);
+    };
+
     cv::Vec3f vx = {1,0,0};
     cv::Vec3f vy = {0,1,0};
 
@@ -642,6 +707,9 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
             succ++;
         }
         std::cout << "Resuming from generation " << generation << " with " << fringe.size() << " points. Initial loss count: " << loss_count << std::endl;
+
+        // Initialize the area accumulator + mask from the resumed state.
+        init_area_scan();
 
     } else {
         // Initialise the trace at the center of the available area, as a tiny single-quad patch at the seed point
@@ -701,6 +769,10 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     if (!resume_surf) {
         ceres::Solve(options_big, &big_problem, &big_summary);
         std::cout << big_summary.BriefReport() << "\n";
+        // After placing the initial 2x2 patch and optimizing, seed area/mask
+        // by scanning existing complete quads (only the initial one at start).
+        // This keeps live area in sync with the optimized geometry.
+        init_area_scan();
     }
 
     // Prepare a new set of Ceres options used later during local solves
@@ -969,6 +1041,16 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                     {
                         fringe.push_back(p);
                         succ_gen_ps.push_back(p);
+                        // O(1) area update: at most four quads become complete when a new vertex is accepted.
+                        // Synchronize the small check+set/accumulate section across threads.
+#pragma omp critical(area_update)
+                        {
+                            // top-left quads relative to (j,i): (j-1,i-1), (j-1,i), (j,i-1), (j,i)
+                            area_accum_vox2 += maybe_quad_area_and_mark(p[0]-1, p[1]-1, state, locs, quad_done);
+                            area_accum_vox2 += maybe_quad_area_and_mark(p[0]-1, p[1]  , state, locs, quad_done);
+                            area_accum_vox2 += maybe_quad_area_and_mark(p[0]  , p[1]-1, state, locs, quad_done);
+                            area_accum_vox2 += maybe_quad_area_and_mark(p[0]  , p[1]  , state, locs, quad_done);
+                        }
                     }
                 }
             }  // end parallel iteration over cands
@@ -1069,9 +1151,11 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         gen_avg_cost.push_back(avg_cost/cost_count);
         gen_max_cost.push_back(max_cost);
 
-        float const current_area_vx2 = double(succ)*step*step;
-        float const current_area_cm2 = current_area_vx2 * voxelsize * voxelsize / 1e8;
-        printf("-> total done %d/ fringe: %ld surf: %fG vx^2 (%f cm^2)\n", succ, (long)fringe.size(), current_area_vx2/1e9, current_area_cm2);
+        // Live area reporting based on accumulated geometric area (voxel^2 -> cm^2).
+        const double current_area_vx2 = area_accum_vox2;
+        const double current_area_cm2 = current_area_vx2 * double(voxelsize) * double(voxelsize) / 1e8; // 1 cm^2 = 1e8 µm^2
+        printf("-> total done %d / fringe: %ld  surf: %.6fG voxel^2  (%.6f cm^2)\n",
+               succ, (long)fringe.size(), current_area_vx2/1e9, current_area_cm2);
 
         timer_gen.unit = succ_gen*step*step;
         timer_gen.unit_string = "vx^2";
@@ -1104,16 +1188,31 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
         }
     avg_cost /= count;
 
-    float const area_est_vx2 = succ*step*step;
-    float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
-    printf("generated approximate surface %f vx^2 (%f cm^2)\n", area_est_vx2, area_est_cm2);
+    // Recompute the exact final surface area from the final optimized geometry.
+    // We don't reuse 'quad_done' here because locs/state were cropped; simply
+    // sum all quads whose four corners are STATE_LOC_VALID.
+    double area_final_vox2 = 0.0;
+    for (int j = 0; j < state.rows - 1; ++j)
+        for (int i = 0; i < state.cols - 1; ++i)
+            if ( (state(j,   i  ) & STATE_LOC_VALID) &&
+                 (state(j+1, i  ) & STATE_LOC_VALID) &&
+                 (state(j,   i+1) & STATE_LOC_VALID) &&
+                 (state(j+1, i+1) & STATE_LOC_VALID) )
+            {
+                area_final_vox2 += quad_area_vox2(locs(j,   i  ),
+                                                  locs(j+1, i  ),
+                                                  locs(j,   i+1),
+                                                  locs(j+1, i+1));
+            }
+    const double area_final_cm2 = area_final_vox2 * double(voxelsize) * double(voxelsize) / 1e8;
+    printf("generated surface area %.6f voxel^2 (%.6f cm^2)\n", area_final_vox2, area_final_cm2);
 
     auto surf = new QuadSurface(locs, {1/T, 1/T});
     surf->setChannel("generations", generations);
 
     surf->meta = new nlohmann::json;
-    (*surf->meta)["area_vx2"] = area_est_vx2;
-    (*surf->meta)["area_cm2"] = area_est_cm2;
+    (*surf->meta)["area_vx2"] = area_final_vox2;
+    (*surf->meta)["area_cm2"] = area_final_cm2;
     (*surf->meta)["max_cost"] = max_cost;
     (*surf->meta)["avg_cost"] = avg_cost;
     (*surf->meta)["max_gen"] = generation;

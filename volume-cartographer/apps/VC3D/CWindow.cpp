@@ -27,6 +27,7 @@
 #include <QFileInfo>
 #include <atomic>
 #include <omp.h>
+#include <opencv2/imgcodecs.hpp>   // imreadmulti
 #include <opencv2/imgproc.hpp>
 #include <opencv2/highgui.hpp>
 
@@ -59,6 +60,54 @@
 
 
 using qga = QGuiApplication;
+
+// ---- JSON helpers (avoid type_error when keys exist but are null/wrong type) ----
+namespace {
+    static inline double json_number_or(const nlohmann::json* m, const char* key, double def) {
+        if (!m || !m->contains(key)) return def;
+        const auto& v = m->at(key);
+        if (v.is_number_float())    return v.get<double>();
+        if (v.is_number_integer())  return static_cast<double>(v.get<int64_t>());
+        if (v.is_string()) {
+            try { return std::stod(v.get<std::string>()); } catch (...) { return def; }
+        }
+        return def;
+    }
+    static inline std::string json_string_or(const nlohmann::json* m, const char* key, const std::string& def) {
+        if (!m || !m->contains(key)) return def;
+        const auto& v = m->at(key);
+        if (v.is_string()) return v.get<std::string>();
+        return def;
+    }
+    static inline nlohmann::json json_tags_or_empty(const nlohmann::json* m) {
+        if (!m || !m->contains("tags")) return nlohmann::json::object();
+        const auto& t = m->at("tags");
+        return t.is_object() ? t : nlohmann::json::object();
+    }
+    static inline bool json_has_tag(const nlohmann::json* m, const char* tag) {
+        auto t = json_tags_or_empty(m); return t.contains(tag);
+    }
+
+    // Derive a single UV sampling scale from metadata.
+    // Prefer "scale"; if absent/invalid, fall back to geometric mean of {sx, sy}.
+    // This factor is multiplicative in length (areas scale with scale^2).
+    static inline double param_scale_from_meta(const nlohmann::json* meta)
+    {
+        if (!meta) return 1.0;
+        double s  = json_number_or(meta, "scale", 1.0);
+        double sx = json_number_or(meta, "sx", s);
+        double sy = json_number_or(meta, "sy", s);
+        if (!std::isfinite(s) || s <= 0.0) {
+            if (std::isfinite(sx) && sx > 0.0 &&
+                std::isfinite(sy) && sy > 0.0) {
+                return std::sqrt(sx * sy);
+            }
+            return 1.0;
+        }
+        return s;
+    }
+
+}
 
 
 // Constructor
@@ -843,6 +892,7 @@ void CWindow::CreateMenus(void)
     fActionsMenu = new QMenu(tr("&Actions"), this);
     fActionsMenu->addAction(fVoxelizePathsAct);
     fActionsMenu->addAction(fDrawBBoxAct);
+    fActionsMenu->addAction(fRecalcAreaFromMaskAct);
 
     fSelectionMenu = new QMenu(tr("&Selection"), this);
     fSelectionMenu->addAction(fSelectionSurfaceFromAct);
@@ -916,6 +966,11 @@ void CWindow::CreateActions(void)
     fDrawBBoxAct = new QAction(tr("Draw BBox"), this);
     fDrawBBoxAct->setCheckable(true);
     connect(fDrawBBoxAct, &QAction::toggled, this, &CWindow::onDrawBBoxToggled);
+
+    // Recalculate area from mask (acts on current selection)
+    fRecalcAreaFromMaskAct = new QAction(tr("Recalculate Area from Mask (Selected)"), this);
+    fRecalcAreaFromMaskAct->setToolTip(tr("Recompute area_vx2/cm2 using the edited mask.tif for the selected segment(s)"));
+    connect(fRecalcAreaFromMaskAct, &QAction::triggered, this, &CWindow::onRecalculateAreaFromMaskSelected);
 
     // Selection menu actions
     fSelectionSurfaceFromAct = new QAction(tr("Surface from Selection"), this);
@@ -1642,16 +1697,12 @@ void CWindow::onSurfaceSelected()
             _chkRevisit->setCheckState(Qt::Unchecked);
             _chkInspect->setCheckState(Qt::Unchecked);
             if (_surf->meta) {
-                if (_surf->meta->value("tags", nlohmann::json::object_t()).count("approved"))
-                    _chkApproved->setCheckState(Qt::Checked);
-                if (_surf->meta->value("tags", nlohmann::json::object_t()).count("defective"))
-                    _chkDefective->setCheckState(Qt::Checked);
-                if (_surf->meta->value("tags", nlohmann::json::object_t()).count("reviewed"))
-                    _chkReviewed->setCheckState(Qt::Checked);
-                if (_surf->meta->value("tags", nlohmann::json::object_t()).count("revisit"))
-                    _chkRevisit->setCheckState(Qt::Checked);
-                if (_surf->meta->value("tags", nlohmann::json::object_t()).count("inspect"))
-                    _chkInspect->setCheckState(Qt::Checked);
+                const auto tags = json_tags_or_empty(_surf->meta);
+                if (tags.contains("approved"))  _chkApproved->setCheckState(Qt::Checked);
+                if (tags.contains("defective")) _chkDefective->setCheckState(Qt::Checked);
+                if (tags.contains("reviewed"))  _chkReviewed->setCheckState(Qt::Checked);
+                if (tags.contains("revisit"))   _chkRevisit->setCheckState(Qt::Checked);
+                if (tags.contains("inspect"))   _chkInspect->setCheckState(Qt::Checked);
             }
             else {
                 _chkApproved->setEnabled(false);
@@ -1687,9 +1738,10 @@ void CWindow::FillSurfaceTree()
         item->setText(SURFACE_ID_COLUMN, QString(id.c_str()));
         item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QVariant(id.c_str()));
 
-        double size = surfMeta->meta->value("area_cm2", -1.f);
+        // Safe numeric reads
+        const double size = json_number_or(surfMeta->meta, "area_cm2", -1.0);
         item->setText(2, QString::number(size, 'f', 3));
-        double cost = surfMeta->meta->value("avg_cost", -1.f);
+        const double cost = json_number_or(surfMeta->meta, "avg_cost", -1.0);
         item->setText(3, QString::number(cost, 'f', 3));
         item->setText(4, QString::number(surfMeta->overlapping_str.size()));
         QString timestamp;
@@ -1719,9 +1771,9 @@ void CWindow::UpdateSurfaceTreeIcon(SurfaceTreeWidgetItem *item)
     if (fVpkg) {
         auto surfMeta = fVpkg->getSurface(id);
         if (surfMeta && surfMeta->surface() && surfMeta->surface()->meta) {
-            item->updateItemIcon(
-                surfMeta->surface()->meta->value("tags", nlohmann::json::object_t()).count("approved"),
-                surfMeta->surface()->meta->value("tags", nlohmann::json::object_t()).count("defective"));
+            const bool approved = json_has_tag(surfMeta->surface()->meta, "approved");
+            const bool defective = json_has_tag(surfMeta->surface()->meta, "defective");
+            item->updateItemIcon(approved, defective);
         }
     }
 }
@@ -1847,8 +1899,8 @@ void CWindow::onSegFilterChanged(int index)
             if (chkFilterUnreviewed->isChecked()) {
                 auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    auto tags = surface->meta->value("tags", nlohmann::json::object_t());
-                    show = show && !tags.count("reviewed");
+                    const auto tags = json_tags_or_empty(surface->meta);
+                    show = show && !tags.contains("reviewed");
                 } else {
                     show = show && true;
                 }
@@ -1858,8 +1910,8 @@ void CWindow::onSegFilterChanged(int index)
             if (chkFilterRevisit->isChecked()) {
                 auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    auto tags = surface->meta->value("tags", nlohmann::json::object_t());
-                    show = show && (tags.count("revisit") > 0);
+                    const auto tags = json_tags_or_empty(surface->meta);
+                    show = show && tags.contains("revisit");
                 } else {
                     show = show && false;
                 }
@@ -1869,12 +1921,8 @@ void CWindow::onSegFilterChanged(int index)
             if (chkFilterNoExpansion->isChecked()) {
                 auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    if (surface->meta->contains("vc_gsfs_mode")) {
-                        std::string mode = surface->meta->value("vc_gsfs_mode", "");
-                        show = show && (mode != "expansion");
-                    } else {
-                        show = show && true;
-                    }
+                    const std::string mode = json_string_or(surface->meta, "vc_gsfs_mode", "");
+                    show = show && (mode != "expansion");
                 } else {
                     show = show && true;
                 }
@@ -1884,8 +1932,8 @@ void CWindow::onSegFilterChanged(int index)
             if (chkFilterNoDefective->isChecked()) {
                 auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    auto tags = surface->meta->value("tags", nlohmann::json::object_t());
-                    show = show && !tags.count("defective");
+                    const auto tags = json_tags_or_empty(surface->meta);
+                    show = show && !tags.contains("defective");
                 } else {
                     show = show && true;
                 }
@@ -1895,8 +1943,8 @@ void CWindow::onSegFilterChanged(int index)
             if (chkFilterPartialReview->isChecked()) {
                 auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    auto tags = surface->meta->value("tags", nlohmann::json::object_t());
-                    show = show && !tags.count("partial_review");
+                    const auto tags = json_tags_or_empty(surface->meta);
+                    show = show && !tags.contains("partial_review");
                 } else {
                     show = show && true;
                 }
@@ -1905,8 +1953,8 @@ void CWindow::onSegFilterChanged(int index)
             if (chkFilterHideUnapproved->isChecked()) {
                 auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    auto tags = surface->meta->value("tags", nlohmann::json::object_t());
-                    show = show && (tags.count("approved") > 0);
+                    const auto tags = json_tags_or_empty(surface->meta);
+                    show = show && tags.contains("approved");
                 } else {
                     show = show && false;  // Hide segments without metadata when filter is active
                 }
@@ -1914,8 +1962,8 @@ void CWindow::onSegFilterChanged(int index)
             if (chkFilterInspectOnly->isChecked()) {
                 auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    auto tags = surface->meta->value("tags", nlohmann::json::object_t());
-                    show = show && (tags.count("inspect") > 0);
+                    const auto tags = json_tags_or_empty(surface->meta);
+                    show = show && tags.contains("inspect");
                 } else {
                     show = show && false;  // Hide segments without metadata when filter is active
                 }
@@ -2217,6 +2265,16 @@ void CWindow::onSurfaceContextMenuRequested(const QPoint& pos)
     contextMenu.addAction(inpaintTeleaAction);
     contextMenu.addAction(deleteAction);
     
+    // Recalculate area from mask (per segment/patch/trace, supports multi-select)
+    QAction* recalcAreaAction = new QAction(tr("Recalculate Area from Mask"), this);
+    connect(recalcAreaAction, &QAction::triggered, [this, selectedSegmentIds]() {
+        if (selectedSegmentIds.empty()) return;
+        recalcAreaForSegments(selectedSegmentIds);
+    });
+    // Put it near other maintenance ops
+    contextMenu.addSeparator();
+    contextMenu.addAction(recalcAreaAction);
+
     contextMenu.exec(treeWidgetSurfaces->mapToGlobal(pos));
 }
 
@@ -2488,9 +2546,9 @@ void CWindow::AddSingleSegmentation(const std::string& segId)
         auto* item = new SurfaceTreeWidgetItem(treeWidgetSurfaces);
         item->setText(SURFACE_ID_COLUMN, QString(segId.c_str()));
         item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QVariant(segId.c_str()));
-        double size = sm->meta->value("area_cm2", -1.f);
+        const double size = json_number_or(sm->meta, "area_cm2", -1.0);
         item->setText(2, QString::number(size, 'f', 3));
-        double cost = sm->meta->value("avg_cost", -1.f);
+        const double cost = json_number_or(sm->meta, "avg_cost", -1.0);
         item->setText(3, QString::number(cost, 'f', 3));
         item->setText(4, QString::number(sm->overlapping_str.size()));
         QString timestamp;
@@ -2998,6 +3056,262 @@ void CWindow::onCopyCoordinates()
     if (!coords.isEmpty()) {
         QApplication::clipboard()->setText(coords);
         statusBar()->showMessage(tr("Coordinates copied to clipboard: %1").arg(coords), 2000);
+    }
+}
+
+// ---- Area recompute helpers -------------------------------------------------
+namespace {
+    static inline double tri_area_vox2(const cv::Vec3d& a,
+                                       const cv::Vec3d& b,
+                                       const cv::Vec3d& c)
+    {
+        const cv::Vec3d u = b - a;
+        const cv::Vec3d v = c - a;
+        const cv::Vec3d w(u[1]*v[2] - u[2]*v[1],
+                          u[2]*v[0] - u[0]*v[2],
+                          u[0]*v[1] - u[1]*v[0]);
+        return 0.5 * std::sqrt(w.dot(w));
+    }
+
+    static inline double quad_area_vox2(const cv::Vec3d& p00,
+                                        const cv::Vec3d& p10,
+                                        const cv::Vec3d& p01,
+                                        const cv::Vec3d& p11)
+    {
+        // Diagonal (p00 -> p11)
+        return tri_area_vox2(p00, p10, p11) + tri_area_vox2(p00, p11, p01);
+    }
+}
+
+void CWindow::onRecalculateAreaFromMaskSelected()
+{
+    // Use current selection from the Surfaces tree
+    QList<QTreeWidgetItem*> selectedItems = treeWidgetSurfaces->selectedItems();
+    if (selectedItems.isEmpty()) {
+        QMessageBox::information(this, tr("Recalculate Area"),
+                                 tr("Select one or more segments first."));
+        return;
+    }
+    std::vector<std::string> ids;
+    ids.reserve(selectedItems.size());
+    for (auto* it : selectedItems) {
+        ids.push_back(it->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString());
+    }
+    recalcAreaForSegments(ids);
+}
+
+void CWindow::recalcAreaForSegments(const std::vector<std::string>& ids)
+{
+    if (!fVpkg) return;
+
+    // Voxelsize (for cm² conversion)
+    float voxelsize = 1.0f;
+    try {
+        if (currentVolume && currentVolume->metadata().hasKey("voxelsize")) {
+            voxelsize = currentVolume->metadata().get<float>("voxelsize");
+        }
+    } catch (...) {
+        voxelsize = 1.0f;
+    }
+    // Guard against bad metadata
+    if (!std::isfinite(voxelsize) || voxelsize <= 0.f) {
+        voxelsize = 1.0f;
+    }
+
+    int okCount = 0, failCount = 0;
+    QStringList updatedIds, skippedIds;
+
+    for (const auto& id : ids) {
+        auto sm = fVpkg->getSurface(id);
+        if (!sm || !sm->surface()) { ++failCount; skippedIds << QString::fromStdString(id); continue; }
+        auto* surf = sm->surface(); // QuadSurface*
+
+        // Load mask.tif (first page is binary mask)
+        const std::filesystem::path maskPath = sm->path / "mask.tif";
+        if (!std::filesystem::exists(maskPath)) {
+            skippedIds << QString::fromStdString(id) + " (no mask.tif)";
+            ++failCount;
+            continue;
+        }
+
+        std::vector<cv::Mat> layers;
+        if (!cv::imreadmulti(maskPath.string(), layers, cv::IMREAD_UNCHANGED) || layers.empty()) {
+            skippedIds << QString::fromStdString(id) + " (mask read error)";
+            ++failCount;
+            continue;
+        }
+        cv::Mat mask = layers[0];
+        if (mask.empty()) {
+            skippedIds << QString::fromStdString(id) + " (mask empty)";
+            ++failCount;
+            continue;
+        }
+        if (mask.channels() != 1) {
+            cv::cvtColor(mask, mask, cv::COLOR_BGR2GRAY);
+        }
+        if (mask.type() != CV_8U) {
+            mask.convertTo(mask, CV_8U);
+        }
+
+        // Fixed mask polarity: inside = nonzero (set to false if you want the inverse)
+        constexpr bool INSIDE_IS_NONZERO = true;
+
+        // Helper to compute a robust median
+        auto median = [](std::vector<double>& v) -> double {
+            if (v.empty()) return 0.0;
+            std::nth_element(v.begin(), v.begin() + v.size()/2, v.end());
+            double m = v[v.size()/2];
+            if ((v.size() % 2) == 0) {
+                auto it = std::max_element(v.begin(), v.begin() + v.size()/2);
+                m = 0.5*(m + *it);
+            }
+            return m;
+        };
+
+        // Generate surface coordinates aligned to the mask grid:
+        //  - same grid as mask
+        //  - apply UV sampling scale exactly once here so distances/areas
+        //    are in world/voxel units prior to cm^2 conversion below
+        cv::Mat_<cv::Vec3f> coords;
+        try {
+            cv::Vec3f ptr = surf->pointer();
+            cv::Vec3f offset(-mask.cols/2.0f, -mask.rows/2.0f, 0);
+            surf->gen(&coords, nullptr, mask.size(), ptr, 1.0f, offset);
+        } catch (...) {
+            skippedIds << QString::fromStdString(id) + " (coord gen failed)";
+            ++failCount;
+            continue;
+        }
+        if (coords.empty() || coords.rows != mask.rows || coords.cols != mask.cols) {
+            skippedIds << QString::fromStdString(id) + " (coord/mask size mismatch)";
+            ++failCount;
+            continue;
+        }
+
+        // Robust area computation
+        auto isFinite = [](const cv::Vec3d& p){
+            return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+        };
+
+        const int H = mask.rows, W = mask.cols;
+
+        // Accumulate area for every quad that is NOT all-black in the mask.
+        // (i.e., skip only quads where the 2x2 block is entirely zeros)
+        auto quad_area_from_mask = [&](const cv::Mat& M8,
+                                       double& out_du, double& out_dv) -> double
+        {
+            std::vector<double> stepsU, stepsV;
+            double area_vx2_local = 0.0;
+            for (int j = 0; j < H - 1; ++j) {
+                const uint8_t* r0 = M8.ptr<uint8_t>(j);
+                const uint8_t* r1 = M8.ptr<uint8_t>(j + 1);
+                for (int i = 0; i < W - 1; ++i) {
+                    const bool all_black = (r0[i] == 0) && (r0[i+1] == 0) &&
+                                           (r1[i] == 0) && (r1[i+1] == 0);
+                    if (all_black) continue;  // keep mixed and fully non-zero quads
+
+                    const cv::Vec3d p00 = coords(j,   i  );
+                    const cv::Vec3d p10 = coords(j,   i+1);
+                    const cv::Vec3d p01 = coords(j+1, i  );
+                    const cv::Vec3d p11 = coords(j+1, i+1);
+
+                    if (!isFinite(p00) || !isFinite(p10) || !isFinite(p01) || !isFinite(p11)) continue;
+
+                    stepsU.push_back(cv::norm(p10 - p00)); // along columns (+u)
+                    stepsV.push_back(cv::norm(p01 - p00)); // along rows (+v)
+                    area_vx2_local += quad_area_vox2(p00, p10, p01, p11);
+                }
+            }
+            out_du = median(stepsU);
+            out_dv = median(stepsV);
+            return area_vx2_local;
+        };
+
+        double du = 0.0, dv = 0.0;
+        double area_vx2 = quad_area_from_mask(mask, du, dv);
+
+        // Fallback: for very thin masks there may be no 2x2 fully-inside quads.
+        if (area_vx2 <= 0.0) {
+            // estimate du,dv globally from neighbors on the grid (robust to NaNs)
+            std::vector<double> gU; gU.reserve(H*(W-1));
+            std::vector<double> gV; gV.reserve((H-1)*W);
+            for (int j = 0; j < H; ++j) {
+                for (int i = 0; i < W-1; ++i) {
+                    gU.push_back(cv::norm(coords(j,i+1) - coords(j,i)));
+                }
+            }
+            for (int j = 0; j < H-1; ++j) {
+                for (int i = 0; i < W; ++i) {
+                    gV.push_back(cv::norm(coords(j+1,i) - coords(j,i)));
+                }
+            }
+            double du_g = median(gU);
+            double dv_g = median(gV);
+            if (du <= 0.0) du = du_g;
+            if (dv <= 0.0) dv = dv_g;
+
+            // Count inside pixels using chosen polarity and convert to area
+            long long pixCount = 0;
+            for (int y = 0; y < H; ++y) {
+                const uint8_t* r = mask.ptr<uint8_t>(y);
+                for (int x = 0; x < W; ++x) {
+                    const bool in = (INSIDE_IS_NONZERO ? (r[x] != 0) : (r[x] == 0));
+                    if (in) ++pixCount;
+                }
+            }
+            if (pixCount > 0 && du > 0.0 && dv > 0.0) {
+                area_vx2 = static_cast<double>(pixCount) * (du * dv);
+            }
+        }
+
+        // Final guard – avoid writing NaN
+        if (!std::isfinite(area_vx2)) {
+            skippedIds << QString::fromStdString(id) + " (non-finite area)";
+            ++failCount;
+            continue;
+        }
+
+        const double area_cm2 = area_vx2 * double(voxelsize) * double(voxelsize) / 1e8;
+        if (!std::isfinite(area_cm2)) {
+            skippedIds << QString::fromStdString(id) + " (non-finite cm²)";
+            ++failCount; continue;
+        }
+        // Update metadata and save
+        try {
+            if (!surf->meta) surf->meta = new nlohmann::json();
+            (*surf->meta)["area_vx2"] = area_vx2;
+            (*surf->meta)["area_cm2"] = area_cm2;
+            (*surf->meta)["date_last_modified"] = get_surface_time_str();
+            surf->save_meta();
+            okCount++;
+            updatedIds << QString::fromStdString(id);
+        } catch (...) {
+            ++failCount;
+            skippedIds << QString::fromStdString(id) + " (meta save failed)";
+            continue;
+        }
+
+        // Live-update the tree’s area column for this item
+        QTreeWidgetItemIterator it(treeWidgetSurfaces);
+        while (*it) {
+            if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() == id) {
+                (*it)->setText(2, QString::number(area_cm2, 'f', 3));
+                break;
+            }
+            ++it;
+        }
+    }
+
+    // Feedback
+    if (okCount > 0) {
+        statusBar()->showMessage(tr("Recalculated area for %1 segment(s).").arg(okCount), 5000);
+    }
+    if (failCount > 0) {
+        QMessageBox::warning(this, tr("Area Recalculation"),
+                             tr("Updated: %1\nSkipped: %2\n\n%3")
+                                .arg(okCount)
+                                .arg(failCount)
+                                .arg(skippedIds.join("\n")));
     }
 }
 

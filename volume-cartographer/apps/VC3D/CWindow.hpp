@@ -71,6 +71,7 @@ public slots:
     void onVoxelizePaths();
    void onFocusPOIChanged(std::string name, POI* poi);
     void onPointDoubleClicked(uint64_t pointId);
+    void onRecalculateAreaFromMaskSelected();  // Recalc area for currently selected items
 
 public:
     CWindow();
@@ -128,6 +129,8 @@ private:
 
     void setVolume(std::shared_ptr<Volume> newvol);
 
+    void recalcAreaForSegments(const std::vector<std::string>& ids);
+
 private slots:
     void Open(void);
     void Open(const QString& path);
@@ -153,6 +156,7 @@ private slots:
     void onCopyCoordinates();
     void onImportObjAsPatches();
     void onAxisAlignedSlicesToggled(bool enabled);
+    
 
 private:
     bool appInitComplete{false};
@@ -188,6 +192,7 @@ private:
     QAction* fReportingAct;
     QAction* fVoxelizePathsAct;
     QAction* fDrawBBoxAct;
+    QAction* fRecalcAreaFromMaskAct = nullptr;
     QAction* fSelectionSurfaceFromAct;
     QAction* fSelectionClearAct;
     QAction* fInpaintTeleaAct = nullptr;
