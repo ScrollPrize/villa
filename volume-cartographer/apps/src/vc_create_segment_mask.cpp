@@ -62,7 +62,10 @@ int main(int argc, char *argv[])
             volume = Volume::New(volume_path);
             cache = new ChunkCache(1ULL * 1024ULL * 1024ULL * 1024ULL);
 
-            //generate_mask(surf, mask, img, volume->zarrDataset(0), cache);
+            generate_mask(surf, mask, img,
+                         volume->zarrDataset(0),
+                         volume->zarrDataset(2),
+                         cache);
 
             // Save as multi-layer TIFF
             std::vector<cv::Mat> layers = {mask, img};
@@ -78,6 +81,15 @@ int main(int argc, char *argv[])
         catch (const std::exception& e) {
             std::cerr << "Error processing volume: " << e.what() << std::endl;
             if (cache) delete cache;
+            delete surf;
+            return EXIT_FAILURE;
+        }
+    } else {
+        // Generate mask only
+        generate_mask(surf, mask, img);
+
+        if (!cv::imwrite(mask_path.string(), mask)) {
+            std::cerr << "Error writing mask to " << mask_path << std::endl;
             delete surf;
             return EXIT_FAILURE;
         }

@@ -108,9 +108,9 @@ target_link_libraries(vc_ced2d
 add_executable(vc_transform_geom src/vc_transform_geom.cpp)
 target_link_libraries(vc_transform_geom vc_core Boost::program_options)
 
-add_executable(vc_gen_normalgrids src/vc_gen_normalgrids.cpp diffusion/support.cpp)
-target_link_libraries(vc_gen_normalgrids vc_core z5 Boost::program_options opencv_core opencv_imgproc opencv_ximgproc OpenMP::OpenMP_CXX Ceres::ceres)
-target_include_directories(vc_gen_normalgrids PRIVATE diffusion)
+add_executable(vc_ngrid src/vc_ngrid.cpp diffusion/support.cpp)
+target_link_libraries(vc_ngrid vc_core z5 Boost::program_options opencv_core opencv_imgproc opencv_ximgproc OpenMP::OpenMP_CXX Ceres::ceres)
+target_include_directories(vc_ngrid PRIVATE diffusion)
 
 add_executable(vc_tifxyz2rgb src/vc_tifxyz2rgb.cpp)
 target_link_libraries(vc_tifxyz2rgb
@@ -136,6 +136,9 @@ target_link_libraries(vc_telea_inpaint
     opencv_photo
 )
 
+add_executable(vc_thinning src/vc_thinning.cpp)
+target_link_libraries(vc_thinning vc_core opencv_highgui opencv_ximgproc)
+
 # Install targets
 if(VC_INSTALL_APPS)
 install(
@@ -158,8 +161,9 @@ install(
         vc_diffuse_winding
         vc_ced2d
         vc_transform_geom
-        vc_gen_normalgrids
+        vc_ngrid
         vc_telea_inpaint
+        vc_thinning
         ${extra_apps}
     RUNTIME DESTINATION bin
     COMPONENT Programs

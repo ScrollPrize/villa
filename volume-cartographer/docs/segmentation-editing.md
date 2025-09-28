@@ -96,8 +96,10 @@ UI from constantly snapping to faraway points (`SegmentationWidget.cpp`,
 
 ### Mouse
 
-- **Left-click (default mode)** – Snaps to the nearest existing handle (within
-  radius tolerance) and starts a drag operation (`SegmentationModule.cpp:524-607`).
+- **Left-click (default mode)** – Ensures a grid cell handle exists under the
+  cursor (creating or reusing one on demand) and immediately begins the drag
+  reposition (`SegmentationModule.cpp:880-1065`,
+  `SegmentationEditManager.cpp:348-458`).
 - **Left-click (point-add mode)** – When Shift is held (or toggled), the module
   calls `addHandleAtWorld` with `allowCreate=true`, enabling new handle creation
   inside gaps (`SegmentationModule.cpp:563-607`). Point-add mode forces the
@@ -141,6 +143,10 @@ valid grid samples for the configured number of iterations (default 25) while
 keeping the seed pinned to the barycentric projection
 (`SegmentationEditManager.cpp:676-748`). This produces a stable local mesh
 fragment rather than a lone point floating away from the existing quad surface.
+If you prefer to avoid the automatic solve, uncheck "Fill invalid regions" in
+the widget and the editor will skip the flood-fill/relaxation pass, requiring an
+existing grid cell instead (`SegmentationWidget.cpp:176-207`,
+`SegmentationEditManager.cpp:361-520`).
 
 
 ## Handle Influence and Preview Updates
@@ -175,8 +181,9 @@ over a fresh copy of the original grid to avoid cumulative drift (`SegmentationE
 ## UI and Settings Persistence
 
 `SegmentationWidget` persists user preferences (down-sample, radius, sigma, hole
-search radius, hole smoothing iterations, handle visibility mode, handle display
-distance) into `VC.ini` by calling `writeSetting` each time a control changes
+search radius, hole smoothing iterations, the fill-invalid-regions toggle,
+handle visibility mode, handle display distance) into `VC.ini` by calling
+`writeSetting` each time a control changes
 (`SegmentationWidget.cpp`). The "Hole Filling" and "Handle Display" groups mirror
 the parameters the editor and overlay consume for gap repair and visibility
 culling. When the widget is constructed it restores those values so sessions
