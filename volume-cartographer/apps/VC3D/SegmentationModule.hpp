@@ -7,6 +7,7 @@
 #include <opencv2/core.hpp>
 
 #include "SegmentationInfluenceMode.hpp"
+#include "SegmentationEditManager.hpp"
 
 #include <functional>
 #include <optional>
@@ -51,6 +52,7 @@ public:
     [[nodiscard]] bool handlesAlwaysVisible() const { return _showHandlesAlways; }
     [[nodiscard]] float handleDisplayDistance() const { return _handleDisplayDistance; }
     [[nodiscard]] float highlightDistance() const { return _highlightDistance; }
+    [[nodiscard]] bool fillInvalidRegions() const { return _fillInvalidRegions; }
 
     void setEditingEnabled(bool enabled);
     void setDownsample(int value);
@@ -65,6 +67,7 @@ public:
     void setHandlesAlwaysVisible(bool value);
     void setHandleDisplayDistance(float distance);
     void setHighlightDistance(float distance);
+    void setFillInvalidRegions(bool enabled);
 
     void applyEdits();
     void resetEdits();
@@ -153,6 +156,19 @@ private:
                            const QPointF& scenePoint,
                            const cv::Vec3f& worldPos);
     const QCursor& addCursor();
+    [[nodiscard]] bool isSegmentationViewer(const CVolumeViewer* viewer) const;
+    struct PullResult
+    {
+        bool moved{false};
+        int candidateCount{0};
+        int appliedCount{0};
+        float averageWeight{0.0f};
+    };
+    [[nodiscard]] const SegmentationEditManager::Handle* screenClosestHandle(CVolumeViewer* viewer,
+                                                                            const cv::Vec3f& referenceWorld,
+                                                                            float maxScreenDistance) const;
+    PullResult pullHandlesTowards(const cv::Vec3f& worldPos,
+                                  std::optional<SegmentationRowColAxis> axis);
     [[nodiscard]] SegmentationRowColAxis rowColAxisForViewer(const CVolumeViewer* viewer) const;
 
     SegmentationWidget* _widget{nullptr};
@@ -174,10 +190,12 @@ private:
     bool _showHandlesAlways{true};
     float _handleDisplayDistance{25.0f};
     float _highlightDistance{15.0f};
+    bool _fillInvalidRegions{true};
 
     bool _pointAddMode{false};
     DragState _drag;
     HoverState _hover;
     cv::Vec3f _cursorWorld{0, 0, 0};
     bool _cursorValid{false};
+    CVolumeViewer* _cursorViewer{nullptr};
 };

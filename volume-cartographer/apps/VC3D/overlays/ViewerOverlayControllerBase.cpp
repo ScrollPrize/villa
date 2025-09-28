@@ -504,18 +504,77 @@ void ViewerOverlayControllerBase::applyPrimitives(CVolumeViewer* viewer,
         items.push_back(item);
     };
 
+    struct PointGroup
+    {
+        qreal radius{0.0};
+        OverlayStyle style{};
+        QPainterPath path;
+    };
+
+    auto fuzzyEqual = [](qreal lhs, qreal rhs) {
+        return std::fabs(lhs - rhs) <= 1e-6;
+    };
+
+    auto dashPatternEqual = [&](const OverlayStyle& a, const OverlayStyle& b) {
+        if (a.dashPattern.size() != b.dashPattern.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < a.dashPattern.size(); ++i) {
+            if (!fuzzyEqual(a.dashPattern[i], b.dashPattern[i])) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto styleEquals = [&](const OverlayStyle& a, const OverlayStyle& b) {
+        return a.penColor == b.penColor &&
+               a.brushColor == b.brushColor &&
+               fuzzyEqual(a.penWidth, b.penWidth) &&
+               a.penStyle == b.penStyle &&
+               a.penCap == b.penCap &&
+               a.penJoin == b.penJoin &&
+               dashPatternEqual(a, b) &&
+               fuzzyEqual(a.z, b.z);
+    };
+
+    std::vector<PointGroup> pointGroups;
+    pointGroups.reserve(4);
+
+    auto groupForPoint = [&](const PointPrimitive& prim) -> PointGroup& {
+        for (auto& group : pointGroups) {
+            if (fuzzyEqual(group.radius, prim.radius) && styleEquals(group.style, prim.style)) {
+                return group;
+            }
+        }
+        PointGroup group;
+        group.radius = prim.radius;
+        group.style = prim.style;
+        group.path = QPainterPath();
+        pointGroups.push_back(group);
+        return pointGroups.back();
+    };
+
+    auto flushPointGroups = [&]() {
+        for (auto& group : pointGroups) {
+            if (group.path.isEmpty()) {
+                continue;
+            }
+            auto* item = new QGraphicsPathItem(group.path);
+            addItem(item, group.style);
+        }
+        pointGroups.clear();
+    };
+
     for (const auto& primitive : primitives) {
         std::visit(
             [&](const auto& prim) {
                 using T = std::decay_t<decltype(prim)>;
                 if constexpr (std::is_same_v<T, PointPrimitive>) {
-                    auto* item = new QGraphicsEllipseItem(
-                        prim.position.x() - prim.radius,
-                        prim.position.y() - prim.radius,
-                        prim.radius * 2.0,
-                        prim.radius * 2.0);
-                    addItem(item, prim.style);
+                    PointGroup& group = groupForPoint(prim);
+                    group.path.addEllipse(prim.position, prim.radius, prim.radius);
                 } else if constexpr (std::is_same_v<T, CirclePrimitive>) {
+                    flushPointGroups();
                     auto* item = new QGraphicsEllipseItem(
                         prim.center.x() - prim.radius,
                         prim.center.y() - prim.radius,
@@ -527,6 +586,7 @@ void ViewerOverlayControllerBase::applyPrimitives(CVolumeViewer* viewer,
                     }
                     addItem(item, style);
                 } else if constexpr (std::is_same_v<T, LineStripPrimitive>) {
+                    flushPointGroups();
                     if (prim.points.size() < 2) {
                         return;
                     }
@@ -540,6 +600,7 @@ void ViewerOverlayControllerBase::applyPrimitives(CVolumeViewer* viewer,
                     auto* item = new QGraphicsPathItem(path);
                     addItem(item, prim.style);
                 } else if constexpr (std::is_same_v<T, RectPrimitive>) {
+                    flushPointGroups();
                     auto* item = new QGraphicsRectItem(prim.rect);
                     auto style = prim.style;
                     if (!prim.filled) {
@@ -547,11 +608,13 @@ void ViewerOverlayControllerBase::applyPrimitives(CVolumeViewer* viewer,
                     }
                     addItem(item, style);
                 } else if constexpr (std::is_same_v<T, TextPrimitive>) {
+                    flushPointGroups();
                     auto* item = new QGraphicsSimpleTextItem(prim.text);
                     item->setFont(prim.font);
                     item->setPos(prim.position);
                     addItem(item, prim.style);
                 } else if constexpr (std::is_same_v<T, PathPrimitive>) {
+                    flushPointGroups();
                     if (prim.points.empty()) {
                         return;
                     }
@@ -610,6 +673,7 @@ void ViewerOverlayControllerBase::applyPrimitives(CVolumeViewer* viewer,
                         addItem(item, style);
                     }
                 } else if constexpr (std::is_same_v<T, ArrowPrimitive>) {
+                    flushPointGroups();
                     QPainterPath path;
                     path.moveTo(prim.start);
                     path.lineTo(prim.end);
@@ -637,6 +701,8 @@ void ViewerOverlayControllerBase::applyPrimitives(CVolumeViewer* viewer,
             },
             primitive);
     }
+
+    flushPointGroups();
 
     if (items.empty()) {
         viewer->clearOverlayGroup(overlayKey);

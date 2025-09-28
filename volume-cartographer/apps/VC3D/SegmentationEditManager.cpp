@@ -225,6 +225,14 @@ void SegmentationEditManager::setHoleSmoothIterations(int iterations)
     _holeSmoothIterations = clamped;
 }
 
+void SegmentationEditManager::setFillInvalidCells(bool enabled)
+{
+    if (_fillInvalidCells == enabled) {
+        return;
+    }
+    _fillInvalidCells = enabled;
+}
+
 void SegmentationEditManager::resetPreview()
 {
     if (!hasSession() || !_previewPoints || !_originalPoints) {
@@ -285,6 +293,15 @@ bool SegmentationEditManager::updateHandleWorldPosition(int row,
                                  : SegmentationRowColAxis::Row;
     }
 
+    if (!handle->isManual) {
+        handle->isManual = true;
+        if (_originalPoints &&
+            row >= 0 && row < _originalPoints->rows &&
+            col >= 0 && col < _originalPoints->cols) {
+            handle->originalWorld = (*_originalPoints)(row, col);
+        }
+    }
+
     handle->currentWorld = newWorldPos;
     _originalPoints->copyTo(*_previewPoints);
     for (const auto& h : _handles) {
@@ -295,6 +312,9 @@ bool SegmentationEditManager::updateHandleWorldPosition(int row,
         if (h.row >= 0 && h.row < _previewPoints->rows && h.col >= 0 && h.col < _previewPoints->cols) {
             h.currentWorld = (*_previewPoints)(h.row, h.col);
         }
+    }
+    if (_previewSurface) {
+        _previewSurface->invalidateCache();
     }
     _dirty = true;
     return true;
@@ -341,6 +361,7 @@ std::optional<std::pair<int,int>> SegmentationEditManager::addHandleAtWorld(cons
                                                                            PlaneSurface* plane,
                                                                            float planeTolerance,
                                                                            bool allowCreate,
+                                                                           bool allowReuse,
                                                                            std::optional<SegmentationRowColAxis> axisHint)
 {
     if (!hasSession() || !_previewPoints || !_originalPoints) {
@@ -426,7 +447,9 @@ std::optional<std::pair<int,int>> SegmentationEditManager::addHandleAtWorld(cons
     bool createdCell = false;
     std::vector<std::pair<int,int>> holeCells;
 
-    if (allowCreate) {
+    const bool allowHoleFill = allowCreate && _fillInvalidCells;
+
+    if (allowHoleFill) {
         int seedRow = bestRow;
         int seedCol = bestCol;
         if (seedRow < 0 || seedCol < 0) {
@@ -454,13 +477,19 @@ std::optional<std::pair<int,int>> SegmentationEditManager::addHandleAtWorld(cons
 
     const bool targetCellInvalid = isInvalidPoint(preview(bestRow, bestCol));
     if (targetCellInvalid) {
+        if (!allowHoleFill) {
+            qWarning() << "SegmentationEditManager: target cell invalid and hole filling disabled";
+            return std::nullopt;
+        }
         createdCell = true;
     }
 
     if (createdCell) {
-        holeCells = collectHoleCells(bestRow, bestCol, _holeSearchRadius);
-        if (holeCells.empty()) {
-            holeCells.emplace_back(bestRow, bestCol);
+        if (allowHoleFill) {
+            holeCells = collectHoleCells(bestRow, bestCol, _holeSearchRadius);
+            if (holeCells.empty()) {
+                holeCells.emplace_back(bestRow, bestCol);
+            }
         }
     } else {
         solvedWorld = preview(bestRow, bestCol);
@@ -473,7 +502,7 @@ std::optional<std::pair<int,int>> SegmentationEditManager::addHandleAtWorld(cons
         (*_originalPoints)(bestRow, bestCol) = solvedWorld;
         (*_previewPoints)(bestRow, bestCol) = solvedWorld;
 
-        if (!holeCells.empty()) {
+        if (!holeCells.empty() && allowHoleFill) {
             relaxHolePatch(holeCells, std::make_pair(bestRow, bestCol), solvedWorld);
         }
     }
@@ -486,7 +515,16 @@ std::optional<std::pair<int,int>> SegmentationEditManager::addHandleAtWorld(cons
             if (axisHint.has_value()) {
                 existing->rowColAxis = *axisHint;
             }
+            if (_previewSurface) {
+                _previewSurface->invalidateCache();
+            }
             _dirty = true;
+            return std::make_pair(bestRow, bestCol);
+        }
+        if (allowReuse) {
+            if (axisHint.has_value()) {
+                existing->rowColAxis = *axisHint;
+            }
             return std::make_pair(bestRow, bestCol);
         }
         qWarning() << "SegmentationEditManager: handle at" << bestRow << bestCol
@@ -509,6 +547,9 @@ std::optional<std::pair<int,int>> SegmentationEditManager::addHandleAtWorld(cons
     }
     _handles.push_back(handle);
 
+    if (_previewSurface) {
+        _previewSurface->invalidateCache();
+    }
     _dirty = true;
 
     return std::make_pair(bestRow, bestCol);
@@ -1142,21 +1183,79 @@ void SegmentationEditManager::applyHandleInfluenceRowCol(const Handle& handle, c
     cv::Mat_<cv::Vec3f>& preview = *_previewPoints;
 
     const int radius = std::max(1, static_cast<int>(std::lround(_radius)));
-    const float strength = std::clamp(_sigma, 0.10f, 2.0f);
-    const float maxWeight = std::min(1.5f, std::max(strength, 0.0f));
-    const float denom = static_cast<float>(radius + 1);
+    if (radius <= 0) {
+        return;
+    }
 
     if (handle.row < 0 || handle.row >= original.rows ||
         handle.col < 0 || handle.col >= original.cols) {
         return;
     }
 
-    auto computeWeight = [&](int distance) {
+    const cv::Vec3f& centerOriginal = handle.originalWorld;
+    if (isInvalidPoint(centerOriginal)) {
+        return;
+    }
+
+    const float strength = std::clamp(_sigma, 0.10f, 2.0f);
+    const float baseMaxWeight = std::min(1.5f, std::max(strength * 1.25f, 0.0f));
+    const float denom = static_cast<float>(radius + 1);
+
+    const float deltaNorm = static_cast<float>(cv::norm(delta));
+    const cv::Vec3f deltaUnit = (deltaNorm > 1e-5f)
+                                    ? (delta / deltaNorm)
+                                    : cv::Vec3f(0.0f, 0.0f, 0.0f);
+
+    auto directionUnit = [&](int rowOffset, int colOffset) -> std::optional<cv::Vec3f> {
+        const int nr = handle.row + rowOffset;
+        const int nc = handle.col + colOffset;
+        if (nr < 0 || nr >= original.rows || nc < 0 || nc >= original.cols) {
+            return std::nullopt;
+        }
+        const cv::Vec3f& neighbour = original(nr, nc);
+        if (isInvalidPoint(neighbour)) {
+            return std::nullopt;
+        }
+        cv::Vec3f vec = neighbour - centerOriginal;
+        const float len = static_cast<float>(cv::norm(vec));
+        if (len < 1e-5f) {
+            return std::nullopt;
+        }
+        return vec / len;
+    };
+
+    auto alignmentFor = [&](int rowOffset, int colOffset) {
+        if (deltaNorm <= 1e-5f) {
+            return 0.0f;
+        }
+        if (auto dir = directionUnit(rowOffset, colOffset)) {
+            return static_cast<float>(dir->dot(deltaUnit));
+        }
+        return 0.0f;
+    };
+
+    const float aboveAlignment = alignmentFor(-1, 0);
+    const float belowAlignment = alignmentFor(1, 0);
+    const float leftAlignment = alignmentFor(0, -1);
+    const float rightAlignment = alignmentFor(0, 1);
+
+    auto directionalBias = [&](float alignment) {
+        const float deltaSigma = strength - 1.0f;
+        float bias = 1.0f + deltaSigma * alignment;
+        return std::clamp(bias, 0.1f, 3.0f);
+    };
+
+    const float aboveBias = directionalBias(aboveAlignment);
+    const float belowBias = directionalBias(belowAlignment);
+    const float leftBias = directionalBias(leftAlignment);
+    const float rightBias = directionalBias(rightAlignment);
+
+    auto baseWeightForDistance = [&](int distance) {
         float normalized = static_cast<float>(distance) / denom;
         normalized = std::clamp(normalized, 0.0f, 1.0f);
-        float falloff = std::max(0.0f, 1.0f - normalized);
+        const float falloff = std::max(0.0f, 1.0f - normalized);
         float weight = strength * falloff;
-        return std::clamp(weight, 0.0f, maxWeight);
+        return std::clamp(weight, 0.0f, baseMaxWeight);
     };
 
     auto applyRow = [&]() {
@@ -1172,7 +1271,13 @@ void SegmentationEditManager::applyHandleInfluenceRowCol(const Handle& handle, c
                 continue;
             }
             const int distance = std::abs(c - handle.col);
-            float weight = computeWeight(distance);
+            float weight = baseWeightForDistance(distance);
+            if (c < handle.col) {
+                weight *= leftBias;
+            } else {
+                weight *= rightBias;
+            }
+            weight = std::clamp(weight, 0.0f, baseMaxWeight);
             if (weight < kMinInfluenceWeight) {
                 continue;
             }
@@ -1193,7 +1298,13 @@ void SegmentationEditManager::applyHandleInfluenceRowCol(const Handle& handle, c
                 continue;
             }
             const int distance = std::abs(r - handle.row);
-            float weight = computeWeight(distance);
+            float weight = baseWeightForDistance(distance);
+            if (r < handle.row) {
+                weight *= aboveBias;
+            } else {
+                weight *= belowBias;
+            }
+            weight = std::clamp(weight, 0.0f, baseMaxWeight);
             if (weight < kMinInfluenceWeight) {
                 continue;
             }

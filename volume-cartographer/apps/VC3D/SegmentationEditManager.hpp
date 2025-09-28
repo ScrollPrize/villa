@@ -31,6 +31,8 @@ public:
     void setSigma(float sigma);
     void setInfluenceMode(SegmentationInfluenceMode mode);
     void setRowColMode(SegmentationRowColMode mode);
+    void setFillInvalidCells(bool enabled);
+    [[nodiscard]] bool fillInvalidCells() const { return _fillInvalidCells; }
     [[nodiscard]] int downsample() const { return _downsample; }
     [[nodiscard]] float radius() const { return _radius; }
     [[nodiscard]] float sigma() const { return _sigma; }
@@ -65,6 +67,7 @@ public:
                                                        PlaneSurface* plane = nullptr,
                                                        float planeTolerance = 0.0f,
                                                        bool allowCreate = false,
+                                                       bool allowReuse = false,
                                                        std::optional<SegmentationRowColAxis> axisHint = std::nullopt);
     bool removeHandle(int row, int col);
     std::optional<cv::Vec3f> handleWorldPosition(int row, int col) const;
@@ -103,4 +106,5 @@ private:
     int _holeSearchRadius{6};
     int _holeSmoothIterations{25};
     bool _dirty{false};
+    bool _fillInvalidCells{true};
 };

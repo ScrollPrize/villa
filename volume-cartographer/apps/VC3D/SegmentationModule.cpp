@@ -15,16 +15,23 @@
 #include <QKeyEvent>
 #include <QColor>
 #include <QFont>
+#include <QLoggingCategory>
 #include <QPainter>
 #include <QPen>
 #include <QPixmap>
 #include <QPointer>
+#include <QStringList>
 #include <QTimer>
 #include <QVariant>
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <optional>
+#include <utility>
+#include <vector>
+
+Q_LOGGING_CATEGORY(lcSegEdit, "vc.segmentation.edit");
 
 namespace
 {
@@ -33,6 +40,80 @@ constexpr int kMaxRadiusSteps = 32;
 constexpr int kStatusShort = 1500;
 constexpr int kStatusMedium = 2000;
 constexpr int kStatusLong = 5000;
+
+QString vecToString(const cv::Vec3f& v)
+{
+    return QStringLiteral("(%1,%2,%3)")
+        .arg(static_cast<double>(v[0]), 0, 'f', 3)
+        .arg(static_cast<double>(v[1]), 0, 'f', 3)
+        .arg(static_cast<double>(v[2]), 0, 'f', 3);
+}
+
+QString modifiersToString(Qt::KeyboardModifiers mods)
+{
+    QStringList parts;
+    if (mods.testFlag(Qt::ShiftModifier)) {
+        parts.append(QStringLiteral("Shift"));
+    }
+    if (mods.testFlag(Qt::ControlModifier)) {
+        parts.append(QStringLiteral("Control"));
+    }
+    if (mods.testFlag(Qt::AltModifier)) {
+        parts.append(QStringLiteral("Alt"));
+    }
+    if (mods.testFlag(Qt::MetaModifier)) {
+        parts.append(QStringLiteral("Meta"));
+    }
+    if (parts.isEmpty()) {
+        return QStringLiteral("None");
+    }
+    return parts.join(QChar('+'));
+}
+
+QString axisToString(std::optional<SegmentationRowColAxis> axis)
+{
+    if (!axis.has_value()) {
+        return QStringLiteral("auto");
+    }
+    switch (*axis) {
+    case SegmentationRowColAxis::Row:
+        return QStringLiteral("row");
+    case SegmentationRowColAxis::Column:
+        return QStringLiteral("column");
+    case SegmentationRowColAxis::Both:
+        return QStringLiteral("both");
+    }
+    return QStringLiteral("auto");
+}
+
+struct ClickLog
+{
+    explicit ClickLog(QString header)
+        : _header(std::move(header))
+    {
+    }
+
+    ~ClickLog()
+    {
+        if (_header.isEmpty()) {
+            return;
+        }
+        if (_details.isEmpty()) {
+            qCInfo(lcSegEdit).noquote() << _header;
+        } else {
+            qCInfo(lcSegEdit).noquote() << _header + QStringLiteral(" | ") + _details.join(QStringLiteral(" | "));
+        }
+    }
+
+    void add(const QString& message)
+    {
+        _details.append(message);
+    }
+
+private:
+    QString _header;
+    QStringList _details;
+};
 }
 
 SegmentationModule::SegmentationModule(SegmentationWidget* widget,
@@ -75,12 +156,14 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _sliceFadeDistance = _widget->sliceFadeDistance();
         _sliceDisplayMode = _widget->sliceDisplayMode();
         _highlightDistance = _widget->highlightDistance();
+        _fillInvalidRegions = _widget->fillInvalidRegions();
     }
     if (_editManager) {
         _editManager->setHoleSearchRadius(_holeSearchRadius);
         _editManager->setHoleSmoothIterations(_holeSmoothIterations);
         _editManager->setInfluenceMode(_influenceMode);
         _editManager->setRowColMode(_rowColMode);
+        _editManager->setFillInvalidCells(_fillInvalidRegions);
     }
     if (_overlay) {
         _overlay->setHandleVisibility(_showHandlesAlways, _handleDisplayDistance);
@@ -139,6 +222,9 @@ void SegmentationModule::bindWidgetSignals()
             Qt::UniqueConnection);
     connect(_widget, &SegmentationWidget::handleDisplayDistanceChanged,
             this, &SegmentationModule::setHandleDisplayDistance,
+            Qt::UniqueConnection);
+    connect(_widget, &SegmentationWidget::fillInvalidRegionsChanged,
+            this, &SegmentationModule::setFillInvalidRegions,
             Qt::UniqueConnection);
     connect(_widget, &SegmentationWidget::applyRequested,
             this, &SegmentationModule::applyEdits,
@@ -435,6 +521,22 @@ void SegmentationModule::setHighlightDistance(float distance)
     }
 }
 
+void SegmentationModule::setFillInvalidRegions(bool enabled)
+{
+    if (_fillInvalidRegions == enabled) {
+        return;
+    }
+    _fillInvalidRegions = enabled;
+
+    if (_widget && _widget->fillInvalidRegions() != enabled) {
+        _widget->setFillInvalidRegions(enabled);
+    }
+
+    if (_editManager) {
+        _editManager->setFillInvalidCells(enabled);
+    }
+}
+
 void SegmentationModule::applyEdits()
 {
     emit statusMessageRequested(tr("Applying segmentation edits"), kStatusMedium);
@@ -541,7 +643,14 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         } else if (_hover.valid) {
             target = std::make_pair(_hover.row, _hover.col);
         } else if (_cursorValid) {
-            if (auto* nearest = _editManager->findNearestHandle(_cursorWorld, _highlightDistance)) {
+            const SegmentationEditManager::Handle* nearest = nullptr;
+            if (_cursorViewer) {
+                nearest = screenClosestHandle(_cursorViewer, _cursorWorld, _highlightDistance);
+            }
+            if (!nearest) {
+                nearest = _editManager->findNearestHandle(_cursorWorld, radiusWorldExtent(_radius));
+            }
+            if (nearest) {
                 target = std::make_pair(nearest->row, nearest->col);
             }
         }
@@ -675,6 +784,7 @@ void SegmentationModule::resetInteractionState()
     _drag.reset();
     _hover.clear();
     _cursorValid = false;
+    _cursorViewer = nullptr;
 
     if (_overlay) {
         _overlay->setActiveHandle(std::nullopt, false);
@@ -732,11 +842,31 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
                                           Qt::MouseButton button,
                                           Qt::KeyboardModifiers modifiers)
 {
-    if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
+    const QString viewerName = viewer ? QString::fromStdString(viewer->surfName()) : QStringLiteral("<null>");
+    const bool canEdit = _editingEnabled && _editManager && _editManager->hasSession();
+    const QString header = QStringLiteral("[SegEdit] click viewer=%1 button=%2 pointAdd=%3 pos=%4 mods=%5")
+                               .arg(viewerName,
+                                    button == Qt::LeftButton ? QStringLiteral("Left") : QStringLiteral("Other"),
+                                    _pointAddMode ? QStringLiteral("true") : QStringLiteral("false"),
+                                    vecToString(worldPos),
+                                    modifiersToString(modifiers));
+
+    if (!canEdit) {
+        qCInfo(lcSegEdit).noquote() << header + QStringLiteral(" | ignored=no-active-session");
         return;
     }
+
+    ClickLog logger(header);
+
+    Q_UNUSED(normal);
+
     if (button != Qt::LeftButton) {
+        logger.add(QStringLiteral("ignored: button not left"));
         return;
+    }
+
+    if (viewer) {
+        _cursorViewer = viewer;
     }
 
     PlaneSurface* planeSurface = viewer ? dynamic_cast<PlaneSurface*>(viewer->currentSurface()) : nullptr;
@@ -746,6 +876,7 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
         const float tolerance = radiusWorldExtent(_radius);
         if (auto* handle = _editManager->findNearestHandle(worldPos, tolerance)) {
             if (_editManager->removeHandle(handle->row, handle->col)) {
+                logger.add(QStringLiteral("removed handle row=%1 col=%2").arg(handle->row).arg(handle->col));
                 _hover.clear();
                 emitPendingChanges();
                 if (_surfaces) {
@@ -757,25 +888,37 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
                     _overlay->setKeyboardHandle(std::nullopt, false);
                     _overlay->refreshAll();
                 }
+            } else {
+                logger.add(QStringLiteral("remove handle failed row=%1 col=%2").arg(handle->row).arg(handle->col));
             }
+        } else {
+            logger.add(QStringLiteral("remove skipped: no handle within %1mm").arg(tolerance, 0, 'f', 2));
         }
         return;
     }
     if (!viewer) {
+        logger.add(QStringLiteral("ignored: viewer null"));
         return;
     }
 
-    const float pickTolerance = radiusWorldExtent(_radius);
-    const float addTolerance = _pointAddMode ? -1.0f : pickTolerance;
-    const float addPlaneTolerance = planeSurface ? (_pointAddMode ? -1.0f : pickTolerance) : 0.0f;
+    logger.add(QStringLiteral("viewer-surface=%1").arg(viewerName));
 
-    auto* handle = _pointAddMode ? nullptr : _editManager->findNearestHandle(worldPos, pickTolerance);
-    if (!handle) {
-        std::optional<SegmentationRowColAxis> axis;
-        if (_influenceMode == SegmentationInfluenceMode::RowColumn) {
-            axis = rowColAxisForViewer(viewer);
-        }
-        if (auto added = _editManager->addHandleAtWorld(worldPos, addTolerance, planeSurface, addPlaneTolerance, _pointAddMode, axis)) {
+    std::optional<SegmentationRowColAxis> axis;
+    if (_influenceMode == SegmentationInfluenceMode::RowColumn) {
+        axis = rowColAxisForViewer(viewer);
+    }
+    logger.add(QStringLiteral("axis-mode=%1").arg(axisToString(axis)));
+
+    if (_pointAddMode) {
+        const float addTolerance = -1.0f;
+        const float addPlaneTolerance = planeSurface ? -1.0f : 0.0f;
+        if (auto added = _editManager->addHandleAtWorld(worldPos,
+                                                        addTolerance,
+                                                        planeSurface,
+                                                        addPlaneTolerance,
+                                                        true,
+                                                        false,
+                                                        axis)) {
             cv::Vec3f handleWorld = worldPos;
             if (auto world = _editManager->handleWorldPosition(added->first, added->second)) {
                 handleWorld = *world;
@@ -791,27 +934,176 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
                 _overlay->setKeyboardHandle(*added, false);
                 _overlay->refreshAll();
             }
+            logger.add(QStringLiteral("added handle row=%1 col=%2").arg(added->first).arg(added->second));
         } else {
             emit statusMessageRequested(tr("Failed to add handle; see terminal for details"), kStatusMedium);
+            logger.add(QStringLiteral("add handle failed"));
         }
         return;
     }
 
+    const float screenRadius = std::max(_highlightDistance, 1.0f);
+    const float extendedRadius = screenRadius * 1.75f;
+    const bool segmentationView = isSegmentationViewer(viewer);
+    logger.add(QStringLiteral("segmentation-view=%1").arg(segmentationView ? QStringLiteral("true") : QStringLiteral("false")));
+    if (segmentationView) {
+        logger.add(QStringLiteral("mass-pull disabled on segmentation surface"));
+    }
+
+    int handleRow = -1;
+    int handleCol = -1;
+    cv::Vec3f initialWorld{0.0f, 0.0f, 0.0f};
+    bool haveHandle = false;
+    bool repositionImmediately = false;
+
+    if (const auto* handle = screenClosestHandle(viewer, worldPos, screenRadius)) {
+        handleRow = handle->row;
+        handleCol = handle->col;
+        initialWorld = handle->currentWorld;
+        haveHandle = true;
+        logger.add(QStringLiteral("picked handle row=%1 col=%2 (screen radius)")
+                       .arg(handleRow)
+                       .arg(handleCol));
+    }
+
+    if (!haveHandle) {
+        if (const auto* handle = screenClosestHandle(viewer, worldPos, extendedRadius)) {
+            handleRow = handle->row;
+            handleCol = handle->col;
+            initialWorld = handle->currentWorld;
+            haveHandle = true;
+            repositionImmediately = true;
+            logger.add(QStringLiteral("picked handle row=%1 col=%2 (extended radius)")
+                           .arg(handleRow)
+                           .arg(handleCol));
+        }
+    }
+
+    if (!haveHandle && !segmentationView) {
+        const auto pullResult = pullHandlesTowards(worldPos, axis);
+        if (pullResult.moved) {
+            logger.add(QStringLiteral("pulled handles candidates=%1 applied=%2 avgWeight=%3")
+                           .arg(pullResult.candidateCount)
+                           .arg(pullResult.appliedCount)
+                           .arg(pullResult.averageWeight, 0, 'f', 3));
+            if (_surfaces) {
+                _surfaces->setSurface("segmentation", _editManager->previewSurface());
+            }
+            emitPendingChanges();
+            if (_overlay) {
+                const auto* hoverHandle = screenClosestHandle(viewer, worldPos, screenRadius);
+                if (hoverHandle) {
+                    if (auto world = _editManager->handleWorldPosition(hoverHandle->row, hoverHandle->col)) {
+                        _hover.set(hoverHandle->row, hoverHandle->col, *world);
+                    } else {
+                        _hover.set(hoverHandle->row, hoverHandle->col, hoverHandle->currentWorld);
+                    }
+                    _overlay->setHoverHandle(std::make_pair(hoverHandle->row, hoverHandle->col));
+                } else {
+                    _hover.clear();
+                    _overlay->setHoverHandle(std::nullopt);
+                }
+                _overlay->setActiveHandle(std::nullopt, false);
+                _overlay->refreshViewer(viewer);
+            }
+            return;
+        } else {
+            logger.add(QStringLiteral("pull skipped candidates=%1 applied=%2")
+                           .arg(pullResult.candidateCount)
+                           .arg(pullResult.appliedCount));
+        }
+    }
+
+    if (!haveHandle) {
+        const float ensureTolerance = -1.0f;
+        const float ensurePlaneTolerance = planeSurface ? -1.0f : 0.0f;
+        if (auto ensured = _editManager->addHandleAtWorld(worldPos,
+                                                          ensureTolerance,
+                                                          planeSurface,
+                                                          ensurePlaneTolerance,
+                                                          true,
+                                                          true,
+                                                          axis)) {
+            handleRow = ensured->first;
+            handleCol = ensured->second;
+            if (auto world = _editManager->handleWorldPosition(handleRow, handleCol)) {
+                initialWorld = *world;
+            } else {
+                initialWorld = worldPos;
+            }
+            haveHandle = true;
+            repositionImmediately = true;
+            logger.add(QStringLiteral("ensured handle row=%1 col=%2")
+                           .arg(handleRow)
+                           .arg(handleCol));
+        } else if (auto* nearest = _editManager->findNearestHandle(worldPos, -1.0f)) {
+            handleRow = nearest->row;
+            handleCol = nearest->col;
+            initialWorld = nearest->currentWorld;
+            haveHandle = true;
+            repositionImmediately = true;
+            logger.add(QStringLiteral("fallback to nearest handle row=%1 col=%2")
+                           .arg(handleRow)
+                           .arg(handleCol));
+        }
+    }
+
+    if (!haveHandle) {
+        logger.add(QStringLiteral("no handle found; click ignored"));
+        return;
+    }
+
+    logger.add(QStringLiteral("begin drag row=%1 col=%2 immediate=%3")
+                   .arg(handleRow)
+                   .arg(handleCol)
+                   .arg(repositionImmediately));
     _drag.active = true;
-    _drag.row = handle->row;
-    _drag.col = handle->col;
+    _drag.row = handleRow;
+    _drag.col = handleCol;
     _drag.viewer = viewer;
-    _drag.startWorld = handle->currentWorld;
+    _drag.startWorld = initialWorld;
     _drag.moved = false;
 
     _hover.clear();
     if (_overlay) {
         _overlay->setHoverHandle(std::nullopt);
-        _overlay->setActiveHandle(std::make_pair(handle->row, handle->col));
+        _overlay->setActiveHandle(std::make_pair(handleRow, handleCol));
+        _overlay->refreshViewer(viewer);
     }
 
     if (viewer->fGraphicsView) {
         viewer->fGraphicsView->setCursor(Qt::ClosedHandCursor);
+    }
+
+    if (repositionImmediately) {
+        const bool moved = _editManager->updateHandleWorldPosition(handleRow, handleCol, worldPos, axis);
+        if (!moved) {
+            emit statusMessageRequested(tr("Handle move failed; see terminal for details"), kStatusMedium);
+            logger.add(QStringLiteral("immediate reposition failed"));
+            _drag.reset();
+            if (_overlay) {
+                _overlay->setActiveHandle(std::nullopt, false);
+                _overlay->refreshViewer(viewer);
+            }
+            if (viewer->fGraphicsView) {
+                viewer->fGraphicsView->setCursor(Qt::ArrowCursor);
+            }
+            return;
+        }
+        _drag.moved = true;
+        logger.add(QStringLiteral("immediate reposition applied"));
+        if (_surfaces) {
+            _surfaces->setSurface("segmentation", _editManager->previewSurface());
+        }
+        emitPendingChanges();
+        if (auto world = _editManager->handleWorldPosition(handleRow, handleCol)) {
+            _hover.set(handleRow, handleCol, *world);
+        }
+        if (_overlay) {
+            _overlay->setActiveHandle(std::make_pair(handleRow, handleCol), false);
+            _overlay->setHoverHandle(std::nullopt, false);
+            _overlay->refreshAll();
+        }
     }
 }
 
@@ -824,6 +1116,7 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
         return;
     }
 
+    _cursorViewer = viewer;
     _cursorWorld = worldPos;
     _cursorValid = true;
     if (_overlay) {
@@ -863,10 +1156,15 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
         return;
     }
 
-    auto* handle = _editManager->findNearestHandle(worldPos, _highlightDistance);
+    const float screenRadius = std::max(_highlightDistance, 1.0f);
+    const SegmentationEditManager::Handle* handle = screenClosestHandle(viewer, worldPos, screenRadius);
     if (handle) {
         const bool changed = !_hover.valid || _hover.row != handle->row || _hover.col != handle->col;
-        _hover.set(handle->row, handle->col, handle->currentWorld);
+        if (auto world = _editManager->handleWorldPosition(handle->row, handle->col)) {
+            _hover.set(handle->row, handle->col, *world);
+        } else {
+            _hover.set(handle->row, handle->col, handle->currentWorld);
+        }
         if (_overlay) {
             _overlay->setHoverHandle(std::make_pair(handle->row, handle->col));
             if (changed) {
@@ -887,6 +1185,9 @@ void SegmentationModule::handleMouseRelease(CVolumeViewer* viewer,
                                             Qt::MouseButton button,
                                             Qt::KeyboardModifiers /*modifiers*/)
 {
+    if (viewer) {
+        _cursorViewer = viewer;
+    }
     if (!_drag.active || viewer != _drag.viewer) {
         return;
     }
@@ -1028,6 +1329,123 @@ const QCursor& SegmentationModule::addCursor()
         initialized = true;
     }
     return cursor;
+}
+
+bool SegmentationModule::isSegmentationViewer(const CVolumeViewer* viewer) const
+{
+    if (!viewer) {
+        return false;
+    }
+    std::string name = viewer->surfName();
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return name == "segmentation";
+}
+
+const SegmentationEditManager::Handle* SegmentationModule::screenClosestHandle(CVolumeViewer* viewer,
+                                                                               const cv::Vec3f& referenceWorld,
+                                                                               float maxScreenDistance) const
+{
+    if (!viewer || !_editManager || !_editManager->hasSession()) {
+        return nullptr;
+    }
+
+    const auto& handles = _editManager->handles();
+    if (handles.empty()) {
+        return nullptr;
+    }
+
+    const float radius = std::max(maxScreenDistance, 1.0f);
+    float bestDistSq = radius * radius;
+    const QPointF cursorScene = viewer->volumePointToScene(referenceWorld);
+    const SegmentationEditManager::Handle* bestHandle = nullptr;
+
+    for (const auto& handle : handles) {
+        const cv::Vec3f& world = handle.currentWorld;
+        if (!std::isfinite(world[0]) || !std::isfinite(world[1]) || !std::isfinite(world[2])) {
+            continue;
+        }
+        const QPointF scenePos = viewer->volumePointToScene(world);
+        const QPointF diff = cursorScene - scenePos;
+        const float distSq = static_cast<float>(QPointF::dotProduct(diff, diff));
+        if (distSq <= bestDistSq) {
+            bestDistSq = distSq;
+            bestHandle = &handle;
+        }
+    }
+
+    return bestHandle;
+}
+
+SegmentationModule::PullResult SegmentationModule::pullHandlesTowards(const cv::Vec3f& worldPos,
+                                                                      std::optional<SegmentationRowColAxis> axis)
+{
+    PullResult result;
+    if (!_editManager || !_editManager->hasSession()) {
+        return result;
+    }
+
+    const auto& handles = _editManager->handles();
+    if (handles.empty()) {
+        return result;
+    }
+
+    const float worldRadius = radiusWorldExtent(_radius);
+    if (worldRadius <= 0.0f || !std::isfinite(worldRadius)) {
+        return result;
+    }
+
+    const float baseStrength = std::clamp(_sigma, 0.10f, 2.0f);
+    struct HandleUpdate {
+        int row;
+        int col;
+        cv::Vec3f target;
+        float weight;
+    };
+    std::vector<HandleUpdate> updates;
+    updates.reserve(handles.size());
+
+    for (const auto& handle : handles) {
+        const cv::Vec3f& current = handle.currentWorld;
+        if (!std::isfinite(current[0]) || !std::isfinite(current[1]) || !std::isfinite(current[2])) {
+            continue;
+        }
+        const float dist = static_cast<float>(cv::norm(current - worldPos));
+        if (!std::isfinite(dist) || dist > worldRadius) {
+            continue;
+        }
+        const float falloff = std::max(0.0f, 1.0f - (dist / worldRadius));
+        if (falloff <= 1e-3f) {
+            continue;
+        }
+        float weight = std::clamp(baseStrength * falloff, 0.0f, 0.95f);
+        if (weight <= 1e-4f) {
+            continue;
+        }
+        cv::Vec3f target = current + (worldPos - current) * weight;
+        updates.push_back({handle.row, handle.col, target, weight});
+    }
+
+    result.candidateCount = static_cast<int>(updates.size());
+    if (updates.empty()) {
+        return result;
+    }
+
+    float weightSum = 0.0f;
+    for (const auto& upd : updates) {
+        if (_editManager->updateHandleWorldPosition(upd.row, upd.col, upd.target, axis)) {
+            result.appliedCount += 1;
+            weightSum += upd.weight;
+        }
+    }
+
+    if (result.appliedCount > 0) {
+        result.moved = true;
+        result.averageWeight = weightSum / static_cast<float>(result.appliedCount);
+    }
+
+    return result;
 }
 
 SegmentationRowColAxis SegmentationModule::rowColAxisForViewer(const CVolumeViewer* viewer) const

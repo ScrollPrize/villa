@@ -35,6 +35,7 @@ public:
     [[nodiscard]] int holeSmoothIterations() const { return _holeSmoothIterations; }
     [[nodiscard]] bool handlesAlwaysVisible() const { return _handlesAlwaysVisible; }
     [[nodiscard]] float handleDisplayDistance() const { return _handleDisplayDistance; }
+    [[nodiscard]] bool fillInvalidRegions() const { return _fillInvalidRegions; }
 
     void setPendingChanges(bool pending);
 
@@ -52,6 +53,7 @@ public slots:
     void setHoleSmoothIterations(int value);
     void setHandlesAlwaysVisible(bool value);
     void setHandleDisplayDistance(float value);
+    void setFillInvalidRegions(bool value);
 
 signals:
     void editingModeChanged(bool enabled);
@@ -62,6 +64,7 @@ signals:
     void holeSmoothIterationsChanged(int value);
     void handlesAlwaysVisibleChanged(bool value);
     void handleDisplayDistanceChanged(float value);
+    void fillInvalidRegionsChanged(bool value);
     void influenceModeChanged(SegmentationInfluenceMode mode);
     void sliceFadeDistanceChanged(float value);
     void sliceDisplayModeChanged(SegmentationSliceDisplayMode mode);
@@ -90,6 +93,7 @@ private:
     QDoubleSpinBox* _spinHighlightDistance;
     QSpinBox* _spinHoleRadius;
     QSpinBox* _spinHoleIterations;
+    QCheckBox* _chkFillInvalidRegions;
     QCheckBox* _chkHandlesAlwaysVisible;
     QDoubleSpinBox* _spinHandleDisplayDistance;
     QPushButton* _btnApply;
@@ -108,6 +112,7 @@ private:
     int _holeSmoothIterations = 25;
     bool _handlesAlwaysVisible = true;
     float _handleDisplayDistance = 25.0f; // world-space units
-    float _highlightDistance = 15.0f;      // world-space units
+    float _highlightDistance = 15.0f;      // screen-space pixels
+    bool _fillInvalidRegions = true;
     bool _hasPendingChanges = false;
 };

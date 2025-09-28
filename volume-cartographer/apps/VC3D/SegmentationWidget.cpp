@@ -26,6 +26,7 @@ SegmentationWidget::SegmentationWidget(QWidget* parent)
     , _spinSigma(nullptr)
     , _spinHoleRadius(nullptr)
     , _spinHoleIterations(nullptr)
+    , _chkFillInvalidRegions(nullptr)
     , _btnApply(nullptr)
     , _btnReset(nullptr)
     , _btnStopTools(nullptr)
@@ -173,6 +174,11 @@ void SegmentationWidget::setupUI()
     auto* holeGroup = new QGroupBox(tr("Hole Filling"), this);
     auto* holeLayout = new QVBoxLayout(holeGroup);
 
+    _chkFillInvalidRegions = new QCheckBox(tr("Fill invalid regions"), holeGroup);
+    _chkFillInvalidRegions->setChecked(_fillInvalidRegions);
+    _chkFillInvalidRegions->setToolTip(tr("When enabled, gap clicks try to solve and smooth missing grid cells before adding a handle."));
+    holeLayout->addWidget(_chkFillInvalidRegions);
+
     auto* holeRadiusLayout = new QHBoxLayout();
     auto* holeRadiusLabel = new QLabel(tr("Search radius:"), holeGroup);
     _spinHoleRadius = new QSpinBox(holeGroup);
@@ -228,7 +234,7 @@ void SegmentationWidget::setupUI()
     _spinHighlightDistance->setSingleStep(0.5);
     _spinHighlightDistance->setDecimals(1);
     _spinHighlightDistance->setValue(static_cast<double>(_highlightDistance));
-    _spinHighlightDistance->setToolTip(tr("World-space radius used to select the nearest handle for hover highlighting"));
+    _spinHighlightDistance->setToolTip(tr("Screen-space radius (pixels) used to select the nearest handle for hover highlighting"));
     highlightLayout->addWidget(highlightLabel);
     highlightLayout->addWidget(_spinHighlightDistance);
     highlightLayout->addStretch();
@@ -378,6 +384,15 @@ void SegmentationWidget::setupUI()
         _holeSmoothIterations = value;
         writeSetting(QStringLiteral("hole_smooth_iterations"), _holeSmoothIterations);
         emit holeSmoothIterationsChanged(value);
+    });
+
+    connect(_chkFillInvalidRegions, &QCheckBox::toggled, this, [this](bool checked) {
+        if (checked == _fillInvalidRegions) {
+            return;
+        }
+        _fillInvalidRegions = checked;
+        writeSetting(QStringLiteral("fill_invalid_regions"), _fillInvalidRegions);
+        emit fillInvalidRegionsChanged(checked);
     });
 
     connect(_chkHandlesAlwaysVisible, &QCheckBox::toggled, this, [this](bool checked) {
@@ -596,6 +611,19 @@ void SegmentationWidget::setHandleDisplayDistance(float value)
     writeSetting(QStringLiteral("handle_display_distance"), _handleDisplayDistance);
 }
 
+void SegmentationWidget::setFillInvalidRegions(bool value)
+{
+    if (_fillInvalidRegions == value) {
+        return;
+    }
+    _fillInvalidRegions = value;
+    if (_chkFillInvalidRegions) {
+        const QSignalBlocker blocker(_chkFillInvalidRegions);
+        _chkFillInvalidRegions->setChecked(value);
+    }
+    writeSetting(QStringLiteral("fill_invalid_regions"), _fillInvalidRegions);
+}
+
 void SegmentationWidget::setHighlightDistance(float value)
 {
     const float clamped = std::clamp(value, 0.5f, 500.0f);
@@ -649,6 +677,9 @@ void SegmentationWidget::updateEditingUi()
     }
     if (_spinHoleIterations) {
         _spinHoleIterations->setEnabled(_editingEnabled);
+    }
+    if (_chkFillInvalidRegions) {
+        _chkFillInvalidRegions->setEnabled(_editingEnabled);
     }
     if (_chkHandlesAlwaysVisible) {
         _chkHandlesAlwaysVisible->setEnabled(true);
@@ -707,6 +738,9 @@ void SegmentationWidget::restoreSettings()
 
     const int storedHoleIterations = settings.value(QStringLiteral("segmentation_edit/hole_smooth_iterations"), _holeSmoothIterations).toInt();
     setHoleSmoothIterations(std::clamp(storedHoleIterations, 1, 200));
+
+    const bool storedFillInvalid = settings.value(QStringLiteral("segmentation_edit/fill_invalid_regions"), _fillInvalidRegions).toBool();
+    setFillInvalidRegions(storedFillInvalid);
 
     const bool storedHandlesAlways = settings.value(QStringLiteral("segmentation_edit/handles_always_visible"), _handlesAlwaysVisible).toBool();
     setHandlesAlwaysVisible(storedHandlesAlways);
