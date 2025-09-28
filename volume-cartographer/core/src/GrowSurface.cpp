@@ -77,6 +77,55 @@ static cv::Vec3f at_int_inv(const cv::Mat_<cv::Vec3f> &points, cv::Vec2f p)
 
 using SurfPoint = std::pair<SurfaceMeta*,cv::Vec2i>;
 
+// -----------------------------------------------------------------------------
+// Robust geometric area helpers (areas returned in voxel^2)
+// -----------------------------------------------------------------------------
+static inline double tri_area_vox2(const cv::Vec3d& a,
+                                   const cv::Vec3d& b,
+                                   const cv::Vec3d& c)
+{
+    const cv::Vec3d u = b - a;
+    const cv::Vec3d v = c - a;
+    const cv::Vec3d w(u[1]*v[2] - u[2]*v[1],
+                      u[2]*v[0] - u[0]*v[2],
+                      u[0]*v[1] - u[1]*v[0]);
+    return 0.5 * std::sqrt(w.dot(w));
+}
+
+static inline double quad_area_vox2(const cv::Vec3d& p00,
+                                    const cv::Vec3d& p10,
+                                    const cv::Vec3d& p01,
+                                    const cv::Vec3d& p11)
+{
+    // Split consistently along (p00 -> p11)
+    return tri_area_vox2(p00, p10, p11) + tri_area_vox2(p00, p11, p01);
+}
+
+// Try to count a quad (top-left index j,i) if its four corners are STATE_LOC_VALID.
+// Returns the quad area (voxel^2) if counted; 0 otherwise. Caller must ensure
+// any check+set of 'quad_done(j,i)' is synchronized if used from parallel code.
+static inline double maybe_quad_area_and_mark(int j, int i,
+                                              const cv::Mat_<uint8_t>& state,
+                                              const cv::Mat_<cv::Vec3d>& points,
+                                              cv::Mat_<uint8_t>& quad_done)
+{
+    if (j < 0 || i < 0 || j >= quad_done.rows || i >= quad_done.cols) return 0.0;
+    if (quad_done(j,i)) return 0.0;
+    if ( (state(j,   i  ) & STATE_LOC_VALID) &&
+         (state(j,   i+1) & STATE_LOC_VALID) &&
+         (state(j+1, i  ) & STATE_LOC_VALID) &&
+         (state(j+1, i+1) & STATE_LOC_VALID) )
+    {
+        const double a = quad_area_vox2(points(j,   i  ),
+                                        points(j,   i+1),
+                                        points(j+1, i  ),
+                                        points(j+1, i+1));
+        quad_done(j,i) = 1;
+        return a;
+    }
+    return 0.0;
+}
+
 // Deterministic ordering for cv::Vec2i (row-major: y, then x)
 struct Vec2iLess {
     bool operator()(const cv::Vec2i& a, const cv::Vec2i& b) const {
@@ -1435,6 +1484,18 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
 
     SurfTrackerData data;
 
+    // Per-quad "already counted" mask for area accumulation (rows-1) x (cols-1)
+    cv::Mat_<uint8_t> quad_done(cv::Size(std::max(0, w-1), std::max(0, h-1)), 0);
+    // Live accumulated area in voxel^2 (progress logging). Updated O(1) per accepted vertex.
+    double area_accum_vox2 = 0.0;
+    auto init_area_scan = [&](void) {
+        area_accum_vox2 = 0.0;
+        quad_done = cv::Mat_<uint8_t>(cv::Size(std::max(0, points.cols-1), std::max(0, points.rows-1)), 0);
+        for (int j = 0; j < state.rows - 1; ++j)
+            for (int i = 0; i < state.cols - 1; ++i)
+                area_accum_vox2 += maybe_quad_area_and_mark(j, i, state, points, quad_done);
+    };
+
     cv::Vec2i seed_loc = {seed_points.rows/2, seed_points.cols/2};
 
     // Deterministic seed search around center using PRNG seeded by param
@@ -1468,6 +1529,9 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
 
     state(y0,x0) = STATE_LOC_VALID | STATE_COORD_VALID;
     fringe.insert(cv::Vec2i(y0,x0));
+
+    // Initial area is zero (need 2x2 block to form first quad)
+    init_area_scan(); // harmless here; leaves accumulator at 0
 
     //insert initial surfs per location
     for(const auto& p : fringe) {
@@ -1868,6 +1932,11 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                     used_area_hr = {used_area.x*step, used_area.y*step, used_area.width*step, used_area.height*step};
                 }
                 fringe.insert(p);
+                // O(1) geometric area update: up to four quads become complete with a new vertex.
+                area_accum_vox2 += maybe_quad_area_and_mark(p[0]-1, p[1]-1, state, points, quad_done);
+                area_accum_vox2 += maybe_quad_area_and_mark(p[0]-1, p[1]  , state, points, quad_done);
+                area_accum_vox2 += maybe_quad_area_and_mark(p[0]  , p[1]-1, state, points, quad_done);
+                area_accum_vox2 += maybe_quad_area_and_mark(p[0]  , p[1]  , state, points, quad_done);
                 mutex.unlock();
             }
             else if (best_inliers == -1) {
@@ -1923,6 +1992,8 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 for(int i=used_area.x-2;i<=used_area.br().x+2;i++)
                     if (state(j,i) & STATE_LOC_VALID)
                         fringe.insert(cv::Vec2i(j,i));
+            // Geometry changed globally; rebuild area mask & accumulator
+            init_area_scan();
         }
 
         int inl_lower_bound_reg = params.value("consensus_default_th", 10);
@@ -1971,10 +2042,11 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 dbg_surf->meta = new nlohmann::json;
                 (*dbg_surf->meta)["vc_grow_seg_from_segments_params"] = params;
 
-                float const area_est_vx2 = loc_valid_count*src_step*src_step*step*step;
-                float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
-                (*dbg_surf->meta)["area_vx2"] = area_est_vx2;
-                (*dbg_surf->meta)["area_cm2"] = area_est_cm2;
+                // Use exact geometric area accumulated so far
+                const double area_exact_vx2 = area_accum_vox2;
+                const double area_exact_cm2 = area_exact_vx2 * double(voxelsize) * double(voxelsize) / 1e8;
+                (*dbg_surf->meta)["area_vx2"] = area_exact_vx2;
+                (*dbg_surf->meta)["area_cm2"] = area_exact_cm2;
                 (*dbg_surf->meta)["used_approved_segments"] = std::vector<std::string>(used_approved_names.begin(), used_approved_names.end());
                 std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str();
                 dbg_surf->save(tgt_dir / uuid, uuid);
@@ -2010,6 +2082,8 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                     data_ths[i] = data;
                     added_points_threads[i].resize(0);
                 }
+                // After remap, geometry/states may have changed -> recompute area mask/accumulator
+                init_area_scan();
             }
 
             last_succ_parametrization = loc_valid_count;
@@ -2031,18 +2105,18 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 (*dbg_surf->meta)["vc_grow_seg_from_segments_params"] = params;
 
                 std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str()+"_opt";
-                float const area_est_vx2 = loc_valid_count*src_step*src_step*step*step;
-                float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
-                (*dbg_surf->meta)["area_vx2"] = area_est_vx2;
-                (*dbg_surf->meta)["area_cm2"] = area_est_cm2;
+                const double area_exact_vx2 = area_accum_vox2;
+                const double area_exact_cm2 = area_exact_vx2 * double(voxelsize) * double(voxelsize) / 1e8;
+                (*dbg_surf->meta)["area_vx2"] = area_exact_vx2;
+                (*dbg_surf->meta)["area_cm2"] = area_exact_cm2;
                 (*dbg_surf->meta)["used_approved_segments"] = std::vector<std::string>(used_approved_names.begin(), used_approved_names.end());
                 dbg_surf->save(tgt_dir / uuid, uuid);
                 delete dbg_surf;
             }
         }
 
-        float const current_area_vx2 = loc_valid_count*src_step*src_step*step*step;
-        float const current_area_cm2 = current_area_vx2 * voxelsize * voxelsize / 1e8;
+        const double current_area_vx2 = area_accum_vox2;
+        const double current_area_cm2 = current_area_vx2 * double(voxelsize) * double(voxelsize) / 1e8;
         printf("gen %d processing %lu fringe cands (total done %d fringe: %lu) area %.0f vx^2 (%f cm^2) best th: %d\n",
                generation, static_cast<unsigned long>(cands.size()), succ, static_cast<unsigned long>(fringe.size()),
                current_area_vx2, current_area_cm2, best_inliers_gen);
@@ -2086,6 +2160,8 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                     //FIXME why isn't this working?!'
                     if (state(j,i) & STATE_LOC_VALID)
                         fringe.insert(cv::Vec2i(j,i));
+            // Grid grew horizontally; rebuild area mask/accumulator in new shape
+            init_area_scan();
         }
 
         cv::imwrite(tgt_dir / "inliers_sum.tif", inliers_sum_dbg(used_area));
@@ -2096,9 +2172,22 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
 
     approved_log.close();
 
-    float const area_est_vx2 = loc_valid_count*src_step*src_step*step*step;
-    float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
-    std::cout << "area est: " << area_est_vx2 << " vx^2 (" << area_est_cm2 << " cm^2)" << std::endl;
+    // Final exact surface area from final optimized geometry.
+    double area_final_vox2 = 0.0;
+    for (int j = 0; j < state.rows - 1; ++j)
+        for (int i = 0; i < state.cols - 1; ++i)
+            if ( (state(j,   i  ) & STATE_LOC_VALID) &&
+                 (state(j,   i+1) & STATE_LOC_VALID) &&
+                 (state(j+1, i  ) & STATE_LOC_VALID) &&
+                 (state(j+1, i+1) & STATE_LOC_VALID) )
+            {
+                area_final_vox2 += quad_area_vox2(points(j,   i  ),
+                                                  points(j,   i+1),
+                                                  points(j+1, i  ),
+                                                  points(j+1, i+1));
+            }
+    const double area_final_cm2 = area_final_vox2 * double(voxelsize) * double(voxelsize) / 1e8;
+    std::cout << "area exact: " << area_final_vox2 << " vx^2 (" << area_final_cm2 << " cm^2)" << std::endl;
 
     cv::Mat_<cv::Vec3f> points_hr =
         surftrack_genpoints_hr(data, state, points, used_area, step, src_step,
@@ -2107,8 +2196,8 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     auto surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
 
     surf->meta = new nlohmann::json;
-    (*surf->meta)["area_vx2"] = area_est_vx2;
-    (*surf->meta)["area_cm2"] = area_est_cm2;
+    (*surf->meta)["area_vx2"] = area_final_vox2;
+    (*surf->meta)["area_cm2"] = area_final_cm2;
     (*surf->meta)["used_approved_segments"] = std::vector<std::string>(used_approved_names.begin(), used_approved_names.end());
 
     return surf;
