@@ -795,6 +795,22 @@ bool SegmentationModule::hasActiveSession() const
     return _editManager && _editManager->hasSession();
 }
 
+void SegmentationModule::refreshSessionFromSurface(QuadSurface* surface)
+{
+    if (!_editManager || !_editManager->hasSession()) {
+        return;
+    }
+
+    _editManager->refreshFromBaseSurface();
+    if (_surfaces) {
+        if (auto* preview = _editManager->previewSurface()) {
+            _surfaces->setSurface("segmentation", preview);
+        }
+    }
+    emitPendingChanges();
+    refreshOverlay();
+}
+
 void SegmentationModule::refreshOverlay()
 {
     if (_overlay) {

@@ -46,6 +46,7 @@ public:
 
     void resetPreview();
     void applyPreview();
+    void refreshFromBaseSurface();
 
     struct Handle {
         int row;

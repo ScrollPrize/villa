@@ -11,6 +11,8 @@
 #include <queue>
 #include <unordered_map>
 
+#include <nlohmann/json.hpp>
+
 namespace
 {
 bool isInvalidPoint(const cv::Vec3f& p)
@@ -137,7 +139,13 @@ bool SegmentationEditManager::beginSession(QuadSurface* baseSurface, int downsam
 
     auto* previewMatrix = new cv::Mat_<cv::Vec3f>(_originalPoints->clone());
     _previewSurface = std::make_unique<QuadSurface>(previewMatrix, baseSurface->scale());
-    _previewSurface->meta = baseSurface->meta;
+    if (_previewSurface->meta) {
+        delete _previewSurface->meta;
+        _previewSurface->meta = nullptr;
+    }
+    if (baseSurface->meta) {
+        _previewSurface->meta = new nlohmann::json(*baseSurface->meta);
+    }
     _previewSurface->path = baseSurface->path;
     _previewSurface->id = baseSurface->id;
     _previewPoints = _previewSurface->rawPointsPtr();
@@ -262,6 +270,62 @@ void SegmentationEditManager::applyPreview()
     // Update original snapshot to new base state
     *(_originalPoints) = basePoints->clone();
     basePoints->copyTo(*_previewPoints);
+    regenerateHandles();
+    _dirty = false;
+}
+
+void SegmentationEditManager::refreshFromBaseSurface()
+{
+    if (!hasSession() || !_baseSurface) {
+        return;
+    }
+
+    const cv::Mat_<cv::Vec3f>& basePoints = _baseSurface->rawPoints();
+
+    if (!_originalPoints || _originalPoints->size() != basePoints.size()) {
+        _originalPoints = std::make_unique<cv::Mat_<cv::Vec3f>>(basePoints.clone());
+    } else {
+        basePoints.copyTo(*_originalPoints);
+    }
+
+    const auto rebuildPreviewSurface = [this, &basePoints]() {
+        auto* previewMatrix = new cv::Mat_<cv::Vec3f>(basePoints.clone());
+        _previewSurface = std::make_unique<QuadSurface>(previewMatrix, _baseSurface->scale());
+        if (_previewSurface->meta) {
+            delete _previewSurface->meta;
+            _previewSurface->meta = nullptr;
+        }
+        if (_baseSurface->meta) {
+            _previewSurface->meta = new nlohmann::json(*_baseSurface->meta);
+        }
+        _previewSurface->path = _baseSurface->path;
+        _previewSurface->id = _baseSurface->id;
+        _previewPoints = _previewSurface->rawPointsPtr();
+    };
+
+    if (!_previewPoints || _previewSurface == nullptr) {
+        rebuildPreviewSurface();
+    } else if (_previewPoints->size() != basePoints.size()) {
+        rebuildPreviewSurface();
+    } else {
+        basePoints.copyTo(*_previewPoints);
+        if (_previewSurface) {
+            if (_previewSurface->meta) {
+                delete _previewSurface->meta;
+                _previewSurface->meta = nullptr;
+            }
+            if (_baseSurface->meta) {
+                _previewSurface->meta = new nlohmann::json(*_baseSurface->meta);
+            }
+            _previewSurface->path = _baseSurface->path;
+            _previewSurface->id = _baseSurface->id;
+        }
+    }
+
+    if (_previewSurface) {
+        _previewSurface->invalidateCache();
+    }
+
     regenerateHandles();
     _dirty = false;
 }
@@ -1354,6 +1418,17 @@ void SegmentationEditManager::syncPreviewFromBase()
     const cv::Mat_<cv::Vec3f>& basePoints = _baseSurface->rawPoints();
     if (!_previewPoints->empty() && basePoints.size() == _previewPoints->size()) {
         basePoints.copyTo(*_previewPoints);
+        if (_previewSurface) {
+            if (_previewSurface->meta) {
+                delete _previewSurface->meta;
+                _previewSurface->meta = nullptr;
+            }
+            if (_baseSurface->meta) {
+                _previewSurface->meta = new nlohmann::json(*_baseSurface->meta);
+            }
+            _previewSurface->path = _baseSurface->path;
+            _previewSurface->id = _baseSurface->id;
+        }
     }
 }
 

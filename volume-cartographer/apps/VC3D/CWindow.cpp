@@ -1726,7 +1726,7 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
 
         if (_segmentationModule && _segmentationModule->hasActiveSession()) {
             qCInfo(lcSegGrowth) << "Refreshing active segmentation session after interpolation growth";
-            _segmentationModule->applyEdits();
+            _segmentationModule->refreshSessionFromSurface(segmentationSurface);
         }
 
         qCInfo(lcSegGrowth) << "Interpolation growth complete";
@@ -1815,7 +1815,7 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
 
         if (_segmentationModule && _segmentationModule->hasActiveSession()) {
             qCInfo(lcSegGrowth) << "Refreshing active segmentation session after tracer growth";
-            _segmentationModule->applyEdits();
+            _segmentationModule->refreshSessionFromSurface(segmentationSurface);
         }
 
         qCInfo(lcSegGrowth) << "Tracer growth completed successfully";

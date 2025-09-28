@@ -85,6 +85,7 @@ public:
     bool beginEditingSession(QuadSurface* activeSurface);
     void endEditingSession();
     bool hasActiveSession() const;
+    void refreshSessionFromSurface(QuadSurface* surface);
 
 signals:
     void editingEnabledChanged(bool enabled);
