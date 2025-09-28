@@ -62,6 +62,7 @@ public:
                                    const cv::Vec3f& newWorldPos,
                                    std::optional<SegmentationRowColAxis> axisHint = std::nullopt);
     Handle* findNearestHandle(const cv::Vec3f& world, float tolerance);
+    void bakePreviewToOriginal();
     std::optional<std::pair<int,int>> addHandleAtWorld(const cv::Vec3f& worldPos,
                                                        float tolerance = 40.0f,
                                                        PlaneSurface* plane = nullptr,

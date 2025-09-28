@@ -3,6 +3,7 @@
 #include <QWidget>
 
 #include "SegmentationInfluenceMode.hpp"
+#include "SegmentationGrowth.hpp"
 
 class QPushButton;
 class QSpinBox;
@@ -73,6 +74,9 @@ signals:
     void applyRequested();
     void resetRequested();
     void stopToolsRequested();
+    void growSurfaceRequested(SegmentationGrowthMethod method,
+                              SegmentationGrowthDirection direction,
+                              int steps);
 
 private:
     void setupUI();
@@ -99,6 +103,10 @@ private:
     QPushButton* _btnApply;
     QPushButton* _btnReset;
     QPushButton* _btnStopTools;
+    class QComboBox* _comboGrowthMethod;
+    class QComboBox* _comboGrowthDirection;
+    QSpinBox* _spinGrowthSteps;
+    QPushButton* _btnGrow;
 
     bool _editingEnabled = false;
     int _downsample = 12;
@@ -115,4 +123,7 @@ private:
     float _highlightDistance = 15.0f;      // screen-space pixels
     bool _fillInvalidRegions = true;
     bool _hasPendingChanges = false;
+    SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Tracer};
+    SegmentationGrowthDirection _growthDirection{SegmentationGrowthDirection::All};
+    int _growthSteps{0};
 };

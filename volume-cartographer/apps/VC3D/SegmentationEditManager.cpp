@@ -1357,6 +1357,40 @@ void SegmentationEditManager::syncPreviewFromBase()
     }
 }
 
+void SegmentationEditManager::bakePreviewToOriginal()
+{
+    if (!_previewPoints || !_originalPoints) {
+        return;
+    }
+
+    _previewPoints->copyTo(*_originalPoints);
+
+    for (auto& handle : _handles) {
+        if (handle.row < 0 || handle.col < 0) {
+            continue;
+        }
+        if (handle.row >= _previewPoints->rows || handle.col >= _previewPoints->cols) {
+            continue;
+        }
+        const cv::Vec3f& value = (*_previewPoints)(handle.row, handle.col);
+        handle.originalWorld = value;
+        handle.currentWorld = value;
+    }
+
+    auto manualBegin = std::remove_if(_handles.begin(), _handles.end(), [](const Handle& h) {
+        return h.isManual;
+    });
+    if (manualBegin != _handles.end()) {
+        _handles.erase(manualBegin, _handles.end());
+    }
+
+    if (_previewSurface) {
+        _previewSurface->invalidateCache();
+    }
+
+    regenerateHandles();
+}
+
 void SegmentationEditManager::reapplyAllHandles()
 {
     if (!hasSession() || !_previewPoints || !_originalPoints) {

@@ -10,6 +10,7 @@
 #include <QFileDialog>
 #include <QTextStream>
 #include <QFileInfo>
+#include <QDir>
 #include <QProgressDialog>
 #include <QMessageBox>
 #include <QThread>
@@ -23,6 +24,8 @@
 #include <QToolBar>
 #include <QFileInfo>
 #include <QTimer>
+#include <QSize>
+#include <QLoggingCategory>
 #include <QGraphicsSimpleTextItem>
 #include <QPointer>
 #include <QPen>
@@ -34,6 +37,7 @@
 #include <cctype>
 #include <algorithm>
 #include <utility>
+#include <initializer_list>
 #include <omp.h>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/highgui.hpp>
@@ -68,6 +72,8 @@
 
 
 
+
+Q_LOGGING_CATEGORY(lcSegGrowth, "vc.segmentation.growth");
 
 using qga = QGuiApplication;
 using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
@@ -111,6 +117,45 @@ void configureFloatingBehaviour(QDockWidget* dock)
         }
         dock->show();
     }
+}
+
+void ensureDockWidgetFeatures(QDockWidget* dock)
+{
+    if (!dock) {
+        return;
+    }
+
+    auto features = dock->features();
+    features |= QDockWidget::DockWidgetMovable;
+    features |= QDockWidget::DockWidgetFloatable;
+    features |= QDockWidget::DockWidgetClosable;
+    dock->setFeatures(features);
+}
+
+void ensureGenerationsChannel(QuadSurface* surface)
+{
+    if (!surface) {
+        return;
+    }
+    cv::Mat generations = surface->channel("generations");
+    if (!generations.empty()) {
+        return;
+    }
+    cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+    if (!points || points->empty()) {
+        return;
+    }
+    cv::Mat_<uint16_t> seeded(points->rows, points->cols, static_cast<uint16_t>(1));
+    surface->setChannel("generations", seeded);
+}
+
+QString cacheRootForVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
+{
+    if (!pkg) {
+        return QString();
+    }
+    const QString base = QString::fromStdString(pkg->getVolpkgDirectory());
+    return QDir(base).filePath(QStringLiteral("cache"));
 }
 }
 
@@ -197,11 +242,32 @@ CWindow::CWindow() :
 
     // Restore geometry / sizes
     const QSettings geometry;
-    if (geometry.contains("mainWin/geometry")) {
-        restoreGeometry(geometry.value("mainWin/geometry").toByteArray());
+    const QByteArray savedGeometry = geometry.value("mainWin/geometry").toByteArray();
+    if (!savedGeometry.isEmpty()) {
+        restoreGeometry(savedGeometry);
     }
-    if (geometry.contains("mainWin/state")) {
-        restoreState(geometry.value("mainWin/state").toByteArray());
+    const QByteArray savedState = geometry.value("mainWin/state").toByteArray();
+    if (!savedState.isEmpty()) {
+        restoreState(savedState);
+    }
+
+    for (QDockWidget* dock : { ui.dockWidgetSegmentation,
+                               ui.dockWidgetDistanceTransform,
+                               ui.dockWidgetDrawing,
+                               ui.dockWidgetOpList,
+                               ui.dockWidgetOpSettings,
+                               ui.dockWidgetComposite,
+                               ui.dockWidgetVolumes,
+                               ui.dockWidgetLocation }) {
+        ensureDockWidgetFeatures(dock);
+    }
+    ensureDockWidgetFeatures(_point_collection_widget);
+
+    const QSize minWindowSize(960, 640);
+    setMinimumSize(minWindowSize);
+    if (width() < minWindowSize.width() || height() < minWindowSize.height()) {
+        resize(std::max(width(), minWindowSize.width()),
+               std::max(height(), minWindowSize.height()));
     }
 
     // If enabled, auto open the last used volpkg
@@ -603,6 +669,8 @@ void CWindow::CreateWidgets(void)
                 Q_UNUSED(position);
                 applySlicePlaneOrientation(base);
             });
+    connect(_segmentationModule.get(), &SegmentationModule::growSurfaceRequested,
+            this, &CWindow::onGrowSegmentationSurface);
 
     // Create Drawing widget
     _drawingWidget = new DrawingWidget(ui.dockWidgetDrawing);
@@ -1594,6 +1662,171 @@ void CWindow::onSegmentationStopToolsRequested()
         _cmdRunner->cancel();
         statusBar()->showMessage(tr("Cancelling running tools..."), 3000);
     }
+}
+
+void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
+                                        SegmentationGrowthDirection direction,
+                                        int steps)
+{
+    qCInfo(lcSegGrowth) << "Segmentation growth requested"
+                        << segmentationGrowthMethodToString(method)
+                        << segmentationGrowthDirectionToString(direction)
+                        << "steps" << steps;
+    if (_segmentationGrowthRunning) {
+        qCInfo(lcSegGrowth) << "Rejecting growth because another operation is running";
+        statusBar()->showMessage(tr("A surface growth operation is already running."), 4000);
+        return;
+    }
+
+    if (!currentVolume) {
+        qCInfo(lcSegGrowth) << "Rejecting growth because there is no active volume";
+        statusBar()->showMessage(tr("No volume loaded for growth."), 4000);
+        return;
+    }
+
+    auto* segmentationSurface = dynamic_cast<QuadSurface*>(_surf_col->surface("segmentation"));
+    if (!segmentationSurface) {
+        qCInfo(lcSegGrowth) << "Rejecting growth because segmentation surface is missing";
+        statusBar()->showMessage(tr("Segmentation surface is not available."), 4000);
+        return;
+    }
+
+    ensureGenerationsChannel(segmentationSurface);
+
+    _segmentationGrowthRunning = true;
+    if (_segmentationModule) {
+        _segmentationModule->setGrowthInProgress(true);
+    }
+    const auto finalize = [this]() {
+        _segmentationGrowthRunning = false;
+        if (_segmentationModule) {
+            _segmentationModule->setGrowthInProgress(false);
+        }
+        qCInfo(lcSegGrowth) << "Segmentation growth finalize called";
+    };
+
+    if (method == SegmentationGrowthMethod::Interpolate) {
+        qCInfo(lcSegGrowth) << "Starting interpolation growth";
+        QString error;
+        if (!growSurfaceByInterpolation(segmentationSurface, direction, steps, &error)) {
+            qCInfo(lcSegGrowth) << "Interpolation growth failed" << error;
+            statusBar()->showMessage(error.isEmpty() ? tr("Interpolation growth failed.") : error, 5000);
+            finalize();
+            return;
+        }
+
+        try {
+            segmentationSurface->saveOverwrite();
+        } catch (const std::exception& ex) {
+            qCInfo(lcSegGrowth) << "Failed to save interpolation result" << ex.what();
+            statusBar()->showMessage(tr("Failed to save segmentation: %1").arg(ex.what()), 5000);
+        }
+
+        _surf_col->setSurface("segmentation", segmentationSurface);
+
+        if (_segmentationModule && _segmentationModule->hasActiveSession()) {
+            qCInfo(lcSegGrowth) << "Refreshing active segmentation session after interpolation growth";
+            _segmentationModule->applyEdits();
+        }
+
+        qCInfo(lcSegGrowth) << "Interpolation growth complete";
+        statusBar()->showMessage(tr("Interpolation growth complete."), 4000);
+        finalize();
+        return;
+    }
+
+    qCInfo(lcSegGrowth) << "Starting tracer growth";
+    statusBar()->showMessage(tr("Running tracer-based surface growth..."), 2000);
+
+    SegmentationGrowthRequest request;
+    request.method = method;
+    request.direction = direction;
+    request.steps = steps;
+
+    TracerGrowthContext ctx;
+    ctx.resumeSurface = segmentationSurface;
+    ctx.volume = currentVolume.get();
+    ctx.cache = chunk_cache;
+    ctx.cacheRoot = cacheRootForVolumePkg(fVpkg);
+    ctx.voxelSize = currentVolume->voxelSize();
+
+    if (ctx.cacheRoot.isEmpty()) {
+        const auto volumePath = currentVolume->path();
+        ctx.cacheRoot = QDir(QString::fromStdString(volumePath.parent_path().string())).filePath(QStringLiteral("cache"));
+    }
+
+    if (ctx.cacheRoot.isEmpty()) {
+        qCInfo(lcSegGrowth) << "Tracer growth aborted because cache root is empty";
+        statusBar()->showMessage(tr("Cache root unavailable for tracer growth."), 5000);
+        finalize();
+        return;
+    }
+
+    qCInfo(lcSegGrowth) << "Launching tracer future" << ctx.cacheRoot;
+    auto future = QtConcurrent::run(runTracerGrowth, request, ctx);
+    auto* watcher = new QFutureWatcher<TracerGrowthResult>(this);
+    _tracerGrowthWatcher.reset(watcher);
+
+    connect(watcher, &QFutureWatcher<TracerGrowthResult>::finished, this, [this, segmentationSurface, finalize]() {
+        if (!_tracerGrowthWatcher) {
+            qCInfo(lcSegGrowth) << "Tracer watcher finished but watcher reset early";
+            finalize();
+            return;
+        }
+
+        const TracerGrowthResult result = _tracerGrowthWatcher->result();
+        _tracerGrowthWatcher.reset();
+
+        qCInfo(lcSegGrowth) << "Tracer growth finished" << (result.error.isEmpty() ? "success" : "error");
+
+        if (!result.error.isEmpty()) {
+            qCInfo(lcSegGrowth) << "Tracer growth error" << result.error;
+            statusBar()->showMessage(result.error, 6000);
+            finalize();
+            return;
+        }
+
+        if (!result.surface) {
+            qCInfo(lcSegGrowth) << "Tracer growth returned null surface";
+            statusBar()->showMessage(tr("Tracer growth did not return a surface."), 5000);
+            finalize();
+            return;
+        }
+
+        if (auto* destPoints = segmentationSurface->rawPointsPtr()) {
+            *destPoints = result.surface->rawPoints();
+        }
+
+        cv::Mat generations = result.surface->channel("generations");
+        if (!generations.empty()) {
+            segmentationSurface->setChannel("generations", generations);
+        }
+
+        segmentationSurface->invalidateCache();
+
+        try {
+            segmentationSurface->saveOverwrite();
+        } catch (const std::exception& ex) {
+            qCInfo(lcSegGrowth) << "Failed to save tracer result" << ex.what();
+            statusBar()->showMessage(tr("Failed to save segmentation: %1").arg(ex.what()), 5000);
+        }
+
+        _surf_col->setSurface("segmentation", segmentationSurface);
+
+        if (_segmentationModule && _segmentationModule->hasActiveSession()) {
+            qCInfo(lcSegGrowth) << "Refreshing active segmentation session after tracer growth";
+            _segmentationModule->applyEdits();
+        }
+
+        qCInfo(lcSegGrowth) << "Tracer growth completed successfully";
+        delete result.surface;
+
+        const QString message = result.statusMessage.isEmpty() ? tr("Tracer growth complete.") : result.statusMessage;
+        statusBar()->showMessage(message, 4000);
+        finalize();
+    });
+
+    watcher->setFuture(future);
 }
 
 void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)

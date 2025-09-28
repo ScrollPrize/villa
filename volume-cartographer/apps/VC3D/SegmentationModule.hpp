@@ -8,6 +8,7 @@
 
 #include "SegmentationInfluenceMode.hpp"
 #include "SegmentationEditManager.hpp"
+#include "SegmentationGrowth.hpp"
 
 #include <functional>
 #include <optional>
@@ -68,6 +69,7 @@ public:
     void setHandleDisplayDistance(float distance);
     void setHighlightDistance(float distance);
     void setFillInvalidRegions(bool enabled);
+    void setGrowthInProgress(bool running);
 
     void applyEdits();
     void resetEdits();
@@ -90,6 +92,9 @@ signals:
     void pendingChangesChanged(bool pending);
     void stopToolsRequested();
     void focusPoiRequested(const cv::Vec3f& position, QuadSurface* surface);
+    void growSurfaceRequested(SegmentationGrowthMethod method,
+                              SegmentationGrowthDirection direction,
+                              int steps);
 
 private:
     struct DragState {
@@ -129,9 +134,13 @@ private:
     };
 
     void bindWidgetSignals();
+    void handleGrowSurfaceRequested(SegmentationGrowthMethod method,
+                                    SegmentationGrowthDirection direction,
+                                    int steps);
     void bindViewerSignals(CVolumeViewer* viewer);
     void refreshOverlay();
     void emitPendingChanges();
+    void resetOverlayHandles();
     void resetInteractionState();
     [[nodiscard]] float gridStepWorld() const;
     [[nodiscard]] float radiusWorldExtent(float gridRadius) const;
@@ -197,5 +206,6 @@ private:
     HoverState _hover;
     cv::Vec3f _cursorWorld{0, 0, 0};
     bool _cursorValid{false};
+    bool _growthInProgress{false};
     CVolumeViewer* _cursorViewer{nullptr};
 };

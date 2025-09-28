@@ -1,5 +1,6 @@
 #pragma once
 #include "vc/core/util/Surface.hpp"
+#include "vc/ui/VCCollection.hpp"
 
 struct Chunked3dFloatFromUint8;
 struct Chunked3dVec3fFromUint8;
@@ -12,4 +13,4 @@ struct DirectionField
 };
 
 QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMeta*> &surfs_v, const nlohmann::json &params, float voxelsize = 1.0);
-QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root = "", float voxelsize = 1.0, std::vector<DirectionField> const &direction_fields = {}, QuadSurface* resume_surf = nullptr);
+QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root = "", float voxelsize = 1.0, const std::vector<DirectionField> &direction_fields = {}, QuadSurface* resume_surf = nullptr, const std::filesystem::path& tgt_path = "", const nlohmann::json& meta_params = {}, const VCCollection &corrections = VCCollection());

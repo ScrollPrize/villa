@@ -6,6 +6,7 @@
 #include <opencv2/core.hpp>
 #include <QComboBox>
 #include <QCheckBox>
+#include <QFutureWatcher>
 #include <memory>
 #include "ui_VCMain.h"
 
@@ -26,6 +27,7 @@
 #include "overlays/VectorOverlayController.hpp"
 #include "ViewerManager.hpp"
 #include "SegmentationWidget.hpp"
+#include "SegmentationGrowth.hpp"
 #include "OpChain.hpp"
 #include "OpsList.hpp"
 #include "OpsSettings.hpp"
@@ -79,6 +81,9 @@ public slots:
     void onSlimFlatten(const std::string& segmentId);
     void onAWSUpload(const std::string& segmentId);
     void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
+    void onGrowSegmentationSurface(SegmentationGrowthMethod method,
+                                   SegmentationGrowthDirection direction,
+                                   int steps);
    void onFocusPOIChanged(std::string name, POI* poi);
     void onPointDoubleClicked(uint64_t pointId);
 
@@ -194,6 +199,8 @@ private:
     std::unique_ptr<ViewerManager> _viewerManager;
     CSurfaceCollection *_surf_col;
     bool _useAxisAlignedSlices{false};
+    bool _segmentationGrowthRunning{false};
+    std::unique_ptr<QFutureWatcher<TracerGrowthResult>> _tracerGrowthWatcher;
 
     std::unordered_map<std::string, OpChain*> _opchains;
 

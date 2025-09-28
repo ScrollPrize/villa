@@ -235,6 +235,33 @@ void SegmentationModule::bindWidgetSignals()
     connect(_widget, &SegmentationWidget::stopToolsRequested,
             this, &SegmentationModule::stopTools,
             Qt::UniqueConnection);
+    connect(_widget, &SegmentationWidget::growSurfaceRequested,
+            this, &SegmentationModule::handleGrowSurfaceRequested,
+            Qt::UniqueConnection);
+}
+
+void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod method,
+                                                    SegmentationGrowthDirection direction,
+                                                    int steps)
+{
+    qCInfo(lcSegEdit) << "Grow request received" << segmentationGrowthMethodToString(method)
+                      << segmentationGrowthDirectionToString(direction)
+                      << "steps" << steps;
+    if (_growthInProgress) {
+        qCInfo(lcSegEdit) << "Ignoring grow request because growth is already running";
+        emit statusMessageRequested(tr("Surface growth already in progress"), kStatusMedium);
+        return;
+    }
+    if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
+        qCInfo(lcSegEdit) << "Rejecting grow request because editing session is unavailable"
+                          << "editingEnabled" << _editingEnabled
+                          << "hasEditManager" << (_editManager != nullptr)
+                          << "hasSession" << (_editManager && _editManager->hasSession());
+        emit statusMessageRequested(tr("Enable segmentation editing before growing surfaces"), kStatusMedium);
+        return;
+    }
+    qCInfo(lcSegEdit) << "Forwarding grow request to window";
+    emit growSurfaceRequested(method, direction, steps);
 }
 
 void SegmentationModule::bindViewerSignals(CVolumeViewer* viewer)
@@ -537,6 +564,11 @@ void SegmentationModule::setFillInvalidRegions(bool enabled)
     }
 }
 
+void SegmentationModule::setGrowthInProgress(bool running)
+{
+    _growthInProgress = running;
+}
+
 void SegmentationModule::applyEdits()
 {
     emit statusMessageRequested(tr("Applying segmentation edits"), kStatusMedium);
@@ -779,6 +811,18 @@ void SegmentationModule::emitPendingChanges()
     }
 }
 
+void SegmentationModule::resetOverlayHandles()
+{
+    _hover.clear();
+
+    if (_overlay) {
+        _overlay->setActiveHandle(std::nullopt, false);
+        _overlay->setHoverHandle(std::nullopt, false);
+        _overlay->setKeyboardHandle(std::nullopt, false);
+        _overlay->refreshAll();
+    }
+}
+
 void SegmentationModule::resetInteractionState()
 {
     _drag.reset();
@@ -935,6 +979,13 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
                 _overlay->refreshAll();
             }
             logger.add(QStringLiteral("added handle row=%1 col=%2").arg(added->first).arg(added->second));
+
+            _editManager->bakePreviewToOriginal();
+
+            if (_surfaces) {
+                _surfaces->setSurface("segmentation", _editManager->previewSurface());
+            }
+            resetOverlayHandles();
         } else {
             emit statusMessageRequested(tr("Failed to add handle; see terminal for details"), kStatusMedium);
             logger.add(QStringLiteral("add handle failed"));
@@ -1104,6 +1155,12 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
             _overlay->setHoverHandle(std::nullopt, false);
             _overlay->refreshAll();
         }
+
+        _editManager->bakePreviewToOriginal();
+        if (_surfaces) {
+            _surfaces->setSurface("segmentation", _editManager->previewSurface());
+        }
+        resetOverlayHandles();
     }
 }
 
@@ -1153,6 +1210,12 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
             _overlay->setHoverHandle(std::nullopt, false);
             _overlay->refreshAll();
         }
+
+        _editManager->bakePreviewToOriginal();
+        if (_surfaces) {
+            _surfaces->setSurface("segmentation", _editManager->previewSurface());
+        }
+        resetOverlayHandles();
         return;
     }
 
@@ -1221,13 +1284,18 @@ void SegmentationModule::handleMouseRelease(CVolumeViewer* viewer,
 
     emitPendingChanges();
 
+    if (_editManager) {
+        _editManager->bakePreviewToOriginal();
+    }
+
+    if (_surfaces) {
+        _surfaces->setSurface("segmentation", _editManager->previewSurface());
+    }
+
+    resetOverlayHandles();
+
     if (_overlay) {
-        _overlay->setActiveHandle(std::nullopt, false);
-        if (_hover.valid) {
-            _overlay->setHoverHandle(std::make_pair(_hover.row, _hover.col));
-        } else {
-            _overlay->setHoverHandle(std::nullopt);
-        }
+        _overlay->setHoverHandle(std::nullopt, false);
     }
 
     _drag.reset();

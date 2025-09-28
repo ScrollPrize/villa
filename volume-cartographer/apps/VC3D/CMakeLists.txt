@@ -23,6 +23,7 @@ set(srcs
     DrawingWidget.hpp
     SegmentationWidget.cpp
     SegmentationWidget.hpp
+    SegmentationGrowth.cpp
     SegmentationEditManager.cpp
     SegmentationEditManager.hpp
     overlays/SegmentationOverlayController.cpp
@@ -72,6 +73,7 @@ add_executable(VC3D ${srcs} resources.qrc)
 target_link_libraries(VC3D
     vc_core
     vc_ui
+    vc_tracer
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets

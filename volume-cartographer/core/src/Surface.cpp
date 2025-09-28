@@ -367,6 +367,23 @@ cv::Mat QuadSurface::channel(const std::string& name, int flags)
     return cv::Mat();
 }
 
+void QuadSurface::invalidateCache()
+{
+    if (_points) {
+        _bounds = {0, 0, _points->cols - 1, _points->rows - 1};
+        _center = {
+            _points->cols / 2.0 / _scale[0],
+            _points->rows / 2.0 / _scale[1],
+            0
+        };
+    } else {
+        _bounds = {0, 0, -1, -1};
+        _center = {0, 0, 0};
+    }
+
+    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+}
+
 void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
                       cv::Mat_<cv::Vec3f>* normals,
                       cv::Size size,
@@ -1171,6 +1188,24 @@ void QuadSurface::save(const std::filesystem::path &path_, bool force_overwrite)
         save(path_, path_.parent_path().filename(), force_overwrite);
     else
         save(path_, path_.filename(), force_overwrite);
+}
+
+void QuadSurface::saveOverwrite()
+{
+    if (path.empty()) {
+        throw std::runtime_error("QuadSurface::saveOverwrite() requires a valid path");
+    }
+
+    std::filesystem::path final_path = path;
+    std::string uuid = !id.empty() ? id : final_path.filename().string();
+    if (uuid.empty()) {
+        throw std::runtime_error("QuadSurface::saveOverwrite() requires a non-empty uuid");
+    }
+
+    save(final_path.string(), uuid, true);
+
+    path = final_path;
+    id = uuid;
 }
 
 void QuadSurface::save(const std::string &path_, const std::string &uuid, bool force_overwrite)

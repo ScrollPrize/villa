@@ -12,10 +12,13 @@
 #include <QVariant>
 #include <QVBoxLayout>
 #include <QSignalBlocker>
+#include <QLoggingCategory>
 
 #include <algorithm>
 
 #include <cmath>
+
+Q_LOGGING_CATEGORY(lcSegWidget, "vc.segmentation.widget");
 
 SegmentationWidget::SegmentationWidget(QWidget* parent)
     : QWidget(parent)
@@ -242,6 +245,50 @@ void SegmentationWidget::setupUI()
 
     layout->addWidget(handleDisplayGroup);
 
+    auto* growthGroup = new QGroupBox(tr("Surface Growth"), this);
+    auto* growthLayout = new QVBoxLayout(growthGroup);
+
+    auto* methodLayout = new QHBoxLayout();
+    auto* methodLabel = new QLabel(tr("Method:"), growthGroup);
+    _comboGrowthMethod = new QComboBox(growthGroup);
+    _comboGrowthMethod->addItem(tr("Tracer"), static_cast<int>(SegmentationGrowthMethod::Tracer));
+    _comboGrowthMethod->addItem(tr("Interpolate"), static_cast<int>(SegmentationGrowthMethod::Interpolate));
+    methodLayout->addWidget(methodLabel);
+    methodLayout->addWidget(_comboGrowthMethod);
+    methodLayout->addStretch();
+    growthLayout->addLayout(methodLayout);
+
+    auto* directionLayout = new QHBoxLayout();
+    auto* directionLabel = new QLabel(tr("Direction:"), growthGroup);
+    _comboGrowthDirection = new QComboBox(growthGroup);
+    _comboGrowthDirection->addItem(tr("All"), static_cast<int>(SegmentationGrowthDirection::All));
+    _comboGrowthDirection->addItem(tr("Up"), static_cast<int>(SegmentationGrowthDirection::Up));
+    _comboGrowthDirection->addItem(tr("Down"), static_cast<int>(SegmentationGrowthDirection::Down));
+    _comboGrowthDirection->addItem(tr("Left"), static_cast<int>(SegmentationGrowthDirection::Left));
+    _comboGrowthDirection->addItem(tr("Right"), static_cast<int>(SegmentationGrowthDirection::Right));
+    directionLayout->addWidget(directionLabel);
+    directionLayout->addWidget(_comboGrowthDirection);
+    directionLayout->addStretch();
+    growthLayout->addLayout(directionLayout);
+
+    auto* stepsLayout = new QHBoxLayout();
+    auto* stepsLabel = new QLabel(tr("Steps:"), growthGroup);
+    _spinGrowthSteps = new QSpinBox(growthGroup);
+    _spinGrowthSteps->setRange(0, 1024);
+    _spinGrowthSteps->setSingleStep(1);
+    _spinGrowthSteps->setValue(_growthSteps);
+    _spinGrowthSteps->setToolTip(tr("Number of grid units to add in the chosen direction"));
+    stepsLayout->addWidget(stepsLabel);
+    stepsLayout->addWidget(_spinGrowthSteps);
+    stepsLayout->addStretch();
+    growthLayout->addLayout(stepsLayout);
+
+    _btnGrow = new QPushButton(tr("Grow"), growthGroup);
+    _btnGrow->setToolTip(tr("Extend the segmentation surface using the selected method"));
+    growthLayout->addWidget(_btnGrow);
+
+    layout->addWidget(growthGroup);
+
     auto* actionsLayout = new QHBoxLayout();
     _btnApply = new QPushButton(tr("Apply"), this);
     _btnApply->setDefault(true);
@@ -364,6 +411,53 @@ void SegmentationWidget::setupUI()
         _highlightDistance = distance;
         writeSetting(QStringLiteral("highlight_distance"), _highlightDistance);
         emit highlightDistanceChanged(_highlightDistance);
+    });
+
+    connect(_comboGrowthMethod, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (index < 0) {
+            return;
+        }
+        const QVariant methodData = _comboGrowthMethod->itemData(index);
+        if (!methodData.isValid()) {
+            return;
+        }
+        auto method = segmentationGrowthMethodFromInt(methodData.toInt());
+        if (method == _growthMethod) {
+            return;
+        }
+        _growthMethod = method;
+        writeSetting(QStringLiteral("growth_method"), static_cast<int>(_growthMethod));
+    });
+
+    connect(_comboGrowthDirection, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (index < 0) {
+            return;
+        }
+        const QVariant dirData = _comboGrowthDirection->itemData(index);
+        if (!dirData.isValid()) {
+            return;
+        }
+        auto direction = segmentationGrowthDirectionFromInt(dirData.toInt());
+        if (direction == _growthDirection) {
+            return;
+        }
+        _growthDirection = direction;
+        writeSetting(QStringLiteral("growth_direction"), static_cast<int>(_growthDirection));
+    });
+
+    connect(_spinGrowthSteps, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if (value == _growthSteps) {
+            return;
+        }
+        _growthSteps = std::max(0, value);
+        writeSetting(QStringLiteral("growth_steps"), _growthSteps);
+    });
+
+    connect(_btnGrow, &QPushButton::clicked, this, [this]() {
+        qCInfo(lcSegWidget) << "Grow pressed" << segmentationGrowthMethodToString(_growthMethod)
+                            << segmentationGrowthDirectionToString(_growthDirection)
+                            << "steps" << _growthSteps;
+        emit growSurfaceRequested(_growthMethod, _growthDirection, _growthSteps);
     });
 
     connect(_spinHoleRadius, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
@@ -690,6 +784,18 @@ void SegmentationWidget::updateEditingUi()
     if (_spinHighlightDistance) {
         _spinHighlightDistance->setEnabled(_editingEnabled);
     }
+    if (_comboGrowthMethod) {
+        _comboGrowthMethod->setEnabled(_editingEnabled);
+    }
+    if (_comboGrowthDirection) {
+        _comboGrowthDirection->setEnabled(_editingEnabled);
+    }
+    if (_spinGrowthSteps) {
+        _spinGrowthSteps->setEnabled(_editingEnabled);
+    }
+    if (_btnGrow) {
+        _btnGrow->setEnabled(_editingEnabled);
+    }
     if (_btnApply) {
         _btnApply->setEnabled(_editingEnabled && _hasPendingChanges);
     }
@@ -750,6 +856,33 @@ void SegmentationWidget::restoreSettings()
 
     const double storedHighlightDistance = settings.value(QStringLiteral("segmentation_edit/highlight_distance"), static_cast<double>(_highlightDistance)).toDouble();
     setHighlightDistance(static_cast<float>(std::clamp(storedHighlightDistance, 0.5, 500.0)));
+
+    const int storedGrowthMethod = settings.value(QStringLiteral("segmentation_edit/growth_method"), static_cast<int>(_growthMethod)).toInt();
+    _growthMethod = segmentationGrowthMethodFromInt(storedGrowthMethod);
+    if (_comboGrowthMethod) {
+        const QSignalBlocker blocker(_comboGrowthMethod);
+        int idx = _comboGrowthMethod->findData(static_cast<int>(_growthMethod));
+        if (idx >= 0) {
+            _comboGrowthMethod->setCurrentIndex(idx);
+        }
+    }
+
+    const int storedGrowthDirection = settings.value(QStringLiteral("segmentation_edit/growth_direction"), static_cast<int>(_growthDirection)).toInt();
+    _growthDirection = segmentationGrowthDirectionFromInt(storedGrowthDirection);
+    if (_comboGrowthDirection) {
+        const QSignalBlocker blocker(_comboGrowthDirection);
+        int idx = _comboGrowthDirection->findData(static_cast<int>(_growthDirection));
+        if (idx >= 0) {
+            _comboGrowthDirection->setCurrentIndex(idx);
+        }
+    }
+
+    const int storedGrowthSteps = settings.value(QStringLiteral("segmentation_edit/growth_steps"), _growthSteps).toInt();
+    _growthSteps = std::clamp(storedGrowthSteps, 0, 1024);
+    if (_spinGrowthSteps) {
+        const QSignalBlocker blocker(_spinGrowthSteps);
+        _spinGrowthSteps->setValue(_growthSteps);
+    }
 }
 
 void SegmentationWidget::writeSetting(const QString& key, const QVariant& value)
