@@ -15,6 +15,11 @@
 #include <QRegularExpressionValidator>
 #include <QFile>
 #include <QTextStream>
+#include <QtGlobal>
+#include <QProcessEnvironment>
+#if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
+#include <QStandardPaths>   // for QStandardPaths::findExecutable
+#endif
 
 #include "CommandLineToolRunner.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -51,6 +56,62 @@ static bool runProcessBlocking(const QString& program,
 
     return (p.exitStatus()==QProcess::NormalExit && p.exitCode()==0);
 }
+
+// --------- locate 'flatboi' executable --------------------------------------
+static QString findFlatboiExecutable()
+{
+    // 0) Env var override (handy for CI or local dev)
+    const QByteArray envFlatboi = qgetenv("FLATBOI");
+    if (!envFlatboi.isEmpty()) {
+        const QString p = QString::fromLocal8Bit(envFlatboi);
+        QFileInfo fi(p);
+        if (fi.exists() && fi.isFile() && fi.isExecutable())
+            return fi.absoluteFilePath();
+    }
+
+    // 1) INI override (VC.ini -> [tools] flatboi_path=/full/path/to/flatboi)
+    {
+        QSettings settings("VC.ini", QSettings::IniFormat);
+        const QString iniPath = settings.value("tools/flatboi_path",
+                                               settings.value("tools/flatboi")).toString().trimmed();
+        if (!iniPath.isEmpty()) {
+            QFileInfo fi(iniPath);
+            if (fi.exists() && fi.isFile() && fi.isExecutable())
+                return fi.absoluteFilePath();
+        }
+    }
+
+    // 2) Known absolute locations
+    const QStringList known = {
+        "/usr/local/bin/flatboi",
+        "/home/builder/vc-dependencies/bin/flatboi"
+    };
+    for (const QString& p : known) {
+        QFileInfo fi(p);
+        if (fi.exists() && fi.isFile() && fi.isExecutable())
+            return fi.absoluteFilePath();
+    }
+
+    // 3) Search on PATH
+#if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
+    const QString onPath = QStandardPaths::findExecutable("flatboi");
+    if (!onPath.isEmpty())
+        return onPath;
+#else
+    const QStringList pathDirs =
+        QProcessEnvironment::systemEnvironment().value("PATH")
+            .split(QDir::listSeparator(), Qt::SkipEmptyParts);
+    for (const QString& dir : pathDirs) {
+        const QString candidate = QDir(dir).filePath("flatboi");
+        QFileInfo fi(candidate);
+        if (fi.exists() && fi.isFile() && fi.isExecutable())
+            return fi.absoluteFilePath();
+    }
+#endif
+
+    return {}; // not found
+}
+
 
 void CWindow::onRenderSegment(const std::string& segmentId)
 {
@@ -173,16 +234,26 @@ void CWindow::onSlimFlatten(const std::string& segmentId)
         }
     }
 
-    // 2) SLIM via flatboi executable: /usr/local/bin/flatboi <obj> 20
+    // 2) SLIM via flatboi executable
     statusBar()->showMessage(tr("Running SLIM (flatboi executable)…"), 0);
     {
-        const QString flatboiExe = "/usr/local/bin/flatboi";
-        if (!QFileInfo::exists(flatboiExe)) {
-            QMessageBox::critical(this, tr("Error"),
-                                tr("flatboi executable not found at:\n%1").arg(flatboiExe));
+        const QString flatboiExe = findFlatboiExecutable();
+        if (flatboiExe.isEmpty()) {
+            const QString msg =
+                tr("Could not find the 'flatboi' executable.\n"
+                "Looked in:\n"
+                "  • /usr/local/bin/flatboi\n"
+                "  • /home/builder/vc-dependencies/bin/flatboi\n"
+                "and on your PATH.\n\n"
+                "Tip: set an override via:\n"
+                "  • VC.ini  →  [tools] flatboi_path=/full/path/to/flatboi\n"
+                "  • or set environment variable FLATBOI=/full/path/to/flatboi");
+            QMessageBox::critical(this, tr("Error"), msg);
             statusBar()->showMessage(tr("SLIM-flatten failed"), 5000);
             return;
         }
+
+        std::cout << "Using flatboi: " << flatboiExe.toStdString() << std::endl;
 
         QString err;
         if (!runProcessBlocking(flatboiExe, QStringList() << objPath << "20", segDir, nullptr, &err)) {
@@ -198,6 +269,7 @@ void CWindow::onSlimFlatten(const std::string& segmentId)
             return;
         }
     }
+
 
 
     // 3) flattened obj -> tifxyz  (IMPORTANT: do NOT pre-create the directory)
