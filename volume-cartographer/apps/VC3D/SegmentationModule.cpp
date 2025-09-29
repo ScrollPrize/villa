@@ -808,9 +808,12 @@ void SegmentationModule::updateViewerCursors()
 
 void SegmentationModule::setPointAddMode(bool enabled, bool silent)
 {
-    if (enabled && _handlesLocked) {
+    if (enabled && (_handlesLocked || _correctionsAnnotateMode)) {
         if (!silent) {
-            emit statusMessageRequested(tr("Unlock handles to add manual points."), kStatusShort);
+            const QString message = _correctionsAnnotateMode
+                                        ? tr("Point add mode is unavailable while corrections are active.")
+                                        : tr("Unlock handles to add manual points.");
+            emit statusMessageRequested(message, kStatusShort);
         }
         return;
     }
@@ -834,6 +837,10 @@ void SegmentationModule::togglePointAddMode()
 bool SegmentationModule::handleKeyPress(QKeyEvent* event)
 {
     if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
+        return false;
+    }
+
+    if (_correctionsAnnotateMode) {
         return false;
     }
 
@@ -1435,6 +1442,10 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
         }
     }
 
+    if (_correctionsAnnotateMode) {
+        return;
+    }
+
     if (_handlesLocked) {
         return;
     }
@@ -1504,6 +1515,10 @@ void SegmentationModule::handleMouseRelease(CVolumeViewer* viewer,
                                             Qt::MouseButton button,
                                             Qt::KeyboardModifiers /*modifiers*/)
 {
+    if (_correctionsAnnotateMode) {
+        return;
+    }
+
     if (_handlesLocked) {
         return;
     }
@@ -1566,7 +1581,7 @@ void SegmentationModule::handleRadiusWheel(CVolumeViewer* viewer,
                                            const QPointF& scenePoint,
                                            const cv::Vec3f& /*worldPos*/)
 {
-    if (!_editingEnabled || !_editManager || !_editManager->hasSession() || _handlesLocked) {
+    if (!_editingEnabled || !_editManager || !_editManager->hasSession() || _handlesLocked || _correctionsAnnotateMode) {
         return;
     }
     if (steps == 0) {
@@ -1852,6 +1867,10 @@ void SegmentationModule::setCorrectionsAnnotateMode(bool enabled, bool userIniti
     }
 
     _correctionsAnnotateMode = enabled;
+
+    if (_correctionsAnnotateMode) {
+        resetInteractionState();
+    }
 
     updateHandleVisibility();
 
