@@ -69,94 +69,6 @@ void ensureMetaObject(QuadSurface* surface)
     surface->meta = new nlohmann::json(nlohmann::json::object());
 }
 
-cv::Mat_<uint16_t> extendGenerations(const cv::Mat& generations,
-                                     SegmentationGrowthDirection direction,
-                                     int steps)
-{
-    if (generations.empty() || steps <= 0) {
-        return generations.clone();
-    }
-
-    const int rows = generations.rows;
-    const int cols = generations.cols;
-
-    cv::Mat_<uint16_t> extended;
-    switch (direction) {
-    case SegmentationGrowthDirection::Left:
-        extended = cv::Mat_<uint16_t>::zeros(rows, cols + steps);
-        generations.copyTo(extended(cv::Rect(steps, 0, cols, rows)));
-        break;
-    case SegmentationGrowthDirection::Right:
-        extended = cv::Mat_<uint16_t>::zeros(rows, cols + steps);
-        generations.copyTo(extended(cv::Rect(0, 0, cols, rows)));
-        break;
-    case SegmentationGrowthDirection::Up:
-        extended = cv::Mat_<uint16_t>::zeros(rows + steps, cols);
-        generations.copyTo(extended(cv::Rect(0, steps, cols, rows)));
-        break;
-    case SegmentationGrowthDirection::Down:
-        extended = cv::Mat_<uint16_t>::zeros(rows + steps, cols);
-        generations.copyTo(extended(cv::Rect(0, 0, cols, rows)));
-        break;
-    case SegmentationGrowthDirection::All:
-    default:
-        extended = generations.clone();
-        break;
-    }
-
-    return extended;
-}
-
-void writeInterpolatedColumns(const cv::Mat_<cv::Vec3f>& source,
-                              cv::Mat_<cv::Vec3f>& target,
-                              int steps,
-                              bool insertLeft)
-{
-    CV_Assert(source.cols >= 2);
-    const int rows = source.rows;
-    const int cols = source.cols;
-
-    const int offset = insertLeft ? steps : 0;
-    const cv::Rect dstRect(offset, 0, cols, rows);
-    source.copyTo(target(dstRect));
-
-    for (int s = 0; s < steps; ++s) {
-        const int dstCol = insertLeft ? steps - 1 - s : cols + s;
-        const float scalar = static_cast<float>(s + 1);
-        for (int r = 0; r < rows; ++r) {
-            const cv::Vec3f base = source(r, insertLeft ? 0 : cols - 1);
-            const cv::Vec3f neighbor = source(r, insertLeft ? std::min(1, cols - 1) : std::max(cols - 2, 0));
-            const cv::Vec3f delta = neighbor - base;
-            target(r, dstCol) = base + delta * scalar;
-        }
-    }
-}
-
-void writeInterpolatedRows(const cv::Mat_<cv::Vec3f>& source,
-                           cv::Mat_<cv::Vec3f>& target,
-                           int steps,
-                           bool insertTop)
-{
-    CV_Assert(source.rows >= 2);
-    const int rows = source.rows;
-    const int cols = source.cols;
-
-    const int offset = insertTop ? steps : 0;
-    const cv::Rect dstRect(0, offset, cols, rows);
-    source.copyTo(target(dstRect));
-
-    for (int s = 0; s < steps; ++s) {
-        const int dstRow = insertTop ? steps - 1 - s : rows + s;
-        const float scalar = static_cast<float>(s + 1);
-        for (int c = 0; c < cols; ++c) {
-            const cv::Vec3f base = source(insertTop ? 0 : rows - 1, c);
-            const cv::Vec3f neighbor = source(insertTop ? std::min(1, rows - 1) : std::max(rows - 2, 0), c);
-            const cv::Vec3f delta = neighbor - base;
-            target(dstRow, c) = base + delta * scalar;
-        }
-    }
-}
-
 bool ensureGenerationsChannel(QuadSurface* surface)
 {
     if (!surface) {
@@ -275,78 +187,6 @@ nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
 }
 } // namespace
 
-bool growSurfaceByInterpolation(QuadSurface* surface,
-                                SegmentationGrowthDirection direction,
-                                int steps,
-                                QString* error)
-{
-    if (!surface) {
-        if (error) {
-            *error = QStringLiteral("No segmentation surface available");
-        }
-        return false;
-    }
-    if (steps <= 0) {
-        if (error) {
-            *error = QStringLiteral("Steps must be greater than zero for interpolation growth");
-        }
-        return false;
-    }
-
-    cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (!points || points->empty()) {
-        if (error) {
-            *error = QStringLiteral("Segmentation surface has no points to grow");
-        }
-        return false;
-    }
-
-    if ((direction == SegmentationGrowthDirection::Left || direction == SegmentationGrowthDirection::Right) && points->cols < 2) {
-        if (error) {
-            *error = QStringLiteral("Need at least two columns to interpolate additional columns");
-        }
-        return false;
-    }
-
-    if ((direction == SegmentationGrowthDirection::Up || direction == SegmentationGrowthDirection::Down) && points->rows < 2) {
-        if (error) {
-            *error = QStringLiteral("Need at least two rows to interpolate additional rows");
-        }
-        return false;
-    }
-
-    cv::Mat_<cv::Vec3f> grown;
-
-    switch (direction) {
-    case SegmentationGrowthDirection::Left:
-    case SegmentationGrowthDirection::Right:
-        grown = cv::Mat_<cv::Vec3f>(points->rows, points->cols + steps, cv::Vec3f(-1.0f, -1.0f, -1.0f));
-        writeInterpolatedColumns(*points, grown, steps, direction == SegmentationGrowthDirection::Left);
-        break;
-    case SegmentationGrowthDirection::Up:
-    case SegmentationGrowthDirection::Down:
-        grown = cv::Mat_<cv::Vec3f>(points->rows + steps, points->cols, cv::Vec3f(-1.0f, -1.0f, -1.0f));
-        writeInterpolatedRows(*points, grown, steps, direction == SegmentationGrowthDirection::Up);
-        break;
-    case SegmentationGrowthDirection::All:
-        if (error) {
-            *error = QStringLiteral("Interpolation growth does not support the 'All' direction");
-        }
-        return false;
-    }
-
-    *points = grown;
-    surface->invalidateCache();
-
-    cv::Mat existingGenerations = surface->channel("generations");
-    if (!existingGenerations.empty()) {
-        cv::Mat_<uint16_t> extended = extendGenerations(existingGenerations, direction, steps);
-        surface->setChannel("generations", extended);
-    }
-
-    return true;
-}
-
 TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                    const TracerGrowthContext& context)
 {
@@ -414,11 +254,11 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         targetGenerations = startGen;
     }
     if (targetGenerations <= 0) {
-        targetGenerations = 1;
+        targetGenerations = startGen;
     }
 
     params["generations"] = targetGenerations;
-    params["rewind_gen"] = -1;
+    params["rewind_gen"] = startGen -1;
     params["cache_root"] = context.cacheRoot.toStdString();
     if (!context.normalGridPath.isEmpty()) {
         params["normal_grid_path"] = context.normalGridPath.toStdString();

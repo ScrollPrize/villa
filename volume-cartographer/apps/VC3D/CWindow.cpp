@@ -1242,6 +1242,18 @@ void CWindow::CloseVolume(void)
     // Notify viewers to clear their surface pointers before we delete them
     emit sendVolumeClosing();
 
+    // Tear down active segmentation editing before surfaces disappear to avoid
+    // dangling pointers inside the edit manager when the underlying surfaces
+    // are unloaded (reloading with editing enabled previously triggered a
+    // use-after-free crash).
+    if (_segmentationModule) {
+        if (_segmentationModule->editingEnabled()) {
+            _segmentationModule->setEditingEnabled(false);
+        } else if (_segmentationModule->hasActiveSession()) {
+            _segmentationModule->endEditingSession();
+        }
+    }
+
     // Clear surface collection first
     _surf_col->setSurface("segmentation", nullptr, true);
 
@@ -1826,45 +1838,6 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
         }
         qCInfo(lcSegGrowth) << "Segmentation growth finalize called";
     };
-
-    if (method == SegmentationGrowthMethod::Interpolate) {
-        qCInfo(lcSegGrowth) << "Starting interpolation growth";
-        QString error;
-        if (!growSurfaceByInterpolation(segmentationSurface, direction, steps, &error)) {
-            qCInfo(lcSegGrowth) << "Interpolation growth failed" << error;
-            statusBar()->showMessage(error.isEmpty() ? tr("Interpolation growth failed.") : error, 5000);
-            finalize();
-            return;
-        }
-
-        updateSegmentationSurfaceMetadata(segmentationSurface, currentVolume->voxelSize());
-
-        try {
-            ensureSurfaceMetaObject(segmentationSurface);
-            segmentationSurface->saveOverwrite();
-        } catch (const std::exception& ex) {
-            qCInfo(lcSegGrowth) << "Failed to save interpolation result" << ex.what();
-            statusBar()->showMessage(tr("Failed to save segmentation: %1").arg(ex.what()), 5000);
-        }
-
-        _surf_col->setSurface("segmentation", segmentationSurface);
-
-        synchronizeSurfaceMeta(fVpkg, segmentationSurface, _surfacePanel ? _surfacePanel.get() : nullptr);
-
-        if (_segmentationModule && _segmentationModule->hasActiveSession()) {
-            _segmentationModule->markNextHandlesFromGrowth();
-            qCInfo(lcSegGrowth) << "Refreshing active segmentation session after interpolation growth";
-            _segmentationModule->refreshSessionFromSurface(segmentationSurface);
-        }
-
-        applySlicePlaneOrientation(segmentationSurface);
-        refreshSegmentationViewers(_viewerManager.get());
-
-        qCInfo(lcSegGrowth) << "Interpolation growth complete";
-        statusBar()->showMessage(tr("Interpolation growth complete."), 4000);
-        finalize();
-        return;
-    }
 
     SegmentationCorrectionsPayload corrections;
     if (_segmentationModule) {

@@ -16,8 +16,7 @@ class ChunkCache;
 
 enum class SegmentationGrowthMethod {
     Tracer = 0,
-    Interpolate = 1,
-    Corrections = 2,
+    Corrections = 1,
 };
 
 inline QString segmentationGrowthMethodToString(SegmentationGrowthMethod method)
@@ -25,8 +24,6 @@ inline QString segmentationGrowthMethodToString(SegmentationGrowthMethod method)
     switch (method) {
     case SegmentationGrowthMethod::Tracer:
         return QStringLiteral("Tracer");
-    case SegmentationGrowthMethod::Interpolate:
-        return QStringLiteral("Interpolate");
     case SegmentationGrowthMethod::Corrections:
         return QStringLiteral("Corrections");
     }
@@ -35,9 +32,6 @@ inline QString segmentationGrowthMethodToString(SegmentationGrowthMethod method)
 
 inline SegmentationGrowthMethod segmentationGrowthMethodFromInt(int value)
 {
-    if (value == static_cast<int>(SegmentationGrowthMethod::Interpolate)) {
-        return SegmentationGrowthMethod::Interpolate;
-    }
     if (value == static_cast<int>(SegmentationGrowthMethod::Corrections)) {
         return SegmentationGrowthMethod::Corrections;
     }
@@ -105,11 +99,6 @@ struct SegmentationGrowthRequest {
     int steps{0};
     SegmentationCorrectionsPayload corrections;
 };
-
-bool growSurfaceByInterpolation(QuadSurface* surface,
-                                SegmentationGrowthDirection direction,
-                                int steps,
-                                QString* error = nullptr);
 
 struct TracerGrowthContext {
     QuadSurface* resumeSurface{nullptr};

@@ -976,12 +976,11 @@ void SegmentationWidget::restoreSettings()
     setHighlightDistance(static_cast<float>(std::clamp(storedHighlightDistance, 0.5, 500.0)));
 
     const int storedGrowthMethod = settings.value(QStringLiteral("segmentation_edit/growth_method"), static_cast<int>(_growthMethod)).toInt();
-    auto restoredGrowthMethod = segmentationGrowthMethodFromInt(storedGrowthMethod);
-    if (restoredGrowthMethod == SegmentationGrowthMethod::Interpolate) {
-        restoredGrowthMethod = SegmentationGrowthMethod::Tracer;
-        writeSetting(QStringLiteral("growth_method"), static_cast<int>(restoredGrowthMethod));
+    if (storedGrowthMethod == static_cast<int>(SegmentationGrowthMethod::Corrections)) {
+        _growthMethod = SegmentationGrowthMethod::Corrections;
+    } else {
+        _growthMethod = SegmentationGrowthMethod::Tracer;
     }
-    _growthMethod = restoredGrowthMethod;
     if (_comboGrowthMethod) {
         const QSignalBlocker blocker(_comboGrowthMethod);
         int idx = _comboGrowthMethod->findData(static_cast<int>(_growthMethod));
