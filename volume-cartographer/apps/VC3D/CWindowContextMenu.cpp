@@ -15,6 +15,11 @@
 #include <QRegularExpressionValidator>
 #include <QFile>
 #include <QTextStream>
+#include <QtGlobal>
+#include <QProcessEnvironment>
+#if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
+#include <QStandardPaths>   // for QStandardPaths::findExecutable
+#endif
 
 #include "CommandLineToolRunner.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -52,62 +57,60 @@ static bool runProcessBlocking(const QString& program,
     return (p.exitStatus()==QProcess::NormalExit && p.exitCode()==0);
 }
 
-static QString resolvePythonPath()
+// --------- locate 'flatboi' executable --------------------------------------
+static QString findFlatboiExecutable()
 {
-    QSettings s("VC.ini", QSettings::IniFormat);
-    const QString ini = s.value("python/path").toString();
-    if (!ini.isEmpty() && QFileInfo::exists(ini)) return ini;
-
-    const QString env = QString::fromLocal8Bit(qgetenv("VC_PYTHON"));
-    if (!env.isEmpty() && QFileInfo::exists(env)) return env;
-
-    // Prefer micromamba env
-    if (QFileInfo::exists("/opt/micromamba/envs/py310/bin/python"))
-        return "/opt/micromamba/envs/py310/bin/python";
-
-    // Check for miniconda3 if available
-    const QString minicondaPath = QDir::homePath() + "/miniconda3/bin/python3";
-    if (QFileInfo::exists(minicondaPath)) return minicondaPath;
-
-    // Reasonable system fallbacks
-    if (QFileInfo::exists("/opt/venv/bin/python3"))  return "/opt/venv/bin/python3";
-    if (QFileInfo::exists("/usr/local/bin/python3")) return "/usr/local/bin/python3";
-    if (QFileInfo::exists("/usr/bin/python3"))       return "/usr/bin/python3";
-    return "python3";
-}
-
-static QString resolveFlatboiScript()
-{
-    QSettings s("VC.ini", QSettings::IniFormat);
-    const QString ini = s.value("scripts/flatboi_path").toString();
-    if (!ini.isEmpty()) return ini;
-
-    const QString envDir = QString::fromLocal8Bit(qgetenv("VC_SCRIPTS_DIR"));
-    if (!envDir.isEmpty()) return QDir(envDir).filePath("flatboi.py");
-
-    // Default to the repo path you requested
-    if (QFileInfo::exists("/src/scripts/flatboi.py"))
-        return "/src/scripts/flatboi.py";
-
-    if (QFileInfo::exists("/usr/bin/flatboi.py"))
-        return "/usr/bin/flatboi.py";
-
-    // Last resort: relative to binary
-    QDir bin(QCoreApplication::applicationDirPath());
-
-    if (QFileInfo::exists(bin.filePath("flatboi.py"))) {
-        return bin.filePath("flatboi.py");
+    // 0) Env var override (handy for CI or local dev)
+    const QByteArray envFlatboi = qgetenv("FLATBOI");
+    if (!envFlatboi.isEmpty()) {
+        const QString p = QString::fromLocal8Bit(envFlatboi);
+        QFileInfo fi(p);
+        if (fi.exists() && fi.isFile() && fi.isExecutable())
+            return fi.absoluteFilePath();
     }
 
-    //are we running from a dev branch? if so lets get out of the cmake-build repo and look under scripts/
-    if (QFileInfo::exists(bin.filePath("../../scripts/flatboi.py"))) {
-        return bin.filePath("../../scripts/flatboi.py");
+    // 1) INI override (VC.ini -> [tools] flatboi_path=/full/path/to/flatboi)
+    {
+        QSettings settings("VC.ini", QSettings::IniFormat);
+        const QString iniPath = settings.value("tools/flatboi_path",
+                                               settings.value("tools/flatboi")).toString().trimmed();
+        if (!iniPath.isEmpty()) {
+            QFileInfo fi(iniPath);
+            if (fi.exists() && fi.isFile() && fi.isExecutable())
+                return fi.absoluteFilePath();
+        }
     }
 
+    // 2) Known absolute locations
+    const QStringList known = {
+        "/usr/local/bin/flatboi",
+        "/home/builder/vc-dependencies/bin/flatboi"
+    };
+    for (const QString& p : known) {
+        QFileInfo fi(p);
+        if (fi.exists() && fi.isFile() && fi.isExecutable())
+            return fi.absoluteFilePath();
+    }
 
-    return QDir(bin.filePath("../scripts")).filePath("flatboi.py");
+    // 3) Search on PATH
+#if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
+    const QString onPath = QStandardPaths::findExecutable("flatboi");
+    if (!onPath.isEmpty())
+        return onPath;
+#else
+    const QStringList pathDirs =
+        QProcessEnvironment::systemEnvironment().value("PATH")
+            .split(QDir::listSeparator(), Qt::SkipEmptyParts);
+    for (const QString& dir : pathDirs) {
+        const QString candidate = QDir(dir).filePath("flatboi");
+        QFileInfo fi(candidate);
+        if (fi.exists() && fi.isFile() && fi.isExecutable())
+            return fi.absoluteFilePath();
+    }
+#endif
+
+    return {}; // not found
 }
-// ---------------------------------------------------------------------------
 
 
 void CWindow::onRenderSegment(const std::string& segmentId)
@@ -231,30 +234,43 @@ void CWindow::onSlimFlatten(const std::string& segmentId)
         }
     }
 
-    // 2) SLIM via python: python /src/scripts/flatboi.py <obj> 20
-    statusBar()->showMessage(tr("Running SLIM (flatboi.py)…"), 0);
+    // 2) SLIM via flatboi executable
+    statusBar()->showMessage(tr("Running SLIM (flatboi executable)…"), 0);
     {
-        const QString py = resolvePythonPath();
-        const QString script = resolveFlatboiScript();
-        if (!QFileInfo::exists(script)) {
-            QMessageBox::critical(this, tr("Error"), tr("flatboi.py not found at:\n%1").arg(script));
+        const QString flatboiExe = findFlatboiExecutable();
+        if (flatboiExe.isEmpty()) {
+            const QString msg =
+                tr("Could not find the 'flatboi' executable.\n"
+                "Looked in:\n"
+                "  • /usr/local/bin/flatboi\n"
+                "  • /home/builder/vc-dependencies/bin/flatboi\n"
+                "and on your PATH.\n\n"
+                "Tip: set an override via:\n"
+                "  • VC.ini  →  [tools] flatboi_path=/full/path/to/flatboi\n"
+                "  • or set environment variable FLATBOI=/full/path/to/flatboi");
+            QMessageBox::critical(this, tr("Error"), msg);
             statusBar()->showMessage(tr("SLIM-flatten failed"), 5000);
             return;
         }
+
+        std::cout << "Using flatboi: " << flatboiExe.toStdString() << std::endl;
+
         QString err;
-        if (!runProcessBlocking(py, QStringList() << script << objPath << "20", segDir, nullptr, &err)) {
-            QMessageBox::critical(this, tr("Error"), tr("flatboi.py failed.\n\n%1").arg(err));
+        if (!runProcessBlocking(flatboiExe, QStringList() << objPath << "20", segDir, nullptr, &err)) {
+            QMessageBox::critical(this, tr("Error"), tr("flatboi failed.\n\n%1").arg(err));
             statusBar()->showMessage(tr("SLIM-flatten failed"), 5000);
             return;
         }
+
         if (!QFileInfo::exists(flatObj)) {
-            // flatboi writes <basename>_flatboi.obj next to the input .obj
             QMessageBox::critical(this, tr("Error"),
-                                  tr("Flattened OBJ was not created:\n%1").arg(flatObj));
+                                tr("Flattened OBJ was not created:\n%1").arg(flatObj));
             statusBar()->showMessage(tr("SLIM-flatten failed"), 5000);
             return;
         }
     }
+
+
 
     // 3) flattened obj -> tifxyz  (IMPORTANT: do NOT pre-create the directory)
     statusBar()->showMessage(tr("Converting flattened OBJ back to TIFXYZ…"), 0);
