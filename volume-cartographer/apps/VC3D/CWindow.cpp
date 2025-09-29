@@ -71,7 +71,6 @@
 #include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/util/SurfaceVoxelizer.hpp"
 #include "vc/core/util/Render.hpp"
 
 
