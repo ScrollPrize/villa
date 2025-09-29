@@ -210,9 +210,7 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
             uvs = (uvs - center_ij) / patch.scale / (crop_size * 2)  # *2 is somewhat arbitrary; worst-ish-case = patch wrapping round three sides of cube
             uvws = torch.cat([uvs, edt[..., None]], dim=-1).to(torch.float32)
 
-            localiser = torch.linalg.norm(torch.stack(torch.meshgrid(*[torch.arange(crop_size)] * 3, indexing='ij'), dim=-1).to(torch.float32) - crop_size // 2, dim=-1)
-            localiser = localiser / localiser.amax() * 2 - 1
-            mark_context_point(localiser, center_zyx - min_corner_zyx, value=0.)
+            localiser = build_localiser(center_zyx, min_corner_zyx, crop_size)
 
             #TODO: include full 2d slices for additional context
             #  if so, need to augment them consistently with the 3d crop -> tricky for geometric transforms
@@ -300,9 +298,7 @@ class HeatmapDataset(torch.utils.data.IterableDataset):
                 uv_heatmaps = make_heatmaps([u_pos_shifted_zyxs, u_neg_shifted_zyxs, v_pos_shifted_zyxs, v_neg_shifted_zyxs], min_corner_zyx, crop_size)
 
             # Build localiser volume
-            localiser = torch.linalg.norm(torch.stack(torch.meshgrid(*[torch.arange(crop_size)] * 3, indexing='ij'), dim=-1).to(torch.float32) - crop_size // 2, dim=-1)
-            localiser = localiser / localiser.amax() * 2 - 1
-            mark_context_point(localiser, center_zyx - min_corner_zyx, value=0.)
+            localiser = build_localiser(center_zyx, min_corner_zyx, crop_size)
 
             #TODO: include full 2d slices for additional context
             #  if so, need to augment them consistently with the 3d crop -> tricky for geometric transforms
@@ -577,3 +573,10 @@ def get_crop_from_volume(volume, center_zyx, crop_size):
         volume_crop = F.pad(volume_crop, paddings, mode='constant', value=0)
 
     return volume_crop, crop_min
+
+
+def build_localiser(center_zyx, min_corner_zyx, crop_size):
+    localiser = torch.linalg.norm(torch.stack(torch.meshgrid(*[torch.arange(crop_size)] * 3, indexing='ij'), dim=-1).to(torch.float32) - crop_size // 2, dim=-1)
+    localiser = localiser / localiser.amax() * 2 - 1
+    mark_context_point(localiser, center_zyx - min_corner_zyx, value=0.)
+    return localiser
