@@ -129,6 +129,7 @@ private:
     void playPing();
 
     void setVolume(std::shared_ptr<Volume> newvol);
+    void updateNormalGridAvailability();
 
 private slots:
     void onSegmentationDirChanged(int index);
@@ -215,6 +216,8 @@ private:
     std::unique_ptr<MenuActionController> _menuController;
     // runner for command line tools 
     CommandLineToolRunner* _cmdRunner;
+    bool _normalGridAvailable{false};
+    QString _normalGridPath;
     
     // Keyboard shortcuts
     QShortcut* fReviewedShortcut;

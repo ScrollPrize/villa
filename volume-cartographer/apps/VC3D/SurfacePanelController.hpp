@@ -80,6 +80,7 @@ public:
     void loadSurfaces(bool reload);
     void loadSurfacesIncremental();
     void updateTreeItemIcon(SurfaceTreeWidgetItem* item);
+    void refreshSurfaceMetrics(const std::string& surfaceId);
 
     void configureFilters(const FilterUiRefs& filters, VCCollection* pointCollection);
     void configureTags(const TagUiRefs& tags);

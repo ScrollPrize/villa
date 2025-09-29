@@ -801,10 +801,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     int rewind_gen = params.value("rewind_gen", -1);
     loss_settings.z_min = params.value("z_min", -1);
     loss_settings.z_max = params.value("z_max", std::numeric_limits<int>::max());
-    std::string grow_mode = params.value("grow_mode", std::string("all"));
-    int grow_extra_cols = params.value("grow_extra_cols", 0);
-    int grow_extra_rows = params.value("grow_extra_rows", 0);
-    int grow_steps = params.value("grow_steps", 0);
     ALifeTime f_timer("empty space tracing\n");
     // DSReader reader = {ds,scale,cache};
     std::unique_ptr<vc::core::util::NormalGridVolume> ngv;
@@ -833,39 +829,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     }
     cv::Size size = {w,h};
     cv::Rect bounds(0,0,w,h);
-    int allowed_min_x = 0;
-    int allowed_max_x = w - 1;
-    int allowed_min_y = 0;
-    int allowed_max_y = h - 1;
-    int target_min_x = 0;
-    int target_max_x = w - 1;
-    int target_min_y = 0;
-    int target_max_y = h - 1;
-    bool enforce_column_bounds = false;
-    bool enforce_row_bounds = false;
-
-    if (!resume_surf) {
-        if (grow_mode == "left" || grow_mode == "right" || grow_mode == "all") {
-            enforce_column_bounds = true;
-            int extend_left = (grow_mode == "left" || grow_mode == "all") ? grow_extra_cols : 0;
-            int extend_right = (grow_mode == "right" || grow_mode == "all") ? grow_extra_cols : 0;
-            int center_x = w / 2;
-            allowed_min_x = std::max(0, center_x - extend_left - stop_gen);
-            allowed_max_x = std::min(w - 1, center_x + extend_right + stop_gen);
-            target_min_x = allowed_min_x;
-            target_max_x = allowed_max_x;
-        }
-        if (grow_mode == "up" || grow_mode == "down" || grow_mode == "all") {
-            enforce_row_bounds = true;
-            int extend_up = (grow_mode == "up" || grow_mode == "all") ? grow_extra_rows : 0;
-            int extend_down = (grow_mode == "down" || grow_mode == "all") ? grow_extra_rows : 0;
-            int center_y = h / 2;
-            allowed_min_y = std::max(0, center_y - extend_up - stop_gen);
-            allowed_max_y = std::min(h - 1, center_y + extend_down + stop_gen);
-            target_min_y = allowed_min_y;
-            target_max_y = allowed_max_y;
-        }
-    }
 
     int x0 = w/2;
     int y0 = h/2;
@@ -984,31 +947,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         }
 
         trace_data.point_correction = PointCorrection(corrections);
-
-        int initial_min_x = used_area.x;
-        int initial_max_x = used_area.x + used_area.width - 1;
-        int initial_min_y = used_area.y;
-        int initial_max_y = used_area.y + used_area.height - 1;
-
-        if (grow_mode == "left" || grow_mode == "right" || grow_mode == "all") {
-            enforce_column_bounds = true;
-            int extend_left = (grow_mode == "left" || grow_mode == "all") ? grow_extra_cols : 0;
-            int extend_right = (grow_mode == "right" || grow_mode == "all") ? grow_extra_cols : 0;
-            allowed_min_x = std::max(0, initial_min_x - extend_left);
-            allowed_max_x = std::min(bounds.width - 1, initial_max_x + extend_right);
-            target_min_x = allowed_min_x;
-            target_max_x = allowed_max_x;
-        }
-
-        if (grow_mode == "up" || grow_mode == "down" || grow_mode == "all") {
-            enforce_row_bounds = true;
-            int extend_up = (grow_mode == "up" || grow_mode == "all") ? grow_extra_rows : 0;
-            int extend_down = (grow_mode == "down" || grow_mode == "all") ? grow_extra_rows : 0;
-            allowed_min_y = std::max(0, initial_min_y - extend_up);
-            allowed_max_y = std::min(bounds.height - 1, initial_max_y + extend_down);
-            target_min_y = allowed_min_y;
-            target_max_y = allowed_max_y;
-        }
 
         if (trace_data.point_correction.isValid()) {
             trace_data.point_correction.init(trace_params.dpoints);
@@ -1167,8 +1105,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
     std::cout << "lets start fringe: " << fringe.size() << std::endl;
 
-    bool growth_complete = false;
-
     while (!fringe.empty()) {
         bool global_opt = generation <= 50 && !resume_surf;
 
@@ -1188,14 +1124,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 if (bounds.contains(cv::Point(p+n))
                     && (trace_params.state(p+n) & STATE_PROCESSING) == 0
                     && (trace_params.state(p+n) & STATE_LOC_VALID) == 0) {
-                    int candidate_y = p[0] + n[0];
-                    int candidate_x = p[1] + n[1];
-                    if (enforce_row_bounds && (candidate_y < allowed_min_y || candidate_y > allowed_max_y)) {
-                        continue;
-                    }
-                    if (enforce_column_bounds && (candidate_x < allowed_min_x || candidate_x > allowed_max_x)) {
-                        continue;
-                    }
                     trace_params.state(p+n) |= STATE_PROCESSING;
                     cands.push_back(p+n);
                 }
@@ -1299,12 +1227,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
                     fringe.push_back(p);
                     succ_gen_ps.push_back(p);
-
-                    bool reached_x = !enforce_column_bounds || (used_area.x <= target_min_x && used_area.x + used_area.width - 1 >= target_max_x);
-                    bool reached_y = !enforce_row_bounds || (used_area.y <= target_min_y && used_area.y + used_area.height - 1 >= target_max_y);
-                    if (reached_x && reached_y) {
-                        growth_complete = true;
-                    }
                 }
 
                 for (int i=1;i<local_opt_r;i++)
@@ -1381,11 +1303,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
             surf->save(tgt_path, true);
             delete surf;
             std::cout << "saved snapshot in " << tgt_path << std::endl;
-        }
-
-        if (growth_complete) {
-            std::cout << "growth bounds satisfied, exiting generation loop" << std::endl;
-            break;
         }
 
     }  // end while fringe is non-empty

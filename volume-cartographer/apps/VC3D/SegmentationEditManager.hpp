@@ -55,6 +55,7 @@ public:
         cv::Vec3f currentWorld;
         bool isManual{false};
         SegmentationRowColAxis rowColAxis{SegmentationRowColAxis::Both};
+        bool isGrowth{false};
     };
 
     [[nodiscard]] const std::vector<Handle>& handles() const { return _handles; }
@@ -74,6 +75,7 @@ public:
     bool removeHandle(int row, int col);
     std::optional<cv::Vec3f> handleWorldPosition(int row, int col) const;
     std::optional<std::pair<int,int>> worldToGridIndex(const cv::Vec3f& worldPos, float* outDistance = nullptr) const;
+    void markNextRefreshHandlesAsGrowth();
 
 private:
     void regenerateHandles();
@@ -94,7 +96,6 @@ private:
     void relaxHolePatch(const std::vector<std::pair<int,int>>& holeCells,
                         const std::pair<int,int>& seedCell,
                         const cv::Vec3f& seedWorld);
-
     QuadSurface* _baseSurface{nullptr};
     std::unique_ptr<cv::Mat_<cv::Vec3f>> _originalPoints;
     cv::Mat_<cv::Vec3f>* _previewPoints{nullptr};
@@ -109,4 +110,7 @@ private:
     int _holeSmoothIterations{25};
     bool _dirty{false};
     bool _fillInvalidCells{true};
+    bool _pendingGrowthMarking{false};
+    std::vector<cv::Vec3f> _autoHandleWorldSnapshot;
+    std::vector<cv::Vec3f> _growthHandleWorld;
 };

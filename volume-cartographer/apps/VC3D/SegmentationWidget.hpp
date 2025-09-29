@@ -1,6 +1,11 @@
 #pragma once
 
 #include <QWidget>
+#include <QPair>
+#include <QVector>
+#include <cstdint>
+
+#include <optional>
 
 #include "SegmentationInfluenceMode.hpp"
 #include "SegmentationGrowth.hpp"
@@ -39,6 +44,17 @@ public:
     [[nodiscard]] bool fillInvalidRegions() const { return _fillInvalidRegions; }
 
     void setPendingChanges(bool pending);
+    void setCorrectionsEnabled(bool enabled);
+    void setCorrectionsAnnotateChecked(bool enabled);
+    void setCorrectionCollections(const QVector<QPair<uint64_t, QString>>& collections,
+                                   std::optional<uint64_t> activeId);
+    void setHandlesLocked(bool locked);
+    [[nodiscard]] bool handlesLocked() const { return _handlesLocked; }
+    void setNormalGridAvailable(bool available);
+    void setAvailableVolumes(const QVector<QPair<QString, QString>>& volumes,
+                             const QString& activeId);
+    void setActiveVolume(const QString& volumeId);
+    void setNormalGridPathHint(const QString& hint);
 
 public slots:
     void setEditingEnabled(bool enabled);
@@ -77,27 +93,39 @@ signals:
     void growSurfaceRequested(SegmentationGrowthMethod method,
                               SegmentationGrowthDirection direction,
                               int steps);
+    void correctionsAnnotateToggled(bool enabled);
+    void correctionsCollectionSelected(uint64_t collectionId);
+    void correctionsCreateRequested();
+    void handlesLockToggled(bool locked);
+    void volumeSelectionChanged(const QString& volumeId);
 
 private:
     void setupUI();
     void updateEditingUi();
     void restoreSettings();
     void writeSetting(const QString& key, const QVariant& value);
+    void refreshCorrectionsUiState();
+    void updateGrowthModeUi();
 
     QCheckBox* _chkEditing;
     QLabel* _editingStatus;
+    QGroupBox* _groupGrowth;
+    QGroupBox* _groupSampling;
     QSpinBox* _spinDownsample;
     QSpinBox* _spinRadius;
     QDoubleSpinBox* _spinSigma;
     class QComboBox* _comboInfluenceMode;
+    QGroupBox* _groupInfluence;
     class QGroupBox* _groupSliceVisibility;
     QDoubleSpinBox* _spinSliceFadeDistance;
     class QComboBox* _comboSliceDisplayMode;
     class QComboBox* _comboRowColMode;
     QDoubleSpinBox* _spinHighlightDistance;
+    QGroupBox* _groupHole;
     QSpinBox* _spinHoleRadius;
     QSpinBox* _spinHoleIterations;
     QCheckBox* _chkFillInvalidRegions;
+    QGroupBox* _groupHandleDisplay;
     QCheckBox* _chkHandlesAlwaysVisible;
     QDoubleSpinBox* _spinHandleDisplayDistance;
     QPushButton* _btnApply;
@@ -107,6 +135,15 @@ private:
     class QComboBox* _comboGrowthDirection;
     QSpinBox* _spinGrowthSteps;
     QPushButton* _btnGrow;
+    class QComboBox* _comboVolume;
+    QGroupBox* _groupCorrections;
+    class QComboBox* _comboCorrections;
+    QPushButton* _btnCorrectionsNew;
+    QCheckBox* _chkCorrectionsAnnotate;
+    QPushButton* _btnLockHandles;
+    QWidget* _normalGridStatusWidget;
+    QLabel* _normalGridStatusIcon;
+    QLabel* _normalGridStatusText;
 
     bool _editingEnabled = false;
     int _downsample = 12;
@@ -126,4 +163,10 @@ private:
     SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Tracer};
     SegmentationGrowthDirection _growthDirection{SegmentationGrowthDirection::All};
     int _growthSteps{0};
+    std::optional<uint64_t> _activeCorrectionId;
+    bool _correctionsEnabled{false};
+    bool _handlesLocked{false};
+    bool _normalGridAvailable{false};
+    QVector<QPair<QString, QString>> _volumeEntries;
+    QString _activeVolumeId;
 };

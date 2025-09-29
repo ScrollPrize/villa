@@ -17,6 +17,7 @@ namespace
 {
 constexpr const char* kOverlayGroup = "segmentation_edit_points";
 const QColor kBaseFillColor = QColor(0, 200, 255, 190);
+const QColor kGrowthFillColor = QColor(120, 230, 120, 210);
 const QColor kHoverFillColor = QColor(255, 255, 255, 225);
 const QColor kActiveFillColor = QColor(255, 215, 0, 235);
 const QColor kKeyboardFillColor = QColor(0, 255, 160, 225);
@@ -29,6 +30,7 @@ constexpr qreal kHoverPenWidth = 2.5;
 constexpr qreal kActivePenWidth = 2.6;
 constexpr qreal kKeyboardPenWidth = 2.4;
 const QColor kBaseBorderColor = QColor(255, 255, 255, 200);
+const QColor kGrowthBorderColor = QColor(60, 180, 60, 220);
 const QColor kHoverBorderColor = QColor(Qt::yellow);
 const QColor kActiveBorderColor = QColor(255, 180, 0, 255);
 const QColor kKeyboardBorderColor = QColor(60, 255, 180, 240);
@@ -101,11 +103,11 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
         return opt && opt->first == row && opt->second == col;
     };
 
-    auto pointVisuals = [](bool isActive, bool isHover, bool isKeyboard) {
+    auto pointVisuals = [](bool isActive, bool isHover, bool isKeyboard, bool isGrowth) {
         qreal radius = kBaseRadius;
         qreal penWidth = kBasePenWidth;
-        QColor border = kBaseBorderColor;
-        QColor fill = kBaseFillColor;
+        QColor border = isGrowth ? kGrowthBorderColor : kBaseBorderColor;
+        QColor fill = isGrowth ? kGrowthFillColor : kBaseFillColor;
 
         if (isActive) {
             radius *= kActiveRadiusMultiplier;
@@ -142,6 +144,7 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
             bool isActive;
             bool isHover;
             bool isKeyboard;
+            bool isGrowth;
             float opacity{1.0f};
         };
 
@@ -155,6 +158,7 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
             const bool isActive = matches(handle.row, handle.col, _activeHandle);
             const bool isHover = matches(handle.row, handle.col, _hoverHandle);
             const bool isKeyboard = matches(handle.row, handle.col, keyboardHighlight);
+            const bool isGrowth = handle.isGrowth;
 
             bool include = true;
             if (!planeSurface && !_showAllHandles) {
@@ -172,7 +176,7 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
             }
 
             handlePoints.push_back(handle.currentWorld);
-            handleEntries.push_back({handle.currentWorld, isActive, isHover, isKeyboard});
+            handleEntries.push_back({handle.currentWorld, isActive, isHover, isKeyboard, isGrowth});
         }
 
         PointFilterOptions filter;
@@ -197,7 +201,7 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
             size_t srcIndex = filtered.sourceIndices.empty() ? i : filtered.sourceIndices[i];
             const auto& entry = handleEntries[srcIndex];
             const QPointF& scenePt = filtered.scenePoints[i];
-            auto [radius, style] = pointVisuals(entry.isActive, entry.isHover, entry.isKeyboard);
+            auto [radius, style] = pointVisuals(entry.isActive, entry.isHover, entry.isKeyboard, entry.isGrowth);
             const float opacity = entry.opacity;
             if (opacity <= 0.0f) {
                 continue;
@@ -276,7 +280,7 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
         size_t srcIndex = filtered.sourceIndices.empty() ? i : filtered.sourceIndices[i];
         const auto& entry = gridEntries[srcIndex];
         const QPointF& scenePt = filtered.scenePoints[i];
-        auto [radius, style] = pointVisuals(entry.isActive, entry.isHover, entry.isKeyboard);
+        auto [radius, style] = pointVisuals(entry.isActive, entry.isHover, entry.isKeyboard, false);
         const float opacity = entry.opacity;
         if (opacity <= 0.0f) {
             continue;

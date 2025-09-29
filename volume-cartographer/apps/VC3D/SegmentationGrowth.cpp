@@ -1,6 +1,7 @@
 #include "SegmentationGrowth.hpp"
 
 #include <filesystem>
+#include <cmath>
 
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
@@ -9,10 +10,65 @@
 #include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/DateTime.hpp"
 #include "vc/tracer/Tracer.hpp"
+#include "vc/ui/VCCollection.hpp"
 
 namespace
 {
+bool isInvalidPoint(const cv::Vec3f& p)
+{
+    return !std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]) ||
+           (p[0] == -1.0f && p[1] == -1.0f && p[2] == -1.0f);
+}
+
+double triangleAreaUm2(const cv::Vec3f& a, const cv::Vec3f& b, const cv::Vec3f& c)
+{
+    if (isInvalidPoint(a) || isInvalidPoint(b) || isInvalidPoint(c)) {
+        return 0.0;
+    }
+    const cv::Vec3f ab = b - a;
+    const cv::Vec3f ac = c - a;
+    const cv::Vec3f crossVec = ab.cross(ac);
+    return 0.5 * static_cast<double>(cv::norm(crossVec));
+}
+
+double computeSurfaceAreaUm2(const cv::Mat_<cv::Vec3f>& points)
+{
+    if (points.empty() || points.rows < 2 || points.cols < 2) {
+        return 0.0;
+    }
+
+    double totalArea = 0.0;
+    for (int y = 0; y < points.rows - 1; ++y) {
+        for (int x = 0; x < points.cols - 1; ++x) {
+            const cv::Vec3f& p00 = points(y, x);
+            const cv::Vec3f& p10 = points(y, x + 1);
+            const cv::Vec3f& p01 = points(y + 1, x);
+            const cv::Vec3f& p11 = points(y + 1, x + 1);
+
+            totalArea += triangleAreaUm2(p00, p10, p01);
+            totalArea += triangleAreaUm2(p11, p01, p10);
+        }
+    }
+
+    return totalArea;
+}
+
+void ensureMetaObject(QuadSurface* surface)
+{
+    if (!surface) {
+        return;
+    }
+    if (surface->meta && surface->meta->is_object()) {
+        return;
+    }
+    if (surface->meta) {
+        delete surface->meta;
+    }
+    surface->meta = new nlohmann::json(nlohmann::json::object());
+}
+
 cv::Mat_<uint16_t> extendGenerations(const cv::Mat& generations,
                                      SegmentationGrowthDirection direction,
                                      int steps)
@@ -138,6 +194,23 @@ QString directionToString(SegmentationGrowthDirection direction)
     }
 }
 
+void populateCorrectionsCollection(const SegmentationCorrectionsPayload& payload, VCCollection& collection)
+{
+    for (const auto& entry : payload.collections) {
+        uint64_t id = collection.addCollection(entry.name);
+        collection.setCollectionMetadata(id, entry.metadata);
+        collection.setCollectionColor(id, entry.color);
+
+        for (const auto& point : entry.points) {
+            ColPoint added = collection.addPoint(entry.name, point.p);
+            if (!std::isnan(point.winding_annotation)) {
+                added.winding_annotation = point.winding_annotation;
+                collection.updatePoint(added);
+            }
+        }
+    }
+}
+
 void ensureNormalsInward(QuadSurface* surface, const Volume* volume)
 {
     if (!surface || !volume) {
@@ -198,7 +271,6 @@ nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
         params["grow_extra_rows"] = std::max(0, request.steps);
         params["grow_extra_cols"] = std::max(0, request.steps);
     }
-
     return params;
 }
 } // namespace
@@ -308,9 +380,56 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
     }
 
     nlohmann::json params = buildTracerParams(request);
+
+    int startGen = 0;
+    if (context.resumeSurface) {
+        cv::Mat resumeGenerations = context.resumeSurface->channel("generations");
+        if (!resumeGenerations.empty()) {
+            double minVal = 0.0;
+            double maxVal = 0.0;
+            cv::minMaxLoc(resumeGenerations, &minVal, &maxVal);
+            startGen = static_cast<int>(std::round(maxVal));
+        }
+
+        if (context.resumeSurface->meta && context.resumeSurface->meta->is_object()) {
+            const auto& meta = *context.resumeSurface->meta;
+            auto it = meta.find("max_gen");
+            if (it != meta.end() && it->is_number()) {
+                const int metaGen = static_cast<int>(std::round(it->get<double>()));
+                startGen = std::max(startGen, metaGen);
+            }
+        }
+    }
+
+    const int requestedSteps = std::max(request.steps, 0);
+    int targetGenerations = startGen;
+
+    if (requestedSteps > 0) {
+        targetGenerations = startGen + requestedSteps;
+    } else if (!context.resumeSurface) {
+        targetGenerations = std::max(startGen + 1, 1);
+    }
+
+    if (targetGenerations < startGen) {
+        targetGenerations = startGen;
+    }
+    if (targetGenerations <= 0) {
+        targetGenerations = 1;
+    }
+
+    params["generations"] = targetGenerations;
+    params["rewind_gen"] = -1;
     params["cache_root"] = context.cacheRoot.toStdString();
+    if (!context.normalGridPath.isEmpty()) {
+        params["normal_grid_path"] = context.normalGridPath.toStdString();
+    }
 
     const cv::Vec3f origin(0.0f, 0.0f, 0.0f);
+
+    VCCollection correctionCollection;
+    if (!request.corrections.empty()) {
+        populateCorrectionsCollection(request.corrections, correctionCollection);
+    }
 
     try {
         QuadSurface* surface = tracer(dataset,
@@ -324,7 +443,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                       context.resumeSurface,
                                       std::filesystem::path(),
                                       nlohmann::json{},
-                                      VCCollection());
+                                      correctionCollection);
         result.surface = surface;
         result.statusMessage = QStringLiteral("Tracer growth completed");
     } catch (const std::exception& ex) {
@@ -332,4 +451,37 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
     }
 
     return result;
+}
+
+void updateSegmentationSurfaceMetadata(QuadSurface* surface,
+                                       double voxelSize)
+{
+    if (!surface) {
+        return;
+    }
+
+    ensureMetaObject(surface);
+
+    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+    if (points && !points->empty()) {
+        const double areaUm2 = computeSurfaceAreaUm2(*points);
+        (*surface->meta)["area_cm2"] = areaUm2 * 1e-8;
+
+        if (voxelSize > 0.0) {
+            const double voxelAreaUm2 = voxelSize * voxelSize;
+            if (voxelAreaUm2 > 0.0) {
+                (*surface->meta)["area_vx2"] = areaUm2 / voxelAreaUm2;
+            }
+        }
+    }
+
+    cv::Mat generations = surface->channel("generations");
+    if (!generations.empty()) {
+        double minGen = 0.0;
+        double maxGen = 0.0;
+        cv::minMaxLoc(generations, &minGen, &maxGen);
+        (*surface->meta)["max_gen"] = static_cast<int>(std::round(maxGen));
+    }
+
+    (*surface->meta)["date_last_modified"] = get_surface_time_str();
 }

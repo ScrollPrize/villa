@@ -230,6 +230,53 @@ void SurfacePanelController::populateSurfaceTree()
     _ui.treeWidget->resizeColumnToContents(3);
 }
 
+void SurfacePanelController::refreshSurfaceMetrics(const std::string& surfaceId)
+{
+    if (!_ui.treeWidget) {
+        return;
+    }
+
+    SurfaceTreeWidgetItem* targetItem = nullptr;
+    const QString idQString = QString::fromStdString(surfaceId);
+    QTreeWidgetItemIterator iterator(_ui.treeWidget);
+    while (*iterator) {
+        if ((*iterator)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() == idQString) {
+            targetItem = static_cast<SurfaceTreeWidgetItem*>(*iterator);
+            break;
+        }
+        ++iterator;
+    }
+
+    auto surfMeta = _volumePkg ? _volumePkg->getSurface(surfaceId) : nullptr;
+    double areaCm2 = -1.0;
+    double avgCost = -1.0;
+    int overlapCount = 0;
+    QString timestamp;
+
+    if (surfMeta) {
+        if (surfMeta->meta && surfMeta->meta->contains("area_cm2")) {
+            areaCm2 = (*surfMeta->meta)["area_cm2"].get<double>();
+        }
+        if (surfMeta->meta && surfMeta->meta->contains("avg_cost")) {
+            avgCost = (*surfMeta->meta)["avg_cost"].get<double>();
+        }
+        overlapCount = static_cast<int>(surfMeta->overlapping_str.size());
+        if (surfMeta->meta && surfMeta->meta->contains("date_last_modified")) {
+            timestamp = QString::fromStdString((*surfMeta->meta)["date_last_modified"].get<std::string>());
+        }
+    }
+
+    if (targetItem) {
+        const QString areaText = areaCm2 >= 0.0 ? QString::number(areaCm2, 'f', 3) : QStringLiteral("-");
+        const QString costText = avgCost >= 0.0 ? QString::number(avgCost, 'f', 3) : QStringLiteral("-");
+        targetItem->setText(2, areaText);
+        targetItem->setText(3, costText);
+        targetItem->setText(4, QString::number(overlapCount));
+        targetItem->setText(TIMESTAMP_COLUMN, timestamp);
+        updateTreeItemIcon(targetItem);
+    }
+}
+
 void SurfacePanelController::updateTreeItemIcon(SurfaceTreeWidgetItem* item)
 {
     if (!item || !_volumePkg) {

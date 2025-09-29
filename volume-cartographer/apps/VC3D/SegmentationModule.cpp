@@ -8,6 +8,8 @@
 #include "SegmentationWidget.hpp"
 #include "ViewerManager.hpp"
 
+#include "vc/ui/VCCollection.hpp"
+
 #include "vc/core/util/Surface.hpp"
 
 #include <QApplication>
@@ -23,6 +25,7 @@
 #include <QStringList>
 #include <QTimer>
 #include <QVariant>
+#include <QVector>
 
 #include <algorithm>
 #include <cmath>
@@ -121,6 +124,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
                                        SegmentationOverlayController* overlay,
                                        ViewerManager* viewerManager,
                                        CSurfaceCollection* surfaces,
+                                       VCCollection* pointCollection,
                                        bool editingEnabled,
                                        int downsample,
                                        float radius,
@@ -132,6 +136,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     , _overlay(overlay)
     , _viewerManager(viewerManager)
     , _surfaces(surfaces)
+    , _pointCollection(pointCollection)
     , _editingEnabled(editingEnabled)
     , _downsample(downsample)
     , _radius(static_cast<float>(std::clamp(static_cast<int>(std::lround(radius)), 1, kMaxRadiusSteps)))
@@ -157,6 +162,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _sliceDisplayMode = _widget->sliceDisplayMode();
         _highlightDistance = _widget->highlightDistance();
         _fillInvalidRegions = _widget->fillInvalidRegions();
+        _handlesLocked = _widget->handlesLocked();
     }
     if (_editManager) {
         _editManager->setHoleSearchRadius(_holeSearchRadius);
@@ -176,6 +182,40 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _viewerManager->setSegmentationOverlay(_overlay);
         _viewerManager->setSegmentationModule(this);
     }
+
+    if (_pointCollection) {
+        connect(_pointCollection, &VCCollection::collectionRemoved, this, [this](uint64_t id) {
+            const uint64_t sentinel = std::numeric_limits<uint64_t>::max();
+            if (id == sentinel) {
+                _pendingCorrectionIds.clear();
+                _managedCorrectionIds.clear();
+                _activeCorrectionId = 0;
+                setCorrectionsAnnotateMode(false, false);
+            } else {
+                auto eraseIt = std::remove(_pendingCorrectionIds.begin(), _pendingCorrectionIds.end(), id);
+                if (eraseIt != _pendingCorrectionIds.end()) {
+                    _pendingCorrectionIds.erase(eraseIt, _pendingCorrectionIds.end());
+                    _managedCorrectionIds.erase(id);
+                    if (_activeCorrectionId == id) {
+                        _activeCorrectionId = 0;
+                        setCorrectionsAnnotateMode(false, false);
+                    }
+                }
+            }
+            updateCorrectionsWidget();
+        });
+        connect(_pointCollection, &VCCollection::collectionChanged, this, [this](uint64_t id) {
+            if (id == std::numeric_limits<uint64_t>::max()) {
+                return;
+            }
+            if (std::find(_pendingCorrectionIds.begin(), _pendingCorrectionIds.end(), id) != _pendingCorrectionIds.end()) {
+                updateCorrectionsWidget();
+            }
+        });
+    }
+
+    setHandlesLocked(_handlesLocked, false);
+    updateCorrectionsWidget();
 }
 
 void SegmentationModule::bindWidgetSignals()
@@ -237,6 +277,32 @@ void SegmentationModule::bindWidgetSignals()
             Qt::UniqueConnection);
     connect(_widget, &SegmentationWidget::growSurfaceRequested,
             this, &SegmentationModule::handleGrowSurfaceRequested,
+            Qt::UniqueConnection);
+
+    connect(_widget, &SegmentationWidget::correctionsCreateRequested,
+            this, [this]() {
+                const uint64_t id = createCorrectionCollection(true);
+                if (id == 0) {
+                    emit statusMessageRequested(tr("Unable to create a correction set. Make sure point collections are available."), kStatusShort);
+                    return;
+                }
+                setCorrectionsAnnotateMode(true, false);
+            },
+            Qt::UniqueConnection);
+    connect(_widget, &SegmentationWidget::correctionsCollectionSelected,
+            this, [this](uint64_t id) {
+                setActiveCorrectionCollection(id, true);
+            },
+            Qt::UniqueConnection);
+    connect(_widget, &SegmentationWidget::correctionsAnnotateToggled,
+            this, [this](bool enabled) {
+                setCorrectionsAnnotateMode(enabled, true);
+            },
+            Qt::UniqueConnection);
+    connect(_widget, &SegmentationWidget::handlesLockToggled,
+            this, [this](bool locked) {
+                setHandlesLocked(locked, true);
+            },
             Qt::UniqueConnection);
 }
 
@@ -303,6 +369,12 @@ void SegmentationModule::setEditingEnabled(bool enabled)
         return;
     }
     _editingEnabled = enabled;
+
+    if (!enabled) {
+        setCorrectionsAnnotateMode(false, false);
+        setHandlesLocked(false, false);
+    }
+    updateCorrectionsWidget();
 
     if (_overlay) {
         _overlay->setEditingEnabled(enabled);
@@ -567,6 +639,37 @@ void SegmentationModule::setFillInvalidRegions(bool enabled)
 void SegmentationModule::setGrowthInProgress(bool running)
 {
     _growthInProgress = running;
+    if (running) {
+        setCorrectionsAnnotateMode(false, false);
+    }
+    updateCorrectionsWidget();
+}
+
+void SegmentationModule::setHandlesLocked(bool locked, bool userInitiated)
+{
+    if (_handlesLocked == locked) {
+        if (_widget && _widget->handlesLocked() != locked) {
+            _widget->setHandlesLocked(locked);
+        }
+        return;
+    }
+
+    _handlesLocked = locked;
+
+    if (_widget && _widget->handlesLocked() != locked) {
+        _widget->setHandlesLocked(locked);
+    }
+
+    if (locked) {
+        resetInteractionState();
+        setPointAddMode(false, true);
+    }
+
+    if (userInitiated) {
+        emit statusMessageRequested(locked ? tr("Handle edits locked") : tr("Handle edits unlocked"), kStatusShort);
+    }
+
+    updateViewerCursors();
 }
 
 void SegmentationModule::applyEdits()
@@ -641,6 +744,12 @@ void SegmentationModule::updateViewerCursors()
 
 void SegmentationModule::setPointAddMode(bool enabled, bool silent)
 {
+    if (enabled && _handlesLocked) {
+        if (!silent) {
+            emit statusMessageRequested(tr("Unlock handles to add manual points."), kStatusShort);
+        }
+        return;
+    }
     if (_pointAddMode == enabled) {
         return;
     }
@@ -661,6 +770,10 @@ void SegmentationModule::togglePointAddMode()
 bool SegmentationModule::handleKeyPress(QKeyEvent* event)
 {
     if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
+        return false;
+    }
+
+    if (_handlesLocked && event->key() != Qt::Key_T) {
         return false;
     }
 
@@ -734,6 +847,11 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
                 handled = true;
             }
         }
+    } else if (event->key() == Qt::Key_T && event->modifiers() == Qt::NoModifier) {
+        if (createCorrectionCollection(true)) {
+            setCorrectionsAnnotateMode(true, false);
+            handled = true;
+        }
     }
 
     if (handled) {
@@ -795,11 +913,28 @@ bool SegmentationModule::hasActiveSession() const
     return _editManager && _editManager->hasSession();
 }
 
+QuadSurface* SegmentationModule::activeBaseSurface() const
+{
+    if (!_editManager || !_editManager->hasSession()) {
+        return nullptr;
+    }
+    return _editManager->baseSurface();
+}
+
+void SegmentationModule::markNextHandlesFromGrowth()
+{
+    if (_editManager && _editManager->hasSession()) {
+        _editManager->markNextRefreshHandlesAsGrowth();
+    }
+}
+
 void SegmentationModule::refreshSessionFromSurface(QuadSurface* surface)
 {
     if (!_editManager || !_editManager->hasSession()) {
         return;
     }
+
+    Q_UNUSED(surface);
 
     _editManager->refreshFromBaseSurface();
     if (_surfaces) {
@@ -922,6 +1057,31 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
 
     if (button != Qt::LeftButton) {
         logger.add(QStringLiteral("ignored: button not left"));
+        return;
+    }
+
+    if (_correctionsAnnotateMode) {
+        if (!_pointCollection || _activeCorrectionId == 0) {
+            logger.add(QStringLiteral("correction annotate aborted: no active collection"));
+            setCorrectionsAnnotateMode(false, false);
+            emit statusMessageRequested(tr("Create or select a correction set before annotating."), kStatusShort);
+            return;
+        }
+
+        if (modifiers.testFlag(Qt::ControlModifier)) {
+            handleCorrectionPointRemove(worldPos);
+            logger.add(QStringLiteral("correction point removed"));
+        } else {
+            handleCorrectionPointAdded(worldPos);
+            logger.add(QStringLiteral("correction point added"));
+        }
+
+        updateCorrectionsWidget();
+        return;
+    }
+
+    if (_handlesLocked) {
+        logger.add(QStringLiteral("ignored: handles locked"));
         return;
     }
 
@@ -1199,6 +1359,10 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
         }
     }
 
+    if (_handlesLocked) {
+        return;
+    }
+
     if (_drag.active && viewer == _drag.viewer) {
         if (!(buttons & Qt::LeftButton)) {
             return;
@@ -1264,6 +1428,9 @@ void SegmentationModule::handleMouseRelease(CVolumeViewer* viewer,
                                             Qt::MouseButton button,
                                             Qt::KeyboardModifiers /*modifiers*/)
 {
+    if (_handlesLocked) {
+        return;
+    }
     if (viewer) {
         _cursorViewer = viewer;
     }
@@ -1323,7 +1490,7 @@ void SegmentationModule::handleRadiusWheel(CVolumeViewer* viewer,
                                            const QPointF& scenePoint,
                                            const cv::Vec3f& /*worldPos*/)
 {
-    if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
+    if (!_editingEnabled || !_editManager || !_editManager->hasSession() || _handlesLocked) {
         return;
     }
     if (steps == 0) {
@@ -1558,4 +1725,273 @@ SegmentationRowColAxis SegmentationModule::rowColAxisForViewer(const CVolumeView
         return SegmentationRowColAxis::Row;
     }
     return SegmentationRowColAxis::Row;
+}
+
+void SegmentationModule::updateCorrectionsWidget()
+{
+    if (!_widget) {
+        return;
+    }
+
+    pruneMissingCorrections();
+
+    const bool correctionsAvailable = (_pointCollection != nullptr) && !_growthInProgress;
+    QVector<QPair<uint64_t, QString>> entries;
+    if (_pointCollection) {
+        const auto& collections = _pointCollection->getAllCollections();
+        entries.reserve(static_cast<int>(_pendingCorrectionIds.size()));
+        for (uint64_t id : _pendingCorrectionIds) {
+            auto it = collections.find(id);
+            if (it != collections.end()) {
+                entries.append({id, QString::fromStdString(it->second.name)});
+            }
+        }
+    }
+
+    std::optional<uint64_t> active;
+    if (_activeCorrectionId != 0) {
+        active = _activeCorrectionId;
+    }
+
+    _widget->setCorrectionCollections(entries, active);
+    _widget->setCorrectionsEnabled(correctionsAvailable);
+    _widget->setCorrectionsAnnotateChecked(_correctionsAnnotateMode && correctionsAvailable);
+}
+
+void SegmentationModule::setCorrectionsAnnotateMode(bool enabled, bool userInitiated)
+{
+    if (!_pointCollection || _growthInProgress || !_editingEnabled) {
+        enabled = false;
+    }
+
+    if (enabled && _activeCorrectionId == 0) {
+        if (!createCorrectionCollection(false)) {
+            enabled = false;
+        }
+    }
+
+    if (_correctionsAnnotateMode == enabled) {
+        updateCorrectionsWidget();
+        return;
+    }
+
+    _correctionsAnnotateMode = enabled;
+
+    if (!enabled) {
+        _widget->setCorrectionsAnnotateChecked(false);
+    } else {
+        _widget->setCorrectionsAnnotateChecked(true);
+        if (_pointAddMode) {
+            setPointAddMode(false, true);
+        }
+    }
+
+    if (userInitiated) {
+        const QString message = enabled ? tr("Correction annotation enabled")
+                                        : tr("Correction annotation disabled");
+        emit statusMessageRequested(message, kStatusShort);
+    }
+
+    updateViewerCursors();
+    updateCorrectionsWidget();
+}
+
+void SegmentationModule::setActiveCorrectionCollection(uint64_t collectionId, bool userInitiated)
+{
+    if (collectionId == 0 || !_pointCollection) {
+        if (_activeCorrectionId != 0) {
+            _activeCorrectionId = 0;
+            setCorrectionsAnnotateMode(false, false);
+            updateCorrectionsWidget();
+        }
+        return;
+    }
+
+    const auto& collections = _pointCollection->getAllCollections();
+    if (collections.find(collectionId) == collections.end()) {
+        pruneMissingCorrections();
+        emit statusMessageRequested(tr("Selected correction set no longer exists."), kStatusShort);
+        updateCorrectionsWidget();
+        return;
+    }
+
+    if (std::find(_pendingCorrectionIds.begin(), _pendingCorrectionIds.end(), collectionId) == _pendingCorrectionIds.end()) {
+        _pendingCorrectionIds.push_back(collectionId);
+    }
+
+    _activeCorrectionId = collectionId;
+
+    if (userInitiated) {
+        emit statusMessageRequested(tr("Active correction set changed."), kStatusShort);
+    }
+
+    updateCorrectionsWidget();
+}
+
+uint64_t SegmentationModule::createCorrectionCollection(bool announce)
+{
+    if (!_pointCollection) {
+        return 0;
+    }
+
+    const std::string newName = _pointCollection->generateNewCollectionName("correction");
+    const uint64_t newId = _pointCollection->addCollection(newName);
+    if (newId == 0) {
+        return 0;
+    }
+
+    if (std::find(_pendingCorrectionIds.begin(), _pendingCorrectionIds.end(), newId) == _pendingCorrectionIds.end()) {
+        _pendingCorrectionIds.push_back(newId);
+    }
+    _managedCorrectionIds.insert(newId);
+    _activeCorrectionId = newId;
+
+    if (announce) {
+        emit statusMessageRequested(tr("Created correction set '%1'.").arg(QString::fromStdString(newName)), kStatusShort);
+    }
+
+    updateCorrectionsWidget();
+    return newId;
+}
+
+void SegmentationModule::handleCorrectionPointAdded(const cv::Vec3f& worldPos)
+{
+    if (!_pointCollection || _activeCorrectionId == 0) {
+        return;
+    }
+
+    const auto& collections = _pointCollection->getAllCollections();
+    auto it = collections.find(_activeCorrectionId);
+    if (it == collections.end()) {
+        pruneMissingCorrections();
+        updateCorrectionsWidget();
+        return;
+    }
+
+    _pointCollection->addPoint(it->second.name, worldPos);
+}
+
+void SegmentationModule::handleCorrectionPointRemove(const cv::Vec3f& worldPos)
+{
+    if (!_pointCollection || _activeCorrectionId == 0) {
+        return;
+    }
+
+    const auto& collections = _pointCollection->getAllCollections();
+    auto it = collections.find(_activeCorrectionId);
+    if (it == collections.end()) {
+        pruneMissingCorrections();
+        updateCorrectionsWidget();
+        return;
+    }
+
+    const auto& points = it->second.points;
+    if (points.empty()) {
+        return;
+    }
+
+    uint64_t closestId = 0;
+    float closestDistance = std::numeric_limits<float>::max();
+    for (const auto& entry : points) {
+        const float dist = cv::norm(entry.second.p - worldPos);
+        if (dist < closestDistance) {
+            closestDistance = dist;
+            closestId = entry.second.id;
+        }
+    }
+
+    if (closestId != 0) {
+        _pointCollection->removePoint(closestId);
+    }
+}
+
+void SegmentationModule::pruneMissingCorrections()
+{
+    if (!_pointCollection) {
+        _pendingCorrectionIds.clear();
+        _managedCorrectionIds.clear();
+        _activeCorrectionId = 0;
+        _correctionsAnnotateMode = false;
+        return;
+    }
+
+    const auto& collections = _pointCollection->getAllCollections();
+    auto endIt = std::remove_if(_pendingCorrectionIds.begin(), _pendingCorrectionIds.end(), [&](uint64_t id) {
+        const bool missing = collections.find(id) == collections.end();
+        if (missing) {
+            _managedCorrectionIds.erase(id);
+            if (_activeCorrectionId == id) {
+                _activeCorrectionId = 0;
+                _correctionsAnnotateMode = false;
+            }
+        }
+        return missing;
+    });
+    _pendingCorrectionIds.erase(endIt, _pendingCorrectionIds.end());
+
+    if (_activeCorrectionId != 0 && collections.find(_activeCorrectionId) == collections.end()) {
+        _activeCorrectionId = 0;
+        _correctionsAnnotateMode = false;
+    }
+}
+
+SegmentationCorrectionsPayload SegmentationModule::buildCorrectionsPayload() const
+{
+    SegmentationCorrectionsPayload payload;
+    if (!_pointCollection) {
+        return payload;
+    }
+
+    const auto& collections = _pointCollection->getAllCollections();
+    for (uint64_t id : _pendingCorrectionIds) {
+        auto it = collections.find(id);
+        if (it == collections.end()) {
+            continue;
+        }
+
+        SegmentationCorrectionsPayload::Collection entry;
+        entry.id = it->second.id;
+        entry.name = it->second.name;
+        entry.metadata = it->second.metadata;
+        entry.color = it->second.color;
+        entry.points.reserve(it->second.points.size());
+
+        std::vector<ColPoint> sortedPoints;
+        sortedPoints.reserve(it->second.points.size());
+        for (const auto& pair : it->second.points) {
+            sortedPoints.push_back(pair.second);
+        }
+        std::sort(sortedPoints.begin(), sortedPoints.end(), [](const ColPoint& a, const ColPoint& b) {
+            return a.id < b.id;
+        });
+        if (sortedPoints.empty()) {
+            continue;
+        }
+        entry.points = std::move(sortedPoints);
+
+        payload.collections.push_back(std::move(entry));
+    }
+
+    return payload;
+}
+
+void SegmentationModule::clearPendingCorrections()
+{
+    if (!_pendingCorrectionIds.empty()) {
+        setCorrectionsAnnotateMode(false, false);
+    }
+
+    if (_pointCollection) {
+        std::vector<uint64_t> toClear = _pendingCorrectionIds;
+        for (uint64_t id : toClear) {
+            if (_managedCorrectionIds.count(id) > 0) {
+                _pointCollection->clearCollection(id);
+            }
+        }
+    }
+
+    _pendingCorrectionIds.clear();
+    _managedCorrectionIds.clear();
+    _activeCorrectionId = 0;
+    updateCorrectionsWidget();
 }

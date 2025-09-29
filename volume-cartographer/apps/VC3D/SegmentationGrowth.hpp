@@ -2,6 +2,14 @@
 
 #include <QString>
 
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include <opencv2/core.hpp>
+
+#include "vc/ui/VCCollection.hpp"
+
 class QuadSurface;
 class Volume;
 class ChunkCache;
@@ -9,6 +17,7 @@ class ChunkCache;
 enum class SegmentationGrowthMethod {
     Tracer = 0,
     Interpolate = 1,
+    Corrections = 2,
 };
 
 inline QString segmentationGrowthMethodToString(SegmentationGrowthMethod method)
@@ -18,6 +27,8 @@ inline QString segmentationGrowthMethodToString(SegmentationGrowthMethod method)
         return QStringLiteral("Tracer");
     case SegmentationGrowthMethod::Interpolate:
         return QStringLiteral("Interpolate");
+    case SegmentationGrowthMethod::Corrections:
+        return QStringLiteral("Corrections");
     }
     return QStringLiteral("Unknown");
 }
@@ -26,6 +37,9 @@ inline SegmentationGrowthMethod segmentationGrowthMethodFromInt(int value)
 {
     if (value == static_cast<int>(SegmentationGrowthMethod::Interpolate)) {
         return SegmentationGrowthMethod::Interpolate;
+    }
+    if (value == static_cast<int>(SegmentationGrowthMethod::Corrections)) {
+        return SegmentationGrowthMethod::Corrections;
     }
     return SegmentationGrowthMethod::Tracer;
 }
@@ -71,10 +85,25 @@ inline SegmentationGrowthDirection segmentationGrowthDirectionFromInt(int value)
     }
 }
 
+struct SegmentationCorrectionsPayload {
+    struct Collection {
+        uint64_t id{0};
+        std::string name;
+        std::vector<ColPoint> points;
+        CollectionMetadata metadata;
+        cv::Vec3f color{0.0f, 0.0f, 0.0f};
+    };
+
+    std::vector<Collection> collections;
+
+    [[nodiscard]] bool empty() const { return collections.empty(); }
+};
+
 struct SegmentationGrowthRequest {
     SegmentationGrowthMethod method{SegmentationGrowthMethod::Tracer};
     SegmentationGrowthDirection direction{SegmentationGrowthDirection::All};
     int steps{0};
+    SegmentationCorrectionsPayload corrections;
 };
 
 bool growSurfaceByInterpolation(QuadSurface* surface,
@@ -88,6 +117,7 @@ struct TracerGrowthContext {
     class ChunkCache* cache{nullptr};
     QString cacheRoot;
     double voxelSize{1.0};
+    QString normalGridPath;
 };
 
 struct TracerGrowthResult {
@@ -98,3 +128,6 @@ struct TracerGrowthResult {
 
 TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                    const TracerGrowthContext& context);
+
+void updateSegmentationSurfaceMetadata(QuadSurface* surface,
+                                       double voxelSize);

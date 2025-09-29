@@ -32,6 +32,36 @@ void ensurePointValid(cv::Mat_<cv::Vec3f>* mat, int row, int col, const cv::Vec3
     }
 }
 
+void ensureSurfaceMetaObject(QuadSurface* surface)
+{
+    if (!surface) {
+        return;
+    }
+    if (surface->meta && surface->meta->is_object()) {
+        return;
+    }
+    if (surface->meta) {
+        delete surface->meta;
+    }
+    surface->meta = new nlohmann::json(nlohmann::json::object());
+}
+
+bool containsNearby(const std::vector<cv::Vec3f>& haystack,
+                    const cv::Vec3f& needle,
+                    float toleranceSq)
+{
+    for (const auto& point : haystack) {
+        if (isInvalidPoint(point)) {
+            continue;
+        }
+        const cv::Vec3f diff = point - needle;
+        if (diff.dot(diff) <= toleranceSq) {
+            return true;
+        }
+    }
+    return false;
+}
+
 struct TriangleSample
 {
     cv::Vec3f p0;
@@ -132,8 +162,13 @@ bool SegmentationEditManager::beginSession(QuadSurface* baseSurface, int downsam
         return false;
     }
 
+    ensureSurfaceMetaObject(baseSurface);
+
     _baseSurface = baseSurface;
     _downsample = std::max(1, downsample);
+    _autoHandleWorldSnapshot.clear();
+    _growthHandleWorld.clear();
+    _pendingGrowthMarking = false;
 
     _originalPoints = std::make_unique<cv::Mat_<cv::Vec3f>>(baseSurface->rawPoints().clone());
 
@@ -164,6 +199,9 @@ void SegmentationEditManager::endSession()
     _originalPoints.reset();
     _baseSurface = nullptr;
     _dirty = false;
+    _autoHandleWorldSnapshot.clear();
+    _growthHandleWorld.clear();
+    _pendingGrowthMarking = false;
 }
 
 void SegmentationEditManager::setDownsample(int value)
@@ -267,6 +305,8 @@ void SegmentationEditManager::applyPreview()
     _previewPoints->copyTo(*basePoints);
     _baseSurface->invalidateCache();
 
+    ensureSurfaceMetaObject(_baseSurface);
+
     // Update original snapshot to new base state
     *(_originalPoints) = basePoints->clone();
     basePoints->copyTo(*_previewPoints);
@@ -279,6 +319,8 @@ void SegmentationEditManager::refreshFromBaseSurface()
     if (!hasSession() || !_baseSurface) {
         return;
     }
+
+    ensureSurfaceMetaObject(_baseSurface);
 
     const cv::Mat_<cv::Vec3f>& basePoints = _baseSurface->rawPoints();
 
@@ -609,6 +651,7 @@ std::optional<std::pair<int,int>> SegmentationEditManager::addHandleAtWorld(cons
                                 ? SegmentationRowColAxis::Column
                                 : SegmentationRowColAxis::Row;
     }
+    handle.isGrowth = false;
     _handles.push_back(handle);
 
     if (_previewSurface) {
@@ -645,6 +688,14 @@ std::optional<std::pair<int,int>> SegmentationEditManager::worldToGridIndex(cons
         *outDistance = dist;
     }
     return std::make_pair(row, col);
+}
+
+void SegmentationEditManager::markNextRefreshHandlesAsGrowth()
+{
+    if (!hasSession()) {
+        return;
+    }
+    _pendingGrowthMarking = true;
 }
 
 bool SegmentationEditManager::fillInvalidCellWithLocalSolve(const cv::Vec3f& worldPos,
@@ -1004,20 +1055,36 @@ void SegmentationEditManager::regenerateHandles()
         }
     }
 
+    const std::vector<cv::Vec3f> previousAutoWorld = _autoHandleWorldSnapshot;
+    const std::vector<cv::Vec3f> previousGrowthWorld = _growthHandleWorld;
+
     _handles.clear();
     if (!hasSession() || !_previewPoints) {
         _handles = manualHandles;
+        _pendingGrowthMarking = false;
+        _autoHandleWorldSnapshot.clear();
+        _growthHandleWorld.clear();
         return;
     }
 
     const cv::Mat_<cv::Vec3f>& points = *_previewPoints;
     const int rows = points.rows;
     const int cols = points.cols;
+    const int stride = std::max(1, _downsample);
 
-    for (int r = 0; r < rows; r += _downsample) {
-        for (int c = 0; c < cols; c += _downsample) {
+    const float gridStep = estimateGridStepWorld();
+    const float matchTolerance = std::max(gridStep * 0.5f, 1.0f);
+    const float matchToleranceSq = matchTolerance * matchTolerance;
+
+    std::vector<cv::Vec3f> newAutoWorld;
+    newAutoWorld.reserve((rows / stride + 1) * (cols / stride + 1));
+    std::vector<cv::Vec3f> newGrowthWorld;
+    newGrowthWorld.reserve(previousGrowthWorld.size());
+
+    for (int r = 0; r < rows; r += stride) {
+        for (int c = 0; c < cols; c += stride) {
             const cv::Vec3f& wp = points(r, c);
-            if (wp[0] == -1.0f && wp[1] == -1.0f && wp[2] == -1.0f) {
+            if (isInvalidPoint(wp)) {
                 continue;
             }
 
@@ -1028,6 +1095,17 @@ void SegmentationEditManager::regenerateHandles()
             handle.currentWorld = wp;
             handle.isManual = false;
             handle.rowColAxis = SegmentationRowColAxis::Both;
+
+            const bool existedBefore = containsNearby(previousAutoWorld, wp, matchToleranceSq);
+            const bool wasGrowth = containsNearby(previousGrowthWorld, wp, matchToleranceSq);
+            const bool markAsNewGrowth = _pendingGrowthMarking && !existedBefore;
+
+            handle.isGrowth = wasGrowth || markAsNewGrowth;
+            if (handle.isGrowth) {
+                newGrowthWorld.push_back(wp);
+            }
+
+            newAutoWorld.push_back(wp);
             _handles.push_back(handle);
         }
     }
@@ -1037,16 +1115,21 @@ void SegmentationEditManager::regenerateHandles()
             continue;
         }
         const cv::Vec3f& orig = (*_originalPoints)(handle.row, handle.col);
-        if (orig[0] == -1.0f && orig[1] == -1.0f && orig[2] == -1.0f) {
+        if (isInvalidPoint(orig)) {
             continue;
         }
         handle.originalWorld = orig;
         handle.currentWorld = (*_previewPoints)(handle.row, handle.col);
         handle.isManual = true;
+        handle.isGrowth = false;
         if (!findHandle(handle.row, handle.col)) {
             _handles.push_back(handle);
         }
     }
+
+    _autoHandleWorldSnapshot = std::move(newAutoWorld);
+    _growthHandleWorld = std::move(newGrowthWorld);
+    _pendingGrowthMarking = false;
 }
 
 void SegmentationEditManager::applyHandleInfluence(const Handle& handle)
@@ -1414,6 +1497,8 @@ void SegmentationEditManager::syncPreviewFromBase()
     if (!_baseSurface || !_previewPoints) {
         return;
     }
+
+    ensureSurfaceMetaObject(_baseSurface);
 
     const cv::Mat_<cv::Vec3f>& basePoints = _baseSurface->rawPoints();
     if (!_previewPoints->empty() && basePoints.size() == _previewPoints->size()) {
