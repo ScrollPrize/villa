@@ -160,7 +160,7 @@ private:
     float _highlightDistance = 15.0f;      // screen-space pixels
     bool _fillInvalidRegions = true;
     bool _hasPendingChanges = false;
-    SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Tracer};
+    SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Corrections};
     SegmentationGrowthDirection _growthDirection{SegmentationGrowthDirection::All};
     int _growthSteps{0};
     std::optional<uint64_t> _activeCorrectionId;

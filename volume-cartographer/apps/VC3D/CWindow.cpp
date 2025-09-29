@@ -566,6 +566,8 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
         }
     }
 
+    _segmentationGrowthVolumeId = currentVolumeId;
+
     if (_segmentationWidget) {
         _segmentationWidget->setActiveVolume(QString::fromStdString(currentVolumeId));
     }
@@ -770,21 +772,29 @@ void CWindow::CreateWidgets(void)
     connect(_segmentationWidget, &SegmentationWidget::volumeSelectionChanged, this, [this](const QString& volumeId) {
         if (!fVpkg) {
             statusBar()->showMessage(tr("No volume package loaded."), 4000);
+            if (_segmentationWidget) {
+                const QString fallbackId = QString::fromStdString(!_segmentationGrowthVolumeId.empty()
+                                                                   ? _segmentationGrowthVolumeId
+                                                                   : currentVolumeId);
+                _segmentationWidget->setActiveVolume(fallbackId);
+            }
             return;
         }
 
+        const std::string requestedId = volumeId.toStdString();
         try {
-            auto newVolume = fVpkg->volume(volumeId.toStdString());
-            if (volSelect) {
-                const QSignalBlocker blocker(volSelect);
-                int idx = volSelect->findData(volumeId);
-                if (idx >= 0) {
-                    volSelect->setCurrentIndex(idx);
-                }
-            }
-            setVolume(newVolume);
+            (void)fVpkg->volume(requestedId);
+            _segmentationGrowthVolumeId = requestedId;
+            statusBar()->showMessage(tr("Using volume '%1' for surface growth.").arg(volumeId), 2500);
         } catch (const std::out_of_range&) {
             statusBar()->showMessage(tr("Volume '%1' not found in this package.").arg(volumeId), 4000);
+            if (_segmentationWidget) {
+                const QString fallbackId = QString::fromStdString(!currentVolumeId.empty()
+                                                                   ? currentVolumeId
+                                                                   : std::string{});
+                _segmentationWidget->setActiveVolume(fallbackId);
+                _segmentationGrowthVolumeId = currentVolumeId;
+            }
         }
     });
 
@@ -1189,6 +1199,8 @@ void CWindow::OpenVolume(const QString& path)
         volSelect->clear();
     }
     QVector<QPair<QString, QString>> volumeEntries;
+    QString bestGrowthVolumeId = QString::fromStdString(currentVolumeId);
+    bool preferredVolumeFound = false;
     for (const auto& id : fVpkg->volumeIDs()) {
         auto vol = fVpkg->volume(id);
         const QString idStr = QString::fromStdString(id);
@@ -1196,10 +1208,27 @@ void CWindow::OpenVolume(const QString& path)
         const QString label = nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr);
         volSelect->addItem(label, QVariant(idStr));
         volumeEntries.append({idStr, label});
+
+        const QString loweredName = nameStr.toLower();
+        const QString loweredId = idStr.toLower();
+        const bool matchesPreferred = loweredName.contains(QStringLiteral("surface")) ||
+                                      loweredName.contains(QStringLiteral("surf")) ||
+                                      loweredId.contains(QStringLiteral("surface")) ||
+                                      loweredId.contains(QStringLiteral("surf"));
+
+        if (!preferredVolumeFound && matchesPreferred) {
+            bestGrowthVolumeId = idStr;
+            preferredVolumeFound = true;
+        }
     }
 
+    if (bestGrowthVolumeId.isEmpty() && !volumeEntries.isEmpty()) {
+        bestGrowthVolumeId = volumeEntries.front().first;
+    }
+    _segmentationGrowthVolumeId = bestGrowthVolumeId.toStdString();
+
     if (_segmentationWidget) {
-        _segmentationWidget->setAvailableVolumes(volumeEntries, QString::fromStdString(currentVolumeId));
+        _segmentationWidget->setAvailableVolumes(volumeEntries, bestGrowthVolumeId);
     }
 
     // Populate the segmentation directory dropdown
@@ -1275,6 +1304,7 @@ void CWindow::CloseVolume(void)
     // Clear the volume package
     fVpkg = nullptr;
     currentVolume = nullptr;
+    _segmentationGrowthVolumeId.clear();
     updateNormalGridAvailability();
     if (_segmentationWidget) {
         _segmentationWidget->setAvailableVolumes({}, QString());
@@ -1812,12 +1842,6 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
         return;
     }
 
-    if (!currentVolume) {
-        qCInfo(lcSegGrowth) << "Rejecting growth because there is no active volume";
-        statusBar()->showMessage(tr("No volume loaded for growth."), 4000);
-        return;
-    }
-
     auto* segmentationSurface = dynamic_cast<QuadSurface*>(_surf_col->surface("segmentation"));
     if (!segmentationSurface) {
         qCInfo(lcSegGrowth) << "Rejecting growth because segmentation surface is missing";
@@ -1826,6 +1850,34 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
     }
 
     ensureGenerationsChannel(segmentationSurface);
+
+    std::string growthVolumeId = !_segmentationGrowthVolumeId.empty()
+                                     ? _segmentationGrowthVolumeId
+                                     : currentVolumeId;
+    std::shared_ptr<Volume> growthVolume;
+
+    if (fVpkg && !growthVolumeId.empty()) {
+        try {
+            growthVolume = fVpkg->volume(growthVolumeId);
+        } catch (const std::out_of_range&) {
+            growthVolume.reset();
+        }
+    }
+
+    if (!growthVolume) {
+        growthVolume = currentVolume;
+        growthVolumeId = currentVolumeId;
+    }
+
+    if (!growthVolume) {
+        qCInfo(lcSegGrowth) << "Rejecting growth because no usable volume is available";
+        statusBar()->showMessage(tr("No volume available for growth."), 4000);
+        return;
+    }
+
+    if (!_segmentationGrowthVolumeId.empty() && _segmentationGrowthVolumeId != growthVolumeId) {
+        statusBar()->showMessage(tr("Selected growth volume unavailable; using the active volume instead."), 4000);
+    }
 
     _segmentationGrowthRunning = true;
     if (_segmentationModule) {
@@ -1855,6 +1907,8 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
         qCInfo(lcSegGrowth) << "Including" << corrections.collections.size() << "correction set(s)";
     }
 
+    qCInfo(lcSegGrowth) << "Growth volume ID" << QString::fromStdString(growthVolumeId);
+
     qCInfo(lcSegGrowth) << "Starting tracer growth";
     if (method == SegmentationGrowthMethod::Corrections) {
         if (usingCorrections) {
@@ -1874,14 +1928,14 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
 
     TracerGrowthContext ctx;
     ctx.resumeSurface = segmentationSurface;
-    ctx.volume = currentVolume.get();
+    ctx.volume = growthVolume.get();
     ctx.cache = chunk_cache;
     ctx.cacheRoot = cacheRootForVolumePkg(fVpkg);
-    ctx.voxelSize = currentVolume->voxelSize();
+    ctx.voxelSize = growthVolume->voxelSize();
     ctx.normalGridPath = _normalGridPath;
 
     if (ctx.cacheRoot.isEmpty()) {
-        const auto volumePath = currentVolume->path();
+        const auto volumePath = growthVolume->path();
         ctx.cacheRoot = QDir(QString::fromStdString(volumePath.parent_path().string())).filePath(QStringLiteral("cache"));
     }
 
@@ -1892,12 +1946,15 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
         return;
     }
 
+    const double growthVoxelSize = growthVolume ? growthVolume->voxelSize() : 0.0;
+
     qCInfo(lcSegGrowth) << "Launching tracer future" << ctx.cacheRoot;
     auto future = QtConcurrent::run(runTracerGrowth, request, ctx);
     auto* watcher = new QFutureWatcher<TracerGrowthResult>(this);
     _tracerGrowthWatcher.reset(watcher);
 
-    connect(watcher, &QFutureWatcher<TracerGrowthResult>::finished, this, [this, segmentationSurface, finalize, usingCorrections]() {
+    connect(watcher, &QFutureWatcher<TracerGrowthResult>::finished, this, [this, segmentationSurface, finalize, usingCorrections, growthVoxelSize, growthVolume]() {
+        Q_UNUSED(growthVolume);
         if (!_tracerGrowthWatcher) {
             qCInfo(lcSegGrowth) << "Tracer watcher finished but watcher reset early";
             finalize();
@@ -1923,7 +1980,7 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
             return;
         }
 
-        const double voxelSize = (currentVolume) ? currentVolume->voxelSize() : 0.0;
+        const double voxelSize = growthVoxelSize;
         cv::Mat generations = result.surface->channel("generations");
 
         std::vector<QuadSurface*> surfacesToUpdate;

@@ -156,6 +156,7 @@ private:
 
     std::shared_ptr<Volume> currentVolume;
     std::string currentVolumeId;
+    std::string _segmentationGrowthVolumeId;
     int loc[3] = {0,0,0};
 
     static const int AMPLITUDE = 28000;

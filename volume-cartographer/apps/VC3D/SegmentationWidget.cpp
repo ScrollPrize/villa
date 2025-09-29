@@ -109,7 +109,7 @@ void SegmentationWidget::setupUI()
     auto* stepsLayout = new QHBoxLayout();
     auto* stepsLabel = new QLabel(tr("Steps:"), _groupGrowth);
     _spinGrowthSteps = new QSpinBox(_groupGrowth);
-    _spinGrowthSteps->setRange(0, 1024);
+    _spinGrowthSteps->setRange(-50, 1024);
     _spinGrowthSteps->setSingleStep(1);
     _spinGrowthSteps->setValue(_growthSteps);
     _spinGrowthSteps->setToolTip(tr("Number of grid units to add in the chosen direction"));

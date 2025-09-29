@@ -5,6 +5,8 @@
 
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
+#include <QLoggingCategory>
+#include <QString>
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
@@ -14,6 +16,8 @@
 #include "vc/tracer/Tracer.hpp"
 #include "vc/ui/VCCollection.hpp"
 
+Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth)
+
 namespace
 {
 bool isInvalidPoint(const cv::Vec3f& p)
@@ -22,7 +26,7 @@ bool isInvalidPoint(const cv::Vec3f& p)
            (p[0] == -1.0f && p[1] == -1.0f && p[2] == -1.0f);
 }
 
-double triangleAreaUm2(const cv::Vec3f& a, const cv::Vec3f& b, const cv::Vec3f& c)
+double triangleAreaVx2(const cv::Vec3f& a, const cv::Vec3f& b, const cv::Vec3f& c)
 {
     if (isInvalidPoint(a) || isInvalidPoint(b) || isInvalidPoint(c)) {
         return 0.0;
@@ -33,7 +37,7 @@ double triangleAreaUm2(const cv::Vec3f& a, const cv::Vec3f& b, const cv::Vec3f& 
     return 0.5 * static_cast<double>(cv::norm(crossVec));
 }
 
-double computeSurfaceAreaUm2(const cv::Mat_<cv::Vec3f>& points)
+double computeSurfaceAreaVx2(const cv::Mat_<cv::Vec3f>& points)
 {
     if (points.empty() || points.rows < 2 || points.cols < 2) {
         return 0.0;
@@ -47,8 +51,8 @@ double computeSurfaceAreaUm2(const cv::Mat_<cv::Vec3f>& points)
             const cv::Vec3f& p01 = points(y + 1, x);
             const cv::Vec3f& p11 = points(y + 1, x + 1);
 
-            totalArea += triangleAreaUm2(p00, p10, p01);
-            totalArea += triangleAreaUm2(p11, p01, p10);
+            totalArea += triangleAreaVx2(p00, p10, p01);
+            totalArea += triangleAreaVx2(p11, p01, p10);
         }
     }
 
@@ -272,6 +276,14 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
     }
 
     try {
+        qCInfo(lcSegGrowth) << "Calling tracer()";
+        qCInfo(lcSegGrowth) << "  cacheRoot:" << context.cacheRoot;
+        qCInfo(lcSegGrowth) << "  voxelSize:" << context.voxelSize;
+        qCInfo(lcSegGrowth) << "  resumeSurface:" << (context.resumeSurface ? context.resumeSurface->id.c_str() : "<null>");
+        const auto collectionCount = correctionCollection.getAllCollections().size();
+        qCInfo(lcSegGrowth) << "  corrections collections:" << collectionCount;
+        qCInfo(lcSegGrowth) << "  params:" << QString::fromStdString(params.dump());
+
         QuadSurface* surface = tracer(dataset,
                                       1.0f,
                                       context.cache,
@@ -304,14 +316,14 @@ void updateSegmentationSurfaceMetadata(QuadSurface* surface,
 
     const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
     if (points && !points->empty()) {
-        const double areaUm2 = computeSurfaceAreaUm2(*points);
-        (*surface->meta)["area_cm2"] = areaUm2 * 1e-8;
+        const double areaVx2 = computeSurfaceAreaVx2(*points);
+        (*surface->meta)["area_vx2"] = areaVx2;
 
         if (voxelSize > 0.0) {
-            const double voxelAreaUm2 = voxelSize * voxelSize;
-            if (voxelAreaUm2 > 0.0) {
-                (*surface->meta)["area_vx2"] = areaUm2 / voxelAreaUm2;
-            }
+            const double areaUm2 = areaVx2 * voxelSize * voxelSize;
+            (*surface->meta)["area_cm2"] = areaUm2 * 1e-8;
+        } else if (!surface->meta->contains("area_cm2")) {
+            (*surface->meta)["area_cm2"] = 0.0;
         }
     }
 

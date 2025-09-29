@@ -645,9 +645,9 @@ void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf)
             _intersect_items.clear();
             slice_vis_items.clear();
             _paths.clear();
-            emit overlaysUpdated();
-            // Scene items are already deleted by fScene->clear(); just drop overlay references
+            // Drop overlay references before notifying listeners so they do not touch deleted items
             _overlay_groups.clear();
+            emit overlaysUpdated();
             _cursor = nullptr;
             _center_marker = nullptr;
             fBaseImageItem = nullptr;
