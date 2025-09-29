@@ -200,7 +200,7 @@ enabling and the status label (`SegmentationWidget.cpp:304-351`).
 - **Reset** – Restores the preview from the original clone, rebuilds handles, and
   clears manual state (`SegmentationModule.cpp:205-214`,
   `SegmentationEditManager.cpp:192-205`).
-- **Stop tools** – Emits a `stopToolsRequested` signal so upstream UI can exit the
+- **Stop** – Emits a `stopToolsRequested` signal so upstream UI can exit the
   segmentation workflow gracefully (`SegmentationWidget.cpp:150-163`,
   `SegmentationModule.cpp:215-221`).
 

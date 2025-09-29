@@ -28,6 +28,7 @@ public:
     void setHoverHandle(std::optional<std::pair<int,int>> key, bool refresh = true);
     void setKeyboardHandle(std::optional<std::pair<int,int>> key, bool refresh = true);
     void setHandleVisibility(bool showAll, float distance);
+    void setHandlesVisible(bool visible);
     void setCursorWorld(const cv::Vec3f& world, bool valid);
     void setSliceFadeDistance(float distance);
     void setSliceDisplayMode(SegmentationSliceDisplayMode mode);
@@ -49,6 +50,7 @@ private:
     std::optional<std::pair<int,int>> _activeHandle;
     std::optional<std::pair<int,int>> _hoverHandle;
     std::optional<std::pair<int,int>> _keyboardHandle;
+    bool _handlesVisible{true};
     bool _showAllHandles{true};
     float _handleDisplayDistance{25.0f};
     bool _cursorValid{false};

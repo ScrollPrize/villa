@@ -198,6 +198,8 @@ private:
     void handleCorrectionPointAdded(const cv::Vec3f& worldPos);
     void handleCorrectionPointRemove(const cv::Vec3f& worldPos);
     void pruneMissingCorrections();
+    void onGrowthMethodChanged(SegmentationGrowthMethod method);
+    void updateHandleVisibility();
 
     SegmentationWidget* _widget{nullptr};
     SegmentationEditManager* _editManager{nullptr};
@@ -216,11 +218,12 @@ private:
     SegmentationRowColMode _rowColMode{SegmentationRowColMode::Dynamic};
     int _holeSearchRadius{6};
     int _holeSmoothIterations{25};
-   bool _showHandlesAlways{true};
-   float _handleDisplayDistance{25.0f};
-   float _highlightDistance{15.0f};
-   bool _fillInvalidRegions{true};
+    bool _showHandlesAlways{true};
+    float _handleDisplayDistance{25.0f};
+    float _highlightDistance{15.0f};
+    bool _fillInvalidRegions{true};
     bool _correctionsAnnotateMode{false};
+    bool _usingCorrectionsGrowth{false};
     uint64_t _activeCorrectionId{0};
     std::vector<uint64_t> _pendingCorrectionIds;
     std::unordered_set<uint64_t> _managedCorrectionIds;

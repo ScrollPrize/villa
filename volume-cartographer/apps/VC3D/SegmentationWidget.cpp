@@ -56,7 +56,6 @@ SegmentationWidget::SegmentationWidget(QWidget* parent)
     , _comboCorrections(nullptr)
     , _btnCorrectionsNew(nullptr)
     , _chkCorrectionsAnnotate(nullptr)
-    , _btnLockHandles(nullptr)
     , _normalGridStatusWidget(nullptr)
     , _normalGridStatusIcon(nullptr)
     , _normalGridStatusText(nullptr)
@@ -109,7 +108,7 @@ void SegmentationWidget::setupUI()
     auto* stepsLayout = new QHBoxLayout();
     auto* stepsLabel = new QLabel(tr("Steps:"), _groupGrowth);
     _spinGrowthSteps = new QSpinBox(_groupGrowth);
-    _spinGrowthSteps->setRange(-50, 1024);
+    _spinGrowthSteps->setRange(1, 1024);
     _spinGrowthSteps->setSingleStep(1);
     _spinGrowthSteps->setValue(_growthSteps);
     _spinGrowthSteps->setToolTip(tr("Number of grid units to add in the chosen direction"));
@@ -352,11 +351,6 @@ void SegmentationWidget::setupUI()
     _chkCorrectionsAnnotate->setToolTip(tr("When enabled, left-clicks add points to the active correction set; Ctrl+click removes the nearest point."));
     correctionsLayout->addWidget(_chkCorrectionsAnnotate);
 
-    _btnLockHandles = new QPushButton(tr("Lock handles"), _groupCorrections);
-    _btnLockHandles->setCheckable(true);
-    _btnLockHandles->setToolTip(tr("Toggle to temporarily disable handle edits while annotating corrections."));
-    correctionsLayout->addWidget(_btnLockHandles);
-
     layout->addWidget(_groupCorrections);
 
     auto* actionsLayout = new QHBoxLayout();
@@ -367,7 +361,7 @@ void SegmentationWidget::setupUI()
     actionsLayout->addWidget(_btnReset);
     layout->addLayout(actionsLayout);
 
-    _btnStopTools = new QPushButton(tr("Stop tools"), this);
+    _btnStopTools = new QPushButton(tr("Stop"), this);
     layout->addWidget(_btnStopTools);
 
     layout->addStretch();
@@ -508,12 +502,6 @@ void SegmentationWidget::setupUI()
         emit correctionsAnnotateToggled(enabled);
     });
 
-    connect(_btnLockHandles, &QPushButton::toggled, this, [this](bool locked) {
-        _handlesLocked = locked;
-        _btnLockHandles->setText(locked ? tr("Unlock handles") : tr("Lock handles"));
-        emit handlesLockToggled(locked);
-    });
-
     connect(_comboGrowthMethod, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
         if (index < 0) {
             return;
@@ -529,6 +517,7 @@ void SegmentationWidget::setupUI()
         _growthMethod = method;
         writeSetting(QStringLiteral("growth_method"), static_cast<int>(_growthMethod));
         updateGrowthModeUi();
+        emit growthMethodChanged(_growthMethod);
     });
 
     connect(_comboGrowthDirection, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
@@ -1092,10 +1081,6 @@ void SegmentationWidget::refreshCorrectionsUiState()
         _chkCorrectionsAnnotate->setEnabled(canAnnotate);
     }
 
-    if (_btnLockHandles) {
-        _btnLockHandles->setEnabled(_editingEnabled);
-        _btnLockHandles->setText(_handlesLocked ? tr("Unlock handles") : tr("Lock handles"));
-    }
 }
 
 void SegmentationWidget::updateGrowthModeUi()
@@ -1114,6 +1099,9 @@ void SegmentationWidget::updateGrowthModeUi()
     if (_groupHandleDisplay) {
         _groupHandleDisplay->setVisible(showDetailedControls);
     }
+    if (_groupSliceVisibility) {
+        _groupSliceVisibility->setVisible(showDetailedControls);
+    }
 }
 
 void SegmentationWidget::setHandlesLocked(bool locked)
@@ -1122,11 +1110,6 @@ void SegmentationWidget::setHandlesLocked(bool locked)
         return;
     }
     _handlesLocked = locked;
-    if (_btnLockHandles) {
-        const QSignalBlocker blocker(_btnLockHandles);
-        _btnLockHandles->setChecked(locked);
-        _btnLockHandles->setText(locked ? tr("Unlock handles") : tr("Lock handles"));
-    }
 }
 
 void SegmentationWidget::setNormalGridAvailable(bool available)
@@ -1152,7 +1135,7 @@ void SegmentationWidget::setNormalGridAvailable(bool available)
             _normalGridStatusIcon->setPixmap(icon.pixmap(16, 16));
         }
         if (_normalGridStatusText) {
-            _normalGridStatusText->setText(tr("Normal grid data missing [X]"));
+            _normalGridStatusText->setText(tr("Normal grid not found at {volpkg}/normal_grids"));
             _normalGridStatusText->setStyleSheet(QStringLiteral("color: #c92a2a;"));
         }
     }

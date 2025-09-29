@@ -163,6 +163,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _highlightDistance = _widget->highlightDistance();
         _fillInvalidRegions = _widget->fillInvalidRegions();
         _handlesLocked = _widget->handlesLocked();
+        _usingCorrectionsGrowth = (_widget->growthMethod() == SegmentationGrowthMethod::Corrections);
     }
     if (_editManager) {
         _editManager->setHoleSearchRadius(_holeSearchRadius);
@@ -177,6 +178,8 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _overlay->setSliceDisplayMode(_sliceDisplayMode);
         _overlay->setCursorWorld(cv::Vec3f(0, 0, 0), false);
     }
+
+    updateHandleVisibility();
 
     if (_viewerManager) {
         _viewerManager->setSegmentationOverlay(_overlay);
@@ -278,6 +281,9 @@ void SegmentationModule::bindWidgetSignals()
     connect(_widget, &SegmentationWidget::growSurfaceRequested,
             this, &SegmentationModule::handleGrowSurfaceRequested,
             Qt::UniqueConnection);
+    connect(_widget, &SegmentationWidget::growthMethodChanged,
+            this, &SegmentationModule::onGrowthMethodChanged,
+            Qt::UniqueConnection);
 
     connect(_widget, &SegmentationWidget::correctionsCreateRequested,
             this, [this]() {
@@ -299,11 +305,25 @@ void SegmentationModule::bindWidgetSignals()
                 setCorrectionsAnnotateMode(enabled, true);
             },
             Qt::UniqueConnection);
-    connect(_widget, &SegmentationWidget::handlesLockToggled,
-            this, [this](bool locked) {
-                setHandlesLocked(locked, true);
-            },
-            Qt::UniqueConnection);
+}
+
+void SegmentationModule::onGrowthMethodChanged(SegmentationGrowthMethod method)
+{
+    const bool usingCorrections = (method == SegmentationGrowthMethod::Corrections);
+    if (_usingCorrectionsGrowth == usingCorrections) {
+        return;
+    }
+    _usingCorrectionsGrowth = usingCorrections;
+    updateHandleVisibility();
+}
+
+void SegmentationModule::updateHandleVisibility()
+{
+    if (!_overlay) {
+        return;
+    }
+    const bool showHandles = _editingEnabled && !_correctionsAnnotateMode && !_usingCorrectionsGrowth;
+    _overlay->setHandlesVisible(showHandles);
 }
 
 void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod method,
@@ -382,6 +402,8 @@ void SegmentationModule::setEditingEnabled(bool enabled)
         _overlay->setRadius(_radius);
         _overlay->refreshAll();
     }
+
+    updateHandleVisibility();
 
     if (!enabled) {
         resetInteractionState();
@@ -1066,6 +1088,18 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
             setCorrectionsAnnotateMode(false, false);
             emit statusMessageRequested(tr("Create or select a correction set before annotating."), kStatusShort);
             return;
+        }
+
+        if (!modifiers.testFlag(Qt::ControlModifier) && viewer) {
+            const uint64_t highlightedId = viewer->highlightedPointId();
+            if (highlightedId != 0 && _pointCollection) {
+                if (auto pointOpt = _pointCollection->getPoint(highlightedId)) {
+                    if (pointOpt->collectionId == _activeCorrectionId) {
+                        logger.add(QStringLiteral("correction drag: existing point highlighted"));
+                        return;
+                    }
+                }
+            }
         }
 
         if (modifiers.testFlag(Qt::ControlModifier)) {
@@ -1776,6 +1810,8 @@ void SegmentationModule::setCorrectionsAnnotateMode(bool enabled, bool userIniti
     }
 
     _correctionsAnnotateMode = enabled;
+
+    updateHandleVisibility();
 
     if (!enabled) {
         _widget->setCorrectionsAnnotateChecked(false);

@@ -96,6 +96,10 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
         return;
     }
 
+    if (!_handlesVisible) {
+        return;
+    }
+
     auto* currentSurface = viewer->currentSurface();
     auto* planeSurface = dynamic_cast<PlaneSurface*>(currentSurface);
 
@@ -344,6 +348,15 @@ void SegmentationOverlayController::setHandleVisibility(bool showAll, float dist
     }
     _showAllHandles = showAll;
     _handleDisplayDistance = clamped;
+}
+
+void SegmentationOverlayController::setHandlesVisible(bool visible)
+{
+    if (_handlesVisible == visible) {
+        return;
+    }
+    _handlesVisible = visible;
+    refreshAll();
 }
 
 void SegmentationOverlayController::setCursorWorld(const cv::Vec3f& world, bool valid)

@@ -1018,9 +1018,18 @@ private:
 
 void CVolumeViewer::renderVisible(bool force)
 {
+    if (_surf && _surf_col) {
+        Surface* currentSurface = _surf_col->surface(_surf_name);
+        if (!currentSurface) {
+            // Surface was cleared (e.g. during volume reload) without a change signal
+            // reaching this viewer yet; drop the dangling pointer before rendering.
+            _surf = nullptr;
+        }
+    }
+
     if (!volume || !volume->zarrDataset() || !_surf)
         return;
-    
+
     QRectF bbox = fGraphicsView->mapToScene(fGraphicsView->viewport()->geometry()).boundingRect();
     
     if (!force && QRectF(curr_img_area).contains(bbox))

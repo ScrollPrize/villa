@@ -42,6 +42,7 @@ public:
     [[nodiscard]] bool handlesAlwaysVisible() const { return _handlesAlwaysVisible; }
     [[nodiscard]] float handleDisplayDistance() const { return _handleDisplayDistance; }
     [[nodiscard]] bool fillInvalidRegions() const { return _fillInvalidRegions; }
+    [[nodiscard]] SegmentationGrowthMethod growthMethod() const { return _growthMethod; }
 
     void setPendingChanges(bool pending);
     void setCorrectionsEnabled(bool enabled);
@@ -93,10 +94,10 @@ signals:
     void growSurfaceRequested(SegmentationGrowthMethod method,
                               SegmentationGrowthDirection direction,
                               int steps);
+    void growthMethodChanged(SegmentationGrowthMethod method);
     void correctionsAnnotateToggled(bool enabled);
     void correctionsCollectionSelected(uint64_t collectionId);
     void correctionsCreateRequested();
-    void handlesLockToggled(bool locked);
     void volumeSelectionChanged(const QString& volumeId);
 
 private:
@@ -140,7 +141,6 @@ private:
     class QComboBox* _comboCorrections;
     QPushButton* _btnCorrectionsNew;
     QCheckBox* _chkCorrectionsAnnotate;
-    QPushButton* _btnLockHandles;
     QWidget* _normalGridStatusWidget;
     QLabel* _normalGridStatusIcon;
     QLabel* _normalGridStatusText;
@@ -162,7 +162,7 @@ private:
     bool _hasPendingChanges = false;
     SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Corrections};
     SegmentationGrowthDirection _growthDirection{SegmentationGrowthDirection::All};
-    int _growthSteps{0};
+    int _growthSteps{5};
     std::optional<uint64_t> _activeCorrectionId;
     bool _correctionsEnabled{false};
     bool _handlesLocked{false};
