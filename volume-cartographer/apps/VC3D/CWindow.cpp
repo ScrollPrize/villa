@@ -1923,6 +1923,9 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
     request.method = method;
     request.direction = direction;
     request.steps = steps;
+    if (_segmentationWidget) {
+        request.allowedDirections = _segmentationWidget->allowedGrowthDirections();
+    }
     request.corrections = corrections;
     if (method == SegmentationGrowthMethod::Corrections && _segmentationModule) {
         if (auto zRange = _segmentationModule->correctionsZRange()) {

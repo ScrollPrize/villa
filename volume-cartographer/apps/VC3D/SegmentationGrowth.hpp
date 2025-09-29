@@ -99,6 +99,7 @@ struct SegmentationGrowthRequest {
     SegmentationGrowthMethod method{SegmentationGrowthMethod::Tracer};
     SegmentationGrowthDirection direction{SegmentationGrowthDirection::All};
     int steps{0};
+    std::vector<SegmentationGrowthDirection> allowedDirections;
     SegmentationCorrectionsPayload corrections;
     std::optional<std::pair<int, int>> correctionsZRange;
 };

@@ -7,6 +7,7 @@
 
 #include <optional>
 #include <utility>
+#include <vector>
 
 #include "SegmentationInfluenceMode.hpp"
 #include "SegmentationGrowth.hpp"
@@ -44,6 +45,7 @@ public:
     [[nodiscard]] float handleDisplayDistance() const { return _handleDisplayDistance; }
     [[nodiscard]] bool fillInvalidRegions() const { return _fillInvalidRegions; }
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const { return _growthMethod; }
+    [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
 
     void setPendingChanges(bool pending);
     void setCorrectionsEnabled(bool enabled);
@@ -116,6 +118,10 @@ private:
     void writeSetting(const QString& key, const QVariant& value);
     void refreshCorrectionsUiState();
     void updateGrowthModeUi();
+    void setGrowthDirectionMask(int mask);
+    void updateGrowthDirectionMaskFromUi(QCheckBox* changedCheckbox);
+    void applyGrowthDirectionMaskToUi();
+    static int normalizeGrowthDirectionMask(int mask);
 
     QCheckBox* _chkEditing;
     QLabel* _editingStatus;
@@ -145,6 +151,10 @@ private:
     class QComboBox* _comboGrowthDirection;
     QSpinBox* _spinGrowthSteps;
     QPushButton* _btnGrow;
+    QCheckBox* _chkGrowthDirUp;
+    QCheckBox* _chkGrowthDirDown;
+    QCheckBox* _chkGrowthDirLeft;
+    QCheckBox* _chkGrowthDirRight;
     class QComboBox* _comboVolume;
     QGroupBox* _groupCorrections;
     class QComboBox* _comboCorrections;
@@ -175,6 +185,12 @@ private:
     SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Corrections};
     SegmentationGrowthDirection _growthDirection{SegmentationGrowthDirection::All};
     int _growthSteps{5};
+    static constexpr int kGrowDirUpBit = 1 << 0;
+    static constexpr int kGrowDirDownBit = 1 << 1;
+    static constexpr int kGrowDirLeftBit = 1 << 2;
+    static constexpr int kGrowDirRightBit = 1 << 3;
+    static constexpr int kGrowDirAllMask = kGrowDirUpBit | kGrowDirDownBit | kGrowDirLeftBit | kGrowDirRightBit;
+    int _growthDirectionMask{kGrowDirAllMask};
     std::optional<uint64_t> _activeCorrectionId;
     bool _correctionsEnabled{false};
     bool _correctionsZRangeEnabled{false};

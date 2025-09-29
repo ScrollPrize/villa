@@ -19,6 +19,7 @@
 #include XTENSORINCLUDE(views, xview.hpp)
 
 #include <iostream>
+#include <cctype>
 
 #include "vc/tracer/Tracer.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -172,6 +173,90 @@ struct LossSettings {
     int z_min = -1;
     int z_max = std::numeric_limits<int>::max();
 };
+
+static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& params)
+{
+    static const std::vector<cv::Vec2i> kDefaultDirections = {
+        {1, 0},   // down / +row
+        {0, 1},   // right / +col
+        {-1, 0},  // up / -row
+        {0, -1}   // left / -col
+    };
+
+    const auto it = params.find("growth_directions");
+    if (it == params.end()) {
+        return kDefaultDirections;
+    }
+
+    const nlohmann::json& directions = *it;
+    if (!directions.is_array()) {
+        std::cerr << "growth_directions parameter must be an array of strings" << std::endl;
+        return kDefaultDirections;
+    }
+
+    bool allow_down = false;
+    bool allow_right = false;
+    bool allow_up = false;
+    bool allow_left = false;
+    bool any_valid = false;
+
+    for (const auto& entry : directions) {
+        if (!entry.is_string()) {
+            std::cerr << "Ignoring non-string entry in growth_directions" << std::endl;
+            continue;
+        }
+
+        const std::string value = entry.get<std::string>();
+        std::string lower;
+        lower.reserve(value.size());
+        for (char ch : value) {
+            lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        }
+
+        if (lower == "all") {
+            return kDefaultDirections;
+        }
+        if (lower == "down") {
+            allow_down = true;
+            any_valid = true;
+            continue;
+        }
+        if (lower == "right") {
+            allow_right = true;
+            any_valid = true;
+            continue;
+        }
+        if (lower == "up") {
+            allow_up = true;
+            any_valid = true;
+            continue;
+        }
+        if (lower == "left") {
+            allow_left = true;
+            any_valid = true;
+            continue;
+        }
+
+        std::cerr << "Unknown growth direction '" << value << "' ignored" << std::endl;
+    }
+
+    if (!any_valid) {
+        return kDefaultDirections;
+    }
+
+    std::vector<cv::Vec2i> custom;
+    custom.reserve(4);
+    if (allow_down) custom.emplace_back(1, 0);
+    if (allow_right) custom.emplace_back(0, 1);
+    if (allow_up) custom.emplace_back(-1, 0);
+    if (allow_left) custom.emplace_back(0, -1);
+
+    if (custom.empty()) {
+        return kDefaultDirections;
+    }
+
+    return custom;
+}
 
 } // namespace
 
@@ -1099,7 +1184,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     options.function_tolerance = 1e-3;
 
 
-    std::vector<cv::Vec2i> neighs = {{1,0},{0,1},{-1,0},{0,-1}};
+    auto neighs = parse_growth_directions(params);
 
     int local_opt_r = 3;
 

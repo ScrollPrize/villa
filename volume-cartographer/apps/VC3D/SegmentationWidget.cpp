@@ -51,6 +51,10 @@ SegmentationWidget::SegmentationWidget(QWidget* parent)
     , _comboGrowthDirection(nullptr)
     , _spinGrowthSteps(nullptr)
     , _btnGrow(nullptr)
+    , _chkGrowthDirUp(nullptr)
+    , _chkGrowthDirDown(nullptr)
+    , _chkGrowthDirLeft(nullptr)
+    , _chkGrowthDirRight(nullptr)
     , _comboVolume(nullptr)
     , _groupCorrections(nullptr)
     , _comboCorrections(nullptr)
@@ -107,6 +111,59 @@ void SegmentationWidget::setupUI()
     directionLayout->addWidget(_comboGrowthDirection);
     directionLayout->addStretch();
     growthLayout->addLayout(directionLayout);
+
+    auto* allowedLayout = new QHBoxLayout();
+    auto* allowedLabel = new QLabel(tr("Allowed directions:"), _groupGrowth);
+    allowedLayout->addWidget(allowedLabel);
+
+    _chkGrowthDirUp = new QCheckBox(tr("Up"), _groupGrowth);
+    _chkGrowthDirDown = new QCheckBox(tr("Down"), _groupGrowth);
+    _chkGrowthDirLeft = new QCheckBox(tr("Left"), _groupGrowth);
+    _chkGrowthDirRight = new QCheckBox(tr("Right"), _groupGrowth);
+
+    const QString dirTooltip = tr("Restrict tracer expansion to specific grid directions."
+                                   " At least one direction must remain enabled.");
+    _chkGrowthDirUp->setToolTip(dirTooltip);
+    _chkGrowthDirDown->setToolTip(dirTooltip);
+    _chkGrowthDirLeft->setToolTip(dirTooltip);
+    _chkGrowthDirRight->setToolTip(dirTooltip);
+
+    allowedLayout->addWidget(_chkGrowthDirUp);
+    allowedLayout->addWidget(_chkGrowthDirDown);
+    allowedLayout->addWidget(_chkGrowthDirLeft);
+    allowedLayout->addWidget(_chkGrowthDirRight);
+    allowedLayout->addStretch();
+    growthLayout->addLayout(allowedLayout);
+
+    auto* zRangeLayout = new QHBoxLayout();
+    _chkCorrectionsUseZRange = new QCheckBox(tr("Limit Z range"), _groupGrowth);
+    _chkCorrectionsUseZRange->setToolTip(tr("Restrict tracer growth between the specified Z planes when correction-guided growth runs."));
+    zRangeLayout->addWidget(_chkCorrectionsUseZRange);
+
+    auto* zMinLabel = new QLabel(tr("Z min:"), _groupGrowth);
+    _spinCorrectionsZMin = new QSpinBox(_groupGrowth);
+    _spinCorrectionsZMin->setRange(0, 1000000);
+    _spinCorrectionsZMin->setSingleStep(1);
+    _spinCorrectionsZMin->setValue(_correctionsZMin);
+    _spinCorrectionsZMin->setEnabled(false);
+
+    auto* zMaxLabel = new QLabel(tr("Z max:"), _groupGrowth);
+    _spinCorrectionsZMax = new QSpinBox(_groupGrowth);
+    _spinCorrectionsZMax->setRange(0, 1000000);
+    _spinCorrectionsZMax->setSingleStep(1);
+    _spinCorrectionsZMax->setValue(_correctionsZMax);
+    _spinCorrectionsZMax->setEnabled(false);
+
+    zRangeLayout->addSpacing(12);
+    zRangeLayout->addWidget(zMinLabel);
+    zRangeLayout->addWidget(_spinCorrectionsZMin);
+    zRangeLayout->addSpacing(8);
+    zRangeLayout->addWidget(zMaxLabel);
+    zRangeLayout->addWidget(_spinCorrectionsZMax);
+    zRangeLayout->addStretch();
+    growthLayout->addLayout(zRangeLayout);
+
+    applyGrowthDirectionMaskToUi();
 
     auto* stepsLayout = new QHBoxLayout();
     auto* stepsLabel = new QLabel(tr("Steps:"), _groupGrowth);
@@ -354,31 +411,6 @@ void SegmentationWidget::setupUI()
     _chkCorrectionsAnnotate->setToolTip(tr("When enabled, left-clicks add points to the active correction set; Ctrl+click removes the nearest point."));
     correctionsLayout->addWidget(_chkCorrectionsAnnotate);
 
-    _chkCorrectionsUseZRange = new QCheckBox(tr("Limit Z range"), _groupCorrections);
-    _chkCorrectionsUseZRange->setToolTip(tr("When enabled, tracer growth will be limited to the specified Z range when applying corrections."));
-    correctionsLayout->addWidget(_chkCorrectionsUseZRange);
-
-    auto* zRangeLayout = new QHBoxLayout();
-    auto* zMinLabel = new QLabel(tr("Z min:"), _groupCorrections);
-    _spinCorrectionsZMin = new QSpinBox(_groupCorrections);
-    _spinCorrectionsZMin->setRange(0, 1000000);
-    _spinCorrectionsZMin->setSingleStep(1);
-    _spinCorrectionsZMin->setValue(_correctionsZMin);
-    _spinCorrectionsZMin->setEnabled(false);
-    auto* zMaxLabel = new QLabel(tr("Z max:"), _groupCorrections);
-    _spinCorrectionsZMax = new QSpinBox(_groupCorrections);
-    _spinCorrectionsZMax->setRange(0, 1000000);
-    _spinCorrectionsZMax->setSingleStep(1);
-    _spinCorrectionsZMax->setValue(_correctionsZMax);
-    _spinCorrectionsZMax->setEnabled(false);
-    zRangeLayout->addWidget(zMinLabel);
-    zRangeLayout->addWidget(_spinCorrectionsZMin);
-    zRangeLayout->addSpacing(8);
-    zRangeLayout->addWidget(zMaxLabel);
-    zRangeLayout->addWidget(_spinCorrectionsZMax);
-    zRangeLayout->addStretch();
-    correctionsLayout->addLayout(zRangeLayout);
-
     layout->addWidget(_groupCorrections);
 
     auto* actionsLayout = new QHBoxLayout();
@@ -597,6 +629,20 @@ void SegmentationWidget::setupUI()
         _growthDirection = direction;
         writeSetting(QStringLiteral("growth_direction"), static_cast<int>(_growthDirection));
     });
+
+    auto connectDirectionCheckbox = [this](QCheckBox* box) {
+        if (!box) {
+            return;
+        }
+        connect(box, &QCheckBox::toggled, this, [this, box](bool) {
+            updateGrowthDirectionMaskFromUi(box);
+        });
+    };
+
+    connectDirectionCheckbox(_chkGrowthDirUp);
+    connectDirectionCheckbox(_chkGrowthDirDown);
+    connectDirectionCheckbox(_chkGrowthDirLeft);
+    connectDirectionCheckbox(_chkGrowthDirRight);
 
     connect(_spinGrowthSteps, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (value == _growthSteps) {
@@ -884,6 +930,101 @@ void SegmentationWidget::setFillInvalidRegions(bool value)
     writeSetting(QStringLiteral("fill_invalid_regions"), _fillInvalidRegions);
 }
 
+std::vector<SegmentationGrowthDirection> SegmentationWidget::allowedGrowthDirections() const
+{
+    std::vector<SegmentationGrowthDirection> selected;
+    if (_growthDirectionMask & kGrowDirUpBit) {
+        selected.push_back(SegmentationGrowthDirection::Up);
+    }
+    if (_growthDirectionMask & kGrowDirDownBit) {
+        selected.push_back(SegmentationGrowthDirection::Down);
+    }
+    if (_growthDirectionMask & kGrowDirLeftBit) {
+        selected.push_back(SegmentationGrowthDirection::Left);
+    }
+    if (_growthDirectionMask & kGrowDirRightBit) {
+        selected.push_back(SegmentationGrowthDirection::Right);
+    }
+
+    if (selected.empty()) {
+        selected = {
+            SegmentationGrowthDirection::Up,
+            SegmentationGrowthDirection::Down,
+            SegmentationGrowthDirection::Left,
+            SegmentationGrowthDirection::Right
+        };
+    }
+    return selected;
+}
+
+void SegmentationWidget::setGrowthDirectionMask(int mask)
+{
+    mask = normalizeGrowthDirectionMask(mask);
+    const bool changed = (mask != _growthDirectionMask);
+    _growthDirectionMask = mask;
+    applyGrowthDirectionMaskToUi();
+    if (changed) {
+        writeSetting(QStringLiteral("growth_direction_mask"), _growthDirectionMask);
+    }
+}
+
+void SegmentationWidget::updateGrowthDirectionMaskFromUi(QCheckBox* changedCheckbox)
+{
+    int mask = 0;
+    if (_chkGrowthDirUp && _chkGrowthDirUp->isChecked()) {
+        mask |= kGrowDirUpBit;
+    }
+    if (_chkGrowthDirDown && _chkGrowthDirDown->isChecked()) {
+        mask |= kGrowDirDownBit;
+    }
+    if (_chkGrowthDirLeft && _chkGrowthDirLeft->isChecked()) {
+        mask |= kGrowDirLeftBit;
+    }
+    if (_chkGrowthDirRight && _chkGrowthDirRight->isChecked()) {
+        mask |= kGrowDirRightBit;
+    }
+
+    if (mask == 0) {
+        if (changedCheckbox) {
+            const QSignalBlocker blocker(changedCheckbox);
+            changedCheckbox->setChecked(true);
+        }
+        applyGrowthDirectionMaskToUi();
+        return;
+    }
+
+    setGrowthDirectionMask(mask);
+}
+
+void SegmentationWidget::applyGrowthDirectionMaskToUi()
+{
+    if (_chkGrowthDirUp) {
+        const QSignalBlocker blocker(_chkGrowthDirUp);
+        _chkGrowthDirUp->setChecked((_growthDirectionMask & kGrowDirUpBit) != 0);
+    }
+    if (_chkGrowthDirDown) {
+        const QSignalBlocker blocker(_chkGrowthDirDown);
+        _chkGrowthDirDown->setChecked((_growthDirectionMask & kGrowDirDownBit) != 0);
+    }
+    if (_chkGrowthDirLeft) {
+        const QSignalBlocker blocker(_chkGrowthDirLeft);
+        _chkGrowthDirLeft->setChecked((_growthDirectionMask & kGrowDirLeftBit) != 0);
+    }
+    if (_chkGrowthDirRight) {
+        const QSignalBlocker blocker(_chkGrowthDirRight);
+        _chkGrowthDirRight->setChecked((_growthDirectionMask & kGrowDirRightBit) != 0);
+    }
+}
+
+int SegmentationWidget::normalizeGrowthDirectionMask(int mask)
+{
+    mask &= kGrowDirAllMask;
+    if (mask == 0) {
+        mask = kGrowDirAllMask;
+    }
+    return mask;
+}
+
 void SegmentationWidget::setHighlightDistance(float value)
 {
     const float clamped = std::clamp(value, 0.5f, 500.0f);
@@ -955,6 +1096,19 @@ void SegmentationWidget::updateEditingUi()
     }
     if (_comboGrowthDirection) {
         _comboGrowthDirection->setEnabled(_editingEnabled);
+    }
+    const bool growthDirCheckboxEnabled = _editingEnabled;
+    if (_chkGrowthDirUp) {
+        _chkGrowthDirUp->setEnabled(growthDirCheckboxEnabled);
+    }
+    if (_chkGrowthDirDown) {
+        _chkGrowthDirDown->setEnabled(growthDirCheckboxEnabled);
+    }
+    if (_chkGrowthDirLeft) {
+        _chkGrowthDirLeft->setEnabled(growthDirCheckboxEnabled);
+    }
+    if (_chkGrowthDirRight) {
+        _chkGrowthDirRight->setEnabled(growthDirCheckboxEnabled);
     }
     if (_spinGrowthSteps) {
         _spinGrowthSteps->setEnabled(_editingEnabled);
@@ -1049,6 +1203,9 @@ void SegmentationWidget::restoreSettings()
             _comboGrowthDirection->setCurrentIndex(idx);
         }
     }
+
+    const int storedGrowthDirectionMask = settings.value(QStringLiteral("segmentation_edit/growth_direction_mask"), _growthDirectionMask).toInt();
+    setGrowthDirectionMask(storedGrowthDirectionMask);
 
     const int storedGrowthSteps = settings.value(QStringLiteral("segmentation_edit/growth_steps"), _growthSteps).toInt();
     _growthSteps = std::clamp(storedGrowthSteps, 0, 1024);

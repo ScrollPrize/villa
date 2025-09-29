@@ -187,6 +187,45 @@ nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
         params["grow_extra_rows"] = std::max(0, request.steps);
         params["grow_extra_cols"] = std::max(0, request.steps);
     }
+
+    bool allowUp = false;
+    bool allowDown = false;
+    bool allowLeft = false;
+    bool allowRight = false;
+    for (auto dir : request.allowedDirections) {
+        switch (dir) {
+        case SegmentationGrowthDirection::Up:
+            allowUp = true;
+            break;
+        case SegmentationGrowthDirection::Down:
+            allowDown = true;
+            break;
+        case SegmentationGrowthDirection::Left:
+            allowLeft = true;
+            break;
+        case SegmentationGrowthDirection::Right:
+            allowRight = true;
+            break;
+        case SegmentationGrowthDirection::All:
+        default:
+            allowUp = allowDown = allowLeft = allowRight = true;
+            break;
+        }
+        if (allowUp && allowDown && allowLeft && allowRight) {
+            break;
+        }
+    }
+
+    const int allowedCount = static_cast<int>(allowUp) + static_cast<int>(allowDown) +
+                             static_cast<int>(allowLeft) + static_cast<int>(allowRight);
+    if (allowedCount > 0 && allowedCount < 4) {
+        std::vector<std::string> allowedStrings;
+        if (allowDown) allowedStrings.emplace_back("down");
+        if (allowRight) allowedStrings.emplace_back("right");
+        if (allowUp) allowedStrings.emplace_back("up");
+        if (allowLeft) allowedStrings.emplace_back("left");
+        params["growth_directions"] = allowedStrings;
+    }
     return params;
 }
 } // namespace
