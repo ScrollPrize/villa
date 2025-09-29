@@ -33,7 +33,6 @@ dependencies = [
     "fsspec>=2025.9.0",
     "fvcore>=0.1.5.post20221221",
     "huggingface-hub>=0.35.0",
-    "jupyter>=1.1.1",
     "libigl>=2.6.1",
     "lxml>=6.0.2",
     "magic-class>=0.7.17",

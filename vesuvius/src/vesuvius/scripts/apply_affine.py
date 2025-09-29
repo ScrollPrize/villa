@@ -239,28 +239,6 @@ def load_transform_from_json(json_path):
     return matrix4
 
 
-def invert_affine_matrix(matrix4x4: np.ndarray) -> np.ndarray:
-    """Invert a row-major affine transform whose bottom row is [0,0,0,1]."""
-    if matrix4x4.shape != (4, 4):
-        raise ValueError("Affine inversion expects a 4x4 matrix")
-
-    if not np.allclose(matrix4x4[3, :], np.array([0.0, 0.0, 0.0, 1.0]), atol=1e-6):
-        raise ValueError("Bottom affine row must be [0,0,0,1] to invert")
-
-    linear = matrix4x4[:3, :3]
-    try:
-        linear_inv = np.linalg.inv(linear)
-    except np.linalg.LinAlgError as exc:
-        raise ValueError("Affine matrix is non-invertible") from exc
-
-    translation = matrix4x4[:3, 3]
-
-    inverse = np.eye(4, dtype=np.float64)
-    inverse[:3, :3] = linear_inv
-    inverse[:3, 3] = -linear_inv @ translation
-    return inverse
-
-
 def main():
     parser = argparse.ArgumentParser(description='Scale and/or transform OBJ files')
     parser.add_argument('input_folder', help='Path to folder containing OBJ files')
@@ -308,10 +286,10 @@ def main():
             transform_matrix_4x4 = load_transform_from_json(transform_path)
             if args.invert:
                 try:
-                    transform_matrix_4x4 = invert_affine_matrix(transform_matrix_4x4)
+                    transform_matrix_4x4 = np.linalg.inv(transform_matrix_4x4)
                     print("Note: Inverting affine as requested (--invert).")
-                except ValueError as exc:
-                    print(f"Error: {exc}")
+                except np.linalg.LinAlgError:
+                    print("Error: affine matrix is non-invertible")
                     return 1
             print(f"Loaded transformation matrix from {transform_path}")
             print(f"Axis order for transform: {args.axis_order}")
