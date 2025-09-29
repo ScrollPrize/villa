@@ -46,8 +46,6 @@ set(srcs
     SegmentationModule.hpp
     ViewerManager.cpp
     ViewerManager.hpp
-    CSegmentationEditorWindow.cpp
-    CSegmentationEditorWindow.hpp
     SegmentRenderThread.cpp
     SegmentRenderThread.hpp
     ProgressUtil.cpp
