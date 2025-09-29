@@ -7,7 +7,6 @@
 #include "CVolumeViewerView.hpp"
 #include "CSurfaceCollection.hpp"
 #include "vc/ui/VCCollection.hpp"
-#include "COutlinedTextItem.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -19,6 +18,9 @@
 #include "vc/core/util/Render.hpp"
 
 using qga = QGuiApplication;
+
+using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
+using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 
 #define BGND_RECT_MARGIN 8
 #define DEFAULT_TEXT_COLOR QColor(255, 255, 120)
@@ -238,6 +240,21 @@ bool scene2vol(cv::Vec3f &p, cv::Vec3f &n, Surface *_surf, const std::string &_s
     return true;
 }
 
+cv::Vec3f CVolumeViewer::sceneToVolume(const QPointF& scenePoint) const
+{
+    cv::Vec3f p, n;
+    if (scene2vol(p, n,
+                  const_cast<Surface*>(_surf),
+                  _surf_name,
+                  const_cast<CSurfaceCollection*>(_surf_col),
+                  scenePoint,
+                  _vis_center,
+                  _scale)) {
+        return p;
+    }
+    return {0.0f, 0.0f, 0.0f};
+}
+
 void CVolumeViewer::onCursorMove(QPointF scene_loc)
 {
     if (!_surf || !_surf_col)
@@ -278,24 +295,21 @@ void CVolumeViewer::onCursorMove(QPointF scene_loc)
         const float highlight_dist_threshold = 10.0f;
         float min_dist_sq = highlight_dist_threshold * highlight_dist_threshold;
 
-        for (const auto& item_pair : _points_items) {
-            auto item = item_pair.second.circle;
-            QPointF point_scene_pos = item->rect().center();
-            QPointF diff = scene_loc - point_scene_pos;
-            float dist_sq = QPointF::dotProduct(diff, diff);
-            if (dist_sq < min_dist_sq) {
-                min_dist_sq = dist_sq;
-                _highlighted_point_id = item_pair.first;
+        const auto& collections = _point_collection->getAllCollections();
+        for (const auto& col_pair : collections) {
+            for (const auto& point_pair : col_pair.second.points) {
+                QPointF point_scene_pos = volumeToScene(point_pair.second.p);
+                QPointF diff = scene_loc - point_scene_pos;
+                float dist_sq = QPointF::dotProduct(diff, diff);
+                if (dist_sq < min_dist_sq) {
+                    min_dist_sq = dist_sq;
+                    _highlighted_point_id = point_pair.second.id;
+                }
             }
         }
 
         if (old_highlighted_id != _highlighted_point_id) {
-            if (auto old_point = _point_collection->getPoint(old_highlighted_id)) {
-                renderOrUpdatePoint(*old_point);
-            }
-            if (auto new_point = _point_collection->getPoint(_highlighted_point_id)) {
-                renderOrUpdatePoint(*new_point);
-            }
+            emit overlaysUpdated();
         }
     }
 }
@@ -333,6 +347,12 @@ void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers m
 {
     if (!_surf)
         return;
+
+    if (_segmentationEditActive && (modifiers & Qt::ControlModifier)) {
+        cv::Vec3f world = sceneToVolume(scene_loc);
+        emit sendSegmentationRadiusWheel(steps, scene_loc, world);
+        return;
+    }
 
     for(auto &col : _intersect_items)
         for(auto &item : col.second)
@@ -380,7 +400,7 @@ void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers m
 
         }
         renderVisible();
-        updateSelectionGraphics();
+        emit overlaysUpdated();
     }
 
     _lbl->setText(QString("%1x %2").arg(_scale).arg(_z_off));
@@ -441,7 +461,7 @@ void CVolumeViewer::onVolumeClicked(QPointF scene_loc, Qt::MouseButton buttons, 
     if (buttons == Qt::LeftButton) {
         bool isShift = modifiers.testFlag(Qt::ShiftModifier);
 
-        if (isShift) {
+        if (isShift && !_segmentationEditActive) {
             // If a collection is selected, add to it.
             if (_selected_collection_id != 0) {
                 const auto& collections = _point_collection->getAllCollections();
@@ -477,13 +497,8 @@ void CVolumeViewer::setCache(ChunkCache *cache_)
 
 void CVolumeViewer::setPointCollection(VCCollection* point_collection)
 {
-    if (_point_collection) {
-        disconnect(_point_collection, &VCCollection::collectionChanged, this, &CVolumeViewer::onCollectionChanged);
-    }
     _point_collection = point_collection;
-    if (_point_collection) {
-        connect(_point_collection, &VCCollection::collectionChanged, this, &CVolumeViewer::onCollectionChanged);
-    }
+    emit overlaysUpdated();
 }
 
 void CVolumeViewer::setSurface(const std::string &name)
@@ -629,11 +644,10 @@ void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf)
             fScene->clear();
             _intersect_items.clear();
             slice_vis_items.clear();
-            _points_items.clear();
-            _path_items.clear();
             _paths.clear();
-            // Scene items are already deleted by fScene->clear(); just drop overlay references
+            // Drop overlay references before notifying listeners so they do not touch deleted items
             _overlay_groups.clear();
+            emit overlaysUpdated();
             _cursor = nullptr;
             _center_marker = nullptr;
             fBaseImageItem = nullptr;
@@ -738,7 +752,7 @@ void CVolumeViewer::onPOIChanged(std::string name, POI *poi)
                 return;
             
             plane->setOrigin(poi->p);
-            refreshPointPositions();
+            emit overlaysUpdated();
             
             _surf_col->setSurface(_surf_name, plane);
         } else if (auto* quad = dynamic_cast<QuadSurface*>(_surf)) {
@@ -1004,15 +1018,23 @@ private:
 
 void CVolumeViewer::renderVisible(bool force)
 {
+    if (_surf && _surf_col) {
+        Surface* currentSurface = _surf_col->surface(_surf_name);
+        if (!currentSurface) {
+            // Surface was cleared (e.g. during volume reload) without a change signal
+            // reaching this viewer yet; drop the dangling pointer before rendering.
+            _surf = nullptr;
+        }
+    }
+
     if (!volume || !volume->zarrDataset() || !_surf)
         return;
-    
+
     QRectF bbox = fGraphicsView->mapToScene(fGraphicsView->viewport()->geometry()).boundingRect();
     
     if (!force && QRectF(curr_img_area).contains(bbox))
         return;
     
-    renderPaths();
     
     curr_img_area = {bbox.left(),bbox.top(), bbox.width(), bbox.height()};
     
@@ -1283,254 +1305,14 @@ void CVolumeViewer::onResized()
    renderVisible(true);
 }
 
-void CVolumeViewer::renderPaths()
+void CVolumeViewer::onPathsChanged(const QList<PathPrimitive>& paths)
 {
-   // Clear existing path items
-    for(auto &item : _path_items) {
-        if (item && item->scene() == fScene) {
-            fScene->removeItem(item);
-        }
-        delete item;
+    _paths.clear();
+    _paths.reserve(paths.size());
+    for (const auto& path : paths) {
+        _paths.push_back(path);
     }
-    _path_items.clear();
-    
-    if (!_surf) {
-        return;
-    }
-    
-    // Separate paths by type for proper rendering order
-    QList<PathData> drawPaths;
-    QList<PathData> eraserPaths;
-    
-    for (const auto& path : _paths) {
-        if (path.isEraser) {
-            eraserPaths.append(path);
-        } else {
-            drawPaths.append(path);
-        }
-    }
-    
-    // First render regular drawing paths
-    for (const auto& path : drawPaths) {
-        if (path.points.size() < 2) {
-            continue;
-        }
-        
-        QPainterPath painterPath;
-        bool firstPoint = true;
-        
-        PlaneSurface *plane = dynamic_cast<PlaneSurface*>(_surf);
-        QuadSurface *quad = dynamic_cast<QuadSurface*>(_surf);
-        
-        for (const auto& wp : path.points) {
-            cv::Vec3f p;
-            
-            if (plane) {
-                if (plane->pointDist(wp) >= 4.0)
-                    continue;
-                p = plane->project(wp, 1.0, _scale);
-            }
-            else if (quad) {
-                auto ptr = quad->pointer();
-                float res = _surf->pointTo(ptr, wp, 4.0, 100);
-                p = _surf->loc(ptr)*_scale;
-                if (res >= 4.0)
-                    continue;
-            }
-            else
-                continue;
-            
-            if (firstPoint) {
-                painterPath.moveTo(p[0], p[1]);
-                firstPoint = false;
-            } else {
-                painterPath.lineTo(p[0], p[1]);
-            }
-        }
-        
-        // Create the path item with the specified color and properties
-        QColor color = path.color;
-        if (path.opacity < 1.0f) {
-            color.setAlphaF(path.opacity);
-        }
-        
-        QPen pen(color, path.lineWidth, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
-        
-        // Apply different brush shapes
-        if (path.brushShape == PathData::BrushShape::SQUARE) {
-            pen.setCapStyle(Qt::SquareCap);
-            pen.setJoinStyle(Qt::MiterJoin);
-        }
-        
-        auto item = fScene->addPath(painterPath, pen);
-        item->setZValue(25); // Higher than intersections but lower than points
-        _path_items.push_back(item);
-    }
-    
-    // Then render eraser paths with a distinctive style
-    // In the actual mask generation, these will subtract from the drawn areas
-    for (const auto& path : eraserPaths) {
-        if (path.points.size() < 2) {
-            continue;
-        }
-        
-        QPainterPath painterPath;
-        bool firstPoint = true;
-        
-        PlaneSurface *plane = dynamic_cast<PlaneSurface*>(_surf);
-        QuadSurface *quad = dynamic_cast<QuadSurface*>(_surf);
-        
-        for (const auto& wp : path.points) {
-            cv::Vec3f p;
-            
-            if (plane) {
-                if (plane->pointDist(wp) >= 4.0)
-                    continue;
-                p = plane->project(wp, 1.0, _scale);
-            }
-            else if (quad) {
-                auto ptr = quad->pointer();
-                float res = _surf->pointTo(ptr, wp, 4.0, 100);
-                p = _surf->loc(ptr)*_scale;
-                if (res >= 4.0)
-                    continue;
-            }
-            else
-                continue;
-            
-            if (firstPoint) {
-                painterPath.moveTo(p[0], p[1]);
-                firstPoint = false;
-            } else {
-                painterPath.lineTo(p[0], p[1]);
-            }
-        }
-        
-        // Render eraser paths with a distinctive appearance
-        // Using a dashed pattern to indicate eraser mode
-        QPen pen(Qt::red, path.lineWidth, Qt::DashLine, Qt::RoundCap, Qt::RoundJoin);
-        pen.setDashPattern(QVector<qreal>() << 4 << 4);
-        
-        if (path.opacity < 1.0f) {
-            QColor eraserColor = pen.color();
-            eraserColor.setAlphaF(path.opacity);
-            pen.setColor(eraserColor);
-        }
-        
-        auto item = fScene->addPath(painterPath, pen);
-        item->setZValue(26); // Slightly higher than regular paths
-        _path_items.push_back(item);
-    }
-}
-
-void CVolumeViewer::renderOrUpdatePoint(const ColPoint& point)
-{
-    if (!_surf) return;
-
-    float opacity = 1.0f;
-    float z_dist = -1.0f;
-
-    if (auto* plane = dynamic_cast<PlaneSurface*>(_surf)) {
-        z_dist = std::abs(plane->pointDist(point.p));
-    } else if (auto* quad = dynamic_cast<QuadSurface*>(_surf)) {
-        auto ptr = quad->pointer();
-        z_dist = quad->pointTo(ptr, point.p, 10.0, 100);
-    }
-
-    if (z_dist >= 0) {
-        const float fade_threshold = 10.0f; // Fade over N units
-        if (z_dist < fade_threshold) {
-            opacity = 1.0f - (z_dist / fade_threshold);
-        } else {
-            opacity = 0.0f;
-        }
-    }
-
-    QPointF scene_pos = volumeToScene(point.p);
-    float radius = 5.0f; // pixels
-    
-    const auto& collections = _point_collection->getAllCollections();
-    auto col_it = collections.find(point.collectionId);
-    cv::Vec3f cv_color = (col_it != collections.end()) ? col_it->second.color : cv::Vec3f(1,0,0);
-    QColor color(cv_color[0] * 255, cv_color[1] * 255, cv_color[2] * 255, 255);
-
-    QColor border_color(255, 255, 255, 200);
-    float border_width = 1.5f;
-
-    if (point.id == _highlighted_point_id) {
-        radius = 7.0f;
-        border_color = Qt::yellow;
-        border_width = 2.5f;
-    }
- 
-    if (point.id == _selected_point_id) {
-        border_color = QColor(255, 0, 255, 255); // Bright magenta for selection
-        border_width = 2.5f;
-        radius = 7.0f;
-    }
-
-    PointGraphics pg;
-    bool exists = _points_items.count(point.id);
-    if (exists) {
-        pg = _points_items[point.id];
-    }
-
-    // Update circle
-    if (exists) {
-        pg.circle->setRect(scene_pos.x() - radius, scene_pos.y() - radius, radius * 2, radius * 2);
-        pg.circle->setPen(QPen(border_color, border_width));
-        pg.circle->setBrush(QBrush(color));
-    } else {
-        pg.circle = fScene->addEllipse(
-            scene_pos.x() - radius, scene_pos.y() - radius, radius * 2, radius * 2,
-            QPen(border_color, border_width), QBrush(color)
-        );
-        pg.circle->setZValue(10);
-    }
-    pg.circle->setOpacity(opacity);
-
-    // Update or create text
-    bool has_winding = !std::isnan(point.winding_annotation);
-    if (exists) {
-        pg.text->setPos(scene_pos.x() + radius, scene_pos.y() - radius);
-        pg.text->setVisible(has_winding);
-    } else {
-        pg.text = new COutlinedTextItem();
-        fScene->addItem(pg.text);
-        pg.text->setZValue(11); // Above points
-        pg.text->setDefaultTextColor(Qt::white);
-        pg.text->setPos(scene_pos.x() + radius, scene_pos.y() - radius);
-        pg.text->setVisible(has_winding);
-    }
-    pg.text->setOpacity(opacity);
-    
-    if (has_winding) {
-        bool absolute = col_it != collections.end() ? col_it->second.metadata.absolute_winding_number : false;
-        
-        // Adaptive decimal formatting
-        QString num_text = QString::number(point.winding_annotation, 'g');
-
-        if (!absolute) {
-            if (point.winding_annotation >= 0) {
-                num_text.prepend("+");
-            }
-        }
-        
-        pg.text->setPlainText(num_text);
-
-        // Fixed positioning
-        pg.text->setPos(scene_pos.x() + radius, scene_pos.y() - radius);
-    }
-
-    if (!exists) {
-        _points_items[point.id] = pg;
-    }
-}
-
-void CVolumeViewer::onPathsChanged(const QList<PathData>& paths)
-{
-    _paths = paths;
-    renderPaths();
+    emit overlaysUpdated();
 }
 
 void CVolumeViewer::onMousePress(QPointF scene_loc, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
@@ -1547,14 +1329,9 @@ void CVolumeViewer::onMousePress(QPointF scene_loc, Qt::MouseButton button, Qt::
             quad->pointTo(ptr, p, 2.0f, 100);
             cv::Vec3f sp = quad->loc(ptr); // unscaled surface coords
             _bboxStart = QPointF(sp[0], sp[1]);
-            if (_bboxRectItem) {
-                fScene->removeItem(_bboxRectItem);
-                delete _bboxRectItem;
-                _bboxRectItem = nullptr;
-            }
             QRectF r(QPointF(_bboxStart.x()*_scale, _bboxStart.y()*_scale), QPointF(_bboxStart.x()*_scale, _bboxStart.y()*_scale));
-            _bboxRectItem = fScene->addRect(r, QPen(QColor(255, 220, 0), 2, Qt::DashLine));
-            _bboxRectItem->setZValue(100);
+            _activeBBoxSceneRect = r.normalized();
+            emit overlaysUpdated();
         }
         return; // consume in bbox mode
     }
@@ -1583,7 +1360,7 @@ void CVolumeViewer::onMouseMove(QPointF scene_loc, Qt::MouseButtons buttons, Qt:
 {
     // BBox drawing consumes mouse events on segmentation view
     if (_bboxMode && _surf_name == "segmentation") {
-        if (_bboxRectItem && (buttons & Qt::LeftButton)) {
+        if (_activeBBoxSceneRect && (buttons & Qt::LeftButton)) {
             cv::Vec3f p, n;
             if (!scene2vol(p, n, _surf, _surf_name, _surf_col, scene_loc, _vis_center, _scale)) return;
             auto* quad = dynamic_cast<QuadSurface*>(_surf);
@@ -1593,7 +1370,8 @@ void CVolumeViewer::onMouseMove(QPointF scene_loc, Qt::MouseButtons buttons, Qt:
             cv::Vec3f sp = quad->loc(ptr); // unscaled
             QPointF cur(sp[0], sp[1]);
             QRectF r(QPointF(_bboxStart.x()*_scale, _bboxStart.y()*_scale), QPointF(cur.x()*_scale, cur.y()*_scale));
-            _bboxRectItem->setRect(r.normalized());
+            _activeBBoxSceneRect = r.normalized();
+            emit overlaysUpdated();
         }
         return; // consume in bbox mode
     }
@@ -1625,18 +1403,17 @@ void CVolumeViewer::onMouseRelease(QPointF scene_loc, Qt::MouseButton button, Qt
 {
     // BBox drawing consumes mouse events on segmentation view
     if (_bboxMode && _surf_name == "segmentation") {
-        if (button == Qt::LeftButton && _bboxRectItem) {
+        if (button == Qt::LeftButton && _activeBBoxSceneRect) {
             // Determine final rect in surface parameter coords
-            QRectF rScene = _bboxRectItem->rect().normalized();
+            QRectF rScene = _activeBBoxSceneRect->normalized();
             QRectF rSurf(QPointF(rScene.left()/_scale, rScene.top()/_scale), QPointF(rScene.right()/_scale, rScene.bottom()/_scale));
             // Promote this rectangle into a persistent selection with unique color (stored unscaled)
             // Generate a distinct color using HSV cycling
             int idx = static_cast<int>(_selections.size());
             QColor col = QColor::fromHsv((idx * 53) % 360, 200, 255);
-            // Create persistent item with current scale
-            _bboxRectItem->setPen(QPen(col, 2, Qt::DashLine));
-            _selections.push_back({rSurf, col, _bboxRectItem});
-            _bboxRectItem = nullptr; // end active drag
+            _selections.push_back({rSurf, col});
+            _activeBBoxSceneRect.reset();
+            emit overlaysUpdated();
         }
         return; // consume in bbox mode
     }
@@ -1661,10 +1438,9 @@ void CVolumeViewer::onMouseRelease(QPointF scene_loc, Qt::MouseButton button, Qt
 void CVolumeViewer::setBBoxMode(bool enabled)
 {
     _bboxMode = enabled;
-    if (!enabled && _bboxRectItem) {
-        fScene->removeItem(_bboxRectItem);
-        delete _bboxRectItem;
-        _bboxRectItem = nullptr;
+    if (!enabled && _activeBBoxSceneRect) {
+        _activeBBoxSceneRect.reset();
+        emit overlaysUpdated();
     }
 }
 
@@ -1765,23 +1541,8 @@ auto CVolumeViewer::selections() const -> std::vector<std::pair<QRectF, QColor>>
 
 void CVolumeViewer::clearSelections()
 {
-    for (auto& s : _selections) {
-        if (s.item) {
-            fScene->removeItem(s.item);
-            delete s.item;
-        }
-    }
     _selections.clear();
-}
-
-void CVolumeViewer::updateSelectionGraphics()
-{
-    for (auto& s : _selections) {
-        if (!s.item) continue;
-        QRectF sceneRect(QPointF(s.surfRect.left()*_scale,  s.surfRect.top()*_scale),
-                         QPointF(s.surfRect.right()*_scale, s.surfRect.bottom()*_scale));
-        s.item->setRect(sceneRect.normalized());
-    }
+    emit overlaysUpdated();
 }
 
 void CVolumeViewer::setCompositeEnabled(bool enabled)
@@ -1920,9 +1681,8 @@ void CVolumeViewer::onVolumeClosing()
         // Clear all item collections
         _intersect_items.clear();
         slice_vis_items.clear();
-        _points_items.clear();
-        _path_items.clear();
         _paths.clear();
+        emit overlaysUpdated();
         _cursor = nullptr;
         _center_marker = nullptr;
         fBaseImageItem = nullptr;
@@ -1954,61 +1714,10 @@ void CVolumeViewer::onDrawingModeActive(bool active, float brushSize, bool isSqu
     }
 }
 
-void CVolumeViewer::refreshPointPositions()
-{
-    if (!_point_collection) {
-        return;
-    }
-
-    for (const auto& col_pair : _point_collection->getAllCollections()) {
-        for (const auto& point_pair : col_pair.second.points) {
-            if (_points_items.count(point_pair.first)) {
-                renderOrUpdatePoint(point_pair.second);
-            }
-        }
-    }
-}
-void CVolumeViewer::onPointAdded(const ColPoint& point)
-{
-    renderOrUpdatePoint(point);
-}
-
-void CVolumeViewer::onPointChanged(const ColPoint& point)
-{
-    renderOrUpdatePoint(point);
-}
-
-void CVolumeViewer::onPointRemoved(uint64_t pointId)
-{
-    if (_points_items.count(pointId)) {
-        auto& pg = _points_items[pointId];
-        fScene->removeItem(pg.circle);
-        fScene->removeItem(pg.text);
-        delete pg.circle;
-        delete pg.text;
-        _points_items.erase(pointId);
-    }
-}
-
 void CVolumeViewer::onCollectionSelected(uint64_t collectionId)
 {
     _selected_collection_id = collectionId;
-}
-
-void CVolumeViewer::onCollectionChanged(uint64_t collectionId)
-{
-    if (!_point_collection) {
-        return;
-    }
-
-    const auto& collections = _point_collection->getAllCollections();
-    auto it = collections.find(collectionId);
-    if (it != collections.end()) {
-        const auto& collection = it->second;
-        for (const auto& point_pair : collection.points) {
-            renderOrUpdatePoint(point_pair.second);
-        }
-    }
+    emit overlaysUpdated();
 }
 
 void CVolumeViewer::onKeyRelease(int key, Qt::KeyboardModifiers modifiers)
@@ -2027,12 +1736,7 @@ void CVolumeViewer::onPointSelected(uint64_t pointId)
     uint64_t old_selected_id = _selected_point_id;
     _selected_point_id = pointId;
 
-    if (auto old_point = _point_collection->getPoint(old_selected_id)) {
-        renderOrUpdatePoint(*old_point);
-    }
-    if (auto new_point = _point_collection->getPoint(_selected_point_id)) {
-        renderOrUpdatePoint(*new_point);
-    }
+    emit overlaysUpdated();
 }
 
 void CVolumeViewer::setResetViewOnSurfaceChange(bool reset)
@@ -2074,34 +1778,26 @@ void CVolumeViewer::updateAllOverlays()
         const float highlight_dist_threshold = 10.0f;
         float min_dist_sq = highlight_dist_threshold * highlight_dist_threshold;
 
-        for (const auto& item_pair : _points_items) {
-            auto item = item_pair.second.circle;
-            QPointF point_scene_pos = item->rect().center();
-            QPointF diff = scenePos - point_scene_pos;
-            float dist_sq = QPointF::dotProduct(diff, diff);
-            if (dist_sq < min_dist_sq) {
-                min_dist_sq = dist_sq;
-                _highlighted_point_id = item_pair.first;
+        const auto& collections = _point_collection->getAllCollections();
+        for (const auto& col_pair : collections) {
+            for (const auto& point_pair : col_pair.second.points) {
+                QPointF point_scene_pos = volumeToScene(point_pair.second.p);
+                QPointF diff = scenePos - point_scene_pos;
+                float dist_sq = QPointF::dotProduct(diff, diff);
+                if (dist_sq < min_dist_sq) {
+                    min_dist_sq = dist_sq;
+                    _highlighted_point_id = point_pair.second.id;
+                }
             }
         }
 
-        if (old_highlighted_id != _highlighted_point_id) {
-            if (auto old_point = _point_collection->getPoint(old_highlighted_id)) {
-                renderOrUpdatePoint(*old_point);
-            }
-            if (auto new_point = _point_collection->getPoint(_highlighted_point_id)) {
-                renderOrUpdatePoint(*new_point);
-            }
-        }
     }
 
     invalidateVis();
     invalidateIntersect();
     renderIntersections();
-    renderDirectionHints();
-    renderDirectionStepMarkers();
-    renderPaths();
-    refreshPointPositions();
+
+    emit overlaysUpdated();
 }
 
 void CVolumeViewer::setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items)
@@ -2113,97 +1809,6 @@ void CVolumeViewer::setOverlayGroup(const std::string& key, const std::vector<QG
 
 // Visualize the 'step' parameter used by vc_grow_seg_from_segments by placing
 // three small markers in either direction along the same direction arrows.
-void CVolumeViewer::renderDirectionStepMarkers()
-{
-    if (!_showDirectionHints) {
-        clearOverlayGroup("step_markers");
-        return;
-    }
-
-    clearOverlayGroup("step_markers");
-
-    auto* seg = dynamic_cast<QuadSurface*>(_surf_name == "segmentation" ? _surf : _surf_col->surface("segmentation"));
-    if (!seg) return;
-
-    // Determine step value and number of points
-    QSettings settings("VC.ini", QSettings::IniFormat);
-    bool use_seg_step = settings.value("viewer/use_seg_step_for_hints", true).toBool();
-    int num_points = std::max(0, std::min(100, settings.value("viewer/direction_step_points", 5).toInt()));
-    float step_val = settings.value("viewer/direction_step", 10.0).toFloat();
-    if (use_seg_step && seg->meta) {
-        try {
-            if (seg->meta->contains("vc_grow_seg_from_segments_params")) {
-                auto& p = seg->meta->at("vc_grow_seg_from_segments_params");
-                if (p.contains("step")) step_val = p.at("step").get<float>();
-            }
-        } catch (...) {
-            // keep settings default
-        }
-    }
-    if (step_val <= 0) step_val = settings.value("viewer/direction_step", 10.0).toFloat();
-
-    // Anchor at focus POI if possible
-    cv::Vec3f target_wp;
-    bool have_focus = false;
-    if (auto* poi = _surf_col->poi("focus")) { target_wp = poi->p; have_focus = true; }
-
-    std::vector<QGraphicsItem*> items;
-
-    auto addDot = [&](const QPointF& center, const QColor& color, float radius = 3.0f) {
-        auto* dot = new QGraphicsEllipseItem(center.x() - radius, center.y() - radius, 2*radius, 2*radius);
-        dot->setPen(QPen(Qt::black, 1));
-        dot->setBrush(QBrush(color));
-        dot->setZValue(32);
-        fScene->addItem(dot);
-        items.push_back(dot);
-    };
-
-    if (_surf_name == "segmentation") {
-        // Work in segmentation nominal coordinates converted to scene
-        auto ptr = seg->pointer();
-        if (have_focus) seg->pointTo(ptr, target_wp, 4.0, 100);
-        cv::Vec3f nom = seg->loc(ptr) * _scale;
-        // Center point
-        addDot(QPointF(nom[0], nom[1]), QColor(255, 255, 0), 4.0f); // yellow center
-        // Red side (+X)
-        for (int n = 1; n <= num_points; ++n) {
-            cv::Vec3f p = seg->loc(ptr, {n * step_val, 0, 0}) * _scale;
-            addDot(QPointF(p[0], p[1]), Qt::red);
-        }
-        // Green side (−X)
-        for (int n = 1; n <= num_points; ++n) {
-            cv::Vec3f p = seg->loc(ptr, {-n * step_val, 0, 0}) * _scale;
-            addDot(QPointF(p[0], p[1]), Qt::green);
-        }
-        setOverlayGroup("step_markers", items);
-        return;
-    }
-
-    if (auto* plane = dynamic_cast<PlaneSurface*>(_surf)) {
-        // Project segmentation step samples into plane view
-        auto ptr = seg->pointer();
-        if (have_focus) seg->pointTo(ptr, target_wp, 4.0, 100);
-        cv::Vec3f p0 = seg->coord(ptr, {0,0,0});
-        if (p0[0] == -1) return;
-        cv::Vec3f s0 = plane->project(p0, 1.0f, _scale);
-        addDot(QPointF(s0[0], s0[1]), QColor(255, 255, 0), 4.0f);
-
-        for (int n = 1; n <= num_points; ++n) {
-            cv::Vec3f p_pos = seg->coord(ptr, {n * step_val, 0, 0});
-            cv::Vec3f p_neg = seg->coord(ptr, {-n * step_val, 0, 0});
-            if (p_pos[0] != -1) {
-                cv::Vec3f s = plane->project(p_pos, 1.0f, _scale);
-                addDot(QPointF(s[0], s[1]), Qt::red);
-            }
-            if (p_neg[0] != -1) {
-                cv::Vec3f s = plane->project(p_neg, 1.0f, _scale);
-                addDot(QPointF(s[0], s[1]), Qt::green);
-            }
-        }
-        setOverlayGroup("step_markers", items);
-        return;
-    }
-}
 
 void CVolumeViewer::clearOverlayGroup(const std::string& key)
 {
@@ -2221,146 +1826,3 @@ void CVolumeViewer::clearOverlayGroup(const std::string& key)
 // red = flip_x=false (along +X)
 // green = flip_x=true (opposite −X)
 // Shown on segmentation and projected into slice views.
-void CVolumeViewer::renderDirectionHints()
-{
-    if (!_showDirectionHints) {
-        clearOverlayGroup("direction_hints");
-        return;
-    }
-    // Clear previous group
-    clearOverlayGroup("direction_hints");
-
-    if (!_surf) return;
-
-    // Helper to create an arrow path item
-
-    auto makeArrow = [&](const QPointF& origin, const QPointF& dir, const QColor& color) -> QGraphicsItem* {
-        // Basic line with arrowhead
-        const float line_len = 60.0f;      // scene units
-        const float head_len = 10.0f;
-        const float head_w   = 6.0f;
-
-        // Normalize dir
-        QPointF d = dir;
-        double mag = std::hypot(d.x(), d.y());
-        if (mag < 1e-3) mag = 1.0;
-        d.setX(d.x()/mag); d.setY(d.y()/mag);
-
-        QPointF tip = origin + QPointF(d.x()*line_len, d.y()*line_len);
-        // Perpendicular for head
-        QPointF perp(-d.y(), d.x());
-
-        QPainterPath path;
-        path.moveTo(origin);
-        path.lineTo(tip);
-        // Arrow head as a small V
-        QPointF left  = tip - QPointF(d.x()*head_len, d.y()*head_len) + QPointF(perp.x()*head_w, perp.y()*head_w);
-        QPointF right = tip - QPointF(d.x()*head_len, d.y()*head_len) - QPointF(perp.x()*head_w, perp.y()*head_w);
-        path.moveTo(tip);
-        path.lineTo(left);
-        path.moveTo(tip);
-        path.lineTo(right);
-
-        auto* item = fGraphicsView->scene()->addPath(path, QPen(color, 2));
-        item->setZValue(30); // Above intersections and points
-        return item;
-    };
-    auto makeLabel = [&](const QPointF& pos, const QString& text, const QColor& color) -> QGraphicsItem* {
-        auto* label = new COutlinedTextItem();
-        label->setDefaultTextColor(color);
-        label->setPlainText(text);
-        // Make the label a bit smaller than default
-        QFont f = label->font();
-        f.setPointSizeF(9.0);
-        label->setFont(f);
-        label->setZValue(31);
-        label->setPos(pos);
-        fScene->addItem(label);
-        return label;
-    };
-
-    if (_surf_name == "segmentation") {
-        // Determine anchor in scene coords: prefer focus POI projected to segmentation; fallback to visible center
-        QPointF anchor_scene = visible_center(fGraphicsView);
-
-        if (auto* quad = dynamic_cast<QuadSurface*>(_surf)) {
-            if (auto* poi = _surf_col->poi("focus")) {
-                auto ptr = quad->pointer();
-                float dist = quad->pointTo(ptr, poi->p, 4.0, 100);
-                if (dist >= 0 && dist < 20.0/_scale) {
-                    cv::Vec3f sp = quad->loc(ptr) * _scale;
-                    anchor_scene = QPointF(sp[0], sp[1]);
-                }
-            }
-        }
-
-        // Offsets so the two arrows don't overlap the same origin point
-        QPointF up_offset(0, -20.0);
-        QPointF down_offset(0, 20.0);
-
-        // On segmentation view, scene X is the surface +X direction.
-        // User preference: green = flip_x=true (−X), red = flip_x=false (+X)
-        QGraphicsItem* redArrow   = makeArrow(anchor_scene + up_offset, QPointF(1.0, 0.0), QColor(Qt::red));
-        QGraphicsItem* greenArrow = makeArrow(anchor_scene + down_offset, QPointF(-1.0, 0.0), QColor(Qt::green));
-        // Labels
-        QGraphicsItem* redText   = makeLabel(anchor_scene + up_offset + QPointF(8, -8), QString("false"), QColor(Qt::red));
-        QGraphicsItem* greenText = makeLabel(anchor_scene + down_offset + QPointF(8, -8), QString("true"), QColor(Qt::green));
-
-        std::vector<QGraphicsItem*> items { redArrow, greenArrow, redText, greenText };
-        setOverlayGroup("direction_hints", items);
-        return;
-    }
-
-    // For slice plane views (seg xz / seg yz), project the segmentation +X tangent onto the plane and draw arrows
-    if (auto* plane = dynamic_cast<PlaneSurface*>(_surf)) {
-        auto* seg = dynamic_cast<QuadSurface*>(_surf_col->surface("segmentation"));
-        if (!seg) return;
-
-        // Choose target world point near focus or plane origin
-        cv::Vec3f target_wp = plane->origin();
-        if (auto* poi = _surf_col->poi("focus")) {
-            target_wp = poi->p;
-        }
-
-        // Find nearest point on segmentation and derive local +X tangent in 3D
-        auto seg_ptr = seg->pointer();
-        float dist = seg->pointTo(seg_ptr, target_wp, 4.0, 100);
-        if (dist < 0) return;
-
-        cv::Vec3f p0 = seg->coord(seg_ptr, {0,0,0});
-        // Small nominal step along +X on the segmentation surface
-        const float step_nominal = 2.0f;
-        cv::Vec3f p1 = seg->coord(seg_ptr, {step_nominal, 0, 0});
-        cv::Vec3f dir3 = p1 - p0;
-        float len = std::sqrt(dir3.dot(dir3));
-        if (len < 1e-5f) return;
-        dir3 *= (1.0f / len);
-
-        // Project to plane scene coordinates
-        cv::Vec3f s0 = plane->project(p0, 1.0f, _scale);
-        // Use a fixed scene length for the arrow
-        const float scene_len = 60.0f;
-        cv::Vec3f s1 = plane->project(p0 + dir3 * (scene_len / _scale), 1.0f, _scale);
-        QPointF dir2(s1[0] - s0[0], s1[1] - s0[1]);
-        double mag = std::hypot(dir2.x(), dir2.y());
-        if (mag < 1e-3) return;
-
-        QPointF anchor_scene(s0[0], s0[1]);
-        // Slight offsets so they don't overlap exactly
-        QPointF up_offset(0, -10.0);
-        QPointF down_offset(0, 10.0);
-
-        // User preference: green = flip_x=true (opposite of +X tangent), red = flip_x=false (along +X tangent)
-        QGraphicsItem* redArrow   = makeArrow(anchor_scene + up_offset, dir2, QColor(Qt::red));
-        QGraphicsItem* greenArrow = makeArrow(anchor_scene + down_offset, QPointF(-dir2.x(), -dir2.y()), QColor(Qt::green));
-        // Labels near arrow tips
-        QPointF redTip = anchor_scene + up_offset + QPointF(dir2.x(), dir2.y());
-        QPointF greenTip = anchor_scene + down_offset + QPointF(-dir2.x(), -dir2.y());
-        QGraphicsItem* redText   = makeLabel(redTip + QPointF(8, -8), QString("false"), QColor(Qt::red));
-        QGraphicsItem* greenText = makeLabel(greenTip + QPointF(8, -8), QString("true"), QColor(Qt::green));
-
-        std::vector<QGraphicsItem*> items { redArrow, greenArrow, redText, greenText };
-        setOverlayGroup("direction_hints", items);
-        return;
-    }
-}

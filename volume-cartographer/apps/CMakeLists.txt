@@ -136,6 +136,9 @@ target_link_libraries(vc_telea_inpaint
     opencv_photo
 )
 
+add_executable(vc_thinning src/vc_thinning.cpp)
+target_link_libraries(vc_thinning vc_core opencv_highgui opencv_ximgproc)
+
 # Install targets
 if(VC_INSTALL_APPS)
 install(
@@ -160,6 +163,7 @@ install(
         vc_transform_geom
         vc_gen_normalgrids
         vc_telea_inpaint
+        vc_thinning
         ${extra_apps}
     RUNTIME DESTINATION bin
     COMPONENT Programs

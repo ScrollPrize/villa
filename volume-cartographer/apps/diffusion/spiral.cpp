@@ -57,7 +57,6 @@ void visualize_spiral(
 
 std::pair<SkeletonGraph, cv::Mat> generate_skeleton_graph(const cv::Mat& binary_slice, const po::variables_map& vm);
 void populate_normal_grid(const SkeletonGraph& graph, vc::core::util::GridStore& normal_grid, double spiral_step);
-void visualize_normal_grid(const vc::core::util::GridStore& normal_grid, const cv::Size& size, const std::string& path);
 
 void generate_simple_spiral(
     std::vector<std::vector<SpiralPoint>>& points_per_revolution,
@@ -123,7 +122,9 @@ void run_spiral_generation(
     // }
 
     cv::Mat binary_slice = slice_mat > 0;
-    auto [skeleton_graph, skeleton_id_img] = generate_skeleton_graph(binary_slice, vm);
+    cv::Mat skeleton_img;
+    cv::ximgproc::thinning(binary_slice, skeleton_img, cv::ximgproc::THINNING_GUOHALL);
+    SkeletonGraph skeleton_graph = trace_skeleton_segments(skeleton_img, vm);
     vc::core::util::GridStore normal_grid(
         cv::Rect(0, 0, slice_mat.cols, slice_mat.rows), 32
     );
@@ -134,11 +135,9 @@ void run_spiral_generation(
         cv::ximgproc::thinning(binary_slice, skeleton_img, cv::ximgproc::THINNING_GUOHALL);
         cv::imwrite("skeleton.tif", skeleton_img);
 
-        cv::Mat skeleton_ids_32f;
-        skeleton_id_img.convertTo(skeleton_ids_32f, CV_32F);
-        cv::imwrite("skeleton_ids.tif", skeleton_ids_32f);
 
-        visualize_normal_grid(normal_grid, slice_mat.size(), "normal_constraints_vis.tif");
+        cv::Mat vis = visualize_normal_grid(normal_grid, slice_mat.size());
+        cv::imwrite("normal_constraints_vis.tif", vis);
     }
 
     if (vm["no-optimized-spiral"].as<bool>()) {

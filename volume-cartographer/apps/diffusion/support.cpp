@@ -9,13 +9,11 @@
 
 #include <opencv2/ximgproc.hpp>
 
-void visualize_normal_grid(const vc::core::util::GridStore& normal_grid, const cv::Size& size, const std::string& path);
 
 
 
 void populate_normal_grid(const SkeletonGraph& g, vc::core::util::GridStore& normal_grid, double spiral_step) {
-    int path_count = 0;
-    const float target_length = static_cast<float>(spiral_step);
+    const float target_dist_sq = static_cast<float>(spiral_step * spiral_step);
 
     for (const auto& edge : boost::make_iterator_range(boost::edges(g))) {
         const auto& path = g[edge].path;
@@ -23,37 +21,52 @@ void populate_normal_grid(const SkeletonGraph& g, vc::core::util::GridStore& nor
 
         std::vector<cv::Point> resampled_path;
         resampled_path.push_back(path[0]);
+        cv::Point last_point = path[0];
 
-        float accumulated_dist = 0.f;
-        cv::Point current_pos = path[0];
-
-        for (size_t i = 0; i < path.size() - 1; ++i) {
-            cv::Point p1 = path[i];
-            cv::Point p2 = path[i+1];
-            float segment_length = cv::norm(p2 - p1);
-
-            while (accumulated_dist + segment_length >= target_length) {
-                float remaining_dist = target_length - accumulated_dist;
-                cv::Point2f vec = cv::Point2f(p2 - p1) / segment_length;
-                current_pos = cv::Point(cv::Point2f(p1) + vec * remaining_dist);
-                resampled_path.push_back(current_pos);
-
-                p1 = current_pos;
-                segment_length -= remaining_dist;
-                accumulated_dist = 0;
+        for (size_t i = 1; i < path.size(); ++i) {
+            cv::Point current_point = path[i];
+            double dist_sq = cv::norm(current_point - last_point) * cv::norm(current_point - last_point);
+            if (dist_sq >= target_dist_sq) {
+                resampled_path.push_back(current_point);
+                last_point = current_point;
             }
-            accumulated_dist += segment_length;
         }
+
 
         if (resampled_path.size() >= 2) {
             normal_grid.add(resampled_path);
-            path_count++;
+        }
+    }
+}
+
+void populate_normal_grid(const std::vector<std::vector<cv::Point>>& traces, vc::core::util::GridStore& normal_grid, double spiral_step) {
+    const float target_dist_sq = static_cast<float>(spiral_step * spiral_step);
+
+    for (const auto& trace : traces) {
+        if (trace.size() < 2) continue;
+
+        std::vector<cv::Point> resampled_path;
+        resampled_path.push_back(trace[0]);
+        cv::Point last_point = trace[0];
+
+        for (size_t i = 1; i < trace.size(); ++i) {
+            cv::Point current_point = trace[i];
+            double dist_sq = cv::norm(current_point - last_point) * cv::norm(current_point - last_point);
+            if (dist_sq >= target_dist_sq) {
+                resampled_path.push_back(current_point);
+                last_point = current_point;
+            }
+        }
+
+
+        if (resampled_path.size() >= 2) {
+            normal_grid.add(resampled_path);
         }
     }
 }
 
 
-void visualize_normal_grid(const vc::core::util::GridStore& normal_grid, const cv::Size& size, const std::string& path) {
+cv::Mat visualize_normal_grid(const vc::core::util::GridStore& normal_grid, const cv::Size& size) {
     cv::Mat normal_constraints_vis = cv::Mat::zeros(size, CV_8UC3);
     cv::RNG rng(12345);
     const auto& all_paths = normal_grid.get_all();
@@ -62,21 +75,27 @@ void visualize_normal_grid(const vc::core::util::GridStore& normal_grid, const c
         const auto& path = *path_ptr;
         cv::Scalar color(rng.uniform(0, 256), rng.uniform(0, 256), rng.uniform(0, 256));
         for (size_t i = 0; i < path.size() - 1; ++i) {
-            cv::line(normal_constraints_vis, path[i], path[i+1], color, 1);
-            cv::circle(normal_constraints_vis, path[i+1], 3, color, -1);
+            const auto& p1 = path[i];
+            const auto& p2 = path[i+1];
+
+            cv::line(normal_constraints_vis, p1, p2, color, 1);
+            cv::circle(normal_constraints_vis, p2, 3, color, -1);
+
+            cv::Point center = (p1 + p2) / 2;
+            cv::Vec2f tangent((float)(p2.x - p1.x), (float)(p2.y - p1.y));
+            cv::normalize(tangent, tangent);
+            cv::Vec2f normal(-tangent[1], tangent[0]);
+
+            cv::Point normal_endpoint(center.x + normal[0] * 5, center.y + normal[1] * 5);
+            cv::line(normal_constraints_vis, center, normal_endpoint, cv::Scalar(0, 255, 0), 1, cv::LINE_AA);
         }
     }
-    cv::imwrite(path, normal_constraints_vis);
+    return normal_constraints_vis;
 }
 
 
-std::pair<SkeletonGraph, cv::Mat> generate_skeleton_graph(const cv::Mat& binary_slice, const po::variables_map& vm) {
-    cv::Mat skeleton;
-    cv::ximgproc::thinning(binary_slice, skeleton, cv::ximgproc::THINNING_GUOHALL);
-
+SkeletonGraph trace_skeleton_segments(const cv::Mat& skeleton, const po::variables_map& vm) {
     SkeletonGraph g;
-    cv::Mat skeleton_id_img = cv::Mat::zeros(skeleton.size(), CV_32S);
-    skeleton_id_img.setTo(-1);
     std::unordered_map<cv::Point, int, PointHash> vertex_map;
     int next_edge_id = 1;
 
@@ -170,9 +189,6 @@ std::pair<SkeletonGraph, cv::Mat> generate_skeleton_graph(const cv::Mat& binary_
                     auto edge_desc = boost::add_edge(v_id, other_v_id, g).first;
                     g[edge_desc].path = path;
                     g[edge_desc].id = next_edge_id;
-                    for(const auto& path_p : path) {
-                        skeleton_id_img.at<int32_t>(path_p) = next_edge_id;
-                    }
                     next_edge_id++;
                 }
                     }
@@ -247,9 +263,6 @@ std::pair<SkeletonGraph, cv::Mat> generate_skeleton_graph(const cv::Mat& binary_
                 auto edge_desc = boost::add_edge(v1_id, v2_id, g);
                 g[edge_desc.first].path = path;
                 g[edge_desc.first].id = next_edge_id;
-                for(const auto& path_p : path) {
-                    skeleton_id_img.at<int32_t>(path_p) = next_edge_id;
-                }
                 next_edge_id++;
             }
         }
@@ -273,5 +286,5 @@ std::pair<SkeletonGraph, cv::Mat> generate_skeleton_graph(const cv::Mat& binary_
         cv::imwrite("skeleton_vertices.tif", vertex_viz);
     }
 
-    return {g, skeleton_id_img};
+    return g;
 }

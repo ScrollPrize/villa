@@ -516,7 +516,7 @@
     <set>Qt::DockWidgetArea::LeftDockWidgetArea|Qt::DockWidgetArea::RightDockWidgetArea</set>
    </property>
    <property name="windowTitle">
-    <string>Tools</string>
+    <string>Segmentation</string>
    </property>
    <attribute name="dockWidgetArea">
     <number>2</number>
@@ -538,7 +538,7 @@
      <item>
       <widget class="QPushButton" name="btnStopTools">
        <property name="text">
-        <string>Stop tools</string>
+        <string>Stop</string>
        </property>
       </widget>
      </item>
