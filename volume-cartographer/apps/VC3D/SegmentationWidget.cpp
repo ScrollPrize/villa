@@ -547,9 +547,6 @@ void SegmentationWidget::setupUI()
             return;
         }
         _correctionsZMin = value;
-        if (_spinCorrectionsZMax && _correctionsZMin > _spinCorrectionsZMax->value()) {
-            _spinCorrectionsZMax->setValue(_correctionsZMin);
-        }
         writeSetting(QStringLiteral("corrections_z_min"), _correctionsZMin);
         if (_correctionsZRangeEnabled) {
             emit correctionsZRangeChanged(true, _correctionsZMin, _correctionsZMax);
@@ -561,9 +558,6 @@ void SegmentationWidget::setupUI()
             return;
         }
         _correctionsZMax = value;
-        if (_spinCorrectionsZMin && _correctionsZMax < _spinCorrectionsZMin->value()) {
-            _spinCorrectionsZMin->setValue(_correctionsZMax);
-        }
         writeSetting(QStringLiteral("corrections_z_max"), _correctionsZMax);
         if (_correctionsZRangeEnabled) {
             emit correctionsZRangeChanged(true, _correctionsZMin, _correctionsZMax);
