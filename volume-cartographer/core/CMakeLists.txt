@@ -13,7 +13,6 @@ add_library(vc_core
         src/Logging.cpp
         src/Slicing.cpp
         src/Surface.cpp
-        src/SurfaceVoxelizer.cpp
         src/Render.cpp
         src/Thinning.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp

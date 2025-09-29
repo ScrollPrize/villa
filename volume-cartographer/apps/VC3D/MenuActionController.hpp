@@ -33,7 +33,6 @@ private slots:
     void resetSegmentationViews();
     void toggleConsoleOutput();
     void generateReviewReport();
-    void voxelizePaths();
     void toggleDrawBBox(bool enabled);
     void surfaceFromSelection();
     void clearSelection();
@@ -66,7 +65,6 @@ private:
     QAction* _resetViewsAct{nullptr};
     QAction* _showConsoleAct{nullptr};
     QAction* _reportingAct{nullptr};
-    QAction* _voxelizePathsAct{nullptr};
     QAction* _drawBBoxAct{nullptr};
     QAction* _surfaceFromSelectionAct{nullptr};
     QAction* _selectionClearAct{nullptr};

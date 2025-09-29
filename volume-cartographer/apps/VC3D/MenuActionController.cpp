@@ -17,7 +17,6 @@
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Logging.hpp"
-#include "vc/core/util/SurfaceVoxelizer.hpp"
 
 #include <QAction>
 #include <QApplication>
@@ -33,7 +32,6 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QProcess>
-#include <QProgressDialog>
 #include <QStringList>
 #include <QSettings>
 #include <QStyle>
@@ -41,13 +39,7 @@
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
 #include <QTextStream>
-#include <QThread>
 #include <QUrl>
-#include <QtConcurrent/QtConcurrent>
-
-#include <QFutureWatcher>
-
-#include <omp.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -140,9 +132,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _reportingAct = new QAction(QObject::tr("Generate Review Report..."), this);
     connect(_reportingAct, &QAction::triggered, this, &MenuActionController::generateReviewReport);
 
-    _voxelizePathsAct = new QAction(QObject::tr("&Voxelize Paths..."), this);
-    connect(_voxelizePathsAct, &QAction::triggered, this, &MenuActionController::voxelizePaths);
-
     _drawBBoxAct = new QAction(QObject::tr("Draw BBox"), this);
     _drawBBoxAct->setCheckable(true);
     connect(_drawBBoxAct, &QAction::toggled, this, &MenuActionController::toggleDrawBBox);
@@ -204,7 +193,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _viewMenu->addAction(_showConsoleAct);
 
     _actionsMenu = new QMenu(QObject::tr("&Actions"), qWindow);
-    _actionsMenu->addAction(_voxelizePathsAct);
     _actionsMenu->addAction(_drawBBoxAct);
     _actionsMenu->addSeparator();
     _actionsMenu->addAction(_teleaAct);
@@ -576,129 +564,6 @@ void MenuActionController::generateReviewReport()
                            .arg(dailyStats.size());
 
     QMessageBox::information(_window, QObject::tr("Report Generated"), message);
-}
-
-void MenuActionController::voxelizePaths()
-{
-    if (!_window || !_window->fVpkg || !_window->currentVolume) {
-        QMessageBox::warning(_window, QObject::tr("Error"), QObject::tr("Please load a volume package first."));
-        return;
-    }
-
-    QString outputPath = QFileDialog::getSaveFileName(
-        _window,
-        QObject::tr("Save Voxelized Surfaces"),
-        _window->fVpkgPath + "/voxelized_paths.zarr",
-        QObject::tr("Zarr Files (*.zarr)"));
-
-    if (outputPath.isEmpty()) {
-        return;
-    }
-
-    auto* progress = new QProgressDialog(QObject::tr("Voxelizing surfaces..."),
-                                         QObject::tr("Cancel"), 0, 100, _window);
-    progress->setWindowModality(Qt::NonModal);
-    progress->setAttribute(Qt::WA_DeleteOnClose);
-
-    std::map<std::string, QuadSurface*> surfacesToVoxelize;
-    for (const auto& id : _window->fVpkg->getLoadedSurfaceIDs()) {
-        auto surfMeta = _window->fVpkg->getSurface(id);
-        if (surfMeta && surfMeta->surface()) {
-            surfacesToVoxelize[id] = surfMeta->surface();
-        }
-    }
-
-    if (surfacesToVoxelize.empty()) {
-        QMessageBox::warning(_window, QObject::tr("Error"),
-                             QObject::tr("No surfaces found in current paths directory."));
-        return;
-    }
-
-    SurfaceVoxelizer::VolumeInfo volumeInfo;
-    volumeInfo.width = _window->currentVolume->sliceWidth();
-    volumeInfo.height = _window->currentVolume->sliceHeight();
-    volumeInfo.depth = _window->currentVolume->numSlices();
-    float voxelSize = 1.0f;
-    try {
-        if (_window->currentVolume->metadata().hasKey("voxelsize")) {
-            voxelSize = _window->currentVolume->metadata().get<float>("voxelsize");
-        }
-    } catch (...) {
-        voxelSize = 1.0f;
-    }
-    volumeInfo.voxelSize = voxelSize;
-
-    SurfaceVoxelizer::VoxelizationParams params;
-    params.voxelSize = volumeInfo.voxelSize;
-    params.samplingDensity = 0.5f;
-    params.fillGaps = true;
-    params.chunkSize = 64;
-
-    int numThreads = std::max(1, QThread::idealThreadCount() - 1);
-    omp_set_num_threads(numThreads);
-
-    QFutureWatcher<void>* watcher = new QFutureWatcher<void>(_window);
-    QObject::connect(watcher, &QFutureWatcher<void>::finished, [progress, watcher]() {
-        progress->close();
-        watcher->deleteLater();
-    });
-
-    std::atomic<bool> cancelled(false);
-    QObject::connect(progress, &QProgressDialog::canceled, [&cancelled]() {
-        cancelled = true;
-    });
-
-    auto outputStr = outputPath.toStdString();
-    auto surfacesCopy = surfacesToVoxelize;
-
-    QFuture<void> future = QtConcurrent::run([
-        this,
-        outputStr,
-        surfacesCopy,
-        volumeInfo,
-        params,
-        progress,
-        &cancelled
-    ]() {
-        try {
-            SurfaceVoxelizer::voxelizeSurfaces(
-                outputStr,
-                surfacesCopy,
-                volumeInfo,
-                params,
-                [progress, &cancelled](int value) {
-                    if (!cancelled) {
-                        QMetaObject::invokeMethod(progress, [progress, value]() {
-                            progress->setValue(value);
-                        }, Qt::QueuedConnection);
-                    }
-                });
-        } catch (const std::exception& e) {
-            QString errorMsg = QString::fromStdString(e.what());
-            QMetaObject::invokeMethod(_window, [this, errorMsg]() {
-                QMessageBox::critical(_window, QObject::tr("Error"),
-                                      QObject::tr("Voxelization failed: %1").arg(errorMsg));
-            }, Qt::QueuedConnection);
-        }
-    });
-
-    watcher->setFuture(future);
-    QObject::connect(watcher, &QFutureWatcher<void>::finished, [this, outputPath, surfacesToVoxelize, volumeInfo, progress, &cancelled]() {
-        if (!progress->wasCanceled() && !cancelled) {
-            QMessageBox::information(_window, QObject::tr("Success"),
-                                     QObject::tr("Surfaces voxelized successfully!\n\n"
-                                                 "Output saved to: %1\n"
-                                                 "Surfaces processed: %2\n"
-                                                 "Volume dimensions: %3x%4x%5")
-                                         .arg(outputPath)
-                                         .arg(surfacesToVoxelize.size())
-                                         .arg(volumeInfo.width)
-                                         .arg(volumeInfo.height)
-                                         .arg(volumeInfo.depth));
-        }
-    });
-
-    progress->show();
 }
 
 void MenuActionController::toggleDrawBBox(bool enabled)
