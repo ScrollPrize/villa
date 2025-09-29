@@ -1924,6 +1924,11 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
     request.direction = direction;
     request.steps = steps;
     request.corrections = corrections;
+    if (method == SegmentationGrowthMethod::Corrections && _segmentationModule) {
+        if (auto zRange = _segmentationModule->correctionsZRange()) {
+            request.correctionsZRange = zRange;
+        }
+    }
 
     TracerGrowthContext ctx;
     ctx.resumeSurface = segmentationSurface;

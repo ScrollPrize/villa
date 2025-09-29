@@ -56,6 +56,9 @@ SegmentationWidget::SegmentationWidget(QWidget* parent)
     , _comboCorrections(nullptr)
     , _btnCorrectionsNew(nullptr)
     , _chkCorrectionsAnnotate(nullptr)
+    , _chkCorrectionsUseZRange(nullptr)
+    , _spinCorrectionsZMin(nullptr)
+    , _spinCorrectionsZMax(nullptr)
     , _normalGridStatusWidget(nullptr)
     , _normalGridStatusIcon(nullptr)
     , _normalGridStatusText(nullptr)
@@ -351,6 +354,31 @@ void SegmentationWidget::setupUI()
     _chkCorrectionsAnnotate->setToolTip(tr("When enabled, left-clicks add points to the active correction set; Ctrl+click removes the nearest point."));
     correctionsLayout->addWidget(_chkCorrectionsAnnotate);
 
+    _chkCorrectionsUseZRange = new QCheckBox(tr("Limit Z range"), _groupCorrections);
+    _chkCorrectionsUseZRange->setToolTip(tr("When enabled, tracer growth will be limited to the specified Z range when applying corrections."));
+    correctionsLayout->addWidget(_chkCorrectionsUseZRange);
+
+    auto* zRangeLayout = new QHBoxLayout();
+    auto* zMinLabel = new QLabel(tr("Z min:"), _groupCorrections);
+    _spinCorrectionsZMin = new QSpinBox(_groupCorrections);
+    _spinCorrectionsZMin->setRange(0, 1000000);
+    _spinCorrectionsZMin->setSingleStep(1);
+    _spinCorrectionsZMin->setValue(_correctionsZMin);
+    _spinCorrectionsZMin->setEnabled(false);
+    auto* zMaxLabel = new QLabel(tr("Z max:"), _groupCorrections);
+    _spinCorrectionsZMax = new QSpinBox(_groupCorrections);
+    _spinCorrectionsZMax->setRange(0, 1000000);
+    _spinCorrectionsZMax->setSingleStep(1);
+    _spinCorrectionsZMax->setValue(_correctionsZMax);
+    _spinCorrectionsZMax->setEnabled(false);
+    zRangeLayout->addWidget(zMinLabel);
+    zRangeLayout->addWidget(_spinCorrectionsZMin);
+    zRangeLayout->addSpacing(8);
+    zRangeLayout->addWidget(zMaxLabel);
+    zRangeLayout->addWidget(_spinCorrectionsZMax);
+    zRangeLayout->addStretch();
+    correctionsLayout->addLayout(zRangeLayout);
+
     layout->addWidget(_groupCorrections);
 
     auto* actionsLayout = new QHBoxLayout();
@@ -500,6 +528,46 @@ void SegmentationWidget::setupUI()
 
     connect(_chkCorrectionsAnnotate, &QCheckBox::toggled, this, [this](bool enabled) {
         emit correctionsAnnotateToggled(enabled);
+    });
+
+    connect(_chkCorrectionsUseZRange, &QCheckBox::toggled, this, [this](bool enabled) {
+        _correctionsZRangeEnabled = enabled;
+        if (_spinCorrectionsZMin) {
+            _spinCorrectionsZMin->setEnabled(enabled);
+        }
+        if (_spinCorrectionsZMax) {
+            _spinCorrectionsZMax->setEnabled(enabled);
+        }
+        writeSetting(QStringLiteral("corrections_z_range_enabled"), enabled);
+        emit correctionsZRangeChanged(enabled, _correctionsZMin, _correctionsZMax);
+    });
+
+    connect(_spinCorrectionsZMin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if (value == _correctionsZMin) {
+            return;
+        }
+        _correctionsZMin = value;
+        if (_spinCorrectionsZMax && _correctionsZMin > _spinCorrectionsZMax->value()) {
+            _spinCorrectionsZMax->setValue(_correctionsZMin);
+        }
+        writeSetting(QStringLiteral("corrections_z_min"), _correctionsZMin);
+        if (_correctionsZRangeEnabled) {
+            emit correctionsZRangeChanged(true, _correctionsZMin, _correctionsZMax);
+        }
+    });
+
+    connect(_spinCorrectionsZMax, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if (value == _correctionsZMax) {
+            return;
+        }
+        _correctionsZMax = value;
+        if (_spinCorrectionsZMin && _correctionsZMax < _spinCorrectionsZMin->value()) {
+            _spinCorrectionsZMin->setValue(_correctionsZMax);
+        }
+        writeSetting(QStringLiteral("corrections_z_max"), _correctionsZMax);
+        if (_correctionsZRangeEnabled) {
+            emit correctionsZRangeChanged(true, _correctionsZMin, _correctionsZMax);
+        }
     });
 
     connect(_comboGrowthMethod, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
@@ -995,6 +1063,27 @@ void SegmentationWidget::restoreSettings()
         _spinGrowthSteps->setValue(_growthSteps);
     }
 
+    _correctionsZRangeEnabled = settings.value(QStringLiteral("segmentation_edit/corrections_z_range_enabled"), false).toBool();
+    _correctionsZMin = settings.value(QStringLiteral("segmentation_edit/corrections_z_min"), 0).toInt();
+    _correctionsZMax = settings.value(QStringLiteral("segmentation_edit/corrections_z_max"), _correctionsZMin).toInt();
+    _correctionsZMin = std::max(0, _correctionsZMin);
+    _correctionsZMax = std::max(_correctionsZMin, _correctionsZMax);
+
+    if (_chkCorrectionsUseZRange) {
+        const QSignalBlocker blocker(_chkCorrectionsUseZRange);
+        _chkCorrectionsUseZRange->setChecked(_correctionsZRangeEnabled);
+    }
+    if (_spinCorrectionsZMin) {
+        const QSignalBlocker blocker(_spinCorrectionsZMin);
+        _spinCorrectionsZMin->setValue(_correctionsZMin);
+        _spinCorrectionsZMin->setEnabled(_correctionsZRangeEnabled);
+    }
+    if (_spinCorrectionsZMax) {
+        const QSignalBlocker blocker(_spinCorrectionsZMax);
+        _spinCorrectionsZMax->setValue(_correctionsZMax);
+        _spinCorrectionsZMax->setEnabled(_correctionsZRangeEnabled);
+    }
+
     updateGrowthModeUi();
 }
 
@@ -1079,6 +1168,18 @@ void SegmentationWidget::refreshCorrectionsUiState()
             _chkCorrectionsAnnotate->setChecked(false);
         }
         _chkCorrectionsAnnotate->setEnabled(canAnnotate);
+    }
+
+    if (_chkCorrectionsUseZRange) {
+        _chkCorrectionsUseZRange->setEnabled(allow);
+    }
+
+    if (_spinCorrectionsZMin) {
+        _spinCorrectionsZMin->setEnabled(allow && _correctionsZRangeEnabled);
+    }
+
+    if (_spinCorrectionsZMax) {
+        _spinCorrectionsZMax->setEnabled(allow && _correctionsZRangeEnabled);
     }
 
 }

@@ -3,7 +3,9 @@
 #include <QString>
 
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -98,6 +100,7 @@ struct SegmentationGrowthRequest {
     SegmentationGrowthDirection direction{SegmentationGrowthDirection::All};
     int steps{0};
     SegmentationCorrectionsPayload corrections;
+    std::optional<std::pair<int, int>> correctionsZRange;
 };
 
 struct TracerGrowthContext {

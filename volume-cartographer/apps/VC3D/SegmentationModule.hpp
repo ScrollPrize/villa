@@ -97,6 +97,7 @@ public:
     void clearPendingCorrections();
     void setHandlesLocked(bool locked, bool userInitiated = false);
     [[nodiscard]] bool handlesLocked() const { return _handlesLocked; }
+    [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
 
 signals:
     void editingEnabledChanged(bool enabled);
@@ -200,6 +201,10 @@ private:
     void pruneMissingCorrections();
     void onGrowthMethodChanged(SegmentationGrowthMethod method);
     void updateHandleVisibility();
+    void onCorrectionsCreateRequested();
+    void onCorrectionsCollectionSelected(uint64_t id);
+    void onCorrectionsAnnotateToggled(bool enabled);
+    void onCorrectionsZRangeChanged(bool enabled, int zMin, int zMax);
 
     SegmentationWidget* _widget{nullptr};
     SegmentationEditManager* _editManager{nullptr};
@@ -228,6 +233,9 @@ private:
     std::vector<uint64_t> _pendingCorrectionIds;
     std::unordered_set<uint64_t> _managedCorrectionIds;
     bool _handlesLocked{false};
+    bool _correctionsZRangeEnabled{false};
+    int _correctionsZMin{0};
+    int _correctionsZMax{0};
 
     bool _pointAddMode{false};
     DragState _drag;

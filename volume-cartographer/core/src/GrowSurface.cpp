@@ -9,6 +9,8 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/SurfaceModeling.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
+#include "vc/core/util/NormalGridVolume.hpp"
+#include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/HashFunctions.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"

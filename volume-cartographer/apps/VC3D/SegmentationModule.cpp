@@ -286,25 +286,23 @@ void SegmentationModule::bindWidgetSignals()
             Qt::UniqueConnection);
 
     connect(_widget, &SegmentationWidget::correctionsCreateRequested,
-            this, [this]() {
-                const uint64_t id = createCorrectionCollection(true);
-                if (id == 0) {
-                    emit statusMessageRequested(tr("Unable to create a correction set. Make sure point collections are available."), kStatusShort);
-                    return;
-                }
-                setCorrectionsAnnotateMode(true, false);
-            },
+            this, &SegmentationModule::onCorrectionsCreateRequested,
             Qt::UniqueConnection);
     connect(_widget, &SegmentationWidget::correctionsCollectionSelected,
-            this, [this](uint64_t id) {
-                setActiveCorrectionCollection(id, true);
-            },
+            this, &SegmentationModule::onCorrectionsCollectionSelected,
             Qt::UniqueConnection);
     connect(_widget, &SegmentationWidget::correctionsAnnotateToggled,
-            this, [this](bool enabled) {
-                setCorrectionsAnnotateMode(enabled, true);
-            },
+            this, &SegmentationModule::onCorrectionsAnnotateToggled,
             Qt::UniqueConnection);
+    connect(_widget, &SegmentationWidget::correctionsZRangeChanged,
+            this, &SegmentationModule::onCorrectionsZRangeChanged,
+            Qt::UniqueConnection);
+
+    if (auto zRange = _widget->correctionsZRange()) {
+        onCorrectionsZRangeChanged(true, zRange->first, zRange->second);
+    } else {
+        onCorrectionsZRangeChanged(false, 0, 0);
+    }
 }
 
 void SegmentationModule::onGrowthMethodChanged(SegmentationGrowthMethod method)
@@ -315,6 +313,50 @@ void SegmentationModule::onGrowthMethodChanged(SegmentationGrowthMethod method)
     }
     _usingCorrectionsGrowth = usingCorrections;
     updateHandleVisibility();
+}
+
+void SegmentationModule::onCorrectionsCreateRequested()
+{
+    const uint64_t id = createCorrectionCollection(true);
+    if (id == 0) {
+        emit statusMessageRequested(tr("Unable to create a correction set. Make sure point collections are available."), kStatusShort);
+        return;
+    }
+    setCorrectionsAnnotateMode(true, false);
+}
+
+void SegmentationModule::onCorrectionsCollectionSelected(uint64_t id)
+{
+    setActiveCorrectionCollection(id, true);
+}
+
+void SegmentationModule::onCorrectionsAnnotateToggled(bool enabled)
+{
+    setCorrectionsAnnotateMode(enabled, true);
+}
+
+void SegmentationModule::onCorrectionsZRangeChanged(bool enabled, int zMin, int zMax)
+{
+    if (!enabled) {
+        _correctionsZRangeEnabled = false;
+        return;
+    }
+
+    if (zMin > zMax) {
+        std::swap(zMin, zMax);
+    }
+
+    _correctionsZRangeEnabled = true;
+    _correctionsZMin = std::max(0, zMin);
+    _correctionsZMax = std::max(_correctionsZMin, zMax);
+}
+
+std::optional<std::pair<int, int>> SegmentationModule::correctionsZRange() const
+{
+    if (!_correctionsZRangeEnabled) {
+        return std::nullopt;
+    }
+    return std::make_pair(_correctionsZMin, _correctionsZMax);
 }
 
 void SegmentationModule::updateHandleVisibility()

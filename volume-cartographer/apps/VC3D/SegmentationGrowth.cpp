@@ -268,6 +268,13 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         params["normal_grid_path"] = context.normalGridPath.toStdString();
     }
 
+    if (request.correctionsZRange) {
+        int zMin = std::max(0, request.correctionsZRange->first);
+        int zMax = std::max(zMin, request.correctionsZRange->second);
+        params["z_min"] = zMin;
+        params["z_max"] = zMax;
+    }
+
     const cv::Vec3f origin(0.0f, 0.0f, 0.0f);
 
     VCCollection correctionCollection;
@@ -282,6 +289,9 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         qCInfo(lcSegGrowth) << "  resumeSurface:" << (context.resumeSurface ? context.resumeSurface->id.c_str() : "<null>");
         const auto collectionCount = correctionCollection.getAllCollections().size();
         qCInfo(lcSegGrowth) << "  corrections collections:" << collectionCount;
+        if (request.correctionsZRange) {
+            qCInfo(lcSegGrowth) << "  corrections z-range:" << request.correctionsZRange->first << request.correctionsZRange->second;
+        }
         qCInfo(lcSegGrowth) << "  params:" << QString::fromStdString(params.dump());
 
         QuadSurface* surface = tracer(dataset,

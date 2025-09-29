@@ -6,6 +6,7 @@
 #include <cstdint>
 
 #include <optional>
+#include <utility>
 
 #include "SegmentationInfluenceMode.hpp"
 #include "SegmentationGrowth.hpp"
@@ -56,6 +57,13 @@ public:
                              const QString& activeId);
     void setActiveVolume(const QString& volumeId);
     void setNormalGridPathHint(const QString& hint);
+    [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const
+    {
+        if (!_correctionsZRangeEnabled) {
+            return std::nullopt;
+        }
+        return std::make_pair(_correctionsZMin, _correctionsZMax);
+    }
 
 public slots:
     void setEditingEnabled(bool enabled);
@@ -98,6 +106,7 @@ signals:
     void correctionsAnnotateToggled(bool enabled);
     void correctionsCollectionSelected(uint64_t collectionId);
     void correctionsCreateRequested();
+    void correctionsZRangeChanged(bool enabled, int zMin, int zMax);
     void volumeSelectionChanged(const QString& volumeId);
 
 private:
@@ -141,6 +150,9 @@ private:
     class QComboBox* _comboCorrections;
     QPushButton* _btnCorrectionsNew;
     QCheckBox* _chkCorrectionsAnnotate;
+    QCheckBox* _chkCorrectionsUseZRange;
+    QSpinBox* _spinCorrectionsZMin;
+    QSpinBox* _spinCorrectionsZMax;
     QWidget* _normalGridStatusWidget;
     QLabel* _normalGridStatusIcon;
     QLabel* _normalGridStatusText;
@@ -165,6 +177,9 @@ private:
     int _growthSteps{5};
     std::optional<uint64_t> _activeCorrectionId;
     bool _correctionsEnabled{false};
+    bool _correctionsZRangeEnabled{false};
+    int _correctionsZMin{0};
+    int _correctionsZMax{0};
     bool _handlesLocked{false};
     bool _normalGridAvailable{false};
     QVector<QPair<QString, QString>> _volumeEntries;
