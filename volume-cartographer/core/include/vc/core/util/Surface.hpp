@@ -113,6 +113,7 @@ public:
 
     virtual cv::Mat_<cv::Vec3f> rawPoints() { return *_points; }
     virtual cv::Mat_<cv::Vec3f> *rawPointsPtr() { return _points; }
+    virtual const cv::Mat_<cv::Vec3f> *rawPointsPtr() const { return _points; }
 
     friend QuadSurface *regularized_local_quad(QuadSurface *src, const cv::Vec3f &ptr, int w, int h, int step_search, int step_out);
     friend QuadSurface *smooth_vc_segmentation(QuadSurface *src);

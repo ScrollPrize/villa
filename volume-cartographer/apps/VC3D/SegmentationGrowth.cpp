@@ -12,6 +12,7 @@
 #include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/SurfaceArea.hpp"
 #include "vc/core/util/DateTime.hpp"
 #include "vc/tracer/Tracer.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -20,45 +21,6 @@ Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth)
 
 namespace
 {
-bool isInvalidPoint(const cv::Vec3f& p)
-{
-    return !std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]) ||
-           (p[0] == -1.0f && p[1] == -1.0f && p[2] == -1.0f);
-}
-
-double triangleAreaVx2(const cv::Vec3f& a, const cv::Vec3f& b, const cv::Vec3f& c)
-{
-    if (isInvalidPoint(a) || isInvalidPoint(b) || isInvalidPoint(c)) {
-        return 0.0;
-    }
-    const cv::Vec3f ab = b - a;
-    const cv::Vec3f ac = c - a;
-    const cv::Vec3f crossVec = ab.cross(ac);
-    return 0.5 * static_cast<double>(cv::norm(crossVec));
-}
-
-double computeSurfaceAreaVx2(const cv::Mat_<cv::Vec3f>& points)
-{
-    if (points.empty() || points.rows < 2 || points.cols < 2) {
-        return 0.0;
-    }
-
-    double totalArea = 0.0;
-    for (int y = 0; y < points.rows - 1; ++y) {
-        for (int x = 0; x < points.cols - 1; ++x) {
-            const cv::Vec3f& p00 = points(y, x);
-            const cv::Vec3f& p10 = points(y, x + 1);
-            const cv::Vec3f& p01 = points(y + 1, x);
-            const cv::Vec3f& p11 = points(y + 1, x + 1);
-
-            totalArea += triangleAreaVx2(p00, p10, p01);
-            totalArea += triangleAreaVx2(p11, p01, p10);
-        }
-    }
-
-    return totalArea;
-}
-
 void ensureMetaObject(QuadSurface* surface)
 {
     if (!surface) {
@@ -365,7 +327,7 @@ void updateSegmentationSurfaceMetadata(QuadSurface* surface,
 
     const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
     if (points && !points->empty()) {
-        const double areaVx2 = computeSurfaceAreaVx2(*points);
+        const double areaVx2 = vc::surface::computeSurfaceAreaVox2(*points);
         (*surface->meta)["area_vx2"] = areaVx2;
 
         if (voxelSize > 0.0) {

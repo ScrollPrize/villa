@@ -4,6 +4,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/SurfaceModeling.hpp"
+#include "vc/core/util/SurfaceArea.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
 #include "vc/core/util/LifeTime.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
@@ -966,8 +967,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         auto surf = new QuadSurface(points_crop, {1/T, 1/T});
         surf->setChannel("generations", generations_crop);
 
-        float const area_est_vx2 = succ * step * step;
-        float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
+        const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
+        const double voxel_size_d = static_cast<double>(voxelsize);
+        const double area_est_cm2 = area_est_vx2 * voxel_size_d * voxel_size_d / 1e8;
 
         surf->meta = new nlohmann::json(meta_params);
         (*surf->meta)["area_vx2"] = area_est_vx2;
@@ -1393,9 +1395,11 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     }  // end while fringe is non-empty
     delete timer;
 
-    float const area_est_vx2 = succ*step*step;
-    float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
-    printf("generated approximate surface %f vx^2 (%f cm^2)\n", area_est_vx2, area_est_cm2);
+    QuadSurface* surf = create_surface_from_state();
+    const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
+    const double voxel_size_d = static_cast<double>(voxelsize);
+    const double area_est_cm2 = area_est_vx2 * voxel_size_d * voxel_size_d / 1e8;
+    printf("generated surface %f vx^2 (%f cm^2)\n", area_est_vx2, area_est_cm2);
 
-    return create_surface_from_state();
+    return surf;
 }
