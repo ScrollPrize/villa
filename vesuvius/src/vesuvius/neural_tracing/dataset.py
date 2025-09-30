@@ -384,7 +384,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
             def make_in_out_heatmaps(pos_shifted_zyxs, neg_shifted_zyxs):
                 cond = torch.rand([]) < 0.8
-                if True:
+                if cond:
                     # Conditioning on this direction: include one negative point as input, and all positive as output
                     in_heatmaps = make_heatmaps([neg_shifted_zyxs[:1]], min_corner_zyx, crop_size)
                     out_heatmaps = make_heatmaps([pos_shifted_zyxs], min_corner_zyx, crop_size)
