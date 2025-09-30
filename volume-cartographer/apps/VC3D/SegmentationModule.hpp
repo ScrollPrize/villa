@@ -147,8 +147,7 @@ private:
     };
 
     void bindWidgetSignals();
-    void handleGrowSurfaceRequested(SegmentationGrowthMethod method,
-                                    SegmentationGrowthDirection direction,
+    void handleGrowSurfaceRequested(SegmentationGrowthDirection direction,
                                     int steps);
     void bindViewerSignals(CVolumeViewer* viewer);
     void refreshOverlay();
@@ -199,7 +198,8 @@ private:
     void handleCorrectionPointAdded(const cv::Vec3f& worldPos);
     void handleCorrectionPointRemove(const cv::Vec3f& worldPos);
     void pruneMissingCorrections();
-    void onGrowthMethodChanged(SegmentationGrowthMethod method);
+    void onAdvancedSettingsToggled(bool showAdvanced);
+    void onHandlesVisibilityChanged(bool visible);
     void updateHandleVisibility();
     void onCorrectionsCreateRequested();
     void onCorrectionsCollectionSelected(uint64_t id);
@@ -241,6 +241,7 @@ private:
     float _handleDisplayDistance{25.0f};
     float _highlightDistance{15.0f};
     bool _fillInvalidRegions{true};
+    bool _showHandles{false};
     bool _correctionsAnnotateMode{false};
     bool _usingCorrectionsGrowth{false};
     uint64_t _activeCorrectionId{0};

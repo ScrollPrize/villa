@@ -677,6 +677,47 @@ void CWindow::updateNormalGridAvailability()
     }
 }
 
+void CWindow::toggleVolumeOverlayVisibility()
+{
+    const bool hasOverlaySelection = overlayVolumeSelect && overlayVolumeSelect->currentIndex() > 0 && !_overlayVolumeId.empty();
+    if (!hasOverlaySelection || !overlayOpacitySlider) {
+        return;
+    }
+
+    if (_overlayVisible) {
+        if (_overlayOpacity > 0.0f) {
+            _overlayOpacityBeforeToggle = _overlayOpacity;
+        }
+        const QSignalBlocker blocker(overlayOpacitySlider);
+        overlayOpacitySlider->setValue(0);
+        _overlayOpacity = 0.0f;
+        _overlayVisible = false;
+        if (_viewerManager) {
+            _viewerManager->setOverlayOpacity(_overlayOpacity);
+        }
+        if (statusBar()) {
+            statusBar()->showMessage(tr("Volume overlay hidden"), 1200);
+        }
+    } else {
+        const float restored = (_overlayOpacityBeforeToggle > 0.0f) ? _overlayOpacityBeforeToggle : 0.5f;
+        _overlayOpacity = std::clamp(restored, 0.0f, 1.0f);
+        {
+            const QSignalBlocker blocker(overlayOpacitySlider);
+            overlayOpacitySlider->setValue(static_cast<int>(std::round(_overlayOpacity * 100.0f)));
+        }
+        if (_viewerManager) {
+            _viewerManager->setOverlayOpacity(_overlayOpacity);
+        }
+        _overlayVisible = _overlayOpacity > 0.0f;
+        if (_overlayVisible) {
+            _overlayOpacityBeforeToggle = _overlayOpacity;
+        }
+        if (statusBar()) {
+            statusBar()->showMessage(tr("Volume overlay shown"), 1200);
+        }
+    }
+}
+
 // Create widgets
 void CWindow::CreateWidgets(void)
 {
@@ -957,9 +998,18 @@ void CWindow::CreateWidgets(void)
             if (_viewerManager) {
                 _viewerManager->setOverlayOpacity(_overlayOpacity);
             }
+            const bool hasOverlay = !_overlayVolumeId.empty();
+            _overlayVisible = hasOverlay && _overlayOpacity > 0.0f;
+            if (_overlayVisible) {
+                _overlayOpacityBeforeToggle = _overlayOpacity;
+            }
         });
         if (_viewerManager) {
             _viewerManager->setOverlayOpacity(_overlayOpacity);
+        }
+        _overlayVisible = !_overlayVolumeId.empty() && _overlayOpacity > 0.0f;
+        if (_overlayVisible) {
+            _overlayOpacityBeforeToggle = _overlayOpacity;
         }
     }
 
@@ -1027,6 +1077,13 @@ void CWindow::CreateWidgets(void)
             }
             if (overlayThresholdSpin) {
                 overlayThresholdSpin->setEnabled(hasOverlay);
+            }
+            _overlayVisible = hasOverlay && _overlayOpacity > 0.0f;
+            if (_overlayVisible) {
+                _overlayOpacityBeforeToggle = _overlayOpacity;
+            }
+            if (!hasOverlay) {
+                _overlayVisible = false;
             }
         });
     }
@@ -1231,6 +1288,12 @@ void CWindow::CreateWidgets(void)
 // Create actions
 void CWindow::keyPressEvent(QKeyEvent* event)
 {
+    if (event->key() == Qt::Key_Space && event->modifiers() == Qt::NoModifier) {
+        toggleVolumeOverlayVisibility();
+        event->accept();
+        return;
+    }
+
     if (_segmentationModule && _segmentationModule->handleKeyPress(event)) {
         return;
     }
@@ -1466,6 +1529,13 @@ void CWindow::OpenVolume(const QString& path)
         if (overlayThresholdSpin) {
             overlayThresholdSpin->setEnabled(hasOverlaySelected);
         }
+        _overlayVisible = hasOverlaySelected && _overlayOpacity > 0.0f;
+        if (_overlayVisible) {
+            _overlayOpacityBeforeToggle = _overlayOpacity;
+        }
+        if (!hasOverlaySelected) {
+            _overlayVisible = false;
+        }
     }
 
     // Populate the segmentation directory dropdown
@@ -1581,6 +1651,7 @@ void CWindow::CloseVolume(void)
         overlayThresholdSpin->setEnabled(false);
     }
     _overlayVolumeId.clear();
+    _overlayVisible = false;
     if (_viewerManager) {
         _viewerManager->setOverlayVolume(nullptr, _overlayVolumeId);
     }

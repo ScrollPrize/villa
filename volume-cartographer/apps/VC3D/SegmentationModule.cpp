@@ -169,7 +169,8 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _highlightDistance = _widget->highlightDistance();
         _fillInvalidRegions = _widget->fillInvalidRegions();
         _handlesLocked = _widget->handlesLocked();
-        _usingCorrectionsGrowth = (_widget->growthMethod() == SegmentationGrowthMethod::Corrections);
+        _usingCorrectionsGrowth = !_widget->showAdvancedSettings();
+        _showHandles = _widget->showHandles();
         _maskSamplingStep = std::max(1, _widget->maskSampling());
         _maskBrushRadius = std::max(1, _widget->maskBrushRadius());
         _maskOverlayRadius = static_cast<float>(_maskBrushRadius);
@@ -272,8 +273,10 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::stopTools);
     connect(_widget, &SegmentationWidget::growSurfaceRequested,
             this, &SegmentationModule::handleGrowSurfaceRequested);
-    connect(_widget, &SegmentationWidget::growthMethodChanged,
-            this, &SegmentationModule::onGrowthMethodChanged);
+    connect(_widget, &SegmentationWidget::advancedSettingsToggled,
+            this, &SegmentationModule::onAdvancedSettingsToggled);
+    connect(_widget, &SegmentationWidget::handlesVisibilityChanged,
+            this, &SegmentationModule::onHandlesVisibilityChanged);
 
     connect(_widget, &SegmentationWidget::correctionsCreateRequested,
             this, &SegmentationModule::onCorrectionsCreateRequested);
@@ -299,13 +302,22 @@ void SegmentationModule::bindWidgetSignals()
     }
 }
 
-void SegmentationModule::onGrowthMethodChanged(SegmentationGrowthMethod method)
+void SegmentationModule::onAdvancedSettingsToggled(bool showAdvanced)
 {
-    const bool usingCorrections = (method == SegmentationGrowthMethod::Corrections);
+    const bool usingCorrections = !showAdvanced;
     if (_usingCorrectionsGrowth == usingCorrections) {
         return;
     }
     _usingCorrectionsGrowth = usingCorrections;
+    updateHandleVisibility();
+}
+
+void SegmentationModule::onHandlesVisibilityChanged(bool visible)
+{
+    if (_showHandles == visible) {
+        return;
+    }
+    _showHandles = visible;
     updateHandleVisibility();
 }
 
@@ -655,14 +667,15 @@ void SegmentationModule::updateHandleVisibility()
     if (!_overlay) {
         return;
     }
-    const bool showHandles = _editingEnabled && !_correctionsAnnotateMode && !_usingCorrectionsGrowth;
+    const bool showHandles = _editingEnabled && !_correctionsAnnotateMode && !_usingCorrectionsGrowth && _showHandles;
     _overlay->setHandlesVisible(showHandles);
 }
 
-void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod method,
-                                                    SegmentationGrowthDirection direction,
+void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthDirection direction,
                                                     int steps)
 {
+    const auto method = _usingCorrectionsGrowth ? SegmentationGrowthMethod::Corrections
+                                                : SegmentationGrowthMethod::Tracer;
     qCInfo(lcSegEdit) << "Grow request received" << segmentationGrowthMethodToString(method)
                       << segmentationGrowthDirectionToString(direction)
                       << "steps" << steps;

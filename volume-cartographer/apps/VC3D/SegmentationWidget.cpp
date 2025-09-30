@@ -4,6 +4,7 @@
 #include <QComboBox>
 #include <QDoubleSpinBox>
 #include <QGroupBox>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
@@ -32,6 +33,7 @@ SegmentationWidget::SegmentationWidget(QWidget* parent)
     : QWidget(parent)
     , _chkEditing(nullptr)
     , _editingStatus(nullptr)
+    , _chkAdvancedSettings(nullptr)
     , _groupGrowth(nullptr)
     , _groupMasking(nullptr)
     , _groupSampling(nullptr)
@@ -50,12 +52,12 @@ SegmentationWidget::SegmentationWidget(QWidget* parent)
     , _spinHoleIterations(nullptr)
     , _chkFillInvalidRegions(nullptr)
     , _groupHandleDisplay(nullptr)
+    , _chkShowHandles(nullptr)
     , _chkHandlesAlwaysVisible(nullptr)
     , _spinHandleDisplayDistance(nullptr)
     , _btnApply(nullptr)
     , _btnReset(nullptr)
     , _btnStopTools(nullptr)
-    , _comboGrowthMethod(nullptr)
     , _spinGrowthSteps(nullptr)
     , _btnGrow(nullptr)
     , _chkGrowthDirUp(nullptr)
@@ -84,7 +86,6 @@ SegmentationWidget::SegmentationWidget(QWidget* parent)
     , _spinCorrectionsZMax(nullptr)
     , _normalGridStatusWidget(nullptr)
     , _normalGridStatusIcon(nullptr)
-    , _normalGridStatusText(nullptr)
 {
     setupUI();
     updateEditingUi();
@@ -97,26 +98,25 @@ void SegmentationWidget::setupUI()
     layout->setSpacing(10);
 
     // Editing toggle and status
+    auto* editingLayout = new QHBoxLayout();
+    editingLayout->setContentsMargins(0, 0, 0, 0);
+    editingLayout->setSpacing(8);
     _chkEditing = new QCheckBox(tr("Enable Editing"), this);
     _chkEditing->setToolTip(tr("Toggle interactive segmentation editing mode"));
-    layout->addWidget(_chkEditing);
+    editingLayout->addWidget(_chkEditing);
 
     _editingStatus = new QLabel(tr("Editing disabled"), this);
-    layout->addWidget(_editingStatus);
+    editingLayout->addWidget(_editingStatus);
+    editingLayout->addStretch();
+    layout->addLayout(editingLayout);
+
+    _chkAdvancedSettings = new QCheckBox(tr("Show advanced settings"), this);
+    _chkAdvancedSettings->setToolTip(tr("Toggle additional surface editing controls"));
+    layout->addWidget(_chkAdvancedSettings);
 
     // Surface growth controls (moved to the top for quicker access)
     _groupGrowth = new QGroupBox(tr("Surface Growth"), this);
     auto* growthLayout = new QVBoxLayout(_groupGrowth);
-
-    auto* methodLayout = new QHBoxLayout();
-    auto* methodLabel = new QLabel(tr("Method:"), _groupGrowth);
-    _comboGrowthMethod = new QComboBox(_groupGrowth);
-    _comboGrowthMethod->addItem(tr("Tracer"), static_cast<int>(SegmentationGrowthMethod::Tracer));
-    _comboGrowthMethod->addItem(tr("Corrections"), static_cast<int>(SegmentationGrowthMethod::Corrections));
-    methodLayout->addWidget(methodLabel);
-    methodLayout->addWidget(_comboGrowthMethod);
-    methodLayout->addStretch();
-    growthLayout->addLayout(methodLayout);
 
     auto* allowedLayout = new QHBoxLayout();
     auto* allowedLabel = new QLabel(tr("Allowed directions:"), _groupGrowth);
@@ -184,7 +184,7 @@ void SegmentationWidget::setupUI()
     growthLayout->addLayout(stepsLayout);
 
     _btnGrow = new QPushButton(tr("Grow"), _groupGrowth);
-    _btnGrow->setToolTip(tr("Extend the segmentation surface using the selected method"));
+    _btnGrow->setToolTip(tr("Extend the segmentation surface using the current settings"));
     growthLayout->addWidget(_btnGrow);
 
     auto* volumeLayout = new QHBoxLayout();
@@ -193,20 +193,17 @@ void SegmentationWidget::setupUI()
     _comboVolume->setEnabled(false);
     volumeLayout->addWidget(volumeLabel);
     volumeLayout->addWidget(_comboVolume);
-    volumeLayout->addStretch();
-    growthLayout->addLayout(volumeLayout);
 
     _normalGridStatusWidget = new QWidget(_groupGrowth);
     auto* normalGridLayout = new QHBoxLayout(_normalGridStatusWidget);
     normalGridLayout->setContentsMargins(0, 0, 0, 0);
-    normalGridLayout->setSpacing(6);
+    normalGridLayout->setSpacing(0);
     _normalGridStatusIcon = new QLabel(_normalGridStatusWidget);
-    _normalGridStatusText = new QLabel(tr("Normal grid data available"), _normalGridStatusWidget);
     normalGridLayout->addWidget(_normalGridStatusIcon);
-    normalGridLayout->addWidget(_normalGridStatusText);
-    normalGridLayout->addStretch();
     _normalGridStatusWidget->setVisible(false);
-    growthLayout->addWidget(_normalGridStatusWidget);
+    volumeLayout->addWidget(_normalGridStatusWidget);
+    volumeLayout->addStretch();
+    growthLayout->addLayout(volumeLayout);
 
     layout->addWidget(_groupGrowth);
 
@@ -225,29 +222,25 @@ void SegmentationWidget::setupUI()
     dfPathLayout->addWidget(_directionFieldBrowseButton);
     directionFieldLayout->addLayout(dfPathLayout);
 
-    auto* dfOrientationLayout = new QHBoxLayout();
+    auto* dfSettingsLayout = new QHBoxLayout();
+    dfSettingsLayout->setSpacing(12);
     auto* dfOrientationLabel = new QLabel(tr("Direction:"), _groupDirectionField);
     _comboDirectionFieldOrientation = new QComboBox(_groupDirectionField);
     _comboDirectionFieldOrientation->addItem(tr("Normal"), static_cast<int>(SegmentationDirectionFieldOrientation::Normal));
     _comboDirectionFieldOrientation->addItem(tr("Horizontal"), static_cast<int>(SegmentationDirectionFieldOrientation::Horizontal));
     _comboDirectionFieldOrientation->addItem(tr("Vertical"), static_cast<int>(SegmentationDirectionFieldOrientation::Vertical));
-    dfOrientationLayout->addWidget(dfOrientationLabel);
-    dfOrientationLayout->addWidget(_comboDirectionFieldOrientation);
-    dfOrientationLayout->addStretch();
-    directionFieldLayout->addLayout(dfOrientationLayout);
+    dfSettingsLayout->addWidget(dfOrientationLabel);
+    dfSettingsLayout->addWidget(_comboDirectionFieldOrientation);
 
-    auto* dfScaleLayout = new QHBoxLayout();
     auto* dfScaleLabel = new QLabel(tr("Scale level:"), _groupDirectionField);
     _comboDirectionFieldScale = new QComboBox(_groupDirectionField);
     for (int scale = 0; scale <= 5; ++scale) {
         _comboDirectionFieldScale->addItem(QString::number(scale), scale);
     }
-    dfScaleLayout->addWidget(dfScaleLabel);
-    dfScaleLayout->addWidget(_comboDirectionFieldScale);
-    dfScaleLayout->addStretch();
-    directionFieldLayout->addLayout(dfScaleLayout);
+    dfSettingsLayout->addSpacing(12);
+    dfSettingsLayout->addWidget(dfScaleLabel);
+    dfSettingsLayout->addWidget(_comboDirectionFieldScale);
 
-    auto* dfWeightLayout = new QHBoxLayout();
     auto* dfWeightLabel = new QLabel(tr("Weight:"), _groupDirectionField);
     _spinDirectionFieldWeight = new QDoubleSpinBox(_groupDirectionField);
     _spinDirectionFieldWeight->setDecimals(2);
@@ -255,10 +248,11 @@ void SegmentationWidget::setupUI()
     _spinDirectionFieldWeight->setSingleStep(0.1);
     _spinDirectionFieldWeight->setValue(_directionFieldWeight);
     _spinDirectionFieldWeight->setToolTip(tr("Relative strength for direction field losses (0 disables)"));
-    dfWeightLayout->addWidget(dfWeightLabel);
-    dfWeightLayout->addWidget(_spinDirectionFieldWeight);
-    dfWeightLayout->addStretch();
-    directionFieldLayout->addLayout(dfWeightLayout);
+    dfSettingsLayout->addSpacing(12);
+    dfSettingsLayout->addWidget(dfWeightLabel);
+    dfSettingsLayout->addWidget(_spinDirectionFieldWeight);
+    dfSettingsLayout->addStretch();
+    directionFieldLayout->addLayout(dfSettingsLayout);
 
     auto* dfButtonsLayout = new QHBoxLayout();
     _directionFieldAddButton = new QPushButton(tr("Add"), _groupDirectionField);
@@ -280,35 +274,35 @@ void SegmentationWidget::setupUI()
 
     _btnMaskEdit = new QPushButton(tr("Edit Mask"), _groupMasking);
     _btnMaskEdit->setCheckable(true);
-    maskingLayout->addWidget(_btnMaskEdit);
-
     _btnMaskApply = new QPushButton(tr("Apply Mask"), _groupMasking);
     _btnMaskApply->setEnabled(false);
-    maskingLayout->addWidget(_btnMaskApply);
+    auto* maskActionsRow = new QHBoxLayout();
+    maskActionsRow->addWidget(_btnMaskEdit);
+    maskActionsRow->addWidget(_btnMaskApply);
+    maskActionsRow->addStretch();
+    maskingLayout->addLayout(maskActionsRow);
 
-    auto* samplingRow = new QHBoxLayout();
+    auto* maskSettingsRow = new QHBoxLayout();
     auto* samplingLabel = new QLabel(tr("Sampling:"), _groupMasking);
     _spinMaskSampling = new QSpinBox(_groupMasking);
     _spinMaskSampling->setRange(1, 64);
     _spinMaskSampling->setSingleStep(1);
     _spinMaskSampling->setValue(_maskSampling);
     _spinMaskSampling->setToolTip(tr("Controls how densely mask preview points are sampled"));
-    samplingRow->addWidget(samplingLabel);
-    samplingRow->addWidget(_spinMaskSampling);
-    samplingRow->addStretch();
-    maskingLayout->addLayout(samplingRow);
+    maskSettingsRow->addWidget(samplingLabel);
+    maskSettingsRow->addWidget(_spinMaskSampling);
 
-    auto* maskRadiusRow = new QHBoxLayout();
+    maskSettingsRow->addSpacing(12);
     auto* maskRadiusLabel = new QLabel(tr("Brush radius:"), _groupMasking);
     _spinMaskRadius = new QSpinBox(_groupMasking);
     _spinMaskRadius->setRange(1, 64);
     _spinMaskRadius->setSingleStep(1);
     _spinMaskRadius->setValue(_maskBrushRadius);
     _spinMaskRadius->setToolTip(tr("Size of the eraser brush in grid cells while mask editing"));
-    maskRadiusRow->addWidget(maskRadiusLabel);
-    maskRadiusRow->addWidget(_spinMaskRadius);
-    maskRadiusRow->addStretch();
-    maskingLayout->addLayout(maskRadiusRow);
+    maskSettingsRow->addWidget(maskRadiusLabel);
+    maskSettingsRow->addWidget(_spinMaskRadius);
+    maskSettingsRow->addStretch();
+    maskingLayout->addLayout(maskSettingsRow);
 
     layout->addWidget(_groupMasking);
 
@@ -331,7 +325,9 @@ void SegmentationWidget::setupUI()
     layout->addWidget(_groupSampling);
 
     _groupInfluence = new QGroupBox(tr("Influence"), this);
-    auto* influenceLayout = new QVBoxLayout(_groupInfluence);
+    auto* influenceGrid = new QGridLayout(_groupInfluence);
+    influenceGrid->setHorizontalSpacing(12);
+    influenceGrid->setVerticalSpacing(8);
 
     auto* modeLayout = new QHBoxLayout();
     auto* modeLabel = new QLabel(tr("Falloff mode:"), _groupInfluence);
@@ -347,10 +343,10 @@ void SegmentationWidget::setupUI()
     modeLayout->addWidget(modeLabel);
     modeLayout->addWidget(_comboInfluenceMode);
     modeLayout->addStretch();
-    influenceLayout->addLayout(modeLayout);
+    influenceGrid->addLayout(modeLayout, 0, 0);
 
     auto* rowColLayout = new QHBoxLayout();
-    auto* rowColLabel = new QLabel(tr("Row/Col preference:"), _groupInfluence);
+    auto* rowColLabel = new QLabel(tr("Preference:"), _groupInfluence);
     _comboRowColMode = new QComboBox(_groupInfluence);
     _comboRowColMode->addItem(tr("Row only"), static_cast<int>(SegmentationRowColMode::RowOnly));
     _comboRowColMode->addItem(tr("Column only"), static_cast<int>(SegmentationRowColMode::ColumnOnly));
@@ -363,7 +359,7 @@ void SegmentationWidget::setupUI()
     rowColLayout->addWidget(rowColLabel);
     rowColLayout->addWidget(_comboRowColMode);
     rowColLayout->addStretch();
-    influenceLayout->addLayout(rowColLayout);
+    influenceGrid->addLayout(rowColLayout, 0, 1);
     _comboRowColMode->setEnabled(false);
 
     auto* radiusLayout = new QHBoxLayout();
@@ -377,7 +373,7 @@ void SegmentationWidget::setupUI()
     radiusLayout->addWidget(radiusLabel);
     radiusLayout->addWidget(_spinRadius);
     radiusLayout->addStretch();
-    influenceLayout->addLayout(radiusLayout);
+    influenceGrid->addLayout(radiusLayout, 1, 0);
 
     auto* sigmaLayout = new QHBoxLayout();
     auto* sigmaLabel = new QLabel(tr("Strength (sigma):"), _groupInfluence);
@@ -391,7 +387,9 @@ void SegmentationWidget::setupUI()
     sigmaLayout->addWidget(sigmaLabel);
     sigmaLayout->addWidget(_spinSigma);
     sigmaLayout->addStretch();
-    influenceLayout->addLayout(sigmaLayout);
+    influenceGrid->addLayout(sigmaLayout, 1, 1);
+    influenceGrid->setColumnStretch(0, 1);
+    influenceGrid->setColumnStretch(1, 1);
 
     layout->addWidget(_groupInfluence);
 
@@ -466,6 +464,10 @@ void SegmentationWidget::setupUI()
     _groupHandleDisplay = new QGroupBox(tr("Handle Display"), this);
     auto* handleDisplayLayout = new QVBoxLayout(_groupHandleDisplay);
 
+    _chkShowHandles = new QCheckBox(tr("Render handles"), _groupHandleDisplay);
+    _chkShowHandles->setToolTip(tr("Toggle drawing of segmentation handles in the viewers"));
+    handleDisplayLayout->addWidget(_chkShowHandles);
+
     _chkHandlesAlwaysVisible = new QCheckBox(tr("Show all handles"), _groupHandleDisplay);
     _chkHandlesAlwaysVisible->setChecked(_handlesAlwaysVisible);
     _chkHandlesAlwaysVisible->setToolTip(tr("When unchecked, only handles within the specified world distance from the cursor are shown"));
@@ -502,22 +504,23 @@ void SegmentationWidget::setupUI()
     _groupCorrections = new QGroupBox(tr("Corrections"), this);
     auto* correctionsLayout = new QVBoxLayout(_groupCorrections);
 
-    auto* correctionsComboLayout = new QHBoxLayout();
-    auto* correctionsLabel = new QLabel(tr("Active set:"), _groupCorrections);
-    _comboCorrections = new QComboBox(_groupCorrections);
-    _comboCorrections->addItem(tr("None"), static_cast<qulonglong>(0));
-    correctionsComboLayout->addWidget(correctionsLabel);
-    correctionsComboLayout->addWidget(_comboCorrections);
-    correctionsComboLayout->addStretch();
-    correctionsLayout->addLayout(correctionsComboLayout);
-
     _btnCorrectionsNew = new QPushButton(tr("New set (T)"), _groupCorrections);
     _btnCorrectionsNew->setToolTip(tr("Create a new correction collection (shortcut: T)"));
     correctionsLayout->addWidget(_btnCorrectionsNew);
 
+    auto* correctionsRow = new QHBoxLayout();
+    auto* correctionsLabel = new QLabel(tr("Active set:"), _groupCorrections);
+    _comboCorrections = new QComboBox(_groupCorrections);
+    _comboCorrections->addItem(tr("None"), static_cast<qulonglong>(0));
+    correctionsRow->addWidget(correctionsLabel);
+    correctionsRow->addWidget(_comboCorrections);
+
+    correctionsRow->addSpacing(12);
     _chkCorrectionsAnnotate = new QCheckBox(tr("Annotate corrections"), _groupCorrections);
     _chkCorrectionsAnnotate->setToolTip(tr("When enabled, left-clicks add points to the active correction set; Ctrl+click removes the nearest point."));
-    correctionsLayout->addWidget(_chkCorrectionsAnnotate);
+    correctionsRow->addWidget(_chkCorrectionsAnnotate);
+    correctionsRow->addStretch();
+    correctionsLayout->addLayout(correctionsRow);
 
     layout->addWidget(_groupCorrections);
 
@@ -535,12 +538,22 @@ void SegmentationWidget::setupUI()
     layout->addStretch();
 
     restoreSettings();
-    updateGrowthModeUi();
+    updateAdvancedVisibility();
 
     // Signal wiring
     connect(_chkEditing, &QCheckBox::toggled, this, [this](bool enabled) {
         setEditingEnabled(enabled);
         emit editingModeChanged(enabled);
+    });
+
+    connect(_chkAdvancedSettings, &QCheckBox::toggled, this, [this](bool enabled) {
+        if (_showAdvancedSettings == enabled) {
+            return;
+        }
+        _showAdvancedSettings = enabled;
+        writeSetting(QStringLiteral("show_advanced_settings"), enabled);
+        updateAdvancedVisibility();
+        emit advancedSettingsToggled(enabled);
     });
 
     connect(_spinDownsample, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
@@ -704,24 +717,6 @@ void SegmentationWidget::setupUI()
         }
     });
 
-    connect(_comboGrowthMethod, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        if (index < 0) {
-            return;
-        }
-        const QVariant methodData = _comboGrowthMethod->itemData(index);
-        if (!methodData.isValid()) {
-            return;
-        }
-        auto method = segmentationGrowthMethodFromInt(methodData.toInt());
-        if (method == _growthMethod) {
-            return;
-        }
-        _growthMethod = method;
-        writeSetting(QStringLiteral("growth_method"), static_cast<int>(_growthMethod));
-        updateGrowthModeUi();
-        emit growthMethodChanged(_growthMethod);
-    });
-
     connect(_directionFieldBrowseButton, &QToolButton::clicked, this, [this]() {
         QString start;
         if (_directionFieldPathEdit) {
@@ -745,6 +740,20 @@ void SegmentationWidget::setupUI()
         }
         _directionFieldPath = trimmed;
         writeSetting(QStringLiteral("direction_field_path"), _directionFieldPath);
+
+        if (_updatingDirectionFieldForm) {
+            return;
+        }
+
+        const int row = (_directionFieldList ? _directionFieldList->currentRow() : -1);
+        if (row >= 0 && row < static_cast<int>(_directionFields.size())) {
+            auto& config = _directionFields[static_cast<std::size_t>(row)];
+            if (config.path != trimmed) {
+                config.path = trimmed;
+                persistDirectionFields();
+                refreshDirectionFieldList();
+            }
+        }
     });
 
     connect(_comboDirectionFieldOrientation, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
@@ -761,6 +770,20 @@ void SegmentationWidget::setupUI()
         }
         _directionFieldOrientation = orientation;
         writeSetting(QStringLiteral("direction_field_orientation"), static_cast<int>(_directionFieldOrientation));
+
+        if (_updatingDirectionFieldForm) {
+            return;
+        }
+
+        const int row = (_directionFieldList ? _directionFieldList->currentRow() : -1);
+        if (row >= 0 && row < static_cast<int>(_directionFields.size())) {
+            auto& config = _directionFields[static_cast<std::size_t>(row)];
+            if (config.orientation != orientation) {
+                config.orientation = orientation;
+                persistDirectionFields();
+                refreshDirectionFieldList();
+            }
+        }
     });
 
     connect(_comboDirectionFieldScale, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
@@ -777,6 +800,20 @@ void SegmentationWidget::setupUI()
         }
         _directionFieldScale = scaleValue;
         writeSetting(QStringLiteral("direction_field_scale"), _directionFieldScale);
+
+        if (_updatingDirectionFieldForm) {
+            return;
+        }
+
+        const int row = (_directionFieldList ? _directionFieldList->currentRow() : -1);
+        if (row >= 0 && row < static_cast<int>(_directionFields.size())) {
+            auto& config = _directionFields[static_cast<std::size_t>(row)];
+            if (config.scale != scaleValue) {
+                config.scale = scaleValue;
+                persistDirectionFields();
+                refreshDirectionFieldList();
+            }
+        }
     });
 
     connect(_spinDirectionFieldWeight, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
@@ -790,6 +827,20 @@ void SegmentationWidget::setupUI()
             _spinDirectionFieldWeight->setValue(clamped);
         }
         writeSetting(QStringLiteral("direction_field_weight"), _directionFieldWeight);
+
+        if (_updatingDirectionFieldForm) {
+            return;
+        }
+
+        const int row = (_directionFieldList ? _directionFieldList->currentRow() : -1);
+        if (row >= 0 && row < static_cast<int>(_directionFields.size())) {
+            auto& config = _directionFields[static_cast<std::size_t>(row)];
+            if (std::abs(config.weight - clamped) > 1e-4) {
+                config.weight = clamped;
+                persistDirectionFields();
+                refreshDirectionFieldList();
+            }
+        }
     });
 
     connect(_directionFieldAddButton, &QPushButton::clicked, this, [this]() {
@@ -802,6 +853,9 @@ void SegmentationWidget::setupUI()
         _directionFields.push_back(std::move(config));
         persistDirectionFields();
         refreshDirectionFieldList();
+        if (_directionFieldList) {
+            _directionFieldList->setCurrentRow(static_cast<int>(_directionFields.size()) - 1);
+        }
     });
 
     connect(_directionFieldRemoveButton, &QPushButton::clicked, this, [this]() {
@@ -819,9 +873,12 @@ void SegmentationWidget::setupUI()
     });
 
     connect(_directionFieldList, &QListWidget::currentRowChanged, this, [this](int row) {
+        const bool validRow = row >= 0 && row < static_cast<int>(_directionFields.size());
         if (_directionFieldRemoveButton) {
-            const bool validRow = row >= 0 && row < static_cast<int>(_directionFields.size());
             _directionFieldRemoveButton->setEnabled(_editingEnabled && validRow);
+        }
+        if (validRow) {
+            loadDirectionFieldIntoForm(_directionFields[static_cast<std::size_t>(row)]);
         }
     });
 
@@ -854,10 +911,11 @@ void SegmentationWidget::setupUI()
             direction = allowed.front();
         }
 
-        qCInfo(lcSegWidget) << "Grow pressed" << segmentationGrowthMethodToString(_growthMethod)
+        qCInfo(lcSegWidget) << "Grow pressed"
                             << segmentationGrowthDirectionToString(direction)
-                            << "steps" << _growthSteps;
-        emit growSurfaceRequested(_growthMethod, direction, _growthSteps);
+                            << "steps" << _growthSteps
+                            << "advanced" << _showAdvancedSettings;
+        emit growSurfaceRequested(direction, _growthSteps);
     });
 
     connect(_comboVolume, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
@@ -902,15 +960,23 @@ void SegmentationWidget::setupUI()
         emit fillInvalidRegionsChanged(checked);
     });
 
+    connect(_chkShowHandles, &QCheckBox::toggled, this, [this](bool checked) {
+        if (checked == _showHandles) {
+            return;
+        }
+        _showHandles = checked;
+        writeSetting(QStringLiteral("show_handles"), _showHandles);
+        updateAdvancedVisibility();
+        emit handlesVisibilityChanged(_showHandles);
+    });
+
     connect(_chkHandlesAlwaysVisible, &QCheckBox::toggled, this, [this](bool checked) {
         if (checked == _handlesAlwaysVisible) {
             return;
         }
         _handlesAlwaysVisible = checked;
         writeSetting(QStringLiteral("handles_always_visible"), _handlesAlwaysVisible);
-        if (_spinHandleDisplayDistance) {
-            _spinHandleDisplayDistance->setEnabled(!checked && _editingEnabled);
-        }
+        updateAdvancedVisibility();
         emit handlesAlwaysVisibleChanged(checked);
     });
 
@@ -1111,13 +1177,8 @@ void SegmentationWidget::setHandlesAlwaysVisible(bool value)
         const QSignalBlocker blocker(_chkHandlesAlwaysVisible);
         _chkHandlesAlwaysVisible->setChecked(value);
     }
-    if (_spinHandleDisplayDistance) {
-        _spinHandleDisplayDistance->setEnabled(_editingEnabled && !_handlesAlwaysVisible);
-    }
-    if (_spinHighlightDistance) {
-        _spinHighlightDistance->setEnabled(_editingEnabled);
-    }
     writeSetting(QStringLiteral("handles_always_visible"), _handlesAlwaysVisible);
+    updateAdvancedVisibility();
 }
 
 void SegmentationWidget::setHandleDisplayDistance(float value)
@@ -1195,6 +1256,41 @@ SegmentationDirectionFieldConfig SegmentationWidget::buildDirectionFieldDraft() 
     config.scale = std::clamp(_directionFieldScale, 0, 5);
     config.weight = std::clamp(_directionFieldWeight, 0.0, 10.0);
     return config;
+}
+
+void SegmentationWidget::loadDirectionFieldIntoForm(const SegmentationDirectionFieldConfig& config)
+{
+    _updatingDirectionFieldForm = true;
+
+    _directionFieldPath = config.path.trimmed();
+    _directionFieldOrientation = config.orientation;
+    _directionFieldScale = std::clamp(config.scale, 0, 5);
+    _directionFieldWeight = std::clamp(config.weight, 0.0, 10.0);
+
+    if (_directionFieldPathEdit) {
+        const QSignalBlocker blocker(_directionFieldPathEdit);
+        _directionFieldPathEdit->setText(_directionFieldPath);
+    }
+    if (_comboDirectionFieldOrientation) {
+        const QSignalBlocker blocker(_comboDirectionFieldOrientation);
+        int idx = _comboDirectionFieldOrientation->findData(static_cast<int>(_directionFieldOrientation));
+        if (idx >= 0) {
+            _comboDirectionFieldOrientation->setCurrentIndex(idx);
+        }
+    }
+    if (_comboDirectionFieldScale) {
+        const QSignalBlocker blocker(_comboDirectionFieldScale);
+        int idx = _comboDirectionFieldScale->findData(_directionFieldScale);
+        if (idx >= 0) {
+            _comboDirectionFieldScale->setCurrentIndex(idx);
+        }
+    }
+    if (_spinDirectionFieldWeight) {
+        const QSignalBlocker blocker(_spinDirectionFieldWeight);
+        _spinDirectionFieldWeight->setValue(_directionFieldWeight);
+    }
+
+    _updatingDirectionFieldForm = false;
 }
 
 void SegmentationWidget::refreshDirectionFieldList()
@@ -1386,18 +1482,6 @@ void SegmentationWidget::updateEditingUi()
     if (_chkFillInvalidRegions) {
         _chkFillInvalidRegions->setEnabled(_editingEnabled);
     }
-    if (_chkHandlesAlwaysVisible) {
-        _chkHandlesAlwaysVisible->setEnabled(true);
-    }
-    if (_spinHandleDisplayDistance) {
-        _spinHandleDisplayDistance->setEnabled(_editingEnabled && !_handlesAlwaysVisible);
-    }
-    if (_spinHighlightDistance) {
-        _spinHighlightDistance->setEnabled(_editingEnabled);
-    }
-    if (_comboGrowthMethod) {
-        _comboGrowthMethod->setEnabled(_editingEnabled);
-    }
     const bool growthDirCheckboxEnabled = _editingEnabled;
     if (_chkGrowthDirUp) {
         _chkGrowthDirUp->setEnabled(growthDirCheckboxEnabled);
@@ -1467,7 +1551,7 @@ void SegmentationWidget::updateEditingUi()
         _btnReset->setEnabled(_editingEnabled && _hasPendingChanges);
     }
 
-    updateGrowthModeUi();
+    updateAdvancedVisibility();
     refreshCorrectionsUiState();
 }
 
@@ -1580,18 +1664,16 @@ void SegmentationWidget::restoreSettings()
     const double storedHighlightDistance = settings.value(QStringLiteral("segmentation_edit/highlight_distance"), static_cast<double>(_highlightDistance)).toDouble();
     setHighlightDistance(static_cast<float>(std::clamp(storedHighlightDistance, 0.5, 500.0)));
 
-    const int storedGrowthMethod = settings.value(QStringLiteral("segmentation_edit/growth_method"), static_cast<int>(_growthMethod)).toInt();
-    if (storedGrowthMethod == static_cast<int>(SegmentationGrowthMethod::Corrections)) {
-        _growthMethod = SegmentationGrowthMethod::Corrections;
-    } else {
-        _growthMethod = SegmentationGrowthMethod::Tracer;
+    _showAdvancedSettings = settings.value(QStringLiteral("segmentation_edit/show_advanced_settings"), _showAdvancedSettings).toBool();
+    if (_chkAdvancedSettings) {
+        const QSignalBlocker blocker(_chkAdvancedSettings);
+        _chkAdvancedSettings->setChecked(_showAdvancedSettings);
     }
-    if (_comboGrowthMethod) {
-        const QSignalBlocker blocker(_comboGrowthMethod);
-        int idx = _comboGrowthMethod->findData(static_cast<int>(_growthMethod));
-        if (idx >= 0) {
-            _comboGrowthMethod->setCurrentIndex(idx);
-        }
+
+    _showHandles = settings.value(QStringLiteral("segmentation_edit/show_handles"), _showHandles).toBool();
+    if (_chkShowHandles) {
+        const QSignalBlocker blocker(_chkShowHandles);
+        _chkShowHandles->setChecked(_showHandles);
     }
 
     const int storedGrowthDirectionMask = settings.value(QStringLiteral("segmentation_edit/growth_direction_mask"), _growthDirectionMask).toInt();
@@ -1680,7 +1762,7 @@ void SegmentationWidget::restoreSettings()
         _spinCorrectionsZMax->setEnabled(_correctionsZRangeEnabled);
     }
 
-    updateGrowthModeUi();
+    updateAdvancedVisibility();
 }
 
 void SegmentationWidget::writeSetting(const QString& key, const QVariant& value)
@@ -1780,24 +1862,39 @@ void SegmentationWidget::refreshCorrectionsUiState()
 
 }
 
-void SegmentationWidget::updateGrowthModeUi()
+void SegmentationWidget::updateAdvancedVisibility()
 {
-    const bool showDetailedControls = _growthMethod != SegmentationGrowthMethod::Corrections;
+    const bool showAdvanced = _showAdvancedSettings;
 
     if (_groupSampling) {
-        _groupSampling->setVisible(showDetailedControls);
+        _groupSampling->setVisible(showAdvanced);
     }
     if (_groupInfluence) {
-        _groupInfluence->setVisible(showDetailedControls);
+        _groupInfluence->setVisible(true);
     }
     if (_groupHole) {
-        _groupHole->setVisible(showDetailedControls);
+        _groupHole->setVisible(showAdvanced);
     }
     if (_groupHandleDisplay) {
-        _groupHandleDisplay->setVisible(showDetailedControls);
+        _groupHandleDisplay->setVisible(showAdvanced);
+        const bool canToggleHandles = showAdvanced && _editingEnabled;
+        const bool handleControlsEnabled = canToggleHandles && _showHandles;
+        if (_chkShowHandles) {
+            _chkShowHandles->setEnabled(canToggleHandles);
+        }
+        if (_chkHandlesAlwaysVisible) {
+            _chkHandlesAlwaysVisible->setEnabled(handleControlsEnabled);
+        }
+        if (_spinHandleDisplayDistance) {
+            const bool enableDistance = handleControlsEnabled && !_handlesAlwaysVisible;
+            _spinHandleDisplayDistance->setEnabled(enableDistance);
+        }
+        if (_spinHighlightDistance) {
+            _spinHighlightDistance->setEnabled(handleControlsEnabled);
+        }
     }
     if (_groupSliceVisibility) {
-        _groupSliceVisibility->setVisible(showDetailedControls);
+        _groupSliceVisibility->setVisible(showAdvanced);
     }
     if (_groupDirectionField) {
         _groupDirectionField->setVisible(true);
@@ -1820,24 +1917,18 @@ void SegmentationWidget::setNormalGridAvailable(bool available)
         return;
     }
 
-    if (available) {
-        if (_normalGridStatusIcon) {
-            const auto icon = style()->standardIcon(QStyle::SP_DialogApplyButton);
-            _normalGridStatusIcon->setPixmap(icon.pixmap(16, 16));
-        }
-        if (_normalGridStatusText) {
-            _normalGridStatusText->setText(tr("Normal grid data detected [OK]"));
-            _normalGridStatusText->setStyleSheet(QStringLiteral("color: #2b8a3e;"));
-        }
-    } else {
-        if (_normalGridStatusIcon) {
-            const auto icon = style()->standardIcon(QStyle::SP_MessageBoxCritical);
-            _normalGridStatusIcon->setPixmap(icon.pixmap(16, 16));
-        }
-        if (_normalGridStatusText) {
-            _normalGridStatusText->setText(tr("Normal grid not found at {volpkg}/normal_grids"));
-            _normalGridStatusText->setStyleSheet(QStringLiteral("color: #c92a2a;"));
-        }
+    if (_normalGridStatusIcon) {
+        const auto icon = style()->standardIcon(available ? QStyle::SP_DialogApplyButton
+                                                          : QStyle::SP_MessageBoxCritical);
+        _normalGridStatusIcon->setPixmap(icon.pixmap(16, 16));
+        const QString statusText = available
+            ? tr("Normal grid data detected")
+            : tr("Normal grid not found at {volpkg}/normal_grids");
+        const QString tooltip = _normalGridStatusHint.isEmpty()
+            ? statusText
+            : statusText + QStringLiteral("\n") + _normalGridStatusHint;
+        _normalGridStatusIcon->setToolTip(tooltip);
+        _normalGridStatusWidget->setToolTip(tooltip);
     }
 
     _normalGridStatusWidget->setVisible(true);
@@ -1890,9 +1981,8 @@ void SegmentationWidget::setActiveVolume(const QString& volumeId)
 
 void SegmentationWidget::setNormalGridPathHint(const QString& hint)
 {
-    if (_normalGridStatusWidget) {
-        _normalGridStatusWidget->setToolTip(hint);
-    }
+    _normalGridStatusHint = hint;
+    setNormalGridAvailable(_normalGridAvailable);
 }
 
 void SegmentationWidget::setVolumePackagePath(const QString& path)

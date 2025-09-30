@@ -49,7 +49,8 @@ public:
     [[nodiscard]] bool fillInvalidRegions() const { return _fillInvalidRegions; }
     [[nodiscard]] int maskSampling() const { return _maskSampling; }
     [[nodiscard]] int maskBrushRadius() const { return _maskBrushRadius; }
-    [[nodiscard]] SegmentationGrowthMethod growthMethod() const { return _growthMethod; }
+    [[nodiscard]] bool showAdvancedSettings() const { return _showAdvancedSettings; }
+    [[nodiscard]] bool showHandles() const { return _showHandles; }
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
     [[nodiscard]] std::vector<SegmentationDirectionFieldConfig> directionFieldConfigs() const;
 
@@ -112,10 +113,10 @@ signals:
     void applyRequested();
     void resetRequested();
     void stopToolsRequested();
-    void growSurfaceRequested(SegmentationGrowthMethod method,
-                              SegmentationGrowthDirection direction,
+    void growSurfaceRequested(SegmentationGrowthDirection direction,
                               int steps);
-    void growthMethodChanged(SegmentationGrowthMethod method);
+    void advancedSettingsToggled(bool enabled);
+    void handlesVisibilityChanged(bool visible);
     void correctionsAnnotateToggled(bool enabled);
     void correctionsCollectionSelected(uint64_t collectionId);
     void correctionsCreateRequested();
@@ -132,7 +133,7 @@ private:
     void restoreSettings();
     void writeSetting(const QString& key, const QVariant& value);
     void refreshCorrectionsUiState();
-    void updateGrowthModeUi();
+    void updateAdvancedVisibility();
     void setGrowthDirectionMask(int mask);
     void updateGrowthDirectionMaskFromUi(QCheckBox* changedCheckbox);
     void applyGrowthDirectionMaskToUi();
@@ -140,8 +141,10 @@ private:
     void refreshDirectionFieldList();
     void persistDirectionFields();
     SegmentationDirectionFieldConfig buildDirectionFieldDraft() const;
+    void loadDirectionFieldIntoForm(const SegmentationDirectionFieldConfig& config);
     QCheckBox* _chkEditing;
     QLabel* _editingStatus;
+    QCheckBox* _chkAdvancedSettings;
     QGroupBox* _groupGrowth;
     QGroupBox* _groupMasking;
     QGroupBox* _groupSampling;
@@ -160,12 +163,12 @@ private:
     QSpinBox* _spinHoleIterations;
     QCheckBox* _chkFillInvalidRegions;
     QGroupBox* _groupHandleDisplay;
+    QCheckBox* _chkShowHandles;
     QCheckBox* _chkHandlesAlwaysVisible;
     QDoubleSpinBox* _spinHandleDisplayDistance;
     QPushButton* _btnApply;
     QPushButton* _btnReset;
     QPushButton* _btnStopTools;
-    class QComboBox* _comboGrowthMethod;
     QSpinBox* _spinGrowthSteps;
     QPushButton* _btnGrow;
     QCheckBox* _chkGrowthDirUp;
@@ -195,7 +198,7 @@ private:
     QSpinBox* _spinCorrectionsZMax;
     QWidget* _normalGridStatusWidget;
     QLabel* _normalGridStatusIcon;
-    QLabel* _normalGridStatusText;
+    QString _normalGridStatusHint;
 
     bool _editingEnabled = false;
     int _downsample = 12;
@@ -216,13 +219,15 @@ private:
     bool _maskApplyEnabled = false;
     int _maskSampling = 2;
     int _maskBrushRadius = 3;
-    SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Corrections};
+    bool _showAdvancedSettings{false};
+    bool _showHandles{false};
     int _growthSteps{5};
     QString _directionFieldPath;
     SegmentationDirectionFieldOrientation _directionFieldOrientation{SegmentationDirectionFieldOrientation::Normal};
     int _directionFieldScale{0};
     double _directionFieldWeight{1.0};
     std::vector<SegmentationDirectionFieldConfig> _directionFields;
+    bool _updatingDirectionFieldForm = false;
     QString _volumePackagePath;
     static constexpr int kGrowDirUpBit = 1 << 0;
     static constexpr int kGrowDirDownBit = 1 << 1;

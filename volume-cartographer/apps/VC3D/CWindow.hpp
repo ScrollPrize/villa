@@ -130,6 +130,7 @@ private:
 
     void setVolume(std::shared_ptr<Volume> newvol);
     void updateNormalGridAvailability();
+    void toggleVolumeOverlayVisibility();
 
 private slots:
     void onSegmentationDirChanged(int index);
@@ -207,6 +208,8 @@ private:
     std::string _overlayColormapName;
     float _overlayOpacity{0.5f};
     float _overlayThreshold{1.0f};
+    float _overlayOpacityBeforeToggle{0.5f};
+    bool _overlayVisible{true};
 
     void populateOverlayColormapOptions();
     std::unique_ptr<ViewerManager> _viewerManager;
