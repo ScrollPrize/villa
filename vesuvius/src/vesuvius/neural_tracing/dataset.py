@@ -392,12 +392,15 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                     # Not conditioning on this direction: include all positive and negative points as output, and nothing as input
                     in_heatmaps = torch.zeros([1, crop_size, crop_size, crop_size])
                     out_heatmaps = make_heatmaps([pos_shifted_zyxs, neg_shifted_zyxs], min_corner_zyx, crop_size)
-                return in_heatmaps, out_heatmaps
+                return in_heatmaps, out_heatmaps, cond
 
             # *_in_heatmaps always have a single plane, either the first negative point or empty
             # *_out_heatmaps always have one plane per step, and may contain only positive or both positive and negative points
-            u_in_heatmaps, u_out_heatmaps = make_in_out_heatmaps(u_pos_shifted_zyxs, u_neg_shifted_zyxs)
-            v_in_heatmaps, v_out_heatmaps = make_in_out_heatmaps(v_pos_shifted_zyxs, v_neg_shifted_zyxs)
+            u_in_heatmaps, u_out_heatmaps, u_cond = make_in_out_heatmaps(u_pos_shifted_zyxs, u_neg_shifted_zyxs)
+            v_in_heatmaps, v_out_heatmaps, v_cond = make_in_out_heatmaps(v_pos_shifted_zyxs, v_neg_shifted_zyxs)
+            if ~u_cond and ~v_cond:
+                # In this case U & V are (nearly) indistinguishable, so don't force the model to separate them
+                u_out_heatmaps = v_out_heatmaps = torch.maximum(u_out_heatmaps, v_out_heatmaps)
             uv_heatmaps_both = torch.cat([u_in_heatmaps, v_in_heatmaps, u_out_heatmaps, v_out_heatmaps], dim=0)
 
             # Build localiser volume
