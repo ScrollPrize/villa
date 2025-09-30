@@ -14,7 +14,21 @@
   "num_best_traces_to_average": 2,
   "trace_ranking_metric": "winding_valid_fraction",
   "wandb_project": "surface-tracer-evaluation-debug",
-  
+
+  "seeding_runtime": {
+    "timeout_policy": "adaptive",
+    "adaptive_timeout_multiplier": 3.0,
+    "adaptive_timeout_min_seconds": 30.0,
+    "adaptive_timeout_max_seconds": 1800.0,
+    "adaptive_timeout_min_samples": 8,
+    "grace_after_quorum_seconds": 0.0,
+    "post_cancel_wait_seconds": 30.0
+  },
+
+  "expansion_runtime": {
+    "timeout_policy": "none"
+  },
+
   "vc_grow_seg_from_seed_params": {
     "seeding": {
       "step_size": 20,
@@ -40,7 +54,7 @@
       "direction_fields": []
     }
   },
-  
+
   "vc_grow_seg_from_segments_params": {
     "flip_x": true,
     "global_steps_per_window": 1,
