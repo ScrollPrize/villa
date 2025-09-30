@@ -96,6 +96,19 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
         return;
     }
 
+    const bool segmentationView = viewer->surfName() == "segmentation";
+    if (_maskOverlayVisible && segmentationView && !_maskOverlayPoints.empty()) {
+        ViewerOverlayControllerBase::PathPrimitive maskPath;
+        maskPath.points = _maskOverlayPoints;
+        maskPath.renderMode = ViewerOverlayControllerBase::PathRenderMode::Points;
+        maskPath.brushShape = ViewerOverlayControllerBase::PathBrushShape::Square;
+        maskPath.pointRadius = _maskOverlayPointRadius;
+        maskPath.color = _maskOverlayColor;
+        maskPath.opacity = _maskOverlayOpacity;
+        maskPath.z = 60.0f;
+        builder.addPath(maskPath);
+    }
+
     if (!_handlesVisible) {
         return;
     }
@@ -381,5 +394,22 @@ void SegmentationOverlayController::setSliceDisplayMode(SegmentationSliceDisplay
         return;
     }
     _sliceDisplayMode = mode;
+    refreshAll();
+}
+
+void SegmentationOverlayController::setMaskOverlay(const std::vector<cv::Vec3f>& points,
+                                                   bool visible,
+                                                   float pointRadius,
+                                                   float opacity)
+{
+    _maskOverlayPointRadius = std::max(0.5f, pointRadius);
+    _maskOverlayOpacity = std::clamp(opacity, 0.0f, 1.0f);
+    if (!visible) {
+        _maskOverlayVisible = false;
+        _maskOverlayPoints.clear();
+    } else {
+        _maskOverlayVisible = !points.empty();
+        _maskOverlayPoints = points;
+    }
     refreshAll();
 }

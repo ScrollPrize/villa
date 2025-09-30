@@ -117,6 +117,12 @@ private:
     QString _header;
     QStringList _details;
 };
+
+bool isInvalidPoint(const cv::Vec3f& p)
+{
+    return !std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]) ||
+           (p[0] == -1.0f && p[1] == -1.0f && p[2] == -1.0f);
+}
 }
 
 SegmentationModule::SegmentationModule(SegmentationWidget* widget,
@@ -164,6 +170,9 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _fillInvalidRegions = _widget->fillInvalidRegions();
         _handlesLocked = _widget->handlesLocked();
         _usingCorrectionsGrowth = (_widget->growthMethod() == SegmentationGrowthMethod::Corrections);
+        _maskSamplingStep = std::max(1, _widget->maskSampling());
+        _maskBrushRadius = std::max(1, _widget->maskBrushRadius());
+        _maskOverlayRadius = static_cast<float>(_maskBrushRadius);
     }
     if (_editManager) {
         _editManager->setHoleSearchRadius(_holeSearchRadius);
@@ -228,75 +237,60 @@ void SegmentationModule::bindWidgetSignals()
     }
 
     connect(_widget, &SegmentationWidget::editingModeChanged,
-            this, &SegmentationModule::setEditingEnabled,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::setEditingEnabled);
     connect(_widget, &SegmentationWidget::downsampleChanged,
-            this, &SegmentationModule::setDownsample,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::setDownsample);
     connect(_widget, &SegmentationWidget::radiusChanged,
-            this, &SegmentationModule::setRadius,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::setRadius);
     connect(_widget, &SegmentationWidget::sigmaChanged,
-            this, &SegmentationModule::setSigma,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::setSigma);
     connect(_widget, &SegmentationWidget::influenceModeChanged,
-            this, &SegmentationModule::setInfluenceMode,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::setInfluenceMode);
     connect(_widget, &SegmentationWidget::rowColModeChanged,
-            this, &SegmentationModule::setRowColMode,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::setRowColMode);
     connect(_widget, &SegmentationWidget::highlightDistanceChanged,
-            this, &SegmentationModule::setHighlightDistance,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::setHighlightDistance);
     connect(_widget, &SegmentationWidget::sliceFadeDistanceChanged,
-            this, &SegmentationModule::setSliceFadeDistance,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::setSliceFadeDistance);
     connect(_widget, &SegmentationWidget::sliceDisplayModeChanged,
-            this, &SegmentationModule::setSliceDisplayMode,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::setSliceDisplayMode);
     connect(_widget, &SegmentationWidget::holeSearchRadiusChanged,
-            this, &SegmentationModule::setHoleSearchRadius,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::setHoleSearchRadius);
     connect(_widget, &SegmentationWidget::holeSmoothIterationsChanged,
-            this, &SegmentationModule::setHoleSmoothIterations,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::setHoleSmoothIterations);
     connect(_widget, &SegmentationWidget::handlesAlwaysVisibleChanged,
-            this, &SegmentationModule::setHandlesAlwaysVisible,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::setHandlesAlwaysVisible);
     connect(_widget, &SegmentationWidget::handleDisplayDistanceChanged,
-            this, &SegmentationModule::setHandleDisplayDistance,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::setHandleDisplayDistance);
     connect(_widget, &SegmentationWidget::fillInvalidRegionsChanged,
-            this, &SegmentationModule::setFillInvalidRegions,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::setFillInvalidRegions);
     connect(_widget, &SegmentationWidget::applyRequested,
-            this, &SegmentationModule::applyEdits,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::applyEdits);
     connect(_widget, &SegmentationWidget::resetRequested,
-            this, &SegmentationModule::resetEdits,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::resetEdits);
     connect(_widget, &SegmentationWidget::stopToolsRequested,
-            this, &SegmentationModule::stopTools,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::stopTools);
     connect(_widget, &SegmentationWidget::growSurfaceRequested,
-            this, &SegmentationModule::handleGrowSurfaceRequested,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::handleGrowSurfaceRequested);
     connect(_widget, &SegmentationWidget::growthMethodChanged,
-            this, &SegmentationModule::onGrowthMethodChanged,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::onGrowthMethodChanged);
 
     connect(_widget, &SegmentationWidget::correctionsCreateRequested,
-            this, &SegmentationModule::onCorrectionsCreateRequested,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::onCorrectionsCreateRequested);
     connect(_widget, &SegmentationWidget::correctionsCollectionSelected,
-            this, &SegmentationModule::onCorrectionsCollectionSelected,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::onCorrectionsCollectionSelected);
     connect(_widget, &SegmentationWidget::correctionsAnnotateToggled,
-            this, &SegmentationModule::onCorrectionsAnnotateToggled,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::onCorrectionsAnnotateToggled);
     connect(_widget, &SegmentationWidget::correctionsZRangeChanged,
-            this, &SegmentationModule::onCorrectionsZRangeChanged,
-            Qt::UniqueConnection);
+            this, &SegmentationModule::onCorrectionsZRangeChanged);
+    connect(_widget, &SegmentationWidget::maskEditingToggled,
+            this, &SegmentationModule::onMaskEditingToggled);
+    connect(_widget, &SegmentationWidget::maskApplyRequested,
+            this, &SegmentationModule::onMaskApplyRequested);
+    connect(_widget, &SegmentationWidget::maskSamplingChanged,
+            this, &SegmentationModule::setMaskSampling);
+    connect(_widget, &SegmentationWidget::maskBrushRadiusChanged,
+            this, &SegmentationModule::setMaskBrushRadius);
 
     if (auto zRange = _widget->correctionsZRange()) {
         onCorrectionsZRangeChanged(true, zRange->first, zRange->second);
@@ -357,6 +351,303 @@ std::optional<std::pair<int, int>> SegmentationModule::correctionsZRange() const
         return std::nullopt;
     }
     return std::make_pair(_correctionsZMin, _correctionsZMax);
+}
+
+void SegmentationModule::onMaskEditingToggled(bool active)
+{
+    if (active) {
+        if (!beginMaskEditing()) {
+            if (_widget) {
+                _widget->setMaskEditingActive(false);
+                _widget->setMaskApplyEnabled(false);
+            }
+            return;
+        }
+        emit statusMessageRequested(tr("Mask editing enabled. Hold Shift to use the eraser."), kStatusShort);
+    } else {
+        cancelMaskEditing();
+    }
+}
+
+void SegmentationModule::onMaskApplyRequested()
+{
+    if (!_maskEditingActive) {
+        emit statusMessageRequested(tr("Enable mask editing before applying."), kStatusShort);
+        return;
+    }
+
+    _maskEditingActive = false;
+    _maskStrokeActive = false;
+    _maskDirty = false;
+    _maskHasOriginal = false;
+    _maskOriginalDirty = _editManager ? _editManager->hasPendingChanges() : false;
+    _maskOriginalPoints.release();
+    clearMaskOverlay();
+    updateMaskUi();
+    refreshOverlay();
+    emit statusMessageRequested(tr("Mask edits applied."), kStatusShort);
+
+    if (_viewerManager) {
+        _viewerManager->forEachViewer([](CVolumeViewer* v) {
+            if (v && v->fGraphicsView) {
+                v->fGraphicsView->setCursor(Qt::ArrowCursor);
+            }
+        });
+    }
+}
+
+void SegmentationModule::setMaskSampling(int step)
+{
+    const int clamped = std::max(1, step);
+    if (_maskSamplingStep == clamped) {
+        return;
+    }
+    _maskSamplingStep = clamped;
+    if (_widget && _widget->maskSampling() != clamped) {
+        _widget->setMaskSampling(clamped);
+    }
+    if (_maskEditingActive) {
+        updateMaskOverlay();
+    }
+}
+
+void SegmentationModule::setMaskBrushRadius(int radius)
+{
+    const int clamped = std::max(1, radius);
+    if (_maskBrushRadius == clamped) {
+        return;
+    }
+    _maskBrushRadius = clamped;
+    _maskOverlayRadius = static_cast<float>(_maskBrushRadius);
+    if (_widget && _widget->maskBrushRadius() != clamped) {
+        _widget->setMaskBrushRadius(clamped);
+    }
+    if (_maskEditingActive) {
+        updateMaskOverlay();
+    }
+}
+
+bool SegmentationModule::beginMaskEditing()
+{
+    if (_maskEditingActive) {
+        return true;
+    }
+    if (!_editManager || !_editManager->hasSession()) {
+        emit statusMessageRequested(tr("Start a segmentation editing session before editing the mask."), kStatusMedium);
+        return false;
+    }
+
+    try {
+        _maskOriginalPoints = _editManager->previewPoints().clone();
+        _maskHasOriginal = true;
+    } catch (const std::exception& ex) {
+        qCWarning(lcSegEdit) << "Failed to snapshot preview points for mask editing" << ex.what();
+        emit statusMessageRequested(tr("Unable to enter mask editing."), kStatusMedium);
+        return false;
+    }
+
+    _maskOriginalDirty = _editManager->hasPendingChanges();
+    _maskEditingActive = true;
+    _maskDirty = false;
+    _maskStrokeActive = false;
+    _maskLastCell.reset();
+
+    updateMaskOverlay();
+    updateMaskUi();
+
+    return true;
+}
+
+void SegmentationModule::cancelMaskEditing(bool silent)
+{
+    if (!_maskEditingActive) {
+        return;
+    }
+
+    if (_editManager && _maskHasOriginal) {
+        if (_editManager->setPreviewPoints(_maskOriginalPoints, _maskOriginalDirty)) {
+            if (_surfaces) {
+                if (auto* preview = _editManager->previewSurface()) {
+                    _surfaces->setSurface("segmentation", preview);
+                }
+            }
+            refreshOverlay();
+            emitPendingChanges();
+        }
+    }
+
+    _maskEditingActive = false;
+    _maskDirty = false;
+    _maskStrokeActive = false;
+    _maskHasOriginal = false;
+    _maskLastCell.reset();
+    _maskOriginalPoints.release();
+
+    clearMaskOverlay();
+    updateMaskUi();
+    if (!silent) {
+        emit statusMessageRequested(tr("Mask edits discarded."), kStatusShort);
+    }
+
+    if (_viewerManager) {
+        _viewerManager->forEachViewer([](CVolumeViewer* v) {
+            if (v && v->fGraphicsView) {
+                v->fGraphicsView->setCursor(Qt::ArrowCursor);
+            }
+        });
+    }
+}
+
+void SegmentationModule::handleMaskErase(const cv::Vec3f& worldPos)
+{
+    if (!_maskEditingActive || !_editManager || !_editManager->hasSession()) {
+        return;
+    }
+
+    float distance = std::numeric_limits<float>::infinity();
+    std::optional<std::pair<int, int>> gridIndex = _editManager->worldToGridIndex(worldPos, &distance);
+
+    std::pair<int, int> targetCell;
+    bool haveTarget = false;
+
+    if (gridIndex) {
+        const float worldStep = gridStepWorld();
+        const float maxDistance = worldStep * static_cast<float>(_maskBrushRadius + 2);
+        if (!std::isfinite(distance) || distance > maxDistance) {
+            gridIndex.reset();
+        } else {
+            targetCell = *gridIndex;
+            haveTarget = true;
+        }
+    }
+
+    if (!haveTarget) {
+        if (_maskStrokeActive && _maskLastCell) {
+            targetCell = *_maskLastCell;
+            haveTarget = true;
+        } else {
+            return;
+        }
+    }
+
+    const int brushRadius = std::max(1, _maskBrushRadius);
+    if (!_editManager->invalidateRegion(targetCell.first, targetCell.second, brushRadius)) {
+        return;
+    }
+
+    _maskLastCell = targetCell;
+    _maskDirty = true;
+    if (_surfaces) {
+        if (auto* preview = _editManager->previewSurface()) {
+            _surfaces->setSurface("segmentation", preview);
+        }
+    }
+    refreshOverlay();
+    updateMaskOverlay();
+    updateMaskUi();
+    emitPendingChanges();
+}
+
+void SegmentationModule::updateMaskOverlay()
+{
+    if (!_overlay) {
+        return;
+    }
+    if (!_maskEditingActive || !_editManager || !_editManager->hasSession()) {
+        clearMaskOverlay();
+        return;
+    }
+
+    const cv::Mat_<cv::Vec3f>& preview = _editManager->previewPoints();
+    const int rows = preview.rows;
+    const int cols = preview.cols;
+    const int sampleStep = std::max(1, _maskSamplingStep);
+
+    _maskOverlayPoints.clear();
+    _maskOverlayPoints.reserve(static_cast<size_t>((rows / sampleStep + 1) * (cols / sampleStep + 1)));
+
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+            if (((row + col) % sampleStep) != 0) {
+                continue;
+            }
+            if (!maskCellInvalid(preview(row, col))) {
+                continue;
+            }
+            if (auto world = maskWorldForCell(row, col, preview)) {
+                _maskOverlayPoints.push_back(*world);
+            }
+        }
+    }
+
+    const bool visible = !_maskOverlayPoints.empty();
+    _overlay->setMaskOverlay(_maskOverlayPoints, visible, _maskOverlayRadius, 0.35f);
+}
+
+void SegmentationModule::clearMaskOverlay()
+{
+    if (_overlay) {
+        _overlay->setMaskOverlay({}, false, _maskOverlayRadius, 0.0f);
+    }
+    _maskOverlayPoints.clear();
+}
+
+void SegmentationModule::updateMaskUi()
+{
+    if (!_widget) {
+        return;
+    }
+    _widget->setMaskEditingActive(_maskEditingActive);
+    _widget->setMaskApplyEnabled(_maskEditingActive && _maskDirty);
+}
+
+std::optional<cv::Vec3f> SegmentationModule::maskWorldForCell(int row,
+                                                              int col,
+                                                              const cv::Mat_<cv::Vec3f>& preview) const
+{
+    const cv::Vec3f& current = preview(row, col);
+    if (!maskCellInvalid(current)) {
+        return current;
+    }
+
+    if (_maskHasOriginal && row < _maskOriginalPoints.rows && col < _maskOriginalPoints.cols) {
+        const cv::Vec3f& original = _maskOriginalPoints(row, col);
+        if (!maskCellInvalid(original)) {
+            return original;
+        }
+    }
+
+    const int rows = preview.rows;
+    const int cols = preview.cols;
+    constexpr int kMaxSearchRadius = 5;
+    for (int radius = 1; radius <= kMaxSearchRadius; ++radius) {
+        for (int dy = -radius; dy <= radius; ++dy) {
+            for (int dx = -radius; dx <= radius; ++dx) {
+                const int nr = row + dy;
+                const int nc = col + dx;
+                if (nr < 0 || nc < 0 || nr >= rows || nc >= cols) {
+                    continue;
+                }
+                const cv::Vec3f& neighbor = preview(nr, nc);
+                if (!maskCellInvalid(neighbor)) {
+                    return neighbor;
+                }
+                if (_maskHasOriginal && nr < _maskOriginalPoints.rows && nc < _maskOriginalPoints.cols) {
+                    const cv::Vec3f& origNeighbor = _maskOriginalPoints(nr, nc);
+                    if (!maskCellInvalid(origNeighbor)) {
+                        return origNeighbor;
+                    }
+                }
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
+bool SegmentationModule::maskCellInvalid(const cv::Vec3f& point)
+{
+    return isInvalidPoint(point);
 }
 
 void SegmentationModule::updateHandleVisibility()
@@ -433,6 +724,13 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     _editingEnabled = enabled;
 
     if (!enabled) {
+        if (_maskEditingActive) {
+            cancelMaskEditing(true);
+            if (_widget) {
+                _widget->setMaskEditingActive(false);
+                _widget->setMaskApplyEnabled(false);
+            }
+        }
         setCorrectionsAnnotateMode(false, false);
         setHandlesLocked(false, false);
     }
@@ -484,6 +782,9 @@ void SegmentationModule::setDownsample(int value)
         _overlay->setDownsample(value);
         _overlay->refreshAll();
     }
+    if (_maskEditingActive) {
+        updateMaskOverlay();
+    }
 }
 
 void SegmentationModule::setRadius(float radius)
@@ -510,6 +811,9 @@ void SegmentationModule::setRadius(float radius)
     if (_overlay) {
         _overlay->setRadius(_radius);
         _overlay->refreshAll();
+    }
+    if (_maskEditingActive) {
+        updateMaskOverlay();
     }
 }
 
@@ -937,6 +1241,10 @@ bool SegmentationModule::beginEditingSession(QuadSurface* activeSurface)
         return false;
     }
 
+    if (_maskEditingActive) {
+        cancelMaskEditing(true);
+    }
+
     if (!_editManager->beginSession(activeSurface, _downsample)) {
         return false;
     }
@@ -966,6 +1274,10 @@ void SegmentationModule::endEditingSession()
 {
     if (!_editManager || !_editManager->hasSession()) {
         return;
+    }
+
+    if (_maskEditingActive) {
+        cancelMaskEditing(true);
     }
 
     QuadSurface* base = _editManager->baseSurface();
@@ -1003,6 +1315,10 @@ void SegmentationModule::refreshSessionFromSurface(QuadSurface* surface)
 {
     if (!_editManager || !_editManager->hasSession()) {
         return;
+    }
+
+    if (_maskEditingActive) {
+        cancelMaskEditing(true);
     }
 
     Q_UNUSED(surface);
@@ -1051,6 +1367,7 @@ void SegmentationModule::resetInteractionState()
     _hover.clear();
     _cursorValid = false;
     _cursorViewer = nullptr;
+    _maskStrokeActive = false;
 
     if (_overlay) {
         _overlay->setActiveHandle(std::nullopt, false);
@@ -1110,17 +1427,39 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
 {
     const QString viewerName = viewer ? QString::fromStdString(viewer->surfName()) : QStringLiteral("<null>");
     const bool canEdit = _editingEnabled && _editManager && _editManager->hasSession();
+    if (!canEdit) {
+        qCInfo(lcSegEdit).noquote() << QStringLiteral("[SegEdit] mask/edit ignored: no-active-session viewer=%1")
+                                          .arg(viewerName);
+        if (_maskEditingActive) {
+            cancelMaskEditing(true);
+        }
+        return;
+    }
+
+    if (_maskEditingActive) {
+        if (!viewer || viewer->surfName() != "segmentation") {
+            return;
+        }
+        const bool eraserActive = modifiers.testFlag(Qt::ShiftModifier);
+        if (eraserActive && button == Qt::LeftButton) {
+            _maskStrokeActive = true;
+            _maskLastCell.reset();
+            _cursorViewer = viewer;
+            if (viewer->fGraphicsView) {
+                viewer->fGraphicsView->setCursor(Qt::CrossCursor);
+            }
+            handleMaskErase(worldPos);
+        }
+
+        return;
+    }
+
     const QString header = QStringLiteral("[SegEdit] click viewer=%1 button=%2 pointAdd=%3 pos=%4 mods=%5")
                                .arg(viewerName,
                                     button == Qt::LeftButton ? QStringLiteral("Left") : QStringLiteral("Other"),
                                     _pointAddMode ? QStringLiteral("true") : QStringLiteral("false"),
                                     vecToString(worldPos),
                                     modifiersToString(modifiers));
-
-    if (!canEdit) {
-        qCInfo(lcSegEdit).noquote() << header + QStringLiteral(" | ignored=no-active-session");
-        return;
-    }
 
     ClickLog logger(header);
 
@@ -1426,9 +1765,30 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
 void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
                                          const cv::Vec3f& worldPos,
                                          Qt::MouseButtons buttons,
-                                         Qt::KeyboardModifiers /*modifiers*/)
+                                         Qt::KeyboardModifiers modifiers)
 {
     if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
+        return;
+    }
+
+    if (_maskEditingActive) {
+        if (!viewer || viewer->surfName() != "segmentation") {
+            return;
+        }
+        const bool eraserHeld = modifiers.testFlag(Qt::ShiftModifier);
+
+        if (viewer->fGraphicsView) {
+            viewer->fGraphicsView->setCursor(eraserHeld ? Qt::CrossCursor : Qt::ArrowCursor);
+        }
+
+        if (_maskStrokeActive) {
+            if (eraserHeld && (buttons & Qt::LeftButton)) {
+                handleMaskErase(worldPos);
+            } else {
+                _maskStrokeActive = false;
+                _maskLastCell.reset();
+            }
+        }
         return;
     }
 
@@ -1513,8 +1873,28 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
 void SegmentationModule::handleMouseRelease(CVolumeViewer* viewer,
                                             const cv::Vec3f& worldPos,
                                             Qt::MouseButton button,
-                                            Qt::KeyboardModifiers /*modifiers*/)
+                                            Qt::KeyboardModifiers modifiers)
 {
+    if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
+        return;
+    }
+
+    if (_maskEditingActive) {
+        if (!viewer || viewer->surfName() != "segmentation") {
+            return;
+        }
+        if (_maskStrokeActive && button == Qt::LeftButton) {
+            _maskStrokeActive = false;
+            updateMaskOverlay();
+        }
+        if (viewer->fGraphicsView) {
+            const bool eraserHeld = modifiers.testFlag(Qt::ShiftModifier);
+            viewer->fGraphicsView->setCursor(eraserHeld ? Qt::CrossCursor : Qt::ArrowCursor);
+        }
+        _maskLastCell.reset();
+        return;
+    }
+
     if (_correctionsAnnotateMode) {
         return;
     }
