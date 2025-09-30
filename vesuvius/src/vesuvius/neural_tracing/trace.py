@@ -119,11 +119,9 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
         #  in that case, discretely assign each blob to of t>1 to
         return centroids_by_step
 
-    with torch.inference_mode():
-
-        start_zyx = torch.tensor(start_xyz).flip(0) / 2 ** volume_scale
+    def trace_strip(start_zyx, num_steps):
         trace_zyxs = [start_zyx]
-        for global_step in tqdm(range(50)):  # loop over planning windows
+        for global_step in tqdm(range(num_steps // steps_per_crop), desc='tracing strip'):  # loop over planning windows
             heatmaps, min_corner_zyx = get_heatmaps_at(trace_zyxs[-1])
             coordinates = get_blob_coordinates(heatmaps, min_corner_zyx)
             assert steps_per_crop == 1  # FIXME: the logic for deciding which candidate to take otherwise changes -- for 'later' points, either always just take nearest to one before, or track correspondences properly in get_blob_coordinates, or think about 'long distance' symmetry
@@ -147,12 +145,54 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
                     # Assume the most-distant point is the 'next' point to continue with; this is blind to the fact that the geodesic distances/directions are what matter
                     best_candidate_idx = torch.argmax(torch.linalg.norm(candidates - candidates[nearest_to_previous], dim=-1))
                 trace_zyxs.append(candidates[best_candidate_idx])
+        return torch.stack(trace_zyxs, dim=0)
 
-        trace_zyxs = torch.stack(trace_zyxs, dim=0)
-        quads = torch.stack([trace_zyxs + torch.tensor([0, -24, 0]), trace_zyxs + torch.tensor([0, -18, 0]), trace_zyxs + torch.tensor([0, -12, 0]), trace_zyxs + torch.tensor([0, -6, 0]), trace_zyxs, trace_zyxs + torch.tensor([0, 0, 6]), trace_zyxs + torch.tensor([0, 0, 12]), trace_zyxs + torch.tensor([0, 0, 18]), trace_zyxs + torch.tensor([0, 0, 24])], dim=1)
+    def trace_patch(first_row_zyxs, num_steps):
+        # For simplicity we denote the start_zyxs as a 'row', with 'columns' ordered 'left' to 'right'; however this has no geometric significance!
+        assert steps_per_crop == 1  # TODO!
+        rows = [first_row_zyxs]
+        for row_idx in tqdm(range(1, num_steps // steps_per_crop), desc='tracing patch'):
+            # TODO: would be nice to vectorise model application, but currently loading the crops is the limiting factor!
+            next_row = []
+            for col_idx in tqdm(range(rows[-1].shape[0]), 'tracing row'):
+                heatmaps, min_corner_zyx = get_heatmaps_at(rows[-1][col_idx])
+                coordinates = get_blob_coordinates(heatmaps, min_corner_zyx)
+                candidates = coordinates[0]  # TODO!
+                # TODO: would be better to globally optimise the entire strip; HMM-ish?
+                #  don't always have four blobs per heatmap; would need to account for that
+                #  for each blob, want to assign it to a point in the grid, s.t. all blobs assigned to a given point are physically very close
+                #  if a grid cell is left empty, then just inpaint
+                #  need to encode the fact that each blob is used only once and using it in one way affects other things -- in particular that if there are four blobs, then two 'opposite' blobs must be treated as such
+                if row_idx == 1 and col_idx == 0:
+                    # we're currently at the very first point of the first row; the point to the right is known; we need to choose one below
+                    # 'above' vs 'below' is arbitrary at this point
+                    # 'left' is assumed to be the one farthest from the right (c.f. 1D case); we want to exclude this, so take one of the medium-distance ones
+                    best_idx = torch.argsort(torch.linalg.norm(candidates - rows[-1][col_idx + 1], dim=-1))[2]
+                elif row_idx == 1:
+                    # we're in the first row but not the start; points to left and right are known; we need to find the one 'below'
+                    # 'below' for the previous point has been decided, and we must be consistent with that
+                    # one point is nearest left in existing row; one point is nearest right; of the others take the one that's
+                    best_idx = torch.argsort(torch.linalg.norm(candidates - rows[-1][col_idx + 1], dim=-1))[2]
+                elif col_idx == 0:
+                    # we're in the first col of a later row; point above is known, and the one to the right of that
+                    nearest_to_above = torch.argmin(torch.linalg.norm(candidates - previous, dim=-1))
+                else:
+                    # we're in a later row, not at the start; point above is known, and left/right of that, and left of us
+                    pass
+                next_row.append(candidates[best_idx])
+            rows.append(next_row)
+        return torch.stack(rows, dim=0)
+
+    with torch.inference_mode():
+
+        start_zyx = torch.tensor(start_xyz).flip(0) / 2 ** volume_scale
+        strip_zyxs = trace_strip(start_zyx, num_steps=50)
+        quads = torch.stack([strip_zyxs + torch.tensor([0, -24, 0]), strip_zyxs + torch.tensor([0, -18, 0]), strip_zyxs + torch.tensor([0, -12, 0]), strip_zyxs + torch.tensor([0, -6, 0]), strip_zyxs, strip_zyxs + torch.tensor([0, 0, 6]), strip_zyxs + torch.tensor([0, 0, 12]), strip_zyxs + torch.tensor([0, 0, 18]), strip_zyxs + torch.tensor([0, 0, 24])], dim=1)
         quads *= 2 ** volume_scale
-        save_tifxyz(quads.numpy(), f'{out_path}', 'neural-trace', config['step_size'], voxel_size_um, 'neural-tracer')
+        save_tifxyz(quads.numpy(), f'{out_path}', 'neural-trace-strip', config['step_size'], voxel_size_um, 'neural-tracer')
 
+        patch_zyxs = trace_patch(strip_zyxs, num_steps=10)
+        save_tifxyz((patch_zyxs * 2 ** volume_scale).numpy(), f'{out_path}', 'neural-trace-patch', config['step_size'], voxel_size_um, 'neural-tracer')
 
 if __name__ == '__main__':
     trace()
