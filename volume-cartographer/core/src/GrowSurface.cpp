@@ -8,10 +8,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/SurfaceModeling.hpp"
-#include "vc/core/util/SurfaceArea.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
-#include "vc/core/util/NormalGridVolume.hpp"
-#include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/HashFunctions.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
@@ -80,6 +77,30 @@ static cv::Vec3f at_int_inv(const cv::Mat_<cv::Vec3f> &points, cv::Vec2f p)
 
 using SurfPoint = std::pair<SurfaceMeta*,cv::Vec2i>;
 
+// -----------------------------------------------------------------------------
+// Robust geometric area helpers (areas returned in voxel^2)
+// -----------------------------------------------------------------------------
+static inline double tri_area_vox2(const cv::Vec3d& a,
+                                   const cv::Vec3d& b,
+                                   const cv::Vec3d& c)
+{
+    const cv::Vec3d u = b - a;
+    const cv::Vec3d v = c - a;
+    const cv::Vec3d w(u[1]*v[2] - u[2]*v[1],
+                      u[2]*v[0] - u[0]*v[2],
+                      u[0]*v[1] - u[1]*v[0]);
+    return 0.5 * std::sqrt(w.dot(w));
+}
+
+static inline double quad_area_vox2(const cv::Vec3d& p00,
+                                    const cv::Vec3d& p10,
+                                    const cv::Vec3d& p01,
+                                    const cv::Vec3d& p11)
+{
+    // Split consistently along (p00 -> p11)
+    return tri_area_vox2(p00, p10, p11) + tri_area_vox2(p00, p11, p01);
+}
+
 // Try to count a quad (top-left index j,i) if its four corners are STATE_LOC_VALID.
 // Returns the quad area (voxel^2) if counted; 0 otherwise. Caller must ensure
 // any check+set of 'quad_done(j,i)' is synchronized if used from parallel code.
@@ -95,10 +116,10 @@ static inline double maybe_quad_area_and_mark(int j, int i,
          (state(j+1, i  ) & STATE_LOC_VALID) &&
          (state(j+1, i+1) & STATE_LOC_VALID) )
     {
-        const double a = vc::surface::quadAreaVox2(points(j,   i  ),
-                                                   points(j,   i+1),
-                                                   points(j+1, i  ),
-                                                   points(j+1, i+1));
+        const double a = quad_area_vox2(points(j,   i  ),
+                                        points(j,   i+1),
+                                        points(j+1, i  ),
+                                        points(j+1, i+1));
         quad_done(j,i) = 1;
         return a;
     }
@@ -328,7 +349,7 @@ public:
 // protected:
     std::unordered_map<SurfPoint,cv::Vec2d,SurfPoint_hash> _data;
     std::unordered_map<resId_t,ceres::ResidualBlockId,resId_hash> _res_blocks;
-    std::unordered_map<cv::Vec2i, std::set<SurfaceMeta*>> _surfs;
+    std::unordered_map<cv::Vec2i,std::set<SurfaceMeta*>,vec2i_hash> _surfs;
     std::set<SurfaceMeta*> _emptysurfs;
     // [APPROVED] store approved (surface, location) pairs
     std::unordered_set<SurfPoint, SurfPoint_hash> _approved;
@@ -2160,10 +2181,10 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                  (state(j+1, i  ) & STATE_LOC_VALID) &&
                  (state(j+1, i+1) & STATE_LOC_VALID) )
             {
-                area_final_vox2 += vc::surface::quadAreaVox2(points(j,   i  ),
-                                                            points(j,   i+1),
-                                                            points(j+1, i  ),
-                                                            points(j+1, i+1));
+                area_final_vox2 += quad_area_vox2(points(j,   i  ),
+                                                  points(j,   i+1),
+                                                  points(j+1, i  ),
+                                                  points(j+1, i+1));
             }
     const double area_final_cm2 = area_final_vox2 * double(voxelsize) * double(voxelsize) / 1e8;
     std::cout << "area exact: " << area_final_vox2 << " vx^2 (" << area_final_cm2 << " cm^2)" << std::endl;

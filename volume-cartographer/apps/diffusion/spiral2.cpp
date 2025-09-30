@@ -65,6 +65,7 @@ void generate_bidir_spiral(
     cv::Mat& vis_frame
 );
 
+void visualize_normal_grid(const vc::core::util::GridStore& normal_grid, const cv::Size& size, const std::string& path);
 void visualize_spiral(cv::Mat& vis, const std::vector<SpiralPoint>& spiral, const cv::Scalar& color, const cv::Scalar& endpoint_color, bool draw_endpoints);
 
 // JSON serialization for SpiralPoint
@@ -292,9 +293,7 @@ int spiral2_main(
 
     auto start_skeletonization = std::chrono::high_resolution_clock::now();
     std::clock_t start_cpu_skeletonization = std::clock();
-    cv::Mat thinned_slice;
-    cv::ximgproc::thinning(binary_slice, thinned_slice, cv::ximgproc::THINNING_GUOHALL);
-    SkeletonGraph skeleton_graph = trace_skeleton_segments(thinned_slice, vm);
+    auto [skeleton_graph, skeleton_id_img] = generate_skeleton_graph(binary_slice, vm);
     std::clock_t end_cpu_skeletonization = std::clock();
     auto end_skeletonization = std::chrono::high_resolution_clock::now();
     double real_time_skeletonization = std::chrono::duration<double>(end_skeletonization - start_skeletonization).count();
@@ -325,8 +324,7 @@ int spiral2_main(
     vc::core::util::GridStore normal_grid("test_gridstore.bin");
 
     if (vm.count("debug")) {
-        cv::Mat vis = visualize_normal_grid(normal_grid, slice_mat.size());
-        cv::imwrite("normal_constraints_vis_spiral2.tif", vis);
+        visualize_normal_grid(normal_grid, slice_mat.size(), "normal_constraints_vis_spiral2.tif");
     }
 
     const auto& collections = point_collection.getAllCollections();

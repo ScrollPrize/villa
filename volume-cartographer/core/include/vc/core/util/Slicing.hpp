@@ -26,6 +26,7 @@ public:
     std::shared_ptr<xt::xarray<uint8_t>> get(const cv::Vec4i &key);
     void reset();
     bool has(const cv::Vec4i &idx);
+    size_t size() const { return _size; }
 
     std::shared_mutex mutex;
 private:

@@ -10,10 +10,8 @@
 #include "z5/factory.hxx"
 #include <nlohmann/json.hpp>
 #include <boost/program_options.hpp>
-
+ 
 #include <omp.h>
-
-#include <algorithm>
  
 namespace po = boost::program_options;
 using shape = z5::types::ShapeType;
@@ -110,20 +108,10 @@ static auto load_direction_fields(json const&params, ChunkCache *chunk_cache, st
                 maybe_weight_ds = z5::filesystem::openDataset(weight_ds_handle);
             }
             std::string const unique_id = std::to_string(std::hash<std::string>{}(dirs_group.path().string() + std::to_string(ome_scale)));
-            float weight = 1.0f;
-            if (direction_field.contains("weight")) {
-                try {
-                    weight = std::clamp(direction_field["weight"].get<float>(), 0.0f, 10.0f);
-                } catch (const std::exception& ex) {
-                    std::cerr << "WARNING: invalid weight for direction field " << zarr_path << ": " << ex.what() << std::endl;
-                }
-            }
-
             direction_fields.emplace_back(
                 direction,
                 std::make_unique<Chunked3dVec3fFromUint8>(std::move(direction_dss), scale_factor, chunk_cache, cache_root, unique_id),
-                maybe_weight_ds ? std::make_unique<Chunked3dFloatFromUint8>(std::move(maybe_weight_ds), scale_factor, chunk_cache, cache_root, unique_id + "_conf") : std::unique_ptr<Chunked3dFloatFromUint8>(),
-                weight);
+                maybe_weight_ds ? std::make_unique<Chunked3dFloatFromUint8>(std::move(maybe_weight_ds), scale_factor, chunk_cache, cache_root, unique_id + "_conf") : std::unique_ptr<Chunked3dFloatFromUint8>());
         }
     }
     return direction_fields;
@@ -131,10 +119,9 @@ static auto load_direction_fields(json const&params, ChunkCache *chunk_cache, st
 
 int main(int argc, char *argv[])
 {
-    std::filesystem::path vol_path, tgt_dir, params_path, resume_path, correct_path;
+    std::filesystem::path vol_path, tgt_dir, params_path, resume_path;
     cv::Vec3d origin;
     json params;
-    VCCollection corrections;
 
     bool use_old_args = (argc == 4 || argc == 7) && argv[1][0] != '-' && argv[2][0] != '-' && argv[3][0] != '-';
 
@@ -154,8 +141,7 @@ int main(int argc, char *argv[])
             ("params,p", po::value<std::string>()->required(), "JSON parameters file")
             ("seed,s", po::value<std::vector<float>>()->multitoken(), "Seed coordinates (x y z)")
             ("resume", po::value<std::string>(), "Path to a tifxyz surface to resume from")
-            ("rewind-gen", po::value<int>(), "Generation to rewind to")
-            ("correct", po::value<std::string>(), "JSON file with point-based corrections for resume mode");
+            ("rewind-gen", po::value<int>(), "Generation to rewind to");
 
         po::variables_map vm;
         try {
@@ -187,19 +173,6 @@ int main(int argc, char *argv[])
         }
         if (vm.count("resume")) {
             resume_path = vm["resume"].as<std::string>();
-        }
-
-        if (vm.count("correct")) {
-            if (!vm.count("resume")) {
-                std::cerr << "ERROR: --correct can only be used with --resume" << std::endl;
-                return EXIT_FAILURE;
-            }
-            correct_path = vm["correct"].as<std::string>();
-            std::ifstream correct_f(correct_path.string());
-            if (!corrections.loadFromJSON(correct_path.string())) {
-                std::cerr << "ERROR: Could not load or parse corrections file: " << correct_path << std::endl;
-                return EXIT_FAILURE;
-            }
         }
         
         std::ifstream params_f(params_path.string());
@@ -449,41 +422,30 @@ int main(int argc, char *argv[])
 
     QuadSurface* resume_surf = nullptr;
     if (mode == "resume") {
-        if (corrections.getAllCollections().empty())
-           resume_surf = load_quad_from_tifxyz(resume_path);
-        else
-            resume_surf = load_quad_from_tifxyz(resume_path, SURF_LOAD_IGNORE_MASK);
-
+        resume_surf = load_quad_from_tifxyz(resume_path);
         origin = {0,0,0}; // Not used in resume mode, but needs to be initialized
     }
 
-    json meta_params;
-    meta_params["source"] = "vc_grow_seg_from_seed";
-    meta_params["vc_gsfs_params"] = params;
-    meta_params["vc_gsfs_mode"] = mode;
-    meta_params["vc_gsfs_version"] = "dev";
-    if (mode == "expansion")
-        meta_params["seed_overlap"] = count_overlap;
-
-    std::string uuid = name_prefix + time_str();
-    std::filesystem::path seg_dir = tgt_dir / uuid;
-
-    QuadSurface *surf = tracer(ds.get(), 1.0, &chunk_cache, origin, params, cache_root, voxelsize, direction_fields, resume_surf, seg_dir, meta_params, corrections);
+    QuadSurface *surf = space_tracing_quad_phys(ds.get(), 1.0, &chunk_cache, origin, params, cache_root, voxelsize, direction_fields, resume_surf);
  
     if (resume_surf) {
         delete resume_surf;
     }
 
     double area_cm2 = (*surf->meta)["area_cm2"].get<double>();
-    if (area_cm2 < min_area_cm) {
-        if (std::filesystem::exists(seg_dir)) {
-            std::filesystem::remove_all(seg_dir);
-        }
+    if (area_cm2 < min_area_cm)
         return EXIT_SUCCESS;
-    }
 
+    (*surf->meta)["source"] = "vc_grow_seg_from_seed";
+    (*surf->meta)["vc_gsfs_params"] = params;
+    (*surf->meta)["vc_gsfs_mode"] = mode;
+    (*surf->meta)["vc_gsfs_version"] = "dev";
+    if (mode == "expansion")
+        (*surf->meta)["seed_overlap"] = count_overlap;
+    std::string uuid = name_prefix + time_str();
+    std::filesystem::path seg_dir = tgt_dir / uuid;
     std::cout << "saving " << seg_dir << std::endl;
-    surf->save(seg_dir, uuid, true);
+    surf->save(seg_dir, uuid);
 
     SurfaceMeta current;
 

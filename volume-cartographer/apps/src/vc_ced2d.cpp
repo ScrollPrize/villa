@@ -57,7 +57,7 @@ struct Config {
 };
 
 // Constants (match Python)
-static constexpr float EPS   = static_cast<float>(std::ldexp(1.0, -52)); // 2^-52
+static const float EPS   = static_cast<float>(std::ldexp(1.0, -52)); // 2^-52
 static constexpr float GAMMA = 0.01f;                                     // minimum diffusivity
 static constexpr float CM    = 7.2848f;                                   // exponential constant
 

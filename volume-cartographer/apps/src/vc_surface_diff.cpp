@@ -5,14 +5,12 @@
 #include <opencv2/imgproc.hpp>
 
 #include "vc/core/util/Surface.hpp"
-#include "vc/core/util/SurfaceArea.hpp"
 
 #include <unordered_map>
 #include <filesystem>
 #include <chrono>
 #include <iostream>
 #include <fstream>
-#include <cmath>
 
 
 using json = nlohmann::json;
@@ -205,24 +203,24 @@ int main(int argc, char *argv[])
         for (int j = 0; j < result_points.rows; j++) {
             for (int i = 0; i < result_points.cols; i++) {
                 if (result_points(j, i)[0] != -1) {
-                    ++valid_count;
+                    valid_count++;
                 }
             }
         }
 
         std::cout << "Result surface contains " << valid_count << " valid points" << std::endl;
 
+        // Calculate and print area if voxel size is available
         if (result->meta) {
-            const double area_vx2 = vc::surface::computeSurfaceAreaVox2(result_points);
+            float area_vx2 = valid_count;
             (*result->meta)["area_vx2"] = area_vx2;
 
+            // If we have voxel size, calculate area in cm²
             if (params.contains("voxelsize")) {
-                const double voxelsize = params["voxelsize"];
-                if (std::isfinite(voxelsize) && voxelsize > 0.0) {
-                    const double area_cm2 = area_vx2 * voxelsize * voxelsize / 1e8;
-                    (*result->meta)["area_cm2"] = area_cm2;
-                    std::cout << "Area: " << area_cm2 << " cm²" << std::endl;
-                }
+                float voxelsize = params["voxelsize"];
+                float area_cm2 = area_vx2 * voxelsize * voxelsize / 100.0;
+                (*result->meta)["area_cm2"] = area_cm2;
+                std::cout << "Area: " << area_cm2 << " cm²" << std::endl;
             }
         }
 

@@ -34,6 +34,7 @@ void optimize_spiral_trace(
     cv::Mat& vis_frame
 );
 
+std::pair<SkeletonGraph, cv::Mat> generate_skeleton_graph(const cv::Mat& binary_slice, const po::variables_map& vm);
 void populate_normal_grid(const SkeletonGraph& graph, vc::core::util::GridStore& normal_grid, double spiral_step);
 void visualize_spiral(cv::Mat& vis, const std::vector<SpiralPoint>& spiral, const cv::Scalar& color, const cv::Scalar& endpoint_color, bool draw_endpoints);
 int spiral2cont_main(
@@ -111,9 +112,7 @@ int spiral2cont_main(
     );
 
     cv::Mat binary_slice = slice_mat > 0;
-    cv::Mat skeleton_img;
-    cv::ximgproc::thinning(binary_slice, skeleton_img, cv::ximgproc::THINNING_GUOHALL);
-    SkeletonGraph skeleton_graph = trace_skeleton_segments(skeleton_img, vm);
+    auto [skeleton_graph, skeleton_id_img] = generate_skeleton_graph(binary_slice, vm);
     vc::core::util::GridStore normal_grid(
         cv::Rect(0, 0, slice_mat.cols, slice_mat.rows), 32
     );

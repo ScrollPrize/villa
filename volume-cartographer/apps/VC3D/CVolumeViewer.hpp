@@ -4,10 +4,9 @@
 
 #include <set>
 #include <unordered_map>
-#include <vector>
-#include <optional>
-#include "overlays/ViewerOverlayControllerBase.hpp"
+#include "PathData.hpp"
 #include "vc/ui/VCCollection.hpp"
+#include "COutlinedTextItem.hpp"
 #include "CSurfaceCollection.hpp"
 #include "CVolumeViewerView.hpp"
 #include "vc/core/types/Volume.hpp"
@@ -34,8 +33,9 @@ public:
     
     std::set<std::string> intersects();
     void setIntersects(const std::set<std::string> &set);
-    std::string surfName() const { return _surf_name; };
+    std::string surfName() { return _surf_name; };
     void recalcScales();
+    void renderPaths();
     
     // Composite view methods
     void setCompositeEnabled(bool enabled);
@@ -50,23 +50,18 @@ public:
     void setCompositeReverseDirection(bool reverse);
     void setResetViewOnSurfaceChange(bool reset);
     bool isCompositeEnabled() const { return _composite_enabled; }
-    VCCollection* pointCollection() const { return _point_collection; }
-    uint64_t highlightedPointId() const { return _highlighted_point_id; }
-    uint64_t selectedPointId() const { return _selected_point_id; }
-    uint64_t selectedCollectionId() const { return _selected_collection_id; }
-    bool isPointDragActive() const { return _dragged_point_id != 0; }
-    const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const { return _paths; }
 
     // Direction hints toggle
     void setShowDirectionHints(bool on) { _showDirectionHints = on; updateAllOverlays(); }
     bool isShowDirectionHints() const { return _showDirectionHints; }
 
-    void setSegmentationEditActive(bool active) { _segmentationEditActive = active; }
-    void setSegmentationEditHighlight(std::optional<std::pair<int,int>> handleKey, const cv::Vec3f& worldPos);
-
     void fitSurfaceInView();
     void updateAllOverlays();
     
+    // Direction hints for vc_grow_seg_from_segments flip_x visualization
+    void renderDirectionHints();
+    void renderDirectionStepMarkers();
+
     // Generic overlay group management (ad-hoc helper for reuse)
     void setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items);
     void clearOverlayGroup(const std::string& key);
@@ -75,8 +70,6 @@ public:
     float getCurrentScale() const { return _scale; }
     // Transform scene coordinates to volume coordinates
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const;
-    QPointF volumePointToScene(const cv::Vec3f& vol_point) { return volumeToScene(vol_point); }
-    Surface* currentSurface() const { return _surf; }
 
     // BBox drawing mode for segmentation view
     void setBBoxMode(bool enabled);
@@ -85,8 +78,8 @@ public:
     QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF& sceneRect);
     // Current stored selections (scene-space rects with colors)
     auto selections() const -> std::vector<std::pair<QRectF, QColor>>;
-    std::optional<QRectF> activeBBoxSceneRect() const { return _activeBBoxSceneRect; }
     void clearSelections();
+    void updateSelectionGraphics();
     
     CVolumeViewerView* fGraphicsView;
 
@@ -96,6 +89,7 @@ public slots:
     void onPanRelease(Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onPanStart(Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onCollectionSelected(uint64_t collectionId);
+    void onCollectionChanged(uint64_t collectionId);
     void onSurfaceChanged(std::string name, Surface *surf);
     void onPOIChanged(std::string name, POI *poi);
     void onIntersectionChanged(std::string a, std::string b, Intersection *intersection);
@@ -103,7 +97,10 @@ public slots:
     void onResized();
     void onZoom(int steps, QPointF scene_point, Qt::KeyboardModifiers modifiers);
     void onCursorMove(QPointF);
-    void onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
+    void onPointAdded(const ColPoint& point);
+    void onPointChanged(const ColPoint& point);
+    void onPointRemoved(uint64_t pointId);
+    void onPathsChanged(const QList<PathData>& paths);
     void onPointSelected(uint64_t pointId);
 
     // Mouse event handlers for drawing (transform coordinates)
@@ -128,14 +125,15 @@ signals:
     void sendCollectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
     void pointClicked(uint64_t pointId);
-    void overlaysUpdated();
-    void sendSegmentationRadiusWheel(int steps, QPointF scenePoint, cv::Vec3f worldPos);
     // (kept free for potential future signals)
 
 protected:
     void ScaleImage(double nFactor);
     void CenterOn(const QPointF& point);
     QPointF volumeToScene(const cv::Vec3f& vol_point);
+    void refreshPointPositions();
+    void renderOrUpdatePoint(const ColPoint& point);
+
     void performDeferredUpdates();
 
 protected:
@@ -194,6 +192,11 @@ protected:
     CSurfaceCollection *_surf_col = nullptr;
     
     VCCollection* _point_collection = nullptr;
+    struct PointGraphics {
+        QGraphicsEllipseItem* circle;
+        COutlinedTextItem* text;
+    };
+    std::unordered_map<uint64_t, PointGraphics> _points_items;
     
     // Point interaction state
     uint64_t _highlighted_point_id = 0;
@@ -203,7 +206,8 @@ protected:
     uint64_t _current_shift_collection_id = 0;
     bool _new_shift_group_required = true;
     
-    std::vector<ViewerOverlayControllerBase::PathPrimitive> _paths;
+    QList<PathData> _paths;
+    std::vector<QGraphicsItem*> _path_items;
     
     // Generic overlay groups; each key owns its items' lifetime
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlay_groups;
@@ -214,7 +218,6 @@ protected:
     bool _brushIsSquare = false;
     bool _resetViewOnSurfaceChange = true;
     bool _showDirectionHints = true;
-    bool _segmentationEditActive = false;
 
     int _downscale_override = 0;  // 0=auto, 1=2x, 2=4x, 3=8x, 4=16x, 5=32x
     QTimer* _overlayUpdateTimer;
@@ -222,8 +225,8 @@ protected:
     // BBox tool state
     bool _bboxMode = false;
     QPointF _bboxStart;
-    std::optional<QRectF> _activeBBoxSceneRect;
-    struct Selection { QRectF surfRect; QColor color; };
+    QGraphicsRectItem* _bboxRectItem = nullptr;
+    struct Selection { QRectF surfRect; QColor color; QGraphicsRectItem* item; };
     std::vector<Selection> _selections;
 
     bool _useFastInterpolation;
