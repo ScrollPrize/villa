@@ -197,7 +197,7 @@ void DrawingWidget::setupUI()
             });
     
     // Set size policy
-    setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
+    setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
     
 }
 

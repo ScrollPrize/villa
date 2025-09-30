@@ -21,6 +21,8 @@ class QString;
 class QVariant;
 class QComboBox;
 class QGroupBox;
+class QLineEdit;
+class QToolButton;
 
 // SegmentationWidget hosts controls for interactive surface editing
 class SegmentationWidget : public QWidget
@@ -48,6 +50,7 @@ public:
     [[nodiscard]] int maskBrushRadius() const { return _maskBrushRadius; }
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const { return _growthMethod; }
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
+    [[nodiscard]] std::optional<SegmentationDirectionFieldConfig> directionFieldConfig() const;
 
     void setPendingChanges(bool pending);
     void setCorrectionsEnabled(bool enabled);
@@ -61,6 +64,7 @@ public:
                              const QString& activeId);
     void setActiveVolume(const QString& volumeId);
     void setNormalGridPathHint(const QString& hint);
+    void setVolumePackagePath(const QString& path);
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const
     {
         if (!_correctionsZRangeEnabled) {
@@ -165,6 +169,12 @@ private:
     QCheckBox* _chkGrowthDirDown;
     QCheckBox* _chkGrowthDirLeft;
     QCheckBox* _chkGrowthDirRight;
+    QGroupBox* _groupDirectionField;
+    QLineEdit* _directionFieldPathEdit;
+    QToolButton* _directionFieldBrowseButton;
+    QComboBox* _comboDirectionFieldOrientation;
+    QComboBox* _comboDirectionFieldScale;
+    QDoubleSpinBox* _spinDirectionFieldWeight;
     QPushButton* _btnMaskEdit;
     QPushButton* _btnMaskApply;
     QSpinBox* _spinMaskSampling;
@@ -203,6 +213,11 @@ private:
     SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Corrections};
     SegmentationGrowthDirection _growthDirection{SegmentationGrowthDirection::All};
     int _growthSteps{5};
+    QString _directionFieldPath;
+    SegmentationDirectionFieldOrientation _directionFieldOrientation{SegmentationDirectionFieldOrientation::Normal};
+    int _directionFieldScale{0};
+    double _directionFieldWeight{1.0};
+    QString _volumePackagePath;
     static constexpr int kGrowDirUpBit = 1 << 0;
     static constexpr int kGrowDirDownBit = 1 << 1;
     static constexpr int kGrowDirLeftBit = 1 << 2;

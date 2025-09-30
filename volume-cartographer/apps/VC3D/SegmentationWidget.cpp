@@ -6,16 +6,21 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QLineEdit>
 #include <QPushButton>
 #include <QSettings>
 #include <QSpinBox>
+#include <QToolButton>
 #include <QVariant>
 #include <QVBoxLayout>
 #include <QSignalBlocker>
 #include <QLoggingCategory>
 #include <QStyle>
+#include <QFileDialog>
 
 #include <algorithm>
+
+#include <optional>
 
 #include <cmath>
 
@@ -56,6 +61,12 @@ SegmentationWidget::SegmentationWidget(QWidget* parent)
     , _chkGrowthDirDown(nullptr)
     , _chkGrowthDirLeft(nullptr)
     , _chkGrowthDirRight(nullptr)
+    , _groupDirectionField(nullptr)
+    , _directionFieldPathEdit(nullptr)
+    , _directionFieldBrowseButton(nullptr)
+    , _comboDirectionFieldOrientation(nullptr)
+    , _comboDirectionFieldScale(nullptr)
+    , _spinDirectionFieldWeight(nullptr)
     , _btnMaskEdit(nullptr)
     , _btnMaskApply(nullptr)
     , _spinMaskSampling(nullptr)
@@ -207,6 +218,58 @@ void SegmentationWidget::setupUI()
     growthLayout->addWidget(_normalGridStatusWidget);
 
     layout->addWidget(_groupGrowth);
+
+    _groupDirectionField = new QGroupBox(tr("Direction Field"), this);
+    auto* directionFieldLayout = new QVBoxLayout(_groupDirectionField);
+
+    auto* dfPathLayout = new QHBoxLayout();
+    auto* dfPathLabel = new QLabel(tr("Zarr folder:"), _groupDirectionField);
+    _directionFieldPathEdit = new QLineEdit(_groupDirectionField);
+    _directionFieldPathEdit->setPlaceholderText(tr("Select direction field OME-Zarr"));
+    _directionFieldBrowseButton = new QToolButton(_groupDirectionField);
+    _directionFieldBrowseButton->setText(QStringLiteral("..."));
+    _directionFieldBrowseButton->setToolTip(tr("Choose a direction field OME-Zarr directory"));
+    dfPathLayout->addWidget(dfPathLabel);
+    dfPathLayout->addWidget(_directionFieldPathEdit);
+    dfPathLayout->addWidget(_directionFieldBrowseButton);
+    directionFieldLayout->addLayout(dfPathLayout);
+
+    auto* dfOrientationLayout = new QHBoxLayout();
+    auto* dfOrientationLabel = new QLabel(tr("Direction:"), _groupDirectionField);
+    _comboDirectionFieldOrientation = new QComboBox(_groupDirectionField);
+    _comboDirectionFieldOrientation->addItem(tr("Normal"), static_cast<int>(SegmentationDirectionFieldOrientation::Normal));
+    _comboDirectionFieldOrientation->addItem(tr("Horizontal"), static_cast<int>(SegmentationDirectionFieldOrientation::Horizontal));
+    _comboDirectionFieldOrientation->addItem(tr("Vertical"), static_cast<int>(SegmentationDirectionFieldOrientation::Vertical));
+    dfOrientationLayout->addWidget(dfOrientationLabel);
+    dfOrientationLayout->addWidget(_comboDirectionFieldOrientation);
+    dfOrientationLayout->addStretch();
+    directionFieldLayout->addLayout(dfOrientationLayout);
+
+    auto* dfScaleLayout = new QHBoxLayout();
+    auto* dfScaleLabel = new QLabel(tr("Scale level:"), _groupDirectionField);
+    _comboDirectionFieldScale = new QComboBox(_groupDirectionField);
+    for (int scale = 0; scale <= 5; ++scale) {
+        _comboDirectionFieldScale->addItem(QString::number(scale), scale);
+    }
+    dfScaleLayout->addWidget(dfScaleLabel);
+    dfScaleLayout->addWidget(_comboDirectionFieldScale);
+    dfScaleLayout->addStretch();
+    directionFieldLayout->addLayout(dfScaleLayout);
+
+    auto* dfWeightLayout = new QHBoxLayout();
+    auto* dfWeightLabel = new QLabel(tr("Weight:"), _groupDirectionField);
+    _spinDirectionFieldWeight = new QDoubleSpinBox(_groupDirectionField);
+    _spinDirectionFieldWeight->setDecimals(2);
+    _spinDirectionFieldWeight->setRange(0.0, 10.0);
+    _spinDirectionFieldWeight->setSingleStep(0.1);
+    _spinDirectionFieldWeight->setValue(_directionFieldWeight);
+    _spinDirectionFieldWeight->setToolTip(tr("Relative strength for direction field losses (0 disables)"));
+    dfWeightLayout->addWidget(dfWeightLabel);
+    dfWeightLayout->addWidget(_spinDirectionFieldWeight);
+    dfWeightLayout->addStretch();
+    directionFieldLayout->addLayout(dfWeightLayout);
+
+    layout->addWidget(_groupDirectionField);
 
     _groupMasking = new QGroupBox(tr("Masking"), this);
     auto* maskingLayout = new QVBoxLayout(_groupMasking);
@@ -671,6 +734,76 @@ void SegmentationWidget::setupUI()
         writeSetting(QStringLiteral("growth_direction"), static_cast<int>(_growthDirection));
     });
 
+    connect(_directionFieldBrowseButton, &QToolButton::clicked, this, [this]() {
+        QString start;
+        if (_directionFieldPathEdit) {
+            start = _directionFieldPathEdit->text().trimmed();
+        }
+        if (start.isEmpty() && !_volumePackagePath.isEmpty()) {
+            start = _volumePackagePath;
+        }
+        const QString selected = QFileDialog::getExistingDirectory(this,
+                                                                   tr("Select Direction Field OME-Zarr"),
+                                                                   start);
+        if (!selected.isEmpty() && _directionFieldPathEdit) {
+            _directionFieldPathEdit->setText(selected);
+        }
+    });
+
+    connect(_directionFieldPathEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
+        const QString trimmed = text.trimmed();
+        if (trimmed == _directionFieldPath) {
+            return;
+        }
+        _directionFieldPath = trimmed;
+        writeSetting(QStringLiteral("direction_field_path"), _directionFieldPath);
+    });
+
+    connect(_comboDirectionFieldOrientation, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (index < 0) {
+            return;
+        }
+        const QVariant data = _comboDirectionFieldOrientation->itemData(index);
+        if (!data.isValid()) {
+            return;
+        }
+        const auto orientation = segmentationDirectionFieldOrientationFromInt(data.toInt());
+        if (orientation == _directionFieldOrientation) {
+            return;
+        }
+        _directionFieldOrientation = orientation;
+        writeSetting(QStringLiteral("direction_field_orientation"), static_cast<int>(_directionFieldOrientation));
+    });
+
+    connect(_comboDirectionFieldScale, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (index < 0) {
+            return;
+        }
+        const QVariant data = _comboDirectionFieldScale->itemData(index);
+        if (!data.isValid()) {
+            return;
+        }
+        const int scaleValue = std::clamp(data.toInt(), 0, 5);
+        if (scaleValue == _directionFieldScale) {
+            return;
+        }
+        _directionFieldScale = scaleValue;
+        writeSetting(QStringLiteral("direction_field_scale"), _directionFieldScale);
+    });
+
+    connect(_spinDirectionFieldWeight, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        const double clamped = std::clamp(value, 0.0, 10.0);
+        if (std::abs(clamped - _directionFieldWeight) < 1e-4) {
+            return;
+        }
+        _directionFieldWeight = clamped;
+        if (std::abs(clamped - value) > 1e-4) {
+            const QSignalBlocker blocker(_spinDirectionFieldWeight);
+            _spinDirectionFieldWeight->setValue(clamped);
+        }
+        writeSetting(QStringLiteral("direction_field_weight"), _directionFieldWeight);
+    });
+
     auto connectDirectionCheckbox = [this](QCheckBox* box) {
         if (!box) {
             return;
@@ -1015,6 +1148,20 @@ std::vector<SegmentationGrowthDirection> SegmentationWidget::allowedGrowthDirect
     return selected;
 }
 
+std::optional<SegmentationDirectionFieldConfig> SegmentationWidget::directionFieldConfig() const
+{
+    if (_directionFieldPath.isEmpty()) {
+        return std::nullopt;
+    }
+
+    SegmentationDirectionFieldConfig config;
+    config.path = _directionFieldPath;
+    config.orientation = _directionFieldOrientation;
+    config.scale = std::clamp(_directionFieldScale, 0, 5);
+    config.weight = std::clamp(_directionFieldWeight, 0.0, 10.0);
+    return config;
+}
+
 void SegmentationWidget::setGrowthDirectionMask(int mask)
 {
     mask = normalizeGrowthDirectionMask(mask);
@@ -1173,6 +1320,24 @@ void SegmentationWidget::updateEditingUi()
     }
     if (_btnGrow) {
         _btnGrow->setEnabled(_editingEnabled);
+    }
+    if (_groupDirectionField) {
+        _groupDirectionField->setEnabled(_editingEnabled);
+    }
+    if (_directionFieldPathEdit) {
+        _directionFieldPathEdit->setEnabled(_editingEnabled);
+    }
+    if (_directionFieldBrowseButton) {
+        _directionFieldBrowseButton->setEnabled(_editingEnabled);
+    }
+    if (_comboDirectionFieldOrientation) {
+        _comboDirectionFieldOrientation->setEnabled(_editingEnabled);
+    }
+    if (_comboDirectionFieldScale) {
+        _comboDirectionFieldScale->setEnabled(_editingEnabled);
+    }
+    if (_spinDirectionFieldWeight) {
+        _spinDirectionFieldWeight->setEnabled(_editingEnabled);
     }
     if (_groupMasking) {
         _groupMasking->setEnabled(_editingEnabled);
@@ -1337,10 +1502,41 @@ void SegmentationWidget::restoreSettings()
     setGrowthDirectionMask(storedGrowthDirectionMask);
 
     const int storedGrowthSteps = settings.value(QStringLiteral("segmentation_edit/growth_steps"), _growthSteps).toInt();
-    _growthSteps = std::clamp(storedGrowthSteps, 0, 1024);
-    if (_spinGrowthSteps) {
-        const QSignalBlocker blocker(_spinGrowthSteps);
-        _spinGrowthSteps->setValue(_growthSteps);
+   _growthSteps = std::clamp(storedGrowthSteps, 0, 1024);
+   if (_spinGrowthSteps) {
+       const QSignalBlocker blocker(_spinGrowthSteps);
+       _spinGrowthSteps->setValue(_growthSteps);
+   }
+
+    _directionFieldPath = settings.value(QStringLiteral("segmentation_edit/direction_field_path"), QString()).toString().trimmed();
+    const int storedDirectionOrientation = settings.value(QStringLiteral("segmentation_edit/direction_field_orientation"), static_cast<int>(_directionFieldOrientation)).toInt();
+    _directionFieldOrientation = segmentationDirectionFieldOrientationFromInt(storedDirectionOrientation);
+    const int storedDirectionScale = settings.value(QStringLiteral("segmentation_edit/direction_field_scale"), _directionFieldScale).toInt();
+    _directionFieldScale = std::clamp(storedDirectionScale, 0, 5);
+    const double storedDirectionWeight = settings.value(QStringLiteral("segmentation_edit/direction_field_weight"), _directionFieldWeight).toDouble();
+    _directionFieldWeight = std::clamp(storedDirectionWeight, 0.0, 10.0);
+
+    if (_directionFieldPathEdit) {
+        const QSignalBlocker blocker(_directionFieldPathEdit);
+        _directionFieldPathEdit->setText(_directionFieldPath);
+    }
+    if (_comboDirectionFieldOrientation) {
+        const QSignalBlocker blocker(_comboDirectionFieldOrientation);
+        int idx = _comboDirectionFieldOrientation->findData(static_cast<int>(_directionFieldOrientation));
+        if (idx >= 0) {
+            _comboDirectionFieldOrientation->setCurrentIndex(idx);
+        }
+    }
+    if (_comboDirectionFieldScale) {
+        const QSignalBlocker blocker(_comboDirectionFieldScale);
+        int idx = _comboDirectionFieldScale->findData(_directionFieldScale);
+        if (idx >= 0) {
+            _comboDirectionFieldScale->setCurrentIndex(idx);
+        }
+    }
+    if (_spinDirectionFieldWeight) {
+        const QSignalBlocker blocker(_spinDirectionFieldWeight);
+        _spinDirectionFieldWeight->setValue(_directionFieldWeight);
     }
 
     _correctionsZRangeEnabled = settings.value(QStringLiteral("segmentation_edit/corrections_z_range_enabled"), false).toBool();
@@ -1483,6 +1679,9 @@ void SegmentationWidget::updateGrowthModeUi()
     if (_groupSliceVisibility) {
         _groupSliceVisibility->setVisible(showDetailedControls);
     }
+    if (_groupDirectionField) {
+        _groupDirectionField->setVisible(true);
+    }
 }
 
 void SegmentationWidget::setHandlesLocked(bool locked)
@@ -1574,4 +1773,9 @@ void SegmentationWidget::setNormalGridPathHint(const QString& hint)
     if (_normalGridStatusWidget) {
         _normalGridStatusWidget->setToolTip(hint);
     }
+}
+
+void SegmentationWidget::setVolumePackagePath(const QString& path)
+{
+    _volumePackagePath = path.trimmed();
 }

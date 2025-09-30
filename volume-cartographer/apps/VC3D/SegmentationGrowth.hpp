@@ -81,6 +81,46 @@ inline SegmentationGrowthDirection segmentationGrowthDirectionFromInt(int value)
     }
 }
 
+enum class SegmentationDirectionFieldOrientation {
+    Normal = 0,
+    Horizontal = 1,
+    Vertical = 2,
+};
+
+inline QString segmentationDirectionFieldOrientationKey(SegmentationDirectionFieldOrientation orientation)
+{
+    switch (orientation) {
+    case SegmentationDirectionFieldOrientation::Horizontal:
+        return QStringLiteral("horizontal");
+    case SegmentationDirectionFieldOrientation::Vertical:
+        return QStringLiteral("vertical");
+    case SegmentationDirectionFieldOrientation::Normal:
+    default:
+        return QStringLiteral("normal");
+    }
+}
+
+inline SegmentationDirectionFieldOrientation segmentationDirectionFieldOrientationFromInt(int value)
+{
+    switch (value) {
+    case static_cast<int>(SegmentationDirectionFieldOrientation::Horizontal):
+        return SegmentationDirectionFieldOrientation::Horizontal;
+    case static_cast<int>(SegmentationDirectionFieldOrientation::Vertical):
+        return SegmentationDirectionFieldOrientation::Vertical;
+    default:
+        return SegmentationDirectionFieldOrientation::Normal;
+    }
+}
+
+struct SegmentationDirectionFieldConfig {
+    QString path;
+    SegmentationDirectionFieldOrientation orientation{SegmentationDirectionFieldOrientation::Normal};
+    int scale{0};
+    double weight{1.0};
+
+    [[nodiscard]] bool isValid() const { return !path.isEmpty(); }
+};
+
 struct SegmentationCorrectionsPayload {
     struct Collection {
         uint64_t id{0};
@@ -102,6 +142,7 @@ struct SegmentationGrowthRequest {
     std::vector<SegmentationGrowthDirection> allowedDirections;
     SegmentationCorrectionsPayload corrections;
     std::optional<std::pair<int, int>> correctionsZRange;
+    std::optional<SegmentationDirectionFieldConfig> directionField;
 };
 
 struct TracerGrowthContext {

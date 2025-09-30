@@ -27,6 +27,7 @@
 #include <QSize>
 #include <QVector>
 #include <QLoggingCategory>
+#include <QScrollArea>
 #include <nlohmann/json.hpp>
 #include <QGraphicsSimpleTextItem>
 #include <QPointer>
@@ -723,20 +724,42 @@ void CWindow::CreateWidgets(void)
     ui.dockWidgetOpList->setWidget(wOpsList);
     wOpsSettings = new OpsSettings(ui.dockWidgetOpSettings);
     ui.dockWidgetOpSettings->setWidget(wOpsSettings);
-    
-    // i recognize that having both a seeding widget and a drawing widget that both handle mouse events and paths is redundant, 
+
+    // i recognize that having both a seeding widget and a drawing widget that both handle mouse events and paths is redundant,
     // but i can't find an easy way yet to merge them and maintain the path iteration that the seeding widget currently uses
     // so for now we have both. i suppose i could probably add a 'mode' , but for now i will just hate this section :(
 
+    const auto attachScrollAreaToDock = [](QDockWidget* dock, QWidget* content, const QString& objectName) {
+        if (!dock || !content) {
+            return;
+        }
+
+        auto* container = new QWidget(dock);
+        container->setObjectName(objectName);
+        auto* layout = new QVBoxLayout(container);
+        layout->setContentsMargins(0, 0, 0, 0);
+        layout->setSpacing(0);
+        layout->addWidget(content);
+        layout->addStretch(1);
+
+        auto* scrollArea = new QScrollArea(dock);
+        scrollArea->setWidgetResizable(true);
+        scrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+        scrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+        scrollArea->setWidget(container);
+
+        dock->setWidget(scrollArea);
+    };
+
 
     // Create Segmentation widget
-    _segmentationWidget = new SegmentationWidget(ui.dockWidgetSegmentation);
+    _segmentationWidget = new SegmentationWidget();
     _segmentationWidget->setNormalGridAvailable(_normalGridAvailable);
     const QString initialHint = _normalGridAvailable
         ? tr("Normal grids directory: %1").arg(_normalGridPath)
         : tr("No volume package loaded.");
     _segmentationWidget->setNormalGridPathHint(initialHint);
-    ui.dockWidgetSegmentation->setWidget(_segmentationWidget);
+    attachScrollAreaToDock(ui.dockWidgetSegmentation, _segmentationWidget, QStringLiteral("dockWidgetSegmentationContent"));
 
     _segmentationEdit = std::make_unique<SegmentationEditManager>(this);
     _segmentationOverlay = std::make_unique<SegmentationOverlayController>(_surf_col, this);
@@ -798,8 +821,8 @@ void CWindow::CreateWidgets(void)
     });
 
     // Create Drawing widget
-    _drawingWidget = new DrawingWidget(ui.dockWidgetDrawing);
-    ui.dockWidgetDrawing->setWidget(_drawingWidget);
+    _drawingWidget = new DrawingWidget();
+    attachScrollAreaToDock(ui.dockWidgetDrawing, _drawingWidget, QStringLiteral("dockWidgetDrawingContent"));
 
     connect(this, &CWindow::sendVolumeChanged, _drawingWidget, 
             static_cast<void (DrawingWidget::*)(std::shared_ptr<Volume>, const std::string&)>(&DrawingWidget::onVolumeChanged));
@@ -809,8 +832,8 @@ void CWindow::CreateWidgets(void)
     _drawingWidget->setCache(chunk_cache);
     
     // Create Seeding widget
-    _seedingWidget = new SeedingWidget(_point_collection, _surf_col, ui.dockWidgetDistanceTransform);
-    ui.dockWidgetDistanceTransform->setWidget(_seedingWidget);
+    _seedingWidget = new SeedingWidget(_point_collection, _surf_col);
+    attachScrollAreaToDock(ui.dockWidgetDistanceTransform, _seedingWidget, QStringLiteral("dockWidgetDistanceTransformContent"));
     
     connect(this, &CWindow::sendVolumeChanged, _seedingWidget, 
             static_cast<void (SeedingWidget::*)(std::shared_ptr<Volume>, const std::string&)>(&SeedingWidget::onVolumeChanged));
@@ -1077,6 +1100,7 @@ auto CWindow::InitializeVolumePkg(const std::string& nVpkgPath) -> bool
     updateNormalGridAvailability();
     if (_segmentationWidget) {
         _segmentationWidget->setAvailableVolumes({}, QString());
+        _segmentationWidget->setVolumePackagePath(QString());
     }
 
     try {
@@ -1192,6 +1216,9 @@ void CWindow::OpenVolume(const QString& path)
     }
 
     fVpkgPath = aVpkgPath;
+    if (_segmentationWidget) {
+        _segmentationWidget->setVolumePackagePath(aVpkgPath);
+    }
     setVolume(fVpkg->volume());
     {
         const QSignalBlocker blocker{volSelect};
@@ -1307,6 +1334,7 @@ void CWindow::CloseVolume(void)
     updateNormalGridAvailability();
     if (_segmentationWidget) {
         _segmentationWidget->setAvailableVolumes({}, QString());
+        _segmentationWidget->setVolumePackagePath(QString());
     }
 
     if (_surfacePanel) {
@@ -1925,6 +1953,9 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
     request.steps = steps;
     if (_segmentationWidget) {
         request.allowedDirections = _segmentationWidget->allowedGrowthDirections();
+        if (auto directionField = _segmentationWidget->directionFieldConfig()) {
+            request.directionField = directionField;
+        }
     }
     request.corrections = corrections;
     if (method == SegmentationGrowthMethod::Corrections && _segmentationModule) {
