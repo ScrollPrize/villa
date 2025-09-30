@@ -54,61 +54,12 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SurfaceVoxelizer.hpp"
 #include "vc/core/util/Render.hpp"
-
+#include "vc/core/util/JsonSafe.hpp"
 
 
 
 
 using qga = QGuiApplication;
-
-// ---- JSON helpers (avoid type_error when keys exist but are null/wrong type) ----
-namespace {
-    static inline double json_number_or(const nlohmann::json* m, const char* key, double def) {
-        if (!m || !m->contains(key)) return def;
-        const auto& v = m->at(key);
-        if (v.is_number_float())    return v.get<double>();
-        if (v.is_number_integer())  return static_cast<double>(v.get<int64_t>());
-        if (v.is_string()) {
-            try { return std::stod(v.get<std::string>()); } catch (...) { return def; }
-        }
-        return def;
-    }
-    static inline std::string json_string_or(const nlohmann::json* m, const char* key, const std::string& def) {
-        if (!m || !m->contains(key)) return def;
-        const auto& v = m->at(key);
-        if (v.is_string()) return v.get<std::string>();
-        return def;
-    }
-    static inline nlohmann::json json_tags_or_empty(const nlohmann::json* m) {
-        if (!m || !m->contains("tags")) return nlohmann::json::object();
-        const auto& t = m->at("tags");
-        return t.is_object() ? t : nlohmann::json::object();
-    }
-    static inline bool json_has_tag(const nlohmann::json* m, const char* tag) {
-        auto t = json_tags_or_empty(m); return t.contains(tag);
-    }
-
-    // Derive a single UV sampling scale from metadata.
-    // Prefer "scale"; if absent/invalid, fall back to geometric mean of {sx, sy}.
-    // This factor is multiplicative in length (areas scale with scale^2).
-    static inline double param_scale_from_meta(const nlohmann::json* meta)
-    {
-        if (!meta) return 1.0;
-        double s  = json_number_or(meta, "scale", 1.0);
-        double sx = json_number_or(meta, "sx", s);
-        double sy = json_number_or(meta, "sy", s);
-        if (!std::isfinite(s) || s <= 0.0) {
-            if (std::isfinite(sx) && sx > 0.0 &&
-                std::isfinite(sy) && sy > 0.0) {
-                return std::sqrt(sx * sy);
-            }
-            return 1.0;
-        }
-        return s;
-    }
-
-}
-
 
 // Constructor
 CWindow::CWindow() :
@@ -1697,7 +1648,7 @@ void CWindow::onSurfaceSelected()
             _chkRevisit->setCheckState(Qt::Unchecked);
             _chkInspect->setCheckState(Qt::Unchecked);
             if (_surf->meta) {
-                const auto tags = json_tags_or_empty(_surf->meta);
+                const auto tags = vc::json_safe::tags_or_empty(_surf->meta);
                 if (tags.contains("approved"))  _chkApproved->setCheckState(Qt::Checked);
                 if (tags.contains("defective")) _chkDefective->setCheckState(Qt::Checked);
                 if (tags.contains("reviewed"))  _chkReviewed->setCheckState(Qt::Checked);
@@ -1739,9 +1690,9 @@ void CWindow::FillSurfaceTree()
         item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QVariant(id.c_str()));
 
         // Safe numeric reads
-        const double size = json_number_or(surfMeta->meta, "area_cm2", -1.0);
+        const double size = vc::json_safe::number_or(surfMeta->meta, "area_cm2", -1.0);
         item->setText(2, QString::number(size, 'f', 3));
-        const double cost = json_number_or(surfMeta->meta, "avg_cost", -1.0);
+        const double cost = vc::json_safe::number_or(surfMeta->meta, "avg_cost", -1.0);
         item->setText(3, QString::number(cost, 'f', 3));
         item->setText(4, QString::number(surfMeta->overlapping_str.size()));
         QString timestamp;
@@ -1771,8 +1722,8 @@ void CWindow::UpdateSurfaceTreeIcon(SurfaceTreeWidgetItem *item)
     if (fVpkg) {
         auto surfMeta = fVpkg->getSurface(id);
         if (surfMeta && surfMeta->surface() && surfMeta->surface()->meta) {
-            const bool approved = json_has_tag(surfMeta->surface()->meta, "approved");
-            const bool defective = json_has_tag(surfMeta->surface()->meta, "defective");
+            const bool approved = vc::json_safe::has_tag(surfMeta->surface()->meta, "approved");
+            const bool defective = vc::json_safe::has_tag(surfMeta->surface()->meta, "defective");
             item->updateItemIcon(approved, defective);
         }
     }
@@ -1899,7 +1850,7 @@ void CWindow::onSegFilterChanged(int index)
             if (chkFilterUnreviewed->isChecked()) {
                 auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    const auto tags = json_tags_or_empty(surface->meta);
+                    const auto tags = vc::json_safe::tags_or_empty(surface->meta);
                     show = show && !tags.contains("reviewed");
                 } else {
                     show = show && true;
@@ -1910,7 +1861,7 @@ void CWindow::onSegFilterChanged(int index)
             if (chkFilterRevisit->isChecked()) {
                 auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    const auto tags = json_tags_or_empty(surface->meta);
+                    const auto tags = vc::json_safe::tags_or_empty(surface->meta);
                     show = show && tags.contains("revisit");
                 } else {
                     show = show && false;
@@ -1921,7 +1872,7 @@ void CWindow::onSegFilterChanged(int index)
             if (chkFilterNoExpansion->isChecked()) {
                 auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    const std::string mode = json_string_or(surface->meta, "vc_gsfs_mode", "");
+                    const std::string mode = vc::json_safe::string_or(surface->meta, "vc_gsfs_mode", "");
                     show = show && (mode != "expansion");
                 } else {
                     show = show && true;
@@ -1932,7 +1883,7 @@ void CWindow::onSegFilterChanged(int index)
             if (chkFilterNoDefective->isChecked()) {
                 auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    const auto tags = json_tags_or_empty(surface->meta);
+                    const auto tags = vc::json_safe::tags_or_empty(surface->meta);
                     show = show && !tags.contains("defective");
                 } else {
                     show = show && true;
@@ -1943,7 +1894,7 @@ void CWindow::onSegFilterChanged(int index)
             if (chkFilterPartialReview->isChecked()) {
                 auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    const auto tags = json_tags_or_empty(surface->meta);
+                    const auto tags = vc::json_safe::tags_or_empty(surface->meta);
                     show = show && !tags.contains("partial_review");
                 } else {
                     show = show && true;
@@ -1953,7 +1904,7 @@ void CWindow::onSegFilterChanged(int index)
             if (chkFilterHideUnapproved->isChecked()) {
                 auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    const auto tags = json_tags_or_empty(surface->meta);
+                    const auto tags = vc::json_safe::tags_or_empty(surface->meta);
                     show = show && tags.contains("approved");
                 } else {
                     show = show && false;  // Hide segments without metadata when filter is active
@@ -1962,7 +1913,7 @@ void CWindow::onSegFilterChanged(int index)
             if (chkFilterInspectOnly->isChecked()) {
                 auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    const auto tags = json_tags_or_empty(surface->meta);
+                    const auto tags = vc::json_safe::tags_or_empty(surface->meta);
                     show = show && tags.contains("inspect");
                 } else {
                     show = show && false;  // Hide segments without metadata when filter is active
@@ -2546,9 +2497,9 @@ void CWindow::AddSingleSegmentation(const std::string& segId)
         auto* item = new SurfaceTreeWidgetItem(treeWidgetSurfaces);
         item->setText(SURFACE_ID_COLUMN, QString(segId.c_str()));
         item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QVariant(segId.c_str()));
-        const double size = json_number_or(sm->meta, "area_cm2", -1.0);
+        const double size = vc::json_safe::number_or(sm->meta, "area_cm2", -1.0);
         item->setText(2, QString::number(size, 'f', 3));
-        const double cost = json_number_or(sm->meta, "avg_cost", -1.0);
+        const double cost = vc::json_safe::number_or(sm->meta, "avg_cost", -1.0);
         item->setText(3, QString::number(cost, 'f', 3));
         item->setText(4, QString::number(sm->overlapping_str.size()));
         QString timestamp;
@@ -2727,7 +2678,7 @@ void CWindow::onGenerateReviewReport()
         }
         
         // Get area
-        double area = meta->value("area_cm2", 0.0);
+        double area = vc::json_safe::number_or(meta, "area_cm2", 0.0);
         
         // Aggregate data
         dailyStats[reviewDate][username].totalArea += area;
