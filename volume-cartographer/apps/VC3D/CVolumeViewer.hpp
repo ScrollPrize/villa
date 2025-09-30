@@ -87,6 +87,9 @@ public:
     auto selections() const -> std::vector<std::pair<QRectF, QColor>>;
     std::optional<QRectF> activeBBoxSceneRect() const { return _activeBBoxSceneRect; }
     void clearSelections();
+
+    void setIntersectionOpacity(float opacity);
+    float intersectionOpacity() const { return _intersectionOpacity; }
     
     CVolumeViewerView* fGraphicsView;
 
@@ -186,7 +189,7 @@ protected:
     
     bool _slice_vis_valid = false;
     std::vector<QGraphicsItem*> slice_vis_items; 
-    
+
     std::set<std::string> _intersect_tgts = {"visible_segmentation"};
     std::unordered_map<std::string,std::vector<QGraphicsItem*>> _intersect_items;
     Intersection *_ignore_intersect_change = nullptr;
@@ -194,6 +197,8 @@ protected:
     CSurfaceCollection *_surf_col = nullptr;
     
     VCCollection* _point_collection = nullptr;
+
+    float _intersectionOpacity{1.0f};
     
     // Point interaction state
     uint64_t _highlighted_point_id = 0;

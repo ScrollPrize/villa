@@ -13,6 +13,7 @@
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QSettings>
+#include <algorithm>
 
 ViewerManager::ViewerManager(CSurfaceCollection* surfaces,
                              VCCollection* points,
@@ -83,6 +84,8 @@ CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
     if (_vectorOverlay) {
         _vectorOverlay->attachViewer(viewer);
     }
+
+    viewer->setIntersectionOpacity(_intersectionOpacity);
 
     _viewers.push_back(viewer);
     if (_segmentationModule) {
@@ -161,6 +164,16 @@ void ViewerManager::setVectorOverlay(VectorOverlayController* overlay)
         return;
     }
     _vectorOverlay->bindToViewerManager(this);
+}
+
+void ViewerManager::setIntersectionOpacity(float opacity)
+{
+    _intersectionOpacity = std::clamp(opacity, 0.0f, 1.0f);
+    for (auto* viewer : _viewers) {
+        if (viewer) {
+            viewer->setIntersectionOpacity(_intersectionOpacity);
+        }
+    }
 }
 
 bool ViewerManager::resetDefaultFor(CVolumeViewer* viewer) const

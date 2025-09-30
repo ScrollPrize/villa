@@ -23,6 +23,7 @@ class QComboBox;
 class QGroupBox;
 class QLineEdit;
 class QToolButton;
+class QListWidget;
 
 // SegmentationWidget hosts controls for interactive surface editing
 class SegmentationWidget : public QWidget
@@ -50,7 +51,7 @@ public:
     [[nodiscard]] int maskBrushRadius() const { return _maskBrushRadius; }
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const { return _growthMethod; }
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
-    [[nodiscard]] std::optional<SegmentationDirectionFieldConfig> directionFieldConfig() const;
+    [[nodiscard]] std::vector<SegmentationDirectionFieldConfig> directionFieldConfigs() const;
 
     void setPendingChanges(bool pending);
     void setCorrectionsEnabled(bool enabled);
@@ -136,6 +137,9 @@ private:
     void updateGrowthDirectionMaskFromUi(QCheckBox* changedCheckbox);
     void applyGrowthDirectionMaskToUi();
     static int normalizeGrowthDirectionMask(int mask);
+    void refreshDirectionFieldList();
+    void persistDirectionFields();
+    SegmentationDirectionFieldConfig buildDirectionFieldDraft() const;
     QCheckBox* _chkEditing;
     QLabel* _editingStatus;
     QGroupBox* _groupGrowth;
@@ -162,7 +166,6 @@ private:
     QPushButton* _btnReset;
     QPushButton* _btnStopTools;
     class QComboBox* _comboGrowthMethod;
-    class QComboBox* _comboGrowthDirection;
     QSpinBox* _spinGrowthSteps;
     QPushButton* _btnGrow;
     QCheckBox* _chkGrowthDirUp;
@@ -175,6 +178,9 @@ private:
     QComboBox* _comboDirectionFieldOrientation;
     QComboBox* _comboDirectionFieldScale;
     QDoubleSpinBox* _spinDirectionFieldWeight;
+    QPushButton* _directionFieldAddButton;
+    QPushButton* _directionFieldRemoveButton;
+    QListWidget* _directionFieldList;
     QPushButton* _btnMaskEdit;
     QPushButton* _btnMaskApply;
     QSpinBox* _spinMaskSampling;
@@ -211,12 +217,12 @@ private:
     int _maskSampling = 2;
     int _maskBrushRadius = 3;
     SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Corrections};
-    SegmentationGrowthDirection _growthDirection{SegmentationGrowthDirection::All};
     int _growthSteps{5};
     QString _directionFieldPath;
     SegmentationDirectionFieldOrientation _directionFieldOrientation{SegmentationDirectionFieldOrientation::Normal};
     int _directionFieldScale{0};
     double _directionFieldWeight{1.0};
+    std::vector<SegmentationDirectionFieldConfig> _directionFields;
     QString _volumePackagePath;
     static constexpr int kGrowDirUpBit = 1 << 0;
     static constexpr int kGrowDirDownBit = 1 << 1;

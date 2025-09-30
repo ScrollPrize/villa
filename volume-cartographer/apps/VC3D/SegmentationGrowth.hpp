@@ -142,7 +142,7 @@ struct SegmentationGrowthRequest {
     std::vector<SegmentationGrowthDirection> allowedDirections;
     SegmentationCorrectionsPayload corrections;
     std::optional<std::pair<int, int>> correctionsZRange;
-    std::optional<SegmentationDirectionFieldConfig> directionField;
+    std::vector<SegmentationDirectionFieldConfig> directionFields;
 };
 
 struct TracerGrowthContext {

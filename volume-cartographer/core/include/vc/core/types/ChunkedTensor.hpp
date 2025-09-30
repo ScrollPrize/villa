@@ -638,7 +638,7 @@ struct Chunked3dFloatFromUint8
         // p has zyx ordering!
         p *= _scale;
         cv::Vec3i i{lround(p[0]), lround(p[1]), lround(p[2])};
-        uint8_t x = _x(i) ;
+        uint8_t x = _x.safe_at(i);
         return float{x} / 255.f;
     }
 
@@ -672,9 +672,9 @@ struct Chunked3dVec3fFromUint8
         // Both p and returned vector have zyx ordering!
         p *= _scale;
         cv::Vec3i i{lround(p[0]), lround(p[1]), lround(p[2])};
-        uint8_t x = _x(i) ;
-        uint8_t y = _y(i) ;
-        uint8_t z = _z(i) ;
+        uint8_t x = _x.safe_at(i);
+        uint8_t y = _y.safe_at(i);
+        uint8_t z = _z.safe_at(i);
         return (cv::Vec3f{z, y, x} - cv::Vec3f{128.f, 128.f, 128.f}) / 127.f;
     }
 

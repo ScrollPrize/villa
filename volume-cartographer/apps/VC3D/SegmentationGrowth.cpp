@@ -356,9 +356,13 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
     }
 
     std::vector<DirectionField> directionFields;
-    if (request.directionField && request.directionField->isValid()) {
+    for (const auto& config : request.directionFields) {
+        if (!config.isValid()) {
+            continue;
+        }
+
         QString loadError;
-        if (!appendDirectionField(*request.directionField, context.cache, context.cacheRoot, directionFields, loadError)) {
+        if (!appendDirectionField(config, context.cache, context.cacheRoot, directionFields, loadError)) {
             result.error = loadError;
             return result;
         }
@@ -374,11 +378,19 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         if (request.correctionsZRange) {
             qCInfo(lcSegGrowth) << "  corrections z-range:" << request.correctionsZRange->first << request.correctionsZRange->second;
         }
-        if (!directionFields.empty() && request.directionField) {
-            qCInfo(lcSegGrowth) << "  direction field path:" << request.directionField->path;
-            qCInfo(lcSegGrowth) << "  direction field orientation:" << segmentationDirectionFieldOrientationKey(request.directionField->orientation);
-            qCInfo(lcSegGrowth) << "  direction field scale:" << request.directionField->scale;
-            qCInfo(lcSegGrowth) << "  direction field weight:" << request.directionField->weight;
+        if (!directionFields.empty()) {
+            int idx = 0;
+            for (const auto& config : request.directionFields) {
+                if (!config.isValid()) {
+                    continue;
+                }
+                qCInfo(lcSegGrowth)
+                    << "  direction field[#" << idx << "] path:" << config.path
+                    << "orientation:" << segmentationDirectionFieldOrientationKey(config.orientation)
+                    << "scale:" << config.scale
+                    << "weight:" << config.weight;
+                ++idx;
+            }
         }
         qCInfo(lcSegGrowth) << "  params:" << QString::fromStdString(params.dump());
 

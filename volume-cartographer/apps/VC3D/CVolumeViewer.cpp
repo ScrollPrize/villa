@@ -570,6 +570,18 @@ void CVolumeViewer::setIntersects(const std::set<std::string> &set)
     renderIntersections();
 }
 
+void CVolumeViewer::setIntersectionOpacity(float opacity)
+{
+    _intersectionOpacity = std::clamp(opacity, 0.0f, 1.0f);
+    for (auto& pair : _intersect_items) {
+        for (auto* item : pair.second) {
+            if (item) {
+                item->setOpacity(_intersectionOpacity);
+            }
+        }
+    }
+}
+
 void CVolumeViewer::fitSurfaceInView()
 {
     if (!_surf || !fGraphicsView) {
@@ -1179,6 +1191,7 @@ void CVolumeViewer::renderIntersections()
                     if (last[0] != -1 && cv::norm(p-last) >= 8) {
                         auto item = fGraphicsView->scene()->addPath(path, QPen(col, width));
                         item->setZValue(z_value);
+                        item->setOpacity(_intersectionOpacity);
                         items.push_back(item);
                         first = true;
                     }
@@ -1192,6 +1205,7 @@ void CVolumeViewer::renderIntersections()
                 }
                 auto item = fGraphicsView->scene()->addPath(path, QPen(col, width));
                 item->setZValue(z_value);
+                item->setOpacity(_intersectionOpacity);
                 items.push_back(item);
             }
             _intersect_items[key] = items;
@@ -1255,6 +1269,7 @@ void CVolumeViewer::renderIntersections()
                     if (last[0] != -1 && cv::norm(p-last) >= 8) {
                         auto item = fGraphicsView->scene()->addPath(path, QPen(key == "seg yz" ? COLOR_SEG_YZ: COLOR_SEG_XZ, 2));
                         item->setZValue(5);
+                        item->setOpacity(_intersectionOpacity);
                         items.push_back(item);
                         first = true;
                     }
@@ -1268,6 +1283,7 @@ void CVolumeViewer::renderIntersections()
                 }
                 auto item = fGraphicsView->scene()->addPath(path, QPen(key == "seg yz" ? COLOR_SEG_YZ: COLOR_SEG_XZ, 2));
                 item->setZValue(5);
+                item->setOpacity(_intersectionOpacity);
                 items.push_back(item);
             }
             _intersect_items[key] = items;

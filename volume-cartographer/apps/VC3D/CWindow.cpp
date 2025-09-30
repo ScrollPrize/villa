@@ -953,6 +953,18 @@ void CWindow::CreateWidgets(void)
     connect(btnZoomIn, &QPushButton::clicked, this, &CWindow::onZoomIn);
     connect(btnZoomOut, &QPushButton::clicked, this, &CWindow::onZoomOut);
 
+    auto* spinIntersectionOpacity = ui.spinIntersectionOpacity;
+    connect(spinIntersectionOpacity, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if (!_viewerManager) {
+            return;
+        }
+        const float normalized = std::clamp(value / 100.0f, 0.0f, 1.0f);
+        _viewerManager->setIntersectionOpacity(normalized);
+    });
+    if (_viewerManager) {
+        _viewerManager->setIntersectionOpacity(spinIntersectionOpacity->value() / 100.0f);
+    }
+
     chkAxisAlignedSlices = ui.chkAxisAlignedSlices;
     connect(chkAxisAlignedSlices, &QCheckBox::toggled, this, &CWindow::onAxisAlignedSlicesToggled);
 
@@ -1953,9 +1965,7 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
     request.steps = steps;
     if (_segmentationWidget) {
         request.allowedDirections = _segmentationWidget->allowedGrowthDirections();
-        if (auto directionField = _segmentationWidget->directionFieldConfig()) {
-            request.directionField = directionField;
-        }
+        request.directionFields = _segmentationWidget->directionFieldConfigs();
     }
     request.corrections = corrections;
     if (method == SegmentationGrowthMethod::Corrections && _segmentationModule) {

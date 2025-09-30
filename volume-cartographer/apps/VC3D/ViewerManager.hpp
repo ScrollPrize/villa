@@ -44,6 +44,9 @@ public:
     void setBBoxOverlay(BBoxOverlayController* overlay);
     void setVectorOverlay(VectorOverlayController* overlay);
 
+    void setIntersectionOpacity(float opacity);
+    float intersectionOpacity() const { return _intersectionOpacity; }
+
     bool resetDefaultFor(CVolumeViewer* viewer) const;
     void setResetDefaultFor(CVolumeViewer* viewer, bool value);
 
@@ -65,4 +68,5 @@ private:
     SegmentationModule* _segmentationModule{nullptr};
     std::vector<CVolumeViewer*> _viewers;
     std::unordered_map<CVolumeViewer*, bool> _resetDefaults;
+    float _intersectionOpacity{1.0f};
 };
