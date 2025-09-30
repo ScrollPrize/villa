@@ -18,6 +18,11 @@ import torch
 import concurrent.futures
 from huggingface_hub import snapshot_download
 
+# WebKnossos imports
+from webknossos.dataset import Dataset
+from webknossos.dataset.layer import Layer
+from webknossos.geometry.mag import Mag
+
 from inference_timesformer import (
     RegressionPLModel,
     run_inference,
@@ -40,14 +45,24 @@ class Inputs:
     start_layer: int
     end_layer: int
     force_reverse: bool = False
+    wk_inference: bool = False
+    wk_dataset_id: str = ""
 
 def parse_env() -> Inputs:
     try:
         model_key = os.environ["MODEL"].strip()
-        s3_path = os.environ["S3_PATH"].strip()
+        s3_path = os.getenv("S3_PATH", "").strip()
         start_layer = int(os.environ["START_LAYER"].strip())
         end_layer = int(os.environ["END_LAYER"].strip())
         force_reverse = os.getenv("FORCE_REVERSE", "false").lower() == "true"
+        wk_dataset_id = os.getenv("WK_DATASET_ID", "").strip()
+        
+        # Validate that at least one of s3_path or wk_dataset_id is provided
+        if not s3_path and not wk_dataset_id:
+            raise ValueError("Either S3_PATH or WK_DATASET_ID must be provided")
+        
+        wk_inference = bool(wk_dataset_id)
+        
         if start_layer > end_layer:
             raise ValueError("START_LAYER must be <= END_LAYER")
         return Inputs(
@@ -56,6 +71,8 @@ def parse_env() -> Inputs:
             start_layer=start_layer,
             end_layer=end_layer,
             force_reverse=force_reverse,
+            wk_inference=wk_inference,
+            wk_dataset_id=wk_dataset_id,
         )
     except KeyError as e:
         raise RuntimeError(f"Missing required env var: {e.args[0]}") from e
@@ -241,6 +258,87 @@ def download_model_weights(model_name: str, dest_dir: str, s3_client) -> str:
     return chosen
 
 
+def get_wk_dataset_metadata(wk_dataset_id: str) -> str:
+    """
+    Fetch metadata from WebKnossos dataset and extract s3_path.
+    
+    Args:
+        wk_dataset_id: WebKnossos dataset ID
+        
+    Returns:
+        s3_path extracted from dataset metadata
+        
+    Raises:
+        RuntimeError: If s3_path is not found in metadata
+    """
+    try:
+        logger.info(f"Fetching metadata for WebKnossos dataset: {wk_dataset_id}")
+        dataset = Dataset.open_remote(wk_dataset_id)
+        metadata = dataset.metadata
+        
+        if "s3_path" not in metadata:
+            raise RuntimeError(f"s3_path not found in metadata for dataset {wk_dataset_id}")
+            
+        s3_path = metadata["s3_path"]
+        logger.info(f"Found s3_path in dataset metadata: {s3_path}")
+        return s3_path
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch metadata from WebKnossos dataset {wk_dataset_id}: {e}")
+        raise RuntimeError(f"Failed to fetch WebKnossos dataset metadata: {e}") from e
+
+
+def upload_to_webknossos(wk_dataset_id: str, prediction: np.ndarray, model_key: str, start_layer: int, end_layer: int) -> str:
+    """
+    Upload prediction results to WebKnossos dataset as a new layer.
+    
+    Args:
+        wk_dataset_id: WebKnossos dataset ID
+        prediction: Prediction array to upload
+        model_key: Model identifier for layer naming
+        start_layer: Start layer index
+        end_layer: End layer index
+        
+    Returns:
+        Layer name of uploaded prediction
+    """
+    try:
+        logger.info(f"Uploading prediction to WebKnossos dataset: {wk_dataset_id}")
+        
+        # Open the remote dataset
+        dataset = Dataset.open_remote(wk_dataset_id)
+        
+        # Create layer name
+        layer_name = f"ink_prediction_{model_key}_{start_layer:02d}_{end_layer:02d}"
+        logger.info(f"Creating layer: {layer_name}")
+        
+        # Convert prediction to uint8
+        prediction_uint8 = (np.clip(prediction, 0, 1) * 255).astype(np.uint8)
+        
+        # Add layer to dataset
+        # The prediction is 2D, so we need to add a third dimension for WebKnossos
+        prediction_3d = prediction_uint8[:, :, np.newaxis]
+        
+        layer = dataset.add_layer(
+            layer_name=layer_name,
+            category="segmentation",
+            dtype_per_channel="uint8",
+            num_channels=1,
+            data_format="wkw"
+        )
+        
+        # Write the prediction data
+        with layer.open_mag(Mag(1)) as mag:
+            mag.write(prediction_3d, offset=(0, 0, 0))
+        
+        logger.info(f"Successfully uploaded prediction as layer: {layer_name}")
+        return layer_name
+        
+    except Exception as e:
+        logger.error(f"Failed to upload to WebKnossos: {e}")
+        raise RuntimeError(f"Failed to upload prediction to WebKnossos: {e}") from e
+
+
 def load_model(model_path: str, device: torch.device) -> RegressionPLModel:
     """
     Load and initialize the TimeSformer model.
@@ -305,9 +403,16 @@ def main() -> None:
 
     logger.info("Parsing environment variables for input configuration...")
     inputs = parse_env()
+    
+    # Handle WebKnossos workflow
+    if inputs.wk_inference:
+        logger.info(f"WebKnossos inference mode: fetching metadata for dataset {inputs.wk_dataset_id}")
+        inputs.s3_path = get_wk_dataset_metadata(inputs.wk_dataset_id)
+        logger.info(f"Retrieved s3_path from WebKnossos metadata: {inputs.s3_path}")
+    
     logger.info(
         f"Starting optimized inference with task_id={task_id}, model={inputs.model_key}, s3_path={inputs.s3_path}, "
-        f"layers=[{inputs.start_layer}, {inputs.end_layer}]"
+        f"layers=[{inputs.start_layer}, {inputs.end_layer}], wk_inference={inputs.wk_inference}"
     )
 
     # Prepare I/O directories
@@ -406,14 +511,41 @@ def main() -> None:
     logger.info(f"Inference completed in {time.time() - start_infer_time:.2f} seconds")
 
     # Upload result
-    logger.info("Saving and uploading prediction mask to S3...")
-    result_uri = save_and_upload_prediction(
-        s3_client, bucket, prefix, prediction, inputs.model_key, inputs.start_layer, inputs.end_layer
-    )
-    logger.info(f"Writing result S3 URI to /tmp/result_s3_url.txt: {result_uri}")
-    with open("/tmp/result_s3_url.txt", "w", encoding="utf-8") as f:
-        f.write(result_uri)
-    logger.info(f"Uploaded result to {result_uri}")
+    if inputs.wk_inference:
+        # For WebKnossos inference, upload to both S3 and WebKnossos
+        logger.info("Saving and uploading prediction mask to S3...")
+        result_uri = save_and_upload_prediction(
+            s3_client, bucket, prefix, prediction, inputs.model_key, inputs.start_layer, inputs.end_layer
+        )
+        logger.info(f"Uploaded result to S3: {result_uri}")
+        
+        # Upload to WebKnossos as new layer
+        logger.info("Uploading prediction to WebKnossos dataset...")
+        wk_layer_name = upload_to_webknossos(
+            inputs.wk_dataset_id, prediction, inputs.model_key, inputs.start_layer, inputs.end_layer
+        )
+        logger.info(f"Uploaded prediction to WebKnossos layer: {wk_layer_name}")
+        
+        # Write both results
+        logger.info(f"Writing result S3 URI to /tmp/result_s3_url.txt: {result_uri}")
+        with open("/tmp/result_s3_url.txt", "w", encoding="utf-8") as f:
+            f.write(result_uri)
+        
+        logger.info(f"Writing WebKnossos layer name to /tmp/result_wk_layer.txt: {wk_layer_name}")
+        with open("/tmp/result_wk_layer.txt", "w", encoding="utf-8") as f:
+            f.write(wk_layer_name)
+            
+        logger.info(f"Inference completed successfully - S3: {result_uri}, WebKnossos layer: {wk_layer_name}")
+    else:
+        # Standard S3-only workflow
+        logger.info("Saving and uploading prediction mask to S3...")
+        result_uri = save_and_upload_prediction(
+            s3_client, bucket, prefix, prediction, inputs.model_key, inputs.start_layer, inputs.end_layer
+        )
+        logger.info(f"Writing result S3 URI to /tmp/result_s3_url.txt: {result_uri}")
+        with open("/tmp/result_s3_url.txt", "w", encoding="utf-8") as f:
+            f.write(result_uri)
+        logger.info(f"Uploaded result to {result_uri}")
 
 
 if __name__ == "__main__":
