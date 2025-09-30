@@ -458,8 +458,13 @@ static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_
 
 
 
-int gen_direction_loss(ceres::Problem &problem, const cv::Vec2i &p, const int off_dist, cv::Mat_<uint8_t> &state,
-    cv::Mat_<cv::Vec3d> &loc, std::vector<DirectionField> const &direction_fields)
+int gen_direction_loss(ceres::Problem &problem,
+    const cv::Vec2i &p,
+    const int off_dist,
+    cv::Mat_<uint8_t> &state,
+    cv::Mat_<cv::Vec3d> &loc,
+    std::vector<DirectionField> const &direction_fields,
+    const LossSettings& settings)
 {
     // Add losses saying that the local basis vectors of the patch at loc(p) should match those of the given fields
 
@@ -469,20 +474,26 @@ int gen_direction_loss(ceres::Problem &problem, const cv::Vec2i &p, const int of
     cv::Vec2i const p_off_horz{p[0], p[1] + off_dist};
     cv::Vec2i const p_off_vert{p[0] + off_dist, p[1]};
 
+    const float baseWeight = settings(LossType::DIRECTON, p);
+
     int count = 0;
-    for (auto &field: direction_fields) {
+    for (const auto &field: direction_fields) {
+        const float totalWeight = baseWeight * field.weight;
+        if (totalWeight <= 0.0f) {
+            continue;
+        }
         if (field.direction == "horizontal") {
             if (!loc_valid(state(p_off_horz)))
                 continue;
-            problem.AddResidualBlock(FiberDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), LossType::DIRECTON), nullptr, &loc(p)[0], &loc(p_off_horz)[0]);
+            problem.AddResidualBlock(FiberDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), totalWeight), nullptr, &loc(p)[0], &loc(p_off_horz)[0]);
         } else if (field.direction == "vertical") {
             if (!loc_valid(state(p_off_vert)))
                 continue;
-            problem.AddResidualBlock(FiberDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), LossType::DIRECTON), nullptr, &loc(p)[0], &loc(p_off_vert)[0]);
+            problem.AddResidualBlock(FiberDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), totalWeight), nullptr, &loc(p)[0], &loc(p_off_vert)[0]);
         } else if (field.direction == "normal") {
             if (!loc_valid(state(p_off_horz)) || !loc_valid(state(p_off_vert)))
                 continue;
-            problem.AddResidualBlock(NormalDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), LossType::DIRECTON), nullptr, &loc(p)[0], &loc(p_off_horz)[0], &loc(p_off_vert)[0]);
+            problem.AddResidualBlock(NormalDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), totalWeight), nullptr, &loc(p)[0], &loc(p_off_horz)[0], &loc(p_off_vert)[0]);
         } else {
             assert(false);
         }
@@ -549,8 +560,15 @@ static int add_continuous_losses(ceres::Problem &problem, const cv::Vec2i &p, Tr
     return count;
 }
 
-static int conditional_direction_loss(int bit, const cv::Vec2i &p, const int u_off, cv::Mat_<uint16_t> &loss_status,
-    ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, std::vector<DirectionField> const &direction_fields)
+static int conditional_direction_loss(int bit,
+    const cv::Vec2i &p,
+    const int u_off,
+    cv::Mat_<uint16_t> &loss_status,
+    ceres::Problem &problem,
+    cv::Mat_<uint8_t> &state,
+    cv::Mat_<cv::Vec3d> &loc,
+    const LossSettings& settings,
+    std::vector<DirectionField> const &direction_fields)
 {
     if (!direction_fields.size())
         return 0;
@@ -558,7 +576,7 @@ static int conditional_direction_loss(int bit, const cv::Vec2i &p, const int u_o
     int set = 0;
     cv::Vec2i const off{0, u_off};
     if (!loss_mask(bit, p, off, loss_status))
-        set = set_loss_mask(bit, p, off, loss_status, gen_direction_loss(problem, p, u_off, state, loc, direction_fields));
+        set = set_loss_mask(bit, p, off, loss_status, gen_direction_loss(problem, p, u_off, state, loc, direction_fields, settings));
     return set;
 };
 
@@ -676,8 +694,8 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_dist_loss(5, p, {-1,-1}, loss_status, problem, params, settings);
 
     //normal field
-    count += conditional_direction_loss(9, p, 1, loss_status, problem, params.state, params.dpoints, trace_data.direction_fields);
-    count += conditional_direction_loss(9, p, -1, loss_status, problem, params.state, params.dpoints, trace_data.direction_fields);
+    count += conditional_direction_loss(9, p, 1, loss_status, problem, params.state, params.dpoints, settings, trace_data.direction_fields);
+    count += conditional_direction_loss(9, p, -1, loss_status, problem, params.state, params.dpoints, settings, trace_data.direction_fields);
 
     //gridstore normals
     count += conditional_normal_loss(10, p                   , loss_status, problem, params, trace_data, settings);

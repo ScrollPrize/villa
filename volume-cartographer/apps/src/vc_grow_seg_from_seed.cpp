@@ -10,8 +10,10 @@
 #include "z5/factory.hxx"
 #include <nlohmann/json.hpp>
 #include <boost/program_options.hpp>
- 
+
 #include <omp.h>
+
+#include <algorithm>
  
 namespace po = boost::program_options;
 using shape = z5::types::ShapeType;
@@ -108,10 +110,20 @@ static auto load_direction_fields(json const&params, ChunkCache *chunk_cache, st
                 maybe_weight_ds = z5::filesystem::openDataset(weight_ds_handle);
             }
             std::string const unique_id = std::to_string(std::hash<std::string>{}(dirs_group.path().string() + std::to_string(ome_scale)));
+            float weight = 1.0f;
+            if (direction_field.contains("weight")) {
+                try {
+                    weight = std::clamp(direction_field["weight"].get<float>(), 0.0f, 10.0f);
+                } catch (const std::exception& ex) {
+                    std::cerr << "WARNING: invalid weight for direction field " << zarr_path << ": " << ex.what() << std::endl;
+                }
+            }
+
             direction_fields.emplace_back(
                 direction,
                 std::make_unique<Chunked3dVec3fFromUint8>(std::move(direction_dss), scale_factor, chunk_cache, cache_root, unique_id),
-                maybe_weight_ds ? std::make_unique<Chunked3dFloatFromUint8>(std::move(maybe_weight_ds), scale_factor, chunk_cache, cache_root, unique_id + "_conf") : std::unique_ptr<Chunked3dFloatFromUint8>());
+                maybe_weight_ds ? std::make_unique<Chunked3dFloatFromUint8>(std::move(maybe_weight_ds), scale_factor, chunk_cache, cache_root, unique_id + "_conf") : std::unique_ptr<Chunked3dFloatFromUint8>(),
+                weight);
         }
     }
     return direction_fields;

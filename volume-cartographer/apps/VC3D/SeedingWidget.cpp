@@ -252,7 +252,7 @@ void SeedingWidget::setupUI()
             this, &SeedingWidget::updateParameterPreview);
     
     // Set size policy
-    setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
+    setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
 }
 
 void SeedingWidget::setVolumePkg(std::shared_ptr<VolumePkg> vpkg)

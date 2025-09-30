@@ -1,12 +1,17 @@
 #include "SegmentationGrowth.hpp"
 
 #include <filesystem>
+#include <algorithm>
 #include <cmath>
+#include <functional>
+#include <system_error>
 
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
 #include <QLoggingCategory>
 #include <QString>
+
+#include "z5/factory.hxx"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
@@ -70,6 +75,73 @@ QString directionToString(SegmentationGrowthDirection direction)
     default:
         return QStringLiteral("all");
     }
+}
+
+bool appendDirectionField(const SegmentationDirectionFieldConfig& config,
+                          ChunkCache* cache,
+                          const QString& cacheRoot,
+                          std::vector<DirectionField>& out,
+                          QString& error)
+{
+    if (!cache) {
+        error = QStringLiteral("Direction field loading failed: chunk cache unavailable");
+        return false;
+    }
+
+    if (!config.isValid()) {
+        return true;
+    }
+
+    const QString path = config.path.trimmed();
+    if (path.isEmpty()) {
+        return true;
+    }
+
+    const std::string zarrPath = path.toStdString();
+    std::error_code fsError;
+    if (!std::filesystem::exists(zarrPath, fsError)) {
+        const QString reason = fsError ? QString::fromStdString(fsError.message()) : QString();
+        error = reason.isEmpty()
+            ? QStringLiteral("Direction field directory does not exist: %1").arg(path)
+            : QStringLiteral("Direction field directory error (%1): %2").arg(path, reason);
+        return false;
+    }
+
+    try {
+        z5::filesystem::handle::Group group(zarrPath, z5::FileMode::FileMode::r);
+        const int scaleLevel = std::clamp(config.scale, 0, 5);
+
+        std::vector<std::unique_ptr<z5::Dataset>> datasets;
+        datasets.reserve(3);
+        for (char axis : std::string("xyz")) {
+            z5::filesystem::handle::Group axisGroup(group, std::string(1, axis));
+            z5::filesystem::handle::Dataset datasetHandle(axisGroup, std::to_string(scaleLevel), ".");
+            datasets.push_back(z5::filesystem::openDataset(datasetHandle));
+        }
+
+        const float scaleFactor = std::pow(2.0f, -static_cast<float>(scaleLevel));
+        const std::string uniqueId = std::to_string(std::hash<std::string>{}(zarrPath + std::to_string(scaleLevel)));
+        const std::string cacheRootStr = cacheRoot.toStdString();
+
+        const float weight = static_cast<float>(std::clamp(config.weight, 0.0, 10.0));
+
+        out.emplace_back(segmentationDirectionFieldOrientationKey(config.orientation).toStdString(),
+                         std::make_unique<Chunked3dVec3fFromUint8>(std::move(datasets),
+                                                                   scaleFactor,
+                                                                   cache,
+                                                                   cacheRootStr,
+                                                                   uniqueId),
+                         std::unique_ptr<Chunked3dFloatFromUint8>(),
+                         weight);
+    } catch (const std::exception& ex) {
+        error = QStringLiteral("Failed to load direction field at %1: %2").arg(path, QString::fromStdString(ex.what()));
+        return false;
+    } catch (...) {
+        error = QStringLiteral("Failed to load direction field at %1: unknown error").arg(path);
+        return false;
+    }
+
+    return true;
 }
 
 void populateCorrectionsCollection(const SegmentationCorrectionsPayload& payload, VCCollection& collection)
@@ -283,6 +355,15 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         populateCorrectionsCollection(request.corrections, correctionCollection);
     }
 
+    std::vector<DirectionField> directionFields;
+    if (request.directionField && request.directionField->isValid()) {
+        QString loadError;
+        if (!appendDirectionField(*request.directionField, context.cache, context.cacheRoot, directionFields, loadError)) {
+            result.error = loadError;
+            return result;
+        }
+    }
+
     try {
         qCInfo(lcSegGrowth) << "Calling tracer()";
         qCInfo(lcSegGrowth) << "  cacheRoot:" << context.cacheRoot;
@@ -293,6 +374,12 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         if (request.correctionsZRange) {
             qCInfo(lcSegGrowth) << "  corrections z-range:" << request.correctionsZRange->first << request.correctionsZRange->second;
         }
+        if (!directionFields.empty() && request.directionField) {
+            qCInfo(lcSegGrowth) << "  direction field path:" << request.directionField->path;
+            qCInfo(lcSegGrowth) << "  direction field orientation:" << segmentationDirectionFieldOrientationKey(request.directionField->orientation);
+            qCInfo(lcSegGrowth) << "  direction field scale:" << request.directionField->scale;
+            qCInfo(lcSegGrowth) << "  direction field weight:" << request.directionField->weight;
+        }
         qCInfo(lcSegGrowth) << "  params:" << QString::fromStdString(params.dump());
 
         QuadSurface* surface = tracer(dataset,
@@ -302,7 +389,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                       params,
                                       context.cacheRoot.toStdString(),
                                       static_cast<float>(context.voxelSize),
-                                      {},
+                                      directionFields,
                                       context.resumeSurface,
                                       std::filesystem::path(),
                                       nlohmann::json{},
