@@ -376,6 +376,12 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             # FIXME: should mask instead of skipping (unless zero 'other' points), i.e. don't apply loss on these points
             # FIXME: if the 'missing' point is on the negative side and the relevant _cond is true, then actually we're fine
 
+            # Randomly flip positive and negative directions, as a form of augmentation since they're arbitrary
+            if torch.rand([]) < 0.5:
+                u_pos_shifted_ijs, u_neg_shifted_ijs = u_neg_shifted_ijs, u_pos_shifted_ijs
+            if torch.rand([]) < 0.5:
+                v_pos_shifted_ijs, v_neg_shifted_ijs = v_neg_shifted_ijs, v_pos_shifted_ijs
+
             # Map to 3D space and construct heatmaps
             u_pos_shifted_zyxs = get_zyx_from_patch(u_pos_shifted_ijs, patch)
             u_neg_shifted_zyxs = get_zyx_from_patch(u_neg_shifted_ijs, patch)
