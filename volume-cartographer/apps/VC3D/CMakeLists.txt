@@ -21,31 +21,10 @@ set(srcs
     SeedingWidget.hpp
     DrawingWidget.cpp
     DrawingWidget.hpp
-    SegmentationWidget.cpp
-    SegmentationWidget.hpp
-    SegmentationGrowth.cpp
-    SegmentationEditManager.cpp
-    SegmentationEditManager.hpp
-    overlays/SegmentationOverlayController.cpp
-    overlays/SegmentationOverlayController.hpp
-    overlays/PointsOverlayController.cpp
-    overlays/PointsOverlayController.hpp
-    overlays/BBoxOverlayController.cpp
-    overlays/BBoxOverlayController.hpp
-    overlays/PathsOverlayController.cpp
-    overlays/PathsOverlayController.hpp
-    overlays/VectorOverlayController.cpp
-    overlays/VectorOverlayController.hpp
-    overlays/ViewerOverlayControllerBase.cpp
-    overlays/ViewerOverlayControllerBase.hpp
-    SurfacePanelController.cpp
-    SurfacePanelController.hpp
-    MenuActionController.cpp
-    MenuActionController.hpp
-    SegmentationModule.cpp
-    SegmentationModule.hpp
-    ViewerManager.cpp
-    ViewerManager.hpp
+    PathData.cpp
+    PathData.hpp
+    CSegmentationEditorWindow.cpp
+    CSegmentationEditorWindow.hpp
     SegmentRenderThread.cpp
     SegmentRenderThread.hpp
     ProgressUtil.cpp
@@ -71,7 +50,6 @@ add_executable(VC3D ${srcs} resources.qrc)
 target_link_libraries(VC3D
     vc_core
     vc_ui
-    vc_tracer
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets

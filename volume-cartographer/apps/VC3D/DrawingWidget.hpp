@@ -13,10 +13,7 @@
 #include <QSpinBox>
 #include <opencv2/core.hpp>
 
-#include "overlays/ViewerOverlayControllerBase.hpp"
-
-using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
-using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
+#include "PathData.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Slicing.hpp"
 
@@ -60,7 +57,7 @@ public:
     bool isDrawingModeActive() const { return drawingModeActive; }
     
     /** Get current brush shape */
-    PathBrushShape getBrushShape() const { return brushShape; }
+    PathData::BrushShape getBrushShape() const { return brushShape; }
     
     /** Toggle drawing mode */
     void toggleDrawingMode();
@@ -83,7 +80,7 @@ public slots:
 
 signals:
     /** Emitted when paths change */
-    void sendPathsChanged(const QList<PathPrimitive>& paths);
+    void sendPathsChanged(const QList<PathData>& paths);
     
     /** Emitted to show status messages */
     void sendStatusMessageAvailable(const QString& message, int timeout);
@@ -134,14 +131,14 @@ private:
     bool isValidVolumePoint(const cv::Vec3f& point) const;
     
     /** Process paths to apply eraser operations */
-    QList<PathPrimitive> processPathsWithErasers(const QList<PathPrimitive>& rawPaths) const;
+    QList<PathData> processPathsWithErasers(const QList<PathData>& rawPaths) const;
     
     /** Calculate distance from point to line segment */
     float pointToSegmentDistance(const cv::Vec3f& point, const cv::Vec3f& segStart, const cv::Vec3f& segEnd) const;
     
     /** Check if a point is within eraser brush */
-    bool isPointInEraserBrush(const cv::Vec3f& point, const cv::Vec3f& eraserPoint,
-                              float eraserRadius, PathBrushShape brushShape) const;
+    bool isPointInEraserBrush(const cv::Vec3f& point, const cv::Vec3f& eraserPoint, 
+                              float eraserRadius, PathData::BrushShape brushShape) const;
 
 private:
     // Volume data
@@ -155,11 +152,11 @@ private:
     float brushSize;
     float opacity;
     bool eraserMode;
-    PathBrushShape brushShape;
+    PathData::BrushShape brushShape;
     
     // Path management
-    QList<PathPrimitive> drawnPaths;
-    PathPrimitive currentPath;
+    QList<PathData> drawnPaths;
+    PathData currentPath;
     bool isDrawing;
     cv::Vec3f lastPoint;
     int currentZSlice;
@@ -190,3 +187,5 @@ private:
     QPushButton* clearAllButton;
     QPushButton* saveAsMaskButton;
 };
+
+

@@ -196,12 +196,11 @@ void CVolumeViewerView::mouseMoveEvent(QMouseEvent *event)
         QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
         
         sendCursorMove(scene_loc);
-
-        // Forward mouse move events even without a pressed button so tools that
-        // rely on hover state (e.g. segmentation editing) receive continuous
-        // volume coordinates. Consumers that only care about drags can still
-        // ignore events where no buttons are pressed.
-        sendMouseMove(scene_loc, event->buttons(), event->modifiers());
+        
+        // Also send mouse move event for drawing if left button is pressed
+        if (_left_button_pressed) {
+            sendMouseMove(scene_loc, event->buttons(), event->modifiers());
+        }
     }
     event->ignore();
 }

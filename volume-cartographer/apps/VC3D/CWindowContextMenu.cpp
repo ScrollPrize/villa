@@ -1,6 +1,5 @@
 #include "CWindow.hpp"
 #include "CSurfaceCollection.hpp"
-#include "SurfacePanelController.hpp"
 
 #include <QSettings>
 #include <QMessageBox>
@@ -112,7 +111,6 @@ static QString findFlatboiExecutable()
 
     return {}; // not found
 }
-// ---------------------------------------------------------------------------
 
 
 void CWindow::onRenderSegment(const std::string& segmentId)
@@ -243,13 +241,13 @@ void CWindow::onSlimFlatten(const std::string& segmentId)
         if (flatboiExe.isEmpty()) {
             const QString msg =
                 tr("Could not find the 'flatboi' executable.\n"
-                   "Looked in:\n"
-                   "  • /usr/local/bin/flatboi\n"
-                   "  • /home/builder/vc-dependencies/bin/flatboi\n"
-                   "and on your PATH.\n\n"
-                   "Tip: set an override via:\n"
-                   "  • VC.ini  →  [tools] flatboi_path=/full/path/to/flatboi\n"
-                   "  • or set environment variable FLATBOI=/full/path/to/flatboi");
+                "Looked in:\n"
+                "  • /usr/local/bin/flatboi\n"
+                "  • /home/builder/vc-dependencies/bin/flatboi\n"
+                "and on your PATH.\n\n"
+                "Tip: set an override via:\n"
+                "  • VC.ini  →  [tools] flatboi_path=/full/path/to/flatboi\n"
+                "  • or set environment variable FLATBOI=/full/path/to/flatboi");
             QMessageBox::critical(this, tr("Error"), msg);
             statusBar()->showMessage(tr("SLIM-flatten failed"), 5000);
             return;
@@ -266,11 +264,13 @@ void CWindow::onSlimFlatten(const std::string& segmentId)
 
         if (!QFileInfo::exists(flatObj)) {
             QMessageBox::critical(this, tr("Error"),
-                                  tr("Flattened OBJ was not created:\n%1").arg(flatObj));
+                                tr("Flattened OBJ was not created:\n%1").arg(flatObj));
             statusBar()->showMessage(tr("SLIM-flatten failed"), 5000);
             return;
         }
     }
+
+
 
     // 3) flattened obj -> tifxyz  (IMPORTANT: do NOT pre-create the directory)
     statusBar()->showMessage(tr("Converting flattened OBJ back to TIFXYZ…"), 0);
@@ -604,6 +604,104 @@ bool CWindow::initializeCommandLineRunner()
     }
     return true;
 }
+
+void CWindow::onDeleteSegments(const std::vector<std::string>& segmentIds)
+{
+    if (segmentIds.empty()) {
+        return;
+    }
+
+    // Create confirmation message
+    QString message;
+    if (segmentIds.size() == 1) {
+        message = tr("Are you sure you want to delete segment '%1'?\n\nThis action cannot be undone.")
+                    .arg(QString::fromStdString(segmentIds[0]));
+    } else {
+        message = tr("Are you sure you want to delete %1 segments?\n\nThis action cannot be undone.")
+                    .arg(segmentIds.size());
+    }
+
+    // Show confirmation dialog
+    QMessageBox::StandardButton reply = QMessageBox::question(
+        this, tr("Confirm Deletion"), message,
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+
+    if (reply != QMessageBox::Yes) {
+        return;
+    }
+
+    // Delete each segment
+    int successCount = 0;
+    QStringList failedSegments;
+    bool needsReload = false;
+
+    for (const auto& segmentId : segmentIds) {
+        try {
+            // Use the VolumePkg's removeSegmentation method
+            fVpkg->removeSegmentation(segmentId);
+            successCount++;
+            needsReload = true;
+        } catch (const std::filesystem::filesystem_error& e) {
+            std::cerr << "Failed to delete segment " << segmentId << ": " << e.what() << std::endl;
+
+            // Check if it's a permission error
+            if (e.code() == std::errc::permission_denied) {
+                failedSegments << QString::fromStdString(segmentId) + " (permission denied)";
+            } else {
+                failedSegments << QString::fromStdString(segmentId) + " (filesystem error)";
+            }
+        } catch (const std::exception& e) {
+            failedSegments << QString::fromStdString(segmentId);
+            std::cerr << "Failed to delete segment " << segmentId << ": " << e.what() << std::endl;
+        }
+    }
+
+    // Only update UI if we successfully deleted something
+    if (needsReload) {
+        try {
+            // Use incremental removal to update the UI for each successfully deleted segment
+            for (const auto& segmentId : segmentIds) {
+                // Only remove from UI if it was successfully deleted from disk
+                if (std::find(failedSegments.begin(), failedSegments.end(),
+                            QString::fromStdString(segmentId)) == failedSegments.end() &&
+                    std::find(failedSegments.begin(), failedSegments.end(),
+                            QString::fromStdString(segmentId) + " (permission denied)") == failedSegments.end() &&
+                    std::find(failedSegments.begin(), failedSegments.end(),
+                            QString::fromStdString(segmentId) + " (filesystem error)") == failedSegments.end()) {
+                    RemoveSingleSegmentation(segmentId);
+                }
+            }
+
+            // Update the volpkg label and filters
+            UpdateVolpkgLabel(0);
+            onSegFilterChanged(0);
+        } catch (const std::exception& e) {
+            std::cerr << "Error updating UI after deletion: " << e.what() << std::endl;
+            QMessageBox::warning(this, tr("Warning"),
+                               tr("Segments were deleted but there was an error refreshing the list. "
+                                  "Please reload surfaces manually."));
+        }
+    }
+
+    // Show result message
+    if (successCount == segmentIds.size()) {
+        statusBar()->showMessage(tr("Successfully deleted %1 segment(s)").arg(successCount), 5000);
+    } else if (successCount > 0) {
+        QMessageBox::warning(this, tr("Partial Success"),
+            tr("Deleted %1 segment(s), but failed to delete: %2\n\n"
+               "Note: Permission errors may require manual deletion or running with elevated privileges.")
+            .arg(successCount)
+            .arg(failedSegments.join(", ")));
+    } else {
+        QMessageBox::critical(this, tr("Deletion Failed"),
+            tr("Failed to delete any segments.\n\n"
+               "Failed segments: %1\n\n"
+               "This may be due to insufficient permissions. "
+               "Try running the application with elevated privileges or manually delete the folders.")
+            .arg(failedSegments.join(", ")));
+    }
+}
+
 
 void CWindow::onAWSUpload(const std::string& segmentId)
 {

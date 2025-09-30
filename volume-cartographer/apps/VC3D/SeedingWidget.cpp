@@ -24,10 +24,6 @@
 #include <algorithm>
 #include <functional>
 
-using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
-using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
-using PathRenderMode = ViewerOverlayControllerBase::PathRenderMode;
-
 
 
 
@@ -46,8 +42,6 @@ SeedingWidget::SeedingWidget(VCCollection* point_collection, CSurfaceCollection*
     , _point_collection(point_collection)
     , _surface_collection(surface_collection)
 {
-    qRegisterMetaType<PathPrimitive>("PathPrimitive");
-    qRegisterMetaType<QList<PathPrimitive>>("QList<PathPrimitive>");
     setupUI();
 
     if (_point_collection) {
@@ -252,7 +246,7 @@ void SeedingWidget::setupUI()
             this, &SeedingWidget::updateParameterPreview);
     
     // Set size policy
-    setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+    setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
 }
 
 void SeedingWidget::setVolumePkg(std::shared_ptr<VolumePkg> vpkg)
@@ -929,14 +923,14 @@ void SeedingWidget::analyzePaths()
         5000);
 }
 
-void SeedingWidget::findPeaksAlongPath(const PathPrimitive& path)
+void SeedingWidget::findPeaksAlongPath(const PathData& path)
 {
     if (!currentVolume || path.points.empty()) {
         return;
     }
     
     // densify the path so we don't skip over small surfaces when drawing 
-    PathPrimitive densifiedPath = path.densify(0.5f); // Sample every 0.5 pixels
+    PathData densifiedPath = path.densify(0.5f); // Sample every 0.5 pixels
     
     // Get volume dimensions for bounds checking
     const int width = currentVolume->sliceWidth();
@@ -1046,14 +1040,7 @@ void SeedingWidget::startDrawing(cv::Vec3f startPoint)
     currentPath.points.clear();
     currentPath.points.push_back(startPoint);
     currentPath.color = generatePathColor();
-    currentPath.lineWidth = 2.0f;
-    currentPath.opacity = 1.0f;
-    currentPath.isEraser = false;
-    currentPath.brushShape = PathBrushShape::Circle;
-    currentPath.renderMode = PathRenderMode::LineStrip;
-    currentPath.pointRadius = 2.5f;
-    currentPath.z = 25.0;
-
+    
     // Show temporary path
     displayPaths();
 }
@@ -1142,13 +1129,13 @@ void SeedingWidget::finalizePathLabelWraps(bool shiftHeld)
     updateButtonStates();
 }
 
-void SeedingWidget::findPeaksAlongPathToCollection(const PathPrimitive& path, const std::string& collectionName)
+void SeedingWidget::findPeaksAlongPathToCollection(const PathData& path, const std::string& collectionName)
 {
     if (!currentVolume || path.points.empty()) {
         return;
     }
 
-    PathPrimitive densifiedPath = path.densify(0.5f);
+    PathData densifiedPath = path.densify(0.5f);
 
     const int width = currentVolume->sliceWidth();
     const int height = currentVolume->sliceHeight();
@@ -1252,7 +1239,7 @@ QColor SeedingWidget::generatePathColor()
 void SeedingWidget::displayPaths()
 {
     // Prepare the list of paths to send
-    QList<PathPrimitive> allPaths = paths;
+    QList<PathData> allPaths = paths;
     
     // Add the current drawing path if we're actively drawing
     if (isDrawing && !currentPath.points.empty()) {
@@ -1557,3 +1544,5 @@ void SeedingWidget::onSurfacesLoaded()
     // Update button states when surfaces are loaded/reloaded
     updateButtonStates();
 }
+
+
