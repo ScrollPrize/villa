@@ -168,7 +168,7 @@ def train(config_path):
                         x[:, x.shape[1] // 2, x.shape[2] // 2 + 2 : x.shape[2] // 2 + 8, :] = red
                         return x
                     def inputs_slice(dim):
-                        return overlay_crosshair(inputs[:, 0].select(dim=dim + 1, index=inputs.shape[(dim + 1)] // 2)[..., None].expand(-1, -1, -1, 3) * 0.5 + 0.5)
+                        return overlay_crosshair(inputs[:, 0].select(dim=dim + 1, index=inputs.shape[(dim + 2)] // 2)[..., None].expand(-1, -1, -1, 3) * 0.5 + 0.5)
                     def projections(x):
                         x = torch.cat([inputs[:, 2:4], x], dim=1)
                         coloured = x[..., None] * colours_by_step[None, :, None, None, None, :]
