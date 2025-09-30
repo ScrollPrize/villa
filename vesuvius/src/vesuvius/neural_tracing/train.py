@@ -216,6 +216,9 @@ def train(config_path):
         if wandb.run is not None:
             wandb.log(wandb_log)
 
+        if iteration == config['num_iterations']:
+            break
+
 
 if __name__ == '__main__':
     train()
