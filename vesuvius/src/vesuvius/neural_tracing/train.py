@@ -13,14 +13,14 @@ from einops import rearrange
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 
-from dataset import PatchInCubeDataset, HeatmapDataset
+from dataset import PatchInCubeDataset, HeatmapDataset, HeatmapDatasetV2
 from vesuvius_unet3d import Vesuvius3dUnetModel
 from song_unet3d import SongUnet3dModel
 from sampling import sample_ddim
 
 
 def prepare_batch(batch, noise_scheduler, generative, cfg_uncond_prob):
-    clean_heatmaps = batch['uv_heatmaps']
+    clean_heatmaps = batch['uv_heatmaps_out']
     if generative:
         # FIXME: should use non-uniform timestep distribution
         timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, size=[clean_heatmaps.shape[0]], device=clean_heatmaps.device).long()
@@ -42,8 +42,10 @@ def prepare_batch(batch, noise_scheduler, generative, cfg_uncond_prob):
     inputs = torch.cat([
         batch['volume'].unsqueeze(1) * conditioning_mask,
         batch['localiser'].unsqueeze(1) * conditioning_mask,  # TODO: should this one be removed for cfg?
-        rearrange(noisy_heatmaps, 'b z y x c -> b c z y x')
-    ], dim=1)
+        rearrange(batch['uv_heatmaps_in'], 'b z y x c -> b c z y x') * conditioning_mask,  # TODO: what about this one? it's already randomly dropped 'intrinsically'
+    ] + (
+        [rearrange(noisy_heatmaps, 'b z y x c -> b c z y x')] if generative else []
+    ), dim=1)
     targets = rearrange(targets, 'b z y x c -> b c z y x')
     return timesteps, inputs, targets
 
@@ -72,16 +74,16 @@ def train(config_path):
         wandb.init(project=config['wandb_project'], entity=config.get('wandb_entity', None), config=config)
 
     if config['representation'] == 'heatmap':
-        dataset = HeatmapDataset(config)
+        dataset = HeatmapDatasetV2(config)
     else:
         dataset = PatchInCubeDataset(config)
     train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config['batch_size'], num_workers=config['num_workers'])
 
-    # model = Vesuvius3dUnetModel(in_channels=8, out_channels=6, config=config)
+    # model = Vesuvius3dUnetModel(in_channels=4, out_channels=config['step_count'] * 2, config=config)
     model = SongUnet3dModel(
         img_resolution=config['crop_size'],
-        in_channels=8,
-        out_channels=6,
+        in_channels=4,
+        out_channels=config['step_count'] * 2,
         model_channels=32,
         channel_mult=[1, 2, 4, 8],
         num_blocks=2,  # 4
@@ -155,7 +157,8 @@ def train(config_path):
                     canvas = (canvas * 0.5 + 0.5).clip(0, 1) * canvas_mask
                     canvas = rearrange(canvas[:, :, canvas.shape[2] // 2], 'b uvw y x v -> (b y) (v x) uvw')
                 else:
-                    colours_by_step = torch.rand([targets.shape[1], 3], device=inputs.device) * 0.8 + 0.2
+                    colours_by_step = torch.rand([targets.shape[1], 3], device=inputs.device) * 0.7 + 0.2
+                    colours_by_step = torch.cat([torch.ones([2, 3], device=inputs.device), colours_by_step], dim=0)  # white for conditioning points
                     def overlay_crosshair(x):
                         x = x.clone()
                         red = torch.tensor([0.8, 0, 0], device=x.device)
@@ -167,12 +170,12 @@ def train(config_path):
                     def inputs_slice(dim):
                         return overlay_crosshair(inputs[:, 0].select(dim=dim + 1, index=inputs.shape[(dim + 1)] // 2)[..., None].expand(-1, -1, -1, 3) * 0.5 + 0.5)
                     def projections(x):
+                        x = torch.cat([inputs[:, 2:4], x], dim=1)
                         coloured = x[..., None] * colours_by_step[None, :, None, None, None, :]
-                        return torch.cat([coloured.amax(dim=(1, dim + 2)) for dim in range(3)], dim=1)
+                        return torch.cat([overlay_crosshair(coloured.amax(dim=(1, dim + 2))) for dim in range(3)], dim=1)
 
                     canvas = torch.stack([
                         torch.cat([inputs_slice(dim) for dim in range(3)], dim=1),
-                        projections(inputs[:, 2:]),
                         projections(F.sigmoid(target_pred)),
                         projections(targets),
                     ], dim=-1)

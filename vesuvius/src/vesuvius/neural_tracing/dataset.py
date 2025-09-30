@@ -326,6 +326,113 @@ class HeatmapDataset(torch.utils.data.IterableDataset):
             }
 
 
+class HeatmapDatasetV2(torch.utils.data.IterableDataset):
+
+    def __init__(self, config):
+        self._config = config
+        self._patches = load_datasets(config)
+        self._augmentations = augmentation.get_training_augmentations(config['crop_size'], config['augmentation']['no_spatial'], config['augmentation']['only_spatial_and_intensity'])
+
+    def __iter__(self):
+
+        areas = torch.tensor([patch.area for patch in self._patches])
+        area_weights = areas / areas.sum()
+        crop_size = torch.tensor(self._config['crop_size'])
+        step_size = torch.tensor(self._config['step_size'])
+        step_count = torch.tensor(self._config['step_count'])
+
+        while True:
+            patch = random.choices(self._patches, weights=area_weights)[0]
+
+            # Sample a random valid quad in the patch, then a point in that quad
+            random_idx = torch.randint(len(patch.valid_indices) - 1, size=[])
+            start_quad_ij = patch.valid_indices[random_idx]
+            center_ij = start_quad_ij + torch.rand(size=[2])
+            center_zyx = get_zyx_from_patch(center_ij, patch)
+
+            # Crop ROI out of the volume
+            volume_crop, min_corner_zyx = get_crop_from_volume(patch.volume, center_zyx, crop_size)
+
+            # Sample rows of points along U & V axes
+            uv_deltas = torch.arange(1, step_count + 1)[:, None] * step_size * patch.scale
+            u_pos_shifted_ijs = center_ij + uv_deltas * torch.tensor([1, 0])
+            u_neg_shifted_ijs = center_ij - uv_deltas * torch.tensor([1, 0])
+            v_pos_shifted_ijs = center_ij + uv_deltas * torch.tensor([0, 1])
+            v_neg_shifted_ijs = center_ij - uv_deltas * torch.tensor([0, 1])
+
+            # Check all points lie inside the patch
+            if torch.any(u_pos_shifted_ijs < 0) or torch.any(u_pos_shifted_ijs >= torch.tensor(patch.valid_mask.shape[:2])):
+                continue
+            if torch.any(v_pos_shifted_ijs < 0) or torch.any(v_pos_shifted_ijs >= torch.tensor(patch.valid_mask.shape[:2])):
+                continue
+            if not patch.valid_mask[*u_pos_shifted_ijs.int().T].all() or not patch.valid_mask[*v_pos_shifted_ijs.int().T].all():
+                continue
+            if torch.any(u_neg_shifted_ijs < 0) or torch.any(u_neg_shifted_ijs >= torch.tensor(patch.valid_mask.shape[:2])):
+                continue
+            if torch.any(v_neg_shifted_ijs < 0) or torch.any(v_neg_shifted_ijs >= torch.tensor(patch.valid_mask.shape[:2])):
+                continue
+            if not patch.valid_mask[*u_neg_shifted_ijs.int().T].all() or not patch.valid_mask[*v_neg_shifted_ijs.int().T].all():
+                continue
+            # FIXME: should mask instead of skipping (unless zero 'other' points), i.e. don't apply loss on these points
+            # FIXME: if the 'missing' point is on the negative side and the relevant _cond is true, then actually we're fine
+
+            # Map to 3D space and construct heatmaps
+            u_pos_shifted_zyxs = get_zyx_from_patch(u_pos_shifted_ijs, patch)
+            u_neg_shifted_zyxs = get_zyx_from_patch(u_neg_shifted_ijs, patch)
+            v_pos_shifted_zyxs = get_zyx_from_patch(v_pos_shifted_ijs, patch)
+            v_neg_shifted_zyxs = get_zyx_from_patch(v_neg_shifted_ijs, patch)
+
+            def make_in_out_heatmaps(pos_shifted_zyxs, neg_shifted_zyxs):
+                cond = torch.rand([]) < 0.8
+                if True:
+                    # Conditioning on this direction: include one negative point as input, and all positive as output
+                    in_heatmaps = make_heatmaps([neg_shifted_zyxs[:1]], min_corner_zyx, crop_size)
+                    out_heatmaps = make_heatmaps([pos_shifted_zyxs], min_corner_zyx, crop_size)
+                else:
+                    # Not conditioning on this direction: include all positive and negative points as output, and nothing as input
+                    in_heatmaps = torch.zeros([1, crop_size, crop_size, crop_size])
+                    out_heatmaps = make_heatmaps([pos_shifted_zyxs, neg_shifted_zyxs], min_corner_zyx, crop_size)
+                return in_heatmaps, out_heatmaps
+
+            # *_in_heatmaps always have a single plane, either the first negative point or empty
+            # *_out_heatmaps always have one plane per step, and may contain only positive or both positive and negative points
+            u_in_heatmaps, u_out_heatmaps = make_in_out_heatmaps(u_pos_shifted_zyxs, u_neg_shifted_zyxs)
+            v_in_heatmaps, v_out_heatmaps = make_in_out_heatmaps(v_pos_shifted_zyxs, v_neg_shifted_zyxs)
+            uv_heatmaps_both = torch.cat([u_in_heatmaps, v_in_heatmaps, u_out_heatmaps, v_out_heatmaps], dim=0)
+
+            # Build localiser volume
+            localiser = build_localiser(center_zyx, min_corner_zyx, crop_size)
+
+            #TODO: include full 2d slices for additional context
+            #  if so, need to augment them consistently with the 3d crop -> tricky for geometric transforms
+
+            # FIXME: the loop is a hack because some augmentation sometimes randomly returns None
+            #  we should instead just remove the relevant augmentation (or fix it!)
+            # TODO: consider interaction of augmentation with localiser -- logically should follow translations of
+            #  the center-point, since the heatmaps do, but not follow rotations/scales; however in practice maybe
+            #  ok since it's 'just more augmentation' that won't be applied during tracing
+            while True:
+                augmented = self._augmentations(image=volume_crop[None], dist_map=localiser[None], regression_target=uv_heatmaps_both)
+                if augmented['dist_map'] is not None:
+                    break
+            volume_crop = augmented['image'].squeeze(0)
+            localiser = augmented['dist_map'].squeeze(0)
+            uv_heatmaps_both = rearrange(augmented['regression_target'], 'c z y x -> z y x c')
+            if torch.any(torch.isnan(volume_crop)) or torch.any(torch.isnan(localiser)) or torch.any(torch.isnan(uv_heatmaps_both)):
+                # FIXME: why do these NaNs happen occasionally?
+                continue
+
+            uv_heatmaps_in = uv_heatmaps_both[..., :2]
+            uv_heatmaps_out = uv_heatmaps_both[..., 2:]
+
+            yield {
+                'volume': volume_crop,
+                'localiser': localiser,
+                'uv_heatmaps_in': uv_heatmaps_in,
+                'uv_heatmaps_out': uv_heatmaps_out,
+            }
+
+
 class PatchWithCubeDataset(torch.utils.data.IterableDataset):
 
     def __init__(self, config):
