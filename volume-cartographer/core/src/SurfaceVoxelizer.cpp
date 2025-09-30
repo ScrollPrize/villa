@@ -12,6 +12,7 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <ctime>
 #include <omp.h>
 
 
@@ -152,11 +153,23 @@ void SurfaceVoxelizer::voxelizeSurfaces(
     attrs["voxel_size"] = volumeInfo.voxelSize;
     attrs["volume_dimensions"] = {nx, ny, nz};
 
-    // Get current time as ISO string
-    auto now = std::chrono::system_clock::now();
-    auto time_t = std::chrono::system_clock::to_time_t(now);
-    std::stringstream ss;
-    ss << std::put_time(std::gmtime(&time_t), "%Y-%m-%dT%H:%M:%SZ");
+    // Get current time as ISO 8601 UTC (thread-safe)
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t tt = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#if defined(_WIN32)
+    // Windows: errno_t gmtime_s(struct tm* _Tm, const time_t* _Time)
+    if (::gmtime_s(&tm, &tt) != 0) {
+        throw std::runtime_error("gmtime_s failed");
+    }
+#else
+    // POSIX: struct tm* gmtime_r(const time_t* timep, struct tm* result)
+    if (::gmtime_r(&tt, &tm) == nullptr) {
+        throw std::runtime_error("gmtime_r failed");
+    }
+#endif
+    std::ostringstream ss;
+    ss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
     attrs["created"] = ss.str();
 
     z5::writeAttributes(zarrFile, attrs);
