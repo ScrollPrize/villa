@@ -54,6 +54,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SurfaceVoxelizer.hpp"
 #include "vc/core/util/Render.hpp"
+#include "vc/core/util/Filesystem.hpp"
 
 
 
@@ -257,12 +258,19 @@ CWindow::CWindow() :
         }
     });
 
+    _watchTimer = new QTimer(this);
+    connect(_watchTimer, &QTimer::timeout, this, &CWindow::onWatchTimerTimeout);
+    startWatchingDirectory(create_temp_directory());
+
     appInitComplete = true;
 }
 
 // Destructor
 CWindow::~CWindow(void)
 {
+    stopWatchingDirectory();
+    delete _watchTimer;
+
     setStatusBar(nullptr);
 
     CloseVolume();
@@ -3459,4 +3467,249 @@ void CWindow::onImportObjAsPatches()
     }
 
     QMessageBox::information(this, tr("Import Results"), message);
+}
+
+void CWindow::startWatchingDirectory(const std::filesystem::path& watchDir)
+{
+    if (watchDir.empty()) {
+        std::cout << "Cannot start watching: empty directory path" << std::endl;
+        return;
+    }
+
+    std::cout << "watching dir: " << watchDir.string() << std::endl;
+
+
+    // Create directory if it doesn't exist
+    if (!std::filesystem::exists(watchDir)) {
+        try {
+            std::filesystem::create_directories(watchDir);
+        } catch (const std::exception& e) {
+            Logger()->error("Failed to create watch directory {}: {}",
+                          watchDir.string(), e.what());
+            return;
+        }
+    }
+
+    _watchDir = watchDir;
+    _watchingEnabled = true;
+
+    // Start timer with 1 second interval
+    _watchTimer->start(1000);
+
+    std::cout << "Started watching directory: " << watchDir;
+}
+
+void CWindow::stopWatchingDirectory()
+{
+    if (_watchingEnabled) {
+        _watchTimer->stop();
+        _watchingEnabled = false;
+        Logger()->info("Stopped watching directory");
+    }
+}
+
+void CWindow::onWatchTimerTimeout()
+{
+    if (!_watchingEnabled || _watchDir.empty() || !fVpkg) {
+        return;
+    }
+
+    checkWatchDirectory();
+}
+
+void CWindow::checkWatchDirectory()
+{
+    try {
+        // Check if watch directory still exists
+        if (!std::filesystem::exists(_watchDir)) {
+            Logger()->warn("Watch directory no longer exists: {}", _watchDir.string());
+            return;
+        }
+
+        // Process all files in the watch directory
+        for (const auto& entry : std::filesystem::directory_iterator(_watchDir)) {
+            std::cout << "deleting " << entry << std::endl;
+            if (entry.is_regular_file()) {
+                processWatchFile(entry.path());
+            }
+        }
+    } catch (const std::exception& e) {
+        Logger()->error("Error checking watch directory: {}", e.what());
+    }
+}
+
+void CWindow::processWatchFile(const std::filesystem::path& filePath)
+{
+    try {
+        // Get the filename (without extension)
+        std::string segmentId = filePath.stem().string();
+
+        // Determine the full path to the segment
+        std::filesystem::path segmentPath = std::filesystem::path(fVpkg->getVolpkgDirectory())
+                                           / fVpkg->getSegmentationDirectory()
+                                           / segmentId;
+
+        bool segmentExistsOnDisk = std::filesystem::exists(segmentPath) &&
+                                   std::filesystem::is_directory(segmentPath);
+        bool segmentLoadedInMemory = fVpkg->isSurfaceLoaded(segmentId);
+
+        // Determine operation based on file naming or existence
+        enum Operation { ADD, REMOVE, RELOAD, SKIP };
+        Operation op;
+
+        // You can use filename suffixes for explicit operations:
+        // "segmentId.add", "segmentId.remove", "segmentId.reload"
+        std::string filename = filePath.filename().string();
+        if (filename.find(".add") != std::string::npos) {
+            op = ADD;
+            segmentId = filename.substr(0, filename.find(".add"));
+        } else if (filename.find(".remove") != std::string::npos) {
+            op = REMOVE;
+            segmentId = filename.substr(0, filename.find(".remove"));
+        } else if (filename.find(".reload") != std::string::npos) {
+            op = RELOAD;
+            segmentId = filename.substr(0, filename.find(".reload"));
+        } else {
+            // Infer operation from state
+            if (segmentExistsOnDisk && !segmentLoadedInMemory) {
+                op = ADD;
+            } else if (!segmentExistsOnDisk && segmentLoadedInMemory) {
+                op = REMOVE;
+            } else if (segmentExistsOnDisk && segmentLoadedInMemory) {
+                op = RELOAD;
+            } else {
+                op = SKIP;
+            }
+        }
+
+        if (op == SKIP) {
+            Logger()->debug("Skipping watch file {} - segment not relevant", segmentId);
+            std::filesystem::remove(filePath);
+            return;
+        }
+
+        Logger()->info("Processing watch file for segment {}: {}",
+                      segmentId,
+                      op == ADD ? "ADD" : (op == REMOVE ? "REMOVE" : "RELOAD"));
+
+        bool success = false;
+
+        // Perform the operation using VolumePkg's single-segment methods
+        switch (op) {
+            case ADD:
+                // Add to VolumePkg
+                success = fVpkg->addSingleSegmentation(segmentId);
+                if (success) {
+                    // Load surface and add to UI
+                    auto surfMeta = fVpkg->loadSurface(segmentId);
+                    if (surfMeta) {
+                        // Add to surface collection
+                        _surf_col->setSurface(segmentId, surfMeta->surface(), true);
+
+                        // Add to tree widget
+                        auto* item = new SurfaceTreeWidgetItem(treeWidgetSurfaces);
+                        item->setText(SURFACE_ID_COLUMN, QString(segmentId.c_str()));
+                        item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QVariant(segmentId.c_str()));
+                        double size = surfMeta->meta->value("area_cm2", -1.f);
+                        item->setText(2, QString::number(size, 'f', 3));
+                        double cost = surfMeta->meta->value("avg_cost", -1.f);
+                        item->setText(3, QString::number(cost, 'f', 3));
+                        item->setText(4, QString::number(surfMeta->overlapping_str.size()));
+                        QString timestamp;
+                        if (surfMeta->meta && surfMeta->meta->contains("date_last_modified")) {
+                            timestamp = QString::fromStdString((*surfMeta->meta)["date_last_modified"].get<std::string>());
+                        }
+                        item->setText(5, timestamp);
+                        UpdateSurfaceTreeIcon(item);
+
+                        statusBar()->showMessage(tr("Added segment: %1")
+                                               .arg(QString::fromStdString(segmentId)), 2000);
+                    }
+                }
+                break;
+
+            case REMOVE:
+                // Remove from UI first
+                RemoveSingleSegmentation(segmentId);
+                // Then remove from VolumePkg
+                success = fVpkg->removeSingleSegmentation(segmentId);
+                if (success) {
+                    statusBar()->showMessage(tr("Removed segment: %1")
+                                           .arg(QString::fromStdString(segmentId)), 2000);
+                }
+                break;
+
+            case RELOAD:
+                // Reload in VolumePkg
+                success = fVpkg->reloadSingleSegmentation(segmentId);
+                if (success) {
+                    // Update UI by removing and re-adding
+                    RemoveSingleSegmentation(segmentId);
+
+                    // Re-load and add to UI
+                    auto surfMeta = fVpkg->loadSurface(segmentId);
+                    if (surfMeta) {
+                        // Add to surface collection
+                        _surf_col->setSurface(segmentId, surfMeta->surface(), true);
+
+                        // Add to tree widget
+                        auto* item = new SurfaceTreeWidgetItem(treeWidgetSurfaces);
+                        item->setText(SURFACE_ID_COLUMN, QString(segmentId.c_str()));
+                        item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QVariant(segmentId.c_str()));
+                        double size = surfMeta->meta->value("area_cm2", -1.f);
+                        item->setText(2, QString::number(size, 'f', 3));
+                        double cost = surfMeta->meta->value("avg_cost", -1.f);
+                        item->setText(3, QString::number(cost, 'f', 3));
+                        item->setText(4, QString::number(surfMeta->overlapping_str.size()));
+                        QString timestamp;
+                        if (surfMeta->meta && surfMeta->meta->contains("date_last_modified")) {
+                            timestamp = QString::fromStdString((*surfMeta->meta)["date_last_modified"].get<std::string>());
+                        }
+                        item->setText(5, timestamp);
+                        UpdateSurfaceTreeIcon(item);
+
+                        statusBar()->showMessage(tr("Reloaded segment: %1")
+                                               .arg(QString::fromStdString(segmentId)), 2000);
+                    }
+                }
+                break;
+
+            case SKIP:
+                break;
+        }
+
+        if (!success && op != SKIP) {
+            Logger()->warn("Operation failed for segment {}", segmentId);
+        }
+
+        // Update filter to refresh views
+        onSegFilterChanged(0);
+
+        // Delete the signal file
+        std::filesystem::remove(filePath);
+
+    } catch (const std::exception& e) {
+        Logger()->error("Error processing watch file {}: {}",
+                       filePath.string(), e.what());
+        // Try to delete the file anyway to prevent reprocessing
+        try {
+            std::filesystem::remove(filePath);
+        } catch (...) {}
+    }
+}
+
+// Helper method to get watch directory path for subprocesses
+QString CWindow::getWatchDirectory() const
+{
+    return QString::fromStdString(_watchDir.string());
+}
+
+// Method to enable/disable watching
+void CWindow::setWatchingEnabled(bool enabled)
+{
+    if (enabled && !_watchDir.empty()) {
+        startWatchingDirectory(_watchDir);
+    } else {
+        stopWatchingDirectory();
+    }
 }

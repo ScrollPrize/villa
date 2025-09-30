@@ -272,5 +272,20 @@ private:
     void applySlicePlaneOrientation(Surface* sourceOverride = nullptr);
 
     QAction* fImportObjAct;
+
+    QTimer* _watchTimer = nullptr;
+    std::filesystem::path _watchDir;
+    bool _watchingEnabled = false;
+
+    // Watch directory methods
+    void startWatchingDirectory(const std::filesystem::path& watchDir);
+    void stopWatchingDirectory();
+    void checkWatchDirectory();
+    void processWatchFile(const std::filesystem::path& filePath);
+    void setWatchingEnabled(bool enabled);
+    QString getWatchDirectory() const;
+    void onWatchTimerTimeout();
+
+
 };  // class CWindow
 
