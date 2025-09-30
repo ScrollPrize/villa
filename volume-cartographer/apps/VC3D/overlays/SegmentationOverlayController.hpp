@@ -32,6 +32,10 @@ public:
     void setCursorWorld(const cv::Vec3f& world, bool valid);
     void setSliceFadeDistance(float distance);
     void setSliceDisplayMode(SegmentationSliceDisplayMode mode);
+    void setMaskOverlay(const std::vector<cv::Vec3f>& points,
+                        bool visible,
+                        float pointRadius,
+                        float opacity);
 
 private slots:
     void onSurfaceChanged(std::string name, Surface* surf);
@@ -57,4 +61,9 @@ private:
     cv::Vec3f _cursorWorld{0.0f, 0.0f, 0.0f};
     float _sliceFadeDistance{10.0f};
     SegmentationSliceDisplayMode _sliceDisplayMode{SegmentationSliceDisplayMode::Fade};
+    bool _maskOverlayVisible{false};
+    std::vector<cv::Vec3f> _maskOverlayPoints;
+    float _maskOverlayPointRadius{4.0f};
+    float _maskOverlayOpacity{0.35f};
+    QColor _maskOverlayColor{QColor(255, 140, 0)};
 };

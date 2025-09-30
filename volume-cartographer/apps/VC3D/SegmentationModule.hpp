@@ -205,6 +205,20 @@ private:
     void onCorrectionsCollectionSelected(uint64_t id);
     void onCorrectionsAnnotateToggled(bool enabled);
     void onCorrectionsZRangeChanged(bool enabled, int zMin, int zMax);
+    void onMaskEditingToggled(bool active);
+    void onMaskApplyRequested();
+    void setMaskSampling(int step);
+    void setMaskBrushRadius(int radius);
+    bool beginMaskEditing();
+    void cancelMaskEditing(bool silent = false);
+    void handleMaskErase(const cv::Vec3f& worldPos);
+    void updateMaskOverlay();
+    void clearMaskOverlay();
+    void updateMaskUi();
+    [[nodiscard]] std::optional<cv::Vec3f> maskWorldForCell(int row,
+                                                            int col,
+                                                            const cv::Mat_<cv::Vec3f>& preview) const;
+    [[nodiscard]] static bool maskCellInvalid(const cv::Vec3f& point);
 
     SegmentationWidget* _widget{nullptr};
     SegmentationEditManager* _editManager{nullptr};
@@ -244,4 +258,15 @@ private:
     bool _cursorValid{false};
     bool _growthInProgress{false};
     CVolumeViewer* _cursorViewer{nullptr};
+    bool _maskEditingActive{false};
+    bool _maskDirty{false};
+    bool _maskOriginalDirty{false};
+    bool _maskHasOriginal{false};
+    bool _maskStrokeActive{false};
+    cv::Mat_<cv::Vec3f> _maskOriginalPoints;
+    std::vector<cv::Vec3f> _maskOverlayPoints;
+    float _maskOverlayRadius{4.0f};
+    int _maskSamplingStep{2};
+    int _maskBrushRadius{3};
+    std::optional<std::pair<int, int>> _maskLastCell;
 };

@@ -10,6 +10,7 @@
 #include <limits>
 #include <queue>
 #include <unordered_map>
+#include <stdexcept>
 
 #include <nlohmann/json.hpp>
 
@@ -277,6 +278,77 @@ void SegmentationEditManager::setFillInvalidCells(bool enabled)
         return;
     }
     _fillInvalidCells = enabled;
+}
+
+const cv::Mat_<cv::Vec3f>& SegmentationEditManager::previewPoints() const
+{
+    if (!_previewPoints) {
+        throw std::runtime_error("SegmentationEditManager::previewPoints() called without an active session");
+    }
+    return *_previewPoints;
+}
+
+bool SegmentationEditManager::setPreviewPoints(const cv::Mat_<cv::Vec3f>& points,
+                                               bool dirtyState)
+{
+    if (!hasSession() || !_previewPoints) {
+        return false;
+    }
+    if (points.rows != _previewPoints->rows || points.cols != _previewPoints->cols) {
+        return false;
+    }
+
+    points.copyTo(*_previewPoints);
+    if (_previewSurface) {
+        _previewSurface->invalidateCache();
+    }
+    regenerateHandles();
+    _dirty = dirtyState;
+    return true;
+}
+
+bool SegmentationEditManager::invalidateRegion(int centerRow, int centerCol, int radius)
+{
+    if (!_previewPoints) {
+        return false;
+    }
+
+    const int rows = _previewPoints->rows;
+    const int cols = _previewPoints->cols;
+    const int boundedRadius = std::max(0, radius);
+
+    bool changed = false;
+    const int rowMin = std::max(0, centerRow - boundedRadius);
+    const int rowMax = std::min(rows - 1, centerRow + boundedRadius);
+    const int colMin = std::max(0, centerCol - boundedRadius);
+    const int colMax = std::min(cols - 1, centerCol + boundedRadius);
+
+    for (int row = rowMin; row <= rowMax; ++row) {
+        for (int col = colMin; col <= colMax; ++col) {
+            const int dr = std::abs(row - centerRow);
+            const int dc = std::abs(col - centerCol);
+            if (std::max(dr, dc) > boundedRadius) {
+                continue;
+            }
+
+            cv::Vec3f& cell = (*_previewPoints)(row, col);
+            if (!isInvalidPoint(cell)) {
+                cell = cv::Vec3f(-1.0f, -1.0f, -1.0f);
+                changed = true;
+            }
+        }
+    }
+
+    if (!changed) {
+        return false;
+    }
+
+    if (_previewSurface) {
+        _previewSurface->invalidateCache();
+    }
+    regenerateHandles();
+    _dirty = true;
+    return true;
 }
 
 void SegmentationEditManager::resetPreview()

@@ -44,6 +44,8 @@ public:
     [[nodiscard]] bool handlesAlwaysVisible() const { return _handlesAlwaysVisible; }
     [[nodiscard]] float handleDisplayDistance() const { return _handleDisplayDistance; }
     [[nodiscard]] bool fillInvalidRegions() const { return _fillInvalidRegions; }
+    [[nodiscard]] int maskSampling() const { return _maskSampling; }
+    [[nodiscard]] int maskBrushRadius() const { return _maskBrushRadius; }
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const { return _growthMethod; }
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
 
@@ -82,6 +84,10 @@ public slots:
     void setHandlesAlwaysVisible(bool value);
     void setHandleDisplayDistance(float value);
     void setFillInvalidRegions(bool value);
+    void setMaskEditingActive(bool active);
+    void setMaskApplyEnabled(bool enabled);
+    void setMaskSampling(int value);
+    void setMaskBrushRadius(int value);
 
 signals:
     void editingModeChanged(bool enabled);
@@ -110,6 +116,10 @@ signals:
     void correctionsCreateRequested();
     void correctionsZRangeChanged(bool enabled, int zMin, int zMax);
     void volumeSelectionChanged(const QString& volumeId);
+    void maskEditingToggled(bool active);
+    void maskApplyRequested();
+    void maskSamplingChanged(int value);
+    void maskBrushRadiusChanged(int value);
 
 private:
     void setupUI();
@@ -122,10 +132,10 @@ private:
     void updateGrowthDirectionMaskFromUi(QCheckBox* changedCheckbox);
     void applyGrowthDirectionMaskToUi();
     static int normalizeGrowthDirectionMask(int mask);
-
     QCheckBox* _chkEditing;
     QLabel* _editingStatus;
     QGroupBox* _groupGrowth;
+    QGroupBox* _groupMasking;
     QGroupBox* _groupSampling;
     QSpinBox* _spinDownsample;
     QSpinBox* _spinRadius;
@@ -155,6 +165,10 @@ private:
     QCheckBox* _chkGrowthDirDown;
     QCheckBox* _chkGrowthDirLeft;
     QCheckBox* _chkGrowthDirRight;
+    QPushButton* _btnMaskEdit;
+    QPushButton* _btnMaskApply;
+    QSpinBox* _spinMaskSampling;
+    QSpinBox* _spinMaskRadius;
     class QComboBox* _comboVolume;
     QGroupBox* _groupCorrections;
     class QComboBox* _comboCorrections;
@@ -182,6 +196,10 @@ private:
     float _highlightDistance = 15.0f;      // screen-space pixels
     bool _fillInvalidRegions = true;
     bool _hasPendingChanges = false;
+    bool _maskEditingActive = false;
+    bool _maskApplyEnabled = false;
+    int _maskSampling = 2;
+    int _maskBrushRadius = 3;
     SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Corrections};
     SegmentationGrowthDirection _growthDirection{SegmentationGrowthDirection::All};
     int _growthSteps{5};

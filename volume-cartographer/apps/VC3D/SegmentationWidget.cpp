@@ -26,6 +26,7 @@ SegmentationWidget::SegmentationWidget(QWidget* parent)
     , _chkEditing(nullptr)
     , _editingStatus(nullptr)
     , _groupGrowth(nullptr)
+    , _groupMasking(nullptr)
     , _groupSampling(nullptr)
     , _spinDownsample(nullptr)
     , _spinRadius(nullptr)
@@ -55,6 +56,9 @@ SegmentationWidget::SegmentationWidget(QWidget* parent)
     , _chkGrowthDirDown(nullptr)
     , _chkGrowthDirLeft(nullptr)
     , _chkGrowthDirRight(nullptr)
+    , _btnMaskEdit(nullptr)
+    , _btnMaskApply(nullptr)
+    , _spinMaskSampling(nullptr)
     , _comboVolume(nullptr)
     , _groupCorrections(nullptr)
     , _comboCorrections(nullptr)
@@ -203,6 +207,43 @@ void SegmentationWidget::setupUI()
     growthLayout->addWidget(_normalGridStatusWidget);
 
     layout->addWidget(_groupGrowth);
+
+    _groupMasking = new QGroupBox(tr("Masking"), this);
+    auto* maskingLayout = new QVBoxLayout(_groupMasking);
+
+    _btnMaskEdit = new QPushButton(tr("Edit Mask"), _groupMasking);
+    _btnMaskEdit->setCheckable(true);
+    maskingLayout->addWidget(_btnMaskEdit);
+
+    _btnMaskApply = new QPushButton(tr("Apply Mask"), _groupMasking);
+    _btnMaskApply->setEnabled(false);
+    maskingLayout->addWidget(_btnMaskApply);
+
+    auto* samplingRow = new QHBoxLayout();
+    auto* samplingLabel = new QLabel(tr("Sampling:"), _groupMasking);
+    _spinMaskSampling = new QSpinBox(_groupMasking);
+    _spinMaskSampling->setRange(1, 64);
+    _spinMaskSampling->setSingleStep(1);
+    _spinMaskSampling->setValue(_maskSampling);
+    _spinMaskSampling->setToolTip(tr("Controls how densely mask preview points are sampled"));
+    samplingRow->addWidget(samplingLabel);
+    samplingRow->addWidget(_spinMaskSampling);
+    samplingRow->addStretch();
+    maskingLayout->addLayout(samplingRow);
+
+    auto* maskRadiusRow = new QHBoxLayout();
+    auto* maskRadiusLabel = new QLabel(tr("Brush radius:"), _groupMasking);
+    _spinMaskRadius = new QSpinBox(_groupMasking);
+    _spinMaskRadius->setRange(1, 64);
+    _spinMaskRadius->setSingleStep(1);
+    _spinMaskRadius->setValue(_maskBrushRadius);
+    _spinMaskRadius->setToolTip(tr("Size of the eraser brush in grid cells while mask editing"));
+    maskRadiusRow->addWidget(maskRadiusLabel);
+    maskRadiusRow->addWidget(_spinMaskRadius);
+    maskRadiusRow->addStretch();
+    maskingLayout->addLayout(maskRadiusRow);
+
+    layout->addWidget(_groupMasking);
 
     // Parameter controls
     _groupSampling = new QGroupBox(tr("Sampling"), this);
@@ -734,6 +775,23 @@ void SegmentationWidget::setupUI()
     connect(_btnStopTools, &QPushButton::clicked, this, [this]() {
         emit stopToolsRequested();
     });
+
+    connect(_btnMaskEdit, &QPushButton::toggled, this, [this](bool checked) {
+        setMaskEditingActive(checked);
+        emit maskEditingToggled(checked);
+    });
+
+    connect(_btnMaskApply, &QPushButton::clicked, this, [this]() {
+        emit maskApplyRequested();
+    });
+
+    connect(_spinMaskSampling, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        setMaskSampling(value);
+    });
+
+    connect(_spinMaskRadius, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        setMaskBrushRadius(value);
+    });
     setPendingChanges(false);
 }
 
@@ -1116,6 +1174,21 @@ void SegmentationWidget::updateEditingUi()
     if (_btnGrow) {
         _btnGrow->setEnabled(_editingEnabled);
     }
+    if (_groupMasking) {
+        _groupMasking->setEnabled(_editingEnabled);
+    }
+    if (_btnMaskEdit) {
+        _btnMaskEdit->setEnabled(_editingEnabled);
+    }
+    if (_btnMaskApply) {
+        _btnMaskApply->setEnabled(_editingEnabled && _maskEditingActive && _maskApplyEnabled);
+    }
+    if (_spinMaskSampling) {
+        _spinMaskSampling->setEnabled(_editingEnabled);
+    }
+    if (_spinMaskRadius) {
+        _spinMaskRadius->setEnabled(_editingEnabled);
+    }
     if (_btnApply) {
         _btnApply->setEnabled(_editingEnabled && _hasPendingChanges);
     }
@@ -1127,9 +1200,65 @@ void SegmentationWidget::updateEditingUi()
     refreshCorrectionsUiState();
 }
 
+void SegmentationWidget::setMaskEditingActive(bool active)
+{
+    _maskEditingActive = active;
+    if (!active) {
+        _maskApplyEnabled = false;
+    }
+    if (_btnMaskEdit) {
+        const QSignalBlocker blocker(_btnMaskEdit);
+        _btnMaskEdit->setChecked(active);
+        _btnMaskEdit->setText(active ? tr("Exit Mask Editing") : tr("Edit Mask"));
+    }
+    updateEditingUi();
+}
+
+void SegmentationWidget::setMaskApplyEnabled(bool enabled)
+{
+    _maskApplyEnabled = enabled;
+    updateEditingUi();
+}
+
+void SegmentationWidget::setMaskSampling(int value)
+{
+    const int clamped = std::clamp(value, 1, 64);
+    if (_maskSampling == clamped) {
+        return;
+    }
+    _maskSampling = clamped;
+    if (_spinMaskSampling) {
+        const QSignalBlocker blocker(_spinMaskSampling);
+        _spinMaskSampling->setValue(clamped);
+    }
+    writeSetting(QStringLiteral("mask_sampling"), _maskSampling);
+    emit maskSamplingChanged(_maskSampling);
+}
+
+void SegmentationWidget::setMaskBrushRadius(int value)
+{
+    const int clamped = std::clamp(value, 1, 64);
+    if (_maskBrushRadius == clamped) {
+        return;
+    }
+    _maskBrushRadius = clamped;
+    if (_spinMaskRadius) {
+        const QSignalBlocker blocker(_spinMaskRadius);
+        _spinMaskRadius->setValue(clamped);
+    }
+    writeSetting(QStringLiteral("mask_brush_radius"), _maskBrushRadius);
+    emit maskBrushRadiusChanged(_maskBrushRadius);
+}
+
 void SegmentationWidget::restoreSettings()
 {
     QSettings settings("VC.ini", QSettings::IniFormat);
+
+    const int storedMaskSampling = settings.value(QStringLiteral("segmentation_edit/mask_sampling"), _maskSampling).toInt();
+    setMaskSampling(std::clamp(storedMaskSampling, 1, 64));
+
+    const int storedMaskRadius = settings.value(QStringLiteral("segmentation_edit/mask_brush_radius"), _maskBrushRadius).toInt();
+    setMaskBrushRadius(std::clamp(storedMaskRadius, 1, 64));
 
     const int storedDownsample = settings.value(QStringLiteral("segmentation_edit/downsample"), _downsample).toInt();
     setDownsample(std::clamp(storedDownsample, 2, 64));

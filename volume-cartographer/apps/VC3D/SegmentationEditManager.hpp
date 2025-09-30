@@ -43,6 +43,10 @@ public:
     [[nodiscard]] int holeSearchRadius() const { return _holeSearchRadius; }
     [[nodiscard]] int holeSmoothIterations() const { return _holeSmoothIterations; }
     [[nodiscard]] bool hasPendingChanges() const { return _dirty; }
+    [[nodiscard]] const cv::Mat_<cv::Vec3f>& previewPoints() const;
+    bool setPreviewPoints(const cv::Mat_<cv::Vec3f>& points,
+                          bool dirtyState);
+    bool invalidateRegion(int centerRow, int centerCol, int radius);
 
     void resetPreview();
     void applyPreview();
