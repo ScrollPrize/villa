@@ -4,6 +4,7 @@
 #include <QString>
 
 #include <functional>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -19,6 +20,7 @@ class BBoxOverlayController;
 class VectorOverlayController;
 class ChunkCache;
 class SegmentationModule;
+class Volume;
 
 class ViewerManager : public QObject
 {
@@ -47,6 +49,18 @@ public:
     void setIntersectionOpacity(float opacity);
     float intersectionOpacity() const { return _intersectionOpacity; }
 
+    void setOverlayVolume(std::shared_ptr<Volume> volume, const std::string& volumeId);
+    std::shared_ptr<Volume> overlayVolume() const { return _overlayVolume; }
+    const std::string& overlayVolumeId() const { return _overlayVolumeId; }
+
+    void setOverlayOpacity(float opacity);
+    float overlayOpacity() const { return _overlayOpacity; }
+
+    void setOverlayColormap(const std::string& colormapId);
+    const std::string& overlayColormap() const { return _overlayColormapId; }
+    void setOverlayThreshold(float threshold);
+    float overlayThreshold() const { return _overlayThreshold; }
+
     bool resetDefaultFor(CVolumeViewer* viewer) const;
     void setResetDefaultFor(CVolumeViewer* viewer, bool value);
 
@@ -69,4 +83,9 @@ private:
     std::vector<CVolumeViewer*> _viewers;
     std::unordered_map<CVolumeViewer*, bool> _resetDefaults;
     float _intersectionOpacity{1.0f};
+    std::shared_ptr<Volume> _overlayVolume;
+    std::string _overlayVolumeId;
+    float _overlayOpacity{0.5f};
+    std::string _overlayColormapId;
+    float _overlayThreshold{1.0f};
 };

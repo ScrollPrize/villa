@@ -2,7 +2,9 @@
 
 #include <QtWidgets>
 
+#include <memory>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include <optional>
@@ -90,6 +92,21 @@ public:
 
     void setIntersectionOpacity(float opacity);
     float intersectionOpacity() const { return _intersectionOpacity; }
+
+    void setOverlayVolume(std::shared_ptr<Volume> volume);
+    std::shared_ptr<Volume> overlayVolume() const { return _overlayVolume; }
+    void setOverlayOpacity(float opacity);
+    float overlayOpacity() const { return _overlayOpacity; }
+    void setOverlayColormap(const std::string& colormapId);
+    const std::string& overlayColormap() const { return _overlayColormapId; }
+    void setOverlayThreshold(float threshold);
+    float overlayThreshold() const { return _overlayThreshold; }
+
+    struct OverlayColormapEntry {
+        QString label;
+        std::string id;
+    };
+    static const std::vector<OverlayColormapEntry>& overlayColormapEntries();
     
     CVolumeViewerView* fGraphicsView;
 
@@ -232,6 +249,13 @@ protected:
     std::vector<Selection> _selections;
 
     bool _useFastInterpolation;
+
+    std::shared_ptr<Volume> _overlayVolume;
+    float _overlayOpacity{0.5f};
+    std::string _overlayColormapId;
+    float _overlayThreshold{1.0f};
+    bool _overlayImageValid{false};
+    QImage _overlayImage;
 
 
 };  // class CVolumeViewer

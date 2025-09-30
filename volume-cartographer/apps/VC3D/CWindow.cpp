@@ -28,6 +28,7 @@
 #include <QVector>
 #include <QLoggingCategory>
 #include <QScrollArea>
+#include <QSignalBlocker>
 #include <nlohmann/json.hpp>
 #include <QGraphicsSimpleTextItem>
 #include <QPointer>
@@ -549,12 +550,10 @@ void CWindow::clearSurfaceSelection()
 
 void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 {
-    bool keep_poi = false;
-    if (currentVolume && currentVolume->sliceWidth() == newvol->sliceWidth() && currentVolume->sliceHeight() == newvol->sliceHeight() && currentVolume->numSlices() == newvol->numSlices()) {
-        keep_poi = true;
-    }
+    const bool hadVolume = static_cast<bool>(currentVolume);
+    POI* existingFocusPoi = _surf_col ? _surf_col->poi("focus") : nullptr;
     currentVolume = newvol;
-    
+
     // Find the volume ID for the current volume
     currentVolumeId.clear();
     if (fVpkg && currentVolume) {
@@ -566,39 +565,93 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
         }
     }
 
-    _segmentationGrowthVolumeId = currentVolumeId;
-
-    if (_segmentationWidget) {
-        _segmentationWidget->setActiveVolume(QString::fromStdString(currentVolumeId));
+    const bool growthVolumeValid = fVpkg && !_segmentationGrowthVolumeId.empty() &&
+                                   fVpkg->hasVolume(_segmentationGrowthVolumeId);
+    if (!growthVolumeValid) {
+        _segmentationGrowthVolumeId = currentVolumeId;
+        if (_segmentationWidget) {
+            _segmentationWidget->setActiveVolume(QString::fromStdString(currentVolumeId));
+        }
     }
 
     updateNormalGridAvailability();
 
     sendVolumeChanged(currentVolume, currentVolumeId);
 
-    if (currentVolume->numScales() >= 2)
+    if (currentVolume && currentVolume->numScales() >= 2) {
         wOpsList->setDataset(currentVolume->zarrDataset(1), chunk_cache, 0.5);
-    else
+    } else if (currentVolume) {
         wOpsList->setDataset(currentVolume->zarrDataset(0), chunk_cache, 1.0);
-    
-    int w = currentVolume->sliceWidth();
-    int h = currentVolume->sliceHeight();
-    int d = currentVolume->numSlices();
-    
+    }
 
-    if (!keep_poi) {
-        // Set default focus at middle of volume
-        POI *poi = _surf_col->poi("focus");
+    if (currentVolume && _surf_col) {
+        const int w = currentVolume->sliceWidth();
+        const int h = currentVolume->sliceHeight();
+        const int d = currentVolume->numSlices();
+
+        POI* poi = existingFocusPoi;
+        const bool createdPoi = (poi == nullptr);
         if (!poi) {
             poi = new POI;
+            poi->n = cv::Vec3f(0, 0, 1);
         }
-        poi->p = cv::Vec3f(w/2, h/2, d/2);
-        poi->n = cv::Vec3f(0, 0, 1); // Default normal for XY plane
+
+        const auto clampCoord = [](float value, int maxDim) {
+            if (maxDim <= 0) {
+                return 0.0f;
+            }
+            const float maxValue = static_cast<float>(maxDim - 1);
+            return std::clamp(value, 0.0f, maxValue);
+        };
+
+        if (createdPoi || !hadVolume) {
+            poi->p = cv::Vec3f(w / 2.0f, h / 2.0f, d / 2.0f);
+        } else {
+            poi->p[0] = clampCoord(poi->p[0], w);
+            poi->p[1] = clampCoord(poi->p[1], h);
+            poi->p[2] = clampCoord(poi->p[2], d);
+        }
+
         _surf_col->setPOI("focus", poi);
     }
 
     onManualPlaneChanged();
-    applySlicePlaneOrientation(_surf_col->surface("segmentation"));
+    applySlicePlaneOrientation(_surf_col ? _surf_col->surface("segmentation") : nullptr);
+}
+
+void CWindow::populateOverlayColormapOptions()
+{
+    if (!overlayColormapSelect) {
+        return;
+    }
+
+    const QSignalBlocker blocker{overlayColormapSelect};
+    overlayColormapSelect->clear();
+
+    const auto& entries = CVolumeViewer::overlayColormapEntries();
+    int indexToSelect = 0;
+
+    if (_overlayColormapName.empty() && !entries.empty()) {
+        _overlayColormapName = entries.front().id;
+    }
+
+    for (int i = 0; i < static_cast<int>(entries.size()); ++i) {
+        const auto& entry = entries.at(i);
+        overlayColormapSelect->addItem(entry.label, QVariant(QString::fromStdString(entry.id)));
+        if (entry.id == _overlayColormapName) {
+            indexToSelect = i;
+        }
+    }
+
+    overlayColormapSelect->setEnabled(!entries.empty());
+
+    if (overlayColormapSelect->count() > 0) {
+        overlayColormapSelect->setCurrentIndex(indexToSelect);
+    }
+
+    if (_viewerManager) {
+        _viewerManager->setOverlayColormap(_overlayColormapName);
+    }
 }
 
 void CWindow::updateNormalGridAvailability()
@@ -884,6 +937,100 @@ void CWindow::CreateWidgets(void)
 
     // TODO CHANGE VOLUME LOADING; FIRST CHECK FOR OTHER VOLUMES IN THE STRUCTS
     volSelect = ui.volSelect;
+    overlayVolumeSelect = ui.overlayVolumeSelect;
+    overlayColormapSelect = ui.overlayColormapSelect;
+    overlayOpacitySlider = ui.overlayOpacitySlider;
+    overlayThresholdSpin = ui.overlayThresholdSpin;
+
+    populateOverlayColormapOptions();
+
+    if (overlayVolumeSelect) {
+        overlayVolumeSelect->setEnabled(false);
+    }
+
+    if (overlayOpacitySlider) {
+        overlayOpacitySlider->setRange(0, 100);
+        overlayOpacitySlider->setValue(static_cast<int>(std::round(_overlayOpacity * 100.0f)));
+        overlayOpacitySlider->setEnabled(false);
+        connect(overlayOpacitySlider, &QSlider::valueChanged, this, [this](int value) {
+            _overlayOpacity = std::clamp(value / 100.0f, 0.0f, 1.0f);
+            if (_viewerManager) {
+                _viewerManager->setOverlayOpacity(_overlayOpacity);
+            }
+        });
+        if (_viewerManager) {
+            _viewerManager->setOverlayOpacity(_overlayOpacity);
+        }
+    }
+
+    if (overlayThresholdSpin) {
+        overlayThresholdSpin->setRange(0, 65535);
+        overlayThresholdSpin->setValue(static_cast<int>(std::clamp(_overlayThreshold, 0.0f, 65535.0f)));
+        overlayThresholdSpin->setEnabled(false);
+        connect(overlayThresholdSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+            _overlayThreshold = std::max(0.0f, static_cast<float>(value));
+            if (_viewerManager) {
+                _viewerManager->setOverlayThreshold(_overlayThreshold);
+            }
+        });
+        if (_viewerManager) {
+            _viewerManager->setOverlayThreshold(_overlayThreshold);
+        }
+    }
+
+    if (overlayColormapSelect) {
+        connect(overlayColormapSelect, &QComboBox::currentIndexChanged, this, [this](int) {
+            if (!overlayColormapSelect) {
+                return;
+            }
+            const QVariant data = overlayColormapSelect->currentData();
+            _overlayColormapName = data.isValid() ? data.toString().toStdString() : std::string();
+            if (_viewerManager) {
+                _viewerManager->setOverlayColormap(_overlayColormapName);
+            }
+        });
+    }
+
+    if (overlayVolumeSelect) {
+        connect(overlayVolumeSelect, &QComboBox::currentIndexChanged, this, [this](int) {
+            if (!overlayVolumeSelect) {
+                return;
+            }
+            std::shared_ptr<Volume> overlayVolume;
+            std::string newOverlayId;
+
+            if (const QVariant data = overlayVolumeSelect->currentData(); data.isValid()) {
+                const QString idStr = data.toString();
+                newOverlayId = idStr.toStdString();
+                if (fVpkg) {
+                    try {
+                        overlayVolume = fVpkg->volume(newOverlayId);
+                    } catch (const std::out_of_range&) {
+                        QMessageBox::warning(this, tr("Error"), tr("Unable to load overlay volume."));
+                        newOverlayId.clear();
+                        overlayVolume.reset();
+                    }
+                }
+            }
+
+            _overlayVolumeId = std::move(newOverlayId);
+            if (_viewerManager) {
+                _viewerManager->setOverlayVolume(overlayVolume, _overlayVolumeId);
+            }
+
+            const bool hasOverlay = static_cast<bool>(overlayVolume);
+            if (overlayOpacitySlider) {
+                overlayOpacitySlider->setEnabled(hasOverlay);
+            }
+            if (overlayColormapSelect) {
+                overlayColormapSelect->setEnabled(hasOverlay && overlayColormapSelect->count() > 0);
+            }
+            if (overlayThresholdSpin) {
+                overlayThresholdSpin->setEnabled(hasOverlay);
+            }
+        });
+    }
+
     connect(
         volSelect, &QComboBox::currentIndexChanged, [this](const int& index) {
             std::shared_ptr<Volume> newVolume;
@@ -1236,6 +1383,14 @@ void CWindow::OpenVolume(const QString& path)
         const QSignalBlocker blocker{volSelect};
         volSelect->clear();
     }
+    int overlayIndexToSelect = 0;
+    bool overlayFound = false;
+    if (overlayVolumeSelect) {
+        const QSignalBlocker overlayBlocker{overlayVolumeSelect};
+        overlayVolumeSelect->clear();
+        overlayVolumeSelect->addItem(tr("None"));
+        overlayVolumeSelect->setItemData(0, QVariant());
+    }
     QVector<QPair<QString, QString>> volumeEntries;
     QString bestGrowthVolumeId = QString::fromStdString(currentVolumeId);
     bool preferredVolumeFound = false;
@@ -1245,6 +1400,13 @@ void CWindow::OpenVolume(const QString& path)
         const QString nameStr = QString::fromStdString(vol->name());
         const QString label = nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr);
         volSelect->addItem(label, QVariant(idStr));
+        if (overlayVolumeSelect) {
+            overlayVolumeSelect->addItem(label, QVariant(idStr));
+            if (!_overlayVolumeId.empty() && _overlayVolumeId == id) {
+                overlayIndexToSelect = overlayVolumeSelect->count() - 1;
+                overlayFound = true;
+            }
+        }
         volumeEntries.append({idStr, label});
 
         const QString loweredName = nameStr.toLower();
@@ -1267,6 +1429,43 @@ void CWindow::OpenVolume(const QString& path)
 
     if (_segmentationWidget) {
         _segmentationWidget->setAvailableVolumes(volumeEntries, bestGrowthVolumeId);
+    }
+
+    if (overlayVolumeSelect) {
+        const QSignalBlocker overlayBlocker{overlayVolumeSelect};
+        if (overlayFound) {
+            overlayVolumeSelect->setCurrentIndex(overlayIndexToSelect);
+        } else {
+            overlayVolumeSelect->setCurrentIndex(0);
+            _overlayVolumeId.clear();
+        }
+
+        std::shared_ptr<Volume> overlayVolume;
+        if (overlayFound && fVpkg && !_overlayVolumeId.empty()) {
+            try {
+                overlayVolume = fVpkg->volume(_overlayVolumeId);
+            } catch (const std::out_of_range&) {
+                overlayVolume.reset();
+                _overlayVolumeId.clear();
+            }
+        }
+
+        if (_viewerManager) {
+            _viewerManager->setOverlayVolume(overlayVolume, _overlayVolumeId);
+        }
+
+        const bool enableOverlayChoice = overlayVolumeSelect->count() > 1;
+        overlayVolumeSelect->setEnabled(enableOverlayChoice);
+        const bool hasOverlaySelected = overlayFound && overlayVolume;
+        if (overlayOpacitySlider) {
+            overlayOpacitySlider->setEnabled(hasOverlaySelected);
+        }
+        if (overlayColormapSelect) {
+            overlayColormapSelect->setEnabled(hasOverlaySelected && overlayColormapSelect->count() > 0);
+        }
+        if (overlayThresholdSpin) {
+            overlayThresholdSpin->setEnabled(hasOverlaySelected);
+        }
     }
 
     // Populate the segmentation directory dropdown
@@ -1363,6 +1562,28 @@ void CWindow::CloseVolume(void)
     
     // Clear points
     _point_collection->clearAll();
+
+    if (overlayVolumeSelect) {
+        const QSignalBlocker blocker{overlayVolumeSelect};
+        overlayVolumeSelect->clear();
+        overlayVolumeSelect->addItem(tr("None"));
+        overlayVolumeSelect->setItemData(0, QVariant());
+        overlayVolumeSelect->setCurrentIndex(0);
+        overlayVolumeSelect->setEnabled(false);
+    }
+    if (overlayOpacitySlider) {
+        overlayOpacitySlider->setEnabled(false);
+    }
+    if (overlayColormapSelect) {
+        overlayColormapSelect->setEnabled(false);
+    }
+    if (overlayThresholdSpin) {
+        overlayThresholdSpin->setEnabled(false);
+    }
+    _overlayVolumeId.clear();
+    if (_viewerManager) {
+        _viewerManager->setOverlayVolume(nullptr, _overlayVolumeId);
+    }
 }
 
 // Handle open request
@@ -2087,7 +2308,34 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
             statusBar()->showMessage(tr("Failed to save segmentation: %1").arg(ex.what()), 5000);
         }
 
+        std::vector<std::pair<CVolumeViewer*, bool>> resetDefaults;
+        if (_viewerManager) {
+            _viewerManager->forEachViewer([this, &resetDefaults](CVolumeViewer* viewer) {
+                if (!viewer || viewer->surfName() != "segmentation") {
+                    return;
+                }
+                const bool defaultReset = _viewerManager->resetDefaultFor(viewer);
+                resetDefaults.emplace_back(viewer, defaultReset);
+                viewer->setResetViewOnSurfaceChange(false);
+            });
+        }
+
         _surf_col->setSurface("segmentation", segmentationSurface);
+
+        if (!resetDefaults.empty()) {
+            const bool editingActive = _segmentationModule && _segmentationModule->editingEnabled();
+            for (auto& entry : resetDefaults) {
+                auto* viewer = entry.first;
+                if (!viewer) {
+                    continue;
+                }
+                if (editingActive) {
+                    viewer->setResetViewOnSurfaceChange(false);
+                } else {
+                    viewer->setResetViewOnSurfaceChange(entry.second);
+                }
+            }
+        }
 
         if (_segmentationModule && _segmentationModule->hasActiveSession()) {
             _segmentationModule->markNextHandlesFromGrowth();

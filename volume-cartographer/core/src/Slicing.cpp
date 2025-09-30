@@ -240,12 +240,16 @@ void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv
     out = cv::Mat_<uint8_t>(coords.size(), 0);
     int group_idx = cache->groupIdx(ds->path());
 
-    const int chunk_size = ds->chunking().blockShape()[0];
-    const int chunk_shift = __builtin_ctz(chunk_size);
-    const int chunk_mask = chunk_size - 1;
+    const auto& blockShape = ds->chunking().blockShape();
+    if (blockShape.size() < 3) {
+        throw std::runtime_error("Unexpected chunk dimensionality for nearest-neighbor sampling");
+    }
+    const int chunk_size_x = static_cast<int>(blockShape[0]);
+    const int chunk_size_y = static_cast<int>(blockShape[1]);
+    const int chunk_size_z = static_cast<int>(blockShape[2]);
 
-    if ((chunk_size & (chunk_size - 1)) != 0 || chunk_size == 0) {
-        throw std::runtime_error("Chunk size must be a power of 2, got: " + std::to_string(chunk_size));
+    if (chunk_size_x <= 0 || chunk_size_y <= 0 || chunk_size_z <= 0) {
+        throw std::runtime_error("Invalid chunk dimensions for nearest-neighbor sampling");
     }
 
     int w = coords.cols;
@@ -261,10 +265,10 @@ void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv
         std::shared_ptr<xt::xarray<uint8_t>> chunk_ref;
 
         #pragma omp for schedule(static, 1) collapse(2)
-        for(size_t tile_y = 0; tile_y < h; tile_y += TILE_SIZE) {
-            for(size_t tile_x = 0; tile_x < w; tile_x += TILE_SIZE) {
-                size_t y_end = std::min(tile_y + TILE_SIZE, (size_t)h);
-                size_t x_end = std::min(tile_x + TILE_SIZE, (size_t)w);
+        for(size_t tile_y = 0; tile_y < static_cast<size_t>(h); tile_y += TILE_SIZE) {
+            for(size_t tile_x = 0; tile_x < static_cast<size_t>(w); tile_x += TILE_SIZE) {
+                size_t y_end = std::min(tile_y + TILE_SIZE, static_cast<size_t>(h));
+                size_t x_end = std::min(tile_x + TILE_SIZE, static_cast<size_t>(w));
 
                 for(size_t y = tile_y; y < y_end; y++) {
                     if (y + 1 < y_end) {
@@ -272,16 +276,16 @@ void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv
                     }
 
                     for(size_t x = tile_x; x < x_end; x++) {
-                        int ox = int(coords(y,x)[2] + 0.5f);
-                        int oy = int(coords(y,x)[1] + 0.5f);
-                        int oz = int(coords(y,x)[0] + 0.5f);
+                        int ox = static_cast<int>(coords(y,x)[2] + 0.5f);
+                        int oy = static_cast<int>(coords(y,x)[1] + 0.5f);
+                        int oz = static_cast<int>(coords(y,x)[0] + 0.5f);
 
                         if ((ox | oy | oz) < 0)
                             continue;
 
-                        int ix = ox >> chunk_shift;
-                        int iy = oy >> chunk_shift;
-                        int iz = oz >> chunk_shift;
+                        int ix = ox / chunk_size_x;
+                        int iy = oy / chunk_size_y;
+                        int iz = oz / chunk_size_z;
 
                         cv::Vec4i idx = {group_idx, ix, iy, iz};
 
@@ -304,9 +308,14 @@ void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv
                         if (!chunk)
                             continue;
 
-                        int lx = ox & chunk_mask;
-                        int ly = oy & chunk_mask;
-                        int lz = oz & chunk_mask;
+                        int lx = ox - ix * chunk_size_x;
+                        int ly = oy - iy * chunk_size_y;
+                        int lz = oz - iz * chunk_size_z;
+
+                        if (lx < 0 || ly < 0 || lz < 0 ||
+                            lx >= chunk_size_x || ly >= chunk_size_y || lz >= chunk_size_z) {
+                            continue;
+                        }
 
                         out(y,x) = chunk->operator()(lx, ly, lz);
                     }

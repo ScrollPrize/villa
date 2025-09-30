@@ -9,6 +9,7 @@
 #include "SegmentationModule.hpp"
 #include "CSurfaceCollection.hpp"
 #include "vc/ui/VCCollection.hpp"
+#include "vc/core/types/Volume.hpp"
 
 #include <QMdiArea>
 #include <QMdiSubWindow>
@@ -86,6 +87,10 @@ CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
     }
 
     viewer->setIntersectionOpacity(_intersectionOpacity);
+    viewer->setOverlayVolume(_overlayVolume);
+    viewer->setOverlayOpacity(_overlayOpacity);
+    viewer->setOverlayColormap(_overlayColormapId);
+    viewer->setOverlayThreshold(_overlayThreshold);
 
     _viewers.push_back(viewer);
     if (_segmentationModule) {
@@ -172,6 +177,47 @@ void ViewerManager::setIntersectionOpacity(float opacity)
     for (auto* viewer : _viewers) {
         if (viewer) {
             viewer->setIntersectionOpacity(_intersectionOpacity);
+        }
+    }
+}
+
+void ViewerManager::setOverlayVolume(std::shared_ptr<Volume> volume, const std::string& volumeId)
+{
+    _overlayVolume = std::move(volume);
+    _overlayVolumeId = volumeId;
+    for (auto* viewer : _viewers) {
+        if (viewer) {
+            viewer->setOverlayVolume(_overlayVolume);
+        }
+    }
+}
+
+void ViewerManager::setOverlayOpacity(float opacity)
+{
+    _overlayOpacity = std::clamp(opacity, 0.0f, 1.0f);
+    for (auto* viewer : _viewers) {
+        if (viewer) {
+            viewer->setOverlayOpacity(_overlayOpacity);
+        }
+    }
+}
+
+void ViewerManager::setOverlayColormap(const std::string& colormapId)
+{
+    _overlayColormapId = colormapId;
+    for (auto* viewer : _viewers) {
+        if (viewer) {
+            viewer->setOverlayColormap(_overlayColormapId);
+        }
+    }
+}
+
+void ViewerManager::setOverlayThreshold(float threshold)
+{
+    _overlayThreshold = std::max(threshold, 0.0f);
+    for (auto* viewer : _viewers) {
+        if (viewer) {
+            viewer->setOverlayThreshold(_overlayThreshold);
         }
     }
 }

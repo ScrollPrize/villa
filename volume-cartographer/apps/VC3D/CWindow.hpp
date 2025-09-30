@@ -168,6 +168,10 @@ private:
 
     QComboBox* volSelect;
     QComboBox* cmbSegmentationDir;
+    QComboBox* overlayVolumeSelect{nullptr};
+    QComboBox* overlayColormapSelect{nullptr};
+    QSlider* overlayOpacitySlider{nullptr};
+    QSpinBox* overlayThresholdSpin{nullptr};
     QuadSurface *_surf;
     std::string _surfID;
     
@@ -198,6 +202,13 @@ private:
     bool can_change_volume_();
     
     ChunkCache *chunk_cache;
+
+    std::string _overlayVolumeId;
+    std::string _overlayColormapName;
+    float _overlayOpacity{0.5f};
+    float _overlayThreshold{1.0f};
+
+    void populateOverlayColormapOptions();
     std::unique_ptr<ViewerManager> _viewerManager;
     CSurfaceCollection *_surf_col;
     bool _useAxisAlignedSlices{false};

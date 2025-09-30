@@ -17,6 +17,10 @@
 #include "OpChain.hpp"
 #include "vc/core/util/Render.hpp"
 
+#include <QPainter>
+
+#include <opencv2/imgproc.hpp>
+
 using qga = QGuiApplication;
 
 using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
@@ -38,6 +42,70 @@ constexpr float MAX_ZOOM = 4.0f;
 
 #include <limits>
 #include <algorithm>
+#include <cmath>
+
+namespace {
+
+enum class OverlayColormapKind { OpenCv, Tint };
+
+struct OverlayColormapSpec {
+    std::string id;
+    QString label;
+    OverlayColormapKind kind;
+    int opencvCode;
+    cv::Vec3f tint; // B, G, R in [0,1]
+};
+
+const std::vector<OverlayColormapSpec>& overlayColormapSpecs()
+{
+    static const std::vector<OverlayColormapSpec> specs = {
+        {"fire", QStringLiteral("Fire"), OverlayColormapKind::OpenCv, cv::COLORMAP_HOT, {}},
+        {"viridis", QStringLiteral("Viridis"), OverlayColormapKind::OpenCv, cv::COLORMAP_VIRIDIS, {}},
+        {"magma", QStringLiteral("Magma"), OverlayColormapKind::OpenCv, cv::COLORMAP_MAGMA, {}},
+        {"red", QStringLiteral("Red"), OverlayColormapKind::Tint, 0, cv::Vec3f(0.0f, 0.0f, 1.0f)},
+        {"green", QStringLiteral("Green"), OverlayColormapKind::Tint, 0, cv::Vec3f(0.0f, 1.0f, 0.0f)},
+        {"blue", QStringLiteral("Blue"), OverlayColormapKind::Tint, 0, cv::Vec3f(1.0f, 0.0f, 0.0f)},
+        {"cyan", QStringLiteral("Cyan"), OverlayColormapKind::Tint, 0, cv::Vec3f(1.0f, 1.0f, 0.0f)},
+        {"magenta", QStringLiteral("Magenta"), OverlayColormapKind::Tint, 0, cv::Vec3f(1.0f, 0.0f, 1.0f)}
+    };
+    return specs;
+}
+
+const OverlayColormapSpec& resolveOverlayColormap(const std::string& id)
+{
+    const auto& specs = overlayColormapSpecs();
+    auto it = std::find_if(specs.begin(), specs.end(), [&id](const auto& spec) {
+        return spec.id == id;
+    });
+    if (it != specs.end()) {
+        return *it;
+    }
+    return specs.front();
+}
+
+cv::Mat makeOverlayColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& spec)
+{
+    if (values.empty()) {
+        return {};
+    }
+
+    cv::Mat colored;
+    if (spec.kind == OverlayColormapKind::OpenCv) {
+        cv::applyColorMap(values, colored, spec.opencvCode);
+    } else {
+        cv::Mat valuesFloat;
+        values.convertTo(valuesFloat, CV_32F, 1.0f / 255.0f);
+        std::vector<cv::Mat> channels(3);
+        for (int c = 0; c < 3; ++c) {
+            channels[c] = valuesFloat * (spec.tint[c] * 255.0f);
+        }
+        cv::merge(channels, colored);
+        colored.convertTo(colored, CV_8UC3);
+    }
+    return colored;
+}
+
+} // namespace
 
 // Helper: remove spatial outliers based on robust neighbor-distance stats
 static cv::Mat_<cv::Vec3f> clean_surface_outliers(const cv::Mat_<cv::Vec3f>& points, float distance_threshold = 5.0f)
@@ -582,6 +650,65 @@ void CVolumeViewer::setIntersectionOpacity(float opacity)
     }
 }
 
+void CVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
+{
+    if (_overlayVolume == volume) {
+        return;
+    }
+    _overlayVolume = std::move(volume);
+    renderVisible(true);
+}
+
+void CVolumeViewer::setOverlayOpacity(float opacity)
+{
+    float clamped = std::clamp(opacity, 0.0f, 1.0f);
+    if (std::abs(clamped - _overlayOpacity) < 1e-6f) {
+        return;
+    }
+    _overlayOpacity = clamped;
+    if (_overlayVolume) {
+        renderVisible(true);
+    }
+}
+
+void CVolumeViewer::setOverlayColormap(const std::string& colormapId)
+{
+    if (_overlayColormapId == colormapId) {
+        return;
+    }
+    _overlayColormapId = colormapId;
+    if (_overlayVolume) {
+        renderVisible(true);
+    }
+}
+
+void CVolumeViewer::setOverlayThreshold(float threshold)
+{
+    float clamped = std::max(threshold, 0.0f);
+    if (std::abs(clamped - _overlayThreshold) < 1e-6f) {
+        return;
+    }
+    _overlayThreshold = clamped;
+    if (_overlayVolume) {
+        renderVisible(true);
+    }
+}
+
+const std::vector<CVolumeViewer::OverlayColormapEntry>& CVolumeViewer::overlayColormapEntries()
+{
+    static std::vector<OverlayColormapEntry> entries;
+    static bool initialized = false;
+    if (!initialized) {
+        const auto& specs = overlayColormapSpecs();
+        entries.reserve(specs.size());
+        for (const auto& spec : specs) {
+            entries.push_back(OverlayColormapEntry{spec.label, spec.id});
+        }
+        initialized = true;
+    }
+    return entries;
+}
+
 void CVolumeViewer::fitSurfaceInView()
 {
     if (!_surf || !fGraphicsView) {
@@ -983,32 +1110,123 @@ cv::Mat_<uint8_t> CVolumeViewer::renderCompositeForSurface(QuadSurface* surface,
 cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
 {
     cv::Mat_<cv::Vec3f> coords;
-    cv::Mat_<uint8_t> img;
+    cv::Mat_<uint8_t> baseGray;
 
-    // Check if we should use composite rendering
-    if (_surf_name == "segmentation" && _composite_enabled && (_composite_layers_front > 0 || _composite_layers_behind > 0)) {
-        img = render_composite(roi);
-    }
-    else {
-        // Standard single-slice rendering
-        //PlaneSurface use absolute positioning to simplify intersection logic
-        if (dynamic_cast<PlaneSurface*>(_surf)) {
-            _surf->gen(&coords, nullptr, roi.size(), cv::Vec3f(0,0,0), _scale, {roi.x, roi.y, _z_off});
-        }
-        else {
-            cv::Vec2f roi_c = {roi.x+roi.width/2, roi.y + roi.height/2};
+    _overlayImageValid = false;
+    _overlayImage = QImage();
 
+    const bool useComposite = (_surf_name == "segmentation" && _composite_enabled &&
+                               (_composite_layers_front > 0 || _composite_layers_behind > 0));
+
+    if (useComposite) {
+        baseGray = render_composite(roi);
+    } else {
+        if (auto* plane = dynamic_cast<PlaneSurface*>(_surf)) {
+            _surf->gen(&coords, nullptr, roi.size(), cv::Vec3f(0, 0, 0), _scale, {roi.x, roi.y, _z_off});
+        } else {
+            cv::Vec2f roi_c = {roi.x + roi.width / 2.0f, roi.y + roi.height / 2.0f};
             _ptr = _surf->pointer();
-            cv::Vec3f diff = {roi_c[0],roi_c[1],0};
-            _surf->move(_ptr, diff/_scale);
+            cv::Vec3f diff = {roi_c[0], roi_c[1], 0};
+            _surf->move(_ptr, diff / _scale);
             _vis_center = roi_c;
-            _surf->gen(&coords, nullptr, roi.size(), _ptr, _scale, {-roi.width/2, -roi.height/2, _z_off});
+            _surf->gen(&coords, nullptr, roi.size(), _ptr, _scale, {-roi.width / 2.0f, -roi.height / 2.0f, _z_off});
         }
 
-        readInterpolated3D(img, volume->zarrDataset(_ds_sd_idx), coords*_ds_scale, cache, _useFastInterpolation);
+        readInterpolated3D(baseGray, volume->zarrDataset(_ds_sd_idx), coords * _ds_scale, cache, _useFastInterpolation);
     }
-    cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
-    return img;
+
+    if (baseGray.empty()) {
+        return cv::Mat();
+    }
+
+    cv::normalize(baseGray, baseGray, 0, 255, cv::NORM_MINMAX, CV_8U);
+
+    cv::Mat baseColor;
+    if (baseGray.channels() == 1) {
+        cv::cvtColor(baseGray, baseColor, cv::COLOR_GRAY2BGR);
+    } else {
+        baseColor = baseGray.clone();
+    }
+
+    if (_overlayVolume && _overlayOpacity > 0.0f) {
+        if (coords.empty()) {
+            if (auto* plane = dynamic_cast<PlaneSurface*>(_surf)) {
+                _surf->gen(&coords, nullptr, roi.size(), cv::Vec3f(0, 0, 0), _scale, {roi.x, roi.y, _z_off});
+            } else {
+                cv::Vec2f roi_c = {roi.x + roi.width / 2.0f, roi.y + roi.height / 2.0f};
+                _ptr = _surf->pointer();
+                cv::Vec3f diff = {roi_c[0], roi_c[1], 0};
+                _surf->move(_ptr, diff / _scale);
+                _vis_center = roi_c;
+                _surf->gen(&coords, nullptr, roi.size(), _ptr, _scale, {-roi.width / 2.0f, -roi.height / 2.0f, _z_off});
+            }
+        }
+
+        if (!coords.empty()) {
+            int overlayIdx = 0;
+            float overlayScale = 1.0f;
+            if (_overlayVolume->numScales() > 0) {
+                overlayIdx = std::min<int>(_ds_sd_idx, static_cast<int>(_overlayVolume->numScales()) - 1);
+                overlayScale = std::pow(2.0f, -overlayIdx);
+            }
+
+            cv::Mat_<uint8_t> overlayValues;
+            readInterpolated3D(overlayValues, _overlayVolume->zarrDataset(overlayIdx), coords * overlayScale, cache, /*nearest_neighbor=*/true);
+
+            if (!overlayValues.empty() && cv::countNonZero(overlayValues) > 0) {
+                const int rawThreshold = static_cast<int>(std::max(0.0f, _overlayThreshold));
+
+                cv::Mat activeMask;
+                cv::compare(overlayValues, rawThreshold, activeMask, cv::CmpTypes::CMP_GE);
+
+                if (cv::countNonZero(activeMask) > 0) {
+                    double minActiveValue = 0.0;
+                    double maxActiveValue = 0.0;
+                    cv::minMaxLoc(overlayValues, &minActiveValue, &maxActiveValue, nullptr, nullptr, activeMask);
+
+                    if (maxActiveValue <= rawThreshold) {
+                        maxActiveValue = rawThreshold + 1.0; // avoid division by zero and ensure positive scale
+                    }
+
+                    cv::Mat overlayScaled;
+                    overlayValues.convertTo(overlayScaled, CV_32F);
+                    overlayScaled -= static_cast<float>(rawThreshold);
+                    overlayScaled.setTo(0.0f, overlayScaled < 0.0f);
+                    overlayScaled /= static_cast<float>(maxActiveValue - rawThreshold);
+                    cv::threshold(overlayScaled, overlayScaled, 1.0f, 1.0f, cv::THRESH_TRUNC);
+
+                    cv::Mat overlayColorInput;
+                    overlayScaled.convertTo(overlayColorInput, CV_8U, 255.0f);
+
+                    const auto& spec = resolveOverlayColormap(_overlayColormapId);
+                    cv::Mat overlayColor = makeOverlayColors(overlayColorInput, spec);
+
+                    if (!overlayColor.empty()) {
+                        cv::Mat inactiveMask;
+                        cv::bitwise_not(activeMask, inactiveMask);
+                        overlayColor.setTo(cv::Scalar(0, 0, 0), inactiveMask);
+
+                        cv::Mat overlayBGRA;
+                        cv::cvtColor(overlayColor, overlayBGRA, cv::COLOR_BGR2BGRA);
+
+                        std::vector<cv::Mat> channels;
+                        cv::split(overlayBGRA, channels);
+                        const uchar alphaValue = static_cast<uchar>(std::round(std::clamp(_overlayOpacity, 0.0f, 1.0f) * 255.0f));
+                        channels[3].setTo(alphaValue, activeMask);
+                        channels[3].setTo(0, inactiveMask);
+                        cv::merge(channels, overlayBGRA);
+
+                        cv::cvtColor(overlayBGRA, overlayBGRA, cv::COLOR_BGRA2RGBA);
+                        QImage overlayImage(overlayBGRA.data, overlayBGRA.cols, overlayBGRA.rows, overlayBGRA.step, QImage::Format_RGBA8888);
+                        _overlayImage = overlayImage.copy();
+                        _overlayImageValid = true;
+                    }
+                }
+            }
+        }
+    }
+
+    return baseColor;
 }
 
 class LifeTime
@@ -1053,7 +1271,13 @@ void CVolumeViewer::renderVisible(bool force)
     cv::Mat img = render_area({curr_img_area.x(), curr_img_area.y(), curr_img_area.width(), curr_img_area.height()});
     
     QImage qimg = Mat2QImage(img);
-    
+    if (_overlayImageValid && !_overlayImage.isNull()) {
+        qimg = qimg.convertToFormat(QImage::Format_RGBA8888);
+        QPainter painter(&qimg);
+        painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+        painter.drawImage(0, 0, _overlayImage);
+    }
+
     QPixmap pixmap = QPixmap::fromImage(qimg, fSkipImageFormatConv ? Qt::NoFormatConversion : Qt::AutoColor);
  
     // Add the QPixmap to the scene as a QGraphicsPixmapItem
