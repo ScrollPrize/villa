@@ -317,7 +317,7 @@ public:
             throw std::runtime_error("Invalid GridStore file: magic mismatch.");
         }
         if (version > GRIDSTORE_VERSION) {
-            throw std::runtime_error("GridStore file is a newer version than this reader supports.");
+            throw std::runtime_error("GridStore file version " + std::to_string(version) + " is newer than supported version " + std::to_string(GRIDSTORE_VERSION) + ".");
         }
 
         bounds_.x = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
