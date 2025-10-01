@@ -23,6 +23,7 @@
 #include <shared_mutex>
 
 #include <algorithm>
+#include <random>
 
 
 template<typename T>
@@ -114,66 +115,89 @@ void ChunkCache::put(const cv::Vec4i &idx, xt::xarray<uint8_t> *ar)
     _gen_store[idx] = _generation;
 }
 
-//algorithm 2: do interpolation on basis of individual chunks
-void readArea3D(xt::xtensor<uint8_t,3,xt::layout_type::column_major> &out, const cv::Vec3i offset, z5::Dataset *ds, ChunkCache *cache)
-{
-    //FIXME assert dims
-    //FIXME based on key math we should check bounds here using volume and chunk size
+void readArea3D(xt::xtensor<uint8_t, 3, xt::layout_type::column_major>& out, const cv::Vec3i offset, z5::Dataset* ds, ChunkCache* cache) {
     int group_idx = cache->groupIdx(ds->path());
-
-    cv::Vec3i size = {out.shape()[0],out.shape()[1],out.shape()[2]};
-
+    cv::Vec3i size = {(int)out.shape()[0], (int)out.shape()[1], (int)out.shape()[2]};
     auto chunksize = ds->chunking().blockShape();
+    cv::Vec3i to = offset + size;
 
-    cv::Vec3i to = offset+size;
-    cv::Vec3i offset_valid = offset;
-    for(int i=0;i<3;i++) {
-        offset_valid[i] = std::max(0,offset_valid[i]);
-        to[i] = std::max(0,to[i]);
-        offset_valid[i] = std::min(int(ds->shape(i)),offset_valid[i]);
-        to[i] = std::min(int(ds->shape(i)),to[i]);
+    // Step 1: List all required chunks
+    std::vector<cv::Vec4i> chunks_to_process;
+    cv::Vec3i start_chunk = {offset[0] / (int)chunksize[0], offset[1] / (int)chunksize[1], offset[2] / (int)chunksize[2]};
+    cv::Vec3i end_chunk = {(to[0] - 1) / (int)chunksize[0], (to[1] - 1) / (int)chunksize[1], (to[2] - 1) / (int)chunksize[2]};
+
+    for (int cz = start_chunk[0]; cz <= end_chunk[0]; ++cz) {
+        for (int cy = start_chunk[1]; cy <= end_chunk[1]; ++cy) {
+            for (int cx = start_chunk[2]; cx <= end_chunk[2]; ++cx) {
+                chunks_to_process.push_back({group_idx, cz, cy, cx});
+            }
+        }
     }
 
-    {
-        cv::Vec4i last_idx = {-1,-1,-1,-1};
+    // Shuffle to reduce I/O contention from parallel requests
+    std::shuffle(chunks_to_process.begin(), chunks_to_process.end(), std::mt19937(std::random_device()()));
+
+    // Step 2 & 3: Combined parallel I/O and copy
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (const auto& idx : chunks_to_process) {
         std::shared_ptr<xt::xarray<uint8_t>> chunk_ref;
-        xt::xarray<uint8_t> *chunk = nullptr;
-        for(size_t z = offset_valid[0];z<to[0];z++)
-            for(size_t y = offset_valid[1];y<to[1];y++)
-                for(size_t x = offset_valid[2];x<to[2];x++) {
+        bool needs_read = false;
 
-                    int iz = z/chunksize[0];
-                    int iy = y/chunksize[1];
-                    int ix = x/chunksize[2];
-
-                    cv::Vec4i idx = {group_idx,iz,iy,ix};
-
-                    if (idx != last_idx) {
-                        last_idx = idx;
-                        cache->mutex.lock();
-
-                        if (!cache->has(idx)) {
-                            cache->mutex.unlock();
-                            // std::cout << "reading chunk " << cv::Vec3i(ix,iy,iz) << " for " << cv::Vec3i(x,y,z) << chunksize << std::endl;
-                            chunk = readChunk<uint8_t>(*ds, {size_t(iz),size_t(iy),size_t(ix)});
-                            cache->mutex.lock();
-                            cache->put(idx, chunk);
-                            chunk_ref = cache->get(idx);
-                        }
-                        else {
-                            chunk_ref = cache->get(idx);
-                            chunk = chunk_ref.get();
-                        }
-                        cache->mutex.unlock();
-                    }
-
-                    if (chunk) {
-                        int lz = z-iz*chunksize[0];
-                        int ly = y-iy*chunksize[1];
-                        int lx = x-ix*chunksize[2];
-                        out(z-offset[0], y-offset[1], x-offset[2]) = chunk->operator()(lz,ly,lx);
-                    }
+        {
+            std::shared_lock<std::shared_mutex> lock(cache->mutex);
+            if (cache->has(idx)) {
+                chunk_ref = cache->get(idx);
+            } else {
+                needs_read = true;
             }
+        }
+
+        if (needs_read) {
+            auto* new_chunk = readChunk<uint8_t>(*ds, {(size_t)idx[1], (size_t)idx[2], (size_t)idx[3]});
+            std::unique_lock<std::shared_mutex> lock(cache->mutex);
+            if (!cache->has(idx)) {
+                cache->put(idx, new_chunk);
+            } else {
+                delete new_chunk; // Another thread might have cached it in the meantime
+            }
+            chunk_ref = cache->get(idx);
+        }
+
+        int cz = idx[1], cy = idx[2], cx = idx[3];
+        cv::Vec3i chunk_offset = {(int)chunksize[0] * cz, (int)chunksize[1] * cy, (int)chunksize[2] * cx};
+
+        cv::Vec3i copy_from_start = {
+            std::max(offset[0], chunk_offset[0]),
+            std::max(offset[1], chunk_offset[1]),
+            std::max(offset[2], chunk_offset[2])
+        };
+
+        cv::Vec3i copy_from_end = {
+            std::min(to[0], chunk_offset[0] + (int)chunksize[0]),
+            std::min(to[1], chunk_offset[1] + (int)chunksize[1]),
+            std::min(to[2], chunk_offset[2] + (int)chunksize[2])
+        };
+
+        if (chunk_ref) {
+            for (int z = copy_from_start[0]; z < copy_from_end[0]; ++z) {
+                for (int y = copy_from_start[1]; y < copy_from_end[1]; ++y) {
+                    for (int x = copy_from_start[2]; x < copy_from_end[2]; ++x) {
+                        int lz = z - chunk_offset[0];
+                        int ly = y - chunk_offset[1];
+                        int lx = x - chunk_offset[2];
+                        out(z - offset[0], y - offset[1], x - offset[2]) = (*chunk_ref)(lz, ly, lx);
+                    }
+                }
+            }
+        } else {
+            for (int z = copy_from_start[0]; z < copy_from_end[0]; ++z) {
+                for (int y = copy_from_start[1]; y < copy_from_end[1]; ++y) {
+                    for (int x = copy_from_start[2]; x < copy_from_end[2]; ++x) {
+                        out(z - offset[0], y - offset[1], x - offset[2]) = 0;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -216,12 +240,16 @@ void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv
     out = cv::Mat_<uint8_t>(coords.size(), 0);
     int group_idx = cache->groupIdx(ds->path());
 
-    const int chunk_size = ds->chunking().blockShape()[0];
-    const int chunk_shift = __builtin_ctz(chunk_size);
-    const int chunk_mask = chunk_size - 1;
+    const auto& blockShape = ds->chunking().blockShape();
+    if (blockShape.size() < 3) {
+        throw std::runtime_error("Unexpected chunk dimensionality for nearest-neighbor sampling: got " + std::to_string(blockShape.size()));
+    }
+    const int chunk_size_x = static_cast<int>(blockShape[0]);
+    const int chunk_size_y = static_cast<int>(blockShape[1]);
+    const int chunk_size_z = static_cast<int>(blockShape[2]);
 
-    if ((chunk_size & (chunk_size - 1)) != 0 || chunk_size == 0) {
-        throw std::runtime_error("Chunk size must be a power of 2, got: " + std::to_string(chunk_size));
+    if (chunk_size_x <= 0 || chunk_size_y <= 0 || chunk_size_z <= 0) {
+        throw std::runtime_error("Invalid chunk dimensions for nearest-neighbor sampling");
     }
 
     int w = coords.cols;
@@ -237,10 +265,10 @@ void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv
         std::shared_ptr<xt::xarray<uint8_t>> chunk_ref;
 
         #pragma omp for schedule(static, 1) collapse(2)
-        for(size_t tile_y = 0; tile_y < h; tile_y += TILE_SIZE) {
-            for(size_t tile_x = 0; tile_x < w; tile_x += TILE_SIZE) {
-                size_t y_end = std::min(tile_y + TILE_SIZE, (size_t)h);
-                size_t x_end = std::min(tile_x + TILE_SIZE, (size_t)w);
+        for(size_t tile_y = 0; tile_y < static_cast<size_t>(h); tile_y += TILE_SIZE) {
+            for(size_t tile_x = 0; tile_x < static_cast<size_t>(w); tile_x += TILE_SIZE) {
+                size_t y_end = std::min(tile_y + TILE_SIZE, static_cast<size_t>(h));
+                size_t x_end = std::min(tile_x + TILE_SIZE, static_cast<size_t>(w));
 
                 for(size_t y = tile_y; y < y_end; y++) {
                     if (y + 1 < y_end) {
@@ -248,16 +276,16 @@ void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv
                     }
 
                     for(size_t x = tile_x; x < x_end; x++) {
-                        int ox = int(coords(y,x)[2] + 0.5f);
-                        int oy = int(coords(y,x)[1] + 0.5f);
-                        int oz = int(coords(y,x)[0] + 0.5f);
+                        int ox = static_cast<int>(coords(y,x)[2] + 0.5f);
+                        int oy = static_cast<int>(coords(y,x)[1] + 0.5f);
+                        int oz = static_cast<int>(coords(y,x)[0] + 0.5f);
 
                         if ((ox | oy | oz) < 0)
                             continue;
 
-                        int ix = ox >> chunk_shift;
-                        int iy = oy >> chunk_shift;
-                        int iz = oz >> chunk_shift;
+                        int ix = ox / chunk_size_x;
+                        int iy = oy / chunk_size_y;
+                        int iz = oz / chunk_size_z;
 
                         cv::Vec4i idx = {group_idx, ix, iy, iz};
 
@@ -280,9 +308,14 @@ void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv
                         if (!chunk)
                             continue;
 
-                        int lx = ox & chunk_mask;
-                        int ly = oy & chunk_mask;
-                        int lz = oz & chunk_mask;
+                        int lx = ox - ix * chunk_size_x;
+                        int ly = oy - iy * chunk_size_y;
+                        int lz = oz - iz * chunk_size_z;
+
+                        if (lx < 0 || ly < 0 || lz < 0 ||
+                            lx >= chunk_size_x || ly >= chunk_size_y || lz >= chunk_size_z) {
+                            continue;
+                        }
 
                         out(y,x) = chunk->operator()(lx, ly, lz);
                     }
@@ -292,44 +325,13 @@ void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv
     }
 }
 
-void readInterpolated3D_phased(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
-                        const cv::Mat_<cv::Vec3f> &coords, ChunkCache *cache);
-
 void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
                                const cv::Mat_<cv::Vec3f> &coords, ChunkCache *cache, bool nearest_neighbor) {
     if (nearest_neighbor) {
         return readNearestNeighbor(out,ds,coords,cache);
     }
-
-    if (out.size() != coords.size())
-        out = cv::Mat_<uint8_t>(coords.size(), 0);
-
-    auto chunk_shape = ds->chunking().blockShape();
-    double chunk_overhead = (chunk_shape[0] + chunk_shape[1] + chunk_shape[2]) / 3.0;
-    double estimated_memory = coords.total() * chunk_overhead;
-
-    if (estimated_memory > cache->size() * 0.5) {
-        int w = coords.cols;
-        int h = coords.rows;
-        int chunk_width = std::max(1, (int)(((cache->size() * 0.5) / chunk_overhead) / h));
-
-        for (int i = 0; i < w; i += chunk_width) {
-            int current_chunk_width = std::min(chunk_width, w - i);
-            cv::Rect roi(i, 0, current_chunk_width, h);
-            cv::Mat_<cv::Vec3f> coords_chunk = coords(roi);
-            cv::Mat_<uint8_t> out_chunk = out(roi);
-            readInterpolated3D_phased(out_chunk, ds, coords_chunk, cache);
-        }
-    } else {
-        readInterpolated3D_phased(out, ds, coords, cache);
-    }
-}
-
-
-void readInterpolated3D_phased(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
-                        const cv::Mat_<cv::Vec3f> &coords, ChunkCache *cache) {
-
-    assert(out.size() == coords.size());
+  
+    out = cv::Mat_<uint8_t>(coords.size(), 0);
 
     if (!cache) {
         std::cout << "ERROR should use a shared chunk cache!" << std::endl;

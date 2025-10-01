@@ -26,6 +26,10 @@
 #include <filesystem>
 #include <fstream>
 
+using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
+using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
+using PathRenderMode = ViewerOverlayControllerBase::PathRenderMode;
+
 
 
 
@@ -40,13 +44,15 @@ DrawingWidget::DrawingWidget(QWidget* parent)
     , brushSize(3.0f)
     , opacity(1.0f)
     , eraserMode(false)
-    , brushShape(PathData::BrushShape::CIRCLE)
+    , brushShape(PathBrushShape::Circle)
     , isDrawing(false)
     , currentZSlice(0)
     , drawingModeActive(false)
     , temporaryEraserMode(false)
     , originalEraserMode(false)
 {
+    qRegisterMetaType<PathPrimitive>("PathPrimitive");
+    qRegisterMetaType<QList<PathPrimitive>>("QList<PathPrimitive>");
     setupUI();
     
     // Initialize with some default colors for path IDs
@@ -191,7 +197,7 @@ void DrawingWidget::setupUI()
             });
     
     // Set size policy
-    setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
+    setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
     
 }
 
@@ -264,7 +270,7 @@ void DrawingWidget::onMouseMove(cv::Vec3f vol_point, Qt::MouseButtons buttons, Q
             drawnPaths.append(currentPath);
             
             // Process paths to apply eraser operations
-            QList<PathData> processedPaths = processPathsWithErasers(drawnPaths);
+            QList<PathPrimitive> processedPaths = processPathsWithErasers(drawnPaths);
             emit sendPathsChanged(processedPaths);
             
             // Mark that we're no longer drawing but remember the path settings
@@ -283,11 +289,11 @@ void DrawingWidget::onMouseMove(cv::Vec3f vol_point, Qt::MouseButtons buttons, Q
         lastPoint = vol_point;
         
         // Show the new segment
-        QList<PathData> allPaths = drawnPaths;
+        QList<PathPrimitive> allPaths = drawnPaths;
         allPaths.append(currentPath);
         
         // Process paths to apply eraser operations
-        QList<PathData> processedPaths = processPathsWithErasers(allPaths);
+        QList<PathPrimitive> processedPaths = processPathsWithErasers(allPaths);
         emit sendPathsChanged(processedPaths);
         return;
     }
@@ -356,7 +362,7 @@ void DrawingWidget::onEraserToggled(bool checked)
 void DrawingWidget::onBrushShapeChanged()
 {
     brushShape = circleRadio->isChecked() ? 
-        PathData::BrushShape::CIRCLE : PathData::BrushShape::SQUARE;
+        PathBrushShape::Circle : PathBrushShape::Square;
     
     // Update cursor if drawing mode is active
     if (drawingModeActive) {
@@ -436,7 +442,7 @@ void DrawingWidget::updateUI()
 void DrawingWidget::startDrawing(cv::Vec3f startPoint)
 {
     isDrawing = true;
-    currentPath = PathData();
+    currentPath = PathPrimitive();
     currentPath.points.clear();
     currentPath.points.push_back(startPoint);
     currentPath.color = getColorForPathId(currentPathId);
@@ -445,16 +451,17 @@ void DrawingWidget::startDrawing(cv::Vec3f startPoint)
     currentPath.isEraser = eraserMode;
     currentPath.brushShape = brushShape;
     currentPath.pathId = currentPathId;
-    currentPath.type = PathData::PathType::FREEHAND;
-    currentPath.ownerWidget = "DrawingWidget";
+    currentPath.renderMode = PathRenderMode::LineStrip;
+    currentPath.pointRadius = std::max(1.0f, brushSize * 0.5f);
+    currentPath.z = eraserMode ? 26.0 : 25.0;
     
     lastPoint = startPoint;
     
     // Show temporary path
-    QList<PathData> allPaths = drawnPaths;
+    QList<PathPrimitive> allPaths = drawnPaths;
     allPaths.append(currentPath);
     
-    QList<PathData> processedPaths = processPathsWithErasers(allPaths);
+    QList<PathPrimitive> processedPaths = processPathsWithErasers(allPaths);
     emit sendPathsChanged(processedPaths);
 }
 
@@ -473,10 +480,10 @@ void DrawingWidget::addPointToPath(cv::Vec3f point)
         
         // Update display periodically
         if (currentPath.points.size() % 5 == 0) {
-            QList<PathData> allPaths = drawnPaths;
+            QList<PathPrimitive> allPaths = drawnPaths;
             allPaths.append(currentPath);
             
-            QList<PathData> processedPaths = processPathsWithErasers(allPaths);
+            QList<PathPrimitive> processedPaths = processPathsWithErasers(allPaths);
             emit sendPathsChanged(processedPaths);
         }
     }
@@ -499,7 +506,7 @@ void DrawingWidget::finalizePath()
     updateUI();
     
     // Process paths to apply eraser operations
-    QList<PathData> processedPaths = processPathsWithErasers(drawnPaths);
+    QList<PathPrimitive> processedPaths = processPathsWithErasers(drawnPaths);
     emit sendPathsChanged(processedPaths);
     
     // Update info
@@ -540,7 +547,7 @@ cv::Mat DrawingWidget::generateMask()
     painter.setRenderHint(QPainter::Antialiasing, false); // No antialiasing for masks
     
     // Process paths to apply eraser operations
-    QList<PathData> processedPaths = processPathsWithErasers(drawnPaths);
+    QList<PathPrimitive> processedPaths = processPathsWithErasers(drawnPaths);
     
     // Process paths in order
     for (const auto& path : processedPaths) {
@@ -572,9 +579,9 @@ cv::Mat DrawingWidget::generateMask()
         
         QPen pen;
         pen.setWidthF(path.lineWidth);
-        pen.setCapStyle(path.brushShape == PathData::BrushShape::SQUARE ? 
+        pen.setCapStyle(path.brushShape == PathBrushShape::Square ? 
                         Qt::SquareCap : Qt::RoundCap);
-        pen.setJoinStyle(path.brushShape == PathData::BrushShape::SQUARE ? 
+        pen.setJoinStyle(path.brushShape == PathBrushShape::Square ? 
                          Qt::MiterJoin : Qt::RoundJoin);
         
         // For eraser, use black (0). For drawing, use the path ID + 1
@@ -653,14 +660,14 @@ float DrawingWidget::pointToSegmentDistance(const cv::Vec3f& point, const cv::Ve
     return cv::norm(point - projection);
 }
 
-bool DrawingWidget::isPointInEraserBrush(const cv::Vec3f& point, const cv::Vec3f& eraserPoint, 
-                                          float eraserRadius, PathData::BrushShape brushShape) const
+bool DrawingWidget::isPointInEraserBrush(const cv::Vec3f& point, const cv::Vec3f& eraserPoint,
+                                          float eraserRadius, PathBrushShape brushShape) const
 {
     // For now, we only consider 2D distance (X,Y) as we're drawing on slices
     float dx = point[0] - eraserPoint[0];
     float dy = point[1] - eraserPoint[1];
     
-    if (brushShape == PathData::BrushShape::CIRCLE) {
+    if (brushShape == PathBrushShape::Circle) {
         float distSq = dx * dx + dy * dy;
         return distSq <= (eraserRadius * eraserRadius);
     } else { // SQUARE
@@ -668,9 +675,9 @@ bool DrawingWidget::isPointInEraserBrush(const cv::Vec3f& point, const cv::Vec3f
     }
 }
 
-QList<PathData> DrawingWidget::processPathsWithErasers(const QList<PathData>& rawPaths) const
+QList<PathPrimitive> DrawingWidget::processPathsWithErasers(const QList<PathPrimitive>& rawPaths) const
 {
-    QList<PathData> processedPaths;
+    QList<PathPrimitive> processedPaths;
     
     // Process paths in chronological order
     for (const auto& path : rawPaths) {
@@ -679,7 +686,7 @@ QList<PathData> DrawingWidget::processPathsWithErasers(const QList<PathData>& ra
             processedPaths.append(path);
         } else {
             // For eraser paths, process all previous paths
-            QList<PathData> updatedPaths;
+            QList<PathPrimitive> updatedPaths;
             
             for (const auto& targetPath : processedPaths) {
                 // Skip if this is also an eraser path (shouldn't happen, but be safe)
@@ -689,9 +696,9 @@ QList<PathData> DrawingWidget::processPathsWithErasers(const QList<PathData>& ra
                 }
                 
                 // Process this target path against the eraser
-                PathData currentSegment = targetPath;
+                PathPrimitive currentSegment = targetPath;
                 currentSegment.points.clear();
-                QList<PathData> segments;
+                QList<PathPrimitive> segments;
                 
                 bool inErasedSection = false;
                 
@@ -749,5 +756,3 @@ QList<PathData> DrawingWidget::processPathsWithErasers(const QList<PathData>& ra
     
     return processedPaths;
 }
-
-

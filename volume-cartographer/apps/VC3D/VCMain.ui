@@ -516,7 +516,7 @@
     <set>Qt::DockWidgetArea::LeftDockWidgetArea|Qt::DockWidgetArea::RightDockWidgetArea</set>
    </property>
    <property name="windowTitle">
-    <string>Tools</string>
+    <string>Segmentation</string>
    </property>
    <attribute name="dockWidgetArea">
     <number>2</number>
@@ -538,7 +538,7 @@
      <item>
       <widget class="QPushButton" name="btnStopTools">
        <property name="text">
-        <string>Stop tools</string>
+        <string>Stop</string>
        </property>
       </widget>
      </item>
@@ -972,7 +972,96 @@
         </property>
        </widget>
       </item>
-      <item row="3" column="0" colspan="4">
+      <item row="3" column="0">
+       <widget class="QLabel" name="labelIntersectionOpacity">
+        <property name="text">
+         <string>Intersection opacity</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="1" colspan="2">
+       <widget class="QSpinBox" name="spinIntersectionOpacity">
+        <property name="minimum">
+         <number>0</number>
+        </property>
+        <property name="maximum">
+         <number>100</number>
+        </property>
+        <property name="value">
+         <number>100</number>
+        </property>
+        <property name="suffix">
+         <string>%</string>
+        </property>
+        <property name="toolTip">
+         <string>Adjust opacity of intersection overlays</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="0">
+       <widget class="QLabel" name="labelOverlayVolume">
+        <property name="text">
+         <string>Overlay volume</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="1" colspan="3">
+       <widget class="QComboBox" name="overlayVolumeSelect"/>
+      </item>
+      <item row="5" column="0">
+       <widget class="QLabel" name="labelOverlayOpacity">
+        <property name="text">
+         <string>Overlay opacity</string>
+        </property>
+       </widget>
+      </item>
+      <item row="5" column="1" colspan="3">
+       <widget class="QSlider" name="overlayOpacitySlider">
+        <property name="orientation">
+         <enum>Qt::Horizontal</enum>
+        </property>
+        <property name="minimum">
+         <number>0</number>
+        </property>
+        <property name="maximum">
+         <number>100</number>
+        </property>
+        <property name="value">
+         <number>50</number>
+        </property>
+       </widget>
+      </item>
+      <item row="6" column="0">
+       <widget class="QLabel" name="labelOverlayThreshold">
+        <property name="text">
+         <string>Overlay threshold</string>
+        </property>
+       </widget>
+      </item>
+      <item row="6" column="1" colspan="3">
+       <widget class="QSpinBox" name="overlayThresholdSpin">
+        <property name="minimum">
+         <number>0</number>
+        </property>
+        <property name="maximum">
+         <number>65535</number>
+        </property>
+        <property name="value">
+         <number>1</number>
+        </property>
+       </widget>
+      </item>
+      <item row="7" column="0">
+       <widget class="QLabel" name="labelOverlayColormap">
+        <property name="text">
+         <string>Overlay colormap</string>
+        </property>
+       </widget>
+      </item>
+      <item row="7" column="1" colspan="3">
+       <widget class="QComboBox" name="overlayColormapSelect"/>
+      </item>
+      <item row="8" column="0" colspan="4">
        <widget class="QCheckBox" name="chkAxisAlignedSlices">
         <property name="text">
          <string>Use axis-aligned slice planes</string>

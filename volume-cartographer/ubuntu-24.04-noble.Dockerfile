@@ -14,6 +14,41 @@ RUN apt -y install build-essential git cmake qt6-base-dev libboost-system-dev li
 
 RUN apt-get install -y flex bison zlib1g-dev gfortran libopenblas-dev liblapack-dev libscotch-dev libhwloc-dev
 
+# --- Build & install OpenCV 4.10.0 (with TIFF) ---
+# Extra codecs needed for image I/O; trim if you don't need them
+RUN apt-get update && apt-get install -y \
+    libtiff-dev libjpeg-dev libpng-dev libopenexr-dev \
+    libavcodec-dev libavformat-dev libswscale-dev \
+    libeigen3-dev libtbb-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /tmp/opencv
+RUN git clone -b 4.10.0 --depth 1 https://github.com/opencv/opencv.git \
+ && git clone -b 4.10.0 --depth 1 https://github.com/opencv/opencv_contrib.git
+
+# Configure with CMake, generate build system into ./build
+RUN cmake -S opencv -B build \
+    -DOPENCV_EXTRA_MODULES_PATH=/tmp/opencv/opencv_contrib/modules \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DBUILD_TESTS=OFF \
+    -DBUILD_PERF_TESTS=OFF \
+    -DBUILD_EXAMPLES=OFF \
+    -DWITH_TIFF=ON \
+    -DWITH_CUDA=OFF \
+    -DWITH_OPENCL=OFF \
+    -DBUILD_opencv_dnn=OFF \
+    -DBUILD_opencv_dnn_objdetect=OFF \
+    -DBUILD_opencv_dnn_superres=OFF \
+    -DBUILD_opencv_sfm=OFF
+
+# Build & install
+RUN cmake --build build -- -j"$(nproc)" \
+ && cmake --install build \
+ && ldconfig \
+ && rm -rf /tmp/opencv
+
+
 # --- pin specific xtl + xtensor versions from .deb files ---
 RUN set -eux; \
     cd /tmp; \
@@ -72,7 +107,14 @@ COPY . /src
 # ------------------------- Build your main project ---------------------------
 RUN mkdir -p /src/build
 WORKDIR /src/build
-RUN cmake -DVC_WITH_CUDA_SPARSE=off -GNinja /src && ninja && cpack -G DEB -V && dpkg -i /src/build/pkgs/vc3d*.deb
+RUN cmake -DVC_WITH_CUDA_SPARSE=off \
+          -DCPACK_DEBIAN_PACKAGE_SHLIBDEPS=ON \
+          -DCPACK_DEBIAN_PACKAGE_DEPENDS="" \
+          -GNinja /src \
+ && ninja \
+ && cpack -G DEB -V \
+ && dpkg -i /src/build/pkgs/vc3d*.deb
+
 
 WORKDIR /src/libs
 RUN mkdir pastix-install

@@ -12,6 +12,8 @@
 #include <mutex>
 #include <unordered_map>
 
+#include <opencv2/ximgproc.hpp>
+
 #include "vc/core/util/xtensor_include.hpp"
 #include XTENSORINCLUDE(containers, xarray.hpp)
 #include "z5/factory.hxx"
@@ -26,6 +28,13 @@
 
 namespace fs = std::filesystem;
 namespace po = boost::program_options;
+
+static std::pair<SkeletonGraph, cv::Mat> generate_skeleton_graph(const cv::Mat& binary_slice, const po::variables_map& vm) {
+    cv::Mat skeleton_img;
+    cv::ximgproc::thinning(binary_slice, skeleton_img, cv::ximgproc::THINNING_GUOHALL);
+    SkeletonGraph skeleton_graph = trace_skeleton_segments(skeleton_img, vm);
+    return {std::move(skeleton_graph), std::move(skeleton_img)};
+}
 
 enum class SliceDirection { XY, XZ, YZ };
 
@@ -173,10 +182,9 @@ int main(int argc, char* argv[]) {
                 std::ofstream ofs(out_path); // Create empty file
                 processed++;
             } else {
-                decltype(generate_skeleton_graph(binary_slice, vm)) skeleton_res;
-                skeleton_res = generate_skeleton_graph(binary_slice, vm);
+                auto skeleton_res = generate_skeleton_graph(binary_slice, vm);
                 t.mark("skeleton");
-                auto& [skeleton_graph, skeleton_id_img] = skeleton_res;
+                auto& skeleton_graph = skeleton_res.first;
 
                 vc::core::util::GridStore grid_store(cv::Rect(0, 0, slice_mat.cols, slice_mat.rows), vm["grid-step"].as<int>());
                 populate_normal_grid(skeleton_graph, grid_store, spiral_step);

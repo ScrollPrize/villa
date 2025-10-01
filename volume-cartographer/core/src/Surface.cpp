@@ -10,102 +10,14 @@
 
 #include <unordered_map>
 #include <nlohmann/json.hpp>
+#include <system_error>
 
-#include "vc/core/util/DateTime.hpp"
-
-#include <tiffio.h>
-#include <limits>
-
-static void writeBigTiffSingleChannel(
-    const std::filesystem::path& outPath,
-    const cv::Mat& img,
-    uint32_t tileW = 512,
-    uint32_t tileH = 512,
-    int compression = COMPRESSION_DEFLATE /* or COMPRESSION_LZW */
-) {
-    if (img.empty())
-        throw std::runtime_error("writeBigTiff: empty image: " + outPath.string());
-    if (img.channels() != 1)
-        throw std::runtime_error("writeBigTiff: only single-channel supported for " + outPath.string());
-
-    // Decide bit depth + sample format (promote unsupported to float32)
-    int depthBytes = 0; uint16 bitsPerSample = 0; uint16 sampleFormat = SAMPLEFORMAT_UINT;
-    switch (img.type()) {
-        case CV_8UC1:  depthBytes = 1; bitsPerSample = 8;  sampleFormat = SAMPLEFORMAT_UINT;    break;
-        case CV_16UC1: depthBytes = 2; bitsPerSample = 16; sampleFormat = SAMPLEFORMAT_UINT;    break;
-        case CV_32FC1: depthBytes = 4; bitsPerSample = 32; sampleFormat = SAMPLEFORMAT_IEEEFP;  break;
-        default: {
-            cv::Mat tmp; img.convertTo(tmp, CV_32FC1);
-            writeBigTiffSingleChannel(outPath, tmp, tileW, tileH, compression);
-            return;
-        }
-    }
-
-    TIFF* tif = TIFFOpen(outPath.string().c_str(), "w8"); // BigTIFF
-    if (!tif) throw std::runtime_error("writeBigTiff: cannot open " + outPath.string());
-
-    const uint32_t W = static_cast<uint32_t>(img.cols);
-    const uint32_t H = static_cast<uint32_t>(img.rows);
-
-    TIFFSetField(tif, TIFFTAG_IMAGEWIDTH,  W);
-    TIFFSetField(tif, TIFFTAG_IMAGELENGTH, H);
-    TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 1);
-    TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, bitsPerSample);
-    TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, sampleFormat);
-    TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
-    TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
-    TIFFSetField(tif, TIFFTAG_COMPRESSION, compression);
-    TIFFSetField(tif, TIFFTAG_TILEWIDTH,  tileW);
-    TIFFSetField(tif, TIFFTAG_TILELENGTH, tileH);
-    if (compression != COMPRESSION_NONE) {
-        // 2 = horizontal differencing (for integers), 3 = floating-point predictor
-        const uint16 predictor = (sampleFormat == SAMPLEFORMAT_IEEEFP) ? 3 : 2;
-        TIFFSetField(tif, TIFFTAG_PREDICTOR, predictor);
-    }
-    TIFFSetField(tif, TIFFTAG_SOFTWARE, "vc_obj2tifxyz");
-
-    const size_t tileNPix = static_cast<size_t>(tileW) * static_cast<size_t>(tileH);
-    const tmsize_t tileBytes = static_cast<tmsize_t>(tileNPix * static_cast<size_t>(depthBytes));
-    std::vector<uint8_t> tileBuf(static_cast<size_t>(tileBytes), 0);
-
-    // For float tiles, pad with NaNs so outside-ROI padding is clearly invalid
-    if (sampleFormat == SAMPLEFORMAT_IEEEFP) {
-        float* fbuf = reinterpret_cast<float*>(tileBuf.data());
-        std::fill(fbuf, fbuf + tileNPix, std::numeric_limits<float>::quiet_NaN());
-    }
-
-    for (uint32_t y0 = 0; y0 < H; y0 += tileH) {
-        const uint32_t dy = std::min(tileH, H - y0);
-        for (uint32_t x0 = 0; x0 < W; x0 += tileW) {
-            const uint32_t dx = std::min(tileW, W - x0);
-
-            // Reset padding each tile
-            if (sampleFormat != SAMPLEFORMAT_IEEEFP) {
-                std::fill(tileBuf.begin(), tileBuf.end(), 0);
-            } else {
-                float* fbuf = reinterpret_cast<float*>(tileBuf.data());
-                std::fill(fbuf, fbuf + tileNPix, std::numeric_limits<float>::quiet_NaN());
-            }
-
-            for (uint32_t yy = 0; yy < dy; ++yy) {
-                const uint8_t* src = img.ptr<uint8_t>(static_cast<int>(y0 + yy)) + static_cast<size_t>(x0) * depthBytes;
-                uint8_t* dst = tileBuf.data() + static_cast<size_t>(yy) * tileW * depthBytes;
-                std::memcpy(dst, src, static_cast<size_t>(dx) * depthBytes);
-            }
-
-            const uint32_t tileIndex = TIFFComputeTile(tif, x0, y0, 0, 0);
-            if (TIFFWriteEncodedTile(tif, tileIndex, tileBuf.data(), tileBytes) < 0) {
-                TIFFClose(tif);
-                throw std::runtime_error(
-                    "writeBigTiff: TIFFWriteEncodedTile failed at tile (" +
-                    std::to_string(x0) + "," + std::to_string(y0) + ") for " + outPath.string());
-            }
-        }
-    }
-
-    TIFFClose(tif);
-}
-
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
 
 void write_overlapping_json(const std::filesystem::path& seg_path, const std::set<std::string>& overlapping_names) {
     nlohmann::json overlap_json;
@@ -428,7 +340,7 @@ void QuadSurface::setChannel(const std::string& name, const cv::Mat& channel)
     _channels[name] = channel;
 }
 
-cv::Mat QuadSurface::channel(const std::string& name)
+cv::Mat QuadSurface::channel(const std::string& name, int flags)
 {
     if (_channels.count(name)) {
         cv::Mat& channel = _channels[name];
@@ -436,12 +348,39 @@ cv::Mat QuadSurface::channel(const std::string& name)
             // On-demand loading
             std::filesystem::path channel_path = path / (name + ".tif");
             if (std::filesystem::exists(channel_path)) {
-                channel = cv::imread(channel_path.string(), cv::IMREAD_UNCHANGED);
+                std::vector<cv::Mat> layers;
+                cv::imreadmulti(channel_path.string(), layers, cv::IMREAD_UNCHANGED);
+                if (!layers.empty()) {
+                    channel = layers[0];
+                }
             }
+        }
+
+        if (!channel.empty() && !(flags & SURF_CHANNEL_NORESIZE)) {
+            cv::Mat scaled_channel;
+            cv::resize(channel, scaled_channel, _points->size(), 0, 0, cv::INTER_NEAREST);
+            return scaled_channel;
         }
         return channel;
     }
     return cv::Mat();
+}
+
+void QuadSurface::invalidateCache()
+{
+    if (_points) {
+        _bounds = {0, 0, _points->cols - 1, _points->rows - 1};
+        _center = {
+            _points->cols / 2.0 / _scale[0],
+            _points->rows / 2.0 / _scale[1],
+            0
+        };
+    } else {
+        _bounds = {0, 0, -1, -1};
+        _center = {0, 0, 0};
+    }
+
+    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
 }
 
 void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
@@ -797,11 +736,40 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
         min_dist = 10*(_points->cols/_scale[0]+_points->rows/_scale[1]);
 
     int r_full = 0;
+    int skip_count = 0;
     for(int r=0; r<10*max_iters && r_full<max_iters; r++) {
         loc = {1 + (rand() % (_points->cols-3)), 1 + (rand() % (_points->rows-3))};
 
-        if ((*_points)(loc[1],loc[0])[0] == -1)
-            continue;
+        if ((*_points)(loc[1],loc[0])[0] == -1) {
+            skip_count++;
+            if (skip_count > max_iters / 10) {
+                cv::Vec2f dir = { (float)(rand() % 3 - 1), (float)(rand() % 3 - 1) };
+                if (dir[0] == 0 && dir[1] == 0) dir = {1, 0};
+
+                cv::Vec2f current_pos = loc;
+                bool first_valid_found = false;
+                for (int i = 0; i < std::max(_points->cols, _points->rows); ++i) {
+                    current_pos += dir;
+                    if (current_pos[0] < 1 || current_pos[0] >= _points->cols - 1 ||
+                        current_pos[1] < 1 || current_pos[1] >= _points->rows - 1) {
+                        break; // Reached border
+                    }
+
+                    if ((*_points)((int)current_pos[1], (int)current_pos[0])[0] != -1) {
+                        if (first_valid_found) {
+                            loc = current_pos;
+                            break; // Found second consecutive valid point
+                        }
+                        first_valid_found = true;
+                    } else {
+                        first_valid_found = false;
+                    }
+                }
+                if ((*_points)(loc[1],loc[0])[0] == -1) continue; // if we didn't find a valid point
+            } else {
+                continue;
+            }
+        }
 
         r_full++;
 
@@ -1213,61 +1181,120 @@ struct DSReader
 };
 
 
-void QuadSurface::save(std::filesystem::path &path_)
+void QuadSurface::save(const std::filesystem::path &path_, bool force_overwrite)
 {
     if (path_.filename().empty())
-        save(path_, path_.parent_path().filename());
+        save(path_, path_.parent_path().filename(), force_overwrite);
     else
-        save(path_, path_.filename());
-
+        save(path_, path_.filename(), force_overwrite);
 }
 
-
-void QuadSurface::save(const std::string &path_, const std::string &uuid)
+void QuadSurface::saveOverwrite()
 {
-    path = path_;
-
-    if (!std::filesystem::create_directories(path)) {
-        if (std::filesystem::exists(path))
-            throw std::runtime_error("dir already exists => cannot run QuadSurface::save(): " + path.string());
-        else
-            throw std::runtime_error("error creating dir for QuadSurface::save(): " + path.string());
+    if (path.empty()) {
+        throw std::runtime_error("QuadSurface::saveOverwrite() requires a valid path");
     }
 
-    // Split XYZ planes from points (CV_32FC3 -> three CV_32FC1 mats)
-    std::vector<cv::Mat> xyz;
-    cv::split((*_points), xyz);
+    std::filesystem::path final_path = path;
+    std::string uuid = !id.empty() ? id : final_path.filename().string();
+    if (uuid.empty()) {
+        throw std::runtime_error("QuadSurface::saveOverwrite() requires a non-empty uuid");
+    }
 
-    // --- BigTIFF tiled writes (no size limit issues) ---
-    const uint32_t tileW = 512;
-    const uint32_t tileH = 512;
-    writeBigTiffSingleChannel(path / "x.tif", xyz[0], tileW, tileH);
-    writeBigTiffSingleChannel(path / "y.tif", xyz[1], tileW, tileH);
-    writeBigTiffSingleChannel(path / "z.tif", xyz[2], tileW, tileH);
+    save(final_path.string(), uuid, true);
 
-    std::vector<std::string> channel_names;
-    for (auto const& [name, mat] : _channels) {
-        if (!mat.empty()) {
-            writeBigTiffSingleChannel(path / (name + ".tif"), mat, tileW, tileH);
-            channel_names.push_back(name);
+    path = final_path;
+    id = uuid;
+}
+
+void QuadSurface::save(const std::string &path_, const std::string &uuid, bool force_overwrite)
+{
+    std::filesystem::path target_path = path_;
+    std::filesystem::path final_path = path_;
+
+    if (!force_overwrite && std::filesystem::exists(final_path))
+        throw std::runtime_error("path already exists!");
+
+
+    std::filesystem::path temp_path = target_path.parent_path() / ".tmp" / target_path.filename();
+    std::filesystem::create_directories(temp_path.parent_path());
+    path = temp_path;
+
+    if (!std::filesystem::create_directories(path)) {
+        if (!std::filesystem::exists(path)) {
+            throw std::runtime_error("error creating dir for QuadSurface::save(): " + path.string());
         }
     }
 
-    // --- metadata
-    if (!meta) meta = new nlohmann::json;
-    (*meta)["channels"] = channel_names;
+    std::vector<cv::Mat> xyz;
+
+    cv::split((*_points), xyz);
+
+    std::vector<int> compression_params;
+    compression_params.push_back(cv::IMWRITE_TIFF_COMPRESSION);
+    compression_params.push_back(cv::IMWRITE_TIFF_COMPRESSION_LZW);
+
+    cv::imwrite(path/"x.tif", xyz[0], compression_params);
+    cv::imwrite(path/"y.tif", xyz[1], compression_params);
+    cv::imwrite(path/"z.tif", xyz[2], compression_params);
+
+    for (auto const& [name, mat] : _channels) {
+        if (!mat.empty()) {
+            cv::imwrite(path / (name + ".tif"), mat, compression_params);
+        }
+    }
+
+    if (!meta)
+        meta = new nlohmann::json;
+
     (*meta)["bbox"] = {{bbox().low[0],bbox().low[1],bbox().low[2]},{bbox().high[0],bbox().high[1],bbox().high[2]}};
     (*meta)["type"] = "seg";
     (*meta)["uuid"] = uuid;
     (*meta)["format"] = "tifxyz";
     (*meta)["scale"] = {_scale[0], _scale[1]};
-    (*meta)["date_last_modified"] = get_surface_time_str();
-
-    std::ofstream o(path / "meta.json.tmp");
+    std::ofstream o(path/"meta.json.tmp");
     o << std::setw(4) << (*meta) << std::endl;
-    std::filesystem::rename(path / "meta.json.tmp", path / "meta.json");
-}
 
+    //rename to make creation atomic
+    std::filesystem::rename(path/"meta.json.tmp", path/"meta.json");
+
+    if (force_overwrite && std::filesystem::exists(final_path)) {
+        std::filesystem::path versions_path = final_path / "versions";
+        std::filesystem::create_directories(versions_path);
+        int max_version = -1;
+        if (std::filesystem::exists(versions_path)) {
+            for (const auto& entry : std::filesystem::directory_iterator(versions_path)) {
+                if (entry.is_directory()) {
+                    try {
+                        int version = std::stoi(entry.path().filename().string());
+                        if (version > max_version) {
+                            max_version = version;
+                        }
+                    } catch (const std::invalid_argument& e) {
+                        // Ignore non-numeric directory names
+                    }
+                }
+            }
+        }
+        
+        std::filesystem::path new_version_path = versions_path / std::to_string(max_version + 1);
+
+        if (renameat2(AT_FDCWD, temp_path.c_str(), AT_FDCWD, final_path.c_str(), RENAME_EXCHANGE) != 0) {
+            const int err = errno;
+            if (err == ENOSYS) {
+                throw std::runtime_error("Atomic exchange failed: renameat2 syscall with RENAME_EXCHANGE is not supported on this system. This operation requires Linux kernel >= 3.15.");
+            } else {
+                const std::error_code ec(err, std::generic_category());
+                throw std::runtime_error("atomic exchange failed for " + temp_path.string() + " and " + final_path.string() + ": " + ec.message());
+            }
+        }
+
+        std::filesystem::rename(temp_path/"versions", final_path/"versions");
+        std::filesystem::rename(temp_path, new_version_path);
+    }
+    else
+        std::filesystem::rename(temp_path, final_path);
+}
 
 void QuadSurface::save_meta()
 {
@@ -1275,7 +1302,7 @@ void QuadSurface::save_meta()
         throw std::runtime_error("can't save_meta() without metadata!");
     if (path.empty())
         throw std::runtime_error("no storage path for QuadSurface");
-    std::cout << " saving metadata" << std::endl;
+
     std::ofstream o(path/"meta.json.tmp");
     o << std::setw(4) << (*meta) << std::endl;
 
@@ -1300,7 +1327,7 @@ Rect3D QuadSurface::bbox()
     return _bbox;
 }
 
-QuadSurface *load_quad_from_tifxyz(const std::string &path)
+QuadSurface *load_quad_from_tifxyz(const std::string &path, int flags)
 {
     std::vector<cv::Mat_<float>> xyz = {cv::imread(path+"/x.tif",cv::IMREAD_UNCHANGED),cv::imread(path+"/y.tif",cv::IMREAD_UNCHANGED),cv::imread(path+"/z.tif",cv::IMREAD_UNCHANGED)};
 
@@ -1319,11 +1346,11 @@ QuadSurface *load_quad_from_tifxyz(const std::string &path)
                 (*points)(j,i) = {-1,-1,-1};
             }
 
-    if (std::filesystem::exists(path+"/mask.tif")) {
+    if (!(flags & SURF_LOAD_IGNORE_MASK) && std::filesystem::exists(path+"/mask.tif")) {
         std::vector<cv::Mat> layers;
         cv::imreadmulti(path+"/mask.tif", layers, cv::IMREAD_GRAYSCALE);
         cv::Mat_<uint8_t> mask = layers[0];
-        cv::resize(mask, mask, points->size(), cv::INTER_NEAREST);
+        cv::resize(mask, mask, points->size(), 0, 0, cv::INTER_NEAREST);
         for(int j=0;j<points->rows;j++)
             for(int i=0;i<points->cols;i++)
                 if (!mask(j,i))
@@ -1336,9 +1363,12 @@ QuadSurface *load_quad_from_tifxyz(const std::string &path)
     surf->id   = metadata["uuid"];
     surf->meta = new nlohmann::json(metadata);
 
-    if (metadata.contains("channels")) {
-        for (const auto& name : metadata["channels"]) {
-            surf->setChannel(name.get<std::string>(), cv::Mat());
+    for (const auto& entry : std::filesystem::directory_iterator(path)) {
+        if (entry.path().extension() == ".tif") {
+            std::string filename = entry.path().stem().string();
+            if (filename != "x" && filename != "y" && filename != "z") {
+                surf->setChannel(filename, cv::Mat());
+            }
         }
     }
 
@@ -1492,6 +1522,54 @@ std::string SurfaceMeta::name()
     return path.filename();
 }
 
+void generate_mask(QuadSurface* surf,
+                            cv::Mat_<uint8_t>& mask,
+                            cv::Mat_<uint8_t>& img,
+                            z5::Dataset* ds_high,
+                            z5::Dataset* ds_low,
+                            ChunkCache* cache) {
+    cv::Mat_<cv::Vec3f> points = surf->rawPoints();
+
+    // Choose resolution based on surface size
+    if (points.cols >= 4000) {
+        // Large surface: work at 0.25x scale
+        if (ds_low && cache) {
+            readInterpolated3D(img, ds_low, points * 0.25, cache);
+        } else {
+            img.create(points.size());
+            img.setTo(0);
+        }
+
+        mask.create(img.size());
+        for(int j = 0; j < img.rows; j++) {
+            for(int i = 0; i < img.cols; i++) {
+                mask(j,i) = (points(j,i)[0] == -1) ? 0 : 255;
+            }
+        }
+    } else {
+        // Small surface: resize and downsample
+        cv::Mat_<cv::Vec3f> scaled;
+        cv::Vec2f scale = surf->scale();
+        cv::resize(points, scaled, {0,0}, 1.0/scale[0], 1.0/scale[1], cv::INTER_CUBIC);
+
+        if (ds_high && cache) {
+            readInterpolated3D(img, ds_high, scaled, cache);
+            cv::resize(img, img, {0,0}, 0.25, 0.25, cv::INTER_CUBIC);
+        } else {
+            img.create(cv::Size(points.cols/4.0, points.rows/4.0));
+            img.setTo(0);
+        }
+
+        mask.create(img.size());
+        for(int j = 0; j < img.rows; j++) {
+            for(int i = 0; i < img.cols; i++) {
+                int orig_j = j * 4 * scale[1];
+                int orig_i = i * 4 * scale[0];
+                mask(j,i) = (points(orig_j, orig_i)[0] == -1) ? 0 : 255;
+            }
+        }
+    }
+}
 
 QuadSurface* surface_diff(QuadSurface* a, QuadSurface* b, float tolerance) {
     cv::Mat_<cv::Vec3f>* diff_points = new cv::Mat_<cv::Vec3f>(a->rawPoints().clone());
