@@ -34,14 +34,12 @@ public:
     void invalidateVis();
     void invalidateIntersect(const std::string &name = "");
     
-    std::set<std::string> intersects();
     void setIntersects(const std::set<std::string> &set);
     std::string surfName() const { return _surf_name; };
     void recalcScales();
     
     // Composite view methods
     void setCompositeEnabled(bool enabled);
-    void setCompositeLayers(int layers);
     void setCompositeLayersInFront(int layers);
     void setCompositeLayersBehind(int layers);
     void setCompositeMethod(const std::string& method);

@@ -665,12 +665,6 @@ void CVolumeViewer::onIntersectionChanged(std::string a, std::string b, Intersec
     renderIntersections();
 }
 
-
-std::set<std::string> CVolumeViewer::intersects()
-{
-    return _intersect_tgts;
-}
-
 void CVolumeViewer::setIntersects(const std::set<std::string> &set)
 {
     _intersect_tgts = set;
@@ -1841,24 +1835,6 @@ void CVolumeViewer::setCompositeEnabled(bool enabled)
         _lbl->setText(status);
     }
 }
-
-void CVolumeViewer::setCompositeLayers(int layers)
-{
-    if (layers >= 1 && layers <= 21 && layers != _composite_layers) {
-        _composite_layers = layers;
-        if (_composite_enabled) {
-            renderVisible(true);
-            
-            // Update status label
-            QString status = QString("%1x %2").arg(_scale).arg(_z_off);
-            QString method = QString::fromStdString(_composite_method);
-            method[0] = method[0].toUpper();
-            status += QString(" | Composite: %1(%2)").arg(method).arg(_composite_layers);
-            _lbl->setText(status);
-        }
-    }
-}
-
 void CVolumeViewer::setCompositeLayersInFront(int layers)
 {
     if (layers >= 0 && layers <= 21 && layers != _composite_layers_front) {
