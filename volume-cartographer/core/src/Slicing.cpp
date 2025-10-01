@@ -242,7 +242,7 @@ void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv
 
     const auto& blockShape = ds->chunking().blockShape();
     if (blockShape.size() < 3) {
-        throw std::runtime_error("Unexpected chunk dimensionality for nearest-neighbor sampling");
+        throw std::runtime_error("Unexpected chunk dimensionality for nearest-neighbor sampling: got " + std::to_string(blockShape.size()));
     }
     const int chunk_size_x = static_cast<int>(blockShape[0]);
     const int chunk_size_y = static_cast<int>(blockShape[1]);
