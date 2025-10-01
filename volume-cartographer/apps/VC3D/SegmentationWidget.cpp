@@ -15,6 +15,7 @@
 #include <QLoggingCategory>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QScrollBar>
 #include <QSettings>
 #include <QSignalBlocker>
@@ -41,10 +42,79 @@ constexpr int kGrowDirRightBit = 1 << 3;
 constexpr int kGrowDirAllMask = kGrowDirUpBit | kGrowDirDownBit | kGrowDirLeftBit | kGrowDirRightBit;
 constexpr int kCompactDirectionFieldRowLimit = 3;
 
+bool containsSurfKeyword(const QString& text)
+{
+    if (text.isEmpty()) {
+        return false;
+    }
+    const QString lowered = text.toLower();
+    return lowered.contains(QStringLiteral("surface")) || lowered.contains(QStringLiteral("surf"));
+}
+
+std::optional<int> trailingNumber(const QString& text)
+{
+    static const QRegularExpression numberSuffix(QStringLiteral("(\\d+)$"));
+    const auto match = numberSuffix.match(text.trimmed());
+    if (match.hasMatch()) {
+        return match.captured(1).toInt();
+    }
+    return std::nullopt;
+}
+
 QString settingsGroup()
 {
     return QStringLiteral("segmentation_edit");
 }
+}
+
+QString SegmentationWidget::determineDefaultVolumeId(const QVector<QPair<QString, QString>>& volumes,
+                                                     const QString& requestedId) const
+{
+    const auto hasId = [&volumes](const QString& id) {
+        return std::any_of(volumes.cbegin(), volumes.cend(), [&](const auto& entry) {
+            return entry.first == id;
+        });
+    };
+
+    QString numericCandidate;
+    int numericValue = -1;
+    QString keywordCandidate;
+
+    for (const auto& entry : volumes) {
+        const QString& id = entry.first;
+        const QString& label = entry.second;
+
+        if (!containsSurfKeyword(id) && !containsSurfKeyword(label)) {
+            continue;
+        }
+
+        const auto numberFromId = trailingNumber(id);
+        const auto numberFromLabel = trailingNumber(label);
+        const std::optional<int> number = numberFromId ? numberFromId : numberFromLabel;
+
+        if (number) {
+            if (*number > numericValue) {
+                numericValue = *number;
+                numericCandidate = id;
+            }
+        } else if (keywordCandidate.isEmpty()) {
+            keywordCandidate = id;
+        }
+    }
+
+    if (!numericCandidate.isEmpty()) {
+        return numericCandidate;
+    }
+    if (!keywordCandidate.isEmpty()) {
+        return keywordCandidate;
+    }
+    if (!requestedId.isEmpty() && hasId(requestedId)) {
+        return requestedId;
+    }
+    if (!volumes.isEmpty()) {
+        return volumes.front().first;
+    }
+    return {};
 }
 
 SegmentationWidget::SegmentationWidget(QWidget* parent)
@@ -873,14 +943,20 @@ void SegmentationWidget::setAvailableVolumes(const QVector<QPair<QString, QStrin
                                               const QString& activeId)
 {
     _volumeEntries = volumes;
-    _activeVolumeId = activeId;
+    _activeVolumeId = determineDefaultVolumeId(_volumeEntries, activeId);
     if (_comboVolumes) {
         const QSignalBlocker blocker(_comboVolumes);
         _comboVolumes->clear();
         for (const auto& entry : _volumeEntries) {
-            _comboVolumes->addItem(entry.first, entry.second);
+            const QString& id = entry.first;
+            const QString& label = entry.second.isEmpty() ? id : entry.second;
+            _comboVolumes->addItem(label, id);
         }
         int idx = _comboVolumes->findData(_activeVolumeId);
+        if (idx < 0 && !_volumeEntries.isEmpty()) {
+            _activeVolumeId = _comboVolumes->itemData(0).toString();
+            idx = 0;
+        }
         if (idx >= 0) {
             _comboVolumes->setCurrentIndex(idx);
         }

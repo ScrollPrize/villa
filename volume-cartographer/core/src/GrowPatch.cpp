@@ -22,15 +22,53 @@
 #include <iostream>
 #include <cctype>
 #include <random>
+#include <optional>
+#include <cstdlib>
+#include <limits>
 
 #include "vc/tracer/Tracer.hpp"
 #include "vc/ui/VCCollection.hpp"
 
 namespace { // Anonymous namespace for local helpers
 
+std::optional<uint32_t> environment_seed()
+{
+    static const std::optional<uint32_t> cached = []() -> std::optional<uint32_t> {
+        const char* env = std::getenv("VC_GROWPATCH_RNG_SEED");
+        if (!env || *env == '\0') {
+            return std::nullopt;
+        }
+
+        char* end = nullptr;
+        const unsigned long long value = std::strtoull(env, &end, 10);
+        if (!end || *end != '\0' || value > std::numeric_limits<uint32_t>::max()) {
+            return std::nullopt;
+        }
+        return static_cast<uint32_t>(value);
+    }();
+
+    return cached;
+}
+
+std::mt19937& thread_rng()
+{
+    static thread_local std::mt19937 rng = [] {
+        if (const auto seed = environment_seed()) {
+            return std::mt19937(*seed);
+        }
+        return std::mt19937(std::random_device{}());
+    }();
+    return rng;
+}
+
+[[maybe_unused]] void set_random_perturbation_seed(uint32_t seed)
+{
+    thread_rng().seed(seed);
+}
+
 cv::Vec3d random_perturbation(double max_abs_offset = 0.05) {
-    static thread_local std::mt19937 rng(std::random_device{}());
     std::uniform_real_distribution<double> dist(-max_abs_offset, max_abs_offset);
+    auto& rng = thread_rng();
     return {dist(rng), dist(rng), dist(rng)};
 }
 

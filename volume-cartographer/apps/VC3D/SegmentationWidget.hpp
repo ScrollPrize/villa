@@ -99,6 +99,8 @@ private:
     void applyDirectionFieldDraftToSelection(int row);
     void updateDirectionFieldListItem(int row);
     void updateDirectionFieldListGeometry();
+    [[nodiscard]] QString determineDefaultVolumeId(const QVector<QPair<QString, QString>>& volumes,
+                                                   const QString& requestedId) const;
     void setGrowthDirectionMask(int mask);
     void updateGrowthDirectionMaskFromUi(QCheckBox* changedCheckbox);
     void applyGrowthDirectionMaskToUi();
