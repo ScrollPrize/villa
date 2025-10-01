@@ -8,6 +8,7 @@
 #include <QCheckBox>
 #include <QFutureWatcher>
 #include <memory>
+#include <vector>
 #include "ui_VCMain.h"
 
 #include "vc/ui/VCCollection.hpp"
@@ -151,6 +152,7 @@ private slots:
     void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface, OpChain* chain);
 
 private:
+    void recalcAreaForSegments(const std::vector<std::string>& ids);
     bool appInitComplete{false};
     std::shared_ptr<VolumePkg> fVpkg;
     Surface *_seg_surf;

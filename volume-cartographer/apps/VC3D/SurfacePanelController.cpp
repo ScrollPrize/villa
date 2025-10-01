@@ -9,6 +9,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/DateTime.hpp"
+#include "vc/core/util/JsonSafe.hpp"
 #include "vc/ui/VCCollection.hpp"
 
 #include <QCheckBox>
@@ -213,8 +214,10 @@ void SurfacePanelController::populateSurfaceTree()
         auto* item = new SurfaceTreeWidgetItem(_ui.treeWidget);
         item->setText(SURFACE_ID_COLUMN, QString::fromStdString(id));
         item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(id));
-        item->setText(2, QString::number(surfMeta->meta->value("area_cm2", -1.f), 'f', 3));
-        item->setText(3, QString::number(surfMeta->meta->value("avg_cost", -1.f), 'f', 3));
+        const double areaCm2 = vc::json_safe::number_or(surfMeta->meta, "area_cm2", -1.0);
+        const double avgCost = vc::json_safe::number_or(surfMeta->meta, "avg_cost", -1.0);
+        item->setText(2, QString::number(areaCm2, 'f', 3));
+        item->setText(3, QString::number(avgCost, 'f', 3));
         item->setText(4, QString::number(surfMeta->overlapping_str.size()));
         QString timestamp;
         if (surfMeta->meta && surfMeta->meta->contains("date_last_modified")) {
@@ -254,12 +257,8 @@ void SurfacePanelController::refreshSurfaceMetrics(const std::string& surfaceId)
     QString timestamp;
 
     if (surfMeta) {
-        if (surfMeta->meta && surfMeta->meta->contains("area_cm2")) {
-            areaCm2 = (*surfMeta->meta)["area_cm2"].get<double>();
-        }
-        if (surfMeta->meta && surfMeta->meta->contains("avg_cost")) {
-            avgCost = (*surfMeta->meta)["avg_cost"].get<double>();
-        }
+        areaCm2 = vc::json_safe::number_or(surfMeta->meta, "area_cm2", -1.0);
+        avgCost = vc::json_safe::number_or(surfMeta->meta, "avg_cost", -1.0);
         overlapCount = static_cast<int>(surfMeta->overlapping_str.size());
         if (surfMeta->meta && surfMeta->meta->contains("date_last_modified")) {
             timestamp = QString::fromStdString((*surfMeta->meta)["date_last_modified"].get<std::string>());
@@ -289,8 +288,8 @@ void SurfacePanelController::updateTreeItemIcon(SurfaceTreeWidgetItem* item)
         return;
     }
 
-    const auto& tags = surfMeta->surface()->meta->value("tags", nlohmann::json::object_t());
-    item->updateItemIcon(tags.count("approved"), tags.count("defective"));
+    const auto tags = vc::json_safe::tags_or_empty(surfMeta->surface()->meta);
+    item->updateItemIcon(tags.contains("approved"), tags.contains("defective"));
 }
 
 void SurfacePanelController::addSingleSegmentation(const std::string& segId)
@@ -312,8 +311,10 @@ void SurfacePanelController::addSingleSegmentation(const std::string& segId)
             auto* item = new SurfaceTreeWidgetItem(_ui.treeWidget);
             item->setText(SURFACE_ID_COLUMN, QString::fromStdString(segId));
             item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(segId));
-            item->setText(2, QString::number(surfMeta->meta->value("area_cm2", -1.f), 'f', 3));
-            item->setText(3, QString::number(surfMeta->meta->value("avg_cost", -1.f), 'f', 3));
+            const double areaCm2 = vc::json_safe::number_or(surfMeta->meta, "area_cm2", -1.0);
+            const double avgCost = vc::json_safe::number_or(surfMeta->meta, "avg_cost", -1.0);
+            item->setText(2, QString::number(areaCm2, 'f', 3));
+            item->setText(3, QString::number(avgCost, 'f', 3));
             item->setText(4, QString::number(surfMeta->overlapping_str.size()));
             QString timestamp;
             if (surfMeta->meta && surfMeta->meta->contains("date_last_modified")) {
@@ -490,6 +491,18 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     QAction* inpaintTeleaAction = contextMenu.addAction(tr("Inpaint (Telea) && Rebuild Segment"));
     connect(inpaintTeleaAction, &QAction::triggered, this, [this]() {
         emit teleaInpaintRequested();
+    });
+
+    QStringList recalcTargets = selectedSegmentIds;
+    if (recalcTargets.isEmpty()) {
+        recalcTargets << segmentId;
+    }
+
+    contextMenu.addSeparator();
+
+    QAction* recalcAreaAction = contextMenu.addAction(tr("Recalculate Area from Mask"));
+    connect(recalcAreaAction, &QAction::triggered, this, [this, recalcTargets]() {
+        emit recalcAreaRequested(recalcTargets);
     });
 
     QStringList deletionTargets = selectedSegmentIds;
@@ -1061,16 +1074,16 @@ void SurfacePanelController::applyFiltersInternal()
             if (isChecked(_filters.unreviewed)) {
                 const auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    auto tags = surface->meta->value("tags", nlohmann::json::object_t());
-                    show = show && !tags.count("reviewed");
+                    const auto tags = vc::json_safe::tags_or_empty(surface->meta);
+                    show = show && !tags.contains("reviewed");
                 }
             }
 
             if (isChecked(_filters.revisit)) {
                 const auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    auto tags = surface->meta->value("tags", nlohmann::json::object_t());
-                    show = show && (tags.count("revisit") > 0);
+                    const auto tags = vc::json_safe::tags_or_empty(surface->meta);
+                    show = show && tags.contains("revisit");
                 } else {
                     show = false;
                 }
@@ -1079,34 +1092,32 @@ void SurfacePanelController::applyFiltersInternal()
             if (isChecked(_filters.noExpansion)) {
                 const auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    if (surface->meta->contains("vc_gsfs_mode")) {
-                        const auto mode = surface->meta->value("vc_gsfs_mode", std::string{});
-                        show = show && (mode != "expansion");
-                    }
+                    const auto mode = vc::json_safe::string_or(surface->meta, "vc_gsfs_mode", std::string{});
+                    show = show && (mode != "expansion");
                 }
             }
 
             if (isChecked(_filters.noDefective)) {
                 const auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    auto tags = surface->meta->value("tags", nlohmann::json::object_t());
-                    show = show && !tags.count("defective");
+                    const auto tags = vc::json_safe::tags_or_empty(surface->meta);
+                    show = show && !tags.contains("defective");
                 }
             }
 
             if (isChecked(_filters.partialReview)) {
                 const auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    auto tags = surface->meta->value("tags", nlohmann::json::object_t());
-                    show = show && !tags.count("partial_review");
+                    const auto tags = vc::json_safe::tags_or_empty(surface->meta);
+                    show = show && !tags.contains("partial_review");
                 }
             }
 
             if (isChecked(_filters.hideUnapproved)) {
                 const auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    auto tags = surface->meta->value("tags", nlohmann::json::object_t());
-                    show = show && (tags.count("approved") > 0);
+                    const auto tags = vc::json_safe::tags_or_empty(surface->meta);
+                    show = show && tags.contains("approved");
                 } else {
                     show = false;
                 }
@@ -1115,8 +1126,8 @@ void SurfacePanelController::applyFiltersInternal()
             if (isChecked(_filters.inspectOnly)) {
                 const auto* surface = surfMeta->surface();
                 if (surface && surface->meta) {
-                    auto tags = surface->meta->value("tags", nlohmann::json::object_t());
-                    show = show && (tags.count("inspect") > 0);
+                    const auto tags = vc::json_safe::tags_or_empty(surface->meta);
+                    show = show && tags.contains("inspect");
                 } else {
                     show = false;
                 }
@@ -1173,14 +1184,14 @@ void SurfacePanelController::updateTagCheckboxStatesForSurface(QuadSurface* surf
         return;
     }
 
-    const auto tags = surface->meta->value("tags", nlohmann::json::object_t());
+    const auto tags = vc::json_safe::tags_or_empty(surface->meta);
 
     auto applyTag = [&tags](QCheckBox* box, const char* name) {
         if (!box) {
             return;
         }
         const QSignalBlocker blocker{box};
-        if (tags.count(name)) {
+        if (tags.contains(name)) {
             box->setCheckState(Qt::Checked);
         }
     };

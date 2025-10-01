@@ -17,6 +17,7 @@
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc/core/util/JsonSafe.hpp"
 
 #include <QAction>
 #include <QApplication>
@@ -504,14 +505,18 @@ void MenuActionController::generateReviewReport()
         }
 
         nlohmann::json* meta = surfMeta->surface()->meta;
-        if (!meta->contains("tags") || !meta->at("tags").contains("reviewed")) {
+        const auto tags = vc::json_safe::tags_or_empty(meta);
+        const auto itReviewed = tags.find("reviewed");
+        if (itReviewed == tags.end() || !itReviewed->is_object()) {
             continue;
         }
 
+        const nlohmann::json& reviewed = *itReviewed;
+
         QString reviewDate = "Unknown";
-        if (meta->at("tags").at("reviewed").contains("date")) {
-            QString fullDate = QString::fromStdString(meta->at("tags").at("reviewed").at("date").get<std::string>());
-            reviewDate = fullDate.left(10);
+        const std::string reviewDateRaw = vc::json_safe::string_or(&reviewed, "date", std::string{});
+        if (!reviewDateRaw.empty()) {
+            reviewDate = QString::fromStdString(reviewDateRaw).left(10);
         } else {
             QFileInfo metaFile(QString::fromStdString(surfMeta->path.string()) + "/meta.json");
             if (metaFile.exists()) {
@@ -520,11 +525,12 @@ void MenuActionController::generateReviewReport()
         }
 
         QString username = "Unknown";
-        if (meta->at("tags").at("reviewed").contains("user")) {
-            username = QString::fromStdString(meta->at("tags").at("reviewed").at("user").get<std::string>());
+        const std::string reviewerUser = vc::json_safe::string_or(&reviewed, "user", std::string{});
+        if (!reviewerUser.empty()) {
+            username = QString::fromStdString(reviewerUser);
         }
 
-        double area = meta->value("area_cm2", 0.0);
+        const double area = vc::json_safe::number_or(meta, "area_cm2", 0.0);
 
         dailyStats[reviewDate][username].totalArea += area;
         dailyStats[reviewDate][username].surfaceCount++;

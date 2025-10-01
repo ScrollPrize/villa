@@ -47,6 +47,8 @@
 #include <omp.h>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <QStringList>
 
 #include "CVolumeViewer.hpp"
 #include "CVolumeViewerView.hpp"
@@ -747,6 +749,18 @@ void CWindow::CreateWidgets(void)
                 if (_menuController) {
                     _menuController->triggerTeleaInpaint();
                 }
+            });
+    connect(_surfacePanel.get(), &SurfacePanelController::recalcAreaRequested,
+            this, [this](const QStringList& segmentIds) {
+                if (segmentIds.isEmpty()) {
+                    return;
+                }
+                std::vector<std::string> ids;
+                ids.reserve(segmentIds.size());
+                for (const auto& id : segmentIds) {
+                    ids.push_back(id.toStdString());
+                }
+                recalcAreaForSegments(ids);
             });
     connect(_surfacePanel.get(), &SurfacePanelController::statusMessageRequested,
             this, [this](const QString& message, int timeoutMs) {
@@ -1856,6 +1870,256 @@ void CWindow::onCopyCoordinates()
     if (!coords.isEmpty()) {
         QApplication::clipboard()->setText(coords);
         statusBar()->showMessage(tr("Coordinates copied to clipboard: %1").arg(coords), 2000);
+    }
+}
+
+void CWindow::recalcAreaForSegments(const std::vector<std::string>& ids)
+{
+    if (!fVpkg || ids.empty()) {
+        return;
+    }
+
+    float voxelsize = 1.0f;
+    try {
+        if (currentVolume && currentVolume->metadata().hasKey("voxelsize")) {
+            voxelsize = currentVolume->metadata().get<float>("voxelsize");
+        }
+    } catch (...) {
+        voxelsize = 1.0f;
+    }
+    if (!std::isfinite(voxelsize) || voxelsize <= 0.f) {
+        voxelsize = 1.0f;
+    }
+
+    int okCount = 0;
+    int failCount = 0;
+    QStringList skippedIds;
+
+    auto triAreaVox2 = [](const cv::Vec3d& a,
+                          const cv::Vec3d& b,
+                          const cv::Vec3d& c) -> double {
+        const cv::Vec3d u = b - a;
+        const cv::Vec3d v = c - a;
+        const cv::Vec3d w(u[1] * v[2] - u[2] * v[1],
+                          u[2] * v[0] - u[0] * v[2],
+                          u[0] * v[1] - u[1] * v[0]);
+        return 0.5 * std::sqrt(w.dot(w));
+    };
+
+    auto quadAreaVox2 = [&triAreaVox2](const cv::Vec3d& p00,
+                                       const cv::Vec3d& p10,
+                                       const cv::Vec3d& p01,
+                                       const cv::Vec3d& p11) -> double {
+        return triAreaVox2(p00, p10, p11) + triAreaVox2(p00, p11, p01);
+    };
+
+    auto isFiniteVec3 = [](const cv::Vec3d& p) {
+        return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+    };
+
+    constexpr bool INSIDE_IS_NONZERO = true;
+
+    auto median = [](std::vector<double>& values) -> double {
+        if (values.empty()) {
+            return 0.0;
+        }
+        const auto mid = values.begin() + values.size() / 2;
+        std::nth_element(values.begin(), mid, values.end());
+        double m = *mid;
+        if ((values.size() % 2) == 0 && mid != values.begin()) {
+            const double partner = *std::max_element(values.begin(), mid);
+            m = 0.5 * (m + partner);
+        }
+        return m;
+    };
+
+    for (const auto& id : ids) {
+        auto surfMeta = fVpkg->getSurface(id);
+        if (!surfMeta || !surfMeta->surface()) {
+            skippedIds << QString::fromStdString(id) + tr(" (missing surface)");
+            ++failCount;
+            continue;
+        }
+
+        auto* surface = surfMeta->surface();
+        const std::filesystem::path maskPath = surfMeta->path / "mask.tif";
+        if (!std::filesystem::exists(maskPath)) {
+            skippedIds << QString::fromStdString(id) + tr(" (no mask.tif)");
+            ++failCount;
+            continue;
+        }
+
+        std::vector<cv::Mat> layers;
+        if (!cv::imreadmulti(maskPath.string(), layers, cv::IMREAD_UNCHANGED) || layers.empty()) {
+            skippedIds << QString::fromStdString(id) + tr(" (mask read error)");
+            ++failCount;
+            continue;
+        }
+
+        cv::Mat mask = layers[0];
+        if (mask.empty()) {
+            skippedIds << QString::fromStdString(id) + tr(" (mask empty)");
+            ++failCount;
+            continue;
+        }
+        if (mask.channels() != 1) {
+            cv::cvtColor(mask, mask, cv::COLOR_BGR2GRAY);
+        }
+        if (mask.type() != CV_8U) {
+            mask.convertTo(mask, CV_8U);
+        }
+
+        cv::Mat_<cv::Vec3f> coords;
+        try {
+            const cv::Vec3f pointer = surface->pointer();
+            const cv::Vec3f offset(-mask.cols / 2.0f, -mask.rows / 2.0f, 0.0f);
+            surface->gen(&coords, nullptr, mask.size(), pointer, 1.0f, offset);
+        } catch (...) {
+            skippedIds << QString::fromStdString(id) + tr(" (coord gen failed)");
+            ++failCount;
+            continue;
+        }
+
+        if (coords.empty() || coords.rows != mask.rows || coords.cols != mask.cols) {
+            skippedIds << QString::fromStdString(id) + tr(" (coord/mask size mismatch)");
+            ++failCount;
+            continue;
+        }
+
+        const int height = mask.rows;
+        const int width = mask.cols;
+
+        auto quadAreaFromMask = [&](const cv::Mat& maskImage,
+                                    double& outDu,
+                                    double& outDv) -> double {
+            std::vector<double> stepsU;
+            std::vector<double> stepsV;
+            stepsU.reserve(static_cast<size_t>(height) * static_cast<size_t>(std::max(0, width - 1)));
+            stepsV.reserve(static_cast<size_t>(std::max(0, height - 1)) * static_cast<size_t>(width));
+            double areaVox2 = 0.0;
+
+            for (int y = 0; y < height - 1; ++y) {
+                const uint8_t* row0 = maskImage.ptr<uint8_t>(y);
+                const uint8_t* row1 = maskImage.ptr<uint8_t>(y + 1);
+                for (int x = 0; x < width - 1; ++x) {
+                    const bool allBlack = (row0[x] == 0) && (row0[x + 1] == 0) &&
+                                          (row1[x] == 0) && (row1[x + 1] == 0);
+                    if (allBlack) {
+                        continue;
+                    }
+
+                    const cv::Vec3d p00 = coords(y, x);
+                    const cv::Vec3d p10 = coords(y, x + 1);
+                    const cv::Vec3d p01 = coords(y + 1, x);
+                    const cv::Vec3d p11 = coords(y + 1, x + 1);
+
+                    if (!isFiniteVec3(p00) || !isFiniteVec3(p10) ||
+                        !isFiniteVec3(p01) || !isFiniteVec3(p11)) {
+                        continue;
+                    }
+
+                    stepsU.push_back(cv::norm(p10 - p00));
+                    stepsV.push_back(cv::norm(p01 - p00));
+                    areaVox2 += quadAreaVox2(p00, p10, p01, p11);
+                }
+            }
+
+            outDu = median(stepsU);
+            outDv = median(stepsV);
+            return areaVox2;
+        };
+
+        double du = 0.0;
+        double dv = 0.0;
+        double areaVox2 = quadAreaFromMask(mask, du, dv);
+
+        if (areaVox2 <= 0.0) {
+            std::vector<double> globalStepsU;
+            std::vector<double> globalStepsV;
+            globalStepsU.reserve(static_cast<size_t>(height) * static_cast<size_t>(std::max(0, width - 1)));
+            globalStepsV.reserve(static_cast<size_t>(std::max(0, height - 1)) * static_cast<size_t>(width));
+
+            for (int y = 0; y < height; ++y) {
+                for (int x = 0; x < width - 1; ++x) {
+                    globalStepsU.push_back(cv::norm(coords(y, x + 1) - coords(y, x)));
+                }
+            }
+            for (int y = 0; y < height - 1; ++y) {
+                for (int x = 0; x < width; ++x) {
+                    globalStepsV.push_back(cv::norm(coords(y + 1, x) - coords(y, x)));
+                }
+            }
+
+            const double duGlobal = median(globalStepsU);
+            const double dvGlobal = median(globalStepsV);
+            if (du <= 0.0) {
+                du = duGlobal;
+            }
+            if (dv <= 0.0) {
+                dv = dvGlobal;
+            }
+
+            long long pixelCount = 0;
+            for (int y = 0; y < height; ++y) {
+                const uint8_t* row = mask.ptr<uint8_t>(y);
+                for (int x = 0; x < width; ++x) {
+                    const bool inside = INSIDE_IS_NONZERO ? (row[x] != 0) : (row[x] == 0);
+                    if (inside) {
+                        ++pixelCount;
+                    }
+                }
+            }
+
+            if (pixelCount > 0 && du > 0.0 && dv > 0.0) {
+                areaVox2 = static_cast<double>(pixelCount) * (du * dv);
+            }
+        }
+
+        if (!std::isfinite(areaVox2)) {
+            skippedIds << QString::fromStdString(id) + tr(" (non-finite area)");
+            ++failCount;
+            continue;
+        }
+
+        const double areaCm2 = areaVox2 * static_cast<double>(voxelsize) * static_cast<double>(voxelsize) / 1e8;
+        if (!std::isfinite(areaCm2)) {
+            skippedIds << QString::fromStdString(id) + tr(" (non-finite cm^2)");
+            ++failCount;
+            continue;
+        }
+
+        try {
+            if (!surface->meta) {
+                surface->meta = new nlohmann::json();
+            }
+            (*surface->meta)["area_vx2"] = areaVox2;
+            (*surface->meta)["area_cm2"] = areaCm2;
+            (*surface->meta)["date_last_modified"] = get_surface_time_str();
+            surface->save_meta();
+        } catch (...) {
+            skippedIds << QString::fromStdString(id) + tr(" (meta save failed)");
+            ++failCount;
+            continue;
+        }
+
+        if (_surfacePanel) {
+            _surfacePanel->refreshSurfaceMetrics(id);
+        }
+
+        ++okCount;
+    }
+
+    if (okCount > 0) {
+        statusBar()->showMessage(tr("Recalculated area for %1 segment(s).").arg(okCount), 5000);
+    }
+    if (failCount > 0) {
+        QMessageBox::warning(
+            this,
+            tr("Area Recalculation"),
+            tr("Updated: %1\nSkipped: %2\n\n%3")
+                .arg(okCount)
+                .arg(failCount)
+                .arg(skippedIds.join("\n")));
     }
 }
 
