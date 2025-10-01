@@ -101,9 +101,9 @@ private:
     bool _pending{false};
     bool _growthInProgress{false};
     bool _eraseBrushActive{false};
-    float _radiusSteps{3.0f};
-    float _sigmaSteps{1.5f};
-    float _pushPullStep{0.75f};
+    float _radiusSteps{5.75f};
+    float _sigmaSteps{2.0f};
+    float _pushPullStep{4.0f};
 
     bool _normalGridAvailable{false};
     QString _normalGridHint;

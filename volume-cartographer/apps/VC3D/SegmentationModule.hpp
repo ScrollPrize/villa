@@ -188,11 +188,11 @@ private:
     VCCollection* _pointCollection{nullptr};
 
     bool _editingEnabled{false};
-    float _radiusSteps{3.0f};
-    float _sigmaSteps{1.5f};
+    float _radiusSteps{5.75f};
+    float _sigmaSteps{2.0f};
     bool _growthInProgress{false};
     SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Tracer};
-    int _growthSteps{5};
+    int _growthSteps{10};
     bool _usingCorrectionsGrowth{false};
     bool _correctionsAnnotateMode{false};
     uint64_t _activeCorrectionId{0};
@@ -216,6 +216,6 @@ private:
     std::vector<cv::Vec3f> _paintOverlayPoints;
     cv::Vec3f _lastPaintSample{0.0f, 0.0f, 0.0f};
     bool _hasLastPaintSample{false};
-    float _pushPullStepMultiplier{0.75f};
+    float _pushPullStepMultiplier{4.00f};
     std::optional<std::vector<SegmentationGrowthDirection>> _pendingShortcutDirections;
 };

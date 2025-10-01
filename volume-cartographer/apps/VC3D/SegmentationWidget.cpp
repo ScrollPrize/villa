@@ -135,11 +135,11 @@ void SegmentationWidget::buildUi()
     _lblNormalGrid->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
     layout->addWidget(_lblNormalGrid);
 
-    auto* falloffGroup = new QGroupBox(tr("Gaussian Falloff"), this);
+    auto* falloffGroup = new QGroupBox(tr("Editing"), this);
     auto* falloffLayout = new QVBoxLayout(falloffGroup);
 
     auto* radiusSigmaRow = new QHBoxLayout();
-    auto* radiusLabel = new QLabel(tr("Max radius (grid steps)"), falloffGroup);
+    auto* radiusLabel = new QLabel(tr("Max radius"), falloffGroup);
     _spinRadius = new QDoubleSpinBox(falloffGroup);
     _spinRadius->setDecimals(2);
     _spinRadius->setRange(0.25, 128.0);
@@ -147,7 +147,7 @@ void SegmentationWidget::buildUi()
     radiusSigmaRow->addWidget(radiusLabel);
     radiusSigmaRow->addWidget(_spinRadius);
     radiusSigmaRow->addSpacing(12);
-    auto* sigmaLabel = new QLabel(tr("Sigma (grid steps)"), falloffGroup);
+    auto* sigmaLabel = new QLabel(tr("Sigma"), falloffGroup);
     _spinSigma = new QDoubleSpinBox(falloffGroup);
     _spinSigma->setDecimals(2);
     _spinSigma->setRange(0.05, 64.0);
@@ -158,7 +158,7 @@ void SegmentationWidget::buildUi()
     falloffLayout->addLayout(radiusSigmaRow);
 
     auto* pushPullRow = new QHBoxLayout();
-    auto* pushPullLabel = new QLabel(tr("Push/Pull step (grid steps)"), falloffGroup);
+    auto* pushPullLabel = new QLabel(tr("Push/Pull step"), falloffGroup);
     _spinPushPullStep = new QDoubleSpinBox(falloffGroup);
     _spinPushPullStep->setDecimals(2);
     _spinPushPullStep->setRange(0.05, 10.0);
