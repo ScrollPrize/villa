@@ -67,7 +67,7 @@ class InferenceConfig:
     # Inference configuration
     size = 64       # net input size (post-resize, normally equals tile_size)
     tile_size = 64
-    stride = 32
+    stride = 16
     batch_size = 64
     workers = min(4, os.cpu_count() or 4)
 

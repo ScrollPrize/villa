@@ -14,9 +14,7 @@
 #include <memory>
 
 #include "CSurfaceCollection.hpp"
-#include "overlays/ViewerOverlayControllerBase.hpp"
-
-using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
+#include "PathData.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/ui/VCCollection.hpp"
 
@@ -33,7 +31,7 @@ public:
     void setCache(ChunkCache* cache);
     
 signals:
-    void sendPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
+    void sendPathsChanged(const QList<PathData>& paths);
     void sendStatusMessageAvailable(QString text, int timeout);
     
 public slots:
@@ -75,13 +73,13 @@ private:
     void updateParameterPreview();
     void updateModeUI();
     void analyzePaths();
-    void findPeaksAlongPath(const ViewerOverlayControllerBase::PathPrimitive& path);
+    void findPeaksAlongPath(const PathData& path);
     void startDrawing(cv::Vec3f startPoint);
     void addPointToPath(cv::Vec3f point);
     void finalizePath();
     // Label Wraps helpers
     void finalizePathLabelWraps(bool shiftHeld);
-    void findPeaksAlongPathToCollection(const ViewerOverlayControllerBase::PathPrimitive& path, const std::string& collectionName);
+    void findPeaksAlongPathToCollection(const PathData& path, const std::string& collectionName);
     void setLabelWrapsMode(bool active);
     QColor generatePathColor();
     void displayPaths();
@@ -133,9 +131,9 @@ private:
     
     // Drawing mode data
     Mode currentMode;
-    QList<ViewerOverlayControllerBase::PathPrimitive> paths;  
+    QList<PathData> paths;  
     bool isDrawing;
-    ViewerOverlayControllerBase::PathPrimitive currentPath;
+    PathData currentPath;
     int colorIndex;
     bool labelWrapsMode = false; // special mode built on DrawMode
     
@@ -143,3 +141,5 @@ private:
     QList<QPointer<QProcess>> runningProcesses;
     bool jobsRunning;
 };
+
+
