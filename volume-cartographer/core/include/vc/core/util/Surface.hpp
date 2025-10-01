@@ -74,12 +74,22 @@ public:
     void setOrigin(cv::Vec3f origin);
     cv::Vec3f origin();
     float scalarp(cv::Vec3f point) const;
+    void setInPlaneRotation(float radians);
+    float inPlaneRotation() const { return _inPlaneRotation; }
+    cv::Vec3f basisX() const { return _vx; }
+    cv::Vec3f basisY() const { return _vy; }
+    void setAxisAlignedRotationKey(int key);
+    int axisAlignedRotationKey() const { return _axisAlignedRotationKey; }
 protected:
     void update();
     cv::Vec3f _normal = {0,0,1};
     cv::Vec3f _origin = {0,0,0};
+    cv::Vec3f _vx = {1,0,0};
+    cv::Vec3f _vy = {0,1,0};
+    float _inPlaneRotation = 0.0f;
     cv::Matx33d _M;
     cv::Vec3d _T;
+    int _axisAlignedRotationKey = -1;
 };
 
 //quads based surface class with a pointer implementing a nominal scale of 1 voxel

@@ -19,6 +19,8 @@ public:
     /// Set physical voxel size (units per scene-unit, e.g. µm/pixel).
     /// Call this after you load your Zarr spacing metadata.
     void setVoxelSize(double sx, double sy) { m_vx = sx; m_vy = sy; update(); }
+    void setMiddleButtonPanEnabled(bool enabled) { _middleButtonPanEnabled = enabled; }
+    bool middleButtonPanEnabled() const { return _middleButtonPanEnabled; }
 
 signals:
     void sendResized();
@@ -46,5 +48,5 @@ protected:
 
     // µm per scene-unit (pixel)  
     double m_vx = 32.0, m_vy = 32.0;
+    bool _middleButtonPanEnabled = true;
 };
-

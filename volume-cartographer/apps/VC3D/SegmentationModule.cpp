@@ -22,6 +22,7 @@
 #include <optional>
 #include <limits>
 #include <unordered_set>
+#include <utility>
 
 Q_LOGGING_CATEGORY(lcSegModule, "vc.segmentation.module")
 
@@ -166,6 +167,11 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
             onCorrectionsZRangeChanged(false, 0, 0);
         }
     }
+}
+
+void SegmentationModule::setRotationHandleHitTester(std::function<bool(CVolumeViewer*, const cv::Vec3f&)> tester)
+{
+    _rotationHandleHitTester = std::move(tester);
 }
 
 void SegmentationModule::bindWidgetSignals()
@@ -1177,8 +1183,13 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
         return;
     }
 
+    const bool isLeftButton = (button == Qt::LeftButton);
+    if (isLeftButton && isNearRotationHandle(viewer, worldPos)) {
+        return;
+    }
+
     if (_correctionsAnnotateMode) {
-        if (button != Qt::LeftButton) {
+        if (!isLeftButton) {
             return;
         }
         if (modifiers.testFlag(Qt::ControlModifier)) {
@@ -1194,7 +1205,7 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
         return;
     }
 
-    if (button != Qt::LeftButton) {
+    if (!isLeftButton) {
         return;
     }
 
@@ -1372,6 +1383,14 @@ void SegmentationModule::cancelDrag()
     _drag.reset();
     refreshOverlay();
     emitPendingChanges();
+}
+
+bool SegmentationModule::isNearRotationHandle(CVolumeViewer* viewer, const cv::Vec3f& worldPos) const
+{
+    if (!_rotationHandleHitTester || !viewer) {
+        return false;
+    }
+    return _rotationHandleHitTester(viewer, worldPos);
 }
 
 void SegmentationModule::updateHover(CVolumeViewer* viewer, const cv::Vec3f& worldPos)

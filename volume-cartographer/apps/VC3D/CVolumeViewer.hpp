@@ -223,6 +223,7 @@ protected:
     bool _resetViewOnSurfaceChange = true;
     bool _showDirectionHints = true;
     bool _segmentationEditActive = false;
+    bool _suppressFocusRecentering = false;
 
     int _downscale_override = 0;  // 0=auto, 1=2x, 2=4x, 3=8x, 4=16x, 5=32x
     QTimer* _overlayUpdateTimer;

@@ -11,6 +11,8 @@
 #include <unordered_map>
 #include <nlohmann/json.hpp>
 #include <system_error>
+#include <cmath>
+#include <limits>
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -97,6 +99,17 @@ float PlaneSurface::pointDist(cv::Vec3f wp)
     return abs(scalarp);
 }
 
+void PlaneSurface::setInPlaneRotation(float radians)
+{
+    _inPlaneRotation = radians;
+    update();
+}
+
+void PlaneSurface::setAxisAlignedRotationKey(int key)
+{
+    _axisAlignedRotationKey = key;
+}
+
 //given origin and normal, return the normalized vector v which describes a point : origin + v which lies in the plane and maximizes v.x at the cost of v.y,v.z
 static cv::Vec3f vx_from_orig_norm(const cv::Vec3f &o, const cv::Vec3f &n)
 {
@@ -157,13 +170,51 @@ static void vxy_from_normal(cv::Vec3f orig, cv::Vec3f normal, cv::Vec3f &vx, cv:
         vy *= -1;
 }
 
+static cv::Vec3f rotateAroundAxis(const cv::Vec3f& vector, const cv::Vec3f& axis, float angle)
+{
+    if (std::abs(angle) <= std::numeric_limits<float>::epsilon()) {
+        return vector;
+    }
+
+    cv::Vec3d axis_d(axis[0], axis[1], axis[2]);
+    double axis_norm = cv::norm(axis_d);
+    if (axis_norm == 0.0) {
+        return vector;
+    }
+    axis_d /= axis_norm;
+
+    cv::Mat R;
+    cv::Mat rot_vec = (cv::Mat_<double>(3, 1)
+        << axis_d[0] * static_cast<double>(angle),
+           axis_d[1] * static_cast<double>(angle),
+           axis_d[2] * static_cast<double>(angle));
+    cv::Rodrigues(rot_vec, R);
+
+    cv::Mat v = (cv::Mat_<double>(3, 1) << vector[0], vector[1], vector[2]);
+    cv::Mat res = R * v;
+    return cv::Vec3f(static_cast<float>(res.at<double>(0)),
+                     static_cast<float>(res.at<double>(1)),
+                     static_cast<float>(res.at<double>(2)));
+}
+
 void PlaneSurface::update()
 {
     cv::Vec3f vx, vy;
 
     vxy_from_normal(_origin,_normal,vx,vy);
 
-    std::vector <cv::Vec3f> src = {_origin,_origin+_normal,_origin+vx,_origin+vy};
+    if (std::abs(_inPlaneRotation) > std::numeric_limits<float>::epsilon()) {
+        vx = rotateAroundAxis(vx, _normal, _inPlaneRotation);
+        vy = rotateAroundAxis(vy, _normal, _inPlaneRotation);
+    }
+
+    cv::normalize(vx, vx, 1, 0, cv::NORM_L2);
+    cv::normalize(vy, vy, 1, 0, cv::NORM_L2);
+
+    _vx = vx;
+    _vy = vy;
+
+    std::vector <cv::Vec3f> src = {_origin,_origin+_normal,_origin+_vx,_origin+_vy};
     std::vector <cv::Vec3f> tgt = {{0,0,0},{0,0,1},{1,0,0},{0,1,0}};
     cv::Mat transf;
     cv::Mat inliers;
@@ -210,8 +261,8 @@ void PlaneSurface::gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals
     if (create_normals)
         normals->create(size);
 
-    cv::Vec3f vx, vy;
-    vxy_from_normal(_origin,_normal,vx,vy);
+    const cv::Vec3f vx = _vx;
+    const cv::Vec3f vy = _vy;
 
     float m = 1/scale;
     cv::Vec3f use_origin = _origin + _normal*total_offset[2];

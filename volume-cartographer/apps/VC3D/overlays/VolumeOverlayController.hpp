@@ -13,7 +13,6 @@ class ViewerManager;
 class VolumePkg;
 class Volume;
 class QComboBox;
-class QSlider;
 class QSpinBox;
 class QString;
 
@@ -25,7 +24,7 @@ public:
     struct UiRefs {
         QPointer<QComboBox> volumeSelect;
         QPointer<QComboBox> colormapSelect;
-        QPointer<QSlider> opacitySlider;
+        QPointer<QSpinBox> opacitySpin;
         QPointer<QSpinBox> thresholdSpin;
     };
 

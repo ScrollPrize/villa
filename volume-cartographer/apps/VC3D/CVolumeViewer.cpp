@@ -18,6 +18,14 @@
 #include "vc/core/util/Render.hpp"
 
 #include <QPainter>
+#include <QScopedValueRollback>
+
+#include <cstdint>
+#include <list>
+#include <mutex>
+#include <optional>
+#include <unordered_map>
+#include <utility>
 
 #include <opencv2/imgproc.hpp>
 
@@ -103,6 +111,153 @@ cv::Mat makeOverlayColors(const cv::Mat_<uint8_t>& values, const OverlayColormap
         colored.convertTo(colored, CV_8UC3);
     }
     return colored;
+}
+
+} // namespace
+
+namespace
+{
+constexpr size_t kAxisAlignedSliceCacheCapacity = 180;
+constexpr float kScaleQuantization = 1000.0f;
+constexpr float kZOffsetQuantization = 1000.0f;
+constexpr float kDsScaleQuantization = 1000.0f;
+
+inline int quantizeFloat(float value, float multiplier)
+{
+    return static_cast<int>(std::lround(value * multiplier));
+}
+
+inline bool planeIdForSurface(const std::string& name, uint8_t& outId)
+{
+    if (name == "seg xz") {
+        outId = 0;
+        return true;
+    }
+    if (name == "seg yz") {
+        outId = 1;
+        return true;
+    }
+    return false;
+}
+
+struct AxisAlignedSliceCacheKey
+{
+    uint8_t planeId = 0;
+    uint16_t rotationKey = 0;
+    int originX = 0;
+    int originY = 0;
+    int originZ = 0;
+    int roiX = 0;
+    int roiY = 0;
+    int roiWidth = 0;
+    int roiHeight = 0;
+    int scaleMilli = 0;
+    int dsScaleMilli = 0;
+    int zOffsetMilli = 0;
+    int dsIndex = 0;
+    uintptr_t datasetPtr = 0;
+    uint8_t fastInterpolation = 0;
+
+    bool operator==(const AxisAlignedSliceCacheKey& other) const noexcept
+    {
+        return planeId == other.planeId && rotationKey == other.rotationKey &&
+               originX == other.originX && originY == other.originY && originZ == other.originZ &&
+               roiX == other.roiX && roiY == other.roiY &&
+               roiWidth == other.roiWidth && roiHeight == other.roiHeight &&
+               scaleMilli == other.scaleMilli && dsScaleMilli == other.dsScaleMilli &&
+               zOffsetMilli == other.zOffsetMilli && dsIndex == other.dsIndex &&
+               datasetPtr == other.datasetPtr && fastInterpolation == other.fastInterpolation;
+    }
+};
+
+struct AxisAlignedSliceCacheKeyHasher
+{
+    std::size_t operator()(const AxisAlignedSliceCacheKey& key) const noexcept
+    {
+        std::size_t seed = 0;
+        hashCombine(seed, key.planeId);
+        hashCombine(seed, key.rotationKey);
+        hashCombine(seed, key.originX);
+        hashCombine(seed, key.originY);
+        hashCombine(seed, key.originZ);
+        hashCombine(seed, key.roiX);
+        hashCombine(seed, key.roiY);
+        hashCombine(seed, key.roiWidth);
+        hashCombine(seed, key.roiHeight);
+        hashCombine(seed, key.scaleMilli);
+        hashCombine(seed, key.dsScaleMilli);
+        hashCombine(seed, key.zOffsetMilli);
+        hashCombine(seed, key.dsIndex);
+        hashCombine(seed, key.datasetPtr);
+        hashCombine(seed, key.fastInterpolation);
+        return seed;
+    }
+
+private:
+    static void hashCombine(std::size_t& seed, std::size_t value) noexcept
+    {
+        seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+    }
+};
+
+class AxisAlignedSliceCache
+{
+public:
+    explicit AxisAlignedSliceCache(size_t capacity)
+        : _capacity(capacity)
+    {
+    }
+
+    std::optional<cv::Mat> get(const AxisAlignedSliceCacheKey& key)
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        auto it = _entries.find(key);
+        if (it == _entries.end()) {
+            return std::nullopt;
+        }
+        _lru.splice(_lru.begin(), _lru, it->second.orderIt);
+        return it->second.image.clone();
+    }
+
+    void put(const AxisAlignedSliceCacheKey& key, const cv::Mat& image)
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        auto it = _entries.find(key);
+        if (it != _entries.end()) {
+            it->second.image = image.clone();
+            _lru.splice(_lru.begin(), _lru, it->second.orderIt);
+            return;
+        }
+
+        if (_entries.size() >= _capacity && !_lru.empty()) {
+            const AxisAlignedSliceCacheKey& evictKey = _lru.back();
+            _entries.erase(evictKey);
+            _lru.pop_back();
+        }
+
+        _lru.push_front(key);
+        Entry entry;
+        entry.image = image.clone();
+        entry.orderIt = _lru.begin();
+        _entries.emplace(_lru.front(), std::move(entry));
+    }
+
+private:
+    struct Entry {
+        cv::Mat image;
+        std::list<AxisAlignedSliceCacheKey>::iterator orderIt;
+    };
+
+    size_t _capacity;
+    std::list<AxisAlignedSliceCacheKey> _lru;
+    std::unordered_map<AxisAlignedSliceCacheKey, Entry, AxisAlignedSliceCacheKeyHasher> _entries;
+    std::mutex _mutex;
+};
+
+AxisAlignedSliceCache& axisAlignedSliceCache()
+{
+    static AxisAlignedSliceCache cache(kAxisAlignedSliceCacheCapacity);
+    return cache;
 }
 
 } // namespace
@@ -466,8 +621,12 @@ void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers m
             if (length > 0.0) {
                 focus->n = normal;
             }
+            focus->src = plane;
 
-            _surf_col->setPOI("focus", focus);
+            {
+                QScopedValueRollback<bool> focusGuard(_suppressFocusRecentering, true);
+                _surf_col->setPOI("focus", focus);
+            }
             handled = true;
         } else {
             if (_surf_name == "segmentation") {
@@ -919,7 +1078,9 @@ void CVolumeViewer::onPOIChanged(std::string name, POI *poi)
         }
         
         if (auto* plane = dynamic_cast<PlaneSurface*>(_surf)) {
-            fGraphicsView->centerOn(0,0);
+            if (!_suppressFocusRecentering) {
+                fGraphicsView->centerOn(0, 0);
+            }
             if (poi->p == plane->origin())
                 return;
             
@@ -1151,11 +1312,45 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
     const bool useComposite = (_surf_name == "segmentation" && _composite_enabled &&
                                (_composite_layers_front > 0 || _composite_layers_behind > 0));
 
+    cv::Mat baseColor;
+    bool usedCache = false;
+    AxisAlignedSliceCacheKey cacheKey{};
+    bool cacheKeyValid = false;
+
+    z5::Dataset* baseDataset = volume ? volume->zarrDataset(_ds_sd_idx) : nullptr;
+
     if (useComposite) {
         baseGray = render_composite(roi);
     } else {
         if (auto* plane = dynamic_cast<PlaneSurface*>(_surf)) {
             _surf->gen(&coords, nullptr, roi.size(), cv::Vec3f(0, 0, 0), _scale, {roi.x, roi.y, _z_off});
+
+            uint8_t planeId = 0;
+            if (plane->axisAlignedRotationKey() >= 0 && cache && baseDataset &&
+                planeIdForSurface(_surf_name, planeId)) {
+                cacheKey.planeId = planeId;
+                cacheKey.rotationKey = static_cast<uint16_t>(plane->axisAlignedRotationKey());
+                const cv::Vec3f origin = plane->origin();
+                cacheKey.originX = static_cast<int>(std::lround(origin[0]));
+                cacheKey.originY = static_cast<int>(std::lround(origin[1]));
+                cacheKey.originZ = static_cast<int>(std::lround(origin[2]));
+                cacheKey.roiX = roi.x;
+                cacheKey.roiY = roi.y;
+                cacheKey.roiWidth = roi.width;
+                cacheKey.roiHeight = roi.height;
+                cacheKey.scaleMilli = quantizeFloat(_scale, kScaleQuantization);
+                cacheKey.dsScaleMilli = quantizeFloat(_ds_scale, kDsScaleQuantization);
+                cacheKey.zOffsetMilli = quantizeFloat(_z_off, kZOffsetQuantization);
+                cacheKey.dsIndex = _ds_sd_idx;
+                cacheKey.datasetPtr = reinterpret_cast<uintptr_t>(baseDataset);
+                cacheKey.fastInterpolation = _useFastInterpolation ? 1 : 0;
+                cacheKeyValid = true;
+
+                if (auto cached = axisAlignedSliceCache().get(cacheKey)) {
+                    baseColor = *cached;
+                    usedCache = !baseColor.empty();
+                }
+            }
         } else {
             cv::Vec2f roi_c = {roi.x + roi.width / 2.0f, roi.y + roi.height / 2.0f};
             _ptr = _surf->pointer();
@@ -1165,20 +1360,30 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
             _surf->gen(&coords, nullptr, roi.size(), _ptr, _scale, {-roi.width / 2.0f, -roi.height / 2.0f, _z_off});
         }
 
-        readInterpolated3D(baseGray, volume->zarrDataset(_ds_sd_idx), coords * _ds_scale, cache, _useFastInterpolation);
+        if (!usedCache) {
+            if (!baseDataset) {
+                return cv::Mat();
+            }
+            readInterpolated3D(baseGray, baseDataset, coords * _ds_scale, cache, _useFastInterpolation);
+        }
     }
 
-    if (baseGray.empty()) {
+    if (!usedCache && baseGray.empty()) {
         return cv::Mat();
     }
 
-    cv::normalize(baseGray, baseGray, 0, 255, cv::NORM_MINMAX, CV_8U);
+    if (!usedCache) {
+        cv::normalize(baseGray, baseGray, 0, 255, cv::NORM_MINMAX, CV_8U);
 
-    cv::Mat baseColor;
-    if (baseGray.channels() == 1) {
-        cv::cvtColor(baseGray, baseColor, cv::COLOR_GRAY2BGR);
-    } else {
-        baseColor = baseGray.clone();
+        if (baseGray.channels() == 1) {
+            cv::cvtColor(baseGray, baseColor, cv::COLOR_GRAY2BGR);
+        } else {
+            baseColor = baseGray.clone();
+        }
+
+        if (cacheKeyValid && !baseColor.empty()) {
+            axisAlignedSliceCache().put(cacheKey, baseColor);
+        }
     }
 
     if (_overlayVolume && _overlayOpacity > 0.0f) {

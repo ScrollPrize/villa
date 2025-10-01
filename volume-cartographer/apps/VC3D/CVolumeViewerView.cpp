@@ -106,7 +106,27 @@ void CVolumeViewerView::wheelEvent(QWheelEvent *event)
 
 void CVolumeViewerView::mouseReleaseEvent(QMouseEvent *event)
 {
-    if (event->button() == Qt::MiddleButton || event->button() == Qt::RightButton)
+    if (event->button() == Qt::MiddleButton)
+    {
+        if (_middleButtonPanEnabled)
+        {
+            setCursor(Qt::ArrowCursor);
+            event->accept();
+            if (_regular_pan) {
+                _regular_pan = false;
+                sendPanRelease(event->button(), event->modifiers());
+            }
+        }
+        else
+        {
+            QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
+            QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
+            sendMouseRelease(scene_loc, event->button(), event->modifiers());
+            event->accept();
+        }
+        return;
+    }
+    else if (event->button() == Qt::RightButton)
     {
         setCursor(Qt::ArrowCursor);
         event->accept();
@@ -148,7 +168,26 @@ void CVolumeViewerView::keyReleaseEvent(QKeyEvent *event)
 
 void CVolumeViewerView::mousePressEvent(QMouseEvent *event)
 {
-    if (event->button() == Qt::MiddleButton || event->button() == Qt::RightButton)
+    if (event->button() == Qt::MiddleButton)
+    {
+        if (_middleButtonPanEnabled)
+        {
+            _regular_pan = true;
+            _last_pan_position = QPoint(event->position().x(), event->position().y());
+            sendPanStart(event->button(), event->modifiers());
+            setCursor(Qt::ClosedHandCursor);
+            event->accept();
+        }
+        else
+        {
+            QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
+            QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
+            sendMousePress(scene_loc, event->button(), event->modifiers());
+            event->accept();
+        }
+        return;
+    }
+    else if (event->button() == Qt::RightButton)
     {
         _regular_pan = true;
         _last_pan_position = QPoint(event->position().x(), event->position().y());

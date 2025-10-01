@@ -344,6 +344,14 @@ void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
     auto ch = ds->chunking().blockShape()[1];
     auto cd = ds->chunking().blockShape()[2];
 
+    const auto& dsShape = ds->shape();
+    const int sx = static_cast<int>(dsShape[0]);
+    const int sy = static_cast<int>(dsShape[1]);
+    const int sz = static_cast<int>(dsShape[2]);
+    const int chunksX = (sx + static_cast<int>(cw) - 1) / static_cast<int>(cw);
+    const int chunksY = (sy + static_cast<int>(ch) - 1) / static_cast<int>(ch);
+    const int chunksZ = (sz + static_cast<int>(cd) - 1) / static_cast<int>(cd);
+
     int w = coords.cols;
     int h = coords.rows;
 
@@ -351,16 +359,25 @@ void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
     std::unordered_map<cv::Vec4i,std::shared_ptr<xt::xarray<uint8_t>>,vec4i_hash> chunks;
 
     // Lambda for retrieving single values (unchanged)
-    auto retrieve_single_value_cached = [&cw,&ch,&cd,&group_idx,&chunks](
+    auto retrieve_single_value_cached = [&cw,&ch,&cd,&group_idx,&chunks,&sx,&sy,&sz](
         int ox, int oy, int oz) -> uint8_t {
+
+            if (ox < 0 || oy < 0 || oz < 0 ||
+                ox >= sx || oy >= sy || oz >= sz) {
+                return 0;
+            }
 
             int ix = int(ox)/cw;
             int iy = int(oy)/ch;
             int iz = int(oz)/cd;
 
             cv::Vec4i idx = {group_idx,ix,iy,iz};
+            auto it = chunks.find(idx);
+            if (it == chunks.end()) {
+                return 0;
+            }
 
-            xt::xarray<uint8_t> *chunk  = chunks[idx].get();
+            xt::xarray<uint8_t> *chunk  = it->second.get();
 
             if (!chunk)
                 return 0;
@@ -391,6 +408,10 @@ void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
                     if (ox < 0 || oy < 0 || oz < 0)
                         continue;
 
+                    if (ox >= sx || oy >= sy || oz >= sz) {
+                        continue;
+                    }
+
                     int ix = int(ox)/cw;
                     int iy = int(oy)/ch;
                     int iz = int(oz)/cd;
@@ -399,7 +420,11 @@ void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
 
                     if (idx != last_idx) {
                         last_idx = idx;
-                        chunks_local[idx] = nullptr;
+                        if (ix >= 0 && ix < chunksX &&
+                            iy >= 0 && iy < chunksY &&
+                            iz >= 0 && iz < chunksZ) {
+                            chunks_local[idx] = nullptr;
+                        }
                     }
 
                     int lx = ox-ix*cw;
@@ -410,18 +435,24 @@ void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
                         if (lx+1>=cw) {
                             cv::Vec4i idx2 = idx;
                             idx2[1]++;
-                            chunks_local[idx2] = nullptr;
+                            if (idx2[1] >= 0 && idx2[1] < chunksX) {
+                                chunks_local[idx2] = nullptr;
+                            }
                         }
                         if (ly+1>=ch) {
                             cv::Vec4i idx2 = idx;
                             idx2[2]++;
-                            chunks_local[idx2] = nullptr;
+                            if (idx2[2] >= 0 && idx2[2] < chunksY) {
+                                chunks_local[idx2] = nullptr;
+                            }
                         }
 
                         if (lz+1>=cd) {
                             cv::Vec4i idx2 = idx;
                             idx2[3]++;
-                            chunks_local[idx2] = nullptr;
+                            if (idx2[3] >= 0 && idx2[3] < chunksZ) {
+                                chunks_local[idx2] = nullptr;
+                            }
                         }
                     }
                 }
@@ -483,6 +514,10 @@ void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
                 if (ox < 0 || oy < 0 || oz < 0)
                     continue;
 
+                if (ox >= sx || oy >= sy || oz >= sz) {
+                    continue;
+                }
+
                 int ix = int(ox)/cw;
                 int iy = int(oy)/ch;
                 int iz = int(oz)/cd;
@@ -491,7 +526,13 @@ void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
 
                 if (idx != last_idx) {
                     last_idx = idx;
-                    chunk = chunks[idx].get();
+                    if (ix < 0 || ix >= chunksX ||
+                        iy < 0 || iy >= chunksY ||
+                        iz < 0 || iz >= chunksZ) {
+                        chunk = nullptr;
+                    } else {
+                        chunk = chunks[idx].get();
+                    }
                 }
 
                 int lx = ox-ix*cw;

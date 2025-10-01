@@ -7,6 +7,7 @@
 #include <QComboBox>
 #include <QCheckBox>
 #include <QFutureWatcher>
+#include <QPointF>
 #include <memory>
 #include <vector>
 #include "ui_VCMain.h"
@@ -26,6 +27,7 @@
 #include "overlays/PathsOverlayController.hpp"
 #include "overlays/BBoxOverlayController.hpp"
 #include "overlays/VectorOverlayController.hpp"
+#include "overlays/PlaneSlicingOverlayController.hpp"
 #include "overlays/VolumeOverlayController.hpp"
 #include "ViewerManager.hpp"
 #include "SegmentationWidget.hpp"
@@ -132,13 +134,19 @@ private slots:
     void onZoomIn();
     void onZoomOut();
     void onCopyCoordinates();
+    void onResetAxisAlignedRotations();
     void onAxisAlignedSlicesToggled(bool enabled);
+    void onAxisOverlayVisibilityToggled(bool enabled);
+    void onAxisOverlayOpacityChanged(int value);
     void onSegmentationEditingModeChanged(bool enabled);
     void onSegmentationStopToolsRequested();
     void configureViewerConnections(CVolumeViewer* viewer);
     CVolumeViewer* segmentationViewer() const;
     void clearSurfaceSelection();
     void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface, OpChain* chain);
+    void onAxisAlignedSliceMousePress(CVolumeViewer* viewer, const cv::Vec3f& volLoc, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+    void onAxisAlignedSliceMouseMove(CVolumeViewer* viewer, const cv::Vec3f& volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
+    void onAxisAlignedSliceMouseRelease(CVolumeViewer* viewer, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
 
 private:
     void recalcAreaForSegments(const std::vector<std::string>& ids);
@@ -197,6 +205,7 @@ private:
     std::unique_ptr<PathsOverlayController> _pathsOverlay;
     std::unique_ptr<BBoxOverlayController> _bboxOverlay;
     std::unique_ptr<VectorOverlayController> _vectorOverlay;
+    std::unique_ptr<PlaneSlicingOverlayController> _planeSlicingOverlay;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<MenuActionController> _menuController;
@@ -215,5 +224,18 @@ private:
     QShortcut* fAxisAlignedSlicesShortcut;
 
     void applySlicePlaneOrientation(Surface* sourceOverride = nullptr);
+    void updateAxisAlignedSliceInteraction();
+    float currentAxisAlignedRotationDegrees(const std::string& surfaceName) const;
+    void setAxisAlignedRotationDegrees(const std::string& surfaceName, float degrees);
+    static float normalizeDegrees(float degrees);
+
+    struct AxisAlignedSliceDragState {
+        bool active = false;
+        QPointF startScenePos;
+        float startRotationDegrees = 0.0f;
+    };
+    std::unordered_map<const CVolumeViewer*, AxisAlignedSliceDragState> _axisAlignedSliceDrags;
+    float _axisAlignedSegXZRotationDeg = 0.0f;
+    float _axisAlignedSegYZRotationDeg = 0.0f;
 
 };  // class CWindow

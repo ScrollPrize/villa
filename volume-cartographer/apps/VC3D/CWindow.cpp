@@ -27,6 +27,7 @@
 #include <QSize>
 #include <QVector>
 #include <QLoggingCategory>
+#include <QDebug>
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include <nlohmann/json.hpp>
@@ -35,8 +36,10 @@
 #include <QPen>
 #include <QFont>
 #include <QPainter>
+#include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <limits>
 #include <optional>
 #include <cctype>
 #include <algorithm>
@@ -82,12 +85,77 @@
 
 
 Q_LOGGING_CATEGORY(lcSegGrowth, "vc.segmentation.growth");
+Q_LOGGING_CATEGORY(lcAxisSlices, "vc.axis_aligned");
 
 using qga = QGuiApplication;
 using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 
 namespace
 {
+constexpr float kAxisRotationDegreesPerScenePixel = 0.25f;
+constexpr float kEpsilon = 1e-6f;
+constexpr float kDegToRad = static_cast<float>(CV_PI / 180.0);
+
+int axisAlignedRotationCacheKey(float degrees)
+{
+    int key = static_cast<int>(std::lround(degrees));
+    key %= 360;
+    if (key < 0) {
+        key += 360;
+    }
+    return key;
+}
+
+cv::Vec3f rotateAroundZ(const cv::Vec3f& v, float radians)
+{
+    const float c = std::cos(radians);
+    const float s = std::sin(radians);
+    return {
+        v[0] * c - v[1] * s,
+        v[0] * s + v[1] * c,
+        v[2]
+    };
+}
+
+cv::Vec3f projectVectorOntoPlane(const cv::Vec3f& v, const cv::Vec3f& normal)
+{
+    const float dot = v.dot(normal);
+    return v - normal * dot;
+}
+
+cv::Vec3f normalizeOrZero(const cv::Vec3f& v)
+{
+    const float magnitude = cv::norm(v);
+    if (magnitude <= kEpsilon) {
+        return cv::Vec3f(0.0f, 0.0f, 0.0f);
+    }
+    return v * (1.0f / magnitude);
+}
+
+cv::Vec3f crossProduct(const cv::Vec3f& a, const cv::Vec3f& b)
+{
+    return cv::Vec3f(
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0]);
+}
+
+float signedAngleBetween(const cv::Vec3f& from, const cv::Vec3f& to, const cv::Vec3f& axis)
+{
+    cv::Vec3f fromNorm = normalizeOrZero(from);
+    cv::Vec3f toNorm = normalizeOrZero(to);
+    if (cv::norm(fromNorm) <= kEpsilon || cv::norm(toNorm) <= kEpsilon) {
+        return 0.0f;
+    }
+
+    float dot = fromNorm.dot(toNorm);
+    dot = std::clamp(dot, -1.0f, 1.0f);
+    cv::Vec3f cross = crossProduct(fromNorm, toNorm);
+    float angle = std::atan2(cv::norm(cross), dot);
+    float sign = cross.dot(axis) >= 0.0f ? 1.0f : -1.0f;
+    return angle * sign;
+}
+
 void ensureDockWidgetFeatures(QDockWidget* dock)
 {
     if (!dock) {
@@ -266,6 +334,14 @@ CWindow::CWindow() :
 
     _vectorOverlay = std::make_unique<VectorOverlayController>(_surf_col, this);
     _viewerManager->setVectorOverlay(_vectorOverlay.get());
+
+    _planeSlicingOverlay = std::make_unique<PlaneSlicingOverlayController>(_surf_col, this);
+    _planeSlicingOverlay->bindToViewerManager(_viewerManager.get());
+    _planeSlicingOverlay->setRotationSetter([this](const std::string& planeName, float degrees) {
+        setAxisAlignedRotationDegrees(planeName, degrees);
+        applySlicePlaneOrientation();
+    });
+    _planeSlicingOverlay->setAxisAlignedEnabled(_useAxisAlignedSlices);
 
     _volumeOverlay = std::make_unique<VolumeOverlayController>(_viewerManager.get(), this);
     connect(_volumeOverlay.get(), &VolumeOverlayController::requestStatusMessage, this,
@@ -521,6 +597,30 @@ void CWindow::configureViewerConnections(CVolumeViewer* viewer)
         connect(viewer, &CVolumeViewer::pointClicked,
                 _point_collection_widget, &CPointCollectionWidget::selectPoint, Qt::UniqueConnection);
         viewer->setProperty("vc_points_bound", true);
+    }
+
+    const std::string& surfName = viewer->surfName();
+    if ((surfName == "seg xz" || surfName == "seg yz") && !viewer->property("vc_axisaligned_bound").toBool()) {
+        if (viewer->fGraphicsView) {
+            viewer->fGraphicsView->setMiddleButtonPanEnabled(!_useAxisAlignedSlices);
+        }
+
+        connect(viewer, &CVolumeViewer::sendMousePressVolume,
+                this, [this, viewer](cv::Vec3f volLoc, cv::Vec3f /*normal*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
+                    onAxisAlignedSliceMousePress(viewer, volLoc, button, modifiers);
+                });
+
+        connect(viewer, &CVolumeViewer::sendMouseMoveVolume,
+                this, [this, viewer](cv::Vec3f volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers) {
+                    onAxisAlignedSliceMouseMove(viewer, volLoc, buttons, modifiers);
+                });
+
+        connect(viewer, &CVolumeViewer::sendMouseReleaseVolume,
+                this, [this, viewer](cv::Vec3f /*volLoc*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
+                    onAxisAlignedSliceMouseRelease(viewer, button, modifiers);
+                });
+
+        viewer->setProperty("vc_axisaligned_bound", true);
     }
 }
 
@@ -823,6 +923,17 @@ void CWindow::CreateWidgets(void)
         _segmentationWidget->sigma(),
         this);
 
+    if (_segmentationModule && _planeSlicingOverlay) {
+        QPointer<PlaneSlicingOverlayController> overlayPtr(_planeSlicingOverlay.get());
+        _segmentationModule->setRotationHandleHitTester(
+            [overlayPtr](CVolumeViewer* viewer, const cv::Vec3f& worldPos) {
+                if (!overlayPtr) {
+                    return false;
+                }
+                return overlayPtr->isVolumePointNearRotationHandle(viewer, worldPos, 1.5);
+            });
+    }
+
     connect(_segmentationModule.get(), &SegmentationModule::editingEnabledChanged,
             this, &CWindow::onSegmentationEditingModeChanged);
     connect(_segmentationModule.get(), &SegmentationModule::statusMessageRequested,
@@ -934,7 +1045,7 @@ void CWindow::CreateWidgets(void)
         VolumeOverlayController::UiRefs overlayUi{
             .volumeSelect = ui.overlayVolumeSelect,
             .colormapSelect = ui.overlayColormapSelect,
-            .opacitySlider = ui.overlayOpacitySlider,
+            .opacitySpin = ui.overlayOpacitySpin,
             .thresholdSpin = ui.overlayThresholdSpin,
         };
         _volumeOverlay->setUi(overlayUi);
@@ -1002,6 +1113,24 @@ void CWindow::CreateWidgets(void)
     QPushButton* btnCopyCoords = ui.btnCopyCoords;
     connect(btnCopyCoords, &QPushButton::clicked, this, &CWindow::onCopyCoordinates);
 
+    if (auto* chkAxisOverlays = ui.chkAxisOverlays) {
+        bool showOverlays = settings.value("viewer/show_axis_overlays", true).toBool();
+        QSignalBlocker blocker(chkAxisOverlays);
+        chkAxisOverlays->setChecked(showOverlays);
+        connect(chkAxisOverlays, &QCheckBox::toggled, this, &CWindow::onAxisOverlayVisibilityToggled);
+    }
+    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
+        int storedOpacity = settings.value("viewer/axis_overlay_opacity", spinAxisOverlayOpacity->value()).toInt();
+        storedOpacity = std::clamp(storedOpacity, spinAxisOverlayOpacity->minimum(), spinAxisOverlayOpacity->maximum());
+        QSignalBlocker blocker(spinAxisOverlayOpacity);
+        spinAxisOverlayOpacity->setValue(storedOpacity);
+        connect(spinAxisOverlayOpacity, qOverload<int>(&QSpinBox::valueChanged), this, &CWindow::onAxisOverlayOpacityChanged);
+    }
+
+    if (auto* btnResetRot = ui.btnResetAxisRotations) {
+        connect(btnResetRot, &QPushButton::clicked, this, &CWindow::onResetAxisAlignedRotations);
+    }
+
     // Zoom buttons
     btnZoomIn = ui.btnZoomIn;
     btnZoomOut = ui.btnZoomOut;
@@ -1029,7 +1158,12 @@ void CWindow::CreateWidgets(void)
     }
 
     chkAxisAlignedSlices = ui.chkAxisAlignedSlices;
-    connect(chkAxisAlignedSlices, &QCheckBox::toggled, this, &CWindow::onAxisAlignedSlicesToggled);
+    if (chkAxisAlignedSlices) {
+        bool useAxisAligned = settings.value("viewer/use_axis_aligned_slices", false).toBool();
+        QSignalBlocker blocker(chkAxisAlignedSlices);
+        chkAxisAlignedSlices->setChecked(useAxisAligned);
+        connect(chkAxisAlignedSlices, &QCheckBox::toggled, this, &CWindow::onAxisAlignedSlicesToggled);
+    }
 
     spNorm[0] = ui.dspNX;
     spNorm[1] = ui.dspNY;
@@ -1066,6 +1200,16 @@ void CWindow::CreateWidgets(void)
             viewer->setCompositeMethod(method);
         }
     });
+
+    if (chkAxisAlignedSlices) {
+        onAxisAlignedSlicesToggled(chkAxisAlignedSlices->isChecked());
+    }
+    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
+        onAxisOverlayOpacityChanged(spinAxisOverlayOpacity->value());
+    }
+    if (auto* chkAxisOverlays = ui.chkAxisOverlays) {
+        onAxisOverlayVisibilityToggled(chkAxisOverlays->isChecked());
+    }
     
     // Connect Layers In Front controls
     connect(ui.spinLayersInFront, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
@@ -1878,6 +2022,40 @@ void CWindow::onCopyCoordinates()
     }
 }
 
+void CWindow::onResetAxisAlignedRotations()
+{
+    _axisAlignedSegXZRotationDeg = 0.0f;
+    _axisAlignedSegYZRotationDeg = 0.0f;
+    _axisAlignedSliceDrags.clear();
+    applySlicePlaneOrientation();
+    if (_planeSlicingOverlay) {
+        _planeSlicingOverlay->refreshAll();
+    }
+    statusBar()->showMessage(tr("Axis-aligned rotations reset"), 2000);
+}
+
+void CWindow::onAxisOverlayVisibilityToggled(bool enabled)
+{
+    if (_planeSlicingOverlay) {
+        _planeSlicingOverlay->setAxisAlignedEnabled(enabled && _useAxisAlignedSlices);
+    }
+    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
+        spinAxisOverlayOpacity->setEnabled(_useAxisAlignedSlices && enabled);
+    }
+    QSettings settings("VC.ini", QSettings::IniFormat);
+    settings.setValue("viewer/show_axis_overlays", enabled ? "1" : "0");
+}
+
+void CWindow::onAxisOverlayOpacityChanged(int value)
+{
+    float normalized = std::clamp(static_cast<float>(value) / 100.0f, 0.0f, 1.0f);
+    if (_planeSlicingOverlay) {
+        _planeSlicingOverlay->setAxisAlignedOverlayOpacity(normalized);
+    }
+    QSettings settings("VC.ini", QSettings::IniFormat);
+    settings.setValue("viewer/axis_overlay_opacity", value);
+}
+
 void CWindow::recalcAreaForSegments(const std::vector<std::string>& ids)
 {
     if (!fVpkg || ids.empty()) {
@@ -2131,6 +2309,22 @@ void CWindow::recalcAreaForSegments(const std::vector<std::string>& ids)
 void CWindow::onAxisAlignedSlicesToggled(bool enabled)
 {
     _useAxisAlignedSlices = enabled;
+    if (enabled) {
+        _axisAlignedSegXZRotationDeg = 0.0f;
+        _axisAlignedSegYZRotationDeg = 0.0f;
+    }
+    _axisAlignedSliceDrags.clear();
+    qCDebug(lcAxisSlices) << "Axis-aligned slices" << (enabled ? "enabled" : "disabled");
+    if (_planeSlicingOverlay) {
+        bool overlaysVisible = !ui.chkAxisOverlays || ui.chkAxisOverlays->isChecked();
+        _planeSlicingOverlay->setAxisAlignedEnabled(enabled && overlaysVisible);
+    }
+    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
+        spinAxisOverlayOpacity->setEnabled(enabled && (!ui.chkAxisOverlays || ui.chkAxisOverlays->isChecked()));
+    }
+    QSettings settings("VC.ini", QSettings::IniFormat);
+    settings.setValue("viewer/use_axis_aligned_slices", enabled ? "1" : "0");
+    updateAxisAlignedSliceInteraction();
     applySlicePlaneOrientation();
 }
 
@@ -2527,6 +2721,118 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
     watcher->setFuture(future);
 }
 
+float CWindow::normalizeDegrees(float degrees)
+{
+    while (degrees > 180.0f) {
+        degrees -= 360.0f;
+    }
+    while (degrees <= -180.0f) {
+        degrees += 360.0f;
+    }
+    return degrees;
+}
+
+float CWindow::currentAxisAlignedRotationDegrees(const std::string& surfaceName) const
+{
+    if (surfaceName == "seg xz") {
+        return _axisAlignedSegXZRotationDeg;
+    }
+    if (surfaceName == "seg yz") {
+        return _axisAlignedSegYZRotationDeg;
+    }
+    return 0.0f;
+}
+
+void CWindow::setAxisAlignedRotationDegrees(const std::string& surfaceName, float degrees)
+{
+    const float normalized = normalizeDegrees(degrees);
+    if (surfaceName == "seg xz") {
+        _axisAlignedSegXZRotationDeg = normalized;
+    } else if (surfaceName == "seg yz") {
+        _axisAlignedSegYZRotationDeg = normalized;
+    }
+}
+
+void CWindow::updateAxisAlignedSliceInteraction()
+{
+    if (!_viewerManager) {
+        return;
+    }
+
+    _viewerManager->forEachViewer([this](CVolumeViewer* viewer) {
+        if (!viewer || !viewer->fGraphicsView) {
+            return;
+        }
+        const std::string& name = viewer->surfName();
+        if (name == "seg xz" || name == "seg yz") {
+            viewer->fGraphicsView->setMiddleButtonPanEnabled(!_useAxisAlignedSlices);
+            qCDebug(lcAxisSlices) << "Middle-button pan set" << QString::fromStdString(name)
+                                 << "enabled" << viewer->fGraphicsView->middleButtonPanEnabled();
+        }
+    });
+}
+
+void CWindow::onAxisAlignedSliceMousePress(CVolumeViewer* viewer, const cv::Vec3f& volLoc, Qt::MouseButton button, Qt::KeyboardModifiers)
+{
+    if (!_useAxisAlignedSlices || button != Qt::MiddleButton || !viewer) {
+        return;
+    }
+
+    const std::string surfaceName = viewer->surfName();
+    if (surfaceName != "seg xz" && surfaceName != "seg yz") {
+        return;
+    }
+
+    AxisAlignedSliceDragState& state = _axisAlignedSliceDrags[viewer];
+    state.active = true;
+    state.startScenePos = viewer->volumePointToScene(volLoc);
+    state.startRotationDegrees = currentAxisAlignedRotationDegrees(surfaceName);
+
+}
+
+void CWindow::onAxisAlignedSliceMouseMove(CVolumeViewer* viewer, const cv::Vec3f& volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers)
+{
+    if (!_useAxisAlignedSlices || !viewer || !(buttons & Qt::MiddleButton)) {
+        return;
+    }
+
+    const std::string surfaceName = viewer->surfName();
+    if (surfaceName != "seg xz" && surfaceName != "seg yz") {
+        return;
+    }
+
+    auto it = _axisAlignedSliceDrags.find(viewer);
+    if (it == _axisAlignedSliceDrags.end() || !it->second.active) {
+        return;
+    }
+
+    AxisAlignedSliceDragState& state = it->second;
+    QPointF currentScenePos = viewer->volumePointToScene(volLoc);
+    const float dragPixels = static_cast<float>(currentScenePos.y() - state.startScenePos.y());
+    const float candidate = normalizeDegrees(state.startRotationDegrees - dragPixels * kAxisRotationDegreesPerScenePixel);
+    const float currentRotation = currentAxisAlignedRotationDegrees(surfaceName);
+
+    if (std::abs(candidate - currentRotation) < 0.01f) {
+        return;
+    }
+
+    setAxisAlignedRotationDegrees(surfaceName, candidate);
+    applySlicePlaneOrientation();
+
+}
+
+void CWindow::onAxisAlignedSliceMouseRelease(CVolumeViewer* viewer, Qt::MouseButton button, Qt::KeyboardModifiers)
+{
+    if (button != Qt::MiddleButton) {
+        return;
+    }
+
+    auto it = _axisAlignedSliceDrags.find(viewer);
+    if (it != _axisAlignedSliceDrags.end()) {
+        it->second.active = false;
+    }
+}
+
 void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
 {
     if (!_surf_col) {
@@ -2547,14 +2853,50 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
             segYZ = new PlaneSurface();
         }
 
-        segXZ->setOrigin(origin);
-        segYZ->setOrigin(origin);
+        const auto configurePlane = [origin](PlaneSurface* plane,
+                                            float degrees,
+                                            const cv::Vec3f& baseNormal) {
+            if (!plane) {
+                return;
+            }
 
-        segXZ->setNormal(cv::Vec3f(0, 1, 0));
-        segYZ->setNormal(cv::Vec3f(1, 0, 0));
+            plane->setOrigin(origin);
+            plane->setInPlaneRotation(0.0f);
+
+            const float radians = degrees * kDegToRad;
+            const cv::Vec3f rotatedNormal = rotateAroundZ(baseNormal, radians);
+            plane->setNormal(rotatedNormal);
+
+            const cv::Vec3f upAxis(0.0f, 0.0f, 1.0f);
+            const cv::Vec3f projectedUp = projectVectorOntoPlane(upAxis, rotatedNormal);
+            const cv::Vec3f desiredUp = normalizeOrZero(projectedUp);
+
+            if (cv::norm(desiredUp) > kEpsilon) {
+                const cv::Vec3f currentUp = plane->basisY();
+                const float delta = signedAngleBetween(currentUp, desiredUp, rotatedNormal);
+                if (std::abs(delta) > kEpsilon) {
+                    plane->setInPlaneRotation(delta);
+                }
+            } else {
+                plane->setInPlaneRotation(0.0f);
+            }
+        };
+
+        configurePlane(segXZ, _axisAlignedSegXZRotationDeg, cv::Vec3f(0.0f, 1.0f, 0.0f));
+        configurePlane(segYZ, _axisAlignedSegYZRotationDeg, cv::Vec3f(1.0f, 0.0f, 0.0f));
+
+        if (segXZ) {
+            segXZ->setAxisAlignedRotationKey(axisAlignedRotationCacheKey(_axisAlignedSegXZRotationDeg));
+        }
+        if (segYZ) {
+            segYZ->setAxisAlignedRotationKey(axisAlignedRotationCacheKey(_axisAlignedSegYZRotationDeg));
+        }
 
         _surf_col->setSurface("seg xz", segXZ);
         _surf_col->setSurface("seg yz", segYZ);
+        if (_planeSlicingOverlay) {
+            _planeSlicingOverlay->refreshAll();
+        }
         return;
     } else {
         auto* segment = dynamic_cast<QuadSurface*>(sourceOverride ? sourceOverride : _surf_col->surface("segmentation"));
@@ -2582,9 +2924,16 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
         cv::Vec3f yDir = segment->coord(ptr, {0, 1, 0});
         segXZ->setNormal(xDir - origin);
         segYZ->setNormal(yDir - origin);
+        segXZ->setInPlaneRotation(0.0f);
+        segYZ->setInPlaneRotation(0.0f);
+        segXZ->setAxisAlignedRotationKey(-1);
+        segYZ->setAxisAlignedRotationKey(-1);
 
         _surf_col->setSurface("seg xz", segXZ);
         _surf_col->setSurface("seg yz", segYZ);
+        if (_planeSlicingOverlay) {
+            _planeSlicingOverlay->refreshAll();
+        }
         return;
     }
 }

@@ -4,6 +4,7 @@
 #include <QPointer>
 #include <QSet>
 
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
@@ -77,6 +78,8 @@ public:
     [[nodiscard]] SegmentationCorrectionsPayload buildCorrectionsPayload() const;
     void clearPendingCorrections();
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
+
+    void setRotationHandleHitTester(std::function<bool(CVolumeViewer*, const cv::Vec3f&)> tester);
 
 signals:
     void editingEnabledChanged(bool enabled);
@@ -176,6 +179,7 @@ private:
     void cancelDrag();
 
     void updateHover(CVolumeViewer* viewer, const cv::Vec3f& worldPos);
+    [[nodiscard]] bool isNearRotationHandle(CVolumeViewer* viewer, const cv::Vec3f& worldPos) const;
 
     bool startPushPull(int direction);
     void stopPushPull(int direction);
@@ -212,6 +216,8 @@ private:
     QSet<CVolumeViewer*> _attachedViewers;
     QTimer* _pushPullTimer{nullptr};
     PushPullState _pushPull;
+
+    std::function<bool(CVolumeViewer*, const cv::Vec3f&)> _rotationHandleHitTester;
 
     bool _invalidationBrushActive{false};
     bool _paintStrokeActive{false};
