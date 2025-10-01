@@ -18,8 +18,6 @@
 #include <stdio.h>
 #include <unistd.h>
 
-static_assert(__linux__, "Atomic overwrite for QuadSurface::save() is only supported on Linux.");
-
 void write_overlapping_json(const std::filesystem::path& seg_path, const std::set<std::string>& overlapping_names) {
     nlohmann::json overlap_json;
     overlap_json["overlapping"] = std::vector<std::string>(overlapping_names.begin(), overlapping_names.end());
