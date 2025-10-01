@@ -553,7 +553,8 @@ void SegmentationWidget::restoreSettings()
 
     _radiusSteps = settings.value(QStringLiteral("radius_steps"), _radiusSteps).toFloat();
     _sigmaSteps = settings.value(QStringLiteral("sigma_steps"), _sigmaSteps).toFloat();
-    _growthMethod = SegmentationGrowthMethod::Corrections;
+    _growthMethod = segmentationGrowthMethodFromInt(
+        settings.value(QStringLiteral("growth_method"), static_cast<int>(_growthMethod)).toInt());
     _growthSteps = settings.value(QStringLiteral("growth_steps"), _growthSteps).toInt();
     _growthSteps = std::clamp(_growthSteps, 1, 1024);
     _growthDirectionMask = normalizeGrowthDirectionMask(
@@ -1049,7 +1050,7 @@ void SegmentationWidget::updateGrowthUiState()
     if (_btnGrow) {
         _btnGrow->setEnabled(enableGrowth);
     }
-    const bool enableDirCheckbox = enableGrowth && _growthMethod != SegmentationGrowthMethod::Corrections;
+    const bool enableDirCheckbox = enableGrowth;
     if (_chkGrowthDirUp) {
         _chkGrowthDirUp->setEnabled(enableDirCheckbox);
     }
