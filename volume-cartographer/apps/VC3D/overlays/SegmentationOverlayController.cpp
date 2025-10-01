@@ -100,7 +100,7 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
         ViewerOverlayControllerBase::PathPrimitive maskPath;
         maskPath.points = _maskPoints;
         maskPath.renderMode = ViewerOverlayControllerBase::PathRenderMode::Points;
-        maskPath.brushShape = ViewerOverlayControllerBase::PathBrushShape::Square;
+        maskPath.brushShape = ViewerOverlayControllerBase::PathBrushShape::Circle;
         maskPath.pointRadius = _maskPointRadius;
         maskPath.color = QColor(255, 140, 0);
         maskPath.opacity = _maskOpacity;
