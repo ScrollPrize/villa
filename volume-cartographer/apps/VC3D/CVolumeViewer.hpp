@@ -64,7 +64,6 @@ public:
     bool isShowDirectionHints() const { return _showDirectionHints; }
 
     void setSegmentationEditActive(bool active) { _segmentationEditActive = active; }
-    void setSegmentationEditHighlight(std::optional<std::pair<int,int>> handleKey, const cv::Vec3f& worldPos);
 
     void fitSurfaceInView();
     void updateAllOverlays();
@@ -135,10 +134,7 @@ public slots:
     void onDrawingModeActive(bool active, float brushSize = 3.0f, bool isSquare = false);
 
 signals:
-    void SendSignalSliceShift(int shift, int axis);
-    void SendSignalStatusMessageAvailable(QString text, int timeout);
     void sendVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
-    void sendShiftNormal(cv::Vec3f step);
     void sendZSliceChanged(int z_value);
     
     // Mouse event signals with transformed volume coordinates
@@ -153,17 +149,13 @@ signals:
     // (kept free for potential future signals)
 
 protected:
-    void ScaleImage(double nFactor);
-    void CenterOn(const QPointF& point);
     QPointF volumeToScene(const cv::Vec3f& vol_point);
-    void performDeferredUpdates();
 
 protected:
     // widget components
     QGraphicsScene* fScene;
 
     // data
-    QImage* fImgQImage;
     bool fSkipImageFormatConv;
 
     QGraphicsPixmapItem* fBaseImageItem;
@@ -173,8 +165,6 @@ protected:
     cv::Vec3f _ptr = cv::Vec3f(0,0,0);
     cv::Vec2f _vis_center = {0,0};
     std::string _surf_name;
-    int axis = 0;
-    int loc[3] = {0,0,0};
     
     ChunkCache *cache = nullptr;
     QRect curr_img_area = {0,0,1000,1000};
@@ -204,7 +194,6 @@ protected:
     QGraphicsItem *_center_marker = nullptr;
     QGraphicsItem *_cursor = nullptr;
     
-    bool _slice_vis_valid = false;
     std::vector<QGraphicsItem*> slice_vis_items; 
 
     std::set<std::string> _intersect_tgts = {"visible_segmentation"};
@@ -222,8 +211,6 @@ protected:
     uint64_t _selected_point_id = 0;
     uint64_t _dragged_point_id = 0;
     uint64_t _selected_collection_id = 0;
-    uint64_t _current_shift_collection_id = 0;
-    bool _new_shift_group_required = true;
     
     std::vector<ViewerOverlayControllerBase::PathPrimitive> _paths;
     

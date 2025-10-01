@@ -620,7 +620,6 @@ void CVolumeViewer::setSurface(const std::string &name)
 
 void CVolumeViewer::invalidateVis()
 {
-    _slice_vis_valid = false;    
     for(auto &item : slice_vis_items) {
         fScene->removeItem(item);
         delete item;
@@ -2001,11 +2000,8 @@ void CVolumeViewer::onCollectionSelected(uint64_t collectionId)
     emit overlaysUpdated();
 }
 
-void CVolumeViewer::onKeyRelease(int key, Qt::KeyboardModifiers modifiers)
+void CVolumeViewer::onKeyRelease(int /*key*/, Qt::KeyboardModifiers /*modifiers*/)
 {
-    if (key == Qt::Key_Shift) {
-        _new_shift_group_required = true;
-    }
 }
 
 void CVolumeViewer::onPointSelected(uint64_t pointId)
