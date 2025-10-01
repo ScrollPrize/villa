@@ -15,6 +15,7 @@
 #include <QLoggingCategory>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QScrollBar>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSpinBox>
@@ -38,6 +39,7 @@ constexpr int kGrowDirDownBit = 1 << 1;
 constexpr int kGrowDirLeftBit = 1 << 2;
 constexpr int kGrowDirRightBit = 1 << 3;
 constexpr int kGrowDirAllMask = kGrowDirUpBit | kGrowDirDownBit | kGrowDirLeftBit | kGrowDirRightBit;
+constexpr int kCompactDirectionFieldRowLimit = 3;
 
 QString settingsGroup()
 {
@@ -1036,6 +1038,7 @@ void SegmentationWidget::refreshDirectionFieldList()
     }
 
     updateDirectionFieldFormFromSelection(_directionFieldList->currentRow());
+    updateDirectionFieldListGeometry();
 }
 
 void SegmentationWidget::updateDirectionFieldFormFromSelection(int row)
@@ -1126,6 +1129,40 @@ void SegmentationWidget::updateDirectionFieldListItem(int row)
         item->setText(itemText);
         item->setToolTip(config.path);
     }
+}
+
+void SegmentationWidget::updateDirectionFieldListGeometry()
+{
+    if (!_directionFieldList) {
+        return;
+    }
+
+    auto policy = _directionFieldList->sizePolicy();
+    const int itemCount = _directionFieldList->count();
+
+    if (itemCount <= kCompactDirectionFieldRowLimit) {
+        const int sampleRowHeight = _directionFieldList->sizeHintForRow(0);
+        const int rowHeight = sampleRowHeight > 0 ? sampleRowHeight : _directionFieldList->fontMetrics().height() + 8;
+        const int visibleRows = std::max(1, itemCount);
+        const int frameHeight = 2 * _directionFieldList->frameWidth();
+        const auto* hScroll = _directionFieldList->horizontalScrollBar();
+        const int scrollHeight = (hScroll && hScroll->isVisible()) ? hScroll->sizeHint().height() : 0;
+        const int targetHeight = rowHeight * visibleRows + frameHeight + scrollHeight;
+
+        policy.setVerticalPolicy(QSizePolicy::Fixed);
+        policy.setVerticalStretch(0);
+        _directionFieldList->setSizePolicy(policy);
+        _directionFieldList->setMinimumHeight(targetHeight);
+        _directionFieldList->setMaximumHeight(targetHeight);
+    } else {
+        policy.setVerticalPolicy(QSizePolicy::Expanding);
+        policy.setVerticalStretch(1);
+        _directionFieldList->setSizePolicy(policy);
+        _directionFieldList->setMinimumHeight(0);
+        _directionFieldList->setMaximumHeight(QWIDGETSIZE_MAX);
+    }
+
+    _directionFieldList->updateGeometry();
 }
 
 void SegmentationWidget::persistDirectionFields()

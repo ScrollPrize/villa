@@ -98,6 +98,7 @@ private:
     void updateDirectionFieldFormFromSelection(int row);
     void applyDirectionFieldDraftToSelection(int row);
     void updateDirectionFieldListItem(int row);
+    void updateDirectionFieldListGeometry();
     void setGrowthDirectionMask(int mask);
     void updateGrowthDirectionMaskFromUi(QCheckBox* changedCheckbox);
     void applyGrowthDirectionMaskToUi();

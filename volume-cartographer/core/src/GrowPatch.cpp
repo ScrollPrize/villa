@@ -28,20 +28,9 @@
 
 namespace { // Anonymous namespace for local helpers
 
-// Thread-local RNG and seed setter for reproducibility in tests
-static thread_local std::mt19937& get_thread_local_rng() {
-    static thread_local std::mt19937 rng(std::random_device{}());
-    return rng;
-}
-
-// Allows tests to set a fixed seed for reproducibility
-void set_random_perturbation_seed(uint32_t seed) {
-    get_thread_local_rng().seed(seed);
-}
-
 cv::Vec3d random_perturbation(double max_abs_offset = 0.05) {
+    static thread_local std::mt19937 rng(std::random_device{}());
     std::uniform_real_distribution<double> dist(-max_abs_offset, max_abs_offset);
-    auto& rng = get_thread_local_rng();
     return {dist(rng), dist(rng), dist(rng)};
 }
 
