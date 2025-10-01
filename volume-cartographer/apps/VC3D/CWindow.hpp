@@ -101,16 +101,10 @@ protected:
 
 private:
     void CreateWidgets(void);
-    void CreateMenus(void);
-    void CreateActions(void);
 
-    void FillSurfaceTree(void);
     void UpdateView(void);
     void UpdateVolpkgLabel(int filterCounter);
 
-    void UpdateRecentVolpkgActions(void);
-    void UpdateRecentVolpkgList(const QString& path);
-    void RemoveEntryFromRecentVolpkg(const QString& path);
 
     // Helper method for command line tools
     bool initializeCommandLineRunner(void);
@@ -121,13 +115,10 @@ private:
     void setWidgetsEnabled(bool state);
 
     bool InitializeVolumePkg(const std::string& nVpkgPath);
-    void setDefaultWindowWidth(std::shared_ptr<Volume> volume);
 
     void OpenVolume(const QString& path);
     void CloseVolume(void);
 
-    static void audio_callback(void *user_data, uint8_t *raw_buffer, int bytes);
-    void playPing();
 
     void setVolume(std::shared_ptr<Volume> newvol);
     void updateNormalGridAvailability();
@@ -162,8 +153,6 @@ private:
     std::string _segmentationGrowthVolumeId;
     int loc[3] = {0,0,0};
 
-    static const int AMPLITUDE = 28000;
-    static const int FREQUENCY = 44100;
 
     // Selection dock
     QDockWidget* _dockSelection = nullptr;
