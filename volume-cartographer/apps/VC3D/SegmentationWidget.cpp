@@ -1140,6 +1140,8 @@ int SegmentationWidget::normalizeGrowthDirectionMask(int mask)
 {
     mask &= kGrowDirAllMask;
     if (mask == 0) {
+        // If no directions are selected, enable all directions by default.
+        // This ensures that growth is not unintentionally disabled.
         mask = kGrowDirAllMask;
     }
     return mask;
