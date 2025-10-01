@@ -39,6 +39,7 @@ public:
     void setSigma(float value);
     void setGrowthMethod(SegmentationGrowthMethod method);
     void setGrowthInProgress(bool running);
+    void setEraseBrushActive(bool active);
 
     void setNormalGridAvailable(bool available);
     void setNormalGridPathHint(const QString& hint);
@@ -79,6 +80,7 @@ private:
     void syncUiState();
     void restoreSettings();
     void writeSetting(const QString& key, const QVariant& value);
+    void updateEditingState(bool enabled, bool notifyListeners);
 
     void refreshDirectionFieldList();
     void persistDirectionFields();
@@ -95,6 +97,7 @@ private:
     bool _editingEnabled{false};
     bool _pending{false};
     bool _growthInProgress{false};
+    bool _eraseBrushActive{false};
     float _radiusSteps{3.0f};
     float _sigmaSteps{1.5f};
 
@@ -151,6 +154,7 @@ private:
     QPushButton* _btnApply{nullptr};
     QPushButton* _btnReset{nullptr};
     QPushButton* _btnStop{nullptr};
+    QCheckBox* _chkEraseBrush{nullptr};
 
     bool _correctionsEnabled{false};
     bool _correctionsZRangeEnabled{false};

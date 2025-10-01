@@ -15,11 +15,13 @@
 #include <QKeyEvent>
 #include <QLoggingCategory>
 #include <QPointer>
+#include <QTimer>
 
 #include <algorithm>
 #include <cmath>
 #include <optional>
 #include <limits>
+#include <unordered_set>
 
 Q_LOGGING_CATEGORY(lcSegModule, "vc.segmentation.module")
 
@@ -49,17 +51,19 @@ void SegmentationModule::DragState::reset()
     moved = false;
 }
 
-void SegmentationModule::HoverState::set(int r, int c, const cv::Vec3f& w)
+void SegmentationModule::HoverState::set(int r, int c, const cv::Vec3f& w, CVolumeViewer* v)
 {
     valid = true;
     row = r;
     col = c;
     world = w;
+    viewer = v;
 }
 
 void SegmentationModule::HoverState::clear()
 {
     valid = false;
+    viewer = nullptr;
 }
 
 SegmentationModule::SegmentationModule(SegmentationWidget* widget,
@@ -95,6 +99,11 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _editManager->setRadius(_radiusSteps);
         _editManager->setSigma(_sigmaSteps);
     }
+
+    _pushPullTimer = new QTimer(this);
+    _pushPullTimer->setInterval(30);
+    connect(_pushPullTimer, &QTimer::timeout,
+            this, &SegmentationModule::onPushPullTick);
 
     bindWidgetSignals();
 
@@ -182,6 +191,8 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::onCorrectionsAnnotateToggled);
     connect(_widget, &SegmentationWidget::correctionsZRangeChanged,
             this, &SegmentationModule::onCorrectionsZRangeChanged);
+
+    _widget->setEraseBrushActive(false);
 }
 
 void SegmentationModule::bindViewerSignals(CVolumeViewer* viewer)
@@ -247,7 +258,10 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     }
     updateViewerCursors();
     if (!enabled) {
+        stopAllPushPull();
         setCorrectionsAnnotateMode(false, false);
+        setInvalidationBrushActive(false);
+        clearInvalidationBrush();
     }
     updateCorrectionsWidget();
     emit editingEnabledChanged(enabled);
@@ -296,6 +310,7 @@ void SegmentationModule::applyEdits()
     if (!_editManager || !_editManager->hasSession()) {
         return;
     }
+    clearInvalidationBrush();
     _editManager->applyPreview();
     if (_surfaces) {
         _surfaces->setSurface("segmentation", _editManager->previewSurface());
@@ -309,6 +324,7 @@ void SegmentationModule::resetEdits()
         return;
     }
     cancelDrag();
+    clearInvalidationBrush();
     _editManager->resetPreview();
     if (_surfaces) {
         _surfaces->setSurface("segmentation", _editManager->previewSurface());
@@ -329,6 +345,9 @@ bool SegmentationModule::beginEditingSession(QuadSurface* surface)
         return false;
     }
 
+    stopAllPushPull();
+    clearInvalidationBrush();
+    setInvalidationBrushActive(false);
     if (!_editManager->beginSession(surface)) {
         qCWarning(lcSegModule) << "Failed to begin segmentation editing session";
         return false;
@@ -353,7 +372,10 @@ bool SegmentationModule::beginEditingSession(QuadSurface* surface)
 
 void SegmentationModule::endEditingSession()
 {
+    stopAllPushPull();
     cancelDrag();
+    clearInvalidationBrush();
+    setInvalidationBrushActive(false);
     if (_overlay) {
         _overlay->setActiveVertex(std::nullopt);
         _overlay->setTouchedVertices({});
@@ -397,6 +419,22 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         return false;
     }
 
+    if (event->key() == Qt::Key_Shift && !event->isAutoRepeat()) {
+        setInvalidationBrushActive(true);
+        event->accept();
+        return true;
+    }
+
+    if (event->key() == Qt::Key_E && !event->isAutoRepeat()) {
+        const Qt::KeyboardModifiers mods = event->modifiers();
+        if (mods == Qt::NoModifier || mods == Qt::ShiftModifier) {
+            if (applyInvalidationBrush()) {
+                event->accept();
+                return true;
+            }
+        }
+    }
+
     if (event->key() == Qt::Key_Escape) {
         if (_drag.active) {
             cancelDrag();
@@ -404,8 +442,43 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         }
     }
 
+    if ((event->key() == Qt::Key_F || event->key() == Qt::Key_G) && event->modifiers() == Qt::NoModifier) {
+        if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
+            return false;
+        }
+
+        const int direction = (event->key() == Qt::Key_G) ? 1 : -1;
+        if (startPushPull(direction)) {
+            event->accept();
+            return true;
+        }
+        return false;
+    }
+
     if (event->key() == Qt::Key_T && event->modifiers() == Qt::NoModifier) {
         onCorrectionsCreateRequested();
+        event->accept();
+        return true;
+    }
+
+    return false;
+}
+
+bool SegmentationModule::handleKeyRelease(QKeyEvent* event)
+{
+    if (!event) {
+        return false;
+    }
+
+    if (event->key() == Qt::Key_Shift && !event->isAutoRepeat()) {
+        setInvalidationBrushActive(false);
+        event->accept();
+        return true;
+    }
+
+    if ((event->key() == Qt::Key_F || event->key() == Qt::Key_G) && event->modifiers() == Qt::NoModifier) {
+        const int direction = (event->key() == Qt::Key_G) ? 1 : -1;
+        stopPushPull(direction);
         event->accept();
         return true;
     }
@@ -428,6 +501,8 @@ void SegmentationModule::setGrowthInProgress(bool running)
     }
     if (running) {
         setCorrectionsAnnotateMode(false, false);
+        setInvalidationBrushActive(false);
+        clearInvalidationBrush();
     }
     updateCorrectionsWidget();
 }
@@ -547,8 +622,22 @@ void SegmentationModule::refreshOverlay()
         }
     }
 
+    std::vector<cv::Vec3f> maskPoints;
+    maskPoints.reserve(_paintOverlayPoints.size() + _currentPaintStroke.size());
+    maskPoints.insert(maskPoints.end(), _paintOverlayPoints.begin(), _paintOverlayPoints.end());
+    maskPoints.insert(maskPoints.end(), _currentPaintStroke.begin(), _currentPaintStroke.end());
+
+    const bool maskVisible = !maskPoints.empty();
+    const float brushPixelRadius = std::clamp(_radiusSteps * 1.5f, 3.0f, 18.0f);
+    const float brushOpacity = _invalidationBrushActive ? 0.6f : 0.45f;
+
     _overlay->setActiveVertex(activeMarker);
     _overlay->setTouchedVertices(neighbours);
+    if (maskVisible) {
+        _overlay->setMaskOverlay(maskPoints, true, brushPixelRadius, brushOpacity);
+    } else {
+        _overlay->setMaskOverlay({}, false, 0.0f, 0.0f);
+    }
     _overlay->setGaussianParameters(_radiusSteps, _sigmaSteps, gridStepWorld());
     _overlay->refreshAll();
 }
@@ -611,6 +700,11 @@ void SegmentationModule::setCorrectionsAnnotateMode(bool enabled, bool userIniti
     _correctionsAnnotateMode = enabled;
     if (_widget) {
         _widget->setCorrectionsAnnotateChecked(enabled);
+    }
+
+    if (enabled) {
+        setInvalidationBrushActive(false);
+        clearInvalidationBrush();
     }
 
     if (userInitiated) {
@@ -818,6 +912,152 @@ void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod met
     emit growSurfaceRequested(method, direction, _growthSteps);
 }
 
+void SegmentationModule::setInvalidationBrushActive(bool active)
+{
+    const bool shouldEnable = active && _editingEnabled && !_growthInProgress && !_correctionsAnnotateMode &&
+                              _editManager && _editManager->hasSession();
+    if (_invalidationBrushActive == shouldEnable) {
+        if (_widget) {
+            _widget->setEraseBrushActive(shouldEnable);
+        }
+        return;
+    }
+
+    _invalidationBrushActive = shouldEnable;
+    if (!_invalidationBrushActive) {
+        _hasLastPaintSample = false;
+    }
+
+    if (_widget) {
+        _widget->setEraseBrushActive(_invalidationBrushActive);
+    }
+
+    refreshOverlay();
+}
+
+void SegmentationModule::clearInvalidationBrush()
+{
+    _paintStrokeActive = false;
+    _currentPaintStroke.clear();
+    _pendingPaintStrokes.clear();
+    _paintOverlayPoints.clear();
+    _hasLastPaintSample = false;
+
+    if (!_invalidationBrushActive && _widget) {
+        _widget->setEraseBrushActive(false);
+    }
+
+    refreshOverlay();
+}
+
+void SegmentationModule::startPaintStroke(const cv::Vec3f& worldPos)
+{
+    _paintStrokeActive = true;
+    _currentPaintStroke.clear();
+    _currentPaintStroke.push_back(worldPos);
+    _paintOverlayPoints.push_back(worldPos);
+    _lastPaintSample = worldPos;
+    _hasLastPaintSample = true;
+    refreshOverlay();
+}
+
+void SegmentationModule::extendPaintStroke(const cv::Vec3f& worldPos, bool forceSample)
+{
+    if (!_paintStrokeActive) {
+        return;
+    }
+
+    const float step = std::max(gridStepWorld() * 0.3f, 0.25f);
+    if (!forceSample && _hasLastPaintSample) {
+        const cv::Vec3f delta = worldPos - _lastPaintSample;
+        if (delta.dot(delta) < step * step) {
+            return;
+        }
+    }
+
+    _currentPaintStroke.push_back(worldPos);
+    _paintOverlayPoints.push_back(worldPos);
+    _lastPaintSample = worldPos;
+    _hasLastPaintSample = true;
+    refreshOverlay();
+}
+
+void SegmentationModule::finishPaintStroke()
+{
+    if (!_paintStrokeActive) {
+        return;
+    }
+
+    _paintStrokeActive = false;
+    if (!_currentPaintStroke.empty()) {
+        _pendingPaintStrokes.push_back(_currentPaintStroke);
+    }
+    _currentPaintStroke.clear();
+    _hasLastPaintSample = false;
+    refreshOverlay();
+}
+
+bool SegmentationModule::applyInvalidationBrush()
+{
+    if (!_editManager || !_editManager->hasSession()) {
+        return false;
+    }
+
+    if (_paintStrokeActive) {
+        finishPaintStroke();
+    }
+
+    if (_pendingPaintStrokes.empty()) {
+        return false;
+    }
+
+    using GridKey = SegmentationEditManager::GridKey;
+    using GridKeyHash = SegmentationEditManager::GridKeyHash;
+
+    std::unordered_set<GridKey, GridKeyHash> targets;
+    std::size_t estimate = 0;
+    for (const auto& stroke : _pendingPaintStrokes) {
+        estimate += stroke.size();
+    }
+    targets.reserve(estimate);
+
+    for (const auto& stroke : _pendingPaintStrokes) {
+        for (const auto& world : stroke) {
+            if (auto grid = _editManager->worldToGridIndex(world)) {
+                targets.insert(GridKey{grid->first, grid->second});
+            }
+        }
+    }
+
+    if (targets.empty()) {
+        clearInvalidationBrush();
+        return false;
+    }
+
+    const float brushRadiusSteps = std::max(_radiusSteps, 0.5f);
+    bool anyChanged = false;
+    for (const auto& key : targets) {
+        if (_editManager->markInvalidRegion(key.row, key.col, brushRadiusSteps)) {
+            anyChanged = true;
+        }
+    }
+
+    clearInvalidationBrush();
+
+    if (!anyChanged) {
+        return false;
+    }
+
+    if (_surfaces) {
+        _surfaces->setSurface("segmentation", _editManager->previewSurface());
+    }
+
+    emitPendingChanges();
+    emit statusMessageRequested(tr("Invalidated %1 brush target(s).").arg(static_cast<int>(targets.size())),
+                                kStatusMedium);
+    return true;
+}
+
 void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
                                           const cv::Vec3f& worldPos,
                                           const cv::Vec3f& /*surfaceNormal*/,
@@ -853,6 +1093,13 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
         return;
     }
 
+    if (_invalidationBrushActive) {
+        stopAllPushPull();
+        startPaintStroke(worldPos);
+        return;
+    }
+
+    stopAllPushPull();
     auto gridIndex = _editManager->worldToGridIndex(worldPos);
     if (!gridIndex) {
         return;
@@ -873,6 +1120,15 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
 {
     Q_UNUSED(modifiers);
 
+    if (_paintStrokeActive) {
+        if (buttons.testFlag(Qt::LeftButton)) {
+            extendPaintStroke(worldPos);
+        } else {
+            finishPaintStroke();
+        }
+        return;
+    }
+
     if (_drag.active) {
         updateDrag(worldPos);
         return;
@@ -892,6 +1148,12 @@ void SegmentationModule::handleMouseRelease(CVolumeViewer* /*viewer*/,
                                             Qt::MouseButton button,
                                             Qt::KeyboardModifiers /*modifiers*/)
 {
+    if (_paintStrokeActive && button == Qt::LeftButton) {
+        extendPaintStroke(worldPos, true);
+        finishPaintStroke();
+        return;
+    }
+
     if (!_drag.active || button != Qt::LeftButton) {
         if (_correctionsAnnotateMode && button == Qt::LeftButton) {
             return;
@@ -1025,7 +1287,7 @@ void SegmentationModule::updateHover(CVolumeViewer* viewer, const cv::Vec3f& wor
     }
 
     if (auto world = _editManager->vertexWorldPosition(gridIndex->first, gridIndex->second)) {
-        _hover.set(gridIndex->first, gridIndex->second, *world);
+        _hover.set(gridIndex->first, gridIndex->second, *world, viewer);
         if (_overlay) {
             _overlay->setActiveVertex(SegmentationOverlayController::VertexMarker{
                 .row = _hover.row,
@@ -1036,5 +1298,136 @@ void SegmentationModule::updateHover(CVolumeViewer* viewer, const cv::Vec3f& wor
             });
             _overlay->refreshViewer(viewer);
         }
+    }
+}
+
+bool SegmentationModule::startPushPull(int direction)
+{
+    if (direction == 0) {
+        return false;
+    }
+
+    if (_pushPull.active && _pushPull.direction == direction) {
+        if (_pushPullTimer && !_pushPullTimer->isActive()) {
+            _pushPullTimer->start();
+        }
+        return true;
+    }
+
+    if (!_hover.valid || !_hover.viewer || !isSegmentationViewer(_hover.viewer)) {
+        return false;
+    }
+    if (!_editManager || !_editManager->hasSession()) {
+        return false;
+    }
+
+    _pushPull.active = true;
+    _pushPull.direction = direction;
+
+    if (_pushPullTimer && !_pushPullTimer->isActive()) {
+        _pushPullTimer->start();
+    }
+
+    if (!applyPushPullStep()) {
+        stopAllPushPull();
+        return false;
+    }
+
+    return true;
+}
+
+void SegmentationModule::stopPushPull(int direction)
+{
+    if (!_pushPull.active) {
+        return;
+    }
+    if (direction != 0 && direction != _pushPull.direction) {
+        return;
+    }
+    stopAllPushPull();
+}
+
+void SegmentationModule::stopAllPushPull()
+{
+    _pushPull.active = false;
+    _pushPull.direction = 0;
+    if (_pushPullTimer && _pushPullTimer->isActive()) {
+        _pushPullTimer->stop();
+    }
+}
+
+bool SegmentationModule::applyPushPullStep()
+{
+    if (!_pushPull.active || !_editManager || !_editManager->hasSession()) {
+        return false;
+    }
+
+    if (!_hover.valid || !_hover.viewer || !isSegmentationViewer(_hover.viewer)) {
+        return false;
+    }
+
+    const int row = _hover.row;
+    const int col = _hover.col;
+
+    if (!_editManager->beginActiveDrag({row, col})) {
+        return false;
+    }
+
+    auto centerWorldOpt = _editManager->vertexWorldPosition(row, col);
+    if (!centerWorldOpt) {
+        _editManager->cancelActiveDrag();
+        return false;
+    }
+    const cv::Vec3f centerWorld = *centerWorldOpt;
+
+    QuadSurface* baseSurface = _editManager->baseSurface();
+    if (!baseSurface) {
+        _editManager->cancelActiveDrag();
+        return false;
+    }
+
+    cv::Vec3f ptr = baseSurface->pointer();
+    baseSurface->pointTo(ptr, centerWorld, std::numeric_limits<float>::max(), 400);
+    cv::Vec3f normal = baseSurface->normal(ptr);
+    if (std::isnan(normal[0]) || std::isnan(normal[1]) || std::isnan(normal[2])) {
+        _editManager->cancelActiveDrag();
+        return false;
+    }
+
+    const float norm = cv::norm(normal);
+    if (norm <= 1e-4f) {
+        _editManager->cancelActiveDrag();
+        return false;
+    }
+    normal /= norm;
+
+    const float stepWorld = gridStepWorld() * 0.25f;
+    if (stepWorld <= 0.0f) {
+        _editManager->cancelActiveDrag();
+        return false;
+    }
+
+    const cv::Vec3f targetWorld = centerWorld + normal * (static_cast<float>(_pushPull.direction) * stepWorld);
+    if (!_editManager->updateActiveDrag(targetWorld)) {
+        _editManager->cancelActiveDrag();
+        return false;
+    }
+
+    _editManager->commitActiveDrag();
+    _editManager->applyPreview();
+
+    if (_surfaces) {
+        _surfaces->setSurface("segmentation", _editManager->previewSurface());
+    }
+
+    refreshOverlay();
+    emitPendingChanges();
+    return true;
+}
+
+void SegmentationModule::onPushPullTick()
+{
+    if (!applyPushPullStep()) {
+        stopAllPushPull();
     }
 }

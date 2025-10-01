@@ -346,6 +346,67 @@ bool SegmentationEditManager::invalidateRegion(int centerRow, int centerCol, int
     return changed;
 }
 
+bool SegmentationEditManager::markInvalidRegion(int centerRow, int centerCol, float radiusSteps)
+{
+    if (!_previewPoints) {
+        return false;
+    }
+
+    const int rows = _previewPoints->rows;
+    const int cols = _previewPoints->cols;
+    if (rows <= 0 || cols <= 0) {
+        return false;
+    }
+
+    const float sanitizedRadius = std::max(radiusSteps, 0.0f);
+    const float stepNorm = stepNormalization();
+    const float stepX = std::abs(_gridScale[0]);
+    const float stepY = std::abs(_gridScale[1]);
+
+    const float radiusWorld = std::max(stepNorm * 0.5f, sanitizedRadius * stepNorm);
+    const float radiusWorldSq = radiusWorld * radiusWorld;
+
+    const int gridExtent = std::max(1, static_cast<int>(std::ceil(std::max(sanitizedRadius, 0.5f)))) + 1;
+    const int rowStart = std::max(0, centerRow - gridExtent);
+    const int rowEnd = std::min(rows - 1, centerRow + gridExtent);
+    const int colStart = std::max(0, centerCol - gridExtent);
+    const int colEnd = std::min(cols - 1, centerCol + gridExtent);
+
+    const cv::Vec3f invalid(-1.0f, -1.0f, -1.0f);
+
+    bool changed = false;
+    std::vector<GridKey> touched;
+    touched.reserve(static_cast<std::size_t>((rowEnd - rowStart + 1) * (colEnd - colStart + 1)));
+
+    for (int r = rowStart; r <= rowEnd; ++r) {
+        const float dy = static_cast<float>(r - centerRow) * stepY;
+        for (int c = colStart; c <= colEnd; ++c) {
+            const float dx = static_cast<float>(c - centerCol) * stepX;
+            if ((dx * dx + dy * dy) > radiusWorldSq) {
+                continue;
+            }
+
+            cv::Vec3f& preview = (*_previewPoints)(r, c);
+            if (isInvalidPoint(preview)) {
+                continue;
+            }
+
+            preview = invalid;
+            recordVertexEdit(r, c, invalid);
+            touched.push_back(GridKey{r, c});
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        _recentTouched = std::move(touched);
+    } else {
+        _recentTouched.clear();
+    }
+
+    return changed;
+}
+
 bool SegmentationEditManager::isInvalidPoint(const cv::Vec3f& value)
 {
     return ::isInvalidPoint(value);

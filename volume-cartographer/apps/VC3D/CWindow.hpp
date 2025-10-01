@@ -98,6 +98,7 @@ public:
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
+    void keyReleaseEvent(QKeyEvent* event) override;
 
 private:
     void CreateWidgets(void);

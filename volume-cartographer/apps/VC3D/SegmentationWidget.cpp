@@ -64,6 +64,14 @@ void SegmentationWidget::buildUi()
     editingRow->addWidget(_lblStatus, 1);
     layout->addLayout(editingRow);
 
+    auto* brushRow = new QHBoxLayout();
+    brushRow->addSpacing(4);
+    _chkEraseBrush = new QCheckBox(tr("Invalidation brush (Shift)"), this);
+    _chkEraseBrush->setEnabled(false);
+    brushRow->addWidget(_chkEraseBrush);
+    brushRow->addStretch(1);
+    layout->addLayout(brushRow);
+
     _groupGrowth = new QGroupBox(tr("Surface Growth"), this);
     auto* growthLayout = new QVBoxLayout(_groupGrowth);
 
@@ -241,13 +249,7 @@ void SegmentationWidget::buildUi()
     layout->addStretch(1);
 
     connect(_chkEditing, &QCheckBox::toggled, this, [this](bool enabled) {
-        if (_editingEnabled == enabled) {
-            return;
-        }
-        _editingEnabled = enabled;
-        writeSetting(QStringLiteral("editing_enabled"), _editingEnabled);
-        syncUiState();
-        emit editingModeChanged(enabled);
+        updateEditingState(enabled, true);
     });
 
     auto connectDirectionCheckbox = [this](QCheckBox* box) {
@@ -440,6 +442,12 @@ void SegmentationWidget::syncUiState()
         }
     }
 
+    if (_chkEraseBrush) {
+        const QSignalBlocker blocker(_chkEraseBrush);
+        _chkEraseBrush->setChecked(_eraseBrushActive);
+        _chkEraseBrush->setEnabled(_editingEnabled);
+    }
+
     if (_spinRadius) {
         const QSignalBlocker blocker(_spinRadius);
         _spinRadius->setValue(static_cast<double>(_radiusSteps));
@@ -586,6 +594,34 @@ void SegmentationWidget::writeSetting(const QString& key, const QVariant& value)
     settings.endGroup();
 }
 
+void SegmentationWidget::updateEditingState(bool enabled, bool notifyListeners)
+{
+    if (_editingEnabled == enabled) {
+        return;
+    }
+
+    _editingEnabled = enabled;
+    writeSetting(QStringLiteral("editing_enabled"), _editingEnabled);
+    if (!_editingEnabled && _eraseBrushActive) {
+        _eraseBrushActive = false;
+    }
+    syncUiState();
+
+    if (notifyListeners) {
+        emit editingModeChanged(_editingEnabled);
+    }
+}
+
+void SegmentationWidget::setEraseBrushActive(bool active)
+{
+    const bool sanitized = _editingEnabled && active;
+    if (_eraseBrushActive == sanitized) {
+        return;
+    }
+    _eraseBrushActive = sanitized;
+    syncUiState();
+}
+
 void SegmentationWidget::setPendingChanges(bool pending)
 {
     if (_pending == pending) {
@@ -597,12 +633,7 @@ void SegmentationWidget::setPendingChanges(bool pending)
 
 void SegmentationWidget::setEditingEnabled(bool enabled)
 {
-    if (_editingEnabled == enabled) {
-        return;
-    }
-    _editingEnabled = enabled;
-    writeSetting(QStringLiteral("editing_enabled"), _editingEnabled);
-    syncUiState();
+    updateEditingState(enabled, false);
 }
 
 void SegmentationWidget::setRadius(float value)

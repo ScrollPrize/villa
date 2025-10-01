@@ -23,6 +23,7 @@ class SegmentationWidget;
 class VCCollection;
 class ViewerManager;
 class QKeyEvent;
+class QTimer;
 
 class SegmentationModule : public QObject
 {
@@ -62,6 +63,7 @@ public:
     void updateViewerCursors();
 
     bool handleKeyPress(QKeyEvent* event);
+    bool handleKeyRelease(QKeyEvent* event);
 
     void markNextEditsFromGrowth();
     void markNextHandlesFromGrowth() { markNextEditsFromGrowth(); }
@@ -101,9 +103,16 @@ private:
         int row{0};
         int col{0};
         cv::Vec3f world{0.0f, 0.0f, 0.0f};
+        QPointer<CVolumeViewer> viewer;
 
-        void set(int r, int c, const cv::Vec3f& w);
+        void set(int r, int c, const cv::Vec3f& w, CVolumeViewer* v);
         void clear();
+    };
+
+    struct PushPullState
+    {
+        bool active{false};
+        int direction{0};
     };
 
     void bindWidgetSignals();
@@ -127,6 +136,12 @@ private:
     void handleGrowSurfaceRequested(SegmentationGrowthMethod method,
                                     SegmentationGrowthDirection direction,
                                     int steps);
+    void setInvalidationBrushActive(bool active);
+    void clearInvalidationBrush();
+    void startPaintStroke(const cv::Vec3f& worldPos);
+    void extendPaintStroke(const cv::Vec3f& worldPos, bool forceSample = false);
+    void finishPaintStroke();
+    bool applyInvalidationBrush();
 
     void handleMousePress(CVolumeViewer* viewer,
                           const cv::Vec3f& worldPos,
@@ -156,6 +171,12 @@ private:
 
     void updateHover(CVolumeViewer* viewer, const cv::Vec3f& worldPos);
 
+    bool startPushPull(int direction);
+    void stopPushPull(int direction);
+    void stopAllPushPull();
+    bool applyPushPullStep();
+    void onPushPullTick();
+
     SegmentationWidget* _widget{nullptr};
     SegmentationEditManager* _editManager{nullptr};
     SegmentationOverlayController* _overlay{nullptr};
@@ -182,4 +203,14 @@ private:
     DragState _drag;
     HoverState _hover;
     QSet<CVolumeViewer*> _attachedViewers;
+    QTimer* _pushPullTimer{nullptr};
+    PushPullState _pushPull;
+
+    bool _invalidationBrushActive{false};
+    bool _paintStrokeActive{false};
+    std::vector<cv::Vec3f> _currentPaintStroke;
+    std::vector<std::vector<cv::Vec3f>> _pendingPaintStrokes;
+    std::vector<cv::Vec3f> _paintOverlayPoints;
+    cv::Vec3f _lastPaintSample{0.0f, 0.0f, 0.0f};
+    bool _hasLastPaintSample{false};
 };

@@ -1140,6 +1140,15 @@ void CWindow::keyPressEvent(QKeyEvent* event)
     QMainWindow::keyPressEvent(event);
 }
 
+void CWindow::keyReleaseEvent(QKeyEvent* event)
+{
+    if (_segmentationModule && _segmentationModule->handleKeyRelease(event)) {
+        return;
+    }
+
+    QMainWindow::keyReleaseEvent(event);
+}
+
 // Asks User to Save Data Prior to VC.app Exit
 void CWindow::closeEvent(QCloseEvent* event)
 {

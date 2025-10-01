@@ -105,6 +105,7 @@ public:
 
     void bakePreviewToOriginal();
     bool invalidateRegion(int centerRow, int centerCol, int radius);
+    bool markInvalidRegion(int centerRow, int centerCol, float radiusSteps);
 
 private:
     static bool isInvalidPoint(const cv::Vec3f& value);
