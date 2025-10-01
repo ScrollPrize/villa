@@ -2044,8 +2044,24 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
     request.method = method;
     request.direction = direction;
     request.steps = steps;
+    if (_segmentationModule) {
+        if (auto overrideDirs = _segmentationModule->takeShortcutDirectionOverride()) {
+            request.allowedDirections = std::move(*overrideDirs);
+        }
+    }
+    if (request.allowedDirections.empty()) {
+        if (_segmentationWidget) {
+            request.allowedDirections = _segmentationWidget->allowedGrowthDirections();
+        } else {
+            request.allowedDirections = {
+                SegmentationGrowthDirection::Up,
+                SegmentationGrowthDirection::Down,
+                SegmentationGrowthDirection::Left,
+                SegmentationGrowthDirection::Right
+            };
+        }
+    }
     if (_segmentationWidget) {
-        request.allowedDirections = _segmentationWidget->allowedGrowthDirections();
         request.directionFields = _segmentationWidget->directionFieldConfigs();
     }
     request.corrections = corrections;

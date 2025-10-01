@@ -48,6 +48,7 @@ public:
     void setEditingEnabled(bool enabled);
     void setRadius(float radiusSteps);
     void setSigma(float sigmaSteps);
+    void setPushPullStepMultiplier(float multiplier);
 
     void applyEdits();
     void resetEdits();
@@ -64,6 +65,8 @@ public:
 
     bool handleKeyPress(QKeyEvent* event);
     bool handleKeyRelease(QKeyEvent* event);
+
+    [[nodiscard]] std::optional<std::vector<SegmentationGrowthDirection>> takeShortcutDirectionOverride();
 
     void markNextEditsFromGrowth();
     void markNextHandlesFromGrowth() { markNextEditsFromGrowth(); }
@@ -213,4 +216,6 @@ private:
     std::vector<cv::Vec3f> _paintOverlayPoints;
     cv::Vec3f _lastPaintSample{0.0f, 0.0f, 0.0f};
     bool _hasLastPaintSample{false};
+    float _pushPullStepMultiplier{0.75f};
+    std::optional<std::vector<SegmentationGrowthDirection>> _pendingShortcutDirections;
 };

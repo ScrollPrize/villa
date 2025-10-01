@@ -89,6 +89,10 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     , _growthMethod(_widget ? _widget->growthMethod() : SegmentationGrowthMethod::Tracer)
     , _growthSteps(_widget ? _widget->growthSteps() : 5)
 {
+    if (_widget) {
+        _pushPullStepMultiplier = std::clamp(_widget->pushPullStep(), 0.05f, 10.0f);
+    }
+
     if (_overlay) {
         _overlay->setEditManager(_editManager);
         _overlay->setEditingEnabled(_editingEnabled);
@@ -183,6 +187,8 @@ void SegmentationModule::bindWidgetSignals()
             this, [this](SegmentationGrowthMethod method) {
                 _growthMethod = method;
             });
+    connect(_widget, &SegmentationWidget::pushPullStepChanged,
+            this, &SegmentationModule::setPushPullStepMultiplier);
     connect(_widget, &SegmentationWidget::correctionsCreateRequested,
             this, &SegmentationModule::onCorrectionsCreateRequested);
     connect(_widget, &SegmentationWidget::correctionsCollectionSelected,
@@ -302,6 +308,18 @@ void SegmentationModule::setSigma(float sigmaSteps)
     }
     if (_widget) {
         _widget->setSigma(_sigmaSteps);
+    }
+}
+
+void SegmentationModule::setPushPullStepMultiplier(float multiplier)
+{
+    const float sanitized = std::clamp(multiplier, 0.05f, 10.0f);
+    if (std::fabs(sanitized - _pushPullStepMultiplier) < 1e-4f) {
+        return;
+    }
+    _pushPullStepMultiplier = sanitized;
+    if (_widget) {
+        _widget->setPushPullStep(_pushPullStepMultiplier);
     }
 }
 
@@ -461,7 +479,52 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         return true;
     }
 
+    if (event->modifiers() == Qt::NoModifier && !event->isAutoRepeat()) {
+        // Directional growth shortcuts (1-5).
+        SegmentationGrowthDirection shortcutDirection{SegmentationGrowthDirection::All};
+        bool matchedShortcut = true;
+        switch (event->key()) {
+        case Qt::Key_1:
+            shortcutDirection = SegmentationGrowthDirection::Left;
+            break;
+        case Qt::Key_2:
+            shortcutDirection = SegmentationGrowthDirection::Up;
+            break;
+        case Qt::Key_3:
+            shortcutDirection = SegmentationGrowthDirection::Down;
+            break;
+        case Qt::Key_4:
+            shortcutDirection = SegmentationGrowthDirection::Right;
+            break;
+        case Qt::Key_5:
+            shortcutDirection = SegmentationGrowthDirection::All;
+            break;
+        default:
+            matchedShortcut = false;
+            break;
+        }
+
+        if (matchedShortcut) {
+            _pendingShortcutDirections = std::vector<SegmentationGrowthDirection>{shortcutDirection};
+            const int steps = _widget ? std::max(1, _widget->growthSteps()) : std::max(1, _growthSteps);
+            const SegmentationGrowthMethod method = _widget ? _widget->growthMethod() : _growthMethod;
+            handleGrowSurfaceRequested(method, shortcutDirection, steps);
+            event->accept();
+            return true;
+        }
+    }
+
     return false;
+}
+
+std::optional<std::vector<SegmentationGrowthDirection>> SegmentationModule::takeShortcutDirectionOverride()
+{
+    if (!_pendingShortcutDirections) {
+        return std::nullopt;
+    }
+    auto result = std::move(*_pendingShortcutDirections);
+    _pendingShortcutDirections.reset();
+    return result;
 }
 
 bool SegmentationModule::handleKeyRelease(QKeyEvent* event)
@@ -905,6 +968,9 @@ void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod met
         emit statusMessageRequested(tr("Enable segmentation editing before growing surfaces"), kStatusMedium);
         return;
     }
+
+    // Ensure any pending invalidation brush strokes are committed before growth.
+    applyInvalidationBrush();
 
     _growthMethod = method;
     _growthSteps = std::max(1, steps);
@@ -1401,7 +1467,7 @@ bool SegmentationModule::applyPushPullStep()
     }
     normal /= norm;
 
-    const float stepWorld = gridStepWorld() * 0.25f;
+    const float stepWorld = gridStepWorld() * _pushPullStepMultiplier;
     if (stepWorld <= 0.0f) {
         _editManager->cancelActiveDrag();
         return false;

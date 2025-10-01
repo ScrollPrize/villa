@@ -30,6 +30,7 @@ public:
     [[nodiscard]] bool isEditingEnabled() const { return _editingEnabled; }
     [[nodiscard]] float radius() const { return _radiusSteps; }
     [[nodiscard]] float sigma() const { return _sigmaSteps; }
+    [[nodiscard]] float pushPullStep() const { return _pushPullStep; }
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const { return _growthMethod; }
     [[nodiscard]] int growthSteps() const { return _growthSteps; }
 
@@ -37,6 +38,7 @@ public:
     void setEditingEnabled(bool enabled);
     void setRadius(float value);
     void setSigma(float value);
+    void setPushPullStep(float value);
     void setGrowthMethod(SegmentationGrowthMethod method);
     void setGrowthInProgress(bool running);
     void setEraseBrushActive(bool active);
@@ -63,6 +65,7 @@ signals:
     void radiusChanged(float value);
     void sigmaChanged(float value);
     void growthMethodChanged(SegmentationGrowthMethod method);
+    void pushPullStepChanged(float value);
     void growSurfaceRequested(SegmentationGrowthMethod method,
                               SegmentationGrowthDirection direction,
                               int steps);
@@ -100,6 +103,7 @@ private:
     bool _eraseBrushActive{false};
     float _radiusSteps{3.0f};
     float _sigmaSteps{1.5f};
+    float _pushPullStep{0.75f};
 
     bool _normalGridAvailable{false};
     QString _normalGridHint;
@@ -151,6 +155,7 @@ private:
 
     QDoubleSpinBox* _spinRadius{nullptr};
     QDoubleSpinBox* _spinSigma{nullptr};
+    QDoubleSpinBox* _spinPushPullStep{nullptr};
     QPushButton* _btnApply{nullptr};
     QPushButton* _btnReset{nullptr};
     QPushButton* _btnStop{nullptr};

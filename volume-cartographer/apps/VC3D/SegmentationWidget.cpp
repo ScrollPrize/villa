@@ -154,6 +154,14 @@ void SegmentationWidget::buildUi()
     _spinSigma->setSingleStep(0.1);
     radiusSigmaRow->addWidget(sigmaLabel);
     radiusSigmaRow->addWidget(_spinSigma);
+    radiusSigmaRow->addSpacing(12);
+    auto* pushPullLabel = new QLabel(tr("Push/Pull step (grid steps)"), falloffGroup);
+    _spinPushPullStep = new QDoubleSpinBox(falloffGroup);
+    _spinPushPullStep->setDecimals(2);
+    _spinPushPullStep->setRange(0.05, 10.0);
+    _spinPushPullStep->setSingleStep(0.05);
+    radiusSigmaRow->addWidget(pushPullLabel);
+    radiusSigmaRow->addWidget(_spinPushPullStep);
     radiusSigmaRow->addStretch(1);
     falloffLayout->addLayout(radiusSigmaRow);
 
@@ -308,6 +316,11 @@ void SegmentationWidget::buildUi()
         emit sigmaChanged(_sigmaSteps);
     });
 
+    connect(_spinPushPullStep, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        setPushPullStep(static_cast<float>(value));
+        emit pushPullStepChanged(_pushPullStep);
+    });
+
     connect(_directionFieldPathEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         _directionFieldPath = text.trimmed();
         if (!_updatingDirectionFieldForm) {
@@ -456,6 +469,10 @@ void SegmentationWidget::syncUiState()
         const QSignalBlocker blocker(_spinSigma);
         _spinSigma->setValue(static_cast<double>(_sigmaSteps));
     }
+    if (_spinPushPullStep) {
+        const QSignalBlocker blocker(_spinPushPullStep);
+        _spinPushPullStep->setValue(static_cast<double>(_pushPullStep));
+    }
 
     if (_spinGrowthSteps) {
         const QSignalBlocker blocker(_spinGrowthSteps);
@@ -553,6 +570,7 @@ void SegmentationWidget::restoreSettings()
 
     _radiusSteps = settings.value(QStringLiteral("radius_steps"), _radiusSteps).toFloat();
     _sigmaSteps = settings.value(QStringLiteral("sigma_steps"), _sigmaSteps).toFloat();
+    _pushPullStep = settings.value(QStringLiteral("push_pull_step"), _pushPullStep).toFloat();
     _growthMethod = segmentationGrowthMethodFromInt(
         settings.value(QStringLiteral("growth_method"), static_cast<int>(_growthMethod)).toInt());
     _growthSteps = settings.value(QStringLiteral("growth_steps"), _growthSteps).toInt();
@@ -660,6 +678,20 @@ void SegmentationWidget::setSigma(float value)
     if (_spinSigma) {
         const QSignalBlocker blocker(_spinSigma);
         _spinSigma->setValue(static_cast<double>(_sigmaSteps));
+    }
+}
+
+void SegmentationWidget::setPushPullStep(float value)
+{
+    const float clamped = std::clamp(value, 0.05f, 10.0f);
+    if (std::fabs(clamped - _pushPullStep) < 1e-4f) {
+        return;
+    }
+    _pushPullStep = clamped;
+    writeSetting(QStringLiteral("push_pull_step"), _pushPullStep);
+    if (_spinPushPullStep) {
+        const QSignalBlocker blocker(_spinPushPullStep);
+        _spinPushPullStep->setValue(static_cast<double>(_pushPullStep));
     }
 }
 
