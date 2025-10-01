@@ -48,8 +48,7 @@ cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store) {
     sample_points.reserve(num_samples_per_iteration);
     sample_normals.reserve(num_samples_per_iteration);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    static std::mt19937 gen(std::random_device{}());
     std::uniform_int_distribution<> segment_dist(0, all_line_segments.size() - 1);
 
     for (int j = 0; j < num_samples_per_iteration; ++j) {
