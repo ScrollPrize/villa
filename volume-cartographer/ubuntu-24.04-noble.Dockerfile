@@ -9,7 +9,7 @@ RUN apt -y full-upgrade
 
 # --- install everything EXCEPT xtensor-dev ---
 RUN apt -y install build-essential git cmake qt6-base-dev libboost-system-dev libboost-program-options-dev libceres-dev \
-    libxsimd-dev libopencv-dev libblosc-dev libspdlog-dev libgsl-dev libsdl2-dev libcurl4-openssl-dev file \
+    libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev libgsl-dev libsdl2-dev libcurl4-openssl-dev file \
     curl unzip ca-certificates bzip2 wget fuse jq gimp desktop-file-utils ninja-build
 
 RUN apt-get install -y flex bison zlib1g-dev gfortran libopenblas-dev liblapack-dev libscotch-dev libhwloc-dev
