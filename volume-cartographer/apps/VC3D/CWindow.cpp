@@ -265,6 +265,14 @@ CWindow::CWindow() :
     _vectorOverlay = std::make_unique<VectorOverlayController>(_surf_col, this);
     _viewerManager->setVectorOverlay(_vectorOverlay.get());
 
+    _volumeOverlay = std::make_unique<VolumeOverlayController>(_viewerManager.get(), this);
+    connect(_volumeOverlay.get(), &VolumeOverlayController::requestStatusMessage, this,
+            [this](const QString& message, int timeout) {
+                if (statusBar()) {
+                    statusBar()->showMessage(message, timeout);
+                }
+            });
+
     // create UI widgets
     CreateWidgets();
 
@@ -619,41 +627,6 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
     applySlicePlaneOrientation(_surf_col ? _surf_col->surface("segmentation") : nullptr);
 }
 
-void CWindow::populateOverlayColormapOptions()
-{
-    if (!overlayColormapSelect) {
-        return;
-    }
-
-    const QSignalBlocker blocker{overlayColormapSelect};
-    overlayColormapSelect->clear();
-
-    const auto& entries = CVolumeViewer::overlayColormapEntries();
-    int indexToSelect = 0;
-
-    if (_overlayColormapName.empty() && !entries.empty()) {
-        _overlayColormapName = entries.front().id;
-    }
-
-    for (int i = 0; i < static_cast<int>(entries.size()); ++i) {
-        const auto& entry = entries.at(i);
-        overlayColormapSelect->addItem(entry.label, QVariant(QString::fromStdString(entry.id)));
-        if (entry.id == _overlayColormapName) {
-            indexToSelect = i;
-        }
-    }
-
-    overlayColormapSelect->setEnabled(!entries.empty());
-
-    if (overlayColormapSelect->count() > 0) {
-        overlayColormapSelect->setCurrentIndex(indexToSelect);
-    }
-
-    if (_viewerManager) {
-        _viewerManager->setOverlayColormap(_overlayColormapName);
-    }
-}
-
 void CWindow::updateNormalGridAvailability()
 {
     QString checkedPath;
@@ -679,42 +652,8 @@ void CWindow::updateNormalGridAvailability()
 
 void CWindow::toggleVolumeOverlayVisibility()
 {
-    const bool hasOverlaySelection = overlayVolumeSelect && overlayVolumeSelect->currentIndex() > 0 && !_overlayVolumeId.empty();
-    if (!hasOverlaySelection || !overlayOpacitySlider) {
-        return;
-    }
-
-    if (_overlayVisible) {
-        if (_overlayOpacity > 0.0f) {
-            _overlayOpacityBeforeToggle = _overlayOpacity;
-        }
-        const QSignalBlocker blocker(overlayOpacitySlider);
-        overlayOpacitySlider->setValue(0);
-        _overlayOpacity = 0.0f;
-        _overlayVisible = false;
-        if (_viewerManager) {
-            _viewerManager->setOverlayOpacity(_overlayOpacity);
-        }
-        if (statusBar()) {
-            statusBar()->showMessage(tr("Volume overlay hidden"), 1200);
-        }
-    } else {
-        const float restored = (_overlayOpacityBeforeToggle > 0.0f) ? _overlayOpacityBeforeToggle : 0.5f;
-        _overlayOpacity = std::clamp(restored, 0.0f, 1.0f);
-        {
-            const QSignalBlocker blocker(overlayOpacitySlider);
-            overlayOpacitySlider->setValue(static_cast<int>(std::round(_overlayOpacity * 100.0f)));
-        }
-        if (_viewerManager) {
-            _viewerManager->setOverlayOpacity(_overlayOpacity);
-        }
-        _overlayVisible = _overlayOpacity > 0.0f;
-        if (_overlayVisible) {
-            _overlayOpacityBeforeToggle = _overlayOpacity;
-        }
-        if (statusBar()) {
-            statusBar()->showMessage(tr("Volume overlay shown"), 1200);
-        }
+    if (_volumeOverlay) {
+        _volumeOverlay->toggleVisibility();
     }
 }
 
@@ -977,114 +916,15 @@ void CWindow::CreateWidgets(void)
 
     // TODO CHANGE VOLUME LOADING; FIRST CHECK FOR OTHER VOLUMES IN THE STRUCTS
     volSelect = ui.volSelect;
-    overlayVolumeSelect = ui.overlayVolumeSelect;
-    overlayColormapSelect = ui.overlayColormapSelect;
-    overlayOpacitySlider = ui.overlayOpacitySlider;
-    overlayThresholdSpin = ui.overlayThresholdSpin;
 
-    populateOverlayColormapOptions();
-
-    if (overlayVolumeSelect) {
-        overlayVolumeSelect->setEnabled(false);
-    }
-
-    if (overlayOpacitySlider) {
-        overlayOpacitySlider->setRange(0, 100);
-        overlayOpacitySlider->setValue(static_cast<int>(std::round(_overlayOpacity * 100.0f)));
-        overlayOpacitySlider->setEnabled(false);
-        connect(overlayOpacitySlider, &QSlider::valueChanged, this, [this](int value) {
-            _overlayOpacity = std::clamp(value / 100.0f, 0.0f, 1.0f);
-            if (_viewerManager) {
-                _viewerManager->setOverlayOpacity(_overlayOpacity);
-            }
-            const bool hasOverlay = !_overlayVolumeId.empty();
-            _overlayVisible = hasOverlay && _overlayOpacity > 0.0f;
-            if (_overlayVisible) {
-                _overlayOpacityBeforeToggle = _overlayOpacity;
-            }
-        });
-        if (_viewerManager) {
-            _viewerManager->setOverlayOpacity(_overlayOpacity);
-        }
-        _overlayVisible = !_overlayVolumeId.empty() && _overlayOpacity > 0.0f;
-        if (_overlayVisible) {
-            _overlayOpacityBeforeToggle = _overlayOpacity;
-        }
-    }
-
-    if (overlayThresholdSpin) {
-        overlayThresholdSpin->setRange(0, 65535);
-        overlayThresholdSpin->setValue(static_cast<int>(std::clamp(_overlayThreshold, 0.0f, 65535.0f)));
-        overlayThresholdSpin->setEnabled(false);
-        connect(overlayThresholdSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-            _overlayThreshold = std::max(0.0f, static_cast<float>(value));
-            if (_viewerManager) {
-                _viewerManager->setOverlayThreshold(_overlayThreshold);
-            }
-        });
-        if (_viewerManager) {
-            _viewerManager->setOverlayThreshold(_overlayThreshold);
-        }
-    }
-
-    if (overlayColormapSelect) {
-        connect(overlayColormapSelect, &QComboBox::currentIndexChanged, this, [this](int) {
-            if (!overlayColormapSelect) {
-                return;
-            }
-            const QVariant data = overlayColormapSelect->currentData();
-            _overlayColormapName = data.isValid() ? data.toString().toStdString() : std::string();
-            if (_viewerManager) {
-                _viewerManager->setOverlayColormap(_overlayColormapName);
-            }
-        });
-    }
-
-    if (overlayVolumeSelect) {
-        connect(overlayVolumeSelect, &QComboBox::currentIndexChanged, this, [this](int) {
-            if (!overlayVolumeSelect) {
-                return;
-            }
-            std::shared_ptr<Volume> overlayVolume;
-            std::string newOverlayId;
-
-            if (const QVariant data = overlayVolumeSelect->currentData(); data.isValid()) {
-                const QString idStr = data.toString();
-                newOverlayId = idStr.toStdString();
-                if (fVpkg) {
-                    try {
-                        overlayVolume = fVpkg->volume(newOverlayId);
-                    } catch (const std::out_of_range&) {
-                        QMessageBox::warning(this, tr("Error"), tr("Unable to load overlay volume."));
-                        newOverlayId.clear();
-                        overlayVolume.reset();
-                    }
-                }
-            }
-
-            _overlayVolumeId = std::move(newOverlayId);
-            if (_viewerManager) {
-                _viewerManager->setOverlayVolume(overlayVolume, _overlayVolumeId);
-            }
-
-            const bool hasOverlay = static_cast<bool>(overlayVolume);
-            if (overlayOpacitySlider) {
-                overlayOpacitySlider->setEnabled(hasOverlay);
-            }
-            if (overlayColormapSelect) {
-                overlayColormapSelect->setEnabled(hasOverlay && overlayColormapSelect->count() > 0);
-            }
-            if (overlayThresholdSpin) {
-                overlayThresholdSpin->setEnabled(hasOverlay);
-            }
-            _overlayVisible = hasOverlay && _overlayOpacity > 0.0f;
-            if (_overlayVisible) {
-                _overlayOpacityBeforeToggle = _overlayOpacity;
-            }
-            if (!hasOverlay) {
-                _overlayVisible = false;
-            }
-        });
+    if (_volumeOverlay) {
+        VolumeOverlayController::UiRefs overlayUi{
+            .volumeSelect = ui.overlayVolumeSelect,
+            .colormapSelect = ui.overlayColormapSelect,
+            .opacitySlider = ui.overlayOpacitySlider,
+            .thresholdSpin = ui.overlayThresholdSpin,
+        };
+        _volumeOverlay->setUi(overlayUi);
     }
 
     connect(
@@ -1445,14 +1285,6 @@ void CWindow::OpenVolume(const QString& path)
         const QSignalBlocker blocker{volSelect};
         volSelect->clear();
     }
-    int overlayIndexToSelect = 0;
-    bool overlayFound = false;
-    if (overlayVolumeSelect) {
-        const QSignalBlocker overlayBlocker{overlayVolumeSelect};
-        overlayVolumeSelect->clear();
-        overlayVolumeSelect->addItem(tr("None"));
-        overlayVolumeSelect->setItemData(0, QVariant());
-    }
     QVector<QPair<QString, QString>> volumeEntries;
     QString bestGrowthVolumeId = QString::fromStdString(currentVolumeId);
     bool preferredVolumeFound = false;
@@ -1462,13 +1294,6 @@ void CWindow::OpenVolume(const QString& path)
         const QString nameStr = QString::fromStdString(vol->name());
         const QString label = nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr);
         volSelect->addItem(label, QVariant(idStr));
-        if (overlayVolumeSelect) {
-            overlayVolumeSelect->addItem(label, QVariant(idStr));
-            if (!_overlayVolumeId.empty() && _overlayVolumeId == id) {
-                overlayIndexToSelect = overlayVolumeSelect->count() - 1;
-                overlayFound = true;
-            }
-        }
         volumeEntries.append({idStr, label});
 
         const QString loweredName = nameStr.toLower();
@@ -1493,48 +1318,8 @@ void CWindow::OpenVolume(const QString& path)
         _segmentationWidget->setAvailableVolumes(volumeEntries, bestGrowthVolumeId);
     }
 
-    if (overlayVolumeSelect) {
-        const QSignalBlocker overlayBlocker{overlayVolumeSelect};
-        if (overlayFound) {
-            overlayVolumeSelect->setCurrentIndex(overlayIndexToSelect);
-        } else {
-            overlayVolumeSelect->setCurrentIndex(0);
-            _overlayVolumeId.clear();
-        }
-
-        std::shared_ptr<Volume> overlayVolume;
-        if (overlayFound && fVpkg && !_overlayVolumeId.empty()) {
-            try {
-                overlayVolume = fVpkg->volume(_overlayVolumeId);
-            } catch (const std::out_of_range&) {
-                overlayVolume.reset();
-                _overlayVolumeId.clear();
-            }
-        }
-
-        if (_viewerManager) {
-            _viewerManager->setOverlayVolume(overlayVolume, _overlayVolumeId);
-        }
-
-        const bool enableOverlayChoice = overlayVolumeSelect->count() > 1;
-        overlayVolumeSelect->setEnabled(enableOverlayChoice);
-        const bool hasOverlaySelected = overlayFound && overlayVolume;
-        if (overlayOpacitySlider) {
-            overlayOpacitySlider->setEnabled(hasOverlaySelected);
-        }
-        if (overlayColormapSelect) {
-            overlayColormapSelect->setEnabled(hasOverlaySelected && overlayColormapSelect->count() > 0);
-        }
-        if (overlayThresholdSpin) {
-            overlayThresholdSpin->setEnabled(hasOverlaySelected);
-        }
-        _overlayVisible = hasOverlaySelected && _overlayOpacity > 0.0f;
-        if (_overlayVisible) {
-            _overlayOpacityBeforeToggle = _overlayOpacity;
-        }
-        if (!hasOverlaySelected) {
-            _overlayVisible = false;
-        }
+    if (_volumeOverlay) {
+        _volumeOverlay->setVolumePkg(fVpkg, aVpkgPath);
     }
 
     // Populate the segmentation directory dropdown
@@ -1632,27 +1417,8 @@ void CWindow::CloseVolume(void)
     // Clear points
     _point_collection->clearAll();
 
-    if (overlayVolumeSelect) {
-        const QSignalBlocker blocker{overlayVolumeSelect};
-        overlayVolumeSelect->clear();
-        overlayVolumeSelect->addItem(tr("None"));
-        overlayVolumeSelect->setItemData(0, QVariant());
-        overlayVolumeSelect->setCurrentIndex(0);
-        overlayVolumeSelect->setEnabled(false);
-    }
-    if (overlayOpacitySlider) {
-        overlayOpacitySlider->setEnabled(false);
-    }
-    if (overlayColormapSelect) {
-        overlayColormapSelect->setEnabled(false);
-    }
-    if (overlayThresholdSpin) {
-        overlayThresholdSpin->setEnabled(false);
-    }
-    _overlayVolumeId.clear();
-    _overlayVisible = false;
-    if (_viewerManager) {
-        _viewerManager->setOverlayVolume(nullptr, _overlayVolumeId);
+    if (_volumeOverlay) {
+        _volumeOverlay->clearVolumePkg();
     }
 }
 

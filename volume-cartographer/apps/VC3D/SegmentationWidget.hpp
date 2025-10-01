@@ -83,6 +83,9 @@ private:
     void refreshDirectionFieldList();
     void persistDirectionFields();
     SegmentationDirectionFieldConfig buildDirectionFieldDraft() const;
+    void updateDirectionFieldFormFromSelection(int row);
+    void applyDirectionFieldDraftToSelection(int row);
+    void updateDirectionFieldListItem(int row);
     void setGrowthDirectionMask(int mask);
     void updateGrowthDirectionMaskFromUi(QCheckBox* changedCheckbox);
     void applyGrowthDirectionMaskToUi();
@@ -97,6 +100,7 @@ private:
 
     bool _normalGridAvailable{false};
     QString _normalGridHint;
+    QString _normalGridDisplayPath;
     QString _volumePackagePath;
     QVector<QPair<QString, QString>> _volumeEntries;
     QString _activeVolumeId;
@@ -110,6 +114,7 @@ private:
     int _directionFieldScale{0};
     double _directionFieldWeight{1.0};
     std::vector<SegmentationDirectionFieldConfig> _directionFields;
+    bool _updatingDirectionFieldForm{false};
 
     QCheckBox* _chkEditing{nullptr};
     QLabel* _lblStatus{nullptr};

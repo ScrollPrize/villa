@@ -975,8 +975,18 @@ void SegmentationModule::finishDrag()
         return;
     }
 
+    const bool moved = _drag.moved;
+
     _editManager->commitActiveDrag();
     _drag.reset();
+
+    if (moved) {
+        _editManager->applyPreview();
+        if (_surfaces) {
+            _surfaces->setSurface("segmentation", _editManager->previewSurface());
+        }
+    }
+
     refreshOverlay();
     emitPendingChanges();
 }

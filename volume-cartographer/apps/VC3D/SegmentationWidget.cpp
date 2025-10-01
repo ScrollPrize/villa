@@ -68,6 +68,14 @@ void SegmentationWidget::buildUi()
     auto* growthLayout = new QVBoxLayout(_groupGrowth);
 
     auto* dirRow = new QHBoxLayout();
+    auto* stepsLabel = new QLabel(tr("Steps:"), _groupGrowth);
+    _spinGrowthSteps = new QSpinBox(_groupGrowth);
+    _spinGrowthSteps->setRange(1, 1024);
+    _spinGrowthSteps->setSingleStep(1);
+    dirRow->addWidget(stepsLabel);
+    dirRow->addWidget(_spinGrowthSteps);
+    dirRow->addSpacing(16);
+
     auto* dirLabel = new QLabel(tr("Allowed directions:"), _groupGrowth);
     dirRow->addWidget(dirLabel);
     auto addDirectionCheckbox = [&](const QString& text) {
@@ -82,15 +90,23 @@ void SegmentationWidget::buildUi()
     dirRow->addStretch(1);
     growthLayout->addLayout(dirRow);
 
-    auto* stepsRow = new QHBoxLayout();
-    auto* stepsLabel = new QLabel(tr("Steps:"), _groupGrowth);
-    _spinGrowthSteps = new QSpinBox(_groupGrowth);
-    _spinGrowthSteps->setRange(1, 1024);
-    _spinGrowthSteps->setSingleStep(1);
-    stepsRow->addWidget(stepsLabel);
-    stepsRow->addStretch(1);
-    stepsRow->addWidget(_spinGrowthSteps);
-    growthLayout->addLayout(stepsRow);
+    auto* zRow = new QHBoxLayout();
+    _chkCorrectionsUseZRange = new QCheckBox(tr("Limit Z range"), _groupGrowth);
+    zRow->addWidget(_chkCorrectionsUseZRange);
+    zRow->addSpacing(12);
+    auto* zMinLabel = new QLabel(tr("Z min"), _groupGrowth);
+    _spinCorrectionsZMin = new QSpinBox(_groupGrowth);
+    _spinCorrectionsZMin->setRange(-100000, 100000);
+    auto* zMaxLabel = new QLabel(tr("Z max"), _groupGrowth);
+    _spinCorrectionsZMax = new QSpinBox(_groupGrowth);
+    _spinCorrectionsZMax->setRange(-100000, 100000);
+    zRow->addWidget(zMinLabel);
+    zRow->addWidget(_spinCorrectionsZMin);
+    zRow->addSpacing(8);
+    zRow->addWidget(zMaxLabel);
+    zRow->addWidget(_spinCorrectionsZMax);
+    zRow->addStretch(1);
+    growthLayout->addLayout(zRow);
 
     _btnGrow = new QPushButton(tr("Grow"), _groupGrowth);
     growthLayout->addWidget(_btnGrow);
@@ -210,23 +226,6 @@ void SegmentationWidget::buildUi()
     _chkCorrectionsAnnotate = new QCheckBox(tr("Annotate corrections"), _groupCorrections);
     correctionsLayout->addWidget(_chkCorrectionsAnnotate);
 
-    auto* zRow = new QHBoxLayout();
-    _chkCorrectionsUseZRange = new QCheckBox(tr("Limit Z range"), _groupCorrections);
-    zRow->addWidget(_chkCorrectionsUseZRange);
-    zRow->addSpacing(12);
-    auto* zMinLabel = new QLabel(tr("Z min"), _groupCorrections);
-    _spinCorrectionsZMin = new QSpinBox(_groupCorrections);
-    _spinCorrectionsZMin->setRange(-100000, 100000);
-    auto* zMaxLabel = new QLabel(tr("Z max"), _groupCorrections);
-    _spinCorrectionsZMax = new QSpinBox(_groupCorrections);
-    _spinCorrectionsZMax->setRange(-100000, 100000);
-    zRow->addWidget(zMinLabel);
-    zRow->addWidget(_spinCorrectionsZMin);
-    zRow->addSpacing(8);
-    zRow->addWidget(zMaxLabel);
-    zRow->addWidget(_spinCorrectionsZMax);
-    correctionsLayout->addLayout(zRow);
-
     _groupCorrections->setLayout(correctionsLayout);
     layout->addWidget(_groupCorrections);
 
@@ -309,6 +308,9 @@ void SegmentationWidget::buildUi()
 
     connect(_directionFieldPathEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         _directionFieldPath = text.trimmed();
+        if (!_updatingDirectionFieldForm) {
+            applyDirectionFieldDraftToSelection(_directionFieldList ? _directionFieldList->currentRow() : -1);
+        }
     });
 
     connect(_directionFieldBrowseButton, &QToolButton::clicked, this, [this]() {
@@ -324,14 +326,23 @@ void SegmentationWidget::buildUi()
     connect(_comboDirectionFieldOrientation, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
         _directionFieldOrientation = segmentationDirectionFieldOrientationFromInt(
             _comboDirectionFieldOrientation->itemData(index).toInt());
+        if (!_updatingDirectionFieldForm) {
+            applyDirectionFieldDraftToSelection(_directionFieldList ? _directionFieldList->currentRow() : -1);
+        }
     });
 
     connect(_comboDirectionFieldScale, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
         _directionFieldScale = _comboDirectionFieldScale->itemData(index).toInt();
+        if (!_updatingDirectionFieldForm) {
+            applyDirectionFieldDraftToSelection(_directionFieldList ? _directionFieldList->currentRow() : -1);
+        }
     });
 
     connect(_spinDirectionFieldWeight, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         _directionFieldWeight = value;
+        if (!_updatingDirectionFieldForm) {
+            applyDirectionFieldDraftToSelection(_directionFieldList ? _directionFieldList->currentRow() : -1);
+        }
     });
 
     connect(_directionFieldAddButton, &QPushButton::clicked, this, [this]() {
@@ -356,6 +367,7 @@ void SegmentationWidget::buildUi()
     });
 
     connect(_directionFieldList, &QListWidget::currentRowChanged, this, [this](int row) {
+        updateDirectionFieldFormFromSelection(row);
         if (_directionFieldRemoveButton) {
             _directionFieldRemoveButton->setEnabled(_editingEnabled && row >= 0);
         }
@@ -381,12 +393,7 @@ void SegmentationWidget::buildUi()
     connect(_chkCorrectionsUseZRange, &QCheckBox::toggled, this, [this](bool enabled) {
         _correctionsZRangeEnabled = enabled;
         writeSetting(QStringLiteral("corrections_z_range_enabled"), _correctionsZRangeEnabled);
-        if (_spinCorrectionsZMin) {
-            _spinCorrectionsZMin->setEnabled(enabled);
-        }
-        if (_spinCorrectionsZMax) {
-            _spinCorrectionsZMax->setEnabled(enabled);
-        }
+        updateGrowthUiState();
         emit correctionsZRangeChanged(enabled, _correctionsZMin, _correctionsZMax);
     });
 
@@ -449,7 +456,6 @@ void SegmentationWidget::syncUiState()
 
     applyGrowthDirectionMaskToUi();
     refreshDirectionFieldList();
-    updateGrowthUiState();
 
     if (_directionFieldPathEdit) {
         const QSignalBlocker blocker(_directionFieldPathEdit);
@@ -489,38 +495,47 @@ void SegmentationWidget::syncUiState()
     if (_spinCorrectionsZMin) {
         const QSignalBlocker blocker(_spinCorrectionsZMin);
         _spinCorrectionsZMin->setValue(_correctionsZMin);
-        _spinCorrectionsZMin->setEnabled(_correctionsZRangeEnabled && _correctionsEnabled && !_growthInProgress);
     }
     if (_spinCorrectionsZMax) {
         const QSignalBlocker blocker(_spinCorrectionsZMax);
         _spinCorrectionsZMax->setValue(_correctionsZMax);
-        _spinCorrectionsZMax->setEnabled(_correctionsZRangeEnabled && _correctionsEnabled && !_growthInProgress);
     }
 
     if (_lblNormalGrid) {
         const QString icon = _normalGridAvailable
             ? QStringLiteral("<span style=\"color:#2e7d32; font-size:16px;\">&#10003;</span>")
             : QStringLiteral("<span style=\"color:#c62828; font-size:16px;\">&#10007;</span>");
-        const QString accessible = _normalGridAvailable ? tr("Normal grids found") : tr("Normal grids missing");
-        QString tooltip;
-        if (!_volumePackagePath.isEmpty()) {
-            tooltip = tr("Volume package: %1").arg(_volumePackagePath);
-        }
-        if (!_normalGridHint.isEmpty()) {
-            if (!tooltip.isEmpty()) {
-                tooltip.append(QLatin1Char('\n'));
+        const bool hasExplicitLocation = !_normalGridDisplayPath.isEmpty() && _normalGridDisplayPath != _normalGridHint;
+        QString message;
+        if (hasExplicitLocation) {
+            message = _normalGridAvailable
+                ? tr("Normal grids found at %1").arg(_normalGridDisplayPath)
+                : tr("Normal grids not found at %1").arg(_normalGridDisplayPath);
+        } else {
+            message = _normalGridAvailable ? tr("Normal grids found.") : tr("Normal grids not found.");
+            if (!_normalGridHint.isEmpty()) {
+                message.append(QStringLiteral(" ("));
+                message.append(_normalGridHint);
+                message.append(QLatin1Char(')'));
             }
-            tooltip.append(tr("Normal grids: %1").arg(_normalGridHint));
         }
-        if (!tooltip.isEmpty()) {
-            tooltip.append(QLatin1Char('\n'));
-        }
-        tooltip.append(accessible);
 
-        _lblNormalGrid->setText(icon);
+        QString tooltip = message;
+        if (hasExplicitLocation && !_normalGridHint.isEmpty()) {
+            tooltip.append(QStringLiteral("\n"));
+            tooltip.append(_normalGridHint);
+        }
+        if (!_volumePackagePath.isEmpty()) {
+            tooltip.append(QStringLiteral("\n"));
+            tooltip.append(tr("Volume package: %1").arg(_volumePackagePath));
+        }
+
+        _lblNormalGrid->setText(icon + QStringLiteral("&nbsp;") + message);
         _lblNormalGrid->setToolTip(tooltip);
-        _lblNormalGrid->setAccessibleDescription(accessible);
+        _lblNormalGrid->setAccessibleDescription(message);
     }
+
+    updateGrowthUiState();
 }
 
 void SegmentationWidget::restoreSettings()
@@ -647,6 +662,12 @@ void SegmentationWidget::setNormalGridAvailable(bool available)
 void SegmentationWidget::setNormalGridPathHint(const QString& hint)
 {
     _normalGridHint = hint;
+    QString display = hint.trimmed();
+    const int colonIndex = display.indexOf(QLatin1Char(':'));
+    if (colonIndex >= 0 && colonIndex + 1 < display.size()) {
+        display = display.mid(colonIndex + 1).trimmed();
+    }
+    _normalGridDisplayPath = display;
     syncUiState();
 }
 
@@ -823,6 +844,98 @@ void SegmentationWidget::refreshDirectionFieldList()
     if (_directionFieldRemoveButton) {
         _directionFieldRemoveButton->setEnabled(_editingEnabled && !_directionFields.empty() && _directionFieldList->currentRow() >= 0);
     }
+
+    updateDirectionFieldFormFromSelection(_directionFieldList->currentRow());
+}
+
+void SegmentationWidget::updateDirectionFieldFormFromSelection(int row)
+{
+    const bool previousUpdating = _updatingDirectionFieldForm;
+    _updatingDirectionFieldForm = true;
+
+    if (row >= 0 && row < static_cast<int>(_directionFields.size())) {
+        const auto& config = _directionFields[static_cast<std::size_t>(row)];
+        _directionFieldPath = config.path;
+        _directionFieldOrientation = config.orientation;
+        _directionFieldScale = config.scale;
+        _directionFieldWeight = config.weight;
+    }
+
+    if (_directionFieldPathEdit) {
+        const QSignalBlocker blocker(_directionFieldPathEdit);
+        _directionFieldPathEdit->setText(_directionFieldPath);
+    }
+    if (_comboDirectionFieldOrientation) {
+        const QSignalBlocker blocker(_comboDirectionFieldOrientation);
+        int idx = _comboDirectionFieldOrientation->findData(static_cast<int>(_directionFieldOrientation));
+        if (idx >= 0) {
+            _comboDirectionFieldOrientation->setCurrentIndex(idx);
+        }
+    }
+    if (_comboDirectionFieldScale) {
+        const QSignalBlocker blocker(_comboDirectionFieldScale);
+        int idx = _comboDirectionFieldScale->findData(_directionFieldScale);
+        if (idx >= 0) {
+            _comboDirectionFieldScale->setCurrentIndex(idx);
+        }
+    }
+    if (_spinDirectionFieldWeight) {
+        const QSignalBlocker blocker(_spinDirectionFieldWeight);
+        _spinDirectionFieldWeight->setValue(_directionFieldWeight);
+    }
+
+    _updatingDirectionFieldForm = previousUpdating;
+}
+
+void SegmentationWidget::applyDirectionFieldDraftToSelection(int row)
+{
+    if (row < 0 || row >= static_cast<int>(_directionFields.size())) {
+        return;
+    }
+
+    auto config = buildDirectionFieldDraft();
+    if (!config.isValid()) {
+        return;
+    }
+
+    auto& target = _directionFields[static_cast<std::size_t>(row)];
+    if (target.path == config.path &&
+        target.orientation == config.orientation &&
+        target.scale == config.scale &&
+        std::abs(target.weight - config.weight) < 1e-4) {
+        return;
+    }
+
+    target = std::move(config);
+    updateDirectionFieldListItem(row);
+    persistDirectionFields();
+}
+
+void SegmentationWidget::updateDirectionFieldListItem(int row)
+{
+    if (!_directionFieldList) {
+        return;
+    }
+    if (row < 0 || row >= _directionFieldList->count()) {
+        return;
+    }
+    if (row >= static_cast<int>(_directionFields.size())) {
+        return;
+    }
+
+    const auto& config = _directionFields[static_cast<std::size_t>(row)];
+    QString orientationLabel = segmentationDirectionFieldOrientationKey(config.orientation);
+    const QString weightText = QString::number(std::clamp(config.weight, 0.0, 10.0), 'f', 2);
+    const QString itemText = tr("%1 — %2 (scale %3, weight %4)")
+                                 .arg(config.path,
+                                      orientationLabel,
+                                      QString::number(std::clamp(config.scale, 0, 5)),
+                                      weightText);
+
+    if (auto* item = _directionFieldList->item(row)) {
+        item->setText(itemText);
+        item->setToolTip(config.path);
+    }
 }
 
 void SegmentationWidget::persistDirectionFields()
@@ -931,6 +1044,17 @@ void SegmentationWidget::updateGrowthUiState()
         _directionFieldList->setEnabled(_editingEnabled);
     }
 
+    const bool allowZRange = _editingEnabled && !_growthInProgress;
+    if (_chkCorrectionsUseZRange) {
+        _chkCorrectionsUseZRange->setEnabled(allowZRange);
+    }
+    if (_spinCorrectionsZMin) {
+        _spinCorrectionsZMin->setEnabled(allowZRange && _correctionsZRangeEnabled);
+    }
+    if (_spinCorrectionsZMax) {
+        _spinCorrectionsZMax->setEnabled(allowZRange && _correctionsZRangeEnabled);
+    }
+
     const bool allowCorrections = _editingEnabled && _correctionsEnabled && !_growthInProgress;
     if (_groupCorrections) {
         _groupCorrections->setEnabled(allowCorrections);
@@ -944,15 +1068,6 @@ void SegmentationWidget::updateGrowthUiState()
     }
     if (_chkCorrectionsAnnotate) {
         _chkCorrectionsAnnotate->setEnabled(allowCorrections);
-    }
-    if (_chkCorrectionsUseZRange) {
-        _chkCorrectionsUseZRange->setEnabled(allowCorrections);
-    }
-    if (_spinCorrectionsZMin) {
-        _spinCorrectionsZMin->setEnabled(allowCorrections && _correctionsZRangeEnabled);
-    }
-    if (_spinCorrectionsZMax) {
-        _spinCorrectionsZMax->setEnabled(allowCorrections && _correctionsZRangeEnabled);
     }
 }
 

@@ -25,6 +25,7 @@
 #include "overlays/PathsOverlayController.hpp"
 #include "overlays/BBoxOverlayController.hpp"
 #include "overlays/VectorOverlayController.hpp"
+#include "overlays/VolumeOverlayController.hpp"
 #include "ViewerManager.hpp"
 #include "SegmentationWidget.hpp"
 #include "SegmentationGrowth.hpp"
@@ -169,10 +170,6 @@ private:
 
     QComboBox* volSelect;
     QComboBox* cmbSegmentationDir;
-    QComboBox* overlayVolumeSelect{nullptr};
-    QComboBox* overlayColormapSelect{nullptr};
-    QSlider* overlayOpacitySlider{nullptr};
-    QSpinBox* overlayThresholdSpin{nullptr};
     QuadSurface *_surf;
     std::string _surfID;
     
@@ -204,14 +201,7 @@ private:
     
     ChunkCache *chunk_cache;
 
-    std::string _overlayVolumeId;
-    std::string _overlayColormapName;
-    float _overlayOpacity{0.5f};
-    float _overlayThreshold{1.0f};
-    float _overlayOpacityBeforeToggle{0.5f};
-    bool _overlayVisible{true};
-
-    void populateOverlayColormapOptions();
+    std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;
     CSurfaceCollection *_surf_col;
     bool _useAxisAlignedSlices{false};

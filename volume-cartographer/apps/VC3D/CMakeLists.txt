@@ -36,6 +36,8 @@ set(srcs
     overlays/PathsOverlayController.hpp
     overlays/VectorOverlayController.cpp
     overlays/VectorOverlayController.hpp
+    overlays/VolumeOverlayController.cpp
+    overlays/VolumeOverlayController.hpp
     overlays/ViewerOverlayControllerBase.cpp
     overlays/ViewerOverlayControllerBase.hpp
     SurfacePanelController.cpp
