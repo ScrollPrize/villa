@@ -408,8 +408,7 @@ void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
                     if (ox < 0 || oy < 0 || oz < 0)
                         continue;
 
-                    if (ox < 0 || oy < 0 || oz < 0 ||
-                        ox >= sx || oy >= sy || oz >= sz) {
+                    if (ox >= sx || oy >= sy || oz >= sz) {
                         continue;
                     }
 
