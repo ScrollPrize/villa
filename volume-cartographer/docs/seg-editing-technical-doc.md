@@ -1,12 +1,9 @@
 # Segmentation Editing Architecture (Gaussian Vertex Mode)
-
+*last update 10/25*
 ## Purpose and Scope
 
 The segmentation editor lets annotators reshape an existing `QuadSurface` by
-pulling its grid vertices with a Gaussian falloff. The current implementation
-removes the historic "handle" abstraction and operates directly on every valid
-vertex in the surface. This document captures the 2025 refresh so contributors
-can navigate the code base while the UI continues to evolve.
+pulling its grid vertices with a Gaussian falloff. Editing operates directly on every valid vertex in the surface.
 
 Unless noted otherwise, paths are relative to `apps/VC3D`.
 
@@ -36,7 +33,7 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
    `SegmentationEditManager::recentTouched`). During a drag it projects the
    Gaussian radius into viewer space so users understand the footprint.
 5. **Persistence** – "Apply" copies the preview grid back into the base surface
-   and clears the edit map. "Reset" discards active drags and rebuilds the
+   and clears the edit map -- note that these also apply immediately after a manipulation of any vertex, so this is not typically necessary . "Reset" discards active drags and rebuilds the
    preview from the original snapshot. A session ends by destroying the preview
    clone and clearing overlay state.
 
@@ -82,11 +79,6 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
 - `commitActiveDrag` clears the temporary sample list. `cancelActiveDrag` reverts
   the affected vertices to their pre-drag positions.
 
-Because the full grid is now editable, there is no hole-filling logic or
-row/column special case. Growth operations can still flag subsequent drags via
-`SegmentationModule::markNextEditsFromGrowth`, which sets the `isGrowth` bit on
-new or updated vertices.
-
 
 ## Interaction Model
 
@@ -106,9 +98,6 @@ unused.
 ### Keyboard
 
 - **Esc** – Cancels the active drag.
-- Other historical shortcuts (handle add/remove, row/column toggles) are
-  retired. Growth tooling still relies on the module signals but no longer
-  interacts with handles.
 
 
 ## Overlay Behaviour
@@ -126,30 +115,4 @@ unused.
 The controller renders simple filled circles for neighbours, a highlighted circle
 for the active vertex, and (during drag) an outline representing the world-space
 radius.
-
-
-## Growth & Corrections Hooks
-
-The module keeps thin compatibility shims for the existing surface growth
-workflow:
-
-- `setGrowthInProgress`, `markNextEditsFromGrowth`, and `growthInProgress` allow
-  callers to signal when an external growth job is running.
-- `buildCorrectionsPayload`, `clearPendingCorrections`, and `correctionsZRange`
-  currently return empty defaults; they remain so downstream code compiles while
-the new correction UX is designed.
-
-
-## Known Gaps / Follow-up
-
-- The widget has been simplified dramatically; legacy settings (hole filling,
-  handle visibility, slice fade options) are gone. Reintroduce the ones that
-  still matter for production.
-- Growth requests still expect richer correction payloads; the shims noted above
-  should be replaced with a proper vertex-aware implementation once the new
-  UX stabilises.
-- Overlay styling is intentionally minimal. Future iterations may add falloff
-  heat maps or per-vertex annotations once performance constraints are vetted.
-- Persistence (`VC.ini`) still carries obsolete keys. A dedicated cleanup step is
-  required to strip unused values and migrate existing installations.
 
