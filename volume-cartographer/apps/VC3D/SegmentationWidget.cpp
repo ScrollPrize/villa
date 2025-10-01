@@ -551,7 +551,6 @@ void SegmentationWidget::restoreSettings()
     QSettings settings(QStringLiteral("VC.ini"), QSettings::IniFormat);
     settings.beginGroup(settingsGroup());
 
-    _editingEnabled = settings.value(QStringLiteral("editing_enabled"), _editingEnabled).toBool();
     _radiusSteps = settings.value(QStringLiteral("radius_steps"), _radiusSteps).toFloat();
     _sigmaSteps = settings.value(QStringLiteral("sigma_steps"), _sigmaSteps).toFloat();
     _growthMethod = SegmentationGrowthMethod::Corrections;
@@ -601,7 +600,6 @@ void SegmentationWidget::updateEditingState(bool enabled, bool notifyListeners)
     }
 
     _editingEnabled = enabled;
-    writeSetting(QStringLiteral("editing_enabled"), _editingEnabled);
     if (!_editingEnabled && _eraseBrushActive) {
         _eraseBrushActive = false;
     }

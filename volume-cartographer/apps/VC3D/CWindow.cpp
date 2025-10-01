@@ -1168,7 +1168,13 @@ auto CWindow::InitializeVolumePkg(const std::string& nVpkgPath) -> bool
 {
     fVpkg = nullptr;
     updateNormalGridAvailability();
+    if (_segmentationModule && _segmentationModule->editingEnabled()) {
+        _segmentationModule->setEditingEnabled(false);
+    }
     if (_segmentationWidget) {
+        if (!_segmentationModule || _segmentationWidget->isEditingEnabled()) {
+            _segmentationWidget->setEditingEnabled(false);
+        }
         _segmentationWidget->setAvailableVolumes({}, QString());
         _segmentationWidget->setVolumePackagePath(QString());
     }
@@ -1498,8 +1504,17 @@ void CWindow::onOpChainChanged(OpChain *chain)
 
 void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface, OpChain* chain)
 {
+    const std::string previousSurfId = _surfID;
     _surfID = surfaceId.toStdString();
     _surf = surface;
+
+    if (_surfID != previousSurfId) {
+        if (_segmentationModule && _segmentationModule->editingEnabled()) {
+            _segmentationModule->setEditingEnabled(false);
+        } else if (_segmentationWidget && _segmentationWidget->isEditingEnabled()) {
+            _segmentationWidget->setEditingEnabled(false);
+        }
+    }
 
     if (chain) {
         sendOpChainSelected(chain);
