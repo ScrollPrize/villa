@@ -1,678 +1,373 @@
 #include "SegmentationWidget.hpp"
 
+#include <QAbstractItemView>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDir>
 #include <QDoubleSpinBox>
+#include <QFileDialog>
 #include <QGroupBox>
-#include <QGridLayout>
-#include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QListWidgetItem>
+#include <QLoggingCategory>
 #include <QPushButton>
-#include <QAbstractItemView>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSpinBox>
 #include <QToolButton>
 #include <QVariant>
 #include <QVBoxLayout>
-#include <QSignalBlocker>
-#include <QLoggingCategory>
-#include <QStyle>
-#include <QFileDialog>
+#include <QHBoxLayout>
 
 #include <algorithm>
-
-#include <optional>
-
 #include <cmath>
 
-Q_LOGGING_CATEGORY(lcSegWidget, "vc.segmentation.widget");
+namespace
+{
+Q_LOGGING_CATEGORY(lcSegWidget, "vc.segmentation.widget")
+
+constexpr int kGrowDirUpBit = 1 << 0;
+constexpr int kGrowDirDownBit = 1 << 1;
+constexpr int kGrowDirLeftBit = 1 << 2;
+constexpr int kGrowDirRightBit = 1 << 3;
+constexpr int kGrowDirAllMask = kGrowDirUpBit | kGrowDirDownBit | kGrowDirLeftBit | kGrowDirRightBit;
+
+QString settingsGroup()
+{
+    return QStringLiteral("segmentation_edit");
+}
+}
 
 SegmentationWidget::SegmentationWidget(QWidget* parent)
     : QWidget(parent)
-    , _chkEditing(nullptr)
-    , _editingStatus(nullptr)
-    , _chkAdvancedSettings(nullptr)
-    , _groupGrowth(nullptr)
-    , _groupMasking(nullptr)
-    , _groupSampling(nullptr)
-    , _spinDownsample(nullptr)
-    , _spinRadius(nullptr)
-    , _spinSigma(nullptr)
-    , _comboInfluenceMode(nullptr)
-    , _groupInfluence(nullptr)
-    , _groupSliceVisibility(nullptr)
-    , _spinSliceFadeDistance(nullptr)
-    , _comboSliceDisplayMode(nullptr)
-    , _comboRowColMode(nullptr)
-    , _spinHighlightDistance(nullptr)
-    , _groupHole(nullptr)
-    , _spinHoleRadius(nullptr)
-    , _spinHoleIterations(nullptr)
-    , _chkFillInvalidRegions(nullptr)
-    , _groupHandleDisplay(nullptr)
-    , _chkShowHandles(nullptr)
-    , _chkHandlesAlwaysVisible(nullptr)
-    , _spinHandleDisplayDistance(nullptr)
-    , _btnApply(nullptr)
-    , _btnReset(nullptr)
-    , _btnStopTools(nullptr)
-    , _spinGrowthSteps(nullptr)
-    , _btnGrow(nullptr)
-    , _chkGrowthDirUp(nullptr)
-    , _chkGrowthDirDown(nullptr)
-    , _chkGrowthDirLeft(nullptr)
-    , _chkGrowthDirRight(nullptr)
-    , _groupDirectionField(nullptr)
-    , _directionFieldPathEdit(nullptr)
-    , _directionFieldBrowseButton(nullptr)
-    , _comboDirectionFieldOrientation(nullptr)
-    , _comboDirectionFieldScale(nullptr)
-    , _spinDirectionFieldWeight(nullptr)
-    , _directionFieldAddButton(nullptr)
-    , _directionFieldRemoveButton(nullptr)
-    , _directionFieldList(nullptr)
-    , _btnMaskEdit(nullptr)
-    , _btnMaskApply(nullptr)
-    , _spinMaskSampling(nullptr)
-    , _comboVolume(nullptr)
-    , _groupCorrections(nullptr)
-    , _comboCorrections(nullptr)
-    , _btnCorrectionsNew(nullptr)
-    , _chkCorrectionsAnnotate(nullptr)
-    , _chkCorrectionsUseZRange(nullptr)
-    , _spinCorrectionsZMin(nullptr)
-    , _spinCorrectionsZMax(nullptr)
-    , _normalGridStatusWidget(nullptr)
-    , _normalGridStatusIcon(nullptr)
 {
-    setupUI();
-    updateEditingUi();
+    _growthDirectionMask = kGrowDirAllMask;
+    buildUi();
+    restoreSettings();
+    syncUiState();
 }
 
-void SegmentationWidget::setupUI()
+void SegmentationWidget::buildUi()
 {
     auto* layout = new QVBoxLayout(this);
-    layout->setContentsMargins(6, 6, 6, 6);
-    layout->setSpacing(10);
+    layout->setContentsMargins(8, 8, 8, 8);
+    layout->setSpacing(12);
 
-    // Editing toggle and status
-    auto* editingLayout = new QHBoxLayout();
-    editingLayout->setContentsMargins(0, 0, 0, 0);
-    editingLayout->setSpacing(8);
-    _chkEditing = new QCheckBox(tr("Enable Editing"), this);
-    _chkEditing->setToolTip(tr("Toggle interactive segmentation editing mode"));
-    editingLayout->addWidget(_chkEditing);
+    auto* editingRow = new QHBoxLayout();
+    _chkEditing = new QCheckBox(tr("Enable editing"), this);
+    _lblStatus = new QLabel(this);
+    _lblStatus->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    editingRow->addWidget(_chkEditing);
+    editingRow->addSpacing(8);
+    editingRow->addWidget(_lblStatus, 1);
+    layout->addLayout(editingRow);
 
-    _editingStatus = new QLabel(tr("Editing disabled"), this);
-    editingLayout->addWidget(_editingStatus);
-    editingLayout->addStretch();
-    layout->addLayout(editingLayout);
-
-    _chkAdvancedSettings = new QCheckBox(tr("Show advanced settings"), this);
-    _chkAdvancedSettings->setToolTip(tr("Toggle additional surface editing controls"));
-    layout->addWidget(_chkAdvancedSettings);
-
-    // Surface growth controls (moved to the top for quicker access)
     _groupGrowth = new QGroupBox(tr("Surface Growth"), this);
     auto* growthLayout = new QVBoxLayout(_groupGrowth);
 
-    auto* allowedLayout = new QHBoxLayout();
-    auto* allowedLabel = new QLabel(tr("Allowed directions:"), _groupGrowth);
-    allowedLayout->addWidget(allowedLabel);
+    auto* dirRow = new QHBoxLayout();
+    auto* dirLabel = new QLabel(tr("Allowed directions:"), _groupGrowth);
+    dirRow->addWidget(dirLabel);
+    auto addDirectionCheckbox = [&](const QString& text) {
+        auto* box = new QCheckBox(text, _groupGrowth);
+        dirRow->addWidget(box);
+        return box;
+    };
+    _chkGrowthDirUp = addDirectionCheckbox(tr("Up"));
+    _chkGrowthDirDown = addDirectionCheckbox(tr("Down"));
+    _chkGrowthDirLeft = addDirectionCheckbox(tr("Left"));
+    _chkGrowthDirRight = addDirectionCheckbox(tr("Right"));
+    dirRow->addStretch(1);
+    growthLayout->addLayout(dirRow);
 
-    _chkGrowthDirUp = new QCheckBox(tr("Up"), _groupGrowth);
-    _chkGrowthDirDown = new QCheckBox(tr("Down"), _groupGrowth);
-    _chkGrowthDirLeft = new QCheckBox(tr("Left"), _groupGrowth);
-    _chkGrowthDirRight = new QCheckBox(tr("Right"), _groupGrowth);
-
-    const QString dirTooltip = tr("Restrict tracer expansion to specific grid directions."
-                                   " At least one direction must remain enabled.");
-    _chkGrowthDirUp->setToolTip(dirTooltip);
-    _chkGrowthDirDown->setToolTip(dirTooltip);
-    _chkGrowthDirLeft->setToolTip(dirTooltip);
-    _chkGrowthDirRight->setToolTip(dirTooltip);
-
-    allowedLayout->addWidget(_chkGrowthDirUp);
-    allowedLayout->addWidget(_chkGrowthDirDown);
-    allowedLayout->addWidget(_chkGrowthDirLeft);
-    allowedLayout->addWidget(_chkGrowthDirRight);
-    allowedLayout->addStretch();
-    growthLayout->addLayout(allowedLayout);
-
-    auto* zRangeLayout = new QHBoxLayout();
-    _chkCorrectionsUseZRange = new QCheckBox(tr("Limit Z range"), _groupGrowth);
-    _chkCorrectionsUseZRange->setToolTip(tr("Restrict tracer growth between the specified Z planes when correction-guided growth runs."));
-    zRangeLayout->addWidget(_chkCorrectionsUseZRange);
-
-    auto* zMinLabel = new QLabel(tr("Z min:"), _groupGrowth);
-    _spinCorrectionsZMin = new QSpinBox(_groupGrowth);
-    _spinCorrectionsZMin->setRange(0, 1000000);
-    _spinCorrectionsZMin->setSingleStep(1);
-    _spinCorrectionsZMin->setValue(_correctionsZMin);
-    _spinCorrectionsZMin->setEnabled(false);
-
-    auto* zMaxLabel = new QLabel(tr("Z max:"), _groupGrowth);
-    _spinCorrectionsZMax = new QSpinBox(_groupGrowth);
-    _spinCorrectionsZMax->setRange(0, 1000000);
-    _spinCorrectionsZMax->setSingleStep(1);
-    _spinCorrectionsZMax->setValue(_correctionsZMax);
-    _spinCorrectionsZMax->setEnabled(false);
-
-    zRangeLayout->addSpacing(12);
-    zRangeLayout->addWidget(zMinLabel);
-    zRangeLayout->addWidget(_spinCorrectionsZMin);
-    zRangeLayout->addSpacing(8);
-    zRangeLayout->addWidget(zMaxLabel);
-    zRangeLayout->addWidget(_spinCorrectionsZMax);
-    zRangeLayout->addStretch();
-    growthLayout->addLayout(zRangeLayout);
-
-    applyGrowthDirectionMaskToUi();
-
-    auto* stepsLayout = new QHBoxLayout();
+    auto* stepsRow = new QHBoxLayout();
     auto* stepsLabel = new QLabel(tr("Steps:"), _groupGrowth);
     _spinGrowthSteps = new QSpinBox(_groupGrowth);
     _spinGrowthSteps->setRange(1, 1024);
     _spinGrowthSteps->setSingleStep(1);
-    _spinGrowthSteps->setValue(_growthSteps);
-    _spinGrowthSteps->setToolTip(tr("Number of grid units to add during growth"));
-    stepsLayout->addWidget(stepsLabel);
-    stepsLayout->addWidget(_spinGrowthSteps);
-    stepsLayout->addStretch();
-    growthLayout->addLayout(stepsLayout);
+    stepsRow->addWidget(stepsLabel);
+    stepsRow->addStretch(1);
+    stepsRow->addWidget(_spinGrowthSteps);
+    growthLayout->addLayout(stepsRow);
 
     _btnGrow = new QPushButton(tr("Grow"), _groupGrowth);
-    _btnGrow->setToolTip(tr("Extend the segmentation surface using the current settings"));
     growthLayout->addWidget(_btnGrow);
 
-    auto* volumeLayout = new QHBoxLayout();
+    auto* volumeRow = new QHBoxLayout();
     auto* volumeLabel = new QLabel(tr("Volume:"), _groupGrowth);
-    _comboVolume = new QComboBox(_groupGrowth);
-    _comboVolume->setEnabled(false);
-    volumeLayout->addWidget(volumeLabel);
-    volumeLayout->addWidget(_comboVolume);
+    _comboVolumes = new QComboBox(_groupGrowth);
+    _comboVolumes->setEnabled(false);
+    volumeRow->addWidget(volumeLabel);
+    volumeRow->addWidget(_comboVolumes, 1);
+    growthLayout->addLayout(volumeRow);
 
-    _normalGridStatusWidget = new QWidget(_groupGrowth);
-    auto* normalGridLayout = new QHBoxLayout(_normalGridStatusWidget);
-    normalGridLayout->setContentsMargins(0, 0, 0, 0);
-    normalGridLayout->setSpacing(0);
-    _normalGridStatusIcon = new QLabel(_normalGridStatusWidget);
-    normalGridLayout->addWidget(_normalGridStatusIcon);
-    _normalGridStatusWidget->setVisible(false);
-    volumeLayout->addWidget(_normalGridStatusWidget);
-    volumeLayout->addStretch();
-    growthLayout->addLayout(volumeLayout);
-
+    _groupGrowth->setLayout(growthLayout);
     layout->addWidget(_groupGrowth);
 
-    _groupDirectionField = new QGroupBox(tr("Direction Field"), this);
-    auto* directionFieldLayout = new QVBoxLayout(_groupDirectionField);
+    _lblNormalGrid = new QLabel(this);
+    _lblNormalGrid->setTextFormat(Qt::RichText);
+    _lblNormalGrid->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    layout->addWidget(_lblNormalGrid);
 
-    auto* dfPathLayout = new QHBoxLayout();
-    auto* dfPathLabel = new QLabel(tr("Zarr folder:"), _groupDirectionField);
+    auto* falloffGroup = new QGroupBox(tr("Gaussian Falloff"), this);
+    auto* falloffLayout = new QVBoxLayout(falloffGroup);
+
+    auto* radiusSigmaRow = new QHBoxLayout();
+    auto* radiusLabel = new QLabel(tr("Max radius (grid steps)"), falloffGroup);
+    _spinRadius = new QDoubleSpinBox(falloffGroup);
+    _spinRadius->setDecimals(2);
+    _spinRadius->setRange(0.25, 128.0);
+    _spinRadius->setSingleStep(0.25);
+    radiusSigmaRow->addWidget(radiusLabel);
+    radiusSigmaRow->addWidget(_spinRadius);
+    radiusSigmaRow->addSpacing(12);
+    auto* sigmaLabel = new QLabel(tr("Sigma (grid steps)"), falloffGroup);
+    _spinSigma = new QDoubleSpinBox(falloffGroup);
+    _spinSigma->setDecimals(2);
+    _spinSigma->setRange(0.05, 64.0);
+    _spinSigma->setSingleStep(0.1);
+    radiusSigmaRow->addWidget(sigmaLabel);
+    radiusSigmaRow->addWidget(_spinSigma);
+    radiusSigmaRow->addStretch(1);
+    falloffLayout->addLayout(radiusSigmaRow);
+
+    falloffGroup->setLayout(falloffLayout);
+    layout->addWidget(falloffGroup);
+
+    _groupDirectionField = new QGroupBox(tr("Direction Fields"), this);
+    auto* dfLayout = new QVBoxLayout(_groupDirectionField);
+
+    auto* pathRow = new QHBoxLayout();
+    auto* pathLabel = new QLabel(tr("Zarr folder:"), _groupDirectionField);
     _directionFieldPathEdit = new QLineEdit(_groupDirectionField);
-    _directionFieldPathEdit->setPlaceholderText(tr("Select direction field OME-Zarr"));
     _directionFieldBrowseButton = new QToolButton(_groupDirectionField);
     _directionFieldBrowseButton->setText(QStringLiteral("..."));
-    _directionFieldBrowseButton->setToolTip(tr("Choose a direction field OME-Zarr directory"));
-    dfPathLayout->addWidget(dfPathLabel);
-    dfPathLayout->addWidget(_directionFieldPathEdit);
-    dfPathLayout->addWidget(_directionFieldBrowseButton);
-    directionFieldLayout->addLayout(dfPathLayout);
+    pathRow->addWidget(pathLabel);
+    pathRow->addWidget(_directionFieldPathEdit, 1);
+    pathRow->addWidget(_directionFieldBrowseButton);
+    dfLayout->addLayout(pathRow);
 
-    auto* dfSettingsLayout = new QHBoxLayout();
-    dfSettingsLayout->setSpacing(12);
-    auto* dfOrientationLabel = new QLabel(tr("Direction:"), _groupDirectionField);
+    auto* orientationRow = new QHBoxLayout();
+    auto* orientationLabel = new QLabel(tr("Orientation:"), _groupDirectionField);
     _comboDirectionFieldOrientation = new QComboBox(_groupDirectionField);
     _comboDirectionFieldOrientation->addItem(tr("Normal"), static_cast<int>(SegmentationDirectionFieldOrientation::Normal));
     _comboDirectionFieldOrientation->addItem(tr("Horizontal"), static_cast<int>(SegmentationDirectionFieldOrientation::Horizontal));
     _comboDirectionFieldOrientation->addItem(tr("Vertical"), static_cast<int>(SegmentationDirectionFieldOrientation::Vertical));
-    dfSettingsLayout->addWidget(dfOrientationLabel);
-    dfSettingsLayout->addWidget(_comboDirectionFieldOrientation);
-
-    auto* dfScaleLabel = new QLabel(tr("Scale level:"), _groupDirectionField);
+    orientationRow->addWidget(orientationLabel);
+    orientationRow->addWidget(_comboDirectionFieldOrientation);
+    orientationRow->addSpacing(12);
+    auto* scaleLabel = new QLabel(tr("Scale level:"), _groupDirectionField);
     _comboDirectionFieldScale = new QComboBox(_groupDirectionField);
     for (int scale = 0; scale <= 5; ++scale) {
         _comboDirectionFieldScale->addItem(QString::number(scale), scale);
     }
-    dfSettingsLayout->addSpacing(12);
-    dfSettingsLayout->addWidget(dfScaleLabel);
-    dfSettingsLayout->addWidget(_comboDirectionFieldScale);
-
-    auto* dfWeightLabel = new QLabel(tr("Weight:"), _groupDirectionField);
+    orientationRow->addWidget(scaleLabel);
+    orientationRow->addWidget(_comboDirectionFieldScale);
+    orientationRow->addSpacing(12);
+    auto* weightLabel = new QLabel(tr("Weight:"), _groupDirectionField);
     _spinDirectionFieldWeight = new QDoubleSpinBox(_groupDirectionField);
     _spinDirectionFieldWeight->setDecimals(2);
     _spinDirectionFieldWeight->setRange(0.0, 10.0);
     _spinDirectionFieldWeight->setSingleStep(0.1);
-    _spinDirectionFieldWeight->setValue(_directionFieldWeight);
-    _spinDirectionFieldWeight->setToolTip(tr("Relative strength for direction field losses (0 disables)"));
-    dfSettingsLayout->addSpacing(12);
-    dfSettingsLayout->addWidget(dfWeightLabel);
-    dfSettingsLayout->addWidget(_spinDirectionFieldWeight);
-    dfSettingsLayout->addStretch();
-    directionFieldLayout->addLayout(dfSettingsLayout);
+    orientationRow->addWidget(weightLabel);
+    orientationRow->addWidget(_spinDirectionFieldWeight);
+    orientationRow->addStretch(1);
+    dfLayout->addLayout(orientationRow);
 
-    auto* dfButtonsLayout = new QHBoxLayout();
+    auto* buttonsRow = new QHBoxLayout();
     _directionFieldAddButton = new QPushButton(tr("Add"), _groupDirectionField);
     _directionFieldRemoveButton = new QPushButton(tr("Remove"), _groupDirectionField);
     _directionFieldRemoveButton->setEnabled(false);
-    dfButtonsLayout->addWidget(_directionFieldAddButton);
-    dfButtonsLayout->addWidget(_directionFieldRemoveButton);
-    dfButtonsLayout->addStretch();
-    directionFieldLayout->addLayout(dfButtonsLayout);
+    buttonsRow->addWidget(_directionFieldAddButton);
+    buttonsRow->addWidget(_directionFieldRemoveButton);
+    buttonsRow->addStretch(1);
+    dfLayout->addLayout(buttonsRow);
 
     _directionFieldList = new QListWidget(_groupDirectionField);
     _directionFieldList->setSelectionMode(QAbstractItemView::SingleSelection);
-    directionFieldLayout->addWidget(_directionFieldList);
+    dfLayout->addWidget(_directionFieldList);
 
+    _groupDirectionField->setLayout(dfLayout);
     layout->addWidget(_groupDirectionField);
-
-    _groupMasking = new QGroupBox(tr("Masking"), this);
-    auto* maskingLayout = new QVBoxLayout(_groupMasking);
-
-    _btnMaskEdit = new QPushButton(tr("Edit Mask"), _groupMasking);
-    _btnMaskEdit->setCheckable(true);
-    _btnMaskApply = new QPushButton(tr("Apply Mask"), _groupMasking);
-    _btnMaskApply->setEnabled(false);
-    auto* maskActionsRow = new QHBoxLayout();
-    maskActionsRow->addWidget(_btnMaskEdit);
-    maskActionsRow->addWidget(_btnMaskApply);
-    maskActionsRow->addStretch();
-    maskingLayout->addLayout(maskActionsRow);
-
-    auto* maskSettingsRow = new QHBoxLayout();
-    auto* samplingLabel = new QLabel(tr("Sampling:"), _groupMasking);
-    _spinMaskSampling = new QSpinBox(_groupMasking);
-    _spinMaskSampling->setRange(1, 64);
-    _spinMaskSampling->setSingleStep(1);
-    _spinMaskSampling->setValue(_maskSampling);
-    _spinMaskSampling->setToolTip(tr("Controls how densely mask preview points are sampled"));
-    maskSettingsRow->addWidget(samplingLabel);
-    maskSettingsRow->addWidget(_spinMaskSampling);
-
-    maskSettingsRow->addSpacing(12);
-    auto* maskRadiusLabel = new QLabel(tr("Brush radius:"), _groupMasking);
-    _spinMaskRadius = new QSpinBox(_groupMasking);
-    _spinMaskRadius->setRange(1, 64);
-    _spinMaskRadius->setSingleStep(1);
-    _spinMaskRadius->setValue(_maskBrushRadius);
-    _spinMaskRadius->setToolTip(tr("Size of the eraser brush in grid cells while mask editing"));
-    maskSettingsRow->addWidget(maskRadiusLabel);
-    maskSettingsRow->addWidget(_spinMaskRadius);
-    maskSettingsRow->addStretch();
-    maskingLayout->addLayout(maskSettingsRow);
-
-    layout->addWidget(_groupMasking);
-
-    // Parameter controls
-    _groupSampling = new QGroupBox(tr("Sampling"), this);
-    auto* samplingLayout = new QVBoxLayout(_groupSampling);
-
-    auto* downsampleLayout = new QHBoxLayout();
-    auto* downsampleLabel = new QLabel(tr("Downsample factor:"), _groupSampling);
-    _spinDownsample = new QSpinBox(_groupSampling);
-    _spinDownsample->setRange(2, 64);
-    _spinDownsample->setSingleStep(2);
-    _spinDownsample->setValue(_downsample);
-    _spinDownsample->setToolTip(tr("Controls how densely surface control points are sampled"));
-    downsampleLayout->addWidget(downsampleLabel);
-    downsampleLayout->addWidget(_spinDownsample);
-    downsampleLayout->addStretch();
-    samplingLayout->addLayout(downsampleLayout);
-
-    layout->addWidget(_groupSampling);
-
-    _groupInfluence = new QGroupBox(tr("Influence"), this);
-    auto* influenceGrid = new QGridLayout(_groupInfluence);
-    influenceGrid->setHorizontalSpacing(12);
-    influenceGrid->setVerticalSpacing(8);
-
-    auto* modeLayout = new QHBoxLayout();
-    auto* modeLabel = new QLabel(tr("Falloff mode:"), _groupInfluence);
-    _comboInfluenceMode = new QComboBox(_groupInfluence);
-    _comboInfluenceMode->addItem(tr("Grid (square)"), static_cast<int>(SegmentationInfluenceMode::GridChebyshev));
-    _comboInfluenceMode->addItem(tr("Geodesic (circular)"), static_cast<int>(SegmentationInfluenceMode::GeodesicCircular));
-    _comboInfluenceMode->addItem(tr("Row / Column"), static_cast<int>(SegmentationInfluenceMode::RowColumn));
-    _comboInfluenceMode->setToolTip(tr("Choose how handle influence decays across the surface"));
-    int modeIndex = _comboInfluenceMode->findData(static_cast<int>(_influenceMode));
-    if (modeIndex >= 0) {
-        _comboInfluenceMode->setCurrentIndex(modeIndex);
-    }
-    modeLayout->addWidget(modeLabel);
-    modeLayout->addWidget(_comboInfluenceMode);
-    modeLayout->addStretch();
-    influenceGrid->addLayout(modeLayout, 0, 0);
-
-    auto* rowColLayout = new QHBoxLayout();
-    auto* rowColLabel = new QLabel(tr("Preference:"), _groupInfluence);
-    _comboRowColMode = new QComboBox(_groupInfluence);
-    _comboRowColMode->addItem(tr("Row only"), static_cast<int>(SegmentationRowColMode::RowOnly));
-    _comboRowColMode->addItem(tr("Column only"), static_cast<int>(SegmentationRowColMode::ColumnOnly));
-    _comboRowColMode->addItem(tr("Dynamic"), static_cast<int>(SegmentationRowColMode::Dynamic));
-    _comboRowColMode->setToolTip(tr("When using Row / Column mode, choose if influence spreads along rows, columns, or matches the viewer orientation"));
-    int rowColIndex = _comboRowColMode->findData(static_cast<int>(_rowColMode));
-    if (rowColIndex >= 0) {
-        _comboRowColMode->setCurrentIndex(rowColIndex);
-    }
-    rowColLayout->addWidget(rowColLabel);
-    rowColLayout->addWidget(_comboRowColMode);
-    rowColLayout->addStretch();
-    influenceGrid->addLayout(rowColLayout, 0, 1);
-    _comboRowColMode->setEnabled(false);
-
-    auto* radiusLayout = new QHBoxLayout();
-    auto* radiusLabel = new QLabel(tr("Radius:"), _groupInfluence);
-    _spinRadius = new QSpinBox(_groupInfluence);
-    _spinRadius->setRange(1, 32);
-    _spinRadius->setSingleStep(1);
-    _spinRadius->setValue(static_cast<int>(std::lround(_radius)));
-    _spinRadius->setSuffix(tr(" steps"));
-    _spinRadius->setToolTip(tr("Number of grid steps (Chebyshev) influenced around the active handle"));
-    radiusLayout->addWidget(radiusLabel);
-    radiusLayout->addWidget(_spinRadius);
-    radiusLayout->addStretch();
-    influenceGrid->addLayout(radiusLayout, 1, 0);
-
-    auto* sigmaLayout = new QHBoxLayout();
-    auto* sigmaLabel = new QLabel(tr("Strength (sigma):"), _groupInfluence);
-    _spinSigma = new QDoubleSpinBox(_groupInfluence);
-    _spinSigma->setDecimals(2);
-    _spinSigma->setRange(0.10, 2.00);
-    _spinSigma->setSingleStep(0.05);
-    _spinSigma->setValue(static_cast<double>(_sigma));
-    _spinSigma->setSuffix(tr(" x"));
-    _spinSigma->setToolTip(tr("Multiplier for how strongly neighbouring grid points follow the dragged handle"));
-    sigmaLayout->addWidget(sigmaLabel);
-    sigmaLayout->addWidget(_spinSigma);
-    sigmaLayout->addStretch();
-    influenceGrid->addLayout(sigmaLayout, 1, 1);
-    influenceGrid->setColumnStretch(0, 1);
-    influenceGrid->setColumnStretch(1, 1);
-
-    layout->addWidget(_groupInfluence);
-
-    _groupSliceVisibility = new QGroupBox(tr("Slice Visibility"), this);
-    auto* sliceLayout = new QVBoxLayout(_groupSliceVisibility);
-
-    auto* sliceFadeLayout = new QHBoxLayout();
-    auto* sliceFadeLabel = new QLabel(tr("Fade distance:"), _groupSliceVisibility);
-    _spinSliceFadeDistance = new QDoubleSpinBox(_groupSliceVisibility);
-    _spinSliceFadeDistance->setDecimals(1);
-    _spinSliceFadeDistance->setRange(0.1, 500.0);
-    _spinSliceFadeDistance->setSingleStep(0.5);
-    _spinSliceFadeDistance->setValue(static_cast<double>(_sliceFadeDistance));
-    _spinSliceFadeDistance->setToolTip(tr("World-space distance from the slice plane where handles begin to fade or hide"));
-    sliceFadeLayout->addWidget(sliceFadeLabel);
-    sliceFadeLayout->addWidget(_spinSliceFadeDistance);
-    sliceFadeLayout->addStretch();
-    sliceLayout->addLayout(sliceFadeLayout);
-
-    auto* sliceModeLayout = new QHBoxLayout();
-    auto* sliceModeLabel = new QLabel(tr("Beyond distance:"), _groupSliceVisibility);
-    _comboSliceDisplayMode = new QComboBox(_groupSliceVisibility);
-    _comboSliceDisplayMode->addItem(tr("Fade"), static_cast<int>(SegmentationSliceDisplayMode::Fade));
-    _comboSliceDisplayMode->addItem(tr("Hide"), static_cast<int>(SegmentationSliceDisplayMode::Hide));
-    int sliceModeIndex = _comboSliceDisplayMode->findData(static_cast<int>(_sliceDisplayMode));
-    if (sliceModeIndex >= 0) {
-        _comboSliceDisplayMode->setCurrentIndex(sliceModeIndex);
-    }
-    _comboSliceDisplayMode->setToolTip(tr("Choose whether slice viewers fade handles out or hide them past the distance"));
-    sliceModeLayout->addWidget(sliceModeLabel);
-    sliceModeLayout->addWidget(_comboSliceDisplayMode);
-    sliceModeLayout->addStretch();
-    sliceLayout->addLayout(sliceModeLayout);
-
-    layout->addWidget(_groupSliceVisibility);
-
-    _groupHole = new QGroupBox(tr("Hole Filling"), this);
-    auto* holeLayout = new QVBoxLayout(_groupHole);
-
-    _chkFillInvalidRegions = new QCheckBox(tr("Fill invalid regions"), _groupHole);
-    _chkFillInvalidRegions->setChecked(_fillInvalidRegions);
-    _chkFillInvalidRegions->setToolTip(tr("When enabled, gap clicks try to solve and smooth missing grid cells before adding a handle."));
-    holeLayout->addWidget(_chkFillInvalidRegions);
-
-    auto* holeRadiusLayout = new QHBoxLayout();
-    auto* holeRadiusLabel = new QLabel(tr("Search radius:"), _groupHole);
-    _spinHoleRadius = new QSpinBox(_groupHole);
-    _spinHoleRadius->setRange(1, 64);
-    _spinHoleRadius->setSingleStep(1);
-    _spinHoleRadius->setValue(_holeSearchRadius);
-    _spinHoleRadius->setSuffix(tr(" cells"));
-    _spinHoleRadius->setToolTip(tr("Maximum grid distance flood-filled when creating new points inside holes"));
-    holeRadiusLayout->addWidget(holeRadiusLabel);
-    holeRadiusLayout->addWidget(_spinHoleRadius);
-    holeRadiusLayout->addStretch();
-    holeLayout->addLayout(holeRadiusLayout);
-
-    auto* holeIterationsLayout = new QHBoxLayout();
-    auto* holeIterationsLabel = new QLabel(tr("Relax iterations:"), _groupHole);
-    _spinHoleIterations = new QSpinBox(_groupHole);
-    _spinHoleIterations->setRange(1, 200);
-    _spinHoleIterations->setSingleStep(1);
-    _spinHoleIterations->setValue(_holeSmoothIterations);
-    _spinHoleIterations->setToolTip(tr("Number of smoothing passes applied to the filled patch"));
-    holeIterationsLayout->addWidget(holeIterationsLabel);
-    holeIterationsLayout->addWidget(_spinHoleIterations);
-    holeIterationsLayout->addStretch();
-    holeLayout->addLayout(holeIterationsLayout);
-
-    layout->addWidget(_groupHole);
-
-    _groupHandleDisplay = new QGroupBox(tr("Handle Display"), this);
-    auto* handleDisplayLayout = new QVBoxLayout(_groupHandleDisplay);
-
-    _chkShowHandles = new QCheckBox(tr("Render handles"), _groupHandleDisplay);
-    _chkShowHandles->setToolTip(tr("Toggle drawing of segmentation handles in the viewers"));
-    handleDisplayLayout->addWidget(_chkShowHandles);
-
-    _chkHandlesAlwaysVisible = new QCheckBox(tr("Show all handles"), _groupHandleDisplay);
-    _chkHandlesAlwaysVisible->setChecked(_handlesAlwaysVisible);
-    _chkHandlesAlwaysVisible->setToolTip(tr("When unchecked, only handles within the specified world distance from the cursor are shown"));
-    handleDisplayLayout->addWidget(_chkHandlesAlwaysVisible);
-
-    auto* handleDistanceLayout = new QHBoxLayout();
-    auto* handleDistanceLabel = new QLabel(tr("Display distance:"), _groupHandleDisplay);
-    _spinHandleDisplayDistance = new QDoubleSpinBox(_groupHandleDisplay);
-    _spinHandleDisplayDistance->setRange(1.0, 500.0);
-    _spinHandleDisplayDistance->setSingleStep(1.0);
-    _spinHandleDisplayDistance->setDecimals(1);
-    _spinHandleDisplayDistance->setValue(static_cast<double>(_handleDisplayDistance));
-    _spinHandleDisplayDistance->setToolTip(tr("Maximum world-space distance from the cursor used to show nearby handles"));
-    handleDistanceLayout->addWidget(handleDistanceLabel);
-    handleDistanceLayout->addWidget(_spinHandleDisplayDistance);
-    handleDistanceLayout->addStretch();
-    handleDisplayLayout->addLayout(handleDistanceLayout);
-
-    auto* highlightLayout = new QHBoxLayout();
-    auto* highlightLabel = new QLabel(tr("Highlight distance:"), _groupHandleDisplay);
-    _spinHighlightDistance = new QDoubleSpinBox(_groupHandleDisplay);
-    _spinHighlightDistance->setRange(0.5, 500.0);
-    _spinHighlightDistance->setSingleStep(0.5);
-    _spinHighlightDistance->setDecimals(1);
-    _spinHighlightDistance->setValue(static_cast<double>(_highlightDistance));
-    _spinHighlightDistance->setToolTip(tr("Screen-space radius (pixels) used to select the nearest handle for hover highlighting"));
-    highlightLayout->addWidget(highlightLabel);
-    highlightLayout->addWidget(_spinHighlightDistance);
-    highlightLayout->addStretch();
-    handleDisplayLayout->addLayout(highlightLayout);
-
-    layout->addWidget(_groupHandleDisplay);
 
     _groupCorrections = new QGroupBox(tr("Corrections"), this);
     auto* correctionsLayout = new QVBoxLayout(_groupCorrections);
 
-    _btnCorrectionsNew = new QPushButton(tr("New set (T)"), _groupCorrections);
-    _btnCorrectionsNew->setToolTip(tr("Create a new correction collection (shortcut: T)"));
-    correctionsLayout->addWidget(_btnCorrectionsNew);
-
-    auto* correctionsRow = new QHBoxLayout();
+    auto* correctionsComboRow = new QHBoxLayout();
     auto* correctionsLabel = new QLabel(tr("Active set:"), _groupCorrections);
     _comboCorrections = new QComboBox(_groupCorrections);
-    _comboCorrections->addItem(tr("None"), static_cast<qulonglong>(0));
-    correctionsRow->addWidget(correctionsLabel);
-    correctionsRow->addWidget(_comboCorrections);
+    _comboCorrections->setEnabled(false);
+    correctionsComboRow->addWidget(correctionsLabel);
+    correctionsComboRow->addStretch(1);
+    correctionsComboRow->addWidget(_comboCorrections, 1);
+    correctionsLayout->addLayout(correctionsComboRow);
 
-    correctionsRow->addSpacing(12);
+    _btnCorrectionsNew = new QPushButton(tr("New correction set"), _groupCorrections);
+    correctionsLayout->addWidget(_btnCorrectionsNew);
+
     _chkCorrectionsAnnotate = new QCheckBox(tr("Annotate corrections"), _groupCorrections);
-    _chkCorrectionsAnnotate->setToolTip(tr("When enabled, left-clicks add points to the active correction set; Ctrl+click removes the nearest point."));
-    correctionsRow->addWidget(_chkCorrectionsAnnotate);
-    correctionsRow->addStretch();
-    correctionsLayout->addLayout(correctionsRow);
+    correctionsLayout->addWidget(_chkCorrectionsAnnotate);
 
+    auto* zRow = new QHBoxLayout();
+    _chkCorrectionsUseZRange = new QCheckBox(tr("Limit Z range"), _groupCorrections);
+    zRow->addWidget(_chkCorrectionsUseZRange);
+    zRow->addSpacing(12);
+    auto* zMinLabel = new QLabel(tr("Z min"), _groupCorrections);
+    _spinCorrectionsZMin = new QSpinBox(_groupCorrections);
+    _spinCorrectionsZMin->setRange(-100000, 100000);
+    auto* zMaxLabel = new QLabel(tr("Z max"), _groupCorrections);
+    _spinCorrectionsZMax = new QSpinBox(_groupCorrections);
+    _spinCorrectionsZMax->setRange(-100000, 100000);
+    zRow->addWidget(zMinLabel);
+    zRow->addWidget(_spinCorrectionsZMin);
+    zRow->addSpacing(8);
+    zRow->addWidget(zMaxLabel);
+    zRow->addWidget(_spinCorrectionsZMax);
+    correctionsLayout->addLayout(zRow);
+
+    _groupCorrections->setLayout(correctionsLayout);
     layout->addWidget(_groupCorrections);
 
-    auto* actionsLayout = new QHBoxLayout();
+    auto* buttons = new QHBoxLayout();
     _btnApply = new QPushButton(tr("Apply"), this);
-    _btnApply->setDefault(true);
     _btnReset = new QPushButton(tr("Reset"), this);
-    actionsLayout->addWidget(_btnApply);
-    actionsLayout->addWidget(_btnReset);
-    layout->addLayout(actionsLayout);
+    _btnStop = new QPushButton(tr("Stop tools"), this);
+    buttons->addWidget(_btnApply);
+    buttons->addWidget(_btnReset);
+    buttons->addWidget(_btnStop);
+    layout->addLayout(buttons);
 
-    _btnStopTools = new QPushButton(tr("Stop"), this);
-    layout->addWidget(_btnStopTools);
+    layout->addStretch(1);
 
-    layout->addStretch();
-
-    restoreSettings();
-    updateAdvancedVisibility();
-
-    // Signal wiring
     connect(_chkEditing, &QCheckBox::toggled, this, [this](bool enabled) {
-        setEditingEnabled(enabled);
+        if (_editingEnabled == enabled) {
+            return;
+        }
+        _editingEnabled = enabled;
+        writeSetting(QStringLiteral("editing_enabled"), _editingEnabled);
+        syncUiState();
         emit editingModeChanged(enabled);
     });
 
-    connect(_chkAdvancedSettings, &QCheckBox::toggled, this, [this](bool enabled) {
-        if (_showAdvancedSettings == enabled) {
+    auto connectDirectionCheckbox = [this](QCheckBox* box) {
+        if (!box) {
             return;
         }
-        _showAdvancedSettings = enabled;
-        writeSetting(QStringLiteral("show_advanced_settings"), enabled);
-        updateAdvancedVisibility();
-        emit advancedSettingsToggled(enabled);
+        connect(box, &QCheckBox::toggled, this, [this, box](bool) {
+            updateGrowthDirectionMaskFromUi(box);
+        });
+    };
+    connectDirectionCheckbox(_chkGrowthDirUp);
+    connectDirectionCheckbox(_chkGrowthDirDown);
+    connectDirectionCheckbox(_chkGrowthDirLeft);
+    connectDirectionCheckbox(_chkGrowthDirRight);
+
+    connect(_spinGrowthSteps, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        value = std::clamp(value, 1, 1024);
+        if (_growthSteps == value) {
+            return;
+        }
+        _growthSteps = value;
+        writeSetting(QStringLiteral("growth_steps"), _growthSteps);
     });
 
-    connect(_spinDownsample, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (value == _downsample) {
-            return;
+    connect(_btnGrow, &QPushButton::clicked, this, [this]() {
+        const auto allowed = allowedGrowthDirections();
+        SegmentationGrowthDirection direction = SegmentationGrowthDirection::All;
+        if (allowed.size() == 1) {
+            direction = allowed.front();
         }
-        _downsample = value;
-        writeSetting(QStringLiteral("downsample"), _downsample);
-        emit downsampleChanged(value);
+        qCInfo(lcSegWidget) << "Grow pressed" << segmentationGrowthMethodToString(_growthMethod)
+                            << segmentationGrowthDirectionToString(direction)
+                            << "steps" << _growthSteps;
+        emit growSurfaceRequested(_growthMethod, direction, _growthSteps);
     });
 
-    connect(_spinRadius, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        float radius = static_cast<float>(value);
-        if (std::fabs(radius - _radius) < 1e-4f) {
+    connect(_comboVolumes, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (index < 0) {
             return;
         }
-        _radius = radius;
-        writeSetting(QStringLiteral("radius_steps"), static_cast<int>(std::lround(_radius)));
-        emit radiusChanged(radius);
+        const QString volumeId = _comboVolumes->itemData(index).toString();
+        if (volumeId.isEmpty() || volumeId == _activeVolumeId) {
+            return;
+        }
+        _activeVolumeId = volumeId;
+        emit volumeSelectionChanged(volumeId);
+    });
+
+    connect(_spinRadius, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        setRadius(static_cast<float>(value));
+        emit radiusChanged(_radiusSteps);
     });
 
     connect(_spinSigma, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        float sigma = std::max(0.10f, static_cast<float>(value));
-        if (std::fabs(sigma - _sigma) < 1e-4f) {
-            return;
-        }
-        _sigma = sigma;
-        writeSetting(QStringLiteral("strength"), _sigma);
-        emit sigmaChanged(sigma);
+        setSigma(static_cast<float>(value));
+        emit sigmaChanged(_sigmaSteps);
     });
 
-    connect(_comboInfluenceMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        if (index < 0) {
-            return;
-        }
-        const QVariant modeData = _comboInfluenceMode->itemData(index);
-        if (!modeData.isValid()) {
-            return;
-        }
-        const auto mode = static_cast<SegmentationInfluenceMode>(modeData.toInt());
-        if (mode == _influenceMode) {
-            return;
-        }
-        _influenceMode = mode;
-        writeSetting(QStringLiteral("influence_mode"), static_cast<int>(_influenceMode));
-        if (_comboRowColMode) {
-            _comboRowColMode->setEnabled(_editingEnabled && _influenceMode == SegmentationInfluenceMode::RowColumn);
-        }
-        emit influenceModeChanged(_influenceMode);
+    connect(_directionFieldPathEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
+        _directionFieldPath = text.trimmed();
     });
 
-    connect(_comboRowColMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        if (index < 0) {
+    connect(_directionFieldBrowseButton, &QToolButton::clicked, this, [this]() {
+        const QString initial = _directionFieldPath.isEmpty() ? QDir::homePath() : _directionFieldPath;
+        const QString dir = QFileDialog::getExistingDirectory(this, tr("Select direction field"), initial);
+        if (dir.isEmpty()) {
             return;
         }
-        const QVariant modeData = _comboRowColMode->itemData(index);
-        if (!modeData.isValid()) {
-            return;
-        }
-        const auto mode = static_cast<SegmentationRowColMode>(modeData.toInt());
-        if (mode == _rowColMode) {
-            return;
-        }
-        _rowColMode = mode;
-        writeSetting(QStringLiteral("row_col_mode"), static_cast<int>(_rowColMode));
-        emit rowColModeChanged(_rowColMode);
+        _directionFieldPath = dir;
+        _directionFieldPathEdit->setText(dir);
     });
 
-    connect(_spinSliceFadeDistance, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        float distance = static_cast<float>(std::max(0.1, value));
-        if (std::fabs(distance - _sliceFadeDistance) < 1e-4f) {
-            return;
-        }
-        _sliceFadeDistance = distance;
-        writeSetting(QStringLiteral("slice_fade_distance"), _sliceFadeDistance);
-        emit sliceFadeDistanceChanged(_sliceFadeDistance);
+    connect(_comboDirectionFieldOrientation, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        _directionFieldOrientation = segmentationDirectionFieldOrientationFromInt(
+            _comboDirectionFieldOrientation->itemData(index).toInt());
     });
 
-    connect(_comboSliceDisplayMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        if (index < 0) {
-            return;
-        }
-        const QVariant modeData = _comboSliceDisplayMode->itemData(index);
-        if (!modeData.isValid()) {
-            return;
-        }
-        const auto mode = static_cast<SegmentationSliceDisplayMode>(modeData.toInt());
-        if (mode == _sliceDisplayMode) {
-            return;
-        }
-        _sliceDisplayMode = mode;
-        writeSetting(QStringLiteral("slice_display_mode"), static_cast<int>(_sliceDisplayMode));
-        emit sliceDisplayModeChanged(_sliceDisplayMode);
+    connect(_comboDirectionFieldScale, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        _directionFieldScale = _comboDirectionFieldScale->itemData(index).toInt();
     });
 
-    connect(_spinHighlightDistance, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        float distance = static_cast<float>(std::max(0.5, value));
-        if (std::fabs(distance - _highlightDistance) < 1e-4f) {
+    connect(_spinDirectionFieldWeight, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        _directionFieldWeight = value;
+    });
+
+    connect(_directionFieldAddButton, &QPushButton::clicked, this, [this]() {
+        auto config = buildDirectionFieldDraft();
+        if (!config.isValid()) {
+            qCInfo(lcSegWidget) << "Ignoring direction field add; path empty";
             return;
         }
-        _highlightDistance = distance;
-        writeSetting(QStringLiteral("highlight_distance"), _highlightDistance);
-        emit highlightDistanceChanged(_highlightDistance);
+        _directionFields.push_back(std::move(config));
+        refreshDirectionFieldList();
+        persistDirectionFields();
+    });
+
+    connect(_directionFieldRemoveButton, &QPushButton::clicked, this, [this]() {
+        const int row = _directionFieldList ? _directionFieldList->currentRow() : -1;
+        if (row < 0 || row >= static_cast<int>(_directionFields.size())) {
+            return;
+        }
+        _directionFields.erase(_directionFields.begin() + row);
+        refreshDirectionFieldList();
+        persistDirectionFields();
+    });
+
+    connect(_directionFieldList, &QListWidget::currentRowChanged, this, [this](int row) {
+        if (_directionFieldRemoveButton) {
+            _directionFieldRemoveButton->setEnabled(_editingEnabled && row >= 0);
+        }
     });
 
     connect(_comboCorrections, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
         if (index < 0) {
-            _activeCorrectionId.reset();
             emit correctionsCollectionSelected(0);
             return;
         }
         const QVariant data = _comboCorrections->itemData(index);
-        const uint64_t collectionId = static_cast<uint64_t>(data.toULongLong());
-        if (collectionId == 0) {
-            _activeCorrectionId.reset();
-        } else {
-            _activeCorrectionId = collectionId;
-        }
-        emit correctionsCollectionSelected(collectionId);
+        emit correctionsCollectionSelected(data.toULongLong());
     });
 
     connect(_btnCorrectionsNew, &QPushButton::clicked, this, [this]() {
@@ -685,18 +380,18 @@ void SegmentationWidget::setupUI()
 
     connect(_chkCorrectionsUseZRange, &QCheckBox::toggled, this, [this](bool enabled) {
         _correctionsZRangeEnabled = enabled;
+        writeSetting(QStringLiteral("corrections_z_range_enabled"), _correctionsZRangeEnabled);
         if (_spinCorrectionsZMin) {
             _spinCorrectionsZMin->setEnabled(enabled);
         }
         if (_spinCorrectionsZMax) {
             _spinCorrectionsZMax->setEnabled(enabled);
         }
-        writeSetting(QStringLiteral("corrections_z_range_enabled"), enabled);
         emit correctionsZRangeChanged(enabled, _correctionsZMin, _correctionsZMax);
     });
 
     connect(_spinCorrectionsZMin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (value == _correctionsZMin) {
+        if (_correctionsZMin == value) {
             return;
         }
         _correctionsZMin = value;
@@ -707,7 +402,7 @@ void SegmentationWidget::setupUI()
     });
 
     connect(_spinCorrectionsZMax, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (value == _correctionsZMax) {
+        if (_correctionsZMax == value) {
             return;
         }
         _correctionsZMax = value;
@@ -717,555 +412,44 @@ void SegmentationWidget::setupUI()
         }
     });
 
-    connect(_directionFieldBrowseButton, &QToolButton::clicked, this, [this]() {
-        QString start;
-        if (_directionFieldPathEdit) {
-            start = _directionFieldPathEdit->text().trimmed();
-        }
-        if (start.isEmpty() && !_volumePackagePath.isEmpty()) {
-            start = _volumePackagePath;
-        }
-        const QString selected = QFileDialog::getExistingDirectory(this,
-                                                                   tr("Select Direction Field OME-Zarr"),
-                                                                   start);
-        if (!selected.isEmpty() && _directionFieldPathEdit) {
-            _directionFieldPathEdit->setText(selected);
-        }
-    });
-
-    connect(_directionFieldPathEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
-        const QString trimmed = text.trimmed();
-        if (trimmed == _directionFieldPath) {
-            return;
-        }
-        _directionFieldPath = trimmed;
-        writeSetting(QStringLiteral("direction_field_path"), _directionFieldPath);
-
-        if (_updatingDirectionFieldForm) {
-            return;
-        }
-
-        const int row = (_directionFieldList ? _directionFieldList->currentRow() : -1);
-        if (row >= 0 && row < static_cast<int>(_directionFields.size())) {
-            auto& config = _directionFields[static_cast<std::size_t>(row)];
-            if (config.path != trimmed) {
-                config.path = trimmed;
-                persistDirectionFields();
-                refreshDirectionFieldList();
-            }
-        }
-    });
-
-    connect(_comboDirectionFieldOrientation, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        if (index < 0) {
-            return;
-        }
-        const QVariant data = _comboDirectionFieldOrientation->itemData(index);
-        if (!data.isValid()) {
-            return;
-        }
-        const auto orientation = segmentationDirectionFieldOrientationFromInt(data.toInt());
-        if (orientation == _directionFieldOrientation) {
-            return;
-        }
-        _directionFieldOrientation = orientation;
-        writeSetting(QStringLiteral("direction_field_orientation"), static_cast<int>(_directionFieldOrientation));
-
-        if (_updatingDirectionFieldForm) {
-            return;
-        }
-
-        const int row = (_directionFieldList ? _directionFieldList->currentRow() : -1);
-        if (row >= 0 && row < static_cast<int>(_directionFields.size())) {
-            auto& config = _directionFields[static_cast<std::size_t>(row)];
-            if (config.orientation != orientation) {
-                config.orientation = orientation;
-                persistDirectionFields();
-                refreshDirectionFieldList();
-            }
-        }
-    });
-
-    connect(_comboDirectionFieldScale, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        if (index < 0) {
-            return;
-        }
-        const QVariant data = _comboDirectionFieldScale->itemData(index);
-        if (!data.isValid()) {
-            return;
-        }
-        const int scaleValue = std::clamp(data.toInt(), 0, 5);
-        if (scaleValue == _directionFieldScale) {
-            return;
-        }
-        _directionFieldScale = scaleValue;
-        writeSetting(QStringLiteral("direction_field_scale"), _directionFieldScale);
-
-        if (_updatingDirectionFieldForm) {
-            return;
-        }
-
-        const int row = (_directionFieldList ? _directionFieldList->currentRow() : -1);
-        if (row >= 0 && row < static_cast<int>(_directionFields.size())) {
-            auto& config = _directionFields[static_cast<std::size_t>(row)];
-            if (config.scale != scaleValue) {
-                config.scale = scaleValue;
-                persistDirectionFields();
-                refreshDirectionFieldList();
-            }
-        }
-    });
-
-    connect(_spinDirectionFieldWeight, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        const double clamped = std::clamp(value, 0.0, 10.0);
-        if (std::abs(clamped - _directionFieldWeight) < 1e-4) {
-            return;
-        }
-        _directionFieldWeight = clamped;
-        if (std::abs(clamped - value) > 1e-4) {
-            const QSignalBlocker blocker(_spinDirectionFieldWeight);
-            _spinDirectionFieldWeight->setValue(clamped);
-        }
-        writeSetting(QStringLiteral("direction_field_weight"), _directionFieldWeight);
-
-        if (_updatingDirectionFieldForm) {
-            return;
-        }
-
-        const int row = (_directionFieldList ? _directionFieldList->currentRow() : -1);
-        if (row >= 0 && row < static_cast<int>(_directionFields.size())) {
-            auto& config = _directionFields[static_cast<std::size_t>(row)];
-            if (std::abs(config.weight - clamped) > 1e-4) {
-                config.weight = clamped;
-                persistDirectionFields();
-                refreshDirectionFieldList();
-            }
-        }
-    });
-
-    connect(_directionFieldAddButton, &QPushButton::clicked, this, [this]() {
-        auto config = buildDirectionFieldDraft();
-        if (!config.isValid()) {
-            qCInfo(lcSegWidget) << "Ignoring direction field add with empty path";
-            return;
-        }
-
-        _directionFields.push_back(std::move(config));
-        persistDirectionFields();
-        refreshDirectionFieldList();
-        if (_directionFieldList) {
-            _directionFieldList->setCurrentRow(static_cast<int>(_directionFields.size()) - 1);
-        }
-    });
-
-    connect(_directionFieldRemoveButton, &QPushButton::clicked, this, [this]() {
-        if (!_directionFieldList) {
-            return;
-        }
-        const int row = _directionFieldList->currentRow();
-        if (row < 0 || row >= static_cast<int>(_directionFields.size())) {
-            return;
-        }
-
-        _directionFields.erase(_directionFields.begin() + row);
-        persistDirectionFields();
-        refreshDirectionFieldList();
-    });
-
-    connect(_directionFieldList, &QListWidget::currentRowChanged, this, [this](int row) {
-        const bool validRow = row >= 0 && row < static_cast<int>(_directionFields.size());
-        if (_directionFieldRemoveButton) {
-            _directionFieldRemoveButton->setEnabled(_editingEnabled && validRow);
-        }
-        if (validRow) {
-            loadDirectionFieldIntoForm(_directionFields[static_cast<std::size_t>(row)]);
-        }
-    });
-
-    auto connectDirectionCheckbox = [this](QCheckBox* box) {
-        if (!box) {
-            return;
-        }
-        connect(box, &QCheckBox::toggled, this, [this, box](bool) {
-            updateGrowthDirectionMaskFromUi(box);
-        });
-    };
-
-    connectDirectionCheckbox(_chkGrowthDirUp);
-    connectDirectionCheckbox(_chkGrowthDirDown);
-    connectDirectionCheckbox(_chkGrowthDirLeft);
-    connectDirectionCheckbox(_chkGrowthDirRight);
-
-    connect(_spinGrowthSteps, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (value == _growthSteps) {
-            return;
-        }
-        _growthSteps = std::max(0, value);
-        writeSetting(QStringLiteral("growth_steps"), _growthSteps);
-    });
-
-    connect(_btnGrow, &QPushButton::clicked, this, [this]() {
-        const auto allowed = allowedGrowthDirections();
-        SegmentationGrowthDirection direction = SegmentationGrowthDirection::All;
-        if (allowed.size() == 1) {
-            direction = allowed.front();
-        }
-
-        qCInfo(lcSegWidget) << "Grow pressed"
-                            << segmentationGrowthDirectionToString(direction)
-                            << "steps" << _growthSteps
-                            << "advanced" << _showAdvancedSettings;
-        emit growSurfaceRequested(direction, _growthSteps);
-    });
-
-    connect(_comboVolume, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        if (index < 0) {
-            return;
-        }
-        const QVariant idData = _comboVolume->itemData(index);
-        const QString volumeId = idData.toString();
-        if (volumeId.isEmpty() || volumeId == _activeVolumeId) {
-            return;
-        }
-        _activeVolumeId = volumeId;
-        emit volumeSelectionChanged(volumeId);
-    });
-
-    connect(_spinHoleRadius, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        value = std::clamp(value, 1, 64);
-        if (value == _holeSearchRadius) {
-            return;
-        }
-        _holeSearchRadius = value;
-        writeSetting(QStringLiteral("hole_search_radius"), _holeSearchRadius);
-        emit holeSearchRadiusChanged(value);
-    });
-
-    connect(_spinHoleIterations, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        value = std::clamp(value, 1, 200);
-        if (value == _holeSmoothIterations) {
-            return;
-        }
-        _holeSmoothIterations = value;
-        writeSetting(QStringLiteral("hole_smooth_iterations"), _holeSmoothIterations);
-        emit holeSmoothIterationsChanged(value);
-    });
-
-    connect(_chkFillInvalidRegions, &QCheckBox::toggled, this, [this](bool checked) {
-        if (checked == _fillInvalidRegions) {
-            return;
-        }
-        _fillInvalidRegions = checked;
-        writeSetting(QStringLiteral("fill_invalid_regions"), _fillInvalidRegions);
-        emit fillInvalidRegionsChanged(checked);
-    });
-
-    connect(_chkShowHandles, &QCheckBox::toggled, this, [this](bool checked) {
-        if (checked == _showHandles) {
-            return;
-        }
-        _showHandles = checked;
-        writeSetting(QStringLiteral("show_handles"), _showHandles);
-        updateAdvancedVisibility();
-        emit handlesVisibilityChanged(_showHandles);
-    });
-
-    connect(_chkHandlesAlwaysVisible, &QCheckBox::toggled, this, [this](bool checked) {
-        if (checked == _handlesAlwaysVisible) {
-            return;
-        }
-        _handlesAlwaysVisible = checked;
-        writeSetting(QStringLiteral("handles_always_visible"), _handlesAlwaysVisible);
-        updateAdvancedVisibility();
-        emit handlesAlwaysVisibleChanged(checked);
-    });
-
-    connect(_spinHandleDisplayDistance, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        float distance = static_cast<float>(std::max(1.0, value));
-        if (std::fabs(distance - _handleDisplayDistance) < 1e-4f) {
-            return;
-        }
-        _handleDisplayDistance = distance;
-        writeSetting(QStringLiteral("handle_display_distance"), _handleDisplayDistance);
-        emit handleDisplayDistanceChanged(_handleDisplayDistance);
-    });
-
-    connect(_btnApply, &QPushButton::clicked, this, [this]() {
-        emit applyRequested();
-    });
-
-    connect(_btnReset, &QPushButton::clicked, this, [this]() {
-        emit resetRequested();
-    });
-
-    connect(_btnStopTools, &QPushButton::clicked, this, [this]() {
-        emit stopToolsRequested();
-    });
-
-    connect(_btnMaskEdit, &QPushButton::toggled, this, [this](bool checked) {
-        setMaskEditingActive(checked);
-        emit maskEditingToggled(checked);
-    });
-
-    connect(_btnMaskApply, &QPushButton::clicked, this, [this]() {
-        emit maskApplyRequested();
-    });
-
-    connect(_spinMaskSampling, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        setMaskSampling(value);
-    });
-
-    connect(_spinMaskRadius, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        setMaskBrushRadius(value);
-    });
-    setPendingChanges(false);
+    connect(_btnApply, &QPushButton::clicked, this, &SegmentationWidget::applyRequested);
+    connect(_btnReset, &QPushButton::clicked, this, &SegmentationWidget::resetRequested);
+    connect(_btnStop, &QPushButton::clicked, this, &SegmentationWidget::stopToolsRequested);
 }
 
-void SegmentationWidget::setEditingEnabled(bool enabled)
+void SegmentationWidget::syncUiState()
 {
-    if (_editingEnabled == enabled) {
-        return;
+    if (_chkEditing) {
+        const QSignalBlocker blocker(_chkEditing);
+        _chkEditing->setChecked(_editingEnabled);
     }
 
-    _editingEnabled = enabled;
-    const QSignalBlocker blocker(_chkEditing);
-    _chkEditing->setChecked(enabled);
-    if (!enabled) {
-        _hasPendingChanges = false;
-    }
-    updateEditingUi();
-}
-
-void SegmentationWidget::setDownsample(int value)
-{
-    value = std::clamp(value, 2, 64);
-    if (value == _downsample) {
-        return;
-    }
-    _downsample = value;
-    const QSignalBlocker blocker(_spinDownsample);
-    _spinDownsample->setValue(value);
-    writeSetting(QStringLiteral("downsample"), _downsample);
-}
-
-void SegmentationWidget::setRadius(float value)
-{
-    const int snapped = std::max(1, static_cast<int>(std::lround(value)));
-    const float radius = static_cast<float>(snapped);
-    if (std::fabs(radius - _radius) < 1e-4f) {
-        return;
-    }
-    _radius = radius;
-    const QSignalBlocker blocker(_spinRadius);
-    _spinRadius->setValue(snapped);
-    writeSetting(QStringLiteral("radius_steps"), snapped);
-}
-
-void SegmentationWidget::setSigma(float value)
-{
-    const float sigma = std::max(0.10f, value);
-    if (std::fabs(sigma - _sigma) < 1e-4f) {
-        return;
-    }
-    _sigma = sigma;
-    const QSignalBlocker blocker(_spinSigma);
-    _spinSigma->setValue(static_cast<double>(sigma));
-    writeSetting(QStringLiteral("strength"), _sigma);
-}
-
-void SegmentationWidget::setInfluenceMode(SegmentationInfluenceMode mode)
-{
-    if (_influenceMode == mode) {
-        return;
-    }
-    _influenceMode = mode;
-    if (_comboInfluenceMode) {
-        const QSignalBlocker blocker(_comboInfluenceMode);
-        int modeIndex = _comboInfluenceMode->findData(static_cast<int>(_influenceMode));
-        if (modeIndex >= 0) {
-            _comboInfluenceMode->setCurrentIndex(modeIndex);
+    if (_lblStatus) {
+        if (_editingEnabled) {
+            _lblStatus->setText(_pending ? tr("Editing enabled – pending changes")
+                                         : tr("Editing enabled"));
+        } else {
+            _lblStatus->setText(tr("Editing disabled"));
         }
     }
-    if (_comboRowColMode) {
-        _comboRowColMode->setEnabled(_editingEnabled && _influenceMode == SegmentationInfluenceMode::RowColumn);
-    }
-    writeSetting(QStringLiteral("influence_mode"), static_cast<int>(_influenceMode));
-}
 
-void SegmentationWidget::setSliceFadeDistance(float value)
-{
-    const float clamped = std::clamp(value, 0.1f, 500.0f);
-    if (std::fabs(clamped - _sliceFadeDistance) < 1e-4f) {
-        return;
+    if (_spinRadius) {
+        const QSignalBlocker blocker(_spinRadius);
+        _spinRadius->setValue(static_cast<double>(_radiusSteps));
     }
-    _sliceFadeDistance = clamped;
-    if (_spinSliceFadeDistance) {
-        const QSignalBlocker blocker(_spinSliceFadeDistance);
-        _spinSliceFadeDistance->setValue(static_cast<double>(_sliceFadeDistance));
-    }
-    writeSetting(QStringLiteral("slice_fade_distance"), _sliceFadeDistance);
-}
-
-void SegmentationWidget::setSliceDisplayMode(SegmentationSliceDisplayMode mode)
-{
-    if (_sliceDisplayMode == mode) {
-        return;
-    }
-    _sliceDisplayMode = mode;
-    if (_comboSliceDisplayMode) {
-        const QSignalBlocker blocker(_comboSliceDisplayMode);
-        int index = _comboSliceDisplayMode->findData(static_cast<int>(_sliceDisplayMode));
-        if (index >= 0) {
-            _comboSliceDisplayMode->setCurrentIndex(index);
-        }
-    }
-    writeSetting(QStringLiteral("slice_display_mode"), static_cast<int>(_sliceDisplayMode));
-}
-
-void SegmentationWidget::setRowColMode(SegmentationRowColMode mode)
-{
-    if (_rowColMode == mode) {
-        return;
-    }
-    _rowColMode = mode;
-    if (_comboRowColMode) {
-        const QSignalBlocker blocker(_comboRowColMode);
-        int idx = _comboRowColMode->findData(static_cast<int>(_rowColMode));
-        if (idx >= 0) {
-            _comboRowColMode->setCurrentIndex(idx);
-        }
-        _comboRowColMode->setEnabled(_editingEnabled && _influenceMode == SegmentationInfluenceMode::RowColumn);
-    }
-    writeSetting(QStringLiteral("row_col_mode"), static_cast<int>(_rowColMode));
-}
-
-void SegmentationWidget::setHoleSearchRadius(int value)
-{
-    value = std::clamp(value, 1, 64);
-    if (value == _holeSearchRadius) {
-        return;
-    }
-    _holeSearchRadius = value;
-    if (_spinHoleRadius) {
-        const QSignalBlocker blocker(_spinHoleRadius);
-        _spinHoleRadius->setValue(value);
-    }
-    writeSetting(QStringLiteral("hole_search_radius"), _holeSearchRadius);
-}
-
-void SegmentationWidget::setHoleSmoothIterations(int value)
-{
-    value = std::clamp(value, 1, 200);
-    if (value == _holeSmoothIterations) {
-        return;
-    }
-    _holeSmoothIterations = value;
-    if (_spinHoleIterations) {
-        const QSignalBlocker blocker(_spinHoleIterations);
-        _spinHoleIterations->setValue(value);
-    }
-    writeSetting(QStringLiteral("hole_smooth_iterations"), _holeSmoothIterations);
-}
-
-void SegmentationWidget::setHandlesAlwaysVisible(bool value)
-{
-    if (value == _handlesAlwaysVisible) {
-        return;
-    }
-    _handlesAlwaysVisible = value;
-    if (_chkHandlesAlwaysVisible) {
-        const QSignalBlocker blocker(_chkHandlesAlwaysVisible);
-        _chkHandlesAlwaysVisible->setChecked(value);
-    }
-    writeSetting(QStringLiteral("handles_always_visible"), _handlesAlwaysVisible);
-    updateAdvancedVisibility();
-}
-
-void SegmentationWidget::setHandleDisplayDistance(float value)
-{
-    const float clamped = std::clamp(value, 1.0f, 500.0f);
-    if (std::fabs(clamped - _handleDisplayDistance) < 1e-4f) {
-        return;
-    }
-    _handleDisplayDistance = clamped;
-    if (_spinHandleDisplayDistance) {
-        const QSignalBlocker blocker(_spinHandleDisplayDistance);
-        _spinHandleDisplayDistance->setValue(static_cast<double>(clamped));
-        _spinHandleDisplayDistance->setEnabled(_editingEnabled && !_handlesAlwaysVisible);
-    }
-    writeSetting(QStringLiteral("handle_display_distance"), _handleDisplayDistance);
-}
-
-void SegmentationWidget::setFillInvalidRegions(bool value)
-{
-    if (_fillInvalidRegions == value) {
-        return;
-    }
-    _fillInvalidRegions = value;
-    if (_chkFillInvalidRegions) {
-        const QSignalBlocker blocker(_chkFillInvalidRegions);
-        _chkFillInvalidRegions->setChecked(value);
-    }
-    writeSetting(QStringLiteral("fill_invalid_regions"), _fillInvalidRegions);
-}
-
-std::vector<SegmentationGrowthDirection> SegmentationWidget::allowedGrowthDirections() const
-{
-    std::vector<SegmentationGrowthDirection> selected;
-    if (_growthDirectionMask & kGrowDirUpBit) {
-        selected.push_back(SegmentationGrowthDirection::Up);
-    }
-    if (_growthDirectionMask & kGrowDirDownBit) {
-        selected.push_back(SegmentationGrowthDirection::Down);
-    }
-    if (_growthDirectionMask & kGrowDirLeftBit) {
-        selected.push_back(SegmentationGrowthDirection::Left);
-    }
-    if (_growthDirectionMask & kGrowDirRightBit) {
-        selected.push_back(SegmentationGrowthDirection::Right);
+    if (_spinSigma) {
+        const QSignalBlocker blocker(_spinSigma);
+        _spinSigma->setValue(static_cast<double>(_sigmaSteps));
     }
 
-    if (selected.empty()) {
-        selected = {
-            SegmentationGrowthDirection::Up,
-            SegmentationGrowthDirection::Down,
-            SegmentationGrowthDirection::Left,
-            SegmentationGrowthDirection::Right
-        };
+    if (_spinGrowthSteps) {
+        const QSignalBlocker blocker(_spinGrowthSteps);
+        _spinGrowthSteps->setValue(_growthSteps);
     }
-    return selected;
-}
 
-std::vector<SegmentationDirectionFieldConfig> SegmentationWidget::directionFieldConfigs() const
-{
-    std::vector<SegmentationDirectionFieldConfig> configs;
-    configs.reserve(_directionFields.size());
-    for (const auto& config : _directionFields) {
-        if (config.isValid()) {
-            configs.push_back(config);
-        }
-    }
-    return configs;
-}
-
-SegmentationDirectionFieldConfig SegmentationWidget::buildDirectionFieldDraft() const
-{
-    SegmentationDirectionFieldConfig config;
-    config.path = _directionFieldPath.trimmed();
-    config.orientation = _directionFieldOrientation;
-    config.scale = std::clamp(_directionFieldScale, 0, 5);
-    config.weight = std::clamp(_directionFieldWeight, 0.0, 10.0);
-    return config;
-}
-
-void SegmentationWidget::loadDirectionFieldIntoForm(const SegmentationDirectionFieldConfig& config)
-{
-    _updatingDirectionFieldForm = true;
-
-    _directionFieldPath = config.path.trimmed();
-    _directionFieldOrientation = config.orientation;
-    _directionFieldScale = std::clamp(config.scale, 0, 5);
-    _directionFieldWeight = std::clamp(config.weight, 0.0, 10.0);
+    applyGrowthDirectionMaskToUi();
+    refreshDirectionFieldList();
+    updateGrowthUiState();
 
     if (_directionFieldPathEdit) {
         const QSignalBlocker blocker(_directionFieldPathEdit);
@@ -1290,7 +474,325 @@ void SegmentationWidget::loadDirectionFieldIntoForm(const SegmentationDirectionF
         _spinDirectionFieldWeight->setValue(_directionFieldWeight);
     }
 
-    _updatingDirectionFieldForm = false;
+    if (_comboCorrections) {
+        const QSignalBlocker blocker(_comboCorrections);
+        _comboCorrections->setEnabled(_correctionsEnabled && !_growthInProgress && _comboCorrections->count() > 0);
+    }
+    if (_chkCorrectionsAnnotate) {
+        const QSignalBlocker blocker(_chkCorrectionsAnnotate);
+        _chkCorrectionsAnnotate->setChecked(_correctionsAnnotateChecked);
+    }
+    if (_chkCorrectionsUseZRange) {
+        const QSignalBlocker blocker(_chkCorrectionsUseZRange);
+        _chkCorrectionsUseZRange->setChecked(_correctionsZRangeEnabled);
+    }
+    if (_spinCorrectionsZMin) {
+        const QSignalBlocker blocker(_spinCorrectionsZMin);
+        _spinCorrectionsZMin->setValue(_correctionsZMin);
+        _spinCorrectionsZMin->setEnabled(_correctionsZRangeEnabled && _correctionsEnabled && !_growthInProgress);
+    }
+    if (_spinCorrectionsZMax) {
+        const QSignalBlocker blocker(_spinCorrectionsZMax);
+        _spinCorrectionsZMax->setValue(_correctionsZMax);
+        _spinCorrectionsZMax->setEnabled(_correctionsZRangeEnabled && _correctionsEnabled && !_growthInProgress);
+    }
+
+    if (_lblNormalGrid) {
+        const QString icon = _normalGridAvailable
+            ? QStringLiteral("<span style=\"color:#2e7d32; font-size:16px;\">&#10003;</span>")
+            : QStringLiteral("<span style=\"color:#c62828; font-size:16px;\">&#10007;</span>");
+        const QString accessible = _normalGridAvailable ? tr("Normal grids found") : tr("Normal grids missing");
+        QString tooltip;
+        if (!_volumePackagePath.isEmpty()) {
+            tooltip = tr("Volume package: %1").arg(_volumePackagePath);
+        }
+        if (!_normalGridHint.isEmpty()) {
+            if (!tooltip.isEmpty()) {
+                tooltip.append(QLatin1Char('\n'));
+            }
+            tooltip.append(tr("Normal grids: %1").arg(_normalGridHint));
+        }
+        if (!tooltip.isEmpty()) {
+            tooltip.append(QLatin1Char('\n'));
+        }
+        tooltip.append(accessible);
+
+        _lblNormalGrid->setText(icon);
+        _lblNormalGrid->setToolTip(tooltip);
+        _lblNormalGrid->setAccessibleDescription(accessible);
+    }
+}
+
+void SegmentationWidget::restoreSettings()
+{
+    QSettings settings(QStringLiteral("VC.ini"), QSettings::IniFormat);
+    settings.beginGroup(settingsGroup());
+
+    _editingEnabled = settings.value(QStringLiteral("editing_enabled"), _editingEnabled).toBool();
+    _radiusSteps = settings.value(QStringLiteral("radius_steps"), _radiusSteps).toFloat();
+    _sigmaSteps = settings.value(QStringLiteral("sigma_steps"), _sigmaSteps).toFloat();
+    _growthMethod = SegmentationGrowthMethod::Corrections;
+    _growthSteps = settings.value(QStringLiteral("growth_steps"), _growthSteps).toInt();
+    _growthSteps = std::clamp(_growthSteps, 1, 1024);
+    _growthDirectionMask = normalizeGrowthDirectionMask(
+        settings.value(QStringLiteral("growth_direction_mask"), kGrowDirAllMask).toInt());
+
+    QVariantList serialized = settings.value(QStringLiteral("direction_fields"), QVariantList{}).toList();
+    _directionFields.clear();
+    for (const QVariant& entry : serialized) {
+        const QVariantMap map = entry.toMap();
+        SegmentationDirectionFieldConfig config;
+        config.path = map.value(QStringLiteral("path")).toString();
+        config.orientation = segmentationDirectionFieldOrientationFromInt(
+            map.value(QStringLiteral("orientation"), 0).toInt());
+        config.scale = map.value(QStringLiteral("scale"), 0).toInt();
+        config.weight = map.value(QStringLiteral("weight"), 1.0).toDouble();
+        if (config.isValid()) {
+            _directionFields.push_back(std::move(config));
+        }
+    }
+
+    _correctionsEnabled = settings.value(QStringLiteral("corrections_enabled"), false).toBool();
+    _correctionsZRangeEnabled = settings.value(QStringLiteral("corrections_z_range_enabled"), false).toBool();
+    _correctionsZMin = settings.value(QStringLiteral("corrections_z_min"), 0).toInt();
+    _correctionsZMax = settings.value(QStringLiteral("corrections_z_max"), _correctionsZMin).toInt();
+    if (_correctionsZMax < _correctionsZMin) {
+        _correctionsZMax = _correctionsZMin;
+    }
+
+    settings.endGroup();
+}
+
+void SegmentationWidget::writeSetting(const QString& key, const QVariant& value)
+{
+    QSettings settings(QStringLiteral("VC.ini"), QSettings::IniFormat);
+    settings.beginGroup(settingsGroup());
+    settings.setValue(key, value);
+    settings.endGroup();
+}
+
+void SegmentationWidget::setPendingChanges(bool pending)
+{
+    if (_pending == pending) {
+        return;
+    }
+    _pending = pending;
+    syncUiState();
+}
+
+void SegmentationWidget::setEditingEnabled(bool enabled)
+{
+    if (_editingEnabled == enabled) {
+        return;
+    }
+    _editingEnabled = enabled;
+    writeSetting(QStringLiteral("editing_enabled"), _editingEnabled);
+    syncUiState();
+}
+
+void SegmentationWidget::setRadius(float value)
+{
+    const float clamped = std::clamp(value, 0.25f, 128.0f);
+    if (std::fabs(clamped - _radiusSteps) < 1e-4f) {
+        return;
+    }
+    _radiusSteps = clamped;
+    writeSetting(QStringLiteral("radius_steps"), _radiusSteps);
+    if (_spinRadius) {
+        const QSignalBlocker blocker(_spinRadius);
+        _spinRadius->setValue(static_cast<double>(_radiusSteps));
+    }
+}
+
+void SegmentationWidget::setSigma(float value)
+{
+    const float clamped = std::clamp(value, 0.05f, 64.0f);
+    if (std::fabs(clamped - _sigmaSteps) < 1e-4f) {
+        return;
+    }
+    _sigmaSteps = clamped;
+    writeSetting(QStringLiteral("sigma_steps"), _sigmaSteps);
+    if (_spinSigma) {
+        const QSignalBlocker blocker(_spinSigma);
+        _spinSigma->setValue(static_cast<double>(_sigmaSteps));
+    }
+}
+
+void SegmentationWidget::setGrowthMethod(SegmentationGrowthMethod method)
+{
+    if (_growthMethod == method) {
+        return;
+    }
+    _growthMethod = method;
+    writeSetting(QStringLiteral("growth_method"), static_cast<int>(_growthMethod));
+    syncUiState();
+    emit growthMethodChanged(_growthMethod);
+}
+
+void SegmentationWidget::setGrowthInProgress(bool running)
+{
+    if (_growthInProgress == running) {
+        return;
+    }
+    _growthInProgress = running;
+    updateGrowthUiState();
+}
+
+void SegmentationWidget::setNormalGridAvailable(bool available)
+{
+    _normalGridAvailable = available;
+    syncUiState();
+}
+
+void SegmentationWidget::setNormalGridPathHint(const QString& hint)
+{
+    _normalGridHint = hint;
+    syncUiState();
+}
+
+void SegmentationWidget::setVolumePackagePath(const QString& path)
+{
+    _volumePackagePath = path;
+    syncUiState();
+}
+
+void SegmentationWidget::setAvailableVolumes(const QVector<QPair<QString, QString>>& volumes,
+                                              const QString& activeId)
+{
+    _volumeEntries = volumes;
+    _activeVolumeId = activeId;
+    if (_comboVolumes) {
+        const QSignalBlocker blocker(_comboVolumes);
+        _comboVolumes->clear();
+        for (const auto& entry : _volumeEntries) {
+            _comboVolumes->addItem(entry.first, entry.second);
+        }
+        int idx = _comboVolumes->findData(_activeVolumeId);
+        if (idx >= 0) {
+            _comboVolumes->setCurrentIndex(idx);
+        }
+        _comboVolumes->setEnabled(!_volumeEntries.isEmpty());
+    }
+}
+
+void SegmentationWidget::setActiveVolume(const QString& volumeId)
+{
+    if (_activeVolumeId == volumeId) {
+        return;
+    }
+    _activeVolumeId = volumeId;
+    if (_comboVolumes) {
+        const QSignalBlocker blocker(_comboVolumes);
+        int idx = _comboVolumes->findData(_activeVolumeId);
+        if (idx >= 0) {
+            _comboVolumes->setCurrentIndex(idx);
+        }
+    }
+}
+
+void SegmentationWidget::setCorrectionsEnabled(bool enabled)
+{
+    if (_correctionsEnabled == enabled) {
+        return;
+    }
+    _correctionsEnabled = enabled;
+    writeSetting(QStringLiteral("corrections_enabled"), _correctionsEnabled);
+    if (!enabled) {
+        _correctionsAnnotateChecked = false;
+        if (_chkCorrectionsAnnotate) {
+            const QSignalBlocker blocker(_chkCorrectionsAnnotate);
+            _chkCorrectionsAnnotate->setChecked(false);
+        }
+    }
+    updateGrowthUiState();
+}
+
+void SegmentationWidget::setCorrectionsAnnotateChecked(bool enabled)
+{
+    _correctionsAnnotateChecked = enabled;
+    if (_chkCorrectionsAnnotate) {
+        const QSignalBlocker blocker(_chkCorrectionsAnnotate);
+        _chkCorrectionsAnnotate->setChecked(enabled);
+    }
+    updateGrowthUiState();
+}
+
+void SegmentationWidget::setCorrectionCollections(const QVector<QPair<uint64_t, QString>>& collections,
+                                                  std::optional<uint64_t> activeId)
+{
+    if (!_comboCorrections) {
+        return;
+    }
+    const QSignalBlocker blocker(_comboCorrections);
+    _comboCorrections->clear();
+    for (const auto& pair : collections) {
+        _comboCorrections->addItem(pair.second, QVariant::fromValue(static_cast<qulonglong>(pair.first)));
+    }
+    if (activeId) {
+        int idx = _comboCorrections->findData(QVariant::fromValue(static_cast<qulonglong>(*activeId)));
+        if (idx >= 0) {
+            _comboCorrections->setCurrentIndex(idx);
+        }
+    } else {
+        _comboCorrections->setCurrentIndex(-1);
+    }
+    _comboCorrections->setEnabled(_correctionsEnabled && !_growthInProgress && _comboCorrections->count() > 0);
+}
+
+std::optional<std::pair<int, int>> SegmentationWidget::correctionsZRange() const
+{
+    if (!_correctionsZRangeEnabled) {
+        return std::nullopt;
+    }
+    return std::make_pair(_correctionsZMin, _correctionsZMax);
+}
+
+std::vector<SegmentationGrowthDirection> SegmentationWidget::allowedGrowthDirections() const
+{
+    std::vector<SegmentationGrowthDirection> dirs;
+    if (_growthDirectionMask & kGrowDirUpBit) {
+        dirs.push_back(SegmentationGrowthDirection::Up);
+    }
+    if (_growthDirectionMask & kGrowDirDownBit) {
+        dirs.push_back(SegmentationGrowthDirection::Down);
+    }
+    if (_growthDirectionMask & kGrowDirLeftBit) {
+        dirs.push_back(SegmentationGrowthDirection::Left);
+    }
+    if (_growthDirectionMask & kGrowDirRightBit) {
+        dirs.push_back(SegmentationGrowthDirection::Right);
+    }
+    if (dirs.empty()) {
+        dirs = {
+            SegmentationGrowthDirection::Up,
+            SegmentationGrowthDirection::Down,
+            SegmentationGrowthDirection::Left,
+            SegmentationGrowthDirection::Right
+        };
+    }
+    return dirs;
+}
+
+std::vector<SegmentationDirectionFieldConfig> SegmentationWidget::directionFieldConfigs() const
+{
+    std::vector<SegmentationDirectionFieldConfig> configs;
+    configs.reserve(_directionFields.size());
+    for (const auto& config : _directionFields) {
+        if (config.isValid()) {
+            configs.push_back(config);
+        }
+    }
+    return configs;
+}
+
+SegmentationDirectionFieldConfig SegmentationWidget::buildDirectionFieldDraft() const
+{
+    SegmentationDirectionFieldConfig config;
+    config.path = _directionFieldPath.trimmed();
+    config.orientation = _directionFieldOrientation;
+    config.scale = std::clamp(_directionFieldScale, 0, 5);
+    config.weight = std::clamp(_directionFieldWeight, 0.0, 10.0);
+    return config;
 }
 
 void SegmentationWidget::refreshDirectionFieldList()
@@ -1298,30 +800,18 @@ void SegmentationWidget::refreshDirectionFieldList()
     if (!_directionFieldList) {
         return;
     }
-
     const QSignalBlocker blocker(_directionFieldList);
     const int previousRow = _directionFieldList->currentRow();
     _directionFieldList->clear();
 
     for (const auto& config : _directionFields) {
-        QString orientationLabel;
-        if (_comboDirectionFieldOrientation) {
-            const int idx = _comboDirectionFieldOrientation->findData(static_cast<int>(config.orientation));
-            if (idx >= 0) {
-                orientationLabel = _comboDirectionFieldOrientation->itemText(idx);
-            }
-        }
-        if (orientationLabel.isEmpty()) {
-            orientationLabel = segmentationDirectionFieldOrientationKey(config.orientation);
-        }
-
+        QString orientationLabel = segmentationDirectionFieldOrientationKey(config.orientation);
         const QString weightText = QString::number(std::clamp(config.weight, 0.0, 10.0), 'f', 2);
         const QString itemText = tr("%1 — %2 (scale %3, weight %4)")
                                      .arg(config.path,
                                           orientationLabel,
                                           QString::number(std::clamp(config.scale, 0, 5)),
                                           weightText);
-
         auto* item = new QListWidgetItem(itemText, _directionFieldList);
         item->setToolTip(config.path);
     }
@@ -1330,10 +820,8 @@ void SegmentationWidget::refreshDirectionFieldList()
         const int clampedRow = std::clamp(previousRow, 0, static_cast<int>(_directionFields.size()) - 1);
         _directionFieldList->setCurrentRow(clampedRow);
     }
-
     if (_directionFieldRemoveButton) {
-        const bool hasSelection = _directionFieldList->currentRow() >= 0;
-        _directionFieldRemoveButton->setEnabled(_editingEnabled && hasSelection);
+        _directionFieldRemoveButton->setEnabled(_editingEnabled && !_directionFields.empty() && _directionFieldList->currentRow() >= 0);
     }
 }
 
@@ -1341,11 +829,7 @@ void SegmentationWidget::persistDirectionFields()
 {
     QVariantList serialized;
     serialized.reserve(static_cast<int>(_directionFields.size()));
-
     for (const auto& config : _directionFields) {
-        if (!config.isValid()) {
-            continue;
-        }
         QVariantMap map;
         map.insert(QStringLiteral("path"), config.path);
         map.insert(QStringLiteral("orientation"), static_cast<int>(config.orientation));
@@ -1353,19 +837,18 @@ void SegmentationWidget::persistDirectionFields()
         map.insert(QStringLiteral("weight"), std::clamp(config.weight, 0.0, 10.0));
         serialized.push_back(map);
     }
-
     writeSetting(QStringLiteral("direction_fields"), serialized);
 }
 
 void SegmentationWidget::setGrowthDirectionMask(int mask)
 {
     mask = normalizeGrowthDirectionMask(mask);
-    const bool changed = (mask != _growthDirectionMask);
-    _growthDirectionMask = mask;
-    applyGrowthDirectionMaskToUi();
-    if (changed) {
-        writeSetting(QStringLiteral("growth_direction_mask"), _growthDirectionMask);
+    if (_growthDirectionMask == mask) {
+        return;
     }
+    _growthDirectionMask = mask;
+    writeSetting(QStringLiteral("growth_direction_mask"), _growthDirectionMask);
+    applyGrowthDirectionMaskToUi();
 }
 
 void SegmentationWidget::updateGrowthDirectionMaskFromUi(QCheckBox* changedCheckbox)
@@ -1389,8 +872,7 @@ void SegmentationWidget::updateGrowthDirectionMaskFromUi(QCheckBox* changedCheck
             const QSignalBlocker blocker(changedCheckbox);
             changedCheckbox->setChecked(true);
         }
-        applyGrowthDirectionMaskToUi();
-        return;
+        mask = kGrowDirAllMask;
     }
 
     setGrowthDirectionMask(mask);
@@ -1416,111 +898,27 @@ void SegmentationWidget::applyGrowthDirectionMaskToUi()
     }
 }
 
-int SegmentationWidget::normalizeGrowthDirectionMask(int mask)
+void SegmentationWidget::updateGrowthUiState()
 {
-    mask &= kGrowDirAllMask;
-    if (mask == 0) {
-        mask = kGrowDirAllMask;
-    }
-    return mask;
-}
-
-void SegmentationWidget::setHighlightDistance(float value)
-{
-    const float clamped = std::clamp(value, 0.5f, 500.0f);
-    if (std::fabs(clamped - _highlightDistance) < 1e-4f) {
-        return;
-    }
-    _highlightDistance = clamped;
-    if (_spinHighlightDistance) {
-        const QSignalBlocker blocker(_spinHighlightDistance);
-        _spinHighlightDistance->setValue(static_cast<double>(_highlightDistance));
-    }
-    writeSetting(QStringLiteral("highlight_distance"), _highlightDistance);
-}
-
-void SegmentationWidget::setPendingChanges(bool pending)
-{
-    if (_hasPendingChanges == pending) {
-        updateEditingUi();
-        return;
-    }
-    _hasPendingChanges = pending;
-    updateEditingUi();
-}
-
-void SegmentationWidget::updateEditingUi()
-{
-    if (!_editingStatus) {
-        return;
-    }
-
-    if (_editingEnabled) {
-        _editingStatus->setText(tr("Editing enabled"));
-    } else {
-        _editingStatus->setText(tr("Editing disabled"));
-    }
-
-    _spinDownsample->setEnabled(true);
-    _spinRadius->setEnabled(_editingEnabled);
-    _spinSigma->setEnabled(_editingEnabled);
-    if (_comboInfluenceMode) {
-        _comboInfluenceMode->setEnabled(_editingEnabled);
-    }
-    if (_comboRowColMode) {
-        _comboRowColMode->setEnabled(_editingEnabled && _influenceMode == SegmentationInfluenceMode::RowColumn);
-    }
-    if (_groupSliceVisibility) {
-        _groupSliceVisibility->setEnabled(_editingEnabled);
-    }
-    if (_spinHoleRadius) {
-        _spinHoleRadius->setEnabled(_editingEnabled);
-    }
-    if (_spinHoleIterations) {
-        _spinHoleIterations->setEnabled(_editingEnabled);
-    }
-    if (_chkFillInvalidRegions) {
-        _chkFillInvalidRegions->setEnabled(_editingEnabled);
-    }
-    const bool growthDirCheckboxEnabled = _editingEnabled;
-    if (_chkGrowthDirUp) {
-        _chkGrowthDirUp->setEnabled(growthDirCheckboxEnabled);
-    }
-    if (_chkGrowthDirDown) {
-        _chkGrowthDirDown->setEnabled(growthDirCheckboxEnabled);
-    }
-    if (_chkGrowthDirLeft) {
-        _chkGrowthDirLeft->setEnabled(growthDirCheckboxEnabled);
-    }
-    if (_chkGrowthDirRight) {
-        _chkGrowthDirRight->setEnabled(growthDirCheckboxEnabled);
-    }
+    const bool enableGrowth = _editingEnabled && !_growthInProgress;
     if (_spinGrowthSteps) {
-        _spinGrowthSteps->setEnabled(_editingEnabled);
+        _spinGrowthSteps->setEnabled(enableGrowth);
     }
     if (_btnGrow) {
-        _btnGrow->setEnabled(_editingEnabled);
+        _btnGrow->setEnabled(enableGrowth);
     }
-    if (_groupDirectionField) {
-        _groupDirectionField->setEnabled(_editingEnabled);
+    const bool enableDirCheckbox = enableGrowth && _growthMethod != SegmentationGrowthMethod::Corrections;
+    if (_chkGrowthDirUp) {
+        _chkGrowthDirUp->setEnabled(enableDirCheckbox);
     }
-    if (_directionFieldPathEdit) {
-        _directionFieldPathEdit->setEnabled(_editingEnabled);
+    if (_chkGrowthDirDown) {
+        _chkGrowthDirDown->setEnabled(enableDirCheckbox);
     }
-    if (_directionFieldBrowseButton) {
-        _directionFieldBrowseButton->setEnabled(_editingEnabled);
+    if (_chkGrowthDirLeft) {
+        _chkGrowthDirLeft->setEnabled(enableDirCheckbox);
     }
-    if (_comboDirectionFieldOrientation) {
-        _comboDirectionFieldOrientation->setEnabled(_editingEnabled);
-    }
-    if (_comboDirectionFieldScale) {
-        _comboDirectionFieldScale->setEnabled(_editingEnabled);
-    }
-    if (_spinDirectionFieldWeight) {
-        _spinDirectionFieldWeight->setEnabled(_editingEnabled);
-    }
-    if (_directionFieldList) {
-        _directionFieldList->setEnabled(_editingEnabled);
+    if (_chkGrowthDirRight) {
+        _chkGrowthDirRight->setEnabled(enableDirCheckbox);
     }
     if (_directionFieldAddButton) {
         _directionFieldAddButton->setEnabled(_editingEnabled);
@@ -1529,463 +927,40 @@ void SegmentationWidget::updateEditingUi()
         const bool hasSelection = _directionFieldList && _directionFieldList->currentRow() >= 0;
         _directionFieldRemoveButton->setEnabled(_editingEnabled && hasSelection);
     }
-    if (_groupMasking) {
-        _groupMasking->setEnabled(_editingEnabled);
-    }
-    if (_btnMaskEdit) {
-        _btnMaskEdit->setEnabled(_editingEnabled);
-    }
-    if (_btnMaskApply) {
-        _btnMaskApply->setEnabled(_editingEnabled && _maskEditingActive && _maskApplyEnabled);
-    }
-    if (_spinMaskSampling) {
-        _spinMaskSampling->setEnabled(_editingEnabled);
-    }
-    if (_spinMaskRadius) {
-        _spinMaskRadius->setEnabled(_editingEnabled);
-    }
-    if (_btnApply) {
-        _btnApply->setEnabled(_editingEnabled && _hasPendingChanges);
-    }
-    if (_btnReset) {
-        _btnReset->setEnabled(_editingEnabled && _hasPendingChanges);
+    if (_directionFieldList) {
+        _directionFieldList->setEnabled(_editingEnabled);
     }
 
-    updateAdvancedVisibility();
-    refreshCorrectionsUiState();
-}
-
-void SegmentationWidget::setMaskEditingActive(bool active)
-{
-    _maskEditingActive = active;
-    if (!active) {
-        _maskApplyEnabled = false;
-    }
-    if (_btnMaskEdit) {
-        const QSignalBlocker blocker(_btnMaskEdit);
-        _btnMaskEdit->setChecked(active);
-        _btnMaskEdit->setText(active ? tr("Exit Mask Editing") : tr("Edit Mask"));
-    }
-    updateEditingUi();
-}
-
-void SegmentationWidget::setMaskApplyEnabled(bool enabled)
-{
-    _maskApplyEnabled = enabled;
-    updateEditingUi();
-}
-
-void SegmentationWidget::setMaskSampling(int value)
-{
-    const int clamped = std::clamp(value, 1, 64);
-    if (_maskSampling == clamped) {
-        return;
-    }
-    _maskSampling = clamped;
-    if (_spinMaskSampling) {
-        const QSignalBlocker blocker(_spinMaskSampling);
-        _spinMaskSampling->setValue(clamped);
-    }
-    writeSetting(QStringLiteral("mask_sampling"), _maskSampling);
-    emit maskSamplingChanged(_maskSampling);
-}
-
-void SegmentationWidget::setMaskBrushRadius(int value)
-{
-    const int clamped = std::clamp(value, 1, 64);
-    if (_maskBrushRadius == clamped) {
-        return;
-    }
-    _maskBrushRadius = clamped;
-    if (_spinMaskRadius) {
-        const QSignalBlocker blocker(_spinMaskRadius);
-        _spinMaskRadius->setValue(clamped);
-    }
-    writeSetting(QStringLiteral("mask_brush_radius"), _maskBrushRadius);
-    emit maskBrushRadiusChanged(_maskBrushRadius);
-}
-
-void SegmentationWidget::restoreSettings()
-{
-    QSettings settings("VC.ini", QSettings::IniFormat);
-
-    const int storedMaskSampling = settings.value(QStringLiteral("segmentation_edit/mask_sampling"), _maskSampling).toInt();
-    setMaskSampling(std::clamp(storedMaskSampling, 1, 64));
-
-    const int storedMaskRadius = settings.value(QStringLiteral("segmentation_edit/mask_brush_radius"), _maskBrushRadius).toInt();
-    setMaskBrushRadius(std::clamp(storedMaskRadius, 1, 64));
-
-    const int storedDownsample = settings.value(QStringLiteral("segmentation_edit/downsample"), _downsample).toInt();
-    setDownsample(std::clamp(storedDownsample, 2, 64));
-
-    const int storedRadius = settings.value(QStringLiteral("segmentation_edit/radius_steps"), static_cast<int>(std::lround(_radius))).toInt();
-    setRadius(static_cast<float>(std::clamp(storedRadius, 1, 32)));
-
-    const double storedStrength = settings.value(QStringLiteral("segmentation_edit/strength"), static_cast<double>(_sigma)).toDouble();
-    const float clampedStrength = static_cast<float>(std::clamp(storedStrength, 0.10, 2.0));
-    setSigma(clampedStrength);
-
-    const int storedInfluence = settings.value(QStringLiteral("segmentation_edit/influence_mode"), static_cast<int>(_influenceMode)).toInt();
-    const int clampedInfluence = std::clamp(storedInfluence,
-                                            static_cast<int>(SegmentationInfluenceMode::GridChebyshev),
-                                            static_cast<int>(SegmentationInfluenceMode::RowColumn));
-    setInfluenceMode(static_cast<SegmentationInfluenceMode>(clampedInfluence));
-
-    const double storedSliceFade = settings.value(QStringLiteral("segmentation_edit/slice_fade_distance"), static_cast<double>(_sliceFadeDistance)).toDouble();
-    setSliceFadeDistance(static_cast<float>(std::clamp(storedSliceFade, 0.1, 500.0)));
-
-    const int storedSliceMode = settings.value(QStringLiteral("segmentation_edit/slice_display_mode"), static_cast<int>(_sliceDisplayMode)).toInt();
-    const int clampedSliceMode = std::clamp(storedSliceMode,
-                                            static_cast<int>(SegmentationSliceDisplayMode::Fade),
-                                            static_cast<int>(SegmentationSliceDisplayMode::Hide));
-    setSliceDisplayMode(static_cast<SegmentationSliceDisplayMode>(clampedSliceMode));
-
-    const int storedRowCol = settings.value(QStringLiteral("segmentation_edit/row_col_mode"), static_cast<int>(_rowColMode)).toInt();
-    const int clampedRowCol = std::clamp(storedRowCol,
-                                         static_cast<int>(SegmentationRowColMode::RowOnly),
-                                         static_cast<int>(SegmentationRowColMode::Dynamic));
-    setRowColMode(static_cast<SegmentationRowColMode>(clampedRowCol));
-
-    const int storedHoleRadius = settings.value(QStringLiteral("segmentation_edit/hole_search_radius"), _holeSearchRadius).toInt();
-    setHoleSearchRadius(std::clamp(storedHoleRadius, 1, 64));
-
-    const int storedHoleIterations = settings.value(QStringLiteral("segmentation_edit/hole_smooth_iterations"), _holeSmoothIterations).toInt();
-    setHoleSmoothIterations(std::clamp(storedHoleIterations, 1, 200));
-
-    const bool storedFillInvalid = settings.value(QStringLiteral("segmentation_edit/fill_invalid_regions"), _fillInvalidRegions).toBool();
-    setFillInvalidRegions(storedFillInvalid);
-
-    const bool storedHandlesAlways = settings.value(QStringLiteral("segmentation_edit/handles_always_visible"), _handlesAlwaysVisible).toBool();
-    setHandlesAlwaysVisible(storedHandlesAlways);
-
-    const double storedHandleDistance = settings.value(QStringLiteral("segmentation_edit/handle_display_distance"), static_cast<double>(_handleDisplayDistance)).toDouble();
-    setHandleDisplayDistance(static_cast<float>(std::clamp(storedHandleDistance, 1.0, 500.0)));
-
-    const double storedHighlightDistance = settings.value(QStringLiteral("segmentation_edit/highlight_distance"), static_cast<double>(_highlightDistance)).toDouble();
-    setHighlightDistance(static_cast<float>(std::clamp(storedHighlightDistance, 0.5, 500.0)));
-
-    _showAdvancedSettings = settings.value(QStringLiteral("segmentation_edit/show_advanced_settings"), _showAdvancedSettings).toBool();
-    if (_chkAdvancedSettings) {
-        const QSignalBlocker blocker(_chkAdvancedSettings);
-        _chkAdvancedSettings->setChecked(_showAdvancedSettings);
-    }
-
-    _showHandles = settings.value(QStringLiteral("segmentation_edit/show_handles"), _showHandles).toBool();
-    if (_chkShowHandles) {
-        const QSignalBlocker blocker(_chkShowHandles);
-        _chkShowHandles->setChecked(_showHandles);
-    }
-
-    const int storedGrowthDirectionMask = settings.value(QStringLiteral("segmentation_edit/growth_direction_mask"), _growthDirectionMask).toInt();
-    setGrowthDirectionMask(storedGrowthDirectionMask);
-
-    const int storedGrowthSteps = settings.value(QStringLiteral("segmentation_edit/growth_steps"), _growthSteps).toInt();
-    _growthSteps = std::clamp(storedGrowthSteps, 0, 1024);
-    if (_spinGrowthSteps) {
-        const QSignalBlocker blocker(_spinGrowthSteps);
-        _spinGrowthSteps->setValue(_growthSteps);
-    }
-
-    _directionFieldPath = settings.value(QStringLiteral("segmentation_edit/direction_field_path"), QString()).toString().trimmed();
-    const int storedDirectionOrientation = settings.value(QStringLiteral("segmentation_edit/direction_field_orientation"), static_cast<int>(_directionFieldOrientation)).toInt();
-    _directionFieldOrientation = segmentationDirectionFieldOrientationFromInt(storedDirectionOrientation);
-    const int storedDirectionScale = settings.value(QStringLiteral("segmentation_edit/direction_field_scale"), _directionFieldScale).toInt();
-    _directionFieldScale = std::clamp(storedDirectionScale, 0, 5);
-    const double storedDirectionWeight = settings.value(QStringLiteral("segmentation_edit/direction_field_weight"), _directionFieldWeight).toDouble();
-    _directionFieldWeight = std::clamp(storedDirectionWeight, 0.0, 10.0);
-
-    if (_directionFieldPathEdit) {
-        const QSignalBlocker blocker(_directionFieldPathEdit);
-        _directionFieldPathEdit->setText(_directionFieldPath);
-    }
-    if (_comboDirectionFieldOrientation) {
-        const QSignalBlocker blocker(_comboDirectionFieldOrientation);
-        int idx = _comboDirectionFieldOrientation->findData(static_cast<int>(_directionFieldOrientation));
-        if (idx >= 0) {
-            _comboDirectionFieldOrientation->setCurrentIndex(idx);
-        }
-    }
-    if (_comboDirectionFieldScale) {
-        const QSignalBlocker blocker(_comboDirectionFieldScale);
-        int idx = _comboDirectionFieldScale->findData(_directionFieldScale);
-        if (idx >= 0) {
-            _comboDirectionFieldScale->setCurrentIndex(idx);
-        }
-    }
-    if (_spinDirectionFieldWeight) {
-        const QSignalBlocker blocker(_spinDirectionFieldWeight);
-        _spinDirectionFieldWeight->setValue(_directionFieldWeight);
-    }
-
-    const QVariant directionFieldsVariant = settings.value(QStringLiteral("segmentation_edit/direction_fields"));
-    _directionFields.clear();
-    if (directionFieldsVariant.isValid()) {
-        const auto list = directionFieldsVariant.toList();
-        _directionFields.reserve(list.size());
-        for (const auto& entry : list) {
-            const auto map = entry.toMap();
-            SegmentationDirectionFieldConfig config;
-            config.path = map.value(QStringLiteral("path")).toString().trimmed();
-            if (config.path.isEmpty()) {
-                continue;
-            }
-            const int storedOrientation = map.value(QStringLiteral("orientation"), static_cast<int>(SegmentationDirectionFieldOrientation::Normal)).toInt();
-            config.orientation = segmentationDirectionFieldOrientationFromInt(storedOrientation);
-            config.scale = std::clamp(map.value(QStringLiteral("scale"), 0).toInt(), 0, 5);
-            config.weight = std::clamp(map.value(QStringLiteral("weight"), 1.0).toDouble(), 0.0, 10.0);
-            if (config.isValid()) {
-                _directionFields.push_back(std::move(config));
-            }
-        }
-    }
-
-    refreshDirectionFieldList();
-
-    _correctionsZRangeEnabled = settings.value(QStringLiteral("segmentation_edit/corrections_z_range_enabled"), false).toBool();
-    _correctionsZMin = settings.value(QStringLiteral("segmentation_edit/corrections_z_min"), 0).toInt();
-    _correctionsZMax = settings.value(QStringLiteral("segmentation_edit/corrections_z_max"), _correctionsZMin).toInt();
-    _correctionsZMin = std::max(0, _correctionsZMin);
-    _correctionsZMax = std::max(_correctionsZMin, _correctionsZMax);
-
-    if (_chkCorrectionsUseZRange) {
-        const QSignalBlocker blocker(_chkCorrectionsUseZRange);
-        _chkCorrectionsUseZRange->setChecked(_correctionsZRangeEnabled);
-    }
-    if (_spinCorrectionsZMin) {
-        const QSignalBlocker blocker(_spinCorrectionsZMin);
-        _spinCorrectionsZMin->setValue(_correctionsZMin);
-        _spinCorrectionsZMin->setEnabled(_correctionsZRangeEnabled);
-    }
-    if (_spinCorrectionsZMax) {
-        const QSignalBlocker blocker(_spinCorrectionsZMax);
-        _spinCorrectionsZMax->setValue(_correctionsZMax);
-        _spinCorrectionsZMax->setEnabled(_correctionsZRangeEnabled);
-    }
-
-    updateAdvancedVisibility();
-}
-
-void SegmentationWidget::writeSetting(const QString& key, const QVariant& value)
-{
-    QSettings settings("VC.ini", QSettings::IniFormat);
-    settings.setValue(QStringLiteral("segmentation_edit/%1").arg(key), value);
-}
-
-void SegmentationWidget::setCorrectionsEnabled(bool enabled)
-{
-    if (_correctionsEnabled == enabled) {
-        return;
-    }
-    _correctionsEnabled = enabled;
-    refreshCorrectionsUiState();
-}
-
-void SegmentationWidget::setCorrectionsAnnotateChecked(bool enabled)
-{
-    if (_chkCorrectionsAnnotate) {
-        const QSignalBlocker blocker(_chkCorrectionsAnnotate);
-        _chkCorrectionsAnnotate->setChecked(enabled);
-    }
-}
-
-void SegmentationWidget::setCorrectionCollections(const QVector<QPair<uint64_t, QString>>& collections,
-                                                  std::optional<uint64_t> activeId)
-{
-    _activeCorrectionId = activeId;
-    if (!_comboCorrections) {
-        return;
-    }
-
-    const QSignalBlocker blocker(_comboCorrections);
-    _comboCorrections->clear();
-    _comboCorrections->addItem(tr("None"), static_cast<qulonglong>(0));
-
-    int activeIndex = 0;
-    int idx = 1;
-    for (const auto& entry : collections) {
-        _comboCorrections->addItem(entry.second, static_cast<qulonglong>(entry.first));
-        if (activeId && entry.first == *activeId) {
-            activeIndex = idx;
-        }
-        ++idx;
-    }
-
-    if (activeIndex >= 0 && activeIndex < _comboCorrections->count()) {
-        _comboCorrections->setCurrentIndex(activeIndex);
-    } else {
-        _comboCorrections->setCurrentIndex(0);
-        if (activeId) {
-            _activeCorrectionId.reset();
-        }
-    }
-
-    refreshCorrectionsUiState();
-}
-
-void SegmentationWidget::refreshCorrectionsUiState()
-{
-    const bool allow = _editingEnabled && _correctionsEnabled;
-    const bool hasCollections = _comboCorrections && _comboCorrections->count() > 1;
-
+    const bool allowCorrections = _editingEnabled && _correctionsEnabled && !_growthInProgress;
     if (_groupCorrections) {
-        _groupCorrections->setEnabled(_editingEnabled);
+        _groupCorrections->setEnabled(allowCorrections);
     }
-
     if (_comboCorrections) {
-        _comboCorrections->setEnabled(allow && hasCollections);
+        const QSignalBlocker blocker(_comboCorrections);
+        _comboCorrections->setEnabled(allowCorrections && _comboCorrections->count() > 0);
     }
-
     if (_btnCorrectionsNew) {
-        _btnCorrectionsNew->setEnabled(allow);
+        _btnCorrectionsNew->setEnabled(_editingEnabled && !_growthInProgress);
     }
-
     if (_chkCorrectionsAnnotate) {
-        const bool canAnnotate = allow && hasCollections;
-        if (!canAnnotate) {
-            const QSignalBlocker blocker(_chkCorrectionsAnnotate);
-            _chkCorrectionsAnnotate->setChecked(false);
-        }
-        _chkCorrectionsAnnotate->setEnabled(canAnnotate);
+        _chkCorrectionsAnnotate->setEnabled(allowCorrections);
     }
-
     if (_chkCorrectionsUseZRange) {
-        _chkCorrectionsUseZRange->setEnabled(allow);
+        _chkCorrectionsUseZRange->setEnabled(allowCorrections);
     }
-
     if (_spinCorrectionsZMin) {
-        _spinCorrectionsZMin->setEnabled(allow && _correctionsZRangeEnabled);
+        _spinCorrectionsZMin->setEnabled(allowCorrections && _correctionsZRangeEnabled);
     }
-
     if (_spinCorrectionsZMax) {
-        _spinCorrectionsZMax->setEnabled(allow && _correctionsZRangeEnabled);
-    }
-
-}
-
-void SegmentationWidget::updateAdvancedVisibility()
-{
-    const bool showAdvanced = _showAdvancedSettings;
-
-    if (_groupSampling) {
-        _groupSampling->setVisible(showAdvanced);
-    }
-    if (_groupInfluence) {
-        _groupInfluence->setVisible(true);
-    }
-    if (_groupHole) {
-        _groupHole->setVisible(showAdvanced);
-    }
-    if (_groupHandleDisplay) {
-        _groupHandleDisplay->setVisible(showAdvanced);
-        const bool canToggleHandles = showAdvanced && _editingEnabled;
-        const bool handleControlsEnabled = canToggleHandles && _showHandles;
-        if (_chkShowHandles) {
-            _chkShowHandles->setEnabled(canToggleHandles);
-        }
-        if (_chkHandlesAlwaysVisible) {
-            _chkHandlesAlwaysVisible->setEnabled(handleControlsEnabled);
-        }
-        if (_spinHandleDisplayDistance) {
-            const bool enableDistance = handleControlsEnabled && !_handlesAlwaysVisible;
-            _spinHandleDisplayDistance->setEnabled(enableDistance);
-        }
-        if (_spinHighlightDistance) {
-            _spinHighlightDistance->setEnabled(handleControlsEnabled);
-        }
-    }
-    if (_groupSliceVisibility) {
-        _groupSliceVisibility->setVisible(showAdvanced);
-    }
-    if (_groupDirectionField) {
-        _groupDirectionField->setVisible(true);
+        _spinCorrectionsZMax->setEnabled(allowCorrections && _correctionsZRangeEnabled);
     }
 }
 
-void SegmentationWidget::setHandlesLocked(bool locked)
+int SegmentationWidget::normalizeGrowthDirectionMask(int mask)
 {
-    if (_handlesLocked == locked) {
-        return;
+    mask &= kGrowDirAllMask;
+    if (mask == 0) {
+        mask = kGrowDirAllMask;
     }
-    _handlesLocked = locked;
-}
-
-void SegmentationWidget::setNormalGridAvailable(bool available)
-{
-    _normalGridAvailable = available;
-
-    if (!_normalGridStatusWidget) {
-        return;
-    }
-
-    if (_normalGridStatusIcon) {
-        const auto icon = style()->standardIcon(available ? QStyle::SP_DialogApplyButton
-                                                          : QStyle::SP_MessageBoxCritical);
-        _normalGridStatusIcon->setPixmap(icon.pixmap(16, 16));
-        const QString statusText = available
-            ? tr("Normal grid data detected")
-            : tr("Normal grid not found at {volpkg}/normal_grids");
-        const QString tooltip = _normalGridStatusHint.isEmpty()
-            ? statusText
-            : statusText + QStringLiteral("\n") + _normalGridStatusHint;
-        _normalGridStatusIcon->setToolTip(tooltip);
-        _normalGridStatusWidget->setToolTip(tooltip);
-    }
-
-    _normalGridStatusWidget->setVisible(true);
-}
-
-void SegmentationWidget::setAvailableVolumes(const QVector<QPair<QString, QString>>& volumes,
-                                             const QString& activeId)
-{
-    _volumeEntries = volumes;
-    _activeVolumeId = activeId;
-    if (!_comboVolume) {
-        return;
-    }
-
-    const QSignalBlocker blocker(_comboVolume);
-    _comboVolume->clear();
-
-    for (const auto& entry : volumes) {
-        _comboVolume->addItem(entry.second, entry.first);
-    }
-
-    int index = _comboVolume->findData(_activeVolumeId);
-    if (index < 0 && _comboVolume->count() > 0) {
-        index = 0;
-        _activeVolumeId = _comboVolume->itemData(index).toString();
-    }
-
-    if (index >= 0) {
-        _comboVolume->setCurrentIndex(index);
-    }
-
-    _comboVolume->setEnabled(_comboVolume->count() > 0);
-}
-
-void SegmentationWidget::setActiveVolume(const QString& volumeId)
-{
-    if (_activeVolumeId == volumeId) {
-        return;
-    }
-    _activeVolumeId = volumeId;
-    if (!_comboVolume) {
-        return;
-    }
-    const QSignalBlocker blocker(_comboVolume);
-    int index = _comboVolume->findData(volumeId);
-    if (index >= 0) {
-        _comboVolume->setCurrentIndex(index);
-    }
-}
-
-void SegmentationWidget::setNormalGridPathHint(const QString& hint)
-{
-    _normalGridStatusHint = hint;
-    setNormalGridAvailable(_normalGridAvailable);
-}
-
-void SegmentationWidget::setVolumePackagePath(const QString& path)
-{
-    _volumePackagePath = path.trimmed();
+    return mask;
 }

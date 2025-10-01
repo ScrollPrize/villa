@@ -867,7 +867,6 @@ void CWindow::CreateWidgets(void)
         _surf_col,
         _point_collection,
         _segmentationWidget->isEditingEnabled(),
-        _segmentationWidget->downsample(),
         _segmentationWidget->radius(),
         _segmentationWidget->sigma(),
         this);

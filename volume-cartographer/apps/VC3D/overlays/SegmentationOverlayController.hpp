@@ -1,7 +1,6 @@
 #pragma once
 
 #include "ViewerOverlayControllerBase.hpp"
-#include "../SegmentationInfluenceMode.hpp"
 
 #include <optional>
 #include <vector>
@@ -9,7 +8,6 @@
 #include <opencv2/core.hpp>
 
 class CSurfaceCollection;
-class CVolumeViewer;
 class SegmentationEditManager;
 class Surface;
 
@@ -18,52 +16,53 @@ class SegmentationOverlayController : public ViewerOverlayControllerBase
     Q_OBJECT
 
 public:
-    explicit SegmentationOverlayController(CSurfaceCollection* surfCollection, QObject* parent = nullptr);
+    struct VertexMarker
+    {
+        int row{0};
+        int col{0};
+        cv::Vec3f world{0.0f, 0.0f, 0.0f};
+        bool isActive{false};
+        bool isGrowth{false};
+    };
+
+    explicit SegmentationOverlayController(CSurfaceCollection* surfaces, QObject* parent = nullptr);
 
     void setEditingEnabled(bool enabled);
-    void setDownsample(int value);
-    void setRadius(float radius);
-    void setEditManager(SegmentationEditManager* manager) { _editManager = manager; }
-    void setActiveHandle(std::optional<std::pair<int,int>> key, bool refresh = true);
-    void setHoverHandle(std::optional<std::pair<int,int>> key, bool refresh = true);
-    void setKeyboardHandle(std::optional<std::pair<int,int>> key, bool refresh = true);
-    void setHandleVisibility(bool showAll, float distance);
-    void setHandlesVisible(bool visible);
-    void setCursorWorld(const cv::Vec3f& world, bool valid);
-    void setSliceFadeDistance(float distance);
-    void setSliceDisplayMode(SegmentationSliceDisplayMode mode);
+    void setEditManager(SegmentationEditManager* manager);
+    void setGaussianParameters(float radiusSteps, float sigmaSteps, float gridStepWorld);
+    void setActiveVertex(std::optional<VertexMarker> marker);
+    void setTouchedVertices(const std::vector<VertexMarker>& markers);
     void setMaskOverlay(const std::vector<cv::Vec3f>& points,
                         bool visible,
                         float pointRadius,
                         float opacity);
 
-private slots:
-    void onSurfaceChanged(std::string name, Surface* surf);
-
-private:
+protected:
     bool isOverlayEnabledFor(CVolumeViewer* viewer) const override;
     void collectPrimitives(CVolumeViewer* viewer,
                            ViewerOverlayControllerBase::OverlayBuilder& builder) override;
-    [[nodiscard]] float sliceOpacity(float distance) const;
 
-    CSurfaceCollection* _surfCollection;
-    bool _editingEnabled{false};
-    int _downsample{12};
-    float _radius{1.0f};
+private slots:
+    void onSurfaceChanged(std::string name, Surface* surface);
+
+private:
+    void buildRadiusOverlay(CVolumeViewer* viewer,
+                            ViewerOverlayControllerBase::OverlayBuilder& builder) const;
+    void buildVertexMarkers(CVolumeViewer* viewer,
+                            ViewerOverlayControllerBase::OverlayBuilder& builder) const;
+
+    CSurfaceCollection* _surfaces{nullptr};
     SegmentationEditManager* _editManager{nullptr};
-    std::optional<std::pair<int,int>> _activeHandle;
-    std::optional<std::pair<int,int>> _hoverHandle;
-    std::optional<std::pair<int,int>> _keyboardHandle;
-    bool _handlesVisible{true};
-    bool _showAllHandles{true};
-    float _handleDisplayDistance{25.0f};
-    bool _cursorValid{false};
-    cv::Vec3f _cursorWorld{0.0f, 0.0f, 0.0f};
-    float _sliceFadeDistance{10.0f};
-    SegmentationSliceDisplayMode _sliceDisplayMode{SegmentationSliceDisplayMode::Fade};
-    bool _maskOverlayVisible{false};
-    std::vector<cv::Vec3f> _maskOverlayPoints;
-    float _maskOverlayPointRadius{4.0f};
-    float _maskOverlayOpacity{0.35f};
-    QColor _maskOverlayColor{QColor(255, 140, 0)};
+    bool _editingEnabled{false};
+    float _radiusSteps{3.0f};
+    float _sigmaSteps{1.5f};
+    float _gridStepWorld{1.0f};
+
+    std::optional<VertexMarker> _activeVertex;
+    std::vector<VertexMarker> _touchedVertices;
+
+    bool _maskVisible{false};
+    std::vector<cv::Vec3f> _maskPoints;
+    float _maskPointRadius{3.0f};
+    float _maskOpacity{0.35f};
 };
