@@ -537,7 +537,7 @@ static int add_continuous_losses(ceres::Problem &problem, const cv::Vec2i &p, Tr
     //diag2
     count += gen_straight_loss(problem, p, {-2,2},{-1,1},{0,0}, params, settings);
     count += gen_straight_loss(problem, p, {-1,1},{0,0},{1,-1}, params, settings);
-    count += gen_straight_loss(problem, p, {0,0},{1,1},{2,2}, params, settings);
+    count += gen_straight_loss(problem, p, {0,0},{1,-1},{2,-2}, params, settings);
 
     //direct neighboars
     count += gen_dist_loss(problem, p, {0,-1}, params, settings);
