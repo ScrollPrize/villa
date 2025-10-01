@@ -1034,7 +1034,7 @@ void CWindow::CreateWidgets(void)
         VolumeOverlayController::UiRefs overlayUi{
             .volumeSelect = ui.overlayVolumeSelect,
             .colormapSelect = ui.overlayColormapSelect,
-            .opacitySlider = ui.overlayOpacitySlider,
+            .opacitySpin = ui.overlayOpacitySpin,
             .thresholdSpin = ui.overlayThresholdSpin,
         };
         _volumeOverlay->setUi(overlayUi);
@@ -1108,12 +1108,12 @@ void CWindow::CreateWidgets(void)
         chkAxisOverlays->setChecked(showOverlays);
         connect(chkAxisOverlays, &QCheckBox::toggled, this, &CWindow::onAxisOverlayVisibilityToggled);
     }
-    if (auto* sliderAxisOverlayOpacity = ui.sliderAxisOverlayOpacity) {
-        int storedOpacity = settings.value("viewer/axis_overlay_opacity", sliderAxisOverlayOpacity->value()).toInt();
-        storedOpacity = std::clamp(storedOpacity, sliderAxisOverlayOpacity->minimum(), sliderAxisOverlayOpacity->maximum());
-        QSignalBlocker blocker(sliderAxisOverlayOpacity);
-        sliderAxisOverlayOpacity->setValue(storedOpacity);
-        connect(sliderAxisOverlayOpacity, &QSlider::valueChanged, this, &CWindow::onAxisOverlayOpacityChanged);
+    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
+        int storedOpacity = settings.value("viewer/axis_overlay_opacity", spinAxisOverlayOpacity->value()).toInt();
+        storedOpacity = std::clamp(storedOpacity, spinAxisOverlayOpacity->minimum(), spinAxisOverlayOpacity->maximum());
+        QSignalBlocker blocker(spinAxisOverlayOpacity);
+        spinAxisOverlayOpacity->setValue(storedOpacity);
+        connect(spinAxisOverlayOpacity, qOverload<int>(&QSpinBox::valueChanged), this, &CWindow::onAxisOverlayOpacityChanged);
     }
 
     if (auto* btnResetRot = ui.btnResetAxisRotations) {
@@ -1193,8 +1193,8 @@ void CWindow::CreateWidgets(void)
     if (chkAxisAlignedSlices) {
         onAxisAlignedSlicesToggled(chkAxisAlignedSlices->isChecked());
     }
-    if (auto* sliderAxisOverlayOpacity = ui.sliderAxisOverlayOpacity) {
-        onAxisOverlayOpacityChanged(sliderAxisOverlayOpacity->value());
+    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
+        onAxisOverlayOpacityChanged(spinAxisOverlayOpacity->value());
     }
     if (auto* chkAxisOverlays = ui.chkAxisOverlays) {
         onAxisOverlayVisibilityToggled(chkAxisOverlays->isChecked());
@@ -2028,8 +2028,8 @@ void CWindow::onAxisOverlayVisibilityToggled(bool enabled)
     if (_planeSlicingOverlay) {
         _planeSlicingOverlay->setAxisAlignedEnabled(enabled && _useAxisAlignedSlices);
     }
-    if (auto* sliderAxisOverlayOpacity = ui.sliderAxisOverlayOpacity) {
-        sliderAxisOverlayOpacity->setEnabled(_useAxisAlignedSlices && enabled);
+    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
+        spinAxisOverlayOpacity->setEnabled(_useAxisAlignedSlices && enabled);
     }
     QSettings settings("VC.ini", QSettings::IniFormat);
     settings.setValue("viewer/show_axis_overlays", enabled ? "1" : "0");
@@ -2308,8 +2308,8 @@ void CWindow::onAxisAlignedSlicesToggled(bool enabled)
         bool overlaysVisible = !ui.chkAxisOverlays || ui.chkAxisOverlays->isChecked();
         _planeSlicingOverlay->setAxisAlignedEnabled(enabled && overlaysVisible);
     }
-    if (auto* sliderAxisOverlayOpacity = ui.sliderAxisOverlayOpacity) {
-        sliderAxisOverlayOpacity->setEnabled(enabled && (!ui.chkAxisOverlays || ui.chkAxisOverlays->isChecked()));
+    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
+        spinAxisOverlayOpacity->setEnabled(enabled && (!ui.chkAxisOverlays || ui.chkAxisOverlays->isChecked()));
     }
     QSettings settings("VC.ini", QSettings::IniFormat);
     settings.setValue("viewer/use_axis_aligned_slices", enabled ? "1" : "0");

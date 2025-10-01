@@ -12,7 +12,6 @@
 #include <QFileInfo>
 #include <QSettings>
 #include <QSignalBlocker>
-#include <QSlider>
 #include <QSpinBox>
 #include <QVariant>
 
@@ -66,12 +65,12 @@ QString overlayVolumeLabel(const std::shared_ptr<Volume>& volume, const QString&
     return QStringLiteral("%1 (%2)").arg(name, id);
 }
 
-float normalizedOpacityFromSlider(int sliderValue)
+float normalizedOpacityFromPercent(int percentValue)
 {
-    return std::clamp(sliderValue / 100.0f, 0.0f, 1.0f);
+    return std::clamp(percentValue / 100.0f, 0.0f, 1.0f);
 }
 
-int sliderValueFromOpacity(float opacity)
+int percentValueFromOpacity(float opacity)
 {
     return static_cast<int>(std::round(std::clamp(opacity, 0.0f, 1.0f) * 100.0f));
 }
@@ -99,10 +98,10 @@ void VolumeOverlayController::setUi(const UiRefs& ui)
     disconnectUiSignals();
     _ui = ui;
 
-    if (_ui.opacitySlider) {
-        _ui.opacitySlider->setRange(0, 100);
-        QSignalBlocker blocker(_ui.opacitySlider);
-        _ui.opacitySlider->setValue(sliderValueFromOpacity(_overlayOpacity));
+    if (_ui.opacitySpin) {
+        _ui.opacitySpin->setRange(0, 100);
+        QSignalBlocker blocker(_ui.opacitySpin);
+        _ui.opacitySpin->setValue(percentValueFromOpacity(_overlayOpacity));
     }
 
     if (_ui.thresholdSpin) {
@@ -167,9 +166,9 @@ void VolumeOverlayController::clearVolumePkg()
     _overlayOpacity = 0.5f;
     _overlayOpacityBeforeToggle = _overlayOpacity;
     _overlayThreshold = 1.0f;
-    if (_ui.opacitySlider) {
-        const QSignalBlocker blocker(_ui.opacitySlider);
-        _ui.opacitySlider->setValue(sliderValueFromOpacity(_overlayOpacity));
+    if (_ui.opacitySpin) {
+        const QSignalBlocker blocker(_ui.opacitySpin);
+        _ui.opacitySpin->setValue(percentValueFromOpacity(_overlayOpacity));
     }
     if (_ui.thresholdSpin) {
         const QSignalBlocker blocker(_ui.thresholdSpin);
@@ -275,9 +274,9 @@ void VolumeOverlayController::connectUiSignals()
             this, [this](int index) { handleColormapChanged(index); }));
     }
 
-    if (_ui.opacitySlider) {
+    if (_ui.opacitySpin) {
         _connections.push_back(QObject::connect(
-            _ui.opacitySlider, &QSlider::valueChanged,
+            _ui.opacitySpin, qOverload<int>(&QSpinBox::valueChanged),
             this, [this](int value) { handleOpacityChanged(value); }));
     }
 
@@ -364,8 +363,8 @@ void VolumeOverlayController::updateUiEnabled()
     }
 
     const bool hasOverlay = hasOverlaySelection();
-    if (_ui.opacitySlider) {
-        _ui.opacitySlider->setEnabled(hasOverlay);
+    if (_ui.opacitySpin) {
+        _ui.opacitySpin->setEnabled(hasOverlay);
     }
     if (_ui.thresholdSpin) {
         _ui.thresholdSpin->setEnabled(hasOverlay);
@@ -487,9 +486,9 @@ void VolumeOverlayController::setOpacity(float value)
     const float clamped = std::clamp(value, 0.0f, 1.0f);
     _overlayOpacity = clamped;
 
-    if (_ui.opacitySlider) {
-        const QSignalBlocker blocker(_ui.opacitySlider);
-        _ui.opacitySlider->setValue(sliderValueFromOpacity(_overlayOpacity));
+    if (_ui.opacitySpin) {
+        const QSignalBlocker blocker(_ui.opacitySpin);
+        _ui.opacitySpin->setValue(percentValueFromOpacity(_overlayOpacity));
     }
 
     if (_viewerManager) {
@@ -568,7 +567,7 @@ void VolumeOverlayController::handleColormapChanged(int index)
 
 void VolumeOverlayController::handleOpacityChanged(int value)
 {
-    setOpacity(normalizedOpacityFromSlider(value));
+    setOpacity(normalizedOpacityFromPercent(value));
     if (!_suspendPersistence) {
         saveState();
     }
