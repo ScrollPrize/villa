@@ -8,6 +8,8 @@
 #include <utility>
 #include <vector>
 
+#include <nlohmann/json_fwd.hpp>
+
 #include <opencv2/core.hpp>
 
 #include "vc/ui/VCCollection.hpp"
@@ -143,6 +145,7 @@ struct SegmentationGrowthRequest {
     SegmentationCorrectionsPayload corrections;
     std::optional<std::pair<int, int>> correctionsZRange;
     std::vector<SegmentationDirectionFieldConfig> directionFields;
+    std::optional<nlohmann::json> customParams;
 };
 
 struct TracerGrowthContext {

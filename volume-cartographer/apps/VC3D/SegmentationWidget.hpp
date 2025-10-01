@@ -7,6 +7,8 @@
 #include <utility>
 #include <vector>
 
+#include <nlohmann/json_fwd.hpp>
+
 #include "SegmentationGrowth.hpp"
 
 class QCheckBox;
@@ -16,6 +18,7 @@ class QGroupBox;
 class QLabel;
 class QLineEdit;
 class QListWidget;
+class QPlainTextEdit;
 class QPushButton;
 class QSpinBox;
 class QToolButton;
@@ -33,6 +36,10 @@ public:
     [[nodiscard]] float pushPullStep() const { return _pushPullStep; }
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const { return _growthMethod; }
     [[nodiscard]] int growthSteps() const { return _growthSteps; }
+    [[nodiscard]] QString customParamsText() const { return _customParamsText; }
+    [[nodiscard]] bool customParamsValid() const { return _customParamsError.isEmpty(); }
+    [[nodiscard]] QString customParamsError() const { return _customParamsError; }
+    [[nodiscard]] std::optional<nlohmann::json> customParamsJson() const;
 
     void setPendingChanges(bool pending);
     void setEditingEnabled(bool enabled);
@@ -96,6 +103,10 @@ private:
     void applyGrowthDirectionMaskToUi();
     void updateGrowthUiState();
     static int normalizeGrowthDirectionMask(int mask);
+    void handleCustomParamsEdited();
+    void validateCustomParamsText();
+    void updateCustomParamsStatus();
+    std::optional<nlohmann::json> parseCustomParams(QString* error) const;
 
     bool _editingEnabled{false};
     bool _pending{false};
@@ -160,6 +171,12 @@ private:
     QPushButton* _btnReset{nullptr};
     QPushButton* _btnStop{nullptr};
     QCheckBox* _chkEraseBrush{nullptr};
+
+    QGroupBox* _groupCustomParams{nullptr};
+    QPlainTextEdit* _editCustomParams{nullptr};
+    QLabel* _lblCustomParamsStatus{nullptr};
+    QString _customParamsText;
+    QString _customParamsError;
 
     bool _correctionsEnabled{false};
     bool _correctionsZRangeEnabled{false};

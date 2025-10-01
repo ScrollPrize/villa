@@ -115,6 +115,11 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _viewerManager->setSegmentationModule(this);
     }
 
+    if (_surfaces) {
+        connect(_surfaces, &CSurfaceCollection::sendSurfaceChanged,
+                this, &SegmentationModule::onSurfaceCollectionChanged);
+    }
+
     if (_pointCollection) {
         const auto& collections = _pointCollection->getAllCollections();
         for (const auto& entry : collections) {
@@ -399,9 +404,46 @@ void SegmentationModule::endEditingSession()
         _overlay->setTouchedVertices({});
         _overlay->refreshAll();
     }
+    QuadSurface* baseSurface = _editManager ? _editManager->baseSurface() : nullptr;
+    QuadSurface* previewSurface = _editManager ? _editManager->previewSurface() : nullptr;
+
+    if (_surfaces && previewSurface) {
+        Surface* currentSurface = _surfaces->surface("segmentation");
+        if (currentSurface == previewSurface) {
+            const bool previousGuard = _ignoreSegSurfaceChange;
+            _ignoreSegSurfaceChange = true;
+            _surfaces->setSurface("segmentation", baseSurface);
+            _ignoreSegSurfaceChange = previousGuard;
+        }
+    }
+
     if (_editManager) {
         _editManager->endSession();
     }
+}
+
+void SegmentationModule::onSurfaceCollectionChanged(std::string name, Surface* surface)
+{
+    if (name != "segmentation" || !_editingEnabled || _ignoreSegSurfaceChange) {
+        return;
+    }
+
+    if (!_editManager) {
+        setEditingEnabled(false);
+        return;
+    }
+
+    QuadSurface* previewSurface = _editManager->previewSurface();
+    QuadSurface* baseSurface = _editManager->baseSurface();
+
+    if (surface == previewSurface || surface == baseSurface) {
+        return;
+    }
+
+    qCInfo(lcSegModule) << "Segmentation surface changed externally; disabling editing.";
+    emit statusMessageRequested(tr("Segmentation editing disabled because the surface changed."),
+                                kStatusMedium);
+    setEditingEnabled(false);
 }
 
 bool SegmentationModule::hasActiveSession() const

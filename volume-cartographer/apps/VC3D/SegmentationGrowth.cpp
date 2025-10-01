@@ -260,6 +260,11 @@ nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
         if (allowLeft) allowedStrings.emplace_back("left");
         params["growth_directions"] = allowedStrings;
     }
+    if (request.customParams) {
+        for (auto it = request.customParams->begin(); it != request.customParams->end(); ++it) {
+            params[it.key()] = it.value();
+        }
+    }
     return params;
 }
 } // namespace

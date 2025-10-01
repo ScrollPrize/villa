@@ -1,6 +1,7 @@
 #include "SegmentationWidget.hpp"
 
 #include <QAbstractItemView>
+#include <QByteArray>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDir>
@@ -12,6 +13,7 @@
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QLoggingCategory>
+#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalBlocker>
@@ -23,6 +25,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
+
+#include <nlohmann/json.hpp>
 
 namespace
 {
@@ -248,6 +253,28 @@ void SegmentationWidget::buildUi()
     _groupCorrections->setLayout(correctionsLayout);
     layout->addWidget(_groupCorrections);
 
+    _groupCustomParams = new QGroupBox(tr("Custom Params"), this);
+    auto* customParamsLayout = new QVBoxLayout(_groupCustomParams);
+
+    auto* customParamsDescription = new QLabel(
+        tr("Additional JSON fields merge into the tracer params. Leave empty for defaults."), _groupCustomParams);
+    customParamsDescription->setWordWrap(true);
+    customParamsLayout->addWidget(customParamsDescription);
+
+    _editCustomParams = new QPlainTextEdit(_groupCustomParams);
+    _editCustomParams->setPlaceholderText(QStringLiteral("{\n    \"example_param\": 1\n}"));
+    _editCustomParams->setTabChangesFocus(true);
+    customParamsLayout->addWidget(_editCustomParams);
+
+    _lblCustomParamsStatus = new QLabel(_groupCustomParams);
+    _lblCustomParamsStatus->setWordWrap(true);
+    _lblCustomParamsStatus->setVisible(false);
+    _lblCustomParamsStatus->setStyleSheet(QStringLiteral("color: #c0392b;"));
+    customParamsLayout->addWidget(_lblCustomParamsStatus);
+
+    _groupCustomParams->setLayout(customParamsLayout);
+    layout->addWidget(_groupCustomParams);
+
     auto* buttons = new QHBoxLayout();
     _btnApply = new QPushButton(tr("Apply"), this);
     _btnReset = new QPushButton(tr("Reset"), this);
@@ -404,6 +431,10 @@ void SegmentationWidget::buildUi()
         emit correctionsCreateRequested();
     });
 
+    connect(_editCustomParams, &QPlainTextEdit::textChanged, this, [this]() {
+        handleCustomParamsEdited();
+    });
+
     connect(_chkCorrectionsAnnotate, &QCheckBox::toggled, this, [this](bool enabled) {
         emit correctionsAnnotateToggled(enabled);
     });
@@ -476,6 +507,14 @@ void SegmentationWidget::syncUiState()
         const QSignalBlocker blocker(_spinPushPullStep);
         _spinPushPullStep->setValue(static_cast<double>(_pushPullStep));
     }
+
+    if (_editCustomParams) {
+        if (_editCustomParams->toPlainText() != _customParamsText) {
+            const QSignalBlocker blocker(_editCustomParams);
+            _editCustomParams->setPlainText(_customParamsText);
+        }
+    }
+    updateCustomParamsStatus();
 
     if (_spinGrowthSteps) {
         const QSignalBlocker blocker(_spinGrowthSteps);
@@ -599,10 +638,13 @@ void SegmentationWidget::restoreSettings()
     _correctionsEnabled = settings.value(QStringLiteral("corrections_enabled"), false).toBool();
     _correctionsZRangeEnabled = settings.value(QStringLiteral("corrections_z_range_enabled"), false).toBool();
     _correctionsZMin = settings.value(QStringLiteral("corrections_z_min"), 0).toInt();
-    _correctionsZMax = settings.value(QStringLiteral("corrections_z_max"), _correctionsZMin).toInt();
+   _correctionsZMax = settings.value(QStringLiteral("corrections_z_max"), _correctionsZMin).toInt();
     if (_correctionsZMax < _correctionsZMin) {
         _correctionsZMax = _correctionsZMin;
     }
+
+    _customParamsText = settings.value(QStringLiteral("custom_params_text"), QString()).toString();
+    validateCustomParamsText();
 
     settings.endGroup();
 }
@@ -696,6 +738,89 @@ void SegmentationWidget::setPushPullStep(float value)
         const QSignalBlocker blocker(_spinPushPullStep);
         _spinPushPullStep->setValue(static_cast<double>(_pushPullStep));
     }
+}
+
+void SegmentationWidget::handleCustomParamsEdited()
+{
+    if (!_editCustomParams) {
+        return;
+    }
+    _customParamsText = _editCustomParams->toPlainText();
+    writeSetting(QStringLiteral("custom_params_text"), _customParamsText);
+    validateCustomParamsText();
+    updateCustomParamsStatus();
+}
+
+void SegmentationWidget::validateCustomParamsText()
+{
+    QString error;
+    parseCustomParams(&error);
+    _customParamsError = error;
+}
+
+void SegmentationWidget::updateCustomParamsStatus()
+{
+    if (!_lblCustomParamsStatus) {
+        return;
+    }
+    if (_customParamsError.isEmpty()) {
+        _lblCustomParamsStatus->clear();
+        _lblCustomParamsStatus->setVisible(false);
+        return;
+    }
+    _lblCustomParamsStatus->setText(_customParamsError);
+    _lblCustomParamsStatus->setVisible(true);
+}
+
+std::optional<nlohmann::json> SegmentationWidget::parseCustomParams(QString* error) const
+{
+    if (error) {
+        error->clear();
+    }
+
+    const QString trimmed = _customParamsText.trimmed();
+    if (trimmed.isEmpty()) {
+        return std::nullopt;
+    }
+
+    try {
+        const QByteArray utf8 = trimmed.toUtf8();
+        nlohmann::json parsed = nlohmann::json::parse(utf8.constData(), utf8.constData() + utf8.size());
+        if (!parsed.is_object()) {
+            if (error) {
+                *error = tr("Custom params must be a JSON object.");
+            }
+            return std::nullopt;
+        }
+        return parsed;
+    } catch (const nlohmann::json::parse_error& ex) {
+        if (error) {
+            *error = tr("Custom params JSON parse error (byte %1): %2")
+                         .arg(static_cast<qulonglong>(ex.byte))
+                         .arg(QString::fromStdString(ex.what()));
+        }
+    } catch (const std::exception& ex) {
+        if (error) {
+            *error = tr("Custom params JSON parse error: %1")
+                         .arg(QString::fromStdString(ex.what()));
+        }
+    } catch (...) {
+        if (error) {
+            *error = tr("Custom params JSON parse error: unknown error");
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::optional<nlohmann::json> SegmentationWidget::customParamsJson() const
+{
+    QString error;
+    auto parsed = parseCustomParams(&error);
+    if (!error.isEmpty()) {
+        return std::nullopt;
+    }
+    return parsed;
 }
 
 void SegmentationWidget::setGrowthMethod(SegmentationGrowthMethod method)
@@ -1118,6 +1243,9 @@ void SegmentationWidget::updateGrowthUiState()
     }
     if (_spinCorrectionsZMax) {
         _spinCorrectionsZMax->setEnabled(allowZRange && _correctionsZRangeEnabled);
+    }
+    if (_groupCustomParams) {
+        _groupCustomParams->setEnabled(_editingEnabled);
     }
 
     const bool allowCorrections = _editingEnabled && _correctionsEnabled && !_growthInProgress;

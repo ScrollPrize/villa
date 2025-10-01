@@ -1011,11 +1011,18 @@ void CWindow::CreateWidgets(void)
     connect(btnZoomOut, &QPushButton::clicked, this, &CWindow::onZoomOut);
 
     auto* spinIntersectionOpacity = ui.spinIntersectionOpacity;
+    const int savedIntersectionOpacity = settings.value("viewer/intersection_opacity",
+                                                        spinIntersectionOpacity->value()).toInt();
+    const int boundedIntersectionOpacity = std::clamp(savedIntersectionOpacity,
+                                                      spinIntersectionOpacity->minimum(),
+                                                      spinIntersectionOpacity->maximum());
+    spinIntersectionOpacity->setValue(boundedIntersectionOpacity);
+
     connect(spinIntersectionOpacity, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (!_viewerManager) {
             return;
         }
-        const float normalized = std::clamp(value / 100.0f, 0.0f, 1.0f);
+        const float normalized = std::clamp(static_cast<float>(value) / 100.0f, 0.0f, 1.0f);
         _viewerManager->setIntersectionOpacity(normalized);
     });
     if (_viewerManager) {
@@ -2327,6 +2334,18 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
     }
     if (_segmentationWidget) {
         request.directionFields = _segmentationWidget->directionFieldConfigs();
+        if (!_segmentationWidget->customParamsValid()) {
+            const QString errorText = _segmentationWidget->customParamsError();
+            const QString message = errorText.isEmpty()
+                ? tr("Custom params JSON is invalid. Fix the contents and try again.")
+                : tr("Custom params JSON is invalid: %1").arg(errorText);
+            statusBar()->showMessage(message, 5000);
+            finalize();
+            return;
+        }
+        if (auto customParams = _segmentationWidget->customParamsJson()) {
+            request.customParams = std::move(*customParams);
+        }
     }
     request.corrections = corrections;
     if (method == SegmentationGrowthMethod::Corrections && _segmentationModule) {
