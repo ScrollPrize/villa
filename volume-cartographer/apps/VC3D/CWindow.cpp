@@ -425,7 +425,6 @@ CWindow::CWindow() :
         }
     });
 
-    appInitComplete = true;
 }
 
 // Destructor
