@@ -15,6 +15,7 @@
 #include <QMdiSubWindow>
 #include <QSettings>
 #include <algorithm>
+#include <cmath>
 
 ViewerManager::ViewerManager(CSurfaceCollection* surfaces,
                              VCCollection* points,
@@ -25,6 +26,10 @@ ViewerManager::ViewerManager(CSurfaceCollection* surfaces,
     , _points(points)
     , _chunkCache(cache)
 {
+    QSettings settings("VC.ini", QSettings::IniFormat);
+    const int savedOpacityPercent = settings.value("viewer/intersection_opacity", 100).toInt();
+    const float normalized = static_cast<float>(savedOpacityPercent) / 100.0f;
+    _intersectionOpacity = std::clamp(normalized, 0.0f, 1.0f);
 }
 
 CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
@@ -174,6 +179,11 @@ void ViewerManager::setVectorOverlay(VectorOverlayController* overlay)
 void ViewerManager::setIntersectionOpacity(float opacity)
 {
     _intersectionOpacity = std::clamp(opacity, 0.0f, 1.0f);
+
+    QSettings settings("VC.ini", QSettings::IniFormat);
+    settings.setValue("viewer/intersection_opacity",
+                      static_cast<int>(std::lround(_intersectionOpacity * 100.0f)));
+
     for (auto* viewer : _viewers) {
         if (viewer) {
             viewer->setIntersectionOpacity(_intersectionOpacity);

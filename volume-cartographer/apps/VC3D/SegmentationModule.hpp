@@ -5,6 +5,7 @@
 #include <QSet>
 
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 #include <unordered_set>
@@ -16,6 +17,7 @@
 class CSurfaceCollection;
 class CVolumeViewer;
 class PlaneSurface;
+class Surface;
 class QuadSurface;
 class SegmentationEditManager;
 class SegmentationOverlayController;
@@ -163,6 +165,7 @@ private:
                      int deltaSteps,
                      const QPointF& scenePos,
                      const cv::Vec3f& worldPos);
+    void onSurfaceCollectionChanged(std::string name, Surface* surface);
 
     [[nodiscard]] bool isSegmentationViewer(const CVolumeViewer* viewer) const;
     [[nodiscard]] float gridStepWorld() const;
@@ -198,6 +201,7 @@ private:
     uint64_t _activeCorrectionId{0};
     std::vector<uint64_t> _pendingCorrectionIds;
     std::unordered_set<uint64_t> _managedCorrectionIds;
+    bool _ignoreSegSurfaceChange{false};
     bool _correctionsZRangeEnabled{false};
     int _correctionsZMin{0};
     int _correctionsZMax{0};
