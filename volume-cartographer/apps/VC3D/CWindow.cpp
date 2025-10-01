@@ -1470,7 +1470,6 @@ void CWindow::onLocChanged(void)
 {
     // std::cout << "loc changed!" << "\n";
     
-    // sendLocChanged(spinLoc[0]->value(),spinLoc[1]->value(),spinLoc[2]->value());
 }
 
 void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers)

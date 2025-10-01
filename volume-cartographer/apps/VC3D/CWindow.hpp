@@ -63,9 +63,7 @@ public:
 
 
 signals:
-    void sendLocChanged(int x, int y, int z);
     void sendVolumeChanged(std::shared_ptr<Volume> vol, const std::string& volumeId);
-    void sendSliceChanged(std::string,Surface*);
     void sendOpChainSelected(OpChain*);
     void sendSurfacesLoaded();
     void sendVolumeClosing(); // Signal to notify viewers before closing volume
