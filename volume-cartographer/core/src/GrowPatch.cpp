@@ -142,7 +142,7 @@ struct TraceParameters {
 enum LossType {
     DIST,
     STRAIGHT,
-    DIRECTON,
+    DIRECTION,
     SNAP,
     NORMAL,
     COUNT
@@ -157,7 +157,7 @@ struct LossSettings {
         w[LossType::NORMAL] = 1.0f;
         w[LossType::STRAIGHT] = 0.2f;
         w[LossType::DIST] = 1.0f;
-        w[LossType::DIRECTON] = 1.0f;
+        w[LossType::DIRECTION] = 1.0f;
     }
 
     float operator()(LossType type, const cv::Vec2i& p) const {
@@ -474,7 +474,7 @@ int gen_direction_loss(ceres::Problem &problem,
     cv::Vec2i const p_off_horz{p[0], p[1] + off_dist};
     cv::Vec2i const p_off_vert{p[0] + off_dist, p[1]};
 
-    const float baseWeight = settings(LossType::DIRECTON, p);
+    const float baseWeight = settings(LossType::DIRECTION, p);
 
     int count = 0;
     for (const auto &field: direction_fields) {

@@ -107,6 +107,7 @@ struct DistLoss2D {
 
 struct StraightLoss {
     StraightLoss(float w) : _w(w) {};
+    static constexpr double kStraightAngleCosThreshold = 0.86602540378443864676; // cos(30°); deviations beyond 30° incur quadratic penalty
     template <typename T>
     bool operator()(const T* const a, const T* const b, const T* const c, T* residual) const {
         T d1[3], d2[3];
@@ -120,12 +121,12 @@ struct StraightLoss {
         
         T l1 = sqrt(d1[0]*d1[0] + d1[1]*d1[1] + d1[2]*d1[2]);
         T l2 = sqrt(d2[0]*d2[0] + d2[1]*d2[1] + d2[2]*d2[2]);
-        
+
         T dot = (d1[0]*d2[0] + d1[1]*d2[1] + d1[2]*d2[2])/(l1*l2);
         
 
-        if (dot <= T(0.866)) {
-            T penalty = T(0.866)-dot;
+        if (dot <= T(kStraightAngleCosThreshold)) {
+            T penalty = T(kStraightAngleCosThreshold)-dot;
             residual[0] = T(_w)*(T(1)-dot) + T(_w*8)*penalty*penalty;
         } else
             residual[0] = T(_w)*(T(1)-dot);

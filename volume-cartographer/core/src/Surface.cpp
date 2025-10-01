@@ -10,6 +10,7 @@
 
 #include <unordered_map>
 #include <nlohmann/json.hpp>
+#include <system_error>
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -1279,10 +1280,12 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
         std::filesystem::path new_version_path = versions_path / std::to_string(max_version + 1);
 
         if (renameat2(AT_FDCWD, temp_path.c_str(), AT_FDCWD, final_path.c_str(), RENAME_EXCHANGE) != 0) {
-            if (errno == ENOSYS) {
+            const int err = errno;
+            if (err == ENOSYS) {
                 throw std::runtime_error("Atomic exchange failed: renameat2 syscall with RENAME_EXCHANGE is not supported on this system. This operation requires Linux kernel >= 3.15.");
             } else {
-                throw std::runtime_error("atomic exchange failed for " + temp_path.string() + " and " + final_path.string() + ": " + strerror(errno));
+                const std::error_code ec(err, std::generic_category());
+                throw std::runtime_error("atomic exchange failed for " + temp_path.string() + " and " + final_path.string() + ": " + ec.message());
             }
         }
 
