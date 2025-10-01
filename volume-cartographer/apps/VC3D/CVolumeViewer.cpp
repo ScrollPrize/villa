@@ -18,6 +18,7 @@
 #include "vc/core/util/Render.hpp"
 
 #include <QPainter>
+#include <QScopedValueRollback>
 
 #include <opencv2/imgproc.hpp>
 
@@ -466,8 +467,12 @@ void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers m
             if (length > 0.0) {
                 focus->n = normal;
             }
+            focus->src = plane;
 
-            _surf_col->setPOI("focus", focus);
+            {
+                QScopedValueRollback<bool> focusGuard(_suppressFocusRecentering, true);
+                _surf_col->setPOI("focus", focus);
+            }
             handled = true;
         } else {
             if (_surf_name == "segmentation") {
@@ -919,7 +924,9 @@ void CVolumeViewer::onPOIChanged(std::string name, POI *poi)
         }
         
         if (auto* plane = dynamic_cast<PlaneSurface*>(_surf)) {
-            fGraphicsView->centerOn(0,0);
+            if (!_suppressFocusRecentering) {
+                fGraphicsView->centerOn(0, 0);
+            }
             if (poi->p == plane->origin())
                 return;
             
