@@ -142,21 +142,12 @@ private slots:
 
 private:
     void recalcAreaForSegments(const std::vector<std::string>& ids);
-    bool appInitComplete{false};
     std::shared_ptr<VolumePkg> fVpkg;
-    Surface *_seg_surf;
     QString fVpkgPath;
-    std::string fVpkgName;
 
     std::shared_ptr<Volume> currentVolume;
     std::string currentVolumeId;
     std::string _segmentationGrowthVolumeId;
-    int loc[3] = {0,0,0};
-
-
-    // Selection dock
-    QDockWidget* _dockSelection = nullptr;
-    QPushButton* _btnSurfaceFromSelection = nullptr;
 
     QComboBox* volSelect;
     QComboBox* cmbSegmentationDir;
@@ -225,5 +216,4 @@ private:
 
     void applySlicePlaneOrientation(Surface* sourceOverride = nullptr);
 
-    QAction* fImportObjAct;
 };  // class CWindow
