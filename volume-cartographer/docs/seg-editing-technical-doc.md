@@ -33,7 +33,7 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
    `SegmentationEditManager::recentTouched`). During a drag it projects the
    Gaussian radius into viewer space so users understand the footprint.
 5. **Persistence** – "Apply" copies the preview grid back into the base surface
-   and clears the edit map -- note that these also apply immediately after a manipulation of any vertex, so this is not typically necessary . "Reset" discards active drags and rebuilds the
+   and clears the edit map. Note that these actions (applying changes and clearing the edit map) also occur immediately after a manipulation of any vertex, so using "Apply" is not typically necessary. "Reset" discards active drags and rebuilds the
    preview from the original snapshot. A session ends by destroying the preview
    clone and clearing overlay state.
 
