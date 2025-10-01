@@ -814,12 +814,11 @@ void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf)
     if (_surf_name == name) {
         _surf = surf;
         if (!_surf) {
+            clearAllOverlayGroups();
             fScene->clear();
             _intersect_items.clear();
             slice_vis_items.clear();
             _paths.clear();
-            // Drop overlay references before notifying listeners so they do not touch deleted items
-            _overlay_groups.clear();
             emit overlaysUpdated();
             _cursor = nullptr;
             _center_marker = nullptr;
@@ -1932,6 +1931,7 @@ void CVolumeViewer::onVolumeClosing()
     // but keep the surface reference so it can render with the new volume
     else if (_surf_name == "xy plane" || _surf_name == "xz plane" || _surf_name == "yz plane") {
         if (fScene) {
+            clearAllOverlayGroups();
             fScene->clear();
         }
         // Clear all item collections
@@ -2069,10 +2069,36 @@ void CVolumeViewer::clearOverlayGroup(const std::string& key)
     if (it == _overlay_groups.end()) return;
     for (auto* item : it->second) {
         if (!item) continue;
-        fScene->removeItem(item);
+        if (auto* scene = item->scene()) {
+            scene->removeItem(item);
+        } else if (fScene) {
+            fScene->removeItem(item);
+        }
         delete item;
     }
     _overlay_groups.erase(it);
+}
+
+void CVolumeViewer::clearAllOverlayGroups()
+{
+    if (_overlay_groups.empty()) {
+        return;
+    }
+
+    for (auto& entry : _overlay_groups) {
+        for (auto* item : entry.second) {
+            if (!item) {
+                continue;
+            }
+            if (auto* scene = item->scene()) {
+                scene->removeItem(item);
+            } else if (fScene) {
+                fScene->removeItem(item);
+            }
+            delete item;
+        }
+    }
+    _overlay_groups.clear();
 }
 
 // Draw two small arrows indicating growth direction candidates:
