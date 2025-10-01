@@ -407,6 +407,29 @@ bool SegmentationEditManager::markInvalidRegion(int centerRow, int centerCol, fl
     return changed;
 }
 
+void SegmentationEditManager::clearInvalidatedEdits()
+{
+    if (_editedVertices.empty()) {
+        return;
+    }
+
+    bool removed = false;
+    for (auto it = _editedVertices.begin(); it != _editedVertices.end();) {
+        if (isInvalidPoint(it->second.currentWorld)) {
+            it = _editedVertices.erase(it);
+            removed = true;
+        } else {
+            ++it;
+        }
+    }
+
+    if (removed) {
+        _recentTouched.clear();
+    }
+
+    _dirty = !_editedVertices.empty();
+}
+
 bool SegmentationEditManager::isInvalidPoint(const cv::Vec3f& value)
 {
     return ::isInvalidPoint(value);

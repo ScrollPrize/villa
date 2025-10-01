@@ -154,16 +154,19 @@ void SegmentationWidget::buildUi()
     _spinSigma->setSingleStep(0.1);
     radiusSigmaRow->addWidget(sigmaLabel);
     radiusSigmaRow->addWidget(_spinSigma);
-    radiusSigmaRow->addSpacing(12);
+    radiusSigmaRow->addStretch(1);
+    falloffLayout->addLayout(radiusSigmaRow);
+
+    auto* pushPullRow = new QHBoxLayout();
     auto* pushPullLabel = new QLabel(tr("Push/Pull step (grid steps)"), falloffGroup);
     _spinPushPullStep = new QDoubleSpinBox(falloffGroup);
     _spinPushPullStep->setDecimals(2);
     _spinPushPullStep->setRange(0.05, 10.0);
     _spinPushPullStep->setSingleStep(0.05);
-    radiusSigmaRow->addWidget(pushPullLabel);
-    radiusSigmaRow->addWidget(_spinPushPullStep);
-    radiusSigmaRow->addStretch(1);
-    falloffLayout->addLayout(radiusSigmaRow);
+    pushPullRow->addWidget(pushPullLabel);
+    pushPullRow->addWidget(_spinPushPullStep);
+    pushPullRow->addStretch(1);
+    falloffLayout->addLayout(pushPullRow);
 
     falloffGroup->setLayout(falloffLayout);
     layout->addWidget(falloffGroup);

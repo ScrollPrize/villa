@@ -423,6 +423,7 @@ void SegmentationModule::refreshSessionFromSurface(QuadSurface* surface)
         return;
     }
     cancelDrag();
+    _editManager->clearInvalidatedEdits();
     _editManager->refreshFromBaseSurface();
     if (_surfaces) {
         _surfaces->setSurface("segmentation", _editManager->previewSurface());
