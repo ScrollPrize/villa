@@ -37,10 +37,10 @@ RUN cmake -S opencv -B build \
     -DWITH_TIFF=ON \
     -DWITH_CUDA=OFF \
     -DWITH_OPENCL=OFF \
-    -D BUILD_opencv_dnn=OFF \
-    -D BUILD_opencv_dnn_objdetect=OFF \
-    -D BUILD_opencv_dnn_superres=OFF \
-    -D BUILD_opencv_sfm=OFF
+    -DBUILD_opencv_dnn=OFF \
+    -DBUILD_opencv_dnn_objdetect=OFF \
+    -DBUILD_opencv_dnn_superres=OFF \
+    -DBUILD_opencv_sfm=OFF
 
 # Build & install
 RUN cmake --build build -- -j"$(nproc)" \
