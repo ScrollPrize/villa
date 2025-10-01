@@ -422,34 +422,76 @@ void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers m
         return;
     }
 
-    for(auto &col : _intersect_items)
-        for(auto &item : col.second)
+    for (auto& col : _intersect_items)
+        for (auto& item : col.second)
             item->setVisible(false);
 
+    bool handled = false;
+
     if (modifiers & Qt::ShiftModifier) {
-        // Z slice navigation
+        if (steps == 0) {
+            return;
+        }
+
+        PlaneSurface* plane = dynamic_cast<PlaneSurface*>(_surf);
         int adjustedSteps = steps;
-        if (_surf_name == "segmentation") {
-            adjustedSteps = (steps > 0) ? 1 : -1;
+
+        if (_surf_name != "segmentation" && plane && _surf_col) {
+            POI* focus = _surf_col->poi("focus");
+            if (!focus) {
+                focus = new POI;
+                focus->p = plane->origin();
+                focus->n = plane->normal(plane->pointer(), {});
+            }
+
+            cv::Vec3f normal = plane->normal(plane->pointer(), {});
+            const double length = cv::norm(normal);
+            if (length > 0.0) {
+                normal *= static_cast<float>(1.0 / length);
+            }
+
+            cv::Vec3f newPosition = focus->p + normal * static_cast<float>(adjustedSteps);
+
+            if (volume) {
+                const float maxX = static_cast<float>(volume->sliceWidth() - 1);
+                const float maxY = static_cast<float>(volume->sliceHeight() - 1);
+                const float maxZ = static_cast<float>(volume->numSlices() - 1);
+
+                newPosition[0] = std::clamp(newPosition[0], 0.0f, maxX);
+                newPosition[1] = std::clamp(newPosition[1], 0.0f, maxY);
+                newPosition[2] = std::clamp(newPosition[2], 0.0f, maxZ);
+            }
+
+            focus->p = newPosition;
+            if (length > 0.0) {
+                focus->n = normal;
+            }
+
+            _surf_col->setPOI("focus", focus);
+            handled = true;
+        } else {
+            if (_surf_name == "segmentation") {
+                adjustedSteps = (steps > 0) ? 1 : -1;
+            }
+
+            _z_off += adjustedSteps;
+
+            if (volume && plane) {
+                float effective_z = plane->origin()[2] + _z_off;
+                effective_z = std::max(0.0f, std::min(effective_z, static_cast<float>(volume->numSlices() - 1)));
+                _z_off = effective_z - plane->origin()[2];
+            }
+
+            renderVisible(true);
+            handled = true;
         }
-
-        _z_off += adjustedSteps;
-
-        // Clamp to valid range if we have volume data
-        if (volume && dynamic_cast<PlaneSurface*>(_surf)) {
-            PlaneSurface* plane = dynamic_cast<PlaneSurface*>(_surf);
-            float effective_z = plane->origin()[2] + _z_off;
-            effective_z = std::max(0.0f, std::min(effective_z, static_cast<float>(volume->numSlices() - 1)));
-            _z_off = effective_z - plane->origin()[2];
-        }
-
-        renderVisible(true);
     }
-    else {
+
+    if (!handled) {
         float zoom = pow(ZOOM_FACTOR, steps);
         _scale *= zoom;
         round_scale(_scale);
-        //we should only zoom when we haven't hit the max / min, otherwise the zoom starts to pan center on the mouse
+        // we should only zoom when we haven't hit the max / min, otherwise the zoom starts to pan center on the mouse
         if (_scale > MIN_ZOOM && _scale < MAX_ZOOM) {
             recalcScales();
 
@@ -460,12 +502,11 @@ void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers m
             // If the mouse were at the plane/surface origin, this adjustment should be zero
             // If the mouse were right of the plane origin, should translate to the left so that point ends up where it was
             fGraphicsView->translate(scene_loc.x() * (1 - zoom),
-                                    scene_loc.y() * (1 - zoom));
+                                     scene_loc.y() * (1 - zoom));
 
             curr_img_area = {0,0,0,0};
             int max_size = 100000;
             fGraphicsView->setSceneRect(-max_size/2, -max_size/2, max_size, max_size);
-
         }
         renderVisible();
         emit overlaysUpdated();
