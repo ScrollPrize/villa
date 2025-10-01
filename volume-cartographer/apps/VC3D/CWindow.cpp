@@ -96,6 +96,16 @@ constexpr float kAxisRotationDegreesPerScenePixel = 0.25f;
 constexpr float kEpsilon = 1e-6f;
 constexpr float kDegToRad = static_cast<float>(CV_PI / 180.0);
 
+int axisAlignedRotationCacheKey(float degrees)
+{
+    int key = static_cast<int>(std::lround(degrees));
+    key %= 360;
+    if (key < 0) {
+        key += 360;
+    }
+    return key;
+}
+
 cv::Vec3f rotateAroundZ(const cv::Vec3f& v, float radians)
 {
     const float c = std::cos(radians);
@@ -2864,6 +2874,13 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
         configurePlane(segXZ, _axisAlignedSegXZRotationDeg, cv::Vec3f(0.0f, 1.0f, 0.0f));
         configurePlane(segYZ, _axisAlignedSegYZRotationDeg, cv::Vec3f(1.0f, 0.0f, 0.0f));
 
+        if (segXZ) {
+            segXZ->setAxisAlignedRotationKey(axisAlignedRotationCacheKey(_axisAlignedSegXZRotationDeg));
+        }
+        if (segYZ) {
+            segYZ->setAxisAlignedRotationKey(axisAlignedRotationCacheKey(_axisAlignedSegYZRotationDeg));
+        }
+
         _surf_col->setSurface("seg xz", segXZ);
         _surf_col->setSurface("seg yz", segYZ);
         if (_planeSlicingOverlay) {
@@ -2898,6 +2915,8 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
         segYZ->setNormal(yDir - origin);
         segXZ->setInPlaneRotation(0.0f);
         segYZ->setInPlaneRotation(0.0f);
+        segXZ->setAxisAlignedRotationKey(-1);
+        segYZ->setAxisAlignedRotationKey(-1);
 
         _surf_col->setSurface("seg xz", segXZ);
         _surf_col->setSurface("seg yz", segYZ);

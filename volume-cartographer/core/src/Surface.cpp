@@ -105,6 +105,11 @@ void PlaneSurface::setInPlaneRotation(float radians)
     update();
 }
 
+void PlaneSurface::setAxisAlignedRotationKey(int key)
+{
+    _axisAlignedRotationKey = key;
+}
+
 //given origin and normal, return the normalized vector v which describes a point : origin + v which lies in the plane and maximizes v.x at the cost of v.y,v.z
 static cv::Vec3f vx_from_orig_norm(const cv::Vec3f &o, const cv::Vec3f &n)
 {
