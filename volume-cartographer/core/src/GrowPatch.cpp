@@ -21,11 +21,18 @@
 
 #include <iostream>
 #include <cctype>
+#include <random>
 
 #include "vc/tracer/Tracer.hpp"
 #include "vc/ui/VCCollection.hpp"
 
 namespace { // Anonymous namespace for local helpers
+
+cv::Vec3d random_perturbation(double max_abs_offset = 0.05) {
+    static thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_real_distribution<double> dist(-max_abs_offset, max_abs_offset);
+    return {dist(rng), dist(rng), dist(rng)};
+}
 
 struct Vec2iLess {
     bool operator()(const cv::Vec2i& a, const cv::Vec2i& b) const {
@@ -1300,7 +1307,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 if (avg[2] < loss_settings.z_min || avg[2] > loss_settings.z_max)
                     continue;
 
-                cv::Vec3d init = trace_params.dpoints(best_l)+cv::Vec3d((rand()%1000)/10000.0-0.05,(rand()%1000)/10000.0-0.05,(rand()%1000)/10000.0-0.05);
+                cv::Vec3d init = trace_params.dpoints(best_l) + random_perturbation();
                 trace_params.dpoints(p) = init;
 
                 // Set up a new local optimzation problem for the candidate point and its neighbors (initially just distance
