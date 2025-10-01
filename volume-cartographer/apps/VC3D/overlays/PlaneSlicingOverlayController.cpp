@@ -400,6 +400,43 @@ void PlaneSlicingOverlayController::handleMouseRelease(CVolumeViewer* viewer,
     }
 }
 
+bool PlaneSlicingOverlayController::isScenePointNearRotationHandle(CVolumeViewer* viewer,
+                                                                   const QPointF& scenePoint,
+                                                                   qreal radiusScale) const
+{
+    if (!_axisAlignedEnabled || !viewer || radiusScale <= 0.0) {
+        return false;
+    }
+
+    auto it = _viewerStates.find(viewer);
+    if (it == _viewerStates.end()) {
+        return false;
+    }
+
+    const qreal effectiveRadius = kHandleRadius * std::max<qreal>(radiusScale, 1.0);
+    const ViewerState& state = it->second;
+    for (const auto& entry : state.planes) {
+        const PlaneVisual& visual = entry.second;
+        if (pointInsideHandle(scenePoint, visual.handlePositiveScene, effectiveRadius) ||
+            pointInsideHandle(scenePoint, visual.handleNegativeScene, effectiveRadius)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool PlaneSlicingOverlayController::isVolumePointNearRotationHandle(CVolumeViewer* viewer,
+                                                                    const cv::Vec3f& volumePoint,
+                                                                    qreal radiusScale) const
+{
+    if (!viewer) {
+        return false;
+    }
+    const QPointF scenePoint = viewer->volumePointToScene(volumePoint);
+    return isScenePointNearRotationHandle(viewer, scenePoint, radiusScale);
+}
+
 float PlaneSlicingOverlayController::normalizeDegrees(float degrees)
 {
     while (degrees > 180.0f) {

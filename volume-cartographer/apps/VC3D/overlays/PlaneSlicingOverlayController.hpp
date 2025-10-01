@@ -22,6 +22,13 @@ public:
     void setAxisAlignedOverlayOpacity(float opacity);
     float axisAlignedOverlayOpacity() const { return _overlayOpacity; }
 
+    bool isVolumePointNearRotationHandle(CVolumeViewer* viewer,
+                                         const cv::Vec3f& volumePoint,
+                                         qreal radiusScale = 1.5) const;
+    bool isScenePointNearRotationHandle(CVolumeViewer* viewer,
+                                        const QPointF& scenePoint,
+                                        qreal radiusScale = 1.5) const;
+
 protected:
     bool isOverlayEnabledFor(CVolumeViewer* viewer) const override;
     void collectPrimitives(CVolumeViewer* viewer, OverlayBuilder& builder) override;
@@ -75,7 +82,7 @@ private:
     std::function<void(const std::string&, float)> _rotationSetter;
     float _overlayOpacity{0.7f};
 
-    std::unordered_map<CVolumeViewer*, ViewerState> _viewerStates;
+    mutable std::unordered_map<CVolumeViewer*, ViewerState> _viewerStates;
 
     struct ActiveDragState {
         CVolumeViewer* viewer{nullptr};

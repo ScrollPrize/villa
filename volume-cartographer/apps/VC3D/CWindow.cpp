@@ -923,6 +923,17 @@ void CWindow::CreateWidgets(void)
         _segmentationWidget->sigma(),
         this);
 
+    if (_segmentationModule && _planeSlicingOverlay) {
+        QPointer<PlaneSlicingOverlayController> overlayPtr(_planeSlicingOverlay.get());
+        _segmentationModule->setRotationHandleHitTester(
+            [overlayPtr](CVolumeViewer* viewer, const cv::Vec3f& worldPos) {
+                if (!overlayPtr) {
+                    return false;
+                }
+                return overlayPtr->isVolumePointNearRotationHandle(viewer, worldPos, 1.5);
+            });
+    }
+
     connect(_segmentationModule.get(), &SegmentationModule::editingEnabledChanged,
             this, &CWindow::onSegmentationEditingModeChanged);
     connect(_segmentationModule.get(), &SegmentationModule::statusMessageRequested,
