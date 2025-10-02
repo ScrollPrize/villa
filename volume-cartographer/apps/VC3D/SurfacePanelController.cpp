@@ -31,6 +31,7 @@
 #include <QVector>
 
 #include <iostream>
+#include <unordered_set>
 #include <set>
 #include <filesystem>
 
@@ -146,12 +147,26 @@ void SurfacePanelController::loadSurfacesIncremental()
     _volumePkg->refreshSegmentations();
     auto changes = detectSurfaceChanges();
 
-    for (const auto& id : changes.toRemove) {
-        removeSingleSegmentation(id);
+    if (_ui.treeWidget) {
+        const QSignalBlocker blocker{_ui.treeWidget};
+        // Perform UI mutations without emitting per-item signals.
+        for (const auto& id : changes.toRemove) {
+            removeSingleSegmentation(id);
+        }
+        for (const auto& id : changes.toAdd) {
+            addSingleSegmentation(id);
+        }
+    } else {
+        for (const auto& id : changes.toRemove) {
+            removeSingleSegmentation(id);
+        }
+        for (const auto& id : changes.toAdd) {
+            addSingleSegmentation(id);
+        }
     }
-    for (const auto& id : changes.toAdd) {
-        addSingleSegmentation(id);
-    }
+
+    std::cout << "Incremental delta: add=" << changes.toAdd.size()
+        << " remove=" << changes.toRemove.size() << std::endl;
 
     applyFilters();
     if (_filtersUpdated) {
@@ -168,31 +183,51 @@ SurfacePanelController::SurfaceChanges SurfacePanelController::detectSurfaceChan
         return changes;
     }
 
-    std::set<std::string> diskIds;
+    // Build the set of segmentation IDs currently present on disk.
+    std::unordered_set<std::string> diskIds;
     for (const auto& id : _volumePkg->segmentationIDs()) {
         diskIds.insert(id);
     }
 
-    std::set<std::string> loadedIds;
-    for (const auto& id : _volumePkg->getLoadedSurfaceIDs()) {
-        loadedIds.insert(id);
+    // Build the set of IDs that the UI currently knows about (tree contents).
+    std::unordered_set<std::string> uiIds;
+    if (_ui.treeWidget) {
+        QTreeWidgetItemIterator it(_ui.treeWidget);
+        while (*it) {
+            const auto qid = (*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
+            if (!qid.isEmpty()) {
+                uiIds.insert(qid.toStdString());
+            }
+            ++it;
+        }
+    } else {
+        // Fallback: if no UI is present, best-effort use currently loaded surfaces
+        // (legacy behavior), but note this may be over-inclusive.
+        for (const auto& id : _volumePkg->getLoadedSurfaceIDs()) {
+            uiIds.insert(id);
+        }
     }
 
+    // toAdd: present on disk but not yet in the UI tree
+    changes.toAdd.reserve(diskIds.size());
     for (const auto& id : diskIds) {
-        if (!loadedIds.contains(id)) {
+        if (!uiIds.contains(id)) {
             changes.toAdd.push_back(id);
         }
     }
 
-    for (const auto& loadedId : loadedIds) {
-        if (!diskIds.contains(loadedId)) {
-            try {
-                (void)_volumePkg->segmentation(loadedId);
-            } catch (const std::out_of_range&) {
-                changes.toRemove.push_back(loadedId);
-            }
+    // toRemove: present in the UI tree but no longer on disk
+    changes.toRemove.reserve(uiIds.size());
+    for (const auto& uiId : uiIds) {
+        if (!diskIds.contains(uiId)) {
+            changes.toRemove.push_back(uiId);
         }
     }
+
+    std::cout << "detectSurfaceChanges: disk=" << diskIds.size()
+              << " ui=" << uiIds.size()
+              << " add=" << changes.toAdd.size()
+              << " remove=" << changes.toRemove.size() << std::endl;
     return changes;
 }
 
