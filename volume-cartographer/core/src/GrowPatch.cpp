@@ -29,6 +29,10 @@
 #include "vc/tracer/Tracer.hpp"
 #include "vc/ui/VCCollection.hpp"
 
+#define LOSS_STRAIGHT 1
+#define LOSS_DIST 2
+#define LOSS_NORMALSNAP 4
+
 namespace { // Anonymous namespace for local helpers
 
 std::optional<uint32_t> environment_seed()
@@ -199,8 +203,8 @@ struct LossSettings {
 
     LossSettings() {
         w[LossType::SNAP] = 0.1f;
-        w[LossType::NORMAL] = 1.0f;
-        w[LossType::STRAIGHT] = 0.2f;
+        w[LossType::NORMAL] = 10.0f;
+        w[LossType::STRAIGHT] = 0.1f;
         w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 1.0f;
     }
@@ -554,8 +558,8 @@ static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<u
 static int conditional_corr_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
                                  ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, TraceParameters &trace_params);
 
-static int add_continuous_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params,
-    const TraceData &trace_data, const LossSettings &settings)
+static int add_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params,
+    const TraceData &trace_data, const LossSettings &settings, int flags = LOSS_STRAIGHT | LOSS_DIST)
 {
     //generate losses for point p
     int count = 0;
@@ -563,44 +567,50 @@ static int add_continuous_losses(ceres::Problem &problem, const cv::Vec2i &p, Tr
     if (p[0] < 2 || p[1] < 2 || p[1] >= params.state.cols-2 || p[0] >= params.state.rows-2)
         throw std::runtime_error("point too close to problem border!");
 
-    //horizontal
-    count += gen_straight_loss(problem, p, {0,-2},{0,-1},{0,0}, params, settings);
-    count += gen_straight_loss(problem, p, {0,-1},{0,0},{0,1}, params, settings);
-    count += gen_straight_loss(problem, p, {0,0},{0,1},{0,2}, params, settings);
+    if (flags & LOSS_STRAIGHT) {
+        //horizontal
+        count += gen_straight_loss(problem, p, {0,-2},{0,-1},{0,0}, params, settings);
+        count += gen_straight_loss(problem, p, {0,-1},{0,0},{0,1}, params, settings);
+        count += gen_straight_loss(problem, p, {0,0},{0,1},{0,2}, params, settings);
 
-    //vertical
-    count += gen_straight_loss(problem, p, {-2,0},{-1,0},{0,0}, params, settings);
-    count += gen_straight_loss(problem, p, {-1,0},{0,0},{1,0}, params, settings);
-    count += gen_straight_loss(problem, p, {0,0},{1,0},{2,0}, params, settings);
+        //vertical
+        count += gen_straight_loss(problem, p, {-2,0},{-1,0},{0,0}, params, settings);
+        count += gen_straight_loss(problem, p, {-1,0},{0,0},{1,0}, params, settings);
+        count += gen_straight_loss(problem, p, {0,0},{1,0},{2,0}, params, settings);
 
 
-    //diag1
-    count += gen_straight_loss(problem, p, {-2,-2},{-1,-1},{0,0}, params, settings);
-    count += gen_straight_loss(problem, p, {-1,-1},{0,0},{1,1}, params, settings);
-    count += gen_straight_loss(problem, p, {0,0},{1,1},{2,2}, params, settings);
+        //diag1
+        count += gen_straight_loss(problem, p, {-2,-2},{-1,-1},{0,0}, params, settings);
+        count += gen_straight_loss(problem, p, {-1,-1},{0,0},{1,1}, params, settings);
+        count += gen_straight_loss(problem, p, {0,0},{1,1},{2,2}, params, settings);
 
-    //diag2
-    count += gen_straight_loss(problem, p, {-2,2},{-1,1},{0,0}, params, settings);
-    count += gen_straight_loss(problem, p, {-1,1},{0,0},{1,-1}, params, settings);
-    count += gen_straight_loss(problem, p, {0,0},{1,-1},{2,-2}, params, settings);
+        //diag2
+        count += gen_straight_loss(problem, p, {-2,2},{-1,1},{0,0}, params, settings);
+        count += gen_straight_loss(problem, p, {-1,1},{0,0},{1,-1}, params, settings);
+        count += gen_straight_loss(problem, p, {0,0},{1,-1},{2,-2}, params, settings);
+    }
 
-    //direct neighboars
-    count += gen_dist_loss(problem, p, {0,-1}, params, settings);
-    count += gen_dist_loss(problem, p, {0,1}, params, settings);
-    count += gen_dist_loss(problem, p, {-1,0}, params, settings);
-    count += gen_dist_loss(problem, p, {1,0}, params, settings);
+    if (flags & LOSS_DIST) {
+        //direct neighboars
+        count += gen_dist_loss(problem, p, {0,-1}, params, settings);
+        count += gen_dist_loss(problem, p, {0,1}, params, settings);
+        count += gen_dist_loss(problem, p, {-1,0}, params, settings);
+        count += gen_dist_loss(problem, p, {1,0}, params, settings);
 
-    //diagonal neighbors
-    count += gen_dist_loss(problem, p, {1,-1}, params, settings);
-    count += gen_dist_loss(problem, p, {-1,1}, params, settings);
-    count += gen_dist_loss(problem, p, {1,1}, params, settings);
-    count += gen_dist_loss(problem, p, {-1,-1}, params, settings);
+        //diagonal neighbors
+        count += gen_dist_loss(problem, p, {1,-1}, params, settings);
+        count += gen_dist_loss(problem, p, {-1,1}, params, settings);
+        count += gen_dist_loss(problem, p, {1,1}, params, settings);
+        count += gen_dist_loss(problem, p, {-1,-1}, params, settings);
+    }
 
-    //gridstore normals
-    // count += gen_normal_loss(problem, p                   , params, trace_data, settings);
-    // count += gen_normal_loss(problem, p + cv::Vec2i(-1,-1), params, trace_data, settings);
-    // count += gen_normal_loss(problem, p + cv::Vec2i( 0,-1), params, trace_data, settings);
-    // count += gen_normal_loss(problem, p + cv::Vec2i(-1, 0), params, trace_data, settings);
+    if (flags & LOSS_NORMALSNAP) {
+        //gridstore normals
+        count += gen_normal_loss(problem, p                   , params, trace_data, settings);
+        count += gen_normal_loss(problem, p + cv::Vec2i(-1,-1), params, trace_data, settings);
+        count += gen_normal_loss(problem, p + cv::Vec2i( 0,-1), params, trace_data, settings);
+        count += gen_normal_loss(problem, p + cv::Vec2i(-1, 0), params, trace_data, settings);
+    }
 
     return count;
 }
@@ -758,7 +768,147 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
 }
 
 
+template <typename T>
+void masked_blur(cv::Mat_<T>& img, const cv::Mat_<uchar>& mask) {
+    cv::Mat_<T> fw_pass = img.clone();
+    cv::Mat_<T> bw_pass = img.clone();
+
+    // Initial forward pass (top-left neighbors)
+    for (int y = 1; y < img.rows; ++y) {
+        for (int x = 1; x < img.cols - 1; ++x) {
+            if (mask(y, x) == 0) {
+                T val = (fw_pass(y - 1, x) + fw_pass(y, x - 1) + fw_pass(y - 1, x - 1) + fw_pass(y - 1, x + 1)) * 0.25;
+                fw_pass(y, x) = val;
+            }
+        }
+    }
+
+    // Initial backward pass (bottom-right neighbors)
+    for (int y = img.rows - 2; y >= 0; --y) {
+        for (int x = img.cols - 2; x >= 1; --x) {
+            if (mask(y, x) == 0) {
+                T val = (bw_pass(y + 1, x) + bw_pass(y, x + 1) + bw_pass(y + 1, x + 1) + bw_pass(y + 1, x - 1)) * 0.25;
+                bw_pass(y, x) = val;
+            }
+        }
+    }
+
+    // Average initial passes
+    for (int y = 0; y < img.rows; ++y) {
+        for (int x = 0; x < img.cols; ++x) {
+            if (mask(y, x) == 0) {
+                img(y, x) = (fw_pass(y, x) + bw_pass(y, x)) * 0.5;
+            }
+        }
+    }
+
+    // 4 additional passes
+    for (int i = 0; i < 4; ++i) {
+        // Forward pass
+        for (int y = 1; y < img.rows; ++y) {
+            for (int x = 1; x < img.cols - 1; ++x) {
+                if (mask(y, x) == 0) {
+                    T val = (img(y, x) + img(y - 1, x) + img(y, x - 1) + img(y - 1, x - 1) + img(y - 1, x + 1)) * 0.2;
+                    img(y, x) = val;
+                }
+            }
+        }
+        // Backward pass
+        for (int y = img.rows - 2; y >= 0; --y) {
+            for (int x = img.cols - 2; x >= 1; --x) {
+                if (mask(y, x) == 0) {
+                    T val = (img(y, x) + img(y + 1, x) + img(y, x + 1) + img(y + 1, x + 1) + img(y + 1, x - 1)) * 0.2;
+                    img(y, x) = val;
+                }
+            }
+        }
+    }
+}
+
+static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, const TraceData &trace_data, LossSettings &settings, int flags);
+
 //optimize within a radius, setting edge points to constant
+static void inpaint(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, const TraceData &trace_data)
+{
+    // check that a two pixel border is 1
+    for (int y = 0; y < roi.height; ++y) {
+        for (int x = 0; x < roi.width; ++x) {
+            if (y < 2 || y >= roi.height - 2 || x < 2 || x >= roi.width - 2) {
+                if (mask(y, x) == 0) {
+                    throw std::runtime_error("Mask border is not 1");
+                }
+            }
+        }
+    }
+
+    cv::Mat_<cv::Vec3d> dpoints_roi = params.dpoints(roi);
+    masked_blur(dpoints_roi, mask);
+
+    ceres::Problem problem;
+    LossSettings settings;
+    settings[DIST] = 1.0;
+    settings[STRAIGHT] = 1.0;
+
+    for (int y = 0; y < roi.height; ++y) {
+        for (int x = 0; x < roi.width; ++x) {
+            if (!mask(y, x)) {
+                params.state(roi.y + y, roi.x + x) = STATE_LOC_VALID | STATE_COORD_VALID;
+            }
+        }
+    }
+
+    LossSettings base;
+    base[NORMAL] = 10.0;
+    LossSettings nosnap = base;
+    nosnap[SNAP] = 0;
+    local_optimization(roi, mask, params, trace_data, nosnap, LOSS_DIST | LOSS_STRAIGHT);
+    local_optimization(roi, mask, params, trace_data, nosnap, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+
+    LossSettings lowsnap = base;
+    lowsnap[SNAP] = 0.01*base[SNAP];
+    local_optimization(roi, mask, params, trace_data, lowsnap, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+    lowsnap[SNAP] = 0.1*base[SNAP];
+    local_optimization(roi, mask, params, trace_data, lowsnap, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+    lowsnap[SNAP] = base[SNAP];
+    local_optimization(roi, mask, params, trace_data, lowsnap, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+    LossSettings default_settings;
+    local_optimization(roi, mask, params, trace_data, default_settings, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+}
+
+
+//optimize within a radius, setting edge points to constant
+static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, const TraceData &trace_data, LossSettings &settings, int flags)
+{
+    ceres::Problem problem;
+
+    for (int y = 2; y < roi.height - 2; ++y) {
+        for (int x = 2; x < roi.width - 2; ++x) {
+            // if (!mask(y, x)) {
+                add_losses(problem, {roi.y + y, roi.x + x}, params, trace_data, settings, flags);
+            // }
+        }
+    }
+
+    for (int y = 0; y < roi.height; ++y) {
+        for (int x = 0; x < roi.width; ++x) {
+            if (mask(y, x) && problem.HasParameterBlock(&params.dpoints.at<cv::Vec3d>(roi.y + y, roi.x + x)[0])) {
+                problem.SetParameterBlockConstant(&params.dpoints.at<cv::Vec3d>(roi.y + y, roi.x + x)[0]);
+            }
+        }
+    }
+
+    ceres::Solver::Options options;
+    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    options.max_num_iterations = 10000;
+    // options.minimizer_progress_to_stdout = true;
+    ceres::Solver::Summary summary;
+    ceres::Solve(options, &problem, &summary);
+
+    std::cout << "inpaint solve " << summary.BriefReport() << std::endl;
+
+    // cv::imwrite("opt_mask.tif", mask);
+}
+
 static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters &params,
     TraceData& trace_data, LossSettings &settings, bool quiet = false, bool parallel = false)
 {
@@ -942,8 +1092,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     TraceData trace_data(direction_fields);
     LossSettings loss_settings;
     TraceParameters trace_params;
-
-
+    int snapshot_interval = params.value("snapshot-interval", 0);
     int stop_gen = params.value("generations", 100);
     float step = params.value("step_size", 20.0f);
     trace_params.unit = step*scale;
@@ -963,7 +1112,20 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
     int w, h;
     if (resume_surf) {
-        cv::Mat resume_generations = resume_surf->channel("generations");
+        cv::Mat_<uint16_t> resume_generations = resume_surf->channel("generations");
+        if (resume_generations.empty()) {
+            cv::Mat_<cv::Vec3f> resume_points = resume_surf->rawPoints();
+            resume_generations = cv::Mat_<uint16_t>(resume_points.size(), (uint16_t)0);
+
+            for (int j = 0; j < resume_points.rows; ++j) {
+                for (int i = 0; i < resume_points.cols; ++i) {
+                    if (resume_points(j,i)[0] != -1) {
+                        resume_generations(j,i) = 1;
+                    }
+                }
+            }
+            resume_surf->setChannel("generations", resume_generations);
+        }
         double min_val, max_val;
         cv::minMaxLoc(resume_generations, &min_val, &max_val);
         int start_gen = (rewind_gen == -1) ? static_cast<int>(max_val) : rewind_gen;
@@ -976,6 +1138,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         w = 2*stop_gen+50;
         h = w;
     }
+
     cv::Size size = {w,h};
     cv::Rect bounds(0,0,w,h);
 
@@ -1030,6 +1193,52 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         auto surf = new QuadSurface(points_crop, {1/T, 1/T});
         surf->setChannel("generations", generations_crop);
 
+        if (params.value("vis_losses", false)) {
+            cv::Mat_<float> loss_dist(generations_crop.size(), 0.0f);
+            cv::Mat_<float> loss_straight(generations_crop.size(), 0.0f);
+            cv::Mat_<float> loss_normal(generations_crop.size(), 0.0f);
+            cv::Mat_<float> loss_snap(generations_crop.size(), 0.0f);
+
+#pragma omp paralle for schedule(dynamic)
+            for (int y = 0; y < generations_crop.rows; ++y) {
+                for (int x = 0; x < generations_crop.cols; ++x) {
+                    cv::Vec2i p = {used_area_safe.y + y, used_area_safe.x + x};
+                    if (generations(p) > 0) {
+                        ceres::Problem problem_dist, problem_straight, problem_normal, problem_snap;
+                        
+                        LossSettings settings_dist, settings_straight, settings_normal, settings_snap;
+                        
+                        settings_dist[DIST] = 1.0;
+                        add_losses(problem_dist, p, trace_params, trace_data, settings_dist, LOSS_DIST);
+                        
+                        settings_straight[STRAIGHT] = 1.0;
+                        add_losses(problem_straight, p, trace_params, trace_data, settings_straight, LOSS_STRAIGHT);
+                        
+                        settings_normal[NORMAL] = 1.0;
+                        add_losses(problem_normal, p, trace_params, trace_data, settings_normal, LOSS_NORMALSNAP);
+
+                        settings_snap[SNAP] = 1.0;
+                        add_losses(problem_snap, p, trace_params, trace_data, settings_snap, LOSS_NORMALSNAP);
+
+                        double cost_dist = 0, cost_straight = 0, cost_normal = 0, cost_snap = 0;
+                        problem_dist.Evaluate(ceres::Problem::EvaluateOptions(), &cost_dist, nullptr, nullptr, nullptr);
+                        problem_straight.Evaluate(ceres::Problem::EvaluateOptions(), &cost_straight, nullptr, nullptr, nullptr);
+                        problem_normal.Evaluate(ceres::Problem::EvaluateOptions(), &cost_normal, nullptr, nullptr, nullptr);
+                        problem_snap.Evaluate(ceres::Problem::EvaluateOptions(), &cost_snap, nullptr, nullptr, nullptr);
+
+                        loss_dist(y, x) = sqrt(cost_dist);
+                        loss_straight(y, x) = sqrt(cost_straight);
+                        loss_normal(y, x) = sqrt(cost_normal);
+                        loss_snap(y, x) = sqrt(cost_snap);
+                    }
+                }
+            }
+            surf->setChannel("loss_dist", loss_dist);
+            surf->setChannel("loss_straight", loss_straight);
+            surf->setChannel("loss_normal", loss_normal);
+            surf->setChannel("loss_snap", loss_snap);
+        }
+
         const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
         const double voxel_size_d = static_cast<double>(voxelsize);
         const double area_est_cm2 = area_est_vx2 * voxel_size_d * voxel_size_d / 1e8;
@@ -1051,6 +1260,10 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     int loss_count = 0;
     double last_elapsed_seconds = 0.0;
     int last_succ = 0;
+    int start_gen = 0;
+
+    int resume_pad_y = 0;
+    int resume_pad_x = 0;
 
     std::cout << "lets go! " << std::endl;
 
@@ -1062,16 +1275,16 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         }
 
         cv::Mat_<cv::Vec3f> resume_points = resume_surf->rawPoints();
-        cv::Mat resume_generations = resume_surf->channel("generations");
+        cv::Mat_<uint16_t> resume_generations = resume_surf->channel("generations");
 
-        int pad_x = (w - resume_points.cols) / 2;
-        int pad_y = (h - resume_points.rows) / 2;
+        resume_pad_x = (w - resume_points.cols) / 2;
+        resume_pad_y = (h - resume_points.rows) / 2;
 
-        used_area = cv::Rect(pad_x, pad_y, resume_points.cols, resume_points.rows);
+        used_area = cv::Rect(resume_pad_x, resume_pad_y, resume_points.cols, resume_points.rows);
  
         double min_val, max_val;
         cv::minMaxLoc(resume_generations, &min_val, &max_val);
-        int start_gen = (rewind_gen == -1) ? static_cast<int>(max_val) : rewind_gen;
+        start_gen = (rewind_gen == -1) ? static_cast<int>(max_val) : rewind_gen;
         generation = start_gen;
 
         int min_gen = std::numeric_limits<int>::max();
@@ -1079,8 +1292,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         y0 = -1;
         for (int j = 0; j < resume_points.rows; ++j) {
             for (int i = 0; i < resume_points.cols; ++i) {
-                int target_y = pad_y + j;
-                int target_x = pad_x + i;
+                int target_y = resume_pad_y + j;
+                int target_x = resume_pad_x + i;
                 uint16_t gen = resume_generations.at<uint16_t>(j, i);
                 if (gen > 0 && gen <= start_gen && resume_points(j,i)[0] != -1) {
                     trace_params.dpoints(target_y, target_x) = resume_points(j, i);
@@ -1123,9 +1336,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
                 for (int j = 0; j < mask.rows; ++j) {
                     for (int i = 0; i < mask.cols; ++i) {
-                        if (mask.at<uint8_t>(j, i) == 0 && trace_params.state(pad_y + j, pad_x + i)) {
-                            int target_y = pad_y + j;
-                            int target_x = pad_x + i;
+                        if (mask.at<uint8_t>(j, i) == 0 && trace_params.state(resume_pad_y + j, resume_pad_x + i)) {
+                            int target_y = resume_pad_y + j;
+                            int target_x = resume_pad_x + i;
                             cv::Point2f p(target_x, target_y);
                             bool keep = false;
                             for (const auto& hull : all_hulls) {
@@ -1171,25 +1384,78 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
                 std::cout << "correction opt centered at " << avg_loc << " with radius " << radius << std::endl;
                 LossSettings loss_inpaint = loss_settings;
-                loss_inpaint[SNAP] = 0.0;
+                loss_inpaint[SNAP] *= 0.01;
                 loss_inpaint[DIST] *= 0.1;
+                loss_inpaint[STRAIGHT] *= 10.0;
                 local_optimization(radius, corr_center_i, trace_params, trace_data, loss_inpaint, false, true);
-                loss_inpaint[SNAP] = 0.01;
-                local_optimization(radius, corr_center_i, trace_params, trace_data, loss_inpaint, false, true);
-                loss_inpaint[SNAP] = 0.05;
-                local_optimization(radius, corr_center_i, trace_params, trace_data, loss_inpaint, false, true);
-                local_optimization(radius, corr_center_i, trace_params, trace_data, loss_settings, false, true);
-                local_optimization(radius, corr_center_i, trace_params, trace_data, loss_settings, false, true);
             }
 
-            trace_data.point_correction = PointCorrection();
+            if (!tgt_path.empty() && snapshot_interval > 0) {
+                QuadSurface* surf = create_surface_from_state();
+                surf->save(tgt_path.string()+"_s1", true);
+                delete surf;
+            }
+
+
+            for (const auto& opt_params : opt_centers) {
+                LossSettings loss_inpaint = loss_settings;
+                loss_inpaint[SNAP] *= 0.1;
+                loss_inpaint[DIST] *= 0.1;
+                loss_inpaint[STRAIGHT] *= 10.0;
+                local_optimization(opt_params.radius, opt_params.center, trace_params, trace_data, loss_inpaint, false, true);
+            }
+
+            if (!tgt_path.empty() && snapshot_interval > 0) {
+                QuadSurface* surf = create_surface_from_state();
+                surf->save(tgt_path.string()+"_s2", true);
+                delete surf;
+            }
 
             for (const auto& opt_params : opt_centers) {
                 LossSettings loss_inpaint = loss_settings;
                 loss_inpaint[DIST] *= 0.1;
+                loss_inpaint[STRAIGHT] *= 10.0;
                 local_optimization(opt_params.radius, opt_params.center, trace_params, trace_data, loss_inpaint, false, true);
             }
 
+            if (!tgt_path.empty() && snapshot_interval > 0) {
+                QuadSurface* surf = create_surface_from_state();
+                surf->save(tgt_path.string()+"_s3", true);
+                delete surf;
+            }
+
+            for (const auto& opt_params : opt_centers) {
+                local_optimization(opt_params.radius, opt_params.center, trace_params, trace_data, loss_settings, false, true);
+            }
+
+            if (!tgt_path.empty() && snapshot_interval > 0) {
+                QuadSurface* surf = create_surface_from_state();
+                surf->save(tgt_path.string()+"_s4", true);
+                delete surf;
+            }
+
+
+            // for (const auto& opt_params : opt_centers)
+                // local_optimization(opt_params.radius, opt_params.center, trace_params, trace_data, loss_settings, false, true);
+
+            // if (!tgt_path.empty() && snapshot_interval > 0) {
+            //     QuadSurface* surf = create_surface_from_state();
+            //     surf->save(tgt_path.string()+"_s3", true);
+            //     delete surf;
+            // }
+
+            // trace_data.point_correction = PointCorrection();
+
+            // for (const auto& opt_params : opt_centers) {
+            //     local_optimization(opt_params.radius, opt_params.center, trace_params, trace_data, loss_settings, false, true);
+            // }
+
+            if (!tgt_path.empty() && snapshot_interval > 0) {
+                QuadSurface* surf = create_surface_from_state();
+                surf->save(tgt_path, true);
+                delete surf;
+                std::cout << "saved snapshot in " << tgt_path << std::endl;
+            }
         }
 
         // Rebuild fringe from valid points
@@ -1239,6 +1505,91 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     //just continue on resume no additional global opt
     if (!resume_surf) {
         local_optimization(8, {y0,x0}, trace_params, trace_data, loss_settings, true);
+    } else {
+        cv::Mat mask = resume_surf->channel("mask");
+        cv::Mat_<uchar> hole_mask(trace_params.state.size(), (uchar)0);
+        
+        cv::Mat active_area_mask(trace_params.state.size(), (uchar)0);
+        for (int y = 0; y < trace_params.state.rows; ++y) {
+            for (int x = 0; x < trace_params.state.cols; ++x) {
+                if (trace_params.state(y, x) & STATE_LOC_VALID) {
+                    active_area_mask.at<uchar>(y, x) = 255;
+                }
+            }
+        }
+
+        if (!mask.empty()) {
+            cv::Mat padded_mask = cv::Mat::zeros(trace_params.state.size(), CV_8U);
+            mask.copyTo(padded_mask(used_area));
+            cv::bitwise_and(active_area_mask, padded_mask, hole_mask);
+        } else {
+            active_area_mask.copyTo(hole_mask);
+        }
+
+        std::vector<std::vector<cv::Point>> contours;
+        std::vector<cv::Vec4i> hierarchy;
+        cv::findContours(hole_mask, contours, hierarchy, cv::RETR_CCOMP, cv::CHAIN_APPROX_SIMPLE);
+
+        std::cout << "inpaint!" << contours.size() << std::endl;
+
+        int inpaint_count = 0;
+        int inpaint_skip = 0;
+
+        cv::Mat_<cv::Vec3b> vis(hole_mask.size());
+
+// #pragma omp parallel for schedule(dynamic)
+        for (int i = 0; i < contours.size(); i++) {
+            if (hierarchy[i][3] != -1) { // It's a hole
+                cv::Rect roi = cv::boundingRect(contours[i]);
+                
+                int margin = 4;
+                roi.x = std::max(0, roi.x - margin);
+                roi.y = std::max(0, roi.y - margin);
+                roi.width = std::min(hole_mask.cols - roi.x, roi.width + 2 * margin);
+                roi.height = std::min(hole_mask.rows - roi.y, roi.height + 2 * margin);
+
+                // std::cout << hole_mask.size() << trace_params.state.size() << resume_pad_x << "x" << resume_pad_y << std::endl;
+
+                // cv::Point testp(2492+resume_pad_x, 508+resume_pad_y);
+                cv::Point testp(2500+resume_pad_x, 566+resume_pad_y);
+                // cv::Point testp(2340+resume_pad_x, 577+resume_pad_y);
+
+                cv::rectangle(vis, roi, cv::Scalar(255,255,255));
+
+                if (!roi.contains(testp)) {
+                    // std::cout << "skip " << roi << std::endl;
+                    continue;
+                }
+
+                cv::Mat_<uchar> inpaint_mask(roi.size(), (uchar)1);
+                
+                std::vector<cv::Point> hole_contour_roi;
+                for(const auto& p : contours[i]) {
+                    hole_contour_roi.push_back({p.x - roi.x, p.y - roi.y});
+                }
+                std::vector<std::vector<cv::Point>> contours_to_fill = {hole_contour_roi};
+                cv::fillPoly(inpaint_mask, contours_to_fill, cv::Scalar(0));
+
+                std::cout << "Inpainting hole at " << roi << " - " << inpaint_count << "+" << inpaint_skip << "/" << contours.size() << std::endl;
+                inpaint(roi, inpaint_mask, trace_params, trace_data);
+
+#pragma omp critical
+                if (inpaint_count % 10 == 0 && !tgt_path.empty() && snapshot_interval > 0) {
+                    QuadSurface* surf = create_surface_from_state();
+                    surf->save(tgt_path, true);
+                    delete surf;
+                    std::cout << "saved snapshot in " << tgt_path << std::endl;
+                }
+
+#pragma omp atomic
+                inpaint_count++;
+            }
+            else
+#pragma omp atomic
+                inpaint_skip++;
+        }
+
+        cv::imwrite("vis_inp_rect.tif", vis);
     }
 
     // Prepare a new set of Ceres options used later during local solves
@@ -1353,7 +1704,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 ceres::Problem problem;
 
                 trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
-                int local_loss_count = add_continuous_losses(problem, p, trace_params, trace_data, loss_settings);
+                int local_loss_count = add_losses(problem, p, trace_params, trace_data, loss_settings, LOSS_DIST | LOSS_STRAIGHT);
 
                 std::vector<double*> parameter_blocks;
                 problem.GetParameterBlocks(&parameter_blocks);
@@ -1379,8 +1730,14 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     succ_gen_ps.push_back(p);
                 }
 
-                for (int i=1;i<local_opt_r;i++)
-                    local_optimization(i, p, trace_params, trace_data, loss_settings, true);
+                // LossSettings loss_grow = loss_settings;
+                // loss_grow[DIST] *= 0.1;
+                // for (int i=1;i<local_opt_r;i++)
+                    // local_optimization(i, p, trace_params, trace_data, loss_grow, true);
+
+                local_optimization(1, p, trace_params, trace_data, loss_settings, true);
+                if (local_opt_r > 1)
+                    local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true);
             }  // end parallel iteration over cands
         }
 
@@ -1451,7 +1808,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         timer_gen.unit_string = "vx^2";
         // print_accessor_stats();
 
-        int snapshot_interval = params.value("snapshot-interval", 0);
         if (!tgt_path.empty() && snapshot_interval > 0 && generation % snapshot_interval == 0) {
             QuadSurface* surf = create_surface_from_state();
             surf->save(tgt_path, true);
