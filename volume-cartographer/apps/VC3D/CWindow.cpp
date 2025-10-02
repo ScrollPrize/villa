@@ -90,6 +90,225 @@ Q_LOGGING_CATEGORY(lcAxisSlices, "vc.axis_aligned");
 using qga = QGuiApplication;
 using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 
+// ---- Area recompute helpers (robust) ---------------------------------------
+namespace {
+
+// --- Small config knobs (can be lifted to QSettings later) ------------------
+static constexpr bool   kDeactivateWhenZero   = true;   // mask 0 => deactivate; flip if workflow differs
+static constexpr double kTauDeactivate        = 0.50;   // fraction of deactivating pixels needed to drop a quad
+static constexpr bool   kBackfaceCullFolds    = false;   // reduce double-count in folds by culling backfaces
+static constexpr double kCullDotEps           = 1e-12;  // tolerance for backface culling
+static constexpr int    kNormalDecimateMax    = 128;    // sampling grid for global normal estimation
+
+// --- Utilities ---------------------------------------------------------------
+static inline bool isFinite3(const cv::Vec3d& p) {
+    return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+}
+
+// Triangle area (standard “notorious” cross-product formula)
+static inline double tri_area3D(const cv::Vec3d& a,
+                                const cv::Vec3d& b,
+                                const cv::Vec3d& c)
+{
+    return 0.5 * cv::norm((b - a).cross(c - a));
+}
+
+// Triangle area with simple backface culling vs. a reference normal
+static inline double tri_area3D_culled(const cv::Vec3d& a,
+                                       const cv::Vec3d& b,
+                                       const cv::Vec3d& c,
+                                       const cv::Vec3d& refN,
+                                       double dot_eps)
+{
+    const cv::Vec3d n = (b - a).cross(c - a);
+    const double dot  = n.dot(refN);
+    if (dot <= dot_eps) return 0.0;       // backfacing or near parallel -> culled
+    return 0.5 * cv::norm(n);
+}
+
+// Choose largest image (by pixel count) among multi-page TIFFs
+static int choose_largest_page(const std::vector<cv::Mat>& pages) {
+    int bestIdx = -1;
+    size_t bestPix = 0;
+    for (int i = 0; i < (int)pages.size(); ++i) {
+        const size_t pix = (size_t)pages[i].rows * (size_t)pages[i].cols;
+        if (pix > bestPix) { bestPix = pix; bestIdx = i; }
+    }
+    return bestIdx;
+}
+
+// Robustly binarize an 8/16/32-bit single-channel mask to {0,1}
+//  - fast path if already {0,255} (or {0,1})
+//  - else Otsu
+static void binarize_mask(const cv::Mat& srcAnyDepth, cv::Mat1b& mask01)
+{
+    cv::Mat m;
+    if (srcAnyDepth.channels() != 1) {
+        cv::Mat gray; cv::cvtColor(srcAnyDepth, gray, cv::COLOR_BGR2GRAY);
+        m = gray;
+    } else {
+        m = srcAnyDepth;
+    }
+
+    // Convert to 8U (preserving dynamic range)
+    if (m.type() != CV_8U) {
+        double minv, maxv;
+        cv::minMaxLoc(m, &minv, &maxv);
+        if (std::abs(maxv - minv) < 1e-12) {
+            mask01 = cv::Mat1b(m.size(), 0);
+            return;
+        }
+        cv::Mat m8;
+        m.convertTo(m8, CV_8U, 255.0 / (maxv - minv), (-minv) * 255.0 / (maxv - minv));
+        m = m8;
+    }
+
+    // Fast path: already binary?
+    int nz = cv::countNonZero(m);
+    if (nz == 0) { mask01 = cv::Mat1b(m.size(), 0); return; }
+    if (nz == m.rows * m.cols) { mask01 = cv::Mat1b(m.size(), 1); return; }
+
+    // Check if unique values are (0,255) or (0,1)
+    // (cheap test using bitwise ops)
+    cv::Mat1b tmp;
+    cv::threshold(m, tmp, 0, 255, cv::THRESH_BINARY);
+    if (cv::countNonZero(m != tmp) == 0) {
+        // values are {0, something}; normalize to {0,1}
+        mask01 = (tmp > 0) / 255;
+        return;
+    }
+
+    // Otsu threshold to {0,1}
+    cv::Mat1b otsu;
+    cv::threshold(m, otsu, 0, 1, cv::THRESH_BINARY | cv::THRESH_OTSU);
+    mask01 = otsu;
+}
+
+// Load single-channel TIFF -> CV_32F
+static bool load_tif_as_float(const std::filesystem::path& file, cv::Mat1f& out)
+{
+    cv::Mat raw = cv::imread(file.string(), cv::IMREAD_UNCHANGED);
+    if (raw.empty() || raw.channels() != 1) return false;
+
+    switch (raw.type()) {
+        case CV_32FC1: out = raw; return true;
+        case CV_64FC1: raw.convertTo(out, CV_32F); return true;
+        default:       raw.convertTo(out, CV_32F); return true;
+    }
+}
+
+// 64-bit (double) integral image for 0/1 maps.
+// ii has size (H+1, W+1), type CV_64F
+static inline double sumRect01d(const cv::Mat1d& ii, int x0, int y0, int x1, int y1)
+{
+    // rectangle is [x0,x1) × [y0,y1)
+    return ii(y1, x1) - ii(y0, x1) - ii(y1, x0) + ii(y0, x0);
+}
+
+// Estimate a global reference normal from sparse samples of the grid
+static cv::Vec3d estimate_global_normal(const cv::Mat1f& X,
+                                        const cv::Mat1f& Y,
+                                        const cv::Mat1f& Z)
+{
+    const int H = X.rows, W = X.cols;
+    const int sy = std::max(1, H / kNormalDecimateMax);
+    const int sx = std::max(1, W / kNormalDecimateMax);
+
+    cv::Vec3d acc(0,0,0);
+    for (int y = 0; y + sy < H; y += sy) {
+        for (int x = 0; x + sx < W; x += sx) {
+            const cv::Vec3d A(X(y, x),         Y(y, x),         Z(y, x));
+            const cv::Vec3d B(X(y, x+sx),      Y(y, x+sx),      Z(y, x+sx));
+            const cv::Vec3d C(X(y+sy, x),      Y(y+sy, x),      Z(y+sy, x));
+            if (!isFinite3(A) || !isFinite3(B) || !isFinite3(C)) continue;
+            acc += (B - A).cross(C - A);
+        }
+    }
+    const double nrm = cv::norm(acc);
+    if (nrm < 1e-20) return cv::Vec3d(0,0,1); // fallback (rare)
+    return acc / nrm;
+}
+
+// Core: area from kept quads using original X/Y/Z grids, fractional mask rule, 64-bit integral,
+// and optional backface culling against a global normal to reduce fold double-counting.
+static double area_from_mesh_and_mask(const cv::Mat1f& X,
+                                      const cv::Mat1f& Y,
+                                      const cv::Mat1f& Z,
+                                      const cv::Mat1b& mask01)
+{
+    const int Hq = X.rows, Wq = X.cols;
+    if (Hq < 2 || Wq < 2) return 0.0;
+
+    const int Hm = mask01.rows, Wm = mask01.cols;
+    if (Hm <= 0 || Wm <= 0) return 0.0;
+
+    // Build "deactivation" map: 1 when a pixel should deactivate, 0 otherwise
+    cv::Mat1b deact;
+    if (kDeactivateWhenZero) deact = (mask01 == 0);
+    else                     deact = (mask01 != 0);
+
+    // 64-bit integral image (double) -> no overflow for huge images
+    cv::Mat1d ii; cv::integral(deact, ii, CV_64F);
+
+    // Linear mapping from quad cells to mask pixels
+    const double sx = static_cast<double>(Wm) / static_cast<double>(Wq - 1);
+    const double sy = static_cast<double>(Hm) / static_cast<double>(Hq - 1);
+
+    // Optional global normal for backface culling
+    const cv::Vec3d refN = kBackfaceCullFolds ? estimate_global_normal(X, Y, Z) : cv::Vec3d(0,0,0);
+
+    double total = 0.0;
+
+    #ifdef _OPENMP
+    #pragma omp parallel for reduction(+:total) schedule(static)
+    #endif
+    for (int qy = 0; qy < Hq - 1; ++qy) {
+        for (int qx = 0; qx < Wq - 1; ++qx) {
+            // Map UV cell [qx,qx+1)×[qy,qy+1) → mask rect [x0,x1)×[y0,y1)
+            int x0 = (int)std::floor(qx * sx);
+            int y0 = (int)std::floor(qy * sy);
+            int x1 = (int)std::ceil ((qx + 1) * sx);  // A3 fix: ceil end
+            int y1 = (int)std::ceil ((qy + 1) * sy);
+
+            // Clamp and ensure ≥1 pixel extent
+            x0 = std::clamp(x0, 0, Wm - 1);
+            y0 = std::clamp(y0, 0, Hm - 1);
+            x1 = std::clamp(x1, x0 + 1, Wm);
+            y1 = std::clamp(y1, y0 + 1, Hm);
+
+            const int rectPix = (x1 - x0) * (y1 - y0);
+            if (rectPix <= 0) continue;
+
+            const double deactCount = sumRect01d(ii, x0, y0, x1, y1);
+            const double fracDeact  = deactCount / (double)rectPix;
+
+            // Fractional rule (Brittle ANY-pixel fixed) -> robust fraction rule
+            if (fracDeact >= kTauDeactivate) continue;  // drop quad
+
+            // 3D corners
+            const cv::Vec3d A(X(qy,   qx),   Y(qy,   qx),   Z(qy,   qx));
+            const cv::Vec3d B(X(qy,   qx+1), Y(qy,   qx+1), Z(qy,   qx+1));
+            const cv::Vec3d C(X(qy+1, qx),   Y(qy+1, qx),   Z(qy+1, qx));
+            const cv::Vec3d D(X(qy+1, qx+1), Y(qy+1, qx+1), Z(qy+1, qx+1));
+            if (!isFinite3(A) || !isFinite3(B) || !isFinite3(C) || !isFinite3(D))
+                continue;
+
+            if (kBackfaceCullFolds) {
+                // Count only front-facing triangles vs. global refN (C4 mitigation)
+                total += tri_area3D_culled(A, B, D, refN, kCullDotEps);
+                total += tri_area3D_culled(A, D, C, refN, kCullDotEps);
+            } else {
+                // No culling: fixed diagonal (deterministic) is fine for area
+                total += tri_area3D(A, B, D) + tri_area3D(A, D, C);
+            }
+        }
+    }
+
+    return total;
+}
+
+} // namespace
+
 namespace
 {
 constexpr float kAxisRotationDegreesPerScenePixel = 0.25f;
@@ -2058,251 +2277,123 @@ void CWindow::onAxisOverlayOpacityChanged(int value)
 
 void CWindow::recalcAreaForSegments(const std::vector<std::string>& ids)
 {
-    if (!fVpkg || ids.empty()) {
-        return;
-    }
+    if (!fVpkg) return;
 
+    // Linear voxel size (µm/voxel) for cm² conversion
     float voxelsize = 1.0f;
     try {
         if (currentVolume && currentVolume->metadata().hasKey("voxelsize")) {
             voxelsize = currentVolume->metadata().get<float>("voxelsize");
         }
-    } catch (...) {
-        voxelsize = 1.0f;
-    }
-    if (!std::isfinite(voxelsize) || voxelsize <= 0.f) {
-        voxelsize = 1.0f;
-    }
+    } catch (...) { voxelsize = 1.0f; }
+    if (!std::isfinite(voxelsize) || voxelsize <= 0.f) voxelsize = 1.0f;
 
-    int okCount = 0;
-    int failCount = 0;
-    QStringList skippedIds;
-
-    auto triAreaVox2 = [](const cv::Vec3d& a,
-                          const cv::Vec3d& b,
-                          const cv::Vec3d& c) -> double {
-        const cv::Vec3d u = b - a;
-        const cv::Vec3d v = c - a;
-        const cv::Vec3d w(u[1] * v[2] - u[2] * v[1],
-                          u[2] * v[0] - u[0] * v[2],
-                          u[0] * v[1] - u[1] * v[0]);
-        return 0.5 * std::sqrt(w.dot(w));
-    };
-
-    auto quadAreaVox2 = [&triAreaVox2](const cv::Vec3d& p00,
-                                       const cv::Vec3d& p10,
-                                       const cv::Vec3d& p01,
-                                       const cv::Vec3d& p11) -> double {
-        return triAreaVox2(p00, p10, p11) + triAreaVox2(p00, p11, p01);
-    };
-
-    auto isFiniteVec3 = [](const cv::Vec3d& p) {
-        return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
-    };
-
-    constexpr bool INSIDE_IS_NONZERO = true;
-
-    auto median = [](std::vector<double>& values) -> double {
-        if (values.empty()) {
-            return 0.0;
-        }
-        const auto mid = values.begin() + values.size() / 2;
-        std::nth_element(values.begin(), mid, values.end());
-        double m = *mid;
-        if ((values.size() % 2) == 0 && mid != values.begin()) {
-            const double partner = *std::max_element(values.begin(), mid);
-            m = 0.5 * (m + partner);
-        }
-        return m;
-    };
+    int okCount = 0, failCount = 0;
+    QStringList updatedIds, skippedIds;
 
     for (const auto& id : ids) {
-        auto surfMeta = fVpkg->getSurface(id);
-        if (!surfMeta || !surfMeta->surface()) {
-            skippedIds << QString::fromStdString(id) + tr(" (missing surface)");
-            ++failCount;
+        auto sm = fVpkg->getSurface(id);
+        if (!sm || !sm->surface()) {
+            ++failCount; skippedIds << QString::fromStdString(id) + " (missing surface)";
             continue;
         }
+        auto* surf = sm->surface(); // QuadSurface*
 
-        auto* surface = surfMeta->surface();
-        const std::filesystem::path maskPath = surfMeta->path / "mask.tif";
+        // --- Load mask (robust multi-page handling) ----------------------
+        const std::filesystem::path maskPath = sm->path / "mask.tif";
         if (!std::filesystem::exists(maskPath)) {
-            skippedIds << QString::fromStdString(id) + tr(" (no mask.tif)");
-            ++failCount;
+            ++failCount; skippedIds << QString::fromStdString(id) + " (no mask.tif)";
             continue;
         }
 
-        std::vector<cv::Mat> layers;
-        if (!cv::imreadmulti(maskPath.string(), layers, cv::IMREAD_UNCHANGED) || layers.empty()) {
-            skippedIds << QString::fromStdString(id) + tr(" (mask read error)");
-            ++failCount;
+        cv::Mat1b mask01;
+        {
+            std::vector<cv::Mat> pages;
+            if (cv::imreadmulti(maskPath.string(), pages, cv::IMREAD_UNCHANGED) && !pages.empty()) {
+                int best = choose_largest_page(pages);
+                if (best < 0) { ++failCount; skippedIds << QString::fromStdString(id) + " (mask pages invalid)"; continue; }
+                binarize_mask(pages[best], mask01);
+            } else {
+                // Fallback: single-page read
+                cv::Mat m = cv::imread(maskPath.string(), cv::IMREAD_UNCHANGED);
+                if (m.empty()) { ++failCount; skippedIds << QString::fromStdString(id) + " (mask read error)"; continue; }
+                binarize_mask(m, mask01);
+            }
+        }
+        if (mask01.empty()) {
+            ++failCount; skippedIds << QString::fromStdString(id) + " (empty mask)";
             continue;
         }
 
-        cv::Mat mask = layers[0];
-        if (mask.empty()) {
-            skippedIds << QString::fromStdString(id) + tr(" (mask empty)");
-            ++failCount;
+        // --- Load ORIGINAL quadmesh (no resampling; lower memory) --------
+        cv::Mat1f X, Y, Z;
+        if (!load_tif_as_float(sm->path / "x.tif", X) ||
+            !load_tif_as_float(sm->path / "y.tif", Y) ||
+            !load_tif_as_float(sm->path / "z.tif", Z)) {
+            ++failCount; skippedIds << QString::fromStdString(id) + " (bad or missing x/y/z.tif)";
             continue;
         }
-        if (mask.channels() != 1) {
-            cv::cvtColor(mask, mask, cv::COLOR_BGR2GRAY);
-        }
-        if (mask.type() != CV_8U) {
-            mask.convertTo(mask, CV_8U);
+        if (X.size() != Y.size() || X.size() != Z.size()
+            || X.rows < 2 || X.cols < 2) {
+            ++failCount; skippedIds << QString::fromStdString(id) + " (xyz size mismatch)";
+            continue;
         }
 
-        cv::Mat_<cv::Vec3f> coords;
+        // --- Area from kept quads --------------
+        double area_vx2 = 0.0;
         try {
-            const cv::Vec3f pointer = surface->pointer();
-            const cv::Vec3f offset(-mask.cols / 2.0f, -mask.rows / 2.0f, 0.0f);
-            surface->gen(&coords, nullptr, mask.size(), pointer, 1.0f, offset);
+            area_vx2 = area_from_mesh_and_mask(X, Y, Z, mask01);
         } catch (...) {
-            skippedIds << QString::fromStdString(id) + tr(" (coord gen failed)");
-            ++failCount;
+            ++failCount; skippedIds << QString::fromStdString(id) + " (area compute error)";
+            continue;
+        }
+        if (!std::isfinite(area_vx2)) {
+            ++failCount; skippedIds << QString::fromStdString(id) + " (non-finite area)";
             continue;
         }
 
-        if (coords.empty() || coords.rows != mask.rows || coords.cols != mask.cols) {
-            skippedIds << QString::fromStdString(id) + tr(" (coord/mask size mismatch)");
-            ++failCount;
+        // --- Convert voxel^2 → cm^2 -----------------------------------------
+        const double area_cm2 = area_vx2 * double(voxelsize) * double(voxelsize) / 1e8;
+        if (!std::isfinite(area_cm2)) {
+            ++failCount; skippedIds << QString::fromStdString(id) + " (non-finite cm²)";
             continue;
         }
 
-        const int height = mask.rows;
-        const int width = mask.cols;
-
-        auto quadAreaFromMask = [&](const cv::Mat& maskImage,
-                                    double& outDu,
-                                    double& outDv) -> double {
-            std::vector<double> stepsU;
-            std::vector<double> stepsV;
-            stepsU.reserve(static_cast<size_t>(height) * static_cast<size_t>(std::max(0, width - 1)));
-            stepsV.reserve(static_cast<size_t>(std::max(0, height - 1)) * static_cast<size_t>(width));
-            double areaVox2 = 0.0;
-
-            for (int y = 0; y < height - 1; ++y) {
-                const uint8_t* row0 = maskImage.ptr<uint8_t>(y);
-                const uint8_t* row1 = maskImage.ptr<uint8_t>(y + 1);
-                for (int x = 0; x < width - 1; ++x) {
-                    const bool allBlack = (row0[x] == 0) && (row0[x + 1] == 0) &&
-                                          (row1[x] == 0) && (row1[x + 1] == 0);
-                    if (allBlack) {
-                        continue;
-                    }
-
-                    const cv::Vec3d p00 = coords(y, x);
-                    const cv::Vec3d p10 = coords(y, x + 1);
-                    const cv::Vec3d p01 = coords(y + 1, x);
-                    const cv::Vec3d p11 = coords(y + 1, x + 1);
-
-                    if (!isFiniteVec3(p00) || !isFiniteVec3(p10) ||
-                        !isFiniteVec3(p01) || !isFiniteVec3(p11)) {
-                        continue;
-                    }
-
-                    stepsU.push_back(cv::norm(p10 - p00));
-                    stepsV.push_back(cv::norm(p01 - p00));
-                    areaVox2 += quadAreaVox2(p00, p10, p01, p11);
-                }
-            }
-
-            outDu = median(stepsU);
-            outDv = median(stepsV);
-            return areaVox2;
-        };
-
-        double du = 0.0;
-        double dv = 0.0;
-        double areaVox2 = quadAreaFromMask(mask, du, dv);
-
-        if (areaVox2 <= 0.0) {
-            std::vector<double> globalStepsU;
-            std::vector<double> globalStepsV;
-            globalStepsU.reserve(static_cast<size_t>(height) * static_cast<size_t>(std::max(0, width - 1)));
-            globalStepsV.reserve(static_cast<size_t>(std::max(0, height - 1)) * static_cast<size_t>(width));
-
-            for (int y = 0; y < height; ++y) {
-                for (int x = 0; x < width - 1; ++x) {
-                    globalStepsU.push_back(cv::norm(coords(y, x + 1) - coords(y, x)));
-                }
-            }
-            for (int y = 0; y < height - 1; ++y) {
-                for (int x = 0; x < width; ++x) {
-                    globalStepsV.push_back(cv::norm(coords(y + 1, x) - coords(y, x)));
-                }
-            }
-
-            const double duGlobal = median(globalStepsU);
-            const double dvGlobal = median(globalStepsV);
-            if (du <= 0.0) {
-                du = duGlobal;
-            }
-            if (dv <= 0.0) {
-                dv = dvGlobal;
-            }
-
-            long long pixelCount = 0;
-            for (int y = 0; y < height; ++y) {
-                const uint8_t* row = mask.ptr<uint8_t>(y);
-                for (int x = 0; x < width; ++x) {
-                    const bool inside = INSIDE_IS_NONZERO ? (row[x] != 0) : (row[x] == 0);
-                    if (inside) {
-                        ++pixelCount;
-                    }
-                }
-            }
-
-            if (pixelCount > 0 && du > 0.0 && dv > 0.0) {
-                areaVox2 = static_cast<double>(pixelCount) * (du * dv);
-            }
-        }
-
-        if (!std::isfinite(areaVox2)) {
-            skippedIds << QString::fromStdString(id) + tr(" (non-finite area)");
-            ++failCount;
-            continue;
-        }
-
-        const double areaCm2 = areaVox2 * static_cast<double>(voxelsize) * static_cast<double>(voxelsize) / 1e8;
-        if (!std::isfinite(areaCm2)) {
-            skippedIds << QString::fromStdString(id) + tr(" (non-finite cm^2)");
-            ++failCount;
-            continue;
-        }
-
+        // --- Persist & UI update --------------------------------------------
         try {
-            if (!surface->meta) {
-                surface->meta = new nlohmann::json();
-            }
-            (*surface->meta)["area_vx2"] = areaVox2;
-            (*surface->meta)["area_cm2"] = areaCm2;
-            (*surface->meta)["date_last_modified"] = get_surface_time_str();
-            surface->save_meta();
+            if (!surf->meta) surf->meta = new nlohmann::json();
+            (*surf->meta)["area_vx2"] = area_vx2;
+            (*surf->meta)["area_cm2"] = area_cm2;
+            (*surf->meta)["date_last_modified"] = get_surface_time_str();
+            surf->save_meta();
+            okCount++;
+            updatedIds << QString::fromStdString(id);
         } catch (...) {
-            skippedIds << QString::fromStdString(id) + tr(" (meta save failed)");
-            ++failCount;
+            ++failCount; skippedIds << QString::fromStdString(id) + " (meta save failed)";
             continue;
         }
 
-        if (_surfacePanel) {
-            _surfacePanel->refreshSurfaceMetrics(id);
+        // Update the Surfaces tree (Area column)
+        QTreeWidgetItemIterator it(treeWidgetSurfaces);
+        while (*it) {
+            if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() == id) {
+                (*it)->setText(2, QString::number(area_cm2, 'f', 3));
+                break;
+            }
+            ++it;
         }
-
-        ++okCount;
     }
 
     if (okCount > 0) {
-        statusBar()->showMessage(tr("Recalculated area for %1 segment(s).").arg(okCount), 5000);
+        statusBar()->showMessage(
+            tr("Recalculated area (triangulated kept quads) for %1 segment(s).").arg(okCount), 5000);
     }
     if (failCount > 0) {
-        QMessageBox::warning(
-            this,
-            tr("Area Recalculation"),
-            tr("Updated: %1\nSkipped: %2\n\n%3")
-                .arg(okCount)
-                .arg(failCount)
-                .arg(skippedIds.join("\n")));
+        QMessageBox::warning(this, tr("Area Recalculation"),
+                             tr("Updated: %1\nSkipped: %2\n\n%3")
+                                .arg(okCount)
+                                .arg(failCount)
+                                .arg(skippedIds.join("\n")));
     }
 }
 

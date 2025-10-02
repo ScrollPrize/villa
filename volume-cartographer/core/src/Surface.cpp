@@ -1283,7 +1283,7 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
 
     std::vector<int> compression_params;
     compression_params.push_back(cv::IMWRITE_TIFF_COMPRESSION);
-    compression_params.push_back(cv::IMWRITE_TIFF_COMPRESSION_LZW);
+    compression_params.push_back(5);
 
     cv::imwrite(path/"x.tif", xyz[0], compression_params);
     cv::imwrite(path/"y.tif", xyz[1], compression_params);
