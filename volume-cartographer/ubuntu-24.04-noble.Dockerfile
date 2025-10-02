@@ -1,5 +1,5 @@
 FROM ubuntu:noble
-
+ARG DEBIAN_FRONTEND=noninteractive
 RUN apt -y update
 RUN apt -y install software-properties-common
 RUN add-apt-repository -y universe
@@ -7,47 +7,18 @@ RUN apt -y update
 RUN apt -y upgrade
 RUN apt -y full-upgrade
 
-# --- install everything EXCEPT xtensor-dev ---
-RUN apt -y install build-essential git cmake qt6-base-dev libboost-system-dev libboost-program-options-dev libceres-dev \
-    libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev libgsl-dev libsdl2-dev libcurl4-openssl-dev file \
-    curl unzip ca-certificates bzip2 wget fuse jq gimp desktop-file-utils ninja-build
-
-RUN apt-get install -y flex bison zlib1g-dev gfortran libopenblas-dev liblapack-dev libscotch-dev libhwloc-dev
-
-# --- Build & install OpenCV 4.10.0 (with TIFF) ---
-# Extra codecs needed for image I/O; trim if you don't need them
-RUN apt-get update && apt-get install -y \
-    libtiff-dev libjpeg-dev libpng-dev libopenexr-dev \
-    libavcodec-dev libavformat-dev libswscale-dev \
-    libeigen3-dev libtbb-dev \
+# --- base toolchain & libs (avoiding xtensor-dev here) ---
+RUN apt -y install --no-install-recommends \
+    build-essential git cmake ninja-build pkg-config \
+    qt6-base-dev libboost-system-dev libboost-program-options-dev libceres-dev \
+    libopencv-dev libopencv-contrib-dev \
+    libxsimd-dev libblosc-dev libspdlog-dev libgsl-dev libsdl2-dev libcurl4-openssl-dev \
+    file curl unzip ca-certificates bzip2 wget fuse jq gimp desktop-file-utils \
  && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /tmp/opencv
-RUN git clone -b 4.10.0 --depth 1 https://github.com/opencv/opencv.git \
- && git clone -b 4.10.0 --depth 1 https://github.com/opencv/opencv_contrib.git
-
-# Configure with CMake, generate build system into ./build
-RUN cmake -S opencv -B build \
-    -DOPENCV_EXTRA_MODULES_PATH=/tmp/opencv/opencv_contrib/modules \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX=/usr/local \
-    -DBUILD_TESTS=OFF \
-    -DBUILD_PERF_TESTS=OFF \
-    -DBUILD_EXAMPLES=OFF \
-    -DWITH_TIFF=ON \
-    -DWITH_CUDA=OFF \
-    -DWITH_OPENCL=OFF \
-    -DBUILD_opencv_dnn=OFF \
-    -DBUILD_opencv_dnn_objdetect=OFF \
-    -DBUILD_opencv_dnn_superres=OFF \
-    -DBUILD_opencv_sfm=OFF
-
-# Build & install
-RUN cmake --build build -- -j"$(nproc)" \
- && cmake --install build \
- && ldconfig \
- && rm -rf /tmp/opencv
-
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    flex bison zlib1g-dev gfortran libopenblas-dev liblapack-dev libscotch-dev libhwloc-dev \
+ && rm -rf /var/lib/apt/lists/*
 
 # --- pin specific xtl + xtensor versions from .deb files ---
 RUN set -eux; \
@@ -92,8 +63,8 @@ RUN micromamba run -n py310 python -m pip install --upgrade pip
 RUN micromamba run -n py310 pip install --no-cache-dir numpy==1.26.4 pillow tqdm wandb
 
 # Open3D needs GL/GLib bits even for headless usage.
-#These packages are not available on arm64 so skip for now
-#TODO: install from source?
+# These packages are not available on arm64 so skip for now
+# TODO: install from source?
 RUN if [ "$(uname -m)" = "x86_64" ]; then \
         apt -y install libgl1 libglib2.0-0 libx11-6 libxext6 libxrender1 libsm6 libegl1; \
         micromamba run -n py310 pip install --no-cache-dir libigl==2.5.1 open3d==0.18.0; \
@@ -104,7 +75,53 @@ ENV PATH="/opt/micromamba/envs/py310/bin:${PATH}"
 
 COPY . /src
 
-# ------------------------- Build your main project ---------------------------
+# --------------------------- Third-party libs -------------------------------
+WORKDIR /src/libs
+RUN mkdir -p pastix-install scotch-install
+    
+# --- libigl: clone and pin to latest commit (as of 2025-10-02) ---
+# Latest on main: Aug 1, 2025 — ae8f959ea26d7059abad4c698aba8d6b7c3205e8
+ARG LIBIGL_COMMIT=ae8f959ea26d7059abad4c698aba8d6b7c3205e8
+RUN git clone https://github.com/libigl/libigl.git libigl \
+     && cd libigl \
+     && git fetch --depth 1 origin ${LIBIGL_COMMIT} \
+     && git checkout -q ${LIBIGL_COMMIT} \
+     && git submodule update --init --recursive
+    
+# --- overlay local changes into the cloned libigl ---
+# Copies everything inside /src/libs/libigl_changes into /src/libs/libigl
+RUN if [ -d /src/libs/libigl_changes ]; then \
+          cp -a /src/libs/libigl_changes/. /src/libs/libigl/; \
+        fi
+    
+# --- pastix & scotch from archives already in repo ---
+RUN tar -xjf /src/libs/pastix_5.2.3.tar.bz2 -C pastix-install --strip-components=1
+RUN tar -xzf /src/libs/scotch_6.0.4.tar.gz -C scotch-install --strip-components=1
+    
+WORKDIR /src/libs/scotch-install/src
+RUN cp ./Make.inc/Makefile.inc.x86-64_pc_linux2 Makefile.inc
+RUN mkdir -p /usr/local/scotch
+RUN make scotch
+# Create prefixes we will actually keep (not deleted later)
+RUN make prefix=/usr/local/scotch install
+    
+WORKDIR /src/libs/pastix-install/src
+RUN cp /src/libs/config.in config.in
+RUN make SCOTCH_HOME=/usr/local/scotch
+RUN make SCOTCH_HOME=/usr/local/scotch install
+    
+    # --- build libigl-based target (after overlay) ---
+WORKDIR /src/libs/flatboi/build
+RUN cmake .. -DCMAKE_BUILD_TYPE=Release \
+      -DLIBIGL_WITH_PASTIX=ON \
+      -DBLA_VENDOR=OpenBLAS \
+      -DCMAKE_PREFIX_PATH=/usr/local/pastix
+RUN cmake --build . -j"$(nproc)"
+    
+# Install the flatboi binary into PATH before removing /src
+RUN install -m 0755 ./flatboi /usr/local/bin/flatboi
+
+# ------------------------- Build the main project ---------------------------
 RUN mkdir -p /src/build
 WORKDIR /src/build
 RUN cmake -DVC_WITH_CUDA_SPARSE=off \
@@ -115,37 +132,6 @@ RUN cmake -DVC_WITH_CUDA_SPARSE=off \
  && cpack -G DEB -V \
  && dpkg -i /src/build/pkgs/vc3d*.deb
 
-
-WORKDIR /src/libs
-RUN mkdir pastix-install
-RUN mkdir scotch-install
-RUN mkdir libigl
-RUN wget https://dl.ash2txt.org/other/dev/libigl.tar.bz2
-RUN tar -xjf /src/libs/pastix_5.2.3.tar.bz2 -C pastix-install --strip-components=1
-RUN tar -xjf /src/libs/libigl.tar.bz2 -C libigl --strip-components=1
-RUN tar -xzf /src/libs/scotch_6.0.4.tar.gz -C scotch-install --strip-components=1
-WORKDIR scotch-install/src
-RUN cp ./Make.inc/Makefile.inc.x86-64_pc_linux2 Makefile.inc
-RUN mkdir /usr/local/scotch
-RUN make scotch
-# Create prefixes we will actually keep (not deleted later)
-RUN make prefix=/usr/local/scotch install
-WORKDIR /src/libs/pastix-install/src
-RUN cp /src/libs/config.in config.in
-RUN make SCOTCH_HOME=/usr/local/scotch
-RUN make SCOTCH_HOME=/usr/local/scotch install
-
-WORKDIR /src/libs/libigl/tutorial/999_Flatboi/build
-RUN cmake .. -DCMAKE_BUILD_TYPE=Release \
-  -DLIBIGL_WITH_PASTIX=ON \
-  -DBLA_VENDOR=OpenBLAS \
-  -DCMAKE_PREFIX_PATH=/usr/local/pastix
-RUN cmake --build . -j"$(nproc)"
-
-# Install the flatboi binary into PATH before removing /src
-RUN install -m 0755 ./flatboi /usr/local/bin/flatboi
-
-WORKDIR /src/build
 # --------------------------- Cleanup build tree ------------------------------
 RUN apt -y autoremove && rm -rf /src
 
@@ -160,4 +146,3 @@ COPY docker_s3_entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ENV WANDB_ENTITY="vesuvius-challenge"
-
