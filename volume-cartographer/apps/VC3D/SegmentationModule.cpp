@@ -33,6 +33,7 @@ constexpr int kStatusShort = 1500;
 constexpr int kStatusMedium = 2000;
 constexpr int kStatusLong = 5000;
 constexpr int kMaxUndoStates = 5;
+constexpr float kMaxBrushSampleSpacing = 0.5f;
 
 float averageScale(const cv::Vec2f& scale)
 {
@@ -1192,11 +1193,27 @@ void SegmentationModule::extendPaintStroke(const cv::Vec3f& worldPos, bool force
         return;
     }
 
-    const float step = std::max(gridStepWorld() * 0.3f, 0.25f);
-    if (!forceSample && _hasLastPaintSample) {
+    const float baseSpacing = std::max(gridStepWorld() * 0.3f, 0.25f);
+    const float spacing = std::min(baseSpacing, kMaxBrushSampleSpacing);
+    const float spacingSq = spacing * spacing;
+
+    if (_hasLastPaintSample) {
         const cv::Vec3f delta = worldPos - _lastPaintSample;
-        if (delta.dot(delta) < step * step) {
+        const float distanceSq = delta.dot(delta);
+        if (!forceSample && distanceSq < spacingSq) {
             return;
+        }
+
+        const float distance = std::sqrt(distanceSq);
+        if (distance > spacing) {
+            const cv::Vec3f direction = delta / distance;
+            float travelled = spacing;
+            while (travelled < distance) {
+                const cv::Vec3f intermediate = _lastPaintSample + direction * travelled;
+                _currentPaintStroke.push_back(intermediate);
+                _paintOverlayPoints.push_back(intermediate);
+                travelled += spacing;
+            }
         }
     }
 
