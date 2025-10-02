@@ -4,6 +4,8 @@
 #include "vc/core/util/StreamOperators.hpp"
 
 #include "z5/factory.hxx"
+#include "z5/s3/handle.hxx"
+#include "z5/s3/attributes.hxx"
 #include <nlohmann/json.hpp>
 
 #include <opencv2/imgproc.hpp>
@@ -730,9 +732,16 @@ int main(int argc, char *argv[])
         printMat4x4(affineTransform.matrix, "Final composed affine (applied to points first):");
     }
     
-    z5::filesystem::handle::Group group(vol_path, z5::FileMode::FileMode::r);
-    z5::filesystem::handle::Dataset ds_handle(group, std::to_string(group_idx), json::parse(std::ifstream(vol_path/std::to_string(group_idx)/".zarray")).value<std::string>("dimension_separator","."));
-    std::unique_ptr<z5::Dataset> ds = z5::filesystem::openDataset(ds_handle);
+    std::string vol_path_str = vol_path.string();
+
+    z5::handle::Handle root;
+    if (vol_path_str.rfind("s3://", 0) == 0) {
+        root = z5::s3::handle::Group(vol_path_str, z5::FileMode::FileMode::r);
+    } else {
+        root = z5::filesystem::handle::Group(vol_path, z5::FileMode::FileMode::r);
+    }
+
+    std::unique_ptr<z5::Dataset> ds = z5::openDataset(root, std::to_string(group_idx));
 
     std::cout << "zarr dataset size for scale group " << group_idx << ds->shape() << std::endl;
     std::cout << "chunk shape shape " << ds->chunking().blockShape() << std::endl;
