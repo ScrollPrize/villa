@@ -27,7 +27,7 @@ std::shared_ptr<std::vector<cv::Point>> LineSegListCache::get(CacheKey key) {
     return nullptr;
 }
 
-void LineSegListCache::put(CacheKey key, std::shared_ptr<std::vector<cv::Point>> data) {
+void LineSegListCache::put(const CacheKey& key, std::shared_ptr<std::vector<cv::Point>> data) {
     std::lock_guard<std::mutex> lock(mutex_);
     
     if (lookup_.count(key)) {

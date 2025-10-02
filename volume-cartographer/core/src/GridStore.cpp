@@ -1,8 +1,9 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/LineSegList.hpp"
-
-#include <unordered_set>
-#include <fstream>
+#include "vc/core/util/LineSegListCache.hpp"
+ 
+ #include <unordered_set>
+ #include <fstream>
 #include <stdexcept>
 #include <numeric>
 
@@ -209,7 +210,7 @@ public:
             const char* read_paths_ptr = buffer_start + ntohl(paths_offset);
             for (size_t i = 0; i < storage_.size(); ++i) {
                 std::shared_ptr<LineSegList> seglist;
-                read_paths_ptr = read_seglist(read_paths_ptr, buffer_end, seglist);
+                read_paths_ptr = read_seglist(read_paths_ptr, buffer_end, seglist, nullptr); // No cache for verification
                 deserialized_storage.push_back(seglist);
             }
 
@@ -275,10 +276,11 @@ public:
         file.write(buffer.data(), buffer.size());
     }
 
-    void load_mmap(const std::string& path) {
+    void load_mmap(const std::string& path, std::shared_ptr<LineSegListCache> cache) {
         read_only_ = true;
+        cache_ = cache;
         mmapped_data_ = std::make_unique<MmappedData>();
-
+ 
         mmapped_data_->fd = open(path.c_str(), O_RDONLY);
         if (mmapped_data_->fd == -1) {
             throw std::runtime_error("Failed to open file: " + path);
@@ -431,18 +433,18 @@ private:
         return current;
     }
 
-    const char* read_seglist(const char* current, const char* end, std::shared_ptr<LineSegList>& seglist) const {
+    const char* read_seglist(const char* current, const char* end, std::shared_ptr<LineSegList>& seglist, LineSegListCache* cache) const {
         if (current + 3 * sizeof(uint32_t) > end) throw std::runtime_error("Invalid GridStore file: unexpected end in seglist header.");
         uint32_t start_x = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
         uint32_t start_y = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
         uint32_t num_offsets = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
-
+ 
         if (current + num_offsets > end) throw std::runtime_error("Invalid GridStore file: seglist offsets out of bounds.");
         
         cv::Point start(start_x, start_y);
         const int8_t* offsets_ptr = reinterpret_cast<const int8_t*>(current);
         current += num_offsets;
-
+ 
         seglist = std::make_shared<LineSegList>(cache, start, offsets_ptr, num_offsets);
         return current;
     }
@@ -474,14 +476,15 @@ private:
     std::vector<std::shared_ptr<LineSegList>> storage_;
     bool read_only_;
     std::unique_ptr<MmappedData> mmapped_data_;
+    std::shared_ptr<LineSegListCache> cache_;
 };
-
+ 
 GridStore::GridStore(const cv::Rect& bounds, int cell_size)
     : pimpl_(std::make_unique<GridStoreImpl>(bounds, cell_size)) {}
-
-GridStore::GridStore(const std::string& path)
+ 
+GridStore::GridStore(const std::string& path, std::shared_ptr<LineSegListCache> cache)
     : pimpl_(std::make_unique<GridStoreImpl>(cv::Rect(), 1)) { // Use a dummy cell_size to avoid division by zero
-    pimpl_->load_mmap(path);
+    pimpl_->load_mmap(path, cache);
     meta = pimpl_->meta_;
 }
 
@@ -527,8 +530,8 @@ void GridStore::save(const std::string& path) const {
     pimpl_->save(path);
 }
 
-void GridStore::load_mmap(const std::string& path) {
-    pimpl_->load_mmap(path);
+void GridStore::load_mmap(const std::string& path, std::shared_ptr<LineSegListCache> cache) {
+    pimpl_->load_mmap(path, cache);
 }
 
 }
