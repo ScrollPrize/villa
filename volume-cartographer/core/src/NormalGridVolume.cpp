@@ -5,20 +5,36 @@
 #include <fstream>
 #include <iostream>
 #include <unordered_map>
+#include <random>
+#include <chrono>
+#include <atomic>
+ 
+ namespace fs = std::filesystem;
+ 
+ namespace vc::core::util {
+ 
+    struct CacheEntry {
+        std::unique_ptr<GridStore> grid_store;
+        uint64_t generation;
+    };
 
-namespace fs = std::filesystem;
+     struct NormalGridVolume::pimpl {
+         std::string base_path;
+         int sparse_volume;
+         nlohmann::json metadata;
+         mutable std::mutex mutex;
+         mutable std::unordered_map<cv::Vec2i, CacheEntry> grid_cache;
+         mutable uint64_t generation_counter = 0;
+         size_t max_cache_size = 512;
+         size_t eviction_sample_size = 10;
+        
+         mutable std::atomic<uint64_t> cache_hits{0};
+         mutable std::atomic<uint64_t> cache_misses{0};
+         mutable std::chrono::steady_clock::time_point last_stat_time = std::chrono::steady_clock::now();
 
-namespace vc::core::util {
-
-    struct NormalGridVolume::pimpl {
-        std::string base_path;
-        int sparse_volume;
-        nlohmann::json metadata;
-        mutable std::mutex mutex;
-        mutable std::unordered_map<cv::Vec2i, std::unique_ptr<GridStore>> grid_cache;
-        std::vector<std::string> plane_dirs = {"xy", "xz", "yz"};
-
-        explicit pimpl(const std::string& path) : base_path(path) {
+         std::vector<std::string> plane_dirs = {"xy", "xz", "yz"};
+ 
+         explicit pimpl(const std::string& path) : base_path(path) {
             std::ifstream metadata_file((fs::path(base_path) / "metadata.json").string());
             if (!metadata_file.is_open()) {
                 throw std::runtime_error("Failed to open metadata.json in " + base_path);
@@ -74,18 +90,22 @@ namespace vc::core::util {
                 std::lock_guard<std::mutex> lock(mutex);
                 auto it = grid_cache.find(key);
                 if (it != grid_cache.end()) {
-                    return it->second.get();
+                    cache_hits++;
+                    it->second.generation = ++generation_counter;
+                    check_print_stats();
+                    return it->second.grid_store.get();
                 }
             }
-
-            const std::string& dir = plane_dirs[plane_idx];
+ 
+            cache_misses++;
+             const std::string& dir = plane_dirs[plane_idx];
             char filename[256];
             snprintf(filename, sizeof(filename), "%06d.grid", slice_idx);
             std::string grid_path = (fs::path(base_path) / dir / filename).string();
 
             if (!fs::exists(grid_path)) {
                 std::lock_guard<std::mutex> lock(mutex);
-                grid_cache[key] = nullptr;
+                grid_cache[key] = {nullptr, ++generation_counter};
                 return nullptr;
             }
 
@@ -106,13 +126,62 @@ namespace vc::core::util {
 
                 auto it = grid_cache.find(key);
                 if (it != grid_cache.end()) {
-                    return it->second.get();
+                    // Another thread might have loaded it in the meantime
+                    cache_hits++;
+                    it->second.generation = ++generation_counter;
+                    return it->second.grid_store.get();
+                }
+ 
+                ptr = grid_store.get();
+                grid_cache[key] = {std::move(grid_store), ++generation_counter};
+
+                // Eviction logic
+                if (grid_cache.size() > max_cache_size) {
+                    std::vector<cv::Vec2i> keys;
+                    keys.reserve(grid_cache.size());
+                    for (const auto& pair : grid_cache) {
+                        keys.push_back(pair.first);
+                    }
+
+                    std::mt19937 gen(std::random_device{}());
+                    std::uniform_int_distribution<size_t> dist(0, keys.size() - 1);
+
+                    cv::Vec2i key_to_evict;
+                    uint64_t min_generation = std::numeric_limits<uint64_t>::max();
+
+                    for (size_t i = 0; i < eviction_sample_size && !keys.empty(); ++i) {
+                        size_t rand_idx = dist(gen);
+                        const auto& key = keys[rand_idx];
+                        const auto& entry = grid_cache.at(key);
+                        if (entry.generation < min_generation) {
+                            min_generation = entry.generation;
+                            key_to_evict = key;
+                        }
+                    }
+
+                    if (min_generation != std::numeric_limits<uint64_t>::max()) {
+                        grid_cache.erase(key_to_evict);
+                    }
                 }
 
-                ptr = grid_store.get();
-                grid_cache[key] = std::move(grid_store);
+                check_print_stats();
             }
             return ptr;
+        }
+
+        void check_print_stats() const {
+            if (generation_counter % 1000 == 0) {
+                auto now = std::chrono::steady_clock::now();
+                auto diff = std::chrono::duration_cast<std::chrono::seconds>(now - last_stat_time);
+                if (diff.count() >= 1) {
+                    uint64_t hits = cache_hits.load();
+                    uint64_t misses = cache_misses.load();
+                    uint64_t total = hits + misses;
+                    double hit_rate = (total == 0) ? 0.0 : (static_cast<double>(hits) / total) * 100.0;
+                    std::cout << "[Cache Stats] Hits: " << hits << ", Misses: " << misses << ", Total: " << total << ", Hit Rate: " << std::fixed << std::setprecision(2) << hit_rate << "%" << std::endl;
+                    last_stat_time = now;
+                }
+            }
         }
     };
 
