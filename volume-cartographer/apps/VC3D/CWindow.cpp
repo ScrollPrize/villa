@@ -2299,7 +2299,7 @@ void CWindow::recalcAreaForSegments(const std::vector<std::string>& ids)
         }
         auto* surf = sm->surface(); // QuadSurface*
 
-        // --- Load mask (B3 robust multi-page handling) ----------------------
+        // --- Load mask (robust multi-page handling) ----------------------
         const std::filesystem::path maskPath = sm->path / "mask.tif";
         if (!std::filesystem::exists(maskPath)) {
             ++failCount; skippedIds << QString::fromStdString(id) + " (no mask.tif)";
@@ -2325,7 +2325,7 @@ void CWindow::recalcAreaForSegments(const std::vector<std::string>& ids)
             continue;
         }
 
-        // --- Load ORIGINAL quadmesh (no resampling; E: lower memory) --------
+        // --- Load ORIGINAL quadmesh (no resampling; lower memory) --------
         cv::Mat1f X, Y, Z;
         if (!load_tif_as_float(sm->path / "x.tif", X) ||
             !load_tif_as_float(sm->path / "y.tif", Y) ||
@@ -2339,7 +2339,7 @@ void CWindow::recalcAreaForSegments(const std::vector<std::string>& ids)
             continue;
         }
 
-        // --- Area from kept quads (A3, B1, C4, E fixes inside) --------------
+        // --- Area from kept quads --------------
         double area_vx2 = 0.0;
         try {
             area_vx2 = area_from_mesh_and_mask(X, Y, Z, mask01);
