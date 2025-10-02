@@ -15,7 +15,7 @@ namespace vc::core::util {
 
     class NormalGridVolume {
     public:
-        explicit NormalGridVolume(const std::string& path);
+        explicit NormalGridVolume(const std::string& path, uint64_t cache_size_bytes = 1024 * 1024 * 1024);
         ~NormalGridVolume();
         NormalGridVolume(NormalGridVolume&&) noexcept;
         NormalGridVolume& operator=(NormalGridVolume&&) noexcept;

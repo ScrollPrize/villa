@@ -53,8 +53,8 @@ public:
         if (points.size() < 2) return;
 
         int handle = storage_.size();
-        storage_.emplace_back(std::make_shared<LineSegList>(points));
-
+        storage_.emplace_back(std::make_shared<LineSegList>(cache_.get(), points));
+ 
         std::unordered_set<int> relevant_buckets;
         for (const auto& p : points) {
             cv::Point grid_pos = (p - bounds_.tl()) / cell_size_;
@@ -355,7 +355,7 @@ public:
             int handle = storage_.size();
             
             std::shared_ptr<LineSegList> seglist;
-            current_path_ptr = read_seglist(current_path_ptr, end, seglist);
+            current_path_ptr = read_seglist(current_path_ptr, end, seglist, cache_.get());
             storage_.push_back(seglist);
             offset_to_handle[current_offset] = handle;
         }
@@ -443,7 +443,7 @@ private:
         const int8_t* offsets_ptr = reinterpret_cast<const int8_t*>(current);
         current += num_offsets;
 
-        seglist = std::make_shared<LineSegList>(start, offsets_ptr, num_offsets);
+        seglist = std::make_shared<LineSegList>(cache, start, offsets_ptr, num_offsets);
         return current;
     }
 

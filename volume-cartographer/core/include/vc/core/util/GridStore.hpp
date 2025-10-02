@@ -7,10 +7,12 @@
 
 namespace vc::core::util {
 
+class LineSegListCache;
+
 class GridStore {
 public:
     GridStore(const cv::Rect& bounds, int cell_size);
-    explicit GridStore(const std::string& path);
+    explicit GridStore(const std::string& path, std::shared_ptr<LineSegListCache> cache = nullptr);
     ~GridStore();
 
     void add(const std::vector<cv::Point>& points);
@@ -25,9 +27,10 @@ public:
     nlohmann::json meta;
 
     void save(const std::string& path) const;
-    void load_mmap(const std::string& path);
+    void load_mmap(const std::string& path, std::shared_ptr<LineSegListCache> cache = nullptr);
 
 private:
+    friend class LineSegList;
     class GridStoreImpl;
     std::unique_ptr<GridStoreImpl> pimpl_;
 };

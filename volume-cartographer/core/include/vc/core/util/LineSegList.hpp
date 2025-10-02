@@ -11,9 +11,11 @@ namespace vc {
 namespace core {
 namespace util {
 
+class LineSegListCache;
+
 class LineSegList {
 public:
-    LineSegList(const std::vector<cv::Point>& points) {
+    LineSegList(LineSegListCache* cache, const std::vector<cv::Point>& points) : cache_(cache) {
         if (points.empty()) {
             return;
         }
@@ -32,10 +34,18 @@ public:
         compressed_data_size_ = compressed_data_.size();
     }
 
-    LineSegList(cv::Point start_point, const int8_t* data, size_t size)
-        : start_point_(start_point), compressed_data_ptr_(data), compressed_data_size_(size) {}
+    LineSegList(LineSegListCache* cache, cv::Point start_point, const int8_t* data, size_t size)
+        : cache_(cache), start_point_(start_point), compressed_data_ptr_(data), compressed_data_size_(size) {}
 
     std::shared_ptr<std::vector<cv::Point>> get() {
+        if (cache_) {
+            auto cached_data = cache_->get(this);
+            if (cached_data) {
+                return cached_data;
+            }
+        }
+
+        // Fallback to local cache or decompression if no shared cache or not found
         std::lock_guard<std::mutex> lock(mutex_);
         std::shared_ptr<std::vector<cv::Point>> points_ptr = points_cache_.lock();
         if (!points_ptr) {
@@ -48,6 +58,10 @@ public:
                 points_ptr->push_back(current_point);
             }
             points_cache_ = points_ptr;
+
+            if (cache_) {
+                cache_->put(this, points_ptr);
+            }
         }
         return points_ptr;
     }
@@ -58,6 +72,7 @@ public:
     size_t num_points() const { return 1 + compressed_data_size_ / 2; }
 
 private:
+    LineSegListCache* cache_ = nullptr;
     cv::Point start_point_;
     std::vector<int8_t> compressed_data_; // Owns the data for non-views
     const int8_t* compressed_data_ptr_ = nullptr;
