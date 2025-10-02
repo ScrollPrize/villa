@@ -783,9 +783,10 @@ static inline int surftrack_round_step(float step)
 
 static const std::vector<int>& surftrack_tiff_compression_params()
 {
+    static constexpr int kTiffCompressionLzw = 5;
     static const std::vector<int> params = {
         cv::IMWRITE_TIFF_COMPRESSION,
-        cv::IMWRITE_TIFF_COMPRESSION_LZW
+        kTiffCompressionLzw
     };
     return params;
 }
