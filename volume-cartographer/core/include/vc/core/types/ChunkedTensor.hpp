@@ -16,6 +16,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <cerrno>
+#include <cstring>
+#include <sstream>
 
 #ifndef CCI_TLS_MAX // Max number for ChunkedCachedInterpolator
 #define CCI_TLS_MAX 256
@@ -222,9 +225,21 @@ public:
         tmp_path = std::filesystem::path(_cache_dir) / ss.str();
         _mutex.unlock();
         int fd = open(tmp_path.string().c_str(), O_RDWR | O_CREAT | O_TRUNC, (mode_t)0600);
+        if (fd == -1) {
+            const int err = errno;
+            std::stringstream msg;
+            msg << "Chunked3d: open failed for " << tmp_path << ": " << std::strerror(err);
+            throw std::runtime_error(msg.str());
+        }
         int ret = ftruncate(fd, len_bytes);
-        if (ret != 0)
-            throw std::runtime_error("oops ftruncate failed!");
+        if (ret != 0) {
+            const int err = errno;
+            close(fd);
+            std::stringstream msg;
+            msg << "Chunked3d: ftruncate failed for " << tmp_path
+                << " (" << len_bytes << " bytes): " << std::strerror(err);
+            throw std::runtime_error(msg.str());
+        }
         T *chunk = (T*)mmap(NULL, len_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         close(fd);
         

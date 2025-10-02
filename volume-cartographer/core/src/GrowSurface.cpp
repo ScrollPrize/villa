@@ -26,6 +26,8 @@
 #include <limits>
 #include <algorithm>
 #include <map>
+#include <cmath>
+#include <vector>
 
 int static dbg_counter = 0;
 // Default values for thresholds Will be configurable through JSON
@@ -774,6 +776,65 @@ static double local_solve(SurfaceMeta *sm, const cv::Vec2i &p, SurfTrackerData &
 }
 
 
+static inline int surftrack_round_step(float step)
+{
+    return std::max(1, static_cast<int>(std::lround(step)));
+}
+
+static const std::vector<int>& surftrack_tiff_compression_params()
+{
+    static constexpr int kTiffCompressionLzw = 5;
+    static const std::vector<int> params = {
+        cv::IMWRITE_TIFF_COMPRESSION,
+        kTiffCompressionLzw
+    };
+    return params;
+}
+
+static cv::Mat_<uint16_t> surftrack_generation_channel(
+    const cv::Mat_<uint16_t>& generations,
+    const cv::Rect& used_area,
+    float step)
+{
+    const int step_int = surftrack_round_step(step);
+    if (step_int <= 0 || used_area.width <= 0 || used_area.height <= 0)
+        return {};
+
+    cv::Rect bounds(0, 0, generations.cols, generations.rows);
+    cv::Rect safe = used_area & bounds;
+    if (safe.width <= 0 || safe.height <= 0)
+        return {};
+
+    cv::Mat_<uint16_t> channel(safe.height * step_int, safe.width * step_int, static_cast<uint16_t>(0));
+
+    for (int y = 0; y < safe.height; ++y) {
+        for (int x = 0; x < safe.width; ++x) {
+            uint16_t g = generations(safe.y + y, safe.x + x);
+            int base_y = y * step_int;
+            int base_x = x * step_int;
+            for (int sy = 0; sy < step_int; ++sy)
+                for (int sx = 0; sx < step_int; ++sx)
+                    channel(base_y + sy, base_x + sx) = g;
+        }
+    }
+
+    return channel;
+}
+
+static uint16_t surftrack_max_generation(const cv::Mat_<uint16_t>& generations,
+                                         const cv::Rect& used_area)
+{
+    cv::Rect bounds(0, 0, generations.cols, generations.rows);
+    cv::Rect safe = used_area & bounds;
+    if (safe.width <= 0 || safe.height <= 0)
+        return 0;
+
+    double min_val = 0.0;
+    double max_val = 0.0;
+    cv::minMaxLoc(generations(safe), &min_val, &max_val);
+    return static_cast<uint16_t>(max_val);
+}
+
 static cv::Mat_<cv::Vec3f> surftrack_genpoints_hr(
     SurfTrackerData &data, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points,
     const cv::Rect &used_area, float step, float step_src,
@@ -874,7 +935,7 @@ static cv::Mat_<cv::Vec3f> surftrack_genpoints_hr(
 
 //try flattening the current surface mapping assuming direct 3d distances
 //this is basically just a reparametrization
-static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points, cv::Rect used_area,
+static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points, cv::Mat_<uint16_t> &generations, cv::Rect used_area,
     cv::Rect static_bounds, float step, float src_step, const cv::Vec2i &seed, int closing_r, bool keep_inpainted = false,
     const std::filesystem::path& tgt_dir = std::filesystem::path(),
     bool pin_approved = true, float approved_weight_hr = 4.0f, bool prefer_approved_in_hr = true,
@@ -885,6 +946,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     bool remap_parallel = false)
 {
     std::cout << "optimizer: optimizing surface " << state.size() << " " << used_area <<  " " << static_bounds << std::endl;
+
+    const int step_int = surftrack_round_step(step);
 
     cv::Mat_<cv::Vec3d> points_new = points.clone();
     SurfaceMeta sm;
@@ -901,7 +964,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
         cv::Rect grid_bounds(0, 0, state.cols, state.rows);
         used_area = used_area & grid_bounds;
     }
-    cv::Rect used_area_hr = {used_area.x*step, used_area.y*step, used_area.width*step, used_area.height*step};
+    cv::Rect used_area_hr = {used_area.x*step_int, used_area.y*step_int, used_area.width*step_int, used_area.height*step_int};
 
     ceres::Problem problem_inpaint;
     ceres::Solver::Summary summary;
@@ -1055,6 +1118,9 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                                    /*parallel=*/hr_gen_parallel);
         try {
             auto dbg_surf = new QuadSurface(points_hr_inp(used_area_hr), {1/src_step,1/src_step});
+            auto gen_channel = surftrack_generation_channel(generations, used_area, step);
+            if (!gen_channel.empty())
+                dbg_surf->setChannel("generations", gen_channel);
             std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str()+"_inp_hr";
             dbg_surf->save(tgt_dir / uuid, uuid);
             delete dbg_surf;
@@ -1300,6 +1366,11 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     data.seed_loc = seed;
     data.seed_coord = points(seed);
 
+    for (int j = used_area.y; j < used_area.br().y; ++j)
+        for (int i = used_area.x; i < used_area.br().x; ++i)
+            if ((state(j,i) & STATE_LOC_VALID) == 0)
+                generations(j,i) = 0;
+
     {
         cv::Mat_<cv::Vec3f> points_hr_inp =
             surftrack_genpoints_hr(data, state, points, used_area, step, src_step,
@@ -1307,6 +1378,9 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                                    /*parallel=*/hr_gen_parallel);
         try {
             auto dbg_surf = new QuadSurface(points_hr_inp(used_area_hr), {1/src_step,1/src_step});
+            auto gen_channel = surftrack_generation_channel(generations, used_area, step);
+            if (!gen_channel.empty())
+                dbg_surf->setChannel("generations", gen_channel);
             std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str()+"_opt_inp_hr";
             dbg_surf->save(tgt_dir / uuid, uuid);
             delete dbg_surf;
@@ -1332,6 +1406,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     std::unordered_map<std::string,SurfaceMeta*> surfs;
     float src_step = params.value("src_step", 20);
     float step = params.value("step", 10);
+    const int step_int = surftrack_round_step(step);
     int max_width = params.value("max_width", 80000);
 
     local_cost_inl_th = params.value("local_cost_inl_th", 0.2f);
@@ -1455,11 +1530,12 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     std::set<cv::Vec2i, Vec2iLess> fringe;
 
     cv::Mat_<uint8_t> state(size,0);
+    cv::Mat_<uint16_t> generations(size, static_cast<uint16_t>(0));
     cv::Mat_<uint16_t> inliers_sum_dbg(size,0);
     cv::Mat_<cv::Vec3d> points(size,{-1,-1,-1});
 
     cv::Rect used_area(x0,y0,2,2);
-    cv::Rect used_area_hr = {used_area.x*step, used_area.y*step, used_area.width*step, used_area.height*step};
+    cv::Rect used_area_hr = {used_area.x*step_int, used_area.y*step_int, used_area.width*step_int, used_area.height*step_int};
 
     SurfTrackerData data;
 
@@ -1507,6 +1583,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
         std::cout << "warning: seed z " << data.seed_coord[2] << " is outside z_range; growth will be restricted to [" << z_min << ", " << z_max << "]" << std::endl;
 
     state(y0,x0) = STATE_LOC_VALID | STATE_COORD_VALID;
+    generations(y0,x0) = 1;
     fringe.insert(cv::Vec2i(y0,x0));
 
     // Initial area is zero (need 2x2 block to form first quad)
@@ -1719,6 +1796,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 }
 
                 state(p) = 0;
+                generations(p) = 0;
 
                 int inliers_sum = 0;
                 int inliers_count = 0;
@@ -1766,6 +1844,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                         data_th.loc(test_surf, p) = {loc[1], loc[0]};
                         float cost = local_cost(test_surf, p, data_th, state, points, step, src_step, &count, &straight_count);
                         state(p) = 0;
+                        generations(p) = 0;
                         data_th.erase(test_surf, p);
                         if (cost < local_cost_inl_th && (ref_seed || (count >= 2 && straight_count >= straight_min_count))) {
                             inliers_sum += count;
@@ -1825,6 +1904,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
                 points(p) = best_coord;
                 inliers_sum_dbg(p) = best_inliers;
+                generations(p) = static_cast<uint16_t>(std::min<int>(std::numeric_limits<uint16_t>::max(), generation + 1));
 
                 ceres::Problem problem;
                 surftrack_add_local(best_surf, p, data_th, problem, state, points, step, src_step, SURF_LOSS | LOSS_ZLOC);
@@ -1908,7 +1988,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
 
                 if (!used_area.contains(cv::Point(p[1],p[0]))) {
                     used_area = used_area | cv::Rect(p[1],p[0],1,1);
-                    used_area_hr = {used_area.x*step, used_area.y*step, used_area.width*step, used_area.height*step};
+                    used_area_hr = {used_area.x*step_int, used_area.y*step_int, used_area.width*step_int, used_area.height*step_int};
                 }
                 fringe.insert(p);
                 // O(1) geometric area update: up to four quads become complete with a new vertex.
@@ -1922,10 +2002,12 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 //just try again some other time
                 state(p) = 0;
                 points(p) = {-1,-1,-1};
+                generations(p) = 0;
             }
             else {
                 state(p) = 0;
                 points(p) = {-1,-1,-1};
+                generations(p) = 0;
 #pragma omp critical
                 best_inliers_gen = std::max(best_inliers_gen, best_inliers);
             }
@@ -1950,8 +2032,10 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
 
             cv::Mat_<uint8_t> state_orig = state.clone();
             cv::Mat_<cv::Vec3d> points_orig = points.clone();
+            cv::Mat_<uint16_t> generations_orig = generations.clone();
             state.setTo(0);
             points.setTo(cv::Vec3d(-1,-1,-1));
+            generations.setTo(0);
             cv::Rect new_used_area = used_area;
             for(int j=used_area.y;j<=used_area.br().y+1;j++)
                 for(int i=used_area.x;i<=used_area.br().x+1;i++)
@@ -1960,11 +2044,12 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                         int ny = j;
                         state(ny, nx) = state_orig(j, i);
                         points(ny, nx) = points_orig(j, i);
+                        generations(ny, nx) = generations_orig(j, i);
                         new_used_area = new_used_area | cv::Rect(nx,ny,1,1);
                     }
 
             used_area = new_used_area;
-            used_area_hr = {used_area.x*step, used_area.y*step, used_area.width*step, used_area.height*step};
+            used_area_hr = {used_area.x*step_int, used_area.y*step_int, used_area.width*step_int, used_area.height*step_int};
 
             fringe.clear();
             for(int j=used_area.y-2;j<=used_area.br().y+2;j++)
@@ -2021,6 +2106,12 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 dbg_surf->meta = new nlohmann::json;
                 (*dbg_surf->meta)["vc_grow_seg_from_segments_params"] = params;
 
+                auto gen_channel = surftrack_generation_channel(generations, used_area, step);
+                if (!gen_channel.empty())
+                    dbg_surf->setChannel("generations", gen_channel);
+
+                (*dbg_surf->meta)["max_gen"] = surftrack_max_generation(generations, used_area);
+
                 // Use exact geometric area accumulated so far
                 const double area_exact_vx2 = area_accum_vox2;
                 const double area_exact_cm2 = area_exact_vx2 * double(voxelsize) * double(voxelsize) / 1e8;
@@ -2040,9 +2131,10 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
             cv::Rect all(0,0,w, h);
             cv::Mat_<uint8_t> opt_state = state.clone();
             cv::Mat_<cv::Vec3d> opt_points = points.clone();
+            cv::Mat_<uint16_t> opt_generations = generations.clone();
 
             cv::Rect active = active_bounds & used_area;
-            optimize_surface_mapping(opt_data, opt_state, opt_points, active, static_bounds, step, src_step,
+            optimize_surface_mapping(opt_data, opt_state, opt_points, opt_generations, active, static_bounds, step, src_step,
                                      {y0,x0}, closing_r, /*keep_inpainted=*/true, tgt_dir,
                                      /*pin_approved=*/pin_approved_points,
                                      /*approved_weight_hr=*/approved_weight_hr,
@@ -2056,6 +2148,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 copy(opt_data, data, active);
                 opt_points(active).copyTo(points(active));
                 opt_state(active).copyTo(state(active));
+                opt_generations(active).copyTo(generations(active));
 
                 for(int i=0;i<omp_get_max_threads();i++) {
                     data_ths[i] = data;
@@ -2082,6 +2175,12 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
                 dbg_surf->meta = new nlohmann::json;
                 (*dbg_surf->meta)["vc_grow_seg_from_segments_params"] = params;
+
+                auto gen_channel = surftrack_generation_channel(generations, used_area, step);
+                if (!gen_channel.empty())
+                    dbg_surf->setChannel("generations", gen_channel);
+
+                (*dbg_surf->meta)["max_gen"] = surftrack_max_generation(generations, used_area);
 
                 std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str()+"_opt";
                 const double area_exact_vx2 = area_accum_vox2;
@@ -2121,6 +2220,10 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
             state = cv::Mat_<uint8_t>(size, 0);
             old_state.copyTo(state(cv::Rect(0,0,old_state.cols,h)));
 
+            cv::Mat_<uint16_t> old_generations = generations;
+            generations = cv::Mat_<uint16_t>(size, static_cast<uint16_t>(0));
+            old_generations.copyTo(generations(cv::Rect(0,0,old_generations.cols,h)));
+
             cv::Mat_<uint16_t> old_inliers_sum_dbg = inliers_sum_dbg;
             inliers_sum_dbg = cv::Mat_<uint16_t>(size, 0);
             old_inliers_sum_dbg.copyTo(inliers_sum_dbg(cv::Rect(0,0,old_inliers_sum_dbg.cols,h)));
@@ -2143,7 +2246,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
             init_area_scan();
         }
 
-        cv::imwrite(tgt_dir / "inliers_sum.tif", inliers_sum_dbg(used_area));
+        cv::imwrite(tgt_dir / "inliers_sum.tif", inliers_sum_dbg(used_area), surftrack_tiff_compression_params());
 
         if (fringe.empty())
             break;
@@ -2174,7 +2277,12 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
 
     auto surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
 
+    auto gen_channel = surftrack_generation_channel(generations, used_area, step);
+    if (!gen_channel.empty())
+        surf->setChannel("generations", gen_channel);
+
     surf->meta = new nlohmann::json;
+    (*surf->meta)["max_gen"] = surftrack_max_generation(generations, used_area);
     (*surf->meta)["area_vx2"] = area_final_vox2;
     (*surf->meta)["area_cm2"] = area_final_cm2;
     (*surf->meta)["used_approved_segments"] = std::vector<std::string>(used_approved_names.begin(), used_approved_names.end());

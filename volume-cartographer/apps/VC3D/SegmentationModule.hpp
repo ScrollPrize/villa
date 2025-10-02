@@ -4,6 +4,7 @@
 #include <QPointer>
 #include <QSet>
 
+#include <deque>
 #include <functional>
 #include <optional>
 #include <string>
@@ -170,6 +171,11 @@ private:
                      const cv::Vec3f& worldPos);
     void onSurfaceCollectionChanged(std::string name, Surface* surface);
 
+    [[nodiscard]] bool captureUndoSnapshot();
+    void discardLastUndoSnapshot();
+    bool restoreUndoSnapshot();
+    void clearUndoStack();
+
     [[nodiscard]] bool isSegmentationViewer(const CVolumeViewer* viewer) const;
     [[nodiscard]] float gridStepWorld() const;
 
@@ -228,4 +234,12 @@ private:
     bool _hasLastPaintSample{false};
     float _pushPullStepMultiplier{4.00f};
     std::optional<std::vector<SegmentationGrowthDirection>> _pendingShortcutDirections;
+
+    struct UndoState
+    {
+        cv::Mat_<cv::Vec3f> points;
+    };
+    std::deque<UndoState> _undoStack;
+    bool _suppressUndoCapture{false};
+    bool _pushPullUndoCaptured{false};
 };
