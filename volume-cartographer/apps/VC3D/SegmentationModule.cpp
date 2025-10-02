@@ -13,6 +13,7 @@
 
 #include <QCursor>
 #include <QKeyEvent>
+#include <QKeySequence>
 #include <QLoggingCategory>
 #include <QPointer>
 #include <QTimer>
@@ -31,6 +32,7 @@ namespace
 constexpr int kStatusShort = 1500;
 constexpr int kStatusMedium = 2000;
 constexpr int kStatusLong = 5000;
+constexpr int kMaxUndoStates = 5;
 
 float averageScale(const cv::Vec2f& scale)
 {
@@ -279,6 +281,7 @@ void SegmentationModule::setEditingEnabled(bool enabled)
         setCorrectionsAnnotateMode(false, false);
         setInvalidationBrushActive(false);
         clearInvalidationBrush();
+        clearUndoStack();
     }
     updateCorrectionsWidget();
     emit editingEnabledChanged(enabled);
@@ -339,18 +342,33 @@ void SegmentationModule::applyEdits()
     if (!_editManager || !_editManager->hasSession()) {
         return;
     }
+    const bool hadPendingChanges = _editManager->hasPendingChanges();
+    if (hadPendingChanges) {
+        if (!captureUndoSnapshot()) {
+            qCWarning(lcSegModule) << "Failed to capture undo snapshot before applying edits.";
+        }
+    }
     clearInvalidationBrush();
     _editManager->applyPreview();
     if (_surfaces) {
         _surfaces->setSurface("segmentation", _editManager->previewSurface());
     }
     emitPendingChanges();
+    if (hadPendingChanges) {
+        emit statusMessageRequested(tr("Applied segmentation edits."), kStatusShort);
+    }
 }
 
 void SegmentationModule::resetEdits()
 {
     if (!_editManager || !_editManager->hasSession()) {
         return;
+    }
+    const bool hadPendingChanges = _editManager->hasPendingChanges();
+    if (hadPendingChanges) {
+        if (!captureUndoSnapshot()) {
+            qCWarning(lcSegModule) << "Failed to capture undo snapshot before resetting edits.";
+        }
     }
     cancelDrag();
     clearInvalidationBrush();
@@ -360,6 +378,9 @@ void SegmentationModule::resetEdits()
     }
     refreshOverlay();
     emitPendingChanges();
+    if (hadPendingChanges) {
+        emit statusMessageRequested(tr("Reset pending segmentation edits."), kStatusShort);
+    }
 }
 
 void SegmentationModule::stopTools()
@@ -375,6 +396,7 @@ bool SegmentationModule::beginEditingSession(QuadSurface* surface)
     }
 
     stopAllPushPull();
+    clearUndoStack();
     clearInvalidationBrush();
     setInvalidationBrushActive(false);
     if (!_editManager->beginSession(surface)) {
@@ -402,6 +424,7 @@ bool SegmentationModule::beginEditingSession(QuadSurface* surface)
 void SegmentationModule::endEditingSession()
 {
     stopAllPushPull();
+    clearUndoStack();
     cancelDrag();
     clearInvalidationBrush();
     setInvalidationBrushActive(false);
@@ -452,6 +475,80 @@ void SegmentationModule::onSurfaceCollectionChanged(std::string name, Surface* s
     setEditingEnabled(false);
 }
 
+bool SegmentationModule::captureUndoSnapshot()
+{
+    if (_suppressUndoCapture) {
+        return false;
+    }
+    if (!_editManager || !_editManager->hasSession()) {
+        return false;
+    }
+
+    const auto& previewPoints = _editManager->previewPoints();
+    if (previewPoints.empty()) {
+        return false;
+    }
+
+    UndoState state;
+    state.points = previewPoints.clone();
+    if (state.points.empty()) {
+        return false;
+    }
+
+    if (_undoStack.size() >= static_cast<std::size_t>(kMaxUndoStates)) {
+        _undoStack.pop_front();
+    }
+    _undoStack.push_back(std::move(state));
+    return true;
+}
+
+void SegmentationModule::discardLastUndoSnapshot()
+{
+    if (!_undoStack.empty()) {
+        _undoStack.pop_back();
+    }
+}
+
+bool SegmentationModule::restoreUndoSnapshot()
+{
+    if (_undoStack.empty()) {
+        return false;
+    }
+    if (!_editManager || !_editManager->hasSession()) {
+        return false;
+    }
+
+    UndoState state = std::move(_undoStack.back());
+    _undoStack.pop_back();
+    if (state.points.empty()) {
+        return false;
+    }
+
+    _suppressUndoCapture = true;
+    bool applied = _editManager->setPreviewPoints(state.points, false);
+    if (applied) {
+        _editManager->applyPreview();
+        if (_surfaces) {
+            _surfaces->setSurface("segmentation", _editManager->previewSurface());
+        }
+        clearInvalidationBrush();
+        refreshOverlay();
+        emitPendingChanges();
+        _pushPullUndoCaptured = false;
+    } else {
+        _undoStack.push_back(std::move(state));
+    }
+    _suppressUndoCapture = false;
+
+    return applied;
+}
+
+void SegmentationModule::clearUndoStack()
+{
+    _undoStack.clear();
+    _pushPullUndoCaptured = false;
+}
+
 bool SegmentationModule::hasActiveSession() const
 {
     return _editManager && _editManager->hasSession();
@@ -484,6 +581,19 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
 {
     if (!event) {
         return false;
+    }
+
+    if (!event->isAutoRepeat()) {
+        const bool undoRequested = (event->matches(QKeySequence::Undo) == QKeySequence::ExactMatch) ||
+                                   (event->key() == Qt::Key_Z && event->modifiers().testFlag(Qt::ControlModifier));
+        if (undoRequested) {
+            if (restoreUndoSnapshot()) {
+                emit statusMessageRequested(tr("Undid last segmentation change."), kStatusShort);
+                event->accept();
+                return true;
+            }
+            return false;
+        }
     }
 
     if (event->key() == Qt::Key_Shift && !event->isAutoRepeat()) {
@@ -1149,6 +1259,7 @@ bool SegmentationModule::applyInvalidationBrush()
         return false;
     }
 
+    bool snapshotCaptured = captureUndoSnapshot();
     const float brushRadiusSteps = std::max(_radiusSteps, 0.5f);
     bool anyChanged = false;
     for (const auto& key : targets) {
@@ -1160,6 +1271,9 @@ bool SegmentationModule::applyInvalidationBrush()
     clearInvalidationBrush();
 
     if (!anyChanged) {
+        if (snapshotCaptured) {
+            discardLastUndoSnapshot();
+        }
         return false;
     }
 
@@ -1336,7 +1450,15 @@ void SegmentationModule::updateDrag(const cv::Vec3f& worldPos)
         return;
     }
 
+    bool snapshotCaptured = false;
+    if (!_drag.moved) {
+        snapshotCaptured = captureUndoSnapshot();
+    }
+
     if (!_editManager->updateActiveDrag(worldPos)) {
+        if (!_drag.moved && snapshotCaptured) {
+            discardLastUndoSnapshot();
+        }
         return;
     }
 
@@ -1451,6 +1573,7 @@ bool SegmentationModule::startPushPull(int direction)
 
     _pushPull.active = true;
     _pushPull.direction = direction;
+    _pushPullUndoCaptured = false;
 
     if (_pushPullTimer && !_pushPullTimer->isActive()) {
         _pushPullTimer->start();
@@ -1482,6 +1605,7 @@ void SegmentationModule::stopAllPushPull()
     if (_pushPullTimer && _pushPullTimer->isActive()) {
         _pushPullTimer->stop();
     }
+    _pushPullUndoCaptured = false;
 }
 
 bool SegmentationModule::applyPushPullStep()
@@ -1497,13 +1621,29 @@ bool SegmentationModule::applyPushPullStep()
     const int row = _hover.row;
     const int col = _hover.col;
 
+    bool snapshotCapturedThisStep = false;
+    if (!_pushPullUndoCaptured) {
+        snapshotCapturedThisStep = captureUndoSnapshot();
+        if (snapshotCapturedThisStep) {
+            _pushPullUndoCaptured = true;
+        }
+    }
+
     if (!_editManager->beginActiveDrag({row, col})) {
+        if (snapshotCapturedThisStep) {
+            discardLastUndoSnapshot();
+            _pushPullUndoCaptured = false;
+        }
         return false;
     }
 
     auto centerWorldOpt = _editManager->vertexWorldPosition(row, col);
     if (!centerWorldOpt) {
         _editManager->cancelActiveDrag();
+        if (snapshotCapturedThisStep) {
+            discardLastUndoSnapshot();
+            _pushPullUndoCaptured = false;
+        }
         return false;
     }
     const cv::Vec3f centerWorld = *centerWorldOpt;
@@ -1538,6 +1678,10 @@ bool SegmentationModule::applyPushPullStep()
     const cv::Vec3f targetWorld = centerWorld + normal * (static_cast<float>(_pushPull.direction) * stepWorld);
     if (!_editManager->updateActiveDrag(targetWorld)) {
         _editManager->cancelActiveDrag();
+        if (snapshotCapturedThisStep) {
+            discardLastUndoSnapshot();
+            _pushPullUndoCaptured = false;
+        }
         return false;
     }
 
