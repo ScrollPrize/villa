@@ -4,11 +4,12 @@
 
 #include <random>
 #include <iostream>
+#include <iomanip>
 
 namespace vc::core::util {
 
 LineSegListCache::LineSegListCache(size_t max_size_bytes)
-    : max_size_bytes_(max_size_bytes) {}
+    : max_size_bytes_(max_size_bytes), last_stat_time_(std::chrono::steady_clock::now()) {}
 
 std::shared_ptr<std::vector<cv::Point>> LineSegListCache::get(CacheKey key) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -17,6 +18,8 @@ std::shared_ptr<std::vector<cv::Point>> LineSegListCache::get(CacheKey key) {
         auto& entry = entries_[it->second];
         if (auto data = entry.data.lock()) {
             entry.generation = ++generation_counter_;
+            cache_hits_++;
+            check_print_stats();
             return data;
         } else {
             // Entry expired, remove it
@@ -24,6 +27,8 @@ std::shared_ptr<std::vector<cv::Point>> LineSegListCache::get(CacheKey key) {
             lookup_.erase(it);
         }
     }
+    cache_misses_++;
+    check_print_stats();
     return nullptr;
 }
 
@@ -75,6 +80,21 @@ void LineSegListCache::evict() {
         lookup_[entries_[evict_idx].key] = evict_idx;
     }
     entries_.pop_back();
+}
+
+void LineSegListCache::check_print_stats() {
+    if (generation_counter_ % 1000 == 0) {
+        auto now = std::chrono::steady_clock::now();
+        auto diff = std::chrono::duration_cast<std::chrono::seconds>(now - last_stat_time_);
+        if (diff.count() >= 1) {
+            uint64_t hits = cache_hits_.load();
+            uint64_t misses = cache_misses_.load();
+            uint64_t total = hits + misses;
+            double hit_rate = (total == 0) ? 0.0 : (static_cast<double>(hits) / total) * 100.0;
+            std::cout << "[LineSegList Cache] Hits: " << hits << ", Misses: " << misses << ", Total: " << total << ", Hit Rate: " << std::fixed << std::setprecision(2) << hit_rate << "%" << std::endl;
+            last_stat_time_ = now;
+        }
+    }
 }
 
 } // namespace vc::core::util

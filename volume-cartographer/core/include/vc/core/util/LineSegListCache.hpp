@@ -4,6 +4,8 @@
 #include <memory>
 #include <mutex>
 #include <opencv2/core.hpp>
+#include <atomic>
+#include <chrono>
 
 namespace vc::core::util {
 
@@ -28,10 +30,15 @@ private:
     };
 
     void evict();
+    void check_print_stats();
 
     size_t max_size_bytes_;
     size_t current_size_bytes_ = 0;
     uint64_t generation_counter_ = 0;
+
+    std::atomic<uint64_t> cache_hits_{0};
+    std::atomic<uint64_t> cache_misses_{0};
+    std::chrono::steady_clock::time_point last_stat_time_;
 
     std::vector<CacheEntry> entries_;
     std::unordered_map<CacheKey, size_t> lookup_;
