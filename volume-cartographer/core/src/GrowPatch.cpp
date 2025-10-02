@@ -967,7 +967,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         double min_val, max_val;
         cv::minMaxLoc(resume_generations, &min_val, &max_val);
         int start_gen = (rewind_gen == -1) ? static_cast<int>(max_val) : rewind_gen;
-        int gen_diff = stop_gen - start_gen;
+        int gen_diff = std::max(0, stop_gen - start_gen);
         w = resume_generations.cols + 2 * gen_diff + 50;
         h = resume_generations.rows + 2 * gen_diff + 50;
     } else {
