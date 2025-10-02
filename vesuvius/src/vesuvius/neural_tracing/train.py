@@ -79,10 +79,10 @@ def train(config_path):
         dataset = PatchInCubeDataset(config)
     train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config['batch_size'], num_workers=config['num_workers'])
 
-    # model = Vesuvius3dUnetModel(in_channels=4, out_channels=config['step_count'] * 2, config=config)
+    # model = Vesuvius3dUnetModel(in_channels=5, out_channels=config['step_count'] * 2, config=config)
     model = SongUnet3dModel(
         img_resolution=config['crop_size'],
-        in_channels=4,
+        in_channels=5,
         out_channels=config['step_count'] * 2,
         model_channels=32,
         channel_mult=[1, 2, 4, 8],
@@ -158,7 +158,7 @@ def train(config_path):
                     canvas = rearrange(canvas[:, :, canvas.shape[2] // 2], 'b uvw y x v -> (b y) (v x) uvw')
                 else:
                     colours_by_step = torch.rand([targets.shape[1], 3], device=inputs.device) * 0.7 + 0.2
-                    colours_by_step = torch.cat([torch.ones([2, 3], device=inputs.device), colours_by_step], dim=0)  # white for conditioning points
+                    colours_by_step = torch.cat([torch.ones([3, 3], device=inputs.device), colours_by_step], dim=0)  # white for conditioning points
                     def overlay_crosshair(x):
                         x = x.clone()
                         red = torch.tensor([0.8, 0, 0], device=x.device)
@@ -170,7 +170,7 @@ def train(config_path):
                     def inputs_slice(dim):
                         return overlay_crosshair(inputs[:, 0].select(dim=dim + 1, index=inputs.shape[(dim + 2)] // 2)[..., None].expand(-1, -1, -1, 3) * 0.5 + 0.5)
                     def projections(x):
-                        x = torch.cat([inputs[:, 2:4], x], dim=1)
+                        x = torch.cat([inputs[:, 2:5], x], dim=1)
                         coloured = x[..., None] * colours_by_step[None, :, None, None, None, :]
                         return torch.cat([overlay_crosshair(coloured.amax(dim=(1, dim + 2))) for dim in range(3)], dim=1)
 

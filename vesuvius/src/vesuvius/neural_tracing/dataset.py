@@ -400,6 +400,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                     out_heatmaps = make_heatmaps([pos_shifted_zyxs, neg_shifted_zyxs], min_corner_zyx, crop_size)
                 return in_heatmaps, out_heatmaps, cond
 
+            # TODO: is there a nicer way to arrange this that expresses the logic/cases better?
             # *_in_heatmaps always have a single plane, either the first negative point or empty
             # *_out_heatmaps always have one plane per step, and may contain only positive or both positive and negative points
             u_in_heatmaps, u_out_heatmaps, u_cond = make_in_out_heatmaps(u_pos_shifted_zyxs, u_neg_shifted_zyxs)
@@ -407,7 +408,31 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             if ~u_cond and ~v_cond:
                 # In this case U & V are (nearly) indistinguishable, so don't force the model to separate them
                 u_out_heatmaps = v_out_heatmaps = torch.maximum(u_out_heatmaps, v_out_heatmaps)
-            uv_heatmaps_both = torch.cat([u_in_heatmaps, v_in_heatmaps, u_out_heatmaps, v_out_heatmaps], dim=0)
+            diag_ij = None
+            if (u_cond ^ v_cond) and torch.rand([]) < 0.5:
+                # With 50% probability, in one-cond case, also condition on a diagonal that is adjacent
+                # to the conditioned-on (1st neg) point
+                if u_cond:
+                    diag_ij = torch.stack([u_neg_shifted_ijs[0, 0], (v_pos_shifted_ijs if torch.rand([]) < 0.5 else v_neg_shifted_ijs)[0, 1]])
+                else:
+                    diag_ij = torch.stack([(u_pos_shifted_ijs if torch.rand([]) < 0.5 else u_neg_shifted_ijs)[0, 0], v_neg_shifted_ijs[0, 1]])
+            if (u_cond & v_cond) and torch.rand([]) < 0.5:
+                # With 50% probability, in two-cond case, also condition on a diagonal in a 'to x from' direction, so
+                # adjacent to exactly one of the conditioned-on (1st neg) points
+                if torch.rand([]) < 0.5:
+                    diag_ij = torch.stack([u_neg_shifted_ijs[0, 0], v_pos_shifted_ijs[0, 1]])
+                else:
+                    diag_ij = torch.stack([u_pos_shifted_ijs[0, 0], v_neg_shifted_ijs[0, 1]])
+            if diag_ij is not None:
+                if torch.any(diag_ij < 0) or torch.any(diag_ij >= torch.tensor(patch.valid_mask.shape[:2])):
+                    continue
+                if not patch.valid_mask[*diag_ij.int()]:
+                    continue
+                diag_zyx = get_zyx_from_patch(diag_ij, patch)
+                diag_in_heatmaps = make_heatmaps([diag_zyx[None]], min_corner_zyx, crop_size)
+            else:
+                diag_in_heatmaps = torch.zeros_like(u_in_heatmaps)
+            uv_heatmaps_both = torch.cat([u_in_heatmaps, v_in_heatmaps, diag_in_heatmaps, u_out_heatmaps, v_out_heatmaps], dim=0)
 
             # Build localiser volume
             localiser = build_localiser(center_zyx, min_corner_zyx, crop_size)
@@ -431,8 +456,8 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 # FIXME: why do these NaNs happen occasionally?
                 continue
 
-            uv_heatmaps_in = uv_heatmaps_both[..., :2]
-            uv_heatmaps_out = uv_heatmaps_both[..., 2:]
+            uv_heatmaps_in = uv_heatmaps_both[..., :3]
+            uv_heatmaps_out = uv_heatmaps_both[..., 3:]
 
             yield {
                 'volume': volume_crop,
