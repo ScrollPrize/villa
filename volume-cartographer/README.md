@@ -14,113 +14,155 @@ Via Vesuvius Challenge, it has gone through a few forks:
 this repository (developed and maintained by the Vesuvius Challenge team).
 The original Volume Cartographer is a general purpose toolkit for virtual unwrapping, while this version is specialized for the frontier challenges of the Herculaneum papyri.
 
+### Installation Instructions
+Due to a complex set of dependencies, it is *highly* recommended to use the docker image. We host an up-to-date image on the [github container registry](https://github.com/ScrollPrize/villa/pkgs/container/villa%2Fvolume-cartographer) which can be pulled with a simple command :
 
-## WIP 3D volume slicing
-- ome-zarr enabled VC is available as *VC3D* alongside the existing VC binary
-- this branch implements (OME)-Zarr based volume viewing and arbitrary plane slicing, currently used to show XY,YZ,XZ planes + 1 plane with free rotation
-- along the way a lot of functionality was disabled/broken - for now use it just to look at stuff, do not touch segmentation
-- usage
-  - you need a Zarr volume (e.g. https://dl.ash2txt.org/other/dev/scrolls/1/volumes/54keV_7.91um.zarr/) in the volumes directory of your volpkg
-  - it needs a meta.json in the .zarr directory, which can be identical to the regular volume apart from:
-    - adding "format":"zarr"
-    - changing "name" so you can identify it in VC
-    - change the "UUID" (e.g. also add -zarr)
-  - currently only uint8 datatype is supported (but any compression thats compiled into z5)
-  - currently scale 0 (highest resolution) will be ignored and can be left out (which means ~90GB of data for the volume linked above)
-    - note that the metadata for scale 0 still needs to be present ("0/.zarray")
-  - by default VC will only load scale 1 or higher from the Zarr volume, so you do not need to download the highest resolution scale 0
-  - the default chunk cache is 10GB of RAM
-- features
-  - big yellow circle marks the slicing center
-  - right or middle click + drag to move around
-  - ctrl click to set slicing center to the selected location
-  - free rotation plane slice:
-    - change free plane normal in the bottom left
-    - scroll to zoom in/out
-  - control point based height map slice with IDW for interpolation
-    - click anywhere to add a control point for the 3d slice/segment
-  - fourth panel (center-down) contains the free plane slice, rightmost panel the 3d slice
+```bash
+docker pull ghcr.io/scrollprize/villa/volume-cartographer:edge
+```
 
-## Changes 2024
-- Merged in latest version from Educelab (state 2024-05-08)
-- Added memory-mapped (`mmap`) TIFF loading which improves loading speed and therefore results in smoother slice scanning plus drastically reduces RAM usage
-- Added "Y"/"Z"/"V" shortcut to evenly space points on current curve (in Segmentation tool)
-- Added slice view rotation via "Hold S + Mouse Wheel" and "X"/"I" to reset rotation
-- Added incremental slice rotation via "U" and "O"
-- Added spin box to see current rotation state and manually adjust
-- Fixed Docker builds to no longer require "export QT_PLUGIN_PATH" in order to find xcb platform library
-- Added user setting to override the default slice view scroll speed
-- Added dark theme support
-- Adjusted slice scanning step sizes on number keys (from 1/2/5/10/100 to 1/5/10/50/100)
-- Fixed bug with incorrect slice view zoom factoring
-- Performance improvements for slice rendering and scanning by preventing internal recreation of graphics scene items plus skipping QPixmap image data conversions
+If you want to install vc3d from source, the easiest path is to look at the [dockerfile](ubuntu-24.04-noble.Dockerfile) and adapt for your environment. Building from source presently requires a *nix like environment for atomic rename support. If you are on Windows, either use the docker image or WSL. 
 
-## Changes 2023
-This fork contains the following changes compared to upstream currently:
+[installation instructions for docker](https://docs.docker.com/engine/install/)
 
-### Changes from Whist List / Feature Requests of Segmentation Team
-- Implemented both points from #1 (*"Scan in Segment Mode"*) of the segmentation wish list ([Google Doc](https://docs.google.com/document/d/1YFILhWVHyijU_Yky3lKPvGAjmYm2QnRTYzMM7VqcogA)):
-  * Added new keyboard shortcuts so that now via number keys slice navigation in 1, 2, 5, 10 and 100 steps is available
-  * Added option to scan through slices while in the Segmentation Tool without losing any made curve changes (when user leaves the Segmentation Tool, a warning is shown to offer to either discard the curve changes, store them or cancel)
+[running docker as a non-root user](https://docs.docker.com/engine/install/linux-postinstall/)
 
-- Implemented topics #2 (*"Anchor manually annotated lines"*) and #6 (*"Pull metadata for training autosegmenters"*) of the segmentation wish list ([Google Doc](https://docs.google.com/document/d/1YFILhWVHyijU_Yky3lKPvGAjmYm2QnRTYzMM7VqcogA)):
-  * Implemented new `*.vcano` annotation file. It consists of 4 `double` values per point, storing the following information:
-    * Slice number the annotation point belongs to
-    * Bit flags to annotate each point (there is space for a lot more flags to extend further):
-        * “is anchor”
-        * “was manually changed”
-        * “was used in segmentation run” (to highlight that the slice curve was changed, but not yet used in any segmentation run)
-    * Original X and Y coordinates of the point as output by segmentation algorithm
-  * A new annotation file will automatically be added when none exists and it will get added to the `meta.json` information
-  * Added new annotation list into UI to see the annotations and manually change the anchor state of a slice (shortcut "L" when in Segmentation Tool); double-click on an annotation entry jumps to the corresponding slice
-  * Manually changed curve points are now highlighted (new color selector was added so users can customize the color; defaults to orange) while still showing the original curve color in the middle of the point
-  * Reworked segmentation algorithm trigger section that allows independent forward and backward segmentations with one "Start" click. For each direction users can either:
-    * Set an explicit end slice number (this number will automatically be adjusted internally in case it would go beyond any existing anchor in that direction to protect them against overwrites)
-    * Set anchor mode, in which case the end slice will automatically be the next anchor in that direction (if there is none, no segmentation will happen)
-    * Set to none, if one of the directions should not be used
-  * The "Interpolation Length" and "Interpolation Window" parameters of OFS were replaced by an "Interpolation Percentage" which will automatically be converted into the appropriate number of slices when using "Anchor mode" for segmentation
 
-### UI / UX Improvements
-- Implemented image dragging/panning via right mouse button
-- Implemented Undo/Redo for curve drawing changes
-- Adjusted mouse wheel usage:
-  * Mouse Wheel + Ctrl = Zoom in/out (as in most image apps); was previously Mouse Wheel + Shift in VC
-  * Mouse Wheel + Shift = Next/previous slice (scan range can be set via Q/E keys with visual feedback)
-  * Mouse Wheel + W Key Hold = Adjust impact range (shows visual feedback next to the cursor)
-  * Mouse Wheel + R Key Hold = Follow Highlighted Curve (same as Mouse Forward/Backward buttons)
-- Added Ctrl + G to easily jump to a given slice (opens an input popup to type in the slice index) => no more need to manually click into the spinner below the viewer
-- Changed curve changes / point snapping to only use the left mouse button (without any additional modifiers)
-- Switched to using proper dock widgets for the path list, annotation list and algorithm parameters (which previously was fixed below the path list in one UI element). This allows the user to freely position them and even make them float so they can be moved outside the VC e.g. to a second monitor. A "View" menu was added to hide/show the individual docks.
-- Themed the UI to be visually clearer/structured and more visually pleasing (a bit of eye candy rarely hurts...)
-- Added shortcut "F" to jump back to the slice the Segmentation Tool was started on
-- Added a "Recent volpkg" list and menu option to easily reopen one of the last 10 volume packages
-- Added the feature to remove a path from the `volpkg`
-- Use spin boxes for slice numbers (they allow proper min/max value handling and mouse wheel can be used to change the numeric value)
-- Added button to "Evenly Space Points" on the active "Compute" curves in Segmentation Tool mode (handy when during manual curve changes points get too bunched up to work with)
-- Added volume name into volume dropdown
-- Ensured that columns in segment table auto adjust their width (so that segment ID is fully visible)
-- Highlight the toggle button of the currently active tool mode
-- Added a scroll area for the segmentation algorithm parameters, since on smaller screen sizes, there often was not enough vertical space and all the labels/inputs got visually squished together.
-- Added tooltips to the color selectors boxes below the segment viewer
-- Added app logo for Linux
+### Basic introduction to VC3D 
+The document below is a basic introduction to the ui and keybindings available in VC3D , more detailed documents for each sections are in progress and will be located in [the docs folder](docs).
+> [!WARNING]
+> if you are using Ubuntu , the default open file limit is 1024, and you may encounter errors when running vc3d. To fix this, run `ulimit -n 750000` in your terminal.
 
-![Screenshot GUI Overview](screenshot_gui_overview.png)
+### Launching VC3D
 
-#### User Settings Dialog
-- Added settings dialog (using an INI file `VC.ini`) to make some features configurable by the user
-- Added user defined default path to look for `volpkg` when in "Open volpkg" dialog
-- Added user setting to auto open the last `volpkg` upon app start
-- Added user setting to configure how many slices should automatically be preloaded once Segmentation Tool is entered (previously was hardcoded to 100 slices which depending on the slice image size, might be too much for the machine running the application)
-- Added user setting to configure the initial step size to be used in segmentation runs (if the algorithm supports it), plus sets the initial slice scan range to the same value and uses the step size from the algorithm to control the behavior of the slice preloading when entering Segmentation Tool
-- Added user setting to configure the impact range values the application should use (still defaults to 1 to 20). User can specify a mixture of explicit numbers and ranges for example "1, 2, 3, 5, 7-10"
-- Added user setting to configure the scan range values the application should use (when Mouse Wheel + Shift scanning). User can specify a mixture of explicit numbers and ranges for example "1-5, 10, 20, 30, 100"
-- Added user setting to configure the delay in milliseconds between point jumps in the Mouse Forward/Backward button mode
-- Added user setting to center image slice on mouse cursor during mouse wheel zooming (configurable via settings)
+If you're using docker : 
 
-![Screenshot GUI Settings](screenshot_gui_settings.png)
+```bash
+xhost +local:docker
+sudo docker run -it --rm \
+  -v "/path/to/data/:/path/to/data/" \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -e DISPLAY=$DISPLAY \
+  -e QT_QPA_PLATFORM=xcb \
+  -e QT_X11_NO_MITSHM=1 \
+ghcr.io/scrollprize/villa/volume-cartographer:edge
+```
 
-### Bug Fixes
-- Fixed a bug in the OFS segmentation implementation that would (during the interpolation part), output invalid `vcps` point sets, as the first two segment rows both used the same slice number / Z-value (e.g. 0 when it should have been 0 for the first and 1 for the second slice/row)
-- Ensure app ends slice preloading threads and exits properly
-- Correctly clear the "Display All" and "Compute All" checkboxes when closing a volume, so they are in the correct initial state when a new volume gets opened
-- Fixed some crashes I came across
+From source : 
+
+```bash
+/path/to/build/bin/VC3D
+```
+
+![vc3d initial ui](docs/imgs/vc3d_ui_initial.png)
+
+### Data 
+VC3D requires a few changes to the data you may already have downloaded. All data must be in OME-Zarr format, of dtype uint8, and contain a meta.json file. To check if your zarr is in uint8 already, open a resolution group zarray file (located at /path/to.zarr/0/.zarray) look at the dtype field. "|u1" is uint8, and "|u2" is uint16. 
+
+The meta.json contains the following information. The only real change from a standard VC meta.json is the inclusion of the `format:"zarr"` key.
+```json
+{"height":3550,"max":65535.0,"min":0.0,"name":"PHerc0332, 7.91 - zarr - s3_raw","slices":9778,"type":"vol","uuid":"20231117143551-zarr-s3_raw","voxelsize":7.91,"width":3400, "format":"zarr"}
+```
+Your folder structure should resemble this: 
+```
+.
+└── scroll1.volpkg/
+    ├── volumes/
+    │   ├── s1_uint8_ome.zarr -- this is your volume data/
+    │   │   └── meta.json - REQUIRED!
+    │   └── 050_entire_scroll1_ome.zarr -- this is your surface prediction/
+    │       └── meta.json - REQUIRED!
+    ├── paths 
+    └── config.json - REQUIRED!
+```
+### Opening a volume package and navigating the UI
+First , click `File -> Open volpkg` and select the volpkg you wish to work with (select the folder ending in .volpkg)
+
+On the left side of the UI, you have a few dock widgets. The first being the Volume Package / Surface List. The most important things to note here are the `Volume` dropdown list, which selects the currently displayed volume, and the `paths` surface list, which selects the currently displayed segment. Selecting a `Surface ID` should populate the `Surface` volume view in the top left, and initialize the rest the volume viewers.
+
+There are a number of widgets, each with their own purpose. From top to bottom, and left to right : 
+
+**Volume Package**
+
+_Main UI widget for interacting with the volume package and surface list_
+
+<img src="docs/imgs/volume-package-ui.png" style="height: 500px">
+
+- `Reload Surfaces` : checks for new segmentations in the currently selected directory (by default, this is {volpkg}/paths
+- `Filters` : Apply a single (or multiple) filters to show or hide specific surface ids from the current set
+  - the most important one to remember here is `Current Segment Only` , which will hide the intersection overlays of all other segmentations in the volume viewers (this can greatly speed up ui interaction)
+- `Approved`, `Defective`, `Reviewed`, `Revisit`, `Inspect`  : tags which can be applied to the surface meta.json , and filtered against
+- `Generate Surface Mask` and `Append Surface Mask` : Create a binary mask representing the valid surface, and optionally append the current selected volume to it as a multipage tif
+
+**Location**
+
+_Main UI widget for adjusting the ROI and display of the volume viewers_
+
+<img src="docs/imgs/location-dock-ui.png" style="height: 500px">
+
+- `Focus` : Displays the current location of the focus point (in XYZ) -- also can be used to set the focus point by modifying the values in the text box
+- `Zoom` : Can be used in place of scroll wheel based zooming , mostly exists to alleviate touchy track pad zooming
+- `Overlay Volume` : Selects the volume to overlay onto the base volume 
+- `Overlay opacity` : Modifies the opacity of the overlay volume 
+- `Axis overlay opacity` : Modifies the opacity of the plane slice axis overlays
+- `Overlay threshold` : The value of the overlay array below which will not be rendered on the base volume (useful for removing background)
+- `Overlay colormap` : The colormap to use for the overlay volume
+- `Use axis aligned slices` : by default, vc3d attempts to align your XZ and YZ planes orthogonal to the normal of the current selected surface, this checkbox will instead use the plane normal as the axis to slice along
+- `Show axis overlays in XY view` : if you do not wish to view the axis overlays in the XY view, this checkbox will disable them
+
+_Keybinds:_
+> - `Right mouse + drag` : pans the current viewer
+> - `Scroll wheel` : zooms the current viewer
+> - `Ctrl + left mouse button` : centers the focus point on the cursor position
+> - `Scroll wheel click + drag` : rotates the slicing pane in the XZ or XY volume viewers
+> - `Spacebar` : toggles the overlay on / off
+
+**Segmentation**
+
+_Primary entry point for interacting with the segmentation_
+ 
+<img src="docs/imgs/segmentation-widget-ui.png" style="height: 500px">
+
+- `Enable editing` : Must be checked to enable any of the actions in this widget. Creates a copy of the base surface upon which we perform any of the following actions
+- `Surface Growth` - grouping of settings mostly pertaining to the `Grow` action
+  - `Steps` : The number of "generations" the growth action will undertake
+  - `Allowed Directions` : Limits the directions of growth _relative to the flattened 2d quad surface!_ (i.e if you look in the segmentation window in the top left, and you set 'up' it will grow towards the top of the window)
+  - `Limit Z range` : Constrains the growth to a selected `Z` range
+  - `Volume` : the volume to pass to the `tracer()` call _should be a surface prediction volume!_ 
+- `Editing` - grouping of settings which mostly apply to drag/push/pull actions for mesh deformation. All mesh deformation-type actions are performed on a gaussian-like area which has a circular shape centered at the current mouse location and whose strength is reduced as we reach the edges. _Radius is in quad vertices in the 2d flattened surface._
+  - `Max Radius` : the maximum radius of the area to be affected by the action
+  - `Sigma` : the _strength_ of the push/pull on affected vertices other the original one (aka how quickly the influence tapers as we step away from the original point)
+  - `Push Pull Step` : The number of "offset steps" to take along the surface normal (in voxels) for each push/pull action (this parameter only affects the push/pull in the segmentation window that is applied with `F` and `G`)
+- `Direction Fields`
+  - `Zarr folder` : the path containing the direction field you want to use for optimization (ex: `/path/to/scroll.volpkg/fiber-directions.zarr/horizontal`) _these are optional_ 
+    - `Orientation` : the orientation/type of the direction field (from horizontal, vertical, or normal)
+    - `Scale level` : the zarr resolution from which these were computed
+    - `Weight` : the weight to apply to the field when optimizing.
+- `Corrections` : group which controls / manages the "correction points" for the current growth session
+  - `New correction set` : creates a new point collection containing a single "correction" 
+      
+_Keybinds:_
+> - `F` or `G` : push/pull the current surface in a positive or negative direction along the surface normal (only works in the surface
+> - `1`, `2`, `3`, `4`, `5` : select a direction to grow in -- left, up , down, right , all , respectively
+> - `T` : create a new correction set
+
+**Seeding** 
+
+_Widget for creating initial segmentations which can be used for traces or later growth actions_
+
+<img src="docs/imgs/seeding-ui.png" style="height: 500px">
+
+- `Switch to point mode` : toggles the seeding widget into draw mode (not recommended)
+- `Source Collection` : the source point collection to use as seed points (will autofill if you draw/analyze)
+- `Parallel processes` : the number of processes to run seeding with
+- `OMP Threads` : limits the amount of threads each process can use (recommend to set this to 1)
+- `Intensity threshold` : mostly unused, can leave default
+- `Peak detection window` : how closely each peak detected along a path/raycast can be
+- `Expansion iterations` : how many iterations to run expansion mode on after initial seeding
+- `Show Preview Points` : unused , can ignore
+- `Clear` (both) : clears current points , paths, or raycasts
+- `Analyze Paths` : after drawing paths, detect peaks along the line segment on which to place seed points
+- `Run seeding` : creates segmentations from the current seed points
+- `Expand seeds` : expands the current seed points to the given number of iterations
+- `Clear all paths` : clears any user drawn paths / points (use this over the clear buttons most of the time)
+- `Start label wraps` : this is used for absolute or relative wrap labels , is not used during the seeding step, will detail in another document
