@@ -955,6 +955,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     std::unique_ptr<vc::core::util::NormalGridVolume> ngv;
     if (params.contains("normal_grid_path")) {
         ngv = std::make_unique<vc::core::util::NormalGridVolume>(params["normal_grid_path"].get<std::string>());
+        // ngv = std::make_unique<vc::core::util::NormalGridVolume>(params["normal_grid_path"].get<std::string>(), 0);
         if (ngv->metadata()["spiral-step"] != step) {
             throw std::runtime_error("step_size parameter mismatch between normal grid volume and tracer.");
         }
@@ -1377,6 +1378,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
                     fringe.push_back(p);
                     succ_gen_ps.push_back(p);
+
+                    if (succ_gen % 10)
+                        std::cout << succ_gen << "/" << cands.size() << std::endl;
                 }
 
                 for (int i=1;i<local_opt_r;i++)
@@ -1392,6 +1396,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 if (p[0] % 4 == 0 && p[1] % 4 == 0)
                     opt_local.push_back(p);
 
+            int done = 0;
+
             if (!opt_local.empty()) {
                 OmpThreadPointCol opt_local_threadcol(17, opt_local);
 
@@ -1403,7 +1409,12 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     if (p[0] == -1)
                         break;
 
+#pragma omp critical
+                    std::cout << "lopt " << done << "/" << opt_local.size() << std::endl;
+
                     local_optimization(8, p, trace_params, trace_data, loss_settings, true);
+#pragma omp atomic
+                    done++;
                 }
             }
         }
