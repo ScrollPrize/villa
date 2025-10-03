@@ -303,26 +303,35 @@ void SegmentationWidget::buildUi()
     _spinPushPullSigma->setDecimals(2);
     _spinPushPullSigma->setRange(0.05, 64.0);
     _spinPushPullSigma->setSingleStep(0.1);
-    pushGrid->addWidget(ppSigmaLabel, 1, 0);
-    pushGrid->addWidget(_spinPushPullSigma, 1, 1);
+    pushGrid->addWidget(ppSigmaLabel, 0, 2);
+    pushGrid->addWidget(_spinPushPullSigma, 0, 3);
 
     auto* pushPullLabel = new QLabel(tr("Step"), _groupPushPull);
     _spinPushPullStep = new QDoubleSpinBox(_groupPushPull);
     _spinPushPullStep->setDecimals(2);
     _spinPushPullStep->setRange(0.05, 10.0);
     _spinPushPullStep->setSingleStep(0.05);
-    pushGrid->addWidget(pushPullLabel, 2, 0);
-    pushGrid->addWidget(_spinPushPullStep, 2, 1);
+    pushGrid->addWidget(pushPullLabel, 1, 0);
+    pushGrid->addWidget(_spinPushPullStep, 1, 1);
 
     _chkAlphaPushPull = new QCheckBox(tr("Enable alpha push/pull"), _groupPushPull);
     _chkAlphaPushPull->setToolTip(tr("Sample volume opacity along the normal and stop push/pull at the configured alpha threshold."));
-    pushGrid->addWidget(_chkAlphaPushPull, 3, 0, 1, 2);
+    pushGrid->addWidget(_chkAlphaPushPull, 2, 0, 1, 4);
 
     _alphaPushPullPanel = new QWidget(_groupPushPull);
     auto* alphaGrid = new QGridLayout(_alphaPushPullPanel);
     alphaGrid->setContentsMargins(0, 0, 0, 0);
-    alphaGrid->setHorizontalSpacing(8);
-    alphaGrid->setVerticalSpacing(4);
+    alphaGrid->setHorizontalSpacing(12);
+    alphaGrid->setVerticalSpacing(6);
+
+    auto addAlphaWidget = [&](const QString& labelText, QWidget* widget, int row, int column, const QString& tooltip) {
+        auto* label = new QLabel(labelText, _alphaPushPullPanel);
+        label->setToolTip(tooltip);
+        widget->setToolTip(tooltip);
+        const int columnBase = column * 2;
+        alphaGrid->addWidget(label, row, columnBase);
+        alphaGrid->addWidget(widget, row, columnBase + 1);
+    };
 
     auto addAlphaControl = [&](const QString& labelText,
                                QDoubleSpinBox*& target,
@@ -330,46 +339,55 @@ void SegmentationWidget::buildUi()
                                double max,
                                double step,
                                int row,
+                               int column,
                                const QString& tooltip) {
-        auto* label = new QLabel(labelText, _alphaPushPullPanel);
-        target = new QDoubleSpinBox(_alphaPushPullPanel);
-        target->setDecimals(2);
-        target->setRange(min, max);
-        target->setSingleStep(step);
-        target->setToolTip(tooltip);
-        label->setToolTip(tooltip);
-        alphaGrid->addWidget(label, row, 0);
-        alphaGrid->addWidget(target, row, 1);
+        auto* spin = new QDoubleSpinBox(_alphaPushPullPanel);
+        spin->setDecimals(2);
+        spin->setRange(min, max);
+        spin->setSingleStep(step);
+        target = spin;
+        addAlphaWidget(labelText, spin, row, column, tooltip);
+    };
+
+    auto addAlphaIntControl = [&](const QString& labelText,
+                                  QSpinBox*& target,
+                                  int min,
+                                  int max,
+                                  int step,
+                                  int row,
+                                  int column,
+                                  const QString& tooltip) {
+        auto* spin = new QSpinBox(_alphaPushPullPanel);
+        spin->setRange(min, max);
+        spin->setSingleStep(step);
+        target = spin;
+        addAlphaWidget(labelText, spin, row, column, tooltip);
     };
 
     int alphaRow = 0;
-    addAlphaControl(tr("Start"), _spinAlphaStart, -64.0, 64.0, 0.5, alphaRow++,
+    addAlphaControl(tr("Start"), _spinAlphaStart, -64.0, 64.0, 0.5, alphaRow, 0,
                     tr("Beginning distance (along the brush normal) where alpha sampling starts."));
-    addAlphaControl(tr("Stop"), _spinAlphaStop, -64.0, 64.0, 0.5, alphaRow++,
+    addAlphaControl(tr("Stop"), _spinAlphaStop, -64.0, 64.0, 0.5, alphaRow++, 1,
                     tr("Ending distance for alpha sampling; the search stops once this depth is reached."));
-    addAlphaControl(tr("Sample step"), _spinAlphaStep, 0.05, 20.0, 0.05, alphaRow++,
+    addAlphaControl(tr("Sample step"), _spinAlphaStep, 0.05, 20.0, 0.05, alphaRow, 0,
                     tr("Spacing between alpha samples inside the start/stop range; smaller steps follow fine features."));
-    addAlphaControl(tr("Opacity low"), _spinAlphaLow, 0.0, 1.0, 0.01, alphaRow++,
-                    tr("Lower bound of the opacity window; voxels below this behave as transparent."));
-    addAlphaControl(tr("Opacity high"), _spinAlphaHigh, 0.0, 1.0, 0.01, alphaRow++,
-                    tr("Upper bound of the opacity window; voxels above this are fully opaque."));
-    addAlphaControl(tr("Border offset"), _spinAlphaBorder, -20.0, 20.0, 0.1, alphaRow++,
+    addAlphaControl(tr("Border offset"), _spinAlphaBorder, -20.0, 20.0, 0.1, alphaRow++, 1,
                     tr("Extra offset applied after the alpha front is located, keeping a safety margin."));
+    addAlphaControl(tr("Opacity low"), _spinAlphaLow, 0.0, 1.0, 0.01, alphaRow, 0,
+                    tr("Lower bound of the opacity window; voxels below this behave as transparent."));
+    addAlphaControl(tr("Opacity high"), _spinAlphaHigh, 0.0, 1.0, 0.01, alphaRow++, 1,
+                    tr("Upper bound of the opacity window; voxels above this are fully opaque."));
 
-    auto* blurLabel = new QLabel(tr("Blur radius"), _alphaPushPullPanel);
-    _spinAlphaBlurRadius = new QSpinBox(_alphaPushPullPanel);
-    _spinAlphaBlurRadius->setRange(0, 15);
-    _spinAlphaBlurRadius->setSingleStep(1);
     const QString blurTooltip = tr("Gaussian blur radius for each sampled slice; higher values smooth noisy volumes before thresholding.");
-    blurLabel->setToolTip(blurTooltip);
-    _spinAlphaBlurRadius->setToolTip(blurTooltip);
-    alphaGrid->addWidget(blurLabel, alphaRow, 0);
-    alphaGrid->addWidget(_spinAlphaBlurRadius, alphaRow, 1);
-    alphaGrid->setColumnStretch(1, 1);
+    addAlphaIntControl(tr("Blur radius"), _spinAlphaBlurRadius, 0, 15, 1, alphaRow++, 0, blurTooltip);
 
-    pushGrid->addWidget(_alphaPushPullPanel, 4, 0, 1, 2);
+    alphaGrid->setColumnStretch(1, 1);
+    alphaGrid->setColumnStretch(3, 1);
+
+    pushGrid->addWidget(_alphaPushPullPanel, 3, 0, 1, 4);
 
     pushGrid->setColumnStretch(1, 1);
+    pushGrid->setColumnStretch(3, 1);
 
     auto setGroupTooltips = [](QGroupBox* group, QDoubleSpinBox* radiusSpin, QDoubleSpinBox* sigmaSpin, const QString& radiusTip, const QString& sigmaTip) {
         if (group) {
