@@ -329,6 +329,51 @@ bool SegmentationEditManager::updateActiveDrag(const cv::Vec3f& newCenterWorld)
     return true;
 }
 
+bool SegmentationEditManager::updateActiveDragTargets(const std::vector<cv::Vec3f>& newWorldPositions)
+{
+    if (!_activeDrag.active || !_previewPoints) {
+        return false;
+    }
+    const std::size_t sampleCount = _activeDrag.samples.size();
+    if (sampleCount == 0 || newWorldPositions.size() != sampleCount) {
+        return false;
+    }
+
+    _recentTouched.clear();
+    _recentTouched.reserve(sampleCount);
+
+    const GridKey centerKey = _activeDrag.center;
+    bool centerUpdated = false;
+
+    for (std::size_t i = 0; i < sampleCount; ++i) {
+        const auto& sample = _activeDrag.samples[i];
+        const cv::Vec3f& newWorld = newWorldPositions[i];
+        if (isInvalidPoint(newWorld)) {
+            return false;
+        }
+
+        (*_previewPoints)(sample.row, sample.col) = newWorld;
+        recordVertexEdit(sample.row, sample.col, newWorld);
+        _recentTouched.push_back(GridKey{sample.row, sample.col});
+
+        if (!centerUpdated && sample.row == centerKey.row && sample.col == centerKey.col) {
+            _activeDrag.targetWorld = newWorld;
+            centerUpdated = true;
+        }
+    }
+
+    if (!centerUpdated) {
+        _activeDrag.targetWorld = newWorldPositions.front();
+    }
+
+    _dirty = true;
+    if (_pendingGrowthMarking) {
+        _pendingGrowthMarking = false;
+    }
+
+    return true;
+}
+
 bool SegmentationEditManager::smoothRecentTouched(float strength, int iterations)
 {
     if (!_previewPoints || _recentTouched.empty()) {

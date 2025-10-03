@@ -9,5 +9,5 @@ struct AlphaPushPullConfig
     float high{1.0f};
     float borderOffset{1.0f};
     int blurRadius{3};
+    bool perVertex{false};
 };
-

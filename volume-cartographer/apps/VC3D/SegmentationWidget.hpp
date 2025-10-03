@@ -216,6 +216,7 @@ private:
     QDoubleSpinBox* _spinPushPullStep{nullptr};
     QWidget* _alphaPushPullPanel{nullptr};
     QCheckBox* _chkAlphaPushPull{nullptr};
+    QCheckBox* _chkAlphaPerVertex{nullptr};
     QDoubleSpinBox* _spinAlphaStart{nullptr};
     QDoubleSpinBox* _spinAlphaStop{nullptr};
     QDoubleSpinBox* _spinAlphaStep{nullptr};

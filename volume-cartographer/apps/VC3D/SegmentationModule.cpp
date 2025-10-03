@@ -27,6 +27,7 @@
 #include <limits>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include <opencv2/imgproc.hpp>
 
@@ -90,7 +91,8 @@ bool alphaConfigsEqual(const AlphaPushPullConfig& lhs, const AlphaPushPullConfig
            nearlyEqual(lhs.low, rhs.low) &&
            nearlyEqual(lhs.high, rhs.high) &&
            nearlyEqual(lhs.borderOffset, rhs.borderOffset) &&
-           lhs.blurRadius == rhs.blurRadius;
+           lhs.blurRadius == rhs.blurRadius &&
+           lhs.perVertex == rhs.perVertex;
 }
 }
 
@@ -2238,22 +2240,105 @@ bool SegmentationModule::applyPushPullStep()
     bool alphaUnavailable = false;
 
     if (_alphaPushPullEnabled) {
-        auto alphaTarget = computeAlphaPushPullTarget(centerWorld,
-                                                     normal,
-                                                     _pushPull.direction,
-                                                     baseSurface,
-                                                     _hover.viewer,
-                                                     &alphaUnavailable);
-        if (alphaTarget) {
-            targetWorld = *alphaTarget;
-            usedAlphaPushPull = true;
-        } else if (!alphaUnavailable) {
-            _editManager->cancelActiveDrag();
-            if (snapshotCapturedThisStep) {
-                discardLastUndoSnapshot();
-                _pushPullUndoCaptured = false;
+        if (_alphaPushPullConfig.perVertex) {
+            const auto& drag = _editManager->activeDrag();
+            const auto& samples = drag.samples;
+            if (samples.empty()) {
+                _editManager->cancelActiveDrag();
+                if (snapshotCapturedThisStep) {
+                    discardLastUndoSnapshot();
+                    _pushPullUndoCaptured = false;
+                }
+                return false;
             }
-            return false;
+
+            std::vector<cv::Vec3f> perVertexTargets;
+            perVertexTargets.reserve(samples.size());
+            bool anyMovement = false;
+
+            for (const auto& sample : samples) {
+                cv::Vec3f sampleNormal = normal;
+                cv::Vec3f samplePtr = baseSurface->pointer();
+                baseSurface->pointTo(samplePtr, sample.baseWorld, std::numeric_limits<float>::max(), 400);
+                cv::Vec3f candidateNormal = baseSurface->normal(samplePtr);
+                if (std::isfinite(candidateNormal[0]) &&
+                    std::isfinite(candidateNormal[1]) &&
+                    std::isfinite(candidateNormal[2])) {
+                    const float candidateNorm = cv::norm(candidateNormal);
+                    if (candidateNorm > 1e-4f) {
+                        sampleNormal = candidateNormal / candidateNorm;
+                    }
+                }
+
+                bool sampleUnavailable = false;
+                auto sampleTarget = computeAlphaPushPullTarget(sample.baseWorld,
+                                                               sampleNormal,
+                                                               _pushPull.direction,
+                                                               baseSurface,
+                                                               _hover.viewer,
+                                                               &sampleUnavailable);
+                if (sampleUnavailable) {
+                    alphaUnavailable = true;
+                    break;
+                }
+
+                cv::Vec3f newWorld = sample.baseWorld;
+                if (sampleTarget) {
+                    newWorld = *sampleTarget;
+                    if (cv::norm(newWorld - sample.baseWorld) >= 1e-4f) {
+                        anyMovement = true;
+                    }
+                }
+
+                perVertexTargets.push_back(newWorld);
+            }
+
+            if (alphaUnavailable) {
+                _editManager->cancelActiveDrag();
+                if (snapshotCapturedThisStep) {
+                    discardLastUndoSnapshot();
+                    _pushPullUndoCaptured = false;
+                }
+                return false;
+            }
+
+            if (!anyMovement) {
+                _editManager->cancelActiveDrag();
+                if (snapshotCapturedThisStep) {
+                    discardLastUndoSnapshot();
+                    _pushPullUndoCaptured = false;
+                }
+                return false;
+            }
+
+            if (!_editManager->updateActiveDragTargets(perVertexTargets)) {
+                _editManager->cancelActiveDrag();
+                if (snapshotCapturedThisStep) {
+                    discardLastUndoSnapshot();
+                    _pushPullUndoCaptured = false;
+                }
+                return false;
+            }
+
+            usedAlphaPushPull = true;
+        } else {
+            auto alphaTarget = computeAlphaPushPullTarget(centerWorld,
+                                                         normal,
+                                                         _pushPull.direction,
+                                                         baseSurface,
+                                                         _hover.viewer,
+                                                         &alphaUnavailable);
+            if (alphaTarget) {
+                targetWorld = *alphaTarget;
+                usedAlphaPushPull = true;
+            } else if (!alphaUnavailable) {
+                _editManager->cancelActiveDrag();
+                if (snapshotCapturedThisStep) {
+                    discardLastUndoSnapshot();
+                    _pushPullUndoCaptured = false;
+                }
+                return false;
+            }
         }
     }
 
@@ -2266,7 +2351,7 @@ bool SegmentationModule::applyPushPullStep()
         targetWorld = centerWorld + normal * (static_cast<float>(_pushPull.direction) * stepWorld);
     }
 
-    if (!_editManager->updateActiveDrag(targetWorld)) {
+    if (!usedAlphaPushPull && !_editManager->updateActiveDrag(targetWorld)) {
         _editManager->cancelActiveDrag();
         if (snapshotCapturedThisStep) {
             discardLastUndoSnapshot();

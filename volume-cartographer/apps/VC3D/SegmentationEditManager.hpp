@@ -94,6 +94,7 @@ public:
 
     bool beginActiveDrag(const std::pair<int, int>& gridIndex);
     bool updateActiveDrag(const cv::Vec3f& newCenterWorld);
+    bool updateActiveDragTargets(const std::vector<cv::Vec3f>& newWorldPositions);
     bool smoothRecentTouched(float strength = 0.35f, int iterations = 1);
     void commitActiveDrag();
     void cancelActiveDrag();

@@ -171,6 +171,7 @@ void SegmentationWidget::buildUi()
 
     auto* editingRow = new QHBoxLayout();
     _chkEditing = new QCheckBox(tr("Enable editing"), this);
+    _chkEditing->setToolTip(tr("Start or stop segmentation editing so brush tools can modify surfaces."));
     _lblStatus = new QLabel(this);
     _lblStatus->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
     editingRow->addWidget(_chkEditing);
@@ -181,6 +182,7 @@ void SegmentationWidget::buildUi()
     auto* brushRow = new QHBoxLayout();
     brushRow->addSpacing(4);
     _chkEraseBrush = new QCheckBox(tr("Invalidation brush (Shift)"), this);
+    _chkEraseBrush->setToolTip(tr("Hold Shift to temporarily switch to the invalidate brush while editing."));
     _chkEraseBrush->setEnabled(false);
     brushRow->addWidget(_chkEraseBrush);
     brushRow->addStretch(1);
@@ -194,6 +196,7 @@ void SegmentationWidget::buildUi()
     _spinGrowthSteps = new QSpinBox(_groupGrowth);
     _spinGrowthSteps->setRange(1, 1024);
     _spinGrowthSteps->setSingleStep(1);
+    _spinGrowthSteps->setToolTip(tr("Number of iterations to run when growing the segmentation."));
     dirRow->addWidget(stepsLabel);
     dirRow->addWidget(_spinGrowthSteps);
     dirRow->addSpacing(16);
@@ -206,22 +209,29 @@ void SegmentationWidget::buildUi()
         return box;
     };
     _chkGrowthDirUp = addDirectionCheckbox(tr("Up"));
+    _chkGrowthDirUp->setToolTip(tr("Allow growth steps to move upward along the volume."));
     _chkGrowthDirDown = addDirectionCheckbox(tr("Down"));
+    _chkGrowthDirDown->setToolTip(tr("Allow growth steps to move downward along the volume."));
     _chkGrowthDirLeft = addDirectionCheckbox(tr("Left"));
+    _chkGrowthDirLeft->setToolTip(tr("Allow growth steps to move left across the volume."));
     _chkGrowthDirRight = addDirectionCheckbox(tr("Right"));
+    _chkGrowthDirRight->setToolTip(tr("Allow growth steps to move right across the volume."));
     dirRow->addStretch(1);
     growthLayout->addLayout(dirRow);
 
     auto* zRow = new QHBoxLayout();
     _chkCorrectionsUseZRange = new QCheckBox(tr("Limit Z range"), _groupGrowth);
+    _chkCorrectionsUseZRange->setToolTip(tr("Restrict growth requests to the specified slice range."));
     zRow->addWidget(_chkCorrectionsUseZRange);
     zRow->addSpacing(12);
     auto* zMinLabel = new QLabel(tr("Z min"), _groupGrowth);
     _spinCorrectionsZMin = new QSpinBox(_groupGrowth);
     _spinCorrectionsZMin->setRange(-100000, 100000);
+    _spinCorrectionsZMin->setToolTip(tr("Lowest slice index used when Z range limits are enabled."));
     auto* zMaxLabel = new QLabel(tr("Z max"), _groupGrowth);
     _spinCorrectionsZMax = new QSpinBox(_groupGrowth);
     _spinCorrectionsZMax->setRange(-100000, 100000);
+    _spinCorrectionsZMax->setToolTip(tr("Highest slice index used when Z range limits are enabled."));
     zRow->addWidget(zMinLabel);
     zRow->addWidget(_spinCorrectionsZMin);
     zRow->addSpacing(8);
@@ -231,12 +241,14 @@ void SegmentationWidget::buildUi()
     growthLayout->addLayout(zRow);
 
     _btnGrow = new QPushButton(tr("Grow"), _groupGrowth);
+    _btnGrow->setToolTip(tr("Run surface growth using the configured steps and directions."));
     growthLayout->addWidget(_btnGrow);
 
     auto* volumeRow = new QHBoxLayout();
     auto* volumeLabel = new QLabel(tr("Volume:"), _groupGrowth);
     _comboVolumes = new QComboBox(_groupGrowth);
     _comboVolumes->setEnabled(false);
+    _comboVolumes->setToolTip(tr("Select which volume provides source data for segmentation growth."));
     volumeRow->addWidget(volumeLabel);
     volumeRow->addWidget(_comboVolumes, 1);
     growthLayout->addLayout(volumeRow);
@@ -246,6 +258,7 @@ void SegmentationWidget::buildUi()
 
     _lblNormalGrid = new QLabel(this);
     _lblNormalGrid->setTextFormat(Qt::RichText);
+    _lblNormalGrid->setToolTip(tr("Shows whether precomputed normal grids are available for push/pull tools."));
     _lblNormalGrid->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
     layout->addWidget(_lblNormalGrid);
 
@@ -381,6 +394,10 @@ void SegmentationWidget::buildUi()
     const QString blurTooltip = tr("Gaussian blur radius for each sampled slice; higher values smooth noisy volumes before thresholding.");
     addAlphaIntControl(tr("Blur radius"), _spinAlphaBlurRadius, 0, 15, 1, alphaRow++, 0, blurTooltip);
 
+    _chkAlphaPerVertex = new QCheckBox(tr("Independent per-vertex stops"), _alphaPushPullPanel);
+    _chkAlphaPerVertex->setToolTip(tr("Move every vertex within the brush independently to the alpha threshold without Gaussian weighting."));
+    alphaGrid->addWidget(_chkAlphaPerVertex, alphaRow++, 0, 1, 4);
+
     alphaGrid->setColumnStretch(1, 1);
     alphaGrid->setColumnStretch(3, 1);
 
@@ -435,6 +452,7 @@ void SegmentationWidget::buildUi()
     auto* smoothStrengthLabel = new QLabel(tr("Smoothing strength"), falloffGroup);
     _spinSmoothStrength = new QDoubleSpinBox(falloffGroup);
     _spinSmoothStrength->setDecimals(2);
+    _spinSmoothStrength->setToolTip(tr("Blend edits toward neighboring vertices; higher values smooth more."));
     _spinSmoothStrength->setRange(0.0, 1.0);
     _spinSmoothStrength->setSingleStep(0.05);
     smoothingRow->addWidget(smoothStrengthLabel);
@@ -443,6 +461,7 @@ void SegmentationWidget::buildUi()
     auto* smoothIterationsLabel = new QLabel(tr("Iterations"), falloffGroup);
     _spinSmoothIterations = new QSpinBox(falloffGroup);
     _spinSmoothIterations->setRange(1, 25);
+    _spinSmoothIterations->setToolTip(tr("Number of smoothing passes applied after growth."));
     _spinSmoothIterations->setSingleStep(1);
     smoothingRow->addWidget(smoothIterationsLabel);
     smoothingRow->addWidget(_spinSmoothIterations);
@@ -458,8 +477,10 @@ void SegmentationWidget::buildUi()
     auto* pathRow = new QHBoxLayout();
     auto* pathLabel = new QLabel(tr("Zarr folder:"), _groupDirectionField);
     _directionFieldPathEdit = new QLineEdit(_groupDirectionField);
+    _directionFieldPathEdit->setToolTip(tr("Filesystem path to the direction field zarr folder."));
     _directionFieldBrowseButton = new QToolButton(_groupDirectionField);
     _directionFieldBrowseButton->setText(QStringLiteral("..."));
+    _directionFieldBrowseButton->setToolTip(tr("Browse for a direction field dataset on disk."));
     pathRow->addWidget(pathLabel);
     pathRow->addWidget(_directionFieldPathEdit, 1);
     pathRow->addWidget(_directionFieldBrowseButton);
@@ -468,6 +489,7 @@ void SegmentationWidget::buildUi()
     auto* orientationRow = new QHBoxLayout();
     auto* orientationLabel = new QLabel(tr("Orientation:"), _groupDirectionField);
     _comboDirectionFieldOrientation = new QComboBox(_groupDirectionField);
+    _comboDirectionFieldOrientation->setToolTip(tr("Select which axis the direction field describes."));
     _comboDirectionFieldOrientation->addItem(tr("Normal"), static_cast<int>(SegmentationDirectionFieldOrientation::Normal));
     _comboDirectionFieldOrientation->addItem(tr("Horizontal"), static_cast<int>(SegmentationDirectionFieldOrientation::Horizontal));
     _comboDirectionFieldOrientation->addItem(tr("Vertical"), static_cast<int>(SegmentationDirectionFieldOrientation::Vertical));
@@ -476,6 +498,7 @@ void SegmentationWidget::buildUi()
     orientationRow->addSpacing(12);
     auto* scaleLabel = new QLabel(tr("Scale level:"), _groupDirectionField);
     _comboDirectionFieldScale = new QComboBox(_groupDirectionField);
+    _comboDirectionFieldScale->setToolTip(tr("Choose the multiscale level sampled from the direction field."));
     for (int scale = 0; scale <= 5; ++scale) {
         _comboDirectionFieldScale->addItem(QString::number(scale), scale);
     }
@@ -485,6 +508,7 @@ void SegmentationWidget::buildUi()
     auto* weightLabel = new QLabel(tr("Weight:"), _groupDirectionField);
     _spinDirectionFieldWeight = new QDoubleSpinBox(_groupDirectionField);
     _spinDirectionFieldWeight->setDecimals(2);
+    _spinDirectionFieldWeight->setToolTip(tr("Relative influence of this direction field during growth."));
     _spinDirectionFieldWeight->setRange(0.0, 10.0);
     _spinDirectionFieldWeight->setSingleStep(0.1);
     orientationRow->addWidget(weightLabel);
@@ -494,7 +518,9 @@ void SegmentationWidget::buildUi()
 
     auto* buttonsRow = new QHBoxLayout();
     _directionFieldAddButton = new QPushButton(tr("Add"), _groupDirectionField);
+    _directionFieldAddButton->setToolTip(tr("Save the current direction field parameters to the list."));
     _directionFieldRemoveButton = new QPushButton(tr("Remove"), _groupDirectionField);
+    _directionFieldRemoveButton->setToolTip(tr("Delete the selected direction field entry."));
     _directionFieldRemoveButton->setEnabled(false);
     buttonsRow->addWidget(_directionFieldAddButton);
     buttonsRow->addWidget(_directionFieldRemoveButton);
@@ -502,6 +528,7 @@ void SegmentationWidget::buildUi()
     dfLayout->addLayout(buttonsRow);
 
     _directionFieldList = new QListWidget(_groupDirectionField);
+    _directionFieldList->setToolTip(tr("Direction field configurations applied during growth."));
     _directionFieldList->setSelectionMode(QAbstractItemView::SingleSelection);
     dfLayout->addWidget(_directionFieldList);
 
@@ -515,15 +542,18 @@ void SegmentationWidget::buildUi()
     auto* correctionsLabel = new QLabel(tr("Active set:"), _groupCorrections);
     _comboCorrections = new QComboBox(_groupCorrections);
     _comboCorrections->setEnabled(false);
+    _comboCorrections->setToolTip(tr("Choose an existing correction set to apply."));
     correctionsComboRow->addWidget(correctionsLabel);
     correctionsComboRow->addStretch(1);
     correctionsComboRow->addWidget(_comboCorrections, 1);
     correctionsLayout->addLayout(correctionsComboRow);
 
     _btnCorrectionsNew = new QPushButton(tr("New correction set"), _groupCorrections);
+    _btnCorrectionsNew->setToolTip(tr("Create a new, empty correction set for this segmentation."));
     correctionsLayout->addWidget(_btnCorrectionsNew);
 
     _chkCorrectionsAnnotate = new QCheckBox(tr("Annotate corrections"), _groupCorrections);
+    _chkCorrectionsAnnotate->setToolTip(tr("Toggle annotation overlay while reviewing corrections."));
     correctionsLayout->addWidget(_chkCorrectionsAnnotate);
 
     _groupCorrections->setLayout(correctionsLayout);
@@ -538,6 +568,7 @@ void SegmentationWidget::buildUi()
     customParamsLayout->addWidget(customParamsDescription);
 
     _editCustomParams = new QPlainTextEdit(_groupCustomParams);
+    _editCustomParams->setToolTip(tr("Optional JSON that merges into tracer parameters before growth."));
     _editCustomParams->setPlaceholderText(QStringLiteral("{\n    \"example_param\": 1\n}"));
     _editCustomParams->setTabChangesFocus(true);
     customParamsLayout->addWidget(_editCustomParams);
@@ -553,8 +584,11 @@ void SegmentationWidget::buildUi()
 
     auto* buttons = new QHBoxLayout();
     _btnApply = new QPushButton(tr("Apply"), this);
+    _btnApply->setToolTip(tr("Commit pending edits to the segmentation."));
     _btnReset = new QPushButton(tr("Reset"), this);
+    _btnReset->setToolTip(tr("Discard pending edits and reload the segmentation state."));
     _btnStop = new QPushButton(tr("Stop tools"), this);
+    _btnStop->setToolTip(tr("Exit the active editing tool and return to selection."));
     buttons->addWidget(_btnApply);
     buttons->addWidget(_btnReset);
     buttons->addWidget(_btnStop);
@@ -693,6 +727,11 @@ void SegmentationWidget::buildUi()
     connect(_spinAlphaBlurRadius, QOverload<int>::of(&QSpinBox::valueChanged), this, [this, onAlphaValueChanged](int value) {
         onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
             cfg.blurRadius = value;
+        });
+    });
+    connect(_chkAlphaPerVertex, &QCheckBox::toggled, this, [this, onAlphaValueChanged](bool checked) {
+        onAlphaValueChanged([checked](AlphaPushPullConfig& cfg) {
+            cfg.perVertex = checked;
         });
     });
 
@@ -911,6 +950,11 @@ void SegmentationWidget::syncUiState()
         _spinAlphaBlurRadius->setValue(_alphaPushPullConfig.blurRadius);
         _spinAlphaBlurRadius->setEnabled(editingActive);
     }
+    if (_chkAlphaPerVertex) {
+        const QSignalBlocker blocker(_chkAlphaPerVertex);
+        _chkAlphaPerVertex->setChecked(_alphaPushPullConfig.perVertex);
+        _chkAlphaPerVertex->setEnabled(editingActive);
+    }
     if (_alphaPushPullPanel) {
         _alphaPushPullPanel->setEnabled(editingActive);
     }
@@ -1065,6 +1109,7 @@ void SegmentationWidget::restoreSettings()
     storedAlpha.high = settings.value(QStringLiteral("push_pull_alpha_high"), storedAlpha.high).toFloat();
     storedAlpha.borderOffset = settings.value(QStringLiteral("push_pull_alpha_border"), storedAlpha.borderOffset).toFloat();
     storedAlpha.blurRadius = settings.value(QStringLiteral("push_pull_alpha_radius"), storedAlpha.blurRadius).toInt();
+    storedAlpha.perVertex = settings.value(QStringLiteral("push_pull_alpha_per_vertex"), storedAlpha.perVertex).toBool();
     applyAlphaPushPullConfig(storedAlpha, false, false);
     _smoothStrength = settings.value(QStringLiteral("smooth_strength"), _smoothStrength).toFloat();
     _smoothIterations = settings.value(QStringLiteral("smooth_iterations"), _smoothIterations).toInt();
@@ -1292,7 +1337,8 @@ void SegmentationWidget::applyAlphaPushPullConfig(const AlphaPushPullConfig& con
                          !nearlyEqual(sanitized.low, _alphaPushPullConfig.low) ||
                          !nearlyEqual(sanitized.high, _alphaPushPullConfig.high) ||
                          !nearlyEqual(sanitized.borderOffset, _alphaPushPullConfig.borderOffset) ||
-                         sanitized.blurRadius != _alphaPushPullConfig.blurRadius;
+                         sanitized.blurRadius != _alphaPushPullConfig.blurRadius ||
+                         sanitized.perVertex != _alphaPushPullConfig.perVertex;
 
     if (changed) {
         _alphaPushPullConfig = sanitized;
@@ -1304,6 +1350,7 @@ void SegmentationWidget::applyAlphaPushPullConfig(const AlphaPushPullConfig& con
             writeSetting(QStringLiteral("push_pull_alpha_high"), _alphaPushPullConfig.high);
             writeSetting(QStringLiteral("push_pull_alpha_border"), _alphaPushPullConfig.borderOffset);
             writeSetting(QStringLiteral("push_pull_alpha_radius"), _alphaPushPullConfig.blurRadius);
+            writeSetting(QStringLiteral("push_pull_alpha_per_vertex"), _alphaPushPullConfig.perVertex);
         }
     }
 
@@ -1343,6 +1390,11 @@ void SegmentationWidget::applyAlphaPushPullConfig(const AlphaPushPullConfig& con
         const QSignalBlocker blocker(_spinAlphaBlurRadius);
         _spinAlphaBlurRadius->setValue(_alphaPushPullConfig.blurRadius);
         _spinAlphaBlurRadius->setEnabled(editingActive);
+    }
+    if (_chkAlphaPerVertex) {
+        const QSignalBlocker blocker(_chkAlphaPerVertex);
+        _chkAlphaPerVertex->setChecked(_alphaPushPullConfig.perVertex);
+        _chkAlphaPerVertex->setEnabled(editingActive);
     }
     if (_alphaPushPullPanel) {
         _alphaPushPullPanel->setEnabled(editingActive);
