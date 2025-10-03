@@ -135,6 +135,7 @@ int main(int argc, char *argv[])
     cv::Vec3d origin;
     json params;
     VCCollection corrections;
+    bool skip_overlap_check = false;
 
     bool use_old_args = (argc == 4 || argc == 7) && argv[1][0] != '-' && argv[2][0] != '-' && argv[3][0] != '-';
 
@@ -155,7 +156,8 @@ int main(int argc, char *argv[])
             ("seed,s", po::value<std::vector<float>>()->multitoken(), "Seed coordinates (x y z)")
             ("resume", po::value<std::string>(), "Path to a tifxyz surface to resume from")
             ("rewind-gen", po::value<int>(), "Generation to rewind to")
-            ("correct", po::value<std::string>(), "JSON file with point-based corrections for resume mode");
+            ("correct", po::value<std::string>(), "JSON file with point-based corrections for resume mode")
+            ("skip-overlap-check", "Do not perform overlap check with other surfaces after tracing.");
 
         po::variables_map vm;
         try {
@@ -207,6 +209,10 @@ int main(int argc, char *argv[])
 
         if (vm.count("rewind-gen")) {
             params["rewind_gen"] = vm["rewind-gen"].as<int>();
+        }
+
+        if (vm.count("skip-overlap-check")) {
+            skip_overlap_check = true;
         }
     }
 
@@ -487,7 +493,7 @@ int main(int argc, char *argv[])
 
     SurfaceMeta current;
 
-    if (mode == "expansion") {
+    if (mode == "expansion" && !skip_overlap_check) {
         current.path = seg_dir;
         current.setSurface(surf);
         current.bbox = surf->bbox();
