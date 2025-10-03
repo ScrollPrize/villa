@@ -62,6 +62,16 @@
        return sizeof(LineSegList) + compressed_data_.capacity();
     }
 
+    bool operator==(const LineSegList& other) const {
+        if (start_point_ != other.start_point_) return false;
+        if (compressed_data_size_ != other.compressed_data_size_) return false;
+        return memcmp(compressed_data_ptr_, other.compressed_data_ptr_, compressed_data_size_) == 0;
+    }
+
+    bool operator!=(const LineSegList& other) const {
+        return !(*this == other);
+    }
+
 private:
     cv::Point start_point_;
     std::vector<int8_t> compressed_data_; // Owns the data for non-views
