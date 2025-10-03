@@ -83,9 +83,9 @@ public:
             for (int y = start.y; y <= end.y; ++y) {
                 for (int x = start.x; x <= end.x; ++x) {
                     int index = y * grid_size_.width + x;
-                    if (index >= 0 && index < grid_offsets_.size()) {
-                        const auto& bucket = get_bucket_offsets(index);
-                        offsets.insert(bucket.begin(), bucket.end());
+                    auto bucket_ptr = get_bucket_offsets(index);
+                    if (bucket_ptr && !bucket_ptr->empty()) {
+                        offsets.insert(bucket_ptr->begin(), bucket_ptr->end());
                     }
                 }
             }
@@ -115,9 +115,11 @@ public:
         std::vector<std::shared_ptr<std::vector<cv::Point>>> result;
         if (read_only_) {
             std::unordered_set<size_t> all_offsets;
-            for(size_t i = 0; i < grid_offsets_.size(); ++i) {
-                const auto& bucket = get_bucket_offsets(i);
-                all_offsets.insert(bucket.begin(), bucket.end());
+            for(size_t i = 0; i < grid_bucket_descriptors_.size(); ++i) {
+                auto bucket_ptr = get_bucket_offsets(i);
+                if (bucket_ptr) {
+                    all_offsets.insert(bucket_ptr->begin(), bucket_ptr->end());
+                }
             }
             result.reserve(all_offsets.size());
             for (const auto& offset : all_offsets) {
@@ -157,9 +159,11 @@ public:
     size_t numSegments() const {
         if (read_only_) {
             std::unordered_set<size_t> all_offsets;
-            for(size_t i = 0; i < grid_offsets_.size(); ++i) {
-                const auto& bucket = get_bucket_offsets(i);
-                all_offsets.insert(bucket.begin(), bucket.end());
+            for(size_t i = 0; i < grid_bucket_descriptors_.size(); ++i) {
+                auto bucket_ptr = get_bucket_offsets(i);
+                if (bucket_ptr) {
+                    all_offsets.insert(bucket_ptr->begin(), bucket_ptr->end());
+                }
             }
             size_t count = 0;
             for (const auto& offset : all_offsets) {
@@ -403,7 +407,6 @@ public:
         buckets_offset_in_file_ = buckets_offset;
 
         // 3. Read Bucket Descriptors
-        grid_offsets_.assign(num_buckets, nullptr);
         grid_bucket_descriptors_.resize(num_buckets);
         const char* buckets_start = static_cast<const char*>(mmapped_data_->data) + buckets_offset;
         const char* current_bucket_ptr = buckets_start;
@@ -500,27 +503,38 @@ private:
         LineSegListCache::CacheKey key = {this, offset};
         std::shared_ptr<LineSegList> seglist = cache_->get(key);
         if (!seglist) {
-            const char* paths_start = static_cast<const char*>(mmapped_data_->data) + paths_offset_in_file_;
-            const char* end = static_cast<const char*>(mmapped_data_->data) + mmapped_data_->size;
-            read_seglist_header_and_data(paths_start + offset, end, seglist);
-            cache_->put(key, seglist);
+            std::lock_guard<std::mutex> lock(seglist_mutex_);
+            seglist = cache_->get(key); // Check again after acquiring lock
+            if (!seglist) {
+                const char* paths_start = static_cast<const char*>(mmapped_data_->data) + paths_offset_in_file_;
+                const char* end = static_cast<const char*>(mmapped_data_->data) + mmapped_data_->size;
+                read_seglist_header_and_data(paths_start + offset, end, seglist);
+                cache_->put(key, seglist);
+            }
         }
         return seglist;
     }
 
-    const std::vector<size_t>& get_bucket_offsets(int index) const {
-        // Double-checked locking to avoid locking on every call
-        if (!grid_offsets_[index]) {
-            std::lock_guard<std::mutex> lock(bucket_mutex_);
-            // Check again in case another thread created it while we were waiting for the lock
-            if (!grid_offsets_[index]) {
-                auto bucket_ptr = std::make_shared<std::vector<size_t>>();
-                const auto& descriptor = grid_bucket_descriptors_[index];
-                
+    std::shared_ptr<std::vector<size_t>> get_bucket_offsets(int index) const {
+        // Acquire lock to check for existence
+        bucket_mutex_.lock();
+        auto it = grid_offsets_.find(index);
+        if (it != grid_offsets_.end()) {
+            auto ptr = it->second;
+            bucket_mutex_.unlock();
+            return ptr;
+        }
+        // If not found, release the lock before loading
+        bucket_mutex_.unlock();
+
+        // Perform expensive I/O without holding the lock
+        auto bucket_ptr = std::make_shared<std::vector<size_t>>();
+        if (index >= 0 && index < grid_bucket_descriptors_.size()) {
+            const auto& descriptor = grid_bucket_descriptors_[index];
+            if (descriptor.second > 0) {
                 const char* buckets_start = static_cast<const char*>(mmapped_data_->data) + buckets_offset_in_file_;
                 const char* current_bucket_ptr = buckets_start + descriptor.first;
-                const char* end = static_cast<const char*>(mmapped_data_->data) + mmapped_data_->size;
-
+                
                 current_bucket_ptr += sizeof(uint32_t); // Skip num_indices
                 
                 bucket_ptr->reserve(descriptor.second);
@@ -528,10 +542,20 @@ private:
                     uint32_t path_offset = ntohl(*reinterpret_cast<const uint32_t*>(current_bucket_ptr)); current_bucket_ptr += sizeof(uint32_t);
                     bucket_ptr->push_back(path_offset);
                 }
-                grid_offsets_[index] = bucket_ptr;
             }
         }
-        return *grid_offsets_[index];
+        
+        // Re-acquire lock to safely insert the new bucket
+        std::lock_guard<std::mutex> lock(bucket_mutex_);
+        it = grid_offsets_.find(index);
+        if (it != grid_offsets_.end()) {
+            // Another thread created it. Use the existing one.
+            return it->second;
+        } else {
+            // We are the first. Insert our loaded bucket.
+            grid_offsets_.emplace(index, bucket_ptr);
+            return bucket_ptr;
+        }
     }
 
     size_t get_all_buckets_size() const {
@@ -558,7 +582,7 @@ private:
     int cell_size_;
     cv::Size grid_size_;
     std::vector<std::vector<int>> grid_;
-    mutable std::vector<std::shared_ptr<std::vector<size_t>>> grid_offsets_;
+    mutable std::unordered_map<int, std::shared_ptr<std::vector<size_t>>> grid_offsets_;
     std::vector<std::pair<size_t, size_t>> grid_bucket_descriptors_;
     std::vector<std::shared_ptr<LineSegList>> storage_;
     bool read_only_;
@@ -567,6 +591,7 @@ private:
     std::unique_ptr<MmappedData> mmapped_data_;
     std::shared_ptr<LineSegListCache> cache_;
     mutable std::mutex bucket_mutex_;
+    mutable std::mutex seglist_mutex_;
 };
  
 GridStore::GridStore(const cv::Rect& bounds, int cell_size)

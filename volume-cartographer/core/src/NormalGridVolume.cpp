@@ -15,7 +15,7 @@
  namespace vc::core::util {
  
     struct CacheEntry {
-        std::unique_ptr<GridStore> grid_store;
+        std::shared_ptr<GridStore> grid_store;
         uint64_t generation;
     };
 
@@ -26,7 +26,7 @@
          mutable std::mutex mutex;
          mutable std::unordered_map<cv::Vec2i, CacheEntry> grid_cache;
          mutable uint64_t generation_counter = 0;
-         size_t max_cache_size = 512;
+         size_t max_cache_size = 2048;
          size_t eviction_sample_size = 10;
         
          mutable std::atomic<uint64_t> cache_hits{0};
@@ -63,8 +63,8 @@
 
             double weight = (coord - slice_idx1) / sparse_volume;
 
-            const GridStore* grid1 = get_grid(plane_idx, slice_idx1);
-            const GridStore* grid2 = get_grid(plane_idx, slice_idx2);
+            auto grid1 = get_grid(plane_idx, slice_idx1);
+            auto grid2 = get_grid(plane_idx, slice_idx2);
 
             if (!grid1 || !grid2) {
                 return std::nullopt;
@@ -73,7 +73,7 @@
             return GridQueryResult{grid1, grid2, weight};
         }
 
-        const GridStore* query_nearest(const cv::Point3f& point, int plane_idx) const {
+        std::shared_ptr<const GridStore> query_nearest(const cv::Point3f& point, int plane_idx) const {
 
             float coord;
             switch (plane_idx) {
@@ -88,7 +88,7 @@
             return get_grid(plane_idx, slice_idx);
         }
 
-        const GridStore* get_grid(int plane_idx, int slice_idx) const {
+        std::shared_ptr<const GridStore> get_grid(int plane_idx, int slice_idx) const {
             cv::Vec2i key(plane_idx, slice_idx);
 
             {
@@ -98,7 +98,7 @@
                     cache_hits++;
                     it->second.generation = ++generation_counter;
                     check_print_stats();
-                    return it->second.grid_store.get();
+                    return it->second.grid_store;
                 }
             }
  
@@ -114,8 +114,8 @@
                 return nullptr;
             }
  
-            auto grid_store = std::make_unique<GridStore>(grid_path, line_seg_list_cache_);
- 
+            auto grid_store = std::make_shared<GridStore>(grid_path, line_seg_list_cache_);
+
             // if (plane_idx == 0) { // XY plane
             //     if (!grid_store->meta.contains("umbilicus_x") || !grid_store->meta.contains("umbilicus_y")) {
             //         throw std::runtime_error("Missing umbilicus metadata in " + grid_path);
@@ -125,7 +125,6 @@
             //     }
             // }
 
-            GridStore* ptr;
             {
                 std::lock_guard<std::mutex> lock(mutex);
 
@@ -134,11 +133,10 @@
                     // Another thread might have loaded it in the meantime
                     cache_hits++;
                     it->second.generation = ++generation_counter;
-                    return it->second.grid_store.get();
+                    return it->second.grid_store;
                 }
  
-                ptr = grid_store.get();
-                grid_cache[key] = {std::move(grid_store), ++generation_counter};
+                grid_cache[key] = {grid_store, ++generation_counter};
 
                 // Eviction logic
                 if (grid_cache.size() > max_cache_size) {
@@ -171,7 +169,7 @@
 
                 check_print_stats();
             }
-            return ptr;
+            return grid_store;
         }
 
         void check_print_stats() const {
@@ -197,7 +195,7 @@
         return pimpl_->query(point, plane_idx);
     }
 
-    const GridStore* NormalGridVolume::query_nearest(const cv::Point3f& point, int plane_idx) const {
+    std::shared_ptr<const GridStore> NormalGridVolume::query_nearest(const cv::Point3f& point, int plane_idx) const {
         return pimpl_->query_nearest(point, plane_idx);
     }
 
