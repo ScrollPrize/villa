@@ -47,6 +47,7 @@ constexpr float kAlphaMinRange = 0.01f;
 constexpr float kAlphaDefaultHighDelta = 0.05f;
 constexpr float kAlphaBorderLimit = 20.0f;
 constexpr int kAlphaBlurRadiusMax = 15;
+constexpr float kAlphaPerVertexLimitMax = 128.0f;
 
 bool nearlyEqual(float lhs, float rhs);
 
@@ -79,6 +80,7 @@ AlphaPushPullConfig sanitizeAlphaConfig(const AlphaPushPullConfig& config)
 
     sanitized.borderOffset = std::clamp(sanitized.borderOffset, -kAlphaBorderLimit, kAlphaBorderLimit);
     sanitized.blurRadius = std::clamp(sanitized.blurRadius, 0, kAlphaBlurRadiusMax);
+    sanitized.perVertexLimit = std::clamp(sanitized.perVertexLimit, 0.0f, kAlphaPerVertexLimitMax);
 
     return sanitized;
 }
@@ -92,6 +94,7 @@ bool alphaConfigsEqual(const AlphaPushPullConfig& lhs, const AlphaPushPullConfig
            nearlyEqual(lhs.high, rhs.high) &&
            nearlyEqual(lhs.borderOffset, rhs.borderOffset) &&
            lhs.blurRadius == rhs.blurRadius &&
+           nearlyEqual(lhs.perVertexLimit, rhs.perVertexLimit) &&
            lhs.perVertex == rhs.perVertex;
 }
 }
@@ -2254,7 +2257,10 @@ bool SegmentationModule::applyPushPullStep()
 
             std::vector<cv::Vec3f> perVertexTargets;
             perVertexTargets.reserve(samples.size());
+            std::vector<float> perVertexMovements;
+            perVertexMovements.reserve(samples.size());
             bool anyMovement = false;
+            float minMovement = std::numeric_limits<float>::max();
 
             for (const auto& sample : samples) {
                 cv::Vec3f sampleNormal = normal;
@@ -2283,14 +2289,39 @@ bool SegmentationModule::applyPushPullStep()
                 }
 
                 cv::Vec3f newWorld = sample.baseWorld;
+                float movement = 0.0f;
                 if (sampleTarget) {
                     newWorld = *sampleTarget;
-                    if (cv::norm(newWorld - sample.baseWorld) >= 1e-4f) {
+                    const cv::Vec3f delta = newWorld - sample.baseWorld;
+                    movement = static_cast<float>(cv::norm(delta));
+                    if (movement >= 1e-4f) {
                         anyMovement = true;
                     }
                 }
 
                 perVertexTargets.push_back(newWorld);
+                perVertexMovements.push_back(movement);
+                minMovement = std::min(minMovement, movement);
+            }
+
+            const float perVertexLimit = std::max(0.0f, _alphaPushPullConfig.perVertexLimit);
+            if (perVertexLimit > 0.0f && !perVertexTargets.empty() && std::isfinite(minMovement)) {
+                const float maxAllowedMovement = minMovement + perVertexLimit;
+                for (std::size_t i = 0; i < perVertexTargets.size(); ++i) {
+                    if (perVertexMovements[i] > maxAllowedMovement + 1e-4f) {
+                        const cv::Vec3f& baseWorld = samples[i].baseWorld;
+                        const cv::Vec3f delta = perVertexTargets[i] - baseWorld;
+                        const float length = perVertexMovements[i];
+                        if (length > 1e-6f) {
+                            const float scale = maxAllowedMovement / length;
+                            perVertexTargets[i] = baseWorld + delta * scale;
+                            perVertexMovements[i] = maxAllowedMovement;
+                            if (maxAllowedMovement >= 1e-4f) {
+                                anyMovement = true;
+                            }
+                        }
+                    }
+                }
             }
 
             if (alphaUnavailable) {

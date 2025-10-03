@@ -75,6 +75,7 @@ AlphaPushPullConfig sanitizeAlphaConfig(const AlphaPushPullConfig& config)
 
     sanitized.borderOffset = std::clamp(sanitized.borderOffset, -20.0f, 20.0f);
     sanitized.blurRadius = std::clamp(sanitized.blurRadius, 0, 15);
+    sanitized.perVertexLimit = std::clamp(sanitized.perVertexLimit, 0.0f, 128.0f);
 
     return sanitized;
 }
@@ -397,6 +398,9 @@ void SegmentationWidget::buildUi()
     _chkAlphaPerVertex = new QCheckBox(tr("Independent per-vertex stops"), _alphaPushPullPanel);
     _chkAlphaPerVertex->setToolTip(tr("Move every vertex within the brush independently to the alpha threshold without Gaussian weighting."));
     alphaGrid->addWidget(_chkAlphaPerVertex, alphaRow++, 0, 1, 4);
+
+    const QString perVertexLimitTip = tr("Maximum additional distance (world units) a vertex may exceed relative to the smallest movement in the brush when independent stops are enabled.");
+    addAlphaControl(tr("Per-vertex limit"), _spinAlphaPerVertexLimit, 0.0, 128.0, 0.25, alphaRow++, 0, perVertexLimitTip);
 
     alphaGrid->setColumnStretch(1, 1);
     alphaGrid->setColumnStretch(3, 1);
@@ -729,6 +733,11 @@ void SegmentationWidget::buildUi()
             cfg.blurRadius = value;
         });
     });
+    connect(_spinAlphaPerVertexLimit, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
+        onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
+            cfg.perVertexLimit = static_cast<float>(value);
+        });
+    });
     connect(_chkAlphaPerVertex, &QCheckBox::toggled, this, [this, onAlphaValueChanged](bool checked) {
         onAlphaValueChanged([checked](AlphaPushPullConfig& cfg) {
             cfg.perVertex = checked;
@@ -950,6 +959,7 @@ void SegmentationWidget::syncUiState()
         _spinAlphaBlurRadius->setValue(_alphaPushPullConfig.blurRadius);
         _spinAlphaBlurRadius->setEnabled(editingActive);
     }
+    updateAlphaSpin(_spinAlphaPerVertexLimit, _alphaPushPullConfig.perVertexLimit);
     if (_chkAlphaPerVertex) {
         const QSignalBlocker blocker(_chkAlphaPerVertex);
         _chkAlphaPerVertex->setChecked(_alphaPushPullConfig.perVertex);
@@ -1109,6 +1119,7 @@ void SegmentationWidget::restoreSettings()
     storedAlpha.high = settings.value(QStringLiteral("push_pull_alpha_high"), storedAlpha.high).toFloat();
     storedAlpha.borderOffset = settings.value(QStringLiteral("push_pull_alpha_border"), storedAlpha.borderOffset).toFloat();
     storedAlpha.blurRadius = settings.value(QStringLiteral("push_pull_alpha_radius"), storedAlpha.blurRadius).toInt();
+    storedAlpha.perVertexLimit = settings.value(QStringLiteral("push_pull_alpha_limit"), storedAlpha.perVertexLimit).toFloat();
     storedAlpha.perVertex = settings.value(QStringLiteral("push_pull_alpha_per_vertex"), storedAlpha.perVertex).toBool();
     applyAlphaPushPullConfig(storedAlpha, false, false);
     _smoothStrength = settings.value(QStringLiteral("smooth_strength"), _smoothStrength).toFloat();
@@ -1338,6 +1349,7 @@ void SegmentationWidget::applyAlphaPushPullConfig(const AlphaPushPullConfig& con
                          !nearlyEqual(sanitized.high, _alphaPushPullConfig.high) ||
                          !nearlyEqual(sanitized.borderOffset, _alphaPushPullConfig.borderOffset) ||
                          sanitized.blurRadius != _alphaPushPullConfig.blurRadius ||
+                         !nearlyEqual(sanitized.perVertexLimit, _alphaPushPullConfig.perVertexLimit) ||
                          sanitized.perVertex != _alphaPushPullConfig.perVertex;
 
     if (changed) {
@@ -1350,6 +1362,7 @@ void SegmentationWidget::applyAlphaPushPullConfig(const AlphaPushPullConfig& con
             writeSetting(QStringLiteral("push_pull_alpha_high"), _alphaPushPullConfig.high);
             writeSetting(QStringLiteral("push_pull_alpha_border"), _alphaPushPullConfig.borderOffset);
             writeSetting(QStringLiteral("push_pull_alpha_radius"), _alphaPushPullConfig.blurRadius);
+            writeSetting(QStringLiteral("push_pull_alpha_limit"), _alphaPushPullConfig.perVertexLimit);
             writeSetting(QStringLiteral("push_pull_alpha_per_vertex"), _alphaPushPullConfig.perVertex);
         }
     }
@@ -1390,6 +1403,11 @@ void SegmentationWidget::applyAlphaPushPullConfig(const AlphaPushPullConfig& con
         const QSignalBlocker blocker(_spinAlphaBlurRadius);
         _spinAlphaBlurRadius->setValue(_alphaPushPullConfig.blurRadius);
         _spinAlphaBlurRadius->setEnabled(editingActive);
+    }
+    if (_spinAlphaPerVertexLimit) {
+        const QSignalBlocker blocker(_spinAlphaPerVertexLimit);
+        _spinAlphaPerVertexLimit->setValue(static_cast<double>(_alphaPushPullConfig.perVertexLimit));
+        _spinAlphaPerVertexLimit->setEnabled(editingActive);
     }
     if (_chkAlphaPerVertex) {
         const QSignalBlocker blocker(_chkAlphaPerVertex);

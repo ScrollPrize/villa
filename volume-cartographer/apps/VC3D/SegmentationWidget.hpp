@@ -224,6 +224,7 @@ private:
     QDoubleSpinBox* _spinAlphaHigh{nullptr};
     QDoubleSpinBox* _spinAlphaBorder{nullptr};
     QSpinBox* _spinAlphaBlurRadius{nullptr};
+    QDoubleSpinBox* _spinAlphaPerVertexLimit{nullptr};
     QDoubleSpinBox* _spinSmoothStrength{nullptr};
     QSpinBox* _spinSmoothIterations{nullptr};
     QPushButton* _btnApply{nullptr};
