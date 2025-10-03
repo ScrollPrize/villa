@@ -8,17 +8,17 @@
 #include <mutex>
 
 #include "vc/core/util/LineSegListCache.hpp"
- 
-namespace vc {
-namespace core {
-namespace util {
 
-class LineSegList {
-public:
-    LineSegList(LineSegListCache* cache, const std::vector<cv::Point>& points) : cache_(cache) {
-        if (points.empty()) {
-            return;
-        }
+ namespace vc {
+ namespace core {
+ namespace util {
+
+ class LineSegList {
+ public:
+     explicit LineSegList(const std::vector<cv::Point>& points) {
+         if (points.empty()) {
+             return;
+         }
         start_point_ = points[0];
         compressed_data_.reserve(2 * (points.size() - 1));
         for (size_t i = 1; i < points.size(); ++i) {
@@ -34,18 +34,10 @@ public:
         compressed_data_size_ = compressed_data_.size();
     }
 
-    LineSegList(LineSegListCache* cache, cv::Point start_point, const int8_t* data, size_t size)
-        : cache_(cache), start_point_(start_point), compressed_data_ptr_(data), compressed_data_size_(size) {}
+    LineSegList(cv::Point start_point, const int8_t* data, size_t size)
+        : start_point_(start_point), compressed_data_ptr_(data), compressed_data_size_(size) {}
 
     std::shared_ptr<std::vector<cv::Point>> get() {
-        if (cache_) {
-            auto cached_data = cache_->get(this);
-            if (cached_data) {
-                return cached_data;
-            }
-        }
-
-        // Fallback to local cache or decompression if no shared cache or not found
         std::lock_guard<std::mutex> lock(mutex_);
         std::shared_ptr<std::vector<cv::Point>> points_ptr = points_cache_.lock();
         if (!points_ptr) {
@@ -58,10 +50,6 @@ public:
                 points_ptr->push_back(current_point);
             }
             points_cache_ = points_ptr;
-
-            if (cache_) {
-                cache_->put(this, points_ptr);
-            }
         }
         return points_ptr;
     }
@@ -70,9 +58,11 @@ public:
     size_t compressed_data_size() const { return compressed_data_size_; }
     cv::Point start_point() const { return start_point_; }
     size_t num_points() const { return 1 + compressed_data_size_ / 2; }
+    size_t get_memory_usage() const {
+       return sizeof(LineSegList) + compressed_data_.capacity();
+    }
 
 private:
-    LineSegListCache* cache_ = nullptr;
     cv::Point start_point_;
     std::vector<int8_t> compressed_data_; // Owns the data for non-views
     const int8_t* compressed_data_ptr_ = nullptr;

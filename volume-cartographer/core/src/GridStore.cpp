@@ -54,7 +54,7 @@ public:
         if (points.size() < 2) return;
 
         int handle = storage_.size();
-        storage_.emplace_back(std::make_shared<LineSegList>(cache_.get(), points));
+        storage_.emplace_back(std::make_shared<LineSegList>(points));
  
         std::unordered_set<int> relevant_buckets;
         for (const auto& p : points) {
@@ -72,34 +72,60 @@ public:
     }
 
     std::vector<std::shared_ptr<std::vector<cv::Point>>> get(const cv::Rect& query_rect) const {
-        std::unordered_set<int> handles;
+        std::vector<std::shared_ptr<std::vector<cv::Point>>> result;
         cv::Rect clamped_rect = query_rect & bounds_;
 
         cv::Point start = (clamped_rect.tl() - bounds_.tl()) / cell_size_;
         cv::Point end = (clamped_rect.br() - bounds_.tl()) / cell_size_;
 
-        for (int y = start.y; y <= end.y; ++y) {
-            for (int x = start.x; x <= end.x; ++x) {
-                int index = y * grid_size_.width + x;
-                if (index >= 0 && index < grid_.size()) {
-                    handles.insert(grid_[index].begin(), grid_[index].end());
+        if (read_only_) {
+            std::unordered_set<size_t> offsets;
+            for (int y = start.y; y <= end.y; ++y) {
+                for (int x = start.x; x <= end.x; ++x) {
+                    int index = y * grid_size_.width + x;
+                    if (index >= 0 && index < grid_offsets_.size()) {
+                        offsets.insert(grid_offsets_[index].begin(), grid_offsets_[index].end());
+                    }
                 }
             }
-        }
-
-        std::vector<std::shared_ptr<std::vector<cv::Point>>> result;
-        result.reserve(handles.size());
-        for (int handle : handles) {
-            result.push_back(storage_[handle]->get());
+            result.reserve(offsets.size());
+            for (size_t offset : offsets) {
+                result.push_back(get_seglist_from_offset(offset)->get());
+            }
+        } else {
+            std::unordered_set<int> handles;
+            for (int y = start.y; y <= end.y; ++y) {
+                for (int x = start.x; x <= end.x; ++x) {
+                    int index = y * grid_size_.width + x;
+                    if (index >= 0 && index < grid_.size()) {
+                        handles.insert(grid_[index].begin(), grid_[index].end());
+                    }
+                }
+            }
+            result.reserve(handles.size());
+            for (int handle : handles) {
+                result.push_back(storage_[handle]->get());
+            }
         }
         return result;
     }
 
     std::vector<std::shared_ptr<std::vector<cv::Point>>> get_all() const {
         std::vector<std::shared_ptr<std::vector<cv::Point>>> result;
-        result.reserve(storage_.size());
-        for (const auto& seg_list : storage_) {
-            result.push_back(seg_list->get());
+        if (read_only_) {
+            std::unordered_set<size_t> all_offsets;
+            for(const auto& bucket : grid_offsets_) {
+                all_offsets.insert(bucket.begin(), bucket.end());
+            }
+            result.reserve(all_offsets.size());
+            for (const auto& offset : all_offsets) {
+                result.push_back(get_seglist_from_offset(offset)->get());
+            }
+        } else {
+            result.reserve(storage_.size());
+            for (const auto& seg_list : storage_) {
+                result.push_back(seg_list->get());
+            }
         }
         return result;
     }
@@ -113,20 +139,42 @@ public:
         for (const auto& cell : grid_) {
             grid_memory += cell.capacity() * sizeof(int);
         }
-        size_t storage_memory = storage_.capacity() * sizeof(std::shared_ptr<LineSegList>);
-        // This doesn't account for the memory inside LineSegList, which is complex to calculate here.
-        // A more accurate implementation would require a get_memory_usage() method in LineSegList.
+        size_t storage_memory = 0;
+        if (read_only_) {
+            // In read-only mode, storage is just offsets, which are part of grid_offsets_
+            storage_memory = 0;
+        } else {
+            storage_memory = storage_.capacity() * sizeof(std::shared_ptr<LineSegList>);
+            for (const auto& seg : storage_) {
+                storage_memory += seg->get_memory_usage();
+            }
+        }
         return grid_memory + storage_memory;
     }
 
     size_t numSegments() const {
-        size_t count = 0;
-        for (const auto& seg_list : storage_) {
-            if (seg_list->num_points() > 0) {
-                count += seg_list->num_points() - 1;
+        if (read_only_) {
+            std::unordered_set<size_t> all_offsets;
+            for(const auto& bucket : grid_offsets_) {
+                all_offsets.insert(bucket.begin(), bucket.end());
             }
+            size_t count = 0;
+            for (const auto& offset : all_offsets) {
+                auto seg_list = get_seglist_from_offset(offset);
+                if (seg_list->num_points() > 0) {
+                    count += seg_list->num_points() - 1;
+                }
+            }
+            return count;
+        } else {
+            size_t count = 0;
+            for (const auto& seg_list : storage_) {
+                if (seg_list->num_points() > 0) {
+                    count += seg_list->num_points() - 1;
+                }
+            }
+            return count;
         }
-        return count;
     }
 
     size_t numNonEmptyBuckets() const {
@@ -210,7 +258,7 @@ public:
             const char* read_paths_ptr = buffer_start + ntohl(paths_offset);
             for (size_t i = 0; i < storage_.size(); ++i) {
                 std::shared_ptr<LineSegList> seglist;
-                read_paths_ptr = read_seglist(read_paths_ptr, buffer_end, seglist, nullptr); // No cache for verification
+                read_paths_ptr = read_seglist_header_and_data(read_paths_ptr, buffer_end, seglist);
                 deserialized_storage.push_back(seglist);
             }
 
@@ -348,33 +396,21 @@ public:
         );
 
         // 2. Read Paths and build offset map
-        storage_.reserve(num_paths);
-        std::unordered_map<uint32_t, int> offset_to_handle;
-        const char* paths_start = static_cast<const char*>(mmapped_data_->data) + paths_offset;
-        const char* current_path_ptr = paths_start;
-        for (uint32_t i = 0; i < num_paths; ++i) {
-            uint32_t current_offset = current_path_ptr - paths_start;
-            int handle = storage_.size();
-            
-            std::shared_ptr<LineSegList> seglist;
-            current_path_ptr = read_seglist(current_path_ptr, end, seglist, cache_.get());
-            storage_.push_back(seglist);
-            offset_to_handle[current_offset] = handle;
-        }
+        paths_offset_in_file_ = paths_offset;
 
         // 3. Read Buckets
-        grid_.assign(num_buckets, std::vector<int>());
+        grid_offsets_.assign(num_buckets, std::vector<size_t>());
         const char* buckets_start = static_cast<const char*>(mmapped_data_->data) + buckets_offset;
         const char* current_bucket_ptr = buckets_start;
         for (uint32_t i = 0; i < num_buckets; ++i) {
             if (current_bucket_ptr + sizeof(uint32_t) > end) throw std::runtime_error("Invalid GridStore file: unexpected end in bucket header.");
             uint32_t num_indices = ntohl(*reinterpret_cast<const uint32_t*>(current_bucket_ptr)); current_bucket_ptr += sizeof(uint32_t);
             
-            grid_[i].reserve(num_indices);
+            grid_offsets_[i].reserve(num_indices);
             if (current_bucket_ptr + num_indices * sizeof(uint32_t) > end) throw std::runtime_error("Invalid GridStore file: bucket indices out of bounds.");
             for (uint32_t j = 0; j < num_indices; ++j) {
                 uint32_t path_offset = ntohl(*reinterpret_cast<const uint32_t*>(current_bucket_ptr)); current_bucket_ptr += sizeof(uint32_t);
-                grid_[i].push_back(offset_to_handle.at(path_offset));
+                grid_offsets_[i].push_back(path_offset);
             }
         }
         // 4. Read Metadata
@@ -433,7 +469,7 @@ private:
         return current;
     }
 
-    const char* read_seglist(const char* current, const char* end, std::shared_ptr<LineSegList>& seglist, LineSegListCache* cache) const {
+    const char* read_seglist_header_and_data(const char* current, const char* end, std::shared_ptr<LineSegList>& seglist) const {
         if (current + 3 * sizeof(uint32_t) > end) throw std::runtime_error("Invalid GridStore file: unexpected end in seglist header.");
         uint32_t start_x = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
         uint32_t start_y = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
@@ -445,8 +481,28 @@ private:
         const int8_t* offsets_ptr = reinterpret_cast<const int8_t*>(current);
         current += num_offsets;
  
-        seglist = std::make_shared<LineSegList>(cache, start, offsets_ptr, num_offsets);
+        seglist = std::make_shared<LineSegList>(start, offsets_ptr, num_offsets);
         return current;
+    }
+
+    std::shared_ptr<LineSegList> get_seglist_from_offset(size_t offset) const {
+        if (!cache_) {
+            const char* paths_start = static_cast<const char*>(mmapped_data_->data) + paths_offset_in_file_;
+            const char* end = static_cast<const char*>(mmapped_data_->data) + mmapped_data_->size;
+            std::shared_ptr<LineSegList> seglist;
+            read_seglist_header_and_data(paths_start + offset, end, seglist);
+            return seglist;
+        }
+
+        LineSegListCache::CacheKey key = {this, offset};
+        std::shared_ptr<LineSegList> seglist = cache_->get(key);
+        if (!seglist) {
+            const char* paths_start = static_cast<const char*>(mmapped_data_->data) + paths_offset_in_file_;
+            const char* end = static_cast<const char*>(mmapped_data_->data) + mmapped_data_->size;
+            read_seglist_header_and_data(paths_start + offset, end, seglist);
+            cache_->put(key, seglist);
+        }
+        return seglist;
     }
 
     size_t get_all_buckets_size() const {
@@ -473,8 +529,10 @@ private:
     int cell_size_;
     cv::Size grid_size_;
     std::vector<std::vector<int>> grid_;
+    std::vector<std::vector<size_t>> grid_offsets_;
     std::vector<std::shared_ptr<LineSegList>> storage_;
     bool read_only_;
+    uint32_t paths_offset_in_file_;
     std::unique_ptr<MmappedData> mmapped_data_;
     std::shared_ptr<LineSegListCache> cache_;
 };

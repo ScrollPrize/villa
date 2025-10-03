@@ -11,7 +11,7 @@ namespace vc::core::util {
 LineSegListCache::LineSegListCache(size_t max_size_bytes)
     : max_size_bytes_(max_size_bytes), last_stat_time_(std::chrono::steady_clock::now()) {}
 
-std::shared_ptr<std::vector<cv::Point>> LineSegListCache::get(CacheKey key) {
+std::shared_ptr<LineSegList> LineSegListCache::get(const CacheKey& key) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = lookup_.find(key);
     if (it != lookup_.end()) {
@@ -32,14 +32,14 @@ std::shared_ptr<std::vector<cv::Point>> LineSegListCache::get(CacheKey key) {
     return nullptr;
 }
 
-void LineSegListCache::put(const CacheKey& key, std::shared_ptr<std::vector<cv::Point>> data) {
+void LineSegListCache::put(const CacheKey& key, std::shared_ptr<LineSegList> data) {
     std::lock_guard<std::mutex> lock(mutex_);
     
     if (lookup_.count(key)) {
         return; // Already in cache
     }
 
-    size_t data_size = data->capacity() * sizeof(cv::Point);
+    size_t data_size = data->get_memory_usage();
 
     if (current_size_bytes_ + data_size > max_size_bytes_) {
         evict();
@@ -91,7 +91,10 @@ void LineSegListCache::check_print_stats() {
             uint64_t misses = cache_misses_.load();
             uint64_t total = hits + misses;
             double hit_rate = (total == 0) ? 0.0 : (static_cast<double>(hits) / total) * 100.0;
-            std::cout << "[LineSegList Cache] Hits: " << hits << ", Misses: " << misses << ", Total: " << total << ", Hit Rate: " << std::fixed << std::setprecision(2) << hit_rate << "%" << std::endl;
+            double utilization_gb = static_cast<double>(current_size_bytes_) / (1024 * 1024 * 1024);
+            std::cout << "[LineSegList Cache] Hits: " << hits << ", Misses: " << misses << ", Total: " << total
+                      << ", Hit Rate: " << std::fixed << std::setprecision(2) << hit_rate << "%"
+                      << ", Utilization: " << utilization_gb << " GB" << std::endl;
             last_stat_time_ = now;
         }
     }

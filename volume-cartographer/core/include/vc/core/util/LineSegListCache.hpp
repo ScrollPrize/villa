@@ -14,17 +14,23 @@ class LineSegList;
 
 class LineSegListCache {
 public:
-    using CacheKey = const LineSegList*;
+    using CacheKey = std::pair<const void*, size_t>; // GridStore pointer and offset
 
     explicit LineSegListCache(size_t max_size_bytes = 1024 * 1024 * 1024); // 1 GB default
 
-    std::shared_ptr<std::vector<cv::Point>> get(CacheKey key);
-    void put(const CacheKey& key, std::shared_ptr<std::vector<cv::Point>> data);
+    std::shared_ptr<LineSegList> get(const CacheKey& key);
+    void put(const CacheKey& key, std::shared_ptr<LineSegList> data);
 
 private:
+    struct CacheKeyHash {
+        std::size_t operator()(const CacheKey& k) const {
+            return std::hash<const void*>()(k.first) ^ (std::hash<size_t>()(k.second) << 1);
+        }
+    };
+
     struct CacheEntry {
         CacheKey key;
-        std::weak_ptr<std::vector<cv::Point>> data;
+        std::weak_ptr<LineSegList> data;
         uint64_t generation;
         size_t size_bytes;
     };
@@ -41,7 +47,7 @@ private:
     std::chrono::steady_clock::time_point last_stat_time_;
 
     std::vector<CacheEntry> entries_;
-    std::unordered_map<CacheKey, size_t> lookup_;
+    std::unordered_map<CacheKey, size_t, CacheKeyHash> lookup_;
     
     std::mutex mutex_;
 };
