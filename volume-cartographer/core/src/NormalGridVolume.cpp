@@ -26,7 +26,7 @@
          mutable std::mutex mutex;
          mutable std::unordered_map<cv::Vec2i, CacheEntry> grid_cache;
          mutable uint64_t generation_counter = 0;
-         size_t max_cache_size = 2048;
+         size_t max_cache_size = 4096;
          size_t eviction_sample_size = 10;
         
          mutable std::atomic<uint64_t> cache_hits{0};
