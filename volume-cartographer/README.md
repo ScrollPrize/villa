@@ -116,10 +116,11 @@ _Keybinds:_
 > - `Ctrl + left mouse button` : centers the focus point on the cursor position
 > - `Scroll wheel click + drag` : rotates the slicing pane in the XZ or XY volume viewers
 > - `Spacebar` : toggles the overlay on / off
+> - `C` : toggle a composite view of the current surface in the segmentation window (parameters of which can be located in the "composite" dock tab, next to the location tab)
 
 **Segmentation**
 
-_Primary entry point for interacting with the segmentation_
+_Primary entry point for interacting with the segmentation, more info in the [segmentation docs](docs/segmentation.md)_
  
 <img src="docs/imgs/segmentation-widget-ui.png" style="height: 500px">
 

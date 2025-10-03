@@ -33,7 +33,7 @@ constexpr int kStatusShort = 1500;
 constexpr int kStatusMedium = 2000;
 constexpr int kStatusLong = 5000;
 constexpr int kMaxUndoStates = 5;
-constexpr float kMaxBrushSampleSpacing = 0.5f;
+constexpr float kBrushSampleSpacing = 2.0f;
 
 float averageScale(const cv::Vec2f& scale)
 {
@@ -95,6 +95,8 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
 {
     if (_widget) {
         _pushPullStepMultiplier = std::clamp(_widget->pushPullStep(), 0.05f, 10.0f);
+        _smoothStrength = std::clamp(_widget->smoothingStrength(), 0.0f, 1.0f);
+        _smoothIterations = std::clamp(_widget->smoothingIterations(), 1, 25);
     }
 
     if (_overlay) {
@@ -203,6 +205,10 @@ void SegmentationModule::bindWidgetSignals()
             });
     connect(_widget, &SegmentationWidget::pushPullStepChanged,
             this, &SegmentationModule::setPushPullStepMultiplier);
+    connect(_widget, &SegmentationWidget::smoothingStrengthChanged,
+            this, &SegmentationModule::setSmoothingStrength);
+    connect(_widget, &SegmentationWidget::smoothingIterationsChanged,
+            this, &SegmentationModule::setSmoothingIterations);
     connect(_widget, &SegmentationWidget::correctionsCreateRequested,
             this, &SegmentationModule::onCorrectionsCreateRequested);
     connect(_widget, &SegmentationWidget::correctionsCollectionSelected,
@@ -335,6 +341,30 @@ void SegmentationModule::setPushPullStepMultiplier(float multiplier)
     _pushPullStepMultiplier = sanitized;
     if (_widget) {
         _widget->setPushPullStep(_pushPullStepMultiplier);
+    }
+}
+
+void SegmentationModule::setSmoothingStrength(float strength)
+{
+    const float clamped = std::clamp(strength, 0.0f, 1.0f);
+    if (std::fabs(clamped - _smoothStrength) < 1e-4f) {
+        return;
+    }
+    _smoothStrength = clamped;
+    if (_widget) {
+        _widget->setSmoothingStrength(_smoothStrength);
+    }
+}
+
+void SegmentationModule::setSmoothingIterations(int iterations)
+{
+    const int clamped = std::clamp(iterations, 1, 25);
+    if (_smoothIterations == clamped) {
+        return;
+    }
+    _smoothIterations = clamped;
+    if (_widget) {
+        _widget->setSmoothingIterations(_smoothIterations);
     }
 }
 
@@ -1193,8 +1223,7 @@ void SegmentationModule::extendPaintStroke(const cv::Vec3f& worldPos, bool force
         return;
     }
 
-    const float baseSpacing = std::max(gridStepWorld() * 0.3f, 0.25f);
-    const float spacing = std::min(baseSpacing, kMaxBrushSampleSpacing);
+    const float spacing = kBrushSampleSpacing;
     const float spacingSq = spacing * spacing;
 
     if (_hasLastPaintSample) {
@@ -1263,11 +1292,20 @@ bool SegmentationModule::applyInvalidationBrush()
     }
     targets.reserve(estimate);
 
+    const float stepWorld = gridStepWorld();
+    const float maxDistance = stepWorld * std::max(_radiusSteps * 6.0f, 15.0f);
+
     for (const auto& stroke : _pendingPaintStrokes) {
         for (const auto& world : stroke) {
-            if (auto grid = _editManager->worldToGridIndex(world)) {
-                targets.insert(GridKey{grid->first, grid->second});
+            float gridDistance = 0.0f;
+            auto grid = _editManager->worldToGridIndex(world, &gridDistance);
+            if (!grid) {
+                continue;
             }
+            if (maxDistance > 0.0f && gridDistance > maxDistance) {
+                continue;
+            }
+            targets.insert(GridKey{grid->first, grid->second});
         }
     }
 
@@ -1435,7 +1473,8 @@ bool SegmentationModule::isSegmentationViewer(const CVolumeViewer* viewer) const
     if (!viewer) {
         return false;
     }
-    return viewer->surfName() == "segmentation";
+    const std::string& name = viewer->surfName();
+    return name.rfind("seg", 0) == 0 || name == "xy plane";
 }
 
 float SegmentationModule::gridStepWorld() const
@@ -1497,6 +1536,10 @@ void SegmentationModule::finishDrag()
     }
 
     const bool moved = _drag.moved;
+
+    if (moved && _smoothStrength > 0.0f && _smoothIterations > 0) {
+        _editManager->smoothRecentTouched(_smoothStrength, _smoothIterations);
+    }
 
     _editManager->commitActiveDrag();
     _drag.reset();

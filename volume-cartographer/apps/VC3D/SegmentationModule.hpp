@@ -53,6 +53,8 @@ public:
     void setRadius(float radiusSteps);
     void setSigma(float sigmaSteps);
     void setPushPullStepMultiplier(float multiplier);
+    void setSmoothingStrength(float strength);
+    void setSmoothingIterations(int iterations);
 
     void applyEdits();
     void resetEdits();
@@ -203,6 +205,8 @@ private:
     bool _editingEnabled{false};
     float _radiusSteps{5.75f};
     float _sigmaSteps{2.0f};
+    float _smoothStrength{0.4f};
+    int _smoothIterations{2};
     bool _growthInProgress{false};
     SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Tracer};
     int _growthSteps{10};

@@ -6,6 +6,8 @@
 #include <cmath>
 #include <limits>
 #include <utility>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <nlohmann/json.hpp>
 
@@ -193,24 +195,95 @@ std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(con
     const float distance = _baseSurface->pointTo(ptr, worldPos, std::numeric_limits<float>::max(), 400);
     cv::Vec3f raw = _baseSurface->loc_raw(ptr);
 
-    auto* points = _baseSurface->rawPointsPtr();
+    const cv::Mat_<cv::Vec3f>* points = nullptr;
+    if (_previewPoints) {
+        points = _previewPoints;
+    } else if (_previewSurface) {
+        points = _previewSurface->rawPointsPtr();
+    }
+    if (!points) {
+        points = _baseSurface->rawPointsPtr();
+    }
     if (!points) {
         return std::nullopt;
     }
 
-    int col = static_cast<int>(std::round(raw[0]));
-    int row = static_cast<int>(std::round(raw[1]));
-
-    if (row < 0 || row >= points->rows || col < 0 || col >= points->cols) {
-        row = std::clamp(row, 0, points->rows - 1);
-        col = std::clamp(col, 0, points->cols - 1);
+    const int rows = points->rows;
+    const int cols = points->cols;
+    if (rows <= 0 || cols <= 0) {
+        return std::nullopt;
     }
 
+    int approxCol = static_cast<int>(std::round(raw[0]));
+    int approxRow = static_cast<int>(std::round(raw[1]));
+
+    approxRow = std::clamp(approxRow, 0, rows - 1);
+    approxCol = std::clamp(approxCol, 0, cols - 1);
+
+    auto accumulateCandidate = [&](int r, int c, float& bestDistSq, int& bestRow, int& bestCol) {
+        const cv::Vec3f& candidate = (*points)(r, c);
+        if (isInvalidPoint(candidate)) {
+            return;
+        }
+        const cv::Vec3f diff = candidate - worldPos;
+        const float distSq = diff.dot(diff);
+        if (distSq < bestDistSq) {
+            bestDistSq = distSq;
+            bestRow = r;
+            bestCol = c;
+        }
+    };
+
+    const float stepNorm = stepNormalization();
+    const float stepNormSq = stepNorm * stepNorm;
+
+    float bestDistSq = std::numeric_limits<float>::max();
+    int bestRow = -1;
+    int bestCol = -1;
+
+    constexpr int kInitialRadius = 12;
+    for (int radius = 0; radius <= kInitialRadius; ++radius) {
+        const int rowStart = std::max(0, approxRow - radius);
+        const int rowEnd = std::min(rows - 1, approxRow + radius);
+        const int colStart = std::max(0, approxCol - radius);
+        const int colEnd = std::min(cols - 1, approxCol + radius);
+
+        for (int r = rowStart; r <= rowEnd; ++r) {
+            for (int c = colStart; c <= colEnd; ++c) {
+                accumulateCandidate(r, c, bestDistSq, bestRow, bestCol);
+            }
+        }
+
+        if (bestRow != -1) {
+            const float bestDist = std::sqrt(bestDistSq);
+            const float breakThreshold = (radius == 0) ? stepNorm : stepNorm * 1.5f * static_cast<float>(radius);
+            if (bestDist <= breakThreshold) {
+                break;
+            }
+        }
+    }
+
+    if (bestRow == -1 || bestDistSq > stepNormSq * 25.0f) {
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                accumulateCandidate(r, c, bestDistSq, bestRow, bestCol);
+            }
+        }
+    }
+
+    if (bestRow == -1) {
+        if (outDistance) {
+            *outDistance = distance;
+        }
+        return std::nullopt;
+    }
+
+    const float bestDist = std::sqrt(bestDistSq);
     if (outDistance) {
-        *outDistance = distance;
+        *outDistance = bestDist;
     }
 
-    return std::make_pair(row, col);
+    return std::make_pair(bestRow, bestCol);
 }
 
 std::optional<cv::Vec3f> SegmentationEditManager::vertexWorldPosition(int row, int col) const
@@ -253,6 +326,151 @@ bool SegmentationEditManager::updateActiveDrag(const cv::Vec3f& newCenterWorld)
     const cv::Vec3f delta = newCenterWorld - _activeDrag.baseWorld;
     _activeDrag.targetWorld = newCenterWorld;
     applyGaussianToSamples(delta);
+    return true;
+}
+
+bool SegmentationEditManager::smoothRecentTouched(float strength, int iterations)
+{
+    if (!_previewPoints || _recentTouched.empty()) {
+        return false;
+    }
+    if (!std::isfinite(strength) || strength <= 0.0f) {
+        return false;
+    }
+
+    const int rows = _previewPoints->rows;
+    const int cols = _previewPoints->cols;
+    if (rows <= 0 || cols <= 0) {
+        return false;
+    }
+
+    strength = std::clamp(strength, 0.01f, 1.0f);
+    iterations = std::max(iterations, 1);
+
+    std::unordered_set<GridKey, GridKeyHash> region;
+    region.reserve(_recentTouched.size() * 2);
+
+    auto tryInsert = [&](int r, int c) {
+        if (r < 0 || r >= rows || c < 0 || c >= cols) {
+            return;
+        }
+        const cv::Vec3f& candidate = (*_previewPoints)(r, c);
+        if (isInvalidPoint(candidate)) {
+            return;
+        }
+        region.insert(GridKey{r, c});
+    };
+
+    for (const auto& key : _recentTouched) {
+        tryInsert(key.row, key.col);
+    }
+
+    if (region.empty()) {
+        return false;
+    }
+
+    static constexpr int kNeighbourOffsets[8][2] = {
+        {-1, 0}, {1, 0}, {0, -1}, {0, 1},
+        {-1, -1}, {-1, 1}, {1, -1}, {1, 1}
+    };
+
+    std::vector<GridKey> seeds(region.begin(), region.end());
+    for (const auto& key : seeds) {
+        for (const auto& off : kNeighbourOffsets) {
+            tryInsert(key.row + off[0], key.col + off[1]);
+        }
+    }
+
+    std::vector<GridKey> regionVec(region.begin(), region.end());
+    if (regionVec.empty()) {
+        return false;
+    }
+
+    std::unordered_map<GridKey, cv::Vec3f, GridKeyHash> currentValues;
+    currentValues.reserve(regionVec.size());
+    for (const auto& key : regionVec) {
+        currentValues[key] = (*_previewPoints)(key.row, key.col);
+    }
+
+    bool anyChange = false;
+
+    for (int iter = 0; iter < iterations; ++iter) {
+        std::vector<std::pair<GridKey, cv::Vec3f>> updates;
+        updates.reserve(regionVec.size());
+
+        for (const auto& key : regionVec) {
+            auto currentIt = currentValues.find(key);
+            if (currentIt == currentValues.end()) {
+                continue;
+            }
+
+            const cv::Vec3f& current = currentIt->second;
+            if (isInvalidPoint(current)) {
+                continue;
+            }
+
+            cv::Vec3f sum(0.0f, 0.0f, 0.0f);
+            int count = 0;
+
+            for (const auto& off : kNeighbourOffsets) {
+                const int nr = key.row + off[0];
+                const int nc = key.col + off[1];
+                if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) {
+                    continue;
+                }
+
+                cv::Vec3f neighbour;
+                GridKey neighbourKey{nr, nc};
+                const auto regionIt = currentValues.find(neighbourKey);
+                if (regionIt != currentValues.end()) {
+                    neighbour = regionIt->second;
+                } else {
+                    neighbour = (*_previewPoints)(nr, nc);
+                }
+
+                if (isInvalidPoint(neighbour)) {
+                    continue;
+                }
+
+                sum += neighbour;
+                ++count;
+            }
+
+            if (count == 0) {
+                continue;
+            }
+
+            const cv::Vec3f average = sum * (1.0f / static_cast<float>(count));
+            const cv::Vec3f newWorld = current * (1.0f - strength) + average * strength;
+
+            if (cv::norm(newWorld - current) < 1e-5f) {
+                continue;
+            }
+
+            updates.emplace_back(key, newWorld);
+        }
+
+        if (updates.empty()) {
+            break;
+        }
+
+        for (const auto& entry : updates) {
+            const GridKey& key = entry.first;
+            const cv::Vec3f& newWorld = entry.second;
+
+            (*_previewPoints)(key.row, key.col) = newWorld;
+            currentValues[key] = newWorld;
+            recordVertexEdit(key.row, key.col, newWorld);
+            anyChange = true;
+        }
+    }
+
+    if (!anyChange) {
+        return false;
+    }
+
+    _recentTouched.assign(regionVec.begin(), regionVec.end());
+    _dirty = true;
     return true;
 }
 

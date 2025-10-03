@@ -16,6 +16,8 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QKeySequence>
+#include <QShortcut>
 #include <QScrollBar>
 #include <QSettings>
 #include <QSignalBlocker>
@@ -215,35 +217,50 @@ void SegmentationWidget::buildUi()
     auto* falloffGroup = new QGroupBox(tr("Editing"), this);
     auto* falloffLayout = new QVBoxLayout(falloffGroup);
 
-    auto* radiusSigmaRow = new QHBoxLayout();
-    auto* radiusLabel = new QLabel(tr("Max radius"), falloffGroup);
+    auto* falloffRow1 = new QHBoxLayout();
+    auto* radiusLabel = new QLabel(tr("Radius"), falloffGroup);
     _spinRadius = new QDoubleSpinBox(falloffGroup);
     _spinRadius->setDecimals(2);
     _spinRadius->setRange(0.25, 128.0);
     _spinRadius->setSingleStep(0.25);
-    radiusSigmaRow->addWidget(radiusLabel);
-    radiusSigmaRow->addWidget(_spinRadius);
-    radiusSigmaRow->addSpacing(12);
+    falloffRow1->addWidget(radiusLabel);
+    falloffRow1->addWidget(_spinRadius);
+    falloffRow1->addSpacing(12);
     auto* sigmaLabel = new QLabel(tr("Sigma"), falloffGroup);
     _spinSigma = new QDoubleSpinBox(falloffGroup);
     _spinSigma->setDecimals(2);
     _spinSigma->setRange(0.05, 64.0);
     _spinSigma->setSingleStep(0.1);
-    radiusSigmaRow->addWidget(sigmaLabel);
-    radiusSigmaRow->addWidget(_spinSigma);
-    radiusSigmaRow->addStretch(1);
-    falloffLayout->addLayout(radiusSigmaRow);
-
-    auto* pushPullRow = new QHBoxLayout();
+    falloffRow1->addWidget(sigmaLabel);
+    falloffRow1->addWidget(_spinSigma);
+    falloffRow1->addSpacing(12);
     auto* pushPullLabel = new QLabel(tr("Push/Pull step"), falloffGroup);
     _spinPushPullStep = new QDoubleSpinBox(falloffGroup);
     _spinPushPullStep->setDecimals(2);
     _spinPushPullStep->setRange(0.05, 10.0);
     _spinPushPullStep->setSingleStep(0.05);
-    pushPullRow->addWidget(pushPullLabel);
-    pushPullRow->addWidget(_spinPushPullStep);
-    pushPullRow->addStretch(1);
-    falloffLayout->addLayout(pushPullRow);
+    falloffRow1->addWidget(pushPullLabel);
+    falloffRow1->addWidget(_spinPushPullStep);
+    falloffRow1->addStretch(1);
+    falloffLayout->addLayout(falloffRow1);
+
+    auto* smoothingRow = new QHBoxLayout();
+    auto* smoothStrengthLabel = new QLabel(tr("Smoothing strength"), falloffGroup);
+    _spinSmoothStrength = new QDoubleSpinBox(falloffGroup);
+    _spinSmoothStrength->setDecimals(2);
+    _spinSmoothStrength->setRange(0.0, 1.0);
+    _spinSmoothStrength->setSingleStep(0.05);
+    smoothingRow->addWidget(smoothStrengthLabel);
+    smoothingRow->addWidget(_spinSmoothStrength);
+    smoothingRow->addSpacing(12);
+    auto* smoothIterationsLabel = new QLabel(tr("Iterations"), falloffGroup);
+    _spinSmoothIterations = new QSpinBox(falloffGroup);
+    _spinSmoothIterations->setRange(1, 25);
+    _spinSmoothIterations->setSingleStep(1);
+    smoothingRow->addWidget(smoothIterationsLabel);
+    smoothingRow->addWidget(_spinSmoothIterations);
+    smoothingRow->addStretch(1);
+    falloffLayout->addLayout(smoothingRow);
 
     falloffGroup->setLayout(falloffLayout);
     layout->addWidget(falloffGroup);
@@ -390,10 +407,12 @@ void SegmentationWidget::buildUi()
         if (allowed.size() == 1) {
             direction = allowed.front();
         }
-        qCInfo(lcSegWidget) << "Grow pressed" << segmentationGrowthMethodToString(_growthMethod)
-                            << segmentationGrowthDirectionToString(direction)
-                            << "steps" << _growthSteps;
-        emit growSurfaceRequested(_growthMethod, direction, _growthSteps);
+        triggerGrowthRequest(direction, _growthSteps);
+    });
+
+    auto* growShortcut = new QShortcut(QKeySequence(Qt::Key_6), this);
+    connect(growShortcut, &QShortcut::activated, this, [this]() {
+        triggerGrowthRequest(SegmentationGrowthDirection::All, 1);
     });
 
     connect(_comboVolumes, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
@@ -421,6 +440,16 @@ void SegmentationWidget::buildUi()
     connect(_spinPushPullStep, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         setPushPullStep(static_cast<float>(value));
         emit pushPullStepChanged(_pushPullStep);
+    });
+
+    connect(_spinSmoothStrength, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        setSmoothingStrength(static_cast<float>(value));
+        emit smoothingStrengthChanged(_smoothStrength);
+    });
+
+    connect(_spinSmoothIterations, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        setSmoothingIterations(value);
+        emit smoothingIterationsChanged(_smoothIterations);
     });
 
     connect(_directionFieldPathEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
@@ -579,6 +608,14 @@ void SegmentationWidget::syncUiState()
         const QSignalBlocker blocker(_spinPushPullStep);
         _spinPushPullStep->setValue(static_cast<double>(_pushPullStep));
     }
+    if (_spinSmoothStrength) {
+        const QSignalBlocker blocker(_spinSmoothStrength);
+        _spinSmoothStrength->setValue(static_cast<double>(_smoothStrength));
+    }
+    if (_spinSmoothIterations) {
+        const QSignalBlocker blocker(_spinSmoothIterations);
+        _spinSmoothIterations->setValue(_smoothIterations);
+    }
 
     if (_editCustomParams) {
         if (_editCustomParams->toPlainText() != _customParamsText) {
@@ -685,6 +722,10 @@ void SegmentationWidget::restoreSettings()
     _radiusSteps = settings.value(QStringLiteral("radius_steps"), _radiusSteps).toFloat();
     _sigmaSteps = settings.value(QStringLiteral("sigma_steps"), _sigmaSteps).toFloat();
     _pushPullStep = settings.value(QStringLiteral("push_pull_step"), _pushPullStep).toFloat();
+    _smoothStrength = settings.value(QStringLiteral("smooth_strength"), _smoothStrength).toFloat();
+    _smoothIterations = settings.value(QStringLiteral("smooth_iterations"), _smoothIterations).toInt();
+    _smoothStrength = std::clamp(_smoothStrength, 0.0f, 1.0f);
+    _smoothIterations = std::clamp(_smoothIterations, 1, 25);
     _growthMethod = segmentationGrowthMethodFromInt(
         settings.value(QStringLiteral("growth_method"), static_cast<int>(_growthMethod)).toInt());
     _growthSteps = settings.value(QStringLiteral("growth_steps"), _growthSteps).toInt();
@@ -809,6 +850,34 @@ void SegmentationWidget::setPushPullStep(float value)
     if (_spinPushPullStep) {
         const QSignalBlocker blocker(_spinPushPullStep);
         _spinPushPullStep->setValue(static_cast<double>(_pushPullStep));
+    }
+}
+
+void SegmentationWidget::setSmoothingStrength(float value)
+{
+    const float clamped = std::clamp(value, 0.0f, 1.0f);
+    if (std::fabs(clamped - _smoothStrength) < 1e-4f) {
+        return;
+    }
+    _smoothStrength = clamped;
+    writeSetting(QStringLiteral("smooth_strength"), _smoothStrength);
+    if (_spinSmoothStrength) {
+        const QSignalBlocker blocker(_spinSmoothStrength);
+        _spinSmoothStrength->setValue(static_cast<double>(_smoothStrength));
+    }
+}
+
+void SegmentationWidget::setSmoothingIterations(int value)
+{
+    const int clamped = std::clamp(value, 1, 25);
+    if (_smoothIterations == clamped) {
+        return;
+    }
+    _smoothIterations = clamped;
+    writeSetting(QStringLiteral("smooth_iterations"), _smoothIterations);
+    if (_spinSmoothIterations) {
+        const QSignalBlocker blocker(_spinSmoothIterations);
+        _spinSmoothIterations->setValue(_smoothIterations);
     }
 }
 
@@ -1375,6 +1444,18 @@ void SegmentationWidget::updateGrowthUiState()
     if (_chkCorrectionsAnnotate) {
         _chkCorrectionsAnnotate->setEnabled(allowCorrections);
     }
+}
+
+void SegmentationWidget::triggerGrowthRequest(SegmentationGrowthDirection direction, int steps)
+{
+    if (!_editingEnabled || _growthInProgress) {
+        return;
+    }
+
+    const int clampedSteps = std::clamp(steps, 1, 1024);
+    qCInfo(lcSegWidget) << "Grow request" << segmentationGrowthMethodToString(_growthMethod)
+                        << segmentationGrowthDirectionToString(direction) << "steps" << clampedSteps;
+    emit growSurfaceRequested(_growthMethod, direction, clampedSteps);
 }
 
 int SegmentationWidget::normalizeGrowthDirectionMask(int mask)

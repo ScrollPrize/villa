@@ -34,6 +34,8 @@ public:
     [[nodiscard]] float radius() const { return _radiusSteps; }
     [[nodiscard]] float sigma() const { return _sigmaSteps; }
     [[nodiscard]] float pushPullStep() const { return _pushPullStep; }
+    [[nodiscard]] float smoothingStrength() const { return _smoothStrength; }
+    [[nodiscard]] int smoothingIterations() const { return _smoothIterations; }
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const { return _growthMethod; }
     [[nodiscard]] int growthSteps() const { return _growthSteps; }
     [[nodiscard]] QString customParamsText() const { return _customParamsText; }
@@ -46,6 +48,8 @@ public:
     void setRadius(float value);
     void setSigma(float value);
     void setPushPullStep(float value);
+    void setSmoothingStrength(float value);
+    void setSmoothingIterations(int value);
     void setGrowthMethod(SegmentationGrowthMethod method);
     void setGrowthInProgress(bool running);
     void setEraseBrushActive(bool active);
@@ -73,6 +77,8 @@ signals:
     void sigmaChanged(float value);
     void growthMethodChanged(SegmentationGrowthMethod method);
     void pushPullStepChanged(float value);
+    void smoothingStrengthChanged(float value);
+    void smoothingIterationsChanged(int value);
     void growSurfaceRequested(SegmentationGrowthMethod method,
                               SegmentationGrowthDirection direction,
                               int steps);
@@ -110,6 +116,7 @@ private:
     void validateCustomParamsText();
     void updateCustomParamsStatus();
     std::optional<nlohmann::json> parseCustomParams(QString* error) const;
+    void triggerGrowthRequest(SegmentationGrowthDirection direction, int steps);
 
     bool _editingEnabled{false};
     bool _pending{false};
@@ -118,6 +125,8 @@ private:
     float _radiusSteps{5.75f};
     float _sigmaSteps{2.0f};
     float _pushPullStep{4.0f};
+    float _smoothStrength{0.4f};
+    int _smoothIterations{2};
 
     bool _normalGridAvailable{false};
     QString _normalGridHint;
@@ -170,6 +179,8 @@ private:
     QDoubleSpinBox* _spinRadius{nullptr};
     QDoubleSpinBox* _spinSigma{nullptr};
     QDoubleSpinBox* _spinPushPullStep{nullptr};
+    QDoubleSpinBox* _spinSmoothStrength{nullptr};
+    QSpinBox* _spinSmoothIterations{nullptr};
     QPushButton* _btnApply{nullptr};
     QPushButton* _btnReset{nullptr};
     QPushButton* _btnStop{nullptr};
