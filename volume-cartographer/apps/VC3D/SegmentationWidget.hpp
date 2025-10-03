@@ -7,6 +7,8 @@
 #include <utility>
 #include <vector>
 
+#include "SegmentationPushPullConfig.hpp"
+
 #include <nlohmann/json_fwd.hpp>
 
 #include "SegmentationGrowth.hpp"
@@ -31,9 +33,15 @@ public:
     explicit SegmentationWidget(QWidget* parent = nullptr);
 
     [[nodiscard]] bool isEditingEnabled() const { return _editingEnabled; }
-    [[nodiscard]] float radius() const { return _radiusSteps; }
-    [[nodiscard]] float sigma() const { return _sigmaSteps; }
+    [[nodiscard]] float dragRadius() const { return _dragRadiusSteps; }
+    [[nodiscard]] float dragSigma() const { return _dragSigmaSteps; }
+    [[nodiscard]] float lineRadius() const { return _lineRadiusSteps; }
+    [[nodiscard]] float lineSigma() const { return _lineSigmaSteps; }
+    [[nodiscard]] float pushPullRadius() const { return _pushPullRadiusSteps; }
+    [[nodiscard]] float pushPullSigma() const { return _pushPullSigmaSteps; }
     [[nodiscard]] float pushPullStep() const { return _pushPullStep; }
+    [[nodiscard]] bool alphaPushPullEnabled() const { return _alphaPushPullEnabled; }
+    [[nodiscard]] AlphaPushPullConfig alphaPushPullConfig() const;
     [[nodiscard]] float smoothingStrength() const { return _smoothStrength; }
     [[nodiscard]] int smoothingIterations() const { return _smoothIterations; }
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const { return _growthMethod; }
@@ -45,9 +53,15 @@ public:
 
     void setPendingChanges(bool pending);
     void setEditingEnabled(bool enabled);
-    void setRadius(float value);
-    void setSigma(float value);
+    void setDragRadius(float value);
+    void setDragSigma(float value);
+    void setLineRadius(float value);
+    void setLineSigma(float value);
+    void setPushPullRadius(float value);
+    void setPushPullSigma(float value);
     void setPushPullStep(float value);
+    void setAlphaPushPullEnabled(bool enabled);
+    void setAlphaPushPullConfig(const AlphaPushPullConfig& config);
     void setSmoothingStrength(float value);
     void setSmoothingIterations(int value);
     void setGrowthMethod(SegmentationGrowthMethod method);
@@ -73,10 +87,16 @@ public:
 
 signals:
     void editingModeChanged(bool enabled);
-    void radiusChanged(float value);
-    void sigmaChanged(float value);
+    void dragRadiusChanged(float value);
+    void dragSigmaChanged(float value);
+    void lineRadiusChanged(float value);
+    void lineSigmaChanged(float value);
+    void pushPullRadiusChanged(float value);
+    void pushPullSigmaChanged(float value);
     void growthMethodChanged(SegmentationGrowthMethod method);
     void pushPullStepChanged(float value);
+    void alphaPushPullModeChanged(bool enabled);
+    void alphaPushPullConfigChanged();
     void smoothingStrengthChanged(float value);
     void smoothingIterationsChanged(int value);
     void growSurfaceRequested(SegmentationGrowthMethod method,
@@ -117,14 +137,21 @@ private:
     void updateCustomParamsStatus();
     std::optional<nlohmann::json> parseCustomParams(QString* error) const;
     void triggerGrowthRequest(SegmentationGrowthDirection direction, int steps);
+    void applyAlphaPushPullConfig(const AlphaPushPullConfig& config, bool emitSignal, bool persist = true);
 
     bool _editingEnabled{false};
     bool _pending{false};
     bool _growthInProgress{false};
     bool _eraseBrushActive{false};
-    float _radiusSteps{5.75f};
-    float _sigmaSteps{2.0f};
+    float _dragRadiusSteps{5.75f};
+    float _dragSigmaSteps{2.0f};
+    float _lineRadiusSteps{5.75f};
+    float _lineSigmaSteps{2.0f};
+    float _pushPullRadiusSteps{5.75f};
+    float _pushPullSigmaSteps{2.0f};
     float _pushPullStep{4.0f};
+    bool _alphaPushPullEnabled{false};
+    AlphaPushPullConfig _alphaPushPullConfig{};
     float _smoothStrength{0.4f};
     int _smoothIterations{2};
 
@@ -176,9 +203,26 @@ private:
     QSpinBox* _spinCorrectionsZMin{nullptr};
     QSpinBox* _spinCorrectionsZMax{nullptr};
 
-    QDoubleSpinBox* _spinRadius{nullptr};
-    QDoubleSpinBox* _spinSigma{nullptr};
+    QGroupBox* _groupDrag{nullptr};
+    QGroupBox* _groupLine{nullptr};
+    QGroupBox* _groupPushPull{nullptr};
+
+    QDoubleSpinBox* _spinDragRadius{nullptr};
+    QDoubleSpinBox* _spinDragSigma{nullptr};
+    QDoubleSpinBox* _spinLineRadius{nullptr};
+    QDoubleSpinBox* _spinLineSigma{nullptr};
+    QDoubleSpinBox* _spinPushPullRadius{nullptr};
+    QDoubleSpinBox* _spinPushPullSigma{nullptr};
     QDoubleSpinBox* _spinPushPullStep{nullptr};
+    QWidget* _alphaPushPullPanel{nullptr};
+    QCheckBox* _chkAlphaPushPull{nullptr};
+    QDoubleSpinBox* _spinAlphaStart{nullptr};
+    QDoubleSpinBox* _spinAlphaStop{nullptr};
+    QDoubleSpinBox* _spinAlphaStep{nullptr};
+    QDoubleSpinBox* _spinAlphaLow{nullptr};
+    QDoubleSpinBox* _spinAlphaHigh{nullptr};
+    QDoubleSpinBox* _spinAlphaBorder{nullptr};
+    QSpinBox* _spinAlphaBlurRadius{nullptr};
     QDoubleSpinBox* _spinSmoothStrength{nullptr};
     QSpinBox* _spinSmoothIterations{nullptr};
     QPushButton* _btnApply{nullptr};

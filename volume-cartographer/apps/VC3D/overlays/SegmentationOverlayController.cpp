@@ -75,12 +75,18 @@ void SegmentationOverlayController::setTouchedVertices(const std::vector<VertexM
 void SegmentationOverlayController::setMaskOverlay(const std::vector<cv::Vec3f>& points,
                                                    bool visible,
                                                    float pointRadius,
-                                                   float opacity)
+                                                   float opacity,
+                                                   ViewerOverlayControllerBase::PathRenderMode renderMode,
+                                                   float lineWidth,
+                                                   QColor color)
 {
     _maskPoints = points;
     _maskVisible = visible;
     _maskPointRadius = pointRadius;
     _maskOpacity = opacity;
+    _maskRenderMode = renderMode;
+    _maskLineWidth = lineWidth;
+    _maskColor = std::move(color);
 }
 
 bool SegmentationOverlayController::isOverlayEnabledFor(CVolumeViewer* viewer) const
@@ -99,10 +105,11 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
     if (_maskVisible && !_maskPoints.empty()) {
         ViewerOverlayControllerBase::PathPrimitive maskPath;
         maskPath.points = _maskPoints;
-        maskPath.renderMode = ViewerOverlayControllerBase::PathRenderMode::Points;
+        maskPath.renderMode = _maskRenderMode;
         maskPath.brushShape = ViewerOverlayControllerBase::PathBrushShape::Circle;
         maskPath.pointRadius = _maskPointRadius;
-        maskPath.color = QColor(255, 140, 0);
+        maskPath.lineWidth = _maskLineWidth;
+        maskPath.color = _maskColor;
         maskPath.opacity = _maskOpacity;
         maskPath.z = kMaskZ;
         builder.addPath(maskPath);

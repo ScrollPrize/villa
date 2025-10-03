@@ -2,6 +2,7 @@
 
 #include "ViewerOverlayControllerBase.hpp"
 
+#include <QColor>
 #include <optional>
 #include <vector>
 
@@ -35,7 +36,11 @@ public:
     void setMaskOverlay(const std::vector<cv::Vec3f>& points,
                         bool visible,
                         float pointRadius,
-                        float opacity);
+                        float opacity,
+                        ViewerOverlayControllerBase::PathRenderMode renderMode =
+                            ViewerOverlayControllerBase::PathRenderMode::Points,
+                        float lineWidth = 2.0f,
+                        QColor color = QColor(255, 140, 0));
 
 protected:
     bool isOverlayEnabledFor(CVolumeViewer* viewer) const override;
@@ -65,4 +70,7 @@ private:
     std::vector<cv::Vec3f> _maskPoints;
     float _maskPointRadius{3.0f};
     float _maskOpacity{0.35f};
+    ViewerOverlayControllerBase::PathRenderMode _maskRenderMode{ViewerOverlayControllerBase::PathRenderMode::Points};
+    float _maskLineWidth{2.0f};
+    QColor _maskColor{255, 140, 0};
 };

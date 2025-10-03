@@ -50,6 +50,10 @@ public:
     void setCompositeReverseDirection(bool reverse);
     void setResetViewOnSurfaceChange(bool reset);
     bool isCompositeEnabled() const { return _composite_enabled; }
+    std::shared_ptr<Volume> currentVolume() const { return volume; }
+    ChunkCache* chunkCachePtr() const { return cache; }
+    int datasetScaleIndex() const { return _ds_sd_idx; }
+    float datasetScaleFactor() const { return _ds_scale; }
     VCCollection* pointCollection() const { return _point_collection; }
     uint64_t highlightedPointId() const { return _highlighted_point_id; }
     uint64_t selectedPointId() const { return _selected_point_id; }

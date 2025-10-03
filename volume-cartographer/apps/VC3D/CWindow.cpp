@@ -1138,8 +1138,6 @@ void CWindow::CreateWidgets(void)
         _surf_col,
         _point_collection,
         _segmentationWidget->isEditingEnabled(),
-        _segmentationWidget->radius(),
-        _segmentationWidget->sigma(),
         this);
 
     if (_segmentationModule && _planeSlicingOverlay) {
@@ -1151,6 +1149,10 @@ void CWindow::CreateWidgets(void)
                 }
                 return overlayPtr->isVolumePointNearRotationHandle(viewer, worldPos, 1.5);
             });
+    }
+
+    if (_viewerManager) {
+        _viewerManager->setSegmentationOverlay(_segmentationOverlay.get());
     }
 
     connect(_segmentationModule.get(), &SegmentationModule::editingEnabledChanged,

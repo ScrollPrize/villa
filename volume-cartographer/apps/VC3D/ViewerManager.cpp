@@ -111,11 +111,7 @@ void ViewerManager::setSegmentationOverlay(SegmentationOverlayController* overla
     if (!_segmentationOverlay) {
         return;
     }
-    for (auto* viewer : _viewers) {
-        if (viewer) {
-            _segmentationOverlay->attachViewer(viewer);
-        }
-    }
+    _segmentationOverlay->bindToViewerManager(this);
 }
 
 void ViewerManager::setSegmentationEditActive(bool active)

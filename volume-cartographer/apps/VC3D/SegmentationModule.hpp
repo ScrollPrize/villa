@@ -15,6 +15,7 @@
 #include <opencv2/core.hpp>
 
 #include "SegmentationGrowth.hpp"
+#include "SegmentationPushPullConfig.hpp"
 
 class CSurfaceCollection;
 class CVolumeViewer;
@@ -41,20 +42,21 @@ public:
                        CSurfaceCollection* surfaces,
                        VCCollection* pointCollection,
                        bool editingEnabled,
-                       float radiusSteps,
-                       float sigmaSteps,
                        QObject* parent = nullptr);
 
     [[nodiscard]] bool editingEnabled() const { return _editingEnabled; }
-    [[nodiscard]] float radius() const { return _radiusSteps; }
-    [[nodiscard]] float sigma() const { return _sigmaSteps; }
-
     void setEditingEnabled(bool enabled);
-    void setRadius(float radiusSteps);
-    void setSigma(float sigmaSteps);
+    void setDragRadius(float radiusSteps);
+    void setDragSigma(float sigmaSteps);
+    void setLineRadius(float radiusSteps);
+    void setLineSigma(float sigmaSteps);
+    void setPushPullRadius(float radiusSteps);
+    void setPushPullSigma(float sigmaSteps);
     void setPushPullStepMultiplier(float multiplier);
     void setSmoothingStrength(float strength);
     void setSmoothingIterations(int iterations);
+    void setAlphaPushPullEnabled(bool enabled);
+    void setAlphaPushPullConfig(const AlphaPushPullConfig& config);
 
     void applyEdits();
     void resetEdits();
@@ -95,6 +97,13 @@ signals:
                               int steps);
 
 private:
+    enum class FalloffTool
+    {
+        Drag,
+        Line,
+        PushPull
+    };
+
     struct DragState
     {
         bool active{false};
@@ -154,6 +163,12 @@ private:
     void finishPaintStroke();
     bool applyInvalidationBrush();
 
+    void startLineDragStroke(const cv::Vec3f& worldPos);
+    void extendLineDragStroke(const cv::Vec3f& worldPos, bool forceSample = false);
+    void finishLineDragStroke();
+    bool applyLineDragStroke(const std::vector<cv::Vec3f>& stroke);
+    void clearLineDragStroke();
+
     void handleMousePress(CVolumeViewer* viewer,
                           const cv::Vec3f& worldPos,
                           const cv::Vec3f& surfaceNormal,
@@ -181,6 +196,17 @@ private:
     [[nodiscard]] bool isSegmentationViewer(const CVolumeViewer* viewer) const;
     [[nodiscard]] float gridStepWorld() const;
 
+    void useFalloff(FalloffTool tool);
+    void updateOverlayFalloff(FalloffTool tool);
+    [[nodiscard]] float falloffRadius(FalloffTool tool) const;
+    [[nodiscard]] float falloffSigma(FalloffTool tool) const;
+    [[nodiscard]] std::optional<cv::Vec3f> computeAlphaPushPullTarget(const cv::Vec3f& centerWorld,
+                                                                      const cv::Vec3f& normal,
+                                                                      int direction,
+                                                                      QuadSurface* surface,
+                                                                      CVolumeViewer* viewer,
+                                                                      bool* outUnavailable) const;
+
     void beginDrag(int row, int col, CVolumeViewer* viewer, const cv::Vec3f& worldPos);
     void updateDrag(const cv::Vec3f& worldPos);
     void finishDrag();
@@ -203,8 +229,13 @@ private:
     VCCollection* _pointCollection{nullptr};
 
     bool _editingEnabled{false};
-    float _radiusSteps{5.75f};
-    float _sigmaSteps{2.0f};
+    float _dragRadiusSteps{5.75f};
+    float _dragSigmaSteps{2.0f};
+    float _lineRadiusSteps{5.75f};
+    float _lineSigmaSteps{2.0f};
+    float _pushPullRadiusSteps{5.75f};
+    float _pushPullSigmaSteps{2.0f};
+    FalloffTool _activeFalloff{FalloffTool::Drag};
     float _smoothStrength{0.4f};
     int _smoothIterations{2};
     bool _growthInProgress{false};
@@ -236,7 +267,15 @@ private:
     std::vector<cv::Vec3f> _paintOverlayPoints;
     cv::Vec3f _lastPaintSample{0.0f, 0.0f, 0.0f};
     bool _hasLastPaintSample{false};
+    bool _lineDrawKeyActive{false};
+    bool _lineStrokeActive{false};
+    std::vector<cv::Vec3f> _lineStrokePoints;
+    std::vector<cv::Vec3f> _lineStrokeOverlayPoints;
+    cv::Vec3f _lastLineSample{0.0f, 0.0f, 0.0f};
+    bool _hasLastLineSample{false};
     float _pushPullStepMultiplier{4.00f};
+    bool _alphaPushPullEnabled{false};
+    AlphaPushPullConfig _alphaPushPullConfig{};
     std::optional<std::vector<SegmentationGrowthDirection>> _pendingShortcutDirections;
 
     struct UndoState
