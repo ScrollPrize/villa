@@ -509,22 +509,27 @@ private:
     }
 
     const std::vector<size_t>& get_bucket_offsets(int index) const {
+        // Double-checked locking to avoid locking on every call
         if (!grid_offsets_[index]) {
-            auto bucket_ptr = std::make_shared<std::vector<size_t>>();
-            const auto& descriptor = grid_bucket_descriptors_[index];
-            
-            const char* buckets_start = static_cast<const char*>(mmapped_data_->data) + buckets_offset_in_file_;
-            const char* current_bucket_ptr = buckets_start + descriptor.first;
-            const char* end = static_cast<const char*>(mmapped_data_->data) + mmapped_data_->size;
+            std::lock_guard<std::mutex> lock(bucket_mutex_);
+            // Check again in case another thread created it while we were waiting for the lock
+            if (!grid_offsets_[index]) {
+                auto bucket_ptr = std::make_shared<std::vector<size_t>>();
+                const auto& descriptor = grid_bucket_descriptors_[index];
+                
+                const char* buckets_start = static_cast<const char*>(mmapped_data_->data) + buckets_offset_in_file_;
+                const char* current_bucket_ptr = buckets_start + descriptor.first;
+                const char* end = static_cast<const char*>(mmapped_data_->data) + mmapped_data_->size;
 
-            current_bucket_ptr += sizeof(uint32_t); // Skip num_indices
-            
-            bucket_ptr->reserve(descriptor.second);
-            for (uint32_t j = 0; j < descriptor.second; ++j) {
-                uint32_t path_offset = ntohl(*reinterpret_cast<const uint32_t*>(current_bucket_ptr)); current_bucket_ptr += sizeof(uint32_t);
-                bucket_ptr->push_back(path_offset);
+                current_bucket_ptr += sizeof(uint32_t); // Skip num_indices
+                
+                bucket_ptr->reserve(descriptor.second);
+                for (uint32_t j = 0; j < descriptor.second; ++j) {
+                    uint32_t path_offset = ntohl(*reinterpret_cast<const uint32_t*>(current_bucket_ptr)); current_bucket_ptr += sizeof(uint32_t);
+                    bucket_ptr->push_back(path_offset);
+                }
+                grid_offsets_[index] = bucket_ptr;
             }
-            grid_offsets_[index] = bucket_ptr;
         }
         return *grid_offsets_[index];
     }
@@ -561,6 +566,7 @@ private:
     uint32_t buckets_offset_in_file_;
     std::unique_ptr<MmappedData> mmapped_data_;
     std::shared_ptr<LineSegListCache> cache_;
+    mutable std::mutex bucket_mutex_;
 };
  
 GridStore::GridStore(const cv::Rect& bounds, int cell_size)
