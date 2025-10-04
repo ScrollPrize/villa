@@ -1,6 +1,8 @@
 #include "CWindow.hpp"
 
+#include "WindowRangeWidget.hpp"
 #include <QKeySequence>
+#include <QHBoxLayout>
 #include <QKeyEvent>
 #include <QSettings>
 #include <QMdiArea>
@@ -38,6 +40,7 @@
 #include <QPainter>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cmath>
 #include <limits>
 #include <optional>
@@ -482,6 +485,7 @@ CWindow::CWindow() :
                     statusBar()->showMessage(message, timeout);
                 }
             });
+    _viewerManager->setVolumeOverlay(_volumeOverlay.get());
 
     // create UI widgets
     CreateWidgets();
@@ -538,7 +542,8 @@ CWindow::CWindow() :
                                ui.dockWidgetOpSettings,
                                ui.dockWidgetComposite,
                                ui.dockWidgetVolumes,
-                               ui.dockWidgetLocation }) {
+                               ui.dockWidgetView,
+                               ui.dockWidgetOverlay }) {
         ensureDockWidgetFeatures(dock);
     }
     ensureDockWidgetFeatures(_point_collection_widget);
@@ -1168,19 +1173,42 @@ void CWindow::CreateWidgets(void)
     }
     connect(_point_collection_widget, &CPointCollectionWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
 
-    // Tab the docks - Drawing first, then Seeding, then Tools
+    // Tab the docks - keep Segmentation, Seeding, Point Collections, and Drawing together
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
-    tabifyDockWidget(ui.dockWidgetDistanceTransform, ui.dockWidgetDrawing);
+    tabifyDockWidget(ui.dockWidgetSegmentation, _point_collection_widget);
+    tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDrawing);
     
     // Make Drawing dock the active tab by default
     ui.dockWidgetDrawing->raise();
 
-    // Tab the composite widget with the Volume Package widget on the left dock
-    tabifyDockWidget(ui.dockWidgetVolumes, ui.dockWidgetComposite);
-    
-    // Make Volume Package dock the active tab by default
-    ui.dockWidgetVolumes->show();
-    ui.dockWidgetVolumes->raise();
+    // Keep the view-related docks on the left and grouped together as tabs
+    addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetView);
+    addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetOverlay);
+    addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetComposite);
+
+    auto ensureTabified = [this](QDockWidget* primary, QDockWidget* candidate) {
+        const auto currentTabs = tabifiedDockWidgets(primary);
+        const bool alreadyTabified = std::find(currentTabs.cbegin(), currentTabs.cend(), candidate) != currentTabs.cend();
+        if (!alreadyTabified) {
+            tabifyDockWidget(primary, candidate);
+        }
+    };
+
+    ensureTabified(ui.dockWidgetView, ui.dockWidgetOverlay);
+    ensureTabified(ui.dockWidgetView, ui.dockWidgetComposite);
+
+    const auto tabOrder = tabifiedDockWidgets(ui.dockWidgetView);
+    for (QDockWidget* dock : tabOrder) {
+        tabifyDockWidget(ui.dockWidgetView, dock);
+    }
+
+    ui.dockWidgetView->show();
+    ui.dockWidgetView->raise();
+    QTimer::singleShot(0, this, [this]() {
+        if (ui.dockWidgetView) {
+            ui.dockWidgetView->raise();
+        }
+    });
 
     connect(this, &CWindow::sendOpChainSelected, wOpsList, &OpsList::onOpChainSelected);
     connect(wOpsList, &OpsList::sendOpSelected, wOpsSettings, &OpsSettings::onOpSelected);
@@ -1220,7 +1248,7 @@ void CWindow::CreateWidgets(void)
             setVolume(newVolume);
         });
 
-    auto* chkFilterFocusPoints = ui.chkFilterFocusPoints;
+    auto* filterDropdown = ui.btnFilterDropdown;
     auto* cmbPointSetFilter = ui.cmbPointSetFilter;
     auto* btnPointSetFilterAll = ui.btnPointSetFilterAll;
     auto* btnPointSetFilterNone = ui.btnPointSetFilterNone;
@@ -1229,21 +1257,12 @@ void CWindow::CreateWidgets(void)
     cmbPointSetFilterMode->addItem("All (AND)");
     ui.pointSetFilterLayout->insertWidget(1, cmbPointSetFilterMode);
 
-    SurfacePanelController::FilterUiRefs filterUi{
-        .focusPoints = chkFilterFocusPoints,
-        .pointSet = cmbPointSetFilter,
-        .pointSetAll = btnPointSetFilterAll,
-        .pointSetNone = btnPointSetFilterNone,
-        .pointSetMode = cmbPointSetFilterMode,
-        .unreviewed = ui.chkFilterUnreviewed,
-        .revisit = ui.chkFilterRevisit,
-        .noExpansion = ui.chkFilterNoExpansion,
-        .noDefective = ui.chkFilterNoDefective,
-        .partialReview = ui.chkFilterPartialReview,
-        .hideUnapproved = ui.chkFilterHideUnapproved,
-        .inspectOnly = ui.chkFilterInspectOnly,
-        .currentOnly = ui.chkFilterCurrentOnly,
-    };
+    SurfacePanelController::FilterUiRefs filterUi;
+    filterUi.dropdown = filterDropdown;
+    filterUi.pointSet = cmbPointSetFilter;
+    filterUi.pointSetAll = btnPointSetFilterAll;
+    filterUi.pointSetNone = btnPointSetFilterNone;
+    filterUi.pointSetMode = cmbPointSetFilterMode;
     _surfacePanel->configureFilters(filterUi, _point_collection);
 
     SurfacePanelController::TagUiRefs tagUi{
@@ -1294,6 +1313,98 @@ void CWindow::CreateWidgets(void)
     
     connect(btnZoomIn, &QPushButton::clicked, this, &CWindow::onZoomIn);
     connect(btnZoomOut, &QPushButton::clicked, this, &CWindow::onZoomOut);
+
+    if (auto* volumeContainer = ui.volumeWindowContainer) {
+        auto* layout = new QHBoxLayout(volumeContainer);
+        layout->setContentsMargins(0, 0, 0, 0);
+        layout->setSpacing(6);
+
+        _volumeWindowWidget = new WindowRangeWidget(volumeContainer);
+        _volumeWindowWidget->setRange(0, 255);
+        _volumeWindowWidget->setMinimumSeparation(1);
+        _volumeWindowWidget->setControlsEnabled(false);
+        layout->addWidget(_volumeWindowWidget);
+
+        connect(_volumeWindowWidget, &WindowRangeWidget::windowValuesChanged,
+                this, [this](int low, int high) {
+                    if (_viewerManager) {
+                        _viewerManager->setVolumeWindow(static_cast<float>(low),
+                                                        static_cast<float>(high));
+                    }
+                });
+
+        if (_viewerManager) {
+            connect(_viewerManager.get(), &ViewerManager::volumeWindowChanged,
+                    this, [this](float low, float high) {
+                        if (!_volumeWindowWidget) {
+                            return;
+                        }
+                        const int lowInt = static_cast<int>(std::lround(low));
+                        const int highInt = static_cast<int>(std::lround(high));
+                        _volumeWindowWidget->setWindowValues(lowInt, highInt);
+                    });
+
+            _volumeWindowWidget->setWindowValues(
+                static_cast<int>(std::lround(_viewerManager->volumeWindowLow())),
+                static_cast<int>(std::lround(_viewerManager->volumeWindowHigh())));
+        }
+
+        const bool viewEnabled = !ui.grpVolManager || ui.grpVolManager->isEnabled();
+        _volumeWindowWidget->setControlsEnabled(viewEnabled);
+    }
+
+    if (auto* container = ui.overlayWindowContainer) {
+        auto* layout = new QHBoxLayout(container);
+        layout->setContentsMargins(0, 0, 0, 0);
+        layout->setSpacing(6);
+
+        _overlayWindowWidget = new WindowRangeWidget(container);
+        _overlayWindowWidget->setRange(0, 255);
+        _overlayWindowWidget->setMinimumSeparation(1);
+        _overlayWindowWidget->setControlsEnabled(false);
+        layout->addWidget(_overlayWindowWidget);
+
+        connect(_overlayWindowWidget, &WindowRangeWidget::windowValuesChanged,
+                this, [this](int low, int high) {
+                    if (_viewerManager) {
+                        _viewerManager->setOverlayWindow(static_cast<float>(low),
+                                                         static_cast<float>(high));
+                    }
+                });
+
+        if (_viewerManager) {
+            connect(_viewerManager.get(), &ViewerManager::overlayWindowChanged,
+                    this, [this](float low, float high) {
+                        if (!_overlayWindowWidget) {
+                            return;
+                        }
+                        const int lowInt = static_cast<int>(std::lround(low));
+                        const int highInt = static_cast<int>(std::lround(high));
+                        _overlayWindowWidget->setWindowValues(lowInt, highInt);
+                    });
+
+            _overlayWindowWidget->setWindowValues(
+                static_cast<int>(std::lround(_viewerManager->overlayWindowLow())),
+                static_cast<int>(std::lround(_viewerManager->overlayWindowHigh())));
+        }
+    }
+
+    if (_viewerManager && _overlayWindowWidget) {
+        connect(_viewerManager.get(), &ViewerManager::overlayVolumeAvailabilityChanged,
+                this, [this](bool hasOverlay) {
+                    if (!_overlayWindowWidget) {
+                        return;
+                    }
+                    const bool viewEnabled = !ui.grpVolManager || ui.grpVolManager->isEnabled();
+                    _overlayWindowWidget->setControlsEnabled(hasOverlay && viewEnabled);
+                });
+    }
+
+    if (_overlayWindowWidget) {
+        const bool hasOverlay = _volumeOverlay && _volumeOverlay->hasOverlaySelection();
+        const bool viewEnabled = !ui.grpVolManager || ui.grpVolManager->isEnabled();
+        _overlayWindowWidget->setControlsEnabled(hasOverlay && viewEnabled);
+    }
 
     auto* spinIntersectionOpacity = ui.spinIntersectionOpacity;
     const int savedIntersectionOpacity = settings.value("viewer/intersection_opacity",
@@ -1483,6 +1594,13 @@ void CWindow::closeEvent(QCloseEvent* event)
 void CWindow::setWidgetsEnabled(bool state)
 {
     ui.grpVolManager->setEnabled(state);
+    if (_volumeWindowWidget) {
+        _volumeWindowWidget->setControlsEnabled(state);
+    }
+    if (_overlayWindowWidget) {
+        const bool hasOverlay = _volumeOverlay && _volumeOverlay->hasOverlaySelection();
+        _overlayWindowWidget->setControlsEnabled(state && hasOverlay);
+    }
 }
 
 auto CWindow::InitializeVolumePkg(const std::string& nVpkgPath) -> bool

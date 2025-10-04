@@ -665,14 +665,19 @@ void SegmentationModule::setInvalidationBrushActive(bool active)
         return;
     }
 
-    const bool shouldEnable = active && _editingEnabled && !_growthInProgress && !(_corrections && _corrections->annotateMode()) &&
-                              _editManager && _editManager->hasSession();
+    const bool canUseBrush = _editingEnabled && !_growthInProgress &&
+                             !(_corrections && _corrections->annotateMode()) &&
+                             _editManager && _editManager->hasSession();
+    const bool shouldEnable = active && canUseBrush;
 
     if (!shouldEnable) {
         if (_brushTool->brushActive()) {
             _brushTool->setActive(false);
         }
-        _brushTool->clear();
+        // Only discard pending strokes when brush use is no longer possible.
+        if (!canUseBrush) {
+            _brushTool->clear();
+        }
         return;
     }
 

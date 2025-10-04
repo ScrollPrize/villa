@@ -53,6 +53,7 @@ class SegmentationModule;
 class SurfacePanelController;
 class MenuActionController;
 class SegmentationGrower;
+class WindowRangeWidget;
 
 class CWindow : public QMainWindow
 {
@@ -180,8 +181,10 @@ private:
     QLineEdit* lblLocFocus;
     QDoubleSpinBox* spNorm[3];
     QPushButton* btnZoomIn;
-    QPushButton* btnZoomOut;
-    QCheckBox* chkAxisAlignedSlices;
+   QPushButton* btnZoomOut;
+   QCheckBox* chkAxisAlignedSlices;
+    WindowRangeWidget* _volumeWindowWidget{nullptr};
+    WindowRangeWidget* _overlayWindowWidget{nullptr};
 
 
     Ui_VCMainWindow ui;

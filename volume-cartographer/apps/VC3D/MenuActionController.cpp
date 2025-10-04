@@ -182,7 +182,8 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _viewMenu->addAction(qWindow->ui.dockWidgetDrawing->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetOpSettings->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetComposite->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetLocation->toggleViewAction());
+    _viewMenu->addAction(qWindow->ui.dockWidgetView->toggleViewAction());
+    _viewMenu->addAction(qWindow->ui.dockWidgetOverlay->toggleViewAction());
 
     if (qWindow->_point_collection_widget) {
         _viewMenu->addAction(qWindow->_point_collection_widget->toggleViewAction());
