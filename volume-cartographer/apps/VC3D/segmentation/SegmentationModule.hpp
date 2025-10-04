@@ -3,6 +3,7 @@
 #include <QObject>
 #include <QPointer>
 #include <QSet>
+#include <QLoggingCategory>
 
 #include <deque>
 #include <functional>
@@ -19,6 +20,8 @@
 #include "SegmentationUndoHistory.hpp"
 
 namespace segmentation { class CorrectionsState; }
+
+Q_DECLARE_LOGGING_CATEGORY(lcSegModule);
 
 
 class CSurfaceCollection;

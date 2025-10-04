@@ -33,6 +33,9 @@ set(srcs
     segmentation/SegmentationPushPullTool.cpp
     segmentation/SegmentationPushPullTool.hpp
     segmentation/SegmentationTool.hpp
+    segmentation/SegmentationModule_Falloff.cpp
+    segmentation/SegmentationModule_Input.cpp
+    segmentation/SegmentationModule_Session.cpp
     overlays/SegmentationOverlayController.cpp
     overlays/SegmentationOverlayController.hpp
     overlays/PointsOverlayController.cpp
