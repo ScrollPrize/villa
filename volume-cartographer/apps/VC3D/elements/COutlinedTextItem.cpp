@@ -1,4 +1,4 @@
-#include "COutlinedTextItem.hpp"
+#include "elements/COutlinedTextItem.hpp"
 #include <QPainterPath>
 #include <QPen>
 
@@ -41,5 +41,4 @@ QRectF COutlinedTextItem::boundingRect() const
 {
     return QGraphicsTextItem::boundingRect().adjusted(-5,-5,5,5);
 }
-
 

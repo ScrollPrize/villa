@@ -1,4 +1,4 @@
-#include "ProgressUtil.hpp"
+#include "elements/ProgressUtil.hpp"
 
 
 
@@ -49,5 +49,4 @@ void ProgressUtil::updateAnimation()
     _animFrame = (_animFrame + 1) % 4;
     if (_statusBar) _statusBar->showMessage(_message + " " + animChars[_animFrame], 0);
 }
-
 

@@ -9,6 +9,12 @@ set(srcs
     CWindowContextMenu.cpp
     CVolumeViewer.cpp
     CVolumeViewerView.cpp
+    VolumeViewerCmaps.cpp
+    VolumeViewerCmaps.hpp
+    WindowRangeWidget.cpp
+    WindowRangeWidget.hpp
+    elements/RangeSlider.cpp
+    elements/RangeSlider.hpp
     SettingsDialog.cpp
     CSurfaceCollection.cpp
     OpChain.cpp
@@ -67,8 +73,8 @@ set(srcs
     ViewerManager.hpp
     SegmentRenderThread.cpp
     SegmentRenderThread.hpp
-    ProgressUtil.cpp
-    ProgressUtil.hpp
+    elements/ProgressUtil.cpp
+    elements/ProgressUtil.hpp
     CommandLineToolRunner.cpp
     CommandLineToolRunner.hpp
     ToolDialogs.cpp
@@ -76,8 +82,8 @@ set(srcs
     ConsoleOutputWidget.cpp
     ConsoleOutputWidget.hpp
     CPointCollectionWidget.cpp
-    COutlinedTextItem.hpp
-    COutlinedTextItem.cpp
+    elements/COutlinedTextItem.hpp
+    elements/COutlinedTextItem.cpp
 )
 
 if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)
