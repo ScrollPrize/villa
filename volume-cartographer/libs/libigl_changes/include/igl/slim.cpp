@@ -178,7 +178,6 @@ namespace igl
           igl::local_basis(s.V, s.F, F1, F2, F3);
           Eigen::SparseMatrix<double> G;
           igl::grad(s.V, s.F, G);
-          Eigen::SparseMatrix<double> Face_Proj;
 
           auto face_proj = [](Eigen::MatrixXd& F){
             std::vector<Eigen::Triplet<double> >IJV;
@@ -263,13 +262,11 @@ namespace igl
       L = s.AtA;               // Aᵀ W A
       L.makeCompressed();
       L.diagonal().array() += s.proximal_p; // proximal: add to diagonal in-place
-      L.makeCompressed();
 
       #else
-      L = At * s.WGL_M.asDiagonal(f) * A; // Aᵀ (diag(w)) A
+      L = At * s.WGL_M.asDiagonal() * A; // Aᵀ (diag(w)) A
       L.makeCompressed();
       L.diagonal().array() += s.proximal_p; // proximal: add to diagonal in-place
-      L.makeCompressed();
       #endif
 
       #ifdef SLIM_CACHED
@@ -278,7 +275,6 @@ namespace igl
       buildRhs(s, A);
       #endif
 
-      Eigen::SparseMatrix<double> OldL = L;
       add_soft_constraints(s,L);
       L.makeCompressed();
     }
@@ -362,10 +358,6 @@ namespace igl
           f_rhs(i + 8 * s.f_n) = s.W(i, 6) * s.Ri(i, 6) + s.W(i, 7) * s.Ri(i, 7) + s.W(i, 8) * s.Ri(i, 8);
         }
       }
-      Eigen::VectorXd uv_flat(s.dim *s.v_n);
-      for (int i = 0; i < s.dim; i++)
-        for (int j = 0; j < s.v_n; j++)
-          uv_flat(s.v_n * i + j) = s.V_o(j, i);
 
       // Faster RHS: avoid dense diagonal; compute wr = (WGL_M ∘ f_rhs), then Aᵀ wr
       const Eigen::Map<const Eigen::VectorXd> uv_map(s.V_o.data(), s.dim * s.v_n);
