@@ -24,7 +24,9 @@
 #include <QStandardItem>
 #include <QStandardItemModel>
 #include <QStyle>
+#include <QToolButton>
 #include <QWidget>
+#include <QWidgetAction>
 #include <QString>
 #include <QTreeWidget>
 #include <QTreeWidgetItemIterator>
@@ -621,9 +623,64 @@ void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCol
 {
     _filters = filters;
     _pointCollection = pointCollection;
+
+    QMenu* menu = nullptr;
+    if (_filters.dropdown) {
+        menu = _filters.dropdown->menu();
+        if (!menu) {
+            menu = new QMenu(_filters.dropdown);
+            menu->setObjectName(QStringLiteral("menuFilters"));
+            _filters.dropdown->setMenu(menu);
+        }
+        _filters.dropdown->setToolButtonStyle(Qt::ToolButtonTextOnly);
+        _filters.dropdown->setPopupMode(QToolButton::InstantPopup);
+    }
+
+    const bool buildMenuLayout = menu && menu->actions().isEmpty();
+
+    const auto addFilterOption = [&](QCheckBox*& target, const QString& text, const QString& objectName) {
+        const bool created = (target == nullptr);
+        if (created) {
+            target = new QCheckBox(text, menu);
+            target->setObjectName(objectName);
+            if (menu) {
+                auto* action = new QWidgetAction(menu);
+                action->setDefaultWidget(target);
+                menu->addAction(action);
+            } else {
+                target->hide();
+            }
+        } else {
+            target->setText(text);
+            if (!menu) {
+                target->hide();
+            }
+        }
+    };
+
+    addFilterOption(_filters.focusPoints, tr("Focus Point"), QStringLiteral("chkFilterFocusPoints"));
+    if (buildMenuLayout) {
+        menu->addSeparator();
+    }
+    addFilterOption(_filters.unreviewed, tr("Unreviewed"), QStringLiteral("chkFilterUnreviewed"));
+    addFilterOption(_filters.revisit, tr("Revisit"), QStringLiteral("chkFilterRevisit"));
+    addFilterOption(_filters.hideUnapproved, tr("Hide Unapproved"), QStringLiteral("chkFilterHideUnapproved"));
+    if (buildMenuLayout) {
+        menu->addSeparator();
+    }
+    addFilterOption(_filters.noExpansion, tr("Hide Expansion"), QStringLiteral("chkFilterNoExpansion"));
+    addFilterOption(_filters.noDefective, tr("Hide Defective"), QStringLiteral("chkFilterNoDefective"));
+    addFilterOption(_filters.partialReview, tr("Hide Partial Review"), QStringLiteral("chkFilterPartialReview"));
+    addFilterOption(_filters.inspectOnly, tr("Inspect Only"), QStringLiteral("chkFilterInspectOnly"));
+    if (buildMenuLayout) {
+        menu->addSeparator();
+    }
+    addFilterOption(_filters.currentOnly, tr("Current Segment Only"), QStringLiteral("chkFilterCurrentOnly"));
+
     connectFilterSignals();
     rebuildPointSetFilterModel();
     applyFilters();
+    updateFilterSummary();
 }
 
 void SurfacePanelController::configureTags(const TagUiRefs& tags)
@@ -645,6 +702,7 @@ void SurfacePanelController::applyFilters()
         return;
     }
     applyFiltersInternal();
+    updateFilterSummary();
 }
 
 void SurfacePanelController::syncSelectionUi(const std::string& surfaceId, QuadSurface* surface)
@@ -842,6 +900,37 @@ void SurfacePanelController::rebuildPointSetFilterModel()
         });
 
     _configuringFilters = false;
+    updateFilterSummary();
+}
+
+void SurfacePanelController::updateFilterSummary()
+{
+    if (!_filters.dropdown) {
+        return;
+    }
+
+    int activeFilters = 0;
+    const auto countIfChecked = [&activeFilters](QCheckBox* box) {
+        if (box && box->isChecked()) {
+            ++activeFilters;
+        }
+    };
+
+    countIfChecked(_filters.focusPoints);
+    countIfChecked(_filters.unreviewed);
+    countIfChecked(_filters.revisit);
+    countIfChecked(_filters.hideUnapproved);
+    countIfChecked(_filters.noExpansion);
+    countIfChecked(_filters.noDefective);
+    countIfChecked(_filters.partialReview);
+    countIfChecked(_filters.inspectOnly);
+    countIfChecked(_filters.currentOnly);
+
+    QString label = tr("Filters");
+    if (activeFilters > 0) {
+        label += tr(" (%1)").arg(activeFilters);
+    }
+    _filters.dropdown->setText(label);
 }
 
 void SurfacePanelController::onTagCheckboxToggled()

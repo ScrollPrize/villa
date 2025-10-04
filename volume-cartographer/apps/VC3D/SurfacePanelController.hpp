@@ -22,6 +22,7 @@ class QCheckBox;
 class QComboBox;
 class QPushButton;
 class QStandardItemModel;
+class QToolButton;
 class QuadSurface;
 
 class SurfacePanelController : public QObject
@@ -35,6 +36,7 @@ public:
     };
 
     struct FilterUiRefs {
+        QToolButton* dropdown{nullptr};
         QCheckBox* focusPoints{nullptr};
         QComboBox* pointSet{nullptr};
         QPushButton* pointSetAll{nullptr};
@@ -132,6 +134,7 @@ private:
     void handleDeleteSegments(const QStringList& segmentIds);
     void onTagCheckboxToggled();
     void applyFiltersInternal();
+    void updateFilterSummary();
     void updateTagCheckboxStatesForSurface(QuadSurface* surface);
     void setTagCheckboxEnabled(bool enabledApproved,
                                bool enabledDefective,
