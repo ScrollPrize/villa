@@ -797,8 +797,15 @@ void CWindow::clearSurfaceSelection()
 void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 {
     const bool hadVolume = static_cast<bool>(currentVolume);
+    auto previousVolume = currentVolume;
     POI* existingFocusPoi = _surf_col ? _surf_col->poi("focus") : nullptr;
     currentVolume = newvol;
+
+    if (previousVolume != newvol) {
+        _focusHistory.clear();
+        _focusHistoryIndex = -1;
+        _navigatingFocusHistory = false;
+    }
 
     // Find the volume ID for the current volume
     currentVolumeId.clear();
@@ -895,7 +902,68 @@ void CWindow::toggleVolumeOverlayVisibility()
     }
 }
 
-bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, Surface* source)
+void CWindow::recordFocusHistory(const POI& poi)
+{
+    if (_navigatingFocusHistory) {
+        return;
+    }
+
+    FocusHistoryEntry entry;
+    entry.position = poi.p;
+    entry.normal = poi.n;
+    entry.source = poi.src;
+
+    if (_focusHistoryIndex >= 0 &&
+        _focusHistoryIndex < static_cast<int>(_focusHistory.size())) {
+        const auto& current = _focusHistory[_focusHistoryIndex];
+        const float positionDelta = cv::norm(current.position - entry.position);
+        const float normalDelta = cv::norm(current.normal - entry.normal);
+        if (positionDelta < 1e-4f && normalDelta < 1e-4f && current.source == entry.source) {
+            return;
+        }
+    }
+
+    if (_focusHistoryIndex >= 0 &&
+        _focusHistoryIndex + 1 < static_cast<int>(_focusHistory.size())) {
+        _focusHistory.erase(_focusHistory.begin() + _focusHistoryIndex + 1,
+                            _focusHistory.end());
+    }
+
+    _focusHistory.push_back(entry);
+
+    if (_focusHistory.size() > 10) {
+        _focusHistory.pop_front();
+        if (_focusHistoryIndex > 0) {
+            --_focusHistoryIndex;
+        }
+    }
+
+    _focusHistoryIndex = static_cast<int>(_focusHistory.size()) - 1;
+}
+
+bool CWindow::stepFocusHistory(int direction)
+{
+    if (_focusHistory.empty() || direction == 0 || _focusHistoryIndex < 0) {
+        return false;
+    }
+
+    const int lastIndex = static_cast<int>(_focusHistory.size()) - 1;
+    int targetIndex = _focusHistoryIndex + direction;
+    targetIndex = std::max(0, std::min(targetIndex, lastIndex));
+
+    if (targetIndex == _focusHistoryIndex) {
+        return false;
+    }
+
+    _focusHistoryIndex = targetIndex;
+    _navigatingFocusHistory = true;
+    const auto& entry = _focusHistory[_focusHistoryIndex];
+    centerFocusAt(entry.position, entry.normal, entry.source, false);
+    _navigatingFocusHistory = false;
+    return true;
+}
+
+bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, Surface* source, bool addToHistory)
 {
     if (!_surf_col) {
         return false;
@@ -918,6 +986,10 @@ bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, 
 
     _surf_col->setPOI("focus", focus);
 
+    if (addToHistory) {
+        recordFocusHistory(*focus);
+    }
+
     Surface* orientationSource = focus->src ? focus->src : _surf_col->surface("segmentation");
     applySlicePlaneOrientation(orientationSource);
 
@@ -935,7 +1007,7 @@ bool CWindow::centerFocusOnCursor()
         return false;
     }
 
-    return centerFocusAt(cursor->p, cursor->n, cursor->src);
+    return centerFocusAt(cursor->p, cursor->n, cursor->src, true);
 }
 
 // Create widgets
@@ -1615,6 +1687,18 @@ void CWindow::keyPressEvent(QKeyEvent* event)
         }
     }
 
+    if (event->key() == Qt::Key_F) {
+        if (event->modifiers() == Qt::NoModifier) {
+            stepFocusHistory(-1);
+            event->accept();
+            return;
+        } else if (event->modifiers() == Qt::ControlModifier) {
+            stepFocusHistory(1);
+            event->accept();
+            return;
+        }
+    }
+
     if (_segmentationModule && _segmentationModule->handleKeyPress(event)) {
         return;
     }
@@ -1899,6 +1983,9 @@ void CWindow::CloseVolume(void)
     // Clear the volume package
     fVpkg = nullptr;
     currentVolume = nullptr;
+    _focusHistory.clear();
+    _focusHistoryIndex = -1;
+    _navigatingFocusHistory = false;
     _segmentationGrowthVolumeId.clear();
     updateNormalGridAvailability();
     if (_segmentationWidget) {
@@ -1947,7 +2034,7 @@ void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf
     }
     else if (modifiers & Qt::ControlModifier) {
         std::cout << "clicked on vol loc " << vol_loc << std::endl;
-        centerFocusAt(vol_loc, normal, surf);
+        centerFocusAt(vol_loc, normal, surf, true);
     }
     else {
     }

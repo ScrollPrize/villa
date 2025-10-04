@@ -10,6 +10,7 @@
 #include <QPointF>
 #include <memory>
 #include <vector>
+#include <deque>
 #include "ui_VCMain.h"
 
 #include "vc/ui/VCCollection.hpp"
@@ -127,7 +128,7 @@ private:
     void setVolume(std::shared_ptr<Volume> newvol);
     void updateNormalGridAvailability();
     void toggleVolumeOverlayVisibility();
-    bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, Surface* source);
+    bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, Surface* source, bool addToHistory = false);
     bool centerFocusOnCursor();
 
 private slots:
@@ -218,6 +219,18 @@ private:
     CommandLineToolRunner* _cmdRunner;
     bool _normalGridAvailable{false};
     QString _normalGridPath;
+
+    struct FocusHistoryEntry {
+        cv::Vec3f position;
+        cv::Vec3f normal;
+        Surface* source{nullptr};
+    };
+    std::deque<FocusHistoryEntry> _focusHistory;
+    int _focusHistoryIndex{-1};
+    bool _navigatingFocusHistory{false};
+
+    void recordFocusHistory(const POI& poi);
+    bool stepFocusHistory(int direction);
     
     // Keyboard shortcuts
     QShortcut* fReviewedShortcut;
