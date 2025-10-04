@@ -126,7 +126,7 @@ struct StraightLoss {
         
         if (dot <= T(kStraightAngleCosThreshold)) {
             T penalty = T(kStraightAngleCosThreshold)-dot;
-            residual[0] = T(_w)*(T(1)-dot) + T(_w*100)*penalty;
+            residual[0] = T(_w)*(T(1)-dot) + T(_w*8)*penalty*penalty;
         } else
             residual[0] = T(_w)*(T(1)-dot);
 
