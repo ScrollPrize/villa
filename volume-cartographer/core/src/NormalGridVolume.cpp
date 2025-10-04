@@ -178,7 +178,7 @@
                     double hit_rate = (total == 0) ? 0.0 : (static_cast<double>(hits) / total) * 100.0;
                     if (hit_rate < 99.0)
                         std::cout << "[GridStore Cache] Hitrate Warning Triggered: Hits: " << hits << ", Misses: " << misses << ", Total: " << total << ", Hit Rate: " << std::fixed << std::setprecision(2) << hit_rate << "%" << std::endl;
-                        last_stat_time = now;
+                    last_stat_time = now;
                 }
             }
         }
