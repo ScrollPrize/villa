@@ -90,7 +90,6 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     , _growthSteps(_widget ? _widget->growthSteps() : 5)
 {
     float initialPushPullStep = 4.0f;
-    bool initialAlphaPushPullEnabled = false;
     AlphaPushPullConfig initialAlphaConfig{};
 
     if (_widget) {
@@ -103,7 +102,6 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         initialPushPullStep = std::clamp(_widget->pushPullStep(), 0.05f, 10.0f);
         _smoothStrength = std::clamp(_widget->smoothingStrength(), 0.0f, 1.0f);
         _smoothIterations = std::clamp(_widget->smoothingIterations(), 1, 25);
-        initialAlphaPushPullEnabled = _widget->alphaPushPullEnabled();
         initialAlphaConfig = SegmentationPushPullTool::sanitizeConfig(_widget->alphaPushPullConfig());
     }
 
@@ -116,7 +114,6 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     _lineTool = std::make_unique<SegmentationLineTool>(*this, _editManager, _surfaces, _smoothStrength, _smoothIterations);
     _pushPullTool = std::make_unique<SegmentationPushPullTool>(*this, _editManager, _widget, _overlay, _surfaces);
     _pushPullTool->setStepMultiplier(initialPushPullStep);
-    _pushPullTool->setAlphaEnabled(initialAlphaPushPullEnabled);
     _pushPullTool->setAlphaConfig(initialAlphaConfig);
 
     _corrections = std::make_unique<segmentation::CorrectionsState>(*this, _widget, _pointCollection);
@@ -198,8 +195,6 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::setPushPullRadius);
     connect(_widget, &SegmentationWidget::pushPullSigmaChanged,
             this, &SegmentationModule::setPushPullSigma);
-    connect(_widget, &SegmentationWidget::alphaPushPullModeChanged,
-            this, &SegmentationModule::setAlphaPushPullEnabled);
     connect(_widget, &SegmentationWidget::alphaPushPullConfigChanged,
             this, [this]() {
                 if (_widget) {
@@ -857,9 +852,9 @@ void SegmentationModule::updateHover(CVolumeViewer* viewer, const cv::Vec3f& wor
     }
 }
 
-bool SegmentationModule::startPushPull(int direction)
+bool SegmentationModule::startPushPull(int direction, std::optional<bool> alphaOverride)
 {
-    return _pushPullTool ? _pushPullTool->start(direction) : false;
+    return _pushPullTool ? _pushPullTool->start(direction, alphaOverride) : false;
 }
 
 void SegmentationModule::stopPushPull(int direction)

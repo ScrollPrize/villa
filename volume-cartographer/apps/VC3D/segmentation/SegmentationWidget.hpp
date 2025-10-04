@@ -40,7 +40,6 @@ public:
     [[nodiscard]] float pushPullRadius() const { return _pushPullRadiusSteps; }
     [[nodiscard]] float pushPullSigma() const { return _pushPullSigmaSteps; }
     [[nodiscard]] float pushPullStep() const { return _pushPullStep; }
-    [[nodiscard]] bool alphaPushPullEnabled() const { return _alphaPushPullEnabled; }
     [[nodiscard]] AlphaPushPullConfig alphaPushPullConfig() const;
     [[nodiscard]] float smoothingStrength() const { return _smoothStrength; }
     [[nodiscard]] int smoothingIterations() const { return _smoothIterations; }
@@ -60,7 +59,6 @@ public:
     void setPushPullRadius(float value);
     void setPushPullSigma(float value);
     void setPushPullStep(float value);
-    void setAlphaPushPullEnabled(bool enabled);
     void setAlphaPushPullConfig(const AlphaPushPullConfig& config);
     void setSmoothingStrength(float value);
     void setSmoothingIterations(int value);
@@ -95,7 +93,6 @@ signals:
     void pushPullSigmaChanged(float value);
     void growthMethodChanged(SegmentationGrowthMethod method);
     void pushPullStepChanged(float value);
-    void alphaPushPullModeChanged(bool enabled);
     void alphaPushPullConfigChanged();
     void smoothingStrengthChanged(float value);
     void smoothingIterationsChanged(int value);
@@ -150,7 +147,6 @@ private:
     float _pushPullRadiusSteps{5.75f};
     float _pushPullSigmaSteps{2.0f};
     float _pushPullStep{4.0f};
-    bool _alphaPushPullEnabled{false};
     AlphaPushPullConfig _alphaPushPullConfig{};
     float _smoothStrength{0.4f};
     int _smoothIterations{2};
@@ -184,6 +180,7 @@ private:
     QCheckBox* _chkGrowthDirRight{nullptr};
     QComboBox* _comboVolumes{nullptr};
     QLabel* _lblNormalGrid{nullptr};
+    QLabel* _lblAlphaInfo{nullptr};
 
     QGroupBox* _groupDirectionField{nullptr};
     QLineEdit* _directionFieldPathEdit{nullptr};
@@ -215,7 +212,6 @@ private:
     QDoubleSpinBox* _spinPushPullSigma{nullptr};
     QDoubleSpinBox* _spinPushPullStep{nullptr};
     QWidget* _alphaPushPullPanel{nullptr};
-    QCheckBox* _chkAlphaPushPull{nullptr};
     QCheckBox* _chkAlphaPerVertex{nullptr};
     QDoubleSpinBox* _spinAlphaStart{nullptr};
     QDoubleSpinBox* _spinAlphaStop{nullptr};

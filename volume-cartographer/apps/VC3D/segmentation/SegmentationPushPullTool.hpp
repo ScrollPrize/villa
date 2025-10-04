@@ -34,16 +34,13 @@ public:
     void setStepMultiplier(float multiplier);
     [[nodiscard]] float stepMultiplier() const { return _stepMultiplier; }
 
-    void setAlphaEnabled(bool enabled);
-    [[nodiscard]] bool alphaEnabled() const { return _alphaEnabled; }
-
     void setAlphaConfig(const AlphaPushPullConfig& config);
     [[nodiscard]] const AlphaPushPullConfig& alphaConfig() const { return _alphaConfig; }
 
     static AlphaPushPullConfig sanitizeConfig(const AlphaPushPullConfig& config);
     static bool configsEqual(const AlphaPushPullConfig& lhs, const AlphaPushPullConfig& rhs);
 
-    bool start(int direction);
+    bool start(int direction, std::optional<bool> alphaOverride = std::nullopt);
     void stop(int direction);
     void stopAll();
     bool applyStep();
@@ -76,8 +73,8 @@ private:
     State _state;
     QTimer* _timer{nullptr};
     float _stepMultiplier{4.0f};
-    bool _alphaEnabled{false};
+    bool _activeAlphaEnabled{false};
+    bool _alphaOverrideActive{false};
     AlphaPushPullConfig _alphaConfig{};
     bool _undoCaptured{false};
 };
-

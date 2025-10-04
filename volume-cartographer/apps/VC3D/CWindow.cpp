@@ -592,7 +592,7 @@ CWindow::CWindow() :
         }
     });
     
-    fDrawingModeShortcut = new QShortcut(QKeySequence("D"), this);
+    fDrawingModeShortcut = new QShortcut(QKeySequence("Ctrl+Shift+D"), this);
     fDrawingModeShortcut->setContext(Qt::ApplicationShortcut);
     connect(fDrawingModeShortcut, &QShortcut::activated, [this]() {
         if (_drawingWidget) {
@@ -893,6 +893,49 @@ void CWindow::toggleVolumeOverlayVisibility()
     if (_volumeOverlay) {
         _volumeOverlay->toggleVisibility();
     }
+}
+
+bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, Surface* source)
+{
+    if (!_surf_col) {
+        return false;
+    }
+
+    POI* focus = _surf_col->poi("focus");
+    if (!focus) {
+        focus = new POI;
+    }
+
+    focus->p = position;
+    if (cv::norm(normal) > 0.0) {
+        focus->n = normal;
+    }
+    if (source) {
+        focus->src = source;
+    } else if (!focus->src) {
+        focus->src = _surf_col->surface("segmentation");
+    }
+
+    _surf_col->setPOI("focus", focus);
+
+    Surface* orientationSource = focus->src ? focus->src : _surf_col->surface("segmentation");
+    applySlicePlaneOrientation(orientationSource);
+
+    return true;
+}
+
+bool CWindow::centerFocusOnCursor()
+{
+    if (!_surf_col) {
+        return false;
+    }
+
+    POI* cursor = _surf_col->poi("cursor");
+    if (!cursor) {
+        return false;
+    }
+
+    return centerFocusAt(cursor->p, cursor->n, cursor->src);
 }
 
 // Create widgets
@@ -1565,6 +1608,13 @@ void CWindow::keyPressEvent(QKeyEvent* event)
         return;
     }
 
+    if (event->key() == Qt::Key_R && event->modifiers() == Qt::NoModifier) {
+        if (centerFocusOnCursor()) {
+            event->accept();
+            return;
+        }
+    }
+
     if (_segmentationModule && _segmentationModule->handleKeyPress(event)) {
         return;
     }
@@ -1897,22 +1947,7 @@ void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf
     }
     else if (modifiers & Qt::ControlModifier) {
         std::cout << "clicked on vol loc " << vol_loc << std::endl;
-        //NOTE this comes before the focus poi, so focus is applied by views using these slices
-        //FIXME this assumes a single segmentation ... make configurable and cleaner ...
-        QuadSurface *segment = dynamic_cast<QuadSurface*>(surf);
-        POI *poi = _surf_col->poi("focus");
-        
-        if (!poi)
-            poi = new POI;
-
-        poi->src = surf;
-        poi->p = vol_loc;
-        poi->n = normal;
-        
-        _surf_col->setPOI("focus", poi);
-
-        applySlicePlaneOrientation(segment);
-
+        centerFocusAt(vol_loc, normal, surf);
     }
     else {
     }

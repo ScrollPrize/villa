@@ -198,22 +198,6 @@ void SegmentationModule::setSmoothingIterations(int iterations)
     }
 }
 
-void SegmentationModule::setAlphaPushPullEnabled(bool enabled)
-{
-    if (_pushPullTool && _pushPullTool->alphaEnabled() == enabled) {
-        if (_widget && _widget->alphaPushPullEnabled() != enabled) {
-            _widget->setAlphaPushPullEnabled(enabled);
-        }
-        return;
-    }
-    if (_pushPullTool) {
-        _pushPullTool->setAlphaEnabled(enabled);
-    }
-    if (_widget && _widget->alphaPushPullEnabled() != enabled) {
-        _widget->setAlphaPushPullEnabled(enabled);
-    }
-}
-
 void SegmentationModule::setAlphaPushPullConfig(const AlphaPushPullConfig& config)
 {
     AlphaPushPullConfig sanitized = SegmentationPushPullTool::sanitizeConfig(config);
@@ -230,4 +214,3 @@ void SegmentationModule::setAlphaPushPullConfig(const AlphaPushPullConfig& confi
         _widget->setAlphaPushPullConfig(sanitized);
     }
 }
-

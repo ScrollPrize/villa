@@ -452,6 +452,8 @@ void CVolumeViewer::onCursorMove(QPointF scene_loc)
         if (!cursor)
             cursor = new POI;
         cursor->p = p;
+        cursor->n = n;
+        cursor->src = _surf;
         _surf_col->setPOI("cursor", cursor);
     }
 

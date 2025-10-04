@@ -127,6 +127,8 @@ private:
     void setVolume(std::shared_ptr<Volume> newvol);
     void updateNormalGridAvailability();
     void toggleVolumeOverlayVisibility();
+    bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, Surface* source);
+    bool centerFocusOnCursor();
 
 private slots:
     void onSegmentationDirChanged(int index);

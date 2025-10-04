@@ -69,11 +69,6 @@ void SegmentationPushPullTool::setStepMultiplier(float multiplier)
     _stepMultiplier = std::clamp(multiplier, 0.05f, 10.0f);
 }
 
-void SegmentationPushPullTool::setAlphaEnabled(bool enabled)
-{
-    _alphaEnabled = enabled;
-}
-
 AlphaPushPullConfig SegmentationPushPullTool::sanitizeConfig(const AlphaPushPullConfig& config)
 {
     AlphaPushPullConfig sanitized = config;
@@ -118,7 +113,7 @@ void SegmentationPushPullTool::setAlphaConfig(const AlphaPushPullConfig& config)
     _alphaConfig = sanitizeConfig(config);
 }
 
-bool SegmentationPushPullTool::start(int direction)
+bool SegmentationPushPullTool::start(int direction, std::optional<bool> alphaOverride)
 {
     if (direction == 0) {
         return false;
@@ -140,6 +135,9 @@ bool SegmentationPushPullTool::start(int direction)
     if (!_editManager || !_editManager->hasSession()) {
         return false;
     }
+
+    _activeAlphaEnabled = alphaOverride.value_or(false);
+    _alphaOverrideActive = alphaOverride.has_value();
 
     _state.active = true;
     _state.direction = direction;
@@ -177,6 +175,8 @@ void SegmentationPushPullTool::stopAll()
         _timer->stop();
     }
     _undoCaptured = false;
+    _alphaOverrideActive = false;
+    _activeAlphaEnabled = false;
     if (_module._activeFalloff == SegmentationModule::FalloffTool::PushPull) {
         _module.useFalloff(SegmentationModule::FalloffTool::Drag);
     }
@@ -253,7 +253,7 @@ bool SegmentationPushPullTool::applyStepInternal()
     bool usedAlphaPushPull = false;
     bool usedAlphaPushPullPerVertex = false;
 
-    if (_alphaEnabled && _alphaConfig.perVertex) {
+    if (_activeAlphaEnabled && _alphaConfig.perVertex) {
         const auto& activeSamples = _editManager->activeDrag().samples;
         if (!activeSamples.empty()) {
             bool alphaUnavailable = false;
@@ -358,7 +358,7 @@ bool SegmentationPushPullTool::applyStepInternal()
             usedAlphaPushPull = true;
             usedAlphaPushPullPerVertex = true;
         }
-    } else if (_alphaEnabled) {
+    } else if (_activeAlphaEnabled) {
         bool alphaUnavailable = false;
         auto alphaTarget = computeAlphaTarget(centerWorld,
                           normal,
@@ -437,7 +437,7 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTarget(const cv::
         *outUnavailable = false;
     }
 
-    if (!alphaEnabled() || !viewer || !surface) {
+    if (!_activeAlphaEnabled || !viewer || !surface) {
         return std::nullopt;
     }
 

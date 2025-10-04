@@ -69,7 +69,6 @@ public:
     void setPushPullStepMultiplier(float multiplier);
     void setSmoothingStrength(float strength);
     void setSmoothingIterations(int iterations);
-    void setAlphaPushPullEnabled(bool enabled);
     void setAlphaPushPullConfig(const AlphaPushPullConfig& config);
 
     void applyEdits();
@@ -223,7 +222,7 @@ private:
     void updateHover(CVolumeViewer* viewer, const cv::Vec3f& worldPos);
     [[nodiscard]] bool isNearRotationHandle(CVolumeViewer* viewer, const cv::Vec3f& worldPos) const;
 
-    bool startPushPull(int direction);
+    bool startPushPull(int direction, std::optional<bool> alphaOverride = std::nullopt);
     void stopPushPull(int direction);
     void stopAllPushPull();
     bool applyPushPullStep();

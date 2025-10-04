@@ -67,6 +67,31 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         }
     }
 
+    if (!event->isAutoRepeat() && event->key() == Qt::Key_G &&
+        event->modifiers() == Qt::ControlModifier) {
+        if (!_editingEnabled || _growthInProgress || !_widget || !_widget->isEditingEnabled()) {
+            return false;
+        }
+
+        SegmentationGrowthMethod method = _growthMethod;
+        int steps = std::clamp(_growthSteps, 1, 1024);
+        SegmentationGrowthDirection direction = SegmentationGrowthDirection::All;
+
+        if (_widget) {
+            method = _widget->growthMethod();
+            steps = std::clamp(_widget->growthSteps(), 1, 1024);
+
+            const auto allowed = _widget->allowedGrowthDirections();
+            if (allowed.size() == 1) {
+                direction = allowed.front();
+            }
+        }
+
+        handleGrowSurfaceRequested(method, direction, steps);
+        event->accept();
+        return true;
+    }
+
     if (event->key() == Qt::Key_Escape) {
         if (_drag.active) {
             cancelDrag();
@@ -74,13 +99,19 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         }
     }
 
-    if ((event->key() == Qt::Key_F || event->key() == Qt::Key_G) && event->modifiers() == Qt::NoModifier) {
+    const bool pushPullKey = (event->key() == Qt::Key_A || event->key() == Qt::Key_D);
+    const Qt::KeyboardModifiers pushPullMods = event->modifiers();
+    const bool controlActive = pushPullMods.testFlag(Qt::ControlModifier);
+    const Qt::KeyboardModifiers disallowedMods = pushPullMods &
+                                                 ~(Qt::ControlModifier | Qt::KeypadModifier);
+    if (pushPullKey && disallowedMods == Qt::NoModifier) {
         if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
             return false;
         }
 
-        const int direction = (event->key() == Qt::Key_G) ? 1 : -1;
-        if (startPushPull(direction)) {
+        const int direction = (event->key() == Qt::Key_D) ? 1 : -1;
+        const std::optional<bool> alphaOverride = controlActive ? std::optional<bool>{true} : std::nullopt;
+        if (startPushPull(direction, alphaOverride)) {
             event->accept();
             return true;
         }
@@ -94,6 +125,13 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
     }
 
     if (event->modifiers() == Qt::NoModifier && !event->isAutoRepeat()) {
+        if (event->key() == Qt::Key_6) {
+            const SegmentationGrowthMethod method = _widget ? _widget->growthMethod() : _growthMethod;
+            handleGrowSurfaceRequested(method, SegmentationGrowthDirection::All, 1);
+            event->accept();
+            return true;
+        }
+
         SegmentationGrowthDirection shortcutDirection{SegmentationGrowthDirection::All};
         bool matchedShortcut = true;
         switch (event->key()) {
@@ -151,8 +189,12 @@ bool SegmentationModule::handleKeyRelease(QKeyEvent* event)
         return true;
     }
 
-    if ((event->key() == Qt::Key_F || event->key() == Qt::Key_G) && event->modifiers() == Qt::NoModifier) {
-        const int direction = (event->key() == Qt::Key_G) ? 1 : -1;
+    const bool pushPullKey = (event->key() == Qt::Key_A || event->key() == Qt::Key_D);
+    const Qt::KeyboardModifiers pushPullMods = event->modifiers();
+    const Qt::KeyboardModifiers disallowedMods = pushPullMods &
+                                                 ~(Qt::ControlModifier | Qt::KeypadModifier);
+    if (pushPullKey && disallowedMods == Qt::NoModifier) {
+        const int direction = (event->key() == Qt::Key_D) ? 1 : -1;
         stopPushPull(direction);
         event->accept();
         return true;

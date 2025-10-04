@@ -17,8 +17,6 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRegularExpression>
-#include <QKeySequence>
-#include <QShortcut>
 #include <QScrollBar>
 #include <QSettings>
 #include <QSignalBlocker>
@@ -46,10 +44,21 @@ constexpr int kGrowDirAllMask = kGrowDirUpBit | kGrowDirDownBit | kGrowDirLeftBi
 constexpr int kCompactDirectionFieldRowLimit = 3;
 
 constexpr float kFloatEpsilon = 1e-4f;
+constexpr float kAlphaOpacityScale = 255.0f;
 
 bool nearlyEqual(float lhs, float rhs)
 {
     return std::fabs(lhs - rhs) < kFloatEpsilon;
+}
+
+float displayOpacityToNormalized(double displayValue)
+{
+    return static_cast<float>(displayValue / kAlphaOpacityScale);
+}
+
+double normalizedOpacityToDisplay(float normalizedValue)
+{
+    return static_cast<double>(normalizedValue * kAlphaOpacityScale);
 }
 
 AlphaPushPullConfig sanitizeAlphaConfig(const AlphaPushPullConfig& config)
@@ -298,7 +307,7 @@ void SegmentationWidget::buildUi()
     _groupDrag = createToolGroup(tr("Drag Brush"), _spinDragRadius, _spinDragSigma);
     _groupLine = createToolGroup(tr("Line Brush (S)"), _spinLineRadius, _spinLineSigma);
 
-    _groupPushPull = new QGroupBox(tr("Push/Pull (F / G)"), falloffGroup);
+    _groupPushPull = new QGroupBox(tr("Push/Pull (A / D, Ctrl for alpha)"), falloffGroup);
     auto* pushGrid = new QGridLayout(_groupPushPull);
     pushGrid->setContentsMargins(8, 8, 8, 8);
     pushGrid->setHorizontalSpacing(12);
@@ -328,9 +337,10 @@ void SegmentationWidget::buildUi()
     pushGrid->addWidget(pushPullLabel, 1, 0);
     pushGrid->addWidget(_spinPushPullStep, 1, 1);
 
-    _chkAlphaPushPull = new QCheckBox(tr("Enable alpha push/pull"), _groupPushPull);
-    _chkAlphaPushPull->setToolTip(tr("Sample volume opacity along the normal and stop push/pull at the configured alpha threshold."));
-    pushGrid->addWidget(_chkAlphaPushPull, 2, 0, 1, 4);
+    _lblAlphaInfo = new QLabel(tr("Hold Ctrl with A/D to sample alpha while pushing or pulling."), _groupPushPull);
+    _lblAlphaInfo->setWordWrap(true);
+    _lblAlphaInfo->setToolTip(tr("Hold Ctrl when starting push/pull to stop at the configured alpha thresholds."));
+    pushGrid->addWidget(_lblAlphaInfo, 2, 0, 1, 4);
 
     _alphaPushPullPanel = new QWidget(_groupPushPull);
     auto* alphaGrid = new QGridLayout(_alphaPushPullPanel);
@@ -387,9 +397,9 @@ void SegmentationWidget::buildUi()
                     tr("Spacing between alpha samples inside the start/stop range; smaller steps follow fine features."));
     addAlphaControl(tr("Border offset"), _spinAlphaBorder, -20.0, 20.0, 0.1, alphaRow++, 1,
                     tr("Extra offset applied after the alpha front is located, keeping a safety margin."));
-    addAlphaControl(tr("Opacity low"), _spinAlphaLow, 0.0, 1.0, 0.01, alphaRow, 0,
+    addAlphaControl(tr("Opacity low"), _spinAlphaLow, 0.0, 255.0, 1.0, alphaRow, 0,
                     tr("Lower bound of the opacity window; voxels below this behave as transparent."));
-    addAlphaControl(tr("Opacity high"), _spinAlphaHigh, 0.0, 1.0, 0.01, alphaRow++, 1,
+    addAlphaControl(tr("Opacity high"), _spinAlphaHigh, 0.0, 255.0, 1.0, alphaRow++, 1,
                     tr("Upper bound of the opacity window; voxels above this are fully opaque."));
 
     const QString blurTooltip = tr("Gaussian blur radius for each sampled slice; higher values smooth noisy volumes before thresholding.");
@@ -626,19 +636,16 @@ void SegmentationWidget::buildUi()
         writeSetting(QStringLiteral("growth_steps"), _growthSteps);
     });
 
-    connect(_btnGrow, &QPushButton::clicked, this, [this]() {
+    const auto triggerConfiguredGrowth = [this]() {
         const auto allowed = allowedGrowthDirections();
-        SegmentationGrowthDirection direction = SegmentationGrowthDirection::All;
+        auto direction = SegmentationGrowthDirection::All;
         if (allowed.size() == 1) {
             direction = allowed.front();
         }
         triggerGrowthRequest(direction, _growthSteps);
-    });
+    };
 
-    auto* growShortcut = new QShortcut(QKeySequence(Qt::Key_6), this);
-    connect(growShortcut, &QShortcut::activated, this, [this]() {
-        triggerGrowthRequest(SegmentationGrowthDirection::All, 1);
-    });
+    connect(_btnGrow, &QPushButton::clicked, this, triggerConfiguredGrowth);
 
     connect(_comboVolumes, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
         if (index < 0) {
@@ -687,11 +694,6 @@ void SegmentationWidget::buildUi()
         emit pushPullStepChanged(_pushPullStep);
     });
 
-    connect(_chkAlphaPushPull, &QCheckBox::toggled, this, [this](bool checked) {
-        setAlphaPushPullEnabled(checked);
-        emit alphaPushPullModeChanged(_alphaPushPullEnabled);
-    });
-
     auto onAlphaValueChanged = [this](auto updater) {
         AlphaPushPullConfig config = _alphaPushPullConfig;
         updater(config);
@@ -715,12 +717,12 @@ void SegmentationWidget::buildUi()
     });
     connect(_spinAlphaLow, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
         onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
-            cfg.low = static_cast<float>(value);
+            cfg.low = displayOpacityToNormalized(value);
         });
     });
     connect(_spinAlphaHigh, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
         onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
-            cfg.high = static_cast<float>(value);
+            cfg.high = displayOpacityToNormalized(value);
         });
     });
     connect(_spinAlphaBorder, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
@@ -932,26 +934,28 @@ void SegmentationWidget::syncUiState()
         _spinPushPullStep->setEnabled(editingActive);
     }
 
-    if (_chkAlphaPushPull) {
-        const QSignalBlocker blocker(_chkAlphaPushPull);
-        _chkAlphaPushPull->setChecked(_alphaPushPullEnabled);
-        _chkAlphaPushPull->setEnabled(editingActive);
+    if (_lblAlphaInfo) {
+        _lblAlphaInfo->setEnabled(editingActive);
     }
 
-    auto updateAlphaSpin = [&](QDoubleSpinBox* spin, float value) {
+    auto updateAlphaSpin = [&](QDoubleSpinBox* spin, float value, bool opacitySpin = false) {
         if (!spin) {
             return;
         }
         const QSignalBlocker blocker(spin);
-        spin->setValue(static_cast<double>(value));
+        if (opacitySpin) {
+            spin->setValue(normalizedOpacityToDisplay(value));
+        } else {
+            spin->setValue(static_cast<double>(value));
+        }
         spin->setEnabled(editingActive);
     };
 
     updateAlphaSpin(_spinAlphaStart, _alphaPushPullConfig.start);
     updateAlphaSpin(_spinAlphaStop, _alphaPushPullConfig.stop);
     updateAlphaSpin(_spinAlphaStep, _alphaPushPullConfig.step);
-    updateAlphaSpin(_spinAlphaLow, _alphaPushPullConfig.low);
-    updateAlphaSpin(_spinAlphaHigh, _alphaPushPullConfig.high);
+    updateAlphaSpin(_spinAlphaLow, _alphaPushPullConfig.low, true);
+    updateAlphaSpin(_spinAlphaHigh, _alphaPushPullConfig.high, true);
     updateAlphaSpin(_spinAlphaBorder, _alphaPushPullConfig.borderOffset);
 
     if (_spinAlphaBlurRadius) {
@@ -1110,7 +1114,6 @@ void SegmentationWidget::restoreSettings()
     _pushPullStep = settings.value(QStringLiteral("push_pull_step"), _pushPullStep).toFloat();
     _pushPullStep = std::clamp(_pushPullStep, 0.05f, 10.0f);
 
-    _alphaPushPullEnabled = settings.value(QStringLiteral("push_pull_alpha_enabled"), _alphaPushPullEnabled).toBool();
     AlphaPushPullConfig storedAlpha = _alphaPushPullConfig;
     storedAlpha.start = settings.value(QStringLiteral("push_pull_alpha_start"), storedAlpha.start).toFloat();
     storedAlpha.stop = settings.value(QStringLiteral("push_pull_alpha_stop"), storedAlpha.stop).toFloat();
@@ -1314,23 +1317,6 @@ AlphaPushPullConfig SegmentationWidget::alphaPushPullConfig() const
     return _alphaPushPullConfig;
 }
 
-void SegmentationWidget::setAlphaPushPullEnabled(bool enabled)
-{
-    if (_alphaPushPullEnabled == enabled) {
-        return;
-    }
-    _alphaPushPullEnabled = enabled;
-    writeSetting(QStringLiteral("push_pull_alpha_enabled"), _alphaPushPullEnabled);
-    if (_chkAlphaPushPull) {
-        const QSignalBlocker blocker(_chkAlphaPushPull);
-        _chkAlphaPushPull->setChecked(_alphaPushPullEnabled);
-        _chkAlphaPushPull->setEnabled(_editingEnabled && !_growthInProgress);
-    }
-    if (_alphaPushPullPanel) {
-        _alphaPushPullPanel->setEnabled(_editingEnabled && !_growthInProgress);
-    }
-}
-
 void SegmentationWidget::setAlphaPushPullConfig(const AlphaPushPullConfig& config)
 {
     applyAlphaPushPullConfig(config, false);
@@ -1386,12 +1372,12 @@ void SegmentationWidget::applyAlphaPushPullConfig(const AlphaPushPullConfig& con
     }
     if (_spinAlphaLow) {
         const QSignalBlocker blocker(_spinAlphaLow);
-        _spinAlphaLow->setValue(static_cast<double>(_alphaPushPullConfig.low));
+        _spinAlphaLow->setValue(normalizedOpacityToDisplay(_alphaPushPullConfig.low));
         _spinAlphaLow->setEnabled(editingActive);
     }
     if (_spinAlphaHigh) {
         const QSignalBlocker blocker(_spinAlphaHigh);
-        _spinAlphaHigh->setValue(static_cast<double>(_alphaPushPullConfig.high));
+        _spinAlphaHigh->setValue(normalizedOpacityToDisplay(_alphaPushPullConfig.high));
         _spinAlphaHigh->setEnabled(editingActive);
     }
     if (_spinAlphaBorder) {
