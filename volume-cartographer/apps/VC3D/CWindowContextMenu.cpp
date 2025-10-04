@@ -366,7 +366,7 @@ private:
         // Success: advance phases
         if (phase_ == Phase::ToObj) {
             if (!QFileInfo::exists(objPath_)) { onFinished_(1, QProcess::NormalExit); return; }
-            progress_->setValue(1);
+            if (progress_) progress_->setValue(1);
             startFlatboi_();
             return;
         }
