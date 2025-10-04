@@ -570,9 +570,9 @@ static int add_continuous_losses(ceres::Problem &problem, const cv::Vec2i &p, Tr
     count += gen_dist_loss(problem, p, {-1,-1}, params, settings);
 
     // (unmasked here; local problems don't revisit the same p many times)
-    count += gen_sdirichlet_loss(problem, p, params, settings, /*eps=*/sdir_eps);
-    count += gen_sdirichlet_loss(problem, p + cv::Vec2i(-1, 0), params, settings, sdir_eps);
-    count += gen_sdirichlet_loss(problem, p + cv::Vec2i( 0,-1), params, settings, sdir_eps);
+    count += gen_sdirichlet_loss(problem, p, params, settings, /*eps=*/1e-8);
+    count += gen_sdirichlet_loss(problem, p + cv::Vec2i(-1, 0), params, settings, 1e-8);
+    count += gen_sdirichlet_loss(problem, p + cv::Vec2i( 0,-1), params, settings, 1e-8);
 
     return count;
 }
@@ -756,9 +756,9 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_dist_loss(5, p, {-1,-1}, loss_status, problem, params, settings);
 
     //symmetrich dirichlet
-    count += conditional_sdirichlet_loss(6, p,                    loss_status, problem, params, settings, /*eps=*/sdir_eps);
-    count += conditional_sdirichlet_loss(6, p + cv::Vec2i(-1, 0), loss_status, problem, params, settings, /*eps=*/sdir_eps);
-    count += conditional_sdirichlet_loss(6, p + cv::Vec2i( 0,-1), loss_status, problem, params, settings, /*eps=*/sdir_eps);
+    count += conditional_sdirichlet_loss(6, p,                    loss_status, problem, params, settings, /*eps=*/1e-8);
+    count += conditional_sdirichlet_loss(6, p + cv::Vec2i(-1, 0), loss_status, problem, params, settings, /*eps=*/1e-8);
+    count += conditional_sdirichlet_loss(6, p + cv::Vec2i( 0,-1), loss_status, problem, params, settings, /*eps=*/1e-8);
 
     //normal field
     count += conditional_direction_loss(9, p, 1, loss_status, problem, params.state, params.dpoints, settings, trace_data.direction_fields);
@@ -941,7 +941,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     float step = params.value("step_size", 20.0f);
     trace_params.unit = step*scale;
     const double sdir_w   = params.value("sdir_weight",  loss_settings[LossType::SDIR]);
-    const double sdir_eps = params.value("sdir_eps",     1e-8);
     loss_settings[LossType::SDIR] = static_cast<float>(sdir_w);
     int rewind_gen = params.value("rewind_gen", -1);
     loss_settings.z_min = params.value("z_min", -1);
