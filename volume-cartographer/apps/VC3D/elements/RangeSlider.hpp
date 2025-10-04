@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QColor>
 #include <QWidget>
 
 class RangeSlider : public QWidget
@@ -13,11 +14,13 @@ public:
     void setValues(int low, int high);
     void setLowValue(int value);
     void setHighValue(int value);
+    void setHandleBorderColor(const QColor& color);
 
     int minimum() const { return _minimum; }
     int maximum() const { return _maximum; }
     int lowValue() const { return _lowValue; }
     int highValue() const { return _highValue; }
+    QColor handleBorderColor() const { return _handleBorderColor; }
 
     void setMinimumSeparation(int separation);
     int minimumSeparation() const { return _minimumSeparation; }
@@ -58,5 +61,5 @@ private:
 
     DragTarget _dragTarget;
     int _dragOffset{}; // pixel delta between cursor and handle center
+    QColor _handleBorderColor;
 };
-

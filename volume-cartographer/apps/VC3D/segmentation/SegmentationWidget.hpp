@@ -24,6 +24,7 @@ class QPlainTextEdit;
 class QPushButton;
 class QSpinBox;
 class QToolButton;
+class CollapsibleSettingsGroup;
 
 class SegmentationWidget : public QWidget
 {
@@ -168,6 +169,7 @@ private:
     double _directionFieldWeight{1.0};
     std::vector<SegmentationDirectionFieldConfig> _directionFields;
     bool _updatingDirectionFieldForm{false};
+    bool _restoringSettings{false};
 
     QCheckBox* _chkEditing{nullptr};
     QLabel* _lblStatus{nullptr};
@@ -182,7 +184,8 @@ private:
     QLabel* _lblNormalGrid{nullptr};
     QLabel* _lblAlphaInfo{nullptr};
 
-    QGroupBox* _groupDirectionField{nullptr};
+    CollapsibleSettingsGroup* _groupEditing{nullptr};
+    CollapsibleSettingsGroup* _groupDirectionField{nullptr};
     QLineEdit* _directionFieldPathEdit{nullptr};
     QToolButton* _directionFieldBrowseButton{nullptr};
     QComboBox* _comboDirectionFieldOrientation{nullptr};
@@ -200,9 +203,9 @@ private:
     QSpinBox* _spinCorrectionsZMin{nullptr};
     QSpinBox* _spinCorrectionsZMax{nullptr};
 
-    QGroupBox* _groupDrag{nullptr};
-    QGroupBox* _groupLine{nullptr};
-    QGroupBox* _groupPushPull{nullptr};
+    CollapsibleSettingsGroup* _groupDrag{nullptr};
+    CollapsibleSettingsGroup* _groupLine{nullptr};
+    CollapsibleSettingsGroup* _groupPushPull{nullptr};
 
     QDoubleSpinBox* _spinDragRadius{nullptr};
     QDoubleSpinBox* _spinDragSigma{nullptr};

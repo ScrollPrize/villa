@@ -14,6 +14,7 @@ namespace
 constexpr int kHandleRadius = 6;
 constexpr int kTrackThickness = 4;
 constexpr int kHorizontalPadding = kHandleRadius;
+constexpr int kHandleBorderWidth = 2;
 }
 
 RangeSlider::RangeSlider(Qt::Orientation orientation, QWidget* parent)
@@ -25,6 +26,7 @@ RangeSlider::RangeSlider(Qt::Orientation orientation, QWidget* parent)
     , _highValue(100)
     , _minimumSeparation(1)
     , _dragTarget(DragTarget::None)
+    , _handleBorderColor(palette().color(QPalette::Highlight))
 {
     setFocusPolicy(Qt::StrongFocus);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
@@ -69,6 +71,15 @@ void RangeSlider::setMinimumSeparation(int separation)
 {
     _minimumSeparation = std::max(0, separation);
     updateValues(_lowValue, _highValue, true);
+}
+
+void RangeSlider::setHandleBorderColor(const QColor& color)
+{
+    if (_handleBorderColor == color) {
+        return;
+    }
+    _handleBorderColor = color;
+    update();
 }
 
 void RangeSlider::updateValues(int low, int high, bool emitSignals)
@@ -155,7 +166,9 @@ void RangeSlider::paintEvent(QPaintEvent* event)
     const QRect highHandle = handleRectForValue(_highValue);
 
     painter.setBrush(palette().color(QPalette::Base));
-    painter.setPen(palette().color(QPalette::Dark));
+    QPen handlePen(_handleBorderColor);
+    handlePen.setWidth(kHandleBorderWidth);
+    painter.setPen(handlePen);
     painter.drawEllipse(lowHandle);
     painter.drawEllipse(highHandle);
 }
@@ -291,4 +304,3 @@ QRect RangeSlider::trackRect() const
     const int centerY = height() / 2;
     return QRect(left, centerY - kTrackThickness / 2, right - left, kTrackThickness);
 }
-

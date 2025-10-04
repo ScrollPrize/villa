@@ -13,6 +13,8 @@ set(srcs
     VolumeViewerCmaps.hpp
     WindowRangeWidget.cpp
     WindowRangeWidget.hpp
+    elements/CollapsibleSettingsGroup.cpp
+    elements/CollapsibleSettingsGroup.hpp
     elements/RangeSlider.cpp
     elements/RangeSlider.hpp
     SettingsDialog.cpp

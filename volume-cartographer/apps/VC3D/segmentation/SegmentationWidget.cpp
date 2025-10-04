@@ -1,5 +1,7 @@
 #include "SegmentationWidget.hpp"
 
+#include "elements/CollapsibleSettingsGroup.hpp"
+
 #include <QAbstractItemView>
 #include <QByteArray>
 #include <QCheckBox>
@@ -272,77 +274,61 @@ void SegmentationWidget::buildUi()
     _lblNormalGrid->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
     layout->addWidget(_lblNormalGrid);
 
-    auto* falloffGroup = new QGroupBox(tr("Editing"), this);
-    auto* falloffLayout = new QVBoxLayout(falloffGroup);
+    _groupEditing = new CollapsibleSettingsGroup(tr("Editing"), this);
+    auto* falloffLayout = _groupEditing->contentLayout();
+    auto* falloffParent = _groupEditing->contentWidget();
 
     auto createToolGroup = [&](const QString& title,
                                QDoubleSpinBox*& radiusSpin,
                                QDoubleSpinBox*& sigmaSpin) {
-        auto* group = new QGroupBox(title, falloffGroup);
-        auto* grid = new QGridLayout(group);
-        grid->setContentsMargins(8, 8, 8, 8);
-        grid->setHorizontalSpacing(12);
-        grid->setVerticalSpacing(8);
-
-        auto* radiusLabel = new QLabel(tr("Radius"), group);
-        radiusSpin = new QDoubleSpinBox(group);
-        radiusSpin->setDecimals(2);
-        radiusSpin->setRange(0.25, 128.0);
-        radiusSpin->setSingleStep(0.25);
-        grid->addWidget(radiusLabel, 0, 0);
-        grid->addWidget(radiusSpin, 0, 1);
-
-        auto* sigmaLabel = new QLabel(tr("Sigma"), group);
-        sigmaSpin = new QDoubleSpinBox(group);
-        sigmaSpin->setDecimals(2);
-        sigmaSpin->setRange(0.05, 64.0);
-        sigmaSpin->setSingleStep(0.1);
-        grid->addWidget(sigmaLabel, 1, 0);
-        grid->addWidget(sigmaSpin, 1, 1);
-
-        grid->setColumnStretch(1, 1);
+        auto* group = new CollapsibleSettingsGroup(title, _groupEditing);
+        radiusSpin = group->addDoubleSpinBox(tr("Radius"), 0.25, 128.0, 0.25);
+        sigmaSpin = group->addDoubleSpinBox(tr("Sigma"), 0.05, 64.0, 0.1);
         return group;
     };
 
     _groupDrag = createToolGroup(tr("Drag Brush"), _spinDragRadius, _spinDragSigma);
     _groupLine = createToolGroup(tr("Line Brush (S)"), _spinLineRadius, _spinLineSigma);
 
-    _groupPushPull = new QGroupBox(tr("Push/Pull (A / D, Ctrl for alpha)"), falloffGroup);
-    auto* pushGrid = new QGridLayout(_groupPushPull);
-    pushGrid->setContentsMargins(8, 8, 8, 8);
+    _groupPushPull = new CollapsibleSettingsGroup(tr("Push/Pull (A / D, Ctrl for alpha)"), _groupEditing);
+    auto* pushGrid = new QGridLayout();
+    pushGrid->setContentsMargins(0, 0, 0, 0);
     pushGrid->setHorizontalSpacing(12);
     pushGrid->setVerticalSpacing(8);
+    _groupPushPull->contentLayout()->addLayout(pushGrid);
 
-    auto* ppRadiusLabel = new QLabel(tr("Radius"), _groupPushPull);
-    _spinPushPullRadius = new QDoubleSpinBox(_groupPushPull);
+    auto* pushParent = _groupPushPull->contentWidget();
+
+    auto* ppRadiusLabel = new QLabel(tr("Radius"), pushParent);
+    _spinPushPullRadius = new QDoubleSpinBox(pushParent);
     _spinPushPullRadius->setDecimals(2);
     _spinPushPullRadius->setRange(0.25, 128.0);
     _spinPushPullRadius->setSingleStep(0.25);
     pushGrid->addWidget(ppRadiusLabel, 0, 0);
     pushGrid->addWidget(_spinPushPullRadius, 0, 1);
 
-    auto* ppSigmaLabel = new QLabel(tr("Sigma"), _groupPushPull);
-    _spinPushPullSigma = new QDoubleSpinBox(_groupPushPull);
+    auto* ppSigmaLabel = new QLabel(tr("Sigma"), pushParent);
+    _spinPushPullSigma = new QDoubleSpinBox(pushParent);
     _spinPushPullSigma->setDecimals(2);
     _spinPushPullSigma->setRange(0.05, 64.0);
     _spinPushPullSigma->setSingleStep(0.1);
     pushGrid->addWidget(ppSigmaLabel, 0, 2);
     pushGrid->addWidget(_spinPushPullSigma, 0, 3);
 
-    auto* pushPullLabel = new QLabel(tr("Step"), _groupPushPull);
-    _spinPushPullStep = new QDoubleSpinBox(_groupPushPull);
+    auto* pushPullLabel = new QLabel(tr("Step"), pushParent);
+    _spinPushPullStep = new QDoubleSpinBox(pushParent);
     _spinPushPullStep->setDecimals(2);
     _spinPushPullStep->setRange(0.05, 10.0);
     _spinPushPullStep->setSingleStep(0.05);
     pushGrid->addWidget(pushPullLabel, 1, 0);
     pushGrid->addWidget(_spinPushPullStep, 1, 1);
 
-    _lblAlphaInfo = new QLabel(tr("Hold Ctrl with A/D to sample alpha while pushing or pulling."), _groupPushPull);
+    _lblAlphaInfo = new QLabel(tr("Hold Ctrl with A/D to sample alpha while pushing or pulling."), pushParent);
     _lblAlphaInfo->setWordWrap(true);
     _lblAlphaInfo->setToolTip(tr("Hold Ctrl when starting push/pull to stop at the configured alpha thresholds."));
     pushGrid->addWidget(_lblAlphaInfo, 2, 0, 1, 4);
 
-    _alphaPushPullPanel = new QWidget(_groupPushPull);
+    _alphaPushPullPanel = new QWidget(pushParent);
     auto* alphaGrid = new QGridLayout(_alphaPushPullPanel);
     alphaGrid->setContentsMargins(0, 0, 0, 0);
     alphaGrid->setHorizontalSpacing(12);
@@ -420,7 +406,7 @@ void SegmentationWidget::buildUi()
     pushGrid->setColumnStretch(1, 1);
     pushGrid->setColumnStretch(3, 1);
 
-    auto setGroupTooltips = [](QGroupBox* group, QDoubleSpinBox* radiusSpin, QDoubleSpinBox* sigmaSpin, const QString& radiusTip, const QString& sigmaTip) {
+    auto setGroupTooltips = [](QWidget* group, QDoubleSpinBox* radiusSpin, QDoubleSpinBox* sigmaSpin, const QString& radiusTip, const QString& sigmaTip) {
         if (group) {
             group->setToolTip(radiusTip + QLatin1Char('\n') + sigmaTip);
         }
@@ -463,8 +449,8 @@ void SegmentationWidget::buildUi()
     falloffLayout->addLayout(pushPullRow);
 
     auto* smoothingRow = new QHBoxLayout();
-    auto* smoothStrengthLabel = new QLabel(tr("Smoothing strength"), falloffGroup);
-    _spinSmoothStrength = new QDoubleSpinBox(falloffGroup);
+    auto* smoothStrengthLabel = new QLabel(tr("Smoothing strength"), falloffParent);
+    _spinSmoothStrength = new QDoubleSpinBox(falloffParent);
     _spinSmoothStrength->setDecimals(2);
     _spinSmoothStrength->setToolTip(tr("Blend edits toward neighboring vertices; higher values smooth more."));
     _spinSmoothStrength->setRange(0.0, 1.0);
@@ -472,8 +458,8 @@ void SegmentationWidget::buildUi()
     smoothingRow->addWidget(smoothStrengthLabel);
     smoothingRow->addWidget(_spinSmoothStrength);
     smoothingRow->addSpacing(12);
-    auto* smoothIterationsLabel = new QLabel(tr("Iterations"), falloffGroup);
-    _spinSmoothIterations = new QSpinBox(falloffGroup);
+    auto* smoothIterationsLabel = new QLabel(tr("Iterations"), falloffParent);
+    _spinSmoothIterations = new QSpinBox(falloffParent);
     _spinSmoothIterations->setRange(1, 25);
     _spinSmoothIterations->setToolTip(tr("Number of smoothing passes applied after growth."));
     _spinSmoothIterations->setSingleStep(1);
@@ -482,72 +468,87 @@ void SegmentationWidget::buildUi()
     smoothingRow->addStretch(1);
     falloffLayout->addLayout(smoothingRow);
 
-    falloffGroup->setLayout(falloffLayout);
-    layout->addWidget(falloffGroup);
+    layout->addWidget(_groupEditing);
 
-    _groupDirectionField = new QGroupBox(tr("Direction Fields"), this);
-    auto* dfLayout = new QVBoxLayout(_groupDirectionField);
+    _groupDirectionField = new CollapsibleSettingsGroup(tr("Direction Fields"), this);
 
-    auto* pathRow = new QHBoxLayout();
-    auto* pathLabel = new QLabel(tr("Zarr folder:"), _groupDirectionField);
-    _directionFieldPathEdit = new QLineEdit(_groupDirectionField);
-    _directionFieldPathEdit->setToolTip(tr("Filesystem path to the direction field zarr folder."));
-    _directionFieldBrowseButton = new QToolButton(_groupDirectionField);
-    _directionFieldBrowseButton->setText(QStringLiteral("..."));
-    _directionFieldBrowseButton->setToolTip(tr("Browse for a direction field dataset on disk."));
-    pathRow->addWidget(pathLabel);
-    pathRow->addWidget(_directionFieldPathEdit, 1);
-    pathRow->addWidget(_directionFieldBrowseButton);
-    dfLayout->addLayout(pathRow);
+    auto* directionParent = _groupDirectionField->contentWidget();
 
-    auto* orientationRow = new QHBoxLayout();
-    auto* orientationLabel = new QLabel(tr("Orientation:"), _groupDirectionField);
-    _comboDirectionFieldOrientation = new QComboBox(_groupDirectionField);
-    _comboDirectionFieldOrientation->setToolTip(tr("Select which axis the direction field describes."));
-    _comboDirectionFieldOrientation->addItem(tr("Normal"), static_cast<int>(SegmentationDirectionFieldOrientation::Normal));
-    _comboDirectionFieldOrientation->addItem(tr("Horizontal"), static_cast<int>(SegmentationDirectionFieldOrientation::Horizontal));
-    _comboDirectionFieldOrientation->addItem(tr("Vertical"), static_cast<int>(SegmentationDirectionFieldOrientation::Vertical));
-    orientationRow->addWidget(orientationLabel);
-    orientationRow->addWidget(_comboDirectionFieldOrientation);
-    orientationRow->addSpacing(12);
-    auto* scaleLabel = new QLabel(tr("Scale level:"), _groupDirectionField);
-    _comboDirectionFieldScale = new QComboBox(_groupDirectionField);
-    _comboDirectionFieldScale->setToolTip(tr("Choose the multiscale level sampled from the direction field."));
-    for (int scale = 0; scale <= 5; ++scale) {
-        _comboDirectionFieldScale->addItem(QString::number(scale), scale);
-    }
-    orientationRow->addWidget(scaleLabel);
-    orientationRow->addWidget(_comboDirectionFieldScale);
-    orientationRow->addSpacing(12);
-    auto* weightLabel = new QLabel(tr("Weight:"), _groupDirectionField);
-    _spinDirectionFieldWeight = new QDoubleSpinBox(_groupDirectionField);
-    _spinDirectionFieldWeight->setDecimals(2);
-    _spinDirectionFieldWeight->setToolTip(tr("Relative influence of this direction field during growth."));
-    _spinDirectionFieldWeight->setRange(0.0, 10.0);
-    _spinDirectionFieldWeight->setSingleStep(0.1);
-    orientationRow->addWidget(weightLabel);
-    orientationRow->addWidget(_spinDirectionFieldWeight);
-    orientationRow->addStretch(1);
-    dfLayout->addLayout(orientationRow);
+    _groupDirectionField->addRow(tr("Zarr folder:"), [&](QHBoxLayout* row) {
+        _directionFieldPathEdit = new QLineEdit(directionParent);
+        _directionFieldPathEdit->setToolTip(tr("Filesystem path to the direction field zarr folder."));
+        _directionFieldBrowseButton = new QToolButton(directionParent);
+        _directionFieldBrowseButton->setText(QStringLiteral("..."));
+        _directionFieldBrowseButton->setToolTip(tr("Browse for a direction field dataset on disk."));
+        row->addWidget(_directionFieldPathEdit, 1);
+        row->addWidget(_directionFieldBrowseButton);
+    }, tr("Filesystem path to the direction field zarr folder."));
 
-    auto* buttonsRow = new QHBoxLayout();
-    _directionFieldAddButton = new QPushButton(tr("Add"), _groupDirectionField);
-    _directionFieldAddButton->setToolTip(tr("Save the current direction field parameters to the list."));
-    _directionFieldRemoveButton = new QPushButton(tr("Remove"), _groupDirectionField);
-    _directionFieldRemoveButton->setToolTip(tr("Delete the selected direction field entry."));
-    _directionFieldRemoveButton->setEnabled(false);
-    buttonsRow->addWidget(_directionFieldAddButton);
-    buttonsRow->addWidget(_directionFieldRemoveButton);
-    buttonsRow->addStretch(1);
-    dfLayout->addLayout(buttonsRow);
+    _groupDirectionField->addRow(tr("Orientation:"), [&](QHBoxLayout* row) {
+        _comboDirectionFieldOrientation = new QComboBox(directionParent);
+        _comboDirectionFieldOrientation->setToolTip(tr("Select which axis the direction field describes."));
+        _comboDirectionFieldOrientation->addItem(tr("Normal"), static_cast<int>(SegmentationDirectionFieldOrientation::Normal));
+        _comboDirectionFieldOrientation->addItem(tr("Horizontal"), static_cast<int>(SegmentationDirectionFieldOrientation::Horizontal));
+        _comboDirectionFieldOrientation->addItem(tr("Vertical"), static_cast<int>(SegmentationDirectionFieldOrientation::Vertical));
+        row->addWidget(_comboDirectionFieldOrientation);
+        row->addSpacing(12);
 
-    _directionFieldList = new QListWidget(_groupDirectionField);
+        auto* scaleLabel = new QLabel(tr("Scale level:"), directionParent);
+        _comboDirectionFieldScale = new QComboBox(directionParent);
+        _comboDirectionFieldScale->setToolTip(tr("Choose the multiscale level sampled from the direction field."));
+        for (int scale = 0; scale <= 5; ++scale) {
+            _comboDirectionFieldScale->addItem(QString::number(scale), scale);
+        }
+        row->addWidget(scaleLabel);
+        row->addWidget(_comboDirectionFieldScale);
+        row->addSpacing(12);
+
+        auto* weightLabel = new QLabel(tr("Weight:"), directionParent);
+        _spinDirectionFieldWeight = new QDoubleSpinBox(directionParent);
+        _spinDirectionFieldWeight->setDecimals(2);
+        _spinDirectionFieldWeight->setToolTip(tr("Relative influence of this direction field during growth."));
+        _spinDirectionFieldWeight->setRange(0.0, 10.0);
+        _spinDirectionFieldWeight->setSingleStep(0.1);
+        row->addWidget(weightLabel);
+        row->addWidget(_spinDirectionFieldWeight);
+        row->addStretch(1);
+    });
+
+    _groupDirectionField->addRow(QString(), [&](QHBoxLayout* row) {
+        _directionFieldAddButton = new QPushButton(tr("Add"), directionParent);
+        _directionFieldAddButton->setToolTip(tr("Save the current direction field parameters to the list."));
+        _directionFieldRemoveButton = new QPushButton(tr("Remove"), directionParent);
+        _directionFieldRemoveButton->setToolTip(tr("Delete the selected direction field entry."));
+        _directionFieldRemoveButton->setEnabled(false);
+        row->addWidget(_directionFieldAddButton);
+        row->addWidget(_directionFieldRemoveButton);
+        row->addStretch(1);
+    });
+
+    _directionFieldList = new QListWidget(directionParent);
     _directionFieldList->setToolTip(tr("Direction field configurations applied during growth."));
     _directionFieldList->setSelectionMode(QAbstractItemView::SingleSelection);
-    dfLayout->addWidget(_directionFieldList);
+    _groupDirectionField->addFullWidthWidget(_directionFieldList);
 
-    _groupDirectionField->setLayout(dfLayout);
     layout->addWidget(_groupDirectionField);
+
+    auto rememberGroupState = [this](CollapsibleSettingsGroup* group, const QString& key) {
+        if (!group) {
+            return;
+        }
+        connect(group, &CollapsibleSettingsGroup::toggled, this, [this, key](bool expanded) {
+            if (_restoringSettings) {
+                return;
+            }
+            writeSetting(key, expanded);
+        });
+    };
+
+    rememberGroupState(_groupEditing, QStringLiteral("group_editing_expanded"));
+    rememberGroupState(_groupDrag, QStringLiteral("group_drag_expanded"));
+    rememberGroupState(_groupLine, QStringLiteral("group_line_expanded"));
+    rememberGroupState(_groupPushPull, QStringLiteral("group_push_pull_expanded"));
+    rememberGroupState(_groupDirectionField, QStringLiteral("group_direction_field_expanded"));
 
     _groupCorrections = new QGroupBox(tr("Corrections"), this);
     auto* correctionsLayout = new QVBoxLayout(_groupCorrections);
@@ -1086,6 +1087,8 @@ void SegmentationWidget::restoreSettings()
     QSettings settings(QStringLiteral("VC.ini"), QSettings::IniFormat);
     settings.beginGroup(settingsGroup());
 
+    _restoringSettings = true;
+
     if (settings.contains(QStringLiteral("drag_radius_steps"))) {
         _dragRadiusSteps = settings.value(QStringLiteral("drag_radius_steps"), _dragRadiusSteps).toFloat();
     } else {
@@ -1162,7 +1165,30 @@ void SegmentationWidget::restoreSettings()
     _customParamsText = settings.value(QStringLiteral("custom_params_text"), QString()).toString();
     validateCustomParamsText();
 
+    const bool editingExpanded = settings.value(QStringLiteral("group_editing_expanded"), true).toBool();
+    const bool dragExpanded = settings.value(QStringLiteral("group_drag_expanded"), true).toBool();
+    const bool lineExpanded = settings.value(QStringLiteral("group_line_expanded"), true).toBool();
+    const bool pushPullExpanded = settings.value(QStringLiteral("group_push_pull_expanded"), true).toBool();
+    const bool directionExpanded = settings.value(QStringLiteral("group_direction_field_expanded"), true).toBool();
+
+    if (_groupEditing) {
+        _groupEditing->setExpanded(editingExpanded);
+    }
+    if (_groupDrag) {
+        _groupDrag->setExpanded(dragExpanded);
+    }
+    if (_groupLine) {
+        _groupLine->setExpanded(lineExpanded);
+    }
+    if (_groupPushPull) {
+        _groupPushPull->setExpanded(pushPullExpanded);
+    }
+    if (_groupDirectionField) {
+        _groupDirectionField->setExpanded(directionExpanded);
+    }
+
     settings.endGroup();
+    _restoringSettings = false;
 }
 
 void SegmentationWidget::writeSetting(const QString& key, const QVariant& value)
