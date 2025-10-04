@@ -568,30 +568,6 @@ CWindow::CWindow() :
     }
 
     // Create application-wide keyboard shortcuts
-    fReviewedShortcut = new QShortcut(QKeySequence("R"), this);
-    fReviewedShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fReviewedShortcut, &QShortcut::activated, [this]() {
-        if (_surfacePanel) {
-            _surfacePanel->toggleTag(SurfacePanelController::Tag::Reviewed);
-        }
-    });
-    
-    fRevisitShortcut = new QShortcut(QKeySequence("Shift+R"), this);
-    fRevisitShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fRevisitShortcut, &QShortcut::activated, [this]() {
-        if (_surfacePanel) {
-            _surfacePanel->toggleTag(SurfacePanelController::Tag::Revisit);
-        }
-    });
-    
-    fDefectiveShortcut = new QShortcut(QKeySequence("Shift+D"), this);
-    fDefectiveShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fDefectiveShortcut, &QShortcut::activated, [this]() {
-        if (_surfacePanel) {
-            _surfacePanel->toggleTag(SurfacePanelController::Tag::Defective);
-        }
-    });
-    
     fDrawingModeShortcut = new QShortcut(QKeySequence("Ctrl+Shift+D"), this);
     fDrawingModeShortcut->setContext(Qt::ApplicationShortcut);
     connect(fDrawingModeShortcut, &QShortcut::activated, [this]() {
@@ -2635,16 +2611,8 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
                 }
             });
         }
-
-        if (fReviewedShortcut) {
-            fReviewedShortcut->setEnabled(false);
-        }
     } else {
         _segmentationModule->endEditingSession();
-
-        if (fReviewedShortcut) {
-            fReviewedShortcut->setEnabled(true);
-        }
     }
 
     const QString message = enabled

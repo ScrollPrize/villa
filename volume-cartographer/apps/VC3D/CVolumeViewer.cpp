@@ -1090,6 +1090,8 @@ void CVolumeViewer::onPOIChanged(std::string name, POI *poi)
                     _center_marker->hide();
                 }
             }
+
+            renderVisible(true);
         }
     }
     else if (name == "cursor") {
