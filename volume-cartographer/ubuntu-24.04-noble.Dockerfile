@@ -115,7 +115,10 @@ WORKDIR /src/libs/flatboi/build
 RUN cmake .. -DCMAKE_BUILD_TYPE=Release \
       -DLIBIGL_WITH_PASTIX=ON \
       -DBLA_VENDOR=OpenBLAS \
-      -DCMAKE_PREFIX_PATH=/usr/local/pastix
+      -DCMAKE_PREFIX_PATH=/usr/local/pastix \
+      -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG" \
+      -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+      -DCMAKE_CXX_FLAGS="-DSLIM_CACHED"
 RUN cmake --build . -j"$(nproc)"
     
 # Install the flatboi binary into PATH before removing /src

@@ -451,10 +451,13 @@ struct Flatboi {
     energies.push_back(data.energy); // iter=0
     if (wblog) wblog->log_energy(data.energy, /*step=*/0);
 
+    std::cout << "PROGRESS 0/" << max_iter << std::endl;
+
     for (int it = 0; it < max_iter; ++it) {
       igl::slim_solve(data, 1);
       energies.push_back(data.energy);
-      std::cout << "[it " << (it+1) << "] E = " << data.energy << "\n";
+      std::cout << "[it " << (it+1) << "] E = " << data.energy << std::endl; // flush
+      std::cout << "PROGRESS " << (it+1) << "/" << max_iter << std::endl;
       if (wblog) wblog->log_energy(data.energy, /*step=*/it+1);
 
       if (((it+1) % 20) == 0) {
@@ -840,6 +843,9 @@ int main(int argc, char** argv) {
   if(!fs::exists(obj_path)) { std::cerr << "File not found: " << obj_path << "\n"; return 1; }
   if(fs::path(obj_path).extension() != ".obj") { std::cerr << "Input must be .obj\n"; return 1; }
 
+  std::ios::sync_with_stdio(false);
+  std::cout.setf(std::ios::unitbuf); // line-buffered: flush on '\n'
+  
   try {
     Flatboi fb(obj_path, iters);
 
