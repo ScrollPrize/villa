@@ -332,7 +332,18 @@ void SurfacePanelController::removeSingleSegmentation(const std::string& segId)
 {
     std::cout << "Removing segmentation: " << segId << std::endl;
 
+    Surface* removedSurface = nullptr;
+    Surface* activeSegSurface = nullptr;
+
     if (_surfaces) {
+        removedSurface = _surfaces->surface(segId);
+        activeSegSurface = _surfaces->surface("segmentation");
+    }
+
+    if (_surfaces) {
+        if (removedSurface && activeSegSurface == removedSurface) {
+            _surfaces->setSurface("segmentation", nullptr);
+        }
         _surfaces->setSurface(segId, nullptr, false);
     }
 
