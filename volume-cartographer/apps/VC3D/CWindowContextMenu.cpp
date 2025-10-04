@@ -253,14 +253,21 @@ private:
         QTimer::singleShot(0, this, [this](){ this->deleteLater(); });
     }
 
+
     void onCanceled_() {
         if (proc_->state() != QProcess::NotRunning) {
             proc_->kill();
             proc_->waitForFinished(3000);
+            
+            // Ensure the process is actually terminated before proceeding
+            if (proc_->state() != QProcess::NotRunning) {
+                return; // Don't proceed with cleanup if process is still running
+            }
         }
         if (QFileInfo::exists(outTemp_) && outTemp_ != outFinal_) {
             QDir(outTemp_).removeRecursively();
         }
+
         w_->statusBar()->showMessage(QObject::tr("SLIM-flatten cancelled"), 5000);
         progress_->close();
         progress_->deleteLater();
