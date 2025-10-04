@@ -388,36 +388,39 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             v_pos_shifted_zyxs = get_zyx_from_patch(v_pos_shifted_ijs, patch)
             v_neg_shifted_zyxs = get_zyx_from_patch(v_neg_shifted_ijs, patch)
 
-            def make_in_out_heatmaps(pos_shifted_zyxs, neg_shifted_zyxs):
-                cond = torch.rand([]) < 0.8
+            def make_in_out_heatmaps(pos_shifted_zyxs, neg_shifted_zyxs, cond, suppress_out=None):
                 if cond:
                     # Conditioning on this direction: include one negative point as input, and all positive as output
+                    assert suppress_out is None
                     in_heatmaps = make_heatmaps([neg_shifted_zyxs[:1]], min_corner_zyx, crop_size)
                     out_heatmaps = make_heatmaps([pos_shifted_zyxs], min_corner_zyx, crop_size)
                 else:
                     # Not conditioning on this direction: include all positive and negative points as output, and nothing as input
                     in_heatmaps = torch.zeros([1, crop_size, crop_size, crop_size])
-                    out_heatmaps = make_heatmaps([pos_shifted_zyxs, neg_shifted_zyxs], min_corner_zyx, crop_size)
-                return in_heatmaps, out_heatmaps, cond
+                    out_points = ([pos_shifted_zyxs] if suppress_out != 'pos' else []) + ([neg_shifted_zyxs] if suppress_out != 'neg' else [])
+                    out_heatmaps = make_heatmaps(out_points, min_corner_zyx, crop_size) if out_points else torch.zeros([pos_shifted_zyxs.shape[0], crop_size, crop_size, crop_size])
+                return in_heatmaps, out_heatmaps
 
             # TODO: is there a nicer way to arrange this that expresses the logic/cases better?
-            # *_in_heatmaps always have a single plane, either the first negative point or empty
-            # *_out_heatmaps always have one plane per step, and may contain only positive or both positive and negative points
-            u_in_heatmaps, u_out_heatmaps, u_cond = make_in_out_heatmaps(u_pos_shifted_zyxs, u_neg_shifted_zyxs)
-            v_in_heatmaps, v_out_heatmaps, v_cond = make_in_out_heatmaps(v_pos_shifted_zyxs, v_neg_shifted_zyxs)
-            if ~u_cond and ~v_cond:
-                # In this case U & V are (nearly) indistinguishable, so don't force the model to separate them
-                u_out_heatmaps = v_out_heatmaps = torch.maximum(u_out_heatmaps, v_out_heatmaps)
+
+            u_cond, v_cond = torch.rand([2]) < 0.75
+
             diag_ij = None
-            if (u_cond ^ v_cond) and torch.rand([]) < 0.5:
-                # With 50% probability, in one-cond case, also condition on a diagonal that is adjacent
-                # to the conditioned-on (1st neg) point
+            suppress_out_u = suppress_out_v = None
+            
+            if (u_cond ^ v_cond) and torch.rand([]) < 0.6:
+                # With 60% probability in one-cond case, also condition on a diagonal that is adjacent
+                # to the conditioned-on (1st neg) point, and suppress output (positive/negative) heatmaps
+                # for the perpendicular (not-cond) direction on the same side as the diagonal
+                diag_is_pos = torch.rand([]) < 0.5
                 if u_cond:
-                    diag_ij = torch.stack([u_neg_shifted_ijs[0, 0], (v_pos_shifted_ijs if torch.rand([]) < 0.5 else v_neg_shifted_ijs)[0, 1]])
+                    diag_ij = torch.stack([u_neg_shifted_ijs[0, 0], (v_pos_shifted_ijs if diag_is_pos else v_neg_shifted_ijs)[0, 1]])
+                    suppress_out_v = 'neg' if diag_is_pos else 'pos'
                 else:
-                    diag_ij = torch.stack([(u_pos_shifted_ijs if torch.rand([]) < 0.5 else u_neg_shifted_ijs)[0, 0], v_neg_shifted_ijs[0, 1]])
+                    diag_ij = torch.stack([(u_pos_shifted_ijs if diag_is_pos else u_neg_shifted_ijs)[0, 0], v_neg_shifted_ijs[0, 1]])
+                    suppress_out_u = 'neg' if diag_is_pos else 'pos'
             if (u_cond & v_cond) and torch.rand([]) < 0.5:
-                # With 50% probability, in two-cond case, also condition on a diagonal in a 'to x from' direction, so
+                # With 50% probability in two-cond case, also condition on a diagonal in a 'to x from' direction, so
                 # adjacent to exactly one of the conditioned-on (1st neg) points
                 if torch.rand([]) < 0.5:
                     diag_ij = torch.stack([u_neg_shifted_ijs[0, 0], v_pos_shifted_ijs[0, 1]])
@@ -429,6 +432,17 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 if not patch.valid_mask[*diag_ij.int()]:
                     continue
                 diag_zyx = get_zyx_from_patch(diag_ij, patch)
+            else:
+                diag_zyx = None
+
+            # *_in_heatmaps always have a single plane, either the first negative point or empty
+            # *_out_heatmaps always have one plane per step, and may contain only positive or both positive and negative points
+            u_in_heatmaps, u_out_heatmaps = make_in_out_heatmaps(u_pos_shifted_zyxs, u_neg_shifted_zyxs, u_cond, suppress_out_u)
+            v_in_heatmaps, v_out_heatmaps = make_in_out_heatmaps(v_pos_shifted_zyxs, v_neg_shifted_zyxs, v_cond, suppress_out_v)
+            if ~u_cond and ~v_cond:
+                # In this case U & V are (nearly) indistinguishable, so don't force the model to separate them
+                u_out_heatmaps = v_out_heatmaps = torch.maximum(u_out_heatmaps, v_out_heatmaps)
+            if diag_zyx is not None:
                 diag_in_heatmaps = make_heatmaps([diag_zyx[None]], min_corner_zyx, crop_size)
             else:
                 diag_in_heatmaps = torch.zeros_like(u_in_heatmaps)
