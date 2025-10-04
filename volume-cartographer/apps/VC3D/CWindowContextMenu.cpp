@@ -350,6 +350,7 @@ private:
             QMessageBox* box = new QMessageBox(QMessageBox::Critical, QObject::tr("Error"),
                                                what + (err.isEmpty()? QString() : ("\n\n" + err)),
                                                QMessageBox::Ok, w_);
+            errorShown_ = true;  // Prevent duplicate error dialogs
             box->setAttribute(Qt::WA_DeleteOnClose);
             QObject::connect(box, &QMessageBox::finished, this, [this]() {
                 if (QFileInfo::exists(outTemp_) && outTemp_ != outFinal_) {
