@@ -2,6 +2,7 @@
 
 #include "ViewerOverlayControllerBase.hpp"
 
+#include <QColor>
 #include <optional>
 #include <vector>
 
@@ -25,17 +26,39 @@ public:
         bool isGrowth{false};
     };
 
+    struct State
+    {
+        enum class FalloffMode
+        {
+            Drag,
+            Line,
+            PushPull
+        };
+
+        std::optional<VertexMarker> activeMarker;
+        std::vector<VertexMarker> neighbours;
+        std::vector<cv::Vec3f> maskPoints;
+        bool maskVisible{false};
+        bool brushActive{false};
+        bool brushStrokeActive{false};
+        bool lineStrokeActive{false};
+        bool hasLineStroke{false};
+        bool pushPullActive{false};
+        FalloffMode falloff{FalloffMode::Drag};
+        float gaussianRadiusSteps{0.0f};
+        float gaussianSigmaSteps{0.0f};
+        float displayRadiusSteps{0.0f};
+        float gridStepWorld{1.0f};
+
+        bool operator==(const State& rhs) const;
+        bool operator!=(const State& rhs) const { return !(*this == rhs); }
+    };
+
     explicit SegmentationOverlayController(CSurfaceCollection* surfaces, QObject* parent = nullptr);
 
     void setEditingEnabled(bool enabled);
     void setEditManager(SegmentationEditManager* manager);
-    void setGaussianParameters(float radiusSteps, float sigmaSteps, float gridStepWorld);
-    void setActiveVertex(std::optional<VertexMarker> marker);
-    void setTouchedVertices(const std::vector<VertexMarker>& markers);
-    void setMaskOverlay(const std::vector<cv::Vec3f>& points,
-                        bool visible,
-                        float pointRadius,
-                        float opacity);
+    void applyState(const State& state);
 
 protected:
     bool isOverlayEnabledFor(CVolumeViewer* viewer) const override;
@@ -46,23 +69,18 @@ private slots:
     void onSurfaceChanged(std::string name, Surface* surface);
 
 private:
-    void buildRadiusOverlay(CVolumeViewer* viewer,
+    void buildRadiusOverlay(const State& state,
+                            CVolumeViewer* viewer,
                             ViewerOverlayControllerBase::OverlayBuilder& builder) const;
-    void buildVertexMarkers(CVolumeViewer* viewer,
+    void buildVertexMarkers(const State& state,
+                            CVolumeViewer* viewer,
                             ViewerOverlayControllerBase::OverlayBuilder& builder) const;
+
+    ViewerOverlayControllerBase::PathPrimitive buildMaskPrimitive(const State& state) const;
+    bool shouldShowMask(const State& state) const;
 
     CSurfaceCollection* _surfaces{nullptr};
     SegmentationEditManager* _editManager{nullptr};
     bool _editingEnabled{false};
-    float _radiusSteps{3.0f};
-    float _sigmaSteps{1.5f};
-    float _gridStepWorld{1.0f};
-
-    std::optional<VertexMarker> _activeVertex;
-    std::vector<VertexMarker> _touchedVertices;
-
-    bool _maskVisible{false};
-    std::vector<cv::Vec3f> _maskPoints;
-    float _maskPointRadius{3.0f};
-    float _maskOpacity{0.35f};
+    std::optional<State> _currentState;
 };

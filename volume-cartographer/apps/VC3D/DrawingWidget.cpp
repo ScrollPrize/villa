@@ -72,9 +72,9 @@ void DrawingWidget::setupUI()
     auto mainLayout = new QVBoxLayout(this);
     
     // Drawing mode toggle button
-    toggleModeButton = new QPushButton("Enable Drawing Mode (D)", this);
+    toggleModeButton = new QPushButton("Enable Drawing Mode (Ctrl+Shift+D)", this);
     toggleModeButton->setCheckable(true);
-    toggleModeButton->setToolTip("Toggle drawing mode on/off (D key)");
+    toggleModeButton->setToolTip("Toggle drawing mode on/off (Ctrl+Shift+D)");
     mainLayout->addWidget(toggleModeButton);
     
     // Info label
@@ -191,7 +191,7 @@ void DrawingWidget::setupUI()
             [this](bool checked) {
                 drawingModeActive = checked;
                 toggleModeButton->setText(checked ? 
-                    "Disable Drawing Mode (D)" : "Enable Drawing Mode (D)");
+                    "Disable Drawing Mode (Ctrl+Shift+D)" : "Enable Drawing Mode (Ctrl+Shift+D)");
                 updateUI();
                 emit sendDrawingModeActive(checked);
             });

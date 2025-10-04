@@ -3,18 +3,30 @@
 #include <QObject>
 #include <QPointer>
 #include <QSet>
+#include <QLoggingCategory>
 
 #include <deque>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
-#include <unordered_set>
 
 #include <opencv2/core.hpp>
 
 #include "SegmentationGrowth.hpp"
+#include "SegmentationPushPullConfig.hpp"
+#include "SegmentationUndoHistory.hpp"
+
+namespace segmentation { class CorrectionsState; }
+
+Q_DECLARE_LOGGING_CATEGORY(lcSegModule);
+
+inline constexpr int kStatusShort = 1500;
+inline constexpr int kStatusMedium = 2000;
+inline constexpr int kStatusLong = 5000;
+
 
 class CSurfaceCollection;
 class CVolumeViewer;
@@ -27,7 +39,9 @@ class SegmentationWidget;
 class VCCollection;
 class ViewerManager;
 class QKeyEvent;
-class QTimer;
+class SegmentationBrushTool;
+class SegmentationLineTool;
+class SegmentationPushPullTool;
 
 class SegmentationModule : public QObject
 {
@@ -41,18 +55,21 @@ public:
                        CSurfaceCollection* surfaces,
                        VCCollection* pointCollection,
                        bool editingEnabled,
-                       float radiusSteps,
-                       float sigmaSteps,
                        QObject* parent = nullptr);
+    ~SegmentationModule();
 
     [[nodiscard]] bool editingEnabled() const { return _editingEnabled; }
-    [[nodiscard]] float radius() const { return _radiusSteps; }
-    [[nodiscard]] float sigma() const { return _sigmaSteps; }
-
     void setEditingEnabled(bool enabled);
-    void setRadius(float radiusSteps);
-    void setSigma(float sigmaSteps);
+    void setDragRadius(float radiusSteps);
+    void setDragSigma(float sigmaSteps);
+    void setLineRadius(float radiusSteps);
+    void setLineSigma(float sigmaSteps);
+    void setPushPullRadius(float radiusSteps);
+    void setPushPullSigma(float sigmaSteps);
     void setPushPullStepMultiplier(float multiplier);
+    void setSmoothingStrength(float strength);
+    void setSmoothingIterations(int iterations);
+    void setAlphaPushPullConfig(const AlphaPushPullConfig& config);
 
     void applyEdits();
     void resetEdits();
@@ -80,6 +97,18 @@ public:
     void clearPendingCorrections();
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
 
+    struct HoverInfo
+    {
+        bool valid{false};
+        int row{0};
+        int col{0};
+        cv::Vec3f world{0.0f, 0.0f, 0.0f};
+        CVolumeViewer* viewer{nullptr};
+    };
+
+    [[nodiscard]] HoverInfo hoverInfo() const;
+    [[nodiscard]] bool isSegmentationViewer(const CVolumeViewer* viewer) const;
+
     void setRotationHandleHitTester(std::function<bool(CVolumeViewer*, const cv::Vec3f&)> tester);
 
 signals:
@@ -93,6 +122,18 @@ signals:
                               int steps);
 
 private:
+    friend class SegmentationBrushTool;
+    friend class SegmentationLineTool;
+    friend class SegmentationPushPullTool;
+    friend class segmentation::CorrectionsState;
+
+    enum class FalloffTool
+    {
+        Drag,
+        Line,
+        PushPull
+    };
+
     struct DragState
     {
         bool active{false};
@@ -118,18 +159,11 @@ private:
         void clear();
     };
 
-    struct PushPullState
-    {
-        bool active{false};
-        int direction{0};
-    };
-
     void bindWidgetSignals();
     void bindViewerSignals(CVolumeViewer* viewer);
 
     void emitPendingChanges();
     void refreshOverlay();
-    void refreshMaskOverlay();
     void updateCorrectionsWidget();
     void setCorrectionsAnnotateMode(bool enabled, bool userInitiated);
     void setActiveCorrectionCollection(uint64_t collectionId, bool userInitiated);
@@ -147,10 +181,8 @@ private:
                                     int steps);
     void setInvalidationBrushActive(bool active);
     void clearInvalidationBrush();
-    void startPaintStroke(const cv::Vec3f& worldPos);
-    void extendPaintStroke(const cv::Vec3f& worldPos, bool forceSample = false);
-    void finishPaintStroke();
-    bool applyInvalidationBrush();
+    void deactivateInvalidationBrush();
+    void clearLineDragStroke();
 
     void handleMousePress(CVolumeViewer* viewer,
                           const cv::Vec3f& worldPos,
@@ -176,9 +208,12 @@ private:
     bool restoreUndoSnapshot();
     void clearUndoStack();
 
-    [[nodiscard]] bool isSegmentationViewer(const CVolumeViewer* viewer) const;
     [[nodiscard]] float gridStepWorld() const;
 
+    void useFalloff(FalloffTool tool);
+    void updateOverlayFalloff(FalloffTool tool);
+    [[nodiscard]] float falloffRadius(FalloffTool tool) const;
+    [[nodiscard]] float falloffSigma(FalloffTool tool) const;
     void beginDrag(int row, int col, CVolumeViewer* viewer, const cv::Vec3f& worldPos);
     void updateDrag(const cv::Vec3f& worldPos);
     void finishDrag();
@@ -187,11 +222,10 @@ private:
     void updateHover(CVolumeViewer* viewer, const cv::Vec3f& worldPos);
     [[nodiscard]] bool isNearRotationHandle(CVolumeViewer* viewer, const cv::Vec3f& worldPos) const;
 
-    bool startPushPull(int direction);
+    bool startPushPull(int direction, std::optional<bool> alphaOverride = std::nullopt);
     void stopPushPull(int direction);
     void stopAllPushPull();
     bool applyPushPullStep();
-    void onPushPullTick();
 
     SegmentationWidget* _widget{nullptr};
     SegmentationEditManager* _editManager{nullptr};
@@ -201,45 +235,35 @@ private:
     VCCollection* _pointCollection{nullptr};
 
     bool _editingEnabled{false};
-    float _radiusSteps{5.75f};
-    float _sigmaSteps{2.0f};
+    float _dragRadiusSteps{5.75f};
+    float _dragSigmaSteps{2.0f};
+    float _lineRadiusSteps{5.75f};
+    float _lineSigmaSteps{2.0f};
+    float _pushPullRadiusSteps{5.75f};
+    float _pushPullSigmaSteps{2.0f};
+    FalloffTool _activeFalloff{FalloffTool::Drag};
+    float _smoothStrength{0.4f};
+    int _smoothIterations{2};
     bool _growthInProgress{false};
     SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Tracer};
     int _growthSteps{10};
-    bool _usingCorrectionsGrowth{false};
-    bool _correctionsAnnotateMode{false};
-    uint64_t _activeCorrectionId{0};
-    std::vector<uint64_t> _pendingCorrectionIds;
-    std::unordered_set<uint64_t> _managedCorrectionIds;
     bool _ignoreSegSurfaceChange{false};
-    bool _correctionsZRangeEnabled{false};
-    int _correctionsZMin{0};
-    int _correctionsZMax{0};
-    std::optional<std::pair<int, int>> _correctionsRange;
+
+    std::unique_ptr<segmentation::CorrectionsState> _corrections;
 
     DragState _drag;
     HoverState _hover;
     QSet<CVolumeViewer*> _attachedViewers;
-    QTimer* _pushPullTimer{nullptr};
-    PushPullState _pushPull;
 
     std::function<bool(CVolumeViewer*, const cv::Vec3f&)> _rotationHandleHitTester;
 
-    bool _invalidationBrushActive{false};
-    bool _paintStrokeActive{false};
-    std::vector<cv::Vec3f> _currentPaintStroke;
-    std::vector<std::vector<cv::Vec3f>> _pendingPaintStrokes;
-    std::vector<cv::Vec3f> _paintOverlayPoints;
-    cv::Vec3f _lastPaintSample{0.0f, 0.0f, 0.0f};
-    bool _hasLastPaintSample{false};
-    float _pushPullStepMultiplier{4.00f};
+    bool _lineDrawKeyActive{false};
     std::optional<std::vector<SegmentationGrowthDirection>> _pendingShortcutDirections;
 
-    struct UndoState
-    {
-        cv::Mat_<cv::Vec3f> points;
-    };
-    std::deque<UndoState> _undoStack;
+    std::unique_ptr<SegmentationBrushTool> _brushTool;
+    std::unique_ptr<SegmentationLineTool> _lineTool;
+    std::unique_ptr<SegmentationPushPullTool> _pushPullTool;
+
+    segmentation::UndoHistory _undoHistory;
     bool _suppressUndoCapture{false};
-    bool _pushPullUndoCaptured{false};
 };

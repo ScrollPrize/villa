@@ -36,6 +36,7 @@ public:
     void refreshVolumeOptions();
     void toggleVisibility();
     bool hasOverlaySelection() const;
+    void syncWindowFromManager(float low, float high);
 
 signals:
     void requestStatusMessage(const QString& message, int timeoutMs);
@@ -51,6 +52,7 @@ private:
     void setColormap(const std::string& id);
     void setOpacity(float value);
     void setThreshold(float value);
+    void setWindowBounds(float low, float high);
 
     void handleVolumeComboChanged(int index);
     void handleColormapChanged(int index);
@@ -67,7 +69,8 @@ private:
     std::string _overlayColormapName;
     float _overlayOpacity{0.5f};
     float _overlayOpacityBeforeToggle{0.5f};
-    float _overlayThreshold{1.0f};
+    float _overlayWindowLow{0.0f};
+    float _overlayWindowHigh{255.0f};
     bool _overlayVisible{false};
 
     std::vector<QMetaObject::Connection> _connections;

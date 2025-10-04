@@ -9,6 +9,16 @@ set(srcs
     CWindowContextMenu.cpp
     CVolumeViewer.cpp
     CVolumeViewerView.cpp
+    VolumeViewerCmaps.cpp
+    VolumeViewerCmaps.hpp
+    WindowRangeWidget.cpp
+    WindowRangeWidget.hpp
+    elements/CollapsibleSettingsGroup.cpp
+    elements/CollapsibleSettingsGroup.hpp
+    elements/DropdownChecklistButton.cpp
+    elements/DropdownChecklistButton.hpp
+    elements/RangeSlider.cpp
+    elements/RangeSlider.hpp
     SettingsDialog.cpp
     CSurfaceCollection.cpp
     OpChain.cpp
@@ -21,11 +31,23 @@ set(srcs
     SeedingWidget.hpp
     DrawingWidget.cpp
     DrawingWidget.hpp
-    SegmentationWidget.cpp
-    SegmentationWidget.hpp
-    SegmentationGrowth.cpp
-    SegmentationEditManager.cpp
-    SegmentationEditManager.hpp
+    segmentation/SegmentationWidget.cpp
+    segmentation/SegmentationWidget.hpp
+    segmentation/SegmentationGrowth.cpp
+    segmentation/SegmentationGrower.cpp
+    segmentation/SegmentationGrower.hpp
+    segmentation/SegmentationEditManager.cpp
+    segmentation/SegmentationEditManager.hpp
+    segmentation/SegmentationBrushTool.cpp
+    segmentation/SegmentationBrushTool.hpp
+    segmentation/SegmentationLineTool.cpp
+    segmentation/SegmentationLineTool.hpp
+    segmentation/SegmentationPushPullTool.cpp
+    segmentation/SegmentationPushPullTool.hpp
+    segmentation/SegmentationTool.hpp
+    segmentation/SegmentationModule_Falloff.cpp
+    segmentation/SegmentationModule_Input.cpp
+    segmentation/SegmentationModule_Session.cpp
     overlays/SegmentationOverlayController.cpp
     overlays/SegmentationOverlayController.hpp
     overlays/PointsOverlayController.cpp
@@ -46,14 +68,17 @@ set(srcs
     SurfacePanelController.hpp
     MenuActionController.cpp
     MenuActionController.hpp
-    SegmentationModule.cpp
-    SegmentationModule.hpp
+    segmentation/SegmentationModule.cpp
+    segmentation/SegmentationModule.hpp
+    segmentation/SegmentationCorrections.cpp
+    segmentation/SegmentationCorrections.hpp
+    segmentation/SegmentationUndoHistory.hpp
     ViewerManager.cpp
     ViewerManager.hpp
     SegmentRenderThread.cpp
     SegmentRenderThread.hpp
-    ProgressUtil.cpp
-    ProgressUtil.hpp
+    elements/ProgressUtil.cpp
+    elements/ProgressUtil.hpp
     CommandLineToolRunner.cpp
     CommandLineToolRunner.hpp
     ToolDialogs.cpp
@@ -61,8 +86,8 @@ set(srcs
     ConsoleOutputWidget.cpp
     ConsoleOutputWidget.hpp
     CPointCollectionWidget.cpp
-    COutlinedTextItem.hpp
-    COutlinedTextItem.cpp
+    elements/COutlinedTextItem.hpp
+    elements/COutlinedTextItem.cpp
 )
 
 if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)
@@ -71,6 +96,11 @@ endif()
 
 
 add_executable(VC3D ${srcs} resources.qrc)
+
+target_include_directories(VC3D
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
 
 target_link_libraries(VC3D
     vc_core

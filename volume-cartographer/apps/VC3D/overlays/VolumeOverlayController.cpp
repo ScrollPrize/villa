@@ -75,14 +75,14 @@ int percentValueFromOpacity(float opacity)
     return static_cast<int>(std::round(std::clamp(opacity, 0.0f, 1.0f) * 100.0f));
 }
 
-float normalizedThresholdFromSpin(int spinValue)
+float windowValueFromSpin(int spinValue)
 {
-    return std::max(0.0f, static_cast<float>(spinValue));
+    return std::clamp(static_cast<float>(spinValue), 0.0f, 255.0f);
 }
 
-int spinValueFromThreshold(float threshold)
+int spinValueFromWindow(float value)
 {
-    const float clamped = std::clamp(threshold, 0.0f, 65535.0f);
+    const float clamped = std::clamp(value, 0.0f, 255.0f);
     return static_cast<int>(std::round(clamped));
 }
 } // namespace
@@ -105,8 +105,8 @@ void VolumeOverlayController::setUi(const UiRefs& ui)
     }
 
     if (_ui.thresholdSpin) {
-        _ui.thresholdSpin->setRange(0, 65535);
-        _ui.thresholdSpin->setValue(spinValueFromThreshold(_overlayThreshold));
+        _ui.thresholdSpin->setRange(0, 255);
+        _ui.thresholdSpin->setValue(spinValueFromWindow(_overlayWindowLow));
     }
 
     populateColormapOptions();
@@ -130,7 +130,7 @@ void VolumeOverlayController::setVolumePkg(const std::shared_ptr<VolumePkg>& pkg
     applyOverlayVolume();
     setColormap(_overlayColormapName);
     setOpacity(_overlayOpacity);
-    setThreshold(_overlayThreshold);
+    setWindowBounds(_overlayWindowLow, _overlayWindowHigh);
     updateUiEnabled();
     _suspendPersistence = false;
 }
@@ -165,19 +165,20 @@ void VolumeOverlayController::clearVolumePkg()
 
     _overlayOpacity = 0.5f;
     _overlayOpacityBeforeToggle = _overlayOpacity;
-    _overlayThreshold = 1.0f;
+    _overlayWindowLow = 0.0f;
+    _overlayWindowHigh = 255.0f;
     if (_ui.opacitySpin) {
         const QSignalBlocker blocker(_ui.opacitySpin);
         _ui.opacitySpin->setValue(percentValueFromOpacity(_overlayOpacity));
     }
     if (_ui.thresholdSpin) {
         const QSignalBlocker blocker(_ui.thresholdSpin);
-        _ui.thresholdSpin->setValue(spinValueFromThreshold(_overlayThreshold));
+        _ui.thresholdSpin->setValue(spinValueFromWindow(_overlayWindowLow));
     }
 
     if (_viewerManager) {
         _viewerManager->setOverlayOpacity(_overlayOpacity);
-        _viewerManager->setOverlayThreshold(_overlayThreshold);
+        _viewerManager->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
         _viewerManager->setOverlayColormap(std::string());
     }
 
@@ -375,12 +376,34 @@ void VolumeOverlayController::updateUiEnabled()
     }
 }
 
+void VolumeOverlayController::syncWindowFromManager(float low, float high)
+{
+    const bool wasSuspended = _suspendPersistence;
+    _suspendPersistence = true;
+
+    _overlayWindowLow = std::clamp(low, 0.0f, 255.0f);
+    const float minHigh = std::min(_overlayWindowLow + 1.0f, 255.0f);
+    _overlayWindowHigh = std::clamp(high, minHigh, 255.0f);
+
+    if (_ui.thresholdSpin) {
+        const QSignalBlocker blocker(_ui.thresholdSpin);
+        _ui.thresholdSpin->setValue(spinValueFromWindow(_overlayWindowLow));
+    }
+
+    _suspendPersistence = wasSuspended;
+
+    if (!wasSuspended) {
+        saveState();
+    }
+}
+
 void VolumeOverlayController::loadState()
 {
     _overlayVolumeId.clear();
     _overlayOpacity = 0.5f;
     _overlayOpacityBeforeToggle = _overlayOpacity;
-    _overlayThreshold = 1.0f;
+    _overlayWindowLow = 0.0f;
+    _overlayWindowHigh = 255.0f;
     _overlayColormapName.clear();
 
     if (_volpkgPath.isEmpty()) {
@@ -403,7 +426,26 @@ void VolumeOverlayController::loadState()
 
     _overlayOpacity = std::clamp(settings.value(QStringLiteral("opacity"), _overlayOpacity).toFloat(), 0.0f, 1.0f);
     _overlayOpacityBeforeToggle = _overlayOpacity;
-    _overlayThreshold = std::max(0.0f, settings.value(QStringLiteral("threshold"), _overlayThreshold).toFloat());
+
+    const QVariant storedWindowLow = settings.value(QStringLiteral("window_low"));
+    if (storedWindowLow.isValid()) {
+        _overlayWindowLow = std::clamp(storedWindowLow.toFloat(), 0.0f, 255.0f);
+    } else {
+        // Fall back to legacy threshold if present.
+        const float legacyThreshold = std::max(0.0f, settings.value(QStringLiteral("threshold"), _overlayWindowLow).toFloat());
+        _overlayWindowLow = std::clamp(legacyThreshold, 0.0f, 255.0f);
+    }
+
+    const QVariant storedWindowHigh = settings.value(QStringLiteral("window_high"));
+    if (storedWindowHigh.isValid()) {
+        _overlayWindowHigh = std::clamp(storedWindowHigh.toFloat(), 0.0f, 255.0f);
+    } else {
+        // Default to full range when no explicit upper bound is stored.
+        _overlayWindowHigh = 255.0f;
+    }
+    if (_overlayWindowHigh <= _overlayWindowLow) {
+        _overlayWindowHigh = std::min(255.0f, _overlayWindowLow + 1.0f);
+    }
 
     const QString storedColormap = settings.value(QStringLiteral("colormap")).toString();
     if (!storedColormap.isEmpty()) {
@@ -431,7 +473,9 @@ void VolumeOverlayController::saveState() const
     settings.setValue(QStringLiteral("path"), _volpkgPath);
     settings.setValue(QStringLiteral("volume_id"), QString::fromStdString(_overlayVolumeId));
     settings.setValue(QStringLiteral("opacity"), _overlayOpacity);
-    settings.setValue(QStringLiteral("threshold"), _overlayThreshold);
+    settings.setValue(QStringLiteral("window_low"), _overlayWindowLow);
+    settings.setValue(QStringLiteral("window_high"), _overlayWindowHigh);
+    settings.setValue(QStringLiteral("threshold"), _overlayWindowLow); // legacy compatibility
     settings.setValue(QStringLiteral("colormap"), QString::fromStdString(_overlayColormapName));
     settings.endGroup();
     settings.endGroup();
@@ -504,16 +548,33 @@ void VolumeOverlayController::setOpacity(float value)
 
 void VolumeOverlayController::setThreshold(float value)
 {
-    const float clamped = std::max(0.0f, std::min(value, 65535.0f));
-    _overlayThreshold = clamped;
+    const float clamped = std::clamp(value, 0.0f, 255.0f);
+    setWindowBounds(clamped, _overlayWindowHigh);
+}
+
+void VolumeOverlayController::setWindowBounds(float low, float high)
+{
+    const float clampedLow = std::clamp(low, 0.0f, 255.0f);
+    float clampedHigh = std::clamp(high, 0.0f, 255.0f);
+    if (clampedHigh <= clampedLow) {
+        clampedHigh = std::min(255.0f, clampedLow + 1.0f);
+    }
+
+    if (std::abs(clampedLow - _overlayWindowLow) < 1e-6f &&
+        std::abs(clampedHigh - _overlayWindowHigh) < 1e-6f) {
+        return;
+    }
+
+    _overlayWindowLow = clampedLow;
+    _overlayWindowHigh = clampedHigh;
 
     if (_ui.thresholdSpin) {
         const QSignalBlocker blocker(_ui.thresholdSpin);
-        _ui.thresholdSpin->setValue(spinValueFromThreshold(_overlayThreshold));
+        _ui.thresholdSpin->setValue(spinValueFromWindow(_overlayWindowLow));
     }
 
     if (_viewerManager) {
-        _viewerManager->setOverlayThreshold(_overlayThreshold);
+        _viewerManager->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
     }
 }
 
@@ -575,7 +636,7 @@ void VolumeOverlayController::handleOpacityChanged(int value)
 
 void VolumeOverlayController::handleThresholdChanged(int value)
 {
-    setThreshold(normalizedThresholdFromSpin(value));
+    setThreshold(windowValueFromSpin(value));
     if (!_suspendPersistence) {
         saveState();
     }

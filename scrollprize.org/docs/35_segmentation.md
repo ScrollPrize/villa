@@ -39,13 +39,6 @@ hide_table_of_contents: true
 
 *Last updated: February 20, 2025*
 
-This tutorial is a practical walkthrough for two of the methods reviewed in the [virtual unwrapping guide](unwrapping). Both of these methods are in active development and as such the content of this page may become outdated (let us know so we can fix it!). For a high-level introduction to the problem these approaches are aiming to solve, check out that [guide](unwrapping).
-
-Both of these methods have pros and cons detailed in the previous walkthrough, in terms of current and future performance. Currently implemented, the primary benefit of the VC3D tracer solution is that the intermediate steps produce immediately usable partial segments, and the entire pipeline save ink detection is self-contained within the VC3D ecosystem. *If you are looking to simply produce exploratory segments for ink detection or other tasks, the tracer has the lowest "startup" time.*
-
-:::tip
-If you want to try out running traces only, and do not want to perform any of the seeding or expansion steps, you can download patches we have generated for some of the scrolls from the links in the [data section](#volume-data), place these in your paths directory, place the uint8 volumes and surface predictions in the volume directory, and skip to [running a trace](#running-a-trace).
-:::
 
 import TOCInline from '@theme/TOCInline';
 
@@ -55,35 +48,58 @@ import TOCInline from '@theme/TOCInline';
   maxHeadingLevel={4}
 />
 
-## Sheet Tracing (VC3D)
-<div className="mb-4">
-  <img src="/img/segmentation/vc3d_gui.png" className="w-[85%]"/>
-</div>
-___
 
-### Installation
-This guide will be written for Ubuntu 24.04, for other operating systems the details may vary slightly. Windows users may benefit from using Windows Subsystem For Linux(WSL2), and placing their volume data within the Linux filesystem. 
-
-**Install Docker Engine for Linux:**
-
-Follow the installation steps [here](https://docs.docker.com/engine/install/ubuntu/).
-
-Ensure your installation is complete by entering. If you get the 'hello world' output from Docker, you're good to go. 
+### Installation Instructions
+Due to a complex set of dependencies, it is *highly* recommended to use the docker image. We host an up-to-date image on the [github container registry](https://github.com/ScrollPrize/villa/pkgs/container/villa%2Fvolume-cartographer) which can be pulled with a simple command :
 
 ```bash
-sudo docker run hello-world
+docker pull ghcr.io/scrollprize/villa/volume-cartographer:edge
 ```
 
-**Pull the container image**
+If you want to install vc3d from source, the easiest path is to look at the [dockerfile](ubuntu-24.04-noble.Dockerfile) and adapt for your environment. Building from source presently requires a *nix like environment for atomic rename support. If you are on Windows, either use the docker image or WSL. 
 
-While it is possible to build this from source, we recommend just pulling the container image from our [volume-cartographer repository](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer) by entering the following command:
-```bash
-sudo docker pull ghcr.io/scrollprize/villa/volume-cartographer:edge
+[installation instructions for docker](https://docs.docker.com/engine/install/)
+
+[running docker as a non-root user](https://docs.docker.com/engine/install/linux-postinstall/)
+
+:::warning
+if you are using Ubuntu , the default open file limit is 1024. You may encounter errors when running VC3D. To fix this, run `ulimit -Sn 750000` (or some other high number) in the terminal you plan to launch VC3D/Docker from before doing so.
+:::
+
+### Data formatting
+VC3D requires a few changes to the data you may already have downloaded. All data must be in OME-Zarr format, of dtype uint8, and contain a meta.json file. To check if your zarr is in uint8 already, open a resolution group zarray file (located at /path/to.zarr/0/.zarray) look at the dtype field. "|u1" is uint8, and "|u2" is uint16. 
+
+The meta.json contains the following information. The only real change from a standard VC meta.json is the inclusion of the `format:"zarr"` key.
+```json
+{"height":3550,"max":65535.0,"min":0.0,"name":"PHerc0332, 7.91 - zarr - s3_raw","slices":9778,"type":"vol","uuid":"20231117143551-zarr-s3_raw","voxelsize":7.91,"width":3400, "format":"zarr"}
 ```
 
-**Launch VC3D**
+Your folder structure should resemble this: 
+```
+.
+└── scroll1.volpkg/
+    ├── volumes/
+    │   ├── s1_uint8_ome.zarr -- this is your volume data/
+    │   │   └── meta.json - REQUIRED!
+    │   └── 050_entire_scroll1_ome.zarr -- this is your surface prediction/
+    │       └── meta.json - REQUIRED!
+    ├── paths 
+    ├── normal_grids - REQUIRED!
+    └── config.json - REQUIRED!
+```
 
-To launch the docker image, simply type 
+There is only one additional requirement with the latest updates , which is the computation of a normal grid. These can be computed using the `vc_gen_normalgrids` tool , and shuold be placed at the root of your volpkg in a folder called `normal_grids`.
+
+Scroll 5 (PHerc172) has precomputed versions of direction fields and normal grids, available at the following links: 
+
+- [normal_grids](https://dl.ash2txt.org/full-scrolls/Scroll5/PHerc172.volpkg/normal_grids/)
+- [fiber-directions](https://dl.ash2txt.org/full-scrolls/Scroll5/PHerc172.volpkg/representations/direction_fields/s5-fiber-directions.zarr/)
+  - _the horizontal fiber field was only computed from z2000:z8000, the vertical covers the entire height_
+- [structure-tensor-normal](https://dl.ash2txt.org/full-scrolls/Scroll5/PHerc172.volpkg/representations/direction_fields/s5-structure-tensor/)
+
+### Launching VC3D
+
+If you're using docker : 
 
 ```bash
 xhost +local:docker
@@ -95,491 +111,264 @@ sudo docker run -it --rm \
   -e QT_X11_NO_MITSHM=1 \
 ghcr.io/scrollprize/villa/volume-cartographer:edge
 ```
-The -v flag is used to mount a folder to the docker image, allowing you to use files that exist on your local filesystem. It will be mounted under the path following the ':'. You can place as many folders here as you would like.
+
+From source : 
+
+```bash
+/path/to/build/bin/VC3D
+```
+
+### Navigation
+
+First , click `File -> Open volpkg` and select the volpkg you wish to work with (select the folder ending in `.volpkg`)
+
+On the left side of the UI, you have a few dock widgets. The first being the Volume Package / Surface List. The most important things to note here are the `Volume` dropdown list, which selects the currently displayed volume, and the `paths` surface list, which selects the currently displayed segment. Selecting a `Surface ID` should populate the `Surface` volume view in the top left, and initialize the rest the volume viewers.
+
+### Widgets
+
+Most actions in VC3D are grouped into similar sets of actions controlled by a widget. 
+
+**Volume Package**
+
+_Main UI widget for interacting with the volume package and surface list_
+
+<figure>
+  <video autoPlay playsInline loop muted controls className="w-[100%]">
+    <source src="/img/segmentation/volume-widget.webm" type="video/webm"/>
+  </video>
+</figure>
+
+- `Reload Surfaces` : checks for new segmentations in the currently selected directory (by default, this is `{volpkg}/paths`
+- `Filters` : Apply a single (or multiple) filters to show or hide specific surface ids from the current set
+  - the most important one to remember here is `Current Segment Only` , which will hide the intersection overlays of all other segmentations in the volume viewers (this can greatly speed up ui interaction)
+- `Approved`, `Defective`, `Reviewed`, `Revisit`, `Inspect`  : tags which can be applied to the surface meta.json , and filtered against
+- `Generate Surface Mask` and `Append Surface Mask` : Create a binary mask representing the valid surface, and optionally append the current selected volume to it as a multipage tif
+
+**Location**
+
+_Main UI widget for adjusting the ROI and display of the volume viewers_
+
+<figure>
+  <video autoPlay playsInline loop muted controls className="w-[100%]">
+    <source src="/img/segmentation/location-widget.webm" type="video/webm"/>
+  </video>
+</figure>
+
+- `Focus` : Displays the current location of the focus point (in XYZ) -- also can be used to set the focus point by modifying the values in the text box
+- `Zoom` : Can be used in place of scroll wheel based zooming , mostly exists to alleviate touchy track pad zooming
+- `Overlay Volume` : Selects the volume to overlay onto the base volume 
+- `Overlay opacity` : Modifies the opacity of the overlay volume 
+- `Axis overlay opacity` : Modifies the opacity of the plane slice axis overlays
+- `Overlay threshold` : The value of the overlay array below which will not be rendered on the base volume (useful for removing background)
+- `Overlay colormap` : The colormap to use for the overlay volume
+- `Use axis aligned slices` : by default, vc3d attempts to align your XZ and YZ planes orthogonal to the normal of the current selected surface, this checkbox will instead use the plane normal as the axis to slice along
+- `Show axis overlays in XY view` : if you do not wish to view the axis overlays in the XY view, this checkbox will disable them
+
+_Keybinds:_
+> - `Right mouse + drag` : pans the current viewer
+> - `Scroll wheel` : zooms the current viewer
+> - `Ctrl + left mouse button` : centers the focus point on the cursor position
+> - `Scroll wheel click + drag` : rotates the slicing pane in the XZ or XY volume viewers
+> - `Spacebar` : toggles the overlay on / off
+> - `C` : toggle a composite view of the current surface in the segmentation window (parameters of which can be located in the "composite" dock tab, next to the location tab)
+
+**Segmentation**
+
+_Primary entry point for interacting with the segmentation_
+
+<figure>
+  <video autoPlay playsInline loop muted controls className="w-[100%]">
+    <source src="/img/segmentation/segmentation-widget.webm" type="video/webm"/>
+  </video>
+</figure>
+
+- `Enable editing` : Must be checked to enable any of the actions in this widget. Creates a copy of the base surface upon which we perform any of the following actions
+- `Surface Growth` - grouping of settings mostly pertaining to the `Grow` action
+  - `Steps` : The number of "generations" the growth action will undertake
+  - `Allowed Directions` : Limits the directions of growth _relative to the flattened 2d quad surface!_ (i.e if you look in the segmentation window in the top left, and you set 'up' it will grow towards the top of the window)
+  - `Limit Z range` : Constrains the growth to a selected `Z` range
+  - `Volume` : the volume to pass to the `tracer()` call _should be a surface prediction volume!_ 
+- `Editing` - grouping of settings which mostly apply to drag/push/pull actions for mesh deformation. All mesh deformation-type actions are performed on a gaussian-like area which has a circular shape centered at the current mouse location and whose strength is reduced as we reach the edges. _Radius is in quad vertices in the 2d flattened surface._
+  - `Max Radius` : the maximum radius of the area to be affected by the action
+  - `Sigma` : the _strength_ of the push/pull on affected vertices other the original one (aka how quickly the influence tapers as we step away from the original point)
+  - `Push Pull Step` : The number of "offset steps" to take along the surface normal (in voxels) for each push/pull action (this parameter only affects the push/pull in the segmentation window that is applied with `F` and `G`)
+- `Direction Fields`
+  - `Zarr folder` : the path containing the direction field you want to use for optimization (ex: `/path/to/scroll.volpkg/fiber-directions.zarr/horizontal`) _these are optional_ 
+    - `Orientation` : the orientation/type of the direction field (from horizontal, vertical, or normal)
+    - `Scale level` : the zarr resolution from which these were computed
+    - `Weight` : the weight to apply to the field when optimizing.
+- `Corrections` : group which controls / manages the "correction points" for the current growth session
+  - `New correction set` : creates a new point collection containing a single "correction" 
+
+_Keybinds:_
+> - `F` or `G` : push/pull the current surface in a positive or negative direction along the surface normal (only works in the surface
+> - `1`, `2`, `3`, `4`, `5` : select a direction to grow in -- left, up , down, right , all , respectively
+> - `T` : create a new correction set
+
+**Seeding** 
+
+_Widget for creating initial segmentations which can be used for traces or later growth actions_
+
+<figure>
+  <video autoPlay playsInline loop muted controls className="w-[100%]">
+    <source src="/img/segmentation/seeding-widget.webm" type="video/webm"/>
+  </video>
+</figure>
+
+- `Switch to point mode` : toggles the seeding widget into draw mode (not recommended)
+- `Source Collection` : the source point collection to use as seed points (will autofill if you draw/analyze)
+- `Parallel processes` : the number of processes to run seeding with
+- `OMP Threads` : limits the amount of threads each process can use (recommend to set this to 1)
+- `Intensity threshold` : mostly unused, can leave default
+- `Peak detection window` : how closely each peak detected along a path/raycast can be
+- `Expansion iterations` : how many iterations to run expansion mode on after initial seeding
+- `Show Preview Points` : unused , can ignore
+- `Clear` (both) : clears current points , paths, or raycasts
+- `Analyze Paths` : after drawing paths, detect peaks along the line segment on which to place seed points
+- `Run seeding` : creates segmentations from the current seed points
+- `Expand seeds` : expands the current seed points to the given number of iterations
+- `Clear all paths` : clears any user drawn paths / points (use this over the clear buttons most of the time)
+- `Start label wraps` : this is used for absolute or relative wrap labels , is not used during the seeding step, will detail in another document
+
+
+
+### Creating an inital segmentation 
+
+For all growth or editing actions, you'll need an initial mesh to start from. This can be done either through the GUI or the CLI. 
+
+*From the GUI* 
+- Launch VC3D and open a .volpkg
+- Select the seeding widget (on the right side dock)
+- If not already selected, click `switch to draw mode` and draw a path _across_ a surface prediction (or multiple)
+- Click `analyze paths` , and you should see a seed point (or multiple) on the surface prediction
+- Ensure your seed.json exists in the .volpkg root 
+- Click `run seeding` 
+- Click `refresh surfaces` and you should see your segmentation in the surface list on the left side of the UI 
+
+*From the terminal -- adjust for your own locations*
+
+```bash
+/home/sean/Documents/villa/volume-cartographer/build/bin/vc_grow_seg_from_seed \
+  -v /mnt/raid_nvme/volpkgs/PHerc172.volpkg/volumes/s5_105.zarr \
+  -t /mnt/raid_nvme/volpkgs/PHerc172.volpkg/paths \
+  -p /mnt/raid_nvme/volpkgs/PHerc172.volpkg/seed.json \
+  -s 1674.9 3066.41 6915.49
+```
+
+
+### Growing an existing segmentation
+
+An existing segmentation can be semi-automatically grown utlizing the tracer optimization process by setting your direction in the widget and hitting `Grow`, keybinds exist for each growth direction or `all`, these are noted in the [widget section](#widgets) above, under `segmentation widget` 
+
+<figure>
+  <video autoPlay playsInline loop muted controls className="w-[75%]">
+    <source src="/img/segmentation/segmentation-growth.webm" type="video/webm"/>
+  </video>
+</figure>
+
+### Correcting errors in a segmentation
+
+There are a few ways to fix errors which occured during segmentation. All parameters controlling these actions are in the `segmentation` widget , and have tooltips which will appear on mouse hover.
+
+*Deforming/manipulating the mesh manually by left-clicking or dragging near it* 
+
+<figure>
+  <video autoPlay playsInline loop muted controls className="w-[75%]">
+    <source src="/img/segmentation/manual-mesh-deform.webm" type="video/webm"/>
+  </video>
+</figure>
+
+*Manually pushing or pulling vertices along the normals using `A` or `D`* 
+
+<figure>
+  <video autoPlay playsInline loop muted controls className="w-[75%]">
+    <source src="/img/segmentation/manual-push-pull-normals.webm" type="video/webm"/>
+  </video>
+</figure>
+
+*Applying an "alpha refinement" along the normals using `A` or `D`*
+
+<figure>
+  <video autoPlay playsInline loop muted controls className="w-[75%]">
+    <source src="/img/segmentation/push-pull-alpha.webm" type="video/webm"/>
+  </video>
+</figure>
+
+*Placing correction point sets with `T` and `Left-click` and running `Grow`* 
+
+<figure>
+  <video autoPlay playsInline loop muted controls className="w-[75%]">
+    <source src="/img/segmentation/correction-points.webm" type="video/webm"/>
+  </video>
+</figure>
+
+*Pull the mesh along a drawn path with `S` and `Left-click`*
+
+<figure>
+  <video autoPlay playsInline loop muted controls className="w-[75%]">
+    <source src="/img/segmentation/drawn-pull.webm" type="video/webm"/>
+  </video>
+</figure>
 
 :::tip
-If you map the docker path exactly the same as it exists on your local system, you can use command snippets in either place without modification. This will also _greatly_ help troubleshooting path issues.
+Most actions can be undone with the keybind `ctrl+z`
 :::
 
-You'll now have a terminal open in the running Docker container. To open the GUI type 
-```bash
-OMP_NUM_THREADS=8 OMP_WAIT_POLICY=PASSIVE OMP_NESTED=FALSE nice ionice VC3D
-```
-Note that while the OMP environment variables and `nice ionice` are not necessary, for now these will make VC3D more responsive when working with very large amounts of patches.
-___
-
-### Preparing Data
-VC3D requires a few changes to the data you may already have downloaded. All data must be in OME-Zarr format, of dtype uint8, and contain a meta.json file. To check if your zarr is in uint8 already, open a resolution group zarray file (located at /path/to.zarr/0/.zarray) look at the dtype field. "|u1" is uint8, and "|u2" is uint16. 
-
-The meta.json contains the following information. The only real change from a standard VC meta.json is the inclusion of the `format:"zarr"` key.
-```json
-{"height":3550,"max":65535.0,"min":0.0,"name":"PHerc0332, 7.91 - zarr - s3_raw","slices":9778,"type":"vol","uuid":"20231117143551-zarr-s3_raw","voxelsize":7.91,"width":3400, "format":"zarr"}
-```
-
-To convert an already downloaded Zarr of dtype uint16 to uint8, download the zarr_to_ome.py file located in @khartes_chuck's scroll2zarr repository [here](https://github.com/KhartesViewer/scroll2zarr) and use the following command 
-```bash
-python zarr_to_ome.py /path/to/input.zarr /path/to/output.zarr --bytes 1
-```
-:::tip
-if you are performing this on "indicator" data (such as binary predictions), use the flag `--algorithm max` or `--algorithm nearest`. When downsampling with the default 'mean' algorithm, the values of the neighboring pixels are considered when writing the lower resolution array. If we have a pixel of value 255, and the pixels around it are mostly valued 0, we might get a pixel of value 125. This obviously is not desired.
-:::
-
-If you do not wish to perform these, you can use the standardized volumes, links are below for these. I'd recommend Scroll 3 if you are looking to conserve storage, as it's only around 100gb all-in.
-
-If you want to use the original data and do not want to run the processing steps, we have converted some of the scrolls into uint8 and placed the meta.json files within. These links will be updated as new predictions become available. You do not need both versions, you only need one version of the volume data.
-
-The data should be placed within the volpkg of the respective scroll, in this format:
-```
-.
-└── scroll1.volpkg/
-    ├── volumes/
-    │   ├── s1_uint8_ome.zarr -- this is your volume data/
-    │   │   └── meta.json - REQUIRED!
-    │   └── 050_entire_scroll1_ome.zarr -- this is your surface prediction/
-    │       └── meta.json - REQUIRED!
-    ├── paths 
-    └── config.json - REQUIRED!
-```
-#### Volume Data
-  * Scroll 1 
-    * Raw uint8 not yet available, in progress.
-    * [Standardized](https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumes_zarr_standardized/)
-    * [Surface Predictions](https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s1/surfaces/full_scroll/050_entire_scroll1_ome.zarr.zip) - Updated 29 Dec 2024
-    * [Patches](https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s1/s1_patches.7z) - Updated 02 Feb 2025
-  * Scroll 2 - Not available
-    * [Standardized](https://dl.ash2txt.org/full-scrolls/Scroll2/PHercParis3.volpkg/volumes_zarr_standardized/)
-  * Scroll 3  
-    * Raw uint8 not yet available, in progress.
-    * [Standardized](https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/volumes_zarr_standardized/)
-    * [Surface Predictions](https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s3/surfaces/s3_multi-ensemble_ome.7z) - Updated 26 Jan 2025
-    * [Patches](https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s3/s3_patches.7z) - Updated 06 Feb 2025
-  * Scroll 4
-    * Raw uint8 not yet available, in progress.
-    * Standardized not yet available, in progress.
-    * [Surface Predictions](https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s4/surfaces/s4_multi-ensemble_ome.7z) - Updated 28 Jan 2025
-    * [Patches](https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s4/s4_patches.7z) - Updated 01 Feb 2025
-  * Scroll 5  
-    * [Raw uint8](https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s5/s5_masked_ome.zarr/)
-    * [Standardized](https://dl.ash2txt.org/full-scrolls/Scroll5/PHerc172.volpkg/volumes_zarr_standardized/)
-    * [Surface Predictions](https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s5/surfaces/s5_055_surfaces.7z) - Updated 10 Feb 2025
-    * [Patches](https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s5/s5_patches.7z) - Updated 09 Feb 2025
-
-___
-
-### Seeding the Volume
-:::warning
-If you are running these steps in a docker container that was started using `sudo`, the files generated during these steps will be owned by root. If you encounter write errors in subsequent steps, change the ownership of the folder by typing 
-```bash
-sudo chown -R username /path/to/folder
-```
-If you encounter "json" errors, its likely you have entered your paths wrong, or forgot to include a meta.json! If you cannot view the zarr within the vc3d gui, you may be missing the `format:zarr` key!
-:::
-
-Much of this section borrows from Hendrik Schilling's repository [here](https://github.com/hendrikschilling/FASP), which also contains more detailed explanations of these processes.
-
-The tracer operates by connecting overlapping patches based on a number of conditions. It chooses the initial candidates to connect based on patch overlap, and then uses some constraints defined within the cost functions to find the optimal patch to select. This step places our initial seeds, which are later expanded. The app that generates the seeds and the expanded patches is `vc_grow_seg_from_seed`.
-
-During the tracing , a euclidean distance transform is performed, and this is stored within a cache, defined in the json params. This can occupy a non-neglible amount of space, so ensure your disk has enough storage -- my Scroll 1 cache is 376gb. This (and each subsequent step) involves _a ton_ of disk i/o , so a very fast disk here is a good choice.
-
-The seed step uses a json file for configuration, which looks like this: 
-```json
-{
-    "cache_root": "/mnt/raid_nvme/scroll3.volpkg/ensemble_cache", 
-    "thread_limit": 1,
-    "min_area_cm": 0.3, 
-    "generations": 200
-}
-```
-
-We begin the volume seeding by entering the following command , replacing the paths with your own. 
-```bash
-time seq 1 5000 |  xargs -i -P 8 bash -c 'nice ionice bin/vc_grow_seg_from_seed /mnt/raid_nvme/volpkgs/scroll3.volpkg/volumes/s3_multi_ensemble_ome.zarr /mnt/raid_nvme/volpkgs/scroll3.volpkg/paths /mnt/raid_nvme/volpkgs/scroll3.volpkg/seed.json' || true
-```
-
-This will run vc_grow_seg_from_seed five thousand times, concurrently using 8 processes. You can change these values if desired. This is ran 5,000 times because each run may not produce a segment that meets our min_area_cm defined in the json. Each time a succesful seed is generated, it will be placed in your /paths/ directory. We'd like to finish this seeding step with the following counts for seeds:
-
-* Scroll 1, 2, and 5 (Entire Scroll) - 5,000
-* Scroll 3 and 4 - 1000-1500
-
-You can watch the progress of the seeding by opening another terminal window and entering:
-```bash
-watch -n 1 "ls -l /path/to/paths | wc -l"
-```
-This will refresh every 1 second, and count the number of folders in your /paths/ directory. 
-:::tip
-You may need to run the seed command multiple times to get a sufficient number of seeds before proceeding to the next step.
-:::
-
-___
-### Expanding Seeds
-:::warning
-Seeds created using the mode "seed" do not contain overlap information and are not used by the tracer. Ensure that your params json 'mode' key is set to 'expansion' for this step.
-:::
-In this step, each initial seed is visited in an attempt to generate overlapping patches. The new patches will grow out from these initial seeds, and should eventually populate the entire scroll volume. Expansions are generated until each patch has a minimum number of overlapping patches associated with it. Overlaps are marked by creating a symlinked file in the /auto_grown_xxxx/overlaps directory of the respective patch. Expansion mode uses a config json, which contains the following keys:
-```json
-{
-    "mode" : "expansion",
-    "cache_root": "/mnt/raid_nvme/scroll3.volpkg/ensemble_cache",
-    "tgt_overlap_count": 10,
-    "min_area_cm": 0.30,
-    "thread_limit": 1,
-    "generations": 200
-    
- }
-```
-
-Begin the expansion step by typing: 
-
-```bash
-time seq 1 10000000 |  xargs -i -P 8 bash -c 'nice ionice bin/vc_grow_seg_from_seed /mnt/raid_nvme/volpkgs/scroll3.volpkg/volumes/s3_multi_ensemble_ome.zarr /mnt/raid_nvme/volpkgs/scroll3.volpkg/paths /mnt/raid_nvme/volpkgs/scroll3.volpkg/seed.json' || true
-```
-
-You may need to repeat this command, until the volume is densely seeded. The number of patches required is somewhat difficult to approximate as better predictions generate larger patches, which require less seeds. You will need to open vc3d and inspect the volume to see it is sufficiently seeded. As an example, this Scroll 1 volume contains 68,000 seeds and could still use some more. 
-
-<div className="mb-4">
-  <img src="/img/segmentation/s1_seeded.png" className="w-[50%]"/>
-  <figcaption className="mt-[-6px]">Scroll 1 with generated patches.</figcaption>
-</div>
-
-___
-
-### Running a Trace
-A "Trace" in the context of vc3d is essentially the same as a segmentation as we've come to know them. 
+### Erasing / invalidating portions of the mesh
 
-This step will finally create larger connected surfaces. The large surface tracer generates a single surface by tracing a "consensus" surface from the patches generated earlier. This processed can be influenced by annotating patches in several ways which allows to guide the tracer to avoid errors. Hence the process looks like this:
-
-1. pick a seed patch
-2. generate a trace
-3. check for errors
-4. annotation
-5. and repeat step 2-4 or 1-4 several times
-
-Keep previous trace rounds around as the fusion step can later join multiple traces and problematic areas of a trace can be masked out. A mask can be generated for example with VC3D, or by using any 8-bit grayscale image with the same aspect ratio as one of the tiffxyz channels.
-
-**Locate a seed patch**
-The choice here is somewhat arbitrary, but the initial condition is important. You want a seed here that does not skip sheets, and is of reasonable size.
-
-<div className="mb-4">
-  <img src="/img/segmentation/s3_good_seed.png" className="w-[100%]"/>
-  <figcaption className="mt-[-6px]">A "good" seed".</figcaption>
-</div>
+If you encounter a region in which your mesh has become degenerate/warped or just horribly out of place, sometimes it can be easier to simply erase it and grow back into the region. This can be done while editing is active by pressing `Shift` and dragging the left mouse button. If you are happy with the drawn path, press `E` to erase the mesh along this path. 
 
-By placing patches generated in the last step into the paths directory of the volpkg VC3D allows to inspect them. VC3D can also display the prediction ome-zarrs, which, together with fiber continuity allows to quickly scan for obvious errors. Useful tools for navigation:
-* ctrl-click in any slice view to focus and slice on the clicked point
-* shift-click to place a red POI
-* shift-ctrl-click to place a blur POI
-* filter by focus point & filter by POIs to narrow down the choice of patches
+<figure>
+  <video autoPlay playsInline loop muted controls className="w-[75%]">
+    <source src="/img/segmentation/mesh-erasing.webm" type="video/webm"/>
+  </video>
+</figure>
 
-<div className="mb-4">
-  <img src="/img/segmentation/s3_bad_seed.png" className="w-[100%]"/>
-  <figcaption className="mt-[-6px]">A "bad" seed".</figcaption>
-</div>
+**_Note: this brush is occasionally erratic. If you accidentally erase something, you can typically restore with `ctrl+z`_**
 
-**Generate the trace**
+### Growing large meshes 
 
-The trace uses a config json with the following parameters:
-```json
-{
-        "flip_x" : false,
-        "global_steps_per_window" : 3,
-        "step" : 10,
-        "consensus_default_th" : 10,
-        "consensus_limit_th" : 2
-}
-```
-* flip_x determines the direction of the trace (it always grows to the right, but that can go to the inside or outside of the scroll, depending on seed location).
-* global steps per window: number of global optimization steps per moving window. The tracer operates in a moving window fashion, once the global optimization steps were run per window and no new corners were added the window is moved to the right and the process repeated. At the beginning use 0 global steps to get a fast and long trace and see if there are any coarse errors. Set to 0 to get a purely greedy but quite fast trace.
-* consensus_default_th: lowest number of inliers (patch "supports") required per corner to be considered an inlier. Note that a single well-connected patch gives more than a single support to a corner (so this is not the number of surfaces). Maximum of 20 to get only well-connected patches, minimum of 6 before there are a lot of errors. For the submission values of 6 and 10 were used.
-* consesus_limit_th: if we could otherwise not proceed go down to this number of required inliers, this will only be used if otherwise the trace would end.
+The typical growth process looks something like this :
+1. Seed an initial point in the region you wish to segment
+2. Grow this segmentation some small-ish number of generations at a time, somewhere between 10-30 is a reasonable number
+3. Check for errors, and fix ones that appear
+4. Repeat steps 1-3 until you feel like stopping
 
-Begin the trace by typing:
+### Growing large meshes with the "tracer" method
 
-```bash
-bin/vc_grow_seg_from_segments /mnt/raid_nvme/volpkgs/scroll3.volpkg/volumes/s3_multi_ensemble_ome.zarr /mnt/raid_nvme/volpkgs/scroll3.volpkg/paths /mnt/raid_nvme/volpkgs/scroll3.volpkg/paths/ /mnt/raid_nvme/volpkgs/scroll3.volpkg/params.json /mnt/raid_nvme/volpkgs/scroll3.volpkg/paths/auto_grown_20250211031737772
-```
-The tracer will generate a debug/preview surface every 50 generations (labeled z_dbg_gen...) and in the end save a final surface, both in the output dir. You can watch the trace grow by opening and closing vc3d to repopulate the segments and selecting the highest number "dbg_gen" to view it in the 2d window in the top left. If the trace starts growing opposite of the direction you intended, change "flip_x" to the opposite of what you had set (for ex: true to false)
+The above steps mostly detail how to grow and correct meshes in a semi-supervised manner. This is in contrast to the "tracer" method, which attempts to piece together large meshes in a more automatic manner, by connecting overlapping patches. 
 
-<div className="mb-4">
-  <img src="/img/segmentation/s3_sample_trace.png" className="w-[100%]"/>
-  <figcaption className="mt-[-6px]">Scroll 3 trace "in-progress".</figcaption>
-</div>
+The tracer method requires a "seeded" volume , containing thousands of overlapping segmentations with some metadata marking which ones overlap eachother. There are two steps to this method : 
 
-**Check for errors**
+1. Fully seed the volume with patches
+2. Run the tracer on these patches
 
-Using the VC3D GUI, the traced surfaces can be inspected for errors. Inspecting with an ome-zarr volume containing the original scan data (to see fiber continuity) is suggested. You can switch your volume by selecting the drop-down below the segments.
+**Seeding the volume** 
 
-The errors that need to be fixed are generally sheet jumps, where the surface jumps from one correct surface to another correct surface. Often these are visible by checking for gaps in the generated trace as a jump will normally not reconnect with the rest of the trace. 
+You have two options for doing this , either through the CLI or through the GUI. This doc will cover the GUI.
 
-Typically, the easiest method for fixing these is to locate where the sheet jump first occurs, and then ctrl+click on this location, filter segments by focus point, and then mask out the offending patches.
+Open the segmentation widget, and draw paths along the intersections of the surface predictions to place seed points, and run seeding on those points. Place these manual seeds until you've covered a decent portion of the volume, such that if these patches were grown, they could reasonably cover the entire volume.
 
-<div className="mb-4">
-  <img src="/img/segmentation/sheet_jump.jpg" className="w-[75%]"/>
-  <figcaption className="mt-[-6px]">"Sheet Jump" in a patch".</figcaption>
-</div>
+<figure>
+  <video autoPlay playsInline loop muted controls className="w-[75%]">
+    <source src="/img/segmentation/manual-seeding.webm" type="video/webm"/>
+  </video>
+</figure>
 
-___ 
+**Click 'expand seeds'** to grow new seeds from these patches, which overlap with existing ones 
 
-### Fixing Errors
+**Let this expansion mode run** until your volume is densely seeded. It should look like this :
 
-VC3D allows to annotate patches as approved, defective, and to edit a patch mask which allows masking out areas of a patch that are problematic.
-
-<div className="mb-4">
-  <img src="/img/segmentation/vc3d_annotation.jpg" className="w-[50%]"/>
-</div>
-
-**Defective**
+<img src="/img/segmentation/expanded.png" style={{ height: '750px' }} />
 
-A patch can be marked as "defective" by checking the checkbox in the VC3D side panel. This is fast but not very useful as most patches have some good areas and also will have some amount of errors. Errors only matter if they fall at the same spot in multiple patches, so marking a whole patch as defective, which will make the tracer ignore it completely is not necessary. **_Use sparingly, most patches contain at least some good data_**
-
-**Approved**
+**Running a trace** 
 
-Checking the approved checkbox will mark a patch as manually "approved" which means the tracer will consider mesh corners coming from such a patch as good without checking for other patches. It is important that such a patch is error free (which is not necessary when creating a mask to only remove a problem area without checking "approved"). If you must mark one approved, the following process can be used: 
-
-* ctrl-click on a point in the area that shall be "correct".
-* follow along the two segment slices and place blue POIs at an interval wherever you are sure the trace follows the correct sheet.
-* place red POIs where errors occur. This process will place a "cross" of two lines which show the good/bad areas of the patch
-* ctrl-click to focus on a point on/between blue points to generate a second line, this way a whole grid of points is generated
-* use this grid as orientation to create a mask in GIMP
+To run a trace, simply right click an existing segmentation, and from the context menu select `Run trace` , you can keep the default settings for now, but they are available in the dialog box if you wish to experiment with them. You can monitor its growth by selecting the `traces` folder in your volume widget, by clicking on `paths` on the volume package widget and selecting `traces`
 
-**Masking**
-
-By clicking on the "edit segment mask" button a mask image will be generated and saved as .tif in the segments directory. Then the systems default application for the filetype .tif will be launched. It is recommended to use GIMP for this. The mask file is a multi-layer tif file where the lowest layer is the actual binary mask and the second layer is the rendered surface using the currently selected volume.
-
-* place one POI on one side of the jump and a second on the other.
-* select "filter by POIs" to get a list of patches which contain this sheet jump, this probably list about 5-20 patches
-* press "edit segment mask"
-* GIMP will open an import dialog, the default settings are fine so just press import
-* click on the layer transparency to make the upper layer around 50% transparent
-* your default tool should be the pencil tool with black as color and a size of around 30-100 pixels. Use it to mask out offending areas on the lower layer (the actual mask), refer back to VC3D if you are unsure.
-* save the mask by clicking "File->overwrite mask.tif"
+The tracer will run for an indeterminate amount of time , until it runs out of area in which it can continue to grow. This could be 10cm^2 , or it could be 2800cm^2 -- it completely depends on the surface prediction and patch quality. This is a 53cm^2 segmentation from PHerc0172 which completed in about a minute.
 
-With this process a mask can be generated using less than 10 clicks
-
-<div className="mb-4">
-  <img src="/img/segmentation/gimp_masking.jpg" className="w-[100%]"/>
-</div>
-
-___
+<img src="/img/segmentation/trace.png" style={{ height: '750px' }} />
 
-### Inpainting
-
-It is possible after the previous steps to simply render the trace and use it within downstream tasks. The traces at this stage however frequently contain holes and are not flattened as well as they could be. To improve the mesh, we can combine multiple traces and attempt to fill in the holes. 
+### Editing traces
 
-The traces to be combined should be error free, and one can mask out bad regions of these larger traces using the same masking process as we used on the patches.
-
-**Generating Winding Number Assignments**
-
-<div className="mb-4">
-  <img src="/img/segmentation/wind_vis.png" className="w-[100%]"/>
-</div>
-
-The first step in the fusion process is generating relative winding numbers of each trace by running:
-
-```bash
-OMP_WAIT_POLICY=PASSIVE OMP_NESTED=FALSE \
-vc_tifxyz_winding /path/to/trace
-```
-
-Which will generate some debug images and the two files "winding.tif" and "winding_vis.tif". Check the winding vis for errors, it should be a smooth continuous rainbow going from left to right. If you see discontinuities here, there were some errors in the trace that must be fixed. Mask those errors in the source trace and re-run winding estimation until it works. This should not generally be necessary.
-
-Copy the winding.tif and wind_vis.tif to the traces storage directory so it's all in one place and ready for the next step. The winding estimation should take about 10s.
-
-**Trace Fusion and Inpainting**
-
-Once you have estimated winding assignments for all the traces you intend on fusing, you can run this command with an arbitrary number of traces. Note that the first trace will be used as the seed and it will also define the size of the output trace and will generate normal constraints, so it should be the longest and most complete. The number after the trace is the weight of the trace when generating the surface, in all tests a weight of 1.0 was used and for the submission this params.json.
-
-```bash
-OMP_WAIT_POLICY=PASSIVE OMP_NESTED=FALSE time nice \
-vc_fill_quadmesh params.json /path/to/trace1/ /path/to/trace1/winding.tif 1.0 /path/to/trace2/ /path/to/trace2/winding.tif 1.0
-```
-The params.json contains the following keys:
-```json
-{
-    "trace_mul" : 5,
-    "dist_w" : 1.5,
-    "straight_w" : 0.005,
-    "surf_w" : 0.05,
-    "z_loc_loss_w" : 0.002,
-    "wind_w" : 10.0,
-    "wind_th" : 0.5,
-    "inpaint_back_range" : 60,
-    "opt_w" : 4
-}
-```
-
-**Grounding and Upscaling**
-The output of this fusion process is a lower resolution than the source traces. To upscale it back to its source resolution, run the following command
-
-```bash
-vc_tiffxyz_upscale_grounding <infill-tiffxyz> <infill-winding> 5 /path/to/trace1/ /path/to/trace1/winding.tif ...
-```
-
-___
-
-### Rendering
-Each stage of the seeding/expanding/tracing process uses the tifxyz format, and thus any output in these processes can be rendered by using the `vc_render_tifxyz`. To render your new trace, enter:
-```bash
-OMP_WAIT_POLICY=PASSIVE OMP_NESTED=FALSE time nice \
-vc_render_tifxyz /path/to/volume/ome-zarr /output/path/%02d.tif /path/to/trace 0.5 1 21
-```
-where 0.5 is the "scale" (the final output is scaled down to this percentage, 50% in the example), 1 is the source resolution group (in this case, 1 , or the second resolution of the ome-zarr), and 21 is the number of "layers" from the center slice we want, equally in positive and negative directions. This will generate 21 slices from our traditionally understood "layer 22" to "layer 43".
-
-:::tip
-For the TimeSFormer model, the "1" resolution performs only slightly worse than the full resolution, "0". The i3d first letters model however, performs much worse on downsampled data. For models of this type, it is suggested to render the full resolution. This requires processing 8x more data, and will render significantly slower.
-:::
-
-___
-### Ink Detection
-Ink detection on the produced segmentations is no different at this stage than it was on previous segments, although some of the segmentations generated by the tracer can be quite large. The [ink-detection](https://github.com/ScrollPrize/villa/tree/main/ink-detection) page of the villa monorepo contains the 2023 Grand-Prize model, with some recent updates. If you have difficulty loading large segmentations with this version, a fork exists which was used to generate the ink detections for @waldkauz and @bruniss 2024 year-end submission , documented [here](https://discord.com/channels/1079907749569237093/1315006782191570975). 
-
-<div className="mb-4">
-  <img src="/img/segmentation/v4_hr.jpg" className="w-[100%]"/>
-<figcaption className="mt-[-6px]">2023 grand prize region trace and ink detection.</figcaption>
-</div>
-
-___
-
-### Common Issues
-**When attempting to run one of these steps, you encounter "json" errors**
-  * Fix: 99% of the time when this error is thrown, it is the result of an incorrect path in the command, or a missing meta.json file in the target volume. Check your paths.
-<div className="ml-8">
-  <img src="/img/segmentation/json_error.png" className="w-[75%]"/>
-</div>
-
-**When running subsequent traces after an initial trace , a write error is thrown**
-    * Fix: The tracer cannot write to the folder because a folder with the same name exists. Clear your paths directory of "z_dbg_gen" files, and try again.
-
-**When attempting to run a trace on a verified existing seed patch, and no z_dbg_gen files exist, a permissions or write error is thrown**
-    * Fix: If you launched docker using sudo, your patches are owned by sudo and thus your user does not have permissions. Type `sudo chown -R username /path/to/paths/`
-
-**Trace ends abruptly or before expected considering seed density**
-    * Fix: If you are running into issues getting your trace to "take off", verify you are heading in the direction of a densely seeded region. If you are starting from the umbilicus or the outside of the scroll, verify you are not trying to trace outside of the volume. Change your `flip x:` key in the params.json.
-    * Note: If you are sure your `flip x:` key is properly set, and still cannot get a trace to go from a good initial seed, you can try lowering the `step` parameter. This increases processing time significantly, but can help traces in regions of high curvature.
-
-**Cannot view zarr in VC3D gui (may just show a black screen), or cannot select it in the volumes drop-down**
-    * Fix: ensure that you have a meta.json in the zarr's root, and that it contains `"format":"zarr"`
-    * Ensure that the volume is in uint8, or `|u1` if looking at the `.zarray` file
-
-**Seed or Expand steps are running slow on VC3D built from source**
-    * Fix: on most ubuntu linux installations, at least one of two file indexers are typically installed -- `tracker-miner-fs` or `rygel`. Either of these will attempt to index every single file you add, and during the seed/expansion steps, this is a very large number. You will want to "mask" or disable these services, as they will slow the seed/expansion steps to a crawl. 
-___
-
-### Tips and Tricks
-
-**"Checkpointing"**
-
-If you are attempting to create very large traces, it is generally smart to "checkpoint" your progress as you go by running a relatively long trace, allowing it to continue through errors, and then utilizing your dbg_gen files as "superpatches". The process looks like this:
-  - Run a trace
-  - Starting from your longest one, identify large contiguous regions of papyrus without errors
-  - Edit the mask, and remove all the areas other than this
-  - Rename the folder to "auto_grown_xxx"
-  - Update the meta.json with this new name
-  - Run `vc_seg_add_overlap /path/to/paths /path/to/trace`
-  - Mark the segment as "approved" in the VC3D gui
-
-**Manual Seeding**
-
-It can be highly beneficial to manually seed volumes. The random seeding is just that, random. It places seeds at nonzero points throughout the volume, and these points can include the case, the lining, or regions that are far from the current location you're targeting. If you wish to manually seed, simply open the volume in VC3D, the simplest way is likely the following:
-  - ctrl+click on the predicted surfaces around the area you're trying to segment. Ensure you don't miss any sheets. As you click these points, the 3d coordinates will be printed into the terminal. 
-  - Copy the script below and paste it into a file called `create_seed.sh`, changing the paths to your own 
-  - Run this script from a separate terminal
-  - Paste the outputs of the coordinates (including the words before them) into the terminal running `create_seed`
-  - The script will run vc_grow_seg_from_segments in explicit seed mode at these locations
-  - Verify that a seed has been created on each surface around the target region, and that none have been missed
-  - If necessary, repeat the process until you have a seed on each wrap. 
-  - Run vc_grow_seg_from_seed in expansion mode as detailed earlier in the tutorial
-
-The primary motivation for doing this is that if you run expansion mode on randomly created seeds, a significant portion of your compute time is spent expanding seeds into regions you might not care about, or expanding seeds along the case. While it's generally true that if you leave expansion mode running long enough, it will fill the volume, this may take a while. It is also not possible for a seed to expand if the surface itself is not sufficiently connected to other surfaces -- it is not uncommon to miss large parts of wraps if you do not verify and manually seed.
-
-
-```bash
-#!/bin/bash
-# Configuration variables - update these as needed:
-OME_ZARR_VOLUME="/home/sean/Documents/volpkgs/scroll3.volpkg/volumes/s3_059_medial_ome.zarr/"
-TGT_DIR="/home/sean/Documents/volpkgs/scroll3.volpkg/paths/"
-JSON_PARAMS="/home/sean/Documents/volpkgs/scroll3.volpkg/seed.json"
-CMD="bin/vc_grow_seg_from_seed"
-
-# Offset variable (in voxels)
-OFFSET=30
-
-# Maximum number of parallel jobs to run concurrently
-MAX_JOBS=16
-
-# Check for bc availability. If not available, fallback to awk.
-if command -v bc >/dev/null 2>&1; then
-    use_bc=1
-else
-    echo "bc command not found. Falling back to awk for arithmetic."
-    use_bc=0
-fi
-
-# Function to wait until background jobs are below MAX_JOBS
-wait_for_slot() {
-    while [ "$(jobs -r | wc -l)" -ge "$MAX_JOBS" ]; do
-        sleep 0.5
-    done
-}
-
-while true; do
-    echo "Paste coordinate lines (end with an empty line):"
-    lines=()
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && break
-        lines+=("$line")
-    done
-
-    if [ ${#lines[@]} -eq 0 ]; then
-        echo "No coordinates provided. Try again."
-        continue
-    fi
-
-    # Process each pasted line
-    for line in "${lines[@]}"; do
-        # Extract text between [ and ]
-        coords=$(echo "$line" | grep -o '\[[^]]*\]')
-        if [ -z "$coords" ]; then
-            echo "No coordinates found in: $line"
-            continue
-        fi
-
-        # Remove the square brackets and split into x, y, z
-        coords=${coords#[}
-        coords=${coords%]}
-        IFS=',' read -r x y z <<< "$coords"
-        x=$(echo "$x" | xargs)
-        y=$(echo "$y" | xargs)
-        z=$(echo "$z" | xargs)
-        
-        echo "Processing coordinate: x=$x, y=$y, z=$z"
-
-        # Loop only over x offsets: -OFFSET, 0, and +OFFSET
-        for dx in -$OFFSET 0 $OFFSET; do
-            # Ensure we don't exceed the parallel job limit
-            wait_for_slot
-
-            # Calculate new seed position for x; y and z remain unchanged.
-            if [ $use_bc -eq 1 ]; then
-                seed_x=$(echo "$x + $dx" | bc)
-            else
-                seed_x=$(awk "BEGIN {print $x + $dx}")
-            fi
-            seed_y=$y
-            seed_z=$z
-
-            echo "Launching: nice ionice $CMD $OME_ZARR_VOLUME $TGT_DIR $JSON_PARAMS $seed_x $seed_y $seed_z"
-            nice ionice $CMD "$OME_ZARR_VOLUME" "$TGT_DIR" "$JSON_PARAMS" "$seed_x" "$seed_y" "$seed_z" || true &
-        done
-    done
-
-    # Wait for all background jobs to finish before prompting again
-    wait
-    echo "Finished processing these coordinates."
-    echo
-done
-
-```
-
-
-
-## Spiral Fitting (Coming Soon)
+You can edit or continue growth on a trace with any of the methods detailed in [growing an existing segmentation](#growing-an-existing-segmentation) , and correct them with any of the methods in [correcting errors in a segmentation](#correcting-errors-in-a-segmentation) , do note that these traces will have to have been produced _after_ the recent VC3D changes, as prior ones did not include a `generations.tif`,  which is necessary for that growth method.

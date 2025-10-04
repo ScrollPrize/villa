@@ -18,6 +18,7 @@ class PointsOverlayController;
 class PathsOverlayController;
 class BBoxOverlayController;
 class VectorOverlayController;
+class VolumeOverlayController;
 class ChunkCache;
 class SegmentationModule;
 class Volume;
@@ -45,6 +46,7 @@ public:
     void setPathsOverlay(PathsOverlayController* overlay);
     void setBBoxOverlay(BBoxOverlayController* overlay);
     void setVectorOverlay(VectorOverlayController* overlay);
+    void setVolumeOverlay(VolumeOverlayController* overlay);
 
     void setIntersectionOpacity(float opacity);
     float intersectionOpacity() const { return _intersectionOpacity; }
@@ -59,7 +61,15 @@ public:
     void setOverlayColormap(const std::string& colormapId);
     const std::string& overlayColormap() const { return _overlayColormapId; }
     void setOverlayThreshold(float threshold);
-    float overlayThreshold() const { return _overlayThreshold; }
+    float overlayThreshold() const { return _overlayWindowLow; }
+
+    void setOverlayWindow(float low, float high);
+    float overlayWindowLow() const { return _overlayWindowLow; }
+    float overlayWindowHigh() const { return _overlayWindowHigh; }
+
+    void setVolumeWindow(float low, float high);
+    float volumeWindowLow() const { return _volumeWindowLow; }
+    float volumeWindowHigh() const { return _volumeWindowHigh; }
 
     bool resetDefaultFor(CVolumeViewer* viewer) const;
     void setResetDefaultFor(CVolumeViewer* viewer, bool value);
@@ -68,6 +78,9 @@ public:
 
 signals:
     void viewerCreated(CVolumeViewer* viewer);
+    void overlayWindowChanged(float low, float high);
+    void volumeWindowChanged(float low, float high);
+    void overlayVolumeAvailabilityChanged(bool hasOverlay);
 
 private:
     CSurfaceCollection* _surfaces;
@@ -87,5 +100,10 @@ private:
     std::string _overlayVolumeId;
     float _overlayOpacity{0.5f};
     std::string _overlayColormapId;
-    float _overlayThreshold{1.0f};
+    float _overlayWindowLow{0.0f};
+    float _overlayWindowHigh{255.0f};
+    float _volumeWindowLow{0.0f};
+    float _volumeWindowHigh{255.0f};
+
+    VolumeOverlayController* _volumeOverlay{nullptr};
 };

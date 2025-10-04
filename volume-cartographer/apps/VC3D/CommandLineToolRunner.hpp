@@ -8,7 +8,7 @@
 #include <QFile>
 
 #include "CWindow.hpp"
-#include "ProgressUtil.hpp"
+#include "elements/ProgressUtil.hpp"
 #include "ConsoleOutputWidget.hpp"
 
 

@@ -29,6 +29,76 @@ constexpr qreal kMarkerZ = 95.0;
 constexpr qreal kRadiusCircleZ = 80.0;
 }
 
+bool SegmentationOverlayController::State::operator==(const State& rhs) const
+{
+    const auto equalMarker = [](const VertexMarker& lhs, const VertexMarker& rhs) {
+        return lhs.row == rhs.row &&
+               lhs.col == rhs.col &&
+               std::fabs(lhs.world[0] - rhs.world[0]) < 1e-4f &&
+               std::fabs(lhs.world[1] - rhs.world[1]) < 1e-4f &&
+               std::fabs(lhs.world[2] - rhs.world[2]) < 1e-4f &&
+               lhs.isActive == rhs.isActive &&
+               lhs.isGrowth == rhs.isGrowth;
+    };
+
+    const auto optionalEqual = [&](const std::optional<VertexMarker>& lhsOpt,
+                                   const std::optional<VertexMarker>& rhsOpt) {
+        if (!lhsOpt && !rhsOpt) {
+            return true;
+        }
+        if (static_cast<bool>(lhsOpt) != static_cast<bool>(rhsOpt)) {
+            return false;
+        }
+        return equalMarker(*lhsOpt, *rhsOpt);
+    };
+
+    const auto vectorEqual = [&](const std::vector<VertexMarker>& lhsVec,
+                                 const std::vector<VertexMarker>& rhsVec) {
+        if (lhsVec.size() != rhsVec.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < lhsVec.size(); ++i) {
+            if (!equalMarker(lhsVec[i], rhsVec[i])) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    const auto maskEqual = [&](const std::vector<cv::Vec3f>& lhsVec,
+                               const std::vector<cv::Vec3f>& rhsVec) {
+        if (lhsVec.size() != rhsVec.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < lhsVec.size(); ++i) {
+            const cv::Vec3f delta = lhsVec[i] - rhsVec[i];
+            if (cv::norm(delta) >= 1e-4f) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    const auto floatEqual = [](float lhs, float rhs) {
+        return std::fabs(lhs - rhs) < 1e-4f;
+    };
+
+    return optionalEqual(activeMarker, rhs.activeMarker) &&
+           vectorEqual(neighbours, rhs.neighbours) &&
+           maskEqual(maskPoints, rhs.maskPoints) &&
+           maskVisible == rhs.maskVisible &&
+           brushActive == rhs.brushActive &&
+           brushStrokeActive == rhs.brushStrokeActive &&
+           lineStrokeActive == rhs.lineStrokeActive &&
+           hasLineStroke == rhs.hasLineStroke &&
+           pushPullActive == rhs.pushPullActive &&
+           falloff == rhs.falloff &&
+           floatEqual(gaussianRadiusSteps, rhs.gaussianRadiusSteps) &&
+           floatEqual(gaussianSigmaSteps, rhs.gaussianSigmaSteps) &&
+           floatEqual(displayRadiusSteps, rhs.displayRadiusSteps) &&
+           floatEqual(gridStepWorld, rhs.gridStepWorld);
+}
+
 SegmentationOverlayController::SegmentationOverlayController(CSurfaceCollection* surfaces, QObject* parent)
     : ViewerOverlayControllerBase(kOverlayGroupKey, parent)
     , _surfaces(surfaces)
@@ -53,34 +123,20 @@ void SegmentationOverlayController::setEditManager(SegmentationEditManager* mana
     _editManager = manager;
 }
 
-void SegmentationOverlayController::setGaussianParameters(float radiusSteps,
-                                                          float sigmaSteps,
-                                                          float gridStepWorld)
+void SegmentationOverlayController::applyState(const State& state)
 {
-    _radiusSteps = std::max(radiusSteps, 0.0f);
-    _sigmaSteps = std::max(sigmaSteps, 0.0f);
-    _gridStepWorld = std::max(gridStepWorld, 1e-4f);
-}
+    State sanitized = state;
+    sanitized.gaussianRadiusSteps = std::max(sanitized.gaussianRadiusSteps, 0.0f);
+    sanitized.gaussianSigmaSteps = std::max(sanitized.gaussianSigmaSteps, 0.0f);
+    sanitized.displayRadiusSteps = std::max(sanitized.displayRadiusSteps, 0.0f);
+    sanitized.gridStepWorld = std::max(sanitized.gridStepWorld, 1e-4f);
 
-void SegmentationOverlayController::setActiveVertex(std::optional<VertexMarker> marker)
-{
-    _activeVertex = std::move(marker);
-}
+    if (_currentState && *_currentState == sanitized) {
+        return;
+    }
 
-void SegmentationOverlayController::setTouchedVertices(const std::vector<VertexMarker>& markers)
-{
-    _touchedVertices = markers;
-}
-
-void SegmentationOverlayController::setMaskOverlay(const std::vector<cv::Vec3f>& points,
-                                                   bool visible,
-                                                   float pointRadius,
-                                                   float opacity)
-{
-    _maskPoints = points;
-    _maskVisible = visible;
-    _maskPointRadius = pointRadius;
-    _maskOpacity = opacity;
+    _currentState = std::move(sanitized);
+    refreshAll();
 }
 
 bool SegmentationOverlayController::isOverlayEnabledFor(CVolumeViewer* viewer) const
@@ -92,24 +148,44 @@ bool SegmentationOverlayController::isOverlayEnabledFor(CVolumeViewer* viewer) c
 void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
                                                       ViewerOverlayControllerBase::OverlayBuilder& builder)
 {
-    if (!viewer || !_editingEnabled) {
+    if (!viewer || !_editingEnabled || !_currentState) {
         return;
     }
 
-    if (_maskVisible && !_maskPoints.empty()) {
-        ViewerOverlayControllerBase::PathPrimitive maskPath;
-        maskPath.points = _maskPoints;
-        maskPath.renderMode = ViewerOverlayControllerBase::PathRenderMode::Points;
-        maskPath.brushShape = ViewerOverlayControllerBase::PathBrushShape::Circle;
-        maskPath.pointRadius = _maskPointRadius;
-        maskPath.color = QColor(255, 140, 0);
-        maskPath.opacity = _maskOpacity;
-        maskPath.z = kMaskZ;
-        builder.addPath(maskPath);
+    const State& state = *_currentState;
+
+    if (shouldShowMask(state)) {
+        builder.addPath(buildMaskPrimitive(state));
     }
 
-    buildVertexMarkers(viewer, builder);
-    buildRadiusOverlay(viewer, builder);
+    buildVertexMarkers(state, viewer, builder);
+    buildRadiusOverlay(state, viewer, builder);
+}
+
+ViewerOverlayControllerBase::PathPrimitive SegmentationOverlayController::buildMaskPrimitive(const State& state) const
+{
+    ViewerOverlayControllerBase::PathPrimitive maskPath;
+    maskPath.points = state.maskPoints;
+    maskPath.renderMode = state.hasLineStroke ? ViewerOverlayControllerBase::PathRenderMode::LineStrip
+                                              : ViewerOverlayControllerBase::PathRenderMode::Points;
+    maskPath.brushShape = ViewerOverlayControllerBase::PathBrushShape::Circle;
+
+    const float brushPixelRadius = std::clamp(state.displayRadiusSteps * 1.5f, 3.0f, 18.0f);
+    const bool drawingOverlay = state.brushActive || state.brushStrokeActive || state.lineStrokeActive || state.hasLineStroke;
+    const float brushOpacity = drawingOverlay ? 0.6f : 0.45f;
+
+    maskPath.pointRadius = state.hasLineStroke ? std::max(brushPixelRadius * 0.35f, 2.0f) : brushPixelRadius;
+    maskPath.lineWidth = state.hasLineStroke ? 3.0f : std::max(brushPixelRadius * 0.5f, 2.0f);
+    maskPath.color = state.hasLineStroke ? QColor(80, 170, 255) : QColor(255, 140, 0);
+    maskPath.opacity = state.hasLineStroke ? 0.85f : brushOpacity;
+    maskPath.z = kMaskZ;
+
+    return maskPath;
+}
+
+bool SegmentationOverlayController::shouldShowMask(const State& state) const
+{
+    return state.maskVisible && !state.maskPoints.empty();
 }
 
 void SegmentationOverlayController::onSurfaceChanged(std::string name, Surface* surface)
@@ -120,19 +196,20 @@ void SegmentationOverlayController::onSurfaceChanged(std::string name, Surface* 
     }
 }
 
-void SegmentationOverlayController::buildRadiusOverlay(CVolumeViewer* viewer,
+void SegmentationOverlayController::buildRadiusOverlay(const State& state,
+                                                       CVolumeViewer* viewer,
                                                        ViewerOverlayControllerBase::OverlayBuilder& builder) const
 {
-    if (!_activeVertex || !_activeVertex->isActive) {
+    if (!state.activeMarker || !state.activeMarker->isActive) {
         return;
     }
 
-    const float radiusWorld = _radiusSteps * _gridStepWorld;
+    const float radiusWorld = state.gaussianRadiusSteps * state.gridStepWorld;
     if (radiusWorld <= 0.0f) {
         return;
     }
 
-    const cv::Vec3f world = _activeVertex->world;
+    const cv::Vec3f world = state.activeMarker->world;
     const QPointF sceneCenter = viewer->volumePointToScene(world);
 
     cv::Vec3f offsetWorld = world;
@@ -154,7 +231,8 @@ void SegmentationOverlayController::buildRadiusOverlay(CVolumeViewer* viewer,
     builder.addCircle(sceneCenter, radiusPixels, false, style);
 }
 
-void SegmentationOverlayController::buildVertexMarkers(CVolumeViewer* viewer,
+void SegmentationOverlayController::buildVertexMarkers(const State& state,
+                                                       CVolumeViewer* viewer,
                                                        ViewerOverlayControllerBase::OverlayBuilder& builder) const
 {
     const auto buildStyle = [](const VertexMarker& marker) {
@@ -176,18 +254,18 @@ void SegmentationOverlayController::buildVertexMarkers(CVolumeViewer* viewer,
         return style;
     };
 
-    auto appendMarker = [&](const VertexMarker& marker) {
+    const auto appendMarker = [&](VertexMarker marker) {
         const QPointF scene = viewer->volumePointToScene(marker.world);
         const auto style = buildStyle(marker);
         builder.addCircle(scene, kMarkerRadius, true, style);
     };
 
-    for (const auto& marker : _touchedVertices) {
+    for (const auto& marker : state.neighbours) {
         appendMarker(marker);
     }
 
-    if (_activeVertex) {
-        auto active = *_activeVertex;
+    if (state.activeMarker) {
+        auto active = *state.activeMarker;
         active.isActive = true;
         appendMarker(active);
     }
