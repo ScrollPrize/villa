@@ -66,8 +66,8 @@
 #include "SeedingWidget.hpp"
 #include "DrawingWidget.hpp"
 #include "CommandLineToolRunner.hpp"
-#include "SegmentationModule.hpp"
-#include "SegmentationGrowth.hpp"
+#include "segmentation/SegmentationModule.hpp"
+#include "segmentation/SegmentationGrowth.hpp"
 #include "SurfacePanelController.hpp"
 #include "MenuActionController.hpp"
 

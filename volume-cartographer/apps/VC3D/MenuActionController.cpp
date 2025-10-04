@@ -3,7 +3,7 @@
 #include "CWindow.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
-#include "SegmentationModule.hpp"
+#include "segmentation/SegmentationModule.hpp"
 #include "OpChain.hpp"
 #include "OpsList.hpp"
 #include "OpsSettings.hpp"
@@ -12,7 +12,7 @@
 #include "CSurfaceCollection.hpp"
 #include "CommandLineToolRunner.hpp"
 #include "SettingsDialog.hpp"
-#include "SegmentationModule.hpp"
+#include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
 
 #include "vc/core/types/VolumePkg.hpp"

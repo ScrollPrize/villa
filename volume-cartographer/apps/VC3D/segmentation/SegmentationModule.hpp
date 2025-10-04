@@ -6,6 +6,7 @@
 
 #include <deque>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -28,7 +29,9 @@ class SegmentationWidget;
 class VCCollection;
 class ViewerManager;
 class QKeyEvent;
-class QTimer;
+class SegmentationBrushTool;
+class SegmentationLineTool;
+class SegmentationPushPullTool;
 
 class SegmentationModule : public QObject
 {
@@ -43,6 +46,7 @@ public:
                        VCCollection* pointCollection,
                        bool editingEnabled,
                        QObject* parent = nullptr);
+    ~SegmentationModule();
 
     [[nodiscard]] bool editingEnabled() const { return _editingEnabled; }
     void setEditingEnabled(bool enabled);
@@ -97,6 +101,10 @@ signals:
                               int steps);
 
 private:
+    friend class SegmentationBrushTool;
+    friend class SegmentationLineTool;
+    friend class SegmentationPushPullTool;
+
     enum class FalloffTool
     {
         Drag,
@@ -127,12 +135,6 @@ private:
 
         void set(int r, int c, const cv::Vec3f& w, CVolumeViewer* v);
         void clear();
-    };
-
-    struct PushPullState
-    {
-        bool active{false};
-        int direction{0};
     };
 
     void bindWidgetSignals();
@@ -219,7 +221,6 @@ private:
     void stopPushPull(int direction);
     void stopAllPushPull();
     bool applyPushPullStep();
-    void onPushPullTick();
 
     SegmentationWidget* _widget{nullptr};
     SegmentationEditManager* _editManager{nullptr};
@@ -255,28 +256,15 @@ private:
     DragState _drag;
     HoverState _hover;
     QSet<CVolumeViewer*> _attachedViewers;
-    QTimer* _pushPullTimer{nullptr};
-    PushPullState _pushPull;
 
     std::function<bool(CVolumeViewer*, const cv::Vec3f&)> _rotationHandleHitTester;
 
-    bool _invalidationBrushActive{false};
-    bool _paintStrokeActive{false};
-    std::vector<cv::Vec3f> _currentPaintStroke;
-    std::vector<std::vector<cv::Vec3f>> _pendingPaintStrokes;
-    std::vector<cv::Vec3f> _paintOverlayPoints;
-    cv::Vec3f _lastPaintSample{0.0f, 0.0f, 0.0f};
-    bool _hasLastPaintSample{false};
     bool _lineDrawKeyActive{false};
-    bool _lineStrokeActive{false};
-    std::vector<cv::Vec3f> _lineStrokePoints;
-    std::vector<cv::Vec3f> _lineStrokeOverlayPoints;
-    cv::Vec3f _lastLineSample{0.0f, 0.0f, 0.0f};
-    bool _hasLastLineSample{false};
-    float _pushPullStepMultiplier{4.00f};
-    bool _alphaPushPullEnabled{false};
-    AlphaPushPullConfig _alphaPushPullConfig{};
     std::optional<std::vector<SegmentationGrowthDirection>> _pendingShortcutDirections;
+
+    std::unique_ptr<SegmentationBrushTool> _brushTool;
+    std::unique_ptr<SegmentationLineTool> _lineTool;
+    std::unique_ptr<SegmentationPushPullTool> _pushPullTool;
 
     struct UndoState
     {
@@ -284,5 +272,4 @@ private:
     };
     std::deque<UndoState> _undoStack;
     bool _suppressUndoCapture{false};
-    bool _pushPullUndoCaptured{false};
 };

@@ -5,6 +5,9 @@
 #include "CSurfaceCollection.hpp"
 #include "SegmentationEditManager.hpp"
 #include "SegmentationWidget.hpp"
+#include "SegmentationBrushTool.hpp"
+#include "SegmentationLineTool.hpp"
+#include "SegmentationPushPullTool.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 
@@ -19,13 +22,11 @@
 #include <QKeySequence>
 #include <QLoggingCategory>
 #include <QPointer>
-#include <QTimer>
 
 #include <algorithm>
 #include <cmath>
 #include <optional>
 #include <limits>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -39,8 +40,6 @@ constexpr int kStatusShort = 1500;
 constexpr int kStatusMedium = 2000;
 constexpr int kStatusLong = 5000;
 constexpr int kMaxUndoStates = 5;
-constexpr float kBrushSampleSpacing = 2.0f;
-
 constexpr float kAlphaMinStep = 0.05f;
 constexpr float kAlphaMaxStep = 20.0f;
 constexpr float kAlphaMinRange = 0.01f;
@@ -125,6 +124,8 @@ void SegmentationModule::HoverState::clear()
     viewer = nullptr;
 }
 
+SegmentationModule::~SegmentationModule() = default;
+
 SegmentationModule::SegmentationModule(SegmentationWidget* widget,
                                        SegmentationEditManager* editManager,
                                        SegmentationOverlayController* overlay,
@@ -144,6 +145,10 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     , _growthMethod(_widget ? _widget->growthMethod() : SegmentationGrowthMethod::Tracer)
     , _growthSteps(_widget ? _widget->growthSteps() : 5)
 {
+    float initialPushPullStep = 4.0f;
+    bool initialAlphaPushPullEnabled = false;
+    AlphaPushPullConfig initialAlphaConfig{};
+
     if (_widget) {
         _dragRadiusSteps = _widget->dragRadius();
         _dragSigmaSteps = _widget->dragSigma();
@@ -151,11 +156,11 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _lineSigmaSteps = _widget->lineSigma();
         _pushPullRadiusSteps = _widget->pushPullRadius();
         _pushPullSigmaSteps = _widget->pushPullSigma();
-        _pushPullStepMultiplier = std::clamp(_widget->pushPullStep(), 0.05f, 10.0f);
+        initialPushPullStep = std::clamp(_widget->pushPullStep(), 0.05f, 10.0f);
         _smoothStrength = std::clamp(_widget->smoothingStrength(), 0.0f, 1.0f);
         _smoothIterations = std::clamp(_widget->smoothingIterations(), 1, 25);
-        _alphaPushPullEnabled = _widget->alphaPushPullEnabled();
-        _alphaPushPullConfig = sanitizeAlphaConfig(_widget->alphaPushPullConfig());
+        initialAlphaPushPullEnabled = _widget->alphaPushPullEnabled();
+        initialAlphaConfig = sanitizeAlphaConfig(_widget->alphaPushPullConfig());
     }
 
     if (_overlay) {
@@ -163,12 +168,14 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _overlay->setEditingEnabled(_editingEnabled);
     }
 
-    useFalloff(FalloffTool::Drag);
+    _brushTool = std::make_unique<SegmentationBrushTool>(*this, _editManager, _widget, _surfaces);
+    _lineTool = std::make_unique<SegmentationLineTool>(*this, _editManager, _surfaces, _smoothStrength, _smoothIterations);
+    _pushPullTool = std::make_unique<SegmentationPushPullTool>(*this, _editManager, _widget, _overlay, _surfaces);
+    _pushPullTool->setStepMultiplier(initialPushPullStep);
+    _pushPullTool->setAlphaEnabled(initialAlphaPushPullEnabled);
+    _pushPullTool->setAlphaConfig(initialAlphaConfig);
 
-    _pushPullTimer = new QTimer(this);
-    _pushPullTimer->setInterval(30);
-    connect(_pushPullTimer, &QTimer::timeout,
-            this, &SegmentationModule::onPushPullTick);
+    useFalloff(FalloffTool::Drag);
 
     bindWidgetSignals();
 
@@ -515,12 +522,17 @@ void SegmentationModule::useFalloff(FalloffTool tool)
 void SegmentationModule::setPushPullStepMultiplier(float multiplier)
 {
     const float sanitized = std::clamp(multiplier, 0.05f, 10.0f);
-    if (std::fabs(sanitized - _pushPullStepMultiplier) < 1e-4f) {
+    if (_pushPullTool && std::fabs(sanitized - _pushPullTool->stepMultiplier()) < 1e-4f) {
+        if (_widget && std::fabs(_widget->pushPullStep() - sanitized) >= 1e-4f) {
+            _widget->setPushPullStep(sanitized);
+        }
         return;
     }
-    _pushPullStepMultiplier = sanitized;
-    if (_widget) {
-        _widget->setPushPullStep(_pushPullStepMultiplier);
+    if (_pushPullTool) {
+        _pushPullTool->setStepMultiplier(sanitized);
+    }
+    if (_widget && std::fabs(_widget->pushPullStep() - sanitized) >= 1e-4f) {
+        _widget->setPushPullStep(sanitized);
     }
 }
 
@@ -534,6 +546,9 @@ void SegmentationModule::setSmoothingStrength(float strength)
     if (_widget) {
         _widget->setSmoothingStrength(_smoothStrength);
     }
+    if (_lineTool) {
+        _lineTool->setSmoothing(_smoothStrength, _smoothIterations);
+    }
 }
 
 void SegmentationModule::setSmoothingIterations(int iterations)
@@ -546,14 +561,22 @@ void SegmentationModule::setSmoothingIterations(int iterations)
     if (_widget) {
         _widget->setSmoothingIterations(_smoothIterations);
     }
+    if (_lineTool) {
+        _lineTool->setSmoothing(_smoothStrength, _smoothIterations);
+    }
 }
 
 void SegmentationModule::setAlphaPushPullEnabled(bool enabled)
 {
-    if (_alphaPushPullEnabled == enabled) {
+    if (_pushPullTool && _pushPullTool->alphaEnabled() == enabled) {
+        if (_widget && _widget->alphaPushPullEnabled() != enabled) {
+            _widget->setAlphaPushPullEnabled(enabled);
+        }
         return;
     }
-    _alphaPushPullEnabled = enabled;
+    if (_pushPullTool) {
+        _pushPullTool->setAlphaEnabled(enabled);
+    }
     if (_widget && _widget->alphaPushPullEnabled() != enabled) {
         _widget->setAlphaPushPullEnabled(enabled);
     }
@@ -562,12 +585,17 @@ void SegmentationModule::setAlphaPushPullEnabled(bool enabled)
 void SegmentationModule::setAlphaPushPullConfig(const AlphaPushPullConfig& config)
 {
     AlphaPushPullConfig sanitized = sanitizeAlphaConfig(config);
-    if (alphaConfigsEqual(_alphaPushPullConfig, sanitized)) {
+    if (_pushPullTool && alphaConfigsEqual(_pushPullTool->alphaConfig(), sanitized)) {
+        if (_widget) {
+            _widget->setAlphaPushPullConfig(sanitized);
+        }
         return;
     }
-    _alphaPushPullConfig = sanitized;
+    if (_pushPullTool) {
+        _pushPullTool->setAlphaConfig(sanitized);
+    }
     if (_widget) {
-        _widget->setAlphaPushPullConfig(_alphaPushPullConfig);
+        _widget->setAlphaPushPullConfig(sanitized);
     }
 }
 
@@ -774,7 +802,6 @@ bool SegmentationModule::restoreUndoSnapshot()
         clearInvalidationBrush();
         refreshOverlay();
         emitPendingChanges();
-        _pushPullUndoCaptured = false;
     } else {
         _undoStack.push_back(std::move(state));
     }
@@ -786,7 +813,6 @@ bool SegmentationModule::restoreUndoSnapshot()
 void SegmentationModule::clearUndoStack()
 {
     _undoStack.clear();
-    _pushPullUndoCaptured = false;
 }
 
 bool SegmentationModule::hasActiveSession() const
@@ -846,7 +872,8 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         if (_editingEnabled && !_growthInProgress && _editManager && _editManager->hasSession()) {
             _lineDrawKeyActive = true;
             stopAllPushPull();
-            if (_invalidationBrushActive) {
+            const bool brushActive = _brushTool && _brushTool->brushActive();
+            if (brushActive) {
                 setInvalidationBrushActive(false);
                 clearInvalidationBrush();
             }
@@ -956,7 +983,7 @@ bool SegmentationModule::handleKeyRelease(QKeyEvent* event)
 
     if (event->key() == Qt::Key_S && !event->isAutoRepeat()) {
         _lineDrawKeyActive = false;
-        if (_lineStrokeActive) {
+        if (_lineTool && _lineTool->strokeActive()) {
             finishLineDragStroke();
         }
         event->accept();
@@ -1112,29 +1139,47 @@ void SegmentationModule::refreshOverlay()
     }
 
     std::vector<cv::Vec3f> maskPoints;
-    maskPoints.reserve(_paintOverlayPoints.size() + _currentPaintStroke.size() +
-                       _lineStrokeOverlayPoints.size());
-    maskPoints.insert(maskPoints.end(), _paintOverlayPoints.begin(), _paintOverlayPoints.end());
-    maskPoints.insert(maskPoints.end(), _currentPaintStroke.begin(), _currentPaintStroke.end());
-    maskPoints.insert(maskPoints.end(), _lineStrokeOverlayPoints.begin(), _lineStrokeOverlayPoints.end());
+    std::size_t maskReserve = 0;
+    const bool brushHasOverlay = _brushTool &&
+                                 (!_brushTool->overlayPoints().empty() ||
+                                  !_brushTool->currentStrokePoints().empty());
+    if (_brushTool) {
+        maskReserve += _brushTool->overlayPoints().size();
+        maskReserve += _brushTool->currentStrokePoints().size();
+    }
+    if (_lineTool) {
+        maskReserve += _lineTool->overlayPoints().size();
+    }
+    maskPoints.reserve(maskReserve);
+    if (_brushTool) {
+        const auto& overlayPts = _brushTool->overlayPoints();
+        maskPoints.insert(maskPoints.end(), overlayPts.begin(), overlayPts.end());
+        const auto& strokePts = _brushTool->currentStrokePoints();
+        maskPoints.insert(maskPoints.end(), strokePts.begin(), strokePts.end());
+    }
+    if (_lineTool) {
+        const auto& linePts = _lineTool->overlayPoints();
+        maskPoints.insert(maskPoints.end(), linePts.begin(), linePts.end());
+    }
 
     const bool maskVisible = !maskPoints.empty();
-    const bool hasLineStroke = !_lineStrokeOverlayPoints.empty();
+    const bool hasLineStroke = _lineTool && !_lineTool->overlayPoints().empty();
+    const bool lineStrokeActive = _lineTool && _lineTool->strokeActive();
+    const bool brushActive = _brushTool && _brushTool->brushActive();
+    const bool brushStrokeActive = _brushTool && _brushTool->strokeActive();
 
     FalloffTool overlayTool = _activeFalloff;
     if (hasLineStroke) {
         overlayTool = FalloffTool::Line;
-    } else if (!_paintOverlayPoints.empty() || !_currentPaintStroke.empty() ||
-               _paintStrokeActive || _invalidationBrushActive) {
+    } else if (brushHasOverlay || brushStrokeActive || brushActive) {
         overlayTool = FalloffTool::Drag;
-    } else if (_pushPull.active) {
+    } else if (_pushPullTool && _pushPullTool->isActive()) {
         overlayTool = FalloffTool::PushPull;
     }
 
     const float overlayRadiusSteps = falloffRadius(overlayTool);
     const float brushPixelRadius = std::clamp(overlayRadiusSteps * 1.5f, 3.0f, 18.0f);
-    const bool drawingOverlay = _invalidationBrushActive || _paintStrokeActive || _lineStrokeActive ||
-                                hasLineStroke;
+    const bool drawingOverlay = brushActive || brushStrokeActive || lineStrokeActive || hasLineStroke;
     const float brushOpacity = drawingOverlay ? 0.6f : 0.45f;
     const auto renderMode = hasLineStroke ? ViewerOverlayControllerBase::PathRenderMode::LineStrip
                                           : ViewerOverlayControllerBase::PathRenderMode::Points;
@@ -1448,259 +1493,85 @@ void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod met
 
 void SegmentationModule::setInvalidationBrushActive(bool active)
 {
-    const bool shouldEnable = active && _editingEnabled && !_growthInProgress && !_correctionsAnnotateMode &&
-                              _editManager && _editManager->hasSession();
-    if (_invalidationBrushActive == shouldEnable) {
-        if (_widget) {
-            _widget->setEraseBrushActive(shouldEnable);
-        }
+    if (!_brushTool) {
         return;
     }
 
-    _invalidationBrushActive = shouldEnable;
-    if (!_invalidationBrushActive) {
-        _hasLastPaintSample = false;
-        if (_activeFalloff == FalloffTool::Drag) {
-            // Keep drag falloff active by default.
+    const bool shouldEnable = active && _editingEnabled && !_growthInProgress && !_correctionsAnnotateMode &&
+                              _editManager && _editManager->hasSession();
+
+    if (!shouldEnable) {
+        if (_brushTool->brushActive()) {
+            _brushTool->setActive(false);
         }
-    }
-    if (_invalidationBrushActive && _activeFalloff != FalloffTool::Drag) {
-        useFalloff(FalloffTool::Drag);
-    }
-
-    if (_widget) {
-        _widget->setEraseBrushActive(_invalidationBrushActive);
+        _brushTool->clear();
+        return;
     }
 
-    refreshOverlay();
+    if (!_brushTool->brushActive()) {
+        _brushTool->setActive(true);
+    }
 }
 
 void SegmentationModule::clearInvalidationBrush()
 {
-    _paintStrokeActive = false;
-    _currentPaintStroke.clear();
-    _pendingPaintStrokes.clear();
-    _paintOverlayPoints.clear();
-    _hasLastPaintSample = false;
-
-    if (!_invalidationBrushActive && _widget) {
-        _widget->setEraseBrushActive(false);
+    if (_brushTool) {
+        _brushTool->clear();
     }
-
-    refreshOverlay();
 }
 
 void SegmentationModule::startPaintStroke(const cv::Vec3f& worldPos)
 {
-    if (_activeFalloff != FalloffTool::Drag) {
-        useFalloff(FalloffTool::Drag);
+    if (_brushTool) {
+        _brushTool->startStroke(worldPos);
     }
-    _paintStrokeActive = true;
-    _currentPaintStroke.clear();
-    _currentPaintStroke.push_back(worldPos);
-    _paintOverlayPoints.push_back(worldPos);
-    _lastPaintSample = worldPos;
-    _hasLastPaintSample = true;
-    refreshOverlay();
 }
 
 void SegmentationModule::extendPaintStroke(const cv::Vec3f& worldPos, bool forceSample)
 {
-    if (!_paintStrokeActive) {
-        return;
+    if (_brushTool) {
+        _brushTool->extendStroke(worldPos, forceSample);
     }
-
-    const float spacing = kBrushSampleSpacing;
-    const float spacingSq = spacing * spacing;
-
-    if (_hasLastPaintSample) {
-        const cv::Vec3f delta = worldPos - _lastPaintSample;
-        const float distanceSq = delta.dot(delta);
-        if (!forceSample && distanceSq < spacingSq) {
-            return;
-        }
-
-        const float distance = std::sqrt(distanceSq);
-        if (distance > spacing) {
-            const cv::Vec3f direction = delta / distance;
-            float travelled = spacing;
-            while (travelled < distance) {
-                const cv::Vec3f intermediate = _lastPaintSample + direction * travelled;
-                _currentPaintStroke.push_back(intermediate);
-                _paintOverlayPoints.push_back(intermediate);
-                travelled += spacing;
-            }
-        }
-    }
-
-    _currentPaintStroke.push_back(worldPos);
-    _paintOverlayPoints.push_back(worldPos);
-    _lastPaintSample = worldPos;
-    _hasLastPaintSample = true;
-    refreshOverlay();
 }
 
 void SegmentationModule::finishPaintStroke()
 {
-    if (!_paintStrokeActive) {
-        return;
+    if (_brushTool) {
+        _brushTool->finishStroke();
     }
-
-    _paintStrokeActive = false;
-    if (!_currentPaintStroke.empty()) {
-        _pendingPaintStrokes.push_back(_currentPaintStroke);
-    }
-    _currentPaintStroke.clear();
-    _hasLastPaintSample = false;
-    refreshOverlay();
 }
 
 void SegmentationModule::startLineDragStroke(const cv::Vec3f& worldPos)
 {
-    useFalloff(FalloffTool::Line);
-    _lineStrokeActive = true;
-    _lineStrokePoints.clear();
-    _lineStrokeOverlayPoints.clear();
-    _lineStrokePoints.push_back(worldPos);
-    _lineStrokeOverlayPoints.push_back(worldPos);
-    _lastLineSample = worldPos;
-    _hasLastLineSample = true;
-    refreshOverlay();
+    if (_lineTool) {
+        _lineTool->startStroke(worldPos);
+    }
 }
 
 void SegmentationModule::extendLineDragStroke(const cv::Vec3f& worldPos, bool forceSample)
 {
-    if (!_lineStrokeActive) {
-        return;
+    if (_lineTool) {
+        _lineTool->extendStroke(worldPos, forceSample);
     }
-
-    const float spacing = kBrushSampleSpacing;
-    const float spacingSq = spacing * spacing;
-
-    if (_hasLastLineSample) {
-        const cv::Vec3f delta = worldPos - _lastLineSample;
-        const float distanceSq = delta.dot(delta);
-        if (!forceSample && distanceSq < spacingSq) {
-            return;
-        }
-
-        const float distance = std::sqrt(distanceSq);
-        if (distance > spacing) {
-            const cv::Vec3f direction = delta / distance;
-            float travelled = spacing;
-            while (travelled < distance) {
-                const cv::Vec3f intermediate = _lastLineSample + direction * travelled;
-                _lineStrokePoints.push_back(intermediate);
-                _lineStrokeOverlayPoints.push_back(intermediate);
-                travelled += spacing;
-            }
-        }
-    }
-
-    _lineStrokePoints.push_back(worldPos);
-    _lineStrokeOverlayPoints.push_back(worldPos);
-    _lastLineSample = worldPos;
-    _hasLastLineSample = true;
-    refreshOverlay();
 }
 
 void SegmentationModule::finishLineDragStroke()
 {
-    if (!_lineStrokeActive) {
-        return;
-    }
-
-    _lineStrokeActive = false;
-    const std::vector<cv::Vec3f> strokeCopy = _lineStrokePoints;
-    applyLineDragStroke(strokeCopy);
-    clearLineDragStroke();
-    if (!_lineDrawKeyActive) {
-        useFalloff(FalloffTool::Drag);
+    if (_lineTool) {
+        _lineTool->finishStroke(_lineDrawKeyActive);
     }
 }
 
 bool SegmentationModule::applyLineDragStroke(const std::vector<cv::Vec3f>& stroke)
 {
-    useFalloff(FalloffTool::Line);
-    if (!_editManager || !_editManager->hasSession()) {
-        return false;
-    }
-    if (stroke.size() < 2) {
-        return false;
-    }
-
-    using GridKey = SegmentationEditManager::GridKey;
-    using GridKeyHash = SegmentationEditManager::GridKeyHash;
-
-    std::unordered_set<GridKey, GridKeyHash> visited;
-    visited.reserve(stroke.size());
-
-    bool snapshotCaptured = false;
-    bool anyMoved = false;
-
-    for (const auto& world : stroke) {
-        auto gridIndex = _editManager->worldToGridIndex(world);
-        if (!gridIndex) {
-            continue;
-        }
-
-        GridKey key{gridIndex->first, gridIndex->second};
-        if (!visited.insert(key).second) {
-            continue;
-        }
-
-        if (!_editManager->beginActiveDrag(*gridIndex)) {
-            continue;
-        }
-
-        bool capturedThisSample = false;
-        if (!snapshotCaptured) {
-            snapshotCaptured = captureUndoSnapshot();
-            capturedThisSample = snapshotCaptured;
-        }
-
-        if (!_editManager->updateActiveDrag(world)) {
-            _editManager->cancelActiveDrag();
-            if (capturedThisSample) {
-                discardLastUndoSnapshot();
-                snapshotCaptured = false;
-            }
-            continue;
-        }
-
-        if (_smoothStrength > 0.0f && _smoothIterations > 0) {
-            _editManager->smoothRecentTouched(_smoothStrength, _smoothIterations);
-        }
-
-        _editManager->commitActiveDrag();
-        anyMoved = true;
-    }
-
-    if (!anyMoved) {
-        if (snapshotCaptured) {
-            discardLastUndoSnapshot();
-        }
-        return false;
-    }
-
-    _editManager->applyPreview();
-    if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface());
-    }
-
-    refreshOverlay();
-    emitPendingChanges();
-    emit statusMessageRequested(tr("Applied segmentation drag along path."), kStatusShort);
-    return true;
+    return _lineTool ? _lineTool->applyStroke(stroke) : false;
 }
 
 void SegmentationModule::clearLineDragStroke()
 {
-    _lineStrokeActive = false;
-    _lineStrokePoints.clear();
-    _lineStrokeOverlayPoints.clear();
-    _hasLastLineSample = false;
-    refreshOverlay();
+    if (_lineTool) {
+        _lineTool->clear();
+    }
     if (!_lineDrawKeyActive && _activeFalloff == FalloffTool::Line) {
         useFalloff(FalloffTool::Drag);
     }
@@ -1708,77 +1579,10 @@ void SegmentationModule::clearLineDragStroke()
 
 bool SegmentationModule::applyInvalidationBrush()
 {
-    if (!_editManager || !_editManager->hasSession()) {
+    if (!_brushTool) {
         return false;
     }
-
-    if (_paintStrokeActive) {
-        finishPaintStroke();
-    }
-
-    if (_pendingPaintStrokes.empty()) {
-        return false;
-    }
-
-    using GridKey = SegmentationEditManager::GridKey;
-    using GridKeyHash = SegmentationEditManager::GridKeyHash;
-
-    std::unordered_set<GridKey, GridKeyHash> targets;
-    std::size_t estimate = 0;
-    for (const auto& stroke : _pendingPaintStrokes) {
-        estimate += stroke.size();
-    }
-    targets.reserve(estimate);
-
-    const float stepWorld = gridStepWorld();
-    const float dragRadius = std::max(_dragRadiusSteps, 0.5f);
-    const float maxDistance = stepWorld * std::max(dragRadius * 6.0f, 15.0f);
-
-    for (const auto& stroke : _pendingPaintStrokes) {
-        for (const auto& world : stroke) {
-            float gridDistance = 0.0f;
-            auto grid = _editManager->worldToGridIndex(world, &gridDistance);
-            if (!grid) {
-                continue;
-            }
-            if (maxDistance > 0.0f && gridDistance > maxDistance) {
-                continue;
-            }
-            targets.insert(GridKey{grid->first, grid->second});
-        }
-    }
-
-    if (targets.empty()) {
-        clearInvalidationBrush();
-        return false;
-    }
-
-    bool snapshotCaptured = captureUndoSnapshot();
-    const float brushRadiusSteps = dragRadius;
-    bool anyChanged = false;
-    for (const auto& key : targets) {
-        if (_editManager->markInvalidRegion(key.row, key.col, brushRadiusSteps)) {
-            anyChanged = true;
-        }
-    }
-
-    clearInvalidationBrush();
-
-    if (!anyChanged) {
-        if (snapshotCaptured) {
-            discardLastUndoSnapshot();
-        }
-        return false;
-    }
-
-    if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface());
-    }
-
-    emitPendingChanges();
-    emit statusMessageRequested(tr("Invalidated %1 brush target(s).").arg(static_cast<int>(targets.size())),
-                                kStatusMedium);
-    return true;
+    return _brushTool->applyPending(_dragRadiusSteps);
 }
 
 void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
@@ -1821,9 +1625,11 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
         return;
     }
 
+    const bool brushActive = _brushTool && _brushTool->brushActive();
+
     if (_lineDrawKeyActive) {
         stopAllPushPull();
-        if (_invalidationBrushActive) {
+        if (brushActive) {
             setInvalidationBrushActive(false);
             clearInvalidationBrush();
         }
@@ -1834,7 +1640,7 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
         return;
     }
 
-    if (_invalidationBrushActive) {
+    if (brushActive) {
         stopAllPushPull();
         startPaintStroke(worldPos);
         return;
@@ -1865,7 +1671,8 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
 {
     Q_UNUSED(modifiers);
 
-    if (_lineStrokeActive) {
+    const bool lineStrokeActive = _lineTool && _lineTool->strokeActive();
+    if (lineStrokeActive) {
         if (buttons.testFlag(Qt::LeftButton)) {
             extendLineDragStroke(worldPos);
         } else {
@@ -1874,7 +1681,8 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
         return;
     }
 
-    if (_paintStrokeActive) {
+    const bool paintStrokeActive = _brushTool && _brushTool->strokeActive();
+    if (paintStrokeActive) {
         if (buttons.testFlag(Qt::LeftButton)) {
             extendPaintStroke(worldPos);
         } else {
@@ -1902,13 +1710,15 @@ void SegmentationModule::handleMouseRelease(CVolumeViewer* /*viewer*/,
                                             Qt::MouseButton button,
                                             Qt::KeyboardModifiers /*modifiers*/)
 {
-    if (_lineStrokeActive && button == Qt::LeftButton) {
+    const bool lineStrokeActive = _lineTool && _lineTool->strokeActive();
+    if (lineStrokeActive && button == Qt::LeftButton) {
         extendLineDragStroke(worldPos, true);
         finishLineDragStroke();
         return;
     }
 
-    if (_paintStrokeActive && button == Qt::LeftButton) {
+    const bool paintStrokeActive = _brushTool && _brushTool->strokeActive();
+    if (paintStrokeActive && button == Qt::LeftButton) {
         extendPaintStroke(worldPos, true);
         finishPaintStroke();
         return;
@@ -1935,9 +1745,10 @@ void SegmentationModule::handleWheel(CVolumeViewer* viewer,
     }
     const float step = deltaSteps * 0.25f;
     FalloffTool targetTool = FalloffTool::Drag;
-    if (_lineDrawKeyActive || _lineStrokeActive) {
+    const bool lineStrokeActive = _lineTool && _lineTool->strokeActive();
+    if (_lineDrawKeyActive || lineStrokeActive) {
         targetTool = FalloffTool::Line;
-    } else if (_pushPull.active) {
+    } else if (_pushPullTool && _pushPullTool->isActive()) {
         targetTool = FalloffTool::PushPull;
     }
 
@@ -2118,290 +1929,28 @@ void SegmentationModule::updateHover(CVolumeViewer* viewer, const cv::Vec3f& wor
 
 bool SegmentationModule::startPushPull(int direction)
 {
-    if (direction == 0) {
-        return false;
-    }
-
-    if (_pushPull.active && _pushPull.direction == direction) {
-        if (_pushPullTimer && !_pushPullTimer->isActive()) {
-            _pushPullTimer->start();
-        }
-        return true;
-    }
-
-    if (!_hover.valid || !_hover.viewer || !isSegmentationViewer(_hover.viewer)) {
-        return false;
-    }
-    if (!_editManager || !_editManager->hasSession()) {
-        return false;
-    }
-
-    _pushPull.active = true;
-    _pushPull.direction = direction;
-    _pushPullUndoCaptured = false;
-    useFalloff(FalloffTool::PushPull);
-
-    if (_pushPullTimer && !_pushPullTimer->isActive()) {
-        _pushPullTimer->start();
-    }
-
-    if (!applyPushPullStep()) {
-        stopAllPushPull();
-        return false;
-    }
-
-    return true;
+    return _pushPullTool ? _pushPullTool->start(direction) : false;
 }
 
 void SegmentationModule::stopPushPull(int direction)
 {
-    if (!_pushPull.active) {
-        return;
+    if (_pushPullTool) {
+        _pushPullTool->stop(direction);
     }
-    if (direction != 0 && direction != _pushPull.direction) {
-        return;
-    }
-    stopAllPushPull();
 }
 
 void SegmentationModule::stopAllPushPull()
 {
-    _pushPull.active = false;
-    _pushPull.direction = 0;
-    if (_pushPullTimer && _pushPullTimer->isActive()) {
-        _pushPullTimer->stop();
-    }
-    _pushPullUndoCaptured = false;
-    if (_activeFalloff == FalloffTool::PushPull) {
-        useFalloff(FalloffTool::Drag);
+    if (_pushPullTool) {
+        _pushPullTool->stopAll();
     }
 }
 
 bool SegmentationModule::applyPushPullStep()
 {
-    if (!_pushPull.active || !_editManager || !_editManager->hasSession()) {
-        return false;
-    }
-
-    if (!_hover.valid || !_hover.viewer || !isSegmentationViewer(_hover.viewer)) {
-        return false;
-    }
-
-    const int row = _hover.row;
-    const int col = _hover.col;
-
-    bool snapshotCapturedThisStep = false;
-    if (!_pushPullUndoCaptured) {
-        snapshotCapturedThisStep = captureUndoSnapshot();
-        if (snapshotCapturedThisStep) {
-            _pushPullUndoCaptured = true;
-        }
-    }
-
-    if (!_editManager->beginActiveDrag({row, col})) {
-        if (snapshotCapturedThisStep) {
-            discardLastUndoSnapshot();
-            _pushPullUndoCaptured = false;
-        }
-        return false;
-    }
-
-    auto centerWorldOpt = _editManager->vertexWorldPosition(row, col);
-    if (!centerWorldOpt) {
-        _editManager->cancelActiveDrag();
-        if (snapshotCapturedThisStep) {
-            discardLastUndoSnapshot();
-            _pushPullUndoCaptured = false;
-        }
-        return false;
-    }
-    const cv::Vec3f centerWorld = *centerWorldOpt;
-
-    QuadSurface* baseSurface = _editManager->baseSurface();
-    if (!baseSurface) {
-        _editManager->cancelActiveDrag();
-        return false;
-    }
-
-    cv::Vec3f ptr = baseSurface->pointer();
-    baseSurface->pointTo(ptr, centerWorld, std::numeric_limits<float>::max(), 400);
-    cv::Vec3f normal = baseSurface->normal(ptr);
-    if (std::isnan(normal[0]) || std::isnan(normal[1]) || std::isnan(normal[2])) {
-        _editManager->cancelActiveDrag();
-        return false;
-    }
-
-    const float norm = cv::norm(normal);
-    if (norm <= 1e-4f) {
-        _editManager->cancelActiveDrag();
-        return false;
-    }
-    normal /= norm;
-
-    cv::Vec3f targetWorld = centerWorld;
-    bool usedAlphaPushPull = false;
-    bool alphaUnavailable = false;
-
-    if (_alphaPushPullEnabled) {
-        if (_alphaPushPullConfig.perVertex) {
-            const auto& drag = _editManager->activeDrag();
-            const auto& samples = drag.samples;
-            if (samples.empty()) {
-                _editManager->cancelActiveDrag();
-                if (snapshotCapturedThisStep) {
-                    discardLastUndoSnapshot();
-                    _pushPullUndoCaptured = false;
-                }
-                return false;
-            }
-
-            std::vector<cv::Vec3f> perVertexTargets;
-            perVertexTargets.reserve(samples.size());
-            std::vector<float> perVertexMovements;
-            perVertexMovements.reserve(samples.size());
-            bool anyMovement = false;
-            float minMovement = std::numeric_limits<float>::max();
-
-            for (const auto& sample : samples) {
-                cv::Vec3f sampleNormal = normal;
-                cv::Vec3f samplePtr = baseSurface->pointer();
-                baseSurface->pointTo(samplePtr, sample.baseWorld, std::numeric_limits<float>::max(), 400);
-                cv::Vec3f candidateNormal = baseSurface->normal(samplePtr);
-                if (std::isfinite(candidateNormal[0]) &&
-                    std::isfinite(candidateNormal[1]) &&
-                    std::isfinite(candidateNormal[2])) {
-                    const float candidateNorm = cv::norm(candidateNormal);
-                    if (candidateNorm > 1e-4f) {
-                        sampleNormal = candidateNormal / candidateNorm;
-                    }
-                }
-
-                bool sampleUnavailable = false;
-                auto sampleTarget = computeAlphaPushPullTarget(sample.baseWorld,
-                                                               sampleNormal,
-                                                               _pushPull.direction,
-                                                               baseSurface,
-                                                               _hover.viewer,
-                                                               &sampleUnavailable);
-                if (sampleUnavailable) {
-                    alphaUnavailable = true;
-                    break;
-                }
-
-                cv::Vec3f newWorld = sample.baseWorld;
-                float movement = 0.0f;
-                if (sampleTarget) {
-                    newWorld = *sampleTarget;
-                    const cv::Vec3f delta = newWorld - sample.baseWorld;
-                    movement = static_cast<float>(cv::norm(delta));
-                    if (movement >= 1e-4f) {
-                        anyMovement = true;
-                    }
-                }
-
-                perVertexTargets.push_back(newWorld);
-                perVertexMovements.push_back(movement);
-                minMovement = std::min(minMovement, movement);
-            }
-
-            const float perVertexLimit = std::max(0.0f, _alphaPushPullConfig.perVertexLimit);
-            if (perVertexLimit > 0.0f && !perVertexTargets.empty() && std::isfinite(minMovement)) {
-                const float maxAllowedMovement = minMovement + perVertexLimit;
-                for (std::size_t i = 0; i < perVertexTargets.size(); ++i) {
-                    if (perVertexMovements[i] > maxAllowedMovement + 1e-4f) {
-                        const cv::Vec3f& baseWorld = samples[i].baseWorld;
-                        const cv::Vec3f delta = perVertexTargets[i] - baseWorld;
-                        const float length = perVertexMovements[i];
-                        if (length > 1e-6f) {
-                            const float scale = maxAllowedMovement / length;
-                            perVertexTargets[i] = baseWorld + delta * scale;
-                            perVertexMovements[i] = maxAllowedMovement;
-                            if (maxAllowedMovement >= 1e-4f) {
-                                anyMovement = true;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (alphaUnavailable) {
-                _editManager->cancelActiveDrag();
-                if (snapshotCapturedThisStep) {
-                    discardLastUndoSnapshot();
-                    _pushPullUndoCaptured = false;
-                }
-                return false;
-            }
-
-            if (!anyMovement) {
-                _editManager->cancelActiveDrag();
-                if (snapshotCapturedThisStep) {
-                    discardLastUndoSnapshot();
-                    _pushPullUndoCaptured = false;
-                }
-                return false;
-            }
-
-            if (!_editManager->updateActiveDragTargets(perVertexTargets)) {
-                _editManager->cancelActiveDrag();
-                if (snapshotCapturedThisStep) {
-                    discardLastUndoSnapshot();
-                    _pushPullUndoCaptured = false;
-                }
-                return false;
-            }
-
-            usedAlphaPushPull = true;
-        } else {
-            auto alphaTarget = computeAlphaPushPullTarget(centerWorld,
-                                                         normal,
-                                                         _pushPull.direction,
-                                                         baseSurface,
-                                                         _hover.viewer,
-                                                         &alphaUnavailable);
-            if (alphaTarget) {
-                targetWorld = *alphaTarget;
-                usedAlphaPushPull = true;
-            } else if (!alphaUnavailable) {
-                _editManager->cancelActiveDrag();
-                if (snapshotCapturedThisStep) {
-                    discardLastUndoSnapshot();
-                    _pushPullUndoCaptured = false;
-                }
-                return false;
-            }
-        }
-    }
-
-    if (!usedAlphaPushPull) {
-        const float stepWorld = gridStepWorld() * _pushPullStepMultiplier;
-        if (stepWorld <= 0.0f) {
-            _editManager->cancelActiveDrag();
-            return false;
-        }
-        targetWorld = centerWorld + normal * (static_cast<float>(_pushPull.direction) * stepWorld);
-    }
-
-    if (!usedAlphaPushPull && !_editManager->updateActiveDrag(targetWorld)) {
-        _editManager->cancelActiveDrag();
-        if (snapshotCapturedThisStep) {
-            discardLastUndoSnapshot();
-            _pushPullUndoCaptured = false;
-        }
-        return false;
-    }
-
-    _editManager->commitActiveDrag();
-    _editManager->applyPreview();
-
-    if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface());
-    }
-
-    refreshOverlay();
-    emitPendingChanges();
-    return true;
+    return _pushPullTool ? _pushPullTool->applyStep() : false;
 }
+
 
 std::optional<cv::Vec3f> SegmentationModule::computeAlphaPushPullTarget(const cv::Vec3f& centerWorld,
                                                                         const cv::Vec3f& normal,
@@ -2414,7 +1963,7 @@ std::optional<cv::Vec3f> SegmentationModule::computeAlphaPushPullTarget(const cv
         *outUnavailable = false;
     }
 
-    if (!_alphaPushPullEnabled || !viewer || !surface) {
+    if (!_pushPullTool || !_pushPullTool->alphaEnabled() || !viewer || !surface) {
         return std::nullopt;
     }
 
@@ -2452,7 +2001,7 @@ std::optional<cv::Vec3f> SegmentationModule::computeAlphaPushPullTarget(const cv
 
     ChunkCache* cache = viewer->chunkCachePtr();
 
-    AlphaPushPullConfig cfg = sanitizeAlphaConfig(_alphaPushPullConfig);
+    AlphaPushPullConfig cfg = sanitizeAlphaConfig(_pushPullTool->alphaConfig());
 
     cv::Vec3f orientedNormal = normal * static_cast<float>(direction);
     const float norm = cv::norm(orientedNormal);
@@ -2537,11 +2086,4 @@ std::optional<cv::Vec3f> SegmentationModule::computeAlphaPushPullTarget(const cv
     }
 
     return targetWorld;
-}
-
-void SegmentationModule::onPushPullTick()
-{
-    if (!applyPushPullStep()) {
-        stopAllPushPull();
-    }
 }

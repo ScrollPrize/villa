@@ -21,11 +21,18 @@ set(srcs
     SeedingWidget.hpp
     DrawingWidget.cpp
     DrawingWidget.hpp
-    SegmentationWidget.cpp
-    SegmentationWidget.hpp
-    SegmentationGrowth.cpp
-    SegmentationEditManager.cpp
-    SegmentationEditManager.hpp
+    segmentation/SegmentationWidget.cpp
+    segmentation/SegmentationWidget.hpp
+    segmentation/SegmentationGrowth.cpp
+    segmentation/SegmentationEditManager.cpp
+    segmentation/SegmentationEditManager.hpp
+    segmentation/SegmentationBrushTool.cpp
+    segmentation/SegmentationBrushTool.hpp
+    segmentation/SegmentationLineTool.cpp
+    segmentation/SegmentationLineTool.hpp
+    segmentation/SegmentationPushPullTool.cpp
+    segmentation/SegmentationPushPullTool.hpp
+    segmentation/SegmentationTool.hpp
     overlays/SegmentationOverlayController.cpp
     overlays/SegmentationOverlayController.hpp
     overlays/PointsOverlayController.cpp
@@ -46,8 +53,8 @@ set(srcs
     SurfacePanelController.hpp
     MenuActionController.cpp
     MenuActionController.hpp
-    SegmentationModule.cpp
-    SegmentationModule.hpp
+    segmentation/SegmentationModule.cpp
+    segmentation/SegmentationModule.hpp
     ViewerManager.cpp
     ViewerManager.hpp
     SegmentRenderThread.cpp
@@ -71,6 +78,11 @@ endif()
 
 
 add_executable(VC3D ${srcs} resources.qrc)
+
+target_include_directories(VC3D
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
 
 target_link_libraries(VC3D
     vc_core
