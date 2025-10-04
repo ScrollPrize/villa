@@ -24,6 +24,8 @@ set(srcs
     segmentation/SegmentationWidget.cpp
     segmentation/SegmentationWidget.hpp
     segmentation/SegmentationGrowth.cpp
+    segmentation/SegmentationGrower.cpp
+    segmentation/SegmentationGrower.hpp
     segmentation/SegmentationEditManager.cpp
     segmentation/SegmentationEditManager.hpp
     segmentation/SegmentationBrushTool.cpp

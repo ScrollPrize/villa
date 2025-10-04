@@ -165,6 +165,19 @@ void SegmentationModule::setRotationHandleHitTester(std::function<bool(CVolumeVi
     _rotationHandleHitTester = std::move(tester);
 }
 
+SegmentationModule::HoverInfo SegmentationModule::hoverInfo() const
+{
+    HoverInfo info;
+    if (_hover.valid) {
+        info.valid = true;
+        info.row = _hover.row;
+        info.col = _hover.col;
+        info.world = _hover.world;
+        info.viewer = _hover.viewer;
+    }
+    return info;
+}
+
 void SegmentationModule::bindWidgetSignals()
 {
     if (!_widget) {
@@ -288,8 +301,7 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     if (!enabled) {
         stopAllPushPull();
         setCorrectionsAnnotateMode(false, false);
-        setInvalidationBrushActive(false);
-        clearInvalidationBrush();
+        deactivateInvalidationBrush();
         clearLineDragStroke();
         _lineDrawKeyActive = false;
         clearUndoStack();
@@ -381,8 +393,7 @@ void SegmentationModule::setGrowthInProgress(bool running)
     }
     if (running) {
         setCorrectionsAnnotateMode(false, false);
-        setInvalidationBrushActive(false);
-        clearInvalidationBrush();
+        deactivateInvalidationBrush();
         clearLineDragStroke();
         _lineDrawKeyActive = false;
     }
@@ -533,8 +544,7 @@ void SegmentationModule::setCorrectionsAnnotateMode(bool enabled, bool userIniti
     const bool wasActive = _corrections->annotateMode();
     const bool isActive = _corrections->setAnnotateMode(enabled, userInitiated, _editingEnabled);
     if (isActive && !wasActive) {
-        setInvalidationBrushActive(false);
-        clearInvalidationBrush();
+        deactivateInvalidationBrush();
     }
 }
 
@@ -583,8 +593,7 @@ void SegmentationModule::onCorrectionsCreateRequested()
     if (created != 0) {
         const bool nowActive = _corrections->setAnnotateMode(true, false, _editingEnabled);
         if (nowActive && !wasActive) {
-            setInvalidationBrushActive(false);
-            clearInvalidationBrush();
+            deactivateInvalidationBrush();
         }
     }
 }
@@ -677,6 +686,17 @@ void SegmentationModule::clearInvalidationBrush()
     if (_brushTool) {
         _brushTool->clear();
     }
+}
+
+void SegmentationModule::deactivateInvalidationBrush()
+{
+    if (!_brushTool) {
+        return;
+    }
+    if (_brushTool->brushActive()) {
+        _brushTool->setActive(false);
+    }
+    _brushTool->clear();
 }
 
 void SegmentationModule::clearLineDragStroke()

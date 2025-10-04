@@ -68,6 +68,7 @@
 #include "CommandLineToolRunner.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "segmentation/SegmentationGrowth.hpp"
+#include "segmentation/SegmentationGrower.hpp"
 #include "SurfacePanelController.hpp"
 #include "MenuActionController.hpp"
 
@@ -388,32 +389,6 @@ void ensureDockWidgetFeatures(QDockWidget* dock)
     dock->setFeatures(features);
 }
 
-void ensureGenerationsChannel(QuadSurface* surface)
-{
-    if (!surface) {
-        return;
-    }
-    cv::Mat generations = surface->channel("generations");
-    if (!generations.empty()) {
-        return;
-    }
-    cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (!points || points->empty()) {
-        return;
-    }
-    cv::Mat_<uint16_t> seeded(points->rows, points->cols, static_cast<uint16_t>(1));
-    surface->setChannel("generations", seeded);
-}
-
-QString cacheRootForVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
-{
-    if (!pkg) {
-        return QString();
-    }
-    const QString base = QString::fromStdString(pkg->getVolpkgDirectory());
-    return QDir(base).filePath(QStringLiteral("cache"));
-}
-
 QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
                                         QString* checkedPath)
 {
@@ -447,69 +422,7 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
     return QString();
 }
 
-void ensureSurfaceMetaObject(QuadSurface* surface)
-{
-    if (!surface) {
-        return;
-    }
-    if (surface->meta && surface->meta->is_object()) {
-        return;
-    }
-    if (surface->meta) {
-        delete surface->meta;
-    }
-    surface->meta = new nlohmann::json(nlohmann::json::object());
-}
-
-void synchronizeSurfaceMeta(const std::shared_ptr<VolumePkg>& pkg,
-                            QuadSurface* surface,
-                            SurfacePanelController* panel)
-{
-    if (!pkg || !surface) {
-        return;
-    }
-
-    const auto loadedIds = pkg->getLoadedSurfaceIDs();
-    for (const auto& id : loadedIds) {
-        auto surfMeta = pkg->getSurface(id);
-        if (!surfMeta) {
-            continue;
-        }
-        if (surfMeta->path == surface->path) {
-            if (!surfMeta->meta) {
-                surfMeta->meta = new nlohmann::json(nlohmann::json::object());
-            }
-            if (surface->meta) {
-                *surfMeta->meta = *surface->meta;
-            } else {
-                surfMeta->meta->clear();
-            }
-            surfMeta->bbox = surface->bbox();
-            surfMeta->setSurface(surface);
-            if (panel) {
-                panel->refreshSurfaceMetrics(id);
-            }
-        }
-    }
-}
-
-void refreshSegmentationViewers(ViewerManager* manager)
-{
-    if (!manager) {
-        return;
-    }
-    manager->forEachViewer([](CVolumeViewer* viewer) {
-        if (!viewer) {
-            return;
-        }
-        if (viewer->surfName() == "segmentation") {
-            viewer->invalidateVis();
-            viewer->renderVisible(true);
-        }
-    });
-}
-}
-
+} // namespace
 
 // Constructor
 CWindow::CWindow() :
@@ -1012,6 +925,9 @@ void CWindow::CreateWidgets(void)
         [this]() { return segmentationViewer(); },
         std::function<void()>{},
         this);
+    if (_segmentationGrower) {
+        _segmentationGrower->setSurfacePanel(_surfacePanel.get());
+    }
     connect(_surfacePanel.get(), &SurfacePanelController::surfacesLoaded, this, [this]() {
         emit sendSurfacesLoaded();
     });
@@ -1168,6 +1084,26 @@ void CWindow::CreateWidgets(void)
             });
     connect(_segmentationModule.get(), &SegmentationModule::growSurfaceRequested,
             this, &CWindow::onGrowSegmentationSurface);
+
+    SegmentationGrower::Context growerContext{
+        _segmentationModule.get(),
+        _segmentationWidget,
+        _surf_col,
+        _viewerManager.get(),
+        chunk_cache
+    };
+    SegmentationGrower::UiCallbacks growerCallbacks{
+        [this](const QString& text, int timeout) {
+            if (statusBar()) {
+                statusBar()->showMessage(text, timeout);
+            }
+        },
+        [this](QuadSurface* surface) {
+            applySlicePlaneOrientation(surface);
+        }
+    };
+    _segmentationGrower = std::make_unique<SegmentationGrower>(growerContext, growerCallbacks, this);
+
     connect(_segmentationWidget, &SegmentationWidget::volumeSelectionChanged, this, [this](const QString& volumeId) {
         if (!fVpkg) {
             statusBar()->showMessage(tr("No volume package loaded."), 4000);
@@ -2508,310 +2444,31 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                         SegmentationGrowthDirection direction,
                                         int steps)
 {
-    qCInfo(lcSegGrowth) << "Segmentation growth requested"
-                        << segmentationGrowthMethodToString(method)
-                        << segmentationGrowthDirectionToString(direction)
-                        << "steps" << steps;
-    if (_segmentationGrowthRunning) {
-        qCInfo(lcSegGrowth) << "Rejecting growth because another operation is running";
-        statusBar()->showMessage(tr("A surface growth operation is already running."), 4000);
+    if (!_segmentationGrower) {
+        statusBar()->showMessage(tr("Segmentation growth is unavailable."), 4000);
         return;
     }
 
-    auto* segmentationSurface = dynamic_cast<QuadSurface*>(_surf_col->surface("segmentation"));
-    if (!segmentationSurface) {
-        qCInfo(lcSegGrowth) << "Rejecting growth because segmentation surface is missing";
-        statusBar()->showMessage(tr("Segmentation surface is not available."), 4000);
-        return;
-    }
+    SegmentationGrower::Context context{
+        _segmentationModule.get(),
+        _segmentationWidget,
+        _surf_col,
+        _viewerManager.get(),
+        chunk_cache
+    };
+    _segmentationGrower->updateContext(context);
 
-    ensureGenerationsChannel(segmentationSurface);
-
-    std::string growthVolumeId = !_segmentationGrowthVolumeId.empty()
-                                     ? _segmentationGrowthVolumeId
-                                     : currentVolumeId;
-    std::shared_ptr<Volume> growthVolume;
-
-    if (fVpkg && !growthVolumeId.empty()) {
-        try {
-            growthVolume = fVpkg->volume(growthVolumeId);
-        } catch (const std::out_of_range&) {
-            growthVolume.reset();
-        }
-    }
-
-    if (!growthVolume) {
-        growthVolume = currentVolume;
-        growthVolumeId = currentVolumeId;
-    }
-
-    if (!growthVolume) {
-        qCInfo(lcSegGrowth) << "Rejecting growth because no usable volume is available";
-        statusBar()->showMessage(tr("No volume available for growth."), 4000);
-        return;
-    }
-
-    if (!_segmentationGrowthVolumeId.empty() && _segmentationGrowthVolumeId != growthVolumeId) {
-        statusBar()->showMessage(tr("Selected growth volume unavailable; using the active volume instead."), 4000);
-    }
-
-    _segmentationGrowthRunning = true;
-    if (_segmentationModule) {
-        _segmentationModule->setGrowthInProgress(true);
-    }
-    const auto finalize = [this]() {
-        _segmentationGrowthRunning = false;
-        if (_segmentationModule) {
-            _segmentationModule->setGrowthInProgress(false);
-        }
-        qCInfo(lcSegGrowth) << "Segmentation growth finalize called";
+    SegmentationGrower::VolumeContext volumeContext{
+        fVpkg,
+        currentVolume,
+        currentVolumeId,
+        _segmentationGrowthVolumeId.empty() ? currentVolumeId : _segmentationGrowthVolumeId,
+        _normalGridPath
     };
 
-    SegmentationCorrectionsPayload corrections;
-    if (_segmentationModule) {
-        corrections = _segmentationModule->buildCorrectionsPayload();
-    }
-
-    const bool hasCorrections = !corrections.empty();
-    const bool usingCorrections = method == SegmentationGrowthMethod::Corrections && hasCorrections;
-
-    if (method == SegmentationGrowthMethod::Corrections && !hasCorrections) {
-        qCInfo(lcSegGrowth) << "Corrections growth requested without correction points; continuing with tracer behavior.";
-    }
-
-    if (usingCorrections) {
-        qCInfo(lcSegGrowth) << "Including" << corrections.collections.size() << "correction set(s)";
-    }
-
-    qCInfo(lcSegGrowth) << "Growth volume ID" << QString::fromStdString(growthVolumeId);
-
-    qCInfo(lcSegGrowth) << "Starting tracer growth";
-    if (method == SegmentationGrowthMethod::Corrections) {
-        if (usingCorrections) {
-            statusBar()->showMessage(tr("Applying correction-guided tracer growth..."), 2000);
-        } else {
-            statusBar()->showMessage(tr("No correction points provided; running tracer growth..."), 2000);
-        }
-    } else {
-        statusBar()->showMessage(tr("Running tracer-based surface growth..."), 2000);
-    }
-
-    SegmentationGrowthRequest request;
-    request.method = method;
-    request.direction = direction;
-    request.steps = steps;
-    if (_segmentationModule) {
-        if (auto overrideDirs = _segmentationModule->takeShortcutDirectionOverride()) {
-            request.allowedDirections = std::move(*overrideDirs);
-        }
-    }
-    if (request.allowedDirections.empty()) {
-        if (_segmentationWidget) {
-            request.allowedDirections = _segmentationWidget->allowedGrowthDirections();
-        } else {
-            request.allowedDirections = {
-                SegmentationGrowthDirection::Up,
-                SegmentationGrowthDirection::Down,
-                SegmentationGrowthDirection::Left,
-                SegmentationGrowthDirection::Right
-            };
-        }
-    }
-    if (_segmentationWidget) {
-        request.directionFields = _segmentationWidget->directionFieldConfigs();
-        if (!_segmentationWidget->customParamsValid()) {
-            const QString errorText = _segmentationWidget->customParamsError();
-            const QString message = errorText.isEmpty()
-                ? tr("Custom params JSON is invalid. Fix the contents and try again.")
-                : tr("Custom params JSON is invalid: %1").arg(errorText);
-            statusBar()->showMessage(message, 5000);
-            finalize();
-            return;
-        }
-        if (auto customParams = _segmentationWidget->customParamsJson()) {
-            request.customParams = std::move(*customParams);
-        }
-    }
-    request.corrections = corrections;
-    if (method == SegmentationGrowthMethod::Corrections && _segmentationModule) {
-        if (auto zRange = _segmentationModule->correctionsZRange()) {
-            request.correctionsZRange = zRange;
-        }
-    }
-
-    TracerGrowthContext ctx;
-    ctx.resumeSurface = segmentationSurface;
-    ctx.volume = growthVolume.get();
-    ctx.cache = chunk_cache;
-    ctx.cacheRoot = cacheRootForVolumePkg(fVpkg);
-    ctx.voxelSize = growthVolume->voxelSize();
-    ctx.normalGridPath = _normalGridPath;
-
-    if (ctx.cacheRoot.isEmpty()) {
-        const auto volumePath = growthVolume->path();
-        ctx.cacheRoot = QDir(QString::fromStdString(volumePath.parent_path().string())).filePath(QStringLiteral("cache"));
-    }
-
-    if (ctx.cacheRoot.isEmpty()) {
-        qCInfo(lcSegGrowth) << "Tracer growth aborted because cache root is empty";
-        statusBar()->showMessage(tr("Cache root unavailable for tracer growth."), 5000);
-        finalize();
+    if (!_segmentationGrower->start(volumeContext, method, direction, steps)) {
         return;
     }
-
-    const double growthVoxelSize = growthVolume ? growthVolume->voxelSize() : 0.0;
-
-    qCInfo(lcSegGrowth) << "Launching tracer future" << ctx.cacheRoot;
-    auto future = QtConcurrent::run(runTracerGrowth, request, ctx);
-    auto* watcher = new QFutureWatcher<TracerGrowthResult>(this);
-    _tracerGrowthWatcher.reset(watcher);
-
-    connect(watcher, &QFutureWatcher<TracerGrowthResult>::finished, this, [this, segmentationSurface, finalize, usingCorrections, growthVoxelSize, growthVolume]() {
-        Q_UNUSED(growthVolume);
-        if (!_tracerGrowthWatcher) {
-            qCInfo(lcSegGrowth) << "Tracer watcher finished but watcher reset early";
-            finalize();
-            return;
-        }
-
-        const TracerGrowthResult result = _tracerGrowthWatcher->result();
-        _tracerGrowthWatcher.reset();
-
-        qCInfo(lcSegGrowth) << "Tracer growth finished" << (result.error.isEmpty() ? "success" : "error");
-
-        if (!result.error.isEmpty()) {
-            qCInfo(lcSegGrowth) << "Tracer growth error" << result.error;
-            statusBar()->showMessage(result.error, 6000);
-            finalize();
-            return;
-        }
-
-        if (!result.surface) {
-            qCInfo(lcSegGrowth) << "Tracer growth returned null surface";
-            statusBar()->showMessage(tr("Tracer growth did not return a surface."), 5000);
-            finalize();
-            return;
-        }
-
-        const double voxelSize = growthVoxelSize;
-        cv::Mat generations = result.surface->channel("generations");
-
-        std::vector<QuadSurface*> surfacesToUpdate;
-        if (_segmentationModule && _segmentationModule->hasActiveSession()) {
-            if (auto* baseSurface = _segmentationModule->activeBaseSurface()) {
-                surfacesToUpdate.push_back(baseSurface);
-            }
-        }
-        if (std::find(surfacesToUpdate.begin(), surfacesToUpdate.end(), segmentationSurface) == surfacesToUpdate.end()) {
-            surfacesToUpdate.push_back(segmentationSurface);
-        }
-
-        for (QuadSurface* targetSurface : surfacesToUpdate) {
-            if (!targetSurface) {
-                continue;
-            }
-
-            if (auto* destPoints = targetSurface->rawPointsPtr()) {
-                result.surface->rawPoints().copyTo(*destPoints);
-            }
-
-            if (!generations.empty()) {
-                targetSurface->setChannel("generations", generations);
-            }
-
-            targetSurface->invalidateCache();
-
-            if (result.surface->meta) {
-                if (targetSurface->meta) {
-                    delete targetSurface->meta;
-                    targetSurface->meta = nullptr;
-                }
-                targetSurface->meta = new nlohmann::json(*result.surface->meta);
-            } else {
-                ensureSurfaceMetaObject(targetSurface);
-            }
-
-            updateSegmentationSurfaceMetadata(targetSurface, voxelSize);
-        }
-
-        QuadSurface* surfaceToPersist = nullptr;
-        if (_segmentationModule && _segmentationModule->hasActiveSession()) {
-            surfaceToPersist = _segmentationModule->activeBaseSurface();
-        }
-        if (!surfaceToPersist) {
-            surfaceToPersist = segmentationSurface;
-        }
-
-        try {
-            if (surfaceToPersist) {
-                ensureSurfaceMetaObject(surfaceToPersist);
-                surfaceToPersist->saveOverwrite();
-            }
-        } catch (const std::exception& ex) {
-            qCInfo(lcSegGrowth) << "Failed to save tracer result" << ex.what();
-            statusBar()->showMessage(tr("Failed to save segmentation: %1").arg(ex.what()), 5000);
-        }
-
-        std::vector<std::pair<CVolumeViewer*, bool>> resetDefaults;
-        if (_viewerManager) {
-            _viewerManager->forEachViewer([this, &resetDefaults](CVolumeViewer* viewer) {
-                if (!viewer || viewer->surfName() != "segmentation") {
-                    return;
-                }
-                const bool defaultReset = _viewerManager->resetDefaultFor(viewer);
-                resetDefaults.emplace_back(viewer, defaultReset);
-                viewer->setResetViewOnSurfaceChange(false);
-            });
-        }
-
-        _surf_col->setSurface("segmentation", segmentationSurface);
-
-        if (!resetDefaults.empty()) {
-            const bool editingActive = _segmentationModule && _segmentationModule->editingEnabled();
-            for (auto& entry : resetDefaults) {
-                auto* viewer = entry.first;
-                if (!viewer) {
-                    continue;
-                }
-                if (editingActive) {
-                    viewer->setResetViewOnSurfaceChange(false);
-                } else {
-                    viewer->setResetViewOnSurfaceChange(entry.second);
-                }
-            }
-        }
-
-        if (_segmentationModule && _segmentationModule->hasActiveSession()) {
-            _segmentationModule->markNextHandlesFromGrowth();
-            qCInfo(lcSegGrowth) << "Refreshing active segmentation session after tracer growth";
-            _segmentationModule->refreshSessionFromSurface(surfaceToPersist);
-        }
-
-        QuadSurface* currentSegSurface = dynamic_cast<QuadSurface*>(_surf_col->surface("segmentation"));
-        if (!currentSegSurface) {
-            currentSegSurface = segmentationSurface;
-        }
-
-        synchronizeSurfaceMeta(fVpkg, currentSegSurface, _surfacePanel ? _surfacePanel.get() : nullptr);
-        applySlicePlaneOrientation(currentSegSurface);
-        refreshSegmentationViewers(_viewerManager.get());
-
-        if (usingCorrections && _segmentationModule) {
-            _segmentationModule->clearPendingCorrections();
-        }
-
-        qCInfo(lcSegGrowth) << "Tracer growth completed successfully";
-        delete result.surface;
-
-        QString message = result.statusMessage.isEmpty() ? tr("Tracer growth complete.") : result.statusMessage;
-        if (usingCorrections) {
-            message = tr("Corrections applied; tracer growth complete.");
-        }
-        statusBar()->showMessage(message, 4000);
-        finalize();
-    });
-
-    watcher->setFuture(future);
 }
 
 float CWindow::normalizeDegrees(float degrees)

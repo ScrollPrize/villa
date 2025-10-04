@@ -47,8 +47,7 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
             stopAllPushPull();
             const bool brushActive = _brushTool && _brushTool->brushActive();
             if (brushActive) {
-                setInvalidationBrushActive(false);
-                clearInvalidationBrush();
+                deactivateInvalidationBrush();
             }
             clearLineDragStroke();
             cancelDrag();
@@ -207,8 +206,7 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
     if (_lineDrawKeyActive) {
         stopAllPushPull();
         if (brushActive) {
-            setInvalidationBrushActive(false);
-            clearInvalidationBrush();
+            deactivateInvalidationBrush();
         }
         if (_drag.active) {
             cancelDrag();

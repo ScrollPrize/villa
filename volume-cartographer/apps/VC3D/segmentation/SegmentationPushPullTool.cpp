@@ -133,7 +133,8 @@ bool SegmentationPushPullTool::start(int direction)
         return true;
     }
 
-    if (!_module._hover.valid || !_module._hover.viewer || !_module.isSegmentationViewer(_module._hover.viewer)) {
+    const auto hover = _module.hoverInfo();
+    if (!hover.valid || !hover.viewer || !_module.isSegmentationViewer(hover.viewer)) {
         return false;
     }
     if (!_editManager || !_editManager->hasSession()) {
@@ -192,12 +193,13 @@ bool SegmentationPushPullTool::applyStepInternal()
         return false;
     }
 
-    if (!_module._hover.valid || !_module._hover.viewer || !_module.isSegmentationViewer(_module._hover.viewer)) {
+    const auto hover = _module.hoverInfo();
+    if (!hover.valid || !hover.viewer || !_module.isSegmentationViewer(hover.viewer)) {
         return false;
     }
 
-    const int row = _module._hover.row;
-    const int col = _module._hover.col;
+    const int row = hover.row;
+    const int col = hover.col;
 
     bool snapshotCapturedThisStep = false;
     if (!_undoCaptured) {
@@ -283,7 +285,7 @@ bool SegmentationPushPullTool::applyStepInternal()
                                  sampleNormal,
                                  _state.direction,
                                  baseSurface,
-                                 _module._hover.viewer,
+                                 hover.viewer,
                                  &sampleUnavailable);
                 if (sampleUnavailable) {
                     alphaUnavailable = true;
@@ -362,7 +364,7 @@ bool SegmentationPushPullTool::applyStepInternal()
                           normal,
                           _state.direction,
                           baseSurface,
-                          _module._hover.viewer,
+                          hover.viewer,
                           &alphaUnavailable);
         if (alphaTarget) {
             targetWorld = *alphaTarget;

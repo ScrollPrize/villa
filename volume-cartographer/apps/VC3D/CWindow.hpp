@@ -52,6 +52,7 @@ class CommandLineToolRunner;
 class SegmentationModule;
 class SurfacePanelController;
 class MenuActionController;
+class SegmentationGrower;
 
 class CWindow : public QMainWindow
 {
@@ -194,8 +195,7 @@ private:
     std::unique_ptr<ViewerManager> _viewerManager;
     CSurfaceCollection *_surf_col;
     bool _useAxisAlignedSlices{false};
-    bool _segmentationGrowthRunning{false};
-    std::unique_ptr<QFutureWatcher<TracerGrowthResult>> _tracerGrowthWatcher;
+    std::unique_ptr<SegmentationGrower> _segmentationGrower;
 
     std::unordered_map<std::string, OpChain*> _opchains;
 

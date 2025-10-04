@@ -98,6 +98,18 @@ public:
     void clearPendingCorrections();
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
 
+    struct HoverInfo
+    {
+        bool valid{false};
+        int row{0};
+        int col{0};
+        cv::Vec3f world{0.0f, 0.0f, 0.0f};
+        CVolumeViewer* viewer{nullptr};
+    };
+
+    [[nodiscard]] HoverInfo hoverInfo() const;
+    [[nodiscard]] bool isSegmentationViewer(const CVolumeViewer* viewer) const;
+
     void setRotationHandleHitTester(std::function<bool(CVolumeViewer*, const cv::Vec3f&)> tester);
 
 signals:
@@ -170,6 +182,7 @@ private:
                                     int steps);
     void setInvalidationBrushActive(bool active);
     void clearInvalidationBrush();
+    void deactivateInvalidationBrush();
     void clearLineDragStroke();
 
     void handleMousePress(CVolumeViewer* viewer,
@@ -196,7 +209,6 @@ private:
     bool restoreUndoSnapshot();
     void clearUndoStack();
 
-    [[nodiscard]] bool isSegmentationViewer(const CVolumeViewer* viewer) const;
     [[nodiscard]] float gridStepWorld() const;
 
     void useFalloff(FalloffTool tool);
