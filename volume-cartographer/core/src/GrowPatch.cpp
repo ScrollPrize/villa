@@ -14,7 +14,6 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/CostFunctions.hpp"
 #include "vc/core/util/HashFunctions.hpp"
-#include "vc/core/util/NormalGridVolume.hpp"
 
 #include "vc/core/util/xtensor_include.hpp"
 #include XTENSORINCLUDE(views, xview.hpp)
@@ -25,6 +24,7 @@
 #include <optional>
 #include <cstdlib>
 #include <limits>
+#include <omp.h>  // ensure omp_get_max_threads() is declared
 
 #include "vc/tracer/Tracer.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -190,6 +190,7 @@ enum LossType {
     DIRECTION,
     SNAP,
     NORMAL,
+    SDIR,
     COUNT
 };
 
@@ -203,6 +204,7 @@ struct LossSettings {
         w[LossType::STRAIGHT] = 0.2f;
         w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 1.0f;
+        w[LossType::SDIR] = 0.05f; // conservative default; tune 0.03–0.10
     }
 
     float operator()(LossType type, const cv::Vec2i& p) const {
@@ -319,7 +321,12 @@ static int gen_straight_loss(ceres::Problem &problem, const cv::Vec2i &p, const 
 static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, const LossSettings &settings);
-
+static int gen_sdirichlet_loss(ceres::Problem &problem, const cv::Vec2i &p,
+                               TraceParameters &params, const LossSettings &settings,
+                               double sdir_eps);
+static int conditional_sdirichlet_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
+                                       ceres::Problem &problem, TraceParameters &params,
+                                       const LossSettings &settings, double sdir_eps);
 static bool loc_valid(int state)
 {
     return state & STATE_LOC_VALID;
@@ -366,6 +373,9 @@ static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::
     return 1;
 }
 
+// -------------------------
+// helpers used by conditionals (must be before they’re used)
+// -------------------------
 static cv::Vec2i lower_p(const cv::Vec2i &point, const cv::Vec2i &offset)
 {
     if (offset[0] == 0) {
@@ -389,6 +399,66 @@ static int set_loss_mask(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::
 {
     if (set)
         loss_status(lower_p(p, off)) |= (1 << bit);
+    return set;
+}
+
+// -------------------------
+// Symmetric Dirichlet losses (definitions)
+// -------------------------
+static int gen_sdirichlet_loss(ceres::Problem &problem,
+                               const cv::Vec2i &p,
+                               TraceParameters &params,
+                               const LossSettings &settings,
+                               double sdir_eps)
+{
+    // Need p, p+u, p+v inside the image; treat (p) as the lower-left of a cell
+    const int rows = params.state.rows;
+    const int cols = params.state.cols;
+    if (p[0] < 0 || p[1] < 0 || p[0] >= rows - 1 || p[1] >= cols - 1) {
+        return 0;
+    }
+
+    const cv::Vec2i pu = p + cv::Vec2i(0, 1);  // (i, j+1)  u-direction
+    const cv::Vec2i pv = p + cv::Vec2i(1, 0);  // (i+1, j)  v-direction
+
+    // All three parameter blocks must be present/valid
+    if (!coord_valid(params.state(p)) ||
+        !coord_valid(params.state(pu)) ||
+        !coord_valid(params.state(pv))) {
+        return 0;
+    }
+
+    const float w = settings(LossType::SDIR, p);
+    if (w <= 0.0f) {
+        return 0;
+    }
+
+    problem.AddResidualBlock(
+        SymmetricDirichletLoss::Create(/*unit*/ params.unit,
+                                       /*w   */ w,
+                                       /*eps */ sdir_eps),
+        /*loss*/ nullptr,
+        &params.dpoints(p)[0],
+        &params.dpoints(pu)[0],
+        &params.dpoints(pv)[0]);
+
+    return 1;
+}
+
+static int conditional_sdirichlet_loss(int bit,
+                                       const cv::Vec2i &p,
+                                       cv::Mat_<uint16_t> &loss_status,
+                                       ceres::Problem &problem,
+                                       TraceParameters &params,
+                                       const LossSettings &settings,
+                                       double sdir_eps)
+{
+    int set = 0;
+    // One SD term per cell (keyed at p itself)
+    if (!loss_mask(bit, p, {0, 0}, loss_status)) {
+        set = set_loss_mask(bit, p, {0, 0}, loss_status,
+                            gen_sdirichlet_loss(problem, p, params, settings, sdir_eps));
+    }
     return set;
 }
 
@@ -429,22 +499,14 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TracePar
     double* pC = &params.dpoints(p_br)[0];
 
     int count = 0;
-    // int i = 1;
     for (int i = 0; i < 3; ++i) { // For each plane
-        // bool direction_aware = (i == 0); // XY plane
-        bool direction_aware = false; // this is not that simple ...
-        // Loss with p as base point A
+        bool direction_aware = false; // direction-awareness is non-trivial here; keep off
         problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), direction_aware, settings.z_min, settings.z_max), nullptr, pA, pB1, pB2, pC);
-        // Loss with p_br as base point A
         problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), direction_aware, settings.z_min, settings.z_max), nullptr, pC, pB2, pB1, pA);
-        // Loss with p_tr as base point A
         problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), direction_aware, settings.z_min, settings.z_max), nullptr, pB1, pC, pA, pB2);
-        // Loss with p_bl as base point A
         problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), direction_aware, settings.z_min, settings.z_max), nullptr, pB2, pA, pC, pB1);
         count += 4;
     }
-
-    //FIXME make params constant if not optimize-all is set
 
     return count;
 }
@@ -460,50 +522,62 @@ static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_
 };
 
 
-// static void freeze_inner_params(ceres::Problem &problem, int edge_dist, const cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &out,
-//     cv::Mat_<cv::Vec2d> &loc, cv::Mat_<uint16_t> &loss_status, int inner_flags)
-// {
-//     cv::Mat_<float> dist(state.size());
-//
-//     edge_dist = std::min(edge_dist,254);
-//
-//
-//     cv::Mat_<uint8_t> masked;
-//     bitwise_and(state, cv::Scalar(inner_flags), masked);
-//
-//
-//     cv::distanceTransform(masked, dist, cv::DIST_L1, cv::DIST_MASK_3);
-//
-//     for(int j=0;j<dist.rows;j++)
-//         for(int i=0;i<dist.cols;i++) {
-//             if (dist(j,i) >= edge_dist && !loss_mask(7, {j,i}, {0,0}, loss_status)) {
-//                 if (problem.HasParameterBlock(&out(j,i)[0]))
-//                     problem.SetParameterBlockConstant(&out(j,i)[0]);
-//                 if (!loc.empty() && problem.HasParameterBlock(&loc(j,i)[0]))
-//                     problem.SetParameterBlockConstant(&loc(j,i)[0]);
-//                 // set_loss_mask(7, {j,i}, {0,0}, loss_status, 1);
-//             }
-//             if (dist(j,i) >= edge_dist+2 && !loss_mask(8, {j,i}, {0,0}, loss_status)) {
-//                 if (problem.HasParameterBlock(&out(j,i)[0]))
-//                     problem.RemoveParameterBlock(&out(j,i)[0]);
-//                 if (!loc.empty() && problem.HasParameterBlock(&loc(j,i)[0]))
-//                     problem.RemoveParameterBlock(&loc(j,i)[0]);
-//                 // set_loss_mask(8, {j,i}, {0,0}, loss_status, 1);
-//             }
-//         }
-// }
+//create all valid losses for this point
+// Forward declarations
+static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, TraceParameters &trace_params);
+static int conditional_corr_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
+                                 ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, TraceParameters &trace_params);
 
+static int add_continuous_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params,
+    const TraceData &trace_data, const LossSettings &settings)
+{
+    //generate losses for point p
+    int count = 0;
 
-// struct DSReader
-// {
-//     z5::Dataset *ds;
-//     float scale;
-//     ChunkCache *cache;
-// };
+    if (p[0] < 2 || p[1] < 2 || p[1] >= params.state.cols-2 || p[0] >= params.state.rows-2)
+        throw std::runtime_error("point too close to problem border!");
 
+    //horizontal
+    count += gen_straight_loss(problem, p, {0,-2},{0,-1},{0,0}, params, settings);
+    count += gen_straight_loss(problem, p, {0,-1},{0,0},{0,1}, params, settings);
+    count += gen_straight_loss(problem, p, {0,0},{0,1},{0,2}, params, settings);
 
+    //vertical
+    count += gen_straight_loss(problem, p, {-2,0},{-1,0},{0,0}, params, settings);
+    count += gen_straight_loss(problem, p, {-1,0},{0,0},{1,0}, params, settings);
+    count += gen_straight_loss(problem, p, {0,0},{1,0},{2,0}, params, settings);
 
-int gen_direction_loss(ceres::Problem &problem,
+    //diag1
+    count += gen_straight_loss(problem, p, {-2,-2},{-1,-1},{0,0}, params, settings);
+    count += gen_straight_loss(problem, p, {-1,-1},{0,0},{1,1}, params, settings);
+    count += gen_straight_loss(problem, p, {0,0},{1,1},{2,2}, params, settings);
+
+    //diag2
+    count += gen_straight_loss(problem, p, {-2,2},{-1,1},{0,0}, params, settings);
+    count += gen_straight_loss(problem, p, {-1,1},{0,0},{1,-1}, params, settings);
+    count += gen_straight_loss(problem, p, {0,0},{1,-1},{2,-2}, params, settings);
+
+    //direct neighboars
+    count += gen_dist_loss(problem, p, {0,-1}, params, settings);
+    count += gen_dist_loss(problem, p, {0,1}, params, settings);
+    count += gen_dist_loss(problem, p, {-1,0}, params, settings);
+    count += gen_dist_loss(problem, p, {1,0}, params, settings);
+
+    //diagonal neighbors
+    count += gen_dist_loss(problem, p, {1,-1}, params, settings);
+    count += gen_dist_loss(problem, p, {-1,1}, params, settings);
+    count += gen_dist_loss(problem, p, {1,1}, params, settings);
+    count += gen_dist_loss(problem, p, {-1,-1}, params, settings);
+
+    // (unmasked here; local problems don't revisit the same p many times)
+    count += gen_sdirichlet_loss(problem, p, params, settings, /*eps=*/1e-6);
+    count += gen_sdirichlet_loss(problem, p + cv::Vec2i(-1, 0), params, settings, 1e-6);
+    count += gen_sdirichlet_loss(problem, p + cv::Vec2i( 0,-1), params, settings, 1e-6);
+
+    return count;
+}
+
+static int gen_direction_loss(ceres::Problem &problem,
     const cv::Vec2i &p,
     const int off_dist,
     cv::Mat_<uint8_t> &state,
@@ -544,63 +618,6 @@ int gen_direction_loss(ceres::Problem &problem,
         }
         ++count;
     }
-
-    return count;
-}
-
-//create all valid losses for this point
-// Forward declarations
-static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, TraceParameters &trace_params);
-static int conditional_corr_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
-                                 ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, TraceParameters &trace_params);
-
-static int add_continuous_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params,
-    const TraceData &trace_data, const LossSettings &settings)
-{
-    //generate losses for point p
-    int count = 0;
-
-    if (p[0] < 2 || p[1] < 2 || p[1] >= params.state.cols-2 || p[0] >= params.state.rows-2)
-        throw std::runtime_error("point too close to problem border!");
-
-    //horizontal
-    count += gen_straight_loss(problem, p, {0,-2},{0,-1},{0,0}, params, settings);
-    count += gen_straight_loss(problem, p, {0,-1},{0,0},{0,1}, params, settings);
-    count += gen_straight_loss(problem, p, {0,0},{0,1},{0,2}, params, settings);
-
-    //vertical
-    count += gen_straight_loss(problem, p, {-2,0},{-1,0},{0,0}, params, settings);
-    count += gen_straight_loss(problem, p, {-1,0},{0,0},{1,0}, params, settings);
-    count += gen_straight_loss(problem, p, {0,0},{1,0},{2,0}, params, settings);
-
-
-    //diag1
-    count += gen_straight_loss(problem, p, {-2,-2},{-1,-1},{0,0}, params, settings);
-    count += gen_straight_loss(problem, p, {-1,-1},{0,0},{1,1}, params, settings);
-    count += gen_straight_loss(problem, p, {0,0},{1,1},{2,2}, params, settings);
-
-    //diag2
-    count += gen_straight_loss(problem, p, {-2,2},{-1,1},{0,0}, params, settings);
-    count += gen_straight_loss(problem, p, {-1,1},{0,0},{1,-1}, params, settings);
-    count += gen_straight_loss(problem, p, {0,0},{1,-1},{2,-2}, params, settings);
-
-    //direct neighboars
-    count += gen_dist_loss(problem, p, {0,-1}, params, settings);
-    count += gen_dist_loss(problem, p, {0,1}, params, settings);
-    count += gen_dist_loss(problem, p, {-1,0}, params, settings);
-    count += gen_dist_loss(problem, p, {1,0}, params, settings);
-
-    //diagonal neighbors
-    count += gen_dist_loss(problem, p, {1,-1}, params, settings);
-    count += gen_dist_loss(problem, p, {-1,1}, params, settings);
-    count += gen_dist_loss(problem, p, {1,1}, params, settings);
-    count += gen_dist_loss(problem, p, {-1,-1}, params, settings);
-
-    //gridstore normals
-    // count += gen_normal_loss(problem, p                   , params, trace_data, settings);
-    // count += gen_normal_loss(problem, p + cv::Vec2i(-1,-1), params, trace_data, settings);
-    // count += gen_normal_loss(problem, p + cv::Vec2i( 0,-1), params, trace_data, settings);
-    // count += gen_normal_loss(problem, p + cv::Vec2i(-1, 0), params, trace_data, settings);
 
     return count;
 }
@@ -738,6 +755,11 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_dist_loss(5, p, {1,1}, loss_status, problem, params, settings);
     count += conditional_dist_loss(5, p, {-1,-1}, loss_status, problem, params, settings);
 
+    //symmetrich dirichlet
+    count += conditional_sdirichlet_loss(6, p,                    loss_status, problem, params, settings, /*eps=*/1e-6);
+    count += conditional_sdirichlet_loss(6, p + cv::Vec2i(-1, 0), loss_status, problem, params, settings, /*eps=*/1e-6);
+    count += conditional_sdirichlet_loss(6, p + cv::Vec2i( 0,-1), loss_status, problem, params, settings, /*eps=*/1e-6);
+
     //normal field
     count += conditional_direction_loss(9, p, 1, loss_status, problem, params.state, params.dpoints, settings, trace_data.direction_fields);
     count += conditional_direction_loss(9, p, -1, loss_status, problem, params.state, params.dpoints, settings, trace_data.direction_fields);
@@ -762,8 +784,6 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
 static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters &params,
     TraceData& trace_data, LossSettings &settings, bool quiet = false, bool parallel = false)
 {
-    // This Ceres problem is parameterised by locs; residuals are progressively added as the patch grows enforcing that
-    // all points in the patch are correct distance in 2D vs 3D space, not too high curvature, near surface prediction, etc.
     ceres::Problem problem;
     cv::Mat_<uint16_t> loss_status(params.state.size());
 
@@ -792,36 +812,9 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 1000;
 
-    // options.function_tolerance = 1e-4;
-    // options.use_nonmonotonic_steps = true;
-    // options.use_mixed_precision_solves = true;
-    // options.max_num_refinement_iterations = 3;
-    // options.use_inner_iterations = true;
-
-
     if (parallel)
         options.num_threads = omp_get_max_threads();
 
-//    if (problem.NumParameterBlocks() > 1) {
-//        options.use_inner_iterations = true;
-//    }
-// // NOTE currently CPU seems always faster (40x , AMD 5800H vs RTX 3080 mobile, even a 5090 would probably be slower?)
-// #ifdef VC_USE_CUDA_SPARSE
-//     // Check if Ceres was actually built with CUDA sparse support
-//     if (g_use_cuda) {
-//         if (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::CUDA_SPARSE)) {
-//             options.linear_solver_type = ceres::SPARSE_SCHUR;
-//             // options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-//             options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
-//
-//             // if (options.linear_solver_type == ceres::SPARSE_SCHUR) {
-//                 options.use_mixed_precision_solves = true;
-//             // }
-//         } else {
-//             std::cerr << "Warning: use_cuda=true but Ceres was not built with CUDA sparse support. Falling back to CPU sparse." << std::endl;
-//         }
-//     }
-// #endif
     ceres::Solver::Summary summary;
 
     ceres::Solve(options, &problem, &summary);
@@ -947,11 +940,13 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     int stop_gen = params.value("generations", 100);
     float step = params.value("step_size", 20.0f);
     trace_params.unit = step*scale;
+    const double sdir_w   = params.value("sdir_weight",  loss_settings[LossType::SDIR]);
+    const double sdir_eps = params.value("sdir_eps",     1e-6);
+    loss_settings[LossType::SDIR] = static_cast<float>(sdir_w);
     int rewind_gen = params.value("rewind_gen", -1);
     loss_settings.z_min = params.value("z_min", -1);
     loss_settings.z_max = params.value("z_max", std::numeric_limits<int>::max());
     ALifeTime f_timer("empty space tracing\n");
-    // DSReader reader = {ds,scale,cache};
     std::unique_ptr<vc::core::util::NormalGridVolume> ngv;
     if (params.contains("normal_grid_path")) {
         ngv = std::make_unique<vc::core::util::NormalGridVolume>(params["normal_grid_path"].get<std::string>());
@@ -1003,7 +998,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     std::vector<cv::Vec2i> cands;
 
     float T = step;
-    // float Ts = step*scale;
 
     // The following track the state of the patch; they are each as big as the largest possible patch but initially empty
     // - locs defines the patch! It says for each 2D position, which 3D position it corresponds to
@@ -1012,7 +1006,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     trace_params.state = cv::Mat_<uint8_t>(size,0);
     cv::Mat_<uint16_t> generations(size, (uint16_t)0);
     cv::Mat_<uint8_t> phys_fail(size,0);
-    // cv::Mat_<float> init_dist(size,0);
     cv::Mat_<uint16_t> loss_status(cv::Size(w,h),0);
     cv::Rect used_area;
     int generation = 1;
@@ -1047,7 +1040,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     cv::Vec3f vx = {1,0,0};
     cv::Vec3f vy = {0,1,0};
 
-    // ceres::Problem big_problem;
     int loss_count = 0;
     double last_elapsed_seconds = 0.0;
     int last_succ = 0;
@@ -1236,7 +1228,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
     // Solve the initial optimisation problem, just placing the first four vertices around the seed
     ceres::Solver::Summary big_summary;
-    //just continue on resume no additional global opt
     if (!resume_surf) {
         local_optimization(8, {y0,x0}, trace_params, trace_data, loss_settings, true);
     }
@@ -1247,7 +1238,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 200;
     options.function_tolerance = 1e-3;
-
 
     auto neighs = parse_growth_directions(params);
 
@@ -1266,8 +1256,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         if (stop_gen && generation >= stop_gen)
             break;
 
-        // For every point in the fringe (where we might expand the patch outwards), add to cands all
-        // new 2D points we might add to the patch (and later find the corresponding 3D point for)
+        // For every point in the fringe, add to cands all new 2D points we might add
         for(const auto& p : fringe)
         {
             for(const auto& n : neighs)
@@ -1286,15 +1275,11 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         int succ_gen = 0;
         std::vector<cv::Vec2i> succ_gen_ps;
 
-        // Build a structure that allows parallel iteration over cands, while avoiding any two threads simultaneously
-        // considering two points that are too close to each other...
         OmpThreadPointCol cands_threadcol(local_opt_r*2+1, cands);
 
-        // ...then start iterating over candidates in parallel using the above to yield points
 #pragma omp parallel
         {
             CachedChunked3dInterpolator<uint8_t,thresholdedDistance> interp(proc_tensor);
-//             int idx = rand() % cands.size();
             while (true) {
                 int r = 1;
                 double phys_fail_th = 0.1;
@@ -1305,9 +1290,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 if (trace_params.state(p) & (STATE_LOC_VALID | STATE_COORD_VALID))
                     continue;
 
-                // p is now a 2D point we consider adding to the patch; find the best 3D point to map it to
-
-                // Iterate all adjacent points that are in the patch, and find their 3D locations
+                // Gather neighbors
                 int ref_count = 0;
                 cv::Vec3d avg = {0,0,0};
                 std::vector<cv::Vec2i> srcs;
@@ -1319,7 +1302,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                             srcs.push_back({oy,ox});
                         }
 
-                // Of those adjacent points, find the one that itself has most adjacent in-patch points
                 cv::Vec2i best_l = srcs[0];
                 int best_ref_l = -1;
                 int rec_ref_sum = 0;
@@ -1338,18 +1320,16 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     }
                 }
 
-                // Initial guess for the corresponding 3D location is a perturbation of the position of the best-connected neighbor
                 avg /= ref_count;
 
-                //"fast" skip based on avg z value out of limits
+                // z-windowing
                 if (avg[2] < loss_settings.z_min || avg[2] > loss_settings.z_max)
                     continue;
 
                 cv::Vec3d init = trace_params.dpoints(best_l) + random_perturbation();
                 trace_params.dpoints(p) = init;
 
-                // Set up a new local optimzation problem for the candidate point and its neighbors (initially just distance
-                // and curvature losses, not nearness-to-surface)
+                // Local solve for this candidate
                 ceres::Problem problem;
 
                 trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
@@ -1381,12 +1361,10 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
                 for (int i=1;i<local_opt_r;i++)
                     local_optimization(i, p, trace_params, trace_data, loss_settings, true);
-            }  // end parallel iteration over cands
+            }
         }
 
         if (!global_opt) {
-            // For late generations, instead of re-solving the global problem, solve many local-ish problems, around each
-            // of the newly added points
             std::vector<cv::Vec2i> opt_local;
             for(auto p : succ_gen_ps)
                 if (p[0] % 4 == 0 && p[1] % 4 == 0)
@@ -1408,7 +1386,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
             }
         }
         else {
-            //we do the global opt only every 8 gens, as every add does a small local solve anyweays
             if (generation % 8 == 0) {
                 local_optimization(stop_gen+10, {y0,x0}, trace_params, trace_data, loss_settings, false, true);
             }
@@ -1445,7 +1422,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
         timer_gen.unit = succ_gen * vx_per_quad;
         timer_gen.unit_string = "vx^2";
-        // print_accessor_stats();
 
         int snapshot_interval = params.value("snapshot-interval", 0);
         if (!tgt_path.empty() && snapshot_interval > 0 && generation % snapshot_interval == 0) {

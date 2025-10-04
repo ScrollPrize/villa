@@ -1190,3 +1190,46 @@ private:
 public:
     bool dbg_ = false;
 };
+
+struct SymmetricDirichletLoss {
+    SymmetricDirichletLoss(double unit, double w, double eps)
+      : _unit(unit), _w(w), _eps(eps) {}
+
+    template <typename T>
+    bool operator()(const T* const p,    // 3D at (i,j)
+                    const T* const pu,   // 3D at (i,j+1)  (u-direction)
+                    const T* const pv,   // 3D at (i+1,j)  (v-direction)
+                    T* residual) const
+    {
+        // Normalize edge vectors by expected step length to get a dimensionless Jacobian
+        const T inv_unit = T(1.0) / T(_unit);
+        T eu[3] = { (pu[0]-p[0])*inv_unit, (pu[1]-p[1])*inv_unit, (pu[2]-p[2])*inv_unit };
+        T ev[3] = { (pv[0]-p[0])*inv_unit, (pv[1]-p[1])*inv_unit, (pv[2]-p[2])*inv_unit };
+
+        // First fundamental form G = J^T J is 2x2 SPD with entries a,b,c
+        T a = eu[0]*eu[0] + eu[1]*eu[1] + eu[2]*eu[2];
+        T c = ev[0]*ev[0] + ev[1]*ev[1] + ev[2]*ev[2];
+        T b = eu[0]*ev[0] + eu[1]*ev[1] + eu[2]*ev[2];
+
+        T trG  = a + c;
+        T detG = a*c - b*b;
+        // Smooth(ish) barrier against degeneracy
+        T det_safe = detG + T(_eps);
+
+        // E_SD(J) = tr(G) + tr(G^{-1}) ; for 2x2, tr(G^{-1}) = (a+c)/det(G)
+        T E = trG + trG / det_safe;
+        // Zero at optimum (identity metric): E - 4
+        residual[0] = T(_w) * (E - T(4.0));
+        return true;
+    }
+
+    static ceres::CostFunction* Create(double unit, double w = 1.0, double eps = 1e-6)
+    {
+        return new ceres::AutoDiffCostFunction<SymmetricDirichletLoss, 1, 3, 3, 3>(
+            new SymmetricDirichletLoss(unit, w, eps));
+    }
+
+    double _unit;
+    double _w;
+    double _eps;
+};
