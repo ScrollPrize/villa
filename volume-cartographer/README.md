@@ -29,7 +29,7 @@ If you want to install vc3d from source, the easiest path is to look at the [doc
 
 
 ### Basic introduction to VC3D 
-The document below is a basic introduction to the ui and keybindings available in VC3D , more detailed documents for each sections are in progress and will be located in [the docs folder](docs).
+The document below is a basic introduction to the ui and keybindings available in VC3D , more detailed documentation is available in the [segmentation tutorial](https://scrollprize.org/segmentation) on the scrollprize website.
 > [!WARNING]
 > if you are using Ubuntu , the default open file limit is 1024, and you may encounter errors when running vc3d. To fix this, run `ulimit -n 750000` in your terminal.
 
