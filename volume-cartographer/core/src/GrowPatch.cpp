@@ -1378,9 +1378,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
                     fringe.push_back(p);
                     succ_gen_ps.push_back(p);
-
-                    if (succ_gen % 10)
-                        std::cout << succ_gen << "/" << cands.size() << std::endl;
                 }
 
                 for (int i=1;i<local_opt_r;i++)
@@ -1408,9 +1405,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     cv::Vec2i p = opt_local_threadcol.next();
                     if (p[0] == -1)
                         break;
-
-#pragma omp critical
-                    std::cout << "lopt " << done << "/" << opt_local.size() << std::endl;
 
                     local_optimization(8, p, trace_params, trace_data, loss_settings, true);
 #pragma omp atomic
