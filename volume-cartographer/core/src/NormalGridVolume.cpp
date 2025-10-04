@@ -1,6 +1,5 @@
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/HashFunctions.hpp"
-#include "vc/core/util/LineSegListCache.hpp"
  
  #include <filesystem>
  #include <fstream>
@@ -33,13 +32,9 @@
          mutable std::atomic<uint64_t> cache_misses{0};
          mutable std::chrono::steady_clock::time_point last_stat_time = std::chrono::steady_clock::now();
 
-         std::shared_ptr<LineSegListCache> line_seg_list_cache_;
          std::vector<std::string> plane_dirs = {"xy", "xz", "yz"};
  
-         explicit pimpl(const std::string& path, uint64_t cache_size_bytes) : base_path(path) {
-             if (cache_size_bytes > 0) {
-                line_seg_list_cache_ = std::make_shared<LineSegListCache>(cache_size_bytes);
-             }
+         explicit pimpl(const std::string& path) : base_path(path) {
              std::ifstream metadata_file((fs::path(base_path) / "metadata.json").string());
              if (!metadata_file.is_open()) {
                 throw std::runtime_error("Failed to open metadata.json in " + base_path);
@@ -114,7 +109,7 @@
                 return nullptr;
             }
  
-            auto grid_store = std::make_shared<GridStore>(grid_path, line_seg_list_cache_);
+            auto grid_store = std::make_shared<GridStore>(grid_path);
 
             // if (plane_idx == 0) { // XY plane
             //     if (!grid_store->meta.contains("umbilicus_x") || !grid_store->meta.contains("umbilicus_y")) {
@@ -188,8 +183,8 @@
         }
     };
 
-    NormalGridVolume::NormalGridVolume(const std::string& path, uint64_t cache_size_bytes)
-        : pimpl_(std::make_unique<pimpl>(path, cache_size_bytes)) {}
+    NormalGridVolume::NormalGridVolume(const std::string& path)
+        : pimpl_(std::make_unique<pimpl>(path)) {}
  
     std::optional<NormalGridVolume::GridQueryResult> NormalGridVolume::query(const cv::Point3f& point, int plane_idx) const {
         return pimpl_->query(point, plane_idx);

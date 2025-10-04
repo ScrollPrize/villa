@@ -7,8 +7,6 @@
 #include <limits>
 #include <mutex>
 
-#include "vc/core/util/LineSegListCache.hpp"
-
  namespace vc {
  namespace core {
  namespace util {

@@ -11,7 +11,6 @@ add_library(vc_core
         src/VolumePkg.cpp
         src/ChunkedTensor.cpp
         src/Logging.cpp
-        src/LineSegListCache.cpp
         src/Slicing.cpp
         src/Surface.cpp
         src/Render.cpp

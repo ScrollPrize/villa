@@ -954,8 +954,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     // DSReader reader = {ds,scale,cache};
     std::unique_ptr<vc::core::util::NormalGridVolume> ngv;
     if (params.contains("normal_grid_path")) {
-        // ngv = std::make_unique<vc::core::util::NormalGridVolume>(params["normal_grid_path"].get<std::string>());
-        ngv = std::make_unique<vc::core::util::NormalGridVolume>(params["normal_grid_path"].get<std::string>(), 0);
+        ngv = std::make_unique<vc::core::util::NormalGridVolume>(params["normal_grid_path"].get<std::string>());
         if (ngv->metadata()["spiral-step"] != step) {
             throw std::runtime_error("step_size parameter mismatch between normal grid volume and tracer.");
         }

@@ -1,9 +1,8 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/LineSegList.hpp"
-#include "vc/core/util/LineSegListCache.hpp"
  
- #include <unordered_set>
- #include <fstream>
+#include <unordered_set>
+#include <fstream>
 #include <stdexcept>
 #include <numeric>
 
@@ -333,9 +332,8 @@ public:
         }
     }
 
-    void load_mmap(const std::string& path, std::shared_ptr<LineSegListCache> cache) {
+    void load_mmap(const std::string& path) {
         read_only_ = true;
-        cache_ = cache;
         mmapped_data_ = std::make_unique<MmappedData>();
  
         mmapped_data_->fd = open(path.c_str(), O_RDONLY);
@@ -498,26 +496,10 @@ private:
     }
 
     std::shared_ptr<LineSegList> get_seglist_from_offset(size_t offset) const {
-        if (!cache_) {
-            const char* paths_start = static_cast<const char*>(mmapped_data_->data) + paths_offset_in_file_;
-            const char* end = static_cast<const char*>(mmapped_data_->data) + mmapped_data_->size;
-            std::shared_ptr<LineSegList> seglist;
-            read_seglist_header_and_data(paths_start + offset, end, seglist);
-            return seglist;
-        }
-
-        LineSegListCache::CacheKey key = {this, offset};
-        std::shared_ptr<LineSegList> seglist = cache_->get(key);
-        if (!seglist) {
-            std::lock_guard<std::mutex> lock(seglist_mutex_);
-            seglist = cache_->get(key); // Check again after acquiring lock
-            if (!seglist) {
-                const char* paths_start = static_cast<const char*>(mmapped_data_->data) + paths_offset_in_file_;
-                const char* end = static_cast<const char*>(mmapped_data_->data) + mmapped_data_->size;
-                read_seglist_header_and_data(paths_start + offset, end, seglist);
-                cache_->put(key, seglist);
-            }
-        }
+        const char* paths_start = static_cast<const char*>(mmapped_data_->data) + paths_offset_in_file_;
+        const char* end = static_cast<const char*>(mmapped_data_->data) + mmapped_data_->size;
+        std::shared_ptr<LineSegList> seglist;
+        read_seglist_header_and_data(paths_start + offset, end, seglist);
         return seglist;
     }
 
@@ -626,7 +608,6 @@ private:
     uint32_t paths_offset_in_file_;
     uint32_t buckets_offset_in_file_;
     std::unique_ptr<MmappedData> mmapped_data_;
-    std::shared_ptr<LineSegListCache> cache_;
     mutable std::mutex bucket_mutex_;
     mutable std::mutex seglist_mutex_;
 };
@@ -634,9 +615,9 @@ private:
 GridStore::GridStore(const cv::Rect& bounds, int cell_size)
     : pimpl_(std::make_unique<GridStoreImpl>(bounds, cell_size)) {}
  
-GridStore::GridStore(const std::string& path, std::shared_ptr<LineSegListCache> cache)
+GridStore::GridStore(const std::string& path)
     : pimpl_(std::make_unique<GridStoreImpl>(cv::Rect(), 1)) { // Use a dummy cell_size to avoid division by zero
-    pimpl_->load_mmap(path, cache);
+    pimpl_->load_mmap(path);
     meta = pimpl_->meta_;
 }
 
@@ -682,8 +663,8 @@ void GridStore::save(const std::string& path) const {
     pimpl_->save(path);
 }
 
-void GridStore::load_mmap(const std::string& path, std::shared_ptr<LineSegListCache> cache) {
-    pimpl_->load_mmap(path, cache);
+void GridStore::load_mmap(const std::string& path) {
+    pimpl_->load_mmap(path);
 }
 
 }
