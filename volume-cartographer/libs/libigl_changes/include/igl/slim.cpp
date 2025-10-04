@@ -268,7 +268,8 @@ namespace igl
       #else
       L = At * s.WGL_M.asDiagonal(f) * A; // Aᵀ (diag(w)) A
       L.makeCompressed();
-      L.diagonal().array() += s.proximal_p; // proximal: add to diagonal in-place      L.makeCompressed();
+      L.diagonal().array() += s.proximal_p; // proximal: add to diagonal in-place
+      L.makeCompressed();
       #endif
 
       #ifdef SLIM_CACHED
