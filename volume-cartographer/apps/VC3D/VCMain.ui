@@ -326,7 +326,7 @@
                 <number>0</number>
                </property>
                <item row="0" column="0">
-                <widget class="QToolButton" name="btnFilterDropdown">
+                <widget class="DropdownChecklistButton" name="btnFilterDropdown">
                  <property name="text">
                   <string>Filters</string>
                  </property>
@@ -1129,6 +1129,11 @@
   <zorder>dockWidgetOpList</zorder>
  </widget>
  <customwidgets>
+ <customwidget>
+   <class>DropdownChecklistButton</class>
+   <extends>QToolButton</extends>
+   <header>../../../../../apps/VC3D/elements/DropdownChecklistButton.hpp</header>
+  </customwidget>
   <customwidget>
    <class>SurfaceTreeWidget</class>
    <extends>QTreeWidget</extends>

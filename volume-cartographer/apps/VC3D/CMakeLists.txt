@@ -15,6 +15,8 @@ set(srcs
     WindowRangeWidget.hpp
     elements/CollapsibleSettingsGroup.cpp
     elements/CollapsibleSettingsGroup.hpp
+    elements/DropdownChecklistButton.cpp
+    elements/DropdownChecklistButton.hpp
     elements/RangeSlider.cpp
     elements/RangeSlider.hpp
     SettingsDialog.cpp

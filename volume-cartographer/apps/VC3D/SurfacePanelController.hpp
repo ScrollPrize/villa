@@ -22,8 +22,8 @@ class QCheckBox;
 class QComboBox;
 class QPushButton;
 class QStandardItemModel;
-class QToolButton;
 class QuadSurface;
+class DropdownChecklistButton;
 
 class SurfacePanelController : public QObject
 {
@@ -36,7 +36,7 @@ public:
     };
 
     struct FilterUiRefs {
-        QToolButton* dropdown{nullptr};
+        DropdownChecklistButton* dropdown{nullptr};
         QCheckBox* focusPoints{nullptr};
         QComboBox* pointSet{nullptr};
         QPushButton* pointSetAll{nullptr};
