@@ -23,6 +23,10 @@ namespace segmentation { class CorrectionsState; }
 
 Q_DECLARE_LOGGING_CATEGORY(lcSegModule);
 
+inline constexpr int kStatusShort = 1500;
+inline constexpr int kStatusMedium = 2000;
+inline constexpr int kStatusLong = 5000;
+
 
 class CSurfaceCollection;
 class CVolumeViewer;

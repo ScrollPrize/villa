@@ -2,7 +2,7 @@
 
 #include "CSurfaceCollection.hpp"
 #include "SegmentationEditManager.hpp"
-#include "SegmentationOverlayController.hpp"
+#include "overlays/SegmentationOverlayController.hpp"
 
 #include <QLoggingCategory>
 
@@ -182,4 +182,3 @@ void SegmentationModule::refreshSessionFromSurface(QuadSurface* surface)
     refreshOverlay();
     emitPendingChanges();
 }
-

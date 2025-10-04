@@ -2,6 +2,7 @@
 
 #include "CVolumeViewer.hpp"
 #include "SegmentationBrushTool.hpp"
+#include "SegmentationCorrections.hpp"
 #include "SegmentationEditManager.hpp"
 #include "SegmentationLineTool.hpp"
 #include "SegmentationPushPullTool.hpp"

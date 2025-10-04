@@ -29,10 +29,6 @@ Q_LOGGING_CATEGORY(lcSegModule, "vc.segmentation.module")
 
 namespace
 {
-constexpr int kStatusShort = 1500;
-constexpr int kStatusMedium = 2000;
-constexpr int kStatusLong = 5000;
-
 float averageScale(const cv::Vec2f& scale)
 {
     const float sx = std::abs(scale[0]);

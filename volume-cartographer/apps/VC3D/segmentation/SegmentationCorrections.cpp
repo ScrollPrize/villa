@@ -12,11 +12,6 @@
 
 namespace segmentation
 {
-namespace
-{
-constexpr int kStatusShort = 1500;
-}
-
 CorrectionsState::CorrectionsState(SegmentationModule& module,
                                    SegmentationWidget* widget,
                                    VCCollection* collection)
@@ -412,4 +407,3 @@ void CorrectionsState::emitStatus(const QString& message, int timeoutMs)
 }
 
 } // namespace segmentation
-
