@@ -666,15 +666,15 @@ struct NormalConstraintPlane {
         // T loss2 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid2, 1);
         // T interpolated_loss = (T(1.0) - T(grid_query->weight)) * loss1 + T(grid_query->weight) * loss2;
 
-        auto grid = normal_grid_volume.query_nearest(query_point, plane_idx);
-        if (!grid)
+        auto grid_ptr = normal_grid_volume.query_nearest(query_point, plane_idx);
+        if (!grid_ptr)
             return true;
 
         T interpolated_loss;
         if (invert_dir)
-            interpolated_loss = calculate_normal_snapping_loss(pE_2d, pA_2d, *grid, 0);
+            interpolated_loss = calculate_normal_snapping_loss(pE_2d, pA_2d, *grid_ptr, 0);
         else
-            interpolated_loss = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid, 0);
+            interpolated_loss = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_ptr, 0);
 
         // Calculate angular weight.
         double v_abn[3], v_ac[3];

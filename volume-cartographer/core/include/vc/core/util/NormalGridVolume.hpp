@@ -21,13 +21,13 @@ namespace vc::core::util {
         NormalGridVolume& operator=(NormalGridVolume&&) noexcept;
 
         struct GridQueryResult {
-            const GridStore* grid1;
-            const GridStore* grid2;
+            std::shared_ptr<const GridStore> grid1;
+            std::shared_ptr<const GridStore> grid2;
             double weight;
         };
 
         std::optional<GridQueryResult> query(const cv::Point3f& point, int plane_idx) const;
-        const GridStore* query_nearest(const cv::Point3f& point, int plane_idx) const;
+        std::shared_ptr<const GridStore> query_nearest(const cv::Point3f& point, int plane_idx) const;
 
     public:
         const nlohmann::json& metadata() const;

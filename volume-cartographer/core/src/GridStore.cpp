@@ -1,6 +1,6 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/LineSegList.hpp"
-
+ 
 #include <unordered_set>
 #include <fstream>
 #include <stdexcept>
@@ -17,7 +17,7 @@ namespace vc::core::util {
 
 namespace {
 constexpr uint32_t GRIDSTORE_MAGIC = 0x56434753; // "VCGS"
-constexpr uint32_t GRIDSTORE_VERSION = 2;
+constexpr uint32_t GRIDSTORE_VERSION = 3;
 }
 
 struct MmappedData {
@@ -54,7 +54,7 @@ public:
 
         int handle = storage_.size();
         storage_.emplace_back(std::make_shared<LineSegList>(points));
-
+ 
         std::unordered_set<int> relevant_buckets;
         for (const auto& p : points) {
             cv::Point grid_pos = (p - bounds_.tl()) / cell_size_;
@@ -71,34 +71,65 @@ public:
     }
 
     std::vector<std::shared_ptr<std::vector<cv::Point>>> get(const cv::Rect& query_rect) const {
-        std::unordered_set<int> handles;
+        std::vector<std::shared_ptr<std::vector<cv::Point>>> result;
         cv::Rect clamped_rect = query_rect & bounds_;
 
         cv::Point start = (clamped_rect.tl() - bounds_.tl()) / cell_size_;
         cv::Point end = (clamped_rect.br() - bounds_.tl()) / cell_size_;
 
-        for (int y = start.y; y <= end.y; ++y) {
-            for (int x = start.x; x <= end.x; ++x) {
-                int index = y * grid_size_.width + x;
-                if (index >= 0 && index < grid_.size()) {
-                    handles.insert(grid_[index].begin(), grid_[index].end());
+        if (read_only_) {
+            std::unordered_set<size_t> offsets;
+            for (int y = start.y; y <= end.y; ++y) {
+                for (int x = start.x; x <= end.x; ++x) {
+                    int index = y * grid_size_.width + x;
+                    auto bucket_ptr = get_bucket_offsets(index);
+                    if (bucket_ptr && !bucket_ptr->empty()) {
+                        offsets.insert(bucket_ptr->begin(), bucket_ptr->end());
+                    }
                 }
             }
-        }
-
-        std::vector<std::shared_ptr<std::vector<cv::Point>>> result;
-        result.reserve(handles.size());
-        for (int handle : handles) {
-            result.push_back(storage_[handle]->get());
+            result.reserve(offsets.size());
+            for (size_t offset : offsets) {
+                result.push_back(get_seglist_from_offset(offset)->get());
+            }
+        } else {
+            std::unordered_set<int> handles;
+            for (int y = start.y; y <= end.y; ++y) {
+                for (int x = start.x; x <= end.x; ++x) {
+                    int index = y * grid_size_.width + x;
+                    if (index >= 0 && index < grid_.size()) {
+                        handles.insert(grid_[index].begin(), grid_[index].end());
+                    }
+                }
+            }
+            result.reserve(handles.size());
+            for (int handle : handles) {
+                result.push_back(storage_[handle]->get());
+            }
         }
         return result;
     }
 
     std::vector<std::shared_ptr<std::vector<cv::Point>>> get_all() const {
         std::vector<std::shared_ptr<std::vector<cv::Point>>> result;
-        result.reserve(storage_.size());
-        for (const auto& seg_list : storage_) {
-            result.push_back(seg_list->get());
+        if (read_only_) {
+            std::unordered_set<size_t> all_offsets;
+            size_t num_buckets = grid_size_.width * grid_size_.height;
+            for(size_t i = 0; i < num_buckets; ++i) {
+                auto bucket_ptr = get_bucket_offsets(i);
+                if (bucket_ptr) {
+                    all_offsets.insert(bucket_ptr->begin(), bucket_ptr->end());
+                }
+            }
+            result.reserve(all_offsets.size());
+            for (const auto& offset : all_offsets) {
+                result.push_back(get_seglist_from_offset(offset)->get());
+            }
+        } else {
+            result.reserve(storage_.size());
+            for (const auto& seg_list : storage_) {
+                result.push_back(seg_list->get());
+            }
         }
         return result;
     }
@@ -112,20 +143,46 @@ public:
         for (const auto& cell : grid_) {
             grid_memory += cell.capacity() * sizeof(int);
         }
-        size_t storage_memory = storage_.capacity() * sizeof(std::shared_ptr<LineSegList>);
-        // This doesn't account for the memory inside LineSegList, which is complex to calculate here.
-        // A more accurate implementation would require a get_memory_usage() method in LineSegList.
+        size_t storage_memory = 0;
+        if (read_only_) {
+            // In read-only mode, storage is just offsets, which are part of grid_offsets_
+            storage_memory = 0;
+        } else {
+            storage_memory = storage_.capacity() * sizeof(std::shared_ptr<LineSegList>);
+            for (const auto& seg : storage_) {
+                storage_memory += seg->get_memory_usage();
+            }
+        }
         return grid_memory + storage_memory;
     }
 
     size_t numSegments() const {
-        size_t count = 0;
-        for (const auto& seg_list : storage_) {
-            if (seg_list->num_points() > 0) {
-                count += seg_list->num_points() - 1;
+        if (read_only_) {
+            std::unordered_set<size_t> all_offsets;
+            size_t num_buckets = grid_size_.width * grid_size_.height;
+            for(size_t i = 0; i < num_buckets; ++i) {
+                auto bucket_ptr = get_bucket_offsets(i);
+                if (bucket_ptr) {
+                    all_offsets.insert(bucket_ptr->begin(), bucket_ptr->end());
+                }
             }
+            size_t count = 0;
+            for (const auto& offset : all_offsets) {
+                auto seg_list = get_seglist_from_offset(offset);
+                if (seg_list->num_points() > 0) {
+                    count += seg_list->num_points() - 1;
+                }
+            }
+            return count;
+        } else {
+            size_t count = 0;
+            for (const auto& seg_list : storage_) {
+                if (seg_list->num_points() > 0) {
+                    count += seg_list->num_points() - 1;
+                }
+            }
+            return count;
         }
-        return count;
     }
 
     size_t numNonEmptyBuckets() const {
@@ -139,32 +196,54 @@ public:
     }
 
     void save(const std::string& path) const {
+        if (read_only_) {
+            throw std::runtime_error("Cannot save a read-only GridStore. Load the data into a new, writable GridStore instance first.");
+        }
+
         std::string meta_str = meta_.dump();
         size_t header_size = 13 * sizeof(uint32_t);
-        size_t buckets_size = get_all_buckets_size();
-        size_t paths_size = get_all_seglist_size();
+
+        // 1. Serialize all paths and record their offsets
+        std::vector<char> paths_buffer;
+        std::unordered_map<int, uint32_t> handle_to_offset;
+        for (size_t i = 0; i < storage_.size(); ++i) {
+            handle_to_offset[i] = paths_buffer.size();
+            const auto& seglist = storage_[i];
+            size_t current_size = paths_buffer.size();
+            paths_buffer.resize(current_size + 3 * sizeof(uint32_t) + seglist->compressed_data_size());
+            write_seglist(paths_buffer.data() + current_size, *seglist);
+        }
+        size_t paths_size = paths_buffer.size();
+
+        // 2. Create bucket structures for v3
+        std::vector<uint32_t> bucket_path_indices;
+        bucket_path_indices.reserve(grid_.size() + 1);
+        std::vector<uint32_t> bucket_paths_flat;
+        uint32_t current_path_idx_counter = 0;
+        for (const auto& bucket : grid_) {
+            bucket_path_indices.push_back(current_path_idx_counter);
+            for (int handle : bucket) {
+                bucket_paths_flat.push_back(handle_to_offset.at(handle));
+            }
+            current_path_idx_counter += bucket.size();
+        }
+        bucket_path_indices.push_back(current_path_idx_counter);
+
+        size_t bucket_indices_size = bucket_path_indices.size() * sizeof(uint32_t);
+        size_t bucket_paths_flat_size = bucket_paths_flat.size() * sizeof(uint32_t);
         size_t meta_size = meta_str.size();
-        size_t total_size = header_size + buckets_size + paths_size + meta_size;
+        size_t total_size = header_size + bucket_indices_size + bucket_paths_flat_size + paths_size + meta_size;
 
         std::vector<char> buffer(total_size);
+        char* current_ptr = buffer.data();
 
-        // Serialize paths and store offsets
-        std::unordered_map<int, uint32_t> path_offsets;
-        char* paths_start = buffer.data() + header_size + buckets_size;
-        char* current_path_ptr = paths_start;
-        for (size_t i = 0; i < storage_.size(); ++i) {
-            path_offsets[i] = current_path_ptr - paths_start;
-            current_path_ptr = write_seglist(current_path_ptr, *storage_[i]);
-        }
+        // 3. Define offsets for v3
+        uint32_t bucket_indices_offset = header_size;
+        uint32_t bucket_paths_offset = bucket_indices_offset + bucket_indices_size;
+        uint32_t paths_offset = bucket_paths_offset + bucket_paths_flat_size;
+        uint32_t json_meta_offset = paths_offset + paths_size;
 
-        // Serialize buckets
-        char* current_bucket_ptr = buffer.data() + header_size;
-        for (const auto& bucket : grid_) {
-            current_bucket_ptr = write_bucket(current_bucket_ptr, bucket, path_offsets);
-        }
-
-        // Write header
-        char* header_ptr = buffer.data();
+        // 4. Write header
         uint32_t magic = htonl(GRIDSTORE_MAGIC);
         uint32_t version = htonl(GRIDSTORE_VERSION);
         uint32_t bounds_x = htonl(bounds_.x);
@@ -174,111 +253,89 @@ public:
         uint32_t cell_size = htonl(cell_size_);
         uint32_t num_buckets = htonl(grid_.size());
         uint32_t num_paths = htonl(storage_.size());
-        uint32_t buckets_offset = htonl(header_size);
-        uint32_t paths_offset = htonl(header_size + buckets_size);
-        uint32_t json_meta_offset = htonl(header_size + buckets_size + paths_size);
         uint32_t json_meta_size = htonl(meta_size);
 
-        memcpy(header_ptr, &magic, sizeof(magic)); header_ptr += sizeof(magic);
-        memcpy(header_ptr, &version, sizeof(version)); header_ptr += sizeof(version);
-        memcpy(header_ptr, &bounds_x, sizeof(bounds_x)); header_ptr += sizeof(bounds_x);
-        memcpy(header_ptr, &bounds_y, sizeof(bounds_y)); header_ptr += sizeof(bounds_y);
-        memcpy(header_ptr, &bounds_width, sizeof(bounds_width)); header_ptr += sizeof(bounds_width);
-        memcpy(header_ptr, &bounds_height, sizeof(bounds_height)); header_ptr += sizeof(bounds_height);
-        memcpy(header_ptr, &cell_size, sizeof(cell_size)); header_ptr += sizeof(cell_size);
-        memcpy(header_ptr, &num_buckets, sizeof(num_buckets)); header_ptr += sizeof(num_buckets);
-        memcpy(header_ptr, &num_paths, sizeof(num_paths)); header_ptr += sizeof(num_paths);
-        memcpy(header_ptr, &buckets_offset, sizeof(buckets_offset)); header_ptr += sizeof(buckets_offset);
-        memcpy(header_ptr, &paths_offset, sizeof(paths_offset)); header_ptr += sizeof(paths_offset);
-        memcpy(header_ptr, &json_meta_offset, sizeof(json_meta_offset)); header_ptr += sizeof(json_meta_offset);
-        memcpy(header_ptr, &json_meta_size, sizeof(json_meta_size)); header_ptr += sizeof(json_meta_size);
+        memcpy(current_ptr, &magic, sizeof(magic)); current_ptr += sizeof(magic);
+        memcpy(current_ptr, &version, sizeof(version)); current_ptr += sizeof(version);
+        memcpy(current_ptr, &bounds_x, sizeof(bounds_x)); current_ptr += sizeof(bounds_x);
+        memcpy(current_ptr, &bounds_y, sizeof(bounds_y)); current_ptr += sizeof(bounds_y);
+        memcpy(current_ptr, &bounds_width, sizeof(bounds_width)); current_ptr += sizeof(bounds_width);
+        memcpy(current_ptr, &bounds_height, sizeof(bounds_height)); current_ptr += sizeof(bounds_height);
+        memcpy(current_ptr, &cell_size, sizeof(cell_size)); current_ptr += sizeof(cell_size);
+        memcpy(current_ptr, &num_buckets, sizeof(num_buckets)); current_ptr += sizeof(num_buckets);
+        memcpy(current_ptr, &num_paths, sizeof(num_paths)); current_ptr += sizeof(num_paths);
+        uint32_t net_bucket_indices_offset = htonl(bucket_indices_offset);
+        memcpy(current_ptr, &net_bucket_indices_offset, sizeof(net_bucket_indices_offset)); current_ptr += sizeof(net_bucket_indices_offset);
+        uint32_t net_paths_offset = htonl(paths_offset);
+        memcpy(current_ptr, &net_paths_offset, sizeof(net_paths_offset)); current_ptr += sizeof(net_paths_offset);
+        uint32_t net_json_meta_offset = htonl(json_meta_offset);
+        memcpy(current_ptr, &net_json_meta_offset, sizeof(net_json_meta_offset)); current_ptr += sizeof(net_json_meta_offset);
+        memcpy(current_ptr, &json_meta_size, sizeof(json_meta_size)); current_ptr += sizeof(json_meta_size);
 
-        // In-line verification
-        {
-            const char* buffer_start = buffer.data();
-            const char* buffer_end = buffer_start + buffer.size();
-
-            // 1. Verify Header
-            if (ntohl(*reinterpret_cast<const uint32_t*>(buffer_start)) != GRIDSTORE_MAGIC) throw std::runtime_error("Header verification failed: magic mismatch.");
-            if (ntohl(*reinterpret_cast<const uint32_t*>(buffer_start + 4)) != GRIDSTORE_VERSION) throw std::runtime_error("Header verification failed: version mismatch.");
-            // ... (add more header checks if desired)
-
-            // 2. Deserialize Paths
-            std::vector<std::shared_ptr<LineSegList>> deserialized_storage;
-            deserialized_storage.reserve(storage_.size());
-            const char* read_paths_ptr = buffer_start + ntohl(paths_offset);
-            for (size_t i = 0; i < storage_.size(); ++i) {
-                std::shared_ptr<LineSegList> seglist;
-                read_paths_ptr = read_seglist(read_paths_ptr, buffer_end, seglist);
-                deserialized_storage.push_back(seglist);
-            }
-
-            // 3. Deserialize Buckets (requires mapping offsets back to handles)
-            std::unordered_map<uint32_t, int> offset_to_handle;
-            const char* temp_paths_ptr = buffer_start + ntohl(paths_offset);
-            for (size_t i = 0; i < deserialized_storage.size(); ++i) {
-                uint32_t offset = (temp_paths_ptr - (buffer_start + ntohl(paths_offset)));
-                offset_to_handle[offset] = i;
-                
-                // Advance pointer to the next seglist by reading its size
-                if (temp_paths_ptr + 3 * sizeof(uint32_t) > buffer_end) throw std::runtime_error("Verification failed: path header out of bounds.");
-                uint32_t num_offsets_bytes = ntohl(*reinterpret_cast<const uint32_t*>(temp_paths_ptr + 2 * sizeof(uint32_t)));
-                temp_paths_ptr += 3 * sizeof(uint32_t) + num_offsets_bytes;
-            }
-
-            std::vector<std::vector<int>> deserialized_grid(grid_.size());
-            const char* read_bucket_ptr = buffer_start + ntohl(buckets_offset);
-            for (auto& bucket : deserialized_grid) {
-                if (read_bucket_ptr + sizeof(uint32_t) > buffer_end) throw std::runtime_error("Verification failed: bucket header out of bounds.");
-                uint32_t num_indices = ntohl(*reinterpret_cast<const uint32_t*>(read_bucket_ptr)); read_bucket_ptr += sizeof(uint32_t);
-                bucket.resize(num_indices);
-                if (read_bucket_ptr + num_indices * sizeof(uint32_t) > buffer_end) throw std::runtime_error("Verification failed: bucket data out of bounds.");
-                for (uint32_t i = 0; i < num_indices; ++i) {
-                    uint32_t path_offset = ntohl(*reinterpret_cast<const uint32_t*>(read_bucket_ptr)); read_bucket_ptr += sizeof(uint32_t);
-                    bucket[i] = offset_to_handle.at(path_offset);
-                }
-            }
-
-            // 4. Compare
-            if (grid_ != deserialized_grid) {
-                throw std::runtime_error("Bucket serialization verification failed: data mismatch.");
-            }
-
-            if (storage_.size() != deserialized_storage.size()) {
-                throw std::runtime_error("Seglist serialization verification failed: size mismatch.");
-            }
-
-            for (size_t i = 0; i < storage_.size(); ++i) {
-                const auto& original = storage_[i];
-                const auto& deserialized = deserialized_storage[i];
-                if (original->start_point() != deserialized->start_point()) {
-                    throw std::runtime_error("Seglist verification failed: start point mismatch.");
-                }
-                if (original->compressed_data_size() != deserialized->compressed_data_size()) {
-                    throw std::runtime_error("Seglist verification failed: data size mismatch.");
-                }
-                if (memcmp(original->compressed_data(), deserialized->compressed_data(), original->compressed_data_size()) != 0) {
-                    throw std::runtime_error("Seglist verification failed: data mismatch.");
-                }
-            }
+        // 5. Write v3 bucket structures
+        char* bucket_indices_start = buffer.data() + bucket_indices_offset;
+        for (uint32_t idx : bucket_path_indices) {
+            uint32_t net_idx = htonl(idx);
+            memcpy(bucket_indices_start, &net_idx, sizeof(net_idx));
+            bucket_indices_start += sizeof(net_idx);
         }
 
-        // Write metadata
-        char* meta_start = buffer.data() + header_size + buckets_size + paths_size;
-        memcpy(meta_start, meta_str.data(), meta_size);
+        char* bucket_paths_start = buffer.data() + bucket_paths_offset;
+        for (uint32_t offset : bucket_paths_flat) {
+            uint32_t net_offset = htonl(offset);
+            memcpy(bucket_paths_start, &net_offset, sizeof(net_offset));
+            bucket_paths_start += sizeof(net_offset);
+        }
 
-        // Write buffer to file
+        // 6. Write paths data
+        memcpy(buffer.data() + paths_offset, paths_buffer.data(), paths_size);
+
+        // 7. Write metadata
+        memcpy(buffer.data() + json_meta_offset, meta_str.data(), meta_size);
+
+        // 8. Write buffer to file
         std::ofstream file(path, std::ios::binary);
         if (!file) {
             throw std::runtime_error("Failed to open file for writing: " + path);
         }
         file.write(buffer.data(), buffer.size());
+        file.close();
+
+        // 9. In-line verification by reloading the saved file
+        {
+            GridStore reloaded_store(path);
+            auto original_paths = this->get_all();
+            auto reloaded_paths = reloaded_store.get_all();
+
+            if (original_paths.size() != reloaded_paths.size()) {
+                throw std::runtime_error("Verification failed: path count mismatch. Original: " + std::to_string(original_paths.size()) + ", Reloaded: " + std::to_string(reloaded_paths.size()));
+            }
+
+            auto points_to_string_set = [](const std::vector<std::shared_ptr<std::vector<cv::Point>>>& paths) {
+                std::multiset<std::string> string_set;
+                for (const auto& path_ptr : paths) {
+                    std::stringstream ss;
+                    for (const auto& p : *path_ptr) {
+                        ss << p.x << "," << p.y << ";";
+                    }
+                    string_set.insert(ss.str());
+                }
+                return string_set;
+            };
+
+            auto original_set = points_to_string_set(original_paths);
+            auto reloaded_set = points_to_string_set(reloaded_paths);
+
+            if (original_set != reloaded_set) {
+                 throw std::runtime_error("Verification failed: path data mismatch after reload.");
+            }
+        }
     }
 
     void load_mmap(const std::string& path) {
         read_only_ = true;
         mmapped_data_ = std::make_unique<MmappedData>();
-
+ 
         mmapped_data_->fd = open(path.c_str(), O_RDONLY);
         if (mmapped_data_->fd == -1) {
             throw std::runtime_error("Failed to open file: " + path);
@@ -319,6 +376,9 @@ public:
         if (version > GRIDSTORE_VERSION) {
             throw std::runtime_error("GridStore file version " + std::to_string(version) + " is newer than supported version " + std::to_string(GRIDSTORE_VERSION) + ".");
         }
+        if (version < 1) {
+             throw std::runtime_error("GridStore file version " + std::to_string(version) + " is older than minimum supported version 1.");
+        }
 
         bounds_.x = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
         bounds_.y = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
@@ -334,7 +394,7 @@ public:
         uint32_t json_meta_size = 0;
         if (version >= 2) {
             if (mmapped_data_->size < 13 * sizeof(uint32_t)) {
-                throw std::runtime_error("Invalid GridStore v2 file: too small for extended header.");
+                throw std::runtime_error("Invalid GridStore v2+ file: too small for extended header.");
             }
             json_meta_offset = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
             json_meta_size = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
@@ -345,37 +405,25 @@ public:
             (bounds_.height + cell_size_ - 1) / cell_size_
         );
 
-        // 2. Read Paths and build offset map
-        storage_.reserve(num_paths);
-        std::unordered_map<uint32_t, int> offset_to_handle;
-        const char* paths_start = static_cast<const char*>(mmapped_data_->data) + paths_offset;
-        const char* current_path_ptr = paths_start;
-        for (uint32_t i = 0; i < num_paths; ++i) {
-            uint32_t current_offset = current_path_ptr - paths_start;
-            int handle = storage_.size();
-            
-            std::shared_ptr<LineSegList> seglist;
-            current_path_ptr = read_seglist(current_path_ptr, end, seglist);
-            storage_.push_back(seglist);
-            offset_to_handle[current_offset] = handle;
-        }
+        paths_offset_in_file_ = paths_offset;
+        buckets_offset_in_file_ = buckets_offset;
+        file_version_ = version;
 
-        // 3. Read Buckets
-        grid_.assign(num_buckets, std::vector<int>());
-        const char* buckets_start = static_cast<const char*>(mmapped_data_->data) + buckets_offset;
-        const char* current_bucket_ptr = buckets_start;
-        for (uint32_t i = 0; i < num_buckets; ++i) {
-            if (current_bucket_ptr + sizeof(uint32_t) > end) throw std::runtime_error("Invalid GridStore file: unexpected end in bucket header.");
-            uint32_t num_indices = ntohl(*reinterpret_cast<const uint32_t*>(current_bucket_ptr)); current_bucket_ptr += sizeof(uint32_t);
-            
-            grid_[i].reserve(num_indices);
-            if (current_bucket_ptr + num_indices * sizeof(uint32_t) > end) throw std::runtime_error("Invalid GridStore file: bucket indices out of bounds.");
-            for (uint32_t j = 0; j < num_indices; ++j) {
-                uint32_t path_offset = ntohl(*reinterpret_cast<const uint32_t*>(current_bucket_ptr)); current_bucket_ptr += sizeof(uint32_t);
-                grid_[i].push_back(offset_to_handle.at(path_offset));
+        if (version <= 2) {
+            // Legacy v1/v2 loading: Read bucket descriptors
+            grid_bucket_descriptors_.resize(num_buckets);
+            const char* buckets_start = static_cast<const char*>(mmapped_data_->data) + buckets_offset;
+            const char* current_bucket_ptr = buckets_start;
+            for (uint32_t i = 0; i < num_buckets; ++i) {
+                if (current_bucket_ptr + sizeof(uint32_t) > end) throw std::runtime_error("Invalid GridStore file: unexpected end in bucket header.");
+                uint32_t num_indices = ntohl(*reinterpret_cast<const uint32_t*>(current_bucket_ptr));
+                grid_bucket_descriptors_[i] = { (size_t)(current_bucket_ptr - buckets_start), num_indices };
+                current_bucket_ptr += sizeof(uint32_t) + num_indices * sizeof(uint32_t);
+                if (current_bucket_ptr > end) throw std::runtime_error("Invalid GridStore file: bucket data out of bounds during descriptor reading.");
             }
         }
-        // 4. Read Metadata
+        // For v3, we don't need to read descriptors. The bucket indices are read on-demand.
+
         if (version >= 2 && json_meta_size > 0) {
             const char* meta_start = static_cast<const char*>(mmapped_data_->data) + json_meta_offset;
             if (meta_start + json_meta_size > end) {
@@ -431,20 +479,101 @@ private:
         return current;
     }
 
-    const char* read_seglist(const char* current, const char* end, std::shared_ptr<LineSegList>& seglist) const {
+    const char* read_seglist_header_and_data(const char* current, const char* end, std::shared_ptr<LineSegList>& seglist) const {
         if (current + 3 * sizeof(uint32_t) > end) throw std::runtime_error("Invalid GridStore file: unexpected end in seglist header.");
         uint32_t start_x = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
         uint32_t start_y = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
         uint32_t num_offsets = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
-
+ 
         if (current + num_offsets > end) throw std::runtime_error("Invalid GridStore file: seglist offsets out of bounds.");
         
         cv::Point start(start_x, start_y);
         const int8_t* offsets_ptr = reinterpret_cast<const int8_t*>(current);
         current += num_offsets;
-
+ 
         seglist = std::make_shared<LineSegList>(start, offsets_ptr, num_offsets);
         return current;
+    }
+
+    std::shared_ptr<LineSegList> get_seglist_from_offset(size_t offset) const {
+        const char* paths_start = static_cast<const char*>(mmapped_data_->data) + paths_offset_in_file_;
+        const char* end = static_cast<const char*>(mmapped_data_->data) + mmapped_data_->size;
+        std::shared_ptr<LineSegList> seglist;
+        read_seglist_header_and_data(paths_start + offset, end, seglist);
+        return seglist;
+    }
+
+    std::shared_ptr<std::vector<size_t>> get_bucket_offsets(int index) const {
+        // Acquire lock to check for existence
+        bucket_mutex_.lock();
+        auto it = grid_offsets_.find(index);
+        if (it != grid_offsets_.end()) {
+            auto ptr = it->second;
+            bucket_mutex_.unlock();
+            return ptr;
+        }
+        // If not found, release the lock before loading
+        bucket_mutex_.unlock();
+
+        // Perform expensive I/O without holding the lock
+        auto bucket_ptr = std::make_shared<std::vector<size_t>>();
+        if (file_version_ <= 2) {
+            if (index >= 0 && index < grid_bucket_descriptors_.size()) {
+                const auto& descriptor = grid_bucket_descriptors_[index];
+                if (descriptor.second > 0) {
+                    const char* buckets_start = static_cast<const char*>(mmapped_data_->data) + buckets_offset_in_file_;
+                    const char* current_bucket_ptr = buckets_start + descriptor.first;
+                    
+                    current_bucket_ptr += sizeof(uint32_t); // Skip num_indices
+                    
+                    bucket_ptr->reserve(descriptor.second);
+                    for (uint32_t j = 0; j < descriptor.second; ++j) {
+                        uint32_t path_offset = ntohl(*reinterpret_cast<const uint32_t*>(current_bucket_ptr)); current_bucket_ptr += sizeof(uint32_t);
+                        bucket_ptr->push_back(path_offset);
+                    }
+                }
+            }
+        } else { // Version 3
+            const char* data_start = static_cast<const char*>(mmapped_data_->data);
+            const uint32_t* bucket_indices = reinterpret_cast<const uint32_t*>(data_start + buckets_offset_in_file_);
+            
+            uint32_t start_idx = ntohl(bucket_indices[index]);
+            uint32_t end_idx = ntohl(bucket_indices[index + 1]);
+            uint32_t count = end_idx - start_idx;
+
+            if (count > 0) {
+                const uint32_t* header_ptr = reinterpret_cast<const uint32_t*>(data_start);
+                uint32_t num_buckets = ntohl(header_ptr[7]);
+                // In V3, header[8] is the total number of paths in the storage, not the number of paths in all buckets combined.
+                // The total number of path offsets in the flat list is given by the last element of the bucket_indices array.
+                const uint32_t* bucket_indices = reinterpret_cast<const uint32_t*>(data_start + buckets_offset_in_file_);
+                uint32_t total_path_indices = ntohl(bucket_indices[num_buckets]);
+
+                if (start_idx + count > total_path_indices) {
+                    throw std::runtime_error("Bucket data is out of bounds of the flat path offset list.");
+                }
+
+                size_t bucket_indices_size = (num_buckets + 1) * sizeof(uint32_t);
+                const uint32_t* path_offsets_flat = reinterpret_cast<const uint32_t*>(data_start + buckets_offset_in_file_ + bucket_indices_size);
+
+                bucket_ptr->reserve(count);
+                for (uint32_t i = 0; i < count; ++i) {
+                    bucket_ptr->push_back(ntohl(path_offsets_flat[start_idx + i]));
+                }
+            }
+        }
+        
+        // Re-acquire lock to safely insert the new bucket
+        std::lock_guard<std::mutex> lock(bucket_mutex_);
+        it = grid_offsets_.find(index);
+        if (it != grid_offsets_.end()) {
+            // Another thread created it. Use the existing one.
+            return it->second;
+        } else {
+            // We are the first. Insert our loaded bucket.
+            grid_offsets_.emplace(index, bucket_ptr);
+            return bucket_ptr;
+        }
     }
 
     size_t get_all_buckets_size() const {
@@ -471,14 +600,21 @@ private:
     int cell_size_;
     cv::Size grid_size_;
     std::vector<std::vector<int>> grid_;
+    mutable std::unordered_map<int, std::shared_ptr<std::vector<size_t>>> grid_offsets_;
+    std::vector<std::pair<size_t, size_t>> grid_bucket_descriptors_;
     std::vector<std::shared_ptr<LineSegList>> storage_;
     bool read_only_;
+    uint32_t file_version_ = 0;
+    uint32_t paths_offset_in_file_;
+    uint32_t buckets_offset_in_file_;
     std::unique_ptr<MmappedData> mmapped_data_;
+    mutable std::mutex bucket_mutex_;
+    mutable std::mutex seglist_mutex_;
 };
-
+ 
 GridStore::GridStore(const cv::Rect& bounds, int cell_size)
     : pimpl_(std::make_unique<GridStoreImpl>(bounds, cell_size)) {}
-
+ 
 GridStore::GridStore(const std::string& path)
     : pimpl_(std::make_unique<GridStoreImpl>(cv::Rect(), 1)) { // Use a dummy cell_size to avoid division by zero
     pimpl_->load_mmap(path);

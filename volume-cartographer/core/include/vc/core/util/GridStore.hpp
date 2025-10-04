@@ -28,6 +28,7 @@ public:
     void load_mmap(const std::string& path);
 
 private:
+    friend class LineSegList;
     class GridStoreImpl;
     std::unique_ptr<GridStoreImpl> pimpl_;
 };
