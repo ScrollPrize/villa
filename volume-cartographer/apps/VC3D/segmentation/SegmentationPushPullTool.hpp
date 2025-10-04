@@ -4,12 +4,17 @@
 #include "SegmentationPushPullConfig.hpp"
 
 #include <memory>
+#include <optional>
+
+#include <opencv2/core.hpp>
 
 class SegmentationEditManager;
 class SegmentationWidget;
 class SegmentationOverlayController;
 class CSurfaceCollection;
 class SegmentationModule;
+class CVolumeViewer;
+class QuadSurface;
 class QTimer;
 
 class SegmentationPushPullTool : public SegmentationTool
@@ -35,6 +40,9 @@ public:
     void setAlphaConfig(const AlphaPushPullConfig& config);
     [[nodiscard]] const AlphaPushPullConfig& alphaConfig() const { return _alphaConfig; }
 
+    static AlphaPushPullConfig sanitizeConfig(const AlphaPushPullConfig& config);
+    static bool configsEqual(const AlphaPushPullConfig& lhs, const AlphaPushPullConfig& rhs);
+
     bool start(int direction);
     void stop(int direction);
     void stopAll();
@@ -46,6 +54,12 @@ public:
 private:
     bool applyStepInternal();
     void ensureTimer();
+    std::optional<cv::Vec3f> computeAlphaTarget(const cv::Vec3f& centerWorld,
+                                                const cv::Vec3f& normal,
+                                                int direction,
+                                                QuadSurface* surface,
+                                                CVolumeViewer* viewer,
+                                                bool* outUnavailable) const;
 
     SegmentationModule& _module;
     SegmentationEditManager* _editManager{nullptr};

@@ -11,12 +11,15 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <unordered_set>
 
 #include <opencv2/core.hpp>
 
 #include "SegmentationGrowth.hpp"
 #include "SegmentationPushPullConfig.hpp"
+#include "SegmentationUndoHistory.hpp"
+
+namespace segmentation { class CorrectionsState; }
+
 
 class CSurfaceCollection;
 class CVolumeViewer;
@@ -104,6 +107,7 @@ private:
     friend class SegmentationBrushTool;
     friend class SegmentationLineTool;
     friend class SegmentationPushPullTool;
+    friend class segmentation::CorrectionsState;
 
     enum class FalloffTool
     {
@@ -142,7 +146,6 @@ private:
 
     void emitPendingChanges();
     void refreshOverlay();
-    void refreshMaskOverlay();
     void updateCorrectionsWidget();
     void setCorrectionsAnnotateMode(bool enabled, bool userInitiated);
     void setActiveCorrectionCollection(uint64_t collectionId, bool userInitiated);
@@ -160,15 +163,6 @@ private:
                                     int steps);
     void setInvalidationBrushActive(bool active);
     void clearInvalidationBrush();
-    void startPaintStroke(const cv::Vec3f& worldPos);
-    void extendPaintStroke(const cv::Vec3f& worldPos, bool forceSample = false);
-    void finishPaintStroke();
-    bool applyInvalidationBrush();
-
-    void startLineDragStroke(const cv::Vec3f& worldPos);
-    void extendLineDragStroke(const cv::Vec3f& worldPos, bool forceSample = false);
-    void finishLineDragStroke();
-    bool applyLineDragStroke(const std::vector<cv::Vec3f>& stroke);
     void clearLineDragStroke();
 
     void handleMousePress(CVolumeViewer* viewer,
@@ -202,13 +196,6 @@ private:
     void updateOverlayFalloff(FalloffTool tool);
     [[nodiscard]] float falloffRadius(FalloffTool tool) const;
     [[nodiscard]] float falloffSigma(FalloffTool tool) const;
-    [[nodiscard]] std::optional<cv::Vec3f> computeAlphaPushPullTarget(const cv::Vec3f& centerWorld,
-                                                                      const cv::Vec3f& normal,
-                                                                      int direction,
-                                                                      QuadSurface* surface,
-                                                                      CVolumeViewer* viewer,
-                                                                      bool* outUnavailable) const;
-
     void beginDrag(int row, int col, CVolumeViewer* viewer, const cv::Vec3f& worldPos);
     void updateDrag(const cv::Vec3f& worldPos);
     void finishDrag();
@@ -242,16 +229,9 @@ private:
     bool _growthInProgress{false};
     SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Tracer};
     int _growthSteps{10};
-    bool _usingCorrectionsGrowth{false};
-    bool _correctionsAnnotateMode{false};
-    uint64_t _activeCorrectionId{0};
-    std::vector<uint64_t> _pendingCorrectionIds;
-    std::unordered_set<uint64_t> _managedCorrectionIds;
     bool _ignoreSegSurfaceChange{false};
-    bool _correctionsZRangeEnabled{false};
-    int _correctionsZMin{0};
-    int _correctionsZMax{0};
-    std::optional<std::pair<int, int>> _correctionsRange;
+
+    std::unique_ptr<segmentation::CorrectionsState> _corrections;
 
     DragState _drag;
     HoverState _hover;
@@ -266,10 +246,6 @@ private:
     std::unique_ptr<SegmentationLineTool> _lineTool;
     std::unique_ptr<SegmentationPushPullTool> _pushPullTool;
 
-    struct UndoState
-    {
-        cv::Mat_<cv::Vec3f> points;
-    };
-    std::deque<UndoState> _undoStack;
+    segmentation::UndoHistory _undoHistory;
     bool _suppressUndoCapture{false};
 };

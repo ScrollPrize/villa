@@ -8,15 +8,12 @@
 #include "SegmentationBrushTool.hpp"
 #include "SegmentationLineTool.hpp"
 #include "SegmentationPushPullTool.hpp"
+#include "SegmentationCorrections.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 
 #include "vc/ui/VCCollection.hpp"
-#include "vc/core/util/Surface.hpp"
-#include "vc/core/types/Volume.hpp"
-#include "vc/core/util/Slicing.hpp"
 
-#include <QColor>
 #include <QCursor>
 #include <QKeyEvent>
 #include <QKeySequence>
@@ -30,7 +27,6 @@
 #include <utility>
 #include <vector>
 
-#include <opencv2/imgproc.hpp>
 
 Q_LOGGING_CATEGORY(lcSegModule, "vc.segmentation.module")
 
@@ -39,14 +35,6 @@ namespace
 constexpr int kStatusShort = 1500;
 constexpr int kStatusMedium = 2000;
 constexpr int kStatusLong = 5000;
-constexpr int kMaxUndoStates = 5;
-constexpr float kAlphaMinStep = 0.05f;
-constexpr float kAlphaMaxStep = 20.0f;
-constexpr float kAlphaMinRange = 0.01f;
-constexpr float kAlphaDefaultHighDelta = 0.05f;
-constexpr float kAlphaBorderLimit = 20.0f;
-constexpr int kAlphaBlurRadiusMax = 15;
-constexpr float kAlphaPerVertexLimitMax = 128.0f;
 
 bool nearlyEqual(float lhs, float rhs);
 
@@ -58,44 +46,9 @@ float averageScale(const cv::Vec2f& scale)
     return (avg > 1e-4f) ? avg : 1.0f;
 }
 
-AlphaPushPullConfig sanitizeAlphaConfig(const AlphaPushPullConfig& config)
-{
-    AlphaPushPullConfig sanitized = config;
 
-    sanitized.start = std::clamp(sanitized.start, -128.0f, 128.0f);
-    sanitized.stop = std::clamp(sanitized.stop, -128.0f, 128.0f);
-    if (sanitized.start > sanitized.stop) {
-        std::swap(sanitized.start, sanitized.stop);
-    }
 
-    const float magnitude = std::clamp(std::fabs(sanitized.step), kAlphaMinStep, kAlphaMaxStep);
-    sanitized.step = (sanitized.step < 0.0f) ? -magnitude : magnitude;
 
-    sanitized.low = std::clamp(sanitized.low, 0.0f, 1.0f);
-    sanitized.high = std::clamp(sanitized.high, 0.0f, 1.0f);
-    if (sanitized.high <= sanitized.low + kAlphaMinRange) {
-        sanitized.high = std::min(1.0f, sanitized.low + kAlphaDefaultHighDelta);
-    }
-
-    sanitized.borderOffset = std::clamp(sanitized.borderOffset, -kAlphaBorderLimit, kAlphaBorderLimit);
-    sanitized.blurRadius = std::clamp(sanitized.blurRadius, 0, kAlphaBlurRadiusMax);
-    sanitized.perVertexLimit = std::clamp(sanitized.perVertexLimit, 0.0f, kAlphaPerVertexLimitMax);
-
-    return sanitized;
-}
-
-bool alphaConfigsEqual(const AlphaPushPullConfig& lhs, const AlphaPushPullConfig& rhs)
-{
-    return nearlyEqual(lhs.start, rhs.start) &&
-           nearlyEqual(lhs.stop, rhs.stop) &&
-           nearlyEqual(lhs.step, rhs.step) &&
-           nearlyEqual(lhs.low, rhs.low) &&
-           nearlyEqual(lhs.high, rhs.high) &&
-           nearlyEqual(lhs.borderOffset, rhs.borderOffset) &&
-           lhs.blurRadius == rhs.blurRadius &&
-           nearlyEqual(lhs.perVertexLimit, rhs.perVertexLimit) &&
-           lhs.perVertex == rhs.perVertex;
-}
 }
 
 void SegmentationModule::DragState::reset()
@@ -160,7 +113,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _smoothStrength = std::clamp(_widget->smoothingStrength(), 0.0f, 1.0f);
         _smoothIterations = std::clamp(_widget->smoothingIterations(), 1, 25);
         initialAlphaPushPullEnabled = _widget->alphaPushPullEnabled();
-        initialAlphaConfig = sanitizeAlphaConfig(_widget->alphaPushPullConfig());
+        initialAlphaConfig = SegmentationPushPullTool::sanitizeConfig(_widget->alphaPushPullConfig());
     }
 
     if (_overlay) {
@@ -174,6 +127,8 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     _pushPullTool->setStepMultiplier(initialPushPullStep);
     _pushPullTool->setAlphaEnabled(initialAlphaPushPullEnabled);
     _pushPullTool->setAlphaConfig(initialAlphaConfig);
+
+    _corrections = std::make_unique<segmentation::CorrectionsState>(*this, _widget, _pointCollection);
 
     useFalloff(FalloffTool::Drag);
 
@@ -189,38 +144,16 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     }
 
     if (_pointCollection) {
-        const auto& collections = _pointCollection->getAllCollections();
-        for (const auto& entry : collections) {
-            _pendingCorrectionIds.push_back(entry.first);
-        }
-
         connect(_pointCollection, &VCCollection::collectionRemoved, this, [this](uint64_t id) {
-            const uint64_t sentinel = std::numeric_limits<uint64_t>::max();
-            if (id == sentinel) {
-                _pendingCorrectionIds.clear();
-                _managedCorrectionIds.clear();
-                _activeCorrectionId = 0;
-                setCorrectionsAnnotateMode(false, false);
-            } else {
-                auto eraseIt = std::remove(_pendingCorrectionIds.begin(), _pendingCorrectionIds.end(), id);
-                if (eraseIt != _pendingCorrectionIds.end()) {
-                    _pendingCorrectionIds.erase(eraseIt, _pendingCorrectionIds.end());
-                    _managedCorrectionIds.erase(id);
-                    if (_activeCorrectionId == id) {
-                        _activeCorrectionId = 0;
-                        setCorrectionsAnnotateMode(false, false);
-                    }
-                }
+            if (_corrections) {
+                _corrections->onCollectionRemoved(id);
+                updateCorrectionsWidget();
             }
-            updateCorrectionsWidget();
         });
 
         connect(_pointCollection, &VCCollection::collectionChanged, this, [this](uint64_t id) {
-            if (id == std::numeric_limits<uint64_t>::max()) {
-                return;
-            }
-            if (std::find(_pendingCorrectionIds.begin(), _pendingCorrectionIds.end(), id) != _pendingCorrectionIds.end()) {
-                updateCorrectionsWidget();
+            if (_corrections) {
+                _corrections->onCollectionChanged(id);
             }
         });
     }
@@ -371,6 +304,7 @@ void SegmentationModule::setEditingEnabled(bool enabled)
         clearUndoStack();
     }
     updateCorrectionsWidget();
+    refreshOverlay();
     emit editingEnabledChanged(enabled);
 }
 
@@ -498,13 +432,9 @@ float SegmentationModule::falloffSigma(FalloffTool tool) const
     return _dragSigmaSteps;
 }
 
-void SegmentationModule::updateOverlayFalloff(FalloffTool tool)
+void SegmentationModule::updateOverlayFalloff(FalloffTool)
 {
-    if (!_overlay) {
-        return;
-    }
-    _overlay->setGaussianParameters(falloffRadius(tool), falloffSigma(tool), gridStepWorld());
-    _overlay->refreshAll();
+    refreshOverlay();
 }
 
 void SegmentationModule::useFalloff(FalloffTool tool)
@@ -584,8 +514,8 @@ void SegmentationModule::setAlphaPushPullEnabled(bool enabled)
 
 void SegmentationModule::setAlphaPushPullConfig(const AlphaPushPullConfig& config)
 {
-    AlphaPushPullConfig sanitized = sanitizeAlphaConfig(config);
-    if (_pushPullTool && alphaConfigsEqual(_pushPullTool->alphaConfig(), sanitized)) {
+    AlphaPushPullConfig sanitized = SegmentationPushPullTool::sanitizeConfig(config);
+    if (_pushPullTool && SegmentationPushPullTool::configsEqual(_pushPullTool->alphaConfig(), sanitized)) {
         if (_widget) {
             _widget->setAlphaPushPullConfig(sanitized);
         }
@@ -696,11 +626,7 @@ void SegmentationModule::endEditingSession()
     clearLineDragStroke();
     setInvalidationBrushActive(false);
     _lineDrawKeyActive = false;
-    if (_overlay) {
-        _overlay->setActiveVertex(std::nullopt);
-        _overlay->setTouchedVertices({});
-        _overlay->refreshAll();
-    }
+    refreshOverlay();
     QuadSurface* baseSurface = _editManager ? _editManager->baseSurface() : nullptr;
     QuadSurface* previewSurface = _editManager ? _editManager->previewSurface() : nullptr;
 
@@ -757,43 +683,35 @@ bool SegmentationModule::captureUndoSnapshot()
         return false;
     }
 
-    UndoState state;
-    state.points = previewPoints.clone();
-    if (state.points.empty()) {
-        return false;
-    }
-
-    if (_undoStack.size() >= static_cast<std::size_t>(kMaxUndoStates)) {
-        _undoStack.pop_front();
-    }
-    _undoStack.push_back(std::move(state));
-    return true;
+    return _undoHistory.capture(previewPoints);
 }
 
 void SegmentationModule::discardLastUndoSnapshot()
 {
-    if (!_undoStack.empty()) {
-        _undoStack.pop_back();
-    }
+    _undoHistory.discardLast();
 }
 
 bool SegmentationModule::restoreUndoSnapshot()
 {
-    if (_undoStack.empty()) {
+    if (_suppressUndoCapture) {
         return false;
     }
     if (!_editManager || !_editManager->hasSession()) {
         return false;
     }
 
-    UndoState state = std::move(_undoStack.back());
-    _undoStack.pop_back();
-    if (state.points.empty()) {
+    auto state = _undoHistory.takeLast();
+    if (!state) {
+        return false;
+    }
+
+    cv::Mat_<cv::Vec3f> points = std::move(*state);
+    if (points.empty()) {
         return false;
     }
 
     _suppressUndoCapture = true;
-    bool applied = _editManager->setPreviewPoints(state.points, false);
+    bool applied = _editManager->setPreviewPoints(points, false);
     if (applied) {
         _editManager->applyPreview();
         if (_surfaces) {
@@ -803,7 +721,7 @@ bool SegmentationModule::restoreUndoSnapshot()
         refreshOverlay();
         emitPendingChanges();
     } else {
-        _undoStack.push_back(std::move(state));
+        _undoHistory.pushBack(std::move(points));
     }
     _suppressUndoCapture = false;
 
@@ -812,7 +730,7 @@ bool SegmentationModule::restoreUndoSnapshot()
 
 void SegmentationModule::clearUndoStack()
 {
-    _undoStack.clear();
+    _undoHistory.clear();
 }
 
 bool SegmentationModule::hasActiveSession() const
@@ -888,7 +806,7 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
     if (event->key() == Qt::Key_E && !event->isAutoRepeat()) {
         const Qt::KeyboardModifiers mods = event->modifiers();
         if (mods == Qt::NoModifier || mods == Qt::ShiftModifier) {
-            if (applyInvalidationBrush()) {
+            if (_brushTool && _brushTool->applyPending(_dragRadiusSteps)) {
                 event->accept();
                 return true;
             }
@@ -984,7 +902,7 @@ bool SegmentationModule::handleKeyRelease(QKeyEvent* event)
     if (event->key() == Qt::Key_S && !event->isAutoRepeat()) {
         _lineDrawKeyActive = false;
         if (_lineTool && _lineTool->strokeActive()) {
-            finishLineDragStroke();
+            _lineTool->finishStroke(_lineDrawKeyActive);
         }
         event->accept();
         return true;
@@ -1013,6 +931,9 @@ void SegmentationModule::setGrowthInProgress(bool running)
     if (_widget) {
         _widget->setGrowthInProgress(running);
     }
+    if (_corrections) {
+        _corrections->setGrowthInProgress(running);
+    }
     if (running) {
         setCorrectionsAnnotateMode(false, false);
         setInvalidationBrushActive(false);
@@ -1021,70 +942,6 @@ void SegmentationModule::setGrowthInProgress(bool running)
         _lineDrawKeyActive = false;
     }
     updateCorrectionsWidget();
-}
-
-SegmentationCorrectionsPayload SegmentationModule::buildCorrectionsPayload() const
-{
-    SegmentationCorrectionsPayload payload;
-    if (!_pointCollection) {
-        return payload;
-    }
-
-    const auto& collections = _pointCollection->getAllCollections();
-    for (uint64_t id : _pendingCorrectionIds) {
-        auto it = collections.find(id);
-        if (it == collections.end()) {
-            continue;
-        }
-
-        SegmentationCorrectionsPayload::Collection entry;
-        entry.id = it->second.id;
-        entry.name = it->second.name;
-        entry.metadata = it->second.metadata;
-        entry.color = it->second.color;
-
-        std::vector<ColPoint> points;
-        points.reserve(it->second.points.size());
-        for (const auto& pair : it->second.points) {
-            points.push_back(pair.second);
-        }
-        std::sort(points.begin(), points.end(), [](const ColPoint& a, const ColPoint& b) {
-            return a.id < b.id;
-        });
-        if (points.empty()) {
-            continue;
-        }
-        entry.points = std::move(points);
-        payload.collections.push_back(std::move(entry));
-    }
-
-    return payload;
-}
-
-void SegmentationModule::clearPendingCorrections()
-{
-    setCorrectionsAnnotateMode(false, false);
-
-    if (_pointCollection) {
-        for (uint64_t id : _pendingCorrectionIds) {
-            if (_managedCorrectionIds.count(id) > 0) {
-                _pointCollection->clearCollection(id);
-            }
-        }
-    }
-
-    _pendingCorrectionIds.clear();
-    _managedCorrectionIds.clear();
-    _activeCorrectionId = 0;
-    updateCorrectionsWidget();
-}
-
-std::optional<std::pair<int, int>> SegmentationModule::correctionsZRange() const
-{
-    if (!_correctionsZRangeEnabled) {
-        return std::nullopt;
-    }
-    return std::make_pair(_correctionsZMin, _correctionsZMax);
 }
 
 void SegmentationModule::emitPendingChanges()
@@ -1099,14 +956,38 @@ void SegmentationModule::emitPendingChanges()
 
 void SegmentationModule::refreshOverlay()
 {
-    if (!_overlay || !_editManager) {
+    if (!_overlay) {
         return;
     }
 
-    std::optional<SegmentationOverlayController::VertexMarker> activeMarker;
+    SegmentationOverlayController::State state;
+    state.gaussianRadiusSteps = falloffRadius(_activeFalloff);
+    state.gaussianSigmaSteps = falloffSigma(_activeFalloff);
+    state.gridStepWorld = gridStepWorld();
+
+    const auto toFalloffMode = [](FalloffTool tool) {
+        using Mode = SegmentationOverlayController::State::FalloffMode;
+        switch (tool) {
+        case FalloffTool::Drag:
+            return Mode::Drag;
+        case FalloffTool::Line:
+            return Mode::Line;
+        case FalloffTool::PushPull:
+            return Mode::PushPull;
+        }
+        return Mode::Drag;
+    };
+    state.falloff = toFalloffMode(_activeFalloff);
+
+    const bool hasSession = _editManager && _editManager->hasSession();
+    if (!hasSession) {
+        _overlay->applyState(state);
+        return;
+    }
+
     if (_drag.active) {
         if (auto world = _editManager->vertexWorldPosition(_drag.row, _drag.col)) {
-            activeMarker = SegmentationOverlayController::VertexMarker{
+            state.activeMarker = SegmentationOverlayController::VertexMarker{
                 .row = _drag.row,
                 .col = _drag.col,
                 .world = *world,
@@ -1115,7 +996,7 @@ void SegmentationModule::refreshOverlay()
             };
         }
     } else if (_hover.valid) {
-        activeMarker = SegmentationOverlayController::VertexMarker{
+        state.activeMarker = SegmentationOverlayController::VertexMarker{
             .row = _hover.row,
             .col = _hover.col,
             .world = _hover.world,
@@ -1124,16 +1005,15 @@ void SegmentationModule::refreshOverlay()
         };
     }
 
-    std::vector<SegmentationOverlayController::VertexMarker> neighbours;
-    if (_editManager && _drag.active) {
+    if (_drag.active) {
         const auto touched = _editManager->recentTouched();
-        neighbours.reserve(touched.size());
+        state.neighbours.reserve(touched.size());
         for (const auto& key : touched) {
             if (key.row == _drag.row && key.col == _drag.col) {
                 continue;
             }
             if (auto world = _editManager->vertexWorldPosition(key.row, key.col)) {
-                neighbours.push_back({key.row, key.col, *world, false, false});
+                state.neighbours.push_back({key.row, key.col, *world, false, false});
             }
         }
     }
@@ -1162,281 +1042,105 @@ void SegmentationModule::refreshOverlay()
         maskPoints.insert(maskPoints.end(), linePts.begin(), linePts.end());
     }
 
-    const bool maskVisible = !maskPoints.empty();
     const bool hasLineStroke = _lineTool && !_lineTool->overlayPoints().empty();
     const bool lineStrokeActive = _lineTool && _lineTool->strokeActive();
     const bool brushActive = _brushTool && _brushTool->brushActive();
     const bool brushStrokeActive = _brushTool && _brushTool->strokeActive();
+    const bool pushPullActive = _pushPullTool && _pushPullTool->isActive();
+
+    state.maskPoints = std::move(maskPoints);
+    state.maskVisible = !state.maskPoints.empty();
+    state.hasLineStroke = hasLineStroke;
+    state.lineStrokeActive = lineStrokeActive;
+    state.brushActive = brushActive;
+    state.brushStrokeActive = brushStrokeActive;
+    state.pushPullActive = pushPullActive;
 
     FalloffTool overlayTool = _activeFalloff;
     if (hasLineStroke) {
         overlayTool = FalloffTool::Line;
     } else if (brushHasOverlay || brushStrokeActive || brushActive) {
         overlayTool = FalloffTool::Drag;
-    } else if (_pushPullTool && _pushPullTool->isActive()) {
+    } else if (pushPullActive) {
         overlayTool = FalloffTool::PushPull;
     }
 
-    const float overlayRadiusSteps = falloffRadius(overlayTool);
-    const float brushPixelRadius = std::clamp(overlayRadiusSteps * 1.5f, 3.0f, 18.0f);
-    const bool drawingOverlay = brushActive || brushStrokeActive || lineStrokeActive || hasLineStroke;
-    const float brushOpacity = drawingOverlay ? 0.6f : 0.45f;
-    const auto renderMode = hasLineStroke ? ViewerOverlayControllerBase::PathRenderMode::LineStrip
-                                          : ViewerOverlayControllerBase::PathRenderMode::Points;
-    const float lineWidth = hasLineStroke ? 3.0f : std::max(brushPixelRadius * 0.5f, 2.0f);
-    const float pointRadius = hasLineStroke ? std::max(brushPixelRadius * 0.35f, 2.0f) : brushPixelRadius;
-    const QColor overlayColor = hasLineStroke ? QColor(80, 170, 255)
-                                              : QColor(255, 140, 0);
-    const float overlayOpacity = hasLineStroke ? 0.85f : brushOpacity;
+    state.displayRadiusSteps = falloffRadius(overlayTool);
 
-    _overlay->setActiveVertex(activeMarker);
-    _overlay->setTouchedVertices(neighbours);
-    if (maskVisible) {
-        _overlay->setMaskOverlay(maskPoints,
-                                 true,
-                                 pointRadius,
-                                 overlayOpacity,
-                                 renderMode,
-                                 lineWidth,
-                                 overlayColor);
-    } else {
-        _overlay->setMaskOverlay({},
-                                 false,
-                                 0.0f,
-                                 0.0f,
-                                 ViewerOverlayControllerBase::PathRenderMode::Points,
-                                 0.0f,
-                                 QColor());
-    }
-    _overlay->setGaussianParameters(falloffRadius(_activeFalloff), falloffSigma(_activeFalloff), gridStepWorld());
-    _overlay->refreshAll();
+    _overlay->applyState(state);
 }
 
-void SegmentationModule::refreshMaskOverlay()
-{
-    if (_overlay) {
-        _overlay->setMaskOverlay({},
-                                 false,
-                                 0.0f,
-                                 0.0f,
-                                 ViewerOverlayControllerBase::PathRenderMode::Points,
-                                 0.0f,
-                                 QColor());
-    }
-}
+
 
 void SegmentationModule::updateCorrectionsWidget()
 {
-    if (!_widget) {
-        return;
+    if (_corrections) {
+        _corrections->refreshWidget();
     }
-
-    pruneMissingCorrections();
-
-    const bool correctionsAvailable = (_pointCollection != nullptr) && !_growthInProgress;
-    QVector<QPair<uint64_t, QString>> entries;
-    if (_pointCollection) {
-        const auto& collections = _pointCollection->getAllCollections();
-        entries.reserve(static_cast<int>(_pendingCorrectionIds.size()));
-        for (uint64_t id : _pendingCorrectionIds) {
-            auto it = collections.find(id);
-            if (it != collections.end()) {
-                entries.append({id, QString::fromStdString(it->second.name)});
-            }
-        }
-    }
-
-    std::optional<uint64_t> active;
-    if (_activeCorrectionId != 0) {
-        active = _activeCorrectionId;
-    }
-
-    _widget->setCorrectionCollections(entries, active);
-    _widget->setCorrectionsEnabled(correctionsAvailable);
-    _widget->setCorrectionsAnnotateChecked(_correctionsAnnotateMode && correctionsAvailable);
 }
 
 void SegmentationModule::setCorrectionsAnnotateMode(bool enabled, bool userInitiated)
 {
-    if (!_pointCollection || _growthInProgress || !_editingEnabled) {
-        enabled = false;
-    }
-
-    if (enabled && _activeCorrectionId == 0) {
-        if (!createCorrectionCollection(false)) {
-            enabled = false;
-        }
-    }
-
-    if (_correctionsAnnotateMode == enabled) {
-        updateCorrectionsWidget();
+    if (!_corrections) {
         return;
     }
 
-    _correctionsAnnotateMode = enabled;
-    if (_widget) {
-        _widget->setCorrectionsAnnotateChecked(enabled);
-    }
-
-    if (enabled) {
+    const bool wasActive = _corrections->annotateMode();
+    const bool isActive = _corrections->setAnnotateMode(enabled, userInitiated, _editingEnabled);
+    if (isActive && !wasActive) {
         setInvalidationBrushActive(false);
         clearInvalidationBrush();
     }
-
-    if (userInitiated) {
-        const QString message = enabled ? tr("Correction annotation enabled")
-                                        : tr("Correction annotation disabled");
-        emit statusMessageRequested(message, kStatusShort);
-    }
-
-    updateCorrectionsWidget();
 }
 
 void SegmentationModule::setActiveCorrectionCollection(uint64_t collectionId, bool userInitiated)
 {
-    if (!_pointCollection) {
-        return;
+    if (_corrections) {
+        _corrections->setActiveCollection(collectionId, userInitiated);
     }
-
-    if (collectionId == 0) {
-        _activeCorrectionId = 0;
-        setCorrectionsAnnotateMode(false, false);
-        updateCorrectionsWidget();
-        return;
-    }
-
-    const auto& collections = _pointCollection->getAllCollections();
-    if (collections.find(collectionId) == collections.end()) {
-        pruneMissingCorrections();
-        emit statusMessageRequested(tr("Selected correction set no longer exists."), kStatusShort);
-        updateCorrectionsWidget();
-        return;
-    }
-
-    if (std::find(_pendingCorrectionIds.begin(), _pendingCorrectionIds.end(), collectionId) == _pendingCorrectionIds.end()) {
-        _pendingCorrectionIds.push_back(collectionId);
-    }
-
-    _activeCorrectionId = collectionId;
-
-    if (userInitiated) {
-        emit statusMessageRequested(tr("Active correction set changed."), kStatusShort);
-    }
-
-    updateCorrectionsWidget();
 }
 
 uint64_t SegmentationModule::createCorrectionCollection(bool announce)
 {
-    if (!_pointCollection) {
-        return 0;
-    }
-
-    const std::string newName = _pointCollection->generateNewCollectionName("correction");
-    const uint64_t newId = _pointCollection->addCollection(newName);
-    if (newId == 0) {
-        return 0;
-    }
-
-    if (std::find(_pendingCorrectionIds.begin(), _pendingCorrectionIds.end(), newId) == _pendingCorrectionIds.end()) {
-        _pendingCorrectionIds.push_back(newId);
-    }
-    _managedCorrectionIds.insert(newId);
-    _activeCorrectionId = newId;
-
-    if (announce) {
-        emit statusMessageRequested(tr("Created correction set '%1'.").arg(QString::fromStdString(newName)), kStatusShort);
-    }
-
-    updateCorrectionsWidget();
-    return newId;
+    return _corrections ? _corrections->createCollection(announce) : 0;
 }
 
 void SegmentationModule::handleCorrectionPointAdded(const cv::Vec3f& worldPos)
 {
-    if (!_pointCollection || _activeCorrectionId == 0) {
-        return;
+    if (_corrections) {
+        _corrections->handlePointAdded(worldPos);
     }
-
-    const auto& collections = _pointCollection->getAllCollections();
-    auto it = collections.find(_activeCorrectionId);
-    if (it == collections.end()) {
-        pruneMissingCorrections();
-        updateCorrectionsWidget();
-        return;
-    }
-
-    _pointCollection->addPoint(it->second.name, worldPos);
 }
 
 void SegmentationModule::handleCorrectionPointRemove(const cv::Vec3f& worldPos)
 {
-    if (!_pointCollection || _activeCorrectionId == 0) {
-        return;
-    }
-
-    const auto& collections = _pointCollection->getAllCollections();
-    auto it = collections.find(_activeCorrectionId);
-    if (it == collections.end()) {
-        pruneMissingCorrections();
-        updateCorrectionsWidget();
-        return;
-    }
-
-    const auto& points = it->second.points;
-    if (points.empty()) {
-        return;
-    }
-
-    uint64_t closestId = 0;
-    float closestDistance = std::numeric_limits<float>::max();
-    for (const auto& entry : points) {
-        const float dist = cv::norm(entry.second.p - worldPos);
-        if (dist < closestDistance) {
-            closestDistance = dist;
-            closestId = entry.second.id;
-        }
-    }
-
-    if (closestId != 0) {
-        _pointCollection->removePoint(closestId);
+    if (_corrections) {
+        _corrections->handlePointRemoved(worldPos);
     }
 }
 
 void SegmentationModule::pruneMissingCorrections()
 {
-    if (!_pointCollection) {
-        _pendingCorrectionIds.clear();
-        _managedCorrectionIds.clear();
-        _activeCorrectionId = 0;
-        _correctionsAnnotateMode = false;
-        return;
-    }
-
-    const auto& collections = _pointCollection->getAllCollections();
-    auto endIt = std::remove_if(_pendingCorrectionIds.begin(), _pendingCorrectionIds.end(), [&](uint64_t id) {
-        const bool missing = collections.find(id) == collections.end();
-        if (missing) {
-            _managedCorrectionIds.erase(id);
-            if (_activeCorrectionId == id) {
-                _activeCorrectionId = 0;
-                _correctionsAnnotateMode = false;
-            }
-        }
-        return missing;
-    });
-    _pendingCorrectionIds.erase(endIt, _pendingCorrectionIds.end());
-
-    if (_activeCorrectionId != 0 && collections.find(_activeCorrectionId) == collections.end()) {
-        _activeCorrectionId = 0;
-        _correctionsAnnotateMode = false;
+    if (_corrections) {
+        _corrections->pruneMissing();
+        _corrections->refreshWidget();
     }
 }
 
 void SegmentationModule::onCorrectionsCreateRequested()
 {
-    if (createCorrectionCollection(true) != 0) {
-        setCorrectionsAnnotateMode(true, false);
+    if (!_corrections) {
+        return;
+    }
+
+    const bool wasActive = _corrections->annotateMode();
+    const uint64_t created = _corrections->createCollection(true);
+    if (created != 0) {
+        const bool nowActive = _corrections->setAnnotateMode(true, false, _editingEnabled);
+        if (nowActive && !wasActive) {
+            setInvalidationBrushActive(false);
+            clearInvalidationBrush();
+        }
     }
 }
 
@@ -1452,19 +1156,27 @@ void SegmentationModule::onCorrectionsAnnotateToggled(bool enabled)
 
 void SegmentationModule::onCorrectionsZRangeChanged(bool enabled, int zMin, int zMax)
 {
-    _correctionsZRangeEnabled = enabled;
-    if (zMin > zMax) {
-        std::swap(zMin, zMax);
-    }
-    _correctionsZMin = zMin;
-    _correctionsZMax = zMax;
-    if (enabled) {
-        _correctionsRange = std::make_pair(_correctionsZMin, _correctionsZMax);
-    } else {
-        _correctionsRange.reset();
+    if (_corrections) {
+        _corrections->onZRangeChanged(enabled, zMin, zMax);
     }
 }
 
+void SegmentationModule::clearPendingCorrections()
+{
+    if (_corrections) {
+        _corrections->clearAll(_editingEnabled);
+    }
+}
+
+std::optional<std::pair<int, int>> SegmentationModule::correctionsZRange() const
+{
+    return _corrections ? _corrections->zRange() : std::nullopt;
+}
+
+SegmentationCorrectionsPayload SegmentationModule::buildCorrectionsPayload() const
+{
+    return _corrections ? _corrections->buildPayload() : SegmentationCorrectionsPayload{};
+}
 void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod method,
                                                     SegmentationGrowthDirection direction,
                                                     int steps)
@@ -1483,7 +1195,9 @@ void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod met
     }
 
     // Ensure any pending invalidation brush strokes are committed before growth.
-    applyInvalidationBrush();
+    if (_brushTool) {
+        _brushTool->applyPending(_dragRadiusSteps);
+    }
 
     _growthMethod = method;
     _growthSteps = std::max(1, steps);
@@ -1497,7 +1211,7 @@ void SegmentationModule::setInvalidationBrushActive(bool active)
         return;
     }
 
-    const bool shouldEnable = active && _editingEnabled && !_growthInProgress && !_correctionsAnnotateMode &&
+    const bool shouldEnable = active && _editingEnabled && !_growthInProgress && !(_corrections && _corrections->annotateMode()) &&
                               _editManager && _editManager->hasSession();
 
     if (!shouldEnable) {
@@ -1520,53 +1234,6 @@ void SegmentationModule::clearInvalidationBrush()
     }
 }
 
-void SegmentationModule::startPaintStroke(const cv::Vec3f& worldPos)
-{
-    if (_brushTool) {
-        _brushTool->startStroke(worldPos);
-    }
-}
-
-void SegmentationModule::extendPaintStroke(const cv::Vec3f& worldPos, bool forceSample)
-{
-    if (_brushTool) {
-        _brushTool->extendStroke(worldPos, forceSample);
-    }
-}
-
-void SegmentationModule::finishPaintStroke()
-{
-    if (_brushTool) {
-        _brushTool->finishStroke();
-    }
-}
-
-void SegmentationModule::startLineDragStroke(const cv::Vec3f& worldPos)
-{
-    if (_lineTool) {
-        _lineTool->startStroke(worldPos);
-    }
-}
-
-void SegmentationModule::extendLineDragStroke(const cv::Vec3f& worldPos, bool forceSample)
-{
-    if (_lineTool) {
-        _lineTool->extendStroke(worldPos, forceSample);
-    }
-}
-
-void SegmentationModule::finishLineDragStroke()
-{
-    if (_lineTool) {
-        _lineTool->finishStroke(_lineDrawKeyActive);
-    }
-}
-
-bool SegmentationModule::applyLineDragStroke(const std::vector<cv::Vec3f>& stroke)
-{
-    return _lineTool ? _lineTool->applyStroke(stroke) : false;
-}
-
 void SegmentationModule::clearLineDragStroke()
 {
     if (_lineTool) {
@@ -1577,13 +1244,23 @@ void SegmentationModule::clearLineDragStroke()
     }
 }
 
-bool SegmentationModule::applyInvalidationBrush()
-{
-    if (!_brushTool) {
-        return false;
-    }
-    return _brushTool->applyPending(_dragRadiusSteps);
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
                                           const cv::Vec3f& worldPos,
@@ -1600,7 +1277,7 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
         return;
     }
 
-    if (_correctionsAnnotateMode) {
+    if (_corrections && _corrections->annotateMode()) {
         if (!isLeftButton) {
             return;
         }
@@ -1636,13 +1313,17 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
         if (_drag.active) {
             cancelDrag();
         }
-        startLineDragStroke(worldPos);
+        if (_lineTool) {
+            _lineTool->startStroke(worldPos);
+        }
         return;
     }
 
     if (brushActive) {
         stopAllPushPull();
-        startPaintStroke(worldPos);
+        if (_brushTool) {
+            _brushTool->startStroke(worldPos);
+        }
         return;
     }
 
@@ -1674,9 +1355,13 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
     const bool lineStrokeActive = _lineTool && _lineTool->strokeActive();
     if (lineStrokeActive) {
         if (buttons.testFlag(Qt::LeftButton)) {
-            extendLineDragStroke(worldPos);
+            if (_lineTool) {
+                _lineTool->extendStroke(worldPos, false);
+            }
         } else {
-            finishLineDragStroke();
+            if (_lineTool) {
+                _lineTool->finishStroke(_lineDrawKeyActive);
+            }
         }
         return;
     }
@@ -1684,9 +1369,13 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
     const bool paintStrokeActive = _brushTool && _brushTool->strokeActive();
     if (paintStrokeActive) {
         if (buttons.testFlag(Qt::LeftButton)) {
-            extendPaintStroke(worldPos);
+            if (_brushTool) {
+                _brushTool->extendStroke(worldPos, false);
+            }
         } else {
-            finishPaintStroke();
+            if (_brushTool) {
+                _brushTool->finishStroke();
+            }
         }
         return;
     }
@@ -1696,7 +1385,7 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
         return;
     }
 
-    if (_correctionsAnnotateMode) {
+    if (_corrections && _corrections->annotateMode()) {
         return;
     }
 
@@ -1712,20 +1401,24 @@ void SegmentationModule::handleMouseRelease(CVolumeViewer* /*viewer*/,
 {
     const bool lineStrokeActive = _lineTool && _lineTool->strokeActive();
     if (lineStrokeActive && button == Qt::LeftButton) {
-        extendLineDragStroke(worldPos, true);
-        finishLineDragStroke();
+        if (_lineTool) {
+            _lineTool->extendStroke(worldPos, true);
+            _lineTool->finishStroke(_lineDrawKeyActive);
+        }
         return;
     }
 
     const bool paintStrokeActive = _brushTool && _brushTool->strokeActive();
     if (paintStrokeActive && button == Qt::LeftButton) {
-        extendPaintStroke(worldPos, true);
-        finishPaintStroke();
+        if (_brushTool) {
+            _brushTool->extendStroke(worldPos, true);
+            _brushTool->finishStroke();
+        }
         return;
     }
 
     if (!_drag.active || button != Qt::LeftButton) {
-        if (_correctionsAnnotateMode && button == Qt::LeftButton) {
+        if (_corrections && _corrections->annotateMode() && button == Qt::LeftButton) {
             return;
         }
         return;
@@ -1893,37 +1586,37 @@ bool SegmentationModule::isNearRotationHandle(CVolumeViewer* viewer, const cv::V
 
 void SegmentationModule::updateHover(CVolumeViewer* viewer, const cv::Vec3f& worldPos)
 {
+    bool hoverChanged = false;
+
     if (!_editManager || !_editManager->hasSession()) {
-        _hover.clear();
-        if (_overlay) {
-            _overlay->setActiveVertex(std::nullopt);
-            _overlay->refreshViewer(viewer);
+        if (_hover.valid) {
+            _hover.clear();
+            hoverChanged = true;
         }
-        return;
+    } else {
+        auto gridIndex = _editManager->worldToGridIndex(worldPos);
+        if (!gridIndex) {
+            if (_hover.valid) {
+                _hover.clear();
+                hoverChanged = true;
+            }
+        } else if (auto world = _editManager->vertexWorldPosition(gridIndex->first, gridIndex->second)) {
+            const bool rowChanged = !_hover.valid || _hover.row != gridIndex->first;
+            const bool colChanged = !_hover.valid || _hover.col != gridIndex->second;
+            const bool worldChanged = !_hover.valid || cv::norm(_hover.world - *world) >= 1e-4f;
+            const bool viewerChanged = !_hover.valid || _hover.viewer != viewer;
+            if (rowChanged || colChanged || worldChanged || viewerChanged) {
+                _hover.set(gridIndex->first, gridIndex->second, *world, viewer);
+                hoverChanged = true;
+            }
+        } else if (_hover.valid) {
+            _hover.clear();
+            hoverChanged = true;
+        }
     }
 
-    auto gridIndex = _editManager->worldToGridIndex(worldPos);
-    if (!gridIndex) {
-        _hover.clear();
-        if (_overlay) {
-            _overlay->setActiveVertex(std::nullopt);
-            _overlay->refreshViewer(viewer);
-        }
-        return;
-    }
-
-    if (auto world = _editManager->vertexWorldPosition(gridIndex->first, gridIndex->second)) {
-        _hover.set(gridIndex->first, gridIndex->second, *world, viewer);
-        if (_overlay) {
-            _overlay->setActiveVertex(SegmentationOverlayController::VertexMarker{
-                .row = _hover.row,
-                .col = _hover.col,
-                .world = *world,
-                .isActive = false,
-                .isGrowth = false
-            });
-            _overlay->refreshViewer(viewer);
-        }
+    if (hoverChanged) {
+        refreshOverlay();
     }
 }
 
@@ -1952,138 +1645,4 @@ bool SegmentationModule::applyPushPullStep()
 }
 
 
-std::optional<cv::Vec3f> SegmentationModule::computeAlphaPushPullTarget(const cv::Vec3f& centerWorld,
-                                                                        const cv::Vec3f& normal,
-                                                                        int direction,
-                                                                        QuadSurface* surface,
-                                                                        CVolumeViewer* viewer,
-                                                                        bool* outUnavailable) const
-{
-    if (outUnavailable) {
-        *outUnavailable = false;
-    }
 
-    if (!_pushPullTool || !_pushPullTool->alphaEnabled() || !viewer || !surface) {
-        return std::nullopt;
-    }
-
-    std::shared_ptr<Volume> volume = viewer->currentVolume();
-    if (!volume) {
-        if (outUnavailable) {
-            *outUnavailable = true;
-        }
-        return std::nullopt;
-    }
-
-    const size_t scaleCount = volume->numScales();
-    int datasetIndex = viewer->datasetScaleIndex();
-    if (scaleCount == 0) {
-        datasetIndex = 0;
-    } else {
-        datasetIndex = std::clamp(datasetIndex, 0, static_cast<int>(scaleCount) - 1);
-    }
-
-    z5::Dataset* dataset = volume->zarrDataset(datasetIndex);
-    if (!dataset) {
-        dataset = volume->zarrDataset(0);
-    }
-    if (!dataset) {
-        if (outUnavailable) {
-            *outUnavailable = true;
-        }
-        return std::nullopt;
-    }
-
-    float scale = viewer->datasetScaleFactor();
-    if (!std::isfinite(scale) || scale <= 0.0f) {
-        scale = 1.0f;
-    }
-
-    ChunkCache* cache = viewer->chunkCachePtr();
-
-    AlphaPushPullConfig cfg = sanitizeAlphaConfig(_pushPullTool->alphaConfig());
-
-    cv::Vec3f orientedNormal = normal * static_cast<float>(direction);
-    const float norm = cv::norm(orientedNormal);
-    if (norm <= 1e-4f) {
-        return std::nullopt;
-    }
-    orientedNormal /= norm;
-
-    const int radius = std::max(cfg.blurRadius, 0);
-    const int kernel = radius * 2 + 1;
-    const cv::Size patchSize(kernel, kernel);
-
-    PlaneSurface plane(centerWorld, orientedNormal);
-    cv::Mat_<cv::Vec3f> coords;
-    plane.gen(&coords, nullptr, patchSize, cv::Vec3f(0, 0, 0), scale, cv::Vec3f(0, 0, 0));
-    coords *= scale;
-
-    const cv::Point2i centerIndex(radius, radius);
-    const float range = std::max(cfg.high - cfg.low, kAlphaMinRange);
-
-    float transparent = 1.0f;
-    float integ = 0.0f;
-
-    const float start = cfg.start;
-    const float stop = cfg.stop;
-    const float step = std::fabs(cfg.step);
-
-    for (float offset = start; offset <= stop + 1e-4f; offset += step) {
-        cv::Mat_<uint8_t> slice;
-        cv::Mat_<cv::Vec3f> offsetMat(patchSize, orientedNormal * (offset * scale));
-        readInterpolated3D(slice, dataset, coords + offsetMat, cache);
-        if (slice.empty()) {
-            continue;
-        }
-
-        cv::Mat sliceFloat;
-        slice.convertTo(sliceFloat, CV_32F, 1.0 / 255.0);
-        cv::GaussianBlur(sliceFloat, sliceFloat, cv::Size(kernel, kernel), 0);
-
-        cv::Mat_<float> opaq = sliceFloat;
-        opaq = (opaq - cfg.low) / range;
-        cv::min(opaq, 1.0f, opaq);
-        cv::max(opaq, 0.0f, opaq);
-
-        const float centerOpacity = opaq(centerIndex);
-        const float joint = transparent * centerOpacity;
-        integ += joint * offset;
-        transparent -= joint;
-
-        if (transparent <= 1e-3f) {
-            break;
-        }
-    }
-
-    if (transparent >= 1.0f) {
-        return std::nullopt;
-    }
-
-    const float denom = 1.0f - transparent;
-    if (denom < 1e-5f) {
-        return std::nullopt;
-    }
-
-    const float expected = integ / denom;
-    if (!std::isfinite(expected)) {
-        return std::nullopt;
-    }
-
-    const float totalOffset = expected + cfg.borderOffset;
-    if (!std::isfinite(totalOffset) || totalOffset <= 0.0f) {
-        return std::nullopt;
-    }
-
-    const cv::Vec3f targetWorld = centerWorld + orientedNormal * totalOffset;
-    if (!std::isfinite(targetWorld[0]) || !std::isfinite(targetWorld[1]) || !std::isfinite(targetWorld[2])) {
-        return std::nullopt;
-    }
-
-    const cv::Vec3f delta = targetWorld - centerWorld;
-    if (cv::norm(delta) < 1e-4f) {
-        return std::nullopt;
-    }
-
-    return targetWorld;
-}

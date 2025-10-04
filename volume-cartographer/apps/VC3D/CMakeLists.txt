@@ -55,6 +55,9 @@ set(srcs
     MenuActionController.hpp
     segmentation/SegmentationModule.cpp
     segmentation/SegmentationModule.hpp
+    segmentation/SegmentationCorrections.cpp
+    segmentation/SegmentationCorrections.hpp
+    segmentation/SegmentationUndoHistory.hpp
     ViewerManager.cpp
     ViewerManager.hpp
     SegmentRenderThread.cpp
