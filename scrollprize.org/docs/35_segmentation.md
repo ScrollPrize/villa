@@ -88,6 +88,15 @@ Your folder structure should resemble this:
     └── config.json - REQUIRED!
 ```
 
+There is only one additional requirement with the latest updates , which is the computation of a normal grid. These can be computed using the `vc_gen_normalgrids` tool , and shuold be placed at the root of your volpkg in a folder called `normal_grids`.
+
+Scroll 5 (PHerc172) has precomputed versions of direction fields and normal grids, available at the following links: 
+
+- [normal_grids](https://dl.ash2txt.org/full-scrolls/Scroll5/PHerc172.volpkg/normal_grids/)
+- [fiber-directions](https://dl.ash2txt.org/full-scrolls/Scroll5/PHerc172.volpkg/representations/direction_fields/s5-fiber-directions.zarr/)
+  - _the horizontal fiber field was only computed from z2000:z8000, the vertical covers the entire height_
+- [structure-tensor-normal](https://dl.ash2txt.org/full-scrolls/Scroll5/PHerc172.volpkg/representations/direction_fields/s5-structure-tensor/)
+
 ### Launching VC3D
 
 If you're using docker : 
