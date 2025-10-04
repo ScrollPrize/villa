@@ -36,6 +36,10 @@
 #include <Eigen/SparseCholesky>
 #include <Eigen/IterativeLinearSolvers>
 
+#ifdef _OPENMP
+#  include <omp.h>
+#endif
+
 #include "Timer.h"
 #include "sparse_cached.h"
 #include "AtA_cached.h"
@@ -174,7 +178,6 @@ namespace igl
           igl::local_basis(s.V, s.F, F1, F2, F3);
           Eigen::SparseMatrix<double> G;
           igl::grad(s.V, s.F, G);
-          Eigen::SparseMatrix<double> Face_Proj;
 
           auto face_proj = [](Eigen::MatrixXd& F){
             std::vector<Eigen::Triplet<double> >IJV;
@@ -243,19 +246,10 @@ namespace igl
       A.makeCompressed();
       #endif
 
-      #ifdef SLIM_CACHED
-      #else
+      #ifndef SLIM_CACHED
       Eigen::SparseMatrix<double> At = A.transpose();
       At.makeCompressed();
       #endif
-
-      #ifdef SLIM_CACHED
-      Eigen::SparseMatrix<double> id_m(s.A.cols(), s.A.cols());
-      #else
-      Eigen::SparseMatrix<double> id_m(A.cols(), A.cols());
-      #endif
-
-      id_m.setIdentity();
 
       // add proximal penalty
       #ifdef SLIM_CACHED
@@ -265,12 +259,14 @@ namespace igl
       else
         igl::AtA_cached(s.A,s.AtA_data,s.AtA);
 
-      L = s.AtA + s.proximal_p * id_m; //add also a proximal 
+      L = s.AtA;               // Aᵀ W A
       L.makeCompressed();
+      L.diagonal().array() += s.proximal_p; // proximal: add to diagonal in-place
 
       #else
-      L = At * s.WGL_M.asDiagonal() * A + s.proximal_p * id_m; //add also a proximal term
+      L = At * s.WGL_M.asDiagonal() * A; // Aᵀ (diag(w)) A
       L.makeCompressed();
+      L.diagonal().array() += s.proximal_p; // proximal: add to diagonal in-place
       #endif
 
       #ifdef SLIM_CACHED
@@ -279,7 +275,6 @@ namespace igl
       buildRhs(s, A);
       #endif
 
-      Eigen::SparseMatrix<double> OldL = L;
       add_soft_constraints(s,L);
       L.makeCompressed();
     }
@@ -363,12 +358,11 @@ namespace igl
           f_rhs(i + 8 * s.f_n) = s.W(i, 6) * s.Ri(i, 6) + s.W(i, 7) * s.Ri(i, 7) + s.W(i, 8) * s.Ri(i, 8);
         }
       }
-      Eigen::VectorXd uv_flat(s.dim *s.v_n);
-      for (int i = 0; i < s.dim; i++)
-        for (int j = 0; j < s.v_n; j++)
-          uv_flat(s.v_n * i + j) = s.V_o(j, i);
 
-      s.rhs = (f_rhs.transpose() * s.WGL_M.asDiagonal() * A).transpose() + s.proximal_p * uv_flat;
+      // Faster RHS: avoid dense diagonal; compute wr = (WGL_M ∘ f_rhs), then Aᵀ wr
+      const Eigen::Map<const Eigen::VectorXd> uv_map(s.V_o.data(), s.dim * s.v_n);
+      Eigen::VectorXd wr = f_rhs.array() * s.WGL_M.array();
+      s.rhs = A.transpose() * wr + s.proximal_p * uv_map;
     }
 
   }
@@ -386,6 +380,10 @@ IGL_INLINE void igl::slim_update_weights_and_closest_rotations_with_jacobians(co
 
   if (dim == 2)
   {
+    // Parallelize local SVD/weight updates (embarrassingly parallel)
+    #ifdef _OPENMP
+    #pragma omp parallel for
+    #endif
     for (int i = 0; i < Ji.rows(); ++i)
     {
       typedef Eigen::Matrix2d Mat2;
@@ -499,6 +497,9 @@ IGL_INLINE void igl::slim_update_weights_and_closest_rotations_with_jacobians(co
     Vec3 m_sing_new;
     Vec3 closest_sing_vec;
     const double sqrt_2 = sqrt(2);
+    #ifdef _OPENMP
+    #pragma omp parallel for firstprivate(ji, m_sing_new, closest_sing_vec)
+    #endif
     for (int i = 0; i < Ji.rows(); ++i)
     {
       ji << Ji(i,0), Ji(i,1), Ji(i,2), 

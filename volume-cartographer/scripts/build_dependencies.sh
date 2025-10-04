@@ -176,7 +176,10 @@ cmake .. -G Ninja \
   -DBLA_VENDOR=OpenBLAS \
   -DCMAKE_PREFIX_PATH="/usr/local/pastix;/usr/local/scotch" \
   -DPASTIX_ROOT="/usr/local/pastix" \
-  -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+  -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+  -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG" \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+  -DCMAKE_CXX_FLAGS="-DSLIM_CACHED"
 cmake --build . -j"$JOBS"
 install -d "$INSTALL_PREFIX/bin"
 install -m 0755 ./flatboi "$INSTALL_PREFIX/bin/flatboi"
