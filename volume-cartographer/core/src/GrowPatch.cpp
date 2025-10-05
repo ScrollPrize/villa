@@ -434,12 +434,15 @@ static int gen_sdirichlet_loss(ceres::Problem &problem,
         return 0;
     }
 
+    ceres::LossFunction* robust = nullptr;
+    robust = new ceres::CauchyLoss(1.0); // cauchy scale = 1.0
+
     problem.AddResidualBlock(
         SymmetricDirichletLoss::Create(/*unit*/ params.unit,
                                        /*w       */ w,
                                        /*eps_abs */ sdir_eps_abs,
                                        /*eps_rel */ sdir_eps_rel),
-        /*loss*/ nullptr,
+        /*loss*/ robust, // Cauchy Loss
         &params.dpoints(p)[0],
         &params.dpoints(pu)[0],
         &params.dpoints(pv)[0]);
