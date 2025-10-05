@@ -79,18 +79,18 @@ def train(config_path):
         dataset = PatchInCubeDataset(config)
     train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config['batch_size'], num_workers=config['num_workers'])
 
-    # model = Vesuvius3dUnetModel(in_channels=5, out_channels=config['step_count'] * 2, config=config)
-    model = SongUnet3dModel(
-        img_resolution=config['crop_size'],
-        in_channels=5,
-        out_channels=config['step_count'] * 2,
-        model_channels=32,
-        channel_mult=[1, 2, 4, 8],
-        num_blocks=2,  # 4
-        encoder_type='residual',
-        dropout=0.1,
-        attn_resolutions=[16, 8],
-    )
+    model = Vesuvius3dUnetModel(in_channels=5, out_channels=config['step_count'] * 2, config=config)
+    # model = SongUnet3dModel(
+    #     img_resolution=config['crop_size'],
+    #     in_channels=5,
+    #     out_channels=config['step_count'] * 2,
+    #     model_channels=32,
+    #     channel_mult=[1, 2, 4, 8],
+    #     num_blocks=2,  # 4
+    #     encoder_type='residual',
+    #     dropout=0.1,
+    #     attn_resolutions=[16, 8],
+    # )
 
     noise_scheduler = diffusers.DDPMScheduler(
         num_train_timesteps=1000,
