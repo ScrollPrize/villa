@@ -326,13 +326,16 @@
                 <number>0</number>
                </property>
                <item row="0" column="0">
-                <widget class="QCheckBox" name="chkFilterFocusPoints">
+                <widget class="DropdownChecklistButton" name="btnFilterDropdown">
                  <property name="text">
-                  <string>Focus Point</string>
+                  <string>Filters</string>
+                 </property>
+                 <property name="popupMode">
+                  <enum>QToolButton::InstantPopup</enum>
                  </property>
                 </widget>
                </item>
-               <item row="0" column="1" colspan="2">
+               <item row="0" column="1">
                 <layout class="QHBoxLayout" name="pointSetFilterLayout">
                  <item>
                   <widget class="QComboBox" name="cmbPointSetFilter"/>
@@ -352,62 +355,6 @@
                   </widget>
                  </item>
                 </layout>
-               </item>
-               <item row="1" column="0">
-                <widget class="QCheckBox" name="chkFilterUnreviewed">
-                 <property name="text">
-                  <string>Unreviewed</string>
-                 </property>
-                </widget>
-               </item>
-               <item row="1" column="1">
-                <widget class="QCheckBox" name="chkFilterRevisit">
-                 <property name="text">
-                  <string>Revisit</string>
-                 </property>
-                </widget>
-               </item>
-               <item row="1" column="2">
-                <widget class="QCheckBox" name="chkFilterHideUnapproved">
-                 <property name="text">
-                  <string>Hide Unapproved</string>
-                 </property>
-                </widget>
-               </item>
-               <item row="2" column="0">
-                <widget class="QCheckBox" name="chkFilterNoExpansion">
-                 <property name="text">
-                  <string>Hide Expansion</string>
-                 </property>
-                </widget>
-               </item>
-               <item row="2" column="1">
-                <widget class="QCheckBox" name="chkFilterNoDefective">
-                 <property name="text">
-                  <string>Hide Defective</string>
-                 </property>
-                </widget>
-               </item>
-               <item row="3" column="0">
-                <widget class="QCheckBox" name="chkFilterPartialReview">
-                 <property name="text">
-                  <string>Hide Partial Review</string>
-                 </property>
-                </widget>
-               </item>
-               <item row="3" column="1">
-                <widget class="QCheckBox" name="chkFilterCurrentOnly">
-                 <property name="text">
-                  <string>Current Segment Only</string>
-                 </property>
-                </widget>
-               </item>
-               <item row="2" column="2">
-                <widget class="QCheckBox" name="chkFilterInspectOnly">
-                 <property name="text">
-                  <string>Inspect Only</string>
-                 </property>
-                </widget>
                </item>
               </layout>
              </item>
@@ -816,14 +763,14 @@
     </layout>
    </widget>
   </widget>
-  <widget class="QDockWidget" name="dockWidgetLocation">
+  <widget class="QDockWidget" name="dockWidgetView">
    <property name="windowTitle">
-    <string>Location</string>
+    <string>View</string>
    </property>
    <attribute name="dockWidgetArea">
     <number>1</number>
    </attribute>
-   <widget class="QWidget" name="dockWidgetLocationContents">
+   <widget class="QWidget" name="dockWidgetViewContents">
     <property name="sizePolicy">
      <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
       <horstretch>0</horstretch>
@@ -917,7 +864,7 @@
          </property>
         </widget>
        </item>
-      <item row="0" column="3">
+       <item row="0" column="3">
         <widget class="QPushButton" name="btnCopyCoords">
          <property name="text">
           <string>Copy</string>
@@ -929,7 +876,7 @@
           </size>
          </property>
          <property name="toolTip">
-         <string>Copy coordinates to clipboard</string>
+          <string>Copy coordinates to clipboard</string>
          </property>
         </widget>
        </item>
@@ -955,158 +902,114 @@
          </property>
         </widget>
        </item>
-       <item row="2" column="0">
-        <widget class="QLabel" name="label_zoom">
-         <property name="text">
-          <string>Zoom</string>
-         </property>
-        </widget>
-       </item>
-       <item row="2" column="1">
-        <widget class="QPushButton" name="btnZoomIn">
-         <property name="text">
-          <string>+</string>
-         </property>
-         <property name="maximumSize">
-          <size>
-           <width>30</width>
-           <height>16777215</height>
-          </size>
-         </property>
-         <property name="toolTip">
-          <string>Zoom In</string>
-         </property>
-        </widget>
-       </item>
-      <item row="2" column="2">
-       <widget class="QPushButton" name="btnZoomOut">
-        <property name="text">
-         <string>-</string>
-        </property>
-        <property name="maximumSize">
-         <size>
-          <width>30</width>
-          <height>16777215</height>
-         </size>
-        </property>
-        <property name="toolTip">
-         <string>Zoom Out</string>
-        </property>
-       </widget>
-      </item>
-      <item row="3" column="0">
-       <widget class="QLabel" name="labelIntersectionOpacity">
-        <property name="text">
-         <string>Intersection opacity</string>
-        </property>
-       </widget>
-      </item>
-      <item row="3" column="1" colspan="2">
-       <widget class="QSpinBox" name="spinIntersectionOpacity">
-        <property name="minimum">
-         <number>0</number>
-        </property>
-        <property name="maximum">
-         <number>100</number>
-        </property>
-        <property name="value">
-         <number>100</number>
-        </property>
-        <property name="suffix">
-         <string>%</string>
-        </property>
-        <property name="toolTip">
-         <string>Adjust opacity of intersection overlays</string>
-        </property>
-       </widget>
-      </item>
-      <item row="4" column="0">
-       <widget class="QLabel" name="labelOverlayVolume">
-        <property name="text">
-         <string>Overlay volume</string>
-        </property>
-       </widget>
-      </item>
-      <item row="4" column="1" colspan="3">
-       <widget class="QComboBox" name="overlayVolumeSelect"/>
-      </item>
-      <item row="5" column="0">
-       <widget class="QLabel" name="labelOverlayOpacity">
-        <property name="text">
-         <string>Overlay opacity</string>
-        </property>
-       </widget>
-      </item>
-      <item row="5" column="1" colspan="2">
-       <widget class="QSpinBox" name="overlayOpacitySpin">
-        <property name="minimum">
-         <number>0</number>
-        </property>
-        <property name="maximum">
-         <number>100</number>
-        </property>
-        <property name="value">
-         <number>50</number>
-        </property>
-        <property name="suffix">
-         <string>%</string>
-        </property>
-       </widget>
-      </item>
-      <item row="6" column="0">
-       <widget class="QLabel" name="labelAxisOverlayOpacity">
-        <property name="text">
-         <string>Axis overlay opacity</string>
-        </property>
-       </widget>
-      </item>
-      <item row="6" column="1" colspan="2">
-       <widget class="QSpinBox" name="spinAxisOverlayOpacity">
-        <property name="minimum">
-         <number>0</number>
-        </property>
-        <property name="maximum">
-         <number>100</number>
-        </property>
-        <property name="value">
-         <number>70</number>
-        </property>
-        <property name="suffix">
-         <string>%</string>
-        </property>
-       </widget>
-      </item>
-      <item row="7" column="0">
-       <widget class="QLabel" name="labelOverlayThreshold">
-        <property name="text">
-         <string>Overlay threshold</string>
-        </property>
-       </widget>
-      </item>
-      <item row="7" column="1" colspan="3">
-       <widget class="QSpinBox" name="overlayThresholdSpin">
-        <property name="minimum">
-         <number>0</number>
-        </property>
-        <property name="maximum">
-         <number>65535</number>
-        </property>
-        <property name="value">
-         <number>1</number>
-        </property>
-       </widget>
-      </item>
-      <item row="8" column="0">
-       <widget class="QLabel" name="labelOverlayColormap">
-        <property name="text">
-         <string>Overlay colormap</string>
-        </property>
-       </widget>
-      </item>
-      <item row="8" column="1" colspan="3">
-       <widget class="QComboBox" name="overlayColormapSelect"/>
-      </item>
-      <item row="9" column="0" colspan="4">
+      </layout>
+     </item>
+     <item row="2" column="0">
+      <widget class="QLabel" name="label_zoom">
+       <property name="text">
+        <string>Zoom</string>
+       </property>
+      </widget>
+     </item>
+     <item row="2" column="1">
+      <widget class="QPushButton" name="btnZoomIn">
+       <property name="text">
+        <string>+</string>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>30</width>
+         <height>16777215</height>
+        </size>
+       </property>
+       <property name="toolTip">
+        <string>Zoom In</string>
+       </property>
+      </widget>
+     </item>
+     <item row="2" column="2">
+      <widget class="QPushButton" name="btnZoomOut">
+       <property name="text">
+        <string>-</string>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>30</width>
+         <height>16777215</height>
+        </size>
+       </property>
+       <property name="toolTip">
+        <string>Zoom Out</string>
+       </property>
+      </widget>
+     </item>
+     <item row="3" column="0">
+      <widget class="QLabel" name="labelIntersectionOpacity">
+       <property name="text">
+        <string>Intersection opacity</string>
+       </property>
+      </widget>
+     </item>
+     <item row="3" column="1" colspan="2">
+      <widget class="QSpinBox" name="spinIntersectionOpacity">
+       <property name="minimum">
+        <number>0</number>
+       </property>
+       <property name="maximum">
+        <number>100</number>
+       </property>
+       <property name="value">
+        <number>100</number>
+       </property>
+       <property name="suffix">
+        <string>%</string>
+       </property>
+       <property name="toolTip">
+        <string>Adjust opacity of intersection overlays</string>
+       </property>
+      </widget>
+     </item>
+     <item row="4" column="0">
+      <widget class="QLabel" name="labelVolumeWindow">
+       <property name="text">
+        <string>Volume window</string>
+       </property>
+      </widget>
+     </item>
+     <item row="4" column="1" colspan="3">
+      <widget class="QWidget" name="volumeWindowContainer" native="true">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+      </widget>
+     </item>
+     <item row="5" column="0">
+      <widget class="QLabel" name="labelAxisOverlayOpacity">
+       <property name="text">
+        <string>Axis overlay opacity</string>
+       </property>
+      </widget>
+     </item>
+     <item row="5" column="1" colspan="2">
+      <widget class="QSpinBox" name="spinAxisOverlayOpacity">
+       <property name="minimum">
+        <number>0</number>
+       </property>
+       <property name="maximum">
+        <number>100</number>
+       </property>
+       <property name="value">
+        <number>70</number>
+       </property>
+       <property name="suffix">
+        <string>%</string>
+       </property>
+      </widget>
+     </item>
+     <item row="6" column="0" colspan="4">
       <widget class="QCheckBox" name="chkAxisAlignedSlices">
        <property name="text">
         <string>Use axis-aligned slice planes</string>
@@ -1116,14 +1019,104 @@
        </property>
       </widget>
      </item>
-      <item row="10" column="0" colspan="4">
-       <widget class="QCheckBox" name="chkAxisOverlays">
-        <property name="text">
-         <string>Show axis overlays in XY view</string>
-        </property>
-       </widget>
-      </item>
-      </layout>
+     <item row="7" column="0" colspan="4">
+      <widget class="QCheckBox" name="chkAxisOverlays">
+       <property name="text">
+        <string>Show axis overlays in XY view</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </widget>
+  </widget>
+  <widget class="QDockWidget" name="dockWidgetOverlay">
+   <property name="windowTitle">
+    <string>Overlay</string>
+   </property>
+   <attribute name="dockWidgetArea">
+    <number>1</number>
+   </attribute>
+   <widget class="QWidget" name="dockWidgetOverlayContents">
+    <layout class="QGridLayout" name="gridLayoutOverlay">
+     <item row="0" column="0">
+      <widget class="QLabel" name="labelOverlayVolume">
+       <property name="text">
+        <string>Overlay volume</string>
+       </property>
+      </widget>
+     </item>
+     <item row="0" column="1" colspan="2">
+      <widget class="QComboBox" name="overlayVolumeSelect"/>
+     </item>
+     <item row="1" column="0">
+      <widget class="QLabel" name="labelOverlayOpacity">
+       <property name="text">
+        <string>Overlay opacity</string>
+       </property>
+      </widget>
+     </item>
+     <item row="1" column="1">
+      <widget class="QSpinBox" name="overlayOpacitySpin">
+       <property name="minimum">
+        <number>0</number>
+       </property>
+       <property name="maximum">
+        <number>100</number>
+       </property>
+       <property name="value">
+        <number>50</number>
+       </property>
+       <property name="suffix">
+        <string>%</string>
+       </property>
+      </widget>
+     </item>
+     <item row="2" column="0">
+      <widget class="QLabel" name="labelOverlayThreshold">
+       <property name="text">
+        <string>Overlay threshold</string>
+       </property>
+      </widget>
+     </item>
+     <item row="2" column="1">
+      <widget class="QSpinBox" name="overlayThresholdSpin">
+       <property name="minimum">
+        <number>0</number>
+       </property>
+       <property name="maximum">
+        <number>255</number>
+       </property>
+       <property name="value">
+        <number>0</number>
+       </property>
+      </widget>
+     </item>
+     <item row="3" column="0">
+      <widget class="QLabel" name="labelOverlayColormap">
+       <property name="text">
+        <string>Overlay colormap</string>
+       </property>
+      </widget>
+     </item>
+     <item row="3" column="1" colspan="2">
+      <widget class="QComboBox" name="overlayColormapSelect"/>
+     </item>
+     <item row="4" column="0">
+      <widget class="QLabel" name="labelOverlayWindow">
+       <property name="text">
+        <string>Overlay window</string>
+       </property>
+      </widget>
+     </item>
+     <item row="4" column="1" colspan="2">
+      <widget class="QWidget" name="overlayWindowContainer" native="true">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+      </widget>
      </item>
     </layout>
    </widget>
@@ -1136,6 +1129,11 @@
   <zorder>dockWidgetOpList</zorder>
  </widget>
  <customwidgets>
+ <customwidget>
+   <class>DropdownChecklistButton</class>
+   <extends>QToolButton</extends>
+   <header>../../../../../apps/VC3D/elements/DropdownChecklistButton.hpp</header>
+  </customwidget>
   <customwidget>
    <class>SurfaceTreeWidget</class>
    <extends>QTreeWidget</extends>

@@ -10,6 +10,7 @@
 #include <QPointF>
 #include <memory>
 #include <vector>
+#include <deque>
 #include "ui_VCMain.h"
 
 #include "vc/ui/VCCollection.hpp"
@@ -21,7 +22,7 @@
 #include "CSurfaceCollection.hpp"
 #include "CVolumeViewer.hpp"
 #include "DrawingWidget.hpp"
-#include "SegmentationEditManager.hpp"
+#include "segmentation/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
 #include "overlays/PathsOverlayController.hpp"
@@ -30,8 +31,8 @@
 #include "overlays/PlaneSlicingOverlayController.hpp"
 #include "overlays/VolumeOverlayController.hpp"
 #include "ViewerManager.hpp"
-#include "SegmentationWidget.hpp"
-#include "SegmentationGrowth.hpp"
+#include "segmentation/SegmentationWidget.hpp"
+#include "segmentation/SegmentationGrowth.hpp"
 #include "OpChain.hpp"
 #include "OpsList.hpp"
 #include "OpsSettings.hpp"
@@ -52,6 +53,8 @@ class CommandLineToolRunner;
 class SegmentationModule;
 class SurfacePanelController;
 class MenuActionController;
+class SegmentationGrower;
+class WindowRangeWidget;
 
 class CWindow : public QMainWindow
 {
@@ -125,6 +128,8 @@ private:
     void setVolume(std::shared_ptr<Volume> newvol);
     void updateNormalGridAvailability();
     void toggleVolumeOverlayVisibility();
+    bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, Surface* source, bool addToHistory = false);
+    bool centerFocusOnCursor();
 
 private slots:
     void onSegmentationDirChanged(int index);
@@ -179,8 +184,10 @@ private:
     QLineEdit* lblLocFocus;
     QDoubleSpinBox* spNorm[3];
     QPushButton* btnZoomIn;
-    QPushButton* btnZoomOut;
-    QCheckBox* chkAxisAlignedSlices;
+   QPushButton* btnZoomOut;
+   QCheckBox* chkAxisAlignedSlices;
+    WindowRangeWidget* _volumeWindowWidget{nullptr};
+    WindowRangeWidget* _overlayWindowWidget{nullptr};
 
 
     Ui_VCMainWindow ui;
@@ -194,8 +201,7 @@ private:
     std::unique_ptr<ViewerManager> _viewerManager;
     CSurfaceCollection *_surf_col;
     bool _useAxisAlignedSlices{false};
-    bool _segmentationGrowthRunning{false};
-    std::unique_ptr<QFutureWatcher<TracerGrowthResult>> _tracerGrowthWatcher;
+    std::unique_ptr<SegmentationGrower> _segmentationGrower;
 
     std::unordered_map<std::string, OpChain*> _opchains;
 
@@ -213,11 +219,20 @@ private:
     CommandLineToolRunner* _cmdRunner;
     bool _normalGridAvailable{false};
     QString _normalGridPath;
+
+    struct FocusHistoryEntry {
+        cv::Vec3f position;
+        cv::Vec3f normal;
+        Surface* source{nullptr};
+    };
+    std::deque<FocusHistoryEntry> _focusHistory;
+    int _focusHistoryIndex{-1};
+    bool _navigatingFocusHistory{false};
+
+    void recordFocusHistory(const POI& poi);
+    bool stepFocusHistory(int direction);
     
     // Keyboard shortcuts
-    QShortcut* fReviewedShortcut;
-    QShortcut* fRevisitShortcut;
-    QShortcut* fDefectiveShortcut;
     QShortcut* fDrawingModeShortcut;
     QShortcut* fCompositeViewShortcut;
     QShortcut* fDirectionHintsShortcut;

@@ -1,6 +1,8 @@
 #include "CVolumeViewer.hpp"
 #include "vc/ui/UDataManipulateUtils.hpp"
 
+#include "VolumeViewerCmaps.hpp"
+
 #include <QGraphicsView>
 #include <QGraphicsScene>
 
@@ -52,69 +54,6 @@ constexpr float MAX_ZOOM = 4.0f;
 #include <algorithm>
 #include <cmath>
 
-namespace {
-
-enum class OverlayColormapKind { OpenCv, Tint };
-
-struct OverlayColormapSpec {
-    std::string id;
-    QString label;
-    OverlayColormapKind kind;
-    int opencvCode;
-    cv::Vec3f tint; // B, G, R in [0,1]
-};
-
-const std::vector<OverlayColormapSpec>& overlayColormapSpecs()
-{
-    static const std::vector<OverlayColormapSpec> specs = {
-        {"fire", QStringLiteral("Fire"), OverlayColormapKind::OpenCv, cv::COLORMAP_HOT, {}},
-        {"viridis", QStringLiteral("Viridis"), OverlayColormapKind::OpenCv, cv::COLORMAP_VIRIDIS, {}},
-        {"magma", QStringLiteral("Magma"), OverlayColormapKind::OpenCv, cv::COLORMAP_MAGMA, {}},
-        {"red", QStringLiteral("Red"), OverlayColormapKind::Tint, 0, cv::Vec3f(0.0f, 0.0f, 1.0f)},
-        {"green", QStringLiteral("Green"), OverlayColormapKind::Tint, 0, cv::Vec3f(0.0f, 1.0f, 0.0f)},
-        {"blue", QStringLiteral("Blue"), OverlayColormapKind::Tint, 0, cv::Vec3f(1.0f, 0.0f, 0.0f)},
-        {"cyan", QStringLiteral("Cyan"), OverlayColormapKind::Tint, 0, cv::Vec3f(1.0f, 1.0f, 0.0f)},
-        {"magenta", QStringLiteral("Magenta"), OverlayColormapKind::Tint, 0, cv::Vec3f(1.0f, 0.0f, 1.0f)}
-    };
-    return specs;
-}
-
-const OverlayColormapSpec& resolveOverlayColormap(const std::string& id)
-{
-    const auto& specs = overlayColormapSpecs();
-    auto it = std::find_if(specs.begin(), specs.end(), [&id](const auto& spec) {
-        return spec.id == id;
-    });
-    if (it != specs.end()) {
-        return *it;
-    }
-    return specs.front();
-}
-
-cv::Mat makeOverlayColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& spec)
-{
-    if (values.empty()) {
-        return {};
-    }
-
-    cv::Mat colored;
-    if (spec.kind == OverlayColormapKind::OpenCv) {
-        cv::applyColorMap(values, colored, spec.opencvCode);
-    } else {
-        cv::Mat valuesFloat;
-        values.convertTo(valuesFloat, CV_32F, 1.0f / 255.0f);
-        std::vector<cv::Mat> channels(3);
-        for (int c = 0; c < 3; ++c) {
-            channels[c] = valuesFloat * (spec.tint[c] * 255.0f);
-        }
-        cv::merge(channels, colored);
-        colored.convertTo(colored, CV_8UC3);
-    }
-    return colored;
-}
-
-} // namespace
-
 namespace
 {
 constexpr size_t kAxisAlignedSliceCacheCapacity = 180;
@@ -157,6 +96,8 @@ struct AxisAlignedSliceCacheKey
     int dsIndex = 0;
     uintptr_t datasetPtr = 0;
     uint8_t fastInterpolation = 0;
+    uint8_t baseWindowLow = 0;
+    uint8_t baseWindowHigh = 0;
 
     bool operator==(const AxisAlignedSliceCacheKey& other) const noexcept
     {
@@ -166,7 +107,8 @@ struct AxisAlignedSliceCacheKey
                roiWidth == other.roiWidth && roiHeight == other.roiHeight &&
                scaleMilli == other.scaleMilli && dsScaleMilli == other.dsScaleMilli &&
                zOffsetMilli == other.zOffsetMilli && dsIndex == other.dsIndex &&
-               datasetPtr == other.datasetPtr && fastInterpolation == other.fastInterpolation;
+               datasetPtr == other.datasetPtr && fastInterpolation == other.fastInterpolation &&
+               baseWindowLow == other.baseWindowLow && baseWindowHigh == other.baseWindowHigh;
     }
 };
 
@@ -190,6 +132,8 @@ struct AxisAlignedSliceCacheKeyHasher
         hashCombine(seed, key.dsIndex);
         hashCombine(seed, key.datasetPtr);
         hashCombine(seed, key.fastInterpolation);
+        hashCombine(seed, key.baseWindowLow);
+        hashCombine(seed, key.baseWindowHigh);
         return seed;
     }
 
@@ -508,6 +452,8 @@ void CVolumeViewer::onCursorMove(QPointF scene_loc)
         if (!cursor)
             cursor = new POI;
         cursor->p = p;
+        cursor->n = n;
+        cursor->src = _surf;
         _surf_col->setPOI("cursor", cursor);
     }
 
@@ -849,6 +795,7 @@ void CVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
         return;
     }
     _overlayVolume = std::move(volume);
+
     renderVisible(true);
 }
 
@@ -877,11 +824,50 @@ void CVolumeViewer::setOverlayColormap(const std::string& colormapId)
 
 void CVolumeViewer::setOverlayThreshold(float threshold)
 {
-    float clamped = std::max(threshold, 0.0f);
-    if (std::abs(clamped - _overlayThreshold) < 1e-6f) {
+    setOverlayWindow(std::max(threshold, 0.0f), _overlayWindowHigh);
+}
+
+void CVolumeViewer::setVolumeWindow(float low, float high)
+{
+    constexpr float kMaxValue = 255.0f;
+    const float clampedLow = std::clamp(low, 0.0f, kMaxValue);
+    float clampedHigh = std::clamp(high, 0.0f, kMaxValue);
+    if (clampedHigh <= clampedLow) {
+        clampedHigh = std::min(kMaxValue, clampedLow + 1.0f);
+    }
+
+    const bool unchanged = std::abs(clampedLow - _baseWindowLow) < 1e-6f &&
+                           std::abs(clampedHigh - _baseWindowHigh) < 1e-6f;
+    if (unchanged) {
         return;
     }
-    _overlayThreshold = clamped;
+
+    _baseWindowLow = clampedLow;
+    _baseWindowHigh = clampedHigh;
+
+    if (volume) {
+        renderVisible(true);
+    }
+}
+
+void CVolumeViewer::setOverlayWindow(float low, float high)
+{
+    constexpr float kMaxOverlayValue = 255.0f;
+    const float clampedLow = std::clamp(low, 0.0f, kMaxOverlayValue);
+    float clampedHigh = std::clamp(high, 0.0f, kMaxOverlayValue);
+    if (clampedHigh <= clampedLow) {
+        clampedHigh = std::min(kMaxOverlayValue, clampedLow + 1.0f);
+    }
+
+    const bool unchanged = std::abs(clampedLow - _overlayWindowLow) < 1e-6f &&
+                           std::abs(clampedHigh - _overlayWindowHigh) < 1e-6f;
+    if (unchanged) {
+        return;
+    }
+
+    _overlayWindowLow = clampedLow;
+    _overlayWindowHigh = clampedHigh;
+
     if (_overlayVolume) {
         renderVisible(true);
     }
@@ -892,10 +878,10 @@ const std::vector<CVolumeViewer::OverlayColormapEntry>& CVolumeViewer::overlayCo
     static std::vector<OverlayColormapEntry> entries;
     static bool initialized = false;
     if (!initialized) {
-        const auto& specs = overlayColormapSpecs();
-        entries.reserve(specs.size());
-        for (const auto& spec : specs) {
-            entries.push_back(OverlayColormapEntry{spec.label, spec.id});
+        const auto& sharedEntries = volume_viewer_cmaps::entries();
+        entries.reserve(sharedEntries.size());
+        for (const auto& entry : sharedEntries) {
+            entries.push_back({entry.label, entry.id});
         }
         initialized = true;
     }
@@ -1104,6 +1090,8 @@ void CVolumeViewer::onPOIChanged(std::string name, POI *poi)
                     _center_marker->hide();
                 }
             }
+
+            renderVisible(true);
         }
     }
     else if (name == "cursor") {
@@ -1305,9 +1293,15 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
 {
     cv::Mat_<cv::Vec3f> coords;
     cv::Mat_<uint8_t> baseGray;
+    const int baseWindowLowInt = static_cast<int>(std::clamp(_baseWindowLow, 0.0f, 255.0f));
+    const int baseWindowHighInt = static_cast<int>(
+        std::clamp(_baseWindowHigh, static_cast<float>(baseWindowLowInt + 1), 255.0f));
+    const float baseWindowSpan = std::max(1.0f, static_cast<float>(baseWindowHighInt - baseWindowLowInt));
 
     _overlayImageValid = false;
     _overlayImage = QImage();
+
+    const QRect roiRect(roi.x, roi.y, roi.width, roi.height);
 
     const bool useComposite = (_surf_name == "segmentation" && _composite_enabled &&
                                (_composite_layers_front > 0 || _composite_layers_behind > 0));
@@ -1344,6 +1338,8 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
                 cacheKey.dsIndex = _ds_sd_idx;
                 cacheKey.datasetPtr = reinterpret_cast<uintptr_t>(baseDataset);
                 cacheKey.fastInterpolation = _useFastInterpolation ? 1 : 0;
+                cacheKey.baseWindowLow = static_cast<uint8_t>(baseWindowLowInt);
+                cacheKey.baseWindowHigh = static_cast<uint8_t>(baseWindowHighInt);
                 cacheKeyValid = true;
 
                 if (auto cached = axisAlignedSliceCache().get(cacheKey)) {
@@ -1373,7 +1369,13 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
     }
 
     if (!usedCache) {
-        cv::normalize(baseGray, baseGray, 0, 255, cv::NORM_MINMAX, CV_8U);
+        cv::Mat baseFloat;
+        baseGray.convertTo(baseFloat, CV_32F);
+        baseFloat -= static_cast<float>(baseWindowLowInt);
+        baseFloat /= baseWindowSpan;
+        cv::max(baseFloat, 0.0f, baseFloat);
+        cv::min(baseFloat, 1.0f, baseFloat);
+        baseFloat.convertTo(baseGray, CV_8U, 255.0f);
 
         if (baseGray.channels() == 1) {
             cv::cvtColor(baseGray, baseColor, cv::COLOR_GRAY2BGR);
@@ -1409,35 +1411,30 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
             }
 
             cv::Mat_<uint8_t> overlayValues;
-            readInterpolated3D(overlayValues, _overlayVolume->zarrDataset(overlayIdx), coords * overlayScale, cache, /*nearest_neighbor=*/true);
+            z5::Dataset* overlayDataset = _overlayVolume->zarrDataset(overlayIdx);
+            readInterpolated3D(overlayValues, overlayDataset, coords * overlayScale, cache, /*nearest_neighbor=*/true);
 
-            if (!overlayValues.empty() && cv::countNonZero(overlayValues) > 0) {
-                const int rawThreshold = static_cast<int>(std::max(0.0f, _overlayThreshold));
+            if (!overlayValues.empty()) {
+                const int windowLow = static_cast<int>(std::clamp(_overlayWindowLow, 0.0f, 255.0f));
+                const int windowHigh = static_cast<int>(std::clamp(_overlayWindowHigh, static_cast<float>(windowLow + 1), 255.0f));
 
                 cv::Mat activeMask;
-                cv::compare(overlayValues, rawThreshold, activeMask, cv::CmpTypes::CMP_GE);
+                cv::compare(overlayValues, windowLow, activeMask, cv::CmpTypes::CMP_GE);
 
                 if (cv::countNonZero(activeMask) > 0) {
-                    double minActiveValue = 0.0;
-                    double maxActiveValue = 0.0;
-                    cv::minMaxLoc(overlayValues, &minActiveValue, &maxActiveValue, nullptr, nullptr, activeMask);
-
-                    if (maxActiveValue <= rawThreshold) {
-                        maxActiveValue = rawThreshold + 1.0; // avoid division by zero and ensure positive scale
-                    }
-
                     cv::Mat overlayScaled;
                     overlayValues.convertTo(overlayScaled, CV_32F);
-                    overlayScaled -= static_cast<float>(rawThreshold);
+                    overlayScaled -= static_cast<float>(windowLow);
                     overlayScaled.setTo(0.0f, overlayScaled < 0.0f);
-                    overlayScaled /= static_cast<float>(maxActiveValue - rawThreshold);
+                    const float windowSpan = std::max(1.0f, static_cast<float>(windowHigh - windowLow));
+                    overlayScaled /= windowSpan;
                     cv::threshold(overlayScaled, overlayScaled, 1.0f, 1.0f, cv::THRESH_TRUNC);
 
                     cv::Mat overlayColorInput;
                     overlayScaled.convertTo(overlayColorInput, CV_8U, 255.0f);
 
-                    const auto& spec = resolveOverlayColormap(_overlayColormapId);
-                    cv::Mat overlayColor = makeOverlayColors(overlayColorInput, spec);
+                    const auto& spec = volume_viewer_cmaps::resolve(_overlayColormapId);
+                    cv::Mat overlayColor = volume_viewer_cmaps::makeColors(overlayColorInput, spec);
 
                     if (!overlayColor.empty()) {
                         cv::Mat inactiveMask;

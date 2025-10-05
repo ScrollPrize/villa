@@ -14,6 +14,8 @@
 #include "CVolumeViewerView.hpp"
 #include "vc/core/types/Volume.hpp"
 
+class QImage;
+
 
 class CVolumeViewer : public QWidget
 {
@@ -50,6 +52,10 @@ public:
     void setCompositeReverseDirection(bool reverse);
     void setResetViewOnSurfaceChange(bool reset);
     bool isCompositeEnabled() const { return _composite_enabled; }
+    std::shared_ptr<Volume> currentVolume() const { return volume; }
+    ChunkCache* chunkCachePtr() const { return cache; }
+    int datasetScaleIndex() const { return _ds_sd_idx; }
+    float datasetScaleFactor() const { return _ds_scale; }
     VCCollection* pointCollection() const { return _point_collection; }
     uint64_t highlightedPointId() const { return _highlighted_point_id; }
     uint64_t selectedPointId() const { return _selected_point_id; }
@@ -98,7 +104,15 @@ public:
     void setOverlayColormap(const std::string& colormapId);
     const std::string& overlayColormap() const { return _overlayColormapId; }
     void setOverlayThreshold(float threshold);
-    float overlayThreshold() const { return _overlayThreshold; }
+    float overlayThreshold() const { return _overlayWindowLow; }
+
+    void setOverlayWindow(float low, float high);
+    float overlayWindowLow() const { return _overlayWindowLow; }
+    float overlayWindowHigh() const { return _overlayWindowHigh; }
+
+    void setVolumeWindow(float low, float high);
+    float volumeWindowLow() const { return _baseWindowLow; }
+    float volumeWindowHigh() const { return _baseWindowHigh; }
 
     struct OverlayColormapEntry {
         QString label;
@@ -240,7 +254,10 @@ protected:
     std::shared_ptr<Volume> _overlayVolume;
     float _overlayOpacity{0.5f};
     std::string _overlayColormapId;
-    float _overlayThreshold{1.0f};
+    float _overlayWindowLow{0.0f};
+    float _overlayWindowHigh{255.0f};
+    float _baseWindowLow{0.0f};
+    float _baseWindowHigh{255.0f};
     bool _overlayImageValid{false};
     QImage _overlayImage;
 

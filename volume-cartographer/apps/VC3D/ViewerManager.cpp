@@ -6,7 +6,8 @@
 #include "overlays/PathsOverlayController.hpp"
 #include "overlays/BBoxOverlayController.hpp"
 #include "overlays/VectorOverlayController.hpp"
-#include "SegmentationModule.hpp"
+#include "overlays/VolumeOverlayController.hpp"
+#include "segmentation/SegmentationModule.hpp"
 #include "CSurfaceCollection.hpp"
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/types/Volume.hpp"
@@ -30,6 +31,12 @@ ViewerManager::ViewerManager(CSurfaceCollection* surfaces,
     const int savedOpacityPercent = settings.value("viewer/intersection_opacity", 100).toInt();
     const float normalized = static_cast<float>(savedOpacityPercent) / 100.0f;
     _intersectionOpacity = std::clamp(normalized, 0.0f, 1.0f);
+
+    const float storedBaseLow = settings.value("viewer/base_window_low", 0.0f).toFloat();
+    const float storedBaseHigh = settings.value("viewer/base_window_high", 255.0f).toFloat();
+    _volumeWindowLow = std::clamp(storedBaseLow, 0.0f, 255.0f);
+    const float minHigh = std::min(_volumeWindowLow + 1.0f, 255.0f);
+    _volumeWindowHigh = std::clamp(storedBaseHigh, minHigh, 255.0f);
 }
 
 CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
@@ -92,10 +99,11 @@ CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
     }
 
     viewer->setIntersectionOpacity(_intersectionOpacity);
+    viewer->setVolumeWindow(_volumeWindowLow, _volumeWindowHigh);
     viewer->setOverlayVolume(_overlayVolume);
     viewer->setOverlayOpacity(_overlayOpacity);
     viewer->setOverlayColormap(_overlayColormapId);
-    viewer->setOverlayThreshold(_overlayThreshold);
+    viewer->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
 
     _viewers.push_back(viewer);
     if (_segmentationModule) {
@@ -111,11 +119,7 @@ void ViewerManager::setSegmentationOverlay(SegmentationOverlayController* overla
     if (!_segmentationOverlay) {
         return;
     }
-    for (auto* viewer : _viewers) {
-        if (viewer) {
-            _segmentationOverlay->attachViewer(viewer);
-        }
-    }
+    _segmentationOverlay->bindToViewerManager(this);
 }
 
 void ViewerManager::setSegmentationEditActive(bool active)
@@ -176,6 +180,14 @@ void ViewerManager::setVectorOverlay(VectorOverlayController* overlay)
     _vectorOverlay->bindToViewerManager(this);
 }
 
+void ViewerManager::setVolumeOverlay(VolumeOverlayController* overlay)
+{
+    _volumeOverlay = overlay;
+    if (_volumeOverlay) {
+        _volumeOverlay->syncWindowFromManager(_overlayWindowLow, _overlayWindowHigh);
+    }
+}
+
 void ViewerManager::setIntersectionOpacity(float opacity)
 {
     _intersectionOpacity = std::clamp(opacity, 0.0f, 1.0f);
@@ -200,6 +212,8 @@ void ViewerManager::setOverlayVolume(std::shared_ptr<Volume> volume, const std::
             viewer->setOverlayVolume(_overlayVolume);
         }
     }
+
+    emit overlayVolumeAvailabilityChanged(static_cast<bool>(_overlayVolume));
 }
 
 void ViewerManager::setOverlayOpacity(float opacity)
@@ -224,12 +238,69 @@ void ViewerManager::setOverlayColormap(const std::string& colormapId)
 
 void ViewerManager::setOverlayThreshold(float threshold)
 {
-    _overlayThreshold = std::max(threshold, 0.0f);
+    setOverlayWindow(std::max(threshold, 0.0f), _overlayWindowHigh);
+}
+
+void ViewerManager::setOverlayWindow(float low, float high)
+{
+    constexpr float kMaxOverlayValue = 255.0f;
+    const float clampedLow = std::clamp(low, 0.0f, kMaxOverlayValue);
+    float clampedHigh = std::clamp(high, 0.0f, kMaxOverlayValue);
+    if (clampedHigh <= clampedLow) {
+        clampedHigh = std::min(kMaxOverlayValue, clampedLow + 1.0f);
+    }
+
+    const bool unchanged = std::abs(clampedLow - _overlayWindowLow) < 1e-6f &&
+                           std::abs(clampedHigh - _overlayWindowHigh) < 1e-6f;
+    if (unchanged) {
+        return;
+    }
+
+    _overlayWindowLow = clampedLow;
+    _overlayWindowHigh = clampedHigh;
+
+    if (_volumeOverlay) {
+        _volumeOverlay->syncWindowFromManager(_overlayWindowLow, _overlayWindowHigh);
+    }
+
     for (auto* viewer : _viewers) {
         if (viewer) {
-            viewer->setOverlayThreshold(_overlayThreshold);
+            viewer->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
         }
     }
+
+    emit overlayWindowChanged(_overlayWindowLow, _overlayWindowHigh);
+}
+
+void ViewerManager::setVolumeWindow(float low, float high)
+{
+    constexpr float kMaxValue = 255.0f;
+    const float clampedLow = std::clamp(low, 0.0f, kMaxValue);
+    float clampedHigh = std::clamp(high, 0.0f, kMaxValue);
+    if (clampedHigh <= clampedLow) {
+        clampedHigh = std::min(kMaxValue, clampedLow + 1.0f);
+    }
+
+    const bool unchanged = std::abs(clampedLow - _volumeWindowLow) < 1e-6f &&
+                           std::abs(clampedHigh - _volumeWindowHigh) < 1e-6f;
+    if (unchanged) {
+        return;
+    }
+
+    _volumeWindowLow = clampedLow;
+    _volumeWindowHigh = clampedHigh;
+
+    QSettings settings("VC.ini", QSettings::IniFormat);
+    settings.setValue("viewer/base_window_low", _volumeWindowLow);
+    settings.setValue("viewer/base_window_high", _volumeWindowHigh);
+
+    for (auto* viewer : _viewers) {
+        if (viewer) {
+            viewer->setVolumeWindow(_volumeWindowLow, _volumeWindowHigh);
+        }
+    }
+
+    emit volumeWindowChanged(_volumeWindowLow, _volumeWindowHigh);
 }
 
 bool ViewerManager::resetDefaultFor(CVolumeViewer* viewer) const
