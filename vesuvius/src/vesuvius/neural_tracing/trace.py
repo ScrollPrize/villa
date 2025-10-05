@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 from vesuvius_unet3d import Vesuvius3dUnetModel
 from song_unet3d import SongUnet3dModel
-from dataset import get_crop_from_volume, build_localiser
+from dataset import get_crop_from_volume, build_localiser, make_heatmaps
 from tifxyz import save_tifxyz
 
 
@@ -35,6 +35,7 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
         config = json.load(f)
 
     assert steps_per_crop <= config['step_count']
+    crop_size = config['crop_size']
     
     random.seed(config['seed'])
     np.random.seed(config['seed'])
@@ -46,11 +47,11 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
     )
 
     # TODO: share this code with train.py!
-    model = Vesuvius3dUnetModel(in_channels=8, out_channels=6, config=config)
+    model = Vesuvius3dUnetModel(in_channels=5, out_channels=config['step_count'] * 2, config=config)
     # model = SongUnet3dModel(
-    #     img_resolution=config['crop_size'],
-    #     in_channels=8,
-    #     out_channels=6,
+    #     img_resolution=crop_size,
+    #     in_channels=5,
+    #     out_channels=config['step_count'] * 2,
     #     model_channels=32,
     #     channel_mult=[1, 2, 4, 8],
     #     num_blocks=2,  # 4
@@ -73,126 +74,154 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
     volume = ome_zarr[str(volume_scale)]
     with open(f'{volume_zarr}/meta.json', 'rt') as meta_fp:
         voxel_size_um = json.load(meta_fp)['voxelsize']
-    print(f"volume shape: {volume.shape}, dtype: {volume.dtype}, voxel-size: {voxel_size_um}um")
+    print(f"volume shape: {volume.shape}, dtype: {volume.dtype}, voxel-size: {voxel_size_um * 2 ** volume_scale}um")
 
-    def get_heatmaps_at(zyx):
-        volume_crop, min_corner_zyx = get_crop_from_volume(volume, zyx, config['crop_size'])
-        localiser = build_localiser(zyx, min_corner_zyx, config['crop_size'])
+    def get_heatmaps_at(zyx, prev_u, prev_v, prev_diag):
+        volume_crop, min_corner_zyx = get_crop_from_volume(volume, zyx, crop_size)
+        localiser = build_localiser(zyx, min_corner_zyx, crop_size)
+        prev_u_heatmap = make_heatmaps([prev_u[None]], min_corner_zyx, crop_size) if prev_u is not None else torch.zeros([1, crop_size, crop_size, config['crop_size']])
+        prev_v_heatmap = make_heatmaps([prev_v[None]], min_corner_zyx, crop_size) if prev_v is not None else torch.zeros([1, crop_size, crop_size, config['crop_size']])
+        prev_diag_heatmap = make_heatmaps([prev_diag[None]], min_corner_zyx, crop_size) if prev_diag is not None else torch.zeros([1, crop_size, crop_size, config['crop_size']])
         inputs = torch.cat([
             volume_crop[None, None].to(accelerator.device),
             localiser[None, None].to(accelerator.device),
-            torch.zeros([1, config['step_count'], *volume_crop.shape], device=accelerator.device),
+            prev_u_heatmap[None].to(accelerator.device),
+            prev_v_heatmap[None].to(accelerator.device),
+            prev_diag_heatmap[None].to(accelerator.device),
         ], dim=1)
         timesteps = torch.zeros([1], dtype=torch.long, device=accelerator.device)
-        logits = model(inputs, timesteps).squeeze(0)[:steps_per_crop]
+        logits = model(inputs, timesteps).squeeze(0).reshape(2, config['step_count'], crop_size, crop_size, crop_size)  # u/v, step, z, y, x
         # TODO: test-time augmentation! as well as flip/rotate also consider very small spatial jitters etc
-        return F.sigmoid(logits), min_corner_zyx
+        return F.sigmoid(logits[:, :steps_per_crop]), min_corner_zyx
 
-    def get_blob_coordinates(heatmaps, min_corner_zyx):
-        centroids_by_step = []
-        for heatmap in heatmaps:
-            if False:
-                points = torch.stack(torch.where(heatmap > 0.5), dim=-1).cpu().numpy()
-                kmeans = sklearn.cluster.KMeans(n_clusters=4)
-                kmeans.fit(points)
-                print(kmeans.cluster_centers_)
+    def get_blob_coordinates(heatmap, min_corner_zyx, threshold=0.5, min_size=40):
+        # Find up to four blobs of sufficient size; return their centroids in descending order of blob size
+        # TODO: strip blobs that are further than K * step_size in euclidean space
+        cc_labels = cc3d.connected_components((heatmap > threshold).cpu().numpy(), connectivity=18, binary_image=True)
+        cc_labels, num_ccs = cc3d.dust(cc_labels, threshold=min_size, precomputed_ccl=True, return_N=True)
+        cc_stats = cc3d.statistics(cc_labels)
+        centroid_zyxs = cc_stats['centroids'][1:] + min_corner_zyx.numpy()
+        size_order = np.argsort(-cc_stats['voxel_counts'][1:])[:4]
+        centroid_zyxs = centroid_zyxs[size_order]
+        return torch.from_numpy(centroid_zyxs.astype(np.float32))
+
+    def trace_strip(start_zyx, num_steps, direction):
+
+        assert steps_per_crop == 1  # TODO...
+
+        # Get hopefully-4 adjacent points; take the one with min or max z-displacement depending on required direction
+        heatmaps, min_corner_zyx = get_heatmaps_at(start_zyx, prev_u=None, prev_v=None, prev_diag=None)
+        coordinates = get_blob_coordinates(heatmaps[:, 0].amax(dim=0), min_corner_zyx)
+        save_point_collection('coordinates.json', torch.cat([start_zyx[None], coordinates], dim=0))
+        if direction == 'u':  # use maximum delta-z
+            best_idx = torch.argmax((coordinates - start_zyx)[:, 0].abs())
+        elif direction == 'v':  # use minimum delta-z
+            best_idx = torch.argmin((coordinates - start_zyx)[:, 0].abs())
+        else:
+            assert False
+        trace_zyxs = [start_zyx, coordinates[best_idx]]
+
+        for step in tqdm(range(num_steps // steps_per_crop), desc='tracing strip'):  # loop over planning windows
+
+            # Query the model 'along' the relevant direction, with crop centered at current point and previous as conditioning
+            if direction == 'u':
+                prev_uv = {'prev_u': trace_zyxs[-2], 'prev_v': None}
             else:
-                cc_labels = cc3d.connected_components((heatmap > 0.5).cpu().numpy(), connectivity=18, binary_image=True)
-                cc_labels, num_ccs = cc3d.dust(cc_labels, threshold=40, precomputed_ccl=True, return_N=True)
-                cc_stats = cc3d.statistics(cc_labels)
-                centroid_zyxs = cc_stats['centroids'][1:] + min_corner_zyx.numpy()
-                if num_ccs > 4:
-                    size_order = np.argsort(-cc_stats['voxel_counts'][1:])
-                    centroid_zyxs = centroid_zyxs[size_order[:4]]
-                centroids_by_step.append(torch.from_numpy(centroid_zyxs))
-                # if len(centroids_by_distance) == 0:
-                #     centroids_by_distance.append(centroid_zyxs)
-                # else:
-                #     # TODO: this is non-trivial when some blobs are missing then/now
-                #     #  ideally we want to look back further in time
-                #     #  also can use CW/ACW-ness to resolve some points if we have others
-                #     #  trickiest case is if we have two blobs in previous and two in current, but they're disjoint!
-                #     distances = centroids_by_distance[-1] - centroid_zyxs
-                #     centroids_by_distance.append(centroid_zyxs)
-        # TODO: *might* be useful to 'connect' the blobs across planes, associating with the nearest adjacent ones (hungarian / greedy)
-        #  ideally would globally optimise this across all four points and all planes; however maybe overkill!
-        #  in that case, discretely assign each blob to of t>1 to
-        return centroids_by_step
+                prev_uv = {'prev_v': trace_zyxs[-2], 'prev_u': None}
+            heatmaps, min_corner_zyx = get_heatmaps_at(trace_zyxs[-1], **prev_uv, prev_diag=None)
+            coordinates = get_blob_coordinates(heatmaps[0 if direction == 'u' else 1].squeeze(0), min_corner_zyx)
 
-    def trace_strip(start_zyx, num_steps):
-        trace_zyxs = [start_zyx]
-        for global_step in tqdm(range(num_steps // steps_per_crop), desc='tracing strip'):  # loop over planning windows
-            heatmaps, min_corner_zyx = get_heatmaps_at(trace_zyxs[-1])
-            coordinates = get_blob_coordinates(heatmaps, min_corner_zyx)
-            assert steps_per_crop == 1  # FIXME: the logic for deciding which candidate to take otherwise changes -- for 'later' points, either always just take nearest to one before, or track correspondences properly in get_blob_coordinates, or think about 'long distance' symmetry
-            for step_in_crop in range(steps_per_crop):  # loop over steps within the current planning window
-                candidates = coordinates[step_in_crop]
-                if len(trace_zyxs) == 1:
-                    # For very first step, move in the -z direction for now
-                    # TODO: should allow the user to specify the starting direction
-                    assert step_in_crop == 0
-                    delta_zs = (candidates - trace_zyxs[-1])[0]
-                    best_candidate_idx = torch.argmin(delta_zs)
-                else:
-                    previous = trace_zyxs[-2]
-                    nearest_to_previous = torch.argmin(torch.linalg.norm(candidates - previous, dim=-1))
-                    # TODO: if candidates[nearest_to_previous] is too far from previous (i.e. the min is too large), don't trust this step
-                    # TODO: tricky to find the correct point among the four; the right one is the one that continues the current line in the geodesic sense (i.e. in the unrolled surface)
-                    #  - consider geometry in lstsq plane (still this fails to account for geodesic-ness)
-                    #  - no possibility of working with full surface (because we don't know it); maybe could at least use symmetry (maybe not in planar projection) to account for the case of a 'squashed diamond'
-                    #  - could use similarity of directions -- presumably the current-to-next direction should be more parallel with the previous-to-current direction than the others
-                    #  - in the extreme case of a right-angle bend (with fold at current point, perpendicular to direction from previous), there is no 'per point' local measure that'll work
-                    # Assume the most-distant point is the 'next' point to continue with; this is blind to the fact that the geodesic distances/directions are what matter
-                    best_candidate_idx = torch.argmax(torch.linalg.norm(candidates - candidates[nearest_to_previous], dim=-1))
-                trace_zyxs.append(candidates[best_candidate_idx])
+            if len(coordinates) == 0 or coordinates[0].isnan().any():
+                break
+
+            # Take the largest (0th) blob centroid as the next point
+            next_zyx = coordinates[0]
+            trace_zyxs.append(next_zyx)
+
         return torch.stack(trace_zyxs, dim=0)
 
-    def trace_patch(first_row_zyxs, num_steps):
+    def trace_patch(first_row_zyxs, num_steps, direction):
         # For simplicity we denote the start_zyxs as a 'row', with 'columns' ordered 'left' to 'right'; however this has no geometric significance!
+        # direction parameter controls which direction we're growing in; the initial strip should be perpendicular
+
         assert steps_per_crop == 1  # TODO!
         rows = [first_row_zyxs]
         for row_idx in tqdm(range(1, num_steps // steps_per_crop), desc='tracing patch'):
-            # TODO: would be nice to vectorise model application, but currently loading the crops is the limiting factor!
             next_row = []
             for col_idx in tqdm(range(rows[-1].shape[0]), 'tracing row'):
-                heatmaps, min_corner_zyx = get_heatmaps_at(rows[-1][col_idx])
-                coordinates = get_blob_coordinates(heatmaps, min_corner_zyx)
-                candidates = coordinates[0]  # TODO!
-                # TODO: would be better to globally optimise the entire strip; HMM-ish?
-                #  don't always have four blobs per heatmap; would need to account for that
-                #  for each blob, want to assign it to a point in the grid, s.t. all blobs assigned to a given point are physically very close
-                #  if a grid cell is left empty, then just inpaint
-                #  need to encode the fact that each blob is used only once and using it in one way affects other things -- in particular that if there are four blobs, then two 'opposite' blobs must be treated as such
-                if row_idx == 1 and col_idx == 0:
-                    # we're currently at the very first point of the first row; the point to the right is known; we need to choose one below
-                    # 'above' vs 'below' is arbitrary at this point
-                    # 'left' is assumed to be the one farthest from the right (c.f. 1D case); we want to exclude this, so take one of the medium-distance ones
-                    best_idx = torch.argsort(torch.linalg.norm(candidates - rows[-1][col_idx + 1], dim=-1))[2]
-                elif row_idx == 1:
-                    # we're in the first row but not the start; points to left and right are known; we need to find the one 'below'
-                    # 'below' for the previous point has been decided, and we must be consistent with that
-                    # one point is nearest left in existing row; one point is nearest right; of the others take the one that's
-                    best_idx = torch.argsort(torch.linalg.norm(candidates - rows[-1][col_idx + 1], dim=-1))[2]
-                elif col_idx == 0:
-                    # we're in the first col of a later row; point above is known, and the one to the right of that
-                    nearest_to_above = torch.argmin(torch.linalg.norm(candidates - previous, dim=-1))
-                else:
-                    # we're in a later row, not at the start; point above is known, and left/right of that, and left of us
-                    pass
-                next_row.append(candidates[best_idx])
-            rows.append(next_row)
+
+                # TODO: could grow more 'triangularly' -- would increase the support for the top row, hence maybe more robust
+
+                # TODO: could grow bidirectionally
+
+                # TODO: more generally, can just be a single loop over points in *arbitrary* order, and we figure out what already exists in the patch to use as conditioning
+                #  that'd nicely separate the growing strategy from constructing the conditioning signal
+
+                # TODO: fallback conditioning inputs for fail (no-blob / NaN) cases
+
+                assert direction == 'u'  # TODO! need to conditionally flip u/v in each of the following cases
+                if row_idx == 1 and col_idx == 0:  # first point of second row
+                    # Conditioned on center and right, predict below & above
+                    # Note this one is ambiguous for +/- direction and we choose arbitrarily below, based on largest blob
+                    heatmaps, min_corner_zyx = get_heatmaps_at(rows[0][0], prev_u=None, prev_v=rows[0][1], prev_diag=None)
+                elif row_idx == 1:  # later points of second row
+                    # Conditioned on center and left and below-left, predict below
+                    heatmaps, min_corner_zyx = get_heatmaps_at(rows[0][col_idx], prev_u=None, prev_v=rows[0][col_idx - 1], prev_diag=next_row[-1])
+                elif col_idx == 0:  # first point of later rows
+                    # Conditioned on center and above and right, predict below
+                    heatmaps, min_corner_zyx = get_heatmaps_at(rows[-1][0], prev_u=rows[-2][0], prev_v=rows[-1][1], prev_diag=None)
+                else:  # later points of later rows
+                    # Conditioned on center and left and above and below-left, predict below
+                    heatmaps, min_corner_zyx = get_heatmaps_at(rows[-1][col_idx], prev_u=rows[-2][col_idx], prev_v=rows[-1][col_idx - 1], prev_diag=next_row[-1])
+
+                coordinates = get_blob_coordinates(heatmaps[0 if direction == 'u' else 1].squeeze(0), min_corner_zyx)
+                if len(coordinates) == 0 or coordinates[0].isnan().any():
+                    print('warning: no point found!')
+                    next_row.extend([torch.tensor([-1, -1, -1])] * (first_row_zyxs.shape[0] - len(next_row)))
+                    break
+
+                # Take the largest (0th) blob centroid as the next point
+                next_zyx = coordinates[0]
+                next_row.append(next_zyx)
+
+            rows.append(torch.stack(next_row, dim=0))
         return torch.stack(rows, dim=0)
+
+    def save_point_collection(filename, zyxs):
+        with open(filename, 'wt') as fp:
+            json.dump({
+                'collections': {
+                    '0': {
+                        'name': 'strip',
+                        'color': [1.0, 0.5, 0.5],
+                        'metadata': {'winding_is_absolute': False},
+                        'points': {
+                            str(idx): {
+                                'creation_time': 1000,
+                                'p': (zyxs[idx].flip(0) * 2 ** volume_scale).tolist(),
+                                'wind_a': 1.,
+                            }
+                            for idx in range(zyxs.shape[0])
+                        }
+                    }
+                },
+                'vc_pointcollections_json_version': '1'
+            }, fp)
 
     with torch.inference_mode():
 
+        strip_direction = 'v'
         start_zyx = torch.tensor(start_xyz).flip(0) / 2 ** volume_scale
-        strip_zyxs = trace_strip(start_zyx, num_steps=50)
-        quads = torch.stack([strip_zyxs + torch.tensor([0, -24, 0]), strip_zyxs + torch.tensor([0, -18, 0]), strip_zyxs + torch.tensor([0, -12, 0]), strip_zyxs + torch.tensor([0, -6, 0]), strip_zyxs, strip_zyxs + torch.tensor([0, 0, 6]), strip_zyxs + torch.tensor([0, 0, 12]), strip_zyxs + torch.tensor([0, 0, 18]), strip_zyxs + torch.tensor([0, 0, 24])], dim=1)
-        quads *= 2 ** volume_scale
-        save_tifxyz(quads.numpy(), f'{out_path}', 'neural-trace-strip', config['step_size'], voxel_size_um, 'neural-tracer')
+        strip_zyxs = trace_strip(start_zyx, num_steps=50, direction=strip_direction)
+        save_point_collection(f'points_{strip_direction}.json', strip_zyxs)
 
-        patch_zyxs = trace_patch(strip_zyxs, num_steps=10)
-        save_tifxyz((patch_zyxs * 2 ** volume_scale).numpy(), f'{out_path}', 'neural-trace-patch', config['step_size'], voxel_size_um, 'neural-tracer')
+        patch_zyxs = trace_patch(strip_zyxs, num_steps=50, direction='v' if strip_direction == 'u' else 'u')
+        save_point_collection(f'points_patch.json', patch_zyxs.view(-1, 3))
+        save_tifxyz((patch_zyxs * 2 ** volume_scale).numpy(), f'{out_path}', 'neural-trace-patch', config['step_size'] * 2 ** volume_scale, voxel_size_um, 'neural-tracer')
+        plt.plot(*patch_zyxs.view(-1, 3)[:, [0, 1]].T, 'r.')
+        plt.savefig('patch.png')
+        plt.close()
+
 
 if __name__ == '__main__':
     trace()
