@@ -812,7 +812,7 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_dist_loss(5, p, {1,1}, loss_status, problem, params, settings);
     count += conditional_dist_loss(5, p, {-1,-1}, loss_status, problem, params, settings);
 
-    //symmetrich dirichlet
+    //symmetric dirichlet
     count += conditional_sdirichlet_loss(6, p,                    loss_status, problem, params, settings, /*eps=*/1e-8);
     count += conditional_sdirichlet_loss(6, p + cv::Vec2i(-1, 0), loss_status, problem, params, settings, /*eps=*/1e-8);
     count += conditional_sdirichlet_loss(6, p + cv::Vec2i( 0,-1), loss_status, problem, params, settings, /*eps=*/1e-8);
