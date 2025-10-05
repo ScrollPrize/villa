@@ -1192,8 +1192,8 @@ public:
 };
 
 struct SymmetricDirichletLoss {
-    SymmetricDirichletLoss(double unit, double w, double eps)
-      : _unit(unit), _w(w), _eps(eps) {}
+    SymmetricDirichletLoss(double unit, double w, double eps_abs, double eps_rel)
+      : _unit(unit), _w(w), _eps_abs(eps_abs), _eps_rel(eps_rel) {}
 
     template <typename T>
     bool operator()(const T* const p,    // 3D at (i,j)
@@ -1213,8 +1213,8 @@ struct SymmetricDirichletLoss {
 
         T trG  = a + c;
         T detG = a*c - b*b;
-        // Smooth(ish) barrier against degeneracy
-        T det_safe = detG + T(_eps);
+        // Smooth(ish) barrier against degeneracy (relative + absolute floor)
+        T det_safe = detG + T(_eps_abs) + T(_eps_rel) * trG;
 
         // E_SD(J) = tr(G) + tr(G^{-1}) ; for 2x2, tr(G^{-1}) = (a+c)/det(G)
         T E = trG + trG / det_safe;
@@ -1223,13 +1223,14 @@ struct SymmetricDirichletLoss {
         return true;
     }
 
-    static ceres::CostFunction* Create(double unit, double w = 1.0, double eps = 1e-6)
+    static ceres::CostFunction* Create(double unit, double w = 1.0, double eps_abs = 1e-8, double eps_rel = 1e-2)
     {
         return new ceres::AutoDiffCostFunction<SymmetricDirichletLoss, 1, 3, 3, 3>(
-            new SymmetricDirichletLoss(unit, w, eps));
+            new SymmetricDirichletLoss(unit, w, eps_abs, eps_rel));
     }
 
     double _unit;
     double _w;
-    double _eps;
+    double _eps_abs;
+    double _eps_rel;
 };

@@ -323,10 +323,10 @@ static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_
 static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, const LossSettings &settings);
 static int gen_sdirichlet_loss(ceres::Problem &problem, const cv::Vec2i &p,
                                TraceParameters &params, const LossSettings &settings,
-                               double sdir_eps);
+                               double sdir_eps_abs, double sdir_eps_rel);
 static int conditional_sdirichlet_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
                                        ceres::Problem &problem, TraceParameters &params,
-                                       const LossSettings &settings, double sdir_eps);
+                                       const LossSettings &settings, double sdir_eps_abs, double sdir_eps_rel);
 static bool loc_valid(int state)
 {
     return state & STATE_LOC_VALID;
@@ -409,7 +409,8 @@ static int gen_sdirichlet_loss(ceres::Problem &problem,
                                const cv::Vec2i &p,
                                TraceParameters &params,
                                const LossSettings &settings,
-                               double sdir_eps)
+                               double sdir_eps_abs,
+                               double sdir_eps_rel)
 {
     // Need p, p+u, p+v inside the image; treat (p) as the lower-left of a cell
     const int rows = params.state.rows;
@@ -435,8 +436,9 @@ static int gen_sdirichlet_loss(ceres::Problem &problem,
 
     problem.AddResidualBlock(
         SymmetricDirichletLoss::Create(/*unit*/ params.unit,
-                                       /*w   */ w,
-                                       /*eps */ sdir_eps),
+                                       /*w       */ w,
+                                       /*eps_abs */ sdir_eps_abs,
+                                       /*eps_rel */ sdir_eps_rel),
         /*loss*/ nullptr,
         &params.dpoints(p)[0],
         &params.dpoints(pu)[0],
@@ -451,13 +453,14 @@ static int conditional_sdirichlet_loss(int bit,
                                        ceres::Problem &problem,
                                        TraceParameters &params,
                                        const LossSettings &settings,
-                                       double sdir_eps)
+                                       double sdir_eps_abs,
+                                       double sdir_eps_rel)
 {
     int set = 0;
     // One SD term per cell (keyed at p itself)
     if (!loss_mask(bit, p, {0, 0}, loss_status)) {
         set = set_loss_mask(bit, p, {0, 0}, loss_status,
-                            gen_sdirichlet_loss(problem, p, params, settings, sdir_eps));
+                            gen_sdirichlet_loss(problem, p, params, settings, sdir_eps_abs, sdir_eps_rel));
     }
     return set;
 }
@@ -672,9 +675,9 @@ static int add_continuous_losses(ceres::Problem &problem, const cv::Vec2i &p, Tr
     // count += gen_normal_loss(problem, p + cv::Vec2i(-1, 0), params, trace_data, settings);
 
     //symmetric dirichlet
-    count += gen_sdirichlet_loss(problem, p, params, settings, /*eps=*/1e-8);
-    count += gen_sdirichlet_loss(problem, p + cv::Vec2i(-1, 0), params, settings, 1e-8);
-    count += gen_sdirichlet_loss(problem, p + cv::Vec2i( 0,-1), params, settings, 1e-8);
+    count += gen_sdirichlet_loss(problem, p, params, settings, /*eps_abs=*/1e-8, /*eps_rel=*/1e-2);
+    count += gen_sdirichlet_loss(problem, p + cv::Vec2i(-1, 0), params, settings, 1e-8, 1e-2);
+    count += gen_sdirichlet_loss(problem, p + cv::Vec2i( 0,-1), params, settings, 1e-8, 1e-2);
 
     return count;
 }
@@ -812,10 +815,10 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_dist_loss(5, p, {1,1}, loss_status, problem, params, settings);
     count += conditional_dist_loss(5, p, {-1,-1}, loss_status, problem, params, settings);
 
-    //symmetrich dirichlet
-    count += conditional_sdirichlet_loss(6, p,                    loss_status, problem, params, settings, /*eps=*/1e-8);
-    count += conditional_sdirichlet_loss(6, p + cv::Vec2i(-1, 0), loss_status, problem, params, settings, /*eps=*/1e-8);
-    count += conditional_sdirichlet_loss(6, p + cv::Vec2i( 0,-1), loss_status, problem, params, settings, /*eps=*/1e-8);
+    //symmetric dirichlet
+    count += conditional_sdirichlet_loss(6, p,                    loss_status, problem, params, settings, /*eps_abs=*/1e-8, /*eps_rel=*/1e-2);
+    count += conditional_sdirichlet_loss(6, p + cv::Vec2i(-1, 0), loss_status, problem, params, settings, 1e-8, 1e-2);
+    count += conditional_sdirichlet_loss(6, p + cv::Vec2i( 0,-1), loss_status, problem, params, settings, 1e-8, 1e-2);
 
     //normal field
     count += conditional_direction_loss(9, p, 1, loss_status, problem, params.state, params.dpoints, settings, trace_data.direction_fields);
