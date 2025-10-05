@@ -1139,7 +1139,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
     std::cout << "lets go! " << std::endl;
 
-    //just continue on resume no additional global opt
     if (resume_surf) {
         std::cout << "resuime! " << std::endl;
         float resume_step = 1.0 / resume_surf->scale()[0];
