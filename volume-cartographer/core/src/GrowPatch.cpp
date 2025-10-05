@@ -1319,6 +1319,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
     // Solve the initial optimisation problem, just placing the first four vertices around the seed
     ceres::Solver::Summary big_summary;
+    //just continue on resume no additional global opt	
     if (!resume_surf) {
         local_optimization(8, {y0,x0}, trace_params, trace_data, loss_settings, true);
     }
@@ -1371,7 +1372,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         // considering two points that are too close to each other...
         OmpThreadPointCol cands_threadcol(local_opt_r*2+1, cands);
 
-// ...then start iterating over candidates in parallel using the above to yield points
+        // ...then start iterating over candidates in parallel using the above to yield points
 #pragma omp parallel
         {
             CachedChunked3dInterpolator<uint8_t,thresholdedDistance> interp(proc_tensor);
@@ -1461,8 +1462,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 }
 
                 for (int i=1;i<local_opt_r;i++)
-                    local_optimization(i, p, trace_params, trace_data, loss_settings, true); // end parallel iteration over cands
-            }
+                    local_optimization(i, p, trace_params, trace_data, loss_settings, true);
+            } // end parallel iteration over cands
         }
 
         if (!global_opt) {
@@ -1527,7 +1528,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         timer_gen.unit = succ_gen * vx_per_quad;
         timer_gen.unit_string = "vx^2";
         // print_accessor_stats();
-        
+
         int snapshot_interval = params.value("snapshot-interval", 0);
         if (!tgt_path.empty() && snapshot_interval > 0 && generation % snapshot_interval == 0) {
             QuadSurface* surf = create_surface_from_state();
