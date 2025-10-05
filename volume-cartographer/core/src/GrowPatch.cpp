@@ -14,7 +14,6 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/CostFunctions.hpp"
 #include "vc/core/util/HashFunctions.hpp"
-#include "vc/core/util/NormalGridVolume.hpp"
 
 #include "vc/core/util/xtensor_include.hpp"
 #include XTENSORINCLUDE(views, xview.hpp)
@@ -25,6 +24,7 @@
 #include <optional>
 #include <cstdlib>
 #include <limits>
+#include <omp.h>  // ensure omp_get_max_threads() is declared
 
 #include "vc/tracer/Tracer.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -190,6 +190,7 @@ enum LossType {
     DIRECTION,
     SNAP,
     NORMAL,
+    SDIR,
     COUNT
 };
 
@@ -203,6 +204,7 @@ struct LossSettings {
         w[LossType::STRAIGHT] = 0.2f;
         w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 1.0f;
+        w[LossType::SDIR] = 0.00f; // conservative default; tune 0.01–0.10 maybe
     }
 
     float operator()(LossType type, const cv::Vec2i& p) const {
@@ -319,7 +321,12 @@ static int gen_straight_loss(ceres::Problem &problem, const cv::Vec2i &p, const 
 static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, const LossSettings &settings);
-
+static int gen_sdirichlet_loss(ceres::Problem &problem, const cv::Vec2i &p,
+                               TraceParameters &params, const LossSettings &settings,
+                               double sdir_eps_abs, double sdir_eps_rel);
+static int conditional_sdirichlet_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
+                                       ceres::Problem &problem, TraceParameters &params,
+                                       const LossSettings &settings, double sdir_eps_abs, double sdir_eps_rel);
 static bool loc_valid(int state)
 {
     return state & STATE_LOC_VALID;
@@ -366,6 +373,9 @@ static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::
     return 1;
 }
 
+// -------------------------
+// helpers used by conditionals (must be before they’re used)
+// -------------------------
 static cv::Vec2i lower_p(const cv::Vec2i &point, const cv::Vec2i &offset)
 {
     if (offset[0] == 0) {
@@ -389,6 +399,72 @@ static int set_loss_mask(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::
 {
     if (set)
         loss_status(lower_p(p, off)) |= (1 << bit);
+    return set;
+}
+
+// -------------------------
+// Symmetric Dirichlet losses (definitions)
+// -------------------------
+static int gen_sdirichlet_loss(ceres::Problem &problem,
+                               const cv::Vec2i &p,
+                               TraceParameters &params,
+                               const LossSettings &settings,
+                               double sdir_eps_abs,
+                               double sdir_eps_rel)
+{
+    // Need p, p+u, p+v inside the image; treat (p) as the lower-left of a cell
+    const int rows = params.state.rows;
+    const int cols = params.state.cols;
+    if (p[0] < 0 || p[1] < 0 || p[0] >= rows - 1 || p[1] >= cols - 1) {
+        return 0;
+    }
+
+    const cv::Vec2i pu = p + cv::Vec2i(0, 1);  // (i, j+1)  u-direction
+    const cv::Vec2i pv = p + cv::Vec2i(1, 0);  // (i+1, j)  v-direction
+
+    // All three parameter blocks must be present/valid
+    if (!coord_valid(params.state(p)) ||
+        !coord_valid(params.state(pu)) ||
+        !coord_valid(params.state(pv))) {
+        return 0;
+    }
+
+    const float w = settings(LossType::SDIR, p);
+    if (w <= 0.0f) {
+        return 0;
+    }
+
+    ceres::LossFunction* robust = nullptr;
+    robust = new ceres::CauchyLoss(1.0); // cauchy scale = 1.0
+
+    problem.AddResidualBlock(
+        SymmetricDirichletLoss::Create(/*unit*/ params.unit,
+                                       /*w       */ w,
+                                       /*eps_abs */ sdir_eps_abs,
+                                       /*eps_rel */ sdir_eps_rel),
+        /*loss*/ robust, // Cauchy Loss
+        &params.dpoints(p)[0],
+        &params.dpoints(pu)[0],
+        &params.dpoints(pv)[0]);
+
+    return 1;
+}
+
+static int conditional_sdirichlet_loss(int bit,
+                                       const cv::Vec2i &p,
+                                       cv::Mat_<uint16_t> &loss_status,
+                                       ceres::Problem &problem,
+                                       TraceParameters &params,
+                                       const LossSettings &settings,
+                                       double sdir_eps_abs,
+                                       double sdir_eps_rel)
+{
+    int set = 0;
+    // One SD term per cell (keyed at p itself)
+    if (!loss_mask(bit, p, {0, 0}, loss_status)) {
+        set = set_loss_mask(bit, p, {0, 0}, loss_status,
+                            gen_sdirichlet_loss(problem, p, params, settings, sdir_eps_abs, sdir_eps_rel));
+    }
     return set;
 }
 
@@ -427,11 +503,12 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TracePar
     double* pB1 = &params.dpoints(p_tr)[0];
     double* pB2 = &params.dpoints(p_bl)[0];
     double* pC = &params.dpoints(p_br)[0];
-
+    
     int count = 0;
     // int i = 1;
     for (int i = 0; i < 3; ++i) { // For each plane
         // bool direction_aware = (i == 0); // XY plane
+
         bool direction_aware = false; // this is not that simple ...
         // Loss with p as base point A
         problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), direction_aware, settings.z_min, settings.z_max), nullptr, pA, pB1, pB2, pC);
@@ -458,7 +535,6 @@ static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_
         set = set_loss_mask(bit, p, {0,0}, loss_status, gen_normal_loss(problem, p, params, trace_data, settings));
     return set;
 };
-
 
 // static void freeze_inner_params(ceres::Problem &problem, int edge_dist, const cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &out,
 //     cv::Mat_<cv::Vec2d> &loc, cv::Mat_<uint16_t> &loss_status, int inner_flags)
@@ -573,7 +649,6 @@ static int add_continuous_losses(ceres::Problem &problem, const cv::Vec2i &p, Tr
     count += gen_straight_loss(problem, p, {-1,0},{0,0},{1,0}, params, settings);
     count += gen_straight_loss(problem, p, {0,0},{1,0},{2,0}, params, settings);
 
-
     //diag1
     count += gen_straight_loss(problem, p, {-2,-2},{-1,-1},{0,0}, params, settings);
     count += gen_straight_loss(problem, p, {-1,-1},{0,0},{1,1}, params, settings);
@@ -601,6 +676,11 @@ static int add_continuous_losses(ceres::Problem &problem, const cv::Vec2i &p, Tr
     // count += gen_normal_loss(problem, p + cv::Vec2i(-1,-1), params, trace_data, settings);
     // count += gen_normal_loss(problem, p + cv::Vec2i( 0,-1), params, trace_data, settings);
     // count += gen_normal_loss(problem, p + cv::Vec2i(-1, 0), params, trace_data, settings);
+
+    //symmetric dirichlet
+    count += gen_sdirichlet_loss(problem, p, params, settings, /*eps_abs=*/1e-8, /*eps_rel=*/1e-2);
+    count += gen_sdirichlet_loss(problem, p + cv::Vec2i(-1, 0), params, settings, 1e-8, 1e-2);
+    count += gen_sdirichlet_loss(problem, p + cv::Vec2i( 0,-1), params, settings, 1e-8, 1e-2);
 
     return count;
 }
@@ -738,6 +818,11 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_dist_loss(5, p, {1,1}, loss_status, problem, params, settings);
     count += conditional_dist_loss(5, p, {-1,-1}, loss_status, problem, params, settings);
 
+    //symmetric dirichlet
+    count += conditional_sdirichlet_loss(6, p,                    loss_status, problem, params, settings, /*eps_abs=*/1e-8, /*eps_rel=*/1e-2);
+    count += conditional_sdirichlet_loss(6, p + cv::Vec2i(-1, 0), loss_status, problem, params, settings, 1e-8, 1e-2);
+    count += conditional_sdirichlet_loss(6, p + cv::Vec2i( 0,-1), loss_status, problem, params, settings, 1e-8, 1e-2);
+
     //normal field
     count += conditional_direction_loss(9, p, 1, loss_status, problem, params.state, params.dpoints, settings, trace_data.direction_fields);
     count += conditional_direction_loss(9, p, -1, loss_status, problem, params.state, params.dpoints, settings, trace_data.direction_fields);
@@ -798,7 +883,6 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
     // options.max_num_refinement_iterations = 3;
     // options.use_inner_iterations = true;
 
-
     if (parallel)
         options.num_threads = omp_get_max_threads();
 
@@ -822,6 +906,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
 //         }
 //     }
 // #endif
+
     ceres::Solver::Summary summary;
 
     ceres::Solve(options, &problem, &summary);
@@ -947,6 +1032,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     int stop_gen = params.value("generations", 100);
     float step = params.value("step_size", 20.0f);
     trace_params.unit = step*scale;
+    const double sdir_w   = params.value("sdir_weight",  loss_settings[LossType::SDIR]);
+    loss_settings[LossType::SDIR] = static_cast<float>(sdir_w);
     int rewind_gen = params.value("rewind_gen", -1);
     loss_settings.z_min = params.value("z_min", -1);
     loss_settings.z_max = params.value("z_max", std::numeric_limits<int>::max());
@@ -1001,10 +1088,11 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     // cands will contain new points adjacent to the fringe that are candidates to expand into
     std::vector<cv::Vec2i> fringe;
     std::vector<cv::Vec2i> cands;
-
+    
     float T = step;
     // float Ts = step*scale;
 
+    
     // The following track the state of the patch; they are each as big as the largest possible patch but initially empty
     // - locs defines the patch! It says for each 2D position, which 3D position it corresponds to
     // - state tracks whether each 2D position is part of the patch yet, and whether its 3D position has been found
@@ -1236,7 +1324,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
     // Solve the initial optimisation problem, just placing the first four vertices around the seed
     ceres::Solver::Summary big_summary;
-    //just continue on resume no additional global opt
+    //just continue on resume no additional global opt	
     if (!resume_surf) {
         local_optimization(8, {y0,x0}, trace_params, trace_data, loss_settings, true);
     }
@@ -1247,7 +1335,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 200;
     options.function_tolerance = 1e-3;
-
 
     auto neighs = parse_growth_directions(params);
 
@@ -1381,7 +1468,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
                 for (int i=1;i<local_opt_r;i++)
                     local_optimization(i, p, trace_params, trace_data, loss_settings, true);
-            }  // end parallel iteration over cands
+            } // end parallel iteration over cands
         }
 
         if (!global_opt) {
