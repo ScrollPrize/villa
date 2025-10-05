@@ -35,6 +35,16 @@ struct DistLoss {
 
         T dist = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
 
+        // Guard: near-zero-length segment leads to unstable division and duplicate-placement artifacts
+        if (dist <= T(1e-12)) {
+            std::cout << "[DistLoss:zero_distance] d=" << val(_d)
+                      << " a=(" << val(a[0]) << "," << val(a[1]) << "," << val(a[2]) << ")"
+                      << " b=(" << val(b[0]) << "," << val(b[1]) << "," << val(b[2]) << ")"
+                      << std::endl;
+            residual[0] = T(0);
+            return true;
+        }
+
         if (dist <= T(0)) {
             residual[0] = T(_w)*(d[0]*d[0] + d[1]*d[1] + d[2]*d[2] - T(1));
         }
@@ -78,6 +88,16 @@ struct DistLoss2D {
 
         T dist = sqrt(d[0]*d[0] + d[1]*d[1]);
 
+        // Guard: near-zero-length segment leads to unstable division and duplicate-placement artifacts
+        if (dist <= T(1e-12)) {
+            std::cout << "[DistLoss2D:zero_distance] d=" << val(_d)
+                      << " a=(" << val(a[0]) << "," << val(a[1]) << ")"
+                      << " b=(" << val(b[0]) << "," << val(b[1]) << ")"
+                      << std::endl;
+            residual[0] = T(0);
+            return true;
+        }
+
         if (dist <= T(0)) {
             residual[0] = T(_w)*(d[0]*d[0] + d[1]*d[1] - T(1));
             std::cout << "uhohh" << std::endl;
@@ -104,6 +124,112 @@ struct DistLoss2D {
 };
 
 
+
+// Encourages movement of p relative to b along a precomputed outward direction.
+struct ForwardProgressLoss {
+    ForwardProgressLoss(const cv::Vec3d& outward, float w) : _w(w) {
+        double n = std::sqrt(outward[0]*outward[0] + outward[1]*outward[1] + outward[2]*outward[2]);
+        if (n > 1e-12) {
+            _out[0] = outward[0]/n; _out[1] = outward[1]/n; _out[2] = outward[2]/n;
+        } else {
+            _out[0] = _out[1] = _out[2] = 0.0;
+        }
+    }
+    template <typename T>
+    bool operator()(const T* const p, const T* const b, T* residual) const {
+        // Penalize negative projection onto outward direction; zero when moving outward or perpendicular
+        T move0 = p[0] - b[0];
+        T move1 = p[1] - b[1];
+        T move2 = p[2] - b[2];
+        T dot = move0*T(_out[0]) + move1*T(_out[1]) + move2*T(_out[2]);
+        if (dot < T(0)) residual[0] = T(_w) * (-dot);
+        else residual[0] = T(0);
+        return true;
+    }
+    float _w;
+    double _out[3];
+    static ceres::CostFunction* Create(const cv::Vec3d& outward, float w = 1.0)
+    {
+        return new ceres::AutoDiffCostFunction<ForwardProgressLoss, 1, 3, 3>(new ForwardProgressLoss(outward, w));
+    }
+};
+
+// Discourages the candidate movement from becoming parallel to a reference axis (degenerate frame)
+struct MovementOrthogonalityLoss {
+    MovementOrthogonalityLoss(const cv::Vec3d& v_ref, double cos_max, float w) : _w(w) {
+        double n = std::sqrt(v_ref[0]*v_ref[0] + v_ref[1]*v_ref[1] + v_ref[2]*v_ref[2]);
+        if (n > 1e-12) {
+            _v[0] = v_ref[0]/n; _v[1] = v_ref[1]/n; _v[2] = v_ref[2]/n;
+        } else {
+            _v[0] = _v[1] = _v[2] = 0.0;
+        }
+        _cos_max = cos_max;
+    }
+    template <typename T>
+    bool operator()(const T* const p, const T* const b, T* residual) const {
+        T mv0 = p[0] - b[0];
+        T mv1 = p[1] - b[1];
+        T mv2 = p[2] - b[2];
+        T len = ceres::sqrt(mv0*mv0 + mv1*mv1 + mv2*mv2);
+        if (len < T(1e-12)) { residual[0] = T(0); return true; }
+        T dot_unit = (mv0*T(_v[0]) + mv1*T(_v[1]) + mv2*T(_v[2])) / len;
+        T ad = ceres::abs(dot_unit);
+        T excess = ad - T(_cos_max);
+        if (excess > T(0)) residual[0] = T(_w) * excess; else residual[0] = T(0);
+        return true;
+    }
+    float _w;
+    double _v[3];
+    double _cos_max;
+    static ceres::CostFunction* Create(const cv::Vec3d& v_ref, double cos_max, float w = 1.0)
+    {
+        return new ceres::AutoDiffCostFunction<MovementOrthogonalityLoss, 1, 3, 3>(new MovementOrthogonalityLoss(v_ref, cos_max, w));
+    }
+};
+
+// Penalizes flips of the induced normal n_move = normalize((p - b) x v_ref)
+// relative to a reference local normal n_ref.
+struct NormalFlipLoss {
+    NormalFlipLoss(const cv::Vec3d& v_ref, const cv::Vec3d& n_ref, float w) : _w(w) {
+        auto norm = [](const cv::Vec3d& v) {
+            double n = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+            return n;
+        };
+        double nv = norm(v_ref);
+        double nn = norm(n_ref);
+        if (nv > 1e-12) { _v[0] = v_ref[0]/nv; _v[1] = v_ref[1]/nv; _v[2] = v_ref[2]/nv; }
+        else { _v[0] = _v[1] = _v[2] = 0.0; }
+        if (nn > 1e-12) { _n[0] = n_ref[0]/nn; _n[1] = n_ref[1]/nn; _n[2] = n_ref[2]/nn; }
+        else { _n[0] = _n[1] = _n[2] = 0.0; }
+    }
+    template <typename T>
+    bool operator()(const T* const p, const T* const b, T* residual) const {
+        T mv0 = p[0] - b[0];
+        T mv1 = p[1] - b[1];
+        T mv2 = p[2] - b[2];
+        T len = ceres::sqrt(mv0*mv0 + mv1*mv1 + mv2*mv2);
+        if (len < T(1e-12)) { residual[0] = T(0); return true; }
+        // unit movement
+        T um0 = mv0/len, um1 = mv1/len, um2 = mv2/len;
+        // n_move = um x v_ref
+        T nx = um1*T(_v[2]) - um2*T(_v[1]);
+        T ny = um2*T(_v[0]) - um0*T(_v[2]);
+        T nz = um0*T(_v[1]) - um1*T(_v[0]);
+        T nlen = ceres::sqrt(nx*nx + ny*ny + nz*nz);
+        if (nlen < T(1e-12)) { residual[0] = T(0); return true; }
+        nx /= nlen; ny /= nlen; nz /= nlen;
+        T dot = nx*T(_n[0]) + ny*T(_n[1]) + nz*T(_n[2]);
+        if (dot < T(0)) residual[0] = T(_w) * (-dot); else residual[0] = T(0);
+        return true;
+    }
+    float _w;
+    double _v[3];
+    double _n[3];
+    static ceres::CostFunction* Create(const cv::Vec3d& v_ref, const cv::Vec3d& n_ref, float w = 1.0)
+    {
+        return new ceres::AutoDiffCostFunction<NormalFlipLoss, 1, 3, 3>(new NormalFlipLoss(v_ref, n_ref, w));
+    }
+};
 
 struct StraightLoss {
     StraightLoss(float w) : _w(w) {};
@@ -510,7 +636,12 @@ struct NormalDirectionLoss {
             return true;
         }
 
-        E const abs_dot = abs(patch_normal_zyx[0] * target_normal_zyx[0] + patch_normal_zyx[1] * target_normal_zyx[1] + patch_normal_zyx[2] * target_normal_zyx[2]) / patch_normal_length;
+        E const dot_raw_nd = patch_normal_zyx[0] * target_normal_zyx[0] + patch_normal_zyx[1] * target_normal_zyx[1] + patch_normal_zyx[2] * target_normal_zyx[2];
+        // [DISABLED] abs smoothing and log; revert to exact absolute value
+        // if (ceres::abs(dot_raw_nd) < E(1e-6)) {
+        //     std::cout << "[NormalDir:abs_smooth] dot_raw=" << val(dot_raw_nd) << std::endl;
+        // }
+        E const abs_dot = ceres::abs(dot_raw_nd) / patch_normal_length;
 
         E const weight_at_point = _maybe_weights ? E((*_maybe_weights)(unjet(l_base[2]), unjet(l_base[1]), unjet(l_base[0]))) : E(1);
 
@@ -644,6 +775,15 @@ struct NormalConstraintPlane {
         }
 
         if (pBn == nullptr) {
+            std::cout << "[NCP:no_Bn] plane=" << plane_idx
+                      << " b1_rel=" << val(b1_rel)
+                      << " b2_rel=" << val(b2_rel)
+                      << " c_rel=" << val(c_rel)
+                      << " A=(" << val(pA[0]) << "," << val(pA[1]) << "," << val(pA[2]) << ")"
+                      << " B1=(" << val(pB1[0]) << "," << val(pB1[1]) << "," << val(pB1[2]) << ")"
+                      << " B2=(" << val(pB2[0]) << "," << val(pB2[1]) << "," << val(pB2[2]) << ")"
+                      << " C=(" << val(pC[0]) << "," << val(pC[1]) << "," << val(pC[2]) << ")"
+                      << std::endl;
             return true; // C is on the plane, or B1/B2 are on the same side as C.
         }
 
@@ -687,20 +827,20 @@ struct NormalConstraintPlane {
         if (z_min != -1 && query_point.z < z_min) return true;
         if (z_max != -1 && query_point.z > z_max) return true;
 
+        // [DISABLED] Blended slice smoothing across adjacent grids; revert to nearest grid behavior
         // auto grid_query = normal_grid_volume.query(query_point, plane_idx);
-        // if (!grid_query) {
-        //     return true;
-        // }
-
-        // Calculate normal loss for both grid planes and interpolate.
-        // T loss1 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid1, 0);
-        // T loss2 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid2, 1);
+        // if (!grid_query) { return true; }
+        // T loss1 = invert_dir
+        //           ? calculate_normal_snapping_loss(pE_2d, pA_2d, *grid_query->grid1, 0)
+        //           : calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid1, 0);
+        // T loss2 = invert_dir
+        //           ? calculate_normal_snapping_loss(pE_2d, pA_2d, *grid_query->grid2, 1)
+        //           : calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid2, 1);
         // T interpolated_loss = (T(1.0) - T(grid_query->weight)) * loss1 + T(grid_query->weight) * loss2;
-
         auto grid_ptr = normal_grid_volume.query_nearest(query_point, plane_idx);
-        if (!grid_ptr)
+        if (!grid_ptr) {
             return true;
-
+        }
         T interpolated_loss;
         if (invert_dir)
             interpolated_loss = calculate_normal_snapping_loss(pE_2d, pA_2d, *grid_ptr, 0);
@@ -773,6 +913,13 @@ struct NormalConstraintPlane {
 
         T ab_len_sq = ab_x * ab_x + ab_y * ab_y;
         if (ab_len_sq < T(1e-9)) {
+            static int s_seg_deg_log_count = 0;
+            if ((++s_seg_deg_log_count % 5) == 0) {
+                std::cout << "[NCP:seg_degenerate] a=(" << a.x << "," << a.y << ")"
+                          << " b=(" << b.x << "," << b.y << ")"
+                          << " p=(" << val(p[0]) << "," << val(p[1]) << ")"
+                          << std::endl;
+            }
             return ap_x * ap_x + ap_y * ap_y;
         }
         T t = (ap_x * ab_x + ap_y * ab_y) / ab_len_sq;
@@ -827,11 +974,19 @@ struct NormalConstraintPlane {
         T edge_len_sq = edge_vec_x * edge_vec_x + edge_vec_y * edge_vec_y;
         T edge_len = ceres::sqrt(edge_len_sq);
         if (edge_len_sq < T(1e-12)) {
-            std::cout << "[NCP:edge_zero] plane=" << plane_idx
+            static int s_edge_zero_log_count = 0;
+            if ((++s_edge_zero_log_count % 5) == 0) {
+                std::cout << "[NCP:edge_zero] plane=" << plane_idx
+                          << " grid_idx=" << grid_idx
+                          << " edge_len_sq=" << val(edge_len_sq)
+                          << " p1=(" << val(p1[0]) << "," << val(p1[1]) << ")"
+                          << " p2=(" << val(p2[0]) << "," << val(p2[1]) << ")"
+                          << std::endl;
+            }
+            std::cout << "[NCP:edge_zero_summary] plane=" << plane_idx
                       << " grid_idx=" << grid_idx
-                      << " edge_len_sq=" << val(edge_len_sq)
-                      << " p1=(" << val(p1[0]) << "," << val(p1[1]) << ")"
-                      << " p2=(" << val(p2[0]) << "," << val(p2[1]) << ")"
+                      << " skipped=" << 1
+                      << " total=" << 0
                       << std::endl;
             return T(0.0);
         }
@@ -883,6 +1038,8 @@ struct NormalConstraintPlane {
 
         T total_weighted_dot_loss = T(0.0);
         T total_weight = T(0.0);
+        // int near_tangent_skipped = 0; // [DISABLED] near-tangent guard regressed functionality
+        // int segments_considered = 0;  // [DISABLED]
 
         for (const std::vector<cv::Point>& path : nearby_paths) {
             if (path.size() < 2) continue;
@@ -906,15 +1063,32 @@ struct NormalConstraintPlane {
                 }
                 cv::Point2f normal(-tangent.y, tangent.x);
 
-                T dot_product = edge_normal_x * T(normal.x) + edge_normal_y * T(normal.y);
+                // Compute alignment between edge normal and path normal
+                // segments_considered++; // [DISABLED]
+                T dot_raw = edge_normal_x * T(normal.x) + edge_normal_y * T(normal.y);
+                // [DISABLED] near-tangent guard; keep contribution but without smoothing
+                // if (ceres::abs(dot_raw) < T(1e-6)) { ... }
+
+                T dot_product = dot_raw;
                 if (!direction_aware_) {
-                    dot_product = ceres::abs(dot_product);
+                    // [DISABLED] abs smoothing; revert to exact absolute value
+                    // dot_product = ceres::sqrt(dot_raw * dot_raw + T(1e-12));
+                    dot_product = ceres::abs(dot_raw);
                 }
 
                 total_weighted_dot_loss += weight_n*(T(1.0) - dot_product);
                 total_weight += weight_n;
             }
         }
+
+        // [DISABLED] near-tangent summary telemetry
+        // if (near_tangent_skipped > 0) {
+        //     std::cout << "[NCP:near_tangent_summary] plane=" << plane_idx
+        //               << " grid_idx=" << grid_idx
+        //               << " skipped=" << near_tangent_skipped
+        //               << " total=" << segments_considered
+        //               << std::endl;
+        // }
 
         T normal_loss = T(0.0);
         if (total_weight > T(1e-9)) {
@@ -991,6 +1165,9 @@ struct NormalConstraintPlane {
             snap_cache.legacy_grid_source_volume = &normal_grid_volume;
         }
 
+        int seg_deg_skipped_total = 0;
+        int seg_deg_checked_total = 0;
+
         const auto& snap_payload = snap_cache.get();
         T snapping_loss = T(0.0);
 
@@ -1008,8 +1185,29 @@ struct NormalConstraintPlane {
                 seg1_p2 = best_path[snap_payload.best_seg_idx];
             }
 
-            T d1_sq = point_line_dist_sq_differentiable(p1, seg1_p1, seg1_p2);
-            T d2_sq = point_line_dist_sq_differentiable(p2, seg2_p1, seg2_p2);
+            auto d_sq_with_deg_check = [&](const T* pp, const cv::Point2f& aa, const cv::Point2f& bb) -> T {
+                float abx = bb.x - aa.x;
+                float aby = bb.y - aa.y;
+                float ab_len_sq_f = abx*abx + aby*aby;
+                seg_deg_checked_total++;
+                if (ab_len_sq_f < 1e-9f) {
+                    static int s_seg_deg_log_count2 = 0;
+                    if ((++s_seg_deg_log_count2 % 5) == 0) {
+                        std::cout << "[NCP:seg_degenerate] a=(" << aa.x << "," << aa.y << ")"
+                                  << " b=(" << bb.x << "," << bb.y << ")"
+                                  << " p=(" << val(pp[0]) << "," << val(pp[1]) << ")"
+                                  << std::endl;
+                    }
+                    seg_deg_skipped_total++;
+                    T ap_x = pp[0] - T(aa.x);
+                    T ap_y = pp[1] - T(aa.y);
+                    return ap_x*ap_x + ap_y*ap_y;
+                }
+                return point_line_dist_sq_differentiable(pp, aa, bb);
+            };
+
+            T d1_sq = d_sq_with_deg_check(p1, seg1_p1, seg1_p2);
+            T d2_sq = d_sq_with_deg_check(p2, seg2_p1, seg2_p2);
 
             T d1_norm, d2_norm;
             if (d1_sq < T(1e-9))
@@ -1025,6 +1223,14 @@ struct NormalConstraintPlane {
             snapping_loss = (d1_norm * (T(1.0) - d2_norm) + d2_norm);
         } else {
             snapping_loss = T(1.0); // Penalty if no snap target found
+        }
+
+        if (seg_deg_skipped_total > 0) {
+            std::cout << "[NCP:seg_degenerate_summary] plane=" << plane_idx
+                      << " grid_idx=" << grid_idx
+                      << " skipped=" << seg_deg_skipped_total
+                      << " total=" << seg_deg_checked_total
+                      << std::endl;
         }
 
         return T(w_normal)*normal_loss + T(w_snap)*snapping_loss;

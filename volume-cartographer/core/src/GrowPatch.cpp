@@ -25,6 +25,7 @@
 #include <optional>
 #include <cstdlib>
 #include <limits>
+#include <cmath>
 
 #include "vc/tracer/Tracer.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -74,6 +75,148 @@ cv::Vec3d random_perturbation(double max_abs_offset = 0.05) {
     std::uniform_real_distribution<double> dist(-max_abs_offset, max_abs_offset);
     auto& rng = thread_rng();
     return {dist(rng), dist(rng), dist(rng)};
+}
+
+struct CandidateFrame {
+    cv::Vec3d tangent{0, 0, 0};
+    cv::Vec3d bitangent{0, 0, 0};
+    cv::Vec3d normal{0, 0, 0};
+    bool tangent_valid = false;
+    bool bitangent_valid = false;
+    bool normal_valid = false;
+};
+
+struct FrameHints {
+    std::optional<cv::Vec3d> tangent;
+    std::optional<cv::Vec3d> bitangent;
+    std::optional<cv::Vec3d> normal;
+    double lambda0 = 0.0;
+    double lambda1 = 0.0;
+    double lambda2 = 0.0;
+};
+
+static double vec_dot(const cv::Vec3d& a, const cv::Vec3d& b)
+{
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+static double vec_norm(const cv::Vec3d& v)
+{
+    return std::sqrt(vec_dot(v, v));
+}
+
+static cv::Vec3d vec_cross(const cv::Vec3d& a, const cv::Vec3d& b)
+{
+    return {
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0]
+    };
+}
+
+static CandidateFrame rebuild_candidate_frame(const cv::Vec3d& tangent_hint,
+                                              const std::optional<cv::Vec3d>& bitangent_hint,
+                                              const std::optional<cv::Vec3d>& normal_hint)
+{
+    const double kEps = 1e-12;
+    CandidateFrame frame;
+
+    auto normalize_if_valid = [&](const cv::Vec3d& v) -> std::optional<cv::Vec3d> {
+        double len = vec_norm(v);
+        if (len <= kEps) {
+            return std::nullopt;
+        }
+        return v * (1.0 / len);
+    };
+
+    if (auto t = normalize_if_valid(tangent_hint)) {
+        frame.tangent = *t;
+        frame.tangent_valid = true;
+    }
+
+    if (normal_hint) {
+        cv::Vec3d n = *normal_hint;
+        if (frame.tangent_valid) {
+            n -= frame.tangent * vec_dot(n, frame.tangent);
+        }
+        if (auto n_norm = normalize_if_valid(n)) {
+            frame.normal = *n_norm;
+            frame.normal_valid = true;
+        }
+    }
+
+    if (bitangent_hint) {
+        cv::Vec3d b = *bitangent_hint;
+        if (frame.tangent_valid) {
+            b -= frame.tangent * vec_dot(b, frame.tangent);
+        }
+        if (frame.normal_valid) {
+            b -= frame.normal * vec_dot(b, frame.normal);
+        }
+        if (auto b_norm = normalize_if_valid(b)) {
+            frame.bitangent = *b_norm;
+            frame.bitangent_valid = true;
+        }
+    }
+
+    if (!frame.bitangent_valid && frame.tangent_valid && frame.normal_valid) {
+        if (auto b_norm = normalize_if_valid(vec_cross(frame.normal, frame.tangent))) {
+            frame.bitangent = *b_norm;
+            frame.bitangent_valid = true;
+        }
+    }
+
+    if (!frame.normal_valid && frame.tangent_valid && frame.bitangent_valid) {
+        if (auto n_norm = normalize_if_valid(vec_cross(frame.tangent, frame.bitangent))) {
+            frame.normal = *n_norm;
+            frame.normal_valid = true;
+        }
+    }
+
+    return frame;
+}
+
+static FrameHints compute_pca_frame(const std::vector<cv::Vec3d>& points)
+{
+    FrameHints hints;
+    if (points.size() < 3) {
+        return hints;
+    }
+
+    cv::Mat data(static_cast<int>(points.size()), 3, CV_64F);
+    for (size_t i = 0; i < points.size(); ++i) {
+        data.at<double>(static_cast<int>(i), 0) = points[i][0];
+        data.at<double>(static_cast<int>(i), 1) = points[i][1];
+        data.at<double>(static_cast<int>(i), 2) = points[i][2];
+    }
+
+    cv::PCA pca(data, cv::Mat(), cv::PCA::DATA_AS_ROW);
+    if (pca.eigenvectors.rows < 3 || pca.eigenvalues.rows < 3) {
+        return hints;
+    }
+
+    const double lambda0 = pca.eigenvalues.at<double>(0);
+    const double lambda1 = pca.eigenvalues.at<double>(1);
+    const double lambda2 = pca.eigenvalues.at<double>(2);
+    const double kEigThresh = 1e-12;
+
+    auto vec_from_row = [&](int row) {
+        return cv::Vec3d(
+            pca.eigenvectors.at<double>(row, 0),
+            pca.eigenvectors.at<double>(row, 1),
+            pca.eigenvectors.at<double>(row, 2)
+        );
+    };
+
+    hints.lambda0 = lambda0;
+    hints.lambda1 = lambda1;
+    hints.lambda2 = lambda2;
+
+    if (lambda0 > kEigThresh) hints.tangent = vec_from_row(0);
+    if (lambda1 > kEigThresh) hints.bitangent = vec_from_row(1);
+    if (lambda2 > kEigThresh) hints.normal = vec_from_row(2);
+
+    return hints;
 }
 
 struct Vec2iLess {
@@ -323,6 +466,7 @@ static int gen_straight_loss(ceres::Problem &problem, const cv::Vec2i &p, const 
 static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, const LossSettings &settings);
+static int gen_laplacian_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &neg_off, const cv::Vec2i &pos_off, TraceParameters &params, float w);
 
 static bool loc_valid(int state)
 {
@@ -347,6 +491,19 @@ static int gen_straight_loss(ceres::Problem &problem, const cv::Vec2i &p, const 
 
     problem.AddResidualBlock(StraightLoss::Create(settings(LossType::STRAIGHT, p)), nullptr, &params.dpoints(p+o1)[0], &params.dpoints(p+o2)[0], &params.dpoints(p+o3)[0]);
 
+    return 1;
+}
+
+// Mild Laplacian-style regularization: keep p near the average of opposing neighbors
+static int gen_laplacian_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &neg_off, const cv::Vec2i &pos_off, TraceParameters &params, float w)
+{
+    if (w <= 0.0f) return 0;
+    const cv::Vec2i p_neg = p + neg_off;
+    const cv::Vec2i p_pos = p + pos_off;
+    if (!coord_valid(params.state(p_neg))) return 0;
+    if (!coord_valid(params.state(p))) return 0;
+    if (!coord_valid(params.state(p_pos))) return 0;
+    problem.AddResidualBlock(StraightLoss2::Create(w), nullptr, &params.dpoints(p_neg)[0], &params.dpoints(p)[0], &params.dpoints(p_pos)[0]);
     return 1;
 }
 
@@ -588,6 +745,15 @@ static int add_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParamete
         count += gen_straight_loss(problem, p, {-2,2},{-1,1},{0,0}, params, settings);
         count += gen_straight_loss(problem, p, {-1,1},{0,0},{1,-1}, params, settings);
         count += gen_straight_loss(problem, p, {0,0},{1,-1},{2,-2}, params, settings);
+
+        // [DISABLED] Mild Laplacian regularization (horizontal/vertical + diagonals)
+        // const float w_reg = 0.1f * settings(LossType::STRAIGHT, p);
+        // if (w_reg > 0.0f) {
+        //     count += gen_laplacian_loss(problem, p, {0,-1}, {0,1}, params, w_reg);
+        //     count += gen_laplacian_loss(problem, p, {-1,0}, {1,0}, params, w_reg);
+        //     count += gen_laplacian_loss(problem, p, {-1,-1}, {1,1}, params, w_reg);
+        //     count += gen_laplacian_loss(problem, p, {-1,1}, {1,-1}, params, w_reg);
+        // }
     }
 
     if (flags & LOSS_DIST) {
@@ -1706,6 +1872,220 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
                 int local_loss_count = add_losses(problem, p, trace_params, trace_data, loss_settings, LOSS_DIST | LOSS_STRAIGHT);
 
+                // Frame-informed preferences baked into the solve (cheap):
+                // 1) prefer moving outward relative to the best-connected neighbor
+                // 2) discourage movement parallel to an orthogonal reference axis near best_l
+                {
+                    const cv::Vec3d b3d = trace_params.dpoints(best_l);
+                    cv::Vec3d line_dir(0,0,0);
+                    bool line_dir_valid = false;
+
+                    // Compute outward using centroid of valid r-frame neighborhood around best_l
+                    int r_frame = 2; // use a 2-ring (5x5) neighborhood
+                    cv::Vec3d centroid(0,0,0);
+                    int cnt = 0;
+                    std::vector<cv::Vec3d> neighbor_pts;
+                    neighbor_pts.reserve((2*r_frame+1)*(2*r_frame+1));
+                    for (int dy = -r_frame; dy <= r_frame; ++dy) {
+                        for (int dx = -r_frame; dx <= r_frame; ++dx) {
+                            if (dy == 0 && dx == 0) continue;
+                            int ny = best_l[0] + dy;
+                            int nx = best_l[1] + dx;
+                            if (ny < 0 || nx < 0 || ny >= trace_params.dpoints.rows || nx >= trace_params.dpoints.cols) continue;
+                            if (!(trace_params.state(ny, nx) & STATE_LOC_VALID)) continue;
+                            const cv::Vec3d& neigh = trace_params.dpoints(ny, nx);
+                            centroid += neigh;
+                            cnt++;
+                            neighbor_pts.push_back(neigh);
+                        }
+                    }
+                    if (cnt > 0) {
+                        centroid *= (1.0 / cnt);
+                        cv::Vec3d outward = b3d - centroid; // outward points away from interior
+
+                        const float w_base = loss_settings(LossType::STRAIGHT, p);
+                        const float w_fp = 0.1f * w_base;
+
+                        FrameHints pca_hints = compute_pca_frame(neighbor_pts);
+
+                        // Reference axis: choose axis most orthogonal to the 2D movement among cardinal + diagonal,
+                        // aggregating over opposite pairs up to radius r_frame
+                        cv::Vec2i d2 = { p[0] - best_l[0], p[1] - best_l[1] };
+                        auto valid = [&](cv::Vec2i q){ return q[0] >= 0 && q[1] >= 0 && q[0] < trace_params.dpoints.rows && q[1] < trace_params.dpoints.cols && (trace_params.state(q) & STATE_LOC_VALID); };
+                        cv::Vec3d vref(0,0,0);
+                        bool have_vref = false;
+                        auto accum_axis_step = [&](cv::Vec2i step) {
+                            cv::Vec3d sum(0,0,0); int used = 0;
+                            for (int k = 1; k <= r_frame; ++k) {
+                                cv::Vec2i a = best_l + k*step;
+                                cv::Vec2i b = best_l - k*step;
+                                if (valid(a) && valid(b)) { sum += trace_params.dpoints(a) - trace_params.dpoints(b); used++; }
+                            }
+                            return std::pair<cv::Vec3d,int>(sum, used);
+                        };
+                        // Aggregate axes: vertical, horizontal, and diagonals
+                        auto [axis_v_sum, usedV]  = accum_axis_step({1,0});
+                        auto [axis_h_sum, usedH]  = accum_axis_step({0,1});
+                        auto [axis_d1_sum, usedD1]= accum_axis_step({1,1});
+                        auto [axis_d2_sum, usedD2]= accum_axis_step({1,-1});
+                        // Choose axis most orthogonal to movement in 2D
+                        auto choose_axis = [&](cv::Vec3d& out_vref) -> bool {
+                            double best_score = -1.0; // higher is better (more orthogonal)
+                            bool ok = false;
+                            auto score_axis = [&](cv::Vec2i a2d, const cv::Vec3d& sum, int used){
+                                if (used <= 0) return;
+                                double l = std::sqrt(double(d2[0]*d2[0] + d2[1]*d2[1]));
+                                if (l < 1e-9) return;
+                                double ax = a2d[0], ay = a2d[1];
+                                double al = std::sqrt(ax*ax + ay*ay);
+                                if (al < 1e-9) return;
+                                // normalized abs dot in 2D
+                                double dot = std::abs((d2[0]/l)*(ax/al) + (d2[1]/l)*(ay/al));
+                                double orth = 1.0 - dot; // larger is more orthogonal
+                                if (orth > best_score) { best_score = orth; out_vref = sum; ok = true; }
+                            };
+                            score_axis({1,0}, axis_v_sum, usedV);
+                            score_axis({0,1}, axis_h_sum, usedH);
+                            score_axis({1,1}, axis_d1_sum, usedD1);
+                            score_axis({1,-1}, axis_d2_sum, usedD2);
+                            return ok;
+                        };
+                        have_vref = choose_axis(vref);
+                        if (!have_vref) {
+                            // Fallback: pick any available axis in priority order V,H,D1,D2
+                            if (usedV > 0) { vref = axis_v_sum; have_vref = true; }
+                            else if (usedH > 0) { vref = axis_h_sum; have_vref = true; }
+                            else if (usedD1 > 0) { vref = axis_d1_sum; have_vref = true; }
+                            else if (usedD2 > 0) { vref = axis_d2_sum; have_vref = true; }
+                        }
+
+                        std::optional<cv::Vec3d> vref_hint;
+                        std::optional<cv::Vec3d> normal_hint;
+                        if (have_vref) {
+                            vref_hint = vref;
+
+                            // Normal-flip preference: encourage induced normal to agree with local reference normal
+                            // Build axes (cardinal + diagonals) and compute a stable n_ref
+                            cv::Vec3d nref(0,0,0);
+                            bool have_nref = false;
+                            std::vector<cv::Vec3d> normals;
+                            normals.reserve(2);
+                            if (usedH > 0 && usedV > 0) {
+                                cv::Vec3d n1(
+                                    axis_h_sum[1]*axis_v_sum[2] - axis_h_sum[2]*axis_v_sum[1],
+                                    axis_h_sum[2]*axis_v_sum[0] - axis_h_sum[0]*axis_v_sum[2],
+                                    axis_h_sum[0]*axis_v_sum[1] - axis_h_sum[1]*axis_v_sum[0]
+                                );
+                                double nlen = std::sqrt(n1[0]*n1[0] + n1[1]*n1[1] + n1[2]*n1[2]);
+                                if (nlen > 1e-12) normals.push_back(n1 * (1.0/nlen));
+                            }
+                            if (usedD1 > 0 && usedD2 > 0) {
+                                cv::Vec3d n2(
+                                    axis_d1_sum[1]*axis_d2_sum[2] - axis_d1_sum[2]*axis_d2_sum[1],
+                                    axis_d1_sum[2]*axis_d2_sum[0] - axis_d1_sum[0]*axis_d2_sum[2],
+                                    axis_d1_sum[0]*axis_d2_sum[1] - axis_d1_sum[1]*axis_d2_sum[0]
+                                );
+                                double nlen = std::sqrt(n2[0]*n2[0] + n2[1]*n2[1] + n2[2]*n2[2]);
+                                if (nlen > 1e-12) normals.push_back(n2 * (1.0/nlen));
+                            }
+                            if (!normals.empty()) {
+                                // Average available normals and renormalize
+                                for (const auto& ni : normals) nref += ni;
+                                double nlen = std::sqrt(nref[0]*nref[0] + nref[1]*nref[1] + nref[2]*nref[2]);
+                                if (nlen > 1e-12) { nref *= (1.0/nlen); have_nref = true; }
+                            }
+                            if (!have_nref) {
+                                // Fallback: use vref and outward to define a normal
+                                double nv = std::sqrt(vref[0]*vref[0] + vref[1]*vref[1] + vref[2]*vref[2]);
+                                double no = std::sqrt(outward[0]*outward[0] + outward[1]*outward[1] + outward[2]*outward[2]);
+                                if (nv > 1e-12 && no > 1e-12) {
+                                    cv::Vec3d vref_n = vref * (1.0/nv);
+                                    cv::Vec3d out_n = outward * (1.0/no);
+                                    nref = cv::Vec3d(
+                                        vref_n[1]*out_n[2] - vref_n[2]*out_n[1],
+                                        vref_n[2]*out_n[0] - vref_n[0]*out_n[2],
+                                        vref_n[0]*out_n[1] - vref_n[1]*out_n[0]
+                                    );
+                                    double nlen = std::sqrt(nref[0]*nref[0] + nref[1]*nref[1] + nref[2]*nref[2]);
+                                    have_nref = (nlen > 1e-12);
+                                }
+                            }
+                            if (have_nref) {
+                                normal_hint = nref;
+                            }
+                        }
+
+                        cv::Vec3d tangent_seed = pca_hints.tangent.value_or(outward);
+                        std::optional<cv::Vec3d> bitangent_seed = pca_hints.bitangent ? pca_hints.bitangent : vref_hint;
+                        std::optional<cv::Vec3d> normal_seed = pca_hints.normal ? pca_hints.normal : normal_hint;
+
+                        CandidateFrame frame = rebuild_candidate_frame(tangent_seed, bitangent_seed, normal_seed);
+
+                        if (!frame.tangent_valid || !frame.bitangent_valid) {
+                            std::cout << "[Grow:frame_invalid] p=(" << p[0] << "," << p[1]
+                                      << ") cnt=" << cnt
+                                      << " tangent_valid=" << frame.tangent_valid
+                                      << " bitangent_valid=" << frame.bitangent_valid
+                                      << std::endl;
+                            trace_params.state(p) = 0;
+                            trace_params.dpoints(p) = cv::Vec3d(-1, -1, -1);
+                            continue;
+                        }
+                        if (w_fp > 0.0f) {
+                            problem.AddResidualBlock(ForwardProgressLoss::Create(frame.tangent, w_fp), nullptr, &trace_params.dpoints(p)[0], &trace_params.dpoints(best_l)[0]);
+                        }
+
+                        const double cos_max = 0.97; // discourage near-parallel (>~14° allowed)
+                        const float w_ortho = 0.1f * w_base;
+                        if (w_ortho > 0.0f) {
+                            problem.AddResidualBlock(MovementOrthogonalityLoss::Create(frame.bitangent, cos_max, w_ortho), nullptr, &trace_params.dpoints(p)[0], &trace_params.dpoints(best_l)[0]);
+                        }
+
+                        const float w_flip = 0.1f * w_base;
+                        if (w_flip > 0.0f && frame.normal_valid) {
+                            problem.AddResidualBlock(NormalFlipLoss::Create(frame.bitangent, frame.normal, w_flip), nullptr, &trace_params.dpoints(p)[0], &trace_params.dpoints(best_l)[0]);
+                        }
+
+                        auto gather_line = [&](bool horizontal) {
+                            std::vector<cv::Vec3d> pts;
+                            int diff = horizontal ? (p[1] - best_l[1]) : (p[0] - best_l[0]);
+                            if (diff == 0)
+                                return pts;
+                            int step_sign = (diff > 0) ? -1 : 1;
+                            for (int step = 0; step <= 20; ++step) {
+                                int row = best_l[0] + (horizontal ? 0 : step_sign * step);
+                                int col = best_l[1] + (horizontal ? step_sign * step : 0);
+                                if (row < 0 || row >= trace_params.dpoints.rows || col < 0 || col >= trace_params.dpoints.cols)
+                                    break;
+                                if (!(trace_params.state(row, col) & STATE_LOC_VALID))
+                                    break;
+                                pts.push_back(trace_params.dpoints(row, col));
+                            }
+                            return pts;
+                        };
+
+                        auto row_pts = gather_line(true);
+                        auto col_pts = gather_line(false);
+                        const std::vector<cv::Vec3d>& line_pts = (row_pts.size() >= col_pts.size()) ? row_pts : col_pts;
+                        if (line_pts.size() >= 2) {
+                            const cv::Vec3d& farthest = line_pts.back();
+                            cv::Vec3d dir = b3d - farthest;
+                            double len = vec_norm(dir);
+                            if (len > 1e-9) {
+                                line_dir = dir * (1.0 / len);
+                                line_dir_valid = true;
+                            }
+                        }
+
+                        if (line_dir_valid) {
+                            const float w_line = 0.05f * w_base;
+                            if (w_line > 0.0f) {
+                                problem.AddResidualBlock(ForwardProgressLoss::Create(line_dir, w_line), nullptr, &trace_params.dpoints(p)[0], &trace_params.dpoints(best_l)[0]);
+                            }
+                        }
+                    }
+                }
+
                 std::vector<double*> parameter_blocks;
                 problem.GetParameterBlocks(&parameter_blocks);
                 for (auto& block : parameter_blocks) {
@@ -1715,6 +2095,71 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
                 ceres::Solver::Summary summary;
                 ceres::Solve(options, &problem, &summary);
+
+                // NaN/Inf guard: ensure the new point and solve stats are finite
+                {
+                    bool bad = false;
+                    const cv::Vec3d &p3d = trace_params.dpoints(p);
+                    if (!std::isfinite(p3d[0]) || !std::isfinite(p3d[1]) || !std::isfinite(p3d[2])) {
+                        std::cout << "[Grow:nan_guard] p=(" << p[0] << "," << p[1]
+                                  << ") reason=non_finite_point p3d=(" << p3d[0] << "," << p3d[1] << "," << p3d[2] << ")"
+                                  << std::endl;
+                        bad = true;
+                    }
+                    if (!std::isfinite(summary.final_cost) || !std::isfinite(summary.initial_cost)) {
+                        std::cout << "[Grow:nan_guard] p=(" << p[0] << "," << p[1]
+                                  << ") reason=non_finite_cost initial=" << summary.initial_cost
+                                  << " final=" << summary.final_cost << std::endl;
+                        bad = true;
+                    }
+                    if (bad) {
+                        // Revert placement and skip this candidate
+                        trace_params.state(p) = 0;
+                        trace_params.dpoints(p) = cv::Vec3d(-1, -1, -1);
+                        continue;
+                    }
+                }
+
+                // Duplicate placement guard: reject if new point coincides with an already placed neighbor
+                {
+                    const cv::Vec3d &p3d = trace_params.dpoints(p);
+                    double min_dist_sq = std::numeric_limits<double>::max();
+                    cv::Vec2i nearest = {-1, -1};
+                    // Check immediate 8-neighborhood
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            if (dy == 0 && dx == 0) continue;
+                            int ny = p[0] + dy;
+                            int nx = p[1] + dx;
+                            if (ny < 0 || nx < 0 || ny >= trace_params.dpoints.rows || nx >= trace_params.dpoints.cols) continue;
+                            if (!(trace_params.state(ny, nx) & STATE_LOC_VALID)) continue;
+                            const cv::Vec3d &n3d = trace_params.dpoints(ny, nx);
+                            double dx3 = p3d[0] - n3d[0];
+                            double dy3 = p3d[1] - n3d[1];
+                            double dz3 = p3d[2] - n3d[2];
+                            double d2 = dx3*dx3 + dy3*dy3 + dz3*dz3;
+                            if (d2 < min_dist_sq) {
+                                min_dist_sq = d2;
+                                nearest = {ny, nx};
+                            }
+                        }
+                    }
+                    // Treat extremely small distances as duplicates. Threshold chosen to match other zero-length guards.
+                    const double kDuplicateDistSqTh = 1e-24; // (1e-12)^2
+                    if (min_dist_sq <= kDuplicateDistSqTh) {
+                        const cv::Vec3d &n3d = trace_params.dpoints(nearest);
+                        std::cout << "[Grow:duplicate_placement] p=(" << p[0] << "," << p[1]
+                                  << ") nearest=(" << nearest[0] << "," << nearest[1]
+                                  << ") dist_sq=" << min_dist_sq
+                                  << " p3d=(" << p3d[0] << "," << p3d[1] << "," << p3d[2]
+                                  << ") n3d=(" << n3d[0] << "," << n3d[1] << "," << n3d[2] << ")"
+                                  << std::endl;
+                        // Revert placement and skip this candidate
+                        trace_params.state(p) = 0;
+                        trace_params.dpoints(p) = cv::Vec3d(-1, -1, -1);
+                        continue;
+                    }
+                }
 
                 generations(p) = generation;
 
