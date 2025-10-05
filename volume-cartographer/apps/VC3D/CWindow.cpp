@@ -1774,6 +1774,12 @@ void CWindow::UpdateVolpkgLabel(int filterCounter)
 
 void CWindow::onShowStatusMessage(QString text, int timeout)
 {
+    // If timeout is 0, persist until replaced and style as orange
+    if (timeout == 0) {
+        statusBar()->setStyleSheet(QStringLiteral("QStatusBar { color: #d97a00; }"));
+    } else {
+        statusBar()->setStyleSheet(QString());
+    }
     statusBar()->showMessage(text, timeout);
 }
 

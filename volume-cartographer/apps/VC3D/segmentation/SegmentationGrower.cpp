@@ -314,6 +314,9 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
 
     _running = true;
     _context.module->setGrowthInProgress(true);
+    if (_surfacePanel) {
+        _surfacePanel->setInteractiveEnabled(false);
+    }
 
     ActiveRequest pending;
     pending.volumeContext = volumeContext;
@@ -337,6 +340,9 @@ void SegmentationGrower::finalize(bool ok)
 {
     if (_context.module) {
         _context.module->setGrowthInProgress(false);
+    }
+    if (_surfacePanel) {
+        _surfacePanel->setInteractiveEnabled(true);
     }
     _running = false;
     _activeRequest.reset();

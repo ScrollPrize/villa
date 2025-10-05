@@ -122,6 +122,18 @@ struct StraightLoss {
         T l1 = sqrt(d1[0]*d1[0] + d1[1]*d1[1] + d1[2]*d1[2]);
         T l2 = sqrt(d2[0]*d2[0] + d2[1]*d2[1] + d2[2]*d2[2]);
 
+        // Guard degenerate segments
+        if (l1 <= T(1e-12) || l2 <= T(1e-12)) {
+            std::cout << "[StraightLoss:degenerate] l1=" << val(l1)
+                      << " l2=" << val(l2)
+                      << " a=(" << val(a[0]) << "," << val(a[1]) << "," << val(a[2]) << ")"
+                      << " b=(" << val(b[0]) << "," << val(b[1]) << "," << val(b[2]) << ")"
+                      << " c=(" << val(c[0]) << "," << val(c[1]) << "," << val(c[2]) << ")"
+                      << std::endl;
+            residual[0] = T(0);
+            return true;
+        }
+
         T dot = (d1[0]*d2[0] + d1[1]*d2[1] + d1[2]*d2[2])/(l1*l2);
         
         if (dot <= T(kStraightAngleCosThreshold)) {
@@ -488,6 +500,15 @@ struct NormalDirectionLoss {
             patch_u_disp_zyx[0] * patch_v_disp_zyx[1] - patch_u_disp_zyx[1] * patch_v_disp_zyx[0],
         };
         E const patch_normal_length = sqrt(patch_normal_zyx[0] * patch_normal_zyx[0] + patch_normal_zyx[1] * patch_normal_zyx[1] + patch_normal_zyx[2] * patch_normal_zyx[2]);
+        if (patch_normal_length < E(1e-12)) {
+            std::cout << "[NormalDir:zero_normal] len=" << val(patch_normal_length)
+                      << " base=(" << val(l_base[0]) << "," << val(l_base[1]) << "," << val(l_base[2]) << ")"
+                      << " u_off=(" << val(l_u_off[0]) << "," << val(l_u_off[1]) << "," << val(l_u_off[2]) << ")"
+                      << " v_off=(" << val(l_v_off[0]) << "," << val(l_v_off[1]) << "," << val(l_v_off[2]) << ")"
+                      << std::endl;
+            residual[0] = E(0);
+            return true;
+        }
 
         E const abs_dot = abs(patch_normal_zyx[0] * target_normal_zyx[0] + patch_normal_zyx[1] * target_normal_zyx[1] + patch_normal_zyx[2] * target_normal_zyx[2]) / patch_normal_length;
 
@@ -540,9 +561,12 @@ struct NormalConstraintPlane {
      struct PointPairCache {
          cv::Point2f p1_ = {-1, -1}, p2_ = {-1, -1};
          T payload_;
-         const vc::core::util::NormalGridVolume* grid_source = nullptr;
+         // Cache must be tied to the specific GridStore slice, not the volume.
+         const vc::core::util::GridStore* grid_source = nullptr;
+         // Legacy identity (pre-fix) used the volume pointer; keep for debug comparison.
+         const vc::core::util::NormalGridVolume* legacy_grid_source_volume = nullptr;
  
-         bool valid(const cv::Point2f& p1, const cv::Point2f& p2, float th, const vc::core::util::NormalGridVolume* current_grid_source) const {
+         bool valid(const cv::Point2f& p1, const cv::Point2f& p2, float th, const vc::core::util::GridStore* current_grid_source) const {
              if (grid_source != current_grid_source) return false;
              cv::Point2f d1 = p1 - p1_;
              cv::Point2f d2 = p2 - p2_;
@@ -551,7 +575,7 @@ struct NormalConstraintPlane {
  
          const T& get() const { return payload_; }
  
-         void put(const cv::Point2f& p1, const cv::Point2f& p2, T payload, const vc::core::util::NormalGridVolume* new_grid_source) {
+         void put(const cv::Point2f& p1, const cv::Point2f& p2, T payload, const vc::core::util::GridStore* new_grid_source) {
              p1_ = p1;
              p2_ = p2;
              payload_ = std::move(payload);
@@ -626,6 +650,14 @@ struct NormalConstraintPlane {
         // Intersection of segment C-Bn with plane P.
         T denominator = bn_rel - c_rel;
         if (ceres::abs(denominator) < T(1e-9)) {
+            // Log when the segment C-Bn is (near) parallel to the plane through A on the chosen axis.
+            std::cout << "[NCP:parallel] plane=" << plane_idx
+                      << " denom=" << val(denominator)
+                      << " bn_rel=" << val(bn_rel)
+                      << " c_rel=" << val(c_rel)
+                      << " A=(" << val(pA[0]) << "," << val(pA[1]) << "," << val(pA[2]) << ")"
+                      << " C=(" << val(pC[0]) << "," << val(pC[1]) << "," << val(pC[2]) << ")"
+                      << std::endl;
             return true; // Avoid division by zero if segment is parallel to plane.
         }
         T t = -c_rel / denominator;
@@ -691,7 +723,25 @@ struct NormalConstraintPlane {
         double cross_len = std::sqrt(cross_product[0]*cross_product[0] + cross_product[1]*cross_product[1] + cross_product[2]*cross_product[2]);
         double plane_normal_coord = cross_product[normal_axis];
         
-        double cos_angle = plane_normal_coord / (cross_len + 1e-9);
+        if (cross_len < 1e-9) {
+            std::cout << "[NCP:angle_degenerate] plane=" << plane_idx
+                      << " cross_len=" << cross_len << std::endl;
+            return true;
+        }
+
+        double cos_angle_raw = plane_normal_coord / (cross_len + 1e-9);
+        double cos_angle = cos_angle_raw;
+        // Clamp to valid cosine range to guard numerical drift; log if clamped
+        if (cos_angle > 1.0) {
+            std::cout << "[NCP:angle_clamp] plane=" << plane_idx
+                      << " cos_raw=" << cos_angle_raw << std::endl;
+            cos_angle = 1.0;
+        }
+        if (cos_angle < -1.0) {
+            std::cout << "[NCP:angle_clamp] plane=" << plane_idx
+                      << " cos_raw=" << cos_angle_raw << std::endl;
+            cos_angle = -1.0;
+        }
         double angle_weight = 1.0 - abs(cos_angle) ;// * cos_angle; // sin^2(angle)
         //good but slow?
         // double angle_weight = sqrt(1.0 - abs(cos_angle)+1e-9); // * cos_angle; // sin^2(angle)
@@ -776,6 +826,15 @@ struct NormalConstraintPlane {
 
         T edge_len_sq = edge_vec_x * edge_vec_x + edge_vec_y * edge_vec_y;
         T edge_len = ceres::sqrt(edge_len_sq);
+        if (edge_len_sq < T(1e-12)) {
+            std::cout << "[NCP:edge_zero] plane=" << plane_idx
+                      << " grid_idx=" << grid_idx
+                      << " edge_len_sq=" << val(edge_len_sq)
+                      << " p1=(" << val(p1[0]) << "," << val(p1[1]) << ")"
+                      << " p2=(" << val(p2[0]) << "," << val(p2[1]) << ")"
+                      << std::endl;
+            return T(0.0);
+        }
 
         T edge_normal_x = edge_vec_y / edge_len;
         T edge_normal_y = -edge_vec_x / edge_len;
@@ -785,11 +844,34 @@ struct NormalConstraintPlane {
 
         auto& path_cache = path_caches_[grid_idx];
 
-        if (!path_cache.valid(p1_cv, p2_cv, cache_radius_normal_, &normal_grid_volume)) {
+        // Debug: Log only when new-vs-old cache validity differs
+        // #if 0
+        // {
+        //     cv::Point2f d1 = p1_cv - path_cache.p1_;
+        //     cv::Point2f d2 = p2_cv - path_cache.p2_;
+        //     float disp2 = d1.dot(d1) + d2.dot(d2);
+        //     bool new_valid = path_cache.valid(p1_cv, p2_cv, cache_radius_normal_, &normal_grid);
+        //     bool old_valid = (path_cache.legacy_grid_source_volume == &normal_grid_volume) && (disp2 < cache_radius_normal_ * cache_radius_normal_);
+        //     if (new_valid != old_valid) {
+        //         std::cout << "[NormalConstraintPlane:path] plane=" << plane_idx
+        //                   << " grid_idx=" << grid_idx
+        //                   << " new_gridstore=" << (const void*)(&normal_grid)
+        //                   << " old_volume=" << (const void*)(&normal_grid_volume)
+        //                   << " disp2=" << disp2
+        //                   << " th2=" << (cache_radius_normal_ * cache_radius_normal_)
+        //                   << " new_valid=" << new_valid
+        //                   << " old_valid=" << old_valid
+        //                   << std::endl;
+        //     }
+        // }
+        // #endif
+
+        if (!path_cache.valid(p1_cv, p2_cv, cache_radius_normal_, &normal_grid)) {
             cv::Point2f midpoint_cv = 0.5f * (p1_cv + p2_cv);
             auto raw_paths = normal_grid.get(midpoint_cv, query_radius_);
             auto filtered_paths = filter_and_split_paths(raw_paths, p1_cv, p2_cv);
-            path_cache.put(p1_cv, p2_cv, std::move(filtered_paths), &normal_grid_volume);
+            path_cache.put(p1_cv, p2_cv, std::move(filtered_paths), &normal_grid);
+            path_cache.legacy_grid_source_volume = &normal_grid_volume;
             // Invalidate snapping cache whenever the path cache is updated
             snap_loss_caches_[grid_idx] = {};
         }
@@ -845,7 +927,29 @@ struct NormalConstraintPlane {
             return T(w_normal)*normal_loss;
 
         auto& snap_cache = snap_loss_caches_[grid_idx];
-        if (!snap_cache.valid(p1_cv, p2_cv, cache_radius_snap_, &normal_grid_volume)) {
+        // Debug: Log only when new-vs-old cache validity differs
+        // #if 0
+        // {
+        //     cv::Point2f d1s = p1_cv - snap_cache.p1_;
+        //     cv::Point2f d2s = p2_cv - snap_cache.p2_;
+        //     float disp2s = d1s.dot(d1s) + d2s.dot(d2s);
+        //     bool new_valid_s = snap_cache.valid(p1_cv, p2_cv, cache_radius_snap_, &normal_grid);
+        //     bool old_valid_s = (snap_cache.legacy_grid_source_volume == &normal_grid_volume) && (disp2s < cache_radius_snap_ * cache_radius_snap_);
+        //     if (new_valid_s != old_valid_s) {
+        //         std::cout << "[NormalConstraintPlane:snap] plane=" << plane_idx
+        //                   << " grid_idx=" << grid_idx
+        //                   << " new_gridstore=" << (const void*)(&normal_grid)
+        //                   << " old_volume=" << (const void*)(&normal_grid_volume)
+        //                   << " disp2=" << disp2s
+        //                   << " th2=" << (cache_radius_snap_ * cache_radius_snap_)
+        //                   << " new_valid=" << new_valid_s
+        //                   << " old_valid=" << old_valid_s
+        //                   << std::endl;
+        //     }
+        // }
+        // #endif
+
+        if (!snap_cache.valid(p1_cv, p2_cv, cache_radius_snap_, &normal_grid)) {
             SnapLossPayload payload;
             float closest_dist_norm = std::numeric_limits<float>::max();
  
@@ -883,7 +987,8 @@ struct NormalConstraintPlane {
                      }
                  }
              }
-            snap_cache.put(p1_cv, p2_cv, payload, &normal_grid_volume);
+            snap_cache.put(p1_cv, p2_cv, payload, &normal_grid);
+            snap_cache.legacy_grid_source_volume = &normal_grid_volume;
         }
 
         const auto& snap_payload = snap_cache.get();
@@ -1180,7 +1285,7 @@ private:
         double dz_proj = proj_val[2] - p_val[2];
         double dist_proj_to_corner = std::sqrt(dx_proj*dx_proj + dy_proj*dy_proj + dz_proj*dz_proj);
 
-        // Linear falloff from 1 to 0 over a distance of 80
+        // Linear falloff from 1 to 0 over a distance of 40
         double weight = std::max(0.0, 1.0 - dist_proj_to_corner / 40.0);
 
         if (dbg_)

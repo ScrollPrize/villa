@@ -5,6 +5,7 @@
 #include "overlays/SegmentationOverlayController.hpp"
 
 #include <QLoggingCategory>
+#include <QMessageBox>
 
 bool SegmentationModule::beginEditingSession(QuadSurface* surface)
 {
@@ -69,7 +70,28 @@ void SegmentationModule::endEditingSession()
 
 void SegmentationModule::onSurfaceCollectionChanged(std::string name, Surface* surface)
 {
-    if (name != "segmentation" || !_editingEnabled || _ignoreSegSurfaceChange) {
+    if (name != "segmentation" || _ignoreSegSurfaceChange) {
+        return;
+    }
+
+    // If growth is running, prevent switching the active segmentation surface.
+    if (_growthInProgress) {
+        QuadSurface* previewSurface = _editManager ? _editManager->previewSurface() : nullptr;
+        QuadSurface* baseSurface = _editManager ? _editManager->baseSurface() : nullptr;
+        QuadSurface* target = previewSurface ? previewSurface : baseSurface;
+
+        if (_surfaces && target && surface != target) {
+            const bool previousGuard = _ignoreSegSurfaceChange;
+            _ignoreSegSurfaceChange = true;
+            _surfaces->setSurface("segmentation", target);
+            _ignoreSegSurfaceChange = previousGuard;
+            emit statusMessageRequested(tr("Cannot switch active surface while growth is running."),
+                                        0);
+        }
+        return;
+    }
+
+    if (!_editingEnabled) {
         return;
     }
 

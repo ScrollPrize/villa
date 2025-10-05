@@ -431,6 +431,65 @@ void SurfacePanelController::handleTreeSelectionChanged()
     const QString idQString = firstSelected->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
     const std::string id = idQString.toStdString();
 
+    // Prevent switching the active segmentation surface while growth is running
+    if (_viewerManager && _viewerManager->segmentationGrowthInProgress()) {
+        // Determine the target surface for this selection
+        OpChain* selChain = ensureOpChainFor(id);
+        QuadSurface* selSurface = selChain ? selChain->src() : nullptr;
+        if (!selSurface && _volumePkg) {
+            if (auto surfMeta = _volumePkg->getSurface(id)) {
+                selSurface = surfMeta->surface();
+            }
+        }
+
+        QuadSurface* activeSegSurface = nullptr;
+        if (_surfaces) {
+            activeSegSurface = dynamic_cast<QuadSurface*>(_surfaces->surface("segmentation"));
+        }
+
+        if (selSurface && activeSegSurface && selSurface != activeSegSurface) {
+            // Revert selection to the currently active segmentation surface
+            QTreeWidgetItem* match = nullptr;
+            QTreeWidgetItemIterator it(_ui.treeWidget);
+            while (*it) {
+                const auto itemId = (*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
+                if (!itemId.isEmpty()) {
+                    OpChain* chain = ensureOpChainFor(itemId.toStdString());
+                    QuadSurface* itemSurface = chain ? chain->src() : nullptr;
+                    if (!itemSurface && _volumePkg) {
+                        if (auto meta = _volumePkg->getSurface(itemId.toStdString())) {
+                            itemSurface = meta->surface();
+                        }
+                    }
+                    if (itemSurface == activeSegSurface) {
+                        match = *it;
+                        break;
+                    }
+                }
+                ++it;
+            }
+
+            const QSignalBlocker blocker{_ui.treeWidget};
+            if (match) {
+                _ui.treeWidget->setCurrentItem(match);
+                match->setSelected(true);
+            } else if (!_currentSurfaceId.empty()) {
+                // Fallback: reselect the previously active surface ID
+                QTreeWidgetItemIterator it2(_ui.treeWidget);
+                while (*it2) {
+                    if ((*it2)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() == _currentSurfaceId) {
+                        _ui.treeWidget->setCurrentItem(*it2);
+                        (*it2)->setSelected(true);
+                        break;
+                    }
+                    ++it2;
+                }
+            }
+            emit statusMessageRequested(tr("Cannot switch active surface while growth is running."), 0);
+            return;
+        }
+    }
+
     OpChain* chain = ensureOpChainFor(id);
     QuadSurface* surface = chain ? chain->src() : nullptr;
 
@@ -801,6 +860,39 @@ void SurfacePanelController::reloadSurfacesFromDisk()
 void SurfacePanelController::refreshFiltersOnly()
 {
     applyFilters();
+}
+
+void SurfacePanelController::setInteractiveEnabled(bool enabled)
+{
+    if (_ui.treeWidget) {
+        _ui.treeWidget->setEnabled(enabled);
+    }
+    if (_ui.reloadButton) {
+        _ui.reloadButton->setEnabled(enabled);
+    }
+
+    // Filters group
+    if (_filters.dropdown) { _filters.dropdown->setEnabled(enabled); }
+    if (_filters.focusPoints) { _filters.focusPoints->setEnabled(enabled); }
+    if (_filters.pointSet) { _filters.pointSet->setEnabled(enabled); }
+    if (_filters.pointSetAll) { _filters.pointSetAll->setEnabled(enabled); }
+    if (_filters.pointSetNone) { _filters.pointSetNone->setEnabled(enabled); }
+    if (_filters.pointSetMode) { _filters.pointSetMode->setEnabled(enabled); }
+    if (_filters.unreviewed) { _filters.unreviewed->setEnabled(enabled); }
+    if (_filters.revisit) { _filters.revisit->setEnabled(enabled); }
+    if (_filters.noExpansion) { _filters.noExpansion->setEnabled(enabled); }
+    if (_filters.noDefective) { _filters.noDefective->setEnabled(enabled); }
+    if (_filters.partialReview) { _filters.partialReview->setEnabled(enabled); }
+    if (_filters.hideUnapproved) { _filters.hideUnapproved->setEnabled(enabled); }
+    if (_filters.inspectOnly) { _filters.inspectOnly->setEnabled(enabled); }
+    if (_filters.currentOnly) { _filters.currentOnly->setEnabled(enabled); }
+
+    // Tags group
+    if (_tags.approved) { _tags.approved->setEnabled(enabled); }
+    if (_tags.defective) { _tags.defective->setEnabled(enabled); }
+    if (_tags.reviewed) { _tags.reviewed->setEnabled(enabled); }
+    if (_tags.revisit) { _tags.revisit->setEnabled(enabled); }
+    if (_tags.inspect) { _tags.inspect->setEnabled(enabled); }
 }
 
 void SurfacePanelController::connectFilterSignals()

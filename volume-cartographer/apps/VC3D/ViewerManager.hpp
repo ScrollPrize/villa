@@ -76,6 +76,9 @@ public:
 
     void forEachViewer(const std::function<void(CVolumeViewer*)>& fn) const;
 
+    // Query segmentation growth state (via attached SegmentationModule)
+    bool segmentationGrowthInProgress() const;
+
 signals:
     void viewerCreated(CVolumeViewer* viewer);
     void overlayWindowChanged(float low, float high);

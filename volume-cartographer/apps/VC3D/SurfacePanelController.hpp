@@ -97,6 +97,8 @@ public:
     bool toggleTag(Tag tag);
     void reloadSurfacesFromDisk();
     void refreshFiltersOnly();
+    // Enable/disable interaction with the surface panel UI (greys out when disabled)
+    void setInteractiveEnabled(bool enabled);
 
 signals:
     void surfacesLoaded();

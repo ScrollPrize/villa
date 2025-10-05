@@ -153,6 +153,11 @@ void ViewerManager::setPointsOverlay(PointsOverlayController* overlay)
     _pointsOverlay->bindToViewerManager(this);
 }
 
+bool ViewerManager::segmentationGrowthInProgress() const
+{
+    return _segmentationModule && _segmentationModule->growthInProgress();
+}
+
 void ViewerManager::setPathsOverlay(PathsOverlayController* overlay)
 {
     _pathsOverlay = overlay;

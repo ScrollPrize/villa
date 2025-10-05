@@ -42,6 +42,7 @@ class QKeyEvent;
 class SegmentationBrushTool;
 class SegmentationLineTool;
 class SegmentationPushPullTool;
+class QDialog;
 
 class SegmentationModule : public QObject
 {
@@ -184,6 +185,10 @@ private:
     void deactivateInvalidationBrush();
     void clearLineDragStroke();
 
+    // Growth guard notice
+    void showGrowthGuardDialog();
+    void hideGrowthGuardDialog();
+
     void handleMousePress(CVolumeViewer* viewer,
                           const cv::Vec3f& worldPos,
                           const cv::Vec3f& surfaceNormal,
@@ -266,4 +271,6 @@ private:
 
     segmentation::UndoHistory _undoHistory;
     bool _suppressUndoCapture{false};
+
+    // No persistent dialog state needed
 };

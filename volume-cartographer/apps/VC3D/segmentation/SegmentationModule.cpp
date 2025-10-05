@@ -16,6 +16,7 @@
 
 #include <QLoggingCategory>
 #include <QPointer>
+//
 
 #include <algorithm>
 #include <cmath>
@@ -391,6 +392,10 @@ void SegmentationModule::setGrowthInProgress(bool running)
         deactivateInvalidationBrush();
         clearLineDragStroke();
         _lineDrawKeyActive = false;
+        showGrowthGuardDialog();
+    }
+    if (!running) {
+        hideGrowthGuardDialog();
     }
     updateCorrectionsWidget();
 }
@@ -519,6 +524,17 @@ void SegmentationModule::refreshOverlay()
     state.displayRadiusSteps = falloffRadius(overlayTool);
 
     _overlay->applyState(state);
+}
+
+void SegmentationModule::showGrowthGuardDialog()
+{
+    emit statusMessageRequested(tr("Growth running: surface panel disabled; cannot switch active surface."),
+                                0);
+}
+
+void SegmentationModule::hideGrowthGuardDialog()
+{
+    // No persistent dialog to close; noop
 }
 
 
