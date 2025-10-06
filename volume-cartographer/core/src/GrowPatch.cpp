@@ -205,7 +205,7 @@ struct LossSettings {
 
     LossSettings() {
         w[LossType::SNAP] = 0.1f;
-        w[LossType::NORMAL] = 1.0f;
+        w[LossType::NORMAL] = 10.0f;
         w[LossType::STRAIGHT] = 0.2f;
         w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 1.0f;
