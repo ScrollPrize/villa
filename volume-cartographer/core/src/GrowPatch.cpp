@@ -940,7 +940,10 @@ static void inpaint(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParam
     for (int y = 0; y < roi.height; ++y) {
         for (int x = 0; x < roi.width; ++x) {
             if (!mask(y, x)) {
-                params.state(roi.y + y, roi.x + x) = STATE_LOC_VALID | STATE_COORD_VALID;
+                cv::Vec3d &pt = params.dpoints(roi.y + y, roi.x + x);
+                if (pt[0] != -1) {
+                    params.state(roi.y + y, roi.x + x) = STATE_LOC_VALID | STATE_COORD_VALID;
+                }
             }
         }
     }
@@ -1620,41 +1623,106 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 #pragma omp parallel for schedule(dynamic)
         for (int i = 0; i < contours.size(); i++) {
             if (hierarchy[i][3] != -1) { // It's a hole
-                cv::Rect roi = cv::boundingRect(contours[i]);
-                
-                int margin = 4;
-                roi.x = std::max(0, roi.x - margin);
-                roi.y = std::max(0, roi.y - margin);
-                roi.width = std::min(hole_mask.cols - roi.x, roi.width + 2 * margin);
-                roi.height = std::min(hole_mask.rows - roi.y, roi.height + 2 * margin);
+                const int base_margin = 4;
+                const int required_border = 2;
 
+                cv::Rect contour_bbox = cv::boundingRect(contours[i]);
                 // std::cout << hole_mask.size() << trace_params.state.size() << resume_pad_x << "x" << resume_pad_y << std::endl;
+                cv::Rect roi = contour_bbox;
+                cv::Rect fallback_candidate = contour_bbox;
+                cv::Mat_<uchar> inpaint_mask;
+                bool mask_ready = false;
 
-                // cv::Point testp(2492+resume_pad_x, 508+resume_pad_y);
-                // cv::Point testp(2500+resume_pad_x, 566+resume_pad_y);
-                // cv::Point testp(2340+resume_pad_x, 577+resume_pad_y);
-
-                // cv::rectangle(vis, roi, cv::Scalar(255,255,255));
-
-                // if (!roi.contains(testp)) {
-                //     // std::cout << "skip " << roi << std::endl;
-                //     continue;
-                // }
-
-                cv::Mat_<uchar> inpaint_mask(roi.size(), (uchar)1);
-                
                 std::vector<cv::Point> hole_contour_roi;
-                for(const auto& p : contours[i]) {
-                    hole_contour_roi.push_back({p.x - roi.x, p.y - roi.y});
+                hole_contour_roi.reserve(contours[i].size());
+
+                auto build_mask = [&](const cv::Rect &candidate, std::vector<cv::Point> &contour_roi, cv::Mat_<uchar> &mask_out) {
+                    contour_roi.clear();
+                    contour_roi.reserve(contours[i].size());
+                    for (const auto &p : contours[i]) {
+                        contour_roi.emplace_back(p.x - candidate.x, p.y - candidate.y);
+                    }
+                    mask_out.create(candidate.size());
+                    mask_out.setTo((uchar)1);
+                    std::vector<std::vector<cv::Point>> fill = {contour_roi};
+                    cv::fillPoly(mask_out, fill, cv::Scalar(0));
+                };
+
+                auto has_safe_border = [&](const cv::Mat_<uchar> &mask) {
+                    for (int y = 0; y < mask.rows; ++y) {
+                        for (int x = 0; x < mask.cols; ++x) {
+                            if ((y < required_border || y >= mask.rows - required_border ||
+                                 x < required_border || x >= mask.cols - required_border) && mask(y, x) == 0) {
+                                return false;
+                            }
+                        }
+                    }
+                    return true;
+                };
+
+                for (int extra = 0; extra <= 8 && !mask_ready; extra += 2) {
+                    cv::Rect candidate = contour_bbox;
+                    int margin = base_margin + extra;
+                    candidate.x = std::max(0, candidate.x - margin);
+                    candidate.y = std::max(0, candidate.y - margin);
+                    candidate.width = std::min(hole_mask.cols - candidate.x, candidate.width + 2 * margin);
+                    candidate.height = std::min(hole_mask.rows - candidate.y, candidate.height + 2 * margin);
+
+                    build_mask(candidate, hole_contour_roi, inpaint_mask);
+                    fallback_candidate = candidate;
+
+                    if (has_safe_border(inpaint_mask)) {
+                        roi = candidate;
+                        mask_ready = true;
+                    }
                 }
-                std::vector<std::vector<cv::Point>> contours_to_fill = {hole_contour_roi};
-                cv::fillPoly(inpaint_mask, contours_to_fill, cv::Scalar(0));
+
+                if (!mask_ready) {
+                    cv::Rect candidate = fallback_candidate;
+
+                    build_mask(candidate, hole_contour_roi, inpaint_mask);
+
+                    cv::Mat hole_roi(inpaint_mask.size(), CV_8U, cv::Scalar(0));
+                    std::vector<std::vector<cv::Point>> fill = {hole_contour_roi};
+                    cv::fillPoly(hole_roi, fill, cv::Scalar(255));
+
+                    int erosion_iters = required_border;
+                    if (erosion_iters > 0) {
+                        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+                        cv::erode(hole_roi, hole_roi, kernel, cv::Point(-1, -1), erosion_iters);
+                    }
+
+                    if (cv::countNonZero(hole_roi) == 0) {
+#pragma omp atomic
+                        inpaint_skip++;
+                        continue;
+                    }
+
+                    inpaint_mask.create(hole_roi.size());
+                    inpaint_mask.setTo((uchar)1);
+                    inpaint_mask.setTo((uchar)0, hole_roi == 255);
+
+                    if (!has_safe_border(inpaint_mask)) {
+#pragma omp atomic
+                        inpaint_skip++;
+                        continue;
+                    }
+
+                    roi = candidate;
+                    mask_ready = true;
+                }
+
+                if (!mask_ready) {
+#pragma omp atomic
+                    inpaint_skip++;
+                    continue;
+                }
 
                 // std::cout << "Inpainting hole at " << roi << " - " << inpaint_count << "+" << inpaint_skip << "/" << contours.size() << std::endl;
                 inpaint(roi, inpaint_mask, trace_params, trace_data);
 
 #pragma omp critical
-                if (inpaint_count % snapshot_interval == 0 && !tgt_path.empty() && snapshot_interval > 0) {
+                if (snapshot_interval > 0 && !tgt_path.empty() && inpaint_count % snapshot_interval == 0) {
                     QuadSurface* surf = create_surface_from_state();
                     surf->save(tgt_path, true);
                     delete surf;
