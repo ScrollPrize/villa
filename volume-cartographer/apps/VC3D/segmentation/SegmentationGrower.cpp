@@ -507,6 +507,36 @@ void SegmentationGrower::onFutureFinished()
 
     synchronizeSurfaceMeta(request.volumeContext.package, currentSegSurface, _surfacePanel);
 
+    if (_surfacePanel) {
+        std::vector<std::string> idsToRefresh;
+        idsToRefresh.reserve(surfacesToUpdate.size() + 1);
+
+        auto maybeAddId = [&idsToRefresh](QuadSurface* surface) {
+            if (!surface) {
+                return;
+            }
+            const std::string& surfaceId = surface->id;
+            if (surfaceId.empty()) {
+                return;
+            }
+            if (std::find(idsToRefresh.begin(), idsToRefresh.end(), surfaceId) == idsToRefresh.end()) {
+                idsToRefresh.push_back(surfaceId);
+            }
+        };
+
+        for (QuadSurface* surface : surfacesToUpdate) {
+            maybeAddId(surface);
+        }
+        maybeAddId(currentSegSurface);
+        if (_context.module && _context.module->hasActiveSession()) {
+            maybeAddId(_context.module->activeBaseSurface());
+        }
+
+        for (const auto& id : idsToRefresh) {
+            _surfacePanel->refreshSurfaceMetrics(id);
+        }
+    }
+
     if (_callbacks.applySliceOrientation) {
         _callbacks.applySliceOrientation(currentSegSurface);
     }
