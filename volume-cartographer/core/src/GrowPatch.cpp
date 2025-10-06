@@ -1130,6 +1130,59 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         auto surf = new QuadSurface(points_crop, {1/T, 1/T});
         surf->setChannel("generations", generations_crop);
 
+        if (params.value("vis_losses", false)) {
+            cv::Mat_<float> loss_dist(generations_crop.size(), 0.0f);
+            cv::Mat_<float> loss_straight(generations_crop.size(), 0.0f);
+            cv::Mat_<float> loss_normal(generations_crop.size(), 0.0f);
+            cv::Mat_<float> loss_snap(generations_crop.size(), 0.0f);
+            cv::Mat_<float> loss_sdir(generations_crop.size(), 0.0f);
+
+#pragma omp paralle for schedule(dynamic)
+            for (int y = 0; y < generations_crop.rows; ++y) {
+                for (int x = 0; x < generations_crop.cols; ++x) {
+                    cv::Vec2i p = {used_area_safe.y + y, used_area_safe.x + x};
+                    if (generations(p) > 0) {
+                        ceres::Problem problem_dist, problem_straight, problem_normal, problem_snap, problem_sdir;
+                        
+                        LossSettings settings_dist, settings_straight, settings_normal, settings_snap, settings_sdir;
+                        
+                        settings_dist[DIST] = 1.0;
+                        add_losses(problem_dist, p, trace_params, trace_data, settings_dist, LOSS_DIST);
+                        
+                        settings_straight[STRAIGHT] = 1.0;
+                        add_losses(problem_straight, p, trace_params, trace_data, settings_straight, LOSS_STRAIGHT);
+                        
+                        settings_normal[NORMAL] = 1.0;
+                        add_losses(problem_normal, p, trace_params, trace_data, settings_normal, LOSS_NORMALSNAP);
+
+                        settings_snap[SNAP] = 1.0;
+                        add_losses(problem_snap, p, trace_params, trace_data, settings_snap, LOSS_NORMALSNAP);
+
+                        settings_sdir[SDIR] = 1.0;
+                        add_losses(problem_sdir, p, trace_params, trace_data, settings_sdir, LOSS_SDIR);
+
+                        double cost_dist = 0, cost_straight = 0, cost_normal = 0, cost_snap = 0, cost_sdir = 0;
+                        problem_dist.Evaluate(ceres::Problem::EvaluateOptions(), &cost_dist, nullptr, nullptr, nullptr);
+                        problem_straight.Evaluate(ceres::Problem::EvaluateOptions(), &cost_straight, nullptr, nullptr, nullptr);
+                        problem_normal.Evaluate(ceres::Problem::EvaluateOptions(), &cost_normal, nullptr, nullptr, nullptr);
+                        problem_snap.Evaluate(ceres::Problem::EvaluateOptions(), &cost_snap, nullptr, nullptr, nullptr);
+                        problem_sdir.Evaluate(ceres::Problem::EvaluateOptions(), &cost_sdir, nullptr, nullptr, nullptr);
+
+                        loss_dist(y, x) = sqrt(cost_dist);
+                        loss_straight(y, x) = sqrt(cost_straight);
+                        loss_normal(y, x) = sqrt(cost_normal);
+                        loss_snap(y, x) = sqrt(cost_snap);
+                        loss_sdir(y, x) = sqrt(cost_sdir);
+                    }
+                }
+            }
+            surf->setChannel("loss_dist", loss_dist);
+            surf->setChannel("loss_straight", loss_straight);
+            surf->setChannel("loss_normal", loss_normal);
+            surf->setChannel("loss_snap", loss_snap);
+            surf->setChannel("loss_sdir", loss_sdir);
+        }
+
         const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
         const double voxel_size_d = static_cast<double>(voxelsize);
         const double area_est_cm2 = area_est_vx2 * voxel_size_d * voxel_size_d / 1e8;
