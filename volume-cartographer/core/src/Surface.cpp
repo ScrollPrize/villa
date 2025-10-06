@@ -1536,7 +1536,7 @@ SurfaceMeta::SurfaceMeta(const std::filesystem::path &path_) : path(path_)
 
 SurfaceMeta::~SurfaceMeta()
 {
-    if (_surf) {
+    if (_surf && _ownsSurface) {
         delete _surf;
     }
 
@@ -1558,14 +1558,21 @@ void SurfaceMeta::readOverlapping()
 
 QuadSurface *SurfaceMeta::surface()
 {
-    if (!_surf)
+    if (!_surf) {
         _surf = load_quad_from_tifxyz(path);
+        _ownsSurface = true;
+    }
     return _surf;
 }
 
-void SurfaceMeta::setSurface(QuadSurface *surf)
+void SurfaceMeta::setSurface(QuadSurface *surf, bool takeOwnership)
 {
+    if (_surf && _ownsSurface && _surf != surf) {
+        delete _surf;
+    }
+
     _surf = surf;
+    _ownsSurface = takeOwnership && (surf != nullptr);
 }
 
 std::string SurfaceMeta::name()

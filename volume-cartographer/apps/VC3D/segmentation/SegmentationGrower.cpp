@@ -505,7 +505,8 @@ void SegmentationGrower::onFutureFinished()
         currentSegSurface = request.segmentationSurface;
     }
 
-    synchronizeSurfaceMeta(request.volumeContext.package, currentSegSurface, _surfacePanel);
+    QuadSurface* metaSurface = surfaceToPersist ? surfaceToPersist : request.segmentationSurface;
+    synchronizeSurfaceMeta(request.volumeContext.package, metaSurface, _surfacePanel);
 
     if (_surfacePanel) {
         std::vector<std::string> idsToRefresh;
