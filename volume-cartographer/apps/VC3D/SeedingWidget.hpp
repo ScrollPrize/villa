@@ -14,6 +14,7 @@
 #include <memory>
 
 #include "CSurfaceCollection.hpp"
+#include "elements/ProgressUtil.hpp"
 #include "overlays/ViewerOverlayControllerBase.hpp"
 
 using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
@@ -120,6 +121,7 @@ private:
     QPushButton* cancelButton;
     QPushButton* labelWrapsButton;
     QProgressBar* progressBar;
+    ProgressUtil* progressUtil;
     
     // Data
     std::shared_ptr<VolumePkg> fVpkg;

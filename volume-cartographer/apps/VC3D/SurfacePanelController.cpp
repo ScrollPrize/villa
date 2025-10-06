@@ -32,6 +32,7 @@
 #include <QVector>
 
 #include <iostream>
+#include <algorithm>
 #include <unordered_set>
 #include <set>
 #include <filesystem>
@@ -415,6 +416,50 @@ void SurfacePanelController::handleTreeSelectionChanged()
     }
 
     const QList<QTreeWidgetItem*> selectedItems = _ui.treeWidget->selectedItems();
+
+    if (_selectionLocked) {
+        QStringList currentIds;
+        currentIds.reserve(selectedItems.size());
+        for (auto* item : selectedItems) {
+            if (!item) {
+                continue;
+            }
+            const QString id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
+            if (!id.isEmpty()) {
+                currentIds.append(id);
+            }
+        }
+
+        QStringList normalizedCurrent = currentIds;
+        QStringList normalizedLocked = _lockedSelectionIds;
+        std::sort(normalizedCurrent.begin(), normalizedCurrent.end());
+        std::sort(normalizedLocked.begin(), normalizedLocked.end());
+
+        if (normalizedCurrent != normalizedLocked) {
+            const QSignalBlocker blocker{_ui.treeWidget};
+            _ui.treeWidget->clearSelection();
+            for (const QString& id : _lockedSelectionIds) {
+                if (id.isEmpty()) {
+                    continue;
+                }
+                QTreeWidgetItemIterator it(_ui.treeWidget);
+                while (*it) {
+                    if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() == id) {
+                        (*it)->setSelected(true);
+                        break;
+                    }
+                    ++it;
+                }
+            }
+            if (!_selectionLockNotified) {
+                _selectionLockNotified = true;
+                constexpr int kLockNoticeMs = 3000;
+                emit statusMessageRequested(tr("Surface selection is locked while growth runs."), kLockNoticeMs);
+            }
+        }
+        return;
+    }
+
     if (selectedItems.isEmpty()) {
         _currentSurfaceId.clear();
         resetTagUi();
@@ -801,6 +846,41 @@ void SurfacePanelController::reloadSurfacesFromDisk()
 void SurfacePanelController::refreshFiltersOnly()
 {
     applyFilters();
+}
+
+void SurfacePanelController::setSelectionLocked(bool locked)
+{
+    if (_selectionLocked == locked) {
+        return;
+    }
+
+    _selectionLocked = locked;
+    _lockedSelectionIds.clear();
+    _selectionLockNotified = false;
+
+    if (_ui.reloadButton) {
+        _ui.reloadButton->setDisabled(locked);
+    }
+
+    if (!_ui.treeWidget) {
+        return;
+    }
+
+    _ui.treeWidget->setDisabled(locked);
+
+    if (locked) {
+        const QList<QTreeWidgetItem*> selectedItems = _ui.treeWidget->selectedItems();
+        _lockedSelectionIds.reserve(selectedItems.size());
+        for (auto* item : selectedItems) {
+            if (!item) {
+                continue;
+            }
+            const QString id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
+            if (!id.isEmpty()) {
+                _lockedSelectionIds.append(id);
+            }
+        }
+    }
 }
 
 void SurfacePanelController::connectFilterSignals()

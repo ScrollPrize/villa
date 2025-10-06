@@ -379,6 +379,9 @@ void SegmentationModule::markNextEditsFromGrowth()
 
 void SegmentationModule::setGrowthInProgress(bool running)
 {
+    if (_growthInProgress == running) {
+        return;
+    }
     _growthInProgress = running;
     if (_widget) {
         _widget->setGrowthInProgress(running);
@@ -393,6 +396,7 @@ void SegmentationModule::setGrowthInProgress(bool running)
         _lineDrawKeyActive = false;
     }
     updateCorrectionsWidget();
+    emit growthInProgressChanged(_growthInProgress);
 }
 
 void SegmentationModule::emitPendingChanges()

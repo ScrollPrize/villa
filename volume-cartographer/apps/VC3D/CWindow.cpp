@@ -21,6 +21,8 @@
 #include <QFutureWatcher>
 #include <QRegularExpressionValidator>
 #include <QDockWidget>
+#include <QLabel>
+#include <QSizePolicy>
 #include <QProcess>
 #include <QTemporaryDir>
 #include <QToolBar>
@@ -1173,6 +1175,8 @@ void CWindow::CreateWidgets(void)
             this, &CWindow::onShowStatusMessage);
     connect(_segmentationModule.get(), &SegmentationModule::stopToolsRequested,
             this, &CWindow::onSegmentationStopToolsRequested);
+    connect(_segmentationModule.get(), &SegmentationModule::growthInProgressChanged,
+            this, &CWindow::onSegmentationGrowthStatusChanged);
     connect(_segmentationModule.get(), &SegmentationModule::focusPoiRequested,
             this, [this](const cv::Vec3f& position, QuadSurface* base) {
                 Q_UNUSED(position);
@@ -1775,6 +1779,42 @@ void CWindow::UpdateVolpkgLabel(int filterCounter)
 void CWindow::onShowStatusMessage(QString text, int timeout)
 {
     statusBar()->showMessage(text, timeout);
+}
+
+void CWindow::onSegmentationGrowthStatusChanged(bool running)
+{
+    if (!statusBar()) {
+        return;
+    }
+
+    if (_surfacePanel) {
+        _surfacePanel->setSelectionLocked(running);
+    }
+
+    if (running) {
+        if (!_segmentationGrowthWarning) {
+            _segmentationGrowthWarning = new QLabel(statusBar());
+            _segmentationGrowthWarning->setObjectName(QStringLiteral("segmentationGrowthWarning"));
+            _segmentationGrowthWarning->setStyleSheet(QStringLiteral("color: #c62828; font-weight: 600;"));
+            _segmentationGrowthWarning->setContentsMargins(8, 0, 8, 0);
+            _segmentationGrowthWarning->setAlignment(Qt::AlignCenter);
+            _segmentationGrowthWarning->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+            _segmentationGrowthWarning->setMinimumWidth(260);
+            _segmentationGrowthWarning->hide();
+            statusBar()->addPermanentWidget(_segmentationGrowthWarning, 1);
+        }
+        _segmentationGrowthStatusText = tr("Surface growth in progress - surface selection locked");
+        _segmentationGrowthWarning->setText(_segmentationGrowthStatusText);
+        _segmentationGrowthWarning->setVisible(true);
+        statusBar()->showMessage(_segmentationGrowthStatusText, 0);
+    } else if (_segmentationGrowthWarning) {
+        _segmentationGrowthWarning->clear();
+        _segmentationGrowthWarning->setVisible(false);
+        if (statusBar()->currentMessage() == _segmentationGrowthStatusText) {
+            statusBar()->clearMessage();
+        }
+        _segmentationGrowthStatusText.clear();
+    }
 }
 
 std::filesystem::path seg_path_name(const std::filesystem::path &path)

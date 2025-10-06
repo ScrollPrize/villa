@@ -121,6 +121,7 @@ signals:
                               SegmentationGrowthDirection direction,
                               int steps,
                               bool inpaintOnly);
+    void growthInProgressChanged(bool running);
 
 private:
     friend class SegmentationBrushTool;
