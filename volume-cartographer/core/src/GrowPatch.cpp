@@ -29,6 +29,11 @@
 #include "vc/tracer/Tracer.hpp"
 #include "vc/ui/VCCollection.hpp"
 
+#define LOSS_STRAIGHT 1
+#define LOSS_DIST 2
+#define LOSS_NORMALSNAP 4
+#define LOSS_SDIR 8
+
 namespace { // Anonymous namespace for local helpers
 
 std::optional<uint32_t> environment_seed()
@@ -630,8 +635,8 @@ static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<u
 static int conditional_corr_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
                                  ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, TraceParameters &trace_params);
 
-static int add_continuous_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params,
-    const TraceData &trace_data, const LossSettings &settings)
+static int add_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params,
+    const TraceData &trace_data, const LossSettings &settings, int flags = LOSS_STRAIGHT | LOSS_DIST)
 {
     //generate losses for point p
     int count = 0;
@@ -639,48 +644,56 @@ static int add_continuous_losses(ceres::Problem &problem, const cv::Vec2i &p, Tr
     if (p[0] < 2 || p[1] < 2 || p[1] >= params.state.cols-2 || p[0] >= params.state.rows-2)
         throw std::runtime_error("point too close to problem border!");
 
-    //horizontal
-    count += gen_straight_loss(problem, p, {0,-2},{0,-1},{0,0}, params, settings);
-    count += gen_straight_loss(problem, p, {0,-1},{0,0},{0,1}, params, settings);
-    count += gen_straight_loss(problem, p, {0,0},{0,1},{0,2}, params, settings);
+    if (flags & LOSS_STRAIGHT) {
+        //horizontal
+        count += gen_straight_loss(problem, p, {0,-2},{0,-1},{0,0}, params, settings);
+        count += gen_straight_loss(problem, p, {0,-1},{0,0},{0,1}, params, settings);
+        count += gen_straight_loss(problem, p, {0,0},{0,1},{0,2}, params, settings);
 
-    //vertical
-    count += gen_straight_loss(problem, p, {-2,0},{-1,0},{0,0}, params, settings);
-    count += gen_straight_loss(problem, p, {-1,0},{0,0},{1,0}, params, settings);
-    count += gen_straight_loss(problem, p, {0,0},{1,0},{2,0}, params, settings);
+        //vertical
+        count += gen_straight_loss(problem, p, {-2,0},{-1,0},{0,0}, params, settings);
+        count += gen_straight_loss(problem, p, {-1,0},{0,0},{1,0}, params, settings);
+        count += gen_straight_loss(problem, p, {0,0},{1,0},{2,0}, params, settings);
 
-    //diag1
-    count += gen_straight_loss(problem, p, {-2,-2},{-1,-1},{0,0}, params, settings);
-    count += gen_straight_loss(problem, p, {-1,-1},{0,0},{1,1}, params, settings);
-    count += gen_straight_loss(problem, p, {0,0},{1,1},{2,2}, params, settings);
+        //diag1
+        count += gen_straight_loss(problem, p, {-2,-2},{-1,-1},{0,0}, params, settings);
+        count += gen_straight_loss(problem, p, {-1,-1},{0,0},{1,1}, params, settings);
+        count += gen_straight_loss(problem, p, {0,0},{1,1},{2,2}, params, settings);
 
-    //diag2
-    count += gen_straight_loss(problem, p, {-2,2},{-1,1},{0,0}, params, settings);
-    count += gen_straight_loss(problem, p, {-1,1},{0,0},{1,-1}, params, settings);
-    count += gen_straight_loss(problem, p, {0,0},{1,-1},{2,-2}, params, settings);
+        //diag2
+        count += gen_straight_loss(problem, p, {-2,2},{-1,1},{0,0}, params, settings);
+        count += gen_straight_loss(problem, p, {-1,1},{0,0},{1,-1}, params, settings);
+        count += gen_straight_loss(problem, p, {0,0},{1,-1},{2,-2}, params, settings);
+    }
 
-    //direct neighboars
-    count += gen_dist_loss(problem, p, {0,-1}, params, settings);
-    count += gen_dist_loss(problem, p, {0,1}, params, settings);
-    count += gen_dist_loss(problem, p, {-1,0}, params, settings);
-    count += gen_dist_loss(problem, p, {1,0}, params, settings);
+    if (flags & LOSS_DIST) {
+        //direct neighboars
+        count += gen_dist_loss(problem, p, {0,-1}, params, settings);
+        count += gen_dist_loss(problem, p, {0,1}, params, settings);
+        count += gen_dist_loss(problem, p, {-1,0}, params, settings);
+        count += gen_dist_loss(problem, p, {1,0}, params, settings);
 
-    //diagonal neighbors
-    count += gen_dist_loss(problem, p, {1,-1}, params, settings);
-    count += gen_dist_loss(problem, p, {-1,1}, params, settings);
-    count += gen_dist_loss(problem, p, {1,1}, params, settings);
-    count += gen_dist_loss(problem, p, {-1,-1}, params, settings);
+        //diagonal neighbors
+        count += gen_dist_loss(problem, p, {1,-1}, params, settings);
+        count += gen_dist_loss(problem, p, {-1,1}, params, settings);
+        count += gen_dist_loss(problem, p, {1,1}, params, settings);
+        count += gen_dist_loss(problem, p, {-1,-1}, params, settings);
+    }
 
-    //gridstore normals
-    // count += gen_normal_loss(problem, p                   , params, trace_data, settings);
-    // count += gen_normal_loss(problem, p + cv::Vec2i(-1,-1), params, trace_data, settings);
-    // count += gen_normal_loss(problem, p + cv::Vec2i( 0,-1), params, trace_data, settings);
-    // count += gen_normal_loss(problem, p + cv::Vec2i(-1, 0), params, trace_data, settings);
+    if (flags & LOSS_NORMALSNAP) {
+        //gridstore normals
+        count += gen_normal_loss(problem, p                   , params, trace_data, settings);
+        count += gen_normal_loss(problem, p + cv::Vec2i(-1,-1), params, trace_data, settings);
+        count += gen_normal_loss(problem, p + cv::Vec2i( 0,-1), params, trace_data, settings);
+        count += gen_normal_loss(problem, p + cv::Vec2i(-1, 0), params, trace_data, settings);
+    }
 
-    //symmetric dirichlet
-    count += gen_sdirichlet_loss(problem, p, params, settings, /*eps_abs=*/1e-8, /*eps_rel=*/1e-2);
-    count += gen_sdirichlet_loss(problem, p + cv::Vec2i(-1, 0), params, settings, 1e-8, 1e-2);
-    count += gen_sdirichlet_loss(problem, p + cv::Vec2i( 0,-1), params, settings, 1e-8, 1e-2);
+    if (flags & LOSS_SDIR) {
+        //symmetric dirichlet
+        count += gen_sdirichlet_loss(problem, p, params, settings, /*eps_abs=*/1e-8, /*eps_rel=*/1e-2);
+        count += gen_sdirichlet_loss(problem, p + cv::Vec2i(-1, 0), params, settings, 1e-8, 1e-2);
+        count += gen_sdirichlet_loss(problem, p + cv::Vec2i( 0,-1), params, settings, 1e-8, 1e-2);
+    }
 
     return count;
 }
@@ -1027,8 +1040,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     TraceData trace_data(direction_fields);
     LossSettings loss_settings;
     TraceParameters trace_params;
-
-
+    int snapshot_interval = params.value("snapshot-interval", 0);
     int stop_gen = params.value("generations", 100);
     float step = params.value("step_size", 20.0f);
     trace_params.unit = step*scale;
@@ -1117,6 +1129,59 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
         auto surf = new QuadSurface(points_crop, {1/T, 1/T});
         surf->setChannel("generations", generations_crop);
+
+        if (params.value("vis_losses", false)) {
+            cv::Mat_<float> loss_dist(generations_crop.size(), 0.0f);
+            cv::Mat_<float> loss_straight(generations_crop.size(), 0.0f);
+            cv::Mat_<float> loss_normal(generations_crop.size(), 0.0f);
+            cv::Mat_<float> loss_snap(generations_crop.size(), 0.0f);
+            cv::Mat_<float> loss_sdir(generations_crop.size(), 0.0f);
+
+#pragma omp parallel for schedule(dynamic)
+            for (int y = 0; y < generations_crop.rows; ++y) {
+                for (int x = 0; x < generations_crop.cols; ++x) {
+                    cv::Vec2i p = {used_area_safe.y + y, used_area_safe.x + x};
+                    if (generations(p) > 0) {
+                        ceres::Problem problem_dist, problem_straight, problem_normal, problem_snap, problem_sdir;
+                        
+                        LossSettings settings_dist, settings_straight, settings_normal, settings_snap, settings_sdir;
+                        
+                        settings_dist[DIST] = 1.0;
+                        add_losses(problem_dist, p, trace_params, trace_data, settings_dist, LOSS_DIST);
+                        
+                        settings_straight[STRAIGHT] = 1.0;
+                        add_losses(problem_straight, p, trace_params, trace_data, settings_straight, LOSS_STRAIGHT);
+                        
+                        settings_normal[NORMAL] = 1.0;
+                        add_losses(problem_normal, p, trace_params, trace_data, settings_normal, LOSS_NORMALSNAP);
+
+                        settings_snap[SNAP] = 1.0;
+                        add_losses(problem_snap, p, trace_params, trace_data, settings_snap, LOSS_NORMALSNAP);
+
+                        settings_sdir[SDIR] = 1.0;
+                        add_losses(problem_sdir, p, trace_params, trace_data, settings_sdir, LOSS_SDIR);
+
+                        double cost_dist = 0, cost_straight = 0, cost_normal = 0, cost_snap = 0, cost_sdir = 0;
+                        problem_dist.Evaluate(ceres::Problem::EvaluateOptions(), &cost_dist, nullptr, nullptr, nullptr);
+                        problem_straight.Evaluate(ceres::Problem::EvaluateOptions(), &cost_straight, nullptr, nullptr, nullptr);
+                        problem_normal.Evaluate(ceres::Problem::EvaluateOptions(), &cost_normal, nullptr, nullptr, nullptr);
+                        problem_snap.Evaluate(ceres::Problem::EvaluateOptions(), &cost_snap, nullptr, nullptr, nullptr);
+                        problem_sdir.Evaluate(ceres::Problem::EvaluateOptions(), &cost_sdir, nullptr, nullptr, nullptr);
+
+                        loss_dist(y, x) = sqrt(cost_dist);
+                        loss_straight(y, x) = sqrt(cost_straight);
+                        loss_normal(y, x) = sqrt(cost_normal);
+                        loss_snap(y, x) = sqrt(cost_snap);
+                        loss_sdir(y, x) = sqrt(cost_sdir);
+                    }
+                }
+            }
+            surf->setChannel("loss_dist", loss_dist);
+            surf->setChannel("loss_straight", loss_straight);
+            surf->setChannel("loss_normal", loss_normal);
+            surf->setChannel("loss_snap", loss_snap);
+            surf->setChannel("loss_sdir", loss_sdir);
+        }
 
         const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
         const double voxel_size_d = static_cast<double>(voxelsize);
@@ -1440,7 +1505,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 ceres::Problem problem;
 
                 trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
-                int local_loss_count = add_continuous_losses(problem, p, trace_params, trace_data, loss_settings);
+                int local_loss_count = add_losses(problem, p, trace_params, trace_data, loss_settings, LOSS_DIST | LOSS_STRAIGHT);
 
                 std::vector<double*> parameter_blocks;
                 problem.GetParameterBlocks(&parameter_blocks);
@@ -1466,9 +1531,10 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     succ_gen_ps.push_back(p);
                 }
 
-                for (int i=1;i<local_opt_r;i++)
-                    local_optimization(i, p, trace_params, trace_data, loss_settings, true);
-            } // end parallel iteration over cands
+                local_optimization(1, p, trace_params, trace_data, loss_settings, true);
+                if (local_opt_r > 1)
+                    local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true);
+            }  // end parallel iteration over cands
         }
 
         if (!global_opt) {
@@ -1538,7 +1604,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         timer_gen.unit_string = "vx^2";
         // print_accessor_stats();
 
-        int snapshot_interval = params.value("snapshot-interval", 0);
         if (!tgt_path.empty() && snapshot_interval > 0 && generation % snapshot_interval == 0) {
             QuadSurface* surf = create_surface_from_state();
             surf->save(tgt_path, true);
