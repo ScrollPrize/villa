@@ -15,6 +15,7 @@ add_library(vc_core
         src/Surface.cpp
         src/Render.cpp
         src/Thinning.cpp
+        src/Umbilicus.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
 )
 

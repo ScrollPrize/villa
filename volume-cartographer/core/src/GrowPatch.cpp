@@ -14,6 +14,7 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/CostFunctions.hpp"
 #include "vc/core/util/HashFunctions.hpp"
+#include "vc/core/util/Umbilicus.hpp"
 
 #include "vc/core/util/xtensor_include.hpp"
 #include XTENSORINCLUDE(views, xview.hpp)
@@ -24,6 +25,7 @@
 #include <optional>
 #include <cstdlib>
 #include <limits>
+#include <memory>
 #include <omp.h>  // ensure omp_get_max_threads() is declared
 
 #include "vc/tracer/Tracer.hpp"
@@ -180,6 +182,8 @@ struct TraceData {
     TraceData(const std::vector<DirectionField> &direction_fields) : direction_fields(direction_fields) {};
     PointCorrection point_correction;
     const vc::core::util::NormalGridVolume *ngv = nullptr;
+    std::unique_ptr<vc::core::util::Umbilicus> umbilicus_storage;
+    const vc::core::util::Umbilicus *umbilicus = nullptr;
     const std::vector<DirectionField> &direction_fields;
 };
 
@@ -196,6 +200,7 @@ enum LossType {
     SNAP,
     NORMAL,
     SDIR,
+    UMBILICUS_NORMAL,
     COUNT
 };
 
@@ -210,6 +215,7 @@ struct LossSettings {
         w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 1.0f;
         w[LossType::SDIR] = 0.00f; // conservative default; tune 0.01–0.10 maybe
+        w[LossType::UMBILICUS_NORMAL] = 0.05f;
     }
 
     float operator()(LossType type, const cv::Vec2i& p) const {
@@ -357,6 +363,8 @@ static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::
 static int gen_sdirichlet_loss(ceres::Problem &problem, const cv::Vec2i &p,
                                TraceParameters &params, const LossSettings &settings,
                                double sdir_eps_abs, double sdir_eps_rel);
+static int gen_umbilicus_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params,
+                              const TraceData &trace_data, const LossSettings &settings);
 static int conditional_sdirichlet_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
                                        ceres::Problem &problem, TraceParameters &params,
                                        const LossSettings &settings, double sdir_eps_abs, double sdir_eps_rel);
@@ -559,6 +567,34 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TracePar
     return count;
 }
 
+static int gen_umbilicus_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params,
+                              const TraceData &trace_data, const LossSettings &settings)
+{
+    if (!trace_data.umbilicus) return 0;
+
+    const float weight = settings(LossType::UMBILICUS_NORMAL, p);
+    if (weight <= 0.0f) {
+        return 0;
+    }
+
+    const cv::Vec2i p_br = p + cv::Vec2i(1, 1);
+    if (!coord_valid(params.state(p)) || !coord_valid(params.state(p[0], p_br[1])) ||
+        !coord_valid(params.state(p_br[0], p[1])) || !coord_valid(params.state(p_br))) {
+        return 0;
+    }
+
+    const cv::Vec2i p_tr{p[0], p[1] + 1};
+    const cv::Vec2i p_bl{p[0] + 1, p[1]};
+
+    double* pA = &params.dpoints(p)[0];
+    double* pB1 = &params.dpoints(p_tr)[0];
+    double* pB2 = &params.dpoints(p_bl)[0];
+    double* pC = &params.dpoints(p_br)[0];
+
+    problem.AddResidualBlock(UmbilicusNormalLoss::Create(*trace_data.umbilicus, weight), nullptr, pA, pB1, pB2, pC);
+    return 1;
+}
+
 static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
     ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings)
 {
@@ -714,6 +750,10 @@ static int add_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParamete
         count += gen_normal_loss(problem, p + cv::Vec2i(-1,-1), params, trace_data, settings);
         count += gen_normal_loss(problem, p + cv::Vec2i( 0,-1), params, trace_data, settings);
         count += gen_normal_loss(problem, p + cv::Vec2i(-1, 0), params, trace_data, settings);
+    }
+
+    if (trace_data.umbilicus) {
+        count += gen_umbilicus_loss(problem, p, params, trace_data, settings);
     }
 
     if (flags & LOSS_SDIR) {
@@ -1214,6 +1254,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     trace_params.unit = step*scale;
     const double sdir_w   = params.value("sdir_weight",  loss_settings[LossType::SDIR]);
     loss_settings[LossType::SDIR] = static_cast<float>(sdir_w);
+    const double umbilicus_w = params.value("umbilicus_weight", static_cast<double>(loss_settings[LossType::UMBILICUS_NORMAL]));
+    loss_settings[LossType::UMBILICUS_NORMAL] = static_cast<float>(umbilicus_w);
     int rewind_gen = params.value("rewind_gen", -1);
     loss_settings.z_min = params.value("z_min", -1);
     loss_settings.z_max = params.value("z_max", std::numeric_limits<int>::max());
@@ -1227,6 +1269,71 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         }
     }
     trace_data.ngv = ngv.get();
+
+    if (params.contains("umbilicus_path")) {
+        const std::string path = params["umbilicus_path"].get<std::string>();
+        if (!path.empty()) {
+            const auto shape = ds->shape();
+            if (shape.size() < 3) {
+                throw std::runtime_error("Dataset shape must have at least three dimensions for umbilicus support.");
+            }
+
+            auto to_int = [](std::size_t value) -> int {
+                if (value > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+                    throw std::runtime_error("Volume dimension exceeds supported range for umbilicus.");
+                }
+                return static_cast<int>(value);
+            };
+
+            cv::Vec3i volume_shape{to_int(shape[0]), to_int(shape[1]), to_int(shape[2])};
+            auto umbilicus = std::make_unique<vc::core::util::Umbilicus>(
+                vc::core::util::Umbilicus::FromFile(path, volume_shape));
+
+            if (params.contains("umbilicus_seam_direction")) {
+                std::string seam_dir = params["umbilicus_seam_direction"].get<std::string>();
+                std::string normalized;
+                normalized.reserve(seam_dir.size());
+                for (char ch : seam_dir) {
+                    const unsigned char uch = static_cast<unsigned char>(ch);
+                    if (std::isspace(uch) || ch == '-' || ch == '_') {
+                        continue;
+                    }
+                    normalized.push_back(static_cast<char>(std::tolower(uch)));
+                }
+
+                using SeamDirection = vc::core::util::Umbilicus::SeamDirection;
+                if (normalized == "+x" || normalized == "posx" || normalized == "positivex" || normalized == "x+" || normalized == "x") {
+                    umbilicus->set_seam(SeamDirection::PositiveX);
+                } else if (normalized == "-x" || normalized == "negx" || normalized == "negativex" || normalized == "x-" ) {
+                    umbilicus->set_seam(SeamDirection::NegativeX);
+                } else if (normalized == "+y" || normalized == "posy" || normalized == "positivey" || normalized == "y+" || normalized == "y") {
+                    umbilicus->set_seam(SeamDirection::PositiveY);
+                } else if (normalized == "-y" || normalized == "negy" || normalized == "negativey" || normalized == "y-" ) {
+                    umbilicus->set_seam(SeamDirection::NegativeY);
+                }
+            }
+
+            if (params.contains("umbilicus_seam_point")) {
+                const auto& seam_point_json = params["umbilicus_seam_point"];
+                if (seam_point_json.is_array() && seam_point_json.size() >= 3) {
+                    const float z = seam_point_json[0].get<float>();
+                    const float y = seam_point_json[1].get<float>();
+                    const float x = seam_point_json[2].get<float>();
+                    cv::Vec3f seam_point{x, y, z};
+                    try {
+                        umbilicus->set_seam_from_point(seam_point);
+                    } catch (const std::exception& e) {
+                        std::cerr << "Failed to set umbilicus seam from point: " << e.what() << std::endl;
+                    }
+                } else {
+                    std::cerr << "umbilicus_seam_point must be an array with three numeric entries" << std::endl;
+                }
+            }
+
+            trace_data.umbilicus_storage = std::move(umbilicus);
+            trace_data.umbilicus = trace_data.umbilicus_storage.get();
+        }
+    }
 
     int w, h;
     if (resume_surf) {

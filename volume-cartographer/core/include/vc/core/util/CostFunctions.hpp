@@ -3,10 +3,14 @@
 #include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/GridStore.hpp"
+#include "vc/core/util/Umbilicus.hpp"
 
 #include <opencv2/core.hpp>
 
 #include "ceres/ceres.h"
+
+#include <algorithm>
+#include <cmath>
 
 
 static double  val(const double &v) { return v; }
@@ -199,6 +203,75 @@ struct StraightLoss2D {
     {
         return new ceres::AutoDiffCostFunction<StraightLoss2D, 1, 2, 2, 2>(new StraightLoss2D(w));
     }
+};
+
+struct UmbilicusNormalLoss {
+    explicit UmbilicusNormalLoss(const vc::core::util::Umbilicus& umbilicus, double weight)
+        : umbilicus_(&umbilicus), weight_(weight) {}
+
+    template <typename T>
+    bool operator()(const T* const pA, const T* const pB1, const T* const pB2, const T* const pC, T* residual) const
+    {
+        if (!umbilicus_ || umbilicus_->centers().empty()) {
+            residual[0] = T(0);
+            return true;
+        }
+
+        const double avg_z = (val(pA[2]) + val(pB1[2]) + val(pB2[2]) + val(pC[2])) * 0.25;
+        const auto& centers = umbilicus_->centers();
+        const int max_index = static_cast<int>(centers.size() - 1);
+        int z_index = static_cast<int>(std::lround(avg_z));
+        z_index = std::clamp(z_index, 0, max_index);
+        const cv::Vec3f& center = centers[z_index];
+
+        T centroid[3];
+        for (int i = 0; i < 3; ++i) {
+            centroid[i] = (pA[i] + pB1[i] + pB2[i] + pC[i]) * T(0.25);
+        }
+
+        const T center_t[3] = {T(center[0]), T(center[1]), T(center[2])};
+
+        T radial[3];
+        for (int i = 0; i < 3; ++i) {
+            radial[i] = centroid[i] - center_t[i];
+        }
+
+        T edge1[3];
+        T edge2[3];
+        for (int i = 0; i < 3; ++i) {
+            edge1[i] = pB1[i] - pA[i];
+            edge2[i] = pB2[i] - pA[i];
+        }
+
+        T normal[3];
+        normal[0] = edge1[1] * edge2[2] - edge1[2] * edge2[1];
+        normal[1] = edge1[2] * edge2[0] - edge1[0] * edge2[2];
+        normal[2] = edge1[0] * edge2[1] - edge1[1] * edge2[0];
+
+        constexpr double kEps = 1e-9;
+        const T normal_norm = ceres::sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2] + T(kEps));
+        const T radial_norm = ceres::sqrt(radial[0] * radial[0] + radial[1] * radial[1] + radial[2] * radial[2] + T(kEps));
+
+        const T dot = normal[0] * radial[0] + normal[1] * radial[1] + normal[2] * radial[2];
+        const T cos_angle = dot / (normal_norm * radial_norm + T(kEps));
+
+        // Smooth ReLU on -cos_angle to penalize angles greater than 90 degrees
+        const T sqrt_term = ceres::sqrt(cos_angle * cos_angle + T(kEps));
+        const T violation = T(0.5) * ((-cos_angle) + sqrt_term);
+
+        residual[0] = T(weight_) * violation;
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const vc::core::util::Umbilicus& umbilicus, double weight)
+    {
+        return new ceres::AutoDiffCostFunction<UmbilicusNormalLoss, 1, 3, 3, 3, 3>(
+            new UmbilicusNormalLoss(umbilicus, weight));
+    }
+
+private:
+    const vc::core::util::Umbilicus* umbilicus_;
+    double weight_;
 };
 
 template<typename T, typename E, int C>
