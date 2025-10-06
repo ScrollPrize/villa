@@ -199,9 +199,9 @@ enum LossType {
     COUNT
 };
 
-struct LossSettings {
-    std::vector<float> w = std::vector<float>(LossType::COUNT, 0.0f);
-    std::vector<cv::Mat_<float>> w_mats = std::vector<cv::Mat_<float>>(LossType::COUNT);
+class LossSettings {
+public:
+    virtual ~LossSettings() = default;
 
     LossSettings() {
         w[LossType::SNAP] = 0.1f;
@@ -212,7 +212,7 @@ struct LossSettings {
         w[LossType::SDIR] = 0.00f; // conservative default; tune 0.01–0.10 maybe
     }
 
-    float operator()(LossType type, const cv::Vec2i& p) const {
+    virtual float operator()(LossType type, const cv::Vec2i& p) const {
         if (!w_mats[type].empty()) {
             return w_mats[type](p);
         }
@@ -225,6 +225,50 @@ struct LossSettings {
 
     int z_min = -1;
     int z_max = std::numeric_limits<int>::max();
+
+protected:
+    std::vector<float> w = std::vector<float>(LossType::COUNT, 0.0f);
+    std::vector<cv::Mat_<float>> w_mats = std::vector<cv::Mat_<float>>(LossType::COUNT);
+};
+
+class DistanceLossSettings : public LossSettings {
+public:
+    using Step = std::pair<float, float>; // weight, distance
+
+    DistanceLossSettings(const cv::Mat_<uchar>& mask) {
+        cv::distanceTransform(mask, dist_transform_, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+    }
+
+    void set_steps(LossType type, std::vector<Step> steps) {
+        std::sort(steps.begin(), steps.end(), [](const Step& a, const Step& b) {
+            return a.second < b.second;
+        });
+        steps_[type] = std::move(steps);
+    }
+
+    float operator()(LossType type, const cv::Vec2i& p) const override {
+        const auto it = steps_.find(type);
+        if (it == steps_.end() || it->second.empty()) {
+            return LossSettings::operator()(type, p);
+        }
+
+        float dist = dist_transform_(p);
+        const auto& steps = it->second;
+
+        float current_weight = 0.0f; // Implicitly 0 before the first step
+        for (const auto& step : steps) {
+            if (dist >= step.second) {
+                current_weight = step.first;
+            } else {
+                break; // Steps are sorted by distance
+            }
+        }
+        return current_weight;
+    }
+
+private:
+    cv::Mat_<float> dist_transform_;
+    std::map<LossType, std::vector<Step>> steps_;
 };
 
 static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& params)
@@ -969,11 +1013,26 @@ static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask,
 {
     ceres::Problem problem;
 
+    // check that a two pixel border is 1
+    for (int y = 0; y < roi.height; ++y) {
+        for (int x = 0; x < roi.width; ++x) {
+            if (y < 2 || y >= roi.height - 2 || x < 2 || x >= roi.width - 2) {
+                if (mask(y, x) == 0) {
+                    throw std::runtime_error("Mask border is not 1");
+                }
+            }
+        }
+    }
+
+    cv::Mat_<uchar> problem_mask;
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_CROSS, cv::Size(3, 3));
+    cv::dilate(mask, problem_mask, kernel, cv::Point(-1,-1), 2);
+
     for (int y = 2; y < roi.height - 2; ++y) {
         for (int x = 2; x < roi.width - 2; ++x) {
-            // if (!mask(y, x)) {
+            if (problem_mask(y, x)) {
                 add_losses(problem, {roi.y + y, roi.x + x}, params, trace_data, settings, flags);
-            // }
+            }
         }
     }
 
@@ -1686,7 +1745,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     std::cout << "lets start fringe: " << fringe.size() << std::endl;
 
     while (!fringe.empty()) {
-        bool global_opt = generation <= 50 && !resume_surf;
+        bool global_opt = generation <= 10 && !resume_surf;
 
         ALifeTime timer_gen;
         timer_gen.del_msg = "time per generation ";
@@ -1809,38 +1868,86 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     succ_gen_ps.push_back(p);
                 }
 
-                local_optimization(1, p, trace_params, trace_data, loss_settings, true);
-                if (local_opt_r > 1)
-                    local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true);
+                // local_optimization(1, p, trace_params, trace_data, loss_settings, true);
+                // if (local_opt_r > 1)
+                    // local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true);
             }  // end parallel iteration over cands
         }
 
         if (!global_opt) {
-            // For late generations, instead of re-solving the global problem, solve many local-ish problems, around each
-            // of the newly added points
-            std::vector<cv::Vec2i> opt_local;
-            for(auto p : succ_gen_ps)
-                if (p[0] % 4 == 0 && p[1] % 4 == 0)
-                    opt_local.push_back(p);
+            cv::Mat_<uint16_t> gen_mask_u16;
+            cv::Mat_<uchar> gen_mask;
+            cv::threshold(generations, gen_mask_u16, 0, 255, cv::THRESH_BINARY);
+            gen_mask_u16.convertTo(gen_mask, CV_8U);
 
-            int done = 0;
+            // cv::Mat_<uchar> unexplored_mask;
+            // cv::bitwise_not(gen_mask, unexplored_mask);
 
-            if (!opt_local.empty()) {
-                OmpThreadPointCol opt_local_threadcol(17, opt_local);
+            cv::Mat_<uchar> dist_transform;
+            cv::distanceTransform(gen_mask, dist_transform, cv::DIST_L1, cv::DIST_MASK_5, CV_8U);
 
-#pragma omp parallel
-                while (true)
-                {
-                    CachedChunked3dInterpolator<uint8_t,thresholdedDistance> interp(proc_tensor);
-                    cv::Vec2i p = opt_local_threadcol.next();
-                    if (p[0] == -1)
-                        break;
-
-                    local_optimization(8, p, trace_params, trace_data, loss_settings, true);
-#pragma omp atomic
-                    done++;
+            cv::Mat_<uchar> grow_edge(dist_transform.size(), (uchar)0);
+            for (int y = 0; y < dist_transform.rows; ++y) {
+                for (int x = 0; x < dist_transform.cols; ++x) {
+                    if (dist_transform(y, x) > 0 && dist_transform(y, x) < 8) {
+                        grow_edge(y, x) = 1;
+                    }
                 }
             }
+
+            cv::imwrite("gen_mask.tif", gen_mask);
+            cv::imwrite("grow_edge.tif", grow_edge);
+            cv::imwrite("dist.tif", dist_transform);
+
+            cv::Rect used_area_safe = used_area;
+            used_area_safe.x -= 2;
+            used_area_safe.y -= 2;
+            used_area_safe.width += 4;
+            used_area_safe.height += 4;
+
+            DistanceLossSettings loss_edge;
+
+            w[LossType::SNAP] = 0.1f;
+            w[LossType::NORMAL] = 10.0f;
+            w[LossType::STRAIGHT] = 0.2f;
+            w[LossType::DIST] = 1.0f;
+            w[LossType::DIRECTION] = 1.0f;
+            w[LossType::SDIR] = 0.00f; // con
+
+           loss_edge.set_steps(NORMAL, {1.0,3},{10.0,5});
+           // loss_edge.set_steps(SNAP, {0.01,3},{0.1,5},{0.1,5}) {
+                // set_steps(LossType type, std::vector<Step> steps) {
+
+            local_optimization(used_area_safe, gen_mask, trace_params, trace_data, LossSettings &settings, LOSS_ALL);
+
+
+            // exit(0);
+
+//             // For late generations, instead of re-solving the global problem, solve many local-ish problems, around each
+//             // of the newly added points
+//             std::vector<cv::Vec2i> opt_local;
+//             for(auto p : succ_gen_ps)
+//                 if (p[0] % 4 == 0 && p[1] % 4 == 0)
+//                     opt_local.push_back(p);
+//
+//             int done = 0;
+//
+//             if (!opt_local.empty()) {
+//                 OmpThreadPointCol opt_local_threadcol(17, opt_local);
+//
+// #pragma omp parallel
+//                 while (true)
+//                 {
+//                     CachedChunked3dInterpolator<uint8_t,thresholdedDistance> interp(proc_tensor);
+//                     cv::Vec2i p = opt_local_threadcol.next();
+//                     if (p[0] == -1)
+//                         break;
+//
+//                     local_optimization(8, p, trace_params, trace_data, loss_settings, true);
+// #pragma omp atomic
+//                     done++;
+//                 }
+//             }
         }
         else {
             //we do the global opt only every 8 gens, as every add does a small local solve anyweays
