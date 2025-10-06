@@ -913,10 +913,10 @@ void masked_blur(cv::Mat_<T>& img, const cv::Mat_<uchar>& mask) {
     }
 }
 
-static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, const TraceData &trace_data, LossSettings &settings, int flags);
+static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, TraceData &trace_data, LossSettings &settings);
 
 //optimize within a radius, setting edge points to constant
-static void inpaint(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, const TraceData &trace_data)
+static void inpaint(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, TraceData &trace_data)
 {
     // check that a two pixel border is 1
     for (int y = 0; y < roi.height; ++y) {
@@ -949,52 +949,48 @@ static void inpaint(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParam
     base[NORMAL] = 10.0;
     LossSettings nosnap = base;
     nosnap[SNAP] = 0;
-    local_optimization(roi, mask, params, trace_data, nosnap, LOSS_DIST | LOSS_STRAIGHT);
-    local_optimization(roi, mask, params, trace_data, nosnap, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+    nosnap[NORMAL] = 0;
+    local_optimization(roi, mask, params, trace_data, nosnap);
+    nosnap[NORMAL] = base[NORMAL];
+    local_optimization(roi, mask, params, trace_data, nosnap);
 
     LossSettings lowsnap = base;
     lowsnap[SNAP] = 0.01*base[SNAP];
-    local_optimization(roi, mask, params, trace_data, lowsnap, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+    local_optimization(roi, mask, params, trace_data, lowsnap);
     lowsnap[SNAP] = 0.1*base[SNAP];
-    local_optimization(roi, mask, params, trace_data, lowsnap, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+    local_optimization(roi, mask, params, trace_data, lowsnap);
     lowsnap[SNAP] = base[SNAP];
-    local_optimization(roi, mask, params, trace_data, lowsnap, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+    local_optimization(roi, mask, params, trace_data, lowsnap);
     LossSettings default_settings;
-    local_optimization(roi, mask, params, trace_data, default_settings, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+    local_optimization(roi, mask, params, trace_data, default_settings);
 }
 
 
 //optimize within a radius, setting edge points to constant
-static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, const TraceData &trace_data, LossSettings &settings, int flags)
+static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, TraceData &trace_data, LossSettings &settings)
 {
     ceres::Problem problem;
+    cv::Mat_<uint16_t> loss_status(params.state.size());
 
-    for (int y = 2; y < roi.height - 2; ++y) {
-        for (int x = 2; x < roi.width - 2; ++x) {
-            // if (!mask(y, x)) {
-                add_losses(problem, {roi.y + y, roi.x + x}, params, trace_data, settings, flags);
-            // }
-        }
-    }
-
-    for (int y = 0; y < roi.height; ++y) {
+    for (int y = 0; y < roi.height; ++y)
         for (int x = 0; x < roi.width; ++x) {
-            if (mask(y, x) && problem.HasParameterBlock(&params.dpoints.at<cv::Vec3d>(roi.y + y, roi.x + x)[0])) {
-                problem.SetParameterBlockConstant(&params.dpoints.at<cv::Vec3d>(roi.y + y, roi.x + x)[0]);
-            }
+            loss_status(roi.y + y, roi.x + x) = 0;
         }
-    }
+
+    for (int y = 2; y < roi.height - 2; ++y)
+        for (int x = 2; x < roi.width - 2; ++x)
+            add_missing_losses(problem, loss_status, {roi.y + y, roi.x + x}, params, trace_data, settings);
+
+    for (int y = 0; y < roi.height; ++y)
+        for (int x = 0; x < roi.width; ++x)
+            if (mask(y, x) && problem.HasParameterBlock(&params.dpoints.at<cv::Vec3d>(roi.y + y, roi.x + x)[0]))
+                problem.SetParameterBlockConstant(&params.dpoints.at<cv::Vec3d>(roi.y + y, roi.x + x)[0]);
 
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
     options.max_num_iterations = 10000;
-    // options.minimizer_progress_to_stdout = true;
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
-
-    // std::cout << "inpaint solve " << summary.BriefReport() << std::endl;
-
-    // cv::imwrite("opt_mask.tif", mask);
 }
 
 static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters &params,
@@ -1615,8 +1611,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         int inpaint_count = 0;
         int inpaint_skip = 0;
 
-        // cv::Mat_<cv::Vec3b> vis(hole_mask.size());
-
 #pragma omp parallel for schedule(dynamic)
         for (int i = 0; i < contours.size(); i++) {
             if (hierarchy[i][3] != -1) { // It's a hole
@@ -1628,19 +1622,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 roi.width = std::min(hole_mask.cols - roi.x, roi.width + 2 * margin);
                 roi.height = std::min(hole_mask.rows - roi.y, roi.height + 2 * margin);
 
-                // std::cout << hole_mask.size() << trace_params.state.size() << resume_pad_x << "x" << resume_pad_y << std::endl;
-
-                // cv::Point testp(2492+resume_pad_x, 508+resume_pad_y);
-                // cv::Point testp(2500+resume_pad_x, 566+resume_pad_y);
-                // cv::Point testp(2340+resume_pad_x, 577+resume_pad_y);
-
-                // cv::rectangle(vis, roi, cv::Scalar(255,255,255));
-
-                // if (!roi.contains(testp)) {
-                //     // std::cout << "skip " << roi << std::endl;
-                //     continue;
-                // }
-
                 cv::Mat_<uchar> inpaint_mask(roi.size(), (uchar)1);
                 
                 std::vector<cv::Point> hole_contour_roi;
@@ -1650,7 +1631,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 std::vector<std::vector<cv::Point>> contours_to_fill = {hole_contour_roi};
                 cv::fillPoly(inpaint_mask, contours_to_fill, cv::Scalar(0));
 
-                // std::cout << "Inpainting hole at " << roi << " - " << inpaint_count << "+" << inpaint_skip << "/" << contours.size() << std::endl;
                 inpaint(roi, inpaint_mask, trace_params, trace_data);
 
 #pragma omp critical
@@ -1668,8 +1648,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 #pragma omp atomic
                 inpaint_skip++;
         }
-
-        // cv::imwrite("vis_inp_rect.tif", vis);
     }
 
     // Prepare a new set of Ceres options used later during local solves
