@@ -3,12 +3,14 @@ VERSIONBIT  = _32bit
 EXEEXT      =
 OBJEXT      = .o
 LIBEXT      = .a
-CCPROG      = gcc -Wall
-CFPROG      = gfortran
-CF90PROG    = gfortran -ffree-form
-CXXPROG     = g++
+# Silence third-party warning spam during container builds
+NOWARN      = -w
+CCPROG      = gcc $(NOWARN)
+CFPROG      = gfortran $(NOWARN)
+CF90PROG    = gfortran -ffree-form $(NOWARN)
+CXXPROG     = g++ $(NOWARN)
 
-MCFPROG     = mpif90
+MCFPROG     = mpif90 $(NOWARN)
 CF90CCPOPT  = -ffree-form -x f95-cpp-input
 # Compilation options for optimization (make expor)
 CCFOPT      = -O3
@@ -19,8 +21,8 @@ NVCCOPT     = -O3
 
 LKFOPT      =
 MKPROG      = make
-MPCCPROG    = mpicc -Wall
-MPCXXPROG   = mpic++ -Wall
+MPCCPROG    = mpicc $(NOWARN)
+MPCXXPROG   = mpic++ $(NOWARN)
 CPP         = cpp
 ARFLAGS     = ruv
 ARPROG      = ar
