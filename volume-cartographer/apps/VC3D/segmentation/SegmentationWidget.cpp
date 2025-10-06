@@ -252,9 +252,16 @@ void SegmentationWidget::buildUi()
     zRow->addStretch(1);
     growthLayout->addLayout(zRow);
 
+    auto* growButtonsRow = new QHBoxLayout();
     _btnGrow = new QPushButton(tr("Grow"), _groupGrowth);
     _btnGrow->setToolTip(tr("Run surface growth using the configured steps and directions."));
-    growthLayout->addWidget(_btnGrow);
+    growButtonsRow->addWidget(_btnGrow);
+
+    _btnInpaint = new QPushButton(tr("Inpaint"), _groupGrowth);
+    _btnInpaint->setToolTip(tr("Resume the current surface and run tracer inpainting without additional growth."));
+    growButtonsRow->addWidget(_btnInpaint);
+    growButtonsRow->addStretch(1);
+    growthLayout->addLayout(growButtonsRow);
 
     auto* volumeRow = new QHBoxLayout();
     auto* volumeLabel = new QLabel(tr("Volume:"), _groupGrowth);
@@ -643,10 +650,13 @@ void SegmentationWidget::buildUi()
         if (allowed.size() == 1) {
             direction = allowed.front();
         }
-        triggerGrowthRequest(direction, _growthSteps);
+        triggerGrowthRequest(direction, _growthSteps, false);
     };
 
     connect(_btnGrow, &QPushButton::clicked, this, triggerConfiguredGrowth);
+    connect(_btnInpaint, &QPushButton::clicked, this, [this]() {
+        triggerGrowthRequest(SegmentationGrowthDirection::All, 0, true);
+    });
 
     connect(_comboVolumes, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
         if (index < 0) {
@@ -1974,6 +1984,9 @@ void SegmentationWidget::updateGrowthUiState()
     if (_btnGrow) {
         _btnGrow->setEnabled(enableGrowth);
     }
+    if (_btnInpaint) {
+        _btnInpaint->setEnabled(enableGrowth);
+    }
     const bool enableDirCheckbox = enableGrowth;
     if (_chkGrowthDirUp) {
         _chkGrowthDirUp->setEnabled(enableDirCheckbox);
@@ -2028,16 +2041,25 @@ void SegmentationWidget::updateGrowthUiState()
     }
 }
 
-void SegmentationWidget::triggerGrowthRequest(SegmentationGrowthDirection direction, int steps)
+void SegmentationWidget::triggerGrowthRequest(SegmentationGrowthDirection direction,
+                                              int steps,
+                                              bool inpaintOnly)
 {
     if (!_editingEnabled || _growthInProgress) {
         return;
     }
 
-    const int clampedSteps = std::clamp(steps, 1, 1024);
-    qCInfo(lcSegWidget) << "Grow request" << segmentationGrowthMethodToString(_growthMethod)
-                        << segmentationGrowthDirectionToString(direction) << "steps" << clampedSteps;
-    emit growSurfaceRequested(_growthMethod, direction, clampedSteps);
+    const int minSteps = inpaintOnly ? 0 : 1;
+    const int clampedSteps = std::clamp(steps, minSteps, 1024);
+    const SegmentationGrowthMethod method = inpaintOnly
+        ? SegmentationGrowthMethod::Tracer
+        : _growthMethod;
+
+    qCInfo(lcSegWidget) << "Grow request" << segmentationGrowthMethodToString(method)
+                        << segmentationGrowthDirectionToString(direction)
+                        << "steps" << clampedSteps
+                        << "inpaintOnly" << inpaintOnly;
+    emit growSurfaceRequested(method, direction, clampedSteps, inpaintOnly);
 }
 
 int SegmentationWidget::normalizeGrowthDirectionMask(int mask)

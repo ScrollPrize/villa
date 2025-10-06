@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <system_error>
 
 #include <nlohmann/json.hpp>
@@ -18,6 +19,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
+#include "vc/core/util/JsonSafe.hpp"
 #include "vc/core/util/DateTime.hpp"
 #include "vc/tracer/Tracer.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -221,6 +223,8 @@ nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
         params["grow_extra_rows"] = std::max(0, request.steps);
         params["grow_extra_cols"] = std::max(0, request.steps);
     }
+
+    params["inpaint"] = request.inpaintOnly;
 
     bool allowUp = false;
     bool allowDown = false;
@@ -429,16 +433,30 @@ void updateSegmentationSurfaceMetadata(QuadSurface* surface,
 
     ensureMetaObject(surface);
 
+    const double previousAreaVx2 = vc::json_safe::number_or(surface->meta, "area_vx2", -1.0);
+    const double previousAreaCm2 = vc::json_safe::number_or(surface->meta, "area_cm2", -1.0);
+
     const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
     if (points && !points->empty()) {
         const double areaVx2 = vc::surface::computeSurfaceAreaVox2(*points);
         (*surface->meta)["area_vx2"] = areaVx2;
 
+        double areaCm2 = std::numeric_limits<double>::quiet_NaN();
         if (voxelSize > 0.0) {
             const double areaUm2 = areaVx2 * voxelSize * voxelSize;
-            (*surface->meta)["area_cm2"] = areaUm2 * 1e-8;
-        } else if (!surface->meta->contains("area_cm2")) {
-            (*surface->meta)["area_cm2"] = 0.0;
+            areaCm2 = areaUm2 * 1e-8;
+        } else if (previousAreaVx2 > std::numeric_limits<double>::epsilon() && previousAreaCm2 >= 0.0) {
+            const double cm2PerVx2 = previousAreaCm2 / previousAreaVx2;
+            areaCm2 = areaVx2 * cm2PerVx2;
+        }
+
+        if (std::isfinite(areaCm2)) {
+            (*surface->meta)["area_cm2"] = areaCm2;
+        } else {
+            // Fall back to assuming the geometry is in microns and convert directly.
+            const double assumedAreaCm2 = areaVx2 * 1e-8;
+            (*surface->meta)["area_cm2"] = assumedAreaCm2;
+            qCWarning(lcSegGrowth) << "Fallback surface area conversion applied due to missing voxel size metadata";
         }
     }
 

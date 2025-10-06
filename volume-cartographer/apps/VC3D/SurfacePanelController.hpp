@@ -97,6 +97,7 @@ public:
     bool toggleTag(Tag tag);
     void reloadSurfacesFromDisk();
     void refreshFiltersOnly();
+    void setSelectionLocked(bool locked);
 
 signals:
     void surfacesLoaded();
@@ -156,4 +157,7 @@ private:
     std::string _currentSurfaceId;
     QMetaObject::Connection _pointSetModelConnection;
     bool _configuringFilters{false};
+    bool _selectionLocked{false};
+    QStringList _lockedSelectionIds;
+    bool _selectionLockNotified{false};
 };

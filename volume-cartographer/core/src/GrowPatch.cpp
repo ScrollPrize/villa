@@ -230,10 +230,14 @@ struct LossSettings {
 static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& params)
 {
     static const std::vector<cv::Vec2i> kDefaultDirections = {
-        {1, 0},   // down / +row
-        {0, 1},   // right / +col
-        {-1, 0},  // up / -row
-        {0, -1}   // left / -col
+        {1, 0},    // down / +row
+        {0, 1},    // right / +col
+        {-1, 0},   // up / -row
+        {0, -1},   // left / -col
+        {1, 1},    // down-right
+        {1, -1},   // down-left
+        {-1, 1},   // up-right
+        {-1, -1}   // up-left
     };
 
     const auto it = params.find("growth_directions");
@@ -247,11 +251,18 @@ static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& para
         return kDefaultDirections;
     }
 
-    bool allow_down = false;
-    bool allow_right = false;
-    bool allow_up = false;
-    bool allow_left = false;
+    std::vector<cv::Vec2i> custom;
+    custom.reserve(kDefaultDirections.size());
     bool any_valid = false;
+
+    auto append_unique = [&custom](const cv::Vec2i& dir) {
+        for (const auto& existing : custom) {
+            if (existing[0] == dir[0] && existing[1] == dir[1]) {
+                return;
+            }
+        }
+        custom.push_back(dir);
+    };
 
     for (const auto& entry : directions) {
         if (!entry.is_string()) {
@@ -260,33 +271,61 @@ static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& para
         }
 
         const std::string value = entry.get<std::string>();
-        std::string lower;
-        lower.reserve(value.size());
+        std::string normalized;
+        normalized.reserve(value.size());
         for (char ch : value) {
-            lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+            const unsigned char uch = static_cast<unsigned char>(ch);
+            char lower = static_cast<char>(std::tolower(uch));
+            if (lower == '-' || lower == '_' || lower == ' ') {
+                continue;
+            }
+            normalized.push_back(lower);
         }
 
-        if (lower == "all") {
+        if (normalized.empty()) {
+            std::cerr << "Empty growth direction entry ignored" << std::endl;
+            continue;
+        }
+
+        if (normalized == "all" || normalized == "default") {
             return kDefaultDirections;
         }
-        if (lower == "down") {
-            allow_down = true;
+
+        auto mark_valid = [&](const cv::Vec2i& dir) {
+            append_unique(dir);
             any_valid = true;
+        };
+
+        if (normalized == "down") {
+            mark_valid({1, 0});
             continue;
         }
-        if (lower == "right") {
-            allow_right = true;
-            any_valid = true;
+        if (normalized == "right") {
+            mark_valid({0, 1});
             continue;
         }
-        if (lower == "up") {
-            allow_up = true;
-            any_valid = true;
+        if (normalized == "up") {
+            mark_valid({-1, 0});
             continue;
         }
-        if (lower == "left") {
-            allow_left = true;
-            any_valid = true;
+        if (normalized == "left") {
+            mark_valid({0, -1});
+            continue;
+        }
+        if (normalized == "downright") {
+            mark_valid({1, 1});
+            continue;
+        }
+        if (normalized == "downleft") {
+            mark_valid({1, -1});
+            continue;
+        }
+        if (normalized == "upright") {
+            mark_valid({-1, 1});
+            continue;
+        }
+        if (normalized == "upleft") {
+            mark_valid({-1, -1});
             continue;
         }
 
@@ -294,17 +333,6 @@ static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& para
     }
 
     if (!any_valid) {
-        return kDefaultDirections;
-    }
-
-    std::vector<cv::Vec2i> custom;
-    custom.reserve(4);
-    if (allow_down) custom.emplace_back(1, 0);
-    if (allow_right) custom.emplace_back(0, 1);
-    if (allow_up) custom.emplace_back(-1, 0);
-    if (allow_left) custom.emplace_back(0, -1);
-
-    if (custom.empty()) {
         return kDefaultDirections;
     }
 
@@ -1621,7 +1649,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         for (int i = 0; i < contours.size(); i++) {
             if (hierarchy[i][3] != -1) { // It's a hole
                 cv::Rect roi = cv::boundingRect(contours[i]);
-                
+
                 int margin = 4;
                 roi.x = std::max(0, roi.x - margin);
                 roi.y = std::max(0, roi.y - margin);
@@ -1642,7 +1670,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 // }
 
                 cv::Mat_<uchar> inpaint_mask(roi.size(), (uchar)1);
-                
+
                 std::vector<cv::Point> hole_contour_roi;
                 for(const auto& p : contours[i]) {
                     hole_contour_roi.push_back({p.x - roi.x, p.y - roi.y});
@@ -1654,7 +1682,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 inpaint(roi, inpaint_mask, trace_params, trace_data);
 
 #pragma omp critical
-                if (inpaint_count % snapshot_interval == 0 && !tgt_path.empty() && snapshot_interval > 0) {
+                if (snapshot_interval > 0 && !tgt_path.empty() && inpaint_count % snapshot_interval == 0) {
                     QuadSurface* surf = create_surface_from_state();
                     surf->save(tgt_path, true);
                     delete surf;

@@ -87,7 +87,7 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
             }
         }
 
-        handleGrowSurfaceRequested(method, direction, steps);
+        handleGrowSurfaceRequested(method, direction, steps, false);
         event->accept();
         return true;
     }
@@ -127,7 +127,7 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
     if (event->modifiers() == Qt::NoModifier && !event->isAutoRepeat()) {
         if (event->key() == Qt::Key_6) {
             const SegmentationGrowthMethod method = _widget ? _widget->growthMethod() : _growthMethod;
-            handleGrowSurfaceRequested(method, SegmentationGrowthDirection::All, 1);
+            handleGrowSurfaceRequested(method, SegmentationGrowthDirection::All, 1, false);
             event->accept();
             return true;
         }
@@ -159,7 +159,7 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
             _pendingShortcutDirections = std::vector<SegmentationGrowthDirection>{shortcutDirection};
             const int steps = _widget ? std::max(1, _widget->growthSteps()) : std::max(1, _growthSteps);
             const SegmentationGrowthMethod method = _widget ? _widget->growthMethod() : _growthMethod;
-            handleGrowSurfaceRequested(method, shortcutDirection, steps);
+            handleGrowSurfaceRequested(method, shortcutDirection, steps, false);
             event->accept();
             return true;
         }

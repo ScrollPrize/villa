@@ -216,10 +216,11 @@ public:
     ~SurfaceMeta();
     void readOverlapping();
     QuadSurface *surface();
-    void setSurface(QuadSurface *surf);
+    void setSurface(QuadSurface *surf, bool takeOwnership = true);
     std::string name();
     std::filesystem::path path;
     QuadSurface *_surf = nullptr;
+    bool _ownsSurface = false;
     Rect3D bbox;
     nlohmann::json *meta = nullptr;
     std::set<std::string> overlapping_str;

@@ -55,6 +55,7 @@ class SurfacePanelController;
 class MenuActionController;
 class SegmentationGrower;
 class WindowRangeWidget;
+class QLabel;
 
 class CWindow : public QMainWindow
 {
@@ -88,7 +89,8 @@ public slots:
     void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
     void onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                    SegmentationGrowthDirection direction,
-                                   int steps);
+                                   int steps,
+                                   bool inpaintOnly);
    void onFocusPOIChanged(std::string name, POI* poi);
     void onPointDoubleClicked(uint64_t pointId);
 
@@ -152,6 +154,7 @@ private slots:
     void onAxisAlignedSliceMousePress(CVolumeViewer* viewer, const cv::Vec3f& volLoc, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void onAxisAlignedSliceMouseMove(CVolumeViewer* viewer, const cv::Vec3f& volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
     void onAxisAlignedSliceMouseRelease(CVolumeViewer* viewer, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+    void onSegmentationGrowthStatusChanged(bool running);
 
 private:
     void recalcAreaForSegments(const std::vector<std::string>& ids);
@@ -188,6 +191,8 @@ private:
    QCheckBox* chkAxisAlignedSlices;
     WindowRangeWidget* _volumeWindowWidget{nullptr};
     WindowRangeWidget* _overlayWindowWidget{nullptr};
+    QLabel* _segmentationGrowthWarning{nullptr};
+    QString _segmentationGrowthStatusText;
 
 
     Ui_VCMainWindow ui;

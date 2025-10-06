@@ -63,7 +63,8 @@ public:
     bool start(const VolumeContext& volumeContext,
                SegmentationGrowthMethod method,
                SegmentationGrowthDirection direction,
-               int steps);
+               int steps,
+               bool inpaintOnly);
 
     bool running() const { return _running; }
 
@@ -76,6 +77,7 @@ private:
         QuadSurface* segmentationSurface{nullptr};
         double growthVoxelSize{0.0};
         bool usingCorrections{false};
+        bool inpaintOnly{false};
     };
 
     void finalize(bool ok);

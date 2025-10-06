@@ -45,6 +45,7 @@ SeedingWidget::SeedingWidget(VCCollection* point_collection, CSurfaceCollection*
     , jobsRunning(false)
     , _point_collection(point_collection)
     , _surface_collection(surface_collection)
+    , progressUtil(new ProgressUtil(nullptr, this))
 {
     qRegisterMetaType<PathPrimitive>("PathPrimitive");
     qRegisterMetaType<QList<PathPrimitive>>("QList<PathPrimitive>");
@@ -213,6 +214,11 @@ void SeedingWidget::setupUI()
     progressBar->setValue(0);
     progressBar->setVisible(false);
     mainLayout->addWidget(progressBar);
+    progressUtil->setProgressBar(progressBar);
+    ProgressUtil::ProgressBarOptions progressDefaults;
+    progressDefaults.textMode = ProgressUtil::ProgressTextMode::Percent;
+    progressDefaults.percentPrecision = 0;
+    progressUtil->configureProgressBar(progressDefaults);
     
     // Connect signals
     connect(modeButton, &QPushButton::clicked, [this, modeButton]() {
@@ -436,33 +442,34 @@ void SeedingWidget::castRays()
         return;
     }
     
-    // Setup progress tracking
-    progressBar->setVisible(true);
-    progressBar->setValue(0);
-    
+    POI* focusPoi = _surface_collection ? _surface_collection->poi("focus") : nullptr;
+    if (!focusPoi) {
+        QMessageBox::warning(this, "Warning", "No focus point set. Please set a focus point before casting rays.");
+        return;
+    }
+
     // Cast rays at regular angle steps
     const double angleStep = angleStepSpinBox->value();
     const int numSteps = static_cast<int>(360.0 / angleStep);
-    
+
+    ProgressUtil::ProgressBarOptions options;
+    options.textMode = ProgressUtil::ProgressTextMode::Percent;
+    progressUtil->startProgress(numSteps, &options);
+
     for (int i = 0; i < numSteps; i++) {
         // Calculate ray direction in 2D (will be used for XY plane)
         const double angle = i * angleStep * M_PI / 180.0;
         const cv::Vec2f rayDir(cos(angle), sin(angle));
-        
+
         // Find peaks along this ray in 3D
-        POI* focus_poi = _surface_collection->poi("focus");
-        if (!focus_poi) {
-            QMessageBox::warning(this, "Warning", "No focus point set. Please set a focus point before casting rays.");
-            return;
-        }
-        findPeaksAlongRay(rayDir, focus_poi->p);
-        
+        findPeaksAlongRay(rayDir, focusPoi->p);
+
         // Update progress
-        progressBar->setValue((i + 1) * 100 / numSteps);
+        progressUtil->updateProgress(i + 1);
         QApplication::processEvents();
     }
-    
-    progressBar->setVisible(false);
+
+    progressUtil->stopProgress();
 }
 
 void SeedingWidget::findPeaksAlongRay(
@@ -606,19 +613,7 @@ void SeedingWidget::onRunSegmentationClicked()
         QMessageBox::warning(this, "Error", "No points available for segmentation or volume package not loaded.");
         return;
     }
-    
-    // Update UI
-    progressBar->setVisible(true);
-    progressBar->setValue(0);
-    infoLabel->setText("Running segmentation jobs...");
-    runSegmentationButton->setEnabled(false);
-    expandSeedsButton->setEnabled(false);
-    
-    // Show cancel button and set jobs running
-    jobsRunning = true;
-    cancelButton->setVisible(true);
-    runningProcesses.clear();
-    
+
     const int numProcesses = processesSpinBox->value();
     const int totalPoints = static_cast<int>(allPoints.size());
     const int ompThreads = ompThreadsSpinBox ? ompThreadsSpinBox->value() : 0;
@@ -635,8 +630,6 @@ void SeedingWidget::onRunSegmentationClicked()
     } else {
         if (!fVpkg->hasVolumes()) {
             QMessageBox::warning(this, "Error", "No volumes in volume package.");
-            progressBar->setVisible(false);
-            runSegmentationButton->setEnabled(true);
             return;
         }
         
@@ -647,29 +640,38 @@ void SeedingWidget::onRunSegmentationClicked()
         
         if (!std::filesystem::exists(pathsDir)) {
             QMessageBox::warning(this, "Error", "Segmentation paths directory not found in volume package.");
-            progressBar->setVisible(false);
-            runSegmentationButton->setEnabled(true);
             return;
         }
     }
     
     if (!std::filesystem::exists(seedJsonPath)) {
         QMessageBox::warning(this, "Error", "seed.json not found in volume package.");
-        progressBar->setVisible(false);
-        runSegmentationButton->setEnabled(true);
         return;
     }
     
     if (!currentVolume) {
         QMessageBox::warning(this, "Error", "No current volume selected.");
-        progressBar->setVisible(false);
-        runSegmentationButton->setEnabled(true);
         return;
     }
     
     std::filesystem::path volumePath = currentVolume->path();
     QString workingDir = QString::fromStdString(pathsDir.parent_path().string());
-    
+
+    // Update UI
+    infoLabel->setText("Running segmentation jobs...");
+    runSegmentationButton->setEnabled(false);
+    expandSeedsButton->setEnabled(false);
+
+    // Show cancel button and set jobs running
+    jobsRunning = true;
+    cancelButton->setVisible(true);
+    runningProcesses.clear();
+
+    ProgressUtil::ProgressBarOptions barOptions;
+    barOptions.textMode = ProgressUtil::ProgressTextMode::DoneRemaining;
+    barOptions.fontPointSize = 11;
+    progressUtil->startProgress(totalPoints, &barOptions);
+
     // Track completion
     int completedJobs = 0;
     int nextPointIndex = 0;
@@ -708,7 +710,7 @@ void SeedingWidget::onRunSegmentationClicked()
                 
                 // Update progress
                 completedJobs++;
-                progressBar->setValue(completedJobs * 100 / totalPoints);
+                progressUtil->updateProgress(completedJobs);
                 
                 // Remove from running list (QPointer will handle null checking)
                 runningProcesses.removeOne(process);
@@ -721,7 +723,7 @@ void SeedingWidget::onRunSegmentationClicked()
                 
                 // Check if all done
                 if (completedJobs >= totalPoints) {
-                    progressBar->setVisible(false);
+                    progressUtil->stopProgress();
                     cancelButton->setVisible(false);
                     jobsRunning = false;
                     runningProcesses.clear();
@@ -768,6 +770,8 @@ void SeedingWidget::onRunSegmentationClicked()
     while (jobsRunning && completedJobs < totalPoints) {
         QApplication::processEvents(QEventLoop::AllEvents, 100);
     }
+
+    progressUtil->stopProgress();
 }
 
 
@@ -896,13 +900,13 @@ void SeedingWidget::analyzePaths()
     // Compute distance transform once
     computeDistanceTransform();
     
-    // Setup progress tracking
-    progressBar->setVisible(true);
-    progressBar->setValue(0);
-    
     int totalPaths = paths.size();
     int pathIndex = 0;
     
+    ProgressUtil::ProgressBarOptions options;
+    options.textMode = ProgressUtil::ProgressTextMode::Fraction;
+    progressUtil->startProgress(totalPaths, &options);
+
     // For each path
     for (const auto& path : paths) {
         // Analyze along this path
@@ -910,11 +914,11 @@ void SeedingWidget::analyzePaths()
         
         // Update progress
         pathIndex++;
-        progressBar->setValue(pathIndex * 100 / totalPaths);
+        progressUtil->updateProgress(pathIndex);
         QApplication::processEvents();
     }
-    
-    progressBar->setVisible(false);
+
+    progressUtil->stopProgress();
     
     // Enable segmentation button if we found peaks
     runSegmentationButton->setEnabled(!_point_collection->getPoints("seeding_peaks").empty());
@@ -1352,19 +1356,7 @@ void SeedingWidget::onExpandSeedsClicked()
         QMessageBox::warning(this, "Error", "Volume package or volume not loaded.");
         return;
     }
-    
-    // Update UI
-    progressBar->setVisible(true);
-    progressBar->setValue(0);
-    infoLabel->setText("Running expansion jobs...");
-    expandSeedsButton->setEnabled(false);
-    runSegmentationButton->setEnabled(false);
-    
-    // Show cancel button and set jobs running
-    jobsRunning = true;
-    cancelButton->setVisible(true);
-    runningProcesses.clear();
-    
+
     const int numProcesses = processesSpinBox->value();
     const int expansionIterations = expansionIterationsSpinBox->value();
     const int ompThreads = ompThreadsSpinBox ? ompThreadsSpinBox->value() : 0;
@@ -1381,8 +1373,6 @@ void SeedingWidget::onExpandSeedsClicked()
     } else {
         if (!fVpkg->hasVolumes()) {
             QMessageBox::warning(this, "Error", "No volumes in volume package.");
-            progressBar->setVisible(false);
-            expandSeedsButton->setEnabled(true);
             return;
         }
         
@@ -1393,22 +1383,34 @@ void SeedingWidget::onExpandSeedsClicked()
         
         if (!std::filesystem::exists(pathsDir)) {
             QMessageBox::warning(this, "Error", "Segmentation paths directory not found in volume package.");
-            progressBar->setVisible(false);
-            expandSeedsButton->setEnabled(true);
             return;
         }
     }
     
     if (!std::filesystem::exists(expandJsonPath)) {
         QMessageBox::warning(this, "Error", "expand.json not found in volume package.");
-        progressBar->setVisible(false);
-        expandSeedsButton->setEnabled(true);
         return;
     }
     
     std::filesystem::path volumePath = currentVolume->path();
     QString workingDir = QString::fromStdString(pathsDir.parent_path().string());
-    
+
+    // Update UI
+    infoLabel->setText("Running expansion jobs...");
+    expandSeedsButton->setEnabled(false);
+    runSegmentationButton->setEnabled(false);
+
+    // Show cancel button and set jobs running
+    jobsRunning = true;
+    cancelButton->setVisible(true);
+    runningProcesses.clear();
+
+    ProgressUtil::ProgressBarOptions barOptions;
+    barOptions.textMode = ProgressUtil::ProgressTextMode::DoneRemaining;
+    barOptions.fontPointSize = 11;
+    barOptions.prefix = tr("Expansion ");
+    progressUtil->startProgress(expansionIterations, &barOptions);
+
     // Track completion
     int completedJobs = 0;
     int nextIterationIndex = 0;
@@ -1446,7 +1448,7 @@ void SeedingWidget::onExpandSeedsClicked()
                 
                 // Update progress
                 completedJobs++;
-                progressBar->setValue(completedJobs * 100 / expansionIterations);
+                progressUtil->updateProgress(completedJobs);
                 
                 // Remove from running list (QPointer will handle null checking)
                 runningProcesses.removeOne(process);
@@ -1459,7 +1461,7 @@ void SeedingWidget::onExpandSeedsClicked()
                 
                 // Check if all done
                 if (completedJobs >= expansionIterations) {
-                    progressBar->setVisible(false);
+                    progressUtil->stopProgress();
                     cancelButton->setVisible(false);
                     jobsRunning = false;
                     runningProcesses.clear();
@@ -1500,6 +1502,8 @@ void SeedingWidget::onExpandSeedsClicked()
     while (jobsRunning && completedJobs < expansionIterations) {
         QApplication::processEvents(QEventLoop::AllEvents, 100);
     }
+
+    progressUtil->stopProgress();
 }
 
 void SeedingWidget::onCancelClicked()
@@ -1536,12 +1540,11 @@ void SeedingWidget::onCancelClicked()
     }
     
     // Clear the list
-    runningProcesses.clear();
+   runningProcesses.clear();
     
     // Update UI
     cancelButton->setVisible(false);
-    progressBar->setVisible(false);
-    progressBar->setValue(0);
+    progressUtil->stopProgress();
     infoLabel->setText("Jobs cancelled by user");
     
     // Re-enable buttons
