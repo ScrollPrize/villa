@@ -1137,7 +1137,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
             cv::Mat_<float> loss_snap(generations_crop.size(), 0.0f);
             cv::Mat_<float> loss_sdir(generations_crop.size(), 0.0f);
 
-#pragma omp paralle for schedule(dynamic)
+#pragma omp parallel for schedule(dynamic)
             for (int y = 0; y < generations_crop.rows; ++y) {
                 for (int x = 0; x < generations_crop.cols; ++x) {
                     cv::Vec2i p = {used_area_safe.y + y, used_area_safe.x + x};
