@@ -26,6 +26,8 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <algorithm>
+#include <cmath>
 #include <omp.h>  // ensure omp_get_max_threads() is declared
 
 #include "vc/tracer/Tracer.hpp"
@@ -86,6 +88,160 @@ struct Vec2iLess {
         }
         return a[1] < b[1];
     }
+};
+
+constexpr double kRadiansPerDegree = 3.141592653589793238462643383279502884L / 180.0;
+constexpr double kDegreesPerRadian = 1.0 / kRadiansPerDegree;
+
+template <typename T>
+static bool point_in_bounds(const cv::Mat_<T>& mat, const cv::Vec2i& p)
+{
+    return p[0] >= 0 && p[0] < mat.rows && p[1] >= 0 && p[1] < mat.cols;
+}
+
+class UmbilicusThetaIncreaseLoss {
+public:
+    UmbilicusThetaIncreaseLoss(const vc::core::util::Umbilicus& umbilicus, double weight, double min_delta_rad)
+        : umbilicus_(&umbilicus), weight_(weight), min_delta_rad_(min_delta_rad) {}
+
+    template <typename T>
+    bool operator()(const T* const base, const T* const next, T* residual) const
+    {
+        if (!umbilicus_ || !umbilicus_->has_seam() || umbilicus_->centers().empty()) {
+            residual[0] = T(0);
+            return true;
+        }
+
+        const T theta_base = compute_theta(base);
+        const T theta_next = compute_theta(next);
+
+        const T diff = theta_next - theta_base;
+        const T desired = T(min_delta_rad_);
+        const T shortage = desired - diff;
+        const T abs_shortage = ceres::sqrt(shortage * shortage);
+        const T hinge = (shortage + abs_shortage) * T(0.5);
+
+        residual[0] = T(weight_) * hinge;
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const vc::core::util::Umbilicus& umbilicus, double weight, double min_delta_rad)
+    {
+        return new ceres::AutoDiffCostFunction<UmbilicusThetaIncreaseLoss, 1, 3, 3>(
+            new UmbilicusThetaIncreaseLoss(umbilicus, weight, min_delta_rad));
+    }
+
+private:
+    template <typename T>
+    T compute_theta(const T* const point) const
+    {
+        const auto& centers = umbilicus_->centers();
+        const auto& seam_points = umbilicus_->seam_endpoints();
+        const int max_index = static_cast<int>(centers.size() - 1);
+
+        const double z_value = val(point[2]);
+        int index = static_cast<int>(std::lround(z_value));
+        index = std::clamp(index, 0, max_index);
+
+        const cv::Vec3f& center = centers[index];
+        const cv::Vec3f& seam = seam_points[index];
+
+        const T base_x = T(static_cast<double>(seam[0] - center[0]));
+        const T base_y = T(static_cast<double>(seam[1] - center[1]));
+        const T ray_x = point[0] - T(static_cast<double>(center[0]));
+        const T ray_y = point[1] - T(static_cast<double>(center[1]));
+
+        const T dot = base_x * ray_x + base_y * ray_y;
+        const T det = base_x * ray_y - base_y * ray_x;
+        return ceres::atan2(det, dot);
+    }
+
+    const vc::core::util::Umbilicus* umbilicus_;
+    double weight_;
+    double min_delta_rad_;
+};
+
+class UmbilicusThetaStabilityLoss {
+public:
+    UmbilicusThetaStabilityLoss(const vc::core::util::Umbilicus& umbilicus, double weight)
+        : umbilicus_(&umbilicus), weight_(weight) {}
+
+    template <typename T>
+    bool operator()(const T* const a, const T* const b, T* residual) const
+    {
+        if (!umbilicus_ || !umbilicus_->has_seam() || umbilicus_->centers().empty()) {
+            residual[0] = T(0);
+            return true;
+        }
+
+        const T theta_a = compute_theta(a);
+        const T theta_b = compute_theta(b);
+        residual[0] = T(weight_) * (theta_b - theta_a);
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const vc::core::util::Umbilicus& umbilicus, double weight)
+    {
+        return new ceres::AutoDiffCostFunction<UmbilicusThetaStabilityLoss, 1, 3, 3>(
+            new UmbilicusThetaStabilityLoss(umbilicus, weight));
+    }
+
+private:
+    template <typename T>
+    T compute_theta(const T* const point) const
+    {
+        const auto& centers = umbilicus_->centers();
+        const auto& seam_points = umbilicus_->seam_endpoints();
+        const int max_index = static_cast<int>(centers.size() - 1);
+
+        const double z_value = val(point[2]);
+        int index = static_cast<int>(std::lround(z_value));
+        index = std::clamp(index, 0, max_index);
+
+        const cv::Vec3f& center = centers[index];
+        const cv::Vec3f& seam = seam_points[index];
+
+        const T base_x = T(static_cast<double>(seam[0] - center[0]));
+        const T base_y = T(static_cast<double>(seam[1] - center[1]));
+        const T ray_x = point[0] - T(static_cast<double>(center[0]));
+        const T ray_y = point[1] - T(static_cast<double>(center[1]));
+
+        const T dot = base_x * ray_x + base_y * ray_y;
+        const T det = base_x * ray_y - base_y * ray_x;
+        return ceres::atan2(det, dot);
+    }
+
+    const vc::core::util::Umbilicus* umbilicus_;
+    double weight_;
+};
+
+class UmbilicusRowZFlatLoss {
+public:
+    UmbilicusRowZFlatLoss(double weight, double tolerance)
+        : weight_(weight), tolerance_(tolerance) {}
+
+    template <typename T>
+    bool operator()(const T* const a, const T* const b, T* residual) const
+    {
+        // small epsilon keeps autodiff stable when dz ~= 0
+        constexpr double kEps = 1e-12;
+        const T dz = b[2] - a[2];
+        const T abs_dz = ceres::sqrt(dz * dz + T(kEps));
+        const T delta = abs_dz - T(tolerance_);
+        const T relu = T(0.5) * (delta + ceres::sqrt(delta * delta + T(kEps)));
+        residual[0] = T(weight_) * relu;
+        return true;
+    }
+
+    static ceres::CostFunction* Create(double weight, double tolerance)
+    {
+        return new ceres::AutoDiffCostFunction<UmbilicusRowZFlatLoss, 1, 3, 3>(
+            new UmbilicusRowZFlatLoss(weight, tolerance));
+    }
+
+private:
+    double weight_;
+    double tolerance_;
 };
 
 class PointCorrection {
@@ -201,6 +357,10 @@ enum LossType {
     NORMAL,
     SDIR,
     UMBILICUS_NORMAL,
+    UMBILICUS_THETA_ROW,
+    UMBILICUS_THETA_COL,
+    UMBILICUS_ROW_Z_FLAT,
+    UMBILICUS_ROW_Z_COL_FLAT,
     COUNT
 };
 
@@ -216,6 +376,10 @@ struct LossSettings {
         w[LossType::DIRECTION] = 1.0f;
         w[LossType::SDIR] = 0.00f; // conservative default; tune 0.01–0.10 maybe
         w[LossType::UMBILICUS_NORMAL] = 0.05f;
+        w[LossType::UMBILICUS_THETA_ROW] = 0.1f;
+        w[LossType::UMBILICUS_THETA_COL] = 0.1f;
+        w[LossType::UMBILICUS_ROW_Z_FLAT] = 0.05f;
+        w[LossType::UMBILICUS_ROW_Z_COL_FLAT] = 0.05f;
     }
 
     float operator()(LossType type, const cv::Vec2i& p) const {
@@ -231,6 +395,9 @@ struct LossSettings {
 
     int z_min = -1;
     int z_max = std::numeric_limits<int>::max();
+    double theta_row_min_delta = 0.1 * kRadiansPerDegree;
+    double row_z_flat_tolerance = 0.5;
+    double row_z_col_flat_tolerance = 0.5;
 };
 
 static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& params)
@@ -365,6 +532,22 @@ static int gen_sdirichlet_loss(ceres::Problem &problem, const cv::Vec2i &p,
                                double sdir_eps_abs, double sdir_eps_rel);
 static int gen_umbilicus_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params,
                               const TraceData &trace_data, const LossSettings &settings);
+static int gen_umbilicus_theta_row_loss(ceres::Problem &problem, const cv::Vec2i &p,
+                                        TraceParameters &params, const TraceData &trace_data,
+                                        const LossSettings &settings);
+static int gen_umbilicus_theta_col_loss(ceres::Problem &problem, const cv::Vec2i &p,
+                                        TraceParameters &params, const TraceData &trace_data,
+                                        const LossSettings &settings);
+static int gen_umbilicus_row_z_flat_loss(ceres::Problem &problem, const cv::Vec2i &p,
+                                         TraceParameters &params, const TraceData &trace_data,
+                                         const LossSettings &settings);
+static int gen_umbilicus_row_z_col_flat_loss(ceres::Problem &problem, const cv::Vec2i &p,
+                                             TraceParameters &params, const TraceData &trace_data,
+                                             const LossSettings &settings);
+static int conditional_umbilicus_row_z_flat_loss(int bit, const cv::Vec2i &p, const cv::Vec2i &off,
+                                                 cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem,
+                                                 TraceParameters &params, const TraceData &trace_data,
+                                                 const LossSettings &settings, bool column_partner);
 static int conditional_sdirichlet_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
                                        ceres::Problem &problem, TraceParameters &params,
                                        const LossSettings &settings, double sdir_eps_abs, double sdir_eps_rel);
@@ -595,6 +778,134 @@ static int gen_umbilicus_loss(ceres::Problem &problem, const cv::Vec2i &p, Trace
     return 1;
 }
 
+static int gen_umbilicus_theta_row_loss(ceres::Problem &problem, const cv::Vec2i &p,
+                                        TraceParameters &params, const TraceData &trace_data,
+                                        const LossSettings &settings)
+{
+    if (!trace_data.umbilicus || !trace_data.umbilicus->has_seam()) {
+        return 0;
+    }
+
+    const cv::Vec2i neighbor = p + cv::Vec2i(1, 0);
+    if (!point_in_bounds(params.state, neighbor) || !point_in_bounds(params.dpoints, neighbor)) {
+        return 0;
+    }
+
+    if (!coord_valid(params.state(p)) || !coord_valid(params.state(neighbor))) {
+        return 0;
+    }
+
+    const float weight = settings(LossType::UMBILICUS_THETA_ROW, p);
+    if (weight <= 0.0f) {
+        return 0;
+    }
+
+    double* base = &params.dpoints(p)[0];
+    double* next = &params.dpoints(neighbor)[0];
+    problem.AddResidualBlock(
+        UmbilicusThetaIncreaseLoss::Create(*trace_data.umbilicus, weight, settings.theta_row_min_delta),
+        nullptr,
+        base,
+        next);
+    return 1;
+}
+
+static int gen_umbilicus_theta_col_loss(ceres::Problem &problem, const cv::Vec2i &p,
+                                        TraceParameters &params, const TraceData &trace_data,
+                                        const LossSettings &settings)
+{
+    if (!trace_data.umbilicus || !trace_data.umbilicus->has_seam()) {
+        return 0;
+    }
+
+    const cv::Vec2i neighbor = p + cv::Vec2i(0, 1);
+    if (!point_in_bounds(params.state, neighbor) || !point_in_bounds(params.dpoints, neighbor)) {
+        return 0;
+    }
+
+    if (!coord_valid(params.state(p)) || !coord_valid(params.state(neighbor))) {
+        return 0;
+    }
+
+    const float weight = settings(LossType::UMBILICUS_THETA_COL, p);
+    if (weight <= 0.0f) {
+        return 0;
+    }
+
+    double* left = &params.dpoints(p)[0];
+    double* right = &params.dpoints(neighbor)[0];
+    problem.AddResidualBlock(
+        UmbilicusThetaStabilityLoss::Create(*trace_data.umbilicus, weight),
+        nullptr,
+        left,
+        right);
+    return 1;
+}
+
+static int gen_umbilicus_row_z_flat_loss(ceres::Problem &problem, const cv::Vec2i &p,
+                                         TraceParameters &params, const TraceData &trace_data,
+                                         const LossSettings &settings)
+{
+    if (!trace_data.umbilicus) {
+        return 0;
+    }
+
+    const cv::Vec2i neighbor = p + cv::Vec2i(1, 0);
+    if (!point_in_bounds(params.state, neighbor) || !point_in_bounds(params.dpoints, neighbor)) {
+        return 0;
+    }
+
+    if (!coord_valid(params.state(p)) || !coord_valid(params.state(neighbor))) {
+        return 0;
+    }
+
+    const float weight = settings(LossType::UMBILICUS_ROW_Z_FLAT, p);
+    if (weight <= 0.0f) {
+        return 0;
+    }
+
+    double* base = &params.dpoints(p)[0];
+    double* next = &params.dpoints(neighbor)[0];
+    problem.AddResidualBlock(
+        UmbilicusRowZFlatLoss::Create(weight, settings.row_z_flat_tolerance),
+        nullptr,
+        base,
+        next);
+    return 1;
+}
+
+static int gen_umbilicus_row_z_col_flat_loss(ceres::Problem &problem, const cv::Vec2i &p,
+                                             TraceParameters &params, const TraceData &trace_data,
+                                             const LossSettings &settings)
+{
+    if (!trace_data.umbilicus) {
+        return 0;
+    }
+
+    const cv::Vec2i neighbor = p + cv::Vec2i(0, 1);
+    if (!point_in_bounds(params.state, neighbor) || !point_in_bounds(params.dpoints, neighbor)) {
+        return 0;
+    }
+
+    if (!coord_valid(params.state(p)) || !coord_valid(params.state(neighbor))) {
+        return 0;
+    }
+
+    const float weight = settings(LossType::UMBILICUS_ROW_Z_COL_FLAT, p);
+    if (weight <= 0.0f) {
+        return 0;
+    }
+
+    double* left = &params.dpoints(p)[0];
+    double* right = &params.dpoints(neighbor)[0];
+    problem.AddResidualBlock(
+        UmbilicusRowZFlatLoss::Create(weight, settings.row_z_col_flat_tolerance),
+        nullptr,
+        left,
+        right);
+    return 1;
+}
+
 static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
     ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings)
 {
@@ -602,6 +913,69 @@ static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_
     int set = 0;
     if (!loss_mask(bit, p, {0,0}, loss_status))
         set = set_loss_mask(bit, p, {0,0}, loss_status, gen_normal_loss(problem, p, params, trace_data, settings));
+    return set;
+};
+
+static int conditional_umbilicus_row_z_flat_loss(int bit, const cv::Vec2i &p, const cv::Vec2i &off,
+    cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params,
+    const TraceData &trace_data, const LossSettings &settings, bool column_partner)
+{
+    if (!trace_data.umbilicus) {
+        return 0;
+    }
+
+    int set = 0;
+    if (!loss_mask(bit, p, off, loss_status)) {
+        if (column_partner) {
+            set = set_loss_mask(bit, p, off, loss_status,
+                                gen_umbilicus_row_z_col_flat_loss(problem, p, params, trace_data, settings));
+        } else {
+            set = set_loss_mask(bit, p, off, loss_status,
+                                gen_umbilicus_row_z_flat_loss(problem, p, params, trace_data, settings));
+        }
+    }
+    return set;
+};
+
+static int conditional_umbilicus_theta_row_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
+    ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings)
+{
+    if (!trace_data.umbilicus || !trace_data.umbilicus->has_seam()) {
+        return 0;
+    }
+    int set = 0;
+    if (!loss_mask(bit, p, {1,0}, loss_status)) {
+        set = set_loss_mask(bit, p, {1,0}, loss_status,
+            gen_umbilicus_theta_row_loss(problem, p, params, trace_data, settings));
+    }
+    return set;
+};
+
+static int conditional_umbilicus_theta_col_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
+    ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings)
+{
+    if (!trace_data.umbilicus || !trace_data.umbilicus->has_seam()) {
+        return 0;
+    }
+    int set = 0;
+    if (!loss_mask(bit, p, {0,1}, loss_status)) {
+        set = set_loss_mask(bit, p, {0,1}, loss_status,
+            gen_umbilicus_theta_col_loss(problem, p, params, trace_data, settings));
+    }
+    return set;
+};
+
+static int conditional_umbilicus_quad_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
+    ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings)
+{
+    if (!trace_data.umbilicus) {
+        return 0;
+    }
+    int set = 0;
+    if (!loss_mask(bit, p, {0,0}, loss_status)) {
+        set = set_loss_mask(bit, p, {0,0}, loss_status,
+            gen_umbilicus_loss(problem, p, params, trace_data, settings));
+    }
     return set;
 };
 
@@ -754,6 +1128,10 @@ static int add_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParamete
 
     if (trace_data.umbilicus) {
         count += gen_umbilicus_loss(problem, p, params, trace_data, settings);
+        count += gen_umbilicus_theta_row_loss(problem, p, params, trace_data, settings);
+        count += gen_umbilicus_theta_col_loss(problem, p, params, trace_data, settings);
+//        count += gen_umbilicus_row_z_flat_loss(problem, p, params, trace_data, settings);
+//        count += gen_umbilicus_row_z_col_flat_loss(problem, p, params, trace_data, settings);
     }
 
     if (flags & LOSS_SDIR) {
@@ -913,6 +1291,15 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_normal_loss(10, p + cv::Vec2i(-1,-1), loss_status, problem, params, trace_data, settings);
     count += conditional_normal_loss(10, p + cv::Vec2i( 0,-1), loss_status, problem, params, trace_data, settings);
     count += conditional_normal_loss(10, p + cv::Vec2i(-1, 0), loss_status, problem, params, trace_data, settings);
+
+    // umbilicus-specific costs
+    count += conditional_umbilicus_quad_loss(14, p, loss_status, problem, params, trace_data, settings);
+    count += conditional_umbilicus_theta_row_loss(15, p, loss_status, problem, params, trace_data, settings);
+    count += conditional_umbilicus_theta_col_loss(16, p, loss_status, problem, params, trace_data, settings);
+
+    // umbilicus row/column z flattening
+//    count += conditional_umbilicus_row_z_flat_loss(12, p, cv::Vec2i(1, 0), loss_status, problem, params, trace_data, settings, /*column_partner=*/false);
+//    count += conditional_umbilicus_row_z_flat_loss(13, p, cv::Vec2i(0, 1), loss_status, problem, params, trace_data, settings, /*column_partner=*/true);
 
     //snapping
     count += conditional_corr_loss(11, p,                    loss_status, problem, params.state, params.dpoints, trace_data);
@@ -1256,6 +1643,41 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     loss_settings[LossType::SDIR] = static_cast<float>(sdir_w);
     const double umbilicus_w = params.value("umbilicus_weight", static_cast<double>(loss_settings[LossType::UMBILICUS_NORMAL]));
     loss_settings[LossType::UMBILICUS_NORMAL] = static_cast<float>(umbilicus_w);
+    const double theta_row_w = params.value("umbilicus_theta_row_weight", static_cast<double>(loss_settings[LossType::UMBILICUS_THETA_ROW]));
+    loss_settings[LossType::UMBILICUS_THETA_ROW] = static_cast<float>(theta_row_w);
+    const double theta_col_w = params.value("umbilicus_theta_col_weight", static_cast<double>(loss_settings[LossType::UMBILICUS_THETA_COL]));
+    loss_settings[LossType::UMBILICUS_THETA_COL] = static_cast<float>(theta_col_w);
+    const double theta_row_min_delta_deg = params.value(
+        "umbilicus_theta_row_min_delta_deg",
+        loss_settings.theta_row_min_delta * kDegreesPerRadian);
+    loss_settings.theta_row_min_delta = theta_row_min_delta_deg * kRadiansPerDegree;
+    const double row_z_flat_w = params.value("umbilicus_row_z_flat_weight", static_cast<double>(loss_settings[LossType::UMBILICUS_ROW_Z_FLAT]));
+    loss_settings[LossType::UMBILICUS_ROW_Z_FLAT] = static_cast<float>(row_z_flat_w);
+    loss_settings.row_z_flat_tolerance = params.value(
+        "umbilicus_row_z_flat_tolerance",
+        loss_settings.row_z_flat_tolerance);
+    const double row_z_col_flat_w = params.value("umbilicus_row_z_col_flat_weight", static_cast<double>(loss_settings[LossType::UMBILICUS_ROW_Z_COL_FLAT]));
+    loss_settings[LossType::UMBILICUS_ROW_Z_COL_FLAT] = static_cast<float>(row_z_col_flat_w);
+    loss_settings.row_z_col_flat_tolerance = params.value(
+        "umbilicus_row_z_col_flat_tolerance",
+        loss_settings.row_z_col_flat_tolerance);
+
+    std::cout << "GrowPatch loss weights:\n"
+              << "  DIST: " << loss_settings.w[LossType::DIST]
+              << " STRAIGHT: " << loss_settings.w[LossType::STRAIGHT]
+              << " DIRECTION: " << loss_settings.w[LossType::DIRECTION]
+              << " SNAP: " << loss_settings.w[LossType::SNAP]
+              << " NORMAL: " << loss_settings.w[LossType::NORMAL]
+              << " SDIR: " << loss_settings.w[LossType::SDIR]
+              << "\n  Umbilicus Normal: " << loss_settings.w[LossType::UMBILICUS_NORMAL]
+              << " Theta Row: " << loss_settings.w[LossType::UMBILICUS_THETA_ROW]
+              << " Theta Col: " << loss_settings.w[LossType::UMBILICUS_THETA_COL]
+              << " Row Z Flat: " << loss_settings.w[LossType::UMBILICUS_ROW_Z_FLAT]
+              << " Row Z Col Flat: " << loss_settings.w[LossType::UMBILICUS_ROW_Z_COL_FLAT]
+              << "\n  Theta Row Min Delta (deg): " << (loss_settings.theta_row_min_delta * kDegreesPerRadian)
+              << " Row Z Flat Tol: " << loss_settings.row_z_flat_tolerance
+              << " Row Z Col Flat Tol: " << loss_settings.row_z_col_flat_tolerance
+              << std::endl;
     int rewind_gen = params.value("rewind_gen", -1);
     loss_settings.z_min = params.value("z_min", -1);
     loss_settings.z_max = params.value("z_max", std::numeric_limits<int>::max());
@@ -1328,6 +1750,12 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 } else {
                     std::cerr << "umbilicus_seam_point must be an array with three numeric entries" << std::endl;
                 }
+            }
+
+            try {
+                umbilicus->set_seam_from_point(origin);
+            } catch (const std::exception& e) {
+                std::cerr << "Failed to set umbilicus seam from origin: " << e.what() << std::endl;
             }
 
             trace_data.umbilicus_storage = std::move(umbilicus);
