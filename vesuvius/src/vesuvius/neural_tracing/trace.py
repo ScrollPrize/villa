@@ -156,24 +156,37 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
 
                 # TODO: more generally, can just be a single loop over points in *arbitrary* order, and we figure out what already exists in the patch to use as conditioning
                 #  that'd nicely separate the growing strategy from constructing the conditioning signal
+                #  this would allow working around holes, in theory)
+                #  could prioritise maximally-supported points where possible, which effectively makes it do something triangle-like
 
                 # TODO: fallback conditioning inputs for fail (no-blob / NaN) cases
+                #  ...so try to grow a point rightwards instead of downwards
 
-                assert direction == 'u'  # TODO! need to conditionally flip u/v in each of the following cases
                 if row_idx == 1 and col_idx == 0:  # first point of second row
                     # Conditioned on center and right, predict below & above
                     # Note this one is ambiguous for +/- direction and we choose arbitrarily below, based on largest blob
-                    heatmaps, min_corner_zyx = get_heatmaps_at(rows[0][0], prev_u=None, prev_v=rows[0][1], prev_diag=None)
+                    prev_u = None
+                    prev_v = rows[0][1]
+                    prev_diag = None
                 elif row_idx == 1:  # later points of second row
                     # Conditioned on center and left and below-left, predict below
-                    heatmaps, min_corner_zyx = get_heatmaps_at(rows[0][col_idx], prev_u=None, prev_v=rows[0][col_idx - 1], prev_diag=next_row[-1])
+                    prev_u = None
+                    prev_v = rows[0][col_idx - 1]
+                    prev_diag = next_row[-1]
                 elif col_idx == 0:  # first point of later rows
                     # Conditioned on center and above and right, predict below
-                    heatmaps, min_corner_zyx = get_heatmaps_at(rows[-1][0], prev_u=rows[-2][0], prev_v=rows[-1][1], prev_diag=None)
+                    prev_u=rows[-2][0]
+                    prev_v = rows[-1][1]
+                    prev_diag = None
                 else:  # later points of later rows
                     # Conditioned on center and left and above and below-left, predict below
-                    heatmaps, min_corner_zyx = get_heatmaps_at(rows[-1][col_idx], prev_u=rows[-2][col_idx], prev_v=rows[-1][col_idx - 1], prev_diag=next_row[-1])
+                    prev_u = rows[-2][col_idx]
+                    prev_v = rows[-1][col_idx - 1]
+                    prev_diag = next_row[-1]
 
+                if direction == 'v':
+                    prev_u, prev_v = prev_v, prev_u
+                heatmaps, min_corner_zyx = get_heatmaps_at(rows[-1][col_idx], prev_u=prev_u, prev_v=prev_v, prev_diag=prev_diag)
                 coordinates = get_blob_coordinates(heatmaps[0 if direction == 'u' else 1].squeeze(0), min_corner_zyx)
                 if len(coordinates) == 0 or coordinates[0].isnan().any():
                     print('warning: no point found!')
