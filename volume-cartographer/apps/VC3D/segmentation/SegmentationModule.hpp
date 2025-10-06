@@ -119,7 +119,8 @@ signals:
     void focusPoiRequested(const cv::Vec3f& position, QuadSurface* surface);
     void growSurfaceRequested(SegmentationGrowthMethod method,
                               SegmentationGrowthDirection direction,
-                              int steps);
+                              int steps,
+                              bool inpaintOnly);
 
 private:
     friend class SegmentationBrushTool;
@@ -178,7 +179,8 @@ private:
 
     void handleGrowSurfaceRequested(SegmentationGrowthMethod method,
                                     SegmentationGrowthDirection direction,
-                                    int steps);
+                                    int steps,
+                                    bool inpaintOnly);
     void setInvalidationBrushActive(bool active);
     void clearInvalidationBrush();
     void deactivateInvalidationBrush();

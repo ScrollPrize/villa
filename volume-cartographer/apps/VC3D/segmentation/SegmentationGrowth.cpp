@@ -222,6 +222,8 @@ nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
         params["grow_extra_cols"] = std::max(0, request.steps);
     }
 
+    params["inpaint"] = request.inpaintOnly;
+
     bool allowUp = false;
     bool allowDown = false;
     bool allowLeft = false;

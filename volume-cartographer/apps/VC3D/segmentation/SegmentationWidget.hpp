@@ -99,7 +99,8 @@ signals:
     void smoothingIterationsChanged(int value);
     void growSurfaceRequested(SegmentationGrowthMethod method,
                               SegmentationGrowthDirection direction,
-                              int steps);
+                              int steps,
+                              bool inpaintOnly);
     void applyRequested();
     void resetRequested();
     void stopToolsRequested();
@@ -134,7 +135,7 @@ private:
     void validateCustomParamsText();
     void updateCustomParamsStatus();
     std::optional<nlohmann::json> parseCustomParams(QString* error) const;
-    void triggerGrowthRequest(SegmentationGrowthDirection direction, int steps);
+    void triggerGrowthRequest(SegmentationGrowthDirection direction, int steps, bool inpaintOnly);
     void applyAlphaPushPullConfig(const AlphaPushPullConfig& config, bool emitSignal, bool persist = true);
 
     bool _editingEnabled{false};
@@ -176,6 +177,7 @@ private:
     QGroupBox* _groupGrowth{nullptr};
     QSpinBox* _spinGrowthSteps{nullptr};
     QPushButton* _btnGrow{nullptr};
+    QPushButton* _btnInpaint{nullptr};
     QCheckBox* _chkGrowthDirUp{nullptr};
     QCheckBox* _chkGrowthDirDown{nullptr};
     QCheckBox* _chkGrowthDirLeft{nullptr};

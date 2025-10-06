@@ -628,11 +628,13 @@ SegmentationCorrectionsPayload SegmentationModule::buildCorrectionsPayload() con
 }
 void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod method,
                                                     SegmentationGrowthDirection direction,
-                                                    int steps)
+                                                    int steps,
+                                                    bool inpaintOnly)
 {
     qCInfo(lcSegModule) << "Grow request" << segmentationGrowthMethodToString(method)
                         << segmentationGrowthDirectionToString(direction)
-                        << "steps" << steps;
+                        << "steps" << steps
+                        << "inpaintOnly" << inpaintOnly;
 
     if (_growthInProgress) {
         emit statusMessageRequested(tr("Surface growth already in progress"), kStatusMedium);
@@ -648,10 +650,13 @@ void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod met
         _brushTool->applyPending(_dragRadiusSteps);
     }
 
-    _growthMethod = method;
-    _growthSteps = std::max(1, steps);
+    if (!inpaintOnly) {
+        _growthMethod = method;
+        _growthSteps = std::max(1, steps);
+    }
     markNextEditsFromGrowth();
-    emit growSurfaceRequested(method, direction, _growthSteps);
+    const int sanitizedSteps = inpaintOnly ? std::max(0, steps) : std::max(1, steps);
+    emit growSurfaceRequested(method, direction, sanitizedSteps, inpaintOnly);
 }
 
 void SegmentationModule::setInvalidationBrushActive(bool active)

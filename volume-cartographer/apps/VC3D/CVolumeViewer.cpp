@@ -715,6 +715,20 @@ void CVolumeViewer::setPointCollection(VCCollection* point_collection)
     emit overlaysUpdated();
 }
 
+Surface* CVolumeViewer::currentSurface() const
+{
+    if (!_surf_col) {
+        return _surf;
+    }
+
+    Surface* surface = _surf_col->surface(_surf_name);
+    if (surface != _surf) {
+        const_cast<CVolumeViewer*>(this)->_surf = surface;
+    }
+
+    return surface;
+}
+
 void CVolumeViewer::setSurface(const std::string &name)
 {
     _surf_name = name;

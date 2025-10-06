@@ -2650,7 +2650,8 @@ void CWindow::onSegmentationStopToolsRequested()
 
 void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                         SegmentationGrowthDirection direction,
-                                        int steps)
+                                        int steps,
+                                        bool inpaintOnly)
 {
     if (!_segmentationGrower) {
         statusBar()->showMessage(tr("Segmentation growth is unavailable."), 4000);
@@ -2674,7 +2675,7 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
         _normalGridPath
     };
 
-    if (!_segmentationGrower->start(volumeContext, method, direction, steps)) {
+    if (!_segmentationGrower->start(volumeContext, method, direction, steps, inpaintOnly)) {
         return;
     }
 }

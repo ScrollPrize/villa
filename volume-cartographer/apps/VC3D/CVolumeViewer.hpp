@@ -82,7 +82,7 @@ public:
     // Transform scene coordinates to volume coordinates
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const;
     QPointF volumePointToScene(const cv::Vec3f& vol_point) { return volumeToScene(vol_point); }
-    Surface* currentSurface() const { return _surf; }
+    Surface* currentSurface() const;
 
     // BBox drawing mode for segmentation view
     void setBBoxMode(bool enabled);

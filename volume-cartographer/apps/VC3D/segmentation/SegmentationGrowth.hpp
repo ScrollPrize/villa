@@ -146,6 +146,7 @@ struct SegmentationGrowthRequest {
     std::optional<std::pair<int, int>> correctionsZRange;
     std::vector<SegmentationDirectionFieldConfig> directionFields;
     std::optional<nlohmann::json> customParams;
+    bool inpaintOnly{false};
 };
 
 struct TracerGrowthContext {

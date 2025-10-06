@@ -160,7 +160,8 @@ void SegmentationGrower::setSurfacePanel(SurfacePanelController* panel)
 bool SegmentationGrower::start(const VolumeContext& volumeContext,
                                SegmentationGrowthMethod method,
                                SegmentationGrowthDirection direction,
-                               int steps)
+                               int steps,
+                               bool inpaintOnly)
 {
     auto showStatus = [&](const QString& text, int timeout) {
         if (_callbacks.showStatus) {
@@ -232,12 +233,13 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         return false;
     }
 
-    steps = std::max(1, steps);
+    steps = inpaintOnly ? std::max(0, steps) : std::max(1, steps);
 
     SegmentationGrowthRequest request;
     request.method = method;
     request.direction = direction;
     request.steps = steps;
+    request.inpaintOnly = inpaintOnly;
 
     if (auto overrideDirs = _context.module->takeShortcutDirectionOverride()) {
         request.allowedDirections = std::move(*overrideDirs);
@@ -302,13 +304,17 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             showStatus(tr("No correction points provided; running tracer growth..."), kStatusMedium);
         }
     } else {
-        showStatus(tr("Running tracer-based surface growth..."), kStatusMedium);
+        const QString status = inpaintOnly
+            ? tr("Running tracer inpainting...")
+            : tr("Running tracer-based surface growth...");
+        showStatus(status, kStatusMedium);
     }
 
     qCInfo(lcSegGrowth) << "Segmentation growth requested"
                         << segmentationGrowthMethodToString(method)
                         << segmentationGrowthDirectionToString(direction)
-                        << "steps" << steps;
+                        << "steps" << steps
+                        << "inpaintOnly" << inpaintOnly;
     qCInfo(lcSegGrowth) << "Growth volume ID" << QString::fromStdString(growthVolumeId);
     qCInfo(lcSegGrowth) << "Starting tracer growth";
 
@@ -322,6 +328,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     pending.segmentationSurface = segmentationSurface;
     pending.growthVoxelSize = growthVolume->voxelSize();
     pending.usingCorrections = usingCorrections;
+    pending.inpaintOnly = inpaintOnly;
     _activeRequest = std::move(pending);
 
     auto future = QtConcurrent::run(runTracerGrowth, request, ctx);
@@ -513,9 +520,15 @@ void SegmentationGrower::onFutureFinished()
     qCInfo(lcSegGrowth) << "Tracer growth completed successfully";
     delete result.surface;
 
-    QString message = result.statusMessage.isEmpty() ? tr("Tracer growth complete.") : result.statusMessage;
-    if (request.usingCorrections) {
+    QString message;
+    if (!result.statusMessage.isEmpty()) {
+        message = result.statusMessage;
+    } else if (request.usingCorrections) {
         message = tr("Corrections applied; tracer growth complete.");
+    } else if (request.inpaintOnly) {
+        message = tr("Tracer inpainting complete.");
+    } else {
+        message = tr("Tracer growth complete.");
     }
     showStatus(message, kStatusLong);
 

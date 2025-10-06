@@ -88,7 +88,8 @@ public slots:
     void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
     void onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                    SegmentationGrowthDirection direction,
-                                   int steps);
+                                   int steps,
+                                   bool inpaintOnly);
    void onFocusPOIChanged(std::string name, POI* poi);
     void onPointDoubleClicked(uint64_t pointId);
 
