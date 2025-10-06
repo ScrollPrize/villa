@@ -445,7 +445,7 @@ void updateSegmentationSurfaceMetadata(QuadSurface* surface,
         if (voxelSize > 0.0) {
             const double areaUm2 = areaVx2 * voxelSize * voxelSize;
             areaCm2 = areaUm2 * 1e-8;
-        } else if (previousAreaVx2 > 0.0 && previousAreaCm2 >= 0.0) {
+        } else if (previousAreaVx2 > std::numeric_limits<double>::epsilon() && previousAreaCm2 >= 0.0) {
             const double cm2PerVx2 = previousAreaCm2 / previousAreaVx2;
             areaCm2 = areaVx2 * cm2PerVx2;
         }
