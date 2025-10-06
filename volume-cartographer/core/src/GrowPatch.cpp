@@ -236,7 +236,7 @@ public:
     using Step = std::pair<float, float>; // weight, distance
 
     DistanceLossSettings(const cv::Mat_<uchar>& mask) {
-        cv::distanceTransform(mask, dist_transform_, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+        cv::distanceTransform(mask, dist_transform_, cv::DIST_L1, cv::DIST_MASK_5, CV_8U);
     }
 
     void set_steps(LossType type, std::vector<Step> steps) {
@@ -259,15 +259,13 @@ public:
         for (const auto& step : steps) {
             if (dist >= step.second) {
                 current_weight = step.first;
-            } else {
-                break; // Steps are sorted by distance
             }
         }
         return current_weight;
     }
 
 private:
-    cv::Mat_<float> dist_transform_;
+    cv::Mat_<uchar> dist_transform_;
     std::map<LossType, std::vector<Step>> steps_;
 };
 
@@ -957,10 +955,10 @@ void masked_blur(cv::Mat_<T>& img, const cv::Mat_<uchar>& mask) {
     }
 }
 
-static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, const TraceData &trace_data, LossSettings &settings, int flags);
+static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, TraceData &trace_data, LossSettings &settings);
 
 //optimize within a radius, setting edge points to constant
-static void inpaint(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, const TraceData &trace_data)
+static void inpaint(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, TraceData &trace_data)
 {
     // check that a two pixel border is 1
     for (int y = 0; y < roi.height; ++y) {
@@ -993,67 +991,63 @@ static void inpaint(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParam
     base[NORMAL] = 10.0;
     LossSettings nosnap = base;
     nosnap[SNAP] = 0;
-    local_optimization(roi, mask, params, trace_data, nosnap, LOSS_DIST | LOSS_STRAIGHT);
-    local_optimization(roi, mask, params, trace_data, nosnap, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+    nosnap[NORMAL] = 0;
+    local_optimization(roi, mask, params, trace_data, nosnap);
+    nosnap[NORMAL] = base[NORMAL];
+    local_optimization(roi, mask, params, trace_data, nosnap);
 
     LossSettings lowsnap = base;
     lowsnap[SNAP] = 0.01*base[SNAP];
-    local_optimization(roi, mask, params, trace_data, lowsnap, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+    local_optimization(roi, mask, params, trace_data, lowsnap);
     lowsnap[SNAP] = 0.1*base[SNAP];
-    local_optimization(roi, mask, params, trace_data, lowsnap, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+    local_optimization(roi, mask, params, trace_data, lowsnap);
     lowsnap[SNAP] = base[SNAP];
-    local_optimization(roi, mask, params, trace_data, lowsnap, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+    local_optimization(roi, mask, params, trace_data, lowsnap);
     LossSettings default_settings;
-    local_optimization(roi, mask, params, trace_data, default_settings, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+    local_optimization(roi, mask, params, trace_data, default_settings);
 }
 
 
 //optimize within a radius, setting edge points to constant
-static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, const TraceData &trace_data, LossSettings &settings, int flags)
+static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, TraceData &trace_data, LossSettings &settings)
 {
     ceres::Problem problem;
+    cv::Mat_<uint16_t> loss_status(params.state.size());
 
+    assert(mask.size() == params.state.size());
     // check that a two pixel border is 1
-    for (int y = 0; y < roi.height; ++y) {
-        for (int x = 0; x < roi.width; ++x) {
-            if (y < 2 || y >= roi.height - 2 || x < 2 || x >= roi.width - 2) {
-                if (mask(y, x) == 0) {
-                    throw std::runtime_error("Mask border is not 1");
-                }
-            }
-        }
-    }
+    for (int y = 0; y < roi.height; ++y)
+        for (int x = 0; x < roi.width; ++x)
+            if (y < 2 || y >= roi.height - 2 || x < 2 || x >= roi.width - 2)
+                if (mask(roi.y + y, roi.x + x) != 0)
+                    throw std::runtime_error("Mask border is not 0");
+
+    for (int y = 0; y < roi.height; ++y)
+        for (int x = 0; x < roi.width; ++x)
+            loss_status(roi.y + y, roi.x + x) = 0;
 
     cv::Mat_<uchar> problem_mask;
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_CROSS, cv::Size(3, 3));
-    cv::dilate(mask, problem_mask, kernel, cv::Point(-1,-1), 2);
+    cv::dilate(mask, problem_mask, kernel, cv::Point(-1,-1), 4);
 
-    for (int y = 2; y < roi.height - 2; ++y) {
-        for (int x = 2; x < roi.width - 2; ++x) {
-            if (problem_mask(y, x)) {
-                add_losses(problem, {roi.y + y, roi.x + x}, params, trace_data, settings, flags);
-            }
-        }
-    }
+    for (int y = 2; y < roi.height - 2; ++y)
+        for (int x = 2; x < roi.width - 2; ++x)
+            if (mask(roi.y + y, roi.x + x))
+                add_missing_losses(problem, loss_status, {roi.y + y, roi.x + x}, params, trace_data, settings);
 
-    for (int y = 0; y < roi.height; ++y) {
-        for (int x = 0; x < roi.width; ++x) {
-            if (mask(y, x) && problem.HasParameterBlock(&params.dpoints.at<cv::Vec3d>(roi.y + y, roi.x + x)[0])) {
+    for (int y = 0; y < roi.height; ++y)
+        for (int x = 0; x < roi.width; ++x)
+            if (problem_mask(roi.y + y, roi.x + x) && !mask(roi.y + y, roi.x + x) && problem.HasParameterBlock(&params.dpoints.at<cv::Vec3d>(roi.y + y, roi.x + x)[0]))
                 problem.SetParameterBlockConstant(&params.dpoints.at<cv::Vec3d>(roi.y + y, roi.x + x)[0]);
-            }
-        }
-    }
+
+    cv::imwrite("problem_mask.tif", problem_mask);
+    cv::imwrite("mask.tif", mask);
 
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
     options.max_num_iterations = 10000;
-    // options.minimizer_progress_to_stdout = true;
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
-
-    // std::cout << "inpaint solve " << summary.BriefReport() << std::endl;
-
-    // cv::imwrite("opt_mask.tif", mask);
 }
 
 static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters &params,
@@ -1674,8 +1668,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         int inpaint_count = 0;
         int inpaint_skip = 0;
 
-        // cv::Mat_<cv::Vec3b> vis(hole_mask.size());
-
 #pragma omp parallel for schedule(dynamic)
         for (int i = 0; i < contours.size(); i++) {
             if (hierarchy[i][3] != -1) { // It's a hole
@@ -1687,19 +1679,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 roi.width = std::min(hole_mask.cols - roi.x, roi.width + 2 * margin);
                 roi.height = std::min(hole_mask.rows - roi.y, roi.height + 2 * margin);
 
-                // std::cout << hole_mask.size() << trace_params.state.size() << resume_pad_x << "x" << resume_pad_y << std::endl;
-
-                // cv::Point testp(2492+resume_pad_x, 508+resume_pad_y);
-                // cv::Point testp(2500+resume_pad_x, 566+resume_pad_y);
-                // cv::Point testp(2340+resume_pad_x, 577+resume_pad_y);
-
-                // cv::rectangle(vis, roi, cv::Scalar(255,255,255));
-
-                // if (!roi.contains(testp)) {
-                //     // std::cout << "skip " << roi << std::endl;
-                //     continue;
-                // }
-
                 cv::Mat_<uchar> inpaint_mask(roi.size(), (uchar)1);
                 
                 std::vector<cv::Point> hole_contour_roi;
@@ -1709,7 +1688,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 std::vector<std::vector<cv::Point>> contours_to_fill = {hole_contour_roi};
                 cv::fillPoly(inpaint_mask, contours_to_fill, cv::Scalar(0));
 
-                // std::cout << "Inpainting hole at " << roi << " - " << inpaint_count << "+" << inpaint_skip << "/" << contours.size() << std::endl;
                 inpaint(roi, inpaint_mask, trace_params, trace_data);
 
 #pragma omp critical
@@ -1727,8 +1705,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 #pragma omp atomic
                 inpaint_skip++;
         }
-
-        // cv::imwrite("vis_inp_rect.tif", vis);
     }
 
     // Prepare a new set of Ceres options used later during local solves
@@ -1745,7 +1721,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     std::cout << "lets start fringe: " << fringe.size() << std::endl;
 
     while (!fringe.empty()) {
-        bool global_opt = generation <= 10 && !resume_surf;
+        bool global_opt = generation <= 24 && !resume_surf;
 
         ALifeTime timer_gen;
         timer_gen.del_msg = "time per generation ";
@@ -1868,6 +1844,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     succ_gen_ps.push_back(p);
                 }
 
+                // LossSettings nosnap = loss_settings;
+                // nosnap[SNAP] = 0;
+                // nosnap[NORMAL] = 1;
                 // local_optimization(1, p, trace_params, trace_data, loss_settings, true);
                 // if (local_opt_r > 1)
                     // local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true);
@@ -1889,36 +1868,43 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
             cv::Mat_<uchar> grow_edge(dist_transform.size(), (uchar)0);
             for (int y = 0; y < dist_transform.rows; ++y) {
                 for (int x = 0; x < dist_transform.cols; ++x) {
-                    if (dist_transform(y, x) > 0 && dist_transform(y, x) < 8) {
+                    if (dist_transform(y, x) > 0 && dist_transform(y, x) < 12) {
                         grow_edge(y, x) = 1;
                     }
                 }
             }
 
-            cv::imwrite("gen_mask.tif", gen_mask);
-            cv::imwrite("grow_edge.tif", grow_edge);
+            std::stringstream ss;
+            ss << "_" << std::setw(6) << std::setfill('0') << generation;
+            std::string genstr = ss.str();
+
+            cv::imwrite("gen_mask"+genstr+".tif", gen_mask);
+            cv::imwrite("grow_edge"+genstr+".tif", grow_edge);
             cv::imwrite("dist.tif", dist_transform);
 
             cv::Rect used_area_safe = used_area;
-            used_area_safe.x -= 2;
-            used_area_safe.y -= 2;
-            used_area_safe.width += 4;
-            used_area_safe.height += 4;
+            used_area_safe.x -= 4;
+            used_area_safe.y -= 4;
+            used_area_safe.width += 8;
+            used_area_safe.height += 8;
 
-            DistanceLossSettings loss_edge;
+            DistanceLossSettings loss_edge(gen_mask);
 
-            w[LossType::SNAP] = 0.1f;
-            w[LossType::NORMAL] = 10.0f;
-            w[LossType::STRAIGHT] = 0.2f;
-            w[LossType::DIST] = 1.0f;
-            w[LossType::DIRECTION] = 1.0f;
-            w[LossType::SDIR] = 0.00f; // con
+            // w[LossType::SNAP] = 0.1f;
+            // w[LossType::NORMAL] = 10.0f;
+            // w[LossType::STRAIGHT] = 0.2f;
+            // w[LossType::DIST] = 1.0f;
+            // w[LossType::DIRECTION] = 1.0f;
+            // w[LossType::SDIR] = 0.00f; // con
 
-           loss_edge.set_steps(NORMAL, {1.0,3},{10.0,5});
-           // loss_edge.set_steps(SNAP, {0.01,3},{0.1,5},{0.1,5}) {
-                // set_steps(LossType type, std::vector<Step> steps) {
+           // loss_edge.set_steps(NORMAL, {{1.0,1},{3.0,2},{10.0,3}});
+           // loss_edge.set_steps(SNAP, {{0.01,4},{0.03,5},{0.1,6}});
+           loss_edge.set_steps(NORMAL, {{10.0,4}});
+           loss_edge.set_steps(SNAP, {{0.1,8}});
 
-            local_optimization(used_area_safe, gen_mask, trace_params, trace_data, LossSettings &settings, LOSS_ALL);
+           //TODO initial solve with just edge/normals?
+
+           local_optimization(used_area_safe, grow_edge, trace_params, trace_data, loss_edge);
 
 
             // exit(0);
@@ -1991,7 +1977,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
         if (!tgt_path.empty() && snapshot_interval > 0 && generation % snapshot_interval == 0) {
             QuadSurface* surf = create_surface_from_state();
-            surf->save(tgt_path, true);
+            std::stringstream ss;
+            ss << "_" << std::setw(6) << std::setfill('0') << generation;
+            surf->save(tgt_path.string() + ss.str(), true);
             delete surf;
             std::cout << "saved snapshot in " << tgt_path << std::endl;
         }
