@@ -265,7 +265,8 @@ void ProgressUtil::updateProgressFormat()
     }
 
     const int total = _progressTotal;
-    const int value = std::clamp(_progressValue, 0, total > 0 ? total : _progressValue);
+    const int maxValue = (total > 0) ? total : _progressValue;
+    const int value = std::clamp(_progressValue, 0, maxValue);
     const int remaining = (total > 0) ? std::max(0, total - value) : 0;
     const int percentPrecision = std::max(0, options.percentPrecision);
     const double percent = (total > 0) ? (static_cast<double>(value) * 100.0) / static_cast<double>(total)
