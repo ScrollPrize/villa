@@ -2035,7 +2035,7 @@ void CWindow::onManualPlaneChanged(void)
 
 void CWindow::onOpChainChanged(OpChain *chain)
 {
-    _surf_col->setSurface("segmentation", chain);
+    _surf_col->setSurface("segmentation", chain, false, false);
 }
 
 void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface, OpChain* chain)

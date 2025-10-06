@@ -175,7 +175,7 @@ bool SegmentationLineTool::applyStroke(const std::vector<cv::Vec3f>& stroke)
 
     _editManager->applyPreview();
     if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface());
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
     }
 
     _module.refreshOverlay();
@@ -194,4 +194,3 @@ void SegmentationLineTool::clear()
     _hasLastSample = false;
     _module.refreshOverlay();
 }
-

@@ -473,7 +473,7 @@ void SegmentationGrower::onFutureFinished()
     }
 
     if (_context.surfaces) {
-        _context.surfaces->setSurface("segmentation", request.segmentationSurface);
+        _context.surfaces->setSurface("segmentation", request.segmentationSurface, false, false);
     }
 
     if (!resetDefaults.empty()) {

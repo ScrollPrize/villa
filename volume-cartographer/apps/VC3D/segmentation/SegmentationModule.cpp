@@ -319,7 +319,7 @@ void SegmentationModule::applyEdits()
     clearInvalidationBrush();
     _editManager->applyPreview();
     if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface());
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
     }
     emitPendingChanges();
     if (hadPendingChanges) {
@@ -343,7 +343,7 @@ void SegmentationModule::resetEdits()
     clearLineDragStroke();
     _editManager->resetPreview();
     if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface());
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
     }
     refreshOverlay();
     emitPendingChanges();
@@ -768,7 +768,7 @@ void SegmentationModule::updateDrag(const cv::Vec3f& worldPos)
     _drag.moved = true;
 
     if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface());
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
     }
 
     refreshOverlay();
@@ -793,7 +793,7 @@ void SegmentationModule::finishDrag()
     if (moved) {
         _editManager->applyPreview();
         if (_surfaces) {
-            _surfaces->setSurface("segmentation", _editManager->previewSurface());
+            _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
         }
     }
 

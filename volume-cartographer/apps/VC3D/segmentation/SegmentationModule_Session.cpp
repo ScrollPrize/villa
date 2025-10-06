@@ -22,7 +22,7 @@ bool SegmentationModule::beginEditingSession(QuadSurface* surface)
     }
 
     if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface());
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
     }
 
     if (_overlay) {
@@ -57,7 +57,7 @@ void SegmentationModule::endEditingSession()
         if (currentSurface == previewSurface) {
             const bool previousGuard = _ignoreSegSurfaceChange;
             _ignoreSegSurfaceChange = true;
-            _surfaces->setSurface("segmentation", baseSurface);
+            _surfaces->setSurface("segmentation", baseSurface, false, false);
             _ignoreSegSurfaceChange = previousGuard;
         }
     }
@@ -137,7 +137,7 @@ bool SegmentationModule::restoreUndoSnapshot()
     if (applied) {
         _editManager->applyPreview();
         if (_surfaces) {
-            _surfaces->setSurface("segmentation", _editManager->previewSurface());
+            _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
         }
         clearInvalidationBrush();
         refreshOverlay();
@@ -177,7 +177,7 @@ void SegmentationModule::refreshSessionFromSurface(QuadSurface* surface)
     _editManager->clearInvalidatedEdits();
     _editManager->refreshFromBaseSurface();
     if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface());
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
     }
     refreshOverlay();
     emitPendingChanges();

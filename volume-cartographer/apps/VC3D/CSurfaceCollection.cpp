@@ -8,7 +8,9 @@
 CSurfaceCollection::~CSurfaceCollection()
 {
     for (auto& pair : _surfs) {
-        delete pair.second;
+        if (pair.second.owns && pair.second.ptr) {
+            delete pair.second.ptr;
+        }
     }
 
     for (auto& pair : _pois) {
@@ -20,9 +22,18 @@ CSurfaceCollection::~CSurfaceCollection()
     }
 }
 
-void CSurfaceCollection::setSurface(const std::string &name, Surface* surf, bool noSignalSend)
+void CSurfaceCollection::setSurface(const std::string &name, Surface* surf, bool noSignalSend, bool takeOwnership)
 {
-    _surfs[name] = surf;
+    auto it = _surfs.find(name);
+    if (it != _surfs.end()) {
+        if (it->second.owns && it->second.ptr && it->second.ptr != surf) {
+            delete it->second.ptr;
+        }
+        it->second.ptr = surf;
+        it->second.owns = takeOwnership;
+    } else {
+        _surfs[name] = {surf, takeOwnership};
+    }
     if (!noSignalSend) {
         sendSurfaceChanged(name, surf);
     }
@@ -36,9 +47,10 @@ void CSurfaceCollection::setPOI(const std::string &name, POI *poi)
 
 Surface* CSurfaceCollection::surface(const std::string &name)
 {
-    if (!_surfs.count(name))
+    auto it = _surfs.find(name);
+    if (it == _surfs.end())
         return nullptr;
-    return _surfs[name];
+    return it->second.ptr;
 }
 
 POI *CSurfaceCollection::poi(const std::string &name)
@@ -54,7 +66,7 @@ std::vector<Surface*> CSurfaceCollection::surfaces()
     surfaces.reserve(_surfs.size());
 
     for(auto surface : _surfs) {
-        surfaces.push_back(surface.second);  
+        surfaces.push_back(surface.second.ptr);
     } 
 
     return surfaces;

@@ -125,7 +125,7 @@ void SurfacePanelController::loadSurfaces(bool reload)
         for (const auto& id : segIds) {
             auto surfMeta = _volumePkg->getSurface(id);
             if (surfMeta) {
-                _surfaces->setSurface(id, surfMeta->surface(), true);
+                _surfaces->setSurface(id, surfMeta->surface(), true, false);
             }
         }
     }
@@ -341,7 +341,7 @@ void SurfacePanelController::addSingleSegmentation(const std::string& segId)
             return;
         }
         if (_surfaces) {
-            _surfaces->setSurface(segId, surfMeta->surface(), true);
+            _surfaces->setSurface(segId, surfMeta->surface(), true, false);
         }
         if (_ui.treeWidget) {
             auto* item = new SurfaceTreeWidgetItem(_ui.treeWidget);
@@ -441,7 +441,7 @@ void SurfacePanelController::handleTreeSelectionChanged()
     }
 
     if (surface && _surfaces) {
-        _surfaces->setSurface("segmentation", surface);
+        _surfaces->setSurface("segmentation", surface, false, false);
     }
 
     syncSelectionUi(id, surface);
