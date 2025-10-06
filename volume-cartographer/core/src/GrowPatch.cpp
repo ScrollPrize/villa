@@ -1487,12 +1487,11 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 local_optimization(radius, corr_center_i, trace_params, trace_data, loss_inpaint, false, true);
             }
 
-            if (!tgt_path.empty() && snapshot_interval > 0) {
-                QuadSurface* surf = create_surface_from_state();
-                surf->save(tgt_path.string()+"_s1", true);
-                delete surf;
-            }
-
+            // if (!tgt_path.empty() && snapshot_interval > 0) {
+            //     QuadSurface* surf = create_surface_from_state();
+            //     surf->save(tgt_path.string()+"_corr_stage1", true);
+            //     delete surf;
+            // }
 
             for (const auto& opt_params : opt_centers) {
                 LossSettings loss_inpaint = loss_settings;
@@ -1502,11 +1501,11 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 local_optimization(opt_params.radius, opt_params.center, trace_params, trace_data, loss_inpaint, false, true);
             }
 
-            if (!tgt_path.empty() && snapshot_interval > 0) {
-                QuadSurface* surf = create_surface_from_state();
-                surf->save(tgt_path.string()+"_s2", true);
-                delete surf;
-            }
+            // if (!tgt_path.empty() && snapshot_interval > 0) {
+            //     QuadSurface* surf = create_surface_from_state();
+            //     surf->save(tgt_path.string()+"_corr_stage2", true);
+            //     delete surf;
+            // }
 
             for (const auto& opt_params : opt_centers) {
                 LossSettings loss_inpaint = loss_settings;
@@ -1515,36 +1514,20 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 local_optimization(opt_params.radius, opt_params.center, trace_params, trace_data, loss_inpaint, false, true);
             }
 
-            if (!tgt_path.empty() && snapshot_interval > 0) {
-                QuadSurface* surf = create_surface_from_state();
-                surf->save(tgt_path.string()+"_s3", true);
-                delete surf;
-            }
+            // if (!tgt_path.empty() && snapshot_interval > 0) {
+            //     QuadSurface* surf = create_surface_from_state();
+            //     surf->save(tgt_path.string()+"_corr_stage3", true);
+            //     delete surf;
+            // }
 
             for (const auto& opt_params : opt_centers) {
                 local_optimization(opt_params.radius, opt_params.center, trace_params, trace_data, loss_settings, false, true);
             }
 
-            if (!tgt_path.empty() && snapshot_interval > 0) {
-                QuadSurface* surf = create_surface_from_state();
-                surf->save(tgt_path.string()+"_s4", true);
-                delete surf;
-            }
-
-
-            // for (const auto& opt_params : opt_centers)
-                // local_optimization(opt_params.radius, opt_params.center, trace_params, trace_data, loss_settings, false, true);
-
             // if (!tgt_path.empty() && snapshot_interval > 0) {
             //     QuadSurface* surf = create_surface_from_state();
-            //     surf->save(tgt_path.string()+"_s3", true);
+            //     surf->save(tgt_path.string()+"_corr_stage4", true);
             //     delete surf;
-            // }
-
-            // trace_data.point_correction = PointCorrection();
-
-            // for (const auto& opt_params : opt_centers) {
-            //     local_optimization(opt_params.radius, opt_params.center, trace_params, trace_data, loss_settings, false, true);
             // }
 
             if (!tgt_path.empty() && snapshot_interval > 0) {
