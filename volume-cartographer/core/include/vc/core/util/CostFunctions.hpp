@@ -107,7 +107,7 @@ struct DistLoss2D {
 
 struct StraightLoss {
     StraightLoss(float w) : _w(w) {};
-    static constexpr double kStraightAngleCosThreshold = 0.86602540378443864676; // cos(30°); deviations beyond 30° incur quadratic penalty
+    static constexpr double kStraightAngleCosThreshold = 0.86602540378443864676; // cos(30°); deviations beyond 30° incur penalty
     template <typename T>
     bool operator()(const T* const a, const T* const b, const T* const c, T* residual) const {
         T d1[3], d2[3];
@@ -531,7 +531,7 @@ struct NormalDirectionLoss {
 struct NormalConstraintPlane {
     const vc::core::util::NormalGridVolume& normal_grid_volume;
     const int plane_idx; // 0: XY, 1: XZ, 2: YZ
-    const double weight;
+    const double w_normal;
     const double w_snap;
     const int z_min;
     const int z_max;
@@ -579,8 +579,8 @@ struct NormalConstraintPlane {
      const double snap_trig_th_ = 4.0;
      const double snap_search_range_ = 16.0;
  
-     NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight, double w_snap, bool direction_aware = false, int z_min = -1, int z_max = -1, bool invert_dir = false)
-         : normal_grid_volume(normal_grid_volume), plane_idx(plane_idx), weight(weight), w_snap(w_snap), direction_aware_(direction_aware), z_min(z_min), z_max(z_max), invert_dir(invert_dir) {}
+     NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double w_normal, double w_snap, bool direction_aware = false, int z_min = -1, int z_max = -1, bool invert_dir = false)
+         : normal_grid_volume(normal_grid_volume), plane_idx(plane_idx), w_normal(w_normal), w_snap(w_snap), direction_aware_(direction_aware), z_min(z_min), z_max(z_max), invert_dir(invert_dir) {}
 
     template <typename T>
     bool operator()(const T* const pA, const T* const pB1, const T* const pB2, const T* const pC, T* residual) const {
@@ -697,7 +697,7 @@ struct NormalConstraintPlane {
         //good but slow?
         // double angle_weight = sqrt(1.0 - abs(cos_angle)+1e-9); // * cos_angle; // sin^2(angle)
 
-        residual[0] = T(weight) * interpolated_loss * T(angle_weight);
+        residual[0] = interpolated_loss * T(angle_weight);
 
         return true;
     }
@@ -813,7 +813,8 @@ struct NormalConstraintPlane {
                 float dist_sq = seg_dist_sq_appx(p1_cv, p2_cv, p_a, p_b);
                 if (dist_sq > roi_radius_*roi_radius_)
                     continue;
-                dist_sq = std::max(0.1f, dist_sq);
+
+                dist_sq = std::max(10.0f, dist_sq);
 
                 T weight_n = T(1.0 / dist_sq);
 
@@ -840,6 +841,10 @@ struct NormalConstraintPlane {
         }
 
         // Snapping logic
+
+        if (w_snap == 0.0)
+            return T(w_normal)*normal_loss;
+
         auto& snap_cache = snap_loss_caches_[grid_idx];
         if (!snap_cache.valid(p1_cv, p2_cv, cache_radius_snap_, &normal_grid_volume)) {
             SnapLossPayload payload;
@@ -918,7 +923,7 @@ struct NormalConstraintPlane {
             snapping_loss = T(1.0); // Penalty if no snap target found
         }
 
-        return normal_loss + T(w_snap)*snapping_loss;
+        return T(w_normal)*normal_loss + T(w_snap)*snapping_loss;
     }
 
     static float seg_dist_sq_appx(cv::Point2f p1, cv::Point2f p2, cv::Point2f p3, cv::Point2f p4)
@@ -956,9 +961,9 @@ struct NormalConstraintPlane {
         return dist_sq(dP);
     }
 
-    static ceres::CostFunction* Create(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight, double w_snap, bool direction_aware = false, int z_min = -1, int z_max = -1, bool invert_dir = false) {
+    static ceres::CostFunction* Create(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double w_normal, double w_snap, bool direction_aware = false, int z_min = -1, int z_max = -1, bool invert_dir = false) {
         return new ceres::AutoDiffCostFunction<NormalConstraintPlane, 1, 3, 3, 3, 3>(
-            new NormalConstraintPlane(normal_grid_volume, plane_idx, weight, w_snap, direction_aware, z_min, z_max, invert_dir)
+            new NormalConstraintPlane(normal_grid_volume, plane_idx, w_normal, w_snap, direction_aware, z_min, z_max, invert_dir)
         );
     }
 
@@ -1112,7 +1117,7 @@ private:
         double dx_2d = grid_loc_val[0] - grid_loc_int_[0];
         double dy_2d = grid_loc_val[1] - grid_loc_int_[1];
         double dist_2d = std::sqrt(dx_2d * dx_2d + dy_2d * dy_2d);
-        double weight_2d = std::max(0.0, 1.0 - dist_2d / 4.0);
+        double weight_2d = std::max(0.0, 1.0 - dist_2d / 2.0);
 
         // Corner p00 (neighbors p10, p01)
         total_residual += calculate_corner_residual(tgt, p00, p10, p01);
@@ -1177,7 +1182,7 @@ private:
         double dist_proj_to_corner = std::sqrt(dx_proj*dx_proj + dy_proj*dy_proj + dz_proj*dz_proj);
 
         // Linear falloff from 1 to 0 over a distance of 80
-        double weight = std::max(0.0, 1.0 - dist_proj_to_corner / 80.0);
+        double weight = std::max(0.0, 1.0 - dist_proj_to_corner / 40.0);
 
         if (dbg_)
             std::cout << "weight " << weight << std::endl;

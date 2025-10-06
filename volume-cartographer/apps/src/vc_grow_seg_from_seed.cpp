@@ -157,7 +157,8 @@ int main(int argc, char *argv[])
             ("resume", po::value<std::string>(), "Path to a tifxyz surface to resume from")
             ("rewind-gen", po::value<int>(), "Generation to rewind to")
             ("correct", po::value<std::string>(), "JSON file with point-based corrections for resume mode")
-            ("skip-overlap-check", "Do not perform overlap check with other surfaces after tracing.");
+            ("skip-overlap-check", "Do not perform overlap check with other surfaces after tracing")
+            ("inpaint", "perform automatic inpainting on all detected holes.");
 
         po::variables_map vm;
         try {
@@ -209,6 +210,10 @@ int main(int argc, char *argv[])
 
         if (vm.count("rewind-gen")) {
             params["rewind_gen"] = vm["rewind-gen"].as<int>();
+        }
+
+        if (vm.count("inpaint")) {
+            params["inpaint"] = true;
         }
 
         if (vm.count("skip-overlap-check")) {
