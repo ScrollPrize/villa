@@ -76,7 +76,7 @@ int main(int argc, char* argv[]) {
         generate_desc.add_options()
             ("input,i", po::value<std::string>()->required(), "Input Zarr volume path")
             ("output,o", po::value<std::string>()->required(), "Output directory path")
-            ("spiral-step", po::value<double>()->default_value(8.0), "Spiral step for resampling")
+            ("spiral-step", po::value<double>()->default_value(20.0), "Spiral step for resampling")
             ("grid-step", po::value<int>()->default_value(64), "Grid cell size for the GridStore");
 
         std::vector<std::string> opts = po::collect_unrecognized(parsed.options, po::include_positional);
