@@ -151,13 +151,10 @@ void CommandLineToolRunner::setOmpThreads(int threads)
     _ompThreads = threads;
 }
 
-void CommandLineToolRunner::setToObjOptions(bool normalizeUV, bool alignGrid, int decimateIterations, bool cleanSurface, float cleanK)
+void CommandLineToolRunner::setToObjOptions(bool normalizeUV, bool alignGrid)
 {
     _optNormalizeUV = normalizeUV;
     _optAlignGrid = alignGrid;
-    _optDecimateIter = decimateIterations;
-    _optCleanSurface = cleanSurface;
-    _optCleanK = cleanK;
 }
 
 void CommandLineToolRunner::setRenderAdvanced(
@@ -565,12 +562,6 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                  << _objPath;
             if (_optNormalizeUV) args << "--normalize-uv";
             if (_optAlignGrid)   args << "--align-grid";
-            if (_optDecimateIter > 0) {
-                args << "--decimate" << QString::number(_optDecimateIter);
-            }
-            if (_optCleanSurface) {
-                args << "--clean" << QString::number(_optCleanK);
-            }
             break;
         case Tool::obj2tifxyz:
             args << _objPath

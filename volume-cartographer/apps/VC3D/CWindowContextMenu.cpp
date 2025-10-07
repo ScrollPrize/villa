@@ -735,7 +735,7 @@ void CWindow::onConvertToObj(const std::string& segmentId)
 
     _cmdRunner->setToObjParams(dlg.tifxyzPath(), dlg.objPath());
     _cmdRunner->setOmpThreads(dlg.ompThreads());
-    _cmdRunner->setToObjOptions(dlg.normalizeUV(), dlg.alignGrid(), dlg.decimateIterations(), dlg.cleanSurface(), static_cast<float>(dlg.cleanK()));
+    _cmdRunner->setToObjOptions(dlg.normalizeUV(), dlg.alignGrid());
     _cmdRunner->execute(CommandLineToolRunner::Tool::tifxyz2obj);
     statusBar()->showMessage(tr("Converting segment to OBJ: %1").arg(QString::fromStdString(segmentId)), 5000);
 }
