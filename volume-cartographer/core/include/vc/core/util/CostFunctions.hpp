@@ -255,9 +255,10 @@ struct UmbilicusNormalLoss {
         const T dot = normal[0] * radial[0] + normal[1] * radial[1] + normal[2] * radial[2];
         const T cos_angle = dot / (normal_norm * radial_norm + T(kEps));
 
-        // Smooth ReLU on -cos_angle to penalize angles greater than 90 degrees
+        // Penalize normals pointing away from the umbilicus (cos_angle > 0).
+        // Smooth ReLU on cos_angle: max(0, cos_angle)
         const T sqrt_term = ceres::sqrt(cos_angle * cos_angle + T(kEps));
-        const T violation = T(0.5) * ((-cos_angle) + sqrt_term);
+        const T violation = T(0.5) * (cos_angle + sqrt_term);
 
         residual[0] = T(weight_) * violation;
         return true;
