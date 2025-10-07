@@ -1412,16 +1412,66 @@ QuadSurface *load_quad_from_tifxyz(const std::string &path, int flags)
 
     surf->path = path;
     surf->id   = metadata["uuid"];
-    surf->meta = new nlohmann::json(metadata);
 
+    bool has_generations_channel = false;
     for (const auto& entry : std::filesystem::directory_iterator(path)) {
         if (entry.path().extension() == ".tif") {
             std::string filename = entry.path().stem().string();
             if (filename != "x" && filename != "y" && filename != "z") {
                 surf->setChannel(filename, cv::Mat());
+                if (filename == "generations") {
+                    has_generations_channel = true;
+                }
             }
         }
     }
+
+    int placeholder_max_gen = 0;
+    bool placeholder_seeded = false;
+    if (!has_generations_channel) {
+        cv::Mat_<uint16_t> generations_placeholder(points->rows, points->cols, static_cast<uint16_t>(0));
+
+        for (int j = 0; j < points->rows; ++j) {
+            for (int i = 0; i < points->cols; ++i) {
+                if ((*points)(j, i)[0] != -1) {
+                    generations_placeholder(j, i) = 1;
+                    placeholder_seeded = true;
+                }
+            }
+        }
+
+        surf->setChannel("generations", generations_placeholder);
+
+        if (placeholder_seeded) {
+            // We report at least two generations so downstream rewind logic keeps the existing surface.
+            placeholder_max_gen = 2;
+        }
+    }
+
+    int meta_max_gen = 0;
+    if (metadata.contains("max_gen")) {
+        const auto& meta_value = metadata["max_gen"];
+        if (meta_value.is_number_integer()) {
+            meta_max_gen = meta_value.get<int>();
+        } else if (meta_value.is_number_float()) {
+            meta_max_gen = static_cast<int>(std::lround(meta_value.get<double>()));
+        } else if (meta_value.is_string()) {
+            try {
+                meta_max_gen = std::stoi(meta_value.get<std::string>());
+            } catch (const std::exception&) {
+                meta_max_gen = 0;
+            }
+        }
+    }
+
+    const int resolved_max_gen = std::max(meta_max_gen, placeholder_max_gen);
+    if (resolved_max_gen > 0) {
+        metadata["max_gen"] = resolved_max_gen;
+    } else if (!metadata.contains("max_gen")) {
+        metadata["max_gen"] = 0;
+    }
+
+    surf->meta = new nlohmann::json(metadata);
 
     return surf;
 }
