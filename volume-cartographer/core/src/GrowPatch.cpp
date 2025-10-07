@@ -1128,10 +1128,10 @@ static int add_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParamete
 
     if (trace_data.umbilicus) {
         count += gen_umbilicus_loss(problem, p, params, trace_data, settings);
-        count += gen_umbilicus_theta_row_loss(problem, p, params, trace_data, settings);
-        count += gen_umbilicus_theta_col_loss(problem, p, params, trace_data, settings);
-//        count += gen_umbilicus_row_z_flat_loss(problem, p, params, trace_data, settings);
-//        count += gen_umbilicus_row_z_col_flat_loss(problem, p, params, trace_data, settings);
+        // count += gen_umbilicus_theta_row_loss(problem, p, params, trace_data, settings);
+        // count += gen_umbilicus_theta_col_loss(problem, p, params, trace_data, settings);
+        // count += gen_umbilicus_row_z_flat_loss(problem, p, params, trace_data, settings);
+        // count += gen_umbilicus_row_z_col_flat_loss(problem, p, params, trace_data, settings);
     }
 
     if (flags & LOSS_SDIR) {
@@ -1294,8 +1294,8 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
 
     // umbilicus-specific costs
     count += conditional_umbilicus_quad_loss(14, p, loss_status, problem, params, trace_data, settings);
-    count += conditional_umbilicus_theta_row_loss(15, p, loss_status, problem, params, trace_data, settings);
-    count += conditional_umbilicus_theta_col_loss(16, p, loss_status, problem, params, trace_data, settings);
+    // count += conditional_umbilicus_theta_row_loss(15, p, loss_status, problem, params, trace_data, settings);
+    // count += conditional_umbilicus_theta_col_loss(16, p, loss_status, problem, params, trace_data, settings);
 
     // umbilicus row/column z flattening
 //    count += conditional_umbilicus_row_z_flat_loss(12, p, cv::Vec2i(1, 0), loss_status, problem, params, trace_data, settings, /*column_partner=*/false);
@@ -1643,10 +1643,10 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     loss_settings[LossType::SDIR] = static_cast<float>(sdir_w);
     const double umbilicus_w = params.value("umbilicus_weight", static_cast<double>(loss_settings[LossType::UMBILICUS_NORMAL]));
     loss_settings[LossType::UMBILICUS_NORMAL] = static_cast<float>(umbilicus_w);
-    const double theta_row_w = params.value("umbilicus_theta_row_weight", static_cast<double>(loss_settings[LossType::UMBILICUS_THETA_ROW]));
-    loss_settings[LossType::UMBILICUS_THETA_ROW] = static_cast<float>(theta_row_w);
-    const double theta_col_w = params.value("umbilicus_theta_col_weight", static_cast<double>(loss_settings[LossType::UMBILICUS_THETA_COL]));
-    loss_settings[LossType::UMBILICUS_THETA_COL] = static_cast<float>(theta_col_w);
+    // const double theta_row_w = params.value("umbilicus_theta_row_weight", static_cast<double>(loss_settings[LossType::UMBILICUS_THETA_ROW]));
+    // loss_settings[LossType::UMBILICUS_THETA_ROW] = static_cast<float>(theta_row_w);
+    // const double theta_col_w = params.value("umbilicus_theta_col_weight", static_cast<double>(loss_settings[LossType::UMBILICUS_THETA_COL]));
+    // loss_settings[LossType::UMBILICUS_THETA_COL] = static_cast<float>(theta_col_w);
     const double theta_row_min_delta_deg = params.value(
         "umbilicus_theta_row_min_delta_deg",
         loss_settings.theta_row_min_delta * kDegreesPerRadian);
