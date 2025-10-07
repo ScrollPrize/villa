@@ -363,7 +363,7 @@ static std::vector<Pie> generate_pie_slices(const cv::Mat_<uchar>& dist_transfor
     // Find the outer contour of the grow_edge mask
     cv::Mat outer_edge;
     cv::compare(dist_transform, 1, outer_edge, cv::CMP_EQ);
-    cv::imwrite("outer_edge.tif", outer_edge);
+    // cv::imwrite("outer_edge.tif", outer_edge);
 
     // Manually trace contours by direct search to avoid artifacts from cv::findContours
     cv::Mat visited = cv::Mat::zeros(outer_edge.size(), CV_8U);
@@ -423,18 +423,18 @@ static std::vector<Pie> generate_pie_slices(const cv::Mat_<uchar>& dist_transfor
     for (const auto& p : contour_points) {
         contour_vis.at<uchar>(p) = 255;
     }
-    cv::imwrite("traced_contour.tif", contour_vis);
+    // cv::imwrite("traced_contour.tif", contour_vis);
 
 
     // Split contour and generate masks
-    int desired_pie_size = 32;
+    int desired_pie_size = 64;
     int num_segments = std::max(1, static_cast<int>(std::round(static_cast<double>(contour_points.size()) / desired_pie_size)));
     if (num_segments > 1 && num_segments % 2 != 0) {
         num_segments++;
     }
     double pie_size_f = static_cast<double>(contour_points.size()) / num_segments;
-    int cutoff_dist = 16;
-    const int pie_overlap = 8;
+    int cutoff_dist = 64;
+    const int pie_overlap = 16;
 
     std::vector<Pie> pies;
 
@@ -1184,6 +1184,7 @@ static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask,
 
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    // options.linear_solver_type = ceres::SPARSE_SCHUR;
     options.max_num_iterations = 10000;
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
@@ -1780,7 +1781,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     //just continue on resume no additional global opt	
     if (!resume_surf) {
         local_optimization(8, {y0,x0}, trace_params, trace_data, loss_settings, true);
-    } else if (params.value("inpaint", true)) {
+    } else if (params.value("inpaint", false)) {
         cv::Mat mask = resume_surf->channel("mask");
         cv::Mat_<uchar> hole_mask(trace_params.state.size(), (uchar)0);
         
@@ -1863,7 +1864,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     std::cout << "lets start fringe: " << fringe.size() << std::endl;
 
     while (!fringe.empty()) {
-        bool global_opt = generation <= 50 && !resume_surf;
+        bool global_opt = generation <= 100 && !resume_surf;
 
         ALifeTime timer_gen;
         timer_gen.del_msg = "time per generation ";
@@ -2026,9 +2027,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 ss << "_" << std::setw(6) << std::setfill('0') << generation;
                 std::string genstr = ss.str();
 
-                cv::imwrite("gen_mask"+genstr+".tif", gen_mask);
-                cv::imwrite("grow_edge"+genstr+".tif", grow_edge);
-                cv::imwrite("dist.tif", dist_transform);
+                // cv::imwrite("gen_mask"+genstr+".tif", gen_mask);
+                // cv::imwrite("grow_edge"+genstr+".tif", grow_edge);
+                // cv::imwrite("dist.tif", dist_transform);
 
                 auto pies = generate_pie_slices(dist_transform);
 
@@ -2110,7 +2111,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         }
         else {
             //we do the global opt only every 8 gens, as every add does a small local solve anyweays
-            if (generation % 5 == 0) {
+            if (generation % 8 == 0) {
                 local_optimization(stop_gen+10, {y0,x0}, trace_params, trace_data, loss_settings, false, true);
             }
         }
