@@ -256,11 +256,22 @@ struct UmbilicusNormalLoss {
         const T cos_angle = dot / (normal_norm * radial_norm + T(kEps));
 
         // Penalize normals pointing away from the umbilicus (cos_angle > 0).
-        // Smooth ReLU on cos_angle: max(0, cos_angle)
+        // Smooth ReLU on cos_angle: approx max(0, cos_angle)
         const T sqrt_term = ceres::sqrt(cos_angle * cos_angle + T(kEps));
-        const T violation = T(0.5) * (cos_angle + sqrt_term);
+        const T away_violation = T(0.5) * (cos_angle + sqrt_term);
 
-        residual[0] = T(weight_) * violation;
+        // Additionally apply a very small penalty for near-perpendicular normals on the "toward" side
+        // (cos_angle <= 0), increasing as the angle approaches 90° (cos_angle -> 0 from below) and
+        // vanishing as it approaches 180° (cos_angle -> -1). This is smoothly gated to avoid
+        // introducing a non-differentiable branch at cos_angle = 0.
+        // Gate approximating Heaviside(-cos): 0 for cos>0, ~1 for cos<<0, 0.5 at 0.
+        const T neg_gate = T(0.5) * (T(1) - cos_angle / (sqrt_term + T(kEps)));
+        // Shape term that is 0 at 180° (cos=-1) and ~1 near 90° (cos~0).
+        const T near_perp_shape = T(2) * neg_gate * (T(1) + cos_angle);
+        // Minor fraction relative to the main weight (kept intentionally very small).
+        constexpr double kMinorFraction = 0.02; // tweakable if needed
+
+        residual[0] = T(weight_) * (away_violation + T(kMinorFraction) * near_perp_shape);
         return true;
     }
 
