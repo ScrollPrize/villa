@@ -408,6 +408,7 @@ bool SegmentationPushPullTool::applyStepInternal()
 
     _module.refreshOverlay();
     _module.emitPendingChanges();
+    _module.markAutosaveNeeded();
     return true;
 }
 

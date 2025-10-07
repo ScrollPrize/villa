@@ -180,6 +180,7 @@ bool SegmentationLineTool::applyStroke(const std::vector<cv::Vec3f>& stroke)
 
     _module.refreshOverlay();
     _module.emitPendingChanges();
+    _module.markAutosaveNeeded();
     Q_EMIT _module.statusMessageRequested(QCoreApplication::translate("SegmentationModule",
                                                                      "Applied segmentation drag along path."),
                                           1500);

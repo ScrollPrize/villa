@@ -39,6 +39,7 @@ class SegmentationWidget;
 class VCCollection;
 class ViewerManager;
 class QKeyEvent;
+class QTimer;
 class SegmentationBrushTool;
 class SegmentationLineTool;
 class SegmentationPushPullTool;
@@ -230,6 +231,11 @@ private:
     void stopAllPushPull();
     bool applyPushPullStep();
 
+    void markAutosaveNeeded(bool immediate = false);
+    void performAutosave();
+    void ensureAutosaveTimer();
+    void updateAutosaveState();
+
     SegmentationWidget* _widget{nullptr};
     SegmentationEditManager* _editManager{nullptr};
     SegmentationOverlayController* _overlay{nullptr};
@@ -269,4 +275,9 @@ private:
 
     segmentation::UndoHistory _undoHistory;
     bool _suppressUndoCapture{false};
+
+    static constexpr int kAutosaveIntervalMs = 10000;
+    QTimer* _autosaveTimer{nullptr};
+    bool _pendingAutosave{false};
+    bool _autosaveNotifiedFailure{false};
 };

@@ -16,13 +16,18 @@
 
 #include <QLoggingCategory>
 #include <QPointer>
+#include <QString>
+#include <QTimer>
 
 #include <algorithm>
 #include <cmath>
 #include <optional>
 #include <limits>
+#include <exception>
 #include <utility>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 
 Q_LOGGING_CATEGORY(lcSegModule, "vc.segmentation.module")
@@ -37,9 +42,19 @@ float averageScale(const cv::Vec2f& scale)
     return (avg > 1e-4f) ? avg : 1.0f;
 }
 
-
-
-
+void ensureSurfaceMetaObject(QuadSurface* surface)
+{
+    if (!surface) {
+        return;
+    }
+    if (surface->meta && surface->meta->is_object()) {
+        return;
+    }
+    if (surface->meta) {
+        delete surface->meta;
+    }
+    surface->meta = new nlohmann::json(nlohmann::json::object());
+}
 }
 
 void SegmentationModule::DragState::reset()
@@ -155,6 +170,9 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
             onCorrectionsZRangeChanged(false, 0, 0);
         }
     }
+
+    ensureAutosaveTimer();
+    updateAutosaveState();
 }
 
 void SegmentationModule::setRotationHandleHitTester(std::function<bool(CVolumeViewer*, const cv::Vec3f&)> tester)
@@ -300,10 +318,14 @@ void SegmentationModule::setEditingEnabled(bool enabled)
         clearLineDragStroke();
         _lineDrawKeyActive = false;
         clearUndoStack();
+        if (_pendingAutosave) {
+            performAutosave();
+        }
     }
     updateCorrectionsWidget();
     refreshOverlay();
     emit editingEnabledChanged(enabled);
+    updateAutosaveState();
 }
 void SegmentationModule::applyEdits()
 {
@@ -322,6 +344,7 @@ void SegmentationModule::applyEdits()
         _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
     }
     emitPendingChanges();
+    markAutosaveNeeded(true);
     if (hadPendingChanges) {
         emit statusMessageRequested(tr("Applied segmentation edits."), kStatusShort);
     }
@@ -799,6 +822,7 @@ void SegmentationModule::finishDrag()
         if (_surfaces) {
             _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
         }
+        markAutosaveNeeded();
     }
 
     refreshOverlay();
@@ -883,4 +907,92 @@ void SegmentationModule::stopAllPushPull()
 bool SegmentationModule::applyPushPullStep()
 {
     return _pushPullTool ? _pushPullTool->applyStep() : false;
+}
+
+void SegmentationModule::markAutosaveNeeded(bool immediate)
+{
+    if (!_editManager || !_editManager->hasSession()) {
+        return;
+    }
+
+    _pendingAutosave = true;
+    _autosaveNotifiedFailure = false;
+
+    ensureAutosaveTimer();
+    if (_editingEnabled && _autosaveTimer && !_autosaveTimer->isActive()) {
+        _autosaveTimer->start();
+    }
+
+    if (immediate) {
+        performAutosave();
+    }
+}
+
+void SegmentationModule::performAutosave()
+{
+    if (!_pendingAutosave) {
+        return;
+    }
+    if (!_editManager) {
+        return;
+    }
+    QuadSurface* surface = _editManager->baseSurface();
+    if (!surface) {
+        return;
+    }
+    if (surface->path.empty() || surface->id.empty()) {
+        if (!_autosaveNotifiedFailure) {
+            qCWarning(lcSegModule) << "Skipping autosave: segmentation surface lacks path or id.";
+            emit statusMessageRequested(tr("Cannot autosave segmentation: surface is missing file metadata."),
+                                        kStatusMedium);
+            _autosaveNotifiedFailure = true;
+        }
+        return;
+    }
+
+    ensureSurfaceMetaObject(surface);
+
+    try {
+        surface->saveOverwrite();
+        _pendingAutosave = false;
+        _autosaveNotifiedFailure = false;
+    } catch (const std::exception& ex) {
+        qCWarning(lcSegModule) << "Autosave failed:" << ex.what();
+        if (!_autosaveNotifiedFailure) {
+            emit statusMessageRequested(tr("Failed to autosave segmentation: %1")
+                                            .arg(QString::fromUtf8(ex.what())),
+                                        kStatusLong);
+            _autosaveNotifiedFailure = true;
+        }
+    }
+}
+
+void SegmentationModule::ensureAutosaveTimer()
+{
+    if (_autosaveTimer) {
+        return;
+    }
+    _autosaveTimer = new QTimer(this);
+    _autosaveTimer->setInterval(kAutosaveIntervalMs);
+    _autosaveTimer->setSingleShot(false);
+    connect(_autosaveTimer, &QTimer::timeout, this, [this]() {
+        performAutosave();
+    });
+}
+
+void SegmentationModule::updateAutosaveState()
+{
+    ensureAutosaveTimer();
+    if (!_autosaveTimer) {
+        return;
+    }
+
+    const bool shouldRun = _editingEnabled && _editManager && _editManager->hasSession();
+    if (shouldRun) {
+        if (!_autosaveTimer->isActive()) {
+            _autosaveTimer->start();
+        }
+    } else if (_autosaveTimer->isActive()) {
+        _autosaveTimer->stop();
+    }
 }
