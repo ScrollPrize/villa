@@ -353,7 +353,146 @@ static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& para
     return custom;
 }
 
+struct Pie {
+    cv::Mat mask;
+    cv::Rect roi;
+};
 } // namespace
+
+static std::vector<Pie> generate_pie_slices(const cv::Mat_<uchar>& dist_transform) {
+    // Find the outer contour of the grow_edge mask
+    cv::Mat outer_edge;
+    cv::compare(dist_transform, 1, outer_edge, cv::CMP_EQ);
+    cv::imwrite("outer_edge.tif", outer_edge);
+
+    // Manually trace contours by direct search to avoid artifacts from cv::findContours
+    cv::Mat visited = cv::Mat::zeros(outer_edge.size(), CV_8U);
+    std::vector<std::vector<cv::Point>> all_contours;
+
+    for (int y = 0; y < outer_edge.rows; ++y) {
+        for (int x = 0; x < outer_edge.cols; ++x) {
+            if (outer_edge.at<uchar>(y, x) > 0 && visited.at<uchar>(y, x) == 0) {
+                std::vector<cv::Point> current_contour;
+                cv::Point current_p = {x, y};
+
+                while(current_p.x != -1) {
+                    current_contour.push_back(current_p);
+                    visited.at<uchar>(current_p) = 255;
+                    
+                    cv::Point next_p = {-1, -1};
+                    // Find the next unvisited neighbor in a consistent order (e.g., clockwise)
+                    for (int dy = -1; dy <= 1; dy++) {
+                        for (int dx = -1; dx <= 1; dx++) {
+                            if (dx == 0 && dy == 0) continue;
+                            cv::Point neighbor = current_p + cv::Point(dx, dy);
+                            if (neighbor.x >= 0 && neighbor.x < outer_edge.cols &&
+                                neighbor.y >= 0 && neighbor.y < outer_edge.rows &&
+                                outer_edge.at<uchar>(neighbor) > 0 &&
+                                visited.at<uchar>(neighbor) == 0) {
+                                next_p = neighbor;
+                                goto found_next;
+                            }
+                        }
+                    }
+                    found_next:
+                    current_p = next_p;
+                }
+                all_contours.push_back(current_contour);
+            }
+        }
+    }
+
+    if (all_contours.empty()) {
+        std::cout << "No contours found via direct search." << std::endl;
+        return {};
+    }
+
+    // Find the largest contour
+    size_t largest_contour_idx = 0;
+    size_t max_size = 0;
+    for (size_t i = 0; i < all_contours.size(); ++i) {
+        if (all_contours[i].size() > max_size) {
+            max_size = all_contours[i].size();
+            largest_contour_idx = i;
+        }
+    }
+    const auto& contour_points = all_contours[largest_contour_idx];
+
+    // Visualize the traced contour
+    cv::Mat contour_vis = cv::Mat::zeros(outer_edge.size(), CV_8U);
+    for (const auto& p : contour_points) {
+        contour_vis.at<uchar>(p) = 255;
+    }
+    cv::imwrite("traced_contour.tif", contour_vis);
+
+
+    // Split contour and generate masks
+    int desired_pie_size = 32;
+    int num_segments = std::max(1, static_cast<int>(std::round(static_cast<double>(contour_points.size()) / desired_pie_size)));
+    if (num_segments > 1 && num_segments % 2 != 0) {
+        num_segments++;
+    }
+    double pie_size_f = static_cast<double>(contour_points.size()) / num_segments;
+    int cutoff_dist = 16;
+    const int pie_overlap = 8;
+
+    std::vector<Pie> pies;
+
+    for (int seg = 0; seg < num_segments; ++seg) {
+        cv::Mat pie_mask = cv::Mat::zeros(outer_edge.size(), CV_8U);
+        size_t start = static_cast<size_t>(std::round(seg * pie_size_f));
+        size_t end = static_cast<size_t>(std::round((seg + 1) * pie_size_f));
+        end = std::min(end, contour_points.size());
+
+        for (size_t j = start; j < end; ++j) {
+            cv::Point current_p = contour_points[j];
+            while(dist_transform.at<uchar>(current_p) < cutoff_dist) {
+                pie_mask.at<uchar>(current_p) = 255;
+                uchar max_dist_val = dist_transform.at<uchar>(current_p);
+                cv::Point next_p = current_p;
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0) continue;
+                        cv::Point neighbor = current_p + cv::Point(dx, dy);
+                        if (neighbor.x >= 0 && neighbor.x < dist_transform.cols &&
+                            neighbor.y >= 0 && neighbor.y < dist_transform.rows) {
+                            if (dist_transform.at<uchar>(neighbor) > max_dist_val) {
+                                max_dist_val = dist_transform.at<uchar>(neighbor);
+                                next_p = neighbor;
+                            }
+                        }
+                    }
+                }
+                if (next_p == current_p) break;
+                current_p = next_p;
+            }
+        }
+
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+        cv::morphologyEx(pie_mask, pie_mask, cv::MORPH_CLOSE, kernel);
+        cv::morphologyEx(pie_mask, pie_mask, cv::MORPH_OPEN, kernel);
+
+        cv::Mat overlap_kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2 * pie_overlap + 1, 2 * pie_overlap + 1));
+        cv::dilate(pie_mask, pie_mask, overlap_kernel);
+
+        // Ensure the expanded mask doesn't go into the already traced area
+        cv::Mat valid_growth_area;
+        cv::compare(dist_transform, 0, valid_growth_area, cv::CMP_NE);
+        cv::bitwise_and(pie_mask, valid_growth_area, pie_mask);
+
+        cv::Rect roi = cv::boundingRect(pie_mask);
+        roi.x = std::max(0, roi.x - 2);
+        roi.y = std::max(0, roi.y - 2);
+        roi.width = std::min(dist_transform.cols - roi.x, roi.width + 4);
+        roi.height = std::min(dist_transform.rows - roi.y, roi.height + 4);
+        if (roi.width > 0 && roi.height > 0) {
+            pies.push_back({pie_mask.clone(), roi});
+        }
+    }
+
+    std::cout << "Generated " << pies.size() << " pie masks for processing." << std::endl;
+    return pies;
+}
 
 // global CUDA to allow use to set to false globally
 // in the case they have cuda avail, but do not want to use it
@@ -1040,14 +1179,17 @@ static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask,
             if (problem_mask(roi.y + y, roi.x + x) && !mask(roi.y + y, roi.x + x) && problem.HasParameterBlock(&params.dpoints.at<cv::Vec3d>(roi.y + y, roi.x + x)[0]))
                 problem.SetParameterBlockConstant(&params.dpoints.at<cv::Vec3d>(roi.y + y, roi.x + x)[0]);
 
-    cv::imwrite("problem_mask.tif", problem_mask);
-    cv::imwrite("mask.tif", mask);
+    // cv::imwrite("problem_mask.tif", problem_mask);
+    // cv::imwrite("mask.tif", mask);
 
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
     options.max_num_iterations = 10000;
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
+
+#pragma omp critical
+    std::cout << "local solve roi " << " " << summary.BriefReport() << std::endl;
 }
 
 static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters &params,
@@ -1721,7 +1863,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     std::cout << "lets start fringe: " << fringe.size() << std::endl;
 
     while (!fringe.empty()) {
-        bool global_opt = generation <= 24 && !resume_surf;
+        bool global_opt = generation <= 50 && !resume_surf;
 
         ALifeTime timer_gen;
         timer_gen.del_msg = "time per generation ";
@@ -1844,100 +1986,131 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     succ_gen_ps.push_back(p);
                 }
 
-                // LossSettings nosnap = loss_settings;
-                // nosnap[SNAP] = 0;
-                // nosnap[NORMAL] = 1;
-                // local_optimization(1, p, trace_params, trace_data, loss_settings, true);
-                // if (local_opt_r > 1)
-                    // local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true);
+                // if (global_opt) {
+                //     local_optimization(1, p, trace_params, trace_data, loss_settings, true);
+                //     if (local_opt_r > 1)
+                //         local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true);
+                // }
+                // else {
+                    LossSettings nosnap = loss_settings;
+                    nosnap[SNAP] = 0;
+                    local_optimization(2, p, trace_params, trace_data, nosnap, true);
+                    // nosnap[NORMAL] = 1;
+                // }
             }  // end parallel iteration over cands
         }
 
         if (!global_opt) {
-            cv::Mat_<uint16_t> gen_mask_u16;
-            cv::Mat_<uchar> gen_mask;
-            cv::threshold(generations, gen_mask_u16, 0, 255, cv::THRESH_BINARY);
-            gen_mask_u16.convertTo(gen_mask, CV_8U);
+            if (generation % 4 == 0) {
+                cv::Mat_<uint16_t> gen_mask_u16;
+                cv::Mat_<uchar> gen_mask;
+                cv::threshold(generations, gen_mask_u16, 0, 255, cv::THRESH_BINARY);
+                gen_mask_u16.convertTo(gen_mask, CV_8U);
 
-            // cv::Mat_<uchar> unexplored_mask;
-            // cv::bitwise_not(gen_mask, unexplored_mask);
+                // cv::Mat_<uchar> unexplored_mask;
+                // cv::bitwise_not(gen_mask, unexplored_mask);
 
-            cv::Mat_<uchar> dist_transform;
-            cv::distanceTransform(gen_mask, dist_transform, cv::DIST_L1, cv::DIST_MASK_5, CV_8U);
+                cv::Mat_<uchar> dist_transform;
+                cv::distanceTransform(gen_mask, dist_transform, cv::DIST_L1, cv::DIST_MASK_5, CV_8U);
 
-            cv::Mat_<uchar> grow_edge(dist_transform.size(), (uchar)0);
-            for (int y = 0; y < dist_transform.rows; ++y) {
-                for (int x = 0; x < dist_transform.cols; ++x) {
-                    if (dist_transform(y, x) > 0 && dist_transform(y, x) < 12) {
-                        grow_edge(y, x) = 1;
+                cv::Mat_<uchar> grow_edge(dist_transform.size(), (uchar)0);
+                for (int y = 0; y < dist_transform.rows; ++y) {
+                    for (int x = 0; x < dist_transform.cols; ++x) {
+                        if (dist_transform(y, x) > 0 && dist_transform(y, x) < 12) {
+                            grow_edge(y, x) = 1;
+                        }
                     }
                 }
+
+                std::stringstream ss;
+                ss << "_" << std::setw(6) << std::setfill('0') << generation;
+                std::string genstr = ss.str();
+
+                cv::imwrite("gen_mask"+genstr+".tif", gen_mask);
+                cv::imwrite("grow_edge"+genstr+".tif", grow_edge);
+                cv::imwrite("dist.tif", dist_transform);
+
+                auto pies = generate_pie_slices(dist_transform);
+
+                DistanceLossSettings loss_edge(gen_mask);
+                // loss_edge.set_steps(NORMAL, {{10.0,0},{3.0,3},{10.0,4}});
+                loss_edge.set_steps(DIST, {{0.1,1},{0.2,3},{0.3,4},{0.5,5},{0.7,6},{0.8,7},{1.0,8}});
+                loss_edge.set_steps(SNAP, {{0.01,2},{0.03,3},{0.1,4},{0.2,5},{0.3,6},{0.4,7},{0.5,8}});
+
+                cv::Mat even_pies_vis = cv::Mat::zeros(size, CV_8UC3);
+                cv::Mat odd_pies_vis = cv::Mat::zeros(size, CV_8UC3);
+
+                #pragma omp parallel for schedule(dynamic)
+                for (size_t i = 0; i < pies.size(); i += 2) {
+                    local_optimization(pies[i].roi, pies[i].mask, trace_params, trace_data, loss_edge);
+                    // #pragma omp critical
+                    // {
+                    //     cv::Mat color_mask;
+                    //     cv::cvtColor(pies[i].mask, color_mask, cv::COLOR_GRAY2BGR);
+                    //     cv::bitwise_or(even_pies_vis, color_mask, even_pies_vis);
+                    // }
+                }
+
+                #pragma omp parallel for schedule(dynamic)
+                for (size_t i = 1; i < pies.size(); i += 2) {
+                    local_optimization(pies[i].roi, pies[i].mask, trace_params, trace_data, loss_edge);
+                    // #pragma omp critical
+                    // {
+                    //     cv::Mat color_mask;
+                    //     cv::cvtColor(pies[i].mask, color_mask, cv::COLOR_GRAY2BGR);
+                    //     cv::bitwise_or(odd_pies_vis, color_mask, odd_pies_vis);
+                    // }
+                }
+
+                // cv::imwrite("even_pies.tif", even_pies_vis);
+                // cv::imwrite("odd_pies.tif", odd_pies_vis);
+
+                // std::cout << "Finished processing pies. Exiting for debug." << std::endl;
+                // exit(0);
+
+                // cv::Rect used_area_safe = used_area;
+                // used_area_safe.x -= 4;
+                // used_area_safe.y -= 4;
+                // used_area_safe.width += 8;
+                // used_area_safe.height += 8;
+
+            //TODO initial solve with just edge/normals?
+
+            // local_optimization(used_area_safe, grow_edge, trace_params, trace_data, loss_edge);
+
+
+                // exit(0);
+
+    //             // For late generations, instead of re-solving the global problem, solve many local-ish problems, around each
+    //             // of the newly added points
+    //             std::vector<cv::Vec2i> opt_local;
+    //             for(auto p : succ_gen_ps)
+    //                 if (p[0] % 4 == 0 && p[1] % 4 == 0)
+    //                     opt_local.push_back(p);
+    //
+    //             int done = 0;
+    //
+    //             if (!opt_local.empty()) {
+    //                 OmpThreadPointCol opt_local_threadcol(17, opt_local);
+    //
+    // #pragma omp parallel
+    //                 while (true)
+    //                 {
+    //                     CachedChunked3dInterpolator<uint8_t,thresholdedDistance> interp(proc_tensor);
+    //                     cv::Vec2i p = opt_local_threadcol.next();
+    //                     if (p[0] == -1)
+    //                         break;
+    //
+    //                     local_optimization(8, p, trace_params, trace_data, loss_settings, true);
+    // #pragma omp atomic
+    //                     done++;
+    //                 }
+    //             }
             }
-
-            std::stringstream ss;
-            ss << "_" << std::setw(6) << std::setfill('0') << generation;
-            std::string genstr = ss.str();
-
-            cv::imwrite("gen_mask"+genstr+".tif", gen_mask);
-            cv::imwrite("grow_edge"+genstr+".tif", grow_edge);
-            cv::imwrite("dist.tif", dist_transform);
-
-            cv::Rect used_area_safe = used_area;
-            used_area_safe.x -= 4;
-            used_area_safe.y -= 4;
-            used_area_safe.width += 8;
-            used_area_safe.height += 8;
-
-            DistanceLossSettings loss_edge(gen_mask);
-
-            // w[LossType::SNAP] = 0.1f;
-            // w[LossType::NORMAL] = 10.0f;
-            // w[LossType::STRAIGHT] = 0.2f;
-            // w[LossType::DIST] = 1.0f;
-            // w[LossType::DIRECTION] = 1.0f;
-            // w[LossType::SDIR] = 0.00f; // con
-
-           // loss_edge.set_steps(NORMAL, {{1.0,1},{3.0,2},{10.0,3}});
-           // loss_edge.set_steps(SNAP, {{0.01,4},{0.03,5},{0.1,6}});
-           loss_edge.set_steps(NORMAL, {{10.0,4}});
-           loss_edge.set_steps(SNAP, {{0.1,8}});
-
-           //TODO initial solve with just edge/normals?
-
-           local_optimization(used_area_safe, grow_edge, trace_params, trace_data, loss_edge);
-
-
-            // exit(0);
-
-//             // For late generations, instead of re-solving the global problem, solve many local-ish problems, around each
-//             // of the newly added points
-//             std::vector<cv::Vec2i> opt_local;
-//             for(auto p : succ_gen_ps)
-//                 if (p[0] % 4 == 0 && p[1] % 4 == 0)
-//                     opt_local.push_back(p);
-//
-//             int done = 0;
-//
-//             if (!opt_local.empty()) {
-//                 OmpThreadPointCol opt_local_threadcol(17, opt_local);
-//
-// #pragma omp parallel
-//                 while (true)
-//                 {
-//                     CachedChunked3dInterpolator<uint8_t,thresholdedDistance> interp(proc_tensor);
-//                     cv::Vec2i p = opt_local_threadcol.next();
-//                     if (p[0] == -1)
-//                         break;
-//
-//                     local_optimization(8, p, trace_params, trace_data, loss_settings, true);
-// #pragma omp atomic
-//                     done++;
-//                 }
-//             }
         }
         else {
             //we do the global opt only every 8 gens, as every add does a small local solve anyweays
-            if (generation % 8 == 0) {
+            if (generation % 5 == 0) {
                 local_optimization(stop_gen+10, {y0,x0}, trace_params, trace_data, loss_settings, false, true);
             }
         }
