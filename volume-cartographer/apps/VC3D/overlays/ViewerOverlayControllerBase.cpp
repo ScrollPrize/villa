@@ -359,7 +359,8 @@ ViewerOverlayControllerBase::filterPoints(CVolumeViewer* viewer,
 
         if (keep && quadSurface) {
             auto ptr = quadSurface->pointer();
-            float res = quadSurface->pointTo(ptr, point, options.quadDistanceTolerance, 100);
+            float res = quadSurface->pointTo(ptr, point, options.quadDistanceTolerance,
+                                             viewer->pointToMaxIterations());
             if (res > options.quadDistanceTolerance) {
                 keep = false;
             }

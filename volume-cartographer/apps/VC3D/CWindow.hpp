@@ -8,6 +8,7 @@
 #include <QCheckBox>
 #include <QFutureWatcher>
 #include <QPointF>
+#include <QSpinBox>
 #include <memory>
 #include <vector>
 #include <deque>
@@ -147,6 +148,7 @@ private slots:
     void onAxisOverlayOpacityChanged(int value);
     void onSegmentationEditingModeChanged(bool enabled);
     void onSegmentationStopToolsRequested();
+    void onPointToIterationsChanged(int value);
     void configureViewerConnections(CVolumeViewer* viewer);
     CVolumeViewer* segmentationViewer() const;
     void clearSurfaceSelection();
@@ -182,10 +184,11 @@ private:
     OpsList *wOpsList;
     OpsSettings *wOpsSettings;
     QPushButton *btnReloadSurfaces;
-    
+
     //TODO abstract these into separate QWidget class?
     QLineEdit* lblLocFocus;
     QDoubleSpinBox* spNorm[3];
+    QSpinBox* _pointToIterationSpin{nullptr};
     QPushButton* btnZoomIn;
    QPushButton* btnZoomOut;
    QCheckBox* chkAxisAlignedSlices;
@@ -197,6 +200,10 @@ private:
 
     Ui_VCMainWindow ui;
     QMdiArea *mdiArea;
+
+    int _pointToIterations{CVolumeViewer::kDefaultPointToIterations};
+
+    void applyPointToIterationsToViewer(CVolumeViewer* viewer);
 
     bool can_change_volume_();
     

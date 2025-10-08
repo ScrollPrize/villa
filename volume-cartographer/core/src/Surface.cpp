@@ -13,6 +13,11 @@
 #include <system_error>
 #include <cmath>
 #include <limits>
+#include <random>
+#include <chrono>
+#include <thread>
+#include <functional>
+#include <cstdint>
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -59,6 +64,26 @@ static cv::Vec3f internal_loc(const cv::Vec3f &nominal, const cv::Vec3f &interna
 static cv::Vec3f nominal_loc(const cv::Vec3f &nominal, const cv::Vec3f &internal, const cv::Vec2f &scale)
 {
     return nominal + cv::Vec3f(internal[0]/scale[0], internal[1]/scale[1], internal[2]);
+}
+
+static int random_int_exclusive(int max_exclusive)
+{
+    if (max_exclusive <= 0) {
+        return 0;
+    }
+
+    static thread_local std::mt19937 rng = []() {
+        std::random_device rd;
+        const auto time_seed = static_cast<uint32_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        const auto thread_seed = static_cast<uint32_t>(
+            std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        std::seed_seq seq{rd(), time_seed, thread_seed};
+        return std::mt19937(seq);
+    }();
+
+    std::uniform_int_distribution<int> dist(0, max_exclusive - 1);
+    return dist(rng);
 }
 
 Surface::~Surface()
@@ -1071,7 +1096,10 @@ void find_intersect_segments(std::vector<std::vector<cv::Vec3f>> &seg_vol, std::
 
         //initial points
         for(int i=0;i<std::max(min_tries, std::max(points.cols,points.rows)/100);i++) {
-            loc = {std::rand() % (points.cols-1), std::rand() % (points.rows-1)};
+            loc = {
+                static_cast<float>(random_int_exclusive(points.cols - 1)),
+                static_cast<float>(random_int_exclusive(points.rows - 1))
+            };
             point = at_int(points, loc);
 
             plane_loc = plane->project(point);

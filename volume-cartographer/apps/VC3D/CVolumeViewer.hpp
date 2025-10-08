@@ -122,6 +122,10 @@ public:
     
     CVolumeViewerView* fGraphicsView;
 
+    static constexpr int kDefaultPointToIterations = 100;
+    void setPointToMaxIterations(int iterations);
+    int pointToMaxIterations() const { return _pointToMaxIterations; }
+
 public slots:
     void OnVolumeChanged(std::shared_ptr<Volume> vol);
     void onVolumeClicked(QPointF scene_loc,Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
@@ -253,13 +257,15 @@ protected:
 
     std::shared_ptr<Volume> _overlayVolume;
     float _overlayOpacity{0.5f};
-    std::string _overlayColormapId;
+   std::string _overlayColormapId;
     float _overlayWindowLow{0.0f};
     float _overlayWindowHigh{255.0f};
     float _baseWindowLow{0.0f};
     float _baseWindowHigh{255.0f};
     bool _overlayImageValid{false};
     QImage _overlayImage;
+
+    int _pointToMaxIterations{kDefaultPointToIterations};
 
 
 };  // class CVolumeViewer

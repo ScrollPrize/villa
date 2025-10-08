@@ -2481,8 +2481,52 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 std::vector<std::vector<cv::Point>> contours_to_fill = {hole_contour_roi};
                 cv::fillPoly(inpaint_mask, contours_to_fill, cv::Scalar(0));
 
+                if (inpaint_mask.rows < 5 || inpaint_mask.cols < 5) {
+#pragma omp atomic
+                    inpaint_skip++;
+                    continue;
+                }
+
+                bool border_is_valid = true;
+                for (int yy = 0; yy < inpaint_mask.rows && border_is_valid; ++yy) {
+                    for (int xx = 0; xx < inpaint_mask.cols; ++xx) {
+                        if ((yy < 2 || yy >= inpaint_mask.rows - 2 || xx < 2 || xx >= inpaint_mask.cols - 2) && inpaint_mask(yy, xx) == 0) {
+                            border_is_valid = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (!border_is_valid) {
+#pragma omp atomic
+                    inpaint_skip++;
+#pragma omp critical
+                    {
+                        std::cerr << "Skipping inpaint for ROI " << roi << " due to insufficient border padding" << std::endl;
+                    }
+                    continue;
+                }
+
                 // std::cout << "Inpainting hole at " << roi << " - " << inpaint_count << "+" << inpaint_skip << "/" << contours.size() << std::endl;
-                inpaint(roi, inpaint_mask, trace_params, trace_data);
+                try {
+                    inpaint(roi, inpaint_mask, trace_params, trace_data);
+                } catch (const std::exception &ex) {
+#pragma omp atomic
+                    inpaint_skip++;
+#pragma omp critical
+                    {
+                        std::cerr << "Skipping inpaint for ROI " << roi << ": " << ex.what() << std::endl;
+                    }
+                    continue;
+                } catch (...) {
+#pragma omp atomic
+                    inpaint_skip++;
+#pragma omp critical
+                    {
+                        std::cerr << "Skipping inpaint for ROI " << roi << " due to unknown error" << std::endl;
+                    }
+                    continue;
+                }
 
 #pragma omp critical
                 if (snapshot_interval > 0 && !tgt_path.empty() && inpaint_count % snapshot_interval == 0) {
