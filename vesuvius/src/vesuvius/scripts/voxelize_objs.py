@@ -1178,8 +1178,8 @@ def main():
         required=True,
         type=int,
         nargs=3,
-        metavar=("Z", "X", "Y"),
-        help="Total output spatial shape as integers in the order (z, x, y)",
+        metavar=("Z", "Y", "X"),
+        help="Total output spatial shape as integers in the order (z, y, x)",
     )
     parser.add_argument(
         "--transform",
@@ -1293,15 +1293,15 @@ def main():
     folder_path = args.folder
     print(f"Using mesh folder: {folder_path}")
 
-    z_dim, x_dim, y_dim = args.spatial_shape
-    if z_dim <= 0 or x_dim <= 0 or y_dim <= 0:
+    z_dim, y_dim, x_dim = args.spatial_shape
+    if z_dim <= 0 or y_dim <= 0 or x_dim <= 0:
         print("ERROR: spatial shape dimensions must be positive integers.")
         sys.exit(1)
 
     h = y_dim
     w = x_dim
     print(
-        f"Using spatial shape (z, x, y)=({z_dim}, {x_dim}, {y_dim}) -> (height, width)=({h}, {w})"
+        f"Using spatial shape (z, y, x)=({z_dim}, {y_dim}, {x_dim}) -> (height, width)=({h}, {w})"
     )
 
     out_path = args.output_path
@@ -1432,21 +1432,34 @@ def main():
         triangle_bitangents = np.zeros((0, 3), dtype=np.float32)
         triangle_use_vertex_tangents = np.zeros(0, dtype=np.bool_)
 
+    # Clip vertices into the valid volume bounds (z, y, x) before slice processing.
+    if vertices.size:
+        max_x = max(w - 1e-3, 0.0)
+        max_y = max(h - 1e-3, 0.0)
+        max_z = max(z_dim - 1e-3, 0.0)
+
+        needs_clip = (
+            (vertices[:, 0] < 0.0).any()
+            or (vertices[:, 0] > max_x).any()
+            or (vertices[:, 1] < 0.0).any()
+            or (vertices[:, 1] > max_y).any()
+            or (vertices[:, 2] < 0.0).any()
+            or (vertices[:, 2] > max_z).any()
+        )
+
+        if needs_clip:
+            print(
+                "Clipping mesh vertices to the valid spatial bounds before voxelization.",
+                flush=True,
+            )
+
+        np.clip(vertices[:, 0], 0.0, max_x, out=vertices[:, 0])
+        np.clip(vertices[:, 1], 0.0, max_y, out=vertices[:, 1])
+        np.clip(vertices[:, 2], 0.0, max_z, out=vertices[:, 2])
+
     # Determine slice range from the vertices.
-    z_min = int(np.floor(vertices[:, 2].min()))
-    z_max = int(np.ceil(vertices[:, 2].max()))
-
-    if z_min < 0:
-        print(
-            "ERROR: Mesh vertices include negative z coordinates; shift the meshes or adjust the spatial shape origin."
-        )
-        sys.exit(1)
-
-    if z_max >= z_dim:
-        print(
-            f"ERROR: Mesh z-extent [{z_min}, {z_max}] exceeds provided z dimension {z_dim}."
-        )
-        sys.exit(1)
+    z_min = max(0, int(np.floor(vertices[:, 2].min())))
+    z_max = min(z_dim - 1, int(np.ceil(vertices[:, 2].max())))
 
     z_slices = np.arange(z_min, z_max + 1)
     print(f"Processing slices from {z_min} to {z_max} (inclusive).")
