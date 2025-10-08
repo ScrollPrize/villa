@@ -149,6 +149,36 @@ public:
     }
 
 private:
+    // Write (or update) meta.json in 'dir' so that it contains:
+    //   "scale": [sx, sy]
+    // Returns true on success; leaves other JSON keys intact if meta.json exists.
+    static bool overwriteMetaScale_(const QString& dir, double sx, double sy) {
+        const QString metaPath = QDir(dir).filePath(QStringLiteral("meta.json"));
+        QJsonObject root;
+
+        // Try to read existing meta.json (optional).
+        if (QFileInfo::exists(metaPath)) {
+            QFile in(metaPath);
+            if (in.open(QIODevice::ReadOnly)) {
+                const auto doc = QJsonDocument::fromJson(in.readAll());
+                if (doc.isObject()) root = doc.object();
+                in.close();
+            }
+        }
+
+        QJsonArray scaleArr; scaleArr.append(sx); scaleArr.append(sy);
+        root.insert(QStringLiteral("scale"), scaleArr);
+
+        QFile out(metaPath);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            return false;
+        }
+        out.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+        out.close();
+        return true;
+    }
+
+private:
     enum class Phase { ToObj, Flatboi, ToTifxyz, Swap, Done };
 
     void startToObj_() {
@@ -203,7 +233,11 @@ private:
         }
 
         ioLog_.clear();
-        QStringList args; args << flatObj_ << outTemp_;
+        QStringList args;
+        args << flatObj_
+             << outTemp_
+             // Downsample UV grid by 20× per axis to reduce compute/memory.
+             << QStringLiteral("--uv-downsample=20");
         ioLog_ += QStringLiteral("Running: %1 %2\n").arg(obj2tifxyzExe_, args.join(' '));
         proc_->start(obj2tifxyzExe_, args);
     }
@@ -382,6 +416,20 @@ private:
             if (!QFileInfo::exists(outTemp_) || !QFileInfo(outTemp_).isDir()) {
                 onFinished_(1, QProcess::NormalExit); return;
             }
+
+            // Ensure the new tifxyz has a deterministic pixel size in meta.json
+            // Requested: "scale": [0.05, 0.05]
+            if (!overwriteMetaScale_(outTemp_, 0.05, 0.05)) {
+                // Non-fatal: warn but continue with swap and completion.
+                QMessageBox* warn = new QMessageBox(QMessageBox::Warning,
+                    QObject::tr("Warning"),
+                    QObject::tr("Converted directory created, but failed to update meta.json scale in:\n%1")
+                        .arg(outTemp_),
+                    QMessageBox::Ok, w_);
+                warn->setAttribute(Qt::WA_DeleteOnClose);
+                warn->open();
+            }
+
             phase_ = Phase::Swap;
             finishSwapIfNeeded_();
             phase_ = Phase::Done;
@@ -735,7 +783,7 @@ void CWindow::onConvertToObj(const std::string& segmentId)
 
     _cmdRunner->setToObjParams(dlg.tifxyzPath(), dlg.objPath());
     _cmdRunner->setOmpThreads(dlg.ompThreads());
-    _cmdRunner->setToObjOptions(dlg.normalizeUV(), dlg.alignGrid(), dlg.decimateIterations(), dlg.cleanSurface(), static_cast<float>(dlg.cleanK()));
+    _cmdRunner->setToObjOptions(dlg.normalizeUV(), dlg.alignGrid());
     _cmdRunner->execute(CommandLineToolRunner::Tool::tifxyz2obj);
     statusBar()->showMessage(tr("Converting segment to OBJ: %1").arg(QString::fromStdString(segmentId)), 5000);
 }

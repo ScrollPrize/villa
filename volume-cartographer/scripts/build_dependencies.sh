@@ -115,8 +115,9 @@ cp ./Make.inc/Makefile.inc.x86-64_pc_linux2 Makefile.inc
 make -j"$JOBS" scotch
 sudo mkdir -p /usr/local/scotch/{bin,include,lib,share/man/man1}
 make prefix=/usr/local/scotch install || true
-sudo cp -f ../lib/*scotch*.a /usr/local/scotch/lib/ || true
-sudo cp -f ../include/*scotch*.h /usr/local/scotch/include/ || true
+# Do NOT prefer locally installed static Scotch; rely on distro shared libs
+# (libscotch-7.0.so, libscotcherr-7.0.so) to match the working Docker.
+sudo find /usr/local/scotch/lib -name "libscotch*.a" -delete || true
 popd >/dev/null
 
 log "Building PaStiX 5.2.3 into /usr/local/pastix (linked to /usr/local/scotch)"
@@ -126,9 +127,9 @@ rm -rf "$PASTIX_SRC"; mkdir -p "$PASTIX_SRC"
 tar -xjf "$LIBS_DIR/pastix_5.2.3.tar.bz2" -C "$PASTIX_SRC" --strip-components=1
 pushd "$PASTIX_SRC/src" >/dev/null
 cp "$LIBS_DIR/config.in" config.in
-sed -i -E "s|^ROOT[[:space:]]*=.*$|ROOT = /usr/local/pastix|" config.in
-sed -i -E "s|^SCOTCH_HOME[[:space:]]*=.*$|SCOTCH_HOME = /usr/local/scotch|" config.in
-make -j"$JOBS" SCOTCH_HOME=/usr/local/scotch
+# Link PaStiX against distro Scotch shared libs
+sed -i -E "s|^SCOTCH_HOME[[:space:]]*=.*$|SCOTCH_HOME = /usr|" config.in
+make SCOTCH_HOME=/usr && sudo make install SCOTCH_HOME=/usr
 sudo make install SCOTCH_HOME=/usr/local/scotch
 popd >/dev/null
 
@@ -158,7 +159,7 @@ FLATBOI_CMAKE="$FLATBOI_DIR/CMakeLists.txt"
 if [[ -f "$FLATBOI_CMAKE" ]]; then
   # Patch any hard-coded /src/libs/libigl subdirectory call
   sed -i -E \
-    's|^([[:space:]]*)add_subdirectory\([[:space:]]*/src/libs/libigl[^)]*\)|\1add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../.. ${CMAKE_BINARY_DIR}/libigl-build)|' \
+    's|^([[:space:]]*)add_subdirectory\([[:space:]]*/src/libs/libigl[^)]*\)|\1add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../libigl ${CMAKE_BINARY_DIR}/libigl-build)|' \
     "$FLATBOI_CMAKE" || true
   # If something still uses /src/libs/libigl, provide a symlink
   if grep -q "/src/libs/libigl" "$FLATBOI_CMAKE"; then
