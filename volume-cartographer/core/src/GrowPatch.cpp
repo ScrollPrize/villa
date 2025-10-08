@@ -427,14 +427,14 @@ static std::vector<Pie> generate_pie_slices(const cv::Mat_<uchar>& dist_transfor
 
 
     // Split contour and generate masks
-    int desired_pie_size = 64;
+    int desired_pie_size = 32;
     int num_segments = std::max(1, static_cast<int>(std::round(static_cast<double>(contour_points.size()) / desired_pie_size)));
     if (num_segments > 1 && num_segments % 2 != 0) {
         num_segments++;
     }
     double pie_size_f = static_cast<double>(contour_points.size()) / num_segments;
-    int cutoff_dist = 64;
-    const int pie_overlap = 16;
+    int cutoff_dist = 32;
+    const int pie_overlap = 8;
 
     std::vector<Pie> pies;
 
@@ -1864,7 +1864,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     std::cout << "lets start fringe: " << fringe.size() << std::endl;
 
     while (!fringe.empty()) {
-        bool global_opt = generation <= 100 && !resume_surf;
+        bool global_opt = generation <= 50 && !resume_surf;
 
         ALifeTime timer_gen;
         timer_gen.del_msg = "time per generation ";
@@ -1987,17 +1987,16 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     succ_gen_ps.push_back(p);
                 }
 
-                // if (global_opt) {
-                //     local_optimization(1, p, trace_params, trace_data, loss_settings, true);
-                //     if (local_opt_r > 1)
-                //         local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true);
-                // }
-                // else {
+                if (global_opt) {
+                    local_optimization(1, p, trace_params, trace_data, loss_settings, true);
+                    if (local_opt_r > 1)
+                        local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true);
+                }
+                else {
                     LossSettings nosnap = loss_settings;
                     nosnap[SNAP] = 0;
                     local_optimization(2, p, trace_params, trace_data, nosnap, true);
-                    // nosnap[NORMAL] = 1;
-                // }
+                }
             }  // end parallel iteration over cands
         }
 
