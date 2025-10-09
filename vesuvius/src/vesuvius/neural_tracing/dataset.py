@@ -463,7 +463,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             perturbed_ij = point_ij + offset_2d
             
             # Clamp to patch bounds
-            perturbed_ij = torch.clamp(perturbed_ij, torch.zeros([]), torch.tensor(patch.zyxs.shape[:2]) - 1)
+            perturbed_ij = torch.clamp(perturbed_ij, torch.zeros([]), torch.tensor(patch.zyxs.shape[:2]) - 1.001)
             
             # Check if the perturbed point is still valid
             if not patch.valid_quad_mask[*perturbed_ij.int()]:
