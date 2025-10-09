@@ -1101,9 +1101,9 @@ int main(int argc, char *argv[])
         multiscale["version"] = "0.4";
         multiscale["name"] = "render";
         multiscale["axes"] = nlohmann::json::array({
-            nlohmann::json{{"name","z"},{"type","space"},{"unit","pixel"}},
-            nlohmann::json{{"name","y"},{"type","space"},{"unit","pixel"}},
-            nlohmann::json{{"name","x"},{"type","space"},{"unit","pixel"}}
+            nlohmann::json{{"name","z"},{"type","space"}},
+            nlohmann::json{{"name","y"},{"type","space"}},
+            nlohmann::json{{"name","x"},{"type","space"}}
         });
         multiscale["datasets"] = nlohmann::json::array();
         for (int level = 0; level <= 5; ++level) {
