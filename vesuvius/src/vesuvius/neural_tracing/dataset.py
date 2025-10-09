@@ -332,6 +332,189 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         self._config = config
         self._patches = load_datasets(config)
         self._augmentations = augmentation.get_training_augmentations(config['crop_size'], config['augmentation']['no_spatial'], config['augmentation']['only_spatial_and_intensity'])
+        self._perturb_prob = config['point_perturbation']['perturb_probability']
+        self._uv_max_perturbation = config['point_perturbation']['uv_max_perturbation']  # measured in voxels
+        self._w_max_perturbation = config['point_perturbation']['w_max_perturbation']  # measured in voxels
+        self._main_component_distance_factor = config['point_perturbation']['main_component_distance_factor']
+
+    def _sample_points_from_quads(self, patch, quad_mask):
+        """Sample points finely from quads specified by the mask"""
+        if not torch.any(quad_mask):
+            return torch.empty(0, 3)
+        
+        filtered_quads_zyxs = torch.stack([
+            torch.stack([
+                patch.zyxs[:-1, :-1][quad_mask],
+                patch.zyxs[:-1, 1:][quad_mask],
+            ], dim=1),
+            torch.stack([
+                patch.zyxs[1:, :-1][quad_mask],
+                patch.zyxs[1:, 1:][quad_mask],
+            ], dim=1),
+        ], dim=1)  # quad, top/bottom, left/right, zyx
+        
+        points_per_side = (1 / patch.scale + 0.5).int()
+        v_points = torch.arange(points_per_side[0], dtype=torch.float32) / points_per_side[0]
+        u_points = torch.arange(points_per_side[1], dtype=torch.float32) / points_per_side[1]
+        points_covering_quads = torch.lerp(filtered_quads_zyxs[:, None, 0, :], filtered_quads_zyxs[:, None, 1, :], v_points[None, :, None, None])
+        points_covering_quads = torch.lerp(points_covering_quads[:, :, None, 0], points_covering_quads[:, :, None, 1], u_points[None, None, :, None])
+        
+        return points_covering_quads.view(-1, 3)
+
+    def _get_quads_in_crop(self, patch, min_corner_zyx, crop_size):
+        """Get mask of quads that fall within the crop region"""
+        quad_centers = 0.5 * (patch.zyxs[1:, 1:] + patch.zyxs[:-1, :-1])
+        return patch.valid_mask & torch.all(quad_centers >= min_corner_zyx, dim=-1) & torch.all(quad_centers < min_corner_zyx + crop_size, dim=-1)
+
+    def _get_patch_points_in_crop(self, patch, min_corner_zyx, crop_size):
+        """Get finely sampled points from a patch that fall within the crop region"""
+        quad_in_crop = self._get_quads_in_crop(patch, min_corner_zyx, crop_size)
+        return self._sample_points_from_quads(patch, quad_in_crop)
+
+    def _get_current_patch_center_component_mask(self, current_patch, center_ij, min_corner_zyx, crop_size):
+        """Get the mask of the connected component containing the center point"""
+        quad_in_crop = self._get_quads_in_crop(current_patch, min_corner_zyx, crop_size)
+        
+        if not torch.any(quad_in_crop):
+            return torch.zeros_like(quad_in_crop)
+        
+        center_quad = center_ij.int()
+        if (center_quad[0] < 0 or center_quad[0] >= quad_in_crop.shape[0] or 
+            center_quad[1] < 0 or center_quad[1] >= quad_in_crop.shape[1] or
+            not quad_in_crop[center_quad[0], center_quad[1]]):
+            return torch.zeros_like(quad_in_crop)
+        
+        component_mask = torch.zeros_like(quad_in_crop)
+        stack = [(center_quad[0].item(), center_quad[1].item())]
+        
+        while stack:
+            i, j = stack.pop()
+            if (0 <= i < quad_in_crop.shape[0] and 0 <= j < quad_in_crop.shape[1] and 
+                quad_in_crop[i, j] and not component_mask[i, j]):
+                component_mask[i, j] = True
+                stack.extend([(i-1, j), (i+1, j), (i, j-1), (i, j+1)])
+        
+        return component_mask
+
+    def _get_cached_patch_points(self, current_patch, center_ij, min_corner_zyx, crop_size):
+        """Pre-compute and cache all patch points for efficient distance calculations"""
+        
+        # Get the main component mask
+        quad_main_component = self._get_current_patch_center_component_mask(current_patch, center_ij, min_corner_zyx, crop_size)
+        
+        all_patch_points = []
+        
+        # Check all other patches from the same volume
+        for other_patch in self._patches:
+            if other_patch is current_patch or other_patch.volume is not current_patch.volume:
+                continue  # Skip current patch and patches from different volumes
+            
+            # Get finely sampled points from this patch in the crop region
+            patch_points = self._get_patch_points_in_crop(other_patch, min_corner_zyx, crop_size)
+            
+            if len(patch_points) > 0:
+                all_patch_points.append(patch_points)
+        
+        # Check other parts of the current patch (excluding main component)
+        quad_in_crop = self._get_quads_in_crop(current_patch, min_corner_zyx, crop_size)
+        quad_excluding_main = quad_in_crop & ~quad_main_component
+        
+        # Sample points from remaining parts of current patch
+        other_patch_points = self._sample_points_from_quads(current_patch, quad_excluding_main)
+        
+        if len(other_patch_points) > 0:
+            all_patch_points.append(other_patch_points)
+        
+        return all_patch_points
+
+    def _get_distance_to_nearest_patch_cached(self, point_zyx, cached_patch_points):
+        """Calculate the distance to the nearest patch using pre-computed patch points"""
+        
+        if not cached_patch_points:
+            return float('inf')
+        
+        min_distance = float('inf')
+        
+        for patch_points in cached_patch_points:
+            # Calculate minimum distance to any point in this patch
+            distances = torch.norm(patch_points - point_zyx, dim=-1)
+            min_distance = min(min_distance, distances.min().item())
+        
+        return min_distance
+
+    def _get_perturbed_zyx_from_patch(self, point_ij, patch, center_ij, min_corner_zyx, crop_size, is_center_point=False):
+        """Apply random 3D perturbation to a point and return the perturbed 3D coordinates"""
+        if is_center_point:
+            # For center point, only apply normal perturbation, skip uv perturbation
+            perturbed_ij = point_ij
+            perturbed_zyx = get_zyx_from_patch(point_ij, patch)
+        else:
+            # For conditioning points, apply both uv and normal perturbations
+            # Generate random 2D offset within the uv threshold (in voxels)
+            offset_magnitude = torch.rand([]) * self._uv_max_perturbation
+            offset_angle = torch.rand([]) * 2 * torch.pi
+            offset_uv_voxels = offset_magnitude * torch.tensor([torch.cos(offset_angle), torch.sin(offset_angle)])
+            
+            # Convert uv offset from voxels to patch coordinates using patch scale
+            offset_2d = offset_uv_voxels * patch.scale
+            
+            # Apply 2D offset
+            perturbed_ij = point_ij + offset_2d
+            
+            # Clamp to patch bounds
+            perturbed_ij = torch.clamp(perturbed_ij, torch.zeros([]), torch.tensor(patch.zyxs.shape[:2]) - 1)
+            
+            # Check if the perturbed point is still valid
+            if not patch.valid_mask[*perturbed_ij.int()]:
+                return get_zyx_from_patch(point_ij, patch)  # Return original 3D point if invalid
+            
+            # Convert to 3D coordinates
+            perturbed_zyx = get_zyx_from_patch(perturbed_ij, patch)
+        
+        # Estimate quad normal at this point for 3D perturbation
+        # Get neighboring points to estimate the surface normal
+        i, j = perturbed_ij.int()
+        h, w = patch.zyxs.shape[:2]
+        
+        # Get surrounding points for normal estimation
+        neighbors = []
+        for di in [-1, 0, 1]:
+            for dj in [-1, 0, 1]:
+                ni, nj = i + di, j + dj
+                if 0 <= ni < h and 0 <= nj < w and patch.valid_mask[ni, nj]:
+                    neighbors.append(patch.zyxs[ni, nj])
+        
+        if len(neighbors) < 3:
+            # Not enough neighbors for normal estimation, skip 3D perturbation
+            final_zyx = perturbed_zyx
+        else:
+            # Estimate surface normal using cross product of two edges
+            normal = torch.linalg.cross(neighbors[1] - neighbors[0], neighbors[2] - neighbors[0], dim=-1)
+            normal_norm = torch.norm(normal)
+            if normal_norm > 1e-6:
+                normal = normal / normal_norm
+                # Apply random 3D offset along normal direction using w threshold
+                normal_offset_magnitude = (torch.rand([]) * 2 - 1) * self._w_max_perturbation
+                
+                # Pre-compute patch points once for efficient distance calculations
+                cached_patch_points = self._get_cached_patch_points(patch, center_ij, min_corner_zyx, crop_size)
+                
+                # Find a perturbation size that is acceptable, i.e. doesn't bring us too close to another patch
+                while abs(normal_offset_magnitude) >= 1.0:
+                    nearest_patch_distance = self._get_distance_to_nearest_patch_cached(perturbed_zyx, cached_patch_points)
+                    if abs(normal_offset_magnitude) <= nearest_patch_distance * self._main_component_distance_factor:
+                        break
+                    normal_offset_magnitude *= 0.5
+                else:
+                    normal_offset_magnitude = 0.
+                
+                # Apply the acceptable perturbation
+                final_zyx = perturbed_zyx + normal_offset_magnitude * normal
+            else:
+                # Normal is too small, skip 3D perturbation
+                final_zyx = perturbed_zyx
+        
+        return final_zyx
 
     def __iter__(self):
 
@@ -382,11 +565,34 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             if torch.rand([]) < 0.5:
                 v_pos_shifted_ijs, v_neg_shifted_ijs = v_neg_shifted_ijs, v_pos_shifted_ijs
 
+            # Apply perturbations to center and negative points
+            if torch.rand([]) < self._perturb_prob:
+                min_corner_zyx = (center_zyx - crop_size // 2).int()
+                
+                # Perturb center point in 3D (only normal perturbation, no uv)
+                center_zyx = self._get_perturbed_zyx_from_patch(center_ij, patch, center_ij, min_corner_zyx, crop_size, is_center_point=True)
+                
+                # Perturb negative points (context points) in 3D (both uv and normal)
+                u_neg_shifted_zyxs = torch.stack([
+                    self._get_perturbed_zyx_from_patch(u_neg_shifted_ijs[i], patch, center_ij, min_corner_zyx, crop_size, is_center_point=False) 
+                    for i in range(len(u_neg_shifted_ijs))
+                ])
+                v_neg_shifted_zyxs = torch.stack([
+                    self._get_perturbed_zyx_from_patch(v_neg_shifted_ijs[i], patch, center_ij, min_corner_zyx, crop_size, is_center_point=False) 
+                    for i in range(len(v_neg_shifted_ijs))
+                ])
+                
+            else:
+                # No perturbation applied, use original coordinates
+                u_neg_shifted_zyxs = get_zyx_from_patch(u_neg_shifted_ijs, patch)
+                v_neg_shifted_zyxs = get_zyx_from_patch(v_neg_shifted_ijs, patch)
+            
+            # Get final crop volume (only called once now)
+            volume_crop, min_corner_zyx = get_crop_from_volume(patch.volume, center_zyx, crop_size)
+
             # Map to 3D space and construct heatmaps
             u_pos_shifted_zyxs = get_zyx_from_patch(u_pos_shifted_ijs, patch)
-            u_neg_shifted_zyxs = get_zyx_from_patch(u_neg_shifted_ijs, patch)
             v_pos_shifted_zyxs = get_zyx_from_patch(v_pos_shifted_ijs, patch)
-            v_neg_shifted_zyxs = get_zyx_from_patch(v_neg_shifted_ijs, patch)
 
             def make_in_out_heatmaps(pos_shifted_zyxs, neg_shifted_zyxs, cond, suppress_out=None):
                 if cond:
@@ -658,6 +864,7 @@ def load_tifxyz_patches(segments_path, z_range, volume):
     all_patches = []
     for segment_path in tqdm(segment_paths, desc='loading tifxyz patches'):
         try:  # TODO: remove
+            # TODO: move this bit to a method in tifxyz.py
             with open(f'{segment_path}/meta.json', 'r') as meta_json:
                 metadata = json.load(meta_json)
                 bbox = metadata['bbox']
