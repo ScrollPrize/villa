@@ -944,14 +944,14 @@ void masked_blur(cv::Mat_<T>& img, const cv::Mat_<uchar>& mask) {
 static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, const TraceData &trace_data, LossSettings &settings, int flags);
 
 //optimize within a radius, setting edge points to constant
-static void inpaint(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, const TraceData &trace_data)
+static bool inpaint(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, const TraceData &trace_data)
 {
     // check that a two pixel border is 1
     for (int y = 0; y < roi.height; ++y) {
         for (int x = 0; x < roi.width; ++x) {
             if (y < 2 || y >= roi.height - 2 || x < 2 || x >= roi.width - 2) {
                 if (mask(y, x) == 0) {
-                    throw std::runtime_error("Mask border is not 1");
+                    return false;
                 }
             }
         }
@@ -989,6 +989,7 @@ static void inpaint(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParam
     local_optimization(roi, mask, params, trace_data, lowsnap, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
     LossSettings default_settings;
     local_optimization(roi, mask, params, trace_data, default_settings, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+    return true;
 }
 
 
@@ -1656,6 +1657,21 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 roi.width = std::min(hole_mask.cols - roi.x, roi.width + 2 * margin);
                 roi.height = std::min(hole_mask.rows - roi.y, roi.height + 2 * margin);
 
+                bool insufficient_border =
+                    roi.width <= 4 || roi.height <= 4 ||
+                    roi.x <= 1 || roi.y <= 1 ||
+                    (roi.x + roi.width) > hole_mask.cols - 2 ||
+                    (roi.y + roi.height) > hole_mask.rows - 2;
+                if (insufficient_border) {
+#pragma omp atomic
+                    inpaint_skip++;
+#pragma omp critical
+                    {
+                        std::cout << "skip inpaint: insufficient margin around roi " << roi << std::endl;
+                    }
+                    continue;
+                }
+
                 // std::cout << hole_mask.size() << trace_params.state.size() << resume_pad_x << "x" << resume_pad_y << std::endl;
 
                 // cv::Point testp(2492+resume_pad_x, 508+resume_pad_y);
@@ -1679,14 +1695,53 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 cv::fillPoly(inpaint_mask, contours_to_fill, cv::Scalar(0));
 
                 // std::cout << "Inpainting hole at " << roi << " - " << inpaint_count << "+" << inpaint_skip << "/" << contours.size() << std::endl;
-                inpaint(roi, inpaint_mask, trace_params, trace_data);
+                bool did_inpaint = false;
+                try {
+                    did_inpaint = inpaint(roi, inpaint_mask, trace_params, trace_data);
+                } catch (const cv::Exception& ex) {
+#pragma omp atomic
+                    inpaint_skip++;
+#pragma omp critical
+                    {
+                        std::cout << "skip inpaint: OpenCV exception for roi " << roi << " => " << ex.what() << std::endl;
+                    }
+                    continue;
+                } catch (const std::exception& ex) {
+#pragma omp atomic
+                    inpaint_skip++;
+#pragma omp critical
+                    {
+                        std::cout << "skip inpaint: exception for roi " << roi << " => " << ex.what() << std::endl;
+                    }
+                    continue;
+                } catch (...) {
+#pragma omp atomic
+                    inpaint_skip++;
+#pragma omp critical
+                    {
+                        std::cout << "skip inpaint: unknown exception for roi " << roi << std::endl;
+                    }
+                    continue;
+                }
+
+                if (!did_inpaint) {
+#pragma omp atomic
+                    inpaint_skip++;
+#pragma omp critical
+                    {
+                        std::cout << "skip inpaint: mask border check failed for roi " << roi << std::endl;
+                    }
+                    continue;
+                }
 
 #pragma omp critical
-                if (snapshot_interval > 0 && !tgt_path.empty() && inpaint_count % snapshot_interval == 0) {
-                    QuadSurface* surf = create_surface_from_state();
-                    surf->save(tgt_path, true);
-                    delete surf;
-                    std::cout << "saved snapshot in " << tgt_path << " (" << inpaint_count << "+" << inpaint_skip << "/" << contours.size() << ")" << std::endl;
+                {
+                    if (snapshot_interval > 0 && !tgt_path.empty() && inpaint_count % snapshot_interval == 0) {
+                        QuadSurface* surf = create_surface_from_state();
+                        surf->save(tgt_path, true);
+                        delete surf;
+                        std::cout << "saved snapshot in " << tgt_path << " (" << inpaint_count << "+" << inpaint_skip << "/" << contours.size() << ")" << std::endl;
+                    }
                 }
 
 #pragma omp atomic

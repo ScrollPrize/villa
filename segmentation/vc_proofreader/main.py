@@ -1,6 +1,7 @@
 import os
 import json
 import glob
+import argparse
 import numpy as np
 import napari
 import zarr
@@ -8,17 +9,7 @@ import tifffile
 from magicgui import magicgui
 from datetime import datetime
 import cc3d
-from typing import Optional, Tuple
-
-
-# Try to import config defaults; if not found, use empty defaults.
-try:
-    from .config import config
-except ImportError:
-    try:
-        from config import config
-    except ImportError:
-        config = {}
+from typing import Optional, Tuple, Dict, Any
 
 state = {
     # Volumes (using highest resolution only)
@@ -40,6 +31,86 @@ state = {
     'output_label_zarr': None,  # Path to output zarr for labels
     'output_zarr_array': None,  # Zarr array object for writing labels
 }
+
+
+DEFAULT_VOLUME_PLACEHOLDER = "No volumes available"
+KNOWN_DEFAULT_KEYS = {
+    "dataset_out_path",
+    "output_label_zarr",
+    "patch_size",
+    "sampling",
+    "save_progress",
+    "progress_file",
+    "min_label_percentage",
+    "target_label_value",
+    "min_z",
+    "default_volume",
+}
+
+config_defaults: Dict[str, Any] = {}
+volume_configs: Dict[str, Dict[str, Any]] = {}
+
+
+def load_config(config_path: Optional[str]) -> None:
+    """Load configuration data from a JSON file into global state."""
+    global config_defaults, volume_configs
+    config_defaults = {}
+    volume_configs = {}
+
+    if not config_path:
+        return
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as config_file:
+            data = json.load(config_file)
+    except OSError as err:
+        print(f"Unable to read config file '{config_path}': {err}")
+        return
+    except json.JSONDecodeError as err:
+        print(f"Invalid JSON in config file '{config_path}': {err}")
+        return
+
+    if not isinstance(data, dict):
+        print(f"Config file '{config_path}' must contain a JSON object at the top level.")
+        return
+
+    volumes_section = data.get("volumes")
+    if isinstance(volumes_section, dict):
+        filtered_volumes = {
+            name: value
+            for name, value in volumes_section.items()
+            if isinstance(value, dict) and {"volume_path", "label_path"}.issubset(value.keys())
+        }
+        volume_configs = filtered_volumes
+    else:
+        volume_configs = {}
+
+    if not volume_configs:
+        volume_configs = {
+            name: value
+            for name, value in data.items()
+            if isinstance(value, dict) and {"volume_path", "label_path"}.issubset(value.keys())
+        }
+
+    defaults_section = data.get("defaults")
+    if isinstance(defaults_section, dict):
+        config_defaults.update(defaults_section)
+
+    for key, value in data.items():
+        if key in ("volumes", "defaults"):
+            continue
+        if key in volume_configs:
+            continue
+        if key in KNOWN_DEFAULT_KEYS:
+            config_defaults[key] = value
+
+    default_volume = config_defaults.get("default_volume")
+    if default_volume and default_volume not in volume_configs:
+        print(f"Warning: default_volume '{default_volume}' not found among configured volumes. Ignoring.")
+        config_defaults.pop("default_volume", None)
+
+    if not volume_configs:
+        print(f"Warning: No volume entries were found in the config file '{config_path}'.")
 
 
 def generate_patch_coords(vol_shape, patch_size, sampling, min_z=0):
@@ -348,7 +419,7 @@ def save_current_patch():
 
 
 @magicgui(
-    volume_selection={"choices": list(config.keys()) if config else ["No volumes available"]},
+    volume_selection={"choices": [DEFAULT_VOLUME_PLACEHOLDER]},
     energy={"widget_type": "LineEdit", "enabled": False},
     resolution={"widget_type": "LineEdit", "enabled": False},
     sampling={"choices": ["random", "sequence"]},
@@ -358,17 +429,17 @@ def save_current_patch():
     call_button="Initialize Volumes"
 )
 def init_volume(
-        volume_selection: str = list(config.keys())[0] if config else "",
+        volume_selection: str = DEFAULT_VOLUME_PLACEHOLDER,
         energy: str = "",
         resolution: str = "",
-        dataset_out_path: str = config.get("dataset_out_path", ""),
-        output_label_zarr: str = config.get("output_label_zarr", ""),
-        patch_size: int = config.get("patch_size", 384),
-        sampling: str = config.get("sampling", "sequence"),
-        save_progress: bool = config.get("save_progress", True),
-        progress_file: str = config.get("progress_file", ""),
-        min_label_percentage: int = config.get("min_label_percentage", 1),
-        target_label_value: str = config.get("target_label_value", ""),
+        dataset_out_path: str = "",
+        output_label_zarr: str = "",
+        patch_size: int = 384,
+        sampling: str = "sequence",
+        save_progress: bool = True,
+        progress_file: str = "",
+        min_label_percentage: int = 1,
+        target_label_value: str = "",
         min_z: int = 2500,  # minimum z index from which to start patching (only for 3D)
 ):
     """
@@ -378,52 +449,45 @@ def init_volume(
     
     # Generate timestamp for use in default paths
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
+
+    # Get the selected volume configuration
+    if not volume_configs or volume_selection not in volume_configs:
+        print(f"Error: Volume '{volume_selection}' not found in config.")
+        return
+
     # If no dataset_out_path provided, check for existing directories
     if not dataset_out_path:
-        # Look for existing dataset directories for this volume
         existing_dirs = glob.glob(f"{volume_selection}_*")
         existing_dirs = [d for d in existing_dirs if os.path.isdir(d)]
-        
+
         if existing_dirs:
-            # Use the most recent directory
             dataset_out_path = max(existing_dirs, key=os.path.getmtime)
             print(f"Found existing dataset directory: {dataset_out_path}")
         else:
-            # No existing directory, create new one
             dataset_out_path = f"{volume_selection}_{timestamp}"
-            
-        # Update the widget to show the path
-        init_volume.dataset_out_path.value = dataset_out_path
-    
+
     # Check if dataset_out_path exists and look for existing progress files
     existing_progress_file = None
-    if os.path.exists(dataset_out_path):
-        # Look for existing progress files in the directory
+    if dataset_out_path and os.path.exists(dataset_out_path):
         progress_files = glob.glob(os.path.join(dataset_out_path, f"{volume_selection}_*_progress.json"))
         if progress_files:
-            # Use the most recent progress file
             existing_progress_file = max(progress_files, key=os.path.getmtime)
             print(f"Found existing progress file: {existing_progress_file}")
-    
+
     # Generate default output_label_zarr if not provided
-    if not output_label_zarr:
-        # Check if there's an existing zarr in the dataset path
+    if not output_label_zarr and dataset_out_path:
         if os.path.exists(dataset_out_path):
             existing_zarrs = glob.glob(os.path.join(dataset_out_path, f"{volume_selection}_*_labels.zarr"))
             if existing_zarrs:
-                output_label_zarr = existing_zarrs[0]  # Use the first found
+                output_label_zarr = existing_zarrs[0]
             else:
                 output_label_zarr = os.path.join(dataset_out_path, f"{volume_selection}_{timestamp}_labels.zarr")
         else:
             output_label_zarr = os.path.join(dataset_out_path, f"{volume_selection}_{timestamp}_labels.zarr")
-        # Update the widget to show the generated path
-        init_volume.output_label_zarr.value = output_label_zarr
-    
+
     # Handle progress file path
     if save_progress:
         if not progress_file:
-            # Use existing progress file if found, otherwise generate new
             if existing_progress_file:
                 progress_file = existing_progress_file
             else:
@@ -432,24 +496,16 @@ def init_volume(
                     progress_file = os.path.join(dataset_out_path, progress_filename)
                 else:
                     progress_file = progress_filename
-        else:
-            # Check if progress_file is just a filename (no directory path)
-            if os.path.dirname(progress_file) == "":
-                progress_filename = progress_file
-                # If we have a filename without path, place it in dataset_out_path
-                if dataset_out_path:
-                    progress_file = os.path.join(dataset_out_path, progress_filename)
-            # else: Full path provided, use as is
-            
-        # Update the widget to show the final progress file path
+        elif os.path.dirname(progress_file) == "" and dataset_out_path:
+            progress_file = os.path.join(dataset_out_path, progress_file)
+
+    # Update widgets to reflect resolved values
+    init_volume.dataset_out_path.value = dataset_out_path
+    init_volume.output_label_zarr.value = output_label_zarr
+    if save_progress:
         init_volume.progress_file.value = progress_file
 
-    # Get the selected volume configuration
-    if not config or volume_selection not in config:
-        print(f"Error: Volume '{volume_selection}' not found in config.")
-        return
-    
-    selected_config = config[volume_selection]
+    selected_config = volume_configs[volume_selection]
     image_zarr = selected_config['volume_path']
     label_zarr = selected_config['label_path']
     energy = selected_config.get('energy', 'Unknown')
@@ -576,6 +632,94 @@ def init_volume(
     if state['current_index'] > 0:
         print(f"Starting from patch index {state['current_index']} (resuming from previous session)")
     load_next_patch()
+
+
+def _update_energy_resolution_fields(volume_name: str) -> None:
+    """Update the energy and resolution widgets based on the selected volume."""
+    energy_widget = getattr(init_volume, "energy", None)
+    resolution_widget = getattr(init_volume, "resolution", None)
+
+    if energy_widget is None or resolution_widget is None:
+        return
+
+    if volume_name in volume_configs:
+        volume = volume_configs[volume_name]
+        energy_value = volume.get('energy', 'Unknown')
+        resolution_value = volume.get('resolution', 'Unknown')
+        energy_widget.value = f"{energy_value} keV"
+        resolution_widget.value = f"{resolution_value} μm"
+    else:
+        energy_widget.value = ""
+        resolution_widget.value = ""
+
+
+def apply_config_to_widgets() -> None:
+    """Populate widget defaults and choices using the loaded configuration."""
+    selection_widget = getattr(init_volume, "volume_selection", None)
+    if selection_widget is None:
+        return
+
+    if volume_configs:
+        choices = list(volume_configs.keys())
+        selection_widget.choices = choices
+        default_selection = config_defaults.get("default_volume") or choices[0]
+        if default_selection not in volume_configs:
+            default_selection = choices[0]
+        selection_widget.value = default_selection
+        _update_energy_resolution_fields(default_selection)
+    else:
+        selection_widget.choices = [DEFAULT_VOLUME_PLACEHOLDER]
+        selection_widget.value = DEFAULT_VOLUME_PLACEHOLDER
+        _update_energy_resolution_fields("")
+
+    widget_defaults = {
+        "dataset_out_path": "dataset_out_path",
+        "output_label_zarr": "output_label_zarr",
+        "patch_size": "patch_size",
+        "sampling": "sampling",
+        "save_progress": "save_progress",
+        "progress_file": "progress_file",
+        "min_label_percentage": "min_label_percentage",
+        "target_label_value": "target_label_value",
+        "min_z": "min_z",
+    }
+
+    for key, widget_name in widget_defaults.items():
+        if key not in config_defaults:
+            continue
+
+        value = config_defaults[key]
+        if value is None:
+            continue
+
+        widget = getattr(init_volume, widget_name, None)
+        if widget is None:
+            continue
+
+        try:
+            if widget_name in {"patch_size", "min_label_percentage", "min_z"}:
+                widget.value = int(value)
+            elif widget_name == "save_progress":
+                if isinstance(value, str):
+                    widget.value = value.strip().lower() in {"1", "true", "yes", "on"}
+                else:
+                    widget.value = bool(value)
+            elif widget_name == "sampling":
+                choices = list(getattr(widget, "choices", []) or [])
+                candidate = str(value)
+                if candidate in choices:
+                    widget.value = candidate
+                else:
+                    lowered_choices = {str(choice).lower(): choice for choice in choices}
+                    lowered_candidate = candidate.lower()
+                    if lowered_candidate in lowered_choices:
+                        widget.value = lowered_choices[lowered_candidate]
+            elif widget_name in {"dataset_out_path", "output_label_zarr", "progress_file", "target_label_value"}:
+                widget.value = str(value)
+            else:
+                widget.value = value
+        except (TypeError, ValueError):
+            continue
 
 
 @magicgui(call_button="next pair")
@@ -901,9 +1045,13 @@ def _get_layer_data(layer_name: str) -> Optional[np.ndarray]:
     return None
 
 
-def main():
+def main(config_path: Optional[str] = None):
     """Main entry point for the proofreader application."""
     global viewer
+
+    load_config(config_path)
+    apply_config_to_widgets()
+
     viewer = napari.Viewer()
     viewer.window.add_dock_widget(init_volume, name="Initialize Volumes", area="right")
     viewer.window.add_dock_widget(jump_control, name="Jump Control", area="right")
@@ -916,15 +1064,9 @@ def main():
     @init_volume.volume_selection.changed.connect
     def update_energy_resolution():
         selected = init_volume.volume_selection.value
-        if selected in config:
-            init_volume.energy.value = f"{config[selected].get('energy', 'Unknown')} keV"
-            init_volume.resolution.value = f"{config[selected].get('resolution', 'Unknown')} μm"
-    
-    # Initialize with the default selection
-    if config:
-        default_selection = list(config.keys())[0]
-        init_volume.energy.value = f"{config[default_selection].get('energy', 'Unknown')} keV"
-        init_volume.resolution.value = f"{config[default_selection].get('resolution', 'Unknown')} μm"
+        _update_energy_resolution_fields(selected)
+
+    _update_energy_resolution_fields(init_volume.volume_selection.value)
 
     # --- Keybindings ---
     @viewer.bind_key("Space")
@@ -941,5 +1083,13 @@ def main():
     napari.run()
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the proofreader application."""
+    parser = argparse.ArgumentParser(description="VC Proofreader")
+    parser.add_argument("--config", type=str, help="Path to a JSON configuration file.")
+    return parser.parse_args()
+
+
 if __name__ == '__main__':
-    main()
+    args = parse_args()
+    main(args.config)
