@@ -11,7 +11,6 @@ from magicgui import magicgui
 from datetime import datetime
 import cc3d
 from typing import Optional, Tuple, Dict, Any
-import runpy
 
 state = {
     # Volumes (using highest resolution only)
