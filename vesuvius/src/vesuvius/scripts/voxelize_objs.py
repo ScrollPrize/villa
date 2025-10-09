@@ -1767,7 +1767,6 @@ def main():
             }
         ]
 
-    normals_dataset_name = normals_datasets[0].path if normals_datasets else None
     if surface_frame_datasets:
         surface_frame_dataset_name = surface_frame_datasets[0].path
 
