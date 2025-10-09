@@ -19,9 +19,12 @@ import concurrent.futures
 from huggingface_hub import snapshot_download
 
 # WebKnossos imports
-from webknossos.dataset import Dataset
-from webknossos.dataset.layer import Layer
-from webknossos.geometry.mag import Mag
+try:
+    from webknossos.dataset import Dataset
+    from webknossos.dataset.layer import Layer
+    from webknossos.geometry.mag import Mag
+except:
+    pass
 
 from inference_timesformer import (
     RegressionPLModel,
