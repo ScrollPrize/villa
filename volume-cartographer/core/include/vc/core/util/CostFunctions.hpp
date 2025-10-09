@@ -107,7 +107,7 @@ struct DistLoss2D {
 
 struct StraightLoss {
     StraightLoss(float w) : _w(w) {};
-    static constexpr double kStraightAngleCosThreshold = 0.86602540378443864676; // cos(30°); deviations beyond 30° incur penalty
+    // static constexpr double kStraightAngleCosThreshold = 0.86602540378443864676; // cos(30°); deviations beyond 30° incur penalty
     template <typename T>
     bool operator()(const T* const a, const T* const b, const T* const c, T* residual) const {
         T d1[3], d2[3];
@@ -125,10 +125,10 @@ struct StraightLoss {
         T dot = (d1[0]*d2[0] + d1[1]*d2[1] + d1[2]*d2[2])/(l1*l2);
         
 
-        if (dot <= T(kStraightAngleCosThreshold)) {
-            T penalty = T(kStraightAngleCosThreshold)-dot;
-            residual[0] = T(_w)*(T(1)-dot) + T(_w*8)*penalty*penalty;
-        } else
+        // if (dot <= T(kStraightAngleCosThreshold)) {
+        //     T penalty = T(kStraightAngleCosThreshold)-dot;
+        //     residual[0] = T(_w)*(T(1)-dot) + T(_w*8)*penalty*penalty;
+        // } else
             residual[0] = T(_w)*(T(1)-dot);
 
         return true;
@@ -908,12 +908,16 @@ struct NormalConstraintPlane {
             T d2_sq = point_line_dist_sq_differentiable(p2, seg2_p1, seg2_p2);
 
             T d1_norm, d2_norm;
-            if (d1_sq < T(1e-9))
+            if (d1_sq > T(snap_search_range_*snap_search_range_))
+                d1_norm = T(1.0);
+            else if (d1_sq < T(1e-9))
                 d1_norm = d1_sq / T(snap_search_range_);
             else
                 d1_norm = ceres::sqrt(d1_sq) / T(snap_search_range_);
 
-            if (d2_sq < T(1e-9))
+            if (d2_sq > T(snap_trig_th_*snap_trig_th_))
+                d2_norm = T(1.0);
+            else if (d2_sq < T(1e-9))
                 d2_norm = d2_sq / T(snap_trig_th_);
             else
                 d2_norm = ceres::sqrt(d2_sq) / T(snap_trig_th_);

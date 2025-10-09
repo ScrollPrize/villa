@@ -205,7 +205,7 @@ public:
 
     LossSettings() {
         w[LossType::SNAP] = 0.1f;
-        w[LossType::NORMAL] = 10.0f;
+        w[LossType::NORMAL] = 0.1f;
         w[LossType::STRAIGHT] = 0.2f;
         w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 1.0f;
@@ -1530,6 +1530,18 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
             surf->setChannel("loss_normal", loss_normal);
             surf->setChannel("loss_snap", loss_snap);
             surf->setChannel("loss_sdir", loss_sdir);
+
+            double min_val, max_val;
+            cv::minMaxLoc(loss_dist, &min_val, &max_val);
+            std::cout << "Max loss_dist: " << max_val << std::endl;
+            cv::minMaxLoc(loss_straight, &min_val, &max_val);
+            std::cout << "Max loss_straight: " << max_val << std::endl;
+            cv::minMaxLoc(loss_normal, &min_val, &max_val);
+            std::cout << "Max loss_normal: " << max_val << std::endl;
+            cv::minMaxLoc(loss_snap, &min_val, &max_val);
+            std::cout << "Max loss_snap: " << max_val << std::endl;
+            cv::minMaxLoc(loss_sdir, &min_val, &max_val);
+            std::cout << "Max loss_sdir: " << max_val << std::endl;
         }
 
         const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
@@ -2000,8 +2012,18 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
             }  // end parallel iteration over cands
         }
 
+        if (!tgt_path.empty() && snapshot_interval > 0 && generation % snapshot_interval == 0) {
+            QuadSurface* surf = create_surface_from_state();
+            std::stringstream ss;
+            ss << "_" << std::setw(6) << std::setfill('0') << generation;
+            std::string path = tgt_path.string() + ss.str() + "_preopt";
+            surf->save(path, true);
+            delete surf;
+            std::cout << "saved snapshot in " << path << std::endl;
+        }
+
         if (!global_opt) {
-            if (generation % 4 == 0) {
+            if (generation % 1 == 0) {
                 cv::Mat_<uint16_t> gen_mask_u16;
                 cv::Mat_<uchar> gen_mask;
                 cv::threshold(generations, gen_mask_u16, 0, 255, cv::THRESH_BINARY);
@@ -2033,9 +2055,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 auto pies = generate_pie_slices(dist_transform);
 
                 DistanceLossSettings loss_edge(gen_mask);
-                // loss_edge.set_steps(NORMAL, {{10.0,0},{3.0,3},{10.0,4}});
-                loss_edge.set_steps(DIST, {{0.1,1},{0.2,3},{0.3,4},{0.5,5},{0.7,6},{0.8,7},{1.0,8}});
-                loss_edge.set_steps(SNAP, {{0.01,2},{0.03,3},{0.1,4},{0.2,5},{0.3,6},{0.4,7},{0.5,8}});
+                loss_edge.set_steps(NORMAL, {{0.1,1},{0.2,3},{0.5,5},{0.8,7},{1.0,9}});
+                // loss_edge.set_steps(DIST, {{0.1,1},{0.2,3},{0.3,4},{0.5,5},{0.7,6},{0.8,7},{1.0,8}});
+                // loss_edge.set_steps(NORMAL, {{0.01,3},{0.02,5},{0.05,7},{0.08,9},{0.1,11}});
 
                 cv::Mat even_pies_vis = cv::Mat::zeros(size, CV_8UC3);
                 cv::Mat odd_pies_vis = cv::Mat::zeros(size, CV_8UC3);
