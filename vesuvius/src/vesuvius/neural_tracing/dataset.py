@@ -37,10 +37,11 @@ class Patch:
 
     def __post_init__(self):
         # Construct the valid *quads* mask; the ij'th element says whether all four corners of the quad with min-corner at ij are valid
-        self.valid_mask = torch.any(self.zyxs[:-1, :-1] != -1, dim=-1) & torch.any(self.zyxs[1:, :-1] != -1, dim=-1) & torch.any(self.zyxs[:-1, 1:] != -1, dim=-1) & torch.any(self.zyxs[1:, 1:] != -1, dim=-1)
-        self.valid_indices = torch.stack(torch.where(self.valid_mask), dim=-1)
-        assert len(self.valid_indices) > 0
-        self.area = (~self.valid_mask).sum() * (1 / self.scale).prod()
+        self.valid_quad_mask = torch.any(self.zyxs[:-1, :-1] != -1, dim=-1) & torch.any(self.zyxs[1:, :-1] != -1, dim=-1) & torch.any(self.zyxs[:-1, 1:] != -1, dim=-1) & torch.any(self.zyxs[1:, 1:] != -1, dim=-1)
+        self.valid_quad_indices = torch.stack(torch.where(self.valid_quad_mask), dim=-1)
+        self.valid_vertex_mask = torch.any(self.zyxs != -1, dim=-1)
+        assert len(self.valid_quad_indices) > 0
+        self.area = (~self.valid_quad_mask).sum() * (1 / self.scale).prod()
 
     def retarget(self, factor):
         # Retarget the patch to a volume downsampled by the given factor
@@ -67,8 +68,8 @@ class LineDataset(torch.utils.data.IterableDataset):
             patch = random.choices(self._patches, weights=area_weights)[0]
 
             # Sample a random valid quad in the patch, then a point in that quad
-            random_idx = torch.randint(len(patch.valid_indices) - 1, size=[])
-            start_quad_ij = patch.valid_indices[random_idx]
+            random_idx = torch.randint(len(patch.valid_quad_indices) - 1, size=[])
+            start_quad_ij = patch.valid_quad_indices[random_idx]
             start_ij = start_quad_ij + torch.rand(size=[2])
             
             # Sample second point at random angle; reject if outside the patch or quad not valid
@@ -77,7 +78,7 @@ class LineDataset(torch.utils.data.IterableDataset):
             end_ij = start_ij + distance * torch.tensor([torch.cos(angle), torch.sin(angle)])
             if torch.any(end_ij < 0) or torch.any(end_ij >= torch.tensor(patch.zyxs.shape[:2])):
                 continue
-            if not patch.valid_mask[*end_ij.int()]:
+            if not patch.valid_quad_mask[*end_ij.int()]:
                 continue
 
             # FIXME: sometimes should sample shorter context (min length of two) to enable bootstrapping traces
@@ -113,8 +114,8 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
             patch = random.choices(self._patches, weights=area_weights)[0]
 
             # Sample a random valid quad in the patch, then a point in that quad
-            random_idx = torch.randint(len(patch.valid_indices) - 1, size=[])
-            start_quad_ij = patch.valid_indices[random_idx]
+            random_idx = torch.randint(len(patch.valid_quad_indices) - 1, size=[])
+            start_quad_ij = patch.valid_quad_indices[random_idx]
             center_ij = start_quad_ij + torch.rand(size=[2])
             # TODO: maybe erode inwards before doing this, so we can directly
             #  avoid sampling points that are too near the edge of the patch
@@ -125,7 +126,7 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
             # context_ij = center_ij + distance * torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1)
             # if torch.any(context_ij < 0) or torch.any(context_ij >= torch.tensor(patch.zyxs.shape[:2])):
             #     continue
-            # if not patch.valid_mask[*context_ij.int().T].all():
+            # if not patch.valid_quad_mask[*context_ij.int().T].all():
             #     continue
 
             center_zyx = get_zyx_from_patch(center_ij, patch)
@@ -141,7 +142,7 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
 
             # FIXME: instead check any corner in crop, and clamp to bounds later
             quad_centers = 0.5 * (patch.zyxs[1:, 1:] + patch.zyxs[:-1, :-1])
-            quad_in_crop = patch.valid_mask & torch.all(quad_centers >= min_corner_zyx, dim=-1) & torch.all(quad_centers < min_corner_zyx + crop_size, dim=-1)
+            quad_in_crop = patch.valid_quad_mask & torch.all(quad_centers >= min_corner_zyx, dim=-1) & torch.all(quad_centers < min_corner_zyx + crop_size, dim=-1)
             
             # Build neighbor graph of quads that are in the volume crop
             G = nx.Graph()
@@ -254,8 +255,8 @@ class HeatmapDataset(torch.utils.data.IterableDataset):
             patch = random.choices(self._patches, weights=area_weights)[0]
 
             # Sample a random valid quad in the patch, then a point in that quad
-            random_idx = torch.randint(len(patch.valid_indices) - 1, size=[])
-            start_quad_ij = patch.valid_indices[random_idx]
+            random_idx = torch.randint(len(patch.valid_quad_indices) - 1, size=[])
+            start_quad_ij = patch.valid_quad_indices[random_idx]
             center_ij = start_quad_ij + torch.rand(size=[2])
             center_zyx = get_zyx_from_patch(center_ij, patch)
 
@@ -270,17 +271,17 @@ class HeatmapDataset(torch.utils.data.IterableDataset):
             v_neg_shifted_ijs = center_ij - uv_deltas * torch.tensor([0, 1])
 
             # Check all points lie inside the patch
-            if torch.any(u_pos_shifted_ijs < 0) or torch.any(u_pos_shifted_ijs >= torch.tensor(patch.valid_mask.shape[:2])):
+            if torch.any(u_pos_shifted_ijs < 0) or torch.any(u_pos_shifted_ijs >= torch.tensor(patch.valid_quad_mask.shape[:2])):
                 continue
-            if torch.any(v_pos_shifted_ijs < 0) or torch.any(v_pos_shifted_ijs >= torch.tensor(patch.valid_mask.shape[:2])):
+            if torch.any(v_pos_shifted_ijs < 0) or torch.any(v_pos_shifted_ijs >= torch.tensor(patch.valid_quad_mask.shape[:2])):
                 continue
-            if not patch.valid_mask[*u_pos_shifted_ijs.int().T].all() or not patch.valid_mask[*v_pos_shifted_ijs.int().T].all():
+            if not patch.valid_quad_mask[*u_pos_shifted_ijs.int().T].all() or not patch.valid_quad_mask[*v_pos_shifted_ijs.int().T].all():
                 continue
-            if torch.any(u_neg_shifted_ijs < 0) or torch.any(u_neg_shifted_ijs >= torch.tensor(patch.valid_mask.shape[:2])):
+            if torch.any(u_neg_shifted_ijs < 0) or torch.any(u_neg_shifted_ijs >= torch.tensor(patch.valid_quad_mask.shape[:2])):
                 continue
-            if torch.any(v_neg_shifted_ijs < 0) or torch.any(v_neg_shifted_ijs >= torch.tensor(patch.valid_mask.shape[:2])):
+            if torch.any(v_neg_shifted_ijs < 0) or torch.any(v_neg_shifted_ijs >= torch.tensor(patch.valid_quad_mask.shape[:2])):
                 continue
-            if not patch.valid_mask[*u_neg_shifted_ijs.int().T].all() or not patch.valid_mask[*v_neg_shifted_ijs.int().T].all():
+            if not patch.valid_quad_mask[*u_neg_shifted_ijs.int().T].all() or not patch.valid_quad_mask[*v_neg_shifted_ijs.int().T].all():
                 continue
             # FIXME: should mask instead of skipping (unless zero 'other' points), i.e. don't apply loss on these points
 
@@ -364,7 +365,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
     def _get_quads_in_crop(self, patch, min_corner_zyx, crop_size):
         """Get mask of quads that fall within the crop region"""
         quad_centers = 0.5 * (patch.zyxs[1:, 1:] + patch.zyxs[:-1, :-1])
-        return patch.valid_mask & torch.all(quad_centers >= min_corner_zyx, dim=-1) & torch.all(quad_centers < min_corner_zyx + crop_size, dim=-1)
+        return patch.valid_quad_mask & torch.all(quad_centers >= min_corner_zyx, dim=-1) & torch.all(quad_centers < min_corner_zyx + crop_size, dim=-1)
 
     def _get_patch_points_in_crop(self, patch, min_corner_zyx, crop_size):
         """Get finely sampled points from a patch that fall within the crop region"""
@@ -465,7 +466,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             perturbed_ij = torch.clamp(perturbed_ij, torch.zeros([]), torch.tensor(patch.zyxs.shape[:2]) - 1)
             
             # Check if the perturbed point is still valid
-            if not patch.valid_mask[*perturbed_ij.int()]:
+            if not patch.valid_quad_mask[*perturbed_ij.int()]:
                 return get_zyx_from_patch(point_ij, patch)  # Return original 3D point if invalid
             
             # Convert to 3D coordinates
@@ -481,7 +482,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         for di in [-1, 0, 1]:
             for dj in [-1, 0, 1]:
                 ni, nj = i + di, j + dj
-                if 0 <= ni < h and 0 <= nj < w and patch.valid_mask[ni, nj]:
+                if 0 <= ni < h and 0 <= nj < w and patch.valid_vertex_mask[ni, nj]:
                     neighbors.append(patch.zyxs[ni, nj])
         
         if len(neighbors) < 3:
@@ -528,8 +529,8 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             patch = random.choices(self._patches, weights=area_weights)[0]
 
             # Sample a random valid quad in the patch, then a point in that quad
-            random_idx = torch.randint(len(patch.valid_indices) - 1, size=[])
-            start_quad_ij = patch.valid_indices[random_idx]
+            random_idx = torch.randint(len(patch.valid_quad_indices) - 1, size=[])
+            start_quad_ij = patch.valid_quad_indices[random_idx]
             center_ij = start_quad_ij + torch.rand(size=[2])
             center_zyx = get_zyx_from_patch(center_ij, patch)
 
@@ -544,17 +545,17 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             v_neg_shifted_ijs = center_ij - uv_deltas * torch.tensor([0, 1])
 
             # Check all points lie inside the patch
-            if torch.any(u_pos_shifted_ijs < 0) or torch.any(u_pos_shifted_ijs >= torch.tensor(patch.valid_mask.shape[:2])):
+            if torch.any(u_pos_shifted_ijs < 0) or torch.any(u_pos_shifted_ijs >= torch.tensor(patch.valid_vertex_mask.shape[:2])):
                 continue
-            if torch.any(v_pos_shifted_ijs < 0) or torch.any(v_pos_shifted_ijs >= torch.tensor(patch.valid_mask.shape[:2])):
+            if torch.any(v_pos_shifted_ijs < 0) or torch.any(v_pos_shifted_ijs >= torch.tensor(patch.valid_vertex_mask.shape[:2])):
                 continue
-            if not patch.valid_mask[*u_pos_shifted_ijs.int().T].all() or not patch.valid_mask[*v_pos_shifted_ijs.int().T].all():
+            if not patch.valid_vertex_mask[*u_pos_shifted_ijs.int().T].all() or not patch.valid_vertex_mask[*v_pos_shifted_ijs.int().T].all():
                 continue
-            if torch.any(u_neg_shifted_ijs < 0) or torch.any(u_neg_shifted_ijs >= torch.tensor(patch.valid_mask.shape[:2])):
+            if torch.any(u_neg_shifted_ijs < 0) or torch.any(u_neg_shifted_ijs >= torch.tensor(patch.valid_vertex_mask.shape[:2])):
                 continue
-            if torch.any(v_neg_shifted_ijs < 0) or torch.any(v_neg_shifted_ijs >= torch.tensor(patch.valid_mask.shape[:2])):
+            if torch.any(v_neg_shifted_ijs < 0) or torch.any(v_neg_shifted_ijs >= torch.tensor(patch.valid_vertex_mask.shape[:2])):
                 continue
-            if not patch.valid_mask[*u_neg_shifted_ijs.int().T].all() or not patch.valid_mask[*v_neg_shifted_ijs.int().T].all():
+            if not patch.valid_vertex_mask[*u_neg_shifted_ijs.int().T].all() or not patch.valid_vertex_mask[*v_neg_shifted_ijs.int().T].all():
                 continue
             # FIXME: should mask instead of skipping (unless zero 'other' points), i.e. don't apply loss on these points
             # FIXME: if the 'missing' point is on the negative side and the relevant _cond is true, then actually we're fine
@@ -633,9 +634,9 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 else:
                     diag_ij = torch.stack([u_pos_shifted_ijs[0, 0], v_neg_shifted_ijs[0, 1]])
             if diag_ij is not None:
-                if torch.any(diag_ij < 0) or torch.any(diag_ij >= torch.tensor(patch.valid_mask.shape[:2])):
+                if torch.any(diag_ij < 0) or torch.any(diag_ij >= torch.tensor(patch.valid_vertex_mask.shape[:2])):
                     continue
-                if not patch.valid_mask[*diag_ij.int()]:
+                if not patch.valid_vertex_mask[*diag_ij.int()]:
                     continue
                 diag_zyx = get_zyx_from_patch(diag_ij, patch)
             else:
@@ -712,7 +713,7 @@ class PatchWithCubeDataset(torch.utils.data.IterableDataset):
         )
         interpolated = rearrange(interpolated, '1 zyx y x -> y x zyx')
         valid_mask = F.grid_sample(
-            rearrange(patch.valid_mask.float(), 'y x -> 1 1 y x'),
+            rearrange(patch.valid_quad_mask.float(), 'y x -> 1 1 y x'),
             normalized_grid.flip(-1).unsqueeze(0),
             align_corners=True,
             mode='nearest',
@@ -734,8 +735,8 @@ class PatchWithCubeDataset(torch.utils.data.IterableDataset):
 
             # Sample a random valid quad in the patch, then a point in that quad
             # This defines the center of our ROI (in both patch and volume)
-            random_idx = torch.randint(len(patch.valid_indices) - 1, size=[])
-            start_quad_ij = patch.valid_indices[random_idx]
+            random_idx = torch.randint(len(patch.valid_quad_indices) - 1, size=[])
+            start_quad_ij = patch.valid_quad_indices[random_idx]
             center_ij = start_quad_ij + torch.rand(size=[2])
 
             # Extract 2D crop from patch, and 3D crop from volume
