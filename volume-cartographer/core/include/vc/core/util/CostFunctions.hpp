@@ -107,7 +107,7 @@ struct DistLoss2D {
 
 struct StraightLoss {
     StraightLoss(float w) : _w(w) {};
-    // static constexpr double kStraightAngleCosThreshold = 0.86602540378443864676; // cos(30°); deviations beyond 30° incur penalty
+    static constexpr double kStraightAngleCosThreshold = 0.86602540378443864676; // cos(30°); deviations beyond 30° incur penalty
     template <typename T>
     bool operator()(const T* const a, const T* const b, const T* const c, T* residual) const {
         T d1[3], d2[3];
@@ -125,11 +125,12 @@ struct StraightLoss {
         T dot = (d1[0]*d2[0] + d1[1]*d2[1] + d1[2]*d2[2])/(l1*l2);
         
 
-        // if (dot <= T(kStraightAngleCosThreshold)) {
-        //     T penalty = T(kStraightAngleCosThreshold)-dot;
-        //     residual[0] = T(_w)*(T(1)-dot) + T(_w*8)*penalty*penalty;
-        // } else
-            residual[0] = T(_w)*(T(1)-dot);
+        if (dot <= T(kStraightAngleCosThreshold)) {
+            T penalty = T(kStraightAngleCosThreshold)-dot;
+            residual[0] = T(0.1*_w)*(T(1)-dot) + T(_w)*penalty;
+            // residual[0] = T(_w)*(T(1)-dot) + T(_w*8)*penalty*penalty;
+        } else
+            residual[0] = T(0.1*_w)*(T(1)-dot);
 
         return true;
     }
@@ -814,7 +815,7 @@ struct NormalConstraintPlane {
                 if (dist_sq > roi_radius_*roi_radius_)
                     continue;
 
-                dist_sq = std::max(10.0f, dist_sq);
+                dist_sq = std::max(1.0f, dist_sq);
 
                 T weight_n = T(1.0 / dist_sq);
 
