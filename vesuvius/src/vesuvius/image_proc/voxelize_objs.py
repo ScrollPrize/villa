@@ -5,7 +5,6 @@ import open3d as o3d
 import os
 import zarr
 import logging
-import json
 from glob import glob
 from itertools import repeat, product
 from numcodecs import Blosc
@@ -17,6 +16,14 @@ import argparse
 from tqdm import tqdm  # Progress bar
 import dask.array as da
 from dask.diagnostics import ProgressBar
+
+from vesuvius.image_proc.shared.mesh.affine import (
+    axis_perm,
+    load_transform_from_json,
+    compute_inv_transpose,
+    apply_affine_to_points,
+    transform_normals,
+)
 
 # Determine default number of workers: half of CPU count (at least 1)
 default_workers = max(1, multiprocessing.cpu_count() // 2)
@@ -36,102 +43,25 @@ _DOWNSAMPLE_DATASETS = {}
 logger = logging.getLogger(__name__)
 
 
-def _axis_perm(order):
-    order = order.lower()
-    mapping = {"x": 0, "y": 1, "z": 2}
-    try:
-        perm = tuple(mapping[c] for c in order)
-    except KeyError as exc:
-        raise ValueError(f"Invalid axis label '{exc.args[0]}' in axis order '{order}'.") from exc
-    inv = [0, 0, 0]
-    for idx, axis in enumerate(perm):
-        inv[axis] = idx
-    return perm, tuple(inv)
-
-
-def load_transform_from_json(json_path):
-    with open(json_path, "r") as f:
-        data = json.load(f)
-
-    if "transformation_matrix" not in data:
-        raise ValueError("JSON file must contain 'transformation_matrix'.")
-
-    matrix = np.array(data["transformation_matrix"], dtype=np.float64)
-
-    if matrix.shape == (3, 4):
-        bottom = np.array([[0.0, 0.0, 0.0, 1.0]], dtype=np.float64)
-        matrix4 = np.vstack([matrix, bottom])
-    elif matrix.shape == (4, 4):
-        matrix4 = matrix
-        if not (np.allclose(matrix4[3, :3], 0.0) and np.isclose(matrix4[3, 3], 1.0)):
-            raise ValueError("Bottom row of affine matrix must be [0, 0, 0, 1].")
-    else:
-        raise ValueError(
-            "Transformation matrix must have shape 3x4 or 4x4 (row-major)."
-        )
-
-    return matrix4
-
-
-def _apply_affine_to_points(points, matrix4, perm):
-    if points.size == 0:
-        return points.astype(np.float64, copy=False)
-
-    points64 = np.asarray(points, dtype=np.float64)
-    points_ord = points64[:, perm]
-    ones = np.ones((points_ord.shape[0], 1), dtype=np.float64)
-    homog = np.concatenate([points_ord, ones], axis=1)
-    transformed_ord = (matrix4 @ homog.T).T[:, :3]
-    result = np.empty_like(points64)
-    result[:, perm] = transformed_ord
-    return result
-
-
-def _transform_normals_batch(normals, linear, perm, inv_transpose=None):
-    if normals.size == 0:
-        return normals.astype(np.float64, copy=False)
-
-    normals64 = np.asarray(normals, dtype=np.float64)
-    normals_ord = normals64[:, perm]
-
-    if inv_transpose is None:
-        try:
-            inv_transpose = np.linalg.inv(linear).T
-        except np.linalg.LinAlgError:
-            inv_transpose = None
-
-    if inv_transpose is not None:
-        transformed_ord = normals_ord @ inv_transpose.T
-    else:
-        transformed_ord = normals_ord @ linear.T
-
-    lengths = np.linalg.norm(transformed_ord, axis=1)
-    nonzero = lengths > 0
-    transformed_ord[nonzero] /= lengths[nonzero][:, None]
-    transformed_ord[~nonzero, :] = 0.0
-
-    result = np.empty_like(normals64)
-    result[:, perm] = transformed_ord
-    return result
-
-
 def _apply_affine_to_mesh(mesh, matrix4, perm, inv_transpose):
     vertices = np.asarray(mesh.vertices)
     if vertices.size:
-        transformed_vertices = _apply_affine_to_points(vertices, matrix4, perm)
+        transformed_vertices = apply_affine_to_points(vertices, matrix4, perm)
         mesh.vertices = o3d.utility.Vector3dVector(transformed_vertices)
 
     linear = matrix4[:3, :3]
 
     if mesh.has_vertex_normals() and len(mesh.vertex_normals) == len(mesh.vertices):
         v_normals = np.asarray(mesh.vertex_normals)
-        transformed_normals = _transform_normals_batch(v_normals, linear, perm, inv_transpose)
+        transformed_normals = transform_normals(
+            v_normals, linear, perm=perm, inv_transpose=inv_transpose
+        )
         mesh.vertex_normals = o3d.utility.Vector3dVector(transformed_normals)
 
     if mesh.has_triangle_normals() and len(mesh.triangle_normals) == len(mesh.triangles):
         t_normals = np.asarray(mesh.triangle_normals)
-        transformed_t_normals = _transform_normals_batch(
-            t_normals, linear, perm, inv_transpose
+        transformed_t_normals = transform_normals(
+            t_normals, linear, perm=perm, inv_transpose=inv_transpose
         )
         mesh.triangle_normals = o3d.utility.Vector3dVector(transformed_t_normals)
 
@@ -1000,7 +930,7 @@ def process_mesh(
     We assign mesh_index+1 as the label.
     """
     print(f"Processing mesh: {mesh_path}")
-    mesh = o3d.io.read_triangle_mesh(mesh_path)
+    mesh = o3d.io.read_triangle_mesh(str(mesh_path))
 
     if transform_info is not None:
         _apply_affine_to_mesh(
@@ -1336,16 +1266,13 @@ def main():
                 sys.exit(1)
 
         try:
-            perm, _ = _axis_perm(args.transform_axis_order)
+            perm, _ = axis_perm(args.transform_axis_order)
         except ValueError as exc:
             print(f"ERROR: {exc}")
             sys.exit(1)
 
         linear_part = transform_matrix[:3, :3]
-        try:
-            inv_transpose = np.linalg.inv(linear_part).T
-        except np.linalg.LinAlgError:
-            inv_transpose = None
+        inv_transpose = compute_inv_transpose(linear_part)
 
         transform_info = {
             "matrix": transform_matrix,
