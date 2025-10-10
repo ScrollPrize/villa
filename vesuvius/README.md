@@ -158,7 +158,7 @@ Training will run for 1,000 epochs by default, with 200 batches/epoch. This can 
 
 Detailed documentation is available in [the inference readme](docs/docs/inference.md)
 
-The inference script used here is unfortunately (by necessity) quite convoluted. It **stores a very large amount of intermediate data** , in the form of float16 logits from patches. In the case that you do not have a lot of storage space, it might make sense to borrow some of the functions from the inferer, and rewrite the inference process to write directly to uint8 final arrays.
+The inference process is a bit convoluted. Due to our focus on very large volumetric data, it becomes very difficult for writes to keep pace with multi-gpu systems, necessitating a map-reduce style of inference where we store intermediate logits before blending.  It **stores a very large amount of intermediate data** , in the form of float16 logits from patches. In the case that you do not have a lot of storage space, it might make sense to borrow some of the functions from the inferer, and rewrite the inference process to write directly to uint8 final arrays.
 
 The inference process is in 3 parts -- inference, blending, and finalization
 
