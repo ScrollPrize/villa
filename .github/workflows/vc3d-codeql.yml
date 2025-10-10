@@ -85,9 +85,6 @@ jobs:
       security-events: write
       contents: read
       packages: read
-    defaults:
-      run:
-        working-directory: ./volume-cartographer
     env:
       # Let CodeQL auto-use all cores; keep RAM conservative for hosted runners.
       CODEQL_THREADS: "0"
@@ -145,6 +142,7 @@ jobs:
 
       - name: Configure (Ninja, fast flags)
         if: needs.changes.outputs.vc == 'true'
+        working-directory: ./volume-cartographer
         run: |
           cmake -S . -B build -G Ninja \
                 -DVC_WITH_CUDA_SPARSE=off \
@@ -154,6 +152,7 @@ jobs:
 
       - name: Build (fast)
         if: needs.changes.outputs.vc == 'true'
+        working-directory: ./volume-cartographer
         run: cmake --build build --parallel
 
       - name: Analyze
