@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ci:
     name: CI
@@ -23,26 +27,19 @@ jobs:
           filters: |
             vc:
               - 'volume-cartographer/**'
-            wf:
-              - '.github/workflows/vc3d-ci.yml'
 
       # --- No-op success path when unrelated files changed ---
       - name: Skip (no volume-cartographer changes)
-        if: ${{ steps.changes.outputs.vc == 'false' && steps.changes.outputs.wf == 'false' }}
+        if: ${{ steps.changes.outputs.vc == 'false' }}
         run: |
           echo "✅ No changes in volume-cartographer/ or the workflow file. Skipping build."
 
-      # --- Real CI only when volume-cartographer (or the workflow) changed ---
-      - name: Set up QEMU
-        if: ${{ steps.changes.outputs.vc == 'true' || steps.changes.outputs.wf == 'true' }}
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
-        if: ${{ steps.changes.outputs.vc == 'true' || steps.changes.outputs.wf == 'true' }}
+        if: ${{ steps.changes.outputs.vc == 'true' }}
         uses: docker/setup-buildx-action@v3
 
       - name: Build (no push)
-        if: ${{ steps.changes.outputs.vc == 'true' || steps.changes.outputs.wf == 'true' }}
+        if: ${{ steps.changes.outputs.vc == 'true' }}
         uses: docker/build-push-action@v6
         with:
           context: ./volume-cartographer
@@ -50,6 +47,7 @@ jobs:
           platforms: linux/amd64
           push: false
           tags: ${{ github.repository_owner }}/volume-cartographer:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Branch-scoped cache improves reuse across PR updates without cross-branch thrash
+          cache-from: type=gha,scope=vc3d-${{ github.ref_name }}
+          cache-to: type=gha,mode=max,scope=vc3d-${{ github.ref_name }}
           # load: true # uncomment if you want the image loaded into the runner for tests
