@@ -1,71 +1,12 @@
 import alphashape
-import numpy as np
 import tifffile
 from tqdm import tqdm
-from PIL import Image, ImageDraw
 import argparse
-import os
 from pathlib import Path
 from multiprocessing import Pool
-from functools import partial
 
-
-def create_alphashape(indices, alpha=0.1):
-    alpha_shape = alphashape.alphashape(indices, alpha)
-    return alpha_shape
-
-def tif_to_indices(img_path, subsample_rate=20, pts_over=0, downsample_factor=1):
-    """Extract foreground point indices from a TIF image.
-
-    - Reads the image at full resolution.
-    - Optionally downsamples the grid by an integer factor before thresholding.
-    - Optionally subsamples the resulting point list by taking every Nth point.
-    - Returns points in the ORIGINAL image coordinate system and the original shape.
-    """
-    img = tifffile.imread(img_path)
-
-    if downsample_factor is None or downsample_factor < 1:
-        downsample_factor = 1
-
-    if downsample_factor > 1:
-        # Simple decimation for speed (sufficient for label masks)
-        img_ds = img[::downsample_factor, ::downsample_factor]
-        pts = np.where(img_ds > pts_over)
-        xs = pts[1]
-        ys = pts[0]
-        # Map back to original coordinate system
-        xs = xs * downsample_factor
-        ys = ys * downsample_factor
-    else:
-        pts = np.where(img > pts_over)
-        xs = pts[1]
-        ys = pts[0]
-
-    # Subsample the point list to thin it further
-    if subsample_rate is None or subsample_rate < 1:
-        subsample_rate = 1
-    xs = xs[::subsample_rate]
-    ys = ys[::subsample_rate]
-
-    # returns x,y coordinates of selected pts in original scale
-    pts_2d = np.column_stack((xs, ys))
-
-    return pts_2d, img.shape
-
-def alpha_shape_to_image(shape, output_path, alpha_shape):
-    output_img = Image.new('L', (shape[1], shape[0]), 0)
-    draw = ImageDraw.Draw(output_img)
-
-    if alpha_shape.geom_type == 'Polygon':
-        coords = list(alpha_shape.exterior.coords)
-        draw.polygon(coords, fill=255)
-    elif alpha_shape.geom_type == 'MultiPolygon':
-        for poly in alpha_shape.geoms:
-            coords = list(poly.exterior.coords)
-            draw.polygon(coords, fill=255)
-
-    output_array = np.array(output_img)
-    tifffile.imwrite(output_path, output_array, compression='packbits')
+from vesuvius.image_proc.shared.script_utils import arr_to_indices
+from vesuvius.image_proc.shared.geometry.alpha_wrap import fill_alpha_shape
 
 def worker_fn(args):
     img_path, output_dir, subsample_rate, pts_over, alpha, downsample_factor = args
@@ -77,8 +18,14 @@ def worker_fn(args):
         if output_path.exists():
             return f"Skipped {img_path} - output exists"
 
-        # Get indices and image shape
-        pts_2d, img_shape = tif_to_indices(img_path, subsample_rate, pts_over, downsample_factor)
+        # Load image and derive sample points for the alpha shape
+        img = tifffile.imread(img_path)
+        pts_2d, img_shape = arr_to_indices(
+            img,
+            subsample_rate=subsample_rate,
+            pts_over=pts_over,
+            downsample_factor=downsample_factor,
+        )
 
         # Skip if no points found
         if len(pts_2d) == 0:
@@ -86,10 +33,11 @@ def worker_fn(args):
             return f"Skipped {img_path} - no points"
 
         # Create alpha shape
-        alpha_shape = create_alphashape(pts_2d, alpha)
+        alpha_shape = alphashape.alphashape(pts_2d, alpha)
 
         # Save the alpha shape as image
-        alpha_shape_to_image(img_shape, output_path, alpha_shape)
+        output_array = fill_alpha_shape(img_shape, alpha_shape, fill_value=255)
+        tifffile.imwrite(output_path, output_array, compression='packbits')
 
         return f"Processed {img_path} -> {output_path}"
 

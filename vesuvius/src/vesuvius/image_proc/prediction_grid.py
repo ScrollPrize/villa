@@ -12,7 +12,7 @@ Features:
 
 Usage
 -----
-python -m vesuvius.scripts.prediction_grid \
+python -m vesuvius.image_proc.prediction_grid \
   --eval-root /path/to/eval_offline_outputs \
   --images /path/to/images \
   --output /path/to/output \
