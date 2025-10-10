@@ -21,6 +21,7 @@ import os
 from functools import lru_cache
 import multiprocessing as mp
 from typing import Dict, Tuple, Optional, List
+from vesuvius.image_proc.shared.geometry.structure_tensor import StructureTensorComputer
 try:
     from skimage.filters import threshold_otsu
     _HAVE_SKIMAGE = True
@@ -180,28 +181,20 @@ def gaussian_blur(img, sigma):
     return img
 
 
-def compute_gradients(img):
-    """Compute image gradients using central differences."""
-    # Gradient kernels matching Java implementation
-    grad_x_kernel = torch.tensor([[-0.5, 0.0, 0.5]], dtype=torch.float32, device=img.device)
-    grad_y_kernel = grad_x_kernel.T
-    
-    grad_x_kernel = grad_x_kernel.view(1, 1, 1, 3)
-    grad_y_kernel = grad_y_kernel.view(1, 1, 3, 1)
-    
-    # Compute gradients with 'replicate' padding for boundary handling
-    grad_x = F.conv2d(img, grad_x_kernel, padding=(0, 1))
-    grad_y = F.conv2d(img, grad_y_kernel, padding=(1, 0))
-    
-    return grad_x, grad_y
-
-
-def compute_structure_tensor(grad_x, grad_y, rho):
-    """Compute smoothed structure tensor components."""
-    s11 = gaussian_blur(grad_x * grad_x, rho)
-    s12 = gaussian_blur(grad_x * grad_y, rho)
-    s22 = gaussian_blur(grad_y * grad_y, rho)
-    
+def _structure_tensor_components_2d(img: torch.Tensor, st_computer: StructureTensorComputer) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute 2D structure tensor components using the shared StructureTensorComputer."""
+    if st_computer.device != img.device:
+        st_computer.device = img.device
+    if st_computer.dtype != img.dtype:
+        st_computer.dtype = img.dtype
+    comps = st_computer.compute(
+        img,
+        device=img.device,
+        spatial_dims=2,
+    )
+    s22 = comps[:, 0:1]  # Jyy
+    s12 = comps[:, 1:2]  # Jyx
+    s11 = comps[:, 2:3]  # Jxx
     return s11, s12, s22
 
 
@@ -312,21 +305,12 @@ def _diffusion_step_vectorized_impl(img, d11, d12, d22, step_size):
 
 # Create compiled versions of key functions if torch.compile is available
 if TORCH_COMPILE_AVAILABLE:
-    # Compile the core computational functions
-    # Disable CUDA graphs to avoid tensor reuse issues when processing multiple slices
     compile_options = {"triton.cudagraphs": False}
-    gaussian_blur_compiled = torch.compile(gaussian_blur, options=compile_options)
-    compute_gradients_compiled = torch.compile(compute_gradients, options=compile_options)
-    compute_structure_tensor_compiled = torch.compile(compute_structure_tensor, options=compile_options)
     compute_alpha_compiled = torch.compile(compute_alpha, options=compile_options)
     compute_c2_compiled = torch.compile(compute_c2, options=compile_options)
     compute_diffusion_tensor_compiled = torch.compile(compute_diffusion_tensor, options=compile_options)
     _diffusion_step_vectorized_impl_compiled = torch.compile(_diffusion_step_vectorized_impl, options=compile_options)
 else:
-    # Use uncompiled versions
-    gaussian_blur_compiled = gaussian_blur
-    compute_gradients_compiled = compute_gradients
-    compute_structure_tensor_compiled = compute_structure_tensor
     compute_alpha_compiled = compute_alpha
     compute_c2_compiled = compute_c2
     compute_diffusion_tensor_compiled = compute_diffusion_tensor
@@ -344,19 +328,22 @@ def diffusion_step_vectorized(img, d11, d12, d22, step_size):
 def coherence_enhancing_diffusion(img_tensor, config, use_vectorized=True, show_progress=False, use_compiled=True):
     """Main function to perform coherence enhancing diffusion."""
     img = img_tensor.clone()
+    rho = float(config['rho'])
+    sigma = float(config['sigma'])
+    component_sigma = rho if rho > 0 else None
+    st_computer = StructureTensorComputer(
+        sigma=sigma,
+        component_sigma=component_sigma,
+        smooth_components=component_sigma is not None,
+        device=img.device,
+        dtype=img.dtype,
+    )
     
-    # Choose compiled or uncompiled functions based on parameter and availability
     if use_compiled and TORCH_COMPILE_AVAILABLE:
-        blur_fn = gaussian_blur_compiled
-        grad_fn = compute_gradients_compiled
-        struct_fn = compute_structure_tensor_compiled
         alpha_fn = compute_alpha_compiled
         c2_fn = compute_c2_compiled
         diff_tensor_fn = compute_diffusion_tensor_compiled
     else:
-        blur_fn = gaussian_blur
-        grad_fn = compute_gradients
-        struct_fn = compute_structure_tensor
         alpha_fn = compute_alpha
         c2_fn = compute_c2
         diff_tensor_fn = compute_diffusion_tensor
@@ -368,14 +355,8 @@ def coherence_enhancing_diffusion(img_tensor, config, use_vectorized=True, show_
         if not show_progress:
             print(f"Step {step + 1}/{config['num_steps']}", end='\r')
         
-        # Gaussian smoothing
-        img_smooth = blur_fn(img, config['sigma'])
-        
-        # Compute gradients
-        grad_x, grad_y = grad_fn(img_smooth)
-        
-        # Compute structure tensor
-        s11, s12, s22 = struct_fn(grad_x, grad_y, config['rho'])
+        # Compute structure tensor components
+        s11, s12, s22 = _structure_tensor_components_2d(img, st_computer)
         
         # Compute eigenvalue measure
         alpha = alpha_fn(s11, s12, s22)
@@ -692,31 +673,80 @@ def process_zarr_array(input_path, output_path, config, batch_size=1, use_vector
 def load_tiff(filepath):
     """Load a TIFF image and convert to torch tensor."""
     img = tifffile.imread(filepath)
-    img_array = np.array(img, dtype=np.float32)
+    img_array = np.asarray(img)
+    original_shape = img_array.shape
+    original_dtype = img_array.dtype
+
+    # DO NOT normalize - keep original values! Cast to float32 for processing.
+    img_array = img_array.astype(np.float32, copy=False)
+
+    tensor = torch.from_numpy(img_array)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    if tensor.ndim == 2:
+        # Single 2D slice -> (1, 1, H, W)
+        tensor = tensor.unsqueeze(0).unsqueeze(0)
+    elif tensor.ndim == 3:
+        if original_shape[-1] <= 4:
+            # Channel-last layout (H, W, C) -> (1, C, H, W)
+            tensor = tensor.permute(2, 0, 1).contiguous().unsqueeze(0)
+        elif original_shape[0] <= 4:
+            # Channel-first layout (C, H, W) -> (1, C, H, W)
+            tensor = tensor.unsqueeze(0)
+        else:
+            # Stack of 2D slices along the first dimension -> (Z, 1, H, W)
+            tensor = tensor.unsqueeze(1)
+    elif tensor.ndim >= 4:
+        # Flatten all leading dimensions into the batch dimension and keep a single channel
+        spatial_h, spatial_w = original_shape[-2], original_shape[-1]
+        leading = int(np.prod(original_shape[:-2]))
+        tensor = tensor.reshape(leading, spatial_h, spatial_w).unsqueeze(1)
+    else:
+        raise ValueError(f"Unsupported TIFF dimensionality ({tensor.ndim}) for file: {filepath}")
+
+    tensor = tensor.to(device)
     
-    # DO NOT normalize - keep original values!
-    # The Java implementation works with raw float values
-    
-    # Convert to torch tensor and add batch and channel dimensions
-    img_tensor = torch.from_numpy(img_array).unsqueeze(0).unsqueeze(0).to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-    
-    return img_tensor, img_array.shape, img_array.dtype
+    return tensor, original_shape, original_dtype
 
 
 def save_tiff(tensor, filepath, original_shape, original_dtype):
     """Save torch tensor as TIFF image."""
-    # Remove batch and channel dimensions
-    img_array = tensor.squeeze().cpu().numpy()
-    
-    # Save with original data type
-    # The Java implementation doesn't rescale values
+    tensor_cpu = tensor.detach().cpu()
+
+    if tensor_cpu.ndim < 2:
+        raise ValueError("Expected at least two dimensions in tensor output.")
+
+    if len(original_shape) == 2:
+        # Original data was a single 2D slice
+        img_array = tensor_cpu.squeeze().numpy().reshape(original_shape)
+    elif len(original_shape) == 3:
+        if original_shape[-1] <= 4 and tensor_cpu.shape[0] == 1 and tensor_cpu.shape[1] == original_shape[-1]:
+            # Channel-last layout (H, W, C)
+            img_array = tensor_cpu.squeeze(0).permute(1, 2, 0).contiguous().numpy()
+        elif tensor_cpu.shape[0] == 1 and tensor_cpu.shape[1] == original_shape[0]:
+            # Channel-first layout (C, H, W)
+            img_array = tensor_cpu.squeeze(0).numpy().reshape(original_shape)
+        elif tensor_cpu.shape[1] == 1 and tensor_cpu.shape[0] == original_shape[0]:
+            # Stack of slices (Z, H, W)
+            img_array = tensor_cpu.squeeze(1).numpy().reshape(original_shape)
+        else:
+            img_array = tensor_cpu.squeeze().numpy().reshape(original_shape)
+    else:
+        leading = int(np.prod(original_shape[:-2]))
+        if tensor_cpu.shape[0] == leading and tensor_cpu.shape[1] == 1:
+            img_array = tensor_cpu.squeeze(1).numpy().reshape(original_shape)
+        else:
+            img_array = tensor_cpu.squeeze().numpy().reshape(original_shape)
+
+    # Save with original data type; do not rescale.
     if original_dtype == np.uint8:
         img_array = np.clip(img_array, 0, 255).astype(np.uint8)
     elif original_dtype == np.uint16:
         img_array = np.clip(img_array, 0, 65535).astype(np.uint16)
     else:
-        img_array = img_array.astype(original_dtype)
-    
+        img_array = img_array.astype(original_dtype, copy=False)
+
     # Create output directory if it doesn't exist
     output_dir = os.path.dirname(filepath)
     if output_dir and not os.path.exists(output_dir):

@@ -235,6 +235,8 @@ def test_eigendecompose_2d_deterministic():
     col_max = torch.abs(dots).max(dim=-2).values
     assert torch.allclose(row_max, torch.ones_like(row_max), atol=1e-4)
     assert torch.allclose(col_max, torch.ones_like(col_max), atol=1e-4)
+
+
 def test_border_trim_math_matches_patch_extent():
     """
     Regression test for border-aware trimming: when the padded read is clipped
