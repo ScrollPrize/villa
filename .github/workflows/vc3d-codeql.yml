@@ -23,9 +23,18 @@ jobs:
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+      contents: read
     outputs:
       vc: ${{ steps.filter.outputs.vc }}
     steps:
+    # On push events paths-filter uses git and needs a checkout.
+      - name: Checkout (non-PR events)
+        if: github.event_name != 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Paths filter
         id: filter
         uses: dorny/paths-filter@v3
