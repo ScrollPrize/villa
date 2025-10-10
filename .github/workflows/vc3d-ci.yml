@@ -17,6 +17,8 @@ jobs:
   ci:
     name: CI
     runs-on: ubuntu-24.04
+    env:
+      REGISTRY_IMAGE_LC: ghcr.io/${{ github.repository_owner }}/villa/volume-cartographer
 
     steps:
       - name: Checkout
@@ -40,8 +42,18 @@ jobs:
         if: ${{ steps.changes.outputs.vc == 'true' }}
         uses: docker/setup-buildx-action@v3
 
-      - name: Build (no push)
-        if: ${{ steps.changes.outputs.vc == 'true' }}
+      # Only log in when the PR is from the same repo (forks don't receive write tokens/secrets).
+      - name: Login to GHCR (same-repo PRs)
+        if: ${{ steps.changes.outputs.vc == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Fork PRs: read-only caches (GHA + public registry if available). No writes.
+      - name: Build (fork PRs; read-only caches)
+        if: ${{ steps.changes.outputs.vc == 'true' && github.event.pull_request.head.repo.full_name != github.repository }}
         uses: docker/build-push-action@v6
         with:
           context: ./volume-cartographer
@@ -49,7 +61,23 @@ jobs:
           platforms: linux/amd64
           push: false
           tags: ${{ github.repository_owner }}/volume-cartographer:latest
-          # Branch-scoped cache improves reuse across PR updates without cross-branch thrash
-          cache-from: type=gha,scope=vc3d-${{ github.ref_name }}
+          cache-from: |
+            type=gha,scope=vc3d-${{ github.base_ref || github.ref_name }}
+            type=registry,ref=${{ env.REGISTRY_IMAGE_LC }}:buildcache
+          # no cache-to on fork PRs (read-only token)
+
+      # Same-repo PRs: allow writing GHA cache for branch
+      - name: Build (same-repo PRs; writable cache)
+        if: ${{ steps.changes.outputs.vc == 'true' && github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ./volume-cartographer
+          file: ./volume-cartographer/ubuntu-24.04-noble.Dockerfile
+          platforms: linux/amd64
+          push: false
+          tags: ${{ github.repository_owner }}/volume-cartographer:latest
+          cache-from: |
+            type=gha,scope=vc3d-${{ github.base_ref || github.ref_name }}
+            type=registry,ref=${{ env.REGISTRY_IMAGE_LC }}:buildcache
           cache-to: type=gha,mode=max,scope=vc3d-${{ github.ref_name }}
           # load: true # uncomment if you want the image loaded into the runner for tests

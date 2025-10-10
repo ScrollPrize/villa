@@ -73,10 +73,10 @@ jobs:
           platforms: linux/amd64
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: |
-            type=gha,scope=${{ github.ref }}
+            type=gha,scope=vc3d-${{ github.ref_name }}
             type=registry,ref=${{ env.REGISTRY_IMAGE_LC }}:buildcache
           cache-to: |
-            type=gha,mode=max,scope=${{ github.ref }}
+            type=gha,mode=max,scope=vc3d-${{ github.ref_name }}
             type=registry,ref=${{ env.REGISTRY_IMAGE_LC }}:buildcache,mode=max
           provenance: true
           outputs: |
@@ -137,10 +137,10 @@ jobs:
           platforms: linux/arm64
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: |
-            type=gha,scope=${{ github.ref }}
+            type=gha,scope=vc3d-${{ github.ref_name }}
             type=registry,ref=${{ env.REGISTRY_IMAGE_LC }}:buildcache
           cache-to: |
-            type=gha,mode=max,scope=${{ github.ref }}
+            type=gha,mode=max,scope=vc3d-${{ github.ref_name }}
             type=registry,ref=${{ env.REGISTRY_IMAGE_LC }}:buildcache,mode=max
           provenance: true
           outputs: |
