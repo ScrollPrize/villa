@@ -1300,7 +1300,7 @@ def main():
 
     if args.format == "tifs":
         try:
-            import tifffile  # noqa: F401
+            import tifffile
         except ImportError as exc:
             print("ERROR: tifffile is required for TIFF output format. Install it and retry.")
             sys.exit(1)
