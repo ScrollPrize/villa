@@ -505,7 +505,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                     nearest_patch_distance = self._get_distance_to_nearest_patch_cached(perturbed_zyx, cached_patch_points)
                     if abs(normal_offset_magnitude) <= nearest_patch_distance * self._main_component_distance_factor:
                         break
-                    normal_offset_magnitude *= 0.5
+                    normal_offset_magnitude *= 0.8
                 else:
                     normal_offset_magnitude = 0.
                 
