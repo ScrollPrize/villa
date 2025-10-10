@@ -7,7 +7,7 @@ import zarr
 import logging
 import json
 from glob import glob
-from itertools import repeat
+from itertools import repeat, product
 from numcodecs import Blosc
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
@@ -148,6 +148,9 @@ def _get_worker_datasets():
     if not state:
         raise RuntimeError("Slice processing state is not initialized in the worker.")
 
+    if state.get("format", "zarr") != "zarr":
+        return None, None, None
+
     labels_ds = _SLICE_DATASETS.get("labels")
     if labels_ds is None:
         label_root = zarr.open(state["label_store_path"], mode="r+")
@@ -173,37 +176,98 @@ def _get_worker_datasets():
     return labels_ds, normals_ds, frame_ds
 
 
+def _write_sparse_slice(dataset, slice_index, slice_data):
+    """
+    Write a single z slice into a chunked zarr dataset while skipping all-zero chunks.
+    Falls back to direct assignment if chunking along z is not 1 voxel.
+    """
+    if dataset is None or slice_data.size == 0:
+        return
+
+    chunks = dataset.chunks
+    if not chunks or chunks[0] != 1:
+        dataset[slice_index, ...] = slice_data
+        return
+
+    # Ensure we iterate over chunk-aligned windows across the remaining axes.
+    data_shape = slice_data.shape
+    axis_ranges = []
+    for axis, dim in enumerate(data_shape):
+        chunk_extent = chunks[axis + 1] if axis + 1 < len(chunks) else dim
+        axis_ranges.append(range(0, dim, chunk_extent))
+
+    for offsets in product(*axis_ranges):
+        slices = []
+        for axis, start in enumerate(offsets):
+            chunk_extent = chunks[axis + 1] if axis + 1 < len(chunks) else data_shape[axis]
+            stop = min(start + chunk_extent, data_shape[axis])
+            slices.append(slice(start, stop))
+        slices_tuple = tuple(slices)
+        tile = slice_data[slices_tuple]
+        if not np.any(tile):
+            continue
+        dataset[(slice_index,) + slices_tuple] = tile
+
+
+def _write_tif_slice(output_dir, slice_index, slice_data, digits, compression):
+    import tifffile
+
+    os.makedirs(output_dir, exist_ok=True)
+    filename = os.path.join(output_dir, f"{slice_index:0{digits}d}.tif")
+    tifffile.imwrite(filename, slice_data, compression=compression)
+
+
 def _write_slice_output_worker(zslice, label_img, normals_img, frame_img):
     state = _SLICE_STATE
-    labels_ds, normals_ds, frame_ds = _get_worker_datasets()
-
     slice_index = int(zslice)
-    if slice_index < 0 or slice_index >= labels_ds.shape[0]:
+    volume_depth = state.get("volume_depth")
+    if volume_depth is not None and (slice_index < 0 or slice_index >= volume_depth):
         raise ValueError(
             f"Requested slice index {slice_index} is outside the allocated z range "
-            f"[0, {labels_ds.shape[0] - 1}]."
-        )
-    labels_ds[slice_index, ...] = np.ascontiguousarray(label_img, dtype=labels_ds.dtype)
-
-    if (
-        state.get("write_normals", False)
-        and normals_img is not None
-        and normals_img.size
-        and normals_ds is not None
-    ):
-        normals_ds[slice_index, ...] = np.ascontiguousarray(
-            normals_img.astype(state["normals_dtype"], copy=False)
+            f"[0, {volume_depth - 1}]."
         )
 
-    if (
-        state.get("include_surface_frame", False)
-        and frame_ds is not None
-        and frame_img is not None
-        and frame_img.size
-    ):
-        frame_ds[slice_index, ...] = np.ascontiguousarray(
-            frame_img.astype(state["surface_frame_dtype"], copy=False)
+    fmt = state.get("format", "zarr")
+    if fmt == "zarr":
+        labels_ds, normals_ds, frame_ds = _get_worker_datasets()
+        if labels_ds is None:
+            raise RuntimeError("Label dataset is not available for zarr output.")
+        label_data = np.ascontiguousarray(label_img, dtype=labels_ds.dtype)
+        _write_sparse_slice(labels_ds, slice_index, label_data)
+
+        if (
+            state.get("write_normals", False)
+            and normals_img is not None
+            and normals_img.size
+            and normals_ds is not None
+        ):
+            normals_data = np.ascontiguousarray(
+                normals_img.astype(state["normals_dtype"], copy=False)
+            )
+            _write_sparse_slice(normals_ds, slice_index, normals_data)
+
+        if (
+            state.get("include_surface_frame", False)
+            and frame_ds is not None
+            and frame_img is not None
+            and frame_img.size
+        ):
+            frame_data = np.ascontiguousarray(
+                frame_img.astype(state["surface_frame_dtype"], copy=False)
+            )
+            _write_sparse_slice(frame_ds, slice_index, frame_data)
+    elif fmt == "tifs":
+        label_dtype = state.get("label_dtype", np.uint16)
+        label_data = np.ascontiguousarray(label_img, dtype=label_dtype)
+        _write_tif_slice(
+            state["label_store_path"],
+            slice_index,
+            label_data,
+            state.get("tif_slice_digits", 5),
+            state.get("tif_compression", "zlib"),
         )
+    else:
+        raise ValueError(f"Unsupported output format '{fmt}'.")
 
 
 def _process_zslice(zslice):
@@ -929,6 +993,7 @@ def process_mesh(
     include_normals,
     include_surface_frame,
     transform_info,
+    label_dtype,
 ):
     """
     Load a mesh from disk, return (vertices, triangles, labels_for_those_triangles).
@@ -949,7 +1014,7 @@ def process_mesh(
     triangles = np.asarray(mesh.triangles, dtype=np.int32)
 
     # Every triangle in this mesh gets the same label: mesh_index+1
-    labels = np.full(len(triangles), mesh_index + 1, dtype=np.uint16)
+    labels = np.full(len(triangles), mesh_index + 1, dtype=label_dtype)
 
     need_normals = include_normals or include_surface_frame
 
@@ -1204,6 +1269,11 @@ def main():
                         help="Force recursive search in subfolders even if OBJ files exist in the parent folder")
     parser.add_argument("--chunk_size", type=int, default=0,
                         help="Override chunk edge length for Zarr datasets (use 0 for auto)")
+    parser.add_argument("--label-dtype", default="uint16",
+                        choices=["uint8", "uint16"],
+                        help="Unsigned integer dtype for the label volume (default: uint16)")
+    parser.add_argument("--format", default="zarr", choices=["zarr", "tifs"],
+                        help="Output format for the label volume (default: zarr)")
     parser.add_argument("--output_normals", action="store_true",
                         help="Also export per-voxel surface normals as an OME-Zarr pyramid")
     parser.add_argument("--normals_output_path", default="mesh_normals.zarr",
@@ -1217,6 +1287,29 @@ def main():
     parser.add_argument("--surface_frame_dtype", default="float16",
                         help="Floating point dtype for the surface frame pyramid (must be <= float16)")
     args = parser.parse_args()
+
+    label_dtype = np.dtype(args.label_dtype)
+    if label_dtype.kind != "u":
+        print("ERROR: label dtype must be an unsigned integer type.")
+        sys.exit(1)
+    if label_dtype.itemsize > 2:
+        print("ERROR: label dtype cannot exceed 16 bits per voxel.")
+        sys.exit(1)
+    args.label_dtype = label_dtype
+    print(f"Label output dtype: {label_dtype}")
+
+    if args.format == "tifs":
+        try:
+            import tifffile
+        except ImportError as exc:
+            print("ERROR: tifffile is required for TIFF output format. Install it and retry.")
+            sys.exit(1)
+        if args.output_normals or args.output_surface_frame:
+            print("ERROR: TIFF output format does not support normals or surface frame volumes.")
+            sys.exit(1)
+        if args.chunk_size > 0:
+            print("Warning: chunk_size is ignored when using TIFF output.")
+            args.chunk_size = 0
 
     if args.chunk_size < 0:
         print("ERROR: chunk_size must be non-negative.")
@@ -1305,7 +1398,17 @@ def main():
     )
 
     out_path = args.output_path
-    print(f"Label OME-Zarr output path: {out_path}")
+    print(f"Label output ({args.format}) path: {out_path}")
+    if args.format == "tifs":
+        if os.path.exists(out_path):
+            if not os.path.isdir(out_path):
+                print(f"ERROR: TIFF output path '{out_path}' must be a directory.")
+                sys.exit(1)
+            if any(os.scandir(out_path)):
+                print(f"ERROR: TIFF output directory '{out_path}' must be empty.")
+                sys.exit(1)
+        else:
+            os.makedirs(out_path, exist_ok=True)
 
     normals_out_path = None
     if args.output_normals:
@@ -1348,6 +1451,7 @@ def main():
                 repeat(args.output_normals),
                 repeat(args.output_surface_frame),
                 repeat(transform_info),
+                repeat(args.label_dtype),
             )
         )
 
@@ -1404,6 +1508,16 @@ def main():
     vertices = np.vstack(all_vertices)
     triangles = np.vstack(all_triangles)
     mesh_labels = np.concatenate(all_labels)
+
+    if mesh_labels.size:
+        label_dtype_info = np.iinfo(label_dtype)
+        max_label_value = int(mesh_labels.max())
+        if max_label_value > label_dtype_info.max:
+            print(
+                f"ERROR: label dtype {label_dtype} cannot represent label ID {max_label_value} "
+                f"(max {label_dtype_info.max})."
+            )
+            sys.exit(1)
 
     if args.output_normals:
         vertex_normals = np.vstack(all_vertex_normals)
@@ -1498,54 +1612,58 @@ def main():
                 chunks[axis] = shape[axis]
         return tuple(chunks)
 
-    label_store = zarr.DirectoryStore(out_path)
-    label_root = zarr.group(store=label_store, overwrite=True)
-    label_base_shape = (z_dim, h, w)
     label_datasets = []
-    label_axes = [
-        {"name": "z", "type": "space", "unit": "index"},
-        {"name": "y", "type": "space", "unit": "pixel"},
-        {"name": "x", "type": "space", "unit": "pixel"},
-    ]
-    label_translation = [0.0, 0.0, 0.0]
-    label_datasets_meta = []
+    label_dataset_name = None
+    if args.format == "zarr":
+        label_store = zarr.DirectoryStore(out_path)
+        label_root = zarr.group(store=label_store, overwrite=True)
+        label_base_shape = (z_dim, h, w)
+        label_axes = [
+            {"name": "z", "type": "space", "unit": "index"},
+            {"name": "y", "type": "space", "unit": "pixel"},
+            {"name": "x", "type": "space", "unit": "pixel"},
+        ]
+        label_translation = [0.0, 0.0, 0.0]
+        label_datasets_meta = []
 
-    for level in range(num_levels):
-        level_shape = compute_level_shape(label_base_shape, level, (0, 1, 2))
-        level_chunks = compute_chunks(level_shape, args.chunk_size, level)
-        dataset_name = f"{level}"
-        ds = label_root.create_dataset(
-            dataset_name,
-            shape=level_shape,
-            chunks=level_chunks,
-            dtype=np.uint16,
-            compressor=compressor,
-            overwrite=True,
-        )
-        label_datasets.append(ds)
-        scale_vector = [float(2 ** level), float(2 ** level), float(2 ** level)]
-        label_datasets_meta.append(
+        for level in range(num_levels):
+            level_shape = compute_level_shape(label_base_shape, level, (0, 1, 2))
+            level_chunks = compute_chunks(level_shape, args.chunk_size, level)
+            dataset_name = f"{level}"
+            ds = label_root.create_dataset(
+                dataset_name,
+                shape=level_shape,
+                chunks=level_chunks,
+                dtype=label_dtype,
+                compressor=compressor,
+                overwrite=True,
+            )
+            label_datasets.append(ds)
+            scale_vector = [float(2 ** level), float(2 ** level), float(2 ** level)]
+            label_datasets_meta.append(
+                {
+                    "path": dataset_name,
+                    "coordinateTransformations": [
+                        {"type": "scale", "scale": scale_vector},
+                        {"type": "translation", "translation": list(label_translation)},
+                    ],
+                }
+            )
+
+        label_root.attrs["multiscales"] = [
             {
-                "path": dataset_name,
-                "coordinateTransformations": [
-                    {"type": "scale", "scale": scale_vector},
-                    {"type": "translation", "translation": list(label_translation)},
-                ],
+                "version": "0.4",
+                "name": "labels",
+                "axes": label_axes,
+                "datasets": label_datasets_meta,
             }
-        )
-
-    label_root.attrs["multiscales"] = [
-        {
+        ]
+        label_root.attrs["image-label"] = {
             "version": "0.4",
-            "name": "labels",
-            "axes": label_axes,
-            "datasets": label_datasets_meta,
+            "colors": [],
         }
-    ]
-    label_root.attrs["image-label"] = {
-        "version": "0.4",
-        "colors": [],
-    }
+
+        label_dataset_name = label_datasets[0].path
 
     normals_datasets = []
     if args.output_normals:
@@ -1594,7 +1712,6 @@ def main():
             }
         ]
 
-    label_dataset_name = label_datasets[0].path
     normals_dataset_name = normals_datasets[0].path if normals_datasets else None
 
     surface_frame_datasets = []
@@ -1650,8 +1767,6 @@ def main():
             }
         ]
 
-    label_dataset_name = label_datasets[0].path
-    normals_dataset_name = normals_datasets[0].path if normals_datasets else None
     if surface_frame_datasets:
         surface_frame_dataset_name = surface_frame_datasets[0].path
 
@@ -1681,28 +1796,39 @@ def main():
         "surface_frame_store_path": surface_frame_out_path,
         "surface_frame_dataset_name": surface_frame_dataset_name,
         "surface_frame_dtype": surface_frame_dtype,
+        "format": args.format,
+        "label_dtype": label_dtype,
+        "tif_slice_digits": max(5, len(str(z_dim - 1))) if z_dim > 0 else 1,
+        "tif_compression": "zlib",
     }
 
     def _write_slice_output(zslice, label_img, normals_img, frame_img):
         slice_index = int(zslice)
-        if slice_index < 0 or slice_index >= label_datasets[0].shape[0]:
+        if slice_index < 0 or slice_index >= z_dim:
             raise ValueError(
                 f"Requested slice index {slice_index} is outside the allocated z range "
-                f"[0, {label_datasets[0].shape[0] - 1}]."
+                f"[0, {z_dim - 1}]."
             )
 
-        label_datasets[0][slice_index, ...] = np.ascontiguousarray(
-            label_img, dtype=label_datasets[0].dtype
-        )
+        if args.format == "zarr":
+            label_data = np.ascontiguousarray(label_img, dtype=label_datasets[0].dtype)
+            _write_sparse_slice(label_datasets[0], slice_index, label_data)
 
-        if args.output_normals and normals_img is not None and normals_img.size:
-            normals_datasets[0][slice_index, ...] = np.ascontiguousarray(
-                normals_img.astype(normals_dtype, copy=False)
-            )
+            if args.output_normals and normals_img is not None and normals_img.size:
+                normals_data = np.ascontiguousarray(normals_img.astype(normals_dtype, copy=False))
+                _write_sparse_slice(normals_datasets[0], slice_index, normals_data)
 
-        if args.output_surface_frame and frame_img is not None and frame_img.size:
-            surface_frame_datasets[0][slice_index, ...] = np.ascontiguousarray(
-                frame_img.astype(surface_frame_dtype, copy=False)
+            if args.output_surface_frame and frame_img is not None and frame_img.size:
+                frame_data = np.ascontiguousarray(frame_img.astype(surface_frame_dtype, copy=False))
+                _write_sparse_slice(surface_frame_datasets[0], slice_index, frame_data)
+        else:
+            label_data = np.ascontiguousarray(label_img, dtype=label_dtype)
+            _write_tif_slice(
+                out_path,
+                slice_index,
+                label_data,
+                slice_state["tif_slice_digits"],
+                slice_state["tif_compression"],
             )
 
     sequential_slice_args = (
@@ -1797,7 +1923,18 @@ def main():
             )
             _write_slice_output(zslice, label_img, normals_img, frame_img)
 
-    if args.chunk_size > 0:
+    processed_slice_indices = set(int(z) for z in z_slices.tolist())
+    if len(processed_slice_indices) < z_dim:
+        missing_slices = sorted(set(range(z_dim)) - processed_slice_indices)
+        if missing_slices:
+            print(f"Writing {len(missing_slices)} empty slices outside the mesh bounds.")
+            zero_label = np.zeros((h, w), dtype=label_dtype)
+            zero_normals = np.zeros((0, 0, 0), dtype=np.float32)
+            zero_frame = np.zeros((0, 0, 0, 0), dtype=np.float32)
+            for z in tqdm(missing_slices, desc="Empty slices", leave=False):
+                _write_slice_output(z, zero_label, zero_normals, zero_frame)
+
+    if args.format == "zarr" and args.chunk_size > 0:
         label_datasets[0] = _rechunk_with_dask(
             label_datasets[0], args.chunk_size, "Labels level 0", N_PROCESSES
         )
@@ -1894,20 +2031,23 @@ def main():
                 finally:
                     _set_downsample_state({})
 
-    populate_downsampled_levels(label_datasets, out_path, axes=(0, 1, 2), desc="Labels")
+    if args.format == "zarr":
+        populate_downsampled_levels(label_datasets, out_path, axes=(0, 1, 2), desc="Labels")
 
-    if args.output_normals:
-        populate_downsampled_levels(normals_datasets, normals_out_path, axes=(0, 1, 2), desc="Normals")
+        if args.output_normals:
+            populate_downsampled_levels(normals_datasets, normals_out_path, axes=(0, 1, 2), desc="Normals")
 
-    if args.output_surface_frame:
-        populate_downsampled_levels(
-            surface_frame_datasets,
-            surface_frame_out_path,
-            axes=(0, 1, 2),
-            desc="Surface frame",
-        )
+        if args.output_surface_frame:
+            populate_downsampled_levels(
+                surface_frame_datasets,
+                surface_frame_out_path,
+                axes=(0, 1, 2),
+                desc="Surface frame",
+            )
 
-    print("Completed OME-Zarr export.")
+        print("Completed OME-Zarr export.")
+    else:
+        print("Completed TIFF slice export.")
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ import os
 import json
 import glob
 import argparse
+import runpy
 import numpy as np
 import napari
 import zarr
@@ -52,7 +53,7 @@ volume_configs: Dict[str, Dict[str, Any]] = {}
 
 
 def load_config(config_path: Optional[str]) -> None:
-    """Load configuration data from a JSON file into global state."""
+    """Load configuration data from a JSON file or Python script into global state."""
     global config_defaults, volume_configs
     config_defaults = {}
     volume_configs = {}
@@ -60,18 +61,76 @@ def load_config(config_path: Optional[str]) -> None:
     if not config_path:
         return
 
-    try:
-        with open(config_path, "r", encoding="utf-8") as config_file:
-            data = json.load(config_file)
-    except OSError as err:
-        print(f"Unable to read config file '{config_path}': {err}")
-        return
-    except json.JSONDecodeError as err:
-        print(f"Invalid JSON in config file '{config_path}': {err}")
-        return
+    data: Optional[Dict[str, Any]] = None
+    config_path_lower = config_path.lower()
+
+    if config_path_lower.endswith(".py"):
+        try:
+            module_vars = runpy.run_path(config_path)
+        except Exception as err:
+            print(f"Unable to execute config script '{config_path}': {err}")
+            return
+
+        volume_candidate_keys = [
+            "volumes",
+            "VOLUMES",
+            "config",
+            "CONFIG",
+            "volume_configs",
+            "VOLUME_CONFIGS",
+        ]
+        volumes_dict = None
+        for key in volume_candidate_keys:
+            value = module_vars.get(key)
+            if isinstance(value, dict):
+                volumes_dict = value
+                break
+
+        if volumes_dict is None:
+            print(
+                f"Config script '{config_path}' must define a dict named "
+                "'config', 'volumes', or 'volume_configs'."
+            )
+            return
+
+        data = {"volumes": volumes_dict}
+
+        defaults_candidate_keys = [
+            "defaults",
+            "DEFAULTS",
+            "config_defaults",
+            "CONFIG_DEFAULTS",
+        ]
+        for key in defaults_candidate_keys:
+            value = module_vars.get(key)
+            if isinstance(value, dict):
+                data["defaults"] = value
+                break
+
+        for key in KNOWN_DEFAULT_KEYS:
+            if key in data.get("defaults", {}):
+                continue
+            if key in data:
+                continue
+            value = module_vars.get(key)
+            if value is not None:
+                data[key] = value
+    else:
+        try:
+            with open(config_path, "r", encoding="utf-8") as config_file:
+                data = json.load(config_file)
+        except OSError as err:
+            print(f"Unable to read config file '{config_path}': {err}")
+            return
+        except json.JSONDecodeError as err:
+            print(f"Invalid JSON in config file '{config_path}': {err}")
+            return
 
     if not isinstance(data, dict):
-        print(f"Config file '{config_path}' must contain a JSON object at the top level.")
+        if config_path_lower.endswith(".py"):
+            print(f"Config script '{config_path}' must define configuration data as a dictionary.")
+        else:
+            print(f"Config file '{config_path}' must contain a JSON object at the top level.")
         return
 
     volumes_section = data.get("volumes")
@@ -660,15 +719,16 @@ def apply_config_to_widgets() -> None:
         return
 
     if volume_configs:
-        choices = list(volume_configs.keys())
-        selection_widget.choices = choices
-        default_selection = config_defaults.get("default_volume") or choices[0]
+        volume_names = list(volume_configs.keys())
+        selection_widget.choices = [(name, name) for name in volume_names]
+        default_selection = config_defaults.get("default_volume") or volume_names[0]
         if default_selection not in volume_configs:
-            default_selection = choices[0]
+            default_selection = volume_names[0]
         selection_widget.value = default_selection
         _update_energy_resolution_fields(default_selection)
     else:
-        selection_widget.choices = [DEFAULT_VOLUME_PLACEHOLDER]
+        placeholder_choices = [(DEFAULT_VOLUME_PLACEHOLDER, DEFAULT_VOLUME_PLACEHOLDER)]
+        selection_widget.choices = placeholder_choices
         selection_widget.value = DEFAULT_VOLUME_PLACEHOLDER
         _update_energy_resolution_fields("")
 
@@ -1050,8 +1110,6 @@ def main(config_path: Optional[str] = None):
     global viewer
 
     load_config(config_path)
-    apply_config_to_widgets()
-
     viewer = napari.Viewer()
     viewer.window.add_dock_widget(init_volume, name="Initialize Volumes", area="right")
     viewer.window.add_dock_widget(jump_control, name="Jump Control", area="right")
@@ -1059,7 +1117,9 @@ def main(config_path: Optional[str] = None):
     viewer.window.add_dock_widget(remove_small_objects, name="Remove Small Objects", area="right")
     viewer.window.add_dock_widget(prev_pair, name="Previous Patch", area="right")
     viewer.window.add_dock_widget(iter_pair, name="Iterate Patches", area="right")
-    
+
+    apply_config_to_widgets()
+
     # Set up event handler to update energy and resolution when volume selection changes
     @init_volume.volume_selection.changed.connect
     def update_energy_resolution():
@@ -1086,7 +1146,11 @@ def main(config_path: Optional[str] = None):
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for the proofreader application."""
     parser = argparse.ArgumentParser(description="VC Proofreader")
-    parser.add_argument("--config", type=str, help="Path to a JSON configuration file.")
+    parser.add_argument(
+        "--config",
+        type=str,
+        help="Path to a configuration file (JSON or Python script).",
+    )
     return parser.parse_args()
 
 

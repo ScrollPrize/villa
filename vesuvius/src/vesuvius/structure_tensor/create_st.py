@@ -1,6 +1,7 @@
 #create_st.py
 import argparse
-import os
+import sys
+import warnings
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -15,6 +16,7 @@ import numcodecs
 from vesuvius.models.run.inference import Inferer
 from vesuvius.data.utils import open_zarr
 from numcodecs import Blosc
+from ._compile_utils import _maybe_compile_function
 
 def _ceildiv(a: int, b: int) -> int:
     """Ceiling division for positives."""
@@ -150,6 +152,11 @@ class StructureTensorInferer(Inferer, nn.Module):
             self._pad + pad_py + extra,
             self._pad + pad_px + extra,
         )
+
+        self._compute_structure_tensor_fn = _maybe_compile_function(
+            self._compute_structure_tensor_impl,
+            compile_kwargs={"mode": "reduce-overhead", "fullgraph": True},
+        )
         
     def _load_model(self):
         """
@@ -256,8 +263,7 @@ class StructureTensorInferer(Inferer, nn.Module):
         
         return self.output_store
     
-    @torch.compile(mode="reduce-overhead", fullgraph=True)
-    def compute_structure_tensor(self, x: torch.Tensor, sigma=None):
+    def _compute_structure_tensor_impl(self, x: torch.Tensor, sigma=None):
         # x: [N,1,Z,Y,X]
         if sigma is None: sigma = self.sigma
         if sigma > 0:
@@ -289,6 +295,21 @@ class StructureTensorInferer(Inferer, nn.Module):
             J = F.conv3d(J, weight=self._gauss3d_tensor, padding=(self._pad,)*3, groups=6)
 
         return J
+
+    def compute_structure_tensor(self, x: torch.Tensor, sigma=None):
+        try:
+            return self._compute_structure_tensor_fn(x, sigma)
+        except RuntimeError as exc:
+            message = str(exc)
+            if "Compiler: cl is not found" in message or "torch._inductor.exc" in message:
+                warnings.warn(
+                    "Falling back to eager structure tensor computation because torch.compile "
+                    "failed (likely missing required compiler).",
+                    RuntimeWarning,
+                )
+                self._compute_structure_tensor_fn = self._compute_structure_tensor_impl
+                return self._compute_structure_tensor_fn(x, sigma)
+            raise
 
     def _run_inference(self):
         """
@@ -541,16 +562,27 @@ def _compute_eigenvectors_impl(block: torch.Tensor) -> tuple[torch.Tensor, torch
     return eigvals, eigvecs
 
 
-_USE_TORCH_COMPILE = os.environ.get("VESUVIUS_TORCH_COMPILE", "1") not in ("0", "false", "False")
+_compute_eigenvectors_fn = _maybe_compile_function(
+    _compute_eigenvectors_impl,
+    compile_kwargs={"mode": "max-autotune-no-cudagraphs", "fullgraph": True},
+)
 
-if _USE_TORCH_COMPILE:
-    _compute_eigenvectors = torch.compile(
-        _compute_eigenvectors_impl,
-        mode="max-autotune-no-cudagraphs",
-        fullgraph=True,
-    )
-else:
-    _compute_eigenvectors = _compute_eigenvectors_impl
+
+def _compute_eigenvectors(block: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    global _compute_eigenvectors_fn
+    try:
+        return _compute_eigenvectors_fn(block)
+    except RuntimeError as exc:
+        message = str(exc)
+        if "Compiler: cl is not found" in message or "torch._inductor.exc" in message:
+            warnings.warn(
+                "Falling back to eager eigenvector computation because torch.compile "
+                "failed (likely missing required compiler).",
+                RuntimeWarning,
+            )
+            _compute_eigenvectors_fn = _compute_eigenvectors_impl
+            return _compute_eigenvectors_fn(block)
+        raise
 
 def _finalize_structure_tensor_torch(
     zarr_path,

@@ -1,7 +1,10 @@
 # smooth_vf.py
+import warnings
 import torch
 import torch.nn as nn
 from typing import Optional
+
+from ._compile_utils import _maybe_compile_function
 
 class VectorFieldModule(nn.Module):
     """
@@ -36,6 +39,10 @@ class VectorFieldModule(nn.Module):
         conv.weight.data.copy_(w)
         conv.weight.requires_grad_(False)
         self.conv = conv.to(self.device)
+        self._smooth_fn = _maybe_compile_function(
+            self._smooth_impl,
+            compile_kwargs={"mode": "reduce-overhead", "fullgraph": True},
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -44,7 +51,20 @@ class VectorFieldModule(nn.Module):
         """
         return self.conv(x)
 
-    @torch.compile(fullgraph=True, mode='reduce-overhead')
-    def smooth(self, x: torch.Tensor) -> torch.Tensor:
-        # compiling this makes the conv into a fused kernel
+    def _smooth_impl(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward(x)
+
+    def smooth(self, x: torch.Tensor) -> torch.Tensor:
+        try:
+            return self._smooth_fn(x)
+        except RuntimeError as exc:
+            message = str(exc)
+            if "Compiler: cl is not found" in message or "torch._inductor.exc" in message:
+                warnings.warn(
+                    "Falling back to eager vector-field smoothing because torch.compile "
+                    "failed (likely missing required compiler).",
+                    RuntimeWarning,
+                )
+                self._smooth_fn = self._smooth_impl
+                return self._smooth_fn(x)
+            raise
