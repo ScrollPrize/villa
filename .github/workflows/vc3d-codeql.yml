@@ -1,18 +1,16 @@
 name: CodeQL
 
 on:
+  # Always trigger on PRs so required checks appear and can succeed fast via a no-op.
   pull_request:
-    paths:
-      - 'volume-cartographer/**'
-      - '.github/workflows/vc3d-codeql.yml'
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [ main ]  # scan after merge too
     paths:
       - 'volume-cartographer/**'
       - '.github/workflows/vc3d-codeql.yml'
-  schedule:
-    # Friday 11:43 UTC
-    - cron: '43 11 * * 5'
+# Keep an on-demand lever now that schedule (which can't be path-filtered) is removed.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -22,19 +20,40 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      vc: ${{ steps.filter.outputs.vc }}
+    steps:
+      - name: Paths filter
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            vc:
+              - 'volume-cartographer/**'
+
   # ⚡ Fast PR scan: no compile, quick feedback
   analyze_fast:
     if: github.event_name == 'pull_request'
+    needs: [changes]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       security-events: write
       contents: read
     steps:
+      - name: No-op (unrelated changes)
+        if: needs.changes.outputs.vc != 'true'
+        run: echo "✅ No volume-cartographer changes — skipping CodeQL (PR fast scan)."
+
       - name: Checkout
+        if: needs.changes.outputs.vc == 'true'
         uses: actions/checkout@v4
 
       - name: Initialize CodeQL (no build)
+        if: needs.changes.outputs.vc == 'true'
         uses: github/codeql-action/init@v3
         with:
           languages: c-cpp
@@ -42,13 +61,15 @@ jobs:
           queries: security-extended
 
       - name: Analyze
+        if: needs.changes.outputs.vc == 'true'
         uses: github/codeql-action/analyze@v3
         with:
           category: "/language:c-cpp"
 
   # 🧪 Deep scan for push/schedule: compiles with fast settings
   analyze_deep:
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'push'
+    needs: [changes]
     runs-on: ubuntu-latest
     timeout-minutes: 360
     permissions:
@@ -58,13 +79,23 @@ jobs:
     defaults:
       run:
         working-directory: ./volume-cartographer
+    env:
+      # Let CodeQL auto-use all cores; keep RAM conservative for hosted runners.
+      CODEQL_THREADS: "0"
+      CODEQL_RAM: "4500"
     steps:
+      - name: No-op (unrelated changes)
+        if: needs.changes.outputs.vc != 'true'
+        run: echo "✅ No volume-cartographer changes — skipping CodeQL deep scan."
+
       - name: Checkout
+        if: needs.changes.outputs.vc == 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0  # history-aware queries if needed
 
       - name: Install build deps
+        if: needs.changes.outputs.vc == 'true'
         run: |
           set -euxo pipefail
           export DEBIAN_FRONTEND=noninteractive
@@ -76,6 +107,7 @@ jobs:
             libgsl-dev libsdl2-dev libcurl4-openssl-dev
 
       - name: Cache ccache
+        if: needs.changes.outputs.vc == 'true'
         uses: actions/cache@v4
         with:
           path: ~/.ccache
@@ -83,15 +115,19 @@ jobs:
           restore-keys: ccache-${{ runner.os }}-
 
       - name: Enable ccache
+        if: needs.changes.outputs.vc == 'true'
         run: |
           mkdir -p ~/.ccache
-          echo 'max_size = 2G' >> ~/.ccache/ccache.conf || true
-
+          echo 'max_size = 5G' >> ~/.ccache/ccache.conf || true
+          echo 'hash_dir = true' >> ~/.ccache/ccache.conf || true
+          echo 'compiler_check = content' >> ~/.ccache/ccache.conf || true
           echo "CC=ccache gcc"  >> $GITHUB_ENV
           echo "CXX=ccache g++" >> $GITHUB_ENV
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE/volume-cartographer" >> $GITHUB_ENV
 
 
       - name: Initialize CodeQL
+        if: needs.changes.outputs.vc == 'true'
         uses: github/codeql-action/init@v3
         with:
           languages: c-cpp
@@ -99,15 +135,20 @@ jobs:
           queries: security-extended,security-and-quality
 
       - name: Configure (Ninja, fast flags)
+        if: needs.changes.outputs.vc == 'true'
         run: |
           cmake -S . -B build -G Ninja \
                 -DVC_WITH_CUDA_SPARSE=off \
-                -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Debug
+                -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Debug \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build (fast)
+        if: needs.changes.outputs.vc == 'true'
         run: cmake --build build --parallel
 
       - name: Analyze
+        if: needs.changes.outputs.vc == 'true'
         uses: github/codeql-action/analyze@v3
         with:
           category: "/language:c-cpp"
