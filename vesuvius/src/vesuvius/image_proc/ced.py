@@ -9,19 +9,19 @@ PyTorch implementation that matches the Java/Scala implementation that is availa
 This script implements the coherence-enhancing diffusion filter using PyTorch.
 """
 
-import torch
-import torch.nn.functional as F
+import argparse
+import multiprocessing as mp
+import os
+from pathlib import Path
+from typing import Dict, List
+
 import numpy as np
 import tifffile
+import torch
 import zarr
 from tqdm import tqdm
-import argparse
-from pathlib import Path
-import os
-from functools import lru_cache
-import multiprocessing as mp
-from typing import Dict, Tuple, Optional, List
-from vesuvius.image_proc.shared.geometry.structure_tensor import StructureTensorComputer
+
+from vesuvius.image_proc.shared.geometry.diffusion import coherence_enhancing_diffusion as run_coherence_diffusion
 try:
     from skimage.filters import threshold_otsu
     _HAVE_SKIMAGE = True
@@ -123,265 +123,15 @@ STEP_SIZE = 0.24      # Time step size for diffusion
 M = 1.0               # Exponent for diffusivity function
 NUM_STEPS = 100        # Number of diffusion iterations
 
-# Algorithm constants
-EPS = 2**-52          # Machine epsilon for numerical stability
-GAMMA = 0.01          # Minimum diffusivity
-CM = 7.2848           # Constant for exponential diffusivity function
-
-# Check if torch.compile is available (PyTorch 2.0+)
-TORCH_COMPILE_AVAILABLE = hasattr(torch, 'compile')
-
-
-@lru_cache(maxsize=8)
-def _create_gaussian_kernel_1d(sigma, device_str):
-    """Create and cache 1D Gaussian kernel."""
-    device = torch.device(device_str)
-    size = int(2 * np.ceil(3 * sigma) + 1)
-    x = torch.arange(size, dtype=torch.float32, device=device) - size // 2
-    kernel_1d = torch.exp(-x**2 / (2 * sigma**2))
-    kernel_1d = kernel_1d / kernel_1d.sum()
-    return kernel_1d, size
-
-
-def create_gaussian_kernel(sigma, device):
-    """Create 2D Gaussian kernel for convolution."""
-    kernel_1d, size = _create_gaussian_kernel_1d(sigma, str(device))
-    gauss_2d = kernel_1d[:, None] @ kernel_1d[None, :]
-    return gauss_2d[None, None, :, :]
-
-
-def gaussian_blur(img, sigma):
-    """Apply Gaussian blur using separable convolution for efficiency."""
-    if sigma <= 0:
-        return img
-    
-    # Get cached kernel
-    kernel_1d, size = _create_gaussian_kernel_1d(sigma, str(img.device))
-    
-    batch_size = img.shape[0]
-    
-    # For batch processing, we need to handle each image in the batch
-    # Reshape input from (B, C, H, W) to (B*C, 1, H, W) for grouped convolution
-    B, C, H, W = img.shape
-    img_reshaped = img.reshape(B * C, 1, H, W)
-    
-    # Create kernels for horizontal and vertical passes
-    kernel_1d_h = kernel_1d.view(1, 1, -1, 1)
-    kernel_1d_v = kernel_1d.view(1, 1, 1, -1)
-    
-    # Apply horizontal convolution
-    img_reshaped = F.conv2d(img_reshaped, kernel_1d_h, padding=(size//2, 0))
-    
-    # Apply vertical convolution
-    img_reshaped = F.conv2d(img_reshaped, kernel_1d_v, padding=(0, size//2))
-    
-    # Reshape back to original batch shape
-    img = img_reshaped.reshape(B, C, H, W)
-    
-    return img
-
-
-def _structure_tensor_components_2d(img: torch.Tensor, st_computer: StructureTensorComputer) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute 2D structure tensor components using the shared StructureTensorComputer."""
-    if st_computer.device != img.device:
-        st_computer.device = img.device
-    if st_computer.dtype != img.dtype:
-        st_computer.dtype = img.dtype
-    comps = st_computer.compute(
-        img,
-        device=img.device,
-        spatial_dims=2,
-    )
-    s22 = comps[:, 0:1]  # Jyy
-    s12 = comps[:, 1:2]  # Jyx
-    s11 = comps[:, 2:3]  # Jxx
-    return s11, s12, s22
-
-
-def compute_alpha(s11, s12, s22):
-    """Compute eigenvalue measure alpha."""
-    a = s11 - s22
-    b = s12
-    alpha = torch.sqrt(a**2 + 4 * b**2)
-    return alpha
-
-
-def compute_c2(alpha, lambda_param, m):
-    """Compute diffusivity function c2."""
-    h1 = (alpha + EPS) / lambda_param
-    
-    if abs(m - 1.0) < 1e-10:
-        h2 = h1
-    else:
-        h2 = torch.pow(h1, m)
-    
-    h3 = torch.exp(-CM / h2)
-    c2 = GAMMA + (1 - GAMMA) * h3
-    
-    return c2
-
-
-def compute_diffusion_tensor(s11, s12, s22, alpha, c2, c1=GAMMA):
-    """Compute diffusion tensor components D11, D12, D22."""
-    dd = (c2 - c1) * (s11 - s22) / (alpha + EPS)
-    
-    d11 = 0.5 * (c1 + c2 + dd)
-    d12 = (c1 - c2) * s12 / (alpha + EPS)
-    d22 = 0.5 * (c1 + c2 - dd)
-    
-    return d11, d12, d22
-
-
-def _diffusion_step_vectorized_impl(img, d11, d12, d22, step_size):
-    """
-    Implementation of vectorized diffusion step.
-    Separated for torch.compile optimization.
-    """
-    # Pad all tensors
-    img_pad = F.pad(img, (1, 1, 1, 1), mode='replicate')
-    d11_pad = F.pad(d11, (1, 1, 1, 1), mode='replicate')
-    d12_pad = F.pad(d12, (1, 1, 1, 1), mode='replicate')
-    d22_pad = F.pad(d22, (1, 1, 1, 1), mode='replicate')
-    
-    # Extract shifted versions
-    # Center is [1:-1, 1:-1]
-    img_c = img_pad[:, :, 1:-1, 1:-1]   # current (i, j)
-    img_n = img_pad[:, :, 0:-2, 1:-1]   # north (i-1, j) - xpo in Java
-    img_s = img_pad[:, :, 2:, 1:-1]     # south (i+1, j) - xmo in Java
-    img_w = img_pad[:, :, 1:-1, 0:-2]   # west (i, j-1) - xop in Java
-    img_e = img_pad[:, :, 1:-1, 2:]     # east (i, j+1) - xom in Java
-    img_nw = img_pad[:, :, 0:-2, 0:-2]  # northwest (i-1, j-1) - xpp
-    img_ne = img_pad[:, :, 0:-2, 2:]    # northeast (i-1, j+1) - xpm
-    img_sw = img_pad[:, :, 2:, 0:-2]    # southwest (i+1, j-1) - xmp
-    img_se = img_pad[:, :, 2:, 2:]      # southeast (i+1, j+1) - xmm
-    
-    # Diffusion coefficients
-    # Java: c = d22, a = d11, b = d12
-    d11_c = d11_pad[:, :, 1:-1, 1:-1]
-    d11_n = d11_pad[:, :, 0:-2, 1:-1]
-    d11_s = d11_pad[:, :, 2:, 1:-1]
-    
-    d22_c = d22_pad[:, :, 1:-1, 1:-1]
-    d22_w = d22_pad[:, :, 1:-1, 0:-2]
-    d22_e = d22_pad[:, :, 1:-1, 2:]
-    
-    d12_c = d12_pad[:, :, 1:-1, 1:-1]
-    d12_n = d12_pad[:, :, 0:-2, 1:-1]
-    d12_s = d12_pad[:, :, 2:, 1:-1]
-    d12_w = d12_pad[:, :, 1:-1, 0:-2]
-    d12_e = d12_pad[:, :, 1:-1, 2:]
-    
-    # First derivative terms (matching Java formula)
-    c_cop = d22_c + d22_w  # (i,j) + (i,j-1)
-    a_amo = d11_s + d11_c  # (i+1,j) + (i,j)
-    a_apo = d11_n + d11_c  # (i-1,j) + (i,j) 
-    c_com = d22_c + d22_e  # (i,j) + (i,j+1)
-    
-    first_deriv = (
-        c_cop * img_w +                                         # c_cop * xop
-        a_amo * img_s -                                         # a_amo * xmo
-        (a_amo + a_apo + c_com + c_cop) * img_c +             # -(sum) * x
-        a_apo * img_n +                                         # a_apo * xpo
-        c_com * img_e                                           # c_com * xom
-    )
-    
-    # Second derivative (cross) terms
-    bmo = d12_s  # (i+1, j)
-    bop = d12_w  # (i, j-1)
-    bpo = d12_n  # (i-1, j)
-    bom = d12_e  # (i, j+1)
-    
-    second_deriv = (
-        -1 * ((bmo + bop) * img_sw + (bpo + bom) * img_ne) +  # -((bmo+bop)*xmp + (bpo+bom)*xpm)
-        (bpo + bop) * img_nw +                                  # (bpo+bop)*xpp
-        (bmo + bom) * img_se                                    # (bmo+bom)*xmm
-    )
-    
-    # Update
-    img_new = img + step_size * (0.5 * first_deriv + 0.25 * second_deriv)
-    
-    return img_new
-
-
-# Create compiled versions of key functions if torch.compile is available
-if TORCH_COMPILE_AVAILABLE:
-    compile_options = {"triton.cudagraphs": False}
-    compute_alpha_compiled = torch.compile(compute_alpha, options=compile_options)
-    compute_c2_compiled = torch.compile(compute_c2, options=compile_options)
-    compute_diffusion_tensor_compiled = torch.compile(compute_diffusion_tensor, options=compile_options)
-    _diffusion_step_vectorized_impl_compiled = torch.compile(_diffusion_step_vectorized_impl, options=compile_options)
-else:
-    compute_alpha_compiled = compute_alpha
-    compute_c2_compiled = compute_c2
-    compute_diffusion_tensor_compiled = compute_diffusion_tensor
-    _diffusion_step_vectorized_impl_compiled = _diffusion_step_vectorized_impl
-
-
-def diffusion_step_vectorized(img, d11, d12, d22, step_size):
-    """
-    Vectorized version of diffusion step (faster but may have slight differences).
-    Matches the Java implementation's formula.
-    """
-    return _diffusion_step_vectorized_impl_compiled(img, d11, d12, d22, step_size)
-
-
-def coherence_enhancing_diffusion(img_tensor, config, use_vectorized=True, show_progress=False, use_compiled=True):
-    """Main function to perform coherence enhancing diffusion."""
-    img = img_tensor.clone()
-    rho = float(config['rho'])
-    sigma = float(config['sigma'])
-    component_sigma = rho if rho > 0 else None
-    st_computer = StructureTensorComputer(
-        sigma=sigma,
-        component_sigma=component_sigma,
-        smooth_components=component_sigma is not None,
-        device=img.device,
-        dtype=img.dtype,
-    )
-    
-    if use_compiled and TORCH_COMPILE_AVAILABLE:
-        alpha_fn = compute_alpha_compiled
-        c2_fn = compute_c2_compiled
-        diff_tensor_fn = compute_diffusion_tensor_compiled
-    else:
-        alpha_fn = compute_alpha
-        c2_fn = compute_c2
-        diff_tensor_fn = compute_diffusion_tensor
-    
-    # Use tqdm if show_progress is True, otherwise use a simple range
-    iterator = tqdm(range(config['num_steps']), desc="Diffusion steps", leave=False) if show_progress else range(config['num_steps'])
-    
-    for step in iterator:
-        if not show_progress:
-            print(f"Step {step + 1}/{config['num_steps']}", end='\r')
-        
-        # Compute structure tensor components
-        s11, s12, s22 = _structure_tensor_components_2d(img, st_computer)
-        
-        # Compute eigenvalue measure
-        alpha = alpha_fn(s11, s12, s22)
-        
-        # Compute diffusivity
-        c2 = c2_fn(alpha, config['lambda'], config['m'])
-        
-        # Compute diffusion tensor
-        d11, d12, d22 = diff_tensor_fn(s11, s12, s22, alpha, c2)
-        
-        # Perform diffusion step
-        if use_vectorized:
-            img = diffusion_step_vectorized(img, d11, d12, d22, config['step_size'])
-        else:
-            raise NotImplementedError("Pixel-by-pixel implementation not supported for batch processing")
-    
-    if not show_progress:
-        print("\nDiffusion complete!")
-    
-    return img
-
-
-def process_zarr_chunk(input_path: str, output_path: str, z_start: int, z_end: int, 
-                      gpu_id: int, config: Dict, batch_size: int = 1,
-                      use_vectorized: bool = True, use_compiled: bool = True) -> None:
+def process_zarr_chunk(
+    input_path: str,
+    output_path: str,
+    z_start: int,
+    z_end: int,
+    gpu_id: int,
+    config: Dict,
+    batch_size: int = 1,
+) -> None:
     """Process a chunk of z-slices on a specific GPU."""
     # Set GPU device - explicitly specify which GPU to use
     if torch.cuda.is_available() and torch.cuda.device_count() > gpu_id:
@@ -443,11 +193,10 @@ def process_zarr_chunk(input_path: str, output_path: str, z_start: int, z_end: i
         
         # Perform diffusion on batch
         with torch.no_grad():
-            result_batch = coherence_enhancing_diffusion(
-                batch_tensor, config, 
-                use_vectorized=use_vectorized, 
-                show_progress=False, 
-                use_compiled=use_compiled
+            result_batch = run_coherence_diffusion(
+                batch_tensor,
+                config,
+                show_progress=False,
             )
         
         # Convert back and write results
@@ -476,9 +225,13 @@ def process_zarr_chunk(input_path: str, output_path: str, z_start: int, z_end: i
     print(f"GPU {gpu_id}: Completed processing slices {z_start} to {z_end-1}")
 
 
-def launch_multi_gpu_processing(input_path: str, output_path: str, config: Dict, 
-                               num_gpus: int, batch_size: int = 1,
-                               use_vectorized: bool = True, use_compiled: bool = True) -> None:
+def launch_multi_gpu_processing(
+    input_path: str,
+    output_path: str,
+    config: Dict,
+    num_gpus: int,
+    batch_size: int = 1,
+) -> None:
     """Launch multiple processes for multi-GPU processing."""
     # Use spawn context for CUDA compatibility
     ctx = mp.get_context('spawn')
@@ -526,8 +279,7 @@ def launch_multi_gpu_processing(input_path: str, output_path: str, config: Dict,
     for gpu_id, (z_start, z_end) in enumerate(chunk_boundaries):
         p = ctx.Process(
             target=process_zarr_chunk,
-            args=(input_path, output_path, z_start, z_end, gpu_id, config, batch_size,
-                  use_vectorized, use_compiled)
+            args=(input_path, output_path, z_start, z_end, gpu_id, config, batch_size),
         )
         p.start()
         processes.append(p)
@@ -539,7 +291,7 @@ def launch_multi_gpu_processing(input_path: str, output_path: str, config: Dict,
     print("\nAll GPU processes completed!")
 
 
-def process_zarr_array(input_path, output_path, config, batch_size=1, use_vectorized=True, use_compiled=True):
+def process_zarr_array(input_path, output_path, config, batch_size=1):
     """Process a zarr array slice by slice with coherence enhancing diffusion (single GPU)."""
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -630,11 +382,10 @@ def process_zarr_array(input_path, output_path, config, batch_size=1, use_vector
         
         # Perform diffusion on batch
         with torch.no_grad():
-            result_batch = coherence_enhancing_diffusion(
-                batch_tensor, config, 
-                use_vectorized=use_vectorized, 
-                show_progress=False, 
-                use_compiled=use_compiled
+            result_batch = run_coherence_diffusion(
+                batch_tensor,
+                config,
+                show_progress=False,
             )
         
         # Convert back and write results
@@ -820,7 +571,13 @@ def _list_tiff_files(folder: Path) -> List[Path]:
     exts = {".tif", ".tiff", ".TIF", ".TIFF"}
     return sorted([p for p in folder.iterdir() if p.is_file() and p.suffix in exts])
 
-def process_tiff_folder(input_dir: str, output_dir: str, config: Dict, *, use_vectorized: bool = True, use_compiled: bool = True, threshold: bool = False) -> None:
+def process_tiff_folder(
+    input_dir: str,
+    output_dir: str,
+    config: Dict,
+    *,
+    threshold: bool = False,
+) -> None:
     """Process a folder of 2D TIFFs, saving outputs with same filenames."""
     in_path = Path(input_dir)
     out_path = Path(output_dir)
@@ -839,11 +596,10 @@ def process_tiff_folder(input_dir: str, output_dir: str, config: Dict, *, use_ve
         print(f"[{idx}/{len(files)}] Processing {f.name}")
         img_tensor, original_shape, original_dtype = load_tiff(str(f))
         with torch.no_grad():
-            result = coherence_enhancing_diffusion(
+            result = run_coherence_diffusion(
                 img_tensor,
                 config,
-                use_vectorized=use_vectorized,
-                use_compiled=use_compiled,
+                show_progress=False,
             )
         out_fp = str(out_path / f.name)
         if threshold:
@@ -870,8 +626,6 @@ def main():
     parser.add_argument('--num-steps', type=int, default=NUM_STEPS, help='Number of diffusion steps')
     parser.add_argument('--batch-size', type=int, default=1, help='Number of slices to process at once on GPU')
     parser.add_argument('--num-gpus', type=int, default=None, help='Number of GPUs to use (default: auto-detect)')
-    parser.add_argument('--no-vectorized', action='store_true', help='Use pixel-by-pixel implementation (slower but exact match to Java)')
-    parser.add_argument('--no-compile', action='store_true', help='Disable torch.compile optimization (useful for debugging)')
     parser.add_argument('--sample-results', action='store_true', help='Generate sample results with various parameter combinations')
     parser.add_argument('--threshold', action='store_true', help='Apply Otsu threshold to TIFF outputs and save as uint8 (0/255)')
     
@@ -915,9 +669,9 @@ def main():
             raise ValueError("When input is a folder of TIFFs, output must be a directory.")
         print("Using folder-of-TIFFs processing")
         process_tiff_folder(
-            str(input_path), str(output_path), config,
-            use_vectorized=not args.no_vectorized,
-            use_compiled=not args.no_compile,
+            str(input_path),
+            str(output_path),
+            config,
             threshold=args.threshold,
         )
     elif input_path.suffix == '.zarr' or _is_zarr_dir(input_path):
@@ -930,18 +684,19 @@ def main():
         if num_gpus > 1:
             print(f"Using multi-GPU processing with {num_gpus} GPUs")
             launch_multi_gpu_processing(
-                str(input_path), str(output_path), config, 
-                num_gpus=num_gpus, batch_size=args.batch_size,
-                use_vectorized=not args.no_vectorized, 
-                use_compiled=not args.no_compile
+                str(input_path),
+                str(output_path),
+                config,
+                num_gpus=num_gpus,
+                batch_size=args.batch_size,
             )
         else:
             print("Using single GPU processing")
             process_zarr_array(
-                str(input_path), str(output_path), config, 
+                str(input_path),
+                str(output_path),
+                config,
                 batch_size=args.batch_size,
-                use_vectorized=not args.no_vectorized, 
-                use_compiled=not args.no_compile
             )
     else:
         # Process TIFF file
@@ -986,10 +741,10 @@ def main():
                 
                 # Perform diffusion
                 with torch.no_grad():
-                    result = coherence_enhancing_diffusion(
-                        img_tensor, sample_config, 
-                        use_vectorized=not args.no_vectorized, 
-                        use_compiled=not args.no_compile
+                    result = run_coherence_diffusion(
+                        img_tensor,
+                        sample_config,
+                        show_progress=False,
                     )
                 
                 # Create output filename
@@ -1026,10 +781,10 @@ def main():
             
             # Perform diffusion
             with torch.no_grad():  # Disable gradient computation for inference
-                result = coherence_enhancing_diffusion(
-                    img_tensor, config, 
-                    use_vectorized=not args.no_vectorized, 
-                    use_compiled=not args.no_compile
+                result = run_coherence_diffusion(
+                    img_tensor,
+                    config,
+                    show_progress=False,
                 )
             
             print(f"Result value range: [{result.min().item():.2f}, {result.max().item():.2f}]")
