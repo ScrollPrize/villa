@@ -2,29 +2,47 @@ name: Continuous Integration (CI)
 
 on:
   pull_request:
-    paths:
-      - 'volume-cartographer/**'
-      - '.github/workflows/vc3d-ci.yml'
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
 
 jobs:
-  docker:
-    name: Build Docker Image
+  ci:
+    name: CI
     runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Detect changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            vc:
+              - 'volume-cartographer/**'
+            wf:
+              - '.github/workflows/vc3d-ci.yml'
+
+      # --- No-op success path when unrelated files changed ---
+      - name: Skip (no volume-cartographer changes)
+        if: ${{ steps.changes.outputs.vc == 'false' && steps.changes.outputs.wf == 'false' }}
+        run: |
+          echo "✅ No changes in volume-cartographer/ or the workflow file. Skipping build."
+
+      # --- Real CI only when volume-cartographer (or the workflow) changed ---
       - name: Set up QEMU
+        if: ${{ steps.changes.outputs.vc == 'true' || steps.changes.outputs.wf == 'true' }}
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
+        if: ${{ steps.changes.outputs.vc == 'true' || steps.changes.outputs.wf == 'true' }}
         uses: docker/setup-buildx-action@v3
 
       - name: Build (no push)
+        if: ${{ steps.changes.outputs.vc == 'true' || steps.changes.outputs.wf == 'true' }}
         uses: docker/build-push-action@v6
         with:
           context: ./volume-cartographer
@@ -34,4 +52,4 @@ jobs:
           tags: ${{ github.repository_owner }}/volume-cartographer:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # load: true  # uncomment if you want the image loaded into the runner for tests
+          # load: true # uncomment if you want the image loaded into the runner for tests
