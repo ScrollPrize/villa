@@ -133,6 +133,8 @@ def eigendecompose(
     if isinstance(components, np.ndarray):
         tensor = torch.as_tensor(components)
         layout = DEFAULT_LAYOUT_3D if tensor.shape[1] == 6 else DEFAULT_LAYOUT_2D
+        if tensor.shape[1] == 3:
+            return _eigendecompose_2d_numpy(tensor, smallest_first=smallest_first)
         mats = _components_to_matrix_structure(tensor, layout).cpu().numpy()
         w, v = np.linalg.eigh(mats)
         if smallest_first:
@@ -140,12 +142,102 @@ def eigendecompose(
             w = np.take_along_axis(w, order, axis=-1)
             v = np.take_along_axis(v, order[..., None], axis=-1)
         return w, v
+    if components.shape[1] == 3:
+        return _eigendecompose_2d_torch(components, smallest_first=smallest_first)
     layout = DEFAULT_LAYOUT_3D if components.shape[1] == 6 else DEFAULT_LAYOUT_2D
     mats = _components_to_matrix_structure(components, layout)
     w, v = torch.linalg.eigh(mats)
     if smallest_first:
         w, idx = torch.sort(w, dim=-1)
         v = torch.gather(v, dim=-1, index=idx.unsqueeze(-1).expand_as(v))
+    return w, v
+
+
+def _eigendecompose_2d_torch(
+    components: torch.Tensor,
+    *,
+    smallest_first: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    Jyy, Jyx, Jxx = components.unbind(dim=1)
+    trace = Jxx + Jyy
+    diff = Jxx - Jyy
+    alpha = torch.sqrt(diff * diff + 4.0 * (Jyx * Jyx))
+    lam1 = 0.5 * (trace - alpha)
+    lam2 = 0.5 * (trace + alpha)
+    if not smallest_first:
+        lam1, lam2 = lam2, lam1
+    w = torch.stack([lam1, lam2], dim=-1)
+
+    # Eigenvectors
+    v1x = torch.where(
+        torch.abs(Jyx) > torch.abs(lam1 - Jxx),
+        -(lam1 - Jxx),
+        -Jyx,
+    )
+    v1y = torch.where(
+        torch.abs(Jyx) > torch.abs(lam1 - Jxx),
+        Jyx,
+        Jxx - lam1,
+    )
+    norm = torch.sqrt(v1x * v1x + v1y * v1y).clamp_min(1e-12)
+    v1x = v1x / norm
+    v1y = v1y / norm
+    v2x = -v1y
+    v2y = v1x
+    if not smallest_first:
+        v1x, v2x = v2x, v1x
+        v1y, v2y = v2y, v1y
+    v = torch.stack(
+        [
+            torch.stack([v1x, v2x], dim=-1),
+            torch.stack([v1y, v2y], dim=-1),
+        ],
+        dim=-2,
+    )
+    return w, v
+
+
+def _eigendecompose_2d_numpy(
+    components: torch.Tensor,
+    *,
+    smallest_first: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    tensor = components.cpu().numpy()
+    Jyy, Jyx, Jxx = tensor
+    trace = Jxx + Jyy
+    diff = Jxx - Jyy
+    alpha = np.sqrt(diff * diff + 4.0 * (Jyx * Jyx))
+    lam1 = 0.5 * (trace - alpha)
+    lam2 = 0.5 * (trace + alpha)
+    if not smallest_first:
+        lam1, lam2 = lam2, lam1
+    w = np.stack([lam1, lam2], axis=-1)
+
+    v1x = np.where(
+        np.abs(Jyx) > np.abs(lam1 - Jxx),
+        -(lam1 - Jxx),
+        -Jyx,
+    )
+    v1y = np.where(
+        np.abs(Jyx) > np.abs(lam1 - Jxx),
+        Jyx,
+        Jxx - lam1,
+    )
+    norm = np.sqrt(v1x * v1x + v1y * v1y) + 1e-12
+    v1x = v1x / norm
+    v1y = v1y / norm
+    v2x = -v1y
+    v2y = v1x
+    if not smallest_first:
+        v1x, v2x = v2x, v1x
+        v1y, v2y = v2y, v1y
+    v = np.stack(
+        [
+            np.stack([v1x, v2x], axis=-1),
+            np.stack([v1y, v2y], axis=-1),
+        ],
+        axis=-2,
+    )
     return w, v
 
 

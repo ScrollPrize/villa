@@ -4,6 +4,10 @@ from torch import nn as nn
 from torch.nn import MSELoss, SmoothL1Loss, L1Loss
 import sys
 import os
+from vesuvius.image_proc.shared.geometry.structure_tensor import (
+    StructureTensorComputer,
+    components_to_matrix,
+)
 
 # Import nnUNet losses
 from .nnunet_losses import (
@@ -530,87 +534,14 @@ class PlanarityLoss(nn.Module):
         self.ignore_index = ignore_index
         self.normalization = nn.Sigmoid() if normalization == 'sigmoid' \
                              else (lambda x: x)
-        
-        # Create Sobel kernels for 3D gradients
-        self._create_sobel_kernels()
+        self._st_computer = StructureTensorComputer(
+            sigma=0.0,
+            component_sigma=rho if rho > 0 else None,
+            smooth_components=rho > 0,
+            device='cpu',
+            dtype=torch.float32,
+        )
 
-    def _create_sobel_kernels(self):
-        """Create 3D Sobel kernels for gradient computation."""
-        # Basic 1D kernels
-        smooth = torch.tensor([1., 2., 1.], dtype=torch.float32)
-        diff = torch.tensor([-1., 0., 1.], dtype=torch.float32)
-        
-        # Create 3D Sobel kernels for each direction
-        # For dz (axis 0)
-        kernel_z = diff.view(-1, 1, 1) * smooth.view(1, -1, 1) * smooth.view(1, 1, -1)
-        kernel_z = kernel_z.unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, 3, 3, 3)
-        
-        # For dy (axis 1)
-        kernel_y = smooth.view(-1, 1, 1) * diff.view(1, -1, 1) * smooth.view(1, 1, -1)
-        kernel_y = kernel_y.unsqueeze(0).unsqueeze(0)
-        
-        # For dx (axis 2)
-        kernel_x = smooth.view(-1, 1, 1) * smooth.view(1, -1, 1) * diff.view(1, 1, -1)
-        kernel_x = kernel_x.unsqueeze(0).unsqueeze(0)
-        
-        # Normalize by the sum of absolute values (similar to scipy's normalization)
-        kernel_z = kernel_z / 8.0
-        kernel_y = kernel_y / 8.0
-        kernel_x = kernel_x / 8.0
-        
-        # Stack kernels for all three gradients
-        self.register_buffer('sobel_kernels', torch.cat([kernel_z, kernel_y, kernel_x], dim=0))
-    
-    # ------------------------------------------------------------------
-    def _sobel3d(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Compute 3D Sobel gradients using conv3d.
-        Input shape: (B, 1, D, H, W)
-        Output shape: (B, 3, D, H, W) for (dz, dy, dx)
-        """
-        # Ensure kernels are on the same device and dtype as input
-        kernels = self.sobel_kernels.to(x.device).to(x.dtype)
-        
-        # Apply convolution for all three gradients at once
-        # Input: (B, 1, D, H, W), Kernel: (3, 1, 3, 3, 3), Output: (B, 3, D, H, W)
-        gradients = F.conv3d(x, kernels, padding=1)
-        
-        return gradients
-
-    def _gauss_blur(self, x: torch.Tensor, sig: float):
-        """
-        Apply 3D Gaussian blur using separable 1D convolutions for efficiency.
-        """
-        # Create 1D Gaussian kernel
-        kernel_size = int(2 * math.ceil(3 * sig) + 1)
-        kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
-        
-        # Create 1D Gaussian kernel
-        kernel_1d = torch.arange(kernel_size, dtype=x.dtype, device=x.device)
-        kernel_1d = kernel_1d - (kernel_size - 1) / 2
-        kernel_1d = torch.exp(-0.5 * (kernel_1d / sig) ** 2)
-        kernel_1d = kernel_1d / kernel_1d.sum()
-        
-        # Apply separable convolution
-        B, C, D, H, W = x.shape
-        
-        # Reshape for 1D convolutions
-        padding = (kernel_size - 1) // 2
-        
-        # Conv along Z axis
-        kernel_z = kernel_1d.view(1, 1, -1, 1, 1).repeat(C, 1, 1, 1, 1)
-        x = F.conv3d(x, kernel_z, padding=(padding, 0, 0), groups=C)
-        
-        # Conv along Y axis
-        kernel_y = kernel_1d.view(1, 1, 1, -1, 1).repeat(C, 1, 1, 1, 1)
-        x = F.conv3d(x, kernel_y, padding=(0, padding, 0), groups=C)
-        
-        # Conv along X axis
-        kernel_x = kernel_1d.view(1, 1, 1, 1, -1).repeat(C, 1, 1, 1, 1)
-        x = F.conv3d(x, kernel_x, padding=(0, 0, padding), groups=C)
-        
-        return x
-    
     def _compute_eigenvalues_3x3_batch(self, J: torch.Tensor) -> torch.Tensor:
         """
         Compute eigenvalues for batched 3x3 symmetric matrices using analytical formula.
@@ -673,43 +604,22 @@ class PlanarityLoss(nn.Module):
         else:
             valid = torch.ones_like(p, dtype=torch.bool)
 
-        # ---------- gradients & structure tensor ----------------------
-        g = self._sobel3d(p)                           # B,3,D,H,W
-        
-        # Compute structure tensor components (outer products)
-        # J = ∇p ∇p^T, which has 6 unique components for symmetric 3x3
-        J_components = []
-        for i in range(3):
-            for j in range(i, 3):
-                J_components.append(g[:, i:i+1] * g[:, j:j+1])
-        
-        J_components = torch.cat(J_components, dim=1)  # (B, 6, D, H, W)
-        
-        # Apply Gaussian blur to structure tensor components
-        J_components = self._gauss_blur(J_components, self.rho)
-        
-        # Extract components
-        Jxx = J_components[:, 0]
-        Jxy = J_components[:, 1]
-        Jxz = J_components[:, 2]
-        Jyy = J_components[:, 3]
-        Jyz = J_components[:, 4]
-        Jzz = J_components[:, 5]
-        
-        # Reconstruct 3x3 structure tensor
-        # Shape: (B, D, H, W, 3, 3)
-        B, D, H, W = Jxx.shape
-        J = torch.zeros(B, D, H, W, 3, 3, dtype=Jxx.dtype, device=Jxx.device)
-        
-        J[..., 0, 0] = Jxx
-        J[..., 0, 1] = Jxy
-        J[..., 0, 2] = Jxz
-        J[..., 1, 0] = Jxy
-        J[..., 1, 1] = Jyy
-        J[..., 1, 2] = Jyz
-        J[..., 2, 0] = Jxz
-        J[..., 2, 1] = Jyz
-        J[..., 2, 2] = Jzz
+        # ---------- structure tensor via shared computer ---------------
+        rho = float(self.rho)
+        component_sigma = rho if rho > 0 else None
+        st_device = p.device
+        self._st_computer.device = st_device
+        self._st_computer.smooth_components = component_sigma is not None
+        self._st_computer.component_sigma = component_sigma
+        J_components = self._st_computer.compute(
+            p,
+            sigma=0.0,
+            component_sigma=component_sigma,
+            smooth_components=self._st_computer.smooth_components,
+            device=st_device,
+            spatial_dims=3,
+        )
+        J = components_to_matrix(J_components)
 
         # Compute eigenvalues using optimized method
         try:

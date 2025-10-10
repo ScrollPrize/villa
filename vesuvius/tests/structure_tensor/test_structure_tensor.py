@@ -9,6 +9,8 @@ from math import isfinite
 
 from vesuvius.image_proc.shared.geometry.structure_tensor import (
     StructureTensorComputer,
+    components_to_matrix,
+    eigendecompose,
     _get_gaussian_kernel_3d,
     _get_pavel_kernels_3d,
 )
@@ -194,10 +196,45 @@ def test_compute_eigenvectors_constant_block():
     # e.g. for first EV v[0], max index is component 0
     comps = torch.argmax(v.abs(), dim=1)
     # For M=diag(Jzz,Jyy,Jxx)=[3,2,1], ascending eigenvalues [1,2,3] correspond to axes [x=2, y=1, z=0]
-    assert torch.all(comps[0] == 2), "smallest eigenvalue → x‐axis (index 2)"
-    assert torch.all(comps[1] == 1), "middle eigenvalue → y‐axis (index 1)"
-    assert torch.all(comps[2] == 0), "largest eigenvalue → z‐axis (index 0)"
+    assert torch.all(comps[0] == 2), "smallest eigenvalue → x-axis (index 2)"
+    assert torch.all(comps[1] == 1), "middle eigenvalue → y-axis (index 1)"
+    assert torch.all(comps[2] == 0), "largest eigenvalue → z-axis (index 0)"
 
+
+def test_eigendecompose_2d_matches_torch():
+    computer = StructureTensorComputer(sigma=0.0, smooth_components=False, device="cpu")
+    img = torch.rand((1, 64, 64), dtype=torch.float32)
+    comps = computer.compute(img, spatial_dims=2)
+    mats = components_to_matrix(comps.unsqueeze(0))
+    w_torch, v_torch = torch.linalg.eigh(mats)
+    w_shared, v_shared = eigendecompose(comps.unsqueeze(0))
+    assert torch.allclose(w_shared, w_torch, atol=1e-6)
+    v_shared_cols = v_shared.squeeze(0)
+    v_torch_cols = v_torch.squeeze(0)
+    dots = torch.matmul(v_shared_cols.transpose(-2, -1), v_torch_cols)
+    abs_dots = torch.abs(dots)
+    row_max = abs_dots.max(dim=-1).values
+    col_max = abs_dots.max(dim=-2).values
+    assert torch.allclose(row_max, torch.ones_like(row_max), atol=1e-4)
+    assert torch.allclose(col_max, torch.ones_like(col_max), atol=1e-4)
+
+
+def test_eigendecompose_2d_deterministic():
+    computer = StructureTensorComputer(sigma=0.0, smooth_components=False, device="cpu")
+    h = torch.linspace(0, 1, steps=16)
+    img = h.view(1, 1, 16).repeat(1, 16, 1)
+    comps = computer.compute(img, spatial_dims=2)
+    mats = components_to_matrix(comps.unsqueeze(0))
+    w_torch, v_torch = torch.linalg.eigh(mats)
+    w_shared, v_shared = eigendecompose(comps.unsqueeze(0))
+    assert torch.allclose(w_shared, w_torch, atol=1e-6)
+    v_shared_cols = v_shared.squeeze(0)
+    v_torch_cols = v_torch.squeeze(0)
+    dots = torch.matmul(v_shared_cols.transpose(-2, -1), v_torch_cols)
+    row_max = torch.abs(dots).max(dim=-1).values
+    col_max = torch.abs(dots).max(dim=-2).values
+    assert torch.allclose(row_max, torch.ones_like(row_max), atol=1e-4)
+    assert torch.allclose(col_max, torch.ones_like(col_max), atol=1e-4)
 def test_border_trim_math_matches_patch_extent():
     """
     Regression test for border-aware trimming: when the padded read is clipped
