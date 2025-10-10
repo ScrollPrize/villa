@@ -29,9 +29,9 @@ If you want to install vc3d from source, the easiest path is to look at the [doc
 
 
 ### Basic introduction to VC3D 
-The document below is a basic introduction to the ui and keybindings available in VC3D , more detailed documentation is available in the [segmentation tutorial](https://scrollprize.org/segmentation) on the scrollprize website.
+The document below is a basic introduction to the ui and keybindings available in VC3D, more detailed documentation is available in the [segmentation tutorial](https://scrollprize.org/segmentation) on the scrollprize website.
 > [!WARNING]
-> if you are using Ubuntu , the default open file limit is 1024, and you may encounter errors when running vc3d. To fix this, run `ulimit -n 750000` in your terminal.
+> if you are using Ubuntu, the default open file limit is 1024, and you may encounter errors when running vc3d. To fix this, run `ulimit -n 750000` in your terminal.
 
 ### Launching VC3D
 
@@ -76,7 +76,7 @@ Your folder structure should resemble this:
     └── config.json - REQUIRED!
 ```
 ### Opening a volume package and navigating the UI
-First , click `File -> Open volpkg` and select the volpkg you wish to work with (select the folder ending in .volpkg)
+First, click `File -> Open volpkg` and select the volpkg you wish to work with (select the folder ending in .volpkg)
 
 On the left side of the UI, you have a few dock widgets. The first being the Volume Package / Surface List. The most important things to note here are the `Volume` dropdown list, which selects the currently displayed volume, and the `paths` surface list, which selects the currently displayed segment. Selecting a `Surface ID` should populate the `Surface` volume view in the top left, and initialize the rest the volume viewers.
 
@@ -90,8 +90,8 @@ _Main UI widget for interacting with the volume package and surface list_
 
 - `Reload Surfaces` : checks for new segmentations in the currently selected directory (by default, this is {volpkg}/paths
 - `Filters` : Apply a single (or multiple) filters to show or hide specific surface ids from the current set
-  - the most important one to remember here is `Current Segment Only` , which will hide the intersection overlays of all other segmentations in the volume viewers (this can greatly speed up ui interaction)
-- `Approved`, `Defective`, `Reviewed`, `Revisit`, `Inspect`  : tags which can be applied to the surface meta.json , and filtered against
+  - the most important one to remember here is `Current Segment Only`, which will hide the intersection overlays of all other segmentations in the volume viewers (this can greatly speed up ui interaction)
+- `Approved`, `Defective`, `Reviewed`, `Revisit`, `Inspect`  : tags which can be applied to the surface meta.json, and filtered against
 - `Generate Surface Mask` and `Append Surface Mask` : Create a binary mask representing the valid surface, and optionally append the current selected volume to it as a multipage tif
 
 **Location**
@@ -101,7 +101,7 @@ _Main UI widget for adjusting the ROI and display of the volume viewers_
 <img src="docs/imgs/location-dock-ui.png" style="height: 500px">
 
 - `Focus` : Displays the current location of the focus point (in XYZ) -- also can be used to set the focus point by modifying the values in the text box
-- `Zoom` : Can be used in place of scroll wheel based zooming , mostly exists to alleviate touchy track pad zooming
+- `Zoom` : Can be used in place of scroll wheel based zooming, mostly exists to alleviate touchy track pad zooming
 - `Overlay Volume` : Selects the volume to overlay onto the base volume 
 - `Overlay opacity` : Modifies the opacity of the overlay volume 
 - `Axis overlay opacity` : Modifies the opacity of the plane slice axis overlays
@@ -144,7 +144,7 @@ _Primary entry point for interacting with the segmentation, more info in the [se
       
 _Keybinds:_
 > - `F` or `G` : push/pull the current surface in a positive or negative direction along the surface normal (only works in the surface
-> - `1`, `2`, `3`, `4`, `5` : select a direction to grow in -- left, up , down, right , all , respectively
+> - `1`, `2`, `3`, `4`, `5` : select a direction to grow in -- left, up, down, right, all, respectively
 > - `T` : create a new correction set
 
 **Seeding** 
@@ -160,10 +160,10 @@ _Widget for creating initial segmentations which can be used for traces or later
 - `Intensity threshold` : mostly unused, can leave default
 - `Peak detection window` : how closely each peak detected along a path/raycast can be
 - `Expansion iterations` : how many iterations to run expansion mode on after initial seeding
-- `Show Preview Points` : unused , can ignore
-- `Clear` (both) : clears current points , paths, or raycasts
+- `Show Preview Points` : unused, can be ignored
+- `Clear` (both) : clears current points, paths, or raycasts
 - `Analyze Paths` : after drawing paths, detect peaks along the line segment on which to place seed points
 - `Run seeding` : creates segmentations from the current seed points
 - `Expand seeds` : expands the current seed points to the given number of iterations
 - `Clear all paths` : clears any user drawn paths / points (use this over the clear buttons most of the time)
-- `Start label wraps` : this is used for absolute or relative wrap labels , is not used during the seeding step, will detail in another document
+- `Start label wraps` : this is used for absolute or relative wrap labels, is not used during the seeding step, will detail in another document
