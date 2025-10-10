@@ -834,26 +834,40 @@ int main(int argc, char *argv[])
         full_size.height = std::max(1, static_cast<int>(std::lround(full_size.height * sy)));
     }
     
+    // The uncropped, scaled canvas:
     cv::Size tgt_size = full_size;
-    cv::Rect crop = {0,0,tgt_size.width, tgt_size.height};
+    // 'crop' is expressed in the *uncropped* canvas coordinate system
+    cv::Rect crop = {0, 0, full_size.width, full_size.height};
     
     std::cout << "downsample level " << group_idx
               << " (ds_scale=" << ds_scale << ", sA=" << sA
               << ", Pg=" << Pg << ", render_scale=" << render_scale << ")\n";
 
-    // Handle crop parameters
-    int crop_x = parsed["crop-x"].as<int>();
-    int crop_y = parsed["crop-y"].as<int>();
-    int crop_width = parsed["crop-width"].as<int>();
-    int crop_height = parsed["crop-height"].as<int>();
-    
+    // Handle crop parameters (clamped to canvas)
+    const int crop_x = parsed["crop-x"].as<int>();
+    const int crop_y = parsed["crop-y"].as<int>();
+    const int crop_width  = parsed["crop-width"].as<int>();
+    const int crop_height = parsed["crop-height"].as<int>();
+    const cv::Rect canvasROI{0, 0, full_size.width, full_size.height};
     if (crop_width > 0 && crop_height > 0) {
-        crop = {crop_x, crop_y, crop_width, crop_height};
+        const cv::Rect req{crop_x, crop_y, crop_width, crop_height};
+        crop = (req & canvasROI); // intersect with canvas
+        if (crop.width <= 0 || crop.height <= 0) {
+            std::cerr << "Error: crop rectangle " << req
+                      << " lies outside the render canvas " << canvasROI << std::endl;
+            delete surf;
+            return;
+        }
         tgt_size = crop.size();
-    }        
+    } else {
+        crop = canvasROI;              // no crop requested
+        tgt_size = crop.size();
+    }
     
-    std::cout << "rendering size " << tgt_size << " at scale " << tgt_scale << " crop " << crop << std::endl;
-    
+    std::cout << "rendering size " << tgt_size
+              << " at scale " << tgt_scale
+              << " crop " << crop << std::endl;    
+              
     cv::Mat_<cv::Vec3f> points, normals;
     
     bool slice_gen = false;
@@ -866,7 +880,10 @@ int main(int argc, char *argv[])
     if ((tgt_size.width >= 10000 || tgt_size.height >= 10000) && num_slices > 1)
         slice_gen = true;
     else {
-        float u0, v0; computeCanvasOrigin(tgt_size, u0, v0);
+        // Origin must be computed in full (uncropped) canvas and shifted by crop origin.
+        float u0, v0; computeCanvasOrigin(full_size, u0, v0);
+        u0 += static_cast<float>(crop.x);
+        v0 += static_cast<float>(crop.y);
         genTile(surf, tgt_size, static_cast<float>(render_scale), u0, v0, points, normals);
     }
 
@@ -874,8 +891,10 @@ int main(int argc, char *argv[])
         const double render_scale_zarr = render_scale;
 
         cv::Mat_<cv::Vec3f> points, normals;
-        const float u0_full = -0.5f * (static_cast<float>(tgt_size.width)  - 1.0f);
-        const float v0_full = -0.5f * (static_cast<float>(tgt_size.height) - 1.0f);
+        float u0_base, v0_base;
+        computeCanvasOrigin(full_size, u0_base, v0_base);
+        u0_base += static_cast<float>(crop.x);
+        v0_base += static_cast<float>(crop.y);
         const size_t CH = 128, CW = 128;
         const size_t baseZ = std::max(1, num_slices);
         const size_t CZ = baseZ;
@@ -917,8 +936,8 @@ int main(int argc, char *argv[])
         {
             const int dx0 = static_cast<int>(std::min(CW, shape0[2]));
             const int dy0 = static_cast<int>(std::min(CH, shape0[1]));
-            const float u0 = u0_full;
-            const float v0 = v0_full;
+            const float u0 = u0_base;
+            const float v0 = v0_base;
             globalFlipDecision = computeGlobalFlipDecision(
                 surf, dx0, dy0, u0, v0,
                 static_cast<float>(render_scale_zarr),
@@ -937,7 +956,11 @@ int main(int argc, char *argv[])
                     const size_t dy = std::min(static_cast<size_t>(CH), static_cast<size_t>(tgt_size.height) - y0_src);
                     const size_t dx = std::min(static_cast<size_t>(CW), static_cast<size_t>(tgt_size.width)  - x0_src);
 
-                    float u0, v0; computeTileOrigin(tgt_size, x0_src, y0_src, u0, v0);
+                    float u0, v0;
+                    computeTileOrigin(full_size,
+                                      x0_src + static_cast<size_t>(crop.x),
+                                      y0_src + static_cast<size_t>(crop.y),
+                                      u0, v0);
 
                     cv::Mat_<cv::Vec3f> tilePoints, tileNormals;
                     genTile(surf, cv::Size(static_cast<int>(dx), static_cast<int>(dy)),
@@ -1322,7 +1345,9 @@ int main(int argc, char *argv[])
                 {
                     const int dx0 = std::min<int>(static_cast<int>(tileW), tgt_size.width);
                     const int dy0 = std::min<int>(static_cast<int>(tileH), tgt_size.height);
-                    float u0, v0; computeCanvasOrigin(tgt_size, u0, v0);
+                    float u0, v0; computeCanvasOrigin(full_size, u0, v0);
+                    u0 += static_cast<float>(crop.x);
+                    v0 += static_cast<float>(crop.y);
                     globalFlipDecision = computeGlobalFlipDecision(
                         surf, dx0, dy0, u0, v0,
                         static_cast<float>(render_scale),
@@ -1344,7 +1369,11 @@ int main(int argc, char *argv[])
                         const uint32_t dy = std::min<uint32_t>(tileH, static_cast<uint32_t>(tgt_size.height) - y0_src);
 
                         // Generate base coordinates/normals for this tile once
-                        float u0, v0; computeTileOrigin(tgt_size, x0_src, y0_src, u0, v0);
+                        float u0, v0;
+                        computeTileOrigin(full_size,
+                                          x0_src + static_cast<size_t>(crop.x),
+                                          y0_src + static_cast<size_t>(crop.y),
+                                          u0, v0);
                         cv::Mat_<cv::Vec3f> tilePoints, tileNormals;
                         genTile(surf, cv::Size(static_cast<int>(dx), static_cast<int>(dy)),
                                 static_cast<float>(render_scale), u0, v0, tilePoints, tileNormals);
