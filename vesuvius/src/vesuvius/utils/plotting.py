@@ -187,7 +187,15 @@ def save_debug(
     train_skeleton_dict: dict = None,   # Optional train skeleton data
     apply_activation: bool = True       # Whether to apply activation functions
 ):
-    """Save debug visualization as GIF (3D) or PNG (2D)"""
+    """
+    Save debug visualization as GIF (3D) or PNG (2D).
+
+    Returns
+    -------
+    tuple[list[np.ndarray] | None, np.ndarray | None]
+        (frames_for_gif, preview_image) where preview_image is a single 2D panel
+        extracted from the visualization (middle Z slice for 3D data).
+    """
     
     # Get input array
     # Convert BFloat16 to Float32 before numpy conversion
@@ -342,11 +350,16 @@ def save_debug(
         print(f"[Epoch {epoch}] Saving PNG to: {save_path}")
         # Use PIL for saving
         Image.fromarray(final_img).save(save_path)
-        
+
+        preview_img = np.ascontiguousarray(final_img, dtype=np.uint8)
+        return None, preview_img
+
     else:
         # Build frames for 3D GIF
         frames = []
+        preview_frame = None
         z_dim = inp_np.shape[0] if inp_np.ndim == 3 else inp_np.shape[1]
+        mid_z_idx = max(z_dim // 2, 0)
 
         for z_idx in range(z_dim):
             rows = []
@@ -416,6 +429,9 @@ def save_debug(
             # Ensure frame is uint8 and contiguous
             frame = np.ascontiguousarray(frame, dtype=np.uint8)
             frames.append(frame)
+
+            if z_idx == mid_z_idx:
+                preview_frame = frame.copy()
         
         # Save GIF in a subprocess to avoid crashing main training process on encoder segfaults
         out_dir = Path(save_path).parent
@@ -431,14 +447,20 @@ def save_debug(
         if proc.is_alive():
             proc.terminate()
             print("Warning: GIF save timed out; skipping debug visualization")
-            return None
+            if preview_frame is None and frames:
+                preview_frame = frames[len(frames) // 2].copy()
+            return None, preview_frame
 
         if proc.exitcode == 0:
             print(f"Successfully saved GIF to: {save_path}")
-            return frames
+            if preview_frame is None and frames:
+                preview_frame = frames[len(frames) // 2].copy()
+            return frames, preview_frame
         else:
             print(f"Warning: GIF save failed in subprocess (exit code {proc.exitcode}); skipping")
-            return None
+            if preview_frame is None and frames:
+                preview_frame = frames[len(frames) // 2].copy()
+            return None, preview_frame
 
 
 def apply_activation_if_needed(activation_str):
