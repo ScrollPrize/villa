@@ -14,7 +14,7 @@ import numcodecs
 
 from vesuvius.models.run.inference import Inferer
 from vesuvius.data.utils import open_zarr
-from vesuvius.image_proc.shared.geometry.structure_tensor import (
+from vesuvius.image_proc.geometry.structure_tensor import (
     StructureTensorComputer,
     _get_gaussian_kernel_3d,
     _get_pavel_kernels_3d,

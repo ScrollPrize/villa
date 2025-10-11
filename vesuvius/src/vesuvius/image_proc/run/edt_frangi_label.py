@@ -8,8 +8,8 @@ import numpy as np
 import tifffile
 from tqdm import tqdm
 
-from vesuvius.image_proc.shared.distance import dilate_by_inverse_edt
-from vesuvius.image_proc.shared.features.ridges_vessels import (
+from vesuvius.image_proc.distance import dilate_by_inverse_edt
+from vesuvius.image_proc.features.ridges_vessels import (
     detect_ridges_2d,
     detect_ridges_3d,
 )

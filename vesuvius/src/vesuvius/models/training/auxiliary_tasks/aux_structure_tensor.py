@@ -10,7 +10,7 @@ from typing import Dict, Any
 import torch
 import numpy as np
 from scipy.ndimage import distance_transform_edt
-from vesuvius.image_proc.shared.geometry.structure_tensor import StructureTensorComputer
+from vesuvius.image_proc.geometry.structure_tensor import StructureTensorComputer
 
 
 def create_structure_tensor_config(aux_task_name: str, aux_config: Dict[str, Any],

@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 import numpy as np
 
-from vesuvius.image_proc.shared.mesh.affine import (
+from vesuvius.image_proc.mesh.affine import (
     axis_perm,
     load_transform_from_json,
     compute_inv_transpose,

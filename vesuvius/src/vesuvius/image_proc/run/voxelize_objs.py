@@ -17,7 +17,7 @@ from tqdm import tqdm  # Progress bar
 import dask.array as da
 from dask.diagnostics import ProgressBar
 
-from vesuvius.image_proc.shared.mesh.affine import (
+from vesuvius.image_proc.mesh.affine import (
     axis_perm,
     load_transform_from_json,
     compute_inv_transpose,

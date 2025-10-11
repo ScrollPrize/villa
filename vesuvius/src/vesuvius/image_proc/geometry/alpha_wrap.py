@@ -2,7 +2,7 @@ import alphashape
 import numpy as np
 from PIL import Image, ImageDraw
 
-from vesuvius.image_proc.shared.script_utils import arr_to_indices
+from vesuvius.image_proc.helpers import arr_to_indices
 
 def alpha_wrap_arr(arr, alpha=0.1):
     indices = arr_to_indices(arr)

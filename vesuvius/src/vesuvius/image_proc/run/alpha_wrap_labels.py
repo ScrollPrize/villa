@@ -5,8 +5,8 @@ import argparse
 from pathlib import Path
 from multiprocessing import Pool
 
-from vesuvius.image_proc.shared.script_utils import arr_to_indices
-from vesuvius.image_proc.shared.geometry.alpha_wrap import fill_alpha_shape
+from vesuvius.image_proc.helpers import arr_to_indices
+from vesuvius.image_proc.geometry.alpha_wrap import fill_alpha_shape
 
 def worker_fn(args):
     img_path, output_dir, subsample_rate, pts_over, alpha, downsample_factor = args
