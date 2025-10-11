@@ -6,9 +6,11 @@ derived from a source segmentation target. Intended for regression losses with
 masking over the foreground label region.
 """
 
-from typing import Dict, Any, Tuple
+from typing import Dict, Any
+import torch
 import numpy as np
-from scipy.ndimage import gaussian_filter, distance_transform_edt
+from scipy.ndimage import distance_transform_edt
+from vesuvius.image_proc.shared.geometry.structure_tensor import StructureTensorComputer
 
 
 def create_structure_tensor_config(aux_task_name: str, aux_config: Dict[str, Any],
@@ -97,31 +99,25 @@ def compute_structure_tensor(
         outside = distance_transform_edt(1 - binary_mask)
         base = (outside - inside).astype(np.float32)
 
-    # Smooth base before gradients
-    base_s = gaussian_filter(base, sigma=grad_sigma) if grad_sigma and grad_sigma > 0 else base
-
-    # Gradients
-    if is_2d:
-        gy, gx = np.gradient(base_s)
-        Jxx = gx * gx
-        Jxy = gx * gy
-        Jyy = gy * gy
-        comps = [Jxx, Jxy, Jyy]
-    else:
-        gz, gy, gx = np.gradient(base_s)
-        Jxx = gx * gx
-        Jxy = gx * gy
-        Jxz = gx * gz
-        Jyy = gy * gy
-        Jyz = gy * gz
-        Jzz = gz * gz
-        comps = [Jxx, Jxy, Jxz, Jyy, Jyz, Jzz]
-
-    # Smooth tensor components
-    if tensor_sigma and tensor_sigma > 0:
-        comps = [gaussian_filter(c, sigma=tensor_sigma) for c in comps]
-
-    st = np.stack(comps, axis=0).astype(np.float32)
+    component_sigma = tensor_sigma if tensor_sigma and tensor_sigma > 0 else None
+    smooth_components = component_sigma is not None
+    computer = StructureTensorComputer(
+        sigma=float(grad_sigma),
+        component_sigma=component_sigma,
+        smooth_components=smooth_components,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    spatial_dims = 2 if is_2d else 3
+    st = computer.compute(
+        base,
+        sigma=float(grad_sigma),
+        component_sigma=component_sigma,
+        smooth_components=smooth_components,
+        device="cpu",
+        as_numpy=True,
+        spatial_dims=spatial_dims,
+    ).astype(np.float32)
 
     # Mask background for masked regression
     if ignore_index is not None:

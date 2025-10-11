@@ -4,7 +4,6 @@ import sys
 import warnings
 import torch
 from torch import nn
-import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
 from typing import Optional, Union
@@ -15,6 +14,11 @@ import numcodecs
 
 from vesuvius.models.run.inference import Inferer
 from vesuvius.data.utils import open_zarr
+from vesuvius.image_proc.shared.geometry.structure_tensor import (
+    StructureTensorComputer,
+    _get_gaussian_kernel_3d,
+    _get_pavel_kernels_3d,
+)
 from numcodecs import Blosc
 from ._compile_utils import _maybe_compile_function
 
@@ -98,64 +102,32 @@ class StructureTensorInferer(Inferer, nn.Module):
             if self.verbose:
                 print(f"Inferred patch_size {self.patch_size} from input Zarr chunking")
 
-        # — precompute 3D Gaussian kernel  —
+        self._st_computer = StructureTensorComputer(
+            sigma=self.sigma,
+            component_sigma=None,
+            smooth_components=self.smooth_components,
+            device=self.device,
+        )
+
+        dev = torch.device(self.device)
+        dtype = torch.float32
+
         if self.sigma > 0:
-            radius = int(3 * self.sigma)
-            coords = torch.arange(-radius, radius + 1,
-                                  device=self.device, dtype=torch.float32)
-            g1 = torch.exp(-coords**2 / (2 * self.sigma * self.sigma))
-            g1 = g1 / g1.sum()
-            g3 = g1[:, None, None] * g1[None, :, None] * g1[None, None, :]
-            # store both kernel and pad:
-            self.register_buffer("_gauss3d",   g3[None,None])     # [1,1,D,H,W]
-            self.register_buffer(
-                "_gauss3d_tensor",
-                self._gauss3d.expand(6, 1, -1, -1, -1).contiguous())
+            _, radius = _get_gaussian_kernel_3d(dev, dtype, self.sigma)
             self._pad = radius
         else:
-            # no Gaussian padding when σ=0
             self._pad = 0
 
-        # Build 3D Pavel Holoborodko kernels and store as plain tensors
-        # http://www.holoborodko.com/pavel/image-processing/edge-detection/
-        # derivative kernel, smoothing kernel
-        
-        dev   = self.device
-        dtype = torch.float32
-        d = torch.tensor([2.,1.,-16.,-27.,0.,27.,16.,-1.,-2.], device=dev, dtype=dtype) # derivative kernel
-        s = torch.tensor([1., 4., 6., 4., 1.], device=dev, dtype=dtype) # smoothing kernel
+        kz, ky, kx = _get_pavel_kernels_3d(dev, dtype)
+        pad_pz = kz.shape[2] // 2
+        pad_py = ky.shape[3] // 2
+        pad_px = kx.shape[4] // 2
 
-        # depth‐derivative with y/x smoothing
-        kz = (d.view(9,1,1) * s.view(1,5,1) * s.view(1,1,5)) / (96*16*16)
-        # height‐derivative with z/x smoothing
-        ky = (s.view(5,1,1) * d.view(1,9,1) * s.view(1,1,5)) / (96*16*16)
-        # width‐derivative with z/y smoothing
-        kx = (s.view(5,1,1) * s.view(1,5,1) * d.view(1,1,9)) / (96*16*16)
-
-        self.register_buffer("pavel_kz", kz[None,None])
-        self.register_buffer("pavel_ky", ky[None,None])
-        self.register_buffer("pavel_kx", kx[None,None])
-        
-
-        # — figure out how much extra context the Pavel convs need —
-        # we take the maximum half‐kernel‐size over kz, ky, kx for each dim
-        pp = [k for k in (self.pavel_kz, self.pavel_ky, self.pavel_kx)]
-        pad_pz = max(k.shape[2] // 2 for k in pp)
-        pad_py = max(k.shape[3] // 2 for k in pp)
-        pad_px = max(k.shape[4] // 2 for k in pp)
-        # if you also smooth the 6 channels, that adds another gaussian pad
-        extra = self._pad if self.smooth_components else 0
-        # total pad needed on each side so that, after all conv→padding, you
-        # can still trim back to the original patch
+        extra = self._pad if (self.sigma > 0 and self.smooth_components) else 0
         self._total_pad = (
             self._pad + pad_pz + extra,
             self._pad + pad_py + extra,
             self._pad + pad_px + extra,
-        )
-
-        self._compute_structure_tensor_fn = _maybe_compile_function(
-            self._compute_structure_tensor_impl,
-            compile_kwargs={"mode": "reduce-overhead", "fullgraph": True},
         )
         
     def _load_model(self):
@@ -263,53 +235,21 @@ class StructureTensorInferer(Inferer, nn.Module):
         
         return self.output_store
     
-    def _compute_structure_tensor_impl(self, x: torch.Tensor, sigma=None):
-        # x: [N,1,Z,Y,X]
-        if sigma is None: sigma = self.sigma
-        if sigma > 0:
-            x = F.conv3d(x, self._gauss3d, padding=(self._pad,)*3)
-
-        # 2) apply Pavel
-        gz = F.conv3d(x, self.pavel_kz, padding=(4,2,2))
-        gy = F.conv3d(x, self.pavel_ky, padding=(2,4,2))
-        gx = F.conv3d(x, self.pavel_kx, padding=(2,2,4))
-
-        # 3) build tensor components
-        Jxx = gx * gx
-        Jyx = gx * gy
-        Jzx = gx * gz
-        Jyy = gy * gy
-        Jzy = gy * gz
-        Jzz = gz * gz
-
-        # stack into [N,6, Z,Y,X]
-        J = torch.stack([Jzz, Jzy, Jzx, Jyy, Jyx, Jxx], dim=1)
-
-        # drop that singleton channel axis → [N,6,D,H,W]
-        if J.dim() == 6 and J.shape[2] == 1:
-            J = J.squeeze(2)
-
-        # now group‐conv each of the 6 channels with your Gaussian:
-        if sigma > 0 and self.smooth_components:
-            # build one filter per channel
-            J = F.conv3d(J, weight=self._gauss3d_tensor, padding=(self._pad,)*3, groups=6)
-
-        return J
-
     def compute_structure_tensor(self, x: torch.Tensor, sigma=None):
-        try:
-            return self._compute_structure_tensor_fn(x, sigma)
-        except RuntimeError as exc:
-            message = str(exc)
-            if "Compiler: cl is not found" in message or "torch._inductor.exc" in message:
-                warnings.warn(
-                    "Falling back to eager structure tensor computation because torch.compile "
-                    "failed (likely missing required compiler).",
-                    RuntimeWarning,
-                )
-                self._compute_structure_tensor_fn = self._compute_structure_tensor_impl
-                return self._compute_structure_tensor_fn(x, sigma)
-            raise
+        sigma_val = float(self.sigma if sigma is None else sigma)
+        target_device = torch.device(self.device)
+        if target_device.type == "cuda" and not torch.cuda.is_available():
+            target_device = torch.device("cpu")
+        self._st_computer.device = target_device
+        component_sigma = sigma_val if self.smooth_components else None
+        return self._st_computer.compute(
+            x,
+            sigma=sigma_val,
+            component_sigma=component_sigma,
+            device=target_device,
+            smooth_components=self.smooth_components,
+            spatial_dims=3,
+        )
 
     def _run_inference(self):
         """

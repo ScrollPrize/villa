@@ -7,8 +7,10 @@ with 2 channels (2D) or 3 channels (3D), masked on the background.
 """
 
 from typing import Dict, Any
+import torch
 import numpy as np
-from scipy.ndimage import gaussian_filter, distance_transform_edt
+from scipy.ndimage import distance_transform_edt
+from vesuvius.image_proc.shared.geometry.structure_tensor import StructureTensorComputer
 
 
 def create_inplane_direction_config(aux_task_name: str, aux_config: Dict[str, Any],
@@ -111,49 +113,50 @@ def compute_inplane_direction(
         outside = distance_transform_edt(1 - binary_mask)
         base = (outside - inside).astype(np.float32)
 
-    u = gaussian_filter(base, sigma=grad_sigma) if grad_sigma and grad_sigma > 0 else base
-
+    component_sigma = tensor_sigma if tensor_sigma and tensor_sigma > 0 else None
+    smooth_components = component_sigma is not None
+    computer = StructureTensorComputer(
+        sigma=float(grad_sigma),
+        component_sigma=component_sigma,
+        smooth_components=smooth_components,
+        device="cpu",
+        dtype=torch.float32,
+    )
     if is_2d:
-        gy, gx = np.gradient(u)
-        Jxx = gx * gx
-        Jxy = gx * gy
-        Jyy = gy * gy
-        if tensor_sigma and tensor_sigma > 0:
-            Jxx = gaussian_filter(Jxx, sigma=tensor_sigma)
-            Jxy = gaussian_filter(Jxy, sigma=tensor_sigma)
-            Jyy = gaussian_filter(Jyy, sigma=tensor_sigma)
+        st = computer.compute(
+            base,
+            sigma=float(grad_sigma),
+            component_sigma=component_sigma,
+            smooth_components=smooth_components,
+            device="cpu",
+            spatial_dims=2,
+            as_numpy=True,
+        )
+        Jyy, Jyx, Jxx = st
+        Jxy = Jyx
         (l1, l2), vecs = _eigh2x2(Jxx, Jxy, Jyy)  # l1<=l2
         # eigenvector for smallest eigenvalue (index 0)
         v = vecs[0]  # shape (2, H, W)
     else:
-        gz, gy, gx = np.gradient(u)
-        Jxx = gx * gx
-        Jxy = gx * gy
-        Jxz = gx * gz
-        Jyy = gy * gy
-        Jyz = gy * gz
-        Jzz = gz * gz
-        if tensor_sigma and tensor_sigma > 0:
-            Jxx = gaussian_filter(Jxx, sigma=tensor_sigma)
-            Jxy = gaussian_filter(Jxy, sigma=tensor_sigma)
-            Jxz = gaussian_filter(Jxz, sigma=tensor_sigma)
-            Jyy = gaussian_filter(Jyy, sigma=tensor_sigma)
-            Jyz = gaussian_filter(Jyz, sigma=tensor_sigma)
-            Jzz = gaussian_filter(Jzz, sigma=tensor_sigma)
-        # Assemble tensor per-voxel and eigendecompose
-        # Shape broadcasting; we'll do a naive approach using numpy.linalg.eigh
-        H = np.stack
-        # Build symmetric matrices (D,H,W,3,3)
-        J = np.stack([
-            np.stack([Jxx, Jxy, Jxz], axis=-1),
-            np.stack([Jxy, Jyy, Jyz], axis=-1),
-            np.stack([Jxz, Jyz, Jzz], axis=-1)
-        ], axis=-2)  # (..., 3, 3)
-        # Move channels last to (...,3,3)
-        # Already constructed as (...,3,3)
-        # Compute eigenvalues/vectors
-        w, vec = np.linalg.eigh(J)  # w ascending; vec (...,3,3); columns are eigenvectors
-        # Smallest eigenvector is column 0
+        st = computer.compute(
+            base,
+            sigma=float(grad_sigma),
+            component_sigma=component_sigma,
+            smooth_components=smooth_components,
+            device="cpu",
+            spatial_dims=3,
+            as_numpy=True,
+        )
+        Jzz, Jzy, Jzx, Jyy, Jyx, Jxx = st
+        J = np.stack(
+            [
+                np.stack([Jxx, Jyx, Jzx], axis=-1),
+                np.stack([Jyx, Jyy, Jzy], axis=-1),
+                np.stack([Jzx, Jzy, Jzz], axis=-1),
+            ],
+            axis=-2,
+        )
+        w, vec = np.linalg.eigh(J)
         v = np.moveaxis(vec[..., 0], -1, 0)  # (3, D, H, W)
 
     # Normalize and mask
@@ -166,4 +169,3 @@ def compute_inplane_direction(
         v[:, bg] = float(ignore_index)
 
     return np.ascontiguousarray(v.astype(np.float32))
-
