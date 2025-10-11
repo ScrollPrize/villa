@@ -1198,7 +1198,11 @@ class BaseTrainer:
             
             # Update scheduler for this epoch (for epoch-based scheduler switching)
             scheduler, is_per_iteration_scheduler = self._update_scheduler_for_epoch(scheduler, optimizer, epoch)
-            
+            step_scheduler_at_epoch_begin = getattr(scheduler, 'step_on_epoch_begin', False) and not is_per_iteration_scheduler
+
+            if step_scheduler_at_epoch_begin:
+                scheduler.step(epoch)
+
             # Optionally update dataloaders for this epoch (e.g., warmup strategies)
             train_dataloader, val_dataloader = self._update_dataloaders_for_epoch(
                 train_dataloader=train_dataloader,
@@ -1337,7 +1341,7 @@ class BaseTrainer:
             if pbar is not None:
                 pbar.close()
 
-            if not is_per_iteration_scheduler:
+            if not is_per_iteration_scheduler and not step_scheduler_at_epoch_begin:
                 scheduler.step()
 
             gc.collect()
@@ -1359,7 +1363,7 @@ class BaseTrainer:
                     model.eval()
                 with torch.no_grad():
                     val_losses = {t_name: [] for t_name in self.mgr.targets}
-                    frames_array = None
+                    debug_preview_image = None
                     
                     # Initialize evaluation metrics
                     evaluation_metrics = self._initialize_evaluation_metrics()
@@ -1460,7 +1464,7 @@ class BaseTrainer:
                                         if t_name not in ['skel', 'is_unlabeled']:
                                             targets_dict_first[t_name] = t_tensor
                                     
-                                    frames_array = save_debug(
+                                    _, debug_preview_image = save_debug(
                                         input_volume=inputs_first,
                                         targets_dict=targets_dict_first,
                                         outputs_dict=outputs_dict_first,
@@ -1516,18 +1520,16 @@ class BaseTrainer:
                         for metric_name, value in metric_results.items():
                             val_metrics[f"val_{metric_name}"] = value
 
-                        if 'frames_array' in locals() and frames_array is not None:
-                            import wandb
-                            # Stack the list of frames into a proper numpy array (T, H, W, C)
-                            frames_np = np.stack(frames_array, axis=0)
-                            # Convert BGR to RGB for wandb
-                            frames_np = frames_np[..., ::-1]
-                            # Transpose to (frames, channels, height, width) as required by wandb
-                            frames_np = np.transpose(frames_np, (0, 3, 1, 2))
-                            
-                            val_metrics["debug_gif"] = wandb.Video(frames_np, format="gif")
-
                         import wandb
+
+                        if debug_preview_image is not None:
+                            preview_to_log = debug_preview_image
+                            if preview_to_log.ndim == 3 and preview_to_log.shape[2] == 3:
+                                # Convert BGR (OpenCV) to RGB for wandb
+                                preview_to_log = preview_to_log[..., ::-1]
+                            preview_to_log = np.ascontiguousarray(preview_to_log)
+                            val_metrics["debug_image"] = wandb.Image(preview_to_log)
+
                         wandb.log(val_metrics)
 
                     # Early stopping check
@@ -1918,7 +1920,7 @@ def main():
         trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Base Trainer for supervised training")
     elif trainer_name == "surface_frame":
-        from vesuvius.models.training.surface_frame_trainer import SurfaceFrameTrainer
+        from vesuvius.models.training.trainers.surface_frame_trainer import SurfaceFrameTrainer
 
         trainer = SurfaceFrameTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Surface Frame Trainer")

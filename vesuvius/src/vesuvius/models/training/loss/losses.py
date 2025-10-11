@@ -4,7 +4,7 @@ from torch import nn as nn
 from torch.nn import MSELoss, SmoothL1Loss, L1Loss
 import sys
 import os
-from vesuvius.image_proc.shared.geometry.structure_tensor import (
+from vesuvius.image_proc.geometry.structure_tensor import (
     StructureTensorComputer,
     components_to_matrix,
 )

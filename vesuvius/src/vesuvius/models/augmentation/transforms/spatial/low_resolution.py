@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -12,8 +12,8 @@ class SimulateLowResolutionTransform(ImageOnlyTransform):
                  scale: RandomScalar,
                  synchronize_channels: bool,
                  synchronize_axes: bool,
-                 ignore_axes: Tuple[int, ...],
-                 allowed_channels: Tuple[int, ...] = None,
+                 ignore_axes: Optional[Tuple[int, ...]],
+                 allowed_channels: Optional[Tuple[int, ...]] = None,
                  p_per_channel: float = 1):
         super().__init__()
         self.scale = scale
@@ -45,7 +45,7 @@ class SimulateLowResolutionTransform(ImageOnlyTransform):
                 scales = torch.Tensor([[sample_scalar(self.scale, image=data_dict['image'], channel=c, dim=None)]  * (len(shape) - 1) for c in apply_to_channel])
             else:
                 scales = torch.Tensor([[sample_scalar(self.scale, image=data_dict['image'], channel=c, dim=d) for d in range(len(shape) - 1)] for c in apply_to_channel])
-        if len(scales) > 0:
+        if len(scales) > 0 and self.ignore_axes:
             scales[:, self.ignore_axes] = 1
         return {
             'apply_to_channel': apply_to_channel,

@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.ndimage.filters import gaussian_filter
-from vesuvius.image_proc.shared.normalization import normalize_minmax
+from vesuvius.image_proc.intensity.normalization import normalize_minmax
 
 
 def hessian_curvature_2d(image, gauss_sigma=2, sigma=6):

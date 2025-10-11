@@ -736,121 +736,103 @@ class BaseDataset(Dataset):
             if mirror_axes is not None and len(mirror_axes) > 0:
                 transforms.append(MirrorTransform(allowed_axes=mirror_axes))
 
-        if dimension == 2:
-            if not only_spatial_and_intensity:
-                transforms.append(RandomTransform(
-                    BlankRectangleTransform(
-                        rectangle_size=tuple(
-                            (max(1, size // 6), size // 3) for size in self.mgr.train_patch_size
-                        ),
-                        rectangle_value=np.mean,
-                        num_rectangles=(1, 5),
-                        force_square=False,
-                        p_per_sample=0.4,
-                        p_per_channel=0.5
-                    ), apply_probability=0.5
-                ))
+        # Build shared intensity transforms once to keep 2D/3D lists aligned.
+        # Some transforms are conditional so we cache their ready-to-use wrappers.
+        blank_rectangle = None
+        if not only_spatial_and_intensity:
+            blank_rectangle = RandomTransform(
+                BlankRectangleTransform(
+                    rectangle_size=tuple(
+                        (max(1, size // 6), size // 3) for size in self.mgr.train_patch_size
+                    ),
+                    rectangle_value=np.mean,
+                    num_rectangles=(1, 5),
+                    force_square=False,
+                    p_per_sample=0.4,
+                    p_per_channel=0.5
+                ),
+                apply_probability=0.5
+            )
 
-            # # Illumination
-            # transforms.append(RandomTransform(
-            #     InhomogeneousSliceIlluminationTransform(
-            #         num_defects=(2, 5),
-            #         defect_width=(25, 50),
-            #         mult_brightness_reduction_at_defect=(0.3, 1.5),
-            #         base_p=(0.2, 0.4),
-            #         base_red=(0.5, 0.9),
-            #         p_per_sample=1.0,
-            #         per_channel=True,
-            #         p_per_channel=0.5
-            #     ), apply_probability=0.4
-            # ))
-
-            # Noise and blur
-            if not only_spatial_and_intensity:
-                transforms.append(RandomTransform(
-                    GaussianNoiseTransform(
-                        noise_variance=(0, 0.15),
-                        p_per_channel=1,
-                        synchronize_channels=True
-                    ), apply_probability=0.4
-                ))
-                transforms.append(RandomTransform(
-                    GaussianBlurTransform(
-                        blur_sigma=(0.5, 1.5),
-                        synchronize_channels=False,
-                        synchronize_axes=False,
-                        p_per_channel=0.5, benchmark=False
-                    ), apply_probability=0.4
-                ))
-
-            # Brightness/contrast/gamma
-            transforms.append(RandomTransform(
-                MultiplicativeBrightnessTransform(
-                    multiplier_range=BGContrast((0.5, 1.5)),
-                    synchronize_channels=False,
-                    p_per_channel=1
-                ), apply_probability=0.3
-            ))
-            transforms.append(RandomTransform(
-                ContrastTransform(
-                    contrast_range=BGContrast((0.5, 1.5)),
-                    preserve_range=True,
-                    synchronize_channels=False,
-                    p_per_channel=1
-                ), apply_probability=0.3
-            ))
-            if not only_spatial_and_intensity:
-                transforms.append(RandomTransform(
-                    SimulateLowResolutionTransform(
-                        scale=(0.25, 1),
-                        synchronize_channels=False,
-                        synchronize_axes=True,
-                        ignore_axes=None,
-                        allowed_channels=None,
-                        p_per_channel=0.5
-                    ), apply_probability=0.4
-                ))
-            transforms.append(RandomTransform(
-                GammaTransform(
-                    gamma=BGContrast((0.7, 1.5)),
-                    p_invert_image=1,
-                    synchronize_channels=False,
+        common_transforms = []
+        if not only_spatial_and_intensity:
+            common_transforms.append(RandomTransform(
+                GaussianNoiseTransform(
+                    noise_variance=(0, 0.15),
                     p_per_channel=1,
-                    p_retain_stats=1
-                ), apply_probability=0.2
-            ))
-            transforms.append(RandomTransform(
-                GammaTransform(
-                    gamma=BGContrast((0.7, 1.5)),
-                    p_invert_image=0,
-                    synchronize_channels=False,
-                    p_per_channel=1,
-                    p_retain_stats=1
+                    synchronize_channels=True
                 ), apply_probability=0.4
             ))
-        else:
-            if not no_spatial:
-                # Only add transpose transform if all three dimensions are equal
-                if patch_d == patch_h == patch_w:
-                    transforms.append(RandomTransform(
-                        TransposeAxesTransform(allowed_axes={0, 1, 2}),
-                        apply_probability=0.2
-                    ))
+            common_transforms.append(RandomTransform(
+                GaussianBlurTransform(
+                    blur_sigma=(0.5, 1.5),
+                    synchronize_channels=False,
+                    synchronize_axes=False,
+                    p_per_channel=0.5,
+                    benchmark=False
+                ), apply_probability=0.4
+            ))
 
-            if not only_spatial_and_intensity:
+        common_transforms.append(RandomTransform(
+            MultiplicativeBrightnessTransform(
+                multiplier_range=BGContrast((0.5, 1.5)),
+                synchronize_channels=False,
+                p_per_channel=1
+            ), apply_probability=0.3
+        ))
+        common_transforms.append(RandomTransform(
+            ContrastTransform(
+                contrast_range=BGContrast((0.5, 1.5)),
+                preserve_range=True,
+                synchronize_channels=False,
+                p_per_channel=1
+            ), apply_probability=0.3
+        ))
+
+        if not only_spatial_and_intensity:
+            common_transforms.append(RandomTransform(
+                SimulateLowResolutionTransform(
+                    scale=(0.25, 1),
+                    synchronize_channels=False,
+                    synchronize_axes=True,
+                    ignore_axes=None,
+                    allowed_channels=None,
+                    p_per_channel=0.5
+                ), apply_probability=0.4
+            ))
+
+        common_transforms.append(RandomTransform(
+            GammaTransform(
+                gamma=BGContrast((0.7, 1.5)),
+                p_invert_image=1,
+                synchronize_channels=False,
+                p_per_channel=1,
+                p_retain_stats=1
+            ), apply_probability=0.2
+        ))
+        common_transforms.append(RandomTransform(
+            GammaTransform(
+                gamma=BGContrast((0.7, 1.5)),
+                p_invert_image=0,
+                synchronize_channels=False,
+                p_per_channel=1,
+                p_retain_stats=1
+            ), apply_probability=0.4
+        ))
+
+        if dimension == 2:
+            if blank_rectangle is not None:
+                transforms.append(blank_rectangle)
+            transforms.extend(common_transforms)
+        else:
+            if not no_spatial and patch_d == patch_h == patch_w:
                 transforms.append(RandomTransform(
-                    BlankRectangleTransform(
-                        rectangle_size=tuple(
-                            (max(1, size // 6), size // 3) for size in self.mgr.train_patch_size
-                        ),
-                        rectangle_value=np.mean,
-                        num_rectangles=(1, 5),
-                        force_square=False,
-                        p_per_sample=0.4,
-                        p_per_channel=0.5
-                    ), apply_probability=0.5
+                    TransposeAxesTransform(allowed_axes={0, 1, 2}),
+                    apply_probability=0.2
                 ))
 
+            if blank_rectangle is not None:
+                transforms.append(blank_rectangle)
                 transforms.append(RandomTransform(
                     SmearTransform(
                         shift=(5, 0),
@@ -873,67 +855,7 @@ class BaseDataset(Dataset):
                 ), apply_probability=0.4
             ))
 
-            if not only_spatial_and_intensity:
-                transforms.append(RandomTransform(
-                    GaussianNoiseTransform(
-                        noise_variance=(0, 0.15),
-                        p_per_channel=1,
-                        synchronize_channels=True
-                    ), apply_probability=0.4
-                ))
-                transforms.append(RandomTransform(
-                    GaussianBlurTransform(
-                        blur_sigma=(0.5, 1.5),
-                        synchronize_channels=False,
-                        synchronize_axes=False,
-                        p_per_channel=0.5, benchmark=False
-                    ), apply_probability=0.4
-                ))
-
-            transforms.append(RandomTransform(
-                MultiplicativeBrightnessTransform(
-                    multiplier_range=BGContrast((0.5, 1.5)),
-                    synchronize_channels=False,
-                    p_per_channel=1
-                ), apply_probability=0.3
-            ))
-            transforms.append(RandomTransform(
-                ContrastTransform(
-                    contrast_range=BGContrast((0.5, 1.5)),
-                    preserve_range=True,
-                    synchronize_channels=False,
-                    p_per_channel=1
-                ), apply_probability=0.3
-            ))
-            if not only_spatial_and_intensity:
-                transforms.append(RandomTransform(
-                    SimulateLowResolutionTransform(
-                        scale=(0.25, 1),
-                        synchronize_channels=False,
-                        synchronize_axes=True,
-                        ignore_axes=None,
-                        allowed_channels=None,
-                        p_per_channel=0.5
-                    ), apply_probability=0.4
-                ))
-            transforms.append(RandomTransform(
-                GammaTransform(
-                    gamma=BGContrast((0.7, 1.5)),
-                    p_invert_image=1,
-                    synchronize_channels=False,
-                    p_per_channel=1,
-                    p_retain_stats=1
-                ), apply_probability=0.2
-            ))
-            transforms.append(RandomTransform(
-                GammaTransform(
-                    gamma=BGContrast((0.7, 1.5)),
-                    p_invert_image=0,
-                    synchronize_channels=False,
-                    p_per_channel=1,
-                    p_retain_stats=1
-                ), apply_probability=0.4
-            ))
+            transforms.extend(common_transforms)
 
         if no_spatial:
             print("Spatial transformations disabled (no_spatial=True)")
@@ -1026,10 +948,11 @@ class BaseDataset(Dataset):
             chunk_patch = self._chunk_patches[index]
             data_dict = self._extract_chunk_patch(chunk_patch)
 
-        # if we don't want to perform augmentation on gpu , we might as well do here with cpu in the dataloader workers
+
         metadata = data_dict.pop('patch_info', None)
         plane_mask = data_dict.pop('plane_mask', None)
 
+        # if we don't want to perform augmentation on gpu , we might as well do here with cpu in the dataloader workers
         if self.transforms is not None and not (self.is_training and getattr(self.mgr, 'augment_on_device', False)):
             data_dict = self.transforms(**data_dict)
 

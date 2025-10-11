@@ -2,8 +2,8 @@ import numpy as np
 from numpy import linalg as LA
 
 
-from vesuvius.image_proc.shared.script_utils import divide_nonzero
-from vesuvius.image_proc.shared.features.curvature import hessian_curvature_3d, hessian_curvature_2d
+from vesuvius.image_proc.helpers import divide_nonzero
+from vesuvius.image_proc.features.curvature import hessian_curvature_3d, hessian_curvature_2d
 
 def detect_ridges_2d(image, gamma=1.5, beta=0.5, gauss_sigma=2, sigma=6):
     joint_hessian, zero_mask = hessian_curvature_2d(image, gauss_sigma, sigma)

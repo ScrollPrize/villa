@@ -12,7 +12,7 @@ try:
 except Exception:  # pragma: no cover - tqdm is optional
     tqdm = None
 
-from vesuvius.image_proc.shared.geometry.structure_tensor import StructureTensorComputer
+from vesuvius.image_proc.geometry.structure_tensor import StructureTensorComputer
 
 EPS = 2**-52
 GAMMA = 0.01

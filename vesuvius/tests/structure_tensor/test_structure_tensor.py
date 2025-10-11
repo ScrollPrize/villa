@@ -7,7 +7,7 @@ import zarr
 import os
 from math import isfinite
 
-from vesuvius.image_proc.shared.geometry.structure_tensor import (
+from vesuvius.image_proc.geometry.structure_tensor import (
     StructureTensorComputer,
     components_to_matrix,
     eigendecompose,
