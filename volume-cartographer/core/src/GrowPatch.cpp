@@ -204,10 +204,10 @@ public:
     virtual ~LossSettings() = default;
 
     LossSettings() {
-        w[LossType::SNAP] = 0.1f;
+        w[LossType::SNAP] = 0.01f;
         w[LossType::NORMAL] = 1.0f;
-        w[LossType::STRAIGHT] = 0.2f;
-        w[LossType::DIST] = 1.0f;
+        w[LossType::STRAIGHT] = 2.0f;
+        w[LossType::DIST] = 0.5f;
         w[LossType::DIRECTION] = 1.0f;
         w[LossType::SDIR] = 0.00f; // conservative default; tune 0.01–0.10 maybe
     }
@@ -1226,11 +1226,11 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
 
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-    options.minimizer_progress_to_stdout = false;
+    options.minimizer_progress_to_stdout = !quiet;
     options.max_num_iterations = 1000;
 
     // options.function_tolerance = 1e-4;
-    // options.use_nonmonotonic_steps = true;
+    options.use_nonmonotonic_steps = true;
     // options.use_mixed_precision_solves = true;
     // options.max_num_refinement_iterations = 3;
     // options.use_inner_iterations = true;
@@ -1264,7 +1264,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
     ceres::Solve(options, &problem, &summary);
 
     if (!quiet)
-        std::cout << "local solve radius " << radius << " " << summary.BriefReport() << std::endl;
+        std::cout << "local solve radius " << radius << " " << summary.FullReport() << std::endl;
 
     return sqrt(summary.final_cost/summary.num_residual_blocks);
 }
@@ -1879,7 +1879,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     std::cout << "lets start fringe: " << fringe.size() << std::endl;
 
     while (!fringe.empty()) {
-        bool global_opt = generation <= 50 && !resume_surf;
+        // bool global_opt = generation <= 50 && !resume_surf;
+        bool global_opt = true;
 
         ALifeTime timer_gen;
         timer_gen.del_msg = "time per generation ";
@@ -2137,9 +2138,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         }
         else {
             //we do the global opt only every 8 gens, as every add does a small local solve anyweays
-            if (generation % 8 == 0) {
+            // if (generation % 8 == 0) {
                 local_optimization(stop_gen+10, {y0,x0}, trace_params, trace_data, loss_settings, false, true);
-            }
+            // }
         }
 
         cands.resize(0);

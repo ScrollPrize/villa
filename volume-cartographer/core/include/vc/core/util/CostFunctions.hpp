@@ -33,17 +33,19 @@ struct DistLoss {
         d[1] = a[1] - b[1];
         d[2] = a[2] - b[2];
 
-        T dist = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+        T dist_n = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2])/T(_d);
 
-        if (dist <= T(0)) {
-            residual[0] = T(_w)*(d[0]*d[0] + d[1]*d[1] + d[2]*d[2] - T(1));
-        }
-        else {
-            if (dist < T(_d))
-                residual[0] = T(_w)*(T(_d)/dist - T(1));
-            else
-                residual[0] = T(_w)*(dist/T(_d) - T(1));
-        }
+        residual[0] = T(_w)*(dist_n - T(1));
+
+        // if (dist <= T(0)) {
+        //     residual[0] = T(_w)*(d[0]*d[0] + d[1]*d[1] + d[2]*d[2] - T(1));
+        // }
+        // else {
+        //     if (dist < T(_d))
+        //         residual[0] = T(_w)*(T(_d)/dist - T(1));
+        //     else
+        //         residual[0] = T(_w)*(dist/T(_d) - T(1));
+        // }
 
         return true;
     }
@@ -107,7 +109,7 @@ struct DistLoss2D {
 
 struct StraightLoss {
     StraightLoss(float w) : _w(w) {};
-    static constexpr double kStraightAngleCosThreshold = 0.86602540378443864676; // cos(30°); deviations beyond 30° incur penalty
+    static constexpr double kStraightAngleCosThreshold = 0.7; // cos(30°); deviations beyond 30° incur penalty
     template <typename T>
     bool operator()(const T* const a, const T* const b, const T* const c, T* residual) const {
         T d1[3], d2[3];
@@ -127,7 +129,7 @@ struct StraightLoss {
 
         if (dot <= T(kStraightAngleCosThreshold)) {
             T penalty = T(kStraightAngleCosThreshold)-dot;
-            residual[0] = T(0.1*_w)*(T(1)-dot) + T(_w)*penalty;
+            residual[0] = T(0.001*_w)*(T(1)-dot) + T(_w)*penalty;
             // residual[0] = T(_w)*(T(1)-dot) + T(_w*8)*penalty*penalty;
         } else
             residual[0] = T(0.1*_w)*(T(1)-dot);
@@ -814,6 +816,8 @@ struct NormalConstraintPlane {
                 float dist_sq = seg_dist_sq_appx(p1_cv, p2_cv, p_a, p_b);
                 if (dist_sq > roi_radius_*roi_radius_)
                     continue;
+
+                dist_sq = seg_dist_sq(p1_cv, p2_cv, p_a, p_b);
 
                 dist_sq = std::max(1.0f, dist_sq);
 
