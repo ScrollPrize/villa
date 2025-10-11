@@ -1198,7 +1198,11 @@ class BaseTrainer:
             
             # Update scheduler for this epoch (for epoch-based scheduler switching)
             scheduler, is_per_iteration_scheduler = self._update_scheduler_for_epoch(scheduler, optimizer, epoch)
-            
+            step_scheduler_at_epoch_begin = getattr(scheduler, 'step_on_epoch_begin', False) and not is_per_iteration_scheduler
+
+            if step_scheduler_at_epoch_begin:
+                scheduler.step(epoch)
+
             # Optionally update dataloaders for this epoch (e.g., warmup strategies)
             train_dataloader, val_dataloader = self._update_dataloaders_for_epoch(
                 train_dataloader=train_dataloader,
@@ -1337,7 +1341,7 @@ class BaseTrainer:
             if pbar is not None:
                 pbar.close()
 
-            if not is_per_iteration_scheduler:
+            if not is_per_iteration_scheduler and not step_scheduler_at_epoch_begin:
                 scheduler.step()
 
             gc.collect()
@@ -1918,7 +1922,7 @@ def main():
         trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Base Trainer for supervised training")
     elif trainer_name == "surface_frame":
-        from vesuvius.models.training.surface_frame_trainer import SurfaceFrameTrainer
+        from vesuvius.models.training.trainers.surface_frame_trainer import SurfaceFrameTrainer
 
         trainer = SurfaceFrameTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Surface Frame Trainer")

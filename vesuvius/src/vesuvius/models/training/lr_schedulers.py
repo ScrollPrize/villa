@@ -48,6 +48,8 @@ class PolyLRScheduler(_LRScheduler):
         self.max_steps = max_steps
         self.exponent = exponent
         self.ctr = 0
+        # Step polynomial schedulers at the beginning of an epoch to mirror nnU-Net behaviour
+        self.step_on_epoch_begin = True
         # In newer PyTorch versions, _LRScheduler only takes optimizer and last_epoch
         # The verbose parameter was removed
         super().__init__(optimizer, last_epoch=current_step if current_step is not None else -1)
@@ -99,6 +101,8 @@ class WarmupPolyLRScheduler(_LRScheduler):
         self.warmup_steps = warmup_steps
         self.exponent = exponent
         self.ctr = 0
+        # Warmup+poly should also advance at the beginning of each epoch
+        self.step_on_epoch_begin = True
         # In newer PyTorch versions, _LRScheduler only takes optimizer and last_epoch
         # The verbose parameter was removed
         super().__init__(optimizer, last_epoch=current_step if current_step is not None else -1)
