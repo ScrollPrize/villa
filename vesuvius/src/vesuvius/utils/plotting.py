@@ -36,18 +36,29 @@ def _save_gif_worker(frames_list, path, _fps):
         sys.exit(1)
 
 
-def minmax_scale_to_8bit(arr_np):
-    """Convert array to 8-bit by scaling to 0-255 range"""
+def minmax_scale_to_8bit(arr_np, clip_quantile: float = 0.005):
+    """Convert array to 8-bit by scaling to 0-255 range with optional outlier clipping (default 0.5/99.5 percentiles)."""
+    if not 0.0 <= clip_quantile < 0.5:
+        raise ValueError("clip_quantile must be in the range [0.0, 0.5)")
+
     # Ensure float32 for computation
     if arr_np.dtype != np.float32 and arr_np.dtype != np.float64:
         arr_np = arr_np.astype(np.float32)
-    
+    else:
+        arr_np = arr_np.astype(np.float32, copy=False)
+
+    if clip_quantile > 0.0:
+        lower = float(np.quantile(arr_np, clip_quantile))
+        upper = float(np.quantile(arr_np, 1.0 - clip_quantile))
+        if upper > lower:
+            arr_np = np.clip(arr_np, lower, upper)
+
     min_val = arr_np.min()
     max_val = arr_np.max()
     if max_val > min_val:
         arr_np = (arr_np - min_val) / (max_val - min_val) * 255
     else:
-        arr_np = np.zeros_like(arr_np, dtype=np.float32) * 255
+        arr_np = np.zeros_like(arr_np, dtype=np.float32)
     return np.clip(arr_np, 0, 255).astype(np.uint8)
 
 
