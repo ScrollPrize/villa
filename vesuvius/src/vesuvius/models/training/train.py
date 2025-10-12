@@ -233,7 +233,61 @@ class BaseTrainer:
             param.requires_grad_(False)
 
         if getattr(self.mgr, 'coarse_patch_size', None) is None:
-            self.mgr.update_config(coarse_patch_size=list(coarse_mgr.train_patch_size))
+            fine_patch = np.asarray(self.mgr.train_patch_size, dtype=float)
+            dims = fine_patch.size
+
+            def _spacing_to_array(values):
+                if values is None:
+                    return None
+                arr = np.asarray(values, dtype=float)
+                if arr.size == 0:
+                    return None
+                if arr.size == 1:
+                    return np.full(dims, float(arr[0]), dtype=float)
+                if arr.size != dims:
+                    return None
+                return arr
+
+            fine_spacing = _spacing_to_array(getattr(self.mgr, 'fine_spacing_um', None))
+            coarse_spacing = _spacing_to_array(getattr(self.mgr, 'coarse_spacing_um', None))
+            derived_coarse = None
+            if fine_spacing is not None and coarse_spacing is not None:
+                ratio = np.ones_like(fine_spacing, dtype=float)
+                nonzero = coarse_spacing != 0
+                ratio[nonzero] = fine_spacing[nonzero] / coarse_spacing[nonzero]
+                coarse_patch = np.maximum(1, np.round(fine_patch * ratio)).astype(int)
+                must_div = getattr(coarse_network, 'must_be_divisible_by', None)
+                if must_div is not None:
+                    must_div = np.asarray(must_div, dtype=int)
+                    if must_div.size == 1:
+                        must_div = np.full(dims, int(max(1, must_div.item())), dtype=int)
+                    elif must_div.size != dims:
+                        must_div = None
+                    else:
+                        must_div = np.maximum(must_div, 1)
+                if must_div is not None:
+                    adjusted = np.zeros_like(coarse_patch)
+                    for axis in range(dims):
+                        step = int(max(1, must_div[axis]))
+                        target = int(coarse_patch[axis])
+                        lower = (target // step) * step
+                        if lower < step:
+                            lower = step
+                        upper = ((target + step - 1) // step) * step
+                        lower_diff = abs(lower - target)
+                        upper_diff = abs(upper - target)
+                        adjusted[axis] = lower if lower_diff <= upper_diff else upper
+                    coarse_patch = adjusted
+                derived_coarse = coarse_patch.astype(int)
+
+            if derived_coarse is not None:
+                if not self.is_distributed or self.rank == 0:
+                    print(f"Derived coarse patch size from spacing ratio: {derived_coarse.tolist()}")
+                self.mgr.update_config(coarse_patch_size=derived_coarse.tolist())
+            else:
+                if not self.is_distributed or self.rank == 0:
+                    print("Falling back to coarse model patch size; could not derive coarse patch size from spacings.")
+                self.mgr.update_config(coarse_patch_size=list(coarse_mgr.train_patch_size))
 
         model.configure_coarse_fusion(coarse_network.shared_encoder.output_channels)
         self.coarse_model = coarse_network
