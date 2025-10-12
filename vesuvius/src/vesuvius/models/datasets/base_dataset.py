@@ -716,6 +716,7 @@ class BaseDataset(Dataset):
                 rotation_for_DA = (-np.pi, np.pi)
                 mirror_axes = (0, 1, 2)
 
+            allowed_rotation_axes = getattr(self.mgr, 'allowed_rotation_axes', None)
             # Add SpatialTransform for rotations, scaling, elastic deformations
             transforms.append(
                 SpatialTransform(
@@ -729,7 +730,8 @@ class BaseDataset(Dataset):
                     scaling=(0.7, 1.4),
                     p_synchronize_scaling_across_axes=1,
                     bg_style_seg_sampling=False,  # =, mode_seg='nearest'
-                    elastic_deform_magnitude=(5, 25)
+                    elastic_deform_magnitude=(5, 25),
+                    allowed_rotation_axes=allowed_rotation_axes
                 )
             )
 

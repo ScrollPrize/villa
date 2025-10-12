@@ -129,6 +129,60 @@ class ConfigManager:
         self.skip_bounding_box = bool(self.dataset_config.get("skip_bounding_box", True))
         self.cache_valid_patches = bool(self.dataset_config.get("cache_valid_patches", True))
 
+        rotation_axes_cfg = self.dataset_config.get("rotation_axes", None)
+        axis_name_to_index = {
+            'x': 0,
+            'width': 0,
+            'w': 0,
+            'y': 1,
+            'height': 1,
+            'h': 1,
+            'z': 2,
+            'depth': 2,
+            'd': 2,
+        }
+        index_to_axis_name = {0: 'x', 1: 'y', 2: 'z'}
+        if rotation_axes_cfg is None:
+            self.allowed_rotation_axes = None
+        else:
+            if isinstance(rotation_axes_cfg, (str, int)):
+                rotation_axes_iterable = [rotation_axes_cfg]
+            else:
+                rotation_axes_iterable = rotation_axes_cfg
+
+            normalized_axes = []
+            seen_axes = set()
+            for token in rotation_axes_iterable:
+                if isinstance(token, int):
+                    idx = token
+                else:
+                    token_str = str(token).strip().lower()
+                    if token_str in {'all', 'xyz', 'zyx'}:
+                        normalized_axes = [0, 1, 2]
+                        seen_axes = {0, 1, 2}
+                        break
+                    if token_str in axis_name_to_index:
+                        idx = axis_name_to_index[token_str]
+                    else:
+                        try:
+                            idx = int(token_str)
+                        except ValueError as exc:
+                            raise ValueError(
+                                f"Invalid axis '{token}' in dataset_config.rotation_axes; "
+                                "use x,y,z (width,height,depth) or indices 0-2."
+                            ) from exc
+                if idx < 0 or idx > 2:
+                    raise ValueError(
+                        f"Axis index '{idx}' in dataset_config.rotation_axes is out of range; valid indices are 0, 1, 2."
+                    )
+                if idx not in seen_axes:
+                    normalized_axes.append(idx)
+                    seen_axes.add(idx)
+
+            self.allowed_rotation_axes = tuple(normalized_axes)
+            # Store canonical names for downstream logging
+            self.dataset_config['rotation_axes'] = [index_to_axis_name[idx] for idx in normalized_axes]
+
         # Chunk-slicing worker configuration
         self.downsample_level = int(self.dataset_config.get("downsample_level", 1))
         self.num_workers = int(self.dataset_config.get("num_workers", 8))
