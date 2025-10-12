@@ -78,6 +78,8 @@ class NetworkFromConfig(nn.Module):
         self.coarse_fusion_enabled = False
         self.coarse_adapters: Optional[nn.ModuleList] = None
         self._coarse_stage_offset: int = 0
+        self._coarse_feature_offset: int = 0
+        self._coarse_mapping: Optional[Sequence[Optional[int]]] = None
 
         if hasattr(mgr, 'model_config') and mgr.model_config:
             model_config = mgr.model_config
@@ -622,37 +624,46 @@ class NetworkFromConfig(nn.Module):
         if not coarse_channels:
             return
 
-        fine_len = len(self.shared_encoder.output_channels)
+        fine_channels = list(self.shared_encoder.output_channels)
+        fine_len = len(fine_channels)
         coarse_channels = list(coarse_channels)
         coarse_len = len(coarse_channels)
 
-        if coarse_len < fine_len:
-            raise ValueError(
-                f"Coarse encoder produced {coarse_len} stages but fine encoder requires at least {fine_len}."
-            )
+        feature_offset = 0
+        if coarse_len >= fine_len:
+            feature_offset = coarse_len - fine_len
+            coarse_channels = coarse_channels[feature_offset:]
+            coarse_len = len(coarse_channels)
 
-        self._coarse_stage_offset = max(0, coarse_len - fine_len)
-        if self._coarse_stage_offset > 0:
-            trimmed = coarse_channels[self._coarse_stage_offset:]
-            if len(trimmed) != fine_len:
-                raise RuntimeError(
-                    "Failed to align coarse and fine encoder stages after trimming."
-                )
-            coarse_channels = trimmed
+        mapping: list[Optional[int]] = [None] * fine_len
+        if coarse_len >= fine_len:
+            for idx in range(fine_len):
+                mapping[idx] = idx
+        else:
+            offset = fine_len - coarse_len
+            for idx in range(offset, fine_len):
+                mapping[idx] = idx - offset
+
+        self._coarse_feature_offset = feature_offset
+        self._coarse_mapping = mapping
 
         conv_cls = self.conv_op
         adapters = []
-        for fine_ch, coarse_ch in zip(self.shared_encoder.output_channels, coarse_channels):
-            adapters.append(
-                conv_cls(
-                    int(coarse_ch),
-                    int(fine_ch),
-                    kernel_size=1,
-                    stride=1,
-                    padding=0,
-                    bias=False,
-                )
+        for idx, fine_ch in enumerate(fine_channels):
+            coarse_idx = mapping[idx]
+            if coarse_idx is None:
+                adapters.append(nn.Identity())
+                continue
+            adapter = conv_cls(
+                int(coarse_channels[coarse_idx]),
+                int(fine_ch),
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=False,
             )
+            adapters.append(adapter)
+
         self.coarse_adapters = nn.ModuleList(adapters)
         self.coarse_fusion_enabled = True
 
@@ -693,20 +704,29 @@ class NetworkFromConfig(nn.Module):
 
         if coarse_features is not None and self.coarse_fusion_enabled and self.coarse_adapters is not None:
             if not isinstance(coarse_features, (list, tuple)):
-                coarse_features = list(coarse_features)
+                coarse_feats = list(coarse_features)
             else:
-                coarse_features = list(coarse_features)
-            if len(coarse_features) != len(features):
-                offset = getattr(self, "_coarse_stage_offset", 0)
-                if len(coarse_features) - offset == len(features):
-                    coarse_features = coarse_features[offset:]
-                else:
-                    raise ValueError(
-                        f"Coarse feature stages ({len(coarse_features)}) do not match fine encoder stages ({len(features)})."
-                    )
+                coarse_feats = list(coarse_features)
+
+            feature_offset = getattr(self, "_coarse_feature_offset", 0)
+            if feature_offset > 0 and len(coarse_feats) >= feature_offset:
+                coarse_feats = coarse_feats[feature_offset:]
+
+            mapping = getattr(self, "_coarse_mapping", None) or []
             fused = []
-            for idx, (fine_feat, coarse_feat) in enumerate(zip(features, coarse_features)):
-                projected = self.coarse_adapters[idx](coarse_feat)
+            for idx, fine_feat in enumerate(features):
+                coarse_idx = mapping[idx] if idx < len(mapping) else None
+                if coarse_idx is None or coarse_idx >= len(coarse_feats):
+                    fused.append(fine_feat)
+                    continue
+
+                adapter = self.coarse_adapters[idx]
+                if isinstance(adapter, nn.Identity):
+                    fused.append(fine_feat)
+                    continue
+
+                coarse_feat = coarse_feats[coarse_idx]
+                projected = adapter(coarse_feat)
                 if projected.shape[2:] != fine_feat.shape[2:]:
                     interp_mode = 'trilinear' if projected.ndim == 5 else 'bilinear'
                     projected = F.interpolate(
