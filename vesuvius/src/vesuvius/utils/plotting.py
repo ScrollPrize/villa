@@ -2,7 +2,7 @@ import torch
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 from PIL import Image, ImageDraw
 import multiprocessing as mp
 
@@ -185,7 +185,9 @@ def save_debug(
     train_outputs_dict: dict = None,    # Optional train sample outputs
     skeleton_dict: dict = None,         # Optional skeleton data for visualization
     train_skeleton_dict: dict = None,   # Optional train skeleton data
-    apply_activation: bool = True       # Whether to apply activation functions
+    apply_activation: bool = True,      # Whether to apply activation functions
+    coarse_input: torch.Tensor | None = None,    # Optional coarse-resolution input
+    coarse_features: Sequence[torch.Tensor] | None = None  # Optional coarse encoder feature maps
 ):
     """
     Save debug visualization as GIF (3D) or PNG (2D).
@@ -197,6 +199,33 @@ def save_debug(
         extracted from the visualization (middle Z slice for 3D data).
     """
     
+    def _tensor_to_numpy(t: Optional[torch.Tensor]) -> Optional[np.ndarray]:
+        if t is None:
+            return None
+        if t.dtype == torch.bfloat16:
+            t = t.float()
+        return t.cpu().numpy()
+
+    def _resize_bgr(img: np.ndarray, target_hw: tuple[int, int]) -> np.ndarray:
+        if img.shape[:2] == target_hw:
+            return img
+        if target_hw[0] <= 0 or target_hw[1] <= 0:
+            return img
+        return cv2.resize(img, (target_hw[1], target_hw[0]), interpolation=cv2.INTER_LINEAR)
+
+    def _select_volume_slice(volume: np.ndarray, z_idx: int, fine_len: int) -> np.ndarray:
+        if volume.ndim <= 2:
+            return volume
+        z_len = volume.shape[0]
+        if z_len == 1 or fine_len <= 1:
+            return volume[0]
+        if z_len == fine_len:
+            return volume[z_idx]
+        ratio = z_idx / max(fine_len - 1, 1)
+        coarse_idx = int(round(ratio * (z_len - 1)))
+        coarse_idx = max(0, min(z_len - 1, coarse_idx))
+        return volume[coarse_idx]
+
     # Get input array
     # Convert BFloat16 to Float32 before numpy conversion
     if input_volume.dtype == torch.bfloat16:
@@ -297,6 +326,37 @@ def save_debug(
             
             train_preds_np[t_name] = arr_np
 
+    # Prepare coarse-resolution inputs and features
+    coarse_inp_np = None
+    if coarse_input is not None:
+        coarse_np = _tensor_to_numpy(coarse_input)
+        if coarse_np is not None:
+            while coarse_np.ndim > (3 if is_2d else 4):
+                coarse_np = coarse_np[0]
+            if coarse_np.ndim > 2 and coarse_np.shape[0] == 1:
+                coarse_np = coarse_np[0]
+            coarse_inp_np = coarse_np
+
+    coarse_feature_volumes: list[tuple[str, np.ndarray]] = []
+    if coarse_features:
+        for idx, feat in enumerate(coarse_features):
+            if feat is None:
+                continue
+            feat_np = _tensor_to_numpy(feat)
+            if feat_np is None:
+                continue
+            while feat_np.ndim > (4 if not is_2d else 3):
+                feat_np = feat_np[0]
+            if not is_2d:
+                if feat_np.ndim == 4:
+                    feat_np = feat_np.mean(axis=0)
+                # keep (Z, H, W) volumes as-is for slicing
+            else:
+                if feat_np.ndim == 3:
+                    feat_np = feat_np.mean(axis=0)
+            if isinstance(feat_np, np.ndarray):
+                coarse_feature_volumes.append((f"Coarse L{idx}", feat_np))
+
     # Create visualization
     # Get actual prediction tasks (not skeleton data)
     pred_task_names = sorted(list(preds_np.keys()))
@@ -304,42 +364,66 @@ def save_debug(
     if is_2d:
         # Build image grid for 2D
         rows = []
+        ref_hw = (inp_np.shape[-2], inp_np.shape[-1])
         
         # Val row: input, targets (including skels), preds
-        val_imgs = [add_text_label(convert_slice_to_bgr(inp_np), "Val Input")]
+        val_input_bgr = convert_slice_to_bgr(inp_np)
+        val_imgs = [add_text_label(val_input_bgr, "Val Input")]
         
         # Show all targets (including skeleton data)
         for t_name in sorted(targets_np.keys()):
             gt = targets_np[t_name]
             gt_slice = gt[0] if gt.shape[0] == 1 else gt
             label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
-            val_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), label))
+            img = convert_slice_to_bgr(gt_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {}))
+            val_imgs.append(add_text_label(_resize_bgr(img, ref_hw), label))
         
         # Show predictions (only for actual model outputs)
         for t_name in pred_task_names:
             pred = preds_np[t_name]
             pred_slice = pred[0] if pred.ndim == 3 and pred.shape[0] == 1 else pred
-            val_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pred {t_name}"))
+            img = convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {}))
+            val_imgs.append(add_text_label(_resize_bgr(img, ref_hw), f"Pred {t_name}"))
         
         rows.append(np.hstack(val_imgs))
+
+        # Coarse row if available
+        if coarse_inp_np is not None or coarse_feature_volumes:
+            coarse_imgs = []
+            if coarse_inp_np is not None:
+                coarse_slice = coarse_inp_np if coarse_inp_np.ndim <= 2 else coarse_inp_np[coarse_inp_np.shape[0] // 2]
+                img = convert_slice_to_bgr(coarse_slice)
+                coarse_imgs.append(add_text_label(_resize_bgr(img, ref_hw), "Coarse Input"))
+            for label, volume in coarse_feature_volumes:
+                if volume.ndim > 2:
+                    coarse_slice = volume[volume.shape[0] // 2]
+                else:
+                    coarse_slice = volume
+                img = convert_slice_to_bgr(coarse_slice)
+                coarse_imgs.append(add_text_label(_resize_bgr(img, ref_hw), label))
+            if coarse_imgs:
+                rows.append(np.hstack(coarse_imgs))
         
         # Train row if available
         if train_inp_np is not None:
-            train_imgs = [add_text_label(convert_slice_to_bgr(train_inp_np), "Train Input")]
+            train_input_bgr = convert_slice_to_bgr(train_inp_np)
+            train_imgs = [add_text_label(_resize_bgr(train_input_bgr, ref_hw), "Train Input")]
             
             # Show all train targets (including skeleton data)
             for t_name in sorted(train_targets_np.keys()):
                 gt = train_targets_np[t_name]
                 gt_slice = gt[0] if gt.shape[0] == 1 else gt
                 label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
-                train_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), label))
+                img = convert_slice_to_bgr(gt_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {}))
+                train_imgs.append(add_text_label(_resize_bgr(img, ref_hw), label))
             
             # Show train predictions (only for actual model outputs)
             for t_name in pred_task_names:
                 if t_name in train_preds_np:
                     pred = train_preds_np[t_name]
                     pred_slice = pred[0] if pred.ndim == 3 and pred.shape[0] == 1 else pred
-                    train_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pred {t_name}"))
+                    img = convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {}))
+                    train_imgs.append(add_text_label(_resize_bgr(img, ref_hw), f"Pred {t_name}"))
             
             rows.append(np.hstack(train_imgs))
         
@@ -366,9 +450,11 @@ def save_debug(
             
             # Get slices
             inp_slice = inp_np[z_idx] if inp_np.ndim == 3 else inp_np[:, z_idx, :, :]
+            val_input_bgr = convert_slice_to_bgr(inp_slice)
+            target_hw = val_input_bgr.shape[:2]
             
             # Val row
-            val_imgs = [add_text_label(convert_slice_to_bgr(inp_slice), "Val Input")]
+            val_imgs = [add_text_label(val_input_bgr, "Val Input")]
             
             # Show all targets (including skeleton data)
             for t_name in sorted(targets_np.keys()):
@@ -378,7 +464,8 @@ def save_debug(
                 else:
                     gt_slice = gt[:, z_idx, :, :]
                 label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
-                val_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), label))
+                img = convert_slice_to_bgr(gt_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {}))
+                val_imgs.append(add_text_label(_resize_bgr(img, target_hw), label))
             
             # Show predictions (only for actual model outputs)
             for t_name in pred_task_names:
@@ -387,17 +474,33 @@ def save_debug(
                     if pred.shape[0] == 1:
                         pred_slice = pred[0, z_idx, :, :]
                     else:
-                        pred_slice = pred[:, z_idx, :, :]
+                    pred_slice = pred[:, z_idx, :, :]
                 else:
                     pred_slice = pred[z_idx, :, :]
-                val_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pred {t_name}"))
+                img = convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {}))
+                val_imgs.append(add_text_label(_resize_bgr(img, target_hw), f"Pred {t_name}"))
             
             rows.append(np.hstack(val_imgs))
+
+            # Coarse row if available
+            if coarse_inp_np is not None or coarse_feature_volumes:
+                coarse_imgs = []
+                if coarse_inp_np is not None:
+                    coarse_slice = _select_volume_slice(coarse_inp_np, z_idx, z_dim)
+                    img = convert_slice_to_bgr(coarse_slice)
+                    coarse_imgs.append(add_text_label(_resize_bgr(img, target_hw), "Coarse Input"))
+                for label, volume in coarse_feature_volumes:
+                    coarse_slice = _select_volume_slice(volume, z_idx, z_dim)
+                    img = convert_slice_to_bgr(coarse_slice)
+                    coarse_imgs.append(add_text_label(_resize_bgr(img, target_hw), label))
+                if coarse_imgs:
+                    rows.append(np.hstack(coarse_imgs))
             
             # Train row if available
             if train_inp_np is not None:
                 train_slice = train_inp_np[z_idx] if train_inp_np.ndim == 3 else train_inp_np[:, z_idx, :, :]
-                train_imgs = [add_text_label(convert_slice_to_bgr(train_slice), "Train Input")]
+                train_input_bgr = convert_slice_to_bgr(train_slice)
+                train_imgs = [add_text_label(_resize_bgr(train_input_bgr, target_hw), "Train Input")]
                 
                 # Show all train targets (including skeleton data)
                 for t_name in sorted(train_targets_np.keys()):
@@ -407,7 +510,8 @@ def save_debug(
                     else:
                         gt_slice = gt[:, z_idx, :, :]
                     label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
-                    train_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), label))
+                    img = convert_slice_to_bgr(gt_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {}))
+                    train_imgs.append(add_text_label(_resize_bgr(img, target_hw), label))
                 
                 # Show train predictions (only for actual model outputs)
                 for t_name in pred_task_names:
@@ -420,7 +524,8 @@ def save_debug(
                                 pred_slice = pred[:, z_idx, :, :]
                         else:
                             pred_slice = pred[z_idx, :, :]
-                        train_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pred {t_name}"))
+                        img = convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {}))
+                        train_imgs.append(add_text_label(_resize_bgr(img, target_hw), f"Pred {t_name}"))
                 
                 rows.append(np.hstack(train_imgs))
             

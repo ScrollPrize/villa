@@ -1222,6 +1222,8 @@ class BaseTrainer:
         coarse_inputs = None
         if self.coarse_model is not None and "image_coarse" in data_dict:
             coarse_inputs = data_dict["image_coarse"].to(self.device)
+        coarse_inputs_cpu = None
+        coarse_features_cpu = None
 
         if use_amp:
             if self.device.type == 'cuda':
@@ -1244,8 +1246,13 @@ class BaseTrainer:
             if getattr(self.mgr, 'enable_deep_supervision', False):
                 targets_dict = self._downsample_targets_for_ds(outputs, targets_dict)
             task_losses = self._compute_validation_loss(outputs, targets_dict, loss_fns)
-        
-        return task_losses, inputs, targets_dict, outputs
+
+        if coarse_inputs is not None:
+            coarse_inputs_cpu = coarse_inputs.detach().cpu()
+        if coarse_features is not None:
+            coarse_features_cpu = [feat.detach().cpu() for feat in coarse_features]
+
+        return task_losses, inputs, targets_dict, outputs, coarse_inputs_cpu, coarse_features_cpu
 
     def _compute_validation_loss(self, outputs, targets_dict, loss_fns):
         task_losses = {}
@@ -1603,6 +1610,8 @@ class BaseTrainer:
                         num_val_iters = len(val_indices)
 
                     val_pbar = tqdm(range(num_val_iters), desc=f'Validation {epoch + 1}')
+                    coarse_debug_input = None
+                    coarse_debug_features = None
 
                     for i in val_pbar:
                         try:
@@ -1611,7 +1620,7 @@ class BaseTrainer:
                             val_dataloader_iter = iter(val_dataloader)
                             data_dict = next(val_dataloader_iter)
 
-                        task_losses, inputs, targets_dict, outputs = self._validation_step(
+                        task_losses, inputs, targets_dict, outputs, coarse_inputs_batch, coarse_features_batch = self._validation_step(
                             model=model,
                             data_dict=data_dict,
                             loss_fns=loss_fns,
@@ -1640,6 +1649,10 @@ class BaseTrainer:
                                     metric.update(pred=pred_val, gt=gt_val)
 
                         if i == 0:
+                                if coarse_inputs_batch is not None:
+                                    coarse_debug_input = coarse_inputs_batch
+                                if coarse_features_batch is not None:
+                                    coarse_debug_features = coarse_features_batch
                                 # Find first non-zero sample for debug visualization, but save even if all zeros
                                 b_idx = 0
                                 found_non_zero = False
@@ -1703,7 +1716,12 @@ class BaseTrainer:
                                         train_targets_dict=train_sample_targets,
                                         train_outputs_dict=train_sample_outputs,
                                         skeleton_dict=skeleton_dict,
-                                        train_skeleton_dict=train_skeleton_dict
+                                        train_skeleton_dict=train_skeleton_dict,
+                                        coarse_input=coarse_debug_input[b_idx:b_idx + 1] if coarse_debug_input is not None else None,
+                                        coarse_features=[
+                                            feat[b_idx:b_idx + 1] if isinstance(feat, torch.Tensor) and feat.shape[0] > 1 else feat
+                                            for feat in coarse_debug_features
+                                        ] if coarse_debug_features is not None else None
                                     )
                                     debug_gif_history.append((epoch, debug_img_path))
 
