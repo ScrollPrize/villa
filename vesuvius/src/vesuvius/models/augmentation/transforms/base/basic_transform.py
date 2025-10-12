@@ -25,6 +25,8 @@ class BasicTransform(abc.ABC):
         if data_dict.get('image') is not None:
             # Always transform images, even for unlabeled data
             data_dict['image'] = self._apply_to_image(data_dict['image'], **params)
+        if data_dict.get('image_coarse') is not None:
+            data_dict['image_coarse'] = self._apply_to_image(data_dict['image_coarse'], **params)
 
         # Skip all label transforms for unlabeled data
         if not is_unlabeled:
@@ -49,7 +51,7 @@ class BasicTransform(abc.ABC):
             # Dynamic handling for any other keys (e.g., custom targets like 'ink', 'normals')
             # Skip 'ignore_masks' as it shouldn't be transformed
             regression_keys = set(data_dict.get('regression_keys', []) or [])
-            known_keys = {'image', 'regression_target', 'segmentation', 'dist_map',
+            known_keys = {'image', 'image_coarse', 'regression_target', 'segmentation', 'dist_map',
                           'geols_labels', 'keypoints', 'bbox', 'ignore_masks', 'is_unlabeled', 'regression_keys'}
 
             for key in list(data_dict.keys()):

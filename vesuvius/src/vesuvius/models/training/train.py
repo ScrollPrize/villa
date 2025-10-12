@@ -968,6 +968,12 @@ class BaseTrainer:
             wandb.log_artifact(artifact)
 
     def _get_model_outputs(self, model, data_dict):
+        coarse_inputs = None
+        if self.coarse_model is not None and "image_coarse" in data_dict:
+            coarse_inputs = data_dict["image_coarse"].to(self.device)
+            coarse_inputs = coarse_inputs.to(dtype=data_dict["image"].dtype)
+            data_dict = {k: v for k, v in data_dict.items() if k != "image_coarse"}
+
         inputs = data_dict["image"].to(self.device)
         # Only include tensor targets; skip metadata and lists (e.g., 'regression_keys')
         targets_dict = {
@@ -977,9 +983,7 @@ class BaseTrainer:
             and hasattr(v, "to")
         }
         coarse_features = None
-        if self.coarse_model is not None and "image_coarse" in data_dict:
-            coarse_inputs = data_dict["image_coarse"].to(self.device)
-            coarse_inputs = coarse_inputs.to(dtype=inputs.dtype)
+        if coarse_inputs is not None:
             coarse_features = self._run_coarse_encoder(coarse_inputs, reference_dtype=inputs.dtype)
 
         outputs = model(inputs, coarse_features=coarse_features)
@@ -1009,12 +1013,9 @@ class BaseTrainer:
             return batched_dict
         B = batched_dict['image'].shape[0]
         out_accum = {}
-        coarse_batch = batched_dict.get('image_coarse') if isinstance(batched_dict.get('image_coarse'), torch.Tensor) else None
         for b in range(B):
             sample = {}
             for k, v in batched_dict.items():
-                if k == 'image_coarse':
-                    continue
                 if isinstance(v, torch.Tensor) and v.shape[0] == B:
                     sample[k] = v[b]
                 elif isinstance(v, (list, tuple)) and len(v) == B:
@@ -1031,8 +1032,6 @@ class BaseTrainer:
                 batched_out[k] = torch.stack(vals, dim=0)
             else:
                 batched_out[k] = vals
-        if coarse_batch is not None:
-            batched_out['image_coarse'] = coarse_batch
         return batched_out
 
     def _train_step(self, model, data_dict, loss_fns, use_amp, autocast_ctx, epoch, step, verbose=False,
