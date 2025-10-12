@@ -225,6 +225,25 @@ def save_debug(
         coarse_idx = int(round(ratio * (z_len - 1)))
         coarse_idx = max(0, min(z_len - 1, coarse_idx))
         return volume[coarse_idx]
+    
+    def _select_feature_slice(arr: np.ndarray, z_idx: int) -> np.ndarray:
+        if not isinstance(arr, np.ndarray):
+            return arr
+        if arr.ndim == 4:
+            z_len = arr.shape[1]
+            if z_len <= 0:
+                return arr[0] if arr.shape[0] > 0 else arr
+            slice_idx = min(z_idx, z_len - 1)
+            if arr.shape[0] == 1:
+                return arr[0, slice_idx, :, :]
+            return arr[:, slice_idx, :, :]
+        elif arr.ndim == 3:
+            z_len = arr.shape[0]
+            if z_len <= 0:
+                return arr[0]
+            slice_idx = min(z_idx, z_len - 1)
+            return arr[slice_idx, :, :]
+        return arr
 
     # Get input array
     # Convert BFloat16 to Float32 before numpy conversion
@@ -459,10 +478,7 @@ def save_debug(
             # Show all targets (including skeleton data)
             for t_name in sorted(targets_np.keys()):
                 gt = targets_np[t_name]
-                if gt.shape[0] == 1:
-                    gt_slice = gt[0, z_idx, :, :]
-                else:
-                    gt_slice = gt[:, z_idx, :, :]
+                gt_slice = _select_feature_slice(gt, z_idx)
                 label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
                 img = convert_slice_to_bgr(gt_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {}))
                 val_imgs.append(add_text_label(_resize_bgr(img, target_hw), label))
@@ -470,13 +486,7 @@ def save_debug(
             # Show predictions (only for actual model outputs)
             for t_name in pred_task_names:
                 pred = preds_np[t_name]
-                if pred.ndim == 4:
-                    if pred.shape[0] == 1:
-                        pred_slice = pred[0, z_idx, :, :]
-                    else:
-                        pred_slice = pred[:, z_idx, :, :]
-                else:
-                    pred_slice = pred[z_idx, :, :]
+                pred_slice = _select_feature_slice(pred, z_idx)
                 img = convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {}))
                 val_imgs.append(add_text_label(_resize_bgr(img, target_hw), f"Pred {t_name}"))
             
@@ -498,17 +508,14 @@ def save_debug(
             
             # Train row if available
             if train_inp_np is not None:
-                train_slice = train_inp_np[z_idx] if train_inp_np.ndim == 3 else train_inp_np[:, z_idx, :, :]
+                train_slice = _select_feature_slice(train_inp_np, z_idx)
                 train_input_bgr = convert_slice_to_bgr(train_slice)
                 train_imgs = [add_text_label(_resize_bgr(train_input_bgr, target_hw), "Train Input")]
                 
                 # Show all train targets (including skeleton data)
                 for t_name in sorted(train_targets_np.keys()):
                     gt = train_targets_np[t_name]
-                    if gt.shape[0] == 1:
-                        gt_slice = gt[0, z_idx, :, :]
-                    else:
-                        gt_slice = gt[:, z_idx, :, :]
+                    gt_slice = _select_feature_slice(gt, z_idx)
                     label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
                     img = convert_slice_to_bgr(gt_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {}))
                     train_imgs.append(add_text_label(_resize_bgr(img, target_hw), label))
@@ -517,13 +524,7 @@ def save_debug(
                 for t_name in pred_task_names:
                     if t_name in train_preds_np:
                         pred = train_preds_np[t_name]
-                        if pred.ndim == 4:
-                            if pred.shape[0] == 1:
-                                pred_slice = pred[0, z_idx, :, :]
-                            else:
-                                pred_slice = pred[:, z_idx, :, :]
-                        else:
-                            pred_slice = pred[z_idx, :, :]
+                        pred_slice = _select_feature_slice(pred, z_idx)
                         img = convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {}))
                         train_imgs.append(add_text_label(_resize_bgr(img, target_hw), f"Pred {t_name}"))
                 
