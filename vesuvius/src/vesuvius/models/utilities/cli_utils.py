@@ -163,6 +163,12 @@ def update_config_from_args(mgr, args):
     if dual_kwargs:
         mgr.update_config(**dual_kwargs)
 
+    if getattr(args, 'train_coarse_encoder', False):
+        mgr.train_coarse_encoder = True
+        mgr.tr_configs["train_coarse_encoder"] = True
+        if mgr.verbose:
+            print("Coarse encoder fine-tuning enabled via --train-coarse-encoder")
+
     if args.loss is not None:
         import ast
         from vesuvius.models.configuration.config_utils import configure_targets

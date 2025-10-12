@@ -2,7 +2,8 @@ import torch
 from pathlib import Path
 
 
-def load_checkpoint(checkpoint_path, model, optimizer, scheduler, mgr, device, load_weights_only=False):
+def load_checkpoint(checkpoint_path, model, optimizer, scheduler, mgr, device,
+                    load_weights_only=False, coarse_model=None):
 
     checkpoint_path = Path(checkpoint_path)
 
@@ -242,4 +243,12 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler, mgr, device, l
         )
         print("Loaded model weights only; starting new training run from epoch 1.")
     
+    if coarse_model is not None and isinstance(checkpoint, dict) and 'coarse_encoder' in checkpoint:
+        try:
+            target_encoder = getattr(coarse_model, 'shared_encoder', coarse_model)
+            target_encoder.load_state_dict(checkpoint['coarse_encoder'], strict=False)
+            print("Loaded coarse encoder state from checkpoint")
+        except Exception as exc:
+            print(f"Warning: failed to load coarse encoder from checkpoint: {exc}")
+
     return model, optimizer, scheduler, start_epoch, True

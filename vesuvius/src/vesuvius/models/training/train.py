@@ -82,6 +82,8 @@ class BaseTrainer:
 
         self.coarse_model = None
         self.dual_spacing_enabled = bool(getattr(self.mgr, 'dual_spacing_enabled', False))
+        self.train_coarse_encoder = bool(getattr(self.mgr, 'train_coarse_encoder', False))
+        self._coarse_trainable = False
 
         # --- DDP and GPU selection setup --- #
         self.is_distributed = False
@@ -183,6 +185,8 @@ class BaseTrainer:
         if not coarse_ckpt:
             if not self.is_distributed or self.rank == 0:
                 print("dual_spacing_enabled without coarse_model_ckpt; skipping coarse branch initialization.")
+                if self.train_coarse_encoder:
+                    print("Warning: --train-coarse-encoder set but no coarse checkpoint was provided; coarse branch will remain frozen.")
             self.coarse_model = None
             return
 
@@ -234,9 +238,19 @@ class BaseTrainer:
             print(f"Coarse encoder load info -> missing: {missing}; unexpected: {unexpected}")
 
         coarse_network = coarse_network.to(self.device)
-        coarse_network.eval()
-        for param in coarse_network.parameters():
-            param.requires_grad_(False)
+        trainable = bool(self.train_coarse_encoder)
+        self._coarse_trainable = trainable
+        if trainable:
+            if not self.is_distributed or self.rank == 0:
+                print("Coarse encoder fine-tuning enabled; gradients will update the coarse shared encoder.")
+                if self.is_distributed:
+                    print("Warning: coarse encoder fine-tuning is not wrapped in DDP; gradients will update per-rank independently.")
+            for param in coarse_network.parameters():
+                param.requires_grad_(True)
+        else:
+            coarse_network.eval()
+            for param in coarse_network.parameters():
+                param.requires_grad_(False)
 
         fine_patch_voxels = np.asarray(self.mgr.train_patch_size, dtype=int)
         dims = fine_patch_voxels.size
@@ -338,6 +352,14 @@ class BaseTrainer:
 
         model.configure_coarse_fusion(coarse_network.shared_encoder.output_channels)
         self.coarse_model = coarse_network
+
+    def _set_coarse_model_mode(self, is_training: bool):
+        if self.coarse_model is None:
+            return
+        if self._coarse_trainable:
+            self.coarse_model.train(is_training)
+        else:
+            self.coarse_model.eval()
 
     # --- configure dataset --- #
     def _configure_dataset(self, is_training=True):
@@ -671,7 +693,13 @@ class BaseTrainer:
             'weight_decay': self.mgr.weight_decay
         }
 
-        return create_optimizer(optimizer_config, model)
+        params = None
+        if self.coarse_model is not None and self._coarse_trainable:
+            params = list(model.parameters())
+            params.extend(
+                param for param in self.coarse_model.shared_encoder.parameters() if param.requires_grad
+            )
+        return create_optimizer(optimizer_config, model, params=params)
 
     # --- scheduler --- #
     def _get_scheduler(self, optimizer):
@@ -980,7 +1008,8 @@ class BaseTrainer:
                 scheduler=scheduler,
                 mgr=self.mgr,
                 device=self.device,
-                load_weights_only=getattr(self.mgr, 'load_weights_only', False)
+                load_weights_only=getattr(self.mgr, 'load_weights_only', False),
+                coarse_model=self.coarse_model
             )
 
             if checkpoint_loaded and self.mgr.load_weights_only:
@@ -1141,7 +1170,9 @@ class BaseTrainer:
     def _run_coarse_encoder(self, coarse_inputs, reference_dtype: torch.dtype, patch_info=None, fine_shape=None):
         if self.coarse_model is None:
             return None
-        with torch.no_grad():
+        grad_enabled = self._coarse_trainable and torch.is_grad_enabled()
+        context = nullcontext() if grad_enabled else torch.no_grad()
+        with context:
             coarse_feats = self.coarse_model.shared_encoder(coarse_inputs)
         if patch_info is not None and fine_shape is not None:
             try:
@@ -1153,10 +1184,12 @@ class BaseTrainer:
                 )
             except Exception as exc:
                 print(f"Warning: failed to align coarse features with fine patch: {exc}")
-        return [
-            feat.detach().to(device=self.device, dtype=reference_dtype)
-            for feat in coarse_feats
-        ]
+        processed_feats = []
+        for feat in coarse_feats:
+            tensor = feat if grad_enabled else feat.detach()
+            tensor = tensor.to(device=self.device, dtype=reference_dtype)
+            processed_feats.append(tensor)
+        return processed_feats
 
     def _align_coarse_features_to_fine(self, *, coarse_inputs, coarse_feats, patch_info, fine_shape):
         if coarse_inputs.dim() < 3:
@@ -1562,6 +1595,13 @@ class BaseTrainer:
             f"{self.mgr.model_name}_epoch{epoch + 1}.pth"
         )
 
+        additional_data = None
+        if self.coarse_model is not None and self._coarse_trainable:
+            encoder_state = self.coarse_model.shared_encoder.state_dict()
+            additional_data = {
+                'coarse_encoder': {k: v.detach().cpu() for k, v in encoder_state.items()}
+            }
+
         checkpoint_data = save_checkpoint(
             model=model,
             optimizer=optimizer,
@@ -1569,7 +1609,8 @@ class BaseTrainer:
             epoch=epoch,
             checkpoint_path=ckpt_path,
             model_config=getattr(model, 'final_config', None),
-            train_dataset=train_dataset
+            train_dataset=train_dataset,
+            additional_data=additional_data
         )
 
         checkpoint_history.append((epoch, ckpt_path))
@@ -1703,6 +1744,7 @@ class BaseTrainer:
             )
 
             model.train()
+            self._set_coarse_model_mode(is_training=True)
 
             if getattr(self.mgr, 'max_steps_per_epoch', None) is not None and self.mgr.max_steps_per_epoch > 0:
                 num_iters = min(len(train_dataloader), self.mgr.max_steps_per_epoch)
@@ -1857,6 +1899,7 @@ class BaseTrainer:
                 # For MAE training, don't set to eval mode to keep patch dropping active
                 if not hasattr(self, '_is_mae_training'):
                     model.eval()
+                self._set_coarse_model_mode(is_training=False)
                 with torch.no_grad():
                     val_losses = {t_name: [] for t_name in self.mgr.targets}
                     debug_preview_image = None
@@ -2195,6 +2238,8 @@ def main():
     grp_model.add_argument("--dual-resample-mode", type=str,
                            choices=["bilinear", "trilinear", "nearest", "area", "avg", "bspline"],
                            help="Interpolation mode when resampling patches for the coarse model.")
+    grp_model.add_argument("--train-coarse-encoder", action="store_true",
+                           help="Fine-tune the coarse encoder along with the fine model when dual spacing is enabled.")
 
     # Training Control
     grp_train.add_argument("--max-epoch", type=int, default=1000,
