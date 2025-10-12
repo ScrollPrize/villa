@@ -996,7 +996,7 @@ class BaseTrainer:
         return total_loss, task_losses, inputs, targets_dict, outputs, optimizer_stepped
 
     def _compute_train_loss(self, outputs, targets_dict, loss_fns):
-        total_loss = 0.0
+        total_loss = None
         task_losses = {}
 
         for t_name, t_gt in targets_dict.items():
@@ -1012,7 +1012,7 @@ class BaseTrainer:
             else:
                 ref_tensor = t_pred
 
-            task_total_loss = torch.zeros((), device=ref_tensor.device, dtype=ref_tensor.dtype)
+            task_total_loss = None
             for loss_fn, loss_weight in task_loss_fns:
                 pred_for_loss, gt_for_loss = t_pred, t_gt
                 if isinstance(t_pred, (list, tuple)) and not isinstance(loss_fn, DeepSupervisionWrapper):
@@ -1028,11 +1028,22 @@ class BaseTrainer:
                     targets_dict=targets_dict,
                     outputs=outputs,
                 )
-                task_total_loss += loss_weight * loss_value
+                if not isinstance(loss_value, torch.Tensor):
+                    loss_value = torch.as_tensor(loss_value, device=ref_tensor.device)
+                loss_value = loss_value.to(torch.float32)
+                weighted_component = loss_weight * loss_value
+                task_total_loss = weighted_component if task_total_loss is None else task_total_loss + weighted_component
 
+            if task_total_loss is None:
+                continue
+
+            task_total_loss = task_total_loss.to(torch.float32)
             weighted_loss = task_weight * task_total_loss
-            total_loss += weighted_loss
+            total_loss = weighted_loss if total_loss is None else total_loss + weighted_loss
             task_losses[t_name] = weighted_loss.detach().cpu().item()
+
+        if total_loss is None:
+            total_loss = torch.zeros((), device=self.device, dtype=torch.float32)
 
         return total_loss, task_losses
 
