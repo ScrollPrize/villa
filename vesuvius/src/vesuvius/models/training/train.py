@@ -1074,6 +1074,7 @@ class BaseTrainer:
 
     def _get_model_outputs(self, model, data_dict):
         coarse_inputs = None
+        patch_info = data_dict.get("patch_info", None)
         if self.coarse_model is not None and "image_coarse" in data_dict:
             coarse_inputs = data_dict["image_coarse"].to(self.device)
             coarse_inputs = self._maybe_resize_coarse_input(coarse_inputs)
@@ -1090,7 +1091,12 @@ class BaseTrainer:
         }
         coarse_features = None
         if coarse_inputs is not None:
-            coarse_features = self._run_coarse_encoder(coarse_inputs, reference_dtype=inputs.dtype)
+            coarse_features = self._run_coarse_encoder(
+                coarse_inputs,
+                reference_dtype=inputs.dtype,
+                patch_info=patch_info,
+                fine_shape=tuple(inputs.shape[2:])
+            )
 
         outputs = model(inputs, coarse_features=coarse_features)
 
@@ -1132,15 +1138,190 @@ class BaseTrainer:
         )
         return resized
 
-    def _run_coarse_encoder(self, coarse_inputs, reference_dtype: torch.dtype):
+    def _run_coarse_encoder(self, coarse_inputs, reference_dtype: torch.dtype, patch_info=None, fine_shape=None):
         if self.coarse_model is None:
             return None
         with torch.no_grad():
             coarse_feats = self.coarse_model.shared_encoder(coarse_inputs)
+        if patch_info is not None and fine_shape is not None:
+            try:
+                coarse_feats = self._align_coarse_features_to_fine(
+                    coarse_inputs=coarse_inputs,
+                    coarse_feats=coarse_feats,
+                    patch_info=patch_info,
+                    fine_shape=fine_shape,
+                )
+            except Exception as exc:
+                print(f"Warning: failed to align coarse features with fine patch: {exc}")
         return [
             feat.detach().to(device=self.device, dtype=reference_dtype)
             for feat in coarse_feats
         ]
+
+    def _align_coarse_features_to_fine(self, *, coarse_inputs, coarse_feats, patch_info, fine_shape):
+        if coarse_inputs.dim() < 3:
+            return coarse_feats
+
+        batch_size = coarse_inputs.shape[0]
+        patch_info_list = self._normalize_patch_info_list(patch_info, batch_size)
+        if not patch_info_list:
+            return coarse_feats
+
+        base_shape = np.array(coarse_inputs.shape[2:], dtype=np.int64)
+        dims = base_shape.shape[0]
+        fine_shape_arr = np.asarray(fine_shape[-dims:], dtype=np.float32)
+
+        starts = []
+        ends = []
+        target_size = None
+
+        for meta in patch_info_list:
+            if not isinstance(meta, dict):
+                continue
+            coarse_start = np.asarray(meta.get('coarse_window_start_fine', [0] * dims), dtype=np.float32)
+            coarse_size = np.asarray(meta.get('coarse_window_size_fine', fine_shape_arr), dtype=np.float32)
+            fine_start = np.asarray(meta.get('global_position', [0] * dims), dtype=np.float32)
+            fine_size = np.asarray(meta.get('patch_size', fine_shape_arr), dtype=np.float32)
+
+            denom = np.maximum(coarse_size, 1e-6)
+            size_factor = base_shape.astype(np.float32) / denom
+            start = (fine_start - coarse_start) * size_factor
+            end = start + fine_size * size_factor
+
+            start = np.floor(start).astype(np.int64)
+            end = np.ceil(end).astype(np.int64)
+
+            start = np.clip(start, 0, base_shape - 1)
+            end = np.clip(end, 1, base_shape)
+            end = np.maximum(end, start + 1)
+
+            size = end - start
+            if target_size is None:
+                target_size = size
+            else:
+                target_size = np.maximum(target_size, size)
+
+            starts.append(start)
+            ends.append(end)
+
+        if not starts or target_size is None:
+            return coarse_feats
+
+        adjusted_bounds = []
+        for start, end in zip(starts, ends):
+            size = end - start
+            diff = target_size - size
+            if np.any(diff > 0):
+                shift = diff // 2
+                start = start - shift
+                end = start + target_size
+                start = np.clip(start, 0, base_shape - target_size)
+                end = start + target_size
+            adjusted_bounds.append((start, end))
+
+        aligned_feats = []
+        base_shape_float = base_shape.astype(np.float32)
+
+        for feat in coarse_feats:
+            if feat.dim() < 3 + 1:
+                aligned_feats.append(feat)
+                continue
+            spatial_shape = np.array(feat.shape[2:], dtype=np.int64)
+            spatial_shape_float = spatial_shape.astype(np.float32)
+            scale = spatial_shape_float / base_shape_float
+
+            per_sample = []
+            target_spatial = None
+
+            for b_idx, (start, end) in enumerate(adjusted_bounds):
+                start_scaled = np.floor(start * scale).astype(np.int64)
+                end_scaled = np.ceil(end * scale).astype(np.int64)
+
+                start_scaled = np.clip(start_scaled, 0, spatial_shape - 1)
+                end_scaled = np.clip(end_scaled, 1, spatial_shape)
+                end_scaled = np.maximum(end_scaled, start_scaled + 1)
+
+                slices = tuple(slice(int(s), int(e)) for s, e in zip(start_scaled, end_scaled))
+                sample = feat[b_idx:b_idx + 1, :, *slices]
+
+                sample_shape = np.array([s.stop - s.start for s in slices], dtype=np.int64)
+                if target_spatial is None:
+                    target_spatial = sample_shape
+                else:
+                    target_spatial = np.maximum(target_spatial, sample_shape)
+
+                per_sample.append(sample)
+
+            if target_spatial is None:
+                aligned_feats.append(feat)
+                continue
+
+            padded_samples = []
+            for sample in per_sample:
+                pads = []
+                for dim in reversed(range(target_spatial.shape[0])):
+                    current = sample.shape[2 + dim]
+                    target = int(target_spatial[dim])
+                    pad_amt = max(target - current, 0)
+                    pads.extend([0, pad_amt])
+                if any(pads):
+                    sample = F.pad(sample, pads, mode='constant', value=0.0)
+                padded_samples.append(sample)
+
+            aligned_feats.append(torch.cat(padded_samples, dim=0))
+
+        return aligned_feats
+
+    def _normalize_patch_info_list(self, patch_info, batch_size: int):
+        if patch_info is None:
+            return None
+
+        if isinstance(patch_info, dict):
+            # Detect dict of sequences (default PyTorch collate output)
+            values = list(patch_info.values())
+            if not values:
+                return None
+            # If values are tensors or sequences, construct per-sample dicts
+            if any(isinstance(v, torch.Tensor) or isinstance(v, np.ndarray) or isinstance(v, (list, tuple)) for v in values):
+                per_sample = []
+                for idx in range(batch_size):
+                    entry = {}
+                    for key, value in patch_info.items():
+                        if isinstance(value, torch.Tensor):
+                            item = value[idx]
+                            if item.ndim == 0:
+                                entry[key] = item.item()
+                            else:
+                                entry[key] = item.detach().cpu().tolist()
+                        elif isinstance(value, (list, tuple)) and value and all(isinstance(v, torch.Tensor) for v in value):
+                            extracted = []
+                            for v in value:
+                                elem = v[idx]
+                                if elem.ndim == 0:
+                                    extracted.append(elem.item())
+                                else:
+                                    extracted.append(elem.detach().cpu().tolist())
+                            entry[key] = extracted
+                        elif isinstance(value, np.ndarray):
+                            entry[key] = value[idx].tolist()
+                        elif isinstance(value, (list, tuple)):
+                            entry[key] = value[idx]
+                        else:
+                            entry[key] = value
+                    per_sample.append(entry)
+                return per_sample
+            return [patch_info]
+
+        if isinstance(patch_info, (list, tuple)):
+            if len(patch_info) == batch_size and all(isinstance(p, dict) for p in patch_info):
+                return [dict(p) for p in patch_info]
+            if len(patch_info) == 1 and isinstance(patch_info[0], dict):
+                return [dict(patch_info[0]) for _ in range(batch_size)]
+
+        if isinstance(patch_info, dict) and all(isinstance(v, dict) for v in patch_info.values()):
+            return [patch_info]
+
+        return None
 
     def _apply_transforms_per_sample(self, tfm, batched_dict):
         """Apply a ComposeTransforms pipeline to each sample in a batched dict.
@@ -1294,6 +1475,7 @@ class BaseTrainer:
             and hasattr(v, "to")
         }
         coarse_inputs = None
+        patch_info = data_dict.get("patch_info", None)
         if self.coarse_model is not None and "image_coarse" in data_dict:
             coarse_inputs = data_dict["image_coarse"].to(self.device)
             coarse_inputs = self._maybe_resize_coarse_input(coarse_inputs)
@@ -1316,7 +1498,12 @@ class BaseTrainer:
             coarse_features = None
             if coarse_inputs is not None:
                 coarse_inputs_cast = coarse_inputs.to(dtype=inputs.dtype)
-                coarse_features = self._run_coarse_encoder(coarse_inputs_cast, reference_dtype=inputs.dtype)
+                coarse_features = self._run_coarse_encoder(
+                    coarse_inputs_cast,
+                    reference_dtype=inputs.dtype,
+                    patch_info=patch_info,
+                    fine_shape=tuple(inputs.shape[2:])
+                )
             outputs = model(inputs, coarse_features=coarse_features)
             if getattr(self.mgr, 'enable_deep_supervision', False):
                 targets_dict = self._downsample_targets_for_ds(outputs, targets_dict)
