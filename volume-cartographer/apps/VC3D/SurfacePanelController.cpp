@@ -580,6 +580,13 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
 
     contextMenu.addSeparator();
 
+    QAction* exportChunksAction = contextMenu.addAction(tr("Export width-chunks (40k px)"));
+    connect(exportChunksAction, &QAction::triggered, this, [this, segmentId]() {
+        emit exportTifxyzChunksRequested(segmentId);
+    });
+
+    contextMenu.addSeparator();
+
     QAction* inpaintTeleaAction = contextMenu.addAction(tr("Inpaint (Telea) && Rebuild Segment"));
     connect(inpaintTeleaAction, &QAction::triggered, this, [this]() {
         emit teleaInpaintRequested();

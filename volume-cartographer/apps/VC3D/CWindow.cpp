@@ -1072,6 +1072,11 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 onAWSUpload(segmentId.toStdString());
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::exportTifxyzChunksRequested,
+        this, [this](const QString& segmentId) {
+            onExportWidthChunks(segmentId.toStdString());
+        });
+
     connect(_surfacePanel.get(), &SurfacePanelController::growSeedsRequested,
             this, [this](const QString& segmentId, bool isExpand, bool isRandomSeed) {
                 onGrowSeeds(segmentId.toStdString(), isExpand, isRandomSeed);

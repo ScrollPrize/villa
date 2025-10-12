@@ -319,7 +319,7 @@ auto VolumePkg::getAvailableSegmentationDirectories() const -> std::vector<std::
     std::vector<std::string> dirs;
     
     // Check for common segmentation directories
-    const std::vector<std::string> commonDirs = {"paths", "traces"};
+    const std::vector<std::string> commonDirs = {"paths", "traces", "export"};
     for (const auto& dir : commonDirs) {
         if (std::filesystem::exists(rootDir_ / dir) && std::filesystem::is_directory(rootDir_ / dir)) {
             dirs.push_back(dir);

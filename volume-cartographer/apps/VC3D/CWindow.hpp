@@ -86,6 +86,7 @@ public slots:
     void onConvertToObj(const std::string& segmentId);
     void onSlimFlatten(const std::string& segmentId);
     void onAWSUpload(const std::string& segmentId);
+    void onExportWidthChunks(const std::string& segmentId);
     void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
     void onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                    SegmentationGrowthDirection direction,
