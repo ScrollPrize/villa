@@ -81,6 +81,7 @@ class ConfigManager:
         self.compute_loss_on_labeled_only = bool(self.tr_info.get("compute_loss_on_labeled_only", False))
         self.wandb_project = self.tr_info.get("wandb_project", None)
         self.wandb_entity = self.tr_info.get("wandb_entity", None)
+        self.wandb_run_name = self.tr_info.get("wandb_run_name", None)
 
         ckpt_out_base = self.tr_info.get("ckpt_out_base", "./checkpoints/")
         self.ckpt_out_base = Path(ckpt_out_base)
@@ -128,6 +129,18 @@ class ConfigManager:
         # its a bit of a waste of computation when considering the downsampled zarr patches are quite fast to check
         self.skip_bounding_box = bool(self.dataset_config.get("skip_bounding_box", True))
         self.cache_valid_patches = bool(self.dataset_config.get("cache_valid_patches", True))
+
+        self.fine_spacing_um = self.dataset_config.get("fine_spacing_um", None)
+        self.dual_spacing_resample_mode = self.dataset_config.get("dual_spacing_resample_mode", "trilinear")
+
+        self.dual_spacing_enabled = bool(self.model_config.get("dual_spacing_enabled", False))
+        self.coarse_model_ckpt = self.model_config.get("coarse_model_ckpt", None)
+        self.coarse_spacing_um = self.model_config.get("coarse_spacing_um", None)
+        coarse_patch_cfg = self.model_config.get("coarse_patch_size", None)
+        if isinstance(coarse_patch_cfg, (list, tuple)):
+            self.coarse_patch_size = tuple(int(v) for v in coarse_patch_cfg)
+        else:
+            self.coarse_patch_size = coarse_patch_cfg
 
         rotation_axes_cfg = self.dataset_config.get("rotation_axes", None)
         axis_name_to_index = {
@@ -778,7 +791,13 @@ class ConfigManager:
                      skip_patch_validation=None,
                      normalization_scheme=None, intensity_properties=None,
                      min_bbox_percent=None,
-                     skip_bounding_box=None):
+                     skip_bounding_box=None,
+                     dual_spacing_enabled=None,
+                     coarse_model_ckpt=None,
+                     coarse_spacing_um=None,
+                     coarse_patch_size=None,
+                     fine_spacing_um=None,
+                     dual_spacing_resample_mode=None):
         if patch_size is not None:
             if isinstance(patch_size, (list, tuple)) and len(patch_size) >= 2:
                 self.train_patch_size = tuple(patch_size)
@@ -853,6 +872,46 @@ class ConfigManager:
             self.dataset_config["skip_bounding_box"] = self.skip_bounding_box
             if self.verbose:
                 print(f"Updated skip_bounding_box: {self.skip_bounding_box}")
+
+        if dual_spacing_enabled is not None:
+            self.dual_spacing_enabled = bool(dual_spacing_enabled)
+            self.model_config["dual_spacing_enabled"] = self.dual_spacing_enabled
+            if self.verbose:
+                print(f"Dual spacing enabled: {self.dual_spacing_enabled}")
+
+        if coarse_model_ckpt is not None:
+            self.coarse_model_ckpt = str(coarse_model_ckpt)
+            self.model_config["coarse_model_ckpt"] = self.coarse_model_ckpt
+            if self.verbose:
+                print(f"Coarse model checkpoint: {self.coarse_model_ckpt}")
+
+        if coarse_spacing_um is not None:
+            self.coarse_spacing_um = coarse_spacing_um
+            self.model_config["coarse_spacing_um"] = self.coarse_spacing_um
+            if self.verbose:
+                print(f"Coarse spacing (um): {self.coarse_spacing_um}")
+
+        if coarse_patch_size is not None:
+            if isinstance(coarse_patch_size, (list, tuple)):
+                self.coarse_patch_size = tuple(int(v) for v in coarse_patch_size)
+                self.model_config["coarse_patch_size"] = list(self.coarse_patch_size)
+            else:
+                self.coarse_patch_size = coarse_patch_size
+                self.model_config["coarse_patch_size"] = self.coarse_patch_size
+            if self.verbose:
+                print(f"Coarse patch size: {self.coarse_patch_size}")
+
+        if fine_spacing_um is not None:
+            self.fine_spacing_um = fine_spacing_um
+            self.dataset_config["fine_spacing_um"] = self.fine_spacing_um
+            if self.verbose:
+                print(f"Fine spacing (um): {self.fine_spacing_um}")
+
+        if dual_spacing_resample_mode is not None:
+            self.dual_spacing_resample_mode = str(dual_spacing_resample_mode)
+            self.dataset_config["dual_spacing_resample_mode"] = self.dual_spacing_resample_mode
+            if self.verbose:
+                print(f"Dual spacing resample mode: {self.dual_spacing_resample_mode}")
 
     def _apply_auxiliary_tasks(self):
         """

@@ -1,8 +1,9 @@
 # Dataset exports
 from .base_dataset import BaseDataset
 from .orchestrator import DatasetOrchestrator
+from .multi_spacing_dataset import MultiSpacingDataset
 
-__all__ = ["BaseDataset", "DatasetOrchestrator"]
+__all__ = ["BaseDataset", "DatasetOrchestrator", "MultiSpacingDataset"]
 
 
 _LEGACY_DATASETS = {

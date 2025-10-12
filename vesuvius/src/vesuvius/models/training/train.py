@@ -11,6 +11,7 @@ if __name__ == '__main__' and len(sys.argv) > 1:
             pass
 
 from pathlib import Path
+from copy import deepcopy
 import os
 from datetime import datetime
 from tqdm import tqdm
@@ -23,7 +24,7 @@ from vesuvius.models.training.lr_schedulers import get_scheduler, PolyLRSchedule
 from torch.utils.data import DataLoader, SubsetRandomSampler, Subset, WeightedRandomSampler
 from torch.utils.data.distributed import DistributedSampler
 from vesuvius.models.utils import InitWeights_He
-from vesuvius.models.datasets import DatasetOrchestrator
+from vesuvius.models.datasets import DatasetOrchestrator, MultiSpacingDataset
 from vesuvius.utils.plotting import save_debug
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 
@@ -78,6 +79,9 @@ class BaseTrainer:
         else:
             from vesuvius.models.configuration.config_manager import ConfigManager
             self.mgr = ConfigManager(verbose)
+
+        self.coarse_model = None
+        self.dual_spacing_enabled = bool(getattr(self.mgr, 'dual_spacing_enabled', False))
 
         # --- DDP and GPU selection setup --- #
         self.is_distributed = False
@@ -166,7 +170,73 @@ class BaseTrainer:
             }
 
         model = NetworkFromConfig(self.mgr)
+        self._initialize_coarse_branch(model)
         return model
+
+    def _initialize_coarse_branch(self, model):
+        """Load and configure the optional coarse-resolution encoder branch."""
+        if not self.dual_spacing_enabled:
+            self.coarse_model = None
+            return
+
+        coarse_ckpt = getattr(self.mgr, 'coarse_model_ckpt', None)
+        if not coarse_ckpt:
+            if not self.is_distributed or self.rank == 0:
+                print("dual_spacing_enabled without coarse_model_ckpt; skipping coarse branch initialization.")
+            self.coarse_model = None
+            return
+
+        coarse_ckpt_path = Path(coarse_ckpt)
+        if not coarse_ckpt_path.exists():
+            raise FileNotFoundError(f"Coarse model checkpoint not found: {coarse_ckpt_path}")
+
+        if not self.is_distributed or self.rank == 0:
+            print(f"Loading coarse encoder from checkpoint: {coarse_ckpt_path}")
+
+        try:
+            checkpoint = torch.load(coarse_ckpt_path, map_location='cpu', weights_only=False)
+        except TypeError:  # Older Torch versions without weights_only
+            checkpoint = torch.load(coarse_ckpt_path, map_location='cpu')
+        coarse_mgr = deepcopy(self.mgr)
+        checkpoint_model_config = checkpoint.get('model_config')
+        if checkpoint_model_config is not None:
+            coarse_mgr.model_config = checkpoint_model_config
+            if 'train_patch_size' in checkpoint_model_config:
+                coarse_mgr.train_patch_size = tuple(checkpoint_model_config['train_patch_size'])
+        else:
+            if not self.is_distributed or self.rank == 0:
+                print("Warning: coarse checkpoint is missing 'model_config'; using current manager configuration.")
+
+        coarse_network = NetworkFromConfig(coarse_mgr)
+        state_dict = checkpoint.get('model', checkpoint)
+        encoder_state = {}
+        encoder_prefixes = ("shared_encoder.", "module.shared_encoder.")
+        for key, value in state_dict.items():
+            for prefix in encoder_prefixes:
+                if key.startswith(prefix):
+                    trimmed = key[len(prefix):]
+                    encoder_state[trimmed] = value
+                    break
+
+        if not encoder_state:
+            raise RuntimeError("Coarse checkpoint does not contain shared_encoder weights.")
+
+        load_info = coarse_network.shared_encoder.load_state_dict(encoder_state, strict=False)
+        if (load_info.missing_keys or load_info.unexpected_keys) and (not self.is_distributed or self.rank == 0):
+            missing = ", ".join(load_info.missing_keys) if load_info.missing_keys else "none"
+            unexpected = ", ".join(load_info.unexpected_keys) if load_info.unexpected_keys else "none"
+            print(f"Coarse encoder load info -> missing: {missing}; unexpected: {unexpected}")
+
+        coarse_network = coarse_network.to(self.device)
+        coarse_network.eval()
+        for param in coarse_network.parameters():
+            param.requires_grad_(False)
+
+        if getattr(self.mgr, 'coarse_patch_size', None) is None:
+            self.mgr.update_config(coarse_patch_size=list(coarse_mgr.train_patch_size))
+
+        model.configure_coarse_fusion(coarse_network.shared_encoder.output_channels)
+        self.coarse_model = coarse_network
 
     # --- configure dataset --- #
     def _configure_dataset(self, is_training=True):
@@ -197,7 +267,9 @@ class BaseTrainer:
         if adapter_name == 'napari' and hasattr(mgr, 'napari_viewer'):
             adapter_kwargs['viewer'] = mgr.napari_viewer
 
-        return DatasetOrchestrator(
+        dataset_cls = MultiSpacingDataset if getattr(mgr, 'dual_spacing_enabled', False) else DatasetOrchestrator
+
+        return dataset_cls(
             mgr=mgr,
             adapter=adapter_name,
             adapter_kwargs=adapter_kwargs,
@@ -876,13 +948,19 @@ class BaseTrainer:
             mgr_config['train_val_splits_file'] = splits_filepath
             mgr_config['train_patch_count'] = len(train_indices)
             mgr_config['val_patch_count'] = len(val_indices)
+            if self.mgr.wandb_run_name:
+                mgr_config['wandb_run_name'] = self.mgr.wandb_run_name
 
-            wandb.init(
-                entity=self.mgr.wandb_entity,
-                project=self.mgr.wandb_project,
-                group=self.mgr.model_name,
-                config=mgr_config
-            )
+            init_kwargs = {
+                "entity": self.mgr.wandb_entity,
+                "project": self.mgr.wandb_project,
+                "group": self.mgr.model_name,
+                "config": mgr_config,
+            }
+            if self.mgr.wandb_run_name:
+                init_kwargs["name"] = self.mgr.wandb_run_name
+
+            wandb.init(**init_kwargs)
             
             # Log the splits file as an artifact for reference
             artifact = wandb.Artifact(f"train_val_splits_{timestamp}", type="dataset")
@@ -895,17 +973,32 @@ class BaseTrainer:
         targets_dict = {
             k: v.to(self.device)
             for k, v in data_dict.items()
-            if k not in ["image", "patch_info", "is_unlabeled", "regression_keys"]
+            if k not in ["image", "image_coarse", "patch_info", "is_unlabeled", "regression_keys"]
             and hasattr(v, "to")
         }
-        
-        outputs = model(inputs)
+        coarse_features = None
+        if self.coarse_model is not None and "image_coarse" in data_dict:
+            coarse_inputs = data_dict["image_coarse"].to(self.device)
+            coarse_inputs = coarse_inputs.to(dtype=inputs.dtype)
+            coarse_features = self._run_coarse_encoder(coarse_inputs, reference_dtype=inputs.dtype)
+
+        outputs = model(inputs, coarse_features=coarse_features)
 
         # If deep supervision is enabled, prepare lists of downsampled targets
         if getattr(self.mgr, 'enable_deep_supervision', False):
             targets_dict = self._downsample_targets_for_ds(outputs, targets_dict)
         
         return inputs, targets_dict, outputs
+
+    def _run_coarse_encoder(self, coarse_inputs, reference_dtype: torch.dtype):
+        if self.coarse_model is None:
+            return None
+        with torch.no_grad():
+            coarse_feats = self.coarse_model.shared_encoder(coarse_inputs)
+        return [
+            feat.detach().to(device=self.device, dtype=reference_dtype)
+            for feat in coarse_feats
+        ]
 
     def _apply_transforms_per_sample(self, tfm, batched_dict):
         """Apply a ComposeTransforms pipeline to each sample in a batched dict.
@@ -916,9 +1009,12 @@ class BaseTrainer:
             return batched_dict
         B = batched_dict['image'].shape[0]
         out_accum = {}
+        coarse_batch = batched_dict.get('image_coarse') if isinstance(batched_dict.get('image_coarse'), torch.Tensor) else None
         for b in range(B):
             sample = {}
             for k, v in batched_dict.items():
+                if k == 'image_coarse':
+                    continue
                 if isinstance(v, torch.Tensor) and v.shape[0] == B:
                     sample[k] = v[b]
                 elif isinstance(v, (list, tuple)) and len(v) == B:
@@ -935,6 +1031,8 @@ class BaseTrainer:
                 batched_out[k] = torch.stack(vals, dim=0)
             else:
                 batched_out[k] = vals
+        if coarse_batch is not None:
+            batched_out['image_coarse'] = coarse_batch
         return batched_out
 
     def _train_step(self, model, data_dict, loss_fns, use_amp, autocast_ctx, epoch, step, verbose=False,
@@ -1055,9 +1153,12 @@ class BaseTrainer:
         targets_dict = {
             k: v.to(self.device)
             for k, v in data_dict.items()
-            if k not in ["image", "patch_info", "is_unlabeled", "regression_keys"]
+            if k not in ["image", "image_coarse", "patch_info", "is_unlabeled", "regression_keys"]
             and hasattr(v, "to")
         }
+        coarse_inputs = None
+        if self.coarse_model is not None and "image_coarse" in data_dict:
+            coarse_inputs = data_dict["image_coarse"].to(self.device)
 
         if use_amp:
             if self.device.type == 'cuda':
@@ -1072,7 +1173,11 @@ class BaseTrainer:
             context = nullcontext()
 
         with context:
-            outputs = model(inputs)
+            coarse_features = None
+            if coarse_inputs is not None:
+                coarse_inputs_cast = coarse_inputs.to(dtype=inputs.dtype)
+                coarse_features = self._run_coarse_encoder(coarse_inputs_cast, reference_dtype=inputs.dtype)
+            outputs = model(inputs, coarse_features=coarse_features)
             if getattr(self.mgr, 'enable_deep_supervision', False):
                 targets_dict = self._downsample_targets_for_ds(outputs, targets_dict)
             task_losses = self._compute_validation_loss(outputs, targets_dict, loss_fns)
@@ -1722,6 +1827,8 @@ def main():
                           help="Disable spatial/geometric augmentations")
     grp_data.add_argument("--rotation-axes", type=str,
                           help="Comma-separated axes (subset of x,y,z / width,height,depth) that may be rotated; e.g. 'z' keeps the depth axis upright")
+    grp_data.add_argument("--fine-spacing", type=str,
+                          help="Comma-separated voxel spacing (µm) for the fine-resolution dataset, e.g. '2,2,2'.")
 
     # Model
     grp_model.add_argument("--model-name", type=str,
@@ -1733,6 +1840,17 @@ def main():
                            help="Squeeze excitation reduction ratio")
     grp_model.add_argument("--pool-type", type=str, choices=["avg", "max", "conv"],
                            help="Type of pooling in encoder ('conv' = strided conv)")
+    grp_model.add_argument("--enable-dual-spacing", action="store_true",
+                           help="Enable optional coarse-to-fine dual spacing pipeline.")
+    grp_model.add_argument("--coarse-model", type=str,
+                           help="Path to a pretrained coarse-resolution model checkpoint (.pth).")
+    grp_model.add_argument("--coarse-spacing", type=str,
+                           help="Comma-separated voxel spacing (µm) for the coarse model, e.g. '9,9,9'.")
+    grp_model.add_argument("--coarse-patch-size", type=str,
+                           help="Comma-separated patch size (voxels) expected by the coarse model, e.g. '128,128,128'.")
+    grp_model.add_argument("--dual-resample-mode", type=str,
+                           choices=["bilinear", "trilinear", "nearest", "area", "avg", "bspline"],
+                           help="Interpolation mode when resampling patches for the coarse model.")
 
     # Training Control
     grp_train.add_argument("--max-epoch", type=int, default=1000,
@@ -1798,6 +1916,8 @@ def main():
                              help="Weights & Biases project (omit to disable wandb)")
     grp_logging.add_argument("--wandb-entity", type=str, default=None,
                              help="Weights & Biases team/username")
+    grp_logging.add_argument("--wandb-run-name", type=str, default=None,
+                             help="Weights & Biases run name (optional override)")
     grp_logging.add_argument("--verbose", action="store_true",
                              help="Enable verbose debug output")
 

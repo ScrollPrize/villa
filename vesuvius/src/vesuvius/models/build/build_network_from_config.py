@@ -43,7 +43,10 @@ this is inspired by the nnUNet architecture.
 https://github.com/MIC-DKFZ/nnUNet
 """
 
+from typing import Optional, Sequence
+
 import torch.nn as nn
+import torch.nn.functional as F
 from ..utilities.utils import get_pool_and_conv_props, get_n_blocks_per_stage
 from .encoder import Encoder
 from .decoder import Decoder
@@ -72,6 +75,9 @@ class NetworkFromConfig(nn.Module):
         # Get input channels from manager if available, otherwise default to 1
         self.in_channels = getattr(mgr, 'in_channels', 1)
         self.autoconfigure = mgr.autoconfigure
+        self.coarse_fusion_enabled = False
+        self.coarse_adapters: Optional[nn.ModuleList] = None
+        self._coarse_stage_offset: int = 0
 
         if hasattr(mgr, 'model_config') and mgr.model_config:
             model_config = mgr.model_config
@@ -202,6 +208,8 @@ class NetworkFromConfig(nn.Module):
             # If features_per_stage was manually specified, adjust the auto-configured values
             if manual_features is not None:
                 # Trim or extend the auto-configured lists to match the number of stages
+                pool_op_kernel_sizes = list(pool_op_kernel_sizes)
+                conv_kernel_sizes = list(conv_kernel_sizes)
                 if len(pool_op_kernel_sizes) > self.num_stages:
                     pool_op_kernel_sizes = pool_op_kernel_sizes[:self.num_stages]
                     conv_kernel_sizes = conv_kernel_sizes[:self.num_stages]
@@ -609,7 +617,46 @@ class NetworkFromConfig(nn.Module):
             return False
         return True
 
-    def forward(self, x, return_mae_mask=False):
+    def configure_coarse_fusion(self, coarse_channels: Sequence[int]) -> None:
+        """Install learnable adapters to fuse coarse encoder features with fine features."""
+        if not coarse_channels:
+            return
+
+        fine_len = len(self.shared_encoder.output_channels)
+        coarse_channels = list(coarse_channels)
+        coarse_len = len(coarse_channels)
+
+        if coarse_len < fine_len:
+            raise ValueError(
+                f"Coarse encoder produced {coarse_len} stages but fine encoder requires at least {fine_len}."
+            )
+
+        self._coarse_stage_offset = max(0, coarse_len - fine_len)
+        if self._coarse_stage_offset > 0:
+            trimmed = coarse_channels[self._coarse_stage_offset:]
+            if len(trimmed) != fine_len:
+                raise RuntimeError(
+                    "Failed to align coarse and fine encoder stages after trimming."
+                )
+            coarse_channels = trimmed
+
+        conv_cls = self.conv_op
+        adapters = []
+        for fine_ch, coarse_ch in zip(self.shared_encoder.output_channels, coarse_channels):
+            adapters.append(
+                conv_cls(
+                    int(coarse_ch),
+                    int(fine_ch),
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    bias=False,
+                )
+            )
+        self.coarse_adapters = nn.ModuleList(adapters)
+        self.coarse_fusion_enabled = True
+
+    def forward(self, x, return_mae_mask=False, coarse_features=None):
         # Check input channels and warn if mismatch
         self.check_input_channels(x)
 
@@ -643,6 +690,33 @@ class NetworkFromConfig(nn.Module):
             # Standard forward pass
             features = self.shared_encoder(x)
             restoration_mask = None
+
+        if coarse_features is not None and self.coarse_fusion_enabled and self.coarse_adapters is not None:
+            if not isinstance(coarse_features, (list, tuple)):
+                coarse_features = list(coarse_features)
+            else:
+                coarse_features = list(coarse_features)
+            if len(coarse_features) != len(features):
+                offset = getattr(self, "_coarse_stage_offset", 0)
+                if len(coarse_features) - offset == len(features):
+                    coarse_features = coarse_features[offset:]
+                else:
+                    raise ValueError(
+                        f"Coarse feature stages ({len(coarse_features)}) do not match fine encoder stages ({len(features)})."
+                    )
+            fused = []
+            for idx, (fine_feat, coarse_feat) in enumerate(zip(features, coarse_features)):
+                projected = self.coarse_adapters[idx](coarse_feat)
+                if projected.shape[2:] != fine_feat.shape[2:]:
+                    interp_mode = 'trilinear' if projected.ndim == 5 else 'bilinear'
+                    projected = F.interpolate(
+                        projected,
+                        size=fine_feat.shape[2:],
+                        mode=interp_mode,
+                        align_corners=False,
+                    )
+                fused.append(fine_feat + projected)
+            features = fused
         
         results = {}
         shared_features = None

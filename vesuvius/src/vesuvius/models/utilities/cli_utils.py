@@ -3,6 +3,15 @@ from vesuvius.models.utilities.data_format_utils import detect_data_format
 
 
 def update_config_from_args(mgr, args):
+    def _parse_numeric_list(raw_value, cast_type=float, label="value"):
+        try:
+            parts = [cast_type(x.strip()) for x in str(raw_value).split(',') if x.strip()]
+        except Exception as exc:  # pragma: no cover - defensive
+            raise ValueError(f"Unable to parse {label}: '{raw_value}'") from exc
+        if not parts:
+            raise ValueError(f"{label} must contain at least one numeric entry.")
+        return parts
+
     if args.input is not None:
         mgr.data_path = Path(args.input)
         if not hasattr(mgr, 'dataset_config'):
@@ -71,6 +80,10 @@ def update_config_from_args(mgr, args):
     if args.max_val_steps_per_epoch is not None:
         mgr.max_val_steps_per_epoch = args.max_val_steps_per_epoch
         mgr.tr_configs["max_val_steps_per_epoch"] = args.max_val_steps_per_epoch
+
+    fine_spacing_values = None
+    if getattr(args, 'fine_spacing', None):
+        fine_spacing_values = _parse_numeric_list(args.fine_spacing, float, "fine spacing")
     
     # Handle full_epoch flag - overrides max_steps_per_epoch and max_val_steps_per_epoch
     if args.full_epoch:
@@ -118,6 +131,37 @@ def update_config_from_args(mgr, args):
         mgr.tr_configs["optimizer"] = args.optimizer
         if mgr.verbose:
             print(f"Set optimizer: {mgr.optimizer}")
+
+    coarse_spacing_values = None
+    if getattr(args, 'coarse_spacing', None):
+        coarse_spacing_values = _parse_numeric_list(args.coarse_spacing, float, "coarse spacing")
+
+    coarse_patch_values = None
+    if getattr(args, 'coarse_patch_size', None):
+        coarse_patch_values = [int(x.strip()) for x in args.coarse_patch_size.split(',') if x.strip()]
+        if not coarse_patch_values:
+            raise ValueError(f"Invalid coarse patch size: '{args.coarse_patch_size}'")
+
+    dual_kwargs = {}
+    if fine_spacing_values is not None:
+        dual_kwargs['fine_spacing_um'] = fine_spacing_values
+    if getattr(args, 'coarse_model', None):
+        dual_kwargs['coarse_model_ckpt'] = args.coarse_model
+    if coarse_spacing_values is not None:
+        dual_kwargs['coarse_spacing_um'] = coarse_spacing_values
+    if coarse_patch_values is not None:
+        dual_kwargs['coarse_patch_size'] = coarse_patch_values
+    if getattr(args, 'dual_resample_mode', None):
+        dual_kwargs['dual_spacing_resample_mode'] = args.dual_resample_mode
+
+    coarse_flag = any(
+        key in dual_kwargs for key in ("coarse_model_ckpt", "coarse_spacing_um", "coarse_patch_size", "dual_spacing_resample_mode")
+    )
+    if getattr(args, 'enable_dual_spacing', False) or coarse_flag:
+        dual_kwargs['dual_spacing_enabled'] = True
+
+    if dual_kwargs:
+        mgr.update_config(**dual_kwargs)
 
     if args.loss is not None:
         import ast
@@ -326,3 +370,6 @@ def update_config_from_args(mgr, args):
 
     mgr.wandb_project = args.wandb_project
     mgr.wandb_entity = args.wandb_entity
+    if hasattr(args, "wandb_run_name") and args.wandb_run_name is not None:
+        mgr.wandb_run_name = args.wandb_run_name
+        mgr.tr_info["wandb_run_name"] = args.wandb_run_name

@@ -656,6 +656,14 @@ class BaseDataset(Dataset):
         if self.chunk_slicer is None:
             raise RuntimeError("Chunk slicer not initialized")
         chunk_result = self.chunk_slicer.extract(chunk_patch, normalizer=self.normalizer)
+        return self._build_chunk_data_dict(chunk_patch, chunk_result)
+
+    def _build_chunk_data_dict(
+        self,
+        chunk_patch: ChunkPatch,
+        chunk_result,
+    ) -> Dict[str, torch.Tensor]:
+        """Convert a ChunkResult into a dictionary of tensors."""
 
         label_patches: Dict[str, np.ndarray] = {
             name: np.asarray(array, dtype=np.float32)
