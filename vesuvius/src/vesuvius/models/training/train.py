@@ -238,30 +238,35 @@ class BaseTrainer:
         for param in coarse_network.parameters():
             param.requires_grad_(False)
 
+        fine_patch_voxels = np.asarray(self.mgr.train_patch_size, dtype=int)
+        dims = fine_patch_voxels.size
+
+        def _spacing_to_array(values, default_value):
+            if values is None:
+                if default_value is None:
+                    return None
+                return np.full(dims, float(default_value), dtype=float)
+            arr = np.asarray(values, dtype=float)
+            if arr.size == 0:
+                if default_value is None:
+                    return None
+                return np.full(dims, float(default_value), dtype=float)
+            if arr.size == 1:
+                return np.full(dims, float(arr[0]), dtype=float)
+            if arr.size != dims:
+                return None
+            return arr
+
+        fine_spacing = _spacing_to_array(getattr(self.mgr, 'fine_spacing_um', None), default_value=1.0)
+        coarse_spacing = _spacing_to_array(getattr(self.mgr, 'coarse_spacing_um', None), default_value=None)
+
         if getattr(self.mgr, 'coarse_patch_size', None) is None:
-            fine_patch = np.asarray(self.mgr.train_patch_size, dtype=float)
-            dims = fine_patch.size
-
-            def _spacing_to_array(values):
-                if values is None:
-                    return None
-                arr = np.asarray(values, dtype=float)
-                if arr.size == 0:
-                    return None
-                if arr.size == 1:
-                    return np.full(dims, float(arr[0]), dtype=float)
-                if arr.size != dims:
-                    return None
-                return arr
-
-            fine_spacing = _spacing_to_array(getattr(self.mgr, 'fine_spacing_um', None))
-            coarse_spacing = _spacing_to_array(getattr(self.mgr, 'coarse_spacing_um', None))
             derived_coarse = None
             if fine_spacing is not None and coarse_spacing is not None:
                 ratio = np.ones_like(fine_spacing, dtype=float)
                 nonzero = coarse_spacing != 0
                 ratio[nonzero] = fine_spacing[nonzero] / coarse_spacing[nonzero]
-                coarse_patch = np.maximum(1, np.round(fine_patch * ratio)).astype(int)
+                coarse_patch = np.maximum(1, np.round(fine_patch_voxels.astype(float) * ratio)).astype(int)
                 must_div = getattr(coarse_network, 'must_be_divisible_by', None)
                 if must_div is not None:
                     must_div = np.asarray(must_div, dtype=int)
@@ -294,6 +299,42 @@ class BaseTrainer:
                 if not self.is_distributed or self.rank == 0:
                     print("Falling back to coarse model patch size; could not derive coarse patch size from spacings.")
                 self.mgr.update_config(coarse_patch_size=list(coarse_mgr.train_patch_size))
+
+        coarse_patch_attr = getattr(self.mgr, 'coarse_patch_size', None)
+        coarse_patch_arr = None
+        if coarse_patch_attr is not None:
+            coarse_patch_arr = np.asarray(coarse_patch_attr, dtype=int).reshape(-1)
+            if coarse_patch_arr.size != dims:
+                if coarse_patch_arr.size > dims:
+                    coarse_patch_arr = coarse_patch_arr[-dims:]
+                else:
+                    pad = np.ones(dims, dtype=int)
+                    pad[-coarse_patch_arr.size:] = coarse_patch_arr
+                    coarse_patch_arr = pad
+        fine_spacing_vec = fine_spacing if fine_spacing is not None else np.full(dims, 1.0, dtype=float)
+
+        if not self.is_distributed or self.rank == 0:
+            def _fmt_list(arr):
+                return "[" + ", ".join(f"{float(v):.2f}" for v in arr) + "]"
+
+            def _fmt_extent(arr):
+                return " × ".join(f"{float(v):.1f}" for v in arr) + " µm"
+
+            fine_extent_um = fine_patch_voxels.astype(float) * fine_spacing_vec
+            print(
+                f"Fine patch FoV: voxels {fine_patch_voxels.tolist()} @ spacing {_fmt_list(fine_spacing_vec)} µm -> {_fmt_extent(fine_extent_um)}"
+            )
+
+            if coarse_patch_arr is not None:
+                if coarse_spacing is not None:
+                    coarse_extent_um = coarse_patch_arr.astype(float) * coarse_spacing
+                    print(
+                        f"Coarse patch FoV: voxels {coarse_patch_arr.tolist()} @ spacing {_fmt_list(coarse_spacing)} µm -> {_fmt_extent(coarse_extent_um)}"
+                    )
+                else:
+                    print(
+                        f"Coarse patch FoV: voxels {coarse_patch_arr.tolist()} (coarse spacing unspecified; physical extent not reported)"
+                    )
 
         model.configure_coarse_fusion(coarse_network.shared_encoder.output_channels)
         self.coarse_model = coarse_network
