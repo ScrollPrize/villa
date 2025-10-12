@@ -1296,6 +1296,7 @@ class BaseTrainer:
         coarse_inputs = None
         if self.coarse_model is not None and "image_coarse" in data_dict:
             coarse_inputs = data_dict["image_coarse"].to(self.device)
+            coarse_inputs = self._maybe_resize_coarse_input(coarse_inputs)
         coarse_inputs_cpu = None
         coarse_features_cpu = None
 
