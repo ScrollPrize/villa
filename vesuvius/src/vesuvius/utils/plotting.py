@@ -474,7 +474,7 @@ def save_debug(
                     if pred.shape[0] == 1:
                         pred_slice = pred[0, z_idx, :, :]
                     else:
-                    pred_slice = pred[:, z_idx, :, :]
+                        pred_slice = pred[:, z_idx, :, :]
                 else:
                     pred_slice = pred[z_idx, :, :]
                 img = convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {}))
