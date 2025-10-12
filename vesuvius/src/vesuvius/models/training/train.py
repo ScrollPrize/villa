@@ -1035,6 +1035,7 @@ class BaseTrainer:
         coarse_inputs = None
         if self.coarse_model is not None and "image_coarse" in data_dict:
             coarse_inputs = data_dict["image_coarse"].to(self.device)
+            coarse_inputs = self._maybe_resize_coarse_input(coarse_inputs)
             coarse_inputs = coarse_inputs.to(dtype=data_dict["image"].dtype)
             data_dict = {k: v for k, v in data_dict.items() if k != "image_coarse"}
 
@@ -1057,6 +1058,38 @@ class BaseTrainer:
             targets_dict = self._downsample_targets_for_ds(outputs, targets_dict)
         
         return inputs, targets_dict, outputs
+
+    def _maybe_resize_coarse_input(self, coarse_inputs: torch.Tensor) -> torch.Tensor:
+        if coarse_inputs is None:
+            return coarse_inputs
+        expected = getattr(self.mgr, 'coarse_patch_size', None)
+        if not expected:
+            return coarse_inputs
+        spatial_dims = coarse_inputs.ndim - 2
+        if spatial_dims not in (2, 3):
+            return coarse_inputs
+
+        expected_seq = list(expected) if isinstance(expected, (list, tuple)) else [expected]
+        if len(expected_seq) == spatial_dims:
+            pass
+        elif len(expected_seq) == self.mgr.op_dims:
+            expected_seq = expected_seq[-spatial_dims:]
+        else:
+            return coarse_inputs
+
+        expected_shape = tuple(int(max(1, v)) for v in expected_seq)
+        current_shape = tuple(int(v) for v in coarse_inputs.shape[2:])
+        if current_shape == expected_shape:
+            return coarse_inputs
+
+        mode = 'trilinear' if spatial_dims == 3 else 'bilinear'
+        resized = F.interpolate(
+            coarse_inputs,
+            size=expected_shape,
+            mode=mode,
+            align_corners=False,
+        )
+        return resized
 
     def _run_coarse_encoder(self, coarse_inputs, reference_dtype: torch.dtype):
         if self.coarse_model is None:
@@ -1649,81 +1682,82 @@ class BaseTrainer:
                                     metric.update(pred=pred_val, gt=gt_val)
 
                         if i == 0:
-                                if coarse_inputs_batch is not None:
-                                    coarse_debug_input = coarse_inputs_batch
-                                if coarse_features_batch is not None:
-                                    coarse_debug_features = coarse_features_batch
-                                # Find first non-zero sample for debug visualization, but save even if all zeros
-                                b_idx = 0
-                                found_non_zero = False
+                            if coarse_inputs_batch is not None:
+                                coarse_debug_input = coarse_inputs_batch
+                            if coarse_features_batch is not None:
+                                coarse_debug_features = coarse_features_batch
 
-                                first_target_any = next(iter(targets_dict.values()))
-                                first_target = first_target_any[0] if isinstance(first_target_any, (list, tuple)) else first_target_any
-                                if torch.any(first_target[0] != 0):
-                                    found_non_zero = True
-                                else:
-                                    # Look for a non-zero sample
-                                    for b in range(first_target.shape[0]):
-                                        if torch.any(first_target[b] != 0):
-                                            b_idx = b
-                                            found_non_zero = True
-                                            break
+                            # Find first non-zero sample for debug visualization, but save even if all zeros
+                            b_idx = 0
+                            found_non_zero = False
 
-                                if True:  # Was: if found_non_zero:
-                                    # Slicing shape: [1, c, z, y, x ]
-                                    inputs_first = inputs[b_idx: b_idx + 1]
+                            first_target_any = next(iter(targets_dict.values()))
+                            first_target = first_target_any[0] if isinstance(first_target_any, (list, tuple)) else first_target_any
+                            if torch.any(first_target[0] != 0):
+                                found_non_zero = True
+                            else:
+                                # Look for a non-zero sample
+                                for b in range(first_target.shape[0]):
+                                    if torch.any(first_target[b] != 0):
+                                        b_idx = b
+                                        found_non_zero = True
+                                        break
 
-                                    targets_dict_first_all = {}
-                                    for t_name, t_val in targets_dict.items():
-                                        if isinstance(t_val, (list, tuple)):
-                                            targets_dict_first_all[t_name] = t_val[0][b_idx: b_idx + 1]
-                                        else:
-                                            targets_dict_first_all[t_name] = t_val[b_idx: b_idx + 1]
+                            if True:  # Was: if found_non_zero:
+                                # Slicing shape: [1, c, z, y, x ]
+                                inputs_first = inputs[b_idx: b_idx + 1]
 
-                                    outputs_dict_first = {}
-                                    for t_name, p_val in outputs.items():
-                                        if isinstance(p_val, (list, tuple)):
-                                            outputs_dict_first[t_name] = p_val[0][b_idx: b_idx + 1]
-                                        else:
-                                            outputs_dict_first[t_name] = p_val[b_idx: b_idx + 1]
+                                targets_dict_first_all = {}
+                                for t_name, t_val in targets_dict.items():
+                                    if isinstance(t_val, (list, tuple)):
+                                        targets_dict_first_all[t_name] = t_val[0][b_idx: b_idx + 1]
+                                    else:
+                                        targets_dict_first_all[t_name] = t_val[b_idx: b_idx + 1]
 
-                                    # Use human-friendly 1-based epoch numbering in debug image filenames
-                                    debug_img_path = f"{ckpt_dir}/{self.mgr.model_name}_debug_epoch{epoch + 1}.gif"
-                                    
-                                    # handle skel data from skeleton-based losses
-                                    skeleton_dict = None
-                                    train_skeleton_dict = None
-                                    if 'skel' in targets_dict_first_all:
-                                        skeleton_dict = {'segmentation': targets_dict_first_all.get('skel')}
-                                    # Check if train_sample_targets_all exists (from earlier training step)
-                                    if 'train_sample_targets_all' in locals() and train_sample_targets_all and 'skel' in train_sample_targets_all:
-                                        train_skeleton_dict = {'segmentation': train_sample_targets_all.get('skel')}
-                                    
-                                    targets_dict_first = {}
-                                    for t_name, t_tensor in targets_dict_first_all.items():
-                                        if t_name not in ['skel', 'is_unlabeled']:
-                                            targets_dict_first[t_name] = t_tensor
-                                    
-                                    _, debug_preview_image = save_debug(
-                                        input_volume=inputs_first,
-                                        targets_dict=targets_dict_first,
-                                        outputs_dict=outputs_dict_first,
-                                        tasks_dict=self.mgr.targets,
-                                        # dictionary, e.g. {"sheet": {"activation":"sigmoid"}, "normals": {"activation":"none"}}
-                                        epoch=epoch,
-                                        save_path=debug_img_path,
-                                        train_input=train_sample_input,
-                                        train_targets_dict=train_sample_targets,
-                                        train_outputs_dict=train_sample_outputs,
-                                        skeleton_dict=skeleton_dict,
-                                        train_skeleton_dict=train_skeleton_dict,
-                                        coarse_input=coarse_debug_input[b_idx:b_idx + 1] if coarse_debug_input is not None else None,
-                                        coarse_features=[
-                                            feat[b_idx:b_idx + 1] if isinstance(feat, torch.Tensor) and feat.shape[0] > 1 else feat
-                                            for feat in coarse_debug_features
-                                        ] if coarse_debug_features is not None else None
-                                    )
-                                    debug_gif_history.append((epoch, debug_img_path))
+                                outputs_dict_first = {}
+                                for t_name, p_val in outputs.items():
+                                    if isinstance(p_val, (list, tuple)):
+                                        outputs_dict_first[t_name] = p_val[0][b_idx: b_idx + 1]
+                                    else:
+                                        outputs_dict_first[t_name] = p_val[b_idx: b_idx + 1]
+
+                                # Use human-friendly 1-based epoch numbering in debug image filenames
+                                debug_img_path = f"{ckpt_dir}/{self.mgr.model_name}_debug_epoch{epoch + 1}.gif"
+                                
+                                # handle skel data from skeleton-based losses
+                                skeleton_dict = None
+                                train_skeleton_dict = None
+                                if 'skel' in targets_dict_first_all:
+                                    skeleton_dict = {'segmentation': targets_dict_first_all.get('skel')}
+                                # Check if train_sample_targets_all exists (from earlier training step)
+                                if 'train_sample_targets_all' in locals() and train_sample_targets_all and 'skel' in train_sample_targets_all:
+                                    train_skeleton_dict = {'segmentation': train_sample_targets_all.get('skel')}
+                                
+                                targets_dict_first = {}
+                                for t_name, t_tensor in targets_dict_first_all.items():
+                                    if t_name not in ['skel', 'is_unlabeled']:
+                                        targets_dict_first[t_name] = t_tensor
+                                
+                                _, debug_preview_image = save_debug(
+                                    input_volume=inputs_first,
+                                    targets_dict=targets_dict_first,
+                                    outputs_dict=outputs_dict_first,
+                                    tasks_dict=self.mgr.targets,
+                                    # dictionary, e.g. {"sheet": {"activation":"sigmoid"}, "normals": {"activation":"none"}}
+                                    epoch=epoch,
+                                    save_path=debug_img_path,
+                                    train_input=train_sample_input,
+                                    train_targets_dict=train_sample_targets,
+                                    train_outputs_dict=train_sample_outputs,
+                                    skeleton_dict=skeleton_dict,
+                                    train_skeleton_dict=train_skeleton_dict,
+                                    coarse_input=coarse_debug_input[b_idx:b_idx + 1] if coarse_debug_input is not None else None,
+                                    coarse_features=[
+                                        feat[b_idx:b_idx + 1] if isinstance(feat, torch.Tensor) and feat.shape[0] > 1 else feat
+                                        for feat in coarse_debug_features
+                                    ] if coarse_debug_features is not None else None
+                                )
+                                debug_gif_history.append((epoch, debug_img_path))
 
                         loss_str = " | ".join([f"{t}: {np.mean(val_losses[t]):.4f}"
                                                for t in self.mgr.targets if len(val_losses[t]) > 0])
