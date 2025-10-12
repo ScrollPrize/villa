@@ -530,7 +530,18 @@ def save_debug(
                 rows.append(np.hstack(train_imgs))
             
             # Stack rows for this frame
-            frame = np.vstack(rows)
+            if rows:
+                max_width = max(row.shape[1] for row in rows)
+                padded_rows = []
+                for row in rows:
+                    pad_w = max_width - row.shape[1]
+                    if pad_w > 0:
+                        padding = np.zeros((row.shape[0], pad_w, row.shape[2]), dtype=row.dtype)
+                        row = np.concatenate([row, padding], axis=1)
+                    padded_rows.append(row)
+                frame = np.vstack(padded_rows)
+            else:
+                continue
             # Ensure frame is uint8 and contiguous
             frame = np.ascontiguousarray(frame, dtype=np.uint8)
             frames.append(frame)
