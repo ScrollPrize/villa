@@ -131,17 +131,17 @@ class ConfigManager:
 
         rotation_axes_cfg = self.dataset_config.get("rotation_axes", None)
         axis_name_to_index = {
-            'x': 0,
-            'width': 0,
-            'w': 0,
+            'z': 0,
+            'depth': 0,
+            'd': 0,
             'y': 1,
             'height': 1,
             'h': 1,
-            'z': 2,
-            'depth': 2,
-            'd': 2,
+            'x': 2,
+            'width': 2,
+            'w': 2,
         }
-        index_to_axis_name = {0: 'x', 1: 'y', 2: 'z'}
+        index_to_axis_name = {0: 'z', 1: 'y', 2: 'x'}
         if rotation_axes_cfg is None:
             self.allowed_rotation_axes = None
         else:

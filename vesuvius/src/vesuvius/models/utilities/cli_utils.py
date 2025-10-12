@@ -138,17 +138,17 @@ def update_config_from_args(mgr, args):
 
     if hasattr(args, 'rotation_axes') and args.rotation_axes is not None:
         axis_name_to_index = {
-            'x': 0,
-            'width': 0,
-            'w': 0,
+            'z': 0,
+            'depth': 0,
+            'd': 0,
             'y': 1,
             'height': 1,
             'h': 1,
-            'z': 2,
-            'depth': 2,
-            'd': 2,
+            'x': 2,
+            'width': 2,
+            'w': 2,
         }
-        index_to_axis_name = {0: 'x', 1: 'y', 2: 'z'}
+        index_to_axis_name = {0: 'z', 1: 'y', 2: 'x'}
 
         tokens = [tok.strip().lower() for tok in args.rotation_axes.split(',') if tok.strip()]
         normalized_indices = []
