@@ -207,6 +207,12 @@ class BaseTrainer:
             if not self.is_distributed or self.rank == 0:
                 print("Warning: coarse checkpoint is missing 'model_config'; using current manager configuration.")
 
+        coarse_mgr.targets = {}
+        if isinstance(getattr(coarse_mgr, 'model_config', None), dict):
+            coarse_mgr.model_config = dict(coarse_mgr.model_config)
+            coarse_mgr.model_config['targets'] = {}
+        coarse_mgr.enable_deep_supervision = False
+
         coarse_network = NetworkFromConfig(coarse_mgr)
         state_dict = checkpoint.get('model', checkpoint)
         encoder_state = {}
@@ -951,10 +957,14 @@ class BaseTrainer:
         loss_fns = self._build_loss()
 
         if self.device.type == 'cuda':
-            try:
-                model = torch.compile(model)
-            except Exception as e:
-                print(f"torch.compile failed; continuing without compile. Reason: {e}")
+            if self.coarse_model is not None:
+                if not self.is_distributed or self.rank == 0:
+                    print("Skipping torch.compile because coarse fusion is enabled (avoids large CUDA scratch buffers).")
+            else:
+                try:
+                    model = torch.compile(model)
+                except Exception as e:
+                    print(f"torch.compile failed; continuing without compile. Reason: {e}")
 
         return {
             'model': model,
