@@ -149,6 +149,10 @@ class BaseTrainer:
             else:
                 print(f"Using GPU {self.gpu_ids[0]}")
 
+        # Default AMP dtype; resolved during training initialization
+        self.amp_dtype = torch.float16
+        self.amp_dtype_str = 'float16'
+
     # --- build model --- #
     def _build_model(self):
         if not hasattr(self.mgr, 'model_config') or self.mgr.model_config is None:
@@ -538,7 +542,7 @@ class BaseTrainer:
         
         return metrics
     
-    def _get_scaler(self, device_type='cuda', use_amp=True):
+    def _get_scaler(self, device_type='cuda', use_amp=True, amp_dtype=torch.float16):
         # for cuda, we can use a grad scaler for mixed precision training if amp is enabled
         # for mps or cpu, or when amp is disabled, we create a dummy scaler that does nothing
 
@@ -556,9 +560,9 @@ class BaseTrainer:
                 pass
 
 
-        if device_type == 'cuda' and use_amp:
-            # Use standard GradScaler when AMP is enabled on CUDA
-            print("Using GradScaler with CUDA AMP")
+        if device_type == 'cuda' and use_amp and amp_dtype == torch.float16:
+            # Use standard GradScaler when AMP is enabled on CUDA with float16
+            print("Using GradScaler with CUDA AMP (float16)")
             return torch.amp.GradScaler('cuda')
         else:
             # Not using amp or not on cuda - no gradient scaling needed
@@ -739,8 +743,42 @@ class BaseTrainer:
 
         if not use_amp and getattr(self.mgr, 'no_amp', False):
             print("Automatic Mixed Precision (AMP) is disabled")
+
+        amp_dtype_setting = getattr(self.mgr, 'amp_dtype', 'float16')
+        if amp_dtype_setting is None:
+            amp_dtype_setting = 'float16'
+
+        if isinstance(amp_dtype_setting, torch.dtype):
+            resolved_amp_dtype = amp_dtype_setting
+            amp_dtype_str = 'bfloat16' if amp_dtype_setting == torch.bfloat16 else 'float16'
+        else:
+            amp_dtype_str = str(amp_dtype_setting).lower()
+            if amp_dtype_str in ('bfloat16', 'bf16'):
+                resolved_amp_dtype = torch.bfloat16
+                amp_dtype_str = 'bfloat16'
+            elif amp_dtype_str in ('float16', 'fp16', 'half'):
+                resolved_amp_dtype = torch.float16
+                amp_dtype_str = 'float16'
+            else:
+                if not self.is_distributed or self.rank == 0:
+                    print(f"Unrecognized amp_dtype '{amp_dtype_setting}', defaulting to float16")
+                resolved_amp_dtype = torch.float16
+                amp_dtype_str = 'float16'
+
+        self.amp_dtype = resolved_amp_dtype
+        self.amp_dtype_str = amp_dtype_str
+
+        if self.device.type in ['mlx', 'mps'] and self.amp_dtype == torch.bfloat16:
+            if not self.is_distributed or self.rank == 0:
+                print("bfloat16 autocast not supported on this backend; falling back to float16")
+            self.amp_dtype = torch.float16
+            self.amp_dtype_str = 'float16'
+
+        if use_amp and self.device.type == 'cuda' and self.amp_dtype == torch.bfloat16:
+            if not self.is_distributed or self.rank == 0:
+                print("Using CUDA AMP with bfloat16 (GradScaler disabled)")
         
-        scaler = self._get_scaler(self.device.type, use_amp=use_amp)
+        scaler = self._get_scaler(self.device.type, use_amp=use_amp, amp_dtype=self.amp_dtype)
         train_dataloader, val_dataloader, train_indices, val_indices = self._configure_dataloaders(train_dataset,
                                                                                                    val_dataset)
 
@@ -1012,7 +1050,11 @@ class BaseTrainer:
 
         if use_amp:
             if self.device.type == 'cuda':
-                context = torch.amp.autocast('cuda')
+                context = torch.amp.autocast('cuda', dtype=self.amp_dtype)
+            elif self.device.type == 'cpu':
+                context = torch.amp.autocast('cpu')
+            elif self.device.type in ['mlx', 'mps']:
+                context = torch.amp.autocast(self.device.type, dtype=self.amp_dtype)
             else:
                 context = torch.amp.autocast(self.device.type)
         else:
@@ -1231,7 +1273,6 @@ class BaseTrainer:
 
             print(f"Using optimizer : {optimizer.__class__.__name__}")
             print(f"Using scheduler : {scheduler.__class__.__name__} (per-iteration: {is_per_iteration_scheduler})")
-            print(f"Initial learning rate : {self.mgr.initial_lr}")
             print(f"Gradient accumulation steps : {grad_accumulate_n}")
 
             for i in range(num_iters):
@@ -1241,11 +1282,13 @@ class BaseTrainer:
                 data_dict = next(train_iter)
                 global_step += 1
                 
-                # Setup autocast context (no explicit dtype overrides)
+                # Setup autocast context (dtype resolved based on CLI/config)
                 if use_amp and self.device.type == 'cuda':
-                    autocast_ctx = torch.amp.autocast('cuda')
-                elif use_amp and self.device.type in ['cpu', 'mlx']:
-                    autocast_ctx = torch.amp.autocast(self.device.type)
+                    autocast_ctx = torch.amp.autocast('cuda', dtype=self.amp_dtype)
+                elif use_amp and self.device.type == 'cpu':
+                    autocast_ctx = torch.amp.autocast('cpu')
+                elif use_amp and self.device.type in ['mlx', 'mps']:
+                    autocast_ctx = torch.amp.autocast(self.device.type, dtype=self.amp_dtype)
                 else:
                     autocast_ctx = nullcontext()
 
@@ -1348,8 +1391,13 @@ class BaseTrainer:
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
 
+            # Report the effective learning rate(s) after all scheduler updates for this epoch.
+            current_lrs = [group['lr'] for group in optimizer.param_groups]
+
             if not self.is_distributed or self.rank == 0:
                 print(f"\n[Train] Epoch {epoch + 1} completed.")
+                lr_str = ", ".join(f"{lr:.8f}" for lr in current_lrs)
+                print(f"  Learning rate(s) = {lr_str}")
                 for t_name in self.mgr.targets:
                     avg_loss = np.mean(epoch_losses[t_name]) if epoch_losses[t_name] else 0
                     print(f"  {t_name}: Avg Loss = {avg_loss:.4f}")
@@ -1661,6 +1709,8 @@ def main():
                           help="Enable intensity sampling during dataset init")
     grp_data.add_argument("--no-spatial", action="store_true",
                           help="Disable spatial/geometric augmentations")
+    grp_data.add_argument("--rotation-axes", type=str,
+                          help="Comma-separated axes (subset of x,y,z / width,height,depth) that may be rotated; e.g. 'z' keeps the depth axis upright")
 
     # Model
     grp_model.add_argument("--model-name", type=str,
@@ -1704,6 +1754,8 @@ def main():
                            help="Number of steps to accumulate gradients before optimizer.step()")
     grp_optim.add_argument("--grad-clip", type=float, default=12.0,
                            help="Gradient clipping value")
+    grp_optim.add_argument("--amp-dtype", type=str, choices=["float16", "bfloat16"], default="float16",
+                           help="Autocast dtype when AMP is enabled (float16 uses GradScaler; bfloat16 skips scaling)")
     grp_optim.add_argument("--no-amp", action="store_true",
                            help="Disable Automatic Mixed Precision (AMP)")
 

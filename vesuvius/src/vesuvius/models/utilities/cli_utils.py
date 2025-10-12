@@ -136,6 +136,69 @@ def update_config_from_args(mgr, args):
         if mgr.verbose:
             print(f"Disabled spatial transformations (--no-spatial flag set)")
 
+    if hasattr(args, 'rotation_axes') and args.rotation_axes is not None:
+        axis_name_to_index = {
+            'x': 0,
+            'width': 0,
+            'w': 0,
+            'y': 1,
+            'height': 1,
+            'h': 1,
+            'z': 2,
+            'depth': 2,
+            'd': 2,
+        }
+        index_to_axis_name = {0: 'x', 1: 'y', 2: 'z'}
+
+        tokens = [tok.strip().lower() for tok in args.rotation_axes.split(',') if tok.strip()]
+        normalized_indices = []
+
+        if not tokens:
+            normalized_indices = []
+        else:
+            seen = set()
+            special_handled = False
+            for token in tokens:
+                if token in ('all', 'xyz', 'zyx'):
+                    normalized_indices = [0, 1, 2]
+                    special_handled = True
+                    break
+                if token == 'none':
+                    normalized_indices = []
+                    special_handled = True
+                    break
+                if token in axis_name_to_index:
+                    idx = axis_name_to_index[token]
+                else:
+                    try:
+                        idx = int(token)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Invalid value '{token}' for --rotation-axes. "
+                            "Use a comma-separated subset of x,y,z (width,height,depth), digits 0-2, or 'none'."
+                        ) from exc
+                    if idx not in index_to_axis_name:
+                        raise ValueError(
+                            f"Invalid axis index '{idx}' for --rotation-axes. Valid indices are 0, 1, 2."
+                        )
+                if idx not in seen:
+                    normalized_indices.append(idx)
+                    seen.add(idx)
+            if not special_handled and not normalized_indices:
+                raise ValueError(
+                    "No valid axes provided to --rotation-axes. Provide a comma-separated subset of x,y,z or use 'none'."
+                )
+
+        mgr.allowed_rotation_axes = tuple(normalized_indices)
+        axis_names = [index_to_axis_name[idx] for idx in normalized_indices]
+        if hasattr(mgr, 'dataset_config'):
+            mgr.dataset_config['rotation_axes'] = axis_names
+        if mgr.verbose:
+            if axis_names:
+                print(f"Restricting random rotations to axes: {', '.join(axis_names)}")
+            else:
+                print("Disabling random rotations (rotation_axes=none)")
+
     # Handle skip_intensity_sampling (default is True now)
     if hasattr(args, 'skip_intensity_sampling'):
         mgr.skip_intensity_sampling = args.skip_intensity_sampling
@@ -184,6 +247,12 @@ def update_config_from_args(mgr, args):
         mgr.tr_configs["no_amp"] = True
         if mgr.verbose:
             print(f"Disabled Automatic Mixed Precision (AMP)")
+
+    if hasattr(args, 'amp_dtype') and args.amp_dtype is not None:
+        mgr.amp_dtype = args.amp_dtype.lower()
+        mgr.tr_configs["amp_dtype"] = mgr.amp_dtype
+        if mgr.verbose:
+            print(f"Set AMP dtype: {mgr.amp_dtype}")
 
     if hasattr(args, 'early_stopping_patience') and args.early_stopping_patience is not None:
         mgr.early_stopping_patience = args.early_stopping_patience
