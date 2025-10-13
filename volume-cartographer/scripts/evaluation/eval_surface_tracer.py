@@ -220,32 +220,65 @@ class SurfaceTracerEvaluation:
         if len(filtered_patches) <= target_count:
             return filtered_patches
         filtered_patches.sort(key=lambda p: p.area, reverse=True)
-        return filtered_patches[::len(filtered_patches) // target_count][:target_count]
+        # Evenly spaced deterministic selection over the sorted list
+        n = len(filtered_patches)
+        idxs = [round(i * (n - 1) / (target_count - 1)) for i in range(target_count)]
+        return [filtered_patches[i] for i in idxs]
     
     def run_tracer(self, source_patches: List[PatchInfo]) -> List[Path]:
 
-        logger.info(f"Running vc_grow_seg_from_segments for {len(source_patches)} source patches")
-        
-        tracer_params = self.config["vc_grow_seg_from_segments_params"].copy()
+        logger.info(f"Running vc_grow_seg_from_segments (both flip_x variants) for {len(source_patches)} source patches")
+
+        # Base params (we will materialize per-flip variants below)
+        base_params = self.config["vc_grow_seg_from_segments_params"].copy()
         if "z_range" in self.config:
-            tracer_params["z_range"] = self.config["z_range"]
-        tracer_params_file = self.out_dir / "tracer_params.json"
-        with open(tracer_params_file, 'w') as f:
-            json.dump(tracer_params, f, indent=2)
-        
-        trace_paths = []
-        for patch_info in source_patches:
-            result = self._run_vc_grow_seg_from_segments(patch_info, tracer_params_file)
-            if result:
-                trace_paths.append(result)
+            base_params["z_range"] = self.config["z_range"]
+
+        # Always evaluate both flips; no config change required
+        flip_variants = [False, True]
+        param_files = {}
+        for fv in flip_variants:
+            params = base_params.copy()
+            params["flip_x"] = bool(fv)
+            pf = self.out_dir / f"tracer_params_fx{int(fv)}.json"
+            with open(pf, 'w') as f:
+                json.dump(params, f, indent=2)
+            param_files[fv] = pf
+
+        trace_paths: List[Path] = []
+        max_workers = self.config.get("tracer_parallel_processes", 1)
+        logger.info(f"Tracing with up to {max_workers} parallel processes")
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for patch_info in source_patches:
+                for fv, pf in param_files.items():
+                    tag = f"fx{int(fv)}"
+                    futures.append(
+                        executor.submit(
+                            self._run_vc_grow_seg_from_segments,
+                            patch_info,
+                            pf,
+                            tag
+                        )
+                    )
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    if result:
+                        trace_paths.append(result)
+                except Exception as e:
+                    logger.error(f"Error in tracer run: {e}")
         
         logger.info(f"Created {len(trace_paths)} valid traces")
         
         return trace_paths
     
-    def _run_vc_grow_seg_from_segments(self, source_patch: PatchInfo, tracer_params_file: Path) -> Optional[Tuple[Path, float]]:
+    def _run_vc_grow_seg_from_segments(self, source_patch: PatchInfo, tracer_params_file: Path, run_tag: str = "") -> Optional[Path]:
 
-        run_traces_dir = self.traces_dir / f"from_{source_patch.path.name}_{int(time.time())}"
+        # Unique, informative run directory (include flip tag and ns-resolution time)
+        ts = time.time_ns()
+        tag = f"_{run_tag}" if run_tag else ""
+        run_traces_dir = self.traces_dir / f"from_{source_patch.path.name}{tag}_{ts}"
         run_traces_dir.mkdir(exist_ok=True)
 
         cmd = [
@@ -258,8 +291,13 @@ class SurfaceTracerEvaluation:
         ]
         
         logger.info(f"Starting vc_grow_seg_from_segments run from {source_patch.path.name}")
-        result = subprocess.run(cmd)
+        result = subprocess.run(cmd, capture_output=True, text=True)
         logger.info(f"Finished vc_grow_seg_from_segments run (return code {result.returncode})")
+        if result.returncode != 0:
+            if result.stdout:
+                logger.error(f"vc_grow_seg_from_segments STDOUT:\n{result.stdout}")
+            if result.stderr:
+                logger.error(f"vc_grow_seg_from_segments STDERR:\n{result.stderr}")
         
         # Find the final trace
         trace_paths = []
@@ -295,7 +333,7 @@ class SurfaceTracerEvaluation:
         ]
         
         logger.info(f"Starting vc_tifxyz_winding for {trace_dir.name}")
-        result = subprocess.run(cmd, cwd=trace_dir)
+        result = subprocess.run(cmd, cwd=trace_dir, capture_output=True, text=True)
         logger.info(f"Finished vc_tifxyz_winding (return code {result.returncode})")
         
         winding_file = trace_dir / "winding.tif"
@@ -303,6 +341,10 @@ class SurfaceTracerEvaluation:
             return True
         else:
             logger.error(f"Failed to calculate winding numbers for {trace_dir.name}")
+            if result.stdout:
+                logger.error(f"vc_tifxyz_winding STDOUT:\n{result.stdout}")
+            if result.stderr:
+                logger.error(f"vc_tifxyz_winding STDERR:\n{result.stderr}")
             return False
     
     def run_metrics(self, traces: List[Path]) -> Dict[Path, Dict]:
@@ -333,7 +375,7 @@ class SurfaceTracerEvaluation:
             "--z_max", str(z_range[1]),
         ]
         
-        result = subprocess.run(cmd)
+        result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode == 0 and metrics_file.exists():
             with open(metrics_file, 'r') as f:
@@ -342,18 +384,37 @@ class SurfaceTracerEvaluation:
             return metrics
         else:
             logger.error(f"Failed to calculate metrics for {trace_dir.name}")
+            if result.stdout:
+                logger.error(f"vc_calc_surface_metrics STDOUT:\n{result.stdout}")
+            if result.stderr:
+                logger.error(f"vc_calc_surface_metrics STDERR:\n{result.stderr}")
             return None
     
     def collate_and_log_metrics(self, metrics_results: Dict[Path, Dict]):
 
         logger.info("Collating metrics and logging to wandb")
-        
+
+        if not metrics_results:
+            logger.warning("No metrics to collate. Skipping summarization.")
+            return
+
         ranking_metric = self.config["trace_ranking_metric"]
-        best_traces = sorted(
-            metrics_results,
-            key=lambda trace: metrics_results[trace][ranking_metric],
-            reverse=True
-        )[:self.config["num_best_traces_to_average"]]
+
+        def safe_metric(trace: Path) -> float:
+            v = metrics_results.get(trace, {}).get(ranking_metric, None)
+            if isinstance(v, (int, float)):
+                return float(v)
+            logger.debug(f"Trace {trace.name} missing/non-numeric ranking metric '{ranking_metric}': {v}")
+            return float("-inf")
+
+        # Keep only traces that actually have a numeric ranking metric
+        ranked = [t for t in metrics_results.keys() if safe_metric(t) != float("-inf")]
+        if not ranked:
+            logger.warning(f"No traces contained a numeric '{ranking_metric}'. Skipping summarization.")
+            return
+
+        ranked.sort(key=safe_metric, reverse=True)
+        best_traces = ranked[: self.config["num_best_traces_to_average"]]
         
         metric_to_values = defaultdict(list)
         for trace in best_traces:
@@ -369,15 +430,18 @@ class SurfaceTracerEvaluation:
             logger.info(f'  {metric_name}: {mean}')
 
         if "wandb_project" in self.config:
-            import wandb
-            wandb.init(
-                project=self.config["wandb_project"],
-                config=self.config,
-                name=f"surface_tracer_{int(time.time())}",
-                dir=self.out_dir,
-            )
-            wandb.summary.update(metric_to_mean)
-            wandb.finish()
+            try:
+                import wandb
+                wandb.init(
+                    project=self.config["wandb_project"],
+                    config=self.config,
+                    name=f"surface_tracer_{int(time.time())}",
+                    dir=self.out_dir,
+                )
+                wandb.summary.update(metric_to_mean)
+                wandb.finish()
+            except Exception as e:
+                logger.warning(f"wandb logging skipped: {e}")
     
     def run(self):
         
