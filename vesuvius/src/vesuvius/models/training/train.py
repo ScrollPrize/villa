@@ -737,8 +737,8 @@ class BaseTrainer:
             #     task_metrics.append(CriticalComponentsMetric())
 
             task_metrics.append(IOUDiceMetric(num_classes=num_classes))
-            # task_metrics.append(SkeletonBranchPointsMetric(num_classes=num_classes))
-            # task_metrics.append(HausdorffDistanceMetric(num_classes=num_classes))
+            task_metrics.append(SkeletonBranchPointsMetric(num_classes=num_classes))
+            task_metrics.append(HausdorffDistanceMetric(num_classes=num_classes))
             metrics[task_name] = task_metrics
         
         return metrics
