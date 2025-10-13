@@ -121,6 +121,7 @@ class LayersSource:
             if ext in (".tif", ".tiff"):
                 img = tiff.imread(path)
                 if img is None:
+                    logger.warning(f"Failed to read image: {path}")
                     return None
                 if img.ndim > 2:
                     img = img[..., 0]
@@ -131,13 +132,13 @@ class LayersSource:
             else:
                 return cv2.imread(path, cv2.IMREAD_GRAYSCALE)
         except Exception:
+            logger.exception(f"Exception reading image: {path}")
             return None
 
     @staticmethod
-    def _build_memmap_from_files(paths: List[str]) -> Tuple[np.memmap, Tuple[int, int, int], np.dtype]:
-        """Create a disk-backed array of shape (C,H,W) for contiguous per-layer writes,
-        but expose shape as (H,W,C) to callers."""
-        from numpy.lib.format import open_memmap
+    def _build_memmap_from_files(paths: List[str]) -> Tuple[np.ndarray, Tuple[int, int, int], np.dtype]:
+        """Create a zarr disk-backed array with shape (H,W,C)."""
+        import zarr
         import concurrent.futures
 
         first = LayersSource._read_gray_any(paths[0])
@@ -146,53 +147,69 @@ class LayersSource:
         h, w = first.shape
         c = len(paths)
 
-        mm_root = os.environ.get("MMAP_DIR", "/tmp")
-        mm_path = os.path.join(mm_root, f"layers_{uuid.uuid4().hex}.npy")
+        zarr_root = os.environ.get("MMAP_DIR", "/tmp")
+        zarr_path = os.path.join(zarr_root, f"layers_{uuid.uuid4().hex}.zarr")
         required_gib = (h * w * c) / (1024**3)
-        free_gib = shutil.disk_usage(mm_root).free / (1024**3)
+        free_gib = shutil.disk_usage(zarr_root).free / (1024**3)
         logger.info(
-            f"Creating memmap at {mm_path} (C,H,W={c},{h},{w} ~{required_gib:.2f} GiB). "
-            f"Free on {mm_root}: {free_gib:.2f} GiB."
+            f"Creating zarr array at {zarr_path} (H,W,C={h},{w},{c} ~{required_gib:.2f} GiB). "
+            f"Free on {zarr_root}: {free_gib:.2f} GiB."
         )
         if free_gib < required_gib * 1.10:
             raise RuntimeError(
-                f"Not enough space on {mm_root}: need ~{required_gib:.2f} GiB, have {free_gib:.2f} GiB"
+                f"Not enough space on {zarr_root}: need ~{required_gib:.2f} GiB, have {free_gib:.2f} GiB"
             )
-        # True .npy with header; contiguous C-order
-        mm = open_memmap(mm_path, mode="w+", dtype=np.uint8, shape=(c, h, w))
 
-        # Parallel reads, single-writer commit
-        max_workers = int(os.environ.get("MMAP_READ_WORKERS", str(min(6, (os.cpu_count() or 4)))))
-        flush_every = int(os.environ.get("MMAP_FLUSH_EVERY", "0"))  # 0 = only flush once at end
+        # Create zarr v2 array with shape (H, W, C) and chunk size optimized for spatial tile access
+        # Using chunks of (256, 256, c) for efficient spatial tile reads
+        # Compression disabled (compressor=None) for maximum speed
+        chunk_size = 1024
+        z = zarr.open(
+            zarr_path,
+            mode="w",
+            shape=(h, w, c),
+            chunks=(chunk_size, chunk_size, 1),
+            dtype=np.uint8,
+            compressor=None
+        )
+
+        # Simple sequential loop
         log_every = max(1, c // 10)
 
-        def _read(idx_path):
-            idx, p = idx_path
+        for idx, p in enumerate(paths):
             img = LayersSource._read_gray_any(p)
             if img is None:
                 raise RuntimeError(f"Failed to read image: {p}")
             if img.shape != (h, w):
                 raise RuntimeError(f"Layer size mismatch: {p} has {img.shape}, expected {(h, w)}")
-            return idx, img
+            z[:, :, idx] = img  # write to channel slice
+            if ((idx + 1) % log_every == 0) or ((idx + 1) == c):
+                logger.info(f"Zarr array build progress: {idx + 1}/{c} layers")
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = [ex.submit(_read, (i, p)) for i, p in enumerate(paths)]
-            n_done = 0
-            for fut in concurrent.futures.as_completed(futures):
-                idx, img = fut.result()
-                n_done += 1
-                mm[idx, :, :] = img  # contiguous plane write
-                if flush_every and (n_done % flush_every == 0):
-                    mm.flush()
-                if (n_done % log_every == 0) or (n_done == c):
-                    logger.info(f"Memmap build progress: {n_done}/{c} layers")
+        # # Parallel reads, single-writer commit (commented out for now)
+        # max_workers = int(os.environ.get("MMAP_READ_WORKERS", str(min(6, (os.cpu_count() or 4)))))
+        # def _read(idx_path):
+        #     idx, p = idx_path
+        #     img = LayersSource._read_gray_any(p)
+        #     if img is None:
+        #         raise RuntimeError(f"Failed to read image: {p}")
+        #     if img.shape != (h, w):
+        #         raise RuntimeError(f"Layer size mismatch: {p} has {img.shape}, expected {(h, w)}")
+        #     return idx, img
+        #
+        # with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        #     futures = [ex.submit(_read, (i, p)) for i, p in enumerate(paths)]
+        #     n_done = 0
+        #     for fut in concurrent.futures.as_completed(futures):
+        #         idx, img = fut.result()
+        #         n_done += 1
+        #         z[:, :, idx] = img  # write to channel slice
+        #         if (n_done % log_every == 0) or (n_done == c):
+        #             logger.info(f"Zarr array build progress: {n_done}/{c} layers")
 
-        mm.flush()  # ensure on-disk
-        # Reopen read-only for safety/perf
-        del mm
-        mm = np.lib.format.open_memmap(mm_path, mode="r", dtype=np.uint8, shape=(c, h, w))
-        # Expose logical (H,W,C) to the rest of the pipeline
-        return mm, (h, w, c), mm.dtype
+        # Reopen in read-only mode for safety
+        z = zarr.open(zarr_path, mode="r")
+        return z, (h, w, c), z.dtype
 
     @property
     def shape(self) -> Tuple[int, int, int]:
@@ -212,9 +229,8 @@ class LayersSource:
                 # in-RAM case is already HWC
                 out[(yy1 - y1):(yy2 - y1), (xx1 - x1):(xx2 - x1)] = self._arr[yy1:yy2, xx1:xx2, :]
             else:
-                # memmap stored as (C,H,W) -> slice (C, tile_h, tile_w) then move channels last
-                roi = self._mm[:, yy1:yy2, xx1:xx2]
-                roi = np.moveaxis(roi, 0, 2)  # (tile_h, tile_w, C)
+                # zarr array stored as (H,W,C) -> slice directly
+                roi = self._mm[yy1:yy2, xx1:xx2, :]
                 out[(yy1 - y1):(yy2 - y1), (xx1 - x1):(xx2 - x1)] = roi
         return out
 
