@@ -1,6 +1,10 @@
 import os
 import io
 import sys
+
+# Allow huge images before anything imports cv2 (and before importing inference_timesformer)
+os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")
+
 import json
 import time
 import math
@@ -125,7 +129,7 @@ def list_layers_objects(
             except ValueError:
                 continue
                 
-            # Check if layer index is within range (exclusive end)
+            # Check if layer index is within range (exclusive end) -> [start_layer, end_layer)
             if start_layer <= layer_idx < end_layer:
                 keys.append((key, base))
     if not keys:
@@ -432,7 +436,7 @@ def main() -> None:
     s3_client = boto3.client("s3")
     logger.info(f"Parsing S3 URI: {inputs.s3_path}")
     bucket, prefix = parse_s3_uri(inputs.s3_path)
-    logger.info(f"Listing layer objects in S3 bucket '{bucket}' with prefix '{prefix}' for layers {inputs.start_layer} to {inputs.end_layer}")
+    logger.info(f"Listing layer objects in S3 bucket '{bucket}' with prefix '{prefix}' for layers [{inputs.start_layer}, {inputs.end_layer})")
     layer_objects = list_layers_objects(
         s3_client, bucket, prefix, inputs.start_layer, inputs.end_layer
     )
