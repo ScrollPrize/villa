@@ -29,14 +29,6 @@ try:
 except:
     pass
 
-from inference_timesformer import (
-    run_inference,
-    reduce_partitions,
-    write_tiled_tiff,
-    create_surface_volume_zarr,
-    CFG,
-)
-
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] [%(levelname)s] %(message)s",
@@ -402,6 +394,9 @@ def save_and_upload_prediction(
 
 def run_prepare_step(inputs: Inputs) -> None:
     """Execute the prepare step to create surface volume zarr from S3 layers."""
+    # Import torch-free processing utilities
+    from processing import create_surface_volume_zarr
+
     logger.info("Starting prepare step: creating surface volume zarr")
 
     # Handle WebKnossos workflow
@@ -460,7 +455,7 @@ def run_inference_step(inputs: Inputs) -> None:
     # Import torch and related dependencies only when doing inference
     import torch
     from torch.nn import DataParallel
-    from inference_timesformer import load_model
+    from inference_timesformer import load_model, run_inference, CFG
 
     task_id = uuid.uuid4()
     logger.info(f"Task ID generated: {task_id}")
@@ -623,6 +618,9 @@ def run_inference_step(inputs: Inputs) -> None:
 
 def run_reduce_step(inputs: Inputs) -> None:
     """Execute the reduce step to blend all partitions."""
+    # Import torch-free processing utilities
+    from processing import reduce_partitions, write_tiled_tiff
+
     logger.info(f"Starting reduce step: blending {inputs.num_parts} partitions")
 
     # S3 setup (need it for uploading final result)

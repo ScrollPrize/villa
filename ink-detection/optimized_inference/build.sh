@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -e
+
 VERSION=$1
 DIR=$(readlink -f $(dirname $0))
 

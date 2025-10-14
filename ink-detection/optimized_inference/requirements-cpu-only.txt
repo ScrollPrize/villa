@@ -9,5 +9,5 @@ huggingface_hub>=0.23.0
 tifffile
 numcodecs>=0.16.3
 imagecodecs
-zarr
+zarr<3
 #webknossos==0.16.2

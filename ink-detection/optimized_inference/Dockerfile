@@ -20,6 +20,7 @@ COPY requirements.txt /app
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY entrypoint.py /app
+COPY processing.py /app
 COPY inference_timesformer.py /app
 
 ENV PYTHONUNBUFFERED=1
@@ -42,6 +43,7 @@ COPY requirements-cpu-only.txt /app
 RUN pip install --no-cache-dir -r requirements-cpu-only.txt
 
 COPY entrypoint.py /app
+COPY processing.py /app
 COPY inference_timesformer.py /app
 
 ENV PYTHONUNBUFFERED=1
