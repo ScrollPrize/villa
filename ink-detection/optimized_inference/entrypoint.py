@@ -20,6 +20,7 @@ from botocore.config import Config
 import cv2
 import torch
 import concurrent.futures
+import zarr
 from huggingface_hub import snapshot_download
 
 # WebKnossos imports
@@ -140,24 +141,24 @@ def list_layers_objects(
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
-            
+
             # Check if it's a layer file with supported format
             if "/layers/" not in key.lower():
                 continue
-                
+
             base = os.path.basename(key)
             name, ext = os.path.splitext(base)
-            
+
             # Check if the file extension is supported
             if ext.lower() not in SUPPORTED_IMAGE_FORMATS:
                 continue
-                
+
             try:
                 # Tolerate leading zeros, e.g., 01, 02, ...
                 layer_idx = int(name)
             except ValueError:
                 continue
-                
+
             # Check if layer index is within range (exclusive end) -> [start_layer, end_layer)
             if start_layer <= layer_idx < end_layer:
                 keys.append((key, base))
@@ -205,7 +206,7 @@ def download_layers(
 def load_layers_to_numpy(layer_paths: List[str]) -> np.ndarray:
     if not layer_paths:
         raise ValueError("No layer paths provided")
-    
+
     # Load all images first to ensure consistent processing
     images = []
     for i, path in enumerate(layer_paths):
@@ -213,7 +214,7 @@ def load_layers_to_numpy(layer_paths: List[str]) -> np.ndarray:
         if img is None:
             raise RuntimeError(f"Failed to read image: {path}")
         images.append(img)
-    
+
     # Ensure all images have the same shape
     h, w = images[0].shape
     for i, img in enumerate(images):
@@ -221,11 +222,11 @@ def load_layers_to_numpy(layer_paths: List[str]) -> np.ndarray:
             raise RuntimeError(
                 f"Layer size mismatch: {layer_paths[i]} has {img.shape}, expected {(h, w)}"
             )
-    
+
     # Stack layers using the same method as local script
     # This creates (H, W, C) format like the working version
     stacked_layers = np.stack(images, axis=2)
-    
+
     # Ensure proper dtype - match the local script behavior
     # Don't convert to float32 here, let the inference function handle it
     return stacked_layers
@@ -311,14 +312,14 @@ def get_wk_dataset_metadata(wk_dataset_id: str) -> str:
         logger.info(f"Fetching metadata for WebKnossos dataset: {wk_dataset_id}")
         dataset = Dataset.open_remote(wk_dataset_id)
         metadata = dataset.metadata
-        
+
         if "s3_path" not in metadata:
             raise RuntimeError(f"s3_path not found in metadata for dataset {wk_dataset_id}")
-            
+
         s3_path = metadata["s3_path"]
         logger.info(f"Found s3_path in dataset metadata: {s3_path}")
         return s3_path
-        
+
     except Exception as e:
         logger.error(f"Failed to fetch metadata from WebKnossos dataset {wk_dataset_id}: {e}")
         raise RuntimeError(f"Failed to fetch WebKnossos dataset metadata: {e}") from e
@@ -340,21 +341,21 @@ def upload_to_webknossos(wk_dataset_id: str, prediction: np.ndarray, model_key: 
     """
     try:
         logger.info(f"Uploading prediction to WebKnossos dataset: {wk_dataset_id}")
-        
+
         # Open the remote dataset
         dataset = Dataset.open_remote(wk_dataset_id)
-        
+
         # Create layer name
         layer_name = f"ink_prediction_{model_key}_{start_layer:02d}_{end_layer:02d}"
         logger.info(f"Creating layer: {layer_name}")
-        
+
         # Convert prediction to uint8
         prediction_uint8 = (np.clip(prediction, 0, 1) * 255).astype(np.uint8)
-        
+
         # Add layer to dataset
         # The prediction is 2D, so we need to add a third dimension for WebKnossos
         prediction_3d = prediction_uint8[:, :, np.newaxis]
-        
+
         layer = dataset.add_layer(
             layer_name=layer_name,
             category="segmentation",
@@ -362,14 +363,14 @@ def upload_to_webknossos(wk_dataset_id: str, prediction: np.ndarray, model_key: 
             num_channels=1,
             data_format="wkw"
         )
-        
+
         # Write the prediction data
         with layer.open_mag(Mag(1)) as mag:
             mag.write(prediction_3d, offset=(0, 0, 0))
-        
+
         logger.info(f"Successfully uploaded prediction as layer: {layer_name}")
         return layer_name
-        
+
     except Exception as e:
         logger.error(f"Failed to upload to WebKnossos: {e}")
         raise RuntimeError(f"Failed to upload prediction to WebKnossos: {e}") from e
@@ -387,7 +388,7 @@ def load_model(model_path: str, device: torch.device) -> RegressionPLModel:
     """
     try:
         logger.info(f"Loading model from: {model_path}")
-        
+
         # Try to load with PyTorch Lightning first
         try:
             model = RegressionPLModel.load_from_checkpoint(model_path, strict=False)
@@ -399,19 +400,19 @@ def load_model(model_path: str, device: torch.device) -> RegressionPLModel:
             checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
             model.load_state_dict(checkpoint['state_dict'])
             logger.info("Model loaded manually")
-        
+
         # Setup multi-GPU if available
         if torch.cuda.device_count() > 1:
             model = DataParallel(model)
             logger.info(f"Model wrapped with DataParallel for {torch.cuda.device_count()} GPUs")
-        
+
         # Move to device
         model.to(device)
         model.eval()
-        
+
         logger.info(f"Model loaded successfully on {device}")
         return model
-        
+
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
         raise
@@ -452,7 +453,7 @@ def run_inference_step(inputs: Inputs) -> None:
         logger.info(f"WebKnossos inference mode: fetching metadata for dataset {inputs.wk_dataset_id}")
         inputs.s3_path = get_wk_dataset_metadata(inputs.wk_dataset_id)
         logger.info(f"Retrieved s3_path from WebKnossos metadata: {inputs.s3_path}")
-    
+
     logger.info(
         f"Starting optimized inference with task_id={task_id}, model={inputs.model_key}, s3_path={inputs.s3_path}, "
         f"layers=[{inputs.start_layer}, {inputs.end_layer}], wk_inference={inputs.wk_inference}"
@@ -484,11 +485,11 @@ def run_inference_step(inputs: Inputs) -> None:
     # Stream tiles directly from the downloaded files inside the inference module.
     num_layers = len(layer_paths)
     logger.info(f"Prepared {num_layers} layer files for streaming")
-    logger.info(f"Model expects {CFG.in_chans} channels, got {num_layers} layers") 
+    logger.info(f"Model expects {CFG.in_chans} channels, got {num_layers} layers")
 
     if CFG.in_chans != num_layers:
         raise ValueError(f"Channel mismatch: model expects {CFG.in_chans}, got {num_layers}")
-        
+
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
@@ -569,23 +570,23 @@ def run_inference_step(inputs: Inputs) -> None:
             s3_client, bucket, prefix, prediction, inputs.model_key, inputs.start_layer, inputs.end_layer
         )
         logger.info(f"Uploaded result to S3: {result_uri}")
-        
+
         # Upload to WebKnossos as new layer
         logger.info("Uploading prediction to WebKnossos dataset...")
         wk_layer_name = upload_to_webknossos(
             inputs.wk_dataset_id, prediction, inputs.model_key, inputs.start_layer, inputs.end_layer
         )
         logger.info(f"Uploaded prediction to WebKnossos layer: {wk_layer_name}")
-        
+
         # Write both results
         logger.info(f"Writing result S3 URI to /tmp/result_s3_url.txt: {result_uri}")
         with open("/tmp/result_s3_url.txt", "w", encoding="utf-8") as f:
             f.write(result_uri)
-        
+
         logger.info(f"Writing WebKnossos layer name to /tmp/result_wk_layer.txt: {wk_layer_name}")
         with open("/tmp/result_wk_layer.txt", "w", encoding="utf-8") as f:
             f.write(wk_layer_name)
-            
+
         logger.info(f"Inference completed successfully - S3: {result_uri}, WebKnossos layer: {wk_layer_name}")
     else:
         # Standard S3-only workflow
