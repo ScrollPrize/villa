@@ -15,10 +15,8 @@ from typing import Dict, List, Optional, Tuple
 import uuid
 import boto3
 import numpy as np
-from torch.nn import DataParallel
 from botocore.config import Config
 import cv2
-import torch
 import concurrent.futures
 import zarr
 from huggingface_hub import snapshot_download
@@ -32,15 +30,12 @@ except:
     pass
 
 from inference_timesformer import (
-    RegressionPLModel,
     run_inference,
     reduce_partitions,
     write_tiled_tiff,
     create_surface_volume_zarr,
     CFG,
 )
-
-from torch.nn import DataParallel
 
 logging.basicConfig(
     level=logging.INFO,
@@ -390,48 +385,6 @@ def upload_to_webknossos(wk_dataset_id: str, prediction: np.ndarray, model_key: 
         raise RuntimeError(f"Failed to upload prediction to WebKnossos: {e}") from e
 
 
-def load_model(model_path: str, device: torch.device) -> RegressionPLModel:
-    """
-    Load and initialize the TimeSformer model.
-    
-    Args:
-        model_path: Path to model checkpoint
-        
-    Returns:
-        Loaded and initialized model
-    """
-    try:
-        logger.info(f"Loading model from: {model_path}")
-
-        # Try to load with PyTorch Lightning first
-        try:
-            model = RegressionPLModel.load_from_checkpoint(model_path, strict=False)
-            logger.info("Model loaded with PyTorch Lightning")
-        except Exception as e:
-            logger.warning(f"PyTorch Lightning loading failed: {e}, trying manual loading")
-            # Fallback to manual loading
-            model = RegressionPLModel(pred_shape=(1, 1))
-            checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
-            model.load_state_dict(checkpoint['state_dict'])
-            logger.info("Model loaded manually")
-
-        # Setup multi-GPU if available
-        if torch.cuda.device_count() > 1:
-            model = DataParallel(model)
-            logger.info(f"Model wrapped with DataParallel for {torch.cuda.device_count()} GPUs")
-
-        # Move to device
-        model.to(device)
-        model.eval()
-
-        logger.info(f"Model loaded successfully on {device}")
-        return model
-
-    except Exception as e:
-        logger.error(f"Failed to load model: {e}")
-        raise
-
-
 def save_and_upload_prediction(
     s3_client, bucket: str, prefix: str, prediction: np.ndarray, model_key: str, start_layer: int, end_layer: int
 ) -> str:
@@ -504,6 +457,11 @@ def run_prepare_step(inputs: Inputs) -> None:
 
 def run_inference_step(inputs: Inputs) -> None:
     """Execute the inference step (either standard or partitioned mode)."""
+    # Import torch and related dependencies only when doing inference
+    import torch
+    from torch.nn import DataParallel
+    from inference_timesformer import load_model
+
     task_id = uuid.uuid4()
     logger.info(f"Task ID generated: {task_id}")
 

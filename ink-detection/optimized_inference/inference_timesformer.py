@@ -643,6 +643,49 @@ def reduce_partitions(
         logger.error(f"Error in reduce_partitions: {e}")
         raise
 
+def load_model(model_path: str, device: torch.device) -> RegressionPLModel:
+    """
+    Load and initialize the TimeSformer model.
+
+    Args:
+        model_path: Path to model checkpoint
+        device: Torch device to load model onto
+
+    Returns:
+        Loaded and initialized model
+    """
+    try:
+        logger.info(f"Loading model from: {model_path}")
+
+        # Try to load with PyTorch Lightning first
+        try:
+            model = RegressionPLModel.load_from_checkpoint(model_path, strict=False)
+            logger.info("Model loaded with PyTorch Lightning")
+        except Exception as e:
+            logger.warning(f"PyTorch Lightning loading failed: {e}, trying manual loading")
+            # Fallback to manual loading
+            model = RegressionPLModel(pred_shape=(1, 1))
+            checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+            model.load_state_dict(checkpoint['state_dict'])
+            logger.info("Model loaded manually")
+
+        # Setup multi-GPU if available
+        if torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model)
+            logger.info(f"Model wrapped with DataParallel for {torch.cuda.device_count()} GPUs")
+
+        # Move to device
+        model.to(device)
+        model.eval()
+
+        logger.info(f"Model loaded successfully on {device}")
+        return model
+
+    except Exception as e:
+        logger.error(f"Failed to load model: {e}")
+        raise
+
+
 def write_tiled_tiff(prediction: np.ndarray, output_path: str) -> None:
     """
     Write prediction array to a tiled TIFF file.

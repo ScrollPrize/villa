@@ -28,21 +28,18 @@ ENV CUDA_VISIBLE_DEVICES=0
 
 ENTRYPOINT ["python", "/app/entrypoint.py"]
 
-FROM python:3.10-slim AS cpu
+FROM python:3.11-slim AS cpu
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
     ca-certificates \
-    gcc \
-    g++ \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements-cpu-only.txt /app
-RUN pip install --no-cache-dir -r requirements-cpu-only.txt && \
-    apt-get purge -y --auto-remove gcc g++
+RUN pip install --no-cache-dir -r requirements-cpu-only.txt
 
 COPY entrypoint.py /app
 COPY inference_timesformer.py /app
