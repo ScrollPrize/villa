@@ -71,8 +71,9 @@ class InferenceConfig:
     size = 64       # net input size (post-resize, normally equals tile_size)
     tile_size = 64
     stride = 16
-    batch_size = 64
-    workers = min(4, os.cpu_count() or 4)
+    batch_size = 256  # Increased for better GPU utilization
+    workers = min(8, os.cpu_count() or 4)  # More workers to feed GPU faster
+    prefetch_factor = 4  # More prefetching per worker
 
     # Image processing / scaling
     max_clip_value = 200
@@ -161,7 +162,7 @@ class LayersSource:
             )
 
         # Create zarr v2 array with shape (H, W, C) and chunk size optimized for spatial tile access
-        # Using chunks of (256, 256, c) for efficient spatial tile reads
+        # Using chunks of (256, 256, 1) for efficient spatial tile reads
         # Compression disabled (compressor=None) for maximum speed
         chunk_size = 1024
         z = zarr.open(
@@ -173,39 +174,37 @@ class LayersSource:
             compressor=None
         )
 
-        # Simple sequential loop
+        # Parallel reads with batching to limit memory usage
+        max_workers = int(os.environ.get("MMAP_READ_WORKERS", str(min(6, (os.cpu_count() or 4)))))
         log_every = max(1, c // 10)
+        # Limit in-flight futures to prevent memory buildup
+        batch_size = max_workers * 2
 
-        for idx, p in enumerate(paths):
+        def _read_and_write(idx_path):
+            """Read image and write directly to zarr, return only index."""
+            idx, p = idx_path
             img = LayersSource._read_gray_any(p)
             if img is None:
                 raise RuntimeError(f"Failed to read image: {p}")
             if img.shape != (h, w):
                 raise RuntimeError(f"Layer size mismatch: {p} has {img.shape}, expected {(h, w)}")
-            z[:, :, idx] = img  # write to channel slice
-            if ((idx + 1) % log_every == 0) or ((idx + 1) == c):
-                logger.info(f"Zarr array build progress: {idx + 1}/{c} layers")
+            z[:, :, idx] = img  # write to zarr immediately
+            del img  # release memory ASAP
+            return idx
 
-        # # Parallel reads, single-writer commit (commented out for now)
-        # max_workers = int(os.environ.get("MMAP_READ_WORKERS", str(min(6, (os.cpu_count() or 4)))))
-        # def _read(idx_path):
-        #     idx, p = idx_path
-        #     img = LayersSource._read_gray_any(p)
-        #     if img is None:
-        #         raise RuntimeError(f"Failed to read image: {p}")
-        #     if img.shape != (h, w):
-        #         raise RuntimeError(f"Layer size mismatch: {p} has {img.shape}, expected {(h, w)}")
-        #     return idx, img
-        #
-        # with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        #     futures = [ex.submit(_read, (i, p)) for i, p in enumerate(paths)]
-        #     n_done = 0
-        #     for fut in concurrent.futures.as_completed(futures):
-        #         idx, img = fut.result()
-        #         n_done += 1
-        #         z[:, :, idx] = img  # write to channel slice
-        #         if (n_done % log_every == 0) or (n_done == c):
-        #             logger.info(f"Zarr array build progress: {n_done}/{c} layers")
+        n_done = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            # Process in batches to limit memory
+            for batch_start in range(0, c, batch_size):
+                batch_end = min(batch_start + batch_size, c)
+                batch_paths = [(i, paths[i]) for i in range(batch_start, batch_end)]
+                futures = [ex.submit(_read_and_write, ip) for ip in batch_paths]
+
+                for fut in concurrent.futures.as_completed(futures):
+                    idx = fut.result()
+                    n_done += 1
+                    if (n_done % log_every == 0) or (n_done == c):
+                        logger.info(f"Zarr array build progress: {n_done}/{c} layers")
 
         # Reopen in read-only mode for safety
         z = zarr.open(zarr_path, mode="r")
@@ -282,8 +281,8 @@ class SlidingWindowDataset(Dataset):
         tile = self.source.read_roi(y1, y2, x1, x2)  # (tile, tile, C), uint8
         if self.reverse:
             tile = tile[:, :, ::-1]
-        # Clip to match training range
-        tile = np.clip(tile, 0, CFG.max_clip_value).astype(tile.dtype, copy=False)
+        # Clip to match training range - in-place for speed
+        np.clip(tile, 0, CFG.max_clip_value, out=tile)
 
         data = self.transform(image=tile)  # -> tensor (C,H,W)
         tens = data["image"].unsqueeze(0)  # -> (1,C,H,W) so C becomes frames
@@ -336,8 +335,9 @@ def create_inference_dataloader(
             num_workers=CFG.workers,
             pin_memory=torch.cuda.is_available(),
             persistent_workers=(CFG.workers > 0),
-            prefetch_factor=2 if CFG.workers > 0 else None,
+            prefetch_factor=CFG.prefetch_factor if CFG.workers > 0 else None,
             drop_last=False,
+            multiprocessing_context='fork' if CFG.workers > 0 else None,  # Faster worker startup
         )
         logger.info(f"Created dataloader with {len(dataset)} tiles")
         return loader, (h, w)
