@@ -94,17 +94,136 @@ class InferenceConfig:
 
 CFG = InferenceConfig()
 
+# --------------------- Surface Volume Zarr Creation -------------------------
+def _read_gray_any(path: str) -> np.ndarray:
+    """Read a grayscale image from various formats."""
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext in (".tif", ".tiff"):
+            img = tiff.imread(path)
+            if img is None:
+                logger.warning(f"Failed to read image: {path}")
+                return None
+            if img.ndim > 2:
+                img = img[..., 0]
+            if img.dtype != np.uint8:
+                # Minimal, safe conversion to uint8
+                img = np.clip(img, 0, 255).astype(np.uint8)
+            return img
+        else:
+            return cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    except Exception:
+        logger.exception(f"Exception reading image: {path}")
+        return None
+
+def create_surface_volume_zarr(
+    layer_paths: List[str],
+    output_path: str,
+    chunk_size: int = 1024,
+    max_workers: Optional[int] = None
+) -> str:
+    """
+    Create a surface volume zarr array from a list of layer image files.
+
+    Args:
+        layer_paths: List of paths to layer image files (must be sorted in layer order)
+        output_path: Path where the zarr array will be created
+        chunk_size: Chunk size for zarr array (default: 1024x1024x1)
+        max_workers: Number of worker threads for parallel reading (default: auto)
+
+    Returns:
+        Path to the created zarr array (same as output_path)
+
+    Raises:
+        RuntimeError: If image reading fails or size mismatches occur
+    """
+    import concurrent.futures
+
+    if not layer_paths:
+        raise ValueError("layer_paths cannot be empty")
+
+    # Read first image to get dimensions
+    first = _read_gray_any(layer_paths[0])
+    if first is None:
+        raise RuntimeError(f"Failed to read image: {layer_paths[0]}")
+    h, w = first.shape
+    c = len(layer_paths)
+
+    # Check disk space
+    zarr_root = os.path.dirname(output_path) or "/tmp"
+    required_gib = (h * w * c) / (1024**3)
+    free_gib = shutil.disk_usage(zarr_root).free / (1024**3)
+    logger.info(
+        f"Creating surface volume zarr at {output_path} (H,W,C={h},{w},{c} ~{required_gib:.2f} GiB). "
+        f"Free on {zarr_root}: {free_gib:.2f} GiB."
+    )
+    if free_gib < required_gib * 1.10:
+        raise RuntimeError(
+            f"Not enough space on {zarr_root}: need ~{required_gib:.2f} GiB, have {free_gib:.2f} GiB"
+        )
+
+    # Remove existing zarr if present
+    if os.path.exists(output_path):
+        logger.warning(f"Removing existing zarr at {output_path}")
+        shutil.rmtree(output_path)
+
+    # Create zarr v2 array with shape (H, W, C) and chunk size optimized for spatial tile access
+    # Compression disabled (compressor=None) for maximum speed
+    z = zarr.open(
+        output_path,
+        mode="w",
+        shape=(h, w, c),
+        chunks=(chunk_size, chunk_size, 1),
+        dtype=np.uint8,
+        compressor=None
+    )
+
+    # Parallel reads with batching to limit memory usage
+    if max_workers is None:
+        max_workers = int(os.environ.get("MMAP_READ_WORKERS", str(min(6, (os.cpu_count() or 4)))))
+    log_every = max(1, c // 10)
+    # Limit in-flight futures to prevent memory buildup
+    batch_size = max_workers * 2
+
+    def _read_and_write(idx_path):
+        """Read image and write directly to zarr, return only index."""
+        idx, p = idx_path
+        img = _read_gray_any(p)
+        if img is None:
+            raise RuntimeError(f"Failed to read image: {p}")
+        if img.shape != (h, w):
+            raise RuntimeError(f"Layer size mismatch: {p} has {img.shape}, expected {(h, w)}")
+        z[:, :, idx] = img  # write to zarr immediately
+        del img  # release memory ASAP
+        return idx
+
+    n_done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        # Process in batches to limit memory
+        for batch_start in range(0, c, batch_size):
+            batch_end = min(batch_start + batch_size, c)
+            batch_paths = [(i, layer_paths[i]) for i in range(batch_start, batch_end)]
+            futures = [ex.submit(_read_and_write, ip) for ip in batch_paths]
+
+            for fut in concurrent.futures.as_completed(futures):
+                idx = fut.result()
+                n_done += 1
+                if (n_done % log_every == 0) or (n_done == c):
+                    logger.info(f"Surface volume zarr build progress: {n_done}/{c} layers")
+
+    logger.info(f"Surface volume zarr created successfully at {output_path}")
+    return output_path
+
 # --------------------- Disk-backed / Array-backed layers ---------------------
 class LayersSource:
     """
     Unified source of layers that supports:
       • numpy arrays of shape (H, W, C)
-      • list of file paths to grayscale images (C files)
+      • path to an existing zarr array
 
-    When given file paths, builds a disk-backed memmap (uint8) (H, W, C) once,
-    so tiles are read quickly without holding the whole stack in RAM.
+    For reading tiles during inference without holding the whole stack in RAM.
     """
-    def __init__(self, src: Union[np.ndarray, List[str]]):
+    def __init__(self, src: Union[np.ndarray, str]):
         if isinstance(src, np.ndarray):
             if src.ndim != 3:
                 raise ValueError(f"Expected (H,W,C) array, got {src.shape}")
@@ -112,110 +231,20 @@ class LayersSource:
             self._mm = None
             self._shape = src.shape
             self._dtype = src.dtype
-            self._owns_mm = False
-        elif isinstance(src, list):
-            if len(src) != CFG.in_chans:
-                logger.warning(f"Expected {CFG.in_chans} layer files, got {len(src)}")
+        elif isinstance(src, str):
+            # Path to existing zarr array
+            if not os.path.exists(src):
+                raise ValueError(f"Zarr path does not exist: {src}")
+            logger.info(f"Opening existing zarr array at {src}")
             self._arr = None
-            self._mm, self._shape, self._dtype = self._build_memmap_from_files(src)
-            self._owns_mm = True
+            self._mm = zarr.open(src, mode='r')
+            self._shape = self._mm.shape
+            self._dtype = self._mm.dtype
+            if len(self._shape) != 3:
+                raise ValueError(f"Expected (H,W,C) zarr, got shape {self._shape}")
+            logger.info(f"Loaded zarr with shape {self._shape}, dtype {self._dtype}")
         else:
-            raise TypeError("LayersSource expects np.ndarray or List[str] of file paths")
-
-    @staticmethod
-    def _read_gray_any(path: str) -> np.ndarray:
-        ext = os.path.splitext(path)[1].lower()
-        try:
-            if ext in (".tif", ".tiff"):
-                img = tiff.imread(path)
-                if img is None:
-                    logger.warning(f"Failed to read image: {path}")
-                    return None
-                if img.ndim > 2:
-                    img = img[..., 0]
-                if img.dtype != np.uint8:
-                    # Minimal, safe conversion to uint8
-                    img = np.clip(img, 0, 255).astype(np.uint8)
-                return img
-            else:
-                return cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        except Exception:
-            logger.exception(f"Exception reading image: {path}")
-            return None
-
-    @staticmethod
-    def _build_memmap_from_files(paths: List[str]) -> Tuple[np.ndarray, Tuple[int, int, int], np.dtype]:
-        """Create a zarr disk-backed array with shape (H,W,C)."""
-        import zarr
-        import concurrent.futures
-
-        first = LayersSource._read_gray_any(paths[0])
-        if first is None:
-            raise RuntimeError(f"Failed to read image: {paths[0]}")
-        h, w = first.shape
-        c = len(paths)
-
-        zarr_root = os.environ.get("MMAP_DIR", "/tmp")
-        zarr_path = os.path.join(zarr_root, f"layers_{uuid.uuid4().hex}.zarr")
-        required_gib = (h * w * c) / (1024**3)
-        free_gib = shutil.disk_usage(zarr_root).free / (1024**3)
-        logger.info(
-            f"Creating zarr array at {zarr_path} (H,W,C={h},{w},{c} ~{required_gib:.2f} GiB). "
-            f"Free on {zarr_root}: {free_gib:.2f} GiB."
-        )
-        if free_gib < required_gib * 1.10:
-            raise RuntimeError(
-                f"Not enough space on {zarr_root}: need ~{required_gib:.2f} GiB, have {free_gib:.2f} GiB"
-            )
-
-        # Create zarr v2 array with shape (H, W, C) and chunk size optimized for spatial tile access
-        # Using chunks of (256, 256, 1) for efficient spatial tile reads
-        # Compression disabled (compressor=None) for maximum speed
-        chunk_size = 1024
-        z = zarr.open(
-            zarr_path,
-            mode="w",
-            shape=(h, w, c),
-            chunks=(chunk_size, chunk_size, 1),
-            dtype=np.uint8,
-            compressor=None
-        )
-
-        # Parallel reads with batching to limit memory usage
-        max_workers = int(os.environ.get("MMAP_READ_WORKERS", str(min(6, (os.cpu_count() or 4)))))
-        log_every = max(1, c // 10)
-        # Limit in-flight futures to prevent memory buildup
-        batch_size = max_workers * 2
-
-        def _read_and_write(idx_path):
-            """Read image and write directly to zarr, return only index."""
-            idx, p = idx_path
-            img = LayersSource._read_gray_any(p)
-            if img is None:
-                raise RuntimeError(f"Failed to read image: {p}")
-            if img.shape != (h, w):
-                raise RuntimeError(f"Layer size mismatch: {p} has {img.shape}, expected {(h, w)}")
-            z[:, :, idx] = img  # write to zarr immediately
-            del img  # release memory ASAP
-            return idx
-
-        n_done = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-            # Process in batches to limit memory
-            for batch_start in range(0, c, batch_size):
-                batch_end = min(batch_start + batch_size, c)
-                batch_paths = [(i, paths[i]) for i in range(batch_start, batch_end)]
-                futures = [ex.submit(_read_and_write, ip) for ip in batch_paths]
-
-                for fut in concurrent.futures.as_completed(futures):
-                    idx = fut.result()
-                    n_done += 1
-                    if (n_done % log_every == 0) or (n_done == c):
-                        logger.info(f"Zarr array build progress: {n_done}/{c} layers")
-
-        # Reopen in read-only mode for safety
-        z = zarr.open(zarr_path, mode="r")
-        return z, (h, w, c), z.dtype
+            raise TypeError("LayersSource expects np.ndarray or str (zarr path)")
 
     @property
     def shape(self) -> Tuple[int, int, int]:
@@ -242,18 +271,23 @@ class LayersSource:
 
 # ----------------------------- Preprocess ------------------------------------
 def preprocess_layers(
-    layers: Union[np.ndarray, List[str]],
+    layers: Union[np.ndarray, str],
     fragment_mask: Optional[np.ndarray] = None,
     is_reverse_segment: bool = False
 ) -> Tuple[LayersSource, np.ndarray, Tuple[int, int], bool]:
     """
     Prepare layers for streaming inference.
 
+    Args:
+        layers: Either a numpy array (H, W, C) or path to a zarr array
+        fragment_mask: Optional mask array (H, W)
+        is_reverse_segment: Whether to reverse layer order
+
     Returns:
         (source, mask, orig_shape, reverse_flag)
     """
     try:
-        src = LayersSource(layers)  # could build memmap here
+        src = LayersSource(layers)
         h, w, c = src.shape
         if c != CFG.in_chans:
             logger.warning(f"Model expects {CFG.in_chans} channels, got {c}")
@@ -636,14 +670,21 @@ def write_tiled_tiff(prediction: np.ndarray, output_path: str) -> None:
         raise
 
 def run_inference(
-    layers: Union[np.ndarray, List[str]],
+    layers: Union[np.ndarray, str],
     model: RegressionPLModel,
     device: torch.device,
     fragment_mask: Optional[np.ndarray] = None,
     is_reverse_segment: bool = False
 ) -> Union[np.ndarray, Dict[str, str]]:
     """
-    Main entrypoint: accepts either a stacked array (H,W,C) or a list of file paths.
+    Main entrypoint: accepts either a stacked array (H,W,C) or path to a zarr array.
+
+    Args:
+        layers: Either numpy array (H, W, C) or path to zarr array
+        model: The inference model
+        device: Torch device
+        fragment_mask: Optional mask array (H, W)
+        is_reverse_segment: Whether to reverse layer order
 
     Returns:
         - If num_parts == 1: returns (H,W) heatmap numpy array

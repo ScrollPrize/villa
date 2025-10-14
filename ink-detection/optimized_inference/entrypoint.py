@@ -36,6 +36,7 @@ from inference_timesformer import (
     run_inference,
     reduce_partitions,
     write_tiled_tiff,
+    create_surface_volume_zarr,
     CFG,
 )
 
@@ -57,10 +58,11 @@ class Inputs:
     force_reverse: bool = False
     wk_inference: bool = False
     wk_dataset_id: str = ""
-    step: str = "inference"  # "inference" or "reduce"
+    step: str = "inference"  # "prepare", "inference", or "reduce"
     num_parts: int = 1
     part_id: int = 0
     zarr_output_dir: str = "/tmp/partitions"
+    surface_volume_zarr: str = ""  # Path to pre-created surface volume zarr
 
 def parse_env() -> Inputs:
     try:
@@ -76,10 +78,11 @@ def parse_env() -> Inputs:
         num_parts = int(os.getenv("NUM_PARTS", "1"))
         part_id = int(os.getenv("PART_ID", "0"))
         zarr_output_dir = os.getenv("ZARR_OUTPUT_DIR", "/tmp/partitions").strip()
+        surface_volume_zarr = os.getenv("SURFACE_VOLUME_ZARR", "").strip()
 
         # Validate step parameter
-        if step not in ("inference", "reduce"):
-            raise ValueError(f"STEP must be 'inference' or 'reduce', got '{step}'")
+        if step not in ("prepare", "inference", "reduce"):
+            raise ValueError(f"STEP must be 'prepare', 'inference', or 'reduce', got '{step}'")
 
         # Validate partitioning parameters
         if step == "inference" and num_parts > 1:
@@ -89,9 +92,19 @@ def parse_env() -> Inputs:
         if step == "reduce" and num_parts <= 1:
             raise ValueError("STEP=reduce requires NUM_PARTS > 1")
 
-        # Validate that at least one of s3_path or wk_dataset_id is provided (except for reduce step)
-        if step != "reduce" and not s3_path and not wk_dataset_id:
-            raise ValueError("Either S3_PATH or WK_DATASET_ID must be provided")
+        # Validate required parameters per step
+        if step == "prepare":
+            # Prepare step requires s3_path or wk_dataset_id
+            if not s3_path and not wk_dataset_id:
+                raise ValueError("STEP=prepare requires either S3_PATH or WK_DATASET_ID")
+        elif step == "inference":
+            # Inference step requires surface_volume_zarr
+            if not surface_volume_zarr:
+                raise ValueError("STEP=inference requires SURFACE_VOLUME_ZARR (run STEP=prepare first)")
+            # For non-partitioned inference, also need s3_path for result upload
+            if num_parts == 1 and not s3_path and not wk_dataset_id:
+                raise ValueError("STEP=inference with NUM_PARTS=1 requires S3_PATH or WK_DATASET_ID for result upload")
+        # reduce step doesn't require these
 
         wk_inference = bool(wk_dataset_id)
 
@@ -110,6 +123,7 @@ def parse_env() -> Inputs:
             num_parts=num_parts,
             part_id=part_id,
             zarr_output_dir=zarr_output_dir,
+            surface_volume_zarr=surface_volume_zarr,
         )
     except KeyError as e:
         raise RuntimeError(f"Missing required env var: {e.args[0]}") from e
@@ -433,10 +447,71 @@ def save_and_upload_prediction(
     return f"s3://{bucket}/{out_key}"
 
 
+def run_prepare_step(inputs: Inputs) -> None:
+    """Execute the prepare step to create surface volume zarr from S3 layers."""
+    logger.info("Starting prepare step: creating surface volume zarr")
+
+    # Handle WebKnossos workflow
+    if inputs.wk_inference:
+        logger.info(f"WebKnossos inference mode: fetching metadata for dataset {inputs.wk_dataset_id}")
+        inputs.s3_path = get_wk_dataset_metadata(inputs.wk_dataset_id)
+        logger.info(f"Retrieved s3_path from WebKnossos metadata: {inputs.s3_path}")
+
+    # S3 setup
+    logger.info("Setting up S3 client...")
+    s3_client = boto3.client("s3")
+    logger.info(f"Parsing S3 URI: {inputs.s3_path}")
+    bucket, prefix = parse_s3_uri(inputs.s3_path)
+
+    logger.info(f"Listing layer objects in S3 bucket '{bucket}' with prefix '{prefix}' for layers [{inputs.start_layer}, {inputs.end_layer})")
+    layer_objects = list_layers_objects(
+        s3_client, bucket, prefix, inputs.start_layer, inputs.end_layer
+    )
+    logger.info(f"Found {len(layer_objects)} layer objects to download")
+
+    # Download layers to temporary directory
+    work_dir = "/workspace"
+    input_dir = os.path.join(work_dir, "input", "layers")
+    logger.info(f"Ensuring clean input directory at {os.path.join(work_dir, 'input')}")
+    ensure_clean_dir(os.path.join(work_dir, "input"))
+
+    logger.info(f"Downloading layer files to {input_dir} ...")
+    layer_paths = download_layers(s3_client, bucket, layer_objects, input_dir)
+    logger.info(f"Downloaded {len(layer_paths)} layer files")
+
+    # Determine output path for surface volume zarr
+    if inputs.surface_volume_zarr:
+        output_path = inputs.surface_volume_zarr
+    else:
+        # Default: put it in the zarr output directory with a descriptive name
+        os.makedirs(inputs.zarr_output_dir, exist_ok=True)
+        output_path = os.path.join(
+            inputs.zarr_output_dir,
+            f"surface_volume_{inputs.start_layer:02d}_{inputs.end_layer:02d}.zarr"
+        )
+
+    logger.info(f"Creating surface volume zarr at {output_path}")
+    created_zarr_path = create_surface_volume_zarr(layer_paths, output_path)
+
+    # Write output path to file for next step
+    output_file = "/tmp/surface_volume_zarr_path.txt"
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(created_zarr_path)
+
+    logger.info(f"Prepare step completed successfully. Surface volume zarr created at: {created_zarr_path}")
+    logger.info(f"Zarr path written to: {output_file}")
+
+
 def run_inference_step(inputs: Inputs) -> None:
     """Execute the inference step (either standard or partitioned mode)."""
     task_id = uuid.uuid4()
     logger.info(f"Task ID generated: {task_id}")
+
+    # Verify surface volume zarr exists
+    if not os.path.exists(inputs.surface_volume_zarr):
+        raise RuntimeError(f"Surface volume zarr not found at: {inputs.surface_volume_zarr}")
+
+    logger.info(f"Using surface volume zarr: {inputs.surface_volume_zarr}")
 
     # Configure CFG with partition parameters
     CFG.num_parts = inputs.num_parts
@@ -448,47 +523,35 @@ def run_inference_step(inputs: Inputs) -> None:
         f"zarr_output_dir={inputs.zarr_output_dir}"
     )
 
-    # Handle WebKnossos workflow
+    # For uploading results, we need s3_path
+    # Handle WebKnossos workflow if needed
     if inputs.wk_inference:
         logger.info(f"WebKnossos inference mode: fetching metadata for dataset {inputs.wk_dataset_id}")
         inputs.s3_path = get_wk_dataset_metadata(inputs.wk_dataset_id)
         logger.info(f"Retrieved s3_path from WebKnossos metadata: {inputs.s3_path}")
 
     logger.info(
-        f"Starting optimized inference with task_id={task_id}, model={inputs.model_key}, s3_path={inputs.s3_path}, "
+        f"Starting optimized inference with task_id={task_id}, model={inputs.model_key}, "
+        f"surface_volume_zarr={inputs.surface_volume_zarr}, "
         f"layers=[{inputs.start_layer}, {inputs.end_layer}], wk_inference={inputs.wk_inference}"
     )
 
-    # Prepare I/O directories
+    # Prepare models directory
     work_dir = "/workspace"
-    input_dir = os.path.join(work_dir, "input", "layers")
     models_dir = os.path.join(work_dir, "models")
-    logger.info(f"Ensuring clean input directory at {os.path.join(work_dir, 'input')}")
-    ensure_clean_dir(os.path.join(work_dir, "input"))
     logger.info(f"Ensuring models directory exists at {models_dir}")
     os.makedirs(models_dir, exist_ok=True)
 
-    # S3 setup
+    # S3 setup (for model download and result upload)
     logger.info("Setting up S3 client...")
     s3_client = boto3.client("s3")
-    logger.info(f"Parsing S3 URI: {inputs.s3_path}")
-    bucket, prefix = parse_s3_uri(inputs.s3_path)
-    logger.info(f"Listing layer objects in S3 bucket '{bucket}' with prefix '{prefix}' for layers [{inputs.start_layer}, {inputs.end_layer})")
-    layer_objects = list_layers_objects(
-        s3_client, bucket, prefix, inputs.start_layer, inputs.end_layer
-    )
-    logger.info(f"Found {len(layer_objects)} layer objects to download")
-    logger.info(f"Downloading layer files to {input_dir} ...")
-    layer_paths = download_layers(s3_client, bucket, layer_objects, input_dir)
-    logger.info(f"Downloaded {len(layer_paths)} layer files")
 
-    # Stream tiles directly from the downloaded files inside the inference module.
-    num_layers = len(layer_paths)
-    logger.info(f"Prepared {num_layers} layer files for streaming")
-    logger.info(f"Model expects {CFG.in_chans} channels, got {num_layers} layers")
-
-    if CFG.in_chans != num_layers:
-        raise ValueError(f"Channel mismatch: model expects {CFG.in_chans}, got {num_layers}")
+    # Parse s3_path for result upload
+    if inputs.s3_path:
+        logger.info(f"Parsing S3 URI for result upload: {inputs.s3_path}")
+        bucket, prefix = parse_s3_uri(inputs.s3_path)
+    else:
+        bucket, prefix = None, None
 
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -548,10 +611,10 @@ def run_inference_step(inputs: Inputs) -> None:
     else:
         is_reverse_segment = False
 
-    # Run inference
-    logger.info("Running inference from streamed layer files...")
+    # Run inference from zarr
+    logger.info("Running inference from surface volume zarr...")
     start_infer_time = time.time()
-    result = run_inference(layer_paths, model, device, is_reverse_segment=is_reverse_segment)
+    result = run_inference(inputs.surface_volume_zarr, model, device, is_reverse_segment=is_reverse_segment)
     logger.info(f"Inference completed in {time.time() - start_infer_time:.2f} seconds")
 
     # Handle partitioned vs standard mode
@@ -673,7 +736,9 @@ def main() -> None:
     )
 
     # Dispatch to appropriate step
-    if inputs.step == "inference":
+    if inputs.step == "prepare":
+        run_prepare_step(inputs)
+    elif inputs.step == "inference":
         run_inference_step(inputs)
     elif inputs.step == "reduce":
         run_reduce_step(inputs)
