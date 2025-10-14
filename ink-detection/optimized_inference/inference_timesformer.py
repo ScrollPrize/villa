@@ -14,7 +14,8 @@ import gc
 import uuid
 import logging
 import shutil
-from typing import List, Tuple, Optional, Union
+import math
+from typing import List, Tuple, Optional, Union, Dict
 
 import numpy as np
 import torch
@@ -28,6 +29,7 @@ from albumentations.pytorch import ToTensorV2
 from tqdm.auto import tqdm
 import tifffile as tiff
 import cv2
+import zarr
 
 # ----------------------------- Logging ---------------------------------------
 logging.basicConfig(level=logging.INFO)
@@ -84,6 +86,11 @@ class InferenceConfig:
 
     # Tile selection
     min_valid_ratio = 0.0  # keep tiles with >= this fraction of nonzero mask
+
+    # Partitioning for map/reduce inference
+    num_parts = 1  # Total number of partitions (1 = no partitioning)
+    part_id = 0    # Current partition ID (0-indexed)
+    zarr_output_dir = os.environ.get("ZARR_OUTPUT_DIR", "/tmp/partitions")
 
 CFG = InferenceConfig()
 
@@ -292,8 +299,8 @@ def create_inference_dataloader(
     source: LayersSource,
     fragment_mask: np.ndarray,
     reverse: bool
-) -> Tuple[DataLoader, Tuple[int, int]]:
-    """Return (loader, pred_shape=(H,W))."""
+) -> Tuple[DataLoader, Tuple[int, int], Dict[str, int]]:
+    """Return (loader, pred_shape=(H,W), partition_info)."""
     try:
         h, w, _ = source.shape
 
@@ -314,6 +321,34 @@ def create_inference_dataloader(
 
         if not xyxys:
             raise ValueError("No valid tiles (mask empty or fully filtered).")
+
+        total_tiles = len(xyxys)
+
+        # Apply range-based partitioning if num_parts > 1
+        partition_info = {
+            "total_tiles": total_tiles,
+            "start_idx": 0,
+            "end_idx": total_tiles,
+            "partition_tiles": total_tiles,
+        }
+
+        if CFG.num_parts > 1:
+            tiles_per_part = math.ceil(total_tiles / CFG.num_parts)
+            start_idx = CFG.part_id * tiles_per_part
+            end_idx = min(start_idx + tiles_per_part, total_tiles)
+            xyxys = xyxys[start_idx:end_idx]
+
+            partition_info.update({
+                "start_idx": start_idx,
+                "end_idx": end_idx,
+                "partition_tiles": len(xyxys),
+            })
+
+            logger.info(
+                f"Partition {CFG.part_id}/{CFG.num_parts}: "
+                f"processing tiles [{start_idx}:{end_idx}] "
+                f"({len(xyxys)} tiles out of {total_tiles} total)"
+            )
 
         # Build transforms; avoid no-op resize
         tfm_list = []
@@ -340,7 +375,7 @@ def create_inference_dataloader(
             multiprocessing_context='fork' if CFG.workers > 0 else None,  # Faster worker startup
         )
         logger.info(f"Created dataloader with {len(dataset)} tiles")
-        return loader, (h, w)
+        return loader, (h, w), partition_info
 
     except Exception as e:
         logger.error(f"Error creating dataloader: {e}")
@@ -387,12 +422,48 @@ def predict_fn(
     model: RegressionPLModel,
     device: torch.device,
     pred_shape: Tuple[int, int]
-) -> np.ndarray:
-    """Run tiled inference and blend into a single (H,W) heatmap."""
+) -> Union[np.ndarray, Dict[str, str]]:
+    """
+    Run tiled inference and blend into a single (H,W) heatmap.
+
+    Returns:
+        - If num_parts == 1: returns blended numpy array (H, W)
+        - If num_parts > 1: returns dict with zarr paths {"mask_pred": path, "mask_count": path}
+    """
     try:
         H, W = pred_shape
-        mask_pred = np.zeros((H, W), dtype=np.float32)
-        mask_count = np.zeros((H, W), dtype=np.float32)
+
+        # Determine output mode based on partitioning
+        if CFG.num_parts > 1:
+            # Partitioned mode: write to zarr arrays
+            os.makedirs(CFG.zarr_output_dir, exist_ok=True)
+            mask_pred_path = os.path.join(CFG.zarr_output_dir, f"mask_pred_part_{CFG.part_id:03d}.zarr")
+            mask_count_path = os.path.join(CFG.zarr_output_dir, f"mask_count_part_{CFG.part_id:03d}.zarr")
+
+            logger.info(f"Creating zarr arrays for partition {CFG.part_id} at {CFG.zarr_output_dir}")
+            mask_pred = zarr.open(
+                mask_pred_path,
+                mode='w',
+                shape=(H, W),
+                chunks=(1024, 1024),
+                dtype=np.float32,
+                compressor=None  # No compression for speed
+            )
+            mask_count = zarr.open(
+                mask_count_path,
+                mode='w',
+                shape=(H, W),
+                chunks=(1024, 1024),
+                dtype=np.float32,
+                compressor=None
+            )
+            # Initialize to zero
+            mask_pred[:] = 0.0
+            mask_count[:] = 0.0
+        else:
+            # Standard mode: in-memory numpy arrays
+            mask_pred = np.zeros((H, W), dtype=np.float32)
+            mask_count = np.zeros((H, W), dtype=np.float32)
 
         weight_tensor: Optional[torch.Tensor] = None
         model.eval()
@@ -447,13 +518,120 @@ def predict_fn(
                 pbar.update(images.size(0))
             pbar.close()
 
-        mask_pred = mask_pred / np.clip(mask_count, a_min=1e-6, a_max=None)
-        mask_pred = np.clip(mask_pred, 0, 1)
-        logger.info(f"Inference completed. Prediction shape: {mask_pred.shape}")
-        return mask_pred
+        if CFG.num_parts > 1:
+            # Return zarr paths for partitioned mode
+            logger.info(f"Partition {CFG.part_id} completed. Wrote zarr arrays to {CFG.zarr_output_dir}")
+            return {
+                "mask_pred": mask_pred_path,
+                "mask_count": mask_count_path,
+            }
+        else:
+            # Blend and return numpy array for standard mode
+            mask_pred = mask_pred / np.clip(mask_count, a_min=1e-6, a_max=None)
+            mask_pred = np.clip(mask_pred, 0, 1)
+            logger.info(f"Inference completed. Prediction shape: {mask_pred.shape}")
+            return mask_pred
 
     except Exception as e:
         logger.error(f"Error in predict_fn: {e}")
+        raise
+
+def reduce_partitions(
+    zarr_output_dir: str,
+    num_parts: int,
+    pred_shape: Tuple[int, int]
+) -> np.ndarray:
+    """
+    Reduce/blend all partition zarr arrays into a single prediction.
+
+    Args:
+        zarr_output_dir: Directory containing partition zarr arrays
+        num_parts: Total number of partitions
+        pred_shape: Output shape (H, W)
+
+    Returns:
+        Blended numpy array (H, W) with values in [0, 1]
+    """
+    try:
+        H, W = pred_shape
+        logger.info(f"Starting reduce phase: blending {num_parts} partitions from {zarr_output_dir}")
+
+        # Initialize accumulators in memory (we're blending, so need the full arrays)
+        total_pred = np.zeros((H, W), dtype=np.float32)
+        total_count = np.zeros((H, W), dtype=np.float32)
+
+        # Process each partition in chunks to avoid memory issues
+        chunk_size = 1024
+        for part_id in range(num_parts):
+            mask_pred_path = os.path.join(zarr_output_dir, f"mask_pred_part_{part_id:03d}.zarr")
+            mask_count_path = os.path.join(zarr_output_dir, f"mask_count_part_{part_id:03d}.zarr")
+
+            if not os.path.exists(mask_pred_path) or not os.path.exists(mask_count_path):
+                logger.warning(f"Missing partition {part_id} at {zarr_output_dir}, skipping")
+                continue
+
+            logger.info(f"Loading partition {part_id}/{num_parts}")
+            mask_pred_z = zarr.open(mask_pred_path, mode='r')
+            mask_count_z = zarr.open(mask_count_path, mode='r')
+
+            # Process in chunks to avoid loading entire partition into memory
+            for y in range(0, H, chunk_size):
+                y_end = min(y + chunk_size, H)
+                for x in range(0, W, chunk_size):
+                    x_end = min(x + chunk_size, W)
+
+                    # Read chunks and accumulate
+                    pred_chunk = mask_pred_z[y:y_end, x:x_end]
+                    count_chunk = mask_count_z[y:y_end, x:x_end]
+
+                    total_pred[y:y_end, x:x_end] += pred_chunk
+                    total_count[y:y_end, x:x_end] += count_chunk
+
+            logger.info(f"Completed partition {part_id}/{num_parts}")
+
+        # Blend: divide total_pred by total_count
+        logger.info("Blending accumulated predictions")
+        result = total_pred / np.clip(total_count, 1e-6, None)
+        result = np.clip(result, 0, 1)
+
+        logger.info(f"Reduce completed. Final prediction shape: {result.shape}")
+        return result
+
+    except Exception as e:
+        logger.error(f"Error in reduce_partitions: {e}")
+        raise
+
+def write_tiled_tiff(prediction: np.ndarray, output_path: str) -> None:
+    """
+    Write prediction array to a tiled TIFF file.
+
+    Args:
+        prediction: Float32 array with values in [0, 1], shape (H, W)
+        output_path: Path to output TIFF file
+    """
+    try:
+        logger.info(f"Writing tiled TIFF to {output_path}")
+
+        # Convert float32 [0, 1] to uint8 [0, 255]
+        pred_uint8 = (np.clip(prediction, 0, 1) * 255).astype(np.uint8)
+
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        # Write with tiling and compression
+        tiff.imwrite(
+            output_path,
+            pred_uint8,
+            compression='deflate',
+            tile=(256, 256),
+            metadata={'software': 'optimized_inference'}
+        )
+
+        file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        logger.info(f"Wrote tiled TIFF: {output_path} ({file_size_mb:.2f} MB)")
+
+    except Exception as e:
+        logger.error(f"Error writing tiled TIFF: {e}")
         raise
 
 def run_inference(
@@ -462,20 +640,29 @@ def run_inference(
     device: torch.device,
     fragment_mask: Optional[np.ndarray] = None,
     is_reverse_segment: bool = False
-) -> np.ndarray:
+) -> Union[np.ndarray, Dict[str, str]]:
     """
     Main entrypoint: accepts either a stacked array (H,W,C) or a list of file paths.
-    Returns (H,W) heatmap cropped to the original size.
+
+    Returns:
+        - If num_parts == 1: returns (H,W) heatmap numpy array
+        - If num_parts > 1: returns dict with zarr paths {"mask_pred": path, "mask_count": path}
     """
     try:
         logger.info("Starting inference process...")
         source, mask, orig_shape, reverse = preprocess_layers(
             layers, fragment_mask, is_reverse_segment
         )
-        test_loader, pred_shape = create_inference_dataloader(source, mask, reverse)
-        mask_pred = predict_fn(test_loader, model, device, pred_shape)
+        test_loader, pred_shape, partition_info = create_inference_dataloader(source, mask, reverse)
+        result = predict_fn(test_loader, model, device, pred_shape)
 
-        # Crop to original size and re-normalize per-fragment
+        # If partitioned mode, return zarr paths directly
+        if CFG.num_parts > 1:
+            logger.info("Inference partition completed successfully")
+            return result
+
+        # Standard mode: crop to original size and re-normalize per-fragment
+        mask_pred = result  # result is np.ndarray in this case
         oh, ow = orig_shape
         mask_pred = np.clip(mask_pred[:oh, :ow], 0, 1)
         mx = float(mask_pred.max())

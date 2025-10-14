@@ -33,6 +33,8 @@ except:
 from inference_timesformer import (
     RegressionPLModel,
     run_inference,
+    reduce_partitions,
+    write_tiled_tiff,
     CFG,
 )
 
@@ -54,6 +56,10 @@ class Inputs:
     force_reverse: bool = False
     wk_inference: bool = False
     wk_dataset_id: str = ""
+    step: str = "inference"  # "inference" or "reduce"
+    num_parts: int = 1
+    part_id: int = 0
+    zarr_output_dir: str = "/tmp/partitions"
 
 def parse_env() -> Inputs:
     try:
@@ -63,15 +69,34 @@ def parse_env() -> Inputs:
         end_layer = int(os.environ["END_LAYER"].strip())
         force_reverse = os.getenv("FORCE_REVERSE", "false").lower() == "true"
         wk_dataset_id = os.getenv("WK_DATASET_ID", "").strip()
-        
-        # Validate that at least one of s3_path or wk_dataset_id is provided
-        if not s3_path and not wk_dataset_id:
+
+        # Map/reduce parameters
+        step = os.getenv("STEP", "inference").strip().lower()
+        num_parts = int(os.getenv("NUM_PARTS", "1"))
+        part_id = int(os.getenv("PART_ID", "0"))
+        zarr_output_dir = os.getenv("ZARR_OUTPUT_DIR", "/tmp/partitions").strip()
+
+        # Validate step parameter
+        if step not in ("inference", "reduce"):
+            raise ValueError(f"STEP must be 'inference' or 'reduce', got '{step}'")
+
+        # Validate partitioning parameters
+        if step == "inference" and num_parts > 1:
+            if part_id < 0 or part_id >= num_parts:
+                raise ValueError(f"PART_ID must be in range [0, {num_parts}), got {part_id}")
+
+        if step == "reduce" and num_parts <= 1:
+            raise ValueError("STEP=reduce requires NUM_PARTS > 1")
+
+        # Validate that at least one of s3_path or wk_dataset_id is provided (except for reduce step)
+        if step != "reduce" and not s3_path and not wk_dataset_id:
             raise ValueError("Either S3_PATH or WK_DATASET_ID must be provided")
-        
+
         wk_inference = bool(wk_dataset_id)
-        
+
         if start_layer > end_layer:
             raise ValueError("START_LAYER must be <= END_LAYER")
+
         return Inputs(
             model_key=model_key,
             s3_path=s3_path,
@@ -80,6 +105,10 @@ def parse_env() -> Inputs:
             force_reverse=force_reverse,
             wk_inference=wk_inference,
             wk_dataset_id=wk_dataset_id,
+            step=step,
+            num_parts=num_parts,
+            part_id=part_id,
+            zarr_output_dir=zarr_output_dir,
         )
     except KeyError as e:
         raise RuntimeError(f"Missing required env var: {e.args[0]}") from e
@@ -403,14 +432,21 @@ def save_and_upload_prediction(
     return f"s3://{bucket}/{out_key}"
 
 
-def main() -> None:
-
+def run_inference_step(inputs: Inputs) -> None:
+    """Execute the inference step (either standard or partitioned mode)."""
     task_id = uuid.uuid4()
     logger.info(f"Task ID generated: {task_id}")
 
-    logger.info("Parsing environment variables for input configuration...")
-    inputs = parse_env()
-    
+    # Configure CFG with partition parameters
+    CFG.num_parts = inputs.num_parts
+    CFG.part_id = inputs.part_id
+    CFG.zarr_output_dir = inputs.zarr_output_dir
+
+    logger.info(
+        f"Inference step: num_parts={inputs.num_parts}, part_id={inputs.part_id}, "
+        f"zarr_output_dir={inputs.zarr_output_dir}"
+    )
+
     # Handle WebKnossos workflow
     if inputs.wk_inference:
         logger.info(f"WebKnossos inference mode: fetching metadata for dataset {inputs.wk_dataset_id}")
@@ -514,10 +550,18 @@ def main() -> None:
     # Run inference
     logger.info("Running inference from streamed layer files...")
     start_infer_time = time.time()
-    prediction = run_inference(layer_paths, model, device, is_reverse_segment=is_reverse_segment)
+    result = run_inference(layer_paths, model, device, is_reverse_segment=is_reverse_segment)
     logger.info(f"Inference completed in {time.time() - start_infer_time:.2f} seconds")
 
-    # Upload result
+    # Handle partitioned vs standard mode
+    if inputs.num_parts > 1:
+        # Partitioned mode: zarr files written, just log and exit
+        logger.info(f"Partition {inputs.part_id} completed. Zarr arrays written to {inputs.zarr_output_dir}")
+        logger.info("Partition inference step complete. Run reduce step after all partitions finish.")
+        return
+
+    # Standard mode (num_parts == 1): upload result
+    prediction = result  # result is np.ndarray in standard mode
     if inputs.wk_inference:
         # For WebKnossos inference, upload to both S3 and WebKnossos
         logger.info("Saving and uploading prediction mask to S3...")
@@ -553,6 +597,87 @@ def main() -> None:
         with open("/tmp/result_s3_url.txt", "w", encoding="utf-8") as f:
             f.write(result_uri)
         logger.info(f"Uploaded result to {result_uri}")
+
+
+def run_reduce_step(inputs: Inputs) -> None:
+    """Execute the reduce step to blend all partitions."""
+    logger.info(f"Starting reduce step: blending {inputs.num_parts} partitions")
+
+    # S3 setup (need it for uploading final result)
+    s3_client = boto3.client("s3")
+
+    # Handle WebKnossos workflow to get s3_path
+    if inputs.wk_inference:
+        logger.info(f"WebKnossos inference mode: fetching metadata for dataset {inputs.wk_dataset_id}")
+        inputs.s3_path = get_wk_dataset_metadata(inputs.wk_dataset_id)
+        logger.info(f"Retrieved s3_path from WebKnossos metadata: {inputs.s3_path}")
+
+    bucket, prefix = parse_s3_uri(inputs.s3_path)
+
+    # We need to determine the prediction shape from one of the partition zarr files
+    mask_pred_path = os.path.join(inputs.zarr_output_dir, "mask_pred_part_000.zarr")
+    if not os.path.exists(mask_pred_path):
+        raise RuntimeError(f"Partition 0 not found at {mask_pred_path}. Ensure all inference partitions completed.")
+
+    logger.info(f"Reading prediction shape from {mask_pred_path}")
+    z = zarr.open(mask_pred_path, mode='r')
+    pred_shape = z.shape
+    logger.info(f"Prediction shape: {pred_shape}")
+
+    # Run reduce/blend
+    logger.info(f"Reducing {inputs.num_parts} partitions from {inputs.zarr_output_dir}")
+    start_reduce_time = time.time()
+    prediction = reduce_partitions(inputs.zarr_output_dir, inputs.num_parts, pred_shape)
+    logger.info(f"Reduce completed in {time.time() - start_reduce_time:.2f} seconds")
+
+    # Write to local tiled TIFF
+    local_tiff_path = f"/tmp/prediction_{inputs.model_key}_{inputs.start_layer:02d}_{inputs.end_layer:02d}.tif"
+    write_tiled_tiff(prediction, local_tiff_path)
+
+    # Upload TIFF to S3
+    logger.info("Uploading tiled TIFF to S3...")
+    out_key = os.path.join(prefix.rstrip("/"), "predictions", f"prediction_{inputs.model_key}_{inputs.start_layer:02d}_{inputs.end_layer:02d}.tif")
+    s3_client.upload_file(local_tiff_path, bucket, out_key)
+    result_uri = f"s3://{bucket}/{out_key}"
+    logger.info(f"Uploaded result to S3: {result_uri}")
+
+    # Write result URI
+    with open("/tmp/result_s3_url.txt", "w", encoding="utf-8") as f:
+        f.write(result_uri)
+
+    # If WebKnossos mode, also upload to WebKnossos
+    if inputs.wk_inference:
+        logger.info("Uploading prediction to WebKnossos dataset...")
+        wk_layer_name = upload_to_webknossos(
+            inputs.wk_dataset_id, prediction, inputs.model_key, inputs.start_layer, inputs.end_layer
+        )
+        logger.info(f"Uploaded prediction to WebKnossos layer: {wk_layer_name}")
+
+        with open("/tmp/result_wk_layer.txt", "w", encoding="utf-8") as f:
+            f.write(wk_layer_name)
+
+        logger.info(f"Reduce completed successfully - S3: {result_uri}, WebKnossos layer: {wk_layer_name}")
+    else:
+        logger.info(f"Reduce completed successfully - S3: {result_uri}")
+
+
+def main() -> None:
+    """Main entrypoint with step dispatch."""
+    logger.info("Parsing environment variables for input configuration...")
+    inputs = parse_env()
+
+    logger.info(
+        f"Starting optimized inference: step={inputs.step}, model={inputs.model_key}, "
+        f"s3_path={inputs.s3_path}, layers=[{inputs.start_layer}, {inputs.end_layer}]"
+    )
+
+    # Dispatch to appropriate step
+    if inputs.step == "inference":
+        run_inference_step(inputs)
+    elif inputs.step == "reduce":
+        run_reduce_step(inputs)
+    else:
+        raise ValueError(f"Unknown step: {inputs.step}")
 
 
 if __name__ == "__main__":
