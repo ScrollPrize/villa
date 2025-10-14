@@ -138,6 +138,7 @@ def create_surface_volume_zarr(
         RuntimeError: If image reading fails or size mismatches occur
     """
     import concurrent.futures
+    from numcodecs import LZ4
 
     if not layer_paths:
         raise ValueError("layer_paths cannot be empty")
@@ -149,17 +150,18 @@ def create_surface_volume_zarr(
     h, w = first.shape
     c = len(layer_paths)
 
-    # Check disk space
+    # Check disk space (estimate with 50% compression ratio for LZ4)
     zarr_root = os.path.dirname(output_path) or "/tmp"
-    required_gib = (h * w * c) / (1024**3)
+    uncompressed_gib = (h * w * c) / (1024**3)
+    estimated_gib = uncompressed_gib * 0.5  # LZ4 typically achieves ~50% compression on uint8 images
     free_gib = shutil.disk_usage(zarr_root).free / (1024**3)
     logger.info(
-        f"Creating surface volume zarr at {output_path} (H,W,C={h},{w},{c} ~{required_gib:.2f} GiB). "
-        f"Free on {zarr_root}: {free_gib:.2f} GiB."
+        f"Creating surface volume zarr at {output_path} (H,W,C={h},{w},{c} ~{uncompressed_gib:.2f} GiB uncompressed, "
+        f"~{estimated_gib:.2f} GiB estimated with LZ4). Free on {zarr_root}: {free_gib:.2f} GiB."
     )
-    if free_gib < required_gib * 1.10:
+    if free_gib < estimated_gib * 1.10:
         raise RuntimeError(
-            f"Not enough space on {zarr_root}: need ~{required_gib:.2f} GiB, have {free_gib:.2f} GiB"
+            f"Not enough space on {zarr_root}: need ~{estimated_gib:.2f} GiB, have {free_gib:.2f} GiB"
         )
 
     # Remove existing zarr if present
@@ -168,14 +170,15 @@ def create_surface_volume_zarr(
         shutil.rmtree(output_path)
 
     # Create zarr v2 array with shape (H, W, C) and chunk size optimized for spatial tile access
-    # Compression disabled (compressor=None) for maximum speed
+    # Using LZ4 compression (fast with decent ratio)
     z = zarr.open(
         output_path,
         mode="w",
         shape=(h, w, c),
         chunks=(chunk_size, chunk_size, 1),
         dtype=np.uint8,
-        compressor=None
+        compressor=LZ4(acceleration=1),  # acceleration=1 is default, good balance of speed/ratio
+        write_empty_chunks=False  # Don't write chunks that are entirely fill_value
     )
 
     # Parallel reads with batching to limit memory usage
@@ -527,31 +530,35 @@ def predict_fn(
         # Write results based on mode
         if CFG.num_parts > 1:
             # Partitioned mode: write in-memory arrays to zarr once at the end
+            from numcodecs import LZ4
+
             logger.info(f"Writing partition {CFG.part_id} results to zarr arrays...")
             os.makedirs(CFG.zarr_output_dir, exist_ok=True)
 
             mask_pred_path = os.path.join(CFG.zarr_output_dir, f"mask_pred_part_{CFG.part_id:03d}.zarr")
             mask_count_path = os.path.join(CFG.zarr_output_dir, f"mask_count_part_{CFG.part_id:03d}.zarr")
 
-            # Create and write mask_pred zarr
+            # Create and write mask_pred zarr with LZ4 compression
             mask_pred_z = zarr.open(
                 mask_pred_path,
                 mode='w',
                 shape=(H, W),
                 chunks=(1024, 1024),
                 dtype=np.float32,
-                compressor=None
+                compressor=LZ4(acceleration=1),
+                write_empty_chunks=False
             )
             mask_pred_z[:] = mask_pred
 
-            # Create and write mask_count zarr
+            # Create and write mask_count zarr with LZ4 compression
             mask_count_z = zarr.open(
                 mask_count_path,
                 mode='w',
                 shape=(H, W),
                 chunks=(1024, 1024),
                 dtype=np.float32,
-                compressor=None
+                compressor=LZ4(acceleration=1),
+                write_empty_chunks=False
             )
             mask_count_z[:] = mask_count
 
