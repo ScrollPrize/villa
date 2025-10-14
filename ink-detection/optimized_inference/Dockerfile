@@ -1,6 +1,4 @@
-ARG BASE_IMAGE=pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
-
-FROM ${BASE_IMAGE}
+FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime AS gpu
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
@@ -27,5 +25,29 @@ COPY inference_timesformer.py /app
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 ENV CUDA_VISIBLE_DEVICES=0
+
+ENTRYPOINT ["python", "/app/entrypoint.py"]
+
+FROM python:3.10-slim AS cpu
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    ca-certificates \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements-cpu-only.txt /app
+RUN pip install --no-cache-dir -r requirements-cpu-only.txt && \
+    apt-get purge -y --auto-remove gcc g++
+
+COPY entrypoint.py /app
+COPY inference_timesformer.py /app
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
 
 ENTRYPOINT ["python", "/app/entrypoint.py"]
