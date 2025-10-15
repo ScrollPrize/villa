@@ -106,7 +106,8 @@ def create_surface_volume_zarr(
         chunks=(chunk_size, chunk_size, 1),
         dtype=np.uint8,
         compressor=LZ4(acceleration=1),  # acceleration=1 is default, good balance of speed/ratio
-        write_empty_chunks=False  # Don't write chunks that are entirely fill_value
+        zarr_format=2,
+        config={'write_empty_chunks': False}  # Don't write chunks that are entirely fill_value
     )
 
     # Parallel reads with batching to limit memory usage

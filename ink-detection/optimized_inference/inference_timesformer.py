@@ -423,7 +423,8 @@ def predict_fn(
                 chunks=(1024, 1024),
                 dtype=np.float32,
                 compressor=LZ4(acceleration=1),
-                write_empty_chunks=False
+                zarr_format=2,
+                config={'write_empty_chunks': False}
             )
             mask_pred_z[:] = mask_pred
 
@@ -435,7 +436,8 @@ def predict_fn(
                 chunks=(1024, 1024),
                 dtype=np.float32,
                 compressor=LZ4(acceleration=1),
-                write_empty_chunks=False
+                zarr_format=2,
+                config={'write_empty_chunks': False}
             )
             mask_count_z[:] = mask_count
 

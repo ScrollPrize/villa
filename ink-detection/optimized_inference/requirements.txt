@@ -1,7 +1,7 @@
 albumentations
-pytorch-lightning==2.0.9
+pytorch-lightning
 timesformer-pytorch
-numpy==1.26.4
+numpy
 torch>=2.0.0
 scipy
 tqdm
@@ -10,7 +10,7 @@ boto3>=1.26.0
 botocore>=1.29.0
 huggingface_hub>=0.23.0
 tifffile
-numcodecs>=0.11.0,<0.13.0
+numcodecs>=0.16.3
 imagecodecs
-zarr>=2.13.0,<3
+zarr>=3.0.0,<4
 #webknossos==0.16.2
