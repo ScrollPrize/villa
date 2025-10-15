@@ -19,11 +19,19 @@ import zarr
 import tifffile as tiff
 from numcodecs import LZ4
 from tqdm.auto import tqdm
+import fsspec
 
 from k8s import get_tqdm_kwargs
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def path_exists(path: str) -> bool:
+    """Check if path exists (supports local paths and S3 URLs)."""
+    storage_options = {"anon": False, "asynchronous": False} if path.startswith("s3://") else {}
+    fs, p = fsspec.core.url_to_fs(path, **storage_options)
+    return fs.exists(p)
 
 
 # ----------------------------- Surface Volume Creation ------------------------------

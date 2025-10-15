@@ -32,6 +32,7 @@ import cv2
 import zarr
 
 from k8s import get_tqdm_kwargs
+from processing import path_exists
 
 # ----------------------------- Logging ---------------------------------------
 logging.basicConfig(level=logging.INFO)
@@ -114,12 +115,14 @@ class LayersSource:
             self._shape = src.shape
             self._dtype = src.dtype
         elif isinstance(src, str):
-            # Path to existing zarr array
-            if not os.path.exists(src):
+            # Path to existing zarr array (supports both local paths and S3 URLs)
+            if not path_exists(src):
                 raise ValueError(f"Zarr path does not exist: {src}")
             logger.info(f"Opening existing zarr array at {src}")
+            # For S3 paths, pass storage options to zarr.open
+            storage_options = {"anon": False, "asynchronous": False} if src.startswith("s3://") else {}
             self._arr = None
-            self._mm = zarr.open(src, mode='r')
+            self._mm = zarr.open(src, mode='r', storage_options=storage_options)
             self._shape = self._mm.shape
             self._dtype = self._mm.dtype
             if len(self._shape) != 3:

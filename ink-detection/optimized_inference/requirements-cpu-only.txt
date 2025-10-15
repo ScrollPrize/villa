@@ -11,4 +11,5 @@ numcodecs>=0.16.3
 imagecodecs
 zarr>=3.0.0,<4
 s3fs>=2024.3.0
+fsspec
 #webknossos==0.16.2

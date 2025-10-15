@@ -398,7 +398,7 @@ def save_and_upload_prediction(
 def run_prepare_step(inputs: Inputs) -> None:
     """Execute the prepare step to create surface volume zarr from S3 layers."""
     # Import torch-free processing utilities
-    from processing import create_surface_volume_zarr
+    from processing import create_surface_volume_zarr, path_exists
 
     logger.info("Starting prepare step: creating surface volume zarr")
 
@@ -459,12 +459,13 @@ def run_inference_step(inputs: Inputs) -> None:
     import torch
     from torch.nn import DataParallel
     from inference_timesformer import load_model, run_inference, CFG
+    from processing import path_exists
 
     task_id = uuid.uuid4()
     logger.info(f"Task ID generated: {task_id}")
 
-    # Verify surface volume zarr exists
-    if not os.path.exists(inputs.surface_volume_zarr):
+    # Verify surface volume zarr exists (supports both local paths and S3 URLs)
+    if not path_exists(inputs.surface_volume_zarr):
         raise RuntimeError(f"Surface volume zarr not found at: {inputs.surface_volume_zarr}")
 
     logger.info(f"Using surface volume zarr: {inputs.surface_volume_zarr}")
