@@ -877,12 +877,17 @@ class BaseTrainer:
             mgr_config['train_patch_count'] = len(train_indices)
             mgr_config['val_patch_count'] = len(val_indices)
 
-            wandb.init(
-                entity=self.mgr.wandb_entity,
-                project=self.mgr.wandb_project,
-                group=self.mgr.model_name,
-                config=mgr_config
-            )
+            wandb_init_kwargs = {
+                "entity": self.mgr.wandb_entity,
+                "project": self.mgr.wandb_project,
+                "group": self.mgr.model_name,
+                "config": mgr_config,
+            }
+            run_name = getattr(self.mgr, "wandb_run_name", None)
+            if run_name:
+                wandb_init_kwargs["name"] = run_name
+
+            wandb.init(**wandb_init_kwargs)
             
             # Log the splits file as an artifact for reference
             artifact = wandb.Artifact(f"train_val_splits_{timestamp}", type="dataset")
@@ -1798,6 +1803,8 @@ def main():
                              help="Weights & Biases project (omit to disable wandb)")
     grp_logging.add_argument("--wandb-entity", type=str, default=None,
                              help="Weights & Biases team/username")
+    grp_logging.add_argument("--wandb-run-name", type=str, default=None,
+                             help="Optional custom name for the Weights & Biases run")
     grp_logging.add_argument("--verbose", action="store_true",
                              help="Enable verbose debug output")
 
