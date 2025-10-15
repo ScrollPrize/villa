@@ -31,6 +31,8 @@ import tifffile as tiff
 import cv2
 import zarr
 
+from k8s import get_tqdm_kwargs
+
 # ----------------------------- Logging ---------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -363,7 +365,7 @@ def predict_fn(
             pbar = tqdm(total=total_tiles,
                         desc="Running inference",
                         unit="tile",
-                        dynamic_ncols=True)
+                        **get_tqdm_kwargs())
 
             for (images, xys) in test_loader:
                 images = images.to(device, non_blocking=True)

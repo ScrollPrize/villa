@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime AS gpu
+FROM pytorch/pytorch:2.8.0-cuda12.6-cudnn9-runtime AS gpu
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
@@ -22,6 +22,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY entrypoint.py /app
 COPY processing.py /app
 COPY inference_timesformer.py /app
+COPY k8s.py /app
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
@@ -45,6 +46,7 @@ RUN pip install --no-cache-dir -r requirements-cpu-only.txt
 COPY entrypoint.py /app
 COPY processing.py /app
 COPY inference_timesformer.py /app
+COPY k8s.py /app
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
