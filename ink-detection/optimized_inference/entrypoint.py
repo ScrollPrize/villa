@@ -139,6 +139,7 @@ def list_layers_objects(
     s3_client, bucket: str, prefix: str, start_layer: int, end_layer: int
 ) -> List[Tuple[str, str]]:
     # Return list of (key, basename) for .tif/.tiff/.png/.jpeg/.jpg files inside any "layers/" folder under prefix
+    # OR directly under prefix for surface-volumes (e.g., paths ending in .tifs/)
     paginator = s3_client.get_paginator("list_objects_v2")
     keys: List[Tuple[str, str]] = []
     SUPPORTED_IMAGE_FORMATS = {'.tif', '.tiff', '.png', '.jpeg', '.jpg'}
@@ -147,7 +148,8 @@ def list_layers_objects(
             key = obj["Key"]
 
             # Check if it's a layer file with supported format
-            if "/layers/" not in key.lower():
+            # Support both: paths with "/layers/" subdirectory AND surface-volumes with .tifs/ directory
+            if "/layers/" not in key.lower() and not prefix.endswith(".tifs/"):
                 continue
 
             base = os.path.basename(key)
