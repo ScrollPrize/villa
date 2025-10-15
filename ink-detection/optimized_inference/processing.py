@@ -41,7 +41,12 @@ def get_zarr_store(path: str):
     if path.startswith("s3://"):
         # Use fsspec.get_mapper directly with S3 credentials
         # Pass anon=False to use AWS credentials from environment/config
-        return fsspec.get_mapper(path, anon=False)
+        # Use INTELLIGENT_TIERING storage class for cost optimization
+        return fsspec.get_mapper(
+            path,
+            anon=False,
+            s3_additional_kwargs={'StorageClass': 'INTELLIGENT_TIERING'}
+        )
     return path
 
 
@@ -80,7 +85,7 @@ def create_surface_volume_zarr(
 
     Args:
         layer_paths: List of paths to layer image files (must be sorted in layer order)
-        output_path: Path where the zarr array will be created
+        output_path: Path where the zarr array will be created (supports local paths and S3 URLs)
         chunk_size: Chunk size for zarr array (default: 1024x1024x1)
         max_workers: Number of worker threads for parallel reading (default: auto)
 
@@ -100,29 +105,42 @@ def create_surface_volume_zarr(
     h, w = first.shape
     c = len(layer_paths)
 
-    # Check disk space (estimate with 50% compression ratio for LZ4)
-    zarr_root = os.path.dirname(output_path) or "/tmp"
+    # Determine if we're writing to S3 or local
+    is_s3 = output_path.startswith("s3://")
+
+    # Calculate size estimates
     uncompressed_gib = (h * w * c) / (1024**3)
     estimated_gib = uncompressed_gib * 0.5  # LZ4 typically achieves ~50% compression on uint8 images
-    free_gib = shutil.disk_usage(zarr_root).free / (1024**3)
-    logger.info(
-        f"Creating surface volume zarr at {output_path} (H,W,C={h},{w},{c} ~{uncompressed_gib:.2f} GiB uncompressed, "
-        f"~{estimated_gib:.2f} GiB estimated with LZ4). Free on {zarr_root}: {free_gib:.2f} GiB."
-    )
-    if free_gib < estimated_gib * 1.10:
-        raise RuntimeError(
-            f"Not enough space on {zarr_root}: need ~{estimated_gib:.2f} GiB, have {free_gib:.2f} GiB"
+
+    # Check disk space only for local paths
+    if not is_s3:
+        zarr_root = os.path.dirname(output_path) or "/tmp"
+        free_gib = shutil.disk_usage(zarr_root).free / (1024**3)
+        logger.info(
+            f"Creating surface volume zarr at {output_path} (H,W,C={h},{w},{c} ~{uncompressed_gib:.2f} GiB uncompressed, "
+            f"~{estimated_gib:.2f} GiB estimated with LZ4). Free on {zarr_root}: {free_gib:.2f} GiB."
+        )
+        if free_gib < estimated_gib * 1.10:
+            raise RuntimeError(
+                f"Not enough space on {zarr_root}: need ~{estimated_gib:.2f} GiB, have {free_gib:.2f} GiB"
+            )
+    else:
+        logger.info(
+            f"Creating surface volume zarr at {output_path} (H,W,C={h},{w},{c} ~{uncompressed_gib:.2f} GiB uncompressed, "
+            f"~{estimated_gib:.2f} GiB estimated with LZ4). Writing to S3 with INTELLIGENT_TIERING."
         )
 
-    # Remove existing zarr if present
-    if os.path.exists(output_path):
-        logger.warning(f"Removing existing zarr at {output_path}")
-        shutil.rmtree(output_path)
+    # Fail if zarr already exists
+    if path_exists(output_path):
+        raise RuntimeError(f"Surface volume zarr already exists at {output_path}. Please remove it or use a different path.")
+
+    # Get zarr store (handles both local and S3)
+    store = get_zarr_store(output_path)
 
     # Create zarr v2 array with shape (H, W, C) and chunk size optimized for spatial tile access
     # Using LZ4 compression (fast with decent ratio)
     z = zarr.open(
-        output_path,
+        store,
         mode="w",
         shape=(h, w, c),
         chunks=(chunk_size, chunk_size, 1),

@@ -432,16 +432,10 @@ def run_prepare_step(inputs: Inputs) -> None:
     layer_paths = download_layers(s3_client, bucket, layer_objects, input_dir)
     logger.info(f"Downloaded {len(layer_paths)} layer files")
 
-    # Determine output path for surface volume zarr
     if inputs.surface_volume_zarr:
         output_path = inputs.surface_volume_zarr
     else:
-        # Default: put it in the zarr output directory with a descriptive name
-        os.makedirs(inputs.zarr_output_dir, exist_ok=True)
-        output_path = os.path.join(
-            inputs.zarr_output_dir,
-            f"surface_volume_{inputs.start_layer:02d}_{inputs.end_layer:02d}.zarr"
-        )
+        output_path = f"/tmp/surface_volume_{inputs.start_layer:02d}_{inputs.end_layer:02d}.zarr"
 
     logger.info(f"Creating surface volume zarr at {output_path} with chunk_size={inputs.chunk_size}")
     created_zarr_path = create_surface_volume_zarr(layer_paths, output_path, chunk_size=inputs.chunk_size)
