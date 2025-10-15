@@ -50,6 +50,7 @@ class Inputs:
     part_id: int = 0
     zarr_output_dir: str = "/tmp/partitions"
     surface_volume_zarr: str = ""  # Path to pre-created surface volume zarr
+    chunk_size: int = 1024  # Chunk size for zarr array creation (SURFACE_VOLUME_CHUNK_SIZE)
 
 def parse_env() -> Inputs:
     try:
@@ -66,6 +67,7 @@ def parse_env() -> Inputs:
         part_id = int(os.getenv("PART_ID", "0"))
         zarr_output_dir = os.getenv("ZARR_OUTPUT_DIR", "/tmp/partitions").strip()
         surface_volume_zarr = os.getenv("SURFACE_VOLUME_ZARR", "").strip()
+        chunk_size = int(os.getenv("SURFACE_VOLUME_CHUNK_SIZE", "1024"))
 
         # Validate step parameter
         if step not in ("prepare", "inference", "reduce"):
@@ -111,6 +113,7 @@ def parse_env() -> Inputs:
             part_id=part_id,
             zarr_output_dir=zarr_output_dir,
             surface_volume_zarr=surface_volume_zarr,
+            chunk_size=chunk_size,
         )
     except KeyError as e:
         raise RuntimeError(f"Missing required env var: {e.args[0]}") from e
@@ -438,8 +441,8 @@ def run_prepare_step(inputs: Inputs) -> None:
             f"surface_volume_{inputs.start_layer:02d}_{inputs.end_layer:02d}.zarr"
         )
 
-    logger.info(f"Creating surface volume zarr at {output_path}")
-    created_zarr_path = create_surface_volume_zarr(layer_paths, output_path)
+    logger.info(f"Creating surface volume zarr at {output_path} with chunk_size={inputs.chunk_size}")
+    created_zarr_path = create_surface_volume_zarr(layer_paths, output_path, chunk_size=inputs.chunk_size)
 
     # Write output path to file for next step
     output_file = "/tmp/surface_volume_zarr_path.txt"
