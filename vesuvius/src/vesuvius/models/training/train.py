@@ -219,6 +219,8 @@ class BaseTrainer:
             return False
         if target_name.endswith('_skel'):
             return False
+        if target_name.endswith('_mask') or target_name.startswith('mask_') or target_name == 'plane_mask':
+            return False
         return True
 
     def _compute_loss_value(
@@ -1471,10 +1473,13 @@ class BaseTrainer:
                                 if isinstance(gt_val, (list, tuple)):
                                     gt_val = gt_val[0]
                                 # If no metrics configured for this task (e.g., MAE), skip safely
+                                mask_tensor = targets_dict.get(f"{t_name}_mask")
+                                if isinstance(mask_tensor, (list, tuple)):
+                                    mask_tensor = mask_tensor[0]
                                 for metric in evaluation_metrics.get(t_name, []):
                                     if isinstance(metric, CriticalComponentsMetric) and i >= 10:
                                         continue
-                                    metric.update(pred=pred_val, gt=gt_val)
+                                    metric.update(pred=pred_val, gt=gt_val, mask=mask_tensor)
 
                         if i == 0:
                                 # Find first non-zero sample for debug visualization, but save even if all zeros
@@ -1986,6 +1991,10 @@ def main():
         from vesuvius.models.training.trainers.self_supervised.train_finetune_mae_unet import TrainFineTuneMAEUNet
         trainer = TrainFineTuneMAEUNet(mgr=mgr, verbose=args.verbose)
         print("Using Fine-Tune MAE->UNet Trainer (NetworkFromConfig)")
+    elif trainer_name == "mutex_affinity":
+        from vesuvius.models.training.trainers.mutex_affinity_trainer import MutexAffinityTrainer
+        trainer = MutexAffinityTrainer(mgr=mgr, verbose=args.verbose)
+        print("Using Mutex Affinity Trainer")
     elif trainer_name == "base":
         trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Base Trainer for supervised training")
@@ -1996,7 +2005,7 @@ def main():
         print("Using Surface Frame Trainer")
     else:
         raise ValueError(
-            "Unknown trainer: {trainer}. Available options: base, surface_frame, mean_teacher, "
+            "Unknown trainer: {trainer}. Available options: base, surface_frame, mutex_affinity, mean_teacher, "
             "uncertainty_aware_mean_teacher, primus_mae, unet_mae, finetune_mae_unet".format(trainer=trainer_name)
         )
 

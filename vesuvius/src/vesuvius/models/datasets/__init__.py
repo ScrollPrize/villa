@@ -1,8 +1,9 @@
 # Dataset exports
 from .base_dataset import BaseDataset
+from .mutex_affinity_dataset import MutexAffinityDataset
 from .orchestrator import DatasetOrchestrator
 
-__all__ = ["BaseDataset", "DatasetOrchestrator"]
+__all__ = ["BaseDataset", "DatasetOrchestrator", "MutexAffinityDataset"]
 
 
 _LEGACY_DATASETS = {

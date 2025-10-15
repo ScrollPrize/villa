@@ -189,23 +189,33 @@ def generate_positions(min_val, max_val, patch_size, step):
 
 def pad_or_crop_3d(arr, desired_shape, pad_value=0):
     """Pad or crop a 3D array (D,H,W) to the desired shape."""
-    d, h, w = arr.shape
-    dd, hh, ww = desired_shape
-    out = np.full((dd, hh, ww), pad_value, dtype=arr.dtype)
+    array = np.asarray(arr)
+    desired = tuple(int(v) for v in desired_shape)
+    if array.shape == desired:
+        return array if array.flags.c_contiguous else np.ascontiguousarray(array)
+
+    d, h, w = array.shape
+    dd, hh, ww = desired
+    out = np.full((dd, hh, ww), pad_value, dtype=array.dtype)
 
     # Compute the region to copy
     dmin = min(d, dd)
     hmin = min(h, hh)
     wmin = min(w, ww)
 
-    out[:dmin, :hmin, :wmin] = arr[:dmin, :hmin, :wmin]
+    out[:dmin, :hmin, :wmin] = array[:dmin, :hmin, :wmin]
     return out
 
 def pad_or_crop_4d(arr, desired_shape, pad_value=0):
     """Pad or crop a 4D array (C,D,H,W) to the desired shape."""
-    c, d, h, w = arr.shape
-    cc, dd, hh, ww = desired_shape
-    out = np.full((cc, dd, hh, ww), pad_value, dtype=arr.dtype)
+    array = np.asarray(arr)
+    desired = tuple(int(v) for v in desired_shape)
+    if array.shape == desired:
+        return array if array.flags.c_contiguous else np.ascontiguousarray(array)
+
+    c, d, h, w = array.shape
+    cc, dd, hh, ww = desired
+    out = np.full((cc, dd, hh, ww), pad_value, dtype=array.dtype)
 
     # Compute the region to copy
     cmin = min(c, cc)
@@ -213,20 +223,25 @@ def pad_or_crop_4d(arr, desired_shape, pad_value=0):
     hmin = min(h, hh)
     wmin = min(w, ww)
 
-    out[:cmin, :dmin, :hmin, :wmin] = arr[:cmin, :dmin, :hmin, :wmin]
+    out[:cmin, :dmin, :hmin, :wmin] = array[:cmin, :dmin, :hmin, :wmin]
     return out
 
 def pad_or_crop_2d(arr, desired_shape, pad_value=0):
     """Pad or crop a 2D array (H,W) to the desired shape."""
-    h, w = arr.shape
-    hh, ww = desired_shape
-    out = np.full((hh, ww), pad_value, dtype=arr.dtype)
+    array = np.asarray(arr)
+    desired = tuple(int(v) for v in desired_shape)
+    if array.shape == desired:
+        return array if array.flags.c_contiguous else np.ascontiguousarray(array)
+
+    h, w = array.shape
+    hh, ww = desired
+    out = np.full((hh, ww), pad_value, dtype=array.dtype)
 
     # Compute the region to copy
     hmin = min(h, hh)
     wmin = min(w, ww)
 
-    out[:hmin, :wmin] = arr[:hmin, :wmin]
+    out[:hmin, :wmin] = array[:hmin, :wmin]
     return out
 
 def init_weights_he(module, neg_slope=1e-2):
