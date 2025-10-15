@@ -29,9 +29,20 @@ logger = logging.getLogger(__name__)
 
 def path_exists(path: str) -> bool:
     """Check if path exists (supports local paths and S3 URLs)."""
-    storage_options = {"anon": False, "asynchronous": False} if path.startswith("s3://") else {}
-    fs, p = fsspec.core.url_to_fs(path, **storage_options)
-    return fs.exists(p)
+    if path.startswith("s3://"):
+        import s3fs
+        fs = s3fs.S3FileSystem(anon=False)
+        return fs.exists(path)
+    return os.path.exists(path)
+
+
+def get_zarr_store(path: str):
+    """Get zarr store for path (supports local paths and S3 URLs)."""
+    if path.startswith("s3://"):
+        # Use fsspec.get_mapper directly with S3 credentials
+        # Pass anon=False to use AWS credentials from environment/config
+        return fsspec.get_mapper(path, anon=False)
+    return path
 
 
 # ----------------------------- Surface Volume Creation ------------------------------

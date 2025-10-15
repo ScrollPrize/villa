@@ -32,7 +32,7 @@ import cv2
 import zarr
 
 from k8s import get_tqdm_kwargs
-from processing import path_exists
+from processing import path_exists, get_zarr_store
 
 # ----------------------------- Logging ---------------------------------------
 logging.basicConfig(level=logging.INFO)
@@ -114,20 +114,49 @@ class LayersSource:
             self._mm = None
             self._shape = src.shape
             self._dtype = src.dtype
+            self._needs_transpose = False
         elif isinstance(src, str):
             # Path to existing zarr array (supports both local paths and S3 URLs)
             if not path_exists(src):
                 raise ValueError(f"Zarr path does not exist: {src}")
             logger.info(f"Opening existing zarr array at {src}")
-            # For S3 paths, pass storage options to zarr.open
-            storage_options = {"anon": False, "asynchronous": False} if src.startswith("s3://") else {}
             self._arr = None
-            self._mm = zarr.open(src, mode='r', storage_options=storage_options)
-            self._shape = self._mm.shape
+            store = get_zarr_store(src)
+            root = zarr.open(store, mode='r')
+
+            # Handle OME-Zarr format (hierarchical with multiscale levels)
+            if isinstance(root, zarr.Group):
+                logger.info("Detected OME-Zarr format, using multiscale level 0")
+                # OME-Zarr stores arrays at paths like "0", "1", "2" for different resolutions
+                if "0" in root:
+                    self._mm = root["0"]
+                else:
+                    raise ValueError(f"OME-Zarr group found but no '0' array present. Available keys: {list(root.keys())}")
+            else:
+                # Standard zarr array
+                self._mm = root
+
+            raw_shape = self._mm.shape
             self._dtype = self._mm.dtype
-            if len(self._shape) != 3:
-                raise ValueError(f"Expected (H,W,C) zarr, got shape {self._shape}")
-            logger.info(f"Loaded zarr with shape {self._shape}, dtype {self._dtype}")
+            if len(raw_shape) != 3:
+                raise ValueError(f"Expected 3D zarr, got shape {raw_shape}")
+
+            # Detect axis ordering: (C, H, W) vs (H, W, C)
+            # Heuristic: smallest dimension is the channel dimension
+            min_dim_idx = raw_shape.index(min(raw_shape))
+
+            if min_dim_idx == 0:
+                # Smallest dimension first -> (C, H, W) format
+                self._needs_transpose = True
+                self._shape = (raw_shape[1], raw_shape[2], raw_shape[0])
+                logger.info(f"Detected (C, H, W) format: {raw_shape} -> transposing to (H, W, C) = {self._shape}")
+            else:
+                # Smallest dimension last or middle -> (H, W, C) format
+                self._needs_transpose = False
+                self._shape = raw_shape
+                logger.info(f"Detected (H, W, C) format: {raw_shape}")
+
+            logger.info(f"Loaded zarr with effective shape {self._shape}, dtype {self._dtype}")
         else:
             raise TypeError("LayersSource expects np.ndarray or str (zarr path)")
 
@@ -149,8 +178,15 @@ class LayersSource:
                 # in-RAM case is already HWC
                 out[(yy1 - y1):(yy2 - y1), (xx1 - x1):(xx2 - x1)] = self._arr[yy1:yy2, xx1:xx2, :]
             else:
-                # zarr array stored as (H,W,C) -> slice directly
-                roi = self._mm[yy1:yy2, xx1:xx2, :]
+                # zarr array - handle both (H,W,C) and (C,H,W) formats
+                if self._needs_transpose:
+                    # Zarr is stored as (C, H, W), need to transpose to (H, W, C)
+                    # Read as [:, yy1:yy2, xx1:xx2] then transpose
+                    roi = self._mm[:, yy1:yy2, xx1:xx2]  # (C, h, w)
+                    roi = np.transpose(roi, (1, 2, 0))   # (h, w, C)
+                else:
+                    # Zarr is stored as (H, W, C) -> slice directly
+                    roi = self._mm[yy1:yy2, xx1:xx2, :]
                 out[(yy1 - y1):(yy2 - y1), (xx1 - x1):(xx2 - x1)] = roi
         return out
 
@@ -291,7 +327,7 @@ def create_inference_dataloader(
             persistent_workers=(CFG.workers > 0),
             prefetch_factor=CFG.prefetch_factor if CFG.workers > 0 else None,
             drop_last=False,
-            multiprocessing_context='fork' if CFG.workers > 0 else None,  # Faster worker startup
+            multiprocessing_context='spawn' if CFG.workers > 0 else None,  # Use spawn for S3/async compatibility
         )
         logger.info(f"Created dataloader with {len(dataset)} tiles")
         return loader, (h, w), partition_info
