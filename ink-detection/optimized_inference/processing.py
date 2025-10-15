@@ -18,6 +18,9 @@ import cv2
 import zarr
 import tifffile as tiff
 from numcodecs import LZ4
+from tqdm.auto import tqdm
+
+from k8s import get_tqdm_kwargs
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -113,7 +116,6 @@ def create_surface_volume_zarr(
     # Parallel reads with batching to limit memory usage
     if max_workers is None:
         max_workers = int(os.environ.get("MMAP_READ_WORKERS", str(min(6, (os.cpu_count() or 4)))))
-    log_every = max(1, c // 10)
     # Limit in-flight futures to prevent memory buildup
     batch_size = max_workers * 2
 
@@ -129,19 +131,17 @@ def create_surface_volume_zarr(
         del img  # release memory ASAP
         return idx
 
-    n_done = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        # Process in batches to limit memory
-        for batch_start in range(0, c, batch_size):
-            batch_end = min(batch_start + batch_size, c)
-            batch_paths = [(i, layer_paths[i]) for i in range(batch_start, batch_end)]
-            futures = [ex.submit(_read_and_write, ip) for ip in batch_paths]
+    with tqdm(total=c, desc="Building surface volume", unit="layer", **get_tqdm_kwargs()) as pbar:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            # Process in batches to limit memory
+            for batch_start in range(0, c, batch_size):
+                batch_end = min(batch_start + batch_size, c)
+                batch_paths = [(i, layer_paths[i]) for i in range(batch_start, batch_end)]
+                futures = [ex.submit(_read_and_write, ip) for ip in batch_paths]
 
-            for fut in concurrent.futures.as_completed(futures):
-                idx = fut.result()
-                n_done += 1
-                if (n_done % log_every == 0) or (n_done == c):
-                    logger.info(f"Surface volume zarr build progress: {n_done}/{c} layers")
+                for fut in concurrent.futures.as_completed(futures):
+                    idx = fut.result()
+                    pbar.update(1)
 
     logger.info(f"Surface volume zarr created successfully at {output_path}")
     return output_path
@@ -175,32 +175,33 @@ def reduce_partitions(
 
         # Process each partition in chunks to avoid memory issues
         chunk_size = 1024
-        for part_id in range(num_parts):
-            mask_pred_path = os.path.join(zarr_output_dir, f"mask_pred_part_{part_id:03d}.zarr")
-            mask_count_path = os.path.join(zarr_output_dir, f"mask_count_part_{part_id:03d}.zarr")
+        with tqdm(total=num_parts, desc="Blending partitions", unit="partition", **get_tqdm_kwargs()) as pbar:
+            for part_id in range(num_parts):
+                mask_pred_path = os.path.join(zarr_output_dir, f"mask_pred_part_{part_id:03d}.zarr")
+                mask_count_path = os.path.join(zarr_output_dir, f"mask_count_part_{part_id:03d}.zarr")
 
-            if not os.path.exists(mask_pred_path) or not os.path.exists(mask_count_path):
-                logger.warning(f"Missing partition {part_id} at {zarr_output_dir}, skipping")
-                continue
+                if not os.path.exists(mask_pred_path) or not os.path.exists(mask_count_path):
+                    logger.warning(f"Missing partition {part_id} at {zarr_output_dir}, skipping")
+                    pbar.update(1)
+                    continue
 
-            logger.info(f"Loading partition {part_id}/{num_parts}")
-            mask_pred_z = zarr.open(mask_pred_path, mode='r')
-            mask_count_z = zarr.open(mask_count_path, mode='r')
+                mask_pred_z = zarr.open(mask_pred_path, mode='r')
+                mask_count_z = zarr.open(mask_count_path, mode='r')
 
-            # Process in chunks to avoid loading entire partition into memory
-            for y in range(0, H, chunk_size):
-                y_end = min(y + chunk_size, H)
-                for x in range(0, W, chunk_size):
-                    x_end = min(x + chunk_size, W)
+                # Process in chunks to avoid loading entire partition into memory
+                for y in range(0, H, chunk_size):
+                    y_end = min(y + chunk_size, H)
+                    for x in range(0, W, chunk_size):
+                        x_end = min(x + chunk_size, W)
 
-                    # Read chunks and accumulate
-                    pred_chunk = mask_pred_z[y:y_end, x:x_end]
-                    count_chunk = mask_count_z[y:y_end, x:x_end]
+                        # Read chunks and accumulate
+                        pred_chunk = mask_pred_z[y:y_end, x:x_end]
+                        count_chunk = mask_count_z[y:y_end, x:x_end]
 
-                    total_pred[y:y_end, x:x_end] += pred_chunk
-                    total_count[y:y_end, x:x_end] += count_chunk
+                        total_pred[y:y_end, x:x_end] += pred_chunk
+                        total_count[y:y_end, x:x_end] += count_chunk
 
-            logger.info(f"Completed partition {part_id}/{num_parts}")
+                pbar.update(1)
 
         # Blend: divide total_pred by total_count
         logger.info("Blending accumulated predictions")
