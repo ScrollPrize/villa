@@ -197,6 +197,8 @@ class SurfaceTracerEvaluation:
         successful_runs = 0
         total = max(1, len(tasks))
         next_watch = None
+        last_status = 0.0
+        status_period = float(self.config.get("status_log_period_sec", 60.0))
 
         def _close_logf(t):
             try:
@@ -226,6 +228,10 @@ class SurfaceTracerEvaluation:
                 if rc == 0:
                     successful_runs += 1
             active = still
+
+            if now - last_status >= status_period:
+                logger.info(f"[{stage_key}] active={len(active)} completed={completed}/{total} queued={len(tasks)} (parallel={parallel})")
+                last_status = now
 
             # watchdog: after threshold fraction completed, run checks every period
             if completed / total >= self._watch_trigger_fraction:
