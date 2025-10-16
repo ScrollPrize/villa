@@ -106,15 +106,22 @@ class LayersSource:
 
     For reading tiles during inference without holding the whole stack in RAM.
     """
-    def __init__(self, src: Union[np.ndarray, str]):
+    def __init__(self, src: Union[np.ndarray, str], start_z: Optional[int] = None, end_z: Optional[int] = None):
         if isinstance(src, np.ndarray):
             if src.ndim != 3:
                 raise ValueError(f"Expected (H,W,C) array, got {src.shape}")
-            self._arr = src
+            # Apply z-range cropping to numpy array at initialization
+            start_z = start_z if start_z is not None else 0
+            end_z = end_z if end_z is not None else src.shape[2]
+            self._arr = src[:, :, start_z:end_z]
             self._mm = None
-            self._shape = src.shape
-            self._dtype = src.dtype
+            self._shape = self._arr.shape
+            self._dtype = self._arr.dtype
             self._needs_transpose = False
+            if start_z != 0 or end_z != src.shape[2]:
+                logger.info(f"Numpy array cropped from z-range [{start_z}, {end_z}), shape: {self._shape}")
+            else:
+                logger.info(f"Numpy array shape: {self._shape}")
         elif isinstance(src, str):
             # Path to existing zarr array (supports both local paths and S3 URLs)
             if not path_exists(src):
@@ -129,15 +136,15 @@ class LayersSource:
                 logger.info("Detected OME-Zarr format, using multiscale level 0")
                 # OME-Zarr stores arrays at paths like "0", "1", "2" for different resolutions
                 if "0" in root:
-                    self._mm = root["0"]
+                    zarr_array = root["0"]
                 else:
                     raise ValueError(f"OME-Zarr group found but no '0' array present. Available keys: {list(root.keys())}")
             else:
                 # Standard zarr array
-                self._mm = root
+                zarr_array = root
 
-            raw_shape = self._mm.shape
-            self._dtype = self._mm.dtype
+            raw_shape = zarr_array.shape
+            self._dtype = zarr_array.dtype
             if len(raw_shape) != 3:
                 raise ValueError(f"Expected 3D zarr, got shape {raw_shape}")
 
@@ -148,15 +155,39 @@ class LayersSource:
             if min_dim_idx == 0:
                 # Smallest dimension first -> (C, H, W) format
                 self._needs_transpose = True
-                self._shape = (raw_shape[1], raw_shape[2], raw_shape[0])
-                logger.info(f"Detected (C, H, W) format: {raw_shape} -> transposing to (H, W, C) = {self._shape}")
+                full_shape = (raw_shape[1], raw_shape[2], raw_shape[0])
+                logger.info(f"Detected (C, H, W) format: {raw_shape} -> transposing to (H, W, C) = {full_shape}")
             else:
                 # Smallest dimension last or middle -> (H, W, C) format
                 self._needs_transpose = False
-                self._shape = raw_shape
+                full_shape = raw_shape
                 logger.info(f"Detected (H, W, C) format: {raw_shape}")
 
-            logger.info(f"Loaded zarr with effective shape {self._shape}, dtype {self._dtype}")
+            # Apply z-range cropping for zarr by slicing the array view
+            start_z = start_z if start_z is not None else 0
+            end_z = end_z if end_z is not None else full_shape[2]
+
+            if end_z > full_shape[2]:
+                logger.warning(f"Requested end_z={end_z} exceeds available channels={full_shape[2]}, clamping to {full_shape[2]}")
+                end_z = full_shape[2]
+
+            if start_z >= end_z:
+                raise ValueError(f"Invalid z-range: start_z={start_z} >= end_z={end_z}")
+
+            # Slice the zarr array to the requested z-range
+            if self._needs_transpose:
+                # For (C, H, W) format, slice the first dimension
+                self._mm = zarr_array[start_z:end_z, :, :]
+            else:
+                # For (H, W, C) format, slice the last dimension
+                self._mm = zarr_array[:, :, start_z:end_z]
+
+            self._shape = (full_shape[0], full_shape[1], end_z - start_z)
+
+            if start_z != 0 or end_z != full_shape[2]:
+                logger.info(f"Zarr cropped from z-range [{start_z}, {end_z}), effective shape: {self._shape}, dtype {self._dtype}")
+            else:
+                logger.info(f"Loaded zarr with shape {self._shape}, dtype {self._dtype}")
         else:
             raise TypeError("LayersSource expects np.ndarray or str (zarr path)")
 
@@ -175,17 +206,12 @@ class LayersSource:
         )
         if yy2 > yy1 and xx2 > xx1:
             if self._arr is not None:
-                # in-RAM case is already HWC
                 out[(yy1 - y1):(yy2 - y1), (xx1 - x1):(xx2 - x1)] = self._arr[yy1:yy2, xx1:xx2, :]
             else:
-                # zarr array - handle both (H,W,C) and (C,H,W) formats
                 if self._needs_transpose:
-                    # Zarr is stored as (C, H, W), need to transpose to (H, W, C)
-                    # Read as [:, yy1:yy2, xx1:xx2] then transpose
-                    roi = self._mm[:, yy1:yy2, xx1:xx2]  # (C, h, w)
-                    roi = np.transpose(roi, (1, 2, 0))   # (h, w, C)
+                    roi = self._mm[:, yy1:yy2, xx1:xx2]
+                    roi = np.transpose(roi, (1, 2, 0))
                 else:
-                    # Zarr is stored as (H, W, C) -> slice directly
                     roi = self._mm[yy1:yy2, xx1:xx2, :]
                 out[(yy1 - y1):(yy2 - y1), (xx1 - x1):(xx2 - x1)] = roi
         return out
@@ -194,7 +220,9 @@ class LayersSource:
 def preprocess_layers(
     layers: Union[np.ndarray, str],
     fragment_mask: Optional[np.ndarray] = None,
-    is_reverse_segment: bool = False
+    is_reverse_segment: bool = False,
+    start_z: Optional[int] = None,
+    end_z: Optional[int] = None
 ) -> Tuple[LayersSource, np.ndarray, Tuple[int, int], bool]:
     """
     Prepare layers for streaming inference.
@@ -203,12 +231,14 @@ def preprocess_layers(
         layers: Either a numpy array (H, W, C) or path to a zarr array
         fragment_mask: Optional mask array (H, W)
         is_reverse_segment: Whether to reverse layer order
+        start_z: Optional starting z-layer index (inclusive)
+        end_z: Optional ending z-layer index (exclusive)
 
     Returns:
         (source, mask, orig_shape, reverse_flag)
     """
     try:
-        src = LayersSource(layers)
+        src = LayersSource(layers, start_z=start_z, end_z=end_z)
         h, w, c = src.shape
         if c != CFG.in_chans:
             logger.warning(f"Model expects {CFG.in_chans} channels, got {c}")
@@ -547,7 +577,9 @@ def run_inference(
     model: RegressionPLModel,
     device: torch.device,
     fragment_mask: Optional[np.ndarray] = None,
-    is_reverse_segment: bool = False
+    is_reverse_segment: bool = False,
+    start_z: Optional[int] = None,
+    end_z: Optional[int] = None
 ) -> Union[np.ndarray, Dict[str, str]]:
     """
     Main entrypoint: accepts either a stacked array (H,W,C) or path to a zarr array.
@@ -558,6 +590,8 @@ def run_inference(
         device: Torch device
         fragment_mask: Optional mask array (H, W)
         is_reverse_segment: Whether to reverse layer order
+        start_z: Optional starting z-layer index (inclusive)
+        end_z: Optional ending z-layer index (exclusive)
 
     Returns:
         - If num_parts == 1: returns (H,W) heatmap numpy array
@@ -566,7 +600,7 @@ def run_inference(
     try:
         logger.info("Starting inference process...")
         source, mask, orig_shape, reverse = preprocess_layers(
-            layers, fragment_mask, is_reverse_segment
+            layers, fragment_mask, is_reverse_segment, start_z=start_z, end_z=end_z
         )
         test_loader, pred_shape, partition_info = create_inference_dataloader(source, mask, reverse)
         result = predict_fn(test_loader, model, device, pred_shape)

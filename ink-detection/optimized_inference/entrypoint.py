@@ -565,9 +565,19 @@ def run_inference_step(inputs: Inputs) -> None:
         is_reverse_segment = False
 
     # Run inference from zarr
-    logger.info("Running inference from surface volume zarr...")
+    # Note: When using a predefined surface volume zarr (not created by the prepare step),
+    # it may contain more layers than requested. We use start_layer and end_layer to crop
+    # to the desired range within the zarr.
+    logger.info(f"Running inference from surface volume zarr with layer range [{inputs.start_layer}, {inputs.end_layer})...")
     start_infer_time = time.time()
-    result = run_inference(inputs.surface_volume_zarr, model, device, is_reverse_segment=is_reverse_segment)
+    result = run_inference(
+        inputs.surface_volume_zarr,
+        model,
+        device,
+        is_reverse_segment=is_reverse_segment,
+        start_z=inputs.start_layer,
+        end_z=inputs.end_layer
+    )
     logger.info(f"Inference completed in {time.time() - start_infer_time:.2f} seconds")
 
     # Handle partitioned vs standard mode
