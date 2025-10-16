@@ -121,6 +121,7 @@ private:
     struct SurfaceChanges {
         std::vector<std::string> toAdd;
         std::vector<std::string> toRemove;
+        std::vector<std::string> toReload;
     };
 
     SurfaceChanges detectSurfaceChanges() const;

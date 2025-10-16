@@ -167,8 +167,49 @@ void SurfacePanelController::loadSurfacesIncremental()
         }
     }
 
+    std::size_t reloadCount = 0;
+    for (const auto& id : changes.toReload) {
+        std::cout << "Reloading segmentation: " << id << std::endl;
+        Surface* currentSurface = _surfaces ? _surfaces->surface(id) : nullptr;
+        Surface* activeSegSurface = _surfaces ? _surfaces->surface("segmentation") : nullptr;
+        const bool wasActiveSeg = (currentSurface != nullptr && activeSegSurface == currentSurface);
+
+        if (_surfaces) {
+            _surfaces->setSurface(id, nullptr, true, false);
+            if (wasActiveSeg) {
+                _surfaces->setSurface("segmentation", nullptr, false, false);
+            }
+        }
+
+        if (_opchains && _opchains->count(id)) {
+            delete (*_opchains)[id];
+            _opchains->erase(id);
+        }
+
+        _volumePkg->unloadSurface(id);
+        auto surfMeta = _volumePkg->loadSurface(id);
+        if (!surfMeta) {
+            continue;
+        }
+
+        QuadSurface* reloadedSurface = surfMeta->surface();
+        if (_surfaces) {
+            _surfaces->setSurface(id, reloadedSurface, true, false);
+            if (wasActiveSeg) {
+                _surfaces->setSurface("segmentation", reloadedSurface, false, false);
+            }
+        }
+
+        refreshSurfaceMetrics(id);
+        if (_currentSurfaceId == id) {
+            syncSelectionUi(id, reloadedSurface);
+        }
+        ++reloadCount;
+    }
+
     std::cout << "Incremental delta: add=" << changes.toAdd.size()
-        << " remove=" << changes.toRemove.size() << std::endl;
+        << " remove=" << changes.toRemove.size()
+        << " reload=" << reloadCount << std::endl;
 
     applyFilters();
     if (_filtersUpdated) {
@@ -226,10 +267,33 @@ SurfacePanelController::SurfaceChanges SurfacePanelController::detectSurfaceChan
         }
     }
 
+    std::unordered_set<std::string> addedIds(
+        changes.toAdd.begin(), changes.toAdd.end());
+    if (_volumePkg) {
+        for (const auto& uiId : uiIds) {
+            if (!diskIds.contains(uiId)) {
+                continue;
+            }
+            if (addedIds.find(uiId) != addedIds.end()) {
+                continue;
+            }
+            auto surfMeta = _volumePkg->getSurface(uiId);
+            if (!surfMeta) {
+                continue;
+            }
+            const auto storedTs = surfMeta->maskTimestamp();
+            const auto currentTs = SurfaceMeta::readMaskTimestamp(surfMeta->path);
+            if (storedTs != currentTs) {
+                changes.toReload.push_back(uiId);
+            }
+        }
+    }
+
     std::cout << "detectSurfaceChanges: disk=" << diskIds.size()
               << " ui=" << uiIds.size()
               << " add=" << changes.toAdd.size()
-              << " remove=" << changes.toRemove.size() << std::endl;
+              << " remove=" << changes.toRemove.size()
+              << " reload=" << changes.toReload.size() << std::endl;
     return changes;
 }
 
