@@ -317,35 +317,35 @@ class SurfaceTracerEvaluation:
     # Patch selection for tracing
     # -------------------------------
     def get_trace_starting_patches(self, patches: List[Path]) -> List[PatchInfo]:
-        patch_infos: List[PatchInfo] = []
+        patch_infos = []
         for patch_dir in patches:
-            meta_file = patch_dir / "meta.json"
             try:
-                with open(meta_file, "r") as f:
-                    meta = json.load(f)
+                meta = json.load(open(patch_dir / "meta.json"))
                 area = float(meta.get("area_vx2", 0.0) or 0.0)
                 patch_infos.append(PatchInfo(path=patch_dir, area=area))
             except Exception as e:
                 logger.warning(f"Error reading meta.json from {patch_dir}: {e}")
                 continue
-
+    
         min_size = float(self.config.get("min_trace_starting_patch_size", 0.0))
         filtered = [p for p in patch_infos if p.area >= min_size]
         if not filtered:
             logger.warning(f"No patches found with area >= {min_size}")
             return []
-
-        target = int(self.config["num_trace_starting_patches"])
+    
+        k = int(self.config["num_trace_starting_patches"])
         filtered.sort(key=lambda p: p.area, reverse=True)
-        if target <= 1:
-            return [filtered[0]]
-        if len(filtered) <= target:
-            return filtered
-
-        # Evenly spaced deterministic selection across sorted list
         n = len(filtered)
-        idxs = [round(i * (n - 1) / (target - 1)) for i in range(target)]
+    
+        if k <= 1:
+            return filtered[:1]
+        if k >= n:
+            return filtered
+    
+        # Evenly spaced indices across [0, n-1], inclusive (quantiles)
+        idxs = [(i * (n - 1)) // (k - 1) for i in range(k)]  # floor ensures monotone, no dups
         return [filtered[i] for i in idxs]
+
 
     # -------------------------------
     # Tracing (both flip_x variants)
