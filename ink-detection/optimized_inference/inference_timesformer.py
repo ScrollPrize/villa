@@ -95,6 +95,9 @@ class InferenceConfig:
     part_id = 0    # Current partition ID (0-indexed)
     zarr_output_dir = os.environ.get("ZARR_OUTPUT_DIR", "/tmp/partitions")
 
+    # Compression settings
+    use_zarr_compression = True  # Enable/disable zarr compression (LZ4)
+
 CFG = InferenceConfig()
 
 # --------------------- Disk-backed / Array-backed layers ---------------------

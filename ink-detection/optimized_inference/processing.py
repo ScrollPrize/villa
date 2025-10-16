@@ -78,7 +78,8 @@ def create_surface_volume_zarr(
     layer_paths: List[str],
     output_path: str,
     chunk_size: int = 1024,
-    max_workers: Optional[int] = None
+    max_workers: Optional[int] = None,
+    use_compression: bool = True
 ) -> str:
     """
     Create a surface volume zarr array from a list of layer image files.
@@ -88,6 +89,7 @@ def create_surface_volume_zarr(
         output_path: Path where the zarr array will be created (supports local paths and S3 URLs)
         chunk_size: Chunk size for zarr array (default: 1024x1024x1)
         max_workers: Number of worker threads for parallel reading (default: auto)
+        use_compression: Enable LZ4 compression (default: True)
 
     Returns:
         Path to the created zarr array (same as output_path)
@@ -138,14 +140,18 @@ def create_surface_volume_zarr(
     store = get_zarr_store(output_path)
 
     # Create zarr v2 array with shape (H, W, C) and chunk size optimized for spatial tile access
-    # Using LZ4 compression (fast with decent ratio)
+    # Optionally use LZ4 compression (fast with decent ratio)
+    compressor = LZ4(acceleration=1) if use_compression else None
+    compression_msg = "with LZ4 compression" if use_compression else "without compression"
+    logger.info(f"Creating zarr array {compression_msg}")
+
     z = zarr.open(
         store,
         mode="w",
         shape=(h, w, c),
         chunks=(chunk_size, chunk_size, 1),
         dtype=np.uint8,
-        compressor=LZ4(acceleration=1),  # acceleration=1 is default, good balance of speed/ratio
+        compressor=compressor,
         zarr_format=2,
         config={'write_empty_chunks': False}  # Don't write chunks that are entirely fill_value
     )
