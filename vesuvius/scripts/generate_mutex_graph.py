@@ -141,6 +141,70 @@ def main() -> None:
                     progress_bar.close()
 
 
+# --------------------------------------------------------------------------------------
+# DType helpers
+# --------------------------------------------------------------------------------------
+
+def _is_binary_array(arr: np.ndarray) -> bool:
+    """Return True if the array contains only 0 and 1 values.
+
+    Works for integer and floating arrays. Uses exact comparison intended for
+    programmatically created binary arrays (no tolerance to avoid silent loss).
+    """
+    a = np.asarray(arr)
+    # Fast path: check bounds first
+    if a.size == 0:
+        return True
+    # Only values 0 or 1
+    return np.all((a == 0) | (a == 1))
+
+
+def _min_uint_dtype(max_value: int) -> np.dtype:
+    """Choose the smallest unsigned integer dtype that can store max_value."""
+    mv = int(max(0, max_value))
+    if mv <= np.iinfo(np.uint8).max:
+        return np.uint8
+    if mv <= np.iinfo(np.uint16).max:
+        return np.uint16
+    if mv <= np.iinfo(np.uint32).max:
+        return np.uint32
+    return np.uint64
+
+
+def _select_min_lossless_dtype(arr: np.ndarray) -> np.dtype:
+    """
+    Decide the smallest dtype that preserves data exactly.
+
+    Rules:
+    - Binary arrays (only 0/1) -> uint8
+    - Integer arrays          -> minimal unsigned/signed integer dtype that fits
+    - Other floats            -> keep float32 (avoid potential loss)
+    """
+    a = np.asarray(arr)
+    kind = a.dtype.kind
+
+    # Binary detection takes precedence
+    if _is_binary_array(a):
+        return np.uint8
+
+    if kind in ("i", "u"):
+        min_v = int(a.min(initial=0))
+        max_v = int(a.max(initial=0))
+        if min_v >= 0:
+            return _min_uint_dtype(max_v)
+        # For signed, choose the smallest signed dtype that fits the range
+        if np.iinfo(np.int8).min <= min_v and max_v <= np.iinfo(np.int8).max:
+            return np.int8
+        if np.iinfo(np.int16).min <= min_v and max_v <= np.iinfo(np.int16).max:
+            return np.int16
+        if np.iinfo(np.int32).min <= min_v and max_v <= np.iinfo(np.int32).max:
+            return np.int32
+        return np.int64
+
+    # Floats that are not strictly binary: keep float32 to avoid precision loss
+    return np.float32
+
+
 def process_volume(
     path: Path,
     output_dir: Path,
@@ -175,6 +239,7 @@ def process_volume(
         stride_applicable_offsets=long_range_offsets,
     )
 
+    # Conservative chunk shape with channel-leading layout
     chunk_shape = (1,) + tuple(min(64, s) for s in labels.shape)
     compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
 
@@ -188,35 +253,46 @@ def process_volume(
             output_path.unlink()
 
     root = zarr.open_group(str(output_path), mode="w")
+
+    # Determine minimal lossless dtypes
+    attr_dtype = _select_min_lossless_dtype(attractive)
+    rep_dtype = _select_min_lossless_dtype(repulsive)
+    # For masks we prefer uint8 as well (avoids downstream bool->uint8 conversion)
+    mask_attr_dtype = np.uint8 if _is_binary_array(attractive_mask) else _select_min_lossless_dtype(attractive_mask)
+    mask_rep_dtype = np.uint8 if _is_binary_array(repulsive_mask) else _select_min_lossless_dtype(repulsive_mask)
+
+    # Cast on write to avoid holding two copies if possible
     root.create_dataset(
         "affinities/attractive",
-        data=attractive,
+        data=attractive.astype(attr_dtype, copy=False),
         compressor=compressor,
         chunks=chunk_shape,
     )
     root.create_dataset(
         "affinities/repulsive",
-        data=repulsive,
+        data=repulsive.astype(rep_dtype, copy=False),
         compressor=compressor,
         chunks=chunk_shape,
     )
     root.create_dataset(
         "mask/attractive",
-        data=attractive_mask,
+        data=attractive_mask.astype(mask_attr_dtype, copy=False),
         compressor=compressor,
         chunks=chunk_shape,
     )
     root.create_dataset(
         "mask/repulsive",
-        data=repulsive_mask,
+        data=repulsive_mask.astype(mask_rep_dtype, copy=False),
         compressor=compressor,
         chunks=chunk_shape,
     )
 
     if cfg.store_labels:
+        max_label = int(labels.max(initial=0)) if labels.size else 0
+        label_dtype = _min_uint_dtype(max_label)
         root.create_dataset(
             "labels",
-            data=labels.astype(np.int32),
+            data=labels.astype(label_dtype, copy=False),
             compressor=compressor,
             chunks=tuple(min(64, s) for s in labels.shape),
         )
@@ -231,6 +307,10 @@ def process_volume(
             "attractive_offsets": offsets_to_json(attractive_offsets),
             "repulsive_offsets": offsets_to_json(repulsive_offsets),
             "long_range_offsets": offsets_to_json(sorted(long_range_offsets, key=offset_sort_key)),
+            "affinities_attractive_dtype": str(np.dtype(attr_dtype)),
+            "affinities_repulsive_dtype": str(np.dtype(rep_dtype)),
+            "mask_attractive_dtype": str(np.dtype(mask_attr_dtype)),
+            "mask_repulsive_dtype": str(np.dtype(mask_rep_dtype)),
         }
     )
 

@@ -16,5 +16,7 @@ dataset_config:
           weight: 0.25
           kwargs:
             filtration: 'superlevel'
+            chunk_mode: "grid"
+            chunk_size: [12,128,128]
           start_epoch: 25
 

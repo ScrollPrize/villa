@@ -575,6 +575,8 @@ class PlaneSlicer:
         pos0: int,
         pos1: int,
         patch_size: Tuple[int, int],
+        *,
+        finalize: bool = True,
     ) -> Optional[np.ndarray]:
         if array is None:
             return None
@@ -595,10 +597,13 @@ class PlaneSlicer:
                     raise KeyError(f"Unsupported plane axis '{axis}'")
 
                 patch = np.asarray(patch)
-                channels = patch.shape[0]
-                padded = [pad_or_crop_2d(patch[c], patch_size) for c in range(channels)]
-                stacked = np.stack(padded, axis=0)
-                return stacked.astype(arr.dtype, copy=False)
+                if finalize:
+                    channels = patch.shape[0]
+                    padded = [pad_or_crop_2d(patch[c], patch_size) for c in range(channels)]
+                    stacked = np.stack(padded, axis=0)
+                    return stacked.astype(arr.dtype, copy=False)
+                else:
+                    return patch.astype(arr.dtype, copy=False)
 
             if arr.ndim == 2:
                 arr = np.expand_dims(arr, axis=0)
@@ -615,7 +620,9 @@ class PlaneSlicer:
             else:
                 raise KeyError(f"Unsupported plane axis '{axis}'")
 
-            patch_2d = pad_or_crop_2d(np.asarray(patch), patch_size)
+            patch_2d = np.asarray(patch)
+            if finalize:
+                patch_2d = pad_or_crop_2d(patch_2d, patch_size)
             expanded = np.expand_dims(patch_2d, axis=0)
             return expanded.astype(arr.dtype, copy=False)
         except Exception as exc:
@@ -962,7 +969,10 @@ class PlaneSlicer:
             img_patch = None
 
         if img_patch is None:
-            img_patch = self._slice_array_patch(image_array_full, plane, slice_idx, pos0, pos1, patch_size)
+            # Axis-aligned slice; extract raw region without finalizing to full patch size
+            img_patch = self._slice_array_patch(
+                image_array_full, plane, slice_idx, pos0, pos1, patch_size, finalize=False
+            )
             if img_patch is None:
                 raise RuntimeError("PlaneSlicer failed to extract image patch")
             if image_mask_2d is None:
@@ -990,18 +1000,39 @@ class PlaneSlicer:
                     patch_size=patch_size,
                 )
 
+        # Prepare mask that marks valid (in-bounds) pixels so normalization can
+        # ignore padded/out-of-bounds regions. Do NOT multiply into the image
+        # prior to normalization to avoid biasing statistics.
         mask_for_norm = None
         if image_mask_2d is not None:
             mask_for_norm = image_mask_2d.astype(np.float32, copy=False)
-            if img_patch.ndim == 2:
-                img_patch = img_patch * mask_for_norm
-            else:
-                img_patch = img_patch * mask_for_norm[np.newaxis, ...]
+
+        # Normalize first, with mask if supported, then (optionally) re-apply the
+        # mask to keep padded regions at zero.
+        # For axis-aligned slices (no rotation), we extracted an unfinalized region
+        # that contains no padding, so do not provide a mask to normalization.
+        if orientation is None:
+            mask_for_norm = None
 
         if self.normalizer is not None:
+            # Enable mask-aware normalization when available
+            if hasattr(self.normalizer, 'use_mask_for_norm'):
+                self.normalizer.use_mask_for_norm = True
             img_patch = self.normalizer.run(img_patch, mask=mask_for_norm)
         else:
             img_patch = img_patch.astype(np.float32)
+
+        # If we extracted a raw axis-aligned region (no rotation), finalize to the
+        # requested patch size after normalization.
+        if orientation is None:
+            if img_patch.ndim == 2:
+                img_patch = pad_or_crop_2d(img_patch, patch_size)
+            elif img_patch.ndim == 3:
+                channels = img_patch.shape[0]
+                img_patch = np.stack(
+                    [pad_or_crop_2d(img_patch[c], patch_size) for c in range(channels)],
+                    axis=0,
+                )
 
         if mask_for_norm is not None:
             if img_patch.ndim == 2:
