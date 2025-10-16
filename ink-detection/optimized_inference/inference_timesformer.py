@@ -113,7 +113,6 @@ class LayersSource:
         if isinstance(src, np.ndarray):
             if src.ndim != 3:
                 raise ValueError(f"Expected (H,W,C) array, got {src.shape}")
-            # Apply z-range cropping to numpy array at initialization
             start_z = start_z if start_z is not None else 0
             end_z = end_z if end_z is not None else src.shape[2]
             self._arr = src[:, :, start_z:end_z]
@@ -121,76 +120,48 @@ class LayersSource:
             self._shape = self._arr.shape
             self._dtype = self._arr.dtype
             self._needs_transpose = False
-            if start_z != 0 or end_z != src.shape[2]:
-                logger.info(f"Numpy array cropped from z-range [{start_z}, {end_z}), shape: {self._shape}")
-            else:
-                logger.info(f"Numpy array shape: {self._shape}")
+            self._start_z = None
+            self._end_z = None
         elif isinstance(src, str):
-            # Path to existing zarr array (supports both local paths and S3 URLs)
             if not path_exists(src):
                 raise ValueError(f"Zarr path does not exist: {src}")
-            logger.info(f"Opening existing zarr array at {src}")
             self._arr = None
             store = get_zarr_store(src)
             root = zarr.open(store, mode='r')
 
-            # Handle OME-Zarr format (hierarchical with multiscale levels)
             if isinstance(root, zarr.Group):
-                logger.info("Detected OME-Zarr format, using multiscale level 0")
-                # OME-Zarr stores arrays at paths like "0", "1", "2" for different resolutions
                 if "0" in root:
-                    zarr_array = root["0"]
+                    self._mm = root["0"]
                 else:
                     raise ValueError(f"OME-Zarr group found but no '0' array present. Available keys: {list(root.keys())}")
             else:
-                # Standard zarr array
-                zarr_array = root
+                self._mm = root
 
-            raw_shape = zarr_array.shape
-            self._dtype = zarr_array.dtype
+            raw_shape = self._mm.shape
+            self._dtype = self._mm.dtype
             if len(raw_shape) != 3:
                 raise ValueError(f"Expected 3D zarr, got shape {raw_shape}")
 
-            # Detect axis ordering: (C, H, W) vs (H, W, C)
-            # Heuristic: smallest dimension is the channel dimension
             min_dim_idx = raw_shape.index(min(raw_shape))
-
             if min_dim_idx == 0:
-                # Smallest dimension first -> (C, H, W) format
                 self._needs_transpose = True
                 full_shape = (raw_shape[1], raw_shape[2], raw_shape[0])
-                logger.info(f"Detected (C, H, W) format: {raw_shape} -> transposing to (H, W, C) = {full_shape}")
             else:
-                # Smallest dimension last or middle -> (H, W, C) format
                 self._needs_transpose = False
                 full_shape = raw_shape
-                logger.info(f"Detected (H, W, C) format: {raw_shape}")
 
-            # Apply z-range cropping for zarr by slicing the array view
-            start_z = start_z if start_z is not None else 0
-            end_z = end_z if end_z is not None else full_shape[2]
+            self._start_z = start_z if start_z is not None else 0
+            self._end_z = end_z if end_z is not None else full_shape[2]
 
-            if end_z > full_shape[2]:
-                logger.warning(f"Requested end_z={end_z} exceeds available channels={full_shape[2]}, clamping to {full_shape[2]}")
-                end_z = full_shape[2]
+            if self._end_z > full_shape[2]:
+                logger.warning(f"Requested end_z={self._end_z} exceeds available channels={full_shape[2]}, clamping")
+                self._end_z = full_shape[2]
 
-            if start_z >= end_z:
-                raise ValueError(f"Invalid z-range: start_z={start_z} >= end_z={end_z}")
+            if self._start_z >= self._end_z:
+                raise ValueError(f"Invalid z-range: start_z={self._start_z} >= end_z={self._end_z}")
 
-            # Slice the zarr array to the requested z-range
-            if self._needs_transpose:
-                # For (C, H, W) format, slice the first dimension
-                self._mm = zarr_array[start_z:end_z, :, :]
-            else:
-                # For (H, W, C) format, slice the last dimension
-                self._mm = zarr_array[:, :, start_z:end_z]
-
-            self._shape = (full_shape[0], full_shape[1], end_z - start_z)
-
-            if start_z != 0 or end_z != full_shape[2]:
-                logger.info(f"Zarr cropped from z-range [{start_z}, {end_z}), effective shape: {self._shape}, dtype {self._dtype}")
-            else:
-                logger.info(f"Loaded zarr with shape {self._shape}, dtype {self._dtype}")
+            self._shape = (full_shape[0], full_shape[1], self._end_z - self._start_z)
+            logger.info(f"Loaded zarr: shape={self._shape}, z-range=[{self._start_z}, {self._end_z}), dtype={self._dtype}")
         else:
             raise TypeError("LayersSource expects np.ndarray or str (zarr path)")
 
@@ -203,19 +174,16 @@ class LayersSource:
         H, W, C = self._shape
         yy1, yy2 = max(0, y1), min(H, y2)
         xx1, xx2 = max(0, x1), min(W, x2)
-        out = np.zeros(
-            (y2 - y1, x2 - x1, C),
-            dtype=self._dtype if self._arr is None else self._arr.dtype,
-        )
+        out = np.zeros((y2 - y1, x2 - x1, C), dtype=self._dtype)
         if yy2 > yy1 and xx2 > xx1:
             if self._arr is not None:
                 out[(yy1 - y1):(yy2 - y1), (xx1 - x1):(xx2 - x1)] = self._arr[yy1:yy2, xx1:xx2, :]
             else:
                 if self._needs_transpose:
-                    roi = self._mm[:, yy1:yy2, xx1:xx2]
+                    roi = self._mm[self._start_z:self._end_z, yy1:yy2, xx1:xx2]
                     roi = np.transpose(roi, (1, 2, 0))
                 else:
-                    roi = self._mm[yy1:yy2, xx1:xx2, :]
+                    roi = self._mm[yy1:yy2, xx1:xx2, self._start_z:self._end_z]
                 out[(yy1 - y1):(yy2 - y1), (xx1 - x1):(xx2 - x1)] = roi
         return out
 
