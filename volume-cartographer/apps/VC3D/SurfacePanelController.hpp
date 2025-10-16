@@ -114,6 +114,7 @@ signals:
     void growSeedsRequested(const QString& segmentId, bool isExpand, bool isRandomSeed);
     void teleaInpaintRequested();
     void recalcAreaRequested(const QStringList& segmentIds);
+    void exportTifxyzChunksRequested(const QString& segmentId);
     void statusMessageRequested(const QString& message, int timeoutMs);
 
 private:

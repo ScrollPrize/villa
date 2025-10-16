@@ -92,6 +92,17 @@ protected:
     int _axisAlignedRotationKey = -1;
 };
 
+// Options for writing TIFF from QuadSurface
+struct TiffWriteOptions {
+    enum class Compression { NONE, LZW, DEFLATE };
+    enum class Predictor  { NONE, HORIZONTAL, FLOATINGPOINT };
+
+    bool forceBigTiff = false;
+    int  tileSize = 1024;                 // square tiles
+    Compression compression = Compression::LZW;
+    Predictor  predictor   = Predictor::FLOATINGPOINT; // for float32
+};
+
 //quads based surface class with a pointer implementing a nominal scale of 1 voxel
 class QuadSurface : public Surface
 {
@@ -117,6 +128,8 @@ public:
     void save(const std::string &path, const std::string &uuid, bool force_overwrite = false);
     void save(const std::filesystem::path &path, bool force_overwrite = false);
     void save_meta();
+    // Configure how TIFFs are written
+    void setTiffWriteOptions(const TiffWriteOptions& opt) { _tiff_opts = opt; }
     Rect3D bbox();
 
     bool containsPoint(const cv::Vec3f& point, float tolerance) const;
@@ -138,6 +151,7 @@ protected:
     std::unordered_map<std::string, cv::Mat> _channels;
     cv::Mat_<cv::Vec3f>* _points = nullptr;
     cv::Rect _bounds;
+    TiffWriteOptions _tiff_opts;
     cv::Vec3f _center;
     Rect3D _bbox = {{-1,-1,-1},{-1,-1,-1}};
 };

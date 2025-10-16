@@ -458,7 +458,6 @@ CWindow::CWindow() :
     _viewerManager = std::make_unique<ViewerManager>(_surf_col, _point_collection, chunk_cache, this);
     connect(_viewerManager.get(), &ViewerManager::viewerCreated, this, [this](CVolumeViewer* viewer) {
         configureViewerConnections(viewer);
-        applyPointToIterationsToViewer(viewer);
     });
 
     _pointsOverlay = std::make_unique<PointsOverlayController>(_point_collection, this);
@@ -1073,6 +1072,11 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 onAWSUpload(segmentId.toStdString());
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::exportTifxyzChunksRequested,
+        this, [this](const QString& segmentId) {
+            onExportWidthChunks(segmentId.toStdString());
+        });
+
     connect(_surfacePanel.get(), &SurfacePanelController::growSeedsRequested,
             this, [this](const QString& segmentId, bool isExpand, bool isRandomSeed) {
                 onGrowSeeds(segmentId.toStdString(), isExpand, isRandomSeed);
@@ -1540,24 +1544,6 @@ void CWindow::CreateWidgets(void)
     connect(spNorm[0], &QDoubleSpinBox::valueChanged, this, &CWindow::onManualPlaneChanged);
     connect(spNorm[1], &QDoubleSpinBox::valueChanged, this, &CWindow::onManualPlaneChanged);
     connect(spNorm[2], &QDoubleSpinBox::valueChanged, this, &CWindow::onManualPlaneChanged);
-
-    _pointToIterationSpin = ui.spinPointToIterations;
-    if (_pointToIterationSpin) {
-        _pointToIterationSpin->setRange(1, 2000);
-        int storedIterations = settings.value("viewer/point_to_iterations",
-                                              CVolumeViewer::kDefaultPointToIterations).toInt();
-        storedIterations = std::clamp(storedIterations,
-                                      _pointToIterationSpin->minimum(),
-                                      _pointToIterationSpin->maximum());
-        {
-            QSignalBlocker blocker(_pointToIterationSpin);
-            _pointToIterationSpin->setValue(storedIterations);
-        }
-        _pointToIterations = storedIterations;
-        connect(_pointToIterationSpin, qOverload<int>(&QSpinBox::valueChanged),
-                this, &CWindow::onPointToIterationsChanged);
-        onPointToIterationsChanged(_pointToIterations);
-    }
 
     connect(ui.btnEditMask, &QPushButton::pressed, this, &CWindow::onEditMaskPressed);
     connect(ui.btnAppendMask, &QPushButton::pressed, this, &CWindow::onAppendMaskPressed);  // Add this
@@ -2417,7 +2403,7 @@ void CWindow::onPointDoubleClicked(uint64_t pointId)
         Surface* seg_surface = _surf_col->surface("segmentation");
         if (auto* quad_surface = dynamic_cast<QuadSurface*>(seg_surface)) {
             auto ptr = quad_surface->pointer();
-            quad_surface->pointTo(ptr, point_opt->p, 4.0, CVolumeViewer::kDefaultPointToIterations);
+            quad_surface->pointTo(ptr, point_opt->p, 4.0, 100);
             poi->n = quad_surface->normal(ptr, quad_surface->loc(ptr));
         } else {
             poi->n = cv::Vec3f(0, 0, 1); // Default normal if no surface
@@ -2705,34 +2691,6 @@ void CWindow::onSegmentationStopToolsRequested()
         _cmdRunner->cancel();
         statusBar()->showMessage(tr("Cancelling running tools..."), 3000);
     }
-}
-
-void CWindow::onPointToIterationsChanged(int value)
-{
-    const int clampedValue = std::max(1, value);
-    _pointToIterations = clampedValue;
-
-    QSettings settings("VC.ini", QSettings::IniFormat);
-    settings.setValue("viewer/point_to_iterations", _pointToIterations);
-
-    if (_viewerManager) {
-        _viewerManager->forEachViewer([this](CVolumeViewer* viewer) {
-            applyPointToIterationsToViewer(viewer);
-        });
-    }
-}
-
-void CWindow::applyPointToIterationsToViewer(CVolumeViewer* viewer)
-{
-    if (!viewer) {
-        return;
-    }
-
-    const bool isSegmentation = viewer->surfName() == "segmentation";
-    const int iterations = isSegmentation
-        ? CVolumeViewer::kDefaultPointToIterations
-        : std::max(1, _pointToIterations);
-    viewer->setPointToMaxIterations(iterations);
 }
 
 void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,

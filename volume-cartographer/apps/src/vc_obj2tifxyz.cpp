@@ -11,8 +11,6 @@
 #include <algorithm>
 #include <limits>
 
-
-
 struct Vertex {
     cv::Vec3f pos;
 };
@@ -41,12 +39,18 @@ private:
     cv::Vec2i grid_size;
     cv::Vec2f scale;
     // UV handling
-    bool uv_is_metric = true;  // if true, scale comes from UV spacing
+    bool uv_is_metric = true;   // if true, scale comes from UV spacing
     float uv_to_obj   = 1.0f;   // OBJ units per 1 UV unit (used when uv_is_metric)
+    // UV decimation / capping
+    float uv_downsample = 1.0f;            // user-specified uniform decimation
+    uint64_t grid_cap_pixels = 0;          // cap total pixel count (0=off)
 
 public:
     void setUVMetric(bool v) { uv_is_metric = v; }
     void setUVToObj(float r) { uv_to_obj = r; }
+    void setUVDownsample(float f) { uv_downsample = std::max(1.0f, f); }
+    void setGridCapPixels(uint64_t cap) { grid_cap_pixels = cap; }
+
     bool loadObj(const std::string& filename) {
         std::ifstream file(filename);
         if (!file.is_open()) {
@@ -118,7 +122,7 @@ public:
         
         for (const auto& face : faces) {
             for (int i = 0; i < 3; i++) {
-                if (face.vt[i] >= 0 && face.vt[i] < uvs.size()) {
+                if (face.vt[i] >= 0 && face.vt[i] < (int)uvs.size()) {
                     cv::Vec2f uv = uvs[face.vt[i]].coord;
                     uv_min[0] = std::min(uv_min[0], uv[0]);
                     uv_min[1] = std::min(uv_min[1], uv[1]);
@@ -131,40 +135,75 @@ public:
         std::cout << "UV bounds: [" << uv_min[0] << ", " << uv_min[1] << "] to [" 
                   << uv_max[0] << ", " << uv_max[1] << "]" << std::endl;
         
-        // Build grid from UV range and stretch factor
-        cv::Vec2f uv_range = uv_max - uv_min;
-        grid_size[0] = std::max(2, static_cast<int>(std::ceil(uv_range[0] * stretch_factor)) + 1);
-        grid_size[1] = std::max(2, static_cast<int>(std::ceil(uv_range[1] * stretch_factor)) + 1);
+        // Build raw grid (pre-decimation) from UV range and stretch factor
+        const cv::Vec2f uv_range = uv_max - uv_min;
+        const int gw_raw = std::max(2, static_cast<int>(std::ceil(uv_range[0] * stretch_factor)) + 1);
+        const int gh_raw = std::max(2, static_cast<int>(std::ceil(uv_range[1] * stretch_factor)) + 1);
+
+        // Apply uniform decimation / capping to the resolution (NOT to the scale)
+        const auto apply_decimation = [](int n, double d) {
+            if (d <= 1.0) return n;
+            // keep endpoints: 1 + floor((n-1)/d)
+            const double eff = std::max(1.0, d);
+            return std::max(2, static_cast<int>(std::floor((n - 1) / eff)) + 1);
+        };
+
+        double decim = std::max(1.0, static_cast<double>(uv_downsample));
+        if (grid_cap_pixels > 0) {
+            const long double raw_px = static_cast<long double>(gw_raw) * static_cast<long double>(gh_raw);
+            if (raw_px > static_cast<long double>(grid_cap_pixels)) {
+                const double need = std::sqrt(static_cast<double>(raw_px / static_cast<long double>(grid_cap_pixels)));
+                decim = std::max(decim, std::ceil(need));
+            }
+        }
+        const int gw_dec = apply_decimation(gw_raw, decim);
+        const int gh_dec = apply_decimation(gh_raw, decim);
+        grid_size[0] = gw_dec;
+        grid_size[1] = gh_dec;
+
+        // Effective decimation per axis (accounts for rounding at endpoints)
+        const double eff_decim_x = (gw_dec > 1) ? (double)(gw_raw - 1) / (double)(gw_dec - 1) : 1.0;
+        const double eff_decim_y = (gh_dec > 1) ? (double)(gh_raw - 1) / (double)(gh_dec - 1) : 1.0;
 
         if (uv_is_metric) {
-            // Directly derive scale (OBJ units per grid step) from UV spacing
-            // pixel size in UV units
-            const float du = (grid_size[0] > 1) ? uv_range[0] / float(grid_size[0] - 1) : 0.f;
-            const float dv = (grid_size[1] > 1) ? uv_range[1] / float(grid_size[1] - 1) : 0.f;
-            scale[0] = du * uv_to_obj; // OBJ units per pixel in U
-            scale[1] = dv * uv_to_obj; // OBJ units per pixel in V
+            // --- Preserve physical pixel size (scale) from the RAW grid ---
+            // du_raw/dv_raw are UV units per pixel *before* decimation.
+            const float du_raw = (gw_raw > 1) ? uv_range[0] / float(gw_raw - 1) : 0.f;
+            const float dv_raw = (gh_raw > 1) ? uv_range[1] / float(gh_raw - 1) : 0.f;
+            scale[0] = du_raw * uv_to_obj; // OBJ units per pixel (unchanged by decimation)
+            scale[1] = dv_raw * uv_to_obj;
+
             std::cout << "UV-metric mode: grid " << grid_size[0] << " x " << grid_size[1]
                       << "  scale(OBJ units): " << scale[0] << ", " << scale[1] << std::endl;
+            if (decim > 1.0) {
+                std::cout << "  (applied UV decimation ~" << decim << "x per axis; "
+                          << "effective decim [" << eff_decim_x << ", " << eff_decim_y << "]; "
+                          << "preserved per-pixel physical scale)\n";
+            }
         } else {
-            // Two-pass approach (pre-rasterize then measure in 3D)
+            // --- Legacy non-metric: measure from 3D on decimated grid, then compensate ---
             std::cout << "Creating preliminary grid " << grid_size[0] << " x " << grid_size[1]
                       << " to measure scale from 3D..." << std::endl;
-            cv::Mat_<cv::Vec3f> preliminary_points(
-                grid_size[1], grid_size[0], cv::Vec3f(-1, -1, -1));
 
+            cv::Mat_<cv::Vec3f> preliminary_points(grid_size[1], grid_size[0], cv::Vec3f(-1, -1, -1));
             for (const auto& face : faces) {
                 rasterizeTriangle(preliminary_points, face);
             }
-            // This fills 'scale' in OBJ units
+            // This fills 'scale' with the distance between adjacent samples on the DECIMATED grid
             calculateScaleFromGrid(preliminary_points);
 
-            // Re-derive grid from measured physical spacing × stretch
+            // Compensate by the effective decimation so that scale matches the raw-grid pixel size
+            if (scale[0] > 0) scale[0] = static_cast<float>(scale[0] / eff_decim_x);
+            if (scale[1] > 0) scale[1] = static_cast<float>(scale[1] / eff_decim_y);
+
+            // Keep original behavior for the final log (do not fight it further)
             const cv::Vec2f measured = scale;
             grid_size[0] = std::max(2, static_cast<int>(std::round(measured[0] * stretch_factor)) + 1);
             grid_size[1] = std::max(2, static_cast<int>(std::round(measured[1] * stretch_factor)) + 1);
 
             std::cout << "Final grid: " << grid_size[0] << " x " << grid_size[1] << std::endl;
-            std::cout << "Scale(OBJ units): " << measured[0] << ", " << measured[1] << std::endl;
+            std::cout << "Scale(OBJ units; compensated to raw-pixel spacing): "
+                      << measured[0] << ", " << measured[1] << std::endl;
         }
     }
     
@@ -199,7 +238,7 @@ public:
             scale[1] *= mesh_units;
             std::cout << "Scale from UV (micrometers): " << scale[0] << ", " << scale[1] << std::endl;
         } else {
-            // Measure from 3D to preserve anisotropy and noise-robustness
+            // Measure from 3D to preserve anisotropy and noise-robustness (already compensated in determineGridDimensions)
             calculateScaleFromGrid(*points, mesh_units);
         }
         
@@ -213,10 +252,10 @@ public:
         int count = 0;
         
         // Skip borders (10% on each side) to avoid artifacts
-        int jmin = points.rows * 0.1 + 1;
-        int jmax = points.rows * 0.9;
-        int imin = points.cols * 0.1 + 1;
-        int imax = points.cols * 0.9;
+        int jmin = static_cast<int>(points.rows * 0.1) + 1;
+        int jmax = static_cast<int>(points.rows * 0.9);
+        int imin = static_cast<int>(points.cols * 0.1) + 1;
+        int imax = static_cast<int>(points.cols * 0.9);
         int step = 4;
         
         // For small grids, use all points
@@ -254,8 +293,8 @@ public:
         
         if (count > 0 && sum_x > 0 && sum_y > 0) {
             // Scale is the average distance between points, adjusted by mesh units
-            scale[0] = (sum_x / count) * mesh_units;
-            scale[1] = (sum_y / count) * mesh_units;
+            scale[0] = static_cast<float>((sum_x / count) * mesh_units);
+            scale[1] = static_cast<float>((sum_y / count) * mesh_units);
         } else {
             // Fallback to UV-based scale if we couldn't calculate from grid
             std::cerr << "Warning: Could not calculate scale from grid, using UV-based fallback" << std::endl;
@@ -359,7 +398,8 @@ int main(int argc, char *argv[])
     if (argc < 3) {
         std::cout << "usage: " << argv[0]
                   << " <input.obj> <output_directory> [stretch_factor] [mesh_units]"
-                  << " [--uv-metric] [--uv-to-obj=<ratio>]" << std::endl;
+                  << " [--uv-metric] [--uv-to-obj=<ratio>] [--uv-downsample=<f>]"
+                  << " [--grid-cap=<pixels>]" << std::endl;
         std::cout << "Converts an OBJ file to tifxyz format" << std::endl;
         std::cout << std::endl;
         std::cout << "Parameters:" << std::endl;
@@ -369,6 +409,8 @@ int main(int argc, char *argv[])
         std::cout << "  --uv-metric         : UVs are metric (default; UV units == OBJ units unless --uv-to-obj is set)" << std::endl;
         std::cout << "  --uv-non-metric     : Revert to legacy behavior (measure scale from 3D mesh)" << std::endl;
         std::cout << "  --uv-to-obj=<ratio> : OBJ units per 1 UV unit (default: 1.0). Only used with --uv-metric." << std::endl;
+        std::cout << "  --uv-downsample=<f> : Uniform UV decimation factor (>=1.0). Reduces grid by ~f^2." << std::endl;
+        std::cout << "  --grid-cap=<pixels> : Upper bound on total grid pixels. Implies extra decimation if needed." << std::endl;
         std::cout << std::endl;
         std::cout << "Note: Scale factors are automatically calculated from the mesh grid structure." << std::endl;
         std::cout << "Examples:" << std::endl;
@@ -382,9 +424,11 @@ int main(int argc, char *argv[])
     std::filesystem::path output_dir = argv[2];
     float stretch_factor = 1.0f;
     float mesh_units = 1.0f;      // micrometers per OBJ unit
-    bool  uv_metric = true;      // treat UV as metric parametrization
+    bool  uv_metric = true;       // treat UV as metric parametrization
     float uv_to_obj = 1.0f;       // OBJ units per UV unit (only when uv_metric)
-    
+    float uv_downsample = 1.0f;
+    uint64_t grid_cap = 0;
+
     // Backward-compatible parsing:
     // positional numbers: stretch_factor, mesh_units
     // optional flags: --uv-metric (no-op default)  --uv-non-metric  --uv-to-obj=<ratio>
@@ -405,6 +449,25 @@ int main(int argc, char *argv[])
                 continue;
             } catch (...) {
                 std::cerr << "Invalid value for --uv-to-obj\n";
+                return EXIT_FAILURE;
+            }
+        }
+        if (starts_with(a, "--uv-downsample=")) {
+            try {
+                uv_downsample = std::stof(a.substr(std::string("--uv-downsample=").size()));
+                if (uv_downsample < 1.0f) throw 1;
+                continue;
+            } catch (...) {
+                std::cerr << "Invalid value for --uv-downsample (must be >= 1)\n";
+                return EXIT_FAILURE;
+            }
+        }
+        if (starts_with(a, "--grid-cap=")) {
+            try {
+                grid_cap = static_cast<uint64_t>(std::stoll(a.substr(std::string("--grid-cap=").size())));
+                continue;
+            } catch (...) {
+                std::cerr << "Invalid value for --grid-cap\n";
                 return EXIT_FAILURE;
             }
         }
@@ -445,10 +508,16 @@ int main(int argc, char *argv[])
     } else {
         std::cout << "UV mode: non-metric (scale measured from mesh)" << std::endl;
     }
-    
+    if (uv_downsample > 1.0f)
+        std::cout << "UV downsample: " << uv_downsample << "x per axis\n";
+    if (grid_cap > 0)
+        std::cout << "Grid cap: " << grid_cap << " pixels (pre-rasterization)\n";
+
     ObjToTifxyzConverter converter;
     converter.setUVMetric(uv_metric);
     converter.setUVToObj(uv_to_obj);
+    converter.setUVDownsample(uv_downsample);
+    converter.setGridCapPixels(grid_cap);
 
     // Load OBJ file
     if (!converter.loadObj(obj_path.string())) {

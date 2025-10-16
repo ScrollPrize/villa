@@ -26,6 +26,7 @@
 #include <array>
 #include <chrono>
 #include <iomanip>
+#include <csignal>
 #include <sstream>
 
 // OpenCV for compressed image writing
@@ -40,6 +41,12 @@ namespace fs = std::filesystem;
 class WBLogger {
 public:
   WBLogger(const std::string& obj_path, int n_iters) {
+    // Allow explicit opt-out. If WANDB_DISABLED is set and truthy, skip logger entirely.
+    if (const char* d = std::getenv("WANDB_DISABLED")) {
+      std::string v(d);
+      std::transform(v.begin(), v.end(), v.begin(), ::tolower);
+      if (v=="1" || v=="true" || v=="yes") { enabled_ = false; return; }
+    }
     // Derive run name: <volume or parent>_<stem>_<UTC-YYYYMMDD-HHMMSS>
     std::string vol_or_parent = "flatboi";
     try {
@@ -173,7 +180,20 @@ wandb.finish()
     std::string cmd = "python -u \"" + script_path_.string() + "\"";
     pipe_ = _popen(cmd.c_str(), "w");
 #else
-    std::string cmd = "python3 -u \"" + script_path_.string() + "\"";
+    // Robust launcher:
+    //  - Prefer python3 if present
+    //  - Fallback to python (Micromamba/Conda envs commonly expose only 'python')
+    //  - Final fallback to 'cat >/dev/null' so writes never SIGPIPE even if Python is missing
+    // Also, ignore SIGPIPE so a dying child cannot terminate flatboi.
+    std::string quoted = "\"" + script_path_.string() + "\"";
+    std::string cmd =
+      "(command -v python3 >/dev/null 2>&1 && exec python3 -u " + quoted +
+      " || command -v python  >/dev/null 2>&1 && exec python  -u " + quoted +
+      " || exec cat >/dev/null)";
+    // Hardening: ensure writes to a closed pipe don't kill the process.
+    // (Linux lacks O_NOSIGPIPE for pipes; MSG_NOSIGNAL doesn't apply to stdio.)
+    std::signal(SIGPIPE, SIG_IGN);
+
     pipe_ = popen(cmd.c_str(), "w");
 #endif
     if (!pipe_) { enabled_ = false; cleanup_script(); return; }
@@ -269,6 +289,8 @@ private:
 
   bool write_line(const std::string& s){
     if(!pipe_) return false;
+    // Best-effort guard: if the consumer vanished despite our fallbacks,
+    // avoid UB from fwrite size mismatch + SIGPIPE already ignored.
     if (std::fwrite(s.data(), 1, s.size(), pipe_) != s.size()) return false;
     std::fflush(pipe_);
     return !std::ferror(pipe_);
