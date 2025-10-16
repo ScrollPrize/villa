@@ -1,4 +1,3 @@
-
 import os
 import json
 import time
@@ -10,7 +9,7 @@ from dataclasses import dataclass
 from collections import defaultdict
 from typing import List, Dict, Tuple, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
-
+import numbers
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -23,11 +22,11 @@ class PatchInfo:
 
 
 class SurfaceTracerEvaluation:
-    
+
     def __init__(self, config_path: str):
         with open(config_path, 'r') as f:
             self.config = json.load(f)
-        
+        self.config_path = Path(config_path)
         self.out_dir = Path(self.config["out_path"])
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.patches_dir = self.out_dir / "patches"
@@ -35,13 +34,18 @@ class SurfaceTracerEvaluation:
         self.patches_dir.mkdir(exist_ok=self.config["use_existing_patches"])
         self.traces_dir.mkdir(exist_ok=True)
 
+        # Resolve bin dir once (stable absolute paths for all tools)
+        self.bin_dir = Path(self.config["bin_path"]).resolve()
+
+    # -------------------------------
+    # Seed discovery
+    # -------------------------------
     def find_seed_points(self) -> List[Tuple[float, float, float]]:
         # Find seed points from existing patches, filtering by z-range and vc_gsfs_mode = explicit_seed
         patches_path = Path(self.config["existing_patches_for_seeds"])
         z_min, z_max = self.config["z_range"]
-        
-        if patches_path.is_file() and patches_path.suffix == '.json':
 
+        if patches_path.is_file() and patches_path.suffix == '.json':
             with open(patches_path, 'r') as f:
                 seeds_by_mode = json.load(f)
             seed_points = [
@@ -51,9 +55,8 @@ class SurfaceTracerEvaluation:
             ]
             logger.info(f"Loaded {len(seed_points)} seeds from JSON")
             return seed_points
-                
-        elif patches_path.is_dir():
 
+        elif patches_path.is_dir():
             seed_points = []
             failed_count = 0
             for patch_dir in patches_path.iterdir():
@@ -71,36 +74,47 @@ class SurfaceTracerEvaluation:
                     x, y, z = seed
                     if z_min <= z <= z_max:
                         seed_points.append((x, y, z))
-                except Exception as e:
+                except Exception:
                     failed_count += 1
                     continue
-            
+
             logger.warning(f"Failed to read meta.json from {failed_count} patches")
             logger.info(f"Found {len(seed_points)} explicit_seed seed points in z-range [{z_min}, {z_max}]")
             return seed_points
-        
+
         else:
             logger.error(f"existing_patches_for_seeds path {patches_path} is neither a valid JSON file nor a directory")
             return []
-    
-    def _run_vc_grow_seg_from_seed(self, mode: str, params_file: Path, seed_point: Tuple[float, float, float] = None) -> bool:
-        
+
+    # -------------------------------
+    # vc_grow_seg_from_seed
+    # -------------------------------
+    def _run_vc_grow_seg_from_seed(
+        self,
+        mode: str,
+        params_file: Path,
+        seed_point: Tuple[float, float, float] = None
+    ) -> bool:
+
         cmd = [
-            f"{self.config['bin_path']}/vc_grow_seg_from_seed",
+            str(self.bin_dir / "vc_grow_seg_from_seed"),
             self.config["surface_zarr_volume"],
             str(self.patches_dir),
             str(params_file)
         ]
-        
+
         if seed_point:
             cmd.extend([str(int(seed_point[0])), str(int(seed_point[1])), str(int(seed_point[2]))])
 
+        # Clamp threads to avoid oversubscription in multiprocess settings
         env = os.environ.copy()
-        env["OMP_NUM_THREADS"] = "1"
-        
+        env.setdefault("OMP_NUM_THREADS", "1")
+        env.setdefault("OPENBLAS_NUM_THREADS", "1")
+        env.setdefault("MKL_NUM_THREADS", "1")
+        env.setdefault("NUMEXPR_NUM_THREADS", "1")
+
         logger.info(f"Starting {mode} run of vc_grow_seg_from_seed")
         result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-        
         if result.returncode == 0:
             logger.info(f"Finished {mode} run")
             return True
@@ -111,31 +125,29 @@ class SurfaceTracerEvaluation:
             if result.stderr:
                 logger.error(f"STDERR:\n{result.stderr}")
             return False
-    
-    def run_seeding(self, seed_points: List[Tuple[float, float, float]]) -> List[Path]:
 
+    def run_seeding(self, seed_points: List[Tuple[float, float, float]]) -> List[Path]:
         logger.info(f"Running vc_grow_seg_from_seed seeding for {len(seed_points)} seed points")
-        
+
         seeding_params = self.config["vc_grow_seg_from_seed_params"]["seeding"].copy()
         seeding_params["mode"] = "seed"
-        
+
         seeding_params_file = self.out_dir / "seeding_params.json"
         with open(seeding_params_file, 'w') as f:
             json.dump(seeding_params, f, indent=2)
 
         max_num_seeds = self.config.get("max_num_seeds", len(seed_points))
-        
+
         successful_runs = 0
         with ProcessPoolExecutor(max_workers=self.config["seeding_parallel_processes"]) as executor:
             futures = []
-            
             for i, seed_point in enumerate(seed_points[:max_num_seeds]):
                 future = executor.submit(
                     self._run_vc_grow_seg_from_seed,
                     "seeding", seeding_params_file, seed_point
                 )
                 futures.append(future)
-            
+
             for future in as_completed(futures):
                 try:
                     result = future.result()
@@ -143,39 +155,37 @@ class SurfaceTracerEvaluation:
                         successful_runs += 1
                 except Exception as e:
                     logger.error(f"Error in seed growth: {e}")
-        
+
         # Collect all created patches from patches directory
         created_patches = []
         for patch_dir in self.patches_dir.iterdir():
             if patch_dir.is_dir() and (patch_dir / "meta.json").exists():
                 created_patches.append(patch_dir)
-        
+
         logger.info(f"Completed {successful_runs} seed runs, found {len(created_patches)} patches in results directory")
         return created_patches
-    
-    def run_expansion(self, existing_patches: List[Path]) -> List[Path]:
 
+    def run_expansion(self, existing_patches: List[Path]) -> List[Path]:
         num_expansion_patches = self.config.get("num_expansion_patches", 1)
         logger.info(f"Running vc_grow_seg_from_seed in expansion mode {num_expansion_patches} times")
-        
+
         expansion_params = self.config["vc_grow_seg_from_seed_params"]["expansion"].copy()
         expansion_params["mode"] = "expansion"
-        
+
         expansion_params_file = self.out_dir / "expansion_params.json"
         with open(expansion_params_file, 'w') as f:
             json.dump(expansion_params, f, indent=2)
-        
+
         successful_runs = 0
         with ProcessPoolExecutor(max_workers=self.config.get("seeding_parallel_processes")) as executor:
             futures = []
-            
-            for i in range(num_expansion_patches):
+            for _ in range(num_expansion_patches):
                 future = executor.submit(
                     self._run_vc_grow_seg_from_seed,
                     "expansion", expansion_params_file, None
                 )
                 futures.append(future)
-            
+
             for future in as_completed(futures):
                 try:
                     result = future.result()
@@ -183,17 +193,20 @@ class SurfaceTracerEvaluation:
                         successful_runs += 1
                 except Exception as e:
                     logger.error(f"Error in expansion run: {e}")
-        
+
         # Collect new patches created by expansion runs
         all_patches = []
-        existing_patches = set(existing_patches)
+        existing_patches_set = set(existing_patches)
         for patch_dir in self.patches_dir.iterdir():
-            if patch_dir.is_dir() and (patch_dir / "meta.json").exists() and patch_dir not in existing_patches:
+            if patch_dir.is_dir() and (patch_dir / "meta.json").exists() and patch_dir not in existing_patches_set:
                 all_patches.append(patch_dir)
-        
+
         logger.info(f"Completed {successful_runs} successful expansion runs, found {len(all_patches)} new patches")
         return all_patches
-    
+
+    # -------------------------------
+    # Patch selection for tracing
+    # -------------------------------
     def get_trace_starting_patches(self, patches: List[Path]) -> List[PatchInfo]:
         patch_infos = []
         for patch_dir in patches:
@@ -202,14 +215,11 @@ class SurfaceTracerEvaluation:
                 with open(meta_file, 'r') as f:
                     meta = json.load(f)
                 area = meta.get("area_vx2", 0)
-                patch_infos.append(PatchInfo(
-                    path=patch_dir,
-                    area=area
-                ))
+                patch_infos.append(PatchInfo(path=patch_dir, area=area))
             except Exception as e:
                 logger.warning(f"Error reading meta.json from {patch_dir}: {e}")
                 continue
-        
+
         # Filter by minimum size, sort by area, then subsample deterministically
         min_size = self.config.get("min_trace_starting_patch_size", 0.0)
         filtered_patches = [p for p in patch_infos if p.area >= min_size]
@@ -224,9 +234,11 @@ class SurfaceTracerEvaluation:
         n = len(filtered_patches)
         idxs = [round(i * (n - 1) / (target_count - 1)) for i in range(target_count)]
         return [filtered_patches[i] for i in idxs]
-    
-    def run_tracer(self, source_patches: List[PatchInfo]) -> List[Path]:
 
+    # -------------------------------
+    # Tracing (both flip_x variants)
+    # -------------------------------
+    def run_tracer(self, source_patches: List[PatchInfo]) -> List[Path]:
         logger.info(f"Running vc_grow_seg_from_segments (both flip_x variants) for {len(source_patches)} source patches")
 
         # Base params (we will materialize per-flip variants below)
@@ -234,7 +246,7 @@ class SurfaceTracerEvaluation:
         if "z_range" in self.config:
             base_params["z_range"] = self.config["z_range"]
 
-        # Always evaluate both flips; no config change required
+        # Evaluate both flips unconditionally here
         flip_variants = [False, True]
         param_files = {}
         for fv in flip_variants:
@@ -246,7 +258,7 @@ class SurfaceTracerEvaluation:
             param_files[fv] = pf
 
         trace_paths: List[Path] = []
-        max_workers = self.config.get("tracer_parallel_processes", 1)
+        max_workers = int(self.config.get("tracer_parallel_processes", 1))
         logger.info(f"Tracing with up to {max_workers} parallel processes")
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = []
@@ -261,6 +273,7 @@ class SurfaceTracerEvaluation:
                             tag
                         )
                     )
+
             for future in as_completed(futures):
                 try:
                     result = future.result()
@@ -268,12 +281,16 @@ class SurfaceTracerEvaluation:
                         trace_paths.append(result)
                 except Exception as e:
                     logger.error(f"Error in tracer run: {e}")
-        
+
         logger.info(f"Created {len(trace_paths)} valid traces")
-        
         return trace_paths
-    
-    def _run_vc_grow_seg_from_segments(self, source_patch: PatchInfo, tracer_params_file: Path, run_tag: str = "") -> Optional[Path]:
+
+    def _run_vc_grow_seg_from_segments(
+        self,
+        source_patch: PatchInfo,
+        tracer_params_file: Path,
+        run_tag: str = ""
+    ) -> Optional[Path]:
 
         # Unique, informative run directory (include flip tag and ns-resolution time)
         ts = time.time_ns()
@@ -282,27 +299,34 @@ class SurfaceTracerEvaluation:
         run_traces_dir.mkdir(exist_ok=True)
 
         cmd = [
-            f"{self.config['bin_path']}/vc_grow_seg_from_segments",
+            str(self.bin_dir / "vc_grow_seg_from_segments"),
             self.config["surface_zarr_volume"],
             str(self.patches_dir),
             str(run_traces_dir),
             str(tracer_params_file),
             str(source_patch.path)
         ]
-        
+
+        # Clamp per-process threading for inner OpenMP libs
+        env = os.environ.copy()
+        env.setdefault("OMP_NUM_THREADS", "1")
+        env.setdefault("OPENBLAS_NUM_THREADS", "1")
+        env.setdefault("MKL_NUM_THREADS", "1")
+        env.setdefault("NUMEXPR_NUM_THREADS", "1")
+
         logger.info(f"Starting vc_grow_seg_from_segments run from {source_patch.path.name}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
         logger.info(f"Finished vc_grow_seg_from_segments run (return code {result.returncode})")
         if result.returncode != 0:
             if result.stdout:
                 logger.error(f"vc_grow_seg_from_segments STDOUT:\n{result.stdout}")
             if result.stderr:
                 logger.error(f"vc_grow_seg_from_segments STDERR:\n{result.stderr}")
-        
+
         # Find the final trace
         trace_paths = []
         for trace_dir in run_traces_dir.iterdir():
-            if all(os.path.exists(trace_dir / filename) for filename in ["meta.json", "x.tif", "y.tif", "z.tif"]) and not trace_dir.name.endswith("_opt"):
+            if all((trace_dir / filename).exists() for filename in ["meta.json", "x.tif", "y.tif", "z.tif"]) and not trace_dir.name.endswith("_opt"):
                 trace_paths.append(trace_dir)
         if not trace_paths:
             logger.warning(f"No trace produced starting from patch {source_patch.path.name}")
@@ -310,32 +334,32 @@ class SurfaceTracerEvaluation:
         trace_paths.sort(key=lambda p: p.name)
         last_trace_path = trace_paths[-1]
         logger.info(f"Selected final trace {last_trace_path.name} for patch {source_patch.path.name}")
-        
         return last_trace_path
-    
-    def run_winding_numbers(self, traces: List[Path]) -> List[Path]:
 
+    # -------------------------------
+    # Winding numbers
+    # -------------------------------
+    def run_winding_numbers(self, traces: List[Path]) -> List[Path]:
         logger.info(f"Running vc_tifxyz_winding for {len(traces)} traces")
-        
+
         successful_traces = []
         for trace_dir in traces:
             if self._run_vc_tifxyz_winding(trace_dir):
                 successful_traces.append(trace_dir)
-        
+
         logger.info(f"Completed winding calculation for {len(successful_traces)} traces")
         return successful_traces
-    
+
     def _run_vc_tifxyz_winding(self, trace_dir: Path) -> bool:
-        
         cmd = [
-            str(Path(self.config['bin_path']).resolve() / "vc_tifxyz_winding"),
+            str(self.bin_dir / "vc_tifxyz_winding"),
             "."
         ]
-        
+
         logger.info(f"Starting vc_tifxyz_winding for {trace_dir.name}")
         result = subprocess.run(cmd, cwd=trace_dir, capture_output=True, text=True)
         logger.info(f"Finished vc_tifxyz_winding (return code {result.returncode})")
-        
+
         winding_file = trace_dir / "winding.tif"
         if result.returncode == 0 and winding_file.exists():
             return True
@@ -346,27 +370,27 @@ class SurfaceTracerEvaluation:
             if result.stderr:
                 logger.error(f"vc_tifxyz_winding STDERR:\n{result.stderr}")
             return False
-    
-    def run_metrics(self, traces: List[Path]) -> Dict[Path, Dict]:
 
+    # -------------------------------
+    # Metrics
+    # -------------------------------
+    def run_metrics(self, traces: List[Path]) -> Dict[Path, Dict]:
         logger.info(f"Running vc_calc_surface_metrics for {len(traces)} traces")
-        
+
         metrics_results = {}
         for trace_dir in traces:
             result = self._run_vc_calc_surface_metrics(trace_dir)
             if result:
                 metrics_results[trace_dir] = result
-        
+
         logger.info(f"Completed metrics calculation for {len(metrics_results)} traces")
         return metrics_results
-    
-    def _run_vc_calc_surface_metrics(self, trace_dir: Path) -> Optional[Dict]:
-        
-        metrics_file = trace_dir / "metrics.json"
 
+    def _run_vc_calc_surface_metrics(self, trace_dir: Path) -> Optional[Dict]:
+        metrics_file = trace_dir / "metrics.json"
         z_range = self.config.get("z_range", [-1, -1])  # -1 means entire surface bbox is used
         cmd = [
-            f"{self.config['bin_path']}/vc_calc_surface_metrics",
+            str(self.bin_dir / "vc_calc_surface_metrics"),
             "--collection", self.config["wrap_labels"],
             "--surface", str(trace_dir),
             "--winding", str(trace_dir / "winding.tif"),
@@ -374,9 +398,8 @@ class SurfaceTracerEvaluation:
             "--z_min", str(z_range[0]),
             "--z_max", str(z_range[1]),
         ]
-        
         result = subprocess.run(cmd, capture_output=True, text=True)
-        
+
         if result.returncode == 0 and metrics_file.exists():
             with open(metrics_file, 'r') as f:
                 metrics = json.load(f)
@@ -389,9 +412,27 @@ class SurfaceTracerEvaluation:
             if result.stderr:
                 logger.error(f"vc_calc_surface_metrics STDERR:\n{result.stderr}")
             return None
-    
-    def collate_and_log_metrics(self, metrics_results: Dict[Path, Dict]):
 
+    # -------------------------------
+    # Collate & W&B logging (scalar-only, concurrency-safe)
+    # -------------------------------
+    def _wandb_safe_config(self) -> Dict[str, str]:
+        """
+        Convert any non-scalar config values into compact JSON strings,
+        to avoid implicit Tables and IMMUTABLE warnings.
+        """
+        safe = {}
+        for k, v in self.config.items():
+            if isinstance(v, (str, bool, numbers.Number)) or v is None:
+                safe[k] = v
+            else:
+                try:
+                    safe[k] = json.dumps(v, separators=(",", ":"), ensure_ascii=False)[:10000]
+                except Exception:
+                    safe[k] = str(v)
+        return safe
+
+    def collate_and_log_metrics(self, metrics_results: Dict[Path, Dict]):
         logger.info("Collating metrics and logging to wandb")
 
         if not metrics_results:
@@ -415,38 +456,89 @@ class SurfaceTracerEvaluation:
 
         ranked.sort(key=safe_metric, reverse=True)
         best_traces = ranked[: self.config["num_best_traces_to_average"]]
-        
+
         metric_to_values = defaultdict(list)
         for trace in best_traces:
-            for metric_name in metrics_results[trace].keys():
-                metric_to_values[metric_name].append(metrics_results[trace][metric_name])
+            for metric_name, value in metrics_results[trace].items():
+                metric_to_values[metric_name].append(value)
+
         metric_to_mean = {
-            metric_name: sum(values) / len(values)
+            metric_name: (sum(values) / len(values))
             for metric_name, values in metric_to_values.items()
+            if all(isinstance(v, (int, float)) for v in values)
         }
 
         logger.info(f'final metrics, average over best {self.config["num_best_traces_to_average"]} traces:')
         for metric_name, mean in metric_to_mean.items():
             logger.info(f'  {metric_name}: {mean}')
 
+        # ---- W&B (main process only; scalar row; ignore heavy artifacts) ----
         if "wandb_project" in self.config:
             try:
-                import wandb
-                wandb.init(
-                    project=self.config["wandb_project"],
-                    config=self.config,
-                    name=f"surface_tracer_{int(time.time())}",
-                    dir=self.out_dir,
+                # Ensure any W&B background service behaves well in multiprocess envs
+                os.environ.setdefault("WANDB_START_METHOD", "thread")
+                os.environ.setdefault("WANDB_SILENT", "true")
+
+                import wandb  # import only here (not in workers)
+
+                # Ignore heavy paths
+                default_ignores = [
+                    "patches/**", "traces/**",
+                    "**/*.tif", "**/*.tiff", "**/*.png", "**/*.jpg", "**/*.jpeg",
+                    "**/*.zarr", "**/*.npz", "**/*.npy", "**/*.h5",
+                    "**/*.zip", "**/*.tar", "**/*.gz"
+                ]
+                ignore_globs = self.config.get("wandb_ignore_globs", default_ignores)
+                os.environ.setdefault("WANDB_IGNORE_GLOBS", ",".join(ignore_globs))
+
+                # Keep W&B files contained
+                wandb_dir = self.out_dir / self.config.get("wandb_run_dir_name", "wandb_runs")
+                wandb_dir.mkdir(parents=True, exist_ok=True)
+
+                settings = wandb.Settings(
+                    ignore_globs=tuple(ignore_globs),
+                    save_code=False,
+                    disable_code=True,
+                    disable_git=True,
+                    root_dir=str(wandb_dir),
+                    mode=self.config.get("wandb_mode", "online"),
                 )
-                wandb.summary.update(metric_to_mean)
-                wandb.finish()
+
+                # Build final W&B run name = Argo workflow name (exported as env)
+                run_name = os.environ.get("VC3D_RUN_NAME")
+                if not run_name:
+                    # Fallback: derive from config filename + tags (sanitized)
+                    def _clean(s: str) -> str:
+                        return "".join(ch if ch.isalnum() or ch == "-" else "-" for ch in s.lower()).strip("-")
+                    cfg_stem = _clean(self.config_path.stem)
+                    tags_raw = self.config.get("wandb_tags", self.config.get("tags", []))
+                    if not isinstance(tags_raw, list): tags_raw = [str(tags_raw)]
+                    tags_clean = "-".join(_clean(str(t)) for t in tags_raw if str(t).strip())
+                    run_name = f"{cfg_stem}--{tags_clean}" if tags_clean else cfg_stem
+
+                run = wandb.init(
+                    project=self.config["wandb_project"],
+                    config=self._wandb_safe_config(),
+                    name=run_name,
+                    tags=self.config.get("wandb_tags", self.config.get("tags", [])),
+                    dir=str(wandb_dir),
+                    settings=settings,
+                )
+
+                # Log exactly one scalar row; do not touch summary Tables
+                scalar_row = {k: float(v) for k, v in metric_to_mean.items() if isinstance(v, numbers.Number)}
+                if scalar_row:
+                    run.log(scalar_row, step=0, commit=True)
+
+                run.finish()
             except Exception as e:
                 logger.warning(f"wandb logging skipped: {e}")
-    
-    def run(self):
-        
-        try:
 
+    # -------------------------------
+    # Driver
+    # -------------------------------
+    def run(self):
+        try:
             if self.config.get("use_existing_patches", False):
                 existing_patches = []
                 for patch_dir in self.patches_dir.iterdir():
@@ -461,14 +553,14 @@ class SurfaceTracerEvaluation:
                 seeding_patches = self.run_seeding(seed_points)
                 expansion_patches = self.run_expansion(seeding_patches)
                 all_patches = seeding_patches + expansion_patches
-            
+
             top_patches = self.get_trace_starting_patches(all_patches)
             traces = self.run_tracer(top_patches)
             traces = self.run_winding_numbers(traces)
-            
+
             metrics_results = self.run_metrics(traces)
             self.collate_and_log_metrics(metrics_results)
-            
+
         except Exception as e:
             logger.error(f"Error: {e}")
             raise
