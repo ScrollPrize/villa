@@ -1148,14 +1148,14 @@ void masked_blur(cv::Mat_<T>& img, const cv::Mat_<uchar>& mask) {
 static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, const TraceData &trace_data, LossSettings &settings, int flags);
 
 //optimize within a radius, setting edge points to constant
-static void inpaint(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, const TraceData &trace_data)
+static bool inpaint(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, const TraceData &trace_data)
 {
     // check that a two pixel border is 1
     for (int y = 0; y < roi.height; ++y) {
         for (int x = 0; x < roi.width; ++x) {
             if (y < 2 || y >= roi.height - 2 || x < 2 || x >= roi.width - 2) {
                 if (mask(y, x) == 0) {
-                    throw std::runtime_error("Mask border is not 1");
+                    return false;
                 }
             }
         }
@@ -1193,6 +1193,8 @@ static void inpaint(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParam
     local_optimization(roi, mask, params, trace_data, lowsnap, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
     LossSettings default_settings;
     local_optimization(roi, mask, params, trace_data, default_settings, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+
+    return true;
 }
 
 
