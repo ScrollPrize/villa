@@ -938,25 +938,39 @@ class BaseTrainer:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             splits_filename = f"train_val_splits_{self.mgr.model_name}_{timestamp}.json"
             splits_filepath = os.path.join(save_dir, splits_filename)
-            
+
             # Save to local file
             with open(splits_filepath, 'w') as f:
                 json.dump(train_val_splits, f, indent=2)
             print(f"Saved train/val splits to: {splits_filepath}")
-            
 
             mgr_config = self.mgr.convert_to_dict()
             mgr_config['train_val_splits_file'] = splits_filepath
             mgr_config['train_patch_count'] = len(train_indices)
             mgr_config['val_patch_count'] = len(val_indices)
 
-            wandb.init(
-                entity=self.mgr.wandb_entity,
-                project=self.mgr.wandb_project,
-                group=self.mgr.model_name,
-                config=mgr_config
-            )
-            
+            wandb_init_kwargs = {
+                "entity": self.mgr.wandb_entity,
+                "project": self.mgr.wandb_project,
+                "group": self.mgr.model_name,
+                "config": mgr_config,
+            }
+            wandb_resume = getattr(self.mgr, "wandb_resume", None)
+            if wandb_resume:
+                resume_arg = str(wandb_resume).strip()
+                resume_lower = resume_arg.lower()
+                known_resume_modes = {"allow", "auto", "must", "never"}
+                if resume_lower in known_resume_modes:
+                    wandb_init_kwargs["resume"] = resume_lower
+                else:
+                    wandb_init_kwargs["resume"] = "allow"
+                    wandb_init_kwargs["id"] = resume_arg
+            run_name = getattr(self.mgr, "wandb_run_name", None)
+            if run_name:
+                wandb_init_kwargs["name"] = run_name
+
+            wandb.init(**wandb_init_kwargs)
+
             # Log the splits file as an artifact for reference
             artifact = wandb.Artifact(f"train_val_splits_{timestamp}", type="dataset")
             artifact.add_file(splits_filepath)
@@ -1863,6 +1877,10 @@ def main():
                              help="Weights & Biases project (omit to disable wandb)")
     grp_logging.add_argument("--wandb-entity", type=str, default=None,
                              help="Weights & Biases team/username")
+    grp_logging.add_argument("--wandb-run-name", type=str, default=None,
+                             help="Optional custom name for the Weights & Biases run")
+    grp_logging.add_argument("--wandb-resume", nargs='?', const='allow', default=None,
+                             help="Weights & Biases resume mode or run id. Provide a resume policy ('allow', 'auto', 'must', 'never') or a run id (defaults to 'allow' if flag used without value).")
     grp_logging.add_argument("--verbose", action="store_true",
                              help="Enable verbose debug output")
 
@@ -2044,6 +2062,10 @@ def main():
         from vesuvius.models.training.trainers.self_supervised.train_finetune_mae_unet import TrainFineTuneMAEUNet
         trainer = TrainFineTuneMAEUNet(mgr=mgr, verbose=args.verbose)
         print("Using Fine-Tune MAE->UNet Trainer (NetworkFromConfig)")
+    elif trainer_name == "mutex_affinity":
+        from vesuvius.models.training.trainers.mutex_affinity_trainer import MutexAffinityTrainer
+        trainer = MutexAffinityTrainer(mgr=mgr, verbose=args.verbose)
+        print("Using Mutex Affinity Trainer")
     elif trainer_name == "base":
         trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Base Trainer for supervised training")
@@ -2054,7 +2076,7 @@ def main():
         print("Using Surface Frame Trainer")
     else:
         raise ValueError(
-            "Unknown trainer: {trainer}. Available options: base, surface_frame, mean_teacher, "
+            "Unknown trainer: {trainer}. Available options: base, surface_frame, mutex_affinity, mean_teacher, "
             "uncertainty_aware_mean_teacher, primus_mae, unet_mae, finetune_mae_unet".format(trainer=trainer_name)
         )
 

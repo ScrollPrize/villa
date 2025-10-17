@@ -326,3 +326,12 @@ def update_config_from_args(mgr, args):
 
     mgr.wandb_project = args.wandb_project
     mgr.wandb_entity = args.wandb_entity
+    mgr.wandb_run_name = getattr(args, 'wandb_run_name', None)
+    if mgr.wandb_run_name:
+        mgr.model_name = mgr.wandb_run_name
+        mgr.tr_info["model_name"] = mgr.wandb_run_name
+        if mgr.verbose:
+            print(f"Model name set from wandb run: {mgr.model_name}")
+    mgr.wandb_resume = getattr(args, 'wandb_resume', None)
+    if mgr.wandb_resume:
+        mgr.tr_info["wandb_resume"] = mgr.wandb_resume
