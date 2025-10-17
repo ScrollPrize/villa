@@ -24,6 +24,9 @@
 #include <optional>
 #include <cstdlib>
 #include <limits>
+#include <memory>
+#include <algorithm>
+#include <cmath>
 #include <omp.h>  // ensure omp_get_max_threads() is declared
 
 #include "vc/tracer/Tracer.hpp"
@@ -85,6 +88,12 @@ struct Vec2iLess {
         return a[1] < b[1];
     }
 };
+
+template <typename T>
+static bool point_in_bounds(const cv::Mat_<T>& mat, const cv::Vec2i& p)
+{
+    return p[0] >= 0 && p[0] < mat.rows && p[1] >= 0 && p[1] < mat.cols;
+}
 
 class PointCorrection {
 public:
@@ -181,6 +190,139 @@ struct TraceData {
     PointCorrection point_correction;
     const vc::core::util::NormalGridVolume *ngv = nullptr;
     const std::vector<DirectionField> &direction_fields;
+    struct ReferenceRaycastSettings {
+        QuadSurface* surface = nullptr;
+        double voxel_threshold = 1.0;
+        double penalty_weight = 0.5;
+        double sample_step = 1.0;
+        double max_distance = 250.0;
+        double min_clearance = 4.0;
+        double clearance_weight = 1.0;
+
+        bool enabled() const { return surface && penalty_weight > 0.0; }
+    } reference_raycast;
+
+    Chunked3d<uint8_t, passTroughComputor>* raw_volume = nullptr;
+};
+
+class ReferenceClearanceCost {
+public:
+    ReferenceClearanceCost(const cv::Vec3d& target,
+                           double min_clearance,
+                           double weight)
+        : target_(target),
+          min_clearance_(min_clearance),
+          weight_(weight) {}
+
+    bool operator()(const double* candidate, double* residual) const {
+        if (weight_ <= 0.0 || min_clearance_ <= 0.0) {
+            residual[0] = 0.0;
+            return true;
+        }
+
+        const cv::Vec3d diff{candidate[0] - target_[0],
+                             candidate[1] - target_[1],
+                             candidate[2] - target_[2]};
+        const double dist = cv::norm(diff);
+        if (dist >= min_clearance_) {
+            residual[0] = 0.0;
+        } else {
+            residual[0] = weight_ * (min_clearance_ - dist);
+        }
+        return true;
+    }
+
+private:
+    cv::Vec3d target_;
+    double min_clearance_;
+    double weight_;
+};
+
+class ReferenceRayOcclusionCost {
+public:
+    ReferenceRayOcclusionCost(Chunked3d<uint8_t, passTroughComputor>* volume,
+                              const cv::Vec3d& target,
+                              double threshold,
+                              double weight,
+                              double step,
+                              double max_distance) :
+        volume_(volume),
+        target_(target),
+        threshold_(threshold),
+        weight_(weight),
+        step_(step > 0.0 ? step : 1.0),
+        max_distance_(max_distance)
+    {}
+
+    bool operator()(const double* candidate, double* residual) const {
+        if (!volume_ || weight_ <= 0.0) {
+            residual[0] = 0.0;
+            return true;
+        }
+
+        const cv::Vec3d start{candidate[0], candidate[1], candidate[2]};
+        const double distance = cv::norm(target_ - start);
+        if (distance <= 1e-6) {
+            residual[0] = 0.0;
+            return true;
+        }
+
+        if (max_distance_ > 0.0 && distance > max_distance_) {
+            residual[0] = 0.0;
+            return true;
+        }
+
+        const int steps = std::max(1, static_cast<int>(std::ceil(distance / step_)));
+        const cv::Vec3d delta = (target_ - start) / static_cast<double>(steps + 1);
+
+        double max_value = std::numeric_limits<double>::lowest();
+        bool hit_threshold = false;
+        cv::Vec3d current = start;
+        for (int i = 1; i <= steps; ++i) {
+            current += delta;
+            const double value = sample(current);
+            if (!std::isfinite(value)) {
+                continue;
+            }
+
+            max_value = std::max(max_value, value);
+            if (value >= threshold_) {
+                hit_threshold = true;
+                break;
+            }
+        }
+
+        if (!hit_threshold) {
+            residual[0] = 0.0;
+            return true;
+        }
+
+        if (!std::isfinite(max_value) || max_value < 0.0) {
+            max_value = 0.0;
+        }
+
+        const double diff = std::max(0.0, threshold_ - max_value);
+        residual[0] = weight_ * diff;
+        return true;
+    }
+
+private:
+    double sample(const cv::Vec3d& xyz) const {
+        if (!interp_) {
+            interp_ = std::make_unique<CachedChunked3dInterpolator<uint8_t, passTroughComputor>>(*volume_);
+        }
+        double value = 0.0;
+        interp_->Evaluate(xyz[2], xyz[1], xyz[0], &value);
+        return value;
+    }
+
+    Chunked3d<uint8_t, passTroughComputor>* volume_;
+    cv::Vec3d target_;
+    double threshold_;
+    double weight_;
+    double step_;
+    double max_distance_;
+    mutable std::unique_ptr<CachedChunked3dInterpolator<uint8_t, passTroughComputor>> interp_;
 };
 
 struct TraceParameters {
@@ -360,6 +502,8 @@ static int gen_sdirichlet_loss(ceres::Problem &problem, const cv::Vec2i &p,
 static int conditional_sdirichlet_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
                                        ceres::Problem &problem, TraceParameters &params,
                                        const LossSettings &settings, double sdir_eps_abs, double sdir_eps_rel);
+static int gen_reference_ray_loss(ceres::Problem &problem, const cv::Vec2i &p,
+                                  TraceParameters &params, const TraceData &trace_data);
 static bool loc_valid(int state)
 {
     return state & STATE_LOC_VALID;
@@ -402,6 +546,62 @@ static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::
         throw std::runtime_error("invalid loc passed as valid!");
 
     problem.AddResidualBlock(DistLoss::Create(params.unit*cv::norm(off),settings(LossType::DIST, p)), nullptr, &params.dpoints(p)[0], &params.dpoints(p+off)[0]);
+
+    return 1;
+}
+
+static int gen_reference_ray_loss(ceres::Problem &problem, const cv::Vec2i &p,
+                                  TraceParameters &params, const TraceData &trace_data)
+{
+    if (!trace_data.reference_raycast.enabled())
+        return 0;
+    if (!trace_data.raw_volume)
+        return 0;
+    if (!(params.state(p) & STATE_LOC_VALID))
+        return 0;
+
+    const cv::Vec3d& candidate = params.dpoints(p);
+    if (candidate[0] == -1.0 && candidate[1] == -1.0 && candidate[2] == -1.0)
+        return 0;
+
+    cv::Vec3f ptr = trace_data.reference_raycast.surface->pointer();
+    const cv::Vec3f candidate_f(static_cast<float>(candidate[0]),
+                                static_cast<float>(candidate[1]),
+                                static_cast<float>(candidate[2]));
+
+    float dist = trace_data.reference_raycast.surface->pointTo(
+        ptr,
+        candidate_f,
+        std::numeric_limits<float>::max(),
+        1000);
+    if (dist < 0.0f)
+        return 0;
+    if (trace_data.reference_raycast.max_distance > 0.0 && dist > trace_data.reference_raycast.max_distance)
+        return 0;
+
+    const cv::Vec3f nearest = trace_data.reference_raycast.surface->coord(ptr);
+    const cv::Vec3d target{nearest[0], nearest[1], nearest[2]};
+
+    if (trace_data.reference_raycast.penalty_weight > 0.0) {
+        auto* functor = new ReferenceRayOcclusionCost(trace_data.raw_volume,
+                                                      target,
+                                                      trace_data.reference_raycast.voxel_threshold,
+                                                      trace_data.reference_raycast.penalty_weight,
+                                                      trace_data.reference_raycast.sample_step,
+                                                      trace_data.reference_raycast.max_distance);
+
+        auto* cost = new ceres::NumericDiffCostFunction<ReferenceRayOcclusionCost, ceres::CENTRAL, 1, 3>(functor);
+        problem.AddResidualBlock(cost, nullptr, &params.dpoints(p)[0]);
+    }
+
+    if (trace_data.reference_raycast.clearance_weight > 0.0 &&
+        trace_data.reference_raycast.min_clearance > 0.0) {
+        auto* clearance_functor = new ReferenceClearanceCost(target,
+                                                             trace_data.reference_raycast.min_clearance,
+                                                             trace_data.reference_raycast.clearance_weight);
+        auto* clearance_cost = new ceres::NumericDiffCostFunction<ReferenceClearanceCost, ceres::CENTRAL, 1, 3>(clearance_functor);
+        problem.AddResidualBlock(clearance_cost, nullptr, &params.dpoints(p)[0]);
+    }
 
     return 1;
 }
@@ -723,6 +923,8 @@ static int add_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParamete
         count += gen_sdirichlet_loss(problem, p + cv::Vec2i( 0,-1), params, settings, 1e-8, 1e-2);
     }
 
+    count += gen_reference_ray_loss(problem, p, params, trace_data);
+
     return count;
 }
 
@@ -880,6 +1082,8 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_corr_loss(11, p + cv::Vec2i( 0,-1), loss_status, problem, params.state, params.dpoints, trace_data);
     count += conditional_corr_loss(11, p + cv::Vec2i(-1, 0), loss_status, problem, params.state, params.dpoints, trace_data);
 
+    count += gen_reference_ray_loss(problem, p, params, trace_data);
+
     return count;
 }
 
@@ -989,6 +1193,7 @@ static bool inpaint(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParam
     local_optimization(roi, mask, params, trace_data, lowsnap, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
     LossSettings default_settings;
     local_optimization(roi, mask, params, trace_data, default_settings, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+
     return true;
 }
 
@@ -1208,6 +1413,78 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 {
     TraceData trace_data(direction_fields);
     LossSettings loss_settings;
+
+    std::unique_ptr<QuadSurface> reference_surface;
+    if (params.contains("reference_surface")) {
+        const nlohmann::json& ref_cfg = params["reference_surface"];
+        std::string ref_path;
+        if (ref_cfg.is_string()) {
+            ref_path = ref_cfg.get<std::string>();
+        } else if (ref_cfg.is_object()) {
+            const auto path_it = ref_cfg.find("path");
+            if (path_it != ref_cfg.end()) {
+                if (path_it->is_string()) {
+                    ref_path = path_it->get<std::string>();
+                } else if (!path_it->is_null()) {
+                    std::cerr << "reference_surface.path must be a string" << std::endl;
+                }
+            }
+        }
+
+        if (!ref_path.empty()) {
+            try {
+                reference_surface.reset(load_quad_from_tifxyz(ref_path));
+                trace_data.reference_raycast.surface = reference_surface.get();
+                std::cout << "Loaded reference surface from " << ref_path << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "Failed to load reference surface '" << ref_path << "': " << e.what() << std::endl;
+            }
+        } else {
+            std::cerr << "reference_surface parameter provided without a valid path" << std::endl;
+        }
+
+        if (trace_data.reference_raycast.surface && ref_cfg.is_object()) {
+            auto read_double = [&](const char* key, double current) {
+                const auto it = ref_cfg.find(key);
+                if (it == ref_cfg.end() || it->is_null()) {
+                    return current;
+                }
+                if (it->is_number()) {
+                    return it->get<double>();
+                }
+                std::cerr << "reference_surface." << key << " must be numeric" << std::endl;
+                return current;
+            };
+            trace_data.reference_raycast.voxel_threshold = read_double("voxel_threshold", trace_data.reference_raycast.voxel_threshold);
+            trace_data.reference_raycast.penalty_weight  = read_double("penalty_weight",  trace_data.reference_raycast.penalty_weight);
+            trace_data.reference_raycast.sample_step     = read_double("sample_step",     trace_data.reference_raycast.sample_step);
+            trace_data.reference_raycast.max_distance    = read_double("max_distance",    trace_data.reference_raycast.max_distance);
+            trace_data.reference_raycast.min_clearance   = read_double("min_clearance",   trace_data.reference_raycast.min_clearance);
+            trace_data.reference_raycast.clearance_weight = read_double("clearance_weight", trace_data.reference_raycast.clearance_weight);
+            trace_data.reference_raycast.voxel_threshold = std::clamp(trace_data.reference_raycast.voxel_threshold, 0.0, 255.0);
+            if (trace_data.reference_raycast.penalty_weight < 0.0)
+                trace_data.reference_raycast.penalty_weight = 0.0;
+            if (trace_data.reference_raycast.sample_step <= 0.0)
+                trace_data.reference_raycast.sample_step = 1.0;
+            if (trace_data.reference_raycast.min_clearance < 0.0)
+                trace_data.reference_raycast.min_clearance = 0.0;
+            if (trace_data.reference_raycast.clearance_weight < 0.0)
+                trace_data.reference_raycast.clearance_weight = 0.0;
+        }
+
+        if (trace_data.reference_raycast.enabled()) {
+            std::cout << "Reference raycast penalty enabled (threshold="
+                      << trace_data.reference_raycast.voxel_threshold
+                      << ", weight=" << trace_data.reference_raycast.penalty_weight
+                      << ", step=" << trace_data.reference_raycast.sample_step
+                      << ", min_clearance=" << trace_data.reference_raycast.min_clearance
+                      << " (clear_w=" << trace_data.reference_raycast.clearance_weight << ")";
+            if (trace_data.reference_raycast.max_distance > 0.0) {
+                std::cout << ", max_distance=" << trace_data.reference_raycast.max_distance;
+            }
+            std::cout << ")" << std::endl;
+        }
+    }
     TraceParameters trace_params;
     int snapshot_interval = params.value("snapshot-interval", 0);
     int stop_gen = params.value("generations", 100);
@@ -1215,6 +1492,14 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     trace_params.unit = step*scale;
     const double sdir_w   = params.value("sdir_weight",  loss_settings[LossType::SDIR]);
     loss_settings[LossType::SDIR] = static_cast<float>(sdir_w);
+    std::cout << "GrowPatch loss weights:\n"
+              << "  DIST: " << loss_settings.w[LossType::DIST]
+              << " STRAIGHT: " << loss_settings.w[LossType::STRAIGHT]
+              << " DIRECTION: " << loss_settings.w[LossType::DIRECTION]
+              << " SNAP: " << loss_settings.w[LossType::SNAP]
+              << " NORMAL: " << loss_settings.w[LossType::NORMAL]
+              << " SDIR: " << loss_settings.w[LossType::SDIR]
+              << std::endl;
     int rewind_gen = params.value("rewind_gen", -1);
     loss_settings.z_min = params.value("z_min", -1);
     loss_settings.z_max = params.value("z_max", std::numeric_limits<int>::max());
@@ -1228,6 +1513,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         }
     }
     trace_data.ngv = ngv.get();
+
+
 
     int w, h;
     if (resume_surf) {
@@ -1270,6 +1557,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     // Debug: test the chunk cache by reading one voxel
     passTroughComputor pass;
     Chunked3d<uint8_t,passTroughComputor> dbg_tensor(pass, ds, cache);
+    trace_data.raw_volume = &dbg_tensor;
     std::cout << "seed val " << origin << " " <<
     (int)dbg_tensor(origin[2],origin[1],origin[0]) << std::endl;
 

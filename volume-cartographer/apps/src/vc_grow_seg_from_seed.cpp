@@ -258,7 +258,12 @@ int main(int argc, char *argv[])
 
     float voxelsize = json::parse(std::ifstream(vol_path/"meta.json"))["voxelsize"];
     
-    std::filesystem::path cache_root = params["cache_root"];
+    std::filesystem::path cache_root;
+    if (params.contains("cache_root") && params["cache_root"].is_string()) {
+        cache_root = params["cache_root"].get<std::string>();
+    } else if (params.contains("cache_root") && !params["cache_root"].is_null()) {
+        std::cerr << "WARNING: cache_root must be a string; ignoring" << std::endl;
+    }
 
     std::string mode = params.value("mode", "seed");
     

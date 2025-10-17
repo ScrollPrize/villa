@@ -8,6 +8,9 @@
 
 #include "ceres/ceres.h"
 
+#include <algorithm>
+#include <cmath>
+
 
 static double  val(const double &v) { return v; }
 template <typename JetT>

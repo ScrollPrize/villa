@@ -36,6 +36,9 @@ bool SegmentationModule::beginEditingSession(QuadSurface* surface)
     }
 
     emitPendingChanges();
+    _pendingAutosave = false;
+    _autosaveNotifiedFailure = false;
+    updateAutosaveState();
     return true;
 }
 
@@ -62,9 +65,15 @@ void SegmentationModule::endEditingSession()
         }
     }
 
+    if (_pendingAutosave) {
+        performAutosave();
+    }
+
     if (_editManager) {
         _editManager->endSession();
     }
+
+    updateAutosaveState();
 }
 
 void SegmentationModule::onSurfaceCollectionChanged(std::string name, Surface* surface)
@@ -142,6 +151,7 @@ bool SegmentationModule::restoreUndoSnapshot()
         clearInvalidationBrush();
         refreshOverlay();
         emitPendingChanges();
+        markAutosaveNeeded();
     } else {
         _undoHistory.pushBack(std::move(points));
     }

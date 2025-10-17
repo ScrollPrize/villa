@@ -235,24 +235,37 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
 
     steps = inpaintOnly ? std::max(0, steps) : std::max(1, steps);
 
+    const SegmentationGrowthDirection effectiveDirection = inpaintOnly
+        ? SegmentationGrowthDirection::All
+        : direction;
+
     SegmentationGrowthRequest request;
     request.method = method;
-    request.direction = direction;
+    request.direction = effectiveDirection;
     request.steps = steps;
     request.inpaintOnly = inpaintOnly;
 
-    if (auto overrideDirs = _context.module->takeShortcutDirectionOverride()) {
-        request.allowedDirections = std::move(*overrideDirs);
-    }
-    if (request.allowedDirections.empty()) {
-        request.allowedDirections = _context.widget->allowedGrowthDirections();
+    if (inpaintOnly) {
+        // Consume any pending overrides; inpainting ignores directional constraints.
+        const auto pendingOverride = _context.module->takeShortcutDirectionOverride();
+        if (pendingOverride) {
+            qCInfo(lcSegGrowth) << "Ignoring direction override for inpaint request.";
+        }
+        request.allowedDirections = {SegmentationGrowthDirection::All};
+    } else {
+        if (auto overrideDirs = _context.module->takeShortcutDirectionOverride()) {
+            request.allowedDirections = std::move(*overrideDirs);
+        }
         if (request.allowedDirections.empty()) {
-            request.allowedDirections = {
-                SegmentationGrowthDirection::Up,
-                SegmentationGrowthDirection::Down,
-                SegmentationGrowthDirection::Left,
-                SegmentationGrowthDirection::Right
-            };
+            request.allowedDirections = _context.widget->allowedGrowthDirections();
+            if (request.allowedDirections.empty()) {
+                request.allowedDirections = {
+                    SegmentationGrowthDirection::Up,
+                    SegmentationGrowthDirection::Down,
+                    SegmentationGrowthDirection::Left,
+                    SegmentationGrowthDirection::Right
+                };
+            }
         }
     }
 
@@ -312,7 +325,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
 
     qCInfo(lcSegGrowth) << "Segmentation growth requested"
                         << segmentationGrowthMethodToString(method)
-                        << segmentationGrowthDirectionToString(direction)
+                        << segmentationGrowthDirectionToString(effectiveDirection)
                         << "steps" << steps
                         << "inpaintOnly" << inpaintOnly;
     qCInfo(lcSegGrowth) << "Growth volume ID" << QString::fromStdString(growthVolumeId);

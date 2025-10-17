@@ -96,12 +96,26 @@ public:
                 for (auto const& entry : std::filesystem::directory_iterator(root))
                     if (std::filesystem::is_directory(entry) && std::filesystem::exists(entry.path()/"meta.json") && std::filesystem::is_regular_file(entry.path()/"meta.json")) {
                         paths.insert(entry.path());
-                        std::ifstream meta_f(entry.path()/"meta.json");
-                        nlohmann::json meta = nlohmann::json::parse(meta_f);
-                        std::filesystem::path src = std::filesystem::canonical(meta["dataset_source_path"]);
-                        if (src == std::filesystem::canonical(ds->path())) {
-                            _cache_dir = entry.path();
-                            break;
+                        try {
+                            std::ifstream meta_f(entry.path()/"meta.json");
+                            nlohmann::json meta = nlohmann::json::parse(meta_f);
+                            // Skip entries with invalid or non-existent dataset paths
+                            if (!meta.contains("dataset_source_path") || !meta["dataset_source_path"].is_string())
+                                continue;
+                            std::filesystem::path src_candidate(meta["dataset_source_path"].get<std::string>());
+                            if (!std::filesystem::exists(src_candidate))
+                                continue;
+                            if (!std::filesystem::exists(ds->path()))
+                                continue;
+                            std::filesystem::path src = std::filesystem::canonical(src_candidate);
+                            std::filesystem::path cur = std::filesystem::canonical(ds->path());
+                            if (src == cur) {
+                                _cache_dir = entry.path();
+                                break;
+                            }
+                        } catch (const std::exception&) {
+                            // Ignore malformed cache entries or paths we cannot canonicalize
+                            continue;
                         }
                     }
                 

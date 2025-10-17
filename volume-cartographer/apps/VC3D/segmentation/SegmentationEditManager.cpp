@@ -19,6 +19,19 @@ bool isInvalidPoint(const cv::Vec3f& value)
            (value[0] == -1.0f && value[1] == -1.0f && value[2] == -1.0f);
 }
 
+void syncMaskChannel(QuadSurface* dst, QuadSurface* src)
+{
+    if (!dst || !src) {
+        return;
+    }
+    cv::Mat mask = src->channel("mask");
+    if (mask.empty()) {
+        dst->setChannel("mask", cv::Mat());
+    } else {
+        dst->setChannel("mask", mask);
+    }
+}
+
 void ensureSurfaceMetaObject(QuadSurface* surface)
 {
     if (!surface) {
@@ -62,6 +75,7 @@ bool SegmentationEditManager::beginSession(QuadSurface* baseSurface)
     }
     _previewSurface->path = baseSurface->path;
     _previewSurface->id = baseSurface->id;
+    syncMaskChannel(_previewSurface.get(), baseSurface);
     _previewPoints = _previewSurface->rawPointsPtr();
 
     _editedVertices.clear();
@@ -179,6 +193,7 @@ void SegmentationEditManager::refreshFromBaseSurface()
         _previewSurface = std::make_unique<QuadSurface>(previewMatrix, _baseSurface->scale());
         _previewPoints = _previewSurface->rawPointsPtr();
     }
+    syncMaskChannel(_previewSurface.get(), _baseSurface);
 
     rebuildPreviewFromOriginal();
     _dirty = !_editedVertices.empty();

@@ -325,6 +325,26 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                 startGen = std::max(startGen, metaGen);
             }
         }
+
+        if (startGen <= 0) {
+            bool hasValidPoints = false;
+            const auto* resumePoints = context.resumeSurface->rawPointsPtr();
+            if (resumePoints && !resumePoints->empty()) {
+                for (int row = 0; row < resumePoints->rows && !hasValidPoints; ++row) {
+                    for (int col = 0; col < resumePoints->cols; ++col) {
+                        const cv::Vec3f& point = resumePoints->operator()(row, col);
+                        if (point[0] != -1.0f) {
+                            hasValidPoints = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (hasValidPoints) {
+                startGen = 1;
+                qCWarning(lcSegGrowth) << "Resume surface missing generation metadata; defaulting start generation to 1.";
+            }
+        }
     }
 
     const int requestedSteps = std::max(request.steps, 0);
@@ -344,7 +364,11 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
     }
 
     params["generations"] = targetGenerations;
-    params["rewind_gen"] = startGen -1;
+    int rewindGen = -1;
+    if (startGen > 1) {
+        rewindGen = startGen - 1;
+    }
+    params["rewind_gen"] = rewindGen;
     params["cache_root"] = context.cacheRoot.toStdString();
     if (!context.normalGridPath.isEmpty()) {
         params["normal_grid_path"] = context.normalGridPath.toStdString();

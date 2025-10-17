@@ -1,6 +1,7 @@
 #pragma once
 #include <filesystem>
 #include <set>
+#include <optional>
 
 #include <opencv2/core.hpp> 
 #include <nlohmann/json_fwd.hpp>
@@ -239,6 +240,12 @@ public:
     nlohmann::json *meta = nullptr;
     std::set<std::string> overlapping_str;
     std::set<SurfaceMeta*> overlapping;
+    std::optional<std::filesystem::file_time_type> maskTimestamp() const { return maskTimestamp_; }
+    static std::optional<std::filesystem::file_time_type> readMaskTimestamp(const std::filesystem::path& dir);
+
+private:
+    void cacheMaskTimestamp();
+    std::optional<std::filesystem::file_time_type> maskTimestamp_;
 };
 
 QuadSurface *load_quad_from_tifxyz(const std::string &path, int flags = 0);
