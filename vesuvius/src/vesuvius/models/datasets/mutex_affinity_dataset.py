@@ -573,19 +573,22 @@ def _convert_store_to_uint8(payload: Tuple[str, Sequence[str]]):
             overwrite=True,
         )
 
+        # First, check if all data is binary before writing
         is_binary = True
         for chunk_slices in _iter_chunk_slices(array.shape, chunks):
             data = array[chunk_slices]
             if not np.all((data == 0) | (data == 1)):
                 is_binary = False
                 break
-            tmp_ds[chunk_slices] = data.astype(np.uint8, copy=False)
 
         if not is_binary:
-            del dest_group[tmp_name]
             skipped.append(key)
             continue
 
+        # Now, write the data to the temporary dataset
+        for chunk_slices in _iter_chunk_slices(array.shape, chunks):
+            data = array[chunk_slices]
+            tmp_ds[chunk_slices] = data.astype(np.uint8, copy=False)
         if leaf in dest_group:
             del dest_group[leaf]
         dest_group.move(tmp_name, leaf)
