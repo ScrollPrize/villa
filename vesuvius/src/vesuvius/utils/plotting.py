@@ -84,6 +84,23 @@ def add_text_label(img, text):
     return np.array(pil_img, dtype=np.uint8)
 
 
+def _apply_activation(array_np: np.ndarray, activation: Optional[str], *, is_surface: bool) -> np.ndarray:
+    if activation is None or str(activation).lower() in {"none", "identity"} or is_surface:
+        return array_np
+
+    activation_l = str(activation).lower()
+    arr = array_np.astype(np.float32, copy=False)
+    tensor = torch.from_numpy(arr)
+
+    if activation_l.startswith("sigmoid"):
+        return torch.sigmoid(tensor).numpy()
+    if activation_l.startswith("softmax"):
+        return torch.softmax(tensor, dim=0).numpy()
+    if activation_l.startswith("tanh"):
+        return torch.tanh(tensor).numpy()
+    return array_np
+
+
 def _vector_to_bgr(vector_3ch):
     """Map a 3×H×W vector field to a BGR image using directional colouring."""
     if vector_3ch.shape[0] != 3:
@@ -163,8 +180,16 @@ def convert_slice_to_bgr(slice_2d_or_3d, *, task_name: str | None = None, task_c
             return cv2.cvtColor(ch_8u, cv2.COLOR_GRAY2BGR)
         
         else:
-            # Multi-channel - just use first channel
-            ch_8u = minmax_scale_to_8bit(slice_2d_or_3d[0])
+            is_affinity = (
+                task_type == "affinity"
+                or (task_name is not None and "affinity" in task_name.lower())
+            )
+            if is_affinity:
+                # Aggregate across channels for visualization
+                agg = slice_2d_or_3d.mean(axis=0)
+                ch_8u = minmax_scale_to_8bit(agg)
+            else:
+                ch_8u = minmax_scale_to_8bit(slice_2d_or_3d[0])
             return cv2.cvtColor(ch_8u, cv2.COLOR_GRAY2BGR)
     
     else:
@@ -238,14 +263,8 @@ def save_debug(
         activation = task_cfg.get("activation", None)
         is_surface_frame = arr_np.shape[0] == 9 or t_name.endswith("surface_frame")
 
-        # Apply activation based on config/channel count when appropriate
-        if apply_activation and activation not in {"none", "identity"} and not is_surface_frame:
-            if arr_np.shape[0] == 1:
-                arr_np = torch.sigmoid(torch.from_numpy(arr_np)).numpy()
-            elif arr_np.shape[0] == 2:
-                arr_np = torch.softmax(torch.from_numpy(arr_np), dim=0).numpy()
-            else:
-                arr_np = torch.argmax(torch.from_numpy(arr_np), dim=0).numpy()
+        if apply_activation:
+            arr_np = _apply_activation(arr_np, activation, is_surface=is_surface_frame)
         
         preds_np[t_name] = arr_np
 
@@ -287,13 +306,8 @@ def save_debug(
             activation = task_cfg.get("activation", None)
             is_surface_frame = arr_np.shape[0] == 9 or t_name.endswith("surface_frame")
 
-            if apply_activation and activation not in {"none", "identity"} and not is_surface_frame:
-                if arr_np.shape[0] == 1:
-                    arr_np = torch.sigmoid(torch.from_numpy(arr_np)).numpy()
-                elif arr_np.shape[0] == 2:
-                    arr_np = torch.softmax(torch.from_numpy(arr_np), dim=0).numpy()
-                else:
-                    arr_np = torch.argmax(torch.from_numpy(arr_np), dim=0).numpy()
+            if apply_activation:
+                arr_np = _apply_activation(arr_np, activation, is_surface=is_surface_frame)
             
             train_preds_np[t_name] = arr_np
 
@@ -301,6 +315,26 @@ def save_debug(
     # Get actual prediction tasks (not skeleton data)
     pred_task_names = sorted(list(preds_np.keys()))
     
+    def _pad_rows_to_uniform_width(rows_list: list[np.ndarray]) -> list[np.ndarray]:
+        if not rows_list:
+            return rows_list
+        max_width = max(row.shape[1] for row in rows_list)
+        if max_width == 0:
+            return rows_list
+        padded_rows = []
+        for row in rows_list:
+            pad_width = max_width - row.shape[1]
+            if pad_width > 0:
+                if row.ndim == 3:
+                    pad_config = ((0, 0), (0, pad_width), (0, 0))
+                elif row.ndim == 2:
+                    pad_config = ((0, 0), (0, pad_width))
+                else:
+                    raise ValueError(f"Unexpected row ndim={row.ndim} for debug visualization stacking.")
+                row = np.pad(row, pad_config, mode="constant", constant_values=0)
+            padded_rows.append(row)
+        return padded_rows
+
     if is_2d:
         # Build image grid for 2D
         rows = []
@@ -344,6 +378,7 @@ def save_debug(
             rows.append(np.hstack(train_imgs))
         
         # Stack rows and save
+        rows = _pad_rows_to_uniform_width(rows)
         final_img = np.vstack(rows)
         out_dir = Path(save_path).parent
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -425,6 +460,7 @@ def save_debug(
                 rows.append(np.hstack(train_imgs))
             
             # Stack rows for this frame
+            rows = _pad_rows_to_uniform_width(rows)
             frame = np.vstack(rows)
             # Ensure frame is uint8 and contiguous
             frame = np.ascontiguousarray(frame, dtype=np.uint8)

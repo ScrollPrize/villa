@@ -46,6 +46,7 @@ dependencies = [
     "numpy>=2.0.2",
     "open3d",
     "open3d>=0.18,<0.19",
+    "opencv-contrib-python>=4.11.0.86",
     "opencv-python-headless>=4.11.0.86",
     "pandas>=2.3.2",
     "pillow>=11.3.0",
