@@ -67,6 +67,7 @@ class BaseDataset(Dataset):
         self.logger = logging.getLogger(__name__)
         self.mgr = mgr
         self.is_training = is_training
+        self._preserve_label_dtype = getattr(self, "_preserve_label_dtype", False)
 
         self.model_name = mgr.model_name
         self.targets = mgr.targets               # e.g. {"ink": {...}, "normals": {...}}
@@ -496,14 +497,25 @@ class BaseDataset(Dataset):
         bool
             True if skeleton transform should be added to the pipeline
         """
-        skeleton_losses = ['MedialSurfaceRecall', 'DC_SkelREC_and_CE_loss', 'SoftSkeletonRecallLoss']
-        
+        return bool(self._skeleton_loss_targets())
+
+    def _skeleton_loss_targets(self):
+        """
+        Identify targets that need skeletonised ground truth.
+        """
+        skeleton_losses = {'MedialSurfaceRecall', 'DC_SkelREC_and_CE_loss', 'SoftSkeletonRecallLoss'}
+        skeleton_targets = []
+
         for target_name, target_info in self.targets.items():
-            if "losses" in target_info:
-                for loss_cfg in target_info["losses"]:
-                    if loss_cfg["name"] in skeleton_losses:
-                        return True
-        return False
+            if "losses" not in target_info:
+                continue
+            for loss_cfg in target_info["losses"]:
+                loss_name = loss_cfg.get("name")
+                if loss_name in skeleton_losses:
+                    skeleton_targets.append(target_name)
+                    break
+
+        return tuple(skeleton_targets)
 
     def _get_valid_patches(self):
         """Find valid patches based on labeled ratio requirements."""
@@ -657,10 +669,12 @@ class BaseDataset(Dataset):
             raise RuntimeError("Chunk slicer not initialized")
         chunk_result = self.chunk_slicer.extract(chunk_patch, normalizer=self.normalizer)
 
-        label_patches: Dict[str, np.ndarray] = {
-            name: np.asarray(array, dtype=np.float32)
-            for name, array in chunk_result.labels.items()
-        }
+        label_patches: Dict[str, np.ndarray] = {}
+        for name, array in chunk_result.labels.items():
+            arr = np.ascontiguousarray(array)
+            if not self._preserve_label_dtype:
+                arr = arr.astype(np.float32, copy=False)
+            label_patches[name] = arr
 
         data_dict: Dict[str, torch.Tensor] = {
             'image': torch.from_numpy(chunk_result.image),
@@ -865,10 +879,11 @@ class BaseDataset(Dataset):
         if only_spatial_and_intensity:
             print("Only spatial and intensity augmentations enabled (only_spatial_and_intensity=True)")
 
-        if self._needs_skeleton_transform():
+        skeleton_targets = self._skeleton_loss_targets()
+        if skeleton_targets:
             from vesuvius.models.augmentation.transforms.utils.skeleton_transform import MedialSurfaceTransform
-            transforms.append(MedialSurfaceTransform(do_tube=False))
-            print("Added MedialSurfaceTransform to training pipeline")
+            transforms.append(MedialSurfaceTransform(do_tube=False, target_keys=skeleton_targets))
+            print(f"Added MedialSurfaceTransform to training pipeline for targets: {', '.join(skeleton_targets)}")
 
         return ComposeTransforms(transforms)
     
@@ -877,14 +892,15 @@ class BaseDataset(Dataset):
         Create validation transforms.
         For validation, we only apply skeleton transform if needed (no augmentations).
         """
-        if not self._needs_skeleton_transform():
+        skeleton_targets = self._skeleton_loss_targets()
+        if not skeleton_targets:
             return None
 
         from vesuvius.models.augmentation.transforms.utils.skeleton_transform import MedialSurfaceTransform
         
         transforms = []
-        transforms.append(MedialSurfaceTransform(do_tube=False))
-        print("Added MedialSurfaceTransform to validation pipeline")
+        transforms.append(MedialSurfaceTransform(do_tube=False, target_keys=skeleton_targets))
+        print(f"Added MedialSurfaceTransform to validation pipeline for targets: {', '.join(skeleton_targets)}")
         
         return ComposeTransforms(transforms)
     
