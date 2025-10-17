@@ -1689,16 +1689,17 @@ QuadSurface *load_quad_from_tifxyz(const std::string &path, int flags)
                 const bool isPlanarSeparate = (planarConfig == PLANARCONFIG_SEPARATE);
                 const size_t pixelStride = static_cast<size_t>(bytesPer) *
                                            static_cast<size_t>(isPlanarSeparate ? 1 : samplesPerPixel);
-                const uint32_t scaleX = (mW == static_cast<uint32_t>(W))
-                                            ? 1
-                                            : ((W > 0 && (mW % static_cast<uint32_t>(W)) == 0)
-                                                   ? (mW / static_cast<uint32_t>(W))
-                                                   : 0);
-                const uint32_t scaleY = (mH == static_cast<uint32_t>(H))
-                                            ? 1
-                                            : ((H > 0 && (mH % static_cast<uint32_t>(H)) == 0)
-                                                   ? (mH / static_cast<uint32_t>(H))
-                                                   : 0);
+                auto computeScaleFactor = [](uint32_t maskDim, int targetDim) -> uint32_t {
+                    if (maskDim == static_cast<uint32_t>(targetDim)) {
+                        return 1;
+                    } else if (targetDim > 0 && (maskDim % static_cast<uint32_t>(targetDim)) == 0) {
+                        return maskDim / static_cast<uint32_t>(targetDim);
+                    } else {
+                        return 0;
+                    }
+                };
+                const uint32_t scaleX = computeScaleFactor(mW, W);
+                const uint32_t scaleY = computeScaleFactor(mH, H);
                 if (scaleX != 0 && scaleY != 0) {
                     // Channel 0 encodes mask validity; later channels remain untouched.
                     const double retainThreshold = [&]{
