@@ -1064,6 +1064,10 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 onConvertToObj(segmentId.toStdString());
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::alphaCompRefineRequested,
+            this, [this](const QString& segmentId) {
+                onAlphaCompRefine(segmentId.toStdString());
+            });
     connect(_surfacePanel.get(), &SurfacePanelController::slimFlattenRequested,
             this, [this](const QString& segmentId) {
                 onSlimFlatten(segmentId.toStdString());

@@ -35,7 +35,8 @@ public:
         GrowSegFromSeeds,
         SegAddOverlap,
         tifxyz2obj,
-        obj2tifxyz
+        obj2tifxyz,
+        AlphaCompRefine
     };
 
     void setVolumePath(const QString& path);
@@ -56,6 +57,10 @@ public:
                              float stretchFactor = 1000.0f,
                              float meshUnits = 1.0f,
                              int stepSize = 20);
+    void setObjRefineParams(const QString& volumePath,
+                            const QString& srcSurface,
+                            const QString& dstSurface,
+                            const QString& jsonParams);
     bool execute(Tool tool);
     void cancel();
     bool isRunning() const;
@@ -140,4 +145,5 @@ private:
     float _objStretchFactor = 1000.0f;
     float _objMeshUnits = 1.0f;
     int _objStepSize = 20;
+    QString _refineDst;
 };
