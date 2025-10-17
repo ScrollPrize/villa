@@ -11,7 +11,7 @@ def _load_base_trainer() -> Any:
 
 
 def _load_surface_frame_trainer() -> Any:
-    from .surface_frame_trainer import SurfaceFrameTrainer
+    from .trainers.surface_frame_trainer import SurfaceFrameTrainer
 
     return SurfaceFrameTrainer
 

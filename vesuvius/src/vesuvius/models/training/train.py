@@ -149,6 +149,10 @@ class BaseTrainer:
             else:
                 print(f"Using GPU {self.gpu_ids[0]}")
 
+        # Default AMP dtype; resolved during training initialization
+        self.amp_dtype = torch.float16
+        self.amp_dtype_str = 'float16'
+
     # --- build model --- #
     def _build_model(self):
         if not hasattr(self.mgr, 'model_config') or self.mgr.model_config is None:
@@ -538,7 +542,7 @@ class BaseTrainer:
         
         return metrics
     
-    def _get_scaler(self, device_type='cuda', use_amp=True):
+    def _get_scaler(self, device_type='cuda', use_amp=True, amp_dtype=torch.float16):
         # for cuda, we can use a grad scaler for mixed precision training if amp is enabled
         # for mps or cpu, or when amp is disabled, we create a dummy scaler that does nothing
 
@@ -556,9 +560,9 @@ class BaseTrainer:
                 pass
 
 
-        if device_type == 'cuda' and use_amp:
-            # Use standard GradScaler when AMP is enabled on CUDA
-            print("Using GradScaler with CUDA AMP")
+        if device_type == 'cuda' and use_amp and amp_dtype == torch.float16:
+            # Use standard GradScaler when AMP is enabled on CUDA with float16
+            print("Using GradScaler with CUDA AMP (float16)")
             return torch.amp.GradScaler('cuda')
         else:
             # Not using amp or not on cuda - no gradient scaling needed
@@ -739,8 +743,42 @@ class BaseTrainer:
 
         if not use_amp and getattr(self.mgr, 'no_amp', False):
             print("Automatic Mixed Precision (AMP) is disabled")
+
+        amp_dtype_setting = getattr(self.mgr, 'amp_dtype', 'float16')
+        if amp_dtype_setting is None:
+            amp_dtype_setting = 'float16'
+
+        if isinstance(amp_dtype_setting, torch.dtype):
+            resolved_amp_dtype = amp_dtype_setting
+            amp_dtype_str = 'bfloat16' if amp_dtype_setting == torch.bfloat16 else 'float16'
+        else:
+            amp_dtype_str = str(amp_dtype_setting).lower()
+            if amp_dtype_str in ('bfloat16', 'bf16'):
+                resolved_amp_dtype = torch.bfloat16
+                amp_dtype_str = 'bfloat16'
+            elif amp_dtype_str in ('float16', 'fp16', 'half'):
+                resolved_amp_dtype = torch.float16
+                amp_dtype_str = 'float16'
+            else:
+                if not self.is_distributed or self.rank == 0:
+                    print(f"Unrecognized amp_dtype '{amp_dtype_setting}', defaulting to float16")
+                resolved_amp_dtype = torch.float16
+                amp_dtype_str = 'float16'
+
+        self.amp_dtype = resolved_amp_dtype
+        self.amp_dtype_str = amp_dtype_str
+
+        if self.device.type in ['mlx', 'mps'] and self.amp_dtype == torch.bfloat16:
+            if not self.is_distributed or self.rank == 0:
+                print("bfloat16 autocast not supported on this backend; falling back to float16")
+            self.amp_dtype = torch.float16
+            self.amp_dtype_str = 'float16'
+
+        if use_amp and self.device.type == 'cuda' and self.amp_dtype == torch.bfloat16:
+            if not self.is_distributed or self.rank == 0:
+                print("Using CUDA AMP with bfloat16 (GradScaler disabled)")
         
-        scaler = self._get_scaler(self.device.type, use_amp=use_amp)
+        scaler = self._get_scaler(self.device.type, use_amp=use_amp, amp_dtype=self.amp_dtype)
         train_dataloader, val_dataloader, train_indices, val_indices = self._configure_dataloaders(train_dataset,
                                                                                                    val_dataset)
 
@@ -958,7 +996,7 @@ class BaseTrainer:
         return total_loss, task_losses, inputs, targets_dict, outputs, optimizer_stepped
 
     def _compute_train_loss(self, outputs, targets_dict, loss_fns):
-        total_loss = 0.0
+        total_loss = None
         task_losses = {}
 
         for t_name, t_gt in targets_dict.items():
@@ -974,7 +1012,7 @@ class BaseTrainer:
             else:
                 ref_tensor = t_pred
 
-            task_total_loss = torch.zeros((), device=ref_tensor.device, dtype=ref_tensor.dtype)
+            task_total_loss = None
             for loss_fn, loss_weight in task_loss_fns:
                 pred_for_loss, gt_for_loss = t_pred, t_gt
                 if isinstance(t_pred, (list, tuple)) and not isinstance(loss_fn, DeepSupervisionWrapper):
@@ -990,11 +1028,22 @@ class BaseTrainer:
                     targets_dict=targets_dict,
                     outputs=outputs,
                 )
-                task_total_loss += loss_weight * loss_value
+                if not isinstance(loss_value, torch.Tensor):
+                    loss_value = torch.as_tensor(loss_value, device=ref_tensor.device)
+                loss_value = loss_value.to(torch.float32)
+                weighted_component = loss_weight * loss_value
+                task_total_loss = weighted_component if task_total_loss is None else task_total_loss + weighted_component
 
+            if task_total_loss is None:
+                continue
+
+            task_total_loss = task_total_loss.to(torch.float32)
             weighted_loss = task_weight * task_total_loss
-            total_loss += weighted_loss
+            total_loss = weighted_loss if total_loss is None else total_loss + weighted_loss
             task_losses[t_name] = weighted_loss.detach().cpu().item()
+
+        if total_loss is None:
+            total_loss = torch.zeros((), device=self.device, dtype=torch.float32)
 
         return total_loss, task_losses
 
@@ -1012,7 +1061,11 @@ class BaseTrainer:
 
         if use_amp:
             if self.device.type == 'cuda':
-                context = torch.amp.autocast('cuda')
+                context = torch.amp.autocast('cuda', dtype=self.amp_dtype)
+            elif self.device.type == 'cpu':
+                context = torch.amp.autocast('cpu')
+            elif self.device.type in ['mlx', 'mps']:
+                context = torch.amp.autocast(self.device.type, dtype=self.amp_dtype)
             else:
                 context = torch.amp.autocast(self.device.type)
         else:
@@ -1198,7 +1251,11 @@ class BaseTrainer:
             
             # Update scheduler for this epoch (for epoch-based scheduler switching)
             scheduler, is_per_iteration_scheduler = self._update_scheduler_for_epoch(scheduler, optimizer, epoch)
-            
+            step_scheduler_at_epoch_begin = getattr(scheduler, 'step_on_epoch_begin', False) and not is_per_iteration_scheduler
+
+            if step_scheduler_at_epoch_begin:
+                scheduler.step(epoch)
+
             # Optionally update dataloaders for this epoch (e.g., warmup strategies)
             train_dataloader, val_dataloader = self._update_dataloaders_for_epoch(
                 train_dataloader=train_dataloader,
@@ -1227,7 +1284,6 @@ class BaseTrainer:
 
             print(f"Using optimizer : {optimizer.__class__.__name__}")
             print(f"Using scheduler : {scheduler.__class__.__name__} (per-iteration: {is_per_iteration_scheduler})")
-            print(f"Initial learning rate : {self.mgr.initial_lr}")
             print(f"Gradient accumulation steps : {grad_accumulate_n}")
 
             for i in range(num_iters):
@@ -1237,11 +1293,13 @@ class BaseTrainer:
                 data_dict = next(train_iter)
                 global_step += 1
                 
-                # Setup autocast context (no explicit dtype overrides)
+                # Setup autocast context (dtype resolved based on CLI/config)
                 if use_amp and self.device.type == 'cuda':
-                    autocast_ctx = torch.amp.autocast('cuda')
-                elif use_amp and self.device.type in ['cpu', 'mlx']:
-                    autocast_ctx = torch.amp.autocast(self.device.type)
+                    autocast_ctx = torch.amp.autocast('cuda', dtype=self.amp_dtype)
+                elif use_amp and self.device.type == 'cpu':
+                    autocast_ctx = torch.amp.autocast('cpu')
+                elif use_amp and self.device.type in ['mlx', 'mps']:
+                    autocast_ctx = torch.amp.autocast(self.device.type, dtype=self.amp_dtype)
                 else:
                     autocast_ctx = nullcontext()
 
@@ -1337,15 +1395,20 @@ class BaseTrainer:
             if pbar is not None:
                 pbar.close()
 
-            if not is_per_iteration_scheduler:
+            if not is_per_iteration_scheduler and not step_scheduler_at_epoch_begin:
                 scheduler.step()
 
             gc.collect()
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
 
+            # Report the effective learning rate(s) after all scheduler updates for this epoch.
+            current_lrs = [group['lr'] for group in optimizer.param_groups]
+
             if not self.is_distributed or self.rank == 0:
                 print(f"\n[Train] Epoch {epoch + 1} completed.")
+                lr_str = ", ".join(f"{lr:.8f}" for lr in current_lrs)
+                print(f"  Learning rate(s) = {lr_str}")
                 for t_name in self.mgr.targets:
                     avg_loss = np.mean(epoch_losses[t_name]) if epoch_losses[t_name] else 0
                     print(f"  {t_name}: Avg Loss = {avg_loss:.4f}")
@@ -1359,7 +1422,7 @@ class BaseTrainer:
                     model.eval()
                 with torch.no_grad():
                     val_losses = {t_name: [] for t_name in self.mgr.targets}
-                    frames_array = None
+                    debug_preview_image = None
                     
                     # Initialize evaluation metrics
                     evaluation_metrics = self._initialize_evaluation_metrics()
@@ -1460,7 +1523,7 @@ class BaseTrainer:
                                         if t_name not in ['skel', 'is_unlabeled']:
                                             targets_dict_first[t_name] = t_tensor
                                     
-                                    frames_array = save_debug(
+                                    _, debug_preview_image = save_debug(
                                         input_volume=inputs_first,
                                         targets_dict=targets_dict_first,
                                         outputs_dict=outputs_dict_first,
@@ -1516,18 +1579,16 @@ class BaseTrainer:
                         for metric_name, value in metric_results.items():
                             val_metrics[f"val_{metric_name}"] = value
 
-                        if 'frames_array' in locals() and frames_array is not None:
-                            import wandb
-                            # Stack the list of frames into a proper numpy array (T, H, W, C)
-                            frames_np = np.stack(frames_array, axis=0)
-                            # Convert BGR to RGB for wandb
-                            frames_np = frames_np[..., ::-1]
-                            # Transpose to (frames, channels, height, width) as required by wandb
-                            frames_np = np.transpose(frames_np, (0, 3, 1, 2))
-                            
-                            val_metrics["debug_gif"] = wandb.Video(frames_np, format="gif")
-
                         import wandb
+
+                        if debug_preview_image is not None:
+                            preview_to_log = debug_preview_image
+                            if preview_to_log.ndim == 3 and preview_to_log.shape[2] == 3:
+                                # Convert BGR (OpenCV) to RGB for wandb
+                                preview_to_log = preview_to_log[..., ::-1]
+                            preview_to_log = np.ascontiguousarray(preview_to_log)
+                            val_metrics["debug_image"] = wandb.Image(preview_to_log)
+
                         wandb.log(val_metrics)
 
                     # Early stopping check
@@ -1659,6 +1720,8 @@ def main():
                           help="Enable intensity sampling during dataset init")
     grp_data.add_argument("--no-spatial", action="store_true",
                           help="Disable spatial/geometric augmentations")
+    grp_data.add_argument("--rotation-axes", type=str,
+                          help="Comma-separated axes (subset of x,y,z / width,height,depth) that may be rotated; e.g. 'z' keeps the depth axis upright")
 
     # Model
     grp_model.add_argument("--model-name", type=str,
@@ -1702,6 +1765,8 @@ def main():
                            help="Number of steps to accumulate gradients before optimizer.step()")
     grp_optim.add_argument("--grad-clip", type=float, default=12.0,
                            help="Gradient clipping value")
+    grp_optim.add_argument("--amp-dtype", type=str, choices=["float16", "bfloat16"], default="float16",
+                           help="Autocast dtype when AMP is enabled (float16 uses GradScaler; bfloat16 skips scaling)")
     grp_optim.add_argument("--no-amp", action="store_true",
                            help="Disable Automatic Mixed Precision (AMP)")
 
@@ -1918,7 +1983,7 @@ def main():
         trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Base Trainer for supervised training")
     elif trainer_name == "surface_frame":
-        from vesuvius.models.training.surface_frame_trainer import SurfaceFrameTrainer
+        from vesuvius.models.training.trainers.surface_frame_trainer import SurfaceFrameTrainer
 
         trainer = SurfaceFrameTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Surface Frame Trainer")

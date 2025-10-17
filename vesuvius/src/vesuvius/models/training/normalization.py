@@ -4,14 +4,26 @@ from typing import Type
 import numpy as np
 from numpy import number
 
+from vesuvius.image_proc.intensity.normalization import (
+    DEFAULT_TARGET_DTYPE,
+    normalize_ct,
+    normalize_minmax,
+    normalize_robust,
+    normalize_zscore,
+)
+
 
 class ImageNormalization(ABC):
     """
     Abstract base class for image normalization strategies.
     """
     
-    def __init__(self, use_mask_for_norm: bool = None, intensityproperties: dict = None,
-                 target_dtype: Type[number] = np.float32):
+    def __init__(
+        self,
+        use_mask_for_norm: bool | None = None,
+        intensityproperties: dict | None = None,
+        target_dtype: Type[number] = DEFAULT_TARGET_DTYPE,
+    ):
         """
         Initialize the normalization.
         
@@ -58,21 +70,13 @@ class ZScoreNormalization(ImageNormalization):
         """
         Apply z-score normalization.
         """
-        image = image.astype(self.target_dtype, copy=False)
-        
-        if self.use_mask_for_norm is not None and self.use_mask_for_norm and mask is not None:
-            # Normalize only within the mask region
-            mask_bool = mask > 0
-            mean = image[mask_bool].mean()
-            std = image[mask_bool].std()
-            image[mask_bool] = (image[mask_bool] - mean) / max(std, 1e-8)
-        else:
-            # Normalize the entire image
-            mean = image.mean()
-            std = image.std()
-            image = (image - mean) / max(std, 1e-8)
-            
-        return image
+        use_mask = bool(self.use_mask_for_norm)
+        return normalize_zscore(
+            image,
+            mask=mask,
+            use_mask=use_mask,
+            target_dtype=self.target_dtype,
+        )
 
 
 class CTNormalization(ImageNormalization):
@@ -89,20 +93,11 @@ class CTNormalization(ImageNormalization):
         assert all(k in self.intensityproperties for k in ['mean', 'std', 'percentile_00_5', 'percentile_99_5']), \
             "CTNormalization requires 'mean', 'std', 'percentile_00_5', and 'percentile_99_5' in intensity properties"
         
-        image = image.astype(self.target_dtype, copy=False)
-        
-        mean_intensity = self.intensityproperties['mean']
-        std_intensity = self.intensityproperties['std']
-        lower_bound = self.intensityproperties['percentile_00_5']
-        upper_bound = self.intensityproperties['percentile_99_5']
-        
-        # Clip to percentile bounds
-        np.clip(image, lower_bound, upper_bound, out=image)
-        
-        # Normalize using global mean and std
-        image = (image - mean_intensity) / max(std_intensity, 1e-8)
-        
-        return image
+        return normalize_ct(
+            image,
+            intensity_properties=self.intensityproperties,
+            target_dtype=self.target_dtype,
+        )
 
 
 class RescaleTo01Normalization(ImageNormalization):
@@ -114,18 +109,10 @@ class RescaleTo01Normalization(ImageNormalization):
         """
         Apply min-max normalization to [0, 1] range.
         """
-        image = image.astype(self.target_dtype, copy=False)
-        
-        min_val = image.min()
-        max_val = image.max()
-        
-        if max_val > min_val:
-            image = (image - min_val) / (max_val - min_val)
-        else:
-            # If all values are the same, return zeros
-            image = np.zeros_like(image, dtype=self.target_dtype)
-            
-        return image
+        return normalize_minmax(
+            image,
+            target_dtype=self.target_dtype,
+        )
 
 
 class RobustNormalization(ImageNormalization):
@@ -157,80 +144,16 @@ class RobustNormalization(ImageNormalization):
         """
         Apply robust normalization using median and MAD.
         """
-        image = image.astype(self.target_dtype, copy=False)
-
-        # Compute robust statistics
-        if self.use_mask_for_norm is not None and self.use_mask_for_norm and mask is not None:
-            mask_bool = mask > 0
-            valid_data = image[mask_bool]
-        else:
-            valid_data = image.ravel()
-
-        # Skip if no valid data
-        if len(valid_data) == 0:
-            return image
-
-        # Record basic stats before any clipping so we can fall back if MAD collapses
-        std_preclip = float(np.std(valid_data))
-        min_preclip = float(np.min(valid_data))
-        max_preclip = float(np.max(valid_data))
-
-        # Clip to percentiles if requested
-        lower_val = upper_val = None
-        if self.clip_values and len(valid_data) > 0:
-            lower_val = float(np.percentile(valid_data, self.percentile_lower))
-            upper_val = float(np.percentile(valid_data, self.percentile_upper))
-            np.clip(image, lower_val, upper_val, out=image)
-
-            # Recompute valid_data after clipping
-            if self.use_mask_for_norm is not None and self.use_mask_for_norm and mask is not None:
-                valid_data = image[mask_bool]
-            else:
-                valid_data = image.ravel()
-
-        # Compute median
-        median = float(np.median(valid_data))
-
-        # Compute MAD (Median Absolute Deviation)
-        mad = float(np.median(np.abs(valid_data - median)))
-
-        # Scale MAD to be comparable to standard deviation
-        # For normal distribution, std ≈ 1.4826 * MAD
-        scaled_mad = 1.4826 * mad
-
-        # Avoid division by zero
-        if not np.isfinite(scaled_mad) or scaled_mad < 1e-6:
-            percentile_span = None
-            if lower_val is not None and upper_val is not None:
-                percentile_span = upper_val - lower_val
-            else:
-                percentile_span = max_preclip - min_preclip
-
-            fallback_candidates = []
-            if np.isfinite(std_preclip):
-                fallback_candidates.append(abs(std_preclip))
-            if percentile_span is not None and np.isfinite(percentile_span):
-                fallback_candidates.append(abs(percentile_span) / 2.0)
-
-            scaled_mad = None
-            for candidate in fallback_candidates:
-                if candidate >= 1e-6:
-                    scaled_mad = candidate
-                    break
-
-            if scaled_mad is None or not np.isfinite(scaled_mad):
-                scaled_mad = 1.0
-
-        # Apply normalization
-        if self.use_mask_for_norm is not None and self.use_mask_for_norm and mask is not None:
-            image[mask_bool] = (image[mask_bool] - median) / scaled_mad
-        else:
-            image = (image - median) / scaled_mad
-
-        # Ensure we never propagate NaNs/Infs downstream
-        np.nan_to_num(image, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-
-        return image
+        use_mask = bool(self.use_mask_for_norm)
+        return normalize_robust(
+            image,
+            mask=mask,
+            use_mask=use_mask,
+            percentile_lower=self.percentile_lower,
+            percentile_upper=self.percentile_upper,
+            clip_values=self.clip_values,
+            target_dtype=self.target_dtype,
+        )
 
 
 # Mapping from string names to normalization classes

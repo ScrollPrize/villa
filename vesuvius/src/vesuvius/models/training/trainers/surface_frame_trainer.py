@@ -8,8 +8,8 @@ from typing import Dict, Tuple, Union
 
 import torch
 
-from .train import BaseTrainer
-from .loss.surface_frame import SurfaceFrameMultiTermLoss
+from ..train import BaseTrainer
+from ..loss.surface_frame import SurfaceFrameMultiTermLoss
 
 
 logger = logging.getLogger(__name__)

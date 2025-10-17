@@ -165,7 +165,7 @@ def run_structure_tensor_part(args, part_id, gpu_id, shared_output_path):
     # Set overlap to 0.0 for no overlap
     cmd.extend(['--overlap', '0.0'])
     
-    # Pass a valid step_size (if user supplied one), else default to 1.0−overlap
+    # Pass a valid step_size (if user supplied one), else default to 1.0 - overlap
     if args.step_size is not None:
         cmd.extend(['--step_size', str(args.step_size)])
     else:
@@ -266,11 +266,11 @@ def parse_arguments():
     
     # Structure tensor computation arguments
     parser.add_argument('--sigma', type=float, default=2.0,
-                        help='Gaussian σ for structure-tensor smoothing')
+                        help='Gaussian sigma for structure-tensor smoothing')
     parser.add_argument('--structure-tensor-only', action='store_true',
                         help='Compute only the structure tensor, skip eigenanalysis')
     parser.add_argument('--smooth-components', action='store_true',
-                        help='After computing Jxx…Jzz, apply a second Gaussian smoothing to each channel')
+                        help='After computing Jxx...Jzz, apply a second Gaussian smoothing to each channel')
     parser.add_argument('--volume', type=int, default=None,
                         help='Volume ID for fiber-volume masking')
     
@@ -280,7 +280,7 @@ def parse_arguments():
     parser.add_argument('--overlap', type=float, default=0.0, 
                         help='Overlap between patches (0-1), default 0.0 for structure tensor')
     parser.add_argument('--step_size', type=float, default=None,
-                        help='Step‐size factor for sliding window (0 < step_size ≤ 1). If unset, will be inferred as 1.0 − overlap.')
+                        help='Step-size factor for sliding window (0 < step_size <= 1). If unset, will be inferred as 1.0 - overlap.')
     parser.add_argument('--batch_size', type=int, default=1,
                         help='Batch size for inference')
     
@@ -470,11 +470,11 @@ def main():
                         success = future.result()
                         results.append((part_id, success))
                         if success:
-                            print(f"✓ Part {part_id} completed successfully")
+                            print(f"[OK] Part {part_id} completed successfully")
                         else:
-                            print(f"✗ Part {part_id} failed")
+                            print(f"[FAIL] Part {part_id} failed")
                     except Exception as e:
-                        print(f"✗ Part {part_id} failed with exception: {e}")
+                        print(f"[FAIL] Part {part_id} failed with exception: {e}")
                         results.append((part_id, False))
             
             # Check if all parts succeeded

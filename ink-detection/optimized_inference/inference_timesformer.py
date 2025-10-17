@@ -9,9 +9,11 @@ Key features:
 - Efficient dataloader settings and safe zero-padding at image borders
 """
 import os
+os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")  # safety in case imported directly
 import gc
 import uuid
 import logging
+import shutil
 from typing import List, Tuple, Optional, Union
 
 import numpy as np
@@ -24,6 +26,7 @@ from timesformer_pytorch import TimeSformer
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from tqdm.auto import tqdm
+import tifffile as tiff
 import cv2
 
 # ----------------------------- Logging ---------------------------------------
@@ -112,32 +115,83 @@ class LayersSource:
             raise TypeError("LayersSource expects np.ndarray or List[str] of file paths")
 
     @staticmethod
+    def _read_gray_any(path: str) -> np.ndarray:
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext in (".tif", ".tiff"):
+                img = tiff.imread(path)
+                if img is None:
+                    return None
+                if img.ndim > 2:
+                    img = img[..., 0]
+                if img.dtype != np.uint8:
+                    # Minimal, safe conversion to uint8
+                    img = np.clip(img, 0, 255).astype(np.uint8)
+                return img
+            else:
+                return cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        except Exception:
+            return None
+
+    @staticmethod
     def _build_memmap_from_files(paths: List[str]) -> Tuple[np.memmap, Tuple[int, int, int], np.dtype]:
-        # Probe first image
-        first = cv2.imread(paths[0], cv2.IMREAD_GRAYSCALE)
+        """Create a disk-backed array of shape (C,H,W) for contiguous per-layer writes,
+        but expose shape as (H,W,C) to callers."""
+        from numpy.lib.format import open_memmap
+        import concurrent.futures
+
+        first = LayersSource._read_gray_any(paths[0])
         if first is None:
             raise RuntimeError(f"Failed to read image: {paths[0]}")
         h, w = first.shape
         c = len(paths)
 
-        # Create a memmap file on disk (uint8 keeps size modest)
-        mm_path = os.path.join("/tmp", f"layers_{uuid.uuid4().hex}.npy")
-        logger.info(f"Creating disk-backed memmap for layers at {mm_path} (shape={h}x{w}x{c}, dtype=uint8)")
-        mm = np.memmap(mm_path, mode="w+", dtype=np.uint8, shape=(h, w, c))
+        mm_root = os.environ.get("MMAP_DIR", "/tmp")
+        mm_path = os.path.join(mm_root, f"layers_{uuid.uuid4().hex}.npy")
+        required_gib = (h * w * c) / (1024**3)
+        free_gib = shutil.disk_usage(mm_root).free / (1024**3)
+        logger.info(
+            f"Creating memmap at {mm_path} (C,H,W={c},{h},{w} ~{required_gib:.2f} GiB). "
+            f"Free on {mm_root}: {free_gib:.2f} GiB."
+        )
+        if free_gib < required_gib * 1.10:
+            raise RuntimeError(
+                f"Not enough space on {mm_root}: need ~{required_gib:.2f} GiB, have {free_gib:.2f} GiB"
+            )
+        # True .npy with header; contiguous C-order
+        mm = open_memmap(mm_path, mode="w+", dtype=np.uint8, shape=(c, h, w))
 
-        # Stream images one-by-one, validate shape, write to memmap
-        for idx, p in enumerate(paths):
-            img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+        # Parallel reads, single-writer commit
+        max_workers = int(os.environ.get("MMAP_READ_WORKERS", str(min(6, (os.cpu_count() or 4)))))
+        flush_every = int(os.environ.get("MMAP_FLUSH_EVERY", "0"))  # 0 = only flush once at end
+        log_every = max(1, c // 10)
+
+        def _read(idx_path):
+            idx, p = idx_path
+            img = LayersSource._read_gray_any(p)
             if img is None:
                 raise RuntimeError(f"Failed to read image: {p}")
             if img.shape != (h, w):
                 raise RuntimeError(f"Layer size mismatch: {p} has {img.shape}, expected {(h, w)}")
-            # No global clipping; we clip per-tile before normalize
-            mm[:, :, idx] = img
+            return idx, img
 
-        # Flush to disk, reopen read-only for safety/perf
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_read, (i, p)) for i, p in enumerate(paths)]
+            n_done = 0
+            for fut in concurrent.futures.as_completed(futures):
+                idx, img = fut.result()
+                n_done += 1
+                mm[idx, :, :] = img  # contiguous plane write
+                if flush_every and (n_done % flush_every == 0):
+                    mm.flush()
+                if (n_done % log_every == 0) or (n_done == c):
+                    logger.info(f"Memmap build progress: {n_done}/{c} layers")
+
+        mm.flush()  # ensure on-disk
+        # Reopen read-only for safety/perf
         del mm
-        mm = np.memmap(mm_path, mode="r", dtype=np.uint8, shape=(h, w, c))
+        mm = np.lib.format.open_memmap(mm_path, mode="r", dtype=np.uint8, shape=(c, h, w))
+        # Expose logical (H,W,C) to the rest of the pipeline
         return mm, (h, w, c), mm.dtype
 
     @property
@@ -149,13 +203,19 @@ class LayersSource:
         H, W, C = self._shape
         yy1, yy2 = max(0, y1), min(H, y2)
         xx1, xx2 = max(0, x1), min(W, x2)
-        out = np.zeros((y2 - y1, x2 - x1, C),
-                       dtype=self._dtype if self._arr is None else self._arr.dtype)
+        out = np.zeros(
+            (y2 - y1, x2 - x1, C),
+            dtype=self._dtype if self._arr is None else self._arr.dtype,
+        )
         if yy2 > yy1 and xx2 > xx1:
             if self._arr is not None:
+                # in-RAM case is already HWC
                 out[(yy1 - y1):(yy2 - y1), (xx1 - x1):(xx2 - x1)] = self._arr[yy1:yy2, xx1:xx2, :]
             else:
-                out[(yy1 - y1):(yy2 - y1), (xx1 - x1):(xx2 - x1)] = self._mm[yy1:yy2, xx1:xx2, :]
+                # memmap stored as (C,H,W) -> slice (C, tile_h, tile_w) then move channels last
+                roi = self._mm[:, yy1:yy2, xx1:xx2]
+                roi = np.moveaxis(roi, 0, 2)  # (tile_h, tile_w, C)
+                out[(yy1 - y1):(yy2 - y1), (xx1 - x1):(xx2 - x1)] = roi
         return out
 
 # ----------------------------- Preprocess ------------------------------------

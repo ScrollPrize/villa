@@ -36,18 +36,29 @@ def _save_gif_worker(frames_list, path, _fps):
         sys.exit(1)
 
 
-def minmax_scale_to_8bit(arr_np):
-    """Convert array to 8-bit by scaling to 0-255 range"""
+def minmax_scale_to_8bit(arr_np, clip_quantile: float = 0.005):
+    """Convert array to 8-bit by scaling to 0-255 range with optional outlier clipping (default 0.5/99.5 percentiles)."""
+    if not 0.0 <= clip_quantile < 0.5:
+        raise ValueError("clip_quantile must be in the range [0.0, 0.5)")
+
     # Ensure float32 for computation
     if arr_np.dtype != np.float32 and arr_np.dtype != np.float64:
         arr_np = arr_np.astype(np.float32)
-    
+    else:
+        arr_np = arr_np.astype(np.float32, copy=False)
+
+    if clip_quantile > 0.0:
+        lower = float(np.quantile(arr_np, clip_quantile))
+        upper = float(np.quantile(arr_np, 1.0 - clip_quantile))
+        if upper > lower:
+            arr_np = np.clip(arr_np, lower, upper)
+
     min_val = arr_np.min()
     max_val = arr_np.max()
     if max_val > min_val:
         arr_np = (arr_np - min_val) / (max_val - min_val) * 255
     else:
-        arr_np = np.zeros_like(arr_np, dtype=np.float32) * 255
+        arr_np = np.zeros_like(arr_np, dtype=np.float32)
     return np.clip(arr_np, 0, 255).astype(np.uint8)
 
 
@@ -176,7 +187,15 @@ def save_debug(
     train_skeleton_dict: dict = None,   # Optional train skeleton data
     apply_activation: bool = True       # Whether to apply activation functions
 ):
-    """Save debug visualization as GIF (3D) or PNG (2D)"""
+    """
+    Save debug visualization as GIF (3D) or PNG (2D).
+
+    Returns
+    -------
+    tuple[list[np.ndarray] | None, np.ndarray | None]
+        (frames_for_gif, preview_image) where preview_image is a single 2D panel
+        extracted from the visualization (middle Z slice for 3D data).
+    """
     
     # Get input array
     # Convert BFloat16 to Float32 before numpy conversion
@@ -331,11 +350,16 @@ def save_debug(
         print(f"[Epoch {epoch}] Saving PNG to: {save_path}")
         # Use PIL for saving
         Image.fromarray(final_img).save(save_path)
-        
+
+        preview_img = np.ascontiguousarray(final_img, dtype=np.uint8)
+        return None, preview_img
+
     else:
         # Build frames for 3D GIF
         frames = []
+        preview_frame = None
         z_dim = inp_np.shape[0] if inp_np.ndim == 3 else inp_np.shape[1]
+        mid_z_idx = max(z_dim // 2, 0)
 
         for z_idx in range(z_dim):
             rows = []
@@ -405,6 +429,9 @@ def save_debug(
             # Ensure frame is uint8 and contiguous
             frame = np.ascontiguousarray(frame, dtype=np.uint8)
             frames.append(frame)
+
+            if z_idx == mid_z_idx:
+                preview_frame = frame.copy()
         
         # Save GIF in a subprocess to avoid crashing main training process on encoder segfaults
         out_dir = Path(save_path).parent
@@ -420,14 +447,20 @@ def save_debug(
         if proc.is_alive():
             proc.terminate()
             print("Warning: GIF save timed out; skipping debug visualization")
-            return None
+            if preview_frame is None and frames:
+                preview_frame = frames[len(frames) // 2].copy()
+            return None, preview_frame
 
         if proc.exitcode == 0:
             print(f"Successfully saved GIF to: {save_path}")
-            return frames
+            if preview_frame is None and frames:
+                preview_frame = frames[len(frames) // 2].copy()
+            return frames, preview_frame
         else:
             print(f"Warning: GIF save failed in subprocess (exit code {proc.exitcode}); skipping")
-            return None
+            if preview_frame is None and frames:
+                preview_frame = frames[len(frames) // 2].copy()
+            return None, preview_frame
 
 
 def apply_activation_if_needed(activation_str):

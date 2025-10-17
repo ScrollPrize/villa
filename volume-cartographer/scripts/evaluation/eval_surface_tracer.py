@@ -85,14 +85,15 @@ class SurfaceTracerEvaluation:
     def _robust_threshold(self, durations: List[float]) -> Optional[float]:
         """
         Robust wall-clock duration threshold in seconds from completed jobs:
-          thr = max(2*median, median + 3*MAD), with a lower bound of 60s.
-        Returns None if there aren't enough samples.
+          thr = max(2*median, median + 3*MAD, floor), where floor defaults to 300s.
+        No fixed minimum-sample requirement; computes with whatever data is available.
         """
-        if len(durations) < self._watch_min_samples:
+        if not durations:
             return None
         m = float(median(durations))
-        mad = float(median([abs(x - m) for x in durations])) if durations else 0.0
-        thr = max(2.0 * m, m + 3.0 * mad, 60.0)
+        mad = float(median([abs(x - m) for x in durations])) if len(durations) > 1 else 0.0
+        floor = float(self.config.get("watchdog_floor_seconds", 300.0))
+        thr = max(2.0 * m, m + 3.0 * mad, floor)
         return thr
 
     # -------------------------------
@@ -199,6 +200,7 @@ class SurfaceTracerEvaluation:
         next_watch = None
         last_status = 0.0
         status_period = float(self.config.get("status_log_period_sec", 60.0))
+        watch_armed_logged = False
 
         def _close_logf(t):
             try:
@@ -230,11 +232,24 @@ class SurfaceTracerEvaluation:
             active = still
 
             if now - last_status >= status_period:
-                logger.info(f"[{stage_key}] active={len(active)} completed={completed}/{total} queued={len(tasks)} (parallel={parallel})")
+                progress_total = (completed / total) if total > 0 else 0.0
+                logger.info(
+                    f"[{stage_key}] active={len(active)} completed={completed}/{total} "
+                    f"queued={len(tasks)} (parallel={parallel}) "
+                    f"progress_total={progress_total:.1%}"
+                )
                 last_status = now
 
-            # watchdog: after threshold fraction completed, run checks every period
-            if completed / total >= self._watch_trigger_fraction:
+            # Watchdog: only after the requested fraction of the TOTAL work is completed
+            trigger_completed = max(1, math.ceil(total * self._watch_trigger_fraction))
+            if completed >= trigger_completed:
+                if not watch_armed_logged:
+                    logger.info(
+                        f"[watchdog] Activated for {stage_key}: "
+                        f"completed={completed}/{total} (>= {trigger_completed}); "
+                        f"threshold_fraction={self._watch_trigger_fraction:.2f}"
+                    )
+                    watch_armed_logged = True
                 if next_watch is None:
                     next_watch = now  # fire immediately at first trigger
                 if now >= next_watch:
@@ -254,6 +269,11 @@ class SurfaceTracerEvaluation:
                                         t["p"].wait(self._watch_grace_seconds)
                                     except subprocess.TimeoutExpired:
                                         t["p"].kill()
+                                    # Close per-proc logfile after termination
+                                    try:
+                                        t["logf"].close()
+                                    except Exception:
+                                        pass
                                     kills += 1
                                 except Exception as e:
                                     logger.warning(f"[watchdog] terminate failed: {e}")

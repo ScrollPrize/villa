@@ -28,7 +28,7 @@ _this package is in active development_
 | `vesuvius.finalize_outputs`   | `models.run.finalize_outputs`      | performs softmax / argmax / none on the blended array and writes a final `uint8` volume                                                                                                                   |
 | `vesuvius.inference_pipeline` | `models.run.vesuvius_pipeline`     | runs the three steps above (predict → blend → finalize) in sequence                                                                                                                                       |
 | `vesuvius.compute_st`         | `structure_tensor.run_create_st`   | computes structure tensors on input data and derives eigen-values/vectors                                                                                                                                 |
-| `vesuvius.napari_trainer`     | `utils.napari_trainer.main_window` | launches a Napari window for interactive training and inference                                                                                                                                           |
+| `vesuvius.napari_trainer`     | `napari_trainer.main_window`       | launches a Napari window for interactive training and inference                                                                                                                                           |
 | `vesuvius.proofreader`        | `utils.vc_proofreader.main`        | opens a Napari window that loads local / remote image-label arrays and extracts training patches                                                                                                          |
 | `vesuvius.voxelize_obj`       | `scripts.voxelize_objs`            | converts input `.obj` meshes to voxel grids and outputs `.tif` stacks                                                                                                                                     |
 | `vesuvius.refine_labels`      | `scripts.edt_frangi_label`         | refines surface or fibre labels with a custom Frangi-based filter                                                                                                                                         |
@@ -158,7 +158,7 @@ Training will run for 1,000 epochs by default, with 200 batches/epoch. This can 
 
 Detailed documentation is available in [the inference readme](docs/docs/inference.md)
 
-The inference script used here is unfortunately (by necessity) quite convoluted. It **stores a very large amount of intermediate data** , in the form of float16 logits from patches. In the case that you do not have a lot of storage space, it might make sense to borrow some of the functions from the inferer, and rewrite the inference process to write directly to uint8 final arrays.
+The inference process is a bit convoluted. Due to our focus on very large volumetric data, it becomes very difficult for writes to keep pace with multi-gpu systems, necessitating a map-reduce style of inference where we store intermediate logits before blending.  It **stores a very large amount of intermediate data** , in the form of float16 logits from patches. In the case that you do not have a lot of storage space, it might make sense to borrow some of the functions from the inferer, and rewrite the inference process to write directly to uint8 final arrays.
 
 The inference process is in 3 parts -- inference, blending, and finalization
 
