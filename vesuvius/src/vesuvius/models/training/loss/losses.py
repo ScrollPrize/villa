@@ -10,10 +10,11 @@ from vesuvius.image_proc.geometry.structure_tensor import (
 )
 
 # Import nnUNet losses
-from .nnunet_losses import (
+from vesuvius.models.training.loss.nnunet_losses import (
     DC_and_CE_loss, DC_and_BCE_loss, MemoryEfficientSoftDiceLoss,
     DeepSupervisionWrapper
 )
+from vesuvius.models.training.loss.ect_loss import ECTLoss
 
 
 
@@ -1125,12 +1126,31 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight, mgr=None):
         )
 
     elif name == 'BettiMatchingLoss':
-        from .betti_losses import BettiMatchingLoss
+        from vesuvius.models.training.loss.betti_losses import BettiMatchingLoss
         base_loss = BettiMatchingLoss(
             filtration=loss_config.get('filtration', 'superlevel')
         )
 
-    
+    elif name == 'ECTLoss':
+        base_loss = ECTLoss(
+            num_directions=loss_config.get('num_directions', 32),
+            resolution=loss_config.get('resolution', 64),
+            scale=loss_config.get('scale', 8.0),
+            normalize=loss_config.get('normalize', False),
+            aggregation=loss_config.get('aggregation', 'mse'),
+            apply_activation=loss_config.get('apply_activation', 'auto'),
+            seed=loss_config.get('seed', 17),
+            radius_multiplier=loss_config.get('radius_multiplier', 1.1),
+            use_fast_ect=loss_config.get('use_fast_ect', False),
+            fast_subsample_ratio=loss_config.get('fast_subsample_ratio'),
+            fast_max_points=loss_config.get('fast_max_points'),
+            learnable=loss_config.get('learnable', False),
+            accumulation_mode=loss_config.get('accumulation_mode', 'auto'),
+            soft_sigma=loss_config.get('soft_sigma'),
+            soft_chunk_size=loss_config.get('soft_chunk_size'),
+        )
+
+
     else:
         raise RuntimeError(f"Unsupported loss function: '{name}'")
     

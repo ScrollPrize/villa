@@ -11,6 +11,7 @@ if __name__ == '__main__' and len(sys.argv) > 1:
             pass
 
 from pathlib import Path
+from copy import deepcopy
 import os
 from datetime import datetime
 from tqdm import tqdm
@@ -219,6 +220,8 @@ class BaseTrainer:
             return False
         if target_name.endswith('_skel'):
             return False
+        if target_name.endswith('_mask') or target_name.startswith('mask_') or target_name == 'plane_mask':
+            return False
         return True
 
     def _compute_loss_value(
@@ -270,8 +273,12 @@ class BaseTrainer:
                 for loss_cfg in task_info["losses"]:
                     loss_name = loss_cfg["name"]
                     loss_weight = loss_cfg.get("weight", 1.0)
-                    loss_kwargs = loss_cfg.get("kwargs", {})
+                    loss_kwargs = dict(loss_cfg.get("kwargs", {}))
                     start_epoch = loss_cfg.get("start_epoch", 0)
+
+                    for key, value in loss_cfg.items():
+                        if key not in {"name", "weight", "kwargs", "start_epoch"}:
+                            loss_kwargs.setdefault(key, value)
 
                     weight = loss_kwargs.get("weight", None)
                     ignore_index = loss_kwargs.get("ignore_index", -100)
@@ -313,6 +320,66 @@ class BaseTrainer:
                 self._deferred_losses[task_name] = deferred_losses
 
         return loss_fns
+
+    def _capture_loss_overrides(self):
+        """
+        Snapshot loss-related configuration for each target so it can be restored
+        after loading a checkpoint that may overwrite mgr.targets.
+        """
+        targets = getattr(self.mgr, 'targets', None)
+        if not targets:
+            return {}
+
+        overrides = {}
+        for target_name, cfg in targets.items():
+            if not isinstance(cfg, dict):
+                continue
+            target_override = {}
+            if cfg.get("losses"):
+                target_override["losses"] = deepcopy(cfg["losses"])
+            elif cfg.get("loss_fn"):
+                target_override["loss_fn"] = cfg["loss_fn"]
+            if target_override:
+                overrides[target_name] = target_override
+        return overrides
+
+    def _apply_loss_overrides(self, overrides):
+        """
+        Reapply stored loss configuration after checkpoint load so CLI/config
+        overrides take precedence over persisted checkpoint values.
+        """
+        if not overrides:
+            return
+
+        targets = getattr(self.mgr, 'targets', None)
+        if not targets:
+            return
+
+        applied = False
+        for target_name, override in overrides.items():
+            if target_name not in targets:
+                continue
+            if override.get("losses"):
+                targets[target_name]["losses"] = deepcopy(override["losses"])
+                targets[target_name].pop("loss_fn", None)
+                applied = True
+            elif override.get("loss_fn"):
+                loss_name = override["loss_fn"]
+                targets[target_name]["loss_fn"] = loss_name
+                targets[target_name]["losses"] = [{
+                    "name": loss_name,
+                    "weight": 1.0,
+                    "kwargs": {}
+                }]
+                applied = True
+
+        if applied:
+            if isinstance(getattr(self.mgr, 'model_config', None), dict):
+                self.mgr.model_config["targets"] = deepcopy(targets)
+            if isinstance(getattr(self.mgr, 'dataset_config', None), dict):
+                self.mgr.dataset_config["targets"] = deepcopy(targets)
+            if getattr(self.mgr, 'verbose', False):
+                print("Applied loss configuration overrides after loading checkpoint.")
 
     # --- deep supervision helpers --- #
     def _set_deep_supervision_enabled(self, model, enabled: bool):
@@ -777,7 +844,7 @@ class BaseTrainer:
         if use_amp and self.device.type == 'cuda' and self.amp_dtype == torch.bfloat16:
             if not self.is_distributed or self.rank == 0:
                 print("Using CUDA AMP with bfloat16 (GradScaler disabled)")
-        
+
         scaler = self._get_scaler(self.device.type, use_amp=use_amp, amp_dtype=self.amp_dtype)
         train_dataloader, val_dataloader, train_indices, val_indices = self._configure_dataloaders(train_dataset,
                                                                                                    val_dataset)
@@ -798,7 +865,10 @@ class BaseTrainer:
         ckpt_dir = os.path.join('checkpoints', f"{self.mgr.model_name}_{date_str}{time_str}")
         os.makedirs(ckpt_dir, exist_ok=True)
 
+        loss_overrides = self._capture_loss_overrides()
+
         start_epoch = 0
+        checkpoint_loaded = False
         if hasattr(self.mgr, 'checkpoint_path') and self.mgr.checkpoint_path:
             model, optimizer, scheduler, start_epoch, checkpoint_loaded = load_checkpoint(
                 checkpoint_path=self.mgr.checkpoint_path,
@@ -809,6 +879,9 @@ class BaseTrainer:
                 device=self.device,
                 load_weights_only=getattr(self.mgr, 'load_weights_only', False)
             )
+
+            if checkpoint_loaded:
+                self._apply_loss_overrides(loss_overrides)
 
             if checkpoint_loaded and self.mgr.load_weights_only:
                 scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
@@ -996,7 +1069,7 @@ class BaseTrainer:
         return total_loss, task_losses, inputs, targets_dict, outputs, optimizer_stepped
 
     def _compute_train_loss(self, outputs, targets_dict, loss_fns):
-        total_loss = None
+        total_loss = torch.zeros((), device=self.device, dtype=torch.float32)
         task_losses = {}
 
         for t_name, t_gt in targets_dict.items():
@@ -1012,7 +1085,7 @@ class BaseTrainer:
             else:
                 ref_tensor = t_pred
 
-            task_total_loss = None
+            task_total_loss = torch.zeros((), device=ref_tensor.device, dtype=torch.float32)
             for loss_fn, loss_weight in task_loss_fns:
                 pred_for_loss, gt_for_loss = t_pred, t_gt
                 if isinstance(t_pred, (list, tuple)) and not isinstance(loss_fn, DeepSupervisionWrapper):
@@ -1028,22 +1101,11 @@ class BaseTrainer:
                     targets_dict=targets_dict,
                     outputs=outputs,
                 )
-                if not isinstance(loss_value, torch.Tensor):
-                    loss_value = torch.as_tensor(loss_value, device=ref_tensor.device)
-                loss_value = loss_value.to(torch.float32)
-                weighted_component = loss_weight * loss_value
-                task_total_loss = weighted_component if task_total_loss is None else task_total_loss + weighted_component
+                task_total_loss += loss_weight * loss_value
 
-            if task_total_loss is None:
-                continue
-
-            task_total_loss = task_total_loss.to(torch.float32)
             weighted_loss = task_weight * task_total_loss
-            total_loss = weighted_loss if total_loss is None else total_loss + weighted_loss
+            total_loss = total_loss + weighted_loss.to(total_loss.dtype)
             task_losses[t_name] = weighted_loss.detach().cpu().item()
-
-        if total_loss is None:
-            total_loss = torch.zeros((), device=self.device, dtype=torch.float32)
 
         return total_loss, task_losses
 
@@ -1094,7 +1156,7 @@ class BaseTrainer:
             else:
                 ref_tensor = t_pred
 
-            task_total_loss = torch.zeros((), device=ref_tensor.device, dtype=ref_tensor.dtype)
+            task_total_loss = torch.zeros((), device=ref_tensor.device, dtype=torch.float32)
             for loss_fn, loss_weight in task_loss_fns:
                 pred_for_loss, gt_for_loss = t_pred, t_gt
                 if isinstance(t_pred, (list, tuple)) and not isinstance(loss_fn, DeepSupervisionWrapper):
@@ -1466,10 +1528,13 @@ class BaseTrainer:
                                 if isinstance(gt_val, (list, tuple)):
                                     gt_val = gt_val[0]
                                 # If no metrics configured for this task (e.g., MAE), skip safely
+                                mask_tensor = targets_dict.get(f"{t_name}_mask")
+                                if isinstance(mask_tensor, (list, tuple)):
+                                    mask_tensor = mask_tensor[0]
                                 for metric in evaluation_metrics.get(t_name, []):
                                     if isinstance(metric, CriticalComponentsMetric) and i >= 10:
                                         continue
-                                    metric.update(pred=pred_val, gt=gt_val)
+                                    metric.update(pred=pred_val, gt=gt_val, mask=mask_tensor)
 
                         if i == 0:
                                 # Find first non-zero sample for debug visualization, but save even if all zeros

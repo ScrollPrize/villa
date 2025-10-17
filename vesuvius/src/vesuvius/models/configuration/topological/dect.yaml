@@ -1,0 +1,27 @@
+tr_config:
+  patch_size: [128,128,128]
+  enable_deep_supervision: false
+
+
+dataset_config:
+  min_labeled_ratio: 0
+  min_bbox_percent: 0
+  normalization_scheme: "zscore"
+  skip_patch_validation: true
+  targets:
+    surface:
+      activation: "none"
+      losses:
+        - name: "MedialSurfaceRecall"
+          weight: 0.5
+        - name: "ECTLoss"
+          weight: 1.0
+          use_fast_ect: true
+          accumulation_mode: "fast"
+          learnable: false
+          num_directions: 48
+          scale: 6
+          resolution: 48
+          normalize: true
+
+

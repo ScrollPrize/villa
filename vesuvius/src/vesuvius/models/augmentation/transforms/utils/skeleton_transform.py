@@ -1,3 +1,5 @@
+from typing import Optional, Sequence
+
 import torch
 from skimage.morphology import skeletonize, dilation, opening, closing
 import numpy as np
@@ -9,7 +11,8 @@ class MedialSurfaceTransform(BasicTransform):
     def __init__(self,
                  do_tube: bool = True,
                  do_open: bool = False,
-                 do_close: bool = True,):
+                 do_close: bool = True,
+                 target_keys: Optional[Sequence[str]] = None,):
         """
         Calculates the medial surface skeleton of the segmentation (plus an optional 2 px tube around it)
         and adds it to the dict with the key "skel"
@@ -18,17 +21,23 @@ class MedialSurfaceTransform(BasicTransform):
         self.do_tube = do_tube
         self.do_open = do_open
         self.do_close = do_close
+        self.target_keys = tuple(target_keys) if target_keys else None
 
     def apply(self, data_dict, **params):
         # Collect regression keys to avoid processing continuous aux targets
         regression_keys = set(data_dict.get('regression_keys', []) or [])
         # Find eligible target keys: tensor-valued, not image/meta, not regression aux
-        target_keys = [
+        candidate_keys = [
             k for k, v in data_dict.items()
             if k not in ['image', 'is_unlabeled', 'regression_keys']
             and isinstance(v, torch.Tensor)
             and k not in regression_keys
         ]
+
+        if self.target_keys is not None:
+            target_keys = [k for k in candidate_keys if k in self.target_keys]
+        else:
+            target_keys = candidate_keys
 
         # Process each target
         for target_key in target_keys:
