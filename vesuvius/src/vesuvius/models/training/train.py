@@ -96,55 +96,107 @@ class BaseTrainer:
         env_world_size = int(os.environ.get('WORLD_SIZE', '1'))
         want_ddp = bool(getattr(self.mgr, 'use_ddp', False)) or env_world_size > 1
 
-        # Set device early (before init) if CUDA available
-        if torch.cuda.is_available():
-            # Determine local rank from env (torchrun) or default 0
-            env_local_rank = int(os.environ.get('LOCAL_RANK', os.environ.get('RANK', '0')))
-            self.local_rank = env_local_rank
-            if want_ddp and self.gpu_ids:
-                # Map this process to the user-specified GPU list
-                if len(self.gpu_ids) < env_world_size:
-                    raise ValueError(
-                        f"--gpus specifies {len(self.gpu_ids)} devices, but WORLD_SIZE={env_world_size}. "
-                        f"Launch with torchrun --nproc_per_node={len(self.gpu_ids)} or adjust --gpus."
-                    )
-                assigned_gpu = int(self.gpu_ids[env_local_rank])
-            elif want_ddp:
-                assigned_gpu = env_local_rank
-            elif self.gpu_ids:
-                assigned_gpu = int(self.gpu_ids[0])
-            else:
-                assigned_gpu = 0
+        # Determine local rank from env (torchrun) or default 0
+        env_local_rank = int(os.environ.get('LOCAL_RANK', os.environ.get('RANK', '0')))
+        self.local_rank = env_local_rank
 
+        raw_device_request = getattr(self.mgr, 'device_request', 'auto')
+        if raw_device_request is None:
+            raw_device_request = 'auto'
+        if isinstance(raw_device_request, str):
+            device_request = raw_device_request.strip() or 'auto'
+        else:
+            device_request = str(raw_device_request)
+        device_request_lower = device_request.lower()
+
+        cuda_available = torch.cuda.is_available()
+        mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+        assigned_gpu = None
+
+        def resolve_cuda_index(explicit_index=None):
+            if explicit_index is not None:
+                return explicit_index
+            if want_ddp:
+                if self.gpu_ids:
+                    if len(self.gpu_ids) < env_world_size:
+                        raise ValueError(
+                            f"--gpus specifies {len(self.gpu_ids)} devices, but WORLD_SIZE={env_world_size}. "
+                            f"Launch with torchrun --nproc_per_node={len(self.gpu_ids)} or adjust --gpus."
+                        )
+                    return int(self.gpu_ids[env_local_rank])
+                return env_local_rank
+            if self.gpu_ids:
+                return int(self.gpu_ids[0])
+            return 0
+
+        if device_request_lower in ('auto', ''):
+            if cuda_available:
+                assigned_gpu = resolve_cuda_index()
+                if assigned_gpu < 0 or assigned_gpu >= torch.cuda.device_count():
+                    raise ValueError(
+                        f"Resolved CUDA device index {assigned_gpu} is out of range (device_count={torch.cuda.device_count()})."
+                    )
+                torch.cuda.set_device(assigned_gpu)
+                self.device = torch.device('cuda', assigned_gpu)
+                self.assigned_gpu_id = assigned_gpu
+            else:
+                self.device = get_accelerator()
+                self.assigned_gpu_id = None
+        elif device_request_lower.startswith('cuda'):
+            if not cuda_available:
+                raise ValueError("--device requested CUDA, but no CUDA device is available.")
+            explicit_index = None
+            if ':' in device_request_lower:
+                idx_str = device_request_lower.split(':', 1)[1]
+                if idx_str == '':
+                    raise ValueError("Invalid --device specification 'cuda:'; expected 'cuda' or 'cuda:<index>'.")
+                try:
+                    explicit_index = int(idx_str)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid CUDA device index '{idx_str}' in --device.") from exc
+            assigned_gpu = resolve_cuda_index(explicit_index)
+            if assigned_gpu < 0 or assigned_gpu >= torch.cuda.device_count():
+                raise ValueError(
+                    f"Requested CUDA device index {assigned_gpu} is out of range (device_count={torch.cuda.device_count()})."
+                )
             torch.cuda.set_device(assigned_gpu)
             self.device = torch.device('cuda', assigned_gpu)
             self.assigned_gpu_id = assigned_gpu
-        else:
-            self.device = get_accelerator()
+        elif device_request_lower == 'cpu':
+            self.device = torch.device('cpu')
             self.assigned_gpu_id = None
+        elif device_request_lower == 'mps':
+            if not mps_available:
+                raise ValueError("--device requested MPS, but torch.backends.mps.is_available() returned False.")
+            self.device = torch.device('mps')
+            self.assigned_gpu_id = None
+        else:
+            raise ValueError(
+                f"Unsupported --device option '{device_request}'. Use 'auto', 'cuda', 'cuda:N', 'cpu', or 'mps'."
+            )
 
         # Initialize process group if needed
         if want_ddp and dist.is_available():
-            backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+            backend = 'nccl' if getattr(self.device, 'type', None) == 'cuda' else 'gloo'
             if not dist.is_initialized():
                 dist.init_process_group(backend=backend, init_method='env://')
             self.is_distributed = True
             self.world_size = dist.get_world_size()
             self.rank = dist.get_rank()
             # Validate GPU mapping length matches world size when provided
-            if torch.cuda.is_available() and self.gpu_ids and len(self.gpu_ids) != self.world_size:
+            if getattr(self.device, 'type', None) == 'cuda' and self.gpu_ids and len(self.gpu_ids) != self.world_size:
                 raise ValueError(
                     f"In DDP, number of GPUs in --gpus ({len(self.gpu_ids)}) must equal WORLD_SIZE ({self.world_size})."
                 )
 
         # Friendly prints
         if self.is_distributed and (not self.rank or self.rank == 0):
-            if torch.cuda.is_available():
+            if getattr(self.device, 'type', None) == 'cuda':
                 used = self.gpu_ids if self.gpu_ids else list(range(self.world_size))
                 print(f"DDP enabled (world size={self.world_size}). Using GPUs: {used}")
             else:
-                print(f"DDP enabled on CPU/MPS (world size={self.world_size})")
-        elif not self.is_distributed and torch.cuda.is_available() and self.gpu_ids:
+                print(f"DDP enabled on {self.device.type.upper()} (world size={self.world_size})")
+        elif not self.is_distributed and getattr(self.device, 'type', None) == 'cuda' and self.gpu_ids:
             if len(self.gpu_ids) > 1:
                 print(f"Multiple GPUs specified {self.gpu_ids} without DDP; using GPU {self.gpu_ids[0]} only.")
             else:
@@ -1828,6 +1880,8 @@ def main():
                            help="Enable DistributedDataParallel (use with torchrun)")
     grp_train.add_argument("--val-every-n", dest="val_every_n", type=int, default=1,
                            help="Perform validation every N epochs (1=every epoch)")
+    grp_train.add_argument("--device", type=str, default="auto",
+                           help="Device to use for training (auto, cuda, cuda:N, cpu, mps)")
     grp_train.add_argument("--gpus", type=str, default=None,
                            help="Comma-separated GPU device IDs to use, e.g. '0,1,3'. With DDP, length must equal WORLD_SIZE")
     grp_train.add_argument("--nproc-per-node", type=int, default=None,
@@ -1909,6 +1963,12 @@ def main():
     Path(args.output).mkdir(parents=True, exist_ok=True)
 
     update_config_from_args(mgr, args)
+
+    device_choice = (str(getattr(args, 'device', 'auto')).strip() or 'auto')
+    setattr(mgr, 'device_request', device_choice)
+    mgr.tr_info["device"] = device_choice
+    if args.verbose and device_choice.lower() != 'auto':
+        print(f"Requested device override: {device_choice}")
 
     # Validation frequency
     if hasattr(args, 'val_every_n') and args.val_every_n is not None:
