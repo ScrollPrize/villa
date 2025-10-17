@@ -372,11 +372,14 @@ class ChunkSlicer:
         volume = self._get_volume(patch.volume_index)
         normalizer = normalizer if normalizer is not None else self.normalizer
 
+        # Extract raw (un-padded) region first so normalization does not include
+        # any zero padding. Then pad/crop to the configured patch size.
         image_patch = self._extract_image_patch(volume.image, patch.position)
         if normalizer is not None:
             image_patch = normalizer.run(image_patch)
         else:
             image_patch = image_patch.astype(np.float32, copy=False)
+        image_patch = self._finalize_image_patch(image_patch, patch.position)
         image_tensor = np.ascontiguousarray(image_patch[np.newaxis, ...], dtype=np.float32)
 
         labels: Dict[str, np.ndarray] = {}
@@ -387,14 +390,13 @@ class ChunkSlicer:
             if label_patch is None:
                 label_patch = np.zeros_like(image_patch, dtype=np.float32)
             else:
-                label_patch = label_patch.astype(np.float32, copy=False)
-                if np.any(np.abs(label_patch) > 0):
+                if is_unlabeled and np.count_nonzero(label_patch):
                     is_unlabeled = False
 
             if label_patch.ndim == image_patch.ndim:
-                label_tensor = np.ascontiguousarray(label_patch[np.newaxis, ...], dtype=np.float32)
+                label_tensor = np.ascontiguousarray(label_patch[np.newaxis, ...])
             elif label_patch.ndim == image_patch.ndim + 1:
-                label_tensor = np.ascontiguousarray(label_patch, dtype=np.float32)
+                label_tensor = np.ascontiguousarray(label_patch)
             else:
                 raise ValueError(
                     f"Label array for target '{target_name}' has unexpected ndim {label_patch.ndim}"
@@ -538,9 +540,10 @@ class ChunkSlicer:
         patch_size = tuple(int(v) for v in self.config.patch_size)
 
         if hasattr(image, 'read_window'):
+            # Defer padding/cropping so normalization can run on the raw region first
             patch = image.read_window(pos, patch_size)
             arr = np.asarray(patch)
-            return self._finalize_image_patch(arr, pos)
+            return arr
 
         arr = np.asarray(image)
         if self._is_2d:
@@ -550,10 +553,10 @@ class ChunkSlicer:
             ph, pw = patch_size[-2:]
             if arr.ndim == 2:
                 patch = arr[y : y + ph, x : x + pw]
-                return pad_or_crop_2d(patch, (ph, pw)).astype(np.float32, copy=False)
+                return patch.astype(np.float32, copy=False)
             if arr.ndim == 3 and arr.shape[0] == 1:
                 patch = arr[0, y : y + ph, x : x + pw]
-                return pad_or_crop_2d(patch, (ph, pw)).astype(np.float32, copy=False)
+                return patch.astype(np.float32, copy=False)
             raise ValueError("2D chunk extraction expects image data with shape (H, W) or (1, H, W)")
 
         if len(pos) != 3:
@@ -563,10 +566,10 @@ class ChunkSlicer:
 
         if arr.ndim == 3:
             patch = arr[z : z + pd, y : y + ph, x : x + pw]
-            return pad_or_crop_3d(patch, (pd, ph, pw)).astype(np.float32, copy=False)
+            return patch.astype(np.float32, copy=False)
         if arr.ndim == 4 and arr.shape[0] == 1:
             patch = arr[0, z : z + pd, y : y + ph, x : x + pw]
-            return pad_or_crop_3d(patch, (pd, ph, pw)).astype(np.float32, copy=False)
+            return patch.astype(np.float32, copy=False)
         raise ValueError("3D chunk extraction expects image data with shape (D, H, W) or (1, D, H, W)")
 
     def _extract_label_patch(
@@ -594,7 +597,7 @@ class ChunkSlicer:
             y, x = pos
             if arr.ndim == 2:
                 patch = arr[y : y + ph, x : x + pw]
-                return pad_or_crop_2d(patch, (ph, pw)).astype(np.float32, copy=False)
+                return pad_or_crop_2d(patch, (ph, pw))
             if arr.ndim == 3:
                 layout = self._infer_label_layout_2d(arr.shape, (y, x))
                 if layout == "channel_first":
@@ -602,7 +605,7 @@ class ChunkSlicer:
                     padded = [
                         pad_or_crop_2d(
                             arr[c, y : y + ph, x : x + pw], (ph, pw)
-                        ).astype(np.float32, copy=False)
+                        )
                         for c in range(channels)
                     ]
                     return np.stack(padded, axis=0)
@@ -611,7 +614,7 @@ class ChunkSlicer:
                     flat = patch.reshape(patch.shape[0], patch.shape[1], -1)
                     flat = np.moveaxis(flat, -1, 0)
                     padded = [
-                        pad_or_crop_2d(flat[c], (ph, pw)).astype(np.float32, copy=False)
+                        pad_or_crop_2d(flat[c], (ph, pw))
                         for c in range(flat.shape[0])
                     ]
                     return np.stack(padded, axis=0)
@@ -631,7 +634,7 @@ class ChunkSlicer:
 
         if arr.ndim == 3:
             patch = arr[z : z + pd, y : y + ph, x : x + pw]
-            return pad_or_crop_3d(patch, (pd, ph, pw)).astype(np.float32, copy=False)
+            return pad_or_crop_3d(patch, (pd, ph, pw))
         if arr.ndim == 4:
             layout = self._infer_label_layout_3d(arr.shape, (z, y, x))
             if layout == "channel_first":
@@ -639,7 +642,7 @@ class ChunkSlicer:
                 padded = [
                     pad_or_crop_3d(
                         arr[c, z : z + pd, y : y + ph, x : x + pw], (pd, ph, pw)
-                    ).astype(np.float32, copy=False)
+                    )
                     for c in range(channels)
                 ]
                 return np.stack(padded, axis=0)
@@ -648,7 +651,7 @@ class ChunkSlicer:
                 flat = patch.reshape(patch.shape[0], patch.shape[1], patch.shape[2], -1)
                 flat = np.moveaxis(flat, -1, 0)
                 padded = [
-                    pad_or_crop_3d(flat[c], (pd, ph, pw)).astype(np.float32, copy=False)
+                    pad_or_crop_3d(flat[c], (pd, ph, pw))
                     for c in range(flat.shape[0])
                 ]
                 return np.stack(padded, axis=0)
@@ -665,7 +668,7 @@ class ChunkSlicer:
             flat = patch.reshape(patch.shape[0], patch.shape[1], patch.shape[2], -1)
             flat = np.moveaxis(flat, -1, 0)
             padded = [
-                pad_or_crop_3d(flat[c], (pd, ph, pw)).astype(np.float32, copy=False)
+                pad_or_crop_3d(flat[c], (pd, ph, pw))
                 for c in range(flat.shape[0])
             ]
             return np.stack(padded, axis=0)
@@ -678,13 +681,13 @@ class ChunkSlicer:
         if self._is_2d:
             ph, pw = self.config.patch_size[-2:]
             if patch.ndim == 2:
-                return pad_or_crop_2d(patch, (ph, pw)).astype(np.float32, copy=False)
+                return pad_or_crop_2d(patch, (ph, pw))
             if patch.ndim == 3 and patch.shape[0] == 1:
-                return pad_or_crop_2d(patch[0], (ph, pw)).astype(np.float32, copy=False)
+                return pad_or_crop_2d(patch[0], (ph, pw))
             if patch.ndim == 3:
                 channels = patch.shape[0]
                 padded = [
-                    pad_or_crop_2d(patch[c], (ph, pw)).astype(np.float32, copy=False)
+                    pad_or_crop_2d(patch[c], (ph, pw))
                     for c in range(channels)
                 ]
                 return np.stack(padded, axis=0)
@@ -692,13 +695,13 @@ class ChunkSlicer:
 
         pd, ph, pw = self.config.patch_size
         if patch.ndim == 3:
-            return pad_or_crop_3d(patch, (pd, ph, pw)).astype(np.float32, copy=False)
+            return pad_or_crop_3d(patch, (pd, ph, pw))
         if patch.ndim == 4 and patch.shape[0] == 1:
-            return pad_or_crop_3d(patch[0], (pd, ph, pw)).astype(np.float32, copy=False)
+            return pad_or_crop_3d(patch[0], (pd, ph, pw))
         if patch.ndim == 4:
             channels = patch.shape[0]
             padded = [
-                pad_or_crop_3d(patch[c], (pd, ph, pw)).astype(np.float32, copy=False)
+                pad_or_crop_3d(patch[c], (pd, ph, pw))
                 for c in range(channels)
             ]
             return np.stack(padded, axis=0)
@@ -708,11 +711,11 @@ class ChunkSlicer:
         if self._is_2d:
             ph, pw = self.config.patch_size[-2:]
             if patch.ndim == 2:
-                return pad_or_crop_2d(patch, (ph, pw)).astype(np.float32, copy=False)
+                return pad_or_crop_2d(patch, (ph, pw))
             if patch.ndim == 3:
                 channels = patch.shape[0]
                 padded = [
-                    pad_or_crop_2d(patch[c], (ph, pw)).astype(np.float32, copy=False)
+                    pad_or_crop_2d(patch[c], (ph, pw))
                     for c in range(channels)
                 ]
                 return np.stack(padded, axis=0)
@@ -720,11 +723,11 @@ class ChunkSlicer:
 
         pd, ph, pw = self.config.patch_size
         if patch.ndim == 3:
-            return pad_or_crop_3d(patch, (pd, ph, pw)).astype(np.float32, copy=False)
+            return pad_or_crop_3d(patch, (pd, ph, pw))
         if patch.ndim == 4:
             channels = patch.shape[0]
             padded = [
-                pad_or_crop_3d(patch[c], (pd, ph, pw)).astype(np.float32, copy=False)
+                pad_or_crop_3d(patch[c], (pd, ph, pw))
                 for c in range(channels)
             ]
             return np.stack(padded, axis=0)
