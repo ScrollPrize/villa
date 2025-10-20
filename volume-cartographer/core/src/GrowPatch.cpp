@@ -1899,8 +1899,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     std::cout << "lets start fringe: " << fringe.size() << std::endl;
 
     while (!fringe.empty()) {
-        // bool global_opt = generation <= 50 && !resume_surf;
-        bool global_opt = true;
+        bool global_opt = generation <= 50 && !resume_surf;
+        // bool global_opt = true;
 
         ALifeTime timer_gen;
         timer_gen.del_msg = "time per generation ";
@@ -2081,7 +2081,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 auto pies = generate_pie_slices(dist_transform);
 
                 DistanceLossSettings loss_edge(gen_mask);
-                // loss_edge.set_steps(NORMAL, {{0.1,1},{0.2,3},{0.5,5},{0.8,7},{1.0,9}});
+                loss_edge.set_steps(NORMAL, {{10.0, 4}});
                 // loss_edge.set_steps(DIST, {{0.1,1},{0.2,3},{0.3,4},{0.5,5},{0.7,6},{0.8,7},{1.0,8}});
                 loss_edge.set_steps(SNAP, {{0.1,8}});
 
