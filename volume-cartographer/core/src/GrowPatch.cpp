@@ -206,12 +206,12 @@ public:
     virtual ~LossSettings() = default;
 
     LossSettings() {
-        w[LossType::SNAP] = 0.01f;
-        w[LossType::NORMAL] = 1.0f;
-        w[LossType::STRAIGHT] = 2.0f;
-        w[LossType::DIST] = 0.5f;
+        w[LossType::SNAP] = 0.1f;
+        w[LossType::NORMAL] = 10.0f;
+        w[LossType::STRAIGHT] = 0.2f;
+        w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 1.0f;
-        w[LossType::SDIR] = 0.00f; // conservative default; tune 0.01–0.10 maybe
+        w[LossType::SDIR] = 0.0f; // conservative default; tune 0.01–0.10 maybe
     }
 
     virtual float operator()(LossType type, const cv::Vec2i& p) const {
@@ -702,13 +702,13 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TracePar
 
         bool direction_aware = false; // this is not that simple ...
         // Loss with p as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, w, ws, direction_aware, settings.z_min, settings.z_max), new ceres::CauchyLoss(w), pA, pB1, pB2, pC);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, w, ws, direction_aware, settings.z_min, settings.z_max), nullptr, pA, pB1, pB2, pC);
         // Loss with p_br as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, w, ws, direction_aware, settings.z_min, settings.z_max), new ceres::CauchyLoss(w), pC, pB2, pB1, pA);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, w, ws, direction_aware, settings.z_min, settings.z_max), nullptr, pC, pB2, pB1, pA);
         // Loss with p_tr as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, w, ws, direction_aware, settings.z_min, settings.z_max), new ceres::CauchyLoss(w), pB1, pC, pA, pB2);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, w, ws, direction_aware, settings.z_min, settings.z_max), nullptr, pB1, pC, pA, pB2);
         // Loss with p_bl as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, w, ws, direction_aware, settings.z_min, settings.z_max), new ceres::CauchyLoss(w), pB2, pA, pC, pB1);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, w, ws, direction_aware, settings.z_min, settings.z_max), nullptr, pB2, pA, pC, pB1);
         count += 4;
     }
 
@@ -2080,17 +2080,17 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
                 auto pies = generate_pie_slices(dist_transform);
 
-                // DistanceLossSettings loss_edge(gen_mask);
+                DistanceLossSettings loss_edge(gen_mask);
                 // loss_edge.set_steps(NORMAL, {{0.1,1},{0.2,3},{0.5,5},{0.8,7},{1.0,9}});
                 // loss_edge.set_steps(DIST, {{0.1,1},{0.2,3},{0.3,4},{0.5,5},{0.7,6},{0.8,7},{1.0,8}});
-                // loss_edge.set_steps(NORMAL, {{0.01,3},{0.02,5},{0.05,7},{0.08,9},{0.1,11}});
+                loss_edge.set_steps(SNAP, {{0.1,8}});
 
                 cv::Mat even_pies_vis = cv::Mat::zeros(size, CV_8UC3);
                 cv::Mat odd_pies_vis = cv::Mat::zeros(size, CV_8UC3);
 
                 #pragma omp parallel for schedule(dynamic)
                 for (size_t i = 0; i < pies.size(); i += 2) {
-                    local_optimization(pies[i].roi, pies[i].mask, trace_params, trace_data, loss_settings);
+                    local_optimization(pies[i].roi, pies[i].mask, trace_params, trace_data, loss_edge);
                     // #pragma omp critical
                     // {
                     //     cv::Mat color_mask;
@@ -2101,7 +2101,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
                 #pragma omp parallel for schedule(dynamic)
                 for (size_t i = 1; i < pies.size(); i += 2) {
-                    local_optimization(pies[i].roi, pies[i].mask, trace_params, trace_data, loss_settings);
+                    local_optimization(pies[i].roi, pies[i].mask, trace_params, trace_data, loss_edge);
                     // #pragma omp critical
                     // {
                     //     cv::Mat color_mask;
@@ -2158,9 +2158,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         }
         else {
             //we do the global opt only every 8 gens, as every add does a small local solve anyweays
-            // if (generation % 8 == 0) {
+            if (generation % 8 == 0) {
                 local_optimization(stop_gen+10, {y0,x0}, trace_params, trace_data, loss_settings, false, true);
-            // }
+            }
         }
 
         cands.resize(0);
