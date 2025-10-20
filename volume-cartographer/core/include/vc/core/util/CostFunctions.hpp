@@ -313,6 +313,25 @@ struct ZCoordLoss {
     
 };
 
+struct PointConstraintLoss {
+    PointConstraintLoss(const cv::Vec3f& p, float w) :  _p(p), _w(w) {};
+    template <typename T>
+    bool operator()(const T* const p, T* residual) const {
+        residual[0] = T(_w)*(p[0] - T(_p[0]));
+        residual[1] = T(_w)*(p[1] - T(_p[1]));
+        residual[2] = T(_w)*(p[2] - T(_p[2]));
+        return true;
+    }
+    
+    cv::Vec3f _p;
+    float _w;
+    
+    static ceres::CostFunction* Create(const cv::Vec3f& p, float w = 1.0)
+    {
+        return new ceres::AutoDiffCostFunction<PointConstraintLoss, 3, 3>(new PointConstraintLoss(p, w));
+    }
+};
+
 template <typename V>
 struct ZLocationLoss {
     ZLocationLoss(const cv::Mat_<V> &m, float z, float w) :  _m(m), _z(z), _w(w) {};

@@ -201,6 +201,8 @@ enum LossType {
 
 class LossSettings {
 public:
+    std::vector<std::pair<cv::Vec3f, cv::Point2i>> constant_points;
+
     virtual ~LossSettings() = default;
 
     LossSettings() {
@@ -1182,6 +1184,12 @@ static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask,
             if (problem_mask(roi.y + y, roi.x + x) && !mask(roi.y + y, roi.x + x) && problem.HasParameterBlock(&params.dpoints.at<cv::Vec3d>(roi.y + y, roi.x + x)[0]))
                 problem.SetParameterBlockConstant(&params.dpoints.at<cv::Vec3d>(roi.y + y, roi.x + x)[0]);
 
+    for (const auto& p_const : settings.constant_points) {
+        if (problem.HasParameterBlock(&params.dpoints(p_const.second)[0])) {
+            problem.AddResidualBlock(PointConstraintLoss::Create(p_const.first, 0.1f), nullptr, &params.dpoints(p_const.second)[0]);
+        }
+    }
+
     // cv::imwrite("problem_mask.tif", problem_mask);
     // cv::imwrite("mask.tif", mask);
 
@@ -1223,6 +1231,12 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
             if (cv::norm(p-op) > radius && problem.HasParameterBlock(&params.dpoints(op)[0]))
                 problem.SetParameterBlockConstant(&params.dpoints(op)[0]);
         }
+
+    for (const auto& p_const : settings.constant_points) {
+        if (problem.HasParameterBlock(&params.dpoints(p_const.second)[0])) {
+            problem.AddResidualBlock(PointConstraintLoss::Create(p_const.first, 0.1f), nullptr, &params.dpoints(p_const.second)[0]);
+        }
+    }
 
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
@@ -1762,6 +1776,10 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         last_elapsed_seconds = f_timer.seconds();
         std::cout << "Resuming from generation " << generation << " with " << fringe.size() << " points. Initial loss count: " << loss_count << std::endl;
 
+        if (x0 != -1 && y0 != -1) {
+            loss_settings.constant_points.push_back({trace_params.dpoints(y0, x0), {y0, x0}});
+        }
+
     } else {
         // Initialise the trace at the center of the available area, as a tiny single-quad patch at the seed point
         used_area = cv::Rect(x0,y0,2,2);
@@ -1787,6 +1805,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         fringe.push_back({y0+1,x0+1});
 
         std::cout << "init loss count " << loss_count << std::endl;
+
+        loss_settings.constant_points.push_back({trace_params.dpoints(y0, x0), {y0, x0}});
     }
 
     int succ_start = succ;
