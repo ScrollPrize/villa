@@ -722,6 +722,9 @@ static float pointTo_(cv::Vec2f &loc, const cv::Mat_<E> &points, const cv::Vec3f
     float min_mul = std::min(0.1*points.cols/scale,0.1*points.rows/scale);
     cv::Vec2f step_large = {min_mul*scale,min_mul*scale};
 
+    assert(points.cols > 3);
+    assert(points.rows > 3);
+
     float dist = search_min_loc(points, loc, _out, tgt, step_small, scale*0.1);
 
     if (dist < th && dist >= 0) {
@@ -737,7 +740,7 @@ static float pointTo_(cv::Vec2f &loc, const cv::Mat_<E> &points, const cv::Vec3f
     int r_full = 0;
     for(int r=0;r<10*max_iters && r_full < max_iters;r++) {
         //FIXME skipn invalid init locs!
-        loc = {1 + (rand() % points.cols-3), 1 + (rand() % points.rows-3)};
+        loc = {1 + (rand() % (points.cols-3)), 1 + (rand() % (points.rows-3))};
 
         if (points(loc[1],loc[0])[0] == -1)
             continue;
