@@ -13,6 +13,7 @@ import sklearn.cluster
 from tqdm import tqdm
 from einops import rearrange
 import matplotlib.pyplot as plt
+from datetime import datetime
 import torch.nn.functional as F
 
 from vesuvius_unet3d import Vesuvius3dUnetModel
@@ -60,7 +61,7 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
     #     attn_resolutions=[16, 8],
     # )
 
-    print('loading checkpoint')
+    print(f'loading checkpoint {checkpoint_path}... ')
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     model.load_state_dict(checkpoint['model'])
     noise_scheduler = diffusers.DDPMScheduler.from_config(checkpoint.get('noise_scheduler', None))
@@ -69,7 +70,7 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
     model = accelerator.prepare(model)
     model.eval()
     
-    print("loading volume zarr")
+    print(f"loading volume zarr {volume_zarr}...")
     ome_zarr = zarr.open_group(volume_zarr, mode='r')
     volume = ome_zarr[str(volume_scale)]
     with open(f'{volume_zarr}/meta.json', 'rt') as meta_fp:
@@ -94,7 +95,7 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
         # TODO: test-time augmentation! as well as flip/rotate also consider very small spatial jitters etc
         return F.sigmoid(logits[:, :steps_per_crop]), min_corner_zyx
 
-    def get_blob_coordinates(heatmap, min_corner_zyx, threshold=0.5, min_size=40):
+    def get_blob_coordinates(heatmap, min_corner_zyx, threshold=0.5, min_size=8):
         # Find up to four blobs of sufficient size; return their centroids in descending order of blob size
         # TODO: strip blobs that are further than K * step_size in euclidean space
         cc_labels = cc3d.connected_components((heatmap > threshold).cpu().numpy(), connectivity=18, binary_image=True)
@@ -112,6 +113,9 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
         # Get hopefully-4 adjacent points; take the one with min or max z-displacement depending on required direction
         heatmaps, min_corner_zyx = get_heatmaps_at(start_zyx, prev_u=None, prev_v=None, prev_diag=None)
         coordinates = get_blob_coordinates(heatmaps[:, 0].amax(dim=0), min_corner_zyx)
+        if len(coordinates) == 0 or coordinates[0].isnan().any():
+            print('no blobs found at step 0')
+            return torch.empty([0, 0, 3])
         save_point_collection('coordinates.json', torch.cat([start_zyx[None], coordinates], dim=0))
         if direction == 'u':  # use maximum delta-z
             best_idx = torch.argmax((coordinates - start_zyx)[:, 0].abs())
@@ -132,6 +136,7 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
             coordinates = get_blob_coordinates(heatmaps[0 if direction == 'u' else 1].squeeze(0), min_corner_zyx)
 
             if len(coordinates) == 0 or coordinates[0].isnan().any():
+                print(f'no blobs found at step {step + 1}')
                 break
 
             # Take the largest (0th) blob centroid as the next point
@@ -223,14 +228,17 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
 
     with torch.inference_mode():
 
-        strip_direction = 'v'
-        start_zyx = torch.tensor(start_xyz).flip(0) / 2 ** volume_scale
-        strip_zyxs = trace_strip(start_zyx, num_steps=50, direction=strip_direction)
-        save_point_collection(f'points_{strip_direction}.json', strip_zyxs)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        patch_zyxs = trace_patch(strip_zyxs, num_steps=50, direction='v' if strip_direction == 'u' else 'u')
-        save_point_collection(f'points_patch.json', patch_zyxs.view(-1, 3))
-        save_tifxyz((patch_zyxs * 2 ** volume_scale).numpy(), f'{out_path}', 'neural-trace-patch', config['step_size'] * 2 ** volume_scale, voxel_size_um, 'neural-tracer')
+        start_zyx = torch.tensor(start_xyz).flip(0) / 2 ** volume_scale
+
+        strip_direction = 'u'
+        strip_zyxs = trace_strip(start_zyx, num_steps=100, direction=strip_direction)
+        save_point_collection(f'points_{strip_direction}_{timestamp}.json', strip_zyxs)
+        patch_zyxs = trace_patch(strip_zyxs, num_steps=100, direction='v' if strip_direction == 'u' else 'u')
+
+        save_point_collection(f'points_patch_{timestamp}.json', patch_zyxs.view(-1, 3))
+        save_tifxyz((patch_zyxs * 2 ** volume_scale).numpy(), f'{out_path}', f'neural-trace-patch_{timestamp}', config['step_size'] * 2 ** volume_scale, voxel_size_um, 'neural-tracer')
         plt.plot(*patch_zyxs.view(-1, 3)[:, [0, 1]].T, 'r.')
         plt.savefig('patch.png')
         plt.close()
