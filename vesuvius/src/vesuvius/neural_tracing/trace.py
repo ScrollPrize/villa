@@ -17,7 +17,6 @@ from datetime import datetime
 import torch.nn.functional as F
 
 from vesuvius_unet3d import Vesuvius3dUnetModel
-from song_unet3d import SongUnet3dModel
 from dataset import get_crop_from_volume, build_localiser, make_heatmaps
 from tifxyz import save_tifxyz
 
@@ -49,17 +48,6 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
 
     # TODO: share this code with train.py!
     model = Vesuvius3dUnetModel(in_channels=5, out_channels=config['step_count'] * 2, config=config)
-    # model = SongUnet3dModel(
-    #     img_resolution=crop_size,
-    #     in_channels=5,
-    #     out_channels=config['step_count'] * 2,
-    #     model_channels=32,
-    #     channel_mult=[1, 2, 4, 8],
-    #     num_blocks=2,  # 4
-    #     encoder_type='residual',
-    #     dropout=0.1,
-    #     attn_resolutions=[16, 8],
-    # )
 
     print(f'loading checkpoint {checkpoint_path}... ')
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
