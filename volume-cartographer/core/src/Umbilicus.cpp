@@ -4,6 +4,7 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <numbers>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -36,7 +37,7 @@ cv::Vec2f SeamDirectionVector(vc::core::util::Umbilicus::SeamDirection direction
     throw std::logic_error("Unhandled seam direction");
 }
 
-constexpr double DegreesPerRadian = 180.0 / std::acos(-1.0);
+constexpr double DegreesPerRadian = 180.0 / std::numbers::pi_v<double>;
 
 } // namespace
 
