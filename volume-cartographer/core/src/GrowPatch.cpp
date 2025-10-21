@@ -1902,7 +1902,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     //just continue on resume no additional global opt	
     if (!resume_surf) {
         local_optimization(8, {y0,x0}, trace_params, trace_data, loss_settings, true);
-    } else if (params.value("inpaint", true)) {
+    } else if (params.value("inpaint", false)) {
         cv::Mat mask = resume_surf->channel("mask");
         cv::Mat_<uchar> hole_mask(trace_params.state.size(), (uchar)0);
         
