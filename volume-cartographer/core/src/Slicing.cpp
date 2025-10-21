@@ -72,6 +72,7 @@ static xt::xarray<T> *readChunk(const z5::Dataset & ds, z5::types::ShapeType chu
 
 int ChunkCache::groupIdx(const std::string &name)
 {
+    std::unique_lock<std::shared_mutex> lock(_mutex);
     if (!_group_store.count(name))
         _group_store[name] = _group_store.size()+1;
     
@@ -80,6 +81,7 @@ int ChunkCache::groupIdx(const std::string &name)
     
 void ChunkCache::put(const cv::Vec4i &idx, xt::xarray<uint8_t> *ar)
 {
+    std::unique_lock<std::shared_mutex> lock(_mutex);
     if (_stored >= _size) {
         using KP = std::pair<cv::Vec4i, uint64_t>;
         std::vector<KP> gen_list(_gen_store.begin(), _gen_store.end());
@@ -204,12 +206,14 @@ void readArea3D(xt::xtensor<uint8_t, 3, xt::layout_type::column_major>& out, con
 
 ChunkCache::~ChunkCache()
 {
+    std::unique_lock<std::shared_mutex> lock(_mutex);
     for(auto &it : _store)
         it.second.reset();
 }
 
 void ChunkCache::reset()
 {
+    std::unique_lock<std::shared_mutex> lock(_mutex);
     _gen_store.clear();
     _group_store.clear();
     _store.clear();
@@ -220,6 +224,7 @@ void ChunkCache::reset()
 
 std::shared_ptr<xt::xarray<uint8_t>> ChunkCache::get(const cv::Vec4i &idx)
 {
+    std::unique_lock<std::shared_mutex> lock(_mutex);
     auto res = _store.find(idx);
     if (res == _store.end())
         return nullptr;
@@ -232,6 +237,7 @@ std::shared_ptr<xt::xarray<uint8_t>> ChunkCache::get(const cv::Vec4i &idx)
 
 bool ChunkCache::has(const cv::Vec4i &idx)
 {
+    std::shared_lock<std::shared_mutex> lock(_mutex);
     return _store.count(idx);
 }
 

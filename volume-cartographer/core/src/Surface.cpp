@@ -15,6 +15,7 @@
 #include <limits>
 #include <cerrno>
 #include <algorithm>
+#include <vector>
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -25,6 +26,42 @@
 
 // Use libtiff for BigTIFF; fall back to OpenCV if not present.
 #include <tiffio.h>
+
+namespace {
+
+void normalizeMaskChannel(cv::Mat& mask)
+{
+    if (mask.empty()) {
+        return;
+    }
+
+    cv::Mat singleChannel;
+    if (mask.channels() == 1) {
+        singleChannel = mask;
+    } else if (mask.channels() == 3) {
+        cv::cvtColor(mask, singleChannel, cv::COLOR_BGR2GRAY);
+    } else if (mask.channels() == 4) {
+        cv::cvtColor(mask, singleChannel, cv::COLOR_BGRA2GRAY);
+    } else {
+        std::vector<cv::Mat> channels;
+        cv::split(mask, channels);
+        if (!channels.empty()) {
+            singleChannel = channels[0];
+        } else {
+            singleChannel = mask;
+        }
+    }
+
+    if (singleChannel.depth() != CV_8U) {
+        cv::Mat converted;
+        singleChannel.convertTo(converted, CV_8U);
+        singleChannel = converted;
+    }
+
+    mask = singleChannel;
+}
+
+} // namespace
 
 void write_overlapping_json(const std::filesystem::path& seg_path, const std::set<std::string>& overlapping_names) {
     nlohmann::json overlap_json;
@@ -412,9 +449,16 @@ cv::Mat QuadSurface::channel(const std::string& name, int flags)
             }
         }
 
+        if (name == "mask") {
+            normalizeMaskChannel(channel);
+        }
+
         if (!channel.empty() && !(flags & SURF_CHANNEL_NORESIZE)) {
             cv::Mat scaled_channel;
             cv::resize(channel, scaled_channel, _points->size(), 0, 0, cv::INTER_NEAREST);
+            if (name == "mask") {
+                normalizeMaskChannel(scaled_channel);
+            }
             return scaled_channel;
         }
         return channel;
