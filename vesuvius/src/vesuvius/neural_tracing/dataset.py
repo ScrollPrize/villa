@@ -820,7 +820,7 @@ def load_datasets(config):
     all_patches = []
     for dataset in config['datasets']:
         volume_path = dataset['volume_path']
-        if True:
+        if False:
             # TODO: how does this interact with multiple dataloader workers? cache is created before fork, hence presumably not shared?
             if "://" in volume_path or "::" in volume_path:
                 store = zarr.storage.FSStore(volume_path, mode='r')
