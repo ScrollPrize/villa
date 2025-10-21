@@ -1,34 +1,54 @@
 {
-  "out_dir": "../out",
-  "wandb_project": "neural-tracing",
-  "seed": 0,
-  "batch_size": 4,
-  "num_workers": 0,
-  "log_frequency": 50,
-  "mixed_precision": "fp16",
-  "learning_rate": 6e-5,
-  "weight_decay": 1e-4,
-  "lr_warmup_steps": 1000,
-  "num_iterations": 100000,
-    "datasets": [
-        {
-            "volume_path": "/mnt/bcache/projects/vesuvius-scrolls/volpkgs/P0343P.volpkg/volumes/4.320um_1.0m_116keV_binmean_2_PHerc0343P.zarr",
-            "volume_scale": 1,
-            "segments_path": "/mnt/bcache/projects/vesuvius-scrolls/neural-tracing/data/PHerc0343P"
-        },
-        {
-            "volume_path": "/mnt/bcache/projects/vesuvius-scrolls/volpkgs/0500P2.volpkg/volumes/111keV_1.2m_scroll-fragment-0500P2.zarr",
-            "volume_scale": 1,
-            "segments_path": "/mnt/bcache/projects/vesuvius-scrolls/neural-tracing/data/PHerc500P2",
-            "segments_scale": 1
-        },
-        {
-            "volume_path": "/home/paul/remote/salina/projects/vesuvius-scrolls/data/zarr/Scroll1_masked.zarr",
-            "volume_scale": 1,
-            "segments_path": "/mnt/bcache/projects/vesuvius-scrolls/neural-tracing/data/PHercParis4/tifxyz"
-        }
-    ],
-    "crop_size": 128,
-    "patch_size": 16,
-    "step_size": 10
-}
+    "out_dir": "../out/2025-10-09",
+    "wandb_project": "neural-tracing",
+    "wandb_entity": "vesuvius-challenge",
+    "seed": 0,
+    "batch_size": 4,
+    "num_workers": 16,
+    "log_frequency": 200,
+    "ckpt_frequency": 5000,
+    "mixed_precision": "fp16",
+    "learning_rate": 1e-4,
+    "weight_decay": 1e-4,
+    "lr_warmup_steps": 1000,
+    "num_iterations": 250000,
+      "datasets": [
+          {
+              "volume_path": "/mnt/sda/paul/vesuvius-scrolls-data/zarr/Scroll1_masked.zarr",
+              "volume_scale": 1,
+              "segments_path": "/home/paul/projects/vesuvius-scrolls/neural-tracing/data/PHercParis4/tifxyz"
+          }
+      ],
+      "augmentation": {
+        "no_spatial": true,
+        "only_spatial_and_intensity": false
+      },
+      "point_perturbation": {
+        "perturb_probability": 0.9,
+        "uv_max_perturbation": 8,
+        "w_max_perturbation": 24,
+        "main_component_distance_factor": 0.4
+      },
+      "representation": "heatmap",
+      "step_size": 8,
+      "step_count": 2,
+      "generative": false,
+      "binary": true,
+      "cfg_uncond_prob": 0.1,
+      "cfg_scale": 1.5,
+      "crop_size": 128,
+      "model_config": {
+        "conv_op": "nn.Conv3d",
+        "norm_op": "nn.InstanceNorm3d",
+        "features_per_stage": [
+          32,
+          64,
+          128,
+          256,
+          320,
+          320
+        ],
+        "squeeze_excitation": true,
+        "time_emb_dim": 128
+      }
+    }
