@@ -12,3 +12,5 @@ docker build $DIR \
 docker build $DIR \
     --progress plain --builder kube --platform linux/amd64,linux/arm64 --target cpu --push \
     --tag 585768151128.dkr.ecr.us-east-1.amazonaws.com/scrollprize/ink-detection:$VERSION-cpu
+
+git tag -a docker/ink-detection/$VERSION -m "Published docker version $VERSION / ${VERSION}-cpu"
