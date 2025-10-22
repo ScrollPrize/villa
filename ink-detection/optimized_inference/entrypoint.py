@@ -474,15 +474,17 @@ def run_inference_step(inputs: Inputs) -> None:
     from inference import run_inference, CFG
     from processing import path_exists
 
+    # Calculate in_chans from layer range
+    CFG.in_chans = inputs.end_layer - inputs.start_layer
+    logger.info(f"Using {CFG.in_chans} input channels (layers [{inputs.start_layer}, {inputs.end_layer}))")
+
     # Import model-specific module based on model_type
     if inputs.model_type == "timesformer":
-        from model_timesformer import load_model, TimeSformerConfig
-        CFG.in_chans = TimeSformerConfig.in_chans
-        logger.info(f"Using TimeSformer model with {CFG.in_chans} input channels")
+        from model_timesformer import load_model
+        logger.info(f"Using TimeSformer model")
     elif inputs.model_type == "resnet3d-50":
-        from model_resnet3d import load_model, ResNet3DConfig
-        CFG.in_chans = ResNet3DConfig.in_chans
-        logger.info(f"Using ResNet3D-50 model with {CFG.in_chans} input channels")
+        from model_resnet3d import load_model
+        logger.info(f"Using ResNet3D-50 model")
     else:
         raise ValueError(f"Unknown model_type: {inputs.model_type}")
 
@@ -545,8 +547,8 @@ def run_inference_step(inputs: Inputs) -> None:
     weight_path = download_model_weights(inputs.model_key, models_dir, s3_client)
     logger.info(f"Loading model from weights at: {weight_path}")
 
-    # Load model
-    model = load_model(weight_path, device)
+    # Load model with dynamic number of frames
+    model = load_model(weight_path, device, num_frames=CFG.in_chans)
 
     # -------- Performance toggles ------------------------------------------------
     # TF32 on Ampere+ gives fast GEMMs with tiny accuracy impact for this task.

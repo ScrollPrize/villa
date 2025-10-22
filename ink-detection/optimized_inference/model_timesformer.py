@@ -9,16 +9,10 @@ from timesformer_pytorch import TimeSformer
 
 logger = logging.getLogger(__name__)
 
-# ----------------------------- Model Config ----------------------------------
-class TimeSformerConfig:
-    """Default configuration for TimeSformer model."""
-    in_chans = 26  # Number of input frames/layers
-    output_scale_factor = 16  # Model outputs 4x4, needs 16x interpolation to 64x64
-
 # ------------------------------- Model ---------------------------------------
 class RegressionPLModel(pl.LightningModule):
     """TimeSformer for ink detection inference."""
-    def __init__(self, pred_shape=(1, 1), size=64, enc='', with_norm=False):
+    def __init__(self, pred_shape=(1, 1), size=64, enc='', with_norm=False, num_frames=26):
         super().__init__()
         self.save_hyperparameters()
 
@@ -26,7 +20,7 @@ class RegressionPLModel(pl.LightningModule):
             dim=512,
             image_size=64,
             patch_size=16,
-            num_frames=TimeSformerConfig.in_chans,   # frames = layers
+            num_frames=num_frames,   # frames = layers (dynamic)
             num_classes=16,            # 4x4 logits
             channels=1,                # single-channel per frame
             depth=8,
@@ -52,7 +46,7 @@ class RegressionPLModel(pl.LightningModule):
 
     def get_output_scale_factor(self) -> int:
         """TimeSformer outputs 4x4 logits, needs 16x scale to reach 64x64 tiles."""
-        return TimeSformerConfig.output_scale_factor
+        return 16  # 4x4 -> 64x64
 
 
 class TimeSformerWrapper:
@@ -76,30 +70,31 @@ class TimeSformerWrapper:
         self.device = device
 
 
-def load_model(model_path: str, device: torch.device) -> TimeSformerWrapper:
+def load_model(model_path: str, device: torch.device, num_frames: int = 26) -> TimeSformerWrapper:
     """
     Load and initialize the TimeSformer model.
 
     Args:
         model_path: Path to model checkpoint
         device: Torch device to load model onto
+        num_frames: Number of input frames/layers
 
     Returns:
         Wrapped model implementing InferenceModel protocol
     """
     try:
-        logger.info(f"Loading TimeSformer model from: {model_path}")
+        logger.info(f"Loading TimeSformer model from: {model_path} with {num_frames} frames")
 
         # Try to load with PyTorch Lightning first
         try:
-            model = RegressionPLModel.load_from_checkpoint(model_path, strict=False)
+            model = RegressionPLModel.load_from_checkpoint(model_path, strict=False, num_frames=num_frames)
             logger.info("Model loaded with PyTorch Lightning")
         except Exception as e:
             logger.warning(f"PyTorch Lightning loading failed: {e}, trying manual loading")
             # Fallback to manual loading
-            model = RegressionPLModel(pred_shape=(1, 1))
+            model = RegressionPLModel(pred_shape=(1, 1), num_frames=num_frames)
             checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
-            model.load_state_dict(checkpoint['state_dict'])
+            model.load_state_dict(checkpoint['state_dict'], strict=False)
             logger.info("Model loaded manually")
 
         # Setup multi-GPU if available
