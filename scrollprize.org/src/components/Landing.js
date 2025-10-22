@@ -1605,10 +1605,6 @@ export function Landing() {
                   <span className="opacity-80 md:opacity-60">
                     to win prizes and make history.
                   </span>
-                  <span className="opacity-80 md:opacity-60">&nbsp;Also:</span>
-                  <span className="opacity-100">
-                    <a href="jobs">&nbsp;we're hiring!</a>
-                  </span>
                 </p>
               </div>
 
