@@ -547,7 +547,26 @@ static inline void renderSliceFromBase(
     out = tmp;
 }
 
-
+// 16-bit variant (uses the uint16_t overload)
+static inline void renderSliceFromBase16(
+    cv::Mat& out,
+    z5::Dataset* ds,
+    ChunkCache* cache,
+    const cv::Mat_<cv::Vec3f>& basePoints,
+    const cv::Mat_<cv::Vec3f>& stepDirs,
+    float off,
+    float ds_scale)
+{
+    cv::Mat_<cv::Vec3f> coords(basePoints.size());
+    for (int yy = 0; yy < coords.rows; ++yy) {
+        for (int xx = 0; xx < coords.cols; ++xx) {
+            const cv::Vec3f& p = basePoints(yy, xx);
+            const cv::Vec3f& d = stepDirs(yy, xx);
+            coords(yy, xx) = p + off * d * static_cast<float>(ds_scale);
+        }
+    }
+    cv::Mat_<uint16_t> tmp; readInterpolated3D(tmp, ds, coords, cache); out = tmp;
+}
 
 int main(int argc, char *argv[])
 {
@@ -735,6 +754,11 @@ int main(int argc, char *argv[])
     std::unique_ptr<z5::Dataset> ds = z5::filesystem::openDataset(ds_handle);
 
     std::cout << "zarr dataset size for scale group " << group_idx << ds->shape() << std::endl;
+    const bool output_is_u16 = (ds->getDtype() == z5::types::Datatype::uint16);
+    if (output_is_u16)
+        std::cout << "Detected source dtype=uint16 -> rendering as uint16" << std::endl;
+    else
+        std::cout << "Detected source dtype!=uint16 -> rendering as uint8 (default)" << std::endl;
     std::cout << "chunk shape shape " << ds->chunking().blockShape() << std::endl;
     std::cout << "output argument: " << base_output_arg << std::endl;
 
@@ -925,7 +949,9 @@ int main(int argc, char *argv[])
             {"clevel",  1},
             {"shuffle", 0}
         };
-        auto dsOut0 = z5::createDataset(outFile, "0", "uint8", shape0, chunks0, std::string("blosc"), compOpts0);
+        const std::string out_dtype0 = output_is_u16 ? "uint16" : "uint8";
+        auto dsOut0 = z5::createDataset(
+            outFile, "0", out_dtype0, shape0, chunks0, std::string("blosc"), compOpts0);
 
         const size_t tilesY_src = (static_cast<size_t>(tgt_size.height) + CH - 1) / CH;
         const size_t tilesX_src = (static_cast<size_t>(tgt_size.width)  + CW - 1) / CW;
@@ -974,44 +1000,78 @@ int main(int argc, char *argv[])
                         globalFlipDecision,
                         basePoints, stepDirs);
 
-                    const bool swapWH = (rotQuad % 2) == 1 && rotQuad >= 0;
+                    const bool swapWH = (rotQuad >= 0) && ((rotQuad % 2) == 1);
                     const size_t dy_dst = swapWH ? dx : dy;
                     const size_t dx_dst = swapWH ? dy : dx;
-                    xt::xarray<uint8_t> outChunk = xt::empty<uint8_t>({dz, dy_dst, dx_dst});
+                    
+                    cv::Mat tileOut; // will be CV_8UC1 or CV_16UC1
 
-                    cv::Mat tileOut; // CV_8UC1
-                    for (size_t zi = 0; zi < dz; ++zi) {
-                        const size_t sliceIndex = z0 + zi;
-                        const float off = static_cast<float>(static_cast<double>(sliceIndex) - 0.5 * (static_cast<double>(baseZ) - 1.0));
-                        renderSliceFromBase(tileOut, ds.get(), &chunk_cache, basePoints, stepDirs, off, static_cast<float>(ds_scale));
-
-                        if (rotQuad >= 0 || flip_axis >= 0) {
-                            rotateFlipIfNeeded(tileOut, rotQuad, flip_axis);
-                        }
-
-                        // Copy into outChunk
-                        const size_t cH = static_cast<size_t>(tileOut.rows);
-                        const size_t cW = static_cast<size_t>(tileOut.cols);
-                        for (size_t yy = 0; yy < cH; ++yy) {
-                            for (size_t xx = 0; xx < cW; ++xx) {
-                                outChunk(zi, yy, xx) = tileOut.at<uint8_t>(static_cast<int>(yy), static_cast<int>(xx));
+                    if (output_is_u16) {
+                        xt::xarray<uint16_t> outChunk =
+                            xt::empty<uint16_t>({dz, dy_dst, dx_dst});
+                        for (size_t zi = 0; zi < dz; ++zi) {
+                            const size_t sliceIndex = z0 + zi;
+                            const float off = static_cast<float>(
+                                static_cast<double>(sliceIndex) - 0.5 * (static_cast<double>(baseZ) - 1.0));
+                            renderSliceFromBase16(tileOut, ds.get(), &chunk_cache,
+                                                  basePoints, stepDirs, off, static_cast<float>(ds_scale));
+                            if (rotQuad >= 0 || flip_axis >= 0) {
+                                rotateFlipIfNeeded(tileOut, rotQuad, flip_axis);
+                            }
+                            const size_t cH = static_cast<size_t>(tileOut.rows);
+                            const size_t cW = static_cast<size_t>(tileOut.cols);
+                            for (size_t yy = 0; yy < cH; ++yy) {
+                                const uint16_t* src = tileOut.ptr<uint16_t>(static_cast<int>(yy));
+                                for (size_t xx = 0; xx < cW; ++xx) {
+                                    outChunk(zi, yy, xx) = src[xx];
+                                }
                             }
                         }
+                        int dstTx = static_cast<int>(tx), dstTy = static_cast<int>(ty);
+                        int dstTilesX = static_cast<int>(tilesX_src), dstTilesY = static_cast<int>(tilesY_src);
+                        if (rotQuad >= 0 || flip_axis >= 0) {
+                            mapTileIndex(static_cast<int>(tx), static_cast<int>(ty),
+                                         static_cast<int>(tilesX_src), static_cast<int>(tilesY_src),
+                                         std::max(rotQuad, 0), flip_axis,
+                                         dstTx, dstTy, dstTilesX, dstTilesY);
+                        }
+                        const size_t x0_dst = static_cast<size_t>(dstTx) * CW;
+                        const size_t y0_dst = static_cast<size_t>(dstTy) * CH;
+                        z5::types::ShapeType outOffset = {z0, y0_dst, x0_dst};
+                        z5::multiarray::writeSubarray<uint16_t>(dsOut0, outChunk, outOffset.begin());
+                    } else {
+                        xt::xarray<uint8_t> outChunk = xt::empty<uint8_t>({dz, dy_dst, dx_dst});
+                        for (size_t zi = 0; zi < dz; ++zi) {
+                            const size_t sliceIndex = z0 + zi;
+                            const float off = static_cast<float>(
+                                static_cast<double>(sliceIndex) - 0.5 * (static_cast<double>(baseZ) - 1.0));
+                            renderSliceFromBase(tileOut, ds.get(), &chunk_cache,
+                                                basePoints, stepDirs, off, static_cast<float>(ds_scale));
+                            if (rotQuad >= 0 || flip_axis >= 0) {
+                                rotateFlipIfNeeded(tileOut, rotQuad, flip_axis);
+                            }
+                            const size_t cH = static_cast<size_t>(tileOut.rows);
+                            const size_t cW = static_cast<size_t>(tileOut.cols);
+                            for (size_t yy = 0; yy < cH; ++yy) {
+                                const uint8_t* src = tileOut.ptr<uint8_t>(static_cast<int>(yy));
+                                for (size_t xx = 0; xx < cW; ++xx) {
+                                    outChunk(zi, yy, xx) = src[xx];
+                                }
+                            }
+                        }
+                        int dstTx = static_cast<int>(tx), dstTy = static_cast<int>(ty);
+                        int dstTilesX = static_cast<int>(tilesX_src), dstTilesY = static_cast<int>(tilesY_src);
+                        if (rotQuad >= 0 || flip_axis >= 0) {
+                            mapTileIndex(static_cast<int>(tx), static_cast<int>(ty),
+                                         static_cast<int>(tilesX_src), static_cast<int>(tilesY_src),
+                                         std::max(rotQuad, 0), flip_axis,
+                                         dstTx, dstTy, dstTilesX, dstTilesY);
+                        }
+                        const size_t x0_dst = static_cast<size_t>(dstTx) * CW;
+                        const size_t y0_dst = static_cast<size_t>(dstTy) * CH;
+                        z5::types::ShapeType outOffset = {z0, y0_dst, x0_dst};
+                        z5::multiarray::writeSubarray<uint8_t>(dsOut0, outChunk, outOffset.begin());
                     }
-
-                    int dstTx = static_cast<int>(tx), dstTy = static_cast<int>(ty);
-                    int dstTilesX = static_cast<int>(tilesX_src), dstTilesY = static_cast<int>(tilesY_src);
-                    if (rotQuad >= 0 || flip_axis >= 0) {
-                        mapTileIndex(static_cast<int>(tx), static_cast<int>(ty),
-                                     static_cast<int>(tilesX_src), static_cast<int>(tilesY_src),
-                                     std::max(rotQuad, 0), flip_axis,
-                                     dstTx, dstTy, dstTilesX, dstTilesY);
-                    }
-                    const size_t x0_dst = static_cast<size_t>(dstTx) * CW;
-                    const size_t y0_dst = static_cast<size_t>(dstTy) * CH;
-
-                    z5::types::ShapeType outOffset = {z0, y0_dst, x0_dst};
-                    z5::multiarray::writeSubarray<uint8_t>(dsOut0, outChunk, outOffset.begin());
 
                     size_t done = ++tilesDone;
                     int pct = static_cast<int>(100.0 * double(done) / double(totalTiles));
@@ -1044,7 +1104,10 @@ int main(int argc, char *argv[])
                 {"clevel",  1},
                 {"shuffle", 0}
             };
-            auto dst = z5::createDataset(outFile, std::to_string(targetLevel), "uint8", dShape, dChunks, std::string("blosc"), compOpts);
+            auto dst = z5::createDataset(
+                outFile, std::to_string(targetLevel),
+                output_is_u16 ? "uint16" : "uint8",
+                dShape, dChunks, std::string("blosc"), compOpts);
 
             const size_t tileZ = dShape[0], tileY = CH, tileX = CW;
             const size_t tilesY = (dShape[1] + tileY - 1) / tileY;
@@ -1064,31 +1127,45 @@ int main(int argc, char *argv[])
                         const size_t sy = std::min<size_t>(2*ly, sShape[1] - y*2);
                         const size_t sx = std::min<size_t>(2*lx, sShape[2] - x*2);
 
-                        xt::xarray<uint8_t> srcChunk = xt::empty<uint8_t>({sz, sy, sx});
-                        {
+                        if (output_is_u16) {
+                            xt::xarray<uint16_t> srcChunk = xt::empty<uint16_t>({sz, sy, sx});
+                            z5::types::ShapeType sOff = {static_cast<size_t>(2*z), static_cast<size_t>(2*y), static_cast<size_t>(2*x)};
+                            z5::multiarray::readSubarray<uint16_t>(src, srcChunk, sOff.begin());
+                            xt::xarray<uint16_t> dstChunk = xt::empty<uint16_t>({lz, ly, lx});
+                            for (size_t zz = 0; zz < lz; ++zz)
+                                for (size_t yy = 0; yy < ly; ++yy)
+                                    for (size_t xx = 0; xx < lx; ++xx) {
+                                        uint32_t sum = 0; int cnt = 0;
+                                        for (int dz2 = 0; dz2 < 2 && (2*zz + dz2) < sz; ++dz2)
+                                            for (int dy2 = 0; dy2 < 2 && (2*yy + dy2) < sy; ++dy2)
+                                                for (int dx2 = 0; dx2 < 2 && (2*xx + dx2) < sx; ++dx2) {
+                                                    sum += srcChunk(2*zz + dz2, 2*yy + dy2, 2*xx + dx2);
+                                                    cnt += 1;
+                                                }
+                                        dstChunk(zz, yy, xx) = static_cast<uint16_t>((sum + (cnt/2)) / std::max(1, cnt));
+                                    }
+                            z5::types::ShapeType dOff = {z, static_cast<size_t>(y), static_cast<size_t>(x)};
+                            z5::multiarray::writeSubarray<uint16_t>(dst, dstChunk, dOff.begin());
+                        } else {
+                            xt::xarray<uint8_t> srcChunk = xt::empty<uint8_t>({sz, sy, sx});
                             z5::types::ShapeType sOff = {static_cast<size_t>(2*z), static_cast<size_t>(2*y), static_cast<size_t>(2*x)};
                             z5::multiarray::readSubarray<uint8_t>(src, srcChunk, sOff.begin());
-                        }
-
-                        xt::xarray<uint8_t> dstChunk = xt::empty<uint8_t>({lz, ly, lx});
-                        for (size_t zz = 0; zz < lz; ++zz) {
-                            for (size_t yy = 0; yy < ly; ++yy) {
-                                for (size_t xx = 0; xx < lx; ++xx) {
-                                    int sum = 0;
-                                    int cnt = 0;
-                                    for (int dz2 = 0; dz2 < 2 && (2*zz + dz2) < sz; ++dz2)
-                                        for (int dy2 = 0; dy2 < 2 && (2*yy + dy2) < sy; ++dy2)
-                                            for (int dx2 = 0; dx2 < 2 && (2*xx + dx2) < sx; ++dx2) {
-                                                sum += srcChunk(2*zz + dz2, 2*yy + dy2, 2*xx + dx2);
-                                                cnt += 1;
-                                            }
-                                    dstChunk(zz, yy, xx) = static_cast<uint8_t>((sum + (cnt/2)) / std::max(1, cnt));
-                                }
-                            }
-                        }
-
-                        z5::types::ShapeType dOff = {z, static_cast<size_t>(y), static_cast<size_t>(x)};
-                        z5::multiarray::writeSubarray<uint8_t>(dst, dstChunk, dOff.begin());
+                            xt::xarray<uint8_t> dstChunk = xt::empty<uint8_t>({lz, ly, lx});
+                            for (size_t zz = 0; zz < lz; ++zz)
+                                for (size_t yy = 0; yy < ly; ++yy)
+                                    for (size_t xx = 0; xx < lx; ++xx) {
+                                        int sum = 0; int cnt = 0;
+                                        for (int dz2 = 0; dz2 < 2 && (2*zz + dz2) < sz; ++dz2)
+                                            for (int dy2 = 0; dy2 < 2 && (2*yy + dy2) < sy; ++dy2)
+                                                for (int dx2 = 0; dx2 < 2 && (2*xx + dx2) < sx; ++dx2) {
+                                                    sum += srcChunk(2*zz + dz2, 2*yy + dy2, 2*xx + dx2);
+                                                    cnt += 1;
+                                                }
+                                        dstChunk(zz, yy, xx) = static_cast<uint8_t>((sum + (cnt/2)) / std::max(1, cnt));
+                                    }
+                            z5::types::ShapeType dOff = {z, static_cast<size_t>(y), static_cast<size_t>(x)};
+                            z5::multiarray::writeSubarray<uint8_t>(dst, dstChunk, dOff.begin());
+                        }                        
 
                         size_t done = ++tilesDone;
                         int pct = static_cast<int>(100.0 * double(done) / double(totalTiles));
@@ -1197,7 +1274,7 @@ int main(int argc, char *argv[])
                     TIFFSetField(tf, TIFFTAG_IMAGEWIDTH, outW);
                     TIFFSetField(tf, TIFFTAG_IMAGELENGTH, outH);
                     TIFFSetField(tf, TIFFTAG_SAMPLESPERPIXEL, 1);
-                    TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE, 8);
+                    TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE, output_is_u16 ? 16 : 8);
                     TIFFSetField(tf, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
                     TIFFSetField(tf, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
                     TIFFSetField(tf, TIFFTAG_COMPRESSION, COMPRESSION_LZW);
@@ -1216,41 +1293,62 @@ int main(int argc, char *argv[])
                         const uint32_t dx = std::min<uint32_t>(tileW, static_cast<uint32_t>(X) - x0_src);
                         const uint32_t dy = std::min<uint32_t>(tileH, static_cast<uint32_t>(Y) - y0_src);
 
-                        xt::xarray<uint8_t> tile = xt::empty<uint8_t>({Z, static_cast<size_t>(dy), static_cast<size_t>(dx)});
-                        {
+                        if (output_is_u16) {
+                            xt::xarray<uint16_t> tile = xt::empty<uint16_t>({Z, static_cast<size_t>(dy), static_cast<size_t>(dx)});
+                            z5::types::ShapeType off = {0, static_cast<size_t>(y0_src), static_cast<size_t>(x0_src)};
+                            z5::multiarray::readSubarray<uint16_t>(dsL0, tile, off.begin());
+                            std::vector<uint16_t> tileBuf(tileW * tileH, 0);
+                            for (size_t z = 0; z < Z; ++z) {
+                                cv::Mat srcTile(static_cast<int>(dy), static_cast<int>(dx), CV_16UC1);
+                                for (uint32_t yy = 0; yy < dy; ++yy) {
+                                    uint16_t* dst = srcTile.ptr<uint16_t>(static_cast<int>(yy));
+                                    for (uint32_t xx = 0; xx < dx; ++xx) dst[xx] = tile(z, yy, xx);
+                                }
+                                cv::Mat& dstTile = srcTile;
+                                const uint32_t x0_dst = static_cast<uint32_t>(tx) * tileW;
+                                const uint32_t y0_dst = static_cast<uint32_t>(ty) * tileH;
+                                const uint32_t ddy = static_cast<uint32_t>(dstTile.rows);
+                                const uint32_t ddx = static_cast<uint32_t>(dstTile.cols);
+                                std::fill(tileBuf.begin(), tileBuf.end(), 0);
+                                for (uint32_t yy = 0; yy < ddy; ++yy) {
+                                    const uint16_t* src = dstTile.ptr<uint16_t>(static_cast<int>(yy));
+                                    std::memcpy(tileBuf.data() + yy * tileW, src, ddx * sizeof(uint16_t));
+                                }
+                                {
+                                    std::lock_guard<std::mutex> guard(tiffLocks[z]);
+                                    TIFF* tf = tiffs[z];
+                                    const uint32_t tileIndex = TIFFComputeTile(tf, x0_dst, y0_dst, 0, 0);
+                                    TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(),
+                                                         static_cast<tmsize_t>(tileBuf.size() * sizeof(uint16_t)));
+                                }
+                            }
+                        } else {
+                            xt::xarray<uint8_t> tile = xt::empty<uint8_t>({Z, static_cast<size_t>(dy), static_cast<size_t>(dx)});
                             z5::types::ShapeType off = {0, static_cast<size_t>(y0_src), static_cast<size_t>(x0_src)};
                             z5::multiarray::readSubarray<uint8_t>(dsL0, tile, off.begin());
-                        }
-
-                        std::vector<uint8_t> tileBuf(tileW * tileH, 0);
-                        for (size_t z = 0; z < Z; ++z) {
-                            cv::Mat srcTile(static_cast<int>(dy), static_cast<int>(dx), CV_8UC1);
-                            for (uint32_t yy = 0; yy < dy; ++yy) {
-                                uint8_t* dst = srcTile.ptr<uint8_t>(static_cast<int>(yy));
-                                for (uint32_t xx = 0; xx < dx; ++xx) dst[xx] = tile(z, yy, xx);
-                            }
-                            // No additional rotate/flip here; L0 is final orientation
-                            cv::Mat& dstTile = srcTile;
-                            const uint32_t x0_dst = static_cast<uint32_t>(tx) * tileW;
-                            const uint32_t y0_dst = static_cast<uint32_t>(ty) * tileH;
-
-                            const uint32_t ddy = static_cast<uint32_t>(dstTile.rows);
-                            const uint32_t ddx = static_cast<uint32_t>(dstTile.cols);
-                            // Fill pad buffer
-                            std::fill(tileBuf.begin(), tileBuf.end(), 0);
-                            for (uint32_t yy = 0; yy < ddy; ++yy) {
-                                const uint8_t* src = dstTile.ptr<uint8_t>(static_cast<int>(yy));
-                                std::memcpy(tileBuf.data() + yy * tileW, src, ddx);
-                            }
-
-                            // Write tile to the corresponding TIFF (per-slice lock)
-                            {
-                                std::lock_guard<std::mutex> guard(tiffLocks[z]);
-                                TIFF* tf = tiffs[z];
-                                const uint32_t tileIndex = TIFFComputeTile(tf, x0_dst, y0_dst, 0, 0);
-                                (void)tileIndex;
-                                if (TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(), static_cast<tmsize_t>(tileBuf.size())) < 0) {
-                                    // ignore individual tile write errors for now
+                            std::vector<uint8_t> tileBuf(tileW * tileH, 0);
+                            for (size_t z = 0; z < Z; ++z) {
+                                cv::Mat srcTile(static_cast<int>(dy), static_cast<int>(dx), CV_8UC1);
+                                for (uint32_t yy = 0; yy < dy; ++yy) {
+                                    uint8_t* dst = srcTile.ptr<uint8_t>(static_cast<int>(yy));
+                                    for (uint32_t xx = 0; xx < dx; ++xx) dst[xx] = tile(z, yy, xx);
+                                }
+                                cv::Mat& dstTile = srcTile;
+                                const uint32_t x0_dst = static_cast<uint32_t>(tx) * tileW;
+                                const uint32_t y0_dst = static_cast<uint32_t>(ty) * tileH;
+                                const uint32_t ddy = static_cast<uint32_t>(dstTile.rows);
+                                const uint32_t ddx = static_cast<uint32_t>(dstTile.cols);
+                                std::fill(tileBuf.begin(), tileBuf.end(), 0);
+                                for (uint32_t yy = 0; yy < ddy; ++yy) {
+                                    const uint8_t* src = dstTile.ptr<uint8_t>(static_cast<int>(yy));
+                                    std::memcpy(tileBuf.data() + yy * tileW, src, ddx);
+                                }
+                                {
+                                    std::lock_guard<std::mutex> guard(tiffLocks[z]);
+                                    TIFF* tf = tiffs[z];
+                                    const uint32_t tileIndex = TIFFComputeTile(tf, x0_dst, y0_dst, 0, 0);
+                                    TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(),
+                                                         static_cast<tmsize_t>(tileBuf.size()));
                                 }
                             }
                         }
@@ -1332,7 +1430,7 @@ int main(int argc, char *argv[])
                     TIFFSetField(tf, TIFFTAG_IMAGEWIDTH, static_cast<uint32_t>(outW));
                     TIFFSetField(tf, TIFFTAG_IMAGELENGTH, static_cast<uint32_t>(outH));
                     TIFFSetField(tf, TIFFTAG_SAMPLESPERPIXEL, 1);
-                    TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE, 8);
+                    TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE, output_is_u16 ? 16 : 8);
                     TIFFSetField(tf, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
                     TIFFSetField(tf, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
                     TIFFSetField(tf, TIFFTAG_COMPRESSION, COMPRESSION_LZW);
@@ -1386,36 +1484,69 @@ int main(int argc, char *argv[])
                             globalFlipDecision,
                             basePoints, stepDirs);
 
-                        std::vector<uint8_t> tileBuf(tileW * tileH, 0);
-                        cv::Mat_<uint8_t> tileOut;
-                        for (int zi = 0; zi < num_slices; ++zi) {
-                            const float off = static_cast<float>(static_cast<double>(zi) - 0.5 * (static_cast<double>(num_slices) - 1.0));
-                            renderSliceFromBase(tileOut, ds.get(), &chunk_cache, basePoints, stepDirs, off, static_cast<float>(ds_scale));
-
-                            cv::Mat tileTransformed = tileOut;
-                            rotateFlipIfNeeded(tileTransformed, rotQuad, flip_axis);
-
-                            const uint32_t dty = static_cast<uint32_t>(tileTransformed.rows);
-                            const uint32_t dtx = static_cast<uint32_t>(tileTransformed.cols);
-                            std::fill(tileBuf.begin(), tileBuf.end(), 0);
-                            for (uint32_t yy = 0; yy < dty; ++yy) {
-                                const uint8_t* src = tileTransformed.ptr<uint8_t>(static_cast<int>(yy));
-                                std::memcpy(tileBuf.data() + yy * tileW, src, dtx);
+                        if (output_is_u16) {
+                            std::vector<uint16_t> tileBuf(tileW * tileH, 0);
+                            cv::Mat tileOut; // CV_16UC1
+                            for (int zi = 0; zi < num_slices; ++zi) {
+                                const float off = static_cast<float>(
+                                    static_cast<double>(zi) - 0.5 * (static_cast<double>(num_slices) - 1.0));
+                                renderSliceFromBase16(tileOut, ds.get(), &chunk_cache,
+                                                      basePoints, stepDirs, off, static_cast<float>(ds_scale));
+                                cv::Mat tileTransformed = tileOut;
+                                rotateFlipIfNeeded(tileTransformed, rotQuad, flip_axis);
+                                const uint32_t dty = static_cast<uint32_t>(tileTransformed.rows);
+                                const uint32_t dtx = static_cast<uint32_t>(tileTransformed.cols);
+                                std::fill(tileBuf.begin(), tileBuf.end(), 0);
+                                for (uint32_t yy = 0; yy < dty; ++yy) {
+                                    const uint16_t* src = tileTransformed.ptr<uint16_t>(static_cast<int>(yy));
+                                    std::memcpy(tileBuf.data() + yy * tileW, src, dtx * sizeof(uint16_t));
+                                }
+                                int dstTx, dstTy, rTilesX, rTilesY;
+                                mapTileIndex(static_cast<int>(tx), static_cast<int>(ty),
+                                             static_cast<int>(tilesX_src), static_cast<int>(tilesY_src),
+                                             std::max(rotQuad, 0), flip_axis,
+                                             dstTx, dstTy, rTilesX, rTilesY);
+                                const uint32_t x0_dst = static_cast<uint32_t>(dstTx) * tileW;
+                                const uint32_t y0_dst = static_cast<uint32_t>(dstTy) * tileH;
+                                {
+                                    std::lock_guard<std::mutex> guard(tiffLocks[static_cast<size_t>(zi)]);
+                                    TIFF* tf = tiffs[static_cast<size_t>(zi)];
+                                    const uint32_t tileIndex = TIFFComputeTile(tf, x0_dst, y0_dst, 0, 0);
+                                    TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(),
+                                                         static_cast<tmsize_t>(tileBuf.size() * sizeof(uint16_t)));
+                                }
                             }
-
-                            int dstTx, dstTy, rTilesX, rTilesY;
-                            mapTileIndex(static_cast<int>(tx), static_cast<int>(ty),
-                                         static_cast<int>(tilesX_src), static_cast<int>(tilesY_src),
-                                         std::max(rotQuad, 0), flip_axis,
-                                         dstTx, dstTy, rTilesX, rTilesY);
-                            const uint32_t x0_dst = static_cast<uint32_t>(dstTx) * tileW;
-                            const uint32_t y0_dst = static_cast<uint32_t>(dstTy) * tileH;
-
-                            {
-                                std::lock_guard<std::mutex> guard(tiffLocks[static_cast<size_t>(zi)]);
-                                TIFF* tf = tiffs[static_cast<size_t>(zi)];
-                                const uint32_t tileIndex = TIFFComputeTile(tf, x0_dst, y0_dst, 0, 0);
-                                TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(), static_cast<tmsize_t>(tileBuf.size()));
+                        } else {
+                            std::vector<uint8_t> tileBuf(tileW * tileH, 0);
+                            cv::Mat tileOut; // CV_8UC1
+                            for (int zi = 0; zi < num_slices; ++zi) {
+                                const float off = static_cast<float>(
+                                    static_cast<double>(zi) - 0.5 * (static_cast<double>(num_slices) - 1.0));
+                                renderSliceFromBase(tileOut, ds.get(), &chunk_cache,
+                                                    basePoints, stepDirs, off, static_cast<float>(ds_scale));
+                                cv::Mat tileTransformed = tileOut;
+                                rotateFlipIfNeeded(tileTransformed, rotQuad, flip_axis);
+                                const uint32_t dty = static_cast<uint32_t>(tileTransformed.rows);
+                                const uint32_t dtx = static_cast<uint32_t>(tileTransformed.cols);
+                                std::fill(tileBuf.begin(), tileBuf.end(), 0);
+                                for (uint32_t yy = 0; yy < dty; ++yy) {
+                                    const uint8_t* src = tileTransformed.ptr<uint8_t>(static_cast<int>(yy));
+                                    std::memcpy(tileBuf.data() + yy * tileW, src, dtx);
+                                }
+                                int dstTx, dstTy, rTilesX, rTilesY;
+                                mapTileIndex(static_cast<int>(tx), static_cast<int>(ty),
+                                             static_cast<int>(tilesX_src), static_cast<int>(tilesY_src),
+                                             std::max(rotQuad, 0), flip_axis,
+                                             dstTx, dstTy, rTilesX, rTilesY);
+                                const uint32_t x0_dst = static_cast<uint32_t>(dstTx) * tileW;
+                                const uint32_t y0_dst = static_cast<uint32_t>(dstTy) * tileH;
+                                {
+                                    std::lock_guard<std::mutex> guard(tiffLocks[static_cast<size_t>(zi)]);
+                                    TIFF* tf = tiffs[static_cast<size_t>(zi)];
+                                    const uint32_t tileIndex = TIFFComputeTile(tf, x0_dst, y0_dst, 0, 0);
+                                    TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(),
+                                                         static_cast<tmsize_t>(tileBuf.size()));
+                                }
                             }
                         }
 
