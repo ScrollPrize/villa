@@ -685,6 +685,11 @@ const team = {
       href: "https://www.linkedin.com/in/dr-hendrik-schilling-a2019418a",
     },
     {
+      name: "Paul Henderson",
+      title: "Computer Vision & AI Expert, PhD",
+      href: "https://www.pmh47.net/",
+    },
+    {
       name: "Elian Rafael Dal Prá",
       title: "ML Intern & Annotation Specialist",
       href: "https://twitter.com/elianrafaeldp",
