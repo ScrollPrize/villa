@@ -74,7 +74,7 @@ class RegressionPLModel(pl.LightningModule):
                 logger.warning(f"Could not load pretrained weights for ResNet101: {e}")
 
         else:  # Default: resnet50
-            self.backbone = generate_model(model_depth=50, n_input_channels=1, forward_features=True, n_classes=700)
+            self.backbone = generate_model(model_depth=50, n_input_channels=1, forward_features=True, n_classes=1039)
             try:
                 state_dict = torch.load('./r3d50_K_200ep.pth', weights_only=False)["state_dict"]
                 conv1_weight = state_dict['conv1.weight']
@@ -148,6 +148,7 @@ def load_model(model_path: str, device: torch.device, encoder: str = 'resnet50')
         model_path: Path to model checkpoint
         device: Torch device to load model onto
         encoder: Encoder type ('resnet34', 'resnet50', 'resnet101')
+                 MUST match the encoder used during training
 
     Returns:
         Wrapped model implementing InferenceModel protocol
@@ -164,7 +165,7 @@ def load_model(model_path: str, device: torch.device, encoder: str = 'resnet50')
             # Fallback to manual loading
             model = RegressionPLModel(pred_shape=(1, 1), enc=encoder)
             checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
-            model.load_state_dict(checkpoint['state_dict'])
+            model.load_state_dict(checkpoint['state_dict'], strict=False)
             logger.info("Model loaded manually")
 
         # Setup multi-GPU if available
