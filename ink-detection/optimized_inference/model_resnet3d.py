@@ -1,5 +1,5 @@
 """
-ResNet3D model for ink detection inference.
+ResNet3D-50 model for ink detection inference.
 """
 import logging
 import torch
@@ -44,45 +44,13 @@ class Decoder(nn.Module):
 
 # ------------------------------- Model ---------------------------------------
 class RegressionPLModel(pl.LightningModule):
-    """ResNet3D for ink detection inference."""
-    def __init__(self, pred_shape=(1, 1), size=64, enc='resnet50', with_norm=False):
+    """ResNet3D-50 for ink detection inference."""
+    def __init__(self, pred_shape=(1, 1), size=64, enc='resnet3d-50', with_norm=False):
         super().__init__()
         self.save_hyperparameters()
 
-        # Select backbone based on encoder type
-        if self.hparams.enc == 'resnet34':
-            self.backbone = generate_model(model_depth=34, n_input_channels=1, forward_features=True, n_classes=700)
-            # Try to load pretrained weights if available
-            try:
-                state_dict = torch.load('./r3d34_K_200ep.pth', weights_only=False)["state_dict"]
-                conv1_weight = state_dict['conv1.weight']
-                state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
-                self.backbone.load_state_dict(state_dict, strict=False)
-                logger.info("Loaded pretrained weights for ResNet34")
-            except Exception as e:
-                logger.warning(f"Could not load pretrained weights for ResNet34: {e}")
-
-        elif self.hparams.enc == 'resnet101':
-            self.backbone = generate_model(model_depth=101, n_input_channels=1, forward_features=True, n_classes=1039)
-            try:
-                state_dict = torch.load('./r3d101_KM_200ep.pth', weights_only=False)["state_dict"]
-                conv1_weight = state_dict['conv1.weight']
-                state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
-                self.backbone.load_state_dict(state_dict, strict=False)
-                logger.info("Loaded pretrained weights for ResNet101")
-            except Exception as e:
-                logger.warning(f"Could not load pretrained weights for ResNet101: {e}")
-
-        else:  # Default: resnet50
-            self.backbone = generate_model(model_depth=50, n_input_channels=1, forward_features=True, n_classes=1039)
-            try:
-                state_dict = torch.load('./r3d50_K_200ep.pth', weights_only=False)["state_dict"]
-                conv1_weight = state_dict['conv1.weight']
-                state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
-                self.backbone.load_state_dict(state_dict, strict=False)
-                logger.info("Loaded pretrained weights for ResNet50")
-            except Exception as e:
-                logger.warning(f"Could not load pretrained weights for ResNet50: {e}")
+        # ResNet50 backbone
+        self.backbone = generate_model(model_depth=50, n_input_channels=1, forward_features=True, n_classes=1039)
 
         # Initialize decoder based on backbone output dimensions
         # Get encoder dims by doing a forward pass with dummy input
@@ -140,30 +108,28 @@ class ResNet3DWrapper:
         self.device = device
 
 
-def load_model(model_path: str, device: torch.device, encoder: str = 'resnet50') -> ResNet3DWrapper:
+def load_model(model_path: str, device: torch.device) -> ResNet3DWrapper:
     """
-    Load and initialize the ResNet3D model.
+    Load and initialize the ResNet3D-50 model.
 
     Args:
         model_path: Path to model checkpoint
         device: Torch device to load model onto
-        encoder: Encoder type ('resnet34', 'resnet50', 'resnet101')
-                 MUST match the encoder used during training
 
     Returns:
         Wrapped model implementing InferenceModel protocol
     """
     try:
-        logger.info(f"Loading ResNet3D model from: {model_path} with encoder: {encoder}")
+        logger.info(f"Loading ResNet3D-50 model from: {model_path}")
 
         # Try to load with PyTorch Lightning first
         try:
-            model = RegressionPLModel.load_from_checkpoint(model_path, strict=False, enc=encoder)
+            model = RegressionPLModel.load_from_checkpoint(model_path, strict=False)
             logger.info("Model loaded with PyTorch Lightning")
         except Exception as e:
             logger.warning(f"PyTorch Lightning loading failed: {e}, trying manual loading")
             # Fallback to manual loading
-            model = RegressionPLModel(pred_shape=(1, 1), enc=encoder)
+            model = RegressionPLModel(pred_shape=(1, 1))
             checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
             model.load_state_dict(checkpoint['state_dict'], strict=False)
             logger.info("Model loaded manually")

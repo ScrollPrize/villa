@@ -52,8 +52,7 @@ class Inputs:
     surface_volume_zarr: str = ""  # Path to pre-created surface volume zarr
     chunk_size: int = 1024  # Chunk size for zarr array creation (SURFACE_VOLUME_CHUNK_SIZE)
     use_zarr_compression: bool = False  # Enable/disable zarr compression
-    model_type: str = "timesformer"  # "timesformer" or "resnet3d"
-    encoder: str = "resnet50"  # For resnet3d: "resnet34", "resnet50", "resnet101"
+    model_type: str = "timesformer"  # "timesformer" or "resnet3d-50"
 
 def parse_env() -> Inputs:
     try:
@@ -73,13 +72,12 @@ def parse_env() -> Inputs:
         chunk_size = int(os.getenv("SURFACE_VOLUME_CHUNK_SIZE", "1024"))
         use_zarr_compression = os.getenv("USE_ZARR_COMPRESSION", "false").lower() == "true"
 
-        # Model type and encoder parameters
+        # Model type parameter
         model_type = os.getenv("MODEL_TYPE", "timesformer").strip().lower()
-        encoder = os.getenv("ENCODER", "resnet50").strip().lower()
 
         # Validate model_type
-        if model_type not in ("timesformer", "resnet3d"):
-            raise ValueError(f"MODEL_TYPE must be 'timesformer' or 'resnet3d', got '{model_type}'")
+        if model_type not in ("timesformer", "resnet3d-50"):
+            raise ValueError(f"MODEL_TYPE must be 'timesformer' or 'resnet3d-50', got '{model_type}'")
 
         # Validate step parameter
         if step not in ("prepare", "inference", "reduce"):
@@ -128,7 +126,6 @@ def parse_env() -> Inputs:
             chunk_size=chunk_size,
             use_zarr_compression=use_zarr_compression,
             model_type=model_type,
-            encoder=encoder,
         )
     except KeyError as e:
         raise RuntimeError(f"Missing required env var: {e.args[0]}") from e
@@ -482,10 +479,10 @@ def run_inference_step(inputs: Inputs) -> None:
         from model_timesformer import load_model, TimeSformerConfig
         CFG.in_chans = TimeSformerConfig.in_chans
         logger.info(f"Using TimeSformer model with {CFG.in_chans} input channels")
-    elif inputs.model_type == "resnet3d":
+    elif inputs.model_type == "resnet3d-50":
         from model_resnet3d import load_model, ResNet3DConfig
         CFG.in_chans = ResNet3DConfig.in_chans
-        logger.info(f"Using ResNet3D model ({inputs.encoder}) with {CFG.in_chans} input channels")
+        logger.info(f"Using ResNet3D-50 model with {CFG.in_chans} input channels")
     else:
         raise ValueError(f"Unknown model_type: {inputs.model_type}")
 
@@ -548,11 +545,8 @@ def run_inference_step(inputs: Inputs) -> None:
     weight_path = download_model_weights(inputs.model_key, models_dir, s3_client)
     logger.info(f"Loading model from weights at: {weight_path}")
 
-    # Load model with appropriate parameters
-    if inputs.model_type == "resnet3d":
-        model = load_model(weight_path, device, encoder=inputs.encoder)
-    else:
-        model = load_model(weight_path, device)
+    # Load model
+    model = load_model(weight_path, device)
 
     # -------- Performance toggles ------------------------------------------------
     # TF32 on Ampere+ gives fast GEMMs with tiny accuracy impact for this task.
