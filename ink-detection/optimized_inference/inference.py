@@ -1,34 +1,28 @@
 """
-Optimized inference module for ink detection using TimeSformer model.
-Production-ready, memory-friendly inference for processing scroll layers.
+Common inference infrastructure for ink detection models.
+Supports both TimeSformer and ResNet3D architectures.
 
 Key features:
-- No full HxWxC tensor in RAM (stream tiles from disk or accept a legacy numpy array)
-- Correct TimeSformer framing (frames=C, channels=1)
-- Smooth overlap-add with a Hann window (no dotted grid)
-- Efficient dataloader settings and safe zero-padding at image borders
+- Memory-efficient streaming from zarr or numpy arrays
+- Sliding window inference with overlap-add blending
+- Partitioned inference for distributed processing
+- Model-agnostic pipeline
 """
 import os
-os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")  # safety in case imported directly
+os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")
 import gc
-import uuid
-import logging
-import shutil
 import math
-from typing import List, Tuple, Optional, Union, Dict
+import logging
+from typing import List, Tuple, Optional, Union, Dict, Protocol
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-import pytorch_lightning as pl
-from timesformer_pytorch import TimeSformer
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from tqdm.auto import tqdm
-import tifffile as tiff
-import cv2
 import zarr
 
 from k8s import get_tqdm_kwargs
@@ -66,37 +60,58 @@ def _grid_1d(L: int, tile: int, stride: int) -> List[int]:
         xs.append(end)
     return xs
 
+# ----------------------------- Model Protocol --------------------------------
+class InferenceModel(Protocol):
+    """Protocol that model wrappers must implement."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run inference on input tensor."""
+        ...
+
+    def get_output_scale_factor(self) -> int:
+        """Get the scale factor for interpolating model output to tile size."""
+        ...
+
+    def eval(self):
+        """Set model to evaluation mode."""
+        ...
+
+    def to(self, device: torch.device):
+        """Move model to device."""
+        ...
+
 # ----------------------------- Config ----------------------------------------
 class InferenceConfig:
     # Model configuration
-    in_chans = 26  # frames
-    encoder_depth = 5
+    model_type: str = "timesformer"  # "timesformer" or "resnet3d"
+    in_chans: int = 26  # Will be overridden by model-specific defaults
+    encoder_depth: int = 5
 
     # Inference configuration
-    size = 64       # net input size (post-resize, normally equals tile_size)
-    tile_size = 64
-    stride = 16
-    batch_size = 256  # Increased for better GPU utilization
-    workers = min(8, os.cpu_count() or 4)  # More workers to feed GPU faster
-    prefetch_factor = 4  # More prefetching per worker
+    size: int = 64       # net input size (post-resize, normally equals tile_size)
+    tile_size: int = 64
+    stride: int = 16
+    batch_size: int = 256
+    workers: int = min(8, os.cpu_count() or 4)
+    prefetch_factor: int = 4
 
     # Image processing / scaling
-    max_clip_value = 200
+    max_clip_value: int = 200
 
     # Blending
-    use_hann_window = True
-    gaussian_sigma = 0.0  # if using Gaussian: 0 -> auto (~ tile/2.5)
+    use_hann_window: bool = True
+    gaussian_sigma: float = 0.0  # if using Gaussian: 0 -> auto (~ tile/2.5)
 
     # Tile selection
-    min_valid_ratio = 0.0  # keep tiles with >= this fraction of nonzero mask
+    min_valid_ratio: float = 0.0
 
     # Partitioning for map/reduce inference
-    num_parts = 1  # Total number of partitions (1 = no partitioning)
-    part_id = 0    # Current partition ID (0-indexed)
-    zarr_output_dir = os.environ.get("ZARR_OUTPUT_DIR", "/tmp/partitions")
+    num_parts: int = 1
+    part_id: int = 0
+    zarr_output_dir: str = os.environ.get("ZARR_OUTPUT_DIR", "/tmp/partitions")
 
     # Compression settings
-    use_zarr_compression = True  # Enable/disable zarr compression (LZ4)
+    use_zarr_compression: bool = True
 
 CFG = InferenceConfig()
 
@@ -142,6 +157,7 @@ class LayersSource:
             if len(raw_shape) != 3:
                 raise ValueError(f"Expected 3D zarr, got shape {raw_shape}")
 
+            # we support depth dimension both as first or last axis
             min_dim_idx = raw_shape.index(min(raw_shape))
             if min_dim_idx == 0:
                 self._needs_transpose = True
@@ -328,7 +344,7 @@ def create_inference_dataloader(
             persistent_workers=(CFG.workers > 0),
             prefetch_factor=CFG.prefetch_factor if CFG.workers > 0 else None,
             drop_last=False,
-            multiprocessing_context='spawn' if CFG.workers > 0 else None,  # Use spawn for S3/async compatibility
+            multiprocessing_context='spawn' if CFG.workers > 0 else None,
         )
         logger.info(f"Created dataloader with {len(dataset)} tiles")
         return loader, (h, w), partition_info
@@ -337,45 +353,10 @@ def create_inference_dataloader(
         logger.error(f"Error creating dataloader: {e}")
         raise
 
-# ------------------------------- Model ---------------------------------------
-class RegressionPLModel(pl.LightningModule):
-    """TimeSformer for ink detection inference."""
-    def __init__(self, pred_shape=(1, 1), size=64, enc='', with_norm=False):
-        super().__init__()
-        self.save_hyperparameters()
-
-        self.backbone = TimeSformer(
-            dim=512,
-            image_size=64,
-            patch_size=16,
-            num_frames=CFG.in_chans,   # frames = layers
-            num_classes=16,            # 4x4 logits
-            channels=1,                # single-channel per frame
-            depth=8,
-            heads=6,
-            dim_head=64,
-            attn_dropout=0.1,
-            ff_dropout=0.1,
-        )
-
-        if self.hparams.with_norm:
-            self.normalization = nn.BatchNorm3d(num_features=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Input from dataset: (B,1,C,H,W). TimeSformer lib expects (B,frames,channels,H,W).
-        if x.ndim == 4:
-            x = x[:, None]
-        if self.hparams.with_norm:
-            x = self.normalization(x)
-        x = torch.permute(x, (0, 2, 1, 3, 4))  # -> (B,C,1,H,W)
-        x = self.backbone(x)
-        x = x.view(-1, 1, 4, 4)                # (B,1,4,4)
-        return x
-
 # ----------------------------- Inference -------------------------------------
 def predict_fn(
     test_loader: DataLoader,
-    model: RegressionPLModel,
+    model: InferenceModel,
     device: torch.device,
     pred_shape: Tuple[int, int]
 ) -> Union[np.ndarray, Dict[str, str]]:
@@ -397,7 +378,6 @@ def predict_fn(
         model.eval()
 
         with torch.inference_mode():
-            # total tiles = len(dataset); progress bar advances by batch size
             try:
                 total_tiles = len(test_loader.dataset)
             except Exception:
@@ -412,9 +392,12 @@ def predict_fn(
 
                 amp_device = "cuda" if device.type == "cuda" else "cpu"
                 with torch.autocast(device_type=amp_device, enabled=True):
-                    y_preds = model(images)  # (B,1,4,4)
+                    y_preds = model.forward(images)  # Model-specific forward
 
                 y_preds = torch.sigmoid(y_preds)
+
+                # Get scale factor from model
+                scale_factor = model.get_output_scale_factor()
                 y_preds_resized = F.interpolate(
                     y_preds.float(),
                     size=(CFG.tile_size, CFG.tile_size),
@@ -442,7 +425,6 @@ def predict_fn(
                     x1, y1, x2, y2 = [int(v) for v in xys[i]]
                     mask_pred[y1:y2, x1:x2] += y_cpu[i]
                     mask_count[y1:y2, x1:x2] += w_cpu
-                # advance by the number of tiles in this batch
                 pbar.update(images.size(0))
             pbar.close()
 
@@ -457,27 +439,29 @@ def predict_fn(
             mask_pred_path = os.path.join(CFG.zarr_output_dir, f"mask_pred_part_{CFG.part_id:03d}.zarr")
             mask_count_path = os.path.join(CFG.zarr_output_dir, f"mask_count_part_{CFG.part_id:03d}.zarr")
 
-            # Create and write mask_pred zarr with LZ4 compression
+            compressor = LZ4(acceleration=1) if CFG.use_zarr_compression else None
+
+            # Create and write mask_pred zarr
             mask_pred_z = zarr.open(
                 mask_pred_path,
                 mode='w',
                 shape=(H, W),
                 chunks=(1024, 1024),
                 dtype=np.float32,
-                compressor=LZ4(acceleration=1),
+                compressor=compressor,
                 zarr_format=2,
                 config={'write_empty_chunks': False}
             )
             mask_pred_z[:] = mask_pred
 
-            # Create and write mask_count zarr with LZ4 compression
+            # Create and write mask_count zarr
             mask_count_z = zarr.open(
                 mask_count_path,
                 mode='w',
                 shape=(H, W),
                 chunks=(1024, 1024),
                 dtype=np.float32,
-                compressor=LZ4(acceleration=1),
+                compressor=compressor,
                 zarr_format=2,
                 config={'write_empty_chunks': False}
             )
@@ -500,52 +484,9 @@ def predict_fn(
         raise
 
 
-def load_model(model_path: str, device: torch.device) -> RegressionPLModel:
-    """
-    Load and initialize the TimeSformer model.
-
-    Args:
-        model_path: Path to model checkpoint
-        device: Torch device to load model onto
-
-    Returns:
-        Loaded and initialized model
-    """
-    try:
-        logger.info(f"Loading model from: {model_path}")
-
-        # Try to load with PyTorch Lightning first
-        try:
-            model = RegressionPLModel.load_from_checkpoint(model_path, strict=False)
-            logger.info("Model loaded with PyTorch Lightning")
-        except Exception as e:
-            logger.warning(f"PyTorch Lightning loading failed: {e}, trying manual loading")
-            # Fallback to manual loading
-            model = RegressionPLModel(pred_shape=(1, 1))
-            checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
-            model.load_state_dict(checkpoint['state_dict'])
-            logger.info("Model loaded manually")
-
-        # Setup multi-GPU if available
-        if torch.cuda.device_count() > 1:
-            model = nn.DataParallel(model)
-            logger.info(f"Model wrapped with DataParallel for {torch.cuda.device_count()} GPUs")
-
-        # Move to device
-        model.to(device)
-        model.eval()
-
-        logger.info(f"Model loaded successfully on {device}")
-        return model
-
-    except Exception as e:
-        logger.error(f"Failed to load model: {e}")
-        raise
-
-
 def run_inference(
     layers: Union[np.ndarray, str],
-    model: RegressionPLModel,
+    model: InferenceModel,
     device: torch.device,
     fragment_mask: Optional[np.ndarray] = None,
     is_reverse_segment: bool = False,
@@ -557,7 +498,7 @@ def run_inference(
 
     Args:
         layers: Either numpy array (H, W, C) or path to zarr array
-        model: The inference model
+        model: The inference model (must implement InferenceModel protocol)
         device: Torch device
         fragment_mask: Optional mask array (H, W)
         is_reverse_segment: Whether to reverse layer order
