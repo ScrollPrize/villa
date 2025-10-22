@@ -1040,12 +1040,13 @@ const StoryBackground = ({ story, index }) => (
     id={`story-image-${index}`}
     aria-hidden="true"
     style={{
-      background: `url(${story.background})`,
+      backgroundImage: "none",
       backgroundSize: "60%",
       backgroundPosition: "center right",
       backgroundRepeat: "no-repeat",
       opacity: 0,
     }}
+    data-bg={story.background}
   />
 );
 
@@ -1122,7 +1123,7 @@ const Prize = ({ prize }) => (
         {(!prize.winners || prize.bannerImage) && !prize.tba && (
           <div className="pt-2">
             <AnimatedArrow
-              text={prizes.winners ? "Read the announcement" : "Learn more"}
+              text={prize.winners ? "Read the announcement" : "Learn more"}
             />
           </div>
         )}
@@ -1235,7 +1236,7 @@ const Sponsor = ({ sponsor }) => {
       href={sponsor.href}
       className={`text-white hover:text-white hover:no-underline`}
       target="_blank"
-      rel="noopener noreferrer"
+      rel="nofollow sponsored noopener noreferrer"
     >
       <div
         className={`${padding} ${radius} flex items-center gap-2 bg-[#131114bf] border border-solid h-full border-[#FFFFFF40] hover:bg-[#292525d6] transition-color ease-in-out duration-300`}
@@ -1532,6 +1533,23 @@ export function Landing() {
   useBrokenLinks().collectAnchor("educelab-funders");
   useBrokenLinks().collectAnchor("our-story");
 
+  // JSON-LD (Organization + WebSite)
+  const siteUrl = (siteConfig?.url ?? "") + (siteConfig?.baseUrl ?? "/");
+  const orgJsonLd = {
+    "@context": "https://schema.org",
+    "@type": "Organization",
+    "name": "Vesuvius Challenge",
+    "url": siteUrl,
+    "logo": siteUrl + "img/social/opengraph.jpg",
+    "sameAs": ["https://twitter.com/scrollprize","https://github.com/ScrollPrize"],
+  };
+  const webSiteJsonLd = {
+    "@context": "https://schema.org",
+    "@type": "WebSite",
+    "name": "Vesuvius Challenge",
+    "url": siteUrl
+  };
+
   const heroVideo = useRef(null);
   const unrollVideo = useRef(null);
   // const mlVideo = useRef(null);
@@ -1565,7 +1583,19 @@ export function Landing() {
   }, []);
 
   useEffect(() => {
-    autoPlay(heroVideo);
+    // Defer hero video source until idle (improves LCP)
+    const v = heroVideo.current;
+    const srcEl = v?.querySelector("source[data-src]");
+    const enableVideo = () => {
+      if (!v || !srcEl || srcEl.src) return;
+      srcEl.src = srcEl.dataset.src;
+      v.load();
+      autoPlay(heroVideo);
+    };
+    if (typeof window !== "undefined") {
+      if ("requestIdleCallback" in window) window.requestIdleCallback(enableVideo, { timeout: 1200 });
+      else setTimeout(enableVideo, 600);
+    }
     autoPlay(unrollVideo);
     // autoPlay(mlVideo);
     // autoPlay(xrayVideo);
@@ -1573,6 +1603,33 @@ export function Landing() {
 
   return (
     <>
+      <Head>
+        <title>Vesuvius Challenge</title>
+        <meta
+          name="description"
+          content="A $1,500,000+ machine learning and computer vision competition"
+        />
+        <link rel="canonical" href={canonicalUrl} />
+        {/* Preload the LCP poster image */}
+        <link rel="preload" as="image" href="/img/landing/vesuvius.webp" fetchpriority="high" />
+        {/* OpenGraph/Twitter */}
+        <meta property="og:type" content="website" />
+        <meta property="og:url" content={siteUrl} />
+        <meta property="og:title" content="Vesuvius Challenge" />
+        <meta property="og:description" content="A $1,500,000+ machine learning and computer vision competition" />
+        <meta property="og:image" content={siteUrl + "img/social/opengraph.jpg"} />
+        <meta property="og:image:width" content="1200" />
+        <meta property="og:image:height" content="630" />
+        <meta name="twitter:card" content="summary_large_image" />
+        <meta name="twitter:title" content="Vesuvius Challenge" />
+        <meta name="twitter:description" content="A $1,500,000+ machine learning and computer vision competition" />
+        <meta name="twitter:image" content={siteUrl + "img/social/opengraph.jpg"} />
+        {/* JSON-LD */}
+        <script type="application/ld+json"
+          dangerouslySetInnerHTML={{ __html: JSON.stringify(orgJsonLd) }} />
+        <script type="application/ld+json"
+          dangerouslySetInnerHTML={{ __html: JSON.stringify(webSiteJsonLd) }} />
+      </Head>
       <div className="absolute inset-0 z-0 md:block hidden">
         {stories({ unrollVideo }).map((s, index) => (
           <StoryBackground story={s} key={s.date} index={index} />
@@ -1789,10 +1846,7 @@ export function Landing() {
                 className="w-full h-full object-cover object-[45%]"
                 ref={heroVideo}
               >
-                <source
-                  src="img/landing/vesuvius-flipped-min.webm"
-                  type="video/webm"
-                />
+                <source data-src="img/landing/vesuvius-flipped-min.webm" type="video/webm" />
               </video>
             </div>
           </section>
