@@ -1,14 +1,20 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef } from "react";
 import useBrokenLinks from "@docusaurus/useBrokenLinks";
+import Head from "@docusaurus/Head";
+import Heading from "@theme/Heading";
+import useDocusaurusContext from "@docusaurus/useDocusaurusContext";
 import BeforeAfter from "./BeforeAfter";
 import LatestPosts from "./LatestPosts";
 
-const inlineImage = (src) => (
-  <div
-    className="md:mb-8 mb-4 rounded-lg md:h-80 h-full md:w-auto w-full aspect-[4/3] sepia-[.4] inline-block mr-4"
-    style={{ backgroundImage: `url(${src})`, backgroundSize: "cover" }}
-  />
-);
+const inlineImage = (src, alt = "") => (
+    <img
+      src={src}
+      alt={alt}
+      loading="lazy"
+      decoding="async"
+      className="md:mb-8 mb-4 rounded-lg md:h-80 h-full md:w-auto w-full aspect-[4/3] sepia-[.4] inline-block mr-4 object-cover"
+    />
+  );
 
 const stories = ({ unrollVideo, mlVideo, xrayVideo }) => [
   {
@@ -28,7 +34,10 @@ const stories = ({ unrollVideo, mlVideo, xrayVideo }) => [
           text exposed to the air decays and disappears, the library of the
           Villa of the Papyri waits underground, intact.
         </div>
-        {inlineImage("/img/landing/rocio-espin-pinar-villa-papyri-small.webp")}
+        {inlineImage(
+          "/img/landing/rocio-espin-pinar-villa-papyri-small.webp",
+          "Villa of the Papyri illustration"
+        )}
       </>
     ),
     background: "/img/landing/story1.webp",
@@ -52,8 +61,8 @@ const stories = ({ unrollVideo, mlVideo, xrayVideo }) => [
           they are found to contain philosophical texts written in Greek. More
           than six hundred remain unopened and unreadable.
         </div>
-        {inlineImage("/img/landing/scroll.webp")}
-        {inlineImage("/img/landing/herc-materials.webp")}
+        {inlineImage("/img/landing/scroll.webp", "Carbonized Herculaneum scroll")}
+        {inlineImage("/img/landing/herc-materials.webp", "Herculaneum excavation materials")}
       </>
     ),
     background: "/img/landing/story2.webp",
@@ -80,13 +89,16 @@ const stories = ({ unrollVideo, mlVideo, xrayVideo }) => [
           playsInline
           loop
           muted
+          preload="metadata"
+          title="Virtual unwrapping of the En-Gedi scroll"
+          aria-label="Virtual unwrapping of the En-Gedi scroll"
           className="md:mb-8 mb-4 rounded-lg md:h-80 h-full md:w-auto w-full aspect-[4/3] sepia-[.8] inline-block mr-4 object-cover"
           poster="/img/landing/engedi5.webp"
           ref={unrollVideo}
         >
           <source src="/img/landing/engedi5.webm" type="video/webm" />
         </video>
-        {inlineImage("/img/landing/brent1.webp")}
+        {inlineImage("/img/landing/brent1.webp", "Dr. Brent Seales and team")}
       </>
     ),
     background: "/img/landing/story3.webp",
@@ -104,13 +116,16 @@ const stories = ({ unrollVideo, mlVideo, xrayVideo }) => [
         </div>
         <div className="max-w-3xl mb-8">
           Following a year of remarkable progress,{" "}
-          <a href="grandprize">the prize was claimed</a>. After 275 years, the
+          <a href="/grandprize">the prize was claimed</a>. After 275 years, the
           ancient puzzle of the Herculaneum Papyri has been cracked open. But
           the quest to uncover the secrets of the scrolls is just beginning.
         </div>
         <div className="flex overflow-hidden rounded-lg md:mb-8 mb-4 h-96 relative bg-black">
           <img
             src="/img/landing/scroll-full-min.webp"
+            alt="Herculaneum scroll panorama"
+            loading="lazy"
+            decoding="async"
             className="pan-horizontal max-w-none"
           />
         </div>
@@ -987,13 +1002,15 @@ const Story = ({ story, index }) => (
           "linear-gradient(360deg, rgba(28, 26, 29, 0) 59.11%, #1C1A1D 99.36%)",
       }),
     }}
+    aria-labelledby={story.anchor ? story.anchor : undefined}
   >
     <div className="container mx-auto z-30 relative">
       <div className="py-10 max-w-4xl">
-        <h1
+      <Heading
+          as="h2"
           className="text-3xl md:text-6xl font-black mb-2 leading-none tracking-tighter"
           id={story.anchor}
-        >
+      >
           <span
             style={{
               background:
@@ -1008,7 +1025,7 @@ const Story = ({ story, index }) => (
           </span>
           <br />
           {story.text}
-        </h1>
+        </Heading>
         <div className="md:text-xl text-lg font-medium mb-8 text-[rgba(255,255,255,0.7)] leading-6 tracking-tight whitespace-pre-line">
           {story.description}
         </div>
@@ -1021,13 +1038,15 @@ const StoryBackground = ({ story, index }) => (
   <div
     className="fixed inset-0 z-0"
     id={`story-image-${index}`}
+    aria-hidden="true"
     style={{
-      background: `url(${story.background})`,
+      backgroundImage: "none",
       backgroundSize: "60%",
       backgroundPosition: "center right",
       backgroundRepeat: "no-repeat",
       opacity: 0,
     }}
+    data-bg={story.background}
   />
 );
 
@@ -1038,6 +1057,9 @@ const Winners = ({ winners, large }) => (
         <div className="-ml-3" style={{ zIndex: 100 - i }}>
           <img
             src={winner.image}
+            alt={winner.name}
+            loading="lazy"
+            decoding="async"
             className={`${large ? "h-10" : "h-8"} rounded-full border-2 ${
               large ? "border-[#272222]" : "border-[#1C1A1D]"
             } border-solid`}
@@ -1101,7 +1123,7 @@ const Prize = ({ prize }) => (
         {(!prize.winners || prize.bannerImage) && !prize.tba && (
           <div className="pt-2">
             <AnimatedArrow
-              text={prizes.winners ? "Read the announcement" : "Learn more"}
+              text={prize.winners ? "Read the announcement" : "Learn more"}
             />
           </div>
         )}
@@ -1140,6 +1162,9 @@ const Prize = ({ prize }) => (
           </div>
           <img
             src={prize.bannerImage}
+            alt={`${prize.title} banner`}
+            loading="lazy"
+            decoding="async"
             className={`block max-h-16 ${
               prize.href === "/firstletters"
                 ? "object-contain object-right -mt-6"
@@ -1160,6 +1185,9 @@ const Creator = ({ creator }) => (
     <div className="flex items-center gap-3 rounded-2xl bg-[#131114bf] border border-solid h-full md:p-6 p-4 border-[#FFFFFF40] hover:bg-[#292525d6] transition-color ease-in-out duration-300">
       <img
         src={creator.image}
+        alt={creator.name}
+        loading="lazy"
+        decoding="async"
         className="md:w-20 md:h-20 w-12 h-12 rounded-full saturate-0"
       />
       <h2 className="text-2xl md:text-4xl font-black !mb-0 !leading-[90%] tracking-tighter !my-0">
@@ -1208,6 +1236,7 @@ const Sponsor = ({ sponsor }) => {
       href={sponsor.href}
       className={`text-white hover:text-white hover:no-underline`}
       target="_blank"
+      rel="nofollow sponsored noopener noreferrer"
     >
       <div
         className={`${padding} ${radius} flex items-center gap-2 bg-[#131114bf] border border-solid h-full border-[#FFFFFF40] hover:bg-[#292525d6] transition-color ease-in-out duration-300`}
@@ -1220,6 +1249,9 @@ const Sponsor = ({ sponsor }) => {
               <img
                 key={i}
                 src={img}
+                alt={sponsor.name}
+                loading="lazy"
+                decoding="async"
                 className={`${image} ${
                   i === 1 ? "-ml-3" : ""
                 } rounded-full saturate-0 border-2 border-solid border-[#272222]`}
@@ -1230,6 +1262,9 @@ const Sponsor = ({ sponsor }) => {
         ) : (
           <img
             src={sponsor.image}
+            alt={sponsor.name}
+            loading="lazy"
+            decoding="async"
             className={`${image} rounded-full saturate-0`}
           />
         )}
@@ -1491,22 +1526,29 @@ const BuildingBlock = ({ title, description, showDividerMobile = true, showDivid
   </div>
 );
 
-const App = () => {
-  const tabData = [{ label: "Tab 1" }, { label: "Tab 2" }, { label: "Tab 3" }];
-
-  return (
-    <div className="App">
-      <h1 className="geeks">GeeksforGeeks</h1>
-      <h1>React Tabs Example</h1>
-      <Tabs tabs={tabData} />
-    </div>
-  );
-};
-
 export function Landing() {
+  const { siteConfig } = useDocusaurusContext();
+  const canonicalUrl = `${siteConfig?.url ?? ""}${siteConfig?.baseUrl ?? "/"}`;
   useBrokenLinks().collectAnchor("sponsors");
   useBrokenLinks().collectAnchor("educelab-funders");
   useBrokenLinks().collectAnchor("our-story");
+
+  // JSON-LD (Organization + WebSite)
+  const siteUrl = (siteConfig?.url ?? "") + (siteConfig?.baseUrl ?? "/");
+  const orgJsonLd = {
+    "@context": "https://schema.org",
+    "@type": "Organization",
+    "name": "Vesuvius Challenge",
+    "url": siteUrl,
+    "logo": siteUrl + "img/social/opengraph.jpg",
+    "sameAs": ["https://twitter.com/scrollprize","https://github.com/ScrollPrize"],
+  };
+  const webSiteJsonLd = {
+    "@context": "https://schema.org",
+    "@type": "WebSite",
+    "name": "Vesuvius Challenge",
+    "url": siteUrl
+  };
 
   const heroVideo = useRef(null);
   const unrollVideo = useRef(null);
@@ -1541,7 +1583,19 @@ export function Landing() {
   }, []);
 
   useEffect(() => {
-    autoPlay(heroVideo);
+    // Defer hero video source until idle (improves LCP)
+    const v = heroVideo.current;
+    const srcEl = v?.querySelector("source[data-src]");
+    const enableVideo = () => {
+      if (!v || !srcEl || srcEl.src) return;
+      srcEl.src = srcEl.dataset.src;
+      v.load();
+      autoPlay(heroVideo);
+    };
+    if (typeof window !== "undefined") {
+      if ("requestIdleCallback" in window) window.requestIdleCallback(enableVideo, { timeout: 1200 });
+      else setTimeout(enableVideo, 600);
+    }
     autoPlay(unrollVideo);
     // autoPlay(mlVideo);
     // autoPlay(xrayVideo);
@@ -1549,6 +1603,33 @@ export function Landing() {
 
   return (
     <>
+      <Head>
+        <title>Vesuvius Challenge</title>
+        <meta
+          name="description"
+          content="A $1,500,000+ machine learning and computer vision competition"
+        />
+        <link rel="canonical" href={canonicalUrl} />
+        {/* Preload the LCP poster image */}
+        <link rel="preload" as="image" href="/img/landing/vesuvius.webp" fetchpriority="high" />
+        {/* OpenGraph/Twitter */}
+        <meta property="og:type" content="website" />
+        <meta property="og:url" content={siteUrl} />
+        <meta property="og:title" content="Vesuvius Challenge" />
+        <meta property="og:description" content="A $1,500,000+ machine learning and computer vision competition" />
+        <meta property="og:image" content={siteUrl + "img/social/opengraph.jpg"} />
+        <meta property="og:image:width" content="1200" />
+        <meta property="og:image:height" content="630" />
+        <meta name="twitter:card" content="summary_large_image" />
+        <meta name="twitter:title" content="Vesuvius Challenge" />
+        <meta name="twitter:description" content="A $1,500,000+ machine learning and computer vision competition" />
+        <meta name="twitter:image" content={siteUrl + "img/social/opengraph.jpg"} />
+        {/* JSON-LD */}
+        <script type="application/ld+json"
+          dangerouslySetInnerHTML={{ __html: JSON.stringify(orgJsonLd) }} />
+        <script type="application/ld+json"
+          dangerouslySetInnerHTML={{ __html: JSON.stringify(webSiteJsonLd) }} />
+      </Head>
       <div className="absolute inset-0 z-0 md:block hidden">
         {stories({ unrollVideo }).map((s, index) => (
           <StoryBackground story={s} key={s.date} index={index} />
@@ -1560,7 +1641,11 @@ export function Landing() {
           <section>
             <div className="container mx-auto z-20 relative mb-12">
               <div className="md:pt-20 pt-8 mb-4">
-                <h1 className="text-4xl md:text-7xl font-black !mb-4 tracking-tighter mix-blend-exclusion !leading-[90%] transition-opacity">
+                <Heading
+                  as="h1"
+                  id="home-hero-title"
+                  className="text-4xl md:text-7xl font-black !mb-4 tracking-tighter mix-blend-exclusion !leading-[90%] transition-opacity"
+                >
                   <div className="max-w-3xl">
                     Resurrect an ancient library from the ashes of a volcano.
                   </div>
@@ -1581,14 +1666,14 @@ export function Landing() {
                       Make History.&nbsp;
                     </span>
                   </span>
-                </h1>
+                </Heading>
                 <p className="max-w-lg md:text-xl text-lg font-medium mb-8 !leading-[110%] tracking-tight">
                   <span className="opacity-80 md:opacity-60">
                     Vesuvius Challenge is a machine learning, computer vision,
                     and geometry competition that is{" "}
                   </span>
                   <span className="opacity-100">
-                    <a href="grandprize">reading</a>&nbsp;
+                    <a href="/grandprize">reading</a>&nbsp;
                   </span>
                   <span className="opacity-80 md:opacity-60">
                     the carbonized Herculaneum scrolls & has awarded $1,500,000 in prizes.
@@ -1604,10 +1689,6 @@ export function Landing() {
                   </span>
                   <span className="opacity-80 md:opacity-60">
                     to win prizes and make history.
-                  </span>
-                  <span className="opacity-80 md:opacity-60">&nbsp;Also:</span>
-                  <span className="opacity-100">
-                    <a href="jobs">&nbsp;we're hiring!</a>
                   </span>
                 </p>
               </div>
@@ -1703,9 +1784,9 @@ export function Landing() {
                     "0px 2.767px 2.214px 0px rgba(0, 0, 0, 0.09), 0px 6.65px 5.32px 0px rgba(0, 0, 0, 0.13), 0px 12.522px 10.017px 0px rgba(0, 0, 0, 0.16), 0px 22.336px 17.869px 0px rgba(0, 0, 0, 0.19), 0px 41.778px 33.422px 0px rgba(0, 0, 0, 0.23), 0px 100px 80px 0px rgba(0, 0, 0, 0.32)",
                 }}
               >
-                <h3 className="text-2xl text-white pt-2 pb-3 text-center">
+                <Heading as="h2" className="text-2xl text-white pt-2 pb-3 text-center">
                   What We're Building Towards
-                </h3>
+                </Heading>
 
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4 md:gap-5 px-6 pb-3">
                   <BuildingBlock
@@ -1736,11 +1817,13 @@ export function Landing() {
               </div>
 
               <div className="pt-8 mb-4">
-                <p className="max-w-lg md:text-xl text-lg font-medium mb-8 !leading-[110%] tracking-tight">
-                  <span id="our-story" className=" opacity-80 md:opacity-60">
-                    Our story ↓
-                  </span>
-                </p>
+                <Heading
+                  as="h2"
+                  id="our-story"
+                  className="text-3xl md:text-5xl font-black !mb-2 leading-none tracking-tighter"
+                >
+                  Our story ↓
+                </Heading>
               </div>
             </div>
             <div
@@ -1756,14 +1839,14 @@ export function Landing() {
                 playsInline
                 loop
                 muted
+                preload="metadata"
+                title="Vesuvius volcano hero background"
+                aria-label="Vesuvius volcano hero background"
                 poster="/img/landing/vesuvius.webp"
                 className="w-full h-full object-cover object-[45%]"
                 ref={heroVideo}
               >
-                <source
-                  src="img/landing/vesuvius-flipped-min.webm"
-                  type="video/webm"
-                />
+                <source data-src="img/landing/vesuvius-flipped-min.webm" type="video/webm" />
               </video>
             </div>
           </section>
@@ -1772,10 +1855,10 @@ export function Landing() {
             <Story story={s} key={s.date} index={index} />
           ))}
           {/* Prize */}
-          <section className="mb-24 md:mb-36">
+          <section className="mb-24 md:mb-36" aria-labelledby="prizes-heading">
             <div className="container mx-auto z-30 relative">
               <div className="flex flex-col py-8 md:py-16 ">
-                <h1 className="text-3xl md:text-6xl font-black !mb-2 leading-none tracking-tighter">
+                <Heading as="h2" id="prizes-heading" className="text-3xl md:text-6xl font-black !mb-2 leading-none tracking-tighter">
                   <span
                     className="font-black leading-none tracking-tighter mb-0"
                     style={{
@@ -1791,12 +1874,12 @@ export function Landing() {
                   </span>
                   <br />
                   The Challenge Continues
-                </h1>
+                </Heading>
                 <p className="max-w-xl md:text-xl text-lg font-medium !mb-8 md:w-full w-4/5  !leading-[110%] tracking-tight opacity-60">
                   Vesuvius Challenge moves onto its next stage of reading multiple entire scrolls.
                   Read more about the prizes below, and on how
                   they contribute towards the{" "}
-                  <a href="master_plan">The Master Plan</a>.
+                  <a href="/master_plan">The Master Plan</a>.
                 </p>
                 <div className="flex flex-col gap-3 max-w-7xl">
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-w-6xl">
@@ -1809,9 +1892,9 @@ export function Landing() {
                 </div>
               </div>
               <div className="pt-10 md:pt-20 max-w-3xl">
-                <h1 className="text-4xl md:text-7xl font-black !mb-2 leading-none tracking-tighter">
+                <Heading as="h2" id="awarded-prizes" className="text-4xl md:text-7xl font-black !mb-2 leading-none tracking-tighter">
                   Awarded Prizes
-                </h1>
+                </Heading>
                 <p className="max-w-xl md:text-xl text-lg font-medium !mb-8 md:w-full w-4/5  !leading-[110%] tracking-tight opacity-60">
                   Incredible teams of engineers are helping us unlock these
                   secrets, providing unprecedented access to scrolls that have
@@ -1841,9 +1924,9 @@ export function Landing() {
           <section>
             <div className="container mx-auto z-30 relative">
               <div className="mb-6 md:mb-24 max-w-6xl">
-                <h1 className="mb-16 text-4xl md:text-7xl font-black leading-none tracking-tighter ">
+                <Heading as="h2" className="mb-16 text-4xl md:text-7xl font-black leading-none tracking-tighter ">
                   Created By
-                </h1>
+                </Heading>
                 <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 auto-rows-fr gap-2">
                   {creators.map((c, i) => (
                     <Creator creator={c} key={i} />
@@ -1851,13 +1934,13 @@ export function Landing() {
                 </div>
               </div>
               <div className="mb-6 md:mb-10 max-w-6xl">
-                <h1
+                <Heading
+                  as="h2"
                   className="mb-16 text-4xl md:text-7xl font-black leading-none tracking-tighter "
-                  name="sponsors"
                   id="sponsors"
                 >
                   Sponsors
-                </h1>
+                </Heading>
                 <h2 className="text-3xl md:text-5xl text-[#E8A42F]">Caesars</h2>
                 <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-4 auto-rows-fr  gap-2 pb-8">
                   {sponsors
@@ -1898,9 +1981,9 @@ export function Landing() {
                 </div>
               </div>
               <div className="py-10">
-                <h1 className="hidden md:block text-4xl md:text-7xl font-black leading-none tracking-tighter ">
+                <Heading as="h2" className="hidden md:block text-4xl md:text-7xl font-black leading-none tracking-tighter ">
                   Team
-                </h1>
+                </Heading>
                 <div className="flex flex-wrap">
                   <div className="flex-1 flex-col lg:gap-0 gap-2 mt-8 min-w-[100%] md:min-w-[50%] pr-4 lg:pr-12">
                     <h3 className="text-3xl font-black tracking-tighter">
@@ -1953,13 +2036,19 @@ export function Landing() {
                 />
               </div>
               <div className="py-10">
-                <h1 className="mb-16 text-4xl md:text-7xl font-black leading-none tracking-tighter  mix-blend-exclusion">
+                <Heading as="h2" className="mb-16 text-4xl md:text-7xl font-black leading-none tracking-tighter  mix-blend-exclusion">
                   Partners
-                </h1>
+                </Heading>
                 <div className="flex lg:flex-row flex-col lg:gap-12 gap-6 lg:items-center items-start">
                   {partners.map((p, i) => (
                     <a key={i} href={p.href}>
-                      <img src={p.icon} className={`h-${i === 1 ? 28 : 12}`} />
+                      <img
+                        src={p.icon}
+                        alt="Partner logo"
+                        loading="lazy"
+                        decoding="async"
+                        className={`h-${i === 1 ? 28 : 12}`}
+                      />
                     </a>
                   ))}
                 </div>

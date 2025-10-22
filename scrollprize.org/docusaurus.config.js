@@ -57,6 +57,12 @@ const config = {
           trackingID: "G-NLQQENBL0L",
           anonymizeIP: false,
         },
+        sitemap: {
+          changefreq: 'monthly',
+          priority: 0.5,
+          filename: 'sitemap.xml',
+          ignorePatterns: [],
+        },
       }),
     ],
   ],
@@ -121,6 +127,7 @@ const config = {
           ],
           copyright: `Copyright © ${new Date().getFullYear()} Vesuvius Challenge.`,
         },
+        image: '/img/social/opengraph.jpg',
         metadata: [
           {
             name: "description",

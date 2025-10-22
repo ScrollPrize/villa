@@ -136,7 +136,7 @@ The goal of segmentation is to map and capture information near the written surf
 
 <div>There are four steps to segmentation:</div>
 
-* **Map.** Working from the chosen representation, map the surface (VC, Khartes, Thaumato) or volume (Slicer, Napari, Dragonfly) of the targeted scroll section.
+* **Map.** Working from the chosen representation, map the surface (VC, Khartes) or volume (Slicer, Napari, Dragonfly) of the targeted scroll section.
 * **Mesh.** Once the surface has been mapped in three dimensions, we need to start preparing the ground to visualize the results. In computer vision, the common approach is triangulating the surface obtaining a “triangular mesh”. Triangular meshes allow coherent texturization and rendering of the surface for both enhanced 3D visualization and flattened 2D visualization. The triangular mesh is stored in a “.obj” file. 
 * **Subvolume.** Sample voxels around the mesh to extract a subvolume containing information around the surface (surface volume).
 * **Flatten.** Transform this subvolume into a new .tif image stack where each layer is 2D, similar to creating a map of the earth on flat paper
