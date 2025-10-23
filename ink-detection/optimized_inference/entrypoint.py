@@ -56,6 +56,7 @@ class Inputs:
     tile_size: int = 64  # Tile size for sliding window inference (size will be set to same value)
     stride: int = 16  # Stride for sliding window
     batch_size: int = 256  # Batch size for inference
+    output_path: str = ""  # Full output path (S3 URI or local path) for prediction result
 
 def parse_env() -> Inputs:
     try:
@@ -86,6 +87,7 @@ def parse_env() -> Inputs:
         tile_size = int(os.getenv("TILE_SIZE", "64"))
         stride = int(os.getenv("STRIDE", "16"))
         batch_size = int(os.getenv("BATCH_SIZE", "256"))
+        output_path = os.getenv("OUTPUT_PATH", "").strip()
 
         # Validate inference parameters
         if tile_size <= 0:
@@ -147,6 +149,7 @@ def parse_env() -> Inputs:
             tile_size=tile_size,
             stride=stride,
             batch_size=batch_size,
+            output_path=output_path,
         )
     except KeyError as e:
         raise RuntimeError(f"Missing required env var: {e.args[0]}") from e
@@ -416,18 +419,56 @@ def upload_to_webknossos(wk_dataset_id: str, prediction: np.ndarray, model_key: 
 
 
 def save_and_upload_prediction(
-    s3_client, bucket: str, prefix: str, prediction: np.ndarray, model_key: str, start_layer: int, end_layer: int
+    s3_client, prediction: np.ndarray, output_path: str, model_key: str, start_layer: int, end_layer: int,
+    default_bucket: str = None, default_prefix: str = None
 ) -> str:
-    # Convert to uint8 PNG and upload to s3://bucket/prefix/predictions/prediction_START_END.png
-    out_key = os.path.join(prefix.rstrip("/"), "predictions", f"prediction_{model_key}_{start_layer:02d}_{end_layer:02d}.png")
-    # Ensure parent prefix virtually exists
-    _, tmp_path = os.path.split(out_key)
-    os.makedirs("/tmp/outputs", exist_ok=True)
-    local_path = os.path.join("/tmp/outputs", tmp_path)
+    """
+    Save and upload prediction to specified output path.
+
+    Args:
+        s3_client: Boto3 S3 client
+        prediction: Prediction array to save
+        output_path: Full output path (S3 URI or local path). If empty, uses default bucket/prefix
+        model_key: Model identifier
+        start_layer: Start layer index
+        end_layer: End layer index
+        default_bucket: Default S3 bucket (used if output_path is empty)
+        default_prefix: Default S3 prefix (used if output_path is empty)
+
+    Returns:
+        Final output path (S3 URI or local path)
+    """
     prediction_uint8 = (np.clip(prediction, 0, 1) * 255).astype(np.uint8)
-    cv2.imwrite(local_path, prediction_uint8)
-    s3_client.upload_file(local_path, bucket, out_key)
-    return f"s3://{bucket}/{out_key}"
+
+    # Determine output path
+    if output_path:
+        final_output_path = output_path
+    elif default_bucket and default_prefix:
+        # Use legacy default: s3://bucket/prefix/predictions/prediction_MODEL_START_END.png
+        out_key = os.path.join(default_prefix.rstrip("/"), "predictions", f"prediction_{model_key}_{start_layer:02d}_{end_layer:02d}.png")
+        final_output_path = f"s3://{default_bucket}/{out_key}"
+    else:
+        raise ValueError("No output_path specified and no default bucket/prefix provided")
+
+    # Handle S3 upload
+    if final_output_path.startswith("s3://"):
+        bucket, key = parse_s3_uri(final_output_path)
+
+        # Save to local temp file first
+        os.makedirs("/tmp/outputs", exist_ok=True)
+        local_path = os.path.join("/tmp/outputs", os.path.basename(key))
+        cv2.imwrite(local_path, prediction_uint8)
+
+        # Upload to S3
+        logger.info(f"Uploading prediction to S3: {final_output_path}")
+        s3_client.upload_file(local_path, bucket, key)
+    else:
+        # Local file path
+        os.makedirs(os.path.dirname(final_output_path), exist_ok=True)
+        logger.info(f"Saving prediction to local path: {final_output_path}")
+        cv2.imwrite(final_output_path, prediction_uint8)
+
+    return final_output_path
 
 
 def run_prepare_step(inputs: Inputs) -> None:
@@ -651,11 +692,12 @@ def run_inference_step(inputs: Inputs) -> None:
     prediction = result  # result is np.ndarray in standard mode
     if inputs.wk_inference:
         # For WebKnossos inference, upload to both S3 and WebKnossos
-        logger.info("Saving and uploading prediction mask to S3...")
+        logger.info("Saving and uploading prediction mask...")
         result_uri = save_and_upload_prediction(
-            s3_client, bucket, prefix, prediction, inputs.model_key, inputs.start_layer, inputs.end_layer
+            s3_client, prediction, inputs.output_path, inputs.model_key,
+            inputs.start_layer, inputs.end_layer, bucket, prefix
         )
-        logger.info(f"Uploaded result to S3: {result_uri}")
+        logger.info(f"Uploaded result: {result_uri}")
 
         # Upload to WebKnossos as new layer
         logger.info("Uploading prediction to WebKnossos dataset...")
@@ -665,7 +707,7 @@ def run_inference_step(inputs: Inputs) -> None:
         logger.info(f"Uploaded prediction to WebKnossos layer: {wk_layer_name}")
 
         # Write both results
-        logger.info(f"Writing result S3 URI to /tmp/result_s3_url.txt: {result_uri}")
+        logger.info(f"Writing result URI to /tmp/result_s3_url.txt: {result_uri}")
         with open("/tmp/result_s3_url.txt", "w", encoding="utf-8") as f:
             f.write(result_uri)
 
@@ -673,17 +715,18 @@ def run_inference_step(inputs: Inputs) -> None:
         with open("/tmp/result_wk_layer.txt", "w", encoding="utf-8") as f:
             f.write(wk_layer_name)
 
-        logger.info(f"Inference completed successfully - S3: {result_uri}, WebKnossos layer: {wk_layer_name}")
+        logger.info(f"Inference completed successfully - Output: {result_uri}, WebKnossos layer: {wk_layer_name}")
     else:
         # Standard S3-only workflow
-        logger.info("Saving and uploading prediction mask to S3...")
+        logger.info("Saving and uploading prediction mask...")
         result_uri = save_and_upload_prediction(
-            s3_client, bucket, prefix, prediction, inputs.model_key, inputs.start_layer, inputs.end_layer
+            s3_client, prediction, inputs.output_path, inputs.model_key,
+            inputs.start_layer, inputs.end_layer, bucket, prefix
         )
-        logger.info(f"Writing result S3 URI to /tmp/result_s3_url.txt: {result_uri}")
+        logger.info(f"Writing result URI to /tmp/result_s3_url.txt: {result_uri}")
         with open("/tmp/result_s3_url.txt", "w", encoding="utf-8") as f:
             f.write(result_uri)
-        logger.info(f"Uploaded result to {result_uri}")
+        logger.info(f"Saved result to {result_uri}")
 
 
 def run_reduce_step(inputs: Inputs) -> None:
@@ -720,16 +763,32 @@ def run_reduce_step(inputs: Inputs) -> None:
     prediction = reduce_partitions(inputs.zarr_output_dir, inputs.num_parts, pred_shape)
     logger.info(f"Reduce completed in {time.time() - start_reduce_time:.2f} seconds")
 
-    # Write to local tiled TIFF
+    # Determine output path
+    if inputs.output_path:
+        final_output_path = inputs.output_path
+    else:
+        # Use legacy default: s3://bucket/prefix/predictions/prediction_MODEL_START_END.tif
+        out_key = os.path.join(prefix.rstrip("/"), "predictions", f"prediction_{inputs.model_key}_{inputs.start_layer:02d}_{inputs.end_layer:02d}.tif")
+        final_output_path = f"s3://{bucket}/{out_key}"
+
+    # Write to local tiled TIFF first
     local_tiff_path = f"/tmp/prediction_{inputs.model_key}_{inputs.start_layer:02d}_{inputs.end_layer:02d}.tif"
     write_tiled_tiff(prediction, local_tiff_path)
 
-    # Upload TIFF to S3
-    logger.info("Uploading tiled TIFF to S3...")
-    out_key = os.path.join(prefix.rstrip("/"), "predictions", f"prediction_{inputs.model_key}_{inputs.start_layer:02d}_{inputs.end_layer:02d}.tif")
-    s3_client.upload_file(local_tiff_path, bucket, out_key)
-    result_uri = f"s3://{bucket}/{out_key}"
-    logger.info(f"Uploaded result to S3: {result_uri}")
+    # Handle S3 upload or local save
+    if final_output_path.startswith("s3://"):
+        output_bucket, output_key = parse_s3_uri(final_output_path)
+        logger.info(f"Uploading tiled TIFF to S3: {final_output_path}")
+        s3_client.upload_file(local_tiff_path, output_bucket, output_key)
+        result_uri = final_output_path
+    else:
+        # Local file path
+        os.makedirs(os.path.dirname(final_output_path), exist_ok=True)
+        logger.info(f"Copying tiled TIFF to local path: {final_output_path}")
+        shutil.copy2(local_tiff_path, final_output_path)
+        result_uri = final_output_path
+
+    logger.info(f"Saved result to: {result_uri}")
 
     # Write result URI
     with open("/tmp/result_s3_url.txt", "w", encoding="utf-8") as f:
