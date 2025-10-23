@@ -28,8 +28,11 @@ RUN uv pip install --system --no-cache -r requirements.txt
 
 COPY entrypoint.py /app
 COPY processing.py /app
-COPY inference_timesformer.py /app
+COPY inference.py /app
+COPY model_timesformer.py /app
+COPY model_resnet3d.py /app
 COPY k8s.py /app
+COPY models/ /app/models/
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
@@ -57,8 +60,11 @@ RUN uv pip install --system --no-cache -r requirements-cpu-only.txt
 
 COPY entrypoint.py /app
 COPY processing.py /app
-COPY inference_timesformer.py /app
+COPY inference.py /app
+COPY model_timesformer.py /app
+COPY model_resnet3d.py /app
 COPY k8s.py /app
+COPY models/ /app/models/
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
