@@ -53,6 +53,9 @@ class Inputs:
     chunk_size: int = 1024  # Chunk size for zarr array creation (SURFACE_VOLUME_CHUNK_SIZE)
     use_zarr_compression: bool = False  # Enable/disable zarr compression
     model_type: str = "timesformer"  # "timesformer" or "resnet3d-50"
+    tile_size: int = 64  # Tile size for sliding window inference (size will be set to same value)
+    stride: int = 16  # Stride for sliding window
+    batch_size: int = 256  # Batch size for inference
 
 def parse_env() -> Inputs:
     try:
@@ -78,6 +81,21 @@ def parse_env() -> Inputs:
         # Validate model_type
         if model_type not in ("timesformer", "resnet3d-50"):
             raise ValueError(f"MODEL_TYPE must be 'timesformer' or 'resnet3d-50', got '{model_type}'")
+
+        # Inference configuration parameters
+        tile_size = int(os.getenv("TILE_SIZE", "64"))
+        stride = int(os.getenv("STRIDE", "16"))
+        batch_size = int(os.getenv("BATCH_SIZE", "256"))
+
+        # Validate inference parameters
+        if tile_size <= 0:
+            raise ValueError(f"TILE_SIZE must be positive, got {tile_size}")
+        if stride <= 0:
+            raise ValueError(f"STRIDE must be positive, got {stride}")
+        if batch_size <= 0:
+            raise ValueError(f"BATCH_SIZE must be positive, got {batch_size}")
+        if stride > tile_size:
+            logger.warning(f"STRIDE ({stride}) > TILE_SIZE ({tile_size}) may create gaps in coverage")
 
         # Validate step parameter
         if step not in ("prepare", "inference", "reduce"):
@@ -126,6 +144,9 @@ def parse_env() -> Inputs:
             chunk_size=chunk_size,
             use_zarr_compression=use_zarr_compression,
             model_type=model_type,
+            tile_size=tile_size,
+            stride=stride,
+            batch_size=batch_size,
         )
     except KeyError as e:
         raise RuntimeError(f"Missing required env var: {e.args[0]}") from e
@@ -474,9 +495,14 @@ def run_inference_step(inputs: Inputs) -> None:
     from inference import run_inference, CFG
     from processing import path_exists
 
-    # Calculate in_chans from layer range
+    # Configure inference parameters
     CFG.in_chans = inputs.end_layer - inputs.start_layer
+    CFG.tile_size = inputs.tile_size
+    CFG.size = inputs.tile_size  # Set size to same as tile_size
+    CFG.stride = inputs.stride
+    CFG.batch_size = inputs.batch_size
     logger.info(f"Using {CFG.in_chans} input channels (layers [{inputs.start_layer}, {inputs.end_layer}))")
+    logger.info(f"Inference config: tile_size={CFG.tile_size}, size={CFG.size}, stride={CFG.stride}, batch_size={CFG.batch_size}")
 
     # Import model-specific module based on model_type
     if inputs.model_type == "timesformer":
