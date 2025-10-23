@@ -422,6 +422,15 @@ cv::Mat QuadSurface::channel(const std::string& name, int flags)
     return cv::Mat();
 }
 
+std::vector<std::string> QuadSurface::channelNames() const
+{
+    std::vector<std::string> names;
+    for (const auto& pair : _channels) {
+        names.push_back(pair.first);
+    }
+    return names;
+}
+
 void QuadSurface::invalidateCache()
 {
     if (_points) {
