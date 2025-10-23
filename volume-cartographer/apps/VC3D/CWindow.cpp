@@ -435,8 +435,14 @@ CWindow::CWindow() :
     _cmdRunner(nullptr),
     _seedingWidget(nullptr),
     _drawingWidget(nullptr),
-    _point_collection_widget(nullptr)
+    _point_collection_widget(nullptr),
+    _inotifyFd(-1),
+    _inotifyNotifier(nullptr)
 {
+    // Initialize periodic timer for inotify events
+    _inotifyProcessTimer = new QTimer(this);
+    connect(_inotifyProcessTimer, &QTimer::timeout, this, &CWindow::processPendingInotifyEvents);
+
     _point_collection = new VCCollection(this);
     const QSettings settings("VC.ini", QSettings::IniFormat);
     setWindowIcon(QPixmap(":/images/logo.png"));
@@ -445,7 +451,7 @@ CWindow::CWindow() :
 
     chunk_cache = new ChunkCache(CHUNK_CACHE_SIZE_GB*1024ULL*1024ULL*1024ULL);
     std::cout << "chunk cache size is " << CHUNK_CACHE_SIZE_GB << " gigabytes " << std::endl;
-    
+
     _surf_col = new CSurfaceCollection();
 
     //_surf_col->setSurface("manual plane", new PlaneSurface({2000,2000,2000},{1,1,1}));
@@ -577,7 +583,7 @@ CWindow::CWindow() :
             _drawingWidget->toggleDrawingMode();
         }
     });
-    
+
     fCompositeViewShortcut = new QShortcut(QKeySequence("C"), this);
     fCompositeViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fCompositeViewShortcut, &QShortcut::activated, [this]() {
@@ -615,12 +621,18 @@ CWindow::CWindow() :
             chkAxisAlignedSlices->toggle();
         }
     });
-
 }
 
 // Destructor
-CWindow::~CWindow(void)
+CWindow::~CWindow()
 {
+
+    if (_inotifyProcessTimer) {
+        _inotifyProcessTimer->stop();
+        delete _inotifyProcessTimer;
+    }
+
+    stopWatchingWithInotify();
     setStatusBar(nullptr);
 
     CloseVolume();
@@ -996,10 +1008,10 @@ void CWindow::CreateWidgets(void)
     // add volume viewer
     auto aWidgetLayout = new QVBoxLayout;
     ui.tabSegment->setLayout(aWidgetLayout);
-    
+
     mdiArea = new QMdiArea(ui.tabSegment);
     aWidgetLayout->addWidget(mdiArea);
-    
+
     // newConnectedCVolumeViewer("manual plane", tr("Manual Plane"), mdiArea);
     newConnectedCVolumeViewer("seg xz", tr("Segmentation XZ"), mdiArea)->setIntersects({"segmentation"});
     newConnectedCVolumeViewer("seg yz", tr("Segmentation YZ"), mdiArea)->setIntersects({"segmentation"});
@@ -1242,24 +1254,24 @@ void CWindow::CreateWidgets(void)
     _drawingWidget = new DrawingWidget();
     attachScrollAreaToDock(ui.dockWidgetDrawing, _drawingWidget, QStringLiteral("dockWidgetDrawingContent"));
 
-    connect(this, &CWindow::sendVolumeChanged, _drawingWidget, 
+    connect(this, &CWindow::sendVolumeChanged, _drawingWidget,
             static_cast<void (DrawingWidget::*)(std::shared_ptr<Volume>, const std::string&)>(&DrawingWidget::onVolumeChanged));
     connect(_drawingWidget, &DrawingWidget::sendStatusMessageAvailable, this, &CWindow::onShowStatusMessage);
     connect(this, &CWindow::sendSurfacesLoaded, _drawingWidget, &DrawingWidget::onSurfacesLoaded);
 
     _drawingWidget->setCache(chunk_cache);
-    
+
     // Create Seeding widget
     _seedingWidget = new SeedingWidget(_point_collection, _surf_col);
     attachScrollAreaToDock(ui.dockWidgetDistanceTransform, _seedingWidget, QStringLiteral("dockWidgetDistanceTransformContent"));
-    
-    connect(this, &CWindow::sendVolumeChanged, _seedingWidget, 
+
+    connect(this, &CWindow::sendVolumeChanged, _seedingWidget,
             static_cast<void (SeedingWidget::*)(std::shared_ptr<Volume>, const std::string&)>(&SeedingWidget::onVolumeChanged));
     connect(_seedingWidget, &SeedingWidget::sendStatusMessageAvailable, this, &CWindow::onShowStatusMessage);
     connect(this, &CWindow::sendSurfacesLoaded, _seedingWidget, &SeedingWidget::onSurfacesLoaded);
-    
+
     _seedingWidget->setCache(chunk_cache);
-    
+
     // Create and add the point collection widget
     _point_collection_widget = new CPointCollectionWidget(_point_collection, this);
     _point_collection_widget->setObjectName("pointCollectionDock");
@@ -1277,7 +1289,7 @@ void CWindow::CreateWidgets(void)
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
     tabifyDockWidget(ui.dockWidgetSegmentation, _point_collection_widget);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDrawing);
-    
+
     // Make Drawing dock the active tab by default
     ui.dockWidgetDrawing->raise();
 
@@ -1410,7 +1422,7 @@ void CWindow::CreateWidgets(void)
     // Zoom buttons
     btnZoomIn = ui.btnZoomIn;
     btnZoomOut = ui.btnZoomOut;
-    
+
     connect(btnZoomIn, &QPushButton::clicked, this, &CWindow::onZoomIn);
     connect(btnZoomOut, &QPushButton::clicked, this, &CWindow::onZoomOut);
 
@@ -1553,7 +1565,7 @@ void CWindow::CreateWidgets(void)
             viewer->setCompositeEnabled(checked);
         }
     });
-    
+
     connect(ui.cmbCompositeMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
         // Find the segmentation viewer and update its composite method
         std::string method = "max";
@@ -1563,7 +1575,7 @@ void CWindow::CreateWidgets(void)
             case 2: method = "min"; break;
             case 3: method = "alpha"; break;
         }
-        
+
         if (auto* viewer = segmentationViewer()) {
             viewer->setCompositeMethod(method);
         }
@@ -1578,35 +1590,35 @@ void CWindow::CreateWidgets(void)
     if (auto* chkAxisOverlays = ui.chkAxisOverlays) {
         onAxisOverlayVisibilityToggled(chkAxisOverlays->isChecked());
     }
-    
+
     // Connect Layers In Front controls
     connect(ui.spinLayersInFront, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (auto* viewer = segmentationViewer()) {
             viewer->setCompositeLayersInFront(value);
         }
     });
-    
+
     // Connect Layers Behind controls
     connect(ui.spinLayersBehind, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (auto* viewer = segmentationViewer()) {
             viewer->setCompositeLayersBehind(value);
         }
     });
-    
+
     // Connect Alpha Min controls
     connect(ui.spinAlphaMin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (auto* viewer = segmentationViewer()) {
             viewer->setCompositeAlphaMin(value);
         }
     });
-    
+
     // Connect Alpha Max controls
     connect(ui.spinAlphaMax, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (auto* viewer = segmentationViewer()) {
             viewer->setCompositeAlphaMax(value);
         }
     });
-    
+
     // Connect Alpha Threshold controls
     connect(ui.spinAlphaThreshold, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (!_viewerManager) {
@@ -1619,7 +1631,7 @@ void CWindow::CreateWidgets(void)
             }
         }
     });
-    
+
     // Connect Material controls
     connect(ui.spinMaterial, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (!_viewerManager) {
@@ -1632,7 +1644,7 @@ void CWindow::CreateWidgets(void)
             }
         }
     });
-    
+
     // Connect Reverse Direction control
     connect(ui.chkReverseDirection, &QCheckBox::toggled, this, [this](bool checked) {
         if (!_viewerManager) {
@@ -1765,7 +1777,7 @@ void CWindow::UpdateView(void)
     setWidgetsEnabled(true);  // Enable Widgets for User
 
     // show volume package name
-    UpdateVolpkgLabel(0);    
+    UpdateVolpkgLabel(0);
 
     volSelect->setEnabled(can_change_volume_());
 
@@ -1935,12 +1947,12 @@ void CWindow::OpenVolume(const QString& path)
     {
         const QSignalBlocker blocker{cmbSegmentationDir};
         cmbSegmentationDir->clear();
-        
+
         auto availableDirs = fVpkg->getAvailableSegmentationDirectories();
         for (const auto& dirName : availableDirs) {
             cmbSegmentationDir->addItem(QString::fromStdString(dirName));
         }
-        
+
         // Select the current directory (default is "paths")
         int currentIndex = cmbSegmentationDir->findText(QString::fromStdString(fVpkg->getSegmentationDirectory()));
         if (currentIndex >= 0) {
@@ -1955,7 +1967,7 @@ void CWindow::OpenVolume(const QString& path)
     if (_menuController) {
         _menuController->updateRecentVolpkgList(aVpkgPath);
     }
-    
+
     // Set volume package in Seeding widget
    if (_seedingWidget) {
        _seedingWidget->setVolumePkg(fVpkg);
@@ -1964,10 +1976,22 @@ void CWindow::OpenVolume(const QString& path)
    if (_surfacePanel) {
        _surfacePanel->refreshPointSetFilterOptions();
    }
+
+    startWatchingWithInotify();
 }
 
 void CWindow::CloseVolume(void)
 {
+    stopWatchingWithInotify();
+    if (_inotifyProcessTimer) {
+        _inotifyProcessTimer->stop();
+    }
+
+    // Clear any pending inotify events
+    _pendingInotifyEvents.clear();
+    _pendingSegmentUpdates.clear();
+    _pendingMoves.clear();
+
     // Notify viewers to clear their surface pointers before we delete them
     emit sendVolumeClosing();
 
@@ -2025,7 +2049,7 @@ void CWindow::CloseVolume(void)
     if (treeWidgetSurfaces) {
         treeWidgetSurfaces->clear();
     }
-    
+
     // Clear points
     _point_collection->clearAll();
 
@@ -2045,7 +2069,7 @@ auto CWindow::can_change_volume_() -> bool
 void CWindow::onLocChanged(void)
 {
     // std::cout << "loc changed!" << "\n";
-    
+
 }
 
 void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers)
@@ -2062,18 +2086,18 @@ void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf
 }
 
 void CWindow::onManualPlaneChanged(void)
-{    
+{
     cv::Vec3f normal;
-    
+
     for(int i=0;i<3;i++) {
         normal[i] = spNorm[i]->value();
     }
- 
+
     PlaneSurface *plane = dynamic_cast<PlaneSurface*>(_surf_col->surface("manual plane"));
- 
+
     if (!plane)
         return;
- 
+
     plane->setNormal(normal);
     _surf_col->setSurface("manual plane", plane);
 }
@@ -2253,31 +2277,31 @@ void CWindow::onSegmentationDirChanged(int index)
     if (!fVpkg || index < 0 || !cmbSegmentationDir) {
         return;
     }
-    
+
     std::string newDir = cmbSegmentationDir->itemText(index).toStdString();
-    
+
     // Only reload if the directory actually changed
     if (newDir != fVpkg->getSegmentationDirectory()) {
         // Clear the current segmentation surface first to ensure viewers update
         _surf_col->setSurface("segmentation", nullptr, true);
-        
+
         // Clear current surface selection
         _surf = nullptr;
         _surfID.clear();
         treeWidgetSurfaces->clearSelection();
         wOpsList->onOpChainSelected(nullptr);
-        
+
         if (_surfacePanel) {
             _surfacePanel->resetTagUi();
         }
 
         // Set the new directory in the VolumePkg
         fVpkg->setSegmentationDirectory(newDir);
-        
+
         if (_surfacePanel) {
             _surfacePanel->loadSurfaces(false);
         }
-        
+
         // Update the status bar to show the change
         statusBar()->showMessage(tr("Switched to %1 directory").arg(QString::fromStdString(newDir)), 3000);
     }
@@ -2290,7 +2314,7 @@ void CWindow::onManualLocationChanged()
     if (!currentVolume) {
         return;
     }
-    
+
     // Parse the comma-separated values
     QString text = lblLocFocus->text().trimmed();
     QStringList parts = text.split(',');
@@ -2338,18 +2362,18 @@ void CWindow::onManualLocationChanged()
 
     // Update the line edit with clamped values
     lblLocFocus->setText(QString("%1, %2, %3").arg(x).arg(y).arg(z));
-    
+
     // Update the focus POI
     POI* poi = _surf_col->poi("focus");
     if (!poi) {
         poi = new POI;
     }
-    
+
     poi->p = cv::Vec3f(x, y, z);
     poi->n = cv::Vec3f(0, 0, 1); // Default normal for XY plane
-    
+
     _surf_col->setPOI("focus", poi);
-    
+
     if (_surfacePanel) {
         _surfacePanel->refreshFiltersOnly();
     }
@@ -2360,15 +2384,15 @@ void CWindow::onZoomIn()
     // Get the active sub-window
     QMdiSubWindow* activeWindow = mdiArea->activeSubWindow();
     if (!activeWindow) return;
-    
+
     // Get the viewer from the active window
     CVolumeViewer* viewer = qobject_cast<CVolumeViewer*>(activeWindow->widget());
     if (!viewer) return;
-    
+
     // Get the center of the current view as the zoom point
     QPointF center = viewer->fGraphicsView->mapToScene(
         viewer->fGraphicsView->viewport()->rect().center());
-    
+
     // Trigger zoom in (positive steps)
     viewer->onZoom(1, center, Qt::NoModifier);
 }
@@ -2408,7 +2432,7 @@ void CWindow::onPointDoubleClicked(uint64_t pointId)
         } else {
             poi->n = cv::Vec3f(0, 0, 1); // Default normal if no surface
         }
-        
+
         _surf_col->setPOI("focus", poi);
     }
 }
@@ -2418,15 +2442,15 @@ void CWindow::onZoomOut()
     // Get the active sub-window
     QMdiSubWindow* activeWindow = mdiArea->activeSubWindow();
     if (!activeWindow) return;
-    
+
     // Get the viewer from the active window
     CVolumeViewer* viewer = qobject_cast<CVolumeViewer*>(activeWindow->widget());
     if (!viewer) return;
-    
+
     // Get the center of the current view as the zoom point
     QPointF center = viewer->fGraphicsView->mapToScene(
         viewer->fGraphicsView->viewport()->rect().center());
-    
+
     // Trigger zoom out (negative steps)
     viewer->onZoom(-1, center, Qt::NoModifier);
 }
@@ -2940,4 +2964,561 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
         }
         return;
     }
+}
+
+
+void CWindow::startWatchingWithInotify()
+{
+    if (!fVpkg) {
+        return;
+    }
+
+    // Stop any existing watches
+    stopWatchingWithInotify();
+
+    // Initialize inotify
+    _inotifyFd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (_inotifyFd < 0) {
+        Logger()->error("Failed to initialize inotify: {}", strerror(errno));
+        return;
+    }
+
+    // Watch both paths and traces directories
+    auto availableDirs = fVpkg->getAvailableSegmentationDirectories();
+    for (const auto& dirName : availableDirs) {
+        std::filesystem::path dirPath = std::filesystem::path(fVpkg->getVolpkgDirectory()) / dirName;
+
+        if (!std::filesystem::exists(dirPath)) {
+            Logger()->debug("Directory {} does not exist, skipping watch", dirPath.string());
+            continue;
+        }
+
+        // Watch for directory create, delete, and move events
+        int wd = inotify_add_watch(_inotifyFd, dirPath.c_str(),
+                                  IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_ONLYDIR);
+
+        if (wd < 0) {
+            Logger()->error("Failed to add inotify watch for {}: {}", dirPath.string(), strerror(errno));
+            continue;
+        }
+
+        _watchDescriptors[wd] = dirName;
+        Logger()->info("Started inotify watch for {} directory (wd={})", dirName, wd);
+    }
+
+    // Set up Qt socket notifier to integrate with event loop
+    _inotifyNotifier = new QSocketNotifier(_inotifyFd, QSocketNotifier::Read, this);
+    connect(_inotifyNotifier, &QSocketNotifier::activated, this, &CWindow::onInotifyEvent);;
+}
+
+void CWindow::stopWatchingWithInotify()
+{
+    if (_inotifyProcessTimer) {if (_inotifyProcessTimer) {
+        _inotifyProcessTimer->stop();
+    }
+        _inotifyProcessTimer->stop();
+    }
+
+    if (_inotifyNotifier) {
+        delete _inotifyNotifier;
+        _inotifyNotifier = nullptr;
+    }
+
+    if (_inotifyFd >= 0) {
+        // Remove all watches
+        for (const auto& [wd, dirName] : _watchDescriptors) {
+            inotify_rm_watch(_inotifyFd, wd);
+        }
+        _watchDescriptors.clear();
+
+        ::close(_inotifyFd);
+        _inotifyFd = -1;
+    }
+
+    _pendingMoves.clear();
+}
+
+void CWindow::onInotifyEvent()
+{
+    char buffer[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+    ssize_t length = read(_inotifyFd, buffer, sizeof(buffer));
+
+    if (length < 0) {
+        if (errno != EAGAIN) {
+            std::cerr << "Error reading inotify events: " << strerror(errno) << std::endl;
+        }
+        return;
+    }
+
+    ssize_t i = 0;
+    while (i < length) {
+        struct inotify_event* event = reinterpret_cast<struct inotify_event*>(&buffer[i]);
+
+        if (event->len > 0) {
+            std::string fileName(event->name);
+
+            // Skip hidden files and temporary files
+            if (fileName.empty() || fileName[0] == '.' || fileName.find("~") != std::string::npos) {
+                i += sizeof(struct inotify_event) + event->len;
+                continue;
+            }
+
+            // Find the directory name for this watch descriptor
+            auto it = _watchDescriptors.find(event->wd);
+            if (it != _watchDescriptors.end()) {
+                std::string dirName = it->second;
+
+                // Handle different event types
+                if (event->mask & IN_CREATE) {
+                    // New segment created
+                    InotifyEvent evt;
+                    evt.type = InotifyEvent::Addition;
+                    evt.dirName = dirName;
+                    evt.segmentId = fileName;
+                    _pendingInotifyEvents.push_back(evt);
+
+                } else if (event->mask & IN_DELETE) {
+                    // Segment deleted
+                    InotifyEvent evt;
+                    evt.type = InotifyEvent::Removal;
+                    evt.dirName = dirName;
+                    evt.segmentId = fileName;
+                    _pendingInotifyEvents.push_back(evt);
+
+                } else if (event->mask & IN_MOVED_FROM) {
+                    // First part of move/rename - store with cookie
+                    // Store both the filename and directory for orphaned move cleanup
+                    _pendingMoves[event->cookie] = dirName + "/" + fileName;
+
+                } else if (event->mask & IN_MOVED_TO) {
+                    // Second part of move/rename
+                    auto moveIt = _pendingMoves.find(event->cookie);
+                    if (moveIt != _pendingMoves.end()) {
+                        // This is a rename within watched directories
+                        // Extract the old filename from the stored path
+                        std::string oldPath = moveIt->second;
+                        size_t lastSlash = oldPath.rfind('/');
+                        std::string oldName = (lastSlash != std::string::npos) ?
+                                               oldPath.substr(lastSlash + 1) : oldPath;
+                        _pendingMoves.erase(moveIt);
+
+                        InotifyEvent evt;
+                        evt.type = InotifyEvent::Rename;
+                        evt.dirName = dirName;
+                        evt.segmentId = oldName;  // old segment ID
+                        evt.newId = fileName;      // new segment ID
+                        _pendingInotifyEvents.push_back(evt);
+
+                    } else {
+                        // File moved from outside watched directory - treat as new addition
+                        InotifyEvent evt;
+                        evt.type = InotifyEvent::Addition;
+                        evt.dirName = dirName;
+                        evt.segmentId = fileName;
+                        _pendingInotifyEvents.push_back(evt);
+                    }
+
+                } else if (event->mask & (IN_MODIFY | IN_CLOSE_WRITE)) {
+                    // Segment modified or closed after writing
+                    // Use set to avoid duplicate updates for the same segment
+                    _pendingSegmentUpdates.insert({dirName, fileName});
+                }
+
+                // Handle overflow
+                if (event->mask & IN_Q_OVERFLOW) {
+                    std::cerr << "Inotify queue overflow - some events may have been lost" << std::endl;
+                    // Could trigger a full reload here if needed
+                }
+            }
+        }
+
+        i += sizeof(struct inotify_event) + event->len;
+    }
+
+    // Clean up old pending moves that never got their MOVED_TO pair
+    if (!_pendingMoves.empty()) {
+        static auto lastCleanup = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+
+        // Clean up orphaned moves every 5 seconds
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastCleanup).count() > 5) {
+            for (auto it = _pendingMoves.begin(); it != _pendingMoves.end(); ) {
+                // Extract directory and filename from stored path
+                std::string fullPath = it->second;
+                size_t lastSlash = fullPath.rfind('/');
+                if (lastSlash != std::string::npos) {
+                    std::string dirName = fullPath.substr(0, lastSlash);
+                    std::string fileName = fullPath.substr(lastSlash + 1);
+
+                    // Treat orphaned MOVED_FROM as deletions
+                    InotifyEvent evt;
+                    evt.type = InotifyEvent::Removal;
+                    evt.dirName = dirName;
+                    evt.segmentId = fileName;
+                    _pendingInotifyEvents.push_back(evt);
+                }
+
+                it = _pendingMoves.erase(it);
+            }
+            lastCleanup = now;
+        }
+    }
+
+    scheduleInotifyProcessing();
+}
+
+void CWindow::processInotifySegmentUpdate(const std::string& dirName, const std::string& segmentName)
+{
+    if (!fVpkg) return;
+
+    Logger()->info("Processing update of {} in {}", segmentName, dirName);
+
+    bool isCurrentDir = (dirName == fVpkg->getSegmentationDirectory());
+    if (!isCurrentDir) {
+        Logger()->debug("Update in non-current directory {}, skipping UI update", dirName);
+        return;
+    }
+
+    std::string segmentId = segmentName; // UUID = directory name
+
+    // Check if the segment exists
+    auto seg = fVpkg->segmentation(segmentId);
+    if (!seg) {
+        Logger()->warn("Segment {} not found for update, treating as addition", segmentId);
+        processInotifySegmentAddition(dirName, segmentName);
+        return;
+    }
+
+    bool wasSelected = (_surfID == segmentId);
+
+    // Reload the segmentation
+    if (fVpkg->reloadSingleSegmentation(segmentId)) {
+        // Remove and re-add to UI to refresh all metadata
+        if (_surfacePanel) {
+            _surfacePanel->removeSingleSegmentation(segmentId);
+        }
+
+        // Re-load surface
+        try {
+            auto surfMeta = fVpkg->loadSurface(segmentId);
+            if (surfMeta) {
+                _surf_col->setSurface(segmentId, surfMeta->surface(), true);
+                if (_surfacePanel) {
+                    _surfacePanel->addSingleSegmentation(segmentId);
+                }
+
+                statusBar()->showMessage(tr("Updated: %1").arg(QString::fromStdString(segmentName)), 2000);
+
+                // Reselect if it was selected
+                if (wasSelected) {
+                    _surfID = segmentId;
+                    auto surface = _surf_col->surface(segmentId);  // Changed from getSurface to surface
+                    if (surface && _surfacePanel) {
+                        _surfacePanel->syncSelectionUi(segmentId, dynamic_cast<QuadSurface*>(surface));
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            Logger()->error("Failed to reload segment {}: {}", segmentId, e.what());
+        }
+    }
+}
+
+void CWindow::processInotifySegmentRename(const std::string& dirName,
+                                          const std::string& oldDirName,
+                                          const std::string& newDirName)
+{
+    if (!fVpkg) return;
+
+    Logger()->info("Processing rename in {}: {} -> {}", dirName, oldDirName, newDirName);
+
+    bool isCurrentDir = (dirName == fVpkg->getSegmentationDirectory());
+
+    // The old UUID would have been the old directory name
+    std::string oldId = oldDirName;
+    std::string newId = newDirName;
+
+    // Check if the old segment exists
+    if (!fVpkg->segmentation(oldId)) {
+        Logger()->warn("Old segment {} not found, treating as new addition", oldId);
+        processInotifySegmentAddition(dirName, newDirName);
+        return;
+    }
+
+    // Remove the old entry
+    bool wasSelected = isCurrentDir && (_surfID == oldId);
+    fVpkg->removeSingleSegmentation(oldId);
+
+    if (isCurrentDir && _surfacePanel) {
+        _surfacePanel->removeSingleSegmentation(oldId);
+    }
+
+    // Add with new name (which will read the meta.json and update the UUID)
+    std::string previousDir;
+    if (!isCurrentDir) {
+        previousDir = fVpkg->getSegmentationDirectory();
+        fVpkg->setSegmentationDirectory(dirName);
+    }
+
+    if (fVpkg->addSingleSegmentation(newDirName)) {
+        // The UUID in meta.json will be updated when the segment is saved/loaded
+        try {
+            auto surfMeta = fVpkg->loadSurface(newId);
+
+            if (surfMeta && isCurrentDir) {
+                _surf_col->setSurface(newId, surfMeta->surface(), true);
+                if (_surfacePanel) {
+                    _surfacePanel->addSingleSegmentation(newId);
+                }
+
+                statusBar()->showMessage(tr("Renamed: %1 → %2")
+                                       .arg(QString::fromStdString(oldDirName),
+                                            QString::fromStdString(newDirName)), 3000);
+
+                // Reselect if it was selected
+                if (wasSelected) {
+                    _surfID = newId;
+                    auto surface = _surf_col->surface(newId);  // Changed from getSurface to surface
+                    if (surface && _surfacePanel) {
+                        _surfacePanel->syncSelectionUi(newId, dynamic_cast<QuadSurface*>(surface));
+                    }
+                }
+
+                if (_surfacePanel) {
+                    //_surfacePanel->refreshFiltersOnly();
+                }
+            }
+        } catch (const std::exception& e) {
+            Logger()->error("Failed to load renamed segment {}: {}", newId, e.what());
+        }
+    }
+
+    if (!isCurrentDir && !previousDir.empty()) {
+        fVpkg->setSegmentationDirectory(previousDir);
+    }
+}
+
+void CWindow::processInotifySegmentAddition(const std::string& dirName, const std::string& segmentName)
+{
+    if (!fVpkg) return;
+
+    Logger()->info("Processing addition of {} to {}", segmentName, dirName);
+
+    bool isCurrentDir = (dirName == fVpkg->getSegmentationDirectory());
+
+    // The UUID will be the directory name (or will be updated to match)
+    std::string segmentId = segmentName;
+
+    // Switch directory if needed
+    std::string previousDir;
+    if (!isCurrentDir) {
+        previousDir = fVpkg->getSegmentationDirectory();
+        fVpkg->setSegmentationDirectory(dirName);
+    }
+
+    // Add the segment
+    if (fVpkg->addSingleSegmentation(segmentName)) {
+        if (isCurrentDir) {
+            try {
+                auto surfMeta = fVpkg->loadSurface(segmentId);
+                if (surfMeta) {
+                    _surf_col->setSurface(segmentId, surfMeta->surface(), true);
+                    if (_surfacePanel) {
+                        _surfacePanel->addSingleSegmentation(segmentId);
+                    }
+                    statusBar()->showMessage(tr("Added: %1").arg(QString::fromStdString(segmentName)), 2000);
+                    if (_surfacePanel) {
+                        //_surfacePanel->refreshFiltersOnly();
+                    }
+                }
+            } catch (const std::exception& e) {
+                Logger()->error("Failed to load segment {}: {}", segmentId, e.what());
+            }
+        }
+    }
+
+    if (!isCurrentDir && !previousDir.empty()) {
+        fVpkg->setSegmentationDirectory(previousDir);
+    }
+}
+
+void CWindow::processInotifySegmentRemoval(const std::string& dirName, const std::string& segmentName)
+{
+    if (!fVpkg) return;
+
+    std::string segmentId = segmentName;
+
+    Logger()->info("Processing removal of {} from {}", segmentId, dirName);
+
+    // First check if this segment even exists and belongs to this directory
+    auto seg = fVpkg->segmentation(segmentId);
+    if (!seg) {
+        Logger()->debug("Segment {} not found, ignoring removal event from {}", segmentId, dirName);
+        return;
+    }
+
+    // Verify the segment is actually in the directory that reported the removal
+    if (seg->path().parent_path().filename() != dirName) {
+        Logger()->warn("Removal event for {} from {}, but segment is actually in {}",
+                      segmentId, dirName, seg->path().parent_path().filename().string());
+        return;
+    }
+
+    bool isCurrentDir = (dirName == fVpkg->getSegmentationDirectory());
+
+    // Remove from VolumePkg
+    if (fVpkg->removeSingleSegmentation(segmentId)) {
+        if (isCurrentDir && _surfacePanel) {
+            _surfacePanel->removeSingleSegmentation(segmentId);
+            statusBar()->showMessage(tr("Removed: %1").arg(QString::fromStdString(segmentName)), 2000);
+            //_surfacePanel->refreshFiltersOnly();
+        }
+    }
+}
+
+void CWindow::processPendingInotifyEvents()
+{
+    if (_pendingInotifyEvents.empty() && _pendingSegmentUpdates.empty()) {
+        return;
+    }
+
+    // Store current selection to restore later
+    std::string previousSelection = _surfID;
+    QuadSurface* previousSurface = _surf;
+
+    // Track if the previously selected segment gets removed
+    bool previousSelectionRemoved = false;
+
+    // Sort events to process removals first, then renames, then additions
+    std::vector<InotifyEvent> removals, renames, additions, updates;
+    for (const auto& evt : _pendingInotifyEvents) {
+        switch (evt.type) {
+            case InotifyEvent::Removal:
+                removals.push_back(evt);
+                // Check if this removal is our current selection
+                if (evt.segmentId == previousSelection) {
+                    previousSelectionRemoved = true;
+                }
+                break;
+            case InotifyEvent::Rename:
+                renames.push_back(evt);
+                break;
+            case InotifyEvent::Addition:
+                additions.push_back(evt);
+                break;
+            case InotifyEvent::Update:
+                updates.push_back(evt);
+                break;
+        }
+    }
+
+    // Process in order: removals, renames, additions, updates
+    for (const auto& evt : removals) {
+        processInotifySegmentRemoval(evt.dirName, evt.segmentId);
+    }
+
+    for (const auto& evt : renames) {
+        processInotifySegmentRename(evt.dirName, evt.segmentId, evt.newId);
+    }
+
+    for (const auto& evt : additions) {
+        processInotifySegmentAddition(evt.dirName, evt.segmentId);
+    }
+
+    for (const auto& evt : updates) {
+        processInotifySegmentUpdate(evt.dirName, evt.segmentId);
+    }
+
+    // Process unique segment updates
+    for (const auto& [dirName, segmentId] : _pendingSegmentUpdates) {
+        processInotifySegmentUpdate(dirName, segmentId);
+    }
+
+    // Clear the queues
+    _pendingInotifyEvents.clear();
+    _pendingSegmentUpdates.clear();
+
+    // Restore selection if it still exists (might have been renamed or re-added)
+    if (!previousSelection.empty() && previousSelectionRemoved) {
+        // Check if the segment was re-added in this batch
+        bool wasReAdded = false;
+        for (const auto& evt : additions) {
+            if (evt.segmentId == previousSelection) {
+                wasReAdded = true;
+                break;
+            }
+        }
+
+        if (wasReAdded) {
+            // The segment was removed and re-added - restore selection
+            auto seg = fVpkg ? fVpkg->segmentation(previousSelection) : nullptr;
+            if (seg) {
+                _surfID = previousSelection;
+                auto surfMeta = fVpkg->getSurface(previousSelection);
+                if (surfMeta) {
+                    _surf = surfMeta->surface();
+
+                    if (_surf_col) {
+                        _surf_col->setSurface("segmentation", _surf, false, false);
+                    }
+
+                    if (treeWidgetSurfaces) {
+                        QTreeWidgetItemIterator it(treeWidgetSurfaces);
+                        while (*it) {
+                            if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() == previousSelection) {
+                                const QSignalBlocker blocker{treeWidgetSurfaces};
+                                treeWidgetSurfaces->clearSelection();
+                                (*it)->setSelected(true);
+                                treeWidgetSurfaces->scrollToItem(*it);
+                                break;
+                            }
+                            ++it;
+                        }
+                    }
+
+                    if (_surfacePanel) {
+                        _surfacePanel->syncSelectionUi(previousSelection, _surf);
+                    }
+
+                    if (auto* viewer = segmentationViewer()) {
+                        viewer->setWindowTitle(tr("Surface %1").arg(QString::fromStdString(previousSelection)));
+                    }
+                }
+            }
+        }
+    } else if (!previousSelection.empty()) {
+        // Original logic for non-removed segments
+        auto seg = fVpkg ? fVpkg->segmentation(previousSelection) : nullptr;
+        if (seg) {
+            _surfID = previousSelection;
+            _surf = previousSurface;
+
+            if (_surfacePanel) {
+                auto surface = _surf_col->surface(previousSelection);
+                if (surface) {
+                    _surfacePanel->syncSelectionUi(previousSelection, dynamic_cast<QuadSurface*>(surface));
+                }
+            }
+        }
+    }
+
+    // Refresh filters once at the end instead of multiple times
+    if (_surfacePanel) {
+        _surfacePanel->refreshFiltersOnly();
+    }
+}
+
+void CWindow::scheduleInotifyProcessing()
+{
+    if (!_inotifyProcessTimer) {
+        return;
+    }
+
+    // Stop any existing timer
+    _inotifyProcessTimer->stop();
+
+    // Use single-shot timer with short delay
+    _inotifyProcessTimer->setSingleShot(true);
+    _inotifyProcessTimer->setInterval(INOTIFY_THROTTLE_MS);
+    _inotifyProcessTimer->start();
 }

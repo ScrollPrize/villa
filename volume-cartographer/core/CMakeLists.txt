@@ -32,6 +32,9 @@ target_link_libraries(vc_core
         z5
         OpenMP::OpenMP_CXX
         tiff
+        #${CURL_LIBRARIES}
+        #${OPENSSL_LIBRARIES}
+        #${ZLIB_LIBRARIES}
 )
 
 qt6_wrap_cpp(metrics_moc include/vc/ui/VCCollection.hpp)

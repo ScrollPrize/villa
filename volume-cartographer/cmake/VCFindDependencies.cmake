@@ -4,6 +4,11 @@ include(FetchContent)
 option(VC_BUILD_JSON "Build in-source JSON library" OFF)
 option(VC_BUILD_Z5   "Build (vendor) z5 header-only library" ON)
 
+#find_package(CURL REQUIRED)
+#find_package(OpenSSL REQUIRED)
+#find_package(ZLIB REQUIRED)
+#find_package(glog REQUIRED)
+
 # Try a preinstalled z5 first, unless the user explicitly forces vendoring.
 if (VC_BUILD_Z5)
     find_package(z5 CONFIG QUIET)

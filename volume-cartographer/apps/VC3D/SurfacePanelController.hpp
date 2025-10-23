@@ -98,6 +98,8 @@ public:
     void reloadSurfacesFromDisk();
     void refreshFiltersOnly();
     void setSelectionLocked(bool locked);
+    void addSingleSegmentation(const std::string& segId);
+    void removeSingleSegmentation(const std::string& segId);
 
 signals:
     void surfacesLoaded();
@@ -117,6 +119,7 @@ signals:
     void exportTifxyzChunksRequested(const QString& segmentId);
     void statusMessageRequested(const QString& message, int timeoutMs);
 
+
 private:
     struct SurfaceChanges {
         std::vector<std::string> toAdd;
@@ -126,8 +129,6 @@ private:
 
     SurfaceChanges detectSurfaceChanges() const;
     void populateSurfaceTree();
-    void addSingleSegmentation(const std::string& segId);
-    void removeSingleSegmentation(const std::string& segId);
 
     void connectFilterSignals();
     void connectTagSignals();
