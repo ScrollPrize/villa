@@ -3376,7 +3376,6 @@ void CWindow::processInotifySegmentRemoval(const std::string& dirName, const std
     }
 }
 
-
 void CWindow::processPendingInotifyEvents()
 {
     if (_pendingInotifyEvents.empty() && _pendingSegmentUpdates.empty()) {
@@ -3387,12 +3386,19 @@ void CWindow::processPendingInotifyEvents()
     std::string previousSelection = _surfID;
     QuadSurface* previousSurface = _surf;
 
+    // Track if the previously selected segment gets removed
+    bool previousSelectionRemoved = false;
+
     // Sort events to process removals first, then renames, then additions
     std::vector<InotifyEvent> removals, renames, additions, updates;
     for (const auto& evt : _pendingInotifyEvents) {
         switch (evt.type) {
             case InotifyEvent::Removal:
                 removals.push_back(evt);
+                // Check if this removal is our current selection
+                if (evt.segmentId == previousSelection) {
+                    previousSelectionRemoved = true;
+                }
                 break;
             case InotifyEvent::Rename:
                 renames.push_back(evt);
@@ -3432,15 +3438,61 @@ void CWindow::processPendingInotifyEvents()
     _pendingInotifyEvents.clear();
     _pendingSegmentUpdates.clear();
 
-    // Restore selection if it still exists
-    if (!previousSelection.empty()) {
-        // Check if the segment still exists (might have been renamed)
+    // Restore selection if it still exists (might have been renamed or re-added)
+    if (!previousSelection.empty() && previousSelectionRemoved) {
+        // Check if the segment was re-added in this batch
+        bool wasReAdded = false;
+        for (const auto& evt : additions) {
+            if (evt.segmentId == previousSelection) {
+                wasReAdded = true;
+                break;
+            }
+        }
+
+        if (wasReAdded) {
+            // The segment was removed and re-added - restore selection
+            auto seg = fVpkg ? fVpkg->segmentation(previousSelection) : nullptr;
+            if (seg) {
+                _surfID = previousSelection;
+                auto surfMeta = fVpkg->getSurface(previousSelection);
+                if (surfMeta) {
+                    _surf = surfMeta->surface();
+
+                    if (_surf_col) {
+                        _surf_col->setSurface("segmentation", _surf, false, false);
+                    }
+
+                    if (treeWidgetSurfaces) {
+                        QTreeWidgetItemIterator it(treeWidgetSurfaces);
+                        while (*it) {
+                            if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() == previousSelection) {
+                                const QSignalBlocker blocker{treeWidgetSurfaces};
+                                treeWidgetSurfaces->clearSelection();
+                                (*it)->setSelected(true);
+                                treeWidgetSurfaces->scrollToItem(*it);
+                                break;
+                            }
+                            ++it;
+                        }
+                    }
+
+                    if (_surfacePanel) {
+                        _surfacePanel->syncSelectionUi(previousSelection, _surf);
+                    }
+
+                    if (auto* viewer = segmentationViewer()) {
+                        viewer->setWindowTitle(tr("Surface %1").arg(QString::fromStdString(previousSelection)));
+                    }
+                }
+            }
+        }
+    } else if (!previousSelection.empty()) {
+        // Original logic for non-removed segments
         auto seg = fVpkg ? fVpkg->segmentation(previousSelection) : nullptr;
         if (seg) {
             _surfID = previousSelection;
             _surf = previousSurface;
 
-            // Restore UI selection
             if (_surfacePanel) {
                 auto surface = _surf_col->surface(previousSelection);
                 if (surface) {
@@ -3454,9 +3506,6 @@ void CWindow::processPendingInotifyEvents()
     if (_surfacePanel) {
         _surfacePanel->refreshFiltersOnly();
     }
-
-    // Record processing time
-    _lastInotifyProcessTime.restart();
 }
 
 void CWindow::scheduleInotifyProcessing()
