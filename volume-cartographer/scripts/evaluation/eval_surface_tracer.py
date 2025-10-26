@@ -353,17 +353,22 @@ class SurfaceTracerEvaluation:
             logger.warning(f"No patches found with area >= {min_size}")
             return []
     
-        k = int(self.config["num_trace_starting_patches"])
+        k = max(0, int(self.config.get("num_trace_starting_patches", 1)))
         filtered.sort(key=lambda p: p.area, reverse=True)
         n = len(filtered)
     
         if k <= 1:
-            return filtered[:1]
+            return filtered[:min(1, n)]
         if k >= n:
             return filtered
     
-        # Evenly spaced indices across [0, n-1], inclusive (quantiles)
-        idxs = [(i * (n - 1)) // (k - 1) for i in range(k)]  # floor ensures monotone, no dups
+        # selection strategy: "quantiles" (default) or "top_k"
+        strategy = str(self.config.get("trace_starting_selection", "quantiles")).lower()
+        if strategy == "top_k":
+            # strictly take the k largest patches
+            return filtered[:k]
+        # default: evenly spaced indices across [0, n-1] (quantiles)
+        idxs = [(i * (n - 1)) // (k - 1) for i in range(k)]
         return [filtered[i] for i in idxs]
 
 
@@ -382,7 +387,7 @@ class SurfaceTracerEvaluation:
         param_files: Dict[bool, Path] = {}
         for fv in (False, True):
             params = base_params.copy()
-            params["flip_x"] = bool(fv)
+            params["flip_x"] = 1 if fv else 0
             pf = self.out_dir / f"tracer_params_fx{int(fv)}.json"
             with open(pf, "w") as f:
                 json.dump(params, f, indent=2)
