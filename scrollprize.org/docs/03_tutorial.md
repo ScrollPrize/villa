@@ -136,7 +136,7 @@ The goal of segmentation is to map and capture information near the written surf
 
 <div>There are four steps to segmentation:</div>
 
-* **Map.** Working from the chosen representation, map the surface (VC, Khartes, Thaumato) or volume (Slicer, Napari, Dragonfly) of the targeted scroll section.
+* **Map.** Working from the chosen representation, map the surface (VC, Khartes) or volume (Slicer, Napari, Dragonfly) of the targeted scroll section.
 * **Mesh.** Once the surface has been mapped in three dimensions, we need to start preparing the ground to visualize the results. In computer vision, the common approach is triangulating the surface obtaining a “triangular mesh”. Triangular meshes allow coherent texturization and rendering of the surface for both enhanced 3D visualization and flattened 2D visualization. The triangular mesh is stored in a “.obj” file. 
 * **Subvolume.** Sample voxels around the mesh to extract a subvolume containing information around the surface (surface volume).
 * **Flatten.** Transform this subvolume into a new .tif image stack where each layer is 2D, similar to creating a map of the earth on flat paper
@@ -190,25 +190,25 @@ graph TD
 
 classDef substep fill:#223B46
 
-Scanning["1. Micro-CT scan"]:::substep
+Scanning["1\. Micro-CT scan"]:::substep
 Papyrus([Papyrus scroll]) --> Scanning --> tif[/"Scroll volume (.tif stack)"/]
 
-Segmentation["2. Segmentation"]:::substep
+Segmentation["2\. Segmentation"]:::substep
 tif --> Segmentation --> obj[/"3D mesh (.obj)"/]
 
-Volumes["3. Flattening and rendering"]:::substep
+Volumes["3\. Flattening and rendering"]:::substep
 tif --> Volumes
 obj --> Volumes
 Volumes --> surfVol[/"Surface volume (.tif stack)"/]
 
-Alignment["4. Ground data truth alignment"]:::substep
+Alignment["4\. Ground data truth alignment"]:::substep
 Infrared[/Infrared photo/] --> Alignment --> alInf[/Aligned infrared/] --> labels[/Hand-labeled binary mask/]
 surfVol --> Alignment
 
-Ink["5. Ink detection"]:::substep
+Ink["5\. Ink detection"]:::substep
 surfVol --> Ink
 labels --> Ink --> predInk[/Ink predictions/]
 
-Interpretation["6. Interpretation"]:::substep
+Interpretation["6\. Interpretation"]:::substep
 predInk --> Interpretation --> Knowledge([New knowledge])
 ```

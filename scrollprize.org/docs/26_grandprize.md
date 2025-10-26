@@ -114,7 +114,7 @@ For the Grand Prize, they assembled into a superteam, crushing it by creating wh
 The submission contains results from three different model architectures, each supporting the findings of the others, with the strongest images often coming from a [TimeSformer](https://arxiv.org/abs/2102.05095)-based model. Multiple measures prevent overfitting and hallucination, including results from multiple architectures, a study across input/output window sizes, label smoothing, and varying validation folds. Like with all our prizes, this ink detection code has been made public as open source (on [GitHub](https://github.com/younader/Vesuvius-Grandprize-Winner)), leveling up everyone in the community.
 
 <div className="mb-4">
-  <a target="_blank" href="/img/grandprize/youssef_text_wbb.webp"><img src="/img/grandprize/youssef_text_wbb-smaller.webp" className="w-[100%]"/></a>
+  <a target="_blank" href="/img/grandprize/youssef_text_wbb.png"><img src="/img/grandprize/youssef_text_wbb-smaller.webp" className="w-[100%]"/></a>
   <figcaption className="mt-[-6px]">The winners’ main submission image (TimeSformer 64x64).</figcaption>
 </div>
 
