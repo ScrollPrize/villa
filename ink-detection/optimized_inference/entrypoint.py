@@ -103,13 +103,13 @@ def parse_env() -> Inputs:
         if step not in ("prepare", "inference", "reduce"):
             raise ValueError(f"STEP must be 'prepare', 'inference', or 'reduce', got '{step}'")
 
-        # Validate partitioning parameters
-        if step == "inference" and num_parts > 1:
-            if part_id < 0 or part_id >= num_parts:
-                raise ValueError(f"PART_ID must be in range [0, {num_parts}), got {part_id}")
+        # Validate NUM_PARTS upfront
+        if num_parts < 1:
+            raise ValueError(f"NUM_PARTS must be >= 1, got {num_parts}")
 
-        if step == "reduce" and num_parts <= 1:
-            raise ValueError("STEP=reduce requires NUM_PARTS > 1")
+        # Validate PART_ID for inference step
+        if step == "inference" and part_id < 0 or part_id >= num_parts:
+            raise ValueError(f"PART_ID must be in range [0, {num_parts}), got {part_id}")
 
         # Validate required parameters per step
         if step == "prepare":
@@ -120,9 +120,6 @@ def parse_env() -> Inputs:
             # Inference step requires surface_volume_zarr
             if not surface_volume_zarr:
                 raise ValueError("STEP=inference requires SURFACE_VOLUME_ZARR (run STEP=prepare first)")
-            # For non-partitioned inference, also need s3_path for result upload
-            if num_parts == 1 and not s3_path and not wk_dataset_id:
-                raise ValueError("STEP=inference with NUM_PARTS=1 requires S3_PATH or WK_DATASET_ID for result upload")
         # reduce step doesn't require these
 
         wk_inference = bool(wk_dataset_id)
@@ -574,13 +571,6 @@ def run_inference_step(inputs: Inputs) -> None:
         f"zarr_output_dir={inputs.zarr_output_dir}"
     )
 
-    # For uploading results, we need s3_path
-    # Handle WebKnossos workflow if needed
-    if inputs.wk_inference:
-        logger.info(f"WebKnossos inference mode: fetching metadata for dataset {inputs.wk_dataset_id}")
-        inputs.s3_path = get_wk_dataset_metadata(inputs.wk_dataset_id)
-        logger.info(f"Retrieved s3_path from WebKnossos metadata: {inputs.s3_path}")
-
     logger.info(
         f"Starting optimized inference with task_id={task_id}, model={inputs.model_key}, "
         f"surface_volume_zarr={inputs.surface_volume_zarr}, "
@@ -593,16 +583,9 @@ def run_inference_step(inputs: Inputs) -> None:
     logger.info(f"Ensuring models directory exists at {models_dir}")
     os.makedirs(models_dir, exist_ok=True)
 
-    # S3 setup (for model download and result upload)
+    # S3 setup (for model download)
     logger.info("Setting up S3 client...")
     s3_client = boto3.client("s3")
-
-    # Parse s3_path for result upload
-    if inputs.s3_path:
-        logger.info(f"Parsing S3 URI for result upload: {inputs.s3_path}")
-        bucket, prefix = parse_s3_uri(inputs.s3_path)
-    else:
-        bucket, prefix = None, None
 
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -658,7 +641,6 @@ def run_inference_step(inputs: Inputs) -> None:
             logger.warning(f"Warmup after compile failed (continuing un-warmed): {e}")
 
     # Determine reverse option similar to local test
-    segment_name = os.path.basename(prefix.rstrip("/")) if prefix else bucket
     if inputs.force_reverse:
         is_reverse_segment = True
         logger.info("Force reverse enabled via env")
@@ -681,52 +663,10 @@ def run_inference_step(inputs: Inputs) -> None:
     )
     logger.info(f"Inference completed in {time.time() - start_infer_time:.2f} seconds")
 
-    # Handle partitioned vs standard mode
-    if inputs.num_parts > 1:
-        # Partitioned mode: zarr files written, just log and exit
-        logger.info(f"Partition {inputs.part_id} completed. Zarr arrays written to {inputs.zarr_output_dir}")
-        logger.info("Partition inference step complete. Run reduce step after all partitions finish.")
-        return
-
-    # Standard mode (num_parts == 1): upload result
-    prediction = result  # result is np.ndarray in standard mode
-    if inputs.wk_inference:
-        # For WebKnossos inference, upload to both S3 and WebKnossos
-        logger.info("Saving and uploading prediction mask...")
-        result_uri = save_and_upload_prediction(
-            s3_client, prediction, inputs.output_path, inputs.model_key,
-            inputs.start_layer, inputs.end_layer, bucket, prefix
-        )
-        logger.info(f"Uploaded result: {result_uri}")
-
-        # Upload to WebKnossos as new layer
-        logger.info("Uploading prediction to WebKnossos dataset...")
-        wk_layer_name = upload_to_webknossos(
-            inputs.wk_dataset_id, prediction, inputs.model_key, inputs.start_layer, inputs.end_layer
-        )
-        logger.info(f"Uploaded prediction to WebKnossos layer: {wk_layer_name}")
-
-        # Write both results
-        logger.info(f"Writing result URI to /tmp/result_s3_url.txt: {result_uri}")
-        with open("/tmp/result_s3_url.txt", "w", encoding="utf-8") as f:
-            f.write(result_uri)
-
-        logger.info(f"Writing WebKnossos layer name to /tmp/result_wk_layer.txt: {wk_layer_name}")
-        with open("/tmp/result_wk_layer.txt", "w", encoding="utf-8") as f:
-            f.write(wk_layer_name)
-
-        logger.info(f"Inference completed successfully - Output: {result_uri}, WebKnossos layer: {wk_layer_name}")
-    else:
-        # Standard S3-only workflow
-        logger.info("Saving and uploading prediction mask...")
-        result_uri = save_and_upload_prediction(
-            s3_client, prediction, inputs.output_path, inputs.model_key,
-            inputs.start_layer, inputs.end_layer, bucket, prefix
-        )
-        logger.info(f"Writing result URI to /tmp/result_s3_url.txt: {result_uri}")
-        with open("/tmp/result_s3_url.txt", "w", encoding="utf-8") as f:
-            f.write(result_uri)
-        logger.info(f"Saved result to {result_uri}")
+    # Zarr files written, log and exit
+    # Result is a dict with zarr paths: {"mask_pred": path, "mask_count": path}
+    logger.info(f"Partition {inputs.part_id} completed. Zarr arrays written to {inputs.zarr_output_dir}")
+    logger.info("Inference step complete. Run STEP=reduce after all partitions finish to blend and upload results.")
 
 
 def run_reduce_step(inputs: Inputs) -> None:
@@ -744,8 +684,6 @@ def run_reduce_step(inputs: Inputs) -> None:
         logger.info(f"WebKnossos inference mode: fetching metadata for dataset {inputs.wk_dataset_id}")
         inputs.s3_path = get_wk_dataset_metadata(inputs.wk_dataset_id)
         logger.info(f"Retrieved s3_path from WebKnossos metadata: {inputs.s3_path}")
-
-    bucket, prefix = parse_s3_uri(inputs.s3_path)
 
     # We need to determine the prediction shape from one of the partition zarr files
     mask_pred_path = os.path.join(inputs.zarr_output_dir, "mask_pred_part_000.zarr")
@@ -766,10 +704,17 @@ def run_reduce_step(inputs: Inputs) -> None:
     # Determine output path
     if inputs.output_path:
         final_output_path = inputs.output_path
-    else:
+    elif inputs.s3_path:
         # Use legacy default: s3://bucket/prefix/predictions/prediction_MODEL_START_END.tif
+        bucket, prefix = parse_s3_uri(inputs.s3_path)
         out_key = os.path.join(prefix.rstrip("/"), "predictions", f"prediction_{inputs.model_key}_{inputs.start_layer:02d}_{inputs.end_layer:02d}.tif")
         final_output_path = f"s3://{bucket}/{out_key}"
+    elif inputs.wk_inference:
+        # For WebKnossos-only mode, we still need to save locally before uploading to WK
+        final_output_path = f"/tmp/prediction_{inputs.model_key}_{inputs.start_layer:02d}_{inputs.end_layer:02d}.tif"
+        logger.info(f"WebKnossos mode: will save locally to {final_output_path} before uploading to WebKnossos")
+    else:
+        raise ValueError("STEP=reduce requires OUTPUT_PATH, S3_PATH, or WK_DATASET_ID for result upload")
 
     # Write to local tiled TIFF first
     local_tiff_path = f"/tmp/prediction_{inputs.model_key}_{inputs.start_layer:02d}_{inputs.end_layer:02d}.tif"

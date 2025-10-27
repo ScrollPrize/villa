@@ -359,13 +359,12 @@ def predict_fn(
     model: InferenceModel,
     device: torch.device,
     pred_shape: Tuple[int, int]
-) -> Union[np.ndarray, Dict[str, str]]:
+) -> Dict[str, str]:
     """
-    Run tiled inference and blend into a single (H,W) heatmap.
+    Run tiled inference and write results to zarr files.
 
     Returns:
-        - If num_parts == 1: returns blended numpy array (H, W)
-        - If num_parts > 1: returns dict with zarr paths {"mask_pred": path, "mask_count": path}
+        dict with zarr paths {"mask_pred": path, "mask_count": path}
     """
     try:
         H, W = pred_shape
@@ -428,56 +427,48 @@ def predict_fn(
                 pbar.update(images.size(0))
             pbar.close()
 
-        # Write results based on mode
-        if CFG.num_parts > 1:
-            # Partitioned mode: write in-memory arrays to zarr once at the end
-            from numcodecs import LZ4
+        # Always write results to zarr
+        from numcodecs import LZ4
 
-            logger.info(f"Writing partition {CFG.part_id} results to zarr arrays...")
-            os.makedirs(CFG.zarr_output_dir, exist_ok=True)
+        logger.info(f"Writing partition {CFG.part_id} results to zarr arrays...")
+        os.makedirs(CFG.zarr_output_dir, exist_ok=True)
 
-            mask_pred_path = os.path.join(CFG.zarr_output_dir, f"mask_pred_part_{CFG.part_id:03d}.zarr")
-            mask_count_path = os.path.join(CFG.zarr_output_dir, f"mask_count_part_{CFG.part_id:03d}.zarr")
+        mask_pred_path = os.path.join(CFG.zarr_output_dir, f"mask_pred_part_{CFG.part_id:03d}.zarr")
+        mask_count_path = os.path.join(CFG.zarr_output_dir, f"mask_count_part_{CFG.part_id:03d}.zarr")
 
-            compressor = LZ4(acceleration=1) if CFG.use_zarr_compression else None
+        compressor = LZ4(acceleration=1) if CFG.use_zarr_compression else None
 
-            # Create and write mask_pred zarr
-            mask_pred_z = zarr.open(
-                mask_pred_path,
-                mode='w',
-                shape=(H, W),
-                chunks=(1024, 1024),
-                dtype=np.float32,
-                compressor=compressor,
-                zarr_format=2,
-                config={'write_empty_chunks': False}
-            )
-            mask_pred_z[:] = mask_pred
+        # Create and write mask_pred zarr
+        mask_pred_z = zarr.open(
+            mask_pred_path,
+            mode='w',
+            shape=(H, W),
+            chunks=(1024, 1024),
+            dtype=np.float32,
+            compressor=compressor,
+            zarr_format=2,
+            config={'write_empty_chunks': False}
+        )
+        mask_pred_z[:] = mask_pred
 
-            # Create and write mask_count zarr
-            mask_count_z = zarr.open(
-                mask_count_path,
-                mode='w',
-                shape=(H, W),
-                chunks=(1024, 1024),
-                dtype=np.float32,
-                compressor=compressor,
-                zarr_format=2,
-                config={'write_empty_chunks': False}
-            )
-            mask_count_z[:] = mask_count
+        # Create and write mask_count zarr
+        mask_count_z = zarr.open(
+            mask_count_path,
+            mode='w',
+            shape=(H, W),
+            chunks=(1024, 1024),
+            dtype=np.float32,
+            compressor=compressor,
+            zarr_format=2,
+            config={'write_empty_chunks': False}
+        )
+        mask_count_z[:] = mask_count
 
-            logger.info(f"Partition {CFG.part_id} completed. Wrote zarr arrays to {CFG.zarr_output_dir}")
-            return {
-                "mask_pred": mask_pred_path,
-                "mask_count": mask_count_path,
-            }
-
-        # Standard mode: blend and return numpy array
-        mask_pred = mask_pred / np.clip(mask_count, a_min=1e-6, a_max=None)
-        mask_pred = np.clip(mask_pred, 0, 1)
-        logger.info(f"Inference completed. Prediction shape: {mask_pred.shape}")
-        return mask_pred
+        logger.info(f"Partition {CFG.part_id} completed. Wrote zarr arrays to {CFG.zarr_output_dir}")
+        return {
+            "mask_pred": mask_pred_path,
+            "mask_count": mask_count_path,
+        }
 
     except Exception as e:
         logger.error(f"Error in predict_fn: {e}")
@@ -492,7 +483,7 @@ def run_inference(
     is_reverse_segment: bool = False,
     start_z: Optional[int] = None,
     end_z: Optional[int] = None
-) -> Union[np.ndarray, Dict[str, str]]:
+) -> Dict[str, str]:
     """
     Main entrypoint: accepts either a stacked array (H,W,C) or path to a zarr array.
 
@@ -506,8 +497,7 @@ def run_inference(
         end_z: Optional ending z-layer index (exclusive)
 
     Returns:
-        - If num_parts == 1: returns (H,W) heatmap numpy array
-        - If num_parts > 1: returns dict with zarr paths {"mask_pred": path, "mask_count": path}
+        dict with zarr paths {"mask_pred": path, "mask_count": path}
     """
     try:
         logger.info("Starting inference process...")
@@ -517,21 +507,8 @@ def run_inference(
         test_loader, pred_shape, partition_info = create_inference_dataloader(source, mask, reverse)
         result = predict_fn(test_loader, model, device, pred_shape)
 
-        # If partitioned mode, return zarr paths directly
-        if CFG.num_parts > 1:
-            logger.info("Inference partition completed successfully")
-            return result
-
-        # Standard mode: crop to original size and re-normalize per-fragment
-        mask_pred = result  # result is np.ndarray in this case
-        oh, ow = orig_shape
-        mask_pred = np.clip(mask_pred[:oh, :ow], 0, 1)
-        mx = float(mask_pred.max())
-        if mx > 0:
-            mask_pred = mask_pred / mx
-
         logger.info("Inference completed successfully")
-        return mask_pred
+        return result
 
     except Exception as e:
         logger.error(f"Error in run_inference: {e}")
