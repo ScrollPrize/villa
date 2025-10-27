@@ -65,7 +65,7 @@ Contestants can also contribute to our two primary subproblems:
 
 <Admonition type="info" icon="⚙️" title="Segmentation">
 * Prizes: [Progress Prizes](prizes#progress-prizes)
-* Starting point: [Virtual Unwrapping](unwrapping), [Segmentation tutorial](segmentation), [Segmentation - a different approach](tutorial4)
+* Starting point: [Virtual Unwrapping](unwrapping), [Segmentation tutorial](segmentation)
 </Admonition>
 
 <Admonition type="info" icon="🖋️" title="Ink Detection">

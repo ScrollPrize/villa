@@ -36,6 +36,8 @@ hide_table_of_contents: true
   />
 </head>
 
+<div className="opacity-60 mb-8 italic">July 25th, 2025</div>
+
 ## Vesuvius Challenge – Stage Two
 
 * In 2023, Vesuvius Challenge [made a breakthrough](grandprize), extracting more than four passages of never-before-seen text from inside an unopened (and unopenable) carbonized scroll. We have proven techniques for virtually unwrapping the papyrus scroll and recognizing the ink using machine learning. It wasn’t clear it was possible until we did it.
