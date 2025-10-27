@@ -52,29 +52,18 @@ static xt::xarray<T> *readChunk(const z5::Dataset & ds, z5::types::ShapeType chu
     *out = xt::empty<T>(maxChunkShape);
 
 
-    // read/decompress & convert data according to requested T
+    // read/decompress & convert data
     if (ds.getDtype() == z5::types::Datatype::uint8) {
-        if constexpr (std::is_same_v<T,uint8_t>) {
-            ds.readChunk(chunkId, out->data());
-        } else {
-            // upcast 8->16 (preserve scale by *257 for round-ish mapping)
-            xt::xarray<uint8_t> tmp = xt::empty<uint8_t>(maxChunkShape);
-            ds.readChunk(chunkId, tmp.data());
-            uint16_t *p16 = out->data();
-            uint8_t  *p8  = tmp.data();
-            for (size_t i=0;i<maxChunkSize;i++) p16[i] = static_cast<uint16_t>(p8[i]) * 257u;
-        }
-    } else { // src is uint16
-        if constexpr (std::is_same_v<T,uint16_t>) {
-            ds.readChunk(chunkId, out->data());
-        } else {
-            // downcast 16->8 with /257 mapping
-            xt::xarray<uint16_t> tmp = xt::empty<uint16_t>(maxChunkShape);
-            ds.readChunk(chunkId, tmp.data());
-            uint8_t  *p8  = out->data();
-            uint16_t *p16 = tmp.data();
-            for (size_t i=0;i<maxChunkSize;i++) p8[i] = static_cast<uint8_t>(p16[i] / 257u);
-        }
+        ds.readChunk(chunkId, out->data());
+    }
+    else if (ds.getDtype() == z5::types::Datatype::uint16) {
+        xt::xarray<uint16_t> tmp = xt::empty<T>(maxChunkShape);
+        ds.readChunk(chunkId, tmp.data());
+
+        uint8_t *p8 = out->data();
+        uint16_t *p16 = tmp.data();
+        for(int i=0;i<maxChunkSize;i++)
+            p8[i] = p16[i] / 257;
     }
 
     return out;
@@ -91,7 +80,6 @@ int ChunkCache::groupIdx(const std::string &name)
     
 void ChunkCache::put(const cv::Vec4i &idx, xt::xarray<uint8_t> *ar)
 {
-    // evict in bytes (treat _size as byte budget)
     if (_stored >= _size) {
         using KP = std::pair<cv::Vec4i, uint64_t>;
         std::vector<KP> gen_list(_gen_store.begin(), _gen_store.end());
@@ -959,7 +947,7 @@ void readInterpolated3D(cv::Mat_<uint16_t> &out, z5::Dataset *ds,
     }
 }
 
-//somehow opencvs functions are pretty slow 
+//somehow opencvs functions are pretty slow
 static cv::Vec3f normed(const cv::Vec3f v)
 {
     return v/sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
