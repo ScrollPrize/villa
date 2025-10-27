@@ -3463,7 +3463,7 @@ void CWindow::processPendingInotifyEvents()
                     _surf = surfMeta->surface();
 
                     if (_surf_col) {
-                        _surf_col->setSurface("segmentation", _surf, false, false);
+                        _surf_col->setSurface("segmentation", _surf, true, false);
                     }
 
                     if (treeWidgetSurfaces) {
