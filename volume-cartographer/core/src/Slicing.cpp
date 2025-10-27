@@ -39,31 +39,36 @@ static xt::xarray<T> *readChunk(const z5::Dataset & ds, z5::types::ShapeType chu
         throw std::runtime_error("only uint8_t/uint16 zarrs supported currently!");
 
     z5::types::ShapeType chunkShape;
-    // size_t chunkSize;
     ds.getChunkShape(chunkId, chunkShape);
-    // get the shape of the chunk (as stored it is stored)
-    //for ZARR also edge chunks are always full size!
     const std::size_t maxChunkSize = ds.defaultChunkSize();
     const auto & maxChunkShape = ds.defaultChunkShape();
-
-    // chunkSize = std::accumulate(chunkShape.begin(), chunkShape.end(), 1, std::multiplies<std::size_t>());
 
     xt::xarray<T> *out = new xt::xarray<T>();
     *out = xt::empty<T>(maxChunkShape);
 
-
-    // read/decompress & convert data
+    // Handle based on both dataset dtype and target type T
     if (ds.getDtype() == z5::types::Datatype::uint8) {
-        ds.readChunk(chunkId, out->data());
+        // Dataset is uint8 - direct read for uint8_t, invalid for uint16_t
+        if constexpr (std::is_same_v<T, uint8_t>) {
+            ds.readChunk(chunkId, out->data());
+        } else {
+            throw std::runtime_error("Cannot read uint8 dataset into uint16 array");
+        }
     }
     else if (ds.getDtype() == z5::types::Datatype::uint16) {
-        xt::xarray<uint16_t> tmp = xt::empty<T>(maxChunkShape);
-        ds.readChunk(chunkId, tmp.data());
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            // Dataset is uint16, target is uint16 - direct read
+            ds.readChunk(chunkId, out->data());
+        } else if constexpr (std::is_same_v<T, uint8_t>) {
+            // Dataset is uint16, target is uint8 - need conversion
+            xt::xarray<uint16_t> tmp = xt::empty<uint16_t>(maxChunkShape);
+            ds.readChunk(chunkId, tmp.data());
 
-        uint8_t *p8 = out->data();
-        uint16_t *p16 = tmp.data();
-        for(int i=0;i<maxChunkSize;i++)
-            p8[i] = p16[i] / 257;
+            uint8_t *p8 = out->data();
+            uint16_t *p16 = tmp.data();
+            for(size_t i = 0; i < maxChunkSize; i++)
+                p8[i] = p16[i] / 257;
+        }
     }
 
     return out;

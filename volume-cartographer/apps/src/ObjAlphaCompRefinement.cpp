@@ -143,6 +143,7 @@ struct DSReader {
     z5::Dataset* ds;
     float scale;
     ChunkCache* cache;
+    std::mutex read_mutex;
 };
 
 float alphacomp_offset(DSReader &reader, cv::Vec3f point, cv::Vec3f normal, float start, float stop, float step, float low, float high, int r)
@@ -166,7 +167,10 @@ float alphacomp_offset(DSReader &reader, cv::Vec3f point, cv::Vec3f normal, floa
         cv::Mat_<uint8_t> slice;
         //I hate opencv
         cv::Mat_<cv::Vec3f> offmat(size, normal*off*reader.scale);
-        readInterpolated3D(slice, reader.ds, coords+offmat, reader.cache);
+        {
+            std::lock_guard<std::mutex> lock(reader.read_mutex);
+            readInterpolated3D(slice, reader.ds, coords+offmat, reader.cache);
+        }
 
         cv::Mat floatslice;
         slice.convertTo(floatslice, CV_32F, 1/255.0);
@@ -262,6 +266,7 @@ int process_obj(const std::string& src,
     cv::Mat_<uint8_t> slice;
     bool vertexcolor = cfg.gen_vertexcolor;
     if (vertexcolor) {
+        std::lock_guard<std::mutex> lock(reader.read_mutex);
         cv::Mat_<cv::Vec3f> vs_mat(static_cast<int>(vs.size()), 1, vs.data());
         readInterpolated3D(slice, reader.ds, vs_mat*reader.scale, reader.cache);
     }
