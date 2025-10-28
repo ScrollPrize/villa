@@ -1076,6 +1076,10 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 onConvertToObj(segmentId.toStdString());
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::alphaCompRefineRequested,
+            this, [this](const QString& segmentId) {
+                onAlphaCompRefine(segmentId.toStdString());
+            });
     connect(_surfacePanel.get(), &SurfacePanelController::slimFlattenRequested,
             this, [this](const QString& segmentId) {
                 onSlimFlatten(segmentId.toStdString());
@@ -3191,6 +3195,16 @@ void CWindow::processInotifySegmentUpdate(const std::string& dirName, const std:
 
     bool wasSelected = (_surfID == segmentId);
 
+    // Skip reload if this surface is currently being edited to avoid use-after-free
+    // when autosave triggers an inotify event
+    if (_segmentationModule && _segmentationModule->editingEnabled()) {
+        auto* activeBaseSurface = _segmentationModule->activeBaseSurface();
+        if (activeBaseSurface && activeBaseSurface->id == segmentId) {
+            Logger()->info("Skipping reload of {} - currently being edited", segmentId);
+            return;
+        }
+    }
+
     // Reload the segmentation
     if (fVpkg->reloadSingleSegmentation(segmentId)) {
         // Remove and re-add to UI to refresh all metadata
@@ -3309,6 +3323,16 @@ void CWindow::processInotifySegmentAddition(const std::string& dirName, const st
     // The UUID will be the directory name (or will be updated to match)
     std::string segmentId = segmentName;
 
+    // Skip addition if this surface is currently being edited to avoid use-after-free
+    // when autosave triggers delete/add inotify events
+    if (_segmentationModule && _segmentationModule->editingEnabled()) {
+        auto* activeBaseSurface = _segmentationModule->activeBaseSurface();
+        if (activeBaseSurface && activeBaseSurface->id == segmentId) {
+            Logger()->info("Skipping addition of {} - currently being edited", segmentId);
+            return;
+        }
+    }
+
     // Switch directory if needed
     std::string previousDir;
     if (!isCurrentDir) {
@@ -3365,6 +3389,16 @@ void CWindow::processInotifySegmentRemoval(const std::string& dirName, const std
     }
 
     bool isCurrentDir = (dirName == fVpkg->getSegmentationDirectory());
+
+    // Skip removal if this surface is currently being edited to avoid use-after-free
+    // when autosave triggers delete/add inotify events
+    if (_segmentationModule && _segmentationModule->editingEnabled()) {
+        auto* activeBaseSurface = _segmentationModule->activeBaseSurface();
+        if (activeBaseSurface && activeBaseSurface->id == segmentId) {
+            Logger()->info("Skipping removal of {} - currently being edited", segmentId);
+            return;
+        }
+    }
 
     // Remove from VolumePkg
     if (fVpkg->removeSingleSegmentation(segmentId)) {

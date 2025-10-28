@@ -18,6 +18,8 @@
 #include <QJsonArray>
 #include <QFile>
 
+#include <cmath>
+
 // ----- helper creators -----
 static QWidget* pathPicker(QWidget* parent, QLineEdit*& lineOut, const QString& dialogTitle, bool dirMode) {
     auto w = new QWidget(parent);
@@ -768,5 +770,215 @@ void ConvertToObjDialog::updateSessionFromUI() {
     s_decimate = spDecimate_->value();
     s_clean = chkClean_->isChecked();
     s_cleanK = spCleanK_->value();
+    s_ompThreads = ompThreads();
+}
+
+bool AlphaCompRefineDialog::s_haveSession = false;
+double AlphaCompRefineDialog::s_start = -6.0;
+double AlphaCompRefineDialog::s_stop = 30.0;
+double AlphaCompRefineDialog::s_step = 2.0;
+double AlphaCompRefineDialog::s_low = 26.0;
+double AlphaCompRefineDialog::s_high = 255.0;
+double AlphaCompRefineDialog::s_borderOff = 1.0;
+int AlphaCompRefineDialog::s_radius = 3;
+double AlphaCompRefineDialog::s_readerScale = 0.5;
+QString AlphaCompRefineDialog::s_scaleGroup = QStringLiteral("1");
+bool AlphaCompRefineDialog::s_refine = true;
+bool AlphaCompRefineDialog::s_vertexColor = false;
+bool AlphaCompRefineDialog::s_overwrite = true;
+int AlphaCompRefineDialog::s_ompThreads = -1;
+
+AlphaCompRefineDialog::AlphaCompRefineDialog(QWidget* parent,
+                                             const QString& volumePath,
+                                             const QString& srcSurfacePath,
+                                             const QString& dstSurfacePath)
+    : QDialog(parent)
+{
+    setWindowTitle(tr("Alpha-Composite Refinement"));
+    auto main = new QVBoxLayout(this);
+
+    auto pathsBox = new QGroupBox(tr("Paths"), this);
+    auto paths = new QFormLayout(pathsBox);
+    pathsBox->setLayout(paths);
+
+    QWidget* volPick = pathPicker(this, edtVolume_, tr("Select OME-Zarr volume"), true);
+    QWidget* srcPick = pathPicker(this, edtSrc_, tr("Select source surface"), true);
+    QWidget* dstPick = pathPicker(this, edtDst_, tr("Select output surface"), true);
+
+    edtVolume_->setText(volumePath);
+    edtSrc_->setText(srcSurfacePath);
+    edtDst_->setText(dstSurfacePath);
+
+    paths->addRow(tr("Volume:"), volPick);
+    paths->addRow(tr("Source:"), srcPick);
+    paths->addRow(tr("Output:"), dstPick);
+
+    main->addWidget(pathsBox);
+
+    auto paramsBox = new QGroupBox(tr("Refinement Parameters"), this);
+    auto params = new QFormLayout(paramsBox);
+    paramsBox->setLayout(params);
+
+    chkRefine_ = new QCheckBox(tr("Enable geometry refinement"), this);
+    chkRefine_->setChecked(true);
+
+    spStart_ = new QDoubleSpinBox(this); spStart_->setRange(-1000.0, 1000.0); spStart_->setDecimals(3); spStart_->setValue(-6.0);
+    spStop_  = new QDoubleSpinBox(this); spStop_->setRange(-1000.0, 1000.0);  spStop_->setDecimals(3);  spStop_->setValue(30.0);
+    spStep_  = new QDoubleSpinBox(this); spStep_->setRange(0.001, 1000.0);    spStep_->setDecimals(3);  spStep_->setValue(2.0);
+    spLow_   = new QDoubleSpinBox(this);  spLow_->setRange(0.0, 255.0);       spLow_->setDecimals(0);   spLow_->setSingleStep(1.0);   spLow_->setValue(26.0);
+    spHigh_  = new QDoubleSpinBox(this);  spHigh_->setRange(0.0, 255.0);      spHigh_->setDecimals(0);  spHigh_->setSingleStep(1.0);  spHigh_->setValue(255.0);
+    spBorder_= new QDoubleSpinBox(this); spBorder_->setRange(-100.0, 100.0);  spBorder_->setDecimals(3);spBorder_->setValue(1.0);
+    spRadius_= new QSpinBox(this);        spRadius_->setRange(1, 100);        spRadius_->setValue(3);
+    spReaderScale_ = new QDoubleSpinBox(this); spReaderScale_->setRange(0.0001, 1000.0); spReaderScale_->setDecimals(4); spReaderScale_->setValue(0.5);
+    edtScaleGroup_ = new QLineEdit(this); edtScaleGroup_->setText(QStringLiteral("1"));
+
+    chkVertexColor_ = new QCheckBox(tr("Generate vertex color (OBJ only)"), this);
+    chkOverwrite_ = new QCheckBox(tr("Overwrite if output exists"), this);
+    chkOverwrite_->setChecked(true);
+
+    edtThreads_ = new QLineEdit(this);
+    edtThreads_->setPlaceholderText(tr("optional"));
+    edtThreads_->setValidator(new QRegularExpressionValidator(QRegularExpression("^\\s*\\d*\\s*$"), this));
+
+    params->addRow(chkRefine_);
+    params->addRow(tr("Start:"), spStart_);
+    params->addRow(tr("Stop:"), spStop_);
+    params->addRow(tr("Step:"), spStep_);
+    params->addRow(tr("Opacity low (0-255):"), spLow_);
+    params->addRow(tr("Opacity high (0-255):"), spHigh_);
+    params->addRow(tr("Border offset:"), spBorder_);
+    params->addRow(tr("Gaussian radius:"), spRadius_);
+    params->addRow(tr("Reader scale:"), spReaderScale_);
+    params->addRow(tr("Scale group:"), edtScaleGroup_);
+    params->addRow(chkVertexColor_);
+    params->addRow(chkOverwrite_);
+    params->addRow(tr("OMP threads:"), edtThreads_);
+
+    main->addWidget(paramsBox);
+
+    auto buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    connect(buttons, &QDialogButtonBox::accepted, this, &AlphaCompRefineDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, this, &AlphaCompRefineDialog::reject);
+    main->addWidget(buttons);
+
+    applySavedDefaults();
+    applySessionDefaults();
+}
+
+QString AlphaCompRefineDialog::volumePath() const { return edtVolume_->text().trimmed(); }
+QString AlphaCompRefineDialog::srcPath() const { return edtSrc_->text().trimmed(); }
+QString AlphaCompRefineDialog::dstPath() const { return edtDst_->text().trimmed(); }
+
+QJsonObject AlphaCompRefineDialog::paramsJson() const
+{
+    QJsonObject obj;
+    obj["refine"] = chkRefine_->isChecked();
+    obj["start"] = spStart_->value();
+    obj["stop"] = spStop_->value();
+    obj["step"] = spStep_->value();
+    obj["low"] = static_cast<int>(std::lround(spLow_->value()));
+    obj["high"] = static_cast<int>(std::lround(spHigh_->value()));
+    obj["border_off"] = spBorder_->value();
+    obj["r"] = spRadius_->value();
+    obj["gen_vertexcolor"] = chkVertexColor_->isChecked();
+    obj["overwrite"] = chkOverwrite_->isChecked();
+    obj["reader_scale"] = spReaderScale_->value();
+
+    const QString sg = edtScaleGroup_->text().trimmed();
+    obj["scale_group"] = sg.isEmpty() ? QStringLiteral("1") : sg;
+
+    return obj;
+}
+
+int AlphaCompRefineDialog::ompThreads() const
+{
+    const QString text = edtThreads_->text().trimmed();
+    bool ok = false;
+    int v = text.toInt(&ok);
+    return ok ? v : -1;
+}
+
+void AlphaCompRefineDialog::accept()
+{
+    updateSessionFromUI();
+    saveDefaults();
+    QDialog::accept();
+}
+
+void AlphaCompRefineDialog::applySavedDefaults()
+{
+    QSettings s("VC.ini", QSettings::IniFormat);
+    s.beginGroup("objrefine/defaults");
+    chkRefine_->setChecked(s.value("refine", chkRefine_->isChecked()).toBool());
+    spStart_->setValue(s.value("start", spStart_->value()).toDouble());
+    spStop_->setValue(s.value("stop", spStop_->value()).toDouble());
+    spStep_->setValue(s.value("step", spStep_->value()).toDouble());
+    spLow_->setValue(s.value("low", spLow_->value()).toDouble());
+    spHigh_->setValue(s.value("high", spHigh_->value()).toDouble());
+    spBorder_->setValue(s.value("border_off", spBorder_->value()).toDouble());
+    spRadius_->setValue(s.value("radius", spRadius_->value()).toInt());
+    spReaderScale_->setValue(s.value("reader_scale", spReaderScale_->value()).toDouble());
+    edtScaleGroup_->setText(s.value("scale_group", edtScaleGroup_->text()).toString());
+    chkVertexColor_->setChecked(s.value("vertex_color", chkVertexColor_->isChecked()).toBool());
+    chkOverwrite_->setChecked(s.value("overwrite", chkOverwrite_->isChecked()).toBool());
+    const int th = s.value("omp_threads", -1).toInt();
+    edtThreads_->setText(th > 0 ? QString::number(th) : "");
+    s.endGroup();
+}
+
+void AlphaCompRefineDialog::applySessionDefaults()
+{
+    if (!s_haveSession) return;
+    chkRefine_->setChecked(s_refine);
+    spStart_->setValue(s_start);
+    spStop_->setValue(s_stop);
+    spStep_->setValue(s_step);
+    spLow_->setValue(s_low);
+    spHigh_->setValue(s_high);
+    spBorder_->setValue(s_borderOff);
+    spRadius_->setValue(s_radius);
+    spReaderScale_->setValue(s_readerScale);
+    edtScaleGroup_->setText(s_scaleGroup);
+    chkVertexColor_->setChecked(s_vertexColor);
+    chkOverwrite_->setChecked(s_overwrite);
+    edtThreads_->setText(s_ompThreads > 0 ? QString::number(s_ompThreads) : "");
+}
+
+void AlphaCompRefineDialog::saveDefaults() const
+{
+    QSettings s("VC.ini", QSettings::IniFormat);
+    s.beginGroup("objrefine/defaults");
+    s.setValue("refine", chkRefine_->isChecked());
+    s.setValue("start", spStart_->value());
+    s.setValue("stop", spStop_->value());
+    s.setValue("step", spStep_->value());
+    s.setValue("low", static_cast<int>(std::lround(spLow_->value())));
+    s.setValue("high", static_cast<int>(std::lround(spHigh_->value())));
+    s.setValue("border_off", spBorder_->value());
+    s.setValue("radius", spRadius_->value());
+    s.setValue("reader_scale", spReaderScale_->value());
+    s.setValue("scale_group", edtScaleGroup_->text().trimmed().isEmpty() ? QStringLiteral("1") : edtScaleGroup_->text().trimmed());
+    s.setValue("vertex_color", chkVertexColor_->isChecked());
+    s.setValue("overwrite", chkOverwrite_->isChecked());
+    s.setValue("omp_threads", ompThreads());
+    s.endGroup();
+}
+
+void AlphaCompRefineDialog::updateSessionFromUI()
+{
+    s_haveSession = true;
+    s_refine = chkRefine_->isChecked();
+    s_start = spStart_->value();
+    s_stop = spStop_->value();
+    s_step = spStep_->value();
+    s_low = spLow_->value();
+    s_high = spHigh_->value();
+    s_borderOff = spBorder_->value();
+    s_radius = spRadius_->value();
+    s_readerScale = spReaderScale_->value();
+    const QString sg = edtScaleGroup_->text().trimmed();
+    s_scaleGroup = sg.isEmpty() ? QStringLiteral("1") : sg;
+    s_vertexColor = chkVertexColor_->isChecked();
+    s_overwrite = chkOverwrite_->isChecked();
     s_ompThreads = ompThreads();
 }

@@ -13,14 +13,18 @@
 
 #include <QCoreApplication>
 #include <QTimer>
+#include <QLoggingCategory>
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <optional>
+#include <numeric>
 #include <vector>
 
 #include <opencv2/imgproc.hpp>
+
+Q_LOGGING_CATEGORY(lcSegPushPull, "vc.segmentation.pushpull")
 
 namespace
 {
@@ -36,6 +40,323 @@ constexpr float kAlphaPerVertexLimitMax = 128.0f;
 bool nearlyEqual(float lhs, float rhs)
 {
     return std::fabs(lhs - rhs) < 1e-4f;
+}
+
+bool isFiniteVec3(const cv::Vec3f& value)
+{
+    return std::isfinite(value[0]) && std::isfinite(value[1]) && std::isfinite(value[2]);
+}
+
+bool isValidNormal(const cv::Vec3f& normal)
+{
+    if (!isFiniteVec3(normal)) {
+        return false;
+    }
+    const float norm = static_cast<float>(cv::norm(normal));
+    return norm > 1e-4f;
+}
+
+cv::Vec3f normalizeVec(const cv::Vec3f& value)
+{
+    const float norm = static_cast<float>(cv::norm(value));
+    if (!std::isfinite(norm) || norm <= 1e-6f) {
+        return cv::Vec3f(0.0f, 0.0f, 0.0f);
+    }
+    return value / norm;
+}
+
+std::optional<cv::Vec3f> averageNormals(const std::vector<cv::Vec3f>& normals)
+{
+    if (normals.empty()) {
+        return std::nullopt;
+    }
+    cv::Vec3f sum(0.0f, 0.0f, 0.0f);
+    for (const auto& normal : normals) {
+        sum += normal;
+    }
+    sum = normalizeVec(sum);
+    if (!isValidNormal(sum)) {
+        return std::nullopt;
+    }
+    return sum;
+}
+
+std::optional<cv::Vec3f> sampleSurfaceNormalsNearCenter(QuadSurface* surface,
+                                                        const cv::Vec3f& basePtr,
+                                                        const SegmentationEditManager::ActiveDrag& drag)
+{
+    if (!surface || !drag.active) {
+        return std::nullopt;
+    }
+
+    std::vector<cv::Vec3f> normals;
+    normals.reserve(8);
+
+    // Try the center first, then nearby samples in order of proximity.
+    const auto collectNormalAt = [&](const cv::Vec3f& worldPoint) {
+        cv::Vec3f ptrCandidate = basePtr;
+        surface->pointTo(ptrCandidate, worldPoint, std::numeric_limits<float>::max(), 200);
+        const cv::Vec3f candidateNormal = surface->normal(ptrCandidate);
+        if (isValidNormal(candidateNormal)) {
+            normals.push_back(candidateNormal);
+        }
+    };
+
+    collectNormalAt(drag.baseWorld);
+    if (normals.empty()) {
+        // Evaluate additional nearby samples, prioritising the ones closest to the center.
+        auto samples = drag.samples;
+        std::sort(samples.begin(),
+                  samples.end(),
+                  [](const SegmentationEditManager::DragSample& lhs,
+                     const SegmentationEditManager::DragSample& rhs) {
+                      return lhs.distanceWorldSq < rhs.distanceWorldSq;
+                  });
+        for (const auto& sample : samples) {
+            if (sample.row == drag.center.row && sample.col == drag.center.col) {
+                continue;
+            }
+            collectNormalAt(sample.baseWorld);
+            if (normals.size() >= 4) {
+                break;
+            }
+        }
+    }
+
+    return averageNormals(normals);
+}
+
+enum class AxisDirection
+{
+    Row,
+    Column
+};
+
+std::optional<cv::Vec3f> axisVectorFromSamples(AxisDirection axis,
+                                               const SegmentationEditManager::ActiveDrag& drag)
+{
+    if (!drag.active || drag.samples.empty()) {
+        return std::nullopt;
+    }
+
+    const auto& center = drag.center;
+    const cv::Vec3f& centerWorld = drag.baseWorld;
+
+    const SegmentationEditManager::DragSample* posSample = nullptr;
+    const SegmentationEditManager::DragSample* negSample = nullptr;
+
+    int bestPosPrimary = std::numeric_limits<int>::max();
+    int bestPosSecondary = std::numeric_limits<int>::max();
+    float bestPosDist = std::numeric_limits<float>::max();
+
+    int bestNegPrimary = std::numeric_limits<int>::max();
+    int bestNegSecondary = std::numeric_limits<int>::max();
+    float bestNegDist = std::numeric_limits<float>::max();
+
+    for (const auto& sample : drag.samples) {
+        int primaryDelta = 0;
+        int secondaryDelta = 0;
+        if (axis == AxisDirection::Row) {
+            primaryDelta = sample.row - center.row;
+            secondaryDelta = std::abs(sample.col - center.col);
+        } else {
+            primaryDelta = sample.col - center.col;
+            secondaryDelta = std::abs(sample.row - center.row);
+        }
+
+        if (primaryDelta == 0) {
+            continue;
+        }
+
+        const int absPrimary = std::abs(primaryDelta);
+        const float distSq = std::max(sample.distanceWorldSq, 0.0f);
+
+        auto updateCandidate = [&](const SegmentationEditManager::DragSample*& currentSample,
+                                   int& bestPrimary,
+                                   int& bestSecondary,
+                                   float& bestDist) {
+            if (absPrimary < bestPrimary ||
+                (absPrimary == bestPrimary &&
+                 (secondaryDelta < bestSecondary ||
+                  (secondaryDelta == bestSecondary && distSq < bestDist)))) {
+                currentSample = &sample;
+                bestPrimary = absPrimary;
+                bestSecondary = secondaryDelta;
+                bestDist = distSq;
+            }
+        };
+
+        if (primaryDelta > 0) {
+            updateCandidate(posSample, bestPosPrimary, bestPosSecondary, bestPosDist);
+        } else {
+            updateCandidate(negSample, bestNegPrimary, bestNegSecondary, bestNegDist);
+        }
+    }
+
+    cv::Vec3f axisVec(0.0f, 0.0f, 0.0f);
+    if (posSample && negSample) {
+        axisVec = posSample->baseWorld - negSample->baseWorld;
+    } else if (posSample) {
+        axisVec = posSample->baseWorld - centerWorld;
+    } else if (negSample) {
+        axisVec = centerWorld - negSample->baseWorld;
+    } else {
+        return std::nullopt;
+    }
+
+    axisVec = normalizeVec(axisVec);
+    if (!isValidNormal(axisVec)) {
+        return std::nullopt;
+    }
+    return axisVec;
+}
+
+std::optional<cv::Vec3f> fitPlaneNormal(const SegmentationEditManager::ActiveDrag& drag,
+                                        const cv::Vec3f& centerWorld,
+                                        const std::optional<cv::Vec3f>& rowVec,
+                                        const std::optional<cv::Vec3f>& colVec,
+                                        const std::optional<cv::Vec3f>& orientationHint)
+{
+    if (!drag.active) {
+        return std::nullopt;
+    }
+
+    if (drag.samples.size() < 3) {
+        return std::nullopt;
+    }
+
+    std::vector<cv::Vec3d> points;
+    std::vector<double> weights;
+    points.reserve(drag.samples.size());
+    weights.reserve(drag.samples.size());
+
+    double weightSum = 0.0;
+    cv::Vec3d centroid(0.0, 0.0, 0.0);
+
+    for (const auto& sample : drag.samples) {
+        if (!isFiniteVec3(sample.baseWorld)) {
+            continue;
+        }
+        const double dist = std::sqrt(std::max(sample.distanceWorldSq, 0.0f));
+        const double weight = 1.0 / (1.0 + dist);
+        const cv::Vec3d point(sample.baseWorld[0], sample.baseWorld[1], sample.baseWorld[2]);
+        points.push_back(point);
+        weights.push_back(weight);
+        centroid += point * weight;
+        weightSum += weight;
+    }
+
+    if (weightSum <= 0.0 || points.size() < 3) {
+        return std::nullopt;
+    }
+
+    centroid /= weightSum;
+
+    cv::Matx33d covariance = cv::Matx33d::zeros();
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        const cv::Vec3d diff = points[i] - centroid;
+        const double w = weights[i];
+        covariance(0, 0) += w * diff[0] * diff[0];
+        covariance(0, 1) += w * diff[0] * diff[1];
+        covariance(0, 2) += w * diff[0] * diff[2];
+        covariance(1, 0) += w * diff[1] * diff[0];
+        covariance(1, 1) += w * diff[1] * diff[1];
+        covariance(1, 2) += w * diff[1] * diff[2];
+        covariance(2, 0) += w * diff[2] * diff[0];
+        covariance(2, 1) += w * diff[2] * diff[1];
+        covariance(2, 2) += w * diff[2] * diff[2];
+    }
+
+    cv::Mat eigenValues, eigenVectors;
+    cv::eigen(covariance, eigenValues, eigenVectors);
+    if (eigenVectors.rows != 3 || eigenVectors.cols != 3) {
+        return std::nullopt;
+    }
+
+    cv::Vec3d normal(eigenVectors.at<double>(2, 0),
+                     eigenVectors.at<double>(2, 1),
+                     eigenVectors.at<double>(2, 2));
+    double normalNorm = cv::norm(normal);
+    if (!std::isfinite(normalNorm) || normalNorm <= 1e-6) {
+        return std::nullopt;
+    }
+    normal /= normalNorm;
+
+    cv::Vec3d orientation(0.0, 0.0, 0.0);
+    bool orientationValid = false;
+    if (rowVec && colVec) {
+        const cv::Vec3f crossHint = rowVec->cross(*colVec);
+        const double hintNorm = cv::norm(crossHint);
+        if (hintNorm > 1e-6) {
+            orientation = cv::Vec3d(crossHint[0] / hintNorm,
+                                    crossHint[1] / hintNorm,
+                                    crossHint[2] / hintNorm);
+            orientationValid = true;
+        }
+    }
+
+    if (!orientationValid && orientationHint) {
+        const cv::Vec3f hintVec = normalizeVec(*orientationHint);
+        const double hintNorm = cv::norm(cv::Vec3d(hintVec[0], hintVec[1], hintVec[2]));
+        if (hintNorm > 1e-6) {
+            orientation = cv::Vec3d(hintVec[0], hintVec[1], hintVec[2]);
+            orientationValid = true;
+        }
+    }
+
+    if (!orientationValid) {
+        cv::Vec3d toCentroid = centroid - cv::Vec3d(centerWorld[0], centerWorld[1], centerWorld[2]);
+        const double hintNorm = cv::norm(toCentroid);
+        if (hintNorm > 1e-6) {
+            orientation = toCentroid / hintNorm;
+            orientationValid = true;
+        }
+    }
+
+    if (orientationValid && normal.dot(orientation) < 0.0) {
+        normal = -normal;
+    }
+
+    return cv::Vec3f(static_cast<float>(normal[0]),
+                     static_cast<float>(normal[1]),
+                     static_cast<float>(normal[2]));
+}
+
+std::optional<cv::Vec3f> computeRobustNormal(QuadSurface* surface,
+                                             const cv::Vec3f& centerPtr,
+                                             const cv::Vec3f& centerWorld,
+                                             const SegmentationEditManager::ActiveDrag& drag)
+{
+    if (!surface || !drag.active) {
+        return std::nullopt;
+    }
+
+    const auto surfaceNormal = sampleSurfaceNormalsNearCenter(surface, centerPtr, drag);
+    const auto rowVec = axisVectorFromSamples(AxisDirection::Row, drag);
+    const auto colVec = axisVectorFromSamples(AxisDirection::Column, drag);
+
+    std::optional<cv::Vec3f> crossNormal;
+    if (rowVec && colVec) {
+        cv::Vec3f candidate = rowVec->cross(*colVec);
+        candidate = normalizeVec(candidate);
+        if (isValidNormal(candidate)) {
+            crossNormal = candidate;
+        }
+    }
+
+    const std::optional<cv::Vec3f> orientationHint = crossNormal ? crossNormal : surfaceNormal;
+    if (auto planeNormal = fitPlaneNormal(drag, centerWorld, rowVec, colVec, orientationHint)) {
+        return planeNormal;
+    }
+
+    if (surfaceNormal) {
+        return surfaceNormal;
+    }
+    if (crossNormal) {
+        return crossNormal;
+    }
+
+    return std::nullopt;
 }
 }
 
@@ -190,16 +511,21 @@ bool SegmentationPushPullTool::applyStep()
 bool SegmentationPushPullTool::applyStepInternal()
 {
     if (!_state.active || !_editManager || !_editManager->hasSession()) {
+        qCWarning(lcSegPushPull) << "Push/pull aborted: tool inactive or no active editing session.";
         return false;
     }
 
     const auto hover = _module.hoverInfo();
     if (!hover.valid || !hover.viewer || !_module.isSegmentationViewer(hover.viewer)) {
+        qCWarning(lcSegPushPull) << "Push/pull aborted: hover info invalid or viewer not ready.";
         return false;
     }
 
     const int row = hover.row;
     const int col = hover.col;
+    const auto logFailure = [&](const char* reason) {
+        qCWarning(lcSegPushPull) << reason << "(row" << row << ", col" << col << ")";
+    };
 
     bool snapshotCapturedThisStep = false;
     if (!_undoCaptured) {
@@ -214,6 +540,7 @@ bool SegmentationPushPullTool::applyStepInternal()
             _module.discardLastUndoSnapshot();
             _undoCaptured = false;
         }
+        logFailure("Push/pull aborted: beginActiveDrag failed");
         return false;
     }
 
@@ -224,6 +551,7 @@ bool SegmentationPushPullTool::applyStepInternal()
             _module.discardLastUndoSnapshot();
             _undoCaptured = false;
         }
+        logFailure("Push/pull aborted: vertex world position unavailable");
         return false;
     }
     const cv::Vec3f centerWorld = *centerWorldOpt;
@@ -231,6 +559,7 @@ bool SegmentationPushPullTool::applyStepInternal()
     QuadSurface* baseSurface = _editManager->baseSurface();
     if (!baseSurface) {
         _editManager->cancelActiveDrag();
+        logFailure("Push/pull aborted: base surface missing");
         return false;
     }
 
@@ -238,13 +567,35 @@ bool SegmentationPushPullTool::applyStepInternal()
     baseSurface->pointTo(ptr, centerWorld, std::numeric_limits<float>::max(), 400);
     cv::Vec3f normal = baseSurface->normal(ptr);
     if (std::isnan(normal[0]) || std::isnan(normal[1]) || std::isnan(normal[2])) {
+        if (const auto fallbackNormal = computeRobustNormal(baseSurface, ptr, centerWorld, _editManager->activeDrag())) {
+            normal = *fallbackNormal;
+        } else {
+            _editManager->cancelActiveDrag();
+            logFailure("Push/pull aborted: surface normal lookup returned NaN and fallback failed");
+            return false;
+        }
+    }
+
+    if (!isValidNormal(normal)) {
+        if (const auto fallbackNormal = computeRobustNormal(baseSurface, ptr, centerWorld, _editManager->activeDrag())) {
+            normal = *fallbackNormal;
+        } else {
+            _editManager->cancelActiveDrag();
+            logFailure("Push/pull aborted: surface normal invalid and fallback failed");
+            return false;
+        }
+    }
+
+    if (!isValidNormal(normal)) {
         _editManager->cancelActiveDrag();
+        logFailure("Push/pull aborted: surface normal remained invalid after fallback");
         return false;
     }
 
     const float norm = cv::norm(normal);
     if (norm <= 1e-4f) {
         _editManager->cancelActiveDrag();
+        logFailure("Push/pull aborted: surface normal magnitude too small");
         return false;
     }
     normal /= norm;
@@ -334,6 +685,7 @@ bool SegmentationPushPullTool::applyStepInternal()
                     _module.discardLastUndoSnapshot();
                     _undoCaptured = false;
                 }
+                logFailure("Push/pull aborted: alpha push/pull unavailable for per-vertex samples");
                 return false;
             }
 
@@ -343,6 +695,7 @@ bool SegmentationPushPullTool::applyStepInternal()
                     _module.discardLastUndoSnapshot();
                     _undoCaptured = false;
                 }
+                logFailure("Push/pull aborted: alpha push/pull produced no movement for per-vertex samples");
                 return false;
             }
 
@@ -352,6 +705,7 @@ bool SegmentationPushPullTool::applyStepInternal()
                     _module.discardLastUndoSnapshot();
                     _undoCaptured = false;
                 }
+                logFailure("Push/pull aborted: failed to update per-vertex drag targets");
                 return false;
             }
 
@@ -375,6 +729,7 @@ bool SegmentationPushPullTool::applyStepInternal()
                 _module.discardLastUndoSnapshot();
                 _undoCaptured = false;
             }
+            logFailure("Push/pull aborted: alpha push/pull target unavailable");
             return false;
         }
     }
@@ -383,6 +738,7 @@ bool SegmentationPushPullTool::applyStepInternal()
         const float stepWorld = _module.gridStepWorld() * _stepMultiplier;
         if (stepWorld <= 0.0f) {
             _editManager->cancelActiveDrag();
+            logFailure("Push/pull aborted: computed step size non-positive");
             return false;
         }
         targetWorld = centerWorld + normal * (static_cast<float>(_state.direction) * stepWorld);
@@ -395,6 +751,7 @@ bool SegmentationPushPullTool::applyStepInternal()
                 _module.discardLastUndoSnapshot();
                 _undoCaptured = false;
             }
+            logFailure("Push/pull aborted: failed to update drag target");
             return false;
         }
     }

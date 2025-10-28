@@ -202,3 +202,59 @@ private:
     QCheckBox* chkClean_{nullptr};
     QDoubleSpinBox* spCleanK_{nullptr};
 };
+
+class AlphaCompRefineDialog : public QDialog {
+    Q_OBJECT
+public:
+    AlphaCompRefineDialog(QWidget* parent,
+                          const QString& volumePath,
+                          const QString& srcSurfacePath,
+                          const QString& dstSurfacePath);
+
+    QString volumePath() const;
+    QString srcPath() const;
+    QString dstPath() const;
+    QJsonObject paramsJson() const;
+    int ompThreads() const; // -1 if unset
+
+protected:
+    void accept() override;
+
+private:
+    void applySavedDefaults();
+    void applySessionDefaults();
+    void saveDefaults() const;
+    void updateSessionFromUI();
+
+    static bool s_haveSession;
+    static double s_start;
+    static double s_stop;
+    static double s_step;
+    static double s_low;
+    static double s_high;
+    static double s_borderOff;
+    static int    s_radius;
+    static double s_readerScale;
+    static QString s_scaleGroup;
+    static bool   s_refine;
+    static bool   s_vertexColor;
+    static bool   s_overwrite;
+    static int    s_ompThreads;
+
+    QLineEdit* edtVolume_{nullptr};
+    QLineEdit* edtSrc_{nullptr};
+    QLineEdit* edtDst_{nullptr};
+    QLineEdit* edtScaleGroup_{nullptr};
+    QLineEdit* edtThreads_{nullptr};
+    QDoubleSpinBox* spStart_{nullptr};
+    QDoubleSpinBox* spStop_{nullptr};
+    QDoubleSpinBox* spStep_{nullptr};
+    QDoubleSpinBox* spLow_{nullptr};
+    QDoubleSpinBox* spHigh_{nullptr};
+    QDoubleSpinBox* spBorder_{nullptr};
+    QSpinBox* spRadius_{nullptr};
+    QDoubleSpinBox* spReaderScale_{nullptr};
+    QCheckBox* chkRefine_{nullptr};
+    QCheckBox* chkVertexColor_{nullptr};
+    QCheckBox* chkOverwrite_{nullptr};
+};

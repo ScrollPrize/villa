@@ -632,6 +632,11 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         emit convertToObjRequested(segmentId);
     });
 
+    QAction* refineAlphaCompAction = contextMenu.addAction(tr("Refine (Alpha-comp)"));
+    connect(refineAlphaCompAction, &QAction::triggered, this, [this, segmentId]() {
+        emit alphaCompRefineRequested(segmentId);
+    });
+
     QAction* slimFlattenAction = contextMenu.addAction(tr("SLIM-flatten"));
     connect(slimFlattenAction, &QAction::triggered, this, [this, segmentId]() {
         emit slimFlattenRequested(segmentId);

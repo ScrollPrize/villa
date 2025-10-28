@@ -39,41 +39,35 @@ static xt::xarray<T> *readChunk(const z5::Dataset & ds, z5::types::ShapeType chu
         throw std::runtime_error("only uint8_t/uint16 zarrs supported currently!");
 
     z5::types::ShapeType chunkShape;
-    // size_t chunkSize;
     ds.getChunkShape(chunkId, chunkShape);
-    // get the shape of the chunk (as stored it is stored)
-    //for ZARR also edge chunks are always full size!
     const std::size_t maxChunkSize = ds.defaultChunkSize();
     const auto & maxChunkShape = ds.defaultChunkShape();
-
-    // chunkSize = std::accumulate(chunkShape.begin(), chunkShape.end(), 1, std::multiplies<std::size_t>());
 
     xt::xarray<T> *out = new xt::xarray<T>();
     *out = xt::empty<T>(maxChunkShape);
 
-
-    // read/decompress & convert data according to requested T
+    // Handle based on both dataset dtype and target type T
     if (ds.getDtype() == z5::types::Datatype::uint8) {
-        if constexpr (std::is_same_v<T,uint8_t>) {
+        // Dataset is uint8 - direct read for uint8_t, invalid for uint16_t
+        if constexpr (std::is_same_v<T, uint8_t>) {
             ds.readChunk(chunkId, out->data());
         } else {
-            // upcast 8->16 (preserve scale by *257 for round-ish mapping)
-            xt::xarray<uint8_t> tmp = xt::empty<uint8_t>(maxChunkShape);
-            ds.readChunk(chunkId, tmp.data());
-            uint16_t *p16 = out->data();
-            uint8_t  *p8  = tmp.data();
-            for (size_t i=0;i<maxChunkSize;i++) p16[i] = static_cast<uint16_t>(p8[i]) * 257u;
+            throw std::runtime_error("Cannot read uint8 dataset into uint16 array");
         }
-    } else { // src is uint16
-        if constexpr (std::is_same_v<T,uint16_t>) {
+    }
+    else if (ds.getDtype() == z5::types::Datatype::uint16) {
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            // Dataset is uint16, target is uint16 - direct read
             ds.readChunk(chunkId, out->data());
-        } else {
-            // downcast 16->8 with /257 mapping
+        } else if constexpr (std::is_same_v<T, uint8_t>) {
+            // Dataset is uint16, target is uint8 - need conversion
             xt::xarray<uint16_t> tmp = xt::empty<uint16_t>(maxChunkShape);
             ds.readChunk(chunkId, tmp.data());
-            uint8_t  *p8  = out->data();
+
+            uint8_t *p8 = out->data();
             uint16_t *p16 = tmp.data();
-            for (size_t i=0;i<maxChunkSize;i++) p8[i] = static_cast<uint8_t>(p16[i] / 257u);
+            for(size_t i = 0; i < maxChunkSize; i++)
+                p8[i] = p16[i] / 257;
         }
     }
 
@@ -91,7 +85,6 @@ int ChunkCache::groupIdx(const std::string &name)
     
 void ChunkCache::put(const cv::Vec4i &idx, xt::xarray<uint8_t> *ar)
 {
-    // evict in bytes (treat _size as byte budget)
     if (_stored >= _size) {
         using KP = std::pair<cv::Vec4i, uint64_t>;
         std::vector<KP> gen_list(_gen_store.begin(), _gen_store.end());
@@ -959,7 +952,7 @@ void readInterpolated3D(cv::Mat_<uint16_t> &out, z5::Dataset *ds,
     }
 }
 
-//somehow opencvs functions are pretty slow 
+//somehow opencvs functions are pretty slow
 static cv::Vec3f normed(const cv::Vec3f v)
 {
     return v/sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
