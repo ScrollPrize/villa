@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 
 from dataset import PatchInCubeDataset, HeatmapDataset, HeatmapDatasetV2
-from vesuvius_unet3d import Vesuvius3dUnetModel
+from models import make_model
 from sampling import sample_ddim
 
 
@@ -78,12 +78,7 @@ def train(config_path):
         dataset = PatchInCubeDataset(config)
     train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config['batch_size'], num_workers=config['num_workers'])
 
-    if config['model_type'] == 'unet':
-        model = Vesuvius3dUnetModel(in_channels=5, out_channels=config['step_count'] * 2, config=config)
-    elif config['model_type'] == 'vit':
-        model = Vesuvius3dViTModel(mae_ckpt_path=config['model_config'].get('mae_ckpt_path', None), in_channels=5, out_channels=config['step_count'] * 2, input_size=128, patch_size=8)
-    else:
-        assert False
+    model = make_model(config)
 
     noise_scheduler = diffusers.DDPMScheduler(
         num_train_timesteps=1000,
