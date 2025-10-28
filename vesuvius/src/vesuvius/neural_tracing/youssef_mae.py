@@ -170,7 +170,6 @@ class ViT3DSegmentation(nn.Module):
         # Calculate patch dimensions
         patch_dim = config.channels * config.image_patch_size * config.image_patch_size * config.frame_patch_size
 
-        # if config.image_size == config.frames == 256 and config.image_patch_size == config.frame_patch_size == 16 and config.channels == 1:  # i.e. the configuration it was trained for
         self.to_patch_embedding = nn.Sequential(
             Rearrange('b c (f pf) (h p1) (w p2) -> b (f h w) (p1 p2 pf c)',
                      p1 = config.image_patch_size, p2 = config.image_patch_size, pf = config.frame_patch_size),
@@ -178,10 +177,8 @@ class ViT3DSegmentation(nn.Module):
             nn.Linear(patch_dim, config.dim),
             nn.LayerNorm(config.dim),
         )
-        # elif config.image_size == config.frames == 128 and config.image_patch_size == config.frame_patch_size == 8 and config.channels == 5:
-        #     self.to_patch_embedding = ...
 
-            # No cls token for segmentation - only positional embeddings for patches
+        # No cls token for segmentation - only positional embeddings for patches
         self.pos_embedding = nn.Parameter(torch.randn(1, config.total_patches, config.dim))
         self.dropout = nn.Dropout(config.emb_dropout)
 
@@ -227,7 +224,7 @@ class ViT3DSegmentation(nn.Module):
         return x
 
 
-def load_mae_encoder_to_vit3d(mae_checkpoint_path, vit3d_model, device='cuda'):
+def load_mae_encoder_to_vit3d(mae_checkpoint_path, vit3d_model, device='cuda', rewrite_patch_embedding=False):
     checkpoint = torch.load(mae_checkpoint_path, map_location=device)
     mae_state_dict = checkpoint['state_dict']
 
@@ -252,6 +249,41 @@ def load_mae_encoder_to_vit3d(mae_checkpoint_path, vit3d_model, device='cuda'):
             print(f"{key}: MAE {mae_shape} != ViT3D {vit3d_shape}")
 
     vit3d_model.load_state_dict(vit3d_state_dict, strict=False)
+
+    if rewrite_patch_embedding:
+        # Assuming we were pretrained for 256^3 image-size at 16^3 patch-size, set up the patch-embedding layer to
+        # behave roughly equivalently wrt the first (volume) channel and be nearly-invariant wrt the other channels
+        # 1. take the volume channel; rescale it up 2x2x2 then flatten
+        # 2. take the remaining channels and flatten as-is
+        # 3. linear layer is two parts -- first (for flattened upscaled patch) is what we loaded; second (for not-upscaled other channels) is zeros
+        assert ('to_patch_embedding.1.weight', torch.Size([4096]), torch.Size([2560])) in shape_mismatches
+        orig_patch_size = 16
+        new_patch_size = 8
+        channels = 5
+        patch_dim = orig_patch_size**3 + (channels - 1) * new_patch_size**3
+        class Rearrange(nn.Module):
+            def __init__(self):
+                super().__init__()
+            def forward(self, x):
+                volume = x[:, :1]
+                volume = F.interpolate(volume, scale_factor=orig_patch_size / new_patch_size, mode='trilinear', align_corners=False)
+                volume = rearrange(volume, 'b c (f pf) (h p1) (w p2) -> b (f h w) (p1 p2 pf c)', p1=orig_patch_size, p2=orig_patch_size, pf=orig_patch_size)
+                others = x[:, 1:]
+                others = rearrange(others, 'b c (f pf) (h p1) (w p2) -> b (f h w) (p1 p2 pf c)', p1=new_patch_size, p2=new_patch_size, pf=new_patch_size)
+                return torch.concat([volume, others], dim=2)
+        first_layernorm = nn.LayerNorm(patch_dim)
+        first_layernorm.weight.data[:orig_patch_size**3] = mae_state_dict['model.to_patch_embedding.1.weight']
+        first_layernorm.bias.data[:orig_patch_size**3] = mae_state_dict['model.to_patch_embedding.1.bias']
+        first_linear = nn.Linear(patch_dim, vit3d_model.to_patch_embedding[2].out_features)
+        first_linear.weight.data[:, :orig_patch_size**3] = mae_state_dict['model.to_patch_embedding.2.weight']
+        first_linear.weight.data[:, :orig_patch_size ** 3] *= 1.e-1  # leave other channels having a very small effect
+        vit3d_model.to_patch_embedding = nn.Sequential(
+            Rearrange(),
+            first_layernorm,
+            first_linear,
+            vit3d_model.to_patch_embedding[3],  # final LayerNorm
+        )
+
     return loaded_keys
 
 
@@ -285,7 +317,7 @@ class Vesuvius3dViTModel(nn.Module):
         )
 
         if mae_ckpt_path is not None:
-            loaded = load_mae_encoder_to_vit3d(mae_ckpt_path, self.model)
+            loaded = load_mae_encoder_to_vit3d(mae_ckpt_path, self.model, rewrite_patch_embedding=input_size == 128 and patch_size == 8 and in_channels == 5)
             print(f"Loaded {len(loaded)} encoder weights from MAE")
 
         if False:
