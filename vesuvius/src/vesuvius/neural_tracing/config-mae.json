@@ -1,5 +1,5 @@
 {
-    "out_dir": "../out/2025-10-09",
+    "out_dir": "/mnt/bcache/projects/vesuvius-scrolls/neural-tracing/out/2025-10-28",
     "wandb_project": "neural-tracing",
     "wandb_entity": "vesuvius-challenge",
     "seed": 0,
@@ -8,15 +8,16 @@
     "log_frequency": 200,
     "ckpt_frequency": 5000,
     "mixed_precision": "fp16",
-    "learning_rate": 1e-4,
+    "learning_rate": 3e-4,
     "weight_decay": 1e-4,
+    "grad_acc_steps": 12,
     "lr_warmup_steps": 1000,
     "num_iterations": 250000,
       "datasets": [
           {
               "volume_path": "/mnt/sda/paul/vesuvius-scrolls-data/zarr/Scroll1_masked.zarr",
               "volume_scale": 1,
-              "segments_path": "/home/paul/projects/vesuvius-scrolls/neural-tracing/data/PHercParis4/tifxyz"
+              "segments_path": "/home/paul/projects/vesuvius-scrolls/neural-tracing/data/PHercParis4/tifxyz",
           }
       ],
       "augmentation": {
@@ -37,19 +38,8 @@
       "cfg_uncond_prob": 0.1,
       "cfg_scale": 1.5,
       "crop_size": 128,
-      "model_type": "unet",
+      "model_type": "vit",
       "model_config": {
-        "conv_op": "nn.Conv3d",
-        "norm_op": "nn.InstanceNorm3d",
-        "features_per_stage": [
-          32,
-          64,
-          128,
-          256,
-          320,
-          320
-        ],
-        "squeeze_excitation": true,
-        "time_emb_dim": 128
+        "mae_ckpt_path": "/home/paul/projects/vesuvius-scrolls/neural-tracing/vesuvius_mae_vit3d_epoch%3D193_val_mae_loss%3D0.0000.ckpt"
       }
     }
