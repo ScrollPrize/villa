@@ -1,5 +1,6 @@
 import os.path as osp
 import os
+import os
 import PIL.Image
 PIL.Image.MAX_IMAGE_PIXELS = 933120000
 os.environ["OPENCV_IO_MAX_IMAGE_PIXELS"] = str(pow(2,40))
@@ -10,6 +11,7 @@ import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
 import argparse
+import glob
 # from timm.data.mixup import Mixup
 from sklearn.metrics import fbeta_score
 from timesformer_pytorch import TimeSformer
@@ -19,13 +21,13 @@ import torchvision.models as models
 import random
 import sys
 import yaml
-
+from skimage.transform import downscale_local_mean
 import numpy as np
 import pandas as pd
 
 
 import gc
-from data import *
+
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, StochasticWeightAveraging,BackboneFinetuning
@@ -93,6 +95,7 @@ import torch.nn.functional as F
 import PIL.Image
 from models.i3dallnl import InceptionI3d
 from models.resnetall import generate_model
+# PIL.Image.MAX_IMAGE_PIXELS = 933120000
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 class CFG:
     # ============== comp exp name =============
@@ -112,15 +115,15 @@ class CFG:
     backbone = 'efficientnet-b0'
     # backbone = 'se_resnext50_32x4d'
 
-    in_chans = 16 # 65
+    in_chans = 64 # 65
     encoder_depth=5
     # ============== training cfg =============
-    size = 128
-    tile_size = 128
+    size = 64
+    tile_size = 64
     stride = tile_size // 3
 
-    train_batch_size = 32 # 32
-    valid_batch_size = 32
+    train_batch_size = 64 # 32
+    valid_batch_size = 64
     use_amp = True
 
     scheduler = 'GradualWarmupSchedulerV2'
@@ -148,7 +151,7 @@ class CFG:
     max_grad_norm = 5
 
     print_freq = 50
-    num_workers = 16
+    num_workers = 32
 
     seed = 42
 
@@ -256,147 +259,56 @@ cfg_init(CFG)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def read_image_mask(fragment_id,start_idx=18,end_idx=38,rotation=0):
-
+def read_image_mask(fragment_id,start_idx=24,end_idx=42, rotation=0):
+    fragment_id_ = fragment_id.split("_")[0]
     images = []
-
-    # idxs = range(65)
-    mid = 65 // 2
-    start = mid - CFG.in_chans // 2
-    end = mid + CFG.in_chans // 2
     idxs = range(start_idx, end_idx)
-    # idxs = range(0, 65)
-
+    if 'rag' in fragment_id:
+        idxs = range(start_idx-6, 36)
     for i in idxs:
-        
-        image = cv2.imread(f"./train_scrolls/{fragment_id}/layers/{i:02}.tif", 0)
+        if os.path.exists(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{i:02}.tif"):
+            image = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{i:02}.tif", 0)
+        # elif 'rag' in fragment_id:
+        #     image = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{i:02}.png", 0)
 
+        else:
+            image = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{i:02}.jpg", 0)
         pad0 = (256 - image.shape[0] % 256)
         pad1 = (256 - image.shape[1] % 256)
-
-        image = np.pad(image, [(0, pad0), (0, pad1)], constant_values=0)
-        # image = ndimage.median_filter(image, size=5)
-        image=np.clip(image,0,200)
-        # image = cv2.flip(image, 0)
-
+        image = np.pad(image, [(0, pad0), (0, pad1)], constant_values=0)        
+        # image=np.clip(image,0,200)
         images.append(image)
     images = np.stack(images, axis=2)
-    if fragment_id in ['20230701020044','verso','20230901184804','20230901234823','20230531193658','20231007101615','20231005123333','20231011144857','20230522215721', '20230919113918', '20230625171244','20231022170900','20231012173610','20231016151000']:
+    if any(id_ in fragment_id_ for id_ in ['20230701020044','verso','20230901184804','20230901234823','20230531193658','20231007101615','20231005123333','20231011144857','20230522215721', '20230919113918', '20230625171244','20231022170900','20231012173610','20231016151000']):
         images=images[:,:,::-1]
-
-    fragment_mask=None
-    if os.path.exists(f'./train_scrolls/{fragment_id}/{fragment_id}_mask.png'):
-        fragment_mask=cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id}_mask.png", 0)
-        fragment_mask = np.pad(fragment_mask, [(0, pad0), (0, pad1)], constant_values=0)
-
+    # Get the list of files that match the pattern
+    inklabel_files = glob.glob(f"train_scrolls/{fragment_id}/*inklabels.*")
+    if len(inklabel_files) > 0:
+        mask = cv2.imread( inklabel_files[0], 0)
+    else:
+        print(f"Creating empty mask for {fragment_id}")
+        mask = np.zeros(images[:,:,0].shape)
+    fragment_mask=cv2.imread(glob.glob(f'train_scrolls/{fragment_id}/*mask.png')[0], 0)
+    # fragment_mask=cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id_}_mask.png", 0)
+    fragment_mask = np.pad(fragment_mask, [(0, pad0), (0, pad1)], constant_values=0)
+    if 'rag' in fragment_id:
+        mask = np.pad(mask, [(0, pad0), (0, pad1)], constant_values=0)
+    # images=downscale_local_mean(images, (1, 1,2))
+    mask = mask.astype('float32')
+    mask/=255
+    print(fragment_id,images.shape,mask.shape)
     return images,fragment_mask
-
 def get_img_splits(fragment_id,s,e,rotation=0):
     images = []
     xyxys = []
-    if fragment_id in os.listdir('0175_2um'):
-        segment=Segment(                
-                segment_id=fragment_id,
-                    layer_range=(0,62),
-                    reverse_layers=True,
-                    base_path='0175_2um',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=4,
-    
-                           )
-    elif fragment_id in ['500p2a','658'] :
-        segment=Segment(                
-                segment_id=fragment_id,
-                    layer_range=(1,63),
-                    reverse_layers=True,
-                    base_path='train_scrolls',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=.25,
-                           )  
-    elif fragment_id in ['2um_44kev_0.22m','2um_43kev_0.22m','2um_62kev_0.22m','2um_77kev_0.35m']:
-        segment=Segment(                
-            segment_id=fragment_id,
-                layer_range=(2,64),
-                reverse_layers=True,
-                base_path='front_multi_energy',
-                tile_size=CFG.tile_size,
-                # xyz_scale=1.46,
-                       )
-    elif fragment_id in ['-1','-2'] :
-        segment=Segment(                
-            segment_id=fragment_id,
-                layer_range=(1,63),
-                reverse_layers=False,
-                base_path='sean_hiddenlayers',
-                tile_size=CFG.tile_size,
-                # xyz_scale=.25,
-                       )
-    elif fragment_id in ['20240304141530','20231210132040','20240716140052']:
-        segment=Segment(                
-                segment_id=fragment_id,
-                    layer_range=(16,48),
-                    reverse_layers=False,
-                    base_path='train_scrolls',
-                    tile_size=CFG.tile_size,
-                    xyz_scale=2,
-        )
-    elif fragment_id in os.listdir('0139_traces'):
-        segment=Segment(                
-                    segment_id=fragment_id,
-                        layer_range=(8,24) if os.path.exists(f'0139_traces/{fragment_id}/layers/24.tif') else (2,18),
-                        reverse_layers=False,
-                        base_path='0139_traces',
-                        tile_size=CFG.tile_size,
-                        xy_scale=3.9007078344930277,
-                               )
-    elif fragment_id in os.listdir('0139'):
-        segment=Segment(                
-                segment_id=fragment_id,
-                    layer_range=(24,40),
-                    reverse_layers=Falsez,
-                    base_path='0139',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=4,
-    
-
-        )
-    # else:
-    #     segment=Segment(                
-    #             segment_id=fragment_id,
-    #                 layer_range=(8,24) if os.path.exists(f'0139_traces/{fragment_id}/layers/24.tif') else (2,18),
-    #                 reverse_layers=False,
-    #                 base_path='0139_traces',
-    #                 tile_size=CFG.tile_size,
-    #                 # xyz_scale=.25,
-    #                        )
-    # elif fragment_id in os.listdir('0139_columns'):
-    #     segment=Segment(                
-    #             segment_id=fragment_id,
-    #                 layer_range=(0,62),
-    #                 reverse_layers=False,
-    #                 base_path='0139_columns',
-    #                 tile_size=CFG.tile_size,
-    #                 # xyz_scale=4,
-    
-    #                        )
-    else:
-        segment=Segment(                
-                segment_id=fragment_id,
-                    layer_range=(0,62),
-                    reverse_layers=False,
-                    base_path='0139_rewindoed',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=4,
-    
-                           )
-    image, _,fragment_mask = segment.get_data()
+    image,fragment_mask = read_image_mask(fragment_id,s,e,rotation)
     x1_list = list(range(0, image.shape[1]-CFG.tile_size+1, CFG.stride))
     y1_list = list(range(0, image.shape[0]-CFG.tile_size+1, CFG.stride))
     for y1 in y1_list:
         for x1 in x1_list:
             y2 = y1 + CFG.tile_size
             x2 = x1 + CFG.tile_size
-            if not np.any(fragment_mask[y1:y2, x1:x2]==0) and not np.all(image[y1:y2, x1:x2]==0):
+            if not np.any(fragment_mask[y1:y2, x1:x2]==0):
                 images.append(image[y1:y2, x1:x2])
                 xyxys.append([x1, y1, x2, y2])
     test_dataset = CustomDatasetTest(images,np.stack(xyxys), CFG,transform=A.Compose([
@@ -480,8 +392,10 @@ class CustomDatasetTest(Dataset):
         image = self.images[idx]
         xy=self.xyxys[idx]
         if self.transform:
-            data = self.transform(image=image)
-            image = data['image'].unsqueeze(0)
+            image = torch.from_numpy(image).float()/255
+        # label = torch.from_numpy(label).float()
+        # print('label before',label.squeeze(-1).unsqueeze(0).shape)
+            image = image.permute(2, 0, 1).unsqueeze(0)  # (C, D, H, W)
 
         return image,xy
 
@@ -523,96 +437,116 @@ class Decoder(nn.Module):
 from collections import OrderedDict
 
 
+class Decoder3D(nn.Module):
+    def __init__(self, encoder_dims, upscale):
+        super().__init__()
+        self.convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv3d(encoder_dims[i]+encoder_dims[i-1], encoder_dims[i-1], 3, 1, 1, bias=False),
+                nn.BatchNorm3d(encoder_dims[i-1]),
+                nn.ReLU(inplace=True)
+            ) for i in range(1, len(encoder_dims))])
+        
+        self.logit = nn.Conv3d(encoder_dims[0], 1, 1, 1, 0)
+        self.up = nn.Upsample(scale_factor=upscale, mode="trilinear", align_corners=True)
+
+    def forward(self, feature_maps):
+        for i in range(len(feature_maps)-1, 0, -1):
+            f_up = F.interpolate(feature_maps[i], scale_factor=2, mode="trilinear", align_corners=True)
+            f = torch.cat([feature_maps[i-1], f_up], dim=1)
+            f_down = self.convs[i-1](f)
+            feature_maps[i-1] = f_down
+
+        x = self.logit(feature_maps[0])
+        mask = self.up(x)
+        return mask
+class Decoder(nn.Module):
+    def __init__(self, encoder_dims, upscale):
+        super().__init__()
+        self.convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(encoder_dims[i]+encoder_dims[i-1], encoder_dims[i-1], 3, 1, 1, bias=False),
+                nn.BatchNorm2d(encoder_dims[i-1]),
+                nn.ReLU(inplace=True)
+            ) for i in range(1, len(encoder_dims))])
+
+        self.logit = nn.Conv2d(encoder_dims[0], 1, 1, 1, 0)
+        self.up = nn.Upsample(scale_factor=upscale, mode="bilinear")
+
+    def forward(self, feature_maps):
+        for i in range(len(feature_maps)-1, 0, -1):
+            f_up = F.interpolate(feature_maps[i], scale_factor=2, mode="bilinear")
+            f = torch.cat([feature_maps[i-1], f_up], dim=1)
+            f_down = self.convs[i-1](f)
+            feature_maps[i-1] = f_down
+
+        x = self.logit(feature_maps[0])
+        mask = self.up(x)
+        return mask
+
 
 
 class RegressionPLModel(pl.LightningModule):
-    def __init__(self,pred_shape,size=224,enc='',with_norm=False):
+    def __init__(self,pred_shape,size=256,enc='',with_norm=False,total_steps=780):
         super(RegressionPLModel, self).__init__()
 
         self.save_hyperparameters()
         self.mask_pred = np.zeros(self.hparams.pred_shape)
         self.mask_count = np.zeros(self.hparams.pred_shape)
-        # self.backbone=SegModel(model_depth=50)
+
         self.loss_func1 = smp.losses.DiceLoss(mode='binary')
-        # self.loss_func2= smp.losses.FocalLoss(mode='binary',gamma=2)
-        self.loss_func2= smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.15)
-        # self.loss_func=nn.HuberLoss(delta=5.0)
+        self.loss_func2= smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25)
         self.loss_func= lambda x,y:0.5 * self.loss_func1(x,y)+0.5*self.loss_func2(x,y)
-        
-        # self.backbone = generate_model(model_depth=50, n_input_channels=1,forward_features=True,n_classes=700)
-        if self.hparams.enc=='resnet34':
-            self.backbone = generate_model(model_depth=34, n_input_channels=1,forward_features=True,n_classes=700)
-            state_dict=torch.load('./r3d34_K_200ep.pth')["state_dict"]
-            conv1_weight = state_dict['conv1.weight']
-            state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
-            self.backbone.load_state_dict(state_dict,strict=False)
-        elif self.hparams.enc=='resnest101':
-            self.backbone = generate_model(model_depth=101, n_input_channels=1,forward_features=True,n_classes=1039)
-            state_dict=torch.load('./r3d101_KM_200ep.pth')["state_dict"]
-            conv1_weight = state_dict['conv1.weight']
-            state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
-            self.backbone.load_state_dict(state_dict,strict=False)
-        elif self.hparams.enc=='2p1d':
-            self.backbone = generate_2p1d(model_depth=34, n_input_channels=1,n_classes=700)
-            state_dict=torch.load('./r2p1d34_K_200ep.pth')["state_dict"]
-            conv1_weight = state_dict['conv1_s.weight']
-            state_dict['conv1_s.weight'] = conv1_weight.sum(dim=1, keepdim=True)
-            self.backbone.load_state_dict(state_dict,strict=False)
-        elif self.hparams.enc=='wide50':
-            self.backbone = generate_wide(model_depth=50, n_input_channels=1,n_classes=700,forward_features=True,k=2)
-        elif self.hparams.enc=='i3d':
-            self.backbone=InceptionI3d(in_channels=1,num_classes=512,non_local=True)
-        elif self.hparams.enc=='resnext101':
-            self.backbone=resnext101(sample_size=112,
-                                  sample_duration=16,
-                                  shortcut_type='B',
-                                  cardinality=32,
-                                  num_classes=600)
-            state_dict = torch.load('./kinetics_resnext_101_RGB_16_best.pth')['state_dict']
-            checkpoint_custom = OrderedDict()
-            for key_model, key_checkpoint in zip(self.backbone.state_dict().keys(), state_dict.keys()):
-                checkpoint_custom.update({f'{key_model}': state_dict[f'{key_checkpoint}']})
 
-            self.backbone.load_state_dict(checkpoint_custom, strict=True)
-            self.backbone.conv1 = nn.Conv3d(1, 64, kernel_size=(7, 7, 7), stride=(1, 2, 2), padding=(3, 3, 3), bias=False)
-        else:
-            self.backbone = generate_model(model_depth=50, n_input_channels=1,forward_features=True,n_classes=1039)
-
-        
-        self.decoder = Decoder(encoder_dims=[x.size(1) for x in self.backbone(torch.rand(1,1,20,256,256))], upscale=1)
+        self.backbone = generate_model(model_depth=34, n_input_channels=1,forward_features=True,n_classes=1039)
+        # state_dict=torch.load('./r3d101_KM_200ep.pth')["state_dict"]
+        # conv1_weight = state_dict['conv1.weight']
+        # state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
+        # self.backbone.load_state_dict(state_dict,strict=False)
+        # self.backbone=InceptionI3d(in_channels=1,num_classes=512,non_local=True)
+        # self.backbone.load_state_dict(torch.load('./pretraining_i3d_epoch=3.pt'),strict=False)
+        self.decoder = Decoder3D(encoder_dims=[x.size(1) for x in self.backbone(torch.rand(1,1,20,256,256))], upscale=1)
 
         if self.hparams.with_norm:
             self.normalization=nn.BatchNorm3d(num_features=1)
+
+
+
+            
     def forward(self, x):
         if x.ndim==4:
             x=x[:,None]
         if self.hparams.with_norm:
             x=self.normalization(x)
+        # print(x.shape)
         feat_maps = self.backbone(x)
-        feat_maps_pooled = [torch.max(f, dim=2)[0] for f in feat_maps]
-        pred_mask = self.decoder(feat_maps_pooled)
-        
+        # feat_maps_pooled = [torch.max(f, dim=2)[0] for f in feat_maps]
+        pred_mask = self.decoder(feat_maps)
+        # print(pred_mask.shape)
         return pred_mask
+    
     def training_step(self, batch, batch_idx):
         x, y = batch
         outputs = self(x)
         loss1 = self.loss_func(outputs, y)
         if torch.isnan(loss1):
             print("Loss nan encountered")
-        self.log("train/Arcface_loss", loss1.item(),on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train/total_loss", loss1.item(),on_step=True, on_epoch=True, prog_bar=True)
         return {"loss": loss1}
 
     def validation_step(self, batch, batch_idx):
         x,y,xyxys= batch
         batch_size = x.size(0)
         outputs = self(x)
+        # print(y.shape)
+
         loss1 = self.loss_func(outputs, y)
         y_preds = torch.sigmoid(outputs).to('cpu')
         for i, (x1, y1, x2, y2) in enumerate(xyxys):
             self.mask_pred[y1:y2, x1:x2] += F.interpolate(y_preds[i].unsqueeze(0).float(),scale_factor=4,mode='bilinear').squeeze(0).squeeze(0).numpy()
             self.mask_count[y1:y2, x1:x2] += np.ones((self.hparams.size, self.hparams.size))
 
-        self.log("val/MSE_loss", loss1.item(),on_step=True, on_epoch=True, prog_bar=True)
+        self.log("val/total_loss", loss1.item(),on_step=True, on_epoch=True, prog_bar=True)
         return {"loss": loss1}
     
     def on_validation_epoch_end(self):
@@ -623,52 +557,15 @@ class RegressionPLModel(pl.LightningModule):
         self.mask_pred = np.zeros(self.hparams.pred_shape)
         self.mask_count = np.zeros(self.hparams.pred_shape)
     def configure_optimizers(self):
-        optimizer = AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=CFG.lr)    
-        scheduler = get_scheduler(CFG, optimizer)
-        return [optimizer]
-import torch.nn as nn
-import torch
-import math
-import time
-import numpy as np
-import torch
 
-from warmup_scheduler import GradualWarmupScheduler
+        optimizer = AdamW(self.parameters(), lr=CFG.lr)
+        scheduler =torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=3e-4,pct_start=0.15, steps_per_epoch=self.hparams.total_steps, epochs=50,final_div_factor=1e2)
+        # scheduler = get_scheduler(CFG, optimizer)
+        return [optimizer],[scheduler]
 
 
-class GradualWarmupSchedulerV2(GradualWarmupScheduler):
-    """
-    https://www.kaggle.com/code/underwearfitting/single-fold-training-of-resnet200d-lb0-965
-    """
-    def __init__(self, optimizer, multiplier, total_epoch, after_scheduler=None):
-        super(GradualWarmupSchedulerV2, self).__init__(
-            optimizer, multiplier, total_epoch, after_scheduler)
 
-    def get_lr(self):
-        if self.last_epoch > self.total_epoch:
-            if self.after_scheduler:
-                if not self.finished:
-                    self.after_scheduler.base_lrs = [
-                        base_lr * self.multiplier for base_lr in self.base_lrs]
-                    self.finished = True
-                return self.after_scheduler.get_lr()
-            return [base_lr * self.multiplier for base_lr in self.base_lrs]
-        if self.multiplier == 1.0:
-            return [base_lr * (float(self.last_epoch) / self.total_epoch) for base_lr in self.base_lrs]
-        else:
-            return [base_lr * ((self.multiplier - 1.) * self.last_epoch / self.total_epoch + 1.) for base_lr in self.base_lrs]
 
-def get_scheduler(cfg, optimizer):
-    scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, cfg.epochs, eta_min=1e-7)
-    scheduler = GradualWarmupSchedulerV2(
-        optimizer, multiplier=10, total_epoch=1, after_scheduler=scheduler_cosine)
-
-    return scheduler
-
-def scheduler_step(scheduler, avg_val_loss, epoch):
-    scheduler.step(epoch)
-   
 import torch as tc
 def TTA(x:tc.Tensor,model:nn.Module):
     #x.shape=(batch,c,h,w)
@@ -705,8 +602,8 @@ def normalization(x):
     std=x.std(dim=dim,keepdim=True)
     return (x-mean)/(std+1e-9)
 def predict_fn(test_loader, model, device, test_xyxys,pred_shape):
-    mask_pred = np.zeros(pred_shape)
-    mask_count = np.zeros(pred_shape)
+    mask_pred = np.zeros((CFG.in_chans,pred_shape[0],pred_shape[1]))
+    mask_count = np.zeros((CFG.in_chans,pred_shape[0],pred_shape[1]))
     kernel=gkern(CFG.size,1)
     kernel=kernel/kernel.max()
     model.eval()
@@ -722,9 +619,10 @@ def predict_fn(test_loader, model, device, test_xyxys,pred_shape):
 
         y_preds = torch.sigmoid(y_preds).to('cpu')
         for i, (x1, y1, x2, y2) in enumerate(xys):
-            mask_pred[y1:y2, x1:x2] += np.multiply(F.interpolate(y_preds[i].unsqueeze(0).float(),scale_factor=4,mode='bilinear').squeeze(0).squeeze(0).numpy(),kernel)
+            # print(y_preds[i].shape)1, 24, 16, 16
+            mask_pred[:,y1:y2, x1:x2] += np.multiply(F.interpolate(y_preds[i].unsqueeze(0).float(),scale_factor=(1,4,4),mode='trilinear').squeeze(0).squeeze(0).numpy(),kernel)
             # mask_pred[y1:y2, x1:x2] += F.interpolate(y_preds[i].unsqueeze(0).unsqueeze(0).float(),scale_factor=4,mode='bilinear').squeeze(0).squeeze(0).numpy()
-            mask_count[y1:y2, x1:x2] += np.ones((CFG.size, CFG.size))
+            mask_count[:,y1:y2, x1:x2] += np.ones((CFG.in_chans,CFG.size, CFG.size))
 
     mask_pred /= mask_count
     # mask_pred/=mask_pred.max()
@@ -735,15 +633,12 @@ from PIL.ImageOps import equalize,autocontrast
 import gc
 import time
 
-for m in ['0139_wild2_2um_20250807020208_0_fr_i3depoch=3.ckpt']:
-# for m in ['final_downscaled_2um4xdown_no139_20250807020208_0_fr_i3depoch=13.ckpt']:
-# for m in ['final_2um_20250802223135_0_fr_i3depoch=30.ckpt','final_2um_fulldenoise500p2a_0_fr_i3depoch=10.ckpt','final_2um_500p2a_0_fr_i3depoch=5.ckpt']:
+
+for m in ['wild14_deduped_64_pretrained2_20241113070770_0_fr_i3depoch=4-v2.ckpt']:
     # model=torch.jit.load(f'models_norm/{m}')
-    model=RegressionPLModel(pred_shape=(1,1),enc='resnett50')
-    
     w=torch.load(CFG.model_dir+m,weights_only=False)
+    model=RegressionPLModel(pred_shape=(1,1),enc='resnest101')
     model.load_state_dict(w['state_dict'])
-    
     model.cuda()
     model.eval()
     wandb.init(
@@ -753,36 +648,29 @@ for m in ['0139_wild2_2um_20250807020208_0_fr_i3depoch=3.ckpt']:
       name=f"ALL_scrolls_tta_{m}", 
       # Track hyperparameters and run metadata
         )
-    
-    # for fragment_id in [o for o  in os.listdir('./0139_traces') if o not in ['z_dbg_gen_00201_inp_hr','z_dbg_gen_00230','z_dbg_gen_00292_inp_hr','z_dbg_gen_00331','z_dbg_gen_00365','z_dbg_gen_00416','z_dbg_gen_00460','z_dbg_gen_00491','z_dbg_gen_00522','z_dbg_gen_00642','z_dbg_gen_01742']]:
-    # for fragment_id in os.listdir('0139_columns'):
-    for fragment_id in ['layers_02','layers_03']:
-    # for fragment_id in [o for o in os.listdir('0139_columns') if o not in ['auto_grown_20250918234353791','david_9b','auto_grown_20250919060642061','auto_grown_20250919055754487_inp_hr','auto_grown_20250919061352722_inp_hr']]:
-        print('reading', fragment_id)
-        try:
+    for fragment_id in ['20241113070770']:
+    # for fragment_id in os.listdir('train_scrolls'):
+        if True:
             preds=[]
             for r in [0]:
-                for i in [8]:
-                    # original_shape=cv2.imread(f'train_scrolls/{fragment_id}/layers/05.tif',0).shape
+                for i in [0]:
                     start_f=i
                     end_f=start_f+CFG.in_chans
                     test_loader,test_xyxz,test_shape,fragment_mask=get_img_splits(fragment_id,start_f,end_f,r)
                     mask_pred= predict_fn(test_loader, model, device, test_xyxz,test_shape)
                     mask_pred=np.clip(np.nan_to_num(mask_pred),a_min=0,a_max=1)
                     mask_pred/=mask_pred.max()
+                    np.save(f'train_scrolls/{fragment_id}/{fragment_id}_vol_eval_{i}.npy',(mask_pred*255).astype(np.uint8))
+            #         preds.append(mask_pred)
 
-                    preds.append(mask_pred)
+            # img=wandb.Image(
+            # preds[0], 
+            # caption=f"{fragment_id}"
+            # )
+            # wandb.log({'predictions':img})
 
-                    img=wandb.Image(
-                    mask_pred, 
-                    caption=f"{fragment_id}"
-                    )
-                    wandb.log({f'predictions/{fragment_id}':img})
-
-            # print("plot time: ",t5-t4)
-                    gc.collect()
-        except Exception as e:
-            print(e)
+            # # print("plot time: ",t5-t4)
+            # gc.collect()
         
     del mask_pred,test_loader,model
     torch.cuda.empty_cache()

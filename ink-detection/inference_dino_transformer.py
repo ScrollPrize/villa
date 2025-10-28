@@ -1,105 +1,78 @@
 import os.path as osp
 import os
+import os
 import PIL.Image
 PIL.Image.MAX_IMAGE_PIXELS = 933120000
 os.environ["OPENCV_IO_MAX_IMAGE_PIXELS"] = str(pow(2,40))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-import torchvision
-import torchvision.transforms as transforms
-import argparse
-# from timm.data.mixup import Mixup
-from sklearn.metrics import fbeta_score
-from timesformer_pytorch import TimeSformer
-import wandb
 
-import torchvision.models as models
-import random
-import sys
-import yaml
-
-import numpy as np
-import pandas as pd
-
-
-import gc
-from data import *
+from einops import rearrange
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint, StochasticWeightAveraging,BackboneFinetuning
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import WandbLogger
+import timm
+import random
+import yaml
+import glob
+import threading
 import numpy as np
-import scipy.stats as st
-import matplotlib.pyplot as plt
-def gkern(kernlen=21, nsig=3):
-    """Returns a 2D Gaussian kernel."""
+import pandas as pd
 
-    x = np.linspace(-nsig, nsig, kernlen+1)
-    kern1d = np.diff(st.norm.cdf(x))
-    kern2d = np.outer(kern1d, kern1d)
-    return kern2d/kern2d.sum()
+import wandb
 
-from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, log_loss
-import pickle
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
-import warnings
-import sys
+
 import pandas as pd
 import os
-import gc
-import sys
-import math
-import time
 import random
-import shutil
-from pathlib import Path
 from contextlib import contextmanager
-from collections import defaultdict, Counter
 import cv2
 
 import scipy as sp
 import numpy as np
 import pandas as pd
-import segmentation_models_pytorch as smp
-import matplotlib.pyplot as plt
+
 from tqdm.auto import tqdm
-from functools import partial
 
 import argparse
-import importlib
 import torch
 import torch.nn as nn
-from torch.optim import Adam, SGD, AdamW
+from torch.optim import AdamW
 
 import datetime
+import segmentation_models_pytorch as smp
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
-import cv2
-import torch
-import os
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from albumentations import ImageOnlyTransform
-import os
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-from timm.models.convnext import convnextv2_femto,convnextv2_nano
-import torch
-import torch.nn as nn
-from torch.nn.utils.rnn import pack_padded_sequence
-import torch.nn.functional as F
-import PIL.Image
+from torch.utils.data import DataLoader, Dataset
 from models.i3dallnl import InceptionI3d
+import torch.nn as nn
+import torch
+from warmup_scheduler import GradualWarmupScheduler
+from scipy import ndimage
 from models.resnetall import generate_model
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+import PIL.Image
+from skimage.transform import downscale_local_mean
+from einops import rearrange
+from timesformer_pytorch_model import TimeSformer
+import scipy.stats as st
+
+PIL.Image.MAX_IMAGE_PIXELS = 933120000
+from data import *
+
+
 class CFG:
     # ============== comp exp name =============
     comp_name = 'vesuvius'
 
+    # comp_dir_path = './'
     comp_dir_path = './'
     comp_folder_name = './'
+    # comp_dataset_path = f'{comp_dir_path}datasets/{comp_folder_name}/'
     comp_dataset_path = f'./'
     
     exp_name = 'pretraining_all'
@@ -109,31 +82,31 @@ class CFG:
 
     # ============== model cfg =============
     model_name = 'Unet'
-    backbone = 'efficientnet-b0'
+    # backbone = 'efficientnet-b0'
     # backbone = 'se_resnext50_32x4d'
-
-    in_chans = 16 # 65
+    backbone='resnet3d'
+    in_chans = 9 # 65
     encoder_depth=5
     # ============== training cfg =============
-    size = 128
-    tile_size = 128
-    stride = tile_size // 3
+    size = 518
+    tile_size = 518
+    stride = tile_size // 4
 
-    train_batch_size = 32 # 32
-    valid_batch_size = 32
+    train_batch_size = 16 # 32
+    valid_batch_size = train_batch_size
     use_amp = True
 
     scheduler = 'GradualWarmupSchedulerV2'
     # scheduler = 'CosineAnnealingLR'
-    epochs = 50 # 30
+    epochs = 30 # 30
 
     # adamW warmupあり
     warmup_factor = 10
     # lr = 1e-4 / warmup_factor
-    lr = 1e-4 / warmup_factor
-
+    # lr = 1e-4 / warmup_factor
+    lr = 2e-5
     # ============== fold =============
-    valid_id = 2
+    valid_id = '20230820203112'
 
     # objective_cv = 'binary'  # 'binary', 'multiclass', 'regression'
     metric_direction = 'maximize'  # maximize, 'minimize'
@@ -145,12 +118,12 @@ class CFG:
 
     min_lr = 1e-6
     weight_decay = 1e-6
-    max_grad_norm = 5
+    max_grad_norm = 100
 
     print_freq = 50
     num_workers = 16
 
-    seed = 42
+    seed = 130697
 
     # ============== set dataset path =============
     print('set dataset path')
@@ -175,21 +148,27 @@ class CFG:
         A.Resize(size, size),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
-        A.RandomBrightnessContrast(p=0.75),
-        A.ShiftScaleRotate(rotate_limit=90,shift_limit=0.1,scale_limit=0.1,p=0.5),
+        # A.RandomRotate90(p=0.6),
+
         A.OneOf([
-                A.GaussNoise(var_limit=[10, 50]),
+        # A.GaussNoise(var_limit=[10, 50]),
+        A.RandomBrightnessContrast(p=1),
+        # A.CLAHE(p=1),
+        ], p=.75),
+        A.ShiftScaleRotate(rotate_limit=360,shift_limit=0.15,scale_limit=0.1,p=0.75),
+        A.OneOf([
+                # A.GaussNoise(var_limit=[10, 50]),
                 A.GaussianBlur(),
                 A.MotionBlur(),
                 ], p=0.4),
-        A.GridDistortion(num_steps=2, distort_limit=0.3, p=0.4),
-        A.CoarseDropout(max_holes=5, max_width=int(size * 0.05), max_height=int(size * 0.05), 
+        # A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.5),
+        A.CoarseDropout(max_holes=2, max_width=int(size * 0.2), max_height=int(size * 0.2), 
                         mask_fill_value=0, p=0.5),
         # A.Cutout(max_h_size=int(size * 0.6),
         #          max_w_size=int(size * 0.6), num_holes=1, p=1.0),
         A.Normalize(
-            mean= [0] * in_chans,
-            std= [1] * in_chans
+            mean= [0.4560]*in_chans,
+            std= [0.2250]*in_chans
         ),
         ToTensorV2(transpose_mask=True),
     ]
@@ -197,28 +176,12 @@ class CFG:
     valid_aug_list = [
         A.Resize(size, size),
         A.Normalize(
-            mean= [0] * in_chans,
-            std= [1] * in_chans
+            mean= [0.4560]*in_chans,
+            std= [0.2250]*in_chans
         ),
         ToTensorV2(transpose_mask=True),
     ]
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
+    rotate = A.Compose([A.Rotate(5,p=1)])
 def init_logger(log_file):
     from logging import getLogger, INFO, FileHandler, Formatter, StreamHandler
     logger = getLogger(__name__)
@@ -256,154 +219,134 @@ cfg_init(CFG)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def read_image_mask(fragment_id,start_idx=18,end_idx=38,rotation=0):
-
+def read_image_mask(fragment_id,start_idx=24,end_idx=42, CFG=CFG):
+    fragment_id_ = fragment_id.split("_")[0]
     images = []
-
-    # idxs = range(65)
-    mid = 65 // 2
-    start = mid - CFG.in_chans // 2
-    end = mid + CFG.in_chans // 2
     idxs = range(start_idx, end_idx)
-    # idxs = range(0, 65)
-
+    if 'unroll' in fragment_id:
+        idxs = range(1, 19)
     for i in idxs:
-        
-        image = cv2.imread(f"./train_scrolls/{fragment_id}/layers/{i:02}.tif", 0)
+        if os.path.exists(CFG.comp_dataset_path + f"0139_traces/{fragment_id}/layers/{i:02}.tif"):
+            image = cv2.imread(CFG.comp_dataset_path + f"0139_traces/{fragment_id}/layers/{i:02}.tif", 0)
+        # elif 'rag' in fragment_id:
+        #     image = cv2.imread(CFG.comp_dataset_path + f"0139_traces/{fragment_id}/layers/{i:02}.png", 0)
 
+        else:
+            image = cv2.imread(CFG.comp_dataset_path + f"0139_traces/{fragment_id}/layers/{i:02}.jpg", 0)
         pad0 = (256 - image.shape[0] % 256)
         pad1 = (256 - image.shape[1] % 256)
-
-        image = np.pad(image, [(0, pad0), (0, pad1)], constant_values=0)
-        # image = ndimage.median_filter(image, size=5)
-        image=np.clip(image,0,200)
-        # image = cv2.flip(image, 0)
-
+        image = np.pad(image, [(0, pad0), (0, pad1)], constant_values=0)        
+        # image=np.clip(image,0,200)
+        # image = cv2.resize(image, (image.shape[1]*2,image.shape[0]*2), interpolation = cv2.INTER_AREA)
         images.append(image)
+        
     images = np.stack(images, axis=2)
-    if fragment_id in ['20230701020044','verso','20230901184804','20230901234823','20230531193658','20231007101615','20231005123333','20231011144857','20230522215721', '20230919113918', '20230625171244','20231022170900','20231012173610','20231016151000']:
+    if any(id_ in fragment_id_ for id_ in ['20230701020044','verso','20230901184804','20230901234823','20230531193658','20231007101615','20231005123333','20231011144857','20230522215721', '20230919113918', '20230625171244','20231022170900','20231012173610','20231016151000']):
         images=images[:,:,::-1]
-
-    fragment_mask=None
-    if os.path.exists(f'./train_scrolls/{fragment_id}/{fragment_id}_mask.png'):
-        fragment_mask=cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id}_mask.png", 0)
+    # Get the list of files that match the pattern
+    try:
+        fragment_mask=cv2.imread(glob.glob(f'0139_traces/{fragment_id}/*mask*')[0], 0)
         fragment_mask = np.pad(fragment_mask, [(0, pad0), (0, pad1)], constant_values=0)
+    except:
+        fragment_mask=np.ones((images.shape[0],images.shape[1]))
+    images=downscale_local_mean(images, (1, 1,2))
 
     return images,fragment_mask
+# def read_image_mask(fragment_id,start_idx=18,end_idx=38,rotation=0):
+
+#     images = []
+
+#     # idxs = range(65)
+#     mid = 65 // 2
+#     start = mid - CFG.in_chans // 2
+#     end = mid + CFG.in_chans // 2
+#     idxs = range(start_idx, end_idx)
+#     # idxs = range(0, 65)
+
+#     for i in idxs:
+        
+#         image = cv2.imread(f"./0139_traces/{fragment_id}/layers/{i:02}.tif", 0)
+
+#         pad0 = (256 - image.shape[0] % 256)
+#         pad1 = (256 - image.shape[1] % 256)
+
+#         image = np.pad(image, [(0, pad0), (0, pad1)], constant_values=0)
+#         # image = ndimage.median_filter(image, size=5)
+#         image=np.clip(image,0,200)
+#         # image = cv2.flip(image, 0)
+
+#         images.append(image)
+#     images = np.stack(images, axis=2)
+#     if fragment_id in ['20230701020044','verso','20230901184804','20230901234823','20230531193658','20231007101615','20231005123333','20231011144857','20230522215721', '20230919113918', '20230625171244','20231022170900','20231012173610','20231016151000']:
+#         images=images[:,:,::-1]
+
+#     fragment_mask=None
+#     if os.path.exists(f'./0139_traces/{fragment_id}/{fragment_id}_mask.png'):
+#         fragment_mask=cv2.imread(CFG.comp_dataset_path + f"0139_traces/{fragment_id}/{fragment_id}_mask.png", 0)
+#         fragment_mask = np.pad(fragment_mask, [(0, pad0), (0, pad1)], constant_values=0)
+
+#     return images,fragment_mask
 
 def get_img_splits(fragment_id,s,e,rotation=0):
     images = []
     xyxys = []
-    if fragment_id in os.listdir('0175_2um'):
-        segment=Segment(                
-                segment_id=fragment_id,
-                    layer_range=(0,62),
-                    reverse_layers=True,
-                    base_path='0175_2um',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=4,
-    
-                           )
-    elif fragment_id in ['500p2a','658'] :
-        segment=Segment(                
-                segment_id=fragment_id,
-                    layer_range=(1,63),
-                    reverse_layers=True,
-                    base_path='train_scrolls',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=.25,
-                           )  
-    elif fragment_id in ['2um_44kev_0.22m','2um_43kev_0.22m','2um_62kev_0.22m','2um_77kev_0.35m']:
-        segment=Segment(                
-            segment_id=fragment_id,
-                layer_range=(2,64),
-                reverse_layers=True,
-                base_path='front_multi_energy',
-                tile_size=CFG.tile_size,
-                # xyz_scale=1.46,
-                       )
-    elif fragment_id in ['-1','-2'] :
-        segment=Segment(                
-            segment_id=fragment_id,
-                layer_range=(1,63),
-                reverse_layers=False,
-                base_path='sean_hiddenlayers',
-                tile_size=CFG.tile_size,
-                # xyz_scale=.25,
-                       )
-    elif fragment_id in ['20240304141530','20231210132040','20240716140052']:
-        segment=Segment(                
-                segment_id=fragment_id,
-                    layer_range=(16,48),
-                    reverse_layers=False,
-                    base_path='train_scrolls',
-                    tile_size=CFG.tile_size,
-                    xyz_scale=2,
-        )
-    elif fragment_id in os.listdir('0139_traces'):
-        segment=Segment(                
-                    segment_id=fragment_id,
-                        layer_range=(8,24) if os.path.exists(f'0139_traces/{fragment_id}/layers/24.tif') else (2,18),
-                        reverse_layers=False,
-                        base_path='0139_traces',
-                        tile_size=CFG.tile_size,
-                        xy_scale=3.9007078344930277,
-                               )
-    elif fragment_id in os.listdir('0139'):
+    if fragment_id in os.listdir('train_scrolls'):
         segment=Segment(                
                 segment_id=fragment_id,
                     layer_range=(24,40),
-                    reverse_layers=Falsez,
-                    base_path='0139',
+                    reverse_layers=False,
+                    base_path='train_scrolls',
                     tile_size=CFG.tile_size,
-                    # xyz_scale=4,
+                    # xyz_scale=.5,
     
-
-        )
-    # else:
-    #     segment=Segment(                
-    #             segment_id=fragment_id,
-    #                 layer_range=(8,24) if os.path.exists(f'0139_traces/{fragment_id}/layers/24.tif') else (2,18),
-    #                 reverse_layers=False,
-    #                 base_path='0139_traces',
-    #                 tile_size=CFG.tile_size,
-    #                 # xyz_scale=.25,
-    #                        )
-    # elif fragment_id in os.listdir('0139_columns'):
+                           )
+    # elif fragment_id in os.listdir('841'):
     #     segment=Segment(                
     #             segment_id=fragment_id,
     #                 layer_range=(0,62),
     #                 reverse_layers=False,
-    #                 base_path='0139_columns',
+    #                 base_path='841',
     #                 tile_size=CFG.tile_size,
-    #                 # xyz_scale=4,
+    #                 xyz_scale=.258,
     
     #                        )
+    elif fragment_id in os.listdir('0175_2um'):
+        segment=Segment(                
+                segment_id=fragment_id,
+                    layer_range=(0,64),
+                    reverse_layers=False,
+                    base_path='0175_2um',
+                    tile_size=CFG.tile_size,
+                    xyz_scale=.25,
+                           ) 
     else:
         segment=Segment(                
                 segment_id=fragment_id,
-                    layer_range=(0,62),
+                    layer_range=(7,25) if os.path.exists(f'841_9um/{fragment_id}/layers/24.tif') else (2,18),
                     reverse_layers=False,
-                    base_path='0139_rewindoed',
+                    base_path='841_9um',
                     tile_size=CFG.tile_size,
-                    # xyz_scale=4,
-    
+                    # z_scale=.5,
                            )
+        
     image, _,fragment_mask = segment.get_data()
+    image=downscale_local_mean(image, (1, 1,2))
+
+    print(image.shape)
     x1_list = list(range(0, image.shape[1]-CFG.tile_size+1, CFG.stride))
     y1_list = list(range(0, image.shape[0]-CFG.tile_size+1, CFG.stride))
     for y1 in y1_list:
         for x1 in x1_list:
             y2 = y1 + CFG.tile_size
             x2 = x1 + CFG.tile_size
-            if not np.any(fragment_mask[y1:y2, x1:x2]==0) and not np.all(image[y1:y2, x1:x2]==0):
+            if not np.any(fragment_mask[y1:y2, x1:x2]==0):
                 images.append(image[y1:y2, x1:x2])
                 xyxys.append([x1, y1, x2, y2])
     test_dataset = CustomDatasetTest(images,np.stack(xyxys), CFG,transform=A.Compose([
         A.Resize(CFG.size, CFG.size),
         A.Normalize(
-            mean= [0] * CFG.in_chans,
-            std= [1] * CFG.in_chans
+            mean= [0.4560] * CFG.in_chans,
+            std= [0.2250] * CFG.in_chans
         ),
         ToTensorV2(transpose_mask=True),
     ]))
@@ -423,6 +366,13 @@ def get_transforms(data, cfg):
 
     # print(aug)
     return aug
+def gkern(kernlen=21, nsig=3):
+    """Returns a 2D Gaussian kernel."""
+
+    x = np.linspace(-nsig, nsig, kernlen+1)
+    kern1d = np.diff(st.norm.cdf(x))
+    kern2d = np.outer(kern1d, kern1d)
+    return kern2d/kern2d.sum()
 
 class CustomDataset(Dataset):
     def __init__(self, images ,cfg,xyxys=None, labels=None, transform=None):
@@ -448,7 +398,7 @@ class CustomDataset(Dataset):
             if self.transform:
                 data = self.transform(image=image, mask=label)
                 image = data['image'].unsqueeze(0)
-                label= torch.mul(self.kernel,data['mask'])
+                # label= torch.mul(self.kernel,data['mask'])
                 label = label.mean().type(torch.float32)
 
             return image, label,xy
@@ -480,8 +430,12 @@ class CustomDatasetTest(Dataset):
         image = self.images[idx]
         xy=self.xyxys[idx]
         if self.transform:
+            # image=np.max(image,axis=2)
+            # image=np.stack([np.max(image,axis=2),np.median(image,axis=2).astype(np.uint8),np.min(image[:,:,12:18],axis=2)],axis=2)
             data = self.transform(image=image)
-            image = data['image'].unsqueeze(0)
+            image = data['image']
+            # image=image.unsqueeze(0)
+            image=torch.stack([image,image,image],dim=0)
 
         return image,xy
 
@@ -526,73 +480,46 @@ from collections import OrderedDict
 
 
 class RegressionPLModel(pl.LightningModule):
-    def __init__(self,pred_shape,size=224,enc='',with_norm=False):
+    def __init__(self,pred_shape,size=256,enc='',with_norm=False,total_steps=780):
         super(RegressionPLModel, self).__init__()
 
         self.save_hyperparameters()
         self.mask_pred = np.zeros(self.hparams.pred_shape)
         self.mask_count = np.zeros(self.hparams.pred_shape)
-        # self.backbone=SegModel(model_depth=50)
+
         self.loss_func1 = smp.losses.DiceLoss(mode='binary')
-        # self.loss_func2= smp.losses.FocalLoss(mode='binary',gamma=2)
-        self.loss_func2= smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.15)
-        # self.loss_func=nn.HuberLoss(delta=5.0)
+        self.loss_func2= smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25)
         self.loss_func= lambda x,y:0.5 * self.loss_func1(x,y)+0.5*self.loss_func2(x,y)
-        
-        # self.backbone = generate_model(model_depth=50, n_input_channels=1,forward_features=True,n_classes=700)
-        if self.hparams.enc=='resnet34':
-            self.backbone = generate_model(model_depth=34, n_input_channels=1,forward_features=True,n_classes=700)
-            state_dict=torch.load('./r3d34_K_200ep.pth')["state_dict"]
-            conv1_weight = state_dict['conv1.weight']
-            state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
-            self.backbone.load_state_dict(state_dict,strict=False)
-        elif self.hparams.enc=='resnest101':
-            self.backbone = generate_model(model_depth=101, n_input_channels=1,forward_features=True,n_classes=1039)
-            state_dict=torch.load('./r3d101_KM_200ep.pth')["state_dict"]
-            conv1_weight = state_dict['conv1.weight']
-            state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
-            self.backbone.load_state_dict(state_dict,strict=False)
-        elif self.hparams.enc=='2p1d':
-            self.backbone = generate_2p1d(model_depth=34, n_input_channels=1,n_classes=700)
-            state_dict=torch.load('./r2p1d34_K_200ep.pth')["state_dict"]
-            conv1_weight = state_dict['conv1_s.weight']
-            state_dict['conv1_s.weight'] = conv1_weight.sum(dim=1, keepdim=True)
-            self.backbone.load_state_dict(state_dict,strict=False)
-        elif self.hparams.enc=='wide50':
-            self.backbone = generate_wide(model_depth=50, n_input_channels=1,n_classes=700,forward_features=True,k=2)
-        elif self.hparams.enc=='i3d':
-            self.backbone=InceptionI3d(in_channels=1,num_classes=512,non_local=True)
-        elif self.hparams.enc=='resnext101':
-            self.backbone=resnext101(sample_size=112,
-                                  sample_duration=16,
-                                  shortcut_type='B',
-                                  cardinality=32,
-                                  num_classes=600)
-            state_dict = torch.load('./kinetics_resnext_101_RGB_16_best.pth')['state_dict']
-            checkpoint_custom = OrderedDict()
-            for key_model, key_checkpoint in zip(self.backbone.state_dict().keys(), state_dict.keys()):
-                checkpoint_custom.update({f'{key_model}': state_dict[f'{key_checkpoint}']})
-
-            self.backbone.load_state_dict(checkpoint_custom, strict=True)
-            self.backbone.conv1 = nn.Conv3d(1, 64, kernel_size=(7, 7, 7), stride=(1, 2, 2), padding=(3, 3, 3), bias=False)
-        else:
-            self.backbone = generate_model(model_depth=50, n_input_channels=1,forward_features=True,n_classes=1039)
-
-        
-        self.decoder = Decoder(encoder_dims=[x.size(1) for x in self.backbone(torch.rand(1,1,20,256,256))], upscale=1)
-
-        if self.hparams.with_norm:
-            self.normalization=nn.BatchNorm3d(num_features=1)
-    def forward(self, x):
-        if x.ndim==4:
-            x=x[:,None]
-        if self.hparams.with_norm:
-            x=self.normalization(x)
-        feat_maps = self.backbone(x)
-        feat_maps_pooled = [torch.max(f, dim=2)[0] for f in feat_maps]
-        pred_mask = self.decoder(feat_maps_pooled)
-        
-        return pred_mask
+        self.model_name='vit_base_patch14_reg4_dinov2'
+        self.backbone=timm.create_model(self.model_name, pretrained=True)
+        # for p in self.backbone.parameters():
+        #     p.requires_grad=False
+        self.linear=torch.nn.Linear(512,1)
+        self.depth=CFG.in_chans
+        self.timesformer=TimeSformer(
+                dim = 512,
+                image_size = 37,
+                patch_size = 1,
+                num_frames = self.depth,
+                num_classes = 16,
+                channels=768,
+                depth = 4,
+                heads = 8,
+                dim_head =  64,
+                attn_dropout = 0.1,
+                ff_dropout = 0.1
+            )
+    def forward(self,x):
+        x=rearrange(x, 'b c d h w -> (b d) c h w')
+        # with torch.no_grad():
+        x=self.backbone.forward_features(x)
+        x=rearrange(x[:,5:], '(b d) (h w) e -> b d e h w ',d=self.depth,h=37,w=37)
+        x=self.timesformer.forward_features(x)
+        x=rearrange(x[:,1:,:],'b (f h w) d -> b f h w d',f=self.depth,h=37,w=37)
+        x=x.max(dim=1)[0]
+        return self.linear(x).squeeze(-1).unsqueeze(1)
+    
+    
     def training_step(self, batch, batch_idx):
         x, y = batch
         outputs = self(x)
@@ -704,6 +631,33 @@ def normalization(x):
     mean=x.mean(dim=dim,keepdim=True)
     std=x.std(dim=dim,keepdim=True)
     return (x-mean)/(std+1e-9)
+# def predict_fn(test_loader, model, device, test_xyxys,pred_shape):
+#     mask_pred = np.zeros((pred_shape[0]//14,pred_shape[1]//14))
+#     mask_count = np.zeros((pred_shape[0]//14,pred_shape[1]//14))
+#     kernel=gkern(CFG.size,1)
+#     kernel=kernel/kernel.max()
+#     model.eval()
+
+#     for step, (images,xys) in tqdm(enumerate(test_loader),total=len(test_loader)):
+#         images = images.to(device)
+#         batch_size = images.size(0)
+#         with torch.no_grad():
+#             with torch.autocast(device_type="cuda"):
+#                 y_preds = model(images)
+#             # y_preds =TTA(images,model)
+#         # y_preds = y_preds.to('cpu').numpy()
+
+#         y_preds = torch.sigmoid(y_preds).squeeze(1).to('cpu')
+#         for i, (x1, y1, x2, y2) in enumerate(xys):
+#             x1, y1, x2, y2=x1//14, y1//14, x2//14, y2//14
+#             mask_pred[y1:y2, x1:x2] += y_preds[i].numpy()
+#             # mask_pred[y1:y2, x1:x2] += F.interpolate(y_preds[i].unsqueeze(0).unsqueeze(0).float(),scale_factor=4,mode='bilinear').squeeze(0).squeeze(0).numpy()
+#             mask_count[y1:y2, x1:x2] += np.ones((CFG.size//14, CFG.size//14))
+
+#     mask_pred /= mask_count
+#     # mask_pred/=mask_pred.max()
+#     return mask_pred
+    # return losses.avg,
 def predict_fn(test_loader, model, device, test_xyxys,pred_shape):
     mask_pred = np.zeros(pred_shape)
     mask_count = np.zeros(pred_shape)
@@ -722,28 +676,23 @@ def predict_fn(test_loader, model, device, test_xyxys,pred_shape):
 
         y_preds = torch.sigmoid(y_preds).to('cpu')
         for i, (x1, y1, x2, y2) in enumerate(xys):
-            mask_pred[y1:y2, x1:x2] += np.multiply(F.interpolate(y_preds[i].unsqueeze(0).float(),scale_factor=4,mode='bilinear').squeeze(0).squeeze(0).numpy(),kernel)
+            mask_pred[y1:y2, x1:x2] += np.multiply(F.interpolate(y_preds[i].unsqueeze(0).float(),scale_factor=14,mode='bilinear').squeeze(0).squeeze(0).numpy(),kernel)
             # mask_pred[y1:y2, x1:x2] += F.interpolate(y_preds[i].unsqueeze(0).unsqueeze(0).float(),scale_factor=4,mode='bilinear').squeeze(0).squeeze(0).numpy()
             mask_count[y1:y2, x1:x2] += np.ones((CFG.size, CFG.size))
 
     mask_pred /= mask_count
     # mask_pred/=mask_pred.max()
     return mask_pred
-    # return losses.avg,[]
+#     # return losses.avg,[]
 from PIL import Image
 from PIL.ImageOps import equalize,autocontrast
 import gc
 import time
 
-for m in ['0139_wild2_2um_20250807020208_0_fr_i3depoch=3.ckpt']:
-# for m in ['final_downscaled_2um4xdown_no139_20250807020208_0_fr_i3depoch=13.ckpt']:
-# for m in ['final_2um_20250802223135_0_fr_i3depoch=30.ckpt','final_2um_fulldenoise500p2a_0_fr_i3depoch=10.ckpt','final_2um_500p2a_0_fr_i3depoch=5.ckpt']:
+
+for m in ['checkpoints/dinotimes_base_finetune_alldata20241113080880_0_fr_i3depoch=2.ckpt']:
     # model=torch.jit.load(f'models_norm/{m}')
-    model=RegressionPLModel(pred_shape=(1,1),enc='resnett50')
-    
-    w=torch.load(CFG.model_dir+m,weights_only=False)
-    model.load_state_dict(w['state_dict'])
-    
+    model=RegressionPLModel.load_from_checkpoint(m,strict=False,enc='resnest101')
     model.cuda()
     model.eval()
     wandb.init(
@@ -753,36 +702,37 @@ for m in ['0139_wild2_2um_20250807020208_0_fr_i3depoch=3.ckpt']:
       name=f"ALL_scrolls_tta_{m}", 
       # Track hyperparameters and run metadata
         )
-    
-    # for fragment_id in [o for o  in os.listdir('./0139_traces') if o not in ['z_dbg_gen_00201_inp_hr','z_dbg_gen_00230','z_dbg_gen_00292_inp_hr','z_dbg_gen_00331','z_dbg_gen_00365','z_dbg_gen_00416','z_dbg_gen_00460','z_dbg_gen_00491','z_dbg_gen_00522','z_dbg_gen_00642','z_dbg_gen_01742']]:
-    # for fragment_id in os.listdir('0139_columns'):
-    for fragment_id in ['layers_02','layers_03']:
-    # for fragment_id in [o for o in os.listdir('0139_columns') if o not in ['auto_grown_20250918234353791','david_9b','auto_grown_20250919060642061','auto_grown_20250919055754487_inp_hr','auto_grown_20250919061352722_inp_hr']]:
-        print('reading', fragment_id)
-        try:
+# '20231210132040','20240304141531','20240304144031','20240304161941','working_mesh_flatboi_2','working_mesh_flatboi_3','working_mesh_flatboi_4','2','3','05201425','20240618142020','20240716140050','20240712064330','20240712071520','20240712074250','20240715203740','seg4','seg5','seg6','seg7','seg8','20240521175507','20240521175602','20240521175659','20240227180741','20240228135119','20240228191147','20240303035326','20240309033932'
+# '2','3','05201425','20240618142020','20240716140050','20240712064330','20240712071520','20240712074250','20240715203740','seg4','seg5','seg6','seg7','seg8','20240521175507','20240521175602','20240521175659','20240227180741','20240228135119','20240228191147','20240303035326','20240309033932'
+    # '20231210132040','20231005123336','20240304141531','20240304144031','20240304161941','working_mesh_0_window_445437_495437_flatboi','working_mesh_flatboi_4','2','3','05201425','20240618142020','20240716140050','20240712064330','20240712071520','20240712074250','20240715203740','seg4','seg5','seg6','seg7','seg8','20240521175507','20240521175602','20240521175659','20240227180741','20240228135119','20240228191147','20240303035326','20240309033932','20241017164948','20241017165012','20241017165105','20241023103934','20241023104051','20241023104311','20241023104551','20241023104629','Frag1','Frag2','Frag3','Frag4','Frag5'
+    # ['frag5','20240917091538','20240917091756','20240917092034','20240917092608','20240917093139','20240917164959','20240917165329','20240917165839','20240917170131','20240917170315','20240917170604','20240813112037','20240818211653','20240816164032','20240820102547','20240815194445','20240814124338','20240814122007','20240820133348','20240820150159']
+    # for fragment_id in ['s5_inner_wrap']:
+    for fragment_id in os.listdir('841_9um'):
+        if True:
             preds=[]
             for r in [0]:
-                for i in [8]:
-                    # original_shape=cv2.imread(f'train_scrolls/{fragment_id}/layers/05.tif',0).shape
-                    start_f=i
-                    end_f=start_f+CFG.in_chans
-                    test_loader,test_xyxz,test_shape,fragment_mask=get_img_splits(fragment_id,start_f,end_f,r)
-                    mask_pred= predict_fn(test_loader, model, device, test_xyxz,test_shape)
-                    mask_pred=np.clip(np.nan_to_num(mask_pred),a_min=0,a_max=1)
-                    mask_pred/=mask_pred.max()
-
-                    preds.append(mask_pred)
-
-                    img=wandb.Image(
-                    mask_pred, 
-                    caption=f"{fragment_id}"
-                    )
-                    wandb.log({f'predictions/{fragment_id}':img})
-
-            # print("plot time: ",t5-t4)
-                    gc.collect()
-        except Exception as e:
-            print(e)
+                for i in [6]:
+                    try:
+                        start_f=i
+                        end_f=start_f+2*CFG.in_chans
+                        test_loader,test_xyxz,test_shape,fragment_mask=get_img_splits(fragment_id,start_f,end_f,r)
+                        mask_pred= predict_fn(test_loader, model, device, test_xyxz,test_shape)
+                        mask_pred=np.clip(np.nan_to_num(mask_pred),a_min=0,a_max=1)
+                        mask_pred/=mask_pred.max()
+    
+                        preds.append(mask_pred)
+    
+                        img=wandb.Image(
+                        mask_pred, 
+                        caption=f"{fragment_id}"
+                        )
+                        wandb.log({'predictions':img})
+            
+                        # print("plot time: ",t5-t4)
+                        gc.collect()
+                    except Exception as e:
+                        print(e)
+                        continue
         
     del mask_pred,test_loader,model
     torch.cuda.empty_cache()
