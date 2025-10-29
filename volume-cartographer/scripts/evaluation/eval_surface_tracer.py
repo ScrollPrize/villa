@@ -13,30 +13,6 @@ This script orchestrates a multi-stage pipeline:
   7) Metrics calculation
   8) Optional W&B logging (scalar-only) + watchdog kill counters
 
-Key reliability fixes in this version:
-
-  • Every subprocess gets a UNIQUE scratch directory (TMPDIR) under out/scratch.
-    We always override TMPDIR (do NOT use setdefault) to avoid inheriting a
-    global /tmp consumed by other jobs. Temp files are never mixed into the
-    patches/traces output trees, which prevents the “surface is empty” cascade.
-
-  • Low-thread environment is enforced for all subprocesses: OMP, MKL, OPENBLAS,
-    NUMEXPR are pinned to 1, preventing BLAS storms that starve sibling procs.
-
-  • Run/traces directories use high-resolution timestamps (time_ns) to prevent
-    collisions under concurrency.
-
-  • We only select traces that contain a COMPLETE and NON-ZERO tifXYZ + meta.json,
-    and we prefer the MOST RECENT (by file mtimes) trace, not the largest-on-disk.
-    Compression makes “best” traces often smaller; largest-bytes is misleading.
-
-  • Non-empty threshold is now > 0 bytes (was 1024), so we don’t reject valid,
-    small or highly-compressed tiles.
-
-  • Watchdog uses the same isolated scratch pattern and logs stdout/stderr on
-    failures. Expansion tmp naming corrected.
-
-See inline comments for the rationale behind each step.
 """
 
 import os
@@ -502,11 +478,17 @@ class SurfaceTracerEvaluation:
     def run_tracer(self, source_patches: List[PatchInfo]) -> List[Path]:
         """
         For each source patch, run vc_grow_seg_from_segments twice:
-          • flip_x = 0
-          • flip_x = 1
+        • flip_x = 0
+        • flip_x = 1
         We run sequentially for determinism and simpler resource behavior.
         Each run writes into its own run_traces_dir and uses an isolated TMPDIR
         under out/scratch to avoid temp-file collisions.
+
+        RESTORED BEHAVIOR:
+        • Final trace selection is the LEXICOGRAPHICALLY LAST complete candidate
+            (ignoring *_opt), matching the old harness behavior.
+        • Do NOT bail out on non-zero return code; we still scan the run folder
+            and salvage a complete trace if present (old harness tolerance).
         """
         logger.info(f"Running vc_grow_seg_from_segments (both flip_x variants) for {len(source_patches)} source patches")
 
@@ -532,7 +514,9 @@ class SurfaceTracerEvaluation:
         def _run_one(source_patch: PatchInfo, tracer_params_file: Path, run_tag: str) -> Optional[Path]:
             """
             Launch one vc_grow_seg_from_segments run with its own output folder and scratch.
-            Select the *newest* complete trace (by mtime) from within that run's directory.
+            Select the *final* trace using the EXACT OLD rule: pick the lexicographically
+            last trace directory name among complete candidates (ignoring *_opt).
+            If the subprocess exits non-zero, we still scan/salvage any complete trace.
             """
             ts = time.time_ns()
             tag = f"_{run_tag}" if run_tag else ""
@@ -552,16 +536,18 @@ class SurfaceTracerEvaluation:
                 str(source_patch.path),
             ]
 
+            # Log stdout/stderr to a dedicated file, not to memory
+            log_path = self.proc_logs_dir / f"trace_{source_patch.path.name}_{run_tag}_{ts}.log"
             logger.info(f"Starting vc_grow_seg_from_segments run from {source_patch.path.name} ({run_tag})")
-            result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+            with open(log_path, "wb") as lf:
+                result = subprocess.run(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT)
             logger.info(f"Finished vc_grow_seg_from_segments run (return code {result.returncode})")
+
             if result.returncode != 0:
-                # Treat as failure; refuse partial artifacts to avoid "surface is empty" later
-                if result.stdout:
-                    logger.error(f"vc_grow_seg_from_segments STDOUT:\n{result.stdout}")
-                if result.stderr:
-                    logger.error(f"vc_grow_seg_from_segments STDERR:\n{result.stderr}")
-                return None
+                logger.error(
+                    f"vc_grow_seg_from_segments exited with rc={result.returncode} "
+                    f"(attempting to salvage any complete traces); see log: {log_path}"
+                )
 
             # Enumerate candidate traces: require complete tifXYZ + meta.json, ignore *_opt folders
             candidates: List[Path] = []
@@ -570,13 +556,23 @@ class SurfaceTracerEvaluation:
                     candidates.append(td)
 
             if not candidates:
+                # Nothing to keep (even if rc==0 or rc!=0). This mirrors the old harness’ tolerance:
+                # we only reject the run if no complete outputs exist.
                 logger.warning(f"No trace produced starting from patch {source_patch.path.name} ({run_tag})")
                 return None
 
-            # Prefer the newest by mtime across key files; tie-break by folder name for determinism.
-            candidates.sort(key=lambda td: (self._trace_mtime(td), td.name))
+            # ---- RESTORED: exact old final-choice rule (lexicographic last by name) ----
+            candidates.sort(key=lambda td: td.name)
             final_td = candidates[-1]
-            logger.info(f"Selected final trace {final_td.name} for patch {source_patch.path.name} ({run_tag})")
+
+            if result.returncode != 0:
+                logger.warning(
+                    f"Using salvaged trace {final_td.name} from a non-zero exit run "
+                    f"(patch {source_patch.path.name}, {run_tag})"
+                )
+            else:
+                logger.info(f"Selected final trace {final_td.name} for patch {source_patch.path.name} ({run_tag})")
+
             return final_td
 
         # Strictly sequential: iterate patches, and for each patch run fx0 then fx1.
