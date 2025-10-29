@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 from models import make_model
 from dataset import get_crop_from_volume, build_localiser, make_heatmaps
-from tifxyz import save_tifxyz
+from tifxyz import save_tifxyz, get_area
 
 
 @click.command()
@@ -36,6 +36,7 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
 
     assert steps_per_crop <= config['step_count']
     crop_size = config['crop_size']
+    step_size = config['step_size'] * 2 ** volume_scale
     
     random.seed(config['seed'])
     np.random.seed(config['seed'])
@@ -290,9 +291,9 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
             return sum([prev_u is not None, prev_v is not None, prev_diag is not None])
 
         tried_cag_and_conditionings = set()
-        area = 0
+        num_vertices = 1
 
-        while len(candidate_centers_and_gaps) > 0 and area < max_size**2:
+        while len(candidate_centers_and_gaps) > 0 and num_vertices < max_size**2:
 
             # For each center-and-gap, get available conditioning points; choose the center-and-gap
             # with most support that we've not already tried (with its current conditionings)
@@ -318,7 +319,7 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
                 print('warning: no point found!')
                 continue
             patch[*gap_uv] = coordinates[0]
-            area += 1
+            num_vertices += 1
 
             # Update the set of candidate center-and-gap points -- remove any for the same gap
             # Add those that have the former gap as a center (and a new gap adjacent)
@@ -329,7 +330,8 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
             ]
             enqueue_gaps_around_center(gap_uv)
 
-            print(f'area = {area}, queue size = {len(candidate_centers_and_gaps)}')
+            _, area_cm2 = get_area(torch.from_numpy(patch), step_size, voxel_size_um)
+            print(f'vertex count = {num_vertices}, area = {area_cm2:.2f}cm2, queue size = {len(candidate_centers_and_gaps)}')
 
         return torch.from_numpy(patch)
 
@@ -373,7 +375,7 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
 
         print(f'saving with timestamp {timestamp}')
         save_point_collection(f'points_patch_{timestamp}.json', patch_zyxs.view(-1, 3))
-        save_tifxyz((patch_zyxs * 2 ** volume_scale).numpy(), f'{out_path}', f'neural-trace-patch_{timestamp}', config['step_size'] * 2 ** volume_scale, voxel_size_um, 'neural-tracer')
+        save_tifxyz((patch_zyxs * 2 ** volume_scale).numpy(), f'{out_path}', f'neural-trace-patch_{timestamp}', step_size, voxel_size_um, 'neural-tracer')
         plt.plot(*patch_zyxs.view(-1, 3)[:, [0, 1]].T, 'r.')
         plt.savefig('patch.png')
         plt.close()
