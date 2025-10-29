@@ -589,6 +589,16 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
 
     QMenu contextMenu(tr("Context Menu"), _ui.treeWidget);
 
+    std::string currentDir = _volumePkg->getSegmentationDirectory();
+    if (currentDir == "traces") {
+        QAction* moveToPathsAction = contextMenu.addAction(tr("Move to Paths"));
+        moveToPathsAction->setIcon(_ui.treeWidget->style()->standardIcon(QStyle::SP_FileDialogDetailedView));
+        connect(moveToPathsAction, &QAction::triggered, this, [this, segmentId]() {
+            emit moveToPathsRequested(segmentId);
+        });
+        contextMenu.addSeparator();
+    }
+
     QAction* copyPathAction = contextMenu.addAction(tr("Copy Segment Path"));
     connect(copyPathAction, &QAction::triggered, this, [this, segmentId]() {
         emit copySegmentPathRequested(segmentId);

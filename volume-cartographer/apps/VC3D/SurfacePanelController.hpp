@@ -119,6 +119,7 @@ signals:
     void exportTifxyzChunksRequested(const QString& segmentId);
     void alphaCompRefineRequested(const QString& segmentId);
     void statusMessageRequested(const QString& message, int timeoutMs);
+    void moveToPathsRequested(const QString& segmentId);
 
 
 private:

@@ -621,6 +621,7 @@ CWindow::CWindow() :
             chkAxisAlignedSlices->toggle();
         }
     });
+    connect(_surfacePanel.get(), &SurfacePanelController::moveToPathsRequested, this, &CWindow::onMoveSegmentToPaths);
 }
 
 // Destructor
@@ -3555,4 +3556,133 @@ void CWindow::scheduleInotifyProcessing()
     _inotifyProcessTimer->setSingleShot(true);
     _inotifyProcessTimer->setInterval(INOTIFY_THROTTLE_MS);
     _inotifyProcessTimer->start();
+}
+
+
+void CWindow::onMoveSegmentToPaths(const QString& segmentId)
+{
+    if (!fVpkg) {
+        statusBar()->showMessage(tr("No volume package loaded"), 3000);
+        return;
+    }
+
+    // Verify we're in traces directory
+    if (fVpkg->getSegmentationDirectory() != "traces") {
+        statusBar()->showMessage(tr("Can only move segments from traces directory"), 3000);
+        return;
+    }
+
+    // Get the segment
+    auto seg = fVpkg->segmentation(segmentId.toStdString());
+    if (!seg) {
+        statusBar()->showMessage(tr("Segment not found: %1").arg(segmentId), 3000);
+        return;
+    }
+
+    // Build paths
+    std::filesystem::path volpkgPath(fVpkg->getVolpkgDirectory());
+    std::filesystem::path currentPath = seg->path();
+    std::filesystem::path newPath = volpkgPath / "paths" / currentPath.filename();
+
+    // Check if destination exists
+    if (std::filesystem::exists(newPath)) {
+        QMessageBox::StandardButton reply = QMessageBox::question(
+            this,
+            tr("Destination Exists"),
+            tr("Segment '%1' already exists in paths/.\nDo you want to replace it?").arg(segmentId),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No
+        );
+
+        if (reply != QMessageBox::Yes) {
+            return;
+        }
+
+        // Remove the existing one
+        try {
+            std::filesystem::remove_all(newPath);
+        } catch (const std::exception& e) {
+            QMessageBox::critical(this, tr("Error"),
+                tr("Failed to remove existing segment: %1").arg(e.what()));
+            return;
+        }
+    }
+
+    // Confirm the move
+    QMessageBox::StandardButton reply = QMessageBox::question(
+        this,
+        tr("Move to Paths"),
+        tr("Move segment '%1' from traces/ to paths/?\n\n"
+           "Note: The segment will be closed if currently open.").arg(segmentId),
+        QMessageBox::Yes | QMessageBox::No,
+        QMessageBox::Yes
+    );
+
+    if (reply != QMessageBox::Yes) {
+        return;
+    }
+
+    // === CRITICAL: Clean up the segment before moving ===
+    std::string idStd = segmentId.toStdString();
+
+    // Check if this is the currently selected segment
+    bool wasSelected = (_surfID == idStd);
+
+    // Clear from surface collection (including "segmentation" if it matches)
+    if (_surf_col) {
+        Surface* currentSurface = _surf_col->surface(idStd);
+        Surface* segmentationSurface = _surf_col->surface("segmentation");
+
+        // If this surface is currently shown as "segmentation", clear it
+        if (currentSurface && segmentationSurface && currentSurface == segmentationSurface) {
+            _surf_col->setSurface("segmentation", nullptr, false, false);
+        }
+
+        // Clear the surface from the collection
+        _surf_col->setSurface(idStd, nullptr, false, false);
+    }
+
+    // Clear from opchains if present - FIX: use direct member access, not pointer
+    if (_opchains.count(idStd)) {
+        delete _opchains[idStd];
+        _opchains.erase(idStd);
+    }
+
+    // Unload the surface from VolumePkg
+    fVpkg->unloadSurface(idStd);
+
+    // Clear selection if this was selected
+    if (wasSelected) {
+        clearSurfaceSelection();
+
+        // Clear tree selection
+        if (treeWidgetSurfaces) {
+            treeWidgetSurfaces->clearSelection();
+        }
+    }
+
+    // Perform the move
+    try {
+        std::filesystem::rename(currentPath, newPath);
+
+        // Remove from VolumePkg's internal tracking for traces
+        fVpkg->removeSingleSegmentation(idStd);
+
+        // The inotify system will pick up the IN_MOVED_TO in paths/
+        // and handle adding it there if the user switches to that directory
+
+        if (_surfacePanel) {
+            _surfacePanel->removeSingleSegmentation(idStd);
+        }
+
+        statusBar()->showMessage(
+            tr("Moved %1 from traces/ to paths/. Switch to paths directory to see it.").arg(segmentId), 5000);
+
+    } catch (const std::exception& e) {
+        // If move failed, we might want to reload the segment
+        // but it's probably safer to leave it unloaded
+        QMessageBox::critical(this, tr("Error"),
+            tr("Failed to move segment: %1\n\n"
+               "The segment has been unloaded from the viewer.").arg(e.what()));
+    }
 }
