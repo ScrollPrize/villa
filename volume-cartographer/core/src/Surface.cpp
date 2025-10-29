@@ -29,6 +29,176 @@
 
 namespace {
 
+// Write a 32-bit float single-channel image as tiled BigTIFF with LZW compression
+static void writeFloatBigTiff(const std::filesystem::path& outPath,
+                              const cv::Mat& img,
+                              uint32_t tileW = 1024,
+                              uint32_t tileH = 1024)
+{
+    if (img.empty())
+        throw std::runtime_error("empty image for " + outPath.string());
+    if (img.type() != CV_32FC1) {
+        throw std::runtime_error("expected CV_32FC1 for " + outPath.string());
+    }
+
+    TIFF* tf = TIFFOpen(outPath.string().c_str(), "w8"); // BigTIFF
+    if (!tf)
+        throw std::runtime_error("Failed to open BigTIFF for writing: " + outPath.string());
+
+    const uint32_t W = static_cast<uint32_t>(img.cols);
+    const uint32_t H = static_cast<uint32_t>(img.rows);
+
+    // Core tags
+    TIFFSetField(tf, TIFFTAG_IMAGEWIDTH,      W);
+    TIFFSetField(tf, TIFFTAG_IMAGELENGTH,     H);
+    TIFFSetField(tf, TIFFTAG_SAMPLESPERPIXEL, 1);
+    TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE,   32);
+    TIFFSetField(tf, TIFFTAG_SAMPLEFORMAT,    SAMPLEFORMAT_IEEEFP);
+    TIFFSetField(tf, TIFFTAG_PHOTOMETRIC,     PHOTOMETRIC_MINISBLACK);
+    TIFFSetField(tf, TIFFTAG_ORIENTATION,     ORIENTATION_TOPLEFT);
+    TIFFSetField(tf, TIFFTAG_PLANARCONFIG,    PLANARCONFIG_CONTIG);
+    TIFFSetField(tf, TIFFTAG_COMPRESSION,     COMPRESSION_LZW);
+#ifdef PREDICTOR_FLOATINGPOINT
+    TIFFSetField(tf, TIFFTAG_PREDICTOR,       PREDICTOR_FLOATINGPOINT);
+#else
+    TIFFSetField(tf, TIFFTAG_PREDICTOR,       PREDICTOR_HORIZONTAL);
+#endif
+
+    // Tiling
+    TIFFSetField(tf, TIFFTAG_TILEWIDTH,  tileW);
+    TIFFSetField(tf, TIFFTAG_TILELENGTH, tileH);
+
+    // Write tiles
+    const tmsize_t tileBytes = static_cast<tmsize_t>(tileW) *
+                               static_cast<tmsize_t>(tileH) *
+                               static_cast<tmsize_t>(sizeof(float));
+    std::vector<float> tileBuf(static_cast<size_t>(tileW) * tileH, -1.0f); // pad invalid with -1
+
+    for (uint32_t y0 = 0; y0 < H; y0 += tileH) {
+        const uint32_t dy = std::min(tileH, H - y0);
+        for (uint32_t x0 = 0; x0 < W; x0 += tileW) {
+            const uint32_t dx = std::min(tileW, W - x0);
+
+            // Fill tile buffer (pad right/bottom with -1.0f)
+            for (uint32_t ty = 0; ty < tileH; ++ty) {
+                float* dst = tileBuf.data() + ty * tileW;
+                if (ty < dy) {
+                    const float* src = img.ptr<float>(static_cast<int>(y0 + ty)) + x0;
+                    if (dx > 0) std::memcpy(dst, src, sizeof(float) * dx);
+                    if (dx < tileW) std::fill(dst + dx, dst + tileW, -1.0f);
+                } else {
+                    std::fill(dst, dst + tileW, -1.0f);
+                }
+            }
+
+            const ttile_t tileIndex = TIFFComputeTile(tf, x0, y0, 0, 0);
+            if (TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(), tileBytes) < 0) {
+                TIFFClose(tf);
+                throw std::runtime_error("TIFFWriteEncodedTile failed at tile (" +
+                                          std::to_string(x0) + "," + std::to_string(y0) +
+                                          ") in " + outPath.string());
+            }
+        }
+    }
+
+    if (!TIFFWriteDirectory(tf)) {
+        TIFFClose(tf);
+        throw std::runtime_error("TIFFWriteDirectory failed for " + outPath.string());
+    }
+    TIFFClose(tf);
+}
+
+// Write a single-channel image (8U, 16U, or 32F) as tiled BigTIFF with LZW compression
+static void writeSingleChannelBigTiff(const std::filesystem::path& outPath,
+                                      const cv::Mat& img,
+                                      uint32_t tileW = 1024,
+                                      uint32_t tileH = 1024)
+{
+    if (img.empty())
+        throw std::runtime_error("empty image for " + outPath.string());
+    if (img.channels() != 1)
+        throw std::runtime_error("expected single-channel image for " + outPath.string());
+
+    TIFF* tf = TIFFOpen(outPath.string().c_str(), "w8");
+    if (!tf)
+        throw std::runtime_error("Failed to open BigTIFF: " + outPath.string());
+
+    const uint32_t W = static_cast<uint32_t>(img.cols);
+    const uint32_t H = static_cast<uint32_t>(img.rows);
+
+    TIFFSetField(tf, TIFFTAG_IMAGEWIDTH,      W);
+    TIFFSetField(tf, TIFFTAG_IMAGELENGTH,     H);
+    TIFFSetField(tf, TIFFTAG_SAMPLESPERPIXEL, 1);
+    TIFFSetField(tf, TIFFTAG_PLANARCONFIG,    PLANARCONFIG_CONTIG);
+    TIFFSetField(tf, TIFFTAG_PHOTOMETRIC,     PHOTOMETRIC_MINISBLACK);
+    TIFFSetField(tf, TIFFTAG_ORIENTATION,     ORIENTATION_TOPLEFT);
+    TIFFSetField(tf, TIFFTAG_COMPRESSION,     COMPRESSION_LZW);
+    TIFFSetField(tf, TIFFTAG_TILEWIDTH,       tileW);
+    TIFFSetField(tf, TIFFTAG_TILELENGTH,      tileH);
+
+    int bits = 0, samplefmt = 0, elem = 0;
+    switch (img.type()) {
+        case CV_8UC1:
+            bits = 8;
+            samplefmt = SAMPLEFORMAT_UINT;
+            elem = 1;
+            break;
+        case CV_16UC1:
+            bits = 16;
+            samplefmt = SAMPLEFORMAT_UINT;
+            elem = 2;
+            break;
+        case CV_32FC1:
+            bits = 32;
+            samplefmt = SAMPLEFORMAT_IEEEFP;
+            elem = 4;
+            break;
+        default:
+            TIFFClose(tf);
+            throw std::runtime_error("unsupported channel type for " + outPath.string());
+    }
+
+    TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE, bits);
+    TIFFSetField(tf, TIFFTAG_SAMPLEFORMAT,  samplefmt);
+#ifdef PREDICTOR_FLOATINGPOINT
+    TIFFSetField(tf, TIFFTAG_PREDICTOR, (img.type() == CV_32FC1) ? PREDICTOR_FLOATINGPOINT : PREDICTOR_HORIZONTAL);
+#else
+    TIFFSetField(tf, TIFFTAG_PREDICTOR, PREDICTOR_HORIZONTAL);
+#endif
+
+    const tmsize_t tileBytes = static_cast<tmsize_t>(tileW) *
+                               static_cast<tmsize_t>(tileH) *
+                               static_cast<tmsize_t>(elem);
+    std::vector<uint8_t> tileBuf(static_cast<size_t>(tileBytes), 0);
+
+    for (uint32_t y0 = 0; y0 < H; y0 += tileH) {
+        const uint32_t dy = std::min(tileH, H - y0);
+        for (uint32_t x0 = 0; x0 < W; x0 += tileW) {
+            const uint32_t dx = std::min(tileW, W - x0);
+
+            // Fill tile (pad with zeros)
+            std::fill(tileBuf.begin(), tileBuf.end(), 0);
+            for (uint32_t ty = 0; ty < dy; ++ty) {
+                const uint8_t* src = img.ptr<uint8_t>(static_cast<int>(y0 + ty)) + x0 * elem;
+                std::memcpy(tileBuf.data() + (static_cast<size_t>(ty) * tileW * elem),
+                           src,
+                           static_cast<size_t>(dx) * elem);
+            }
+
+            const ttile_t tileIndex = TIFFComputeTile(tf, x0, y0, 0, 0);
+            if (TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(), tileBytes) < 0) {
+                TIFFClose(tf);
+                throw std::runtime_error("TIFFWriteEncodedTile failed in channel " + outPath.string());
+            }
+        }
+    }
+
+    if (!TIFFWriteDirectory(tf)) {
+        TIFFClose(tf);
+        throw std::runtime_error("TIFFWriteDirectory failed for channel " + outPath.string());
+    }
+    TIFFClose(tf);
+}
 void normalizeMaskChannel(cv::Mat& mask)
 {
     if (mask.empty()) {
@@ -1319,6 +1489,7 @@ void QuadSurface::saveOverwrite()
     id = uuid;
 }
 
+
 void QuadSurface::save(const std::string &path_, const std::string &uuid, bool force_overwrite)
 {
     std::filesystem::path target_path = path_;
@@ -1327,218 +1498,104 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
     if (!force_overwrite && std::filesystem::exists(final_path))
         throw std::runtime_error("path already exists!");
 
-
+    // Save to temporary location first for atomic operation
     std::filesystem::path temp_path = target_path.parent_path() / ".tmp" / target_path.filename();
     std::filesystem::create_directories(temp_path.parent_path());
+
+    // Temporarily set path for any operations that might need it
+    std::filesystem::path original_path = path;
     path = temp_path;
 
     if (!std::filesystem::create_directories(path)) {
         if (!std::filesystem::exists(path)) {
+            path = original_path; // Restore on error
             throw std::runtime_error("error creating dir for QuadSurface::save(): " + path.string());
         }
     }
 
+    // Split the points matrix into x, y, z channels
     std::vector<cv::Mat> xyz;
-
     cv::split((*_points), xyz);
 
     // Write x/y/z as 32-bit float tiled BigTIFF with LZW
-    auto write_float_big_tiff = [](const std::filesystem::path& outPath,
-                                   const cv::Mat& img,
-                                   uint32_t tileW = 1024,
-                                   uint32_t tileH = 1024)
-    {
-        if (img.empty())
-            throw std::runtime_error("empty image for " + outPath.string());
-        if (img.type() != CV_32FC1) {
-            // Accept CV_32F single channel only (split() guarantees that)
-            throw std::runtime_error("expected CV_32FC1 for " + outPath.string());
-        }
+    try {
+        writeFloatBigTiff(path / "x.tif", xyz[0]);
+        writeFloatBigTiff(path / "y.tif", xyz[1]);
+        writeFloatBigTiff(path / "z.tif", xyz[2]);
+    } catch (const std::exception& e) {
+        path = original_path; // Restore on error
+        throw;
+    }
 
-        TIFF* tf = TIFFOpen(outPath.string().c_str(), "w8"); // BigTIFF
-        if (!tf)
-            throw std::runtime_error("Failed to open BigTIFF for writing: " + outPath.string());
-
-        const uint32_t W = static_cast<uint32_t>(img.cols);
-        const uint32_t H = static_cast<uint32_t>(img.rows);
-
-        // Core tags
-        TIFFSetField(tf, TIFFTAG_IMAGEWIDTH,      W);
-        TIFFSetField(tf, TIFFTAG_IMAGELENGTH,     H);
-        TIFFSetField(tf, TIFFTAG_SAMPLESPERPIXEL, 1);
-        TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE,   32);
-        TIFFSetField(tf, TIFFTAG_SAMPLEFORMAT,    SAMPLEFORMAT_IEEEFP);
-        TIFFSetField(tf, TIFFTAG_PHOTOMETRIC,     PHOTOMETRIC_MINISBLACK);
-        TIFFSetField(tf, TIFFTAG_ORIENTATION,     ORIENTATION_TOPLEFT);
-        TIFFSetField(tf, TIFFTAG_PLANARCONFIG,    PLANARCONFIG_CONTIG);
-        TIFFSetField(tf, TIFFTAG_COMPRESSION,     COMPRESSION_LZW);
-#ifdef PREDICTOR_FLOATINGPOINT
-        TIFFSetField(tf, TIFFTAG_PREDICTOR,       PREDICTOR_FLOATINGPOINT);
-#else
-        TIFFSetField(tf, TIFFTAG_PREDICTOR,       PREDICTOR_HORIZONTAL);
-#endif
-
-        // Tiling
-        TIFFSetField(tf, TIFFTAG_TILEWIDTH,  tileW);
-        TIFFSetField(tf, TIFFTAG_TILELENGTH, tileH);
-
-        // Write tiles
-        const tmsize_t tileBytes = static_cast<tmsize_t>(tileW) *
-                                   static_cast<tmsize_t>(tileH) *
-                                   static_cast<tmsize_t>(sizeof(float));
-        std::vector<float> tileBuf(static_cast<size_t>(tileW) * tileH, -1.0f); // pad invalid with -1
-
-        for (uint32_t y0 = 0; y0 < H; y0 += tileH) {
-            const uint32_t dy = std::min(tileH, H - y0);
-            for (uint32_t x0 = 0; x0 < W; x0 += tileW) {
-                const uint32_t dx = std::min(tileW, W - x0);
-
-                // Fill tile buffer (pad right/bottom with -1.0f)
-                for (uint32_t ty = 0; ty < tileH; ++ty) {
-                    float* dst = tileBuf.data() + ty * tileW;
-                    if (ty < dy) {
-                        const float* src = img.ptr<float>(static_cast<int>(y0 + ty)) + x0;
-                        if (dx > 0) std::memcpy(dst, src, sizeof(float) * dx);
-                        if (dx < tileW) std::fill(dst + dx, dst + tileW, -1.0f);
-                    } else {
-                        std::fill(dst, dst + tileW, -1.0f);
-                    }
-                }
-
-                const ttile_t tileIndex = TIFFComputeTile(tf, x0, y0, 0, 0);
-                if (TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(), tileBytes) < 0) {
-                    TIFFClose(tf);
-                    throw std::runtime_error("TIFFWriteEncodedTile failed at tile (" +
-                                              std::to_string(x0) + "," + std::to_string(y0) +
-                                              ") in " + outPath.string());
-                }
-            }
-        }
-
-        if (!TIFFWriteDirectory(tf)) {
-            TIFFClose(tf);
-            throw std::runtime_error("TIFFWriteDirectory failed for " + outPath.string());
-        }
-        TIFFClose(tf);
-    };
-
-    write_float_big_tiff(path/"x.tif", xyz[0]);
-    write_float_big_tiff(path/"y.tif", xyz[1]);
-    write_float_big_tiff(path/"z.tif", xyz[2]);
-
-    // OpenCV compression params for any extra channels (and as fallback below).
+    // OpenCV compression params for fallback
     std::vector<int> compression_params = { cv::IMWRITE_TIFF_COMPRESSION, 5 };
 
+    // Save additional channels
     for (auto const& [name, mat] : _channels) {
         if (!mat.empty()) {
-            // Try BigTIFF for large ancillary channels (8U/16U/32F, 1 channel).
             bool wrote = false;
-            try {
-                if (mat.channels() == 1 &&
-                    (mat.type() == CV_8UC1 || mat.type() == CV_16UC1 || mat.type() == CV_32FC1))
-                {
-                    auto write_any_big_tiff = [](const std::filesystem::path& outPath,
-                                                 const cv::Mat& img,
-                                                 uint32_t tileW = 1024,
-                                                 uint32_t tileH = 1024)
-                    {
-                        TIFF* tf = TIFFOpen(outPath.string().c_str(), "w8");
-                        if (!tf) throw std::runtime_error("Failed to open BigTIFF: " + outPath.string());
-                        const uint32_t W = static_cast<uint32_t>(img.cols);
-                        const uint32_t H = static_cast<uint32_t>(img.rows);
-                        TIFFSetField(tf, TIFFTAG_IMAGEWIDTH,      W);
-                        TIFFSetField(tf, TIFFTAG_IMAGELENGTH,     H);
-                        TIFFSetField(tf, TIFFTAG_SAMPLESPERPIXEL, 1);
-                        TIFFSetField(tf, TIFFTAG_PLANARCONFIG,    PLANARCONFIG_CONTIG);
-                        TIFFSetField(tf, TIFFTAG_PHOTOMETRIC,     PHOTOMETRIC_MINISBLACK);
-                        TIFFSetField(tf, TIFFTAG_ORIENTATION,     ORIENTATION_TOPLEFT);
-                        TIFFSetField(tf, TIFFTAG_COMPRESSION,     COMPRESSION_LZW);
-                        TIFFSetField(tf, TIFFTAG_TILEWIDTH,  tileW);
-                        TIFFSetField(tf, TIFFTAG_TILELENGTH, tileH);
-                        int bits=0, samplefmt=0, elem=0;
-                        switch (img.type()) {
-                            case CV_8UC1:  bits = 8;  samplefmt = SAMPLEFORMAT_UINT;    elem = 1; break;
-                            case CV_16UC1: bits = 16; samplefmt = SAMPLEFORMAT_UINT;    elem = 2; break;
-                            case CV_32FC1: bits = 32; samplefmt = SAMPLEFORMAT_IEEEFP;  elem = 4; break;
-                            default: TIFFClose(tf); throw std::runtime_error("unsupported channel type");
-                        }
-                        TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE, bits);
-                        TIFFSetField(tf, TIFFTAG_SAMPLEFORMAT,  samplefmt);
-                    #ifdef PREDICTOR_FLOATINGPOINT
-                        TIFFSetField(tf, TIFFTAG_PREDICTOR, (img.type()==CV_32FC1) ? PREDICTOR_FLOATINGPOINT : PREDICTOR_HORIZONTAL);
-                    #else
-                        TIFFSetField(tf, TIFFTAG_PREDICTOR, PREDICTOR_HORIZONTAL);
-                    #endif
-                        const tmsize_t tileBytes = static_cast<tmsize_t>(tileW) *
-                                                   static_cast<tmsize_t>(tileH) *
-                                                   static_cast<tmsize_t>(elem);
-                        std::vector<uint8_t> tileBuf(static_cast<size_t>(tileBytes), 0);
-                        for (uint32_t y0 = 0; y0 < H; y0 += tileH) {
-                            const uint32_t dy = std::min(tileH, H - y0);
-                            for (uint32_t x0 = 0; x0 < W; x0 += tileW) {
-                                const uint32_t dx = std::min(tileW, W - x0);
-                                // Fill tile (pad with zeros)
-                                std::fill(tileBuf.begin(), tileBuf.end(), 0);
-                                for (uint32_t ty = 0; ty < dy; ++ty) {
-                                    const uint8_t* src = img.ptr<uint8_t>(static_cast<int>(y0 + ty)) + x0*elem;
-                                    std::memcpy(tileBuf.data() + (static_cast<size_t>(ty)*tileW*elem), src, static_cast<size_t>(dx)*elem);
-                                }
-                                const ttile_t tileIndex = TIFFComputeTile(tf, x0, y0, 0, 0);
-                                if (TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(), tileBytes) < 0) {
-                                    TIFFClose(tf);
-                                    throw std::runtime_error("TIFFWriteEncodedTile failed in channel " + outPath.string());
-                                }
-                            }
-                        }
-                        if (!TIFFWriteDirectory(tf)) {
-                            TIFFClose(tf);
-                            throw std::runtime_error("TIFFWriteDirectory failed for channel " + outPath.string());
-                        }
-                        TIFFClose(tf);
-                    };
-                    write_any_big_tiff(path / (name + ".tif"), mat);
+
+            // Try BigTIFF for large single-channel ancillary data (8U/16U/32F)
+            if (mat.channels() == 1 &&
+                (mat.type() == CV_8UC1 || mat.type() == CV_16UC1 || mat.type() == CV_32FC1))
+            {
+                try {
+                    writeSingleChannelBigTiff(path / (name + ".tif"), mat);
                     wrote = true;
+                } catch (...) {
+                    wrote = false; // Fall back to OpenCV
                 }
-            } catch (...) {
-                wrote = false; // fall back below
             }
+
+            // Fallback to OpenCV for multi-channel or other formats
             if (!wrote) {
-                cv::imwrite(path / (name + ".tif"), mat, compression_params);
+                cv::imwrite((path / (name + ".tif")).string(), mat, compression_params);
             }
         }
     }
 
+    // Prepare and write metadata
     if (!meta)
         meta = new nlohmann::json;
 
-    (*meta)["bbox"] = {{bbox().low[0],bbox().low[1],bbox().low[2]},{bbox().high[0],bbox().high[1],bbox().high[2]}};
+    (*meta)["bbox"] = {{bbox().low[0], bbox().low[1], bbox().low[2]},
+                       {bbox().high[0], bbox().high[1], bbox().high[2]}};
     (*meta)["type"] = "seg";
     (*meta)["uuid"] = uuid;
     (*meta)["format"] = "tifxyz";
     (*meta)["scale"] = {_scale[0], _scale[1]};
-    std::ofstream o(path/"meta.json.tmp");
+
+    std::ofstream o(path / "meta.json.tmp");
     o << std::setw(4) << (*meta) << std::endl;
+    o.close();
 
-    //rename to make creation atomic
-    std::filesystem::rename(path/"meta.json.tmp", path/"meta.json");
+    // Rename to make creation atomic
+    std::filesystem::rename(path / "meta.json.tmp", path / "meta.json");
 
+    // Atomically move the saved data to the final location
     bool replacedExisting = false;
     if (force_overwrite && std::filesystem::exists(final_path)) {
         if (renameat2(AT_FDCWD, temp_path.c_str(), AT_FDCWD, final_path.c_str(), RENAME_EXCHANGE) != 0) {
             const int err = errno;
             if (err == ENOSYS || err == EINVAL) {
+                // System doesn't support atomic exchange, fall back to remove + rename
                 std::filesystem::remove_all(final_path);
                 std::filesystem::rename(temp_path, final_path);
                 replacedExisting = true;
             } else {
+                path = original_path; // Restore on error
                 const std::error_code ec(err, std::generic_category());
-                throw std::runtime_error("atomic exchange failed for " + temp_path.string() + " and " + final_path.string() + ": " + ec.message());
+                throw std::runtime_error("atomic exchange failed for " + temp_path.string() +
+                                       " and " + final_path.string() + ": " + ec.message());
             }
         } else {
+            // Atomic exchange succeeded, clean up the old data now in temp location
             std::error_code cleanupErr;
             std::filesystem::remove_all(temp_path, cleanupErr);
             if (cleanupErr) {
-                throw std::runtime_error("failed to clean up previous segmentation data at " + temp_path.string() + ": " + cleanupErr.message());
+                path = original_path; // Restore on error
+                throw std::runtime_error("failed to clean up previous segmentation data at " +
+                                       temp_path.string() + ": " + cleanupErr.message());
             }
             replacedExisting = true;
         }
@@ -1547,6 +1604,10 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
     if (!replacedExisting) {
         std::filesystem::rename(temp_path, final_path);
     }
+
+    // Update the path to the final canonical location
+    path = final_path;
+    id = uuid;
 }
 
 void QuadSurface::save_meta()

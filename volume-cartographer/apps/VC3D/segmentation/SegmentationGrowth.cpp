@@ -27,7 +27,189 @@
 Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth)
 
 namespace
+{void createRotatingBackup(QuadSurface* surface, const std::filesystem::path& surfacePath, int maxBackups = 10)
 {
+    if (!surface) {
+        return;
+    }
+
+    // Normalize the surface path to get the canonical path under paths/
+    std::filesystem::path canonicalPath = surfacePath;
+    std::filesystem::path volpkgRoot;
+    std::string segmentName;
+
+    // Check if this is already a backup path (contains /backups/)
+    std::string pathStr = canonicalPath.string();
+    size_t backupsPos = pathStr.find("/backups/");
+
+    if (backupsPos != std::string::npos) {
+        // This is a backup path. We need to reconstruct the canonical path.
+        // Backup structure: /path/to/scroll.volpkg/backups/segment_name/N/
+
+        qCInfo(lcSegGrowth) << "Detected backup path, normalizing:"
+                           << QString::fromStdString(pathStr);
+
+        // Walk up from the path to find the numeric backup directory
+        std::filesystem::path tempPath = canonicalPath;
+
+        while (tempPath.has_parent_path()) {
+            std::string filename = tempPath.filename().string();
+
+            // Check if this is a numeric backup directory (0, 1, 2, etc.)
+            bool isNumeric = !filename.empty() &&
+                           std::all_of(filename.begin(), filename.end(), ::isdigit);
+
+            if (isNumeric) {
+                // Check if parent is under backups/
+                std::filesystem::path parent = tempPath.parent_path();
+                std::filesystem::path grandparent = parent.parent_path();
+
+                if (grandparent.filename() == "backups") {
+                    // Found it! The parent is the segment name directory
+                    segmentName = parent.filename().string();
+
+                    // Reconstruct volpkg root and canonical path
+                    volpkgRoot = grandparent.parent_path();
+                    canonicalPath = volpkgRoot / "paths" / segmentName;
+
+                    qCInfo(lcSegGrowth) << "Normalized to canonical path:"
+                                       << QString::fromStdString(canonicalPath.string());
+                    break;
+                }
+            }
+            tempPath = tempPath.parent_path();
+        }
+
+        // If we didn't find the pattern, fall back to treating it as a regular path
+        if (segmentName.empty()) {
+            qCWarning(lcSegGrowth) << "Could not parse backup path structure, treating as regular path";
+            volpkgRoot = canonicalPath.parent_path().parent_path();
+            segmentName = canonicalPath.filename().string();
+        }
+    } else {
+        // Regular path: /path/to/scroll.volpkg/paths/segment_name
+        volpkgRoot = canonicalPath.parent_path().parent_path();
+        segmentName = canonicalPath.filename().string();
+    }
+
+    // Create centralized backups directory structure
+    std::filesystem::path backupsDir = volpkgRoot / "backups" / segmentName;
+
+    // Create backups directory if it doesn't exist
+    std::error_code ec;
+    std::filesystem::create_directories(backupsDir, ec);
+    if (ec) {
+        qCWarning(lcSegGrowth) << "Failed to create backups directory:"
+                               << QString::fromStdString(ec.message());
+        return;
+    }
+
+    // Find existing backup directories and determine next backup number
+    std::vector<int> existingBackups;
+    if (std::filesystem::exists(backupsDir)) {
+        for (const auto& entry : std::filesystem::directory_iterator(backupsDir)) {
+            if (entry.is_directory()) {
+                try {
+                    int backupNum = std::stoi(entry.path().filename().string());
+                    if (backupNum >= 0 && backupNum < maxBackups) {
+                        existingBackups.push_back(backupNum);
+                    }
+                } catch (...) {
+                    // Skip non-numeric directories
+                }
+            }
+        }
+    }
+
+    std::sort(existingBackups.begin(), existingBackups.end());
+
+    std::filesystem::path snapshot_dest;
+
+    if (existingBackups.size() < static_cast<size_t>(maxBackups)) {
+        // We have room for more backups, find the first available slot
+        int nextBackup = 0;
+        for (int i = 0; i < maxBackups; ++i) {
+            if (std::find(existingBackups.begin(), existingBackups.end(), i) == existingBackups.end()) {
+                nextBackup = i;
+                break;
+            }
+        }
+        snapshot_dest = backupsDir / std::to_string(nextBackup);
+        qCInfo(lcSegGrowth) << "Creating backup" << nextBackup << "of" << maxBackups;
+    } else {
+        // We're at the limit, rotate backups
+        qCInfo(lcSegGrowth) << "At backup limit, rotating backups";
+
+        // Delete the oldest (0)
+        std::filesystem::remove_all(backupsDir / "0", ec);
+        if (ec) {
+            qCWarning(lcSegGrowth) << "Failed to remove oldest backup:"
+                                   << QString::fromStdString(ec.message());
+        }
+
+        // Rename all backups down by 1 (1->0, 2->1, etc.)
+        for (int i = 1; i < maxBackups; ++i) {
+            std::filesystem::path oldPath = backupsDir / std::to_string(i);
+            std::filesystem::path newPath = backupsDir / std::to_string(i - 1);
+            if (std::filesystem::exists(oldPath)) {
+                std::filesystem::rename(oldPath, newPath, ec);
+                if (ec) {
+                    qCWarning(lcSegGrowth) << "Failed to rotate backup" << i
+                                           << "to" << (i-1) << ":"
+                                           << QString::fromStdString(ec.message());
+                }
+            }
+        }
+
+        // New backup goes in the last slot
+        snapshot_dest = backupsDir / std::to_string(maxBackups - 1);
+    }
+
+    qCInfo(lcSegGrowth) << "Saving backup to:" << QString::fromStdString(snapshot_dest.string());
+
+    // Save the backup
+    surface->save(snapshot_dest, true);
+
+    // Copy mask.tif and generations.tif if they exist from the canonical path
+    std::filesystem::path maskFile = canonicalPath / "mask.tif";
+    std::filesystem::path generationsFile = canonicalPath / "generations.tif";
+
+    if (std::filesystem::exists(maskFile)) {
+        std::filesystem::path destMask = snapshot_dest / "mask.tif";
+        std::filesystem::copy_file(maskFile, destMask,
+            std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            qCWarning(lcSegGrowth) << "Failed to copy mask.tif to backup:"
+                                   << QString::fromStdString(ec.message());
+        } else {
+            qCInfo(lcSegGrowth) << "Copied mask.tif to backup";
+
+            // Delete the original mask.tif after successful copy
+            std::filesystem::remove(maskFile, ec);
+            if (ec) {
+                qCWarning(lcSegGrowth) << "Failed to delete original mask.tif:"
+                                       << QString::fromStdString(ec.message());
+            } else {
+                qCInfo(lcSegGrowth) << "Deleted original mask.tif";
+            }
+        }
+    }
+
+    if (std::filesystem::exists(generationsFile)) {
+        std::filesystem::path destGenerations = snapshot_dest / "generations.tif";
+        std::filesystem::copy_file(generationsFile, destGenerations,
+            std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            qCWarning(lcSegGrowth) << "Failed to copy generations.tif to backup:"
+                                   << QString::fromStdString(ec.message());
+        } else {
+            qCInfo(lcSegGrowth) << "Copied generations.tif to backup";
+        }
+    }
+
+    qCInfo(lcSegGrowth) << "Backup creation complete";
+}
+
 void ensureMetaObject(QuadSurface* surface)
 {
     if (!surface) {
@@ -426,7 +608,8 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
             }
         }
         qCInfo(lcSegGrowth) << "  params:" << QString::fromStdString(params.dump());
-
+        std::filesystem::path surface_path = context.resumeSurface->path;
+        createRotatingBackup(context.resumeSurface, surface_path);
         QuadSurface* surface = tracer(dataset,
                                       1.0f,
                                       context.cache,

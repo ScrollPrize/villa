@@ -17,7 +17,7 @@ VolumePkg::VolumePkg(const std::filesystem::path& fileLocation) : rootDir_{fileL
 {
     config_ = Metadata(fileLocation / ::CONFIG);
 
-    std::vector<std::string> dirs = {"volumes","paths","traces","transforms","renders"};
+    std::vector<std::string> dirs = {"volumes","paths","traces","transforms","renders","backups"};
 
     for (const auto& d : dirs) {
         if (not std::filesystem::exists(rootDir_ / d)) {
