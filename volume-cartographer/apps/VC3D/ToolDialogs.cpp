@@ -1,5 +1,7 @@
 #include "ToolDialogs.hpp"
 
+#include "VCSettings.hpp"
+
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QVBoxLayout>
@@ -160,7 +162,7 @@ RenderParamsDialog::RenderParamsDialog(QWidget* parent,
     applySavedDefaults();
     applySessionDefaults();
     connect(btnReset, &QPushButton::clicked, this, [this]() {
-        QSettings s("VC.ini", QSettings::IniFormat);
+        QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
         s.beginGroup("render/defaults");
         const bool hasAny = s.allKeys().size() > 0;
         s.endGroup();
@@ -222,7 +224,7 @@ void RenderParamsDialog::applyCodeDefaults() {
 }
 
 void RenderParamsDialog::applySavedDefaults() {
-    QSettings s("VC.ini", QSettings::IniFormat);
+    QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
     s.beginGroup("render/defaults");
     chkIncludeTifs_->setChecked(s.value("include_tifs", chkIncludeTifs_->isChecked()).toBool());
     spCropX_->setValue(s.value("crop_x", spCropX_->value()).toInt());
@@ -257,7 +259,7 @@ void RenderParamsDialog::applySessionDefaults() {
 }
 
 void RenderParamsDialog::saveDefaults() const {
-    QSettings s("VC.ini", QSettings::IniFormat);
+    QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
     s.beginGroup("render/defaults");
     s.setValue("include_tifs", chkIncludeTifs_->isChecked());
     s.setValue("crop_x", spCropX_->value());
@@ -425,7 +427,7 @@ TraceParamsDialog::TraceParamsDialog(QWidget* parent,
     connect(btns, &QDialogButtonBox::accepted, this, [this]() { updateSessionFromUI(); });
     connect(btnReset, &QPushButton::clicked, this, [this]() {
         // Prefer saved defaults if available; otherwise code defaults
-        QSettings s("VC.ini", QSettings::IniFormat);
+        QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
         s.beginGroup("trace/defaults");
         const bool hasAny = s.allKeys().size() > 0;
         s.endGroup();
@@ -502,7 +504,7 @@ void TraceParamsDialog::applyCodeDefaults() {
 }
 
 void TraceParamsDialog::applySavedDefaults() {
-    QSettings s("VC.ini", QSettings::IniFormat);
+    QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
     s.beginGroup("trace/defaults");
     chkFlipX_->setChecked(s.value("flip_x", chkFlipX_->isChecked()).toInt() != 0);
     spGlobalStepsWin_->setValue(s.value("global_steps_per_window", spGlobalStepsWin_->value()).toInt());
@@ -602,7 +604,7 @@ void TraceParamsDialog::updateSessionFromUI() {
 }
 
 void TraceParamsDialog::saveDefaults() const {
-    QSettings s("VC.ini", QSettings::IniFormat);
+    QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
     s.beginGroup("trace/defaults");
     s.setValue("flip_x", chkFlipX_->isChecked() ? 1 : 0);
     s.setValue("global_steps_per_window", spGlobalStepsWin_->value());
@@ -693,7 +695,7 @@ ConvertToObjDialog::ConvertToObjDialog(QWidget* parent,
     // Reset / Save handlers
     connect(btnReset, &QPushButton::clicked, this, [this]() {
         // Prefer saved defaults if available; otherwise code defaults
-        QSettings s("VC.ini", QSettings::IniFormat);
+        QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
         s.beginGroup("toobj/defaults");
         const bool hasAny = s.allKeys().size() > 0;
         s.endGroup();
@@ -726,7 +728,7 @@ void ConvertToObjDialog::applyCodeDefaults() {
 }
 
 void ConvertToObjDialog::applySavedDefaults() {
-    QSettings s("VC.ini", QSettings::IniFormat);
+    QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
     s.beginGroup("toobj/defaults");
     chkNormalize_->setChecked(s.value("normalize_uv", chkNormalize_->isChecked()).toBool());
     chkAlign_->setChecked(s.value("align_grid", chkAlign_->isChecked()).toBool());
@@ -751,7 +753,7 @@ void ConvertToObjDialog::applySessionDefaults() {
 }
 
 void ConvertToObjDialog::saveDefaults() const {
-    QSettings s("VC.ini", QSettings::IniFormat);
+    QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
     s.beginGroup("toobj/defaults");
     s.setValue("normalize_uv", chkNormalize_->isChecked());
     s.setValue("align_grid", chkAlign_->isChecked());
@@ -907,7 +909,7 @@ void AlphaCompRefineDialog::accept()
 
 void AlphaCompRefineDialog::applySavedDefaults()
 {
-    QSettings s("VC.ini", QSettings::IniFormat);
+    QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
     s.beginGroup("objrefine/defaults");
     chkRefine_->setChecked(s.value("refine", chkRefine_->isChecked()).toBool());
     spStart_->setValue(s.value("start", spStart_->value()).toDouble());
@@ -946,7 +948,7 @@ void AlphaCompRefineDialog::applySessionDefaults()
 
 void AlphaCompRefineDialog::saveDefaults() const
 {
-    QSettings s("VC.ini", QSettings::IniFormat);
+    QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
     s.beginGroup("objrefine/defaults");
     s.setValue("refine", chkRefine_->isChecked());
     s.setValue("start", spStart_->value());

@@ -1,5 +1,6 @@
 #include "MenuActionController.hpp"
 
+#include "VCSettings.hpp"
 #include "CWindow.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
@@ -237,13 +238,13 @@ void MenuActionController::ensureRecentActions()
 
 QStringList MenuActionController::loadRecentPaths() const
 {
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     return settings.value("volpkg/recent").toStringList();
 }
 
 void MenuActionController::saveRecentPaths(const QStringList& paths)
 {
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue("volpkg/recent", paths);
 }
 
@@ -360,7 +361,7 @@ void MenuActionController::showSettingsDialog()
     auto* dialog = new SettingsDialog(_window);
     dialog->exec();
 
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     bool showDirHints = settings.value("viewer/show_direction_hints", true).toBool();
     if (_window->_viewerManager) {
         _window->_viewerManager->forEachViewer([showDirHints](CVolumeViewer* viewer) {

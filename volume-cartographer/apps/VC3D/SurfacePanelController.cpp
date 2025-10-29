@@ -6,6 +6,7 @@
 #include "OpChain.hpp"
 #include "CVolumeViewer.hpp"
 #include "elements/DropdownChecklistButton.hpp"
+#include "VCSettings.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -1140,7 +1141,7 @@ void SurfacePanelController::onTagCheckboxToggled()
         return;
     }
 
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     const std::string username = settings.value("viewer/username", "").toString().toStdString();
 
     const auto selectedItems = _ui.treeWidget->selectedItems();

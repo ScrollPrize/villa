@@ -36,11 +36,11 @@ enum class SurfaceInputType {
 
 struct RefinementConfig {
     bool refine = true;
-    float start = -6.0f;
+    float start = -2.0f;
     float stop = 30.0f;
     float step = 2.0f;
-    float low = 26.0f / 255.0f;
-    float high = 255.0f / 255.0f;
+    float low = 118.0f / 255.0f;
+    float high = 165.0f / 255.0f;
     float border_off = 1.0f;
     int   r = 3;
     bool  gen_vertexcolor = false;

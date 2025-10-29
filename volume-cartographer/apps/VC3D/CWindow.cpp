@@ -1,6 +1,7 @@
 #include "CWindow.hpp"
 
 #include "WindowRangeWidget.hpp"
+#include "VCSettings.hpp"
 #include <QKeySequence>
 #include <QHBoxLayout>
 #include <QKeyEvent>
@@ -444,7 +445,7 @@ CWindow::CWindow() :
     connect(_inotifyProcessTimer, &QTimer::timeout, this, &CWindow::processPendingInotifyEvents);
 
     _point_collection = new VCCollection(this);
-    const QSettings settings("VC.ini", QSettings::IniFormat);
+    const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     setWindowIcon(QPixmap(":/images/logo.png"));
     ui.setupUi(this);
     // setAttribute(Qt::WA_DeleteOnClose);
@@ -601,7 +602,7 @@ CWindow::CWindow() :
     fDirectionHintsShortcut = new QShortcut(QKeySequence("Ctrl+T"), this);
     fDirectionHintsShortcut->setContext(Qt::ApplicationShortcut);
     connect(fDirectionHintsShortcut, &QShortcut::activated, [this]() {
-        QSettings settings("VC.ini", QSettings::IniFormat);
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         bool current = settings.value("viewer/show_direction_hints", true).toBool();
         bool next = !current;
         settings.setValue("viewer/show_direction_hints", next ? "1" : "0");
@@ -1004,7 +1005,7 @@ bool CWindow::centerFocusOnCursor()
 // Create widgets
 void CWindow::CreateWidgets(void)
 {
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
     // add volume viewer
     auto aWidgetLayout = new QVBoxLayout;
@@ -1544,7 +1545,7 @@ void CWindow::CreateWidgets(void)
 
     chkAxisAlignedSlices = ui.chkAxisAlignedSlices;
     if (chkAxisAlignedSlices) {
-        bool useAxisAligned = settings.value("viewer/use_axis_aligned_slices", false).toBool();
+        bool useAxisAligned = settings.value("viewer/use_axis_aligned_slices", true).toBool();
         QSignalBlocker blocker(chkAxisAlignedSlices);
         chkAxisAlignedSlices->setChecked(useAxisAligned);
         connect(chkAxisAlignedSlices, &QCheckBox::toggled, this, &CWindow::onAxisAlignedSlicesToggled);
@@ -1857,7 +1858,7 @@ std::filesystem::path seg_path_name(const std::filesystem::path &path)
 void CWindow::OpenVolume(const QString& path)
 {
     QString aVpkgPath = path;
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
     if (aVpkgPath.isEmpty()) {
         aVpkgPath = QFileDialog::getExistingDirectory(
@@ -2489,7 +2490,7 @@ void CWindow::onAxisOverlayVisibilityToggled(bool enabled)
     if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
         spinAxisOverlayOpacity->setEnabled(_useAxisAlignedSlices && enabled);
     }
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue("viewer/show_axis_overlays", enabled ? "1" : "0");
 }
 
@@ -2499,7 +2500,7 @@ void CWindow::onAxisOverlayOpacityChanged(int value)
     if (_planeSlicingOverlay) {
         _planeSlicingOverlay->setAxisAlignedOverlayOpacity(normalized);
     }
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue("viewer/axis_overlay_opacity", value);
 }
 
@@ -2641,7 +2642,7 @@ void CWindow::onAxisAlignedSlicesToggled(bool enabled)
     if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
         spinAxisOverlayOpacity->setEnabled(enabled && (!ui.chkAxisOverlays || ui.chkAxisOverlays->isChecked()));
     }
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue("viewer/use_axis_aligned_slices", enabled ? "1" : "0");
     updateAxisAlignedSliceInteraction();
     applySlicePlaneOrientation();
