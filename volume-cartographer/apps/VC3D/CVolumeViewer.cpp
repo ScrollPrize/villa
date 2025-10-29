@@ -30,7 +30,6 @@
 #include <utility>
 
 #include <opencv2/imgproc.hpp>
-#include <nlohmann/json.hpp>
 
 using qga = QGuiApplication;
 
@@ -65,22 +64,6 @@ constexpr float kDsScaleQuantization = 1000.0f;
 inline int quantizeFloat(float value, float multiplier)
 {
     return static_cast<int>(std::lround(value * multiplier));
-}
-
-inline bool hasInspectTag(const QuadSurface* surface)
-{
-    if (!surface || !surface->meta) {
-        return false;
-    }
-    const nlohmann::json& meta = *surface->meta;
-    if (!meta.is_object()) {
-        return false;
-    }
-    auto it = meta.find("tags");
-    if (it == meta.end() || !it->is_object()) {
-        return false;
-    }
-    return it->contains("inspect");
 }
 
 inline bool planeIdForSurface(const std::string& name, uint8_t& outId)
@@ -1623,23 +1606,13 @@ void CVolumeViewer::renderIntersections()
         for(int n=0;n<intersect_cands.size();n++) {
             std::string key = intersect_cands[n];
             QuadSurface *segmentation = dynamic_cast<QuadSurface*>(_surf_col->surface(key));
-            if (!segmentation) {
-                continue;
-            }
-
-            const bool inspectTagged = hasInspectTag(segmentation);
-            // Give inspect-tagged surfaces the same sampling budget as the active surface to reduce flicker.
-            const bool useExpandedSampling = (key == "segmentation") || inspectTagged;
-            const int minTries = useExpandedSampling ? 1000 : 10;
 
             std::vector<std::vector<cv::Vec2f>> xy_seg_;
-            find_intersect_segments(intersections[n],
-                                    xy_seg_,
-                                    segmentation->rawPoints(),
-                                    plane,
-                                    plane_roi,
-                                    4/_scale,
-                                    minTries);
+            if (key == "segmentation") {
+                find_intersect_segments(intersections[n], xy_seg_, segmentation->rawPoints(), plane, plane_roi, 4/_scale, 1000);
+            }
+            else
+                find_intersect_segments(intersections[n], xy_seg_, segmentation->rawPoints(), plane, plane_roi, 4/_scale);
 
         }
 
