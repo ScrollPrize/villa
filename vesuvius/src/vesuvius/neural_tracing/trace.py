@@ -192,6 +192,147 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
             rows.append(torch.stack(next_row, dim=0))
         return torch.stack(rows, dim=0)
 
+    def trace_patch_v4(start_zyx, max_size):
+
+        patch = np.full([max_size, max_size, 3], -1.)
+        center_uv = np.array([max_size // 2, max_size // 2])
+        patch[*center_uv] = start_zyx
+
+        def in_patch(u, v):
+            return 0 <= u < max_size and 0 <= v < max_size and not (patch[u, v] == -1).all()
+
+        candidate_centers_and_gaps = []
+
+        def enqueue_gaps_around_center(center_uv):
+            center_uv = np.asarray(center_uv)
+            candidate_centers_and_gaps.extend([
+                (tuple(center_uv), tuple(center_uv + delta))
+                for delta in [[0, -1], [0, 1], [-1, 0], [1, 0]]
+                if not in_patch(*(center_uv + delta))
+                    and (center_uv + delta >= 0).all() and (center_uv + delta < max_size).all()
+            ])
+
+        enqueue_gaps_around_center(center_uv)
+
+        def get_conditioning(center, gap):
+            assert in_patch(*center)
+            assert not in_patch(*gap)
+            center_u, center_v = center
+            gap_u, gap_v = gap
+
+            if gap_u == center_u:
+                if in_patch(center_u - 1, center_v):
+                    prev_u = center_u - 1
+                elif in_patch(center_u + 1, center_v):
+                    prev_u = center_u + 1
+                else:
+                    prev_u = None
+            elif gap_u > center_u:
+                if in_patch(center_u - 1, center_v):
+                    prev_u = center_u - 1
+                else:
+                    prev_u = None
+            else:  # gap_u < center_u
+                if in_patch(center_u + 1, center_v):
+                    prev_u = center_u + 1
+                else:
+                    prev_u = None
+
+            if gap_v == center_v:
+                if in_patch(center_u, center_v - 1):
+                    prev_v = center_v - 1
+                elif in_patch(center_u, center_v + 1):
+                    prev_v = center_v + 1
+                else:
+                    prev_v = None
+            elif gap_v > center_v:
+                if in_patch(center_u, center_v - 1):
+                    prev_v = center_v - 1
+                else:
+                    prev_v = None
+            else:  # gap_v < center_v
+                if in_patch(center_u, center_v + 1):
+                    prev_v = center_v + 1
+                else:
+                    prev_v = None
+
+            # TODO: missing any cases here?
+            if prev_u is not None and prev_v is None:
+                if gap_v != center_v and in_patch(prev_u, gap_v):
+                    prev_diag = prev_u, gap_v
+                else:
+                    prev_diag = None
+            elif prev_v is not None and prev_u is None:
+                if gap_u != center_u and in_patch(gap_u, prev_v):
+                    prev_diag = gap_u, prev_v
+                else:
+                    prev_diag = None
+            elif prev_u is not None and prev_v is not None:
+                if gap_u != center_u:
+                    assert gap_v == center_v
+                    prev_diag = gap_u, prev_v
+                elif gap_v != center_v:
+                    assert gap_u == center_u
+                    prev_diag = prev_u, gap_v
+                else:
+                    assert False
+            else:
+                prev_diag = None
+
+            return (
+                torch.tensor([prev_u, center_v]) if prev_u is not None else None,
+                torch.tensor([center_u, prev_v]) if prev_v is not None else None,
+                torch.tensor(prev_diag) if prev_diag is not None else None,
+            )
+
+        def count_conditionings(conditionings):
+            prev_u, prev_v, prev_diag = conditionings
+            return sum([prev_u is not None, prev_v is not None, prev_diag is not None])
+
+        tried_cag_and_conditionings = set()
+        area = 0
+
+        while len(candidate_centers_and_gaps) > 0 and area < max_size**2:
+
+            # For each center-and-gap, get available conditioning points; choose the center-and-gap
+            # with most support that we've not already tried (with its current conditionings)
+            cag_to_conditionings = {(center, gap): get_conditioning(center, gap) for center, gap in candidate_centers_and_gaps}
+            cag_to_conditionings = {(center, gap): conditioning for (center, gap), conditioning in cag_to_conditionings.items() if (center, gap, conditioning) not in tried_cag_and_conditionings}
+            if len(cag_to_conditionings) == 0:
+                print('no untried center-gap-conditioning combinations')
+                break
+            center_and_gap = max(cag_to_conditionings, key=lambda center_and_gap: count_conditionings(cag_to_conditionings[center_and_gap]))
+            tried_cag_and_conditionings.add((*center_and_gap, cag_to_conditionings[center_and_gap]))
+            center_zyx = patch[*center_and_gap[0]]
+            center_uv, gap_uv = center_and_gap
+            def get_prev_zyx(uv):
+                if uv is None or (uv < 0).any() or (uv >= max_size).any():
+                    return None
+                return torch.from_numpy(patch[*uv])
+            prev_u, prev_v, prev_diag = map(get_prev_zyx, cag_to_conditionings[center_and_gap])
+
+            # Query model at this point; take the largest (0th) blob centroid to fill the gap-point
+            heatmaps, min_corner_zyx = get_heatmaps_at(torch.from_numpy(center_zyx), prev_u=prev_u, prev_v=prev_v, prev_diag=prev_diag)
+            coordinates = get_blob_coordinates(heatmaps[0 if gap_uv[0] != center_uv[0] else 1].squeeze(0), min_corner_zyx)
+            if len(coordinates) == 0 or coordinates[0].isnan().any():
+                print('warning: no point found!')
+                continue
+            patch[*gap_uv] = coordinates[0]
+            area += 1
+
+            # Update the set of candidate center-and-gap points -- remove any for the same gap
+            # Add those that have the former gap as a center (and a new gap adjacent)
+            candidate_centers_and_gaps = [
+                (other_center_uv, other_gap_uv)
+                for other_center_uv, other_gap_uv in candidate_centers_and_gaps
+                if other_gap_uv != gap_uv
+            ]
+            enqueue_gaps_around_center(gap_uv)
+
+            print(f'area = {area}, queue size = {len(candidate_centers_and_gaps)}')
+
+        return torch.from_numpy(patch)
+
     def save_point_collection(filename, zyxs):
         with open(filename, 'wt') as fp:
             json.dump({
@@ -219,11 +360,18 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
 
         start_zyx = torch.tensor(start_xyz).flip(0) / 2 ** volume_scale
 
-        strip_direction = 'u'
-        strip_zyxs = trace_strip(start_zyx, num_steps=100, direction=strip_direction)
-        save_point_collection(f'points_{strip_direction}_{timestamp}.json', strip_zyxs)
-        patch_zyxs = trace_patch(strip_zyxs, num_steps=100, direction='v' if strip_direction == 'u' else 'u')
+        if True:  # strip-then-extrude
 
+            strip_direction = 'u'
+            strip_zyxs = trace_strip(start_zyx, num_steps=100, direction=strip_direction)
+            save_point_collection(f'points_{strip_direction}_{timestamp}.json', strip_zyxs)
+            patch_zyxs = trace_patch(strip_zyxs, num_steps=100, direction='v' if strip_direction == 'u' else 'u')
+
+        else:  # freeform 2D growth
+
+            patch_zyxs = trace_patch_v4(start_zyx, max_size=100)
+
+        print(f'saving with timestamp {timestamp}')
         save_point_collection(f'points_patch_{timestamp}.json', patch_zyxs.view(-1, 3))
         save_tifxyz((patch_zyxs * 2 ** volume_scale).numpy(), f'{out_path}', f'neural-trace-patch_{timestamp}', config['step_size'] * 2 ** volume_scale, voxel_size_um, 'neural-tracer')
         plt.plot(*patch_zyxs.view(-1, 3)[:, [0, 1]].T, 'r.')
