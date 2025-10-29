@@ -327,7 +327,7 @@ bool VCCollection::loadFromJSON(const std::string& filename)
         qWarning() << "Failed to open file for reading: " << QString::fromStdString(filename);
         return false;
     }
- 
+
     json j;
     try {
         i >> j;
@@ -335,21 +335,26 @@ bool VCCollection::loadFromJSON(const std::string& filename)
         qWarning() << "Failed to parse JSON: " << e.what();
         return false;
     }
- 
-    clearAll();
- 
-    try {
-       if (!j.contains("vc_pointcollections_json_version") || j.at("vc_pointcollections_json_version").get<std::string>() != VC_POINTCOLLECTIONS_JSON_VERSION) {
-           throw std::runtime_error("JSON file has incorrect version or is missing version info.");
-       }
+    return loadFromJson(j);
+}
 
-        json collections_obj = j.at("collections");
+bool VCCollection::loadFromJson(const json& root)
+{
+    clearAll();
+
+    try {
+        if (!root.contains("vc_pointcollections_json_version") ||
+            root.at("vc_pointcollections_json_version").get<std::string>() != VC_POINTCOLLECTIONS_JSON_VERSION) {
+            throw std::runtime_error("JSON file has incorrect version or is missing version info.");
+        }
+
+        const json& collections_obj = root.at("collections");
         if (!collections_obj.is_object()) {
             return false;
         }
 
         for (auto& [id_str, col_json] : collections_obj.items()) {
-           uint64_t id = std::stoull(id_str);
+            uint64_t id = std::stoull(id_str);
             Collection col = col_json.get<Collection>();
             col.id = id;
             _collections[col.id] = col;
@@ -358,11 +363,14 @@ bool VCCollection::loadFromJSON(const std::string& filename)
             }
         }
 
-    } catch (json::exception& e) {
+    } catch (const json::exception& e) {
         qWarning() << "Failed to extract data from JSON: " << e.what();
         return false;
+    } catch (const std::exception& e) {
+        qWarning() << "Failed to load VCCollection from JSON payload: " << e.what();
+        return false;
     }
- 
+
     // Recalculate next IDs
     _next_collection_id = 1;
     _next_point_id = 1;
@@ -432,5 +440,4 @@ uint64_t VCCollection::findOrCreateCollectionByName(const std::string& name)
     emit collectionAdded(new_id);
     return new_id;
 }
-
 

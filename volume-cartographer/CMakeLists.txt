@@ -140,6 +140,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS on)
 option(VC_BUILD_APPS     "Compile VC core programs"    on)
 option(VC_BUILD_GUI      "Compile GUI programs"        on)
 option(VC_BUILD_UTILS    "Compile VC utility programs" on)
+option(VC_BUILD_PYTHON   "Build Python bindings"       ON)
 
 # Choose what to install
 option(VC_INSTALL_APPS      "Install VC core programs"    on)
@@ -173,9 +174,12 @@ endif()
 add_subdirectory(misc)
 add_subdirectory(core)
 
-
 if (VC_BUILD_APPS)
     add_subdirectory(apps)
+endif()
+
+if (VC_BUILD_PYTHON)
+    add_subdirectory(python)
 endif()
 
 include(VCPackageConfig)

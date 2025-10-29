@@ -1,0 +1,42 @@
+[build-system]
+requires = [
+    "scikit-build-core>=0.8.0",
+    "pybind11>=2.11.0",
+    "cmake>=3.23",
+    "ninja",
+    "packaging",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "vc-tracing"
+version = "3.0.2"
+description = "Volume Cartographer tracing bindings"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Vesuvius Challenge Team" }
+]
+dependencies = [
+    "numpy>=1.24",
+    "zarr>=2.16",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Operating System :: POSIX :: Linux",
+]
+
+[project.urls]
+Homepage = "https://scrollprize.org"
+Repository = "https://github.com/ScrollPrize/villa"
+
+[tool.scikit-build]
+wheel.packages = ["python/src"]
+cmake.args = [
+    "-DVC_BUILD_PYTHON=ON",
+    "-DVC_BUILD_APPS=OFF",
+    "-DVC_BUILD_UTILS=OFF",
+]
+cmake.build-type = "Release"

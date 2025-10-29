@@ -42,8 +42,8 @@ else()
     FetchContent_MakeAvailable(z5)
 endif()
 
-# ---- Qt (apps / utils) -------------------------------------------------------
-if ((VC_BUILD_APPS OR VC_BUILD_UTILS) AND VC_BUILD_GUI)
+# ---- Qt (apps / utils / python) ---------------------------------------------
+if (VC_BUILD_GUI AND (VC_BUILD_APPS OR VC_BUILD_UTILS OR VC_BUILD_PYTHON))
     find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network)
     set(CMAKE_AUTOMOC ON)
     set(CMAKE_AUTORCC ON)
@@ -54,6 +54,25 @@ if ((VC_BUILD_APPS OR VC_BUILD_UTILS) AND VC_BUILD_GUI)
         message(WARNING "WARNING qt_generate_deploy_app_script MISSING!")
         function(qt_generate_deploy_app_script)
         endfunction()
+    endif()
+endif()
+
+# ---- Python bindings ---------------------------------------------------------
+if (VC_BUILD_PYTHON)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
+
+    find_package(pybind11 CONFIG QUIET)
+    if (NOT pybind11_FOUND)
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" -m pybind11 --cmakedir
+            OUTPUT_VARIABLE pybind11_cmake_dir
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE pybind11_dir_status
+        )
+        if (pybind11_dir_status EQUAL 0 AND EXISTS "${pybind11_cmake_dir}")
+            list(APPEND CMAKE_PREFIX_PATH "${pybind11_cmake_dir}")
+        endif()
+        find_package(pybind11 CONFIG REQUIRED)
     endif()
 endif()
 
