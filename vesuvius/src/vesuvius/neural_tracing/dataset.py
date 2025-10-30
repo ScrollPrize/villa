@@ -588,7 +588,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 u_neg_shifted_zyxs = get_zyx_from_patch(u_neg_shifted_ijs, patch)
                 v_neg_shifted_zyxs = get_zyx_from_patch(v_neg_shifted_ijs, patch)
             
-            # Get final crop volume (only called once now)
+            # Get final crop volume
             volume_crop, min_corner_zyx = get_crop_from_volume(patch.volume, center_zyx, crop_size)
 
             # Map to 3D space and construct heatmaps

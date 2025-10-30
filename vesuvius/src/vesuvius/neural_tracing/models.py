@@ -1,3 +1,4 @@
+import torch
 
 from vesuvius_unet3d import Vesuvius3dUnetModel
 from youssef_mae import Vesuvius3dViTModel
@@ -17,3 +18,9 @@ def make_model(config):
         )
     else:
         raise RuntimeError('unexpected model_type, should be unet or vit')
+
+
+def load_checkpoint(checkpoint_path, model):
+    print(f'loading checkpoint {checkpoint_path}... ')
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    model.load_state_dict(checkpoint['model'])

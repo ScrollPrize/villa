@@ -1,23 +1,14 @@
-import os
-import cv2
 import json
-import cc3d
 import click
 import torch
-import diffusers
-import accelerate
 import numpy as np
 import random
-import zarr
-import sklearn.cluster
 from tqdm import tqdm
-from einops import rearrange
 import matplotlib.pyplot as plt
 from datetime import datetime
-import torch.nn.functional as F
 
-from models import make_model
-from dataset import get_crop_from_volume, build_localiser, make_heatmaps
+from models import make_model, load_checkpoint
+from infer import Inference
 from tifxyz import save_tifxyz, get_area
 
 
@@ -35,72 +26,24 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
         config = json.load(f)
 
     assert steps_per_crop <= config['step_count']
-    crop_size = config['crop_size']
     step_size = config['step_size'] * 2 ** volume_scale
     
     random.seed(config['seed'])
     np.random.seed(config['seed'])
     torch.manual_seed(config['seed'])
     torch.cuda.manual_seed_all(config['seed'])
-    
-    accelerator = accelerate.Accelerator(
-        mixed_precision=config['mixed_precision'],
-    )
 
     model = make_model(config)
-
-    print(f'loading checkpoint {checkpoint_path}... ')
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    model.load_state_dict(checkpoint['model'])
-    noise_scheduler = diffusers.DDPMScheduler.from_config(checkpoint.get('noise_scheduler', None))
-    del checkpoint
-    
-    model = accelerator.prepare(model)
-    model.eval()
-    
-    print(f"loading volume zarr {volume_zarr}...")
-    ome_zarr = zarr.open_group(volume_zarr, mode='r')
-    volume = ome_zarr[str(volume_scale)]
-    with open(f'{volume_zarr}/meta.json', 'rt') as meta_fp:
-        voxel_size_um = json.load(meta_fp)['voxelsize']
-    print(f"volume shape: {volume.shape}, dtype: {volume.dtype}, voxel-size: {voxel_size_um * 2 ** volume_scale}um")
-
-    def get_heatmaps_at(zyx, prev_u, prev_v, prev_diag):
-        volume_crop, min_corner_zyx = get_crop_from_volume(volume, zyx, crop_size)
-        localiser = build_localiser(zyx, min_corner_zyx, crop_size)
-        prev_u_heatmap = make_heatmaps([prev_u[None]], min_corner_zyx, crop_size) if prev_u is not None else torch.zeros([1, crop_size, crop_size, config['crop_size']])
-        prev_v_heatmap = make_heatmaps([prev_v[None]], min_corner_zyx, crop_size) if prev_v is not None else torch.zeros([1, crop_size, crop_size, config['crop_size']])
-        prev_diag_heatmap = make_heatmaps([prev_diag[None]], min_corner_zyx, crop_size) if prev_diag is not None else torch.zeros([1, crop_size, crop_size, config['crop_size']])
-        inputs = torch.cat([
-            volume_crop[None, None].to(accelerator.device),
-            localiser[None, None].to(accelerator.device),
-            prev_u_heatmap[None].to(accelerator.device),
-            prev_v_heatmap[None].to(accelerator.device),
-            prev_diag_heatmap[None].to(accelerator.device),
-        ], dim=1)
-        timesteps = torch.zeros([1], dtype=torch.long, device=accelerator.device)
-        logits = model(inputs, timesteps).squeeze(0).reshape(2, config['step_count'], crop_size, crop_size, crop_size)  # u/v, step, z, y, x
-        # TODO: test-time augmentation! as well as flip/rotate also consider very small spatial jitters etc
-        return F.sigmoid(logits[:, :steps_per_crop]), min_corner_zyx
-
-    def get_blob_coordinates(heatmap, min_corner_zyx, threshold=0.5, min_size=8):
-        # Find up to four blobs of sufficient size; return their centroids in descending order of blob size
-        # TODO: strip blobs that are further than K * step_size in euclidean space
-        cc_labels = cc3d.connected_components((heatmap > threshold).cpu().numpy(), connectivity=18, binary_image=True)
-        cc_labels, num_ccs = cc3d.dust(cc_labels, threshold=min_size, precomputed_ccl=True, return_N=True)
-        cc_stats = cc3d.statistics(cc_labels)
-        centroid_zyxs = cc_stats['centroids'][1:] + min_corner_zyx.numpy()
-        size_order = np.argsort(-cc_stats['voxel_counts'][1:])[:4]
-        centroid_zyxs = centroid_zyxs[size_order]
-        return torch.from_numpy(centroid_zyxs.astype(np.float32))
+    load_checkpoint(checkpoint_path, model)
+    inference = Inference(model, config, volume_zarr, volume_scale)
 
     def trace_strip(start_zyx, num_steps, direction):
 
         assert steps_per_crop == 1  # TODO...
 
         # Get hopefully-4 adjacent points; take the one with min or max z-displacement depending on required direction
-        heatmaps, min_corner_zyx = get_heatmaps_at(start_zyx, prev_u=None, prev_v=None, prev_diag=None)
-        coordinates = get_blob_coordinates(heatmaps[:, 0].amax(dim=0), min_corner_zyx)
+        heatmaps, min_corner_zyx = inference.get_heatmaps_at(start_zyx, prev_u=None, prev_v=None, prev_diag=None)
+        coordinates = inference.get_blob_coordinates(heatmaps[:, 0].amax(dim=0), min_corner_zyx)
         if len(coordinates) == 0 or coordinates[0].isnan().any():
             print('no blobs found at step 0')
             return torch.empty([0, 0, 3])
@@ -120,8 +63,8 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
                 prev_uv = {'prev_u': trace_zyxs[-2], 'prev_v': None}
             else:
                 prev_uv = {'prev_v': trace_zyxs[-2], 'prev_u': None}
-            heatmaps, min_corner_zyx = get_heatmaps_at(trace_zyxs[-1], **prev_uv, prev_diag=None)
-            coordinates = get_blob_coordinates(heatmaps[0 if direction == 'u' else 1].squeeze(0), min_corner_zyx)
+            heatmaps, min_corner_zyx = inference.get_heatmaps_at(trace_zyxs[-1], **prev_uv, prev_diag=None)
+            coordinates = inference.get_blob_coordinates(heatmaps[0 if direction == 'u' else 1, 0], min_corner_zyx)
 
             if len(coordinates) == 0 or coordinates[0].isnan().any():
                 print(f'no blobs found at step {step + 1}')
@@ -179,8 +122,8 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
 
                 if direction == 'v':
                     prev_u, prev_v = prev_v, prev_u
-                heatmaps, min_corner_zyx = get_heatmaps_at(rows[-1][col_idx], prev_u=prev_u, prev_v=prev_v, prev_diag=prev_diag)
-                coordinates = get_blob_coordinates(heatmaps[0 if direction == 'u' else 1].squeeze(0), min_corner_zyx)
+                heatmaps, min_corner_zyx = inference.get_heatmaps_at(rows[-1][col_idx], prev_u=prev_u, prev_v=prev_v, prev_diag=prev_diag)
+                coordinates = inference.get_blob_coordinates(heatmaps[0 if direction == 'u' else 1, 0], min_corner_zyx)
                 if len(coordinates) == 0 or coordinates[0].isnan().any():
                     print('warning: no point found!')
                     next_row.extend([torch.tensor([-1, -1, -1])] * (first_row_zyxs.shape[0] - len(next_row)))
@@ -313,8 +256,8 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
             prev_u, prev_v, prev_diag = map(get_prev_zyx, cag_to_conditionings[center_and_gap])
 
             # Query model at this point; take the largest (0th) blob centroid to fill the gap-point
-            heatmaps, min_corner_zyx = get_heatmaps_at(torch.from_numpy(center_zyx), prev_u=prev_u, prev_v=prev_v, prev_diag=prev_diag)
-            coordinates = get_blob_coordinates(heatmaps[0 if gap_uv[0] != center_uv[0] else 1].squeeze(0), min_corner_zyx)
+            heatmaps, min_corner_zyx = inference.get_heatmaps_at(torch.from_numpy(center_zyx), prev_u=prev_u, prev_v=prev_v, prev_diag=prev_diag)
+            coordinates = inference.get_blob_coordinates(heatmaps[0 if gap_uv[0] != center_uv[0] else 1, 0], min_corner_zyx)
             if len(coordinates) == 0 or coordinates[0].isnan().any():
                 print('warning: no point found!')
                 continue
@@ -330,7 +273,7 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
             ]
             enqueue_gaps_around_center(gap_uv)
 
-            _, area_cm2 = get_area(torch.from_numpy(patch), step_size, voxel_size_um)
+            _, area_cm2 = get_area(torch.from_numpy(patch), step_size, inference.voxel_size_um)
             print(f'vertex count = {num_vertices}, area = {area_cm2:.2f}cm2, queue size = {len(candidate_centers_and_gaps)}')
 
         return torch.from_numpy(patch)
@@ -375,7 +318,7 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
 
         print(f'saving with timestamp {timestamp}')
         save_point_collection(f'points_patch_{timestamp}.json', patch_zyxs.view(-1, 3))
-        save_tifxyz((patch_zyxs * 2 ** volume_scale).numpy(), f'{out_path}', f'neural-trace-patch_{timestamp}', step_size, voxel_size_um, 'neural-tracer')
+        save_tifxyz((patch_zyxs * 2 ** volume_scale).numpy(), f'{out_path}', f'neural-trace-patch_{timestamp}', step_size, inference.voxel_size_um, 'neural-tracer')
         plt.plot(*patch_zyxs.view(-1, 3)[:, [0, 1]].T, 'r.')
         plt.savefig('patch.png')
         plt.close()
