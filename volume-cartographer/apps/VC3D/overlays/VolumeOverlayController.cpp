@@ -2,6 +2,7 @@
 
 #include "../ViewerManager.hpp"
 #include "../CVolumeViewer.hpp"
+#include "../VCSettings.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -410,7 +411,7 @@ void VolumeOverlayController::loadState()
         return;
     }
 
-    QSettings settings(QStringLiteral("VC.ini"), QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     const QString groupKey = overlaySettingsGroupKey(_volpkgPath);
     if (groupKey.isEmpty()) {
         return;
@@ -467,7 +468,7 @@ void VolumeOverlayController::saveState() const
         return;
     }
 
-    QSettings settings(QStringLiteral("VC.ini"), QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.beginGroup(QString::fromLatin1(kOverlaySettingsGroup));
     settings.beginGroup(groupKey);
     settings.setValue(QStringLiteral("path"), _volpkgPath);

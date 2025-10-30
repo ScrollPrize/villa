@@ -124,6 +124,7 @@ private:
     void applyDirectionFieldDraftToSelection(int row);
     void updateDirectionFieldListItem(int row);
     void updateDirectionFieldListGeometry();
+    void clearDirectionFieldForm();
     [[nodiscard]] QString determineDefaultVolumeId(const QVector<QPair<QString, QString>>& volumes,
                                                    const QString& requestedId) const;
     void setGrowthDirectionMask(int mask);
@@ -195,6 +196,7 @@ private:
     QDoubleSpinBox* _spinDirectionFieldWeight{nullptr};
     QPushButton* _directionFieldAddButton{nullptr};
     QPushButton* _directionFieldRemoveButton{nullptr};
+    QPushButton* _directionFieldClearButton{nullptr};
     QListWidget* _directionFieldList{nullptr};
 
     QGroupBox* _groupCorrections{nullptr};

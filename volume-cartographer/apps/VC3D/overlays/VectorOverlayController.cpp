@@ -2,6 +2,7 @@
 
 #include "../CVolumeViewer.hpp"
 #include "../CSurfaceCollection.hpp"
+#include "../VCSettings.hpp"
 
 #include "vc/core/util/Surface.hpp"
 
@@ -169,7 +170,7 @@ void VectorOverlayController::collectDirectionHints(CVolumeViewer* viewer,
         cv::Vec3f centerParam = quad->loc(ptr) * scale;
         addMarker(QPointF(centerParam[0], centerParam[1]), kCenterColor, kStepCenterRadius);
 
-        QSettings settings("VC.ini", QSettings::IniFormat);
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         bool useSegStep = settings.value("viewer/use_seg_step_for_hints", true).toBool();
         int numPoints = std::max(0, std::min(100, settings.value("viewer/direction_step_points", 5).toInt()));
         float stepVal = settings.value("viewer/direction_step", 10.0f).toFloat();
@@ -248,7 +249,7 @@ void VectorOverlayController::collectDirectionHints(CVolumeViewer* viewer,
         addLabel(redTip + QPointF(8.0, -8.0), QStringLiteral("false"), kArrowFalseColor);
         addLabel(greenTip + QPointF(8.0, -8.0), QStringLiteral("true"), kArrowTrueColor);
 
-        QSettings settings("VC.ini", QSettings::IniFormat);
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         bool useSegStep = settings.value("viewer/use_seg_step_for_hints", true).toBool();
         int numPoints = std::max(0, std::min(100, settings.value("viewer/direction_step_points", 5).toInt()));
         float stepVal = settings.value("viewer/direction_step", 10.0f).toFloat();

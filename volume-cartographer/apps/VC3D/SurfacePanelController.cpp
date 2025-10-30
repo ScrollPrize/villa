@@ -6,6 +6,7 @@
 #include "OpChain.hpp"
 #include "CVolumeViewer.hpp"
 #include "elements/DropdownChecklistButton.hpp"
+#include "VCSettings.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -589,6 +590,16 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
 
     QMenu contextMenu(tr("Context Menu"), _ui.treeWidget);
 
+    std::string currentDir = _volumePkg->getSegmentationDirectory();
+    if (currentDir == "traces") {
+        QAction* moveToPathsAction = contextMenu.addAction(tr("Move to Paths"));
+        moveToPathsAction->setIcon(_ui.treeWidget->style()->standardIcon(QStyle::SP_FileDialogDetailedView));
+        connect(moveToPathsAction, &QAction::triggered, this, [this, segmentId]() {
+            emit moveToPathsRequested(segmentId);
+        });
+        contextMenu.addSeparator();
+    }
+
     QAction* copyPathAction = contextMenu.addAction(tr("Copy Segment Path"));
     connect(copyPathAction, &QAction::triggered, this, [this, segmentId]() {
         emit copySegmentPathRequested(segmentId);
@@ -630,6 +641,11 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     QAction* convertToObjAction = contextMenu.addAction(tr("Convert to OBJ"));
     connect(convertToObjAction, &QAction::triggered, this, [this, segmentId]() {
         emit convertToObjRequested(segmentId);
+    });
+
+    QAction* refineAlphaCompAction = contextMenu.addAction(tr("Refine (Alpha-comp)"));
+    connect(refineAlphaCompAction, &QAction::triggered, this, [this, segmentId]() {
+        emit alphaCompRefineRequested(segmentId);
     });
 
     QAction* slimFlattenAction = contextMenu.addAction(tr("SLIM-flatten"));
@@ -1125,7 +1141,7 @@ void SurfacePanelController::onTagCheckboxToggled()
         return;
     }
 
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     const std::string username = settings.value("viewer/username", "").toString().toStdString();
 
     const auto selectedItems = _ui.treeWidget->selectedItems();

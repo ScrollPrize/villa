@@ -1,13 +1,16 @@
 #include "SegmentationWidget.hpp"
 
 #include "elements/CollapsibleSettingsGroup.hpp"
+#include "VCSettings.hpp"
 
 #include <QAbstractItemView>
+#include <QApplication>
 #include <QByteArray>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDir>
 #include <QDoubleSpinBox>
+#include <QEvent>
 #include <QFileDialog>
 #include <QGroupBox>
 #include <QGridLayout>
@@ -16,6 +19,7 @@
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QLoggingCategory>
+#include <QMouseEvent>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRegularExpression>
@@ -527,8 +531,11 @@ void SegmentationWidget::buildUi()
         _directionFieldRemoveButton = new QPushButton(tr("Remove"), directionParent);
         _directionFieldRemoveButton->setToolTip(tr("Delete the selected direction field entry."));
         _directionFieldRemoveButton->setEnabled(false);
+        _directionFieldClearButton = new QPushButton(tr("Clear"), directionParent);
+        _directionFieldClearButton->setToolTip(tr("Clear selection and reset the form for adding a new entry."));
         row->addWidget(_directionFieldAddButton);
         row->addWidget(_directionFieldRemoveButton);
+        row->addWidget(_directionFieldClearButton);
         row->addStretch(1);
     });
 
@@ -815,6 +822,7 @@ void SegmentationWidget::buildUi()
         _directionFields.push_back(std::move(config));
         refreshDirectionFieldList();
         persistDirectionFields();
+        clearDirectionFieldForm();
     });
 
     connect(_directionFieldRemoveButton, &QPushButton::clicked, this, [this]() {
@@ -825,6 +833,10 @@ void SegmentationWidget::buildUi()
         _directionFields.erase(_directionFields.begin() + row);
         refreshDirectionFieldList();
         persistDirectionFields();
+    });
+
+    connect(_directionFieldClearButton, &QPushButton::clicked, this, [this]() {
+        clearDirectionFieldForm();
     });
 
     connect(_directionFieldList, &QListWidget::currentRowChanged, this, [this](int row) {
@@ -1094,7 +1106,7 @@ void SegmentationWidget::syncUiState()
 
 void SegmentationWidget::restoreSettings()
 {
-    QSettings settings(QStringLiteral("VC.ini"), QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.beginGroup(settingsGroup());
 
     _restoringSettings = true;
@@ -1203,7 +1215,7 @@ void SegmentationWidget::restoreSettings()
 
 void SegmentationWidget::writeSetting(const QString& key, const QVariant& value)
 {
-    QSettings settings(QStringLiteral("VC.ini"), QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.beginGroup(settingsGroup());
     settings.setValue(key, value);
     settings.endGroup();
@@ -1900,6 +1912,50 @@ void SegmentationWidget::updateDirectionFieldListGeometry()
     }
 
     _directionFieldList->updateGeometry();
+}
+
+void SegmentationWidget::clearDirectionFieldForm()
+{
+    // Clear the list selection
+    if (_directionFieldList) {
+        _directionFieldList->setCurrentRow(-1);
+    }
+
+    // Reset member variables to defaults
+    _directionFieldPath.clear();
+    _directionFieldOrientation = SegmentationDirectionFieldOrientation::Normal;
+    _directionFieldScale = 0;
+    _directionFieldWeight = 1.0;
+
+    // Update the form fields to reflect the cleared state
+    const bool previousUpdating = _updatingDirectionFieldForm;
+    _updatingDirectionFieldForm = true;
+
+    if (_directionFieldPathEdit) {
+        _directionFieldPathEdit->clear();
+    }
+    if (_comboDirectionFieldOrientation) {
+        int idx = _comboDirectionFieldOrientation->findData(static_cast<int>(SegmentationDirectionFieldOrientation::Normal));
+        if (idx >= 0) {
+            _comboDirectionFieldOrientation->setCurrentIndex(idx);
+        }
+    }
+    if (_comboDirectionFieldScale) {
+        int idx = _comboDirectionFieldScale->findData(0);
+        if (idx >= 0) {
+            _comboDirectionFieldScale->setCurrentIndex(idx);
+        }
+    }
+    if (_spinDirectionFieldWeight) {
+        _spinDirectionFieldWeight->setValue(1.0);
+    }
+
+    _updatingDirectionFieldForm = previousUpdating;
+
+    // Update button states
+    if (_directionFieldRemoveButton) {
+        _directionFieldRemoveButton->setEnabled(false);
+    }
 }
 
 void SegmentationWidget::persistDirectionFields()

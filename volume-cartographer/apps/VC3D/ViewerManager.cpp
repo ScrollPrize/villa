@@ -1,5 +1,6 @@
 #include "ViewerManager.hpp"
 
+#include "VCSettings.hpp"
 #include "CVolumeViewer.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
@@ -27,7 +28,7 @@ ViewerManager::ViewerManager(CSurfaceCollection* surfaces,
     , _points(points)
     , _chunkCache(cache)
 {
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     const int savedOpacityPercent = settings.value("viewer/intersection_opacity", 100).toInt();
     const float normalized = static_cast<float>(savedOpacityPercent) / 100.0f;
     _intersectionOpacity = std::clamp(normalized, 0.0f, 1.0f);
@@ -63,13 +64,13 @@ CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
 
     // Restore persisted viewer preferences
     {
-        QSettings settings("VC.ini", QSettings::IniFormat);
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         bool showHints = settings.value("viewer/show_direction_hints", true).toBool();
         viewer->setShowDirectionHints(showHints);
     }
 
     {
-        QSettings settings("VC.ini", QSettings::IniFormat);
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         bool resetView = settings.value("viewer/reset_view_on_surface_change", true).toBool();
         viewer->setResetViewOnSurfaceChange(resetView);
         _resetDefaults[viewer] = resetView;
@@ -192,7 +193,7 @@ void ViewerManager::setIntersectionOpacity(float opacity)
 {
     _intersectionOpacity = std::clamp(opacity, 0.0f, 1.0f);
 
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue("viewer/intersection_opacity",
                       static_cast<int>(std::lround(_intersectionOpacity * 100.0f)));
 
@@ -290,7 +291,7 @@ void ViewerManager::setVolumeWindow(float low, float high)
     _volumeWindowLow = clampedLow;
     _volumeWindowHigh = clampedHigh;
 
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue("viewer/base_window_low", _volumeWindowLow);
     settings.setValue("viewer/base_window_high", _volumeWindowHigh);
 

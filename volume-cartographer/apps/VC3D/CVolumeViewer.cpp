@@ -2,6 +2,7 @@
 #include "vc/ui/UDataManipulateUtils.hpp"
 
 #include "VolumeViewerCmaps.hpp"
+#include "VCSettings.hpp"
 
 #include <QGraphicsView>
 #include <QGraphicsScene>
@@ -320,7 +321,7 @@ CVolumeViewer::CVolumeViewer(CSurfaceCollection *col, QWidget* parent)
     // Set the scene
     fGraphicsView->setScene(fScene);
 
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     // fCenterOnZoomEnabled = settings.value("viewer/center_on_zoom", false).toInt() != 0;
     // fScrollSpeed = settings.value("viewer/scroll_speed", false).toInt();
     fSkipImageFormatConv = settings.value("perf/chkSkipImageFormatConvExp", false).toBool();

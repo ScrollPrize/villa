@@ -1,6 +1,7 @@
 #include "CWindow.hpp"
 
 #include "WindowRangeWidget.hpp"
+#include "VCSettings.hpp"
 #include <QKeySequence>
 #include <QHBoxLayout>
 #include <QKeyEvent>
@@ -444,7 +445,7 @@ CWindow::CWindow() :
     connect(_inotifyProcessTimer, &QTimer::timeout, this, &CWindow::processPendingInotifyEvents);
 
     _point_collection = new VCCollection(this);
-    const QSettings settings("VC.ini", QSettings::IniFormat);
+    const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     setWindowIcon(QPixmap(":/images/logo.png"));
     ui.setupUi(this);
     // setAttribute(Qt::WA_DeleteOnClose);
@@ -601,7 +602,7 @@ CWindow::CWindow() :
     fDirectionHintsShortcut = new QShortcut(QKeySequence("Ctrl+T"), this);
     fDirectionHintsShortcut->setContext(Qt::ApplicationShortcut);
     connect(fDirectionHintsShortcut, &QShortcut::activated, [this]() {
-        QSettings settings("VC.ini", QSettings::IniFormat);
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         bool current = settings.value("viewer/show_direction_hints", true).toBool();
         bool next = !current;
         settings.setValue("viewer/show_direction_hints", next ? "1" : "0");
@@ -621,6 +622,7 @@ CWindow::CWindow() :
             chkAxisAlignedSlices->toggle();
         }
     });
+    connect(_surfacePanel.get(), &SurfacePanelController::moveToPathsRequested, this, &CWindow::onMoveSegmentToPaths);
 }
 
 // Destructor
@@ -1003,7 +1005,7 @@ bool CWindow::centerFocusOnCursor()
 // Create widgets
 void CWindow::CreateWidgets(void)
 {
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
     // add volume viewer
     auto aWidgetLayout = new QVBoxLayout;
@@ -1075,6 +1077,10 @@ void CWindow::CreateWidgets(void)
     connect(_surfacePanel.get(), &SurfacePanelController::convertToObjRequested,
             this, [this](const QString& segmentId) {
                 onConvertToObj(segmentId.toStdString());
+            });
+    connect(_surfacePanel.get(), &SurfacePanelController::alphaCompRefineRequested,
+            this, [this](const QString& segmentId) {
+                onAlphaCompRefine(segmentId.toStdString());
             });
     connect(_surfacePanel.get(), &SurfacePanelController::slimFlattenRequested,
             this, [this](const QString& segmentId) {
@@ -1539,7 +1545,7 @@ void CWindow::CreateWidgets(void)
 
     chkAxisAlignedSlices = ui.chkAxisAlignedSlices;
     if (chkAxisAlignedSlices) {
-        bool useAxisAligned = settings.value("viewer/use_axis_aligned_slices", false).toBool();
+        bool useAxisAligned = settings.value("viewer/use_axis_aligned_slices", true).toBool();
         QSignalBlocker blocker(chkAxisAlignedSlices);
         chkAxisAlignedSlices->setChecked(useAxisAligned);
         connect(chkAxisAlignedSlices, &QCheckBox::toggled, this, &CWindow::onAxisAlignedSlicesToggled);
@@ -1852,7 +1858,7 @@ std::filesystem::path seg_path_name(const std::filesystem::path &path)
 void CWindow::OpenVolume(const QString& path)
 {
     QString aVpkgPath = path;
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
     if (aVpkgPath.isEmpty()) {
         aVpkgPath = QFileDialog::getExistingDirectory(
@@ -2484,7 +2490,7 @@ void CWindow::onAxisOverlayVisibilityToggled(bool enabled)
     if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
         spinAxisOverlayOpacity->setEnabled(_useAxisAlignedSlices && enabled);
     }
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue("viewer/show_axis_overlays", enabled ? "1" : "0");
 }
 
@@ -2494,7 +2500,7 @@ void CWindow::onAxisOverlayOpacityChanged(int value)
     if (_planeSlicingOverlay) {
         _planeSlicingOverlay->setAxisAlignedOverlayOpacity(normalized);
     }
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue("viewer/axis_overlay_opacity", value);
 }
 
@@ -2636,7 +2642,7 @@ void CWindow::onAxisAlignedSlicesToggled(bool enabled)
     if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
         spinAxisOverlayOpacity->setEnabled(enabled && (!ui.chkAxisOverlays || ui.chkAxisOverlays->isChecked()));
     }
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue("viewer/use_axis_aligned_slices", enabled ? "1" : "0");
     updateAxisAlignedSliceInteraction();
     applySlicePlaneOrientation();
@@ -3191,6 +3197,16 @@ void CWindow::processInotifySegmentUpdate(const std::string& dirName, const std:
 
     bool wasSelected = (_surfID == segmentId);
 
+    // Skip reload if this surface is currently being edited to avoid use-after-free
+    // when autosave triggers an inotify event
+    if (_segmentationModule && _segmentationModule->editingEnabled()) {
+        auto* activeBaseSurface = _segmentationModule->activeBaseSurface();
+        if (activeBaseSurface && activeBaseSurface->id == segmentId) {
+            Logger()->info("Skipping reload of {} - currently being edited", segmentId);
+            return;
+        }
+    }
+
     // Reload the segmentation
     if (fVpkg->reloadSingleSegmentation(segmentId)) {
         // Remove and re-add to UI to refresh all metadata
@@ -3309,6 +3325,16 @@ void CWindow::processInotifySegmentAddition(const std::string& dirName, const st
     // The UUID will be the directory name (or will be updated to match)
     std::string segmentId = segmentName;
 
+    // Skip addition if this surface is currently being edited to avoid use-after-free
+    // when autosave triggers delete/add inotify events
+    if (_segmentationModule && _segmentationModule->editingEnabled()) {
+        auto* activeBaseSurface = _segmentationModule->activeBaseSurface();
+        if (activeBaseSurface && activeBaseSurface->id == segmentId) {
+            Logger()->info("Skipping addition of {} - currently being edited", segmentId);
+            return;
+        }
+    }
+
     // Switch directory if needed
     std::string previousDir;
     if (!isCurrentDir) {
@@ -3365,6 +3391,16 @@ void CWindow::processInotifySegmentRemoval(const std::string& dirName, const std
     }
 
     bool isCurrentDir = (dirName == fVpkg->getSegmentationDirectory());
+
+    // Skip removal if this surface is currently being edited to avoid use-after-free
+    // when autosave triggers delete/add inotify events
+    if (_segmentationModule && _segmentationModule->editingEnabled()) {
+        auto* activeBaseSurface = _segmentationModule->activeBaseSurface();
+        if (activeBaseSurface && activeBaseSurface->id == segmentId) {
+            Logger()->info("Skipping removal of {} - currently being edited", segmentId);
+            return;
+        }
+    }
 
     // Remove from VolumePkg
     if (fVpkg->removeSingleSegmentation(segmentId)) {
@@ -3521,4 +3557,133 @@ void CWindow::scheduleInotifyProcessing()
     _inotifyProcessTimer->setSingleShot(true);
     _inotifyProcessTimer->setInterval(INOTIFY_THROTTLE_MS);
     _inotifyProcessTimer->start();
+}
+
+
+void CWindow::onMoveSegmentToPaths(const QString& segmentId)
+{
+    if (!fVpkg) {
+        statusBar()->showMessage(tr("No volume package loaded"), 3000);
+        return;
+    }
+
+    // Verify we're in traces directory
+    if (fVpkg->getSegmentationDirectory() != "traces") {
+        statusBar()->showMessage(tr("Can only move segments from traces directory"), 3000);
+        return;
+    }
+
+    // Get the segment
+    auto seg = fVpkg->segmentation(segmentId.toStdString());
+    if (!seg) {
+        statusBar()->showMessage(tr("Segment not found: %1").arg(segmentId), 3000);
+        return;
+    }
+
+    // Build paths
+    std::filesystem::path volpkgPath(fVpkg->getVolpkgDirectory());
+    std::filesystem::path currentPath = seg->path();
+    std::filesystem::path newPath = volpkgPath / "paths" / currentPath.filename();
+
+    // Check if destination exists
+    if (std::filesystem::exists(newPath)) {
+        QMessageBox::StandardButton reply = QMessageBox::question(
+            this,
+            tr("Destination Exists"),
+            tr("Segment '%1' already exists in paths/.\nDo you want to replace it?").arg(segmentId),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No
+        );
+
+        if (reply != QMessageBox::Yes) {
+            return;
+        }
+
+        // Remove the existing one
+        try {
+            std::filesystem::remove_all(newPath);
+        } catch (const std::exception& e) {
+            QMessageBox::critical(this, tr("Error"),
+                tr("Failed to remove existing segment: %1").arg(e.what()));
+            return;
+        }
+    }
+
+    // Confirm the move
+    QMessageBox::StandardButton reply = QMessageBox::question(
+        this,
+        tr("Move to Paths"),
+        tr("Move segment '%1' from traces/ to paths/?\n\n"
+           "Note: The segment will be closed if currently open.").arg(segmentId),
+        QMessageBox::Yes | QMessageBox::No,
+        QMessageBox::Yes
+    );
+
+    if (reply != QMessageBox::Yes) {
+        return;
+    }
+
+    // === CRITICAL: Clean up the segment before moving ===
+    std::string idStd = segmentId.toStdString();
+
+    // Check if this is the currently selected segment
+    bool wasSelected = (_surfID == idStd);
+
+    // Clear from surface collection (including "segmentation" if it matches)
+    if (_surf_col) {
+        Surface* currentSurface = _surf_col->surface(idStd);
+        Surface* segmentationSurface = _surf_col->surface("segmentation");
+
+        // If this surface is currently shown as "segmentation", clear it
+        if (currentSurface && segmentationSurface && currentSurface == segmentationSurface) {
+            _surf_col->setSurface("segmentation", nullptr, false, false);
+        }
+
+        // Clear the surface from the collection
+        _surf_col->setSurface(idStd, nullptr, false, false);
+    }
+
+    // Clear from opchains if present - FIX: use direct member access, not pointer
+    if (_opchains.count(idStd)) {
+        delete _opchains[idStd];
+        _opchains.erase(idStd);
+    }
+
+    // Unload the surface from VolumePkg
+    fVpkg->unloadSurface(idStd);
+
+    // Clear selection if this was selected
+    if (wasSelected) {
+        clearSurfaceSelection();
+
+        // Clear tree selection
+        if (treeWidgetSurfaces) {
+            treeWidgetSurfaces->clearSelection();
+        }
+    }
+
+    // Perform the move
+    try {
+        std::filesystem::rename(currentPath, newPath);
+
+        // Remove from VolumePkg's internal tracking for traces
+        fVpkg->removeSingleSegmentation(idStd);
+
+        // The inotify system will pick up the IN_MOVED_TO in paths/
+        // and handle adding it there if the user switches to that directory
+
+        if (_surfacePanel) {
+            _surfacePanel->removeSingleSegmentation(idStd);
+        }
+
+        statusBar()->showMessage(
+            tr("Moved %1 from traces/ to paths/. Switch to paths directory to see it.").arg(segmentId), 5000);
+
+    } catch (const std::exception& e) {
+        // If move failed, we might want to reload the segment
+        // but it's probably safer to leave it unloaded
+        QMessageBox::critical(this, tr("Error"),
+            tr("Failed to move segment: %1\n\n"
+               "The segment has been unloaded from the viewer.").arg(e.what()));
+    }
 }

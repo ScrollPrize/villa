@@ -244,11 +244,11 @@ private:
     VCCollection* _pointCollection{nullptr};
 
     bool _editingEnabled{false};
-    float _dragRadiusSteps{5.75f};
+    float _dragRadiusSteps{5.0f};
     float _dragSigmaSteps{2.0f};
-    float _lineRadiusSteps{5.75f};
+    float _lineRadiusSteps{5.0f};
     float _lineSigmaSteps{2.0f};
-    float _pushPullRadiusSteps{5.75f};
+    float _pushPullRadiusSteps{2.0f};
     float _pushPullSigmaSteps{2.0f};
     FalloffTool _activeFalloff{FalloffTool::Drag};
     float _smoothStrength{0.4f};
