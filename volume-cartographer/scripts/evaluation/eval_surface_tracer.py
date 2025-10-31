@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-Surface tracer evaluation harness
+Surface tracer evaluation harness (drop-in replacement)
 
 This script orchestrates a multi-stage pipeline:
 
   1) Seed discovery
-  2) Seeding (process-managed with a watchdog)
-  3) Expansion (process-managed with a watchdog)
-  4) Patch selection for tracing
-  5) Tracing (two flip_x variants per patch)
+  2) Seeding (process-managed with optional watchdog)
+  3) Expansion (process-managed with optional watchdog)
+  4) Patch selection for tracing  <-- PRIORITIZES z-boundary touches, then overlap count, then area
+  5) Tracing (two flip_x variants per patch) with salvage of the last complete trace (ignoring *_opt)
   6) Winding number computation
   7) Metrics calculation
   8) Optional W&B logging (scalar-only) + watchdog kill counters
 
+Changes vs your previous "new" version:
+  • TMPDIR override is DISABLED by default (restores old behavior). Opt-in via "use_scratch_tmpdir": true.
+  • Watchdog is OPT-IN via "watchdog_enabled": true. Default false to avoid killing long but valid jobs.
+  • Safer directory creation with exist_ok=True (avoids re-run failures).
+  • Patch selection implements your boundary+overlap priority.
 """
 
 import os
@@ -23,6 +28,7 @@ import click
 import logging
 import subprocess
 import numbers
+import tempfile
 from statistics import median
 from pathlib import Path
 from dataclasses import dataclass
@@ -40,6 +46,12 @@ logger = logging.getLogger(__name__)
 class PatchInfo:
     path: Path
     area: float
+    # Fields for selection policy:
+    # 0: touches neither z_min nor z_max
+    # 1: touches either z_min or z_max
+    # 2: touches both z_min and z_max
+    z_touch_score: int = 0
+    overlap_count: int = 0
 
 
 class SurfaceTracerEvaluation:
@@ -58,17 +70,19 @@ class SurfaceTracerEvaluation:
 
         self.patches_dir = self.out_dir / "patches"
         self.traces_dir = self.out_dir / "traces"
-        self.patches_dir.mkdir(exist_ok=self.config["use_existing_patches"])
+        # Safer on re-runs: never fail if the folder already exists
+        self.patches_dir.mkdir(exist_ok=True)
         self.traces_dir.mkdir(exist_ok=True)
 
         # Dedicated process logs (stdout/stderr per child process)
         self.proc_logs_dir = self.out_dir / "proc_logs"
         self.proc_logs_dir.mkdir(exist_ok=True)
 
-        # Dedicated scratch root for TMPDIR (unique per child)
-        # NOTE: Scratch must never be inside traces/patches to avoid confusing scanners.
+        # Scratch control (RESTORED: do NOT override TMPDIR by default)
+        self.use_scratch_tmpdir = bool(self.config.get("use_scratch_tmpdir", False))
         self.scratch_dir = self.out_dir / "scratch"
-        self.scratch_dir.mkdir(exist_ok=True)
+        if self.use_scratch_tmpdir:
+            self.scratch_dir.mkdir(exist_ok=True)
 
         # Resolve bin dir once (stable absolute paths for all tools)
         self.bin_dir = Path(self.config["bin_path"]).resolve()
@@ -78,6 +92,8 @@ class SurfaceTracerEvaluation:
         self._watch_trigger_fraction = float(self.config.get("watchdog_trigger_fraction", 0.8))
         self._watch_min_samples = int(self.config.get("watchdog_min_samples", 12))  # retained for compatibility
         self._watch_grace_seconds = int(self.config.get("watchdog_grace_seconds", 30))
+        # RESTORED: make watchdog opt-in (old harness had none)
+        self.watchdog_enabled = bool(self.config.get("watchdog_enabled", False))
 
         # Watchdog kill counters (included in W&B summary if enabled)
         self.watchdog_kills = {"seeding": 0, "expansion": 0}
@@ -99,12 +115,28 @@ class SurfaceTracerEvaluation:
 
     def _unique_tmp(self, tag: str) -> Path:
         """
-        Create a unique scratch directory under out/scratch and return its path.
-        The tag helps identify the stage (seed/expand/trace/winding/metrics).
+        Create a unique temp directory and return its path.
+        If use_scratch_tmpdir==True, place it under <out>/scratch (new behavior).
+        Otherwise, fall back to system temp (old behavior).
         """
-        tmp = self.scratch_dir / f"{tag}_{int(time.time_ns())}"
-        tmp.mkdir(parents=True, exist_ok=True)
-        return tmp
+        if self.use_scratch_tmpdir:
+            tmp = self.scratch_dir / f"{tag}_{int(time.time_ns())}"
+            tmp.mkdir(parents=True, exist_ok=True)
+            return tmp
+        # Old behavior: let OS pick a fast local temp location (e.g., /tmp)
+        return Path(tempfile.mkdtemp(prefix=f"vc3d_{tag}_"))
+
+    def _maybe_set_tmpdir(self, env: Dict[str, str], tag: str) -> Dict[str, str]:
+        """
+        Optionally set TMPDIR in the child environment.
+        Restores old behavior (no TMPDIR override) when disabled.
+        """
+        env = env.copy()
+        if self.use_scratch_tmpdir:
+            env["TMPDIR"] = str(self._unique_tmp(tag))
+        else:
+            env.pop("TMPDIR", None)  # ensure we don't force it
+        return env
 
     @staticmethod
     def _is_finite_number(x) -> bool:
@@ -172,17 +204,21 @@ class SurfaceTracerEvaluation:
         z_min, z_max = self.config["z_range"]
 
         if patches_path.is_file() and patches_path.suffix == ".json":
-            with open(patches_path, "r") as f:
-                seeds_by_mode = json.load(f)
-            seed_points = [
-                (x, y, z)
-                for (x, y, z) in seeds_by_mode.get("explicit_seed", [])
-                if z_min <= z <= z_max
-            ]
-            logger.info(f"Loaded {len(seed_points)} seeds from JSON")
-            return seed_points
+            try:
+                with open(patches_path, "r") as f:
+                    seeds_by_mode = json.load(f)
+                seed_points = [
+                    (x, y, z)
+                    for (x, y, z) in seeds_by_mode.get("explicit_seed", [])
+                    if z_min <= z <= z_max
+                ]
+                logger.info(f"Loaded {len(seed_points)} seeds from JSON")
+                return seed_points
+            except Exception as e:
+                logger.error(f"Failed to read seeds JSON {patches_path}: {e}")
+                return []
 
-        elif patches_path.is_dir():
+        if patches_path.is_dir():
             seed_points = []
             failed_count = 0
             for patch_dir in patches_path.iterdir():
@@ -211,25 +247,23 @@ class SurfaceTracerEvaluation:
             )
             return seed_points
 
-        else:
-            logger.error(
-                f"existing_patches_for_seeds path {patches_path} is neither a valid JSON file nor a directory"
-            )
-            return []
+        logger.error(
+            f"existing_patches_for_seeds path {patches_path} is neither a valid JSON file nor a directory"
+        )
+        return []
 
     # -------------------------------
     # Seeding / Expansion (watchdog Popen manager)
     # -------------------------------
     def _launch_seed_proc(self, seeding_params_file: Path, seed_point: Tuple[float, float, float], idx: int):
         """
-        Launch a single seeding process with its own logfile and scratch TMPDIR.
+        Launch a single seeding process with its own logfile and (optionally) scratch TMPDIR.
         """
         env = self._exec_env()
-        # Unique logfile and scratch
+        # Unique logfile and optional scratch
         log_path = self.proc_logs_dir / f"seed_{idx}_{int(time.time_ns())}.log"
         logf = open(log_path, "wb")
-        tmpdir = self._unique_tmp(f"seed_{idx}")
-        env["TMPDIR"] = str(tmpdir)  # FORCE override
+        env = self._maybe_set_tmpdir(env, f"seed_{idx}")
 
         cmd = [
             str(self.bin_dir / "vc_grow_seg_from_seed"),
@@ -245,13 +279,12 @@ class SurfaceTracerEvaluation:
 
     def _launch_expand_proc(self, expansion_params_file: Path, idx: int):
         """
-        Launch a single expansion process with its own logfile and scratch TMPDIR.
+        Launch a single expansion process with its own logfile and (optionally) scratch TMPDIR.
         """
         env = self._exec_env()
         log_path = self.proc_logs_dir / f"expand_{idx}_{int(time.time_ns())}.log"
         logf = open(log_path, "wb")
-        tmpdir = self._unique_tmp(f"expand_{idx}")
-        env["TMPDIR"] = str(tmpdir)  # FORCE override
+        env = self._maybe_set_tmpdir(env, f"expand_{idx}")
 
         cmd = [
             str(self.bin_dir / "vc_grow_seg_from_seed"),
@@ -324,7 +357,7 @@ class SurfaceTracerEvaluation:
 
             # Watchdog: only after the requested fraction of TOTAL work is done
             trigger_completed = max(1, math.ceil(total * self._watch_trigger_fraction))
-            if completed >= trigger_completed:
+            if self.watchdog_enabled and completed >= trigger_completed:
                 if not watch_armed_logged:
                     logger.info(
                         f"[watchdog] Activated for {stage_key}: "
@@ -366,7 +399,7 @@ class SurfaceTracerEvaluation:
 
     def run_seeding(self, seed_points: List[Tuple[float, float, float]]) -> List[Path]:
         """
-        Run vc_grow_seg_from_seed for explicit seeds with watchdog supervision,
+        Run vc_grow_seg_from_seed for explicit seeds with optional watchdog supervision,
         then harvest any patch directories created under patches_dir.
         """
         logger.info(f"Running vc_grow_seg_from_seed seeding for {len(seed_points)} seed points")
@@ -381,7 +414,7 @@ class SurfaceTracerEvaluation:
         parallel = int(self.config["seeding_parallel_processes"])
         tasks = [(i, sp) for i, sp in enumerate(seed_points[:max_num])]
 
-        successful = self._run_watchdog_loop(
+        _ = self._run_watchdog_loop(
             tasks,
             lambda idx, sp: self._launch_seed_proc(seeding_params_file, sp, idx),
             parallel,
@@ -394,12 +427,12 @@ class SurfaceTracerEvaluation:
             if patch_dir.is_dir() and (patch_dir / "meta.json").exists():
                 created_patches.append(patch_dir)
 
-        logger.info(f"Completed {successful} seed runs, found {len(created_patches)} patches in results directory")
+        logger.info(f"Found {len(created_patches)} patches in results directory after seeding")
         return created_patches
 
     def run_expansion(self, existing_patches: List[Path]) -> List[Path]:
         """
-        Run vc_grow_seg_from_seed in expansion mode N times with watchdog supervision,
+        Run vc_grow_seg_from_seed in expansion mode N times with optional watchdog supervision,
         then return only the *new* patch directories (not in existing_patches).
         """
         num_expansion_patches = int(self.config.get("num_expansion_patches", 1))
@@ -414,7 +447,7 @@ class SurfaceTracerEvaluation:
         parallel = int(self.config.get("expansion_parallel_processes", self.config.get("seeding_parallel_processes", 1)))
         tasks = list(range(num_expansion_patches))
 
-        successful = self._run_watchdog_loop(
+        _ = self._run_watchdog_loop(
             tasks, lambda idx: self._launch_expand_proc(expansion_params_file, idx), parallel, "expansion"
         )
 
@@ -425,7 +458,7 @@ class SurfaceTracerEvaluation:
             if patch_dir.is_dir() and (patch_dir / "meta.json").exists() and patch_dir not in existing_patches_set:
                 all_patches.append(patch_dir)
 
-        logger.info(f"Completed {successful} successful expansion runs, found {len(all_patches)} new patches")
+        logger.info(f"Found {len(all_patches)} new patches after expansion")
         return all_patches
 
     # -------------------------------
@@ -433,17 +466,68 @@ class SurfaceTracerEvaluation:
     # -------------------------------
     def get_trace_starting_patches(self, patches: List[Path]) -> List[PatchInfo]:
         """
-        Read meta.json for each patch, compute areas, filter by min_size,
-        then select num_trace_starting_patches patches either via 'top_k' or
-        evenly spaced 'quantiles' selection strategy.
+        Read meta.json & overlapping.json for each patch and compute:
+          • area (area_vx2)
+          • z-touch score (touches z_min and/or z_max)
+          • overlap_count (len(overlapping))
+
+        Selection policy (default 'boundary_overlap'):
+          prioritize: z-touch (both > one > none), then overlap_count desc, then area desc.
+        Falls back to 'top_k' or 'quantiles' if explicitly requested.
         """
-        patch_infos = []
+        patch_infos: List[PatchInfo] = []
+
+        # Determine if z_range is usable for "touch" semantics.
+        z_range = self.config.get("z_range")
+        z_touch_enabled = False
+        z_min_val = z_max_val = 0.0
+        if (
+            isinstance(z_range, (list, tuple))
+            and len(z_range) == 2
+            and all(isinstance(v, (int, float)) for v in z_range)
+            and float(z_range[0]) < float(z_range[1])
+        ):
+            z_min_val = float(z_range[0])
+            z_max_val = float(z_range[1])
+            z_touch_enabled = True
+        tol = float(self.config.get("z_touch_tolerance", 0.0))
+
+        def _touch_score(bbox) -> int:
+            """
+            bbox is [[xmin, ymin, zmin], [xmax, ymax, zmax]] as in meta.json.
+            A patch 'touches' if it meets or exceeds the boundary within tolerance.
+            """
+            if not z_touch_enabled:
+                return 0
+            try:
+                z0 = float(bbox[0][2])
+                z1 = float(bbox[1][2])
+                lo = min(z0, z1)
+                hi = max(z0, z1)
+            except Exception:
+                return 0
+            touch_lo = lo <= (z_min_val + tol)
+            touch_hi = hi >= (z_max_val - tol)
+            return int(touch_lo) + int(touch_hi)
+
+        def _overlap_count(pdir: Path) -> int:
+            try:
+                with open(pdir / "overlapping.json", "r") as f:
+                    data = json.load(f)
+                arr = data.get("overlapping", [])
+                return int(len(arr)) if isinstance(arr, list) else 0
+            except Exception:
+                return 0
+
         for patch_dir in patches:
             try:
                 with open(patch_dir / "meta.json", "r") as f:
                     meta = json.load(f)
                 area = float(meta.get("area_vx2", 0.0) or 0.0)
-                patch_infos.append(PatchInfo(path=patch_dir, area=area))
+                tscore = _touch_score(meta.get("bbox"))
+                ocount = _overlap_count(patch_dir)
+                patch_infos.append(PatchInfo(path=patch_dir, area=area,
+                                             z_touch_score=tscore, overlap_count=ocount))
             except Exception as e:
                 logger.warning(f"Error reading meta.json from {patch_dir}: {e}")
                 continue
@@ -455,22 +539,26 @@ class SurfaceTracerEvaluation:
             return []
 
         k = max(0, int(self.config.get("num_trace_starting_patches", 1)))
-        filtered.sort(key=lambda p: p.area, reverse=True)
         n = len(filtered)
-
         if k <= 1:
+            # single best under the new ranking
+            filtered.sort(key=lambda p: (p.z_touch_score, p.overlap_count, p.area), reverse=True)
             return filtered[:min(1, n)]
         if k >= n:
             return filtered
 
-        # selection strategy: "quantiles" (default) or "top_k"
-        strategy = str(self.config.get("trace_starting_selection", "quantiles")).lower()
-        if strategy == "top_k":
-            # strictly take the k largest patches
+        strategy = str(self.config.get("trace_starting_selection", "boundary_overlap")).lower()
+        if strategy == "boundary_overlap":
+            ranked = sorted(filtered, key=lambda p: (p.z_touch_score, p.overlap_count, p.area), reverse=True)
+            return ranked[:k]
+        elif strategy == "top_k":
+            filtered.sort(key=lambda p: p.area, reverse=True)
             return filtered[:k]
-        # default: evenly spaced indices across [0, n-1] (quantiles)
-        idxs = [(i * (n - 1)) // (k - 1) for i in range(k)]
-        return [filtered[i] for i in idxs]
+        else:
+            # "quantiles": evenly spaced indices across [0, n-1] using the new pre-ranking
+            ranked = sorted(filtered, key=lambda p: (p.z_touch_score, p.overlap_count, p.area), reverse=True)
+            idxs = [(i * (n - 1)) // (k - 1) for i in range(k)]
+            return [ranked[i] for i in idxs]
 
     # -------------------------------
     # Tracing (both flip_x variants)
@@ -482,12 +570,12 @@ class SurfaceTracerEvaluation:
         • flip_x = 1
         We run sequentially for determinism and simpler resource behavior.
         Each run writes into its own run_traces_dir and uses an isolated TMPDIR
-        under out/scratch to avoid temp-file collisions.
+        only if configured (old behavior is to inherit system TMPDIR).
 
-        RESTORED BEHAVIOR:
-        • Final trace selection is the LEXICOGRAPHICALLY LAST complete candidate
-            (ignoring *_opt), matching the old harness behavior.
-        • Do NOT bail out on non-zero return code; we still scan the run folder
+        Final trace selection rule:
+          • pick the LEXICOGRAPHICALLY LAST complete candidate (ignoring *_opt),
+            matching the old harness behavior.
+          • Do NOT bail out on non-zero return code; we still scan the run folder
             and salvage a complete trace if present (old harness tolerance).
         """
         logger.info(f"Running vc_grow_seg_from_segments (both flip_x variants) for {len(source_patches)} source patches")
@@ -508,24 +596,22 @@ class SurfaceTracerEvaluation:
             param_files[fv] = pf
 
         trace_paths: List[Path] = []
-        logger.info("Tracing sequentially (parallelism disabled)")
+        logger.info("Tracing sequentially (parallelism disabled for determinism)")
         base_env = self._exec_env()
 
         def _run_one(source_patch: PatchInfo, tracer_params_file: Path, run_tag: str) -> Optional[Path]:
             """
-            Launch one vc_grow_seg_from_segments run with its own output folder and scratch.
-            Select the *final* trace using the EXACT OLD rule: pick the lexicographically
-            last trace directory name among complete candidates (ignoring *_opt).
-            If the subprocess exits non-zero, we still scan/salvage any complete trace.
+            Launch one vc_grow_seg_from_segments run with its own output folder.
+            Select the final trace using the EXACT OLD rule: lexicographic last among
+            complete candidates (ignoring *_opt). Salvage even if rc!=0.
             """
             ts = time.time_ns()
             tag = f"_{run_tag}" if run_tag else ""
             run_traces_dir = self.traces_dir / f"from_{source_patch.path.name}{tag}_{ts}"
             run_traces_dir.mkdir(exist_ok=True)
 
-            # Per-run env to prevent temp-file collisions across processes
-            env = base_env.copy()
-            env["TMPDIR"] = str(self._unique_tmp(f"trace_{source_patch.path.name}_{run_tag}"))
+            # Per-run env (old behavior by default: do not override TMPDIR)
+            env = self._maybe_set_tmpdir(base_env, f"trace_{source_patch.path.name}_{run_tag}")
 
             cmd = [
                 str(self.bin_dir / "vc_grow_seg_from_segments"),
@@ -556,12 +642,10 @@ class SurfaceTracerEvaluation:
                     candidates.append(td)
 
             if not candidates:
-                # Nothing to keep (even if rc==0 or rc!=0). This mirrors the old harness’ tolerance:
-                # we only reject the run if no complete outputs exist.
                 logger.warning(f"No trace produced starting from patch {source_patch.path.name} ({run_tag})")
                 return None
 
-            # ---- RESTORED: exact old final-choice rule (lexicographic last by name) ----
+            # Lexicographic last candidate
             candidates.sort(key=lambda td: td.name)
             final_td = candidates[-1]
 
@@ -606,8 +690,7 @@ class SurfaceTracerEvaluation:
             if not self._trace_complete(trace_dir):
                 logger.error(f"Skipping winding: incomplete or empty tifXYZ in {trace_dir.name}")
                 continue
-            env = env_base.copy()
-            env["TMPDIR"] = str(self._unique_tmp(f"winding_{trace_dir.name}"))
+            env = self._maybe_set_tmpdir(env_base, f"winding_{trace_dir.name}")
             cmd = [str(self.bin_dir / "vc_tifxyz_winding"), "."]
             logger.info(f"Starting vc_tifxyz_winding for {trace_dir.name}")
             result = subprocess.run(cmd, cwd=trace_dir, env=env, capture_output=True, text=True)
@@ -633,7 +716,7 @@ class SurfaceTracerEvaluation:
         Run vc_calc_surface_metrics for each trace with winding.tif present.
         """
         logger.info(f"Running vc_calc_surface_metrics for {len(traces)} traces")
-        env = self._exec_env()
+        env_base = self._exec_env()
 
         results: Dict[Path, Dict] = {}
         for trace_dir in traces:
@@ -654,8 +737,8 @@ class SurfaceTracerEvaluation:
                 "--z_max",
                 str(z_range[1]),
             ]
-            # Isolate metrics temp as well (cheap + consistent)
-            env["TMPDIR"] = str(self._unique_tmp(f"metrics_{trace_dir.name}"))
+            # Per-run env (do not force TMPDIR unless configured)
+            env = self._maybe_set_tmpdir(env_base, f"metrics_{trace_dir.name}")
             result = subprocess.run(cmd, env=env, capture_output=True, text=True)
             if result.returncode == 0 and metrics_file.exists():
                 try:
