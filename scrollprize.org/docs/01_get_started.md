@@ -54,7 +54,7 @@ Get a feel for [the data](data) by looking inside a scroll that has not been ope
 
 Our goal is to read the entire library.
 
-We need help in automating the virtually unwrapping of entire scrolls:
+We need help in automating the virtual unwrapping of entire scrolls:
 
 <Admonition type="tip" icon="📜" title="Unwrapping at Scale">
 * Prizes: \$200,000 [Unwrapping at Scale Prize](prizes#unwrapping-at-scale-prize)
