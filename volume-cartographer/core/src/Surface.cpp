@@ -1489,6 +1489,148 @@ void QuadSurface::saveOverwrite()
     id = uuid;
 }
 
+void QuadSurface::saveSnapshot(int maxBackups)
+{
+    if (path.empty()) {
+        throw std::runtime_error("QuadSurface::saveSnapshot() requires a valid path");
+    }
+
+    // Normalize the surface path to get the canonical path under paths/
+    std::filesystem::path canonicalPath = path;
+    std::filesystem::path volpkgRoot;
+    std::string segmentName;
+
+    // Check if this is already a backup path (contains /backups/)
+    std::string pathStr = canonicalPath.string();
+    size_t backupsPos = pathStr.find("/backups/");
+
+    if (backupsPos != std::string::npos) {
+        // This is a backup path. Reconstruct the canonical path.
+        std::filesystem::path tempPath = canonicalPath;
+
+        while (tempPath.has_parent_path()) {
+            std::string filename = tempPath.filename().string();
+
+            // Check if this is a numeric backup directory (0, 1, 2, etc.)
+            bool isNumeric = !filename.empty() &&
+                           std::all_of(filename.begin(), filename.end(), ::isdigit);
+
+            if (isNumeric) {
+                std::filesystem::path parent = tempPath.parent_path();
+                std::filesystem::path grandparent = parent.parent_path();
+
+                if (grandparent.filename() == "backups") {
+                    segmentName = parent.filename().string();
+                    volpkgRoot = grandparent.parent_path();
+                    canonicalPath = volpkgRoot / "paths" / segmentName;
+                    break;
+                }
+            }
+            tempPath = tempPath.parent_path();
+        }
+
+        if (segmentName.empty()) {
+            volpkgRoot = canonicalPath.parent_path().parent_path();
+            segmentName = canonicalPath.filename().string();
+        }
+    } else {
+        // Regular path: /path/to/scroll.volpkg/paths/segment_name
+        volpkgRoot = canonicalPath.parent_path().parent_path();
+        segmentName = canonicalPath.filename().string();
+    }
+
+    // Create centralized backups directory structure
+    std::filesystem::path backupsDir = volpkgRoot / "backups" / segmentName;
+
+    std::error_code ec;
+    std::filesystem::create_directories(backupsDir, ec);
+    if (ec) {
+        throw std::runtime_error("Failed to create backups directory: " + ec.message());
+    }
+
+    // Find existing backup directories and determine next backup number
+    std::vector<int> existingBackups;
+    if (std::filesystem::exists(backupsDir)) {
+        for (const auto& entry : std::filesystem::directory_iterator(backupsDir)) {
+            if (entry.is_directory()) {
+                try {
+                    int backupNum = std::stoi(entry.path().filename().string());
+                    if (backupNum >= 0 && backupNum < maxBackups) {
+                        existingBackups.push_back(backupNum);
+                    }
+                } catch (...) {
+                    // Skip non-numeric directories
+                }
+            }
+        }
+    }
+
+    std::sort(existingBackups.begin(), existingBackups.end());
+
+    std::filesystem::path snapshot_dest;
+
+    if (existingBackups.size() < static_cast<size_t>(maxBackups)) {
+        // We have room for more backups, find the first available slot
+        int nextBackup = 0;
+        for (int i = 0; i < maxBackups; ++i) {
+            if (std::find(existingBackups.begin(), existingBackups.end(), i) == existingBackups.end()) {
+                nextBackup = i;
+                break;
+            }
+        }
+        snapshot_dest = backupsDir / std::to_string(nextBackup);
+    } else {
+        // We're at the limit, rotate backups
+        // Delete the oldest (0)
+        std::filesystem::remove_all(backupsDir / "0", ec);
+
+        // Rename all backups down by 1 (1->0, 2->1, etc.)
+        for (int i = 1; i < maxBackups; ++i) {
+            std::filesystem::path oldPath = backupsDir / std::to_string(i);
+            std::filesystem::path newPath = backupsDir / std::to_string(i - 1);
+            if (std::filesystem::exists(oldPath)) {
+                std::filesystem::rename(oldPath, newPath, ec);
+            }
+        }
+
+        // New backup goes in the last slot
+        snapshot_dest = backupsDir / std::to_string(maxBackups - 1);
+    }
+
+    // Save the original path and ID before creating the snapshot
+    std::filesystem::path originalPath = path;
+    std::string originalId = id;
+
+    // Create the snapshot
+    save(snapshot_dest, true);
+
+    // Restore the original path and ID to keep this surface pointing to its canonical location
+    path = originalPath;
+    id = originalId;
+
+    // Copy mask.tif and generations.tif if they exist from the canonical path
+    std::filesystem::path maskFile = canonicalPath / "mask.tif";
+    std::filesystem::path generationsFile = canonicalPath / "generations.tif";
+
+    if (std::filesystem::exists(maskFile)) {
+        std::filesystem::path destMask = snapshot_dest / "mask.tif";
+        std::filesystem::copy_file(maskFile, destMask,
+            std::filesystem::copy_options::overwrite_existing, ec);
+        if (!ec) {
+            // Delete the original mask.tif after successful copy
+            std::filesystem::remove(maskFile, ec);
+            // Clear the mask channel from memory so it doesn't get re-saved later
+            _channels.erase("mask");
+        }
+    }
+
+    if (std::filesystem::exists(generationsFile)) {
+        std::filesystem::path destGenerations = snapshot_dest / "generations.tif";
+        std::filesystem::copy_file(generationsFile, destGenerations,
+            std::filesystem::copy_options::overwrite_existing, ec);
+    }
+}
+
 
 void QuadSurface::save(const std::string &path_, const std::string &uuid, bool force_overwrite)
 {
