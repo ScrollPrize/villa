@@ -69,14 +69,12 @@ Besides the raw scan volume, three types of representations have been explored:
     </div>
 
 </TabItem>
-<TabItem value="Traditional voxel processing" label="Traditional voxel 
-processing" default>
+<TabItem value="Traditional voxel processing" label="Traditional voxel processing" default>
 
-    ### Traditional voxel processing
-
+    ### 
+    
     <div className="bg-gray-800 p-4 rounded mb-4">
-    <strong>Input:</strong> 3D scan volume (voxels in .tif “image 
-stack”)<br/>
+    <strong>Input:</strong> 3D scan volume (voxels in .tif “image stack”)<br/>
     <strong>Output:</strong> new 3D volume (voxels in .tif “image stack”)
     </div>
     
