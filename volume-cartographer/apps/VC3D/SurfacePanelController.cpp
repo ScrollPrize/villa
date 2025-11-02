@@ -286,6 +286,11 @@ SurfacePanelController::SurfaceChanges SurfacePanelController::detectSurfaceChan
             if (addedIds.find(uiId) != addedIds.end()) {
                 continue;
             }
+            // Only check timestamps for surfaces that are actually loaded in memory.
+            // If not loaded, we'll get fresh data when we eventually load it.
+            if (!_volumePkg->isSurfaceLoaded(uiId)) {
+                continue;
+            }
             auto surfMeta = _volumePkg->getSurface(uiId);
             if (!surfMeta) {
                 continue;
