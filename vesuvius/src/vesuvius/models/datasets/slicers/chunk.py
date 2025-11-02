@@ -16,6 +16,7 @@ from ..find_valid_patches import (
     bounding_box_volume,
     compute_bounding_box_3d,
     collapse_patch_to_spatial,
+    zero_ignore_labels,
 )
 from ..save_valid_patches import load_cached_patches, save_valid_patches
 from ..mesh.handles import MeshHandle
@@ -49,6 +50,7 @@ class ChunkVolume:
     labels: Dict[str, Optional[object]]
     label_source: Optional[object]
     cache_key_path: Optional[Path]
+    label_ignore_value: Optional[Union[int, float]] = None
     meshes: Mapping[str, MeshHandle] = field(default_factory=dict)
 
 
@@ -192,11 +194,12 @@ class ChunkSlicer:
                                 volume_name=labeled_volumes[labeled_idx].name,
                                 position=position,
                                 patch_size=tuple(self.config.patch_size),
-                            )
+                                )
                         )
                 else:
+                    ignore_values = [vol.label_ignore_value for vol in labeled_volumes]
                     labeled_positions, raw_valid_entries = self._compute_valid_positions(
-                        label_arrays, label_names
+                        labeled_volumes, label_arrays, label_names, ignore_values
                     )
 
                     if cache_supported and raw_valid_entries:
@@ -244,14 +247,29 @@ class ChunkSlicer:
 
     def _compute_valid_positions(
         self,
+        labeled_volumes: Sequence[ChunkVolume],
         label_arrays: Sequence[object],
         label_names: Sequence[str],
+        ignore_values: Sequence[Optional[Union[int, float]]],
     ) -> Tuple[List[Tuple[int, Tuple[int, ...]]], List[Dict[str, object]]]:
         """Run find_valid_patches and map results to labeled volume indices."""
 
         channel_selectors = None
         if self._label_channel_selector is not None:
             channel_selectors = [self._label_channel_selector] * len(label_arrays)
+
+        all_have_shape = True
+        for arr in label_arrays:
+            if getattr(arr, "shape", None) is None:
+                all_have_shape = False
+                break
+
+        if not all_have_shape:
+            logger.info(
+                "ChunkSlicer: falling back to sequential patch validation because some label sources "
+                "lack array-style shape attributes"
+            )
+            return self._compute_valid_positions_sequential(labeled_volumes)
 
         valid = find_valid_patches(
             label_arrays=label_arrays,
@@ -262,6 +280,7 @@ class ChunkSlicer:
             num_workers=self.config.num_workers,
             downsample_level=self.config.downsample_level,
             channel_selectors=channel_selectors,
+            ignore_labels=ignore_values,
         )
 
         positions: List[Tuple[int, Tuple[int, ...]]] = []
@@ -282,11 +301,14 @@ class ChunkSlicer:
             if label_array is None:
                 continue
 
+            ignore_value = volume.label_ignore_value
             candidate_patches = self.enumerate(volume, stride=self.config.stride)
             for candidate in candidate_patches:
                 mask_patch = self._extract_label_patch(label_array, candidate.position)
                 if mask_patch is None:
                     continue
+                if ignore_value is not None:
+                    mask_patch = zero_ignore_labels(mask_patch, ignore_value)
 
                 mask = collapse_patch_to_spatial(
                     mask_patch,
