@@ -214,10 +214,16 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
             elif prev_u is not None and prev_v is not None:
                 if gap_u != center_u:
                     assert gap_v == center_v
-                    prev_diag = gap_u, prev_v
+                    if in_patch(gap_u, prev_v):
+                        prev_diag = gap_u, prev_v
+                    else:
+                        prev_diag = None
                 elif gap_v != center_v:
                     assert gap_u == center_u
-                    prev_diag = prev_u, gap_v
+                    if in_patch(prev_u, gap_v):
+                        prev_diag = prev_u, gap_v
+                    else:
+                        prev_diag = None
                 else:
                     assert False
             else:
@@ -243,15 +249,18 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
             cag_to_conditionings = {(center, gap): get_conditioning(center, gap) for center, gap in candidate_centers_and_gaps}
             cag_to_conditionings = {(center, gap): conditioning for (center, gap), conditioning in cag_to_conditionings.items() if (center, gap, conditioning) not in tried_cag_and_conditionings}
             if len(cag_to_conditionings) == 0:
-                print('no untried center-gap-conditioning combinations')
+                print('halting: no untried center-gap-conditioning combinations')
                 break
             center_and_gap = max(cag_to_conditionings, key=lambda center_and_gap: count_conditionings(cag_to_conditionings[center_and_gap]))
             tried_cag_and_conditionings.add((*center_and_gap, cag_to_conditionings[center_and_gap]))
             center_zyx = patch[*center_and_gap[0]]
             center_uv, gap_uv = center_and_gap
+            assert in_patch(*center_uv)
+            assert not in_patch(*gap_uv)
             def get_prev_zyx(uv):
                 if uv is None or (uv < 0).any() or (uv >= max_size).any():
                     return None
+                assert in_patch(*uv)
                 return torch.from_numpy(patch[*uv])
             prev_u, prev_v, prev_diag = map(get_prev_zyx, cag_to_conditionings[center_and_gap])
 
@@ -274,7 +283,7 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
             enqueue_gaps_around_center(gap_uv)
 
             _, area_cm2 = get_area(torch.from_numpy(patch), step_size, inference.voxel_size_um)
-            print(f'vertex count = {num_vertices}, area = {area_cm2:.2f}cm2, queue size = {len(candidate_centers_and_gaps)}')
+            print(f'vertex count = {num_vertices}, area = {area_cm2:.2f}cm2, queue size = {len(candidate_centers_and_gaps)} of which {len(cag_to_conditionings) - len(candidate_centers_and_gaps)} already tried')
 
         return torch.from_numpy(patch)
 
