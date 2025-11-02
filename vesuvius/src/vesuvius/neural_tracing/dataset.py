@@ -329,9 +329,9 @@ class HeatmapDataset(torch.utils.data.IterableDataset):
 
 class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
-    def __init__(self, config):
+    def __init__(self, config, patches_for_split):
         self._config = config
-        self._patches = load_datasets(config)
+        self._patches = patches_for_split
         self._augmentations = augmentation.get_training_augmentations(config['crop_size'], config['augmentation']['no_spatial'], config['augmentation']['only_spatial_and_intensity'])
         self._perturb_prob = config['point_perturbation']['perturb_probability']
         self._uv_max_perturbation = config['point_perturbation']['uv_max_perturbation']  # measured in voxels
@@ -817,7 +817,8 @@ def make_heatmaps(all_zyxs, min_corner_zyx, crop_size):
 
 
 def load_datasets(config):
-    all_patches = []
+    train_patches = []
+    val_patches = []
     for dataset in config['datasets']:
         volume_path = dataset['volume_path']
         if False:
@@ -850,10 +851,12 @@ def load_datasets(config):
 
         patches = [patch.retarget(2 ** (volume_scale - patches_wrt_volume_scale)) for patch in patches]
 
-        all_patches.extend(patches)
+        num_val_per_volume = config.get('num_val_segments_per_volume', 1)
+        train_patches.extend(patches[num_val_per_volume:])
+        val_patches.extend(patches[:num_val_per_volume])
         
-    print(f'loaded {len(all_patches)} patches in total')
-    return all_patches
+    print(f'loaded {len(train_patches)} train patches and {len(val_patches)} val patches')
+    return train_patches, val_patches
 
 
 def load_tifxyz_patches(segments_path, z_range, volume):

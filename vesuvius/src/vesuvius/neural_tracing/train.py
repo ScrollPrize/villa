@@ -13,7 +13,7 @@ from einops import rearrange
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 
-from dataset import PatchInCubeDataset, HeatmapDataset, HeatmapDatasetV2
+from dataset import PatchInCubeDataset, HeatmapDataset, HeatmapDatasetV2, load_datasets
 from models import make_model
 from sampling import sample_ddim
 
@@ -73,10 +73,13 @@ def train(config_path):
         wandb.init(project=config['wandb_project'], entity=config.get('wandb_entity', None), config=config)
 
     if config['representation'] == 'heatmap':
-        dataset = HeatmapDatasetV2(config)
+        train_patches, val_patches = load_datasets(config)
+        train_dataset = HeatmapDatasetV2(config, train_patches)
+        val_dataset = HeatmapDatasetV2(config, val_patches)
     else:
-        dataset = PatchInCubeDataset(config)
-    train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config['batch_size'], num_workers=config['num_workers'])
+        train_dataset = val_dataset = PatchInCubeDataset(config)
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=config['batch_size'], num_workers=config['num_workers'])
+    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=config['batch_size'] * 2, num_workers=1)
 
     model = make_model(config)
 
@@ -95,10 +98,20 @@ def train(config_path):
         num_training_steps=config['num_iterations'] * accelerate.PartialState().num_processes,  # FIXME: nasty adjustment by num_processes here accounts for the fact that accelerator's prepare_scheduler weirdly causes the scheduler to take num_processes scheduler-steps per optimiser-step
     )
 
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler
+    model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, val_dataloader, lr_scheduler
     )
+    val_iterator = iter(val_dataloader)
 
+    def loss_fn(target_pred, targets, mask):
+        if config['binary']:
+            targets_binary = (targets > 0.5).long()  # FIXME: should instead not do the gaussian conv in data-loader!
+            from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
+            return DC_and_BCE_loss(bce_kwargs={}, soft_dice_kwargs={'ddp': False})(target_pred, targets_binary)
+        else:
+            # TODO: should this instead weight each element in batch equally regardless of valid area?
+            return ((target_pred - targets) ** 2 * mask).sum() / mask.sum()
+            
     progress_bar = tqdm(total=config['num_iterations'], disable=not accelerator.is_local_main_process)
     for iteration, batch in enumerate(train_dataloader):
 
@@ -108,13 +121,7 @@ def train(config_path):
         wandb_log = {}
         with accelerator.accumulate(model):
             target_pred = model(inputs, timesteps)
-            if config['binary']:
-                targets_binary = (targets > 0.5).long()  # FIXME: should instead not do the gaussian conv in data-loader!
-                from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
-                loss = DC_and_BCE_loss(bce_kwargs={}, soft_dice_kwargs={'ddp': False})(target_pred, targets_binary)
-            else:
-                # TODO: should this instead weight each element in batch equally regardless of valid area?
-                loss = ((target_pred - targets) ** 2 * mask).sum() / mask.sum()
+            loss = loss_fn(target_pred, targets, mask)
             if torch.isnan(loss):
                 raise ValueError('loss is NaN')
             accelerator.backward(loss)
@@ -132,6 +139,13 @@ def train(config_path):
             with torch.no_grad():
                 model.eval()
 
+                val_batch = next(val_iterator)
+                val_timesteps, val_inputs, val_targets = prepare_batch(val_batch, noise_scheduler, config['generative'], config['cfg_uncond_prob'])
+                val_mask = torch.ones_like(val_targets[:, :1, ...])  # TODO!
+                val_target_pred = model(val_inputs, val_timesteps)
+                val_loss = loss_fn(val_target_pred, val_targets, val_mask)
+                wandb_log['val_loss'] = val_loss.item()
+
                 if False:
                     def squish(x):
                         return torch.stack([x[:, :8].amax(dim=1), x[:, 8:16].amax(dim=1), torch.zeros_like(x[:, 0])], dim=1)
@@ -145,31 +159,34 @@ def train(config_path):
                     canvas = (canvas * 0.5 + 0.5).clip(0, 1) * canvas_mask
                     canvas = rearrange(canvas[:, :, canvas.shape[2] // 2], 'b uvw y x v -> (b y) (v x) uvw')
                 else:
-                    colours_by_step = torch.rand([targets.shape[1], 3], device=inputs.device) * 0.7 + 0.2
-                    colours_by_step = torch.cat([torch.ones([3, 3], device=inputs.device), colours_by_step], dim=0)  # white for conditioning points
-                    def overlay_crosshair(x):
-                        x = x.clone()
-                        red = torch.tensor([0.8, 0, 0], device=x.device)
-                        x[:, x.shape[1] // 2 - 7 : x.shape[1] // 2 - 1, x.shape[2] // 2, :] = red
-                        x[:, x.shape[1] // 2 + 2 : x.shape[1] // 2 + 8, x.shape[2] // 2, :] = red
-                        x[:, x.shape[1] // 2, x.shape[2] // 2 - 7 : x.shape[2] // 2 - 1, :] = red
-                        x[:, x.shape[1] // 2, x.shape[2] // 2 + 2 : x.shape[2] // 2 + 8, :] = red
-                        return x
-                    def inputs_slice(dim):
-                        return overlay_crosshair(inputs[:, 0].select(dim=dim + 1, index=inputs.shape[(dim + 2)] // 2)[..., None].expand(-1, -1, -1, 3) * 0.5 + 0.5)
-                    def projections(x):
-                        x = torch.cat([inputs[:, 2:5], x], dim=1)
-                        coloured = x[..., None] * colours_by_step[None, :, None, None, None, :]
-                        return torch.cat([overlay_crosshair(coloured.amax(dim=(1, dim + 2))) for dim in range(3)], dim=1)
+                    def make_canvas(inputs, targets, target_pred):
+                        colours_by_step = torch.rand([targets.shape[1], 3], device=inputs.device) * 0.7 + 0.2
+                        colours_by_step = torch.cat([torch.ones([3, 3], device=inputs.device), colours_by_step], dim=0)  # white for conditioning points
+                        def overlay_crosshair(x):
+                            x = x.clone()
+                            red = torch.tensor([0.8, 0, 0], device=x.device)
+                            x[:, x.shape[1] // 2 - 7 : x.shape[1] // 2 - 1, x.shape[2] // 2, :] = red
+                            x[:, x.shape[1] // 2 + 2 : x.shape[1] // 2 + 8, x.shape[2] // 2, :] = red
+                            x[:, x.shape[1] // 2, x.shape[2] // 2 - 7 : x.shape[2] // 2 - 1, :] = red
+                            x[:, x.shape[1] // 2, x.shape[2] // 2 + 2 : x.shape[2] // 2 + 8, :] = red
+                            return x
+                        def inputs_slice(dim):
+                            return overlay_crosshair(inputs[:, 0].select(dim=dim + 1, index=inputs.shape[(dim + 2)] // 2)[..., None].expand(-1, -1, -1, 3) * 0.5 + 0.5)
+                        def projections(x):
+                            x = torch.cat([inputs[:, 2:5], x], dim=1)
+                            coloured = x[..., None] * colours_by_step[None, :, None, None, None, :]
+                            return torch.cat([overlay_crosshair(coloured.amax(dim=(1, dim + 2))) for dim in range(3)], dim=1)
+                        canvas = torch.stack([
+                            torch.cat([inputs_slice(dim) for dim in range(3)], dim=1),
+                            projections(F.sigmoid(target_pred)),
+                            projections(targets),
+                        ], dim=-1)
+                        return rearrange(canvas.clip(0, 1), 'b y x rgb v -> (b y) (v x) rgb').cpu()
 
-                    canvas = torch.stack([
-                        torch.cat([inputs_slice(dim) for dim in range(3)], dim=1),
-                        projections(F.sigmoid(target_pred)),
-                        projections(targets),
-                    ], dim=-1)
-                    canvas = rearrange(canvas.clip(0, 1), 'b y x rgb v -> (b y) (v x) rgb')
-
-                plt.imsave(f'{out_dir}/{iteration:06}_denoised.png', canvas.cpu())
+                train_canvas = make_canvas(inputs, targets, target_pred)
+                val_canvas = make_canvas(val_inputs, val_targets, val_target_pred)
+                plt.imsave(f'{out_dir}/{iteration:06}_train.png', train_canvas)
+                plt.imsave(f'{out_dir}/{iteration:06}_val.png', val_canvas)
 
                 if config['generative']:
                     eval_num_samples = 4
