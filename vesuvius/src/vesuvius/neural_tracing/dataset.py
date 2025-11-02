@@ -566,6 +566,11 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             if torch.rand([]) < 0.5:
                 v_pos_shifted_ijs, v_neg_shifted_ijs = v_neg_shifted_ijs, v_pos_shifted_ijs
 
+            # Similarly, randomly swap U & V axes
+            if torch.rand([]) < 0.5:
+                u_pos_shifted_ijs, v_pos_shifted_ijs = v_pos_shifted_ijs, u_pos_shifted_ijs
+                u_neg_shifted_ijs, v_neg_shifted_ijs = v_neg_shifted_ijs, u_neg_shifted_ijs
+
             # Apply perturbations to center and negative points
             if torch.rand([]) < self._perturb_prob:
                 min_corner_zyx = (center_zyx - crop_size // 2).int()
