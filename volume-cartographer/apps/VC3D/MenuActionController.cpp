@@ -17,6 +17,7 @@
 #include "ui_VCMain.h"
 
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/Version.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/JsonSafe.hpp"
 
@@ -379,11 +380,19 @@ void MenuActionController::showAboutDialog()
     if (!_window) {
         return;
     }
+    const QString repoShortHash = QString::fromStdString(ProjectInfo::RepositoryShortHash());
+    QString commitText = repoShortHash;
+    if (commitText.isEmpty() || commitText.compare("Untracked", Qt::CaseInsensitive) == 0) {
+        commitText = QStringLiteral("unknown");
+    }
     QMessageBox::information(
         _window,
-        QObject::tr("About Volume Cartographer"),
-        QObject::tr("Vis Center, University of Kentucky\n\n"
-                    "Fork: https://github.com/spacegaier/volume-cartographer"));
+        QObject::tr("About VC3D - Volume Cartographer 3D"),
+        QObject::tr("Vesuvius Challenge Team\n\n"
+                    "code: https://github.com/ScrollPrize/villa\n\n"
+                    "discord: https://discord.com/channels/1079907749569237093/1243576621722767412\n\n"
+                    "Commit: %1")
+            .arg(commitText));
 }
 
 void MenuActionController::showKeybindings()
