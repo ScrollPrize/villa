@@ -387,9 +387,10 @@ void MenuActionController::showAboutDialog()
     }
     QMessageBox::information(
         _window,
-        QObject::tr("About Volume Cartographer"),
-        QObject::tr("Vis Center, University of Kentucky\n\n"
-                    "Fork: https://github.com/spacegaier/volume-cartographer\n\n"
+        QObject::tr("About VC3D - Volume Cartographer 3D"),
+        QObject::tr("Vesuvius Challenge Team\n\n"
+                    "code: https://github.com/ScrollPrize/villa\n\n"
+                    "discord: https://discord.com/channels/1079907749569237093/1243576621722767412\n\n"
                     "Commit: %1")
             .arg(commitText));
 }
