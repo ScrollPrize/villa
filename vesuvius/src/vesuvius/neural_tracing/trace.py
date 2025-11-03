@@ -37,6 +37,8 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
     load_checkpoint(checkpoint_path, model)
     inference = Inference(model, config, volume_zarr, volume_scale)
 
+    partial_uuids = []
+
     def trace_strip(start_zyx, num_steps, direction):
 
         assert steps_per_crop == 1  # TODO...
@@ -282,10 +284,23 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
             ]
             enqueue_gaps_around_center(gap_uv)
 
-            _, area_cm2 = get_area(torch.from_numpy(patch), step_size, inference.voxel_size_um)
-            print(f'vertex count = {num_vertices}, area = {area_cm2:.2f}cm2, queue size = {len(candidate_centers_and_gaps)} of which {len(cag_to_conditionings) - len(candidate_centers_and_gaps)} already tried')
+            _, area_cm2 = get_area(patch, step_size, inference.voxel_size_um)
+            print(f'vertex count = {num_vertices}, area = {area_cm2:.2f}cm2, queue size = {len(candidate_centers_and_gaps)} of which {len(candidate_centers_and_gaps) - len(cag_to_conditionings)} already tried')
 
-        return torch.from_numpy(patch)
+            if num_vertices > 0 and num_vertices % 1000 == 0:
+                partial_uuid = f'neural-trace-patch_{timestamp}_{num_vertices//1000:03}Kvert'
+                partial_uuids.append(partial_uuid)
+                save_tifxyz(
+                    (np.where((patch == -1).all(-1, keepdims=True), -1, patch * 2 ** volume_scale)),
+                    f'{out_path}',
+                    partial_uuid,
+                    step_size,
+                    inference.voxel_size_um,
+                    'neural-tracer',
+                    {'seed': start_xyz}
+                )
+
+        return patch
 
     def save_point_collection(filename, zyxs):
         with open(filename, 'wt') as fp:
@@ -326,7 +341,17 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
             patch_zyxs = trace_patch_v4(start_zyx, max_size=100)
 
         print(f'saving with timestamp {timestamp}')
-        save_tifxyz((patch_zyxs * 2 ** volume_scale).numpy(), f'{out_path}', f'neural-trace-patch_{timestamp}', step_size, inference.voxel_size_um, 'neural-tracer', {'seed': start_xyz})
+        save_tifxyz(
+            patch_zyxs * 2 ** volume_scale,
+            f'{out_path}',
+            f'neural-trace-patch_{timestamp}',
+            step_size,
+            inference.voxel_size_um,
+            'neural-tracer',
+            {'seed': start_xyz}
+        )
+        for partial_uuid in partial_uuids:
+            shutil.rmtree(f'{out_path}/{partial_uuid}')
         if False:  # useful for debugging
             save_point_collection(f'points_patch_{timestamp}.json', patch_zyxs.view(-1, 3))
             plt.plot(*patch_zyxs.view(-1, 3)[:, [0, 1]].T, 'r.')
