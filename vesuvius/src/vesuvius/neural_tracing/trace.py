@@ -326,11 +326,13 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
             patch_zyxs = trace_patch_v4(start_zyx, max_size=100)
 
         print(f'saving with timestamp {timestamp}')
-        save_point_collection(f'points_patch_{timestamp}.json', patch_zyxs.view(-1, 3))
-        save_tifxyz((patch_zyxs * 2 ** volume_scale).numpy(), f'{out_path}', f'neural-trace-patch_{timestamp}', step_size, inference.voxel_size_um, 'neural-tracer')
-        plt.plot(*patch_zyxs.view(-1, 3)[:, [0, 1]].T, 'r.')
-        plt.savefig('patch.png')
-        plt.close()
+        save_tifxyz((patch_zyxs * 2 ** volume_scale).numpy(), f'{out_path}', f'neural-trace-patch_{timestamp}', step_size, inference.voxel_size_um, 'neural-tracer', {'seed': start_xyz})
+        if False:  # useful for debugging
+            save_point_collection(f'points_patch_{timestamp}.json', patch_zyxs.view(-1, 3))
+            plt.plot(*patch_zyxs.view(-1, 3)[:, [0, 1]].T, 'r.')
+            plt.show()
+            plt.savefig('patch.png')
+            plt.close()
 
 
 if __name__ == '__main__':

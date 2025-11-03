@@ -12,7 +12,7 @@ def get_area(zyxs, step_size, voxel_size_um):
     return area_vx2, area_cm2
 
 
-def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source):
+def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, additional_metadata={}):
     path = f'{path}/{uuid}'
     os.makedirs(path, exist_ok=True)
     cv2.imwrite(f'{path}/x.tif', zyxs[..., 2])
@@ -29,6 +29,7 @@ def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source):
             'type': 'seg',
             'uuid': uuid,
             'source': source,
+            **additional_metadata
         }, f, indent=4)
     return True
 
