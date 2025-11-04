@@ -20,6 +20,8 @@ import tifffile as tiff
 from numcodecs import LZ4
 from tqdm.auto import tqdm
 import fsspec
+from zarr.experimental.cache_store import CacheStore
+from zarr.storage import LocalStore
 
 from k8s import get_tqdm_kwargs
 
@@ -37,16 +39,50 @@ def path_exists(path: str) -> bool:
 
 
 def get_zarr_store(path: str):
-    """Get zarr store for path (supports local paths and S3 URLs)."""
+    """Get zarr store for path (supports local paths and S3 URLs).
+
+    For S3 paths, automatically applies disk-based caching using zarr3's CacheStore
+    to improve performance and reduce S3 request costs.
+    """
     if path.startswith("s3://"):
-        # Use fsspec.get_mapper directly with S3 credentials
-        # Pass anon=False to use AWS credentials from environment/config
-        # Use INTELLIGENT_TIERING storage class for cost optimization
-        return fsspec.get_mapper(
+        # Get base S3 store using fsspec
+        base_store = fsspec.get_mapper(
             path,
             anon=False,
             s3_additional_kwargs={'StorageClass': 'INTELLIGENT_TIERING'}
         )
+
+        # Configure cache settings from environment variables
+        cache_dir = os.environ.get("ZARR_CACHE_DIR", "./zarr_cache")
+        cache_size_gb = float(os.environ.get("ZARR_CACHE_SIZE_GB", "100"))
+        cache_max_age = os.environ.get("ZARR_CACHE_MAX_AGE", "infinity")
+
+        # Convert cache size from GB to bytes
+        cache_size_bytes = int(cache_size_gb * 1024 * 1024 * 1024)
+
+        # Create cache directory if it doesn't exist
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # Create LocalStore for persistent disk-based caching
+        cache_store = LocalStore(cache_dir)
+
+        # Wrap S3 store with CacheStore for automatic caching
+        cached_store = CacheStore(
+            store=base_store,
+            cache_store=cache_store,
+            max_size=cache_size_bytes,
+            max_age_seconds=cache_max_age
+        )
+
+        logger.info(
+            f"Enabled zarr3 disk cache for S3 path: {path}\n"
+            f"  Cache dir: {cache_dir}\n"
+            f"  Cache size limit: {cache_size_gb} GB\n"
+            f"  Cache max age: {cache_max_age}"
+        )
+
+        return cached_store
+
     return path
 
 

@@ -9,7 +9,7 @@ huggingface_hub>=0.23.0
 tifffile
 numcodecs>=0.16.3
 imagecodecs
-zarr>=3.0.0,<4
+zarr>=3.1.4,<4
 s3fs>=2024.3.0
 fsspec
 #webknossos==0.16.2
