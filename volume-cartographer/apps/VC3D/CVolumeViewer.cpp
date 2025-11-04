@@ -1610,10 +1610,10 @@ void CVolumeViewer::renderIntersections()
 
             std::vector<std::vector<cv::Vec2f>> xy_seg_;
             if (key == "segmentation") {
-                find_intersect_segments(intersections[n], xy_seg_, segmentation->rawPoints(), plane, plane_roi, 4/_scale, 1000);
+                find_intersect_segments(intersections[n], xy_seg_, segmentation->rawPoints(), plane, plane_roi, 4/_scale, 1500);
             }
             else
-                find_intersect_segments(intersections[n], xy_seg_, segmentation->rawPoints(), plane, plane_roi, 4/_scale);
+                find_intersect_segments(intersections[n], xy_seg_, segmentation->rawPoints(), plane, plane_roi, 4/_scale, 150);
 
         }
 
