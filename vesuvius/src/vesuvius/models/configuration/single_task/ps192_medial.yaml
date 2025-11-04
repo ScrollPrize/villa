@@ -8,6 +8,7 @@ dataset_config:
   targets:
     surface:
       activation: "none"
+      ignore_index: 2
       losses:
         - name: "MedialSurfaceRecall"
           weight: 1.0

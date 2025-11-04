@@ -5,15 +5,15 @@ import glob
 
 class InferenceArgumentParser(Tap):
     segment_id: list[str] =[]           # Leave empty to process all segments in the segment_path
-    segment_path:str='./eval_scrolls'
-    model_path:str= 'outputs/vesuvius/pretraining_all/vesuvius-models/valid_20230827161847_0_fr_i3depoch=7.ckpt'
+    segment_path:str='/mnt/raid_nvme/volpkgs/PHerc172.volpkg/paths/tmp_ink'
+    model_path:str= '/mnt/raid_nvme/results/ink_det/timesformer_scroll5_july_retreat_20241113070770_frepoch=9.ckpt'
     out_path:str=""
     stride: int = 32
-    start_idx:int=17
+    start_idx:int=0
     workers: int = 4
     batch_size: int = 64
     size:int=64
-    reverse:int=0
+    reverse:int=1
     device:str='cuda'
     gpus:int=1
     model_compile:bool=True
@@ -61,7 +61,7 @@ def gkern(kernlen=21, nsig=3):
 class CFG:
 
     # ============== model cfg =============
-    in_chans = 26 # 65
+    in_chans = 31 # 65
     encoder_depth=5
     # ============== training cfg =============
     size = 64
@@ -94,7 +94,7 @@ cfg_init(CFG)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def read_image_mask(fragment_id,start_idx=18,end_idx=38,rotation=0):
+def read_image_mask(fragment_id,start_idx=0,end_idx=26,rotation=0):
     images = []
     idxs = range(start_idx, end_idx)
 
@@ -320,7 +320,7 @@ if __name__ == "__main__":
                     preds[0], 
                     caption=f"{fragment_id}"
                     )
-                    wandb.log({'predictions':img})
+                    # wandb.log({'predictions':img})
                     gc.collect()
             except Exception as e:
                 print(f"Failed to process {fragment_id}: {e}")
