@@ -278,7 +278,32 @@ public:
         double max_value = std::numeric_limits<double>::lowest();
         bool hit_threshold = false;
         cv::Vec3d current = start;
-        for (int i = 1; i <= steps; ++i) {
+
+        const double start_value = sample(start);
+        int begin_step = 1;
+        if (std::isfinite(start_value) && start_value >= threshold_) {
+            bool exited_material = false;
+            for (; begin_step <= steps; ++begin_step) {
+                current += delta;
+                const double value = sample(current);
+                if (!std::isfinite(value)) {
+                    continue;
+                }
+                if (value < threshold_) {
+                    exited_material = true;
+                    ++begin_step;  // start checking one step beyond the exit.
+                    break;
+                }
+            }
+            if (!exited_material) {
+                residual[0] = 0.0;
+                return true;
+            }
+        } else {
+            current = start;
+        }
+
+        for (int i = begin_step; i <= steps; ++i) {
             current += delta;
             const double value = sample(current);
             if (!std::isfinite(value)) {

@@ -14,6 +14,10 @@
 #include <omp.h>
 
 #include <algorithm>
+#include <cmath>
+#include <optional>
+#include <utility>
+#include <vector>
  
 namespace po = boost::program_options;
 using shape = z5::types::ShapeType;
@@ -398,7 +402,7 @@ int main(int argc, char *argv[])
 
         std::cout << "found potential overlapping starting seed " << origin << " with overlap " << count_overlap << std::endl;
     }
-    else {
+    else if (mode != "gen_neighbor") {
         if (!resume_path.empty()) {
             mode = "resume";
         } else if (use_old_args && argc == 7) {
@@ -483,6 +487,372 @@ int main(int argc, char *argv[])
 
     std::string uuid = name_prefix + time_str();
     std::filesystem::path seg_dir = tgt_dir / uuid;
+
+    //
+    // gen_neighbor mode: project a source tifxyz surface "in" or "out" along its vertex normals
+    // to the first nonzero voxel within a max distance, producing a new tifxyz surface.
+    //
+    if (mode == "gen_neighbor") {
+        if (resume_path.empty()) {
+            std::cerr << "ERROR: gen_neighbor mode requires --resume <tifxyz_dir> to provide the source surface" << std::endl;
+            return EXIT_FAILURE;
+        }
+
+        // Load source surface
+        std::unique_ptr<QuadSurface> src_surface;
+        try {
+            src_surface.reset(load_quad_from_tifxyz(resume_path));
+        } catch (const std::exception& ex) {
+            std::cerr << "ERROR: failed to load resume surface: " << ex.what() << std::endl;
+            return EXIT_FAILURE;
+        }
+
+        const cv::Mat_<cv::Vec3f> src_points = src_surface->rawPoints();
+        const int rows = src_points.rows;
+        const int cols = src_points.cols;
+
+        const auto is_valid_vertex = [](const cv::Vec3f& p) -> bool {
+            return p[0] != -1.f && p[1] != -1.f && p[2] != -1.f;
+        };
+
+        const cv::Vec3f invalid_marker(-1.f, -1.f, -1.f);
+        cv::Mat_<cv::Vec3f> dst_points(src_points.size());
+        dst_points.setTo(invalid_marker);
+        cv::Mat_<cv::Vec3f> new_points(src_points.size());
+        new_points.setTo(invalid_marker);
+
+        cv::Mat_<uchar> src_valid(rows, cols);
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                src_valid(r, c) = is_valid_vertex(src_points(r, c)) ? 1 : 0;
+            }
+        }
+
+        // Parameters controlling neighbor generation
+        const std::string neighbor_dir = params.value("neighbor_dir", std::string("out")); // "in" or "out"
+        const double neighbor_step = std::max(1e-3, params.value("neighbor_step", 1.0));   // in voxels
+        const double neighbor_max_distance = std::max(0.0, params.value("neighbor_max_distance", 250.0));
+        const double neighbor_threshold = params.value("neighbor_threshold", 1.0);          // nonzero by default
+        const double neighbor_exit_threshold = std::min(
+            params.value("neighbor_exit_threshold", neighbor_threshold * 0.5),
+            neighbor_threshold);
+        const int neighbor_exit_count = std::max(1, params.value("neighbor_exit_count", 1));
+        const double neighbor_min_clearance = std::max(0.0, params.value("neighbor_min_clearance", 0.0));
+        const int neighbor_min_clearance_steps =
+            std::max(0, params.value("neighbor_min_clearance_steps", 0));
+
+        const int required_clearance_steps = std::max(
+            neighbor_min_clearance_steps,
+            (neighbor_min_clearance > 0.0)
+                ? static_cast<int>(std::ceil(neighbor_min_clearance / neighbor_step))
+                : 0);
+        const bool neighbor_fill = params.value("neighbor_fill", true);
+
+        const bool cast_out = (neighbor_dir == "out");
+        if (!(cast_out || neighbor_dir == "in")) {
+            std::cerr << "WARNING: neighbor_dir must be 'in' or 'out'; defaulting to 'out'" << std::endl;
+        }
+
+        // Cast a ray per valid vertex
+        const int max_steps = (neighbor_max_distance > 0.0)
+                                ? static_cast<int>(std::ceil(neighbor_max_distance / neighbor_step))
+                                : 0;
+
+        // Traverse grid
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                const cv::Vec3f start = src_points(r, c);
+                if (!is_valid_vertex(start)) {
+                    continue;
+                }
+
+                // Compute grid normal at this grid location (c=x, r=y)
+                cv::Vec3f n = grid_normal(src_points, cv::Vec3f(static_cast<float>(c), static_cast<float>(r), 0.0f));
+                if (!std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2])) {
+                    continue; // leave invalid
+                }
+                if (!cast_out) {
+                    n *= -1.f; // cast "in"
+                }
+                // Normalize direction defensively
+                cv::normalize(n, n);
+
+                // March along the ray until threshold is hit or max distance reached
+                bool placed = false;
+                bool clearance_met = (required_clearance_steps == 0);
+                bool left_surface = false;
+                int below_counter = 0;
+
+                for (int k = 1; k <= max_steps; ++k) {
+                    const double t = neighbor_step * static_cast<double>(k);
+                    if (!clearance_met && k >= required_clearance_steps) {
+                        clearance_met = true;
+                    }
+
+                    const cv::Vec3d pos = cv::Vec3d(start[0], start[1], start[2]) + cv::Vec3d(n[0], n[1], n[2]) * t;
+                    const float v = get_val<double, CachedChunked3dInterpolator<uint8_t,passTroughComputor>>(interpolator, pos);
+                    if (!std::isfinite(v)) {
+                        continue;
+                    }
+
+                    if (!clearance_met) {
+                        continue;
+                    }
+
+                    if (!left_surface) {
+                        if (v <= neighbor_exit_threshold) {
+                            below_counter += 1;
+                            if (below_counter >= neighbor_exit_count) {
+                                left_surface = true;
+                            }
+                        } else {
+                            below_counter = 0;
+                        }
+                        continue;
+                    }
+
+                    if (v >= neighbor_threshold) {
+                        new_points(r, c) = cv::Vec3f(static_cast<float>(pos[0]), static_cast<float>(pos[1]), static_cast<float>(pos[2]));
+                        placed = true;
+                        break;
+                    }
+                }
+                // If not placed, leave invalid (-1,-1,-1)
+                (void)placed; // silences unused warning in some builds
+            }
+        }
+
+        cv::Mat_<cv::Vec3f> row_interp;
+        cv::Mat_<cv::Vec3f> col_interp;
+        if (neighbor_fill) {
+            row_interp = cv::Mat_<cv::Vec3f>(src_points.size());
+            row_interp.setTo(invalid_marker);
+            col_interp = cv::Mat_<cv::Vec3f>(src_points.size());
+            col_interp.setTo(invalid_marker);
+
+            struct Anchor {
+                double idx;
+                cv::Vec3f pos;
+            };
+
+            const int window = std::max(1, params.value("neighbor_interp_window", 5));
+
+            auto avg_from_cols = [&](const std::vector<int>& cols_list, int row) -> std::optional<Anchor> {
+                if (cols_list.empty()) {
+                    return std::nullopt;
+                }
+                cv::Vec3f acc(0.f, 0.f, 0.f);
+                double idx_acc = 0.0;
+                int count = 0;
+                for (int col : cols_list) {
+                    const cv::Vec3f& p = new_points(row, col);
+                    if (!is_valid_vertex(p)) {
+                        continue;
+                    }
+                    acc += p;
+                    idx_acc += col;
+                    ++count;
+                }
+                if (count == 0) {
+                    return std::nullopt;
+                }
+                Anchor anchor;
+                anchor.idx = idx_acc / static_cast<double>(count);
+                anchor.pos = acc * (1.0f / static_cast<float>(count));
+                return anchor;
+            };
+
+            std::vector<int> valid_cols;
+            valid_cols.reserve(cols);
+
+            for (int r = 0; r < rows; ++r) {
+                valid_cols.clear();
+                for (int c = 0; c < cols; ++c) {
+                    if (is_valid_vertex(new_points(r, c))) {
+                        valid_cols.push_back(c);
+                    }
+                }
+                if (valid_cols.size() < 2) {
+                    continue;
+                }
+
+                std::vector<int> left_cols;
+                std::vector<int> right_cols;
+                left_cols.reserve(window);
+                right_cols.reserve(window);
+
+                for (int c = 0; c < cols; ++c) {
+                    if (!src_valid(r, c) || is_valid_vertex(new_points(r, c))) {
+                        continue;
+                    }
+
+                    left_cols.clear();
+                    right_cols.clear();
+
+                    auto it = std::lower_bound(valid_cols.begin(), valid_cols.end(), c);
+
+                    for (auto lit = it; lit != valid_cols.begin() && static_cast<int>(left_cols.size()) < window;) {
+                        --lit;
+                        left_cols.push_back(*lit);
+                    }
+                    for (auto rit = it; rit != valid_cols.end() && static_cast<int>(right_cols.size()) < window; ++rit) {
+                        right_cols.push_back(*rit);
+                    }
+
+                    auto left_anchor = avg_from_cols(left_cols, r);
+                    auto right_anchor = avg_from_cols(right_cols, r);
+                    if (left_anchor && right_anchor) {
+                        double span = right_anchor->idx - left_anchor->idx;
+                        cv::Vec3f estimate;
+                        if (std::abs(span) > 1e-3) {
+                            double t = (static_cast<double>(c) - left_anchor->idx) / span;
+                            t = std::clamp(t, 0.0, 1.0);
+                            float tf = static_cast<float>(t);
+                            estimate = left_anchor->pos * (1.0f - tf) + right_anchor->pos * tf;
+                        } else {
+                            estimate = 0.5f * (left_anchor->pos + right_anchor->pos);
+                        }
+                        row_interp(r, c) = estimate;
+                    }
+                }
+            }
+
+            auto avg_from_rows = [&](const std::vector<int>& rows_list, int col) -> std::optional<Anchor> {
+                if (rows_list.empty()) {
+                    return std::nullopt;
+                }
+                cv::Vec3f acc(0.f, 0.f, 0.f);
+                double idx_acc = 0.0;
+                int count = 0;
+                for (int row : rows_list) {
+                    const cv::Vec3f& p = new_points(row, col);
+                    if (!is_valid_vertex(p)) {
+                        continue;
+                    }
+                    acc += p;
+                    idx_acc += row;
+                    ++count;
+                }
+                if (count == 0) {
+                    return std::nullopt;
+                }
+                Anchor anchor;
+                anchor.idx = idx_acc / static_cast<double>(count);
+                anchor.pos = acc * (1.0f / static_cast<float>(count));
+                return anchor;
+            };
+
+            std::vector<int> valid_rows;
+            valid_rows.reserve(rows);
+
+            for (int c = 0; c < cols; ++c) {
+                valid_rows.clear();
+                for (int r = 0; r < rows; ++r) {
+                    if (is_valid_vertex(new_points(r, c))) {
+                        valid_rows.push_back(r);
+                    }
+                }
+                if (valid_rows.size() < 2) {
+                    continue;
+                }
+
+                std::vector<int> upper_rows;
+                std::vector<int> lower_rows;
+                upper_rows.reserve(window);
+                lower_rows.reserve(window);
+
+                for (int r = 0; r < rows; ++r) {
+                    if (!src_valid(r, c) || is_valid_vertex(new_points(r, c))) {
+                        continue;
+                    }
+
+                    upper_rows.clear();
+                    lower_rows.clear();
+
+                    auto it = std::lower_bound(valid_rows.begin(), valid_rows.end(), r);
+
+                    for (auto uit = it; uit != valid_rows.begin() && static_cast<int>(upper_rows.size()) < window;) {
+                        --uit;
+                        upper_rows.push_back(*uit);
+                    }
+                    for (auto lit = it; lit != valid_rows.end() && static_cast<int>(lower_rows.size()) < window; ++lit) {
+                        lower_rows.push_back(*lit);
+                    }
+
+                    auto upper_anchor = avg_from_rows(upper_rows, c);
+                    auto lower_anchor = avg_from_rows(lower_rows, c);
+                    if (upper_anchor && lower_anchor) {
+                        double span = lower_anchor->idx - upper_anchor->idx;
+                        cv::Vec3f estimate;
+                        if (std::abs(span) > 1e-3) {
+                            double t = (static_cast<double>(r) - upper_anchor->idx) / span;
+                            t = std::clamp(t, 0.0, 1.0);
+                            float tf = static_cast<float>(t);
+                            estimate = upper_anchor->pos * (1.0f - tf) + lower_anchor->pos * tf;
+                        } else {
+                            estimate = 0.5f * (upper_anchor->pos + lower_anchor->pos);
+                        }
+                        col_interp(r, c) = estimate;
+                    }
+                }
+            }
+        }
+
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                if (!src_valid(r, c)) {
+                    continue;
+                }
+                if (is_valid_vertex(new_points(r, c))) {
+                    dst_points(r, c) = new_points(r, c);
+                    continue;
+                }
+                if (!neighbor_fill) {
+                    continue;
+                }
+                cv::Vec3f acc(0.f, 0.f, 0.f);
+                int count = 0;
+                if (!row_interp.empty()) {
+                    const cv::Vec3f& row_est = row_interp(r, c);
+                    if (is_valid_vertex(row_est)) {
+                        acc += row_est;
+                        ++count;
+                    }
+                }
+                if (!col_interp.empty()) {
+                    const cv::Vec3f& col_est = col_interp(r, c);
+                    if (is_valid_vertex(col_est)) {
+                        acc += col_est;
+                        ++count;
+                    }
+                }
+                if (count > 0) {
+                    dst_points(r, c) = acc * (1.0f / static_cast<float>(count));
+                }
+            }
+        }
+
+        // Prepare output surface and save
+        std::unique_ptr<QuadSurface> out_surf(new QuadSurface(dst_points, src_surface->scale()));
+        // Prepare naming
+        std::string neighbor_prefix = std::string("neighbor_") + (cast_out ? "out_" : "in_");
+        std::string uuid_local = neighbor_prefix + time_str();
+        std::filesystem::path out_dir = tgt_dir / uuid_local;
+
+        // Meta
+        nlohmann::json neighbor_meta;
+        neighbor_meta["source"] = "vc_grow_seg_from_seed";
+        neighbor_meta["vc_gsfs_params"] = params;
+        neighbor_meta["vc_gsfs_mode"] = mode;
+        neighbor_meta["vc_gsfs_version"] = "dev";
+
+        out_surf->meta = new nlohmann::json(std::move(neighbor_meta));
+        out_surf->save(out_dir, uuid_local, true);
+
+        // Done
+        return EXIT_SUCCESS;
+    }
 
     QuadSurface *surf = tracer(ds.get(), 1.0, &chunk_cache, origin, params, cache_root, voxelsize, direction_fields, resume_surf, seg_dir, meta_params, corrections);
  
