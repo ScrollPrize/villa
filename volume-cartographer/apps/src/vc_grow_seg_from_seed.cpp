@@ -14,6 +14,7 @@
 #include <omp.h>
 
 #include <algorithm>
+#include <cmath>
  
 namespace po = boost::program_options;
 using shape = z5::types::ShapeType;
@@ -398,7 +399,7 @@ int main(int argc, char *argv[])
 
         std::cout << "found potential overlapping starting seed " << origin << " with overlap " << count_overlap << std::endl;
     }
-    else {
+    else if (mode != "gen_neighbor") {
         if (!resume_path.empty()) {
             mode = "resume";
         } else if (use_old_args && argc == 7) {
@@ -483,6 +484,214 @@ int main(int argc, char *argv[])
 
     std::string uuid = name_prefix + time_str();
     std::filesystem::path seg_dir = tgt_dir / uuid;
+
+    //
+    // gen_neighbor mode: project a source tifxyz surface "in" or "out" along its vertex normals
+    // to the first nonzero voxel within a max distance, producing a new tifxyz surface.
+    //
+    if (mode == "gen_neighbor") {
+        if (resume_path.empty()) {
+            std::cerr << "ERROR: gen_neighbor mode requires --resume <tifxyz_dir> to provide the source surface" << std::endl;
+            return EXIT_FAILURE;
+        }
+
+        // Load source surface
+        std::unique_ptr<QuadSurface> src_surface;
+        try {
+            src_surface.reset(load_quad_from_tifxyz(resume_path));
+        } catch (const std::exception& ex) {
+            std::cerr << "ERROR: failed to load resume surface: " << ex.what() << std::endl;
+            return EXIT_FAILURE;
+        }
+
+        const cv::Mat_<cv::Vec3f> src_points = src_surface->rawPoints();
+        cv::Mat_<cv::Vec3f> dst_points = src_points.clone(); // default fallback: keep original surface
+        cv::Mat_<cv::Vec3f> new_points(src_points.size());
+        new_points.setTo(cv::Vec3f(-1.f, -1.f, -1.f));
+
+        // Parameters controlling neighbor generation
+        const std::string neighbor_dir = params.value("neighbor_dir", std::string("out")); // "in" or "out"
+        const double neighbor_step = std::max(1e-3, params.value("neighbor_step", 1.0));   // in voxels
+        const double neighbor_max_distance = std::max(0.0, params.value("neighbor_max_distance", 250.0));
+        const double neighbor_threshold = params.value("neighbor_threshold", 1.0);          // nonzero by default
+        const double neighbor_exit_threshold = std::min(
+            params.value("neighbor_exit_threshold", neighbor_threshold * 0.5),
+            neighbor_threshold);
+        const int neighbor_exit_count = std::max(1, params.value("neighbor_exit_count", 1));
+        const double neighbor_min_clearance = std::max(0.0, params.value("neighbor_min_clearance", 0.0));
+        const int neighbor_min_clearance_steps =
+            std::max(0, params.value("neighbor_min_clearance_steps", 0));
+
+        const int required_clearance_steps = std::max(
+            neighbor_min_clearance_steps,
+            (neighbor_min_clearance > 0.0)
+                ? static_cast<int>(std::ceil(neighbor_min_clearance / neighbor_step))
+                : 0);
+        const bool neighbor_fill = params.value("neighbor_fill", true);
+
+        const bool cast_out = (neighbor_dir == "out");
+        if (!(cast_out || neighbor_dir == "in")) {
+            std::cerr << "WARNING: neighbor_dir must be 'in' or 'out'; defaulting to 'out'" << std::endl;
+        }
+
+        // Cast a ray per valid vertex
+        const int rows = src_points.rows;
+        const int cols = src_points.cols;
+        const int max_steps = (neighbor_max_distance > 0.0)
+                                ? static_cast<int>(std::ceil(neighbor_max_distance / neighbor_step))
+                                : 0;
+
+        // Helper to test if a point is a valid vertex (convention: x==-1 denotes invalid)
+        auto is_valid_vertex = [](const cv::Vec3f& p) -> bool {
+            return p[0] != -1.f && p[1] != -1.f && p[2] != -1.f;
+        };
+
+        // Traverse grid
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                const cv::Vec3f start = src_points(r, c);
+                if (!is_valid_vertex(start)) {
+                    continue;
+                }
+
+                // Compute grid normal at this grid location (c=x, r=y)
+                cv::Vec3f n = grid_normal(src_points, cv::Vec3f(static_cast<float>(c), static_cast<float>(r), 0.0f));
+                if (!std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2])) {
+                    continue; // leave invalid
+                }
+                if (!cast_out) {
+                    n *= -1.f; // cast "in"
+                }
+                // Normalize direction defensively
+                cv::normalize(n, n);
+
+                // March along the ray until threshold is hit or max distance reached
+                bool placed = false;
+                bool clearance_met = (required_clearance_steps == 0);
+                bool left_surface = false;
+                int below_counter = 0;
+
+                for (int k = 1; k <= max_steps; ++k) {
+                    const double t = neighbor_step * static_cast<double>(k);
+                    if (!clearance_met && k >= required_clearance_steps) {
+                        clearance_met = true;
+                    }
+
+                    const cv::Vec3d pos = cv::Vec3d(start[0], start[1], start[2]) + cv::Vec3d(n[0], n[1], n[2]) * t;
+                    const float v = get_val<double, CachedChunked3dInterpolator<uint8_t,passTroughComputor>>(interpolator, pos);
+                    if (!std::isfinite(v)) {
+                        continue;
+                    }
+
+                    if (!clearance_met) {
+                        continue;
+                    }
+
+                    if (!left_surface) {
+                        if (v <= neighbor_exit_threshold) {
+                            below_counter += 1;
+                            if (below_counter >= neighbor_exit_count) {
+                                left_surface = true;
+                            }
+                        } else {
+                            below_counter = 0;
+                        }
+                        continue;
+                    }
+
+                    if (v >= neighbor_threshold) {
+                        new_points(r, c) = cv::Vec3f(static_cast<float>(pos[0]), static_cast<float>(pos[1]), static_cast<float>(pos[2]));
+                        placed = true;
+                        break;
+                    }
+                }
+                // If not placed, leave invalid (-1,-1,-1)
+                (void)placed; // silences unused warning in some builds
+            }
+        }
+
+        // If enabled, fill holes by averaging neighbors on the new grid
+        auto is_valid_vertex_f = [](const cv::Vec3f& p) -> bool {
+            return p[0] != -1.f && p[1] != -1.f && p[2] != -1.f;
+        };
+        if (neighbor_fill) {
+            cv::Mat_<cv::Vec3f> cur = new_points.clone();
+            cv::Mat_<cv::Vec3f> next = cur.clone();
+            const int max_iters = rows + cols; // generous upper bound; exits early when stable
+            bool changed = true;
+            int iter = 0;
+            while (changed && iter < max_iters) {
+                int changes = 0;
+                // For each invalid cell, average valid 8-neighbors
+                #pragma omp parallel for schedule(static) reduction(+:changes)
+                for (int r = 0; r < rows; ++r) {
+                    for (int c = 0; c < cols; ++c) {
+                        if (is_valid_vertex_f(cur(r, c))) {
+                            continue;
+                        }
+                        cv::Vec3d acc(0.0, 0.0, 0.0);
+                        int cnt = 0;
+                        for (int dr = -1; dr <= 1; ++dr) {
+                            for (int dc = -1; dc <= 1; ++dc) {
+                                if (dr == 0 && dc == 0) continue;
+                                const int rr = r + dr;
+                                const int cc = c + dc;
+                                if (rr < 0 || cc < 0 || rr >= rows || cc >= cols) continue;
+                                const cv::Vec3f& q = cur(rr, cc);
+                                if (!is_valid_vertex_f(q)) continue;
+                                acc[0] += q[0]; acc[1] += q[1]; acc[2] += q[2];
+                                ++cnt;
+                            }
+                        }
+                        if (cnt > 0) {
+                            cv::Vec3f avg(static_cast<float>(acc[0] / cnt),
+                                          static_cast<float>(acc[1] / cnt),
+                                          static_cast<float>(acc[2] / cnt));
+                            next(r, c) = avg;
+                            changes += 1;
+                        } else {
+                            next(r, c) = cur(r, c);
+                        }
+                    }
+                }
+                changed = (changes > 0);
+                std::swap(cur, next);
+                ++iter;
+            }
+            new_points = cur;
+        }
+
+        // Merge filled/new points back into destination grid, keeping original where no hit occurred
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                const cv::Vec3f np = new_points(r, c);
+                if (is_valid_vertex(np)) {
+                    dst_points(r, c) = np;
+                }
+            }
+        }
+
+        // Prepare output surface and save
+        std::unique_ptr<QuadSurface> out_surf(new QuadSurface(dst_points, src_surface->scale()));
+        // Prepare naming
+        std::string neighbor_prefix = std::string("neighbor_") + (cast_out ? "out_" : "in_");
+        std::string uuid_local = neighbor_prefix + time_str();
+        std::filesystem::path out_dir = tgt_dir / uuid_local;
+
+        // Meta
+        nlohmann::json neighbor_meta;
+        neighbor_meta["source"] = "vc_grow_seg_from_seed";
+        neighbor_meta["vc_gsfs_params"] = params;
+        neighbor_meta["vc_gsfs_mode"] = mode;
+        neighbor_meta["vc_gsfs_version"] = "dev";
+
+        out_surf->meta = new nlohmann::json(std::move(neighbor_meta));
+        out_surf->save(out_dir, uuid_local, true);
+
+        // Done
+        return EXIT_SUCCESS;
+    }
 
     QuadSurface *surf = tracer(ds.get(), 1.0, &chunk_cache, origin, params, cache_root, voxelsize, direction_fields, resume_surf, seg_dir, meta_params, corrections);
  
