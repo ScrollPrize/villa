@@ -1801,9 +1801,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
                 std::cout << "correction opt centered at " << avg_loc << " with radius " << radius << std::endl;
                 LossSettings loss_inpaint = loss_settings;
-                loss_inpaint[SNAP] *= 0.01;
-                loss_inpaint[DIST] *= 0.1;
-                loss_inpaint[STRAIGHT] *= 10.0;
+                loss_inpaint[SNAP] *= 0.0;
+                loss_inpaint[DIST] *= 0.3;
+                loss_inpaint[STRAIGHT] *= 0.1;
                 local_optimization(radius, corr_center_i, trace_params, trace_data, loss_inpaint, false, true);
             }
 
@@ -1815,28 +1815,14 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
             for (const auto& opt_params : opt_centers) {
                 LossSettings loss_inpaint = loss_settings;
-                loss_inpaint[SNAP] *= 0.1;
-                loss_inpaint[DIST] *= 0.1;
-                loss_inpaint[STRAIGHT] *= 10.0;
+                loss_inpaint[DIST] *= 0.3;
+                loss_inpaint[STRAIGHT] *= 0.1;
                 local_optimization(opt_params.radius, opt_params.center, trace_params, trace_data, loss_inpaint, false, true);
             }
 
             // if (!tgt_path.empty() && snapshot_interval > 0) {
             //     QuadSurface* surf = create_surface_from_state();
-            //     surf->save(tgt_path.string()+"_corr_stage2", true);
-            //     delete surf;
-            // }
-
-            for (const auto& opt_params : opt_centers) {
-                LossSettings loss_inpaint = loss_settings;
-                loss_inpaint[DIST] *= 0.1;
-                loss_inpaint[STRAIGHT] *= 10.0;
-                local_optimization(opt_params.radius, opt_params.center, trace_params, trace_data, loss_inpaint, false, true);
-            }
-
-            // if (!tgt_path.empty() && snapshot_interval > 0) {
-            //     QuadSurface* surf = create_surface_from_state();
-            //     surf->save(tgt_path.string()+"_corr_stage3", true);
+            //     surf->save(tgt_path.string()+"_corr_stage4", true);
             //     delete surf;
             // }
 
@@ -1846,7 +1832,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
             // if (!tgt_path.empty() && snapshot_interval > 0) {
             //     QuadSurface* surf = create_surface_from_state();
-            //     surf->save(tgt_path.string()+"_corr_stage4", true);
+            //     surf->save(tgt_path.string()+"_corr_stage5", true);
             //     delete surf;
             // }
 
