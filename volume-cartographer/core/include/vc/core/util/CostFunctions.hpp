@@ -680,25 +680,34 @@ struct NormalConstraintPlane {
             interpolated_loss = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_ptr, 0);
 
         // Calculate angular weight.
-        double v_abn[3], v_ac[3];
+        double v1[3], v2[3];
         for(int i=0; i<3; ++i) {
-            v_abn[i] = val(pBn[i]) - val(pA[i]);
-            v_ac[i] = val(pC[i]) - val(pA[i]);
+            v1[i] = val(pBn[i]) - val(pA[i]);
+            v2[i] = val(pBn[i]) - val(pC[i]);
         }
 
         double cross_product[3] = {
-            v_abn[1] * v_ac[2] - v_abn[2] * v_ac[1],
-            v_abn[2] * v_ac[0] - v_abn[0] * v_ac[2],
-            v_abn[0] * v_ac[1] - v_abn[1] * v_ac[0]
+            v1[1] * v2[2] - v1[2] * v2[1],
+            v1[2] * v2[0] - v1[0] * v2[2],
+            v1[0] * v2[1] - v1[1] * v2[0]
         };
 
         double cross_len = std::sqrt(cross_product[0]*cross_product[0] + cross_product[1]*cross_product[1] + cross_product[2]*cross_product[2]);
-        double plane_normal_coord = cross_product[normal_axis];
-        
-        double cos_angle = plane_normal_coord / (cross_len + 1e-9);
-        double angle_weight = 1.0 - abs(cos_angle) ;// * cos_angle; // sin^2(angle)
-        //good but slow?
-        // double angle_weight = sqrt(1.0 - abs(cos_angle)+1e-9); // * cos_angle; // sin^2(angle)
+
+        if (cross_len < 1e-9) return true;
+
+        cross_product[0] /= cross_len;
+        cross_product[1] /= cross_len;
+        cross_product[2] /= cross_len;
+
+        double w_x = 1 - cross_product[0] * cross_product[0];
+        double w_y = 1 - cross_product[1] * cross_product[1];
+        double w_z = 1 - cross_product[2] * cross_product[2];
+
+        double angle_weight;
+        if (plane_idx == 0) angle_weight = 0.5 * w_z ; // XY plane
+        else if (plane_idx == 1) angle_weight = 0.5 * w_y; // XZ plane
+        else angle_weight = 0.5 * w_x; // YZ plane
 
         residual[0] = interpolated_loss * T(angle_weight);
 
