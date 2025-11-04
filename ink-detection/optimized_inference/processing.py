@@ -21,7 +21,7 @@ from numcodecs import LZ4
 from tqdm.auto import tqdm
 import fsspec
 from zarr.experimental.cache_store import CacheStore
-from zarr.storage import LocalStore
+from zarr.storage import LocalStore, FsspecStore
 
 from k8s import get_tqdm_kwargs
 
@@ -45,12 +45,18 @@ def get_zarr_store(path: str):
     to improve performance and reduce S3 request costs.
     """
     if path.startswith("s3://"):
-        # Get base S3 store using fsspec
-        base_store = fsspec.get_mapper(
-            path,
+        # Create S3 filesystem with credentials
+        fs = fsspec.filesystem(
+            's3',
             anon=False,
             s3_additional_kwargs={'StorageClass': 'INTELLIGENT_TIERING'}
         )
+
+        # Remove s3:// prefix to get the path for FsspecStore
+        s3_path = path[5:]  # Remove 's3://'
+
+        # Create base S3 store using zarr3's FsspecStore
+        base_store = FsspecStore(fs=fs, path=s3_path, mode='r')
 
         # Configure cache settings from environment variables
         cache_dir = os.environ.get("ZARR_CACHE_DIR", "./zarr_cache")
