@@ -1091,8 +1091,8 @@ private:
 };
 
 struct PointsCorrectionLoss {
-    PointsCorrectionLoss(std::vector<cv::Vec3f> tgts, std::vector<cv::Vec2f> grid_locs, cv::Vec2i grid_loc_int)
-        : tgts_(std::move(tgts)), grid_locs_(std::move(grid_locs)), grid_loc_int_(grid_loc_int) {}
+    PointsCorrectionLoss(std::vector<cv::Vec3f> tgts, std::vector<cv::Vec2f> grid_locs, cv::Vec2i grid_loc_int, double w)
+        : tgts_(std::move(tgts)), grid_locs_(std::move(grid_locs)), grid_loc_int_(grid_loc_int), w_(w) {}
 
     template <typename T>
     bool operator()(T const* const* parameters, T* residuals) const {
@@ -1104,7 +1104,7 @@ struct PointsCorrectionLoss {
         residuals[0] = T(0.0);
         for (size_t i = 0; i < tgts_.size(); ++i) {
             const T grid_loc[2] = {T(grid_locs_[i][0]), T(grid_locs_[i][1])};
-            residuals[0] += T(0.1)*calculate_residual_for_point(i, p00, p01, p10, p11, grid_loc);
+            residuals[0] += T(w_)*calculate_residual_for_point(i, p00, p01, p10, p11, grid_loc);
         }
         return true;
     }
@@ -1204,6 +1204,7 @@ private:
     std::vector<cv::Vec3f> tgts_;
     std::vector<cv::Vec2f> grid_locs_;
     const cv::Vec2i grid_loc_int_;
+    const double w_;
 public:
     bool dbg_ = false;
 };
