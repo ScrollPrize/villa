@@ -1,4 +1,5 @@
 import json
+import shutil
 import click
 import torch
 import numpy as np
