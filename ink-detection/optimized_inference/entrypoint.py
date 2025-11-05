@@ -19,6 +19,7 @@ from botocore.config import Config
 import cv2
 import concurrent.futures
 import zarr
+import tifffile as tiff
 from huggingface_hub import snapshot_download
 
 # WebKnossos imports
@@ -701,11 +702,10 @@ def run_reduce_step(inputs: Inputs) -> None:
     pred_shape = z.shape
     logger.info(f"Prediction shape: {pred_shape}")
 
-    # Run reduce/blend
+    # Run reduce/blend (creates lazy tile iterator)
     logger.info(f"Reducing {inputs.num_parts} partitions from {inputs.zarr_output_dir}")
-    start_reduce_time = time.time()
-    prediction = reduce_partitions(inputs.zarr_output_dir, inputs.num_parts, pred_shape)
-    logger.info(f"Reduce completed in {time.time() - start_reduce_time:.2f} seconds")
+    tile_size = 1024
+    tile_iterator, shape = reduce_partitions(inputs.zarr_output_dir, inputs.num_parts, pred_shape, tile_size)
 
     # Determine output path
     if inputs.output_path:
@@ -722,9 +722,11 @@ def run_reduce_step(inputs: Inputs) -> None:
     else:
         raise ValueError("STEP=reduce requires OUTPUT_PATH, S3_PATH, or WK_DATASET_ID for result upload")
 
-    # Write to local tiled TIFF first
+    # Write to local tiled TIFF first (this is when the lazy reduction actually happens)
     local_tiff_path = f"/tmp/prediction_{inputs.model_key}_{inputs.start_layer:02d}_{inputs.end_layer:02d}.tif"
-    write_tiled_tiff(prediction, local_tiff_path)
+    start_reduce_time = time.time()
+    write_tiled_tiff(tile_iterator, shape, local_tiff_path, tile_size)
+    logger.info(f"Reduce and TIFF write completed in {time.time() - start_reduce_time:.2f} seconds")
 
     # Handle S3 upload or local save
     if final_output_path.startswith("s3://"):
@@ -748,6 +750,12 @@ def run_reduce_step(inputs: Inputs) -> None:
     # If WebKnossos mode, also upload to WebKnossos
     if inputs.wk_inference:
         logger.info("Uploading prediction to WebKnossos dataset...")
+        # Read the TIFF back as numpy array for WebKnossos upload
+        logger.info(f"Reading TIFF for WebKnossos upload: {local_tiff_path}")
+        prediction = tiff.imread(local_tiff_path)
+        # Convert uint8 back to float32 [0, 1] as expected by upload_to_webknossos
+        prediction = prediction.astype(np.float32) / 255.0
+
         wk_layer_name = upload_to_webknossos(
             inputs.wk_dataset_id, prediction, inputs.model_key, inputs.start_layer, inputs.end_layer
         )

@@ -237,95 +237,100 @@ def create_surface_volume_zarr(
 def reduce_partitions(
     zarr_output_dir: str,
     num_parts: int,
-    pred_shape: Tuple[int, int]
-) -> np.ndarray:
+    pred_shape: Tuple[int, int],
+    tile_size: int
+) -> Tuple:
     """
-    Reduce/blend all partition zarr arrays into a single prediction.
+    Create a lazy tile generator that blends partition zarr arrays tile-by-tile.
 
     Args:
         zarr_output_dir: Directory containing partition zarr arrays
         num_parts: Total number of partitions
         pred_shape: Output shape (H, W)
+        tile_size: Size of tiles to process (default 1024)
 
     Returns:
-        Blended numpy array (H, W) with values in [0, 1]
+        Tuple of (tile_generator, shape) where tile_generator yields uint8 tiles lazily
     """
-    try:
-        H, W = pred_shape
-        logger.info(f"Starting reduce phase: blending {num_parts} partitions from {zarr_output_dir}")
+    H, W = pred_shape
+    logger.info(f"Starting reduce phase: will blend {num_parts} partitions tile-by-tile (tile_size={tile_size})")
 
-        # Initialize accumulators in memory (we're blending, so need the full arrays)
-        total_pred = np.zeros((H, W), dtype=np.float32)
-        total_count = np.zeros((H, W), dtype=np.float32)
+    def tile_generator():
+        """Lazily generate tiles by blending partitions on-the-fly."""
+        total_tiles = ((H + tile_size - 1) // tile_size) * ((W + tile_size - 1) // tile_size)
 
-        # Process each partition in chunks to avoid memory issues
-        chunk_size = 1024
-        with tqdm(total=num_parts, desc="Blending partitions", unit="partition", **get_tqdm_kwargs()) as pbar:
-            for part_id in range(num_parts):
-                mask_pred_path = os.path.join(zarr_output_dir, f"mask_pred_part_{part_id:03d}.zarr")
-                mask_count_path = os.path.join(zarr_output_dir, f"mask_count_part_{part_id:03d}.zarr")
+        with tqdm(total=total_tiles, desc="Processing tiles", unit="tile", **get_tqdm_kwargs()) as pbar:
+            # Outer loop: iterate over tile positions
+            for y in range(0, H, tile_size):
+                y_end = min(y + tile_size, H)
+                tile_h = y_end - y
 
-                if not os.path.exists(mask_pred_path) or not os.path.exists(mask_count_path):
-                    logger.warning(f"Missing partition {part_id} at {zarr_output_dir}, skipping")
-                    pbar.update(1)
-                    continue
+                for x in range(0, W, tile_size):
+                    x_end = min(x + tile_size, W)
+                    tile_w = x_end - x
 
-                mask_pred_z = zarr.open(mask_pred_path, mode='r')
-                mask_count_z = zarr.open(mask_count_path, mode='r')
+                    # Create tile-sized accumulators
+                    tile_pred = np.zeros((tile_h, tile_w), dtype=np.float32)
+                    tile_count = np.zeros((tile_h, tile_w), dtype=np.float32)
 
-                # Process in chunks to avoid loading entire partition into memory
-                for y in range(0, H, chunk_size):
-                    y_end = min(y + chunk_size, H)
-                    for x in range(0, W, chunk_size):
-                        x_end = min(x + chunk_size, W)
+                    # Inner loop: accumulate from all partitions for this tile
+                    for part_id in range(num_parts):
+                        mask_pred_path = os.path.join(zarr_output_dir, f"mask_pred_part_{part_id:03d}.zarr")
+                        mask_count_path = os.path.join(zarr_output_dir, f"mask_count_part_{part_id:03d}.zarr")
 
-                        # Read chunks and accumulate
+                        if not os.path.exists(mask_pred_path) or not os.path.exists(mask_count_path):
+                            continue
+
+                        # Open zarr arrays and read tile
+                        mask_pred_z = zarr.open(mask_pred_path, mode='r')
+                        mask_count_z = zarr.open(mask_count_path, mode='r')
+
                         pred_chunk = mask_pred_z[y:y_end, x:x_end]
                         count_chunk = mask_count_z[y:y_end, x:x_end]
 
-                        total_pred[y:y_end, x:x_end] += pred_chunk
-                        total_count[y:y_end, x:x_end] += count_chunk
+                        # Accumulate
+                        tile_pred += pred_chunk
+                        tile_count += count_chunk
 
-                pbar.update(1)
+                    # Blend: divide, clip, convert to uint8
+                    result_tile = tile_pred / np.clip(tile_count, 1e-6, None)
+                    result_tile = np.clip(result_tile, 0, 1)
+                    result_uint8 = (result_tile * 255).astype(np.uint8)
 
-        # Blend: divide total_pred by total_count
-        logger.info("Blending accumulated predictions")
-        result = total_pred / np.clip(total_count, 1e-6, None)
-        result = np.clip(result, 0, 1)
+                    # Yield the tile
+                    yield result_uint8
+                    pbar.update(1)
 
-        logger.info(f"Reduce completed. Final prediction shape: {result.shape}")
-        return result
-
-    except Exception as e:
-        logger.error(f"Error in reduce_partitions: {e}")
-        raise
+    return tile_generator(), pred_shape
 
 
 # ----------------------------- TIFF Writing ------------------------------
 
-def write_tiled_tiff(prediction: np.ndarray, output_path: str) -> None:
+def write_tiled_tiff(tile_iterator, shape: Tuple[int, int], output_path: str, tile_size: int = 1024) -> None:
     """
-    Write prediction array to a tiled TIFF file.
+    Write tiles from iterator to a tiled TIFF file.
 
     Args:
-        prediction: Float32 array with values in [0, 1], shape (H, W)
+        tile_iterator: Iterator that yields uint8 tiles
+        shape: Output shape (H, W)
         output_path: Path to output TIFF file
+        tile_size: Size of tiles (default 1024)
     """
     try:
-        logger.info(f"Writing tiled TIFF to {output_path}")
-
-        # Convert float32 [0, 1] to uint8 [0, 255]
-        pred_uint8 = (np.clip(prediction, 0, 1) * 255).astype(np.uint8)
+        H, W = shape
+        logger.info(f"Writing tiled TIFF to {output_path} with shape ({H}, {W}) and tile size {tile_size}x{tile_size}")
 
         # Ensure output directory exists
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
 
-        # Write with tiling and compression
+        # Write with tiling and compression using iterator
         tiff.imwrite(
             output_path,
-            pred_uint8,
+            tile_iterator,
+            shape=(H, W),
+            dtype=np.uint8,
             compression='deflate',
-            tile=(256, 256),
+            tile=(tile_size, tile_size),
             metadata={'software': 'optimized_inference'}
         )
 
