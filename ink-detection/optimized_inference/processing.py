@@ -49,6 +49,7 @@ def get_zarr_store(path: str):
         fs = fsspec.filesystem(
             's3',
             anon=False,
+            asynchronous=True,
             s3_additional_kwargs={'StorageClass': 'INTELLIGENT_TIERING'}
         )
 
