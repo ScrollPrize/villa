@@ -56,6 +56,7 @@ class Inputs:
     tile_size: int = 64  # Tile size for sliding window inference (size will be set to same value)
     stride: int = 16  # Stride for sliding window
     batch_size: int = 256  # Batch size for inference
+    prefetch_factor: int = 8  # Prefetch factor for DataLoader
     output_path: str = ""  # Full output path (S3 URI or local path) for prediction result
 
 def parse_env() -> Inputs:
@@ -87,6 +88,7 @@ def parse_env() -> Inputs:
         tile_size = int(os.getenv("TILE_SIZE", "64"))
         stride = int(os.getenv("STRIDE", "16"))
         batch_size = int(os.getenv("BATCH_SIZE", "256"))
+        prefetch_factor = int(os.getenv("PREFETCH_FACTOR", "8"))
         output_path = os.getenv("OUTPUT_PATH", "").strip()
 
         # Validate inference parameters
@@ -96,6 +98,8 @@ def parse_env() -> Inputs:
             raise ValueError(f"STRIDE must be positive, got {stride}")
         if batch_size <= 0:
             raise ValueError(f"BATCH_SIZE must be positive, got {batch_size}")
+        if prefetch_factor <= 0:
+            raise ValueError(f"PREFETCH_FACTOR must be positive, got {prefetch_factor}")
         if stride > tile_size:
             logger.warning(f"STRIDE ({stride}) > TILE_SIZE ({tile_size}) may create gaps in coverage")
 
@@ -146,6 +150,7 @@ def parse_env() -> Inputs:
             tile_size=tile_size,
             stride=stride,
             batch_size=batch_size,
+            prefetch_factor=prefetch_factor,
             output_path=output_path,
         )
     except KeyError as e:
@@ -539,8 +544,9 @@ def run_inference_step(inputs: Inputs) -> None:
     CFG.size = inputs.tile_size  # Set size to same as tile_size
     CFG.stride = inputs.stride
     CFG.batch_size = inputs.batch_size
+    CFG.prefetch_factor = inputs.prefetch_factor
     logger.info(f"Using {CFG.in_chans} input channels (layers [{inputs.start_layer}, {inputs.end_layer}))")
-    logger.info(f"Inference config: tile_size={CFG.tile_size}, size={CFG.size}, stride={CFG.stride}, batch_size={CFG.batch_size}")
+    logger.info(f"Inference config: tile_size={CFG.tile_size}, size={CFG.size}, stride={CFG.stride}, batch_size={CFG.batch_size}, prefetch_factor={CFG.prefetch_factor}")
 
     # Import model-specific module based on model_type
     if inputs.model_type == "timesformer":

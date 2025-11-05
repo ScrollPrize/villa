@@ -93,7 +93,7 @@ class InferenceConfig:
     stride: int = 16
     batch_size: int = 256
     workers: int = min(8, os.cpu_count() or 4)
-    prefetch_factor: int = 16
+    prefetch_factor: int = 8
 
     # Image processing / scaling
     max_clip_value: int = 200
