@@ -256,6 +256,24 @@ def reduce_partitions(
     H, W = pred_shape
     logger.info(f"Starting reduce phase: will blend {num_parts} partitions tile-by-tile (tile_size={tile_size})")
 
+    # Open all partition zarr arrays once (outside the generator loop)
+    logger.info(f"Opening {num_parts} partition zarr arrays...")
+    partition_zarrs = []
+    for part_id in range(num_parts):
+        mask_pred_path = os.path.join(zarr_output_dir, f"mask_pred_part_{part_id:03d}.zarr")
+        mask_count_path = os.path.join(zarr_output_dir, f"mask_count_part_{part_id:03d}.zarr")
+
+        if not os.path.exists(mask_pred_path) or not os.path.exists(mask_count_path):
+            logger.warning(f"Missing partition {part_id} at {zarr_output_dir}, skipping")
+            continue
+
+        # Open zarr arrays once and store references
+        mask_pred_z = zarr.open(mask_pred_path, mode='r')
+        mask_count_z = zarr.open(mask_count_path, mode='r')
+        partition_zarrs.append((mask_pred_z, mask_count_z))
+
+    logger.info(f"Successfully opened {len(partition_zarrs)} partition zarr arrays")
+
     def tile_generator():
         """Lazily generate tiles by blending partitions on-the-fly."""
         total_tiles = ((H + tile_size - 1) // tile_size) * ((W + tile_size - 1) // tile_size)
@@ -275,17 +293,8 @@ def reduce_partitions(
                     tile_count = np.zeros((tile_h, tile_w), dtype=np.float32)
 
                     # Inner loop: accumulate from all partitions for this tile
-                    for part_id in range(num_parts):
-                        mask_pred_path = os.path.join(zarr_output_dir, f"mask_pred_part_{part_id:03d}.zarr")
-                        mask_count_path = os.path.join(zarr_output_dir, f"mask_count_part_{part_id:03d}.zarr")
-
-                        if not os.path.exists(mask_pred_path) or not os.path.exists(mask_count_path):
-                            continue
-
-                        # Open zarr arrays and read tile
-                        mask_pred_z = zarr.open(mask_pred_path, mode='r')
-                        mask_count_z = zarr.open(mask_count_path, mode='r')
-
+                    for mask_pred_z, mask_count_z in partition_zarrs:
+                        # Read tile from pre-opened zarr arrays
                         pred_chunk = mask_pred_z[y:y_end, x:x_end]
                         count_chunk = mask_count_z[y:y_end, x:x_end]
 
