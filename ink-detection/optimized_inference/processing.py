@@ -306,48 +306,42 @@ def reduce_partitions(
 
     def tile_generator():
         """Lazily generate tiles by blending partitions on-the-fly."""
-        # Outer loop: iterate over tile positions
-        for y in range(0, H, tile_size):
-            y_end = min(y + tile_size, H)
-            tile_h = y_end - y
+        total_tiles = ((H + tile_size - 1) // tile_size) * ((W + tile_size - 1) // tile_size)
 
-            for x in range(0, W, tile_size):
-                x_end = min(x + tile_size, W)
-                tile_w = x_end - x
+        with tqdm(total=total_tiles, desc="Processing tiles", unit="tile", **get_tqdm_kwargs()) as pbar:
+            # Outer loop: iterate over tile positions
+            for y in range(0, H, tile_size):
+                y_end = min(y + tile_size, H)
+                tile_h = y_end - y
 
-                # Create tile-sized accumulators
-                tile_pred = np.zeros((tile_h, tile_w), dtype=np.float32)
-                tile_count = np.zeros((tile_h, tile_w), dtype=np.float32)
+                for x in range(0, W, tile_size):
+                    x_end = min(x + tile_size, W)
+                    tile_w = x_end - x
 
-                # Inner loop: accumulate from all partitions for this tile
-                for mask_pred_z, mask_count_z in partition_zarrs:
-                    # Read tile from pre-opened zarr arrays
-                    pred_chunk = mask_pred_z[y:y_end, x:x_end]
-                    count_chunk = mask_count_z[y:y_end, x:x_end]
+                    # Create tile-sized accumulators
+                    tile_pred = np.zeros((tile_h, tile_w), dtype=np.float32)
+                    tile_count = np.zeros((tile_h, tile_w), dtype=np.float32)
 
-                    # Accumulate
-                    tile_pred += pred_chunk
-                    tile_count += count_chunk
+                    # Inner loop: accumulate from all partitions for this tile
+                    for mask_pred_z, mask_count_z in partition_zarrs:
+                        # Read tile from pre-opened zarr arrays
+                        pred_chunk = mask_pred_z[y:y_end, x:x_end]
+                        count_chunk = mask_count_z[y:y_end, x:x_end]
 
-                # Blend: divide, clip, convert to uint8
-                result_tile = tile_pred / np.clip(tile_count, 1e-6, None)
-                result_tile = np.clip(result_tile, 0, 1)
-                result_uint8 = (result_tile * 255).astype(np.uint8)
+                        # Accumulate
+                        tile_pred += pred_chunk
+                        tile_count += count_chunk
 
-                # Yield the tile
-                yield result_uint8
+                    # Blend: divide, clip, convert to uint8
+                    result_tile = tile_pred / np.clip(tile_count, 1e-6, None)
+                    result_tile = np.clip(result_tile, 0, 1)
+                    result_uint8 = (result_tile * 255).astype(np.uint8)
 
-    # Wrap generator with tqdm for progress tracking
-    total_tiles = ((H + tile_size - 1) // tile_size) * ((W + tile_size - 1) // tile_size)
-    generator_with_progress = tqdm(
-        tile_generator(),
-        total=total_tiles,
-        desc="Processing tiles",
-        unit="tile",
-        **get_tqdm_kwargs()
-    )
+                    # Yield the tile
+                    yield result_uint8
+                    pbar.update(1)
 
-    return generator_with_progress, pred_shape
+    return tile_generator(), pred_shape
 
 
 # ----------------------------- TIFF Writing ------------------------------
