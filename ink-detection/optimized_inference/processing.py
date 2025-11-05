@@ -56,7 +56,7 @@ def get_zarr_store(path: str):
         s3_path = path[5:]  # Remove 's3://'
 
         # Create base S3 store using zarr3's FsspecStore
-        base_store = FsspecStore(fs=fs, path=s3_path, mode='r')
+        base_store = FsspecStore(fs=fs, path=s3_path, read_only=True)
 
         # Configure cache settings from environment variables
         cache_dir = os.environ.get("ZARR_CACHE_DIR", "./zarr_cache")
