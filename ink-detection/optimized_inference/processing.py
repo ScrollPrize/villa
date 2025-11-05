@@ -261,38 +261,46 @@ def reduce_partitions(
     os.makedirs(cache_dir, exist_ok=True)
 
     # Open all partition zarr arrays once (outside the generator loop)
-    logger.info(f"Caching and opening {num_parts} partition zarr arrays...")
+    logger.info(f"Caching and opening {num_parts} partition zarr arrays in parallel...")
+
+    def prepare_partition(part_id):
+        """Cache and open a single partition's zarr arrays."""
+        mask_pred_path = os.path.join(zarr_output_dir, f"mask_pred_part_{part_id:03d}.zarr")
+        mask_count_path = os.path.join(zarr_output_dir, f"mask_count_part_{part_id:03d}.zarr")
+
+        if not os.path.exists(mask_pred_path) or not os.path.exists(mask_count_path):
+            logger.warning(f"Missing partition {part_id} at {zarr_output_dir}, skipping")
+            return None
+
+        # Copy zarr directories to local cache if not already cached
+        cached_pred_path = os.path.join(cache_dir, f"mask_pred_part_{part_id:03d}.zarr")
+        cached_count_path = os.path.join(cache_dir, f"mask_count_part_{part_id:03d}.zarr")
+
+        if not os.path.exists(cached_pred_path):
+            shutil.copytree(mask_pred_path, cached_pred_path)
+
+        if not os.path.exists(cached_count_path):
+            shutil.copytree(mask_count_path, cached_count_path)
+
+        # Open zarr arrays from cache
+        mask_pred_z = zarr.open(cached_pred_path, mode='r')
+        mask_count_z = zarr.open(cached_count_path, mode='r')
+
+        return (mask_pred_z, mask_count_z)
+
+    # Use ThreadPoolExecutor for parallel I/O
     partition_zarrs = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, num_parts)) as executor:
+        # Submit all tasks
+        futures = {executor.submit(prepare_partition, part_id): part_id for part_id in range(num_parts)}
 
-    with tqdm(total=num_parts, desc="Preparing partitions", unit="partition", **get_tqdm_kwargs()) as pbar:
-        for part_id in range(num_parts):
-            mask_pred_path = os.path.join(zarr_output_dir, f"mask_pred_part_{part_id:03d}.zarr")
-            mask_count_path = os.path.join(zarr_output_dir, f"mask_count_part_{part_id:03d}.zarr")
-
-            if not os.path.exists(mask_pred_path) or not os.path.exists(mask_count_path):
-                logger.warning(f"Missing partition {part_id} at {zarr_output_dir}, skipping")
+        # Collect results with progress bar
+        with tqdm(total=num_parts, desc="Preparing partitions", unit="partition", **get_tqdm_kwargs()) as pbar:
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    partition_zarrs.append(result)
                 pbar.update(1)
-                continue
-
-            # Copy zarr directories to local cache if not already cached
-            cached_pred_path = os.path.join(cache_dir, f"mask_pred_part_{part_id:03d}.zarr")
-            cached_count_path = os.path.join(cache_dir, f"mask_count_part_{part_id:03d}.zarr")
-
-            if not os.path.exists(cached_pred_path):
-                pbar.set_postfix_str(f"caching pred {part_id}")
-                shutil.copytree(mask_pred_path, cached_pred_path)
-
-            if not os.path.exists(cached_count_path):
-                pbar.set_postfix_str(f"caching count {part_id}")
-                shutil.copytree(mask_count_path, cached_count_path)
-
-            # Open zarr arrays from cache once and store references
-            pbar.set_postfix_str(f"opening {part_id}")
-            mask_pred_z = zarr.open(cached_pred_path, mode='r')
-            mask_count_z = zarr.open(cached_count_path, mode='r')
-            partition_zarrs.append((mask_pred_z, mask_count_z))
-
-            pbar.update(1)
 
     logger.info(f"Successfully cached and opened {len(partition_zarrs)} partition zarr arrays")
 
