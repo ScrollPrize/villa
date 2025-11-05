@@ -256,62 +256,90 @@ def reduce_partitions(
     H, W = pred_shape
     logger.info(f"Starting reduce phase: will blend {num_parts} partitions tile-by-tile (tile_size={tile_size})")
 
+    # Cache directory for partition zarrs (network filesystem -> local /tmp)
+    cache_dir = "/tmp/partition_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+
     # Open all partition zarr arrays once (outside the generator loop)
-    logger.info(f"Opening {num_parts} partition zarr arrays...")
+    logger.info(f"Caching and opening {num_parts} partition zarr arrays...")
     partition_zarrs = []
-    for part_id in range(num_parts):
-        mask_pred_path = os.path.join(zarr_output_dir, f"mask_pred_part_{part_id:03d}.zarr")
-        mask_count_path = os.path.join(zarr_output_dir, f"mask_count_part_{part_id:03d}.zarr")
 
-        if not os.path.exists(mask_pred_path) or not os.path.exists(mask_count_path):
-            logger.warning(f"Missing partition {part_id} at {zarr_output_dir}, skipping")
-            continue
+    with tqdm(total=num_parts, desc="Preparing partitions", unit="partition", **get_tqdm_kwargs()) as pbar:
+        for part_id in range(num_parts):
+            mask_pred_path = os.path.join(zarr_output_dir, f"mask_pred_part_{part_id:03d}.zarr")
+            mask_count_path = os.path.join(zarr_output_dir, f"mask_count_part_{part_id:03d}.zarr")
 
-        # Open zarr arrays once and store references
-        mask_pred_z = zarr.open(mask_pred_path, mode='r')
-        mask_count_z = zarr.open(mask_count_path, mode='r')
-        partition_zarrs.append((mask_pred_z, mask_count_z))
+            if not os.path.exists(mask_pred_path) or not os.path.exists(mask_count_path):
+                logger.warning(f"Missing partition {part_id} at {zarr_output_dir}, skipping")
+                pbar.update(1)
+                continue
 
-    logger.info(f"Successfully opened {len(partition_zarrs)} partition zarr arrays")
+            # Copy zarr directories to local cache if not already cached
+            cached_pred_path = os.path.join(cache_dir, f"mask_pred_part_{part_id:03d}.zarr")
+            cached_count_path = os.path.join(cache_dir, f"mask_count_part_{part_id:03d}.zarr")
+
+            if not os.path.exists(cached_pred_path):
+                pbar.set_postfix_str(f"caching pred {part_id}")
+                shutil.copytree(mask_pred_path, cached_pred_path)
+
+            if not os.path.exists(cached_count_path):
+                pbar.set_postfix_str(f"caching count {part_id}")
+                shutil.copytree(mask_count_path, cached_count_path)
+
+            # Open zarr arrays from cache once and store references
+            pbar.set_postfix_str(f"opening {part_id}")
+            mask_pred_z = zarr.open(cached_pred_path, mode='r')
+            mask_count_z = zarr.open(cached_count_path, mode='r')
+            partition_zarrs.append((mask_pred_z, mask_count_z))
+
+            pbar.update(1)
+
+    logger.info(f"Successfully cached and opened {len(partition_zarrs)} partition zarr arrays")
 
     def tile_generator():
         """Lazily generate tiles by blending partitions on-the-fly."""
-        total_tiles = ((H + tile_size - 1) // tile_size) * ((W + tile_size - 1) // tile_size)
+        # Outer loop: iterate over tile positions
+        for y in range(0, H, tile_size):
+            y_end = min(y + tile_size, H)
+            tile_h = y_end - y
 
-        with tqdm(total=total_tiles, desc="Processing tiles", unit="tile", **get_tqdm_kwargs()) as pbar:
-            # Outer loop: iterate over tile positions
-            for y in range(0, H, tile_size):
-                y_end = min(y + tile_size, H)
-                tile_h = y_end - y
+            for x in range(0, W, tile_size):
+                x_end = min(x + tile_size, W)
+                tile_w = x_end - x
 
-                for x in range(0, W, tile_size):
-                    x_end = min(x + tile_size, W)
-                    tile_w = x_end - x
+                # Create tile-sized accumulators
+                tile_pred = np.zeros((tile_h, tile_w), dtype=np.float32)
+                tile_count = np.zeros((tile_h, tile_w), dtype=np.float32)
 
-                    # Create tile-sized accumulators
-                    tile_pred = np.zeros((tile_h, tile_w), dtype=np.float32)
-                    tile_count = np.zeros((tile_h, tile_w), dtype=np.float32)
+                # Inner loop: accumulate from all partitions for this tile
+                for mask_pred_z, mask_count_z in partition_zarrs:
+                    # Read tile from pre-opened zarr arrays
+                    pred_chunk = mask_pred_z[y:y_end, x:x_end]
+                    count_chunk = mask_count_z[y:y_end, x:x_end]
 
-                    # Inner loop: accumulate from all partitions for this tile
-                    for mask_pred_z, mask_count_z in partition_zarrs:
-                        # Read tile from pre-opened zarr arrays
-                        pred_chunk = mask_pred_z[y:y_end, x:x_end]
-                        count_chunk = mask_count_z[y:y_end, x:x_end]
+                    # Accumulate
+                    tile_pred += pred_chunk
+                    tile_count += count_chunk
 
-                        # Accumulate
-                        tile_pred += pred_chunk
-                        tile_count += count_chunk
+                # Blend: divide, clip, convert to uint8
+                result_tile = tile_pred / np.clip(tile_count, 1e-6, None)
+                result_tile = np.clip(result_tile, 0, 1)
+                result_uint8 = (result_tile * 255).astype(np.uint8)
 
-                    # Blend: divide, clip, convert to uint8
-                    result_tile = tile_pred / np.clip(tile_count, 1e-6, None)
-                    result_tile = np.clip(result_tile, 0, 1)
-                    result_uint8 = (result_tile * 255).astype(np.uint8)
+                # Yield the tile
+                yield result_uint8
 
-                    # Yield the tile
-                    yield result_uint8
-                    pbar.update(1)
+    # Wrap generator with tqdm for progress tracking
+    total_tiles = ((H + tile_size - 1) // tile_size) * ((W + tile_size - 1) // tile_size)
+    generator_with_progress = tqdm(
+        tile_generator(),
+        total=total_tiles,
+        desc="Processing tiles",
+        unit="tile",
+        **get_tqdm_kwargs()
+    )
 
-    return tile_generator(), pred_shape
+    return generator_with_progress, pred_shape
 
 
 # ----------------------------- TIFF Writing ------------------------------
