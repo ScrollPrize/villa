@@ -2152,7 +2152,7 @@ void SegmentationWidget::triggerGrowthRequest(SegmentationGrowthDirection direct
     const bool allowZeroSteps = inpaintOnly || method == SegmentationGrowthMethod::Corrections;
     const int minSteps = allowZeroSteps ? 0 : 1;
     const int clampedSteps = std::clamp(steps, minSteps, 1024);
-    const int finalSteps = allowZeroSteps ? clampedSteps : std::max(1, clampedSteps);
+    const int finalSteps = clampedSteps;
 
     qCInfo(lcSegWidget) << "Grow request" << segmentationGrowthMethodToString(method)
                         << segmentationGrowthDirectionToString(direction)
