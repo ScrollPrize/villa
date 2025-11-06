@@ -162,7 +162,8 @@ int main(int argc, char *argv[])
             ("rewind-gen", po::value<int>(), "Generation to rewind to")
             ("correct", po::value<std::string>(), "JSON file with point-based corrections for resume mode")
             ("skip-overlap-check", "Do not perform overlap check with other surfaces after tracing")
-            ("inpaint", "perform automatic inpainting on all detected holes.");
+            ("inpaint", "perform automatic inpainting on all detected holes.")
+            ("resume-opt", po::value<std::string>(), "Resume optimization option (skip, local, global)");
 
         po::variables_map vm;
         try {
@@ -222,6 +223,16 @@ int main(int argc, char *argv[])
 
         if (vm.count("skip-overlap-check")) {
             skip_overlap_check = true;
+        }
+
+        if (vm.count("resume-opt")) {
+            std::string resume_opt = vm["resume-opt"].as<std::string>();
+            if (resume_opt == "skip" || resume_opt == "local" || resume_opt == "global") {
+                params["resume_opt"] = resume_opt;
+            } else {
+                std::cerr << "ERROR: --resume-opt must be one of 'skip', 'local', or 'global'" << std::endl;
+                return EXIT_FAILURE;
+            }
         }
     }
 

@@ -1916,145 +1916,194 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     //just continue on resume no additional global opt	
     if (!resume_surf) {
         local_optimization(8, {y0,x0}, trace_params, trace_data, loss_settings, true);
-    } else if (params.value("inpaint", false)) {
-        cv::Mat mask = resume_surf->channel("mask");
-        cv::Mat_<uchar> hole_mask(trace_params.state.size(), (uchar)0);
-        
-        cv::Mat active_area_mask(trace_params.state.size(), (uchar)0);
-        for (int y = 0; y < trace_params.state.rows; ++y) {
-            for (int x = 0; x < trace_params.state.cols; ++x) {
-                if (trace_params.state(y, x) & STATE_LOC_VALID) {
-                    active_area_mask.at<uchar>(y, x) = 255;
+    }
+    else
+    {
+        if (params.value("resume_opt", "skip") == "global") {
+            std::cout << "global opt" << std::endl;
+            local_optimization(100, {y0,x0}, trace_params, trace_data, loss_settings, false, true);
+        }
+        else if (params.value("resume_opt", "skip") == "local") {
+            int opt_step = 16;
+            std::cout << "local opt" << std::endl;
+            std::vector<cv::Vec2i> opt_local;
+            for (int j = used_area.y; j < used_area.br().y; ++j) {
+                for (int i = used_area.x; i < used_area.br().x; ++i) {
+                    if ((trace_params.state(j, i) & STATE_LOC_VALID) && (i % opt_step == 0 && j % opt_step == 0)) {
+                        opt_local.push_back({j, i});
+                    }
                 }
             }
-        }
 
-        if (!mask.empty()) {
-            cv::Mat padded_mask = cv::Mat::zeros(trace_params.state.size(), CV_8U);
-            mask.copyTo(padded_mask(used_area));
-            cv::bitwise_and(active_area_mask, padded_mask, hole_mask);
-        } else {
-            active_area_mask.copyTo(hole_mask);
-        }
+            std::atomic<int> done = 0;
+            if (!opt_local.empty()) {
+                OmpThreadPointCol opt_local_threadcol(opt_step*2+1, opt_local);
+                int total = opt_local.size();
+                auto start_time = std::chrono::high_resolution_clock::now();
 
-        std::vector<std::vector<cv::Point>> contours;
-        std::vector<cv::Vec4i> hierarchy;
-        cv::findContours(hole_mask, contours, hierarchy, cv::RETR_CCOMP, cv::CHAIN_APPROX_SIMPLE);
-
-        std::cout << "performing inpaint on " << contours.size() << " potential holes" << std::endl;
-
-        int inpaint_count = 0;
-        int inpaint_skip = 0;
-
-        // cv::Mat_<cv::Vec3b> vis(hole_mask.size());
-
-#pragma omp parallel for schedule(dynamic)
-        for (int i = 0; i < contours.size(); i++) {
-            if (hierarchy[i][3] != -1) { // It's a hole
-                cv::Rect roi = cv::boundingRect(contours[i]);
-
-                int margin = 4;
-                roi.x = std::max(0, roi.x - margin);
-                roi.y = std::max(0, roi.y - margin);
-                roi.width = std::min(hole_mask.cols - roi.x, roi.width + 2 * margin);
-                roi.height = std::min(hole_mask.rows - roi.y, roi.height + 2 * margin);
-
-                bool insufficient_border =
-                    roi.width <= 4 || roi.height <= 4 ||
-                    roi.x <= 1 || roi.y <= 1 ||
-                    (roi.x + roi.width) > hole_mask.cols - 2 ||
-                    (roi.y + roi.height) > hole_mask.rows - 2;
-                if (insufficient_border) {
-#pragma omp atomic
-                    inpaint_skip++;
-#pragma omp critical
-                    {
-                        std::cout << "skip inpaint: insufficient margin around roi " << roi << std::endl;
-                    }
-                    continue;
-                }
-
-                // std::cout << hole_mask.size() << trace_params.state.size() << resume_pad_x << "x" << resume_pad_y << std::endl;
-
-                // cv::Point testp(2492+resume_pad_x, 508+resume_pad_y);
-                // cv::Point testp(2500+resume_pad_x, 566+resume_pad_y);
-                // cv::Point testp(2340+resume_pad_x, 577+resume_pad_y);
-
-                // cv::rectangle(vis, roi, cv::Scalar(255,255,255));
-
-                // if (!roi.contains(testp)) {
-                //     // std::cout << "skip " << roi << std::endl;
-                //     continue;
-                // }
-
-                cv::Mat_<uchar> inpaint_mask(roi.size(), (uchar)1);
-
-                std::vector<cv::Point> hole_contour_roi;
-                for(const auto& p : contours[i]) {
-                    hole_contour_roi.push_back({p.x - roi.x, p.y - roi.y});
-                }
-                std::vector<std::vector<cv::Point>> contours_to_fill = {hole_contour_roi};
-                cv::fillPoly(inpaint_mask, contours_to_fill, cv::Scalar(0));
-
-                // std::cout << "Inpainting hole at " << roi << " - " << inpaint_count << "+" << inpaint_skip << "/" << contours.size() << std::endl;
-                bool did_inpaint = false;
-                try {
-                    did_inpaint = inpaint(roi, inpaint_mask, trace_params, trace_data);
-                } catch (const cv::Exception& ex) {
-#pragma omp atomic
-                    inpaint_skip++;
-#pragma omp critical
-                    {
-                        std::cout << "skip inpaint: OpenCV exception for roi " << roi << " => " << ex.what() << std::endl;
-                    }
-                    continue;
-                } catch (const std::exception& ex) {
-#pragma omp atomic
-                    inpaint_skip++;
-#pragma omp critical
-                    {
-                        std::cout << "skip inpaint: exception for roi " << roi << " => " << ex.what() << std::endl;
-                    }
-                    continue;
-                } catch (...) {
-#pragma omp atomic
-                    inpaint_skip++;
-#pragma omp critical
-                    {
-                        std::cout << "skip inpaint: unknown exception for roi " << roi << std::endl;
-                    }
-                    continue;
-                }
-
-                if (!did_inpaint) {
-#pragma omp atomic
-                    inpaint_skip++;
-#pragma omp critical
-                    {
-                        std::cout << "skip inpaint: mask border check failed for roi " << roi << std::endl;
-                    }
-                    continue;
-                }
-
-#pragma omp critical
+                #pragma omp parallel
+                while (true)
                 {
-                    if (snapshot_interval > 0 && !tgt_path.empty() && inpaint_count % snapshot_interval == 0) {
-                        QuadSurface* surf = create_surface_from_state();
-                        surf->save(tgt_path, true);
-                        delete surf;
-                        std::cout << "saved snapshot in " << tgt_path << " (" << inpaint_count << "+" << inpaint_skip << "/" << contours.size() << ")" << std::endl;
+                    cv::Vec2i p = opt_local_threadcol.next();
+                    if (p[0] == -1)
+                        break;
+
+                    local_optimization(opt_step*2, p, trace_params, trace_data, loss_settings, true);
+                    done++;
+#pragma omp critical
+                    {
+                        auto now = std::chrono::high_resolution_clock::now();
+                        double elapsed_seconds = std::chrono::duration<double>(now - start_time).count();
+                        double eta_seconds = (elapsed_seconds / done.load()) * (total - done.load());
+
+                        printf("  optimizing... %d/%d (%.2f%%) | elapsed: %.1fs | eta: %.1fs\r",
+                               done.load(), total, (100.0 * done.load() / total), elapsed_seconds, eta_seconds);
+                        fflush(stdout);
                     }
                 }
-
-#pragma omp atomic
-                inpaint_count++;
+                printf("\n");
             }
-            else
-#pragma omp atomic
-                inpaint_skip++;
         }
+        else if (params.value("inpaint", false)) {
+            cv::Mat mask = resume_surf->channel("mask");
+            cv::Mat_<uchar> hole_mask(trace_params.state.size(), (uchar)0);
 
-        // cv::imwrite("vis_inp_rect.tif", vis);
+            cv::Mat active_area_mask(trace_params.state.size(), (uchar)0);
+            for (int y = 0; y < trace_params.state.rows; ++y) {
+                for (int x = 0; x < trace_params.state.cols; ++x) {
+                    if (trace_params.state(y, x) & STATE_LOC_VALID) {
+                        active_area_mask.at<uchar>(y, x) = 255;
+                    }
+                }
+            }
+
+            if (!mask.empty()) {
+                cv::Mat padded_mask = cv::Mat::zeros(trace_params.state.size(), CV_8U);
+                mask.copyTo(padded_mask(used_area));
+                cv::bitwise_and(active_area_mask, padded_mask, hole_mask);
+            } else {
+                active_area_mask.copyTo(hole_mask);
+            }
+
+            std::vector<std::vector<cv::Point>> contours;
+            std::vector<cv::Vec4i> hierarchy;
+            cv::findContours(hole_mask, contours, hierarchy, cv::RETR_CCOMP, cv::CHAIN_APPROX_SIMPLE);
+
+            std::cout << "performing inpaint on " << contours.size() << " potential holes" << std::endl;
+
+            int inpaint_count = 0;
+            int inpaint_skip = 0;
+
+            // cv::Mat_<cv::Vec3b> vis(hole_mask.size());
+
+    #pragma omp parallel for schedule(dynamic)
+            for (int i = 0; i < contours.size(); i++) {
+                if (hierarchy[i][3] != -1) { // It's a hole
+                    cv::Rect roi = cv::boundingRect(contours[i]);
+
+                    int margin = 4;
+                    roi.x = std::max(0, roi.x - margin);
+                    roi.y = std::max(0, roi.y - margin);
+                    roi.width = std::min(hole_mask.cols - roi.x, roi.width + 2 * margin);
+                    roi.height = std::min(hole_mask.rows - roi.y, roi.height + 2 * margin);
+
+                    bool insufficient_border =
+                        roi.width <= 4 || roi.height <= 4 ||
+                        roi.x <= 1 || roi.y <= 1 ||
+                        (roi.x + roi.width) > hole_mask.cols - 2 ||
+                        (roi.y + roi.height) > hole_mask.rows - 2;
+                    if (insufficient_border) {
+    #pragma omp atomic
+                        inpaint_skip++;
+    #pragma omp critical
+                        {
+                            std::cout << "skip inpaint: insufficient margin around roi " << roi << std::endl;
+                        }
+                        continue;
+                    }
+
+                    // std::cout << hole_mask.size() << trace_params.state.size() << resume_pad_x << "x" << resume_pad_y << std::endl;
+
+                    // cv::Point testp(2492+resume_pad_x, 508+resume_pad_y);
+                    // cv::Point testp(2500+resume_pad_x, 566+resume_pad_y);
+                    // cv::Point testp(2340+resume_pad_x, 577+resume_pad_y);
+
+                    // cv::rectangle(vis, roi, cv::Scalar(255,255,255));
+
+                    // if (!roi.contains(testp)) {
+                    //     // std::cout << "skip " << roi << std::endl;
+                    //     continue;
+                    // }
+
+                    cv::Mat_<uchar> inpaint_mask(roi.size(), (uchar)1);
+
+                    std::vector<cv::Point> hole_contour_roi;
+                    for(const auto& p : contours[i]) {
+                        hole_contour_roi.push_back({p.x - roi.x, p.y - roi.y});
+                    }
+                    std::vector<std::vector<cv::Point>> contours_to_fill = {hole_contour_roi};
+                    cv::fillPoly(inpaint_mask, contours_to_fill, cv::Scalar(0));
+
+                    // std::cout << "Inpainting hole at " << roi << " - " << inpaint_count << "+" << inpaint_skip << "/" << contours.size() << std::endl;
+                    bool did_inpaint = false;
+                    try {
+                        did_inpaint = inpaint(roi, inpaint_mask, trace_params, trace_data);
+                    } catch (const cv::Exception& ex) {
+    #pragma omp atomic
+                        inpaint_skip++;
+    #pragma omp critical
+                        {
+                            std::cout << "skip inpaint: OpenCV exception for roi " << roi << " => " << ex.what() << std::endl;
+                        }
+                        continue;
+                    } catch (const std::exception& ex) {
+    #pragma omp atomic
+                        inpaint_skip++;
+    #pragma omp critical
+                        {
+                            std::cout << "skip inpaint: exception for roi " << roi << " => " << ex.what() << std::endl;
+                        }
+                        continue;
+                    } catch (...) {
+    #pragma omp atomic
+                        inpaint_skip++;
+    #pragma omp critical
+                        {
+                            std::cout << "skip inpaint: unknown exception for roi " << roi << std::endl;
+                        }
+                        continue;
+                    }
+
+                    if (!did_inpaint) {
+    #pragma omp atomic
+                        inpaint_skip++;
+    #pragma omp critical
+                        {
+                            std::cout << "skip inpaint: mask border check failed for roi " << roi << std::endl;
+                        }
+                        continue;
+                    }
+
+    #pragma omp critical
+                    {
+                        if (snapshot_interval > 0 && !tgt_path.empty() && inpaint_count % snapshot_interval == 0) {
+                            QuadSurface* surf = create_surface_from_state();
+                            surf->save(tgt_path, true);
+                            delete surf;
+                            std::cout << "saved snapshot in " << tgt_path << " (" << inpaint_count << "+" << inpaint_skip << "/" << contours.size() << ")" << std::endl;
+                        }
+                    }
+
+    #pragma omp atomic
+                    inpaint_count++;
+                }
+                else
+    #pragma omp atomic
+                    inpaint_skip++;
+            }
+
+            // cv::imwrite("vis_inp_rect.tif", vis);
+        }
     }
 
     // Prepare a new set of Ceres options used later during local solves
