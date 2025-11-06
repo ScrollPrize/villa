@@ -227,31 +227,97 @@ void VolumeOverlayController::refreshVolumeOptions()
 
 void VolumeOverlayController::toggleVisibility()
 {
-    if (!hasOverlaySelection()) {
-        return;
-    }
-
     if (_overlayVisible) {
         if (_overlayOpacity > 0.0f) {
             _overlayOpacityBeforeToggle = _overlayOpacity;
         }
-        setOpacity(0.0f);
+        if (!_overlayVolumeId.empty()) {
+            _overlayVolumeIdBeforeToggle = _overlayVolumeId;
+        }
+
+        if (_ui.volumeSelect) {
+            if (_ui.volumeSelect->currentIndex() != 0) {
+                _ui.volumeSelect->setCurrentIndex(0);
+            } else if (!_overlayVolumeId.empty()) {
+                // UI already points to "None", ensure internal state matches.
+                _overlayVolumeId.clear();
+                applyOverlayVolume();
+                updateUiEnabled();
+            }
+        } else {
+            _overlayVolumeId.clear();
+            applyOverlayVolume();
+            updateUiEnabled();
+        }
+
         _overlayVisible = false;
         if (!_suspendPersistence) {
             saveState();
         }
         emit requestStatusMessage(tr("Volume overlay hidden"), 1200);
+        return;
+    }
+
+    const std::string restoreId = !_overlayVolumeIdBeforeToggle.empty() ? _overlayVolumeIdBeforeToggle : _overlayVolumeId;
+    if (restoreId.empty()) {
+        emit requestStatusMessage(tr("No overlay volume selected"), 1200);
+        return;
+    }
+
+    bool restored = false;
+    if (_ui.volumeSelect) {
+        const int count = _ui.volumeSelect->count();
+        for (int row = 0; row < count; ++row) {
+            const QVariant data = _ui.volumeSelect->itemData(row);
+            if (!data.isValid()) {
+                continue;
+            }
+            if (data.toString().toStdString() == restoreId) {
+                if (_ui.volumeSelect->currentIndex() != row) {
+                    _ui.volumeSelect->setCurrentIndex(row);
+                } else if (_overlayVolumeId != restoreId) {
+                    _overlayVolumeId = restoreId;
+                    applyOverlayVolume();
+                    updateUiEnabled();
+                }
+                restored = true;
+                break;
+            }
+        }
+    }
+
+    if (!restored) {
+        _overlayVolumeId = restoreId;
+        applyOverlayVolume();
+        updateUiEnabled();
+        restored = hasOverlaySelection();
+    }
+
+    if (!restored) {
+        emit requestStatusMessage(tr("Selected overlay volume unavailable"), 1200);
+        return;
+    }
+
+    const float restoredOpacity = (_overlayOpacityBeforeToggle > 0.0f) ? _overlayOpacityBeforeToggle : 0.5f;
+    setOpacity(restoredOpacity);
+
+    const bool hasSelection = hasOverlaySelection();
+    _overlayVisible = hasSelection && _overlayOpacity > 0.0f;
+    if (_overlayVisible) {
+        _overlayVolumeIdBeforeToggle.clear();
+        _overlayOpacityBeforeToggle = _overlayOpacity;
+    }
+
+    if (!_suspendPersistence) {
+        saveState();
+    }
+
+    if (_overlayVisible) {
+        emit requestStatusMessage(tr("Volume overlay shown"), 1200);
+    } else if (hasSelection) {
+        emit requestStatusMessage(tr("Volume overlay shown (opacity 0%)"), 1200);
     } else {
-        const float restored = (_overlayOpacityBeforeToggle > 0.0f) ? _overlayOpacityBeforeToggle : 0.5f;
-        setOpacity(restored);
-        _overlayVisible = hasOverlaySelection() && _overlayOpacity > 0.0f;
-        if (_overlayVisible) {
-            _overlayOpacityBeforeToggle = _overlayOpacity;
-        }
-        if (!_suspendPersistence) {
-            saveState();
-        }
-        emit requestStatusMessage(_overlayVisible ? tr("Volume overlay shown") : tr("Volume overlay hidden"), 1200);
+        emit requestStatusMessage(tr("Selected overlay volume unavailable"), 1200);
     }
 }
 

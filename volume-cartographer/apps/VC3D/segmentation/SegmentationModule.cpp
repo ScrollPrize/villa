@@ -658,9 +658,18 @@ void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod met
                                                     int steps,
                                                     bool inpaintOnly)
 {
+    const bool allowZeroSteps = inpaintOnly || method == SegmentationGrowthMethod::Corrections;
+    int sanitizedSteps = allowZeroSteps ? std::max(0, steps) : std::max(1, steps);
+    const bool usingCorrections = !inpaintOnly &&
+                                  method == SegmentationGrowthMethod::Corrections &&
+                                  _corrections && _corrections->hasCorrections();
+    if (usingCorrections) {
+        sanitizedSteps = 0;
+    }
+
     qCInfo(lcSegModule) << "Grow request" << segmentationGrowthMethodToString(method)
                         << segmentationGrowthDirectionToString(direction)
-                        << "steps" << steps
+                        << "steps" << sanitizedSteps
                         << "inpaintOnly" << inpaintOnly;
 
     if (_growthInProgress) {
@@ -679,10 +688,13 @@ void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod met
 
     if (!inpaintOnly) {
         _growthMethod = method;
-        _growthSteps = std::max(1, steps);
+        if (method == SegmentationGrowthMethod::Corrections) {
+            _growthSteps = std::max(0, steps);
+        } else {
+            _growthSteps = std::max(1, steps);
+        }
     }
     markNextEditsFromGrowth();
-    const int sanitizedSteps = inpaintOnly ? std::max(0, steps) : std::max(1, steps);
     emit growSurfaceRequested(method, direction, sanitizedSteps, inpaintOnly);
 }
 

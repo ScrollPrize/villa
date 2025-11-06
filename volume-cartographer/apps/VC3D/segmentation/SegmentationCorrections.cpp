@@ -215,6 +215,21 @@ void CorrectionsState::onZRangeChanged(bool enabled, int zMin, int zMax)
     }
 }
 
+bool CorrectionsState::hasCorrections() const
+{
+    if (!_collection) {
+        return false;
+    }
+
+    const auto& collections = _collection->getAllCollections();
+    for (const auto& entry : collections) {
+        if (!entry.second.points.empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void CorrectionsState::setGrowthInProgress(bool running)
 {
     _growthInProgress = running;

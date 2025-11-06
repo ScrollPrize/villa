@@ -3476,48 +3476,61 @@ void CWindow::processPendingInotifyEvents()
 
     // Restore selection if it still exists (might have been renamed or re-added)
     if (!previousSelection.empty() && previousSelectionRemoved) {
-        // Check if the segment was re-added in this batch
-        bool wasReAdded = false;
-        for (const auto& evt : additions) {
-            if (evt.segmentId == previousSelection) {
-                wasReAdded = true;
-                break;
+        // If editing is active for this segment, skip re-emitting the segmentation surface change
+        // because autosave-triggered inotify events were intentionally skipped.
+        bool skipRestoreForActiveEdit = false;
+        if (_segmentationModule && _segmentationModule->editingEnabled()) {
+            auto* activeBaseSurface = _segmentationModule->activeBaseSurface();
+            if (activeBaseSurface && activeBaseSurface->id == previousSelection) {
+                Logger()->info("Skipping selection restore of {} - currently being edited", previousSelection);
+                skipRestoreForActiveEdit = true;
             }
         }
 
-        if (wasReAdded) {
-            // The segment was removed and re-added - restore selection
-            auto seg = fVpkg ? fVpkg->segmentation(previousSelection) : nullptr;
-            if (seg) {
-                _surfID = previousSelection;
-                auto surfMeta = fVpkg->getSurface(previousSelection);
-                if (surfMeta) {
-                    _surf = surfMeta->surface();
+        if (!skipRestoreForActiveEdit) {
+            // Check if the segment was re-added in this batch
+            bool wasReAdded = false;
+            for (const auto& evt : additions) {
+                if (evt.segmentId == previousSelection) {
+                    wasReAdded = true;
+                    break;
+                }
+            }
 
-                    if (_surf_col) {
-                        _surf_col->setSurface("segmentation", _surf, false, false);
-                    }
+            if (wasReAdded) {
+                // The segment was removed and re-added - restore selection
+                auto seg = fVpkg ? fVpkg->segmentation(previousSelection) : nullptr;
+                if (seg) {
+                    _surfID = previousSelection;
+                    auto surfMeta = fVpkg->getSurface(previousSelection);
+                    if (surfMeta) {
+                        _surf = surfMeta->surface();
 
-                    if (treeWidgetSurfaces) {
-                        QTreeWidgetItemIterator it(treeWidgetSurfaces);
-                        while (*it) {
-                            if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() == previousSelection) {
-                                const QSignalBlocker blocker{treeWidgetSurfaces};
-                                treeWidgetSurfaces->clearSelection();
-                                (*it)->setSelected(true);
-                                treeWidgetSurfaces->scrollToItem(*it);
-                                break;
-                            }
-                            ++it;
+                        if (_surf_col) {
+                            _surf_col->setSurface("segmentation", _surf, false, false);
                         }
-                    }
 
-                    if (_surfacePanel) {
-                        _surfacePanel->syncSelectionUi(previousSelection, _surf);
-                    }
+                        if (treeWidgetSurfaces) {
+                            QTreeWidgetItemIterator it(treeWidgetSurfaces);
+                            while (*it) {
+                                if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() == previousSelection) {
+                                    const QSignalBlocker blocker{treeWidgetSurfaces};
+                                    treeWidgetSurfaces->clearSelection();
+                                    (*it)->setSelected(true);
+                                    treeWidgetSurfaces->scrollToItem(*it);
+                                    break;
+                                }
+                                ++it;
+                            }
+                        }
 
-                    if (auto* viewer = segmentationViewer()) {
-                        viewer->setWindowTitle(tr("Surface %1").arg(QString::fromStdString(previousSelection)));
+                        if (_surfacePanel) {
+                            _surfacePanel->syncSelectionUi(previousSelection, _surf);
+                        }
+
+                        if (auto* viewer = segmentationViewer()) {
+                            viewer->setWindowTitle(tr("Surface %1").arg(QString::fromStdString(previousSelection)));
+                        }
                     }
                 }
             }

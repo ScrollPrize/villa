@@ -45,6 +45,7 @@ public:
     [[nodiscard]] uint64_t activeCollection() const { return _activeCollectionId; }
     [[nodiscard]] std::optional<std::pair<int, int>> zRange() const;
     [[nodiscard]] SegmentationCorrectionsPayload buildPayload() const;
+    [[nodiscard]] bool hasCorrections() const;
 
     void onCollectionRemoved(uint64_t id);
     void onCollectionChanged(uint64_t id);
@@ -68,4 +69,3 @@ private:
 };
 
 } // namespace segmentation
-
