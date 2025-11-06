@@ -26,7 +26,7 @@ from tqdm.auto import tqdm
 import zarr
 
 from k8s import get_tqdm_kwargs
-from processing import path_exists, get_zarr_store
+from processing import path_exists, get_cached_zarr_store
 
 # ----------------------------- Logging ---------------------------------------
 logging.basicConfig(level=logging.INFO)
@@ -141,7 +141,7 @@ class LayersSource:
             if not path_exists(src):
                 raise ValueError(f"Zarr path does not exist: {src}")
             self._arr = None
-            store = get_zarr_store(src)
+            store = get_cached_zarr_store(src)
             root = zarr.open(store, mode='r')
 
             if isinstance(root, zarr.Group):

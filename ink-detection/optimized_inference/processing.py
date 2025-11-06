@@ -38,11 +38,20 @@ def path_exists(path: str) -> bool:
     return os.path.exists(path)
 
 
-def get_zarr_store(path: str):
-    """Get zarr store for path (supports local paths and S3 URLs).
+def get_cached_zarr_store(path: str):
+    """Get read-only cached zarr store for path (supports local paths and S3 URLs).
 
+    This function is intended for read operations with performance optimization.
     For S3 paths, automatically applies disk-based caching using zarr3's CacheStore
     to improve performance and reduce S3 request costs.
+
+    For write operations, use get_writable_zarr_store() instead.
+
+    Args:
+        path: Local file path or S3 URL (s3://bucket/path)
+
+    Returns:
+        Cached zarr store (CacheStore for S3, path string for local)
     """
     if path.startswith("s3://"):
         # Create S3 filesystem with credentials
@@ -91,6 +100,48 @@ def get_zarr_store(path: str):
         return cached_store
 
     return path
+
+
+def get_writable_zarr_store(path: str):
+    """Get writable zarr store for path (supports local paths and S3 URLs).
+
+    This function is intended for write operations and does not apply caching.
+    For read-only operations with caching, use get_cached_zarr_store() instead.
+
+    Args:
+        path: Local file path or S3 URL (s3://bucket/path)
+
+    Returns:
+        Writable zarr store (fsspec mapper for S3, path string for local)
+    """
+    if path.startswith("s3://"):
+        # Return writable fsspec mapper for S3
+        return fsspec.get_mapper(path, anon=False, s3_additional_kwargs={'StorageClass': 'INTELLIGENT_TIERING'})
+    return path
+
+
+def get_zarr_store(path: str):
+    """Get zarr store for path (supports local paths and S3 URLs).
+
+    .. deprecated::
+        Use get_cached_zarr_store() for read operations or get_writable_zarr_store()
+        for write operations instead. This function defaults to cached read behavior
+        for backwards compatibility.
+
+    Args:
+        path: Local file path or S3 URL (s3://bucket/path)
+
+    Returns:
+        Cached zarr store (defaults to read-only cached behavior)
+    """
+    import warnings
+    warnings.warn(
+        "get_zarr_store() is deprecated. Use get_cached_zarr_store() for reads "
+        "or get_writable_zarr_store() for writes.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    return get_cached_zarr_store(path)
 
 
 # ----------------------------- Surface Volume Creation ------------------------------
@@ -179,8 +230,8 @@ def create_surface_volume_zarr(
     if path_exists(output_path):
         raise RuntimeError(f"Surface volume zarr already exists at {output_path}. Please remove it or use a different path.")
 
-    # Get zarr store (handles both local and S3)
-    store = get_zarr_store(output_path)
+    # Get writable zarr store (handles both local and S3)
+    store = get_writable_zarr_store(output_path)
 
     # Create zarr v2 array with shape (H, W, C) and chunk size optimized for spatial tile access
     # Optionally use LZ4 compression (fast with decent ratio)
