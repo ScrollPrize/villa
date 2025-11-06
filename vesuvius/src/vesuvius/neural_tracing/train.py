@@ -98,6 +98,13 @@ def train(config_path):
         num_training_steps=config['num_iterations'] * accelerate.PartialState().num_processes,  # FIXME: nasty adjustment by num_processes here accounts for the fact that accelerator's prepare_scheduler weirdly causes the scheduler to take num_processes scheduler-steps per optimiser-step
     )
 
+    if 'load_ckpt' in config:
+        print(f'loading checkpoint {config["load_ckpt"]}')
+        ckpt = torch.load(config['load_ckpt'], map_location='cpu', weights_only=False)
+        model.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        # Note we don't load the lr_scheduler state (i.e. training starts 'hot'), nor any config
+
     model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, val_dataloader, lr_scheduler
     )
@@ -215,7 +222,8 @@ def train(config_path):
                 'optimizer': optimizer.state_dict(),
                 'lr_scheduler': lr_scheduler.state_dict(),
                 'noise_scheduler': noise_scheduler.config,
-                'step': iteration
+                'config': config,
+                'step': iteration,
             }, f'{out_dir}/ckpt_{iteration:06}.pth' )
 
         if wandb.run is not None:
