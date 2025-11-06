@@ -843,8 +843,9 @@ static cv::Mat_<cv::Vec3f> surftrack_genpoints_hr(
 {
     std::cout << "hr_gen: start used_area=" << used_area << " step=" << step
               << " inpaint=" << inpaint << " parallel=" << (parallel?1:0) << std::endl;
-    cv::Mat_<cv::Vec3f> points_hr(state.rows*step, state.cols*step, {0,0,0});
-    cv::Mat_<float> weights_hr(state.rows*step, state.cols*step, 0.0f);
+    const int step_int = surftrack_round_step(step);
+    cv::Mat_<cv::Vec3f> points_hr(state.rows*step_int, state.cols*step_int, {0,0,0});
+    cv::Mat_<float> weights_hr(state.rows*step_int, state.cols*step_int, 0.0f);
 #pragma omp parallel for if(parallel) //FIXME data access is just not threading friendly ...
     for(int j=used_area.y;j<used_area.br().y-1;j++)
         for(int i=used_area.x;i<used_area.br().x-1;i++) {
@@ -873,16 +874,16 @@ static cv::Mat_<cv::Vec3f> surftrack_genpoints_hr(
                     );
                     const float w_surf = (cell_has_approved ? approved_weight : 1.0f);
 
-                    for(int sy=0;sy<=step;sy++)
-                        for(int sx=0;sx<=step;sx++) {
-                            float fx = sx/step;
-                            float fy = sy/step;
+                    for (int sy = 0; sy <= step_int; ++sy)
+                        for (int sx = 0; sx <= step_int; ++sx) {
+                            float fx = float(sx)/float(step_int);
+                            float fy = float(sy)/float(step_int);
                             cv::Vec2f l0 = (1-fx)*l00 + fx*l01;
                             cv::Vec2f l1 = (1-fx)*l10 + fx*l11;
                             cv::Vec2f l = (1-fy)*l0 + fy*l1;
                             if (loc_valid(sm->surface()->rawPoints(), l)) {
-                                points_hr(j*step+sy,i*step+sx) += w_surf * cv::Vec3f(SurfTrackerData::lookup_int_loc(sm,l));
-                                weights_hr(j*step+sy,i*step+sx) += w_surf;
+                                points_hr(j*step_int+sy, i*step_int+sx) += w_surf * cv::Vec3f(SurfTrackerData::lookup_int_loc(sm,l));
+                                weights_hr(j*step_int+sy, i*step_int+sx) += w_surf;
                             }
                         }
                 }
@@ -1534,7 +1535,9 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     cv::Mat_<uint16_t> inliers_sum_dbg(size,0);
     cv::Mat_<cv::Vec3d> points(size,{-1,-1,-1});
 
-    cv::Rect used_area(x0,y0,2,2);
+    // Start with at least 4x4 so pointTo_ has enough support
+    cv::Rect used_area(x0 - 1, y0 - 1, 4, 4);
+    used_area &= cv::Rect(0, 0, w, h); // clamp to grid
     cv::Rect used_area_hr = {used_area.x*step_int, used_area.y*step_int, used_area.width*step_int, used_area.height*step_int};
 
     SurfTrackerData data;
@@ -1880,16 +1883,40 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                     best_inliers = -1;
                     best_ref_seed = false;
                 } else {
-                    cv::Vec2f tmp_loc_;
+                    // Duplicate-location guard only when ROI is big enough for pointTo_.
                     cv::Rect used_th = used_area;
-                    float dist = pointTo(tmp_loc_, points(used_th), best_coord, same_surface_th, 1000, 1.0/(step*src_step));
-                    tmp_loc_ += cv::Vec2f(used_th.x,used_th.y);
-                    if (dist <= same_surface_th) {
-                        int state_sum = state(tmp_loc_[1],tmp_loc_[0]) + state(tmp_loc_[1]+1,tmp_loc_[0]) + state(tmp_loc_[1],tmp_loc_[0]+1) + state(tmp_loc_[1]+1,tmp_loc_[0]+1);
-                        best_inliers = -1;
-                        best_ref_seed = false;
-                        if (!state_sum)
-                            throw std::runtime_error("this should not have any location?!");
+                    const int kMinROI = 4;
+                    // Expand tiny ROI toward >=4x4 when possible and keep it in-bounds.
+                    if (used_th.width  < kMinROI || used_th.height < kMinROI) {
+                        int pad_x = std::max(0, (kMinROI - used_th.width  + 1) / 2);
+                        int pad_y = std::max(0, (kMinROI - used_th.height + 1) / 2);
+                        used_th.x      = std::max(0, used_th.x - pad_x);
+                        used_th.y      = std::max(0, used_th.y - pad_y);
+                        used_th.width  = std::min(points.cols - used_th.x, used_th.width  + 2*pad_x);
+                        used_th.height = std::min(points.rows - used_th.y, used_th.height + 2*pad_y);
+                    }
+
+                    if (used_th.width > 3 && used_th.height > 3) {
+                        cv::Vec2f tmp_loc_;
+                        float dist = pointTo(tmp_loc_, points(used_th), best_coord,
+                                             same_surface_th, 1000, 1.0f/(step*src_step));
+                        tmp_loc_ += cv::Vec2f(used_th.x, used_th.y);
+
+                        // Clamp to keep (y+1,x+1) neighbor accesses in-bounds.
+                        const int y0 = std::clamp<int>(int(std::floor(tmp_loc_[0])), 0, state.rows - 2);
+                        const int x0 = std::clamp<int>(int(std::floor(tmp_loc_[1])), 0, state.cols - 2);
+
+                        if (dist <= same_surface_th) {
+                            int state_sum =
+                                state(y0,   x0  ) +
+                                state(y0+1, x0  ) +
+                                state(y0,   x0+1) +
+                                state(y0+1, x0+1);
+                            best_inliers = -1;
+                            best_ref_seed = false;
+                            if (!state_sum)
+                                throw std::runtime_error("this should not have any location?!");
+                        }
                     }
                 }
             }
