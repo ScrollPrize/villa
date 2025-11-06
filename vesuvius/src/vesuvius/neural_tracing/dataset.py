@@ -42,6 +42,7 @@ class Patch:
         self.valid_vertex_mask = torch.any(self.zyxs != -1, dim=-1)
         assert len(self.valid_quad_indices) > 0
         self.area = (~self.valid_quad_mask).sum() * (1 / self.scale).prod()
+        self.quad_centers = torch.where(self.valid_quad_mask[..., None], 0.5 * (self.zyxs[1:, 1:] + self.zyxs[:-1, :-1]), torch.tensor(-1.))
 
     def retarget(self, factor):
         # Retarget the patch to a volume downsampled by the given factor
@@ -364,8 +365,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
     def _get_quads_in_crop(self, patch, min_corner_zyx, crop_size):
         """Get mask of quads that fall within the crop region"""
-        quad_centers = 0.5 * (patch.zyxs[1:, 1:] + patch.zyxs[:-1, :-1])
-        return patch.valid_quad_mask & torch.all(quad_centers >= min_corner_zyx, dim=-1) & torch.all(quad_centers < min_corner_zyx + crop_size, dim=-1)
+        return patch.valid_quad_mask & torch.all(patch.quad_centers >= min_corner_zyx, dim=-1) & torch.all(patch.quad_centers < min_corner_zyx + crop_size, dim=-1)
 
     def _get_patch_points_in_crop(self, patch, min_corner_zyx, crop_size):
         """Get finely sampled points from a patch that fall within the crop region"""
