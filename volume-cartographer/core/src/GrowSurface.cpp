@@ -1741,14 +1741,12 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
             for(auto ref_surf : local_surfs) {
                 int ref_count = 0;
                 cv::Vec2d avg = {0,0};
-                cv::Vec3d any_p = {0,0,0};
                 bool ref_seed = false;
                 for(int oy=std::max(p[0]-r,0);oy<=std::min(p[0]+r,h-1);oy++)
                     for(int ox=std::max(p[1]-r,0);ox<=std::min(p[1]+r,w-1);ox++)
                         if ((state(oy,ox) & STATE_LOC_VALID) && data_th.valid_int(ref_surf,{oy,ox})) {
                             ref_count++;
                             avg += data_th.loc(ref_surf,{oy,ox});
-                            any_p = points(cv::Vec2i(data_th.loc(ref_surf,{oy,ox})));
                             if (data_th.seed_loc == cv::Vec2i(oy,ox))
                                 ref_seed = true;
                         }
@@ -1879,7 +1877,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                     // Final guard: reject best candidate outside z-range
                     best_inliers = -1;
                     best_ref_seed = false;
-                } else {
+                } else if (used_area.width >=4 && used_area.height >= 4) {
                     cv::Vec2f tmp_loc_;
                     cv::Rect used_th = used_area;
                     float dist = pointTo(tmp_loc_, points(used_th), best_coord, same_surface_th, 1000, 1.0/(step*src_step));
