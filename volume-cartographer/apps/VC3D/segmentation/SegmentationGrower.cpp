@@ -233,7 +233,12 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         return false;
     }
 
-    steps = inpaintOnly ? std::max(0, steps) : std::max(1, steps);
+    const bool allowZeroSteps = inpaintOnly || method == SegmentationGrowthMethod::Corrections;
+    int sanitizedSteps = allowZeroSteps ? std::max(0, steps) : std::max(1, steps);
+    if (usingCorrections) {
+        // Correction-guided tracer should not advance additional steps.
+        sanitizedSteps = 0;
+    }
 
     const SegmentationGrowthDirection effectiveDirection = inpaintOnly
         ? SegmentationGrowthDirection::All
@@ -242,7 +247,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     SegmentationGrowthRequest request;
     request.method = method;
     request.direction = effectiveDirection;
-    request.steps = steps;
+    request.steps = sanitizedSteps;
     request.inpaintOnly = inpaintOnly;
 
     if (inpaintOnly) {
@@ -326,7 +331,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     qCInfo(lcSegGrowth) << "Segmentation growth requested"
                         << segmentationGrowthMethodToString(method)
                         << segmentationGrowthDirectionToString(effectiveDirection)
-                        << "steps" << steps
+                        << "steps" << sanitizedSteps
                         << "inpaintOnly" << inpaintOnly;
     qCInfo(lcSegGrowth) << "Growth volume ID" << QString::fromStdString(growthVolumeId);
     qCInfo(lcSegGrowth) << "Starting tracer growth";
@@ -431,6 +436,16 @@ void SegmentationGrower::onFutureFinished()
             continue;
         }
 
+        nlohmann::json preservedTags = nlohmann::json::object();
+        bool hadPreservedTags = false;
+        if (targetSurface->meta && targetSurface->meta->is_object()) {
+            auto tagsIt = targetSurface->meta->find("tags");
+            if (tagsIt != targetSurface->meta->end() && tagsIt->is_object()) {
+                preservedTags = *tagsIt;
+                hadPreservedTags = true;
+            }
+        }
+
         if (auto* destPoints = targetSurface->rawPointsPtr()) {
             result.surface->rawPoints().copyTo(*destPoints);
         }
@@ -449,6 +464,15 @@ void SegmentationGrower::onFutureFinished()
             targetSurface->meta = new nlohmann::json(*result.surface->meta);
         } else {
             ensureSurfaceMetaObject(targetSurface);
+        }
+
+        if (hadPreservedTags && targetSurface->meta && targetSurface->meta->is_object()) {
+            nlohmann::json mergedTags = preservedTags;
+            auto tagsIt = targetSurface->meta->find("tags");
+            if (tagsIt != targetSurface->meta->end() && tagsIt->is_object()) {
+                mergedTags.update(*tagsIt);
+            }
+            (*targetSurface->meta)["tags"] = mergedTags;
         }
 
         updateSegmentationSurfaceMetadata(targetSurface, voxelSize);
