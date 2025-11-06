@@ -17,8 +17,19 @@
               "volume_path": "/mnt/sda/paul/vesuvius-scrolls-data/zarr/Scroll1_masked.zarr",
               "volume_scale": 1,
               "segments_path": "/home/paul/projects/vesuvius-scrolls/neural-tracing/data/PHercParis4/tifxyz"
+          },
+          {
+              "volume_path": "/mnt/sda/paul/vesuvius-scrolls-data/zarr/s5_masked_ome.zarr",
+              "volume_scale": 1,
+              "segments_path": "/home/paul/projects/vesuvius-scrolls/neural-tracing/data/PHerc0172/cropped"
+          },
+          {
+              "volume_path": "/mnt/sda/paul/vesuvius-scrolls-data/zarr/s4_20231117161658.zarr",
+              "volume_scale": 1,
+              "segments_path": "/home/paul/projects/vesuvius-scrolls/neural-tracing/data/PHerc1667/cropped"
           }
       ],
+    "num_val_segments_per_volume": 1,
       "augmentation": {
         "no_spatial": true,
         "only_spatial_and_intensity": false
@@ -30,8 +41,8 @@
         "main_component_distance_factor": 0.4
       },
       "representation": "heatmap",
-      "step_size": 8,
-      "step_count": 2,
+      "step_size": 10,
+      "step_count": 1,
       "generative": false,
       "binary": true,
       "cfg_uncond_prob": 0.1,
@@ -50,6 +61,6 @@
           320
         ],
         "squeeze_excitation": true,
-        "time_emb_dim": 128
+        "time_emb_dim": 4
       }
-    }
+}
