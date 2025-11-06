@@ -180,9 +180,7 @@ void SegmentationWidget::applyGrowthSteps(int steps, bool persist, bool fromUi)
         _spinGrowthSteps->setValue(clamped);
     }
 
-    if (_growthMethod != SegmentationGrowthMethod::Corrections) {
-        _tracerGrowthSteps = std::max(1, clamped);
-    } else if (clamped > 0) {
+    if (clamped > 0) {
         _tracerGrowthSteps = std::max(1, clamped);
     }
 
