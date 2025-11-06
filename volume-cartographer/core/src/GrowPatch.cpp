@@ -363,6 +363,7 @@ enum LossType {
     SNAP,
     NORMAL,
     SDIR,
+    CORRECTION,
     COUNT
 };
 
@@ -377,6 +378,7 @@ struct LossSettings {
         w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 1.0f;
         w[LossType::SDIR] = 0.00f; // conservative default; tune 0.01–0.10 maybe
+        w[LossType::CORRECTION] = 1.0f;
     }
 
     float operator()(LossType type, const cv::Vec2i& p) const {
@@ -884,9 +886,9 @@ int gen_direction_loss(ceres::Problem &problem,
 
 //create all valid losses for this point
 // Forward declarations
-static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, TraceParameters &trace_params);
+static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, TraceData& trace_data, const LossSettings &settings);
 static int conditional_corr_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
-                                 ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, TraceParameters &trace_params);
+                                 ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, TraceData& trace_data, const LossSettings &settings);
 
 static int add_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params,
     const TraceData &trace_data, const LossSettings &settings, int flags = LOSS_STRAIGHT | LOSS_DIST)
@@ -974,9 +976,10 @@ static int conditional_direction_loss(int bit,
 };
 
 //create only missing losses so we can optimize the whole problem
-static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &dpoints, TraceData& trace_data)
+static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &dpoints, TraceData& trace_data, const LossSettings &settings)
 {
-    if (!trace_data.point_correction.isValid()) {
+    const float weight = settings(LossType::CORRECTION, p);
+    if (!trace_data.point_correction.isValid() || weight <= 0.0f) {
         return 0;
     }
 
@@ -1012,7 +1015,7 @@ static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<u
         return 0;
     }
 
-    auto points_correction_loss = new PointsCorrectionLoss(filtered_tgts, filtered_grid_locs, quad_loc_int);
+    auto points_correction_loss = new PointsCorrectionLoss(filtered_tgts, filtered_grid_locs, quad_loc_int, weight);
     auto cost_function = new ceres::DynamicAutoDiffCostFunction<PointsCorrectionLoss>(
         points_correction_loss
     );
@@ -1035,12 +1038,12 @@ static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<u
 }
 
 static int conditional_corr_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
-    ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &out, TraceData& trace_data)
+    ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &out, TraceData& trace_data, const LossSettings &settings)
 {
     if (!trace_data.point_correction.isValid()) return 0;
     int set = 0;
     if (!loss_mask(bit, p, {0,0}, loss_status))
-        set = set_loss_mask(bit, p, {0,0}, loss_status, gen_corr_loss(problem, p, state, out, trace_data));
+        set = set_loss_mask(bit, p, {0,0}, loss_status, gen_corr_loss(problem, p, state, out, trace_data, settings));
     return set;
 };
 
@@ -1102,10 +1105,10 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_normal_loss(10, p + cv::Vec2i(-1, 0), loss_status, problem, params, trace_data, settings);
 
     //snapping
-    count += conditional_corr_loss(11, p,                    loss_status, problem, params.state, params.dpoints, trace_data);
-    count += conditional_corr_loss(11, p + cv::Vec2i(-1,-1), loss_status, problem, params.state, params.dpoints, trace_data);
-    count += conditional_corr_loss(11, p + cv::Vec2i( 0,-1), loss_status, problem, params.state, params.dpoints, trace_data);
-    count += conditional_corr_loss(11, p + cv::Vec2i(-1, 0), loss_status, problem, params.state, params.dpoints, trace_data);
+    count += conditional_corr_loss(11, p,                    loss_status, problem, params.state, params.dpoints, trace_data, settings);
+    count += conditional_corr_loss(11, p + cv::Vec2i(-1,-1), loss_status, problem, params.state, params.dpoints, trace_data, settings);
+    count += conditional_corr_loss(11, p + cv::Vec2i( 0,-1), loss_status, problem, params.state, params.dpoints, trace_data, settings);
+    count += conditional_corr_loss(11, p + cv::Vec2i(-1, 0), loss_status, problem, params.state, params.dpoints, trace_data, settings);
 
     count += gen_reference_ray_loss(problem, p, params, trace_data);
 
@@ -1823,9 +1826,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
                 std::cout << "correction opt centered at " << avg_loc << " with radius " << radius << std::endl;
                 LossSettings loss_inpaint = loss_settings;
-                loss_inpaint[SNAP] *= 0.01;
-                loss_inpaint[DIST] *= 0.1;
-                loss_inpaint[STRAIGHT] *= 10.0;
+                loss_inpaint[SNAP] *= 0.0;
+                loss_inpaint[DIST] *= 0.3;
+                loss_inpaint[STRAIGHT] *= 0.1;
                 local_optimization(radius, corr_center_i, trace_params, trace_data, loss_inpaint, false, true);
             }
 
@@ -1837,28 +1840,14 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
             for (const auto& opt_params : opt_centers) {
                 LossSettings loss_inpaint = loss_settings;
-                loss_inpaint[SNAP] *= 0.1;
-                loss_inpaint[DIST] *= 0.1;
-                loss_inpaint[STRAIGHT] *= 10.0;
+                loss_inpaint[DIST] *= 0.3;
+                loss_inpaint[STRAIGHT] *= 0.1;
                 local_optimization(opt_params.radius, opt_params.center, trace_params, trace_data, loss_inpaint, false, true);
             }
 
             // if (!tgt_path.empty() && snapshot_interval > 0) {
             //     QuadSurface* surf = create_surface_from_state();
-            //     surf->save(tgt_path.string()+"_corr_stage2", true);
-            //     delete surf;
-            // }
-
-            for (const auto& opt_params : opt_centers) {
-                LossSettings loss_inpaint = loss_settings;
-                loss_inpaint[DIST] *= 0.1;
-                loss_inpaint[STRAIGHT] *= 10.0;
-                local_optimization(opt_params.radius, opt_params.center, trace_params, trace_data, loss_inpaint, false, true);
-            }
-
-            // if (!tgt_path.empty() && snapshot_interval > 0) {
-            //     QuadSurface* surf = create_surface_from_state();
-            //     surf->save(tgt_path.string()+"_corr_stage3", true);
+            //     surf->save(tgt_path.string()+"_corr_stage4", true);
             //     delete surf;
             // }
 
@@ -1868,7 +1857,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
             // if (!tgt_path.empty() && snapshot_interval > 0) {
             //     QuadSurface* surf = create_surface_from_state();
-            //     surf->save(tgt_path.string()+"_corr_stage4", true);
+            //     surf->save(tgt_path.string()+"_corr_stage5", true);
             //     delete surf;
             // }
 
