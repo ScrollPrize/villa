@@ -34,6 +34,7 @@ COPY inference.py /app
 COPY model_timesformer.py /app
 COPY model_resnet3d.py /app
 COPY k8s.py /app
+COPY vendored_cache_store.py /app
 COPY models/ /app/models/
 
 ENV PYTHONUNBUFFERED=1
@@ -67,6 +68,7 @@ COPY inference.py /app
 COPY model_timesformer.py /app
 COPY model_resnet3d.py /app
 COPY k8s.py /app
+COPY vendored_cache_store.py /app
 COPY models/ /app/models/
 
 ENV PYTHONUNBUFFERED=1
